@@ -8,14 +8,13 @@
 prepare fetches the PR head into refs/pr-review/<N>/<sha> (old heads stay, so
 a later push can be diffed against them) and the base branch, pins head, base
 and merge base, and puts branch pr-review-<N> at the head in
-.worktrees/pr-review-<N>, or in <checkout>--pr-review-<N> beside it when herdr
-lists the checkout as a linked worktree open in a workspace (herdr's removal of
-the checkout would take a nested tree along); a herdr on PATH that cannot
-answer, or HERDR_ENV set without one, refuses. An existing worktree at either
+.worktrees/pr-review-<N>, or in <checkout>--pr-review-<N> beside it when the
+checkout is a linked worktree (worktree-remove refuses to remove one with a
+worktree nested in it); git failing to tell refuses. An existing worktree at either
 place is reused only when it is clean and its branch tip is a head this script
 pinned; anything else, and a tree at both places, is refused, never reset.
 The sibling tree is locked for the run (`git worktree lock --reason "pr-review
-<N> running <token>"`; herdr's removal of the checkout keeps a locked sibling),
+<N> running <token>"`; worktree-remove's cleanup of the checkout keeps a locked sibling),
 reported as `lock`: `taken` (a new token, or --token's when a prepare for the
 same run is repeated), `held` when it already carries --token's lock, `foreign`
 when someone else's lock is there, left as it is, `none` for a nested tree. A
@@ -49,12 +48,10 @@ to the facts file the line names, beside the ledger. {"error": ...}, exit 2,
 when a fact cannot be read or the pins disagree.
 """
 
-import importlib.util
 import json
 import os
 import re
 import secrets
-import shutil
 import sys
 from pathlib import Path
 
@@ -71,7 +68,6 @@ TOOLING = re.compile(r'(^|/)(CMakeLists\.txt|Makefile|[^/]+\.(cmake|mk|py|sh|ps1
 PASSED = {'SUCCESS', 'SKIPPED', 'NEUTRAL'}
 PENDING = {'PENDING', 'QUEUED', 'IN_PROGRESS', 'WAITING', 'REQUESTED', 'EXPECTED', 'ACTION_REQUIRED'}
 FAILED = {'FAILURE', 'ERROR', 'TIMED_OUT', 'STARTUP_FAILURE', 'CANCELLED', 'STALE'}
-PLUGIN = Path(__file__).resolve().parents[3] / 'plugins' / 'worktree-children' / 'worktree_children.py'
 RUN_LOCK = re.compile(r'pr-review (\d+) running ([0-9a-f]+)')
 
 
@@ -147,21 +143,12 @@ def pin(remote, repo, pr, info):
     return head, base, git('merge-base', base, head).strip()
 
 
-def herdr_sibling(top):
-    """Whether a new worktree goes beside the checkout: herdr lists it as a linked worktree open in a workspace."""
-    name = os.environ.get('HERDR_BIN_PATH') or 'herdr'
-    herdr = shutil.which(name)
-    if not herdr:
-        if os.environ.get('HERDR_ENV'):
-            raise Unusable(f'HERDR_ENV is set but {name} is not on PATH: cannot tell where the review worktree goes')
-        return False
-    try:
-        spec = importlib.util.spec_from_file_location('worktree_children', PLUGIN)
-        plugin = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(plugin)
-        return plugin.linked_workspace(top, herdr)
-    except Exception as err:  # the plugin's Keep, or a plugin that cannot load
-        raise Unusable(f'cannot ask herdr where the review worktree goes: {err}')
+def beside(top):
+    """Whether a new worktree goes beside the checkout: it is a linked worktree."""
+    dirs = git('-C', str(top), 'rev-parse', '--path-format=absolute', '--absolute-git-dir', '--git-common-dir').splitlines()
+    if len(dirs) != 2 or not all(os.path.isabs(d) for d in dirs):
+        raise Unusable(f'cannot tell where the review worktree goes: git rev-parse gave {dirs}')
+    return os.path.realpath(dirs[0]) != os.path.realpath(dirs[1])
 
 
 def own_worktree(path, top):
@@ -207,7 +194,7 @@ def worktree(top, pr, head, token):
         raise Unusable(f'both {nested} and {sibling} exist; remove the one you do not need by hand')
     pinned = {line.split()[0] for line in git('for-each-ref', '--format=%(objectname)', f'refs/pr-review/{pr}/').splitlines()}
     if not found:
-        path = sibling if herdr_sibling(top) else nested
+        path = sibling if beside(top) else nested
         if git('branch', '--list', branch).strip():
             tip = git('rev-parse', branch).strip()
             if tip not in pinned:
@@ -234,7 +221,8 @@ def worktree(top, pr, head, token):
 
 
 def hold(top, pr, wt, token):
-    """Lock the sibling tree for this run; a nested tree goes with the checkout whatever it holds."""
+    """Lock the sibling tree for this run, which worktree-remove's cleanup then keeps; a nested tree needs none:
+    worktree-remove refuses a checkout holding one."""
     if Path(wt) != places(top, pr)[1]:
         return {'state': 'none', 'token': None}
     reason = locks().get(os.path.realpath(wt))

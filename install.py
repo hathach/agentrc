@@ -2,7 +2,7 @@
 """Link parts of this checkout into ~/.claude, ~/.codex and ~/.local/bin, or into one work tree's
 .claude, by explicit choice.
 
-    install.py install --skill --agent --workflow --bin --claude-md --statusline --herdr-plugin
+    install.py install --skill --agent --workflow --bin --claude-md --statusline
     install.py remove --skill
     install.py install --project <work tree> --skill --agent --workflow --claude-md [--skip-clashes]
 
@@ -13,10 +13,8 @@ merged into ~/.claude/settings.json; workflows into ~/.claude/workflows
 (Claude only); bin/ commands into ~/.local/bin;
 --claude-md links instructions/user.md as ~/.claude/CLAUDE.md and
 ~/.codex/AGENTS.md; --statusline links the statusline/ files into ~/.claude
-and sets statusLine in its settings.json; --herdr-plugin links each plugins/*
-herdr plugin into herdr with `herdr plugin link <dir> --enabled` (herdr keeps
-the registration, so edits are live too). Each flag takes every entry of its
-kind; nothing is selected by default. Everything else is a symlink, so edits are
+and sets statusLine in its settings.json. Each flag takes every entry of its
+kind; nothing is selected by default. Everything is a symlink, so edits are
 live and a rerun after a change is a no-op.
 
 Refuses before touching anything when a destination holds something that is
@@ -24,10 +22,7 @@ not a link, or a directory to link into is a file or a dangling link. `remove`
 unlinks the named entries whatever they point to but never deletes a real
 file or directory; --claude-md and --statusline links are removed only when
 they link into this checkout, and statusLine only when it is the one install
-writes. A herdr plugin is linked unless herdr holds its id from elsewhere,
-and unlinked only when linked from this checkout; herdr steps run before any
-link, so herdr's own refusals (min_herdr_version, unlink without a running
-server) change nothing.
+writes.
 
 --project <dir> scopes the install to one work tree instead, and leaves the
 user-wide directories alone. <dir> must be a repository's or a linked
@@ -42,8 +37,8 @@ instructions for that project. The hooks are registered in
 path as above, beside env AGENTRC_DIR: this checkout with / separators, which
 the `${AGENTRC_DIR:-$HOME/.claude}` paths in the skills, agents and workflows
 resolve to; remove takes AGENTRC_DIR out once no link of ours is left there,
-and the file too when nothing else is in it. Codex, bin/, the status line and
-herdr are user-wide, so --project refuses their flags. Each link, and
+and the file too when nothing else is in it. Codex, bin/ and the status line
+are user-wide, so --project refuses their flags. Each link, and
 settings.local.json unless git already ignores it, is an entry of one marked
 block in the repository's exclude file (`git rev-parse --git-common-dir`/info/
 exclude), which every worktree shares: an entry stays while any worktree of
@@ -65,7 +60,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import tomllib
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent
@@ -489,55 +483,6 @@ def write_exclude(exclude, block, trees, added):
     print(f'updated {exclude}')
 
 
-# --- herdr plugins ------------------------------------------------------------
-
-def herdr_plugins():
-    """(id, directory) of every plugins/* herdr plugin."""
-    return [(tomllib.loads(toml.read_text(encoding='utf-8'))['id'], toml.parent)
-            for toml in sorted((REPO / 'plugins').glob('*/herdr-plugin.toml'))]
-
-
-def herdr(*args):
-    exe = os.environ.get('HERDR_BIN_PATH') or shutil.which('herdr')
-    if not exe:
-        refuse('herdr is not on PATH; install it or leave out --herdr-plugin')
-    return subprocess.run([exe, *args], capture_output=True, text=True)
-
-
-def plan_herdr(install):
-    """[(herdr argv, message)] to link or unlink our plugins. herdr's own refusals (an older herdr
-    than min_herdr_version, unlink without a running server) come from run_herdr, which runs before
-    any other change."""
-    listed = herdr('plugin', 'list', '--json')
-    try:
-        plugins = {p['plugin_id']: p for p in json.loads(listed.stdout)['result']['plugins']}
-    except (ValueError, KeyError, TypeError):
-        refuse(f'`herdr plugin list --json` gave no plugin list: {(listed.stderr or listed.stdout).strip()}')
-    steps = []
-    for pid, d in herdr_plugins():
-        cur = plugins.get(pid)
-        mine = bool(cur) and cur.get('source', {}).get('kind') == 'local' and \
-            canonical(os.path.realpath(cur.get('plugin_root', ''))) == canonical(os.path.realpath(d))
-        if install:
-            if cur and not mine:
-                refuse(f'herdr already has plugin {pid} from {cur.get("plugin_root")}; unlink it first')
-            if not (cur and cur.get('enabled')):  # link replaces a disabled entry of the same id
-                steps.append((['plugin', 'link', str(d), '--enabled'], f'herdr plugin {pid} -> {d}'))
-        elif mine:
-            steps.append((['plugin', 'unlink', pid], f'unlinked herdr plugin {pid}'))
-        elif cur:
-            print(f'herdr plugin {pid} is not linked from this checkout, left alone')
-    return steps
-
-
-def run_herdr(steps):
-    for argv, message in steps:
-        done = herdr(*argv)
-        if done.returncode:
-            refuse(f'`herdr {" ".join(argv)}` failed: {(done.stderr or done.stdout).strip()}')
-        print(message)
-
-
 # --- command line -------------------------------------------------------------
 
 def selection(parser, args):
@@ -547,7 +492,7 @@ def selection(parser, args):
         chosen.append(('claude-md', None))
     if args.statusline:
         chosen.append(('statusline', None))
-    if not chosen and not args.herdr_plugin:
+    if not chosen:
         parser.error('nothing selected')
     return chosen
 
@@ -583,17 +528,14 @@ def main(argv=None):
     parser.add_argument('--claude-md', action='store_true', help='instructions/user.md as ~/.claude/CLAUDE.md, also '
                                                                     '~/.codex/AGENTS.md; with --project as its CLAUDE.local.md')
     parser.add_argument('--statusline', action='store_true', help='the Claude Code status line')
-    parser.add_argument('--herdr-plugin', action='store_true', help='every plugins/* herdr plugin, through herdr')
     parser.add_argument('--project', metavar='DIR', help="into this work tree's .claude, for Claude Code only")
     parser.add_argument('--skip-clashes', action='store_true', help="with --project, skip an entry the project has itself")
     args = parser.parse_args(argv)
     if args.skip_clashes and not args.project:
         parser.error('--skip-clashes goes with --project')
-    if args.project and (user_wide := [f for f in ('bin', 'statusline', 'herdr_plugin') if getattr(args, f)]):
+    if args.project and (user_wide := [f for f in ('bin', 'statusline') if getattr(args, f)]):
         parser.error(f'--project takes only --skill, --agent, --workflow and --claude-md: '
-                     f'--{user_wide[0].replace("_", "-")} is user-wide')
-    if args.herdr_plugin and os.name == 'nt':
-        refuse('--herdr-plugin: herdr runs on Linux and macOS only')
+                     f'--{user_wide[0]} is user-wide')
     chosen = selection(parser, args)
     if args.project:
         PROJECT, exclude, trees = work_tree(args.project)
@@ -606,7 +548,6 @@ def main(argv=None):
         pairs, orphaned = project_clashes(args, pairs)
         if args.action == 'install' and not pairs:  # every entry skipped: no AGENTRC_DIR or exclude entry for none
             return
-    herdr_steps = plan_herdr(args.action == 'install') if args.herdr_plugin else []
     hooks = [dst.name for kind, (_, dst) in pairs if kind == 'hook']  # a skipped hook's link is not registered
     planned = None
     if hooks or args.statusline or PROJECT:
@@ -620,7 +561,6 @@ def main(argv=None):
             refuse(f'{settings()} cannot be edited ({err!r}); fix it first')
 
     if args.action == 'remove':
-        run_herdr(herdr_steps)
         foreign = [dst for kind, (_, dst) in pairs if kind in ('claude-md', 'statusline') and not ours(dst)]
         for kind, (_, dst) in pairs:  # ownership settled before any unlink: the Codex link is relative
             if dst in foreign:
@@ -636,7 +576,6 @@ def main(argv=None):
     preflight([pair for _, pair in pairs])
     if planned and planned[1] is not None:  # CLAUDE.local.md alone does not check the .claude it is written into
         directories_for(settings())
-    run_herdr(herdr_steps)
     for _, (src, dst) in pairs:
         link(src, dst)
     for dst in orphaned:  # linked by an earlier install, before the project had the skill

@@ -422,11 +422,11 @@ class GateTest(unittest.TestCase):
             self.assertEqual(got, reread)
         self.assertIn('s.txt', prev['files'])
 
-    def test_a_plugin_that_cannot_load_is_a_failed_snapshot(self):
+    def test_a_worktree_children_module_that_cannot_load_is_a_failed_snapshot(self):
         self.write('a.txt', 'a2\n')
-        with mock.patch.object(gate, 'PLUGIN', self.base / 'missing.py'):
+        with mock.patch.object(gate, 'WORKTREE_CHILDREN', self.base / 'missing.py'):
             reply = self.s.stop()
-        self.assertIn('cannot load the worktree-children plugin', reply['systemMessage'])
+        self.assertIn('cannot load worktree_children from', reply['systemMessage'])
         self.assertEqual(self.s.calls, [])
 
     def test_a_worktree_removed_after_its_edit_keeps_the_edit(self):

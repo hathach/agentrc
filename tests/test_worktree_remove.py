@@ -1,5 +1,5 @@
 """Tests for worktree-remove's worktree_remove.py on real git repos: a bare origin, a primary checkout,
-a worktree `wt/parent` and its `parent--*` siblings; herdr and gh are stubs, or herdr is absent."""
+a worktree `wt/parent` and its `parent--*` siblings; gh is a stub."""
 import importlib.util
 import io
 import json
@@ -13,38 +13,14 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import guard_survivors  # noqa: E402
+from helpers import git_env, guard_survivors, make_stub  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'worktree-remove' / 'scripts' / 'worktree_remove.py'
 spec = importlib.util.spec_from_file_location('worktree_remove', SCRIPT)
 wr = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(wr)
 
-HERDR = r'''#!/usr/bin/env python3
-import json, os, sys
-args = sys.argv[1:]
-mode = open(os.environ['STUB_MODE']).read().split()
-reports = os.environ['STUB_REPORTS']
-with open(os.environ['STUB_LOG'], 'a') as f:
-    f.write(json.dumps({'argv': args, 'reports': sorted(os.listdir(reports)) if os.path.isdir(reports) else []}) + '\n')
-if 'down' in mode:
-    sys.exit('herdr server unreachable')
-if args[:2] == ['worktree', 'list']:
-    path = args[args.index('--cwd') + 1]
-    entry = {'path': path, 'is_linked_worktree': True}
-    if path == os.environ['STUB_OPEN'] and 'closed' not in mode:
-        entry['open_workspace_id'] = 'w1'
-    if 'strlinked' in mode:
-        entry['is_linked_worktree'] = 'false'
-    print(json.dumps({'result': {'worktrees': [entry]}}))
-elif args[:2] == ['plugin', 'list']:
-    root = '/elsewhere' if 'elsewhere' in mode else os.environ['STUB_ROOT']
-    plugins = [] if 'noplugin' in mode else [{'plugin_id': 'agentrc.worktree-children', 'enabled': True,
-                                             'plugin_root': root}]
-    print(json.dumps({'result': {'plugins': plugins}}))
-elif args[:2] == ['worktree', 'remove']:
-    sys.exit('herdr: worktree_remove_failed' if 'fail' in mode else 0)
-'''
+posix = unittest.skipIf(os.name == 'nt', 'POSIX paths and stub executables')
 
 
 def sh(cwd, *args):
@@ -56,7 +32,7 @@ def setUpModule():
 
 
 class Rig(unittest.TestCase):
-    """The repositories and stubs; herdr has wt/parent open as workspace w1."""
+    """The repositories and the gh stub."""
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -66,24 +42,17 @@ class Rig(unittest.TestCase):
                        '[protocol "file"]\n allow = always\n')
         bin_dir = self.t / 'bin'
         bin_dir.mkdir()
-        (bin_dir / 'herdr').write_text(HERDR)
         (bin_dir / 'gh').write_text('#!/bin/sh\necho "gh: network unreachable" >&2\nexit 1\n')
-        for stub in bin_dir.iterdir():
-            stub.chmod(0o755)
-        self.mode, self.calls, self.reports = self.t / 'mode', self.t / 'calls', self.t / 'state' / 'reports'
-        self.mode.write_text('')
+        (bin_dir / 'gh').chmod(0o755)
+        self.bin_dir, self.reports = bin_dir, self.t / 'state' / 'agentrc' / 'worktree-remove'
         self.wt = self.t / 'wt'
         self.parent = self.wt / 'parent'
-        env = {'GIT_CONFIG_GLOBAL': str(cfg), 'GIT_CONFIG_NOSYSTEM': '1', 'HERDR_BIN_PATH': str(bin_dir / 'herdr'),
-               'PATH': f'{bin_dir}{os.pathsep}{os.environ["PATH"]}', 'STUB_MODE': str(self.mode),
-               'STUB_LOG': str(self.calls), 'STUB_REPORTS': str(self.reports), 'STUB_OPEN': str(self.parent),
-               'STUB_ROOT': str(wr.PLUGIN_DIR)}
-        for patch in (mock.patch.dict(os.environ, env), mock.patch.object(wr, 'REPORTS', self.reports),
-                      mock.patch.object(wr, 'LOG', self.reports / 'log'),
-                      mock.patch.object(wr, 'PLUGIN_LOG', self.t / 'state' / 'herdr-plugin-log')):
-            patch.start()
-            self.addCleanup(patch.stop)
-        wr.wc = wr.load_plugin()  # fresh: it reads the environment and caches fetches
+        env = git_env(GIT_CONFIG_GLOBAL=str(cfg), PATH=f'{bin_dir}{os.pathsep}{os.environ["PATH"]}',
+                      XDG_STATE_HOME=str(self.t / 'state'))
+        patch = mock.patch.dict(os.environ, env, clear=True)
+        patch.start()
+        self.addCleanup(patch.stop)
+        wr.wc = wr.load_module()  # fresh: it reads the environment, the log's place included, and caches fetches
         self.main = self.repo('main')
         self.wt.mkdir()
         sh(self.main, 'worktree', 'add', '-q', str(self.parent), '-b', 'parent')
@@ -116,9 +85,8 @@ class Rig(unittest.TestCase):
             rc = wr.main([str(self.parent), *argv])
         return rc, out.getvalue() + err.getvalue()
 
-    def removals(self):
-        calls = [json.loads(l) for l in self.calls.read_text().splitlines()] if self.calls.exists() else []
-        return [c for c in calls if c['argv'][:2] == ['worktree', 'remove']]
+    def tips(self, *branches):
+        return {b: sh(self.main, 'rev-parse', '--verify', '--quiet', f'refs/heads/{b}') for b in branches}
 
     def token(self, out):
         return re.search(r'--proceed (\w+)', out).group(1)
@@ -138,32 +106,15 @@ class Rig(unittest.TestCase):
         rc, out = self.run_remove(*argv)
         self.assertEqual(rc, 3, out)
         self.assertIn(text, out)
-        self.assertEqual(self.removals(), [])
         self.assertFalse(self.reports.exists())
-        self.assertTrue(self.parent.is_dir())
+        self.assertTrue((self.parent / '.git').exists())
 
-    def assert_removed_by_git(self):
-        sibling, dirty = self.sibling('b'), self.sibling('dirty')
-        (dirty / 'wip.txt').write_text('wip')
-        rc, out = self.run_remove()
-        self.assertEqual(rc, 4, out)
-        rc, out = self.run_remove('--proceed', self.token(out))
-        self.assertEqual(rc, 0, out)
-        self.assertEqual(self.removals(), [])
-        self.assertFalse(self.parent.exists() or sibling.exists())
-        self.assertTrue((dirty / 'wip.txt').is_file())
-        self.assertEqual(sh(self.main, 'branch', '--list', 'parent', 'b'), '')
-        self.assertTrue(sh(self.main, 'branch', '--list', 'dirty'))
-        [report] = [r for r in self.reports.iterdir() if r.suffix == '.md']
-        self.assertIn(f'{self.parent}: git removes it; branch parent goes: on origin', report.read_text())
-        log = (self.reports / 'log').read_text()
-        for line in (f'removed {self.parent}', f'removed {sibling}', 'deleted branch parent', 'deleted branch b',
-                     f'kept {dirty}: uncommitted or untracked changes'):
-            self.assertIn(line, log)
-            self.assertIn(line, out)
+    def assertCleanupKept(self, rc, out):
+        self.assertEqual(rc, 6, out)
+        self.assertIn(f'worktree_remove: removed {self.parent}, but the cleanup kept a sibling or branch', out)
+        self.assertFalse(self.parent.exists())
 
 
-@unittest.skipIf(os.name == 'nt', 'POSIX paths and stub executables')
 class Remove(Rig):
     # --- refused --------------------------------------------------------------------
 
@@ -171,37 +122,11 @@ class Remove(Rig):
         self.parent = self.main
         self.assertRefused('a primary checkout')
 
-    def test_a_worktree_herdr_has_not_open_is_removed_by_git_and_the_plugins_cleanup_unlinked(self):
-        self.mode.write_text('closed noplugin')
-        self.assert_removed_by_git()
-
-    def test_a_token_from_the_git_route_stops_once_herdr_has_it_open(self):
-        self.mode.write_text('closed')
-        rc, out = self.run_remove('--pending', 'x')
-        self.assertEqual(rc, 4, out)
-        self.mode.write_text('')
-        rc, out = self.run_remove('--pending', 'x', '--proceed', self.token(out))
-        self.assertEqual(rc, 4, out)
-        self.assertEqual(self.removals(), [])
-
-    def test_a_malformed_herdr_entry_is_refused(self):
-        self.mode.write_text('strlinked')
-        self.assertRefused('malformed entry')
-
-    def test_an_unreachable_herdr_is_refused(self):
-        self.mode.write_text('down')
-        self.assertRefused('herdr server unreachable')
-
-    def test_a_missing_or_foreign_plugin_is_refused(self):
-        self.mode.write_text('noplugin')
-        self.assertRefused('no enabled agentrc.worktree-children')
-        self.mode.write_text('elsewhere')
-        self.assertRefused('from /elsewhere')
-
     def test_a_parent_holding_work_is_refused(self):
         (self.parent / 'new.txt').write_text('x')
         self.assertRefused('uncommitted or untracked changes')
 
+    @posix
     def test_a_parent_with_a_running_chief_or_a_busy_cowork_lane_is_refused(self):
         chief = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)', '--agent', 'chief'],
                                  cwd=self.parent)
@@ -215,15 +140,31 @@ class Remove(Rig):
         (box / 'claude-main-1.lock').write_text('')
         self.assertRefused('cowork lane claude/main holds')
 
-    def test_a_report_dir_inside_a_removed_tree_is_refused(self):
+    def test_a_log_and_its_reports_inside_the_worktree_or_any_sibling_are_refused(self):
+        sibling, dirty = self.sibling('b'), self.sibling('dirty')
+        (dirty / 'wip.txt').write_text('wip')  # kept: the cleanup removes it should it turn clean meanwhile
+        for tree in (self.parent, sibling, dirty):
+            log = tree / 'build' / 'reports' / 'log'
+            with self.subTest(tree=tree.name), mock.patch.object(wr.wc, 'LOG', log):
+                self.assertRefused(f'the log {log} lies inside {tree}; run this from outside it')
+
+    @posix
+    def test_a_log_reached_through_a_link_into_the_worktree_is_refused(self):
+        state = self.t / 'log-state'
+        state.symlink_to(self.parent / 'build')
+        with mock.patch.object(wr.wc, 'LOG', state / 'log'):
+            self.assertRefused(f'the log {state / "log"} lies inside {self.parent}')
+
+    def test_the_inside_refusal_comes_before_any_content_check(self):
+        here = os.getcwd()
+        self.addCleanup(os.chdir, here)
         sibling = self.sibling('b')
-        for inside in (self.parent / 'build' / 'reports', sibling / 'build' / 'reports'):
-            with mock.patch.object(wr, 'REPORTS', inside):
-                self.assertRefused(f'{inside} lies inside a worktree this removes')
-        state = self.t / 'herdr-state'
-        state.symlink_to(self.parent / 'build')  # resolved: a log reached through a link counts too
-        with mock.patch.object(wr, 'PLUGIN_LOG', state / 'log'):
-            self.assertRefused(f'{state / "log"} lies inside a worktree this removes')
+        unchecked = mock.patch.object(wr.wc, 'content_check', side_effect=AssertionError('content_check ran'))
+        with unchecked, mock.patch.object(wr.wc, 'LOG', sibling / 'build' / 'log'):
+            self.assertRefused(f'the log {sibling / "build" / "log"} lies inside {sibling}')
+        os.chdir(self.parent)
+        with unchecked:
+            self.assertRefused(f'the working directory {self.parent} lies inside {self.parent}')
 
     def test_a_tree_changing_after_its_check_is_refused(self):
         self.sibling('b')
@@ -231,9 +172,29 @@ class Remove(Rig):
             with self.subTest(err=err), mock.patch.object(wr, 'links_leaving', side_effect=err):
                 self.assertRefused('listing the symlinks leaving the removed trees')
 
+    @posix
     def test_a_failed_github_lookup_is_refused(self):
         with mock.patch.object(wr.wc, 'GITHUB', re.compile('')):
             self.assertRefused('network unreachable')
+
+    def test_a_working_directory_inside_the_worktree_or_any_sibling_is_refused(self):
+        here = os.getcwd()
+        self.addCleanup(os.chdir, here)
+        dirty = self.sibling('dirty')  # kept now, but cleanup removes it should it turn clean meanwhile
+        (dirty / 'wip.txt').write_text('wip')
+        sibling = self.sibling('b')
+        for inside, tree in ((self.parent, self.parent), (sibling / 'build', sibling), (dirty, dirty)):
+            inside.mkdir(exist_ok=True)
+            os.chdir(inside)
+            self.assertRefused(f'the working directory {inside} lies inside {tree}; run this from outside it')
+        os.chdir(self.main)
+        rc, out = self.run_remove()
+        self.assertEqual(rc, 4, out)
+        self.assertIn('parent--dirty stays: uncommitted or untracked changes', out)
+
+    def test_a_branch_switched_after_the_gate_is_refused(self):
+        with self.after_plan(lambda: sh(self.parent, 'switch', '-q', '-c', 'other')):
+            self.assertRefused('its branch or tip moved since the gate')
 
     # --- pending ----------------------------------------------------------------------
 
@@ -252,11 +213,14 @@ class Remove(Rig):
         self.assertIn('parent--local: branch local stays: commits on no origin branch', out)
         self.assertIn('foreign: commits on origin that master lacks', out)
         self.assertNotIn('parent:', out)
-        self.assertEqual(self.removals(), [])
+        self.assertTrue(self.parent.is_dir())
+        self.assertFalse(self.reports.exists())
         rc, out = self.run_remove('--proceed', self.token(out))
-        self.assertEqual(rc, 0, out)
-        self.assertEqual(len(self.removals()), 1)
+        self.assertCleanupKept(rc, out)
+        self.assertTrue((dirty / 'wip.txt').is_file())
+        self.assertTrue(sh(self.main, 'branch', '--list', 'local'))
 
+    @posix
     def test_a_staying_siblings_own_children_and_link_targets_stay(self):
         target = self.sibling('dep-x')
         owner = self.sibling('z')
@@ -268,8 +232,9 @@ class Remove(Rig):
         self.assertIn(f'{target}: stays: parent--z, which stays, links into it', out)
         self.assertIn(f'{owned}: stays: owned by parent--z, which stays', out)
         self.assertIn('parent--dep-x stays: parent--z, which stays, links into it', out)
-        self.assertNotIn('the plugin removes it', out)
+        self.assertNotIn('the cleanup removes it', out)
 
+    @posix
     def test_every_sibling_a_staying_siblings_link_passes_through_stays(self):
         bridge, target = self.sibling('bridge'), self.sibling('dep')
         owner = self.sibling('z')
@@ -281,6 +246,7 @@ class Remove(Rig):
         for sibling in (bridge, target):
             self.assertIn(f'{sibling}: stays: parent--z, which stays, links into it', out)
 
+    @posix
     def test_a_staying_siblings_link_through_a_sibling_and_back_out_holds_both(self):
         passed, target = self.sibling('a'), self.sibling('b')
         owner = self.sibling('z')
@@ -290,6 +256,7 @@ class Remove(Rig):
         for sibling in (passed, target):
             self.assertIn(f'{sibling}: stays: parent--z, which stays, links into it', out)
 
+    @posix
     def test_siblings_linking_in_a_cycle_stay(self):
         a, b = self.sibling('a'), self.sibling('b')
         for one, other in ((a, b), (b, a)):
@@ -307,9 +274,11 @@ class Remove(Rig):
         token = self.token(out)
         rc, out = self.run_remove('--pending', 'file the flaky test', '--pending', 'rerun HIL', '--proceed', token)
         self.assertEqual(rc, 4, out)
-        self.assertEqual(self.removals(), [])
+        self.assertTrue(self.parent.is_dir())
+        self.assertFalse(self.reports.exists())
         rc, out = self.run_remove('--pending', 'file the flaky test', '--proceed', token)
         self.assertEqual(rc, 0, out)
+        self.assertFalse(self.parent.exists())
 
     def test_github_pr_state_is_pending(self):
         prs = {'parent': [dict(number=3, head='x', state='MERGED', merged_at='2026-01-01'),
@@ -396,6 +365,7 @@ class Remove(Rig):
 
     # --- run --------------------------------------------------------------------------
 
+    @posix
     def test_a_dry_run_reports_and_changes_nothing(self):
         sibling = self.sibling('b')
         target = self.t / 'deps'
@@ -406,99 +376,99 @@ class Remove(Rig):
         (sibling / 'build' / 'inner').symlink_to(sibling / '.gitignore')
         rc, out = self.run_remove('--dry-run')
         self.assertEqual(rc, 0, out)
-        self.assertIn(f'{self.parent}: herdr removes it; branch parent goes: on origin', out)
-        self.assertIn(f'{sibling}: the plugin removes it; branch b goes: on origin', out)
+        self.assertIn(f'{self.parent}: git removes it; branch parent goes: on origin', out)
+        self.assertIn(f'{sibling}: the cleanup removes it; branch b goes: on origin', out)
         self.assertIn(f'{self.parent}/build/deps -> {target}', out)
         self.assertNotIn('inner', out)
         self.assertIn(f'Plan to remove {self.parent}', out)
         self.assertNotRegex(out, 'requested|has the result')
-        self.assertEqual(self.removals(), [])
         self.assertFalse(self.reports.exists())
-        self.assertTrue(sibling.is_dir() and sh(self.main, 'branch', '--list', 'b'))
-
-    def test_the_run_writes_the_report_then_asks_herdr_to_remove(self):
-        rc, out = self.run_remove()
-        self.assertEqual(rc, 0, out)
-        [call] = self.removals()
-        self.assertEqual(call['argv'], ['worktree', 'remove', '--workspace', 'w1'])
-        [report] = call['reports']
-        self.assertIn(f'report: {self.reports / report}', out)
-        self.assertIn('Command: `', (self.reports / report).read_text())
-        self.assertTrue(self.parent.is_dir(), 'herdr removes it, not the script')
-
-    def test_a_parent_with_submodules_is_removed_with_force(self):
-        sub = self.repo('sub')
-        sh(self.parent, '-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', str(self.t / 'sub.git'), 'lib/sub')
-        sh(self.parent, 'commit', '-qm', 'sub')
-        sh(self.parent, 'push', '-q', 'origin', 'parent', 'parent:master')
-        rc, out = self.run_remove()
-        self.assertEqual(rc, 0, out)
-        self.assertEqual(self.removals()[0]['argv'][-1], '--force')
-        self.assertTrue(sub.is_dir())
-
-    def test_a_failed_removal_is_exit_5(self):
-        self.mode.write_text('fail')
-        rc, out = self.run_remove()
-        self.assertEqual(rc, 5, out)
-        self.assertIn('worktree_remove_failed', out)
-
-    def test_a_worktree_herdr_opens_or_loses_sight_of_after_the_plan_is_refused(self):
-        for later, text in (('', f'{self.parent} is now open in herdr workspace w1'),
-                            ('down', f'herdr and {self.parent}: herdr could not list it '
-                                     '(exit 1: herdr server unreachable)')):
-            with self.subTest(later=later):
-                self.mode.write_text('closed')  # open in no workspace while the plan looks it up
-                with self.after_plan(lambda: self.mode.write_text(later)):
-                    rc, out = self.run_remove()
-                self.assertEqual(rc, 3, out)
-                self.assertIn(f'refused, nothing changed: {text}', out)
-                self.assertEqual(self.removals(), [])
-                self.assertFalse(self.reports.exists())
-                self.assertTrue(self.parent.is_dir())
-                self.assertIn(str(self.parent), sh(self.main, 'worktree', 'list'))
-
-
-class NoHerdr(Rig):
-    """No herdr: none at HERDR_BIN_PATH, HERDR_ENV unset."""
-    def setUp(self):
-        super().setUp()
-        patch = mock.patch.dict(os.environ, {'HERDR_BIN_PATH': str(self.t / 'no-herdr'), 'HERDR_ENV': ''})
-        patch.start()
-        self.addCleanup(patch.stop)
-        wr.wc = wr.load_plugin()
-
-    def test_git_removes_it_then_the_plugins_cleanup_its_siblings_and_branches(self):
-        self.assert_removed_by_git()
+        self.assertTrue(self.parent.is_dir() and sibling.is_dir() and sh(self.main, 'branch', '--list', 'b'))
 
     def test_a_dry_run_names_the_git_removal_and_changes_nothing(self):
         rc, out = self.run_remove('--dry-run')
         self.assertEqual(rc, 0, out)
-        self.assertIn('open in no herdr workspace', out)
-        self.assertIn(f"worktree remove {self.parent}`, then the plugin's cleanup", out)
+        self.assertIn(f'worktree remove {self.parent}`, then the cleanup of its siblings and branches', out)
         self.assertTrue(self.parent.is_dir())
         self.assertFalse(self.reports.exists())
 
-    def test_herdr_env_without_a_herdr_is_refused(self):
-        with mock.patch.dict(os.environ, {'HERDR_ENV': '1'}):
-            self.assertRefused('HERDR_ENV is set')
+    def test_git_removes_it_then_the_cleanup_its_siblings_and_branches(self):
+        sibling = self.sibling('b')
+        remove, reports = wr.wc.remove, []
 
-    def test_a_working_directory_inside_the_worktree_or_any_sibling_is_refused(self):
-        here = os.getcwd()
-        self.addCleanup(os.chdir, here)
-        dirty = self.sibling('dirty')  # kept now, but cleanup removes it should it turn clean meanwhile
+        def after_the_report(child, common, force):
+            reports.append(sorted(r.name for r in self.reports.glob('*.md')))
+            remove(child, common, force)
+
+        with mock.patch.object(wr.wc, 'remove', after_the_report):
+            rc, out = self.run_remove()
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(self.parent.exists() or sibling.exists())
+        self.assertEqual(sh(self.main, 'branch', '--list', 'parent', 'b'), '')
+        [report] = [r for r in self.reports.iterdir() if r.suffix == '.md']
+        self.assertEqual(reports[0], [report.name], 'the report is written before git removes the worktree')
+        self.assertIn(f'report: {report}', out)
+        self.assertIn(f'{self.parent}: git removes it; branch parent goes: on origin', report.read_text())
+        log = (self.reports / 'log').read_text()
+        for line in (f'removed {self.parent}', f'removed {sibling}', 'deleted branch parent', 'deleted branch b'):
+            self.assertIn(line, log)
+            self.assertIn(line, out)
+        self.assertNotIn('retry:', log)
+
+    def test_a_sibling_the_cleanup_keeps_is_exit_6(self):
+        sibling, dirty = self.sibling('b'), self.sibling('dirty')
         (dirty / 'wip.txt').write_text('wip')
-        for inside in (self.parent, self.sibling('b') / 'build', dirty):
-            inside.mkdir(exist_ok=True)
-            os.chdir(inside)
-            self.assertRefused('run this from outside them')
-        os.chdir(self.main)
         rc, out = self.run_remove()
         self.assertEqual(rc, 4, out)
-        self.assertIn('parent--dirty stays: uncommitted or untracked changes', out)
+        rc, out = self.run_remove('--proceed', self.token(out))
+        self.assertCleanupKept(rc, out)
+        self.assertFalse(sibling.exists())
+        self.assertTrue((dirty / 'wip.txt').is_file())
+        self.assertEqual(sh(self.main, 'branch', '--list', 'parent', 'b'), '')
+        self.assertTrue(sh(self.main, 'branch', '--list', 'dirty'))
+        log = (self.reports / 'log').read_text()
+        for line in (f'removed {sibling}', f'kept {dirty}: uncommitted or untracked changes', 'retry: '):
+            self.assertIn(line, log)
 
-    def test_a_branch_switched_after_the_gate_is_refused(self):
-        with self.after_plan(lambda: sh(self.parent, 'switch', '-q', '-c', 'other')):
-            self.assertRefused('its branch or tip moved since the gate')
+    def test_a_branch_the_cleanup_keeps_is_exit_6(self):
+        self.commit(self.parent, 'p.txt', 'p')  # on no origin branch
+        rc, out = self.run_remove()
+        self.assertEqual(rc, 4, out)
+        self.assertIn('branch parent stays', out)
+        rc, out = self.run_remove('--proceed', self.token(out))
+        self.assertCleanupKept(rc, out)
+        self.assertTrue(sh(self.main, 'branch', '--list', 'parent'))
+        self.assertIn('kept branch parent', (self.reports / 'log').read_text())
+
+    def test_something_appearing_at_the_path_during_the_cleanup_is_exit_6_and_cleans_up_nothing(self):
+        sibling = self.sibling('b')
+        tips = self.tips('parent', 'b')
+        remove = wr.wc.remove
+
+        def then_replaced(child, common, force):
+            remove(child, common, force)
+            Path(child).mkdir()
+
+        with mock.patch.object(wr.wc, 'remove', then_replaced):
+            rc, out = self.run_remove()
+        self.assertEqual(rc, 6, out)
+        self.assertIn(f'worktree_remove: removed {self.parent}, but something appeared at that path again', out)
+        self.assertTrue(sibling.is_dir())
+        self.assertEqual(self.tips('parent', 'b'), tips)
+        log = (self.reports / 'log').read_text()
+        self.assertIn(f'{self.parent} exists: not touching its children', log)
+        self.assertIn('retry: ', log)
+
+    def test_a_herdr_on_path_or_in_the_environment_is_never_asked(self):
+        asked = self.t / 'herdr-asked'
+        stub = make_stub(self.bin_dir, 'herdr', f'import sys\nopen({str(asked)!r}, "a").write(" ".join(sys.argv))\n'
+                                                'sys.exit("herdr: should not run")\n')
+        with mock.patch.dict(os.environ, {'HERDR_ENV': '1', 'HERDR_BIN_PATH': str(stub)}):
+            wr.wc = wr.load_module()
+            rc, out = self.run_remove()
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(self.parent.exists())
+        self.assertFalse(asked.exists(), asked.exists() and asked.read_text())
 
     def test_a_parent_with_submodules_is_removed_by_git_with_force(self):
         sub = self.repo('sub')
@@ -513,13 +483,14 @@ class NoHerdr(Rig):
 
     def test_a_failed_git_removal_is_exit_5_and_cleans_up_nothing(self):
         sibling = self.sibling('b')
+        tips = self.tips('parent', 'b')
         failed = wr.wc.Keep('`git worktree remove` failed, possibly part way: boom')
         with mock.patch.object(wr.wc, 'remove', side_effect=failed):
             rc, out = self.run_remove()
         self.assertEqual(rc, 5, out)
         self.assertIn(f'worktree_remove: {self.parent}: `git worktree remove` failed, possibly part way: boom', out)
         self.assertTrue(self.parent.is_dir() and sibling.is_dir())
-        self.assertTrue(sh(self.main, 'branch', '--list', 'parent', 'b'))
+        self.assertEqual(self.tips('parent', 'b'), tips)
 
 
 if __name__ == '__main__':
