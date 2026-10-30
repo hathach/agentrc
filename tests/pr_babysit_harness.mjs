@@ -7466,6 +7466,19 @@ test('a reset extended by the live script is waited for without recording an att
   assert.equal(result.state.reviewClock.request.tried, at(31))
 })
 
+test('a live reset later than the harvest\'s is the one reported and saved', async () => {
+  const { result, labels } = await run({
+    args: { coderabbitTrigger: true, maxCycles: 1, yieldAfterCycle: true }, clockOffset: 21, reviews: quiet([limitedCr(at(20))]),
+    crRequest: { outcome: 'notDue', detail: 'Review rate limited', retryAt: at(30) },
+  })
+  assert.equal(result.reason, 'yielded')
+  assert.deepEqual(requests(labels), ['crrequest#1'])
+  assert.equal(result.history.at(-1).bots.bots[0].retryWaitMs, 10 * 60000)
+  assert.equal(result.coderabbitAsk.nextAt, atSeconds(31))
+  assert.equal(result.state.coderabbitRead.retryAt, at(30))
+  assert.equal(result.state.reviewClock.request, undefined)
+})
+
 test('a newer refusal waits for its own reset and an hour after the last attempt: an edited countdown never shortens it', async () => {
   for (const [reset, naps, askedAt] of [[25, [21, 10, 51, 10], 82], [100, [21, 10, 60, 10, 10], 101]]) {
     let n = 0
@@ -7625,15 +7638,17 @@ test('requests and cycle ids carry across a resume; old clocks load and malforme
   assert.deepEqual(requests(c.labels), ['crrequest#3'])
   assert.equal(c.result.state.reviewClock.requests, 2)
   assert.deepEqual(c.result.coderabbitAsk, { relaunchAsks: 'request', asked: [{ ask: 'request', at: at(82), requests: 2 }], nextAt: atSeconds(143) })
-  // Before separate ids and tried existed, cyclesUsed was also the last id, and at (or since) dated the attempt.
-  for (const requestedAt of [at(21), null]) {
+  // Before separate ids and tried existed, cyclesUsed was also the last id, and at dated the attempt.
+  // A failed one, its time unknown, is dated by the resume that first sees it, never by the head's earlier first observation.
+  for (const [requestedAt, nextAt] of [[at(21), 82], [null, 122]]) {
     const { lastCycle, ...old } = a.result.state
-    const state = seal({ ...old, cyclesUsed: 1, reviewClock: { sha: HEAD, eventAt: null, since: at(21), request: { at: requestedAt, retryAt: at(20) } } })
-    const legacy = await run({ args: { ...args, maxCycles: 2, state }, clockOffset: 24, reviews: quiet([limitedCr(at(20))]) })
+    const state = seal({ ...old, cyclesUsed: 1, reviewClock: { sha: HEAD, eventAt: null, since: at(0), request: { at: requestedAt, retryAt: at(20) } } })
+    const legacy = await run({ args: { ...args, maxCycles: 2, state }, clockOffset: 61, reviews: quiet([limitedCr(at(20))]) })
     assert.deepEqual(requests(legacy.labels), [])
     assert.equal(legacy.result.state.lastCycle, 2)
-    assert.equal(legacy.result.coderabbitAsk.nextAt, atSeconds(82))
+    assert.equal(legacy.result.coderabbitAsk.nextAt, atSeconds(nextAt))
     assert.equal(legacy.result.coderabbitAsk.asked[0].requests, 1)
+    assert.equal(legacy.result.state.reviewClock.request.tried, requestedAt ? undefined : at(61))
   }
   for (const request of [{ at: 'never', retryAt: at(20) }, { at: null }, { at: null, retryAt: 'soon' }, { at: null, retryAt: null, tried: 'never' }, null]) {
     await assert.rejects(run({ args: { ...args, state: seal({ ...a.result.state, reviewClock: { ...a.result.state.reviewClock, request } }) } }), /not a pr-babysit state/)

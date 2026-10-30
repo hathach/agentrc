@@ -1234,6 +1234,8 @@ const settleBots = (r) => {
   else if (r.headEventAt !== null && (reviewClock.eventAt === null || Date.parse(r.headEventAt) > Date.parse(reviewClock.eventAt))) {
     reviewClock.eventAt = r.headEventAt // a reopen or ready on the same SHA restarts the wait
   }
+  // A state from before `tried` dates a failed request no earlier than the first observation that resumes it.
+  if (reviewClock.request && reviewClock.request.at === null && reviewClock.request.tried === undefined) reviewClock.request.tried = r.observedAt
   const start = reviewClock.eventAt ?? reviewClock.since
   const waitedMin = Math.floor((Date.parse(r.observedAt) - Date.parse(start)) / 60000)
   const unknown = {}
@@ -2005,7 +2007,7 @@ const coderabbitAskable = (cr, clock) => {
   }
   return limited(cr) ? 'request' : null
 }
-const requestTried = (clock) => clock.request.tried ?? clock.request.at ?? clock.since
+const requestTried = (clock) => clock.request.tried ?? clock.request.at
 const requestCount = (clock) => clock.requests ?? (clock.request ? 1 : 0)
 // CodeRabbit's quota window: harvest.py's ESTIMATED_RESET; the margin is coderabbit_trigger.py's MARGIN.
 const HOUR_MS = 60 * 60000
@@ -2122,6 +2124,7 @@ const requestCodeRabbit = async (cycle, r, cr, ended) => {
   const atOk = !!t && Number.isFinite(Date.parse(t.at))
   const reset = t && Number.isFinite(Date.parse(t.retryAt)) ? t.retryAt : null
   if (outcome === 'notDue' && reset && atOk) {
+    if (!(Date.parse(cr.retryAt) >= Date.parse(reset))) cr.retryAt = reset // reported and saved; an earlier one never shortens
     return retryLater(cr, Math.max(Date.parse(reset) + RESET_MARGIN_MS, quota ? deadline : 0) - Date.parse(t.at))
   }
   // notLimited waits too: what changed since the harvest is for the next harvest to read.
