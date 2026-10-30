@@ -8603,8 +8603,8 @@ test('a rejudge the user asked for hands an answered comment to the caller until
   const quiet = { findings: [], replies: [], bots: 'reviewed' }
   const reason = 'the rewrite dropped dma_drain(), which our reply cites'
   const asked = await run({ reviews: quiet, preflight: at, args: { ...LONG, state: first.result.state, rejudge: [{ commentId: 1, reason }] } })
-  assert.deepEqual(asked.result.handoffs, [{ commentId: 1, why: `the user asked to judge our answer again: ${reason}`, rejudge: { reason } }])
-  assert.notEqual(asked.result.pass, true, 'an answer the user asked to judge again is still owed')
+  assert.deepEqual(asked.result.handoffs, [{ commentId: 1, why: `our answer is to be judged again: ${reason}`, rejudge: { reason } }])
+  assert.notEqual(asked.result.pass, true, 'an answer to judge again is still owed')
   const rejudged = await run({ reviews: oneValid, preflight: at, args: { ...LONG, state: first.result.state, rejudge: [{ commentId: 1, reason }] } })
   assert.equal(rejudged.result.rollup.rows[0].reply.how, 'handed to the caller', 'a rejudge outranks the fix note already posted')
   assert.equal(asked.calls.some(c => c.label.startsWith('replies#')), false, 'the run never answers it itself')

@@ -170,7 +170,8 @@ class AgentFiles(unittest.TestCase):
                        'never retried blind', 'The grant permits no `--auto`, merge queue, branch deletion, PR body edit, issue close or onward delegation'):
             self.assertIn(phrase, merging)
         takeover = body.split('Reply takeover rule:')[1].split('Exception for a headless PR review launch:')[0]
-        for phrase in ('the reply obligations a launch returns in `handoffs`', 'editing only a reply this task\'s recorded attempt posted',
+        for phrase in ('the reply obligations a launch returns in `handoffs`', 'editing a reply of ours on that comment through `reply.py --edit`, whichever task posted it',
+                       'never left for the user to accept or authorize',
                        'It permits no delete, no reply to another comment, no review and no SonarCloud action by its units, and a dry run withholds it',
                        'add `sonar: { how, note }`, `how` `fixNote` when any point was fixed, else `refutation`, and `note` the exact reply body',
                        'Answer only when every point the comment raises as it stands now is fixed on the PR branch, refuted with evidence or deferred',
