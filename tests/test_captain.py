@@ -265,6 +265,11 @@ def ran(code=0, body=None, kind=None, msg=''):
 class HcTest(unittest.TestCase):
     """captain's use of lib/hc.py: a hung or missing hc fails like any hc error instead of holding the ledger lock."""
 
+    def setUp(self):
+        patcher = mock.patch.object(captain.hc, 'program', return_value='hc')   # Windows CI has no hc.exe on PATH
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def hangs(self, *args, timeout=None, **kw):
         raise subprocess.TimeoutExpired(args[0], timeout)
 
@@ -329,6 +334,7 @@ class SubmitTest(unittest.TestCase):
     def test_the_text_is_sent_as_the_captain_not_the_inherited_caller(self):
         answer = mock.Mock(returncode=0, stdout='{"started": true}', stderr='')
         with mock.patch.object(subprocess, 'run', return_value=answer) as run, \
+             mock.patch.object(captain.hc, 'program', return_value='hc'), \
              mock.patch.dict(os.environ, {'HC_TERMINAL_ID': 't9'}):
             self.assertEqual(captain.submit('t2', 'STATUS REQUEST m-1', 'idle', 't1'), ('delivered', ''))
         self.assertEqual(run.call_args.kwargs['env']['HC_TERMINAL_ID'], 't1')
