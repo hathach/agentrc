@@ -166,8 +166,8 @@ class Remove(Rig):
     def test_a_terminal_arriving_during_the_last_content_check_refuses_the_worktree(self):
         check = wr.wc.content_check
 
-        def then_moved_in(child):
-            result = check(child)
+        def then_moved_in(child, *spared):
+            result = check(child, *spared)
             hc_inventory(self.hc, [{'address': 't5', 'cwd': str(self.parent)}])
             return result
 
@@ -661,3 +661,203 @@ class Remove(Rig):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class FakeHc:
+    """hc for the handoff: terminals by address, each {address, cwd, pid, created_ms} backed by a real sleeping
+    process; `hc run` starts the worker in a thread unless start is False; `hc kill` ends a terminal's process."""
+
+    def __init__(self, test, cwds, start=True):
+        self.test, self.start, self.calls, self.threads, self.procs = test, start, [], [], {}
+        self.terminals = {}
+        for address, cwd in cwds.items():
+            proc = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], cwd=cwd)
+            test.addCleanup(proc.wait)
+            test.addCleanup(proc.kill)
+            self.procs[address] = proc
+            self.terminals[address] = dict(address=address, cwd=str(cwd), state='live', pid=proc.pid, created_ms=1)
+        self.real_run = wr.wc.run
+
+    def json(self, hc, *args):
+        if args[0] == 'ls':
+            return {'terminals': [{k: t[k] for k in ('address', 'cwd', 'state')} for t in self.terminals.values()]}
+        t = self.terminals.get(args[1])
+        return dict(t, foreground=None) if t else None
+
+    def run(self, argv, cwd=None, input=None, timeout=None):
+        if argv[0] != wr.wc.hc_path():
+            return self.real_run(argv, cwd=cwd, input=input, timeout=timeout)
+        self.calls.append(argv[1:])
+        if argv[1] == 'run' and self.start:
+            name, worker = argv[argv.index('--name') + 1], argv[argv.index('--') + 1:]
+            self.terminals[name] = dict(address=name, cwd=argv[argv.index('--cwd') + 1], state='live', pid=1, created_ms=1)
+
+            def work():
+                try:
+                    wr.worker(worker[-1])
+                finally:
+                    self.terminals.pop(name, None)  # --rm
+            thread = __import__('threading').Thread(target=work)
+            thread.start()
+            self.threads.append(thread)
+        elif argv[1] == 'kill' and argv[2] in self.procs:
+            self.procs[argv[2]].kill()
+            self.procs[argv[2]].wait()
+            self.terminals[argv[2]]['state'] = 'finished'
+        return subprocess.CompletedProcess(argv, 0, '', '')
+
+    def join(self):
+        for thread in self.threads:
+            thread.join(30)
+
+    def killed(self):
+        return [c[1] for c in self.calls if c[0] == 'kill']
+
+
+@linux
+class Handoff(Rig):
+    """From an hc terminal, the terminals in the worktree and its siblings close and a worker removes it."""
+
+    def setUp(self):
+        super().setUp()
+        self.sib = self.sibling('b')
+        for name, value in (('READY_S', 5), ('ACK_S', 0.3), ('END_S', 5)):
+            patch = mock.patch.object(wr, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def fake(self, start=True, own=True):
+        hc = FakeHc(self, {'t5': self.parent, 't7': self.sib}, start)
+        for target, attr in ((wr.wc, 'hc_json'), (wr.wc, 'run')):
+            patch = mock.patch.object(target, attr, getattr(hc, 'json' if attr == 'hc_json' else 'run'))
+            patch.start()
+            self.addCleanup(patch.stop)
+        mine = hc.terminals['t5'] if own else None
+        patch = mock.patch.object(wr, 'caller_terminal', lambda _: mine)
+        patch.start()
+        self.addCleanup(patch.stop)
+        return hc
+
+    def admission(self):
+        return wr.admission_of(self.parent)
+
+    def test_the_dry_run_lists_the_terminals_it_closes_and_binds_other_sessions(self):
+        hc = self.fake()
+        rc, out = self.run_remove('--dry-run')
+        self.assertEqual(rc, 4, out)
+        self.assertIn(f"- closes terminal t5 (in no herdr-app space) in {self.parent} (this session's own)", out)
+        t7 = hc.terminals['t7']
+        self.assertIn(f'closes terminal t7 (in no herdr-app space) in {self.sib}: pid {t7["pid"]}, created 1', out)
+        self.assertNotIn(f'closes terminal t5 (in no herdr-app space) in {self.parent}: pid', out)
+        token = self.token(out)
+        t7['created_ms'] = 2  # another program in that terminal: another list to agree to
+        self.assertNotEqual(self.token(self.run_remove('--dry-run')[1]), token)
+        self.assertEqual(hc.killed(), [])
+
+    def test_not_from_hc_the_terminals_refuse_as_before(self):
+        self.fake(own=False)
+        patch = mock.patch.object(wr, 'caller_terminal', lambda _: None)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.assertRefused('herdr-core terminals work there: t5 (in no herdr-app space)')
+
+    def test_the_caller_is_proved_by_its_ancestry_not_by_its_variable(self):
+        got = {'address': 't5', 'state': 'live', 'pid': os.getppid()}
+        with mock.patch.object(wr.wc, 'hc_json', lambda *a: dict(got)), \
+                mock.patch.dict(os.environ, {'HC_TERMINAL_ID': 't5'}):
+            self.assertEqual(wr.caller_terminal('hc')['pid'], os.getppid())
+            got['pid'] = 1 << 22  # no ancestor
+            self.assertIsNone(wr.caller_terminal('hc'))
+        self.assertIsNone(wr.caller_terminal('hc'))  # no variable
+
+    def test_the_handoff_closes_every_terminal_then_removes(self):
+        hc = self.fake()
+        rc, out = self.run_remove('--proceed', self.token(self.run_remove('--dry-run')[1]))
+        hc.join()
+        self.assertEqual(rc, 0, out)
+        self.assertIn('handed off to hc terminal wtrm-', out)
+        self.assertEqual(sorted(hc.killed()), ['t5', 't7'])
+        self.assertFalse(self.parent.exists())
+        self.assertFalse(self.sib.exists())
+        self.assertEqual(list(self.admission().parent.iterdir()), [])
+        launch = next(c for c in hc.calls if c[0] == 'run')
+        self.assertEqual(launch[:5], ['run', '--bg', '--no-parent', '--no-notify', '--rm'])
+        self.assertIn('closing terminal t7', (self.reports / 'log').read_text(encoding='utf-8'))
+
+    def test_a_worker_that_never_starts_closes_nothing_and_admits_again(self):
+        hc = self.fake(start=False)
+        with mock.patch.object(wr, 'READY_S', 0.3):
+            rc, out = self.run_remove('--proceed', self.token(self.run_remove('--dry-run')[1]))
+        self.assertEqual(rc, 3, out)
+        self.assertIn('did not answer', out)
+        self.assertEqual(hc.killed()[-1:], [next(c[c.index('--name') + 1] for c in hc.calls if c[0] == 'run')])
+        self.assertNotIn('t5', hc.killed())
+        self.assertTrue(self.parent.exists())
+        self.assertEqual(list(self.admission().parent.iterdir()), [])
+
+    def prepared(self, op='abc'):
+        """A plan and its admission as a caller leaves them before the worker starts."""
+        base = self.admission().parent
+        base.mkdir(parents=True)
+        files = {k: str(base / f'{op}.{k}') for k in ('plan', 'ready', 'ack')}
+        self.admission().write_text(json.dumps(dict(op=op, root=str(self.parent), worker=f'wtrm-{op}', caller=1)))
+        hc = self.fake()
+        closing = [dict(address=a, name=None, where=None, at=hc.terminals[a]['cwd'], pid=hc.terminals[a]['pid'],
+                        created_ms=1) for a in ('t5', 't7')]
+        Path(files['plan']).write_text(json.dumps(dict(
+            op=op, admission=str(self.admission()), root=str(self.parent), common=sh(self.parent, 'rev-parse', '--git-common-dir'),
+            head=list(wr.wc.head_branch(self.parent)), force=False, closing=closing, hc=wr.wc.hc_path(),
+            log=str(wr.wc.LOG), report='r', **files)))
+        return hc, files
+
+    def test_a_caller_gone_before_its_answer_leaves_everything_running(self):
+        hc, files = self.prepared()
+        self.assertEqual(wr.worker(files['plan']), 3)
+        self.assertEqual(hc.killed(), [])
+        self.assertTrue(self.parent.exists())
+        self.assertFalse(self.admission().exists())
+        self.assertIn('the handoff was lapsed; closed nothing', (self.reports / 'log').read_text(encoding='utf-8'))
+
+    def test_a_terminal_running_another_program_than_planned_stops_the_worker(self):
+        hc, files = self.prepared()
+        Path(files['ack']).write_text('go')
+        hc.terminals['t7']['created_ms'] = 2
+        self.assertEqual(wr.worker(files['plan']), 3)
+        self.assertEqual(hc.killed(), [])
+        self.assertTrue(self.parent.exists())
+        self.assertIn('another program runs in t7', (self.reports / 'log').read_text(encoding='utf-8'))
+
+    def test_a_second_removal_of_the_same_tree_is_refused_however_spelled(self):
+        hc = self.fake()
+        token = self.token(self.run_remove('--dry-run')[1])
+        self.admission().parent.mkdir(parents=True)
+        self.admission().write_text(json.dumps(dict(op='other', root=str(self.parent), worker='wtrm-other',
+                                                    caller=os.getpid())))
+        hc.terminals['wtrm-other'] = dict(address='wtrm-other', cwd=str(self.t), state='live', pid=1, created_ms=1)
+        rc, out = self.run_remove('--proceed', token)
+        self.assertEqual(rc, 3, out)
+        self.assertIn('another removal of', out)
+        alias = self.t / 'alias'
+        alias.symlink_to(self.wt)
+        with mock.patch.object(self, 'parent', alias / 'parent'):
+            rc, out = self.run_remove('--proceed', token)
+        self.assertEqual(rc, 3, out)
+        self.assertIn('runs (op other, worker terminal wtrm-other)', out)
+        self.assertEqual(hc.killed(), [])
+
+    def test_a_dead_workers_admission_is_released_only_once_its_caller_is_gone_too(self):
+        hc = self.fake()
+        token = self.token(self.run_remove('--dry-run')[1])
+        self.admission().parent.mkdir(parents=True)
+        record = dict(op='dead', root=str(self.parent), worker='wtrm-dead', caller=os.getpid())
+        self.admission().write_text(json.dumps(record))
+        rc, out = self.run_remove('--proceed', token)  # its caller still runs: it may yet launch
+        self.assertEqual(rc, 3, out)
+        gone = subprocess.Popen([sys.executable, '-c', '0'])
+        gone.wait()
+        self.admission().write_text(json.dumps(dict(record, caller=gone.pid)))
+        rc, out = self.run_remove('--proceed', token)
+        hc.join()
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(self.parent.exists())
+        self.assertIn('released the stale admission of op dead', (self.reports / 'log').read_text(encoding='utf-8'))

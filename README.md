@@ -211,7 +211,7 @@ Agent collaboration and PRs:
 | [`pr-review`](skills/pr-review/SKILL.md) | review someone else's PR in one request, such as `/pr-review N auto-post boards: <ids>`: pin it, run the pr-review workflow on the boards named (none by default), leave a pending review for you to submit (or submit it under auto-post); re-review after a push | `prepare.py --pr N` |
 | [`ci-rerun`](skills/ci-rerun/SKILL.md) | read a failed CircleCI job's or Read the Docs build's log, rerun it once after an infra failure | `circleci.py log <job>`, `rerun <job>...`, `rtd.py log <url>` |
 | [`headless-chief`](skills/headless-chief/SKILL.md) | launch a headless `chief` and follow its status lines while it runs, its report when it exits | `chief_run.py --out <dir> --worktree <wt> --task-file <task>` |
-| [`worktree-remove`](skills/worktree-remove/SKILL.md) | remove a worktree when its task is done, run from outside it: check it, gate on pending follow-ups and PR state, then git removes it and `scripts/worktree_children.py` its clean `<name>--*` siblings and its branches whose commits are on their remote or a PR head | `worktree_remove.py [PATH] --dry-run [--pending <item>]`, `--proceed <token>` |
+| [`worktree-remove`](skills/worktree-remove/SKILL.md) | remove a worktree when its task is done, run from outside it: check it, gate on pending follow-ups and PR state, close the hc terminals working in it when run from one, then git removes it and `scripts/worktree_children.py` its clean `<name>--*` siblings and its branches whose commits are on their remote or a PR head | `worktree_remove.py [PATH] --dry-run [--pending <item>]`, `--proceed <token>` |
 
 Hardware documentation, from the Calibre library at `~/Documents/calibre-library`
 (`CALIBRE_LIBRARY` overrides):

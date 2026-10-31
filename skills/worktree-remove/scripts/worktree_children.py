@@ -362,7 +362,8 @@ def absolute(path):
 
 
 def terminals_in(trees):
-    """{tree: [terminal]} of the trees a live local herdr-core terminal works in: its program's working directory,
+    """{tree: [terminal]} of the trees a live local herdr-core terminal works in, each {address, name, where, at}
+    (`label` words it): its program's working directory,
     as `hc ls` or else `hc get` gives it, or its foreground process's, a terminal in no herdr-app space included.
     hc's own terminals only; with no hc installed nothing is checked; Keep for an inventory hc cannot give whole.
     `hc ls` starts a core when none runs (so does `hc server status`): one that does lists nothing."""
@@ -394,13 +395,17 @@ def terminals_in(trees):
         for tree in trees:
             where = next((d for d in cwds if is_within(d, [tree])), None)
             if where:
-                name = f'{addr} {t["name"]}' if t.get('name') else addr
-                busy.setdefault(tree, []).append(f'{name} ({t.get("where") or "in no herdr-app space"}) in {where}')
+                busy.setdefault(tree, []).append(dict(address=addr, name=t.get('name'), where=t.get('where'), at=where))
     return busy
 
 
+def label(t):
+    name = f'{t["address"]} {t["name"]}' if t.get('name') else t['address']
+    return f'{name} ({t.get("where") or "in no herdr-app space"}) in {t["at"]}'
+
+
 def busy_with(terminals):
-    return f'herdr-core terminals work there: {"; ".join(terminals)}; close them, then retry'
+    return f'herdr-core terminals work there: {"; ".join(map(label, terminals))}; close them, then retry'
 
 
 PROC = Path('/proc')
@@ -411,23 +416,48 @@ def lists_processes():
     return (PROC / 'self' / 'cwd').exists()
 
 
-def processes_in(tree):
-    """[(pid, name)] of the processes working in tree whose /proc cwd entry is readable; none without /proc."""
+def parent_pid(pid):
+    """pid's parent from /proc (Linux); OSError or ValueError when it is gone."""
+    stat = (PROC / str(pid) / 'stat').read_bytes()
+    return int(stat.rsplit(b')', 1)[1].split()[1])  # after the parenthesised comm, which may hold anything
+
+
+def descendants(pids):
+    """pids and every process below them (/proc, Linux)."""
+    children = {}
+    for entry in PROC.iterdir():
+        try:
+            if entry.name.isdigit():
+                children.setdefault(parent_pid(entry.name), []).append(int(entry.name))
+        except (OSError, IndexError, ValueError):  # gone since the listing
+            continue
+    found, todo = set(), list(pids)
+    while todo:
+        pid = todo.pop()
+        if pid not in found:
+            found.add(pid)
+            todo += children.get(pid, [])
+    return found
+
+
+def processes_in(tree, spared=frozenset()):
+    """[(pid, name)] of the processes working in tree whose /proc cwd entry is readable, but the spared pids;
+    none without /proc."""
     if not lists_processes():
         return []
     found = []
     for entry in PROC.iterdir():
         try:
-            if entry.name.isdigit() and is_within(os.readlink(entry / 'cwd'), [tree]):
+            if entry.name.isdigit() and int(entry.name) not in spared and is_within(os.readlink(entry / 'cwd'), [tree]):
                 found.append((int(entry.name), (entry / 'comm').read_bytes().decode(errors='backslashreplace').strip()))
         except OSError:  # gone since the listing, or another user's
             continue
     return sorted(found)
 
 
-def check_processes(tree):
-    """Keep a tree a process works in: removing it takes the process's working directory."""
-    found = processes_in(tree)
+def check_processes(tree, spared=frozenset()):
+    """Keep a tree a process but the spared works in: removing it takes the process's working directory."""
+    found = processes_in(tree, spared)
     if found:
         raise Keep('a process works in it: ' + ', '.join(f'{name} (pid {pid})' for pid, name in found))
 
@@ -439,13 +469,13 @@ def check_terminals(*trees):
         raise Keep(busy_with([t for terminals in busy.values() for t in terminals]))
 
 
-def content_check(child):
+def content_check(child, spared=frozenset()):
     """Raise Keep when removing the linked worktree child could lose anything but ignored files and
-    reflog-only commits, or would cut off a running agent; returns the common git dir to remove it
-    with and whether that needs --force. Terminals working in it are terminals_in's."""
+    reflog-only commits, or would cut off a running agent or a process but the spared pids; returns the common
+    git dir to remove it with and whether that needs --force. Terminals working in it are terminals_in's."""
     gitdir, common = linked_worktree(child)
     check_agents(child, gitdir)
-    check_processes(child)
+    check_processes(child, spared)
     if (gitdir / 'locked').exists():
         raise Keep('locked')
     subs = submodules(child)
@@ -741,7 +771,7 @@ def retry(parent, branches):
                        *[a for b in branches for a in ('--branch', *map(str, b))]])
 
 
-def plan_children(found, busy, scan=None, stop=lambda: False):
+def plan_children(found, busy, scan=None, stop=lambda: False, spared=frozenset()):
     """(removal order, {child: content_check result}, {child: why it stays}) for the children found: busy ones
     ({child: why}) stay, the rest are checked, and removal_plan orders the clean ones and keeps what stayers hold.
     The order is None when stop() turns true during the checks: a returned parent's children are not ours."""
@@ -753,7 +783,7 @@ def plan_children(found, busy, scan=None, stop=lambda: False):
             kept[child] = busy[child]
             continue
         try:
-            removals[child] = content_check(child)
+            removals[child] = content_check(child, spared)
         except (Keep, OSError) as why:  # an unexpected filesystem error keeps the child too
             kept[child] = str(why)
     if stop():
