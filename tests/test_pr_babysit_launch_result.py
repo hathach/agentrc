@@ -88,16 +88,27 @@ class LaunchResultTest(unittest.TestCase):
 
     def test_the_state_is_kept_outside_the_task_directory_and_loads_after_the_output_is_gone(self):
         """#340: a host reset wipes the Workflow task output; the stateRef names a copy that outlives it."""
-        rc, s = self.run_it(output())
+        config = {'pr': 7, 'repo': 'o/r', 'reviewers': ['coderabbit']}
+        saved = output(result={'state': {'expectedHead': NEXT, 'config': config, 'digest': '0123abcd'}})
+        rc, s = self.run_it(saved)
         kept = Path(s['stateRef']['outputFile'])
         self.assertEqual((rc, kept.parent), (0, self.states))
         self.assertTrue(kept.name.startswith('0123abcd-'))
         self.assertEqual(kept.read_bytes(), (self.dir / 'w.output').read_bytes())
-        pinned = s['pinned']
-        self.assertEqual(self.run_it(output())[1]['stateRef']['outputFile'], kept.as_posix(), 'the same bytes reuse the copy')
+        self.assertEqual(self.run_it(saved)[1]['stateRef']['outputFile'], kept.as_posix(), 'the same bytes reuse the copy')
         rc, after = self.run_it('', '--state-ref', f'{kept.as_posix()}:0123abcd')  # the task output wiped, a launch that threw
-        self.assertEqual((rc, after['stateRef']['outputFile'], after['pinned']), (0, kept.as_posix(), pinned))
+        self.assertEqual((rc, after['stateRef']['outputFile'], after['pinned']), (0, kept.as_posix(), config))
+        done = subprocess.run([sys.executable, str(ROOT / 'skills/pr-babysit/scripts/state_transfer.py'), str(kept)],
+                              capture_output=True, text=True)
+        self.assertEqual((done.returncode, json.loads(done.stdout.splitlines()[-1])['digest']), (0, '0123abcd'), done.stdout)
         self.assertEqual(len(list(self.states.iterdir())), 1, 'no temporary file left behind')
+
+    def test_a_state_digest_that_is_not_8_hex_digits_is_never_a_file_name(self):
+        rc, s = self.run_it(output(result={'stateDigest': '../escaped'}))
+        self.assertEqual((rc, s['stateRef']['outputFile']), (0, (self.dir / 'w.output').resolve().as_posix()))
+        self.assertFalse(self.states.exists())
+        self.assertFalse((self.dir / 'escaped').exists())
+        self.assertTrue(any("'../escaped' is not 8 hex digits" in n for n in s['notes']), s['notes'])
 
     def test_a_state_that_cannot_be_kept_names_the_output_and_says_so(self):
         self.states.parent.mkdir(exist_ok=True)

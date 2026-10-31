@@ -440,6 +440,8 @@ def summarize(output, output_path, state_ref=None, tree=None, keys=False):
 def kept(output_path, digest):
     """A copy of the output at output_path, holding the state of digest, under STATES: its path once read back whole,
     the same name for the same bytes, so a second reading reuses it."""
+    if not (isinstance(digest, str) and re.fullmatch(r'[0-9a-f]{8}', digest)):  # it names the file
+        raise Unusable(f'the state digest {digest!r} is not 8 hex digits')
     raw = Path(output_path).read_bytes()
     path = STATES / f'{digest}-{hashlib.sha256(raw).hexdigest()[:16]}.json'
     if not (path.is_file() and path.read_bytes() == raw):
