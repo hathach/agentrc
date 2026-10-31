@@ -1,7 +1,6 @@
 import importlib.util
 import json
 import os
-import re
 import shlex
 import shutil
 import subprocess
@@ -961,6 +960,7 @@ class WorktreeChildren(unittest.TestCase):
                                   cwd=child, stdout=subprocess.PIPE)
         self.addCleanup(holder.wait)
         self.addCleanup(holder.kill)
+        self.addCleanup(holder.stdout.close)
         holder.stdout.readline()
         done = self.cleanup()
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
