@@ -540,6 +540,14 @@ const REVIEWS = {
     rateLimit: { ...RATE_LIMIT, required: [...RATE_LIMIT.required, 'error'], properties: { ...RATE_LIMIT.properties, error: { type: 'string' } } },
   },
 }
+// harvest.py --probe: a reading's head, bots and fingerprint, no comments; what a quota wait compares (#359).
+const PROBE = withSeal({
+  type: 'object', additionalProperties: false, required: ['headSha', 'observedAt', 'fingerprint', 'bots'],
+  properties: {
+    error: { type: 'string' }, rateLimit: REVIEWS.properties.rateLimit,
+    headSha: { type: 'string' }, observedAt: { type: 'string' }, fingerprint: { type: 'string' }, bots: REVIEWS.properties.bots,
+  },
+})
 // code-writer's output contract verbatim: a schema missing a key the role returns rejects a conformant reply.
 const DEV = {
   type: 'object', additionalProperties: false,
@@ -2561,6 +2569,28 @@ const runCycle = async (cycle, entry) => {
   return verdict
 }
 
+// #359: after a cycle that only waited out CodeRabbit's rate limit, a probe of harvest.py stands in for the validator
+// while CodeRabbit stays limited and the review evidence (harvest.py's fingerprint) is unchanged on the same head: the
+// validator would read the same comments. Its last report, as it returned it, goes on with the probe's bots and time.
+let lastRead = null
+let quotaRead = null
+const probeReviews = async (cycle) => {
+  const p = await relayRun(
+    `${IN_CHECKOUT}Editing nothing, run exactly \`${PY} ${HARVEST_SCRIPT} --pr ${args.pr} --repo ${shq(repo)} --reviewers ${reviewers.join(',')}` +
+    `${waitedOn.length ? ` --auto-run ${waitedOn.join(',')}` : ''} --probe\` ` + relayed(PROBE),
+    { label: `reviews:probe#${cycle}`, phase: 'Triage', model: 'haiku', effort: 'low', schema: PROBE },
+  )
+  const last = JSON.parse(quotaRead.json)
+  const cr = p && !p.error && p.bots.find(b => b.bot === 'coderabbit')
+  const why = !p ? 'the probe died' : p.error ? p.error : p.headSha !== expectedHead ? 'the head moved'
+    : p.fingerprint !== last.fingerprint ? 'the review evidence changed' : !cr || !limited(cr) ? 'CodeRabbit is no longer rate-limited' : null
+  if (why) {
+    log(`cycle ${cycle}: probe — ${why}; validating in full`)
+    return null
+  }
+  log(`cycle ${cycle}: probe — CodeRabbit still rate-limited and nothing new on the head; the validator's last report stands`)
+  return { ...last, observedAt: p.observedAt, bots: p.bots }
+}
 const runLanes = async (cycle, entry, lanes) => {
   let ciPromise = null
   const ended = (what) => prGate(lanes, `${cycle}-${what}`)
@@ -2585,11 +2615,13 @@ const runLanes = async (cycle, entry, lanes) => {
         ? 'Our fix notes on these comments are not yet posted; for a stale finding on one, set fixedBy to its sha when that commit\'s change is what fixed the finding: ' +
           `${JSON.stringify(unpostedNotes().map(([commentId, d]) => ({ commentId, sha: d.attempt.repair.sha })))}. ` : '')
     const nobody = { findings: [], replies: [], bots: [] }
+    const probed = reviewLane && reviewers.length > 0 && quotaRead && quotaRead.head === expectedHead ? await probeReviews(cycle) : null
     const r = !reviewLane || reviewers.length === 0
       ? nobody
-      : await agent(reviewPrompt, {
+      : probed || await agent(reviewPrompt, {
         label: `reviews#${cycle}`, phase: 'Triage', agentType: 'pr-review-validator', schema: REVIEWS,
       }).catch(quiet(`cycle ${cycle}: review validator`))
+    lastRead = r && r !== nobody && !r.rateLimit && !r.harvestError ? { head: expectedHead, json: JSON.stringify(r) } : null
     if (lanes.prState) return prEnded(cycle, lanes.prState)
     if (!r) {
       entry.error = 'pr-review-validator died'
@@ -3469,6 +3501,7 @@ for (let cycle = firstCycle; cyclesUsed < maxCycles; cycle++) {
   }
   // Quota-only waits and a GitHub refusal before any work consume an id, but no repair budget.
   const uncharged = verdict ? verdict.reason === 'github-rate-limited' && !worked(entry) : quotaWait(entry, before)
+  quotaRead = !verdict && uncharged && lastRead && lastRead.head === expectedHead ? lastRead : null
   if (!uncharged) cyclesUsed++
   if (verdict) return finish(verdict)
   const change = yieldOnChange && cyclesUsed < maxCycles ? changeOf(entry, before) : null

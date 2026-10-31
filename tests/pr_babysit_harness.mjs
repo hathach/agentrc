@@ -215,6 +215,42 @@ async function run(opts = {}) {
   const replied = new Set() // comments a reply.py run posted to, which a rerun finds there (rerunReuses)
   const commitReceipts = new Map() // commits.py --receipt path -> the line it saved, with its bindings
 
+  // One harvest per cycle, whichever of the validator and the probe (#359) asks for it first.
+  const readings = new Map()
+  const reading = (cycle, prompt) => {
+    if (!readings.has(cycle)) readings.set(cycle, harvestOf(prompt))
+    return readings.get(cycle).then(r => structuredClone(r))
+  }
+  const harvestOf = async (prompt) => {
+    if (reviews instanceof Error) throw reviews
+    // opts.reviewsWait(calls): hold the validator's answer, as afterReviewLane holds the CI evidence.
+    if (opts.reviewsWait) await opts.reviewsWait(calls)
+    const r = structuredClone(opts.reviewsPerCycle ? opts.reviewsPerCycle(prompt) : reviews)
+    // A finding that relates to no earlier verdict and names no repair of ours, unless a case says it does.
+    if (Array.isArray(r.findings)) r.findings = r.findings.map(f => ({ related: null, changeReason: null, fixedBy: null, ...f }))
+    // `bots: 'reviewed'` / `'pending'` name every auto-running bot in that
+    // state; explicit records are filled the same way, one field at a time.
+    // The auto-running bots are the ones the harvest command names.
+    // Every other reviewer gets the harvested record harvest.py gives it, unless the case lists its records whole.
+    const [named, autoRun] = harvestFlags(prompt)
+    const bots = r.bots === 'reviewed' || r.bots === undefined ? autoRun.map(b => bot(b))
+      : r.bots === 'pending' ? autoRun.map(b => bot(b, { state: 'absent', sha: null, evidence: [], reason: 'nothing on head' }))
+        : r.bots
+    if (!r.botsWhole) {
+      for (const b of named.filter(b => !bots.some(x => x.bot === b) && !autoRun.includes(b))) {
+        bots.push(bot(b, b === 'copilot' ? { state: 'absent', sha: null, evidence: [], reason: 'no Copilot review on the head' }
+          : { state: 'harvested', sha: null, evidence: [], reason: '0 comment(s) harvested' }))
+      }
+    }
+    delete r.botsWhole
+    const observedAt = at((opts.clockOffset ?? 0) + (validatorCalls++) * (opts.minutesPerCycle ?? (opts.napClock ? 0 : 1)) +
+      (opts.napClock ? napMs.reduce((sum, ms) => sum + ms, 0) / 60000 : 0))
+    observed = observedAt
+    const read = bots.map(b => ({ ...b, sha: b.sha === 'head' ? head : b.sha }))
+    // Like harvest.py's, over what the bots left and never a time: new or edited findings or a changed bot state change it.
+    const evidence = { findings: r.findings, replies: r.replies, bots: read.map(({ bot, state, kind, sha, evidence }) => ({ bot, state, kind, sha, evidence })) }
+    return { headSha: head, observedAt, headEventAt: null, headEventEvidence: 'stub', fingerprint: `stub|${fnv1a(canonical(evidence))}`, ...r, bots: read }
+  }
   const agent = async (prompt, options) => {
     const label = options.label
     calls.push({
@@ -347,35 +383,13 @@ async function run(opts = {}) {
       const judged = { checks: links.map(link => ({ link, failures: [failures[failed.findIndex(c => c.link === link)]] })), infraRerun: ci.infraRerun }
       return conforms(options.schema, opts.judge ? opts.judge(judged) : judged, label)
     }
-    if (label.startsWith('reviews#')) {
-      if (reviews instanceof Error) throw reviews
-      // opts.reviewsWait(calls): hold the validator's answer, as afterReviewLane holds the CI evidence.
-      if (opts.reviewsWait) await opts.reviewsWait(calls)
-      const r = structuredClone(opts.reviewsPerCycle ? opts.reviewsPerCycle(prompt) : reviews)
-      // A finding that relates to no earlier verdict and names no repair of ours, unless a case says it does.
-      if (Array.isArray(r.findings)) r.findings = r.findings.map(f => ({ related: null, changeReason: null, fixedBy: null, ...f }))
-      // `bots: 'reviewed'` / `'pending'` name every auto-running bot in that
-      // state; explicit records are filled the same way, one field at a time.
-      // The auto-running bots are the ones the harvest command names.
-      // Every other reviewer gets the harvested record harvest.py gives it, unless the case lists its records whole.
-      const [named, autoRun] = harvestFlags(prompt)
-      const bots = r.bots === 'reviewed' || r.bots === undefined ? autoRun.map(b => bot(b))
-        : r.bots === 'pending' ? autoRun.map(b => bot(b, { state: 'absent', sha: null, evidence: [], reason: 'nothing on head' }))
-          : r.bots
-      if (!r.botsWhole) {
-        for (const b of named.filter(b => !bots.some(x => x.bot === b) && !autoRun.includes(b))) {
-          bots.push(bot(b, b === 'copilot' ? { state: 'absent', sha: null, evidence: [], reason: 'no Copilot review on the head' }
-            : { state: 'harvested', sha: null, evidence: [], reason: '0 comment(s) harvested' }))
-        }
-      }
-      delete r.botsWhole
-      const observedAt = at((opts.clockOffset ?? 0) + (validatorCalls++) * (opts.minutesPerCycle ?? (opts.napClock ? 0 : 1)) +
-        (opts.napClock ? napMs.reduce((sum, ms) => sum + ms, 0) / 60000 : 0))
-      observed = observedAt
-      return {
-        headSha: head, observedAt, headEventAt: null, headEventEvidence: 'stub', fingerprint: 'stub', ...r,
-        bots: bots.map(b => ({ ...b, sha: b.sha === 'head' ? head : b.sha })),
-      }
+    if (label.startsWith('reviews#')) return reading(cycleOf(label), prompt)
+    // harvest.py --probe: this cycle's reading without its comments, sealed; opts.probe patches it, null a dead relay.
+    if (label.startsWith('reviews:probe#')) {
+      const r = await reading(cycleOf(label), prompt)
+      if (opts.probe === null) return null
+      const line = { headSha: r.headSha, observedAt: r.observedAt, fingerprint: r.fingerprint, bots: r.bots, ...(opts.probe || {}) }
+      return conforms(options.schema, sealLine(line), label)
     }
     if (label === 'scope:check') {
       // scope_check.py's receipt over the paths the prompt asked it for; opts.lsFiles keeps those it accepts.
@@ -7447,6 +7461,32 @@ test('a rate-limited CodeRabbit waits past maxCycles for its reset and then its 
   assert.deepEqual(result.state.reviewClock, { sha: HEAD, eventAt: null, since: at(0), limitSeen: at(0), requests: 1,
     request: { at: at(21), retryAt: at(20), tried: at(21) } })
   assert.deepEqual(result.observation.launchActions[1].botAsks, [{ bot: 'coderabbit', kind: 'request', outcome: 'requested', commentId: 99, at: at(21), sha: HEAD }])
+})
+
+test('a quota wait probes harvest.py instead of validating until CodeRabbit leaves its limit or the evidence changes (#359)', async () => {
+  const validated = (labels) => labels.filter(l => l.startsWith('reviews#'))
+  const probes = (labels) => labels.filter(l => l.startsWith('reviews:probe#'))
+  let n = 0
+  const waited = await run({ args: { coderabbitTrigger: true, maxCycles: 1 }, napClock: true,
+    reviewsPerCycle: () => quiet([++n < 3 ? limitedCr(at(20)) : bot('coderabbit')]) })
+  assert.equal(waited.result.pass, true, waited.result.reason)
+  assert.deepEqual([validated(waited.labels), probes(waited.labels)], [['reviews#1', 'reviews#3'], ['reviews:probe#2', 'reviews:probe#3']])
+  assert.ok(waited.logs.some(l => /cycle 2: probe — CodeRabbit still rate-limited and nothing new on the head/.test(l)), waited.logs.join('\n'))
+  assert.ok(waited.logs.some(l => /cycle 3: probe — .*; validating in full/.test(l)), "its review is evidence too")
+  assert.match(waited.calls.find(c => c.label === 'reviews:probe#2').prompt, /harvest\.py --pr 3888 .* --auto-run coderabbit --probe`/)
+  assert.deepEqual(requests(waited.labels), ['crrequest#2'], 'the request window is kept')
+  // A review landing mid-wait changes the evidence: validated at once, the finding seen.
+  n = 0
+  const landed = await run({ args: { coderabbitTrigger: true, maxCycles: 2 }, napClock: true,
+    reviewsPerCycle: () => ++n === 1 ? quiet([limitedCr(at(20))]) : { findings: [finding()], replies: [], bots: [limitedCr(at(20))] } })
+  assert.deepEqual(validated(landed.labels).slice(0, 2), ['reviews#1', 'reviews#2'])
+  assert.ok(landed.logs.some(l => /cycle 2: probe — the review evidence changed; validating in full/.test(l)), landed.logs.join('\n'))
+  // A dead probe is no reading: the validator runs.
+  n = 0
+  const dead = await run({ args: { coderabbitTrigger: true, maxCycles: 1 }, napClock: true, probe: null,
+    reviewsPerCycle: () => quiet([++n < 3 ? limitedCr(at(20)) : bot('coderabbit')]) })
+  assert.equal(dead.result.pass, true, dead.result.reason)
+  assert.deepEqual(validated(dead.labels), ['reviews#1', 'reviews#2', 'reviews#3'])
 })
 
 test('two lost hourly races on an unchanged limit are followed by another request and a review', async () => {
