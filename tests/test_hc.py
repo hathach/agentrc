@@ -20,13 +20,12 @@ def setUpModule():
 
 
 # A Python `hc` answering every call with the scenario in HC_STUB: stdout, stderr (JSON when not a string), exit
-# status, and a delay, overridden per call by its `by` entry for 'ls' or 'get:t5'; it logs its argv.
+# status and a delay; it logs its argv.
 STUB = r'''
 import json, os, sys, time
 with open(os.environ['HC_STUB'], encoding='utf-8') as f:
     st = json.load(f)
 argv = sys.argv[1:]
-st = {**st, **st.get('by', {}).get(argv[0] + (':' + argv[argv.index('--') + 1] if '--' in argv else ''), {})}
 with open(st['log'], 'a', encoding='utf-8') as f:
     f.write(json.dumps({'argv': argv, 'id': os.environ.get('HC_TERMINAL_ID'),
                         'socket': os.environ.get('HC_TERMINAL_SOCKET')}) + '\n')
@@ -138,18 +137,6 @@ class SendTest(StubbedHc):
                 self.answer(**scenario)
                 self.assertEqual(hc.send('t7', 'text', timeout=0.5 if 'sleep' in scenario else 5)[0], outcome)
 
-    def test_a_target_already_working_cannot_show_a_new_start(self):
-        for out, outcome in (({'started': False, 'status': 'working', 'turn': 4}, hc.SENT),
-                             ({'started': None, 'turn': 4}, hc.SENT),
-                             ({'started': False, 'status': 'idle', 'turn': 4}, hc.UNCERTAIN),  # it had stopped
-                             ('garbled', hc.UNCERTAIN)):
-            with self.subTest(out):
-                self.answer(out=out)
-                self.assertEqual(hc.send('t7', 'x', timeout=5, was_working=True)[0], outcome)
-                self.assertEqual(hc.send('t7', 'x', timeout=5)[0], hc.UNCERTAIN)
-        self.answer(rc=10, err=err('status_mismatch'))
-        self.assertEqual(hc.send('t7', 'x', timeout=5, was_working=True)[0], hc.NOT_TYPED_OUTCOME)
-
     def test_caller_is_passed_as_hc_terminal_id_and_the_rest_of_the_environment_kept(self):
         """hc tags what it pastes into an agent by the sender's HC_TERMINAL_ID; a shell that dropped it sends
         untagged, as a person would."""
@@ -239,86 +226,6 @@ class ProcessTest(unittest.TestCase):
     def test_ancestors_run_up_from_this_process(self):
         chain = hc.ancestors(os.getpid())
         self.assertEqual(chain[:2], [os.getpid(), os.getppid()])
-
-    def test_foreground(self):
-        live = {'state': 'live', 'foreground': {'pid': os.getpid(), 'cwd': '/w'}}
-        self.assertEqual(hc.foreground(live)['pid'], os.getpid())
-        self.assertEqual(hc.foreground(live)['cwd'], '/w')
-        for info in (None, {**live, 'state': 'finished'}, {'state': 'live', 'foreground': None},
-                     {'state': 'live', 'foreground': {'pid': 'x'}}):
-            self.assertIsNone(hc.foreground(info))
-
-
-class OwnTerminalTest(StubbedHc):
-    def record(self, pid):
-        return {'address': 't5', 'state': 'live', 'foreground': {'pid': pid, 'cwd': '/w'}}
-
-    def stranger(self):
-        child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
-        self.addCleanup(child.wait)
-        self.addCleanup(child.kill)
-        return child.pid
-
-    def terminal(self, address, pid, state='live'):
-        return {'out': {'address': address, 'state': state, 'foreground': {'pid': pid, 'cwd': '/w'}}}
-
-    def without_hint(self, *terminals):
-        """own_terminal with HC_TERMINAL_ID unset (or empty) and hc listing terminals, each (address, pid, state)."""
-        by = {'ls': {'out': {'terminals': [{'address': a, 'state': st} for a, _, st in terminals]}}}
-        by.update({f'get:{a}': self.terminal(a, pid, st) for a, pid, st in terminals})
-        self.answer(by=by)
-        with mock.patch.dict('os.environ', {'HC_TERMINAL_ID': ''}):
-            return hc.own_terminal(timeout=5)
-
-    def test_a_remote_hint_is_refused(self):
-        with mock.patch.dict('os.environ', {'HC_TERMINAL_ID': 'ci/t5'}), self.assertRaises(hc.Unverified):
-            hc.own_terminal(timeout=5)
-
-    @unittest.skipUnless(LINUX, 'ancestry is read from /proc')
-    def test_without_the_hint_the_one_terminal_running_this_process_is_found(self):
-        other = self.stranger()
-        address, _, fg = self.without_hint(('t2', other, 'live'), ('t5', os.getppid(), 'live'),
-                                           ('ci/t3', os.getpid(), 'live'), ('t9', os.getpid(), 'finished'))
-        self.assertEqual((address, fg['pid']), ('t5', os.getppid()))
-        looked_up = {a[-1] for a in self.argv() if a[0] == 'get'}
-        self.assertEqual(looked_up, {'t2', 't5'}, 'remote and finished terminals are not looked up')
-
-    @unittest.skipUnless(LINUX, 'ancestry is read from /proc')
-    def test_without_the_hint_none_or_several_is_a_refusal(self):
-        with self.assertRaisesRegex(hc.Unverified, 'no live local hc terminal runs this process'):
-            self.without_hint(('t2', self.stranger(), 'live'))
-        with self.assertRaisesRegex(hc.Unverified, r'2 hc terminals \(t5, t6\) run this process'):
-            self.without_hint(('t5', os.getppid(), 'live'), ('t6', os.getpid(), 'live'))
-
-    def test_off_linux_without_the_hint_is_a_refusal(self):
-        with mock.patch.dict('os.environ'), mock.patch.object(hc.sys, 'platform', 'darwin'):
-            os.environ.pop('HC_TERMINAL_ID', None)
-            with self.assertRaisesRegex(hc.Unverified, 'HC_TERMINAL_ID is unset'):
-                hc.own_terminal(timeout=5)
-        self.assertFalse(self.log.exists(), 'no hc call off Linux without the hint')
-
-    def test_the_hint_is_verified_by_ancestry(self):
-        with mock.patch.dict('os.environ', {'HC_TERMINAL_ID': 't5'}):
-            self.answer(out=self.record(os.getppid()))
-            address, info, fg = hc.own_terminal(timeout=5)
-            self.assertEqual((address, fg['pid']), ('t5', os.getppid()))
-            self.answer(rc=3, err=err('not_found'))
-            with self.assertRaises(hc.Unverified):
-                hc.own_terminal(timeout=5)
-            if not LINUX:
-                return
-            stranger = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
-            self.addCleanup(stranger.wait)
-            self.addCleanup(stranger.kill)
-            self.answer(out=self.record(stranger.pid))
-            with self.assertRaisesRegex(hc.Unverified, 'does not run this one'):
-                hc.own_terminal(timeout=5)
-
-    def test_off_linux_the_hint_is_taken_as_given(self):
-        with mock.patch.dict('os.environ', {'HC_TERMINAL_ID': 't5'}), \
-             mock.patch.object(hc.sys, 'platform', 'darwin'):
-            self.answer(out=self.record(1))
-            self.assertEqual(hc.own_terminal(timeout=5)[0], 't5')
 
 
 if __name__ == '__main__':

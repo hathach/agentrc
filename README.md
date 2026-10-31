@@ -205,7 +205,6 @@ Agent collaboration and PRs:
 | Skill | Use it to | Start with |
 |---|---|---|
 | [`cowork`](skills/cowork/SKILL.md) | hand the other agent (Codex or Claude) a task, question or review headless, in resumed lanes | `cowork.py send --lane L --task -` |
-| [`herdr-peer`](skills/herdr-peer/SKILL.md) | the same with the agent in another hc terminal on this checkout, watched live; needs herdr-core (`HC_TERMINAL_ID`) | `peer.py peers`, `send --to <t> --files none --task -`, `read --from <t> --for <id>`; the peer answers with `reply --for <id> --file <f>` |
 | [`simplify-gate`](skills/simplify-gate/SKILL.md) | switch the per-repository Codex YAGNI check at Stop (below) | `/simplify-gate status\|on\|off` |
 | [`pr-reply`](skills/pr-reply/SKILL.md) | post PR review replies from a manifest, read each back, resolve verified review threads | `reply.py --pr N --manifest f.json` |
 | [`followup-issue`](skills/followup-issue/SKILL.md) | open a follow-up issue, or comment new evidence on one that covers the topic, read it back, never post twice | `publish.py create --repo o/r --allow-repo o/r --title t --body-file f` |
