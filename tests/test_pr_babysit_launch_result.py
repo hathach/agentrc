@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from helpers import git_env, guard_survivors  # noqa: E402
 
@@ -62,6 +63,10 @@ class LaunchResultTest(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.dir = Path(tmp.name)
+        self.states = self.dir / 'states'
+        patch = mock.patch.object(launch_result, 'STATES', self.states)
+        patch.start()
+        self.addCleanup(patch.stop)
 
     def run_it(self, data, *argv):
         path = self.dir / 'w.output'
@@ -81,12 +86,33 @@ class LaunchResultTest(unittest.TestCase):
         (repo / 'left.txt').write_text('x')
         return str(repo)
 
+    def test_the_state_is_kept_outside_the_task_directory_and_loads_after_the_output_is_gone(self):
+        """#340: a host reset wipes the Workflow task output; the stateRef names a copy that outlives it."""
+        rc, s = self.run_it(output())
+        kept = Path(s['stateRef']['outputFile'])
+        self.assertEqual((rc, kept.parent), (0, self.states))
+        self.assertTrue(kept.name.startswith('0123abcd-'))
+        self.assertEqual(kept.read_bytes(), (self.dir / 'w.output').read_bytes())
+        pinned = s['pinned']
+        self.assertEqual(self.run_it(output())[1]['stateRef']['outputFile'], kept.as_posix(), 'the same bytes reuse the copy')
+        rc, after = self.run_it('', '--state-ref', f'{kept.as_posix()}:0123abcd')  # the task output wiped, a launch that threw
+        self.assertEqual((rc, after['stateRef']['outputFile'], after['pinned']), (0, kept.as_posix(), pinned))
+        self.assertEqual(len(list(self.states.iterdir())), 1, 'no temporary file left behind')
+
+    def test_a_state_that_cannot_be_kept_names_the_output_and_says_so(self):
+        self.states.parent.mkdir(exist_ok=True)
+        self.states.write_text('a file where the directory goes')
+        rc, s = self.run_it(output())
+        self.assertEqual((rc, s['stateRef']['outputFile']), (0, (self.dir / 'w.output').resolve().as_posix()))
+        self.assertTrue(any(n.startswith('the state is not kept outside the Workflow task directory') for n in s['notes']), s['notes'])
+
     def test_a_launch_is_condensed(self):
         rc, s = self.run_it(output())
         self.assertEqual(rc, 0)
         self.assertEqual(s['result']['status'], 'paused')
         self.assertEqual(s['result']['rollup']['pushed'], [NEXT[:8]])
-        self.assertEqual(s['stateRef'], {'outputFile': (self.dir / 'w.output').resolve().as_posix(), 'digest': '0123abcd'},
+        [kept] = self.states.iterdir()
+        self.assertEqual(s['stateRef'], {'outputFile': kept.as_posix(), 'digest': '0123abcd'},
                          'with slashes: the workflow puts it in a shell command')
         self.assertEqual(s['blockers'], [], 'a push past the reviewed head is not a disagreement')
         self.assertEqual((s['observation']['fingerprint'], s['observation']['bots'][0]['sha']), (f'coderabbit|coderabbit|{"f" * 32}', HEAD),
