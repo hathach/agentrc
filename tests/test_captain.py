@@ -1491,6 +1491,33 @@ class AcceptTest(RelayCase):
             self.as_target(captain.accept, self.action)
         self.assertNotIn('accepted', [r['type'] for r in captain.records()])
 
+    def test_a_replacement_in_the_target_terminal_records_its_refusal_once(self):
+        with self.assertRaises(SystemExit):
+            self.as_target(captain.accept, self.action, address='t3')
+        self.assertEqual(self.count('refused'), 0)
+        self.terminals['t2'] = {**pinned('t2'), 'started': 99}
+        with mock.patch('builtins.print') as out, self.assertRaises(SystemExit) as e:
+            self.as_target(captain.accept, self.action)
+        self.assertEqual(e.exception.code, 2)
+        self.assertNotIn('merge o/r#12', str(out.call_args_list))
+        [rec] = [r for r in captain.records() if r['type'] == 'refused']
+        self.assertEqual(rec['by'], captain.identity(captain.find('t2')))
+        self.assertNotIn(self.action, captain.open_items(captain.records()))
+        with self.assertRaises(SystemExit):
+            self.as_target(captain.accept, self.action)
+        self.assertEqual(self.count('refused'), 1)
+        with mock.patch('builtins.print') as out:
+            self.assertEqual(captain.collect([self.action], 0), 0)
+        self.assertTrue(out.call_args_list[-1].args[0].startswith(
+            f'refused by the session that replaced its target {self.action}'))
+
+    def test_no_refusal_once_accepted(self):
+        self.as_target(captain.accept, self.action)
+        self.terminals['t2'] = {**pinned('t2'), 'started': 99}
+        with self.assertRaises(SystemExit):
+            self.as_target(captain.accept, self.action)
+        self.assertEqual(self.count('refused'), 0)
+
     def test_acceptance_is_durable_before_the_message_prints(self):
         self.me = 't2'
         with mock.patch('builtins.print', side_effect=BrokenPipeError), self.assertRaises(BrokenPipeError):

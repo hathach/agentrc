@@ -113,8 +113,8 @@ opened or replaced in a target terminal since refuses, and you preview again.
   `python3 ~/.claude/skills/captain/scripts/captain.py collect <msg>... --wait <ms>` with the ids `ask` and `relay`
   printed and `<ms>` a minute under the timeout: without ids it waits only for what is still open, and misses an
   answer that already landed. A failure shows as the Monitor's exit code. Each line is `reported <msg> · <state>`,
-  with `· needs you` when the report names a need, `accepted`, an outcome, `withdrawn`, `cancelled` or
-  `undelivered`; `pending <msg>...` means the wait lapsed: re-arm, or `cancel` what will not answer.
+  with `· needs you` when the report names a need, `accepted`, an outcome, `withdrawn`, `cancelled`, `undelivered` or
+  `refused by the session that replaced its target`, when another session took the target's terminal before the send; `pending <msg>...` means the wait lapsed: re-arm, or `cancel` what will not answer.
 - **The table** comes from `reports --json <msg>...` with this collection's request ids and those `not asked` named, run
   once `collect` ended or lapsed, never from Monitor lines, which a long line can cut: each id gets the report that
   answered it, even one a later report from that session superseded. If the output itself is abbreviated, run it again

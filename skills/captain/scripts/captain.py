@@ -78,9 +78,9 @@ REPORT = {'task': str, 'prs': list, 'state': str, 'evidence': str, 'chief': str,
 OPTIONAL = {'issues': list}   # a report without it names no issue
 STATES = ('ready', 'in-progress', 'blocked', 'needs-human', 'done', 'idle')
 RECORDS = ('request', 'report', 'cancel', 'delivered', 'undelivered', 'uncertain',
-           'relay', 'accepted', 'outcome', 'withdraw', 'withdraw-requested')
+           'relay', 'accepted', 'outcome', 'withdraw', 'withdraw-requested', 'refused')
 ITEMS = ('request', 'relay')
-CLOSED = ('report', 'cancel', 'undelivered', 'outcome', 'withdraw')
+CLOSED = ('report', 'cancel', 'undelivered', 'outcome', 'withdraw', 'refused')
 RESULTS = ('completed', 'failed', 'rejected', 'needs-clarification')
 REPORT_MAX = 8192
 POLL_S = 2
@@ -682,7 +682,8 @@ def one_line(text):
     return ' '.join(text.split())
 
 
-EVENTS = {'cancel': 'cancelled', 'undelivered': 'undelivered', 'withdraw': 'withdrawn', 'accepted': 'accepted'}
+EVENTS = {'cancel': 'cancelled', 'undelivered': 'undelivered', 'withdraw': 'withdrawn', 'accepted': 'accepted',
+          'refused': 'refused by the session that replaced its target'}
 
 
 def event(item, rec):
@@ -1022,6 +1023,13 @@ def accept(action):
     with locked():
         mine = me()
         recs = records()
+        sent = first(recs, 'relay', action)
+        # hc types by terminal: a session that replaced the target after the send's check gets the prompt, not the text
+        if (sent and sent['target'] != mine and sent['target']['address'] == mine['address'] and action in open_items(recs)
+                and not first(recs, 'accepted', action)):
+            append({'type': 'refused', 'msg': action, 'by': mine})
+            die(f'relay {action} was sent to the session this terminal ran before, not this one: recorded as refused; '
+                'nothing here to act on', 2)
         item = addressed('relay', action, recs, mine)
         current = enrolled()
         if current != item['captain'] or not live(identity(current)):
