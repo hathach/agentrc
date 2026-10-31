@@ -727,6 +727,17 @@ class BriefTest(LedgerCase):
         with self.assertRaises(SystemExit):
             self.brief()
 
+    def test_a_replacement_in_the_target_terminal_closes_the_request_as_refused(self):
+        self.terminals['t2'] = {**pinned('t2'), 'started': 99}
+        with self.assertRaises(SystemExit) as e:
+            self.brief()
+        self.assertEqual((e.exception.code, self.count('refused')), (2, 1))
+        self.assertNotIn(self.msg, captain.open_items(captain.records()))
+        with mock.patch('builtins.print') as out:
+            self.assertEqual(captain.collect([self.msg], 0), 0)
+        self.assertTrue(out.call_args_list[-1].args[0].startswith(
+            f'refused by the session that replaced its target {self.msg}'))
+
     def test_closed_missing_or_stranded_request(self):
         with self.assertRaises(SystemExit):
             self.brief('m-nonesuch')

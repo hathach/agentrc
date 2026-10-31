@@ -631,10 +631,17 @@ def first(recs, kind, msg):
 
 
 def addressed(kind, msg, recs, mine):
-    """The request or relay msg, which must have been sent to mine, the session running this, as pinned then."""
+    """The request or relay msg, which must have been sent to mine, the session running this, as pinned then. Called
+    under the lock: a session that replaced the target in its terminal records its refusal of an open, unaccepted one."""
     item = first(recs, kind, msg)
     if not item:
         die(f'no {kind} {msg}', 3)
+    # hc types by terminal: a session that replaced the target after the send's check gets the prompt, not the text
+    if (item['target'] != mine and item['target']['address'] == mine['address'] and msg in open_items(recs)
+            and not first(recs, 'accepted', msg)):
+        append({'type': 'refused', 'msg': msg, 'by': mine})
+        die(f'{kind} {msg} was sent to the session this terminal ran before, not this one: recorded as refused; '
+            'nothing here to act on', 2)
     if item['target'] != mine:
         die(f'{kind} {msg} was sent to {item["target"]["address"]}, not this session as pinned', 2)
     return item
@@ -649,7 +656,8 @@ def requested(msg, recs, mine):
 
 
 def brief(msg):
-    """What request msg asks, printed for the session it was sent to while it is open; writes nothing."""
+    """What request msg asks, printed for the session it was sent to while it is open; writes nothing but the
+    refusal of a session that replaced that one in its terminal (addressed)."""
     with locked():
         mine = me()
         recs = records()
@@ -1030,13 +1038,6 @@ def accept(action):
     with locked():
         mine = me()
         recs = records()
-        sent = first(recs, 'relay', action)
-        # hc types by terminal: a session that replaced the target after the send's check gets the prompt, not the text
-        if (sent and sent['target'] != mine and sent['target']['address'] == mine['address'] and action in open_items(recs)
-                and not first(recs, 'accepted', action)):
-            append({'type': 'refused', 'msg': action, 'by': mine})
-            die(f'relay {action} was sent to the session this terminal ran before, not this one: recorded as refused; '
-                'nothing here to act on', 2)
         item = addressed('relay', action, recs, mine)
         current = enrolled()
         if current != item['captain'] or not live(identity(current)):
