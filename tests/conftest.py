@@ -8,12 +8,7 @@ import pytest
 def pytest_configure(config):
     # before xdist starts its workers, which inherit the environment but not the controller's -X utf8
     os.environ['PYTHONUTF8'] = '1'
-    # git exports these to a pre-commit hook (GIT_INDEX_FILE relative to the committing checkout); a test's git
-    # in its own temporary repository must not inherit them. Not every GIT_*: GIT_CONFIG_* carries README's
-    # fsmonitor workaround
-    for name in ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY',
-                 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_PREFIX', 'GIT_NAMESPACE'):
-        os.environ.pop(name, None)
+    import helpers  # noqa: F401  drops git's location variables (GIT_LOCATION) before xdist starts its workers
 
 
 def pytest_addoption(parser):
