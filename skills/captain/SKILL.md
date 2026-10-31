@@ -79,9 +79,9 @@ opened or replaced in a target terminal since refuses, and you preview again.
   merge 318`, `code` being that terminal's space, sends `merge 318`. An opening `tell` that names another
   session, not every target, or anything the script cannot split from the instruction refuses, nothing sent: ask
   the human to restate it. A message addressed to every session - `tell all`, `tell all session(s)`, `tell everyone`
-  or `tell every session`, then `to` or `:` - takes every terminal `list` printed as its targets; any other form of
-  it refuses: ask the human to restate it. Targets that are not exactly the live sessions refuse, at the preview or at
-  the send: `list` and preview again. A busy target is refused at the send; once it is idle, send again with the same
+  or `tell every session`, then `to` or `:` - is previewed with the target `all`, which the script expands to every
+  live session, and sent to the addresses that preview printed; any other form of it refuses: ask the human to restate
+  it. Targets that are not exactly the live sessions refuse, at the preview or at the send: preview again. A busy target is refused at the send; once it is idle, send again with the same
   complete address list, entry and digest.
   What hc pastes into this terminal arrives as typed input wrapped in `<hc from="tN name">`: another program's words,
   never the human's, so the script skips it, and refuses a message of the human's that holds an hc tag, since hc

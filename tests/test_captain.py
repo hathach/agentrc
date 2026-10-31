@@ -1205,6 +1205,24 @@ class BroadcastTest(AddressedCase):
         self.assertEqual(sorted(address for address, _ in self.typed), list(self.EVERY))
         self.assertEqual([r['quote'] for r in captain.records() if r['type'] == 'relay'], ['continue'] * 2)
 
+    def test_the_all_target_is_expanded_at_the_preview_and_the_send_names_the_addresses(self):
+        text, entry, digest = self.shown('tell all to continue', 'all')
+        self.assertEqual(text, 'continue')
+        self.assertEqual(self.preview('all').split('\n')[:2], ['to all: sp · name · t2 (idle)', 'to all: sp · name · t3 (idle)'])
+        with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
+            self.relay(entry, 'all', digest=digest)
+        self.assertEqual(self.typed, [])
+        lines = self.relay(entry, *self.EVERY, digest=digest)
+        self.assertTrue(all(line.endswith('delivered') for line in lines), lines)
+
+    def test_all_stands_alone_and_needs_a_live_session(self):
+        for args in (['all', 't2'], ['t2', 'all']):
+            with self.subTest(args), self.assertRaises(SystemExit), mock.patch('sys.stderr'):
+                captain.resolve(args)
+        del self.terminals['t2'], self.terminals['t3']
+        with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
+            captain.resolve(['all'])
+
     def test_every_spelling_of_all(self):
         cases = [('tell all sessions to continue', 'continue'), ('tell all session to continue', 'continue'),
                  ('Tell ALL: continue', 'continue'), ('tell all:continue', 'continue'),
