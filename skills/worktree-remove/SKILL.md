@@ -6,7 +6,7 @@ description: Remove a linked worktree once its task is done, with its clean <nam
 # Removing a worktree
 
 `scripts/worktree_remove.py` checks the worktree, then removes it with
-`git worktree remove` and runs `lib/worktree_children.py`'s cleanup, which
+`git worktree remove` and runs `scripts/worktree_children.py`'s cleanup, which
 removes the clean siblings and deletes the branches. Their docstrings hold
 every check and exit code. This is the only way a worktree goes: a terminal
 app's own Remove (herdr-app's worktree menu) skips the gate and the siblings.

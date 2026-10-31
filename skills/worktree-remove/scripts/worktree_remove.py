@@ -53,7 +53,7 @@ import sys
 import time
 from pathlib import Path
 
-MODULE = Path(__file__).resolve().parents[3] / 'lib' / 'worktree_children.py'
+MODULE = Path(__file__).resolve().with_name('worktree_children.py')
 THREADS = '''query($owner: String!, $name: String!, $number: Int!, $endCursor: String) {
   repository(owner: $owner, name: $name) { pullRequest(number: $number) {
     reviewThreads(first: 100, after: $endCursor) {
@@ -157,18 +157,9 @@ def plan(path, pending):
     except (wc.Keep, OSError) as why:
         raise Refused(f'{root}: {why}')
 
-    siblings = []
-    for child in found:
-        try:
-            wc.content_check(child)
-            why = None
-        except (wc.Keep, OSError) as err:
-            why = str(err)
-        siblings.append(dict(path=child, why=why, head=wc.head_branch(child), common=wc.common_dir(child / '.git')))
-    _, held = wc.removal_plan([s['path'] for s in siblings if s['why'] is None],
-                              [s['path'] for s in siblings if s['why']])
-    for s in siblings:
-        s['why'] = s['why'] or held.get(s['path'])
+    _, _, staying = wc.plan_children(found, {})  # a busy sibling refused above
+    siblings = [dict(path=child, why=staying.get(child), head=wc.head_branch(child), common=wc.common_dir(child / '.git'))
+                for child in found]
     leaving = [root] + [s['path'] for s in siblings if s['why'] is None]
     head, common = wc.head_branch(root), os.path.realpath(common)
     checkouts = [dict(path=root, why=None, head=head, common=common)] + siblings

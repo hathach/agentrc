@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from helpers import guard_survivors, make_stub, tmpdir  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / 'lib' / 'worktree_children.py'
+SCRIPT = ROOT / 'skills' / 'worktree-remove' / 'scripts' / 'worktree_children.py'
 
 # gh: `repo view` names t/repo; `api graphql` prints the search page in $STUB_PRS, else fails
 GH = r'''#!/usr/bin/env python3
@@ -1144,10 +1144,11 @@ class WorktreeChildren(unittest.TestCase):
         clean, dirty = self.child(), self.child('dirty')
         (dirty / 'notes.txt').write_text('wip')
         self.drop_parent()
-        copy = dirty / 'build' / 'lib' / 'worktree_children.py'
-        copy.parent.mkdir()
+        copy = dirty / 'build' / 'skills' / 'worktree-remove' / 'scripts' / 'worktree_children.py'
+        copy.parent.mkdir(parents=True)
         shutil.copy(SCRIPT, copy)
-        shutil.copy(SCRIPT.with_name('windows.py'), copy.parent)
+        (dirty / 'build' / 'lib').mkdir()
+        shutil.copy(ROOT / 'lib' / 'windows.py', dirty / 'build' / 'lib')
         state = dirty / 'build' / 'state'
         log = state / 'agentrc' / 'worktree-remove' / 'log'
         for what, path, script, env, cwd in (

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Remove the sibling child worktrees of a linked worktree once the worktree-remove skill has removed it.
 
-    python3 lib/worktree_children.py cleanup <parent> [--branch <common git dir> <branch> <oid>]...  # a retry
+    python3 worktree_children.py cleanup <parent> [--branch <common git dir> <branch> <oid>]...  # a retry
 
 Children of `<dir>/<name>` are the entries `<dir>/<name>--*` (grandchildren `<name>--a--b`
 too, unless `<name>--a` stays) with a `.git` file that are linked git worktrees of any repository: the `<name>--`
@@ -75,7 +75,7 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))  # loaded by path (worktree_remove.py), lib is not on it
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))  # loaded by path, lib is not on it
 import windows  # noqa: E402
 
 PRIVATE_REFS = ('refs/worktree/', 'refs/bisect/', 'refs/rewritten/')
@@ -86,7 +86,7 @@ GIT_LOCATION = ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE', 
 ENV = {k: v for k, v in os.environ.items() if k not in GIT_LOCATION}  # so `git -C <child>` means the child
 OPERATIONS = ('MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'rebase-merge', 'rebase-apply', 'BISECT_LOG')
 LOG = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local' / 'state') / 'agentrc' / 'worktree-remove' / 'log'
-SKILLS = Path(__file__).resolve().parents[1] / 'skills'
+SKILLS = Path(__file__).resolve().parents[2]
 SEARCH = '''query($q: String!, $endCursor: String) {
   search(query: $q, type: ISSUE, first: 100, after: $endCursor) {
     issueCount
@@ -709,6 +709,27 @@ def retry(parent, branches):
                        *[a for b in branches for a in ('--branch', *map(str, b))]])
 
 
+def plan_children(found, busy, scan=None, stop=lambda: False):
+    """(removal order, {child: content_check result}, {child: why it stays}) for the children found: busy ones
+    ({child: why}) stay, the rest are checked, and removal_plan orders the clean ones and keeps what stayers hold.
+    The order is None when stop() turns true during the checks: a returned parent's children are not ours."""
+    removals, kept = {}, {}
+    for child in found:  # every check first: a child that stays may hold one sorted before it
+        if stop():
+            return None, removals, kept
+        if child in busy:
+            kept[child] = busy[child]
+            continue
+        try:
+            removals[child] = content_check(child)
+        except (Keep, OSError) as why:  # an unexpected filesystem error keeps the child too
+            kept[child] = str(why)
+    if stop():
+        return None, removals, kept
+    pending, held = removal_plan(list(removals), [c for c in found if c not in removals], scan)
+    return pending, removals, {**kept, **held}
+
+
 def cleanup(parent, branches=()):
     """Remove parent's clean children, then delete the given branches and each removed child's;
     a branch is (common git dir, name, tip)."""
@@ -728,31 +749,22 @@ def cleanup(parent, branches=()):
     if branches:
         log(f'branches to settle: {retry(parent, branches)}')
     branches = list(branches)
-    found, removals, stopped = children(parent), {}, False
+    found = children(parent)
     if found and not hc_path():
         log('no hc installed: herdr-core terminals in the children not checked')
     try:  # first: a child a terminal works in stays, which may hold others
         busy = {child: busy_with(terminals) for child, terminals in terminals_in(found).items()}
     except Keep as why:
         busy = dict.fromkeys(found, str(why))
-    for child in found:  # every check first: a child that stays may hold one sorted before it
-        stopped = os.path.lexists(parent)  # once seen, stays seen: the replacement may be mid-move
-        if stopped:
-            break
-        if child in busy:
-            keep(child, busy[child])
-            continue
-        try:
-            removals[child] = content_check(child)
-        except (Keep, OSError) as why:  # an unexpected filesystem error keeps the child too
-            keep(child, why)
-    stopped, scan = stopped or os.path.lexists(parent), {}
+    scan = {}
+    # once seen, stays seen: the replacement may be mid-move
+    pending, removals, staying = plan_children(found, busy, scan, lambda: os.path.lexists(parent))
+    for child, why in staying.items():
+        keep(child, why)
+    stopped = pending is None
     if stopped:  # it returned during the checks: its replacement's children are not ours
         log(f'{parent} exists again: not touching its children')
-    staying = [c for c in found if c not in removals]
-    pending, held = ([], {}) if stopped else removal_plan(list(removals), staying, scan)
-    for child, why in held.items():
-        keep(child, why)
+        pending = []
     while pending:
         child = pending.pop(0)
         removal = removals[child]
