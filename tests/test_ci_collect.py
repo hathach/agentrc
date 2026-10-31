@@ -65,6 +65,51 @@ class ContractTest(unittest.TestCase):
         self.assertEqual(int(re.search(r'^const COLLECT_CONTRACT = (\d+)$', body, re.M)[1]), collect.CONTRACT)
 
 
+
+class PageSizeTest(unittest.TestCase):
+    """A paginated listing read again, whole, at a smaller page size after a server error (#362)."""
+    PATH = 'repos/o/r/actions/runs/7/attempts/1/jobs'
+
+    def listing(self, answer):
+        calls = []
+
+        def gh(*argv, raw=False):
+            calls.append(argv[3])
+            return answer(int(argv[3].rsplit('per_page=', 1)[1]))
+        with mock.patch.object(collect, 'gh', gh):
+            try:
+                return collect.attempt_jobs('o/r', 7, 1, {}), calls
+            except collect.Failed as e:
+                return e, calls
+
+    @staticmethod
+    def server_error_above(limit):
+        def answer(size):
+            if size > limit:
+                raise collect.Failed('gh api --paginate: gh: Server Error (HTTP 502)')
+            return [{'total_count': 2, 'jobs': [{'id': 1}, {'id': 2}]}]
+        return answer
+
+    def test_a_server_error_at_100_retries_the_whole_list_at_50(self):
+        jobs, calls = self.listing(self.server_error_above(50))
+        self.assertEqual(jobs, [{'id': 1}, {'id': 2}])
+        self.assertEqual(calls, [f'{self.PATH}?per_page=100', f'{self.PATH}?per_page=50'])
+
+    def test_a_server_error_at_every_size_fails_after_30(self):
+        failed, calls = self.listing(self.server_error_above(0))
+        self.assertIsInstance(failed, collect.Failed)
+        self.assertEqual([c.rsplit('=', 1)[1] for c in calls], ['100', '50', '30'])
+
+    def test_other_failures_are_not_retried(self):
+        for failure in (collect.Failed('gh api --paginate: gh: Not Found (HTTP 404)'),
+                        collect.Failed('gh api --paginate: gh: Server Error (HTTP 502)', limit={'resetAt': None})):
+            def answer(size, failure=failure):
+                raise failure
+            failed, calls = self.listing(answer)
+            self.assertIs(failed, failure)
+            self.assertEqual(len(calls), 1)
+
+
 class InventoryTest(unittest.TestCase):
     def setUp(self):
         self.heads = []      # headRefOid per `gh pr view`, last one repeats

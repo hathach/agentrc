@@ -132,6 +132,35 @@ class CommitsTest(unittest.TestCase):
             finally:
                 os.chdir(cwd)
 
+    def test_cited_tells_a_kept_repair_from_one_a_rewrite_replaced(self):
+        """#361: after a rebase, a fix note's commit is still on the head, replaced by one patch, or by none or several."""
+        self.write('kept.c', 'k\n')
+        kept = self.commit('kept', 'kept.c')
+        self.write('fix.c', 'f\n')
+        old = self.commit('fix', 'fix.c')
+        self.write('gone.c', 'g\n')
+        gone = self.commit('gone', 'gone.c')
+        self.git('checkout', '-q', '-b', 'rewritten', kept)
+        self.write('other.c', 'o\n')
+        self.commit('other', 'other.c')
+        self.git('cherry-pick', old)
+        new = self.git('rev-parse', 'HEAD').strip()
+        missing = 'f' * 40
+        code, out = self.run_script('cited', new, kept, old, gone, missing)
+        self.assertEqual(code, 0, out)
+        self.assertEqual((out['head'], out['cited']), (new, [
+            {'sha': kept, 'reachable': True, 'replacement': None},
+            {'sha': old, 'reachable': False, 'replacement': new},
+            {'sha': gone, 'reachable': False, 'replacement': None},
+            {'sha': missing, 'reachable': None, 'replacement': None}]))
+        self.assertIn('seal', out)
+        self.git('cherry-pick', '--allow-empty', '--keep-redundant-commits', old)  # two commits carrying the same patch
+        twice = self.git('rev-parse', 'HEAD').strip()
+        _, out = self.run_script('cited', twice, old)
+        self.assertEqual(out['cited'][0]['replacement'], new, 'an empty pick carries no patch')
+        code, out = self.run_script('cited', new, 'abc')
+        self.assertEqual((code, out['error']), (2, "not a full SHA: 'abc'"))
+
     def test_chain_lists_each_commit_oldest_first(self):
         self.write('b.c', 'b\n')
         one = self.commit('one', 'b.c')

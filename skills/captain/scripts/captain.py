@@ -24,7 +24,7 @@ does not recognize is reported, never assumed safe.
 
 A target is a terminal address (t7) or a selector: pr:N, pr:<owner>:<repo>:N, issue:N, issue:<owner>:<repo>:N,
 matched against each live session's latest report, or space:<herdr space id or name>. A selector must match exactly
-one session; a relay with --entry names addresses only.
+one session; `all`, alone, is every live session. A relay with --entry names addresses only.
 
 A message that opens `tell <name>... [to]`, each name an address, space id or name, or selector, is relayed without
 that opening when the names are exactly the relay's targets, and refused when they are not or cannot be told apart
@@ -78,9 +78,9 @@ REPORT = {'task': str, 'prs': list, 'state': str, 'evidence': str, 'chief': str,
 OPTIONAL = {'issues': list}   # a report without it names no issue
 STATES = ('ready', 'in-progress', 'blocked', 'needs-human', 'done', 'idle')
 RECORDS = ('request', 'report', 'cancel', 'delivered', 'undelivered', 'uncertain',
-           'relay', 'accepted', 'outcome', 'withdraw', 'withdraw-requested')
+           'relay', 'accepted', 'outcome', 'withdraw', 'withdraw-requested', 'refused')
 ITEMS = ('request', 'relay')
-CLOSED = ('report', 'cancel', 'undelivered', 'outcome', 'withdraw')
+CLOSED = ('report', 'cancel', 'undelivered', 'outcome', 'withdraw', 'refused')
 RESULTS = ('completed', 'failed', 'rejected', 'needs-clarification')
 REPORT_MAX = 8192
 POLL_S = 2
@@ -381,7 +381,14 @@ def selected(match, session, recs):
 def resolve(args):
     """{address: the argument naming it} for the target arguments, an address as given, a selector replaced by the
     address of the one session it matches; one terminal named twice goes once. Dies, so nothing is sent, when any
-    selector matches none or several."""
+    selector matches none or several. `all` is every live session, and only alone."""
+    if 'all' in args:
+        if len(args) > 1:
+            die('all names every live session, not one to join with other targets; nothing sent', 2)
+        found = {s['address']: 'all' for s in everyone()}
+        if not found:
+            die('all: no live session; nothing sent', 2)
+        return found
     if any(a.startswith(SELECTORS) for a in args):
         with locked():
             recs = records()
@@ -624,10 +631,17 @@ def first(recs, kind, msg):
 
 
 def addressed(kind, msg, recs, mine):
-    """The request or relay msg, which must have been sent to mine, the session running this, as pinned then."""
+    """The request or relay msg, which must have been sent to mine, the session running this, as pinned then. Called
+    under the lock: a session that replaced the target in its terminal records its refusal of an open, unaccepted one."""
     item = first(recs, kind, msg)
     if not item:
         die(f'no {kind} {msg}', 3)
+    # hc types by terminal: a session that replaced the target after the send's check gets the prompt, not the text
+    if (item['target'] != mine and item['target']['address'] == mine['address'] and msg in open_items(recs)
+            and not first(recs, 'accepted', msg)):
+        append({'type': 'refused', 'msg': msg, 'by': mine})
+        die(f'{kind} {msg} was sent to the session this terminal ran before, not this one: recorded as refused; '
+            'nothing here to act on', 2)
     if item['target'] != mine:
         die(f'{kind} {msg} was sent to {item["target"]["address"]}, not this session as pinned', 2)
     return item
@@ -642,7 +656,8 @@ def requested(msg, recs, mine):
 
 
 def brief(msg):
-    """What request msg asks, printed for the session it was sent to while it is open; writes nothing."""
+    """What request msg asks, printed for the session it was sent to while it is open; writes nothing but the
+    refusal of a session that replaced that one in its terminal (addressed)."""
     with locked():
         mine = me()
         recs = records()
@@ -682,7 +697,8 @@ def one_line(text):
     return ' '.join(text.split())
 
 
-EVENTS = {'cancel': 'cancelled', 'undelivered': 'undelivered', 'withdraw': 'withdrawn', 'accepted': 'accepted'}
+EVENTS = {'cancel': 'cancelled', 'undelivered': 'undelivered', 'withdraw': 'withdrawn', 'accepted': 'accepted',
+          'refused': 'refused by the session that replaced its target'}
 
 
 def event(item, rec):
@@ -985,8 +1001,8 @@ def relay(addresses, entry, sent, mine):
     """Relay the human's newest message, which must still be entry and still read as the preview's digest sent, to
     each address, recorded before it is typed. The transcript is read once for every target: a message the human sends
     after that is not seen."""
-    if any(p.startswith(SELECTORS) for p in addresses):
-        die('a relay names the addresses the preview printed, never a selector', 2)
+    if any(p.startswith(SELECTORS) or p == 'all' for p in addresses):
+        die('a relay names the addresses the preview printed, never a selector or all', 2)
     if not sent:
         die('a relay names the digest the preview printed (--digest)', 2)
     with locked():

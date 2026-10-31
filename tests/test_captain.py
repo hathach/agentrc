@@ -727,6 +727,17 @@ class BriefTest(LedgerCase):
         with self.assertRaises(SystemExit):
             self.brief()
 
+    def test_a_replacement_in_the_target_terminal_closes_the_request_as_refused(self):
+        self.terminals['t2'] = {**pinned('t2'), 'started': 99}
+        with self.assertRaises(SystemExit) as e:
+            self.brief()
+        self.assertEqual((e.exception.code, self.count('refused')), (2, 1))
+        self.assertNotIn(self.msg, captain.open_items(captain.records()))
+        with mock.patch('builtins.print') as out:
+            self.assertEqual(captain.collect([self.msg], 0), 0)
+        self.assertTrue(out.call_args_list[-1].args[0].startswith(
+            f'refused by the session that replaced its target {self.msg}'))
+
     def test_closed_missing_or_stranded_request(self):
         with self.assertRaises(SystemExit):
             self.brief('m-nonesuch')
@@ -1205,6 +1216,24 @@ class BroadcastTest(AddressedCase):
         self.assertEqual(sorted(address for address, _ in self.typed), list(self.EVERY))
         self.assertEqual([r['quote'] for r in captain.records() if r['type'] == 'relay'], ['continue'] * 2)
 
+    def test_the_all_target_is_expanded_at_the_preview_and_the_send_names_the_addresses(self):
+        text, entry, digest = self.shown('tell all to continue', 'all')
+        self.assertEqual(text, 'continue')
+        self.assertEqual(self.preview('all').split('\n')[:2], ['to all: sp · name · t2 (idle)', 'to all: sp · name · t3 (idle)'])
+        with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
+            self.relay(entry, 'all', digest=digest)
+        self.assertEqual(self.typed, [])
+        lines = self.relay(entry, *self.EVERY, digest=digest)
+        self.assertTrue(all(line.endswith('delivered') for line in lines), lines)
+
+    def test_all_stands_alone_and_needs_a_live_session(self):
+        for args in (['all', 't2'], ['t2', 'all']):
+            with self.subTest(args), self.assertRaises(SystemExit), mock.patch('sys.stderr'):
+                captain.resolve(args)
+        del self.terminals['t2'], self.terminals['t3']
+        with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
+            captain.resolve(['all'])
+
     def test_every_spelling_of_all(self):
         cases = [('tell all sessions to continue', 'continue'), ('tell all session to continue', 'continue'),
                  ('Tell ALL: continue', 'continue'), ('tell all:continue', 'continue'),
@@ -1490,6 +1519,36 @@ class AcceptTest(RelayCase):
         with self.assertRaises(SystemExit):
             self.as_target(captain.accept, self.action)
         self.assertNotIn('accepted', [r['type'] for r in captain.records()])
+
+    def test_a_replacement_in_the_target_terminal_records_its_refusal_once(self):
+        with self.assertRaises(SystemExit):
+            self.as_target(captain.accept, self.action, address='t3')
+        self.assertEqual(self.count('refused'), 0)
+        self.terminals['t2'] = {**pinned('t2'), 'started': 99}
+        self.me = 't2'
+        with mock.patch('builtins.print') as out, self.assertRaises(SystemExit) as e:
+            captain.accept(self.action)
+        self.me = 't1'
+        self.assertEqual(e.exception.code, 2)
+        self.assertIn('recorded as refused', str(out.call_args_list))   # die prints through print too
+        self.assertNotIn('merge o/r#12', str(out.call_args_list))
+        [rec] = [r for r in captain.records() if r['type'] == 'refused']
+        self.assertEqual(rec['by'], captain.identity(captain.find('t2')))
+        self.assertNotIn(self.action, captain.open_items(captain.records()))
+        with self.assertRaises(SystemExit):
+            self.as_target(captain.accept, self.action)
+        self.assertEqual(self.count('refused'), 1)
+        with mock.patch('builtins.print') as out:
+            self.assertEqual(captain.collect([self.action], 0), 0)
+        self.assertTrue(out.call_args_list[-1].args[0].startswith(
+            f'refused by the session that replaced its target {self.action}'))
+
+    def test_no_refusal_once_accepted(self):
+        self.as_target(captain.accept, self.action)
+        self.terminals['t2'] = {**pinned('t2'), 'started': 99}
+        with self.assertRaises(SystemExit):
+            self.as_target(captain.accept, self.action)
+        self.assertEqual(self.count('refused'), 0)
 
     def test_acceptance_is_durable_before_the_message_prints(self):
         self.me = 't2'

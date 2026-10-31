@@ -16,7 +16,10 @@ with its `batch` and `findingVerdicts`, the verdicts of this harvest's findings 
 its comment (a refutedPosts reply answers stale findings as well as invalid ones),
 and `botAsks` the trigger scripts' comments asking a bot to review (`already`
 found one standing, `uncertain` posted one that did not read back).
-`budget` is the returned state's
+`stateRef` names a copy of the launch's output kept outside the Workflow task directory, which a
+host reset wipes (#340): ${XDG_STATE_HOME:-~/.local/state}/agentrc/pr-babysit/states/<digest>-<content
+hash>.json, written once and read back; when it cannot be kept, stateRef names the output itself and a
+note says so. `budget` is the returned state's
 cyclesUsed and maxCycles; `pinned` its config, the arguments a continuation
 passes unchanged, read from the --state-ref output when the launch returned no state. `blockers` lists what the caller must settle before
 trusting or continuing the launch, a spent cycle budget and a refused launch
@@ -29,17 +32,23 @@ spent budget is no blocker.
 `logs` leaves out lines another field carries whole and folds repeated ones into one.
 """
 import argparse
+import hashlib
 import json
+import os
 import re
 import sys
+import tempfile
 from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
+import windows  # noqa: E402
 from facts import Parser, Unusable, git, report  # noqa: E402
 from state_transfer import MAX  # noqa: E402
 
 CONDENSED = ('history', 'observation', 'state')
+STATES = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local' / 'state') / 'agentrc' / 'pr-babysit' / 'states'
 NOT_FIXING = re.compile(r'^cycle \d+: [\w -]+ CI failure \(not fixing\): ')
 # Whole in result.handoffs (commentId, replyId, the error in `why`) and result.settlements, when the record is there.
 HANDED = (re.compile(r'^cycle \d+: reply \d+ to comment (?P<c>\d+) exists with the wrong content \(.*\) — handed to the caller, not another reply$', re.S),
@@ -102,6 +111,10 @@ STALLED = {
     'github-rate-limited': 'GitHub refused a call for a rate limit (`rateLimit`): relaunch from the stateRef after its resetAt, '
                            'or after a few minutes for a secondary limit',
     'unactionable': 'the launch found nothing to act on: relaunch only on a named change (a push, a review, a CI result)',
+    'fixes-withheld': 'no writer ran: every open fix needed a path the launch may not change (a protected one) or had no file '
+                      'scope it could determine, each named in `withheld`; nothing is left uncommitted. Fix them yourself under '
+                      'the rules for those paths before relaunching; a review finding left unfixed goes in `deferrals`, a CI '
+                      "failure only in `acceptedFailures`, the user's decision",
     'pending-review': 'the posting account holds a pending review on the PR (`review`, by `login`), and GitHub refuses its replies '
                       'while it does: report it for the human to submit or delete, never submit or delete it yourself, and relaunch '
                       'from the stateRef once it is gone',
@@ -430,6 +443,30 @@ def summarize(output, output_path, state_ref=None, tree=None, keys=False):
     return summary
 
 
+def kept(output_path, digest):
+    """A copy of the output at output_path, holding the state of digest, under STATES: its path once read back whole,
+    the same name for the same bytes, so a second reading reuses it."""
+    if not (isinstance(digest, str) and re.fullmatch(r'[0-9a-f]{8}', digest)):  # it names the file
+        raise Unusable(f'the state digest {digest!r} is not 8 hex digits')
+    raw = Path(output_path).read_bytes()
+    path = STATES / f'{digest}-{hashlib.sha256(raw).hexdigest()[:16]}.json'
+    if not (path.is_file() and path.read_bytes() == raw):
+        STATES.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=STATES, prefix=f'.{path.name}.')
+        try:
+            with os.fdopen(fd, 'wb') as f:
+                f.write(raw)
+                f.flush()
+                os.fsync(f.fileno())
+            windows.replace(tmp, path)  # Windows: retried while another reader has it open
+        except BaseException:
+            Path(tmp).unlink(missing_ok=True)
+            raise
+    if ((load_output(path) or {}).get('result') or {}).get('stateDigest') != digest:
+        raise Unusable(f'{path} does not read back with state digest {digest}')
+    return path.as_posix()
+
+
 def collect(argv):
     p = Parser(prog='launch_result.py', description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--output', required=True)
@@ -443,7 +480,16 @@ def collect(argv):
         if not sep or not file or not re.fullmatch(r'[0-9a-f]{8}', digest):
             raise Unusable(f'--state-ref must be FILE:DIGEST with an 8-hex digest, not {a.state_ref!r}')
         ref = {'outputFile': file, 'digest': digest}
-    return summarize(load_output(a.output), Path(a.output).resolve().as_posix(), ref, checkout(a.checkout) if a.checkout else None, a.keys)
+    output_path = Path(a.output).resolve().as_posix()
+    summary = summarize(load_output(a.output), output_path, ref, checkout(a.checkout) if a.checkout else None, a.keys)
+    fresh = summary['stateRef']
+    if fresh and fresh['outputFile'] == output_path:
+        try:
+            fresh['outputFile'] = kept(output_path, fresh['digest'])
+        except (OSError, Unusable) as e:
+            summary['notes'].append(f'the state is not kept outside the Workflow task directory ({e}): the stateRef names the '
+                                    "launch's own output, which a host reset wipes; copy it elsewhere before relying on it")
+    return summary
 
 
 if __name__ == '__main__':

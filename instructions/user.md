@@ -63,7 +63,7 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   the checkout, never nested. Remove a linked checkout only with the
   `worktree-remove` skill, never a terminal app's Remove (herdr-app's worktree
   menu), which skips its gate; its clean siblings and their pushed or PR-head
-  branches go with it (agentrc's `lib/worktree_children.py`, whose docstring
+  branches go with it (agentrc's `worktree_children.py`, whose docstring
   has the rules). The skill refuses a checkout holding nested worktrees.
 
 # Coding style

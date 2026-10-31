@@ -15,6 +15,15 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+# git exports these to a hook (GIT_INDEX_FILE relative to the committing checkout), and a caller may export them too;
+# a test's git, or the code under test, in its own temporary repository must not inherit them, or it writes into the
+# caller's repository. Not every GIT_*: GIT_CONFIG_* carries README's fsmonitor workaround. Here, not only in
+# conftest.py, which unittest never loads: every test module that runs git imports this one.
+GIT_LOCATION = ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY',
+                'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_PREFIX', 'GIT_NAMESPACE')
+for _name in GIT_LOCATION:
+    os.environ.pop(_name, None)
+
 
 def make_stub(bin_dir, name, source):
     """An executable `name` in bin_dir running the Python `source`, its path: a shebang script, or on Windows,

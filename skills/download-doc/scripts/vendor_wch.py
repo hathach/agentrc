@@ -122,9 +122,10 @@ def _crawl(host: str, file_host: str, language: str, suffix: str) -> list:
 
 def _title(content: str) -> str:
     """The description's first clause: "CH32V303/305/307/317 datasheet, this series ..."
-    keeps the part before the comma, "USB3.0" and "2.4G" keep their point."""
+    keeps the part before the comma, "USB3.0" and "2.4G" keep their point, and an ASCII
+    comma between part numbers ("CH32V407,CH32V467的...") lists them, not ends the clause."""
     content = re.sub(r"^Information change in the download page \([^)]*\):\s*", "", content)
-    return re.split(r"[。，,]|\.\s", content)[0].strip()
+    return re.split(r"[。，]|,(?![A-Za-z0-9])|\.\s", content)[0].strip()
 
 
 def _doc(data: dict, file_host: str, language: str, suffix: str) -> Doc | None:

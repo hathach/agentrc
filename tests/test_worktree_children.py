@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from helpers import guard_survivors, make_stub, tmpdir  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / 'lib' / 'worktree_children.py'
+SCRIPT = ROOT / 'skills' / 'worktree-remove' / 'scripts' / 'worktree_children.py'
 
 # gh: `repo view` names t/repo; `api graphql` prints the search page in $STUB_PRS, else fails
 GH = r'''#!/usr/bin/env python3
@@ -125,9 +125,6 @@ class WorktreeChildren(unittest.TestCase):
                     'GIT_CONFIG_NOSYSTEM': '1', 'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t',
                     'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@t', 'GIT_CONFIG_COUNT': '1',
                     'GIT_CONFIG_KEY_0': 'protocol.file.allow', 'GIT_CONFIG_VALUE_0': 'always'}
-        for k in ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY',
-                  'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_PREFIX', 'GIT_NAMESPACE'):
-            self.env.pop(k, None)
         self.calls, self.log = self.t / 'calls', self.t / 'state' / 'agentrc' / 'worktree-remove' / 'log'
         self.env.update(STUB_LOG=str(self.calls), XDG_STATE_HOME=str(self.t / 'state'))
         gh_dir = self.t / 'gh-bin'
@@ -951,6 +948,19 @@ class WorktreeChildren(unittest.TestCase):
         self.assertIn(f'{self.parent} exists again: not touching {child}', done.stdout)
         self.assertTrue(child.is_dir())
 
+    @unittest.skipUnless(Path('/proc/self/cwd').exists(), 'processes listed by /proc')
+    def test_a_process_working_in_the_child_keeps_it(self):
+        child, other = self.child(), self.child('other')
+        holder = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], cwd=child)
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.kill)
+        done = self.cleanup()
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn(f'kept {child}: a process works in it: ', done.stdout)
+        self.assertIn(f' (pid {holder.pid})\n', done.stdout)
+        self.assertTrue(child.is_dir())
+        self.assertFalse(other.exists())
+
     def test_no_hc_installed_skips_the_terminal_check(self):
         child = self.child()
         self.env['PATH'] = without_hc(self.env['PATH'], self.hc_stub)
@@ -1144,10 +1154,12 @@ class WorktreeChildren(unittest.TestCase):
         clean, dirty = self.child(), self.child('dirty')
         (dirty / 'notes.txt').write_text('wip')
         self.drop_parent()
-        copy = dirty / 'build' / 'lib' / 'worktree_children.py'
-        copy.parent.mkdir()
+        copy = dirty / 'build' / 'skills' / 'worktree-remove' / 'scripts' / 'worktree_children.py'
+        copy.parent.mkdir(parents=True)
         shutil.copy(SCRIPT, copy)
-        shutil.copy(SCRIPT.with_name('windows.py'), copy.parent)
+        (dirty / 'build' / 'lib').mkdir()
+        for name in ('windows.py', 'hc.py'):
+            shutil.copy(ROOT / 'lib' / name, dirty / 'build' / 'lib')
         state = dirty / 'build' / 'state'
         log = state / 'agentrc' / 'worktree-remove' / 'log'
         for what, path, script, env, cwd in (
@@ -1213,6 +1225,27 @@ class WorktreeChildren(unittest.TestCase):
         self.assertNotIn('kept branch', done.stdout)
         self.assertEqual(self.logged_retries(), [shlex.split(self.retry())])
         self.assertTrue(self.log.read_text(encoding='utf-8').endswith(f' retry: {self.retry()}\n'))
+
+
+@unittest.skipIf(os.name == 'nt', 'symlinks')
+class Processes(unittest.TestCase):
+    """check_processes on a /proc stand-in: a live process with a name that is no UTF-8 would trip other suites'
+    own /proc scans run beside this one."""
+    def test_a_name_that_is_no_utf8_is_shown_escaped_and_spared_pids_are_skipped(self):
+        spec = importlib.util.spec_from_file_location('worktree_children', SCRIPT)
+        wc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(wc)
+        proc, tree = tmpdir(self) / 'proc', tmpdir(self) / 'tree'
+        (proc / 'self').mkdir(parents=True)
+        (proc / 'self' / 'cwd').symlink_to('/')
+        tree.mkdir()
+        for pid, name, cwd in (('7', b'worker-\xff\n', tree), ('8', b'spared\n', tree), ('9', b'away\n', proc)):
+            (proc / pid).mkdir()
+            (proc / pid / 'cwd').symlink_to(os.path.realpath(cwd))
+            (proc / pid / 'comm').write_bytes(name)
+        with mock.patch.object(wc, 'PROC', proc), self.assertRaises(wc.Keep) as kept:
+            wc.check_processes(tree, frozenset({8}))
+        self.assertEqual(str(kept.exception), 'a process works in it: worker-\\xff (pid 7)')
 
 
 @unittest.skipIf(os.name == 'nt', 'symlinks')
@@ -1361,7 +1394,13 @@ class LinkHops(unittest.TestCase):
         self.assertEqual(anchored('\\\\srv\\share', 'C:\\w'), ('\\\\srv\\share\\', []))
         self.assertEqual(anchored('\\\\?\\UNC\\srv\\share', 'C:\\w'), ('\\\\srv\\share\\', []))
         self.assertEqual(anchored('\\\\?\\unc\\srv\\share\\x', 'C:\\w'), ('\\\\srv\\share\\', ['x']))
-        self.assertEqual(anchored('\\\\?\\Volume{1}\\x', 'C:\\w'), ('\\\\?\\Volume{1}\\', ['x']))
+        self.assertEqual(anchored('\\\\?\\Volume{1}\\x', 'C:\\w'), ('\\\\?\\Volume{1}\\', ['x']))  # nothing mounts it
+        import ctypes
+        drive = os.path.splitdrive(str(self.t))[0] + '\\'
+        volume = ctypes.create_unicode_buffer(64)
+        self.assertTrue(ctypes.windll.kernel32.GetVolumeNameForVolumeMountPointW(drive, volume, 64))
+        root, names = anchored(volume.value + 'x\\y', 'C:\\w')
+        self.assertEqual((root.upper(), names), (drive.upper(), ['x', 'y']))
         self.assertEqual(anchored('D:/x/y', 'C:\\w'), ('D:\\', ['x', 'y']))
         self.assertEqual(anchored('\\x', 'C:\\w'), ('C:\\', ['x']))
         self.assertEqual(anchored('x/y', 'C:\\w'), ('C:\\w', ['x', 'y']))

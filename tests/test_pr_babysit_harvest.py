@@ -608,6 +608,16 @@ class EndToEnd(unittest.TestCase):
         self.assertRegex(got['fingerprint'], r'^coderabbit,copilot\|coderabbit\|[0-9a-f]{32}$')
         self.assertEqual(self.harvest(self.answers([HEAD]))[1]['fingerprint'], got['fingerprint'], 'a second read of the same evidence')
 
+    def test_a_probe_is_the_same_reading_without_comments(self):
+        """#359: a quota wait compares a probe's fingerprint and bots with its last full harvest."""
+        _, full = self.harvest(self.answers([HEAD]))
+        argv = ['--pr', '7', '--reviewers', 'coderabbit,copilot', '--auto-run', 'coderabbit', '--probe']
+        code, probe = self.harvest(self.answers([HEAD]), *argv)
+        self.assertEqual(code, 0, probe)
+        self.assertEqual(sorted(probe), ['bots', 'fingerprint', 'headEventAt', 'headEventEvidence', 'headSha', 'observedAt'],
+                         'what the workflow relays, whole, so its seal holds')
+        self.assertEqual({k: probe[k] for k in probe if k != 'observedAt'}, {k: full[k] for k in probe if k != 'observedAt'})
+
     def test_the_repo_named_is_read_instead_of_the_checkouts(self):
         answers = {k.replace('o/r', 'up/r'): v for k, v in self.answers([HEAD]).items()}
         code, got = self.harvest(answers, '--pr', '7', '--reviewers', 'coderabbit,copilot', '--auto-run', 'coderabbit', '--repo', 'up/r')
