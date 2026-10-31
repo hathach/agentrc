@@ -109,6 +109,9 @@ STALLED = {
     'github-rate-limited': 'GitHub refused a call for a rate limit (`rateLimit`): relaunch from the stateRef after its resetAt, '
                            'or after a few minutes for a secondary limit',
     'unactionable': 'the launch found nothing to act on: relaunch only on a named change (a push, a review, a CI result)',
+    'fixes-withheld': 'no writer ran: every open fix needed a path the launch may not change (a protected one) or had no file '
+                      'scope it could determine, each named in `withheld`; nothing is left uncommitted. Fix them yourself under '
+                      "the rules for those paths, or defer them (`deferrals`), before relaunching",
     'pending-review': 'the posting account holds a pending review on the PR (`review`, by `login`), and GitHub refuses its replies '
                       'while it does: report it for the human to submit or delete, never submit or delete it yourself, and relaunch '
                       'from the stateRef once it is gone',

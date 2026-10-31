@@ -1619,7 +1619,12 @@ test('a review fix needing a protected path is withheld, its other paths include
     args: { protected: '^test/hil/[^/]+\\.json$' },
     reviews: { findings: [finding({ file: 'test/hil/tinyusb.json' })], replies: [], bots: 'reviewed' },
   })
-  assert.equal(result.reason, 'fix-verification-failed')
+  // #369: no writer ran, so the stop names the withheld fixes, not an unverified one left uncommitted.
+  assert.equal(result.reason, 'fixes-withheld')
+  assert.deepEqual(result.withheld, [{ scope: 'test/hil/tinyusb.json', ids: [result.withheld[0].ids[0]], why: 'a path it needs was refused',
+    refused: [{ path: 'test/hil/tinyusb.json', why: "protected, the caller's to change" }] }])
+  assert.ok(logs.some(l => /every review-lane fix withheld for the caller — nothing left uncommitted/.test(l)), logs.join('\n'))
+  assert.equal(logs.some(l => /left uncommitted for the caller's review/.test(l)), false)
   assert.equal(labels.some(l => l.startsWith('fix:')), false, 'no fixer may be dispatched for a protected path')
   assert.ok(logs.some(l => /test\/hil\/tinyusb\.json refused — protected, the caller's to change/.test(l)), logs.join('\n'))
   assert.ok(logs.some(l => /a path it needs was refused — withheld for the caller/.test(l)))
@@ -1630,7 +1635,17 @@ test('a review fix needing a protected path is withheld, its other paths include
     reviews: { findings: [finding({ fixFiles: ['src/a.c', 'test/hil/tinyusb.json'] })], replies: [], bots: 'reviewed' },
   })
   assert.equal(both.labels.some(l => l.startsWith('fix:')), false, both.labels.join(' '))
-  assert.equal(both.result.reason, 'fix-verification-failed')
+  assert.equal(both.result.reason, 'fixes-withheld')
+  // A writer that ran beside a withheld fix leaves its edit uncommitted: the unverified stop, the withheld one listed.
+  const mixed = await run({
+    args: { protected: '^test/hil/[^/]+\\.json$' },
+    reviews: { findings: [finding({ commentId: 1, file: 'test/hil/tinyusb.json' }), finding({ commentId: 2, file: 'src/b.c' })],
+      replies: [], bots: 'reviewed' },
+    verify: { addresses: false, reason: 'misses the point' },
+  })
+  assert.equal(mixed.result.reason, 'fix-verification-failed')
+  assert.deepEqual(mixed.result.withheld.map(w => w.scope), ['test/hil/tinyusb.json'])
+  assert.ok(mixed.logs.some(l => /review-lane fixes left uncommitted for the caller's review/.test(l)), mixed.logs.join('\n'))
 })
 
 test('the publisher stages exactly the owned paths, never a protected one', async () => {
@@ -8555,7 +8570,7 @@ test('a finding asking for a test gets the test file in its fix scope, checked b
   // A required path refused withholds the finding rather than fix it without its test.
   const refused = await run({ reviews: { findings: [wants], replies: [], bots: 'reviewed' }, lsFiles: (asked) => asked.filter(f => !f.startsWith('test/')) })
   assert.equal(refused.labels.some(l => l.startsWith('fix:')), false)
-  assert.equal(refused.result.reason, 'fix-verification-failed')
+  assert.equal(refused.result.reason, 'fixes-withheld')
   assert.ok(refused.logs.some(l => /test\/unit-test\/test\/device\/test_hid\.c refused — exists but is not tracked/.test(l)), refused.logs.join('\n'))
   // A spelling canon() would rewrite never reaches the check as the path it would become.
   const respelled = await run({ reviews: { findings: [finding({ fixFiles: ['src/link/../a.c'] })], replies: [], bots: 'reviewed' } })
@@ -8591,7 +8606,8 @@ test('a finding its validator could not scope sends its group through the scope 
   assert.ok(partial.logs.some(l => /scope:src\/a\.c: test\/t\.c refused — exists but is not tracked/.test(l)), partial.logs.join('\n'))
   const { result, labels, logs } = await run({ reviews, scope: [] })
   assert.equal(labels.some(l => l.startsWith('fix:')), false)
-  assert.equal(result.reason, 'fix-verification-failed')
+  assert.equal(result.reason, 'fixes-withheld')
+  assert.deepEqual(result.withheld.map(w => [w.scope, w.why, 'refused' in w]), [['src/a.c', 'no file scope determinable', false]])
   assert.ok(logs.some(l => /fix for src\/a\.c: no file scope determinable — withheld for the caller/.test(l)), logs.join('\n'))
 })
 

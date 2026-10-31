@@ -1186,7 +1186,16 @@ const acceptedOnly = (c) => nothingToRepair(c) && c.realFailures.length > 0 && !
 const stop = (cycles, reason, extra) => ({ pass: false, cycles, history, reason, ...extra })
 // A PR no longer open ends the launch whatever else is pending: there is nothing left to babysit.
 const prEnded = (cycles, state) => state === 'merged' ? stop(cycles, 'pr-merged') : state === 'closed' ? stop(cycles, 'pr-closed') : stop(cycles, 'pr-state-unread')
-const unverifiedStop = (cycles, unverifiable) => unverifiable ? stop(cycles, 'build-unverifiable', { detail: unverifiable }) : stop(cycles, 'fix-verification-failed')
+// A writer ran, so its edits are left uncommitted; when none did, every fix was withheld and nothing is (#369).
+const unverifiedStop = (cycles, lane, { unverifiable, withheld, dispatched }) => {
+  if (!dispatched) {
+    log(`cycle ${cycles}: every ${lane}-lane fix withheld for the caller — nothing left uncommitted`)
+    return stop(cycles, 'fixes-withheld', { withheld })
+  }
+  log(`cycle ${cycles}: ${lane}-lane fixes left uncommitted for the caller's review — not pushing unverified changes`)
+  const also = withheld.length ? { withheld } : {}
+  return unverifiable ? stop(cycles, 'build-unverifiable', { detail: unverifiable, ...also }) : stop(cycles, 'fix-verification-failed', also)
+}
 // dryRun: the debt was never postable.
 const unresolvedVerdict = (cycles, outstanding, dryRun = false) =>
   stop(cycles, 'deferred-replies-unresolved', { outstanding, dryRun })
@@ -1420,7 +1429,7 @@ const fixAndVerify = async (workIn, tag, rejectable = false) => {
   for (const w of workIn) {
     const take = (f) => {
       if (!refusal.has(f)) { w.files.add(f); return true }
-      if (w.strict) w.refused = true
+      if (w.strict) (w.refused ||= []).push({ path: f, why: refusal.get(f) })
       log(`scope:${w.key}: ${f} ${w.strict ? 'refused' : 'dropped'} — ${refusal.get(f)}`)
       return false
     }
@@ -1429,7 +1438,10 @@ const fixAndVerify = async (workIn, tag, rejectable = false) => {
     if (w.unresolved) w.unresolved = !resolved
   }
   const unscoped = workIn.filter(w => w.files.size === 0 || w.unresolved || w.refused)
-  for (const w of unscoped) log(`fix for ${w.key}: ${w.refused ? 'a path it needs was refused' : 'no file scope determinable'} — withheld for the caller`)
+  // #369: what no writer got, by finding, so a stop that withheld every fix does not read as an unverified one.
+  const withheld = unscoped.map(w => ({ scope: w.key, ids: w.notes.map(n => n.id),
+    why: w.refused ? 'a path it needs was refused' : 'no file scope determinable', ...(w.refused ? { refused: w.refused } : {}) }))
+  for (const w of withheld) log(`fix for ${w.scope}: ${w.why} — withheld for the caller`)
   // Merge groups sharing a file so no two writers edit one file.
   const work = []
   for (let g of workIn.filter(w => !unscoped.includes(w))) {
@@ -1513,6 +1525,8 @@ const fixAndVerify = async (workIn, tag, rejectable = false) => {
     owned,
     unverifiable,
     rejected,
+    withheld,
+    dispatched: work.length,
   }
 }
 
@@ -2901,7 +2915,8 @@ const runLanes = async (cycle, entry, lanes) => {
         claim: `${f.file}:${f.line} ${f.claim}`,
       })))
       if (lanes.prState) return prEnded(cycle, lanes.prState)
-      const { ok, fixes, owned, brief, unverifiable, rejected } = await fixAndVerify(work, `${cycle}-review`, true)
+      const verdict = await fixAndVerify(work, `${cycle}-review`, true)
+      const { ok, fixes, owned, brief, rejected } = verdict
       entry.reviewFixes = fixes
       // A rejected finding is held, its evidence on its decision, until the next harvest judges it again; a second rejection is the caller's.
       // Every rejection is held before any stop: an answered comment owes no debt, so only the hold keeps the finding outstanding.
@@ -2923,10 +2938,7 @@ const runLanes = async (cycle, entry, lanes) => {
         log('autoPush not set: review-lane fixes left uncommitted (dry run)')
         return stop(cycle, 'dry-run', { dryRun: true })
       }
-      if (!ok) {
-        log(`cycle ${cycle}: review-lane fixes left uncommitted for the caller's review — not pushing unverified changes`)
-        return unverifiedStop(cycle, unverifiable)
-      }
+      if (!ok) return unverifiedStop(cycle, 'review', verdict)
       if (lanes.prState) {
         log(`cycle ${cycle}: review-lane fixes left uncommitted — PR #${args.pr} is ${lanes.prState}`)
         return prEnded(cycle, lanes.prState)
@@ -3025,16 +3037,14 @@ const runLanes = async (cycle, entry, lanes) => {
         id: rf.id, scopeFile: rf.files[0] || rf.check, files: rf.files,
         text: `CI ${rf.check}: ${rf.firstError}`,
       })))
-      const { ok, fixes, owned, brief, unverifiable } = await fixAndVerify(work, `${cycle}-ci`)
+      const verdict = await fixAndVerify(work, `${cycle}-ci`)
+      const { ok, fixes, owned, brief } = verdict
       entry.ciFixes = fixes
       if (args.autoPush !== true) {
         log('autoPush not set: CI-lane fixes left uncommitted (dry run)')
         return stop(cycle, 'dry-run', { dryRun: true })
       }
-      if (!ok) {
-        log(`cycle ${cycle}: CI-lane fixes left uncommitted for the caller's review — not pushing unverified changes`)
-        return unverifiedStop(cycle, unverifiable)
-      }
+      if (!ok) return unverifiedStop(cycle, 'CI', verdict)
       const ciPush = await commitAndPush(cycle, 'ci', owned, brief)
       if (!ciPush.pass) {
         entry.ciPushFailed = ciPush
