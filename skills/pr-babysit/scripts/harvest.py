@@ -37,7 +37,7 @@ with its walkthrough marker (CR_WALKTHROUGH), the auto-generated summary,
 and its url shows it (`gh api repos/<repo>/issues/comments/<commentId>` for the walkthrough). Exit 2 with {"error": ...} when gh cannot answer the PR, the
 head, or a comment endpoint, plus facts.py's rateLimit when GitHub refused gh for a rate limit.
 
---probe prints only headSha, observedAt, bots and fingerprint, sealed (facts.sealed): what a workflow waiting out
+--probe prints only headSha, observedAt, headEventAt, headEventEvidence, bots and fingerprint, sealed (facts.sealed): what a workflow waiting out
 CodeRabbit's rate limit compares with its last full harvest (#359).
 """
 
@@ -60,7 +60,7 @@ except ImportError:
 sys.path.insert(0, str(Path(__file__).parent))
 from facts import FULL_SHA, Parser, RateLimited, Unusable, bind_repo, report, run  # noqa: E402
 
-PROBE = ('headSha', 'observedAt', 'bots', 'fingerprint')
+PROBE = ('headSha', 'observedAt', 'headEventAt', 'headEventEvidence', 'bots', 'fingerprint')
 # reply.py checks a comment against the same digest, so both skills share one definition.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'pr-reply' / 'scripts'))
 import comment_digest  # noqa: E402

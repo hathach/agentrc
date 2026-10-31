@@ -614,8 +614,9 @@ class EndToEnd(unittest.TestCase):
         argv = ['--pr', '7', '--reviewers', 'coderabbit,copilot', '--auto-run', 'coderabbit', '--probe']
         code, probe = self.harvest(self.answers([HEAD]), *argv)
         self.assertEqual(code, 0, probe)
-        self.assertEqual(sorted(probe), ['bots', 'fingerprint', 'headSha', 'observedAt'], 'what the workflow relays, whole, so its seal holds')
-        self.assertEqual((probe['headSha'], probe['bots'], probe['fingerprint']), (full['headSha'], full['bots'], full['fingerprint']))
+        self.assertEqual(sorted(probe), ['bots', 'fingerprint', 'headEventAt', 'headEventEvidence', 'headSha', 'observedAt'],
+                         'what the workflow relays, whole, so its seal holds')
+        self.assertEqual({k: probe[k] for k in probe if k != 'observedAt'}, {k: full[k] for k in probe if k != 'observedAt'})
 
     def test_the_repo_named_is_read_instead_of_the_checkouts(self):
         answers = {k.replace('o/r', 'up/r'): v for k, v in self.answers([HEAD]).items()}

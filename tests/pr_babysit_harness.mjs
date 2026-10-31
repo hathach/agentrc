@@ -388,8 +388,9 @@ async function run(opts = {}) {
     if (label.startsWith('reviews:probe#')) {
       const r = await reading(cycleOf(label), prompt)
       if (opts.probe === null) return null
-      const line = { headSha: r.headSha, observedAt: r.observedAt, fingerprint: r.fingerprint, bots: r.bots, ...(opts.probe || {}) }
-      return conforms(options.schema, sealLine(line), label)
+      if (opts.probe?.error) return conforms(options.schema, opts.probe, label)   // the relay's copy of an error line, emptied
+      const { headSha, observedAt, headEventAt, headEventEvidence, fingerprint, bots } = r
+      return conforms(options.schema, sealLine({ headSha, observedAt, headEventAt, headEventEvidence, fingerprint, bots, ...(opts.probe || {}) }), label)
     }
     if (label === 'scope:check') {
       // scope_check.py's receipt over the paths the prompt asked it for; opts.lsFiles keeps those it accepts.
@@ -7487,6 +7488,18 @@ test('a quota wait probes harvest.py instead of validating until CodeRabbit leav
     reviewsPerCycle: () => quiet([++n < 3 ? limitedCr(at(20)) : bot('coderabbit')]) })
   assert.equal(dead.result.pass, true, dead.result.reason)
   assert.deepEqual(validated(dead.labels), ['reviews#1', 'reviews#2', 'reviews#3'])
+  // A probe GitHub refused stops the launch as the validator's refusal would, the validator not dispatched to be refused.
+  const refused = await run({ args: { coderabbitTrigger: true, maxCycles: 1 }, napClock: true,
+    probe: { headSha: '', observedAt: '', headEventAt: null, headEventEvidence: '', fingerprint: '', bots: [], seal: '',
+      error: LIMITED_REVIEWS.rateLimit.error, rateLimit: LIMIT }, reviewsPerCycle: () => quiet([limitedCr(at(20))]) })
+  assert.deepEqual([refused.result.reason, refused.result.rateLimit], ['github-rate-limited', LIMITED_REVIEWS.rateLimit])
+  assert.deepEqual(validated(refused.labels), ['reviews#1'])
+  // A reopen on the same head during the wait restarts the review clock from the probe, not the stale report.
+  n = 0
+  const reopened = await run({ args: { coderabbitTrigger: true, maxCycles: 1 }, napClock: true,
+    reviewsPerCycle: () => ({ ...quiet([++n < 3 ? limitedCr(at(20)) : bot('coderabbit')]), headEventAt: [at(-5), at(2)][n - 1] ?? null }) })
+  assert.deepEqual(probes(reopened.labels), ['reviews:probe#2', 'reviews:probe#3'])
+  assert.equal(reopened.result.state.reviewClock.eventAt, at(2))
 })
 
 test('two lost hourly races on an unchanged limit are followed by another request and a review', async () => {

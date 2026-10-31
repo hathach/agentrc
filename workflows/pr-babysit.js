@@ -540,12 +540,14 @@ const REVIEWS = {
     rateLimit: { ...RATE_LIMIT, required: [...RATE_LIMIT.required, 'error'], properties: { ...RATE_LIMIT.properties, error: { type: 'string' } } },
   },
 }
-// harvest.py --probe: a reading's head, bots and fingerprint, no comments; what a quota wait compares (#359).
+// harvest.py --probe: a reading's head, head event, bots and fingerprint, no comments; what a quota wait compares (#359).
 const PROBE = withSeal({
-  type: 'object', additionalProperties: false, required: ['headSha', 'observedAt', 'fingerprint', 'bots'],
+  type: 'object', additionalProperties: false,
+  required: ['headSha', 'observedAt', 'headEventAt', 'headEventEvidence', 'fingerprint', 'bots'],
   properties: {
-    error: { type: 'string' }, rateLimit: REVIEWS.properties.rateLimit,
-    headSha: { type: 'string' }, observedAt: { type: 'string' }, fingerprint: { type: 'string' }, bots: REVIEWS.properties.bots,
+    error: { type: 'string' }, rateLimit: RATE_LIMIT, headSha: { type: 'string' }, observedAt: { type: 'string' },
+    headEventAt: REVIEWS.properties.headEventAt, headEventEvidence: REVIEWS.properties.headEventEvidence,
+    fingerprint: { type: 'string' }, bots: REVIEWS.properties.bots,
   },
 })
 // code-writer's output contract verbatim: a schema missing a key the role returns rejects a conformant reply.
@@ -744,8 +746,10 @@ function shq (s) { return `'${String(s).replace(/'/g, `'\\''`)}'` }
 const relayed = (schema) => {
   const EMPTY = { boolean: 'false', string: "''", array: '[]', integer: '0' }
   const empty = schema.required.map(k => {
-    if (!(schema.properties[k].type in EMPTY)) throw new Error(`relayed: no empty value for ${k}`)
-    return `${k} = ${EMPTY[schema.properties[k].type]}`
+    const type = schema.properties[k].type
+    if (nullable(schema.properties[k])) return `${k} = null`
+    if (!(type in EMPTY)) throw new Error(`relayed: no empty value for ${k}`)
+    return `${k} = ${EMPTY[type]}`
   })
   // #33: a Haiku copy of a line without error once wrote `"error": ,` five times over.
   return 'and return the JSON object on its last stdout line unchanged; a line without error gets no error member. ' +
@@ -2580,6 +2584,8 @@ const probeReviews = async (cycle) => {
     `${waitedOn.length ? ` --auto-run ${waitedOn.join(',')}` : ''} --probe\` ` + relayed(PROBE),
     { label: `reviews:probe#${cycle}`, phase: 'Triage', model: 'haiku', effort: 'low', schema: PROBE },
   )
+  // GitHub refused the probe: the validator's harvest would be refused too
+  if (p && p.rateLimit) return { rateLimit: { ...p.rateLimit, error: p.error } }
   const last = JSON.parse(quotaRead.json)
   const cr = p && !p.error && p.bots.find(b => b.bot === 'coderabbit')
   const why = !p ? 'the probe died' : p.error ? p.error : p.headSha !== expectedHead ? 'the head moved'
@@ -2589,7 +2595,7 @@ const probeReviews = async (cycle) => {
     return null
   }
   log(`cycle ${cycle}: probe — CodeRabbit still rate-limited and nothing new on the head; the validator's last report stands`)
-  return { ...last, observedAt: p.observedAt, bots: p.bots }
+  return { ...last, observedAt: p.observedAt, headEventAt: p.headEventAt, headEventEvidence: p.headEventEvidence, bots: p.bots }
 }
 const runLanes = async (cycle, entry, lanes) => {
   let ciPromise = null
