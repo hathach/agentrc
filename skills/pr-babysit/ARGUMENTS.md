@@ -164,7 +164,10 @@ A key not listed here throws before anything runs.
   force-push) the user authorized: with the checkout at it and no unpublished
   candidate, the state is re-pinned to it unaudited, keeping cycles used,
   answers, decisions, holds and deferrals; passed only on the user's word,
-  never with `adoptHead`; per launch.
+  never with `adoptHead`; per launch. Each fix note of ours whose cited commit
+  the new head no longer holds, or whose commit no state recorded, comes back
+  as a `rejudge` would, its reason naming the commit now carrying the same
+  patch when exactly one does.
 - `rejudge`: `[{ commentId, reason }]`: answered comments for the caller to
   judge again, such as replies citing code a rewrite dropped, resolved threads
   included; passed on the user's word, or under chief's rule for a reply of

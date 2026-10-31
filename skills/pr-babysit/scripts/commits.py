@@ -6,6 +6,7 @@
   commits.py head --parent P PATH...  audit the commit at HEAD, made on P from PATH
   commits.py chain FROM TO --published P --base B --tip T  audit FROM..TO for adoption (full SHAs), P the PR's head,
     B the base head GitHub recorded for it, T its base branch's live tip
+  commits.py cited HEAD SHA...  whether a rewritten PR head still holds each commit our fix notes cite
 
 `commit` stages PATH and runs `git commit --only`, so nothing staged beside
 it is taken; it prints {committed, detail}: committed false, with git's last
@@ -43,9 +44,14 @@ be published: HEAD still at P, the link refused, a path outside PATH, a change
 to PATH left uncommitted (`git status --porcelain -z --untracked-files=all -- PATH`), or a blank
 message. PATH is never read as an option or as pathspec magic.
 
+`cited` (full SHAs) reports head as given and cited, one {sha, reachable, replacement} per SHA in order:
+reachable true when HEAD holds it, null when the checkout lacks the commit, else false, with replacement
+the one commit between the fork point and HEAD carrying the same patch (`git patch-id --stable`), null
+when none or several do.
+
 stdout ends with one JSON line: `commit` prints {committed, detail}, `head` {parent, scope, sha, entries,
 refusal}, `chain` {from, to, published, base, tip, commits, paths, unpublished,
-mergeOnly, changes, refusal}, each line but an error one with its `seal` (facts.sealed). Exit 0
+mergeOnly, changes, refusal}, `cited` {head, cited}, each line but an error one with its `seal` (facts.sealed). Exit 0
 with that line; exit 2 with {"error": ...} when git cannot answer or the
 arguments are wrong, or when no base in the checkout holds a merge link's
 second parent while B or T is not in the checkout.
@@ -221,6 +227,36 @@ def read_receipt(path, request, parent, paths):
     return {'request': request, 'parent': parent, 'scope': paths, **facts}
 
 
+def patch_id(sha):
+    """git's stable patch id of commit sha, '' for one with no patch (a merge, an empty commit)."""
+    status, out, err = attempt('git', 'patch-id', '--stable', input=git('show', '--format=', sha))
+    if status:
+        raise Unusable(f'git patch-id {sha}: {err.strip()}')
+    return out.split(' ')[0]
+
+
+def cited(head, shas):
+    """#361: our fix notes cite repair commits; a rewrite may have replaced them."""
+    head, found, ids = full(head), [], {}
+    for sha in map(full, shas):
+        if attempt('git', 'cat-file', '-e', f'{sha}^{{commit}}')[0]:
+            found.append({'sha': sha, 'reachable': None, 'replacement': None})
+            continue
+        if run('git', 'merge-base', '--is-ancestor', sha, head, ok=(0, 1))[0] == 0:
+            found.append({'sha': sha, 'reachable': True, 'replacement': None})
+            continue
+        mine, same = patch_id(sha), []
+        if mine:
+            fork = run('git', 'merge-base', sha, head, ok=(0, 1))[1].strip()  # none for unrelated histories
+            for c in git('rev-list', '--no-merges', f'{fork}..{head}' if fork else head).split():
+                if c not in ids:
+                    ids[c] = patch_id(c)
+                if ids[c] == mine:
+                    same.append(c)
+        found.append({'sha': sha, 'reachable': False, 'replacement': same[0] if len(same) == 1 else None})
+    return {'head': head, 'cited': found}
+
+
 def collect(argv):
     if len(argv) > 5 and argv[:2] == ['commit', '--receipt'] and argv[3] == '--request':
         return make(argv[5:], argv[2], argv[4])
@@ -232,7 +268,9 @@ def collect(argv):
         return head(argv[2], argv[3:])
     if len(argv) == 9 and argv[0] == 'chain' and argv[3] == '--published' and argv[5] == '--base' and argv[7] == '--tip':
         return chain(argv[1], argv[2], argv[4], argv[6], argv[8])
-    raise Unusable('usage: commits.py commit [--receipt FILE --request R] PATH... | commits.py receipt FILE --request R --parent P PATH... | commits.py head --parent P PATH... | commits.py chain FROM TO --published P --base B --tip T')
+    if len(argv) > 2 and argv[0] == 'cited':
+        return cited(argv[1], argv[2:])
+    raise Unusable('usage: commits.py commit [--receipt FILE --request R] PATH... | commits.py receipt FILE --request R --parent P PATH... | commits.py head --parent P PATH... | commits.py chain FROM TO --published P --base B --tip T | commits.py cited HEAD SHA...')
 
 
 if __name__ == '__main__':

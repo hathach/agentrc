@@ -620,6 +620,20 @@ const TRIGGER = withSeal({
     retryAt: { type: ['string', 'null'] }, commentId: { type: ['integer', 'null'] }, phase: { type: ['string', 'null'] },
   },
 })
+// commits.py cited: whether a rewritten head still holds each commit our fix notes cite (#361).
+const CITED = withSeal({
+  type: 'object', additionalProperties: false, required: ['head', 'cited'],
+  properties: {
+    error: { type: 'string' }, head: { type: 'string' },
+    cited: {
+      type: 'array',
+      items: {
+        type: 'object', additionalProperties: false, required: ['sha', 'reachable', 'replacement'],
+        properties: { sha: { type: 'string' }, reachable: { type: ['boolean', 'null'] }, replacement: { type: ['string', 'null'] } },
+      },
+    },
+  },
+})
 const ADOPT_AUDIT = withSeal({
   type: 'object', additionalProperties: false,
   required: ['from', 'to', 'published', 'base', 'tip', 'commits', 'paths', 'unpublished', 'mergeOnly', 'changes', 'refusal'],
@@ -1892,9 +1906,11 @@ for (const x of rejudgeArg) {
 }
 // A refutation or an answer by hand settles the comment; a fix note settles only its notes.
 const pay = (commentId, how, digest, sonarNote) => {
-  answeredWith.set(commentId, { how, digest, ...(sonarNote && how !== 'deferral' ? { sonar: sonarNote } : {}) })
-  reanswer.delete(commentId)
   const d = debt.get(commentId)
+  // The repair commit a fix note cites, so a rewrite that replaces it can hand the note back (#361).
+  const sha = how === 'fixNote' && d && d.attempt && d.attempt.repair ? d.attempt.repair.sha : null
+  answeredWith.set(commentId, { how, digest, ...(sha ? { sha } : {}), ...(sonarNote && how !== 'deferral' ? { sonar: sonarNote } : {}) })
+  reanswer.delete(commentId)
   if (!d) return
   d.notes.clear()
   delete d.attempt
@@ -3358,6 +3374,31 @@ const rebased = rebasedHead !== null ? { from: restored.expectedHead, to: rebase
 if (rebased) log(`preflight: re-pinned ${rebased.from.slice(0, 7)} -> ${rebased.to.slice(0, 7)}, the PR history the caller rewrote, unaudited; cycles, answers, decisions, holds and deferrals kept`)
 // A rewrite renamed our repair commits: a pending fix note keeps its body but can no longer be posted on a judgment naming one.
 if (rebased) for (const d of debt.values()) if (d.attempt) delete d.attempt.repair
+// #361: a posted fix note citing a commit the rewrite replaced is handed back as a rejudge is, with the commit now
+// carrying its patch when exactly one does; one whose commit was never recorded (an older state) is handed back too.
+if (rebased) {
+  const notes = [...answeredWith].filter(([id, a]) => a.how === 'fixNote' && !(debt.get(id) && debt.get(id).rejudge))
+  const shas = [...new Set(notes.map(([, a]) => a.sha).filter(Boolean))]
+  const read = shas.length ? await relayOnce(
+    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`${PY} ${COMMITS_SCRIPT} cited ${rebased.to} ${shas.join(' ')}\` ` + relayed(CITED),
+    { label: 'rebase:cited', phase: 'Triage', model: 'haiku', effort: 'low', schema: CITED },
+  ) : null
+  const unread = !shas.length ? null : !read ? 'the relay died' : read.error ? read.error
+    : read.head !== rebased.to || read.cited.map(c => c.sha).join() !== shas.join() ? 'the reading names another head or other commits' : null
+  const at = new Map(read && !unread ? read.cited.map(c => [c.sha, c]) : [])
+  for (const [id, a] of notes) {
+    const c = at.get(a.sha)
+    const why = !a.sha ? 'our fix note names no recorded commit (a state older than #361)'
+      : unread ? `our fix note's commit ${a.sha.slice(0, 7)} could not be checked: ${unread}`
+      : c.reachable === true ? null
+      : c.reachable === null ? `our fix note's commit ${a.sha.slice(0, 7)} is not in the checkout`
+      : `our fix note cites ${a.sha.slice(0, 7)}, which the rewritten head no longer holds` +
+        (c.replacement ? `; ${c.replacement} carries the same patch` : '; no single commit there carries the same patch')
+    if (!why) continue
+    debtEntry(id).rejudge = { reason: `rewrite to ${rebased.to.slice(0, 7)}: ${why}` }
+    log(`preflight: comment ${id} handed back — ${why}`)
+  }
+}
 expectedHead = adoption ? adoption.from : pinned.prHead.trim()
 pin = currentPin
 log(`preflight: ${pinned.prRepo} ${pinned.branch}@${pinned.head.slice(0, 7)} tracking ${pinned.remote}, clean`)

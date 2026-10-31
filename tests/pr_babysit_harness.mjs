@@ -234,6 +234,14 @@ async function run(opts = {}) {
     if (label === 'preflight' || label === 'preflight.retry') {
       return patch({ ...PIN, head, prHead }, opts.preflight)
     }
+    if (label === 'rebase:cited' || label === 'rebase:cited.retry') {
+      // commits.py cited: every SHA still on the head unless opts.cited (shas, head) answers otherwise.
+      const [, head, list] = String(prompt).match(/commits\.py cited ([0-9a-f]{40}) ([0-9a-f ]+)`/)
+      const shas = list.trim().split(' ')
+      const answer = typeof opts.cited === 'function' ? opts.cited(shas, head)
+        : { head, cited: shas.map(sha => ({ sha, reachable: true, replacement: null })) }
+      return answer === null ? null : conforms(options.schema, answer, label)
+    }
     if (label === 'adopt:audit' || label === 'adopt:audit.retry') {
       // commits.py echoes the FROM it was given: the state's expectedHead, or the live PR head without a pinned state.
       const fallback = chainAudit([opts.args?.adoptHead], undefined, { from: String(prompt).match(/commits\.py chain ([0-9a-f]{40}) /)[1] })
@@ -5454,6 +5462,7 @@ test('a verified review-body receipt pays like an issue comment', async () => {
   const { result } = await run({ args: { autoPush: true, maxCycles: 2 }, reviewsPerCycle: validOnce, reviewBody: (id) => id === 1 })
   assert.equal(result.pass, true, result.reason)
   assert.deepEqual(result.state.answeredWith.map(([id, a]) => [id, a.how]), [[1, 'fixNote']])
+  assert.equal(result.state.answeredWith[0][1].sha, result.history[0].reviewPush.sha, 'the repair it cites is kept for a later rewrite (#361)')
   assert.equal(result.history[0].fixNotePosts.detail, 'posted and read back')
 })
 
@@ -6271,6 +6280,27 @@ test('a rebased PR head re-pins the state and keeps its budget and obligations, 
   assert.equal(result.state.cyclesUsed, 3)
   assert.deepEqual(result.state.answeredWith, state.answeredWith)
   assert.ok(result.state.holds.some(([id]) => id === '8#1'), 'a hold is kept until a harvest reconciles it')
+})
+
+test('a re-pin hands back each fix note whose cited commit the rewrite replaced, with the commit now carrying its patch (#361)', async () => {
+  const [OLD, KEPT, GONE, NEW] = ['1', '2', '3', '4'].map(c => c.repeat(40))
+  const state = adoptionState({ answeredWith: [
+    [7, { how: 'fixNote', digest: 'd7', sha: OLD }], [8, { how: 'fixNote', digest: 'd8', sha: KEPT }],
+    [9, { how: 'fixNote', digest: 'd9', sha: GONE }], [10, { how: 'fixNote', digest: 'd10' }], [11, { how: 'refutation', digest: 'd11' }]] })
+  const cited = (shas, head) => ({ head, cited: shas.map(sha => ({ sha, reachable: sha === KEPT, replacement: sha === OLD ? NEW : null })) })
+  const { result, calls, logs } = await run({ args: rebaseArgs(state), preflight: { head: FOREIGN, prHead: FOREIGN }, cited })
+  assert.match(calls.find(c => c.label === 'rebase:cited').prompt, new RegExp(`commits\\.py cited ${FOREIGN} ${OLD} ${KEPT} ${GONE}\``))
+  const rejudged = Object.fromEntries(result.state.debt.filter(([, d]) => d.rejudge).map(([id, d]) => [id, d.rejudge.reason]))
+  assert.deepEqual(Object.keys(rejudged).map(Number), [7, 9, 10], logs.join('\n'))
+  assert.match(rejudged[7], new RegExp(`cites 1111111, which the rewritten head no longer holds; ${NEW} carries the same patch`))
+  assert.match(rejudged[9], /no single commit there carries the same patch/)
+  assert.match(rejudged[10], /names no recorded commit \(a state older than #361\)/)
+  // An unreadable check hands back every cited note rather than vouch for any.
+  const dead = await run({ args: rebaseArgs(state), preflight: { head: FOREIGN, prHead: FOREIGN }, cited: () => null })
+  assert.deepEqual(dead.result.state.debt.filter(([, d]) => d.rejudge).map(([id]) => id), [7, 8, 9, 10])
+  // Without a rewrite nothing is checked.
+  const plain = await run({ args: adoptionArgs(state, { adoptHead: undefined }) })
+  assert.equal(plain.labels.includes('rebase:cited'), false)
 })
 
 test('a re-pin is refused when the checkout is not the rebased head or a candidate is unpublished', async () => {
