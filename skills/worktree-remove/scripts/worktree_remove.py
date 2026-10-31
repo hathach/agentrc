@@ -311,6 +311,7 @@ def main(argv=None):
                 raise wc.Keep(wc.busy_with(extra))
         else:
             wc.check_terminals(p['root'])
+            wc.check_processes(p['root'])  # last: one may have moved in since the content check looked
     except (wc.Keep, OSError) as why:
         print(f'worktree_remove: refused, nothing changed: {p["root"]} changed: {why}', file=sys.stderr)
         return 3
@@ -482,6 +483,7 @@ def worker(plan_file):
         if wc.head_branch(root) != (tuple(p['head']) if p['head'] else None):
             raise wc.Keep('its branch or tip moved since the gate')
         wc.check_terminals(root)
+        wc.check_processes(root)  # last: one may have moved in since the content check looked
         return remove(p, {Path(path): (common, tuple(head) if head else None) for path, common, head in p['siblings']})
     except (wc.Keep, OSError) as why:
         wc.log(f'worker {op}: nothing removed: {root}: {why}')

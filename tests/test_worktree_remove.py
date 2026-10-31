@@ -111,6 +111,23 @@ class Rig(unittest.TestCase):
 
         return mock.patch.object(wr, 'plan', then)
 
+    def moving_in_during_check_repo(self, after=1):
+        """A process starts working in the worktree during the after-th check_repo of it, past the content
+        check's look at its processes; the list holds it once started."""
+        check, seen, holder = wr.wc.check_repo, [], []
+
+        def then_moved_in(tree):
+            if Path(tree) == self.parent:
+                seen.append(tree)
+                if len(seen) == after:
+                    holder.append(subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], cwd=tree))
+                    self.addCleanup(holder[0].wait)
+                    self.addCleanup(holder[0].kill)
+            return check(tree)
+
+        self.patch(wr.wc, 'check_repo', then_moved_in)
+        return holder
+
     def assertRefused(self, text, *argv):
         rc, out = self.run_remove(*argv)
         self.assertEqual(rc, 3, out)
@@ -186,6 +203,16 @@ class Remove(Rig):
             rc, out = self.run_remove()
         self.assertEqual(rc, 3, out)
         self.assertIn(f'{self.parent} changed: herdr-core terminals work there: t5', out)
+        self.assertTrue((self.parent / '.git').exists())
+        self.assertFalse(self.reports.exists())
+
+    @linux
+    def test_a_process_arriving_during_the_last_content_check_refuses_the_worktree(self):
+        holder = self.moving_in_during_check_repo(after=2)  # the plan's check, then the last one
+        rc, out = self.run_remove()
+        self.assertEqual(rc, 3, out)
+        self.assertIn(f'{self.parent} changed: a process works in it: ', out)
+        self.assertIn(f'(pid {holder[0].pid})', out)
         self.assertTrue((self.parent / '.git').exists())
         self.assertFalse(self.reports.exists())
 
@@ -835,6 +862,14 @@ class Handoff(Rig):
         self.assertEqual(wr.worker(files['plan']), 3)
         self.assertEqual(hc.killed(), ['t5'])
         self.assertTrue(self.parent.exists())
+
+    def test_a_process_arriving_during_the_workers_content_check_stops_it(self):
+        hc, files = self.prepared()
+        Path(files['ack']).write_text('go')
+        holder = self.moving_in_during_check_repo()
+        self.assertEqual(wr.worker(files['plan']), 3)
+        self.assertTrue((self.parent / '.git').exists())
+        self.assertIn(f'(pid {holder[0].pid})', (self.reports / 'log').read_text(encoding='utf-8'))
 
     def test_the_worker_removes_only_the_siblings_the_plan_approved(self):
         hc, files = self.prepared()
