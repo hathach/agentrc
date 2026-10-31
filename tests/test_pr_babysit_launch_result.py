@@ -4,13 +4,12 @@ import json
 import re
 import subprocess
 import sys
-import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import git_env, guard_survivors  # noqa: E402
+from helpers import git_env, guard_survivors, tmpdir  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location('launch_result', ROOT / 'skills/pr-babysit/scripts/launch_result.py')
@@ -60,9 +59,7 @@ def setUpModule():
 
 class LaunchResultTest(unittest.TestCase):
     def setUp(self):
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        self.dir = Path(tmp.name)
+        self.dir = tmpdir(self)
         self.states = self.dir / 'states'
         patch = mock.patch.object(launch_result, 'STATES', self.states)
         patch.start()
