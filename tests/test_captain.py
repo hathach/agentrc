@@ -1496,9 +1496,12 @@ class AcceptTest(RelayCase):
             self.as_target(captain.accept, self.action, address='t3')
         self.assertEqual(self.count('refused'), 0)
         self.terminals['t2'] = {**pinned('t2'), 'started': 99}
+        self.me = 't2'
         with mock.patch('builtins.print') as out, self.assertRaises(SystemExit) as e:
-            self.as_target(captain.accept, self.action)
+            captain.accept(self.action)
+        self.me = 't1'
         self.assertEqual(e.exception.code, 2)
+        self.assertIn('recorded as refused', str(out.call_args_list))   # die prints through print too
         self.assertNotIn('merge o/r#12', str(out.call_args_list))
         [rec] = [r for r in captain.records() if r['type'] == 'refused']
         self.assertEqual(rec['by'], captain.identity(captain.find('t2')))
