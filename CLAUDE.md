@@ -3,14 +3,14 @@
 User-wide rules are in `instructions/user.md`; edit them there, and keep
 `~/.codex/AGENTS.md` a symlink to them.
 
-- For both Claude and Codex, review and simplify changes to `cowork`
-  (instructions, scripts, tests or the `lib/` modules it imports) through
-  the installed cowork from the primary checkout, run from the task
-  worktree in a dedicated read-only lane, after checking that the installed
-  copy and the `lib/` modules it imports resolve outside the task worktree
-  and are unchanged; keep them unchanged until the reply is collected. If no
-  working unchanged copy and its `lib/` modules are available, report review
-  and simplification as pending.
+- For both Claude and Codex, run the cowork-routed reviews of a change to
+  `cowork` (its instructions, scripts, tests or the `lib/` modules it
+  imports) through the installed cowork, in a read-only lane run from the
+  task worktree. Before sending and again after collecting the reply, check
+  that the installed copy resolves outside the task worktree and that its
+  `skills/cowork` and `lib/` hold none of the task's commits and no
+  uncommitted edits; if a check fails, or no such copy works, report that
+  review as pending.
 - Verify every change with `python -X utf8 -m unittest discover -s tests`,
   which also runs the workflow harnesses under node.
 - `pr-review` dimensions for this repo (no firmware, so no hardware

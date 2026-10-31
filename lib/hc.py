@@ -39,8 +39,7 @@ def program():
 def run(*args, timeout, caller=None):
     """(exit status, parsed stdout or None, error kind or None, message) of `hc args`; exit None with kind 'timeout'
     past the deadline, or 'spawn_failed' when hc did not start (not on PATH, an argument past the OS limit). caller,
-    the sender's terminal address, is passed as HC_TERMINAL_ID (the rest of the environment as is); hc takes it as the
-    caller only while HC_TERMINAL_SOCKET is unset or names the core it talks to, and sends untagged otherwise."""
+    the sender's terminal address, is passed as HC_TERMINAL_ID (the rest of the environment as is)."""
     env = {**os.environ, 'HC_TERMINAL_ID': caller} if caller else None
     exe = program()
     if exe is None:
