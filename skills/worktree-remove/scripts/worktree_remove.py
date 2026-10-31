@@ -47,9 +47,11 @@ path is spelled, is admitted (`handoff/<digest>.json` beside the reports): anoth
 worker ends, or until its worker terminal and its caller are both gone, never on time alone. The caller
 writes the worker an immutable plan (the log, hc and each terminal's identity, nothing taken from the
 core's environment), waits up to READY_S for its ready, answers go and returns 0 having printed the
-handoff; a worker without that answer within ACK_S closes nothing. The worker checks each terminal still
-runs the program planned, kills them, waits up to END_S for them and their processes to end, runs PATH's
-content and terminal checks again and removes as above, logging each step: its terminal goes when it ends.
+handoff; a worker without that answer within ACK_S closes nothing. The worker checks every terminal still
+runs the program planned, then kills each, the caller's own last, after checking it again (hc kills by
+address: a program swapped in between that check and the kill goes too), waits up to END_S for them and
+their processes to end, runs PATH's content and terminal checks again and removes as above, its cleanup
+limited to the siblings the plan let go, logging each step: its terminal goes when it ends.
 
 --dry-run runs every check and lookup (fetching remote-tracking refs) and prints the report
 without writing it or removing anything.
@@ -60,6 +62,7 @@ or a dry run with nothing pending,
 a sibling or branch, or stopped at a replacement parent (the log has why and the retry).
 """
 import argparse
+import contextlib
 import hashlib
 import importlib.util
 import json
@@ -324,14 +327,27 @@ def main(argv=None):
 
 
 def created(path, text):
-    """Whether this call created path holding text; False when it exists already (O_EXCL decides races)."""
+    """Whether this call created path holding text, whole from its first appearance; False when it exists
+    already. A hard link publishes it: it never replaces another's file, nor shows a half-written one."""
+    draft = f'{path}.{os.getpid()}.{secrets.token_hex(4)}'
+    with open(draft, 'x', encoding='utf-8') as f:
+        f.write(text)
     try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.link(draft, path)
+        return True
     except FileExistsError:
         return False
-    with os.fdopen(fd, 'w', encoding='utf-8') as f:
-        f.write(text)
-    return True
+    finally:
+        os.unlink(draft)
+
+
+@contextlib.contextmanager
+def admitting(admission):
+    """Serialize every change to the admissions: taking one, releasing a stale one, releasing one's own."""
+    import fcntl  # the handoff needs /proc, so Linux
+    with open(admission.parent / 'admissions.lock', 'a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
 
 
 def admission_of(root):
@@ -342,7 +358,7 @@ def admission_of(root):
 def admit(admission, record):
     """Hold admission for record's removal; Refused while another removal of the same tree may still run.
     A record is released only when its worker terminal is gone and its caller too, never on time alone."""
-    for _ in range(2):
+    with admitting(admission):
         if created(admission, json.dumps(record)):
             return
         try:
@@ -355,17 +371,19 @@ def admit(admission, record):
         if not gone:
             raise Refused(f'another removal of {record["root"]} runs (op {held["op"]}, worker terminal '
                           f'{held["worker"]}); it releases {admission} when it ends')
-        release(admission, held['op'])
+        admission.unlink()
         wc.log(f'released the stale admission of op {held["op"]} for {record["root"]}: its worker and caller are gone')
-    raise Refused(f'another removal of {record["root"]} took {admission} meanwhile')
+        if not created(admission, json.dumps(record)):
+            raise Refused(f'another removal of {record["root"]} took {admission} meanwhile')
 
 
 def release(admission, op):
-    try:
-        if json.loads(admission.read_text(encoding='utf-8')).get('op') == op:
-            admission.unlink()
-    except (OSError, ValueError):
-        pass
+    with admitting(admission):
+        try:
+            if json.loads(admission.read_text(encoding='utf-8')).get('op') == op:
+                admission.unlink()
+        except (OSError, ValueError):
+            pass
 
 
 def handoff(p, out):
@@ -383,7 +401,8 @@ def handoff(p, out):
         return 3
     created(files['plan'], json.dumps(dict(
         op=op, admission=str(admission), root=str(p['root']), common=p['common'], head=p['head'], force=p['force'],
-        closing=p['closing'], hc=hc, log=str(wc.LOG), report=str(out), **files)))
+        closing=sorted(p['closing'], key=lambda t: t['address'] == p['caller']), siblings=[str(s['path']) for s in p['checkouts'][1:] if s['why'] is None],
+        hc=hc, log=str(wc.LOG), report=str(out), **files)))
     launch = wc.run([hc, 'run', '--bg', '--no-parent', '--no-notify', '--rm', '--cwd', str(admission.parent),
                      '--name', name, '--label', f'agentrc.worktree-remove={p["root"]}', '--',
                      sys.executable, str(Path(__file__).resolve()), '--worker', files['plan']], timeout=wc.HC_TIMEOUT)
@@ -438,12 +457,16 @@ def worker(plan_file):
         if word != 'go':
             wc.log(f'worker {op}: the handoff was {word}; closed nothing, removed nothing')
             return 3
-        now = [identified(hc, t) for t in p['closing']]
-        moved = [t for t, n in zip(p['closing'], now) if n and (n['pid'], n['created_ms']) != (t['pid'], t['created_ms'])]
-        if moved:
-            raise wc.Keep('another program runs in ' + ', '.join(t['address'] for t in moved) + ' than the plan found')
-        for t, n in zip(p['closing'], now):
-            if n:
+        def moved(t):
+            n = identified(hc, t)
+            if n and (n['pid'], n['created_ms']) != (t['pid'], t['created_ms']):
+                raise wc.Keep(f'another program runs in {t["address"]} than the plan found')
+            return n
+
+        for t in p['closing']:  # all before any kill, and each again right before its own: hc kills by address
+            moved(t)
+        for t in p['closing']:  # the caller's own last
+            if moved(t):
                 wc.log(f'closing terminal {wc.label(t)} for the removal of {root}')
                 wc.run([hc, 'kill', t['address']], timeout=wc.HC_TIMEOUT)
         deadline = time.monotonic() + END_S
@@ -455,7 +478,7 @@ def worker(plan_file):
         if wc.head_branch(root) != (tuple(p['head']) if p['head'] else None):
             raise wc.Keep('its branch or tip moved since the gate')
         wc.check_terminals(root)
-        return remove(p)
+        return remove(p, {Path(s) for s in p['siblings']})
     except (wc.Keep, OSError) as why:
         wc.log(f'worker {op}: nothing removed: {root}: {why}')
         return 3
@@ -465,8 +488,9 @@ def worker(plan_file):
             Path(p[k]).unlink(missing_ok=True)
 
 
-def remove(p):
-    """git's removal of the worktree, then the cleanup of its siblings and branches."""
+def remove(p, approved=None):
+    """git's removal of the worktree, then the cleanup of its siblings and branches, only the approved ones
+    when given."""
     root, common, head = p['root'], p['common'], p['head']
     wc.log(f'running: {" ".join(command(p))}')
     try:
@@ -476,7 +500,7 @@ def remove(p):
         print(f'worktree_remove: {root}: {why}', file=sys.stderr)
         return 5
     wc.log(f'removed {root}')
-    left = wc.cleanup(root, [(common, *head)] if head else [])
+    left = wc.cleanup(root, [(common, *head)] if head else [], approved)
     if left == 2:
         print(f'worktree_remove: removed {root}, but something appeared at that path again, so its siblings '
               f'and branches were left alone; the log has the retry: {wc.LOG}', file=sys.stderr)

@@ -796,9 +796,9 @@ def plan_children(found, busy, scan=None, stop=lambda: False, spared=frozenset()
     return pending, removals, {**kept, **held}
 
 
-def cleanup(parent, branches=()):
-    """Remove parent's clean children, then delete the given branches and each removed child's;
-    a branch is (common git dir, name, tip)."""
+def cleanup(parent, branches=(), approved=None):
+    """Remove parent's clean children, only those in approved when given, then delete the given branches and
+    each removed child's; a branch is (common git dir, name, tip)."""
     parent = Path(parent)
     if os.path.lexists(parent):
         log(f'{parent} exists: not touching its children')
@@ -822,6 +822,8 @@ def cleanup(parent, branches=()):
         busy = {child: busy_with(terminals) for child, terminals in terminals_in(found).items()}
     except Keep as why:
         busy = dict.fromkeys(found, str(why))
+    if approved is not None:  # one found since the plan the human approved, or planned to stay, stays
+        busy.update({c: 'not among the siblings the approved plan removes' for c in found if c not in approved})
     scan = {}
     # once seen, stays seen: the replacement may be mid-move
     pending, removals, staying = plan_children(found, busy, scan, lambda: os.path.lexists(parent))

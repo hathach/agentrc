@@ -677,6 +677,7 @@ class FakeHc:
             self.procs[address] = proc
             self.terminals[address] = dict(address=address, cwd=str(cwd), state='live', pid=proc.pid, created_ms=1)
         self.real_run = wr.wc.run
+        self.on_kill = lambda address: None
 
     def json(self, hc, *args):
         if args[0] == 'ls':
@@ -701,6 +702,7 @@ class FakeHc:
             thread.start()
             self.threads.append(thread)
         elif argv[1] == 'kill' and argv[2] in self.procs:
+            self.on_kill(argv[2])
             self.procs[argv[2]].kill()
             self.procs[argv[2]].wait()
             self.terminals[argv[2]]['state'] = 'finished'
@@ -779,7 +781,7 @@ class Handoff(Rig):
         self.assertEqual(sorted(hc.killed()), ['t5', 't7'])
         self.assertFalse(self.parent.exists())
         self.assertFalse(self.sib.exists())
-        self.assertEqual(list(self.admission().parent.iterdir()), [])
+        self.assertEqual([f.name for f in self.admission().parent.iterdir()], ['admissions.lock'])
         launch = next(c for c in hc.calls if c[0] == 'run')
         self.assertEqual(launch[:5], ['run', '--bg', '--no-parent', '--no-notify', '--rm'])
         self.assertIn('closing terminal t7', (self.reports / 'log').read_text(encoding='utf-8'))
@@ -793,7 +795,7 @@ class Handoff(Rig):
         self.assertEqual(hc.killed()[-1:], [next(c[c.index('--name') + 1] for c in hc.calls if c[0] == 'run')])
         self.assertNotIn('t5', hc.killed())
         self.assertTrue(self.parent.exists())
-        self.assertEqual(list(self.admission().parent.iterdir()), [])
+        self.assertEqual([f.name for f in self.admission().parent.iterdir()], ['admissions.lock'])
 
     def prepared(self, op='abc'):
         """A plan and its admission as a caller leaves them before the worker starts."""
@@ -806,7 +808,8 @@ class Handoff(Rig):
                         created_ms=1) for a in ('t5', 't7')]
         Path(files['plan']).write_text(json.dumps(dict(
             op=op, admission=str(self.admission()), root=str(self.parent), common=sh(self.parent, 'rev-parse', '--git-common-dir'),
-            head=list(wr.wc.head_branch(self.parent)), force=False, closing=closing, hc=wr.wc.hc_path(),
+            head=list(wr.wc.head_branch(self.parent)), force=False, closing=closing, siblings=[str(self.sib)],
+            hc=wr.wc.hc_path(),
             log=str(wr.wc.LOG), report='r', **files)))
         return hc, files
 
@@ -826,6 +829,32 @@ class Handoff(Rig):
         self.assertEqual(hc.killed(), [])
         self.assertTrue(self.parent.exists())
         self.assertIn('another program runs in t7', (self.reports / 'log').read_text(encoding='utf-8'))
+
+    def test_a_terminal_changed_while_another_closes_is_left_running(self):
+        hc, files = self.prepared()
+        Path(files['ack']).write_text('go')
+        hc.on_kill = lambda address: hc.terminals['t7'].update(created_ms=2) if address == 't5' else None
+        self.assertEqual(wr.worker(files['plan']), 3)
+        self.assertEqual(hc.killed(), ['t5'])
+        self.assertTrue(self.parent.exists())
+
+    def test_the_worker_removes_only_the_siblings_the_plan_approved(self):
+        hc, files = self.prepared()
+        late = self.sibling('late')  # clean, but found after the human agreed
+        Path(files['ack']).write_text('go')
+        self.assertEqual(wr.worker(files['plan']), 6)
+        self.assertFalse(self.parent.exists())
+        self.assertFalse(self.sib.exists())
+        self.assertTrue(late.exists())
+        self.assertIn(f'kept {late}: not among the siblings the approved plan removes',
+                      (self.reports / 'log').read_text(encoding='utf-8'))
+
+    def test_a_published_file_is_whole_and_never_replaced(self):
+        target = self.t / 'ack'
+        self.assertTrue(wr.created(target, 'go'))
+        self.assertFalse(wr.created(target, 'lapsed'))
+        self.assertEqual(target.read_text(), 'go')
+        self.assertEqual([p.name for p in self.t.glob('ack*')], ['ack'])
 
     def test_a_second_removal_of_the_same_tree_is_refused_however_spelled(self):
         hc = self.fake()
