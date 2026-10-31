@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -60,6 +61,11 @@ class Rig(unittest.TestCase):
         self.wt.mkdir()
         sh(self.main, 'worktree', 'add', '-q', str(self.parent), '-b', 'parent')
         sh(self.parent, 'push', '-q', 'origin', 'parent')
+
+    def patch(self, target, name, value):
+        patch = mock.patch.object(target, name, value)
+        patch.start()
+        self.addCleanup(patch.stop)
 
     def repo(self, name):
         path = self.t / name
@@ -659,9 +665,6 @@ class Remove(Rig):
         self.assertEqual(self.tips('parent', 'b'), tips)
 
 
-if __name__ == '__main__':
-    unittest.main()
-
 
 class FakeHc:
     """hc for the handoff: terminals by address, each {address, cwd, pid, created_ms} backed by a real sleeping
@@ -691,14 +694,15 @@ class FakeHc:
         self.calls.append(argv[1:])
         if argv[1] == 'run' and self.start:
             name, worker = argv[argv.index('--name') + 1], argv[argv.index('--') + 1:]
-            self.terminals[name] = dict(address=name, cwd=argv[argv.index('--cwd') + 1], state='live', pid=1, created_ms=1)
+            self.terminals[name] = dict(address=name, cwd=argv[argv.index('--cwd') + 1], state='live', pid=1,
+                                        created_ms=1)
 
             def work():
                 try:
                     wr.worker(worker[-1])
                 finally:
                     self.terminals.pop(name, None)  # --rm
-            thread = __import__('threading').Thread(target=work)
+            thread = threading.Thread(target=work)
             thread.start()
             self.threads.append(thread)
         elif argv[1] == 'kill' and argv[2] in self.procs:
@@ -724,20 +728,14 @@ class Handoff(Rig):
         super().setUp()
         self.sib = self.sibling('b')
         for name, value in (('READY_S', 5), ('ACK_S', 0.3), ('END_S', 5)):
-            patch = mock.patch.object(wr, name, value)
-            patch.start()
-            self.addCleanup(patch.stop)
+            self.patch(wr, name, value)
 
     def fake(self, start=True, own=True):
         hc = FakeHc(self, {'t5': self.parent, 't7': self.sib}, start)
-        for target, attr in ((wr.wc, 'hc_json'), (wr.wc, 'run')):
-            patch = mock.patch.object(target, attr, getattr(hc, 'json' if attr == 'hc_json' else 'run'))
-            patch.start()
-            self.addCleanup(patch.stop)
+        self.patch(wr.wc, 'hc_json', hc.json)
+        self.patch(wr.wc, 'run', hc.run)
         mine = hc.terminals['t5'] if own else None
-        patch = mock.patch.object(wr, 'caller_terminal', lambda _: mine)
-        patch.start()
-        self.addCleanup(patch.stop)
+        self.patch(wr, 'caller_terminal', lambda _: mine)
         return hc
 
     def admission(self):
@@ -758,9 +756,6 @@ class Handoff(Rig):
 
     def test_not_from_hc_the_terminals_refuse_as_before(self):
         self.fake(own=False)
-        patch = mock.patch.object(wr, 'caller_terminal', lambda _: None)
-        patch.start()
-        self.addCleanup(patch.stop)
         self.assertRefused('herdr-core terminals work there: t5 (in no herdr-app space)')
 
     def test_the_caller_is_proved_by_its_ancestry_not_by_its_variable(self):
@@ -802,13 +797,16 @@ class Handoff(Rig):
         base = self.admission().parent
         base.mkdir(parents=True)
         files = {k: str(base / f'{op}.{k}') for k in ('plan', 'ready', 'ack')}
-        self.admission().write_text(json.dumps(dict(op=op, root=str(self.parent), worker=f'wtrm-{op}', caller=1)))
+        self.admission().write_text(json.dumps(dict(op=op, root=str(self.parent), worker=f'wtrm-{op}', caller=1,
+                                                    caller_start=0)))
         hc = self.fake()
         closing = [dict(address=a, name=None, where=None, at=hc.terminals[a]['cwd'], pid=hc.terminals[a]['pid'],
                         created_ms=1) for a in ('t5', 't7')]
         Path(files['plan']).write_text(json.dumps(dict(
-            op=op, admission=str(self.admission()), root=str(self.parent), common=sh(self.parent, 'rev-parse', '--git-common-dir'),
-            head=list(wr.wc.head_branch(self.parent)), force=False, closing=closing, siblings=[str(self.sib)],
+            op=op, admission=str(self.admission()), root=str(self.parent),
+            common=sh(self.parent, 'rev-parse', '--git-common-dir'),
+            head=list(wr.wc.head_branch(self.parent)), force=False, closing=closing,
+            siblings=[[str(self.sib), wr.wc.common_dir(self.sib / '.git'), list(wr.wc.head_branch(self.sib))]],
             hc=wr.wc.hc_path(),
             log=str(wr.wc.LOG), report='r', **files)))
         return hc, files
@@ -849,6 +847,43 @@ class Handoff(Rig):
         self.assertIn(f'kept {late}: not among the siblings the approved plan removes',
                       (self.reports / 'log').read_text(encoding='utf-8'))
 
+    def test_the_worker_keeps_another_checkout_found_at_an_approved_path(self):
+        hc, files = self.prepared()
+        hc.procs['t7'].kill()
+        hc.procs['t7'].wait()
+        sh(self.main, 'worktree', 'remove', '--force', str(self.sib))
+        other = self.repo('other')
+        sh(other, 'worktree', 'add', '-q', str(self.sib), '-b', 'replacement-task')
+        sh(self.sib, 'push', '-q', 'origin', 'replacement-task')
+        Path(files['ack']).write_text('go')
+        self.assertEqual(wr.worker(files['plan']), 6)
+        self.assertFalse(self.parent.exists())
+        self.assertTrue(self.sib.exists())
+        self.assertTrue(sh(other, 'rev-parse', '--verify', '--quiet', 'refs/heads/replacement-task'))
+        self.assertIn(f'kept {self.sib}: not the checkout the approved plan found there',
+                      (self.reports / 'log').read_text(encoding='utf-8'))
+
+    def test_the_worker_keeps_a_checkout_replaced_during_the_cleanups_checks(self):
+        hc, files = self.prepared()
+        hc.procs['t7'].kill()
+        hc.procs['t7'].wait()
+        other, check = self.repo('other'), wr.wc.check_processes
+
+        def then_replaced(tree, *spared):  # the cleanup's last look before removing the sibling passes no spared
+            if tree == self.sib and not spared and wr.wc.head_branch(tree)[0] == 'b':
+                sh(self.main, 'worktree', 'remove', '--force', str(self.sib))
+                sh(other, 'worktree', 'add', '-q', str(self.sib), '-b', 'replacement-task')
+                sh(self.sib, 'push', '-q', 'origin', 'replacement-task')
+            return check(tree, *spared)
+
+        self.patch(wr.wc, 'check_processes', then_replaced)
+        Path(files['ack']).write_text('go')
+        self.assertEqual(wr.worker(files['plan']), 6)
+        self.assertTrue(self.sib.exists())
+        self.assertTrue(sh(other, 'rev-parse', '--verify', '--quiet', 'refs/heads/replacement-task'))
+        self.assertIn(f'kept {self.sib}: not the checkout the approved plan found there',
+                      (self.reports / 'log').read_text(encoding='utf-8'))
+
     def test_a_published_file_is_whole_and_never_replaced(self):
         target = self.t / 'ack'
         self.assertTrue(wr.created(target, 'go'))
@@ -861,7 +896,7 @@ class Handoff(Rig):
         token = self.token(self.run_remove('--dry-run')[1])
         self.admission().parent.mkdir(parents=True)
         self.admission().write_text(json.dumps(dict(op='other', root=str(self.parent), worker='wtrm-other',
-                                                    caller=os.getpid())))
+                                                    caller=os.getpid(), caller_start=wr.wc.hc.proc_start(os.getpid()))))
         hc.terminals['wtrm-other'] = dict(address='wtrm-other', cwd=str(self.t), state='live', pid=1, created_ms=1)
         rc, out = self.run_remove('--proceed', token)
         self.assertEqual(rc, 3, out)
@@ -878,7 +913,8 @@ class Handoff(Rig):
         hc = self.fake()
         token = self.token(self.run_remove('--dry-run')[1])
         self.admission().parent.mkdir(parents=True)
-        record = dict(op='dead', root=str(self.parent), worker='wtrm-dead', caller=os.getpid())
+        record = dict(op='dead', root=str(self.parent), worker='wtrm-dead', caller=os.getpid(),
+                      caller_start=wr.wc.hc.proc_start(os.getpid()))
         self.admission().write_text(json.dumps(record))
         rc, out = self.run_remove('--proceed', token)  # its caller still runs: it may yet launch
         self.assertEqual(rc, 3, out)
@@ -890,3 +926,7 @@ class Handoff(Rig):
         self.assertEqual(rc, 0, out)
         self.assertFalse(self.parent.exists())
         self.assertIn('released the stale admission of op dead', (self.reports / 'log').read_text(encoding='utf-8'))
+
+
+if __name__ == '__main__':
+    unittest.main()

@@ -78,6 +78,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))  # loaded by path, lib is not on it
+import hc  # noqa: E402
 import windows  # noqa: E402
 
 PRIVATE_REFS = ('refs/worktree/', 'refs/bisect/', 'refs/rewritten/')
@@ -416,19 +417,15 @@ def lists_processes():
     return (PROC / 'self' / 'cwd').exists()
 
 
-def parent_pid(pid):
-    """pid's parent from /proc (Linux); OSError or ValueError when it is gone."""
-    stat = (PROC / str(pid) / 'stat').read_bytes()
-    return int(stat.rsplit(b')', 1)[1].split()[1])  # after the parenthesised comm, which may hold anything
-
-
 def descendants(pids):
-    """pids and every process below them (/proc, Linux)."""
+    """pids and every process below them (/proc, Linux); none for none."""
+    if not pids:
+        return set()
     children = {}
     for entry in PROC.iterdir():
         try:
             if entry.name.isdigit():
-                children.setdefault(parent_pid(entry.name), []).append(int(entry.name))
+                children.setdefault(hc.parent_pid(entry.name), []).append(int(entry.name))
         except (OSError, IndexError, ValueError):  # gone since the listing
             continue
     found, todo = set(), list(pids)
@@ -440,26 +437,21 @@ def descendants(pids):
     return found
 
 
-def processes_in(tree, spared=frozenset()):
-    """[(pid, name)] of the processes working in tree whose /proc cwd entry is readable, but the spared pids;
-    none without /proc."""
+def check_processes(tree, spared=frozenset()):
+    """Keep a tree a process but the spared works in, as far as /proc shows readable cwd entries: removing it
+    takes the process's working directory."""
     if not lists_processes():
-        return []
-    found = []
+        return
+    root, found = os.path.realpath(tree), []
     for entry in PROC.iterdir():
-        try:
-            if entry.name.isdigit() and int(entry.name) not in spared and is_within(os.readlink(entry / 'cwd'), [tree]):
+        try:  # the kernel gives each cwd resolved already
+            cwd = entry.name.isdigit() and int(entry.name) not in spared and os.readlink(entry / 'cwd')
+            if cwd and (cwd == root or cwd.startswith(root + os.sep)):
                 found.append((int(entry.name), (entry / 'comm').read_bytes().decode(errors='backslashreplace').strip()))
         except OSError:  # gone since the listing, or another user's
             continue
-    return sorted(found)
-
-
-def check_processes(tree, spared=frozenset()):
-    """Keep a tree a process but the spared works in: removing it takes the process's working directory."""
-    found = processes_in(tree, spared)
     if found:
-        raise Keep('a process works in it: ' + ', '.join(f'{name} (pid {pid})' for pid, name in found))
+        raise Keep('a process works in it: ' + ', '.join(f'{name} (pid {pid})' for pid, name in sorted(found)))
 
 
 def check_terminals(*trees):
@@ -796,9 +788,19 @@ def plan_children(found, busy, scan=None, stop=lambda: False, spared=frozenset()
     return pending, removals, {**kept, **held}
 
 
+def unapproved(child, approved):
+    """Why child is not a checkout approved ({path: (common git dir, (branch, tip) or None)}) lets go, or None."""
+    if child not in approved:
+        return 'not among the siblings the approved plan removes'
+    if (common_dir(child / '.git'), head_branch(child)) != approved[child]:
+        return 'not the checkout the approved plan found there'
+    return None
+
+
 def cleanup(parent, branches=(), approved=None):
-    """Remove parent's clean children, only those in approved when given, then delete the given branches and
-    each removed child's; a branch is (common git dir, name, tip)."""
+    """Remove parent's clean children, when approved ({path: (common git dir, (branch, tip) or None)}) is given
+    only the checkouts it names as they were, then delete the given branches and each removed child's; a branch
+    is (common git dir, name, tip)."""
     parent = Path(parent)
     if os.path.lexists(parent):
         log(f'{parent} exists: not touching its children')
@@ -822,8 +824,10 @@ def cleanup(parent, branches=(), approved=None):
         busy = {child: busy_with(terminals) for child, terminals in terminals_in(found).items()}
     except Keep as why:
         busy = dict.fromkeys(found, str(why))
-    if approved is not None:  # one found since the plan the human approved, or planned to stay, stays
-        busy.update({c: 'not among the siblings the approved plan removes' for c in found if c not in approved})
+    for child in found if approved is not None else ():  # what the human approved, as the plan found it
+        why = unapproved(child, approved)
+        if why:
+            busy.setdefault(child, why)
     scan = {}
     # once seen, stays seen: the replacement may be mid-move
     pending, removals, staying = plan_children(found, busy, scan, lambda: os.path.lexists(parent))
@@ -843,6 +847,9 @@ def cleanup(parent, branches=(), approved=None):
                 log(f'removing {child}; its branch is retried by: {retry(parent, [branch])}')
             check_terminals(child)  # again: its checks above can take long
             check_processes(child)
+            why = approved is not None and unapproved(child, approved)
+            if why:
+                raise Keep(why)
             if os.path.lexists(parent):  # last: hc may take long too
                 log(f'{parent} exists again: not touching {child} or the children after it')
                 stopped = True

@@ -45,9 +45,10 @@ With terminals to close, the removal goes to a worker started as its own hc term
 --no-parent --rm`, named wtrm-<op>), which outlives the caller's. One removal per worktree, however its
 path is spelled, is admitted (`handoff/<digest>.json` beside the reports): another is refused until the
 worker ends, or until its worker terminal and its caller are both gone, never on time alone. The caller
-writes the worker an immutable plan (the log, hc and each terminal's identity, nothing taken from the
-core's environment), waits up to READY_S for its ready, answers go and returns 0 having printed the
-handoff; a worker without that answer within ACK_S closes nothing. The worker checks every terminal still
+writes the worker an immutable plan (the log, hc and each terminal's identity, which the worker takes from
+it rather than from the core's environment; its git and gh run in the core's), waits up to READY_S for its
+ready, answers go and returns 0 having printed the handoff; a worker without that answer within ACK_S
+closes nothing. The worker checks every terminal still
 runs the program planned, then kills each, the caller's own last, after checking it again (hc kills by
 address: a program swapped in between that check and the kill goes too), waits up to END_S for them and
 their processes to end, runs PATH's content and terminal checks again and removes as above, its cleanup
@@ -81,6 +82,7 @@ THREADS = '''query($owner: String!, $name: String!, $number: Int!, $endCursor: S
 
 
 READY_S, ACK_S, END_S = 30, 20, 30  # s the worker may take to start, the caller to answer it, the terminals to end
+HANDOFF = ('plan', 'ready', 'ack')  # the files of one handoff, beside its admission
 
 
 class Refused(Exception):
@@ -179,15 +181,15 @@ def plan(path, pending):
         closing = [t for t in (identified(hc, t) for t in closing) if t]
     except wc.Keep as why:
         raise Refused(str(why))
-    spared = frozenset(wc.descendants([t['pid'] for t in closing])) if closing else frozenset()
+    spared = frozenset(wc.descendants([t['pid'] for t in closing]))
     try:
         common, force = wc.content_check(root, spared)
     except (wc.Keep, OSError) as why:
         raise Refused(f'{root}: {why}')
 
     _, _, staying = wc.plan_children(found, {}, spared=spared)  # a busy sibling is closing or refused above
-    siblings = [dict(path=child, why=staying.get(child), head=wc.head_branch(child), common=wc.common_dir(child / '.git'))
-                for child in found]
+    siblings = [dict(path=child, why=staying.get(child), head=wc.head_branch(child),
+                     common=wc.common_dir(child / '.git')) for child in found]
     leaving = [root] + [s['path'] for s in siblings if s['why'] is None]
     head, common = wc.head_branch(root), os.path.realpath(common)
     checkouts = [dict(path=root, why=None, head=head, common=common)] + siblings
@@ -225,15 +227,7 @@ def caller_terminal(hc):
     got = wc.hc_json(hc, 'get', address)
     if not got or got.get('state') != 'live' or not isinstance(got.get('pid'), int):
         return None
-    pid = os.getpid()
-    while pid > 1:
-        try:
-            pid = wc.parent_pid(pid)
-        except (OSError, IndexError, ValueError):
-            return None
-        if pid == got['pid']:
-            return got
-    return None
+    return got if got['pid'] in wc.hc.ancestors(os.getpid())[1:] else None
 
 
 def identified(hc, t):
@@ -307,14 +301,15 @@ def main(argv=None):
     if args.dry_run:
         return 0
     try:
-        closing = p['closing'] and [t for t in (identified(p['hc'], t) for t in p['closing']) if t]
-        wc.content_check(p['root'], frozenset(wc.descendants([t['pid'] for t in closing])) if closing else frozenset())
+        live = [t for t in (identified(p['hc'], t) for t in p['closing']) if t]
+        wc.content_check(p['root'], frozenset(wc.descendants([t['pid'] for t in live])))
         if wc.head_branch(p['root']) != p['head']:
             raise wc.Keep('its branch or tip moved since the gate')
-        extra = unplanned(p, [p['root']]) if p['closing'] else None  # again: the content check can take long
-        if extra:
-            raise wc.Keep(wc.busy_with(extra))
-        if not p['closing']:
+        if p['closing']:  # again: the content check can take long
+            extra = unplanned(p, [p['root']])
+            if extra:
+                raise wc.Keep(wc.busy_with(extra))
+        else:
             wc.check_terminals(p['root'])
     except (wc.Keep, OSError) as why:
         print(f'worktree_remove: refused, nothing changed: {p["root"]} changed: {why}', file=sys.stderr)
@@ -364,8 +359,8 @@ def admit(admission, record):
         try:
             held = json.loads(admission.read_text(encoding='utf-8'))
             worker = wc.hc_json(record['hc'], 'get', held['worker'])
-            gone = (worker is None or worker.get('state') != 'live') and not (wc.PROC / str(held['caller'])).exists()
-        except (OSError, ValueError, KeyError, TypeError, wc.Keep) as why:
+            gone = (worker is None or worker.get('state') != 'live') and not caller_runs(held)
+        except (OSError, ValueError, KeyError, TypeError, wc.Keep, wc.hc.Error) as why:
             raise Refused(f'another removal of {record["root"]} holds {admission}, unreadable ({why}); '
                           'remove it once no worktree-remove worker runs')
         if not gone:
@@ -373,8 +368,15 @@ def admit(admission, record):
                           f'{held["worker"]}); it releases {admission} when it ends')
         admission.unlink()
         wc.log(f'released the stale admission of op {held["op"]} for {record["root"]}: its worker and caller are gone')
-        if not created(admission, json.dumps(record)):
-            raise Refused(f'another removal of {record["root"]} took {admission} meanwhile')
+        created(admission, json.dumps(record))  # under the lock: nobody else can have taken it
+
+
+def caller_runs(held):
+    """Whether the caller that took held still runs: its pid with the start time it had then."""
+    try:
+        return wc.hc.proc_start(held['caller']) == held['caller_start']
+    except wc.hc.Gone:
+        return False
 
 
 def release(admission, op):
@@ -393,15 +395,17 @@ def handoff(p, out):
     hc, op = p['hc'], secrets.token_hex(6)
     admission, name = admission_of(p['root']), f'wtrm-{op}'
     admission.parent.mkdir(parents=True, exist_ok=True)
-    files = {k: str(admission.parent / f'{op}.{k}') for k in ('plan', 'ready', 'ack')}
+    files = {k: str(admission.parent / f'{op}.{k}') for k in HANDOFF}
     try:
-        admit(admission, dict(op=op, root=str(p['root']), worker=name, caller=os.getpid(), hc=hc))
+        admit(admission, dict(op=op, root=str(p['root']), worker=name, caller=os.getpid(),
+                              caller_start=wc.hc.proc_start(os.getpid()), hc=hc))
     except Refused as why:
         print(f'worktree_remove: refused, nothing changed: {why}', file=sys.stderr)
         return 3
     created(files['plan'], json.dumps(dict(
         op=op, admission=str(admission), root=str(p['root']), common=p['common'], head=p['head'], force=p['force'],
-        closing=sorted(p['closing'], key=lambda t: t['address'] == p['caller']), siblings=[str(s['path']) for s in p['checkouts'][1:] if s['why'] is None],
+        closing=sorted(p['closing'], key=lambda t: t['address'] == p['caller']),
+        siblings=[[str(s['path']), s['common'], s['head']] for s in p['checkouts'][1:] if s['why'] is None],
         hc=hc, log=str(wc.LOG), report=str(out), **files)))
     launch = wc.run([hc, 'run', '--bg', '--no-parent', '--no-notify', '--rm', '--cwd', str(admission.parent),
                      '--name', name, '--label', f'agentrc.worktree-remove={p["root"]}', '--',
@@ -439,7 +443,7 @@ def worker(plan_file):
     wc.LOG, hc, op = Path(p['log']), p['hc'], p['op']  # the core's environment is not the caller's
     wc.hc_path = lambda: hc
     admission, root = Path(p['admission']), Path(p['root'])
-    p.update(root=root, caller=None)
+    p['root'] = root
     try:
         try:
             held = json.loads(admission.read_text(encoding='utf-8'))
@@ -470,7 +474,7 @@ def worker(plan_file):
                 wc.log(f'closing terminal {wc.label(t)} for the removal of {root}')
                 wc.run([hc, 'kill', t['address']], timeout=wc.HC_TIMEOUT)
         deadline = time.monotonic() + END_S
-        while (left := [t for t in p['closing'] if identified(hc, t) or (wc.PROC / str(t['pid'])).exists()]):
+        while (left := [t for t in p['closing'] if (wc.PROC / str(t['pid'])).exists() or identified(hc, t)]):
             if time.monotonic() > deadline:
                 raise wc.Keep('terminals still running after their kill: ' + ', '.join(t['address'] for t in left))
             time.sleep(0.2)
@@ -478,13 +482,13 @@ def worker(plan_file):
         if wc.head_branch(root) != (tuple(p['head']) if p['head'] else None):
             raise wc.Keep('its branch or tip moved since the gate')
         wc.check_terminals(root)
-        return remove(p, {Path(s) for s in p['siblings']})
+        return remove(p, {Path(path): (common, tuple(head) if head else None) for path, common, head in p['siblings']})
     except (wc.Keep, OSError) as why:
         wc.log(f'worker {op}: nothing removed: {root}: {why}')
         return 3
     finally:
         release(admission, op)
-        for k in ('plan', 'ready', 'ack'):
+        for k in HANDOFF:
             Path(p[k]).unlink(missing_ok=True)
 
 

@@ -125,9 +125,6 @@ class WorktreeChildren(unittest.TestCase):
                     'GIT_CONFIG_NOSYSTEM': '1', 'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t',
                     'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@t', 'GIT_CONFIG_COUNT': '1',
                     'GIT_CONFIG_KEY_0': 'protocol.file.allow', 'GIT_CONFIG_VALUE_0': 'always'}
-        for k in ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY',
-                  'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_PREFIX', 'GIT_NAMESPACE'):
-            self.env.pop(k, None)
         self.calls, self.log = self.t / 'calls', self.t / 'state' / 'agentrc' / 'worktree-remove' / 'log'
         self.env.update(STUB_LOG=str(self.calls), XDG_STATE_HOME=str(self.t / 'state'))
         gh_dir = self.t / 'gh-bin'
@@ -954,17 +951,13 @@ class WorktreeChildren(unittest.TestCase):
     @unittest.skipUnless(Path('/proc/self/cwd').exists(), 'processes listed by /proc')
     def test_a_process_working_in_the_child_keeps_it(self):
         child, other = self.child(), self.child('other')
-        # a name that is no UTF-8 (PR_SET_NAME) is shown escaped
-        holder = subprocess.Popen([sys.executable, '-c', 'import ctypes, time; '
-                                   "ctypes.CDLL(None).prctl(15, b'worker-\\xff', 0, 0, 0); print(flush=True); time.sleep(60)"],
-                                  cwd=child, stdout=subprocess.PIPE)
+        holder = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], cwd=child)
         self.addCleanup(holder.wait)
         self.addCleanup(holder.kill)
-        self.addCleanup(holder.stdout.close)
-        holder.stdout.readline()
         done = self.cleanup()
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
-        self.assertIn(f'kept {child}: a process works in it: worker-\\xff (pid {holder.pid})\n', done.stdout)
+        self.assertIn(f'kept {child}: a process works in it: ', done.stdout)
+        self.assertIn(f' (pid {holder.pid})\n', done.stdout)
         self.assertTrue(child.is_dir())
         self.assertFalse(other.exists())
 
@@ -1165,7 +1158,8 @@ class WorktreeChildren(unittest.TestCase):
         copy.parent.mkdir(parents=True)
         shutil.copy(SCRIPT, copy)
         (dirty / 'build' / 'lib').mkdir()
-        shutil.copy(ROOT / 'lib' / 'windows.py', dirty / 'build' / 'lib')
+        for name in ('windows.py', 'hc.py'):
+            shutil.copy(ROOT / 'lib' / name, dirty / 'build' / 'lib')
         state = dirty / 'build' / 'state'
         log = state / 'agentrc' / 'worktree-remove' / 'log'
         for what, path, script, env, cwd in (
@@ -1234,6 +1228,26 @@ class WorktreeChildren(unittest.TestCase):
 
 
 @unittest.skipIf(os.name == 'nt', 'symlinks')
+class Processes(unittest.TestCase):
+    """check_processes on a /proc stand-in: a live process with a name that is no UTF-8 would trip other suites'
+    own /proc scans run beside this one."""
+    def test_a_name_that_is_no_utf8_is_shown_escaped_and_spared_pids_are_skipped(self):
+        spec = importlib.util.spec_from_file_location('worktree_children', SCRIPT)
+        wc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(wc)
+        proc, tree = tmpdir(self) / 'proc', tmpdir(self) / 'tree'
+        (proc / 'self').mkdir(parents=True)
+        (proc / 'self' / 'cwd').symlink_to('/')
+        tree.mkdir()
+        for pid, name, cwd in (('7', b'worker-\xff\n', tree), ('8', b'spared\n', tree), ('9', b'away\n', proc)):
+            (proc / pid).mkdir()
+            (proc / pid / 'cwd').symlink_to(os.path.realpath(cwd))
+            (proc / pid / 'comm').write_bytes(name)
+        with mock.patch.object(wc, 'PROC', proc), self.assertRaises(wc.Keep) as kept:
+            wc.check_processes(tree, frozenset({8}))
+        self.assertEqual(str(kept.exception), 'a process works in it: worker-\\xff (pid 7)')
+
+
 class Planning(unittest.TestCase):
     def test_each_tree_is_searched_at_most_once_and_only_when_it_can_matter(self):
         spec = importlib.util.spec_from_file_location('worktree_children', SCRIPT)
