@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -950,6 +951,18 @@ class WorktreeChildren(unittest.TestCase):
         self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
         self.assertIn(f'{self.parent} exists again: not touching {child}', done.stdout)
         self.assertTrue(child.is_dir())
+
+    @unittest.skipUnless(Path('/proc/self/cwd').exists(), 'processes listed by /proc')
+    def test_a_process_working_in_the_child_keeps_it(self):
+        child, other = self.child(), self.child('other')
+        holder = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], cwd=child)
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.kill)
+        done = self.cleanup()
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertRegex(done.stdout, rf'kept {re.escape(str(child))}: a process works in it: .*\(pid {holder.pid}\)\n')
+        self.assertTrue(child.is_dir())
+        self.assertFalse(other.exists())
 
     def test_no_hc_installed_skips_the_terminal_check(self):
         child = self.child()

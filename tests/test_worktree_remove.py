@@ -22,6 +22,7 @@ wr = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(wr)
 
 posix = unittest.skipIf(os.name == 'nt', 'POSIX paths and stub executables')
+linux = unittest.skipUnless(Path('/proc/self/cwd').exists(), 'processes listed by /proc')
 
 
 def sh(cwd, *args):
@@ -193,6 +194,29 @@ class Remove(Rig):
                 self.assertTrue(sibling.is_dir())
                 self.hc.unlink()
         self.assertFalse(self.parent.exists())
+
+    @linux
+    def test_a_process_working_in_the_worktree_or_a_sibling_refuses_it_or_keeps_the_sibling(self):
+        sibling = self.sibling('b')
+        for tree in (self.parent, sibling):
+            holder = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], cwd=tree)
+            self.addCleanup(holder.wait)
+            self.addCleanup(holder.kill)
+            rc, out = self.run_remove('--dry-run')
+            self.assertEqual(rc, 3 if tree == self.parent else 4, out)
+            fate = f'{self.parent}: ' if tree == self.parent else f'- {sibling}: stays: '
+            self.assertRegex(out, rf'{re.escape(fate)}a process works in it: .*\(pid {holder.pid}\)')
+            holder.kill()
+            holder.wait()
+
+    def test_no_proc_is_reported_unchecked(self):
+        wr.wc = wr.wc or wr.load_module()
+        rc, out = self.run_remove('--dry-run')
+        self.assertNotIn('other processes working in them', out)
+        with mock.patch.object(wr.wc, 'PROC', self.t / 'no-proc'):
+            rc, out = self.run_remove('--dry-run')
+        self.assertEqual(rc, 0, out)
+        self.assertIn('- other processes working in them: not checked, no /proc on this system', out)
 
     def test_no_hc_installed_is_reported_unchecked(self):
         rc, out = self.run_remove('--dry-run')

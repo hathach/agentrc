@@ -34,8 +34,9 @@ ${XDG_STATE_HOME:-~/.local/state}/agentrc/worktree-remove/<UTC time>-<name>.md (
 leaving each removed tree, the gate, the log, the command), and
 `git worktree remove <PATH>` runs, with --force only for a checkout with submodules (git refuses
 those otherwise), then the cleanup of PATH with PATH's branch, which prints its actions and appends
-them to the log beside the reports. A process whose working directory is inside PATH can make git
-fail part way (Windows refuses to delete it); then the siblings and branches are left alone.
+them to the log beside the reports. The content check refuses a tree a process of this user works in
+on Linux only: elsewhere such a process can make git fail part way (Windows refuses to delete its
+directory); then the siblings and branches are left alone.
 
 --dry-run runs every check and lookup (fetching remote-tracking refs) and prints the report
 without writing it or removing anything.
@@ -184,7 +185,7 @@ def plan(path, pending):
         raise Refused(f'listing the symlinks leaving the removed trees: {why}')
     token = hashlib.sha256('\n'.join(items).encode()).hexdigest()[:12]
     return dict(root=root, common=common, head=head, force=force, checkouts=checkouts, links=links, items=items,
-                token=token, hc=wc.hc_path())
+                token=token, hc=wc.hc_path(), procs=wc.lists_processes())
 
 
 def command(p):
@@ -202,6 +203,8 @@ def report(p, heading):
         lines.append(f'- {s["path"]}: {fate}' + (f'; {s["branch"]}' if s['branch'] else ''))
     if not p['hc']:
         lines.append('- herdr-core terminals working in them: not checked, no hc installed')
+    if not p['procs']:
+        lines.append('- other processes working in them: not checked, no /proc on this system')
     lines += ['', '## Symlinks leaving the removed trees', '']
     lines += [f'- {link} -> {target}' for link, target in p['links']] or ['- none']
     lines += ['', f'## Pending (token {p["token"]})', '']

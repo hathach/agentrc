@@ -17,7 +17,9 @@ for a child with submodules (git refuses those otherwise), so a write racing its
 - no live herdr-core terminal of this machine, one in no herdr-app space included, has its program's or
   foreground process's working directory in it (`hc ls`, `hc get`), checked again right before its removal:
   it would lose that directory, and on Windows hold it open; an `hc` that fails or answers incompletely
-  keeps it, none installed skips this. Other processes working in it go unseen;
+  keeps it, none installed skips this;
+- on Linux, no process of this user has its working directory in it (`/proc/<pid>/cwd`), checked again
+  right before its removal too; other users' processes, and every process on other systems, go unseen;
 - not locked; HEAD on a branch, or a detached HEAD reachable from the branches, tags or remotes,
   the remotes' only after fetching each configured remote as branches are (below), first;
 - in the child and in every initialized submodule, recursively: `git status` shows no tracked
@@ -401,6 +403,35 @@ def busy_with(terminals):
     return f'herdr-core terminals work there: {"; ".join(terminals)}; close them, then retry'
 
 
+PROC = Path('/proc')
+
+
+def lists_processes():
+    """Whether /proc shows processes' working directories (Linux)."""
+    return (PROC / 'self' / 'cwd').exists()
+
+
+def processes_in(tree):
+    """[(pid, name)] of this user's processes working in tree; none where /proc lists none (not Linux)."""
+    if not lists_processes():
+        return []
+    found = []
+    for entry in PROC.iterdir():
+        try:
+            if entry.name.isdigit() and is_within(os.readlink(entry / 'cwd'), [tree]):
+                found.append((int(entry.name), (entry / 'comm').read_text().strip()))
+        except OSError:  # gone since the listing, or another user's
+            continue
+    return sorted(found)
+
+
+def check_processes(tree):
+    """Keep a tree a process works in: removing it takes the process's working directory."""
+    found = processes_in(tree)
+    if found:
+        raise Keep('a process works in it: ' + ', '.join(f'{name} (pid {pid})' for pid, name in found))
+
+
 def check_terminals(*trees):
     """Keep when a live local herdr-core terminal works in one of trees (terminals_in)."""
     busy = terminals_in(trees)
@@ -414,6 +445,7 @@ def content_check(child):
     with and whether that needs --force. Terminals working in it are terminals_in's."""
     gitdir, common = linked_worktree(child)
     check_agents(child, gitdir)
+    check_processes(child)
     if (gitdir / 'locked').exists():
         raise Keep('locked')
     subs = submodules(child)
@@ -774,6 +806,7 @@ def cleanup(parent, branches=()):
             if branch:
                 log(f'removing {child}; its branch is retried by: {retry(parent, [branch])}')
             check_terminals(child)  # again: its checks above can take long
+            check_processes(child)
             if os.path.lexists(parent):  # last: hc may take long too
                 log(f'{parent} exists again: not touching {child} or the children after it')
                 stopped = True
