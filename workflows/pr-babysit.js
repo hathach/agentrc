@@ -1187,12 +1187,15 @@ const stop = (cycles, reason, extra) => ({ pass: false, cycles, history, reason,
 // A PR no longer open ends the launch whatever else is pending: there is nothing left to babysit.
 const prEnded = (cycles, state) => state === 'merged' ? stop(cycles, 'pr-merged') : state === 'closed' ? stop(cycles, 'pr-closed') : stop(cycles, 'pr-state-unread')
 // A writer ran, so its edits are left uncommitted; when none did, every fix was withheld and nothing is (#369).
-const unverifiedStop = (cycles, lane, { unverifiable, withheld, dispatched }) => {
+const unverifiedStop = (cycles, lane, verdict) => {
+  const { unverifiable, withheld, dispatched } = verdict
   if (!dispatched) {
     log(`cycle ${cycles}: every ${lane}-lane fix withheld for the caller — nothing left uncommitted`)
     return stop(cycles, 'fixes-withheld', { withheld })
   }
-  log(`cycle ${cycles}: ${lane}-lane fixes left uncommitted for the caller's review — not pushing unverified changes`)
+  // A writer that died may have edited before it did: its edits, if any, are the caller's to inspect.
+  log(`cycle ${cycles}: ${lane}-lane fixes left uncommitted for the caller's review — not pushing unverified changes` +
+    (verdict.fixes.length ? '' : '; every writer died, so inspect the checkout for any edit they made'))
   const also = withheld.length ? { withheld } : {}
   return unverifiable ? stop(cycles, 'build-unverifiable', { detail: unverifiable, ...also }) : stop(cycles, 'fix-verification-failed', also)
 }
@@ -2934,6 +2937,7 @@ const runLanes = async (cycle, entry, lanes) => {
         log(`cycle ${cycle}: ${detail}`)
         return stop(cycle, 'fix-verification-failed', { detail })
       }
+      if (!verdict.dispatched && verdict.withheld.length) return unverifiedStop(cycle, 'review', verdict)  // a dry run too: nothing was changed
       if (args.autoPush !== true) {
         log('autoPush not set: review-lane fixes left uncommitted (dry run)')
         return stop(cycle, 'dry-run', { dryRun: true })
@@ -3040,6 +3044,7 @@ const runLanes = async (cycle, entry, lanes) => {
       const verdict = await fixAndVerify(work, `${cycle}-ci`)
       const { ok, fixes, owned, brief } = verdict
       entry.ciFixes = fixes
+      if (!verdict.dispatched && verdict.withheld.length) return unverifiedStop(cycle, 'CI', verdict)  // a dry run too: nothing was changed
       if (args.autoPush !== true) {
         log('autoPush not set: CI-lane fixes left uncommitted (dry run)')
         return stop(cycle, 'dry-run', { dryRun: true })

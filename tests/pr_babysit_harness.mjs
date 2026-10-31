@@ -1646,6 +1646,15 @@ test('a review fix needing a protected path is withheld, its other paths include
   assert.equal(mixed.result.reason, 'fix-verification-failed')
   assert.deepEqual(mixed.result.withheld.map(w => w.scope), ['test/hil/tinyusb.json'])
   assert.ok(mixed.logs.some(l => /review-lane fixes left uncommitted for the caller's review/.test(l)), mixed.logs.join('\n'))
+  // A dry run that withheld every fix changed nothing either.
+  const dry = await run({ args: { protected: '^test/hil/[^/]+\\.json$', autoPush: false },
+    reviews: { findings: [finding({ file: 'test/hil/tinyusb.json' })], replies: [], bots: 'reviewed' } })
+  assert.equal(dry.result.reason, 'fixes-withheld')
+  assert.equal(dry.logs.some(l => /left uncommitted \(dry run\)/.test(l)), false, dry.logs.join('\n'))
+  // Writers that all died may have edited: still the unverified stop, with the checkout to inspect.
+  const dead = await run({ reviews: oneValid, fix: null })
+  assert.equal(dead.result.reason, 'fix-verification-failed')
+  assert.ok(dead.logs.some(l => /every writer died, so inspect the checkout for any edit they made/.test(l)), dead.logs.join('\n'))
 })
 
 test('the publisher stages exactly the owned paths, never a protected one', async () => {
