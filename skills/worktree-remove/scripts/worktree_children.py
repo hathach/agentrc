@@ -507,8 +507,8 @@ def content_check(child, spared=frozenset()):
 def anchored(path, here):
     """(the directory path resolves from, the names after it): path's own drive and root when it has
     a root (here's drive when it names none, as Windows reads `\\x`), else here. Windows' `\\\\?\\`
-    prefix, which readlink can return, is dropped, a volume GUID path spelled from the drive or folder that
-    mounts its volume where one does, and either separator splits. A bare UNC share
+    prefix, which readlink can return, is dropped, a volume GUID path spelled from the drive that mounts its
+    volume where one does, and either separator splits. A bare UNC share
     (`\\\\srv\\share`) is its own root. A drive-relative path (`C:x`), relative to that drive's working
     directory, raises OSError."""
     if os.altsep:

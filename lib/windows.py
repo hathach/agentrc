@@ -80,8 +80,9 @@ def retry(step, tries=50):
 
 
 def volume_mount(volume):
-    """The drive root (`D:\\`), else the first folder, that mounts the volume `\\\\?\\Volume{guid}\\`, by
-    GetVolumePathNamesForVolumeNameW; None when nothing mounts it, Windows cannot say, or this is not Windows."""
+    """The drive root (`D:\\`) that mounts the volume `\\\\?\\Volume{guid}\\`, by GetVolumePathNamesForVolumeNameW;
+    None when no drive letter does (a folder mount point resolves back to the volume), Windows cannot say, or this is
+    not Windows."""
     if os.name != 'nt':
         return None
     import ctypes
@@ -91,8 +92,7 @@ def volume_mount(volume):
     for _ in range(2):
         names = ctypes.create_unicode_buffer(chars)
         if kernel32.GetVolumePathNamesForVolumeNameW(volume, names, chars, ctypes.byref(size)):
-            mounts = [n for n in names[:size.value].split('\0') if n]
-            return next((m for m in mounts if re.fullmatch(r'[A-Za-z]:\\', m)), mounts[0] if mounts else None)
+            return next((m for m in names[:size.value].split('\0') if re.fullmatch(r'[A-Za-z]:\\', m)), None)
         if ctypes.get_last_error() != 234:  # ERROR_MORE_DATA: size holds what it needs
             return None
         chars = size.value
