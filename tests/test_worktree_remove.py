@@ -822,17 +822,16 @@ class Handoff(Rig):
     def test_a_worker_lapsed_before_the_answer_is_no_handoff(self):
         hc = self.fake()
         token = self.token(self.run_remove('--dry-run')[1])
-        exists, seen = os.path.exists, []
+        admitting = wr.admitting
 
-        def caller_pauses(path):  # once it sees ready, past ACK_S: its worker lapses and ends meanwhile
-            if not str(path).endswith('.ready'):
-                return exists(path)
-            if not seen and exists(path):
-                seen.append(path)
+        @contextmanager
+        def caller_waits(admission):  # past ACK_S for the lock once it saw ready: its worker lapses and ends meanwhile
+            if threading.current_thread() not in hc.threads:
                 hc.join()
-            return bool(seen)
+            with admitting(admission):
+                yield
 
-        self.patch(os.path, 'exists', caller_pauses)
+        self.patch(wr, 'admitting', caller_waits)
         rc, out = self.run_remove('--proceed', token)
         self.assertEqual(rc, 3, out)
         self.assertIn('gave up waiting', out)
@@ -905,6 +904,40 @@ class Handoff(Rig):
         self.assertEqual(wr.worker(files['plan']), 3)
         self.assertEqual(hc.killed(), ['t5'])
         self.assertTrue(self.parent.exists())
+
+    def outliving(self, hc, after):
+        """A process working in the worktree that ends `after` s past the caller's terminal's kill, or never for None."""
+        holder = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], cwd=self.parent)
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.kill)
+        if after is not None:
+            def on_kill(address):
+                if address == 't5':
+                    timer = threading.Timer(after, holder.kill)
+                    timer.start()
+                    self.addCleanup(timer.join)
+            hc.on_kill = on_kill
+        return holder
+
+    def test_the_worker_waits_for_a_process_outliving_its_terminal(self):
+        hc, files = self.prepared()
+        Path(files['ack']).write_text('go')
+        self.outliving(hc, 0.6)
+        self.assertEqual(wr.worker(files['plan']), 0, (self.reports / 'log').read_text(encoding='utf-8'))
+        self.assertFalse(self.parent.exists())
+        self.assertFalse(self.sib.exists())
+
+    def test_a_process_outliving_the_wait_keeps_the_worktree(self):
+        hc, files = self.prepared()
+        Path(files['ack']).write_text('go')
+        holder = self.outliving(hc, None)
+        self.patch(wr, 'END_S', 0.5)
+        self.assertEqual(wr.worker(files['plan']), 3)
+        self.assertEqual(sorted(hc.killed()), ['t5', 't7'])
+        self.assertTrue((self.parent / '.git').exists())
+        log = (self.reports / 'log').read_text(encoding='utf-8')
+        self.assertIn('still running after the kill: a process works in it: python', log)
+        self.assertIn(f'(pid {holder.pid})', log)
 
     def test_a_process_arriving_during_the_workers_content_check_stops_it(self):
         hc, files = self.prepared()

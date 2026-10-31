@@ -418,7 +418,8 @@ def handoff(p, out):
     deadline = time.monotonic() + READY_S
     while not launch.returncode and not os.path.exists(files['ready']) and time.monotonic() < deadline:
         time.sleep(0.1)
-    if not launch.returncode and os.path.exists(files['ready']):
+    ready = not launch.returncode and os.path.exists(files['ready'])  # a worker lapsing next deletes it
+    if ready:
         with admitting(admission):  # the worker lapses under it; one that lapsed holds the ack or released
             if admitted(admission, op) and created(files['ack'], 'go'):
                 wc.log(f'handed the removal of {p["root"]} to worker terminal {name} (op {op}): it closes '
@@ -430,7 +431,7 @@ def handoff(p, out):
     created(files['ack'], 'withdrawn')  # a worker starting late reads it and closes nothing
     wc.run([hc, 'kill', name], timeout=wc.HC_TIMEOUT)
     why = (f'`hc run` exit {launch.returncode}: {(launch.stdout + launch.stderr).strip()[:300]}' if launch.returncode
-           else f'its worker {name} did not answer in {READY_S} s' if not os.path.exists(files['ready'])
+           else f'its worker {name} did not answer in {READY_S} s' if not ready
            else f'its worker {name} gave up waiting')
     try:
         if wc.hc_json(hc, 'get', name) is None:  # no worker can read them now
@@ -481,6 +482,14 @@ def worker(plan_file):
         while (left := [t for t in p['closing'] if (wc.PROC / str(t['pid'])).exists() or identified(hc, t)]):
             if time.monotonic() > deadline:
                 raise wc.Keep('terminals still running after their kill: ' + ', '.join(t['address'] for t in left))
+            time.sleep(0.2)
+        while True:  # their processes, a descendant still exiting say, get the same END_S
+            try:
+                wc.check_processes(root)
+                break
+            except wc.Keep as why:
+                if time.monotonic() > deadline:
+                    raise wc.Keep(f'still running after the kill: {why}')
             time.sleep(0.2)
         wc.content_check(root)
         if wc.head_branch(root) != (tuple(p['head']) if p['head'] else None):
