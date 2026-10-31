@@ -1,12 +1,13 @@
 """Windows runtime helpers the skills, hooks and statusline share: a program lookup that never takes the working
-directory, Git Bash found that way, a bounded process-tree kill, and a file step, os.replace among them, retried
-while another process holds the file open.
+directory, Git Bash found that way, a bounded process-tree kill, a file step, os.replace among them, retried
+while another process holds the file open, and the drive that mounts a volume.
 
 A script reaches it through its resolved path, as chief_guard.py reaches shadows.py:
 `sys.path.insert(0, str(Path(__file__).resolve().parents[N] / 'lib'))`, then `import windows`.
 rtt.py keeps its own copies (see its module docstring)."""
 import contextlib
 import os
+import re
 import subprocess
 import time
 from pathlib import PureWindowsPath
@@ -76,6 +77,26 @@ def retry(step, tries=50):
         except PermissionError:
             time.sleep(0.02)
     return step()
+
+
+def volume_mount(volume):
+    """The drive root (`D:\\`), else the first folder, that mounts the volume `\\\\?\\Volume{guid}\\`, by
+    GetVolumePathNamesForVolumeNameW; None when nothing mounts it, Windows cannot say, or this is not Windows."""
+    if os.name != 'nt':
+        return None
+    import ctypes
+    from ctypes import wintypes
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    size, chars = wintypes.DWORD(0), 1024
+    for _ in range(2):
+        names = ctypes.create_unicode_buffer(chars)
+        if kernel32.GetVolumePathNamesForVolumeNameW(volume, names, chars, ctypes.byref(size)):
+            mounts = [n for n in names[:size.value].split('\0') if n]
+            return next((m for m in mounts if re.fullmatch(r'[A-Za-z]:\\', m)), mounts[0] if mounts else None)
+        if ctypes.get_last_error() != 234:  # ERROR_MORE_DATA: size holds what it needs
+            return None
+        chars = size.value
+    return None
 
 
 def replace(src, dst, tries=50):

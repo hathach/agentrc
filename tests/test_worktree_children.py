@@ -1379,7 +1379,13 @@ class LinkHops(unittest.TestCase):
         self.assertEqual(anchored('\\\\srv\\share', 'C:\\w'), ('\\\\srv\\share\\', []))
         self.assertEqual(anchored('\\\\?\\UNC\\srv\\share', 'C:\\w'), ('\\\\srv\\share\\', []))
         self.assertEqual(anchored('\\\\?\\unc\\srv\\share\\x', 'C:\\w'), ('\\\\srv\\share\\', ['x']))
-        self.assertEqual(anchored('\\\\?\\Volume{1}\\x', 'C:\\w'), ('\\\\?\\Volume{1}\\', ['x']))
+        self.assertEqual(anchored('\\\\?\\Volume{1}\\x', 'C:\\w'), ('\\\\?\\Volume{1}\\', ['x']))  # nothing mounts it
+        import ctypes
+        drive = os.path.splitdrive(str(self.t))[0] + '\\'
+        volume = ctypes.create_unicode_buffer(64)
+        self.assertTrue(ctypes.windll.kernel32.GetVolumeNameForVolumeMountPointW(drive, volume, 64))
+        root, names = anchored(volume.value + 'x\\y', 'C:\\w')
+        self.assertEqual((root.upper(), names), (drive.upper(), ['x', 'y']))
         self.assertEqual(anchored('D:/x/y', 'C:\\w'), ('D:\\', ['x', 'y']))
         self.assertEqual(anchored('\\x', 'C:\\w'), ('C:\\', ['x']))
         self.assertEqual(anchored('x/y', 'C:\\w'), ('C:\\w', ['x', 'y']))
