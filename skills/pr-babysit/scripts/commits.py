@@ -47,7 +47,7 @@ message. PATH is never read as an option or as pathspec magic.
 `cited` (full SHAs) reports head as given and cited, one {sha, reachable, replacement} per SHA in order:
 reachable true when HEAD holds it, null when the checkout lacks the commit, else false, with replacement
 the one commit between the fork point and HEAD carrying the same patch (`git patch-id --stable`), null
-when none or several do.
+when none or several do, or the histories share no fork point.
 
 stdout ends with one JSON line: `commit` prints {committed, detail}, `head` {parent, scope, sha, entries,
 refusal}, `chain` {from, to, published, base, tip, commits, paths, unpublished,
@@ -227,33 +227,29 @@ def read_receipt(path, request, parent, paths):
     return {'request': request, 'parent': parent, 'scope': paths, **facts}
 
 
-def patch_id(sha):
-    """git's stable patch id of commit sha, '' for one with no patch (a merge, an empty commit)."""
-    status, out, err = attempt('git', 'patch-id', '--stable', input=git('show', '--format=', sha))
+def patch_ids(*revs):
+    """{commit: git's stable patch id} of the non-merge commits `git log revs` lists, one pipeline for them all;
+    a commit with no patch (an empty one) has none."""
+    log = git('log', '--no-merges', '-p', '--format=commit %H', *revs)
+    status, out, err = attempt('git', 'patch-id', '--stable', input=log)
     if status:
-        raise Unusable(f'git patch-id {sha}: {err.strip()}')
-    return out.split(' ')[0]
+        raise Unusable(f'git patch-id: {err.strip()}')
+    return {commit: pid for pid, commit in (line.split() for line in out.splitlines() if line)}
 
 
 def cited(head, shas):
     """#361: our fix notes cite repair commits; a rewrite may have replaced them."""
-    head, found, ids = full(head), [], {}
+    head, found = full(head), []
     for sha in map(full, shas):
-        if attempt('git', 'cat-file', '-e', f'{sha}^{{commit}}')[0]:
-            found.append({'sha': sha, 'reachable': None, 'replacement': None})
-            continue
-        if run('git', 'merge-base', '--is-ancestor', sha, head, ok=(0, 1))[0] == 0:
-            found.append({'sha': sha, 'reachable': True, 'replacement': None})
-            continue
-        mine, same = patch_id(sha), []
-        if mine:
-            fork = run('git', 'merge-base', sha, head, ok=(0, 1))[1].strip()  # none for unrelated histories
-            for c in git('rev-list', '--no-merges', f'{fork}..{head}' if fork else head).split():
-                if c not in ids:
-                    ids[c] = patch_id(c)
-                if ids[c] == mine:
-                    same.append(c)
-        found.append({'sha': sha, 'reachable': False, 'replacement': same[0] if len(same) == 1 else None})
+        reachable, replacement = None, None
+        if not attempt('git', 'cat-file', '-e', f'{sha}^{{commit}}')[0]:
+            reachable = run('git', 'merge-base', '--is-ancestor', sha, head, ok=(0, 1))[0] == 0
+        mine = reachable is False and patch_ids('-1', sha).get(sha)
+        fork = mine and run('git', 'merge-base', sha, head, ok=(0, 1))[1].strip()
+        if fork:  # none for unrelated histories, which share no range to search
+            same = [c for c, pid in patch_ids(f'{fork}..{head}').items() if pid == mine]
+            replacement = same[0] if len(same) == 1 else None
+        found.append({'sha': sha, 'reachable': reachable, 'replacement': replacement})
     return {'head': head, 'cited': found}
 
 

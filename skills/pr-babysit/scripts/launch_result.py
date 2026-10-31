@@ -42,6 +42,8 @@ from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
+import windows  # noqa: E402
 from facts import Parser, Unusable, git, report  # noqa: E402
 from state_transfer import MAX  # noqa: E402
 
@@ -456,7 +458,7 @@ def kept(output_path, digest):
                 f.write(raw)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp, path)
+            windows.replace(tmp, path)  # Windows: retried while another reader has it open
         except BaseException:
             Path(tmp).unlink(missing_ok=True)
             raise
