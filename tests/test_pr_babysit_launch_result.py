@@ -117,6 +117,15 @@ class LaunchResultTest(unittest.TestCase):
         self.assertEqual((rc, s['stateRef']['outputFile']), (0, (self.dir / 'w.output').resolve().as_posix()))
         self.assertTrue(any(n.startswith('the state is not kept outside the Workflow task directory') for n in s['notes']), s['notes'])
 
+    def test_a_state_directory_the_workflow_refuses_as_a_state_ref_keeps_the_output(self):
+        states = self.dir / 'c++' / 'states'
+        with mock.patch.object(launch_result, 'STATES', states):
+            rc, s = self.run_it(output())
+        self.assertEqual((rc, s['stateRef']['outputFile']), (0, (self.dir / 'w.output').resolve().as_posix()))
+        self.assertFalse(states.exists(), 'nothing written')
+        self.assertTrue(any(n.startswith('the state is not kept outside the Workflow task directory') and 'stateRef' in n
+                            for n in s['notes']), s['notes'])
+
     def test_a_launch_is_condensed(self):
         rc, s = self.run_it(output())
         self.assertEqual(rc, 0)

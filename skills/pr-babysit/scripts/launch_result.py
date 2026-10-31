@@ -450,6 +450,9 @@ def kept(output_path, digest):
         raise Unusable(f'the state digest {digest!r} is not 8 hex digits')
     raw = Path(output_path).read_bytes()
     path = STATES / f'{digest}-{hashlib.sha256(raw).hexdigest()[:16]}.json'
+    # workflows/pr-babysit.js's stateRef rule: the path goes into a shell command
+    if not re.fullmatch(r'(?:[A-Za-z]:)?/(?!/)[A-Za-z0-9._ /-]+', path.as_posix()) or '..' in path.as_posix():
+        raise Unusable(f'{path.as_posix()} is not a plain absolute path the workflow takes as a stateRef')
     if not (path.is_file() and path.read_bytes() == raw):
         STATES.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=STATES, prefix=f'.{path.name}.')
