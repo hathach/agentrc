@@ -279,10 +279,26 @@ def attempt(link):
     return f'readthedocs:{m.group(3)}' if m else None
 
 
+SERVER_ERROR = re.compile(r'\(HTTP 5[0-9][0-9]\)')
+# #362: GitHub answered 502 for every 100-job page of a 90-job run while 50 a page worked
+PAGE_SIZES = (100, 50, 30)
+
+
+def pages_of(path):
+    """Every page of a paginated REST list (gh's --slurp), the whole list read again at a smaller page size after
+    a server error; any other failure, or one at the smallest size, is Failed."""
+    for size in PAGE_SIZES:
+        try:
+            return gh('api', '--paginate', '--slurp', f"{path}{'&' if '?' in path else '?'}per_page={size}")
+        except Failed as e:
+            if size == PAGE_SIZES[-1] or e.limit or not SERVER_ERROR.search(str(e)):
+                raise
+
+
 def attempt_jobs(repo, run, n, cache):
     """Every job of a run's attempt n, the whole paginated list or Failed."""
     if (run, n) not in cache:
-        pages = gh('api', '--paginate', '--slurp', f'repos/{repo}/actions/runs/{run}/attempts/{n}/jobs?per_page=100')
+        pages = pages_of(f'repos/{repo}/actions/runs/{run}/attempts/{n}/jobs')
         jobs = [j for page in pages for j in page.get('jobs') or []]
         if not pages or len(jobs) != pages[0].get('total_count'):
             raise Failed(f'run {run} attempt {n}: listed {len(jobs)} jobs of {pages[0].get("total_count") if pages else "?"}')
@@ -382,8 +398,8 @@ def run_of(link):
 
 
 def listed(path, key=None):
-    """Every item of a paginated REST list, 100 a page; `key` names the list inside an object-wrapped page."""
-    pages = gh('api', '--paginate', '--slurp', f"{path}{'&' if '?' in path else '?'}per_page=100")
+    """Every item of a paginated REST list (pages_of); `key` names the list inside an object-wrapped page."""
+    pages = pages_of(path)
     return [x for page in pages for x in (page.get(key) or [] if key else page)]
 
 
