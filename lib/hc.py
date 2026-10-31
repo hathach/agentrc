@@ -1,5 +1,5 @@
-"""Transport primitives for herdr-core's CLI, `hc` (0.1.14), shared by the scripts that talk to hc terminals
-(herdr-peer, captain). Judgment stays with the caller: these only ask hc, classify its answer, and name processes.
+"""Transport primitives for herdr-core's CLI, `hc` (0.1.14), used by captain to talk to hc terminals. Judgment stays
+with the caller: these only ask hc, classify its answer, and name processes.
 
 Every call takes an explicit deadline in seconds. hc prints its result as JSON on stdout and `{error: {kind,
 message}}` on stderr; options go before `--`, so a terminal name or a text never reads as one. A malformed answer,
@@ -30,11 +30,6 @@ class Gone(Exception):
     """The process hc named has exited."""
 
 
-class Unverified(Exception):
-    """This process cannot be tied to an hc terminal: HC_TERMINAL_ID is unset, or names a terminal whose foreground
-    process is not one of this process's ancestors."""
-
-
 def program():
     """hc to launch: 'hc', or on Windows the hc.exe PATH alone finds, never one in the working directory, which
     CreateProcess tries first; None when there is none."""
@@ -44,8 +39,8 @@ def program():
 def run(*args, timeout, caller=None):
     """(exit status, parsed stdout or None, error kind or None, message) of `hc args`; exit None with kind 'timeout'
     past the deadline, or 'spawn_failed' when hc did not start (not on PATH, an argument past the OS limit). caller,
-    a verified terminal address, is passed as HC_TERMINAL_ID, which hc takes as the caller (the rest of the
-    environment as is): a shell that dropped it, as Codex's tool shells do, would otherwise send untagged."""
+    the sender's terminal address, is passed as HC_TERMINAL_ID (the rest of the environment as is); hc takes it as the
+    caller only while HC_TERMINAL_SOCKET is unset or names the core it talks to, and sends untagged otherwise."""
     env = {**os.environ, 'HC_TERMINAL_ID': caller} if caller else None
     exe = program()
     if exe is None:
@@ -115,19 +110,14 @@ def read(address, *, timeout, lines=None):
     return out.stdout
 
 
-def send(address, text, *, timeout, only_if=None, was_working=False, caller=None):
+def send(address, text, *, timeout, only_if=None, caller=None):
     """Paste text into address and press Enter: (SENT | NOT_TYPED_OUTCOME | UNCERTAIN, detail); only_if ('idle' or
-    'working') is hc's --if. SENT needs exit 0 and a JSON object with `started: true`: hc 0.1.14's schema defines
-    SendResult.started as "whether it went `working` within a few seconds; null when it doesn't report status", and
-    says nothing of a program already working, which has no such change to show. So with was_working (the status the
-    caller read just before) the object alone counts, unless its `status`, the program's status "when the text went
-    in", says it had stopped working by then: started is meaningful again. caller is run's: into an agent hc wraps
-    the text as <hc from="<caller> ...">, untagged without one, which reads as a person's input."""
+    'working') is hc's --if. SENT needs exit 0 and a JSON object with `started: true`. caller is run's: into an agent
+    hc wraps the text as <hc from="<caller> ...">, untagged without one, which reads as a person's input."""
     rc, body, kind, msg = run('send', '--json', *(['--if', only_if] if only_if else []), '--', address, text,
                               timeout=timeout, caller=caller)
     if rc == 0:
-        if isinstance(body, dict) and (body.get('started') is True
-                                       or was_working and body.get('status') in ('working', None)):
+        if isinstance(body, dict) and body.get('started') is True:
             return SENT, body
         return UNCERTAIN, f'hc send answered {body!r}, not started: true'
     return (NOT_TYPED_OUTCOME if kind in NOT_TYPED else UNCERTAIN), f'{kind or "unknown"}: {msg}'
@@ -163,54 +153,3 @@ def ancestors(pid):
             break
         chain.append(pid)
     return chain
-
-
-def foreground(info):
-    """{pid, start, cwd} of a get record's foreground process; None when it has none or it has exited."""
-    fg = info.get('foreground') if info and info.get('state') == 'live' else None
-    if not isinstance(fg, dict) or not isinstance(fg.get('pid'), int):
-        return None
-    try:
-        return {'pid': fg['pid'], 'start': proc_start(fg['pid']), 'cwd': fg.get('cwd')}
-    except Gone:
-        return None
-
-
-def own_terminal(*, timeout):
-    """(address, get record, foreground) of the terminal this process runs in. HC_TERMINAL_ID, which any process can
-    set, is only a hint: on Linux its foreground process must be this process or one of its ancestors. Without the
-    hint (Codex's tool shells drop it) the terminal is found by ancestry instead: the one live local terminal whose
-    foreground process is an ancestor. Off Linux, without /proc, the hint is taken as given and none is a refusal."""
-    address = os.environ.get('HC_TERMINAL_ID')
-    linux = sys.platform.startswith('linux')
-    if not address:
-        if not linux:
-            raise Unverified('HC_TERMINAL_ID is unset, and without /proc this process cannot be traced to an hc '
-                             'terminal')
-        return by_ancestry(timeout)
-    if not is_local(address):
-        raise Unverified(f'HC_TERMINAL_ID={address} is not a local hc terminal')
-    info = get(address, timeout=timeout)
-    fg = foreground(info)
-    if fg is None:
-        raise Unverified(f'hc has no live foreground process for this terminal {address}')
-    if linux and fg['pid'] not in ancestors(os.getpid()):
-        raise Unverified(f'HC_TERMINAL_ID={address}, but its foreground process {fg["pid"]} does not run this one')
-    return address, info, fg
-
-
-def by_ancestry(timeout):
-    chain = set(ancestors(os.getpid()))
-    mine = []
-    for t in terminals(timeout=timeout):
-        address = t.get('address')
-        if is_local(address) and t.get('state') == 'live':
-            info = get(address, timeout=timeout)
-            fg = foreground(info)
-            if fg and fg['pid'] in chain:
-                mine.append((address, info, fg))
-    if len(mine) != 1:
-        raise Unverified('HC_TERMINAL_ID is unset and ' + (
-            f'{len(mine)} hc terminals ({", ".join(m[0] for m in mine)}) run this process' if mine
-            else 'no live local hc terminal runs this process: not inside hc'))
-    return mine[0]
