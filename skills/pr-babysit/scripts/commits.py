@@ -239,7 +239,7 @@ def patch_ids(*revs):
 
 def cited(head, shas):
     """#361: our fix notes cite repair commits; a rewrite may have replaced them."""
-    head, found = full(head), []
+    head, found, ranges = full(head), [], {}
     for sha in map(full, shas):
         reachable, replacement = None, None
         if not attempt('git', 'cat-file', '-e', f'{sha}^{{commit}}')[0]:
@@ -247,7 +247,9 @@ def cited(head, shas):
         mine = reachable is False and patch_ids('-1', sha).get(sha)
         fork = mine and run('git', 'merge-base', sha, head, ok=(0, 1))[1].strip()
         if fork:  # none for unrelated histories, which share no range to search
-            same = [c for c, pid in patch_ids(f'{fork}..{head}').items() if pid == mine]
+            if fork not in ranges:
+                ranges[fork] = patch_ids(f'{fork}..{head}')
+            same = [c for c, pid in ranges[fork].items() if pid == mine]
             replacement = same[0] if len(same) == 1 else None
         found.append({'sha': sha, 'reachable': reachable, 'replacement': replacement})
     return {'head': head, 'cited': found}
