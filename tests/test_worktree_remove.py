@@ -819,6 +819,49 @@ class Handoff(Rig):
         self.assertTrue(self.parent.exists())
         self.assertEqual([f.name for f in self.admission().parent.iterdir()], ['admissions.lock'])
 
+    def test_a_worker_lapsed_before_the_answer_is_no_handoff(self):
+        hc = self.fake()
+        token = self.token(self.run_remove('--dry-run')[1])
+        exists, seen = os.path.exists, []
+
+        def caller_pauses(path):  # once it sees ready, past ACK_S: its worker lapses and ends meanwhile
+            if not str(path).endswith('.ready'):
+                return exists(path)
+            if not seen and exists(path):
+                seen.append(path)
+                hc.join()
+            return bool(seen)
+
+        self.patch(os.path, 'exists', caller_pauses)
+        rc, out = self.run_remove('--proceed', token)
+        self.assertEqual(rc, 3, out)
+        self.assertIn('gave up waiting', out)
+        self.assertNotIn('handed off', out)
+        self.assertEqual(hc.killed(), [next(c[c.index('--name') + 1] for c in hc.calls if c[0] == 'run')])
+        self.assertTrue(self.parent.exists())
+        self.assertEqual([f.name for f in self.admission().parent.iterdir()], ['admissions.lock'])
+
+    def test_the_caller_reports_the_handoff_before_the_worker_kills(self):
+        hc = self.fake()
+        token = self.token(self.run_remove('--dry-run')[1])
+        killed, created = threading.Event(), wr.created
+        hc.on_kill = lambda address: killed.set()
+
+        def then_paused(path, text):  # the caller yields right after its go, as the scheduler may
+            done = created(path, text)
+            if text == 'go':
+                killed.wait(1)
+            return done
+
+        self.patch(wr, 'created', then_paused)
+        rc, out = self.run_remove('--proceed', token)
+        hc.join()
+        self.assertEqual(rc, 0, out)
+        self.assertIn('worktree_remove: handed off', out)
+        log = (self.reports / 'log').read_text(encoding='utf-8')
+        self.assertLess(log.index('handed the removal'), log.index('closing terminal'))
+        self.assertFalse(self.parent.exists())
+
     def prepared(self, op='abc'):
         """A plan and its admission as a caller leaves them before the worker starts."""
         base = self.admission().parent

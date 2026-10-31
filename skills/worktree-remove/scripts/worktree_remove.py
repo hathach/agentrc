@@ -380,19 +380,23 @@ def caller_runs(held):
         return False
 
 
+def admitted(admission, op):
+    try:
+        return json.loads(admission.read_text(encoding='utf-8')).get('op') == op
+    except (OSError, ValueError):
+        return False
+
+
 def release(admission, op):
-    with admitting(admission):
-        try:
-            if json.loads(admission.read_text(encoding='utf-8')).get('op') == op:
-                admission.unlink()
-        except (OSError, ValueError):
-            pass
+    with admitting(admission), contextlib.suppress(OSError):
+        if admitted(admission, op):
+            admission.unlink()
 
 
 def handoff(p, out):
     """Start a worker in its own hc terminal that closes p's terminals, this run's own among them, and then
-    removes: nothing outlives the terminal it closes. The worker kills nothing until this run answers its
-    ready, so this run reports the handoff first."""
+    removes: nothing outlives the terminal it closes. The worker kills nothing until this run has answered its
+    ready and reported the handoff, and only a worker still admitted, not lapsed, gets that answer."""
     hc, op = p['hc'], secrets.token_hex(6)
     admission, name = admission_of(p['root']), f'wtrm-{op}'
     admission.parent.mkdir(parents=True, exist_ok=True)
@@ -414,13 +418,15 @@ def handoff(p, out):
     deadline = time.monotonic() + READY_S
     while not launch.returncode and not os.path.exists(files['ready']) and time.monotonic() < deadline:
         time.sleep(0.1)
-    if not launch.returncode and os.path.exists(files['ready']) and created(files['ack'], 'go'):
-        wc.log(f'handed the removal of {p["root"]} to worker terminal {name} (op {op}): it closes '
-               + ', '.join(t['address'] for t in p['closing']))
-        print(f'worktree_remove: handed off to hc terminal {name}, which closes '
-              + ', '.join(wc.label(t) for t in p['closing']) + f', then removes {p["root"]}; the log has the '
-              f'outcome: {wc.LOG}', flush=True)
-        return 0
+    if not launch.returncode and os.path.exists(files['ready']):
+        with admitting(admission):  # the worker lapses under it; one that lapsed holds the ack or released
+            if admitted(admission, op) and created(files['ack'], 'go'):
+                wc.log(f'handed the removal of {p["root"]} to worker terminal {name} (op {op}): it closes '
+                       + ', '.join(t['address'] for t in p['closing']))
+                print(f'worktree_remove: handed off to hc terminal {name}, which closes '
+                      + ', '.join(wc.label(t) for t in p['closing']) + f', then removes {p["root"]}; the log has '
+                      f'the outcome: {wc.LOG}', flush=True)
+                return 0
     created(files['ack'], 'withdrawn')  # a worker starting late reads it and closes nothing
     wc.run([hc, 'kill', name], timeout=wc.HC_TIMEOUT)
     why = (f'`hc run` exit {launch.returncode}: {(launch.stdout + launch.stderr).strip()[:300]}' if launch.returncode
@@ -446,18 +452,15 @@ def worker(plan_file):
     admission, root = Path(p['admission']), Path(p['root'])
     p['root'] = root
     try:
-        try:
-            held = json.loads(admission.read_text(encoding='utf-8'))
-        except (OSError, ValueError):
-            held = {}
-        if held.get('op') != op:
+        if not admitted(admission, op):
             wc.log(f'worker {op}: not admitted to remove {root}; closed nothing')
             return 3
         created(p['ready'], 'ready')
         deadline = time.monotonic() + ACK_S
         while not os.path.exists(p['ack']) and time.monotonic() < deadline:
             time.sleep(0.1)
-        created(p['ack'], 'lapsed')
+        with admitting(admission):  # the caller answers under it, reporting the handoff before it lets go
+            created(p['ack'], 'lapsed')
         word = Path(p['ack']).read_text(encoding='utf-8')
         if word != 'go':
             wc.log(f'worker {op}: the handoff was {word}; closed nothing, removed nothing')
