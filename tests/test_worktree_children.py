@@ -1248,6 +1248,7 @@ class Processes(unittest.TestCase):
         self.assertEqual(str(kept.exception), 'a process works in it: worker-\\xff (pid 7)')
 
 
+@unittest.skipIf(os.name == 'nt', 'symlinks')
 class Planning(unittest.TestCase):
     def test_each_tree_is_searched_at_most_once_and_only_when_it_can_matter(self):
         spec = importlib.util.spec_from_file_location('worktree_children', SCRIPT)
