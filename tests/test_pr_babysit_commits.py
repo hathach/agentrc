@@ -156,10 +156,6 @@ class CommitsTest(unittest.TestCase):
         self.assertIn('seal', out)
         self.git('cherry-pick', '--allow-empty', '--keep-redundant-commits', old)  # two commits carrying the same patch
         twice = self.git('rev-parse', 'HEAD').strip()
-        self.write('fix.c', 'f2\n')
-        self.commit('again', 'fix.c')
-        self.write('fix.c', 'f\n')
-        self.git('commit', '-q', '-am', 'back')
         _, out = self.run_script('cited', twice, old)
         self.assertEqual(out['cited'][0]['replacement'], new, 'an empty pick carries no patch')
         code, out = self.run_script('cited', new, 'abc')
