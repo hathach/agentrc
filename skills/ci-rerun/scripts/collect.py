@@ -279,7 +279,8 @@ def attempt(link):
     return f'readthedocs:{m.group(3)}' if m else None
 
 
-SERVER_ERROR = re.compile(r'\(HTTP 5[0-9][0-9]\)')
+# gh prints '<message> (HTTP 5xx)', or a bare 'HTTP 5xx' when the body is no JSON error
+SERVER_ERROR = re.compile(r'\bHTTP 5[0-9][0-9]\b')
 # #362: GitHub answered 502 for every 100-job page of a 90-job run while 50 a page worked
 PAGE_SIZES = (100, 50, 30)
 

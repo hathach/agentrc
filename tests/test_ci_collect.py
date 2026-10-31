@@ -83,15 +83,20 @@ class PageSizeTest(unittest.TestCase):
                 return e, calls
 
     @staticmethod
-    def server_error_above(limit):
+    def server_error_above(limit, error='gh: Server Error (HTTP 502)'):
         def answer(size):
             if size > limit:
-                raise collect.Failed('gh api --paginate: gh: Server Error (HTTP 502)')
+                raise collect.Failed(f'gh api --paginate: {error}')
             return [{'total_count': 2, 'jobs': [{'id': 1}, {'id': 2}]}]
         return answer
 
     def test_a_server_error_at_100_retries_the_whole_list_at_50(self):
         jobs, calls = self.listing(self.server_error_above(50))
+        self.assertEqual(jobs, [{'id': 1}, {'id': 2}])
+        self.assertEqual(calls, [f'{self.PATH}?per_page=100', f'{self.PATH}?per_page=50'])
+
+    def test_a_bare_server_error_without_a_message_retries_too(self):
+        jobs, calls = self.listing(self.server_error_above(50, 'gh: HTTP 502'))
         self.assertEqual(jobs, [{'id': 1}, {'id': 2}])
         self.assertEqual(calls, [f'{self.PATH}?per_page=100', f'{self.PATH}?per_page=50'])
 
