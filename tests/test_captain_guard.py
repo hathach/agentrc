@@ -52,7 +52,7 @@ class HookTest(unittest.TestCase):
         self.assertEqual(call('Bash', agent_type=None, command='git push').returncode, 0)
 
     def test_allows_its_own_script(self):
-        done = call('Bash', command=f'{RUN} ask w2:p1')
+        done = call('Bash', command=f'{RUN} ask t2')
         self.assertEqual((done.returncode, done.stderr), (0, ''))
 
     def test_garbage_denies(self):
@@ -90,10 +90,10 @@ class VerdictTest(unittest.TestCase):
     def test_plain_script_calls_pass(self):
         home_script = (Path.home() / '.claude/skills/captain/scripts/captain.py').as_posix()
         for cmd in [f'{RUN} list', f'{RUN} list --json', f'{RUN} enroll', f'{RUN} enroll --replace',
-                    f'{RUN} ask w2:p1 w3:p4', f'{RUN} ask pr:12 pr:hathach:agentrc:12 issue:7 ws:w54 ws:my-label',
-                    f'{RUN} relay pr:12 w2:p1', f'{RUN} collect m-0a1b --wait 1740000', f'{RUN} reports',
-                    f'{RUN} cancel m-0a1b', f'{RUN} relay w2:p1 w3:p4',
-                    f'{RUN} relay w2:p1 --entry f0a4846d-6b04-428a-8e4d-a4fc931e6cff --digest 3f9a0c1d2e4b5a67',
+                    f'{RUN} ask t2 t1b', f'{RUN} ask pr:12 pr:hathach:agentrc:12 issue:7 space:sp9580d0 space:my-label',
+                    f'{RUN} relay pr:12 t2', f'{RUN} collect m-0a1b --wait 1740000', f'{RUN} reports',
+                    f'{RUN} cancel m-0a1b', f'{RUN} relay t2 t1b',
+                    f'{RUN} relay t2 --entry f0a4846d-6b04-428a-8e4d-a4fc931e6cff --digest 3f9a0c1d2e4b5a67',
                     f'{RUN} withdraw a-0a1b',
                     f'{RUN} open --checkout /home/u/code/repo --account ada --name repo',
                     f'{RUN} open --checkout ~/code/repo --account main',
@@ -105,22 +105,23 @@ class VerdictTest(unittest.TestCase):
     def test_anything_else_in_a_command_is_denied(self):
         for cmd in ['gh pr merge 12', 'git push', f'{RUN} list; git push', f'{RUN} list && gh pr view 1',
                     f'{RUN} list | sh', f'{RUN} list > /tmp/x', f'{RUN} ask "$(id)"', f'{RUN} ask `id`',
-                    f'{RUN} ask w2:p1\ngit push', f'{RUN} report --for m-1 --file f.json', f'{RUN}',
+                    f'{RUN} ask t2\ngit push', f'{RUN} report --for m-1 --file f.json', f'{RUN}',
                     'python3 skills/captain/scripts/captain.py list', 'python3 /tmp/captain.py list',
                     f'{RUN} ask ../etc', f'{RUN} ask ~root', 'python3 -c print(1)', f'cd /w && {RUN} list',
-                    f'{RUN} ask w2:p1 --file=/etc/passwd', f'{RUN} accept --action a-1',
+                    f'{RUN} ask t2 --file=/etc/passwd', f'{RUN} accept --action a-1',
                     f'{RUN} outcome --action a-1 --result completed', f'{RUN} ask /etc/passwd',
                     f'{RUN} open --checkout /home/u/../../etc --account main', f'{RUN} open --name /tmp/x',
-                    f'{RUN} open --checkout ~root/x --account main', 'herdr pane close w2:p1',
-                    'herdr workspace close w2', 'herdr agent prompt w2:p1 /exit', 'kill 1234', 'pkill claude',
-                    f'{RUN} close w2:p1', f'{RUN} kill w2:p1', None]:
+                    f'{RUN} open --checkout ~root/x --account main', 'hc send t2 /exit',
+                    'hc kill t2', 'hc keys t2 enter', 'hc run --bg claude', 'herdr-app do space.close',
+                    'kill 1234', 'pkill claude',
+                    f'{RUN} close t2', f'{RUN} kill t2', None]:
             with self.subTest(cmd):
                 self.assertIsNotNone(self.verdict('Bash', command=cmd))
 
     def test_the_skill_s_documented_commands_pass(self):
         """The captain runs what SKILL.md shows; a recipe the guard denies would strand it."""
         text = (Path(__file__).resolve().parents[1] / 'skills' / 'captain' / 'SKILL.md').read_text(encoding='utf-8')
-        sample = {'<pane>...': 'w2:p1', '<msg>...': 'm-1', '<msg>': 'm-1', '<ms>': '1740000', 'MS': '1740000',
+        sample = {'<terminal>...': 't2', '<msg>...': 'm-1', '<msg>': 'm-1', '<ms>': '1740000', 'MS': '1740000',
                   '<uuid>': 'f0a4846d-6b04-428a-8e4d-a4fc931e6cff', '<hex>': '3f9a0c1d2e4b5a67', '<action>': 'a-1',
                   '<target>...': 'pr:12',
                   '<dir>': '/home/u/code/repo', '<main|ada>': 'ada', '<name>': 'repo'}
@@ -163,7 +164,7 @@ class VerdictTest(unittest.TestCase):
                 self.assertIsNone(self.verdict('Bash', command=cmd))
 
     def test_a_follow_up_issue_publishes_only_as_drafted_for_hathach_agentrc(self):
-        title, body = f'{DRAFTS}/herdr-timeout-title.md', f'{DRAFTS}/herdr.md'
+        title, body = f'{DRAFTS}/hc-timeout-title.md', f'{DRAFTS}/hc.md'
         tilde = body.replace(Path.home().as_posix(), '~', 1)
         home = (Path.home() / '.claude/skills/followup-issue/scripts/publish.py').as_posix()
         create = f'create {REPO} --title-file {title} --body-file {body} --label follow-up'
@@ -227,8 +228,8 @@ class VerdictTest(unittest.TestCase):
 
     def test_the_skill_s_documented_publications_pass(self):
         text = (Path(__file__).resolve().parents[1] / 'skills' / 'captain' / 'SKILL.md').read_text(encoding='utf-8')
-        sample = {'<title.md>': '~/.cache/agentrc/captain/drafts/herdr-title.md',
-                  '<body.md>': f'{DRAFTS}/herdr.md', '<N>': '313'}
+        sample = {'<title.md>': '~/.cache/agentrc/captain/drafts/hc-title.md',
+                  '<body.md>': f'{DRAFTS}/hc.md', '<N>': '313'}
         found = re.findall(r'(python3 ~/\.claude/skills/followup-issue/scripts/publish\.py [^`#\n]*)', text)
         self.assertEqual(len(found), 2)
         for cmd in found:
@@ -265,7 +266,7 @@ class VerdictTest(unittest.TestCase):
             self.assertIsNotNone(self.verdict('Read', file_path=str(root / 'out' / 'passwd')))
 
     def test_writes_only_markdown_in_its_memory_and_drafts(self):
-        for note in (os.path.join(guard.MEMORY, 'MEMORY.md'), os.path.join(guard.DRAFTS, 'herdr-title.md')):
+        for note in (os.path.join(guard.MEMORY, 'MEMORY.md'), os.path.join(guard.DRAFTS, 'hc-title.md')):
             self.assertIsNone(self.verdict('Write', file_path=note, content='x'))
             self.assertIsNone(self.verdict('Edit', file_path=note, old_string='a', new_string='b'))
         for path in [os.path.join(guard.MEMORY, 'run.sh'), guard.MEMORY + '-other/x.md',

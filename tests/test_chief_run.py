@@ -188,7 +188,7 @@ class ChiefRun(unittest.TestCase):
         self.stream(init(), result())
         lead = {k: 'lead' for k in ('CLAUDE_PID', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_CODE_MESSAGING_SOCKET',
                                     'CLAUDE_CODE_MESSAGING_TOKEN', 'CLAUDE_CODE_BRIDGE_SESSION_ID',
-                                    'CLAUDE_CODE_SESSION_ATTENDED')}
+                                    'CLAUDE_CODE_SESSION_ATTENDED', 'HC_TERMINAL_ID', 'HC_TERMINAL_SOCKET', 'HC_SCOPE')}
         self.assertEqual(self.run_it('--permission-mode', 'bypassPermissions', **lead).returncode, 0)
         self.assertEqual((self.fake / 'stdin.txt').read_text(), 'Babysit PR 1.\n')
         self.assertEqual(Path((self.fake / 'cwd').read_text()).resolve(), self.worktree.resolve())
@@ -555,12 +555,20 @@ class ChiefRun(unittest.TestCase):
         self.assertTrue(self.texts()[-1].startswith('launcher: exit 0 (result ok)'), self.texts())
         self.assertEqual((self.fake / 'stdin.txt').read_bytes(), want)
 
-    @unittest.skipIf(os.name == 'nt', 'the Windows launcher is the --_detached run of this command')
-    def test_detached_is_no_option_where_the_launcher_forks(self):
-        r = self.run_it('--_detached', detached=True)
-        self.assertEqual(r.returncode, 2)
-        self.assertIn('unrecognized arguments: --_detached', r.stderr)
-        self.assertFalse(self.out.exists())
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'reads /proc/<pid>/environ, the environment hc reads')
+    def test_the_launcher_itself_starts_without_the_lead_terminals_identity(self):
+        # herdr-core ends every process whose starting environment carries the closed terminal's HC_SCOPE
+        self.stream(init(), '#gate go\n', result())
+        lead = {'HC_SCOPE': 'lead-scope', 'HC_TERMINAL_ID': 't5', 'HC_TERMINAL_SOCKET': '/lead.sock'}
+        r = self.run_it(detached=True, **lead)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        pid = int(r.stdout.split('launcher pid ')[1].split(',')[0])
+        self.wait_until('chief to start', lambda: (self.fake / 'pid').exists())
+        names = {e.split(b'=', 1)[0].decode() for e in Path(f'/proc/{pid}/environ').read_bytes().split(b'\0') if e}
+        self.assertFalse(names & {*lead, 'CLAUDECODE', 'HERDR_PANE_ID'}, names)
+        self.assertIn('FAKE_DIR', names, 'the rest of the environment passes')
+        (self.fake / 'go').touch()
+        self.wait_until('the exit line', lambda: self.logged('launcher: exit 0 (result ok)'))
 
     @unittest.skipUnless(os.name == 'nt', 'the Windows launcher is the --_detached run of this command')
     def test_a_detached_launcher_checks_again_what_its_caller_checked(self):
@@ -649,6 +657,7 @@ class ChiefRun(unittest.TestCase):
         self.assertEqual(released, ['lock'])
         self.assertFalse(self.out.exists())
 
+    @unittest.skipUnless(os.name == 'nt', 'a POSIX launcher inherits stderr.log opened for append')
     def test_a_detached_launchers_own_output_is_appended_after_claudes(self):
         # the Windows launcher inherits stderr.log as a handle with no append mode, at offset 0
         self.out.mkdir()

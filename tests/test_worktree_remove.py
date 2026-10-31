@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from helpers import git_env, guard_survivors, make_stub  # noqa: E402
+from test_worktree_children import HC, hc_inventory, without_hc  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'worktree-remove' / 'scripts' / 'worktree_remove.py'
 spec = importlib.util.spec_from_file_location('worktree_remove', SCRIPT)
@@ -44,11 +45,12 @@ class Rig(unittest.TestCase):
         bin_dir.mkdir()
         (bin_dir / 'gh').write_text('#!/bin/sh\necho "gh: network unreachable" >&2\nexit 1\n')
         (bin_dir / 'gh').chmod(0o755)
+        self.hc_stub, self.hc = make_stub(bin_dir, 'hc', HC), self.t / 'hc.json'
         self.bin_dir, self.reports = bin_dir, self.t / 'state' / 'agentrc' / 'worktree-remove'
         self.wt = self.t / 'wt'
         self.parent = self.wt / 'parent'
         env = git_env(GIT_CONFIG_GLOBAL=str(cfg), PATH=f'{bin_dir}{os.pathsep}{os.environ["PATH"]}',
-                      XDG_STATE_HOME=str(self.t / 'state'))
+                      XDG_STATE_HOME=str(self.t / 'state'), STUB_HC=str(self.hc))
         patch = mock.patch.dict(os.environ, env, clear=True)
         patch.start()
         self.addCleanup(patch.stop)
@@ -139,6 +141,69 @@ class Remove(Rig):
         box.mkdir(parents=True)
         (box / 'claude-main-1.lock').write_text('')
         self.assertRefused('cowork lane claude/main holds')
+
+    def test_a_herdr_core_terminal_in_the_worktree_or_any_sibling_is_refused(self):
+        sibling, dirty = self.sibling('b'), self.sibling('dirty')
+        (dirty / 'wip.txt').write_text('wip')  # kept: the cleanup removes it should it turn clean meanwhile
+        hc_inventory(self.hc, [{'address': 't5', 'cwd': str(self.t)}], {'t5': self.parent})
+        self.assertRefused(f'herdr-core terminals work there: t5 (in no herdr-app space) in {self.parent}; '
+                           'close them, then retry')
+        for tree in (sibling, dirty):
+            with self.subTest(tree=tree.name):
+                hc_inventory(self.hc, [{'address': 't7', 'name': 'rev', 'cwd': str(tree), 'where': 'parent / 1'}])
+                self.assertRefused(f'herdr-core terminals work there: t7 rev (parent / 1) in {tree}')
+
+    def test_an_hc_that_cannot_list_its_terminals_is_refused(self):
+        hc_inventory(self.hc, [], raw={'ls': [1, '', 'hc: no core']})
+        self.assertRefused('cannot list herdr-core terminals: `hc ls` exit 1: hc: no core; retry once `hc ls` answers')
+
+    def test_an_hc_that_does_not_answer_is_refused(self):
+        hc_inventory(self.hc, [], raw={'ls': [0, '{"terminals": []}', '', 5]})
+        with mock.patch.object(wr.wc, 'HC_TIMEOUT', 0.5):
+            self.assertRefused('cannot list herdr-core terminals: `hc ls` exit 124: no answer in 0.5 s')
+
+    def test_a_terminal_arriving_during_the_last_content_check_refuses_the_worktree(self):
+        check = wr.wc.content_check
+
+        def then_moved_in(child):
+            result = check(child)
+            hc_inventory(self.hc, [{'address': 't5', 'cwd': str(self.parent)}])
+            return result
+
+        def arm():
+            patch = mock.patch.object(wr.wc, 'content_check', then_moved_in)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+        with self.after_plan(arm):
+            rc, out = self.run_remove()
+        self.assertEqual(rc, 3, out)
+        self.assertIn(f'{self.parent} changed: herdr-core terminals work there: t5', out)
+        self.assertTrue((self.parent / '.git').exists())
+        self.assertFalse(self.reports.exists())
+
+    def test_a_terminal_arriving_after_the_gate_refuses_the_worktree_or_keeps_its_sibling(self):
+        sibling = self.sibling('b')
+        for tree, rc in ((self.parent, 3), (sibling, 6)):
+            with self.subTest(tree=tree.name):
+                with self.after_plan(lambda: hc_inventory(self.hc, [{'address': 't5', 'cwd': str(tree)}])):
+                    got, out = self.run_remove()
+                self.assertEqual(got, rc, out)
+                self.assertIn(f'herdr-core terminals work there: t5 (in no herdr-app space) in {tree}', out)
+                self.assertTrue(sibling.is_dir())
+                self.hc.unlink()
+        self.assertFalse(self.parent.exists())
+
+    def test_no_hc_installed_is_reported_unchecked(self):
+        rc, out = self.run_remove('--dry-run')
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn('herdr-core terminals', out)
+        with mock.patch.dict(os.environ, {'PATH': without_hc(os.environ['PATH'], self.hc_stub)}):
+            wr.wc = wr.load_module()
+            hc_inventory(self.hc, [{'address': 't5', 'cwd': str(self.parent)}])  # no hc answers it
+            rc, out = self.run_remove('--dry-run')
+        self.assertEqual(rc, 0, out)
+        self.assertIn('- herdr-core terminals working in them: not checked, no hc installed', out)
 
     def test_a_log_and_its_reports_inside_the_worktree_or_any_sibling_are_refused(self):
         sibling, dirty = self.sibling('b'), self.sibling('dirty')

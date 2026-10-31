@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import guard_survivors, tmpdir  # noqa: E402
+from helpers import guard_survivors, make_stub, tmpdir  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / 'lib' / 'worktree_children.py'
@@ -28,6 +28,50 @@ if sys.argv[1:3] == ['repo', 'view']:
 else:
     print(open(prs).read())
 '''
+
+# hc: answers each command line from the JSON in $STUB_HC (see hc_inventory), its nth call by `<line> #<n>` first;
+# an empty inventory without one
+HC = r'''import json, os, sys
+args = ' '.join(a for a in sys.argv[1:] if a != '--json')
+try:
+    with open(os.environ['STUB_HC']) as f:
+        answers = json.load(f)
+except FileNotFoundError:
+    answers = {'ls': [0, '{"terminals": []}', '']}
+counts = os.environ['STUB_HC'] + '.calls'
+seen = json.load(open(counts)) if os.path.exists(counts) else {}
+seen[args] = seen.get(args, 0) + 1
+json.dump(seen, open(counts, 'w'))
+rc, out, err, *hang = answers.get(f'{args} #{seen[args]}') or answers.get(
+    args, [3, '', '{"error": {"kind": "not_found", "message": "no terminal"}}'])
+if hang:
+    import time
+    time.sleep(hang[0])
+sys.stdout.write(out)
+sys.stderr.write(err)
+sys.exit(rc)
+'''
+
+
+def hc_inventory(at, terminals, foregrounds=None, raw=None):
+    """Writes the hc stub's answers to at: `hc ls` lists terminals, live unless one says otherwise, and
+    `hc get <t>` gives foregrounds[t] as its foreground's cwd (no foreground when absent); raw maps a command
+    line, or `<line> #<n>` its nth call, to [exit, stdout, stderr(, seconds it hangs first)] in place of either.
+    The call counts restart."""
+    terminals = [{'state': 'live', 'agent': 'bash', **t} for t in terminals]
+    answers = {'ls': [0, json.dumps({'terminals': terminals}), '']}
+    for t in terminals:
+        fg = (foregrounds or {}).get(t['address'])
+        answers[f'get {t["address"]}'] = [0, json.dumps({**t, 'foreground': fg and {'cwd': str(fg), 'pid': 1}}), '']
+    Path(at).write_text(json.dumps({**answers, **(raw or {})}))
+    Path(f'{at}.calls').unlink(missing_ok=True)
+
+
+def without_hc(path, stub):
+    """path with no hc on it: the stub deleted and each other directory holding one dropped."""
+    Path(stub).unlink()
+    return os.pathsep.join(d for d in path.split(os.pathsep) if not shutil.which('hc', path=d))
+
 
 # runs the script with something at the parent path (argv[3]) only at the third look, as a replacement
 # moved in and out again would be
@@ -90,7 +134,8 @@ class WorktreeChildren(unittest.TestCase):
         gh_dir.mkdir()
         (gh_dir / 'gh').write_text(GH)
         (gh_dir / 'gh').chmod(0o755)
-        self.env['PATH'] = f'{gh_dir}{os.pathsep}{self.env["PATH"]}'
+        self.hc_stub, self.hc = make_stub(gh_dir, 'hc', HC), self.t / 'hc.json'
+        self.env.update(PATH=f'{gh_dir}{os.pathsep}{self.env["PATH"]}', STUB_HC=str(self.hc))
         # an upstream for the submodule, and the main repository with it
         self.git('init', '-q', '--bare', str(self.t / 'sub.git'), cwd=self.t)
         self.git('clone', '-q', str(self.t / 'sub.git'), str(self.t / 'subwork'), cwd=self.t)
@@ -828,6 +873,92 @@ class WorktreeChildren(unittest.TestCase):
         (box / 'codex-review-1.lock').write_text('')
         self.assert_kept(child, 'cowork lane codex/review holds a running or undelivered request')
 
+    def test_a_herdr_core_terminal_working_in_the_child_keeps_it(self):
+        child, other = self.child(), self.child('other')
+        hc_inventory(self.hc, [
+            {'address': 't7', 'name': 'rev', 'cwd': str(self.t), 'where': 'parent / 1'},  # its foreground inside
+            {'address': 't8', 'cwd': str(child)},  # a terminal in no herdr-app space
+            {'address': 't9', 'cwd': str(child), 'state': 'finished'},
+            {'address': 'ci/t3', 'cwd': str(child)},  # another machine's
+            {'address': 't10', 'cwd': str(self.t)},  # ended between the listing and the look
+            {'address': 't11', 'cwd': str(self.t)}],  # moved in since the listing
+            {'t7': child / 'build'}, raw={'get t10': [3, '', '{"error": {"kind": "not_found"}}'],
+                                           'get t11': [0, json.dumps({'cwd': str(child), 'foreground': None}), '']})
+        done = self.cleanup()
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn(f'kept {child}: herdr-core terminals work there: t7 rev (parent / 1) in {child / "build"}; '
+                      f't8 (in no herdr-app space) in {child}; t11 (in no herdr-app space) in {child}; close them, then retry\n',
+                      done.stdout)
+        self.assertTrue(child.is_dir())
+        self.assertFalse(other.exists())
+
+    def test_an_hc_that_cannot_list_its_terminals_keeps_the_child(self):
+        child = self.child()
+        listed = [{'address': 't7', 'cwd': str(self.t)}]
+        cases = {'hc fails': [{'ls': [1, '', 'no core']}], 'not JSON': [{'ls': [0, 'oops', '']}],
+                 'no terminal list': [{'ls': [0, '{}', '']}],
+                 'an entry without cwd': [{'ls': [0, '{"terminals": [{"address": "t7", "state": "live"}]}', '']}],
+                 'an entry without state': [{'ls': [0, '{"terminals": [{"address": "t7", "cwd": "/"}]}', '']}],
+                 'an unknown state': [{}, [{'address': 't7', 'cwd': str(self.t), 'state': 'parked'}]],
+                 'an empty cwd': [{}, [{'address': 't7', 'cwd': ''}]],
+                 'a relative cwd': [{}, [{'address': 't7', 'cwd': 'parent--child'}]],
+                 'get with an empty cwd': [{'get t7': [0, '{"cwd": "", "foreground": null}', '']}, listed],
+                 'a relative foreground cwd': [
+                     {'get t7': [0, json.dumps({'cwd': str(self.t), 'foreground': {'cwd': '.'}}), '']}, listed],
+                 'get fails': [{'get t7': [1, '', 'lost']}, listed],
+                 'exit 3 but not not_found': [{'get t7': [3, '', '{"error": {"kind": "needs_target"}}']}, listed],
+                 'get without foreground': [{'get t7': [0, json.dumps({'cwd': str(self.t)}), '']}, listed],
+                 'get without cwd': [{'get t7': [0, '{"foreground": null}', '']}, listed],
+                 'a foreground without cwd': [{'get t7': [0, json.dumps({'cwd': str(self.t), 'foreground': {}}), '']},
+                                              listed]}
+        self.drop_parent()
+        for case, (raw, *terminals) in cases.items():
+            with self.subTest(case):
+                hc_inventory(self.hc, terminals[0] if terminals else [], raw=raw)
+                done = self.run_script('cleanup', str(self.parent))
+                self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+                self.assertIn(f'kept {child}: cannot list herdr-core terminals', done.stdout)
+                self.assertTrue(child.is_dir())
+
+    def test_a_terminal_whose_listing_is_inside_keeps_the_child_without_a_look(self):
+        child = self.child()
+        hc_inventory(self.hc, [{'address': 't7', 'cwd': str(child)}], raw={'get t7': [1, '', 'never asked']})
+        done = self.cleanup()
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn(f'kept {child}: herdr-core terminals work there: t7 (in no herdr-app space) in {child}',
+                      done.stdout)
+
+    def test_a_terminal_arriving_after_the_childs_checks_keeps_it(self):
+        child = self.child()
+        moved_in = json.dumps({'terminals': [{'address': 't7', 'cwd': str(child), 'state': 'live'}]})
+        hc_inventory(self.hc, [], raw={'ls #2': [0, moved_in, ''],
+                                       'get t7': [0, json.dumps({'cwd': str(child), 'foreground': None}), '']})
+        done = self.cleanup()
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn(f'kept {child}: herdr-core terminals work there: t7 (in no herdr-app space) in {child}',
+                      done.stdout)
+        self.assertTrue(child.is_dir())
+
+    def test_a_parent_recreated_during_a_childs_last_terminal_check_keeps_it(self):
+        child = self.child()
+        # the second `hc ls` is the one just before the removal
+        recreate = (f'if sys.argv[1:2] == ["ls"] and os.path.exists(os.environ["STUB_HC"] + ".calls"):\n'
+                    f'    os.makedirs({str(self.parent)!r}, exist_ok=True)\n')
+        make_stub(self.hc_stub.parent, 'hc', HC.replace('\ntry:', f'\n{recreate}try:', 1))
+        hc_inventory(self.hc, [])
+        done = self.cleanup()
+        self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
+        self.assertIn(f'{self.parent} exists again: not touching {child}', done.stdout)
+        self.assertTrue(child.is_dir())
+
+    def test_no_hc_installed_skips_the_terminal_check(self):
+        child = self.child()
+        self.env['PATH'] = without_hc(self.env['PATH'], self.hc_stub)
+        hc_inventory(self.hc, [{'address': 't7', 'cwd': str(child)}])  # no hc answers it
+        self.assert_removed(child)
+        self.assertIn('no hc installed: herdr-core terminals in the children not checked',
+                      self.log.read_text(encoding='utf-8'))
+
     def test_a_staying_childs_own_children_and_link_targets_stay(self):
         target = self.child('dep-x')  # sorted before the child linking to it
         chained = self.child('dep-y')
@@ -1016,6 +1147,7 @@ class WorktreeChildren(unittest.TestCase):
         copy = dirty / 'build' / 'lib' / 'worktree_children.py'
         copy.parent.mkdir()
         shutil.copy(SCRIPT, copy)
+        shutil.copy(SCRIPT.with_name('windows.py'), copy.parent)
         state = dirty / 'build' / 'state'
         log = state / 'agentrc' / 'worktree-remove' / 'log'
         for what, path, script, env, cwd in (
@@ -1108,6 +1240,28 @@ class Planning(unittest.TestCase):
             walked.clear()
             self.assertEqual(wc.removal_plan([a, b, c, d], []), ([a, b, c, d], {}))
             self.assertEqual(sorted(walked), ['a', 'b', 'c', 'd'])
+
+
+class HcPath(unittest.TestCase):
+    def test_hc_comes_from_path_alone_never_the_working_directory(self):
+        spec = importlib.util.spec_from_file_location('worktree_children', SCRIPT)
+        wc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(wc)
+        t = tmpdir(self)
+        name = 'hc.exe' if os.name == 'nt' else 'hc'
+        empty, bin_dir, here = t / 'empty', t / 'bin', t / 'here'
+        for d in (empty, bin_dir, here):
+            d.mkdir()
+        for d in (bin_dir, here):
+            (d / name).write_text('')
+            (d / name).chmod(0o755)
+        cwd = os.getcwd()
+        os.chdir(here)  # a checkout holding an hc: shutil.which on Windows takes it first
+        self.addCleanup(os.chdir, cwd)
+        with mock.patch.dict(wc.ENV, PATH=str(empty)):
+            self.assertIsNone(wc.hc_path())
+        with mock.patch.dict(wc.ENV, PATH=os.pathsep.join([str(empty), str(bin_dir)])):
+            self.assertEqual(os.path.normcase(wc.hc_path()), os.path.normcase(str(bin_dir / name)))
 
 
 class LinkHops(unittest.TestCase):

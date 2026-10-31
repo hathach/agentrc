@@ -13,6 +13,9 @@ Refused (exit 3), nothing changed:
 - the working directory, this script, the module, the report directory or the log lies inside, or
   is reached through, PATH or any sibling, a kept one included (run it from outside them, naming
   PATH): git cannot close the sessions in it; checked before anything else;
+- a live herdr-core terminal works in PATH or any sibling, the caller's own included, each named with
+  its herdr-app space (close them first), or an installed `hc` cannot list them all; checked next, with
+  no hc installed not at all (the report says so);
 - PATH fails the module's content check, the one each sibling gets (its docstring lists them);
   a chief session in PATH, headless or interactive and the caller's own included, refuses it: a
   chief cannot remove its own worktree, so the human runs this from a plain session;
@@ -25,9 +28,10 @@ commits on its remote that the remote's default branch lacks, with no PR at that
 and each branch the cleanup will keep, with the reason (a never-pushed commit, say); each --pending
 item. The token digests the list, so a list that changed since the human saw it stops again.
 
-Then PATH's content check runs again, refused (exit 3) also when its branch or tip moved; the report
-goes to ${XDG_STATE_HOME:-~/.local/state}/agentrc/worktree-remove/<UTC time>-<name>.md (the
-inventory, symlinks leaving each removed tree, the gate, the log, the command), and
+Then PATH's content check and its terminal check run again, refused (exit 3) also when its branch or
+tip moved; the report goes to
+${XDG_STATE_HOME:-~/.local/state}/agentrc/worktree-remove/<UTC time>-<name>.md (the inventory, symlinks
+leaving each removed tree, the gate, the log, the command), and
 `git worktree remove <PATH>` runs, with --force only for a checkout with submodules (git refuses
 those otherwise), then the cleanup of PATH with PATH's branch, which prints its actions and appends
 them to the log beside the reports. A process whose working directory is inside PATH can make git
@@ -145,6 +149,10 @@ def plan(path, pending):
     if why:
         raise Refused(why)
     try:
+        wc.check_terminals(root, *found)  # any sibling, as above
+    except wc.Keep as why:
+        raise Refused(str(why))
+    try:
         common, force = wc.content_check(root)
     except (wc.Keep, OSError) as why:
         raise Refused(f'{root}: {why}')
@@ -185,7 +193,7 @@ def plan(path, pending):
         raise Refused(f'listing the symlinks leaving the removed trees: {why}')
     token = hashlib.sha256('\n'.join(items).encode()).hexdigest()[:12]
     return dict(root=root, common=common, head=head, force=force, checkouts=checkouts, links=links, items=items,
-                token=token)
+                token=token, hc=wc.hc_path())
 
 
 def command(p):
@@ -201,6 +209,8 @@ def report(p, heading):
         fate = ('git removes it' if s['path'] == p['root'] else
                 'the cleanup removes it' if s['why'] is None else f'stays: {s["why"]}')
         lines.append(f'- {s["path"]}: {fate}' + (f'; {s["branch"]}' if s['branch'] else ''))
+    if not p['hc']:
+        lines.append('- herdr-core terminals working in them: not checked, no hc installed')
     lines += ['', '## Symlinks leaving the removed trees', '']
     lines += [f'- {link} -> {target}' for link, target in p['links']] or ['- none']
     lines += ['', f'## Pending (token {p["token"]})', '']
@@ -234,6 +244,7 @@ def main(argv=None):
         wc.content_check(p['root'])
         if wc.head_branch(p['root']) != p['head']:
             raise wc.Keep('its branch or tip moved since the gate')
+        wc.check_terminals(p['root'])  # again: the content check can take long
     except (wc.Keep, OSError) as why:
         print(f'worktree_remove: refused, nothing changed: {p["root"]} changed: {why}', file=sys.stderr)
         return 3

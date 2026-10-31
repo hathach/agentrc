@@ -1705,6 +1705,21 @@ class CoworkTest(unittest.TestCase):
         self.assertTrue(cowork.held(self.box() / f'{request}.lock'), 'the runner still holds the request')
         self.settled(request)
 
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'reads /proc/<pid>/environ, the environment hc reads')
+    def test_the_detached_runner_starts_without_the_lead_terminals_identity(self):
+        # herdr-core ends every process whose starting environment carries the closed terminal's HC_SCOPE
+        lead = {'HC_SCOPE': 'lead-scope', 'HC_TERMINAL_ID': 't5', 'HC_TERMINAL_SOCKET': '/lead.sock'}
+        _, request = self.send_gated('--detach', '--task', 'x', **lead)
+        self.started(request)
+        cli = cowork.cli_pid(self.box() / f'{request}.lock')
+        runner = Path(f'/proc/{cli}/stat').read_text().rsplit(')', 1)[1].split()[1]
+        for pid in (runner, cli):
+            names = {e.split(b'=', 1)[0].decode() for e in Path(f'/proc/{pid}/environ').read_bytes().split(b'\0') if e}
+            self.assertFalse(names & lead.keys(), (pid, names))
+            self.assertIn('FAKE_LOG', names, 'the rest of the environment passes')
+        self.assertIn('cowork.py', Path(f'/proc/{runner}/cmdline').read_text())
+        self.settled(request)
+
     def test_read_wait_recovers_a_dead_sender_and_binds_the_session(self):
         request = self.reaped('--task', 'x')
         reader = self.read_wait(request)

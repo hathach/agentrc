@@ -486,7 +486,8 @@ def nt_detach(argv, cwd, handle, stderr):
     """Start the runner, or the middle process that starts it, outside the
     caller's console, process group and, where the job allows, its job."""
     group = subprocess.CREATE_NEW_PROCESS_GROUP
-    kwargs = dict(cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=stderr)
+    kwargs = dict(cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=stderr,
+                  env=lead_session.child_env())
     try:
         return nt_popen(argv, handle, group | subprocess.CREATE_BREAKAWAY_FROM_JOB, **kwargs)
     except PermissionError:  # a job that forbids breakaway, or a program or cwd denied: the retry tells them apart
@@ -1187,7 +1188,7 @@ def start(box, root, side, task, no_edit, read_only, worktree, model, effort, ti
             middle = os.fork()
             if middle == 0:
                 subprocess.Popen(argv, cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=err,
-                                 start_new_session=True, pass_fds=(lock.fileno(),))
+                                 start_new_session=True, pass_fds=(lock.fileno(),), env=lead_session.child_env())
                 os._exit(0)
             os.waitpid(middle, 0)
     return request

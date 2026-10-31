@@ -9,7 +9,7 @@ whose title and body it drafted under DRAFTS; whether the human asked for it sta
 Only captain's calls are checked, as a backstop to the declaration: the payload names agent_type `captain`,
 whether captain runs as the session's agent or as another session's subagent. An allowlist, so a tool or command
 added later is denied until it is named here. A guard against mistakes and drift, not isolation: captain.py itself
-runs herdr and types into other panes, and the checks in it stay the authority. Exit 2 denies; Claude Code lets an
+runs hc and types into other terminals, and the checks in it stay the authority. Exit 2 denies; Claude Code lets an
 erroring hook pass, so any error denies too.
 """
 import json

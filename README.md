@@ -205,7 +205,7 @@ Agent collaboration and PRs:
 | Skill | Use it to | Start with |
 |---|---|---|
 | [`cowork`](skills/cowork/SKILL.md) | hand the other agent (Codex or Claude) a task, question or review headless, in resumed lanes | `cowork.py send --lane L --task -` |
-| [`herdr-peer`](skills/herdr-peer/SKILL.md) | the same with the agent in the neighbouring Herdr pane, watched live; needs `HERDR_ENV=1` | `peer.py peers`, `send --to <pane> --files none --task -`, `read --from <pane> --for <id>` |
+| [`herdr-peer`](skills/herdr-peer/SKILL.md) | the same with the agent in another hc terminal on this checkout, watched live; needs herdr-core (`HC_TERMINAL_ID`) | `peer.py peers`, `send --to <t> --files none --task -`, `read --from <t> --for <id>`; the peer answers with `reply --for <id> --file <f>` |
 | [`simplify-gate`](skills/simplify-gate/SKILL.md) | switch the per-repository Codex YAGNI check at Stop (below) | `/simplify-gate status\|on\|off` |
 | [`pr-reply`](skills/pr-reply/SKILL.md) | post PR review replies from a manifest, read each back, resolve verified review threads | `reply.py --pr N --manifest f.json` |
 | [`followup-issue`](skills/followup-issue/SKILL.md) | open a follow-up issue, or comment new evidence on one that covers the topic, read it back, never post twice | `publish.py create --repo o/r --allow-repo o/r --title t --body-file f` |
@@ -362,7 +362,7 @@ Leave the checkout to chief until it exits.
 ## Captain session
 
 `agents/captain.md` is one seat over the other Claude Code sessions in this host's
-Herdr (Codex panes are left out): it lists them, opens new ones on existing
+hc terminals (Codex terminals are left out): it lists them, opens new ones on existing
 checkouts under either account, asks the idle ones for status, reports one table
 and carries the human's own words, read from its own transcript, to the sessions
 they name. It checks what sessions report with read-only git and gh lookups and
@@ -371,10 +371,10 @@ sessions' work; the one thing it publishes is a follow-up issue in hathach/agent
 for a defect in its own tooling, on the human's word. Its guard,
 `skills/captain/scripts/captain_guard.py`, declared as a hook in the agent file so
 it applies on every account, names in its docstring the calls it allows. It reads
-sessions from Herdr rather than
-Claude Code's own session list because sessions run under more than one account
+sessions from hc terminals, each pinned to the session Claude Code registered under
+its process's account config dir, because sessions run under more than one account
 (`CLAUDE_CONFIG_DIR`), each shown with the account its process runs under. Start
-it in its own pane:
+it in its own terminal:
 
 ```sh
 ~/code/agentrc/install.py install --agent --skill

@@ -25,10 +25,12 @@ python3 <skill dir>/scripts/worktree_remove.py [PATH] --dry-run [--pending "<ite
   filing issues.
 - Run it from outside the worktree and its siblings, naming it as PATH (it
   refuses a working directory inside them, a kept sibling included); it prints
-  the outcome and logs it beside the report. The script checks only its own
-  working directory: a session or terminal still inside the worktree loses it
-  with the removal (on Windows holds it open, failing the removal part way),
-  so ask the human to close those, or to run it from another session.
+  the outcome and logs it beside the report. It refuses while a herdr-core
+  terminal works in the worktree or a sibling, naming each with its
+  herdr-app space: ask the human to close those, or to run it from another
+  session when it is yours. Any other process still inside loses it
+  with the removal (on Windows holds it open, failing the removal part way).
+  Without `hc` installed terminals go unchecked, as the report says.
 - Exit 6: the worktree is gone but the cleanup kept a sibling or branch, or
   stopped because something appeared at its path again; report the reasons
   and the retry command the log names.
