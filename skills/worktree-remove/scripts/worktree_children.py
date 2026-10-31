@@ -18,8 +18,8 @@ for a child with submodules (git refuses those otherwise), so a write racing its
   foreground process's working directory in it (`hc ls`, `hc get`), checked again right before its removal:
   it would lose that directory, and on Windows hold it open; an `hc` that fails or answers incompletely
   keeps it, none installed skips this;
-- on Linux, no process of this user has its working directory in it (`/proc/<pid>/cwd`), checked again
-  right before its removal too; other users' processes, and every process on other systems, go unseen;
+- on Linux, no process whose working directory `/proc/<pid>/cwd` this user can read is in it, checked
+  again right before its removal too; other users' processes, and every process on other systems, go unseen;
 - not locked; HEAD on a branch, or a detached HEAD reachable from the branches, tags or remotes,
   the remotes' only after fetching each configured remote as branches are (below), first;
 - in the child and in every initialized submodule, recursively: `git status` shows no tracked
@@ -412,14 +412,14 @@ def lists_processes():
 
 
 def processes_in(tree):
-    """[(pid, name)] of this user's processes working in tree; none where /proc lists none (not Linux)."""
+    """[(pid, name)] of the processes working in tree whose /proc cwd entry is readable; none without /proc."""
     if not lists_processes():
         return []
     found = []
     for entry in PROC.iterdir():
         try:
             if entry.name.isdigit() and is_within(os.readlink(entry / 'cwd'), [tree]):
-                found.append((int(entry.name), (entry / 'comm').read_text().strip()))
+                found.append((int(entry.name), (entry / 'comm').read_bytes().decode(errors='backslashreplace').strip()))
         except OSError:  # gone since the listing, or another user's
             continue
     return sorted(found)

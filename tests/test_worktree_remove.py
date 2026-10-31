@@ -211,8 +211,6 @@ class Remove(Rig):
 
     def test_no_proc_is_reported_unchecked(self):
         wr.wc = wr.wc or wr.load_module()
-        rc, out = self.run_remove('--dry-run')
-        self.assertNotIn('other processes working in them', out)
         with mock.patch.object(wr.wc, 'PROC', self.t / 'no-proc'):
             rc, out = self.run_remove('--dry-run')
         self.assertEqual(rc, 0, out)

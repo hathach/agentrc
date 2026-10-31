@@ -955,12 +955,16 @@ class WorktreeChildren(unittest.TestCase):
     @unittest.skipUnless(Path('/proc/self/cwd').exists(), 'processes listed by /proc')
     def test_a_process_working_in_the_child_keeps_it(self):
         child, other = self.child(), self.child('other')
-        holder = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], cwd=child)
+        # a name that is no UTF-8 (PR_SET_NAME) is shown escaped
+        holder = subprocess.Popen([sys.executable, '-c', 'import ctypes, time; '
+                                   "ctypes.CDLL(None).prctl(15, b'worker-\\xff', 0, 0, 0); print(flush=True); time.sleep(60)"],
+                                  cwd=child, stdout=subprocess.PIPE)
         self.addCleanup(holder.wait)
         self.addCleanup(holder.kill)
+        holder.stdout.readline()
         done = self.cleanup()
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
-        self.assertRegex(done.stdout, rf'kept {re.escape(str(child))}: a process works in it: .*\(pid {holder.pid}\)\n')
+        self.assertIn(f'kept {child}: a process works in it: worker-\\xff (pid {holder.pid})\n', done.stdout)
         self.assertTrue(child.is_dir())
         self.assertFalse(other.exists())
 
