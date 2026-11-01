@@ -1,0 +1,23 @@
+# A HIL farm host file: setup.sh install --host FILE validates it and installs it as /etc/hil-farm/host.toml.
+# Each farm host's real one is hosts/<host>.toml.
+
+profile = "lab"                       # this host's name; a host keeps it, so a mistaken file refuses
+admin = "admin"                       # the admin account: SSH key only and passwordless sudo on a dedicated host
+shared = false                        # true: a host its owner also uses (README); the owner keeps sshd, firewall, sudo
+# Optional, all empty by default:
+# skip = ["renesas-fw"]                           # farm.toml tools this host never installs
+# apt_skip = ["unattended-upgrades"]              # apt.packages a new install leaves to the owner
+# runner_path = ["/opt/vendor/bin"]               # appended to the runners' PATH only
+# legacy_units = ["actions.runner.old.service"]   # runner units from before the farm: setup refuses while one runs
+# iar = true                                      # verify.sh's IAR checks: iccarm, cmake >= 3.20, ninja on that PATH
+
+[runner.tinyusb]                      # one table per runner, of tinyusb and tinyuf2: its name and labels on GitHub
+name = "lab-tinyusb"
+labels = ["hardware-in-the-loop", "lab"]
+
+[runner.tinyuf2]
+name = "lab-tinyuf2"
+labels = ["tinyuf2"]
+
+# [adopt]                                         # an owner's plain file at a farm link, moved aside when it matches
+# "/usr/local/bin/openocd" = "<sha256 of the owner's file>"

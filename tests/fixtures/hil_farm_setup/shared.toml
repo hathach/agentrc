@@ -1,0 +1,17 @@
+# A host its owner also uses: one runner beside the owner's account, sshd, firewall and update policy.
+profile = "shared"
+admin = "owner"
+shared = true
+skip = ["renesas-fw"]
+apt_skip = ["unattended-upgrades", "systemd-timesyncd"]
+runner_path = ["/opt/vendor/arm/bin"]
+legacy_units = ["actions.runner.example-runner.service"]
+iar = true
+
+[runner.tinyusb]
+name = "shared-tinyusb"
+labels = ["shared"]
+
+[adopt]
+"/usr/local/bin/openocd" = "b2824a957f327b1ab6222a899be7e1a6f86f8166968cdb1d53d9efe569a5774e"
+"/usr/local/bin/testusb" = "82647bd03d116ba8ad7604e8bbf8a3fa0f9446bcddcab088bf5b8647cea72456"

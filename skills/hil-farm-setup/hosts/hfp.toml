@@ -1,0 +1,17 @@
+# HiFiPhile's tusb VM (ssh alias hifiphile): the farm beside its owner's own setup.
+profile = "hfp"
+admin = "tusb"
+shared = true
+skip = ["renesas-fw"]                                   # no uPD720201 cards
+apt_skip = ["unattended-upgrades", "systemd-timesyncd"]  # the owner's update and time policy
+runner_path = ["/opt/iar/cxarm/arm/bin"]                # the owner's IAR: hil-hfp-iar builds with iccarm
+legacy_units = ["actions.runner.hathach-tinyusb.tusb_hifiphile.service"]  # its runner before the farm
+iar = true
+
+[runner.tinyusb]  # build.yml's hfp legs run on the hifiphile label
+name = "tusb_hifiphile"
+labels = ["hifiphile"]
+
+[adopt]  # the owner's plain files at farm links, moved to <path>.pre-hil-farm when they still match
+"/usr/local/bin/openocd" = "b3fe9592559f5750aad4f1ccc0bbc303560b6265692d2d1cb93f8fee03d72efe"
+"/usr/local/bin/testusb" = "63601dbf181f7f26521bc82c9ba8fa2216ed8b097fa4cf055af66e1cd0a29d74"

@@ -1,0 +1,11 @@
+# ci.lan (VM 100 on pve): the TinyUSB and TinyUF2 HIL farm, the host alone.
+profile = "ci"
+admin = "hathach"
+
+[runner.tinyusb]
+name = "tinyusb"
+labels = ["hardware-in-the-loop", "hathach"]
+
+[runner.tinyuf2]
+name = "tinyuf2"
+labels = ["tinyuf2"]
