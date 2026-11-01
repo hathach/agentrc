@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Where each requested review bot stands on a PR's head, and every comment its reviewers left.
 
-  harvest.py --pr N --reviewers copilot,coderabbit,greptile,code-scanning --auto-run coderabbit,greptile [--repo OWNER/REPO]
+  harvest.py --pr N --reviewers copilot,coderabbit,greptile,code-scanning --auto-run coderabbit,greptile [--repo OWNER/REPO] [--probe]
 
 --auto-run names the bots settled from their artifacts, only coderabbit and greptile. Copilot is read
 from its newest submitted review on the head; any other reviewer is `harvested`, its state not read.
@@ -36,6 +36,9 @@ with its walkthrough marker (CR_WALKTHROUGH), the auto-generated summary,
 "copilot-refusal". Their digest and aliases are still the real body's and identify them,
 and its url shows it (`gh api repos/<repo>/issues/comments/<commentId>` for the walkthrough). Exit 2 with {"error": ...} when gh cannot answer the PR, the
 head, or a comment endpoint, plus facts.py's rateLimit when GitHub refused gh for a rate limit.
+
+--probe prints only headSha, observedAt, headEventAt, headEventEvidence, bots and fingerprint, sealed (facts.sealed): what a workflow waiting out
+CodeRabbit's rate limit compares with its last full harvest (#359).
 """
 
 import base64
@@ -57,6 +60,7 @@ except ImportError:
 sys.path.insert(0, str(Path(__file__).parent))
 from facts import FULL_SHA, Parser, RateLimited, Unusable, bind_repo, report, run  # noqa: E402
 
+PROBE = ('headSha', 'observedAt', 'headEventAt', 'headEventEvidence', 'bots', 'fingerprint')
 # reply.py checks a comment against the same digest, so both skills share one definition.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'pr-reply' / 'scripts'))
 import comment_digest  # noqa: E402
@@ -548,6 +552,7 @@ def collect(argv):
     p.add_argument('--reviewers', required=True)
     p.add_argument('--auto-run', default='')
     p.add_argument('--repo')
+    p.add_argument('--probe', action='store_true')
     a = p.parse_args(argv)
     reviewers = [r for r in a.reviewers.split(',') if r]
     auto = [r for r in a.auto_run.split(',') if r]
@@ -560,11 +565,11 @@ def collect(argv):
             seen = observe(repo, a.pr, reviewers, auto)
             again = gh_json('pr', 'view', str(a.pr), '-R', repo, '--json', 'headRefOid')['headRefOid']
             if again == seen['headSha']:
-                return seen
+                return {k: seen[k] for k in PROBE} if a.probe else seen
     except (KeyError, TypeError, AttributeError, IndexError, ValueError) as e:
         raise Unusable(f'gh answered in a shape harvest.py does not read ({e!r})')
     raise Unusable(f'the head moved during two reads in a row (now {again}); harvest again once it settles')
 
 
 if __name__ == '__main__':
-    sys.exit(report(collect, sys.argv[1:], limits=True))
+    sys.exit(report(collect, sys.argv[1:], seal='--probe' in sys.argv[1:], limits=True))

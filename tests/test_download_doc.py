@@ -1888,6 +1888,8 @@ class EnumerationComplete(unittest.TestCase):
         cases = {'CH32V303/305/307/317 datasheet, this series is': 'CH32V303/305/307/317 datasheet',
                  '超高速USB3.0双核MCU芯片CH32H417数据手册，青稞V5F': '超高速USB3.0双核MCU芯片CH32H417数据手册',
                  '2.4G无线MCU CH572，内置': '2.4G无线MCU CH572',
+                 '互联型MCU芯片CH32V407,CH32V467的数据手册，': '互联型MCU芯片CH32V407,CH32V467的数据手册',
+                 'CH32V407 datasheet,  see the': 'CH32V407 datasheet',
                  'CH545 datasheet. Multi-host': 'CH545 datasheet',
                  'CH32H417 SuperSpeed USB3.0 dual-core MCU': 'CH32H417 SuperSpeed USB3.0 dual-core MCU',
                  'Information change in the download page (Software introduction/application scope): '

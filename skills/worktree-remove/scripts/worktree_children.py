@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Remove the sibling child worktrees of a linked worktree once the worktree-remove skill has removed it.
 
-    python3 lib/worktree_children.py cleanup <parent> [--branch <common git dir> <branch> <oid>]...  # a retry
+    python3 worktree_children.py cleanup <parent> [--branch <common git dir> <branch> <oid>]...  # a retry
 
 Children of `<dir>/<name>` are the entries `<dir>/<name>--*` (grandchildren `<name>--a--b`
 too, unless `<name>--a` stays) with a `.git` file that are linked git worktrees of any repository: the `<name>--`
@@ -17,7 +17,9 @@ for a child with submodules (git refuses those otherwise), so a write racing its
 - no live herdr-core terminal of this machine, one in no herdr-app space included, has its program's or
   foreground process's working directory in it (`hc ls`, `hc get`), checked again right before its removal:
   it would lose that directory, and on Windows hold it open; an `hc` that fails or answers incompletely
-  keeps it, none installed skips this. Other processes working in it go unseen;
+  keeps it, none installed skips this;
+- on Linux, no process whose working directory `/proc/<pid>/cwd` this user can read is in it, checked
+  again right before its removal too; other users' processes, and every process on other systems, go unseen;
 - not locked; HEAD on a branch, or a detached HEAD reachable from the branches, tags or remotes,
   the remotes' only after fetching each configured remote as branches are (below), first;
 - in the child and in every initialized submodule, recursively: `git status` shows no tracked
@@ -75,7 +77,8 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))  # loaded by path (worktree_remove.py), lib is not on it
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))  # loaded by path, lib is not on it
+import hc  # noqa: E402
 import windows  # noqa: E402
 
 PRIVATE_REFS = ('refs/worktree/', 'refs/bisect/', 'refs/rewritten/')
@@ -86,7 +89,7 @@ GIT_LOCATION = ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE', 
 ENV = {k: v for k, v in os.environ.items() if k not in GIT_LOCATION}  # so `git -C <child>` means the child
 OPERATIONS = ('MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'rebase-merge', 'rebase-apply', 'BISECT_LOG')
 LOG = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local' / 'state') / 'agentrc' / 'worktree-remove' / 'log'
-SKILLS = Path(__file__).resolve().parents[1] / 'skills'
+SKILLS = Path(__file__).resolve().parents[2]
 SEARCH = '''query($q: String!, $endCursor: String) {
   search(query: $q, type: ISSUE, first: 100, after: $endCursor) {
     issueCount
@@ -360,7 +363,8 @@ def absolute(path):
 
 
 def terminals_in(trees):
-    """{tree: [terminal]} of the trees a live local herdr-core terminal works in: its program's working directory,
+    """{tree: [terminal]} of the trees a live local herdr-core terminal works in, each {address, name, where, at}
+    (`label` words it): its program's working directory,
     as `hc ls` or else `hc get` gives it, or its foreground process's, a terminal in no herdr-app space included.
     hc's own terminals only; with no hc installed nothing is checked; Keep for an inventory hc cannot give whole.
     `hc ls` starts a core when none runs (so does `hc server status`): one that does lists nothing."""
@@ -392,13 +396,62 @@ def terminals_in(trees):
         for tree in trees:
             where = next((d for d in cwds if is_within(d, [tree])), None)
             if where:
-                name = f'{addr} {t["name"]}' if t.get('name') else addr
-                busy.setdefault(tree, []).append(f'{name} ({t.get("where") or "in no herdr-app space"}) in {where}')
+                busy.setdefault(tree, []).append(dict(address=addr, name=t.get('name'), where=t.get('where'), at=where))
     return busy
 
 
+def label(t):
+    name = f'{t["address"]} {t["name"]}' if t.get('name') else t['address']
+    return f'{name} ({t.get("where") or "in no herdr-app space"}) in {t["at"]}'
+
+
 def busy_with(terminals):
-    return f'herdr-core terminals work there: {"; ".join(terminals)}; close them, then retry'
+    return f'herdr-core terminals work there: {"; ".join(map(label, terminals))}; close them, then retry'
+
+
+PROC = Path('/proc')
+
+
+def lists_processes():
+    """Whether /proc shows processes' working directories (Linux)."""
+    return (PROC / 'self' / 'cwd').exists()
+
+
+def descendants(pids):
+    """pids and every process below them (/proc, Linux); none for none."""
+    if not pids:
+        return set()
+    children = {}
+    for entry in PROC.iterdir():
+        try:
+            if entry.name.isdigit():
+                children.setdefault(hc.parent_pid(entry.name), []).append(int(entry.name))
+        except (OSError, IndexError, ValueError):  # gone since the listing
+            continue
+    found, todo = set(), list(pids)
+    while todo:
+        pid = todo.pop()
+        if pid not in found:
+            found.add(pid)
+            todo += children.get(pid, [])
+    return found
+
+
+def check_processes(tree, spared=frozenset()):
+    """Keep a tree a process but the spared works in, as far as /proc shows readable cwd entries: removing it
+    takes the process's working directory."""
+    if not lists_processes():
+        return
+    root, found = os.path.realpath(tree), []
+    for entry in PROC.iterdir():
+        try:  # the kernel gives each cwd resolved already
+            cwd = entry.name.isdigit() and int(entry.name) not in spared and os.readlink(entry / 'cwd')
+            if cwd and (cwd == root or cwd.startswith(root + os.sep)):
+                found.append((int(entry.name), (entry / 'comm').read_bytes().decode(errors='backslashreplace').strip()))
+        except OSError:  # gone since the listing, or another user's
+            continue
+    if found:
+        raise Keep('a process works in it: ' + ', '.join(f'{name} (pid {pid})' for pid, name in sorted(found)))
 
 
 def check_terminals(*trees):
@@ -408,12 +461,13 @@ def check_terminals(*trees):
         raise Keep(busy_with([t for terminals in busy.values() for t in terminals]))
 
 
-def content_check(child):
+def content_check(child, spared=frozenset()):
     """Raise Keep when removing the linked worktree child could lose anything but ignored files and
-    reflog-only commits, or would cut off a running agent; returns the common git dir to remove it
-    with and whether that needs --force. Terminals working in it are terminals_in's."""
+    reflog-only commits, or would cut off a running agent or a process but the spared pids; returns the common
+    git dir to remove it with and whether that needs --force. Terminals working in it are terminals_in's."""
     gitdir, common = linked_worktree(child)
     check_agents(child, gitdir)
+    check_processes(child, spared)
     if (gitdir / 'locked').exists():
         raise Keep('locked')
     subs = submodules(child)
@@ -445,14 +499,18 @@ def content_check(child):
 def anchored(path, here):
     """(the directory path resolves from, the names after it): path's own drive and root when it has
     a root (here's drive when it names none, as Windows reads `\\x`), else here. Windows' `\\\\?\\`
-    prefix, which readlink can return, is dropped and either separator splits. A bare UNC share
+    prefix, which readlink can return, is dropped, a volume GUID path spelled from the drive that mounts its
+    volume where one does, and either separator splits. A bare UNC share
     (`\\\\srv\\share`) is its own root. A drive-relative path (`C:x`), relative to that drive's working
     directory, raises OSError."""
     if os.altsep:
         path = path.replace(os.altsep, os.sep)
-    if os.name == 'nt' and path.startswith('\\\\?\\'):  # a volume GUID path keeps it: a drive letter need not name it
+    if os.name == 'nt' and path.startswith('\\\\?\\'):
+        volume = re.match(r'\\\\\?\\Volume\{[0-9A-Fa-f-]+\}\\', path)
+        mount = volume and windows.volume_mount(volume.group())  # a volume GUID path keeps it when nothing mounts it
         path = ('\\\\' + path[8:] if path[4:8].upper() == 'UNC\\' else
-                path[4:] if re.match(r'[A-Za-z]:', path[4:]) else path)
+                path[4:] if re.match(r'[A-Za-z]:', path[4:]) else
+                mount + path[volume.end():] if mount else path)
     drive, tail = os.path.splitdrive(path)
     if os.name == 'nt' and drive.startswith(os.sep * 2) and not tail:  # a UNC share names no directory
         return drive + os.sep, []
@@ -709,9 +767,40 @@ def retry(parent, branches):
                        *[a for b in branches for a in ('--branch', *map(str, b))]])
 
 
-def cleanup(parent, branches=()):
-    """Remove parent's clean children, then delete the given branches and each removed child's;
-    a branch is (common git dir, name, tip)."""
+def plan_children(found, busy, scan=None, stop=lambda: False, spared=frozenset()):
+    """(removal order, {child: content_check result}, {child: why it stays}) for the children found: busy ones
+    ({child: why}) stay, the rest are checked, and removal_plan orders the clean ones and keeps what stayers hold.
+    The order is None when stop() turns true during the checks: a returned parent's children are not ours."""
+    removals, kept = {}, {}
+    for child in found:  # every check first: a child that stays may hold one sorted before it
+        if stop():
+            return None, removals, kept
+        if child in busy:
+            kept[child] = busy[child]
+            continue
+        try:
+            removals[child] = content_check(child, spared)
+        except (Keep, OSError) as why:  # an unexpected filesystem error keeps the child too
+            kept[child] = str(why)
+    if stop():
+        return None, removals, kept
+    pending, held = removal_plan(list(removals), [c for c in found if c not in removals], scan)
+    return pending, removals, {**kept, **held}
+
+
+def unapproved(child, approved):
+    """Why child is not a checkout approved ({path: (common git dir, (branch, tip) or None)}) lets go, or None."""
+    if child not in approved:
+        return 'not among the siblings the approved plan removes'
+    if (common_dir(child / '.git'), head_branch(child)) != approved[child]:
+        return 'not the checkout the approved plan found there'
+    return None
+
+
+def cleanup(parent, branches=(), approved=None):
+    """Remove parent's clean children, when approved ({path: (common git dir, (branch, tip) or None)}) is given
+    only the checkouts it names as they were, then delete the given branches and each removed child's; a branch
+    is (common git dir, name, tip)."""
     parent = Path(parent)
     if os.path.lexists(parent):
         log(f'{parent} exists: not touching its children')
@@ -728,31 +817,26 @@ def cleanup(parent, branches=()):
     if branches:
         log(f'branches to settle: {retry(parent, branches)}')
     branches = list(branches)
-    found, removals, stopped = children(parent), {}, False
+    found = children(parent)
     if found and not hc_path():
         log('no hc installed: herdr-core terminals in the children not checked')
     try:  # first: a child a terminal works in stays, which may hold others
         busy = {child: busy_with(terminals) for child, terminals in terminals_in(found).items()}
     except Keep as why:
         busy = dict.fromkeys(found, str(why))
-    for child in found:  # every check first: a child that stays may hold one sorted before it
-        stopped = os.path.lexists(parent)  # once seen, stays seen: the replacement may be mid-move
-        if stopped:
-            break
-        if child in busy:
-            keep(child, busy[child])
-            continue
-        try:
-            removals[child] = content_check(child)
-        except (Keep, OSError) as why:  # an unexpected filesystem error keeps the child too
-            keep(child, why)
-    stopped, scan = stopped or os.path.lexists(parent), {}
+    for child in found if approved is not None else ():  # what the human approved, as the plan found it
+        why = unapproved(child, approved)
+        if why:
+            busy.setdefault(child, why)
+    scan = {}
+    # once seen, stays seen: the replacement may be mid-move
+    pending, removals, staying = plan_children(found, busy, scan, lambda: os.path.lexists(parent))
+    for child, why in staying.items():
+        keep(child, why)
+    stopped = pending is None
     if stopped:  # it returned during the checks: its replacement's children are not ours
         log(f'{parent} exists again: not touching its children')
-    staying = [c for c in found if c not in removals]
-    pending, held = ([], {}) if stopped else removal_plan(list(removals), staying, scan)
-    for child, why in held.items():
-        keep(child, why)
+        pending = []
     while pending:
         child = pending.pop(0)
         removal = removals[child]
@@ -762,6 +846,10 @@ def cleanup(parent, branches=()):
             if branch:
                 log(f'removing {child}; its branch is retried by: {retry(parent, [branch])}')
             check_terminals(child)  # again: its checks above can take long
+            check_processes(child)
+            why = approved is not None and unapproved(child, approved)
+            if why:
+                raise Keep(why)
             if os.path.lexists(parent):  # last: hc may take long too
                 log(f'{parent} exists again: not touching {child} or the children after it')
                 stopped = True
