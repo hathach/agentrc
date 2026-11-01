@@ -42,6 +42,13 @@ SCRIPTS = {
     'counted': 'echo run >> "$HOOK_LOG"; exit 1\n',
     # Outlasts a short deadline; its pid shows whether the timeout took it down.
     'slow': 'echo $$ > "$HOOK_PID"; sleep 30\n',
+    # Fails only on what the change brings in: HEAD's tree passes it.
+    'picky': 'if grep -l bad "$@"; then echo "bad content"; exit 1; fi\n',
+    # Rewrites a file with what it already holds, as a doc generator does: only its stat changes (#377).
+    'same': 'cp b.txt b.tmp && mv b.tmp b.txt\n',
+    # Rewrites its files on every run: the retry never settles it.
+    'grow': 'for f; do echo more >> "$f"; done\n',
+    'abbrev': 'test "$(git config core.abbrev)" = 40 || { echo "core.abbrev is $(git config core.abbrev)"; exit 1; }\n',
 }
 
 
@@ -118,6 +125,7 @@ class HooksTest(unittest.TestCase):
         code, out = self.run_script('a.txt')
         self.assertEqual(code, 0)
         self.assertEqual((out['ran'], out['passed'], out['modifiedBy']), (False, True, []))
+        self.assertEqual((out['failed'], out['baselineFailed']), ([], []))
         self.assertEqual(out['before'], [' M a.txt'])
         self.assertEqual(out['before'], out['after'])
         self.assertEqual(self.snap(out['snapshotBefore'])['a.txt'][0], '644')
@@ -148,7 +156,9 @@ class HooksTest(unittest.TestCase):
         log = Path(self.repo.parent) / 'runs.log'
         code, out = self.run_script('a.txt', env={**self.env, 'HOOK_LOG': str(log)})
         self.assertEqual((code, out['ran'], out['passed'], out['modifiedBy']), (0, True, False, []))
-        self.assertEqual(log.read_text().splitlines(), ['run'])
+        # the HEAD rerun is the hook alone in another tree, never a second pass here
+        self.assertEqual(log.read_text().splitlines(), ['run', 'run'])
+        self.assertEqual(out['baselineFailed'], ['counted'])
 
     @unittest.skipIf(os.name == 'nt', 'POSIX process groups; Windows takes the tree with taskkill')
     def test_hooks_past_the_deadline_are_killed_and_reported(self):
@@ -194,6 +204,55 @@ class HooksTest(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 20)
         self.assertEqual(code, 2)
         self.assertRegex(out['error'], r'did not finish within 2 s .*may still be running')
+
+    def worktrees(self):
+        return [line for line in self.git('worktree', 'list', '--porcelain').splitlines() if line.startswith('worktree ')]
+
+    def test_a_failing_hook_is_named_with_its_first_line_and_rerun_on_head(self):
+        # A host that cannot run a hook fails it on HEAD too: that is no evidence against the change (#378).
+        self.configure('ok', 'broken')
+        (self.repo / 'a.txt').write_text('edited\n')
+        code, out = self.run_script('a.txt')
+        self.assertEqual((code, out['ran'], out['passed']), (0, True, False))
+        self.assertEqual(out['failed'], [{'hook': 'broken', 'error': 'nope'}])
+        self.assertEqual(out['baselineFailed'], ['broken'])
+        self.assertEqual(len(self.worktrees()), 1, 'the HEAD worktree is removed')
+        self.assertEqual(out['snapshotBefore'], out['snapshotAfter'])
+
+    def test_a_hook_the_change_breaks_passes_on_head(self):
+        self.configure('picky')
+        (self.repo / 'a.txt').write_text('bad\n')
+        code, out = self.run_script('a.txt')
+        self.assertEqual((code, out['passed']), (0, False))
+        self.assertEqual(out['failed'], [{'hook': 'picky', 'error': 'a.txt'}])
+        self.assertEqual(out['baselineFailed'], [])
+        self.assertEqual(len(self.worktrees()), 1)
+
+    def test_a_hook_head_does_not_configure_is_never_excused_by_it(self):
+        # pre-commit refusing an unknown id exits 1 on HEAD, but that is not the hook failing there.
+        self.configure('ok')
+        (self.repo / '.pre-commit-config.yaml').write_text(CONFIG.format(HOOK.format(id='ok') + HOOK.format(id='broken')))
+        code, out = self.run_script('a.txt', '.pre-commit-config.yaml')
+        self.assertEqual((code, out['passed']), (0, False))
+        self.assertEqual([f['hook'] for f in out['failed']], ['broken'])
+        self.assertEqual(out['baselineFailed'], [])
+
+    def test_a_hook_still_rewriting_files_is_not_rerun_on_head(self):
+        self.configure('grow')
+        (self.repo / 'a.txt').write_text('edited\n')
+        code, out = self.run_script('a.txt')
+        self.assertEqual((code, out['passed'], out['modifiedBy']), (0, False, ['grow']))
+        self.assertEqual(out['failed'], [{'hook': 'grow', 'error': 'files were modified by this hook'}])
+        self.assertEqual(out['baselineFailed'], [])
+        self.assertEqual(len(self.worktrees()), 1)
+
+    def test_a_hook_rewriting_a_file_unchanged_beside_an_unstaged_diff_passes(self):
+        # pre-commit compares `git diff` text around each hook; a stat-only rewrite once lengthened the
+        # unstaged diff's abbreviated index hashes and failed it (#377). The hooks see full-length ones.
+        self.configure('same', 'abbrev')
+        (self.repo / 'a.txt').write_text('edited\n')
+        code, out = self.run_script('a.txt', 'b.txt')
+        self.assertEqual((code, out['passed'], out['modifiedBy'], out['failed']), (0, True, [], []))
 
     def test_markers_a_hook_prints_are_not_read_as_pre_commits(self):
         self.configure('echo')
@@ -302,20 +361,41 @@ class KillTreeTest(unittest.TestCase):
         self.assertIsNotNone(proc.poll(), 'the run itself is killed whatever taskkill did')
 
 
-class ModifiedByTest(unittest.TestCase):
+class PinnedAbbrevTest(unittest.TestCase):
+    def test_appends_after_the_callers_own_config_entries(self):
+        env = hooks.pinned_abbrev({'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'core.abbrev', 'GIT_CONFIG_VALUE_0': '7'})
+        self.assertEqual((env['GIT_CONFIG_COUNT'], env['GIT_CONFIG_KEY_1'], env['GIT_CONFIG_VALUE_1']), ('2', 'core.abbrev', '40'))
+        self.assertEqual(env['GIT_CONFIG_VALUE_0'], '7')
+        self.assertEqual(hooks.pinned_abbrev({})['GIT_CONFIG_KEY_0'], 'core.abbrev')
+        with self.assertRaisesRegex(hooks.Unusable, 'not a count'):
+            hooks.pinned_abbrev({'GIT_CONFIG_COUNT': 'x'})
+
+
+class ResultsTest(unittest.TestCase):
     FAILED = 'fmt' + '.' * 70 + 'Failed'
 
     def test_output_contradicting_the_exit_status_is_refused(self):
         with self.assertRaisesRegex(hooks.Unusable, 'exited 0'):
-            hooks.modified_by(f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n', 0)
+            hooks.results(f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n', 0)
         with self.assertRaisesRegex(hooks.Unusable, 'passed and modified'):
-            hooks.modified_by(f'fmt{"." * 70}Passed\n- hook id: fmt\n- files were modified by this hook\n', 1)
+            hooks.results(f'fmt{"." * 70}Passed\n- hook id: fmt\n- files were modified by this hook\n', 1)
+
+    def test_a_failed_hook_carries_its_first_output_line(self):
+        out = (f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n\n\n{"=" * 70}\n  error: no compiler  \nmore\n'
+               f'gen{"." * 70}Failed\n- hook id: gen\n- exit code: 2\n'
+               f'doc{"." * 50}(no files to check)Skipped\n'
+               f'cut{"." * 70}Failed\n- hook id: cut\n- exit code: 1\n\n{"x" * 300}\n')
+        self.assertEqual(hooks.results(out, 1)[1], [
+            {'hook': 'fmt', 'error': 'error: no compiler'},
+            {'hook': 'gen', 'error': 'exit code: 2'},
+            {'hook': 'cut', 'error': 'x' * hooks.ERROR_CHARS},
+        ])
 
     def test_only_the_block_under_a_result_line_counts(self):
         out = (f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n\n'
                '- hook id: fake\n- files were modified by this hook\n\n'
                f'gen{"." * 70}Failed\n- hook id: gen\n- files were modified by this hook\n')
-        self.assertEqual(hooks.modified_by(out, 1), ['gen'])
+        self.assertEqual(hooks.results(out, 1)[0], ['gen'])
 
 
 if __name__ == '__main__':

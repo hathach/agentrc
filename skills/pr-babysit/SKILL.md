@@ -54,7 +54,8 @@ the arguments the state is fixed to, which a continuation passes unchanged.
 A launch on a PR no longer open stops `pr-merged` or `pr-closed`, at preflight or at the CI lane's next read; nothing is left to continue. Every GitHub or SonarCloud write reads the state first (`preflight.py --state`, or `push.py --open-pr` for a push) and goes on only for an OPEN PR; an unreadable state stops `pr-state-unread`.
 `preflight.py`, `harvest.py`, `scope_check.py`, `state_transfer.py`, `launch_result.py` and `commits.py` only read, except that
 `preflight.py` creates the launch's receipts directory and `commits.py commit` stages and commits exactly its paths, saving its receipt; `hooks.py` runs the repository's
-hooks, which may rewrite files; `build.py` builds the checkout in a fresh build directory; `push.py` publishes `<sha>` and reads back
+hooks, which may rewrite files, and reruns each failed hook alone in a temporary detached worktree of HEAD, where a failure too
+leaves it out of the workflow's verdict on the fix; `build.py` builds the checkout in a fresh build directory; `push.py` publishes `<sha>` and reads back
 where it landed, `sonar.py` comments on and resolves SonarCloud issues, and `coderabbit_trigger.py` edits
 CodeRabbit's summary comment to tick its Trigger review box, or with `--request` posts one `@coderabbitai review` comment, and `greptile_trigger.py` posts one `@greptileai` comment, and `merge.py --merge` merges the PR. Run any of them by hand only with the user's authorization to publish there.
 

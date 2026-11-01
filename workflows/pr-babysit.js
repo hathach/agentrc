@@ -663,11 +663,13 @@ const RECHECK = withSeal({
 })
 const HOOKS = withSeal({
   type: 'object', additionalProperties: false,
-  required: ['ran', 'passed', 'modifiedBy', 'before', 'after', 'snapshotBefore', 'snapshotAfter'],
+  required: ['ran', 'passed', 'modifiedBy', 'failed', 'baselineFailed', 'before', 'after', 'snapshotBefore', 'snapshotAfter'],
   properties: {
     error: { type: 'string' },
     ran: { type: 'boolean' }, passed: { type: 'boolean' },
     modifiedBy: { type: 'array', items: { type: 'string' } },
+    failed: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['hook', 'error'], properties: { hook: { type: 'string' }, error: { type: 'string' } } } },
+    baselineFailed: { type: 'array', items: { type: 'string' } },
     before: { type: 'array', items: { type: 'string' } }, after: { type: 'array', items: { type: 'string' } },
     snapshotBefore: { type: 'array', items: { type: 'string' } }, snapshotAfter: { type: 'array', items: { type: 'string' } },
   },
@@ -1670,9 +1672,17 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
     (snapBefore.get(f).blob !== snapAfter.get(f).blob || snapBefore.get(f).mode !== snapAfter.get(f).mode))
   const ownedChanged = changedBy(owned)
   const regeneratedChanged = changedBy(regenerated)
+  // A hook that fails on HEAD's tree too fails for the host, not the fix (#378); any other failure refuses, named.
+  const failedIds = hooks.failed.map(f => f.hook)
+  const blamed = hooks.failed.filter(f => !hooks.baselineFailed.includes(f.hook))
+  const excused = hooks.failed.filter(f => hooks.baselineFailed.includes(f.hook))
+  const failures = (fs) => fs.map(f => `${f.hook}: ${f.error}`).join('; ')
   const hookWhy = outside.length ? `tree changed outside the fix scope before the hooks ran: ${outside.join(', ')}`
     : unsteady.length ? `regenerated path(s) no longer a plain modification when the hooks ran: ${unsteady.join(', ')}`
-    : hooks.ran && !hooks.passed ? 'the repository hooks do not pass on the fix'
+    : (hooks.passed && failedIds.length) || hooks.baselineFailed.some(h => !failedIds.includes(h))
+      ? 'hook evidence is inconsistent: a hook failed on HEAD without failing on the fix, or failed while the hooks passed'
+    : hooks.ran && !hooks.passed && !failedIds.length ? 'the repository hooks do not pass on the fix, and pre-commit named no failing hook'
+    : blamed.length ? `the repository hooks do not pass on the fix: ${failures(blamed)}`
     : !hooks.ran && hooks.modifiedBy.length ? 'hook evidence is inconsistent: hooks reported modifying files without running'
     : !hooks.ran && regenerated.length ? `regenerated path(s) have no hook to vouch for them: ${regenerated.join(', ')}`
     : created.length ? `a hook created or renamed file(s): ${created.map(pathOf).join(', ')}`
@@ -1686,6 +1696,7 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
     log(`push#${cycle}-${what}: refusing to publish — ${hookWhy}`)
     return { pass: false, committed: false, detail: hookWhy, sha: '' }
   }
+  if (excused.length) log(`push#${cycle}-${what}: hook(s) failing on HEAD too, not counted against the fix: ${failures(excused)}`)
   if (regenerated.length) log(`push#${cycle}-${what}: build output admitted into the commit: ${regenerated.join(', ')}`)
   if (hookPaths.length) log(`push#${cycle}-${what}: hook output admitted into the commit: ${hookPaths.join(', ')}`)
   const generatedPaths = [...new Set([...regenerated, ...hookPaths])]

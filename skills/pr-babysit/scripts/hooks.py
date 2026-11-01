@@ -6,15 +6,21 @@
 Run from the checkout's top level. Prints the tree status and a snapshot of
 PATH plus every path the status names, runs `pre-commit run --files PATH...`
 when .pre-commit-config.yaml exists (once more if it failed after a hook
-modified files), then the status and snapshot again. Both runs together get N
+modified files), then the status and snapshot again. All runs, the HEAD reruns below included, get N
 seconds (default 540, inside the 600 a relay's Bash call allows); past that
 the pre-commit process tree is killed and the result is an error. Status lines are `git status --porcelain -z`
 records, each untracked file its own; snapshot lines are `<644|755> <blob> <path>` or `absent - <path>`.
 
-stdout ends with one JSON line {ran, passed, modifiedBy, before, after,
+stdout ends with one JSON line {ran, passed, modifiedBy, failed, baselineFailed, before, after,
 snapshotBefore, snapshotAfter, seal} (seal: facts.sealed): passed is the last run's exit status,
 modifiedBy the ids, across both runs, of the hooks pre-commit itself said
-modified files. Without a config: ran false, passed true, modifiedBy [].
+modified files. Without a config: ran false, passed true, and the lists empty.
+failed and baselineFailed explain a failure: failed, {hook, error} for each hook the last
+run failed, error its first output line; and baselineFailed, the ids among
+those that, rerun alone in a detached worktree of HEAD on the same PATHs, fail
+there too, so they are no evidence against the change (#378). A hook whose
+last failure was modifying files is never rerun there. pre-commit runs with
+core.abbrev pinned (#377).
 Exit 0 with that line; exit 2 with {"error": ...} when the facts cannot be
 collected or pre-commit's output contradicts its exit status.
 """
@@ -24,6 +30,7 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -39,6 +46,9 @@ MODIFIED = '- files were modified by this hook'
 # pre-commit pads a hook's name with dots to its result, then prints the
 # hook's `- ` block only when it failed or runs verbose (commands/run.py).
 RESULT = re.compile(r'\.(Passed|Failed)$')
+# Any hook's result line, `(no files to check)Skipped` included: where the hook output above it ends.
+NEXT = re.compile(r'[.)](Passed|Failed|Skipped)$')
+ERROR_CHARS = 200
 
 
 def status_paths(records):
@@ -75,13 +85,24 @@ def snapshot(paths, records):
     return lines
 
 
-def modified_by(output, exit_code):
-    """Ids of the hooks whose own `- ` block says they modified files.
+def first_error(lines, block):
+    """The first line with a word the hook printed, up to the next hook's result, skipping rules such as unittest's
+    `=====`; its last `- ` line when it printed none."""
+    for line in lines:
+        if NEXT.search(line):
+            break
+        if re.search(r'[^\W_]', line):
+            return line.strip()[:ERROR_CHARS]
+    return block[-1][2:] if block else 'no output'
+
+
+def results(output, exit_code):
+    """(ids of the hooks whose own `- ` block says they modified files, {hook, error} of each failed hook).
 
     A block counts only directly under a result line; the hook's output follows
     the block after a blank line, so a marker it echoes is not read as one."""
     lines = output.splitlines()
-    ids = []
+    ids, failures = [], []
     for i, line in enumerate(lines):
         if not (line.startswith(HOOK_ID) and i and RESULT.search(lines[i - 1])):
             continue
@@ -100,7 +121,9 @@ def modified_by(output, exit_code):
             if not failed:
                 raise Unusable(f'pre-commit reported hook {hook} passed and modified files')
             ids.append(hook)
-    return ids
+        if failed:
+            failures.append({'hook': hook, 'error': first_error(lines[i + 1 + len(block):], block)})
+    return ids, failures
 
 
 def kill_tree(proc):
@@ -113,12 +136,24 @@ def kill_tree(proc):
             pass
 
 
-def pre_commit(paths, deadline, start, attempt):
+def pinned_abbrev(env):
+    """env with core.abbrev at full length. pre-commit decides a hook modified files by comparing `git diff` text
+    before and after it; a hook that rewrites a file unchanged can lengthen the unstaged diff's abbreviated `index`
+    hashes at the object store's abbrev boundary, and that alone failed it (#377)."""
+    count = env.get('GIT_CONFIG_COUNT') or '0'
+    if not count.isdigit():
+        raise Unusable(f'GIT_CONFIG_COUNT is {count!r}, not a count')
+    n = int(count)
+    return {**env, 'GIT_CONFIG_COUNT': str(n + 1), f'GIT_CONFIG_KEY_{n}': 'core.abbrev', f'GIT_CONFIG_VALUE_{n}': '40'}
+
+
+def pre_commit(paths, deadline, start, attempt, hook=None, cwd=None):
     """(exit code, stdout) of one run, its whole process tree killed once `deadline` seconds from `start` pass."""
     group = {'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == 'nt' else {'start_new_session': True}
+    argv = ['pre-commit', 'run', '--color', 'never', *([hook] if hook else []), '--files', *paths]
     try:
-        proc = subprocess.Popen(['pre-commit', 'run', '--color', 'never', '--files', *paths], stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, encoding='utf-8', errors='replace', **group)
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf-8',
+                                errors='replace', cwd=cwd, env=pinned_abbrev(os.environ), **group)
     except FileNotFoundError:
         raise Unusable(f'{CONFIG} exists but pre-commit is not installed')
     try:
@@ -139,19 +174,42 @@ def pre_commit(paths, deadline, start, attempt):
     return proc.returncode, out
 
 
+def baseline(hooks, paths, deadline, start):
+    """The ids among hooks that fail on HEAD too: each rerun alone on the same paths in a detached worktree of HEAD,
+    so what the host lacks (a compiler, a codepage, /dev/null) fails it there as well, without the change.
+    Only the hook's own Failed block counts, never pre-commit refusing an id HEAD's config does not have."""
+    failing = []
+    with tempfile.TemporaryDirectory(prefix='hooks-base-', ignore_cleanup_errors=True) as tmp:
+        tree = os.path.join(tmp, 'head')
+        git('worktree', 'add', '--detach', '--quiet', tree, 'HEAD')
+        try:
+            for hook in hooks:
+                code, out = pre_commit(paths, deadline, start, f'HEAD {hook}', hook=hook, cwd=tree)
+                if hook in (f['hook'] for f in results(out, code)[1]):
+                    failing.append(hook)
+        finally:
+            try:
+                git('worktree', 'remove', '--force', tree)
+            except Unusable:
+                git('worktree', 'prune')
+    return failing
+
+
 def run_hooks(paths, deadline=DEADLINE):
     if not os.path.exists(CONFIG):
-        return False, True, []
+        return False, True, [], [], []
     ids = []
     start = time.monotonic()
     for attempt in (1, 2):
         code, out = pre_commit(paths, deadline, start, attempt)
-        modified = modified_by(out, code)
+        modified, failures = results(out, code)
         ids += [h for h in modified if h not in ids]
         # A rerun repairs what a hook rewrote; the same failure again only spends another pass (#140).
         if not code or not modified:
             break
-    return True, not code, ids
+    # A hook still rewriting files is judged by what it wrote, never excused by HEAD.
+    rerun = [f['hook'] for f in failures if f['hook'] not in modified]
+    return True, not code, ids, failures, baseline(rerun, paths, deadline, start) if rerun else []
 
 
 def collect(argv):
@@ -166,10 +224,10 @@ def collect(argv):
     checkout_top()
     before = status()
     snapshot_before = snapshot(paths, before)
-    ran, passed, ids = run_hooks(paths, deadline)
+    ran, passed, ids, failures, base_failed = run_hooks(paths, deadline)
     after = status()
-    return {'ran': ran, 'passed': passed, 'modifiedBy': ids, 'before': before, 'after': after,
-            'snapshotBefore': snapshot_before, 'snapshotAfter': snapshot(paths, after)}
+    return {'ran': ran, 'passed': passed, 'modifiedBy': ids, 'failed': failures, 'baselineFailed': base_failed,
+            'before': before, 'after': after, 'snapshotBefore': snapshot_before, 'snapshotAfter': snapshot(paths, after)}
 
 
 if __name__ == '__main__':

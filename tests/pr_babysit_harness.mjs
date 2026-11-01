@@ -438,7 +438,7 @@ async function run(opts = {}) {
       const owned = hookQuoted(prompt)
       const status = owned.map(f => ` M ${f}`)
       const snap = owned.map(f => `644 ${blobOf(f)} ${f}`)
-      const base = { ran: true, passed: true, modifiedBy: [], before: status, after: status, snapshotBefore: snap, snapshotAfter: snap }
+      const base = { ran: true, passed: true, modifiedBy: [], failed: [], baselineFailed: [], before: status, after: status, snapshotBefore: snap, snapshotAfter: snap }
       return { ...base, ...(typeof opts.hooks === 'function' ? opts.hooks(base) : opts.hooks) }
     }
     if (label.startsWith('commit#')) {
@@ -6775,11 +6775,27 @@ test('incomplete or inconsistent hook evidence admits nothing and commits nothin
     [{ snapshotBefore: [], snapshotAfter: [] }, /evidence is incomplete: no snapshot for src\/a\.c/],
     [b => gen(b, { snapshotAfter: b.snapshotAfter }), /evidence is incomplete: no snapshot for docs\/boards\.rst/],
     [{ ran: false, modifiedBy: ['gen-doc'] }, /evidence is inconsistent/],
+    [{ failed: [{ hook: 'lint', error: 'x' }] }, /evidence is inconsistent/],
+    [{ passed: false, failed: [{ hook: 'lint', error: 'x' }], baselineFailed: ['lint', 'other'] }, /evidence is inconsistent/],
   ]) {
     const { result, labels } = await run({ ...publishing, hooks })
     assert.match(result.history[0].reviewPushFailed.detail, expected)
     assert.ok(!labels.some(l => l.startsWith('commit#')), String(expected))
   }
+})
+
+test('a failing hook is refused by name and first line unless it fails on HEAD too', async () => {
+  // A host that cannot run a hook (a broken compiler, a codepage) fails it with or without the fix (#378).
+  const unit = { hook: 'unit-test', error: 'preprocessing failed' }
+  const cov = { hook: 'drivers-coverage', error: "UnicodeDecodeError: 'gbk' codec can't decode" }
+  const refused = await run({ ...publishing, hooks: { passed: false, failed: [unit, cov], baselineFailed: ['drivers-coverage'] } })
+  assert.equal(refused.result.history[0].reviewPushFailed.detail, 'the repository hooks do not pass on the fix: unit-test: preprocessing failed')
+  assert.ok(!refused.labels.some(l => l.startsWith('commit#')))
+  assert.ok(refused.logs.some(l => l.endsWith('refusing to publish — the repository hooks do not pass on the fix: unit-test: preprocessing failed')))
+
+  const { result, logs } = await run({ ...publishing, hooks: { passed: false, failed: [unit, cov], baselineFailed: ['unit-test', 'drivers-coverage'] } })
+  assert.equal(result.history[0].reviewPush.pass, true, 'the fix is published')
+  assert.ok(logs.some(l => l.endsWith(`push#1-review: hook(s) failing on HEAD too, not counted against the fix: unit-test: preprocessing failed; drivers-coverage: ${cov.error}`)))
 })
 
 test('a commit whose content differs from what the hooks left is never pushed', async () => {
@@ -6912,7 +6928,7 @@ test('a commit the audit script cannot read back is not pushed', async () => {
 test('a hook script that reports no evidence stops publication with its error', async () => {
   const { result, labels, calls } = await run({ ...publishing, hooks: { error: 'pre-commit exited 0 but reported hook fmt failed', ran: false, passed: false } })
   assert.match(calls.find(c => c.label === 'hooks#1-review').prompt,
-    /as error, with ran = false, passed = false, modifiedBy = \[\], before = \[\], after = \[\], snapshotBefore = \[\], snapshotAfter = \[\], seal = ''\.$/,
+    /as error, with ran = false, passed = false, modifiedBy = \[\], failed = \[\], baselineFailed = \[\], before = \[\], after = \[\], snapshotBefore = \[\], snapshotAfter = \[\], seal = ''\.$/,
     'the error-case values come from the schema')
   assert.match(result.history[0].reviewPushFailed.detail, /^no hook evidence: pre-commit exited 0/)
   assert.ok(!labels.some(l => l.startsWith('commit#')), 'nothing is committed')
