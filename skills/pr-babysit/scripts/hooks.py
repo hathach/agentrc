@@ -19,8 +19,11 @@ failed and baselineFailed explain a failure: failed, {hook, error} for each hook
 run failed, error its first output line; and baselineFailed, the ids among
 those that, rerun alone in a detached worktree of HEAD on the same PATHs, fail
 there too, so they are no evidence against the change (#378). A hook whose
-last failure was modifying files is never rerun there. pre-commit runs with
-core.abbrev pinned (#377).
+last failure was modifying files is never rerun there, and each rerun gets a
+clean HEAD tree. When every failure is excused, the hooks run once more on the
+change with SKIP naming the excused ones, so a fail_fast stop cannot hide a
+hook the change breaks; what fails there joins failed, and a failure no hook
+owns excuses nothing. pre-commit runs with core.abbrev pinned (#377).
 Exit 0 with that line; exit 2 with {"error": ...} when the facts cannot be
 collected or pre-commit's output contradicts its exit status.
 """
@@ -49,6 +52,8 @@ RESULT = re.compile(r'\.(Passed|Failed)$')
 # Any hook's result line, `(no files to check)Skipped` included: where the hook output above it ends.
 NEXT = re.compile(r'[.)](Passed|Failed|Skipped)$')
 ERROR_CHARS = 200
+# Seconds past the deadline the HEAD worktree's removal may take.
+CLEANUP = 20
 
 
 def status_paths(records):
@@ -147,20 +152,16 @@ def pinned_abbrev(env):
     return {**env, 'GIT_CONFIG_COUNT': str(n + 1), f'GIT_CONFIG_KEY_{n}': 'core.abbrev', f'GIT_CONFIG_VALUE_{n}': '40'}
 
 
-def pre_commit(paths, deadline, start, attempt, hook=None, cwd=None):
-    """(exit code, stdout) of one run, its whole process tree killed once `deadline` seconds from `start` pass."""
+def bounded(argv, deadline, start, what, cwd=None, env=None):
+    """(exit code, stdout, stderr) of argv, its whole process tree killed once `deadline` seconds from `start` pass."""
     group = {'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == 'nt' else {'start_new_session': True}
-    argv = ['pre-commit', 'run', '--color', 'never', *([hook] if hook else []), '--files', *paths]
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf-8',
+                            errors='replace', cwd=cwd, env=env, **group)
     try:
-        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf-8',
-                                errors='replace', cwd=cwd, env=pinned_abbrev(os.environ), **group)
-    except FileNotFoundError:
-        raise Unusable(f'{CONFIG} exists but pre-commit is not installed')
-    try:
-        out, _ = proc.communicate(timeout=max(deadline - (time.monotonic() - start), 0))
+        out, err = proc.communicate(timeout=max(deadline - (time.monotonic() - start), 0))
     except subprocess.TimeoutExpired:
         kill_tree(proc)
-        late = f'pre-commit did not finish within {deadline} s (run {attempt})'
+        late = f'{argv[0]} did not finish within {deadline} s ({what})'
         try:
             proc.communicate(timeout=5)
         except subprocess.TimeoutExpired:
@@ -171,7 +172,27 @@ def pre_commit(paths, deadline, start, attempt, hook=None, cwd=None):
         # Its own process group spares the hooks the caller's Ctrl-C or kill, so they go down with this run.
         kill_tree(proc)
         raise
-    return proc.returncode, out
+    return proc.returncode, out, err
+
+
+def pre_commit(paths, deadline, start, what, hook=None, cwd=None, skip=()):
+    """(exit code, stdout) of one pre-commit run, skip added to the SKIP it inherits."""
+    env = pinned_abbrev(os.environ)
+    if skip:
+        env['SKIP'] = ','.join([*filter(None, env.get('SKIP', '').split(',')), *skip])
+    try:
+        code, out, _ = bounded(['pre-commit', 'run', '--color', 'never', *([hook] if hook else []), '--files', *paths],
+                               deadline, start, what, cwd, env)
+    except FileNotFoundError:
+        raise Unusable(f'{CONFIG} exists but pre-commit is not installed')
+    return code, out
+
+
+def git_within(deadline, start, *argv):
+    """git argv, held to the same deadline as the hooks: a checkout filter or hook of its own can hang it."""
+    code, _, err = bounded(['git', *argv], deadline, start, f'git {argv[0]}')
+    if code:
+        raise Unusable(f"git {' '.join(argv)}: {err.strip()}")
 
 
 def baseline(hooks, paths, deadline, start):
@@ -181,15 +202,19 @@ def baseline(hooks, paths, deadline, start):
     failing = []
     with tempfile.TemporaryDirectory(prefix='hooks-base-', ignore_cleanup_errors=True) as tmp:
         tree = os.path.join(tmp, 'head')
-        git('worktree', 'add', '--detach', '--quiet', tree, 'HEAD')
+        git_within(deadline, start, 'worktree', 'add', '--detach', '--quiet', tree, 'HEAD')
         try:
-            for hook in hooks:
+            for i, hook in enumerate(hooks):
+                if i:
+                    # What an earlier rerun rewrote or left behind could fail the next one: each gets HEAD as is.
+                    git_within(deadline, start, '-C', tree, 'reset', '--quiet', '--hard', 'HEAD')
+                    git_within(deadline, start, '-C', tree, 'clean', '-qffdx')
                 code, out = pre_commit(paths, deadline, start, f'HEAD {hook}', hook=hook, cwd=tree)
                 if hook in (f['hook'] for f in results(out, code)[1]):
                     failing.append(hook)
         finally:
             try:
-                git('worktree', 'remove', '--force', tree)
+                git_within(deadline + CLEANUP, start, 'worktree', 'remove', '--force', tree)
             except Unusable:
                 git('worktree', 'prune')
     return failing
@@ -201,7 +226,7 @@ def run_hooks(paths, deadline=DEADLINE):
     ids = []
     start = time.monotonic()
     for attempt in (1, 2):
-        code, out = pre_commit(paths, deadline, start, attempt)
+        code, out = pre_commit(paths, deadline, start, f'run {attempt}')
         modified, failures = results(out, code)
         ids += [h for h in modified if h not in ids]
         # A rerun repairs what a hook rewrote; the same failure again only spends another pass (#140).
@@ -209,7 +234,17 @@ def run_hooks(paths, deadline=DEADLINE):
             break
     # A hook still rewriting files is judged by what it wrote, never excused by HEAD.
     rerun = [f['hook'] for f in failures if f['hook'] not in modified]
-    return True, not code, ids, failures, baseline(rerun, paths, deadline, start) if rerun else []
+    excused = baseline(rerun, paths, deadline, start) if rerun else []
+    if excused and len(excused) == len(failures):
+        # fail_fast may have stopped the run at an excused hook: every other hook must pass on the change, as the
+        # commit will run them with the same SKIP.
+        again, out = pre_commit(paths, deadline, start, 'without the excused', skip=excused)
+        modified, others = results(out, again)
+        ids += [h for h in modified if h not in ids]
+        failures += others
+        if again and not others:
+            excused = []  # a failure no hook owns: nothing is excused
+    return True, not code, ids, failures, excused
 
 
 def collect(argv):

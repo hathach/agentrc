@@ -163,7 +163,7 @@ const quotedAfter = (prefix) => (prompt) => {
   const m = String(prompt).match(new RegExp(`${prefix.source} ((?:${SHQ.source} ?)+)`))
   return m ? [...m[1].matchAll(SHQ)].map(t => t[0].slice(1, -1).replaceAll(`'\\''`, `'`)) : []
 }
-const pathLine = quotedAfter(/commits\.py commit --receipt '[^']*' --request '[^']*'/)
+const pathLine = quotedAfter(/commits\.py commit (?:--skip-hooks '[^']*' )?--receipt '[^']*' --request '[^']*'/)
 const auditScope = quotedAfter(/commits\.py head --parent [0-9a-f]{40}/)
 // A deterministic 40-hex blob id per path, shared by the hook snapshot and the audit's ls-tree.
 const blobOf = (f) => [...f].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 0xffffffff, 7).toString(16).padStart(40, '0')
@@ -6793,8 +6793,13 @@ test('a failing hook is refused by name and first line unless it fails on HEAD t
   assert.ok(!refused.labels.some(l => l.startsWith('commit#')))
   assert.ok(refused.logs.some(l => l.endsWith('refusing to publish — the repository hooks do not pass on the fix: unit-test: preprocessing failed')))
 
-  const { result, logs } = await run({ ...publishing, hooks: { passed: false, failed: [unit, cov], baselineFailed: ['unit-test', 'drivers-coverage'] } })
+  const { result, logs, calls } = await run({ ...publishing, hooks: { passed: false, failed: [unit, cov], baselineFailed: ['unit-test', 'drivers-coverage'] } })
   assert.equal(result.history[0].reviewPush.pass, true, 'the fix is published')
+  // an installed pre-commit hook reruns them on the commit: only the excused ones are skipped there
+  assert.ok(calls.find(c => c.label === 'commit#1-review').prompt.includes("commits.py commit --skip-hooks 'unit-test,drivers-coverage' --receipt "))
+  assert.ok(!refused.calls.some(c => String(c.prompt).includes('--skip-hooks')))
+  const plain = await run({ ...publishing })
+  assert.ok(plain.calls.find(c => c.label === 'commit#1-review').prompt.includes('commits.py commit --receipt '), 'nothing excused, nothing skipped')
   assert.ok(logs.some(l => l.endsWith(`push#1-review: hook(s) failing on HEAD too, not counted against the fix: unit-test: preprocessing failed; drivers-coverage: ${cov.error}`)))
 })
 

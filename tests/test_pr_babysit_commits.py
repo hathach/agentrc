@@ -438,6 +438,24 @@ class CommitsTest(unittest.TestCase):
         self.assertIn('trailing whitespace', out['detail'])
         self.assertEqual(self.git('rev-parse', 'HEAD').strip(), self.base)
 
+    def test_skip_hooks_reach_the_installed_hook_as_pre_commits_skip(self):
+        # hooks.py excused a hook that fails on HEAD too; pre-commit installed as the git hook would run it again.
+        self.hook('echo "SKIP=$SKIP" >&2\ncase ",$SKIP," in *,host-broken,*) exit 0;; esac\nexit 1')
+        self.write('a.c', 'changed\n')
+        code, out = self.run_script('commit', 'a.c', stdin='Fix\n')
+        self.assertEqual((code, out['committed']), (0, False))
+        code, out = self.run_script('commit', '--skip-hooks', 'other,host-broken', 'a.c', stdin='Fix\n')
+        self.assertEqual((code, out['committed']), (0, True))
+        self.assertEqual(self.git('show', '--name-only', '--format=', 'HEAD').split(), ['a.c'])
+
+    def test_skip_hooks_takes_hook_ids_only(self):
+        self.write('a.c', 'changed\n')
+        for ids in ('a b', 'a;rm', ''):
+            code, out = self.run_script('commit', '--skip-hooks', ids, 'a.c', stdin='Fix\n')
+            self.assertEqual(code, 2, ids)
+            self.assertIn('is not a hook id', out['error'])
+        self.assertEqual(self.git('rev-parse', 'HEAD').strip(), self.base)
+
     @unittest.skipIf(os.name == 'nt', 'NTFS forbids : and * in a file name')
     def test_commit_reads_a_path_named_like_pathspec_magic_literally(self):
         self.write(':(top)*', 'odd\n')

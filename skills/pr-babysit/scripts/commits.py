@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Commit by path, and read back what commits hold, for pr-babysit to audit before it publishes.
 
-  commits.py commit [--receipt FILE --request R] PATH...  commit exactly PATH, with the message on stdin
+  commits.py commit [--skip-hooks IDS] [--receipt FILE --request R] PATH...  commit exactly PATH, with the message on stdin
   commits.py receipt FILE --request R --parent P PATH...  read back what a `commit --receipt FILE` printed
   commits.py head --parent P PATH...  audit the commit at HEAD, made on P from PATH
   commits.py chain FROM TO --published P --base B --tip T  audit FROM..TO for adoption (full SHAs), P the PR's head,
@@ -10,7 +10,9 @@
 `commit` stages PATH and runs `git commit --only`, so nothing staged beside
 it is taken; it prints {committed, detail}: committed false, with git's last
 lines, when git made no commit (a hook that fails or modifies a file stops it),
-or before staging anything when the message is blank. detail is bounded to
+or before staging anything when the message is blank. --skip-hooks adds the
+comma-separated pre-commit hook ids IDS to the SKIP the commit's hooks see:
+the ones hooks.py found failing on HEAD too. detail is bounded to
 DETAIL_MAX characters, terminal escapes and control characters dropped, so a
 relay can copy it. With --receipt, FILE must not exist yet; the line, with R,
 the parent P (HEAD before) and PATH, is saved there for a caller whose copy of
@@ -61,6 +63,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 from facts import FULL_SHA, Unusable, attempt, attribution_in, git, report, run, sealed, status  # noqa: E402
 
 DETAIL_MAX = 500
+# A pre-commit hook id as --skip-hooks takes it: no comma, space or shell metacharacter.
+HOOK_ID = re.compile(r"[\w.:+-]+")
 ESCAPE = re.compile(r'\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|.)')
 
 
@@ -163,7 +167,18 @@ def bounded(text):
     return text if len(text) <= DETAIL_MAX else text[:DETAIL_MAX - 1] + '…'
 
 
-def outcome(paths):
+def skip_env(ids):
+    """The environment with ids added to pre-commit's SKIP; an id is pre-commit's own charset, never a list."""
+    if not ids:
+        return None
+    for i in ids:
+        if not HOOK_ID.fullmatch(i):
+            raise Unusable(f'--skip-hooks {i!r} is not a hook id')
+    return {**os.environ, 'SKIP': ','.join([*filter(None, os.environ.get('SKIP', '').split(',')), *ids])}
+
+
+def outcome(paths, skip=()):
+    env = skip_env(skip)  # before anything is staged
     try:
         # -sig: a leading BOM would hide an attribution first line from attribution_in
         message = sys.stdin.buffer.read().decode('utf-8-sig')
@@ -174,7 +189,7 @@ def outcome(paths):
     # --literal-pathspecs: a file named like pathspec magic, such as `:(top)*`, is that file only.
     before = git('rev-parse', 'HEAD').strip()
     git('--literal-pathspecs', 'add', '--', *paths)
-    code, out, err = attempt('git', '--literal-pathspecs', 'commit', '--only', '-F', '-', '--', *paths, input=message)
+    code, out, err = attempt('git', '--literal-pathspecs', 'commit', '--only', '-F', '-', '--', *paths, input=message, env=env)
     said = (out + err).strip().splitlines()
     tail = ' / '.join(said[-5:])
     after = git('rev-parse', 'HEAD').strip()
@@ -185,13 +200,13 @@ def outcome(paths):
     return {'committed': True, 'detail': bounded(said[0] if said else 'committed')}
 
 
-def make(paths, receipt=None, request=None):
+def make(paths, receipt=None, request=None, skip=()):
     if receipt is None:
-        return outcome(paths)
+        return outcome(paths, skip)
     if os.path.lexists(receipt):
         raise Unusable(f'receipt {receipt} already exists: a receipt names one commit attempt')
     parent = git('rev-parse', 'HEAD').strip()
-    line = outcome(paths)
+    line = outcome(paths, skip)
     sha = git('rev-parse', 'HEAD').strip() if line['committed'] else ''
     saved = {'request': request, 'parent': parent, 'scope': paths, 'line': sealed({**line, 'sha': sha})}
     try:
@@ -222,17 +237,20 @@ def read_receipt(path, request, parent, paths):
 
 
 def collect(argv):
+    skip = ()
+    if len(argv) > 2 and argv[:2] == ['commit', '--skip-hooks']:
+        skip, argv = tuple(argv[2].split(',')), ['commit', *argv[3:]]
     if len(argv) > 5 and argv[:2] == ['commit', '--receipt'] and argv[3] == '--request':
-        return make(argv[5:], argv[2], argv[4])
+        return make(argv[5:], argv[2], argv[4], skip)
     if len(argv) > 1 and argv[0] == 'commit':
-        return make(argv[1:])
+        return make(argv[1:], skip=skip)
     if len(argv) > 6 and argv[0] == 'receipt' and argv[2] == '--request' and argv[4] == '--parent':
         return read_receipt(argv[1], argv[3], full(argv[5]), argv[6:])
     if len(argv) > 3 and argv[:2] == ['head', '--parent']:
         return head(argv[2], argv[3:])
     if len(argv) == 9 and argv[0] == 'chain' and argv[3] == '--published' and argv[5] == '--base' and argv[7] == '--tip':
         return chain(argv[1], argv[2], argv[4], argv[6], argv[8])
-    raise Unusable('usage: commits.py commit [--receipt FILE --request R] PATH... | commits.py receipt FILE --request R --parent P PATH... | commits.py head --parent P PATH... | commits.py chain FROM TO --published P --base B --tip T')
+    raise Unusable('usage: commits.py commit [--skip-hooks IDS] [--receipt FILE --request R] PATH... | commits.py receipt FILE --request R --parent P PATH... | commits.py head --parent P PATH... | commits.py chain FROM TO --published P --base B --tip T')
 
 
 if __name__ == '__main__':

@@ -49,6 +49,9 @@ SCRIPTS = {
     # Rewrites its files on every run: the retry never settles it.
     'grow': 'for f; do echo more >> "$f"; done\n',
     'abbrev': 'test "$(git config core.abbrev)" = 40 || { echo "core.abbrev is $(git config core.abbrev)"; exit 1; }\n',
+    # Fails everywhere and leaves a file behind; the next one fails wherever that file is.
+    'litter': 'echo litter > litter.txt; echo "no compiler"; exit 1\n',
+    'nolitter': 'test ! -e litter.txt || { echo "found litter.txt"; exit 1; }\n',
 }
 
 
@@ -218,6 +221,26 @@ class HooksTest(unittest.TestCase):
         self.assertEqual(out['baselineFailed'], ['broken'])
         self.assertEqual(len(self.worktrees()), 1, 'the HEAD worktree is removed')
         self.assertEqual(out['snapshotBefore'], out['snapshotAfter'])
+
+    def test_each_head_rerun_starts_from_a_clean_head(self):
+        # nolitter fails here only on what litter left: on HEAD it must not inherit litter's rerun.
+        self.configure('litter', 'nolitter')
+        code, out = self.run_script('a.txt')
+        self.assertEqual((code, out['passed']), (0, False))
+        self.assertEqual([f['hook'] for f in out['failed']], ['litter', 'nolitter'])
+        self.assertEqual(out['baselineFailed'], ['litter'])
+        self.assertEqual(len(self.worktrees()), 1)
+
+    def test_a_fail_fast_stop_at_an_excused_hook_still_runs_the_rest_on_the_change(self):
+        self.configure('broken', 'picky')
+        (self.repo / '.pre-commit-config.yaml').write_text(
+            'fail_fast: true\n' + CONFIG.format(HOOK.format(id='broken') + HOOK.format(id='picky')))
+        self.git('commit', '-qam', 'fail fast')
+        (self.repo / 'a.txt').write_text('bad\n')
+        code, out = self.run_script('a.txt')
+        self.assertEqual((code, out['passed']), (0, False))
+        self.assertEqual(out['failed'], [{'hook': 'broken', 'error': 'nope'}, {'hook': 'picky', 'error': 'a.txt'}])
+        self.assertEqual(out['baselineFailed'], ['broken'])
 
     def test_a_hook_the_change_breaks_passes_on_head(self):
         self.configure('picky')

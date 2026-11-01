@@ -22,7 +22,7 @@ python3 "$S/preflight.py" --recheck            # before a commit: has the checko
 python3 "$S/preflight.py" --state N [--repo R]  # before a GitHub write: is the PR still OPEN?
 python3 "$S/harvest.py" --pr N [--repo R] --reviewers coderabbit,greptile --auto-run coderabbit  # bot states + review comments
 python3 "$S/hooks.py" [--deadline-seconds N] 'src/a.c' 'docs/b.rst'   # from the checkout's top level; killed past N s (540)
-python3 "$S/commits.py" commit [--receipt <file> --request <r>] 'src/a.c' < msg  # commit exactly these paths, the message on stdin; the line saved to a new <file>
+python3 "$S/commits.py" commit [--skip-hooks <ids>] [--receipt <file> --request <r>] 'src/a.c' < msg  # commit exactly these paths, the message on stdin; the line saved to a new <file>; <ids> added to pre-commit's SKIP
 python3 "$S/commits.py" receipt <file> --request <r> --parent <sha> 'src/a.c'  # what that commit printed, for this request, parent and paths only
 python3 "$S/commits.py" head --parent <sha> 'src/a.c'  # audit the commit at HEAD, made on <sha> from these paths
 python3 "$S/commits.py" chain <from> <to> --published <pr-head> --base <base-head> --tip <base-tip>  # audit from..to for adoption, full SHAs; preflight's prBase and prBaseTip

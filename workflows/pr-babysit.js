@@ -1719,7 +1719,8 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
     'no trailer or line crediting an agent, model, tool or session — no Co-Authored-By, Claude-Session, Generated-with or the like: the repository\'s human is the sole author. ' +
     `The fixes: ${JSON.stringify(brief.claims)}; read \`git --literal-pathspecs diff -- ${scope.map(shq).join(' ')}\` for what changed. ` +
     // A file, not a here-document: no delimiter can collide with the message.
-    `Then run exactly \`${PY} ${COMMITS_SCRIPT} commit --receipt ${receiptFile} --request ${shq(commitLabel)} ${scope.map(shq).join(' ')} < '<that file>'; rm -f '<that file>'\` ` +
+    // An installed pre-commit hook runs again on the commit: the hooks excused above stay excused there, the others run.
+    `Then run exactly \`${PY} ${COMMITS_SCRIPT} commit ${excused.length ? `--skip-hooks ${shq(excused.map(f => f.hook).join(','))} ` : ''}--receipt ${receiptFile} --request ${shq(commitLabel)} ${scope.map(shq).join(' ')} < '<that file>'; rm -f '<that file>'\` ` +
     'in the foreground with a Bash timeout of 600000 ms, the tool\'s maximum: an installed pre-commit hook runs again on the commit. ' +
     'Do not push. Change nothing else, and never add a file a hook touched and retry. ' +
     relayed(COMMIT),
