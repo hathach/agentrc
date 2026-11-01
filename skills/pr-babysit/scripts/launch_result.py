@@ -443,21 +443,18 @@ def summarize(output, output_path, state_ref=None, tree=None, keys=False):
     return summary
 
 
-def synced_dirs(directory, created):
-    """fsync directory, where a file was renamed in, and the parent of each directory mkdir made from created down: a
-    rename or mkdir is durable only once its parent's entry is. Skipped on Windows, where os.open cannot open a directory."""
+def synced_dirs(directory):
+    """fsync directory, where a file was renamed in, and each ancestor up to the root: a rename or mkdir is durable only
+    once its parent's entry is, and which of them this or an earlier attempt made is unknown. Skipped on Windows, where
+    os.open cannot open a directory."""
     if os.name == 'nt':
         return
-    d = directory
-    while True:
+    for d in (directory, *directory.parents):
         fd = os.open(d, os.O_RDONLY)
         try:
             os.fsync(fd)
         finally:
             os.close(fd)
-        if created is None or d == created.parent:
-            return
-        d = d.parent
 
 
 def kept(output_path, digest):
@@ -470,11 +467,7 @@ def kept(output_path, digest):
     # workflows/pr-babysit.js's stateRef rule: the path goes into a shell command
     if not re.fullmatch(r'(?:[A-Za-z]:)?/(?!/)[A-Za-z0-9._ /-]+', path.as_posix()) or '..' in path.as_posix():
         raise Unusable(f'{path.as_posix()} is not a plain absolute path the workflow takes as a stateRef')
-    if path.is_file() and path.read_bytes() == raw:
-        # an earlier attempt may have failed before its sync, the entries it made unknown: sync up to the root
-        synced_dirs(STATES, [*reversed(STATES.parents), STATES][1])
-    else:
-        created = next((d for d in [*reversed(STATES.parents), STATES] if not d.exists()), None)
+    if not (path.is_file() and path.read_bytes() == raw):
         STATES.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=STATES, prefix=f'.{path.name}.')
         try:
@@ -486,7 +479,7 @@ def kept(output_path, digest):
         except BaseException:
             Path(tmp).unlink(missing_ok=True)
             raise
-        synced_dirs(STATES, created)
+    synced_dirs(STATES)  # also when reusing a copy an earlier attempt renamed in but never synced
     if ((load_output(path) or {}).get('result') or {}).get('stateDigest') != digest:
         raise Unusable(f'{path} does not read back with state digest {digest}')
     return path.as_posix()

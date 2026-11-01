@@ -102,7 +102,7 @@ class LaunchResultTest(unittest.TestCase):
         self.assertEqual(len(list(self.states.iterdir())), 1, 'no temporary file left behind')
 
     @unittest.skipIf(os.name == 'nt', 'Windows has no directory fsync')
-    def test_the_kept_state_and_every_directory_entry_made_for_it_are_synced(self):
+    def test_the_kept_state_and_every_directory_up_to_the_root_are_synced(self):
         """A host reset after the stateRef is returned keeps the file's name, and the directories mkdir made for it."""
         real, synced = os.fsync, []
 
@@ -115,13 +115,34 @@ class LaunchResultTest(unittest.TestCase):
             rc, s = self.run_it(output())
         kept = Path(s['stateRef']['outputFile'])
         self.assertEqual((rc, kept.parent), (0, states))
-        self.assertEqual(ids(*synced), ids(kept, states, states.parent, self.dir), 'the file, its directory and each new entry')
+        self.assertEqual(ids(*synced), ids(kept, states, *states.parents), 'the file and every directory up to the root')
         (self.dir / 'w.output').unlink()
         synced.clear()
         with mock.patch.object(launch_result, 'STATES', states), mock.patch.object(launch_result.os, 'fsync', fsync):
             self.run_it(output(totalTokens=2))
-        self.assertEqual(ids(*synced), ids(next(p for p in states.iterdir() if p != kept), states),
-                         'an existing directory: only the one holding the new file')
+        self.assertEqual(ids(*synced), ids(next(p for p in states.iterdir() if p != kept), states, *states.parents),
+                         'an existing directory: still every directory up to the root')
+
+    @unittest.skipIf(os.name == 'nt', 'Windows has no directory fsync')
+    def test_a_retry_after_a_failed_rename_syncs_the_directories_the_first_attempt_made(self):
+        """A first attempt that made the directories but failed before the rename leaves entries a retry must sync."""
+        states = self.dir / 'new-parent' / 'states'
+        with mock.patch.object(launch_result, 'STATES', states), \
+                mock.patch.object(launch_result.windows, 'replace', side_effect=OSError('interrupted')):
+            rc, s = self.run_it(output())
+        self.assertEqual((rc, s['stateRef']['outputFile']), (0, (self.dir / 'w.output').resolve().as_posix()))
+        self.assertEqual(list(states.iterdir()), [], 'the directories made, no copy left')
+        real, synced = os.fsync, []
+
+        def fsync(fd):
+            synced.append(os.fstat(fd))
+            real(fd)
+        ids = lambda *paths: {(st.st_dev, st.st_ino) for st in (p if isinstance(p, os.stat_result) else os.stat(p) for p in paths)}
+        with mock.patch.object(launch_result, 'STATES', states), mock.patch.object(launch_result.os, 'fsync', fsync):
+            rc, s = self.run_it(output())
+        kept = Path(s['stateRef']['outputFile'])
+        self.assertEqual((rc, kept.parent), (0, states))
+        self.assertEqual(ids(*synced), ids(kept, states, *states.parents), 'the entries the first attempt made too')
 
     @unittest.skipIf(os.name == 'nt', 'Windows has no directory fsync')
     def test_a_copy_left_by_a_failed_sync_is_synced_before_it_is_reused(self):
