@@ -840,6 +840,25 @@ class Handoff(Rig):
         self.assertTrue(self.parent.exists())
         self.assertEqual([f.name for f in self.admission().parent.iterdir()], ['admissions.lock'])
 
+    def test_a_worker_lapsed_right_after_the_caller_saw_it_ready_is_no_handoff_and_says_so(self):
+        hc = self.fake()
+        token = self.token(self.run_remove('--dry-run')[1])
+        exists = os.path.exists
+
+        def caller_stalls(path):  # past ACK_S right after it saw ready: its worker lapses, deleting ready, and ends
+            seen = exists(path)
+            if seen and str(path).endswith('.ready') and threading.current_thread() not in hc.threads:
+                hc.join()
+            return seen
+
+        self.patch(wr.os.path, 'exists', caller_stalls)
+        rc, out = self.run_remove('--proceed', token)
+        self.assertEqual(rc, 3, out)
+        self.assertIn('gave up waiting', out)
+        self.assertNotIn('did not answer', out)
+        self.assertTrue(self.parent.exists())
+        self.assertEqual([f.name for f in self.admission().parent.iterdir()], ['admissions.lock'])
+
     def test_the_caller_reports_the_handoff_before_the_worker_kills(self):
         hc = self.fake()
         token = self.token(self.run_remove('--dry-run')[1])

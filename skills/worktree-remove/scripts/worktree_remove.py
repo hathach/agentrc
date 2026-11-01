@@ -415,10 +415,10 @@ def handoff(p, out):
     launch = wc.run([hc, 'run', '--bg', '--no-parent', '--no-notify', '--rm', '--cwd', str(admission.parent),
                      '--name', name, '--label', f'agentrc.worktree-remove={p["root"]}', '--',
                      sys.executable, str(Path(__file__).resolve()), '--worker', files['plan']], timeout=wc.HC_TIMEOUT)
-    deadline = time.monotonic() + READY_S
-    while not launch.returncode and not os.path.exists(files['ready']) and time.monotonic() < deadline:
+    deadline, ready = time.monotonic() + READY_S, False
+    # read once: a worker lapsing next deletes it, which the check under the lock reports
+    while not launch.returncode and not (ready := os.path.exists(files['ready'])) and time.monotonic() < deadline:
         time.sleep(0.1)
-    ready = not launch.returncode and os.path.exists(files['ready'])  # a worker lapsing next deletes it
     unannounced = None
     if ready:
         with admitting(admission):  # the worker lapses under it; one that lapsed holds the ack or released
