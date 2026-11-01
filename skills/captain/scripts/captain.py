@@ -752,8 +752,7 @@ def reports(msgs=()):
     requests = {r['msg']: r for r in recs if r['type'] == 'request'}
     answers = {r['msg']: r for r in recs if r['type'] == 'report'}
     if msgs:
-        return [row(requests[m], answers[m]) if m in answers else
-                {'msg': m, 'missing': 'not answered' if m in requests else 'no such request'} for m in msgs]
+        return [row(requests[m], answers[m]) if m in answers else unanswered(m, requests, recs) for m in msgs]
     latest = {}
     for rep in answers.values():
         latest[requests[rep['msg']]['target']['address']] = (requests[rep['msg']], rep)
@@ -762,6 +761,16 @@ def reports(msgs=()):
 
 def row(request, rep):
     return {'handle': request['handle'], 'msg': request['msg'], **rep['report']}
+
+
+def unanswered(msg, requests, recs):
+    """The row for request msg with no report: the record that closed it, such as a refusal, when one did."""
+    if msg not in requests:
+        return {'msg': msg, 'missing': 'no such request'}
+    end = next((r for r in recs if r['msg'] == msg and r['type'] in CLOSED and r['type'] in EVENTS), None)
+    if not end:
+        return {'msg': msg, 'missing': 'not answered'}
+    return {'handle': requests[msg]['handle'], 'msg': msg, 'missing': EVENTS[end['type']]}
 
 
 def cancel(msg, mine):

@@ -737,6 +737,8 @@ class BriefTest(LedgerCase):
             self.assertEqual(captain.collect([self.msg], 0), 0)
         self.assertTrue(out.call_args_list[-1].args[0].startswith(
             f'refused by the session that replaced its target {self.msg}'))
+        self.assertEqual(captain.reports([self.msg]), [{'handle': 'sp · name · t2', 'msg': self.msg,
+                                                        'missing': 'refused by the session that replaced its target'}])
 
     def test_closed_missing_or_stranded_request(self):
         with self.assertRaises(SystemExit):
@@ -827,6 +829,9 @@ class CollectTest(LedgerCase):
         self.assertEqual((rows[0]['msg'], rows[0]['state']), (first, 'in-progress'))
         self.assertEqual(rows[1:], [{'msg': unanswered, 'missing': 'not answered'},
                                     {'msg': 'm-nonesuch', 'missing': 'no such request'}])
+        captain.cancel(unanswered, self.ident)
+        self.assertEqual(captain.reports([unanswered]),
+                         [{'handle': 'sp · name · t2', 'msg': unanswered, 'missing': 'cancelled'}])
 
     def test_reports_keeps_the_latest_per_target(self):
         first = self.msg_of(self.ask())

@@ -19,7 +19,8 @@ found one standing, `uncertain` posted one that did not read back).
 `stateRef` names a copy of the launch's output kept outside the Workflow task directory, which a
 host reset wipes (#340): ${XDG_STATE_HOME:-~/.local/state}/agentrc/pr-babysit/states/<digest>-<content
 hash>.json, written once and read back; when it cannot be kept, stateRef names the output itself and a
-note says so. `budget` is the returned state's
+note says so. Nothing prunes that directory: a copy is needed only while a caller may continue from its stateRef,
+so the copies of a finished PR's launches can be deleted by hand. `budget` is the returned state's
 cyclesUsed and maxCycles; `pinned` its config, the arguments a continuation
 passes unchanged, read from the --state-ref output when the launch returned no state. `blockers` lists what the caller must settle before
 trusting or continuing the launch, a spent cycle budget and a refused launch

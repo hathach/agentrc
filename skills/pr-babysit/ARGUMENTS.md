@@ -133,7 +133,9 @@ A key not listed here throws before anything runs.
 - `state` or `stateRef: { outputFile, digest }`: a previous launch's state, or
   the saved output holding it and its `stateDigest`, loaded as checksummed chunks.
   `launch_result.py`'s `stateRef` names a copy it keeps outside the Workflow
-  task directory, so a host reset does not take the state with it.
+  task directory, so a host reset does not take the state with it. Nothing
+  prunes those copies: one is needed only while a caller may continue from its
+  `stateRef`, so a finished PR's can be deleted by hand.
 - `adoptHead`: full SHA of audited commits on top of the state's
   `expectedHead` (a caller's repair, or a push made outside the workflow):
   the chain is audited, published under `autoPush`, and the run continues
