@@ -123,6 +123,30 @@ class LaunchResultTest(unittest.TestCase):
         self.assertEqual(ids(*synced), ids(next(p for p in states.iterdir() if p != kept), states),
                          'an existing directory: only the one holding the new file')
 
+    @unittest.skipIf(os.name == 'nt', 'Windows has no directory fsync')
+    def test_a_copy_left_by_a_failed_sync_is_synced_before_it_is_reused(self):
+        """A retry on the same output must not return the copy an earlier attempt renamed in but could not sync."""
+        states = self.dir / 'state' / 'states'
+        output_path = (self.dir / 'w.output').resolve().as_posix()
+        failing = mock.patch.object(launch_result, 'synced_dirs', side_effect=OSError('EIO'))
+        for attempt in (1, 2):
+            with mock.patch.object(launch_result, 'STATES', states), failing:
+                rc, s = self.run_it(output())
+            self.assertEqual((rc, s['stateRef']['outputFile']), (0, output_path), f'attempt {attempt}')
+            self.assertTrue(any(n.startswith('the state is not kept outside the Workflow task directory') and 'EIO' in n
+                                for n in s['notes']), s['notes'])
+        [copy] = states.iterdir()
+        real, synced = os.fsync, []
+
+        def fsync(fd):
+            synced.append(os.fstat(fd))
+            real(fd)
+        ids = lambda *paths: {(st.st_dev, st.st_ino) for st in (p if isinstance(p, os.stat_result) else os.stat(p) for p in paths)}
+        with mock.patch.object(launch_result, 'STATES', states), mock.patch.object(launch_result.os, 'fsync', fsync):
+            rc, s = self.run_it(output())
+        self.assertEqual((rc, s['stateRef']['outputFile']), (0, copy.as_posix()))
+        self.assertEqual(ids(*synced), ids(states, *states.parents), 'the new entries are unknown: every directory up to the root')
+
     def test_a_state_digest_that_is_not_8_hex_digits_is_never_a_file_name(self):
         rc, s = self.run_it(output(result={'stateDigest': '../escaped'}))
         self.assertEqual((rc, s['stateRef']['outputFile']), (0, (self.dir / 'w.output').resolve().as_posix()))

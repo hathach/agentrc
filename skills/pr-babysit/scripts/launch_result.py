@@ -470,7 +470,10 @@ def kept(output_path, digest):
     # workflows/pr-babysit.js's stateRef rule: the path goes into a shell command
     if not re.fullmatch(r'(?:[A-Za-z]:)?/(?!/)[A-Za-z0-9._ /-]+', path.as_posix()) or '..' in path.as_posix():
         raise Unusable(f'{path.as_posix()} is not a plain absolute path the workflow takes as a stateRef')
-    if not (path.is_file() and path.read_bytes() == raw):
+    if path.is_file() and path.read_bytes() == raw:
+        # an earlier attempt may have failed before its sync, the entries it made unknown: sync up to the root
+        synced_dirs(STATES, [*reversed(STATES.parents), STATES][1])
+    else:
         created = next((d for d in [*reversed(STATES.parents), STATES] if not d.exists()), None)
         STATES.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=STATES, prefix=f'.{path.name}.')
