@@ -116,7 +116,7 @@ class Descriptor(unittest.TestCase):
 class JLinkDump(unittest.TestCase):
     def setUp(self):
         d = tempfile.TemporaryDirectory()
-        self.addCleanup(d.cleanup)
+        self.addCleanup(dump.ps.windows.retry, d.cleanup)
         self.dir = Path(d.name)
         env = fake_tools(self, self.dir, (('JLinkExe', FAKE_JLINK),))
         # the whole environment, cleared into place: an inherited PROBE_STATE_* override would start a real tool

@@ -215,6 +215,42 @@ async function run(opts = {}) {
   const replied = new Set() // comments a reply.py run posted to, which a rerun finds there (rerunReuses)
   const commitReceipts = new Map() // commits.py --receipt path -> the line it saved, with its bindings
 
+  // One harvest per cycle, whichever of the validator and the probe (#359) asks for it first.
+  const readings = new Map()
+  const reading = (cycle, prompt) => {
+    if (!readings.has(cycle)) readings.set(cycle, harvestOf(prompt))
+    return readings.get(cycle).then(r => structuredClone(r))
+  }
+  const harvestOf = async (prompt) => {
+    if (reviews instanceof Error) throw reviews
+    // opts.reviewsWait(calls): hold the validator's answer, as afterReviewLane holds the CI evidence.
+    if (opts.reviewsWait) await opts.reviewsWait(calls)
+    const r = structuredClone(opts.reviewsPerCycle ? opts.reviewsPerCycle(prompt) : reviews)
+    // A finding that relates to no earlier verdict and names no repair of ours, unless a case says it does.
+    if (Array.isArray(r.findings)) r.findings = r.findings.map(f => ({ related: null, changeReason: null, fixedBy: null, ...f }))
+    // `bots: 'reviewed'` / `'pending'` name every auto-running bot in that
+    // state; explicit records are filled the same way, one field at a time.
+    // The auto-running bots are the ones the harvest command names.
+    // Every other reviewer gets the harvested record harvest.py gives it, unless the case lists its records whole.
+    const [named, autoRun] = harvestFlags(prompt)
+    const bots = r.bots === 'reviewed' || r.bots === undefined ? autoRun.map(b => bot(b))
+      : r.bots === 'pending' ? autoRun.map(b => bot(b, { state: 'absent', sha: null, evidence: [], reason: 'nothing on head' }))
+        : r.bots
+    if (!r.botsWhole) {
+      for (const b of named.filter(b => !bots.some(x => x.bot === b) && !autoRun.includes(b))) {
+        bots.push(bot(b, b === 'copilot' ? { state: 'absent', sha: null, evidence: [], reason: 'no Copilot review on the head' }
+          : { state: 'harvested', sha: null, evidence: [], reason: '0 comment(s) harvested' }))
+      }
+    }
+    delete r.botsWhole
+    const observedAt = at((opts.clockOffset ?? 0) + (validatorCalls++) * (opts.minutesPerCycle ?? (opts.napClock ? 0 : 1)) +
+      (opts.napClock ? napMs.reduce((sum, ms) => sum + ms, 0) / 60000 : 0))
+    observed = observedAt
+    const read = bots.map(b => ({ ...b, sha: b.sha === 'head' ? head : b.sha }))
+    // Like harvest.py's, over what the bots left and never a time: new or edited findings or a changed bot state change it.
+    const evidence = { findings: r.findings, replies: r.replies, bots: read.map(({ bot, state, kind, sha, evidence }) => ({ bot, state, kind, sha, evidence })) }
+    return { headSha: head, observedAt, headEventAt: null, headEventEvidence: 'stub', fingerprint: `stub|${fnv1a(canonical(evidence))}`, ...r, bots: read }
+  }
   const agent = async (prompt, options) => {
     const label = options.label
     calls.push({
@@ -233,6 +269,14 @@ async function run(opts = {}) {
     }
     if (label === 'preflight' || label === 'preflight.retry') {
       return patch({ ...PIN, head, prHead }, opts.preflight)
+    }
+    if (label === 'rebase:cited' || label === 'rebase:cited.retry') {
+      // commits.py cited: every SHA still on the head unless opts.cited (shas, head) answers otherwise.
+      const [, head, list] = String(prompt).match(/commits\.py cited ([0-9a-f]{40}) ([0-9a-f ]+)`/)
+      const shas = list.trim().split(' ')
+      const answer = typeof opts.cited === 'function' ? opts.cited(shas, head)
+        : { head, cited: shas.map(sha => ({ sha, reachable: true, replacement: null })) }
+      return answer === null ? null : conforms(options.schema, answer, label)
     }
     if (label === 'adopt:audit' || label === 'adopt:audit.retry') {
       // commits.py echoes the FROM it was given: the state's expectedHead, or the live PR head without a pinned state.
@@ -339,35 +383,14 @@ async function run(opts = {}) {
       const judged = { checks: links.map(link => ({ link, failures: [failures[failed.findIndex(c => c.link === link)]] })), infraRerun: ci.infraRerun }
       return conforms(options.schema, opts.judge ? opts.judge(judged) : judged, label)
     }
-    if (label.startsWith('reviews#')) {
-      if (reviews instanceof Error) throw reviews
-      // opts.reviewsWait(calls): hold the validator's answer, as afterReviewLane holds the CI evidence.
-      if (opts.reviewsWait) await opts.reviewsWait(calls)
-      const r = structuredClone(opts.reviewsPerCycle ? opts.reviewsPerCycle(prompt) : reviews)
-      // A finding that relates to no earlier verdict and names no repair of ours, unless a case says it does.
-      if (Array.isArray(r.findings)) r.findings = r.findings.map(f => ({ related: null, changeReason: null, fixedBy: null, ...f }))
-      // `bots: 'reviewed'` / `'pending'` name every auto-running bot in that
-      // state; explicit records are filled the same way, one field at a time.
-      // The auto-running bots are the ones the harvest command names.
-      // Every other reviewer gets the harvested record harvest.py gives it, unless the case lists its records whole.
-      const [named, autoRun] = harvestFlags(prompt)
-      const bots = r.bots === 'reviewed' || r.bots === undefined ? autoRun.map(b => bot(b))
-        : r.bots === 'pending' ? autoRun.map(b => bot(b, { state: 'absent', sha: null, evidence: [], reason: 'nothing on head' }))
-          : r.bots
-      if (!r.botsWhole) {
-        for (const b of named.filter(b => !bots.some(x => x.bot === b) && !autoRun.includes(b))) {
-          bots.push(bot(b, b === 'copilot' ? { state: 'absent', sha: null, evidence: [], reason: 'no Copilot review on the head' }
-            : { state: 'harvested', sha: null, evidence: [], reason: '0 comment(s) harvested' }))
-        }
-      }
-      delete r.botsWhole
-      const observedAt = at((opts.clockOffset ?? 0) + (validatorCalls++) * (opts.minutesPerCycle ?? (opts.napClock ? 0 : 1)) +
-        (opts.napClock ? napMs.reduce((sum, ms) => sum + ms, 0) / 60000 : 0))
-      observed = observedAt
-      return {
-        headSha: head, observedAt, headEventAt: null, headEventEvidence: 'stub', fingerprint: 'stub', ...r,
-        bots: bots.map(b => ({ ...b, sha: b.sha === 'head' ? head : b.sha })),
-      }
+    if (label.startsWith('reviews#')) return reading(cycleOf(label), prompt)
+    // harvest.py --probe: this cycle's reading without its comments, sealed; opts.probe patches it, null a dead relay.
+    if (label.startsWith('reviews:probe#')) {
+      const r = await reading(cycleOf(label), prompt)
+      if (opts.probe === null) return null
+      if (opts.probe?.error) return conforms(options.schema, opts.probe, label)   // the relay's copy of an error line, emptied
+      const { headSha, observedAt, headEventAt, headEventEvidence, fingerprint, bots } = r
+      return conforms(options.schema, sealLine({ headSha, observedAt, headEventAt, headEventEvidence, fingerprint, bots, ...(opts.probe || {}) }), label)
     }
     if (label === 'scope:check') {
       // scope_check.py's receipt over the paths the prompt asked it for; opts.lsFiles keeps those it accepts.
@@ -1619,7 +1642,12 @@ test('a review fix needing a protected path is withheld, its other paths include
     args: { protected: '^test/hil/[^/]+\\.json$' },
     reviews: { findings: [finding({ file: 'test/hil/tinyusb.json' })], replies: [], bots: 'reviewed' },
   })
-  assert.equal(result.reason, 'fix-verification-failed')
+  // #369: no writer ran, so the stop names the withheld fixes, not an unverified one left uncommitted.
+  assert.equal(result.reason, 'fixes-withheld')
+  assert.deepEqual(result.withheld, [{ scope: 'test/hil/tinyusb.json', ids: [result.withheld[0].ids[0]], why: 'a path it needs was refused',
+    refused: [{ path: 'test/hil/tinyusb.json', why: "protected, the caller's to change" }] }])
+  assert.ok(logs.some(l => /every review-lane fix withheld for the caller — nothing left uncommitted/.test(l)), logs.join('\n'))
+  assert.equal(logs.some(l => /left uncommitted for the caller's review/.test(l)), false)
   assert.equal(labels.some(l => l.startsWith('fix:')), false, 'no fixer may be dispatched for a protected path')
   assert.ok(logs.some(l => /test\/hil\/tinyusb\.json refused — protected, the caller's to change/.test(l)), logs.join('\n'))
   assert.ok(logs.some(l => /a path it needs was refused — withheld for the caller/.test(l)))
@@ -1630,7 +1658,26 @@ test('a review fix needing a protected path is withheld, its other paths include
     reviews: { findings: [finding({ fixFiles: ['src/a.c', 'test/hil/tinyusb.json'] })], replies: [], bots: 'reviewed' },
   })
   assert.equal(both.labels.some(l => l.startsWith('fix:')), false, both.labels.join(' '))
-  assert.equal(both.result.reason, 'fix-verification-failed')
+  assert.equal(both.result.reason, 'fixes-withheld')
+  // A writer that ran beside a withheld fix leaves its edit uncommitted: the unverified stop, the withheld one listed.
+  const mixed = await run({
+    args: { protected: '^test/hil/[^/]+\\.json$' },
+    reviews: { findings: [finding({ commentId: 1, file: 'test/hil/tinyusb.json' }), finding({ commentId: 2, file: 'src/b.c' })],
+      replies: [], bots: 'reviewed' },
+    verify: { addresses: false, reason: 'misses the point' },
+  })
+  assert.equal(mixed.result.reason, 'fix-verification-failed')
+  assert.deepEqual(mixed.result.withheld.map(w => w.scope), ['test/hil/tinyusb.json'])
+  assert.ok(mixed.logs.some(l => /review-lane fixes left uncommitted for the caller's review/.test(l)), mixed.logs.join('\n'))
+  // A dry run that withheld every fix changed nothing either.
+  const dry = await run({ args: { protected: '^test/hil/[^/]+\\.json$', autoPush: false },
+    reviews: { findings: [finding({ file: 'test/hil/tinyusb.json' })], replies: [], bots: 'reviewed' } })
+  assert.equal(dry.result.reason, 'fixes-withheld')
+  assert.equal(dry.logs.some(l => /left uncommitted \(dry run\)/.test(l)), false, dry.logs.join('\n'))
+  // Writers that all died may have edited: still the unverified stop, with the checkout to inspect.
+  const dead = await run({ reviews: oneValid, fix: null })
+  assert.equal(dead.result.reason, 'fix-verification-failed')
+  assert.ok(dead.logs.some(l => /every writer died, so inspect the checkout for any edit they made/.test(l)), dead.logs.join('\n'))
 })
 
 test('the publisher stages exactly the owned paths, never a protected one', async () => {
@@ -5430,6 +5477,7 @@ test('a verified review-body receipt pays like an issue comment', async () => {
   const { result } = await run({ args: { autoPush: true, maxCycles: 2 }, reviewsPerCycle: validOnce, reviewBody: (id) => id === 1 })
   assert.equal(result.pass, true, result.reason)
   assert.deepEqual(result.state.answeredWith.map(([id, a]) => [id, a.how]), [[1, 'fixNote']])
+  assert.equal(result.state.answeredWith[0][1].sha, result.history[0].reviewPush.sha, 'the repair it cites is kept for a later rewrite (#361)')
   assert.equal(result.history[0].fixNotePosts.detail, 'posted and read back')
 })
 
@@ -6247,6 +6295,27 @@ test('a rebased PR head re-pins the state and keeps its budget and obligations, 
   assert.equal(result.state.cyclesUsed, 3)
   assert.deepEqual(result.state.answeredWith, state.answeredWith)
   assert.ok(result.state.holds.some(([id]) => id === '8#1'), 'a hold is kept until a harvest reconciles it')
+})
+
+test('a re-pin hands back each fix note whose cited commit the rewrite replaced, with the commit now carrying its patch (#361)', async () => {
+  const [OLD, KEPT, GONE, NEW] = ['1', '2', '3', '4'].map(c => c.repeat(40))
+  const state = adoptionState({ answeredWith: [
+    [7, { how: 'fixNote', digest: 'd7', sha: OLD }], [8, { how: 'fixNote', digest: 'd8', sha: KEPT }],
+    [9, { how: 'fixNote', digest: 'd9', sha: GONE }], [10, { how: 'fixNote', digest: 'd10' }], [11, { how: 'refutation', digest: 'd11' }]] })
+  const cited = (shas, head) => ({ head, cited: shas.map(sha => ({ sha, reachable: sha === KEPT, replacement: sha === OLD ? NEW : null })) })
+  const { result, calls, logs } = await run({ args: rebaseArgs(state), preflight: { head: FOREIGN, prHead: FOREIGN }, cited })
+  assert.match(calls.find(c => c.label === 'rebase:cited').prompt, new RegExp(`commits\\.py cited ${FOREIGN} ${OLD} ${KEPT} ${GONE}\``))
+  const rejudged = Object.fromEntries(result.state.debt.filter(([, d]) => d.rejudge).map(([id, d]) => [id, d.rejudge.reason]))
+  assert.deepEqual(Object.keys(rejudged).map(Number), [7, 9, 10], logs.join('\n'))
+  assert.match(rejudged[7], new RegExp(`cites 1111111, which the rewritten head no longer holds; ${NEW} carries the same patch`))
+  assert.match(rejudged[9], /no single commit there carries the same patch/)
+  assert.match(rejudged[10], /names no recorded commit \(a state older than #361\)/)
+  // An unreadable check hands back every cited note rather than vouch for any.
+  const dead = await run({ args: rebaseArgs(state), preflight: { head: FOREIGN, prHead: FOREIGN }, cited: () => null })
+  assert.deepEqual(dead.result.state.debt.filter(([, d]) => d.rejudge).map(([id]) => id), [7, 8, 9, 10])
+  // Without a rewrite nothing is checked.
+  const plain = await run({ args: adoptionArgs(state, { adoptHead: undefined }) })
+  assert.equal(plain.labels.includes('rebase:cited'), false)
 })
 
 test('a re-pin is refused when the checkout is not the rebased head or a candidate is unpublished', async () => {
@@ -7393,6 +7462,44 @@ test('a rate-limited CodeRabbit waits past maxCycles for its reset and then its 
   assert.deepEqual(result.state.reviewClock, { sha: HEAD, eventAt: null, since: at(0), limitSeen: at(0), requests: 1,
     request: { at: at(21), retryAt: at(20), tried: at(21) } })
   assert.deepEqual(result.observation.launchActions[1].botAsks, [{ bot: 'coderabbit', kind: 'request', outcome: 'requested', commentId: 99, at: at(21), sha: HEAD }])
+})
+
+test('a quota wait probes harvest.py instead of validating until CodeRabbit leaves its limit or the evidence changes (#359)', async () => {
+  const validated = (labels) => labels.filter(l => l.startsWith('reviews#'))
+  const probes = (labels) => labels.filter(l => l.startsWith('reviews:probe#'))
+  let n = 0
+  const waited = await run({ args: { coderabbitTrigger: true, maxCycles: 1 }, napClock: true,
+    reviewsPerCycle: () => quiet([++n < 3 ? limitedCr(at(20)) : bot('coderabbit')]) })
+  assert.equal(waited.result.pass, true, waited.result.reason)
+  assert.deepEqual([validated(waited.labels), probes(waited.labels)], [['reviews#1', 'reviews#3'], ['reviews:probe#2', 'reviews:probe#3']])
+  assert.ok(waited.logs.some(l => /cycle 2: probe — CodeRabbit still rate-limited and nothing new on the head/.test(l)), waited.logs.join('\n'))
+  assert.ok(waited.logs.some(l => /cycle 3: probe — .*; validating in full/.test(l)), "its review is evidence too")
+  assert.match(waited.calls.find(c => c.label === 'reviews:probe#2').prompt, /harvest\.py --pr 3888 .* --auto-run coderabbit --probe`/)
+  assert.deepEqual(requests(waited.labels), ['crrequest#2'], 'the request window is kept')
+  // A review landing mid-wait changes the evidence: validated at once, the finding seen.
+  n = 0
+  const landed = await run({ args: { coderabbitTrigger: true, maxCycles: 2 }, napClock: true,
+    reviewsPerCycle: () => ++n === 1 ? quiet([limitedCr(at(20))]) : { findings: [finding()], replies: [], bots: [limitedCr(at(20))] } })
+  assert.deepEqual(validated(landed.labels).slice(0, 2), ['reviews#1', 'reviews#2'])
+  assert.ok(landed.logs.some(l => /cycle 2: probe — the review evidence changed; validating in full/.test(l)), landed.logs.join('\n'))
+  // A dead probe is no reading: the validator runs.
+  n = 0
+  const dead = await run({ args: { coderabbitTrigger: true, maxCycles: 1 }, napClock: true, probe: null,
+    reviewsPerCycle: () => quiet([++n < 3 ? limitedCr(at(20)) : bot('coderabbit')]) })
+  assert.equal(dead.result.pass, true, dead.result.reason)
+  assert.deepEqual(validated(dead.labels), ['reviews#1', 'reviews#2', 'reviews#3'])
+  // A probe GitHub refused stops the launch as the validator's refusal would, the validator not dispatched to be refused.
+  const refused = await run({ args: { coderabbitTrigger: true, maxCycles: 1 }, napClock: true,
+    probe: { headSha: '', observedAt: '', headEventAt: null, headEventEvidence: '', fingerprint: '', bots: [], seal: '',
+      error: LIMITED_REVIEWS.rateLimit.error, rateLimit: LIMIT }, reviewsPerCycle: () => quiet([limitedCr(at(20))]) })
+  assert.deepEqual([refused.result.reason, refused.result.rateLimit], ['github-rate-limited', LIMITED_REVIEWS.rateLimit])
+  assert.deepEqual(validated(refused.labels), ['reviews#1'])
+  // A reopen on the same head during the wait restarts the review clock from the probe, not the stale report.
+  n = 0
+  const reopened = await run({ args: { coderabbitTrigger: true, maxCycles: 1 }, napClock: true,
+    reviewsPerCycle: () => ({ ...quiet([++n < 3 ? limitedCr(at(20)) : bot('coderabbit')]), headEventAt: [at(-5), at(2)][n - 1] ?? null }) })
+  assert.deepEqual(probes(reopened.labels), ['reviews:probe#2', 'reviews:probe#3'])
+  assert.equal(reopened.result.state.reviewClock.eventAt, at(2))
 })
 
 test('two lost hourly races on an unchanged limit are followed by another request and a review', async () => {
@@ -8555,7 +8662,7 @@ test('a finding asking for a test gets the test file in its fix scope, checked b
   // A required path refused withholds the finding rather than fix it without its test.
   const refused = await run({ reviews: { findings: [wants], replies: [], bots: 'reviewed' }, lsFiles: (asked) => asked.filter(f => !f.startsWith('test/')) })
   assert.equal(refused.labels.some(l => l.startsWith('fix:')), false)
-  assert.equal(refused.result.reason, 'fix-verification-failed')
+  assert.equal(refused.result.reason, 'fixes-withheld')
   assert.ok(refused.logs.some(l => /test\/unit-test\/test\/device\/test_hid\.c refused — exists but is not tracked/.test(l)), refused.logs.join('\n'))
   // A spelling canon() would rewrite never reaches the check as the path it would become.
   const respelled = await run({ reviews: { findings: [finding({ fixFiles: ['src/link/../a.c'] })], replies: [], bots: 'reviewed' } })
@@ -8591,7 +8698,8 @@ test('a finding its validator could not scope sends its group through the scope 
   assert.ok(partial.logs.some(l => /scope:src\/a\.c: test\/t\.c refused — exists but is not tracked/.test(l)), partial.logs.join('\n'))
   const { result, labels, logs } = await run({ reviews, scope: [] })
   assert.equal(labels.some(l => l.startsWith('fix:')), false)
-  assert.equal(result.reason, 'fix-verification-failed')
+  assert.equal(result.reason, 'fixes-withheld')
+  assert.deepEqual(result.withheld.map(w => [w.scope, w.why, 'refused' in w]), [['src/a.c', 'no file scope determinable', false]])
   assert.ok(logs.some(l => /fix for src\/a\.c: no file scope determinable — withheld for the caller/.test(l)), logs.join('\n'))
 })
 

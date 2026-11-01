@@ -27,14 +27,14 @@ import prepare  # noqa: E402
 import result  # noqa: E402
 import threads  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import git_env, guard_survivors, make_stub, remotes_checkout  # noqa: E402
+from helpers import git_env, guard_survivors, make_stub, remotes_checkout, tmpdir  # noqa: E402
 
 REPO, PR, ME = 'o/r', 7, 'reviewer'
 REAL_RUN = facts.run
 
 
 def sh(cwd, *argv):
-    return subprocess.run(argv, cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
+    return subprocess.run(argv, cwd=cwd, check=True, capture_output=True, text=True, env=git_env()).stdout.strip()
 
 
 # GitHub's own refusals of a review POST, answered before it creates anything.
@@ -286,6 +286,26 @@ class Case(unittest.TestCase):
                        'replies': []}}
         r.update(over)
         return r
+
+
+
+class CallerGitLocation(unittest.TestCase):
+    def test_a_caller_exporting_git_dir_keeps_its_repository_untouched(self):
+        """A run with GIT_DIR, GIT_WORK_TREE and GIT_INDEX_FILE exported, as a hook or a validator exports them, commits
+        and configures only the fixture's repositories (#337)."""
+        sentinel = tmpdir(self)
+        sh(sentinel, 'git', 'init', '--quiet', '-b', 'main')
+        sh(sentinel, 'git', 'commit', '--quiet', '--allow-empty', '-m', 'sentinel')
+        state = lambda: (sh(sentinel, 'git', 'for-each-ref'), (sentinel / '.git' / 'config').read_bytes(),
+                         sorted(p.name for p in (sentinel / '.git').iterdir()))
+        before = state()
+        env = {**os.environ, 'GIT_DIR': str(sentinel / '.git'), 'GIT_WORK_TREE': str(sentinel),
+               'GIT_INDEX_FILE': str(sentinel / '.git' / 'index')}
+        done = subprocess.run([sys.executable, '-m', 'unittest',
+                               'test_pr_review.Ledger.test_save_refuses_a_word_off_the_scale_before_anything_is_stored'],
+                              cwd=Path(__file__).parent, env=env, capture_output=True, text=True, timeout=300)
+        self.assertEqual(done.returncode, 0, done.stderr[-2000:])
+        self.assertEqual(state(), before)
 
 
 class Prepare(Case):

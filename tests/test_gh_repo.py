@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import sys
@@ -69,6 +70,26 @@ class CheckoutRepoTest(unittest.TestCase):
         self.config(path, 'remote.origin.gh-resolved', 'base')
         self.config(path, 'remote.upstream.gh-resolved', 'base')
         self.assertEqual(self.refusal(path), 'the remotes marked gh-resolved name origin me/fork, upstream o/r')
+
+
+
+class FactsRepoTest(unittest.TestCase):
+    """`facts.py repo`, which fix-issue's triage runs instead of `gh repo view` (#335)."""
+    FACTS = Path(__file__).resolve().parents[1] / 'skills' / 'pr-babysit' / 'scripts' / 'facts.py'
+
+    def run_facts(self, path):
+        done = subprocess.run([sys.executable, str(self.FACTS), 'repo'], cwd=path, capture_output=True, text=True)
+        return done.returncode, json.loads(done.stdout.splitlines()[-1])
+
+    def test_prints_the_one_repository(self):
+        path = remotes_checkout(self, ('origin', 'git@github.com:hathach/tinyusb.git'))
+        self.assertEqual(self.run_facts(path), (0, {'repo': 'hathach/tinyusb'}))
+
+    def test_refuses_with_the_reason_when_the_remotes_name_several(self):
+        path = remotes_checkout(self, ('origin', 'https://github.com/me/fork.git'), ('upstream', 'https://github.com/o/r.git'))
+        code, line = self.run_facts(path)
+        self.assertEqual(code, 2)
+        self.assertIn('the remotes name 2 GitHub repositories', line['error'])
 
 
 if __name__ == '__main__':

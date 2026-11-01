@@ -85,6 +85,21 @@ class BashTest(unittest.TestCase):
             self.assertEqual(windows.bash(), 'bash')
 
 
+class VolumeMountTest(unittest.TestCase):
+    @unittest.skipUnless(NT, 'Windows volumes')
+    def test_the_drive_mounting_a_volume_names_it(self):
+        import ctypes
+        drive = os.path.splitdrive(os.getcwd())[0] + '\\'
+        name = ctypes.create_unicode_buffer(64)
+        self.assertTrue(ctypes.windll.kernel32.GetVolumeNameForVolumeMountPointW(drive, name, 64))
+        self.assertEqual(windows.volume_mount(name.value).upper(), drive.upper())
+        self.assertIsNone(windows.volume_mount('\\\\?\\Volume{00000000-0000-0000-0000-000000000000}\\'))
+
+    def test_elsewhere_nothing_mounts_one(self):
+        with mock.patch.object(windows.os, 'name', 'posix'):
+            self.assertIsNone(windows.volume_mount('\\\\?\\Volume{1}\\'))
+
+
 class KillTreeTest(unittest.TestCase):
     def spawn(self):
         proc = subprocess.Popen(SLEEP)

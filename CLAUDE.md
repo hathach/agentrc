@@ -11,8 +11,9 @@ User-wide rules are in `instructions/user.md`; edit them there, and keep
   `skills/cowork` and `lib/` hold none of the task's commits and no
   uncommitted edits; if a check fails, or no such copy works, report that
   review as pending.
-- Verify every change with `python -X utf8 -m unittest discover -s tests`,
-  which also runs the workflow harnesses under node.
+- Build contract: `BUILD.md`. Verify every change with its command, the
+  whole `python -X utf8 -m unittest discover -s tests` suite with `TMPDIR` on
+  disk, which also runs the workflow harnesses under node.
 - `pr-review` dimensions for this repo (no firmware, so no hardware
   conformance): `correctness: logic, error and edge paths, state machines,
   resource lifetime`; `concurrency: interrupt and thread safety, shared state,

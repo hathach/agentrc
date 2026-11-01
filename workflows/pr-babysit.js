@@ -540,6 +540,16 @@ const REVIEWS = {
     rateLimit: { ...RATE_LIMIT, required: [...RATE_LIMIT.required, 'error'], properties: { ...RATE_LIMIT.properties, error: { type: 'string' } } },
   },
 }
+// harvest.py --probe: a reading's head, head event, bots and fingerprint, no comments; what a quota wait compares (#359).
+const PROBE = withSeal({
+  type: 'object', additionalProperties: false,
+  required: ['headSha', 'observedAt', 'headEventAt', 'headEventEvidence', 'fingerprint', 'bots'],
+  properties: {
+    error: { type: 'string' }, rateLimit: RATE_LIMIT, headSha: { type: 'string' }, observedAt: { type: 'string' },
+    headEventAt: REVIEWS.properties.headEventAt, headEventEvidence: REVIEWS.properties.headEventEvidence,
+    fingerprint: { type: 'string' }, bots: REVIEWS.properties.bots,
+  },
+})
 // code-writer's output contract verbatim: a schema missing a key the role returns rejects a conformant reply.
 const DEV = {
   type: 'object', additionalProperties: false,
@@ -618,6 +628,20 @@ const TRIGGER = withSeal({
   properties: {
     error: { type: 'string' }, outcome: { type: 'string' }, detail: { type: 'string' }, at: { type: 'string' },
     retryAt: { type: ['string', 'null'] }, commentId: { type: ['integer', 'null'] }, phase: { type: ['string', 'null'] },
+  },
+})
+// commits.py cited: whether a rewritten head still holds each commit our fix notes cite (#361).
+const CITED = withSeal({
+  type: 'object', additionalProperties: false, required: ['head', 'cited'],
+  properties: {
+    error: { type: 'string' }, head: { type: 'string' },
+    cited: {
+      type: 'array',
+      items: {
+        type: 'object', additionalProperties: false, required: ['sha', 'reachable', 'replacement'],
+        properties: { sha: { type: 'string' }, reachable: { type: ['boolean', 'null'] }, replacement: { type: ['string', 'null'] } },
+      },
+    },
   },
 })
 const ADOPT_AUDIT = withSeal({
@@ -722,8 +746,10 @@ function shq (s) { return `'${String(s).replace(/'/g, `'\\''`)}'` }
 const relayed = (schema) => {
   const EMPTY = { boolean: 'false', string: "''", array: '[]', integer: '0' }
   const empty = schema.required.map(k => {
-    if (!(schema.properties[k].type in EMPTY)) throw new Error(`relayed: no empty value for ${k}`)
-    return `${k} = ${EMPTY[schema.properties[k].type]}`
+    const type = schema.properties[k].type
+    if (nullable(schema.properties[k])) return `${k} = null`
+    if (!(type in EMPTY)) throw new Error(`relayed: no empty value for ${k}`)
+    return `${k} = ${EMPTY[type]}`
   })
   // #33: a Haiku copy of a line without error once wrote `"error": ,` five times over.
   return 'and return the JSON object on its last stdout line unchanged; a line without error gets no error member. ' +
@@ -1186,7 +1212,19 @@ const acceptedOnly = (c) => nothingToRepair(c) && c.realFailures.length > 0 && !
 const stop = (cycles, reason, extra) => ({ pass: false, cycles, history, reason, ...extra })
 // A PR no longer open ends the launch whatever else is pending: there is nothing left to babysit.
 const prEnded = (cycles, state) => state === 'merged' ? stop(cycles, 'pr-merged') : state === 'closed' ? stop(cycles, 'pr-closed') : stop(cycles, 'pr-state-unread')
-const unverifiedStop = (cycles, unverifiable) => unverifiable ? stop(cycles, 'build-unverifiable', { detail: unverifiable }) : stop(cycles, 'fix-verification-failed')
+// No writer ran: every fix was withheld and nothing is left uncommitted (#369); a dry run stops so too.
+const withheldStop = (cycles, lane, withheld) => {
+  log(`cycle ${cycles}: every ${lane}-lane fix withheld for the caller — nothing left uncommitted`)
+  return stop(cycles, 'fixes-withheld', { withheld })
+}
+// A writer ran, so its edits are left uncommitted; one that died may have edited before it did.
+const unverifiedStop = (cycles, lane, verdict) => {
+  const { unverifiable, withheld, fixes } = verdict
+  log(`cycle ${cycles}: ${lane}-lane fixes left uncommitted for the caller's review — not pushing unverified changes` +
+    (fixes.length ? '' : '; every writer died, so inspect the checkout for any edit they made'))
+  const also = withheld.length ? { withheld } : {}
+  return unverifiable ? stop(cycles, 'build-unverifiable', { detail: unverifiable, ...also }) : stop(cycles, 'fix-verification-failed', also)
+}
 // dryRun: the debt was never postable.
 const unresolvedVerdict = (cycles, outstanding, dryRun = false) =>
   stop(cycles, 'deferred-replies-unresolved', { outstanding, dryRun })
@@ -1420,7 +1458,7 @@ const fixAndVerify = async (workIn, tag, rejectable = false) => {
   for (const w of workIn) {
     const take = (f) => {
       if (!refusal.has(f)) { w.files.add(f); return true }
-      if (w.strict) w.refused = true
+      if (w.strict) (w.refused ||= []).push({ path: f, why: refusal.get(f) })
       log(`scope:${w.key}: ${f} ${w.strict ? 'refused' : 'dropped'} — ${refusal.get(f)}`)
       return false
     }
@@ -1429,7 +1467,10 @@ const fixAndVerify = async (workIn, tag, rejectable = false) => {
     if (w.unresolved) w.unresolved = !resolved
   }
   const unscoped = workIn.filter(w => w.files.size === 0 || w.unresolved || w.refused)
-  for (const w of unscoped) log(`fix for ${w.key}: ${w.refused ? 'a path it needs was refused' : 'no file scope determinable'} — withheld for the caller`)
+  // #369: what no writer got, by finding, so a stop that withheld every fix does not read as an unverified one.
+  const withheld = unscoped.map(w => ({ scope: w.key, ids: w.notes.map(n => n.id),
+    why: w.refused ? 'a path it needs was refused' : 'no file scope determinable', ...(w.refused ? { refused: w.refused } : {}) }))
+  for (const w of withheld) log(`fix for ${w.scope}: ${w.why} — withheld for the caller`)
   // Merge groups sharing a file so no two writers edit one file.
   const work = []
   for (let g of workIn.filter(w => !unscoped.includes(w))) {
@@ -1513,6 +1554,8 @@ const fixAndVerify = async (workIn, tag, rejectable = false) => {
     owned,
     unverifiable,
     rejected,
+    withheld,
+    dispatched: work.length,
   }
 }
 
@@ -1875,9 +1918,11 @@ for (const x of rejudgeArg) {
 }
 // A refutation or an answer by hand settles the comment; a fix note settles only its notes.
 const pay = (commentId, how, digest, sonarNote) => {
-  answeredWith.set(commentId, { how, digest, ...(sonarNote && how !== 'deferral' ? { sonar: sonarNote } : {}) })
-  reanswer.delete(commentId)
   const d = debt.get(commentId)
+  // The repair commit a fix note cites, so a rewrite that replaces it can hand the note back (#361).
+  const sha = how === 'fixNote' && d && d.attempt && d.attempt.repair ? d.attempt.repair.sha : null
+  answeredWith.set(commentId, { how, digest, ...(sha ? { sha } : {}), ...(sonarNote && how !== 'deferral' ? { sonar: sonarNote } : {}) })
+  reanswer.delete(commentId)
   if (!d) return
   d.notes.clear()
   delete d.attempt
@@ -2528,6 +2573,30 @@ const runCycle = async (cycle, entry) => {
   return verdict
 }
 
+// #359: after a cycle that only waited out CodeRabbit's rate limit, a probe of harvest.py stands in for the validator
+// while CodeRabbit stays limited and the review evidence (harvest.py's fingerprint) is unchanged on the same head: the
+// validator would read the same comments. Its last report, as it returned it, goes on with the probe's bots and time.
+let lastRead = null
+let quotaRead = null
+const probeReviews = async (cycle) => {
+  const p = await relayRun(
+    `${IN_CHECKOUT}Editing nothing, run exactly \`${PY} ${HARVEST_SCRIPT} --pr ${args.pr} --repo ${shq(repo)} --reviewers ${reviewers.join(',')}` +
+    `${waitedOn.length ? ` --auto-run ${waitedOn.join(',')}` : ''} --probe\` ` + relayed(PROBE),
+    { label: `reviews:probe#${cycle}`, phase: 'Triage', model: 'haiku', effort: 'low', schema: PROBE },
+  )
+  // GitHub refused the probe: the validator's harvest would be refused too
+  if (p && p.rateLimit) return { rateLimit: { ...p.rateLimit, error: p.error } }
+  const last = JSON.parse(quotaRead.json)
+  const cr = p && !p.error && p.bots.find(b => b.bot === 'coderabbit')
+  const why = !p ? 'the probe died' : p.error ? p.error : p.headSha !== expectedHead ? 'the head moved'
+    : p.fingerprint !== last.fingerprint ? 'the review evidence changed' : !cr || !limited(cr) ? 'CodeRabbit is no longer rate-limited' : null
+  if (why) {
+    log(`cycle ${cycle}: probe — ${why}; validating in full`)
+    return null
+  }
+  log(`cycle ${cycle}: probe — CodeRabbit still rate-limited and nothing new on the head; the validator's last report stands`)
+  return { ...last, observedAt: p.observedAt, headEventAt: p.headEventAt, headEventEvidence: p.headEventEvidence, bots: p.bots }
+}
 const runLanes = async (cycle, entry, lanes) => {
   let ciPromise = null
   const ended = (what) => prGate(lanes, `${cycle}-${what}`)
@@ -2552,11 +2621,13 @@ const runLanes = async (cycle, entry, lanes) => {
         ? 'Our fix notes on these comments are not yet posted; for a stale finding on one, set fixedBy to its sha when that commit\'s change is what fixed the finding: ' +
           `${JSON.stringify(unpostedNotes().map(([commentId, d]) => ({ commentId, sha: d.attempt.repair.sha })))}. ` : '')
     const nobody = { findings: [], replies: [], bots: [] }
+    const probed = reviewLane && reviewers.length > 0 && quotaRead && quotaRead.head === expectedHead ? await probeReviews(cycle) : null
     const r = !reviewLane || reviewers.length === 0
       ? nobody
-      : await agent(reviewPrompt, {
+      : probed || await agent(reviewPrompt, {
         label: `reviews#${cycle}`, phase: 'Triage', agentType: 'pr-review-validator', schema: REVIEWS,
       }).catch(quiet(`cycle ${cycle}: review validator`))
+    lastRead = r && r !== nobody && !r.rateLimit && !r.harvestError ? { head: expectedHead, json: JSON.stringify(r) } : null
     if (lanes.prState) return prEnded(cycle, lanes.prState)
     if (!r) {
       entry.error = 'pr-review-validator died'
@@ -2901,7 +2972,8 @@ const runLanes = async (cycle, entry, lanes) => {
         claim: `${f.file}:${f.line} ${f.claim}`,
       })))
       if (lanes.prState) return prEnded(cycle, lanes.prState)
-      const { ok, fixes, owned, brief, unverifiable, rejected } = await fixAndVerify(work, `${cycle}-review`, true)
+      const verdict = await fixAndVerify(work, `${cycle}-review`, true)
+      const { ok, fixes, owned, brief, rejected } = verdict
       entry.reviewFixes = fixes
       // A rejected finding is held, its evidence on its decision, until the next harvest judges it again; a second rejection is the caller's.
       // Every rejection is held before any stop: an answered comment owes no debt, so only the hold keeps the finding outstanding.
@@ -2919,14 +2991,12 @@ const runLanes = async (cycle, entry, lanes) => {
         log(`cycle ${cycle}: ${detail}`)
         return stop(cycle, 'fix-verification-failed', { detail })
       }
+      if (!verdict.dispatched && verdict.withheld.length) return withheldStop(cycle, 'review', verdict.withheld)
       if (args.autoPush !== true) {
         log('autoPush not set: review-lane fixes left uncommitted (dry run)')
         return stop(cycle, 'dry-run', { dryRun: true })
       }
-      if (!ok) {
-        log(`cycle ${cycle}: review-lane fixes left uncommitted for the caller's review — not pushing unverified changes`)
-        return unverifiedStop(cycle, unverifiable)
-      }
+      if (!ok) return unverifiedStop(cycle, 'review', verdict)
       if (lanes.prState) {
         log(`cycle ${cycle}: review-lane fixes left uncommitted — PR #${args.pr} is ${lanes.prState}`)
         return prEnded(cycle, lanes.prState)
@@ -3025,16 +3095,15 @@ const runLanes = async (cycle, entry, lanes) => {
         id: rf.id, scopeFile: rf.files[0] || rf.check, files: rf.files,
         text: `CI ${rf.check}: ${rf.firstError}`,
       })))
-      const { ok, fixes, owned, brief, unverifiable } = await fixAndVerify(work, `${cycle}-ci`)
+      const verdict = await fixAndVerify(work, `${cycle}-ci`)
+      const { ok, fixes, owned, brief } = verdict
       entry.ciFixes = fixes
+      if (!verdict.dispatched && verdict.withheld.length) return withheldStop(cycle, 'CI', verdict.withheld)
       if (args.autoPush !== true) {
         log('autoPush not set: CI-lane fixes left uncommitted (dry run)')
         return stop(cycle, 'dry-run', { dryRun: true })
       }
-      if (!ok) {
-        log(`cycle ${cycle}: CI-lane fixes left uncommitted for the caller's review — not pushing unverified changes`)
-        return unverifiedStop(cycle, unverifiable)
-      }
+      if (!ok) return unverifiedStop(cycle, 'CI', verdict)
       const ciPush = await commitAndPush(cycle, 'ci', owned, brief)
       if (!ciPush.pass) {
         entry.ciPushFailed = ciPush
@@ -3343,6 +3412,31 @@ const rebased = rebasedHead !== null ? { from: restored.expectedHead, to: rebase
 if (rebased) log(`preflight: re-pinned ${rebased.from.slice(0, 7)} -> ${rebased.to.slice(0, 7)}, the PR history the caller rewrote, unaudited; cycles, answers, decisions, holds and deferrals kept`)
 // A rewrite renamed our repair commits: a pending fix note keeps its body but can no longer be posted on a judgment naming one.
 if (rebased) for (const d of debt.values()) if (d.attempt) delete d.attempt.repair
+// #361: a posted fix note citing a commit the rewrite replaced is handed back as a rejudge is, with the commit now
+// carrying its patch when exactly one does; one whose commit was never recorded (an older state) is handed back too.
+if (rebased) {
+  const notes = [...answeredWith].filter(([id, a]) => a.how === 'fixNote' && !(debt.get(id) && debt.get(id).rejudge))
+  const shas = [...new Set(notes.map(([, a]) => a.sha).filter(Boolean))]
+  const read = shas.length ? await relayOnce(
+    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`${PY} ${COMMITS_SCRIPT} cited ${rebased.to} ${shas.join(' ')}\` ` + relayed(CITED),
+    { label: 'rebase:cited', phase: 'Triage', model: 'haiku', effort: 'low', schema: CITED },
+  ) : null
+  const unread = !shas.length ? null : !read ? 'the relay died' : read.error ? read.error
+    : read.head !== rebased.to || read.cited.map(c => c.sha).join() !== shas.join() ? 'the reading names another head or other commits' : null
+  const at = new Map(read && !unread ? read.cited.map(c => [c.sha, c]) : [])
+  for (const [id, a] of notes) {
+    const c = at.get(a.sha)
+    const why = !a.sha ? 'our fix note names no recorded commit (a state older than #361)'
+      : unread ? `our fix note's commit ${a.sha.slice(0, 7)} could not be checked: ${unread}`
+      : c.reachable === true ? null
+      : c.reachable === null ? `our fix note's commit ${a.sha.slice(0, 7)} is not in the checkout`
+      : `our fix note cites ${a.sha.slice(0, 7)}, which the rewritten head no longer holds` +
+        (c.replacement ? `; ${c.replacement} carries the same patch` : '; no single commit there carries the same patch')
+    if (!why) continue
+    debtEntry(id).rejudge = { reason: `rewrite to ${rebased.to.slice(0, 7)}: ${why}` }
+    log(`preflight: comment ${id} handed back — ${why}`)
+  }
+}
 expectedHead = adoption ? adoption.from : pinned.prHead.trim()
 pin = currentPin
 log(`preflight: ${pinned.prRepo} ${pinned.branch}@${pinned.head.slice(0, 7)} tracking ${pinned.remote}, clean`)
@@ -3413,6 +3507,7 @@ for (let cycle = firstCycle; cyclesUsed < maxCycles; cycle++) {
   }
   // Quota-only waits and a GitHub refusal before any work consume an id, but no repair budget.
   const uncharged = verdict ? verdict.reason === 'github-rate-limited' && !worked(entry) : quotaWait(entry, before)
+  quotaRead = !verdict && uncharged && lastRead && lastRead.head === expectedHead ? lastRead : null
   if (!uncharged) cyclesUsed++
   if (verdict) return finish(verdict)
   const change = yieldOnChange && cyclesUsed < maxCycles ? changeOf(entry, before) : null

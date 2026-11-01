@@ -141,13 +141,18 @@ def proc_start(pid):
         raise Error(f'cannot inspect /proc/{pid}/stat: {e!r}') from None
 
 
+def parent_pid(pid):
+    """pid's parent from /proc/<pid>/stat (Linux); OSError, ValueError or IndexError when it cannot be read."""
+    with open(f'/proc/{pid}/stat', 'rb') as f:
+        return int(f.read().rsplit(b')', 1)[1].split()[1])  # after the parenthesised comm, which may hold anything
+
+
 def ancestors(pid):
     """pid and every process above it (Linux; [pid] elsewhere)."""
     chain = [pid]
     while sys.platform.startswith('linux') and pid > 1:
         try:
-            with open(f'/proc/{pid}/stat') as f:
-                pid = int(f.read().rsplit(')', 1)[1].split()[1])
+            pid = parent_pid(pid)
         except (OSError, ValueError, IndexError):
             break
         chain.append(pid)

@@ -168,3 +168,13 @@ def report(collect, argv, seal=False, limits=False):
         return 2
     print(json.dumps(sealed(facts) if seal else facts))
     return 0
+
+
+def collect(argv):
+    if argv == ['repo']:
+        return {'repo': checkout_repo()}
+    raise Unusable('usage: facts.py repo')
+
+
+if __name__ == '__main__':  # `repo`: the checkout's one repository, for a prompt that must name it (fix-issue's triage)
+    sys.exit(report(collect, sys.argv[1:]))

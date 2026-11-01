@@ -100,6 +100,16 @@ test('a slash-form number reaches triage verbatim, not as JSON', async () => {
   assert.match(url.calls[0].prompt, /issues\/28/)
 })
 
+test('triage names the repository from the remotes script, never gh repo view, unless repo is passed (#335)', async () => {
+  const { calls } = await run()
+  assert.match(calls[0].prompt, /skills\/pr-babysit\/scripts\/facts\.py repo`/)
+  assert.match(calls[0].prompt, /has "error" instead, disposition unclear with needsUser quoting it/)
+  assert.doesNotMatch(calls[0].prompt, /gh repo view/)
+  const named = await run({ args: { target: '28', repo: 'o/r' } })
+  assert.match(named.calls[0].prompt, /repo = "o\/r"\)/)
+  assert.doesNotMatch(named.calls[0].prompt, /facts\.py/)
+})
+
 test('reply, unclear or needsUser stop before Co-plan', async () => {
   for (const [triage, reason] of [
     [{ disposition: 'reply', draftReply: 'Which board?' }, 'not-actionable'],

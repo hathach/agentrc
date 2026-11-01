@@ -66,7 +66,7 @@ STORE = '.blobs'  # the shared blob store, beside session directories named by a
 TEMP = '.tmp-'  # prefix of a blob file still being written
 PRUNE_DAYS, REPORT_DAYS = 30, 90
 SCRIPT = Path(__file__).resolve()
-WORKTREE_CHILDREN = SCRIPT.parents[2] / 'lib' / 'worktree_children.py'
+WORKTREE_CHILDREN = SCRIPT.parents[2] / 'skills' / 'worktree-remove' / 'scripts' / 'worktree_children.py'
 SCHEMA = {
     'type': 'object', 'additionalProperties': False, 'required': ['findings'],
     'properties': {'findings': {'type': 'array', 'items': {
@@ -325,7 +325,7 @@ def snapshot_tree(tree, blobs, previous=None, prefix=''):
 
 def sibling_worktrees(root, listed):
     """`root`'s `<root>--*` siblings that are linked worktrees of any repository, as
-    lib/worktree_children.py finds and defines them; the user rule reserves that prefix for
+    worktree-remove's worktree_children.py finds and defines them; the user rule reserves that prefix for
     them. Those `git worktree list` gave (`listed`) are root's own; any other is checked
     with that module, and one that is neither a pruned leftover nor a linked worktree is an
     error, not out of scope."""
