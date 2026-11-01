@@ -419,19 +419,26 @@ def handoff(p, out):
     while not launch.returncode and not os.path.exists(files['ready']) and time.monotonic() < deadline:
         time.sleep(0.1)
     ready = not launch.returncode and os.path.exists(files['ready'])  # a worker lapsing next deletes it
+    unannounced = None
     if ready:
         with admitting(admission):  # the worker lapses under it; one that lapsed holds the ack or released
-            if admitted(admission, op) and created(files['ack'], 'go'):
-                wc.log(f'handed the removal of {p["root"]} to worker terminal {name} (op {op}): it closes '
-                       + ', '.join(t['address'] for t in p['closing']))
-                print(f'worktree_remove: handed off to hc terminal {name}, which closes '
-                      + ', '.join(wc.label(t) for t in p['closing']) + f', then removes {p["root"]}; the log has '
-                      f'the outcome: {wc.LOG}', flush=True)
-                return 0
+            if admitted(admission, op) and not os.path.exists(files['ack']):
+                try:  # before the go: a handoff nobody heard of closes nothing
+                    wc.log(f'handed the removal of {p["root"]} to worker terminal {name} (op {op}): it closes '
+                           + ', '.join(t['address'] for t in p['closing']))
+                    print(f'worktree_remove: handed off to hc terminal {name}, which closes '
+                          + ', '.join(wc.label(t) for t in p['closing']) + f', then removes {p["root"]}; the log '
+                          f'has the outcome: {wc.LOG}', flush=True)
+                except (OSError, ValueError) as err:  # a closed or broken stdout, an unwritable log
+                    unannounced = err
+                else:
+                    if created(files['ack'], 'go'):
+                        return 0
     created(files['ack'], 'withdrawn')  # a worker starting late reads it and closes nothing
     wc.run([hc, 'kill', name], timeout=wc.HC_TIMEOUT)
     why = (f'`hc run` exit {launch.returncode}: {(launch.stdout + launch.stderr).strip()[:300]}' if launch.returncode
            else f'its worker {name} did not answer in {READY_S} s' if not ready
+           else f'announcing the handoff failed: {unannounced!r}' if unannounced
            else f'its worker {name} gave up waiting')
     try:
         if wc.hc_json(hc, 'get', name) is None:  # no worker can read them now
@@ -483,13 +490,20 @@ def worker(plan_file):
             if time.monotonic() > deadline:
                 raise wc.Keep('terminals still running after their kill: ' + ', '.join(t['address'] for t in left))
             time.sleep(0.2)
-        while True:  # their processes, a descendant still exiting say, get the same END_S
+        def lingering(tree):
             try:
-                wc.check_processes(root)
-                break
+                wc.check_processes(tree)
             except wc.Keep as why:
-                if time.monotonic() > deadline:
-                    raise wc.Keep(f'still running after the kill: {why}')
+                return why
+
+        # their processes, a descendant still exiting say, get the same END_S; past it the cleanup keeps a busy sibling
+        trees = [root, *(Path(path) for path, _, _ in p['siblings'])]
+        while busy := {tree: why for tree in trees if (why := lingering(tree))}:
+            if time.monotonic() > deadline:
+                if root in busy:
+                    raise wc.Keep(f'still running after the kill: {busy[root]}')
+                break
+            trees = list(busy)
             time.sleep(0.2)
         wc.content_check(root)
         if wc.head_branch(root) != (tuple(p['head']) if p['head'] else None):

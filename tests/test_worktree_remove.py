@@ -861,6 +861,40 @@ class Handoff(Rig):
         self.assertLess(log.index('handed the removal'), log.index('closing terminal'))
         self.assertFalse(self.parent.exists())
 
+    def test_a_handoff_it_cannot_announce_closes_nothing(self):
+        hc = self.fake()
+        token = self.token(self.run_remove('--dry-run')[1])
+        log = wr.wc.log
+
+        def unlogged(text):
+            if text.startswith('handed the removal'):
+                raise OSError(28, 'No space left on device')
+            log(text)
+
+        class Broken(io.StringIO):
+            def write(self, text):
+                if 'handed off' in text:
+                    raise BrokenPipeError(32, 'Broken pipe')
+                return super().write(text)
+
+        for broken in ('log', 'stdout'):
+            with self.subTest(broken=broken):
+                out, err = Broken(), io.StringIO()
+                with mock.patch.object(wr.wc, 'log', unlogged if broken == 'log' else log), \
+                        redirect_stdout(out), redirect_stderr(err):
+                    rc = wr.main([str(self.parent), '--proceed', token])
+                hc.join()
+                self.assertEqual(rc, 3, out.getvalue() + err.getvalue())
+                self.assertIn('announcing the handoff failed', err.getvalue())
+                self.assertNotIn('t5', hc.killed())
+                self.assertNotIn('t7', hc.killed())
+                self.assertTrue(self.parent.exists() and self.sib.exists())
+                worker_log = (self.reports / 'log').read_text(encoding='utf-8')
+                self.assertEqual(len(re.findall(r'the handoff was (?:withdrawn|lapsed); closed nothing', worker_log)),
+                                 1 if broken == 'log' else 2)
+                self.assertNotIn('closing terminal', worker_log)
+                self.assertEqual([f.name for f in self.admission().parent.iterdir()], ['admissions.lock'])
+
     def prepared(self, op='abc'):
         """A plan and its admission as a caller leaves them before the worker starts."""
         base = self.admission().parent
@@ -905,14 +939,15 @@ class Handoff(Rig):
         self.assertEqual(hc.killed(), ['t5'])
         self.assertTrue(self.parent.exists())
 
-    def outliving(self, hc, after):
-        """A process working in the worktree that ends `after` s past the caller's terminal's kill, or never for None."""
-        holder = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], cwd=self.parent)
+    def outliving(self, hc, after, cwd=None, terminal='t5'):
+        """A process working in cwd, the worktree by default, that ends `after` s past terminal's kill, or never for
+        None."""
+        holder = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], cwd=cwd or self.parent)
         self.addCleanup(holder.wait)
         self.addCleanup(holder.kill)
         if after is not None:
             def on_kill(address):
-                if address == 't5':
+                if address == terminal:
                     timer = threading.Timer(after, holder.kill)
                     timer.start()
                     self.addCleanup(timer.join)
@@ -938,6 +973,24 @@ class Handoff(Rig):
         log = (self.reports / 'log').read_text(encoding='utf-8')
         self.assertIn('still running after the kill: a process works in it: python', log)
         self.assertIn(f'(pid {holder.pid})', log)
+
+    def test_the_worker_waits_for_a_process_outliving_its_terminal_in_an_approved_sibling(self):
+        hc, files = self.prepared()
+        Path(files['ack']).write_text('go')
+        self.outliving(hc, 2, cwd=self.sib, terminal='t7')
+        self.assertEqual(wr.worker(files['plan']), 0, (self.reports / 'log').read_text(encoding='utf-8'))
+        self.assertFalse(self.parent.exists())
+        self.assertFalse(self.sib.exists())
+
+    def test_a_process_outliving_the_wait_in_a_sibling_keeps_only_the_sibling(self):
+        hc, files = self.prepared()
+        Path(files['ack']).write_text('go')
+        holder = self.outliving(hc, None, cwd=self.sib)
+        self.patch(wr, 'END_S', 0.5)
+        self.assertEqual(wr.worker(files['plan']), 6)
+        self.assertFalse(self.parent.exists())
+        self.assertTrue((self.sib / '.git').exists())
+        self.assertIn(f'(pid {holder.pid})', (self.reports / 'log').read_text(encoding='utf-8'))
 
     def test_a_process_arriving_during_the_workers_content_check_stops_it(self):
         hc, files = self.prepared()

@@ -1,6 +1,7 @@
 import importlib.util
 import io
 import json
+import os
 import re
 import subprocess
 import sys
@@ -99,6 +100,28 @@ class LaunchResultTest(unittest.TestCase):
                               capture_output=True, text=True)
         self.assertEqual((done.returncode, json.loads(done.stdout.splitlines()[-1])['digest']), (0, '0123abcd'), done.stdout)
         self.assertEqual(len(list(self.states.iterdir())), 1, 'no temporary file left behind')
+
+    @unittest.skipIf(os.name == 'nt', 'Windows has no directory fsync')
+    def test_the_kept_state_and_every_directory_entry_made_for_it_are_synced(self):
+        """A host reset after the stateRef is returned keeps the file's name, and the directories mkdir made for it."""
+        real, synced = os.fsync, []
+
+        def fsync(fd):
+            synced.append(os.fstat(fd))
+            real(fd)
+        ids = lambda *paths: {(st.st_dev, st.st_ino) for st in (p if isinstance(p, os.stat_result) else os.stat(p) for p in paths)}
+        states = self.dir / 'state' / 'states'
+        with mock.patch.object(launch_result, 'STATES', states), mock.patch.object(launch_result.os, 'fsync', fsync):
+            rc, s = self.run_it(output())
+        kept = Path(s['stateRef']['outputFile'])
+        self.assertEqual((rc, kept.parent), (0, states))
+        self.assertEqual(ids(*synced), ids(kept, states, states.parent, self.dir), 'the file, its directory and each new entry')
+        (self.dir / 'w.output').unlink()
+        synced.clear()
+        with mock.patch.object(launch_result, 'STATES', states), mock.patch.object(launch_result.os, 'fsync', fsync):
+            self.run_it(output(totalTokens=2))
+        self.assertEqual(ids(*synced), ids(next(p for p in states.iterdir() if p != kept), states),
+                         'an existing directory: only the one holding the new file')
 
     def test_a_state_digest_that_is_not_8_hex_digits_is_never_a_file_name(self):
         rc, s = self.run_it(output(result={'stateDigest': '../escaped'}))

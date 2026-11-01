@@ -443,6 +443,23 @@ def summarize(output, output_path, state_ref=None, tree=None, keys=False):
     return summary
 
 
+def synced_dirs(directory, created):
+    """fsync directory, where a file was renamed in, and the parent of each directory mkdir made from created down: a
+    rename or mkdir is durable only once its parent's entry is. Skipped on Windows, where os.open cannot open a directory."""
+    if os.name == 'nt':
+        return
+    d = directory
+    while True:
+        fd = os.open(d, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        if created is None or d == created.parent:
+            return
+        d = d.parent
+
+
 def kept(output_path, digest):
     """A copy of the output at output_path, holding the state of digest, under STATES: its path once read back whole,
     the same name for the same bytes, so a second reading reuses it."""
@@ -454,6 +471,7 @@ def kept(output_path, digest):
     if not re.fullmatch(r'(?:[A-Za-z]:)?/(?!/)[A-Za-z0-9._ /-]+', path.as_posix()) or '..' in path.as_posix():
         raise Unusable(f'{path.as_posix()} is not a plain absolute path the workflow takes as a stateRef')
     if not (path.is_file() and path.read_bytes() == raw):
+        created = next((d for d in [*reversed(STATES.parents), STATES] if not d.exists()), None)
         STATES.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=STATES, prefix=f'.{path.name}.')
         try:
@@ -465,6 +483,7 @@ def kept(output_path, digest):
         except BaseException:
             Path(tmp).unlink(missing_ok=True)
             raise
+        synced_dirs(STATES, created)
     if ((load_output(path) or {}).get('result') or {}).get('stateDigest') != digest:
         raise Unusable(f'{path} does not read back with state digest {digest}')
     return path.as_posix()
