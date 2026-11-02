@@ -2325,7 +2325,8 @@ class Repair(PostCase):
         self.assertEqual(self.fixed()['status'], 'repaired', 'a rerun returns the receipt')
         self.assertEqual((len(self.gh.notes), len(self.gh.mutations)), (1, mutations), 'and sends nothing')
         row = next(o for o in self.show()['open'] if o['id'] == 'pr7-f1')
-        self.assertEqual(row['repair'], {'head': self.fixed_head, 'resolved': True}, 'the recheck sees the note, so it drafts none')
+        self.assertEqual(row['repair'], {'head': self.fixed_head, 'state': 'published', 'resolved': True},
+                         'the recheck sees the note, so it drafts none')
 
     def test_rows_no_fix_check_verified_on_this_head_refuse_before_anything_is_sent(self):
         for over, why in (({'verdict': 'refuted'}, "not 'verified'"), ({'checkedSha': self.reviewed}, 'not the expected head'),
@@ -2362,7 +2363,7 @@ class Repair(PostCase):
         out = self.fixed()
         self.gh.gh = orig
         self.assertEqual((out['repairs'][0]['state'], out['repairs'][0]['resolve'], out['repairs'][0]['error']),
-                         ('published', 'deferred', 'new replies since the note'))
+                         ('published', 'deferred', 'replied'))
         self.assertFalse(self.thread()['isResolved'])
         self.assertEqual(self.fixed()['repairs'][0]['resolve'], 'deferred', 'never resolved past that reply')
         self.assertEqual(len(self.gh.notes), 1)
@@ -2404,6 +2405,38 @@ class Repair(PostCase):
         led['reviews'][-1]['repairs'][0]['resolve'] = 'sent'
         Path(self.p['ledger']).write_text(json.dumps(led))
         self.assertEqual(self.fixed()['repairs'][0]['error'], 'resolve unconfirmed')
+
+    def after_note(self, act):
+        """Run act right after the fake GitHub takes a note."""
+        orig = self.gh.gh
+        def gh(argv, stdin=None):
+            got = orig(argv, stdin)
+            if argv[0] == 'api' and '--method' in argv and argv[argv.index('--method') + 2].endswith('/replies'):
+                act()
+            return got
+        self.gh.gh = gh
+
+    def test_a_push_after_one_note_stops_the_next_before_it_is_sent(self):
+        self.setUp_second_finding_thread()
+        self.after_note(lambda: setattr(self.gh, 'head', 'f' * 40))
+        out = self.fixed(self.row(), self.row('pr7-f3'))
+        self.assertEqual([(r['findingId'], r['resolve'], r['error']) for r in out['repairs']],
+                         [('pr7-f1', 'deferred', f"the PR head moved to {'f' * 40} since the repair"),
+                          ('pr7-f3', None, f"the PR head moved to {'f' * 40} since the repair")])
+        self.assertEqual(len(self.gh.notes), 1, 'the second note is never sent on a moved head')
+
+    def test_a_root_edited_after_the_note_is_never_resolved(self):
+        self.after_note(lambda: next(c for c in self.gh.inline if c['id'] == self.root).update(body='b may be uninitialised'))
+        out = self.fixed()
+        self.assertEqual((out['status'], out['repairs'][0]['resolve'], out['repairs'][0]['error']), ('partial', 'deferred', 'edited'))
+        self.assertFalse(self.thread()['isResolved'])
+
+    def test_an_unconfirmed_note_is_shown_to_the_recheck_and_held(self):
+        self.gh.note_fails = True
+        self.fixed()
+        row = next(o for o in self.show()['open'] if o['id'] == 'pr7-f1')
+        self.assertEqual(row['repair'], {'head': self.fixed_head, 'state': 'uncertain', 'resolved': False})
+        self.assertEqual(self.show()['heldThreads'], [{'findingId': 'pr7-f1', 'commentId': self.root, 'why': 'repair note unconfirmed'}])
 
     def test_a_pending_review_of_ours_blocks_a_new_note_only(self):
         self.gh.reviews[1] = {'id': 1, 'body': 'by hand', 'state': 'PENDING', 'user': {'login': ME}}

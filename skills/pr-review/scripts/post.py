@@ -579,13 +579,24 @@ def our_pending(repo, pr, led, login):
         r.get('state') == 'PENDING' and (r.get('user') or {}).get('login') == login for r in pages(f'repos/{repo}/pulls/{pr}/reviews'))
 
 
-def note_reply(public, x, login):
+def note_reply(snap, x):
     """Our note as the PR shows it: by its recorded id, else the one reply of ours on its thread carrying its text."""
+    replies = [c for c in snap['comments'] if c['kind'] == 'review' and c['inReplyTo'] == x['commentId']]
     if x['replyId']:
-        return next((c for c in public if c['id'] == x['replyId']), None)
-    hits = [c for c in public if c.get('in_reply_to_id') == x['commentId'] and c['id'] not in x['before']
-            and (c.get('user') or {}).get('login') == login and ledger_digest(c.get('body') or '') == x['digest']]
+        return next((c for c in replies if c['id'] == x['replyId']), None)
+    hits = [c for c in replies if c['id'] not in x['before'] and c['author'] == snap['viewer'] and ledger_digest(c['body']) == x['digest']]
     return hits[0] if len(hits) == 1 else None
+
+
+def unfit(repo, pr, led, f, want, head):
+    """(snapshot, why f's thread may not take a note or a resolve now, or None), read afresh: the root and claim as
+    the fix check judged them (`want`, its claim digest), no pushback since our last answer, the head the repaired one."""
+    snap = snapshot(repo, pr)
+    t = thread_roots(snap).get(f.get('commentId'))
+    at = pr_head(repo, pr)
+    return snap, (holder(led, snap)(f) or ('the claim changed since its fix check' if ledger_digest(claim(f)) != want else
+                                           'no review thread holds the comment' if not t else
+                                           f'the PR head moved to {at} since the repair' if at != head else None))
 
 
 def send_note(repo, pr, x, persist):
@@ -602,25 +613,21 @@ def send_note(repo, pr, x, persist):
         x['error'] = (err or out).strip()[:300] or 'no reply id in the answer'
 
 
-def settle_note(repo, pr, x, head, login, persist):
-    """Read the note back, then resolve its thread while the head is the repaired one and nobody but us or a bot has
-    replied since the thread was read before the note: a note never acknowledges a reply it was not sent against."""
-    public = pages(f'repos/{repo}/pulls/{pr}/comments')
-    c = note_reply(public, x, login)
+def settle_note(repo, pr, led, f, x, head, persist):
+    """Read the note back, then resolve its thread while it still stands as the note answered it: a note never
+    acknowledges a reply, an edit or a push it was not sent against."""
+    snap, why = unfit(repo, pr, led, f, x['claimDigest'], head)
+    c = note_reply(snap, x)
     if x['state'] in ('sent', 'uncertain'):
-        if c and ledger_digest(c.get('body') or '') == x['digest']:
+        if c and ledger_digest(c['body']) == x['digest']:
             x.update(state='published', replyId=c['id'], error=None)
         else:
             x.update(state='uncertain', error=x['error'] if x['error'] != 'sent; not confirmed' else 'not read back on the thread')
             persist()
             return
-    t = {t['commentIds'][0]: t for t in threads(repo, pr) if t['commentIds']}.get(x['commentId'])
-    since = [r for r in public if r.get('in_reply_to_id') == x['commentId'] and r['id'] not in x['before']
-             and r['id'] != x['replyId'] and (r.get('user') or {}).get('login') != login and (r.get('user') or {}).get('type') != 'Bot']
-    now_head = pr_head(repo, pr)
-    why = ('no review thread holds the comment' if not t else None if t['resolved'] else
-           'our note was deleted' if c is None else 'our note was edited' if ledger_digest(c.get('body') or '') != x['digest'] else
-           'new replies since the note' if since else f'the PR head moved to {now_head} since the repair' if now_head != head else None)
+    t = thread_roots(snap).get(x['commentId'])
+    why = (None if t and t['resolved'] else why or ('our note was deleted' if c is None else
+                                                     'our note was edited' if ledger_digest(c['body']) != x['digest'] else None))
     x.update(resolve='observed' if t and t['resolved'] else 'deferred' if why else 'sent', error=why)
     persist()
     if x['resolve'] == 'sent':
@@ -635,43 +642,42 @@ def settle_note(repo, pr, x, head, login, persist):
 
 def fix_notes(repo, pr, led, m, head, persist):
     """A fix note and a resolve on each repaired finding's thread of the last review, which must be the one submitted on
-    the reviewed head; per finding, one record across runs and heads (ledger.py's repairs)."""
+    the reviewed head; per finding, one record across runs and heads (ledger.py's repairs). Each send and each resolve
+    reads the PR afresh first."""
     rev = last(led)
     if not rev or rev['head'] != m['reviewedHead'] or not ((rev.get('receipts') or {}).get('review') or {}).get('submitted'):
         raise Unusable(f"the last review on the PR is {rev and rev['head']}, not one submitted on {m['reviewedHead']}")
     if pr_head(repo, pr) != head:
         raise Unusable(f'the PR head moved to {pr_head(repo, pr)}; the repair was checked on {head}')
-    snap = snapshot(repo, pr)
-    login, hold, roots, fixes = snap['viewer'], holder(led, snap), thread_roots(snap), repairs(led)
-    pending = our_pending(repo, pr, led, login)
-    by_id = {f['id']: f for f in rev['findings']}
-    out = []
+    by_id, fixes, out = {f['id']: f for f in rev['findings']}, repairs(led), []
     for row in m['findings']:
         f = by_id.get(row['id'])
         x = f and fixes.get((f['id'], f.get('commentId')))
         if x and x['resolve'] in ('sent', 'resolved', 'observed'):
-            t = roots.get(x['commentId'])
+            t = thread_roots(snapshot(repo, pr)).get(x['commentId'])
             held = x['resolve'] == 'sent' or not t or not t['resolved']
             out.append({**receipt(x), 'state': 'held', 'error': 'resolve unconfirmed' if x['resolve'] == 'sent' else
                         'reopened after it was resolved'} if held else receipt(x))
             continue
-        elif not x:
+        if not x:
             root = f and f.get('commentId')
             why = ('not a finding of the last review' if not f else 'not standing' if f['status'] not in OPEN else
-                   'no thread: it stands in the review body' if root is None else
-                   hold(f) or ('the claim changed since its fix check' if ledger_digest(claim(f)) != row['claimDigest'] else
-                               'its thread is resolved' if roots[root]['resolved'] else
-                               'a pending review of ours is open on the PR' if pending else None))
+                   'no thread: it stands in the review body' if root is None else None)
+            if not why:
+                snap, why = unfit(repo, pr, led, f, row['claimDigest'], head)
+                t = thread_roots(snap).get(root)
+                why = why or ('its thread is resolved' if t['resolved'] else
+                              'a pending review of ours is open on the PR' if our_pending(repo, pr, led, snap['viewer']) else None)
             if why:
                 out.append({'findingId': row['id'], 'commentId': root, 'state': 'skipped', 'replyId': None, 'resolve': None, 'error': why})
                 continue
             body = fix_body(head, row['note'])
-            x = {'findingId': f['id'], 'commentId': root, 'threadId': roots[root]['threadId'], 'head': head,
+            x = {'findingId': f['id'], 'commentId': root, 'threadId': t['threadId'], 'head': head,
                  'claimDigest': row['claimDigest'], 'evidence': row['evidence'], 'body': body, 'digest': ledger_digest(body),
-                 'before': roots[root]['commentIds'], 'state': 'sent', 'replyId': None, 'resolve': None, 'error': None, 'at': now()}
+                 'before': t['commentIds'], 'state': 'sent', 'replyId': None, 'resolve': None, 'error': None, 'at': now()}
             rev.setdefault('repairs', []).append(x)
             send_note(repo, pr, x, persist)
-        settle_note(repo, pr, x, head, login, persist)
+        settle_note(repo, pr, led, f, x, head, persist)
         out.append(receipt(x))
     done = all(r['resolve'] in ('resolved', 'observed') and r['state'] == 'published' for r in out)
     return {'status': 'repaired' if done else 'partial', 'repairs': out}

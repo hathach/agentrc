@@ -284,9 +284,11 @@ def resolve_due(led, snapshot):
         fix = fixes.get((f['id'], f.get('commentId')))
         if fix and t and fix['state'] == 'published' and fix['replyId'] in t['commentIds']:
             replied[f['id']] = True
-        if fix and t and (fix['resolve'] == 'sent' or fix['resolve'] in ('resolved', 'observed') and not t['resolved']):
-            held.append({'findingId': f['id'], 'commentId': f['commentId'],
-                         'why': 'resolve unconfirmed' if fix['resolve'] == 'sent' else 'reopened after it was resolved'})
+        why = fix and t and ('repair note unconfirmed' if fix['state'] in ('sent', 'uncertain') else
+                             'resolve unconfirmed' if fix['resolve'] == 'sent' else
+                             'reopened after it was resolved' if fix['resolve'] in ('resolved', 'observed') and not t['resolved'] else None)
+        if why:
+            held.append({'findingId': f['id'], 'commentId': f['commentId'], 'why': why})
             continue
         if f['status'] in OPEN or not t or t['resolved']:
             continue
@@ -306,7 +308,7 @@ def open_row(f, due, fixes=None):
             'impact': f.get('impact'), 'severityReason': f.get('severityReason'),
             'why': f['why'], 'commentId': f.get('commentId'), 'defect': f.get('defect'),
             'resolveDue': due.get(f['id']),
-            'repair': fix and fix['state'] == 'published' and {'head': fix['head'], 'resolved': fix['resolve'] in ('resolved', 'observed')} or None}
+            'repair': fix and {'head': fix['head'], 'state': fix['state'], 'resolved': fix['resolve'] in ('resolved', 'observed')}}
 
 
 def show(led, finding=None, draft=False, snapshot=None, pending=False):
@@ -333,6 +335,7 @@ def show(led, finding=None, draft=False, snapshot=None, pending=False):
     if not rev:
         return {'reviews': 0, 'last': None, 'open': []}
     due, held = resolve_due(led, snapshot) if snapshot else ({}, [])
+    fixes = repairs(led)
     snapshots = {}
     answers = [{'findingId': f['id'], 'commentId': f.get('commentId'), 'state': d['state'], 'resolve': d['answer']['resolve'],
                 'body': d['answer']['body'], 'reason': d.get('reason'),
@@ -342,8 +345,7 @@ def show(led, finding=None, draft=False, snapshot=None, pending=False):
         'reviews': len(led['reviews']),
         'last': {k: rev.get(k) for k in ('head', 'mergeBase', 'mode', 'status', 'reviewedAt')} | {'event': rev['verdict']['event']},
         'answers': answers,
-        'open': sorted((open_row(f, due, repairs(led)) for f in rev.get('findings', []) if f['status'] in OPEN or f['id'] in due),
-                       key=by_severity),
+        'open': sorted((open_row(f, due, fixes) for f in rev.get('findings', []) if f['status'] in OPEN or f['id'] in due), key=by_severity),
         **({'heldThreads': held} if snapshot else {}),
     }
 
