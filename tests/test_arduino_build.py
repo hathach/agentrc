@@ -12,6 +12,7 @@ if os.name == 'nt':
 import contextlib
 import io
 import json
+import shutil
 import struct
 import sys
 from pathlib import Path
@@ -590,6 +591,15 @@ class Record(RecordCase):
         self.assertEqual(list(ident['contract']), ['contract/check.py'])
         self.assertEqual(sorted(ident['agentrc']['files']), [ab.SELF, 'skills/hil/scripts/hil_lock.py'])
 
+    def test_record_refuses_two_sketches_of_one_basename(self):
+        row = self.samd_row()
+        args = mock.Mock(experimental=False, build_property=[], record=str(self.root / 'build/r.json'))
+        ident = {'head': 'abc', 'dirty': False, 'diffSha256': 'd', 'status': ''}
+        with mock.patch.object(ab, 'source_identity', return_value=(ident, '')):
+            _, err = ab.make_record(args, 'rig_jlink', [row, {**row, 'example': 'examples/Other/echo'}], ident, '',
+                                    self.roster, {})
+        self.assertEqual(err, 'examples/Other/echo: another sketch of this record has its basename')
+
     def test_elf_flash_over_the_bootloader_refused(self):
         self.flasher({'name': 'openocd'})
         _, err = self.record(self.samd_row())
@@ -799,6 +809,19 @@ class Usage(Lib):
             code, out = self.run_main(argv)
             self.assertEqual(code, 2, argv)
             self.assertIn(why, out['error'])
+
+
+    def test_sketches_sharing_a_basename_on_one_board_are_refused_before_compiling(self):
+        shutil.copytree(self.root / 'examples/Basic/echo', self.root / 'examples/Other/echo')
+        self.patch(ab, 'source_identity', lambda: ({'head': 'abc', 'dirty': False, 'status': ''}, ''))
+        self.patch(ab, 'prepared_dependencies', lambda: {})
+        self.patch(ab.subprocess, 'run', mock.Mock(side_effect=AssertionError('compiled')))
+        code, out = self.run_main(['--board', 'dev_a', '--example', 'examples/Basic/echo',
+                                   '--example', 'examples/Other/echo'])
+        self.assertEqual(code, 2)
+        self.assertIn('dev_a: examples/Basic/echo and examples/Other/echo', out['error'])
+        self.assertEqual(ab.basename_clashes({'dev_a': ['examples/Basic/echo'], 'dev_b': ['examples/Other/echo']}),
+                         [])   # one basename per board's build dir
 
 
 if __name__ == '__main__':

@@ -569,7 +569,23 @@ def compile_sketch(board, example, build_dir, properties, prepared):
     return row
 
 
+def basename_clashes(plan):
+    """Pairs of one board's sketches sharing a basename: both would build into, and the HIL record key on,
+    <root>/<board>/<basename>, the second replacing the first."""
+    clashes = []
+    for board, exs in plan.items():
+        seen = {}
+        for e in exs:
+            first = seen.setdefault(Path(e).name, e)
+            if first != e:
+                clashes.append(f'{board}: {first} and {e}')
+    return clashes
+
+
 def build_all(jobs, plan, root, properties, prepared):
+    clashes = basename_clashes(plan)
+    if clashes:
+        fail(f'sketches sharing a basename would build into one dir: {"; ".join(clashes)}; rename one')
     rows = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
         futures = [pool.submit(compile_sketch, b, e, root / b / Path(e).name, properties, prepared)
@@ -798,6 +814,8 @@ def make_record(args, board, rows, before, diff, roster_path, prepared):
             extra, why = P.record_check(board, {**row, 'loadSpans': spans}, build_dir, entry)
             if why:
                 return None, f'{row["example"]}: {why}'
+        if Path(row['example']).name in sketches:
+            return None, f'{row["example"]}: another sketch of this record has its basename'
         sketches[Path(row['example']).name] = {
             'example': row['example'], 'buildDir': row['buildDir'], 'elf': rel(elf),
             'hex': rel(hexfile) if hexfile else None, 'image': image, 'loadSpans': [[s, e] for s, e in spans],
