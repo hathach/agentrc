@@ -2183,6 +2183,26 @@ class Fixable(PostCase):
         got = self.fixable(head)
         self.assertEqual(([f['id'] for f in got['fix']], got['held']), (['pr7-f1'], []))
 
+    def test_a_carried_finding_the_human_edited_before_submitting_offers_the_published_text(self):
+        # The state post.submitted leaves when the human edited the pending comment before submitting it.
+        edited = 'b is initialised only on the error path'
+        next(c for c in self.gh.inline if c['id'] == self.root)['body'] = edited
+        led = json.loads(Path(self.p['ledger']).read_text())
+        led['reviews'][-1]['findings'][0]['published'] = edited
+        Path(self.p['ledger']).write_text(json.dumps(led))
+        self.commit('src/core/c.c', 'int c;\n', 'c')
+        head = self.push_pr()
+        p = self.prepare()
+        carried = [{'id': 'pr7-f1', 'file': 'src/core/a.c', 'line': 21, 'why': 'b is never initialised', 'severity': 'high',
+                    'dimension': 'correctness', 'status': 'open'}]
+        self.save(self.result_for(p, findings=carried, draft={'event': 'REQUEST_CHANGES', 'body': 'Still open.', 'comments': [], 'replies': []},
+                                  verdict={'event': 'REQUEST_CHANGES', 'reasons': ['r']}))
+        self.head = head
+        self.assertEqual(self.post('--auto')['status'], 'posted')
+        got = self.fixable(head)
+        row = next(f for f in got['fix'] if f['id'] == 'pr7-f1')
+        self.assertEqual((got['held'], row['why'], row.get('published')), ([], 'b is never initialised', edited))
+
     def test_it_refuses_a_head_that_is_not_the_last_submitted_review(self):
         with self.assertRaisesRegex(facts.Unusable, 'not one submitted on'):
             self.fixable(self.base)

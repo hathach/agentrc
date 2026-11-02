@@ -480,7 +480,7 @@ def fixable(led, snapshot, head):
             if why:
                 held.append({'findingId': f['id'], 'commentId': f.get('commentId'), 'why': why})
             else:
-                fix.append(open_row(f, {}))
+                fix.append({**open_row(f, {}), 'published': f.get('published')})  # the text the PR shows, as the human edited it
     return {'fix': sorted(fix, key=by_severity), 'held': held,
             'autoPost': not any(h['why'] in ('unmapped', 'deleted', 'edited') for h in held)}
 

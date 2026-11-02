@@ -183,9 +183,10 @@ sequence:
    2. `threads.py`, then `ledger.py show --fixable` on the reviewed head, and
       `prepare.py --check` on it: a moved head ends the repair ("head moved
       before repair"). Chief's writer path fixes the `fix` findings its fix
-      policy selects, never a `held` one; the repairs get chief's commit check,
-      simplification pass, validation and a whole-task review from the reviewed
-      head to the repair tip.
+      policy selects, never a `held` one, each by its `published` text where
+      set (the human's edit) over its draft `why`; the repairs get chief's
+      commit check, simplification pass, validation and a whole-task review
+      from the reviewed head to the repair tip.
    3. pr-babysit from the review worktree, its branch bound by prepare, with
       `adoptHead` the repair tip when there are repairs (none otherwise: it
       still answers the bots), `autoPush`, `markSonar` and the repository's
