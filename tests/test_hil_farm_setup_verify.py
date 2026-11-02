@@ -5,7 +5,6 @@ import unittest
 if os.name == 'nt':
     raise unittest.SkipTest('the HIL farm setup runs on Debian: bash, fcntl, Linux paths')
 
-import getpass
 import shutil
 import subprocess
 import tempfile
@@ -198,18 +197,6 @@ class TestVerify(unittest.TestCase):
         self.assertIn('FAIL  tinyusb runner root sticky root:ghrunner 1770', out)
         self.assertIn('FAIL  tinyuf2 runner _work ghrunner-tinyuf2:ghrunner-tinyuf2 0750', out)
         self.assertNotIn('runner service active', self.verify('--maintenance').stdout)
-
-    @unittest.skipIf(os.geteuid() == 0, "root owns this test's runner tree, so root cannot be the admin who passes")
-    def test_nothing_in_a_runner_tree_may_be_the_admins(self):
-        d = self.register('tinyusb')
-        for admin, want in (('root', 'ok   '), (getpass.getuser(), 'FAIL ')):
-            with self.subTest(admin=admin):
-                self.host = self.tmp / f'{admin}.toml'
-                self.host.write_text((HOSTS / 'dedicated.toml').read_text()
-                                     .replace('admin = "admin"', f'admin = "{admin}"'))
-                out = self.verify().stdout
-                self.assertIn(f'{want} tinyusb runner _work and _diag hold nothing of {admin}\'s', out)
-        self.assertRegex(out, f'hold nothing of {getpass.getuser()}\'s: {d}/_(work|diag)')
 
     def test_a_runner_unit_must_keep_umask_0022(self):
         self.register('tinyusb')

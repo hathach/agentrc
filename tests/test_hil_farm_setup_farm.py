@@ -757,8 +757,7 @@ class TestInstallHost(unittest.TestCase):
         self.installed = self.tmp / 'etc' / 'host.toml'
         self.home = self.tmp / 'opt'
         self.home.mkdir()
-        for k, v in (('INSTALLED_HOST', self.installed), ('FARM_HOME', self.home),
-                     ('OLD_MARKER', self.home / 'profile')):
+        for k, v in (('INSTALLED_HOST', self.installed), ('FARM_HOME', self.home)):
             p = mock.patch.object(farm, k, v)
             p.start()
             self.addCleanup(p.stop)
@@ -820,16 +819,9 @@ class TestInstallHost(unittest.TestCase):
             self.install(HOSTS / 'dedicated.toml')
         self.assertFalse(self.installed.exists())
 
-    def test_an_install_from_before_host_files_keeps_its_profile(self):
-        (self.home / 'profile').write_text('lab\n')
-        with self.assertRaisesRegex(farm.FarmError, 'installed as profile lab; .*shared.toml is for shared'):
-            self.install(HOSTS / 'shared.toml')
-        self.assertTrue(self.install(HOSTS / 'dedicated.toml'))
-        self.assertFalse((self.home / 'profile').exists())
-
-    def test_an_install_without_marker_needs_confirmation(self):
+    def test_an_install_without_a_host_file_refuses(self):
         (self.home / 'farm.toml').write_text('')
-        with self.assertRaisesRegex(farm.FarmError, 'no host file and no profile marker'):
+        with self.assertRaisesRegex(farm.FarmError, 'no host file .*takes a reinstall'):
             self.install(HOSTS / 'dedicated.toml')
         self.assertFalse(self.installed.exists())
         self.assertEqual(self.guarded, [])

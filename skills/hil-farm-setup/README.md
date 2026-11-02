@@ -147,12 +147,6 @@ Install only after the owner agreed, with the host's earlier runner service, if 
 
 The actions runner is installed once into each runner root and not updated this way.
 
-An install from before host files (`ci` and `hfp` today) has no `SOURCE` and names its host in
-`/opt/hil-farm/profile`; its first `update --host` checks that name against the file and replaces the marker with
-`/etc/hil-farm/host.toml`. Its runner units had `UMask=0002`: that update rewrites them and drops the group write
-they left in `_work` and `_diag`, but what the admin already created there stays; `verify.sh --maintenance` names it,
-so remove that before starting the runners.
-
 Before a reinstall or update, sync with tinyusb: the `agentrc` tool's commit follows its `lib/agentrc` pin, and
 `scripts/udev/88-tinyusb.rules` is its file with the `adm` group as `hil` and without its catch-all hidraw rule, which
 gives every local user every HID device, a shared host owner's too. Likewise `scripts/udev/*-tinyuf2-*.rules`
