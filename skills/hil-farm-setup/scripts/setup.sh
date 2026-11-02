@@ -13,6 +13,7 @@
 # them. install and update refuse while a runner service runs; stop it when idle and start it after verify.sh.
 # Run as root from a root-owned checkout with no uncommitted changes.
 set -euo pipefail
+umask 022  # whatever sudo passed: the runners read and traverse what root creates (tools, .env, profile.d)
 
 B=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 OS_RELEASE=/etc/os-release
@@ -272,9 +273,12 @@ install_rules() {
 }
 
 # devices already attached keep their old group until a change event: a host with no reboot after setup (a shared host)
+# block: USB drives only (TinyUF2's), so no system disk is re-probed; a property match would AND with the others
 apply_rules() {
   timeout 120 udevadm trigger --settle --action=change --subsystem-match=usb --subsystem-match=hidraw \
-    --subsystem-match=tty --subsystem-match=usbmon || die "udev did not apply the rules to the attached devices"
+    --subsystem-match=tty --subsystem-match=usbmon \
+    && timeout 120 udevadm trigger --settle --action=change --subsystem-match=block --property-match=ID_BUS=usb \
+    || die "udev did not apply the rules to the attached devices"
 }
 
 setup_rig() {

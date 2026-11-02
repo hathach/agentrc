@@ -46,6 +46,13 @@ def tar_bytes(members):
     return buf.getvalue()
 
 
+def path_safe_tmp():
+    """A temp base the writable-path check accepts, else None (the tests then fail on it): TMPDIR may sit
+    under a group-writable home dir (umask 002), which the check rightly flags; /tmp is root's sticky dir."""
+    with mock.patch.object(farm, 'TRUSTED_UIDS', {0, os.getuid()}):
+        return next((d for d in (tempfile.gettempdir(), '/tmp') if farm.writable_by_others(d) is None), None)
+
+
 def tool_script(version):
     return f'#!/bin/sh\necho "tool {version}"\n'.encode()
 
@@ -53,7 +60,7 @@ def tool_script(version):
 class FarmCase(unittest.TestCase):
     def setUp(self):
         self.addCleanup(os.umask, os.umask(0o022))  # root's under sudo; a 0775 dir would fail verify's path check
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = Path(tempfile.mkdtemp(dir=path_safe_tmp()))
         self.bin = self.tmp / 'usr/local/bin'
         self.bin.mkdir(parents=True)
         self.remote = {}  # url -> bytes
@@ -310,6 +317,46 @@ class TestRegressions(FarmCase):
                 farm.install_tool('v', t, False)
         self.assertFalse((self.bin / 'py').exists())
         self.assertIsNone(farm.read_receipt('v'))
+
+    def pip_build(self, t):
+        """The argv of each command build() runs for pip tool t, and lock_matches' interpreter call."""
+        (self.tmp / 'checkout/x.lock').write_text('foo==1.0 --hash=sha256:' + 'a' * 64 + '\n')
+        dest = self.tmp / 'venv'
+        dest.mkdir()
+        calls = []
+        with mock.patch.object(farm, 'run', side_effect=lambda a, **k: calls.append(a) or ''):
+            farm.build('v', t, dest, self.tmp / 'work')
+        with mock.patch.object(farm.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)) as r:
+            farm.lock_matches(t, dest)
+        return calls, r.call_args.args[0], str(dest / 'bin/python3')
+
+    def test_pip_runs_every_python_isolated_from_the_callers_cwd(self):
+        (venv, download, install), check, py = self.pip_build({'kind': 'pip', 'lock': 'x.lock'})
+        self.assertEqual(venv[:4], [sys.executable, '-I', '-m', 'venv'])
+        for argv in (download, install):
+            self.assertEqual(argv[:4], [py, '-I', '-m', 'pip'])
+        self.assertEqual(check[:3], [py, '-I', '-c'])
+
+    def test_no_build_isolation_covers_the_download_too(self):
+        for no_iso in (True, False):
+            with self.subTest(no_build_isolation=no_iso):
+                shutil.rmtree(self.tmp / 'venv', ignore_errors=True)
+                (_, download, install), _, _ = self.pip_build(
+                    {'kind': 'pip', 'lock': 'x.lock', 'no_build_isolation': no_iso})
+                for argv in (download, install):
+                    self.assertEqual('--no-build-isolation' in argv, no_iso)
+
+    def test_a_restrictive_umask_still_publishes_traversable_tools(self):
+        os.umask(0o077)   # FarmCase restores the original
+        link = self.bin / 'sub/tool'
+        t = self.release('1.0', links={str(link): 't/bin/tool'}, check=[str(link)])
+        with mock.patch.object(farm.os, 'geteuid', return_value=0), \
+                mock.patch.dict(os.environ, {'HIL_FARM_LOCK_HELD': '1'}), farm.root_lock():
+            farm.install_tool('t', t, False)
+        tools = self.tmp / 'opt/hil-farm/tools'
+        for d in (tools.parent, tools, tools / 't', link.parent):
+            self.assertEqual(oct(d.stat().st_mode & 0o777), '0o755', d)
+        self.assertEqual(os.umask(0o077), 0o077, 'root_lock restores the caller\'s umask')
 
     def test_unmanaged_symlink_refused(self):
         (self.bin / 'tool').symlink_to('/bin/true')

@@ -403,16 +403,16 @@ def build(name, t, dest, work):
             run(['make', '-s', 'install', 'INFO_DEPS='], cwd=src)
     elif kind == 'pip':
         os.rmdir(dest)  # venv creates it
-        venv = [sys.executable, '-m', 'venv']
+        venv = [sys.executable, '-I', '-m', 'venv']  # -I: no module from the caller's cwd runs as root
         if t.get('system_site_packages'):
             venv.append('--system-site-packages')
         run([*venv, str(dest)])
-        pip = [str(dest / 'bin' / 'python3'), '-m', 'pip', '-q']
+        pip = [str(dest / 'bin' / 'python3'), '-I', '-m', 'pip', '-q']
         lock = str(inside(HERE, t['lock']))
-        run([*pip, 'download', '--no-deps', '--require-hashes', '-r', lock, '--dest', str(work / 'wheels')])
-        opts = ['--no-index', '--find-links', str(work / 'wheels'), '--require-hashes']
-        if t.get('no_build_isolation'):
-            opts.append('--no-build-isolation')
+        # download builds an sdist's metadata too: isolated, it would fetch and run unpinned build requirements
+        iso = ['--no-build-isolation'] if t.get('no_build_isolation') else []
+        run([*pip, 'download', '--no-deps', '--require-hashes', *iso, '-r', lock, '--dest', str(work / 'wheels')])
+        opts = ['--no-index', '--find-links', str(work / 'wheels'), '--require-hashes', *iso]
         if t.get('system_site_packages'):
             opts.append('--ignore-installed')  # the lock's versions, never Debian's
         run([*pip, 'install', *opts, '-r', lock])
@@ -500,7 +500,7 @@ def lock_matches(t, dest):
             'bad = [n for n, v in json.loads(sys.argv[1]) if m.version(n) != v]\n'
             'sys.exit(bool(bad))')
     try:
-        return subprocess.run([str(dest / 'bin' / 'python3'), '-c', code, json.dumps(pins)],
+        return subprocess.run([str(dest / 'bin' / 'python3'), '-I', '-c', code, json.dumps(pins)],
                               capture_output=True).returncode == 0
     except OSError:
         return False
@@ -692,13 +692,16 @@ def take_lock():
 
 @contextlib.contextmanager
 def root_lock():
-    """Root, holding the setup lock unless setup.sh holds it."""
+    """Root, holding the setup lock unless setup.sh holds it, with umask 022 whatever sudo passed: the runners must
+    read and traverse what root creates."""
     if os.geteuid() != 0:
         raise FarmError('run as root')
     lock = take_lock()
+    umask = os.umask(0o022)
     try:
         yield
     finally:
+        os.umask(umask)
         if lock:
             lock.close()
 

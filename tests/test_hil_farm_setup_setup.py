@@ -587,16 +587,23 @@ class TestSetup(unittest.TestCase):
 
     def test_attached_devices_get_the_rules_or_setup_fails(self):
         self.stub('timeout', 'shift; exec "$@"')
-        self.stub('udevadm', 'echo "$*" > "$0.log"')
+        self.stub('udevadm', 'echo "$*" >> "$0.log"')
         self.sourced('apply_rules')
-        self.assertEqual((self.stubs / 'udevadm.log').read_text(),
-                         'trigger --settle --action=change --subsystem-match=usb --subsystem-match=hidraw '
-                         '--subsystem-match=tty --subsystem-match=usbmon\n')
-        self.stub('udevadm', 'exit 1')
-        r = self.run_sourced('apply_rules; echo after')
-        self.assertNotEqual(r.returncode, 0)
-        self.assertNotIn('after', r.stdout)
-        self.assertIn('udev did not apply the rules to the attached devices', r.stderr)
+        self.assertEqual((self.stubs / 'udevadm.log').read_text().splitlines(), [
+            'trigger --settle --action=change --subsystem-match=usb --subsystem-match=hidraw '
+            '--subsystem-match=tty --subsystem-match=usbmon',
+            'trigger --settle --action=change --subsystem-match=block --property-match=ID_BUS=usb'])
+        for fail in ('exit 1', 'case "$*" in *block*) exit 1;; esac'):
+            with self.subTest(fail=fail):
+                self.stub('udevadm', fail)
+                r = self.run_sourced('apply_rules; echo after')
+                self.assertNotEqual(r.returncode, 0)
+                self.assertNotIn('after', r.stdout)
+                self.assertIn('udev did not apply the rules to the attached devices', r.stderr)
+
+    def test_root_creates_what_the_runners_can_read_whatever_umask_sudo_passed(self):
+        self.addCleanup(os.umask, os.umask(0o077))
+        self.assertEqual(self.sourced('umask'), '0022\n')
 
     def test_runner_conf(self):
         out = self.sourced('for n in tinyusb tinyuf2; do runner_conf $n; '
