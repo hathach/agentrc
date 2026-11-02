@@ -538,8 +538,8 @@ class TestSetup(unittest.TestCase):
         self.use_host(host)
         setup = self.dir / 'setup.sh'
         setup.write_text(setup.read_text().replace('/etc/apt/apt.conf.d', str(self.tmp)))
-        for c in ('apt-get', 'debconf-set-selections'):
-            self.stub(c, ':')
+        self.stub('apt-get', ':')
+        self.stub('debconf-set-selections', 'cat >/dev/null')  # drain stdin: an unread pipe is SIGPIPE under pipefail
         self.sourced('install_packages')
         return (self.tmp / '20auto-upgrades').exists()
 
