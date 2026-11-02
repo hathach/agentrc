@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Pin a PR for pr-review and check a pinned one has not moved.
 
-  prepare.py --pr N [--repo OWNER/NAME] [--max-groups 6] [--full]   # from the checkout's top level
+  prepare.py --pr N [--repo OWNER/NAME] [--max-groups 6] [--full] [--auto-fix]   # from the checkout's top level
   prepare.py --check --pr N --expected-head SHA [--repo OWNER/NAME]  # from the review worktree top level
   prepare.py --release --pr N --token T [--repo OWNER/NAME]           # from any worktree of the repository
 
@@ -33,6 +33,13 @@ their diff before building anything. `ci` summarises the head's checks:
 `unobserved` with none, `red`, `pending` (action_required included), `green`,
 `unknown` for a state none of these covers.
 
+--auto-fix adds `repair`: whether an auto-fix run's repairs can be pushed to the PR's head branch (headRepo,
+headBranch), {state, why}: `available` with push access to the head repository, or for a cross-repository PR allowing
+edits from maintainers, push access to the base; `unavailable` when this account has neither; `unknown` when gh cannot
+tell. Only when available, it binds the review branch to the head branch through a remote of the head repository
+(head_remote, bind_upstream) and adds {remote, addedRemote}; a binding it cannot make refuses. Without --auto-fix
+nothing of this runs.
+
 --release unlocks the pr-review-<N> sibling whose lock carries the token, once
 the run that took it has ended; nothing locked by it is a no-op, and while
 another run of the PR holds its tree the call is refused.
@@ -60,7 +67,7 @@ from ledger import ONLINE, last, ledger_dir, ledger_path, load, locked, publicat
 from post import sync  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'pr-babysit' / 'scripts'))
-from facts import FULL_SHA, Parser, Unusable, checkout_top, git, report, run  # noqa: E402
+from facts import FULL_SHA, HOST, Parser, Unusable, checkout_repo, checkout_top, git, github_repo, report, run  # noqa: E402
 
 # Paths that run when a PR is built or tested; their diff is read before any build.
 TOOLING = re.compile(r'(^|/)(CMakeLists\.txt|Makefile|[^/]+\.(cmake|mk|py|sh|ps1|bat))$'
@@ -69,6 +76,7 @@ PASSED = {'SUCCESS', 'SKIPPED', 'NEUTRAL'}
 PENDING = {'PENDING', 'QUEUED', 'IN_PROGRESS', 'WAITING', 'REQUESTED', 'EXPECTED', 'ACTION_REQUIRED'}
 FAILED = {'FAILURE', 'ERROR', 'TIMED_OUT', 'STARTUP_FAILURE', 'CANCELLED', 'STALE'}
 RUN_LOCK = re.compile(r'pr-review (\d+) running ([0-9a-f]+)')
+WRITE = ('admin', 'maintain', 'push')
 
 
 def gh_json(*argv, ok=(0,)):
@@ -80,8 +88,139 @@ def gh_json(*argv, ok=(0,)):
 
 
 def pr_view(repo, pr):
-    fields = 'number,url,title,state,author,headRefOid,headRefName,headRepository,headRepositoryOwner,isCrossRepository,baseRefName'
+    fields = ('number,url,title,state,author,headRefOid,headRefName,headRepository,headRepositoryOwner,isCrossRepository,'
+              'maintainerCanModify,baseRefName')
     return gh_json('pr', 'view', str(pr), '--repo', repo, '--json', fields)[1]
+
+
+def config(key):
+    return run('git', 'config', '--get', key, ok=(0, 1))[1].strip()
+
+
+def can_write(repo):
+    """(True or False, '') from this account's permissions on repo, (None, why) when gh cannot tell."""
+    try:
+        perms = gh_json('api', f'repos/{repo}', '--jq', '.permissions')[1]
+    except Unusable as e:
+        return None, str(e)
+    if isinstance(perms, dict) and any(perms.get(k) is True for k in WRITE):
+        return True, ''
+    # push is false for every role without write access; anything less is no answer.
+    if isinstance(perms, dict) and perms.get('push') is False:
+        return False, ''
+    return None, f'gh api repos/{repo} shows no push permission for this account: {json.dumps(perms)}'
+
+
+def push_access(repo, head_repo, info):
+    """(available|unavailable|unknown, why) for pushing to the PR's head branch: push access to its repository, or a
+    cross-repository PR allowing edits from maintainers and push access to the base."""
+    direct, why = can_write(head_repo)
+    if direct:
+        return 'available', f'push access to {head_repo}'
+    if not info.get('isCrossRepository') or not info.get('maintainerCanModify'):
+        if direct is None:
+            return 'unknown', why
+        allow = '' if not info.get('isCrossRepository') else ', and the PR does not allow edits from maintainers'
+        return 'unavailable', f'no push access to {head_repo}{allow}'
+    base, why_base = can_write(repo)
+    if base:
+        return 'available', f'the PR allows edits from maintainers, and push access to {repo}'
+    if direct is None or base is None:
+        return 'unknown', '; '.join(w for w in (why, why_base) if w)
+    return 'unavailable', f'no push access to {head_repo} or {repo}'
+
+
+def url_like(spelled, repo):
+    """repo's github.com URL spelled as `spelled` is: https, ssh:// or scp-like."""
+    if spelled.startswith('https://'):
+        return f'https://{HOST}/{repo}.git'
+    if spelled.startswith('ssh://'):
+        return f'ssh://git@{HOST}/{repo}.git'
+    if github_repo(spelled):
+        return f'git@{HOST}:{repo}.git'
+    return None
+
+
+def head_remote(repo, head_repo, branch):
+    """(name, added) of the remote auto-fix pushes through: the one whose every fetch and push URL is head_repo, else
+    one added as pr-head-<owner>, spelled like the base remote; gh's default is pinned to the base first, as `gh repo
+    set-default` would, so scripts reading the checkout's one repository still read the base."""
+    names = git('remote').split()
+    urls = lambda n: git('remote', 'get-url', '--all', n).splitlines() + git('remote', 'get-url', '--push', '--all', n).splitlines()  # noqa: E731
+    found = [n for n in names if all(github_repo(u).lower() == head_repo.lower() for u in urls(n))]
+    if len(found) > 1:
+        tracked = config(f'branch.{branch}.remote')
+        if tracked not in found:
+            raise Unusable(f"remotes {', '.join(found)} all name {head_repo}: remove the ones you do not need")
+        return tracked, False
+    if found:
+        return found[0], False
+    name = f"pr-head-{head_repo.split('/')[0]}"
+    if name in names:
+        raise Unusable(f'remote {name} exists and does not name only {head_repo}: fix or remove it by hand')
+    base = remote_for(repo)
+    spelled = config(f'remote.{base}.url')
+    url = url_like(spelled, head_repo)
+    if not url:
+        raise Unusable(f'no remote names {head_repo}, and the {base} remote URL {spelled!r} is not a github.com one to '
+                       'spell it like: add a remote for it by hand')
+    if not run('git', 'config', '--get-regexp', r'^remote\..+\.gh-resolved$', ok=(0, 1))[1].strip():
+        git('config', f'remote.{base}.gh-resolved', 'base')
+    git('remote', 'add', name, url)
+    try:
+        reads = checkout_repo()
+    except Unusable as e:
+        reads = str(e)
+    if reads.lower() != repo.lower():
+        # Removed again, so a rerun adds and checks it anew rather than finding it.
+        git('remote', 'remove', name)
+        raise Unusable(f'with remote {name} added the checkout no longer reads as {repo} ({reads}): add a remote for {head_repo} by hand')
+    return name, True
+
+
+def fetch_head_branch(remote, branch):
+    git('fetch', '--quiet', remote, f'+refs/heads/{branch}:refs/remotes/{remote}/{branch}')
+
+
+def bind_upstream(branch, remote, head_branch, head):
+    """Make the review branch track the PR's head branch, as pr-babysit's preflight requires, once that branch is
+    fetched at head; another upstream already set is refused, never replaced."""
+    want, have = (remote, f'refs/heads/{head_branch}'), (config(f'branch.{branch}.remote'), config(f'branch.{branch}.merge'))
+    if any(have) and have != want:
+        raise Unusable(f'branch {branch} already tracks {have[0]} {have[1]}, not {remote} {want[1]}: '
+                       f'unset it by hand (git branch --unset-upstream {branch})')
+    fetch_head_branch(remote, head_branch)
+    got = git('rev-parse', f'refs/remotes/{remote}/{head_branch}').strip()
+    if got != head:
+        raise Unusable(f'{remote}/{head_branch} is at {got}, not the PR head {head}: run again')
+    git('config', f'branch.{branch}.remote', remote)
+    git('config', f'branch.{branch}.merge', want[1])
+    # The upstream is read through the remote's fetch refspec: one that does not map the head branch leaves none.
+    tracked = run('git', 'rev-parse', '--verify', '--quiet', f'{branch}@{{upstream}}', ok=(0, 1))[1].strip()
+    if tracked != head:
+        if not any(have):
+            git('config', '--unset', f'branch.{branch}.remote')
+            git('config', '--unset', f'branch.{branch}.merge')
+        raise Unusable(f"remote {remote}'s fetch refspec does not map {want[1]}, so the branch would track nothing: "
+                       f'add it (git remote set-branches --add {remote} {head_branch}) and run again')
+
+
+def head_repo_of(info):
+    owner, name = (info.get('headRepositoryOwner') or {}).get('login'), (info.get('headRepository') or {}).get('name')
+    return f'{owner}/{name}' if owner and name else None
+
+
+def repair_target(repo, head_repo, info, branch, head):
+    """auto-fix's push destination and whether repairs can be pushed there; when they can, the review branch is
+    bound to it."""
+    if not head_repo:
+        return {'state': 'unavailable', 'why': 'the PR head repository is gone'}
+    state, why = push_access(repo, head_repo, info)
+    if state != 'available':
+        return {'state': state, 'why': why}
+    remote, added = head_remote(repo, head_repo, branch)
+    bind_upstream(branch, remote, info['headRefName'], head)
+    return {'state': state, 'why': why, 'remote': remote, 'addedRemote': added}
 
 
 def remote_for(repo):
@@ -267,6 +406,7 @@ def prepare(a):
                            f"post.py --pr {a.pr} --expected-head {online[-1]['head']}{auto}, which only looks for it by its marker")
         mode, scope_base, prior = mode_of(led, head, merge_base, a.full)
         wt, branch = worktree(top, a.pr, head, token)
+        repair = repair_target(repo, head_repo_of(info), info, branch, head) if a.auto_fix else None
         pr_paths = changed(merge_base, head)
         scope = pr_paths if mode != 'incremental' else changed(scope_base, head)
         groups, over = groups_of(scope, a.max_groups)
@@ -293,6 +433,7 @@ def prepare(a):
         'changed': len(pr_paths), 'scoped': len(scope), 'groups': groups, 'overCap': over,
         'tooling': [p for p in pr_paths if TOOLING.search(p)], 'ci': ci,
         'ledger': path.as_posix(), 'facts': facts.as_posix(), 'synced': synced, 'changedFile': changed_file and changed_file.as_posix(),
+        **({'repair': repair} if a.auto_fix else {}),
     }
 
 
@@ -344,11 +485,14 @@ def collect(argv):
     p.add_argument('--expected-head')
     p.add_argument('--max-groups', type=int, default=6)
     p.add_argument('--full', action='store_true')
+    p.add_argument('--auto-fix', action='store_true')
     a = p.parse_args(argv)
     if a.max_groups < 1:
         raise Unusable('--max-groups must be at least 1')
     if a.token is not None and not re.fullmatch(r'[0-9a-f]+', a.token):
         raise Unusable(f'--token must be the hex token prepare reported, not {a.token!r}')
+    if a.auto_fix and (a.check or a.release):
+        raise Unusable('--auto-fix is for a prepare, not --check or --release')
     if a.release:
         if not a.token:
             raise Unusable('--release needs --token, the token of the lock to release')

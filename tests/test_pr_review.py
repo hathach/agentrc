@@ -69,6 +69,8 @@ class FakeGitHub:
         self.submits = []
         self.submit_fails = False
         self.clock = 0
+        self.maintainer_can_modify = True
+        self.perms = {}  # repo: this account's permissions, or a str for gh's error
 
     def tick(self):
         self.clock += 1
@@ -127,7 +129,7 @@ class FakeGitHub:
                                   'state': 'OPEN', 'author': {'login': 'contrib'}, 'headRefOid': self.head,
                                   'headRefName': 'feature', 'headRepository': {'name': 'r'},
                                   'headRepositoryOwner': {'login': 'contrib'}, 'isCrossRepository': True,
-                                  'baseRefName': 'main'})
+                                  'maintainerCanModify': self.maintainer_can_modify, 'baseRefName': 'main'})
         if argv[:2] == ['pr', 'checks']:
             return self.checks_code, json.dumps(self.checks) if self.checks else ''
         if argv[:2] == ['api', 'user']:
@@ -172,6 +174,9 @@ class FakeGitHub:
         if argv[0] == 'api':
             path = next(a for a in argv[1:] if a.startswith('repos/')).split('?')[0]
             page = lambda xs: [list(xs)]  # noqa: E731 - --paginate --slurp shape
+            if path.count('/') == 2 and '--jq' in argv and argv[argv.index('--jq') + 1] == '.permissions':
+                got = self.perms.get(path[len('repos/'):])
+                return (1, '', got) if isinstance(got, str) else (0, json.dumps(got))
             m = re.fullmatch(rf'repos/{REPO}/pulls/{PR}/reviews/(\d+)/comments', path)
             if m:
                 return 0, json.dumps(page(self.review_comments.get(int(m.group(1)), [])))
@@ -616,6 +621,148 @@ class Prepare(Case):
         # #271: skills/cowork/scripts was scanned again under skills/cowork.
         nested = ['skills/cowork/SKILL.md', 'skills/cowork/scripts/cowork.py', 'agents/coworker.md']
         self.assertEqual(prepare.groups_of(nested, 6), (['agents', 'skills/cowork'], False))
+
+
+class AutoFix(Case):
+    """prepare --auto-fix: where repairs would be pushed, and the review branch bound to it."""
+
+    BRANCH = f'pr-review-{PR}'
+
+    def setUp(self):
+        super().setUp()
+        self.commit('src/core/a.c', 'int a;\n' * 20 + 'int b;\n', 'b')
+        self.head = self.push_pr()
+        self.fetched = []
+
+    def fake_fetch(self, remote, branch, at=None):
+        self.fetched.append((remote, branch))
+        sh(self.clone, 'git', 'update-ref', f'refs/remotes/{remote}/{branch}', at or self.gh.head)
+
+    def auto_fix(self, at=None):
+        with mock.patch.object(prepare, 'fetch_head_branch', lambda r, b: self.fake_fetch(r, b, at)):
+            return self.prepare('--auto-fix')
+
+    def config(self, key):
+        return sh(self.clone, 'git', 'config', '--default', '', '--get', key)
+
+    def test_without_it_prepare_reports_no_repair_and_binds_nothing(self):
+        sh(self.clone, 'git', 'remote', 'add', 'contrib', 'git@github.com:contrib/r.git')
+        p = self.prepare()
+        self.assertNotIn('repair', p)
+        self.assertEqual(self.config(f'branch.{self.BRANCH}.remote'), '')
+
+    def test_a_fork_allowing_maintainer_edits_binds_its_remote_as_babysit_preflight_reads_it(self):
+        import preflight
+        sh(self.clone, 'git', 'remote', 'add', 'contrib', 'git@github.com:contrib/r.git')
+        self.gh.perms = {'contrib/r': {'push': False, 'pull': True}, REPO: {'push': True}}
+        p = self.auto_fix()
+        self.assertEqual(p['repair'], {'state': 'available', 'why': f'the PR allows edits from maintainers, and push access to {REPO}',
+                                       'remote': 'contrib', 'addedRemote': False})
+        self.assertEqual((p['headRepo'], p['headBranch'], p['fork']), ('contrib/r', 'feature', True))
+        self.assertEqual(self.fetched, [('contrib', 'feature')])
+        with contextlib.chdir(p['worktree']):
+            remote, urls = preflight.push_urls(self.BRANCH)
+            self.assertEqual((remote, urls, preflight.upstream_branch(self.BRANCH, remote)),
+                             ('contrib', ['git@github.com:contrib/r.git'], 'feature'))
+            self.assertEqual(preflight.bad_push_url(f'https://github.com/{REPO}/pull/{PR}', 'github.com/contrib/r', urls), '')
+        self.assertEqual(self.auto_fix()['repair']['remote'], 'contrib', 'a second prepare finds its own binding')
+
+    def test_push_access_to_the_head_repository_is_enough(self):
+        sh(self.clone, 'git', 'remote', 'add', 'contrib', 'https://github.com/contrib/r')
+        self.gh.perms = {'contrib/r': {'push': True}}
+        self.gh.maintainer_can_modify = False
+        r = self.auto_fix()['repair']
+        self.assertEqual((r['state'], r['why'], r['remote']), ('available', 'push access to contrib/r', 'contrib'))
+
+    def test_no_push_access_anywhere_is_unavailable_and_binds_nothing(self):
+        sh(self.clone, 'git', 'remote', 'add', 'contrib', 'git@github.com:contrib/r.git')
+        self.gh.perms = {'contrib/r': {'push': False}, REPO: {'push': False, 'triage': True}}
+        r = self.auto_fix()['repair']
+        self.assertEqual((r['state'], r['why']), ('unavailable', f'no push access to contrib/r or {REPO}'))
+        self.assertNotIn('remote', r)
+        self.assertEqual((self.fetched, self.config(f'branch.{self.BRANCH}.remote')), ([], ''))
+
+    def test_a_fork_refusing_maintainer_edits_is_unavailable(self):
+        self.gh.perms = {'contrib/r': {'push': False}, REPO: {'admin': True}}
+        self.gh.maintainer_can_modify = False
+        r = self.auto_fix()['repair']
+        self.assertEqual((r['state'], r['why']), ('unavailable', 'no push access to contrib/r, and the PR does not allow edits from maintainers'))
+
+    def test_permissions_gh_cannot_read_are_unknown_not_unavailable(self):
+        self.gh.perms = {'contrib/r': 'gh: Not Found (HTTP 404)', REPO: {'push': False}}
+        r = self.auto_fix()['repair']
+        self.assertEqual(r['state'], 'unknown')
+        self.assertIn('HTTP 404', r['why'])
+        for shown in (None, {}, {'pull': True}, {'push': 'no'}):
+            self.gh.perms = {'contrib/r': shown, REPO: {'push': False}}
+            self.assertEqual(self.auto_fix()['repair']['state'], 'unknown', f'{shown} is not a refusal')
+
+    def test_with_no_remote_for_the_head_one_is_added_like_the_base_and_gh_default_pinned(self):
+        sh(self.clone, 'git', 'config', f'url.{self.remote.as_posix()}.insteadOf', f'git@github.com:{REPO}.git')
+        sh(self.clone, 'git', 'remote', 'set-url', 'origin', f'git@github.com:{REPO}.git')
+        self.gh.perms = {'contrib/r': {'push': True}}
+        r = self.auto_fix()['repair']
+        self.assertEqual((r['remote'], r['addedRemote']), ('pr-head-contrib', True))
+        self.assertEqual(sh(self.clone, 'git', 'remote', 'get-url', 'pr-head-contrib'), 'git@github.com:contrib/r.git')
+        self.assertEqual(self.config('remote.origin.gh-resolved'), 'base')
+        self.assertEqual(facts.gh_repo.checkout_repo(str(self.clone)), REPO)
+
+    def test_an_added_remote_that_leaves_the_checkout_reading_another_repository_is_removed_so_a_rerun_checks_again(self):
+        sh(self.clone, 'git', 'config', f'url.{self.remote.as_posix()}.insteadOf', f'git@github.com:{REPO}.git')
+        sh(self.clone, 'git', 'remote', 'set-url', 'origin', f'git@github.com:{REPO}.git')
+        sh(self.clone, 'git', 'remote', 'add', 'mirror', 'https://github.com/someone/else')
+        sh(self.clone, 'git', 'config', 'remote.mirror.gh-resolved', 'base')
+        self.gh.perms = {'contrib/r': {'push': True}}
+        for _ in range(2):
+            with self.assertRaisesRegex(facts.Unusable, f'no longer reads as {REPO}'):
+                self.auto_fix()
+            self.assertNotIn('pr-head-contrib', sh(self.clone, 'git', 'remote').split())
+
+    def test_a_remote_pushing_elsewhere_is_not_the_head_remote(self):
+        sh(self.clone, 'git', 'remote', 'add', 'contrib', 'git@github.com:contrib/r.git')
+        sh(self.clone, 'git', 'remote', 'set-url', '--push', 'contrib', 'git@github.com:someone/else.git')
+        self.gh.perms = {'contrib/r': {'push': True}}
+        with self.assertRaisesRegex(facts.Unusable, 'not a github.com one to spell it like'):
+            self.auto_fix()
+
+    def test_two_remotes_naming_the_head_repository_refuse_unless_one_is_tracked(self):
+        for name in ('a', 'b'):
+            sh(self.clone, 'git', 'remote', 'add', name, 'git@github.com:contrib/r.git')
+        self.gh.perms = {'contrib/r': {'push': True}}
+        with self.assertRaisesRegex(facts.Unusable, 'remotes a, b all name contrib/r'):
+            self.auto_fix()
+        sh(self.clone, 'git', 'config', f'branch.{self.BRANCH}.remote', 'b')
+        sh(self.clone, 'git', 'config', f'branch.{self.BRANCH}.merge', 'refs/heads/feature')
+        self.assertEqual(self.auto_fix()['repair']['remote'], 'b')
+
+    def test_another_upstream_already_set_is_refused_not_replaced(self):
+        sh(self.clone, 'git', 'remote', 'add', 'contrib', 'git@github.com:contrib/r.git')
+        self.prepare()
+        sh(self.clone, 'git', 'config', f'branch.{self.BRANCH}.remote', 'origin')
+        sh(self.clone, 'git', 'config', f'branch.{self.BRANCH}.merge', 'refs/heads/main')
+        self.gh.perms = {'contrib/r': {'push': True}}
+        with self.assertRaisesRegex(facts.Unusable, 'already tracks origin refs/heads/main'):
+            self.auto_fix()
+        self.assertEqual(self.config(f'branch.{self.BRANCH}.remote'), 'origin')
+
+    def test_a_remote_whose_fetch_refspec_skips_the_head_branch_refuses_and_binds_nothing(self):
+        sh(self.clone, 'git', 'remote', 'add', '-t', 'main', 'contrib', 'git@github.com:contrib/r.git')
+        self.gh.perms = {'contrib/r': {'push': True}}
+        with self.assertRaisesRegex(facts.Unusable, "fetch refspec does not map refs/heads/feature"):
+            self.auto_fix()
+        self.assertEqual((self.config(f'branch.{self.BRANCH}.remote'), self.config(f'branch.{self.BRANCH}.merge')), ('', ''))
+
+    def test_a_head_branch_not_at_the_pinned_head_refuses_and_binds_nothing(self):
+        sh(self.clone, 'git', 'remote', 'add', 'contrib', 'git@github.com:contrib/r.git')
+        self.gh.perms = {'contrib/r': {'push': True}}
+        with self.assertRaisesRegex(facts.Unusable, 'not the PR head'):
+            self.auto_fix(at=self.base)
+        self.assertEqual(self.config(f'branch.{self.BRANCH}.remote'), '')
+
+    def test_it_is_refused_with_check_or_release(self):
+        for extra in (['--check', '--expected-head', self.head], ['--release', '--token', 'ab']):
+            with self.assertRaisesRegex(facts.Unusable, 'is for a prepare'):
+                self.prepare('--auto-fix', *extra)
 
 
 class Ledger(Case):
@@ -1713,6 +1860,51 @@ class Pushback(PostCase):
         self.post()
         self.assertEqual(len(self.gh.posts), 3, 'a rerun finds the answers\' pending review, never a second one')
 
+    def test_auto_fix_defers_the_answers_so_the_repair_may_list_its_findings_then_plain_post_publishes_them(self):
+        rec = self.dispute('upheld', {'body': 'Still stands.', 'resolve': False})
+        self.comment(950, 'contrib', 'intentional')
+        self.save(self.result_for(self.p, findings=[{'id': 'pr7-f1', 'status': 'upheld', 'disputes': [rec]},
+                                                    {'file': 'src/core/a.c', 'line': 1, 'why': 'a shadows a global', 'severity': 'medium',
+                                                     'dimension': 'correctness', 'status': 'open'}],
+                                  draft={'event': 'COMMENT', 'body': 'Again.', 'replies': [],
+                                         'comments': [{'path': 'src/core/a.c', 'line': 1, 'body': 'a shadows a global', 'finding': 1}]}),
+                  reason='again')
+        out = self.post('--auto', '--defer-answers')
+        self.assertEqual((out['status'], out['answers']), ('posted', {'status': 'deferred'}))
+        self.assertEqual((len(self.gh.posts), self.adds()), (2, []), 'no pending review holds the answers')
+        with mock.patch.object(post, 'collect', return_value=out), mock.patch('sys.stdout'):
+            self.assertEqual(post.main([]), 0)
+        snap = self.tmp / 'threads.json'
+        self.call(threads, ['--pr', str(PR), '--repo', REPO, '--out', str(snap)])
+        got = self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--fixable', '--threads', str(snap), '--head', self.head])['fixable']
+        self.assertEqual(([f['id'] for f in got['fix']], [h['why'] for h in got['held']]), (['pr7-f2'], ['replied']))
+        with self.assertRaisesRegex(facts.Unusable, 'a pending draft'):
+            self.prepare()
+        out = self.post()
+        self.assertEqual((out['status'], [(e['kind'], e['state']) for e in out['staged']]), ('drafted', [('answer', 'staged')]))
+        with self.assertRaisesRegex(facts.Unusable, '--defer-answers goes with --auto'):
+            self.post('--defer-answers')
+
+    def test_deferred_answers_leave_the_recheck_free_and_are_judged_again_on_the_repaired_head(self):
+        rec = self.dispute('upheld', {'body': 'Still stands.', 'resolve': False})
+        self.comment(950, 'contrib', 'intentional')
+        self.save(self.result_for(self.p, findings=[{'id': 'pr7-f1', 'status': 'upheld', 'disputes': [rec]}],
+                                  draft={'event': 'COMMENT', 'body': 'Again.', 'comments': [], 'replies': []}), reason='again')
+        self.assertEqual(self.post('--auto', '--defer-answers')['answers'], {'status': 'deferred'})
+        self.commit('src/core/c.c', 'int c;\n', 'repair')
+        self.head = self.push_pr()
+        p = self.prepare()
+        self.assertEqual(p['mode'], 'incremental')
+        self.assertEqual([d['findingId'] for d in self.disputes(self.snapshot((950, 'contrib', 'intentional', False)))], ['pr7-f1'],
+                         'the pushback is judged again on the repaired head')
+        rec = self.dispute('upheld', {'body': 'Still stands after the repair.', 'resolve': False})
+        self.save(self.result_for(p, findings=[{'id': 'pr7-f1', 'status': 'upheld', 'disputes': [rec]}],
+                                  draft={'event': 'COMMENT', 'body': 'Recheck.', 'comments': [], 'replies': []}))
+        out = self.post('--auto')
+        self.assertEqual((out['status'], out['answers']['status']), ('posted', 'drafted'))
+        self.assertEqual([[p['head'] == self.head, p['status']] for p, r in ledger.publications(self.led()) if p is not r],
+                         [[False, 'pending'], [True, 'drafted']], 'the earlier head\'s answers are never published on this one')
+
 
 class Threads(Case):
     def test_every_comment_with_its_thread_and_ours_marked(self):
@@ -1916,6 +2108,151 @@ class Workflow(unittest.TestCase):
     def test_stub_harness_passes(self):
         done = subprocess.run(['node', str(ROOT / 'tests' / 'pr_review_harness.mjs')], capture_output=True, encoding='utf-8', errors='replace')
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+
+
+class Fixable(PostCase):
+    """ledger.py show --fixable: what an auto-fix repair may take from the review we submitted."""
+
+    def setUp(self):
+        super().setUp()
+        two = [{'file': 'src/core/a.c', 'line': 21, 'why': 'b is never initialised', 'severity': 'high', 'dimension': 'correctness', 'status': 'open'},
+               {'file': 'src/core/a.c', 'line': 1, 'why': 'a shadows a global', 'severity': 'medium', 'dimension': 'correctness', 'status': 'open'}]
+        draft = {'event': 'REQUEST_CHANGES', 'body': 'Summary.', 'replies': [],
+                 'comments': [{'path': 'src/core/a.c', 'line': 21, 'body': 'b is never initialised', 'finding': 0},
+                              {'path': 'src/core/a.c', 'line': 1, 'body': 'a shadows a global', 'finding': 1}]}
+        self.save(self.result_for(self.p, findings=two, draft=draft, verdict={'event': 'REQUEST_CHANGES', 'reasons': ['r']}))
+        self.assertEqual(self.post('--auto')['status'], 'posted')
+        self.root = self.review()['findings'][0]['commentId']
+
+    def snap(self):
+        snap = self.tmp / 'threads.json'
+        self.call(threads, ['--pr', str(PR), '--repo', REPO, '--out', str(snap)])
+        return snap, json.loads(snap.read_text())
+
+    def show_fixable(self, snap, head=None):
+        return self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--fixable', '--threads', str(snap),
+                                  '--head', head or self.head])['fixable']
+
+    def fixable(self, head=None):
+        return self.show_fixable(self.snap()[0], head)
+
+    def held(self, got):
+        return [(h['findingId'], h['why']) for h in got['held']]
+
+    def test_an_untouched_review_offers_every_standing_finding_inline_or_moved_into_the_body(self):
+        got = self.fixable()
+        self.assertEqual(([f['id'] for f in got['fix']], got['held'], got['autoPost']), (['pr7-f1', 'pr7-f2'], [], True))
+        self.assertIsNone(self.review()['findings'][1].get('commentId'), 'the second finding stands in the review body')
+
+    def test_an_edited_inline_comment_is_held_and_sends_the_recheck_to_the_human(self):
+        next(c for c in self.gh.inline if c['id'] == self.root)['body'] = 'b is never initialised (edited)'
+        got = self.fixable()
+        self.assertEqual((self.held(got), [f['id'] for f in got['fix']], got['autoPost']), ([('pr7-f1', 'edited')], ['pr7-f2'], False))
+
+    def test_a_deleted_inline_comment_is_held(self):
+        self.gh.inline = [c for c in self.gh.inline if c['id'] != self.root]
+        self.gh.threads = []
+        self.assertEqual(self.held(self.fixable()), [('pr7-f1', 'deleted')])
+
+    def test_an_edited_review_body_holds_the_finding_moved_into_it(self):
+        rid = self.review()['receipts']['review']['reviewId']
+        self.gh.reviews[rid]['body'] = self.gh.reviews[rid]['body'].replace('a shadows', 'a may shadow')
+        got = self.fixable()
+        self.assertEqual((self.held(got), [f['id'] for f in got['fix']], got['autoPost']), ([('pr7-f2', 'edited')], ['pr7-f1'], False))
+
+    def test_a_contributor_reply_holds_the_finding_but_not_the_auto_recheck_and_a_bot_reply_holds_nothing(self):
+        self.gh.inline.append({'id': 950, 'in_reply_to_id': self.root, 'body': 'intentional', 'created_at': self.gh.tick(),
+                               'user': {'login': 'contrib'}})
+        self.gh.threads[0]['comments']['nodes'].append({'databaseId': 950})
+        got = self.fixable()
+        self.assertEqual((self.held(got), got['autoPost']), ([('pr7-f1', 'replied')], True))
+        self.gh.inline[-1]['user'] = {'login': 'bot[bot]', 'type': 'Bot'}
+        self.assertEqual(self.fixable()['held'], [])
+
+    def test_a_snapshot_missing_a_reply_or_the_thread_refuses_rather_than_hide_pushback(self):
+        self.gh.inline.append({'id': 950, 'in_reply_to_id': self.root, 'body': 'intentional', 'created_at': self.gh.tick(),
+                               'user': {'login': 'contrib'}})
+        self.gh.threads[0]['comments']['nodes'].append({'databaseId': 950})
+        for drop in ('reply', 'thread'):
+            snap, got = self.snap()
+            if drop == 'reply':
+                got['comments'] = [c for c in got['comments'] if c['id'] != 950]
+            else:
+                got['threads'] = []
+            snap.write_text(json.dumps(got))
+            with self.assertRaisesRegex(facts.Unusable, "does not hold pr7-f1's whole thread"):
+                self.show_fixable(snap)
+
+    def test_a_disputed_finding_with_edited_text_still_sends_the_recheck_to_the_human(self):
+        led = json.loads(Path(self.p['ledger']).read_text())
+        led['reviews'][-1]['findings'][0]['status'] = 'disputed'
+        Path(self.p['ledger']).write_text(json.dumps(led))
+        next(c for c in self.gh.inline if c['id'] == self.root)['body'] = 'edited'
+        got = self.fixable()
+        self.assertEqual((self.held(got), got['autoPost']), ([('pr7-f1', 'edited')], False))
+
+    def test_an_unsettled_publication_refuses_since_the_last_review_on_the_pr_is_unknown(self):
+        for status in ledger.ONLINE:
+            led = json.loads(Path(self.p['ledger']).read_text())
+            led['reviews'].append({**led['reviews'][-1], 'status': status, 'head': self.head})
+            Path(self.p['ledger']).write_text(json.dumps(led))
+            with self.assertRaisesRegex(facts.Unusable, f'a {status} publication .* is not settled'):
+                self.fixable()
+            led['reviews'].pop()
+            led['reviews'][-1]['answerPublications'] = [{'head': self.head, 'status': status, 'answers': [], 'receipts': {}}]
+            Path(self.p['ledger']).write_text(json.dumps(led))
+            with self.assertRaisesRegex(facts.Unusable, 'is not settled'):
+                self.fixable()
+            del led['reviews'][-1]['answerPublications']
+            Path(self.p['ledger']).write_text(json.dumps(led))
+
+    def test_a_disputed_or_unplaced_finding_is_held(self):
+        led = json.loads(Path(self.p['ledger']).read_text())
+        led['reviews'][-1]['findings'][0]['status'] = 'disputed'
+        led['reviews'][-1]['draft']['moved'] = []
+        Path(self.p['ledger']).write_text(json.dumps(led))
+        got = self.fixable()
+        self.assertEqual((self.held(got), got['autoPost']), ([('pr7-f1', 'disputed'), ('pr7-f2', 'unmapped')], False))
+
+    def test_a_carried_finding_is_placed_by_the_review_that_published_it(self):
+        self.commit('src/core/c.c', 'int c;\n', 'c')
+        head = self.push_pr()
+        p = self.prepare()
+        self.assertEqual(p['mode'], 'incremental')
+        carried = [{'id': 'pr7-f1', 'file': 'src/core/a.c', 'line': 21, 'why': 'b is never initialised', 'severity': 'high',
+                    'dimension': 'correctness', 'status': 'open'}]
+        self.save(self.result_for(p, findings=carried, draft={'event': 'REQUEST_CHANGES', 'body': 'Still open.', 'comments': [], 'replies': []},
+                                  verdict={'event': 'REQUEST_CHANGES', 'reasons': ['r']}))
+        self.head = head
+        self.assertEqual(self.post('--auto')['status'], 'posted')
+        got = self.fixable(head)
+        self.assertEqual(([f['id'] for f in got['fix']], got['held']), (['pr7-f1'], []))
+
+    def test_a_carried_finding_the_human_edited_before_submitting_offers_the_published_text(self):
+        # The state post.submitted leaves when the human edited the pending comment before submitting it.
+        edited = 'b is initialised only on the error path'
+        next(c for c in self.gh.inline if c['id'] == self.root)['body'] = edited
+        led = json.loads(Path(self.p['ledger']).read_text())
+        led['reviews'][-1]['findings'][0]['published'] = edited
+        Path(self.p['ledger']).write_text(json.dumps(led))
+        self.commit('src/core/c.c', 'int c;\n', 'c')
+        head = self.push_pr()
+        p = self.prepare()
+        carried = [{'id': 'pr7-f1', 'file': 'src/core/a.c', 'line': 21, 'why': 'b is never initialised', 'severity': 'high',
+                    'dimension': 'correctness', 'status': 'open'}]
+        self.save(self.result_for(p, findings=carried, draft={'event': 'REQUEST_CHANGES', 'body': 'Still open.', 'comments': [], 'replies': []},
+                                  verdict={'event': 'REQUEST_CHANGES', 'reasons': ['r']}))
+        self.head = head
+        self.assertEqual(self.post('--auto')['status'], 'posted')
+        got = self.fixable(head)
+        row = next(f for f in got['fix'] if f['id'] == 'pr7-f1')
+        self.assertEqual((got['held'], row['why'], row.get('published')), ([], 'b is never initialised', edited))
+
+    def test_it_refuses_a_head_that_is_not_the_last_submitted_review(self):
+        with self.assertRaisesRegex(facts.Unusable, 'not one submitted on'):
+            self.fixable(self.base)
+        with self.assertRaisesRegex(facts.Unusable, '--fixable needs --threads and --head'):
+            self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--fixable'])
 
 
 if __name__ == '__main__':

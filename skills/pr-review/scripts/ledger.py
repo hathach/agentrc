@@ -2,6 +2,7 @@
 """pr-review's per-PR ledger: what each review of a PR found, drafted and posted.
 
   ledger.py show --pr N [--repo OWNER/NAME] [--finding ID | --draft | --pending | --threads FILE [--head SHA]]
+  ledger.py show --pr N --fixable --threads FILE --head SHA [--repo OWNER/NAME]
   ledger.py save --pr N --output FILE [--repo OWNER/NAME] [--reason TEXT]
 
 The ledger is <git common dir>/agentrc/pr-review/<owner>__<name>/<N>.json,
@@ -28,6 +29,15 @@ reached the PR. With --threads, a threads.py snapshot, it also lists each
 settled finding whose thread is still open and due to be resolved (resolveDue,
 resolve_due()), and in heldThreads those it never resolves again by itself;
 --head adds the disputes on that head.
+
+--fixable, with a fresh threads.py snapshot, prints what an auto-fix repair may take from the review posted on
+SHA, which must be the last review on the PR: each standing finding as `fix` (its row, as show lists it, with
+`published`, its comment text as the human edited it, or null) when the text it stands in on the PR is the one a
+receipt of ours recorded, unedited, and nobody but us or a bot has replied
+on its thread since our last verified answer; else in `held` with why: `disputed`, `unmapped` (no receipt places
+its text), `deleted`, `edited` (the inline comment, or the body of the review it was moved into, reads otherwise) or
+`replied`. `autoPost` is false when any is held `unmapped`, `deleted` or `edited`: a recheck would judge text the
+ledger no longer holds, so its review goes to the human as a pending one.
 
 The disputes join the threads.py snapshot to the findings whose inline comment our
 own verified review posted (commentId, recorded by post.py from its read-back):
@@ -61,6 +71,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'pr-babysit' / 'scripts'))
 from facts import FULL_SHA, Parser, Unusable, git, locked, report  # noqa: E402
 from launch_result import load_output  # noqa: E402
+from harvest import digest as body_digest  # noqa: E402  the digest threads.py records
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
 import gh_repo  # noqa: E402
 import windows  # noqa: E402
@@ -230,6 +241,18 @@ def thread_context(d, root, snapshots):
             'url': (by_id.get(root) or {}).get('url')}
 
 
+def thread_roots(snapshot):
+    """{root comment id: thread} of a threads.py snapshot."""
+    return {t['commentIds'][0]: t for t in snapshot.get('threads', []) if t.get('commentIds')}
+
+
+def viewer_of(snapshot):
+    viewer = snapshot.get('viewer')
+    if not viewer:
+        raise Unusable('the threads file names no viewer: rerun threads.py')
+    return viewer
+
+
 def resolve_due(led, snapshot):
     """({finding id: {replied}}, held) for the last review's settled findings whose thread the snapshot shows open.
     Due: fixed, or closed by a reply of ours since the finding last stood (replied: a published reply that resolves,
@@ -238,7 +261,7 @@ def resolve_due(led, snapshot):
     rev = last(led)
     if not rev:
         return {}, []
-    roots = {t['commentIds'][0]: t for t in snapshot.get('threads', []) if t.get('commentIds')}
+    roots = thread_roots(snapshot)
     replied, mark = {}, {}
     for r in reached(led):
         for p in (r, *r.get('answerPublications', [])):
@@ -382,12 +405,10 @@ def disputes(led, snapshot, head):
     rev = last(led)
     if not rev:
         return []
-    viewer = snapshot.get('viewer')
-    if not viewer:
-        raise Unusable('the threads file names no viewer: rerun threads.py')
+    viewer = viewer_of(snapshot)
     by_id = {c['id']: c for c in snapshot.get('comments', [])}
     known = answered_ids(led)
-    roots = {t['commentIds'][0]: t for t in snapshot.get('threads', []) if t.get('commentIds')}
+    roots = thread_roots(snapshot)
     out = []
     for f in rev.get('findings', []):
         t = roots.get(f.get('commentId'))
@@ -404,6 +425,65 @@ def disputes(led, snapshot, head):
                     'outdated': t['outdated'], 'resolved': t['resolved'],
                     'replies': [{'id': c['id'], 'digest': c['digest'], 'author': c['author']} for c in replies]})
     return out
+
+
+def published_at(led, f):
+    """(kind, id, digest) of where f's text stands on the PR by our receipts: its inline root comment, or the body of
+    the review that moved it there; None when no receipt places it."""
+    from post import body_of  # post imports this module
+    for r in reversed(reached(led)):
+        draft, got = r.get('draft') or {}, (r.get('receipts') or {}).get('review') or {}
+        for c, cid in zip(draft.get('comments', []), got.get('commentIds') or []):
+            if c.get('findingId') == f['id'] and cid is not None and cid == f.get('commentId'):
+                return 'review', cid, body_digest(f.get('published') or c['body'])
+        if f.get('commentId') is None and any(c.get('findingId') == f['id'] for c in draft.get('moved', [])):
+            return ('review-body', got['reviewId'], body_digest(body_of(r))) if got.get('reviewId') else None
+    return None
+
+
+def fixable(led, snapshot, head):
+    online = [x for x, _ in publications(led) if x['status'] in ONLINE]
+    if online:
+        raise Unusable(f"a {online[-1]['status']} publication for {online[-1]['head']} is not settled, so the last review on the PR "
+                       'is unknown: reconcile it first')
+    rev = last(led)
+    if not rev or rev['head'] != head or not ((rev.get('receipts') or {}).get('review') or {}).get('submitted'):
+        raise Unusable(f"the last review on the PR is {rev and rev['head']} ({rev and rev['status']}), not one submitted on {head}")
+    viewer = viewer_of(snapshot)
+    live = {(c['kind'], c['id']): c for c in snapshot.get('comments', [])}
+    roots = thread_roots(snapshot)
+    known = answered_ids(led)
+
+    def hold(f):
+        at = published_at(led, f)
+        if at is None:
+            return 'unmapped'
+        kind, cid, want = at
+        c = live.get((kind, cid))
+        if c is None:
+            return 'deleted'
+        if c['digest'] != want:
+            return 'edited'
+        if f['status'] == 'disputed':
+            return 'disputed'
+        if kind == 'review-body':
+            return None
+        # A root without its thread, or a thread naming a comment the snapshot lacks, could hide pushback.
+        t = roots.get(cid)
+        if t is None or any(('review', i) not in live for i in t['commentIds']):
+            raise Unusable(f"the threads file does not hold {f['id']}'s whole thread: rerun threads.py")
+        return 'replied' if pushback([live[('review', i)] for i in t['commentIds'][1:]], known, viewer) else None
+
+    fix, held = [], []
+    for f in rev.get('findings', []):
+        if f['status'] in OPEN:
+            why = hold(f)
+            if why:
+                held.append({'findingId': f['id'], 'commentId': f.get('commentId'), 'why': why})
+            else:
+                fix.append({**open_row(f, {}), 'published': f.get('published')})  # the text the PR shows, as the human edited it
+    return {'fix': sorted(fix, key=by_severity), 'held': held,
+            'autoPost': not any(h['why'] in ('unmapped', 'deleted', 'edited') for h in held)}
 
 
 def add_answers(review, head, answers, auto=False):
@@ -531,11 +611,14 @@ def collect(argv):
     which.add_argument('--pending', action='store_true')
     which.add_argument('--threads')
     sub.choices['show'].add_argument('--head')
+    sub.choices['show'].add_argument('--fixable', action='store_true')
     sub.choices['save'].add_argument('--output', required=True)
     sub.choices['save'].add_argument('--reason')
     a = p.parse_args(argv)
     repo = repo_of(a.repo)
     path = ledger_path(repo, a.pr)
+    if a.cmd == 'show' and a.fixable and not (a.threads and a.head):
+        p.error('--fixable needs --threads and --head')
     if getattr(a, 'head', None) is not None:
         if not a.threads:
             p.error('--head needs --threads')
@@ -544,6 +627,8 @@ def collect(argv):
     snapshot = read_snapshot(a.threads, repo, a.pr) if getattr(a, 'threads', None) else None
     if a.cmd == 'show':
         led = load(path, repo, a.pr)
+        if a.fixable:
+            return {'ledger': path.as_posix(), 'fixable': fixable(led, snapshot, a.head)}
         out = {'ledger': path.as_posix(), **show(led, a.finding, a.draft, snapshot, a.pending)}
         return {**out, 'disputes': disputes(led, snapshot, a.head)} if a.head else out
     result = (load_output(a.output) or {}).get('result')

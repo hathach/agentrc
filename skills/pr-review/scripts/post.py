@@ -3,7 +3,7 @@
 settle what the human did with it.
 
   post.py --pr N --expected-head SHA [--repo OWNER/NAME]           # a pending review for the human to finish
-  post.py --pr N --expected-head SHA --auto [--repo OWNER/NAME]    # submit it
+  post.py --pr N --expected-head SHA --auto [--defer-answers] [--repo OWNER/NAME]  # submit it
   post.py --pr N --expected-head SHA --decline --reason TEXT [--repo OWNER/NAME]
   post.py --pr N --sync [--repo OWNER/NAME]
 
@@ -29,7 +29,10 @@ first, never sent twice) and the same settling as a human's submit. A moved head
 review an earlier run left (only the human sees it, so it may have changed) or a submit whose outcome cannot be
 read hands the pending review to the human instead (handedOver, exit 1), who finishes it like any draft; a later
 post.py run then publishes its answers. Thread answers are never submitted: the review's are put in an answer publication on it (ledger.py's add_answers), stored with
-the review's send intent, and the same run publishes that as a pending review for the human.
+the review's send intent, and the same run publishes that as a pending review for the human. --defer-answers, for
+auto-fix, keeps it stored (answers deferred, exit 0): the pending review would block the repair (ledger.py's fixable,
+GitHub's review replies) and the recheck, so a plain post.py run publishes it afterwards while the head is still the
+review's. Each run takes only the expected head's publications, so one left on an earlier head is never published.
 
 --sync, run by prepare.py first, settles each drafted or uncertain review from GitHub. Deleted: declined. Still
 pending: left, and prepare refuses to start another; a verified auto one is handed to the human (an unverified one is
@@ -545,6 +548,7 @@ def collect(argv):
     p.add_argument('--expected-head')
     p.add_argument('--repo')
     p.add_argument('--auto', action='store_true')
+    p.add_argument('--defer-answers', action='store_true')
     p.add_argument('--decline', action='store_true')
     p.add_argument('--reason')
     p.add_argument('--sync', action='store_true')
@@ -555,6 +559,8 @@ def collect(argv):
         raise Unusable('--expected-head must be a full SHA')
     if a.decline and not a.reason:
         raise Unusable('--decline needs --reason')
+    if a.defer_answers and not a.auto:
+        raise Unusable('--defer-answers goes with --auto')
     repo = repo_of(a.repo)
     path = ledger_path(repo, a.pr)
     with locked(path):
@@ -600,8 +606,9 @@ def collect(argv):
         out = publish_auto(repo, a.pr, led, review, event, login, recovering, persist)
         answers = [p for p in review.get('answerPublications', []) if p.get('auto') and p['status'] in DRAFTS]
         if answers and review['status'] == 'posted' and not recovering:
-            out['answers'] = {**publish_draft(repo, a.pr, led, answers[-1], login, False, persist),
-                              'overLength': over_length(led, answers[-1])}
+            out['answers'] = ({'status': 'deferred'} if a.defer_answers else
+                              {**publish_draft(repo, a.pr, led, answers[-1], login, False, persist),
+                               'overLength': over_length(led, answers[-1])})
         return out
 
 
@@ -613,7 +620,7 @@ def main(argv):
         return 2
     print(json.dumps(out))
     done = out['status'] in ('posted', 'declined', 'drafted', 'synced') and 'handedOver' not in out
-    return 0 if done and ('answers' not in out or out['answers']['status'] == 'drafted') else 1
+    return 0 if done and ('answers' not in out or out['answers']['status'] in ('drafted', 'deferred')) else 1
 
 
 if __name__ == '__main__':

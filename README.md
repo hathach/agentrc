@@ -354,7 +354,8 @@ human's own words asking to merge that PR, under chief's merge exception: the
 task then also names the base branch and carries `Merge grant: yes — "<the
 words>"`, else `Merge grant: none`, a line a relaunch copies too. A PR review
 submits under its own PR review exception, as `skills/pr-review/SKILL.md` asks
-it; its pending reviews need no grant, under chief's standing exception.
+it, an auto-fix review with the babysitting of its repairs; its pending reviews
+need no grant, under chief's standing exception.
 Leave the checkout to chief until it exits.
 
 ## Captain session
