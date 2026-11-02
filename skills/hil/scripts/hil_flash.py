@@ -56,6 +56,7 @@ def _hil_load():
 hil_load = _hil_load()
 hil_load.require(__file__, FILES)
 hil_process = hil_load.load_file('skills/hil/scripts/hil_process.py')
+usb_observe = hil_load.load_file('skills/hil/scripts/usb_observe.py')
 
 _VID_PID_WARNED: set = set()   # one warning per probe, not per command
 
@@ -536,17 +537,13 @@ def rescue_openocd(flasher: dict, flash_out: str = '', *, timeout, run=None) -> 
     return False
 
 
-# openocd's own syntax: one or more complete "0xVVVV 0xPPPP" pairs. Validated rather than merely
+# openocd's own syntax (usb_observe's grammar, which the board registry admits by too). Validated rather than merely
 # tested for truthiness -- `vid_pid` is a hand-edited roster field whose NAME is also used,
 # with a different syntax, by tinyusb's tests.dev_attached, and convoy_safe reads a non-empty
 # value as PROOF the flasher can deliver a recovery past a poisoned node. A typo there
 # silently promised a recovery that openocd would reject at startup. Spaces and tabs only:
 # the value goes verbatim into a Tcl `-c` command, where a newline starts another command.
-_VID_PID_RE = re.compile(r'0x[0-9a-fA-F]{4}[ \t]+0x[0-9a-fA-F]{4}([ \t]+0x[0-9a-fA-F]{4}[ \t]+0x[0-9a-fA-F]{4})*')
-
-
-def valid_vid_pid(value) -> bool:
-    return isinstance(value, str) and bool(_VID_PID_RE.fullmatch(value.strip(' \t')))
+valid_vid_pid = usb_observe.valid_vid_pid
 
 
 def convoy_safe(flasher: dict) -> bool:
