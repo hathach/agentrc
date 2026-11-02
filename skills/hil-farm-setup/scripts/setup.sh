@@ -273,7 +273,8 @@ install_rules() {
 }
 
 # devices already attached keep their old group until a change event: a host with no reboot after setup (a shared host)
-# block: USB drives only (TinyUF2's), so no system disk is re-probed; a property match would AND with the others
+# block: USB drives only (TinyUF2's), and so a system disk only when it is on USB; a property match would AND with
+# the others
 apply_rules() {
   timeout 120 udevadm trigger --settle --action=change --subsystem-match=usb --subsystem-match=hidraw \
     --subsystem-match=tty --subsystem-match=usbmon \

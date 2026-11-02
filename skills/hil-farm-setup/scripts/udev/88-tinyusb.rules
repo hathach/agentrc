@@ -1,5 +1,6 @@
 # tinyusb tools/88-tinyusb.rules at 034d6dd4d with GROUP="adm" as "hil", the group ghrunner is in, and without its
-# catch-all hidraw rule: a farm device's hidraw node gets its vendor rule below (ATTRS matches its USB parent)
+# catch-all hidraw rule: a hidraw node gets a vendor rule below only if that rule has no SUBSYSTEM=="usb" (ATTRS
+# matches its USB parent); the SUBSYSTEM=="usb" ones set the usb_device node alone
 # Copy this file to the location of your distribution's udev rules:
 # Then reload udev configuration by executing:
 #   sudo cp 88-tinyusb.rules /etc/udev/rules.d/ && sudo udevadm control --reload-rules && sudo udevadm trigger
