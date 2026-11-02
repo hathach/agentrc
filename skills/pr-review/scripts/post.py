@@ -6,6 +6,7 @@ settle what the human did with it.
   post.py --pr N --expected-head SHA --auto [--defer-answers] [--repo OWNER/NAME]  # submit it
   post.py --pr N --expected-head SHA --decline --reason TEXT [--repo OWNER/NAME]
   post.py --pr N --sync [--repo OWNER/NAME]
+  post.py --pr N --expected-head SHA --fixed FILE [--repo OWNER/NAME]   # auto-fix: notes and resolves for a pushed repair
 
 Uses only the draft ledger.py saved for that head, never a regenerated one. Its review body ends with the marker
 <!-- agentrc-pr-review:<head>:<draft digest> -->. Before creating anything it refuses unless the PR head is still
@@ -46,12 +47,23 @@ left for --auto to recover by its marker). Submitted: posted, with the event the
   resolved, deferred or observed (already resolved): one left sent (its answer unconfirmed), or resolved and
   reopened since, is never resolved again by itself.
 
+--fixed FILE, once an auto-fix repair is pushed and the PR head is SHA: FILE is {"reviewedHead": the last review's
+head, which must be submitted, "findings": [{id, claimDigest, verdict: "verified", checkedSha: SHA, note, evidence}]},
+each row a fix check that verified that finding's repair on SHA, its claimDigest the one ledger.py show --fixable gives.
+A bad row refuses the whole file before anything is sent. For each finding it posts `Fixed in <SHA>: <note>` as a reply
+on its thread (no review), reads it back, then resolves the thread; a fresh read of the PR before each send and each
+resolve skips or defers it on a moved head, a resolved thread, a changed claim, a deleted or edited root or note, a
+disputed finding, pushback since our last answer, or, for a new note only, a pending review of ours. One record per
+finding and root (ledger.py's repairs) across runs and heads: a rerun returns it, retries a deferred resolve only on a
+fix check of the same claim, never resends an unconfirmed note, and holds a resolve left sent or a thread reopened since.
+A body-moved finding has no thread to note. A later review's draft never repeats a repair note.
+
 A write is stored as sent before it is sent, so a run that dies in it only looks for it afterwards (a review by
 its marker, a reply by its thread and body digest), never sends it twice. --decline records that the human
 declined a draft never created. A POST GitHub itself refused (its rate limit or Validation Failed, on a 403, 422 or
 429) whose marker does not read back right after created nothing: the review stays pending and unsent, reported
 failed, and a later run may POST it again; one that does read back is recovered. Any other error stays sent. stdout ends with
-one JSON line; exit 0 when drafted, posted, declined or synced, 1 when failed, partial, uncertain or handed over,
+one JSON line; exit 0 when drafted, posted, declined, synced or repaired (--fixed: every row noted and resolved), 1 when failed, partial, uncertain or handed over,
 2 with {"error": ...} when nothing was attempted.
 """
 

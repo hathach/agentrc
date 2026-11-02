@@ -12,8 +12,10 @@ post.py write it, under an exclusive lock, by write-then-rename.
 show prints the last review that reached the PR (posted:
 head, mergeBase, verdict, status), its standing findings (open, upheld,
 disputed: id, file, line, severity with its P0-P4 priority, the grading
-behind it, its claim, and the number of the defect it shares with other findings
-of that review, if any), ordered by
+behind it, its claim and its comment as the human edited it (published), the
+number of the defect it shares with other findings of that review, if any, and
+the repair note post.py --fixed put on its thread (repair: head, state,
+resolved), or null), ordered by
 severity, and the thread answers
 drafted and not yet published, each
 with the replies it answers (author,
@@ -32,7 +34,8 @@ resolve_due()), and in heldThreads those it never resolves again by itself;
 
 --fixable, with a fresh threads.py snapshot, prints what an auto-fix repair may take from the review posted on
 SHA, which must be the last review on the PR: each standing finding as `fix` (its row, as show lists it, with
-`published`, its comment text as the human edited it, or null) when the text it stands in on the PR is the one a
+`published`, its comment text as the human edited it, or null, and `claimDigest`, the digest of that text or its own
+words, which a repair's fix check names) when the text it stands in on the PR is the one a
 receipt of ours recorded, unedited, and nobody but us or a bot has replied
 on its thread since our last verified answer; else in `held` with why: `disputed`, `unmapped` (no receipt places
 its text), `deleted`, `edited` (the inline comment, or the body of the review it was moved into, reads otherwise) or
