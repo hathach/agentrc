@@ -2111,6 +2111,51 @@ class Fixable(PostCase):
         self.gh.inline[-1]['user'] = {'login': 'bot[bot]', 'type': 'Bot'}
         self.assertEqual(self.fixable()['held'], [])
 
+    def snap(self):
+        snap = self.tmp / 'threads.json'
+        self.call(threads, ['--pr', str(PR), '--repo', REPO, '--out', str(snap)])
+        return snap, json.loads(snap.read_text())
+
+    def show_fixable(self, snap):
+        return self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--fixable', '--threads', str(snap), '--head', self.head])
+
+    def test_a_snapshot_missing_a_reply_or_the_thread_refuses_rather_than_hide_pushback(self):
+        self.gh.inline.append({'id': 950, 'in_reply_to_id': self.root, 'body': 'intentional', 'created_at': self.gh.tick(),
+                               'user': {'login': 'contrib'}})
+        self.gh.threads[0]['comments']['nodes'].append({'databaseId': 950})
+        for drop in ('reply', 'thread'):
+            snap, got = self.snap()
+            if drop == 'reply':
+                got['comments'] = [c for c in got['comments'] if c['id'] != 950]
+            else:
+                got['threads'] = []
+            snap.write_text(json.dumps(got))
+            with self.assertRaisesRegex(facts.Unusable, "does not hold pr7-f1's whole thread"):
+                self.show_fixable(snap)
+
+    def test_a_disputed_finding_with_edited_text_still_sends_the_recheck_to_the_human(self):
+        led = json.loads(Path(self.p['ledger']).read_text())
+        led['reviews'][-1]['findings'][0]['status'] = 'disputed'
+        Path(self.p['ledger']).write_text(json.dumps(led))
+        next(c for c in self.gh.inline if c['id'] == self.root)['body'] = 'edited'
+        got = self.fixable()
+        self.assertEqual((self.held(got), got['autoPost']), ([('pr7-f1', 'edited')], False))
+
+    def test_an_unsettled_publication_refuses_since_the_last_review_on_the_pr_is_unknown(self):
+        for status in ledger.ONLINE:
+            led = json.loads(Path(self.p['ledger']).read_text())
+            led['reviews'].append({**led['reviews'][-1], 'status': status, 'head': self.head})
+            Path(self.p['ledger']).write_text(json.dumps(led))
+            with self.assertRaisesRegex(facts.Unusable, f'a {status} publication .* is not settled'):
+                self.fixable()
+            led['reviews'].pop()
+            led['reviews'][-1]['answerPublications'] = [{'head': self.head, 'status': status, 'answers': [], 'receipts': {}}]
+            Path(self.p['ledger']).write_text(json.dumps(led))
+            with self.assertRaisesRegex(facts.Unusable, 'is not settled'):
+                self.fixable()
+            del led['reviews'][-1]['answerPublications']
+            Path(self.p['ledger']).write_text(json.dumps(led))
+
     def test_a_disputed_or_unplaced_finding_is_held(self):
         led = json.loads(Path(self.p['ledger']).read_text())
         led['reviews'][-1]['findings'][0]['status'] = 'disputed'

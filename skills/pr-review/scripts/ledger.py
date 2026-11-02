@@ -431,6 +431,10 @@ def published_at(led, f):
 
 
 def fixable(led, snapshot, head):
+    online = [x for x, _ in publications(led) if x['status'] in ONLINE]
+    if online:
+        raise Unusable(f"a {online[-1]['status']} publication for {online[-1]['head']} is not settled, so the last review on the PR "
+                       'is unknown: reconcile it first')
     rev = last(led)
     if not rev or rev['head'] != head or not ((rev.get('receipts') or {}).get('review') or {}).get('submitted'):
         raise Unusable(f"the last review on the PR is {rev and rev['head']} ({rev and rev['status']}), not one submitted on {head}")
@@ -442,8 +446,6 @@ def fixable(led, snapshot, head):
     known = answered_ids(led)
 
     def hold(f):
-        if f['status'] == 'disputed':
-            return 'disputed'
         at = published_at(led, f)
         if at is None:
             return 'unmapped'
@@ -453,9 +455,15 @@ def fixable(led, snapshot, head):
             return 'deleted'
         if c['digest'] != want:
             return 'edited'
-        t = roots.get(cid) if kind == 'review' else None
-        replies = [live[('review', i)] for i in (t or {}).get('commentIds', [])[1:] if ('review', i) in live]
-        return 'replied' if pushback(replies, known, viewer) else None
+        if f['status'] == 'disputed':
+            return 'disputed'
+        if kind == 'review-body':
+            return None
+        # A root without its thread, or a thread naming a comment the snapshot lacks, could hide pushback.
+        t = roots.get(cid)
+        if t is None or any(('review', i) not in live for i in t['commentIds']):
+            raise Unusable(f"the threads file does not hold {f['id']}'s whole thread: rerun threads.py")
+        return 'replied' if pushback([live[('review', i)] for i in t['commentIds'][1:]], known, viewer) else None
 
     fix, held = [], []
     for f in rev.get('findings', []):
