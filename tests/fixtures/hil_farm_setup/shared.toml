@@ -9,7 +9,3 @@ iar = true
 [runner.tinyusb]
 name = "shared-tinyusb"
 labels = ["shared"]
-
-[adopt]
-"/usr/local/bin/openocd" = "b2824a957f327b1ab6222a899be7e1a6f86f8166968cdb1d53d9efe569a5774e"
-"/usr/local/bin/testusb" = "82647bd03d116ba8ad7604e8bbf8a3fa0f9446bcddcab088bf5b8647cea72456"

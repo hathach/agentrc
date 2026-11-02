@@ -66,7 +66,6 @@ def set_runners(names):
 
 
 set_runners(KNOWN_RUNNERS)
-ADOPT = {}  # {link path: sha256} of owner files switch_links may move aside
 TRUSTED_UIDS = {0}  # who may own an installed tool's links, targets and their directories
 INPUTS = None  # --inputs DIR: where kind local tools' files are
 
@@ -155,7 +154,7 @@ def validate_tool(name, t):
 
 
 # iar: verify.sh checks iccarm, cmake and ninja on the runner PATH
-HOST_DEFAULTS = {'shared': False, 'iar': False, 'skip': [], 'runner_path': [], 'adopt': {}}
+HOST_DEFAULTS = {'shared': False, 'iar': False, 'skip': [], 'runner_path': []}
 HOST_FIELDS = {'profile', 'admin', 'runner', *HOST_DEFAULTS}
 HOST_REQUIRED = {'profile', 'admin', 'runner'}
 IDENTITY = ('profile', 'admin', 'shared', 'runner')  # what only a reinstall or re-registration changes
@@ -168,11 +167,11 @@ def strs(v):
 
 def validate_host(h, cfg):
     errs = []
-    typed = {'profile': str, 'admin': str, 'shared': bool, 'iar': bool, 'runner': dict, 'adopt': dict}
+    typed = {'profile': str, 'admin': str, 'shared': bool, 'iar': bool, 'runner': dict}
     bad = [k for k, v in h.items() if k in typed and not isinstance(v, typed[k])
            or k in HOST_FIELDS - set(typed) and not strs(v)]
     if bad:
-        return [f'wrong types for {sorted(bad)}: profile, admin strings; shared, iar booleans; runner, adopt tables; '
+        return [f'wrong types for {sorted(bad)}: profile, admin strings; shared, iar booleans; runner a table; '
                 'the rest lists of strings']
     if HOST_REQUIRED - set(h):
         errs.append(f'missing {sorted(HOST_REQUIRED - set(h))}')
@@ -194,10 +193,6 @@ def validate_host(h, cfg):
         errs.append(f'skip names unknown tools {sorted(set(h["skip"]) - set(cfg.get("tool", {})))}')
     if not all(d.startswith('/') and '..' not in Path(d).parts and ':' not in d for d in h.get('runner_path', [])):
         errs.append('runner_path entries must be absolute, without .. or :')
-    links = {lk for t in cfg.get('tool', {}).values() for lk in t.get('links', {})}
-    for link, sha in h.get('adopt', {}).items():
-        if link not in links or not isinstance(sha, str) or not re.fullmatch(r'[0-9a-f]{64}', sha):
-            errs.append(f'adopt {link}: a link some tool declares, with a sha256')
     return errs
 
 
@@ -222,9 +217,7 @@ def load_host(cfg, path=None):
 
 def use_host(cfg, h):
     """Narrow cfg and the runner globals to the host's runners, tools and packages; returns h."""
-    global ADOPT
     set_runners(h['runner'])
-    ADOPT = {Path(k): v for k, v in h['adopt'].items()}
     cfg['tool'] = {n: t for n, t in cfg['tool'].items() if n not in h['skip']}
     return h
 
@@ -273,10 +266,6 @@ def install_host(cfg, src):
     os.replace(tmp, INSTALLED_HOST)
     OLD_MARKER.unlink(missing_ok=True)
     return True
-
-
-def adopt_backup(lk):
-    return lk.with_name(f'{lk.name}.pre-hil-farm')
 
 
 def is_relative_inside(rel):
@@ -472,22 +461,12 @@ def owned_links(name):
 
 def switch_links(name, links):
     mine = str(TOOLS_ROOT / name) + '/'
-    adopted = []
     for lk in links:
         if lk.is_symlink():
             if not os.readlink(lk).startswith(mine):
                 raise FarmError(f'{lk} is a link {name} does not own (-> {os.readlink(lk)}); remove it first')
         elif lk.exists():
-            if lk not in ADOPT:
-                raise FarmError(f'{lk} exists and is not a link; remove it first')
-            if not lk.is_file() or not file_matches(lk, ADOPT[lk]):
-                raise FarmError(f'{lk} is not the file the host adopts (sha256 {ADOPT[lk]})')
-            if os.path.lexists(adopt_backup(lk)):
-                raise FarmError(f'{adopt_backup(lk)} exists; never over an earlier backup')
-            adopted.append(lk)
-    for lk in adopted:   # same directory, so the owner's file keeps its inode, mode and times
-        os.rename(lk, adopt_backup(lk))
-        print(f'      {lk} moved to {adopt_backup(lk)}')
+            raise FarmError(f'{lk} exists and is not a link; remove it first')
     for lk, target in links.items():
         lk.parent.mkdir(parents=True, exist_ok=True)
         tmp = lk.with_name(f'.{lk.name}.hil-farm')

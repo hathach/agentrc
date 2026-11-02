@@ -38,7 +38,6 @@ while a runner runs, and applies:
 | Field          | Takes effect                                                                                 |
 |----------------|----------------------------------------------------------------------------------------------|
 | `runner_path`  | the runners' `.path` on this update                                                          |
-| `adopt`        | the next install or update of that tool's links                                              |
 | `iar`          | `verify.sh` from now on                                                                      |
 | `skip`         | which tools are converged from now on; a tool already installed is left, not removed         |
 
@@ -123,9 +122,8 @@ included, and the runner stops with it (`BindsTo`). The owner changes rules with
 file that fails to load on a start or restart leaves no rules at all, the owner's included, as on stock Debian; setup
 checks both files with `nft -c` first. A direct `nft -f` or `flush ruleset` drops the hil_farm table: stop
 `hil-runner-tinyusb` first, `systemctl reload nftables` to load both again, run
-`sudo /opt/hil-farm/verify.sh --maintenance`, then start the runner. The owner's plain files at a farm link (such as
-`/usr/local/bin/openocd`) are moved to `<path>.pre-hil-farm` when they still match the hash the host file's `adopt`
-gives, never over an earlier backup.
+`sudo /opt/hil-farm/verify.sh --maintenance`, then start the runner. Setup refuses an owner's plain file at a farm link
+(such as `/usr/local/bin/openocd`); move it aside first.
 
 Install only after the owner agreed, with the host's earlier runner service, if any, stopped and disabled.
 

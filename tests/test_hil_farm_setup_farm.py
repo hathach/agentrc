@@ -160,6 +160,12 @@ class TestInputHash(unittest.TestCase):
 
 
 class TestInstall(FarmCase):
+    def test_a_plain_file_at_a_link_is_refused(self):
+        (self.bin / 'tool').write_bytes(b'owner')
+        with self.assertRaisesRegex(farm.FarmError, 'exists and is not a link'):
+            farm.install_tool('t', self.release('1.0'), False)
+        self.assertEqual((self.bin / 'tool').read_bytes(), b'owner')
+
     def test_install_verify_skip_bump(self):
         t1 = self.release('1.0')
         farm.install_tool('t', t1, False)
@@ -500,7 +506,7 @@ class TestRunnerInstall(FarmCase):
 def keep_host_globals(case):
     """Restore what use_host sets once case ends."""
     p = mock.patch.multiple(farm, **{g: getattr(farm, g) for g in
-                                     ('RUNNERS', 'RUNNER_DIRS', 'RUNNER_UNITS', 'ADOPT')})
+                                     ('RUNNERS', 'RUNNER_DIRS', 'RUNNER_UNITS')})
     p.start()
     case.addCleanup(p.stop)
 
@@ -547,7 +553,6 @@ class TestHost(unittest.TestCase):
         cfg, _ = self.host('dedicated')
         self.assertEqual(cfg, farm.load())
         self.assertEqual(farm.RUNNERS, ('tinyusb', 'tinyuf2'))
-        self.assertEqual(farm.ADOPT, {})
 
     def test_a_shared_host_narrows_runners_tools_and_apt(self):
         cfg, h = self.host('shared')
@@ -596,11 +601,9 @@ class TestHost(unittest.TestCase):
                             (lambda h: h.update(shared='yes'), r"wrong types for \['shared'\]"),
                             (lambda h: h.update(profile=1), r"wrong types for \['profile'\]"),
                             (lambda h: h.update(skip='renesas-fw'), r"wrong types for \['skip'\]"),
-                            (lambda h: h.update(adopt=[]), r"wrong types for \['adopt'\]"),
                             (lambda h: h['runner']['tinyusb'].update(labels='lab'), 'runner.tinyusb: name and labels'),
                             (lambda h: h['runner']['tinyusb'].update(name=1), 'runner.tinyusb: name and labels'),
                             (lambda h: h['runner'].update(tinyusb='x'), 'runner.tinyusb: name and labels'),
-                            (lambda h: h.update(adopt={'/usr/local/bin/openocd': 1}), 'adopt /usr/local/bin/openocd'),
                             (lambda h: h.update(runner={}), 'runner must hold a table'),
                             (lambda h: h['runner'].update(x={'name': 'x', 'labels': ['x']}), 'runner must hold a table'),
                             (lambda h: h.update(iar='yes'), r"wrong types for \['iar'\]"),
@@ -614,10 +617,7 @@ class TestHost(unittest.TestCase):
                             (lambda h: h.update(legacy_units=['x.service']), 'unknown fields'),
                             (lambda h: h.update(runners=['tinyusb']), 'unknown fields'),
                             (lambda h: h.update(checks=['iar']), 'unknown fields'),
-                            (lambda h: h.update(adopt={'/etc/x': 'a' * 64}), 'adopt /etc/x'),
-                            (lambda h: h.update(adopt={'/usr/local/bin/x': 'a' * 64}),
-                             'adopt /usr/local/bin/x: a link some tool declares'),
-                            (lambda h: h.update(adopt={'/usr/local/bin/openocd': 'x'}), 'adopt /usr/local/bin/openocd'),
+                            (lambda h: h.update(adopt={'/usr/local/bin/openocd': 'a' * 64}), 'unknown fields'),
                             (lambda h: h.update(other=1), 'unknown fields')):
             with self.subTest(msg=msg):
                 h = copy.deepcopy(base)
@@ -740,40 +740,6 @@ class TestInstallHost(unittest.TestCase):
         with mock.patch.object(farm.os, 'geteuid', return_value=1000), mock.patch('sys.stderr', io.StringIO()) as err:
             self.assertEqual(farm.main(['host-install', str(HOSTS / 'dedicated.toml')]), 1)
         self.assertIn('run as root', err.getvalue())
-
-
-class TestAdopt(FarmCase):
-    def adopt(self, content, digest):
-        (self.bin / 'tool').write_bytes(content)
-        os.chmod(self.bin / 'tool', 0o751)
-        self.addCleanup(setattr, farm, 'ADOPT', farm.ADOPT)
-        farm.ADOPT = {self.bin / 'tool': digest}
-
-    def test_adopts_the_owner_file_it_names(self):
-        self.adopt(b'owner', sha(b'owner'))
-        farm.install_tool('t', self.release('1.0'), False)
-        self.assertTrue((self.bin / 'tool').is_symlink())
-        self.assertEqual((self.bin / 'tool.pre-hil-farm').read_bytes(), b'owner')
-        self.assertEqual((self.bin / 'tool.pre-hil-farm').stat().st_mode & 0o777, 0o751)
-
-    def test_refuses_a_changed_owner_file(self):
-        self.adopt(b'changed', sha(b'owner'))
-        with self.assertRaisesRegex(farm.FarmError, 'not the file the host adopts'):
-            farm.install_tool('t', self.release('1.0'), False)
-        self.assertEqual((self.bin / 'tool').read_bytes(), b'changed')
-
-    def test_never_over_an_earlier_backup(self):
-        self.adopt(b'owner', sha(b'owner'))
-        (self.bin / 'tool.pre-hil-farm').write_bytes(b'first')
-        with self.assertRaisesRegex(farm.FarmError, 'never over an earlier backup'):
-            farm.install_tool('t', self.release('1.0'), False)
-        self.assertEqual((self.bin / 'tool').read_bytes(), b'owner')
-        self.assertEqual((self.bin / 'tool.pre-hil-farm').read_bytes(), b'first')
-
-    def test_unnamed_plain_file_still_refused(self):
-        (self.bin / 'tool').write_bytes(b'owner')
-        with self.assertRaisesRegex(farm.FarmError, 'exists and is not a link'):
-            farm.install_tool('t', self.release('1.0'), False)
 
 
 class TestGuard(unittest.TestCase):
