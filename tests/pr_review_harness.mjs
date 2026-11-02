@@ -38,10 +38,14 @@ async function run(args, stubs = {}) {
   const agent = async (prompt, options) => {
     calls.push({ label: options.label, prompt: String(prompt), options })
     const v = pick(options.label, prompt)
-    // `stubs.disputes` is the ledger answer's disputes, unless that answer names its own.
+    // `stubs.disputes` is the ledger answer's disputes, unless that answer names its own; the members ledger.py always
+    // prints default as it prints them. `stubs.ledgerAsIs` is returned untouched.
     if (options.label === 'ledger') {
+      if (stubs.ledgerAsIs !== undefined) return stubs.ledgerAsIs
       const l = v === undefined ? defaults.ledger : v
-      return l && typeof l === 'object' && !('disputes' in l) ? { ...l, disputes: stubs.disputes?.disputes ?? [] } : l
+      if (!l || typeof l !== 'object') return l
+      const rows = Array.isArray(l.open) ? { open: l.open.map(f => f && typeof f === 'object' ? { published: null, repair: null, ...f } : f) } : {}
+      return { ...(l.reviews > 0 ? { heldThreads: [] } : {}), ...l, ...rows, ...('disputes' in l ? {} : { disputes: stubs.disputes?.disputes ?? [] }) }
     }
     if (v !== undefined) return v
     if (options.label in defaults) return defaults[options.label]
@@ -410,6 +414,20 @@ test('a ledger answer missing its members, or not of the review prepare pinned, 
   assert.equal((await run(BASE, { ledger: { reviews: 2, open: [] } })).result.verdict.event, 'APPROVE', 'a full review rechecks whatever stands')
   assert.equal((await run(BASE, { ledger: { reviews: 2 } })).result.reason, 'ledger-failed')
   assert.equal((await run(BASE, { ledger: { reviews: 0, last: null, open: [], disputes: null } })).result.reason, 'ledger-failed', 'no disputes is no answer')
+  const row = { ...standing, published: null, repair: { head: OLD, state: 'published', resolved: true } }
+  const whole = { reviews: 1, last: { head: OLD }, open: [row], heldThreads: [], disputes: [] }
+  assert.equal((await run(inc, { check: pinned(inc), ledgerAsIs: whole, recheck: still })).result.status, 'reviewed')
+  const { published, ...unpublished } = row
+  const { repair, ...unrepaired } = row
+  for (const ledger of [{ ...whole, open: [unpublished] }, { ...whole, open: [unrepaired] }, { ...whole, open: [{ ...row, repair: { resolved: true } }] },
+    (({ heldThreads, ...l }) => l)(whole)]) {
+    const { result, labels } = await run(inc, { check: pinned(inc), ledgerAsIs: ledger, recheck: still })
+    assert.deepEqual([result.status, result.reason], ['blocked', 'ledger-failed'], JSON.stringify(ledger))
+    assert.ok(!labels.some(l => l.startsWith('recheck:')), JSON.stringify(ledger))
+  }
+  assert.equal((await run(BASE, { ledgerAsIs: { reviews: 0, last: null, open: [], disputes: [] } })).result.status, 'reviewed', 'an empty ledger prints no heldThreads')
+  const schema = good.calls.find(c => c.label === 'ledger').options.schema.properties.open.items
+  assert.deepEqual([schema.required, schema.properties.repair.required], [['id', 'published', 'repair'], ['head', 'state', 'resolved']])
 })
 
 test('a draft or check agent that throws takes its null path; a check relay that throws blocks', async () => {
@@ -571,6 +589,20 @@ test('a finding an auto-fix repair noted gets no second fix note, and one still 
   const reopenedThread = { ...repaired(done), heldThreads: [{ findingId: 'pr7-f1', commentId: 901, why: 'reopened after it was resolved' }] }
   const restated = await run(inc, { ledger: reopenedThread, recheck: () => ({ state: 'open', reason: 'still' }), check: pinned(inc) })
   assert.deepEqual(restated.result.draft.comments, [], 'reopened since the repair resolved it, its thread states it again')
+  const long = repaired(done)
+  long.open[0].published = `**high**: ${'w '.repeat(68).trim()}`
+  const near = await run(inc, { ledger: long, recheck: () => ({ state: 'open', reason: 'still' }), check: pinned(inc) })
+  assert.deepEqual(near.result.draft.comments.map(c => c.body), [long.open[0].published], 'the edited claim is kept whole, its repair note left out')
+  assert.match(near.result.draft.body, /^Raised again at `src\/core\/a\.c:10`\. The repair in cccccccccccc did not fix it; its earlier thread was resolved\.$/m)
+  assert.ok(!near.logs.some(l => /over length/.test(l)), 'nothing over its limit')
+  assert.doesNotMatch(still.result.draft.body, /Raised again/, 'a note that fits stays on the comment')
+  const shifted = await run(inc, { ledger: repaired(done), recheck: () => ({ state: 'open', reason: 'still', file: 'src/core/a.c', line: 14 }), check: pinned(inc) })
+  assert.deepEqual([shifted.result.draft.comments.map(c => [c.path, c.line]), shifted.result.findings[0].line], [[['src/core/a.c', 14]], 14],
+    'raised again where the recheck found it on this head')
+  assert.match(shifted.calls.find(c => c.label === 'recheck:pr7-f1').prompt, /`file` and `line` are where it stands/)
+  for (const v of [{ state: 'fixed', reason: 'gone', line: 14 }, { state: 'open', reason: 'still', file: '../x.c', line: 14 }, { state: 'open', reason: 'still', file: '/src/core/a.c', line: 14 }, { state: 'open', reason: 'still', line: 0 }]) {
+    assert.equal((await run(inc, { ledger: repaired(done), recheck: () => v, check: pinned(inc) })).result.findings[0].line, 10, JSON.stringify(v))
+  }
 })
 
 test('args that differ from the pins prepare recorded for this head are blocked before review', async () => {
@@ -596,7 +628,7 @@ test('pushback on our thread is judged with the replies as evidence and answered
   const f1 = result.findings.find(f => f.id === 'pr7-f1')
   assert.equal(f1.status, 'withdrawn')
   assert.deepEqual(f1.disputes, [{ key: 'k1', replies: DISPUTE.replies, judgedHead: H, threadsFile: `${BASE.factsDir}/threads-${H}.json`, state: 'withdrawn', reason: 'the IRQ is masked by the caller',
-    answer: { body: 'Agreed, the caller masks the IRQ first.', resolve: true } }])
+    rootCommentId: 901, answer: { body: 'Agreed, the caller masks the IRQ first.', resolve: true } }])
   assert.deepEqual(result.draft.replies, [], 'a concession is a thread answer awaiting approval, not an auto-granted fix note')
   assert.equal(result.verdict.event, 'COMMENT', 'withdrawn drops the high finding; the medium one still caps')
 })

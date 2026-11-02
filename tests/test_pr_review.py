@@ -2587,6 +2587,36 @@ class Repair(PostCase):
         self.assertEqual(self.call(post, ['--pr', str(PR), '--repo', REPO, '--expected-head', self.fixed_head, '--auto'])['status'], 'posted')
         self.assertEqual((len(self.gh.notes), self.adds()), (1, []), 'only the repair note reaches the thread')
 
+    def upheld_raised_again(self, *flags):
+        """An auto-post whose recheck upholds the pushback on a repaired finding and raises it again on a new comment."""
+        self.fixed()
+        self.reply()
+        d = self.show(self.fixed_head)['disputes'][0]
+        self.assertEqual(d['rootCommentId'], self.root)
+        rec = {'key': d['key'], 'replies': d['replies'], 'judgedHead': self.fixed_head, 'threadsFile': str(self.tmp / 'threads.json'),
+               'state': 'upheld', 'reason': 'r', 'rootCommentId': d['rootCommentId'],
+               'answer': {'body': 'Still stands: b is read before it is set.', 'resolve': False}}
+        sh(self.clone, 'git', 'fetch', '--quiet', 'origin', f'refs/pull/{PR}/head')
+        draft = {'event': 'COMMENT', 'body': 'Again.', 'replies': [],
+                 'comments': [{'path': 'src/core/a.c', 'line': 21, 'body': '**high**: b is never initialised\n- The repair did not fix this.', 'finding': 0}]}
+        self.save(self.result_for(self.p, head=self.fixed_head, findings=[{'id': 'pr7-f1', 'status': 'upheld', 'disputes': [rec]}], draft=draft),
+                  reason='recheck')
+        out = self.call(post, ['--pr', str(PR), '--repo', REPO, '--expected-head', self.fixed_head, '--auto', *flags])
+        self.assertNotEqual(self.review()['findings'][0]['commentId'], self.root, 'the raised-again comment is its root now')
+        return out
+
+    def test_an_upheld_finding_raised_again_answers_its_pushback_on_the_thread_judged(self):
+        out = self.upheld_raised_again()
+        self.assertEqual([(e['commentId'], e['state']) for e in out['answers']['staged']], [(self.root, 'staged')],
+                         'the answer goes on the thread whose pushback it answers')
+
+    def test_a_deferred_answer_on_a_finding_raised_again_lists_the_thread_judged(self):
+        next(c for c in self.gh.inline if c['id'] == self.root)['html_url'] = 'https://x/root'
+        self.assertEqual(self.upheld_raised_again('--defer-answers')['answers'], {'status': 'deferred'})
+        shown = self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO])['answers']
+        self.assertEqual([(a['findingId'], a['commentId'], a['url']) for a in shown], [('pr7-f1', self.root, 'https://x/root')],
+                         'the answer awaiting the human names the thread post.py stages it on')
+
     def test_a_raised_again_comment_keeps_the_claim_the_human_edited_and_reads_unedited(self):
         next(c for c in self.gh.inline if c['id'] == self.root)['body'] = 'b may be uninitialised'
         self.call(post, ['--pr', str(PR), '--repo', REPO, '--sync'])

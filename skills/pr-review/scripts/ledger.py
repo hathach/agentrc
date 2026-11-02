@@ -345,9 +345,9 @@ def show(led, finding=None, draft=False, snapshot=None, pending=False):
     fixes = repairs(led)
     shown = body_shown(led, snapshot) if snapshot else (lambda f: False)
     snapshots = {}
-    answers = [{'findingId': f['id'], 'commentId': f.get('commentId'), 'state': d['state'], 'resolve': d['answer']['resolve'],
+    answers = [{'findingId': f['id'], 'commentId': answer_root(f, d), 'state': d['state'], 'resolve': d['answer']['resolve'],
                 'body': d['answer']['body'], 'reason': d.get('reason'),
-                **thread_context(d, f.get('commentId'), snapshots)}
+                **thread_context(d, answer_root(f, d), snapshots)}
                for f, d in open_disputes(rev.get('findings', []), rev['head'])]
     return {
         'reviews': len(led['reviews']),
@@ -581,6 +581,12 @@ def open_disputes(findings, head=None):
     on `head` when named: an answer to an earlier head is never published on a later one."""
     return [(f, d) for f in findings for d in f.get('disputes', [])[-1:]
             if d.get('answer') and not d['answer'].get('outcome') and head in (None, d.get('judgedHead'))]
+
+
+def answer_root(f, d):
+    """The comment an answer replies to: the thread it was judged on, which a comment raising its finding again
+    replaces as the finding's commentId."""
+    return d.get('rootCommentId', f.get('commentId'))
 
 
 def hold_withdrawal(f, standing):

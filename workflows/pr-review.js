@@ -123,11 +123,16 @@ const DISPUTES = { type: 'array', items: { type: 'object', required: ['findingId
     replies: { type: 'array', items: { type: 'object', properties: { id: { type: 'integer' }, digest: { type: 'string' }, author: { type: 'string' } } } } } } }
 // One read gives the standing findings and the pushback on them, from the same ledger and snapshot.
 const prior = await relay('ledger', 'Context', `python3 ${S}/ledger.py show --pr ${pr} --repo ${repo} --threads '${threadsFile}' --head ${head}`,
-  { type: 'object', properties: { reviews: { type: 'integer' }, last: { type: ['object', 'null'], properties: { head: { type: 'string' } } }, open: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, status: { type: 'string' }, file: { type: 'string' }, line: { type: 'integer' }, severity: { type: ['string', 'null'] }, confidence: { type: ['string', 'null'] }, impact: IMPACT, severityReason: { type: ['string', 'null'] }, commentId: { type: ['integer', 'null'] }, why: { type: 'string' }, published: { type: ['string', 'null'] }, inBody: { type: 'boolean' }, resolveDue: { type: ['object', 'null'], properties: { replied: { type: 'boolean' } } }, repair: { type: ['object', 'null'], properties: { head: { type: 'string' }, state: { type: 'string' }, resolved: { type: 'boolean' } } } }, required: ['id'] } },
+  { type: 'object', properties: { reviews: { type: 'integer' }, last: { type: ['object', 'null'], properties: { head: { type: 'string' } } }, open: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, status: { type: 'string' }, file: { type: 'string' }, line: { type: 'integer' }, severity: { type: ['string', 'null'] }, confidence: { type: ['string', 'null'] }, impact: IMPACT, severityReason: { type: ['string', 'null'] }, commentId: { type: ['integer', 'null'] }, why: { type: 'string' }, published: { type: ['string', 'null'] }, inBody: { type: 'boolean' }, resolveDue: { type: ['object', 'null'], properties: { replied: { type: 'boolean' } } }, repair: { type: ['object', 'null'], properties: { head: { type: 'string' }, state: { type: 'string' }, resolved: { type: 'boolean' } }, required: ['head', 'state', 'resolved'] } }, required: ['id', 'published', 'repair'] } },
     heldThreads: { type: 'array', items: { type: 'object', properties: { findingId: { type: 'string' }, commentId: { type: 'integer' }, why: { type: 'string' } } } }, disputes: DISPUTES, error: { type: 'string' } } })
 if (!prior || prior.error) return blocked('ledger-failed', prior ? prior.error : 'the ledger relay died')
 // A copy missing members must not read as nothing standing: an incremental or discussion run continues the review prepare pinned.
-if (!Number.isInteger(prior.reviews) || !Array.isArray(prior.open) || !Array.isArray(prior.disputes) ||
+// A row without its published text or repair record would restate the draft, or never raise a failed repair again;
+// heldThreads is printed whenever a review is on the ledger.
+const rowOk = (f) => f && typeof f.id === 'string' && (f.published === null || typeof f.published === 'string') &&
+  (f.repair === null || (f.repair && SHA.test(f.repair.head) && typeof f.repair.state === 'string' && typeof f.repair.resolved === 'boolean'))
+if (!Number.isInteger(prior.reviews) || !Array.isArray(prior.open) || !Array.isArray(prior.disputes) || !prior.open.every(rowOk) ||
+  (prior.reviews > 0 && !Array.isArray(prior.heldThreads)) ||
   (args.mode !== 'full' && (prior.reviews < 1 || (prior.last || {}).head !== (discussion ? head : scopeBase)))) {
   return blocked('ledger-failed', `ledger answered ${JSON.stringify(prior)}`)
 }
@@ -143,7 +148,8 @@ const CLAIMS = {
     properties: { commentId: { type: 'integer' }, threadId: { type: ['string', 'null'] }, author: { type: 'string' }, bot: { type: 'boolean' },
       path: { type: ['string', 'null'] }, line: { type: ['integer', 'null'] }, url: { type: ['string', 'null'] }, claim: { type: 'string' } } } } },
 }
-const RECHECK = { type: 'object', required: ['state', 'reason'], properties: { state: { enum: ['open', 'fixed', 'na', 'withdrawn', 'upheld', 'disputed'] }, reason: { type: 'string' }, answer: { type: 'string' }, ...GRADE } }
+const RECHECK = { type: 'object', required: ['state', 'reason'], properties: { state: { enum: ['open', 'fixed', 'na', 'withdrawn', 'upheld', 'disputed'] }, reason: { type: 'string' }, answer: { type: 'string' },
+  file: { type: 'string' }, line: { type: 'integer' }, ...GRADE } }
 const NONE = { confirmed: [], dropped: [], unverified: [] }
 // Public text is measured, never cut: over a limit it is shortened once, a comment then falls back to its
 // finding's words, and what is still over is logged; post.py measures it again and names it for the human, and
@@ -159,7 +165,8 @@ const recheckPrompt = (f) => {
   const d = disputeOf[f.id]
   const ask = `${IN}Adversarially recheck ONE earlier review finding of this PR on head ${head}. Read it with: python3 ${S}/ledger.py show --pr ${pr} --repo ${repo} --finding ${f.id}\n` +
     'Where the record has `published`, on the finding or on an answer, that is what the PR shows, as the maintainer edited it: judge that text, not the draft.\n' +
-    `Its level is ${f.severity || 'unset'}. Only when new evidence changes its facts: ${GRADING} Otherwise leave them out.\n`
+    `Its level is ${f.severity || 'unset'}. Only when new evidence changes its facts: ${GRADING} Otherwise leave them out.\n` +
+    `While it still stands (open, upheld or disputed), \`file\` and \`line\` are where it stands at ${head}: the repository path and the line on that head.\n`
   if (!d) {
     return ask + `Then read the code at ${head}. state=open if the problem is still there, fixed if the change since removed it (say which code does), na if the code it named is gone or the claim no longer applies` +
       `${f.status === 'withdrawn' ? ', withdrawn if it was withdrawn earlier and the code still shows the finding was wrong' : ''}. ${DATA}`
@@ -221,12 +228,17 @@ const answerOf = (f, v) => {
 // A dead verifier records no dispute, so the same replies are judged on the next run.
 const carriedOut = carried.map((f, i) => {
   const v = rechecked[i]
-  const base = { id: f.id, file: f.file, line: f.line, ...(regradeOf(v) || gradeOf(f)) }
+  // A finding still standing is placed where the recheck found it on this head: a push may have moved its line.
+  const moved = v && ['open', 'upheld', 'disputed'].includes(v.state) && Number.isInteger(v.line) && v.line > 0 && (v.file == null || (plainPath(v.file) && !v.file.startsWith('/')))
+  const at = moved ? { file: v.file ?? f.file, line: v.line } : { file: f.file, line: f.line }
+  const base = { id: f.id, ...at, ...(regradeOf(v) || gradeOf(f)) }
   if (!v) return { ...base, status: f.status || 'open', recheckReason: 'unjudged' }
   const d = disputeOf[f.id]
   const out = { ...base, status: statusOf(f, v), recheckReason: v.reason }
   if (d && ['withdrawn', 'upheld', 'disputed', 'fixed', 'na'].includes(v.state)) {
+    // The thread judged keeps the answer: a comment raised again on this review becomes the finding's commentId.
     out.disputes = [{ key: d.key, replies: d.replies, judgedHead: head, threadsFile, state: v.state, reason: v.reason,
+      ...(Number.isInteger(d.rootCommentId) ? { rootCommentId: d.rootCommentId } : {}),
       ...(['withdrawn', 'upheld'].includes(v.state) ? { answer: answerOf(f, v) } : {}) }]
   }
   return out
@@ -464,15 +476,21 @@ const template = (severity, why) => `**${severity || 'finding'}**: ${why}`
 const repairedOf = (f) => (earlier[f.id] || {}).repair
 const heldOf = (f) => (prior.heldThreads || []).some(h => h.findingId === f.id && h.commentId === (earlier[f.id] || {}).commentId)
 const reraised = carriedOut.filter((f, i) => rechecked[i] && ['open', 'upheld'].includes(f.status) && (repairedOf(f) || {}).resolved && !heldOf(f))
+const repairNote = (f, it = 'this') => `The repair in ${repairedOf(f).head.slice(0, 12)} did not fix ${it}; its earlier thread was resolved.`
+// A comment the human edited is restated as they left it, never cut: a repair note that would put it over its limit
+// goes in the body instead.
+const restated = reraised.map(f => {
+  const claim = earlier[f.id].published || template(f.severity, whyOf(f))
+  const noted = `${claim}\n- ${repairNote(f)}`
+  return overLength(noted, LIMIT.comment) ? { f, body: claim, noteInBody: true } : { f, body: noted }
+})
 // `finding` indexes the result's findings (carried first), so the ledger can give the comment its finding's id.
 const comments = [...items.map((x, i) => {
   const ok = bodies[i] && checked && !checked.bad.includes(i) && !offFormat(bodies[i].body, x.f.severity)
   return { path: x.f.file, line: x.f.line, finding: x.finding, body: ok ? bodies[i].body : template(x.f.severity, x.why),
     ...(!ok || checked.firstBad.includes(i) ? { firstLineUnchecked: true } : {}) }
-}), ...reraised.map(f => ({
-  path: f.file, line: f.line, finding: carriedOut.indexOf(f),
-  // A comment the human edited is restated as they left it.
-  body: `${earlier[f.id].published || template(f.severity, whyOf(f))}\n- The repair in ${repairedOf(f).head.slice(0, 12)} did not fix this; its earlier thread was resolved.`,
+}), ...restated.map(({ f, body }) => ({
+  path: f.file, line: f.line, finding: carriedOut.indexOf(f), body,
   // No check sees it, and off the diff its first line drops the repair line and any qualification below.
   firstLineUnchecked: true,
 }))]
@@ -498,6 +516,7 @@ else if (summary) lines.push(summary, '')
 // the CI, hardware and coverage facts the verdict rests on. Findings off the diff get their line from ledger.py save.
 if (blocking.length) lines.push(`Blocking: ${[...new Set(blocking.map(o => o.at))].join(', ')}.`, '')
 if (disputed) lines.push(`Disputed, waiting for a maintainer: ${disputedAt.join(', ')}.`, '')
+for (const { f } of restated.filter(r => r.noteInBody)) lines.push(`Raised again at ${where(f.file, f.line)}. ${repairNote(f, 'it')}`, '')
 if (confirmedClaims.length) lines.push('Confirmed from other reviewers:', ...confirmedClaims.map(c => `- @${c.author} ${c.url ? `[comment](${c.url})` : c.path ? `on ${where(c.path, c.line)}` : `comment ${c.commentId}`}, ` +
   `point ${c.claimId.split('#')[1]}${ourGrade.has(c) ? `; our grade **${ourGrade.get(c).severity}**` : ''}`), '')
 if (ci.state !== 'green') lines.push(`${ciNote}.`, '')

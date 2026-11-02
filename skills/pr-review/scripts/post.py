@@ -77,7 +77,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from ledger import (DRAFTS, ONLINE, OPEN, SETTLED, UNSETTLED, add_answers, answered_ids, answers_of, claim,  # noqa: E402
+from ledger import (DRAFTS, ONLINE, OPEN, SETTLED, UNSETTLED, add_answers, answer_root, answered_ids, answers_of, claim,  # noqa: E402
                     holder, note_hold, open_answers, owner_of, publications, pushback, reached, repair_hold, repairs, submitted_last,
                     thread_roots, digest as ledger_digest, ledger_path, load, locked, repo_of, store)
 
@@ -248,7 +248,7 @@ def replies_of(led, review, answers=True):
     fixes = repairs(led)  # a repair note of any state is the finding's fix note: a draft saved before it never repeats it
     out = [{'kind': 'fixnote', 'findingId': r['findingId'], 'commentId': r['commentId'], 'body': r['body'], 'resolve': True}
            for r in review['draft']['replies'] if (r['findingId'], r['commentId']) not in fixes]
-    return out + [{'kind': 'answer', 'findingId': f['id'], 'commentId': f.get('commentId'), 'body': d['answer']['body'],
+    return out + [{'kind': 'answer', 'findingId': f['id'], 'commentId': answer_root(f, d), 'body': d['answer']['body'],
                    'resolve': d['answer']['resolve'], 'dispute': d} for f, d in (answers_of(led, review) if answers else [])]
 
 
