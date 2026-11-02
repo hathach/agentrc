@@ -5,7 +5,6 @@ shared = true
 skip = ["renesas-fw"]
 apt_skip = ["unattended-upgrades", "systemd-timesyncd"]
 runner_path = ["/opt/vendor/arm/bin"]
-legacy_units = ["actions.runner.example-runner.service"]
 iar = true
 
 [runner.tinyusb]

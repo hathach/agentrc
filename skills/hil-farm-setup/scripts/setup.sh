@@ -327,6 +327,13 @@ setup_runner_service() (  # NAME: its hook pair and unit
   # BindsTo: the runner also stops when the owner's nftables stops (its ExecStop flushes hil_farm too) or fails;
   # the unit never sees the owner's files
   if shared_host; then dep=BindsTo=nftables.service hide=$'\nInaccessiblePaths='$ADMIN_HOME; fi
+  local d
+  if grep -qx UMask=0002 "/etc/systemd/system/$RUNNER_UNIT.service" 2>/dev/null; then  # what that unit left
+    for d in "$RUNNER_DIR/_work" "$RUNNER_DIR/_diag"; do
+      [ ! -L "$d" ] || die "$d is a symlink; a runner's tree is its own"   # chmod -R would follow it
+      [ ! -d "$d" ] || chmod -R g-w "$d"
+    done
+  fi
   cat > "/etc/systemd/system/$RUNNER_UNIT.service" <<EOF
 [Unit]
 Description=GitHub Actions runner ($RUNNER_NAME HIL)

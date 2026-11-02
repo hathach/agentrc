@@ -25,20 +25,20 @@ drives it.
 
 Everything that differs between hosts lives in one host file: the admin account, the runners and their GitHub
 registration names and labels, and for a host its owner also uses, what stays the owner's. Each farm host's is
-committed as [`hosts/<host>.toml`](hosts/); [`examples/host.toml`](examples/host.toml) lists every field.
+committed as [`hosts/<host>.toml`](hosts/): [`ci`](hosts/ci.toml) shows a dedicated host, [`hfp`](hosts/hfp.toml) a
+shared one and every optional field.
 `setup.sh install --host FILE` takes only a committed file of the checkout's `hosts/`, validates it before any change
 and installs it as `/etc/hil-farm/host.toml`; later runs and `verify.sh` read that copy.
 
 A host keeps its identity: `profile`, `admin`, `shared` and its `runner` tables (which runners, their names and
 labels) change only by a reinstall (or, for a runner, its re-registration), and `--host` with a different one refuses.
 The other fields change with `setup.sh update --host FILE`, which keeps the old file as `host.toml.prev`, refuses
-while a runner or legacy unit of either file runs, and applies:
+while a runner runs, and applies:
 
 | Field          | Takes effect                                                                                 |
 |----------------|----------------------------------------------------------------------------------------------|
 | `runner_path`  | the runners' `.path` on this update                                                          |
 | `adopt`        | the next install or update of that tool's links                                              |
-| `legacy_units` | the guard from now on                                                                        |
 | `iar`          | `verify.sh` from now on                                                                      |
 | `skip`         | which tools are converged from now on; a tool already installed is left, not removed         |
 | `apt_skip`     | the next `setup.sh install`; `update` never installs or removes packages                     |
@@ -125,10 +125,9 @@ checks both files with `nft -c` first. A direct `nft -f` or `flush ruleset` drop
 `hil-runner-tinyusb` first, `systemctl reload nftables` to load both again, run
 `sudo /opt/hil-farm/verify.sh --maintenance`, then start the runner. The owner's plain files at a farm link (such as
 `/usr/local/bin/openocd`) are moved to `<path>.pre-hil-farm` when they still match the hash the host file's `adopt`
-gives, never over an earlier backup. `farm.py guard` also refuses while a unit in `legacy_units` runs, such as the
-host's runner from before the farm.
+gives, never over an earlier backup.
 
-Install only after the owner agreed, with any legacy runner service stopped and disabled (kept for rollback).
+Install only after the owner agreed, with the host's earlier runner service, if any, stopped and disabled.
 
 ## Updating a tool
 
@@ -149,6 +148,12 @@ Install only after the owner agreed, with any legacy runner service stopped and 
    if the firmware changed) and `sudo /opt/hil-farm/verify.sh`.
 
 The actions runner is installed once into each runner root and not updated this way.
+
+An install from before host files (`ci` and `hfp` today) has no `SOURCE` and names its host in
+`/opt/hil-farm/profile`; its first `update --host` checks that name against the file and replaces the marker with
+`/etc/hil-farm/host.toml`. Its runner units had `UMask=0002`: that update rewrites them and drops the group write
+they left in `_work` and `_diag`, but what the admin already created there stays; `verify.sh --maintenance` names it,
+so remove that before starting the runners.
 
 Before a reinstall or update, sync with tinyusb: the `agentrc` tool's commit follows its `lib/agentrc` pin, and
 `scripts/udev/88-tinyusb.rules` is its file with the `adm` group as `hil`. Likewise `scripts/udev/*-tinyuf2-*.rules`

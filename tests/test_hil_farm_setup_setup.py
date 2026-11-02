@@ -120,6 +120,48 @@ class TestSetup(unittest.TestCase):
                 self.assertEqual((self.hooks / f).stat().st_mode & 0o777, 0o755)
         self.assertFalse((self.hooks / 'job-started.sh').exists())
 
+    def test_the_runner_service_drops_the_group_write_an_old_unit_left(self):
+        runners, units = self.tmp / 'runners', self.tmp / 'units'
+        units.mkdir()
+        self.hooks.mkdir()
+        common = self.dir / 'common.sh'
+        common.write_text(common.read_text().replace('/opt/actions-runner', str(runners)))
+        setup = self.dir / 'setup.sh'
+        setup.write_text(setup.read_text().replace('/etc/systemd/system/', f'{units}/'))
+        self.stub('systemctl', 'exit 0')
+        state = runners / 'tinyuf2' / '_work' / 'tinyuf2' / 'hil-state'
+        state.mkdir(parents=True)
+        (runners / 'tinyuf2' / '_diag').mkdir()
+        files = {state / 'run.json': 0o664, runners / 'tinyuf2' / '_diag' / 'Runner.log': 0o664}
+        for f, mode in files.items():
+            f.write_text('kept\n')
+            f.chmod(mode)
+        for d in (state, state.parent, state.parent.parent):
+            d.chmod(0o775)
+        (state / 'link').symlink_to(self.tmp)
+        self.tmp.chmod(0o775)
+        self.sourced('setup_runner_service tinyuf2')   # no unit yet: a fresh install's dirs are left as they are
+        self.assertEqual(state.stat().st_mode & 0o777, 0o775)
+        (units / 'hil-runner-tinyuf2.service').write_text('[Service]\nUMask=0002\n')
+        (units / 'hil-runner-tinyusb.service').write_text('[Service]\nUMask=0002\n')
+        self.sourced('setup_runner_service tinyuf2; setup_runner_service tinyusb')   # tinyusb: no _work yet
+        for f in files:
+            self.assertEqual((f.stat().st_mode & 0o777, f.read_text()), (0o644, 'kept\n'))
+        for d in (state, state.parent, state.parent.parent):
+            self.assertEqual(d.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(self.tmp.stat().st_mode & 0o777, 0o775, 'a link is not followed')
+        outside = self.tmp / 'outside'
+        outside.mkdir()
+        outside.chmod(0o775)
+        diag = runners / 'tinyuf2' / '_diag'
+        shutil.rmtree(diag)
+        diag.symlink_to(outside)
+        (units / 'hil-runner-tinyuf2.service').write_text('[Service]\nUMask=0002\n')   # rewritten by the run above
+        r = self.run_sourced('setup_runner_service tinyuf2')
+        self.assertEqual(r.returncode, 1)
+        self.assertIn(f'{diag} is a symlink', r.stderr)
+        self.assertEqual(outside.stat().st_mode & 0o777, 0o775)
+
     def test_update_rewrites_every_runner_unit(self):
         setup = self.dir / 'setup.sh'
         setup.write_text(setup.read_text().replace('preflight() {', 'preflight() { return 0; }\nunused() {')

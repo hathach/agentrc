@@ -499,7 +499,7 @@ class TestRunnerInstall(FarmCase):
 def keep_host_globals(case):
     """Restore what use_host sets once case ends."""
     p = mock.patch.multiple(farm, **{g: getattr(farm, g) for g in
-                                     ('RUNNERS', 'RUNNER_DIRS', 'RUNNER_UNITS', 'LEGACY_UNITS', 'ADOPT')})
+                                     ('RUNNERS', 'RUNNER_DIRS', 'RUNNER_UNITS', 'ADOPT')})
     p.start()
     case.addCleanup(p.stop)
 
@@ -546,14 +546,13 @@ class TestHost(unittest.TestCase):
         cfg, _ = self.host('dedicated')
         self.assertEqual(cfg, farm.load())
         self.assertEqual(farm.RUNNERS, ('tinyusb', 'tinyuf2'))
-        self.assertEqual((farm.LEGACY_UNITS, farm.ADOPT), ((), {}))
+        self.assertEqual(farm.ADOPT, {})
 
     def test_a_shared_host_narrows_runners_tools_and_apt(self):
         cfg, h = self.host('shared')
         self.assertEqual((h['shared'], h['iar']), (True, True))
         self.assertEqual(farm.RUNNER_DIRS, ('/opt/actions-runner/tinyusb',))
         self.assertEqual(farm.RUNNER_UNITS, ('hil-runner-tinyusb',))
-        self.assertEqual(farm.LEGACY_UNITS, ('actions.runner.example-runner.service',))
         self.assertEqual(set(farm.load()['tool']) - set(cfg['tool']), {'renesas-fw'})
         self.assertNotIn('unattended-upgrades', cfg['apt']['packages'])
         self.assertIn('nftables', cfg['apt']['packages'])
@@ -602,7 +601,7 @@ class TestHost(unittest.TestCase):
                             (lambda h: h.update(apt_skip=['nope']), 'apt_skip'),
                             (lambda h: h.update(runner_path=['rel/bin']), 'runner_path'),
                             (lambda h: h.update(runner_path=['/a:/b']), 'runner_path'),
-                            (lambda h: h.update(legacy_units=['x; rm']), 'legacy_units'),
+                            (lambda h: h.update(legacy_units=['x.service']), 'unknown fields'),
                             (lambda h: h.update(runners=['tinyusb']), 'unknown fields'),
                             (lambda h: h.update(checks=['iar']), 'unknown fields'),
                             (lambda h: h.update(adopt={'/etc/x': 'a' * 64}), 'adopt /etc/x'),
@@ -616,19 +615,6 @@ class TestHost(unittest.TestCase):
                 errs = farm.validate_host(h, cfg)
                 self.assertTrue(any(re.search(msg, e) for e in errs), errs)
         self.assertEqual(farm.validate_host(base, cfg), [])
-
-    def test_the_example_host_file_is_valid(self):
-        example = Path(farm.HERE).parent / 'examples' / 'host.toml'
-        cfg = farm.load()
-        self.assertEqual(farm.load_host(cfg, example)['profile'], 'lab')
-        # each commented field, uncommented where it stands, the adopt table with a real hash
-        text = re.sub(r'^# (\w+ = )', r'\1', example.read_text(), flags=re.M)
-        text = re.sub(r'^# (\[adopt\])', r'\1', text, flags=re.M)
-        text = re.sub(r'^# ("/usr/local/bin/openocd" = )"<sha256[^"]*"', r'\1"' + 'a' * 64 + '"', text, flags=re.M)
-        h = tomllib.loads(text)
-        self.assertEqual(set(h) - set(tomllib.loads(example.read_text())),
-                         {'skip', 'apt_skip', 'runner_path', 'legacy_units', 'iar', 'adopt'})
-        self.assertEqual(farm.validate_host(h, cfg), [])
 
     def test_validate_names_a_bad_host_file(self):
         bad = self.tmp / 'bad.toml'
@@ -645,6 +631,8 @@ class TestHost(unittest.TestCase):
         for path in hosts:
             with self.subTest(host=path.name):
                 farm.load_host(cfg, path)
+        # the README points at them as the examples: together they show every field
+        self.assertEqual(set().union(*(tomllib.loads(p.read_text()) for p in hosts)), farm.HOST_FIELDS)
 
 
 class TestInstallHost(unittest.TestCase):
@@ -685,13 +673,11 @@ class TestInstallHost(unittest.TestCase):
     def test_a_setting_change_keeps_the_previous_file(self):
         self.install(HOSTS / 'shared.toml')
         text = (HOSTS / 'shared.toml').read_text()
-        new = self.write('new.toml', text.replace('legacy_units = ["actions.runner.example-runner.service"]',
-                                                  'legacy_units = []').replace('iar = true', 'iar = false'))
+        new = self.write('new.toml', text.replace('iar = true', 'iar = false'))
         self.assertTrue(self.install(new))
         self.assertEqual(self.installed.read_text(), new.read_text())
         self.assertEqual(self.installed.with_name('host.toml.prev').read_text(), text)
-        # the guard still asks about the unit the new file drops
-        self.assertEqual(self.guarded[-1], ['actions.runner.example-runner.service', 'hil-runner-tinyusb'])
+        self.assertEqual(self.guarded[-1], ['hil-runner-tinyusb'])
 
     def test_an_identity_change_refuses(self):
         self.install(HOSTS / 'dedicated.toml')
@@ -794,13 +780,6 @@ class TestGuard(unittest.TestCase):
     def test_every_runner_unit_is_asked(self):
         asked = [c.args[0][2] for c in self.guard_with('inactive', 1).call_args_list if c.args[0][0] == 'systemctl']
         self.assertEqual(asked, ['hil-runner-tinyusb', 'hil-runner-tinyuf2'])
-
-    def test_legacy_units_are_asked_too(self):
-        with mock.patch.object(farm, 'LEGACY_UNITS', ('old.service',)):
-            asked = [c.args[0][2] for c in self.guard_with('inactive', 1).call_args_list if c.args[0][0] == 'systemctl']
-            self.assertEqual(asked, [*farm.RUNNER_UNITS, 'old.service'])
-            with self.assertRaisesRegex(farm.FarmError, 'old.service is active'):
-                self.guard_with({**{u: 'inactive' for u in farm.RUNNER_UNITS}, 'old.service': 'active'}, 1)
 
     def test_one_running_unit_refuses(self):
         for running in farm.RUNNER_UNITS:

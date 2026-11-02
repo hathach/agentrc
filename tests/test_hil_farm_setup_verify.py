@@ -5,6 +5,7 @@ import unittest
 if os.name == 'nt':
     raise unittest.SkipTest('the HIL farm setup runs on Debian: bash, fcntl, Linux paths')
 
+import getpass
 import shutil
 import subprocess
 import tempfile
@@ -195,6 +196,17 @@ class TestVerify(unittest.TestCase):
         self.assertIn('FAIL  tinyuf2 runner _work ghrunner-tinyuf2:ghrunner-tinyuf2 0750', out)
         self.assertNotIn('runner service active', self.verify('--maintenance').stdout)
 
+    def test_nothing_in_a_runner_tree_may_be_the_admins(self):
+        d = self.register('tinyusb')
+        for admin, want in (('root', 'ok   '), (getpass.getuser(), 'FAIL ')):
+            with self.subTest(admin=admin):
+                self.host = self.tmp / f'{admin}.toml'
+                self.host.write_text((HOSTS / 'dedicated.toml').read_text()
+                                     .replace('admin = "admin"', f'admin = "{admin}"'))
+                out = self.verify().stdout
+                self.assertIn(f'{want} tinyusb runner _work and _diag hold nothing of {admin}\'s', out)
+        self.assertRegex(out, f'hold nothing of {getpass.getuser()}\'s: {d}/_(work|diag)')
+
     def test_a_runner_unit_must_keep_umask_0022(self):
         self.register('tinyusb')
         for umask, want in (('0022', 'ok   '), ('0002', 'FAIL ')):
@@ -254,7 +266,6 @@ class TestVerify(unittest.TestCase):
         self.assertNotIn('/etc/environment', out)
         self.assertNotIn('tinyuf2', out)
         self.assertIn("FAIL  nftables loads the owner's rules with hil_farm (drop-in only)", out)
-        self.assertIn('ok    legacy runner actions.runner.example-runner.service not active\n', out)
         self.assertIn('FAIL  sshd denies ghrunner', out)
         self.assertIn('FAIL  iccarm on the runner PATH', out)
         self.assertIn("ok    tinyusb runner .path is farm.toml's\n", out)
@@ -293,7 +304,6 @@ class TestVerify(unittest.TestCase):
         out = self.verify().stdout
         self.assertNotIn('maintenance', out)
         self.assertNotIn('drop-in', out)
-        self.assertNotIn('legacy runner', out)
         self.assertNotIn('sshd denies', out)
         self.assertNotIn('iccarm', out)
         self.assertNotIn('hides /home', out)

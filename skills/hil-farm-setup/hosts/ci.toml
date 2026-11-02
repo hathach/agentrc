@@ -1,8 +1,8 @@
 # ci.lan (VM 100 on pve): the TinyUSB and TinyUF2 HIL farm, the host alone.
-profile = "ci"
-admin = "hathach"
+profile = "ci"      # this host's name; a host keeps it, so a mistaken file refuses
+admin = "hathach"   # the admin account: SSH key only and passwordless sudo on a dedicated host
 
-[runner.tinyusb]
+[runner.tinyusb]  # one table per runner, of tinyusb and tinyuf2: its name and labels on GitHub
 name = "tinyusb"
 labels = ["hardware-in-the-loop", "hathach"]
 

@@ -1,12 +1,11 @@
 # HiFiPhile's tusb VM (ssh alias hifiphile): the farm beside its owner's own setup.
 profile = "hfp"
 admin = "tusb"
-shared = true
-skip = ["renesas-fw"]                                   # no uPD720201 cards
-apt_skip = ["unattended-upgrades", "systemd-timesyncd"]  # the owner's update and time policy
-runner_path = ["/opt/iar/cxarm/arm/bin"]                # the owner's IAR: hil-hfp-iar builds with iccarm
-legacy_units = ["actions.runner.hathach-tinyusb.tusb_hifiphile.service"]  # its runner before the farm
-iar = true
+shared = true                                           # its owner keeps sshd, firewall, sudo (README)
+skip = ["renesas-fw"]                                   # farm.toml tools never installed: no uPD720201 cards
+apt_skip = ["unattended-upgrades", "systemd-timesyncd"]  # apt.packages left to the owner's update and time policy
+runner_path = ["/opt/iar/cxarm/arm/bin"]                # on the runners' PATH only: the owner's IAR for hil-hfp-iar
+iar = true                                              # verify.sh checks iccarm, cmake >= 3.20, ninja on that PATH
 
 [runner.tinyusb]  # build.yml's hfp legs run on the hifiphile label
 name = "tusb_hifiphile"

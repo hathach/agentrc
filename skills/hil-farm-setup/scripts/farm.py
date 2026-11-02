@@ -8,7 +8,6 @@
   farm.py path                      print the farm's PATH
   farm.py runner-path               print the runners' PATH: the farm's plus the host's runner_path
   farm.py tools                     print the host's tools, one per line
-  farm.py legacy-units              print the host's legacy runner units, one per line
   farm.py host-sh                   print the host file as shell assignments for common.sh
   farm.py host-install FILE         install FILE as the host file, refusing an identity change
   farm.py guard                     fail unless every runner is stopped and no job runs
@@ -67,7 +66,6 @@ def set_runners(names):
 
 
 set_runners(KNOWN_RUNNERS)
-LEGACY_UNITS = ()  # runners of the host's earlier setup: guard refuses while one runs
 ADOPT = {}  # {link path: sha256} of owner files switch_links may move aside
 TRUSTED_UIDS = {0}  # who may own an installed tool's links, targets and their directories
 INPUTS = None  # --inputs DIR: where kind local tools' files are
@@ -156,8 +154,8 @@ def validate_tool(name, t):
     return errs
 
 
-HOST_DEFAULTS = {'shared': False, 'iar': False, 'skip': [], 'apt_skip': [], 'runner_path': [], 'legacy_units': [],
-                 'adopt': {}}  # iar: verify.sh checks iccarm, cmake and ninja on the runner PATH
+# iar: verify.sh checks iccarm, cmake and ninja on the runner PATH
+HOST_DEFAULTS = {'shared': False, 'iar': False, 'skip': [], 'apt_skip': [], 'runner_path': [], 'adopt': {}}
 HOST_FIELDS = {'profile', 'admin', 'runner', *HOST_DEFAULTS}
 HOST_REQUIRED = {'profile', 'admin', 'runner'}
 IDENTITY = ('profile', 'admin', 'shared', 'runner')  # what only a reinstall or re-registration changes
@@ -198,8 +196,6 @@ def validate_host(h, cfg):
         errs.append('apt_skip names a package apt.packages does not list')
     if not all(d.startswith('/') and '..' not in Path(d).parts and ':' not in d for d in h.get('runner_path', [])):
         errs.append('runner_path entries must be absolute, without .. or :')
-    if not all(re.fullmatch(r'[A-Za-z0-9_.@-]+\.service', u) for u in h.get('legacy_units', [])):
-        errs.append('legacy_units must be .service names')
     links = {lk for t in cfg.get('tool', {}).values() for lk in t.get('links', {})}
     for link, sha in h.get('adopt', {}).items():
         if link not in links or not isinstance(sha, str) or not re.fullmatch(r'[0-9a-f]{64}', sha):
@@ -228,9 +224,8 @@ def load_host(cfg, path=None):
 
 def use_host(cfg, h):
     """Narrow cfg and the runner globals to the host's runners, tools and packages; returns h."""
-    global LEGACY_UNITS, ADOPT
+    global ADOPT
     set_runners(h['runner'])
-    LEGACY_UNITS = tuple(h['legacy_units'])
     ADOPT = {Path(k): v for k, v in h['adopt'].items()}
     cfg['tool'] = {n: t for n, t in cfg['tool'].items() if n not in h['skip']}
     cfg['apt']['packages'] = [a for a in cfg['apt']['packages'] if a not in h['apt_skip']]
@@ -251,13 +246,9 @@ def host_sh(h):
         assoc('RUNNER_REG_NAMES', lambda r: r['name']), assoc('RUNNER_REG_LABELS', lambda r: ','.join(r['labels']))])
 
 
-def host_units(h):
-    return (*runner_units(h['runner']), *h['legacy_units'])
-
-
 def install_host(cfg, src):
     """Make src the installed host file. A host keeps its identity; an install from before host files keeps its
-    profile name. Refuses while any runner or legacy unit of either file runs."""
+    profile name. Refuses while any of its runners runs."""
     new = load_host(cfg, src)
     data = Path(src).read_bytes()
     old = load_host(cfg, INSTALLED_HOST) if INSTALLED_HOST.exists() else None
@@ -275,7 +266,7 @@ def install_host(cfg, src):
     elif (FARM_HOME / 'farm.toml').exists():
         raise FarmError(f'{FARM_HOME} holds an install with no host file and no profile marker; write its '
                         f'profile name to {OLD_MARKER} to confirm it is {new["profile"]}, then rerun')
-    guard(sorted({*host_units(new), *(host_units(old) if old else ())}))
+    guard(sorted(runner_units(new['runner'])))  # the runners are identity: old and new name the same
     INSTALLED_HOST.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
     if old is not None:
         shutil.copyfile(INSTALLED_HOST, INSTALLED_HOST.with_name('host.toml.prev'))
@@ -705,7 +696,7 @@ def guard(units=None):
     """Refuse to change the farm while a runner may run a job; fail closed on any doubt."""
     try:
         states = {u: subprocess.run(['systemctl', 'is-active', u], capture_output=True, text=True).stdout.strip()
-                  for u in (units or RUNNER_UNITS + LEGACY_UNITS)}
+                  for u in (units or RUNNER_UNITS)}
         workers = subprocess.run(['pgrep', '-x', 'Runner.Worker'], capture_output=True).returncode
     except OSError as e:
         raise FarmError(f'cannot inspect the runners: {e}')
@@ -768,7 +759,6 @@ def main(argv=None):
     sub.add_parser('path')
     sub.add_parser('runner-path')
     sub.add_parser('tools')
-    sub.add_parser('legacy-units')
     sub.add_parser('host-sh')
     sub.add_parser('host-install').add_argument('file')
     sub.add_parser('guard')
@@ -812,8 +802,6 @@ def main(argv=None):
             print(':'.join([cfg['farm']['path'], *host['runner_path']]))
         elif args.cmd == 'tools':
             print('\n'.join(cfg['tool']))
-        elif args.cmd == 'legacy-units':
-            print('\n'.join(LEGACY_UNITS))
         elif args.cmd == 'guard':
             guard()
         elif args.cmd == 'trusted':

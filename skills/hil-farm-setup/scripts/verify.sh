@@ -24,7 +24,7 @@ case "${1:-}" in "") ;; --maintenance) maintenance=1 ;; *) echo "usage: verify.s
 # the PATH ssh commands get; a shared host's sessions keep the owner's, so the checks take the farm's
 if ! shared_host; then set -a; . /etc/environment; set +a; fi
 farm_env=$(farm env) && farm_path=$(farm path) && runner_path=$(farm runner-path) && tools=$(farm tools) \
-  && legacy_units=$(farm legacy-units) || { echo "verify: cannot read $HERE/farm.toml" >&2; exit 2; }
+  || { echo "verify: cannot read $HERE/farm.toml" >&2; exit 2; }
 if shared_host; then export PATH=$farm_path; fi
 [ -n "$ADMIN_HOME" ] || { echo "verify: no home for $ADMIN" >&2; exit 2; }
 
@@ -114,9 +114,6 @@ if out=$(farm trusted "${runner_dirs[@]}" 2>&1); then
 else
   fail "runner PATH writable by root only, so none of its tools run here: $(tail -1 <<<"$out")"
 fi
-while IFS= read -r u; do
-  [ -z "$u" ] || check "legacy runner $u not active" sh -c "! systemctl is-active -q $u"
-done <<<"$legacy_units"
 for h in /home/*; do
   if shared_host && [ "$h" = "$ADMIN_HOME" ]; then continue; fi  # the runner units hide it instead
   [ $(( 8#$(stat -c %a "$h") & 8#007 )) = 0 ] && ok "$h not world-accessible" || fail "$h mode $(stat -c %a "$h")"
@@ -162,6 +159,10 @@ for name in "${RUNNERS[@]}"; do
     check "$name runner $f $RUNNER_USER:$RUNNER_USER 0750" \
       sh -c "[ \"\$(stat -c %U:%G:%a $RUNNER_DIR/$f)\" = $RUNNER_USER:$RUNNER_USER:750 ]"
   done
+  # a job cannot remove what the admin left there (UMask=0002 units before 0022)
+  check "$name runner _work and _diag hold nothing of $ADMIN's" \
+    sh -c 'o=$(find "$1/_work" "$1/_diag" -user "$2" -print -quit) || exit 1; [ -z "$o" ] || { echo "$o"; exit 1; }' \
+    _ "$RUNNER_DIR" "$ADMIN"
   for f in .env .path runsvc.sh run.sh bin; do
     check "$name runner $f not writable by $RUNNER_USER" sh -c "! runuser -u $RUNNER_USER -- test -w $RUNNER_DIR/$f"
   done
