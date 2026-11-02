@@ -119,7 +119,8 @@ class Run(Checkout):
         with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit) as e:
             self.main('run', '--run-id', 'r1', '-t', 'cdc_echo')
         self.assertEqual(e.exception.code, 2)
-        self.assertIn("choose from echo, info, inout, probe", err.getvalue())
+        # newer argparse quotes each choice
+        self.assertIn("choose from echo, info, inout, probe", err.getvalue().replace("'", ''))
         with self.assertRaisesRegex(SystemExit, 'no selected board runs any of'):
             self.main('run', '--run-id', 'r1', '-b', 'rig_host', '-t', 'echo')
 
