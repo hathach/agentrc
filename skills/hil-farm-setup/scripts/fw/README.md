@@ -3,19 +3,16 @@
 `renesas_usb_fw.mem` is firmware 2.0.2.6 for the uPD720201/202 xHCI controllers on the farm's USB cards. setup
 installs it as `/lib/firmware/renesas_usb_fw.mem`.
 
-| Field   | Value                                                                                                     |
-|---------|-----------------------------------------------------------------------------------------------------------|
-| Size    | 13012 bytes                                                                                               |
-| sha256  | `177560c224c73d040836b17082348036430ecf59e8a32d7736ce2b80b2634f97`                                        |
-| md5     | `11b49c68a400564b704c6ef17a0e6c0a`                                                                        |
-| Source  | `k2026fwup1.exe` (Windows self-extracting CAB, 1895424 bytes), station-drivers file 1348                  |
-| Extract | `7z x` or `cabextract`; the blob inside is `UPDATE.mem`, dated 2013-10-17                                 |
-| Same as | `UPDATE.mem` in <https://github.com/o61o/uPD72020x-Firmware>, byte for byte (git blob `47424d45`)         |
+| Field  | Value |
+|--------|---|
+| Size   | 13012 bytes |
+| sha256 | `177560c224c73d040836b17082348036430ecf59e8a32d7736ce2b80b2634f97`, the pin setup checks (`farm.toml`) |
+| Source | [`UPDATE.mem`](https://raw.githubusercontent.com/o61o/uPD72020x-Firmware/1cf8542aa64d816301ea286a8937d9b09ebcbc99/UPDATE.mem) in [o61o/uPD72020x-Firmware](https://github.com/o61o/uPD72020x-Firmware), commit `1cf8542` |
 
-Source page: <https://www.station-drivers.com/index.php/en/component/remository/func-fileinfo/1348/lang,en-gb/>. The
-package's updater tools carry Renesas Electronics Corporation Authenticode signatures; the blob itself is unsigned.
+The file is byte for byte the `UPDATE.mem` of Renesas' `k2026fwup1.exe` updater package, whose tools carry Renesas
+Electronics Corporation Authenticode signatures; the blob itself is unsigned.
 
-Proprietary Renesas firmware, under the Renesas licence in the package's `License.rtf`, not this repository's MIT
+Proprietary Renesas firmware, under the Renesas licence in that repository's `License.rtf`, not this repository's MIT
 licence.
 
 The running version is bits 23:8 of PCI config register `0x6c` (`setpci -s <bdf> 0x6c.l`; uPD720201/202 User's
