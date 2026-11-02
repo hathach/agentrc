@@ -613,10 +613,12 @@ def send_note(repo, pr, x, persist):
         x['error'] = (err or out).strip()[:300] or 'no reply id in the answer'
 
 
-def settle_note(repo, pr, led, f, x, head, persist):
-    """Read the note back, then resolve its thread while it still stands as the note answered it: a note never
-    acknowledges a reply, an edit or a push it was not sent against."""
+def settle_note(repo, pr, led, f, x, row, head, persist):
+    """Read the note back, then resolve its thread while it still stands as the note answered it and this run's fix
+    check (`row`, on `head`) judged that same claim: a note never acknowledges a reply, an edit or a push it was not
+    sent against."""
     snap, why = unfit(repo, pr, led, f, x['claimDigest'], head)
+    why = why or ('the claim changed since its fix check' if row['claimDigest'] != x['claimDigest'] else None)
     c = note_reply(snap, x)
     if x['state'] in ('sent', 'uncertain'):
         if c and ledger_digest(c['body']) == x['digest']:
@@ -629,6 +631,8 @@ def settle_note(repo, pr, led, f, x, head, persist):
     why = (None if t and t['resolved'] else why or ('our note was deleted' if c is None else
                                                      'our note was edited' if ledger_digest(c['body']) != x['digest'] else None))
     x.update(resolve='observed' if t and t['resolved'] else 'deferred' if why else 'sent', error=why)
+    if x['resolve'] == 'sent':
+        x['resolveCheck'] = {'head': head, 'evidence': row['evidence']}  # the fix check the resolve stands on
     persist()
     if x['resolve'] == 'sent':
         # Stored before the mutation: a resolve not confirmed resolved is never tried again.
@@ -677,7 +681,7 @@ def fix_notes(repo, pr, led, m, head, persist):
                  'before': t['commentIds'], 'state': 'sent', 'replyId': None, 'resolve': None, 'error': None, 'at': now()}
             rev.setdefault('repairs', []).append(x)
             send_note(repo, pr, x, persist)
-        settle_note(repo, pr, led, f, x, head, persist)
+        settle_note(repo, pr, led, f, x, row, head, persist)
         out.append(receipt(x))
     done = all(r['resolve'] in ('resolved', 'observed') and r['state'] == 'published' for r in out)
     return {'status': 'repaired' if done else 'partial', 'repairs': out}

@@ -2425,6 +2425,17 @@ class Repair(PostCase):
                           ('pr7-f3', None, f"the PR head moved to {'f' * 40} since the repair")])
         self.assertEqual(len(self.gh.notes), 1, 'the second note is never sent on a moved head')
 
+    def test_a_note_deferred_on_one_head_resolves_on_another_only_for_the_same_claim(self):
+        self.after_note(lambda: setattr(self.gh, 'head', 'f' * 40))
+        self.assertEqual(self.fixed()['repairs'][0]['resolve'], 'deferred')
+        del self.gh.gh  # the head stays moved; a fix check on it comes next
+        out = self.fixed(self.row(checkedSha='f' * 40, claimDigest='0' * 16), head='f' * 40)
+        self.assertEqual((out['repairs'][0]['resolve'], out['repairs'][0]['error']), ('deferred', 'the claim changed since its fix check'))
+        self.assertFalse(self.thread()['isResolved'])
+        out = self.fixed(self.row(checkedSha='f' * 40), head='f' * 40)
+        self.assertEqual(out['status'], 'repaired')
+        self.assertEqual(self.review()['repairs'][0]['resolveCheck'], {'head': 'f' * 40, 'evidence': str(self.evidence)})
+
     def test_a_root_edited_after_the_note_is_never_resolved(self):
         self.after_note(lambda: next(c for c in self.gh.inline if c['id'] == self.root).update(body='b may be uninitialised'))
         out = self.fixed()
