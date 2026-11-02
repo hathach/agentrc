@@ -418,11 +418,7 @@ case "$CMD" in
     install_tools install
     setup_rig
     setup_runners
-    if grep -qx renesas-fw <<<"$(farm tools)"; then
-      log "done; reboot to load the Renesas firmware, then run $FARM_HOME/verify.sh"
-    else
-      log "done; run $FARM_HOME/verify.sh"
-    fi
+    log "done; reboot to load the Renesas firmware, then run $FARM_HOME/verify.sh"
     ;;
   update)
     preflight

@@ -39,7 +39,6 @@ while a runner runs, and applies:
 |----------------|----------------------------------------------------------------------------------------------|
 | `runner_path`  | the runners' `.path` on this update                                                          |
 | `iar`          | `verify.sh` from now on                                                                      |
-| `skip`         | which tools are converged from now on; a tool already installed is left, not removed         |
 
 ## Install
 
@@ -108,8 +107,9 @@ Nothing else checks it, and on older firmware a usbtest battery kills the contro
 ## A host its owner also uses (`shared = true`)
 
 The farm installs beside the owner's setup instead of rebuilding the host: usually one runner, `tinyusb`, as
-`ghrunner` with `hil_root` as its only sudo, the same pinned tools (the host file can `skip` the Renesas firmware) and
-the owner's toolchains on the runner's PATH only (`runner_path`).
+`ghrunner` with `hil_root` as its only sudo, the same pinned tools and the owner's toolchains on the runner's PATH
+only (`runner_path`). The Renesas firmware is one of those tools: setup writes `/lib/firmware/renesas_usb_fw.mem` and
+rebuilds the initramfs there too.
 
 What stays the owner's: the admin account (it joins `hil`) with its sudo, ssh keys and home, sshd's policy (the farm
 adds only `DenyUsers ghrunner`, as a runner user's ssh session would run outside its unit), the apt update and time

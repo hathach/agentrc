@@ -7,7 +7,6 @@
   farm.py env                       print the farm's environment lines
   farm.py path                      print the farm's PATH
   farm.py runner-path               print the runners' PATH: the farm's plus the host's runner_path
-  farm.py tools                     print the host's tools, one per line
   farm.py host-sh                   print the host file as shell assignments for common.sh
   farm.py host-install FILE         install FILE as the host file, refusing an identity change
   farm.py guard                     fail unless every runner is stopped and no job runs
@@ -154,7 +153,7 @@ def validate_tool(name, t):
 
 
 # iar: verify.sh checks iccarm, cmake and ninja on the runner PATH
-HOST_DEFAULTS = {'shared': False, 'iar': False, 'skip': [], 'runner_path': []}
+HOST_DEFAULTS = {'shared': False, 'iar': False, 'runner_path': []}
 HOST_FIELDS = {'profile', 'admin', 'runner', *HOST_DEFAULTS}
 HOST_REQUIRED = {'profile', 'admin', 'runner'}
 IDENTITY = ('profile', 'admin', 'shared', 'runner')  # what only a reinstall or re-registration changes
@@ -189,8 +188,6 @@ def validate_host(h, cfg):
                 or not re.fullmatch(NAME, r['name']) or not strs(r['labels']) or not r['labels'] \
                 or not all(re.fullmatch(NAME, lb) for lb in r['labels']):
             errs.append(f'runner.{n}: name and labels, each {NAME}')
-    if set(h.get('skip', [])) - set(cfg.get('tool', {})):
-        errs.append(f'skip names unknown tools {sorted(set(h["skip"]) - set(cfg.get("tool", {})))}')
     if not all(d.startswith('/') and '..' not in Path(d).parts and ':' not in d for d in h.get('runner_path', [])):
         errs.append('runner_path entries must be absolute, without .. or :')
     return errs
@@ -215,10 +212,9 @@ def load_host(cfg, path=None):
     return {**copy.deepcopy(HOST_DEFAULTS), **h}
 
 
-def use_host(cfg, h):
-    """Narrow cfg and the runner globals to the host's runners, tools and packages; returns h."""
+def use_host(h):
+    """Set the runner globals to the host's runners; returns h."""
     set_runners(h['runner'])
-    cfg['tool'] = {n: t for n, t in cfg['tool'].items() if n not in h['skip']}
     return h
 
 
@@ -734,7 +730,6 @@ def main(argv=None):
     sub.add_parser('env')
     sub.add_parser('path')
     sub.add_parser('runner-path')
-    sub.add_parser('tools')
     sub.add_parser('host-sh')
     sub.add_parser('host-install').add_argument('file')
     sub.add_parser('guard')
@@ -760,7 +755,7 @@ def main(argv=None):
             with root_lock():
                 print(f'host  {INSTALLED_HOST} {"installed" if install_host(cfg, args.file) else "unchanged"}')
             return 0
-        host = use_host(cfg, load_host(cfg)) if args.cmd not in ('fetch', 'env', 'path', 'trusted') else None
+        host = use_host(load_host(cfg)) if args.cmd not in ('fetch', 'env', 'path', 'trusted') else None
         if args.cmd == 'host-sh':
             print(host_sh(host))
         elif args.cmd == 'fetch':
@@ -777,8 +772,6 @@ def main(argv=None):
             print(cfg['farm']['path'])
         elif args.cmd == 'runner-path':
             print(':'.join([cfg['farm']['path'], *host['runner_path']]))
-        elif args.cmd == 'tools':
-            print('\n'.join(cfg['tool']))
         elif args.cmd == 'guard':
             guard()
         elif args.cmd == 'trusted':

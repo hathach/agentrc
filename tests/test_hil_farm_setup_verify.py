@@ -253,14 +253,12 @@ class TestVerify(unittest.TestCase):
 
     def test_a_shared_host_checks_the_owner_boundary_instead_of_the_farm_host_policy(self):
         self.use_shared()
-        self.stub_check('echo "FAIL  renesas"; exit 1')
         self.stub('iccarm', 'exit 1')  # whatever this machine has installed
         d = self.register('tinyusb')
         path = subprocess.run(['python3', '-I', str(self.dir / 'farm.py'), 'runner-path'], capture_output=True, text=True,
                               env={**os.environ, 'HIL_FARM_HOST': str(self.host)})
         (d / '.path').write_text(path.stdout)
         out = self.verify().stdout
-        self.assertNotIn('enesas', out)
         self.assertNotIn('sshd: want', out)
         self.assertNotIn('ok    sshd ', out)
         self.assertNotIn('/etc/environment', out)

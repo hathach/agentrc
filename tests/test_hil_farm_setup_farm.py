@@ -522,7 +522,7 @@ class TestRunnersMatchCommon(unittest.TestCase):
                                      env={**os.environ, 'HIL_FARM_HOST': str(host)}).stdout
                 keep_host_globals(self)
                 cfg = farm.load()
-                farm.use_host(cfg, farm.load_host(cfg, host))
+                farm.use_host(farm.load_host(cfg, host))
                 want = [' '.join(r) for r in zip(farm.RUNNERS, farm.RUNNER_DIRS, farm.RUNNER_UNITS)]
                 self.assertEqual(out.splitlines(), want)
 
@@ -536,7 +536,7 @@ class TestHost(unittest.TestCase):
 
     def host(self, name):
         cfg = farm.load()
-        return cfg, farm.use_host(cfg, farm.load_host(cfg, HOSTS / f'{name}.toml'))
+        return cfg, farm.use_host(farm.load_host(cfg, HOSTS / f'{name}.toml'))
 
     def test_the_installed_host_file_unless_one_is_named(self):
         with mock.patch.dict(os.environ, {'HIL_FARM_HOST': ''}):
@@ -554,12 +554,11 @@ class TestHost(unittest.TestCase):
         self.assertEqual(cfg, farm.load())
         self.assertEqual(farm.RUNNERS, ('tinyusb', 'tinyuf2'))
 
-    def test_a_shared_host_narrows_runners_tools_and_apt(self):
-        cfg, h = self.host('shared')
+    def test_a_shared_host_narrows_runners(self):
+        _, h = self.host('shared')
         self.assertEqual((h['shared'], h['iar']), (True, True))
         self.assertEqual(farm.RUNNER_DIRS, ('/opt/actions-runner/tinyusb',))
         self.assertEqual(farm.RUNNER_UNITS, ('hil-runner-tinyusb',))
-        self.assertEqual(set(farm.load()['tool']) - set(cfg['tool']), {'renesas-fw'})
 
     def test_only_a_dedicated_host_gets_the_policy_packages(self):
         policy = set(farm.load()['apt']['policy'])
@@ -600,7 +599,6 @@ class TestHost(unittest.TestCase):
                             (lambda h: h.update(admin='-x'), 'admin must'),
                             (lambda h: h.update(shared='yes'), r"wrong types for \['shared'\]"),
                             (lambda h: h.update(profile=1), r"wrong types for \['profile'\]"),
-                            (lambda h: h.update(skip='renesas-fw'), r"wrong types for \['skip'\]"),
                             (lambda h: h['runner']['tinyusb'].update(labels='lab'), 'runner.tinyusb: name and labels'),
                             (lambda h: h['runner']['tinyusb'].update(name=1), 'runner.tinyusb: name and labels'),
                             (lambda h: h['runner'].update(tinyusb='x'), 'runner.tinyusb: name and labels'),
@@ -611,7 +609,7 @@ class TestHost(unittest.TestCase):
                             (lambda h: h['runner']['tinyusb'].update(labels=[]), 'runner.tinyusb: name and labels'),
                             (lambda h: h['runner']['tinyusb'].update(labels=['a,b']), 'runner.tinyusb'),
                             (lambda h: h['runner']['tinyusb'].update(other=1), 'runner.tinyusb'),
-                            (lambda h: h.update(skip=['nope']), 'skip names unknown'),
+                            (lambda h: h.update(skip=['renesas-fw']), 'unknown fields'),
                             (lambda h: h.update(runner_path=['rel/bin']), 'runner_path'),
                             (lambda h: h.update(runner_path=['/a:/b']), 'runner_path'),
                             (lambda h: h.update(legacy_units=['x.service']), 'unknown fields'),

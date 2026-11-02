@@ -23,15 +23,12 @@ case "${1:-}" in "") ;; --maintenance) maintenance=1 ;; *) echo "usage: verify.s
 [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 2; }
 # the PATH ssh commands get; a shared host's sessions keep the owner's, so the checks take the farm's
 if ! shared_host; then set -a; . /etc/environment; set +a; fi
-farm_env=$(farm env) && farm_path=$(farm path) && runner_path=$(farm runner-path) && tools=$(farm tools) \
+farm_env=$(farm env) && farm_path=$(farm path) && runner_path=$(farm runner-path) \
   || { echo "verify: cannot read $HERE/farm.toml" >&2; exit 2; }
 if shared_host; then export PATH=$farm_path; fi
 [ -n "$ADMIN_HOME" ] || { echo "verify: no home for $ADMIN" >&2; exit 2; }
 
-# the Renesas controllers' firmware, on a host that installs it
-if grep -qx renesas-fw <<<"$tools"; then
-  "$HERE/fw/renesas_fw_check.sh" || fail "Renesas firmware (fw/renesas_fw_check.sh)"
-fi
+"$HERE/fw/renesas_fw_check.sh" || fail "Renesas firmware (fw/renesas_fw_check.sh)"  # passes with no uPD72020x
 check "usbmon loaded" test -d /sys/module/usbmon
 check "usbtest loaded" test -d /sys/module/usbtest
 
