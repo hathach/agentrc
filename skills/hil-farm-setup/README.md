@@ -154,7 +154,8 @@ they left in `_work` and `_diag`, but what the admin already created there stays
 so remove that before starting the runners.
 
 Before a reinstall or update, sync with tinyusb: the `agentrc` tool's commit follows its `lib/agentrc` pin, and
-`scripts/udev/88-tinyusb.rules` is its file with the `adm` group as `hil`. Likewise `scripts/udev/*-tinyuf2-*.rules`
+`scripts/udev/88-tinyusb.rules` is its file with the `adm` group as `hil` and without its catch-all hidraw rule, which
+gives every local user every HID device, a shared host owner's too. Likewise `scripts/udev/*-tinyuf2-*.rules`
 are tinyuf2's commissioning rules (`.claude/skills/hil-contract/commissioning.md`) with `adm` as `hil`; its harness
 matches the exclusion lines as written. `common.sh`'s tinyuf2 `RUNNER_STATE` is its `hil_remote.py` `ciStateRoot`.
 

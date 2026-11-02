@@ -362,6 +362,20 @@ EOF
   systemctl daemon-reload
 )
 
+# a registered runner's jobs could plant links there; root's install -d, chmod and chown would follow them
+runner_dirs_ok() {  # each runner-owned dir, and every component of its path under RUNNER_DIR, a real dir or missing
+  local rel p part parts
+  for rel in _work _diag ${RUNNER_STATE:+"$RUNNER_STATE"}; do
+    p=$RUNNER_DIR
+    IFS=/ read -ra parts <<<"$rel"
+    for part in "${parts[@]}"; do
+      p=$p/$part
+      [ ! -L "$p" ] || die "$p is a symlink; a runner's tree is its own"
+      [ ! -e "$p" ] || [ -d "$p" ] || die "$p is not a directory"
+    done
+  done
+}
+
 register_runner() {  # NAME TOKEN, checked by the caller
   local token=$2
   runner_conf "$1"
@@ -370,6 +384,7 @@ register_runner() {  # NAME TOKEN, checked by the caller
   fi
   [ -d "$RUNNER_DIR/bin" ] || die "runner not installed; run setup.sh install first"
   ! systemctl is-active -q "$RUNNER_UNIT" || die "$RUNNER_UNIT is running; stop it when idle first"
+  runner_dirs_ok
   setup_runner_service "$1"
   # disabled and stopped until its hardware proof, a reboot included
   systemctl disable -q "$RUNNER_UNIT" || die "cannot disable $RUNNER_UNIT"
@@ -390,10 +405,12 @@ register_runner() {  # NAME TOKEN, checked by the caller
   # files, but runner-owned config persists across jobs: acceptable only for trusted runs.
   # Group = the runner's own, which holds the admin too; nothing for others, the other runner included.
   chown -R root:root "$RUNNER_DIR"
+  runner_dirs_ok   # again, now that no runner process can change the tree: config.sh ran as the runner
   chown -R "$RUNNER_USER:$RUNNER_USER" "$RUNNER_DIR/_work" "$RUNNER_DIR/_diag"
   chmod 0750 "$RUNNER_DIR/_work" "$RUNNER_DIR/_diag"
-  chown "$RUNNER_USER:$RUNNER_USER" "$RUNNER_DIR"/.runner "$RUNNER_DIR"/.credentials*
-  chmod 0600 "$RUNNER_DIR"/.runner "$RUNNER_DIR"/.credentials*
+  [ -f "$RUNNER_DIR/.runner" ] && [ ! -L "$RUNNER_DIR/.runner" ] || die "config.sh left no $RUNNER_DIR/.runner"
+  find "$RUNNER_DIR" -maxdepth 1 -type f \( -name .runner -o -name '.credentials*' \) \
+    -exec chown -h "$RUNNER_USER:$RUNNER_USER" {} + -exec chmod 0600 {} +
   chown root:"$RUNNER_USER" "$RUNNER_DIR"
   chmod 1770 "$RUNNER_DIR"
   log "registered; after hardware proof: systemctl enable --now $RUNNER_UNIT"

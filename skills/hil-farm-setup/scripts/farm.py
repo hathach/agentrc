@@ -581,6 +581,8 @@ def verify_tool(name, t):
         probs.append(f'installed {rec.get("version")} differs from farm.toml {t.get("version", "")}'.rstrip())
     kind = t['kind']
     if kind in DIR_KINDS:
+        if 'dir' not in rec:
+            return probs + ['installed as another kind (receipt has no dir)']
         dest = Path(rec['dir'])
         try:
             want = resolve_links(t, dest)
@@ -655,13 +657,29 @@ def install_tool(name, t, force):
             fetch(t['url'], t['sha256'], work / 'runner.tar.gz')
             for d in RUNNER_DIRS:
                 if d not in held:
-                    os.makedirs(d, mode=0o755, exist_ok=True)
-                    extract(work / 'runner.tar.gz', d)
+                    install_runner(work / 'runner.tar.gz', Path(d))
             write_receipt(name, t)
     probs = verify_tool(name, t)
     if probs:
         raise FarmError(f'{name}: ' + '; '.join(probs))
     print(f'inst  {name} {t.get("version", "")}')
+
+
+def install_runner(archive, d):
+    """Extract archive beside d and rename it into place whole: a runner dir with bin/ counts as installed, so an
+    interrupted extraction must never leave one."""
+    d.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(prefix=f'.{d.name}.hil-farm-', dir=d.parent))
+    try:
+        tmp.chmod(0o755)
+        extract(archive, tmp)
+        try:
+            os.rename(tmp, d)   # replaces only a missing or empty d
+        except OSError as e:
+            raise FarmError(f'{d} exists without a runner and is not empty ({e.strerror}); remove it first')
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
 
 
 def guard(units=None):

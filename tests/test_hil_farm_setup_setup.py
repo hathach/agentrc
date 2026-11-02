@@ -283,6 +283,46 @@ class TestSetup(unittest.TestCase):
                 self.assertNotIn('InaccessiblePaths', unit)
                 self.assertIn(f'--name lab-{name} --labels ', (self.tmp / 'config-args').read_text())
 
+    def test_re_registration_never_follows_a_link_a_job_planted(self):
+        for name, rel, kind in (('tinyusb', '_work', 'link'), ('tinyusb', '_diag', 'link'),
+                                ('tinyuf2', '_work/tinyuf2', 'link'), ('tinyuf2', '_work/tinyuf2/hil-state', 'link'),
+                                ('tinyusb', '_diag', 'file')):
+            with self.subTest(rel=rel, kind=kind):
+                self.setUp()
+                outside = self.tmp / 'outside'
+                outside.mkdir()
+                outside.chmod(0o775)
+                p = self.tmp / 'runners' / name / rel
+                p.parent.mkdir(parents=True)
+                if kind == 'link':
+                    p.symlink_to(outside)
+                else:
+                    p.write_text('')
+                with self.assertRaises(subprocess.CalledProcessError) as cm:
+                    self.registration(name, 'tinyusb-none')
+                self.assertIn(f'{p} is {("not a directory", "a symlink")[kind == "link"]}', cm.exception.stderr)
+                self.assertEqual(outside.stat().st_mode & 0o777, 0o775)
+                self.assertFalse((self.tmp / 'config-args').exists(), 'refused before registering')
+                self.assertFalse((self.tmp / 'etc' / 'units' / f'hil-runner-{name}.service').exists(),
+                                 'refused before any root change')
+
+    def test_registration_sets_only_the_runners_own_credential_files(self):
+        secret = self.tmp / 'secret'
+        secret.write_text('root only\n')
+        secret.chmod(0o644)
+        d = self.tmp / 'runners' / 'tinyusb'
+        d.mkdir(parents=True)
+        (d / '.credentials_planted').symlink_to(secret)
+        chowned = self.tmp / 'chowned'
+        self.registration('tinyusb', 'tinyusb-none')
+        self.stub('chown', f'echo "$@" >> {chowned}')
+        self.sourced('register_runner tinyusb tok')
+        self.assertEqual(secret.stat().st_mode & 0o777, 0o644)
+        self.assertNotIn('.credentials_planted', chowned.read_text())
+        self.assertIn(f'{d}/.credentials', chowned.read_text())
+        for f in ('.runner', '.credentials'):
+            self.assertEqual((d / f).stat().st_mode & 0o777, 0o600)
+
     def test_a_shared_host_registers_its_runner_bound_to_the_firewall_and_blind_to_the_owner(self):
         self.use_host('shared')
         before, after = self.registration('tinyusb', 'tinyusb-none')

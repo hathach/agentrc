@@ -287,6 +287,13 @@ class TestRegressions(FarmCase):
                 farm.install_tool('t', t, True)
         self.assertEqual(farm.verify_tool('t', t), [])
 
+    def test_a_receipt_of_another_kind_reinstalls(self):
+        farm.write_receipt('t', {'kind': 'deb', 'version': '1.0'})   # a deb's receipt has no dir
+        t = self.release('1.0')
+        self.assertIn('installed as another kind (receipt has no dir)', farm.verify_tool('t', t))
+        farm.install_tool('t', t, False)
+        self.assertEqual(farm.verify_tool('t', t), [])
+
     def test_failed_initramfs_is_retried(self):
         blob = b'\x02' * 64
         t, dest = self.firmware(blob)
@@ -548,6 +555,25 @@ class TestRunnerInstall(FarmCase):
         farm.install_tool('actions-runner', self.t, False)
         with self.assertRaisesRegex(farm.FarmError, 'runner updates are not supported'):
             farm.install_tool('actions-runner', bumped, False)
+
+    def test_an_interrupted_extraction_leaves_nothing_a_retry_refuses(self):
+        real = farm.extract
+
+        def interrupted(archive, dest):
+            real(archive, dest)   # bin/ is there, the rest of the runner is not
+            raise KeyboardInterrupt
+        with mock.patch.object(farm, 'extract', interrupted):
+            with self.assertRaises(KeyboardInterrupt):
+                farm.install_tool('actions-runner', self.t, False)
+        self.assertEqual(os.listdir(Path(self.dirs[0]).parent), [])
+        farm.install_tool('actions-runner', self.t, False)
+        self.assertEqual(farm.verify_tool('actions-runner', self.t), [])
+
+    def test_a_leftover_dir_without_a_runner_is_named(self):
+        Path(self.dirs[0], 'stray').mkdir(parents=True)
+        with self.assertRaisesRegex(farm.FarmError, f'{self.dirs[0]} exists without a runner'):
+            farm.install_tool('actions-runner', self.t, False)
+        self.assertEqual(sorted(os.listdir(Path(self.dirs[0]).parent)), [Path(self.dirs[0]).name])
 
 
 def keep_host_globals(case):

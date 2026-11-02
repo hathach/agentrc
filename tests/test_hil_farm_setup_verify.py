@@ -21,7 +21,6 @@ HOSTS = Path(__file__).resolve().parent / 'fixtures' / 'hil_farm_setup'
 INERT = ['sudo', 'runuser', 'curl', 'nft', 'sshd', 'passwd', 'lsusb', 'dfu-util', 'uhubctl']
 
 
-@unittest.skipIf('PATH=' in Path('/etc/environment').read_text(), '/etc/environment would replace the stub PATH')
 class TestVerify(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -39,8 +38,11 @@ class TestVerify(unittest.TestCase):
         self.sysfs.mkdir()
         v = self.dir / 'verify.sh'
         self.devusb = self.tmp / 'dev-bus-usb'
+        environment = self.tmp / 'environment'  # the host's could replace the stub PATH, or be missing
+        environment.touch()
         v.write_text(v.read_text().replace('/sys/bus/usb/devices/', f'{self.sysfs}/')
-                     .replace('/dev/bus/usb/', f'{self.devusb}/'))
+                     .replace('/dev/bus/usb/', f'{self.devusb}/')
+                     .replace('. /etc/environment;', f'. {environment};'))
         self.stubs = self.tmp / 'stubs'
         self.stubs.mkdir()
         self.stub('id', 'if [ "$1" = -u ]; then echo 0; else exec /usr/bin/id "$@"; fi')
@@ -93,6 +95,7 @@ class TestVerify(unittest.TestCase):
         self.verify(cwd=home)
         self.assertEqual((self.stubs / 'dfu-util.log').read_text(), '/\n')
 
+    @unittest.skipIf(os.geteuid() == 0, 'root opens a 0444 node')
     def test_each_runner_must_open_every_probe_node(self):
         for name, vid, bus, dev in (('3-1', '1366', '3', '7'), ('13-1.3', '0483', '13', '84'), ('1-2', '046d', '1', '2')):
             d = self.sysfs / name
@@ -196,6 +199,7 @@ class TestVerify(unittest.TestCase):
         self.assertIn('FAIL  tinyuf2 runner _work ghrunner-tinyuf2:ghrunner-tinyuf2 0750', out)
         self.assertNotIn('runner service active', self.verify('--maintenance').stdout)
 
+    @unittest.skipIf(os.geteuid() == 0, "root owns this test's runner tree, so root cannot be the admin who passes")
     def test_nothing_in_a_runner_tree_may_be_the_admins(self):
         d = self.register('tinyusb')
         for admin, want in (('root', 'ok   '), (getpass.getuser(), 'FAIL ')):
