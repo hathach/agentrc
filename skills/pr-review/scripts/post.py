@@ -701,7 +701,7 @@ def fix_notes(repo, pr, led, m, head, persist):
         x = f and fixes.get((f['id'], f.get('commentId')))
         if x and x['resolve'] in ('sent', *SETTLED):
             # Nothing is sent for these: one read of the PR serves them all.
-            settled = settled or thread_roots(snapshot(repo, pr, login))
+            settled = settled or thread_roots({'threads': threads(repo, pr)})
             t = settled.get(x['commentId'])
             why = repair_hold(x, t) or (None if t else 'no review thread holds the comment')
             out.append({**receipt(x), 'state': 'held', 'error': why} if why else receipt(x))
