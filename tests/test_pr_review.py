@@ -2462,6 +2462,45 @@ class Repair(PostCase):
         self.assertEqual((row['repair'], row['resolveDue']), (None, None), 'the old repair stays on the old root')
         self.assertEqual(json.loads(Path(self.p['ledger']).read_text())['reviews'][-2]['repairs'][0]['commentId'], self.root)
 
+    def recheck(self, comments, replies=()):
+        """A recheck review of the repaired head, saved and submitted with its event."""
+        sh(self.clone, 'git', 'fetch', '--quiet', 'origin', f'refs/pull/{PR}/head')
+        draft = {'event': 'COMMENT', 'body': 'Again.', 'replies': list(replies), 'comments': comments}
+        self.save(self.result_for(self.p, head=self.fixed_head, findings=[{'id': 'pr7-f1', 'status': 'open'}], draft=draft), reason='recheck')
+        return self.call(post, ['--pr', str(PR), '--repo', REPO, '--expected-head', self.fixed_head, '--auto'])
+
+    def test_a_recheck_draft_saved_before_the_repair_note_never_repeats_it(self):
+        sh(self.clone, 'git', 'fetch', '--quiet', 'origin', f'refs/pull/{PR}/head')
+        draft = {'event': 'COMMENT', 'body': 'Fixed.', 'comments': [], 'replies': [{'commentId': self.root, 'body': 'Fixed in abc.', 'findingId': 'pr7-f1'}]}
+        self.save(self.result_for(self.p, head=self.fixed_head, findings=[{'id': 'pr7-f1', 'status': 'fixed'}], draft=draft), reason='recheck')
+        self.fixed()
+        self.assertEqual(self.call(post, ['--pr', str(PR), '--repo', REPO, '--expected-head', self.fixed_head, '--auto'])['status'], 'posted')
+        self.assertEqual((len(self.gh.notes), self.adds()), (1, []), 'only the repair note reaches the thread')
+
+    def test_a_raised_again_comment_keeps_the_claim_the_human_edited_and_reads_unedited(self):
+        next(c for c in self.gh.inline if c['id'] == self.root)['body'] = 'b may be uninitialised'
+        self.call(post, ['--pr', str(PR), '--repo', REPO, '--sync'])
+        led = json.loads(Path(self.p['ledger']).read_text())
+        led['reviews'][-1]['findings'][0]['published'] = 'b may be uninitialised'
+        Path(self.p['ledger']).write_text(json.dumps(led))
+        self.fixed(self.row())
+        body = 'b may be uninitialised\n- The repair did not fix this.'
+        self.recheck([{'path': 'src/core/a.c', 'line': 21, 'body': body, 'finding': 0}])
+        f = self.review()['findings'][0]
+        self.assertEqual(f['published'], body)
+        snap, _ = Fixable.snap(self)
+        self.assertIsNone(ledger.holder(json.loads(Path(self.p['ledger']).read_text()), json.loads(snap.read_text()))(f),
+                          'its new root reads as published')
+
+    def test_a_finding_raised_again_in_the_body_has_no_thread_and_keeps_its_old_repair(self):
+        self.fixed()
+        self.recheck([{'path': 'src/core/a.c', 'line': 1, 'body': '**high**: b is never initialised\n- The repair did not fix this.', 'finding': 0}])
+        self.assertIsNone(self.review()['findings'][0]['commentId'])
+        row = next(o for o in self.show()['open'] if o['id'] == 'pr7-f1')
+        self.assertEqual((row['commentId'], row['repair']), (None, None))
+        self.reviewed = self.fixed_head  # the recheck is now the review a repair answers
+        self.assertEqual(self.fixed()['repairs'][0]['error'], 'no thread: it stands in the review body')
+
     def test_a_pending_review_of_ours_blocks_a_new_note_only(self):
         self.gh.reviews[1] = {'id': 1, 'body': 'by hand', 'state': 'PENDING', 'user': {'login': ME}}
         self.assertEqual(self.fixed()['repairs'][0]['error'], 'a pending review of ours is open on the PR')

@@ -223,8 +223,9 @@ def graphql(query, **fields):
 
 def replies_of(led, review, answers=True):
     """What a review publishes on our earlier threads: its fix notes, then each unpublished answer of its findings."""
+    fixes = repairs(led)  # a repair note of any state is the finding's fix note: a draft saved before it never repeats it
     out = [{'kind': 'fixnote', 'findingId': r['findingId'], 'commentId': r['commentId'], 'body': r['body'], 'resolve': True}
-           for r in review['draft']['replies']]
+           for r in review['draft']['replies'] if (r['findingId'], r['commentId']) not in fixes]
     return out + [{'kind': 'answer', 'findingId': f['id'], 'commentId': f.get('commentId'), 'body': d['answer']['body'],
                    'resolve': d['answer']['resolve'], 'dispute': d} for f, d in (answers_of(led, review) if answers else [])]
 
@@ -376,9 +377,15 @@ def submitted(repo, pr, led, review, state, login, persist):
             f['status'] = 'dropped'
         else:
             f['commentId'] = cid
-            if digest(live.get('body')) != digest(c['body']):
+            # A finding raised again keeps the claim the PR shows: its new comment restates the human's edit.
+            if digest(live.get('body')) != digest(c['body']) or f.get('published'):
                 f['published'] = live.get('body')
         ids.append(live and cid)
+    inline = {c['findingId'] for c in review['draft']['comments']}
+    for c in review['draft'].get('moved', []):
+        if c['findingId'] not in inline:
+            # Raised again in the body: it has no thread now, and its old one keeps the repair that resolved it.
+            by_id[c['findingId']]['commentId'] = None
     got.update(commentIds=ids, submitted=state, event=EVENT.get(state))
     review['status'] = 'posted'
     want = []

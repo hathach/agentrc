@@ -123,7 +123,7 @@ const DISPUTES = { type: 'array', items: { type: 'object', required: ['findingId
     replies: { type: 'array', items: { type: 'object', properties: { id: { type: 'integer' }, digest: { type: 'string' }, author: { type: 'string' } } } } } } }
 // One read gives the standing findings and the pushback on them, from the same ledger and snapshot.
 const prior = await relay('ledger', 'Context', `python3 ${S}/ledger.py show --pr ${pr} --repo ${repo} --threads '${threadsFile}' --head ${head}`,
-  { type: 'object', properties: { reviews: { type: 'integer' }, last: { type: ['object', 'null'], properties: { head: { type: 'string' } } }, open: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, status: { type: 'string' }, file: { type: 'string' }, line: { type: 'integer' }, severity: { type: ['string', 'null'] }, confidence: { type: ['string', 'null'] }, impact: IMPACT, severityReason: { type: ['string', 'null'] }, commentId: { type: ['integer', 'null'] }, why: { type: 'string' }, resolveDue: { type: ['object', 'null'], properties: { replied: { type: 'boolean' } } }, repair: { type: ['object', 'null'], properties: { head: { type: 'string' }, state: { type: 'string' }, resolved: { type: 'boolean' } } } }, required: ['id'] } },
+  { type: 'object', properties: { reviews: { type: 'integer' }, last: { type: ['object', 'null'], properties: { head: { type: 'string' } } }, open: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, status: { type: 'string' }, file: { type: 'string' }, line: { type: 'integer' }, severity: { type: ['string', 'null'] }, confidence: { type: ['string', 'null'] }, impact: IMPACT, severityReason: { type: ['string', 'null'] }, commentId: { type: ['integer', 'null'] }, why: { type: 'string' }, published: { type: ['string', 'null'] }, resolveDue: { type: ['object', 'null'], properties: { replied: { type: 'boolean' } } }, repair: { type: ['object', 'null'], properties: { head: { type: 'string' }, state: { type: 'string' }, resolved: { type: 'boolean' } } } }, required: ['id'] } },
     heldThreads: { type: 'array', items: { type: 'object', properties: { findingId: { type: 'string' }, commentId: { type: 'integer' }, why: { type: 'string' } } } }, disputes: DISPUTES, error: { type: 'string' } } })
 if (!prior || prior.error) return blocked('ledger-failed', prior ? prior.error : 'the ledger relay died')
 // A copy missing members must not read as nothing standing: an incremental or discussion run continues the review prepare pinned.
@@ -442,7 +442,8 @@ const comments = [...toPost.map((f, i) => ({
   body: bodies[i] && checked && !checked.bad.includes(i) && !offFormat(bodies[i].body, f.severity) ? bodies[i].body : template(f),
 })), ...reraised.map(f => ({
   path: f.file, line: f.line, finding: carriedOut.indexOf(f),
-  body: `**${f.severity || 'finding'}**: ${whyOf(f)}\n- The repair in ${repairedOf(f).head.slice(0, 12)} did not fix this; its earlier thread was resolved.`,
+  // A comment the human edited is restated as they left it.
+  body: `${earlier[f.id].published || `**${f.severity || 'finding'}**: ${whyOf(f)}`}\n- The repair in ${repairedOf(f).head.slice(0, 12)} did not fix this; its earlier thread was resolved.`,
 }))]
 const long = [...comments.filter(c => overLength(c.body, LIMIT.comment)).map(c => `${c.path}:${c.line}`), ...answers.filter(x => overLength(x.a.body, LIMIT.answer)).map(x => `answer on ${x.finding}`)]
 if (long.length) log(`over length, for the human to shorten: ${long.join(', ')}`)

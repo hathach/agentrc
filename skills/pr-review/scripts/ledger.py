@@ -306,7 +306,7 @@ def open_row(f, due, fixes=None):
     return {'id': f['id'], 'status': f['status'], 'file': f['file'], 'line': f['line'],
             'severity': sev, 'priority': priority(sev), 'confidence': f.get('confidence'),
             'impact': f.get('impact'), 'severityReason': f.get('severityReason'),
-            'why': f['why'], 'commentId': f.get('commentId'), 'defect': f.get('defect'),
+            'why': f['why'], 'published': f.get('published'), 'commentId': f.get('commentId'), 'defect': f.get('defect'),
             'resolveDue': due.get(f['id']),
             'repair': fix and {'head': fix['head'], 'state': fix['state'], 'resolved': fix['resolve'] in ('resolved', 'observed')}}
 
@@ -512,7 +512,7 @@ def fixable(led, snapshot, head):
                 held.append({'findingId': f['id'], 'commentId': f.get('commentId'), 'why': why})
             else:
                 # The text the PR shows, as the human edited it, and the digest a repair's fix check names.
-                fix.append({**open_row(f, {}), 'published': f.get('published'), 'claimDigest': digest(claim(f))})
+                fix.append({**open_row(f, {}), 'claimDigest': digest(claim(f))})
     return {'fix': sorted(fix, key=by_severity), 'held': held,
             'autoPost': not any(h['why'] in ('unmapped', 'deleted', 'edited') for h in held)}
 

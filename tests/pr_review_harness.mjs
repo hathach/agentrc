@@ -544,6 +544,10 @@ test('a finding an auto-fix repair noted gets no second fix note, and one still 
   assert.deepEqual(still.result.draft.comments, [{ path: 'src/core/a.c', line: 10, finding: 0,
     body: '**high**: overrun past the buffer end\n- The repair in cccccccccccc did not fix this; its earlier thread was resolved.' }])
   assert.equal(still.result.findings[0].id, 'pr7-f1', 'raised again under its own id')
+  const edited = repaired(done)
+  edited.open[0].published = '**high**: overrun past the end of buf'
+  assert.equal((await run(inc, { ledger: edited, recheck: () => ({ state: 'open', reason: 'still' }), check: pinned(inc) })).result.draft.comments[0].body,
+    '**high**: overrun past the end of buf\n- The repair in cccccccccccc did not fix this; its earlier thread was resolved.', 'restated as the human edited it')
   const visible = await run(inc, { ledger: repaired({ ...done, resolved: false }), recheck: () => ({ state: 'open', reason: 'still' }), check: pinned(inc) })
   assert.deepEqual(visible.result.draft.comments, [], 'its thread is still open, so its comment still states it')
 })
