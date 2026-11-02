@@ -69,6 +69,8 @@ class FakeGitHub:
         self.submits = []
         self.submit_fails = False
         self.clock = 0
+        self.maintainer_can_modify = True
+        self.perms = {}  # repo: this account's permissions, or a str for gh's error
 
     def tick(self):
         self.clock += 1
@@ -127,7 +129,7 @@ class FakeGitHub:
                                   'state': 'OPEN', 'author': {'login': 'contrib'}, 'headRefOid': self.head,
                                   'headRefName': 'feature', 'headRepository': {'name': 'r'},
                                   'headRepositoryOwner': {'login': 'contrib'}, 'isCrossRepository': True,
-                                  'baseRefName': 'main'})
+                                  'maintainerCanModify': self.maintainer_can_modify, 'baseRefName': 'main'})
         if argv[:2] == ['pr', 'checks']:
             return self.checks_code, json.dumps(self.checks) if self.checks else ''
         if argv[:2] == ['api', 'user']:
@@ -172,6 +174,9 @@ class FakeGitHub:
         if argv[0] == 'api':
             path = next(a for a in argv[1:] if a.startswith('repos/')).split('?')[0]
             page = lambda xs: [list(xs)]  # noqa: E731 - --paginate --slurp shape
+            if path.count('/') == 2 and '--jq' in argv and argv[argv.index('--jq') + 1] == '.permissions':
+                got = self.perms.get(path[len('repos/'):])
+                return (1, '', got) if isinstance(got, str) else (0, json.dumps(got))
             m = re.fullmatch(rf'repos/{REPO}/pulls/{PR}/reviews/(\d+)/comments', path)
             if m:
                 return 0, json.dumps(page(self.review_comments.get(int(m.group(1)), [])))
@@ -616,6 +621,133 @@ class Prepare(Case):
         # #271: skills/cowork/scripts was scanned again under skills/cowork.
         nested = ['skills/cowork/SKILL.md', 'skills/cowork/scripts/cowork.py', 'agents/coworker.md']
         self.assertEqual(prepare.groups_of(nested, 6), (['agents', 'skills/cowork'], False))
+
+
+class AutoFix(Case):
+    """prepare --auto-fix: where repairs would be pushed, and the review branch bound to it."""
+
+    BRANCH = f'pr-review-{PR}'
+
+    def setUp(self):
+        super().setUp()
+        self.commit('src/core/a.c', 'int a;\n' * 20 + 'int b;\n', 'b')
+        self.head = self.push_pr()
+        self.fetched = []
+
+    def fake_fetch(self, remote, branch, at=None):
+        self.fetched.append((remote, branch))
+        sh(self.clone, 'git', 'update-ref', f'refs/remotes/{remote}/{branch}', at or self.gh.head)
+
+    def auto_fix(self, at=None):
+        with mock.patch.object(prepare, 'fetch_head_branch', lambda r, b: self.fake_fetch(r, b, at)):
+            return self.prepare('--auto-fix')
+
+    def config(self, key):
+        return subprocess.run(['git', 'config', '--get', key], cwd=self.clone, capture_output=True, text=True, env=git_env()).stdout.strip()
+
+    def test_without_it_prepare_reports_no_repair_and_binds_nothing(self):
+        sh(self.clone, 'git', 'remote', 'add', 'contrib', 'git@github.com:contrib/r.git')
+        p = self.prepare()
+        self.assertNotIn('repair', p)
+        self.assertEqual(self.config(f'branch.{self.BRANCH}.remote'), '')
+
+    def test_a_fork_allowing_maintainer_edits_binds_its_remote_as_babysit_preflight_reads_it(self):
+        import preflight
+        sh(self.clone, 'git', 'remote', 'add', 'contrib', 'git@github.com:contrib/r.git')
+        self.gh.perms = {'contrib/r': {'push': False, 'pull': True}, REPO: {'push': True}}
+        p = self.auto_fix()
+        self.assertEqual(p['repair'], {'state': 'available', 'why': f'the PR allows edits from maintainers, and push access to {REPO}',
+                                       'headRepo': 'contrib/r', 'headBranch': 'feature', 'contributor': True,
+                                       'remote': 'contrib', 'addedRemote': False})
+        self.assertEqual(self.fetched, [('contrib', 'feature')])
+        cwd = os.getcwd()
+        os.chdir(p['worktree'])
+        try:
+            remote, urls = preflight.push_urls(self.BRANCH)
+            self.assertEqual((remote, urls, preflight.upstream_branch(self.BRANCH, remote)),
+                             ('contrib', ['git@github.com:contrib/r.git'], 'feature'))
+            self.assertEqual(preflight.bad_push_url(f'https://github.com/{REPO}/pull/{PR}', 'github.com/contrib/r', urls), '')
+        finally:
+            os.chdir(cwd)
+        self.assertEqual(self.auto_fix()['repair']['remote'], 'contrib', 'a second prepare finds its own binding')
+
+    def test_push_access_to_the_head_repository_is_enough(self):
+        sh(self.clone, 'git', 'remote', 'add', 'contrib', 'https://github.com/contrib/r')
+        self.gh.perms = {'contrib/r': {'push': True}}
+        self.gh.maintainer_can_modify = False
+        r = self.auto_fix()['repair']
+        self.assertEqual((r['state'], r['why'], r['remote']), ('available', 'push access to contrib/r', 'contrib'))
+
+    def test_no_push_access_anywhere_is_unavailable_and_binds_nothing(self):
+        sh(self.clone, 'git', 'remote', 'add', 'contrib', 'git@github.com:contrib/r.git')
+        self.gh.perms = {'contrib/r': {'push': False}, REPO: {'push': False, 'triage': True}}
+        r = self.auto_fix()['repair']
+        self.assertEqual((r['state'], r['why']), ('unavailable', f'no push access to contrib/r or {REPO}'))
+        self.assertNotIn('remote', r)
+        self.assertEqual((self.fetched, self.config(f'branch.{self.BRANCH}.remote')), ([], ''))
+
+    def test_a_fork_refusing_maintainer_edits_is_unavailable(self):
+        self.gh.perms = {'contrib/r': {'push': False}, REPO: {'admin': True}}
+        self.gh.maintainer_can_modify = False
+        r = self.auto_fix()['repair']
+        self.assertEqual((r['state'], r['why']), ('unavailable', 'no push access to contrib/r, and the PR does not allow edits from maintainers'))
+
+    def test_permissions_gh_cannot_read_are_unknown_not_unavailable(self):
+        self.gh.perms = {'contrib/r': 'gh: Not Found (HTTP 404)', REPO: {'push': False}}
+        r = self.auto_fix()['repair']
+        self.assertEqual(r['state'], 'unknown')
+        self.assertIn('HTTP 404', r['why'])
+        self.gh.perms = {'contrib/r': None, REPO: {'push': False}}
+        self.assertEqual(self.auto_fix()['repair']['state'], 'unknown', 'no permissions shown is not a refusal')
+
+    def test_with_no_remote_for_the_head_one_is_added_like_the_base_and_gh_default_pinned(self):
+        sh(self.clone, 'git', 'config', f'url.{self.remote.as_posix()}.insteadOf', f'git@github.com:{REPO}.git')
+        sh(self.clone, 'git', 'remote', 'set-url', 'origin', f'git@github.com:{REPO}.git')
+        self.gh.perms = {'contrib/r': {'push': True}}
+        r = self.auto_fix()['repair']
+        self.assertEqual((r['remote'], r['addedRemote']), ('pr-head-contrib', True))
+        self.assertEqual(sh(self.clone, 'git', 'remote', 'get-url', 'pr-head-contrib'), 'git@github.com:contrib/r.git')
+        self.assertEqual(self.config('remote.origin.gh-resolved'), 'base')
+        self.assertEqual(facts.gh_repo.checkout_repo(str(self.clone)), REPO)
+
+    def test_a_remote_pushing_elsewhere_is_not_the_head_remote(self):
+        sh(self.clone, 'git', 'remote', 'add', 'contrib', 'git@github.com:contrib/r.git')
+        sh(self.clone, 'git', 'remote', 'set-url', '--push', 'contrib', 'git@github.com:someone/else.git')
+        self.gh.perms = {'contrib/r': {'push': True}}
+        with self.assertRaisesRegex(facts.Unusable, 'not a github.com one to spell it like'):
+            self.auto_fix()
+
+    def test_two_remotes_naming_the_head_repository_refuse_unless_one_is_tracked(self):
+        for name in ('a', 'b'):
+            sh(self.clone, 'git', 'remote', 'add', name, 'git@github.com:contrib/r.git')
+        self.gh.perms = {'contrib/r': {'push': True}}
+        with self.assertRaisesRegex(facts.Unusable, 'remotes a, b all name contrib/r'):
+            self.auto_fix()
+        sh(self.clone, 'git', 'config', f'branch.{self.BRANCH}.remote', 'b')
+        sh(self.clone, 'git', 'config', f'branch.{self.BRANCH}.merge', 'refs/heads/feature')
+        self.assertEqual(self.auto_fix()['repair']['remote'], 'b')
+
+    def test_another_upstream_already_set_is_refused_not_replaced(self):
+        sh(self.clone, 'git', 'remote', 'add', 'contrib', 'git@github.com:contrib/r.git')
+        self.prepare()
+        sh(self.clone, 'git', 'config', f'branch.{self.BRANCH}.remote', 'origin')
+        sh(self.clone, 'git', 'config', f'branch.{self.BRANCH}.merge', 'refs/heads/main')
+        self.gh.perms = {'contrib/r': {'push': True}}
+        with self.assertRaisesRegex(facts.Unusable, 'already tracks origin refs/heads/main'):
+            self.auto_fix()
+        self.assertEqual(self.config(f'branch.{self.BRANCH}.remote'), 'origin')
+
+    def test_a_head_branch_not_at_the_pinned_head_refuses_and_binds_nothing(self):
+        sh(self.clone, 'git', 'remote', 'add', 'contrib', 'git@github.com:contrib/r.git')
+        self.gh.perms = {'contrib/r': {'push': True}}
+        with self.assertRaisesRegex(facts.Unusable, 'not the PR head'):
+            self.auto_fix(at=self.base)
+        self.assertEqual(self.config(f'branch.{self.BRANCH}.remote'), '')
+
+    def test_it_is_refused_with_check_or_release(self):
+        for extra in (['--check', '--expected-head', self.head], ['--release', '--token', 'ab']):
+            with self.assertRaisesRegex(facts.Unusable, 'is for a prepare'):
+                self.prepare('--auto-fix', *extra)
 
 
 class Ledger(Case):
