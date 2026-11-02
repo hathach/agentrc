@@ -225,7 +225,7 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   auto-post, which grants `post.py --auto` that one review, or auto-fix,
   which also grants chief's repair of the PR on its head branch, pr-babysit on
   it, and one auto-posted recheck review on the head the repairs leave.
-  Neither grants a merge, an approval or a dismissal.
+  Neither grants a merge, an approval, a dismissal or a force-push.
 - Fixing a review bot's finding outside `pr-babysit`: work from the bot's
   original feedback, not a relay, with its AI fix prompt (Greptile `Prompt
   To Fix With AI`, CodeRabbit `🤖 Prompt for AI Agents`) when it has one, and

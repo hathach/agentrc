@@ -240,6 +240,18 @@ def thread_context(d, root, snapshots):
             'url': (by_id.get(root) or {}).get('url')}
 
 
+def thread_roots(snapshot):
+    """{root comment id: thread} of a threads.py snapshot."""
+    return {t['commentIds'][0]: t for t in snapshot.get('threads', []) if t.get('commentIds')}
+
+
+def viewer_of(snapshot):
+    viewer = snapshot.get('viewer')
+    if not viewer:
+        raise Unusable('the threads file names no viewer: rerun threads.py')
+    return viewer
+
+
 def resolve_due(led, snapshot):
     """({finding id: {replied}}, held) for the last review's settled findings whose thread the snapshot shows open.
     Due: fixed, or closed by a reply of ours since the finding last stood (replied: a published reply that resolves,
@@ -248,7 +260,7 @@ def resolve_due(led, snapshot):
     rev = last(led)
     if not rev:
         return {}, []
-    roots = {t['commentIds'][0]: t for t in snapshot.get('threads', []) if t.get('commentIds')}
+    roots = thread_roots(snapshot)
     replied, mark = {}, {}
     for r in reached(led):
         for p in (r, *r.get('answerPublications', [])):
@@ -392,12 +404,10 @@ def disputes(led, snapshot, head):
     rev = last(led)
     if not rev:
         return []
-    viewer = snapshot.get('viewer')
-    if not viewer:
-        raise Unusable('the threads file names no viewer: rerun threads.py')
+    viewer = viewer_of(snapshot)
     by_id = {c['id']: c for c in snapshot.get('comments', [])}
     known = answered_ids(led)
-    roots = {t['commentIds'][0]: t for t in snapshot.get('threads', []) if t.get('commentIds')}
+    roots = thread_roots(snapshot)
     out = []
     for f in rev.get('findings', []):
         t = roots.get(f.get('commentId'))
@@ -438,11 +448,9 @@ def fixable(led, snapshot, head):
     rev = last(led)
     if not rev or rev['head'] != head or not ((rev.get('receipts') or {}).get('review') or {}).get('submitted'):
         raise Unusable(f"the last review on the PR is {rev and rev['head']} ({rev and rev['status']}), not one submitted on {head}")
-    viewer = snapshot.get('viewer')
-    if not viewer:
-        raise Unusable('the threads file names no viewer: rerun threads.py')
+    viewer = viewer_of(snapshot)
     live = {(c['kind'], c['id']): c for c in snapshot.get('comments', [])}
-    roots = {t['commentIds'][0]: t for t in snapshot.get('threads', []) if t.get('commentIds')}
+    roots = thread_roots(snapshot)
     known = answered_ids(led)
 
     def hold(f):
@@ -473,7 +481,7 @@ def fixable(led, snapshot, head):
                 held.append({'findingId': f['id'], 'commentId': f.get('commentId'), 'why': why})
             else:
                 fix.append(open_row(f, {}))
-    return {'head': head, 'fix': sorted(fix, key=by_severity), 'held': held,
+    return {'fix': sorted(fix, key=by_severity), 'held': held,
             'autoPost': not any(h['why'] in ('unmapped', 'deleted', 'edited') for h in held)}
 
 
@@ -608,7 +616,7 @@ def collect(argv):
     a = p.parse_args(argv)
     repo = repo_of(a.repo)
     path = ledger_path(repo, a.pr)
-    if getattr(a, 'fixable', False) and not (a.threads and a.head):
+    if a.cmd == 'show' and a.fixable and not (a.threads and a.head):
         p.error('--fixable needs --threads and --head')
     if getattr(a, 'head', None) is not None:
         if not a.threads:

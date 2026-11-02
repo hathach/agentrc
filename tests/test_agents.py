@@ -213,7 +213,7 @@ class AgentFiles(unittest.TestCase):
         self.assertIn('Merging stays off. My own words asking to merge a named PR', rules)
         self.assertIn('submitting any review stays mine, unless that request names auto-post', rules)
         self.assertIn('A `pr-review` request naming auto-fix is that grant for its PR too', rules)
-        self.assertIn('Neither grants a merge, an approval or a dismissal.', rules)
+        self.assertIn('Neither grants a merge, an approval, a dismissal or a force-push.', rules)
         self.assertIn("Each pr-babysit launch gets a `Findings` subsection holding its reading's `findingsTable` verbatim", body)
         readme = ' '.join((AGENTS.parent / 'README.md').read_text().split())
         self.assertIn('A relaunch for the same PR task copies the grant verbatim from the earlier launch task, without asking again, '

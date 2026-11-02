@@ -33,16 +33,12 @@ their diff before building anything. `ci` summarises the head's checks:
 `unobserved` with none, `red`, `pending` (action_required included), `green`,
 `unknown` for a state none of these covers.
 
---auto-fix adds `repair`, where an auto-fix run's repairs would be pushed and whether they can be:
-{state, why, headRepo, headBranch, contributor (the head repository is not the base)}, state `available` with push
-access to the head repository, or for a cross-repository PR allowing edits from maintainers, push access to the base;
-`unavailable` when this account has neither, `unknown` when gh cannot tell. Only when available, it also binds the
-review branch to the head branch, as pr-babysit's preflight needs: the one remote whose every fetch and push URL is the
-head repository (two such remotes refuse, unless the branch already tracks one), else one it adds as pr-head-<owner>,
-spelled like the base remote, with gh's default first pinned to the base remote when none is set
-(`remote.<base>.gh-resolved base`), so the checkout still reads as the base repository; the head branch is fetched,
-must be the pinned head, and becomes the branch's upstream (another upstream already set refuses). It adds
-{remote, addedRemote}. Without --auto-fix nothing of this runs.
+--auto-fix adds `repair`: whether an auto-fix run's repairs can be pushed to the PR's head branch (headRepo,
+headBranch), {state, why}: `available` with push access to the head repository, or for a cross-repository PR allowing
+edits from maintainers, push access to the base; `unavailable` when this account has neither; `unknown` when gh cannot
+tell. Only when available, it binds the review branch to the head branch through a remote of the head repository
+(head_remote, bind_upstream) and adds {remote, addedRemote}; a binding it cannot make refuses. Without --auto-fix
+nothing of this runs.
 
 --release unlocks the pr-review-<N> sibling whose lock carries the token, once
 the run that took it has ended; nothing locked by it is a no-op, and while
@@ -71,7 +67,7 @@ from ledger import ONLINE, last, ledger_dir, ledger_path, load, locked, publicat
 from post import sync  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'pr-babysit' / 'scripts'))
-from facts import FULL_SHA, HOST, Parser, Unusable, checkout_top, git, github_repo, report, run  # noqa: E402
+from facts import FULL_SHA, HOST, Parser, Unusable, checkout_repo, checkout_top, git, github_repo, report, run  # noqa: E402
 
 # Paths that run when a PR is built or tested; their diff is read before any build.
 TOOLING = re.compile(r'(^|/)(CMakeLists\.txt|Makefile|[^/]+\.(cmake|mk|py|sh|ps1|bat))$'
@@ -95,6 +91,10 @@ def pr_view(repo, pr):
     fields = ('number,url,title,state,author,headRefOid,headRefName,headRepository,headRepositoryOwner,isCrossRepository,'
               'maintainerCanModify,baseRefName')
     return gh_json('pr', 'view', str(pr), '--repo', repo, '--json', fields)[1]
+
+
+def config(key):
+    return run('git', 'config', '--get', key, ok=(0, 1))[1].strip()
 
 
 def can_write(repo):
@@ -149,7 +149,7 @@ def head_remote(repo, head_repo, branch):
     urls = lambda n: git('remote', 'get-url', '--all', n).splitlines() + git('remote', 'get-url', '--push', '--all', n).splitlines()  # noqa: E731
     found = [n for n in names if all(github_repo(u).lower() == head_repo.lower() for u in urls(n))]
     if len(found) > 1:
-        tracked = run('git', 'config', '--get', f'branch.{branch}.remote', ok=(0, 1))[1].strip()
+        tracked = config(f'branch.{branch}.remote')
         if tracked not in found:
             raise Unusable(f"remotes {', '.join(found)} all name {head_repo}: remove the ones you do not need")
         return tracked, False
@@ -159,7 +159,7 @@ def head_remote(repo, head_repo, branch):
     if name in names:
         raise Unusable(f'remote {name} exists and does not name only {head_repo}: fix or remove it by hand')
     base = remote_for(repo)
-    spelled = run('git', 'config', '--get', f'remote.{base}.url', ok=(0, 1))[1].strip()
+    spelled = config(f'remote.{base}.url')
     url = url_like(spelled, head_repo)
     if not url:
         raise Unusable(f'no remote names {head_repo}, and the {base} remote URL {spelled!r} is not a github.com one to '
@@ -167,6 +167,14 @@ def head_remote(repo, head_repo, branch):
     if not run('git', 'config', '--get-regexp', r'^remote\..+\.gh-resolved$', ok=(0, 1))[1].strip():
         git('config', f'remote.{base}.gh-resolved', 'base')
     git('remote', 'add', name, url)
+    try:
+        reads = checkout_repo()
+    except Unusable as e:
+        reads = str(e)
+    if reads.lower() != repo.lower():
+        # Removed again, so a rerun adds and checks it anew rather than finding it.
+        git('remote', 'remove', name)
+        raise Unusable(f'with remote {name} added the checkout no longer reads as {repo} ({reads}): add a remote for {head_repo} by hand')
     return name, True
 
 
@@ -177,8 +185,7 @@ def fetch_head_branch(remote, branch):
 def bind_upstream(branch, remote, head_branch, head):
     """Make the review branch track the PR's head branch, as pr-babysit's preflight requires, once that branch is
     fetched at head; another upstream already set is refused, never replaced."""
-    cfg = lambda k: run('git', 'config', '--get', f'branch.{branch}.{k}', ok=(0, 1))[1].strip()  # noqa: E731
-    want, have = (remote, f'refs/heads/{head_branch}'), (cfg('remote'), cfg('merge'))
+    want, have = (remote, f'refs/heads/{head_branch}'), (config(f'branch.{branch}.remote'), config(f'branch.{branch}.merge'))
     if any(have) and have != want:
         raise Unusable(f'branch {branch} already tracks {have[0]} {have[1]}, not {remote} {want[1]}: '
                        f'unset it by hand (git branch --unset-upstream {branch})')
@@ -198,21 +205,22 @@ def bind_upstream(branch, remote, head_branch, head):
                        f'add it (git remote set-branches --add {remote} {head_branch}) and run again')
 
 
-def repair_target(repo, info, branch, head):
+def head_repo_of(info):
+    owner, name = (info.get('headRepositoryOwner') or {}).get('login'), (info.get('headRepository') or {}).get('name')
+    return f'{owner}/{name}' if owner and name else None
+
+
+def repair_target(repo, head_repo, info, branch, head):
     """auto-fix's push destination and whether repairs can be pushed there; when they can, the review branch is
     bound to it."""
-    owner, name = (info.get('headRepositoryOwner') or {}).get('login'), (info.get('headRepository') or {}).get('name')
-    if not (owner and name):
+    if not head_repo:
         return {'state': 'unavailable', 'why': 'the PR head repository is gone'}
-    head_repo, head_branch = f'{owner}/{name}', info['headRefName']
     state, why = push_access(repo, head_repo, info)
-    out = {'state': state, 'why': why, 'headRepo': head_repo, 'headBranch': head_branch,
-           'contributor': head_repo.lower() != repo.lower()}
     if state != 'available':
-        return out
+        return {'state': state, 'why': why}
     remote, added = head_remote(repo, head_repo, branch)
-    bind_upstream(branch, remote, head_branch, head)
-    return {**out, 'remote': remote, 'addedRemote': added}
+    bind_upstream(branch, remote, info['headRefName'], head)
+    return {'state': state, 'why': why, 'remote': remote, 'addedRemote': added}
 
 
 def remote_for(repo):
@@ -398,7 +406,7 @@ def prepare(a):
                            f"post.py --pr {a.pr} --expected-head {online[-1]['head']}{auto}, which only looks for it by its marker")
         mode, scope_base, prior = mode_of(led, head, merge_base, a.full)
         wt, branch = worktree(top, a.pr, head, token)
-        repair = repair_target(repo, info, branch, head) if a.auto_fix else None
+        repair = repair_target(repo, head_repo_of(info), info, branch, head) if a.auto_fix else None
         pr_paths = changed(merge_base, head)
         scope = pr_paths if mode != 'incremental' else changed(scope_base, head)
         groups, over = groups_of(scope, a.max_groups)

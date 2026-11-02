@@ -105,10 +105,10 @@ contributor's code on this machine and flash it on them, the tooling summary,
 and, when no boards were chosen and the selector names some, those candidates
 with their reasons and the words that would launch with them, `full` included,
 since the same head otherwise gets only a discussion run. Under `auto-fix`, also
-prepare's `repair`: the head repository and branch, said plainly to be the
-contributor's branch when `contributor` is true, its state and why (`unknown`
-is not `unavailable`), and that the run reviews, repairs, validates and rechecks
-the PR within pr-babysit's cycle accounting.
+the head repository and branch, said plainly to be the contributor's branch for
+a fork, prepare's `repair` state and why (`unknown` is not `unavailable`), and
+that the run reviews, repairs, validates and rechecks the PR within
+pr-babysit's cycle accounting.
 
 ## 3. Publishing
 
@@ -130,13 +130,10 @@ judged. For a headless chief, the human's request naming auto-post is the grant
 under `agents/chief.md`'s PR review exception, carried as §4 says.
 Auto-fix, when the request names it: auto-post, then chief repairs the PR on
 its head branch, the contributor's when the PR is from a fork, and rechecks it
-(§4). The request is the grant, under the same exception, for that review,
-pr-babysit on the PR with `autoPush` and `markSonar` (a restriction in the
-request narrows them as it narrows babysitting), and one recheck review on the
-head the repairs leave, submitted only while `ledger.py show --fixable` allows
-it, else left pending for the human. It never approves, dismisses, merges or
-force-pushes, and answers to pushback stay pending. One repair round: what the
-recheck finds new is reported, and repairing it needs a new request.
+(§4 step 6), under the same exception, which bounds it. A recheck review the
+ledger cannot vouch for (`ledger.py show --fixable`'s `autoPost` false) stays
+pending for the human. One repair round: what the recheck finds new is
+reported, and repairing it needs a new request.
 
 ## 4. Launch
 

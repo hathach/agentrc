@@ -643,7 +643,7 @@ class AutoFix(Case):
             return self.prepare('--auto-fix')
 
     def config(self, key):
-        return subprocess.run(['git', 'config', '--get', key], cwd=self.clone, capture_output=True, text=True, env=git_env()).stdout.strip()
+        return sh(self.clone, 'git', 'config', '--default', '', '--get', key)
 
     def test_without_it_prepare_reports_no_repair_and_binds_nothing(self):
         sh(self.clone, 'git', 'remote', 'add', 'contrib', 'git@github.com:contrib/r.git')
@@ -657,18 +657,14 @@ class AutoFix(Case):
         self.gh.perms = {'contrib/r': {'push': False, 'pull': True}, REPO: {'push': True}}
         p = self.auto_fix()
         self.assertEqual(p['repair'], {'state': 'available', 'why': f'the PR allows edits from maintainers, and push access to {REPO}',
-                                       'headRepo': 'contrib/r', 'headBranch': 'feature', 'contributor': True,
                                        'remote': 'contrib', 'addedRemote': False})
+        self.assertEqual((p['headRepo'], p['headBranch'], p['fork']), ('contrib/r', 'feature', True))
         self.assertEqual(self.fetched, [('contrib', 'feature')])
-        cwd = os.getcwd()
-        os.chdir(p['worktree'])
-        try:
+        with contextlib.chdir(p['worktree']):
             remote, urls = preflight.push_urls(self.BRANCH)
             self.assertEqual((remote, urls, preflight.upstream_branch(self.BRANCH, remote)),
                              ('contrib', ['git@github.com:contrib/r.git'], 'feature'))
             self.assertEqual(preflight.bad_push_url(f'https://github.com/{REPO}/pull/{PR}', 'github.com/contrib/r', urls), '')
-        finally:
-            os.chdir(cwd)
         self.assertEqual(self.auto_fix()['repair']['remote'], 'contrib', 'a second prepare finds its own binding')
 
     def test_push_access_to_the_head_repository_is_enough(self):
@@ -710,6 +706,17 @@ class AutoFix(Case):
         self.assertEqual(sh(self.clone, 'git', 'remote', 'get-url', 'pr-head-contrib'), 'git@github.com:contrib/r.git')
         self.assertEqual(self.config('remote.origin.gh-resolved'), 'base')
         self.assertEqual(facts.gh_repo.checkout_repo(str(self.clone)), REPO)
+
+    def test_an_added_remote_that_leaves_the_checkout_reading_another_repository_is_removed_so_a_rerun_checks_again(self):
+        sh(self.clone, 'git', 'config', f'url.{self.remote.as_posix()}.insteadOf', f'git@github.com:{REPO}.git')
+        sh(self.clone, 'git', 'remote', 'set-url', 'origin', f'git@github.com:{REPO}.git')
+        sh(self.clone, 'git', 'remote', 'add', 'mirror', 'https://github.com/someone/else')
+        sh(self.clone, 'git', 'config', 'remote.mirror.gh-resolved', 'base')
+        self.gh.perms = {'contrib/r': {'push': True}}
+        for _ in range(2):
+            with self.assertRaisesRegex(facts.Unusable, f'no longer reads as {REPO}'):
+                self.auto_fix()
+            self.assertNotIn('pr-head-contrib', sh(self.clone, 'git', 'remote').split())
 
     def test_a_remote_pushing_elsewhere_is_not_the_head_remote(self):
         sh(self.clone, 'git', 'remote', 'add', 'contrib', 'git@github.com:contrib/r.git')
@@ -2072,11 +2079,17 @@ class Fixable(PostCase):
         self.assertEqual(self.post('--auto')['status'], 'posted')
         self.root = self.review()['findings'][0]['commentId']
 
-    def fixable(self, head=None):
+    def snap(self):
         snap = self.tmp / 'threads.json'
         self.call(threads, ['--pr', str(PR), '--repo', REPO, '--out', str(snap)])
+        return snap, json.loads(snap.read_text())
+
+    def show_fixable(self, snap, head=None):
         return self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--fixable', '--threads', str(snap),
                                   '--head', head or self.head])['fixable']
+
+    def fixable(self, head=None):
+        return self.show_fixable(self.snap()[0], head)
 
     def held(self, got):
         return [(h['findingId'], h['why']) for h in got['held']]
@@ -2110,14 +2123,6 @@ class Fixable(PostCase):
         self.assertEqual((self.held(got), got['autoPost']), ([('pr7-f1', 'replied')], True))
         self.gh.inline[-1]['user'] = {'login': 'bot[bot]', 'type': 'Bot'}
         self.assertEqual(self.fixable()['held'], [])
-
-    def snap(self):
-        snap = self.tmp / 'threads.json'
-        self.call(threads, ['--pr', str(PR), '--repo', REPO, '--out', str(snap)])
-        return snap, json.loads(snap.read_text())
-
-    def show_fixable(self, snap):
-        return self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--fixable', '--threads', str(snap), '--head', self.head])
 
     def test_a_snapshot_missing_a_reply_or_the_thread_refuses_rather_than_hide_pushback(self):
         self.gh.inline.append({'id': 950, 'in_reply_to_id': self.root, 'body': 'intentional', 'created_at': self.gh.tick(),
