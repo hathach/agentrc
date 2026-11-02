@@ -50,6 +50,7 @@ def setUpModule():
 class FakeGitHub:
     def __init__(self):
         self.head = None
+        self.state = 'OPEN'
         self.checks = []
         self.checks_code = 0
         self.reviews = {}
@@ -127,6 +128,8 @@ class FakeGitHub:
             fields = argv[argv.index('--json') + 1]
             if fields == 'headRefOid':
                 return 0, json.dumps({'headRefOid': self.head})
+            if fields == 'headRefOid,state':
+                return 0, json.dumps({'headRefOid': self.head, 'state': self.state})
             return 0, json.dumps({'number': PR, 'url': f'https://github.com/{REPO}/pull/{PR}', 'title': 't',
                                   'state': 'OPEN', 'author': {'login': 'contrib'}, 'headRefOid': self.head,
                                   'headRefName': 'feature', 'headRepository': {'name': 'r'},
@@ -2424,6 +2427,21 @@ class Repair(PostCase):
                          [('pr7-f1', 'deferred', f"the PR head moved to {'f' * 40} since the repair"),
                           ('pr7-f3', None, f"the PR head moved to {'f' * 40} since the repair")])
         self.assertEqual(len(self.gh.notes), 1, 'the second note is never sent on a moved head')
+
+    def test_a_closed_or_merged_pr_takes_no_note_and_no_resolve(self):
+        for state in ('CLOSED', 'MERGED'):
+            self.gh.state = state
+            with self.assertRaisesRegex(facts.Unusable, f'the PR is {state.lower()}'):
+                self.fixed()
+        self.assertEqual(self.gh.notes, [])
+        self.gh.state = 'OPEN'
+        self.setUp_second_finding_thread()
+        self.after_note(lambda: setattr(self.gh, 'state', 'MERGED'))
+        out = self.fixed(self.row(), self.row('pr7-f3'))
+        self.assertEqual([(r['findingId'], r['resolve'], r['error']) for r in out['repairs']],
+                         [('pr7-f1', 'deferred', 'the PR is merged'), ('pr7-f3', None, 'the PR is merged')])
+        self.assertEqual(len(self.gh.notes), 1, 'no note is sent once the PR is merged')
+        self.assertFalse(self.thread()['isResolved'])
 
     def test_a_note_deferred_on_one_head_resolves_on_another_only_for_the_same_claim(self):
         self.after_note(lambda: setattr(self.gh, 'head', 'f' * 40))

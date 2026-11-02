@@ -205,7 +205,8 @@ class AgentFiles(unittest.TestCase):
                        'A crash with repairs unpublished resumes this task with them, never a new prepare',
                        'Under `auto-fix`, a discussion run repairs nothing', 'a repair of an already-reviewed head takes `auto-fix full`',
                        '`post.py --auto --defer-answers` (auto-fix)',
-                       'whatever becomes of the recheck review; one the recheck finds still standing is raised again on a new comment',
+                       'whatever becomes of the recheck review; one the recheck finds still standing is raised again on a new comment, '
+                       'unless someone reopened its thread since, which then still states it',
                        'After each launch whose reading shows the adoption `pushed` or `already-published`',
                        'its `skipped`, `held` and `uncertain` rows are reported, never worked around',
                        '`ledger.py show --fixable` and the recheck\'s prepare refuse, and GitHub refuses the repair\'s replies',

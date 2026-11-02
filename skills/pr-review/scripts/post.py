@@ -52,8 +52,9 @@ head, which must be submitted, "findings": [{id, claimDigest, verdict: "verified
 each row a fix check that verified that finding's repair on SHA, its claimDigest the one ledger.py show --fixable gives.
 A bad row refuses the whole file before anything is sent. For each finding it posts `Fixed in <SHA>: <note>` as a reply
 on its thread (no review), reads it back, then resolves the thread; a fresh read of the PR before each send and each
-resolve skips or defers it on a moved head, a resolved thread, a changed claim, a deleted or edited root or note, a
-disputed finding, pushback since our last answer, or, for a new note only, a pending review of ours. One record per
+resolve skips or defers it on a closed or merged PR, a moved head, a resolved thread, a changed claim, a deleted or
+edited root or note, a disputed finding, pushback since our last answer, or, for a new note only, a pending review of
+ours; a PR closed or merged before the run refuses it whole. One record per
 finding and root (ledger.py's repairs) across runs and heads: a rerun returns it, retries a deferred resolve only on a
 fix check of the same claim, never resends an unconfirmed note, and holds a resolve left sent or a thread reopened since.
 A body-moved finding has no thread to note. A later review's draft never repeats a repair note.
@@ -104,6 +105,12 @@ def review_comments(repo, pr, rid):
 
 def pr_head(repo, pr):
     return gh_json('pr', 'view', str(pr), '--repo', repo, '--json', 'headRefOid')['headRefOid']
+
+
+def head_if_open(repo, pr):
+    """(head, None) while the PR is open, else (head, why no fix note or resolve may land on it)."""
+    v = gh_json('pr', 'view', str(pr), '--repo', repo, '--json', 'headRefOid,state')
+    return v['headRefOid'], None if v.get('state') == 'OPEN' else f"the PR is {str(v.get('state')).lower()}"
 
 
 def read_back(repo, pr, rid, review):
@@ -618,13 +625,15 @@ def note_reply(snap, x):
 
 def unfit(repo, pr, led, f, want, head, login):
     """(snapshot, why f's thread may not take a note or a resolve now, or None), read afresh: the root and claim as
-    the fix check judged them (`want`, its claim digest), no pushback since our last answer, the head the repaired one."""
+    the fix check judged them (`want`, its claim digest), no pushback since our last answer, the PR open on the repaired
+    head."""
     snap = snapshot(repo, pr, login)
     t = thread_roots(snap).get(f.get('commentId'))
-    at = pr_head(repo, pr)
-    return snap, (holder(led, snap)(f) or ('the claim changed since its fix check' if ledger_digest(claim(f)) != want else
-                                           'no review thread holds the comment' if not t else
-                                           f'the PR head moved to {at} since the repair' if at != head else None))
+    at, shut = head_if_open(repo, pr)
+    return snap, (shut or holder(led, snap)(f) or
+                  ('the claim changed since its fix check' if ledger_digest(claim(f)) != want else
+                   'no review thread holds the comment' if not t else
+                   f'the PR head moved to {at} since the repair' if at != head else None))
 
 
 def send_note(repo, pr, x, persist):
@@ -680,7 +689,9 @@ def fix_notes(repo, pr, led, m, head, persist):
     the reviewed head; per finding, one record across runs and heads (ledger.py's repairs). Each send and each resolve
     reads the PR afresh first."""
     rev = submitted_last(led, m['reviewedHead'])
-    at = pr_head(repo, pr)
+    at, shut = head_if_open(repo, pr)
+    if shut:
+        raise Unusable(shut)
     if at != head:
         raise Unusable(f'the PR head moved to {at}; the repair was checked on {head}')
     login = gh_json('api', 'user')['login']

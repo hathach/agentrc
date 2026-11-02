@@ -138,7 +138,8 @@ its head branch, the contributor's when the PR is from a fork, and rechecks it
 (§4 step 6), under the same exception, which bounds it. Once a repair is
 pushed, each finding it fixed gets a fix note and its thread resolved
 (`post.py --fixed`), whatever becomes of the recheck review; one the recheck
-finds still standing is raised again on a new comment. A recheck review the
+finds still standing is raised again on a new comment, unless someone reopened
+its thread since, which then still states it. A recheck review the
 ledger cannot vouch for (`ledger.py show --fixable`'s `autoPost` false) stays
 pending for the human. One repair round: what the recheck finds new is
 reported, and repairing it needs a new request, with `full` while the head is

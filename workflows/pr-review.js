@@ -433,9 +433,11 @@ for (const x of reworded) if (!checked || (checked.answersBad || []).includes(x.
 // A finding posted beside its group falls back with its verification too, which states what the group's text lacks.
 const template = (f) => `**${f.severity || 'finding'}**: ${f.why}${f.beside ? `\n\n${f.verdictReason}` : ''}`
 // A finding an auto-fix repair resolved (post.py --fixed) that the recheck finds still standing is raised again on a
-// new comment: its old thread is resolved, so nothing visible states it.
+// new comment: its old thread is resolved, so nothing visible states it. A held thread (reopened since, or its
+// state unconfirmed) is not: the snapshot shows it open or the human settles it.
 const repairedOf = (f) => (earlier[f.id] || {}).repair
-const reraised = carriedOut.filter((f, i) => rechecked[i] && ['open', 'upheld'].includes(f.status) && (repairedOf(f) || {}).resolved)
+const heldOf = (f) => (prior.heldThreads || []).some(h => h.findingId === f.id && h.commentId === (earlier[f.id] || {}).commentId)
+const reraised = carriedOut.filter((f, i) => rechecked[i] && ['open', 'upheld'].includes(f.status) && (repairedOf(f) || {}).resolved && !heldOf(f))
 // `finding` indexes the result's findings (carried first), so the ledger can give the comment its finding's id.
 const comments = [...toPost.map((f, i) => ({
   path: f.file, line: f.line, finding: carriedOut.length + ours.indexOf(f),

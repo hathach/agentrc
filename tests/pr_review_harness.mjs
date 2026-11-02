@@ -550,6 +550,9 @@ test('a finding an auto-fix repair noted gets no second fix note, and one still 
     '**high**: overrun past the end of buf\n- The repair in cccccccccccc did not fix this; its earlier thread was resolved.', 'restated as the human edited it')
   const visible = await run(inc, { ledger: repaired({ ...done, resolved: false }), recheck: () => ({ state: 'open', reason: 'still' }), check: pinned(inc) })
   assert.deepEqual(visible.result.draft.comments, [], 'its thread is still open, so its comment still states it')
+  const reopenedThread = { ...repaired(done), heldThreads: [{ findingId: 'pr7-f1', commentId: 901, why: 'reopened after it was resolved' }] }
+  const restated = await run(inc, { ledger: reopenedThread, recheck: () => ({ state: 'open', reason: 'still' }), check: pinned(inc) })
+  assert.deepEqual(restated.result.draft.comments, [], 'reopened since the repair resolved it, its thread states it again')
 })
 
 test('args that differ from the pins prepare recorded for this head are blocked before review', async () => {
