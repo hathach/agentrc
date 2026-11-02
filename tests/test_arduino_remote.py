@@ -197,18 +197,52 @@ class Session(Checkout):
         self.assertEqual((rc, out['held']), (0, True))
         return out
 
-    def test_open_holds_the_board_under_the_session_reason(self):
+    def test_open_holds_the_board_under_a_reason_unique_to_the_attempt(self):
         out = self.open()
         self.assertEqual(self.calls[-1], ['python3', '-u', self.HP.HIL, 'lock', 'hold', BOARD, '--reason',
-                                          'arduino-hil session s1'])
+                                          out['reason']])
+        self.assertRegex(out['reason'], r'^arduino-hil session /home/u/hil-remote/fake-usb/r1 [0-9a-f]{16}$')
         self.assertEqual(out['restoreRecord'], f'build/hil/{BOARD}.build.json')
+        self.assertNotEqual(self.open()['reason'], out['reason'])   # the same run id again, another library's say
 
-    def test_open_without_the_hold_says_so(self):
+    def test_open_without_the_hold_says_so_and_acts_under_none(self):
         self.rig_exit['lock'] = 1
         rc, out = self.main('session', 'open', '--run-id', 's1', '-b', BOARD)
         self.assertEqual((rc, out['held']), (1, False))
         self.assertIn('the hold was not taken', out['error'])
         self.assertFalse(json.loads((self.root / '.hil-remote/s1.session.json').read_text())['held'])
+        calls = len(self.calls)
+        with self.assertRaisesRegex(SystemExit, 'session s1 does not hold rig_ocd'):
+            R.main(['session', 'exec', 's1', 'exec', '--', 'true'])
+        rc, closed = self.main('session', 'close', 's1')
+        self.assertEqual((rc, closed['closed'], closed['restoreExit']), (0, True, None))
+        self.assertEqual(len(self.calls), calls)   # neither reached the rig
+        record = json.loads((self.root / '.hil-remote/s1.session.json').read_text())
+        self.assertEqual((record['held'], record['closed']), (False, True))
+
+    def test_a_session_losing_the_hold_cannot_release_the_winners(self):
+        lock = R.H.A.lock
+        with mock.patch.object(lock, 'BOARD_LOCK_DIR', str(tmpdir(self))):
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(lock.cmd_hold([BOARD], 'arduino-hil session s1'), 0)   # another library's s1
+            try:
+                def rig(tree, argv, **kw):   # the rig: hold, or one session command under its reason
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        if argv[3:5] == ['lock', 'hold']:
+                            return lock.cmd_hold([BOARD], argv[-1])
+                        args = R.H.parse(argv[3:])
+                        R.H.held_by(args.board, args.under_hold)
+                        return lock.cmd_release([args.board])
+                with mock.patch.object(R.core, 'run_remote', rig):
+                    rc, opened = self.main('session', 'open', '--run-id', 's1', '-b', BOARD)
+                    self.assertEqual((rc, opened['held']), (1, False))
+                    with self.assertRaises(SystemExit):
+                        R.main(['session', 'exec', 's1', 'restore', '--release'])
+                    self.assertEqual(self.main('session', 'close', 's1')[0], 0)
+                self.assertTrue(lock.is_locked(BOARD))
+            finally:
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    lock.cmd_release([BOARD])
 
     def test_exec_adds_the_session_options_and_keeps_argv_after_the_roster(self):
         out = self.open()
@@ -237,6 +271,16 @@ class Session(Checkout):
                                           out['reason'], '--staged', R.MANIFEST, '--bundle', R.RESTORE_BUNDLE,
                                           '--build-record', out['restoreRecord'], '--release', ROSTER])
         self.assertNotIn(['lock', 'release'], [c[3:5] for c in self.calls])
+
+    def test_collect_exempts_only_the_records_a_session_never_writes(self):
+        self.open()
+        absent = {r: 'absent' for r in R.core.RECORD_FILES}
+        for manual, rc in (('absent', 0), ('transport', 1)):
+            with self.subTest(manual=manual), \
+                    mock.patch.object(R.core, 'attempt_status', return_value={'state': 'not-launched'}), \
+                    mock.patch.object(R.core, 'copy_back', return_value=R.core.CopyBack(
+                        [], [], {**absent, 'build/hil-manual/': manual})):
+                self.assertEqual(self.main('collect', 's1'), (rc, mock.ANY))
 
     def test_stage_puts_each_record_in_a_bundle_of_its_own(self):
         self.open()

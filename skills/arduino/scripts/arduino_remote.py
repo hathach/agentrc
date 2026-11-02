@@ -37,6 +37,7 @@ FILES = ('skills/arduino/scripts/arduino_build.py', 'skills/arduino/scripts/ardu
 SELF = 'skills/arduino/scripts/arduino_remote.py'
 RUN_DIR = 'hil-run'
 MANIFEST = 'manifest.json'
+SESSION_ARTIFACTS = 'build/hil-manual/'   # every session command's run dir
 RESTORE_BUNDLE = 'bundles/restore'   # the clean record session close restores from, staged at open
 SESSION_CMDS = ('flash', 'gdb', 'restore', 'exec', 'console', 'check')
 OWN_OPTS = ('-b', '--board', '--under-hold', '--staged')
@@ -206,11 +207,14 @@ def cmd_collect(a):
     dest = runs() / a.run_id
     session = session_record(a.run_id, required=False)
     if session:
-        record = core.collect(tree, dest, optional=['build/hil-manual/'])
+        record = core.collect(tree, dest, optional=[SESSION_ARTIFACTS])
+        # a session never launches, so it is never `complete`: it needs only every member fetched or absent
+        ok = all(record['outcomes'].get(m) in ('ok', 'absent') for m in (*core.RECORD_FILES, SESSION_ARTIFACTS))
     else:
         record = core.collect(tree, dest, groups=[[f'{RUN_DIR}/']], accept=report_present)
+        ok = record['state'] == 'complete'
     print(json.dumps({**summary(a.run_id, {'state': record['remoteState']}, dest), 'collection': record['state']}))
-    return 0 if record['state'] == 'complete' or session else 1
+    return 0 if ok else 1
 
 
 # ---- sessions
@@ -229,6 +233,13 @@ def session_record(run_id, required=True):
     return json.loads(p.read_text())
 
 
+def held_session(run_id):
+    s = session_record(run_id)
+    if not s.get('held'):
+        core.fail(f'session {run_id} does not hold {s["board"]} (its hold was never taken, or it is closed)')
+    return s
+
+
 def rig(tree, argv):
     return core.run_remote(tree, ['python3', '-u', *argv])
 
@@ -240,13 +251,15 @@ def cmd_session_open(a):
     head = head_of_clean_tree()
     record = record_files(P.ROOT / 'build' / 'hil' / f'{a.board}.build.json', head, a.board)
     tree = staged_tree(a.run_id, a.host, roster, [record], head, RESTORE_BUNDLE)
-    reason = f'arduino-hil session {a.run_id}'
+    # unique per attempt: the rig admits a session command by its reason alone, and run ids repeat across libraries
+    reason = f'arduino-hil session {tree.dir} {secrets.token_hex(8)}'
     data = {'runId': a.run_id, 'board': a.board, 'reason': reason, 'roster': roster, 'head': head,
             'restoreRecord': record[1][0], 'held': False}
     core.write_json(session_path(a.run_id), data)
     rc = rig(tree, [P.HIL, 'lock', 'hold', a.board, '--reason', reason])
     if rc:
-        print(json.dumps({**data, 'error': f'the hold was not taken (exit {rc})'}))
+        print(json.dumps({**data, 'error': f'the hold was not taken (exit {rc}): the session acts under none; one the '
+                                           f'rig took anyway (a dropped connection) is recovered by this reason'}))
         return 1
     data['held'] = True
     core.write_json(session_path(a.run_id), data)
@@ -281,7 +294,7 @@ def session_argv(s, cmd, opts, argv):
 
 
 def cmd_session_exec(run_id, rest):
-    s = session_record(run_id)
+    s = held_session(run_id)
     if not rest or rest[0] not in SESSION_CMDS:
         core.fail(f'session exec ID takes one of {", ".join(SESSION_CMDS)}, then its options')
     cmd, rest = rest[0], rest[1:]
@@ -292,6 +305,11 @@ def cmd_session_exec(run_id, rest):
 
 def cmd_session_close(a):
     s = session_record(a.run_id)
+    if not s.get('held'):   # nothing of ours to restore or release: never act under another session's hold
+        core.write_json(session_path(a.run_id), {**s, 'closed': True})
+        print(json.dumps({'runId': a.run_id, 'board': s['board'], 'closed': True, 'restoreExit': None,
+                          'note': 'held no hold: closed locally, nothing restored or released'}))
+        return 0
     tree = core.load_attempt(P.ROOT, runs(), a.run_id)
     rc = rig(tree, session_argv(s, 'restore', ['--bundle', RESTORE_BUNDLE, '--build-record', s['restoreRecord'],
                                                '--release'], []))
