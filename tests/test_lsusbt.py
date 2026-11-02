@@ -25,7 +25,7 @@ NAMES = {'001:001': 'Linux Foundation 2.0 root hub', '001:002': 'Terminus Techno
          '001:013': 'Silicon Labs CP210x', '001:014': 'Logitech Keyboard'}
 SERIALS = {(1, 1): '0000:00:14.0', (1, 11): '000681295394', (1, 12): '84:F7:03:C0:84:E4', (1, 13): 'ABC123'}
 BOARDS = {'boards': [{'name': 'esp32s3', 'uid': '84F703C084E4'},
-                     {'name': 'stm32h7', 'uid': '1234', 'flasher': {'uid': '681295394'}}]}
+                     {'name': 'stm32h7', 'uid': '1234', 'flasher': {'name': 'jlink', 'uid': '681295394'}}]}
 
 
 def setUpModule():
@@ -97,7 +97,17 @@ class LsusbtTest(unittest.TestCase):
 
     def test_malformed_json_fails(self):
         self.json.write_text('{"boards": [')
-        self.assert_fails(self.invoke(), 'cannot parse boards')
+        self.assert_fails(self.invoke(), 'cannot resolve boards')
+
+    def test_a_registered_boards_flasher_comes_from_agentrcs_registry(self):
+        (self.sysfs / '1-13' / 'serial').write_text('3ea619acd1cdeb11a0a0b806e93fd3f1\n')   # the S3's registered bridge
+        self.assertIn('        |__ Port 003: Dev 013: [12M] Silicon Labs CP210x [3ea619acd1cdeb11a0a0b806e93fd3f1] '
+                      'esp32s3 flasher', self.run_lsusbt())
+
+    def test_a_roster_carrying_a_registered_boards_flasher_fails(self):
+        self.json.write_text(json.dumps({'boards': [{'name': 'esp32s3', 'uid': '84F703C084E4',
+                                                     'flasher': {'name': 'esptool', 'uid': 'x'}}]}))
+        self.assert_fails(self.invoke(), "come from agentrc's board registry")
 
     def test_missing_jq_fails(self):
         for tool in ('bash', 'sed'):

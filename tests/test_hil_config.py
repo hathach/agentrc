@@ -17,7 +17,6 @@ ROOT = Path(__file__).resolve().parents[1]
 TARGET_DEBUG = ROOT / 'skills' / 'target-debug' / 'scripts'
 SCRIPTS = {'rtt': ROOT / 'skills' / 'rtt' / 'scripts' / 'rtt.py', 'pc_sample': TARGET_DEBUG / 'pc_sample.py'}
 RESOLVERS = {'rtt': SCRIPTS['rtt'], 'probe_state': TARGET_DEBUG / 'probe_state.py'}
-TINYUSB_CONFIG = Path.home() / 'code' / 'tinyusb' / 'test' / 'hil' / 'tinyusb.json'
 
 
 def load(name):
@@ -30,15 +29,16 @@ def load(name):
 
 MODULES = {name: load(name) for name in RESOLVERS}
 
-# one entry per flasher kind a HIL config carries, in the project's own format
-BOARDS = [
+# one entry per flasher kind a HIL config carries: unregistered bench boards with their own flasher
+# (hil_boards.resolve), and a registered board, whose flasher comes from agentrc's registry
+BENCH = [
     {'name': 'k64f', 'flasher': {'name': 'jlink', 'uid': '000100000001', 'args': '-device MK64FN1M0xxx12'}},
     {'name': 'max32', 'flasher': {'name': 'openocd', 'uid': 'E0000000000000A1', 'vid_pid': '0x2e8a 0x000c',
                                   'args': '-f interface/cmsis-dap.cfg -f target/max32665.cfg'}},
     {'name': 'h743', 'flasher': {'name': 'stlink', 'uid': '00AA00BB00CC00DD00EE00FF'}},
     {'name': 'p4', 'flasher': {'name': 'esptool', 'uid': '0a0b0c0d', 'args': '-b 1500000'}},
     {'name': 'tm4c', 'flasher': {'name': 'lm4flash', 'uid': '0A0B0C0D', 'args': '-v'}},
-    {'name': 'bare', 'flasher': {'name': 'jlink'}},
+    {'name': 'bare', 'flasher': {'name': 'jlink', 'uid': '77'}},
     {'name': 'jtag', 'flasher': {'name': 'jlink', 'uid': '1', 'args': '-device X -if jtag'}},
     {'name': 'quote', 'flasher': {'name': 'jlink', 'uid': '1', 'args': '-device "X'}},
     {'name': 'blank_uid', 'flasher': {'name': 'jlink', 'uid': '  ', 'args': '-device X'}},
@@ -53,21 +53,30 @@ BOARDS = [
     {'name': 'bad_ids', 'flasher': {'name': 'openocd', 'uid': '1', 'vid_pid': '2e8a:000c', 'args': '-f x.cfg'}},
     {'name': 'stlink_args', 'flasher': {'name': 'stlink', 'uid': '3', 'args': '--connect-under-reset'}},
 ]
+REGISTRY = MODULES['rtt'].hil_boards().registry()
+K64F_UID = next(uid for uid, e in REGISTRY.items() if e['name'] == 'frdm_k64f')
+BOARDS = [{**b, 'uid': f'BENCH-{i}'} for i, b in enumerate(BENCH)] + [
+    {'name': 'frdm_k64f', 'uid': K64F_UID},
+    {'name': 'frdm_k64f_again', 'uid': K64F_UID, 'flasher': REGISTRY[K64F_UID]['flasher']},
+]
 
 # (board, what the resolver says) - a string is the refusal, a dict the flasher it returns
 RESOLVE_CASES = [
-    ('k64f', BOARDS[0]['flasher']),
-    ('max32', BOARDS[1]['flasher']),
-    ('h743', BOARDS[2]['flasher']),
-    ('bare', {'name': 'jlink'}),
+    ('k64f', BENCH[0]['flasher']),
+    ('max32', BENCH[1]['flasher']),
+    ('h743', BENCH[2]['flasher']),
+    ('frdm_k64f', REGISTRY[K64F_UID]['flasher']),
+    ('frdm_k64f_again', "come from agentrc's board registry"),
+    ('bare', {'name': 'jlink', 'uid': '77'}),
     ('p4', "flashed over 'esptool', which is no debug-probe route"),
     ('tm4c', "flashed over 'lm4flash'"),
-    ('blank_uid', "flasher.uid in"),
-    ('int_uid', "flasher.uid in"),
-    ('no_kind', 'no flasher.name'),
-    ('no_flasher', 'no flasher.name'),
+    ('blank_uid', "uid must be a non-empty string"),
+    ('int_uid', "uid must be a non-empty string"),
+    ('no_kind', 'flasher: name None is none of'),
+    ('no_flasher', 'is not in agentrc'),
     ('twin', '2 entries of that name'),
     ('absent', '0 entries of that name'),
+    ('stlink_args', "a stlink entry's args are not openocd's"),
 ]
 BAD_FILES = [('[]', 'expected {"boards"'), ('{"boards": {}}', 'expected {"boards"'),
              ('{"boards": ["k64f"]}', 'expected {"boards"'), ('{"boards": [', '--hil-config'), ('{}', 'expected {"boards"')]
@@ -88,7 +97,7 @@ class Config(unittest.TestCase):
 
 class Resolver(Config):
     def test_both_scripts_carry_the_same_resolver(self):
-        for func in ('hil_flasher', 'hil_jlink_device', 'hil_merge'):
+        for func in ('hil_boards', 'hil_flasher', 'hil_jlink_device', 'hil_merge'):
             for name, path in RESOLVERS.items():
                 self.assertEqual(Path(inspect.getsourcefile(getattr(MODULES[name], func))), path, func)
             self.assertEqual(inspect.getsource(getattr(MODULES['rtt'], func)),
@@ -150,19 +159,19 @@ class Resolver(Config):
                     mod.hil_jlink_device(board, flasher[board])
                 self.assertIn(want, str(cm.exception), name)
 
-    @unittest.skipUnless(TINYUSB_CONFIG.is_file(), 'no tinyusb checkout beside this one')
-    def test_every_board_of_the_real_tinyusb_config_resolves_or_is_refused_cleanly(self):
+    def test_every_registered_board_resolves_or_is_refused_cleanly(self):
+        self.config.write_text(json.dumps({'boards': [{'name': e['name'], 'uid': uid} for uid, e in REGISTRY.items()]}))
         routes = {}
-        for board in json.loads(TINYUSB_CONFIG.read_text())['boards']:
+        for e in REGISTRY.values():
             try:
-                kind = MODULES['rtt'].hil_flasher(TINYUSB_CONFIG, board['name'])['name']
-            except ValueError as e:
+                kind = MODULES['rtt'].hil_flasher(self.config, e['name'])['name']
+            except ValueError as err:
                 kind = 'refused'
-                self.assertIn('no debug-probe route', str(e))
-            routes.setdefault(kind, []).append(board['name'])
+                self.assertIn('no debug-probe route', str(err))
+            routes.setdefault(kind, []).append(e['name'])
         self.assertIn('jlink', routes)
         for name in routes['jlink']:
-            flasher = MODULES['rtt'].hil_flasher(TINYUSB_CONFIG, name)
+            flasher = MODULES['rtt'].hil_flasher(self.config, name)
             self.assertTrue(MODULES['rtt'].hil_jlink_device(name, flasher), name)
 
 
@@ -235,7 +244,7 @@ class Cli(Config):
                          "--probe '999' contradicts --board k64f, which has '000100000001'")
             self.refused(name, ['--board', 'k64f', '--device', 'OTHER', *self.LINK, *extra],
                          "--device 'OTHER' contradicts --board k64f")
-            self.refused(name, ['--board', 'bare', *self.LINK, *extra], '--probe')
+            self.refused(name, ['--board', 'bare', *self.LINK, *extra], '--device')
         self.refused('rtt', ['--board', 'k64f', '--backend', 'openocd', '--seconds', '1'], "--backend 'openocd' contradicts")
         self.refused('rtt', ['--board', 'max32', '--addr', '20000000', '--cfg', '-f other.cfg'], "--cfg '-f other.cfg' contradicts")
 
@@ -253,7 +262,7 @@ class Cli(Config):
 
     def test_openocd_inputs_are_checked_before_anything_starts(self):
         self.refused('rtt', ['--board', 'bad_cfg', '--addr', '20000000'], 'No closing quotation')
-        self.refused('rtt', ['--board', 'bad_ids', '--addr', '20000000'], '--vid-pid must be "0xVVVV 0xPPPP"')
+        self.refused('rtt', ['--board', 'bad_ids', '--addr', '20000000'], 'vid_pid must be "0xVVVV 0xPPPP"')
         self.refused('rtt', ['--board', 'h743', '--addr', '20000000', '--cfg', '-f "open'], 'No closing quotation')
         self.refused('rtt', ['--board', 'h743', '--addr', '20000000', '--cfg', '-f x.cfg', '--vid-pid', 'junk'],
                      '--vid-pid must be')

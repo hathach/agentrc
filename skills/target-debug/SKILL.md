@@ -36,8 +36,10 @@ These skills know probes, not projects. Three things come from the project, and 
 - **What its symbols and symptoms mean**: kept here, in `projects/`, for the projects this skill has been used on — see
   "Project notes" at the end.
 
-A HIL config json maps board → probe (`--hil-config <file> --board <name>`). `rtt.py` and `swo_capture.py` turn a
-board's `flasher` entry into their flags, and a flag given as well must agree:
+A HIL config json names each board and its `uid` (`--hil-config <file> --board <name>`); the board's probe is its
+`flasher` in agentrc's board registry, keyed by that uid (`hil` skill, Board registry), or an unregistered bench
+board's own entry. `rtt.py` and `swo_capture.py` turn that `flasher` into their flags, and a flag given as well must
+agree:
 
 | `flasher` field | Means | Becomes |
 | --------------- | --- | --- |

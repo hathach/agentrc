@@ -72,7 +72,8 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 FILES = ('skills/hil/scripts/hil_load.py', 'skills/hil/scripts/hil_lock.py', 'skills/hil/scripts/hil_process.py',
          'skills/hil/scripts/usb_observe.py', 'skills/usb-kernel-recover/scripts/usb_recover.sh',
-         'skills/usb-kernel-recover/scripts/root_port_cycle.py', 'skills/hil/scripts/hil_root.py')
+         'skills/usb-kernel-recover/scripts/root_port_cycle.py', 'skills/hil/scripts/hil_root.py',
+         'skills/hil/scripts/hil_boards.py', 'skills/hil/boards.json')
 
 
 def _hil_load():
@@ -92,6 +93,7 @@ hil_load.require(__file__, FILES)
 hil_lock = hil_load.load_file('skills/hil/scripts/hil_lock.py')
 uo = hil_load.load_file('skills/hil/scripts/usb_observe.py')
 hil_root = hil_load.load_file('skills/hil/scripts/hil_root.py')
+hil_boards = hil_load.load_file('skills/hil/scripts/hil_boards.py')
 
 LOCK_NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]*$')
 UDEV_UNSAFE_RE = re.compile(r'[^A-Za-z0-9#+.:=@_-]')   # what usb_id turns into '_' after whitespace runs
@@ -154,7 +156,9 @@ def _identities(obj, out):
 
 def load_rosters(specs):
     """[(file, selector)] -> {'locks': sorted lock names, 'identities': {identity: {locks}}}.
-    A DUT `uid` under two lock names is a conflict; any other identity may serve several."""
+    Each entry is resolved through agentrc's board registry (hil_boards), so its probe serial and
+    its board's aliases are identities too. A DUT under two lock names, by its uid or one its
+    registry entry names, is a conflict; any other identity may serve several."""
     locks, ids, duts, raw_of = set(), {}, {}, {}
     for path, selector in specs:
         try:
@@ -174,12 +178,17 @@ def load_rosters(specs):
             if not isinstance(lock, str) or not LOCK_NAME_RE.match(lock):
                 raise Refused(f'roster {path}: {e["name"]}: lock name {lock!r} is not a plain file name')
             locks.add(lock)
-            uid = e.get('uid')
-            if isinstance(uid, str) and uid.strip():
-                u = uid.strip().lower()
-                if duts.setdefault(u, lock) != lock:
-                    raise Refused(f'uid {uid} names two boards: {duts[u]} and {lock}')
-            found = set()
+            try:
+                e = hil_boards.resolve(e)
+            except ValueError as err:
+                raise Refused(f'roster {path}: {err}')
+            found, uid = set(), e['uid']
+            registered = hil_boards.lookup(uid)
+            board = (registered[0] if registered else uid).strip().lower()
+            if duts.setdefault(board, lock) != lock:
+                raise Refused(f'uid {uid} names two boards: {duts[board]} and {lock}')
+            if registered:
+                found |= {a.strip().lower() for a in (registered[0], *registered[1].get('aliases', ()))}
             _identities(e, found)
             for raw in found:
                 i = identity(raw)

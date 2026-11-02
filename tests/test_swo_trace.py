@@ -1343,9 +1343,9 @@ class HilRoster(unittest.TestCase):
         self.addCleanup(d.cleanup)
         path = Path(d.name, 'hil.json')
         path.write_text(json.dumps({'boards': [
-            {'name': 'f407', 'flasher': {'name': 'jlink', 'uid': '773', 'args': '-device STM32F407VG'}},
-            {'name': 'h743', 'flasher': {'name': 'stlink', 'uid': '004C'}},
-            {'name': 'l412', 'flasher': {'name': 'stlink', 'uid': '0673', 'args': '--freq 4M'}}]}))
+            {'name': 'f407', 'uid': 'B-f407', 'flasher': {'name': 'jlink', 'uid': '773', 'args': '-device STM32F407VG'}},
+            {'name': 'h743', 'uid': 'B-h743', 'flasher': {'name': 'stlink', 'uid': '004C'}},
+            {'name': 'l412', 'uid': 'B-l412', 'flasher': {'name': 'stlink', 'uid': '0673', 'args': '--freq 4M'}}]}))
         return str(path)
 
     def test_a_jlink_entry_fills_probe_and_device_and_a_given_flag_must_agree(self):

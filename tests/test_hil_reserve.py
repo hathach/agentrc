@@ -304,12 +304,13 @@ class Rosters(Fixture):
     def test_identities_compare_as_udev_records_a_serial(self):
         self.assertEqual(hr.identity('  AB  CD/x,y '), 'ab_cd_x_y')
         roster = Path(self.td.name) / 'r.json'
-        roster.write_text(json.dumps({'boards': [{'name': 'a', 'uid': 'AB CD'}, {'name': 'b', 'uid': 'ab_cd'}]}))
+        roster.write_text(json.dumps({'boards': [{'name': 'a', 'uid': 'AB CD', 'flasher': {'name': 'jlink', 'uid': 'pa'}},
+                                                 {'name': 'b', 'uid': 'ab_cd', 'flasher': {'name': 'jlink', 'uid': 'pb'}}]}))
         with self.assertRaisesRegex(hr.Refused, "identities 'ab cd' and 'ab_cd' are one and the same to udev"):
             hr.load_rosters([(str(roster), 'name')])
-        roster.write_text(json.dumps({'boards': [{'name': 'a', 'uid': 'AB CD'}]}))
+        roster.write_text(json.dumps({'boards': [{'name': 'a', 'uid': 'AB CD', 'flasher': {'name': 'jlink', 'uid': 'pa'}}]}))
         got = hr.load_rosters([(str(roster), 'name')])
-        self.assertEqual(got['identities'], {'ab_cd': {'a'}})
+        self.assertEqual(got['identities'], {'ab_cd': {'a'}, 'pa': {'a'}})
         self.dev('3-1.4', serial='AB CD')                    # the sysfs form matches...
         (self.sys / '3-1.5').mkdir()
         self.dev('3-1.5', udev='AB_CD')                      # ...and so does udev's
@@ -318,8 +319,26 @@ class Rosters(Fixture):
 
     def test_a_dut_uid_under_two_lock_names_is_a_conflict(self):
         bad = Path(self.td.name) / 'bad.json'
-        bad.write_text(json.dumps({'boards': [{'name': 'a', 'uid': 'X1'}, {'name': 'b', 'uid': 'x1'}]}))
+        bad.write_text(json.dumps({'boards': [{'name': 'a', 'uid': 'X1', 'flasher': {'name': 'jlink', 'uid': 'pa'}}, {'name': 'b', 'uid': 'x1', 'flasher': {'name': 'jlink', 'uid': 'pb'}}]}))
         with self.assertRaisesRegex(hr.Refused, 'uid x1 names two boards: a and b'):
+            hr.load_rosters([(str(bad), 'name')])
+
+    def test_a_registered_board_is_one_dut_by_any_of_its_uids(self):
+        uid, entry = next((u, e) for u, e in hr.hil_boards.registry().items() if e.get('aliases'))
+        a, b = Path(self.td.name) / 'a.json', Path(self.td.name) / 'b.json'
+        a.write_text(json.dumps({'boards': [{'name': 'a', 'uid': uid}]}))
+        b.write_text(json.dumps({'boards': [{'name': 'b', 'uid': entry['aliases'][0]}]}))
+        got = hr.load_rosters([(str(a), 'name')])
+        self.assertEqual(got['identities'][entry['aliases'][0].lower()], {'a'})
+        self.assertEqual(got['identities'][entry['flasher']['uid'].lower()], {'a'})
+        with self.assertRaisesRegex(hr.Refused, f'uid {entry["aliases"][0]} names two boards: a and b'):
+            hr.load_rosters([(str(a), 'name'), (str(b), 'name')])
+
+    def test_a_roster_carrying_a_registered_boards_flasher_refuses(self):
+        uid, entry = next(iter(hr.hil_boards.registry().items()))
+        bad = Path(self.td.name) / 'bad.json'
+        bad.write_text(json.dumps({'boards': [{'name': 'a', 'uid': uid, 'flasher': entry['flasher']}]}))
+        with self.assertRaisesRegex(hr.Refused, "come from agentrc's board registry"):
             hr.load_rosters([(str(bad), 'name')])
 
     def test_malformed_rosters_and_lock_names_refuse(self):
@@ -923,7 +942,8 @@ class Run(Fixture):
         first = self.run_run(action='fail')
         tok1 = first.token()
         other = Path(self.td.name) / 'other.json'
-        other.write_text(json.dumps({'boards': [{'name': 'other-board', 'uid': 'unrelated-keyboard'}]}))
+        other.write_text(json.dumps({'boards': [{'name': 'other-board', 'uid': 'unrelated-keyboard',
+                                                 'flasher': {'name': 'jlink', 'uid': 'other-probe'}}]}))
         second = self.fork_main('run', 'root-cycle', '3-2', '--roster', str(other), '--reason', 't', action='fail')
         tok2 = second.token()
         self.assertNotEqual(tok1, tok2)

@@ -181,6 +181,24 @@ Below it only what the table cannot show: held boards with their holders, and
 each blocked board with its token or record and that its recovery is a separate
 dispatch.
 
+## Board registry
+
+Each rig board is wired to one probe, so how it is flashed is a farm fact, kept once
+for every project in `boards.json` beside this page and keyed by the board's `uid`:
+its `flasher` and optional `flasher_recover` (the shapes below), its `aliases` (the
+other serials the board reports, matched exactly; each firmware forms its own) and a
+`name` label. A project roster names the board by `uid` and keeps its own name, lock
+name, tests and project fields, never the registry's.
+
+`scripts/hil_boards.py` is the one reader: every consumer that needs a board's
+flasher resolves the roster entry through it (`resolve`, `resolve_roster`, or
+`hil_boards.py roster FILE`). A registered board's entry that carries a flasher of
+its own is refused as a duplicate; an unregistered one (a bench board on a dev PC)
+keeps its own, unless its probe is a registered board's; an unregistered entry
+without one is refused. A reader that needs only names and lock names reads the
+roster raw. A board joins the farm, or its wiring changes, by an agentrc commit to
+`boards.json`, then the project's agentrc pin.
+
 ## Flashers
 
 A runner that flashes or resets through this skill's `scripts/hil_flash.py`
@@ -315,6 +333,7 @@ recovery stay the contract's.
 
 | Script | Gives |
 |---|---|
+| `hil_boards.py` | each board's flasher from the board registry by uid (Board registry above) |
 | `hil_load.py` | the one path loader: one module per file per process, a second path under one name refused |
 | `hil_process.py` | `run_cmd`, a bounded command; `run_tracked` and `recheck`, a command whose end is proven |
 | `hil_farm_check.py` | the farm check engine a project's launcher drives with its profile (Farm check above) |

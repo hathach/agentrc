@@ -10,7 +10,8 @@
 # It also maps each serial back to the TinyUSB HIL board it belongs to, using the
 # uids recorded in a boards JSON (default: $HOME/code/tinyusb/test/hil/tinyusb.json).
 # A serial matching a board's `uid` is that board acting as a USB device; one
-# matching a `flasher.uid` is that board's flasher/debugger. Matches append
+# matching its `flasher.uid` (agentrc's board registry gives it) is that board's
+# flasher/debugger. Matches append
 # `<board> device` or `<board> flasher`.
 #
 # By default only the lines that resolved to a board are printed, plus root hubs and
@@ -67,17 +68,20 @@ strip() {
   "
 }
 
-# Build norm(uid) -> "<board> device|flasher" from the boards JSON.
+# Build norm(uid) -> "<board> device|flasher" from the boards JSON, each board's flasher
+# from agentrc's board registry (skills/hil/scripts/hil_boards.py).
 # A JSON that exists but cannot be read is an error: without its labels the default
 # filtered view shows only hubs, which reads as "no boards connected".
 declare -A LABEL
 if [ -f "$JSON" ]; then
   command -v jq >/dev/null 2>&1 || { echo "lsusbt: jq is needed to read $JSON" >&2; exit 1; }
+  resolved=$(python3 "$(dirname "$(readlink -f "$0")")/../skills/hil/scripts/hil_boards.py" roster "$JSON") ||
+    { echo "lsusbt: cannot resolve boards from $JSON" >&2; exit 1; }
   labels=$(jq -r '
     .boards[] | .name as $n |
     (if .uid         then [.uid,         $n + " device"]  | @tsv else empty end),
     (if .flasher.uid then [.flasher.uid, $n + " flasher"] | @tsv else empty end)
-  ' "$JSON") || { echo "lsusbt: cannot parse boards from $JSON" >&2; exit 1; }
+  ' <<< "$resolved") || { echo "lsusbt: cannot parse boards from $JSON" >&2; exit 1; }
   while IFS=$'\t' read -r uid label; do
     [ -n "$uid" ] && LABEL["$(norm "$uid")"]=$label
   done <<< "$labels"

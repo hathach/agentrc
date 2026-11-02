@@ -595,20 +595,21 @@ while not os.path.exists(os.environ['FAKE_STOP']):
 close()
 """
 
+# k64f, max32, h743 and pico are farm boards by their board uid (flashers from agentrc's registry); the rest
+# are bench boards carrying their own (hil_boards.resolve)
 STATE_BOARDS = [
-    {'name': 'k64f', 'flasher': {'name': 'jlink', 'uid': '000621000000', 'args': '-device MK64FN1M0xxx12'}},
-    {'name': 'max32', 'flasher': {'name': 'openocd', 'uid': 'E6614C311B597D32', 'vid_pid': '0x2e8a 0x000c',
-                                  'args': '-f interface/cmsis-dap.cfg -f target/max32665.cfg'}},
-    {'name': 'h743', 'flasher': {'name': 'stlink', 'uid': '004C00343137510F39383538'}},
-    {'name': 'p4', 'flasher': {'name': 'esptool', 'uid': '4ea4f48f', 'args': '-b 1500000'}},
-    {'name': 'no_uid', 'flasher': {'name': 'jlink', 'args': '-device X'}},
-    {'name': 'no_dev', 'flasher': {'name': 'jlink', 'uid': '1'}},
-    {'name': 'no_cfg', 'flasher': {'name': 'openocd', 'uid': '1'}},
-    {'name': 'bad_ids', 'flasher': {'name': 'openocd', 'uid': '1', 'vid_pid': '2e8a:000c', 'args': '-f x.cfg'}},
-    {'name': 'twin', 'flasher': {'name': 'jlink', 'uid': '1', 'args': '-device X'}},
-    {'name': 'twin', 'flasher': {'name': 'jlink', 'uid': '2', 'args': '-device X'}},
-    {'name': 'pico', 'flasher': {'name': 'openocd', 'uid': 'E6614103E72C1D2F',
-                                 'args': '-f interface/cmsis-dap.cfg -f target/rp2040.cfg'}},
+    {'name': 'k64f', 'uid': 'FFFF1A00FFFFFFFF1031454E0F000280'},
+    {'name': 'max32', 'uid': '0C81464124010B20FF0A08CC2C'},
+    {'name': 'h743', 'uid': '110018000951383432343236'},
+    {'name': 'p4', 'uid': 'B-p4', 'flasher': {'name': 'esptool', 'uid': '4ea4f48f', 'args': '-b 1500000'}},
+    {'name': 'no_uid', 'uid': 'B-no_uid', 'flasher': {'name': 'jlink', 'args': '-device X'}},
+    {'name': 'no_dev', 'uid': 'B-no_dev', 'flasher': {'name': 'jlink', 'uid': '1'}},
+    {'name': 'no_cfg', 'uid': 'B-no_cfg', 'flasher': {'name': 'openocd', 'uid': '1'}},
+    {'name': 'bad_ids', 'uid': 'B-bad_ids', 'flasher': {'name': 'openocd', 'uid': '1', 'vid_pid': '2e8a:000c',
+                                                        'args': '-f x.cfg'}},
+    {'name': 'twin', 'uid': 'B-twin1', 'flasher': {'name': 'jlink', 'uid': '1', 'args': '-device X'}},
+    {'name': 'twin', 'uid': 'B-twin2', 'flasher': {'name': 'jlink', 'uid': '2', 'args': '-device X'}},
+    {'name': 'pico', 'uid': 'E6614C311B764A37'},
 ]
 
 
@@ -1882,7 +1883,7 @@ class ProbeStateCliTest(FakeToolsCase):
     def test_refusals_launch_nothing(self):
         bin_ = self.d / 'fw.bin'
         bin_.write_bytes(b'x')
-        cases = [('p4', (), 'no debug-probe route'), ('h743', (), 'stlink'), ('no_uid', LINK, 'no flasher.uid'),
+        cases = [('p4', (), 'no debug-probe route'), ('h743', (), 'stlink'), ('no_uid', LINK, 'flasher: no uid (the probe serial)'),
                  ('no_dev', LINK, "-device NAME"), ('no_cfg', (), 'needs flasher.args'),
                  ('bad_ids', (), '0xVVVV 0xPPPP'), ('twin', LINK, '2 entries'), ('absent', LINK, '0 entries'),
                  ('k64f', (), 'needs --interface and --speed'), ('k64f', ('--interface', 'swd', '--speed', 'fast'),
