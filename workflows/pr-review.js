@@ -443,7 +443,7 @@ const comments = [...toPost.map((f, i) => ({
 })), ...reraised.map(f => ({
   path: f.file, line: f.line, finding: carriedOut.indexOf(f),
   // A comment the human edited is restated as they left it.
-  body: `${earlier[f.id].published || `**${f.severity || 'finding'}**: ${whyOf(f)}`}\n- The repair in ${repairedOf(f).head.slice(0, 12)} did not fix this; its earlier thread was resolved.`,
+  body: `${earlier[f.id].published || template({ severity: f.severity, why: whyOf(f) })}\n- The repair in ${repairedOf(f).head.slice(0, 12)} did not fix this; its earlier thread was resolved.`,
 }))]
 const long = [...comments.filter(c => overLength(c.body, LIMIT.comment)).map(c => `${c.path}:${c.line}`), ...answers.filter(x => overLength(x.a.body, LIMIT.answer)).map(x => `answer on ${x.finding}`)]
 if (long.length) log(`over length, for the human to shorten: ${long.join(', ')}`)

@@ -73,9 +73,9 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from ledger import (DRAFTS, ONLINE, OPEN, UNSETTLED, add_answers, answered_ids, answers_of, claim, holder, last,  # noqa: E402
-                    now, open_answers, owner_of, publications, pushback, reached, repairs, thread_roots,
-                    digest as ledger_digest, ledger_path, load, locked, repo_of, store)
+from ledger import (DRAFTS, ONLINE, OPEN, SETTLED, UNSETTLED, add_answers, answered_ids, answers_of, claim,  # noqa: E402
+                    holder, open_answers, owner_of, publications, pushback, reached, repair_hold, repairs, submitted_last,
+                    thread_roots, digest as ledger_digest, ledger_path, load, locked, repo_of, store)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'pr-babysit' / 'scripts'))
 from facts import FULL_SHA, Parser, Unusable, attempt  # noqa: E402
@@ -315,6 +315,13 @@ def due_resolves(review):
     return [(by_id[x['findingId']], x['commentId']) for x in review['draft'].get('resolves', []) if x['findingId'] in by_id]
 
 
+def resolve(thread_id):
+    """(True, None) once GitHub answers the thread resolved, else (False, why)."""
+    data, err = graphql(RESOLVE, t=thread_id)
+    ok = bool((((data or {}).get('resolveReviewThread') or {}).get('thread') or {}).get('isResolved'))
+    return ok, None if ok else f'resolve unconfirmed: {err}'
+
+
 def resolve_threads(repo, pr, led, review, want, login, persist):
     """Resolve each (finding, root comment) thread while the PR head is the review's, a published reply of ours is on
     it and nobody pushed back after the last one, marking each in receipts.resolved."""
@@ -323,25 +330,25 @@ def resolve_threads(repo, pr, led, review, want, login, persist):
     head = pr_head(repo, pr)
     public = pages(f'repos/{repo}/pulls/{pr}/comments')
     by_root = {t['commentIds'][0]: t for t in threads(repo, pr) if t['commentIds']}
-    known, marks = answered_ids(led), review['receipts'].setdefault('resolved', [])
+    known, marks, fixes = answered_ids(led), review['receipts'].setdefault('resolved', []), repairs(led)
     for f, root in want:
         t = by_root.get(root)
         replies = live_thread(public, root)
+        fix = fixes.get((f['id'], root))
+        # A draft saved before a repair's resolve was reopened or left unconfirmed never resolves it again.
         why = ('no review thread holds the comment' if not t else None if t['resolved'] else
-               f"the PR head moved to {head} since the review" if head != review['head'] else
-               'no published reply of ours on the thread' if not any(c['id'] in known for c in replies) else
-               'new replies since our last one' if pushback(replies, known, login) else None)
+               (fix and repair_hold(fix, t)) or
+               (f"the PR head moved to {head} since the review" if head != review['head'] else
+                'no published reply of ours on the thread' if not any(c['id'] in known for c in replies) else
+                'new replies since our last one' if pushback(replies, known, login) else None))
         mark = {'findingId': f['id'], 'commentId': root, 'state': 'deferred' if why else 'observed', 'error': why}
         marks.append(mark)
         if t and not why and not t['resolved']:
             # Stored before the mutation: a resolve not confirmed resolved is never tried again.
             mark.update(state='sent')
             persist()
-            data, err = graphql(RESOLVE, t=t['threadId'])
-            if (((data or {}).get('resolveReviewThread') or {}).get('thread') or {}).get('isResolved'):
-                mark.update(state='resolved')
-            else:
-                mark.update(error=f'resolve unconfirmed: {err}')
+            ok, err = resolve(t['threadId'])
+            mark.update(state='resolved') if ok else mark.update(error=err)
 
 
 def declined(led, review, reason):
@@ -569,8 +576,10 @@ def read_manifest(path, head):
         m = json.loads(Path(path).read_text(encoding='utf-8'))
     except (OSError, ValueError) as e:
         raise Unusable(f'--fixed {path} unreadable: {e}')
-    rows = m.get('findings') if isinstance(m, dict) else None
-    if not FULL_SHA.match(str(m.get('reviewedHead') if isinstance(m, dict) else '')) or not isinstance(rows, list) or not rows:
+    if not isinstance(m, dict):
+        m = {}
+    rows = m.get('findings')
+    if not FULL_SHA.match(str(m.get('reviewedHead'))) or not isinstance(rows, list) or not rows:
         raise Unusable('--fixed needs {"reviewedHead": SHA, "findings": [...]} with at least one finding')
     ids = [r.get('id') for r in rows if isinstance(r, dict)]
     if len(ids) != len(rows) or len(set(ids)) != len(ids):
@@ -607,10 +616,10 @@ def note_reply(snap, x):
     return hits[0] if len(hits) == 1 else None
 
 
-def unfit(repo, pr, led, f, want, head):
+def unfit(repo, pr, led, f, want, head, login):
     """(snapshot, why f's thread may not take a note or a resolve now, or None), read afresh: the root and claim as
     the fix check judged them (`want`, its claim digest), no pushback since our last answer, the head the repaired one."""
-    snap = snapshot(repo, pr)
+    snap = snapshot(repo, pr, login)
     t = thread_roots(snap).get(f.get('commentId'))
     at = pr_head(repo, pr)
     return snap, (holder(led, snap)(f) or ('the claim changed since its fix check' if ledger_digest(claim(f)) != want else
@@ -632,12 +641,11 @@ def send_note(repo, pr, x, persist):
         x['error'] = (err or out).strip()[:300] or 'no reply id in the answer'
 
 
-def settle_note(repo, pr, led, f, x, row, head, persist):
+def settle_note(repo, pr, led, f, x, row, head, login, persist):
     """Read the note back, then resolve its thread while it still stands as the note answered it and this run's fix
     check (`row`, on `head`) judged that same claim: a note never acknowledges a reply, an edit or a push it was not
     sent against."""
-    snap, why = unfit(repo, pr, led, f, x['claimDigest'], head)
-    why = why or ('the claim changed since its fix check' if row['claimDigest'] != x['claimDigest'] else None)
+    snap, why = unfit(repo, pr, led, f, x['claimDigest'], head, login)
     c = note_reply(snap, x)
     if x['state'] in ('sent', 'uncertain'):
         if c and ledger_digest(c['body']) == x['digest']:
@@ -647,62 +655,68 @@ def settle_note(repo, pr, led, f, x, row, head, persist):
             persist()
             return
     t = thread_roots(snap).get(x['commentId'])
-    why = (None if t and t['resolved'] else why or ('our note was deleted' if c is None else
-                                                     'our note was edited' if ledger_digest(c['body']) != x['digest'] else None))
-    x.update(resolve='observed' if t and t['resolved'] else 'deferred' if why else 'sent', error=why)
-    if x['resolve'] == 'sent':
-        x['resolveCheck'] = {'head': head, 'evidence': row['evidence']}  # the fix check the resolve stands on
-    persist()
-    if x['resolve'] == 'sent':
-        # Stored before the mutation: a resolve not confirmed resolved is never tried again.
-        data, err = graphql(RESOLVE, t=t['threadId'])
-        if (((data or {}).get('resolveReviewThread') or {}).get('thread') or {}).get('isResolved'):
-            x.update(resolve='resolved', error=None)
-        else:
-            x['error'] = f'resolve unconfirmed: {err}'
+    if t and t['resolved']:
+        x.update(resolve='observed', error=None)
         persist()
+        return
+    why = (why or ('the claim changed since its fix check' if row['claimDigest'] != x['claimDigest'] else
+                   'our note was deleted' if c is None else
+                   'our note was edited' if ledger_digest(c['body']) != x['digest'] else None))
+    if why:
+        x.update(resolve='deferred', error=why)
+        persist()
+        return
+    # Stored before the mutation: a resolve not confirmed resolved is never tried again. resolveCheck is the fix check
+    # the resolve stands on, kept with the note's own head and evidence.
+    x.update(resolve='sent', error=None, resolveCheck={'head': head, 'evidence': row['evidence']})
+    persist()
+    ok, err = resolve(t['threadId'])
+    x.update(resolve='resolved') if ok else x.update(error=err)
+    persist()
 
 
 def fix_notes(repo, pr, led, m, head, persist):
     """A fix note and a resolve on each repaired finding's thread of the last review, which must be the one submitted on
     the reviewed head; per finding, one record across runs and heads (ledger.py's repairs). Each send and each resolve
     reads the PR afresh first."""
-    rev = last(led)
-    if not rev or rev['head'] != m['reviewedHead'] or not ((rev.get('receipts') or {}).get('review') or {}).get('submitted'):
-        raise Unusable(f"the last review on the PR is {rev and rev['head']}, not one submitted on {m['reviewedHead']}")
-    if pr_head(repo, pr) != head:
-        raise Unusable(f'the PR head moved to {pr_head(repo, pr)}; the repair was checked on {head}')
-    by_id, fixes, out = {f['id']: f for f in rev['findings']}, repairs(led), []
+    rev = submitted_last(led, m['reviewedHead'])
+    at = pr_head(repo, pr)
+    if at != head:
+        raise Unusable(f'the PR head moved to {at}; the repair was checked on {head}')
+    login = gh_json('api', 'user')['login']
+    by_id, fixes, out, settled = {f['id']: f for f in rev['findings']}, repairs(led), [], None
     for row in m['findings']:
         f = by_id.get(row['id'])
         x = f and fixes.get((f['id'], f.get('commentId')))
-        if x and x['resolve'] in ('sent', 'resolved', 'observed'):
-            t = thread_roots(snapshot(repo, pr)).get(x['commentId'])
-            held = x['resolve'] == 'sent' or not t or not t['resolved']
-            out.append({**receipt(x), 'state': 'held', 'error': 'resolve unconfirmed' if x['resolve'] == 'sent' else
-                        'reopened after it was resolved'} if held else receipt(x))
+        if x and x['resolve'] in ('sent', *SETTLED):
+            # Nothing is sent for these: one read of the PR serves them all.
+            settled = settled or thread_roots(snapshot(repo, pr, login))
+            t = settled.get(x['commentId'])
+            why = repair_hold(x, t) or (None if t else 'no review thread holds the comment')
+            out.append({**receipt(x), 'state': 'held', 'error': why} if why else receipt(x))
             continue
         if not x:
             root = f and f.get('commentId')
             why = ('not a finding of the last review' if not f else 'not standing' if f['status'] not in OPEN else
                    'no thread: it stands in the review body' if root is None else None)
             if not why:
-                snap, why = unfit(repo, pr, led, f, row['claimDigest'], head)
+                snap, why = unfit(repo, pr, led, f, row['claimDigest'], head, login)
                 t = thread_roots(snap).get(root)
                 why = why or ('its thread is resolved' if t['resolved'] else
-                              'a pending review of ours is open on the PR' if our_pending(repo, pr, led, snap['viewer']) else None)
+                              'a pending review of ours is open on the PR' if our_pending(repo, pr, led, login) else None)
             if why:
                 out.append({'findingId': row['id'], 'commentId': root, 'state': 'skipped', 'replyId': None, 'resolve': None, 'error': why})
                 continue
             body = fix_body(head, row['note'])
-            x = {'findingId': f['id'], 'commentId': root, 'threadId': t['threadId'], 'head': head,
-                 'claimDigest': row['claimDigest'], 'evidence': row['evidence'], 'body': body, 'digest': ledger_digest(body),
-                 'before': t['commentIds'], 'state': 'sent', 'replyId': None, 'resolve': None, 'error': None, 'at': now()}
+            # evidence: the fix check the note stands on, kept for audit.
+            x = {'findingId': f['id'], 'commentId': root, 'head': head, 'claimDigest': row['claimDigest'], 'evidence': row['evidence'],
+                 'body': body, 'digest': ledger_digest(body), 'before': t['commentIds'], 'state': 'sent', 'replyId': None,
+                 'resolve': None, 'error': None}
             rev.setdefault('repairs', []).append(x)
             send_note(repo, pr, x, persist)
-        settle_note(repo, pr, led, f, x, row, head, persist)
+        settle_note(repo, pr, led, f, x, row, head, login, persist)
         out.append(receipt(x))
-    done = all(r['resolve'] in ('resolved', 'observed') and r['state'] == 'published' for r in out)
+    done = all(r['resolve'] in SETTLED and r['state'] == 'published' for r in out)
     return {'status': 'repaired' if done else 'partial', 'repairs': out}
 
 

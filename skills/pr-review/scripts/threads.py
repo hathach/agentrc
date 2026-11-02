@@ -64,14 +64,14 @@ def record(kind, c, **extra):
             'createdAt': c.get('created_at') or c.get('submitted_at'), 'ours': False, **extra}
 
 
-def snapshot(repo, pr):
-    """The PR's comments and threads as FILE holds them."""
+def snapshot(repo, pr, login=None):
+    """The PR's comments and threads, as collect writes them; `login` saves reading who we are again."""
     reviews = pages(f'repos/{repo}/pulls/{pr}/reviews')
     inline = pages(f'repos/{repo}/pulls/{pr}/comments')
     issue = pages(f'repos/{repo}/issues/{pr}/comments')
     ordered = threads(repo, pr)
     where = {i: (t['threadId'], t['resolved'], t['outdated']) for t in ordered for i in t['commentIds']}
-    login = gh_json('api', 'user')['login']
+    login = login or gh_json('api', 'user')['login']
     ours = {r['id'] for r in reviews if MARKER in (r.get('body') or '') and (r.get('user') or {}).get('login') == login}
     out = [record('review-body', r, ours=r['id'] in ours) for r in reviews if (r.get('body') or '').strip()]
     for c in inline:
@@ -91,12 +91,12 @@ def collect(argv):
     p.add_argument('--repo')
     a = p.parse_args(argv)
     snap = snapshot(repo_of(a.repo), a.pr)
-    out = snap['comments']
     text = json.dumps(snap, indent=1) + '\n'
     Path(a.out).write_text(text, encoding='utf-8')
     kinds = {}
-    for c in out:
+    for c in snap['comments']:
         kinds[c['kind']] = kinds.get(c['kind'], 0) + 1
+    out = snap['comments']
     return {'file': a.out, 'sha256': hashlib.sha256(text.encode()).hexdigest(), 'count': len(out), 'kinds': kinds,
             'unresolvedThreads': len({c['threadId'] for c in out if c['threadId'] and c['resolved'] is False}),
             'ours': sum(c['ours'] for c in out)}

@@ -12,7 +12,7 @@ post.py write it, under an exclusive lock, by write-then-rename.
 show prints the last review that reached the PR (posted:
 head, mergeBase, verdict, status), its standing findings (open, upheld,
 disputed: id, file, line, severity with its P0-P4 priority, the grading
-behind it, its claim and its comment as the human edited it (published), the
+behind it, its claim and its comment as the human edited it (published, carried to a comment raising it again), the
 number of the defect it shares with other findings of that review, if any, and
 the repair note post.py --fixed put on its thread (repair: head, state,
 resolved), or null), ordered by
@@ -287,9 +287,7 @@ def resolve_due(led, snapshot):
         fix = fixes.get((f['id'], f.get('commentId')))
         if fix and t and fix['state'] == 'published' and fix['replyId'] in t['commentIds']:
             replied[f['id']] = True
-        why = fix and t and ('repair note unconfirmed' if fix['state'] in ('sent', 'uncertain') else
-                             'resolve unconfirmed' if fix['resolve'] == 'sent' else
-                             'reopened after it was resolved' if fix['resolve'] in ('resolved', 'observed') and not t['resolved'] else None)
+        why = fix and t and repair_hold(fix, t)
         if why:
             held.append({'findingId': f['id'], 'commentId': f['commentId'], 'why': why})
             continue
@@ -311,7 +309,7 @@ def open_row(f, due, fixes=None):
             'impact': f.get('impact'), 'severityReason': f.get('severityReason'),
             'why': f['why'], 'published': f.get('published'), 'commentId': f.get('commentId'), 'defect': f.get('defect'),
             'resolveDue': due.get(f['id']),
-            'repair': fix and {'head': fix['head'], 'state': fix['state'], 'resolved': fix['resolve'] in ('resolved', 'observed')}}
+            'repair': fix and {'head': fix['head'], 'state': fix['state'], 'resolved': fix['resolve'] in SETTLED}}
 
 
 def show(led, finding=None, draft=False, snapshot=None, pending=False):
@@ -407,9 +405,28 @@ def answered_ids(led):
         rec = r.get('receipts') or {}
         ids |= {x.get('replyId') for x in rec.get('staged') or [] if x.get('state') in ('published', 'edited')}
     # A repair note settles pushback only once its resolve saw none: one deferred by a reply must not hide that reply.
-    ids |= {x['replyId'] for x in repairs(led).values() if x['state'] == 'published' and x['resolve'] in ('resolved', 'observed')}
+    ids |= {x['replyId'] for x in repairs(led).values() if x['state'] == 'published' and x['resolve'] in SETTLED}
     ids.discard(None)
     return ids
+
+
+SETTLED = ('resolved', 'observed')
+
+
+def repair_hold(fix, t):
+    """Why a repair record keeps its thread (`t`, as a snapshot shows it) from any further resolve, or None: its note
+    or resolve unconfirmed, or the thread reopened after it was resolved."""
+    return ('repair note unconfirmed' if fix['state'] in ('sent', 'uncertain') else
+            'resolve unconfirmed' if fix['resolve'] == 'sent' else
+            'reopened after it was resolved' if fix['resolve'] in SETTLED and t and not t['resolved'] else None)
+
+
+def submitted_last(led, head):
+    """The last review on the PR, which must be the one submitted on `head`."""
+    rev = last(led)
+    if not rev or rev['head'] != head or not ((rev.get('receipts') or {}).get('review') or {}).get('submitted'):
+        raise Unusable(f"the last review on the PR is {rev and rev['head']} ({rev and rev['status']}), not one submitted on {head}")
+    return rev
 
 
 def repairs(led):
@@ -503,9 +520,7 @@ def fixable(led, snapshot, head):
     if online:
         raise Unusable(f"a {online[-1]['status']} publication for {online[-1]['head']} is not settled, so the last review on the PR "
                        'is unknown: reconcile it first')
-    rev = last(led)
-    if not rev or rev['head'] != head or not ((rev.get('receipts') or {}).get('review') or {}).get('submitted'):
-        raise Unusable(f"the last review on the PR is {rev and rev['head']} ({rev and rev['status']}), not one submitted on {head}")
+    rev = submitted_last(led, head)
     hold = holder(led, snapshot)
     fix, held = [], []
     for f in rev.get('findings', []):

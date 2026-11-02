@@ -2501,6 +2501,18 @@ class Repair(PostCase):
         self.reviewed = self.fixed_head  # the recheck is now the review a repair answers
         self.assertEqual(self.fixed()['repairs'][0]['error'], 'no thread: it stands in the review body')
 
+    def test_a_saved_draft_never_resolves_a_repaired_thread_reopened_since(self):
+        self.fixed()
+        sh(self.clone, 'git', 'fetch', '--quiet', 'origin', f'refs/pull/{PR}/head')
+        draft = {'event': 'COMMENT', 'body': 'Fixed.', 'comments': [], 'replies': [], 'resolves': [{'findingId': 'pr7-f1', 'commentId': self.root}]}
+        self.save(self.result_for(self.p, head=self.fixed_head, findings=[{'id': 'pr7-f1', 'status': 'fixed'}], draft=draft), reason='recheck')
+        self.thread()['isResolved'] = False
+        resolves = len([m for m in self.gh.mutations if 'resolveReviewThread' in m['query']])
+        self.assertEqual(self.call(post, ['--pr', str(PR), '--repo', REPO, '--expected-head', self.fixed_head, '--auto'])['status'], 'posted')
+        self.assertEqual(len([m for m in self.gh.mutations if 'resolveReviewThread' in m['query']]), resolves)
+        self.assertEqual([(m['state'], m['error']) for m in self.review()['receipts']['resolved']], [('deferred', 'reopened after it was resolved')])
+        self.assertFalse(self.thread()['isResolved'])
+
     def test_a_pending_review_of_ours_blocks_a_new_note_only(self):
         self.gh.reviews[1] = {'id': 1, 'body': 'by hand', 'state': 'PENDING', 'user': {'login': ME}}
         self.assertEqual(self.fixed()['repairs'][0]['error'], 'a pending review of ours is open on the PR')
