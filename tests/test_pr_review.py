@@ -2058,5 +2058,87 @@ class Workflow(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
 
 
+class Fixable(PostCase):
+    """ledger.py show --fixable: what an auto-fix repair may take from the review we submitted."""
+
+    def setUp(self):
+        super().setUp()
+        two = [{'file': 'src/core/a.c', 'line': 21, 'why': 'b is never initialised', 'severity': 'high', 'dimension': 'correctness', 'status': 'open'},
+               {'file': 'src/core/a.c', 'line': 1, 'why': 'a shadows a global', 'severity': 'medium', 'dimension': 'correctness', 'status': 'open'}]
+        draft = {'event': 'REQUEST_CHANGES', 'body': 'Summary.', 'replies': [],
+                 'comments': [{'path': 'src/core/a.c', 'line': 21, 'body': 'b is never initialised', 'finding': 0},
+                              {'path': 'src/core/a.c', 'line': 1, 'body': 'a shadows a global', 'finding': 1}]}
+        self.save(self.result_for(self.p, findings=two, draft=draft, verdict={'event': 'REQUEST_CHANGES', 'reasons': ['r']}))
+        self.assertEqual(self.post('--auto')['status'], 'posted')
+        self.root = self.review()['findings'][0]['commentId']
+
+    def fixable(self, head=None):
+        snap = self.tmp / 'threads.json'
+        self.call(threads, ['--pr', str(PR), '--repo', REPO, '--out', str(snap)])
+        return self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--fixable', '--threads', str(snap),
+                                  '--head', head or self.head])['fixable']
+
+    def held(self, got):
+        return [(h['findingId'], h['why']) for h in got['held']]
+
+    def test_an_untouched_review_offers_every_standing_finding_inline_or_moved_into_the_body(self):
+        got = self.fixable()
+        self.assertEqual(([f['id'] for f in got['fix']], got['held'], got['autoPost']), (['pr7-f1', 'pr7-f2'], [], True))
+        self.assertIsNone(self.review()['findings'][1].get('commentId'), 'the second finding stands in the review body')
+
+    def test_an_edited_inline_comment_is_held_and_sends_the_recheck_to_the_human(self):
+        next(c for c in self.gh.inline if c['id'] == self.root)['body'] = 'b is never initialised (edited)'
+        got = self.fixable()
+        self.assertEqual((self.held(got), [f['id'] for f in got['fix']], got['autoPost']), ([('pr7-f1', 'edited')], ['pr7-f2'], False))
+
+    def test_a_deleted_inline_comment_is_held(self):
+        self.gh.inline = [c for c in self.gh.inline if c['id'] != self.root]
+        self.gh.threads = []
+        self.assertEqual(self.held(self.fixable()), [('pr7-f1', 'deleted')])
+
+    def test_an_edited_review_body_holds_the_finding_moved_into_it(self):
+        rid = self.review()['receipts']['review']['reviewId']
+        self.gh.reviews[rid]['body'] = self.gh.reviews[rid]['body'].replace('a shadows', 'a may shadow')
+        got = self.fixable()
+        self.assertEqual((self.held(got), [f['id'] for f in got['fix']], got['autoPost']), ([('pr7-f2', 'edited')], ['pr7-f1'], False))
+
+    def test_a_contributor_reply_holds_the_finding_but_not_the_auto_recheck_and_a_bot_reply_holds_nothing(self):
+        self.gh.inline.append({'id': 950, 'in_reply_to_id': self.root, 'body': 'intentional', 'created_at': self.gh.tick(),
+                               'user': {'login': 'contrib'}})
+        self.gh.threads[0]['comments']['nodes'].append({'databaseId': 950})
+        got = self.fixable()
+        self.assertEqual((self.held(got), got['autoPost']), ([('pr7-f1', 'replied')], True))
+        self.gh.inline[-1]['user'] = {'login': 'bot[bot]', 'type': 'Bot'}
+        self.assertEqual(self.fixable()['held'], [])
+
+    def test_a_disputed_or_unplaced_finding_is_held(self):
+        led = json.loads(Path(self.p['ledger']).read_text())
+        led['reviews'][-1]['findings'][0]['status'] = 'disputed'
+        led['reviews'][-1]['draft']['moved'] = []
+        Path(self.p['ledger']).write_text(json.dumps(led))
+        got = self.fixable()
+        self.assertEqual((self.held(got), got['autoPost']), ([('pr7-f1', 'disputed'), ('pr7-f2', 'unmapped')], False))
+
+    def test_a_carried_finding_is_placed_by_the_review_that_published_it(self):
+        self.commit('src/core/c.c', 'int c;\n', 'c')
+        head = self.push_pr()
+        p = self.prepare()
+        self.assertEqual(p['mode'], 'incremental')
+        carried = [{'id': 'pr7-f1', 'file': 'src/core/a.c', 'line': 21, 'why': 'b is never initialised', 'severity': 'high',
+                    'dimension': 'correctness', 'status': 'open'}]
+        self.save(self.result_for(p, findings=carried, draft={'event': 'REQUEST_CHANGES', 'body': 'Still open.', 'comments': [], 'replies': []},
+                                  verdict={'event': 'REQUEST_CHANGES', 'reasons': ['r']}))
+        self.head = head
+        self.assertEqual(self.post('--auto')['status'], 'posted')
+        got = self.fixable(head)
+        self.assertEqual(([f['id'] for f in got['fix']], got['held']), (['pr7-f1'], []))
+
+    def test_it_refuses_a_head_that_is_not_the_last_submitted_review(self):
+        with self.assertRaisesRegex(facts.Unusable, 'not one submitted on'):
+            self.fixable(self.base)
+        with self.assertRaisesRegex(facts.Unusable, '--fixable needs --threads and --head'):
+            self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--fixable'])
+
+
 if __name__ == '__main__':
     unittest.main()
