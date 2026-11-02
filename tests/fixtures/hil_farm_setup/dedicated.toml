@@ -1,0 +1,11 @@
+# A host that is the farm alone: both runners, the farm's own sshd, firewall and environment.
+profile = "lab"
+admin = "admin"
+
+[runner.tinyusb]
+name = "lab-tinyusb"
+labels = ["hardware-in-the-loop", "lab"]
+
+[runner.tinyuf2]
+name = "lab-tinyuf2"
+labels = ["tinyuf2"]

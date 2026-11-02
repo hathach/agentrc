@@ -1,0 +1,152 @@
+# HIL farm pins: what setup.sh installs and verify.sh checks, both through farm.py.
+# Every remote input is pinned by sha256 or a full git commit; bump a tool by editing its table.
+# Directory tools install to /opt/hil-farm/tools/<name>/<version>-<input hash>-<suffix> and are reached through
+# `links` (link path = path inside that dir; a link path ending in / takes every match of a glob).
+# `check` runs on the new install before its links switch, again after, and in verify; its output must hold
+# `expect` (default: `version`) as a whitespace-separated token. pip venvs have no version or check: the lock is both.
+
+[farm]
+path = "/opt/hil/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+# written to /etc/environment and the runner's .env; HIL_OPENOCD_ESP is where agentrc hil_openocd_esp looks,
+# PYTHONNOUSERSITE keeps ~/.local packages out of the venv
+env = { HIL_OPENOCD_ESP = "/usr/local/bin/openocd-esp32", PYTHONNOUSERSITE = "1" }
+
+[apt]
+packages = [
+  "openssh-server", "sudo", "qemu-guest-agent", "ca-certificates", "curl", "git", "rsync", "python3", "python3-venv",
+  "python3-hid", "python3-setuptools", "libhidapi-hidraw0", "libusb-1.0-0", "usbutils", "pciutils", "uhubctl",
+  "dfu-util", "lm4flash", "mtools", "libmtp-runtime", "mtp-tools", "alsa-utils", "gdb-multiarch",
+  "binutils-arm-none-eabi", "tshark", "nftables", "jq", "zstd", "unzip", "xz-utils", "tmux", "strace", "lsof",
+]
+# they set the host's update and time policy: a shared host leaves them to its owner
+policy = ["unattended-upgrades", "systemd-timesyncd"]
+# openocd's build deps, kept installed: the -dev packages also bring its runtime libraries
+build = [
+  "build-essential", "autoconf", "automake", "libtool", "pkg-config", "texinfo", "libusb-1.0-0-dev", "libhidapi-dev",
+  "libjaylink-dev", "libjim-dev",
+]
+
+[tool.openocd]
+kind = "git"
+recipe = "openocd"
+repo = "https://github.com/hathach/openocd.git"  # branch tinyusb
+commit = "0ce7431256315de66ab9e05c1846999b40e41b03"
+version = "0.12.0+dev-g0ce7431"
+configure = ["--enable-jlink", "--enable-cmsis-dap", "--enable-stlink", "--enable-wlinke", "--disable-werror"]
+links = { "/usr/local/bin/openocd" = "bin/openocd" }
+check = ["/usr/local/bin/openocd", "--version"]
+
+[tool.agentrc]  # the root-run harness files: ghrunner's one sudo grant is hil_root (agentrc hil_root.py)
+kind = "git"
+recipe = "copy"
+repo = "https://github.com/hathach/agentrc.git"
+commit = "12d14432d35231935e9764a72c1bd19dde02c78b"
+version = "12d1443"
+files = ["skills/usb-kernel-recover/scripts/usb_recover.sh", "skills/usb-kernel-recover/scripts/root_port_cycle.py",
+         "skills/hil/scripts/hil_root.py"]
+
+[tool.agentrc.links]
+# usb_recover runs root_port_cycle.py from dirname "$0", so both links share a directory
+"/usr/local/sbin/usb_recover" = "usb_recover.sh"
+"/usr/local/sbin/root_port_cycle.py" = "root_port_cycle.py"
+"/usr/local/sbin/hil_root" = "hil_root.py"
+
+[tool.testusb]
+kind = "source"
+url = "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/tools/usb/testusb.c?h=v6.12"
+sha256 = "c48f1015abd7e73fb4b5b5f7ba00d80615389c4b76a1f8130706521c26c7f0d8"
+version = "6.12"
+cflags = ["-O2", "-Wall", "-pthread"]
+links = { "/usr/local/bin/testusb" = "testusb" }
+
+[tool.picotool]
+kind = "release"
+url = "https://github.com/raspberrypi/pico-sdk-tools/releases/download/v2.3.1-0/picotool-2.3.1-x86_64-lin.tar.gz"
+sha256 = "878a1a1e7d8336b8be60300c7218f366d9790c0d3a211b181d6d172e80b1248e"
+version = "2.3.1"
+links = { "/usr/local/bin/picotool" = "picotool/picotool" }
+check = ["/usr/local/bin/picotool", "version"]
+expect = "v2.3.1"
+
+[tool.wchisp]
+kind = "release"
+url = "https://github.com/ch32-rs/wchisp/releases/download/v0.3.0/wchisp-v0.3.0-linux-x64.tar.gz"
+sha256 = "67e3d4eb0ffd3cc610d8927e3c3f452e2110531a3f14405dcaef87df219f200d"
+version = "0.3.0"
+links = { "/usr/local/bin/wchisp" = "wchisp-linux-x64/wchisp" }
+check = ["/usr/local/bin/wchisp", "--version"]
+
+[tool.wlink]
+kind = "release"
+url = "https://github.com/ch32-rs/wlink/releases/download/v0.1.2/wlink-v0.1.2-linux-x64.tar.gz"
+sha256 = "f8f1fba2436694116fe2cf16b1572e92d116c4acd921bf12fbc0ca5bf63824bf"
+version = "0.1.2"
+links = { "/usr/local/bin/wlink" = "wlink-linux-x64/wlink" }
+check = ["/usr/local/bin/wlink", "--version"]
+
+[tool.openocd-esp32]
+kind = "release"
+url = "https://github.com/espressif/openocd-esp32/releases/download/v0.12.0-esp32-20260703/openocd-esp32-linux-amd64-0.12.0-esp32-20260703.tar.gz"
+sha256 = "4b71d1b4d8e4025029466e780161262a04137348b68e965c15250dbeebef03ce"
+version = "v0.12.0-esp32-20260703"  # agentrc hil_openocd_esp VERIFIED_OPENOCD
+links = { "/usr/local/bin/openocd-esp32" = "openocd-esp32/bin/openocd" }
+check = ["/usr/local/bin/openocd-esp32", "--version"]
+
+[tool.riscv32-esp-elf-gdb]
+kind = "release"
+url = "https://github.com/espressif/binutils-gdb/releases/download/esp-gdb-v17.1_20260402/riscv32-esp-elf-gdb-17.1_20260402-x86_64-linux-gnu.tar.gz"
+sha256 = "35f3db841338cb4f9bc60d757bc3e87dfa50ff50607bcbc3867c5b1ac28dd342"
+version = "17.1_20260402"
+links = { "/usr/local/bin/" = "riscv32-esp-elf-gdb/bin/*" }
+check = ["/usr/local/bin/riscv32-esp-elf-gdb", "--version"]
+
+[tool.xtensa-esp-elf-gdb]
+kind = "release"
+url = "https://github.com/espressif/binutils-gdb/releases/download/esp-gdb-v17.1_20260402/xtensa-esp-elf-gdb-17.1_20260402-x86_64-linux-gnu.tar.gz"
+sha256 = "73bc6c4e50b06dceb60e94b53aded61b7769be3cf563572269d9c8d643db8e95"
+version = "17.1_20260402"
+links = { "/usr/local/bin/" = "xtensa-esp-elf-gdb/bin/*" }
+check = ["/usr/local/bin/xtensa-esp32s3-elf-gdb", "--version"]
+
+[tool.jlink]
+kind = "deb"
+url = "https://www.segger.com/downloads/jlink/JLink_Linux_V978_x86_64.deb"
+form = "accept_license_agreement=accepted&submit=Download+software"  # SEGGER's licence click-through
+sha256 = "046d5ce09346cabf0d373e00c43127b7d65854f486a2f15c131a26e8cd5d963c"
+version = "9.78.0"
+check = ["dpkg-query", "-W", "-f=${Version}", "jlink"]
+
+[tool.stm32cubeprogrammer]
+kind = "local"  # ST's download needs a login: prepare-stm32cubeprogrammer.sh packs an install, setup.sh --inputs
+file = "stm32cubeprogrammer.tar"
+sha256 = "ec7c5db6b948308d213d5ce765cbbf31e4a26408af7ce105bededa9d565ee8d0"
+version = "2.23.0"
+links = { "/usr/local/bin/STM32_Programmer_CLI" = "STM32CubeProgrammer/bin/STM32_Programmer_CLI" }
+check = ["/usr/local/bin/STM32_Programmer_CLI", "--version"]
+expect = "v2.23.0"
+
+[tool.hil-venv]
+kind = "pip"
+lock = "requirements.lock"  # esptool is sdist-only: built offline against Debian's python3-setuptools
+system_site_packages = true  # python3-hid
+no_build_isolation = true
+links = { "/opt/hil/venv" = "." }
+
+[tool.pyocd]
+kind = "pip"
+lock = "pyocd.lock"
+# a symlink, not a wrapper: hil_flash.py takes pyocd's interpreter from its shebang
+links = { "/usr/local/bin/pyocd" = "bin/pyocd" }
+
+[tool.renesas-fw]
+kind = "firmware"
+file = "fw/renesas_usb_fw.mem"
+sha256 = "177560c224c73d040836b17082348036430ecf59e8a32d7736ce2b80b2634f97"
+version = "2.0.2.6"
+dest = "/lib/firmware/renesas_usb_fw.mem"
+
+[tool.actions-runner]
+kind = "runner"  # extracted once to each /opt/actions-runner/<runner>; update leaves them alone (registered there)
+url = "https://github.com/actions/runner/releases/download/v2.338.0/actions-runner-linux-x64-2.338.0.tar.gz"
+sha256 = "af4b794c1bc41d73d40535e3fe092a39f9679cd8d965954c2aca25a05ca41d32"
+version = "2.338.0"

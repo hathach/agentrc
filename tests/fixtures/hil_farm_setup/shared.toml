@@ -1,0 +1,10 @@
+# A host its owner also uses: one runner beside the owner's account, sshd, firewall and update policy.
+profile = "shared"
+admin = "owner"
+shared = true
+runner_path = ["/opt/vendor/arm/bin"]
+iar = true
+
+[runner.tinyusb]
+name = "shared-tinyusb"
+labels = ["shared"]
