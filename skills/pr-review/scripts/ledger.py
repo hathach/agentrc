@@ -31,8 +31,9 @@ resolve_due()), and in heldThreads those it never resolves again by itself;
 --head adds the disputes on that head.
 
 --fixable, with a fresh threads.py snapshot, prints what an auto-fix repair may take from the review posted on
-SHA, which must be the last review on the PR: each standing finding as `fix` (its row, as show lists it) when the
-text it stands in on the PR is the one a receipt of ours recorded, unedited, and nobody but us or a bot has replied
+SHA, which must be the last review on the PR: each standing finding as `fix` (its row, as show lists it, with
+`published`, its comment text as the human edited it, or null) when the text it stands in on the PR is the one a
+receipt of ours recorded, unedited, and nobody but us or a bot has replied
 on its thread since our last verified answer; else in `held` with why: `disputed`, `unmapped` (no receipt places
 its text), `deleted`, `edited` (the inline comment, or the body of the review it was moved into, reads otherwise) or
 `replied`. `autoPost` is false when any is held `unmapped`, `deleted` or `edited`: a recheck would judge text the
