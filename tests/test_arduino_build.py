@@ -14,11 +14,12 @@ import io
 import json
 import shutil
 import struct
+import subprocess
 import sys
 from pathlib import Path
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import guard_survivors, load_arduino_engine, load_arduino_fixture, tmpdir  # noqa: E402
+from helpers import guard_survivors, git_env, load_arduino_engine, load_arduino_fixture, tmpdir  # noqa: E402
 
 ab = load_arduino_engine('skills/arduino/scripts/arduino_build.py')
 fake = load_arduino_fixture()
@@ -233,6 +234,28 @@ class Selection(Lib):
         code, out = self.run_main(['--select-only', '--scope', '/'])
         self.assertEqual(code, 2)
         self.assertIn('outside this checkout', out['error'])
+
+    def test_base_paths_with_spaces_and_non_ascii_arrive_intact(self):
+        env = git_env()
+        environ = mock.patch.dict(os.environ, env, clear=True)   # the engine's own git runs inherit it
+        environ.start()
+        self.addCleanup(environ.stop)
+
+        def git(*a):
+            subprocess.run(['git', '-C', str(self.root), *a], check=True, capture_output=True, env=env)
+        git('init', '-q', '-b', 'main')
+        git('add', '-A')
+        git('commit', '-qm', 'base')
+        for name in ('examples/Basic/echo/my notes.txt', 'src/caf\u00e9.h'):
+            (self.root / name).write_text('x')
+        git('add', '-A')
+        git('commit', '-qm', 'change')
+        (self.root / 'src/new file.h').write_text('x')
+        (self.root / 'src/\u00fcber.h').write_text('x')
+        self.assertEqual(ab.changed_paths(ab.parse(['--select-only', '--base', 'HEAD~1'], None)),
+                         ['examples/Basic/echo/my notes.txt', 'src/caf\u00e9.h'])
+        self.assertEqual(ab.changed_paths(ab.parse(['--select-only', '--base', 'HEAD~1', '--worktree'], None)),
+                         ['examples/Basic/echo/my notes.txt', 'src/caf\u00e9.h', 'src/new file.h', 'src/\u00fcber.h'])
 
     def test_scope_dir_refuses_symlink_out_of_checkout(self):
         (self.tmp / 'outside.txt').write_text('x')

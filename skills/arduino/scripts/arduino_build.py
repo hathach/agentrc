@@ -262,11 +262,13 @@ def changed_paths(args):
         return sorted(set(out))
     if args.diff_file:
         return sorted({line.strip() for line in Path(args.diff_file).read_text().splitlines() if line.strip()})
+    def names(cmd, *a):   # -z: a path keeps its spaces and is not C-quoted (core.quotePath)
+        return {n for n in git(cmd, '-z', *a).split('\0') if n}
     base = git('merge-base', args.base, 'HEAD').strip()
-    paths = set(git('diff', '--name-only', '--no-renames', base, 'HEAD').split())
+    paths = names('diff', '--name-only', '--no-renames', base, 'HEAD')
     if args.worktree:
-        paths |= set(git('diff', '--name-only', '--no-renames', 'HEAD').split())
-        paths |= set(git('ls-files', '--others', '--exclude-standard').split())
+        paths |= names('diff', '--name-only', '--no-renames', 'HEAD')
+        paths |= names('ls-files', '--others', '--exclude-standard')
     return sorted(paths)
 
 
