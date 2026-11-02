@@ -45,7 +45,8 @@ left for --auto to recover by its marker). Submitted: posted, with the event the
   resolve_due), are resolved while the PR head is the review's, a published reply of ours is on the thread, nobody
   has pushed back since and the thread is open; otherwise the next review finds the resolve due again. Each resolve is marked sent before the mutation, then
   resolved, deferred or observed (already resolved): one left sent (its answer unconfirmed), or resolved and
-  reopened since, is never resolved again by itself.
+  reopened since, is never resolved again by itself, nor one whose repair note was deleted or edited before its
+  resolve, whatever older answer of ours the thread holds.
 
 --fixed FILE, once an auto-fix repair is pushed and the PR head is SHA: FILE is {"reviewedHead": the last review's
 head, which must be submitted, "findings": [{id, claimDigest, verdict: "verified", checkedSha: SHA, note, evidence}]},
@@ -54,7 +55,8 @@ A bad row refuses the whole file before anything is sent. For each finding it po
 on its thread (no review), reads it back, then resolves the thread; a fresh read of the PR before each send and each
 resolve skips or defers it on a closed or merged PR, a moved head, a resolved thread, a changed claim, a deleted or
 edited root or note, a disputed finding, pushback since our last answer, or, for a new note only, a pending review of
-ours; a PR closed or merged before the run refuses it whole. One record per
+ours; on a PR closed or merged, or a head other than SHA, before the run it sends and resolves nothing, skips each new
+note and still reads back and reports the rest. One record per
 finding and root (ledger.py's repairs) across runs and heads: a rerun returns it, retries a deferred resolve only on a
 fix check of the same claim, never resends an unconfirmed note, and holds a resolve left sent or a thread reopened since.
 A body-moved finding has no thread to note. A later review's draft never repeats a repair note.
@@ -75,7 +77,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ledger import (DRAFTS, ONLINE, OPEN, SETTLED, UNSETTLED, add_answers, answered_ids, answers_of, claim,  # noqa: E402
-                    holder, open_answers, owner_of, publications, pushback, reached, repair_hold, repairs, submitted_last,
+                    holder, note_hold, open_answers, owner_of, publications, pushback, reached, repair_hold, repairs, submitted_last,
                     thread_roots, digest as ledger_digest, ledger_path, load, locked, repo_of, store)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'pr-babysit' / 'scripts'))
@@ -338,13 +340,15 @@ def resolve_threads(repo, pr, led, review, want, login, persist):
     public = pages(f'repos/{repo}/pulls/{pr}/comments')
     by_root = {t['commentIds'][0]: t for t in threads(repo, pr) if t['commentIds']}
     known, marks, fixes = answered_ids(led), review['receipts'].setdefault('resolved', []), repairs(led)
+    bodies = {c['id']: c.get('body') or '' for c in public}
     for f, root in want:
         t = by_root.get(root)
         replies = live_thread(public, root)
         fix = fixes.get((f['id'], root))
-        # A draft saved before a repair's resolve was reopened or left unconfirmed never resolves it again.
+        # A draft saved before a repair's resolve was reopened, left unconfirmed or held by an edit of its note never
+        # resolves it: an older answer of ours does not stand in for the note.
         why = ('no review thread holds the comment' if not t else None if t['resolved'] else
-               (fix and repair_hold(fix, t)) or
+               (fix and (repair_hold(fix, t) or note_hold(fix, bodies))) or
                (f"the PR head moved to {head} since the review" if head != review['head'] else
                 'no published reply of ours on the thread' if not any(c['id'] in known for c in replies) else
                 'new replies since our last one' if pushback(replies, known, login) else None))
@@ -669,8 +673,7 @@ def settle_note(repo, pr, led, f, x, row, head, login, persist):
         persist()
         return
     why = (why or ('the claim changed since its fix check' if row['claimDigest'] != x['claimDigest'] else
-                   'our note was deleted' if c is None else
-                   'our note was edited' if ledger_digest(c['body']) != x['digest'] else None))
+                   note_hold(x, {c['id']: c['body']} if c else {})))
     if why:
         x.update(resolve='deferred', error=why)
         persist()
@@ -690,10 +693,9 @@ def fix_notes(repo, pr, led, m, head, persist):
     reads the PR afresh first."""
     rev = submitted_last(led, m['reviewedHead'])
     at, shut = head_if_open(repo, pr)
-    if shut:
-        raise Unusable(shut)
-    if at != head:
-        raise Unusable(f'the PR head moved to {at}; the repair was checked on {head}')
+    # A closed PR or moved head still reads back and reports what earlier runs left; settle_note's fresh read then
+    # sends and resolves nothing.
+    stop = shut or (f'the PR head moved to {at}; the repair was checked on {head}' if at != head else None)
     login = gh_json('api', 'user')['login']
     by_id, fixes, out, settled = {f['id']: f for f in rev['findings']}, repairs(led), [], None
     for row in m['findings']:
@@ -708,8 +710,8 @@ def fix_notes(repo, pr, led, m, head, persist):
             continue
         if not x:
             root = f and f.get('commentId')
-            why = ('not a finding of the last review' if not f else 'not standing' if f['status'] not in OPEN else
-                   'no thread: it stands in the review body' if root is None else None)
+            why = stop or ('not a finding of the last review' if not f else 'not standing' if f['status'] not in OPEN else
+                           'no thread: it stands in the review body' if root is None else None)
             if not why:
                 snap, why = unfit(repo, pr, led, f, row['claimDigest'], head, login)
                 t = thread_roots(snap).get(root)

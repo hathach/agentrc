@@ -260,7 +260,7 @@ def resolve_due(led, snapshot):
     """({finding id: {replied}}, held) for the last review's settled findings whose thread the snapshot shows open.
     Due: fixed, or closed by a reply of ours since the finding last stood (replied: a published reply that resolves,
     or a fix note the human edited, still in the thread). Held, never resolved again by itself: one whose last resolve is unconfirmed
-    (sent) or that someone reopened after it was resolved."""
+    (sent), that someone reopened after it was resolved, or whose repair note was deleted or edited before its resolve."""
     rev = last(led)
     if not rev:
         return {}, []
@@ -282,6 +282,7 @@ def resolve_due(led, snapshot):
                 mark.pop(f['id'], None)
     due, held = {}, []
     fixes = repairs(led)
+    bodies = {c['id']: c['body'] for c in snapshot.get('comments') or [] if c['kind'] == 'review'}
     for f in rev.get('findings', []):
         t = roots.get(f.get('commentId'))
         fix = fixes.get((f['id'], f.get('commentId')))
@@ -293,7 +294,10 @@ def resolve_due(led, snapshot):
             continue
         if f['status'] in OPEN or not t or t['resolved']:
             continue
-        if mark.get(f['id']) in ('sent', 'resolved', 'observed'):
+        why = fix and note_hold(fix, bodies)
+        if why:
+            held.append({'findingId': f['id'], 'commentId': f['commentId'], 'why': why})
+        elif mark.get(f['id']) in ('sent', 'resolved', 'observed'):
             held.append({'findingId': f['id'], 'commentId': f['commentId'],
                          'why': 'resolve unconfirmed' if mark[f['id']] == 'sent' else 'reopened after it was resolved'})
         elif replied.get(f['id']) or f['status'] == 'fixed':
@@ -419,6 +423,15 @@ def repair_hold(fix, t):
     return ('repair note unconfirmed' if fix['state'] in ('sent', 'uncertain') else
             'resolve unconfirmed' if fix['resolve'] == 'sent' else
             'reopened after it was resolved' if fix['resolve'] in SETTLED and t and not t['resolved'] else None)
+
+
+def note_hold(fix, bodies):
+    """Why a published repair note whose resolve never settled keeps its thread from any resolve, or None: the note
+    deleted or edited since (`bodies`, the live review comments' text by id), so it no longer says what was verified."""
+    if fix['state'] != 'published' or fix['resolve'] in SETTLED:
+        return None
+    body = bodies.get(fix['replyId'])
+    return 'our repair note was deleted' if body is None else 'our repair note was edited' if digest(body) != fix['digest'] else None
 
 
 def submitted_last(led, head):

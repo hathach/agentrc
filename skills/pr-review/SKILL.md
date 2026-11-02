@@ -220,7 +220,8 @@ sequence:
       pr-babysit's own repairs moved the head past `checkedSha`, one
       `finding-verifier` batch checks those findings again on the new head
       and the rows name it. A rerun returns its receipts and retries only a
-      deferred resolve; its `skipped`, `held` and `uncertain` rows are
+      deferred resolve, sending and resolving nothing on a closed or merged
+      PR or a moved head; its `skipped`, `held` and `uncertain` rows are
       reported, never worked around.
    4. Recheck once the PR head is the one pr-babysit left, its last launch
       reading's `checkout.head`. When that is still the reviewed head and
@@ -270,8 +271,8 @@ it never sends again blind, and the next run looks for it; reconcile by hand
 what it names. A `handedOver` auto review is the human's pending review, with
 its reason; once they submit it, `post.py --pr N --expected-head SHA` publishes
 its answers. A thread in `heldThreads` is one we resolved and someone reopened,
-or whose resolve is unconfirmed: it is never resolved again by itself, so name
-it for the human.
+whose resolve is unconfirmed, or whose repair note was deleted or edited before
+its resolve: it is never resolved again by itself, so name it for the human.
 
 A later push is a new `/pr-review N`: prepare picks the mode and the ledger
 carries the earlier findings, replies and receipts.

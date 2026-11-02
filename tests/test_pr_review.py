@@ -1633,8 +1633,9 @@ class Pushback(PostCase):
 
     def snapshot(self, *thread):
         """thread: (id, author, body, bot) after our root comment."""
-        comments = [{'id': self.root, 'author': ME, 'bot': False, 'digest': 'r0', 'body': 'root', 'url': 'https://x/r0'}]
-        comments += [{'id': i, 'author': who, 'bot': bot, 'digest': harvest.digest(body), 'body': body} for i, who, body, bot in thread]
+        comments = [{'kind': 'review', 'id': self.root, 'author': ME, 'bot': False, 'digest': 'r0', 'body': 'root', 'url': 'https://x/r0'}]
+        comments += [{'kind': 'review', 'id': i, 'author': who, 'bot': bot, 'digest': harvest.digest(body), 'body': body}
+                     for i, who, body, bot in thread]
         f = Path(self.p['facts']).parent / f'threads-{self.head}.json'
         f.write_text(json.dumps({'repo': REPO, 'pr': PR, 'viewer': ME, 'comments': comments,
                                  'threads': [{'threadId': 'T', 'resolved': False, 'outdated': False, 'commentIds': [c['id'] for c in comments]}]}))
@@ -2339,8 +2340,9 @@ class Repair(PostCase):
                 self.fixed(self.row(**over))
         with self.assertRaisesRegex(facts.Unusable, 'twice'):
             self.fixed(self.row(), self.row())
-        with self.assertRaisesRegex(facts.Unusable, 'moved'):
-            self.fixed(self.row(checkedSha=self.reviewed), head=self.reviewed)
+        out = self.fixed(self.row(checkedSha=self.reviewed), head=self.reviewed)
+        self.assertEqual([(r['state'], r['error']) for r in out['repairs']],
+                         [('skipped', f'the PR head moved to {self.fixed_head}; the repair was checked on {self.reviewed}')])
         self.assertEqual(self.gh.notes, [])
 
     def test_a_finding_in_the_body_with_a_changed_claim_or_pushback_is_skipped_and_the_rest_resolve(self):
@@ -2431,8 +2433,9 @@ class Repair(PostCase):
     def test_a_closed_or_merged_pr_takes_no_note_and_no_resolve(self):
         for state in ('CLOSED', 'MERGED'):
             self.gh.state = state
-            with self.assertRaisesRegex(facts.Unusable, f'the PR is {state.lower()}'):
-                self.fixed()
+            out = self.fixed()
+            self.assertEqual((out['status'], out['repairs'][0]['state'], out['repairs'][0]['error']),
+                             ('partial', 'skipped', f'the PR is {state.lower()}'))
         self.assertEqual(self.gh.notes, [])
         self.gh.state = 'OPEN'
         self.setUp_second_finding_thread()
@@ -2441,6 +2444,41 @@ class Repair(PostCase):
         self.assertEqual([(r['findingId'], r['resolve'], r['error']) for r in out['repairs']],
                          [('pr7-f1', 'deferred', 'the PR is merged'), ('pr7-f3', None, 'the PR is merged')])
         self.assertEqual(len(self.gh.notes), 1, 'no note is sent once the PR is merged')
+        self.assertFalse(self.thread()['isResolved'])
+
+    def test_a_rerun_on_a_closed_pr_reads_back_a_note_left_sent_and_sends_and_resolves_nothing(self):
+        with mock.patch.object(post, 'settle_note', side_effect=RuntimeError('crash after the POST')):
+            with self.assertRaises(RuntimeError):
+                self.fixed()
+        self.assertEqual(self.review()['repairs'][0]['state'], 'sent')
+        self.gh.state = 'CLOSED'
+        mutations = len(self.gh.mutations)
+        out = self.fixed()
+        self.assertEqual([(r['state'], r['resolve'], r['error']) for r in out['repairs']], [('published', 'deferred', 'the PR is closed')])
+        self.assertEqual((len(self.gh.notes), len(self.gh.mutations)), (1, mutations), 'nothing sent, nothing resolved')
+        self.assertFalse(self.thread()['isResolved'])
+
+    def test_an_edited_repair_note_holds_its_thread_from_a_later_review_despite_an_older_answer(self):
+        self.reply(author=ME)  # an older verified answer of ours on the thread
+        led = json.loads(Path(self.p['ledger']).read_text())
+        led['reviews'][-1]['receipts']['staged'] = [{'kind': 'answer', 'findingId': 'pr7-f1', 'commentId': self.root, 'replyId': 950,
+                                                     'state': 'published', 'resolve': False}]
+        Path(self.p['ledger']).write_text(json.dumps(led))
+        self.after_note(lambda: setattr(self.gh, 'head', 'f' * 40))
+        self.fixed()
+        del self.gh.gh
+        self.gh.head = self.fixed_head
+        self.gh.inline[-1]['body'] = 'Correction: not actually fixed'
+        out = self.fixed()
+        self.assertEqual((out['repairs'][0]['resolve'], out['repairs'][0]['error']), ('deferred', 'our repair note was edited'))
+        sh(self.clone, 'git', 'fetch', '--quiet', 'origin', f'refs/pull/{PR}/head')
+        resolves = [{'findingId': 'pr7-f1', 'commentId': self.root}]
+        for reason in ('recheck', 'another full review'):
+            draft = {'event': 'COMMENT', 'body': reason, 'comments': [], 'replies': [], 'resolves': resolves}
+            self.save(self.result_for(self.p, head=self.fixed_head, findings=[{'id': 'pr7-f1', 'status': 'fixed'}], draft=draft), reason=reason)
+            self.call(post, ['--pr', str(PR), '--repo', REPO, '--expected-head', self.fixed_head, '--auto'])
+            self.assertEqual([(m['state'], m['error']) for m in self.review()['receipts']['resolved']], [('deferred', 'our repair note was edited')])
+        self.assertEqual(self.show()['heldThreads'], [{'findingId': 'pr7-f1', 'commentId': self.root, 'why': 'our repair note was edited'}])
         self.assertFalse(self.thread()['isResolved'])
 
     def test_a_note_deferred_on_one_head_resolves_on_another_only_for_the_same_claim(self):
