@@ -70,7 +70,6 @@ from facts import FULL_SHA, Unusable, attempt, attribution_in, git, report, run,
 
 DETAIL_MAX = 500
 # A pre-commit hook id as --skip-hooks takes it: no comma, space or shell metacharacter.
-HOOK_ID = re.compile(r"[\w.:+-]+")
 ESCAPE = re.compile(r'\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|.)')
 
 
@@ -174,12 +173,13 @@ def bounded(text):
 
 
 def skip_env(ids):
-    """The environment with ids added to pre-commit's SKIP; an id is pre-commit's own charset, never a list."""
+    """The environment with ids added to pre-commit's SKIP, which splits at commas and strips each id: an empty or
+    padded id there names no hook."""
     if not ids:
         return None
     for i in ids:
-        if not HOOK_ID.fullmatch(i):
-            raise Unusable(f'--skip-hooks {i!r} is not a hook id')
+        if not i or i != i.strip():
+            raise Unusable(f'--skip-hooks {i!r} names no hook SKIP can skip')
     return {**os.environ, 'SKIP': ','.join([*filter(None, os.environ.get('SKIP', '').split(',')), *ids])}
 
 

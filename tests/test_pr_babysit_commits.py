@@ -53,8 +53,8 @@ class CommitsTest(unittest.TestCase):
         hook.write_text(f'#!/bin/sh\n{body}\n')
         hook.chmod(0o755)
 
-    def run_script(self, *argv, cwd=None, stdin=''):
-        done = subprocess.run([sys.executable, str(SCRIPT), *argv], cwd=cwd or self.repo, env=ENV,
+    def run_script(self, *argv, cwd=None, stdin='', env=None):
+        done = subprocess.run([sys.executable, str(SCRIPT), *argv], cwd=cwd or self.repo, env=env or ENV,
                               capture_output=True, encoding='utf-8', input=stdin)
         return done.returncode, json.loads(done.stdout.splitlines()[-1])
 
@@ -473,16 +473,31 @@ class CommitsTest(unittest.TestCase):
         self.write('a.c', 'changed\n')
         code, out = self.run_script('commit', 'a.c', stdin='Fix\n')
         self.assertEqual((code, out['committed']), (0, False))
-        code, out = self.run_script('commit', '--skip-hooks', 'other,host-broken', 'a.c', stdin='Fix\n')
+        # the form the workflow emits: one comma-joined argument before --receipt, ids pre-commit allows
+        receipt = str(self.repo.parent / f'{self.repo.name}-skip.json')
+        self.addCleanup(lambda: Path(receipt).unlink(missing_ok=True))
+        code, out = self.run_script('commit', '--skip-hooks', 'lint/py,host-broken', '--receipt', receipt,
+                                    '--request', 'commit#1-review', 'a.c', stdin='Fix\n')
         self.assertEqual((code, out['committed']), (0, True))
         self.assertEqual(self.git('show', '--name-only', '--format=', 'HEAD').split(), ['a.c'])
+        self.assertTrue(Path(receipt).is_file(), 'the receipt is saved')
 
-    def test_skip_hooks_takes_hook_ids_only(self):
+    def test_skip_hooks_add_to_the_skip_the_commit_inherits(self):
+        self.hook('case ",$SKIP," in *,inherited,*) ;; *) exit 1;; esac\n'
+                  'case ",$SKIP," in *,host-broken,*) exit 0;; esac\nexit 1')
         self.write('a.c', 'changed\n')
-        for ids in ('a b', 'a;rm', ''):
+        code, out = self.run_script('commit', '--skip-hooks', 'host-broken', 'a.c', stdin='Fix\n',
+                                    env={**ENV, 'SKIP': 'inherited'})
+        self.assertEqual((code, out['committed']), (0, True), out)
+
+    def test_skip_hooks_refuses_an_id_skip_cannot_name_before_staging(self):
+        # pre-commit splits SKIP at commas and strips each id: these name no hook there.
+        self.write('a.c', 'changed\n')
+        for ids in ('', 'a,,b', ' a', 'a ,b'):
             code, out = self.run_script('commit', '--skip-hooks', ids, 'a.c', stdin='Fix\n')
             self.assertEqual(code, 2, ids)
-            self.assertIn('is not a hook id', out['error'])
+            self.assertIn('names no hook SKIP can skip', out['error'])
+            self.assertEqual(self.git('diff', '--cached', '--name-only'), '', 'nothing is staged')
         self.assertEqual(self.git('rev-parse', 'HEAD').strip(), self.base)
 
     @unittest.skipIf(os.name == 'nt', 'NTFS forbids : and * in a file name')

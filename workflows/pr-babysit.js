@@ -1719,11 +1719,15 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
   const failedIds = hooks.failed.map(f => f.hook)
   const blamed = hooks.failed.filter(f => !hooks.baselineFailed.includes(f.hook))
   const excused = hooks.failed.filter(f => hooks.baselineFailed.includes(f.hook))
+  const skipIds = [...new Set(excused.map(f => f.hook))]
   const failures = (fs) => fs.map(f => `${f.hook}: ${f.error}`).join('; ')
   const hookWhy = outside.length ? `tree changed outside the fix scope before the hooks ran: ${outside.join(', ')}`
     : unsteady.length ? `regenerated path(s) no longer a plain modification when the hooks ran: ${unsteady.join(', ')}`
-    : (hooks.passed && failedIds.length) || hooks.baselineFailed.some(h => !failedIds.includes(h))
-      ? 'hook evidence is inconsistent: a hook failed on HEAD without failing on the fix, or failed while the hooks passed'
+    : (hooks.passed && failedIds.length) || (!hooks.ran && failedIds.length) || hooks.baselineFailed.some(h => !failedIds.includes(h))
+      ? 'hook evidence is inconsistent: a hook failed on HEAD without failing on the fix, or failed while the hooks passed or did not run'
+    // hooks.py never excuses a hook that rewrote files, nor an id SKIP cannot name: the commit could not skip it
+    : hooks.baselineFailed.some(h => hooks.modifiedBy.includes(h) || !h || h.includes(',') || h !== h.trim())
+      ? `hook evidence is inconsistent: excused hook(s) modified files or cannot be skipped: ${hooks.baselineFailed.join(', ')}`
     : hooks.ran && !hooks.passed && !failedIds.length ? 'the repository hooks do not pass on the fix, and pre-commit named no failing hook'
     : blamed.length ? `the repository hooks do not pass on the fix: ${failures(blamed)}`
     : !hooks.ran && hooks.modifiedBy.length ? 'hook evidence is inconsistent: hooks reported modifying files without running'
@@ -1733,6 +1737,8 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
     : ownedChanged.length ? `a hook changed an owned path after it was verified: ${ownedChanged.join(', ')}`
     : regeneratedChanged.length ? `a hook changed a regenerated path after the build left it: ${regeneratedChanged.join(', ')}`
     : hookPaths.length && !(hooks.ran && hooks.modifiedBy.length) ? `path(s) changed outside the fix scope by no hook: ${hookPaths.join(', ')}`
+    // the HEAD reruns judged only the checked paths, and the commit would skip the excused hooks on these too
+    : hookPaths.length && skipIds.length ? `hook output outside the fix scope, never judged by the excused hook(s) ${skipIds.join(', ')}: ${hookPaths.join(', ')}`
     : generatedProtected.length ? `a hook regenerated a protected path: ${generatedProtected.join(', ')}`
     : null
   if (hookWhy) {
@@ -1763,7 +1769,7 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
     `The fixes: ${JSON.stringify(brief.claims)}; read \`git --literal-pathspecs diff -- ${scope.map(shq).join(' ')}\` for what changed. ` +
     // A file, not a here-document: no delimiter can collide with the message.
     // An installed pre-commit hook runs again on the commit: the hooks excused above stay excused there, the others run.
-    `Then run exactly \`${PY} ${COMMITS_SCRIPT} commit ${excused.length ? `--skip-hooks ${shq(excused.map(f => f.hook).join(','))} ` : ''}--receipt ${receiptFile} --request ${shq(commitLabel)} ${scope.map(shq).join(' ')} < '<that file>'; rm -f '<that file>'\` ` +
+    `Then run exactly \`${PY} ${COMMITS_SCRIPT} commit ${skipIds.length ? `--skip-hooks ${shq(skipIds.join(','))} ` : ''}--receipt ${receiptFile} --request ${shq(commitLabel)} ${scope.map(shq).join(' ')} < '<that file>'; rm -f '<that file>'\` ` +
     'in the foreground with a Bash timeout of 600000 ms, the tool\'s maximum: an installed pre-commit hook runs again on the commit. ' +
     'Do not push. Change nothing else, and never add a file a hook touched and retry. ' +
     relayed(COMMIT),

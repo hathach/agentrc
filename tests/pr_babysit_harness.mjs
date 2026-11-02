@@ -6846,6 +6846,10 @@ test('incomplete or inconsistent hook evidence admits nothing and commits nothin
     [{ ran: false, modifiedBy: ['gen-doc'] }, /evidence is inconsistent/],
     [{ failed: [{ hook: 'lint', error: 'x' }] }, /evidence is inconsistent/],
     [{ passed: false, failed: [{ hook: 'lint', error: 'x' }], baselineFailed: ['lint', 'other'] }, /evidence is inconsistent/],
+    [{ ran: false, passed: false, failed: [{ hook: 'lint', error: 'x' }] }, /evidence is inconsistent/],
+    // hooks.py never excuses a hook that rewrote files, nor an id the commit's SKIP cannot name
+    [b => gen(b, { passed: false, failed: [{ hook: 'gen-doc', error: 'x' }], baselineFailed: ['gen-doc'] }), /excused hook\(s\) modified files or cannot be skipped: gen-doc/],
+    [{ passed: false, failed: [{ hook: 'a,b', error: 'x' }], baselineFailed: ['a,b'] }, /excused hook\(s\) modified files or cannot be skipped: a,b/],
   ]) {
     const { result, labels } = await run({ ...publishing, hooks })
     assert.match(result.history[0].reviewPushFailed.detail, expected)
@@ -6866,10 +6870,24 @@ test('a failing hook is refused by name and first line unless it fails on HEAD t
   assert.equal(result.history[0].reviewPush.pass, true, 'the fix is published')
   // an installed pre-commit hook reruns them on the commit: only the excused ones are skipped there
   assert.ok(calls.find(c => c.label === 'commit#1-review').prompt.includes("commits.py commit --skip-hooks 'unit-test,drivers-coverage' --receipt "))
-  assert.ok(!refused.calls.some(c => String(c.prompt).includes('--skip-hooks')))
   const plain = await run({ ...publishing })
   assert.ok(plain.calls.find(c => c.label === 'commit#1-review').prompt.includes('commits.py commit --receipt '), 'nothing excused, nothing skipped')
   assert.ok(logs.some(l => l.endsWith(`push#1-review: hook(s) failing on HEAD too, not counted against the fix: unit-test: preprocessing failed; drivers-coverage: ${cov.error}`)))
+  // entries sharing an id are skipped by it once; a hook that passed is never in the list
+  const one = await run({ ...publishing, hooks: { passed: false, failed: [unit, unit], baselineFailed: ['unit-test'] } })
+  assert.ok(one.calls.find(c => c.label === 'commit#1-review').prompt.includes("commits.py commit --skip-hooks 'unit-test' --receipt "))
+})
+
+test('a failure no hook owns, and hook output the excused hooks never judged, are refused by cause', async () => {
+  const named = await run({ ...publishing, hooks: { passed: false } })
+  assert.equal(named.result.history[0].reviewPushFailed.detail, 'the repository hooks do not pass on the fix, and pre-commit named no failing hook')
+  // hooks.py's own entry when the run without the excused failed naming no hook: the cause, not the excused hook
+  const unowned = { hook: '(pre-commit)', error: 'pre-commit exited 1 with unit-test skipped, naming no hook' }
+  const { result } = await run({ ...publishing, hooks: { passed: false, failed: [{ hook: 'unit-test', error: 'x' }, unowned], baselineFailed: ['unit-test'] } })
+  assert.equal(result.history[0].reviewPushFailed.detail, `the repository hooks do not pass on the fix: (pre-commit): ${unowned.error}`)
+  const generated = await run({ ...publishing, hooks: b => gen(b, { passed: false, failed: [{ hook: 'unit-test', error: 'x' }], baselineFailed: ['unit-test'] }) })
+  assert.equal(generated.result.history[0].reviewPushFailed.detail, 'hook output outside the fix scope, never judged by the excused hook(s) unit-test: docs/boards.rst')
+  for (const r of [named, generated]) assert.ok(!r.labels.some(l => l.startsWith('commit#')))
 })
 
 test('a commit whose content differs from what the hooks left is never pushed', async () => {

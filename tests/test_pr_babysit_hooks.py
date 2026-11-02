@@ -52,6 +52,18 @@ SCRIPTS = {
     # Fails everywhere and leaves a file behind; the next one fails wherever that file is.
     'litter': 'echo litter > litter.txt; echo "no compiler"; exit 1\n',
     'nolitter': 'test ! -e litter.txt || { echo "found litter.txt"; exit 1; }\n',
+    # Names each violation: HEAD's old one and a new one the change adds read differently.
+    'lint': 'grep -n bad "$@" && exit 1; exit 0\n',
+    # Prints where it runs as a native tool would (Git for Windows' sh says /tmp for %TEMP%): HEAD's tree and the
+    # checkout must read alike.
+    'where': 'echo "$(pwd -W 2>/dev/null || pwd)/a.txt: no compiler"; exit 1\n',
+    # Rewrites a tracked file on HEAD only; showb then reads it.
+    'scribble': 'grep -q edited a.txt || echo scribbled > b.txt; echo "no compiler"; exit 1\n',
+    'showb': 'cat b.txt; exit 1\n',
+    # Fails on the change at once and outlasts a short deadline on HEAD.
+    'headslow': 'if grep -q edited "$@"; then echo fails; exit 1; fi; echo $$ > "$HOOK_PID"; sleep 30\n',
+    # Empties b.txt on its first run anywhere, then fails without modifying anything, on HEAD in the same words.
+    'once': 'if [ ! -e "$ONCE" ]; then : > "$ONCE"; : > b.txt; fi; echo "no compiler"; exit 1\n',
 }
 
 
@@ -153,7 +165,7 @@ class HooksTest(unittest.TestCase):
         self.assertNotIn('b.txt', before)
         self.assertEqual(after['b.txt'][1], self.git('hash-object', 'b.txt').strip())
 
-    def test_a_failing_hook_that_modified_nothing_runs_once(self):
+    def test_a_failing_hook_that_modified_nothing_runs_once_on_the_change(self):
         # A second run repairs only what a hook rewrote (#140): the same failure again costs a whole slow pass.
         self.configure('counted')
         log = Path(self.repo.parent) / 'runs.log'
@@ -231,6 +243,92 @@ class HooksTest(unittest.TestCase):
         self.assertEqual(out['baselineFailed'], ['litter'])
         self.assertEqual(len(self.worktrees()), 1)
 
+    def test_each_head_rerun_starts_from_heads_tracked_files(self):
+        # scribble rewrites b.txt on HEAD (so is not excused: pre-commit says it modified files there); showb must
+        # read HEAD's b.txt, not scribble's.
+        self.configure('scribble', 'showb')
+        (self.repo / 'a.txt').write_text('edited\n')
+        code, out = self.run_script('a.txt')
+        self.assertEqual((code, out['passed']), (0, False))
+        self.assertEqual([f['hook'] for f in out['failed']], ['scribble', 'showb'])
+        self.assertEqual(out['baselineFailed'], ['showb'])
+
+    def test_a_hook_failing_on_head_in_other_words_is_not_excused(self):
+        # HEAD already fails lint; the change adds a violation of its own.
+        (self.repo / 'a.txt').write_text('old bad typo\n')
+        self.configure('lint')
+        (self.repo / 'a.txt').write_text('old bad typo\nnew bad regression\n')
+        code, out = self.run_script('a.txt')
+        self.assertEqual((code, out['passed']), (0, False))
+        self.assertEqual(out['failed'], [{'hook': 'lint', 'error': '1:old bad typo'}])
+        self.assertEqual(out['baselineFailed'], [])
+
+    def test_where_a_hook_runs_is_read_alike_on_head_and_the_checkout(self):
+        self.configure('where')
+        (self.repo / 'a.txt').write_text('edited\n')
+        code, out = self.run_script('a.txt')
+        self.assertEqual((code, out['passed'], [f['hook'] for f in out['failed']]), (0, False, ['where']))
+        self.assertEqual(out['baselineFailed'], ['where'])
+
+    def test_entries_sharing_an_id_are_excused_only_if_all_fail_alike_on_head(self):
+        # pre-commit runs, and SKIP drops, every entry with the id: one failing on HEAD excuses none of the others.
+        (self.repo / '.pre-commit-config.yaml').write_text(CONFIG.format(
+            HOOK.format(id='dup').replace('hooks/dup.sh', 'hooks/broken.sh')
+            + HOOK.format(id='dup').replace('hooks/dup.sh', 'hooks/picky.sh')))
+        self.configure()
+        (self.repo / 'a.txt').write_text('bad\n')
+        code, out = self.run_script('a.txt')
+        self.assertEqual((code, out['passed'], [f['hook'] for f in out['failed']]), (0, False, ['dup', 'dup']))
+        self.assertEqual(out['baselineFailed'], [])
+
+    def test_a_hook_that_modified_files_in_any_run_is_never_excused(self):
+        # The emptied b.txt would otherwise be committed with the hook skipped.
+        self.configure('once')
+        (self.repo / 'a.txt').write_text('edited\n')
+        code, out = self.run_script('a.txt', env={**self.env, 'ONCE': str(Path(self.repo.parent) / 'once')})
+        self.assertEqual((code, out['passed'], out['modifiedBy']), (0, False, ['once']))
+        self.assertEqual(out['failed'], [{'hook': 'once', 'error': 'no compiler'}])
+        self.assertEqual(out['baselineFailed'], [])
+
+    def test_a_head_rerun_past_the_deadline_is_killed_and_its_worktree_removed(self):
+        self.configure('headslow')
+        (self.repo / 'a.txt').write_text('edited\n')
+        pid = Path(self.repo.parent) / 'hook.pid'
+        code, out = self.run_script('--deadline-seconds', '6', 'a.txt', env={**self.env, 'HOOK_PID': str(pid)})
+        self.assertEqual(code, 2)
+        self.assertRegex(out['error'], r'did not finish within 6 s \(HEAD headslow\)')
+        self.assertEqual(len(self.worktrees()), 1, 'the HEAD worktree is removed')
+        if os.name != 'nt':  # an MSYS pid is not a Windows one
+            hook = int(pid.read_text())
+            self.wait_for(lambda: not running(hook), f'the hook ({hook}) outlived the kill')
+
+    def in_repo(self):
+        cwd = os.getcwd()
+        os.chdir(self.repo)
+        self.addCleanup(os.chdir, cwd)
+        patch = mock.patch.dict(os.environ, self.env)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_a_failed_removal_still_drops_the_head_worktree_even_left_locked(self):
+        # A killed `worktree add` leaves its entry locked; prune drops it only once the tree is gone and unlocked.
+        self.configure()
+        self.in_repo()
+        tmp = tempfile.mkdtemp(prefix='hooks-base-')
+        tree = os.path.join(tmp, 'head')
+        self.git('worktree', 'add', '--detach', '--quiet', tree, 'HEAD')
+        self.git('worktree', 'lock', '--reason', 'initializing', tree)
+        real = hooks.git_within
+
+        def failing_remove(deadline, start, *argv, cwd=None):
+            if argv[:2] == ('worktree', 'remove'):
+                raise hooks.Unusable('git worktree remove: refused')
+            return real(deadline, start, *argv, cwd=cwd)
+        with mock.patch.object(hooks, 'git_within', failing_remove):
+            hooks.forget(tree, tmp, 10, time.monotonic())
+        self.assertFalse(os.path.exists(tmp))
+        self.assertEqual(len(self.worktrees()), 1)
+
     def test_a_fail_fast_stop_at_an_excused_hook_still_runs_the_rest_on_the_change(self):
         self.configure('broken', 'picky')
         (self.repo / '.pre-commit-config.yaml').write_text(
@@ -269,9 +367,10 @@ class HooksTest(unittest.TestCase):
         self.assertEqual(out['baselineFailed'], [])
         self.assertEqual(len(self.worktrees()), 1)
 
-    def test_a_hook_rewriting_a_file_unchanged_beside_an_unstaged_diff_passes(self):
+    def test_hooks_run_with_full_length_abbrev_and_a_same_content_rewrite_passes(self):
         # pre-commit compares `git diff` text around each hook; a stat-only rewrite once lengthened the
-        # unstaged diff's abbreviated index hashes and failed it (#377). The hooks see full-length ones.
+        # unstaged diff's abbreviated index hashes and failed it (#377). Reproducing that takes an object store
+        # at the abbrev boundary: abbrev guards the pin itself, same that such a rewrite is not a modification.
         self.configure('same', 'abbrev')
         (self.repo / 'a.txt').write_text('edited\n')
         code, out = self.run_script('a.txt', 'b.txt')
@@ -394,6 +493,62 @@ class PinnedAbbrevTest(unittest.TestCase):
             hooks.pinned_abbrev({'GIT_CONFIG_COUNT': 'x'})
 
 
+class RunHooksTest(unittest.TestCase):
+    BROKEN = 'broken' + '.' * 70 + 'Failed\n- hook id: broken\n- exit code: 1\n\nnope\n'
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        Path(tmp.name, hooks.CONFIG).write_text('repos: []\n')
+        cwd = os.getcwd()
+        os.chdir(tmp.name)
+        self.addCleanup(os.chdir, cwd)
+
+    def test_a_run_without_the_excused_that_fails_naming_no_hook_is_its_own_failure(self):
+        def pre_commit(paths, deadline, start, what, hook=None, cwd=None, skip=()):
+            return (1, '') if skip else (1, self.BROKEN)
+        with mock.patch.object(hooks, 'pre_commit', pre_commit), \
+                mock.patch.object(hooks, 'baseline', return_value=['broken']):
+            ran, passed, ids, failures, excused = hooks.run_hooks(['a.txt'])
+        self.assertEqual((ran, passed, ids, excused), (True, False, [], ['broken']))
+        self.assertEqual([(f['hook'], f['error']) for f in failures], [
+            ('broken', 'nope'), (hooks.UNOWNED, 'pre-commit exited 1 with broken skipped, naming no hook')])
+
+    def test_the_run_without_the_excused_gets_its_retry(self):
+        # A formatter fail_fast hid rewrites in that run and passes on its retry, as it would with fail_fast off.
+        fmt = 'fmt' + '.' * 70 + 'Failed\n- hook id: fmt\n- exit code: 1\n- files were modified by this hook\n'
+        runs = iter([(1, self.BROKEN), (1, fmt), (0, '')])
+        with mock.patch.object(hooks, 'pre_commit', lambda *a, **k: next(runs)), \
+                mock.patch.object(hooks, 'baseline', return_value=['broken']):
+            ran, passed, ids, failures, excused = hooks.run_hooks(['a.txt'])
+        self.assertEqual((ids, [f['hook'] for f in failures], excused), (['fmt'], ['broken'], ['broken']))
+
+    def test_an_id_skip_cannot_name_is_never_rerun_on_head(self):
+        out = self.BROKEN.replace('broken', 'a,b')
+        with mock.patch.object(hooks, 'pre_commit', return_value=(1, out)), \
+                mock.patch.object(hooks, 'baseline') as baseline:
+            *_, excused = hooks.run_hooks(['a.txt'])
+        baseline.assert_not_called()
+        self.assertEqual(excused, [])
+
+
+class AsCheckoutTest(unittest.TestCase):
+    def test_every_spelling_of_the_tree_reads_as_the_placeholder(self):
+        tree = os.path.join(tempfile.gettempdir(), 'hooks-base-x', 'head')
+        posix = tree.replace('\\', '/')
+        said = f'{tree}/a.c: no compiler\n{posix}/b.c'
+        if os.name == 'nt':
+            said += f'\n/{posix[0].lower()}{posix[2:]}/c.c\n{tree.upper()}'
+        self.assertNotIn('hooks-base-x', hooks.as_checkout(said, tree))
+
+    def test_two_runs_of_one_failure_compare_equal_and_a_new_violation_does_not(self):
+        # What tinyusb's unit-test hooks printed on HEAD and on the change (#378): timings, tempfile names, order.
+        change = "FAIL: a\nPermissionError: 'C:/T/tmpl1lb44ri'\nPermissionError: 'C:/T/tmpabcdefgh.json'\nRan 9 tests in 4.357s\n"
+        head = "PermissionError: 'C:/T/tmpld2ovkrs'\nFAIL: a\nPermissionError: 'C:/T/tmpzyxwvuts.json'\n\nRan 9 tests in 6.3s\n"
+        self.assertEqual(hooks.comparable(change, '/x'), hooks.comparable(head, '/x'))
+        self.assertNotEqual(hooks.comparable('1:old bad\n', '/x'), hooks.comparable('1:old bad\n2:new bad\n', '/x'))
+
+
 class ResultsTest(unittest.TestCase):
     FAILED = 'fmt' + '.' * 70 + 'Failed'
 
@@ -408,11 +563,15 @@ class ResultsTest(unittest.TestCase):
                f'gen{"." * 70}Failed\n- hook id: gen\n- exit code: 2\n'
                f'doc{"." * 50}(no files to check)Skipped\n'
                f'cut{"." * 70}Failed\n- hook id: cut\n- exit code: 1\n\n{"x" * 300}\n')
-        self.assertEqual(hooks.results(out, 1)[1], [
+        self.assertEqual([{k: f[k] for k in ('hook', 'error')} for f in hooks.results(out, 1)[1]], [
             {'hook': 'fmt', 'error': 'error: no compiler'},
             {'hook': 'gen', 'error': 'exit code: 2'},
             {'hook': 'cut', 'error': 'x' * hooks.ERROR_CHARS},
         ])
+        # what the HEAD rerun is compared on: the block and everything printed, up to the next result
+        self.assertEqual([f['output'] for f in hooks.results(out, 1)[1]], [
+            f'- exit code: 1\n\n\n{"=" * 70}\n  error: no compiler  \nmore', '- exit code: 2',
+            f'- exit code: 1\n\n{"x" * 300}'])
 
     def test_only_the_block_under_a_result_line_counts(self):
         out = (f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n\n'

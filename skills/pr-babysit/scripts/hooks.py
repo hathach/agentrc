@@ -12,24 +12,35 @@ the pre-commit process tree is killed and the result is an error. Status lines a
 records, each untracked file its own; snapshot lines are `<644|755> <blob> <path>` or `absent - <path>`.
 
 stdout ends with one JSON line {ran, passed, modifiedBy, failed, baselineFailed, before, after,
-snapshotBefore, snapshotAfter, seal} (seal: facts.sealed): passed is the last run's exit status,
-modifiedBy the ids, across both runs, of the hooks pre-commit itself said
-modified files. Without a config: ran false, passed true, and the lists empty.
-failed and baselineFailed explain a failure: failed, {hook, error} for each hook the last
-run failed, error its first output line; and baselineFailed, the ids among
-those that, rerun alone in a detached worktree of HEAD on the same PATHs, fail
-there too, so they are no evidence against the change (#378). A hook whose
-last failure was modifying files is never rerun there, and each rerun gets a
-clean HEAD tree. When every failure is excused, the hooks run once more on the
-change with SKIP naming the excused ones, so a fail_fast stop cannot hide a
-hook the change breaks; what fails there joins failed, and a failure no hook
-owns excuses nothing. pre-commit runs with core.abbrev pinned (#377).
+snapshotBefore, snapshotAfter, seal} (seal: facts.sealed): passed is the exit
+status of the first pass (the run and its retry), modifiedBy the ids of the
+hooks pre-commit itself said modified files in any run. Without a config: ran
+false, passed true, and the lists empty.
+
+failed and baselineFailed explain a failure: failed, {hook, error} for each hook
+the first pass's last run failed, error its first output line; and
+baselineFailed, the ids among those that, rerun alone in a detached worktree of
+HEAD on the same PATHs, fail there with the same output (comparable: its lines
+in any order, the tree's path read as the checkout's, durations and temporary
+names masked), so they are no evidence against the change (#378). A hook
+that ever modified files is never rerun there, nor one whose id SKIP cannot
+name, and each rerun gets a clean HEAD tree. The tree has only what HEAD
+tracks: a hook that needs the checkout's ignored files (fetched dependencies)
+fails there differently and stays counted. A new violation a hook reports in
+the same words as one HEAD already has is still excused; CI runs the hook on
+the pushed head. When every failure is excused, the hooks run once more on the
+change, with its retry, and SKIP naming the excused ones, as the commit will,
+so a fail_fast stop cannot hide a hook the change breaks: what fails there
+joins failed, and a failed run that names no hook adds the failure
+`(pre-commit)`. pre-commit runs with core.abbrev pinned (#377), which the
+hooks' own git commands inherit.
 Exit 0 with that line; exit 2 with {"error": ...} when the facts cannot be
 collected or pre-commit's output contradicts its exit status.
 """
 
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -52,8 +63,12 @@ RESULT = re.compile(r'\.(Passed|Failed)$')
 # Any hook's result line, `(no files to check)Skipped` included: where the hook output above it ends.
 NEXT = re.compile(r'[.)](Passed|Failed|Skipped)$')
 ERROR_CHARS = 200
-# Seconds past the deadline the HEAD worktree's removal may take.
+# Seconds past the deadline the HEAD worktree's removal may take, and its registration's prune after it.
 CLEANUP = 20
+# The failure a run that failed naming no hook adds: not a hook id, so never excused or skipped.
+UNOWNED = '(pre-commit)'
+# What differs between two runs of the same failure: a token holding a digit, or a name tempfile made.
+VARYING = re.compile(r'\w*\d\w*|\btmp\w{8}\b')
 
 
 def status_paths(records):
@@ -90,19 +105,26 @@ def snapshot(paths, records):
     return lines
 
 
-def first_error(lines, block):
-    """The first line with a word the hook printed, up to the next hook's result, skipping rules such as unittest's
-    `=====`; its last `- ` line when it printed none."""
-    for line in lines:
+def printed(lines):
+    """What the hook printed: its lines up to the next hook's result."""
+    for n, line in enumerate(lines):
         if NEXT.search(line):
-            break
+            return lines[:n]
+    return lines
+
+
+def first_error(lines, block):
+    """The first line with a word the hook printed, skipping rules such as unittest's `=====`; its last `- ` line
+    when it printed none."""
+    for line in lines:
         if re.search(r'[^\W_]', line):
             return line.strip()[:ERROR_CHARS]
     return block[-1][2:] if block else 'no output'
 
 
 def results(output, exit_code):
-    """(ids of the hooks whose own `- ` block says they modified files, {hook, error} of each failed hook).
+    """(ids of the hooks whose own `- ` block says they modified files, {hook, error, output} of each failed hook,
+    output its whole `- ` block and what it printed).
 
     A block counts only directly under a result line; the hook's output follows
     the block after a blank line, so a marker it echoes is not read as one."""
@@ -127,7 +149,9 @@ def results(output, exit_code):
                 raise Unusable(f'pre-commit reported hook {hook} passed and modified files')
             ids.append(hook)
         if failed:
-            failures.append({'hook': hook, 'error': first_error(lines[i + 1 + len(block):], block)})
+            said = printed(lines[i + 1 + len(block):])
+            failures.append({'hook': hook, 'error': first_error(said, block),
+                             'output': '\n'.join([*block, *said]).rstrip()})
     return ids, failures
 
 
@@ -188,62 +212,134 @@ def pre_commit(paths, deadline, start, what, hook=None, cwd=None, skip=()):
     return code, out
 
 
-def git_within(deadline, start, *argv):
+def git_within(deadline, start, *argv, cwd=None):
     """git argv, held to the same deadline as the hooks: a checkout filter or hook of its own can hang it."""
-    code, _, err = bounded(['git', *argv], deadline, start, f'git {argv[0]}')
+    code, _, err = bounded(['git', *argv], deadline, start, f'git {argv[0]}', cwd)
     if code:
         raise Unusable(f"git {' '.join(argv)}: {err.strip()}")
 
 
-def baseline(hooks, paths, deadline, start):
-    """The ids among hooks that fail on HEAD too: each rerun alone on the same paths in a detached worktree of HEAD,
-    so what the host lacks (a compiler, a codepage, /dev/null) fails it there as well, without the change.
-    Only the hook's own Failed block counts, never pre-commit refusing an id HEAD's config does not have."""
-    failing = []
-    with tempfile.TemporaryDirectory(prefix='hooks-base-', ignore_cleanup_errors=True) as tmp:
-        tree = os.path.join(tmp, 'head')
-        git_within(deadline, start, 'worktree', 'add', '--detach', '--quiet', tree, 'HEAD')
+def spellings(path):
+    """The ways a hook may print path, longest first: as given and resolved, each native, with forward slashes,
+    and on Windows as MSYS's /c/..."""
+    found = set()
+    for p in (path, os.path.realpath(path)):
+        for q in (p, p.replace('\\', '/')):
+            found.add(q)
+            if re.match(r'[A-Za-z]:/', q):
+                found.add(f'/{q[0].lower()}{q[2:]}')
+    return sorted(found, key=len, reverse=True)
+
+
+def as_checkout(text, root):
+    """text with root, where the hook ran, read as one placeholder, so HEAD's tree and the checkout compare."""
+    for s in spellings(root):
+        text = re.sub(re.escape(s), '<checkout>', text, flags=re.IGNORECASE if os.name == 'nt' else 0)
+    return text
+
+
+def comparable(text, root):
+    """What of a hook's output its HEAD rerun must repeat: its lines, in any order (a parallel runner's), with root
+    read as the checkout and each token holding a digit (a duration, a line number, a temporary name) and
+    tempfile's names masked. A violation the change adds is a line more."""
+    lines = (VARYING.sub('#', line).strip() for line in as_checkout(text, root).splitlines())
+    return sorted(line for line in lines if line)
+
+
+def registration(tree):
+    """The administrative directory registering tree as a worktree, or None."""
+    try:
+        common = Path(git('rev-parse', '--git-common-dir').strip()).resolve()
+    except Unusable:
+        return None
+    want = os.path.normcase(os.path.realpath(os.path.join(tree, '.git')))
+    for admin in (common / 'worktrees').glob('*'):
         try:
-            for i, hook in enumerate(hooks):
-                if i:
-                    # What an earlier rerun rewrote or left behind could fail the next one: each gets HEAD as is.
-                    git_within(deadline, start, '-C', tree, 'reset', '--quiet', '--hard', 'HEAD')
-                    git_within(deadline, start, '-C', tree, 'clean', '-qffdx')
-                code, out = pre_commit(paths, deadline, start, f'HEAD {hook}', hook=hook, cwd=tree)
-                if hook in (f['hook'] for f in results(out, code)[1]):
-                    failing.append(hook)
-        finally:
-            try:
-                git_within(deadline + CLEANUP, start, 'worktree', 'remove', '--force', tree)
-            except Unusable:
-                git('worktree', 'prune')
+            gitdir = (admin / 'gitdir').read_text(encoding='utf-8').strip()
+        except OSError:
+            continue
+        if os.path.normcase(os.path.realpath(gitdir)) == want:
+            return admin
+    return None
+
+
+def forget(tree, tmp, deadline, start):
+    """Remove the HEAD worktree and its registration, one a kill left half made and locked included; a failure here
+    never hides the run's own result."""
+    try:
+        git_within(deadline + CLEANUP, start, 'worktree', 'remove', '--force', '--force', tree)
+    except Unusable:
+        pass
+    admin = registration(tree)
+    shutil.rmtree(tmp, ignore_errors=True)
+    if admin:
+        # `worktree add` keeps the entry locked while it initializes, and prune spares a locked entry.
+        (admin / 'locked').unlink(missing_ok=True)
+        try:
+            # prune drops only an entry whose tree is gone, so it runs after the tree is deleted.
+            git_within(CLEANUP, time.monotonic(), 'worktree', 'prune')
+        except Unusable:
+            pass
+
+
+def baseline(expected, paths, deadline, start):
+    """The ids among expected's ({hook: its outputs on the change}) that fail on HEAD as they failed on the change:
+    each rerun alone on the same paths in a detached worktree of HEAD, so what the host lacks (a compiler, a codepage,
+    /dev/null) fails it there in the same words, without the change. Only the hook's own Failed blocks count, every
+    entry under its id, never pre-commit refusing an id HEAD's config does not have."""
+    failing = []
+    tmp = tempfile.mkdtemp(prefix='hooks-base-')
+    tree = os.path.join(tmp, 'head')
+    try:
+        git_within(deadline, start, 'worktree', 'add', '--detach', '--quiet', tree, 'HEAD')
+        for i, (hook, outputs) in enumerate(expected.items()):
+            if i:
+                # What an earlier rerun rewrote or left behind could fail the next one: each gets HEAD as is.
+                git_within(deadline, start, 'reset', '--quiet', '--hard', 'HEAD', cwd=tree)
+                git_within(deadline, start, 'clean', '-qffdx', cwd=tree)
+            code, out = pre_commit(paths, deadline, start, f'HEAD {hook}', hook=hook, cwd=tree)
+            if [comparable(f['output'], tree) for f in results(out, code)[1] if f['hook'] == hook] == outputs:
+                failing.append(hook)
+    finally:
+        forget(tree, tmp, deadline, start)
     return failing
 
 
-def run_hooks(paths, deadline=DEADLINE):
-    if not os.path.exists(CONFIG):
-        return False, True, [], [], []
+def passes(paths, deadline, start, what, skip=()):
+    """(exit code, ids of the hooks that modified files, the last run's failures) of pre-commit on paths, run once
+    more when it failed after a hook modified files."""
     ids = []
-    start = time.monotonic()
     for attempt in (1, 2):
-        code, out = pre_commit(paths, deadline, start, f'run {attempt}')
+        code, out = pre_commit(paths, deadline, start, f'{what} {attempt}', skip=skip)
         modified, failures = results(out, code)
         ids += [h for h in modified if h not in ids]
         # A rerun repairs what a hook rewrote; the same failure again only spends another pass (#140).
         if not code or not modified:
             break
-    # A hook still rewriting files is judged by what it wrote, never excused by HEAD.
-    rerun = [f['hook'] for f in failures if f['hook'] not in modified]
-    excused = baseline(rerun, paths, deadline, start) if rerun else []
-    if excused and len(excused) == len(failures):
+    return code, ids, failures
+
+
+def run_hooks(paths, deadline=DEADLINE):
+    if not os.path.exists(CONFIG):
+        return False, True, [], [], []
+    start = time.monotonic()
+    code, ids, failures = passes(paths, deadline, start, 'run')
+    # A hook that rewrote files is judged by what it wrote, never excused by HEAD; nor is an id SKIP cannot name,
+    # which the commit could not skip.
+    expected = {}
+    for f in failures:
+        if f['hook'] not in ids and ',' not in f['hook']:
+            expected.setdefault(f['hook'], []).append(comparable(f['output'], os.getcwd()))
+    excused = baseline(expected, paths, deadline, start) if expected else []
+    if excused and {f['hook'] for f in failures} <= set(excused):
         # fail_fast may have stopped the run at an excused hook: every other hook must pass on the change, as the
         # commit will run them with the same SKIP.
-        again, out = pre_commit(paths, deadline, start, 'without the excused', skip=excused)
-        modified, others = results(out, again)
-        ids += [h for h in modified if h not in ids]
+        again, more, others = passes(paths, deadline, start, 'without the excused', skip=excused)
+        ids += [h for h in more if h not in ids]
         failures += others
         if again and not others:
-            excused = []  # a failure no hook owns: nothing is excused
+            failures.append({'hook': UNOWNED, 'output': '',
+                             'error': f"pre-commit exited {again} with {','.join(excused)} skipped, naming no hook"})
     return True, not code, ids, failures, excused
 
 
@@ -261,7 +357,8 @@ def collect(argv):
     snapshot_before = snapshot(paths, before)
     ran, passed, ids, failures, base_failed = run_hooks(paths, deadline)
     after = status()
-    return {'ran': ran, 'passed': passed, 'modifiedBy': ids, 'failed': failures, 'baselineFailed': base_failed,
+    failed = [{'hook': f['hook'], 'error': f['error']} for f in failures]
+    return {'ran': ran, 'passed': passed, 'modifiedBy': ids, 'failed': failed, 'baselineFailed': base_failed,
             'before': before, 'after': after, 'snapshotBefore': snapshot_before, 'snapshotAfter': snapshot(paths, after)}
 
 
