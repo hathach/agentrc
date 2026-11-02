@@ -823,6 +823,15 @@ class Usage(Lib):
         self.assertEqual(ab.basename_clashes({'dev_a': ['examples/Basic/echo'], 'dev_b': ['examples/Other/echo']}),
                          [])   # one basename per board's build dir
 
+    def test_a_sketch_named_twice_is_built_once(self):
+        plans = []
+        self.patch(ab, 'source_identity', lambda: ({'head': 'abc', 'dirty': False, 'status': ''}, ''))
+        self.patch(ab, 'prepared_dependencies', lambda: {})
+        self.patch(ab, 'build_all', lambda jobs, plan, *a: plans.append(plan) or [])
+        self.run_main(['--board', 'dev_a', '--example', 'examples/HID/inout', '--example', 'examples/Basic/echo',
+                       '--example', 'examples/HID/inout/', '--example', 'examples/Basic/echo'])
+        self.assertEqual(plans, [{'dev_a': ['examples/HID/inout', 'examples/Basic/echo']}])
+
 
 if __name__ == '__main__':
     unittest.main()

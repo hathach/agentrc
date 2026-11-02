@@ -896,7 +896,8 @@ def run(profile, argv=None):
 def main(argv=None):
     args = parse(argv if argv is not None else sys.argv[1:], getattr(P, '__doc__', None))
     roster = load_roster(args.hil_config) if args.hil_config else None
-    only = [e.rstrip('/') for e in args.example] if args.example else None
+    # deduplicated: two workers on one sketch would share its build dir
+    only = list(dict.fromkeys(e.rstrip('/') for e in args.example)) if args.example else None
     if args.board:
         unknown = [b for b in args.board if b not in P.BOARDS]
         if unknown:
