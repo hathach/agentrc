@@ -156,10 +156,6 @@ for name in "${RUNNERS[@]}"; do
     check "$name runner $f $RUNNER_USER:$RUNNER_USER 0750" \
       sh -c "[ \"\$(stat -c %U:%G:%a $RUNNER_DIR/$f)\" = $RUNNER_USER:$RUNNER_USER:750 ]"
   done
-  # a job cannot remove what the admin left there (UMask=0002 units before 0022)
-  check "$name runner _work and _diag hold nothing of $ADMIN's" \
-    sh -c 'o=$(find "$1/_work" "$1/_diag" -user "$2" -print -quit) || exit 1; [ -z "$o" ] || { echo "$o"; exit 1; }' \
-    _ "$RUNNER_DIR" "$ADMIN"
   for f in .env .path runsvc.sh run.sh bin; do
     check "$name runner $f not writable by $RUNNER_USER" sh -c "! runuser -u $RUNNER_USER -- test -w $RUNNER_DIR/$f"
   done

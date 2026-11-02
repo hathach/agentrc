@@ -48,7 +48,6 @@ LOCK_FILE = '/run/hil-farm.lock'
 LINK_ROOTS = ('/usr/local/bin/', '/usr/local/sbin/', '/opt/hil/')
 FIRMWARE_ROOT = '/lib/firmware/'
 INSTALLED_HOST = Path('/etc/hil-farm/host.toml')
-OLD_MARKER = FARM_HOME / 'profile'  # an install from before host files: its profile name
 KNOWN_RUNNERS = ('tinyusb', 'tinyuf2')  # common.sh runner_conf
 
 
@@ -233,8 +232,7 @@ def host_sh(h):
 
 
 def install_host(cfg, src):
-    """Make src the installed host file. A host keeps its identity; an install from before host files keeps its
-    profile name. Refuses while any of its runners runs."""
+    """Make src the installed host file. A host keeps its identity. Refuses while any of its runners runs."""
     new = load_host(cfg, src)
     data = Path(src).read_bytes()
     old = load_host(cfg, INSTALLED_HOST) if INSTALLED_HOST.exists() else None
@@ -245,13 +243,8 @@ def install_host(cfg, src):
         if changed:
             raise FarmError(f'{src} changes {", ".join(changed)} of this host ({INSTALLED_HOST}); '
                             'that takes a reinstall, or for a runner its re-registration')
-    elif OLD_MARKER.exists():
-        if OLD_MARKER.read_text().strip() != new['profile']:
-            raise FarmError(f'this host is installed as profile {OLD_MARKER.read_text().strip()}; '
-                            f'{src} is for {new["profile"]}')
     elif (FARM_HOME / 'farm.toml').exists():
-        raise FarmError(f'{FARM_HOME} holds an install with no host file and no profile marker; write its '
-                        f'profile name to {OLD_MARKER} to confirm it is {new["profile"]}, then rerun')
+        raise FarmError(f'{FARM_HOME} holds an install with no host file ({INSTALLED_HOST}); that takes a reinstall')
     guard(sorted(runner_units(new['runner'])))  # the runners are identity: old and new name the same
     INSTALLED_HOST.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
     if old is not None:
@@ -260,7 +253,6 @@ def install_host(cfg, src):
     tmp.write_bytes(data)
     tmp.chmod(0o644)
     os.replace(tmp, INSTALLED_HOST)
-    OLD_MARKER.unlink(missing_ok=True)
     return True
 
 
