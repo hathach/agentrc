@@ -584,6 +584,13 @@ test('a finding an auto-fix repair noted gets no second fix note, and one still 
   edited.open[0].published = '**high**: overrun past the end of buf'
   assert.equal((await run(inc, { ledger: edited, recheck: () => ({ state: 'open', reason: 'still' }), check: pinned(inc) })).result.draft.comments[0].body,
     '**high**: overrun past the end of buf\n- The repair in cccccccccccc did not fix this; its earlier thread was resolved.', 'restated as the human edited it')
+  const regraded = { state: 'open', reason: 'still', severity: 'critical', impact: IMP, severityReason: 'graded', confidence: 'high' }
+  assert.equal((await run(inc, { ledger: edited, recheck: () => regraded, check: pinned(inc) })).result.draft.comments[0].body,
+    '**critical**: overrun past the end of buf\n- The repair in cccccccccccc did not fix this; its earlier thread was resolved.', 'a regrade replaces only the old grade marker')
+  const relabelled = repaired(done)
+  relabelled.open[0].published = '**bug**: overrun past the end of buf'
+  assert.equal((await run(inc, { ledger: relabelled, recheck: () => regraded, check: pinned(inc) })).result.draft.comments[0].body,
+    '**bug**: overrun past the end of buf\n- The repair in cccccccccccc did not fix this; its earlier thread was resolved.', 'a heading the human changed is left alone')
   const visible = await run(inc, { ledger: repaired({ ...done, resolved: false }), recheck: () => ({ state: 'open', reason: 'still' }), check: pinned(inc) })
   assert.deepEqual(visible.result.draft.comments, [], 'its thread is still open, so its comment still states it')
   const reopenedThread = { ...repaired(done), heldThreads: [{ findingId: 'pr7-f1', commentId: 901, why: 'reopened after it was resolved' }] }

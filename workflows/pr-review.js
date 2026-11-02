@@ -478,9 +478,14 @@ const heldOf = (f) => (prior.heldThreads || []).some(h => h.findingId === f.id &
 const reraised = carriedOut.filter((f, i) => rechecked[i] && ['open', 'upheld'].includes(f.status) && (repairedOf(f) || {}).resolved && !heldOf(f))
 const repairNote = (f, it = 'this') => `The repair in ${repairedOf(f).head.slice(0, 12)} did not fix ${it}; its earlier thread was resolved.`
 // A comment the human edited is restated as they left it, never cut: a repair note that would put it over its limit
-// goes in the body instead.
+// goes in the body instead. A regrade replaces its old grade marker; a heading the human changed stays.
+const regraded = (f, text) => {
+  const was = template(earlier[f.id].severity, '')
+  return text.startsWith(was) ? template(f.severity, text.slice(was.length)) : text
+}
 const restated = reraised.map(f => {
-  const claim = earlier[f.id].published || template(f.severity, whyOf(f))
+  const published = earlier[f.id].published
+  const claim = published ? regraded(f, published) : template(f.severity, whyOf(f))
   const noted = `${claim}\n- ${repairNote(f)}`
   return overLength(noted, LIMIT.comment) ? { f, body: claim, noteInBody: true } : { f, body: noted }
 })
