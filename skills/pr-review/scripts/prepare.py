@@ -103,9 +103,12 @@ def can_write(repo):
         perms = gh_json('api', f'repos/{repo}', '--jq', '.permissions')[1]
     except Unusable as e:
         return None, str(e)
-    if not isinstance(perms, dict):
-        return None, f'gh api repos/{repo} shows no permissions for this account'
-    return any(perms.get(k) is True for k in WRITE), ''
+    if isinstance(perms, dict) and any(perms.get(k) is True for k in WRITE):
+        return True, ''
+    # push is false for every role without write access; anything less is no answer.
+    if isinstance(perms, dict) and perms.get('push') is False:
+        return False, ''
+    return None, f'gh api repos/{repo} shows no push permission for this account: {json.dumps(perms)}'
 
 
 def push_access(repo, head_repo, info):
@@ -185,6 +188,14 @@ def bind_upstream(branch, remote, head_branch, head):
         raise Unusable(f'{remote}/{head_branch} is at {got}, not the PR head {head}: run again')
     git('config', f'branch.{branch}.remote', remote)
     git('config', f'branch.{branch}.merge', want[1])
+    # The upstream is read through the remote's fetch refspec: one that does not map the head branch leaves none.
+    tracked = run('git', 'rev-parse', '--verify', '--quiet', f'{branch}@{{upstream}}', ok=(0, 1))[1].strip()
+    if tracked != head:
+        if not any(have):
+            git('config', '--unset', f'branch.{branch}.remote')
+            git('config', '--unset', f'branch.{branch}.merge')
+        raise Unusable(f"remote {remote}'s fetch refspec does not map {want[1]}, so the branch would track nothing: "
+                       f'add it (git remote set-branches --add {remote} {head_branch}) and run again')
 
 
 def repair_target(repo, info, branch, head):

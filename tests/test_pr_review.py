@@ -697,8 +697,9 @@ class AutoFix(Case):
         r = self.auto_fix()['repair']
         self.assertEqual(r['state'], 'unknown')
         self.assertIn('HTTP 404', r['why'])
-        self.gh.perms = {'contrib/r': None, REPO: {'push': False}}
-        self.assertEqual(self.auto_fix()['repair']['state'], 'unknown', 'no permissions shown is not a refusal')
+        for shown in (None, {}, {'pull': True}, {'push': 'no'}):
+            self.gh.perms = {'contrib/r': shown, REPO: {'push': False}}
+            self.assertEqual(self.auto_fix()['repair']['state'], 'unknown', f'{shown} is not a refusal')
 
     def test_with_no_remote_for_the_head_one_is_added_like_the_base_and_gh_default_pinned(self):
         sh(self.clone, 'git', 'config', f'url.{self.remote.as_posix()}.insteadOf', f'git@github.com:{REPO}.git')
@@ -736,6 +737,13 @@ class AutoFix(Case):
         with self.assertRaisesRegex(facts.Unusable, 'already tracks origin refs/heads/main'):
             self.auto_fix()
         self.assertEqual(self.config(f'branch.{self.BRANCH}.remote'), 'origin')
+
+    def test_a_remote_whose_fetch_refspec_skips_the_head_branch_refuses_and_binds_nothing(self):
+        sh(self.clone, 'git', 'remote', 'add', '-t', 'main', 'contrib', 'git@github.com:contrib/r.git')
+        self.gh.perms = {'contrib/r': {'push': True}}
+        with self.assertRaisesRegex(facts.Unusable, "fetch refspec does not map refs/heads/feature"):
+            self.auto_fix()
+        self.assertEqual((self.config(f'branch.{self.BRANCH}.remote'), self.config(f'branch.{self.BRANCH}.merge')), ('', ''))
 
     def test_a_head_branch_not_at_the_pinned_head_refuses_and_binds_nothing(self):
         sh(self.clone, 'git', 'remote', 'add', 'contrib', 'git@github.com:contrib/r.git')
