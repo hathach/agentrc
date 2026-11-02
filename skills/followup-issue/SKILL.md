@@ -54,9 +54,8 @@ one-word searches, a title file and a body file.
 - **The body is the handoff.** The originating PR link, the evidence (run id,
   command and output where there are any, else the cited source), the remaining
   work and why it is deferred. Title in the repository's style (agentrc:
-  `<component>: <what is wrong>`). The repository's follow-up label when it
-  has one (tinyusb and tinyuf2 `followup`, agentrc `follow-up`), else none;
-  never a footer.
+  `<component>: <what is wrong>`). The follow-up label the repository's
+  `CLAUDE.md` names (agentrc: `follow-up`), else none; never a footer.
 - **Receipts, verbatim.** Return the JSON line unchanged. `uncertain` and
   `mismatch` are for a human: never rerun the command on them or post again
   by hand, since a lost write can surface late. Never file with `gh`
