@@ -2449,6 +2449,19 @@ class Repair(PostCase):
         self.assertEqual(row['repair'], {'head': self.fixed_head, 'state': 'uncertain', 'resolved': False})
         self.assertEqual(self.show()['heldThreads'], [{'findingId': 'pr7-f1', 'commentId': self.root, 'why': 'repair note unconfirmed'}])
 
+    def test_a_finding_raised_again_after_its_repair_takes_its_new_comment_as_root_once_published(self):
+        self.fixed()
+        sh(self.clone, 'git', 'fetch', '--quiet', 'origin', f'refs/pull/{PR}/head')
+        draft = {'event': 'COMMENT', 'body': 'Again.', 'replies': [],
+                 'comments': [{'path': 'src/core/a.c', 'line': 21, 'body': '**high**: b is never initialised\n- The repair did not fix this.', 'finding': 0}]}
+        self.save(self.result_for(self.p, head=self.fixed_head, findings=[{'id': 'pr7-f1', 'status': 'open'}], draft=draft), reason='recheck')
+        self.call(post, ['--pr', str(PR), '--repo', REPO, '--expected-head', self.fixed_head, '--auto'])
+        f = self.review()['findings'][0]
+        self.assertNotEqual(f['commentId'], self.root, 'the new comment is its root')
+        row = next(o for o in self.show()['open'] if o['id'] == 'pr7-f1')
+        self.assertEqual((row['repair'], row['resolveDue']), (None, None), 'the old repair stays on the old root')
+        self.assertEqual(json.loads(Path(self.p['ledger']).read_text())['reviews'][-2]['repairs'][0]['commentId'], self.root)
+
     def test_a_pending_review_of_ours_blocks_a_new_note_only(self):
         self.gh.reviews[1] = {'id': 1, 'body': 'by hand', 'state': 'PENDING', 'user': {'login': ME}}
         self.assertEqual(self.fixed()['repairs'][0]['error'], 'a pending review of ours is open on the PR')

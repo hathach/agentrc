@@ -532,6 +532,22 @@ test('an incremental review rechecks earlier findings: fixed ones get a fix note
   assert.equal(lost.result.findings.find(f => f.id === 'pr7-f1').status, 'open')
 })
 
+test('a finding an auto-fix repair noted gets no second fix note, and one still standing is raised again on a new comment', async () => {
+  const inc = { ...BASE, mode: 'incremental', scopeBase: OLD }
+  const repaired = (repair) => ({ reviews: 1, last: { head: OLD }, open: [{ id: 'pr7-f1', file: 'src/core/a.c', line: 10, severity: 'high', why: 'overrun past the buffer end', commentId: 901, repair }] })
+  const done = { head: OLD, state: 'published', resolved: true }
+  const fixed = await run(inc, { ledger: repaired(done), recheck: () => ({ state: 'fixed', reason: 'guarded now' }), check: pinned(inc) })
+  assert.deepEqual([fixed.result.draft.replies, fixed.result.draft.resolves, fixed.result.draft.comments], [[], [], []])
+  const unsure = await run(inc, { ledger: repaired({ ...done, state: 'uncertain', resolved: false }), recheck: () => ({ state: 'fixed', reason: 'guarded now' }), check: pinned(inc) })
+  assert.deepEqual(unsure.result.draft.replies, [], 'an unconfirmed note is reconciled, never noted twice')
+  const still = await run(inc, { ledger: repaired(done), recheck: () => ({ state: 'open', reason: 'still overruns' }), check: pinned(inc) })
+  assert.deepEqual(still.result.draft.comments, [{ path: 'src/core/a.c', line: 10, finding: 0,
+    body: '**high**: overrun past the buffer end\n- The repair in cccccccccccc did not fix this; its earlier thread was resolved.' }])
+  assert.equal(still.result.findings[0].id, 'pr7-f1', 'raised again under its own id')
+  const visible = await run(inc, { ledger: repaired({ ...done, resolved: false }), recheck: () => ({ state: 'open', reason: 'still' }), check: pinned(inc) })
+  assert.deepEqual(visible.result.draft.comments, [], 'its thread is still open, so its comment still states it')
+})
+
 test('args that differ from the pins prepare recorded for this head are blocked before review', async () => {
   for (const pins of [{ mergeBase: OLD, scopeBase: MB, mode: 'full', groups: ['src/core'] }, { mergeBase: MB, scopeBase: MB, mode: 'full', groups: ['src'] }, undefined]) {
     const { result, labels } = await run(BASE, { check: { ...pinned(BASE), pins } })
