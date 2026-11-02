@@ -1781,6 +1781,15 @@ class Pushback(PostCase):
         self.assertIn(reply, ledger.answered_ids(self.led()))
         self.assertEqual(self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO])['answers'], [])
 
+    def test_a_submitted_answer_on_a_closed_pr_is_recorded_and_never_resolves(self):
+        self.concede()
+        self.gh.submit(self.rid())
+        self.gh.state = 'CLOSED'
+        self.call(post, ['--pr', str(PR), '--repo', REPO, '--sync'])
+        self.assertEqual(self.finding()['disputes'][-1]['answer']['outcome'], 'published', 'the receipt still settles')
+        self.assertFalse(self.gh.threads[0]['isResolved'])
+        self.assertEqual([(m['state'], m['error']) for m in self.pub()['receipts']['resolved']], [('deferred', 'the PR is closed')])
+
     def test_an_edited_concession_reopens_its_finding_answers_the_pushback_and_is_never_resolved(self):
         reply = self.concede()
         self.gh.submit(self.rid(), edit={reply: 'Fair point, but see line 3.'})

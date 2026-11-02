@@ -332,11 +332,11 @@ def resolve(thread_id):
 
 
 def resolve_threads(repo, pr, led, review, want, login, persist):
-    """Resolve each (finding, root comment) thread while the PR head is the review's, a published reply of ours is on
-    it and nobody pushed back after the last one, marking each in receipts.resolved."""
+    """Resolve each (finding, root comment) thread while the PR is open, its head is the review's, a published reply of
+    ours is on it and nobody pushed back after the last one, marking each in receipts.resolved."""
     if not want:
         return
-    head = pr_head(repo, pr)
+    head, shut = head_if_open(repo, pr)
     public = pages(f'repos/{repo}/pulls/{pr}/comments')
     by_root = {t['commentIds'][0]: t for t in threads(repo, pr) if t['commentIds']}
     known, marks, fixes = answered_ids(led), review['receipts'].setdefault('resolved', []), repairs(led)
@@ -349,7 +349,7 @@ def resolve_threads(repo, pr, led, review, want, login, persist):
         # resolves it: an older answer of ours does not stand in for the note.
         why = ('no review thread holds the comment' if not t else None if t['resolved'] else
                (fix and (repair_hold(fix, t) or note_hold(fix, bodies))) or
-               (f"the PR head moved to {head} since the review" if head != review['head'] else
+               (shut or f"the PR head moved to {head} since the review" if shut or head != review['head'] else
                 'no published reply of ours on the thread' if not any(c['id'] in known for c in replies) else
                 'new replies since our last one' if pushback(replies, known, login) else None))
         mark = {'findingId': f['id'], 'commentId': root, 'state': 'deferred' if why else 'observed', 'error': why}
