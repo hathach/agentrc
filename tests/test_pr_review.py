@@ -2394,6 +2394,11 @@ class Repair(PostCase):
                 self.fixed(self.row(**over))
         with self.assertRaisesRegex(facts.Unusable, 'twice'):
             self.fixed(self.row(), self.row())
+        nameless = self.row()
+        del nameless['id']
+        for bad in (nameless, {**self.row(), 'id': ''}, {**self.row(), 'id': ['pr7-f1']}, {**self.row(), 'id': 1}):
+            with self.assertRaisesRegex(facts.Unusable, 'not an object with an id', msg=bad.get('id')):
+                self.fixed(self.row('pr7-f2'), bad)
         out = self.fixed(self.row(checkedSha=self.reviewed), head=self.reviewed)
         self.assertEqual([(r['state'], r['error']) for r in out['repairs']],
                          [('skipped', f'the PR head moved to {self.fixed_head}; the repair was checked on {self.reviewed}')])

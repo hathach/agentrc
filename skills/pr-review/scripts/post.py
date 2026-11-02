@@ -594,9 +594,9 @@ def read_manifest(path, head):
     rows = m.get('findings')
     if not FULL_SHA.match(str(m.get('reviewedHead'))) or not isinstance(rows, list) or not rows:
         raise Unusable('--fixed needs {"reviewedHead": SHA, "findings": [...]} with at least one finding')
-    ids = [r.get('id') for r in rows if isinstance(r, dict)]
+    ids = [r.get('id') for r in rows if isinstance(r, dict) and isinstance(r.get('id'), str) and r['id']]
     if len(ids) != len(rows) or len(set(ids)) != len(ids):
-        raise Unusable('--fixed names a finding twice, or a row that is not an object')
+        raise Unusable('--fixed names a finding twice, or a row that is not an object with an id')
     for r in rows:
         note = r.get('note')
         why = (f"its fix check is {r.get('verdict')!r}, not 'verified'" if r.get('verdict') != 'verified' else
