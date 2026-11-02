@@ -638,6 +638,10 @@ test('pushback on our thread is judged with the replies as evidence and answered
     rootCommentId: 901, answer: { body: 'Agreed, the caller masks the IRQ first.', resolve: true } }])
   assert.deepEqual(result.draft.replies, [], 'a concession is a thread answer awaiting approval, not an auto-granted fix note')
   assert.equal(result.verdict.event, 'COMMENT', 'withdrawn drops the high finding; the medium one still caps')
+  const { rootCommentId, ...rootless } = DISPUTE
+  const lossy = await run(inc, { check: pinned(inc), ledger: LEDGER, disputes: { disputes: [rootless] }, recheck })
+  assert.equal(lossy.result.findings.find(f => f.id === 'pr7-f1').disputes[0].rootCommentId, rootCommentId,
+    'a copy that dropped the root keeps the judged thread: a comment raised again would take over the finding\'s commentId')
 })
 
 test('upheld keeps its severity and leaves the thread open; disputed only blocks approval; a dead verifier records nothing', async () => {

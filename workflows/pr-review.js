@@ -237,8 +237,10 @@ const carriedOut = carried.map((f, i) => {
   const out = { ...base, status: statusOf(f, v), recheckReason: v.reason }
   if (d && ['withdrawn', 'upheld', 'disputed', 'fixed', 'na'].includes(v.state)) {
     // The thread judged keeps the answer: a comment raised again on this review becomes the finding's commentId.
+    // A copy that dropped the root falls back to the comment the ledger had for it, which is that thread's.
+    const root = Number.isInteger(d.rootCommentId) ? d.rootCommentId : f.commentId
     out.disputes = [{ key: d.key, replies: d.replies, judgedHead: head, threadsFile, state: v.state, reason: v.reason,
-      ...(Number.isInteger(d.rootCommentId) ? { rootCommentId: d.rootCommentId } : {}),
+      ...(Number.isInteger(root) ? { rootCommentId: root } : {}),
       ...(['withdrawn', 'upheld'].includes(v.state) ? { answer: answerOf(f, v) } : {}) }]
   }
   return out
