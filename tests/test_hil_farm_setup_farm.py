@@ -5,6 +5,7 @@ if os.name == 'nt':
     raise unittest.SkipTest('the HIL farm setup runs on Debian: bash, fcntl, Linux paths')
 
 import copy
+import functools
 import re
 import tomllib
 import hashlib
@@ -15,6 +16,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import warnings
 from pathlib import Path
 from unittest import mock
 
@@ -46,11 +48,16 @@ def tar_bytes(members):
     return buf.getvalue()
 
 
+@functools.cache
 def path_safe_tmp():
     """A temp base the writable-path check accepts, else None (the tests then fail on it): TMPDIR may sit
     under a group-writable home dir (umask 002), which the check rightly flags; /tmp is root's sticky dir."""
     with mock.patch.object(farm, 'TRUSTED_UIDS', {0, os.getuid()}):
-        return next((d for d in (tempfile.gettempdir(), '/tmp') if farm.writable_by_others(d) is None), None)
+        bad = farm.writable_by_others(tempfile.gettempdir())
+        if bad is None:
+            return tempfile.gettempdir()
+        warnings.warn(f'TMPDIR fails the writable-path check at {bad}; the farm tests fall back to /tmp')
+        return '/tmp' if farm.writable_by_others('/tmp') is None else None
 
 
 def tool_script(version):
@@ -568,6 +575,32 @@ class TestRunnerInstall(FarmCase):
         self.assertEqual(os.listdir(Path(self.dirs[0]).parent), [])
         farm.install_tool('actions-runner', self.t, False)
         self.assertEqual(farm.verify_tool('actions-runner', self.t), [])
+
+    def interrupt_and_retry(self, interrupt):
+        with mock.patch.object(farm, 'install_runner', interrupt), self.assertRaises(KeyboardInterrupt):
+            farm.install_tool('actions-runner', self.t, False)
+        with self.assertRaisesRegex(farm.FarmError, 'runner updates are not supported'):
+            farm.install_tool('actions-runner', dict(self.t, version='3'), False)
+        farm.install_tool('actions-runner', self.t, False)
+        self.assertEqual(farm.verify_tool('actions-runner', self.t), [])
+
+    def test_a_retry_fills_what_an_interruption_after_the_first_dir_left_missing(self):
+        real = farm.install_runner
+
+        def second_interrupted(archive, d):
+            if str(d) == self.dirs[1]:
+                raise KeyboardInterrupt
+            real(archive, d)
+        self.interrupt_and_retry(second_interrupted)
+
+    def test_a_retry_after_an_interruption_past_the_last_rename_is_a_no_op(self):
+        real = farm.install_runner
+
+        def last_interrupted(archive, d):
+            real(archive, d)
+            if str(d) == self.dirs[-1]:
+                raise KeyboardInterrupt
+        self.interrupt_and_retry(last_interrupted)
 
     def test_a_leftover_dir_without_a_runner_is_named(self):
         Path(self.dirs[0], 'stray').mkdir(parents=True)

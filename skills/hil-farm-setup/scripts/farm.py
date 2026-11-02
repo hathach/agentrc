@@ -655,10 +655,10 @@ def install_tool(name, t, force):
             if len(held) == len(RUNNER_DIRS) or (held and not (rec and rec['input'] == input_hash(name, t))):
                 raise FarmError(f'{name}: {", ".join(held)} already hold a runner; runner updates are not supported')
             fetch(t['url'], t['sha256'], work / 'runner.tar.gz')
+            write_receipt(name, t)  # before any dir is published, so a retry after an interruption fills the rest
             for d in RUNNER_DIRS:
                 if d not in held:
                     install_runner(work / 'runner.tar.gz', Path(d))
-            write_receipt(name, t)
     probs = verify_tool(name, t)
     if probs:
         raise FarmError(f'{name}: ' + '; '.join(probs))
