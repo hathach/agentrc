@@ -258,8 +258,9 @@ def cmd_session_open(a):
     core.write_json(session_path(a.run_id), data)
     rc = rig(tree, [P.HIL, 'lock', 'hold', a.board, '--reason', reason])
     if rc:
-        print(json.dumps({**data, 'error': f'the hold was not taken (exit {rc}): the session acts under none; one the '
-                                           f'rig took anyway (a dropped connection) is recovered by this reason'}))
+        print(json.dumps({**data, 'error': f'the hold was not taken (exit {rc}): the session acts under none; '
+                                           f'`session close {a.run_id}` releases one the rig took anyway (a dropped '
+                                           f'connection) under this reason, with no restore'}))
         return 1
     data['held'] = True
     core.write_json(session_path(a.run_id), data)
@@ -303,13 +304,28 @@ def cmd_session_exec(run_id, rest):
     return rig(tree, session_argv(s, cmd, opts, argv))
 
 
+def close_unheld(run_id, s):
+    """A hold whose `held:` never reached us may still be taken (ssh dropped after the holder's ack): the rig releases
+    one recorded under this attempt's own reason, never another session's. Nothing ran under it, so nothing is
+    restored; the record stays `held: false`."""
+    tree = core.load_attempt(P.ROOT, runs(), run_id)
+    rc = rig(tree, [P.HIL, 'release', '-b', s['board'], '--under-hold', s['reason']])
+    out = {'runId': run_id, 'board': s['board'], 'closed': rc in (0, H.NOT_HELD), 'restoreExit': None,
+           'releaseExit': rc}
+    if out['closed']:
+        core.write_json(session_path(run_id), {**s, 'closed': True})
+    out['note'] = ("released the hold the rig took under this session's reason; nothing was restored" if rc == 0 else
+                   'held no hold: nothing was held, released or restored' if rc == H.NOT_HELD else
+                   'not closed: the release did not complete (its JSON above, or no answer from the rig); rerun '
+                   'session close')
+    print(json.dumps(out))
+    return 0 if out['closed'] else rc
+
+
 def cmd_session_close(a):
     s = session_record(a.run_id)
-    if not s.get('held'):   # nothing of ours to restore or release: never act under another session's hold
-        core.write_json(session_path(a.run_id), {**s, 'closed': True})
-        print(json.dumps({'runId': a.run_id, 'board': s['board'], 'closed': True, 'restoreExit': None,
-                          'note': 'held no hold: closed locally, nothing restored or released'}))
-        return 0
+    if not s.get('held'):
+        return close_unheld(a.run_id, s)
     tree = core.load_attempt(P.ROOT, runs(), a.run_id)
     rc = rig(tree, session_argv(s, 'restore', ['--bundle', RESTORE_BUNDLE, '--build-record', s['restoreRecord'],
                                                '--release'], []))

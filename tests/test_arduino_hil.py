@@ -1035,6 +1035,21 @@ class Manual(Base):
             release.assert_called_once_with('rig_jlink')
             self.assertEqual(row['pass'], ok)
 
+    def test_release_ends_only_a_hold_under_its_reason_and_restores_nothing(self):
+        self.lock.records['rig_jlink'] = {'reason': 'other', 'pid': 1}
+        argv = ['release', '-b', 'rig_jlink', '--under-hold', 'mine']
+        old = signal.getsignal(signal.SIGHUP)
+        self.addCleanup(signal.signal, signal.SIGHUP, old)
+        with mock.patch.object(H, 'release_hold', return_value={'exit': 0}) as release, \
+                mock.patch.object(H, 'restore', side_effect=AssertionError('restored')):
+            self.assertEqual(self.main(argv)[0], H.NOT_HELD)
+            release.assert_not_called()
+            self.held()
+            self.assertEqual(self.main(argv), (0, {'pass': True, 'board': 'rig_jlink', 'released': {'exit': 0}}))
+            release.assert_called_once_with('rig_jlink')
+            release.return_value = {'exit': 1}
+            self.assertEqual(self.main(argv)[0], 1)
+
     def test_restore_takes_clean_records_only(self):
         args = self.held(build_record=str(self.record(experimental=True)), report=None, release=False)
         with mock.patch.object(H, 'git_identity', return_value=('abc', '')), \

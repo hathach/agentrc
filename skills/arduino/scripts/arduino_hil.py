@@ -57,6 +57,7 @@ FLASH_TIMEOUT, VERIFY_TIMEOUT, ENUM_TIMEOUT, TEST_TIMEOUT, SETTLE = 120, 60, 20,
 CONSOLE_MAX = 120   # one console capture, seconds
 BOARD_BUDGET = 900
 EXEC_MAX = 600   # one session exec or gdb child
+NOT_HELD = 3   # `release`: the board is not held under that reason
 GDB_SERVER = ['-c', 'gdb port pipe', '-c', 'gdb memory_map disable', '-c', 'gdb breakpoint_override hard']
 # An RP2040 SMP resume restores core1 only after each core is polled (target-debug gdb.md, verified on the Pico)
 GDB_DETACH_RESUME = {'target/rp2040.cfg': '{ foreach u [target names] { $u arp_poll }; resume }'}   # by debug cfg
@@ -939,6 +940,20 @@ def release_hold(name):
     return {'exit': r.returncode, 'output': (r.stdout + r.stderr).strip()[-1000:]}
 
 
+def cmd_release(args):
+    """End a hold its session never saw confirmed (an ssh drop after the holder's ack): only one recorded under the
+    session's own reason, so a session that lost the race cannot end the winner's. Nothing ran under it: no restore."""
+    with one_session_command(args.board):
+        try:
+            held_by(args.board, args.under_hold)
+        except Refused as e:
+            emit({'pass': False, 'board': args.board, 'held': False, 'error': str(e)})
+            return NOT_HELD
+        released = release_hold(args.board)
+    emit({'pass': released['exit'] == 0, 'board': args.board, 'released': released})
+    return 0 if released['exit'] == 0 else 1
+
+
 def run_child(argv, timeout, tracker):
     r = tracker.run(argv, timeout=timeout)
     tracker.check()
@@ -1240,6 +1255,9 @@ def parse(argv):
         m.add_argument('roster')
         if name == 'exec':
             m.add_argument('argv', nargs='+')
+    rl = sub.add_parser('release')
+    rl.add_argument('-b', '--board', required=True)
+    rl.add_argument('--under-hold', required=True, metavar='REASON')
     rp = sub.add_parser('report')
     rp.add_argument('run_dir')
     rp.add_argument('-b', '--board', action='append')
@@ -1266,7 +1284,7 @@ def main(argv=None):
     if args.cmd == 'console' and args.baud <= 0:
         emit({'pass': False, 'error': '--baud must be positive'})
         return 2
-    if args.cmd in OPS:
+    if args.cmd in (*OPS, 'release'):
         # a session command runs over ssh: a dropped link must not end it between a child's start and its proof
         signal.signal(signal.SIGHUP, signal.SIG_IGN)
     if args.cmd in ('run', 'commission', *OPS):
@@ -1280,6 +1298,8 @@ def main(argv=None):
             return cmd_commission(args)
         if args.cmd in OPS:
             return manual(args)
+        if args.cmd == 'release':
+            return cmd_release(args)
         return cmd_report(args)
     except Refused as e:
         emit({'pass': False, 'error': str(e)})

@@ -214,10 +214,19 @@ class Session(Checkout):
         calls = len(self.calls)
         with self.assertRaisesRegex(SystemExit, 'session s1 does not hold rig_ocd'):
             R.main(['session', 'exec', 's1', 'exec', '--', 'true'])
+        self.assertEqual(len(self.calls), calls)   # exec never reached the rig
+        session = self.root / '.hil-remote/s1.session.json'
+        self.rig_exit['release'] = 255
+        rc, closed = self.main('session', 'close', 's1')
+        self.assertEqual((rc, closed['closed'], closed['releaseExit']), (255, False, 255))
+        self.assertNotIn('closed', json.loads(session.read_text()))
+        self.rig_exit['release'] = R.H.NOT_HELD
         rc, closed = self.main('session', 'close', 's1')
         self.assertEqual((rc, closed['closed'], closed['restoreExit']), (0, True, None))
-        self.assertEqual(len(self.calls), calls)   # neither reached the rig
-        record = json.loads((self.root / '.hil-remote/s1.session.json').read_text())
+        self.assertIn('nothing was held, released or restored', closed['note'])
+        self.assertEqual(self.calls[-1], ['python3', '-u', self.HP.HIL, 'release', '-b', BOARD, '--under-hold',
+                                          out['reason']])
+        record = json.loads(session.read_text())
         self.assertEqual((record['held'], record['closed']), (False, True))
 
     def test_a_session_losing_the_hold_cannot_release_the_winners(self):
@@ -227,19 +236,52 @@ class Session(Checkout):
                 self.assertEqual(lock.cmd_hold([BOARD], 'arduino-hil session s1'), 0)   # another library's s1
             try:
                 def rig(tree, argv, **kw):   # the rig: hold, or one session command under its reason
-                    with contextlib.redirect_stderr(io.StringIO()):
+                    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                         if argv[3:5] == ['lock', 'hold']:
                             return lock.cmd_hold([BOARD], argv[-1])
                         args = R.H.parse(argv[3:])
+                        if args.cmd == 'release':
+                            return R.H.cmd_release(args)
                         R.H.held_by(args.board, args.under_hold)
                         return lock.cmd_release([args.board])
-                with mock.patch.object(R.core, 'run_remote', rig):
+                with mock.patch.object(R.core, 'run_remote', rig), \
+                        mock.patch.object(R.H, 'release_hold', side_effect=AssertionError('released the winner')):
                     rc, opened = self.main('session', 'open', '--run-id', 's1', '-b', BOARD)
                     self.assertEqual((rc, opened['held']), (1, False))
                     with self.assertRaises(SystemExit):
                         R.main(['session', 'exec', 's1', 'restore', '--release'])
-                    self.assertEqual(self.main('session', 'close', 's1')[0], 0)
+                    rc, closed = self.main('session', 'close', 's1')
+                    self.assertEqual((rc, closed['releaseExit']), (0, R.H.NOT_HELD))
                 self.assertTrue(lock.is_locked(BOARD))
+                self.assertFalse(json.loads((self.root / '.hil-remote/s1.session.json').read_text())['held'])
+            finally:
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    lock.cmd_release([BOARD])
+
+    def test_close_releases_a_hold_the_rig_took_after_open_lost_its_answer(self):
+        lock = R.H.A.lock
+        with mock.patch.object(lock, 'BOARD_LOCK_DIR', str(tmpdir(self))):
+            try:
+                def rig(tree, argv, **kw):   # the holder got its ack, then ssh dropped before `held:` reached us
+                    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                        if argv[3:5] == ['lock', 'hold']:
+                            self.assertEqual(lock.cmd_hold([BOARD], argv[-1]), 0)
+                            return 255
+                        return R.H.cmd_release(R.H.parse(argv[3:]))
+
+                def release(name):
+                    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                        return {'exit': lock.cmd_release([name])}
+                with mock.patch.object(R.core, 'run_remote', rig), mock.patch.object(R.H, 'release_hold', release):
+                    rc, opened = self.main('session', 'open', '--run-id', 's1', '-b', BOARD)
+                    self.assertEqual((rc, opened['held']), (1, False))
+                    self.assertTrue(lock.is_locked(BOARD))
+                    rc, closed = self.main('session', 'close', 's1')
+                self.assertEqual((rc, closed['closed'], closed['releaseExit'], closed['restoreExit']),
+                                 (0, True, 0, None))
+                self.assertFalse(lock.is_locked(BOARD))
+                record = json.loads((self.root / '.hil-remote/s1.session.json').read_text())
+                self.assertEqual((record['held'], record['closed']), (False, True))
             finally:
                 with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                     lock.cmd_release([BOARD])
