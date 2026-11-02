@@ -911,6 +911,27 @@ class Battery(Base):
         self.assertEqual(self.A.report.make_meta.call_args.kwargs['selection'], ['rig_ocd'])
         self.assertEqual(self.A.report.start_attempt.call_args[0][1].name, 'fake-usb-hil')   # the profile's schema
 
+    def test_run_fails_unless_its_report_stands(self):
+        row = {'board': 'rig_ocd', 'ran': True, 'pass': True, 'locked': False, 'recoveryBlocker': False, 'tests': [],
+               'cleanup': {'pass': True, 'state': 'restored'}, 'detail': ''}
+        args = argparse.Namespace(board=['rig_ocd'], test=['echo'], roster=str(self.roster), record_dir=str(self.dir),
+                                  run_dir=str(self.dir / 'run'), staged=None)
+
+        class ReportError(Exception):
+            pass
+        self.A.report.ReportError = ReportError
+        self.A.report.publish.side_effect = ReportError('replace: disk full')
+        for outcome, code in (('repaired', 0), ('withdrawn', 1), ('removed', 1), ('unresolved', 1), ('refused', 1)):
+            self.A.report.recover_publish.return_value = argparse.Namespace(outcome=outcome, problems=[])
+            with self.subTest(outcome=outcome), mock.patch.object(H, 'run_board', return_value=dict(row)), \
+                    mock.patch.object(H.shutil, 'which', return_value='/bin/x'), \
+                    contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(H.cmd_run(args), code)
+                got = json.loads(out.getvalue())
+                self.assertEqual((got['pass'], got['exitCode'], got['reportPath'] is None),
+                                 (code == 0, code, outcome != 'repaired'))
+                self.assertIn(f'recovery {outcome}', got['reportError'])
+
     def test_run_refuses_a_missing_flasher_tool_before_hardware(self):
         args = argparse.Namespace(board=['rig_esp'], test=None, roster=str(self.roster), record_dir=str(self.dir),
                                   run_dir=None, staged=None)

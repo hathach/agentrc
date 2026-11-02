@@ -809,6 +809,9 @@ def cmd_run(args):
         recovery = A.report.recover_publish(run_root, sch, attempt, e)
         out['reportPath'] = str(run_root / 'hil_report.json') if recovery.outcome == 'repaired' else None
         out['reportError'] = f'{e}; recovery {recovery.outcome}: {recovery.problems}'
+        if recovery.outcome != 'repaired':   # no report of this run stands: it cannot pass
+            code = max(code, 1)
+            out.update({'pass': False, 'exitCode': code})
     emit(out)
     return code
 
