@@ -104,6 +104,15 @@ class LsusbtTest(unittest.TestCase):
         self.assertIn('        |__ Port 003: Dev 013: [12M] Silicon Labs CP210x [3ea619acd1cdeb11a0a0b806e93fd3f1] '
                       'esp32s3 flasher', self.run_lsusbt())
 
+    def test_a_registered_board_reporting_an_alias_is_labeled(self):
+        for roster_uid in ('0C81464124010B20FF0A08CC2C', '0C81464124010B20FF0A08CC2C000000'):
+            with self.subTest(roster_uid=roster_uid):
+                self.json.write_text(json.dumps({'boards': [{'name': 'max32', 'uid': roster_uid}]}))
+                for serial in ('0C81464124010B20FF0A08CC2C', '0C81464124010B20FF0A08CC2C000000'):
+                    (self.sysfs / '1-13' / 'serial').write_text(f'{serial}\n')
+                    self.assertIn(f'        |__ Port 003: Dev 013: [12M] Silicon Labs CP210x [{serial}] max32 device',
+                                  self.run_lsusbt())
+
     def test_a_roster_carrying_a_registered_boards_flasher_fails(self):
         self.json.write_text(json.dumps({'boards': [{'name': 'esp32s3', 'uid': '84F703C084E4',
                                                      'flasher': {'name': 'esptool', 'uid': 'x'}}]}))

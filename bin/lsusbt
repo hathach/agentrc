@@ -9,9 +9,9 @@
 #
 # It also maps each serial back to the TinyUSB HIL board it belongs to, using the
 # uids recorded in a boards JSON (default: $HOME/code/tinyusb/test/hil/tinyusb.json).
-# A serial matching a board's `uid` is that board acting as a USB device; one
-# matching its `flasher.uid` (agentrc's board registry gives it) is that board's
-# flasher/debugger. Matches append
+# A serial matching a board's `uid` (for a registered board, its registry key or any
+# alias) is that board acting as a USB device; one matching its `flasher.uid`
+# (agentrc's board registry gives it) is that board's flasher/debugger. Matches append
 # `<board> device` or `<board> flasher`.
 #
 # By default only the lines that resolved to a board are printed, plus root hubs and
@@ -75,11 +75,15 @@ strip() {
 declare -A LABEL
 if [ -f "$JSON" ]; then
   command -v jq >/dev/null 2>&1 || { echo "lsusbt: jq is needed to read $JSON" >&2; exit 1; }
-  resolved=$(python3 "$(dirname "$(readlink -f "$0")")/../skills/hil/scripts/hil_boards.py" roster "$JSON") ||
+  hil=$(dirname "$(readlink -f "$0")")/../skills/hil
+  resolved=$(python3 "$hil/scripts/hil_boards.py" roster "$JSON") ||
     { echo "lsusbt: cannot resolve boards from $JSON" >&2; exit 1; }
-  labels=$(jq -r '
+  # A registered board's device serial may be its registry key or any alias, matched as hil_boards.lookup() does.
+  labels=$(jq -r --slurpfile reg "$hil/boards.json" '
+    [$reg[0].boards | to_entries[] | [.key] + (.value.aliases // [])] as $ids |
     .boards[] | .name as $n |
-    (if .uid         then [.uid,         $n + " device"]  | @tsv else empty end),
+    (if .uid then (.uid as $u | (first($ids[] | select(any(.[]; . == $u))) // [$u])[]
+                  | [., $n + " device"] | @tsv) else empty end),
     (if .flasher.uid then [.flasher.uid, $n + " flasher"] | @tsv else empty end)
   ' <<< "$resolved") || { echo "lsusbt: cannot parse boards from $JSON" >&2; exit 1; }
   while IFS=$'\t' read -r uid label; do
