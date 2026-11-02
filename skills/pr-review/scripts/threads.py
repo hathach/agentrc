@@ -64,17 +64,12 @@ def record(kind, c, **extra):
             'createdAt': c.get('created_at') or c.get('submitted_at'), 'ours': False, **extra}
 
 
-def collect(argv):
-    p = Parser(prog='threads.py')
-    p.add_argument('--pr', type=int, required=True)
-    p.add_argument('--out', required=True)
-    p.add_argument('--repo')
-    a = p.parse_args(argv)
-    repo = repo_of(a.repo)
-    reviews = pages(f'repos/{repo}/pulls/{a.pr}/reviews')
-    inline = pages(f'repos/{repo}/pulls/{a.pr}/comments')
-    issue = pages(f'repos/{repo}/issues/{a.pr}/comments')
-    ordered = threads(repo, a.pr)
+def snapshot(repo, pr):
+    """The PR's comments and threads as FILE holds them."""
+    reviews = pages(f'repos/{repo}/pulls/{pr}/reviews')
+    inline = pages(f'repos/{repo}/pulls/{pr}/comments')
+    issue = pages(f'repos/{repo}/issues/{pr}/comments')
+    ordered = threads(repo, pr)
     where = {i: (t['threadId'], t['resolved'], t['outdated']) for t in ordered for i in t['commentIds']}
     login = gh_json('api', 'user')['login']
     ours = {r['id'] for r in reviews if MARKER in (r.get('body') or '') and (r.get('user') or {}).get('login') == login}
@@ -86,7 +81,18 @@ def collect(argv):
                           threadId=tid, resolved=resolved, outdated=outdated,
                           ours=c.get('pull_request_review_id') in ours))
     out += [record('issue', c) for c in issue]
-    text = json.dumps({'repo': repo, 'pr': a.pr, 'viewer': login, 'comments': out, 'threads': ordered}, indent=1) + '\n'
+    return {'repo': repo, 'pr': pr, 'viewer': login, 'comments': out, 'threads': ordered}
+
+
+def collect(argv):
+    p = Parser(prog='threads.py')
+    p.add_argument('--pr', type=int, required=True)
+    p.add_argument('--out', required=True)
+    p.add_argument('--repo')
+    a = p.parse_args(argv)
+    snap = snapshot(repo_of(a.repo), a.pr)
+    out = snap['comments']
+    text = json.dumps(snap, indent=1) + '\n'
     Path(a.out).write_text(text, encoding='utf-8')
     kinds = {}
     for c in out:

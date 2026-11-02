@@ -278,8 +278,16 @@ def resolve_due(led, snapshot):
                 replied.pop(f['id'], None)
                 mark.pop(f['id'], None)
     due, held = {}, []
+    fixes = repairs(led)
     for f in rev.get('findings', []):
         t = roots.get(f.get('commentId'))
+        fix = fixes.get((f['id'], f.get('commentId')))
+        if fix and t and fix['state'] == 'published' and fix['replyId'] in t['commentIds']:
+            replied[f['id']] = True
+        if fix and t and (fix['resolve'] == 'sent' or fix['resolve'] in ('resolved', 'observed') and not t['resolved']):
+            held.append({'findingId': f['id'], 'commentId': f['commentId'],
+                         'why': 'resolve unconfirmed' if fix['resolve'] == 'sent' else 'reopened after it was resolved'})
+            continue
         if f['status'] in OPEN or not t or t['resolved']:
             continue
         if mark.get(f['id']) in ('sent', 'resolved', 'observed'):
@@ -290,13 +298,15 @@ def resolve_due(led, snapshot):
     return due, held
 
 
-def open_row(f, due):
+def open_row(f, due, fixes=None):
     sev = level(f.get('severity'))
+    fix = (fixes or {}).get((f['id'], f.get('commentId')))
     return {'id': f['id'], 'status': f['status'], 'file': f['file'], 'line': f['line'],
             'severity': sev, 'priority': priority(sev), 'confidence': f.get('confidence'),
             'impact': f.get('impact'), 'severityReason': f.get('severityReason'),
             'why': f['why'], 'commentId': f.get('commentId'), 'defect': f.get('defect'),
-            'resolveDue': due.get(f['id'])}
+            'resolveDue': due.get(f['id']),
+            'repair': fix and fix['state'] == 'published' and {'head': fix['head'], 'resolved': fix['resolve'] in ('resolved', 'observed')} or None}
 
 
 def show(led, finding=None, draft=False, snapshot=None, pending=False):
@@ -332,7 +342,8 @@ def show(led, finding=None, draft=False, snapshot=None, pending=False):
         'reviews': len(led['reviews']),
         'last': {k: rev.get(k) for k in ('head', 'mergeBase', 'mode', 'status', 'reviewedAt')} | {'event': rev['verdict']['event']},
         'answers': answers,
-        'open': sorted((open_row(f, due) for f in rev.get('findings', []) if f['status'] in OPEN or f['id'] in due), key=by_severity),
+        'open': sorted((open_row(f, due, repairs(led)) for f in rev.get('findings', []) if f['status'] in OPEN or f['id'] in due),
+                       key=by_severity),
         **({'heldThreads': held} if snapshot else {}),
     }
 
@@ -390,8 +401,20 @@ def answered_ids(led):
     for r, _ in publications(led):
         rec = r.get('receipts') or {}
         ids |= {x.get('replyId') for x in rec.get('staged') or [] if x.get('state') in ('published', 'edited')}
+    # A repair note settles pushback only once its resolve saw none: one deferred by a reply must not hide that reply.
+    ids |= {x['replyId'] for x in repairs(led).values() if x['state'] == 'published' and x['resolve'] in ('resolved', 'observed')}
     ids.discard(None)
     return ids
+
+
+def repairs(led):
+    """{(finding id, root comment id): the latest repair note record}: post.py --fixed's, across our reviews."""
+    return {(x['findingId'], x['commentId']): x for r in reached(led) for x in r.get('repairs', [])}
+
+
+def claim(f):
+    """The text a repair is judged against: the comment as the human edited it, else the finding's own words."""
+    return f.get('published') or f['why']
 
 
 def pushback(replies, answered, viewer):
@@ -441,14 +464,8 @@ def published_at(led, f):
     return None
 
 
-def fixable(led, snapshot, head):
-    online = [x for x, _ in publications(led) if x['status'] in ONLINE]
-    if online:
-        raise Unusable(f"a {online[-1]['status']} publication for {online[-1]['head']} is not settled, so the last review on the PR "
-                       'is unknown: reconcile it first')
-    rev = last(led)
-    if not rev or rev['head'] != head or not ((rev.get('receipts') or {}).get('review') or {}).get('submitted'):
-        raise Unusable(f"the last review on the PR is {rev and rev['head']} ({rev and rev['status']}), not one submitted on {head}")
+def holder(led, snapshot):
+    """hold(f): why a standing finding is not ours to repair as the snapshot shows the PR, or None."""
     viewer = viewer_of(snapshot)
     live = {(c['kind'], c['id']): c for c in snapshot.get('comments', [])}
     roots = thread_roots(snapshot)
@@ -473,7 +490,18 @@ def fixable(led, snapshot, head):
         if t is None or any(('review', i) not in live for i in t['commentIds']):
             raise Unusable(f"the threads file does not hold {f['id']}'s whole thread: rerun threads.py")
         return 'replied' if pushback([live[('review', i)] for i in t['commentIds'][1:]], known, viewer) else None
+    return hold
 
+
+def fixable(led, snapshot, head):
+    online = [x for x, _ in publications(led) if x['status'] in ONLINE]
+    if online:
+        raise Unusable(f"a {online[-1]['status']} publication for {online[-1]['head']} is not settled, so the last review on the PR "
+                       'is unknown: reconcile it first')
+    rev = last(led)
+    if not rev or rev['head'] != head or not ((rev.get('receipts') or {}).get('review') or {}).get('submitted'):
+        raise Unusable(f"the last review on the PR is {rev and rev['head']} ({rev and rev['status']}), not one submitted on {head}")
+    hold = holder(led, snapshot)
     fix, held = [], []
     for f in rev.get('findings', []):
         if f['status'] in OPEN:
@@ -481,7 +509,8 @@ def fixable(led, snapshot, head):
             if why:
                 held.append({'findingId': f['id'], 'commentId': f.get('commentId'), 'why': why})
             else:
-                fix.append({**open_row(f, {}), 'published': f.get('published')})  # the text the PR shows, as the human edited it
+                # The text the PR shows, as the human edited it, and the digest a repair's fix check names.
+                fix.append({**open_row(f, {}), 'published': f.get('published'), 'claimDigest': digest(claim(f))})
     return {'fix': sorted(fix, key=by_severity), 'held': held,
             'autoPost': not any(h['why'] in ('unmapped', 'deleted', 'edited') for h in held)}
 
