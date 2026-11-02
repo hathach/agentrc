@@ -473,6 +473,8 @@ const comments = [...items.map((x, i) => {
   path: f.file, line: f.line, finding: carriedOut.indexOf(f),
   // A comment the human edited is restated as they left it.
   body: `${earlier[f.id].published || template(f.severity, whyOf(f))}\n- The repair in ${repairedOf(f).head.slice(0, 12)} did not fix this; its earlier thread was resolved.`,
+  // No check sees it, and off the diff its first line drops the repair line and any qualification below.
+  firstLineUnchecked: true,
 }))]
 const long = [...comments.filter(c => overLength(c.body, LIMIT.comment)).map(c => `${c.path}:${c.line}`), ...answers.filter(x => overLength(x.a.body, LIMIT.answer)).map(x => `answer on ${x.finding}`)]
 if (long.length) log(`over length, for the human to shorten: ${long.join(', ')}`)

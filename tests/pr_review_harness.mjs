@@ -559,7 +559,8 @@ test('a finding an auto-fix repair noted gets no second fix note, and one still 
   assert.deepEqual(unsure.result.draft.replies, [], 'an unconfirmed note is reconciled, never noted twice')
   const still = await run(inc, { ledger: repaired(done), recheck: () => ({ state: 'open', reason: 'still overruns' }), check: pinned(inc) })
   assert.deepEqual(still.result.draft.comments, [{ path: 'src/core/a.c', line: 10, finding: 0,
-    body: '**high**: overrun past the buffer end\n- The repair in cccccccccccc did not fix this; its earlier thread was resolved.' }])
+    body: '**high**: overrun past the buffer end\n- The repair in cccccccccccc did not fix this; its earlier thread was resolved.', firstLineUnchecked: true }],
+    'no check verified its first line, which is all the body shows of it off the diff')
   assert.equal(still.result.findings[0].id, 'pr7-f1', 'raised again under its own id')
   const edited = repaired(done)
   edited.open[0].published = '**high**: overrun past the end of buf'

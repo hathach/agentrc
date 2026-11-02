@@ -2611,6 +2611,13 @@ class Repair(PostCase):
         self.reviewed = self.fixed_head  # the recheck is now the review a repair answers
         self.assertEqual(self.fixed()['repairs'][0]['error'], 'no thread: it stands in the review body')
 
+    def test_a_finding_raised_again_off_the_diff_holds_auto_post_for_its_dropped_lines(self):
+        self.fixed()
+        body = '**high**: b is uninitialised.\n- Only when mode is enabled.\n- The repair in cccccccccccc did not fix this; its earlier thread was resolved.'
+        with self.assertRaisesRegex(facts.Unusable, r'first line no check verified \(src/core/a\.c:1\)'):
+            self.recheck([{'path': 'src/core/a.c', 'line': 1, 'body': body, 'finding': 0, 'firstLineUnchecked': True}])
+        self.assertEqual(self.review()['receipts'].get('review'), None, 'nothing posted')
+
     def test_a_saved_draft_never_resolves_a_repaired_thread_reopened_since(self):
         self.fixed()
         sh(self.clone, 'git', 'fetch', '--quiet', 'origin', f'refs/pull/{PR}/head')
