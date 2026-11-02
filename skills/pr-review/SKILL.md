@@ -21,7 +21,7 @@ python3 "$S/threads.py" --pr N --out FILE                         # every commen
 python3 "$S/ledger.py" show --pr N [--finding ID | --draft | --pending | --threads FILE [--head SHA]]  # standing findings, unpublished answers; --draft: the saved review; --pending: the newest one not yet submitted or confirmed, which plain show never lists; --head: replies on our threads still to judge
 python3 "$S/ledger.py" show --pr N --fixable --threads FILE --head SHA  # what an auto-fix repair may take from the review submitted on SHA
 python3 "$S/ledger.py" save --pr N --output FILE [--reason TEXT]  # a finished launch's result, as a pending draft
-python3 "$S/post.py" --pr N --expected-head SHA [--auto]         # a pending GitHub review; --auto: submit it
+python3 "$S/post.py" --pr N --expected-head SHA [--auto [--defer-answers]]  # a pending GitHub review; --auto: submit it; --defer-answers: keep its answers for a later plain run
 python3 "$S/post.py" --pr N --expected-head SHA --decline --reason TEXT
 python3 "$S/post.py" --pr N --sync                                # record what the human did on GitHub (prepare runs it)
 python3 "$S/result.py" --output FILE                              # a launch, condensed: counts, never bodies
@@ -45,8 +45,10 @@ the mode: `full` on a first review or after a force-push or rebase,
 unchanged, `same` when this head was reviewed already. On `same`, launch in
 `discussion` mode, which only judges new replies on our threads and returns
 `nothing-new` when there are none; `full` reviews the head again instead, saved
-with the request's words as `--reason`. An `overCap` answer merged everything
-into one group: report it and launch.
+with the request's words as `--reason`. Under `auto-fix`, a discussion run
+repairs nothing, since step 6 of §4 needs a review this run submitted: a repair
+of an already-reviewed head takes `auto-fix full`. An `overCap` answer merged
+everything into one group: report it and launch.
 
 A sibling tree is locked for the run, so worktree-remove's cleanup of the
 checkout keeps it; `lock.token` names the lock. Pass `--token <it>` to a repeated prepare for the
@@ -108,7 +110,8 @@ since the same head otherwise gets only a discussion run. Under `auto-fix`, also
 the head repository and branch, said plainly to be the contributor's branch for
 a fork, prepare's `repair` state and why (`unknown` is not `unavailable`), and
 that the run reviews, repairs, validates and rechecks the PR within
-pr-babysit's cycle accounting.
+pr-babysit's cycle accounting, or, on `same`, that it repairs nothing and
+`auto-fix full` would.
 
 ## 3. Publishing
 
@@ -124,7 +127,8 @@ Auto-post, when the request names it: the review is submitted as `COMMENT` or
 threads whose fix a recheck verified. It is the same pending review, submitted
 by `post.py` once its head and fix notes check out; otherwise it is handed to
 the human as a pending review (`handedOver`). Answers to pushback (a concession
-or a rebuttal) are never submitted: they go into a pending review for the human.
+or a rebuttal) are never submitted: they go into a pending review for the human,
+under auto-fix only once the repair ends (§4 step 6).
 Pushback is a human's reply on one of our threads; a bot's reply there is not
 judged. For a headless chief, the human's request naming auto-post is the grant
 under `agents/chief.md`'s PR review exception, carried as §4 says.
@@ -133,7 +137,8 @@ its head branch, the contributor's when the PR is from a fork, and rechecks it
 (§4 step 6), under the same exception, which bounds it. A recheck review the
 ledger cannot vouch for (`ledger.py show --fixable`'s `autoPost` false) stays
 pending for the human. One repair round: what the recheck finds new is
-reported, and repairing it needs a new request.
+reported, and repairing it needs a new request, with `full` while the head is
+still the rechecked one (§1).
 
 ## 4. Launch
 
@@ -172,14 +177,21 @@ sequence:
 4. `result.py --output <the launch's output file>`; when its `status` is
    `reviewed`, `ledger.py save --pr N --output <it>`. Any other status saves
    and posts nothing: step 7 reports it with its reason.
-5. The session leading the review runs `post.py` (pending) or `post.py --auto`
-   (auto-post) itself, never through a unit, with `--expected-head`; a
+5. The session leading the review runs `post.py` (pending), `post.py --auto`
+   (auto-post) or `post.py --auto --defer-answers` (auto-fix) itself, never
+   through a unit, with `--expected-head`; a
    `discussion` run always takes plain `post.py`, since its answers only go
    into a pending review. Its exit 1 names what it could not confirm.
 6. Auto-fix, only once step 5 reports `posted`; a failed, partial, uncertain
-   or handed-over post ends it there:
+   or handed-over post ends it there. Its answers to pushback, `answers`
+   `deferred`, stay off the PR meanwhile: while a pending review of ours is
+   open, `ledger.py show --fixable` and the recheck's prepare refuse, and GitHub
+   refuses the repair's replies. When step 6 ends with the PR head still the
+   reviewed one, plain `post.py --expected-head <reviewed head>` puts them in a
+   pending review before step 7; on a moved head the recheck, or the next
+   review, judges that pushback again. Then:
    1. `repair.state` other than `available`: report "review submitted;
-      auto-fix blocked" with its `why`, and go to step 7.
+      auto-fix blocked" with its `why`, and step 6 ends.
    2. `threads.py`, then `ledger.py show --fixable` on the reviewed head, and
       `prepare.py --check` on it: a moved head ends the repair ("head moved
       before repair"). Chief's writer path fixes the `fix` findings its fix
@@ -193,12 +205,17 @@ sequence:
       reviewer and trigger arguments, relaunched under chief's rules until it
       ends, its own repairs reviewed under the completion rule. A crash with
       repairs unpublished resumes this task with them, never a new prepare.
-   4. Recheck once the PR head is the one pr-babysit left: `prepare.py --pr N`
+   4. Recheck once the PR head is the one pr-babysit left, its last launch
+      reading's `checkout.head`. When that is still the reviewed head and
+      answers were deferred, step 6 ends with their publication instead, since
+      prepare refuses a head with a pending draft. Otherwise `prepare.py --pr N`
       from the launcher's checkout top level, with `--token <it>` when
-      `lock.token` is set. `same` with no new reply ends it; `same` with
-      replies takes a `discussion` run, pending; any other mode takes steps 1
-      to 4 on the new head, its hardware rows from runs on that head, then
-      `threads.py` and `ledger.py show --fixable` on the reviewed head again:
+      `lock.token` is set: its `head` other than that one stops the recheck
+      before anything is posted ("head moved after repair"), and step 8
+      releases the lock. `same` with no new reply ends it; `same` with replies
+      takes a `discussion` run, pending; any other mode takes steps 1 to 4 on
+      the new head, its hardware rows from runs on that head, then `threads.py`
+      and `ledger.py show --fixable` on the reviewed head again:
       `autoPost` true takes `post.py --auto` on the new head, else plain
       `post.py`, naming the held findings. A blocker prepare or post names is
       reported, never worked around.

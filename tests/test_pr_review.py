@@ -1860,6 +1860,51 @@ class Pushback(PostCase):
         self.post()
         self.assertEqual(len(self.gh.posts), 3, 'a rerun finds the answers\' pending review, never a second one')
 
+    def test_auto_fix_defers_the_answers_so_the_repair_may_list_its_findings_then_plain_post_publishes_them(self):
+        rec = self.dispute('upheld', {'body': 'Still stands.', 'resolve': False})
+        self.comment(950, 'contrib', 'intentional')
+        self.save(self.result_for(self.p, findings=[{'id': 'pr7-f1', 'status': 'upheld', 'disputes': [rec]},
+                                                    {'file': 'src/core/a.c', 'line': 1, 'why': 'a shadows a global', 'severity': 'medium',
+                                                     'dimension': 'correctness', 'status': 'open'}],
+                                  draft={'event': 'COMMENT', 'body': 'Again.', 'replies': [],
+                                         'comments': [{'path': 'src/core/a.c', 'line': 1, 'body': 'a shadows a global', 'finding': 1}]}),
+                  reason='again')
+        out = self.post('--auto', '--defer-answers')
+        self.assertEqual((out['status'], out['answers']), ('posted', {'status': 'deferred'}))
+        self.assertEqual((len(self.gh.posts), self.adds()), (2, []), 'no pending review holds the answers')
+        with mock.patch.object(post, 'collect', return_value=out), mock.patch('sys.stdout'):
+            self.assertEqual(post.main([]), 0)
+        snap = self.tmp / 'threads.json'
+        self.call(threads, ['--pr', str(PR), '--repo', REPO, '--out', str(snap)])
+        got = self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--fixable', '--threads', str(snap), '--head', self.head])['fixable']
+        self.assertEqual(([f['id'] for f in got['fix']], [h['why'] for h in got['held']]), (['pr7-f2'], ['replied']))
+        with self.assertRaisesRegex(facts.Unusable, 'a pending draft'):
+            self.prepare()
+        out = self.post()
+        self.assertEqual((out['status'], [(e['kind'], e['state']) for e in out['staged']]), ('drafted', [('answer', 'staged')]))
+        with self.assertRaisesRegex(facts.Unusable, '--defer-answers goes with --auto'):
+            self.post('--defer-answers')
+
+    def test_deferred_answers_leave_the_recheck_free_and_are_judged_again_on_the_repaired_head(self):
+        rec = self.dispute('upheld', {'body': 'Still stands.', 'resolve': False})
+        self.comment(950, 'contrib', 'intentional')
+        self.save(self.result_for(self.p, findings=[{'id': 'pr7-f1', 'status': 'upheld', 'disputes': [rec]}],
+                                  draft={'event': 'COMMENT', 'body': 'Again.', 'comments': [], 'replies': []}), reason='again')
+        self.assertEqual(self.post('--auto', '--defer-answers')['answers'], {'status': 'deferred'})
+        self.commit('src/core/c.c', 'int c;\n', 'repair')
+        self.head = self.push_pr()
+        p = self.prepare()
+        self.assertEqual(p['mode'], 'incremental')
+        self.assertEqual([d['findingId'] for d in self.disputes(self.snapshot((950, 'contrib', 'intentional', False)))], ['pr7-f1'],
+                         'the pushback is judged again on the repaired head')
+        rec = self.dispute('upheld', {'body': 'Still stands after the repair.', 'resolve': False})
+        self.save(self.result_for(p, findings=[{'id': 'pr7-f1', 'status': 'upheld', 'disputes': [rec]}],
+                                  draft={'event': 'COMMENT', 'body': 'Recheck.', 'comments': [], 'replies': []}))
+        out = self.post('--auto')
+        self.assertEqual((out['status'], out['answers']['status']), ('posted', 'drafted'))
+        self.assertEqual([[p['head'] == self.head, p['status']] for p, r in ledger.publications(self.led()) if p is not r],
+                         [[False, 'pending'], [True, 'drafted']], 'the earlier head\'s answers are never published on this one')
+
 
 class Threads(Case):
     def test_every_comment_with_its_thread_and_ours_marked(self):

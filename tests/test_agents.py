@@ -178,9 +178,10 @@ class AgentFiles(unittest.TestCase):
                        '`replySettlements: [{ commentId, commentDigest, replyId, bodyDigest, headSha }]`'):
             self.assertIn(phrase, takeover)
         review = body.split('Exception for a headless PR review launch:')[1].split('Standing exception for pr-review pending reviews:')[0]
-        for phrase in ("the human's own message asking pr-review to review a PR with auto-post, carried and accepted under the headless PR launch exception's provenance",
+        for phrase in ("the human's own message asking pr-review to review a PR with auto-post or auto-fix, carried and accepted under the headless PR launch exception's provenance",
                        'A relaunch of the same unfinished review on the same head first reconciles any earlier post',
                        'never submitting a second review',
+                       '`post.py --auto`, or under auto-fix a plain `post.py` once the repair ends, puts those in a pending review',
                        "With auto-fix, the same message, under the headless PR launch exception above, also grants pr-babysit on that PR",
                        'submitted the same way only while `ledger.py show --fixable` allows it, else created pending',
                        'a further repair of newly found findings needs a new request',
@@ -201,6 +202,14 @@ class AgentFiles(unittest.TestCase):
                        'a failed, partial, uncertain or handed-over post ends it there',
                        'report "review submitted; auto-fix blocked"', 'never a `held` one',
                        'A crash with repairs unpublished resumes this task with them, never a new prepare',
+                       'Under `auto-fix`, a discussion run repairs nothing', 'a repair of an already-reviewed head takes `auto-fix full`',
+                       '`post.py --auto --defer-answers` (auto-fix)',
+                       '`ledger.py show --fixable` and the recheck\'s prepare refuse, and GitHub refuses the repair\'s replies',
+                       'plain `post.py --expected-head <reviewed head>` puts them in a pending review before step 7',
+                       'step 6 ends with their publication instead, since prepare refuses a head with a pending draft',
+                       "Recheck once the PR head is the one pr-babysit left, its last launch reading's `checkout.head`",
+                       'its `head` other than that one stops the recheck before anything is posted ("head moved after repair"), '
+                       'and step 8 releases the lock',
                        'resolved threads do not clear it'):
             self.assertIn(phrase, skill)
         self.assertIn('pushed SHAs, posted comment IDs and resolved thread IDs', body)
