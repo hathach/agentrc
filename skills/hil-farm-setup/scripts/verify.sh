@@ -151,6 +151,7 @@ for name in "${RUNNERS[@]}"; do
     done <<<"$want_env"
   fi
   check "$name runner .path is farm.toml's" test "$(cat "$RUNNER_DIR/.path")" = "$runner_path"
+  check "$name runner unit UMask 0022" test "$(systemctl show -p UMask --value "$RUNNER_UNIT")" = 0022
   if shared_host; then
     check "$name runner unit hides $ADMIN_HOME" \
       test "$(systemctl show -p InaccessiblePaths --value "$RUNNER_UNIT")" = "$ADMIN_HOME"

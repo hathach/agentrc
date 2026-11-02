@@ -195,6 +195,13 @@ class TestVerify(unittest.TestCase):
         self.assertIn('FAIL  tinyuf2 runner _work ghrunner-tinyuf2:ghrunner-tinyuf2 0750', out)
         self.assertNotIn('runner service active', self.verify('--maintenance').stdout)
 
+    def test_a_runner_unit_must_keep_umask_0022(self):
+        self.register('tinyusb')
+        for umask, want in (('0022', 'ok   '), ('0002', 'FAIL ')):
+            with self.subTest(umask=umask):
+                self.stub('systemctl', f'[ "$1" = show ] && [ "$3" = UMask ] && echo {umask}')
+                self.assertIn(f'{want} tinyusb runner unit UMask 0022', self.verify().stdout)
+
     def test_env_lines_that_cannot_be_generated_fail(self):
         self.register('tinyusb')
         with open(self.dir / 'common.sh', 'a') as f:

@@ -12,7 +12,10 @@ no developer credentials. Up to two runners run CI jobs, each as its own user wi
 
 Each runner root `/opt/actions-runner/<runner>` and its `_work` and `_diag` belong to that runner's group, which holds
 the admin too from its next login (tinyuf2's remote driver reads `_work/tinyuf2/hil-state` over ssh); others, the
-other runner included, get nothing. TinyUF2 compiles on GitHub-hosted runners, so the farm carries no toolchain for it.
+other runner included, get nothing. In `_work` and `_diag` the admin only reads: the units' `UMask=0022` keeps what
+a job creates group-read-only, so an admin session cannot leave files there the next job cannot remove; hands-on work
+runs from the admin's own checkout, never a runner's. TinyUF2 compiles on GitHub-hosted runners, so the farm carries
+no toolchain for it.
 
 `scripts/farm.toml` pins every tool: version, URL, sha256 or full git commit, install links and a version check.
 `scripts/farm.py` installs from it into `/opt/hil-farm/tools/<name>/` and verifies the result; `scripts/setup.sh`
@@ -140,8 +143,8 @@ Install only after the owner agreed, with any legacy runner service stopped and 
 4. `S=/usr/local/src/agentrc/skills/hil-farm-setup; sudo $S/scripts/setup.sh update --host $S/hosts/<host>.toml
    <tool>` (or no tool for all of them; add `--inputs DIR` when STM32CubeProgrammer changed). `--host` every time
    applies any change to the host's file, and is a no-op otherwise. It refuses while a runner runs and touches only
-   tools, firmware, udev rules and the environment files; a tool is switched only after its new install passes its
-   check, and old installs stay in `/opt/hil-farm/tools/<name>/`.
+   tools, firmware, udev rules, the environment files and the runner units; a tool is switched only after its new
+   install passes its check, and old installs stay in `/opt/hil-farm/tools/<name>/`.
 5. `sudo /opt/hil-farm/verify.sh --maintenance`, then `sudo systemctl start` the registered runner units (reboot first
    if the firmware changed) and `sudo /opt/hil-farm/verify.sh`.
 

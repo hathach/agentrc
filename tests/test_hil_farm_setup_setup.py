@@ -120,6 +120,19 @@ class TestSetup(unittest.TestCase):
                 self.assertEqual((self.hooks / f).stat().st_mode & 0o777, 0o755)
         self.assertFalse((self.hooks / 'job-started.sh').exists())
 
+    def test_update_rewrites_every_runner_unit(self):
+        setup = self.dir / 'setup.sh'
+        setup.write_text(setup.read_text().replace('preflight() {', 'preflight() { return 0; }\nunused() {')
+                         .replace('  farm "$@" ${INPUTS:+--inputs "$INPUTS"}\n',
+                                  '  farm "$@" ${INPUTS:+--inputs "$INPUTS"}\n  return 0\n')
+                         .replace('farm() { python3 -I "$B/farm.py" "$@"; }',
+                                  'farm() { [ "$1" = host-sh ] && python3 -I "$B/farm.py" "$@"; return 0; }')
+                         .replace('    install_rules\n    install_job_hook\n', '')
+                         .replace('setup_runner_service() (', 'setup_runner_service() { echo "unit $1"; }\nunused() ('))
+        r = self.setup('update')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('unit tinyusb\nunit tinyuf2\n', r.stdout)
+
     def test_each_runner_env_points_at_its_own_hooks(self):
         for name in ('tinyusb', 'tinyuf2'):
             with self.subTest(name=name):
@@ -223,6 +236,7 @@ class TestSetup(unittest.TestCase):
                 unit = (self.tmp / 'etc' / 'units' / f'hil-runner-{name}.service').read_text()
                 self.assertIn(f'User={("ghrunner", "ghrunner-tinyuf2")[name == "tinyuf2"]}\n', unit)
                 self.assertIn('Requires=nftables.service\nConditionPathExists', unit)
+                self.assertIn('\nUMask=0022\n', unit)   # the admin, in its group, only reads job files
                 self.assertNotIn('BindsTo', unit)
                 self.assertNotIn('InaccessiblePaths', unit)
                 self.assertIn(f'--name lab-{name} --labels ', (self.tmp / 'config-args').read_text())

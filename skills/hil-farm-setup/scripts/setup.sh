@@ -339,7 +339,8 @@ ConditionPathExists=$RUNNER_DIR/.runner
 ExecStart=$RUNNER_DIR/runsvc.sh
 User=$RUNNER_USER
 WorkingDirectory=$RUNNER_DIR
-UMask=0002
+# the admin, in the runner's group, reads job files; group write would let it add files a job cannot remove
+UMask=0022
 # upstream's template uses KillMode=process, which leaves a job's flashers running
 KillMode=control-group
 TimeoutStopSec=5min$hide
@@ -423,7 +424,7 @@ case "$CMD" in
     install_tools update ${ARGS[@]+"${ARGS[@]}"}
     install_rules
     install_job_hook
-    for name in "${RUNNERS[@]}"; do install_hooks "$name"; done
+    for name in "${RUNNERS[@]}"; do setup_runner_service "$name"; done
     log "done; run $FARM_HOME/verify.sh --maintenance, then start the runner units (reboot first if firmware changed)"
     ;;
   runner)
