@@ -195,14 +195,15 @@ sequence:
       reviewer and trigger arguments, relaunched under chief's rules until it
       ends, its own repairs reviewed under the completion rule. A crash with
       repairs unpublished resumes this task with them, never a new prepare.
-   4. Recheck once the PR head is the one pr-babysit left: `prepare.py --pr N
-      --token <it>` from the launcher's checkout top level. `same` with no new
-      reply ends it; `same` with replies takes a `discussion` run, pending; any
-      other mode takes steps 3 and 4 on the new head, then `threads.py` and
-      `ledger.py show --fixable` on the reviewed head again: `autoPost` true
-      takes `post.py --auto` on the new head, else plain `post.py`, naming the
-      held findings. A blocker prepare or post names is reported, never
-      worked around.
+   4. Recheck once the PR head is the one pr-babysit left: `prepare.py --pr N`
+      from the launcher's checkout top level, with `--token <it>` when
+      `lock.token` is set. `same` with no new reply ends it; `same` with
+      replies takes a `discussion` run, pending; any other mode takes steps 1
+      to 4 on the new head, its hardware rows from runs on that head, then
+      `threads.py` and `ledger.py show --fixable` on the reviewed head again:
+      `autoPost` true takes `post.py --auto` on the new head, else plain
+      `post.py`, naming the held findings. A blocker prepare or post names is
+      reported, never worked around.
 7. Report the verdict and its reasons, the counts, coverage lost, the CI and
    HIL rows, the receipts, `post.py`'s `overLength` and the result's
    `heldThreads`; never the draft's text. Under auto-fix also the repair state,
