@@ -238,8 +238,8 @@ sequence:
       `post.py`, naming the held findings. A blocker prepare or post names is
       reported, never worked around.
 7. Report the verdict and its reasons, the counts, coverage lost, the CI and
-   HIL rows, the receipts, `post.py`'s `overLength` and the result's
-   `heldThreads`; never the draft's text. Under auto-fix also the repair state,
+   HIL rows, the receipts, `post.py`'s `overLength` and `firstLineUnchecked`
+   and the result's `heldThreads`; never the draft's text. Under auto-fix also the repair state,
    the held findings, the repair and pr-babysit receipts, the `--fixed`
    receipts, the recheck's post,
    and the review state GitHub shows (`gh pr view N --json
@@ -258,8 +258,8 @@ link, the proposed event and its reasons, and whether the review was submitted
 answers or a `handedOver` review included), or nothing was posted and why. A
 pending review holds its thread answers beside the replies they answer
 (`ledger.py show` lists each with the recheck's reason and the thread's link). Name each text in `overLength` (and
-`answers.overLength` under `--auto`) for the human to shorten before
-submitting. They edit, delete or add, pick the
+`answers.overLength` under `--auto`) for the human to shorten, and each body
+line in `firstLineUnchecked` for them to check, before submitting. They edit, delete or add, pick the
 event and submit, or delete the whole review. The next `prepare.py` records
 the outcome: a deleted comment drops its finding; an edited one stands, and
 its next recheck reads the text published; a concession withdraws its finding
@@ -295,3 +295,7 @@ carries the earlier findings, replies and receipts.
   change touches it. On a pending review the human picks the event; auto-post
   never approves.
 - Review comments carry no footer or attribution.
+- The review body repeats no inline comment: at most one direction bullet,
+  blocker and dispute places, other reviewers' claims we confirmed by link or
+  place, CI and coverage only when they are not clean, the boards when any
+  ran, and one line per finding off the diff, its comment's first line.

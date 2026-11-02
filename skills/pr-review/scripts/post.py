@@ -20,9 +20,10 @@ threads (GraphQL addPullRequestReviewThreadReply), an answer only while the thre
 it was judged on and the answer still matches its digest. Nothing is public until the human submits it on
 GitHub, choosing the event; deleting a comment or reply before that declines it. The review is `drafted`.
 
-Text over its length limit, measured here (a comment moved into the body as the comment it was), is never cut: a
-pending review names it in overLength for the human to shorten, and --auto refuses to submit it; an answer
-counts only where it is published, never under --auto.
+Text over its length limit, measured here (a comment moved into the body as the line it posts, renderedLine; one
+saved before that form as the whole comment), is never cut: a pending review names it in overLength for the human to
+shorten, and --auto refuses to submit it; an answer counts only where it is published, never under --auto. A body
+line whose first line no check verified (firstLineUnchecked) is named the same way and also holds --auto.
 
 --auto takes the same path, refusing APPROVE: the pending review with its fix notes (never its answers), then,
 while the head is still the draft's and every note reads back, a submit with the draft's event (its intent stored
@@ -570,9 +571,10 @@ def too_long(text, limit):
 
 def over_length(led, review, answers=True):
     """What is too long for its limit, named for the human to shorten before submitting; a comment moved into the
-    body is measured as the comment it was."""
+    body is measured as the line it posts (renderedLine), or, saved before that form, as the whole comment it posts."""
     d = review['draft']
-    long = [f"{c['path']}:{c['line']}" for c in d['comments'] + d.get('moved', []) if too_long(c['body'], COMMENT_WORDS)]
+    long = [f"{c['path']}:{c['line']}" for c in d['comments'] + d.get('moved', [])
+            if too_long(c.get('renderedLine', c['body']), COMMENT_WORDS)]
     long += [f"fix note on {r['findingId']}" for r in d['replies'] if too_long(r['body'], REPLY_WORDS)]
     if answers:
         long += [f"answer on {f['id']}" for f, x in answers_of(led, review)
@@ -737,6 +739,12 @@ def receipt(x):
     return {k: x[k] for k in ('findingId', 'commentId', 'state', 'replyId', 'resolve', 'error')}
 
 
+def first_line_unchecked(review):
+    """Body entries whose first line, all the body shows of them, no check verified states the problem in full; an
+    inline comment shows whole."""
+    return [f"{c['path']}:{c['line']}" for c in review['draft'].get('moved', []) if c.get('firstLineUnchecked')]
+
+
 def collect(argv):
     p = Parser(prog='post.py')
     p.add_argument('--pr', type=int, required=True)
@@ -790,9 +798,13 @@ def collect(argv):
         event = review['draft']['event']
         if a.auto and event == 'APPROVE':
             raise Unusable('auto-post never approves; publish it without --auto for the human to submit')
-        long = over_length(led, review, answers=not a.auto)
-        if a.auto and long and review['status'] == 'pending':
-            raise Unusable(f"over-length text ({', '.join(long)}): publish it without --auto for the human to shorten")
+        long, unchecked = over_length(led, review, answers=not a.auto), first_line_unchecked(review)
+        if a.auto and review['status'] == 'pending':
+            if long:
+                raise Unusable(f"over-length text ({', '.join(long)}): publish it without --auto for the human to shorten")
+            if unchecked:
+                raise Unusable(f"comments whose first line no check verified ({', '.join(unchecked)}): publish it without --auto "
+                               'for the human to fix')
         rec = review['receipts']
         sent = bool((rec.get('review') or {}).get('sent')) and not (rec.get('review') or {}).get('verified')
         head = pr_head(repo, a.pr)
@@ -802,7 +814,8 @@ def collect(argv):
             raise Unusable(f'the PR head moved to {head}; the draft reviewed {a.expected_head}')
         login = gh_json('api', 'user')['login']
         if not a.auto:
-            return {**publish_draft(repo, a.pr, led, review, login, recovering, persist), 'overLength': long}
+            return {**publish_draft(repo, a.pr, led, review, login, recovering, persist), 'overLength': long,
+                    'firstLineUnchecked': unchecked}
         out = publish_auto(repo, a.pr, led, review, event, login, recovering, persist)
         answers = [p for p in review.get('answerPublications', []) if p.get('auto') and p['status'] in DRAFTS]
         if answers and review['status'] == 'posted' and not recovering:

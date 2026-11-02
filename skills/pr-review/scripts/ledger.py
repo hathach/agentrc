@@ -30,6 +30,8 @@ findings as show lists them, or null, since show itself lists only reviews that
 reached the PR. With --threads, a threads.py snapshot, it also lists each
 settled finding whose thread is still open and due to be resolved (resolveDue,
 resolve_due()), and in heldThreads those it never resolves again by itself;
+it marks inBody each finding the snapshot shows as a line of our review body,
+unedited, so a later review states it again only once that line is gone;
 --head adds the disputes on that head.
 
 --fixable, with a fresh threads.py snapshot, prints what an auto-fix repair may take from the review posted on
@@ -341,6 +343,7 @@ def show(led, finding=None, draft=False, snapshot=None, pending=False):
         return {'reviews': 0, 'last': None, 'open': []}
     due, held = resolve_due(led, snapshot) if snapshot else ({}, [])
     fixes = repairs(led)
+    shown = body_shown(led, snapshot) if snapshot else (lambda f: False)
     snapshots = {}
     answers = [{'findingId': f['id'], 'commentId': f.get('commentId'), 'state': d['state'], 'resolve': d['answer']['resolve'],
                 'body': d['answer']['body'], 'reason': d.get('reason'),
@@ -350,7 +353,8 @@ def show(led, finding=None, draft=False, snapshot=None, pending=False):
         'reviews': len(led['reviews']),
         'last': {k: rev.get(k) for k in ('head', 'mergeBase', 'mode', 'status', 'reviewedAt')} | {'event': rev['verdict']['event']},
         'answers': answers,
-        'open': sorted((open_row(f, due, fixes) for f in rev.get('findings', []) if f['status'] in OPEN or f['id'] in due), key=by_severity),
+        'open': sorted(({**open_row(f, due, fixes), **({'inBody': True} if shown(f) else {})}
+                        for f in rev.get('findings', []) if f['status'] in OPEN or f['id'] in due), key=by_severity),
         **({'heldThreads': held} if snapshot else {}),
     }
 
@@ -370,15 +374,19 @@ def added_lines(merge_base, head, path):
 
 
 def anchor(draft, merge_base, head):
-    """Comments on lines the diff does not show go into the body: GitHub refuses them inline."""
+    """Comments on lines the diff does not show go into the body, which GitHub refuses inline, one line each: the
+    place and the comment's first line, its one-sentence problem. The whole comment stays in `moved`."""
     inline, moved, cache = [], [], {}
     for c in draft['comments']:
         if c['path'] not in cache:
             cache[c['path']] = added_lines(merge_base, head, c['path'])
-        (inline if c['line'] in cache[c['path']] else moved).append(c)
+        if c['line'] in cache[c['path']]:
+            inline.append(c)
+        else:
+            moved.append({**c, 'renderedLine': f"- `{c['path']}:{c['line']}` {c['body'].split(chr(10))[0]}"})
     body = draft['body']
     if moved:
-        body += '\n\n' + '\n\n'.join(f"**{c['path']}:{c['line']}**: {c['body']}" for c in moved)
+        body = '\n\n'.join(x for x in (body, 'Not in an inline comment:\n' + '\n'.join(c['renderedLine'] for c in moved)) if x)
     return {**draft, 'body': body, 'comments': inline, 'moved': moved}
 
 
@@ -497,6 +505,16 @@ def published_at(led, f):
         if f.get('commentId') is None and any(c.get('findingId') == f['id'] for c in draft.get('moved', [])):
             return ('review-body', got['reviewId'], body_digest(body_of(r))) if got.get('reviewId') else None
     return None
+
+
+def body_shown(led, snapshot):
+    """shown(f): whether f is a line of a review body of ours that the snapshot shows as we posted it."""
+    bodies = {c['id']: c['digest'] for c in snapshot.get('comments', []) if c.get('kind') == 'review-body'}
+
+    def shown(f):
+        at = f.get('commentId') is None and published_at(led, f)
+        return bool(at and at[0] == 'review-body' and bodies.get(at[1]) == at[2])
+    return shown
 
 
 def holder(led, snapshot):
@@ -635,7 +653,8 @@ def save(led, result, reason):
         raise Unusable('a draft comment has an absolute path or a backslash; GitHub needs repository-relative paths with /')
     findings = number(led, result)
     try:
-        comments = [{'path': c['path'], 'line': c['line'], 'body': c['body'], 'findingId': findings[c['finding']]['id']}
+        comments = [{'path': c['path'], 'line': c['line'], 'body': c['body'], 'findingId': findings[c['finding']]['id'],
+                     **({'firstLineUnchecked': True} if c.get('firstLineUnchecked') else {})}
                     for c in result['draft']['comments']]
     except (KeyError, IndexError, TypeError):
         raise Unusable('a draft comment names no finding of the result')

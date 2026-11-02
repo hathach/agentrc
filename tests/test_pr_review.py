@@ -815,7 +815,7 @@ class Ledger(Case):
         self.assertEqual(rev['status'], 'pending')
         self.assertEqual(rev['findings'][0]['id'], f'pr{PR}-f1')
         self.assertEqual(rev['draft']['comments'][0]['findingId'], f'pr{PR}-f1')
-        self.assertIn('**src/core/a.c:1**: far from the diff', rev['draft']['body'])
+        self.assertEqual(rev['draft']['body'], 'Summary.\n\nNot in an inline comment:\n- `src/core/a.c:1` far from the diff')
         self.assertEqual(rev['draft']['digest'], out['draftDigest'])
         self.assertEqual(self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO])['open'], [], 'a pending draft carries nothing')
         pending = self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--pending'])['pending']
@@ -1244,6 +1244,33 @@ class Post(PostCase):
         with self.assertRaisesRegex(facts.Unusable, r'over-length text \(fix note on pr7-f1\)'):
             self.post('--auto')
         self.assertEqual(self.gh.posts, [])
+
+    def test_a_body_entry_is_one_line_measured_as_posted_and_a_legacy_draft_as_it_was(self):
+        long = '**low**: short problem.\n- ' + 'cause ' * 90
+        draft = {**self.result_for(self.p)['draft'], 'comments': [{'path': 'src/core/a.c', 'line': 1, 'body': long, 'finding': 0}]}
+        self.save(self.result_for(self.p, draft=draft))
+        self.assertEqual(self.review()['draft']['moved'][0]['renderedLine'], '- `src/core/a.c:1` **low**: short problem.')
+        self.assertNotIn('cause', self.review()['draft']['body'], 'only the first line is posted')
+        led = json.loads(Path(self.p['ledger']).read_text())
+        self.assertEqual(post.over_length(led, led['reviews'][-1]), [], 'a long comment posting one short line is not long')
+        del led['reviews'][-1]['draft']['moved'][0]['renderedLine']
+        self.assertEqual(post.over_length(led, led['reviews'][-1]), ['src/core/a.c:1'], 'a draft saved before keeps the old check')
+
+    def test_a_body_entry_over_one_line_of_300_chars_stops_auto_post(self):
+        draft = {**self.result_for(self.p)['draft'], 'comments': [{'path': 'src/core/a.c', 'line': 1, 'body': '**low**: ' + 'x' * 300, 'finding': 0}]}
+        self.save(self.result_for(self.p, draft=draft))
+        with self.assertRaisesRegex(facts.Unusable, r'over-length text \(src/core/a\.c:1\)'):
+            self.post('--auto')
+
+    def test_a_body_entry_whose_first_line_no_check_verified_stops_auto_post_and_is_named_on_a_pending_review(self):
+        unchecked = {'body': '**high**: b.\n- only here: b is never initialised', 'finding': 0, 'firstLineUnchecked': True}
+        self.assertEqual(post.first_line_unchecked({'draft': {'comments': [unchecked], 'moved': []}}), [], 'an inline comment shows whole')
+        draft = {**self.result_for(self.p)['draft'], 'comments': [{'path': 'src/core/a.c', 'line': 1, **unchecked}]}
+        self.save(self.result_for(self.p, draft=draft))
+        with self.assertRaisesRegex(facts.Unusable, r'first line no check verified \(src/core/a\.c:1\)'):
+            self.post('--auto')
+        self.assertEqual(self.gh.posts, [])
+        self.assertEqual(self.post()['firstLineUnchecked'], ['src/core/a.c:1'])
 
     def test_a_long_comment_moved_into_the_body_still_stops_auto_post(self):
         draft = self.result_for(self.p)['draft']
@@ -2187,6 +2214,24 @@ class Fixable(PostCase):
         self.gh.reviews[rid]['body'] = self.gh.reviews[rid]['body'].replace('a shadows', 'a may shadow')
         got = self.fixable()
         self.assertEqual((self.held(got), [f['id'] for f in got['fix']], got['autoPost']), ([('pr7-f2', 'edited')], ['pr7-f1'], False))
+
+    def in_body(self):
+        out = self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--threads', str(self.snap()[0])])
+        return {f['id']: f.get('inBody', False) for f in out['open']}
+
+    def test_a_finding_is_in_the_body_only_while_the_pr_shows_that_body_as_posted(self):
+        self.assertEqual(self.in_body(), {'pr7-f1': False, 'pr7-f2': True}, 'the inline one has its thread, not a body line')
+        led = json.loads(Path(self.p['ledger']).read_text())
+        del led['reviews'][-1]['draft']['moved'][0]['renderedLine']
+        Path(self.p['ledger']).write_text(json.dumps(led))
+        self.assertEqual(self.in_body()['pr7-f2'], True, 'a draft saved before renderedLine is placed by its body too')
+        rid = self.review()['receipts']['review']['reviewId']
+        posted = self.gh.reviews[rid]['body']
+        self.gh.reviews[rid]['body'] = posted.replace('a shadows', 'a may shadow')
+        self.assertEqual(self.in_body()['pr7-f2'], False, 'an edited body no longer states it as we did')
+        self.gh.reviews[rid]['body'] = posted
+        del self.gh.reviews[rid]
+        self.assertEqual(self.in_body()['pr7-f2'], False, 'a body the PR no longer shows states nothing')
 
     def test_a_contributor_reply_holds_the_finding_but_not_the_auto_recheck_and_a_bot_reply_holds_nothing(self):
         self.gh.inline.append({'id': 950, 'in_reply_to_id': self.root, 'body': 'intentional', 'created_at': self.gh.tick(),
