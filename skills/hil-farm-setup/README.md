@@ -41,7 +41,6 @@ while a runner runs, and applies:
 | `adopt`        | the next install or update of that tool's links                                              |
 | `iar`          | `verify.sh` from now on                                                                      |
 | `skip`         | which tools are converged from now on; a tool already installed is left, not removed         |
-| `apt_skip`     | the next `setup.sh install`; `update` never installs or removes packages                     |
 
 ## Install
 
@@ -115,8 +114,9 @@ the owner's toolchains on the runner's PATH only (`runner_path`).
 
 What stays the owner's: the admin account (it joins `hil`) with its sudo, ssh keys and home, sshd's policy (the farm
 adds only `DenyUsers ghrunner`, as a runner user's ssh session would run outside its unit), the apt update and time
-policy (`apt_skip`), `/etc/environment`, and `/etc/nftables.conf` with Debian's unmodified `nftables.service` (setup
-refuses another). The runner unit cannot see the admin's home (`InaccessiblePaths`). A drop-in on `nftables.service`
+policy (setup installs none of `farm.toml`'s `apt.policy` there), `/etc/environment`, and `/etc/nftables.conf` with
+Debian's unmodified `nftables.service` (setup refuses another). The runner unit cannot see the admin's home
+(`InaccessiblePaths`). A drop-in on `nftables.service`
 loads the owner's file and `/etc/hil-farm/hil_farm.nft` in one `nft -f`, on start and reload. Setup needs
 `nftables.service` already enabled, and never enables the owner's firewall. Stopping it flushes every table, hil_farm
 included, and the runner stops with it (`BindsTo`). The owner changes rules with `systemctl reload nftables`. A rules

@@ -117,7 +117,7 @@ install_packages() {
   local pkgs; pkgs=$(farm apt)
   # shellcheck disable=SC2086  # one package per line
   apt-get install -y -qq $pkgs >/dev/null
-  grep -qx unattended-upgrades <<<"$pkgs" || return 0  # a host skipping it keeps the owner's update policy
+  ! shared_host || return 0  # the owner keeps the update policy
   cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";

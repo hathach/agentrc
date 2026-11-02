@@ -503,7 +503,7 @@ class TestSetup(unittest.TestCase):
         self.sourced('install_packages')
         return (self.tmp / '20auto-upgrades').exists()
 
-    def test_auto_upgrades_follow_the_package_list(self):
+    def test_a_dedicated_host_gets_automatic_updates(self):
         self.assertTrue(self.install_packages('dedicated'))
 
     def test_a_shared_host_keeps_the_owner_update_policy(self):

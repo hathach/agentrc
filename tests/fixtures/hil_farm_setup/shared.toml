@@ -3,7 +3,6 @@ profile = "shared"
 admin = "owner"
 shared = true
 skip = ["renesas-fw"]
-apt_skip = ["unattended-upgrades", "systemd-timesyncd"]
 runner_path = ["/opt/vendor/arm/bin"]
 iar = true
 

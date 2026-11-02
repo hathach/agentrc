@@ -3,7 +3,6 @@ profile = "hfp"
 admin = "tusb"
 shared = true                                           # its owner keeps sshd, firewall, sudo (README)
 skip = ["renesas-fw"]                                   # farm.toml tools never installed: no uPD720201 cards
-apt_skip = ["unattended-upgrades", "systemd-timesyncd"]  # apt.packages left to the owner's update and time policy
 runner_path = ["/opt/iar/cxarm/arm/bin"]                # on the runners' PATH only: the owner's IAR for hil-hfp-iar
 iar = true                                              # verify.sh checks iccarm, cmake >= 3.20, ninja on that PATH
 

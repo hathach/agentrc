@@ -148,6 +148,7 @@ class TestValidate(unittest.TestCase):
             farm.validate({'tool': {}, 'extra': {}})
 
 
+
 class TestInputHash(unittest.TestCase):
     def test_per_tool(self):
         a = {'kind': 'release', 'version': '1'}
@@ -554,8 +555,18 @@ class TestHost(unittest.TestCase):
         self.assertEqual(farm.RUNNER_DIRS, ('/opt/actions-runner/tinyusb',))
         self.assertEqual(farm.RUNNER_UNITS, ('hil-runner-tinyusb',))
         self.assertEqual(set(farm.load()['tool']) - set(cfg['tool']), {'renesas-fw'})
-        self.assertNotIn('unattended-upgrades', cfg['apt']['packages'])
-        self.assertIn('nftables', cfg['apt']['packages'])
+
+    def test_only_a_dedicated_host_gets_the_policy_packages(self):
+        policy = set(farm.load()['apt']['policy'])
+        for name, want in (('dedicated', policy), ('shared', set())):
+            env = {'HIL_FARM_HOST': str(HOSTS / f'{name}.toml')}
+            with self.subTest(host=name), mock.patch.dict(os.environ, env), \
+                    mock.patch('sys.stdout', io.StringIO()) as out:
+                self.assertEqual(farm.main(['apt']), 0)
+                pkgs = out.getvalue().split()
+                self.assertIn('nftables', pkgs)
+                self.assertIn('build-essential', pkgs)
+                self.assertEqual(policy & set(pkgs), want)
 
     def test_runner_path_appends_the_host_dirs(self):
         with mock.patch.dict(os.environ, {'HIL_FARM_HOST': str(HOSTS / 'shared.toml')}), \
@@ -598,7 +609,6 @@ class TestHost(unittest.TestCase):
                             (lambda h: h['runner']['tinyusb'].update(labels=['a,b']), 'runner.tinyusb'),
                             (lambda h: h['runner']['tinyusb'].update(other=1), 'runner.tinyusb'),
                             (lambda h: h.update(skip=['nope']), 'skip names unknown'),
-                            (lambda h: h.update(apt_skip=['nope']), 'apt_skip'),
                             (lambda h: h.update(runner_path=['rel/bin']), 'runner_path'),
                             (lambda h: h.update(runner_path=['/a:/b']), 'runner_path'),
                             (lambda h: h.update(legacy_units=['x.service']), 'unknown fields'),

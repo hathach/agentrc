@@ -17,8 +17,9 @@ packages = [
   "python3-hid", "python3-setuptools", "libhidapi-hidraw0", "libusb-1.0-0", "usbutils", "pciutils", "uhubctl",
   "dfu-util", "lm4flash", "mtools", "libmtp-runtime", "mtp-tools", "alsa-utils", "gdb-multiarch",
   "binutils-arm-none-eabi", "tshark", "nftables", "jq", "zstd", "unzip", "xz-utils", "tmux", "strace", "lsof",
-  "unattended-upgrades", "systemd-timesyncd",
 ]
+# they set the host's update and time policy: a shared host leaves them to its owner
+policy = ["unattended-upgrades", "systemd-timesyncd"]
 # openocd's build deps, kept installed: the -dev packages also bring its runtime libraries
 build = [
   "build-essential", "autoconf", "automake", "libtool", "pkg-config", "texinfo", "libusb-1.0-0-dev", "libhidapi-dev",

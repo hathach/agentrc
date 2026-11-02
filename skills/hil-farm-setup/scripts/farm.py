@@ -3,7 +3,7 @@
 
   farm.py validate [--host FILE]    check farm.toml, and a host file when named (no root needed)
   farm.py fetch DIR [TOOL...]       download and hash-check remote inputs into DIR (dev PC pin check)
-  farm.py apt                       print the apt packages (runtime and build), one per line
+  farm.py apt                       print the apt packages (runtime, policy unless shared, build), one per line
   farm.py env                       print the farm's environment lines
   farm.py path                      print the farm's PATH
   farm.py runner-path               print the runners' PATH: the farm's plus the host's runner_path
@@ -102,7 +102,7 @@ def validate(cfg):
         errs.append(f'unknown top-level tables {sorted(set(cfg) - {"farm", "apt", "tool"})}')
     if set(cfg.get('farm', {})) - {'path', 'env'}:
         errs.append('farm: unknown fields')
-    if set(cfg.get('apt', {})) - {'packages', 'build'}:
+    if set(cfg.get('apt', {})) - {'packages', 'build', 'policy'}:
         errs.append('apt: unknown fields')
     for name, t in cfg.get('tool', {}).items():
         errs += [f'{name}: {e}' for e in validate_tool(name, t)]
@@ -155,7 +155,7 @@ def validate_tool(name, t):
 
 
 # iar: verify.sh checks iccarm, cmake and ninja on the runner PATH
-HOST_DEFAULTS = {'shared': False, 'iar': False, 'skip': [], 'apt_skip': [], 'runner_path': [], 'adopt': {}}
+HOST_DEFAULTS = {'shared': False, 'iar': False, 'skip': [], 'runner_path': [], 'adopt': {}}
 HOST_FIELDS = {'profile', 'admin', 'runner', *HOST_DEFAULTS}
 HOST_REQUIRED = {'profile', 'admin', 'runner'}
 IDENTITY = ('profile', 'admin', 'shared', 'runner')  # what only a reinstall or re-registration changes
@@ -192,8 +192,6 @@ def validate_host(h, cfg):
             errs.append(f'runner.{n}: name and labels, each {NAME}')
     if set(h.get('skip', [])) - set(cfg.get('tool', {})):
         errs.append(f'skip names unknown tools {sorted(set(h["skip"]) - set(cfg.get("tool", {})))}')
-    if set(h.get('apt_skip', [])) - set(cfg.get('apt', {}).get('packages', [])):
-        errs.append('apt_skip names a package apt.packages does not list')
     if not all(d.startswith('/') and '..' not in Path(d).parts and ':' not in d for d in h.get('runner_path', [])):
         errs.append('runner_path entries must be absolute, without .. or :')
     links = {lk for t in cfg.get('tool', {}).values() for lk in t.get('links', {})}
@@ -228,7 +226,6 @@ def use_host(cfg, h):
     set_runners(h['runner'])
     ADOPT = {Path(k): v for k, v in h['adopt'].items()}
     cfg['tool'] = {n: t for n, t in cfg['tool'].items() if n not in h['skip']}
-    cfg['apt']['packages'] = [a for a in cfg['apt']['packages'] if a not in h['apt_skip']]
     return h
 
 
@@ -793,7 +790,8 @@ def main(argv=None):
                     fetch(t['url'], t['sha256'], Path(args.dir) / n, t.get('form'))
                     print(f'ok    {n}')
         elif args.cmd == 'apt':
-            print('\n'.join(cfg['apt']['packages'] + cfg['apt']['build']))
+            policy = [] if host['shared'] else cfg['apt']['policy']
+            print('\n'.join(cfg['apt']['packages'] + policy + cfg['apt']['build']))
         elif args.cmd == 'env':
             print('\n'.join(f'{k}={v}' for k, v in cfg['farm']['env'].items()))
         elif args.cmd == 'path':
