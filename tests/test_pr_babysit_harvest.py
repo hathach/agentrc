@@ -128,6 +128,9 @@ class SettleRules(unittest.TestCase):
             with self.subTest(what):
                 r = harvest.coderabbit(HEAD, [], [run_], issue, EVENT)
                 self.assertEqual((r['state'], r['kind'], r['sha'], r['reason']), ('settled', 'skipped', HEAD, 'check run skipped: No files to review'))
+        manual = status('success', 'Review skipped: manual review required for this OSS repository', '2026-09-25T09:00:01Z')
+        r = harvest.coderabbit(HEAD, [manual], [run_], [comment(bot, 'summary\n> - [ ] 🔍 Trigger review', id_=5)], EVENT)
+        self.assertEqual(r['state'], 'unknown', 'a manual-review status at the no-files run\'s second')
 
     def test_a_review_paused_coderabbit_check_run_reads_paused_with_its_resume_command(self):
         # #381: adafruit/Adafruit_TinyUSB_Arduino#595's head; the run completed 38s after the pause comment's last edit.

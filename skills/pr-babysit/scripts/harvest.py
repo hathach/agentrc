@@ -80,6 +80,7 @@ CR_RATE_STATUS = 'review rate limited'
 # A repository CodeRabbit reviews only on request: a box in its summary comment, ticked once asked, or these words beside it (#324).
 CR_TRIGGER_BOX = re.compile(r'^(?P<pre>(?:> )?- \[)(?P<mark>[ xX])(?P<post>\][^\n]*Trigger (?:a manual )?review[^\n]*)$', re.M)
 CR_MANUAL_ONLY = 'does not receive automatic reviews'
+CR_MANUAL_SKIP = 'review skipped: manual review required'
 CR_COUNTDOWN = re.compile(r'Next included review available in ([^.*\n]+)\.')
 COUNTDOWN_TERM = re.compile(r'(\d+) (hour|minute|second)s?')
 # CodeRabbit's included reviews come back within the hour: the reset a notice without a countdown is given.
@@ -212,7 +213,10 @@ def coderabbit(head, statuses, checks, issue, event_at):
         return limited_record('rate-limited after the head event', limited or fresh[0], why, ev, None)
     if s and run_ and s_at == run_at:
         a, b = coderabbit_status(s, ev, head), coderabbit_run(run_, ev, head, stickies)
-        if (a['state'], a['kind']) != (b['state'], b['kind']):
+        # A manual-review skip is askable and a no-files one is not (#372): which of them each reads must agree too.
+        def reading(r):
+            return r['state'], r['kind'], r['reason'].lower().startswith(CR_MANUAL_SKIP)
+        if reading(a) != reading(b):
             return record('coderabbit', 'unknown', 'its status and check run disagree at one timestamp', ev)
     if s and (run_ is None or s_at >= run_at):
         return coderabbit_status(s, ev, head)
