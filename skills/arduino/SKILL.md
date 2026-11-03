@@ -33,7 +33,9 @@ retries, recovery) apply unchanged; these scripts load its `hil_*` scripts throu
   run the first HIL sketch).
   `hil_remote.py` is a wrapper around `arduino_remote.py`.
 - Rosters `test/hil/ci.json` (the farm) and a gitignored `test/hil/local.json` (a dev PC's boards); contract tests in
-  `.claude/test/`, run by pre-commit after `agentrc_pin.py fetch`.
+  `.claude/test/`, run by pre-commit after `agentrc_pin.py fetch`. A farm board names its probe (`"probe"`, the `hil`
+  skill's board registry), which supplies its flasher, under the registry's name, which is its board lock; a dev PC's
+  unregistered board keeps a flasher of its own.
 
 ## What every library gets
 
@@ -62,7 +64,7 @@ retries, recovery) apply unchanged; these scripts load its `hil_*` scripts throu
   `hil_test.py commission` finds and confirms either under the restoration sketch.
 - **Probe detach**: before a flash or console reset through an openocd flasher whose args name `target/rp2040.cfg`
   or `target/rp2350.cfg`, the engine clears the USB pull-up so the host sees the new image enumerate.
-- **Locks**: every library's harness takes the same physical board lock (`/tmp/tinyusb-hil-locks/<board>.lock`, the
+- **Locks**: every library's harness takes the same physical board lock (`/tmp/tinyusb-hil-locks/<name>.lock`, the
   `hil` skill) and records unproven children under the one pending kind `arduino-hil`, so two libraries, and tinyusb
   or tinyuf2, exclude each other on a shared board, and one library's leftover children block the others.
 
@@ -70,8 +72,8 @@ retries, recovery) apply unchanged; these scripts load its `hil_*` scripts throu
 
 1. Copy `agentrc_pin.py` from a library that has it, changing only its cache namespace, and pin a commit of this
    repository that has `skills/arduino/`.
-2. Write the build profile: CI's matrix boards with their FQBNs, the rig boards it will run on (names as on tinyusb's
-   farm roster, each with its `span`), representatives, classification of its `src/` tree, HIL sketches. Prove it
+2. Write the build profile: CI's matrix boards with their FQBNs, the rig boards it will run on (named as in agentrc's
+   board registry, each with its `span`), representatives, classification of its `src/` tree, HIL sketches. Prove it
    with `check_build.py --select-only` on representative diffs and a full `--record` build per rig board.
 3. Write dedicated HIL sketches, never examples, that end each exchange with a result line tied to the host's nonce,
    and a restoration sketch with no erase or write path, so the state a battery leaves survives it (name any

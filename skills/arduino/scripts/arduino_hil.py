@@ -45,13 +45,13 @@ LOCK_SCRIPT = 'skills/hil/scripts/hil_lock.py'
 SCRIPTS = (LOCK_SCRIPT, 'skills/hil/scripts/hil_flash.py', 'skills/hil/scripts/hil_process.py',
            'skills/hil/scripts/hil_report_core.py', 'skills/hil/scripts/usb_observe.py',
            'skills/hil/scripts/hil_openocd_esp.py')
-FILES = ('skills/arduino/scripts/arduino_build.py', 'skills/hil/scripts/esptool_session.py',
-         'skills/hil/scripts/hil_flash.py', 'skills/hil/scripts/hil_load.py', 'skills/hil/scripts/hil_lock.py',
-         'skills/hil/scripts/hil_openocd_esp.py', 'skills/hil/scripts/hil_openocd_esp_receipt.py',
-         'skills/hil/scripts/hil_process.py', 'skills/hil/scripts/hil_report_core.py',
-         'skills/hil/scripts/hil_report_notice.py', 'skills/hil/scripts/pyocd/run_pyocd.py',
-         'skills/hil/scripts/pyocd/user_script.py', 'skills/hil/scripts/usb_observe.py',
-         'skills/target-debug/scripts/esp_session.py')
+FILES = ('skills/arduino/scripts/arduino_build.py', 'skills/hil/boards.json', 'skills/hil/scripts/esptool_session.py',
+         'skills/hil/scripts/hil_boards.py', 'skills/hil/scripts/hil_flash.py', 'skills/hil/scripts/hil_load.py',
+         'skills/hil/scripts/hil_lock.py', 'skills/hil/scripts/hil_openocd_esp.py',
+         'skills/hil/scripts/hil_openocd_esp_receipt.py', 'skills/hil/scripts/hil_process.py',
+         'skills/hil/scripts/hil_report_core.py', 'skills/hil/scripts/hil_report_notice.py',
+         'skills/hil/scripts/pyocd/run_pyocd.py', 'skills/hil/scripts/pyocd/user_script.py',
+         'skills/hil/scripts/usb_observe.py', 'skills/target-debug/scripts/esp_session.py')
 DETACH_WAIT = 5
 FLASH_TIMEOUT, VERIFY_TIMEOUT, ENUM_TIMEOUT, TEST_TIMEOUT, SETTLE = 120, 60, 20, 30, 2
 CONSOLE_MAX = 120   # one console capture, seconds
@@ -142,7 +142,7 @@ def load_roster(path):
     except ValueError as e:
         raise Refused(str(e))
     for name, b in boards.items():
-        flasher = b.get('flasher', {}).get('name')
+        flasher = b['flasher']['name']
         if flasher not in B.IMAGE_KIND:
             raise Refused(f'roster {path}: {name}: flasher must be one of {sorted(B.IMAGE_KIND)}')
         if (flasher == 'esptool') != ('chip' in B.P.BOARDS[name]):

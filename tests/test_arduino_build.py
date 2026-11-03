@@ -582,6 +582,30 @@ class Dependencies(Lib):
         self.assertEqual(out['dependencies'], [prepared['Dep A']])
 
 
+class Registry(Lib):
+    """Rosters resolve through agentrc's board registry (skills/hil/boards.json): its metro_m4_express entry."""
+    def setUp(self):
+        super().setUp()
+        self.probe, self.reg = next((k, v) for k, v in ab.hil_boards.registry().items()
+                                    if v['name'] == 'metro_m4_express')
+        for name in ('metro_m4_express', 'metro_m4'):
+            self.P.BOARDS[name] = {'fqbn': 'adafruit:samd:x', 'family': 'fb', 'span': (0x4000, 0x80000)}
+        self.path = self.root / 'r.json'
+
+    def roster(self, **entry):
+        self.path.write_text(json.dumps({'boards': [{'uid': 'DUT', 'probe': self.probe, **entry}]}))
+        return self.path
+
+    def test_a_registered_board_takes_the_registrys_flasher(self):
+        board = ab.rig_roster(self.roster(name='metro_m4_express'))['metro_m4_express']
+        self.assertEqual(board['flasher'], {**self.reg['flasher'], 'uid': self.probe})
+        self.assertEqual(board['uid'], 'DUT')
+
+    def test_a_registered_board_keeps_the_registrys_name(self):
+        with self.assertRaisesRegex(ValueError, "lock 'metro_m4' is not its registered board's, metro_m4_express"):
+            ab.rig_roster(self.roster(name='metro_m4'))
+
+
 class RecordCase(Lib):
     def setUp(self):
         super().setUp()
@@ -647,13 +671,13 @@ class Record(RecordCase):
         self.assertEqual(err, 'examples/Other/echo: another sketch of this record has its basename')
 
     def test_elf_flash_over_the_bootloader_refused(self):
-        self.flasher({'name': 'openocd'})
+        self.flasher({'name': 'openocd', 'uid': 'E66'})
         _, err = self.record(self.samd_row())
         self.assertIn('the ELF writes', err)
         self.assertIn('outside the board span', err)
 
     def test_any_segment_out_of_span_refused(self):
-        self.flasher({'name': 'openocd'})
+        self.flasher({'name': 'openocd', 'uid': 'E66'})
         _, err = self.record(self.row([(0x4000, 0x80000), (0x5000, 0x20)]))
         self.assertIn('outside the board span', err)
 
@@ -662,14 +686,10 @@ class Record(RecordCase):
         self.assertIn('differ from the ELF sections', err)
 
     def test_flasher_without_an_image_kind_refused(self):
-        self.flasher({'name': 'stlink'})
+        self.flasher({'name': 'stlink', 'uid': 'S'})
         _, err = self.record(self.samd_row())
         self.assertIn("flasher 'stlink' has no image kind", err)
 
-    def test_null_flasher_refused(self):
-        self.flasher(None)
-        _, err = self.record(self.samd_row())
-        self.assertIn('flasher None has no image kind', err)
 
     def test_jlink_board_without_hex_refused(self):
         _, err = self.record(self.row([(0x4000, 32)]))

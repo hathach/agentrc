@@ -200,7 +200,7 @@ class Roster(Base):
     def test_refusals(self):
         esp_dbg = {'openocd': '-f board/esp32s3-builtin.cfg', 'tool': 'openocd-esp32', 'uid': 'M'}
         cases = (('rig_ocd', {'flasher': {'name': 'esptool', 'uid': 'x'}, 'usb_port': '1-1'}, 'ESP chip profile'),
-                 ('rig_ocd', {'flasher': {'name': 'pyocd'}}, 'flasher must be'),
+                 ('rig_ocd', {'flasher': {'name': 'pyocd', 'uid': 'x'}}, 'flasher must be'),
                  ('rig_host', {'arduino': {'tests': ['echo']}}, 'not host tests'),
                  ('rig_ocd', {'arduino': {'tests': ['info']}}, 'not device tests'),
                  ('rig_esp', {'usb_port': None, 'no_serial': None}, 'needs usb_port'),

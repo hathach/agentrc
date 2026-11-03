@@ -30,6 +30,7 @@ import concurrent.futures
 import fcntl
 import functools
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -39,7 +40,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-FILES = ()   # loads and launches nothing by path (hil_load.py)
+HERE = os.path.dirname(os.path.abspath(__file__))
+FILES = ('skills/hil/boards.json', 'skills/hil/scripts/hil_boards.py', 'skills/hil/scripts/hil_load.py',
+         'skills/hil/scripts/usb_observe.py')
 SELF = 'skills/arduino/scripts/arduino_build.py'
 SCHEMA = 2
 COMPILE_TIMEOUT = 900
@@ -50,6 +53,22 @@ IMAGE_KIND = {'openocd': 'elf', 'jlink': 'hex', 'esptool': 'esptool'}   # what t
 BOOT_APP0 = 'tools/partitions/boot_app0.bin'   # the ESP core's otadata image its flash_args name, under the platform
 
 P = None   # the bound profile
+
+
+def _hil_load():
+    """hil_load.py from this agentrc, the process's one `agentrc_hil_load`."""
+    spec = importlib.util.spec_from_file_location('agentrc_hil_load', os.path.join(HERE, '..', '..', 'hil',
+                                                                                    'scripts', 'hil_load.py'))
+    if spec.name not in sys.modules:
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        sys.modules.setdefault(spec.name, mod)
+    return sys.modules[spec.name].load(spec.name, os.path.realpath(spec.origin))
+
+
+hil_load = _hil_load()
+hil_load.require(__file__, FILES)
+hil_boards = hil_load.load_file('skills/hil/scripts/hil_boards.py')
 
 
 def bind(profile):
@@ -187,7 +206,7 @@ def classify(path):
 
 def select(paths, roster=None, only_examples=None):
     builds, tests, out_paths, uncovered = {}, set(), [], []
-    hil_boards, hil_full = set(), False
+    hil_picked, hil_full = set(), False
 
     def add(board, exs):
         builds.setdefault(board, set()).update(e for e in exs if eligible(board, e))
@@ -203,14 +222,14 @@ def select(paths, roster=None, only_examples=None):
             for b in boards:
                 add(b, only_examples or examples())
             if roster:
-                hil_boards.update(b for b in roster if P.BOARDS[b]['family'] in families)
+                hil_picked.update(b for b in roster if P.BOARDS[b]['family'] in families)
         elif effect == 'example':
             if not buildable(detail):
                 uncovered.append({'path': path, 'reason': 'sketch eligible on no board this contract builds'})
             for b in P.BOARDS:
                 add(b, [detail])
             if roster:
-                hil_boards.update(b for b in roster if detail in hil_sketches(b))
+                hil_picked.update(b for b in roster if detail in hil_sketches(b))
         elif effect == 'tests':
             tests.add(detail)
             if detail == 'build':
@@ -221,7 +240,7 @@ def select(paths, roster=None, only_examples=None):
             for b in boards:
                 add(b, hil_sketches(b))
             if roster:
-                hil_boards.update(b for b in roster if b in boards)
+                hil_picked.update(b for b in roster if b in boards)
         elif effect == 'hil_sketch':
             for b in P.BOARDS:
                 add(b, [detail])
@@ -235,7 +254,7 @@ def select(paths, roster=None, only_examples=None):
         'tests': sorted(tests), 'paths': out_paths, 'uncovered': uncovered,
     }
     if roster is not None:
-        result['hil'] = {'boards': sorted(roster) if hil_full else sorted(hil_boards), 'full': hil_full,
+        result['hil'] = {'boards': sorted(roster) if hil_full else sorted(hil_picked), 'full': hil_full,
                          'uncovered': uncovered_by_roster(paths, roster)}
     return result
 
@@ -285,14 +304,18 @@ def changed_paths(args):
 
 
 def rig_roster(path):
-    """{name: entry} of a HIL roster whose every board has a rig profile here; ValueError naming why not."""
+    """{name: entry} of a HIL roster whose every board has a rig profile here, resolved through hil_boards (a
+    registered board's name must be its registry name, its lock); ValueError naming why not."""
     try:
-        boards = {b['name']: b for b in json.loads(Path(path).read_text())['boards']}
+        roster = json.loads(Path(path).read_text())
+        unknown = [b['name'] for b in roster['boards'] if b['name'] not in P.BOARDS or 'span' not in P.BOARDS[b['name']]]
+        if unknown:
+            raise ValueError(f'boards with no rig profile here: {unknown}')
+        boards = {b['name']: b for b in hil_boards.resolve_roster(roster)['boards']}
+        for name, b in boards.items():
+            hil_boards.lock_name(b, name)
     except (OSError, ValueError, KeyError, TypeError) as e:
         raise ValueError(f'roster {path}: {e}')
-    unknown = [n for n in boards if n not in P.BOARDS or 'span' not in P.BOARDS[n]]
-    if unknown:
-        raise ValueError(f'roster {path}: boards with no rig profile here: {unknown}')
     return boards
 
 
@@ -786,8 +809,7 @@ def make_record(args, board, rows, before, diff, roster_path, prepared):
         return None, 'the source changed while building'
     lo, hi = P.BOARDS[board]['span']
     entry = rig_roster(roster_path)[board]
-    flasher = entry.get('flasher')
-    flasher = flasher.get('name') if isinstance(flasher, dict) else None
+    flasher = entry['flasher']['name']
     if flasher not in IMAGE_KIND:
         return None, f'{board}: flasher {flasher!r} has no image kind; must be one of {sorted(IMAGE_KIND)}'
     image = IMAGE_KIND[flasher]   # what the harness flashes for this probe
