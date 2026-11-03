@@ -119,6 +119,26 @@ class Resolve(Base):
         self.assertIn('y: flasher of probe E661', str(cm.exception))
 
 
+class LockName(Base):
+    def setUp(self):
+        self.path = self.registry(REG)
+
+    def test_a_registered_board_locks_as_its_registry_name_whatever_the_roster_calls_it(self):
+        for entry in ({'name': 'frdm_k64f', 'probe': '000621000000'}, {'name': 'k64f', 'probe': '000621000000'}):
+            self.assertEqual(hb.lock_name(entry, path=self.path), 'k64f')
+        self.assertEqual(hb.lock_name({'name': 'x', 'probe': 'E661'}, 'max32', self.path), 'max32')
+
+    def test_a_registered_board_with_another_lock_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "x: lock 'mimxrt' is not its registered board's, max32"):
+            hb.lock_name({'name': 'x', 'probe': 'E661'}, 'mimxrt', self.path)
+        with self.assertRaisesRegex(ValueError, "probe 'NOPE' is not in agentrc"):
+            hb.lock_name({'name': 'x', 'probe': 'NOPE'}, path=self.path)
+
+    def test_a_bench_board_locks_as_its_own(self):
+        self.assertEqual(hb.lock_name({'name': 'bench'}, path=self.path), 'bench')
+        self.assertEqual(hb.lock_name({'name': 'bench'}, 'shared', self.path), 'shared')
+
+
 class Registry(Base):
     def refused(self, doc, why):
         with self.assertRaisesRegex(ValueError, why):
@@ -132,10 +152,18 @@ class Registry(Base):
         self.refused({'boards': {'000123': {'name': 'a', 'flasher': {'name': 'jlink'}},
                                  '123': {'name': 'b', 'flasher': {'name': 'jlink'}}}}, '123: the same probe as 000123')
 
+    def test_a_name_is_a_unique_lock_file_name(self):
+        fl = {'name': 'jlink'}
+        self.refused({'boards': {'A': {'name': 'k64f', 'flasher': fl}, 'B': {'name': 'K64F', 'flasher': fl}}},
+                     "B: name K64F is also A's")
+        for name in ('a/b', '.hidden', 'a b', 'a+b', 7):
+            with self.subTest(name):
+                self.refused({'boards': {'A': {'name': name, 'flasher': fl}}}, 'not a plain file name')
+
     def test_malformed_entries(self):
         fl = {'name': 'jlink'}
         for doc, why in (({'boards': []}, 'expected'), ({'boards': {}, 'x': 1}, 'expected'),
-                         ({'boards': {'A': {'flasher': fl}}}, 'no name'),
+                         ({'boards': {'A': {'flasher': fl}}}, 'name None'),
                          ({'boards': {' ': {'name': 'a', 'flasher': fl}}}, 'empty probe serial'),
                          ({'boards': {'A': {'name': 'a'}}}, 'no flasher'),
                          ({'boards': {'A': {'name': 'a', 'flasher': fl, 'x': 1}}}, 'unknown key'),
@@ -169,6 +197,20 @@ class Cli(Base):
             self.assertEqual((r.returncode, r.stdout), (1, ''))
             self.assertIn("probe 'NOPE' is not in", r.stderr)
         self.assertEqual(self.run_cli().returncode, 2)
+
+    def test_lock_prints_a_boards_lock_parked_ones_included(self):
+        probe, reg = next(iter(hb.registry().items()))
+        with tempfile.TemporaryDirectory() as td:
+            roster = Path(td) / 'r.json'
+            bench = {'name': 'bench', 'uid': 'B', 'flasher': {'name': 'jlink', 'uid': '1'}}
+            parked = {'name': 'its-name', 'uid': 'X', 'probe': probe}
+            roster.write_text(json.dumps({'boards': [bench], 'boards-skip': [parked]}))
+            self.assertEqual(self.run_cli('lock', str(roster), 'its-name').stdout, reg['name'] + '\n')
+            self.assertEqual(self.run_cli('lock', str(roster), 'bench').stdout, 'bench\n')
+            r = self.run_cli('lock', str(roster), 'absent')
+            self.assertEqual((r.returncode, r.stdout), (1, ''))
+            self.assertIn("0 entries named 'absent'", r.stderr)
+        self.assertEqual(self.run_cli('lock', 'x').returncode, 2)
 
 
 if __name__ == '__main__':

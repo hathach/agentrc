@@ -5,19 +5,21 @@ the serial of the debug probe it is wired to. Each board has one probe, so its `
 `probe` and keeps its own `uid`, the serial its firmware reports, which differs per firmware.
 Stdlib only.
 
-  {"boards": {"<probe serial>": {"name": <label>,
+  {"boards": {"<probe serial>": {"name": <lock name>,
                                  "flasher": {name, args, vid_pid, verify, note},
                                  "flasher_recover": {name, args, vid_pid, verify, note}}}}
 
-`name` is a label: rosters keep their own.
+`name` is the board's lock name on every host, whatever a roster calls the board: unique, a
+plain file name, and renamed only with a migration of the locks and records naming it.
 
 resolve(entry) is a roster entry with its board's `flasher` (its `uid` the probe serial) and
 `flasher_recover` filled in, a new dict. An entry with `probe` that also carries either is
 refused as a duplicate; one without `probe` (a bench board on a dev PC) keeps its own, unless
 its probe is a registered board's. resolve_roster(roster) resolves `boards` and `boards-skip`.
-Both raise ValueError naming every problem.
+Both raise ValueError naming every problem. lock_name(entry, own) is an entry's board lock.
 
-  hil_boards.py roster FILE    the resolved roster as JSON (exit 1 refused, 2 usage)
+  hil_boards.py roster FILE         the resolved roster as JSON (exit 1 refused, 2 usage)
+  hil_boards.py lock FILE BOARD     the board lock of FILE's entry named BOARD, boards-skip included
 """
 
 from __future__ import annotations
@@ -26,12 +28,14 @@ import copy
 import importlib.util
 import json
 import os
+import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REGISTRY = os.path.join(HERE, '..', 'boards.json')
 FILES = ('skills/hil/scripts/hil_load.py', 'skills/hil/scripts/usb_observe.py', 'skills/hil/boards.json')
 PHYSICAL = ('flasher', 'flasher_recover')
+LOCK_NAME_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]*\Z')   # also within hil_lock's own grammar
 FLASHER_NAMES = ('jlink', 'stlink', 'openocd', 'lm4flash', 'esptool', 'pyocd', 'openocd_esp')
 _FLASHER_KEYS = {'name', 'uid', 'args', 'vid_pid', 'verify', 'note'}
 _ENTRY_KEYS = {'name', *PHYSICAL}
@@ -86,7 +90,7 @@ def flasher_problem(flasher, *, has_uid=True) -> str:
 
 
 def _check(boards: dict, path) -> list:
-    problems, probes = [], []
+    problems, probes, locks = [], [], {}
     for probe, e in boards.items():
         if not probe.strip():
             problems.append('an empty probe serial')
@@ -99,8 +103,13 @@ def _check(boards: dict, path) -> list:
             continue
         if set(e) - _ENTRY_KEYS:
             problems.append(f'{probe}: unknown key(s) {", ".join(sorted(set(e) - _ENTRY_KEYS))}')
-        if not (isinstance(e.get('name'), str) and e['name'].strip()):
-            problems.append(f'{probe}: no name')
+        name = e.get('name')
+        if not (isinstance(name, str) and LOCK_NAME_RE.match(name)):
+            problems.append(f'{probe}: name {name!r} is not a plain file name (it is the board lock)')
+        elif name.casefold() in locks:
+            problems.append(f'{probe}: name {name} is also {locks[name.casefold()]}\'s')
+        else:
+            locks[name.casefold()] = probe
         if 'flasher' not in e:
             problems.append(f'{probe}: no flasher')
         for key in PHYSICAL:
@@ -131,6 +140,13 @@ def registry(path=REGISTRY) -> dict:
     return _cache[path]
 
 
+def _registered(entry, path) -> tuple:
+    """(the registry entry of a roster entry's `probe`, '') or (None, why)."""
+    probe = entry['probe']
+    reg = registry(path).get(probe) if isinstance(probe, str) else None
+    return (reg, '') if reg else (None, f'{entry.get("name")}: probe {probe!r} is not in agentrc\'s board registry')
+
+
 def _resolve(entry, path) -> tuple:
     name = entry.get('name') if isinstance(entry, dict) else None
     label = name or '<unnamed>'
@@ -142,9 +158,9 @@ def _resolve(entry, path) -> tuple:
     inline = [k for k in PHYSICAL if k in entry]
     if 'probe' in entry:
         probe = entry['probe']
-        reg = registry(path).get(probe) if isinstance(probe, str) else None
-        if reg is None:
-            return None, f'{label}: probe {probe!r} is not in agentrc\'s board registry'
+        reg, why = _registered(entry, path)
+        if why:
+            return None, why
         if inline:
             return None, (f'{label}: {" and ".join(inline)} of probe {probe} come from agentrc\'s board registry '
                           f'({reg["name"]}); drop them from the roster')
@@ -161,6 +177,19 @@ def _resolve(entry, path) -> tuple:
         if usb_observe.jlink_serial_match(probe, key):
             return None, f'{label}: probe {probe} is registered ({reg["name"]}): name it as "probe": "{key}" instead'
     return copy.deepcopy(entry), ''
+
+
+def lock_name(entry, own=None, path=REGISTRY) -> str:
+    """The board lock of a roster entry: its registered board's `name`, else `own` (a project's
+    lock field) or the entry's `name`. A registered board whose `own` differs is refused."""
+    if 'probe' in entry:
+        reg, why = _registered(entry, path)
+        if why:
+            raise ValueError(why)
+        if own is not None and own != reg['name']:
+            raise ValueError(f'{entry.get("name")}: lock {own!r} is not its registered board\'s, {reg["name"]}')
+        return reg['name']
+    return entry['name'] if own is None else own
 
 
 def resolve(entry, path=REGISTRY) -> dict:
@@ -189,14 +218,20 @@ def resolve_roster(roster, path=REGISTRY) -> dict:
 
 def main(argv=None) -> int:
     argv = sys.argv[1:] if argv is None else argv
-    if len(argv) != 2 or argv[0] != 'roster':
+    if not (argv[:1] == ['roster'] and len(argv) == 2 or argv[:1] == ['lock'] and len(argv) == 3):
         print(__doc__.rsplit('\n\n', 1)[-1].rstrip(), file=sys.stderr)
         return 2
     try:
         with open(argv[1], encoding='utf-8-sig') as f:
             roster = json.load(f)
-        print(json.dumps(resolve_roster(roster), indent=2))
-    except (OSError, ValueError) as e:
+        if argv[0] == 'roster':
+            print(json.dumps(resolve_roster(roster), indent=2))
+            return 0
+        found = [e for key in ('boards', 'boards-skip') for e in roster.get(key, []) if e.get('name') == argv[2]]
+        if len(found) != 1:
+            raise ValueError(f'{len(found)} entries named {argv[2]!r}')
+        print(lock_name(found[0]))
+    except (OSError, ValueError, AttributeError) as e:
         print(f'hil_boards: {argv[1]}: {e}', file=sys.stderr)
         return 1
     return 0

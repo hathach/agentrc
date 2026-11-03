@@ -8,11 +8,13 @@ mutation, after a coverage check of the subtree the operation reaches.
   hil_reserve.py release --token TOKEN
 
 A roster is a project's HIL roster JSON (`boards` and `boards-skip`; a parked board is still
-on the hub). SELECTOR is the dotted field holding the entry's lock name, falling back to
-`name` only when the entry lacks the field (tinyuf2: `tinyuf2.lock`; tinyusb: the default,
-`name`). Identities are every `uid`, `uart_uid` and `serial` string in an entry, compared
-in the form udev's usb_id gives a serial (whitespace runs and unsafe characters as `_`),
-case-insensitively; two roster identities that become one that way are refused. The
+on the hub). An entry with `probe` locks as its registered board's name (hil_boards.lock_name);
+any other entry's lock is the dotted SELECTOR field, falling back to `name` only when the entry
+lacks it (tinyuf2: `tinyuf2.lock`; tinyusb: the default, `name`). A registered entry whose
+SELECTOR field names another lock is refused. Identities are every `uid`, `uart_uid` and
+`serial` string in an entry, compared in the form udev's usb_id gives a serial (whitespace
+runs and unsafe characters as `_`), case-insensitively; two roster identities that become one
+that way are refused. The
 contract's Hosts/rosters is the roster list: the check refuses what the rosters do not
 explain, it never infers an inventory.
 
@@ -95,7 +97,7 @@ uo = hil_load.load_file('skills/hil/scripts/usb_observe.py')
 hil_root = hil_load.load_file('skills/hil/scripts/hil_root.py')
 hil_boards = hil_load.load_file('skills/hil/scripts/hil_boards.py')
 
-LOCK_NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]*$')
+LOCK_NAME_RE = hil_boards.LOCK_NAME_RE
 UDEV_UNSAFE_RE = re.compile(r'[^A-Za-z0-9#+.:=@_-]')   # what usb_id turns into '_' after whitespace runs
 IDENTITY_KEYS = ('uid', 'uart_uid', 'serial')
 HUB_CLASS = '09'
@@ -157,8 +159,8 @@ def _identities(obj, out):
 def load_rosters(specs):
     """[(file, selector)] -> {'locks': sorted lock names, 'identities': {identity: {locks}}}.
     Each entry is resolved through agentrc's board registry (hil_boards), so its probe serial is an
-    identity too. A board under two lock names, by its registered probe or its uid, is a conflict;
-    any other identity may serve several."""
+    identity too, and a registered board's lock is the registry's. A DUT uid under two lock names
+    is a conflict; any other identity may serve several."""
     locks, ids, duts, raw_of = set(), {}, {}, {}
     for path, selector in specs:
         try:
@@ -172,9 +174,11 @@ def load_rosters(specs):
         for e in entries:
             if not isinstance(e, dict) or not isinstance(e.get('name'), str) or not e['name']:
                 raise Refused(f'roster {path}: an entry without a name')
-            lock = _field(e, selector)
-            if lock is _ABSENT:
-                lock = e['name']
+            own = _field(e, selector) if selector != 'name' else _ABSENT
+            try:
+                lock = hil_boards.lock_name(e, None if own is _ABSENT else own)
+            except ValueError as err:
+                raise Refused(f'roster {path}: {err}')
             if not isinstance(lock, str) or not LOCK_NAME_RE.match(lock):
                 raise Refused(f'roster {path}: {e["name"]}: lock name {lock!r} is not a plain file name')
             locks.add(lock)
@@ -182,10 +186,9 @@ def load_rosters(specs):
                 e = hil_boards.resolve(e)
             except ValueError as err:
                 raise Refused(f'roster {path}: {err}')
-            for key in ('uid', 'probe'):
-                board = (key, e[key].strip().lower()) if key in e else None
-                if board and duts.setdefault(board, lock) != lock:
-                    raise Refused(f'{key} {board[1]} names two boards: {duts[board]} and {lock}')
+            uid = e['uid'].strip().lower()
+            if duts.setdefault(uid, lock) != lock:
+                raise Refused(f'uid {uid} names two boards: {duts[uid]} and {lock}')
             found = set()
             _identities(e, found)
             for raw in found:
