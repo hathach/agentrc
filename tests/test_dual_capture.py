@@ -398,6 +398,8 @@ class DualCaptureTest(unittest.TestCase):
         child = subprocess.Popen([sys.executable, '-c', code, CUT_NAME], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
         try:
             child.stdout.readline()
+            # it may still be running after the print: wait until input() blocks, so its state stays 'S'
+            self.assertTrue(wait_until(lambda: proc_stat(child.pid)[1] == 'S'))
             with open(f'/proc/{child.pid}/stat', 'rb') as f:
                 raw = f.read()
             self.assertIn(b'(' + CUT_NAME.encode()[:15] + b')', raw)
