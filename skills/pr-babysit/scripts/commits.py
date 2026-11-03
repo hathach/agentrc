@@ -12,14 +12,14 @@
 it is taken; it prints {committed, detail}: committed false, with git's last
 lines, when git made no commit (a hook that fails or modifies a file stops it),
 or before staging anything when the message is blank. --skip-hooks adds the
-comma-separated pre-commit hook ids IDS to the SKIP the commit's hooks see:
-the ones hooks.py found failing on HEAD in the same words (baselineFailed). detail is bounded to
-DETAIL_MAX characters, terminal escapes and control characters dropped, so a
-relay can copy it. With --receipt, FILE must not exist yet; the line, with R,
-the parent P (HEAD before) and PATH, is saved there for a caller whose copy of
-it was lost, and `receipt` prints it again as {request, parent, scope,
-committed, detail, sha} (sha HEAD after, "" without a commit), refusing a
-receipt that is absent or for another R, P or PATH. It never commits.
+comma-separated pre-commit hook ids IDS to the SKIP the commit's hooks see: the
+ones hooks.py found failing on HEAD in the same words (baselineFailed). detail
+is bounded to DETAIL_MAX characters, terminal escapes and control characters
+dropped, so a relay can copy it. With --receipt, FILE must not exist yet; the
+line, with R, the parent P (HEAD before) and PATH, is saved there for a caller
+whose copy of it was lost, and `receipt` prints it again as {request, parent,
+scope, committed, detail, sha} (sha HEAD after, "" without a commit), refusing
+a receipt that is absent or for another R, P or PATH. It never commits.
 
 Per commit: sha, parents (every parent), paths (`git diff-tree --no-renames
 -r -z`, one string per filename, unquoted; for a merge `-c`, the paths whose
