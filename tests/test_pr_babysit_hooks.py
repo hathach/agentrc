@@ -243,6 +243,24 @@ class HooksTest(unittest.TestCase):
         self.assertEqual(out['baselineFailed'], ['litter'])
         self.assertEqual(len(self.worktrees()), 1)
 
+    def test_head_reruns_never_reach_the_checkout_a_callers_git_dir_names(self):
+        # The resets between HEAD reruns, and the reruns, must act on HEAD's tree, not on what GIT_DIR names.
+        self.configure('broken', 'litter')
+        (self.repo / 'a.txt').write_text('edited\n')
+        (self.repo / 'c.txt').write_text('staged\n')
+        self.git('add', 'c.txt')
+        (self.repo / 'd.txt').write_text('untracked\n')
+        git_dir = self.repo / '.git'
+        env = {**self.env, 'GIT_DIR': str(git_dir), 'GIT_WORK_TREE': str(self.repo),
+               'GIT_INDEX_FILE': str(git_dir / 'index')}
+        code, out = self.run_script('a.txt', env=env)
+        self.assertEqual((code, out['passed']), (0, False))
+        self.assertEqual(out['baselineFailed'], ['broken', 'litter'])
+        self.assertEqual((self.repo / 'a.txt').read_text(), 'edited\n')
+        self.assertEqual(self.git('diff', '--cached', '--name-only'), 'c.txt\n')
+        self.assertEqual((self.repo / 'd.txt').read_text(), 'untracked\n')
+        self.assertEqual(len(self.worktrees()), 1)
+
     def test_each_head_rerun_starts_from_heads_tracked_files(self):
         # scribble rewrites b.txt on HEAD (so is not excused: pre-commit says it modified files there); showb must
         # read HEAD's b.txt, not scribble's.

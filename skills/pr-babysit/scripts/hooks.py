@@ -77,6 +77,10 @@ ERROR_CHARS = 200
 CLEANUP = 20
 # The failure a run that failed naming no hook adds: not a hook id, so never excused or skipped.
 UNOWNED = '(pre-commit)'
+# What points git at a repository, its index or its objects; set by a caller, it would send HEAD's tree's resets and
+# reruns to the caller's checkout.
+OTHER_REPO = ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY',
+              'GIT_ALTERNATE_OBJECT_DIRECTORIES')
 # What differs between two runs of the same failure: a number standing alone (a duration with its units, a line
 # number, a count, a pid, an address), an ISO 8601 time, a pytest-xdist worker's number, or a name tempfile, mktemp
 # or gcc made. Any other digit inside a word (usb2.c, E501) names a file, rule or symbol, so it stays.
@@ -191,6 +195,12 @@ def pinned_abbrev(env):
     return {**env, 'GIT_CONFIG_COUNT': str(n + 1), f'GIT_CONFIG_KEY_{n}': 'core.abbrev', f'GIT_CONFIG_VALUE_{n}': '40'}
 
 
+def other_repo_env(names=OTHER_REPO):
+    """os.environ without names, by default what points git at a repository, so a command run in HEAD's tree finds
+    that tree, not the caller's checkout or index."""
+    return {k: v for k, v in os.environ.items() if k not in names}
+
+
 def bounded(argv, deadline, start, what, cwd=None, env=None):
     """(exit code, stdout, stderr) of argv, its whole process tree killed once `deadline` seconds from `start` pass."""
     group = {'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == 'nt' else {'start_new_session': True}
@@ -216,7 +226,7 @@ def bounded(argv, deadline, start, what, cwd=None, env=None):
 
 def pre_commit(paths, deadline, start, what, hook=None, cwd=None, skip=()):
     """(exit code, stdout) of one pre-commit run, skip added to the SKIP it inherits."""
-    env = pinned_abbrev(os.environ)
+    env = pinned_abbrev(other_repo_env() if cwd else os.environ)
     if skip:
         env['SKIP'] = ','.join([*filter(None, env.get('SKIP', '').split(',')), *skip])
     try:
@@ -229,7 +239,9 @@ def pre_commit(paths, deadline, start, what, hook=None, cwd=None, skip=()):
 
 def git_within(deadline, start, *argv, cwd=None):
     """git argv, held to the same deadline as the hooks: a checkout filter or hook of its own can hang it."""
-    code, _, err = bounded(['git', *argv], deadline, start, f'git {argv[0]}', cwd)
+    # `worktree add` checks HEAD out into GIT_INDEX_FILE when set: the caller's index, its staged changes lost.
+    env = other_repo_env() if cwd else other_repo_env(('GIT_INDEX_FILE',))
+    code, _, err = bounded(['git', *argv], deadline, start, f'git {argv[0]}', cwd, env)
     if code:
         raise Unusable(f"git {' '.join(argv)}: {err.strip()}")
 
