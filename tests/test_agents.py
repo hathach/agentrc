@@ -189,6 +189,7 @@ class AgentFiles(unittest.TestCase):
                        'Without auto-fix it permits no push; it never permits approval, dismissal, another PR or issue beyond the follow-up issue rule'):
             self.assertIn(phrase, review)
         self.assertIn('their request that pr-review review a PR with auto-fix', exception)
+        self.assertIn("of our review submitted on it that prepare's `repair.submittedReview` names", body)
         self.assertIn('An auto-fix repair phase is writer work: its repairs get the commit check, one simplification pass, validation '
                       'and a whole-task review from the reviewed head to the repair tip before pr-babysit adopts them', body)
         self.assertNotIn('fresh exchange', review)
@@ -203,7 +204,6 @@ class AgentFiles(unittest.TestCase):
                        'a failed, partial, uncertain or handed-over post ends it there',
                        'report "review submitted; auto-fix blocked"', 'never a `held` one',
                        'A crash with repairs unpublished resumes this task with them, never a new prepare',
-                       'Under `auto-fix`, a discussion run repairs nothing', 'a repair of an already-reviewed head takes `auto-fix full`',
                        '`post.py --auto --defer-answers` (auto-fix)',
                        'whatever becomes of the recheck review; one the recheck finds still standing is raised again on a new comment, '
                        'unless someone reopened its thread since, which then still states it',

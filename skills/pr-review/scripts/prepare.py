@@ -38,7 +38,10 @@ headBranch), {state, why}: `available` with push access to the head repository, 
 edits from maintainers, push access to the base; `unavailable` when this account has neither; `unknown` when gh cannot
 tell. Only when available, it binds the review branch to the head branch through a remote of the head repository
 (head_remote, bind_upstream) and adds {remote, addedRemote}; a binding it cannot make refuses. Without --auto-fix
-nothing of this runs.
+nothing of this runs. On a `same` head `repair` also has `submittedReview`, the id of our review submitted on that
+head (by the human included), which the repair takes its findings from, else null with `submittedWhy`; one unsent
+answer bundle an earlier auto-fix deferred on that review no longer refuses the run: `deferredAnswers` counts its
+answers, which wait for the repair to end.
 
 --release unlocks the pr-review-<N> sibling whose lock carries the token, once
 the run that took it has ended; nothing locked by it is a no-op, and while
@@ -63,7 +66,8 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from ledger import ONLINE, last, ledger_dir, ledger_path, load, locked, publications, refuse_unsettled, repo_of, store  # noqa: E402
+from ledger import (ONLINE, last, ledger_dir, ledger_path, load, locked, publications, refuse_unsettled, repo_of, store,  # noqa: E402
+                    submitted_last)
 from post import sync  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'pr-babysit' / 'scripts'))
@@ -221,6 +225,21 @@ def repair_target(repo, head_repo, info, branch, head):
     remote, added = head_remote(repo, head_repo, branch)
     bind_upstream(branch, remote, info['headRefName'], head)
     return {'state': state, 'why': why, 'remote': remote, 'addedRemote': added}
+
+
+def reused_review(led, head):
+    """repair's submittedReview or submittedWhy, and deferredAnswers when the one pending publication on `head` is
+    an unsent bundle an auto-fix deferred on that review (post.py --defer-answers); any other pending draft refuses."""
+    try:
+        rev = submitted_last(led, head)
+    except Unusable as e:
+        return {'submittedReview': None, 'submittedWhy': str(e)}
+    reuse = {'submittedReview': rev['receipts']['review'].get('reviewId')}
+    pending = [p for p, _ in publications(led) if p['head'] == head and p['status'] == 'pending']
+    one = pending[0] if len(pending) == 1 else None
+    if one and one.get('auto') and not one.get('receipts') and any(one is p for p in rev.get('answerPublications', [])):
+        reuse['deferredAnswers'] = len(one['answers'])
+    return reuse
 
 
 def remote_for(repo):
@@ -396,7 +415,6 @@ def prepare(a):
     with locked(path):
         led = load(path, repo, a.pr)
         synced = sync(repo, a.pr, led, lambda: store(path, led))
-        refuse_unsettled(led, head, ('pending',))
         online = [r for r, _ in publications(led) if r['status'] in ONLINE]
         if online and online[-1]['status'] == 'drafted':
             raise Unusable(f"your pending review of {online[-1]['head']} is still open on the PR: submit or delete it on GitHub first")
@@ -405,8 +423,11 @@ def prepare(a):
             raise Unusable(f"a review POST for {online[-1]['head']} may have landed unseen: reconcile it first with "
                            f"post.py --pr {a.pr} --expected-head {online[-1]['head']}{auto}, which only looks for it by its marker")
         mode, scope_base, prior = mode_of(led, head, merge_base, a.full)
+        reuse = reused_review(led, head) if a.auto_fix and mode == 'same' else {}
+        if 'deferredAnswers' not in reuse:
+            refuse_unsettled(led, head, ('pending',))
         wt, branch = worktree(top, a.pr, head, token)
-        repair = repair_target(repo, head_repo_of(info), info, branch, head) if a.auto_fix else None
+        repair = {**repair_target(repo, head_repo_of(info), info, branch, head), **reuse} if a.auto_fix else None
         pr_paths = changed(merge_base, head)
         scope = pr_paths if mode != 'incremental' else changed(scope_base, head)
         groups, over = groups_of(scope, a.max_groups)
