@@ -3765,8 +3765,8 @@ test('no fix note is dispatched when the push answers no comment', async () => {
 
 test('two valid findings on one comment share one fix note', async () => {
   // One note per thread, as postReplyRecipe posts it - and it has to name both
-  // findings, because paying the comment settles both; by place, as a claim of
-  // any length would put it over the reply limit.
+  // findings, because paying the comment settles both; by place, never quoting
+  // the claim.
   let cycle = 0
   const { calls, result } = await run({
     args: { autoPush: true, maxCycles: 2 },

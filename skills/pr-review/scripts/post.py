@@ -20,9 +20,8 @@ threads (GraphQL addPullRequestReviewThreadReply), an answer only while the thre
 it was judged on and the answer still matches its digest. Nothing is public until the human submits it on
 GitHub, choosing the event; deleting a comment or reply before that declines it. The review is `drafted`.
 
-Text is never measured for length. A body line whose first line no check verified (firstLineUnchecked) is named for
-the human to check and holds --auto; it is read afresh from the saved draft on every run, so no retry submits it: the
-pending review is handed over.
+A body line whose first line no check verified (firstLineUnchecked) is named for the human to check and holds
+--auto; it is read afresh from the saved draft on every run, so no retry submits it: the pending review is handed over.
 
 --auto takes the same path, refusing APPROVE: the pending review with its fix notes (never its answers), then, while the
 head is still the draft's and every note reads back, a submit with the draft's event (its intent stored first, never
@@ -768,10 +767,9 @@ def collect(argv):
             persist()
             return {'status': 'declined', 'review': None}
         unchecked = first_line_unchecked(review)
-        named = {'firstLineUnchecked': unchecked}
         handed = (review['receipts'].get('review') or {}).get('handedOver')
         if a.auto and handed:
-            return {'status': review['status'], 'review': review['receipts']['review'], 'handedOver': handed, **named}
+            return {'status': review['status'], 'review': review['receipts']['review'], 'handedOver': handed, 'firstLineUnchecked': unchecked}
         mode = 'auto' if a.auto else 'draft'
         if review.get('publish', mode) != mode:
             raise Unusable(f"the draft was published {'with' if review['publish'] == 'auto' else 'without'} --auto: finish it the same way")
@@ -789,8 +787,8 @@ def collect(argv):
             raise Unusable(f'the PR head moved to {head}; the draft reviewed {a.expected_head}')
         login = gh_json('api', 'user')['login']
         if not a.auto:
-            return {**publish_draft(repo, a.pr, led, review, login, recovering, persist), **named}
-        out = {**publish_auto(repo, a.pr, led, review, event, login, recovering, persist, hold), **named}
+            return {**publish_draft(repo, a.pr, led, review, login, recovering, persist), 'firstLineUnchecked': unchecked}
+        out = {**publish_auto(repo, a.pr, led, review, event, login, recovering, persist, hold), 'firstLineUnchecked': unchecked}
         answers = [p for p in review.get('answerPublications', []) if p.get('auto') and p['status'] in DRAFTS]
         if answers and review['status'] == 'posted' and not recovering:
             out['answers'] = ({'status': 'deferred'} if a.defer_answers else

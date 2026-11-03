@@ -390,7 +390,6 @@ def anchor(draft, merge_base, head):
         if c['line'] in cache[c['path']]:
             inline.append(c)
         else:
-            # workflows/pr-review.js overComment() measures this same form while drafting.
             moved.append({**c, 'renderedLine': f"- `{c['path']}:{c['line']}` {c['body'].split(chr(10))[0]}"})
     body = draft['body']
     if moved:

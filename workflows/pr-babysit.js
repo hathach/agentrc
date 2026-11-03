@@ -99,10 +99,6 @@ if (!deferralsArg.every(deferralShaped) || new Set(deferralsArg.map(d => d.findi
   throw new Error('deferrals must be [{ findingId: "<commentId>#<n>", commentDigest, issueUrl?: "https://github.com/<owner>/<repo>/issues/<n>", reason }], one per finding, ' +
     'no issueUrl being the PR owner\'s decision not to fix it; or [{ issueUrl, reason }], one per out-of-scope topic, holding the findings its issue covers')
 }
-// A workflow-built line names its finding by place, never quoting its claim.
-const deferralAnswer = (d) => d.issueUrl ? `Real, and out of this PR's scope: ${d.reason}. Tracked in ${d.issueUrl}.` : `Left as is, by the PR owner's decision: ${d.reason}.`
-// The place on its own line, the answer an indented line under it.
-const deferralPoint = (place, d) => `- ${place}:\n  ${deferralAnswer(d)}`
 const FULL_SHA = /^[0-9a-f]{40}$/
 // The caller's verified replies on comments this run handed it, each judged to answer the whole comment at headSha.
 const settlementsArg = args.replySettlements ?? []
@@ -877,7 +873,10 @@ const RECEIPTS = withSeal({
 
 const COVERS = verdictList('findingId', 'string', 'covers', { type: ['boolean', 'null'] })
 
-const deferralLine = (f) => deferralPoint(`${f.file}:${f.line}`, f.deferral)
+// A workflow-built line names its finding by place, never quoting its claim: the place on its own line, the answer
+// an indented line under it.
+const deferralLine = ({ file, line, deferral: d }) => `- ${file}:${line}:\n  ` +
+  (d.issueUrl ? `Real, and out of this PR's scope: ${d.reason}. Tracked in ${d.issueUrl}.` : `Left as is, by the PR owner's decision: ${d.reason}.`)
 
 // Across launches only the last cycle's publication outcome is read (pendingOf).
 const history = restored && restored.last ? [restored.last] : []
@@ -1158,7 +1157,8 @@ const finish = (verdict, status) => {
     rollup: launchRollup(), ...rest, ...(size > STATE_MAX ? { stateTooLarge: size } : {}), ...(corrections.length ? { corrections } : {}), ...(handoffs.length ? { handoffs } : {}), ...(settlements.length ? { settlements } : {}), ...(sonarUnmarked.length ? { sonarUnmarked } : {}), history: cycleHistory, observation, state,
   }
 }
-// Comments the caller answers; a replySettlements entry then settles each.
+// Comments the caller answers; a replySettlements entry then settles each. A repair's draft is only in a state an
+// earlier launch saved.
 const handoffList = () => [...new Set([...debt.keys(), ...reanswer])].filter(handedOff).map(commentId => {
   const d = debt.get(commentId) || {}
   return { commentId, ...(d.digest !== undefined ? { commentDigest: d.digest } : {}), why: handoffWhy(commentId),

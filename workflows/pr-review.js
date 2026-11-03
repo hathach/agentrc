@@ -407,22 +407,21 @@ const uncovered = standing.filter(f => !posted(f) && ('beside' in f || !stated.h
 // What the writer writes, each with the index the result's findings give it (carried first).
 const items = [...toPost.map(f => ({ f, finding: carriedOut.length + ours.indexOf(f), why: f.why, evidence: f.verdictReason })),
   ...uncovered.map(f => ({ f, finding: carriedOut.indexOf(f), why: whyOf(f), evidence: verifiedOf(f) }))]
-const COMMENT_FORMAT = 'Each comment: first line `**<severity>**: <the problem, one sentence>`, complete on its own with any qualification it needs ' +
+const FORMAT = 'Each comment: first line `**<severity>**: <the problem, one sentence>`, complete on its own with any qualification it needs ' +
   '(it may be all the review body shows), then only the bullets it needs: the cause with `file:line`, ' +
-  'the impact, and a fix only where the finding supports one; a question only when genuinely asking. '
-const FORMAT = COMMENT_FORMAT +
+  'the impact, and a fix only where the finding supports one; a question only when genuinely asking. ' +
   'The summary: empty, or one Markdown bullet giving direction: which comments to address first and how ' +
   'they group, by grade and place. It never restates a comment\'s problem, cause, evidence or fix: the comments carry those. '
-const COMMENTS = { type: 'array', items: { type: 'object', required: ['finding', 'body'], properties: { finding: { type: 'integer' }, body: { type: 'string' } } } }
 // The runtime validates an answer against its schema and has the same agent correct one that fails, so a list short of
-// an id is fixed there; the fallbacks below still cover a runtime that does not. An empty enum is no valid schema.
+// an id is fixed there; the fallbacks below still cover a runtime that does not.
 const exactly = (schema, key, idField, ids) => {
   const list = schema.properties[key]
   const id = list.items.properties[idField]
   return { ...schema, properties: { ...schema.properties, [key]: { ...list, minItems: ids.length, maxItems: ids.length,
-    items: { ...list.items, properties: { ...list.items.properties, [idField]: ids.length ? { ...id, enum: ids } : id } } } } }
+    items: { ...list.items, properties: { ...list.items.properties, [idField]: { ...id, enum: ids } } } } } }
 }
-const WRITE = { type: 'object', required: ['summary', 'comments'], properties: { summary: { type: 'string' }, comments: COMMENTS } }
+const WRITE = { type: 'object', required: ['summary', 'comments'], properties: { summary: { type: 'string' },
+  comments: { type: 'array', items: { type: 'object', required: ['finding', 'body'], properties: { finding: { type: 'integer' }, body: { type: 'string' } } } } } }
 // What the PR already states, by grade and place, so the summary's direction can weigh it and its check can verify that.
 const onPr = JSON.stringify([...standing.filter(f => !uncovered.includes(f)).map(f => ({ severity: f.severity, file: f.file, line: f.line })),
   ...confirmedClaims.map(c => ({ severity: c.severity, file: c.path, line: c.line, author: c.author }))])
@@ -445,12 +444,11 @@ const summaryOffFormat = (s) => {
 if (summary && summaryOffFormat(summary)) summary = ''
 const CHECKED = { type: 'object', required: ['bad', 'firstBad', 'summaryBad'], properties: { bad: { type: 'array', items: { type: 'integer' } },
   firstBad: { type: 'array', items: { type: 'integer' } }, summaryBad: { type: 'boolean' } } }
-const COMMENT_CHECK = 'List the finding numbers whose comment states any claim, number, API or file that its finding does not, or fails to ' +
+const checked = items.length && written ? await agent(
+  'List the finding numbers whose comment states any claim, number, API or file that its finding does not, or fails to ' +
   'state the finding\'s problem, or, for a finding with alsoState, omits that issue or states it beyond what the finding and evidence support. ' +
   'firstBad: the finding numbers whose comment\'s FIRST LINE alone does not state the actionable problem with the qualification it needs and, ' +
-  'for a finding with alsoState, that issue. '
-const checked = items.length && written ? await agent(
-  COMMENT_CHECK +
+  'for a finding with alsoState, that issue. ' +
   'summaryBad: does the summary restate any comment\'s problem, cause, evidence or fix, or state a fact, grade, place or dependency that neither ' +
   'a finding nor what is already on the PR supports? ' +
   'An empty summary is not bad.\n' +
@@ -475,20 +473,18 @@ const regraded = (f, text) => {
   const was = template(earlier[f.id].severity, '')
   return text.startsWith(was) ? template(f.severity, text.slice(was.length)) : text
 }
-const restated = reraised.map(f => {
-  const published = earlier[f.id].published
-  return { f, body: `${published ? regraded(f, published) : template(f.severity, whyOf(f))}\n- ${repairNote(f)}` }
-})
 // `finding` indexes the result's findings (carried first), so the ledger can give the comment its finding's id.
 const comments = [...items.map((x, i) => {
   const ok = bodies[i] && checked && !checked.bad.includes(i) && !offFormat(bodies[i].body, x.f.severity)
   return { path: x.f.file, line: x.f.line, finding: x.finding, body: ok ? bodies[i].body : template(x.f.severity, x.why),
     ...(!ok || checked.firstBad.includes(i) ? { firstLineUnchecked: true } : {}) }
-}), ...restated.map(({ f, body }) => ({
-  path: f.file, line: f.line, finding: carriedOut.indexOf(f), body,
-  // Off the diff its first line drops the repair line and any qualification below, which no check weighs.
-  firstLineUnchecked: true,
-}))]
+}), ...reraised.map(f => {
+  const published = earlier[f.id].published
+  return { path: f.file, line: f.line, finding: carriedOut.indexOf(f),
+    body: `${published ? regraded(f, published) : template(f.severity, whyOf(f))}\n- ${repairNote(f)}`,
+    // Off the diff its first line drops the repair line and any qualification below, which no check weighs.
+    firstLineUnchecked: true }
+})]
 // A due resolve whose reply is on the thread is only resolved once reconfirmed; one with no reply of ours there
 // (replied: false) gets the fix note, and the thread resolves once that is published.
 const settledAway = (i) => rechecked[i] && ['fixed', 'na', 'withdrawn'].includes(carriedOut[i].status)
