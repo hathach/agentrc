@@ -300,6 +300,9 @@ class Rosters(Fixture):
         bad.write_text(json.dumps({'boards': [{'name': 'ok', 'tinyuf2': {'lock': ''}}]}))
         with self.assertRaisesRegex(hr.Refused, "not a plain file name"):
             hr.load_rosters([(str(bad), 'tinyuf2.lock')])
+        bad.write_text(json.dumps({'boards': [{'name': 'ok', 'tinyuf2': {'lock': None}}]}))
+        with self.assertRaisesRegex(hr.Refused, "ok: lock name None is not a plain file name"):
+            hr.load_rosters([(str(bad), 'tinyuf2.lock')])
 
     def test_identities_compare_as_udev_records_a_serial(self):
         self.assertEqual(hr.identity('  AB  CD/x,y '), 'ab_cd_x_y')

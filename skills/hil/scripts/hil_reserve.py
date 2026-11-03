@@ -175,6 +175,8 @@ def load_rosters(specs):
             if not isinstance(e, dict) or not isinstance(e.get('name'), str) or not e['name']:
                 raise Refused(f'roster {path}: an entry without a name')
             own = _field(e, selector) if selector != 'name' else _ABSENT
+            if own is not _ABSENT and not isinstance(own, str):
+                raise Refused(f'roster {path}: {e["name"]}: lock name {own!r} is not a plain file name')
             try:
                 lock = hil_boards.lock_name(e, None if own is _ABSENT else own)
             except ValueError as err:
