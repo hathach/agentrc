@@ -118,7 +118,6 @@ async function run(args, stubs = {}) {
 
 const pinned = (a) => ({ ok: true, head: H, top: '/w', repo: a.repo, pr: a.pr, ci: { state: 'green' }, pins: { mergeBase: a.mergeBase, scopeBase: a.scopeBase, mode: a.mode, groups: a.groups } })
 const board = (verdict, regression, testedHead = H) => ({ board: 'b1', verdict, regression, testedHead, report: '/r/b1.json' })
-const words = (s) => s.split(/\s+/).filter(Boolean).length
 // A list's [minItems, maxItems, id enum], as the runtime is asked to hold an answer to.
 const sized = (schema, key, id) => { const l = schema.properties[key]; return [l.minItems, l.maxItems, l.items.properties[id].enum] }
 const audited = (...fs) => ({ confirmed: [{ dir: 'src/core', dim: 'correctness: x', findings: fs }], dropped: [], unverified: [] })
@@ -264,46 +263,32 @@ test('a drafted comment that adds a claim, or is lost, falls back to the finding
     'a first line the check flags keeps its text and holds auto-post')
 })
 
-test('text over its limit is shortened, then marked long for the human, never cut', async () => {
-  const long = { summary: 'Prose, not bullets.', comments: [{ finding: 0, body: wordy(81) }, { finding: 1, body: '**high**: b' }] }
-  const fixed = await run(BASE, { audit: audited(finding('a'), finding('b', 'high', 20)), write: long,
-    shorten: { comments: [{ finding: 0, body: '**high**: a' }], answers: [], summary: '- a is broken' } })
-  const ask = fixed.calls.find(c => c.label === 'shorten')
-  assert.match(ask.prompt, /"finding":0/)
-  // Each list names exactly the ids asked, so the runtime has the agent correct a short answer; no ids, no enum.
-  assert.deepEqual(sized(fixed.calls.find(c => c.label === 'write').options.schema, 'comments', 'finding'), [2, 2, [0, 1]])
-  assert.deepEqual(sized(ask.options.schema, 'comments', 'finding'), [1, 1, [0]])
-  assert.deepEqual(sized(ask.options.schema, 'answers', 'finding'), [0, 0, undefined])
-  const prose = await run(BASE, { audit: audited(finding('a')), write: { summary: 'Prose, not bullets.', comments: [{ finding: 0, body: '**high**: a' }] }, shorten: null })
-  const summaryOnly = prose.calls.find(c => c.label === 'shorten').options.schema
-  assert.deepEqual([sized(summaryOnly, 'comments', 'finding'), sized(summaryOnly, 'answers', 'finding')], [[0, 0, undefined], [0, 0, undefined]])
-  assert.doesNotMatch(ask.prompt, /"body":"\*\*high\*\*: b"/, 'only the text over its limit is sent')
-  assert.deepEqual(fixed.result.draft.comments.map(c => c.body), ['**high**: a', '**high**: b'])
-  assert.ok(!fixed.logs.some(l => /over length/.test(l)))
-  assert.match(fixed.result.draft.body, /^- a is broken$/m)
-  assert.equal(fixed.calls.find(c => c.label === 'check-draft').prompt.includes('**high**: a'), true, 'the claim check reads the shortened text')
-
-  const kept = await run(BASE, { audit: audited(finding('a')), write: { summary: 'Prose.', comments: [{ finding: 0, body: `**high**: ${wordy(80)}` }] }, shorten: null })
-  assert.equal(words(kept.result.draft.comments[0].body), 81, 'never cut')
-  assert.doesNotMatch(kept.result.draft.body, /Prose/, 'a summary still over its format is left out')
-  assert.ok(kept.logs.some(l => /over length, for the human to shorten: src\/core\/a\.c:10$/.test(l)))
-  assert.ok(kept.logs.includes('summary left out: still over its format after shortening'))
-  const line = await run(BASE, { audit: audited(finding('a')), write: { summary: '- ok', comments: [{ finding: 0, body: `**high**: ${'x'.repeat(301)}` }] }, shorten: null })
-  assert.ok(line.logs.some(l => /over length, for the human to shorten: src\/core\/a\.c:10/.test(l)), 'a line over about three rendered lines is long')
-  const edge = await run(BASE, { audit: audited(finding('a')), write: { summary: `- ${wordy(30)}`, comments: [{ finding: 0, body: `**high**: ${wordy(77)}\n- ${wordy(2)}` }] } })
-  assert.equal(edge.labels.includes('shorten'), false, 'at the limit nothing is shortened')
-  const bare = { summary: '- ok', comments: [{ finding: 0, body: 'No heading here.' }, { finding: 1, body: '**high**: b\n- 1\n- 2\n- 3\n- 4' }] }
-  const off = await run(BASE, { audit: audited(finding('a'), finding('b', 'high', 20)), write: bare, shorten: null })
-  assert.match(off.calls.find(c => c.label === 'shorten').prompt, /No heading here[\s\S]*- 4/, 'a comment off its format is rewritten')
-  assert.deepEqual(off.result.draft.comments.map(c => c.body), ['**high**: a', '**high**: b'], 'still off its format: the template')
-  const wrong = await run(BASE, { audit: audited(finding('a')), write: { summary: '- ok', comments: [{ finding: 0, body: '**low**: a' }] }, shorten: null })
+test('text of any length is drafted as written: nothing measures, shortens or holds it', async () => {
+  const long = `**high**: ${wordy(200)}\n- ${'x'.repeat(700)}\n- 2\n- 3\n- 4`
+  const summary = `- ${wordy(60)}`
+  const r = await run(BASE, { audit: audited(finding('a'), finding('b', 'high', 20)), write: { summary, comments: [{ finding: 0, body: long }, { finding: 1, body: '**high**: b' }] } })
+  // Each list names exactly the ids asked, so the runtime has the agent correct a short answer.
+  assert.deepEqual(sized(r.calls.find(c => c.label === 'write').options.schema, 'comments', 'finding'), [2, 2, [0, 1]])
+  assert.deepEqual(r.result.draft.comments.map(c => [c.body, c.firstLineUnchecked]), [[long, undefined], ['**high**: b', undefined]],
+    'four bullets and a 700-character line, kept whole')
+  assert.ok(r.result.draft.body.startsWith(`${summary}\n`), 'a long one-bullet summary is kept')
+  assert.equal(r.labels.some(l => l.startsWith('shorten')), false)
+  assert.ok(!r.logs.some(l => /over length|shorten/.test(l)))
+  const write = r.calls.find(c => c.label === 'write').prompt
+  assert.match(write, /only the bullets it needs/)
+  assert.match(write, /as short as it allows/)
+  assert.doesNotMatch(write, /\d+ words|characters|at most 3/, 'the writer is given no length')
+  const prose = await run(BASE, { audit: audited(finding('a')), write: { summary: 'Prose, not bullets.', comments: [{ finding: 0, body: '**high**: a' }] } })
+  assert.doesNotMatch(prose.result.draft.body, /Prose/, 'a summary off its format is left out')
+  assert.ok(prose.logs.includes('summary left out: off its format'))
+  const bare = { summary: '- ok', comments: [{ finding: 0, body: 'No heading here.' }, { finding: 1, body: '**high**: ' }] }
+  const off = await run(BASE, { audit: audited(finding('a'), finding('b', 'high', 20)), write: bare })
+  assert.deepEqual(off.result.draft.comments.map(c => [c.body, c.firstLineUnchecked]), [['**high**: a', true], ['**high**: b', true]],
+    'no heading, or no problem after it: the finding\'s own words')
+  const wrong = await run(BASE, { audit: audited(finding('a')), write: { summary: '- ok', comments: [{ finding: 0, body: '**low**: a' }] } })
   assert.deepEqual(wrong.result.draft.comments.map(c => c.body), ['**high**: a'], 'a heading must name its finding\'s severity')
-  const empty = await run(BASE, { audit: audited(finding('a'), finding('b', 'high', 20)), shorten: null,
-    write: { summary: '- ok', comments: [{ finding: 0, body: '**high**: ' }, { finding: 1, body: '**high**: b\n+ 1\n+ 2\n+ 3\n+ 4' }] } })
-  assert.deepEqual(empty.result.draft.comments.map(c => c.body), ['**high**: a', '**high**: b'], 'no problem after the heading, or 4 bullets of any marker')
-  assert.ok(edge.result.draft.body.startsWith(`- ${wordy(30)}\n`), 'a direction bullet at its limit is kept')
   const plus = await run(BASE, { audit: audited(finding('a')), write: { summary: '+ one', comments: [{ finding: 0, body: '**high**: a' }] } })
-  assert.equal(plus.labels.includes('shorten'), false, 'a `+` bullet summary is in format')
+  assert.match(plus.result.draft.body, /^\+ one$/m, 'a `+` bullet summary is in format')
 })
 
 test('open thread claims are judged; a confirmed one covers our same finding and counts once', async () => {
@@ -560,12 +545,10 @@ test('a draft or check agent that throws takes its null path; a check relay that
   assert.deepEqual([write.result.verdict.event, write.result.draft.comments.map(c => c.body)], ['REQUEST_CHANGES', ['**high**: a']])
   const checked = await run(BASE, { audit: audited(finding('a')), write: { summary: '- ok', comments: [{ finding: 0, body: '**high**: a, and more' }] }, 'check-draft': thrown('check-draft') })
   assert.deepEqual(checked.result.draft.comments.map(c => c.body), ['**high**: a'], 'unchecked: the finding\'s own words')
-  const shorten = await run(BASE, { audit: audited(finding('a')), write: { summary: '- ok', comments: [{ finding: 0, body: `**high**: ${'w '.repeat(80).trim()}` }] }, shorten: thrown('shorten') })
-  assert.ok(shorten.logs.some(l => /over length, for the human to shorten/.test(l)))
   const nits = audited(finding('a', 'nit'), finding('a too', 'nit'))
   const beyond = await run(BASE, { audit: nits, group: { groups: [{ findings: [0, 1], claims: [] }] }, beyond: thrown('beyond') })
   assert.deepEqual([beyond.result.draft.comments.length, beyond.result.coverage.unjudged], [2, [{ kind: 'beyond' }]])
-  for (const [label, r] of Object.entries({ check, write, 'check-draft': checked, shorten, beyond })) {
+  for (const [label, r] of Object.entries({ check, write, 'check-draft': checked, beyond })) {
     assert.ok(r.logs.includes(`${label} errored — ${label} exploded`), `${label} logs its error`)
   }
 })
@@ -689,49 +672,11 @@ test('an incremental review rechecks earlier findings: fixed ones get a fix note
   assert.equal(lost.result.findings.find(f => f.id === 'pr7-f1').status, 'open')
 })
 
-test('a comment still over its limit after shortening, its fallback included, gets one more checked round', async () => {
-  const passes = { bad: [], firstBad: [], summaryBad: false, answersBad: [] }
-  const clean = await run(BASE, { audit: audited(finding('a')) })
-  assert.ok(!clean.labels.some(l => l.endsWith(':again')), 'nothing over its limit, no extra call')
-  assert.match(clean.calls.find(c => c.label === 'write').prompt, /about 60 words, never over 80/, 'written to a margin under the limit')
-
-  const near = await run(BASE, { audit: audited(finding('a')), write: { summary: '', comments: [{ finding: 0, body: `**high**: ${wordy(84)}` }] },
-    shorten: (p, label) => label === 'shorten' ? { comments: [{ finding: 0, body: `**high**: ${wordy(83)}` }], answers: [] } : { comments: [{ finding: 0, body: '**high**: a, in fewer words' }] },
-    'check-draft': () => passes })
-  assert.match(near.calls.find(c => c.label === 'shorten').prompt, /"words":85/, 'the first round is told its measure')
-  assert.match(near.calls.find(c => c.label === 'shorten:again').prompt, /"words":85,"longestLine":177/,
-    'a first-round reply still over is not taken: the second round gets the written text, told its measure')
-  assert.doesNotMatch(near.calls.find(c => c.label === 'shorten:again').prompt, /The summary/, 'the second round gets the comment format only')
-  assert.match(near.calls.find(c => c.label === 'check-draft:again').prompt, /a, in fewer words/, 'the replacement is checked')
-  assert.deepEqual([near.result.draft.comments[0].body, near.result.draft.comments[0].firstLineUnchecked], ['**high**: a, in fewer words', undefined])
-  assert.ok(!near.logs.some(l => /over length/.test(l)))
-
-  const fallback = await run(BASE, { audit: audited(finding(wordy(90))), shorten: { comments: [{ finding: 0, body: '**high**: the finding, short' }] },
-    'check-draft': (p, label) => label === 'check-draft' ? { ...passes, bad: [0] } : { bad: [], firstBad: [0] } })
-  assert.deepEqual([fallback.result.draft.comments[0].body, fallback.result.draft.comments[0].firstLineUnchecked], ['**high**: the finding, short', true],
-    'the finding\'s own words over the limit are shortened too; a first line the check flags still holds auto-post')
-  assert.match(fallback.calls.find(c => c.label === 'shorten:again').prompt, /"why":"w w w/, 'shortened from its finding')
-
-  const refused = await run(BASE, { audit: audited(finding(wordy(90))), shorten: { comments: [{ finding: 0, body: '**high**: adds a claim' }] },
-    'check-draft': (p, label) => label === 'check-draft' ? { ...passes, bad: [0] } : { bad: [0], firstBad: [] } })
-  assert.equal(refused.result.draft.comments[0].body, `**high**: ${wordy(90)}`, 'a replacement the check flags is dropped, never cut')
-  assert.ok(refused.logs.some(l => /over length, for the human to shorten: src\/core\/a\.c:10$/.test(l)))
-  const still = await run(BASE, { audit: audited(finding(wordy(90))), shorten: { comments: [{ finding: 0, body: `**high**: ${wordy(85)}` }] },
-    'check-draft': (p, label) => label === 'check-draft' ? { ...passes, bad: [0] } : passes })
-  assert.equal(still.labels.includes('check-draft:again'), false, 'a replacement still over is not even checked')
-  assert.equal(still.result.draft.comments[0].body, `**high**: ${wordy(90)}`)
-  const dead = await run(BASE, { audit: audited(finding(wordy(90))), shorten: null, 'check-draft': (p, label) => label === 'check-draft' ? { ...passes, bad: [0] } : passes })
-  assert.equal(dead.result.draft.comments[0].body, `**high**: ${wordy(90)}`, 'a dead round keeps the earlier text')
-  const unchecked = await run(BASE, { audit: audited(finding(wordy(90))), shorten: { comments: [{ finding: 0, body: '**high**: short' }] },
-    'check-draft': (p, label) => label === 'check-draft' ? { ...passes, bad: [0] } : null })
-  assert.deepEqual([unchecked.result.draft.comments[0].body, unchecked.result.draft.comments[0].firstLineUnchecked], [`**high**: ${wordy(90)}`, true],
-    'a replacement no second check passed is not taken, and the earlier hold stays')
-
-  const wide = await run(BASE, { audit: audited(finding('a')), write: { summary: '', comments: [{ finding: 0, body: `**high**: ${'x'.repeat(275)}` }] }, shorten: null })
-  assert.ok(wide.labels.includes('shorten:again'), 'a first line that fits inline but not as a body line is over')
-  assert.ok(wide.logs.some(l => /over length, for the human to shorten: src\/core\/a\.c:10$/.test(l)))
-  const edge = await run(BASE, { audit: audited(finding('a')), write: { summary: '', comments: [{ finding: 0, body: `**high**: ${wordy(79)}` }] }, shorten: null })
-  assert.ok(edge.labels.includes('shorten:again'), 'at 80 words inline, its body line counts 81')
+test('a comment the check flags falls back to its finding\'s own words, whatever their length, with no other round', async () => {
+  const r = await run(BASE, { audit: audited(finding(wordy(100))), 'check-draft': { bad: [0], firstBad: [], summaryBad: false } })
+  assert.deepEqual([r.result.draft.comments[0].body, r.result.draft.comments[0].firstLineUnchecked], [`**high**: ${wordy(100)}`, true])
+  assert.deepEqual(r.labels.filter(l => /^(write|check-draft|shorten)/.test(l)), ['write', 'check-draft'], 'one write, one check')
+  assert.ok(!r.logs.some(l => /over length/.test(l)))
 })
 
 test('a finding an auto-fix repair noted gets no second fix note, and one still standing is raised again on a new comment', async () => {
@@ -758,41 +703,23 @@ test('a finding an auto-fix repair noted gets no second fix note, and one still 
   relabelled.open[0].published = '**bug**: overrun past the end of buf'
   assert.equal((await run(inc, { ledger: relabelled, recheck: () => regraded, check: pinned(inc) })).result.draft.comments[0].body,
     '**bug**: overrun past the end of buf\n- The repair in cccccccccccc did not fix this; its earlier thread was resolved.', 'a heading the human changed is left alone')
-  edited.open[0].published = `**high**: ${wordy(85)}`
-  const longEdit = await run(inc, { ledger: edited, recheck: () => ({ state: 'open', reason: 'still' }), check: pinned(inc), shorten: { comments: [{ finding: 0, body: '**high**: short' }] } })
-  assert.equal(longEdit.labels.includes('shorten:again'), false, 'the human\'s own words are never rewritten')
-  assert.ok(longEdit.logs.some(l => /over length, for the human to shorten: src\/core\/a\.c:10$/.test(l)))
-  const wideEdit = repaired(done)
-  wideEdit.open[0].published = `**high**: ${'x'.repeat(275)}`
-  const wide = await run(inc, { ledger: wideEdit, recheck: () => ({ state: 'open', reason: 'still' }), check: pinned(inc) })
-  assert.deepEqual(wide.result.draft.comments.map(c => c.body), [wideEdit.open[0].published], 'measured as a body line too, the note goes in the body')
-  assert.match(wide.result.draft.body, /^Raised again at `src\/core\/a\.c:10`\./m)
+  const NOTE = '\n- The repair in cccccccccccc did not fix this; its earlier thread was resolved.'
+  edited.open[0].published = `**high**: ${wordy(85)} ${'x'.repeat(300)}`
+  const longEdit = await run(inc, { ledger: edited, recheck: () => ({ state: 'open', reason: 'still' }), check: pinned(inc) })
+  assert.deepEqual(longEdit.result.draft.comments.map(c => c.body), [`${edited.open[0].published}${NOTE}`], 'a long human edit is kept whole, its repair note on the comment')
+  assert.doesNotMatch(longEdit.result.draft.body, /Raised again/)
+  assert.equal(longEdit.labels.some(l => l.startsWith('shorten')), false, 'the human\'s own words are never rewritten')
   const longWhy = repaired(done)
   longWhy.open[0].why = wordy(85)
-  const reraise = (stubs) => run(inc, { ledger: longWhy, recheck: () => ({ state: 'open', reason: 'still' }), check: pinned(inc), ...stubs })
-  const shortened = await reraise({ shorten: { comments: [{ finding: 0, body: '**high**: overrun, in fewer words' }] }, 'check-draft': { bad: [], firstBad: [] } })
-  assert.match(shortened.calls.find(c => c.label === 'shorten:again').prompt, /"why":"w w w/, 'an unedited comment raised again is shortened from its finding')
-  assert.match(shortened.calls.find(c => c.label === 'check-draft:again').prompt, /overrun, in fewer words/, 'and checked')
-  assert.deepEqual(shortened.result.draft.comments.map(c => [c.body, c.firstLineUnchecked]),
-    [['**high**: overrun, in fewer words\n- The repair in cccccccccccc did not fix this; its earlier thread was resolved.', true]])
-  assert.doesNotMatch(shortened.result.draft.body, /Raised again/, 'shortened, its repair note fits on the comment')
-  assert.ok(!shortened.logs.some(l => /over length/.test(l)))
-  const flagged = await reraise({ shorten: { comments: [{ finding: 0, body: '**high**: adds a claim' }] }, 'check-draft': { bad: [0], firstBad: [] } })
-  assert.deepEqual(flagged.result.draft.comments.map(c => c.body), [`**high**: ${wordy(85)}`], 'a replacement the check flags is dropped, never cut')
-  assert.match(flagged.result.draft.body, /^Raised again at `src\/core\/a\.c:10`\./m)
-  assert.ok(flagged.logs.some(l => /over length, for the human to shorten: src\/core\/a\.c:10$/.test(l)))
+  const unedited = await run(inc, { ledger: longWhy, recheck: () => ({ state: 'open', reason: 'still' }), check: pinned(inc) })
+  assert.deepEqual(unedited.result.draft.comments.map(c => [c.body, c.firstLineUnchecked]), [[`**high**: ${wordy(85)}${NOTE}`, true]])
+  assert.ok(!unedited.logs.some(l => /over length/.test(l)))
   const visible = await run(inc, { ledger: repaired({ ...done, resolved: false }), recheck: () => ({ state: 'open', reason: 'still' }), check: pinned(inc) })
   assert.deepEqual(visible.result.draft.comments, [], 'its thread is still open, so its comment still states it')
   const reopenedThread = { ...repaired(done), heldThreads: [{ findingId: 'pr7-f1', commentId: 901, why: 'reopened after it was resolved' }] }
   const restated = await run(inc, { ledger: reopenedThread, recheck: () => ({ state: 'open', reason: 'still' }), check: pinned(inc) })
   assert.deepEqual(restated.result.draft.comments, [], 'reopened since the repair resolved it, its thread states it again')
-  const long = repaired(done)
-  long.open[0].published = `**high**: ${'w '.repeat(68).trim()}`
-  const near = await run(inc, { ledger: long, recheck: () => ({ state: 'open', reason: 'still' }), check: pinned(inc) })
-  assert.deepEqual(near.result.draft.comments.map(c => c.body), [long.open[0].published], 'the edited claim is kept whole, its repair note left out')
-  assert.match(near.result.draft.body, /^Raised again at `src\/core\/a\.c:10`\. The repair in cccccccccccc did not fix it; its earlier thread was resolved\.$/m)
-  assert.ok(!near.logs.some(l => /over length/.test(l)), 'nothing over its limit')
-  assert.doesNotMatch(still.result.draft.body, /Raised again/, 'a note that fits stays on the comment')
+  assert.doesNotMatch(still.result.draft.body, /Raised again/, 'the note stays on the comment')
   const shifted = await run(inc, { ledger: repaired(done), recheck: () => ({ state: 'open', reason: 'still', file: 'src/core/a.c', line: 14 }), check: pinned(inc) })
   assert.deepEqual([shifted.result.draft.comments.map(c => [c.path, c.line]), shifted.result.findings[0].line], [[['src/core/a.c', 14]], 14],
     'raised again where the recheck found it on this head')
@@ -878,25 +805,17 @@ test('a discussion run judges only answered findings, with no audit and no claim
   assert.equal(idle.result.status, 'nothing-new')
 })
 
-test('a thread answer over its limit is shortened, then marked long; the answer prompt carries the format', async () => {
+test('a thread answer of any length is kept as the recheck wrote it; the answer prompt carries the format', async () => {
   const inc = { ...BASE, mode: 'incremental', scopeBase: OLD }
   const base = { check: pinned(inc), ledger: { reviews: 1, last: { head: OLD }, open: [LEDGER.open[0]] }, disputes: { disputes: [DISPUTE] } }
-  const wordy = 'w '.repeat(61).trim()
-  const short = await run(inc, { ...base, recheck: () => ({ state: 'upheld', reason: 'r', answer: wordy }),
-    shorten: { comments: [], answers: [{ finding: 'pr7-f1', body: 'Still stands: `a.c:12` reads it unmasked.' }] }, 'check-draft': { bad: [], firstBad: [], summaryBad: false, answersBad: [] } })
-  assert.match(short.calls.find(c => c.label === 'recheck:pr7-f1').prompt, /at most 60 words/)
-  assert.deepEqual(short.result.findings[0].disputes[0].answer, { body: 'Still stands: `a.c:12` reads it unmasked.', resolve: false })
-  assert.deepEqual(sized(short.calls.find(c => c.label === 'shorten').options.schema, 'answers', 'finding'), [1, 1, ['pr7-f1']])
-  const kept = await run(inc, { ...base, recheck: () => ({ state: 'upheld', reason: 'r', answer: wordy }), shorten: null })
-  assert.deepEqual(kept.result.findings[0].disputes[0].answer, { body: wordy, resolve: false })
-  assert.ok(kept.logs.some(l => /over length, for the human to shorten: answer on pr7-f1/.test(l)))
-  const added = await run(inc, { ...base, recheck: () => ({ state: 'upheld', reason: 'r', answer: wordy }),
-    shorten: { comments: [], answers: [{ finding: 'pr7-f1', body: 'Still stands, and it leaks.' }] }, 'check-draft': { bad: [], firstBad: [], summaryBad: false, answersBad: ['pr7-f1'] } })
-  assert.deepEqual(added.result.findings[0].disputes[0].answer, { body: wordy, resolve: false }, 'a shortening that adds a claim is undone')
-  assert.match(added.calls.find(c => c.label === 'check-draft').prompt, /"shortened":"Still stands, and it leaks\."/, 'with no new comment the one check still runs')
-  const dead = await run(inc, { ...base, recheck: () => ({ state: 'upheld', reason: 'r', answer: wordy }),
-    shorten: { comments: [], answers: [{ finding: 'pr7-f1', body: 'Still stands.' }] }, 'check-draft': null })
-  assert.equal(dead.result.findings[0].disputes[0].answer.body, wordy, 'an unchecked shortening is undone')
+  const long = `${wordy(100)} ${'x'.repeat(400)}`
+  const kept = await run(inc, { ...base, recheck: () => ({ state: 'upheld', reason: 'r', answer: long }) })
+  const ask = kept.calls.find(c => c.label === 'recheck:pr7-f1').prompt
+  assert.match(ask, /the evidence and nothing else, bullets for more than one point/)
+  assert.doesNotMatch(ask, /\d+ words/)
+  assert.deepEqual(kept.result.findings[0].disputes[0].answer, { body: long, resolve: false })
+  assert.equal(kept.labels.some(l => l.startsWith('shorten')), false)
+  assert.ok(!kept.logs.some(l => /over length/.test(l)))
 })
 
 test('a reviewer\'s label never sets our level, and a confirmed claim without its grading is unjudged, never a blocker', async () => {
