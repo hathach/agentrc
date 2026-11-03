@@ -118,6 +118,34 @@ class SettleRules(unittest.TestCase):
         agrees = status('success', 'Review skipped: manual review required for this OSS repository', '2026-09-25T09:00:01Z')
         self.assertEqual(harvest.coderabbit(HEAD, [agrees], [run_], manual, EVENT)['kind'], 'skipped', 'one that agrees')
 
+    def test_a_no_files_to_review_coderabbit_check_run_is_a_skip_never_askable(self):
+        # #372: hathach/tinyusb#4246's rebased head, check run 124595415060.
+        run_ = {'id': 124595415060, 'name': 'CodeRabbit', 'status': 'completed', 'conclusion': 'skipped', 'started_at': '2026-09-25T09:00:00Z',
+                'completed_at': '2026-09-25T09:00:01Z', 'output': {'title': 'No files to review', 'summary': 'Result: Skipped - No files to review'}}
+        bot = 'coderabbitai[bot]'
+        for what, issue in (('no summary', []),
+                            ('a summary with a Trigger review box', [comment(bot, 'summary\n> - [ ] 🔍 Trigger review', id_=5)])):
+            with self.subTest(what):
+                r = harvest.coderabbit(HEAD, [], [run_], issue, EVENT)
+                self.assertEqual((r['state'], r['kind'], r['sha'], r['reason']), ('settled', 'skipped', HEAD, 'check run skipped: No files to review'))
+
+    def test_a_review_paused_coderabbit_check_run_reads_paused_with_its_resume_command(self):
+        # #381: adafruit/Adafruit_TinyUSB_Arduino#595's head; the run completed 38s after the pause comment's last edit.
+        run_ = {'id': 13, 'name': 'CodeRabbit', 'status': 'completed', 'conclusion': 'skipped', 'started_at': '2026-11-01T20:21:40Z',
+                'completed_at': '2026-11-01T20:22:12Z', 'output': {'title': 'Review paused', 'summary': 'Result: Skipped - Review paused'}}
+        bot = 'coderabbitai[bot]'
+        event = '2026-11-01T20:21:12Z'
+        older = comment(bot, 'Reviews paused ' + harvest.CR_PAUSED, at='2026-11-01T18:00:00Z', updated='2026-11-01T20:21:34Z', id_=6)
+        for what, issue in (('a pause comment 38s older', [older]), ('no pause comment', [])):
+            with self.subTest(what):
+                r = harvest.coderabbit(HEAD, [], [run_], issue, event)
+                self.assertEqual((r['state'], r['kind'], r['sha']), ('settled', 'paused', HEAD))
+                self.assertIn('`@coderabbitai resume`', r['reason'])
+        newer = dict(older, updated_at='2026-11-01T20:30:00Z')
+        r = harvest.coderabbit(HEAD, [], [run_], [newer], event)
+        self.assertEqual((r['kind'], r['sha']), ('paused', None), 'a newer pause comment reads paused as before')
+        self.assertIn('`@coderabbitai resume`', r['reason'])
+
     def test_coderabbit_pause_and_rate_limit(self):
         bot = 'coderabbitai[bot]'
         paused = comment(bot, 'x ' + harvest.CR_PAUSED, at='2026-09-25T07:00:00Z', updated='2026-09-25T09:30:00Z')
