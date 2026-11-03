@@ -530,7 +530,8 @@ class ForgetTest(unittest.TestCase):
         # worktree.useRelativePaths (git 2.48) writes the tree's .git relative to the admin dir.
         tree = self.repo.parent / 'rel'
         admin = self.admin(f'{os.path.relpath(tree / ".git", self.repo / ".git" / "worktrees" / "other")}\n'.encode())
-        self.assertEqual(hooks.registration(str(tree)), admin)
+        # registration builds on the resolved common dir: Windows' TEMP may be an 8.3 short name (RUNNER~1)
+        self.assertEqual(hooks.registration(str(tree)), admin.resolve())
 
 
 class KillTreeTest(unittest.TestCase):
