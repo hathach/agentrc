@@ -90,8 +90,8 @@ sudo <skill dir>/scripts/usb_recover.sh unshield <busport> $$  # restore the rec
 ## 3. The rungs — go straight to the one triage names
 
 **Rung 1 — wedged DUT: reset it through its own probe.** The contract's Recovery
-names the board's recovery flasher (its `flasher_recover`, else its primary flasher)
-and the probe serial. A convoy-safe one (section 2) needs no shield; for openocd:
+names the board's recovery flasher (its `flasher_recover`, else its primary flasher, both
+from agentrc's board registry, `hil` skill) and the probe serial. A convoy-safe one (section 2) needs no shield; for openocd:
 
 ```bash
 openocd -c "adapter serial <probe-sn>" <flasher args> -c "init; reset run; shutdown"

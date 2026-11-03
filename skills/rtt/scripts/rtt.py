@@ -27,11 +27,13 @@ test harness uses — read/in_waiting/write/close/timeout, reset_input_buffer,
 context-manager use, plus an `eof` latch — alongside RttError, RTT_BANNER_RE and
 strip_banner. One self-contained file, stdlib only: tinyusb stages rtt.py alone (its
 hil-contract hil_remote.py) and loads it by path (test/hil/hil_test.py), so a rename or
-CLI change needs those consumers updated.
+CLI change needs those consumers updated. Only --hil-config loads another file, agentrc's
+board registry (hil_boards), on first use.
 """
 import argparse
 import contextlib
 import errno
+import importlib.util
 import json
 import math
 import os
@@ -775,11 +777,26 @@ def dump_ring(probe: str, device: str, addr: int, out_path: str, channel: int = 
 HIL_PROBE_ROUTES = {'jlink': 'jlink', 'openocd': 'openocd', 'stlink': 'openocd'}
 
 
+def hil_boards():
+    """agentrc's board registry (skills/hil/scripts/hil_boards.py), loaded on first use only, so
+    a harness may stage this file alone. Kept identical in rtt.py and probe_state.py."""
+    loader = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), '..', 'hil', 'scripts',
+                          'hil_load.py')
+    spec = importlib.util.spec_from_file_location('agentrc_hil_load', loader)
+    if spec.name not in sys.modules:
+        if not os.path.isfile(spec.origin):
+            raise ImportError(f'{spec.origin} is missing')
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        sys.modules.setdefault(spec.name, mod)
+    return sys.modules[spec.name].load(spec.name, spec.origin).load_file('skills/hil/scripts/hil_boards.py')
+
+
 def hil_flasher(path, board):
-    """The `flasher` of one board in a project's HIL config json ({"boards": [{"name",
-    "flasher": {"name", "uid", "args", "vid_pid"}}]}), checked but not completed: only
-    flasher.name must be there, what else is missing is the caller's to supply. Raises
-    ValueError. Kept identical in rtt.py and probe_state.py (see rtt.py's module docstring)."""
+    """The `flasher` of one board in a project's HIL config json ({"boards": [{"name", "uid", "probe"}]}):
+    its probe's in agentrc's registry, or an unregistered bench board's own
+    (hil_boards.resolve). Raises ValueError. Kept identical in rtt.py and probe_state.py (see
+    rtt.py's module docstring)."""
     try:
         with open(path, encoding='utf-8-sig') as f:
             config = json.load(f)
@@ -792,16 +809,13 @@ def hil_flasher(path, board):
     if len(found) != 1:
         names = ', '.join(sorted(str(b.get('name')) for b in boards))
         raise ValueError(f'--board {board}: {len(found)} entries of that name in {path} (it has: {names})')
-    flasher = found[0].get('flasher')
-    if not isinstance(flasher, dict) or not isinstance(flasher.get('name'), str):
-        raise ValueError(f'--board {board}: no flasher.name in {path}')
+    try:
+        flasher = hil_boards().resolve(found[0])['flasher']
+    except (ImportError, ValueError) as e:
+        raise ValueError(f'--board {board} in {path}: {e}')
     if flasher['name'] not in HIL_PROBE_ROUTES:
         raise ValueError(f"--board {board} is flashed over {flasher['name']!r}, which is no debug-probe route "
                          f"(known: {', '.join(HIL_PROBE_ROUTES)}); name the probe with explicit flags")
-    for key in ('uid', 'args', 'vid_pid'):
-        if key in flasher and (not isinstance(flasher[key], str) or not flasher[key].strip()):
-            raise ValueError(f'--board {board}: flasher.{key} in {path} must be a non-empty string, '
-                             f'got {flasher[key]!r}')
     if flasher['name'] == 'stlink' and 'args' in flasher:
         raise ValueError(f"--board {board}: a stlink entry's args are not openocd's")
     return flasher

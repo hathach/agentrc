@@ -1,0 +1,164 @@
+{
+  "boards": {
+    "000621000000": {
+      "name": "frdm_k64f",
+      "flasher": {"name": "jlink", "args": "-device MK64FN1M0xxx12"},
+      "flasher_recover": {"name": "openocd", "args": "-f interface/jlink.cfg -c \"transport select swd\" -f target/k60.cfg -c \"adapter speed 4000\""}
+    },
+    "0E205D19": {
+      "name": "ek_tm4c123gxl",
+      "flasher": {"name": "lm4flash", "args": "-v"},
+      "flasher_recover": {"name": "openocd", "args": "-f interface/ti-icdi.cfg -c \"transport select jtag\" -c \"set WORKAREASIZE 0x8000\" -c \"set CHIPNAME tm4c123gh6pm\" -f target/ti/stellaris.cfg -c \"reset_config none\" -c \"tm4c123gh6pm.cpu configure -event reset-assert-post {sleep 100}\""}
+    },
+    "4ea4f48f6bc3ee11bbb9d00f9e1b1c54": {
+      "name": "espressif_p4_function_ev",
+      "flasher": {"name": "esptool", "args": "-b 1500000", "note": "use --force for ESP32-P4 v0.1"}
+    },
+    "3ea619acd1cdeb11a0a0b806e93fd3f1": {
+      "name": "espressif_s3_devkitm",
+      "flasher": {"name": "esptool", "args": "-b 1500000"}
+    },
+    "683944004": {
+      "name": "nrf52840dk",
+      "flasher": {"name": "jlink", "args": "-device nrf52840_xxaa"},
+      "flasher_recover": {"name": "openocd", "args": "-f interface/jlink.cfg -c \"transport select swd\" -c \"adapter speed 4000\" -f target/nrf52.cfg"}
+    },
+    "E6614C311B597D32": {
+      "name": "max32666fthr",
+      "flasher": {"name": "openocd", "vid_pid": "0x2e8a 0x000c", "args": "-f interface/cmsis-dap.cfg -f target/max32665.cfg", "verify": true}
+    },
+    "000063728691": {
+      "name": "metro_m4_express",
+      "flasher": {"name": "jlink", "args": "-device ATSAMD51J19"},
+      "flasher_recover": {"name": "openocd", "args": "-f interface/jlink.cfg -c \"transport select swd\" -c \"adapter speed 4000\" -f target/atsame5x.cfg"}
+    },
+    "000724441579": {
+      "name": "lpcxpresso11u37",
+      "flasher": {"name": "jlink", "args": "-device LPC11U37/401"},
+      "flasher_recover": {"name": "openocd", "args": "-f interface/jlink.cfg -c \"transport select swd\" -f target/lpc11xx.cfg -c \"adapter speed 4000\"", "verify": false}
+    },
+    "611000000": {
+      "name": "ea4088_quickstart",
+      "flasher": {"name": "jlink", "args": "-device LPC4088"},
+      "flasher_recover": {"name": "openocd", "args": "-f interface/jlink.cfg -c \"transport select swd\" -f target/lpc40xx.cfg -c \"adapter speed 4000\"", "verify": false}
+    },
+    "000727648789": {
+      "name": "lpcxpresso55s69",
+      "flasher": {"name": "jlink", "args": "-device LPC55S69_M33_0"},
+      "flasher_recover": {"name": "openocd", "args": "-f interface/jlink.cfg -c \"transport select swd\" -c \"adapter speed 1000\" -c \"swd newdap lpc55s69 cpu -expected-id 0x6ba02477\" -c \"dap create lpc55s69.dap -chain-position lpc55s69.cpu\" -c \"target create lpc55s69.cpu cortex_m -dap lpc55s69.dap -ap-num 0\" -c \"cortex_m reset_config sysresetreq\""}
+    },
+    "000831174392": {
+      "name": "ra4m1_ek",
+      "flasher": {"name": "jlink", "args": "-device R7FA4M1AB"},
+      "flasher_recover": {"name": "openocd", "args": "-f interface/jlink.cfg -c \"transport select swd\" -c \"adapter speed 1000\" -c \"swd newdap ra4m1 cpu -expected-id 0\" -c \"dap create ra4m1.dap -chain-position ra4m1.cpu\" -c \"target create ra4m1.cpu cortex_m -dap ra4m1.dap\" -c \"cortex_m reset_config sysresetreq\""}
+    },
+    "000831915224": {
+      "name": "ra6m5_ek",
+      "flasher": {"name": "jlink", "args": "-device R7FA6M5BH"},
+      "flasher_recover": {"name": "openocd", "args": "-f interface/jlink.cfg -c \"transport select swd\" -c \"adapter speed 1000\" -c \"swd newdap ra6m5 cpu -expected-id 0\" -c \"dap create ra6m5.dap -chain-position ra6m5.cpu\" -c \"target create ra6m5.cpu cortex_m -dap ra6m5.dap\" -c \"cortex_m reset_config sysresetreq\""}
+    },
+    "E6614103E72C1D2F": {
+      "name": "raspberry_pi_pico",
+      "flasher": {"name": "openocd", "vid_pid": "0x2e8a 0x000c", "args": "-f interface/cmsis-dap.cfg -f target/rp2040.cfg -c \"adapter speed 5000\"", "verify": true}
+    },
+    "E6633861A3819D38": {
+      "name": "raspberry_pi_pico_w",
+      "flasher": {"name": "openocd", "vid_pid": "0x2e8a 0x000c", "args": "-f interface/cmsis-dap.cfg -f target/rp2040.cfg -c \"adapter speed 5000\"", "verify": true}
+    },
+    "E6633861A3978538": {
+      "name": "raspberry_pi_pico2",
+      "flasher": {"name": "openocd", "vid_pid": "0x2e8a 0x000c", "args": "-f interface/cmsis-dap.cfg -f target/rp2350.cfg -c \"adapter speed 5000\"", "verify": true}
+    },
+    "E663AC91D3359B38": {
+      "name": "adafruit_fruit_jam",
+      "flasher": {"name": "openocd", "vid_pid": "0x2e8a 0x000c", "args": "-f interface/cmsis-dap.cfg -f target/rp2350.cfg -c \"adapter speed 5000\"", "verify": true}
+    },
+    "779541626": {
+      "name": "stm32f072disco",
+      "flasher": {"name": "jlink", "args": "-device stm32f072rb"},
+      "flasher_recover": {"name": "openocd", "args": "-f interface/jlink.cfg -c \"transport select swd\" -f target/stm32f0x.cfg -c \"stm32f0x.cpu configure -event reset-init {}\""}
+    },
+    "000773661813": {
+      "name": "stm32f407disco",
+      "flasher": {"name": "jlink", "args": "-device stm32f407vg"},
+      "flasher_recover": {"name": "openocd", "args": "-f interface/jlink.cfg -c \"transport select swd\" -f target/stm32f4x.cfg -c \"stm32f4x.cpu configure -event reset-init {}\""}
+    },
+    "000776606156": {
+      "name": "stm32f723disco",
+      "flasher": {"name": "jlink", "args": "-device stm32f723ie"},
+      "flasher_recover": {"name": "openocd", "args": "-f interface/jlink.cfg -c \"transport select swd\" -f target/stm32f7x.cfg -c \"stm32f7x.cpu configure -event reset-init {}\""}
+    },
+    "004C00343137510F39383538": {
+      "name": "stm32h743nucleo",
+      "flasher": {"name": "stlink", "verify": true},
+      "flasher_recover": {"name": "openocd", "args": "-f interface/stlink.cfg -f target/stm32h7x.cfg"}
+    },
+    "066FFF495087534867063844": {
+      "name": "stm32g0b1nucleo",
+      "flasher": {"name": "stlink", "verify": true},
+      "flasher_recover": {"name": "openocd", "args": "-f interface/stlink.cfg -f target/stm32g0x.cfg"}
+    },
+    "777632258": {
+      "name": "stm32l476disco",
+      "flasher": {"name": "jlink", "args": "-device STM32L476VG"},
+      "flasher_recover": {"name": "openocd", "args": "-f interface/jlink.cfg -c \"transport select swd\" -f target/stm32l4x.cfg -c \"stm32l4x.cpu configure -event reset-init {}\""}
+    },
+    "0668FF575457657187061314": {
+      "name": "stm32u083nucleo",
+      "flasher": {"name": "stlink"},
+      "flasher_recover": {"name": "openocd", "args": "-f interface/stlink.cfg -f target/stm32u0x.cfg"}
+    },
+    "A76D8F062C2A": {
+      "name": "nanoch32v203",
+      "flasher": {"name": "openocd", "vid_pid": "0x1a86 0x8010", "args": "-f target/wch-riscv.cfg"}
+    },
+    "BC4954081051": {
+      "name": "ch32v103r_r1_1v0",
+      "flasher": {"name": "openocd", "vid_pid": "0x1a86 0x8010", "args": "-f target/wch-riscv.cfg", "verify": false}
+    },
+    "BC5DA47360D0": {
+      "name": "ch32v307v_r1_1v0",
+      "flasher": {"name": "openocd", "vid_pid": "0x1a86 0x8010", "args": "-f target/wch-riscv.cfg"}
+    },
+    "57468F06DC03": {
+      "name": "ch582m_evt",
+      "flasher": {"name": "openocd", "vid_pid": "0x1a86 0x8010", "args": "-f target/wch-riscv.cfg", "verify": false}
+    },
+    "000725299165": {
+      "name": "mimxrt1064_evk",
+      "flasher": {"name": "jlink", "args": "-device MIMXRT1064xxx6A"},
+      "flasher_recover": {"name": "openocd", "args": "-f interface/jlink.cfg -c \"transport select swd\" -c \"adapter speed 1000\" -c \"swd newdap rt1064 cpu -expected-id 0\" -c \"dap create rt1064.dap -chain-position rt1064.cpu\" -c \"target create rt1064.cpu cortex_m -dap rt1064.dap\" -c \"cortex_m reset_config sysresetreq\""}
+    },
+    "1051856258": {
+      "name": "nrf54lm20dk",
+      "flasher": {"name": "jlink", "args": "-device NRF54LM20A_M33"},
+      "flasher_recover": {"name": "openocd", "args": "-f interface/jlink.cfg -c \"transport select swd\" -f target/nordic/nrf54l.cfg -c \"adapter speed 4000\""}
+    },
+    "1050076405": {
+      "name": "nrf5340dk",
+      "flasher": {"name": "jlink", "args": "-device nrf5340_xxaa_app"},
+      "flasher_recover": {"name": "openocd", "args": "-f interface/jlink.cfg -c \"transport select swd\" -f target/nordic/nrf53.cfg -c \"adapter speed 4000\""}
+    },
+    "001083115236": {
+      "name": "ra8m1_ek",
+      "flasher": {"name": "jlink", "args": "-device R7FA8M1AH"}
+    },
+    "000778170924": {
+      "name": "stm32f769disco",
+      "flasher": {"name": "jlink", "args": "-device stm32f769ni"}
+    },
+    "0673FF575051717867034946": {
+      "name": "stm32l412nucleo",
+      "flasher": {"name": "stlink"}
+    },
+    "0670FF515448787067122222": {
+      "name": "stm32f746disco",
+      "flasher": {"name": "stlink"}
+    },
+    "728973776": {
+      "name": "lpcxpresso43s67",
+      "flasher": {"name": "jlink", "args": "-device LPC43S67_M4"},
+      "flasher_recover": {"name": "openocd", "args": "-f interface/jlink.cfg -c \"transport select swd\" -f target/lpc4357.cfg -c \"adapter speed 4000\"", "verify": false}
+    }
+  }
+}
