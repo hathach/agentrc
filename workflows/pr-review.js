@@ -151,12 +151,16 @@ const CLAIMS = {
 const RECHECK = { type: 'object', required: ['state', 'reason'], properties: { state: { enum: ['open', 'fixed', 'na', 'withdrawn', 'upheld', 'disputed'] }, reason: { type: 'string' }, answer: { type: 'string' },
   file: { type: 'string' }, line: { type: 'integer' }, ...GRADE } }
 const NONE = { confirmed: [], dropped: [], unverified: [] }
-// Public text is measured, never cut: over a limit it is shortened once, a comment then falls back to its
-// finding's words, and what is still over is logged; post.py measures it again and names it for the human, and
-// auto-post never submits it.
+// Public text is measured, never cut: over a limit it is shortened, a comment then falls back to its finding's words,
+// and a comment still over, its fallback included, is shortened once more; what is still over is logged, and post.py
+// measures it again and hands it to the human: auto-post never submits it.
 const LIMIT = { comment: 80, answer: 60, summary: 30, lineChars: 300 } // words, words, words, about 3 rendered lines
+const AIM = 60 // words a comment is written to, so a model's overshoot still lands under LIMIT.comment
 const words = (s) => String(s || '').split(/\s+/).filter(w => w && !/^[-*+]$/.test(w)).length // a bullet marker is no word
-const overLength = (s, max) => words(s) > max || String(s || '').split('\n').some(l => l.length > LIMIT.lineChars)
+const longestLine = (s) => Math.max(0, ...String(s || '').split('\n').map(l => l.length))
+const overLength = (s, max) => words(s) > max || longestLine(s) > LIMIT.lineChars
+// A comment off the diff is posted as its body line, the form ledger.py anchor() renders, so its first line must fit there too.
+const overComment = (c) => overLength(c.body, LIMIT.comment) || overLength(`- \`${c.path}:${c.line}\` ${c.body.split('\n')[0]}`, LIMIT.comment)
 // The inline comment format: its finding's severity as the heading, then at most 3 bullets.
 const offFormat = (s, sev) => !String(s || '').startsWith(`**${sev || 'finding'}**: `) || !/^\S+ +\S/.test(String(s)) ||
   (String(s).match(/^\s*[-*+] /gm) || []).length > 3
@@ -393,9 +397,11 @@ const uncovered = standing.filter(f => !posted(f) && ('beside' in f || !stated.h
 // What the writer writes, each with the index the result's findings give it (carried first).
 const items = [...toPost.map(f => ({ f, finding: carriedOut.length + ours.indexOf(f), why: f.why, evidence: f.verdictReason })),
   ...uncovered.map(f => ({ f, finding: carriedOut.indexOf(f), why: whyOf(f), evidence: verifiedOf(f) }))]
-const FORMAT = 'Each comment: first line `**<severity>**: <the problem, one sentence>`, complete on its own with any qualification it needs ' +
+const COMMENT_FORMAT = 'Each comment: first line `**<severity>**: <the problem, one sentence>`, complete on its own with any qualification it needs ' +
   '(it may be all the review body shows), then at most 3 bullets: the cause with `file:line`, ' +
-  `the impact, and a fix only where the finding supports one; at most ${LIMIT.comment} words; a question only when genuinely asking. ` +
+  `the impact, and a fix only where the finding supports one; about ${AIM} words, never over ${LIMIT.comment}, each line under ${LIMIT.lineChars - 40} ` +
+  'characters; a question only when genuinely asking. '
+const FORMAT = COMMENT_FORMAT +
   `The summary: empty, or one Markdown bullet of at most ${LIMIT.summary} words giving direction: which comments to address first and how ` +
   'they group, by grade and place. It never restates a comment\'s problem, cause, evidence or fix: the comments carry those. '
 const COMMENTS = { type: 'array', items: { type: 'object', required: ['finding', 'body'], properties: { finding: { type: 'integer' }, body: { type: 'string' } } } }
@@ -427,7 +433,10 @@ const summaryOver = (s) => {
   return ls.length > 1 || ls.some(l => !/^\s*[-*+] /.test(l)) || overLength(s, LIMIT.summary)
 }
 const answers = carriedOut.flatMap(f => (f.disputes || []).filter(d => d.answer).map(d => ({ finding: f.id, a: d.answer })))
-const longBodies = bodies.map((b, i) => b && (overLength(b.body, LIMIT.comment) || offFormat(b.body, items[i].f.severity)) ? i : -1).filter(i => i >= 0)
+// Measured where it may be posted: inline, or as its body line off the diff.
+const overAt = (i, body) => overComment({ path: items[i].f.file, line: items[i].f.line, body })
+const fitsAt = (i, body) => !overAt(i, body) && !offFormat(body, items[i].f.severity)
+const longBodies = bodies.map((b, i) => b && !fitsAt(i, b.body) ? i : -1).filter(i => i >= 0)
 const longAnswers = answers.filter(x => overLength(x.a.body, LIMIT.answer))
 let summaryLong = !!summary && summaryOver(summary)
 const reworded = []
@@ -437,12 +446,13 @@ if (longBodies.length || longAnswers.length || summaryLong) {
     summary: { type: ['string', 'null'] } } }
   const shorter = await agent(
     `Shorten these review texts and put each in its format. Keep every fact each states and add none. ${FORMAT}Each answer: at most ${LIMIT.answer} words, bullets for more than one point. ${STYLE}\n` +
-    `Texts: ${JSON.stringify({ comments: longBodies.map(i => ({ finding: i, severity: items[i].f.severity, body: bodies[i].body })),
+    `Texts: ${JSON.stringify({ comments: longBodies.map(i => ({ finding: i, severity: items[i].f.severity, words: words(bodies[i].body), body: bodies[i].body })),
       answers: longAnswers.map(x => ({ finding: x.finding, body: x.a.body })), summary: summaryLong ? summary : null })}`,
     { label: 'shorten', phase: 'Draft', model: 'sonnet', effort: 'low',
       schema: exactly(exactly(SHORT, 'comments', 'finding', longBodies), 'answers', 'finding', longAnswers.map(x => x.finding)) },
   ).catch(quiet('shorten'))
-  for (const c of (shorter && shorter.comments) || []) if (longBodies.includes(c.finding)) bodies[c.finding] = c
+  // A reply still over or off its format is not taken: the written text stays for the second round.
+  for (const c of (shorter && shorter.comments) || []) if (longBodies.includes(c.finding) && fitsAt(c.finding, c.body)) bodies[c.finding] = c
   const shortAnswer = new Map(((shorter && shorter.answers) || []).map(c => [c.finding, c.body]))
   for (const x of longAnswers) if (shortAnswer.has(x.finding)) { reworded.push({ ...x, was: x.a.body }); x.a.body = shortAnswer.get(x.finding) }
   if (shorter && shorter.summary && summaryLong) summary = shorter.summary
@@ -452,11 +462,12 @@ if (longBodies.length || longAnswers.length || summaryLong) {
 if (summaryLong) summary = ''
 const CHECKED = { type: 'object', required: ['bad', 'firstBad', 'summaryBad', 'answersBad'], properties: { bad: { type: 'array', items: { type: 'integer' } },
   firstBad: { type: 'array', items: { type: 'integer' } }, summaryBad: { type: 'boolean' }, answersBad: { type: 'array', items: { type: 'string' } } } }
-const checked = (items.length && written) || reworded.length ? await agent(
-  `List the finding numbers whose comment states any claim, number, API or file that its finding does not, or fails to state the finding's problem, ` +
-  'or, for a finding with alsoState, omits that issue or states it beyond what the finding and evidence support. ' +
+const COMMENT_CHECK = 'List the finding numbers whose comment states any claim, number, API or file that its finding does not, or fails to ' +
+  'state the finding\'s problem, or, for a finding with alsoState, omits that issue or states it beyond what the finding and evidence support. ' +
   'firstBad: the finding numbers whose comment\'s FIRST LINE alone does not state the actionable problem with the qualification it needs and, ' +
-  'for a finding with alsoState, that issue. ' +
+  'for a finding with alsoState, that issue. '
+const checked = (items.length && written) || reworded.length ? await agent(
+  COMMENT_CHECK +
   'summaryBad: does the summary restate any comment\'s problem, cause, evidence or fix, or state a fact, grade, place or dependency that neither ' +
   'a finding nor what is already on the PR supports? ' +
   'An empty summary is not bad. ' +
@@ -501,7 +512,33 @@ const comments = [...items.map((x, i) => {
   // No check sees it, and off the diff its first line drops the repair line and any qualification below.
   firstLineUnchecked: true,
 }))]
-const long = [...comments.filter(c => overLength(c.body, LIMIT.comment)).map(c => `${c.path}:${c.line}`), ...answers.filter(x => overLength(x.a.body, LIMIT.answer)).map(x => `answer on ${x.finding}`)]
+// Round two: each comment of ours still over its limit, its finding's own words included, is shortened from its finding
+// once more and checked again; one the check passes replaces it. A comment the human edited is never rewritten.
+const over = items.map((_, i) => i).filter(i => overAt(i, comments[i].body))
+if (over.length) {
+  const again = await agent(
+    `Shorten each review comment below from its finding: measured, it is still over its limit. ${COMMENT_FORMAT}${STYLE}Keep every fact the finding ` +
+    'states and add none. `words` and `longestLine` are its measure now.\n' +
+    `Comments: ${JSON.stringify(over.map(i => {
+      const body = comments[i].body
+      return { ...brief(items[i], i), words: words(body), longestLine: longestLine(body), comment: body }
+    }))}`,
+    { label: 'shorten:again', phase: 'Draft', model: 'sonnet', effort: 'medium', schema: exactly({ type: 'object', required: ['comments'], properties: { comments: COMMENTS } }, 'comments', 'finding', over) },
+  ).catch(quiet('shorten:again'))
+  const fits = new Map(((again && again.comments) || []).filter(c => over.includes(c.finding) && fitsAt(c.finding, c.body)).map(c => [c.finding, c.body]))
+  const checkedAgain = fits.size ? await agent(`${COMMENT_CHECK}\nPairs: ${JSON.stringify([...fits].map(([i, body]) => ({ ...brief(items[i], i), comment: body })))}`,
+    { label: 'check-draft:again', phase: 'Draft', model: 'sonnet', effort: 'low',
+      schema: { type: 'object', required: ['bad', 'firstBad'], properties: { bad: CHECKED.properties.bad, firstBad: CHECKED.properties.firstBad } } },
+  ).catch(quiet('check-draft:again')) : null
+  if (checkedAgain) {
+    for (const [i, body] of fits) {
+      if (checkedAgain.bad.includes(i)) continue
+      const { firstLineUnchecked, ...rest } = comments[i]
+      comments[i] = { ...rest, body, ...(checkedAgain.firstBad.includes(i) ? { firstLineUnchecked: true } : {}) }
+    }
+  }
+}
+const long = [...comments.filter(c => overComment(c)).map(c => `${c.path}:${c.line}`), ...answers.filter(x => overLength(x.a.body, LIMIT.answer)).map(x => `answer on ${x.finding}`)]
 if (long.length) log(`over length, for the human to shorten: ${long.join(', ')}`)
 // A due resolve whose reply is on the thread is only resolved once reconfirmed; one with no reply of ours there
 // (replied: false) gets the fix note, and the thread resolves once that is published.

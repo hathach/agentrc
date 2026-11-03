@@ -126,8 +126,10 @@ nothing is ever submitted for them.
 Auto-post, when the request names it: the review is submitted as `COMMENT` or
 `REQUEST_CHANGES`, never `APPROVE`, with fix notes and resolves on our own
 threads whose fix a recheck verified. It is the same pending review, submitted
-by `post.py` once its head and fix notes check out; otherwise it is handed to
-the human as a pending review (`handedOver`). Answers to pushback (a concession
+by `post.py` once its head and fix notes check out and no text is held (over
+its length, or a body line whose first line no check verified); otherwise it is
+handed to the human as a pending review (`handedOver`, exit 1), its fix notes
+staged when the head allows. Answers to pushback (a concession
 or a rebuttal) are never submitted: they go into a pending review for the human,
 under auto-fix only once the repair ends (§4 step 6).
 Pushback is a human's reply on one of our threads; a bot's reply there is not

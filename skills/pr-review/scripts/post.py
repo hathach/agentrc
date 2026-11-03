@@ -22,12 +22,13 @@ GitHub, choosing the event; deleting a comment or reply before that declines it.
 
 Text over its length limit, measured here (a comment moved into the body as the line it posts, renderedLine; one
 saved before that form as the whole comment), is never cut: a pending review names it in overLength for the human to
-shorten, and --auto refuses to submit it; an answer counts only where it is published, never under --auto. A body
-line whose first line no check verified (firstLineUnchecked) is named the same way and also holds --auto.
+shorten, and --auto never submits it; an answer counts only where it is published, never under --auto. A body
+line whose first line no check verified (firstLineUnchecked) is named the same way and also holds --auto. Held text
+is measured afresh from the saved draft on every run, so no retry submits it: the pending review is handed over.
 
 --auto takes the same path, refusing APPROVE: the pending review with its fix notes (never its answers), then,
 while the head is still the draft's and every note reads back, a submit with the draft's event (its intent stored
-first, never sent twice) and the same settling as a human's submit. A moved head, an unconfirmed note, a pending
+first, never sent twice) and the same settling as a human's submit. Held text, a moved head, an unconfirmed note, a pending
 review an earlier run left (only the human sees it, so it may have changed) or a submit whose outcome cannot be
 read hands the pending review to the human instead (handedOver, exit 1), who finishes it like any draft; a later
 post.py run then publishes its answers. Thread answers are never submitted: the review's are put in an answer publication on it (ledger.py's add_answers), stored with
@@ -505,10 +506,10 @@ def submit(repo, pr, review, event, persist):
     return state if state not in (None, 'PENDING') else None
 
 
-def publish_auto(repo, pr, led, review, event, login, recovering, persist):
-    """The draft's pending review with its fix notes, submitted with its event; handed to the human instead when the
-    head moved, a note is unconfirmed or an earlier run left it pending before the submit, or when the submit's outcome
-    cannot be read."""
+def publish_auto(repo, pr, led, review, event, login, recovering, persist, hold=''):
+    """The draft's pending review with its fix notes, submitted with its event; handed to the human instead when its
+    text is held (`hold`, why), the head moved, a note is unconfirmed or an earlier run left it pending before the submit,
+    or when the submit's outcome cannot be read."""
     rec = review['receipts']
     review['publish'] = 'auto'
     answers = open_answers(review['findings'])
@@ -532,6 +533,8 @@ def publish_auto(repo, pr, led, review, event, login, recovering, persist):
         staged = stage(repo, pr, led, review, login, persist, answers=False)
         why = ('a fix note was not confirmed on the pending review' if any(e['state'] in ('sent', 'uncertain') for e in staged)
                else moved if pr_head(repo, pr) != review['head'] else None)
+    # Held text goes to the human, with its fix notes staged when nothing else stops them, and is named first.
+    why = '; '.join(x for x in (hold, why) if x)
     if not why:
         state = submit(repo, pr, review, event, persist)
         if state:
@@ -789,22 +792,21 @@ def collect(argv):
             declined(led, review, a.reason)
             persist()
             return {'status': 'declined', 'review': None}
+        long, unchecked = over_length(led, review, answers=not a.auto), first_line_unchecked(review)
+        named = {'overLength': long, 'firstLineUnchecked': unchecked}
         handed = (review['receipts'].get('review') or {}).get('handedOver')
         if a.auto and handed:
-            return {'status': review['status'], 'review': review['receipts']['review'], 'handedOver': handed}
+            return {'status': review['status'], 'review': review['receipts']['review'], 'handedOver': handed, **named}
         mode = 'auto' if a.auto else 'draft'
         if review.get('publish', mode) != mode:
             raise Unusable(f"the draft was published {'with' if review['publish'] == 'auto' else 'without'} --auto: finish it the same way")
         event = review['draft']['event']
         if a.auto and event == 'APPROVE':
             raise Unusable('auto-post never approves; publish it without --auto for the human to submit')
-        long, unchecked = over_length(led, review, answers=not a.auto), first_line_unchecked(review)
-        if a.auto and review['status'] == 'pending':
-            if long:
-                raise Unusable(f"over-length text ({', '.join(long)}): publish it without --auto for the human to shorten")
-            if unchecked:
-                raise Unusable(f"comments whose first line no check verified ({', '.join(unchecked)}): publish it without --auto "
-                               'for the human to fix')
+        # Measured from the saved draft, which never changes, so every run and retry holds the same text.
+        hold = '; '.join(why for why in (
+            long and f"over-length text for the human to shorten ({', '.join(long)})",
+            unchecked and f"comments whose first line no check verified ({', '.join(unchecked)})") if why)
         rec = review['receipts']
         sent = bool((rec.get('review') or {}).get('sent')) and not (rec.get('review') or {}).get('verified')
         head = pr_head(repo, a.pr)
@@ -814,9 +816,8 @@ def collect(argv):
             raise Unusable(f'the PR head moved to {head}; the draft reviewed {a.expected_head}')
         login = gh_json('api', 'user')['login']
         if not a.auto:
-            return {**publish_draft(repo, a.pr, led, review, login, recovering, persist), 'overLength': long,
-                    'firstLineUnchecked': unchecked}
-        out = publish_auto(repo, a.pr, led, review, event, login, recovering, persist)
+            return {**publish_draft(repo, a.pr, led, review, login, recovering, persist), **named}
+        out = {**publish_auto(repo, a.pr, led, review, event, login, recovering, persist, hold), **named}
         answers = [p for p in review.get('answerPublications', []) if p.get('auto') and p['status'] in DRAFTS]
         if answers and review['status'] == 'posted' and not recovering:
             out['answers'] = ({'status': 'deferred'} if a.defer_answers else
