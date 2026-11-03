@@ -7,7 +7,8 @@ output and the result handed back. Only the pyOCD launcher path and its --projec
 argument are normalised, plus deliberate deltas since, each applied explicitly: J-Link
 command files are unique per invocation, reused by its crash reruns and removed after it
 (jlink_command_file_delta), the J-Link flash script has no reset before `loadfile`
-(jlink_flash_script_delta), esptool runs with NO_COLOR=1 (esptool_no_color_delta), every
+(jlink_flash_script_delta), esptool runs with NO_COLOR=1 (esptool_no_color_delta), an openocd
+flash on target/rp2350.cfg halts both cores before `program` (rp2350_halt_first_delta), every
 command is the pre-move shell string's words as an argv list (argv_delta), and a flash or reset returns an Operation carrying the runner's results as its attempts, whose last
 one is the result compared (provider_invoke). Equality there does not establish timing, signals or pyOCD's
 project-directory behaviour; test_hil_process and test_hil_pyocd do."""
@@ -155,9 +156,22 @@ def argv_delta(case, observed):
     return map_calls(observed, rewrite)
 
 
+def rp2350_halt_first_delta(case, observed):
+    """An openocd flash on target/rp2350.cfg halts both cores before `program` (#395)."""
+    f = case['flasher']
+    if f['name'].lower() != 'openocd' or case['op'] != 'flash' or 'target/rp2350.cfg' not in f['args']:
+        return observed
+
+    def rewrite(call):
+        head, sep, tail = call['cmd'].partition(' -c "program ')
+        assert sep, call['cmd']
+        return {**call, 'cmd': f'{head} -c init -c "catch halt"{sep}{tail}'}
+    return map_calls(observed, rewrite)
+
+
 def deltas(case, observed):
-    return argv_delta(case, esptool_no_color_delta(
-        case, jlink_flash_script_delta(case, jlink_command_file_delta(case, observed))))
+    return argv_delta(case, rp2350_halt_first_delta(case, esptool_no_color_delta(
+        case, jlink_flash_script_delta(case, jlink_command_file_delta(case, observed)))))
 
 
 def setUpModule():

@@ -452,6 +452,13 @@ def openocd_cmd_base(flasher: dict) -> list:
             '-c', f'adapter serial {uid}', *vid_pid, *_args(flasher)]
 
 
+# rp2350.cfg's SMP reset init warm-resets core0 before core1 and leaves core1 running; core1's bootrom loop can then
+# take an RCP fault, mirrored to core0, that stalls `program`'s rcp_init (RP2350 datasheet 3.6.3.3-3.6.3.4). Halting
+# both cores first: 0 of 655 such failures against 9 of 655 on the Fruit Jam (ci.lan, 2026-11-02; #395). `catch`: a
+# core may ignore the halt (Armv8-M ARM DHCSR.C_HALT), and then `program`'s own reset runs as before.
+HALT_BEFORE_PROGRAM_CFG = 'target/rp2350.cfg'
+
+
 # `verify` is on by default, opted out per board with "verify": false. ch32v103r and
 # ch582m opt out: a raw dump_image of their flash is not the image just written (~85% of
 # bytes differ, the same at 0x0 and 0x08000000, shifting with halt vs reset halt, and
@@ -465,7 +472,9 @@ def openocd_cmd_base(flasher: dict) -> list:
 # recovery entries cannot run, so those entries empty the event in the roster instead.
 def flash_openocd(flasher: dict, firmware: str, *, timeout, run=None) -> Operation:
     verify = ' verify' if flasher.get('verify', True) else ''
-    return _once(run, [*openocd_cmd_base(flasher), '-c', f'program {firmware}{verify} reset exit'], timeout=timeout)
+    halt = ['-c', 'init', '-c', 'catch halt'] if HALT_BEFORE_PROGRAM_CFG in (flasher.get('args') or '') else []
+    return _once(run, [*openocd_cmd_base(flasher), *halt, '-c', f'program {firmware}{verify} reset exit'],
+                 timeout=timeout)
 
 
 def reset_openocd(flasher: dict, *, timeout, run=None) -> Operation:
