@@ -114,8 +114,9 @@ the head repository and branch, said plainly to be the contributor's branch for
 a fork, prepare's `repair` state and why (`unknown` is not `unavailable`), and
 that the run reviews, repairs, validates and rechecks the PR within
 pr-babysit's cycle accounting. On `same`, say instead that it repairs from
-submitted review `repair.submittedReview` without a whole-head review, or that
-it repairs nothing, for `submittedWhy`.
+submitted review `repair.submittedReview` without a whole-head review, with
+the `repair.deferredAnswers` answers waiting for the repair to end, or that it
+repairs nothing, for `submittedWhy`.
 
 ## 3. Publishing
 
