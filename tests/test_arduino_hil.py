@@ -87,8 +87,15 @@ class FakeLock:
     def read_record(self, board):
         return self.records.get(board)
 
-    def is_locked(self, board):
-        return board in self.records
+    def record_state(self, board):
+        rec = self.records.get(board)
+        return ('absent', None) if rec is None else ('unreadable', None) if rec == 'unreadable' else ('record', rec)
+
+    def is_locked(self, board):   # as the real one: the record's holder, never the flock
+        return self.holder_alive(self.records.get(board))
+
+    def holder_alive(self, record):
+        return isinstance(record, dict)
 
 
 def fake_serial():
@@ -1043,6 +1050,8 @@ class Manual(Base):
         with mock.patch.object(H, 'release_hold', return_value={'exit': 0}) as release, \
                 mock.patch.object(H, 'restore', side_effect=AssertionError('restored')):
             self.assertEqual(self.main(argv)[0], H.NOT_HELD)
+            self.lock.records['rig_jlink'] = 'unreadable'
+            self.assertEqual(self.main(argv)[0], 2)
             release.assert_not_called()
             self.held()
             self.assertEqual(self.main(argv), (0, {'pass': True, 'board': 'rig_jlink', 'released': {'exit': 0}}))
@@ -1112,13 +1121,30 @@ class Manual(Base):
             H.op_gdb(args, {**self.board('rig_jlink'), 'debug': {}}, self.dir, None, None)
 
     def test_foreign_or_missing_hold_refused(self):
-        with self.assertRaisesRegex(H.Refused, 'not held'):
+        with self.assertRaisesRegex(H.NotHeld, 'not held'):
             H.held_by('rig_jlink', 'mine')
         self.lock.records['rig_jlink'] = {'reason': 'someone else', 'pid': 1}
-        with self.assertRaisesRegex(H.Refused, 'not held'):
+        with self.assertRaisesRegex(H.NotHeld, 'not held'):
             H.held_by('rig_jlink', 'mine')
         self.lock.records['rig_jlink'] = {'reason': 'mine', 'pid': 1}
         H.held_by('rig_jlink', 'mine')
+        with mock.patch.object(self.lock, 'is_locked', return_value=False):   # a second read, unreadable
+            H.held_by('rig_jlink', 'mine')   # the one record read decides owner and liveness
+
+    def test_a_session_command_not_held_exits_not_held_unless_the_record_is_unreadable_or_children_pend(self):
+        argv = ['exec', '-b', 'rig_jlink', '--under-hold', 'mine', str(self.roster), '--', 'true']
+        with mock.patch.object(H, 'git_identity', return_value=('abc', '')):
+            self.assertEqual(self.main(argv)[0], H.NOT_HELD)   # its holder gone: a restore released it, or it died
+            self.lock.records['rig_jlink'] = 'unreadable'   # the flock may still be held: unknown, not "not held"
+            code, out = self.main(argv)
+            self.assertEqual(code, 2)
+            self.assertIn('unreadable', out['error'])
+            del self.lock.records['rig_jlink']
+            self.lock.pending[('rig_jlink', H.PENDING_KIND)] = [{'receipt': {'pid': 7}}]
+            self.A.process.recheck.return_value = 'pending'
+            code, out = self.main(argv)
+            self.assertEqual(code, 2)
+            self.assertIn('pending children', out['error'])
 
     def test_check_runs_a_device_test_without_flashing(self):
         args = argparse.Namespace(board='rig_ocd', test=None)

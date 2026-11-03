@@ -14,7 +14,6 @@ import contextlib
 import hashlib
 import io
 import json
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -74,9 +73,7 @@ class Checkout(unittest.TestCase):
         for name, fn in (('create_attempt', create_attempt), ('load_attempt', lambda *a: tree),
                          ('stage_tree', stage_tree), ('verify_remote', lambda t, d, base='.': []),
                          ('launch', lambda t, argv, env=None, cwd='.': self.calls.append(argv) or {'pid': 9}),
-                         ('run_remote', self.run_remote),
-                         ('copy_back', lambda t, dest, groups=(), optional=(): R.core.CopyBack(
-                             [], [], dict.fromkeys(optional, 'absent')))):
+                         ('run_remote', self.run_remote)):
             stack.enter_context(mock.patch.object(R.core, name, fn))
 
     def run_remote(self, tree, argv, env=None, cwd='.'):
@@ -289,39 +286,19 @@ class Session(Checkout):
                 with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                     lock.cmd_release([BOARD])
 
-    def test_close_whose_restore_released_but_lost_its_answer_closes(self):
-        lock = R.H.A.lock
-        rig_tree = tmpdir(self)
-        with mock.patch.object(lock, 'BOARD_LOCK_DIR', str(tmpdir(self))):
-            try:
-                def rig(tree, argv, **kw):   # restore --release completes on the rig, then ssh drops
-                    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                        if argv[3:5] == ['lock', 'hold']:
-                            return lock.cmd_hold([BOARD], argv[-1])
-                        args = R.H.parse(argv[3:])
-                        try:
-                            R.H.held_by(args.board, args.under_hold)
-                        except R.H.Refused:
-                            return 2
-                        run = rig_tree / f'build/hil-manual/{BOARD}-restore-20261103-120000'
-                        run.mkdir(parents=True)
-                        (run / 'result.json').write_text(json.dumps(
-                            {'pass': True, 'board': BOARD, 'released': {'exit': lock.cmd_release([BOARD])}}))
-                        return 255
-
-                def copy_back(tree, dest, groups=(), optional=()):
-                    shutil.copytree(rig_tree / R.SESSION_ARTIFACTS, Path(dest) / R.SESSION_ARTIFACTS)
-                    return R.core.CopyBack([R.SESSION_ARTIFACTS], [], {R.SESSION_ARTIFACTS: 'ok'})
-                with mock.patch.object(R.core, 'run_remote', rig), mock.patch.object(R.core, 'copy_back', copy_back):
-                    self.open()
-                    rc, closed = self.main('session', 'close', 's1')
-                    self.assertFalse(lock.is_locked(BOARD))
-                    self.assertEqual((rc, closed['closed'], closed['restoreExit']), (0, True, 255))
-                    record = json.loads((self.root / '.hil-remote/s1.session.json').read_text())
-                    self.assertEqual((record['held'], record['closed']), (False, True))
-            finally:
-                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                    lock.cmd_release([BOARD])
+    def test_close_whose_restore_lost_its_answer_closes_once_the_rig_holds_no_more(self):
+        self.open()
+        self.rig_exit['restore'] = 255   # the restore released the board, then ssh dropped
+        rc, closed = self.main('session', 'close', 's1')
+        self.assertEqual((rc, closed['closed']), (255, False))
+        self.assertIn('rerun session close', closed['note'])
+        self.assertTrue(json.loads((self.root / '.hil-remote/s1.session.json').read_text())['held'])
+        self.rig_exit['restore'] = R.H.NOT_HELD
+        rc, closed = self.main('session', 'close', 's1')
+        self.assertEqual((rc, closed['closed'], closed['restoreExit']), (0, True, R.H.NOT_HELD))
+        self.assertIn('the restore unconfirmed', closed['note'])
+        record = json.loads((self.root / '.hil-remote/s1.session.json').read_text())
+        self.assertEqual((record['held'], record['closed']), (False, True))
 
     def test_exec_adds_the_session_options_and_keeps_argv_after_the_roster(self):
         out = self.open()

@@ -57,7 +57,7 @@ FLASH_TIMEOUT, VERIFY_TIMEOUT, ENUM_TIMEOUT, TEST_TIMEOUT, SETTLE = 120, 60, 20,
 CONSOLE_MAX = 120   # one console capture, seconds
 BOARD_BUDGET = 900
 EXEC_MAX = 600   # one session exec or gdb child
-NOT_HELD = 3   # `release`: the board is not held under that reason
+NOT_HELD = 3   # a readable holder record shows no live hold under the caller's reason
 GDB_SERVER = ['-c', 'gdb port pipe', '-c', 'gdb memory_map disable', '-c', 'gdb breakpoint_override hard']
 # An RP2040 SMP resume restores core1 only after each core is polled (target-debug gdb.md, verified on the Pico)
 GDB_DETACH_RESUME = {'target/rp2040.cfg': '{ foreach u [target names] { $u arp_poll }; resume }'}   # by debug cfg
@@ -116,6 +116,10 @@ def bind(profile):
 
 class Refused(Exception):
     """Refused before any hardware access."""
+
+
+class NotHeld(Refused):
+    """The board's holder record is readable and is no live hold under the caller's reason: exit NOT_HELD."""
 
 
 class Unclean(Exception):
@@ -838,9 +842,11 @@ def cmd_report(args):
 
 
 def held_by(name, reason):
-    rec = A.lock.read_record(name)
-    if not isinstance(rec, dict) or rec.get('reason') != reason or not A.lock.is_locked(name):
-        raise Refused(f'{name} is not held under reason {reason!r} by a live holder (record: {rec})')
+    state, rec = A.lock.record_state(name)
+    if state == 'unreadable':   # is_locked reads the record, not the flock: the hold may still stand
+        raise Refused(f'{name} has an unreadable holder record: whether {reason!r} holds it is unknown')
+    if state != 'record' or rec.get('reason') != reason or not A.lock.holder_alive(rec):
+        raise NotHeld(f'{name} is not held under reason {reason!r} by a live holder (record: {rec})')
 
 
 @contextlib.contextmanager
@@ -869,10 +875,10 @@ def _manual(args):
     roster = load_roster(args.roster)
     if args.board not in roster:
         raise Refused(f'{args.board} is not in {args.roster}')
-    held_by(args.board, args.under_hold)
-    why = pending_problem(args.board)
+    why = pending_problem(args.board)   # before held_by: a not-held answer must not hide unproven children
     if why:
         raise Refused(why)
+    held_by(args.board, args.under_hold)
     run_dir = P.ROOT / 'build' / 'hil-manual' / f'{args.board}-{args.cmd}-{time.strftime("%Y%m%d-%H%M%S")}'
     run_dir.mkdir(parents=True, exist_ok=True)
     tracker = Tracker(run_dir)
@@ -946,7 +952,7 @@ def cmd_release(args):
     with one_session_command(args.board):
         try:
             held_by(args.board, args.under_hold)
-        except Refused as e:
+        except NotHeld as e:
             emit({'pass': False, 'board': args.board, 'held': False, 'error': str(e)})
             return NOT_HELD
         released = release_hold(args.board)
@@ -1303,4 +1309,4 @@ def main(argv=None):
         return cmd_report(args)
     except Refused as e:
         emit({'pass': False, 'error': str(e)})
-        return 2
+        return NOT_HELD if isinstance(e, NotHeld) else 2

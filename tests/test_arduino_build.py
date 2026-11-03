@@ -177,6 +177,9 @@ class Selection(Lib):
     def test_example_narrowing_filters_every_rule(self):
         only = ['examples/Basic/echo']
         self.assertEqual(ab.select(['examples/HID/inout/inout.ino'], only_examples=only)['builds'], {})
+        # unnarrowed, a build-contract change smoke-builds each SMOKE_BOARD's first HIL sketch, examples/Basic/echo
+        self.assertEqual(ab.select(['.claude/skills/build/scripts/check_build.py'],
+                                   only_examples=['examples/HID/inout'])['builds'], {})
         for path in ('examples/HID/inout/inout.ino', 'test/hil/fixture.cpp', 'test/hil/sketches/probe/probe.ino',
                      '.claude/skills/build/scripts/check_build.py'):
             built = ab.select([path, 'examples/Basic/echo/echo.ino'], only_examples=only)['builds']
