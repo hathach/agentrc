@@ -2071,11 +2071,18 @@ class Pushback(PostCase):
                          ('same', {'head': self.head, 'reviewId': rid}, None, 1))
         with self.assertRaisesRegex(facts.Unusable, 'a pending draft'):
             self.prepare()
-        led = self.led()
-        led['reviews'][-1]['answerPublications'].append({**led['reviews'][-1]['answerPublications'][0], 'auto': False})
-        Path(self.p['ledger']).write_text(json.dumps(led))
-        with self.assertRaisesRegex(facts.Unusable, 'a pending draft'):
-            self.prepare('--auto-fix')
+        good = self.led()
+        bundle = good['reviews'][-1]['answerPublications'][0]
+        not_auto, sent, two = (json.loads(json.dumps(good)) for _ in range(3))
+        not_auto['reviews'][-1]['answerPublications'][0]['auto'] = False
+        sent['reviews'][-1]['answerPublications'][0]['receipts'] = {'answer': {'sent': True}}
+        two['reviews'][-1]['answerPublications'].append({**bundle, 'auto': False})
+        other = json.loads(json.dumps(good))
+        other['reviews'][0].setdefault('answerPublications', []).append(other['reviews'][-1]['answerPublications'].pop())
+        for name, led in (('not auto', not_auto), ('sent', sent), ('two bundles', two), ("another review's", other)):
+            Path(self.p['ledger']).write_text(json.dumps(led))
+            with self.subTest(name), self.assertRaisesRegex(facts.Unusable, 'a pending draft'):
+                self.prepare('--auto-fix')
 
     def test_a_reply_after_the_deferred_judgment_keeps_its_finding_held_and_its_stale_answer_out(self):
         self.deferred()
