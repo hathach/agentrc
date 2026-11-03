@@ -182,30 +182,28 @@ class Selection(Lib):
         sel = ab.select(['examples/Skip/askip/askip.ino'])
         self.assertEqual(set(sel['builds']), {'dev_b', 'host_ci', 'rig_jlink', 'rig_host', 'rig_esp'})
 
-    def test_source_change_names_examples_no_board_builds(self):
-        self.assertEqual(ab.select(['src/fake.h'])['unbuildable'], ['examples/Nowhere/nowhere'])
-        self.assertEqual(ab.select(['src/ports/fa/port.cpp'])['unbuildable'], ['examples/Nowhere/nowhere'])
-        self.assertEqual(ab.select(['src/fake.h'], only_examples=['examples/Basic/echo'])['unbuildable'], [])
-        self.assertEqual(ab.select(['examples/Basic/echo/echo.ino'])['unbuildable'], [])
+    def test_unbuildable_examples_are_those_no_board_may_build(self):
+        self.assertEqual(ab.unbuildable_examples(), ['examples/Nowhere/nowhere'])
+        self.assertEqual(ab.select(['src/fake.h'])['uncovered'], [])   # a source change does not repeat it
 
-    def test_unbuildable_example_is_a_warning_of_the_run(self):
+    def test_board_or_example_runs_are_narrowed_and_say_so(self):
         self.patch(ab, 'source_identity', lambda: ({'head': 'abc', 'dirty': False, 'status': ''}, ''))
         self.patch(ab, 'prepared_dependencies', lambda: {})
         self.patch(ab, 'build_all', lambda *a: [])
-        code, out = self.run_main(['--scope', 'src/fake.h'])
-        self.assertEqual((code, out['pass'], out['narrowed']), (0, True, False))
-        self.assertEqual(out['warnings'], ['examples/Nowhere/nowhere is eligible on no board this contract builds: '
-                                           'no build here compiles it'])
-
-    def test_board_or_example_runs_are_narrowed(self):
-        self.patch(ab, 'source_identity', lambda: ({'head': 'abc', 'dirty': False, 'status': ''}, ''))
-        self.patch(ab, 'prepared_dependencies', lambda: {})
-        self.patch(ab, 'build_all', lambda *a: [])
+        warning = 'explicit --board/--example selection: automatic change selection was not verified'
         for argv in (['--board', 'dev_a'], ['--scope', 'src/fake.h', '--example', 'examples/Basic/echo']):
-            self.assertTrue(self.run_main(argv)[1]['narrowed'], argv)
+            out = self.run_main(argv)[1]
+            self.assertEqual((out['narrowed'], out['warnings']), (True, [warning]), argv)
+        out = self.run_main(['--scope', 'src/fake.h'])[1]
+        self.assertEqual((out['narrowed'], out['warnings']), (False, []))
         self.assertFalse(self.run_main(['--select-only', '--scope', 'src/fake.h'])[1]['narrowed'])
         self.assertTrue(self.run_main(['--select-only', '--scope', 'src/fake.h', '--example',
                                        'examples/Basic/echo'])[1]['narrowed'])
+        self.patch(ab, 'make_record', lambda *a: (None, 'not recorded'))
+        roster = fake.roster(self.root / 'test/hil/ci.json')
+        out = self.run_main(['--board', 'rig_jlink', '--shared', '--record', str(self.root / 'build/hil/r.json'),
+                             '--hil-config', str(roster)])[1]
+        self.assertEqual((out['narrowed'], out['warnings'], out['firstError']), (True, [], 'not recorded'))
 
     def test_example_eligible_on_no_board_is_uncovered(self):
         path = 'examples/Nowhere/nowhere/nowhere.ino'

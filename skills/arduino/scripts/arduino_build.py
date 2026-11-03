@@ -132,6 +132,16 @@ def eligible(board, example):
 
 # ---- selection
 
+def buildable(example):
+    return any(eligible(b, example) for b in P.BOARDS)
+
+
+def unbuildable_examples():
+    """Example dirs no board of the profile may build: a library's contract tests pin the list, since no build here
+    compiles them."""
+    return [e for e in examples() if not buildable(e)]
+
+
 def hil_sketch_of(path):
     """The HIL sketch dir outside examples/ holding `path`, or None."""
     for sketches in P.HIL_SKETCHES.values():
@@ -177,7 +187,7 @@ def classify(path):
 
 def select(paths, roster=None, only_examples=None):
     builds, tests, out_paths, uncovered = {}, set(), [], []
-    hil_boards, hil_full, broad = set(), False, False
+    hil_boards, hil_full = set(), False
 
     def add(board, exs):
         builds.setdefault(board, set()).update(e for e in exs if eligible(board, e))
@@ -192,11 +202,10 @@ def select(paths, roster=None, only_examples=None):
             boards = [b for f in families for b in P.REPRESENTATIVES[f]]
             for b in boards:
                 add(b, only_examples or examples())
-            broad = True
             if roster:
                 hil_boards.update(b for b in roster if P.BOARDS[b]['family'] in families)
         elif effect == 'example':
-            if not any(eligible(b, detail) for b in P.BOARDS):
+            if not buildable(detail):
                 uncovered.append({'path': path, 'reason': 'sketch eligible on no board this contract builds'})
             for b in P.BOARDS:
                 add(b, [detail])
@@ -224,9 +233,6 @@ def select(paths, roster=None, only_examples=None):
     result = {
         'builds': {b: sorted(e) for b, e in sorted(builds.items()) if e},
         'tests': sorted(tests), 'paths': out_paths, 'uncovered': uncovered,
-        # a source change builds every example it can; one no board here may build drops out unseen otherwise
-        'unbuildable': sorted(e for e in (only_examples or examples()) if not any(eligible(b, e) for b in P.BOARDS))
-        if broad else [],
     }
     if roster is not None:
         result['hil'] = {'boards': sorted(roster) if hil_full else sorted(hil_boards), 'full': hil_full,
@@ -918,7 +924,7 @@ def main(argv=None):
             sel['builds'][b] = [e for e in want if args.record or eligible(b, e)]
     else:
         sel = select(changed_paths(args), roster, only)
-    # --board or --example sets what builds by hand: its pass never stands for the selection a change needs
+    # --board or --example sets what builds by hand; a record is a HIL build, not a check of a change
     narrowed = bool(args.board or args.example)
     if args.select_only:
         print(json.dumps({'version': SCHEMA, 'pass': True, 'narrowed': narrowed, 'build': sel,
@@ -969,7 +975,6 @@ def main(argv=None):
     errors = [r for r in rows + tests if r['status'] == 'error']
     failed = [r for r in rows + tests if r['status'] == 'failed']
     warnings = sorted({h['path'] for r in rows for h in r.get('foreignHeaders', []) if not h['matches']})
-    unbuildable = sel.get('unbuildable', [])
     first = (errors or failed or [{}])[0]
     out = {
         'version': SCHEMA, 'pass': not errors and not failed and not record_error and not sel['uncovered'],
@@ -979,8 +984,8 @@ def main(argv=None):
         'nothingToBuild': not rows and not tests,
         'firstError': record_error or first.get('firstError', ''),
         'warnings': [f'compiled against a foreign copy that differs from this checkout: {h}' for h in warnings] +
-                    [f'{e} is eligible on no board this contract builds: no build here compiles it'
-                     for e in unbuildable],
+                    (['explicit --board/--example selection: automatic change selection was not verified']
+                     if narrowed and not args.record else []),
     }
     if record_path:
         out['record'] = rel(record_path)
