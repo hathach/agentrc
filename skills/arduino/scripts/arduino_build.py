@@ -147,6 +147,8 @@ def classify(path):
     own = P.classify_source(path)
     if own:
         return own
+    if path == 'library.properties':
+        return 'shared', None, 'name= and depends= decide which libraries every build may use'
     if path.startswith('src/'):
         return 'shared', None, 'shared library code'
     if path.startswith('examples/'):
@@ -175,7 +177,7 @@ def classify(path):
 
 def select(paths, roster=None, only_examples=None):
     builds, tests, out_paths, uncovered = {}, set(), [], []
-    hil_boards, hil_full = set(), False
+    hil_boards, hil_full, broad = set(), False, False
 
     def add(board, exs):
         builds.setdefault(board, set()).update(e for e in exs if eligible(board, e))
@@ -190,6 +192,7 @@ def select(paths, roster=None, only_examples=None):
             boards = [b for f in families for b in P.REPRESENTATIVES[f]]
             for b in boards:
                 add(b, only_examples or examples())
+            broad = True
             if roster:
                 hil_boards.update(b for b in roster if P.BOARDS[b]['family'] in families)
         elif effect == 'example':
@@ -221,6 +224,9 @@ def select(paths, roster=None, only_examples=None):
     result = {
         'builds': {b: sorted(e) for b, e in sorted(builds.items()) if e},
         'tests': sorted(tests), 'paths': out_paths, 'uncovered': uncovered,
+        # a source change builds every example it can; one no board here may build drops out unseen otherwise
+        'unbuildable': sorted(e for e in (only_examples or examples()) if not any(eligible(b, e) for b in P.BOARDS))
+        if broad else [],
     }
     if roster is not None:
         result['hil'] = {'boards': sorted(roster) if hil_full else sorted(hil_boards), 'full': hil_full,
@@ -912,9 +918,11 @@ def main(argv=None):
             sel['builds'][b] = [e for e in want if args.record or eligible(b, e)]
     else:
         sel = select(changed_paths(args), roster, only)
+    # --board or --example sets what builds by hand: its pass never stands for the selection a change needs
+    narrowed = bool(args.board or args.example)
     if args.select_only:
-        print(json.dumps({'version': SCHEMA, 'pass': True, 'build': sel, **({'hil': sel.pop('hil')}
-                                                                            if 'hil' in sel else {})}))
+        print(json.dumps({'version': SCHEMA, 'pass': True, 'narrowed': narrowed, 'build': sel,
+                          **({'hil': sel.pop('hil')} if 'hil' in sel else {})}))
         return 0
 
     before, diff = source_identity()
@@ -961,15 +969,18 @@ def main(argv=None):
     errors = [r for r in rows + tests if r['status'] == 'error']
     failed = [r for r in rows + tests if r['status'] == 'failed']
     warnings = sorted({h['path'] for r in rows for h in r.get('foreignHeaders', []) if not h['matches']})
+    unbuildable = sel.get('unbuildable', [])
     first = (errors or failed or [{}])[0]
     out = {
         'version': SCHEMA, 'pass': not errors and not failed and not record_error and not sel['uncovered'],
-        'input': {k: before[k] for k in ('head', 'dirty')}, 'boards': rows, 'tests': tests,
+        'input': {k: before[k] for k in ('head', 'dirty')}, 'narrowed': narrowed, 'boards': rows, 'tests': tests,
         'paths': sel['paths'], 'uncovered': sel['uncovered'],
         'dependencies': list(deps.values()),
         'nothingToBuild': not rows and not tests,
         'firstError': record_error or first.get('firstError', ''),
-        'warnings': [f'compiled against a foreign copy that differs from this checkout: {h}' for h in warnings],
+        'warnings': [f'compiled against a foreign copy that differs from this checkout: {h}' for h in warnings] +
+                    [f'{e} is eligible on no board this contract builds: no build here compiles it'
+                     for e in unbuildable],
     }
     if record_path:
         out['record'] = rel(record_path)

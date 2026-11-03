@@ -159,7 +159,7 @@ class Selection(Lib):
             '.claude/test/conftest.py': ('nothing', None),
             'README.md': ('nothing', None),
             'docs/x.txt': ('nothing', None),
-            'library.properties': ('nothing', None),
+            'library.properties': ('shared', None),      # ahead of the profile's NOTHING, which lists it
             'weird/file.c': ('uncovered', None),
         }
         for path, (effect, detail) in cases.items():
@@ -181,6 +181,31 @@ class Selection(Lib):
         self.assertEqual(set(sel['builds']), {'dev_b', 'rig_jlink', 'rig_esp'})   # .dev_b.test.only, via filters
         sel = ab.select(['examples/Skip/askip/askip.ino'])
         self.assertEqual(set(sel['builds']), {'dev_b', 'host_ci', 'rig_jlink', 'rig_host', 'rig_esp'})
+
+    def test_source_change_names_examples_no_board_builds(self):
+        self.assertEqual(ab.select(['src/fake.h'])['unbuildable'], ['examples/Nowhere/nowhere'])
+        self.assertEqual(ab.select(['src/ports/fa/port.cpp'])['unbuildable'], ['examples/Nowhere/nowhere'])
+        self.assertEqual(ab.select(['src/fake.h'], only_examples=['examples/Basic/echo'])['unbuildable'], [])
+        self.assertEqual(ab.select(['examples/Basic/echo/echo.ino'])['unbuildable'], [])
+
+    def test_unbuildable_example_is_a_warning_of_the_run(self):
+        self.patch(ab, 'source_identity', lambda: ({'head': 'abc', 'dirty': False, 'status': ''}, ''))
+        self.patch(ab, 'prepared_dependencies', lambda: {})
+        self.patch(ab, 'build_all', lambda *a: [])
+        code, out = self.run_main(['--scope', 'src/fake.h'])
+        self.assertEqual((code, out['pass'], out['narrowed']), (0, True, False))
+        self.assertEqual(out['warnings'], ['examples/Nowhere/nowhere is eligible on no board this contract builds: '
+                                           'no build here compiles it'])
+
+    def test_board_or_example_runs_are_narrowed(self):
+        self.patch(ab, 'source_identity', lambda: ({'head': 'abc', 'dirty': False, 'status': ''}, ''))
+        self.patch(ab, 'prepared_dependencies', lambda: {})
+        self.patch(ab, 'build_all', lambda *a: [])
+        for argv in (['--board', 'dev_a'], ['--scope', 'src/fake.h', '--example', 'examples/Basic/echo']):
+            self.assertTrue(self.run_main(argv)[1]['narrowed'], argv)
+        self.assertFalse(self.run_main(['--select-only', '--scope', 'src/fake.h'])[1]['narrowed'])
+        self.assertTrue(self.run_main(['--select-only', '--scope', 'src/fake.h', '--example',
+                                       'examples/Basic/echo'])[1]['narrowed'])
 
     def test_example_eligible_on_no_board_is_uncovered(self):
         path = 'examples/Nowhere/nowhere/nowhere.ino'

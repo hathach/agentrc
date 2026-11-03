@@ -40,6 +40,9 @@ retries, recovery) apply unchanged; these scripts load its `hil_*` scripts throu
 - **Builds**: `arduino-cli compile --clean ... --library <checkout>`; the build fails when arduino-cli takes this
   library from anywhere else. Sketch eligibility follows ci-arduino's `.test.only`/`.test.skip`/`.skip.txt` rules; a
   HIL sketch outside `examples/` (`test/hil/<sketch>/`) builds only on rig boards whose role runs it.
+- **Selection** from a diff: the profile's own rules first; `library.properties` is shared code (its `name=` and
+  `depends=` gate every build). A source change warns of each example eligible on no board of the profile. A run
+  given `--board` or `--example` is `narrowed: true`: its pass never stands for the selection a change needs.
 - **Dependencies**: library.properties `depends=` plus the profile's `EXTRA_DEPENDENCIES` (CI's install list) must be
   installed in the user's Arduino libraries before a build; a missing one is exit 2 naming the `arduino-cli lib
   install` line. Nothing installs during builds. Every library a compile used must be this checkout, a declared
