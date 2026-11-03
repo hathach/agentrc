@@ -126,8 +126,8 @@ nothing is ever submitted for them.
 Auto-post, when the request names it: the review is submitted as `COMMENT` or
 `REQUEST_CHANGES`, never `APPROVE`, with fix notes and resolves on our own
 threads whose fix a recheck verified. It is the same pending review, submitted
-by `post.py` once its head and fix notes check out and no text is held (over
-its length, or a body line whose first line no check verified); otherwise it is
+by `post.py` once its head and fix notes check out and no text is held (a body
+line whose first line no check verified); otherwise it is
 handed to the human as a pending review (`handedOver`, exit 1), its fix notes
 staged unless the head moved or an earlier run left it pending. Answers to
 pushback (a concession or a rebuttal) are never submitted: they go into a
@@ -243,7 +243,7 @@ sequence:
       `post.py`, naming the held findings. A blocker prepare or post names is
       reported, never worked around.
 7. Report the verdict and its reasons, the counts, coverage lost, the CI and
-   HIL rows, the receipts, `post.py`'s `overLength` and `firstLineUnchecked`
+   HIL rows, the receipts, `post.py`'s `firstLineUnchecked`
    and the result's `heldThreads`; never the draft's text. Under auto-fix also the repair state,
    the held findings, the repair and pr-babysit receipts, the `--fixed`
    receipts, the recheck's post,
@@ -262,9 +262,8 @@ link, the proposed event and its reasons, and whether the review was submitted
 (its event and link), waits for them as a pending review (auto-post's held
 answers or a `handedOver` review included), or nothing was posted and why. A
 pending review holds its thread answers beside the replies they answer
-(`ledger.py show` lists each with the recheck's reason and the thread's link). Name each text in `overLength` (and
-`answers.overLength` under `--auto`) for the human to shorten, and each body
-line in `firstLineUnchecked` for them to check, before submitting. They edit, delete or add, pick the
+(`ledger.py show` lists each with the recheck's reason and the thread's link). Name each body line in
+`firstLineUnchecked` for them to check before submitting. They edit, delete or add, pick the
 event and submit, or delete the whole review. The next `prepare.py` records
 the outcome: a deleted comment drops its finding; an edited one stands, and
 its next recheck reads the text published; a concession withdraws its finding
