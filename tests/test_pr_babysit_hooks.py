@@ -294,40 +294,16 @@ class HooksTest(unittest.TestCase):
         self.configure('headslow')
         (self.repo / 'a.txt').write_text('edited\n')
         pid = Path(self.repo.parent) / 'hook.pid'
-        code, out = self.run_script('--deadline-seconds', '6', 'a.txt', env={**self.env, 'HOOK_PID': str(pid)})
+        # The deadline covers the change's run and `worktree add` too: Windows' slow pre-commit startup needs more.
+        deadline = '20' if os.name == 'nt' else '6'
+        code, out = self.run_script('--deadline-seconds', deadline, 'a.txt', env={**self.env, 'HOOK_PID': str(pid)})
         self.assertEqual(code, 2)
-        self.assertRegex(out['error'], r'did not finish within 6 s \(HEAD headslow\)')
+        self.assertRegex(out['error'], rf'did not finish within {deadline} s \(HEAD headslow\)')
         self.assertEqual(len(self.worktrees()), 1, 'the HEAD worktree is removed')
-        if os.name != 'nt':  # an MSYS pid is not a Windows one
+        # an MSYS pid is not a Windows one; no pid, the kill came before the hook started
+        if os.name != 'nt' and pid.exists() and pid.read_text().strip():
             hook = int(pid.read_text())
             self.wait_for(lambda: not running(hook), f'the hook ({hook}) outlived the kill')
-
-    def in_repo(self):
-        cwd = os.getcwd()
-        os.chdir(self.repo)
-        self.addCleanup(os.chdir, cwd)
-        patch = mock.patch.dict(os.environ, self.env)
-        patch.start()
-        self.addCleanup(patch.stop)
-
-    def test_a_failed_removal_still_drops_the_head_worktree_even_left_locked(self):
-        # A killed `worktree add` leaves its entry locked; prune drops it only once the tree is gone and unlocked.
-        self.configure()
-        self.in_repo()
-        tmp = tempfile.mkdtemp(prefix='hooks-base-')
-        tree = os.path.join(tmp, 'head')
-        self.git('worktree', 'add', '--detach', '--quiet', tree, 'HEAD')
-        self.git('worktree', 'lock', '--reason', 'initializing', tree)
-        real = hooks.git_within
-
-        def failing_remove(deadline, start, *argv, cwd=None):
-            if argv[:2] == ('worktree', 'remove'):
-                raise hooks.Unusable('git worktree remove: refused')
-            return real(deadline, start, *argv, cwd=cwd)
-        with mock.patch.object(hooks, 'git_within', failing_remove):
-            hooks.forget(tree, tmp, 10, time.monotonic())
-        self.assertFalse(os.path.exists(tmp))
-        self.assertEqual(len(self.worktrees()), 1)
 
     def test_a_fail_fast_stop_at_an_excused_hook_still_runs_the_rest_on_the_change(self):
         self.configure('broken', 'picky')
@@ -370,7 +346,7 @@ class HooksTest(unittest.TestCase):
     def test_hooks_run_with_full_length_abbrev_and_a_same_content_rewrite_passes(self):
         # pre-commit compares `git diff` text around each hook; a stat-only rewrite once lengthened the
         # unstaged diff's abbreviated index hashes and failed it (#377). Reproducing that takes an object store
-        # at the abbrev boundary: abbrev guards the pin itself, same that such a rewrite is not a modification.
+        # at the abbrev boundary: abbrev guards the pin itself, and same shows such a rewrite is not a modification.
         self.configure('same', 'abbrev')
         (self.repo / 'a.txt').write_text('edited\n')
         code, out = self.run_script('a.txt', 'b.txt')
@@ -469,6 +445,82 @@ class HooksTest(unittest.TestCase):
         self.assertIn('usage', out['error'])
 
 
+class ForgetTest(unittest.TestCase):
+    """forget's cleanup of the HEAD worktree, with git alone: no pre-commit runs."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.repo = Path(tmp.name) / 'repo'
+        self.repo.mkdir()
+        self.env = git_env()
+        self.git('init', '-q')
+        (self.repo / 'a.txt').write_text('a\n')
+        self.git('add', '-A')
+        self.git('commit', '-qm', 'base')
+        cwd = os.getcwd()
+        os.chdir(self.repo)
+        self.addCleanup(os.chdir, cwd)
+        patch = mock.patch.dict(os.environ, self.env)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def git(self, *argv):
+        return subprocess.run(['git', *argv], cwd=self.repo, env=self.env, check=True,
+                              capture_output=True, text=True).stdout
+
+    def worktrees(self):
+        return [line for line in self.git('worktree', 'list', '--porcelain').splitlines() if line.startswith('worktree ')]
+
+    def head_tree(self):
+        tmp = tempfile.mkdtemp(prefix='hooks-base-')
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        tree = os.path.join(tmp, 'head')
+        self.git('worktree', 'add', '--detach', '--quiet', tree, 'HEAD')
+        return tmp, tree
+
+    def test_a_failed_removal_still_drops_the_head_worktree_even_left_locked(self):
+        # A killed `worktree add` leaves its entry locked; prune drops it only once the tree is gone and unlocked.
+        tmp, tree = self.head_tree()
+        self.git('worktree', 'lock', '--reason', 'initializing', tree)
+        real = hooks.git_within
+
+        def failing_remove(deadline, start, *argv, cwd=None):
+            if argv[:2] == ('worktree', 'remove'):
+                raise hooks.Unusable('git worktree remove: refused')
+            return real(deadline, start, *argv, cwd=cwd)
+        with mock.patch.object(hooks, 'git_within', failing_remove):
+            hooks.forget(tree, tmp, 10, time.monotonic())
+        self.assertFalse(os.path.exists(tmp))
+        self.assertEqual(len(self.worktrees()), 1)
+
+    def test_a_lock_that_cannot_be_removed_never_raises(self):
+        tmp, tree = self.head_tree()
+        with mock.patch.object(hooks, 'git_within', side_effect=hooks.Unusable('git worktree remove: refused')), \
+                mock.patch.object(hooks.Path, 'unlink', side_effect=PermissionError('read-only')):
+            hooks.forget(tree, tmp, 10, time.monotonic())
+        self.assertFalse(os.path.exists(tmp))
+
+    def admin(self, gitdir):
+        admin = self.repo / '.git' / 'worktrees' / 'other'
+        admin.mkdir(parents=True)
+        (admin / 'gitdir').write_bytes(gitdir)
+        return admin
+
+    @unittest.skipIf(os.name == 'nt', 'Windows file names are Unicode: none is not UTF-8')
+    def test_another_worktree_registered_at_a_path_that_is_not_utf8_is_passed_over(self):
+        self.admin(b'/tmp/bad\xff/.git\n')
+        tmp, tree = self.head_tree()
+        self.assertIsNotNone(hooks.registration(tree))
+        self.assertIsNone(hooks.registration(os.path.join(tmp, 'gone')))
+
+    def test_a_relative_gitdir_is_read_against_its_admin_dir(self):
+        # worktree.useRelativePaths (git 2.48) writes the tree's .git relative to the admin dir.
+        tree = self.repo.parent / 'rel'
+        admin = self.admin(f'{os.path.relpath(tree / ".git", self.repo / ".git" / "worktrees" / "other")}\n'.encode())
+        self.assertEqual(hooks.registration(str(tree)), admin)
+
+
 class KillTreeTest(unittest.TestCase):
     def test_windows_takes_the_tree_with_a_bounded_taskkill(self):
         # the Windows branch, run anywhere with taskkill stood in for: it must not hang the deadline's cleanup
@@ -539,7 +591,7 @@ class AsCheckoutTest(unittest.TestCase):
         said = f'{tree}/a.c: no compiler\n{posix}/b.c'
         if os.name == 'nt':
             said += f'\n/{posix[0].lower()}{posix[2:]}/c.c\n{tree.upper()}'
-        self.assertNotIn('hooks-base-x', hooks.as_checkout(said, tree))
+        self.assertNotIn('hooks-base-x', hooks.as_checkout(said, tree).lower())
 
     def test_two_runs_of_one_failure_compare_equal_and_a_new_violation_does_not(self):
         # What tinyusb's unit-test hooks printed on HEAD and on the change (#378): timings, tempfile names, order.
@@ -547,6 +599,14 @@ class AsCheckoutTest(unittest.TestCase):
         head = "PermissionError: 'C:/T/tmpld2ovkrs'\nFAIL: a\nPermissionError: 'C:/T/tmpzyxwvuts.json'\n\nRan 9 tests in 6.3s\n"
         self.assertEqual(hooks.comparable(change, '/x'), hooks.comparable(head, '/x'))
         self.assertNotEqual(hooks.comparable('1:old bad\n', '/x'), hooks.comparable('1:old bad\n2:new bad\n', '/x'))
+
+    def test_only_numbers_standing_alone_are_masked(self):
+        # A pid, a line, a duration or an address differs between runs; a file, rule or symbol naming a digit does not.
+        self.assertEqual(hooks.comparable('a.c:12:3: E501 in 0.5s (pid 4242) at 0x7f00ab\n', '/x'),
+                         hooks.comparable('a.c:14:9: E501 in 125ms (pid 77) at 0x7f11cd\n', '/x'))
+        for head, change in (('usb2.c:1: bad\n', 'cdc1.c:1: bad\n'), ('a.c:1: E501 bad\n', 'a.c:1: E502 bad\n'),
+                             ('a.c:1: x1 unused\n', 'a.c:1: x2 unused\n')):
+            self.assertNotEqual(hooks.comparable(head, '/x'), hooks.comparable(change, '/x'), change)
 
 
 class ResultsTest(unittest.TestCase):
