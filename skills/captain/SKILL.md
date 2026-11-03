@@ -67,12 +67,13 @@ opened or replaced in a target terminal since refuses, and you preview again.
   terminal, appending to anything a human half typed, so the empty-line check runs right before each send; a human who
   starts typing there at that instant can still have text merged. `hc read` is plain text, so Claude Code's dim
   suggestion, such as `Try "..."` or a predicted next prompt, cannot be told from a draft: any text in the input line
-  refuses, and a session showing one is reported as refused. An idle target is sent only while hc still sees it idle;
-  hc has no such check for done, so one that starts a turn in between gets the request as its next input. One request
-  per session is open at a time. A session whose own
-  transcript starts no turn after the request its last report answered - no prompt, task notification or compaction -
-  is not asked: `ask` prints `not asked` with that report's id, which answers for it. `--force` asks anyway, only when
-  the human wants a session asked again whatever it last said.
+  refuses, and a session showing one is reported as refused. `promptSuggestionEnabled: false` in the target's Claude
+  Code settings, such as `claude --settings '{"promptSuggestionEnabled":false}'`, turns suggestions off, the startup
+  `Try "..."` included. An idle target is sent only while hc still sees it idle; hc has no such check for done, so one
+  that starts a turn in between gets the request as its next input. One request per session is open at a time. A session
+  whose own transcript starts no turn after the request its last report answered - no prompt, task notification or
+  compaction - is not asked: `ask` prints `not asked` with that report's id, which answers for it. `--force` asks
+  anyway, only when the human wants a session asked again whatever it last said.
 - **Relay** carries the human's newest message, read by the script from this session's own transcript: you never
   pass the words. It goes verbatim, except that an opening `tell <name>... [to]` whose names - addresses, space ids
   or names, or selectors - are exactly the relay's targets is removed by the script: `relay t7` on `tell code to
@@ -99,12 +100,13 @@ opened or replaced in a target terminal since refuses, and you preview again.
 - **Withdraw** a relay only on the human's word. Before the target accepts it, it can no longer be accepted; after,
   the request is recorded but nothing stops the target: say so, and `cancel` it on the human's word if no outcome
   will come.
-- **Open** a session only when the human asks, on a checkout that already exists and the account they name: it runs
-  a terminal there, a new tab in this session's herdr space (in none, it says how to attach), with no parent, so it
-  outlives this session, and starts Claude Code under that account's config dir, set or for main unset, through
-  `env`. `ready` means it is pinned there with an empty input line; a fresh session showing a suggestion is `not
-  ready` like any other. Anything else - a trust prompt, a login, an unknown screen - is the human's: report the
-  terminal and leave it; nothing is answered, closed or retried. It never creates a worktree or resumes a session.
+- **Open** a session only when the human asks, on a checkout that already exists and the account they name: it runs a
+  terminal there, a new tab in this session's herdr space (in none, it says how to attach), with no parent, so it
+  outlives this session, and starts Claude Code under that account's config dir, set or for main unset, through `env`.
+  `ready` means it is pinned there with an empty input line; a fresh session showing a suggestion is `not ready` like
+  any other (the setting under Ask turns suggestions off). Anything else - a trust prompt, a login, an unknown screen -
+  is the human's: report the terminal and leave it; nothing is answered, closed or retried. It never creates a worktree
+  or resumes a session.
 - **Closing** a terminal, space or session is the human's, one you opened included: you may report a session done,
   but never close one, type `/exit`, kill a process or terminal, or ask a target to close itself. `cancel` closes a
   ledger item only. A relayed instruction that ends a target's own work, such as removing its worktree, is the
