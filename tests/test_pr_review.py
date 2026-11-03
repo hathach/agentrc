@@ -1236,8 +1236,7 @@ class Post(PostCase):
     def test_long_text_is_auto_posted_whole(self):
         draft = self.result_for(self.p)['draft']
         long = ' '.join(['w'] * 200) + '\n- ' + 'x' * 700
-        self.save(self.result_for(self.p, draft={**draft, 'comments': [{**draft['comments'][0], 'body': long}],
-                                               'replies': [{'commentId': 5010, 'body': ' '.join(['w'] * 100), 'findingId': 'pr7-f1'}]}))
+        self.save(self.result_for(self.p, draft={**draft, 'comments': [{**draft['comments'][0], 'body': long}]}))
         out = self.post('--auto')
         self.assertEqual((out['status'], len(self.gh.submits)), ('posted', 1))
         self.assertNotIn('handedOver', out)
@@ -1269,13 +1268,6 @@ class Post(PostCase):
         out = self.post('--auto')
         self.assertEqual((out['status'], out['review']['recovered'], len(self.gh.posts), self.gh.submits), ('drafted', True, 1, []))
         self.assertRegex(out['handedOver'], 'first line no check verified', 'recovered by its marker, still handed over')
-
-    def test_a_long_fix_note_is_auto_posted_whole(self):
-        draft = self.result_for(self.p)['draft']
-        self.save(self.result_for(self.p, draft={**draft, 'replies': [{'commentId': 5010, 'body': ' '.join(['w'] * 61), 'findingId': 'pr7-f1'}]}))
-        out = self.post('--auto')
-        self.assertEqual((out['status'], len(self.gh.submits)), ('posted', 1))
-        self.assertNotIn('handedOver', out)
 
     def test_a_body_entry_posts_only_its_first_line(self):
         long = '**low**: short problem.\n- ' + 'cause ' * 90
@@ -1515,6 +1507,19 @@ class Draft(PostCase):
                          'the human gets the whole review, its notes included, and nothing is submitted')
         self.assertEqual(self.adds()[0]['b'], ' '.join(['w'] * 61), 'never cut')
         self.assertFalse(self.gh.threads[0]['isResolved'])
+
+    def test_a_long_fix_note_is_auto_posted_whole(self):
+        self.fixed()
+        led = json.loads(Path(self.p['ledger']).read_text())
+        note = ' '.join(['w'] * 100) + ' ' + 'x' * 400
+        led['reviews'][-1]['draft']['replies'][0]['body'] = note
+        Path(self.p['ledger']).write_text(json.dumps(led))
+        submits = len(self.gh.submits)
+        out = self.post('--auto')
+        self.assertEqual((out['status'], len(self.gh.submits)), ('posted', submits + 1))
+        self.assertNotIn('handedOver', out)
+        self.assertEqual([(e['kind'], e['state']) for e in out['staged']], [('fixnote', 'published')])
+        self.assertEqual(self.adds()[0]['b'], note, 'sent whole')
 
     def test_a_fix_note_is_staged_and_its_thread_resolved_only_once_submitted(self):
         root = self.fixed()
