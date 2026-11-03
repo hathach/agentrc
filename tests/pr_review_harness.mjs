@@ -531,7 +531,7 @@ test('a mis-copied chunk is asked again, padded after an odd count of misses; on
     ['chunks 0,1,2 missing or mis-copied (state_transfer.py: gone)', () => ({ error: 'gone' })]]) {
     const { result, labels } = await go(bad)
     assert.deepEqual([result.status, result.reason], ['blocked', 'ledger-failed'], why)
-    assert.match(result.detail, new RegExp(why.replace(/[.()]/g, '\\$&')))
+    assert.ok(result.detail.includes(why), why)
     assert.ok(!labels.some(l => l.startsWith('recheck:')), why)
   }
 })
