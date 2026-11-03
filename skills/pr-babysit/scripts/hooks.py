@@ -24,8 +24,9 @@ HEAD on the same PATHs, fail there with the same output (comparable: its lines
 in any order, the tree's path read as the checkout's, times, durations, worker
 numbers and temporary names masked), so they are no evidence against the change
 (#378). A hook that ever modified files is never rerun there, nor one whose id
-SKIP cannot name or another hook in the config takes as its alias (SKIP skips
-that hook too), nor any when the config cannot be read or PyYAML is missing;
+SKIP cannot name, more than one config entry uses or another hook in the config
+takes as its alias (SKIP skips those hooks too, and a fail_fast stop at one
+leaves the rest unchecked), nor any when the config cannot be read or PyYAML is missing;
 each rerun gets a clean HEAD tree. The tree has only what HEAD
 tracks: a hook that needs the checkout's ignored files (fetched dependencies)
 fails there differently and stays counted. A change that leaves a hook's
@@ -77,10 +78,11 @@ ERROR_CHARS = 200
 CLEANUP = 20
 # The failure a run that failed naming no hook adds: not a hook id, so never excused or skipped.
 UNOWNED = '(pre-commit)'
-# What points git at a repository, its index or its objects; set by a caller, it would send HEAD's tree's resets and
-# reruns to the caller's checkout.
-OTHER_REPO = ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY',
-              'GIT_ALTERNATE_OBJECT_DIRECTORIES')
+# What points git at a repository or its index; set by a caller, it would send HEAD's tree's resets and reruns to the
+# caller's checkout. The object store stays: HEAD's tree shares it, and resolves HEAD only there.
+OTHER_REPO = ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE')
+# A C-quoted string from its opening quote to its closing one (quote.c unquote_c_style).
+C_QUOTED = re.compile(r'"(?:[^"\\]|\\.)*"', re.DOTALL)
 # What differs between two runs of the same failure: a number standing alone (a duration with its units, a line
 # number, a count, a pid, an address), an ISO 8601 time, a pytest-xdist worker's number, or a name tempfile, mktemp
 # or gcc made. Any other digit inside a word (usb2.c, E501) names a file, rule or symbol, so it stays.
@@ -197,8 +199,29 @@ def pinned_abbrev(env):
 
 def other_repo_env(names=OTHER_REPO):
     """os.environ without names, by default what points git at a repository, so a command run in HEAD's tree finds
-    that tree, not the caller's checkout or index."""
-    return {k: v for k, v in os.environ.items() if k not in names}
+    that tree, not the caller's checkout or index; a relative object store it names is made absolute against the
+    checkout, as the tree's commands run elsewhere."""
+    env = {k: v for k, v in os.environ.items() if k not in names}
+    if env.get('GIT_OBJECT_DIRECTORY'):
+        env['GIT_OBJECT_DIRECTORY'] = os.path.abspath(env['GIT_OBJECT_DIRECTORY'])
+    if env.get('GIT_ALTERNATE_OBJECT_DIRECTORIES'):
+        env['GIT_ALTERNATE_OBJECT_DIRECTORIES'] = absolute_alternates(env['GIT_ALTERNATE_OBJECT_DIRECTORIES'])
+    return env
+
+
+def absolute_alternates(value):
+    """value, a GIT_ALTERNATE_OBJECT_DIRECTORIES, with each plain relative entry made absolute. As git parses it
+    (object-file.c parse_alt_odb_entry), a C-quoted entry, which may hold the separator, runs to its closing quote
+    and one character more; it and a # comment are kept as given."""
+    out, pos = [], 0
+    while pos < len(value):
+        quoted = C_QUOTED.match(value, pos)
+        sep = value.find(os.pathsep, pos)
+        end = quoted.end() if quoted else len(value) if sep < 0 else sep
+        entry = value[pos:end]
+        out += [entry if quoted or not entry or entry.startswith('#') else os.path.abspath(entry), value[end:end + 1]]
+        pos = end + 1
+    return ''.join(out)
 
 
 def bounded(argv, deadline, start, what, cwd=None, env=None):
@@ -274,15 +297,17 @@ def comparable(text, root):
     return sorted(line for line in lines if line)
 
 
-def aliases():
-    """Each alias the config gives a hook under another id, or None when the config cannot be read: SKIP naming it
-    skips that hook too (pre-commit's commands/run.py)."""
+def shared_names():
+    """Each name SKIP would skip more than one hook by, or None when the config cannot be read: an alias the config
+    gives a hook under another id, and an id more than one entry uses (pre-commit's commands/run.py)."""
     if yaml is None:
         return None
     try:
         config = yaml.safe_load(Path(CONFIG).read_text(encoding='utf-8'))
-        return {h['alias'] for repo in config['repos'] for h in repo['hooks']
-                if h.get('alias') not in (None, '', h['id'])}
+        entries = [h for repo in config['repos'] for h in repo['hooks']]
+        ids = [h['id'] for h in entries]
+        return ({h['alias'] for h in entries if h.get('alias') not in (None, '', h['id'])}
+                | {i for i in ids if ids.count(i) > 1})
     except (OSError, ValueError, yaml.YAMLError, KeyError, TypeError, AttributeError):
         return None
 
@@ -370,11 +395,12 @@ def run_hooks(paths, deadline=DEADLINE):
     start = time.monotonic()
     code, ids, failures = passes(paths, deadline, start, 'run')
     # A hook that rewrote files is judged by what it wrote, never excused by HEAD; nor is an id SKIP cannot name,
-    # which the commit could not skip, or one whose SKIP would also skip another hook, unrun on the change.
-    aliased = aliases()
+    # which the commit could not skip, or one whose SKIP would also skip another hook, unrun on the change or, past
+    # a fail_fast stop, unchecked.
+    shared = shared_names()
     expected = {}
     for f in failures:
-        if aliased is not None and f['hook'] not in {*ids, *aliased} and ',' not in f['hook']:
+        if shared is not None and f['hook'] not in {*ids, *shared} and ',' not in f['hook']:
             expected.setdefault(f['hook'], []).append(comparable(f['output'], os.getcwd()))
     excused = baseline(expected, paths, deadline, start) if expected else []
     if excused and {f['hook'] for f in failures} <= set(excused):

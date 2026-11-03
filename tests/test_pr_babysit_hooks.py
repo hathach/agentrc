@@ -261,6 +261,18 @@ class HooksTest(unittest.TestCase):
         self.assertEqual((self.repo / 'd.txt').read_text(), 'untracked\n')
         self.assertEqual(len(self.worktrees()), 1)
 
+    def test_head_reruns_reach_an_object_store_a_callers_git_object_directory_names(self):
+        # The tree shares the checkout's objects: without them its reset before the second rerun cannot resolve HEAD.
+        self.configure('broken', 'litter')
+        (self.repo / 'a.txt').write_text('edited\n')
+        shutil.move(self.repo / '.git' / 'objects', self.repo.parent / 'objects')
+        (self.repo / '.git' / 'objects').mkdir()
+        # relative to the checkout, where HEAD's tree's commands do not run
+        env = {**self.env, 'GIT_OBJECT_DIRECTORY': os.path.join('..', 'objects')}
+        code, out = self.run_script('a.txt', env=env)
+        self.assertEqual((code, out.get('error'), out['passed']), (0, None, False))
+        self.assertEqual(out['baselineFailed'], ['broken', 'litter'])
+
     def test_each_head_rerun_starts_from_heads_tracked_files(self):
         # scribble rewrites b.txt on HEAD (so is not excused: pre-commit says it modified files there); showb must
         # read HEAD's b.txt, not scribble's.
@@ -297,6 +309,18 @@ class HooksTest(unittest.TestCase):
         (self.repo / 'a.txt').write_text('bad\n')
         code, out = self.run_script('a.txt')
         self.assertEqual((code, out['passed'], [f['hook'] for f in out['failed']]), (0, False, ['dup', 'dup']))
+        self.assertEqual(out['baselineFailed'], [])
+
+    def test_an_id_entries_share_is_never_excused_past_a_fail_fast_stop(self):
+        # The first entry fails alike on HEAD and stops both runs; SKIP=dup would skip the second, which the change breaks.
+        (self.repo / '.pre-commit-config.yaml').write_text('fail_fast: true\n' + CONFIG.format(
+            HOOK.format(id='dup').replace('hooks/dup.sh', 'hooks/broken.sh')
+            + HOOK.format(id='dup').replace('hooks/dup.sh', 'hooks/picky.sh')))
+        self.configure()
+        (self.repo / 'a.txt').write_text('bad\n')
+        code, out = self.run_script('a.txt')
+        self.assertEqual((code, out['passed']), (0, False))
+        self.assertEqual(out['failed'], [{'hook': 'dup', 'error': 'nope'}])
         self.assertEqual(out['baselineFailed'], [])
 
     def test_a_hook_that_modified_files_in_any_run_is_never_excused(self):
@@ -574,6 +598,28 @@ class PinnedAbbrevTest(unittest.TestCase):
         self.assertEqual(hooks.pinned_abbrev({})['GIT_CONFIG_KEY_0'], 'core.abbrev')
         with self.assertRaisesRegex(hooks.Unusable, 'not a count'):
             hooks.pinned_abbrev({'GIT_CONFIG_COUNT': 'x'})
+
+
+class OtherRepoEnvTest(unittest.TestCase):
+    def test_the_object_store_stays_absolute_and_the_repository_goes(self):
+        alternates = os.pathsep.join(['alt', os.path.abspath('abs'), '"quoted"'])
+        with mock.patch.dict(os.environ, {'GIT_DIR': '.git', 'GIT_INDEX_FILE': 'index', 'GIT_OBJECT_DIRECTORY': 'objs',
+                                          'GIT_ALTERNATE_OBJECT_DIRECTORIES': alternates}):
+            env = hooks.other_repo_env()
+        self.assertNotIn('GIT_DIR', env)
+        self.assertNotIn('GIT_INDEX_FILE', env)
+        self.assertEqual(env['GIT_OBJECT_DIRECTORY'], os.path.abspath('objs'))
+        self.assertEqual(env['GIT_ALTERNATE_OBJECT_DIRECTORIES'],
+                         os.pathsep.join([os.path.abspath('alt'), os.path.abspath('abs'), '"quoted"']))
+
+    def test_a_quoted_alternate_holding_the_separator_stays_whole(self):
+        # git reads a quoted entry up to its closing quote, past any separator inside it.
+        quoted = '"../a' + os.pathsep + 'l\\"t"'
+        alternates = os.pathsep.join([quoted, 'alt', '', '#note', quoted])
+        with mock.patch.dict(os.environ, {'GIT_ALTERNATE_OBJECT_DIRECTORIES': alternates}):
+            env = hooks.other_repo_env()
+        self.assertEqual(env['GIT_ALTERNATE_OBJECT_DIRECTORIES'],
+                         os.pathsep.join([quoted, os.path.abspath('alt'), '', '#note', quoted]))
 
 
 class RunHooksTest(unittest.TestCase):
