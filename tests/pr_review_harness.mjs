@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { test } from 'node:test'
+import { fileURLToPath } from 'node:url'
 
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
 const body = readFileSync(new URL('../workflows/pr-review.js', import.meta.url), 'utf8')
@@ -21,6 +26,34 @@ const finding = (why, severity = 'high', line = 10, impact = IMP) => ({ file: 's
 const confirmedAs = (severity, over = {}) => ({ verdict: 'confirmed', reason: 'yes', severity, impact: IMP, severityReason: 'graded', confidence: 'high', ...over })
 const REFUTED = { verdict: 'refuted', reason: 'no', severity: null, impact: null, severityReason: null, confidence: null }
 
+// ledger.py show --snapshot's manifest over `answer` as the snapshot's bytes, and the real state_transfer.py --raw's
+// envelope for the file a manifest named.
+const STATE_TRANSFER = fileURLToPath(new URL('../skills/pr-babysit/scripts/state_transfer.py', import.meta.url))
+const snapshots = new Map()
+const asciiJson = (v) => JSON.stringify(v).replace(/[\u007f-￿]/g, c => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`)
+function fnv1a (text) {
+  let h = 0x811c9dc5
+  for (const ch of text) h = Math.imul(h ^ ch.codePointAt(0), 0x01000193) >>> 0
+  return h.toString(16).padStart(8, '0')
+}
+function manifestOf (answer, a) {
+  const payload = asciiJson(answer)
+  const file = `${a.factsDir.replace(/\\/g, '/')}/ledger-${createHash('sha256').update(payload).digest('hex')}.json`
+  snapshots.set(file, payload)
+  return { repo: a.repo, pr: a.pr, head: a.head, file, digest: fnv1a(payload), length: payload.length }
+}
+function envelopeOf (prompt) {
+  const [, file, ids, pad] = /state_transfer\.py '([^']+)' --raw --chunks ([0-9,]+)( --pad)?\n/.exec(prompt)
+  const dir = mkdtempSync(join(tmpdir(), 'pr-review-ledger-'))
+  try {
+    const at = join(dir, 'ledger.json')
+    writeFileSync(at, snapshots.get(file))
+    const done = spawnSync('python3', [STATE_TRANSFER, at, '--raw', '--chunks', ids, ...(pad ? ['--pad'] : [])], { encoding: 'utf8' })
+    assert.equal(done.status, 0, done.stdout + done.stderr)
+    return JSON.parse(done.stdout.trim().split('\n').at(-1))
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+}
+
 // Stub agents keyed by label; `stubs.<label>` is the value, or a function of the prompt.
 async function run(args, stubs = {}) {
   const calls = []
@@ -38,15 +71,23 @@ async function run(args, stubs = {}) {
   }
   const agent = async (prompt, options) => {
     calls.push({ label: options.label, prompt: String(prompt), options })
+    // `stubs.ledgerChunks(envelope, call)` replaces an envelope of the chunks a load asked.
+    if (options.label.startsWith('ledger:load#')) {
+      const env = envelopeOf(prompt)
+      return stubs.ledgerChunks ? stubs.ledgerChunks(env, calls.filter(c => c.label.startsWith('ledger:load#')).length) : env
+    }
     const v = pick(options.label, prompt)
-    // `stubs.disputes` is the ledger answer's disputes, unless that answer names its own; the members ledger.py always
-    // prints default as it prints them. `stubs.ledgerAsIs` is returned untouched.
-    if (options.label === 'ledger') {
-      if (stubs.ledgerAsIs !== undefined) return stubs.ledgerAsIs
-      const l = v === undefined ? defaults.ledger : v
+    // `stubs.ledger` is the answer ledger.py show --snapshot writes; `stubs.disputes` its disputes, unless that answer
+    // names its own; the members ledger.py always prints default as it prints them. `stubs.ledgerAsIs` is written
+    // untouched, and `stubs['ledger:manifest']` replaces the manifest.
+    if (options.label === 'ledger:manifest') {
+      if (stubs['ledger:manifest'] !== undefined) return v
+      const l = stubs.ledgerAsIs !== undefined ? stubs.ledgerAsIs : v === undefined ? defaults.ledger : v
       if (!l || typeof l !== 'object') return l
       const rows = Array.isArray(l.open) ? { open: l.open.map(f => f && typeof f === 'object' ? { published: null, repair: null, ...f } : f) } : {}
-      return { ...(l.reviews > 0 ? { heldThreads: [] } : {}), ...l, ...rows, ...('disputes' in l ? {} : { disputes: stubs.disputes?.disputes ?? [] }) }
+      const answer = stubs.ledgerAsIs !== undefined ? l
+        : { ...(l.reviews > 0 ? { heldThreads: [] } : {}), ...l, ...rows, ...('disputes' in l ? {} : { disputes: stubs.disputes?.disputes ?? [] }) }
+      return manifestOf(answer, args)
     }
     if (v !== undefined) return v
     if (options.label in defaults) return defaults[options.label]
@@ -67,9 +108,12 @@ async function run(args, stubs = {}) {
     return v === undefined ? { confirmed: [], dropped: [], unverified: [] } : (typeof v === 'function' ? v(a) : v)
   }
   const parallel = thunks => Promise.all(thunks.map(t => Promise.resolve().then(t).catch(() => null)))
-  const fn = new AsyncFunction('args', 'agent', 'pipeline', 'parallel', 'phase', 'log', 'workflow', 'budget', ...ABSENT, body)
-  const result = await fn(args, agent, null, parallel, () => {}, m => logs.push(String(m)), workflow, null, ...ABSENT.map(() => undefined))
-  return { result, calls, logs, audits, labels: calls.map(c => c.label) }
+  // Every value the workflow parses, so a test can see the ledger answer it rebuilt.
+  const parsed = []
+  const json = { stringify: JSON.stringify, parse: (t, r) => { const v = JSON.parse(t, r); parsed.push(v); return v } }
+  const fn = new AsyncFunction('args', 'agent', 'pipeline', 'parallel', 'phase', 'log', 'workflow', 'budget', 'JSON', ...ABSENT, body)
+  const result = await fn(args, agent, null, parallel, () => {}, m => logs.push(String(m)), workflow, null, json, ...ABSENT.map(() => undefined))
+  return { result, calls, logs, audits, parsed, labels: calls.map(c => c.label) }
 }
 
 const pinned = (a) => ({ ok: true, head: H, top: '/w', repo: a.repo, pr: a.pr, ci: { state: 'green' }, pins: { mergeBase: a.mergeBase, scopeBase: a.scopeBase, mode: a.mode, groups: a.groups } })
@@ -150,11 +194,13 @@ test('a clean full review approves only with green CI, full coverage and hardwar
   assert.equal(result.verdict.event, 'APPROVE')
   assert.deepEqual(audits[0], { dirs: ['src/core'], dimensions: audits[0].dimensions, diff: { base: MB, head: H }, root: '/w' })
   assert.equal(audits[0].dimensions.length, 4)
-  assert.ok(calls.filter(c => ['check', 'threads', 'ledger'].includes(c.label)).every(c => c.options.model === 'haiku'))
+  assert.ok(calls.filter(c => ['check', 'threads', 'ledger:manifest'].includes(c.label)).every(c => c.options.model === 'haiku'))
+  assert.ok(calls.filter(c => c.label.startsWith('ledger:load#')).every(c => c.options.model === 'sonnet'))
   assert.match(calls.find(c => c.label === 'check').prompt, /prepare\.py --check --pr 7 --repo o\/r --expected-head b{40}/)
   const at = (l) => calls.findIndex(c => c.label === l)
-  assert.ok(at('threads') < at('ledger'), 'show reads the snapshot threads.py wrote')
-  assert.match(calls[at('ledger')].prompt, /ledger\.py show .*--threads '\/tmp\/ledger\/7\/threads-b{40}\.json' --head b{40}\n/)
+  assert.ok(at('threads') < at('ledger:manifest'), 'show reads the snapshot threads.py wrote')
+  assert.match(calls[at('ledger:manifest')].prompt, /ledger\.py show .*--threads '\/tmp\/ledger\/7\/threads-b{40}\.json' --head b{40} --snapshot '\/tmp\/ledger\/7'\n/)
+  assert.match(calls[at('ledger:load#1')].prompt, /state_transfer\.py '\/tmp\/ledger\/7\/ledger-[0-9a-f]{64}\.json' --raw --chunks 0\n/)
   assert.deepEqual(result.heldThreads, [])
   assert.doesNotMatch(result.draft.body, /agentrc|Claude|generated/i)
 
@@ -391,7 +437,8 @@ test('the script relays run as the relay role', async () => {
   const { calls } = await run({ ...BASE, mode: 'incremental', scopeBase: OLD }, { check: pinned({ ...BASE, mode: 'incremental', scopeBase: OLD }),
     ledger: { reviews: 1, last: { head: OLD }, open: [] }, threads: (prompt, label) => label === 'threads' ? null : { file: `${BASE.factsDir}/threads-${H}.json`, count: 0 } })
   const relays = calls.filter(c => c.options.agentType === 'relay')
-  assert.deepEqual(relays.map(c => c.label), ['check', 'threads', 'threads:retry', 'ledger'], 'one relay reads the ledger and its disputes')
+  assert.deepEqual(relays.map(c => c.label), ['check', 'threads', 'threads:retry', 'ledger:manifest', 'ledger:load#1'],
+    'one snapshot of the ledger and its disputes, read in checked chunks')
 })
 
 test('a ledger answer missing its members, or not of the review prepare pinned, blocks instead of dropping standing findings', async () => {
@@ -426,8 +473,82 @@ test('a ledger answer missing its members, or not of the review prepare pinned, 
     assert.ok(!labels.some(l => l.startsWith('recheck:')), JSON.stringify(ledger))
   }
   assert.equal((await run(BASE, { ledgerAsIs: { reviews: 0, last: null, open: [], disputes: [] } })).result.status, 'reviewed', 'an empty ledger prints no heldThreads')
-  const schema = good.calls.find(c => c.label === 'ledger').options.schema.properties.open.items
-  assert.deepEqual([schema.required, schema.properties.repair.required], [['id', 'published', 'repair'], ['head', 'state', 'resolved']])
+})
+
+test('a ledger answer past 64 KiB crosses in checked chunks, every text exact, in every mode', async () => {
+  const inc = { ...BASE, mode: 'incremental', scopeBase: OLD }
+  // As ledger.py's view writes a carried row: without its impact and severityReason.
+  const row = (n) => ({ id: `pr7-f${n}`, status: 'open', file: 'src/core/a.c', line: 10 + n, severity: 'low', confidence: 'high', commentId: 900 + n,
+    why: `${wordy(900)} “é” \\ "q" — ${n}`, published: n % 2 ? `**low**: edited by the human — ${n}` : null, repair: null })
+  const open = [...Array(40).keys()].map(row)
+  const disputes = [...Array(30).keys()].map(n => ({ findingId: `pr7-f${n}`, key: `k${n}`, rootCommentId: 900 + n, replies: [{ id: 5000 + n, digest: 'd', author: 'c' }] }))
+  const still = { state: 'open', reason: 'still' }
+  const same = { ...pinned(BASE), pins: { ...pinned(BASE).pins, mode: 'same' } }
+  for (const [a, check, last] of [[BASE, pinned(BASE), OLD], [inc, pinned(inc), OLD], [{ ...BASE, mode: 'discussion' }, same, H]]) {
+    const whole = { reviews: 1, last: { head: last }, open, heldThreads: [], disputes }
+    const m = manifestOf(whole, a)
+    assert.ok(m.length > 64 * 1024, `${m.length} bytes`)
+    const { result, calls, parsed } = await run(a, { check, ledgerAsIs: whole, recheck: still })
+    assert.equal(result.status, 'reviewed', a.mode)
+    assert.deepEqual(parsed.find(v => v && Array.isArray(v.open) && v.open.length === 40), whole, `${a.mode}: the answer rebuilt exactly`)
+    const loads = calls.filter(c => c.label.startsWith('ledger:load#'))
+    assert.equal(loads.length, Math.ceil(Math.ceil(m.length / 512) / 4), 'four chunks a call, each asked once')
+    assert.equal(calls.filter(c => c.label.startsWith('recheck:')).length, a.mode === 'discussion' ? 30 : 40, a.mode)
+    const carried = result.findings.filter(f => f.id)
+    assert.equal(carried.length, a.mode === 'discussion' ? 30 : 40)
+    assert.ok(carried.every(f => f.severity === 'low' && !('impact' in JSON.parse(JSON.stringify(f))) && !('severityReason' in JSON.parse(JSON.stringify(f)))),
+      `${a.mode}: unregraded, the result leaves the grading out and save keeps the ledger's`)
+  }
+  const regrade = { state: 'open', reason: 'still', severity: 'medium', impact: IMP, severityReason: 'worse now', confidence: 'high' }
+  const whole = { reviews: 1, last: { head: OLD }, open: open.slice(0, 1), heldThreads: [], disputes: [] }
+  const { result } = await run(inc, { check: pinned(inc), ledgerAsIs: whole, recheck: regrade })
+  assert.deepEqual((({ severity, impact, severityReason }) => ({ severity, impact, severityReason }))(result.findings[0]),
+    { severity: 'medium', impact: IMP, severityReason: 'worse now' }, 'a regrade carries its whole grading')
+})
+
+test('a mis-copied chunk is asked again, padded after an odd count of misses; one never copied right blocks before any review work', async () => {
+  const inc = { ...BASE, mode: 'incremental', scopeBase: OLD }
+  const row = { id: 'pr7-f1', status: 'open', file: 'src/core/a.c', line: 10, severity: 'high', commentId: 901, why: wordy(600), published: null, repair: null }
+  const whole = { reviews: 1, last: { head: OLD }, open: [row], heldThreads: [], disputes: [] }
+  const still = { state: 'open', reason: 'still' }
+  const flip = (c) => ({ ...c, data: (c.data[0] === 'A' ? 'B' : 'A') + c.data.slice(1) })
+  const resum = (c) => { const d = flip(c); return { ...d, sum: fnv1a(d.data) } }
+  const go = (ledgerChunks) => run(inc, { check: pinned(inc), ledgerAsIs: whole, recheck: still, ledgerChunks })
+  const once = await go((env, call) => call === 1 ? { ...env, chunks: env.chunks.map((c, k) => k ? c : flip(c)) } : env)
+  assert.equal(once.result.status, 'reviewed')
+  const asked = once.calls.filter(c => c.label.startsWith('ledger:load#')).map(c => /--chunks ([0-9,]+)( --pad)?/.exec(c.prompt).slice(1, 3).join(''))
+  assert.deepEqual(asked.slice(-1), ['0 --pad'], 'only the bad chunk is asked again, padded after one miss')
+  const twice = await go((env, call) => call <= 2 ? { ...env, chunks: env.chunks.map(c => c.i ? c : flip(c)) } : env)
+  assert.equal(twice.result.status, 'reviewed')
+  assert.match(twice.calls.filter(c => c.label.startsWith('ledger:load#')).at(-1).prompt, /--chunks 0\n/, 'unpadded again after two')
+  const dup = await go((env, call) => call === 1 ? { ...env, chunks: [...env.chunks, env.chunks[0]] } : env)
+  assert.equal(dup.result.status, 'reviewed', 'a duplicated chunk settles neither copy, and is asked again')
+  const whole2 = await go((env, call) => call === 1 ? { ...env, chunks: env.chunks.map(c => c.i ? c : resum(c)) } : env)
+  assert.equal(whole2.result.status, 'reviewed', 'a chunk changed with its sum fails the digest, and the load starts over')
+  for (const [why, bad] of [['missing or mis-copied', (env) => ({ ...env, chunks: env.chunks.map(c => c.i === 1 ? flip(c) : c) })],
+    ['does not match the manifest digest', (env) => ({ ...env, chunks: env.chunks.map(c => c.i === 1 ? resum(c) : c) })],
+    ['chunks 0,1,2 missing', (env) => ({ ...env, digest: '00000000' })], ['chunks 0,1,2 missing', () => ({ error: 'gone' })]]) {
+    const { result, labels } = await go(bad)
+    assert.deepEqual([result.status, result.reason], ['blocked', 'ledger-failed'], why)
+    assert.match(result.detail, new RegExp(why.replace('.', '\\.')))
+    assert.ok(!labels.some(l => l.startsWith('recheck:')), why)
+  }
+})
+
+test('a ledger manifest of another head, path or size blocks before reading', async () => {
+  const inc = { ...BASE, mode: 'incremental', scopeBase: OLD }
+  const row = { id: 'pr7-f1', status: 'open', file: 'src/core/a.c', line: 10, severity: 'high', commentId: 901, why: 'w', published: null, repair: null }
+  const whole = { reviews: 1, last: { head: OLD }, open: [row], heldThreads: [], disputes: [] }
+  const real = manifestOf(whole, inc)
+  const name = real.file.split('/').at(-1)
+  for (const wrong of [{ head: OLD }, { repo: 'o/x' }, { pr: 8 }, { file: `/tmp/other/${name}` }, { file: `${inc.factsDir}/ledger-x.json` },
+    { file: `${inc.factsDir}/../${name}` }, { digest: 'xyz' }, { length: 0 }, { length: 256 * 1024 + 1 }, { error: 'no ledger' }]) {
+    const { result, labels } = await run(inc, { check: pinned(inc), ledgerAsIs: whole, 'ledger:manifest': { ...real, ...wrong } })
+    assert.deepEqual([result.status, result.reason], ['blocked', 'ledger-failed'], JSON.stringify(wrong))
+    assert.ok(!labels.some(l => l.startsWith('ledger:load#')), JSON.stringify(wrong))
+  }
+  const dead = await run(inc, { check: pinned(inc), 'ledger:manifest': null })
+  assert.deepEqual([dead.result.reason, dead.result.detail], ['ledger-failed', 'the ledger relay died'])
 })
 
 test('a draft or check agent that throws takes its null path; a check relay that throws blocks', async () => {

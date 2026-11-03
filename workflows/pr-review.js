@@ -118,23 +118,43 @@ if (!threadsOut || (!threadsOut.error && threadsOut.file !== threadsFile)) {
   { label: 'threads:retry', phase: 'Context', agentType: 'relay', model: 'sonnet', effort: 'low', schema: THREADS }).catch(quiet('threads:retry'))
 }
 if (!threadsOut || threadsOut.error || threadsOut.file !== threadsFile) return blocked('threads-failed', threadsOut ? threadsOut.error || 'wrong file' : 'the threads relay died')
-const DISPUTES = { type: 'array', items: { type: 'object', required: ['findingId', 'key', 'replies'],
-  properties: { findingId: { type: 'string' }, key: { type: 'string' }, rootCommentId: { type: 'integer' }, outdated: { type: 'boolean' },
-    replies: { type: 'array', items: { type: 'object', properties: { id: { type: 'integer' }, digest: { type: 'string' }, author: { type: 'string' } } } } } } }
-// One read gives the standing findings and the pushback on them, from the same ledger and snapshot.
-const prior = await relay('ledger', 'Context', `python3 ${S}/ledger.py show --pr ${pr} --repo ${repo} --threads '${threadsFile}' --head ${head}`,
-  { type: 'object', properties: { reviews: { type: 'integer' }, last: { type: ['object', 'null'], properties: { head: { type: 'string' } } }, open: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, status: { type: 'string' }, file: { type: 'string' }, line: { type: 'integer' }, severity: { type: ['string', 'null'] }, confidence: { type: ['string', 'null'] }, impact: IMPACT, severityReason: { type: ['string', 'null'] }, commentId: { type: ['integer', 'null'] }, why: { type: 'string' }, published: { type: ['string', 'null'] }, inBody: { type: 'boolean' }, resolveDue: { type: ['object', 'null'], properties: { replied: { type: 'boolean' } } }, repair: { type: ['object', 'null'], properties: { head: { type: 'string' }, state: { type: 'string' }, resolved: { type: 'boolean' } }, required: ['head', 'state', 'resolved'] } }, required: ['id', 'published', 'repair'] } },
-    heldThreads: { type: 'array', items: { type: 'object', properties: { findingId: { type: 'string' }, commentId: { type: 'integer' }, why: { type: 'string' } } } }, disputes: DISPUTES, error: { type: 'string' } } })
-if (!prior || prior.error) return blocked('ledger-failed', prior ? prior.error : 'the ledger relay died')
+// One read gives the standing findings and the pushback on them, from the same ledger and snapshot. The answer
+// outgrows what a model copies whole (#407): ledger.py writes the workflow's view of it to a content-named file and
+// prints a manifest, and the loader copies state_transfer.py --raw's base64 chunks, as pr-babysit's state loader does.
+// A carried row comes without its impact and severityReason: unregraded, the result leaves them out and save keeps
+// the ledger's.
+const LEDGER_MAX = 256 * 1024 // state_transfer.py's MAX_RAW
+const MANIFEST = { type: 'object', properties: { repo: { type: 'string' }, pr: { type: 'integer' }, head: { type: 'string' }, file: { type: 'string' },
+  digest: { type: 'string' }, length: { type: 'integer' }, error: { type: 'string' } } }
+const manifest = await relay('ledger:manifest', 'Context',
+  `python3 ${S}/ledger.py show --pr ${pr} --repo ${repo} --threads '${threadsFile}' --head ${head} --snapshot '${factsDir}'`, MANIFEST)
+if (!manifest || manifest.error) return blocked('ledger-failed', manifest ? manifest.error : 'the ledger relay died')
+const snapshotDir = factsDir.replace(/(.)\/+$/, '$1')
+// The path goes into a command: only the one ledger.py names under factsDir for this repository, PR and head.
+if (manifest.repo !== repo || manifest.pr !== pr || manifest.head !== head || typeof manifest.file !== 'string' ||
+    !manifest.file.startsWith(`${snapshotDir}/`) || !/^ledger-[0-9a-f]{64}\.json$/.test(manifest.file.slice(snapshotDir.length + 1)) ||
+    !/^[0-9a-f]{8}$/.test(manifest.digest || '') || !Number.isInteger(manifest.length) || manifest.length < 1 || manifest.length > LEDGER_MAX) {
+  return blocked('ledger-failed', `ledger manifest answered ${JSON.stringify(manifest)}`)
+}
+const loaded = await loadChunks(manifest)
+if (loaded.why) {
+  log(`ledger: ${loaded.why}`)
+  return blocked('ledger-failed', loaded.why)
+}
+// The bytes are ledger.py's, yet Python writes JSON JavaScript refuses (NaN).
+let prior = null
+try { prior = JSON.parse(loaded.text) } catch {}
+if (!prior || typeof prior !== 'object') return blocked('ledger-failed', 'the ledger snapshot is not JSON')
 // A copy missing members must not read as nothing standing: an incremental or discussion run continues the review prepare pinned.
 // A row without its published text or repair record would restate the draft, or never raise a failed repair again;
 // heldThreads is printed whenever a review is on the ledger.
 const rowOk = (f) => f && typeof f.id === 'string' && (f.published === null || typeof f.published === 'string') &&
   (f.repair === null || (f.repair && SHA.test(f.repair.head) && typeof f.repair.state === 'string' && typeof f.repair.resolved === 'boolean'))
-if (!Number.isInteger(prior.reviews) || !Array.isArray(prior.open) || !Array.isArray(prior.disputes) || !prior.open.every(rowOk) ||
+if (!Number.isInteger(prior.reviews) || prior.reviews < 0 || !Array.isArray(prior.open) || !Array.isArray(prior.disputes) || !prior.open.every(rowOk) ||
   (prior.reviews > 0 && !Array.isArray(prior.heldThreads)) ||
   (args.mode !== 'full' && (prior.reviews < 1 || (prior.last || {}).head !== (discussion ? head : scopeBase)))) {
-  return blocked('ledger-failed', `ledger answered ${JSON.stringify(prior)}`)
+  const shape = Object.fromEntries(Object.entries(prior).map(([k, v]) => [k, Array.isArray(v) ? `${v.length} rows` : v]))
+  return blocked('ledger-failed', `ledger answered ${JSON.stringify(shape)}`)
 }
 const disputeOf = Object.fromEntries(prior.disputes.map(d => [d.findingId, d]))
 // A discussion run judges only the findings someone answered; any other run rechecks every standing one.
@@ -587,4 +607,89 @@ return {
   ci, hil,
   heldThreads: prior.heldThreads || [],
   draft: { event, body: lines.join('\n'), comments, replies: fixedReplies, resolves },
+}
+
+// The loader of pr-babysit.js (its stateRef load): each chunk with its sum, a padded re-ask after an odd count of failed
+// asks (#147), and the whole checked against the manifest's digest. Sonnet: Haiku mis-copies the same chunks every retry.
+async function loadChunks ({ file, length, digest }) {
+  const SIZE = 512
+  const PER_CALL = 4 // more chunks to a call come back truncated and spliced
+  const ROUNDS = 6
+  const ENVELOPE = {
+    type: 'object', additionalProperties: false,
+    properties: {
+      v: { type: 'integer' }, digest: { type: 'string' }, length: { type: 'integer' }, size: { type: 'integer' }, pad: { type: 'boolean' }, error: { type: 'string' },
+      chunks: { type: 'array', items: { type: 'object', additionalProperties: false,
+        properties: { i: { type: 'integer' }, data: { type: 'string' }, sum: { type: 'string' } } } },
+    },
+  }
+  const script = `${AGENTRC}/skills/pr-babysit/scripts/state_transfer.py`
+  const indices = [...Array(Math.ceil(length / SIZE)).keys()]
+  let why = ''
+  let got = new Map()
+  let idle = 0
+  let call = 0
+  const failed = new Map()
+  const padded = (i) => (failed.get(i) || 0) % 2 === 1
+  const take = (env, asked, pad) => {
+    if (!env) return false
+    if (typeof env.error === 'string') { why = `state_transfer.py: ${env.error}`; return false }
+    if (env.v !== 1 || env.size !== SIZE || env.length !== length || env.digest !== digest || env.pad !== pad || !Array.isArray(env.chunks)) {
+      why = 'the envelope metadata is malformed'
+      return false
+    }
+    const want = new Set(asked)
+    const byIndex = new Map()
+    for (const c of env.chunks) byIndex.set(c.i, byIndex.has(c.i) ? null : c) // a duplicate settles neither copy
+    let added = false
+    for (const [i, c] of byIndex) {
+      if (!c || !want.has(i) || typeof c.data !== 'string' || c.sum !== fnv1a(c.data)) continue
+      const raw = fromBase64(c.data)
+      const bytes = raw !== null && pad ? (raw[0] === ' ' ? raw.slice(1) : null) : raw
+      if (bytes !== null && bytes.length === Math.min(SIZE, length - i * SIZE)) { got.set(i, bytes); added = true }
+    }
+    return added
+  }
+  const missingOf = () => indices.filter(i => !got.has(i))
+  // Idle rounds end the load only once every missing chunk was asked padded too.
+  const untried = () => missingOf().some(i => (failed.get(i) || 0) < 2)
+  for (let round = 1; (idle < 2 || untried()) && round <= ROUNDS; round++) {
+    const missing = missingOf()
+    const groups = [false, true].flatMap(pad => groupsOf(missing.filter(i => padded(i) === pad), PER_CALL).map(asked => ({ asked, pad })))
+    const replies = await parallel(groups.map(({ asked, pad }) => () => agent(
+      `Run exactly: python3 ${script} '${file}' --raw --chunks ${asked.join(',')}${pad ? ' --pad' : ''}\n` +
+      'Its last stdout line is one JSON object: return it unchanged as your answer. The chunk data is opaque base64; ' +
+      'copy every character exactly and change, reorder, drop or add nothing.',
+      { label: `ledger:load#${++call}`, phase: 'Context', agentType: 'relay', model: 'sonnet', effort: 'low', schema: ENVELOPE },
+    ).catch(e => { why = `loader died: ${e && e.message}`; return null })))
+    let added = false
+    replies.forEach((env, g) => { added = take(env, groups[g].asked, groups[g].pad) || added })
+    for (const { asked } of groups) for (const i of asked) if (!got.has(i)) failed.set(i, (failed.get(i) || 0) + 1)
+    const left = missingOf()
+    idle = added && left.length ? 0 : idle + 1
+    if (left.length) { why = `chunks ${left.join(',')} missing or mis-copied`; continue }
+    const text = indices.map(i => got.get(i)).join('')
+    if (fnv1a(text) === digest) return { text }
+    // Every chunk passed its sum yet the whole fails: a chunk and its sum changed together.
+    why = 'the reassembled ledger answer does not match the manifest digest'
+    got = new Map()
+  }
+  return { why }
+}
+function groupsOf (list, n) { return [...Array(Math.ceil(list.length / n)).keys()].map(k => list.slice(k * n, (k + 1) * n)) }
+function fromBase64 (text) {
+  if (typeof text !== 'string' || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(text)) return null
+  const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+  let out = ''
+  for (let k = 0; k < text.length; k += 4) {
+    const n = [...text.slice(k, k + 4)].reduce((acc, ch) => (acc << 6) | Math.max(B64.indexOf(ch), 0), 0)
+    out += String.fromCharCode((n >> 16) & 255, (n >> 8) & 255, n & 255)
+  }
+  return out.slice(0, out.length - (text.endsWith('==') ? 2 : text.endsWith('=') ? 1 : 0))
+}
+// state_transfer.py's sum (seal.fnv1a): 32-bit FNV-1a over code points.
+function fnv1a (text) {
+  let h = 0x811c9dc5
+  for (const ch of text) h = Math.imul(h ^ ch.codePointAt(0), 0x01000193) >>> 0
+  return h.toString(16).padStart(8, '0')
 }

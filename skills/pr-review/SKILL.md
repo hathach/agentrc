@@ -18,7 +18,7 @@ python3 "$S/prepare.py" --pr N [--repo O/R] [--full] [--auto-fix]  # checkout to
 python3 "$S/prepare.py" --check --pr N --expected-head SHA       # review worktree: still that head, clean, its pins
 python3 "$S/prepare.py" --release --pr N --token T                # any worktree: unlock that run's review tree
 python3 "$S/threads.py" --pr N --out FILE                         # every comment and thread, bodies in FILE
-python3 "$S/ledger.py" show --pr N [--finding ID | --draft | --pending | --threads FILE [--head SHA]]  # standing findings, unpublished answers; --draft: the saved review; --pending: the newest one not yet submitted or confirmed, which plain show never lists; --head: replies on our threads still to judge
+python3 "$S/ledger.py" show --pr N [--finding ID | --draft | --pending | --threads FILE [--head SHA [--snapshot DIR]]]  # standing findings, unpublished answers; --draft: the saved review; --pending: the newest one not yet submitted or confirmed, which plain show never lists; --head: replies on our threads still to judge; --snapshot: that answer written to DIR, only its manifest printed (the workflow's read)
 python3 "$S/ledger.py" show --pr N --fixable --threads FILE --head SHA  # what an auto-fix repair may take from the review submitted on SHA, each with its claimDigest
 python3 "$S/ledger.py" save --pr N --output FILE [--reason TEXT]  # a finished launch's result, as a pending draft
 python3 "$S/post.py" --pr N --expected-head SHA [--auto [--defer-answers]]  # a pending GitHub review; --auto: submit it; --defer-answers: keep its answers for a later plain run

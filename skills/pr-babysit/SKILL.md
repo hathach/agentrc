@@ -32,7 +32,7 @@ python3 "$S/coderabbit_trigger.py" --pr N [--repo R] --head <sha> [--request]  #
 python3 "$S/greptile_trigger.py" --pr N [--repo R] --head <sha>  # comment `@greptileai` once per head, recorded under the git common dir
 python3 "$S/build.py" --path 'src/a.c' --command 'make -C <BUILD>' [--setup L] [--require T]  # build the checkout as it stands
 python3 "$S/scope_check.py" --path 'src/a.c' --path 'test/test_a.c'  # which paths a fix writer may edit or create
-python3 "$S/state_transfer.py" <saved output> [--chunks I,J] [--pad]  # a stateRef's state as checksummed base64 chunks; --pad shifts their text
+python3 "$S/state_transfer.py" <saved output> [--chunks I,J] [--pad] [--raw]  # a stateRef's state as checksummed base64 chunks; --pad shifts their text; --raw: the file's own bytes (pr-review's ledger snapshot)
 python3 "$S/launch_result.py" --output <saved output> [--state-ref F:D] [--checkout DIR] [--keys]  # the caller's reading of a launch; --keys: settled failures' keys too
 python3 "$S/merge.py" --pr-url <url> --base <branch> --checkout DIR --output <saved output> --state-digest D [--waive BOT] [--merge]  # chief's merge gate; inspects without --merge; --waive drops a bot from the required reviews on the owner's word, recorded as `waived`
 ```
