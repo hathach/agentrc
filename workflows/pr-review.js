@@ -626,6 +626,7 @@ async function loadChunks ({ file, length, digest }) {
   const script = `${AGENTRC}/skills/pr-babysit/scripts/state_transfer.py`
   const indices = [...Array(Math.ceil(length / SIZE)).keys()]
   let why = ''
+  let cause = '' // this round's failure behind a still-missing chunk
   let got = new Map()
   let idle = 0
   let call = 0
@@ -633,9 +634,9 @@ async function loadChunks ({ file, length, digest }) {
   const padded = (i) => (failed.get(i) || 0) % 2 === 1
   const take = (env, asked, pad) => {
     if (!env) return false
-    if (typeof env.error === 'string') { why = `state_transfer.py: ${env.error}`; return false }
+    if (typeof env.error === 'string') { cause = `state_transfer.py: ${env.error}`; return false }
     if (env.v !== 1 || env.size !== SIZE || env.length !== length || env.digest !== digest || env.pad !== pad || !Array.isArray(env.chunks)) {
-      why = 'the envelope metadata is malformed'
+      cause = 'the envelope metadata is malformed'
       return false
     }
     const want = new Set(asked)
@@ -654,6 +655,7 @@ async function loadChunks ({ file, length, digest }) {
   // Idle rounds end the load only once every missing chunk was asked padded too.
   const untried = () => missingOf().some(i => (failed.get(i) || 0) < 2)
   for (let round = 1; (idle < 2 || untried()) && round <= ROUNDS; round++) {
+    cause = ''
     const missing = missingOf()
     const groups = [false, true].flatMap(pad => groupsOf(missing.filter(i => padded(i) === pad), PER_CALL).map(asked => ({ asked, pad })))
     const replies = await parallel(groups.map(({ asked, pad }) => () => agent(
@@ -661,13 +663,13 @@ async function loadChunks ({ file, length, digest }) {
       'Its last stdout line is one JSON object: return it unchanged as your answer. The chunk data is opaque base64; ' +
       'copy every character exactly and change, reorder, drop or add nothing.',
       { label: `ledger:load#${++call}`, phase: 'Context', agentType: 'relay', model: 'sonnet', effort: 'low', schema: ENVELOPE },
-    ).catch(e => { why = `loader died: ${e && e.message}`; return null })))
+    ).catch(e => { cause = `loader died: ${e && e.message}`; return null })))
     let added = false
     replies.forEach((env, g) => { added = take(env, groups[g].asked, groups[g].pad) || added })
     for (const { asked } of groups) for (const i of asked) if (!got.has(i)) failed.set(i, (failed.get(i) || 0) + 1)
     const left = missingOf()
     idle = added && left.length ? 0 : idle + 1
-    if (left.length) { why = `chunks ${left.join(',')} missing or mis-copied`; continue }
+    if (left.length) { why = `chunks ${left.join(',')} missing or mis-copied${cause ? ` (${cause})` : ''}`; continue }
     const text = indices.map(i => got.get(i)).join('')
     if (fnv1a(text) === digest) return { text }
     // Every chunk passed its sum yet the whole fails: a chunk and its sum changed together.

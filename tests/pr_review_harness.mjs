@@ -527,10 +527,11 @@ test('a mis-copied chunk is asked again, padded after an odd count of misses; on
   assert.equal(whole2.result.status, 'reviewed', 'a chunk changed with its sum fails the digest, and the load starts over')
   for (const [why, bad] of [['missing or mis-copied', (env) => ({ ...env, chunks: env.chunks.map(c => c.i === 1 ? flip(c) : c) })],
     ['does not match the manifest digest', (env) => ({ ...env, chunks: env.chunks.map(c => c.i === 1 ? resum(c) : c) })],
-    ['chunks 0,1,2 missing', (env) => ({ ...env, digest: '00000000' })], ['chunks 0,1,2 missing', () => ({ error: 'gone' })]]) {
+    ['chunks 0,1,2 missing or mis-copied (the envelope metadata is malformed)', (env) => ({ ...env, digest: '00000000' })],
+    ['chunks 0,1,2 missing or mis-copied (state_transfer.py: gone)', () => ({ error: 'gone' })]]) {
     const { result, labels } = await go(bad)
     assert.deepEqual([result.status, result.reason], ['blocked', 'ledger-failed'], why)
-    assert.match(result.detail, new RegExp(why.replace('.', '\\.')))
+    assert.match(result.detail, new RegExp(why.replace(/[.()]/g, '\\$&')))
     assert.ok(!labels.some(l => l.startsWith('recheck:')), why)
   }
 })
