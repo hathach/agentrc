@@ -209,7 +209,8 @@ def select(paths, roster=None, only_examples=None):
     hil_picked, hil_full = set(), False
 
     def add(board, exs):
-        builds.setdefault(board, set()).update(e for e in exs if eligible(board, e))
+        builds.setdefault(board, set()).update(e for e in exs if eligible(board, e) and
+                                               (only_examples is None or e in only_examples))
 
     for path in paths:
         effect, detail, reason = classify(path)
@@ -220,7 +221,7 @@ def select(paths, roster=None, only_examples=None):
             families = [detail] if effect == 'family' else list(P.REPRESENTATIVES)
             boards = [b for f in families for b in P.REPRESENTATIVES[f]]
             for b in boards:
-                add(b, only_examples or examples())
+                add(b, examples())
             if roster:
                 hil_picked.update(b for b in roster if P.BOARDS[b]['family'] in families)
         elif effect == 'example':

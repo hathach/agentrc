@@ -174,6 +174,14 @@ class Selection(Lib):
         sel = ab.select(['src/fake.h'], only_examples=['examples/Basic/echo'])
         self.assertEqual(set(sel['builds']), {'rig_ocd', 'rig_jlink', 'dev_b'})   # host_ci skips echo
 
+    def test_example_narrowing_filters_every_rule(self):
+        only = ['examples/Basic/echo']
+        self.assertEqual(ab.select(['examples/HID/inout/inout.ino'], only_examples=only)['builds'], {})
+        for path in ('examples/HID/inout/inout.ino', 'test/hil/fixture.cpp', 'test/hil/sketches/probe/probe.ino',
+                     '.claude/skills/build/scripts/check_build.py'):
+            built = ab.select([path, 'examples/Basic/echo/echo.ino'], only_examples=only)['builds']
+            self.assertEqual({e for exs in built.values() for e in exs}, set(only), path)
+
     def test_example_change_honours_ci_filters(self):
         sel = ab.select(['examples/Basic/echo/echo.ino'])
         self.assertEqual(set(sel['builds']), {'dev_a', 'dev_b', 'rig_jlink', 'rig_ocd', 'rig_esp'})   # .skip.txt

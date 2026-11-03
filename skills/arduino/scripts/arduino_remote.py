@@ -323,6 +323,22 @@ def close_unheld(run_id, s):
     return 0 if out['closed'] else rc
 
 
+def released_on_rig(tree, board):
+    """The run dir of a restore in this session's tree that released the hold, or None: its result.json outlives a
+    dropped ssh session, and the tree's every session command ran under the session's one reason."""
+    with tempfile.TemporaryDirectory(prefix='hil-remote-') as tmp:
+        if core.copy_back(tree, tmp, optional=[SESSION_ARTIFACTS]).outcomes.get(SESSION_ARTIFACTS) != 'ok':
+            return None
+        for f in sorted((Path(tmp) / SESSION_ARTIFACTS).glob(f'{board}-restore-*/result.json')):
+            try:
+                r = json.loads(f.read_text())
+            except ValueError:
+                continue
+            if isinstance(r, dict) and r.get('pass') and (r.get('released') or {}).get('exit') == 0:
+                return f.parent.name
+    return None
+
+
 def cmd_session_close(a):
     s = session_record(a.run_id)
     if not s.get('held'):
@@ -330,12 +346,16 @@ def cmd_session_close(a):
     tree = core.load_attempt(P.ROOT, runs(), a.run_id)
     rc = rig(tree, session_argv(s, 'restore', ['--bundle', RESTORE_BUNDLE, '--build-record', s['restoreRecord'],
                                                '--release'], []))
-    core.write_json(session_path(a.run_id), {**s, 'held': rc != 0, 'closed': rc == 0})
-    out = {'runId': a.run_id, 'board': s['board'], 'closed': rc == 0, 'restoreExit': rc}
-    if rc:
+    released = rc != 0 and released_on_rig(tree, s['board'])
+    closed = rc == 0 or bool(released)
+    core.write_json(session_path(a.run_id), {**s, 'held': not closed, 'closed': closed})
+    out = {'runId': a.run_id, 'board': s['board'], 'closed': closed, 'restoreExit': rc}
+    if released:
+        out['note'] = f'the rig restored and released the board ({released}/result.json); its answer was lost'
+    elif rc:
         out['note'] = 'not released: the restore or the release failed (its JSON above); recover under the hold'
     print(json.dumps(out))
-    return rc
+    return 0 if closed else rc
 
 
 def parse(argv):
