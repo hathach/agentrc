@@ -14,10 +14,11 @@ its working directory in <out>, so relative output paths land there.
 Both sides are started, then waited for until both exit or --timeout passes. --timeout is a
 backstop: give each tool its own duration and a --timeout beyond the longer one. A side still
 running then gets SIGTERM to its process group, so the tool runs its own shutdown (rtt.py stops
-its probe server, which sits in a session of its own); a descendant that outlives its tool, one
-that left the group included, gets SIGTERM itself; whatever is left of the side after --grace
-seconds gets SIGKILL. The same happens to a side whose tool exited leaving descendants, to the
-other side when one cannot start, and to both on SIGINT or SIGTERM. What each side wrote is kept.
+its probe server, which sits in a session of its own) and the descendants it already has, in the
+group or not, are left to it; one first seen after that signal and outliving its tool gets SIGTERM
+itself; whatever is left of the side after --grace seconds gets SIGKILL. The same happens to a
+side whose tool exited leaving descendants, each of which gets the SIGTERM itself, to the other
+side when one cannot start, and to both on SIGINT or SIGTERM. What each side wrote is kept.
 This script is the subreaper of both sides, so a descendant orphaned before it was seen
 reparents here: it is stopped the same way and reported under orphans, its side unknown.
 
