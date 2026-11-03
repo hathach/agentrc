@@ -1498,7 +1498,7 @@ class Draft(PostCase):
         self.assertEqual([f['id'] for f in self.show()['open']], [f2['id']])
 
     def test_a_held_review_is_handed_over_with_its_fix_notes_staged(self):
-        root = self.fixed()
+        self.fixed()
         led = json.loads(Path(self.p['ledger']).read_text())
         draft = led['reviews'][-1]['draft']
         draft['replies'][0]['body'] = ' '.join(['w'] * 61)
@@ -2203,7 +2203,6 @@ class Workflow(unittest.TestCase):
         done = subprocess.run(['node', str(ROOT / 'tests' / 'pr_review_harness.mjs')], capture_output=True, encoding='utf-8', errors='replace')
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
 
-
     @unittest.skipUnless(shutil.which('node'), 'needs Node.js')
     def test_the_drafting_measure_of_a_body_line_holds_what_post_holds(self):
         src = (ROOT / 'workflows' / 'pr-review.js').read_text(encoding='utf-8')
@@ -2219,7 +2218,7 @@ class Workflow(unittest.TestCase):
         held = post.over_length({}, {'draft': draft}, answers=False)
         self.assertEqual([len(c['renderedLine']) for c in draft['moved'][2:]], [post.LINE_CHARS, post.LINE_CHARS + 1])
         self.assertEqual(drafting, [False, True, False, True], 'the boundaries: 80 then 81 rendered words, 300 then 301 characters')
-        self.assertEqual(drafting, [f"{c['path']}:{c['line']}" in held for c in comments], 'the workflow shortens exactly what post.py holds')
+        self.assertEqual(drafting, [f"{c['path']}:{c['line']}" in held for c in comments], 'the workflow shortens at least what post.py holds')
 
 
 class Fixable(PostCase):

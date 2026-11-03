@@ -129,9 +129,10 @@ threads whose fix a recheck verified. It is the same pending review, submitted
 by `post.py` once its head and fix notes check out and no text is held (over
 its length, or a body line whose first line no check verified); otherwise it is
 handed to the human as a pending review (`handedOver`, exit 1), its fix notes
-staged when the head allows. Answers to pushback (a concession
-or a rebuttal) are never submitted: they go into a pending review for the human,
-under auto-fix only once the repair ends (§4 step 6).
+staged unless the head moved or an earlier run left it pending. Answers to
+pushback (a concession or a rebuttal) are never submitted: they go into a
+pending review for the human, under auto-fix only once the repair ends (§4
+step 6).
 Pushback is a human's reply on one of our threads; a bot's reply there is not
 judged. For a headless chief, the human's request naming auto-post is the grant
 under `agents/chief.md`'s PR review exception, carried as §4 says.
@@ -190,7 +191,9 @@ sequence:
    `discussion` run always takes plain `post.py`, since its answers only go
    into a pending review. Its exit 1 names what it could not confirm.
 6. Auto-fix, only once step 5 reports `posted`; a failed, partial, uncertain
-   or handed-over post ends it there. Its answers to pushback, `answers`
+   or handed-over post ends it there. After a handed-over one, its deferred
+   answers wait for the human's submit (§5): plain `post.py` refuses them
+   until then, so it is not run. Its answers to pushback, `answers`
    `deferred`, stay off the PR meanwhile: while a pending review of ours is
    open, `ledger.py show --fixable` and the recheck's prepare refuse, and GitHub
    refuses the repair's replies. When step 6 ends with the PR head still the

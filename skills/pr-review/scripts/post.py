@@ -26,16 +26,17 @@ shorten, and --auto never submits it; an answer counts only where it is publishe
 line whose first line no check verified (firstLineUnchecked) is named the same way and also holds --auto. Held text
 is measured afresh from the saved draft on every run, so no retry submits it: the pending review is handed over.
 
---auto takes the same path, refusing APPROVE: the pending review with its fix notes (never its answers), then,
-while the head is still the draft's and every note reads back, a submit with the draft's event (its intent stored
-first, never sent twice) and the same settling as a human's submit. Held text, a moved head, an unconfirmed note, a pending
-review an earlier run left (only the human sees it, so it may have changed) or a submit whose outcome cannot be
-read hands the pending review to the human instead (handedOver, exit 1), who finishes it like any draft; a later
-post.py run then publishes its answers. Thread answers are never submitted: the review's are put in an answer publication on it (ledger.py's add_answers), stored with
-the review's send intent, and the same run publishes that as a pending review for the human. --defer-answers, for
-auto-fix, keeps it stored (answers deferred, exit 0): the pending review would block the repair (ledger.py's fixable,
-GitHub's review replies) and the recheck, so a plain post.py run publishes it afterwards while the head is still the
-review's. Each run takes only the expected head's publications, so one left on an earlier head is never published.
+--auto takes the same path, refusing APPROVE: the pending review with its fix notes (never its answers), then, while the
+head is still the draft's and every note reads back, a submit with the draft's event (its intent stored first, never
+sent twice) and the same settling as a human's submit. Held text, a moved head, an unconfirmed note, a pending review an
+earlier run left (only the human sees it, so it may have changed) or a submit whose outcome cannot be read hands the
+pending review to the human instead (handedOver, exit 1), who finishes it like any draft; a later post.py run then
+publishes its answers. Thread answers are never submitted: the review's are put in an answer publication on it
+(ledger.py's add_answers), stored with the review's send intent, and the same run publishes that as a pending review for
+the human. --defer-answers, for auto-fix, keeps it stored (answers deferred, exit 0): the pending review would block the
+repair (ledger.py's fixable, GitHub's review replies) and the recheck, so a plain post.py run publishes it afterwards
+while the head is still the review's. Each run takes only the expected head's publications, so one left on an earlier
+head is never published.
 
 --sync, run by prepare.py first, settles each drafted or uncertain review from GitHub. Deleted: declined. Still
 pending: left, and prepare refuses to start another; a verified auto one is handed to the human (an unverified one is
@@ -508,8 +509,8 @@ def submit(repo, pr, review, event, persist):
 
 def publish_auto(repo, pr, led, review, event, login, recovering, persist, hold=''):
     """The draft's pending review with its fix notes, submitted with its event; handed to the human instead when its
-    text is held (`hold`, why), the head moved, a note is unconfirmed or an earlier run left it pending before the submit,
-    or when the submit's outcome cannot be read."""
+    text is held (`hold`, why), the head moved, a note is unconfirmed or an earlier run left it pending before the
+    submit, or when the submit's outcome cannot be read."""
     rec = review['receipts']
     review['publish'] = 'auto'
     answers = open_answers(review['findings'])
