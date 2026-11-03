@@ -496,11 +496,13 @@ const regraded = (f, text) => {
   const was = template(earlier[f.id].severity, '')
   return text.startsWith(was) ? template(f.severity, text.slice(was.length)) : text
 }
+const restate = (f, claim) => {
+  const noted = `${claim}\n- ${repairNote(f)}`
+  return overComment({ path: f.file, line: f.line, body: noted }) ? { f, body: claim, noteInBody: true } : { f, body: noted }
+}
 const restated = reraised.map(f => {
   const published = earlier[f.id].published
-  const claim = published ? regraded(f, published) : template(f.severity, whyOf(f))
-  const noted = `${claim}\n- ${repairNote(f)}`
-  return overLength(noted, LIMIT.comment) ? { f, body: claim, noteInBody: true } : { f, body: noted }
+  return restate(f, published ? regraded(f, published) : template(f.severity, whyOf(f)))
 })
 // `finding` indexes the result's findings (carried first), so the ledger can give the comment its finding's id.
 const comments = [...items.map((x, i) => {
@@ -509,32 +511,40 @@ const comments = [...items.map((x, i) => {
     ...(!ok || checked.firstBad.includes(i) ? { firstLineUnchecked: true } : {}) }
 }), ...restated.map(({ f, body }) => ({
   path: f.file, line: f.line, finding: carriedOut.indexOf(f), body,
-  // No check sees it, and off the diff its first line drops the repair line and any qualification below.
+  // Off the diff its first line drops the repair line and any qualification below, which no check weighs.
   firstLineUnchecked: true,
 }))]
-// Round two: each comment of ours still over its limit, its finding's own words included, is shortened from its finding
-// once more and checked again; one the check passes replaces it. A comment the human edited is never rewritten.
-const over = items.map((_, i) => i).filter(i => overAt(i, comments[i].body))
+// Round two: each comment of ours still over its limit, its finding's own words and a re-raised one's included, is
+// shortened from its finding once more and checked again; one the check passes replaces it. A comment the human edited
+// is never rewritten. `finding` here is the comment's index.
+const briefed = [...items, ...restated.map(({ f }) => ({ f, why: whyOf(f), evidence: verifiedOf(f) }))]
+const fitsComment = (k, body) => !overComment({ ...comments[k], body }) && !offFormat(body, briefed[k].f.severity)
+const over = comments.map((_, k) => k).filter(k => overComment(comments[k]) && (k < items.length || !earlier[briefed[k].f.id].published))
 if (over.length) {
   const again = await agent(
     `Shorten each review comment below from its finding: measured, it is still over its limit. ${COMMENT_FORMAT}${STYLE}Keep every fact the finding ` +
     'states and add none. `words` and `longestLine` are its measure now.\n' +
-    `Comments: ${JSON.stringify(over.map(i => {
-      const body = comments[i].body
-      return { ...brief(items[i], i), words: words(body), longestLine: longestLine(body), comment: body }
+    `Comments: ${JSON.stringify(over.map(k => {
+      const body = comments[k].body
+      return { ...brief(briefed[k], k), words: words(body), longestLine: longestLine(body), comment: body }
     }))}`,
     { label: 'shorten:again', phase: 'Draft', model: 'sonnet', effort: 'medium', schema: exactly({ type: 'object', required: ['comments'], properties: { comments: COMMENTS } }, 'comments', 'finding', over) },
   ).catch(quiet('shorten:again'))
-  const fits = new Map(((again && again.comments) || []).filter(c => over.includes(c.finding) && fitsAt(c.finding, c.body)).map(c => [c.finding, c.body]))
-  const checkedAgain = fits.size ? await agent(`${COMMENT_CHECK}\nPairs: ${JSON.stringify([...fits].map(([i, body]) => ({ ...brief(items[i], i), comment: body })))}`,
+  const fits = new Map(((again && again.comments) || []).filter(c => over.includes(c.finding) && fitsComment(c.finding, c.body)).map(c => [c.finding, c.body]))
+  const checkedAgain = fits.size ? await agent(`${COMMENT_CHECK}\nPairs: ${JSON.stringify([...fits].map(([k, body]) => ({ ...brief(briefed[k], k), comment: body })))}`,
     { label: 'check-draft:again', phase: 'Draft', model: 'sonnet', effort: 'low',
       schema: { type: 'object', required: ['bad', 'firstBad'], properties: { bad: CHECKED.properties.bad, firstBad: CHECKED.properties.firstBad } } },
   ).catch(quiet('check-draft:again')) : null
   if (checkedAgain) {
-    for (const [i, body] of fits) {
-      if (checkedAgain.bad.includes(i)) continue
-      const { firstLineUnchecked, ...rest } = comments[i]
-      comments[i] = { ...rest, body, ...(checkedAgain.firstBad.includes(i) ? { firstLineUnchecked: true } : {}) }
+    for (const [k, body] of fits) {
+      if (checkedAgain.bad.includes(k)) continue
+      if (k >= items.length) {
+        const r = restated[k - items.length] = restate(briefed[k].f, body)
+        comments[k] = { ...comments[k], body: r.body }
+        continue
+      }
+      const { firstLineUnchecked, ...rest } = comments[k]
+      comments[k] = { ...rest, body, ...(checkedAgain.firstBad.includes(k) ? { firstLineUnchecked: true } : {}) }
     }
   }
 }

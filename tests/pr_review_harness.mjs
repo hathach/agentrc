@@ -218,7 +218,7 @@ test('a drafted comment that adds a claim, or is lost, falls back to the finding
     'a first line the check flags keeps its text and holds auto-post')
 })
 
-test('text over its limit is shortened once, then marked long for the human, never cut', async () => {
+test('text over its limit is shortened, then marked long for the human, never cut', async () => {
   const long = { summary: 'Prose, not bullets.', comments: [{ finding: 0, body: wordy(81) }, { finding: 1, body: '**high**: b' }] }
   const fixed = await run(BASE, { audit: audited(finding('a'), finding('b', 'high', 20)), write: long,
     shorten: { comments: [{ finding: 0, body: '**high**: a' }], answers: [], summary: '- a is broken' } })
@@ -640,6 +640,25 @@ test('a finding an auto-fix repair noted gets no second fix note, and one still 
   const longEdit = await run(inc, { ledger: edited, recheck: () => ({ state: 'open', reason: 'still' }), check: pinned(inc), shorten: { comments: [{ finding: 0, body: '**high**: short' }] } })
   assert.equal(longEdit.labels.includes('shorten:again'), false, 'the human\'s own words are never rewritten')
   assert.ok(longEdit.logs.some(l => /over length, for the human to shorten: src\/core\/a\.c:10$/.test(l)))
+  const wideEdit = repaired(done)
+  wideEdit.open[0].published = `**high**: ${'x'.repeat(275)}`
+  const wide = await run(inc, { ledger: wideEdit, recheck: () => ({ state: 'open', reason: 'still' }), check: pinned(inc) })
+  assert.deepEqual(wide.result.draft.comments.map(c => c.body), [wideEdit.open[0].published], 'measured as a body line too, the note goes in the body')
+  assert.match(wide.result.draft.body, /^Raised again at `src\/core\/a\.c:10`\./m)
+  const longWhy = repaired(done)
+  longWhy.open[0].why = wordy(85)
+  const reraise = (stubs) => run(inc, { ledger: longWhy, recheck: () => ({ state: 'open', reason: 'still' }), check: pinned(inc), ...stubs })
+  const shortened = await reraise({ shorten: { comments: [{ finding: 0, body: '**high**: overrun, in fewer words' }] }, 'check-draft': { bad: [], firstBad: [] } })
+  assert.match(shortened.calls.find(c => c.label === 'shorten:again').prompt, /"why":"w w w/, 'an unedited comment raised again is shortened from its finding')
+  assert.match(shortened.calls.find(c => c.label === 'check-draft:again').prompt, /overrun, in fewer words/, 'and checked')
+  assert.deepEqual(shortened.result.draft.comments.map(c => [c.body, c.firstLineUnchecked]),
+    [['**high**: overrun, in fewer words\n- The repair in cccccccccccc did not fix this; its earlier thread was resolved.', true]])
+  assert.doesNotMatch(shortened.result.draft.body, /Raised again/, 'shortened, its repair note fits on the comment')
+  assert.ok(!shortened.logs.some(l => /over length/.test(l)))
+  const flagged = await reraise({ shorten: { comments: [{ finding: 0, body: '**high**: adds a claim' }] }, 'check-draft': { bad: [0], firstBad: [] } })
+  assert.deepEqual(flagged.result.draft.comments.map(c => c.body), [`**high**: ${wordy(85)}`], 'a replacement the check flags is dropped, never cut')
+  assert.match(flagged.result.draft.body, /^Raised again at `src\/core\/a\.c:10`\./m)
+  assert.ok(flagged.logs.some(l => /over length, for the human to shorten: src\/core\/a\.c:10$/.test(l)))
   const visible = await run(inc, { ledger: repaired({ ...done, resolved: false }), recheck: () => ({ state: 'open', reason: 'still' }), check: pinned(inc) })
   assert.deepEqual(visible.result.draft.comments, [], 'its thread is still open, so its comment still states it')
   const reopenedThread = { ...repaired(done), heldThreads: [{ findingId: 'pr7-f1', commentId: 901, why: 'reopened after it was resolved' }] }
