@@ -74,7 +74,7 @@ Ungranted actions are collected, never dispatched, and asked once at the end wit
 
 ## Review a PR
 
-Run pr-review's launch task in its order. Its review phases have no writer batches, so the commit check, the simplification challenge and the completion sequence do not apply to them. An auto-fix repair phase is writer work: its repairs get the commit check, one simplification pass, validation and a whole-task review from the reviewed head to the repair tip before pr-babysit adopts them, and pr-babysit's own repairs follow its paragraph above. Build each HIL row the workflow takes from the report the operator run wrote, its tested head included, never from a summary. A discussion run's answers go only into a pending review.
+Run pr-review's launch task in its order. Its review phases have no writer batches, so the commit check, the simplification challenge and the completion sequence do not apply to them. An auto-fix repair phase is writer work: its repairs get the commit check, one simplification pass, validation and a whole-task review from the reviewed head to the repair tip before pr-babysit adopts them, and pr-babysit's own repairs follow its paragraph above. Build each HIL row the workflow takes from the report the operator run wrote, its tested head included, never from a summary. A discussion run's answers go only into a pending review; under auto-fix on a head reviewed already, they wait for the repair's end, as the launch task's sequence says.
 
 ## Fix issue N
 

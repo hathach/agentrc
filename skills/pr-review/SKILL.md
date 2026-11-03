@@ -46,9 +46,13 @@ the mode: `full` on a first review or after a force-push or rebase,
 unchanged, `same` when this head was reviewed already. On `same`, launch in
 `discussion` mode, which only judges new replies on our threads and returns
 `nothing-new` when there are none; `full` reviews the head again instead, saved
-with the request's words as `--reason`. Under `auto-fix`, a discussion run
-repairs nothing, since step 6 of §4 needs a review this run submitted: a repair
-of an already-reviewed head takes `auto-fix full`. An `overCap` answer merged
+with the request's words as `--reason`. Under `auto-fix`, prepare's
+`repair.submittedReview` names our review submitted on this head, the human's
+submit included: the run repairs from it (§4 step 6) without reviewing the head
+again. With `deferredAnswers`, the answers an earlier auto-fix deferred on it,
+the discussion is skipped, since that run judged its pushback. A null
+`submittedReview` repairs nothing, for `repair.submittedWhy`; `auto-fix full`
+reviews the head again and repairs from that review. An `overCap` answer merged
 everything into one group: report it and launch.
 
 A sibling tree is locked for the run, so worktree-remove's cleanup of the
@@ -111,8 +115,10 @@ since the same head otherwise gets only a discussion run. Under `auto-fix`, also
 the head repository and branch, said plainly to be the contributor's branch for
 a fork, prepare's `repair` state and why (`unknown` is not `unavailable`), and
 that the run reviews, repairs, validates and rechecks the PR within
-pr-babysit's cycle accounting, or, on `same`, that it repairs nothing and
-`auto-fix full` would.
+pr-babysit's cycle accounting. On `same`, say instead that it repairs from
+submitted review `submittedReview.reviewId` without a whole-head review, with
+any `deferredAnswers` waiting for the repair's end, or that it repairs nothing,
+for `submittedWhy`.
 
 ## 3. Publishing
 
@@ -145,8 +151,8 @@ finds still standing is raised again on a new comment, unless someone reopened
 its thread since, which then still states it. A recheck review the
 ledger cannot vouch for (`ledger.py show --fixable`'s `autoPost` false) stays
 pending for the human. One repair round: what the recheck finds new is
-reported, and repairing it needs a new request, with `full` while the head is
-still the rechecked one (§1).
+reported, and repairing it needs a new request, which on the rechecked head
+repairs from the recheck review once that is submitted (§1).
 
 ## 4. Launch
 
@@ -182,15 +188,21 @@ sequence:
    or {choice: 'boards', boards: [rows]}, hardwareRelevant, autoPost,
    dimensions?}` (`mode: 'discussion'` for prepare's `same`). `dimensions`
    comes from the project's instruction file when it names review dimensions.
+   Under auto-fix with prepare's `deferredAnswers`, steps 3 to 5 are skipped
+   and step 6 starts from `submittedReview`.
 4. `result.py --output <the launch's output file>`; when its `status` is
    `reviewed`, `ledger.py save --pr N --output <it>`. Any other status saves
-   and posts nothing: step 7 reports it with its reason.
+   and posts nothing: step 7 reports it with its reason, except that under
+   auto-fix with `submittedReview` a `nothing-new` discussion goes on to step 6.
 5. The session leading the review runs `post.py` (pending), `post.py --auto`
    (auto-post) or `post.py --auto --defer-answers` (auto-fix) itself, never
    through a unit, with `--expected-head`; a
-   `discussion` run always takes plain `post.py`, since its answers only go
-   into a pending review. Its exit 1 names what it could not confirm.
-6. Auto-fix, only once step 5 reports `posted`; a failed, partial, uncertain
+   `discussion` run takes plain `post.py`, since its answers only go into a
+   pending review, except under auto-fix with `submittedReview`: nothing is
+   posted, and its answers wait on the ledger as deferred ones do. Its exit 1
+   names what it could not confirm.
+6. Auto-fix, only once step 5 reports `posted`, or on `same` with prepare's
+   `submittedReview`, whose head is then the reviewed head; a failed, partial, uncertain
    or handed-over post ends it there. After a handed-over one, its deferred
    answers wait for the human's submit (§5): plain `post.py` refuses them
    until then, so it is not run. Its answers to pushback, `answers`
@@ -245,6 +257,7 @@ sequence:
 7. Report the verdict and its reasons, the counts, coverage lost, the CI and
    HIL rows, the receipts, `post.py`'s `firstLineUnchecked`
    and the result's `heldThreads`; never the draft's text. Under auto-fix also the repair state,
+   whether the repair took this run's review or reused submitted review `submittedReview.reviewId`,
    the held findings, the repair and pr-babysit receipts, the `--fixed`
    receipts, the recheck's post,
    and the review state GitHub shows (`gh pr view N --json
@@ -274,7 +287,8 @@ rules). `post.py` reports `uncertain` or `partial` when it cannot prove what lan
 it never sends again blind, and the next run looks for it; reconcile by hand
 what it names. A `handedOver` auto review is the human's pending review, with
 its reason; once they submit it, `post.py --pr N --expected-head SHA` publishes
-its answers. A thread in `heldThreads` is one we resolved and someone reopened,
+its answers, or a new `auto-fix` request repairs from it first and publishes
+them at the repair's end (§1). A thread in `heldThreads` is one we resolved and someone reopened,
 whose resolve is unconfirmed, or whose repair note was deleted or edited before
 its resolve: it is never resolved again by itself, so name it for the human.
 
