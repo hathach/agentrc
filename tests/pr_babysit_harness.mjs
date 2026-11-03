@@ -3765,8 +3765,8 @@ test('no fix note is dispatched when the push answers no comment', async () => {
 
 test('two valid findings on one comment share one fix note', async () => {
   // One note per thread, as postReplyRecipe posts it - and it has to name both
-  // findings, because paying the comment settles both; by place, as a claim of
-  // any length would put it over the reply limit.
+  // findings, because paying the comment settles both; by place, never quoting
+  // the claim.
   let cycle = 0
   const { calls, result } = await run({
     args: { autoPush: true, maxCycles: 2 },
@@ -4881,34 +4881,19 @@ test('a green PR whose owed findings are all held for the caller stops at once; 
   assert.ok(mixed.labels.includes('reviews#2'), 'the rejected sibling keeps the comment progressing')
 })
 
-test('a deferral whose reason alone breaks the reply limit is refused before anything runs', async () => {
-  await assert.rejects(run({ reviews: oneValid, args: { deferrals: [deferral({ reason: 'w '.repeat(55).trim() })] } }),
-    /deferral reason too long for its reply \(60 words, a line 300 characters with the issue URL\): 1#1/)
-  await assert.rejects(run({ reviews: oneValid, args: { deferrals: [deferral(), deferral({ findingId: '1#2', reason: 'x'.repeat(250) })] } }),
-    /: 1#2$/, 'a long line is refused too, and only the offending finding is named')
-  const trace = []
-  await assert.rejects(run({ trace, args: { stateRef: { outputFile: '/tmp/w.output', digest: '0123abcd' }, deferrals: [deferral({ reason: 'w '.repeat(55).trim() })] } }),
-    /deferral reason too long/)
-  assert.deepEqual(trace, [], 'refused before the state loader starts an agent (#39)')
-  const { calls } = await run({ reviews: oneValid, args: { deferrals: [deferral({ reason: 'w '.repeat(40).trim() })], maxCycles: 1 } })
-  assert.ok(calls.length > 0, 'a reason within the limit runs')
+test('a deferral reason of any length launches and is posted whole, on a resumed launch too', async () => {
+  const reason = `${'w '.repeat(80).trim()} ${'x'.repeat(400)}`
+  const { calls } = await run({ reviews: oneValid, args: { deferrals: [deferral({ reason })], autoPush: true, maxCycles: 2 } })
+  assert.equal(manifestOf(calls, 'defer#1')[0].body, `- src/a.c:1:\n  Real, and out of this PR's scope: ${reason}. Tracked in ${ISSUE}.`)
+  const first = await run({ reviews: oneValid, args: { deferrals: [deferral({ reason })], maxCycles: 3, yieldAfterCycle: true, autoPush: false } })
+  const again = await run({ reviews: oneValid, args: { maxCycles: 3, state: first.result.state } })
+  assert.notEqual(again.result.reason, 'deferral-refused', 'a restored deferral is not measured either')
 })
 
-test('a deferral point quotes no claim, and the launch measures the point the cycle posts (#142)', async () => {
+test('a deferral point quotes no claim (#142)', async () => {
   const wordyClaim = { findings: [finding({ claim: 'w '.repeat(80) + 'x'.repeat(300) })], replies: [], bots: 'reviewed' }
   const posted = await run({ reviews: wordyClaim, args: { deferrals: [deferral()], autoPush: true, maxCycles: 2 } })
   assert.equal(manifestOf(posted.calls, 'defer#1')[0].body, `- src/a.c:1:\n  Real, and out of this PR's scope: broken on master too; own PR. Tracked in ${ISSUE}.`)
-  // The place is one word on its own line: 7 + 50 + 3 answer words and the place make 61.
-  await assert.rejects(run({ reviews: oneValid, args: { deferrals: [deferral({ reason: 'r '.repeat(50).trim() })], maxCycles: 2 } }),
-    /deferral reason too long for its reply .*: 1#1$/)
-  const atWords = await run({ reviews: oneValid, args: { deferrals: [deferral({ reason: 'r '.repeat(49).trim() })], autoPush: true, maxCycles: 2 } })
-  assert.equal(manifestOf(atWords.calls, 'defer#1').length, 1, '60 words are posted')
-  // The answer line is measured as posted, with its two-space indent.
-  const fill = (n) => 'x'.repeat(n - `  Real, and out of this PR's scope: . Tracked in ${ISSUE}.`.length)
-  await assert.rejects(run({ reviews: oneValid, args: { deferrals: [deferral({ reason: fill(301) })] } }), /: 1#1$/)
-  const atChars = await run({ reviews: oneValid, args: { deferrals: [deferral({ reason: fill(300) })], autoPush: true, maxCycles: 2 } })
-  const line = manifestOf(atChars.calls, 'defer#1')[0].body.split('\n')[1]
-  assert.equal(line.length, 300)
 })
 
 test('a deferral attempt offered in the one-line form is posted as offered, not reformatted (#142)', async () => {
@@ -4926,11 +4911,11 @@ test('a deferral attempt offered in the one-line form is posted as offered, not 
   assert.equal(again.result.state.debt.some(([id]) => id === 1), false, 'the old attempt settles the comment')
 })
 
-test('a deferral place that is not one word, or too long for its line, is named by its finding id (#142)', async () => {
+test('a deferral place is posted as is, spaced or long', async () => {
   for (const file of ['src/my file.c', `src/${'d/'.repeat(150)}a.c`]) {
     const reviews = { findings: [finding({ file })], replies: [], bots: 'reviewed' }
     const { calls } = await run({ reviews, args: { deferrals: [deferral()], autoPush: true, maxCycles: 2 } })
-    assert.equal(manifestOf(calls, 'defer#1')[0].body, `- 1#1:\n  Real, and out of this PR's scope: broken on master too; own PR. Tracked in ${ISSUE}.`, file)
+    assert.equal(manifestOf(calls, 'defer#1')[0].body, `- ${file}:1:\n  Real, and out of this PR's scope: broken on master too; own PR. Tracked in ${ISSUE}.`, file)
   }
 })
 
@@ -5588,57 +5573,25 @@ test('the offered body survives a restart', async () => {
 })
 
 test('a green PR whose only debt is handed to a human stops at once instead of re-arming', async () => {
-  const { result, labels } = await run({
-    args: { autoPush: true, maxCycles: 4 },
-    reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'w '.repeat(61).trim() }], bots: 'reviewed' },
-    challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
-  })
+  const { result, labels } = await run({ ...heldForRepair({ args: { autoPush: true, maxCycles: 4 } }), challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] } })
   assert.equal(result.reason, 'deferred-replies-unresolved')
   assert.equal(result.cycles, 1)
   assert.equal(labels.includes('reviews#2'), false)
   assert.equal(result.handoffs[0].commentId, 2)
 })
 
-test('the drafter is told both reply limits, and a draft within the words but over the line limit goes to the caller', async () => {
+test('the drafter is told no length, and a long reply is posted whole', async () => {
   // #3988: a draft with one line over 300 characters was withheld twice and the reply stayed owed.
-  const long = `Not so: ${'x'.repeat(295)}`
+  const long = `Not so: ${'w '.repeat(100).trim()}\n\n- ${'x'.repeat(400)}`
   const { calls, logs, result } = await run({
     args: { autoPush: true, maxCycles: 2 },
     reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: long }], bots: 'reviewed' },
     challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
   })
-  assert.match(calls.find(c => c.label === 'reviews#1').prompt, /each point has at most 60 words and no line is over 300 characters/)
-  assert.ok(logs.some(l => /no reply posted to comment 2 \(over length: .* a line 300 characters\) — handed to the caller/.test(l)), logs.join('\n'))
-  assert.equal(calls.some(c => c.label.startsWith('replies#')), false)
-  assert.equal(result.handoffs[0].draft, long)
-})
-
-test('a reply with a point over the length limit is never posted or cut, and goes to the caller with its draft', async () => {
-  const wordy = 'w '.repeat(61).trim()
-  const long = await run({
-    args: { autoPush: true, maxCycles: 1 },
-    reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: wordy }], bots: 'reviewed' },
-    challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
-  })
-  assert.equal(long.calls.filter(c => c.label.startsWith('replies#')).length, 0, 'nothing is posted')
-  assert.ok(long.logs.some(l => /no reply posted to comment 2 \(over length: a point exceeds 60 words.*\) — handed to the caller/.test(l)), long.logs.join('\n'))
-  const owed = long.result.state.debt.find(([id]) => id === 2)[1]
-  assert.deepEqual(owed.repair, { replyId: null, error: 'no reply posted: over length: a point exceeds 60 words or a line 300 characters', draft: wordy })
-  assert.equal(owed.attempt, undefined, 'a withheld draft is not an offered body')
-  assert.deepEqual(long.result.handoffs, [{ commentId: 2, commentDigest: 'd2', why: owed.repair.error, draft: wordy }])
-  assert.equal(long.result.observation.actions.refutedPosts, null, 'no batch was sent, so none failed beside the handoff (#31)')
-  const shorter = await run({
-    args: { autoPush: true, maxCycles: 2, state: long.result.state },
-    reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'short' }], bots: 'reviewed' },
-    challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
-  })
-  assert.equal(shorter.calls.some(c => c.label.startsWith('replies#')), false, 'a later draft does not go out over the handoff')
-  const points = await run({
-    args: { autoPush: true, maxCycles: 1 },
-    reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: `${'w '.repeat(60).trim()}\n\n- ${'w '.repeat(60).trim()}` }], bots: 'reviewed' },
-    challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
-  })
-  assert.equal(manifestOf(points.calls, 'replies#1').length, 1, 'each point at its limit, bullet marker aside: posted')
+  assert.doesNotMatch(calls.find(c => c.label === 'reviews#1').prompt, /at most \d+ words|over \d+ characters/)
+  assert.equal(manifestOf(calls, 'replies#1')[0].body, long)
+  assert.ok(!logs.some(l => /over length/.test(l)))
+  assert.equal((result.handoffs || []).length, 0)
 })
 
 test('a comment settled on the caller\'s reply is left alone while its body stands: nothing fixed, posted or challenged for it', async () => {

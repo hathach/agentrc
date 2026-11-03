@@ -1233,31 +1233,30 @@ class Post(PostCase):
             self.post()
         self.assertEqual(self.gh.posts, [])
 
-    def test_text_marked_long_is_never_auto_posted_and_is_handed_to_the_human_as_a_pending_review(self):
+    def test_long_text_is_auto_posted_whole(self):
         draft = self.result_for(self.p)['draft']
-        self.save(self.result_for(self.p, draft={**draft, 'comments': [{**draft['comments'][0], 'body': ' '.join(['w'] * 81)}]}))
+        long = ' '.join(['w'] * 200) + '\n- ' + 'x' * 700
+        self.save(self.result_for(self.p, draft={**draft, 'comments': [{**draft['comments'][0], 'body': long}]}))
         out = self.post('--auto')
-        self.assertEqual((out['status'], out['overLength'], self.gh.submits), ('drafted', ['src/core/a.c:21'], []))
-        self.assertRegex(out['handedOver'], r'over-length text for the human to shorten \(src/core/a\.c:21\)')
-        self.assertEqual(self.gh.posts[0]['comments'][0]['body'], ' '.join(['w'] * 81), 'the text is never cut')
-        again = self.post('--auto')
-        self.assertEqual((again['handedOver'], again['overLength'], len(self.gh.posts), self.gh.submits), (out['handedOver'], ['src/core/a.c:21'], 1, []),
-                         'a repeat names it again and sends nothing')
+        self.assertEqual((out['status'], len(self.gh.submits)), ('posted', 1))
+        self.assertNotIn('handedOver', out)
+        self.assertNotIn('overLength', out)
+        self.assertEqual(self.gh.posts[0]['comments'][0]['body'], long, 'never cut')
 
     def test_a_held_review_is_never_submitted_by_a_retry_after_a_crash(self):
         draft = self.result_for(self.p)['draft']
-        self.save(self.result_for(self.p, draft={**draft, 'comments': [{**draft['comments'][0], 'body': ' '.join(['w'] * 81)}]}))
+        self.save(self.result_for(self.p, draft={**draft, 'comments': [{'path': 'src/core/a.c', 'line': 1, 'body': '**high**: b.\n- only here: b is never initialised', 'finding': 0, 'firstLineUnchecked': True}]}))
         with mock.patch.object(post, 'publish_review', side_effect=RuntimeError('crash before the POST')):
             with self.assertRaises(RuntimeError):
                 self.post('--auto')
         self.assertEqual(self.gh.posts, [])
         out = self.post('--auto')
         self.assertEqual((out['status'], len(self.gh.posts), self.gh.submits), ('drafted', 1, []))
-        self.assertRegex(out['handedOver'], 'over-length')
+        self.assertRegex(out['handedOver'], 'first line no check verified')
 
     def test_a_held_review_whose_post_response_is_lost_is_recovered_and_still_handed_over(self):
         draft = self.result_for(self.p)['draft']
-        self.save(self.result_for(self.p, draft={**draft, 'comments': [{**draft['comments'][0], 'body': ' '.join(['w'] * 81)}]}))
+        self.save(self.result_for(self.p, draft={**draft, 'comments': [{'path': 'src/core/a.c', 'line': 1, 'body': '**high**: b.\n- only here: b is never initialised', 'finding': 0, 'firstLineUnchecked': True}]}))
         self.gh.post_fails = True
         self.assertEqual(self.post('--auto')['status'], 'uncertain')
         self.gh.post_fails = False
@@ -1268,32 +1267,21 @@ class Post(PostCase):
                                         for c in sent['comments']]
         out = self.post('--auto')
         self.assertEqual((out['status'], out['review']['recovered'], len(self.gh.posts), self.gh.submits), ('drafted', True, 1, []))
-        self.assertRegex(out['handedOver'], 'over-length', 'recovered by its marker, still handed over')
+        self.assertRegex(out['handedOver'], 'first line no check verified', 'recovered by its marker, still handed over')
 
-    def test_auto_post_measures_what_it_would_submit_whatever_the_draft_marks(self):
-        draft = self.result_for(self.p)['draft']
-        self.save(self.result_for(self.p, draft={**draft, 'replies': [{'commentId': 5010, 'body': ' '.join(['w'] * 61), 'findingId': 'pr7-f1'}]}))
-        out = self.post('--auto')
-        self.assertRegex(out['handedOver'], r'over-length text .*\(fix note on pr7-f1\)')
-        self.assertEqual(self.gh.submits, [])
-
-    def test_a_body_entry_is_one_line_measured_as_posted_and_a_legacy_draft_as_it_was(self):
+    def test_a_body_entry_posts_only_its_first_line(self):
         long = '**low**: short problem.\n- ' + 'cause ' * 90
         draft = {**self.result_for(self.p)['draft'], 'comments': [{'path': 'src/core/a.c', 'line': 1, 'body': long, 'finding': 0}]}
         self.save(self.result_for(self.p, draft=draft))
         self.assertEqual(self.review()['draft']['moved'][0]['renderedLine'], '- `src/core/a.c:1` **low**: short problem.')
         self.assertNotIn('cause', self.review()['draft']['body'], 'only the first line is posted')
-        led = json.loads(Path(self.p['ledger']).read_text())
-        self.assertEqual(post.over_length(led, led['reviews'][-1]), [], 'a long comment posting one short line is not long')
-        del led['reviews'][-1]['draft']['moved'][0]['renderedLine']
-        self.assertEqual(post.over_length(led, led['reviews'][-1]), ['src/core/a.c:1'], 'a draft saved before keeps the old check')
 
-    def test_a_body_entry_over_one_line_of_300_chars_is_handed_over(self):
-        draft = {**self.result_for(self.p)['draft'], 'comments': [{'path': 'src/core/a.c', 'line': 1, 'body': '**low**: ' + 'x' * 300, 'finding': 0}]}
+    def test_a_long_body_entry_is_auto_posted_whole(self):
+        draft = {**self.result_for(self.p)['draft'], 'comments': [{'path': 'src/core/a.c', 'line': 1, 'body': '**low**: ' + 'x' * 700, 'finding': 0}]}
         self.save(self.result_for(self.p, draft=draft))
         out = self.post('--auto')
-        self.assertRegex(out['handedOver'], r'over-length text .*\(src/core/a\.c:1\)')
-        self.assertEqual((out['overLength'], self.gh.submits), (['src/core/a.c:1'], []))
+        self.assertEqual((out['status'], len(self.gh.submits)), ('posted', 1))
+        self.assertIn('x' * 700, self.gh.posts[0]['body'])
 
     def test_a_body_entry_whose_first_line_no_check_verified_is_handed_over_in_a_pending_review(self):
         unchecked = {'body': '**high**: b.\n- only here: b is never initialised', 'finding': 0, 'firstLineUnchecked': True}
@@ -1303,14 +1291,12 @@ class Post(PostCase):
         out = self.post('--auto')
         self.assertRegex(out['handedOver'], r'first line no check verified \(src/core/a\.c:1\)')
         self.assertEqual((out['status'], out['firstLineUnchecked'], len(self.gh.posts), self.gh.submits), ('drafted', ['src/core/a.c:1'], 1, []))
-        self.assertNotIn('over-length', out['handedOver'])
 
-    def test_a_long_comment_moved_into_the_body_still_holds_auto_post(self):
+    def test_a_long_comment_moved_into_the_body_is_auto_posted(self):
         draft = self.result_for(self.p)['draft']
         self.save(self.result_for(self.p, draft={**draft, 'comments': [draft['comments'][0], {**draft['comments'][1], 'body': ' '.join(['w'] * 81)}]}))
         self.assertEqual([c['line'] for c in self.review()['draft']['moved']], [1], 'moved into the body, kept as the comment it was')
-        self.assertRegex(self.post('--auto')['handedOver'], r'over-length text .*\(src/core/a\.c:1\)')
-        self.assertEqual(self.gh.submits, [])
+        self.assertEqual((self.post('--auto')['status'], len(self.gh.submits)), ('posted', 1))
 
     def test_decline_settles_a_draft_never_created(self):
         self.save(self.result_for(self.p))
@@ -1511,15 +1497,29 @@ class Draft(PostCase):
         led = json.loads(Path(self.p['ledger']).read_text())
         draft = led['reviews'][-1]['draft']
         draft['replies'][0]['body'] = ' '.join(['w'] * 61)
-        draft['comments'] = [{'path': 'src/core/a.c', 'line': 21, 'body': ' '.join(['w'] * 81), 'findingId': 'pr7-f1'}]
+        draft['moved'] = [{'path': 'src/core/a.c', 'line': 1, 'body': '**high**: b.', 'finding': 0, 'firstLineUnchecked': True,
+                           'renderedLine': '- `src/core/a.c:1` **high**: b.'}]
         Path(self.p['ledger']).write_text(json.dumps(led))
         submits = list(self.gh.submits)
         out = self.post('--auto')
-        self.assertRegex(out['handedOver'], r'over-length text .*\(src/core/a\.c:21, fix note on pr7-f1\)')
+        self.assertRegex(out['handedOver'], r'first line no check verified \(src/core/a\.c:1\)')
         self.assertEqual(([(e['kind'], e['state']) for e in out['staged']], self.gh.submits), ([('fixnote', 'staged')], submits),
                          'the human gets the whole review, its notes included, and nothing is submitted')
         self.assertEqual(self.adds()[0]['b'], ' '.join(['w'] * 61), 'never cut')
         self.assertFalse(self.gh.threads[0]['isResolved'])
+
+    def test_a_long_fix_note_is_auto_posted_whole(self):
+        self.fixed()
+        led = json.loads(Path(self.p['ledger']).read_text())
+        note = ' '.join(['w'] * 100) + ' ' + 'x' * 400
+        led['reviews'][-1]['draft']['replies'][0]['body'] = note
+        Path(self.p['ledger']).write_text(json.dumps(led))
+        submits = len(self.gh.submits)
+        out = self.post('--auto')
+        self.assertEqual((out['status'], len(self.gh.submits)), ('posted', submits + 1))
+        self.assertNotIn('handedOver', out)
+        self.assertEqual([(e['kind'], e['state']) for e in out['staged']], [('fixnote', 'published')])
+        self.assertEqual(self.adds()[0]['b'], note, 'sent whole')
 
     def test_a_fix_note_is_staged_and_its_thread_resolved_only_once_submitted(self):
         root = self.fixed()
@@ -1836,11 +1836,13 @@ class Pushback(PostCase):
                     with self.assertRaisesRegex(facts.Unusable, f'--threads is a snapshot of .*, not {REPO}#{PR}'):
                         self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--threads', str(snap), *head])
 
-    def test_a_long_answer_is_named_in_its_pending_review(self):
+    def test_a_long_answer_goes_into_its_pending_review_whole(self):
         self.discuss('upheld', {'body': ' '.join(['w'] * 61), 'resolve': False})
         self.comment(950, 'contrib', 'intentional')
         out = self.post()
-        self.assertEqual((out['status'], out['overLength']), ('drafted', ['answer on pr7-f1']))
+        self.assertEqual(out['status'], 'drafted')
+        self.assertNotIn('overLength', out)
+        self.assertEqual(self.adds()[-1]['b'], ' '.join(['w'] * 61))
 
     def test_a_discussion_merges_into_the_review_and_keeps_its_answers_on_it(self):
         out = self.discuss('withdrawn', {'body': 'Agreed, withdrawing.', 'resolve': True})
@@ -1994,13 +1996,15 @@ class Pushback(PostCase):
         self.comment(955, 'coderabbitai[bot]', 'agree', bot=True)
         self.assertEqual(self.post()['staged'][0]['state'], 'staged')
 
-    def test_auto_posts_despite_a_long_answer_and_names_it_in_the_answers_pending_review(self):
+    def test_auto_posts_with_a_long_answer_and_puts_it_whole_in_the_answers_pending_review(self):
         rec = self.dispute('upheld', {'body': ' '.join(['w'] * 61), 'resolve': False})
         self.comment(950, 'contrib', 'intentional')
         self.save(self.result_for(self.p, findings=[{'id': 'pr7-f1', 'status': 'upheld', 'disputes': [rec]}],
                                   draft={'event': 'COMMENT', 'body': 'Again.', 'comments': [], 'replies': []}), reason='again')
         out = self.post('--auto')
-        self.assertEqual((out['status'], out['answers']['overLength']), ('posted', ['answer on pr7-f1']))
+        self.assertEqual((out['status'], out['answers']['status']), ('posted', 'drafted'))
+        self.assertNotIn('overLength', out['answers'])
+        self.assertEqual(self.adds()[-1]['b'], ' '.join(['w'] * 61))
 
     def test_auto_keeps_one_answer_publication_across_a_crash_and_publishes_it_once_its_review_is_submitted(self):
         rec = self.dispute('upheld', {'body': 'Still stands.', 'resolve': False})
@@ -2257,36 +2261,11 @@ class Severity(unittest.TestCase):
             self.assertEqual(re.findall(r"'(\w+)'", got), facts_, f'{wf} IMPACT')
 
 
-class Limits(unittest.TestCase):
-    def test_the_gate_measures_drafts_against_the_workflows_limits(self):
-        src = (ROOT / 'workflows' / 'pr-review.js').read_text(encoding='utf-8')
-        got = dict(re.findall(r'(\w+): (\d+)', re.search(r'^const LIMIT = \{([^}]*)\}', src, re.M).group(1)))
-        self.assertEqual((int(got['comment']), int(got['answer']), int(got['lineChars'])),
-                         (post.COMMENT_WORDS, post.REPLY_WORDS, post.LINE_CHARS))
-
-
 class Workflow(unittest.TestCase):
     @unittest.skipUnless(shutil.which('node'), 'needs Node.js')
     def test_stub_harness_passes(self):
         done = subprocess.run(['node', str(ROOT / 'tests' / 'pr_review_harness.mjs')], capture_output=True, encoding='utf-8', errors='replace')
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
-
-    @unittest.skipUnless(shutil.which('node'), 'needs Node.js')
-    def test_the_drafting_measure_of_a_body_line_holds_what_post_holds(self):
-        src = (ROOT / 'workflows' / 'pr-review.js').read_text(encoding='utf-8')
-        defs = [re.search(rf'^const {name} = .*$', src, re.M).group(0) for name in ('LIMIT', 'words', 'longestLine', 'overLength', 'overComment')]
-        at = {'path': 'src/core/a.c', 'line': 1}
-        room = post.LINE_CHARS - len(f"- `{at['path']}:{at['line']}` **low**: ")
-        bodies = ['**low**: ' + ' '.join(['w'] * n) for n in (78, 79)] + ['**low**: ' + 'x' * n for n in (room, room + 1)]
-        comments = [{**at, 'line': at['line'] + i, 'body': b, 'finding': 0} for i, b in enumerate(bodies)]
-        js = '\n'.join(defs) + f'\nconsole.log(JSON.stringify({json.dumps(comments)}.map(overComment)))'
-        drafting = json.loads(subprocess.run(['node', '-e', js], capture_output=True, encoding='utf-8', check=True).stdout)
-        with mock.patch.object(ledger, 'added_lines', return_value=set()):
-            draft = ledger.anchor({'body': '', 'comments': comments, 'replies': []}, 'a' * 40, 'b' * 40)
-        held = post.over_length({}, {'draft': draft}, answers=False)
-        self.assertEqual([len(c['renderedLine']) for c in draft['moved'][2:]], [post.LINE_CHARS, post.LINE_CHARS + 1])
-        self.assertEqual(drafting, [False, True, False, True], 'the boundaries: 80 then 81 rendered words, 300 then 301 characters')
-        self.assertEqual(drafting, [f"{c['path']}:{c['line']}" in held for c in comments], 'the workflow shortens at least what post.py holds')
 
 
 class Fixable(PostCase):
@@ -2494,6 +2473,11 @@ class Repair(PostCase):
                                'user': {'login': author}})
         self.thread()['comments']['nodes'].append({'databaseId': 950})
 
+    def test_a_long_note_is_posted_whole(self):
+        note = ' '.join(['word'] * 70)
+        self.assertEqual(self.fixed(self.row(note=note))['status'], 'repaired')
+        self.assertEqual(self.gh.notes, [(self.root, f'Fixed in {self.fixed_head[:12]}: {note}')])
+
     def test_a_verified_repair_gets_one_note_and_its_resolve_and_no_review(self):
         posts, submits = len(self.gh.posts), len(self.gh.submits)
         out = self.fixed()
@@ -2513,7 +2497,7 @@ class Repair(PostCase):
     def test_rows_no_fix_check_verified_on_this_head_refuse_before_anything_is_sent(self):
         for over, why in (({'verdict': 'refuted'}, "not 'verified'"), ({'checkedSha': self.reviewed}, 'not the expected head'),
                           ({'claimDigest': ''}, 'no claimDigest'), ({'evidence': str(self.tmp / 'nope')}, 'is not a file'),
-                          ({'note': 'two\nlines'}, 'not one short line'), ({'note': 'word ' * 70}, 'not one short line')):
+                          ({'note': 'two\nlines'}, 'not one nonempty line'), ({'note': '  '}, 'not one nonempty line')):
             with self.assertRaisesRegex(facts.Unusable, why):
                 self.fixed(self.row(**over))
         with self.assertRaisesRegex(facts.Unusable, 'twice'):
