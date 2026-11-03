@@ -6,6 +6,7 @@ settle what the human did with it.
   post.py --pr N --expected-head SHA --auto [--defer-answers] [--repo OWNER/NAME]  # submit it
   post.py --pr N --expected-head SHA --decline --reason TEXT [--repo OWNER/NAME]
   post.py --pr N --sync [--repo OWNER/NAME]
+  post.py --pr N --expected-head SHA --fixed FILE [--repo OWNER/NAME]   # auto-fix: notes and resolves for a pushed repair
 
 Uses only the draft ledger.py saved for that head, never a regenerated one. Its review body ends with the marker
 <!-- agentrc-pr-review:<head>:<draft digest> -->. Before creating anything it refuses unless the PR head is still
@@ -19,9 +20,10 @@ threads (GraphQL addPullRequestReviewThreadReply), an answer only while the thre
 it was judged on and the answer still matches its digest. Nothing is public until the human submits it on
 GitHub, choosing the event; deleting a comment or reply before that declines it. The review is `drafted`.
 
-Text over its length limit, measured here (a comment moved into the body as the comment it was), is never cut: a
-pending review names it in overLength for the human to shorten, and --auto refuses to submit it; an answer
-counts only where it is published, never under --auto.
+Text over its length limit, measured here (a comment moved into the body as the line it posts, renderedLine; one
+saved before that form as the whole comment), is never cut: a pending review names it in overLength for the human to
+shorten, and --auto refuses to submit it; an answer counts only where it is published, never under --auto. A body
+line whose first line no check verified (firstLineUnchecked) is named the same way and also holds --auto.
 
 --auto takes the same path, refusing APPROVE: the pending review with its fix notes (never its answers), then,
 while the head is still the draft's and every note reads back, a submit with the draft's event (its intent stored
@@ -44,14 +46,28 @@ left for --auto to recover by its marker). Submitted: posted, with the event the
   resolve_due), are resolved while the PR head is the review's, a published reply of ours is on the thread, nobody
   has pushed back since and the thread is open; otherwise the next review finds the resolve due again. Each resolve is marked sent before the mutation, then
   resolved, deferred or observed (already resolved): one left sent (its answer unconfirmed), or resolved and
-  reopened since, is never resolved again by itself.
+  reopened since, is never resolved again by itself, nor one whose repair note was deleted or edited before its
+  resolve, whatever older answer of ours the thread holds.
+
+--fixed FILE, once an auto-fix repair is pushed and the PR head is SHA: FILE is {"reviewedHead": the last review's
+head, which must be submitted, "findings": [{id, claimDigest, verdict: "verified", checkedSha: SHA, note, evidence}]},
+each row a fix check that verified that finding's repair on SHA, its claimDigest the one ledger.py show --fixable gives.
+A bad row refuses the whole file before anything is sent. For each finding it posts `Fixed in <SHA>: <note>` as a reply
+on its thread (no review), reads it back, then resolves the thread; a fresh read of the PR before each send and each
+resolve skips or defers it on a closed or merged PR, a moved head, a resolved thread, a changed claim, a deleted or
+edited root or note, a disputed finding, pushback since our last answer, or, for a new note only, a pending review of
+ours; on a PR closed or merged, or a head other than SHA, before the run it sends and resolves nothing, skips each new
+note and still reads back and reports the rest. One record per
+finding and root (ledger.py's repairs) across runs and heads: a rerun returns it, retries a deferred resolve only on a
+fix check of the same claim, never resends an unconfirmed note, and holds a resolve left sent or a thread reopened since.
+A body-moved finding has no thread to note. A later review's draft never repeats a repair note.
 
 A write is stored as sent before it is sent, so a run that dies in it only looks for it afterwards (a review by
 its marker, a reply by its thread and body digest), never sends it twice. --decline records that the human
 declined a draft never created. A POST GitHub itself refused (its rate limit or Validation Failed, on a 403, 422 or
 429) whose marker does not read back right after created nothing: the review stays pending and unsent, reported
 failed, and a later run may POST it again; one that does read back is recovered. Any other error stays sent. stdout ends with
-one JSON line; exit 0 when drafted, posted, declined or synced, 1 when failed, partial, uncertain or handed over,
+one JSON line; exit 0 when drafted, posted, declined, synced or repaired (--fixed: every row noted and resolved), 1 when failed, partial, uncertain or handed over,
 2 with {"error": ...} when nothing was attempted.
 """
 
@@ -61,13 +77,14 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from ledger import (DRAFTS, ONLINE, UNSETTLED, add_answers, answered_ids, answers_of, open_answers,  # noqa: E402
-                    owner_of, publications, pushback, reached, digest as ledger_digest, ledger_path, load, locked, repo_of, store)
+from ledger import (DRAFTS, ONLINE, OPEN, SETTLED, UNSETTLED, add_answers, answer_root, answered_ids, answers_of, claim,  # noqa: E402
+                    holder, note_hold, open_answers, owner_of, publications, pushback, reached, repair_hold, repairs, submitted_last,
+                    thread_roots, digest as ledger_digest, ledger_path, load, locked, repo_of, store)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'pr-babysit' / 'scripts'))
 from facts import FULL_SHA, Parser, Unusable, attempt  # noqa: E402
 from harvest import digest, gh_json, pages  # noqa: E402
-from threads import record, threads  # noqa: E402
+from threads import record, snapshot, threads  # noqa: E402
 
 STATE = {'APPROVE': 'APPROVED', 'REQUEST_CHANGES': 'CHANGES_REQUESTED', 'COMMENT': 'COMMENTED', None: 'PENDING'}
 EVENT = {v: k for k, v in STATE.items()}
@@ -91,6 +108,12 @@ def review_comments(repo, pr, rid):
 
 def pr_head(repo, pr):
     return gh_json('pr', 'view', str(pr), '--repo', repo, '--json', 'headRefOid')['headRefOid']
+
+
+def head_if_open(repo, pr):
+    """(head, None) while the PR is open, else (head, why no fix note or resolve may land on it)."""
+    v = gh_json('pr', 'view', str(pr), '--repo', repo, '--json', 'headRefOid,state')
+    return v['headRefOid'], None if v.get('state') == 'OPEN' else f"the PR is {str(v.get('state')).lower()}"
 
 
 def read_back(repo, pr, rid, review):
@@ -222,9 +245,10 @@ def graphql(query, **fields):
 
 def replies_of(led, review, answers=True):
     """What a review publishes on our earlier threads: its fix notes, then each unpublished answer of its findings."""
+    fixes = repairs(led)  # a repair note of any state is the finding's fix note: a draft saved before it never repeats it
     out = [{'kind': 'fixnote', 'findingId': r['findingId'], 'commentId': r['commentId'], 'body': r['body'], 'resolve': True}
-           for r in review['draft']['replies']]
-    return out + [{'kind': 'answer', 'findingId': f['id'], 'commentId': f.get('commentId'), 'body': d['answer']['body'],
+           for r in review['draft']['replies'] if (r['findingId'], r['commentId']) not in fixes]
+    return out + [{'kind': 'answer', 'findingId': f['id'], 'commentId': answer_root(f, d), 'body': d['answer']['body'],
                    'resolve': d['answer']['resolve'], 'dispute': d} for f, d in (answers_of(led, review) if answers else [])]
 
 
@@ -301,33 +325,42 @@ def due_resolves(review):
     return [(by_id[x['findingId']], x['commentId']) for x in review['draft'].get('resolves', []) if x['findingId'] in by_id]
 
 
+def resolve(thread_id):
+    """(True, None) once GitHub answers the thread resolved, else (False, why)."""
+    data, err = graphql(RESOLVE, t=thread_id)
+    ok = bool((((data or {}).get('resolveReviewThread') or {}).get('thread') or {}).get('isResolved'))
+    return ok, None if ok else f'resolve unconfirmed: {err}'
+
+
 def resolve_threads(repo, pr, led, review, want, login, persist):
-    """Resolve each (finding, root comment) thread while the PR head is the review's, a published reply of ours is on
-    it and nobody pushed back after the last one, marking each in receipts.resolved."""
+    """Resolve each (finding, root comment) thread while the PR is open, its head is the review's, a published reply of
+    ours is on it and nobody pushed back after the last one, marking each in receipts.resolved."""
     if not want:
         return
-    head = pr_head(repo, pr)
+    head, shut = head_if_open(repo, pr)
     public = pages(f'repos/{repo}/pulls/{pr}/comments')
     by_root = {t['commentIds'][0]: t for t in threads(repo, pr) if t['commentIds']}
-    known, marks = answered_ids(led), review['receipts'].setdefault('resolved', [])
+    known, marks, fixes = answered_ids(led), review['receipts'].setdefault('resolved', []), repairs(led)
+    bodies = {c['id']: c.get('body') or '' for c in public}
     for f, root in want:
         t = by_root.get(root)
         replies = live_thread(public, root)
+        fix = fixes.get((f['id'], root))
+        # A draft saved before a repair's resolve was reopened, left unconfirmed or held by an edit of its note never
+        # resolves it: an older answer of ours does not stand in for the note.
         why = ('no review thread holds the comment' if not t else None if t['resolved'] else
-               f"the PR head moved to {head} since the review" if head != review['head'] else
-               'no published reply of ours on the thread' if not any(c['id'] in known for c in replies) else
-               'new replies since our last one' if pushback(replies, known, login) else None)
+               (fix and (repair_hold(fix, t) or note_hold(fix, bodies))) or
+               (shut or f"the PR head moved to {head} since the review" if shut or head != review['head'] else
+                'no published reply of ours on the thread' if not any(c['id'] in known for c in replies) else
+                'new replies since our last one' if pushback(replies, known, login) else None))
         mark = {'findingId': f['id'], 'commentId': root, 'state': 'deferred' if why else 'observed', 'error': why}
         marks.append(mark)
         if t and not why and not t['resolved']:
             # Stored before the mutation: a resolve not confirmed resolved is never tried again.
             mark.update(state='sent')
             persist()
-            data, err = graphql(RESOLVE, t=t['threadId'])
-            if (((data or {}).get('resolveReviewThread') or {}).get('thread') or {}).get('isResolved'):
-                mark.update(state='resolved')
-            else:
-                mark.update(error=f'resolve unconfirmed: {err}')
+            ok, err = resolve(t['threadId'])
+            mark.update(state='resolved') if ok else mark.update(error=err)
 
 
 def declined(led, review, reason):
@@ -375,9 +408,15 @@ def submitted(repo, pr, led, review, state, login, persist):
             f['status'] = 'dropped'
         else:
             f['commentId'] = cid
-            if digest(live.get('body')) != digest(c['body']):
+            # A finding raised again keeps the claim the PR shows: its new comment restates the human's edit.
+            if digest(live.get('body')) != digest(c['body']) or f.get('published'):
                 f['published'] = live.get('body')
         ids.append(live and cid)
+    inline = {c['findingId'] for c in review['draft']['comments']}
+    for c in review['draft'].get('moved', []):
+        if c['findingId'] not in inline:
+            # Raised again in the body: it has no thread now, and its old one keeps the repair that resolved it.
+            by_id[c['findingId']]['commentId'] = None
     got.update(commentIds=ids, submitted=state, event=EVENT.get(state))
     review['status'] = 'posted'
     want = []
@@ -532,14 +571,178 @@ def too_long(text, limit):
 
 def over_length(led, review, answers=True):
     """What is too long for its limit, named for the human to shorten before submitting; a comment moved into the
-    body is measured as the comment it was."""
+    body is measured as the line it posts (renderedLine), or, saved before that form, as the whole comment it posts."""
     d = review['draft']
-    long = [f"{c['path']}:{c['line']}" for c in d['comments'] + d.get('moved', []) if too_long(c['body'], COMMENT_WORDS)]
+    long = [f"{c['path']}:{c['line']}" for c in d['comments'] + d.get('moved', [])
+            if too_long(c.get('renderedLine', c['body']), COMMENT_WORDS)]
     long += [f"fix note on {r['findingId']}" for r in d['replies'] if too_long(r['body'], REPLY_WORDS)]
     if answers:
         long += [f"answer on {f['id']}" for f, x in answers_of(led, review)
                  if too_long(x['answer']['body'], REPLY_WORDS)]
     return list(dict.fromkeys(long))
+
+
+def read_manifest(path, head):
+    """--fixed FILE: {"reviewedHead": SHA, "findings": [{id, claimDigest, verdict, checkedSha, note, evidence}]}, each
+    row a fix check that verified its finding's repair on `head`."""
+    try:
+        m = json.loads(Path(path).read_text(encoding='utf-8'))
+    except (OSError, ValueError) as e:
+        raise Unusable(f'--fixed {path} unreadable: {e}')
+    if not isinstance(m, dict):
+        m = {}
+    rows = m.get('findings')
+    if not FULL_SHA.match(str(m.get('reviewedHead'))) or not isinstance(rows, list) or not rows:
+        raise Unusable('--fixed needs {"reviewedHead": SHA, "findings": [...]} with at least one finding')
+    ids = [r.get('id') for r in rows if isinstance(r, dict) and isinstance(r.get('id'), str) and r['id']]
+    if len(ids) != len(rows) or len(set(ids)) != len(ids):
+        raise Unusable('--fixed names a finding twice, or a row that is not an object with an id')
+    for r in rows:
+        note = r.get('note')
+        why = (f"its fix check is {r.get('verdict')!r}, not 'verified'" if r.get('verdict') != 'verified' else
+               f"its fix check judged {r.get('checkedSha')}, not the expected head" if r.get('checkedSha') != head else
+               'it names no claimDigest' if not r.get('claimDigest') else
+               'its note is not one short line' if not isinstance(note, str) or not note.strip() or '\n' in note.strip()
+               or too_long(fix_body(head, note), REPLY_WORDS) else
+               f"its evidence {r.get('evidence')!r} is not a file" if not isinstance(r.get('evidence'), str) or not Path(r['evidence']).is_file()
+               else None)
+        if why:
+            raise Unusable(f"{r['id']}: {why}")
+    return m
+
+
+def fix_body(head, note):
+    return f'Fixed in {head[:12]}: {note.strip()}'
+
+
+def our_pending(repo, pr, led, login):
+    return any(p['status'] in ONLINE for p, _ in publications(led)) or any(
+        r.get('state') == 'PENDING' and (r.get('user') or {}).get('login') == login for r in pages(f'repos/{repo}/pulls/{pr}/reviews'))
+
+
+def note_reply(snap, x):
+    """Our note as the PR shows it: by its recorded id, else the one reply of ours on its thread carrying its text."""
+    replies = [c for c in snap['comments'] if c['kind'] == 'review' and c['inReplyTo'] == x['commentId']]
+    if x['replyId']:
+        return next((c for c in replies if c['id'] == x['replyId']), None)
+    hits = [c for c in replies if c['id'] not in x['before'] and c['author'] == snap['viewer'] and ledger_digest(c['body']) == x['digest']]
+    return hits[0] if len(hits) == 1 else None
+
+
+def unfit(repo, pr, led, f, want, head, login):
+    """(snapshot, why f's thread may not take a note or a resolve now, or None), read afresh: the root and claim as
+    the fix check judged them (`want`, its claim digest), no pushback since our last answer, the PR open on the repaired
+    head."""
+    snap = snapshot(repo, pr, login)
+    t = thread_roots(snap).get(f.get('commentId'))
+    at, shut = head_if_open(repo, pr)
+    return snap, (shut or holder(led, snap)(f) or
+                  ('the claim changed since its fix check' if ledger_digest(claim(f)) != want else
+                   'no review thread holds the comment' if not t else
+                   f'the PR head moved to {at} since the repair' if at != head else None))
+
+
+def send_note(repo, pr, x, persist):
+    # Stored before the POST, so a run that dies in it only looks for the note afterwards, never sends it twice.
+    x.update(state='sent', error='sent; not confirmed')
+    persist()
+    code, out, err = attempt('gh', 'api', '--method', 'POST', f"repos/{repo}/pulls/{pr}/comments/{x['commentId']}/replies",
+                             '--input', '-', input=json.dumps({'body': x['body']}))
+    try:
+        x['replyId'] = json.loads(out)['id'] if code == 0 else None
+    except (ValueError, KeyError, TypeError):
+        x['replyId'] = None
+    if code:
+        x['error'] = (err or out).strip()[:300] or 'no reply id in the answer'
+
+
+def settle_note(repo, pr, led, f, x, row, head, login, persist):
+    """Read the note back, then resolve its thread while it still stands as the note answered it and this run's fix
+    check (`row`, on `head`) judged that same claim: a note never acknowledges a reply, an edit or a push it was not
+    sent against."""
+    snap, why = unfit(repo, pr, led, f, x['claimDigest'], head, login)
+    c = note_reply(snap, x)
+    if x['state'] in ('sent', 'uncertain'):
+        if c and ledger_digest(c['body']) == x['digest']:
+            x.update(state='published', replyId=c['id'], error=None)
+        else:
+            x.update(state='uncertain', error=x['error'] if x['error'] != 'sent; not confirmed' else 'not read back on the thread')
+            persist()
+            return
+    t = thread_roots(snap).get(x['commentId'])
+    if t and t['resolved']:
+        x.update(resolve='observed', error=None)
+        persist()
+        return
+    why = (why or ('the claim changed since its fix check' if row['claimDigest'] != x['claimDigest'] else
+                   note_hold(x, {c['id']: c['body']} if c else {})))
+    if why:
+        x.update(resolve='deferred', error=why)
+        persist()
+        return
+    # Stored before the mutation: a resolve not confirmed resolved is never tried again. resolveCheck is the fix check
+    # the resolve stands on, kept with the note's own head and evidence.
+    x.update(resolve='sent', error=None, resolveCheck={'head': head, 'evidence': row['evidence']})
+    persist()
+    ok, err = resolve(t['threadId'])
+    x.update(resolve='resolved') if ok else x.update(error=err)
+    persist()
+
+
+def fix_notes(repo, pr, led, m, head, persist):
+    """A fix note and a resolve on each repaired finding's thread of the last review, which must be the one submitted on
+    the reviewed head; per finding, one record across runs and heads (ledger.py's repairs). Each send and each resolve
+    reads the PR afresh first."""
+    rev = submitted_last(led, m['reviewedHead'])
+    at, shut = head_if_open(repo, pr)
+    # A closed PR or moved head still reads back and reports what earlier runs left; settle_note's fresh read then
+    # sends and resolves nothing.
+    stop = shut or (f'the PR head moved to {at}; the repair was checked on {head}' if at != head else None)
+    login = gh_json('api', 'user')['login']
+    by_id, fixes, out, settled = {f['id']: f for f in rev['findings']}, repairs(led), [], None
+    for row in m['findings']:
+        f = by_id.get(row['id'])
+        x = f and fixes.get((f['id'], f.get('commentId')))
+        if x and x['resolve'] in ('sent', *SETTLED):
+            # Nothing is sent for these: one read of the PR serves them all.
+            settled = settled or thread_roots({'threads': threads(repo, pr)})
+            t = settled.get(x['commentId'])
+            why = repair_hold(x, t) or (None if t else 'no review thread holds the comment')
+            out.append({**receipt(x), 'state': 'held', 'error': why} if why else receipt(x))
+            continue
+        if not x:
+            root = f and f.get('commentId')
+            why = stop or ('not a finding of the last review' if not f else 'not standing' if f['status'] not in OPEN else
+                           'no thread: it stands in the review body' if root is None else None)
+            if not why:
+                snap, why = unfit(repo, pr, led, f, row['claimDigest'], head, login)
+                t = thread_roots(snap).get(root)
+                why = why or ('its thread is resolved' if t['resolved'] else
+                              'a pending review of ours is open on the PR' if our_pending(repo, pr, led, login) else None)
+            if why:
+                out.append({'findingId': row['id'], 'commentId': root, 'state': 'skipped', 'replyId': None, 'resolve': None, 'error': why})
+                continue
+            body = fix_body(head, row['note'])
+            # evidence: the fix check the note stands on, kept for audit.
+            x = {'findingId': f['id'], 'commentId': root, 'head': head, 'claimDigest': row['claimDigest'], 'evidence': row['evidence'],
+                 'body': body, 'digest': ledger_digest(body), 'before': t['commentIds'], 'state': 'sent', 'replyId': None,
+                 'resolve': None, 'error': None}
+            rev.setdefault('repairs', []).append(x)
+            send_note(repo, pr, x, persist)
+        settle_note(repo, pr, led, f, x, row, head, login, persist)
+        out.append(receipt(x))
+    done = all(r['resolve'] in SETTLED and r['state'] == 'published' for r in out)
+    return {'status': 'repaired' if done else 'partial', 'repairs': out}
+
+
+def receipt(x):
+    return {k: x[k] for k in ('findingId', 'commentId', 'state', 'replyId', 'resolve', 'error')}
+
+
+def first_line_unchecked(review):
+    """Body entries whose first line, all the body shows of them, no check verified states the problem in full; an
+    inline comment shows whole."""
+    return [f"{c['path']}:{c['line']}" for c in review['draft'].get('moved', []) if c.get('firstLineUnchecked')]
 
 
 def collect(argv):
@@ -552,7 +755,10 @@ def collect(argv):
     p.add_argument('--decline', action='store_true')
     p.add_argument('--reason')
     p.add_argument('--sync', action='store_true')
+    p.add_argument('--fixed')
     a = p.parse_args(argv)
+    if a.fixed and (a.auto or a.decline or a.sync or a.defer_answers):
+        raise Unusable('--fixed takes only --pr, --repo and --expected-head')
     if a.sync and (a.auto or a.decline or a.expected_head):
         raise Unusable('--sync takes only --pr and --repo')
     if not a.sync and not FULL_SHA.match(a.expected_head or ''):
@@ -570,6 +776,8 @@ def collect(argv):
             return {'status': 'synced', 'reviews': sync(repo, a.pr, led, persist)}
         # What the human already submitted or deleted on GitHub is recorded first: it is no longer a draft.
         sync(repo, a.pr, led, persist)
+        if a.fixed:
+            return fix_notes(repo, a.pr, led, read_manifest(a.fixed, a.expected_head), a.expected_head, persist)
         todo = [p for p, r in publications(led) if p['head'] == a.expected_head and p['status'] in UNSETTLED
                 and (p is r or not a.auto)]
         if not todo:
@@ -590,9 +798,13 @@ def collect(argv):
         event = review['draft']['event']
         if a.auto and event == 'APPROVE':
             raise Unusable('auto-post never approves; publish it without --auto for the human to submit')
-        long = over_length(led, review, answers=not a.auto)
-        if a.auto and long and review['status'] == 'pending':
-            raise Unusable(f"over-length text ({', '.join(long)}): publish it without --auto for the human to shorten")
+        long, unchecked = over_length(led, review, answers=not a.auto), first_line_unchecked(review)
+        if a.auto and review['status'] == 'pending':
+            if long:
+                raise Unusable(f"over-length text ({', '.join(long)}): publish it without --auto for the human to shorten")
+            if unchecked:
+                raise Unusable(f"comments whose first line no check verified ({', '.join(unchecked)}): publish it without --auto "
+                               'for the human to fix')
         rec = review['receipts']
         sent = bool((rec.get('review') or {}).get('sent')) and not (rec.get('review') or {}).get('verified')
         head = pr_head(repo, a.pr)
@@ -602,7 +814,8 @@ def collect(argv):
             raise Unusable(f'the PR head moved to {head}; the draft reviewed {a.expected_head}')
         login = gh_json('api', 'user')['login']
         if not a.auto:
-            return {**publish_draft(repo, a.pr, led, review, login, recovering, persist), 'overLength': long}
+            return {**publish_draft(repo, a.pr, led, review, login, recovering, persist), 'overLength': long,
+                    'firstLineUnchecked': unchecked}
         out = publish_auto(repo, a.pr, led, review, event, login, recovering, persist)
         answers = [p for p in review.get('answerPublications', []) if p.get('auto') and p['status'] in DRAFTS]
         if answers and review['status'] == 'posted' and not recovering:
@@ -619,7 +832,7 @@ def main(argv):
         print(json.dumps({'error': str(e)}))
         return 2
     print(json.dumps(out))
-    done = out['status'] in ('posted', 'declined', 'drafted', 'synced') and 'handedOver' not in out
+    done = out['status'] in ('posted', 'declined', 'drafted', 'synced', 'repaired') and 'handedOver' not in out
     return 0 if done and ('answers' not in out or out['answers']['status'] in ('drafted', 'deferred')) else 1
 
 

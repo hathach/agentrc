@@ -123,11 +123,16 @@ const DISPUTES = { type: 'array', items: { type: 'object', required: ['findingId
     replies: { type: 'array', items: { type: 'object', properties: { id: { type: 'integer' }, digest: { type: 'string' }, author: { type: 'string' } } } } } } }
 // One read gives the standing findings and the pushback on them, from the same ledger and snapshot.
 const prior = await relay('ledger', 'Context', `python3 ${S}/ledger.py show --pr ${pr} --repo ${repo} --threads '${threadsFile}' --head ${head}`,
-  { type: 'object', properties: { reviews: { type: 'integer' }, last: { type: ['object', 'null'], properties: { head: { type: 'string' } } }, open: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, status: { type: 'string' }, file: { type: 'string' }, line: { type: 'integer' }, severity: { type: ['string', 'null'] }, confidence: { type: ['string', 'null'] }, impact: IMPACT, severityReason: { type: ['string', 'null'] }, commentId: { type: ['integer', 'null'] }, why: { type: 'string' }, resolveDue: { type: ['object', 'null'], properties: { replied: { type: 'boolean' } } } }, required: ['id'] } },
+  { type: 'object', properties: { reviews: { type: 'integer' }, last: { type: ['object', 'null'], properties: { head: { type: 'string' } } }, open: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, status: { type: 'string' }, file: { type: 'string' }, line: { type: 'integer' }, severity: { type: ['string', 'null'] }, confidence: { type: ['string', 'null'] }, impact: IMPACT, severityReason: { type: ['string', 'null'] }, commentId: { type: ['integer', 'null'] }, why: { type: 'string' }, published: { type: ['string', 'null'] }, inBody: { type: 'boolean' }, resolveDue: { type: ['object', 'null'], properties: { replied: { type: 'boolean' } } }, repair: { type: ['object', 'null'], properties: { head: { type: 'string' }, state: { type: 'string' }, resolved: { type: 'boolean' } }, required: ['head', 'state', 'resolved'] } }, required: ['id', 'published', 'repair'] } },
     heldThreads: { type: 'array', items: { type: 'object', properties: { findingId: { type: 'string' }, commentId: { type: 'integer' }, why: { type: 'string' } } } }, disputes: DISPUTES, error: { type: 'string' } } })
 if (!prior || prior.error) return blocked('ledger-failed', prior ? prior.error : 'the ledger relay died')
 // A copy missing members must not read as nothing standing: an incremental or discussion run continues the review prepare pinned.
-if (!Number.isInteger(prior.reviews) || !Array.isArray(prior.open) || !Array.isArray(prior.disputes) ||
+// A row without its published text or repair record would restate the draft, or never raise a failed repair again;
+// heldThreads is printed whenever a review is on the ledger.
+const rowOk = (f) => f && typeof f.id === 'string' && (f.published === null || typeof f.published === 'string') &&
+  (f.repair === null || (f.repair && SHA.test(f.repair.head) && typeof f.repair.state === 'string' && typeof f.repair.resolved === 'boolean'))
+if (!Number.isInteger(prior.reviews) || !Array.isArray(prior.open) || !Array.isArray(prior.disputes) || !prior.open.every(rowOk) ||
+  (prior.reviews > 0 && !Array.isArray(prior.heldThreads)) ||
   (args.mode !== 'full' && (prior.reviews < 1 || (prior.last || {}).head !== (discussion ? head : scopeBase)))) {
   return blocked('ledger-failed', `ledger answered ${JSON.stringify(prior)}`)
 }
@@ -141,14 +146,15 @@ const CLAIMS = {
   type: 'object', required: ['claims'],
   properties: { claims: { type: 'array', items: { type: 'object', required: ['commentId', 'author', 'claim'],
     properties: { commentId: { type: 'integer' }, threadId: { type: ['string', 'null'] }, author: { type: 'string' }, bot: { type: 'boolean' },
-      path: { type: ['string', 'null'] }, line: { type: ['integer', 'null'] }, claim: { type: 'string' } } } } },
+      path: { type: ['string', 'null'] }, line: { type: ['integer', 'null'] }, url: { type: ['string', 'null'] }, claim: { type: 'string' } } } } },
 }
-const RECHECK = { type: 'object', required: ['state', 'reason'], properties: { state: { enum: ['open', 'fixed', 'na', 'withdrawn', 'upheld', 'disputed'] }, reason: { type: 'string' }, answer: { type: 'string' }, ...GRADE } }
+const RECHECK = { type: 'object', required: ['state', 'reason'], properties: { state: { enum: ['open', 'fixed', 'na', 'withdrawn', 'upheld', 'disputed'] }, reason: { type: 'string' }, answer: { type: 'string' },
+  file: { type: 'string' }, line: { type: 'integer' }, ...GRADE } }
 const NONE = { confirmed: [], dropped: [], unverified: [] }
 // Public text is measured, never cut: over a limit it is shortened once, a comment then falls back to its
 // finding's words, and what is still over is logged; post.py measures it again and names it for the human, and
 // auto-post never submits it.
-const LIMIT = { comment: 80, answer: 60, summaryBullets: 3, lineChars: 300 } // words, words, bullets, about 3 rendered lines
+const LIMIT = { comment: 80, answer: 60, summary: 30, lineChars: 300 } // words, words, words, about 3 rendered lines
 const words = (s) => String(s || '').split(/\s+/).filter(w => w && !/^[-*+]$/.test(w)).length // a bullet marker is no word
 const overLength = (s, max) => words(s) > max || String(s || '').split('\n').some(l => l.length > LIMIT.lineChars)
 // The inline comment format: its finding's severity as the heading, then at most 3 bullets.
@@ -159,7 +165,8 @@ const recheckPrompt = (f) => {
   const d = disputeOf[f.id]
   const ask = `${IN}Adversarially recheck ONE earlier review finding of this PR on head ${head}. Read it with: python3 ${S}/ledger.py show --pr ${pr} --repo ${repo} --finding ${f.id}\n` +
     'Where the record has `published`, on the finding or on an answer, that is what the PR shows, as the maintainer edited it: judge that text, not the draft.\n' +
-    `Its level is ${f.severity || 'unset'}. Only when new evidence changes its facts: ${GRADING} Otherwise leave them out.\n`
+    `Its level is ${f.severity || 'unset'}. Only when new evidence changes its facts: ${GRADING} Otherwise leave them out.\n` +
+    `While it still stands (open, upheld or disputed), \`file\` and \`line\` are where it stands at ${head}: the repository path and the line on that head.\n`
   if (!d) {
     return ask + `Then read the code at ${head}. state=open if the problem is still there, fixed if the change since removed it (say which code does), na if the code it named is gone or the claim no longer applies` +
       `${f.status === 'withdrawn' ? ', withdrawn if it was withdrawn earlier and the code still shows the finding was wrong' : ''}. ${DATA}`
@@ -188,7 +195,7 @@ const [audit, rechecked, claims] = await parallel([
   ))),
   () => (discussion ? Promise.resolve({ claims: [] }) : agent(
     `${IN}Read ${threadsFile} (every comment on PR #${pr}). List the review claims still open that are not ours: each point raised in an unresolved, not outdated thread, and each finding in a bot's review body or summary comment (split multi-point comments; split a bot's comments into findings as the bot rules in ${AGENTRC}/agents/pr-review-validator.md do (expand that path in the shell before reading it; Read does not), a CodeRabbit nitpick or a Greptile summary item included). ` +
-    'Skip comments with ours=true, replies that only acknowledge, questions with no claim about the code, and threads marked resolved. One record per claim, its claim in one sentence. ' + DATA,
+    'Skip comments with ours=true, replies that only acknowledge, questions with no claim about the code, and threads marked resolved. One record per claim, its claim in one sentence, with the url the file gives its comment. ' + DATA,
     { label: 'claims', phase: 'Review', model: 'sonnet', effort: 'medium', schema: CLAIMS },
   )).then(cs => cs && parallel(withClaimIds(cs.claims).map((c, i) => () => judge(c, i))).then(judged => ({ claims: cs.claims, judged }))),
 ])
@@ -221,12 +228,19 @@ const answerOf = (f, v) => {
 // A dead verifier records no dispute, so the same replies are judged on the next run.
 const carriedOut = carried.map((f, i) => {
   const v = rechecked[i]
-  const base = { id: f.id, file: f.file, line: f.line, ...(regradeOf(v) || gradeOf(f)) }
+  // A finding still standing is placed where the recheck found it on this head: a push may have moved its line.
+  const moved = v && ['open', 'upheld', 'disputed'].includes(v.state) && Number.isInteger(v.line) && v.line > 0 && (v.file == null || (plainPath(v.file) && !v.file.startsWith('/')))
+  const at = moved ? { file: v.file ?? f.file, line: v.line } : { file: f.file, line: f.line }
+  const base = { id: f.id, ...at, ...(regradeOf(v) || gradeOf(f)) }
   if (!v) return { ...base, status: f.status || 'open', recheckReason: 'unjudged' }
   const d = disputeOf[f.id]
   const out = { ...base, status: statusOf(f, v), recheckReason: v.reason }
   if (d && ['withdrawn', 'upheld', 'disputed', 'fixed', 'na'].includes(v.state)) {
+    // The thread judged keeps the answer: a comment raised again on this review becomes the finding's commentId.
+    // A copy that dropped the root falls back to the comment the ledger had for it, which is that thread's.
+    const root = Number.isInteger(d.rootCommentId) ? d.rootCommentId : f.commentId
     out.disputes = [{ key: d.key, replies: d.replies, judgedHead: head, threadsFile, state: v.state, reason: v.reason,
+      ...(Number.isInteger(root) ? { rootCommentId: root } : {}),
       ...(['withdrawn', 'upheld'].includes(v.state) ? { answer: answerOf(f, v) } : {}) }]
   }
   return out
@@ -338,6 +352,8 @@ const blocking = openFindings.filter(o => BLOCKING.includes(o.severity))
 const disputedAt = carriedOut.filter(f => f.status === 'disputed').map(f => where(f.file, f.line))
 const disputed = disputedAt.length
 const lost = audit.dropped.length + audit.unverified.length + unjudged.length
+const coverageNote = `coverage incomplete: ${audit.dropped.length} scan unit(s) dropped, ${audit.unverified.length} unit(s) with unverified findings, ${unjudged.length} unjudged`
+const ciNote = `CI ${ci.state}${ci.actionRequired ? ` (${ci.actionRequired} awaiting maintainer approval)` : ''}`
 const reasons = []
 const blockers = blocking.length
 const regressions = hil.choice === 'boards' ? hil.boards.filter(b => b.regression === 'verified') : []
@@ -351,8 +367,8 @@ if (blockers || regressions.length) {
   const hilOk = hil.choice === 'boards' ? hil.boards.every(b => b.verdict === 'pass') : !args.hardwareRelevant
   if (nonMinor) reasons.push(`${nonMinor} open finding(s) above nit`)
   if (disputed) reasons.push(`${disputed} finding(s) disputed, waiting for a maintainer`)
-  if (lost) reasons.push(`coverage incomplete: ${audit.dropped.length} scan unit(s) dropped, ${audit.unverified.length} unit(s) with unverified findings, ${unjudged.length} unjudged`)
-  if (ci.state !== 'green') reasons.push(`CI ${ci.state}${ci.actionRequired ? ` (${ci.actionRequired} awaiting maintainer approval)` : ''}`)
+  if (lost) reasons.push(coverageNote)
+  if (ci.state !== 'green') reasons.push(ciNote)
   if (!hilOk) reasons.push(hil.choice === 'none' ? 'no hardware run on a hardware-relevant change' : 'a HIL board did not pass')
   event = reasons.length ? 'COMMENT' : 'APPROVE'
   if (event === 'APPROVE' && args.autoPost) {
@@ -365,9 +381,23 @@ log(`verdict ${event}: ${reasons.join('; ') || 'nothing open, coverage complete,
 phase('Draft')
 // A muted finding is not posted.
 const toPost = ours.filter(f => !f.muted)
-const FORMAT = 'Each comment: first line `**<severity>**: <the problem, one sentence>`, then at most 3 bullets: the cause with `file:line`, ' +
+// A finding no comment on the PR states, its own or its group's, is named; so is one its group's text states only in part.
+// A group is stated by its lead's comment or a claim; a member's own comment states only that member.
+// Ours already on the PR: its own inline comment, or a line of a review body the PR still shows as posted.
+const posted = (f) => (earlier[f.id] || {}).commentId || (earlier[f.id] || {}).inBody
+const said = (f) => posted(f) || toPost.includes(f)
+const stated = new Set([...pool.filter(f => said(f) && (f.group == null || leadOf.get(f.group) === f)), ...confirmedClaims].map(x => keyOf(x, x)))
+// A standing finding with no comment of ours, its group's text not stating it, gets one like a new finding: inline when
+// its line is on the diff, else one line in the body. One already posted is stated there.
+const uncovered = standing.filter(f => !posted(f) && ('beside' in f || !stated.has(keyOf(f, f))))
+// What the writer writes, each with the index the result's findings give it (carried first).
+const items = [...toPost.map(f => ({ f, finding: carriedOut.length + ours.indexOf(f), why: f.why, evidence: f.verdictReason })),
+  ...uncovered.map(f => ({ f, finding: carriedOut.indexOf(f), why: whyOf(f), evidence: verifiedOf(f) }))]
+const FORMAT = 'Each comment: first line `**<severity>**: <the problem, one sentence>`, complete on its own with any qualification it needs ' +
+  '(it may be all the review body shows), then at most 3 bullets: the cause with `file:line`, ' +
   `the impact, and a fix only where the finding supports one; at most ${LIMIT.comment} words; a question only when genuinely asking. ` +
-  `The summary: 1 to ${LIMIT.summaryBullets} Markdown bullets, one per distinct problem, not repeating the comments in full. `
+  `The summary: empty, or one Markdown bullet of at most ${LIMIT.summary} words giving direction: which comments to address first and how ` +
+  'they group, by grade and place. It never restates a comment\'s problem, cause, evidence or fix: the comments carry those. '
 const COMMENTS = { type: 'array', items: { type: 'object', required: ['finding', 'body'], properties: { finding: { type: 'integer' }, body: { type: 'string' } } } }
 // The runtime validates an answer against its schema and has the same agent correct one that fails, so a list short of
 // an id is fixed there; the fallbacks below still cover a runtime that does not. An empty enum is no valid schema.
@@ -378,21 +408,26 @@ const exactly = (schema, key, idField, ids) => {
     items: { ...list.items, properties: { ...list.items.properties, [idField]: ids.length ? { ...id, enum: ids } : id } } } } }
 }
 const WRITE = { type: 'object', required: ['summary', 'comments'], properties: { summary: { type: 'string' }, comments: COMMENTS } }
-const written = toPost.length ? await agent(
+// What the PR already states, by grade and place, so the summary's direction can weigh it and its check can verify that.
+const onPr = JSON.stringify([...standing.filter(f => !uncovered.includes(f)).map(f => ({ severity: f.severity, file: f.file, line: f.line })),
+  ...confirmedClaims.map(c => ({ severity: c.severity, file: c.path, line: c.line, author: c.author }))])
+const brief = (x, i) => ({ finding: i, file: x.f.file, line: x.f.line, severity: x.f.severity, dimension: x.f.dimension, why: x.why, evidence: x.evidence, alsoState: x.f.beside || undefined })
+const written = items.length ? await agent(
   `Write the inline comments of a code review for a contributor's PR, one per finding below, and its summary. ${FORMAT}${STYLE}` +
   'Use ONLY what each finding states: add no new claim, number, API or file. A finding with `alsoState` must also state that issue, as far as its ' +
-  'finding and evidence support it. No sign-off, no attribution.\n' +
-  `Findings: ${JSON.stringify(toPost.map((f, i) => ({ finding: i, file: f.file, line: f.line, severity: f.severity, dimension: f.dimension, why: f.why, evidence: f.verdictReason, alsoState: f.beside || undefined })))}`,
-  { label: 'write', phase: 'Draft', model: 'sonnet', effort: 'medium', schema: exactly(WRITE, 'comments', 'finding', toPost.map((_, i) => i)) },
+  'finding and evidence support it, in its first line. No sign-off, no attribution. The summary may also weigh the comments already on the PR, listed by grade and place.\n' +
+  `Already on the PR: ${onPr}\n` +
+  `Findings: ${JSON.stringify(items.map(brief))}`,
+  { label: 'write', phase: 'Draft', model: 'sonnet', effort: 'medium', schema: exactly(WRITE, 'comments', 'finding', items.map((_, i) => i)) },
 ).catch(quiet('write')) : { summary: '', comments: [] }
-const bodies = toPost.map((f, i) => ((written && written.comments) || []).find(c => c.finding === i))
+const bodies = items.map((_, i) => ((written && written.comments) || []).find(c => c.finding === i))
 let summary = (written && written.summary) || ''
 const summaryOver = (s) => {
   const ls = s.split('\n').filter(l => l.trim())
-  return ls.length > LIMIT.summaryBullets || ls.some(l => !/^\s*[-*+] /.test(l)) || overLength(s, LIMIT.comment)
+  return ls.length > 1 || ls.some(l => !/^\s*[-*+] /.test(l)) || overLength(s, LIMIT.summary)
 }
 const answers = carriedOut.flatMap(f => (f.disputes || []).filter(d => d.answer).map(d => ({ finding: f.id, a: d.answer })))
-const longBodies = bodies.map((b, i) => b && (overLength(b.body, LIMIT.comment) || offFormat(b.body, toPost[i].severity)) ? i : -1).filter(i => i >= 0)
+const longBodies = bodies.map((b, i) => b && (overLength(b.body, LIMIT.comment) || offFormat(b.body, items[i].f.severity)) ? i : -1).filter(i => i >= 0)
 const longAnswers = answers.filter(x => overLength(x.a.body, LIMIT.answer))
 let summaryLong = !!summary && summaryOver(summary)
 const reworded = []
@@ -402,7 +437,7 @@ if (longBodies.length || longAnswers.length || summaryLong) {
     summary: { type: ['string', 'null'] } } }
   const shorter = await agent(
     `Shorten these review texts and put each in its format. Keep every fact each states and add none. ${FORMAT}Each answer: at most ${LIMIT.answer} words, bullets for more than one point. ${STYLE}\n` +
-    `Texts: ${JSON.stringify({ comments: longBodies.map(i => ({ finding: i, severity: toPost[i].severity, body: bodies[i].body })),
+    `Texts: ${JSON.stringify({ comments: longBodies.map(i => ({ finding: i, severity: items[i].f.severity, body: bodies[i].body })),
       answers: longAnswers.map(x => ({ finding: x.finding, body: x.a.body })), summary: summaryLong ? summary : null })}`,
     { label: 'shorten', phase: 'Draft', model: 'sonnet', effort: 'low',
       schema: exactly(exactly(SHORT, 'comments', 'finding', longBodies), 'answers', 'finding', longAnswers.map(x => x.finding)) },
@@ -415,34 +450,64 @@ if (longBodies.length || longAnswers.length || summaryLong) {
 }
 // A summary still over its format is left out: the comments carry the findings.
 if (summaryLong) summary = ''
-const CHECKED = { type: 'object', required: ['bad', 'summaryBad', 'answersBad'], properties: { bad: { type: 'array', items: { type: 'integer' } },
-  summaryBad: { type: 'boolean' }, answersBad: { type: 'array', items: { type: 'string' } } } }
-const checked = (toPost.length && written) || reworded.length ? await agent(
+const CHECKED = { type: 'object', required: ['bad', 'firstBad', 'summaryBad', 'answersBad'], properties: { bad: { type: 'array', items: { type: 'integer' } },
+  firstBad: { type: 'array', items: { type: 'integer' } }, summaryBad: { type: 'boolean' }, answersBad: { type: 'array', items: { type: 'string' } } } }
+const checked = (items.length && written) || reworded.length ? await agent(
   `List the finding numbers whose comment states any claim, number, API or file that its finding does not, or fails to state the finding's problem, ` +
   'or, for a finding with alsoState, omits that issue or states it beyond what the finding and evidence support. ' +
-  'summaryBad: does the summary state anything that no finding states, or say nothing about the findings? ' +
+  'firstBad: the finding numbers whose comment\'s FIRST LINE alone does not state the actionable problem with the qualification it needs and, ' +
+  'for a finding with alsoState, that issue. ' +
+  'summaryBad: does the summary restate any comment\'s problem, cause, evidence or fix, or state a fact, grade, place or dependency that neither ' +
+  'a finding nor what is already on the PR supports? ' +
+  'An empty summary is not bad. ' +
   'answersBad: the findings whose shortened answer states anything its original does not, or drops its conclusion or the evidence it rests on.\n' +
-  `Pairs: ${JSON.stringify(toPost.map((f, i) => ({ finding: i, finding_text: f.why, evidence: f.verdictReason, alsoState: f.beside || undefined, comment: bodies[i] ? bodies[i].body : null })))}\n` +
+  (summary ? `Already on the PR: ${onPr}\n` : '') +
+  `Pairs: ${JSON.stringify(items.map((x, i) => ({ ...brief(x, i), comment: bodies[i] ? bodies[i].body : null })))}\n` +
   `Summary: ${JSON.stringify(summary || null)}\n` +
   `Answers: ${JSON.stringify(reworded.map(x => ({ finding: x.finding, original: x.was, shortened: x.a.body })))}`,
   { label: 'check-draft', phase: 'Draft', model: 'sonnet', effort: 'low', schema: CHECKED },
-).catch(quiet('check-draft')) : { bad: [], summaryBad: true, answersBad: [] }
+).catch(quiet('check-draft')) : { bad: [], firstBad: [], summaryBad: true, answersBad: [] }
 // A shortened answer the check flags, or one left unchecked, goes back to its original.
 for (const x of reworded) if (!checked || (checked.answersBad || []).includes(x.finding)) x.a.body = x.was
-// A comment the check flags, lost, unchecked or still off its format falls back to the finding's own words.
-// A finding posted beside its group falls back with its verification too, which states what the group's text lacks.
-const template = (f) => `**${f.severity || 'finding'}**: ${f.why}${f.beside ? `\n\n${f.verdictReason}` : ''}`
+// A comment the check flags, lost, unchecked or still off its format falls back to the finding's own words, never its
+// verification; its first line is then unverified, which holds auto-post when that line is all the body shows.
+const template = (severity, why) => `**${severity || 'finding'}**: ${why}`
+// A finding an auto-fix repair resolved (post.py --fixed) that the recheck finds still standing is raised again on a
+// new comment: its old thread is resolved, so nothing visible states it. A held thread (reopened since, or its
+// state unconfirmed) is not: the snapshot shows it open or the human settles it.
+const repairedOf = (f) => (earlier[f.id] || {}).repair
+const heldOf = (f) => (prior.heldThreads || []).some(h => h.findingId === f.id && h.commentId === (earlier[f.id] || {}).commentId)
+const reraised = carriedOut.filter((f, i) => rechecked[i] && ['open', 'upheld'].includes(f.status) && (repairedOf(f) || {}).resolved && !heldOf(f))
+const repairNote = (f, it = 'this') => `The repair in ${repairedOf(f).head.slice(0, 12)} did not fix ${it}; its earlier thread was resolved.`
+// A comment the human edited is restated as they left it, never cut: a repair note that would put it over its limit
+// goes in the body instead. A regrade replaces its old grade marker; a heading the human changed stays.
+const regraded = (f, text) => {
+  const was = template(earlier[f.id].severity, '')
+  return text.startsWith(was) ? template(f.severity, text.slice(was.length)) : text
+}
+const restated = reraised.map(f => {
+  const published = earlier[f.id].published
+  const claim = published ? regraded(f, published) : template(f.severity, whyOf(f))
+  const noted = `${claim}\n- ${repairNote(f)}`
+  return overLength(noted, LIMIT.comment) ? { f, body: claim, noteInBody: true } : { f, body: noted }
+})
 // `finding` indexes the result's findings (carried first), so the ledger can give the comment its finding's id.
-const comments = toPost.map((f, i) => ({
-  path: f.file, line: f.line, finding: carriedOut.length + ours.indexOf(f),
-  body: bodies[i] && checked && !checked.bad.includes(i) && !offFormat(bodies[i].body, f.severity) ? bodies[i].body : template(f),
-}))
+const comments = [...items.map((x, i) => {
+  const ok = bodies[i] && checked && !checked.bad.includes(i) && !offFormat(bodies[i].body, x.f.severity)
+  return { path: x.f.file, line: x.f.line, finding: x.finding, body: ok ? bodies[i].body : template(x.f.severity, x.why),
+    ...(!ok || checked.firstBad.includes(i) ? { firstLineUnchecked: true } : {}) }
+}), ...restated.map(({ f, body }) => ({
+  path: f.file, line: f.line, finding: carriedOut.indexOf(f), body,
+  // No check sees it, and off the diff its first line drops the repair line and any qualification below.
+  firstLineUnchecked: true,
+}))]
 const long = [...comments.filter(c => overLength(c.body, LIMIT.comment)).map(c => `${c.path}:${c.line}`), ...answers.filter(x => overLength(x.a.body, LIMIT.answer)).map(x => `answer on ${x.finding}`)]
 if (long.length) log(`over length, for the human to shorten: ${long.join(', ')}`)
 // A due resolve whose reply is on the thread is only resolved once reconfirmed; one with no reply of ours there
 // (replied: false) gets the fix note, and the thread resolves once that is published.
 const settledAway = (i) => rechecked[i] && ['fixed', 'na', 'withdrawn'].includes(carriedOut[i].status)
-const noteDue = (f, i) => carriedOut[i].status === 'fixed' && !(f.resolveDue && f.resolveDue.replied)
+// A repair note of any state is the fix note: an unconfirmed one is reconciled, never noted twice.
+const noteDue = (f, i) => carriedOut[i].status === 'fixed' && !(f.resolveDue && f.resolveDue.replied) && !f.repair
 const fixedReplies = carried.filter((f, i) => noteDue(f, i) && Number.isInteger(f.commentId))
   .map(f => ({ commentId: f.commentId, findingId: f.id, body: `Fixed in ${head.slice(0, 12)}.` }))
 const resolves = carried.filter((f, i) => f.resolveDue && f.resolveDue.replied && settledAway(i) && Number.isInteger(f.commentId))
@@ -454,27 +519,17 @@ const summaryDropped = written && written.summary ? (!summary ? 'still over its 
   : !checked ? 'no check ran' : checked.summaryBad ? 'the check found a claim no finding states' : null) : null
 if (summaryDropped) log(`summary left out: ${summaryDropped}`)
 else if (summary) lines.push(summary, '')
-const tally = (xs, key) => Object.entries(xs.reduce((m, x) => ({ ...m, [x[key]]: (m[x[key]] || 0) + 1 }), {})).map(([k, v]) => `${v} ${k}`).join(', ')
-lines.push(`Reviewed ${args.mode === 'incremental' ? `the changes since ${scopeBase.slice(0, 12)}` : 'the whole change'} at ${head.slice(0, 12)}: ` +
-  `${ours.length} new finding(s)` +
-  `${carried.length ? `; earlier findings: ${tally(carriedOut, 'status')}` : ''}` +
-  `${claimsOut.length ? `; open thread claims: ${tally(claimsOut, 'verdict')}` : ''}.`)
-// A dispute is named apart from the blockers, so the contributor sees it is not part of the request.
-if (disputed) {
-  lines.push('', `${blocking.length ? `Blocking: ${blocking.map(o => o.at).join(', ')}; disputed` : 'Disputed'}, waiting for a maintainer: ${disputedAt.join(', ')}.`)
-}
-// A standing finding no comment on the PR states, its own or its group's, is named here, so every blocker is; so is
-// one its group's text states only in part.
-// A group is stated by its lead's comment or a claim; a member's own comment states only that member.
-const said = (f) => (earlier[f.id] || {}).commentId || toPost.includes(f)
-const stated = new Set([...pool.filter(f => said(f) && (f.group == null || leadOf.get(f.group) === f)), ...confirmedClaims].map(x => keyOf(x, x)))
-const unstated = standing.filter(f => 'beside' in f || !(said(f) || stated.has(keyOf(f, f))))
-if (unstated.length) lines.push('', 'Still standing from earlier reviews, not stated in full by any comment:', ...unstated.map(f => `- **${f.severity || 'finding'}** ${where(f.file, f.line)}: ${whyOf(f)}${f.beside && verifiedOf(f) ? `\n  ${verifiedOf(f)}` : ''}`))
-if (confirmedClaims.length) lines.push('', 'Confirmed from existing threads:', ...confirmedClaims.map(c => `- @${c.author}${c.path ? ` on ${where(c.path, c.line)}` : ''}: ${c.claim}` +
-  (ourGrade.has(c) ? ` (our review grades it **${ourGrade.get(c).severity}**, ${where(ourGrade.get(c).file, ourGrade.get(c).line)})` : '')))
-lines.push('', `CI: ${ci.state}.`)
-if (hil.choice === 'boards') lines.push('', row(['Board', 'HIL', 'Regression']), row(['---', '---', '---']), ...hil.boards.map(b => row([b.board, b.verdict, b.regression])))
-else lines.push('', 'Hardware: not run.')
+// The body adds only what no comment carries: blockers and disputes by place, other reviewers' claims we confirmed, and
+// the CI, hardware and coverage facts the verdict rests on. Findings off the diff get their line from ledger.py save.
+if (blocking.length) lines.push(`Blocking: ${[...new Set(blocking.map(o => o.at))].join(', ')}.`, '')
+if (disputed) lines.push(`Disputed, waiting for a maintainer: ${disputedAt.join(', ')}.`, '')
+for (const { f } of restated.filter(r => r.noteInBody)) lines.push(`Raised again at ${where(f.file, f.line)}. ${repairNote(f, 'it')}`, '')
+if (confirmedClaims.length) lines.push('Confirmed from other reviewers:', ...confirmedClaims.map(c => `- @${c.author} ${c.url ? `[comment](${c.url})` : c.path ? `on ${where(c.path, c.line)}` : `comment ${c.commentId}`}, ` +
+  `point ${c.claimId.split('#')[1]}${ourGrade.has(c) ? `; our grade **${ourGrade.get(c).severity}**` : ''}`), '')
+if (ci.state !== 'green') lines.push(`${ciNote}.`, '')
+if (hil.choice === 'boards') lines.push(row(['Board', 'HIL', 'Regression']), row(['---', '---', '---']), ...hil.boards.map(b => row([b.board, b.verdict, b.regression])), '')
+if (lost) lines.push(`C${coverageNote.slice(1)}.`, '')
+while (lines.length && !lines[lines.length - 1]) lines.pop()
 
 return {
   status: 'reviewed', pr, repo, head, mergeBase, scopeBase, mode: args.mode,

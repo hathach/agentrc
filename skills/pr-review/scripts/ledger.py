@@ -12,8 +12,10 @@ post.py write it, under an exclusive lock, by write-then-rename.
 show prints the last review that reached the PR (posted:
 head, mergeBase, verdict, status), its standing findings (open, upheld,
 disputed: id, file, line, severity with its P0-P4 priority, the grading
-behind it, its claim, and the number of the defect it shares with other findings
-of that review, if any), ordered by
+behind it, its claim and its comment as the human edited it (published, carried to a comment raising it again), the
+number of the defect it shares with other findings of that review, if any, and
+the repair note post.py --fixed put on its thread (repair: head, state,
+resolved), or null), ordered by
 severity, and the thread answers
 drafted and not yet published, each
 with the replies it answers (author,
@@ -28,11 +30,14 @@ findings as show lists them, or null, since show itself lists only reviews that
 reached the PR. With --threads, a threads.py snapshot, it also lists each
 settled finding whose thread is still open and due to be resolved (resolveDue,
 resolve_due()), and in heldThreads those it never resolves again by itself;
+it marks inBody each finding the snapshot shows as a line of our review body,
+unedited, so a later review states it again only once that line is gone;
 --head adds the disputes on that head.
 
 --fixable, with a fresh threads.py snapshot, prints what an auto-fix repair may take from the review posted on
 SHA, which must be the last review on the PR: each standing finding as `fix` (its row, as show lists it, with
-`published`, its comment text as the human edited it, or null) when the text it stands in on the PR is the one a
+`published`, its comment text as the human edited it, or null, and `claimDigest`, the digest of that text or its own
+words, which a repair's fix check names) when the text it stands in on the PR is the one a
 receipt of ours recorded, unedited, and nobody but us or a bot has replied
 on its thread since our last verified answer; else in `held` with why: `disputed`, `unmapped` (no receipt places
 its text), `deleted`, `edited` (the inline comment, or the body of the review it was moved into, reads otherwise) or
@@ -257,7 +262,7 @@ def resolve_due(led, snapshot):
     """({finding id: {replied}}, held) for the last review's settled findings whose thread the snapshot shows open.
     Due: fixed, or closed by a reply of ours since the finding last stood (replied: a published reply that resolves,
     or a fix note the human edited, still in the thread). Held, never resolved again by itself: one whose last resolve is unconfirmed
-    (sent) or that someone reopened after it was resolved."""
+    (sent), that someone reopened after it was resolved, or whose repair note was deleted or edited before its resolve."""
     rev = last(led)
     if not rev:
         return {}, []
@@ -278,11 +283,23 @@ def resolve_due(led, snapshot):
                 replied.pop(f['id'], None)
                 mark.pop(f['id'], None)
     due, held = {}, []
+    fixes = repairs(led)
+    bodies = {c['id']: c['body'] for c in snapshot.get('comments') or [] if c['kind'] == 'review'}
     for f in rev.get('findings', []):
         t = roots.get(f.get('commentId'))
+        fix = fixes.get((f['id'], f.get('commentId')))
+        if fix and t and fix['state'] == 'published' and fix['replyId'] in t['commentIds']:
+            replied[f['id']] = True
+        why = fix and t and repair_hold(fix, t)
+        if why:
+            held.append({'findingId': f['id'], 'commentId': f['commentId'], 'why': why})
+            continue
         if f['status'] in OPEN or not t or t['resolved']:
             continue
-        if mark.get(f['id']) in ('sent', 'resolved', 'observed'):
+        why = fix and note_hold(fix, bodies)
+        if why:
+            held.append({'findingId': f['id'], 'commentId': f['commentId'], 'why': why})
+        elif mark.get(f['id']) in ('sent', 'resolved', 'observed'):
             held.append({'findingId': f['id'], 'commentId': f['commentId'],
                          'why': 'resolve unconfirmed' if mark[f['id']] == 'sent' else 'reopened after it was resolved'})
         elif replied.get(f['id']) or f['status'] == 'fixed':
@@ -290,13 +307,15 @@ def resolve_due(led, snapshot):
     return due, held
 
 
-def open_row(f, due):
+def open_row(f, due, fixes=None):
     sev = level(f.get('severity'))
+    fix = (fixes or {}).get((f['id'], f.get('commentId')))
     return {'id': f['id'], 'status': f['status'], 'file': f['file'], 'line': f['line'],
             'severity': sev, 'priority': priority(sev), 'confidence': f.get('confidence'),
             'impact': f.get('impact'), 'severityReason': f.get('severityReason'),
-            'why': f['why'], 'commentId': f.get('commentId'), 'defect': f.get('defect'),
-            'resolveDue': due.get(f['id'])}
+            'why': f['why'], 'published': f.get('published'), 'commentId': f.get('commentId'), 'defect': f.get('defect'),
+            'resolveDue': due.get(f['id']),
+            'repair': fix and {'head': fix['head'], 'state': fix['state'], 'resolved': fix['resolve'] in SETTLED}}
 
 
 def show(led, finding=None, draft=False, snapshot=None, pending=False):
@@ -323,16 +342,19 @@ def show(led, finding=None, draft=False, snapshot=None, pending=False):
     if not rev:
         return {'reviews': 0, 'last': None, 'open': []}
     due, held = resolve_due(led, snapshot) if snapshot else ({}, [])
+    fixes = repairs(led)
+    shown = body_shown(led, snapshot) if snapshot else (lambda f: False)
     snapshots = {}
-    answers = [{'findingId': f['id'], 'commentId': f.get('commentId'), 'state': d['state'], 'resolve': d['answer']['resolve'],
+    answers = [{'findingId': f['id'], 'commentId': answer_root(f, d), 'state': d['state'], 'resolve': d['answer']['resolve'],
                 'body': d['answer']['body'], 'reason': d.get('reason'),
-                **thread_context(d, f.get('commentId'), snapshots)}
+                **thread_context(d, answer_root(f, d), snapshots)}
                for f, d in open_disputes(rev.get('findings', []), rev['head'])]
     return {
         'reviews': len(led['reviews']),
         'last': {k: rev.get(k) for k in ('head', 'mergeBase', 'mode', 'status', 'reviewedAt')} | {'event': rev['verdict']['event']},
         'answers': answers,
-        'open': sorted((open_row(f, due) for f in rev.get('findings', []) if f['status'] in OPEN or f['id'] in due), key=by_severity),
+        'open': sorted(({**open_row(f, due, fixes), **({'inBody': True} if shown(f) else {})}
+                        for f in rev.get('findings', []) if f['status'] in OPEN or f['id'] in due), key=by_severity),
         **({'heldThreads': held} if snapshot else {}),
     }
 
@@ -352,15 +374,19 @@ def added_lines(merge_base, head, path):
 
 
 def anchor(draft, merge_base, head):
-    """Comments on lines the diff does not show go into the body: GitHub refuses them inline."""
+    """Comments on lines the diff does not show go into the body, which GitHub refuses inline, one line each: the
+    place and the comment's first line, its one-sentence problem. The whole comment stays in `moved`."""
     inline, moved, cache = [], [], {}
     for c in draft['comments']:
         if c['path'] not in cache:
             cache[c['path']] = added_lines(merge_base, head, c['path'])
-        (inline if c['line'] in cache[c['path']] else moved).append(c)
+        if c['line'] in cache[c['path']]:
+            inline.append(c)
+        else:
+            moved.append({**c, 'renderedLine': f"- `{c['path']}:{c['line']}` {c['body'].split(chr(10))[0]}"})
     body = draft['body']
     if moved:
-        body += '\n\n' + '\n\n'.join(f"**{c['path']}:{c['line']}**: {c['body']}" for c in moved)
+        body = '\n\n'.join(x for x in (body, 'Not in an inline comment:\n' + '\n'.join(c['renderedLine'] for c in moved)) if x)
     return {**draft, 'body': body, 'comments': inline, 'moved': moved}
 
 
@@ -390,8 +416,48 @@ def answered_ids(led):
     for r, _ in publications(led):
         rec = r.get('receipts') or {}
         ids |= {x.get('replyId') for x in rec.get('staged') or [] if x.get('state') in ('published', 'edited')}
+    # A repair note settles pushback only once its resolve saw none: one deferred by a reply must not hide that reply.
+    ids |= {x['replyId'] for x in repairs(led).values() if x['state'] == 'published' and x['resolve'] in SETTLED}
     ids.discard(None)
     return ids
+
+
+SETTLED = ('resolved', 'observed')
+
+
+def repair_hold(fix, t):
+    """Why a repair record keeps its thread (`t`, as a snapshot shows it) from any further resolve, or None: its note
+    or resolve unconfirmed, or the thread reopened after it was resolved."""
+    return ('repair note unconfirmed' if fix['state'] in ('sent', 'uncertain') else
+            'resolve unconfirmed' if fix['resolve'] == 'sent' else
+            'reopened after it was resolved' if fix['resolve'] in SETTLED and t and not t['resolved'] else None)
+
+
+def note_hold(fix, bodies):
+    """Why a published repair note whose resolve never settled keeps its thread from any resolve, or None: the note
+    deleted or edited since (`bodies`, the live review comments' text by id), so it no longer says what was verified."""
+    if fix['state'] != 'published' or fix['resolve'] in SETTLED:
+        return None
+    body = bodies.get(fix['replyId'])
+    return 'our repair note was deleted' if body is None else 'our repair note was edited' if digest(body) != fix['digest'] else None
+
+
+def submitted_last(led, head):
+    """The last review on the PR, which must be the one submitted on `head`."""
+    rev = last(led)
+    if not rev or rev['head'] != head or not ((rev.get('receipts') or {}).get('review') or {}).get('submitted'):
+        raise Unusable(f"the last review on the PR is {rev and rev['head']} ({rev and rev['status']}), not one submitted on {head}")
+    return rev
+
+
+def repairs(led):
+    """{(finding id, root comment id): the latest repair note record}: post.py --fixed's, across our reviews."""
+    return {(x['findingId'], x['commentId']): x for r in reached(led) for x in r.get('repairs', [])}
+
+
+def claim(f):
+    """The text a repair is judged against: the comment as the human edited it, else the finding's own words."""
+    return f.get('published') or f['why']
 
 
 def pushback(replies, answered, viewer):
@@ -441,14 +507,18 @@ def published_at(led, f):
     return None
 
 
-def fixable(led, snapshot, head):
-    online = [x for x, _ in publications(led) if x['status'] in ONLINE]
-    if online:
-        raise Unusable(f"a {online[-1]['status']} publication for {online[-1]['head']} is not settled, so the last review on the PR "
-                       'is unknown: reconcile it first')
-    rev = last(led)
-    if not rev or rev['head'] != head or not ((rev.get('receipts') or {}).get('review') or {}).get('submitted'):
-        raise Unusable(f"the last review on the PR is {rev and rev['head']} ({rev and rev['status']}), not one submitted on {head}")
+def body_shown(led, snapshot):
+    """shown(f): whether f is a line of a review body of ours that the snapshot shows as we posted it."""
+    bodies = {c['id']: c['digest'] for c in snapshot.get('comments', []) if c.get('kind') == 'review-body'}
+
+    def shown(f):
+        at = f.get('commentId') is None and published_at(led, f)
+        return bool(at and at[0] == 'review-body' and bodies.get(at[1]) == at[2])
+    return shown
+
+
+def holder(led, snapshot):
+    """hold(f): why a standing finding is not ours to repair as the snapshot shows the PR, or None."""
     viewer = viewer_of(snapshot)
     live = {(c['kind'], c['id']): c for c in snapshot.get('comments', [])}
     roots = thread_roots(snapshot)
@@ -473,7 +543,16 @@ def fixable(led, snapshot, head):
         if t is None or any(('review', i) not in live for i in t['commentIds']):
             raise Unusable(f"the threads file does not hold {f['id']}'s whole thread: rerun threads.py")
         return 'replied' if pushback([live[('review', i)] for i in t['commentIds'][1:]], known, viewer) else None
+    return hold
 
+
+def fixable(led, snapshot, head):
+    online = [x for x, _ in publications(led) if x['status'] in ONLINE]
+    if online:
+        raise Unusable(f"a {online[-1]['status']} publication for {online[-1]['head']} is not settled, so the last review on the PR "
+                       'is unknown: reconcile it first')
+    rev = submitted_last(led, head)
+    hold = holder(led, snapshot)
     fix, held = [], []
     for f in rev.get('findings', []):
         if f['status'] in OPEN:
@@ -481,7 +560,8 @@ def fixable(led, snapshot, head):
             if why:
                 held.append({'findingId': f['id'], 'commentId': f.get('commentId'), 'why': why})
             else:
-                fix.append({**open_row(f, {}), 'published': f.get('published')})  # the text the PR shows, as the human edited it
+                # The text the PR shows, as the human edited it, and the digest a repair's fix check names.
+                fix.append({**open_row(f, {}), 'claimDigest': digest(claim(f))})
     return {'fix': sorted(fix, key=by_severity), 'held': held,
             'autoPost': not any(h['why'] in ('unmapped', 'deleted', 'edited') for h in held)}
 
@@ -501,6 +581,12 @@ def open_disputes(findings, head=None):
     on `head` when named: an answer to an earlier head is never published on a later one."""
     return [(f, d) for f in findings for d in f.get('disputes', [])[-1:]
             if d.get('answer') and not d['answer'].get('outcome') and head in (None, d.get('judgedHead'))]
+
+
+def answer_root(f, d):
+    """The comment an answer replies to: the thread it was judged on, which a comment raising its finding again
+    replaces as the finding's commentId."""
+    return d.get('rootCommentId', f.get('commentId'))
 
 
 def hold_withdrawal(f, standing):
@@ -573,7 +659,8 @@ def save(led, result, reason):
         raise Unusable('a draft comment has an absolute path or a backslash; GitHub needs repository-relative paths with /')
     findings = number(led, result)
     try:
-        comments = [{'path': c['path'], 'line': c['line'], 'body': c['body'], 'findingId': findings[c['finding']]['id']}
+        comments = [{'path': c['path'], 'line': c['line'], 'body': c['body'], 'findingId': findings[c['finding']]['id'],
+                     **({'firstLineUnchecked': True} if c.get('firstLineUnchecked') else {})}
                     for c in result['draft']['comments']]
     except (KeyError, IndexError, TypeError):
         raise Unusable('a draft comment names no finding of the result')

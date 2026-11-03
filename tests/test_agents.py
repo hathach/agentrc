@@ -185,6 +185,7 @@ class AgentFiles(unittest.TestCase):
                        "With auto-fix, the same message, under the headless PR launch exception above, also grants pr-babysit on that PR",
                        'submitted the same way only while `ledger.py show --fixable` allows it, else created pending',
                        'a further repair of newly found findings needs a new request',
+                       "a fix note and a resolve on each of our own threads whose repair that pr-babysit pushed and a fix check verified on the PR head, solely through pr-review's `post.py --fixed`",
                        'Without auto-fix it permits no push; it never permits approval, dismissal, another PR or issue beyond the follow-up issue rule'):
             self.assertIn(phrase, review)
         self.assertIn('their request that pr-review review a PR with auto-fix', exception)
@@ -204,6 +205,10 @@ class AgentFiles(unittest.TestCase):
                        'A crash with repairs unpublished resumes this task with them, never a new prepare',
                        'Under `auto-fix`, a discussion run repairs nothing', 'a repair of an already-reviewed head takes `auto-fix full`',
                        '`post.py --auto --defer-answers` (auto-fix)',
+                       'whatever becomes of the recheck review; one the recheck finds still standing is raised again on a new comment, '
+                       'unless someone reopened its thread since, which then still states it',
+                       'After each launch whose reading shows the adoption `pushed` or `already-published`',
+                       'its `skipped`, `held` and `uncertain` rows are reported, never worked around',
                        '`ledger.py show --fixable` and the recheck\'s prepare refuse, and GitHub refuses the repair\'s replies',
                        'plain `post.py --expected-head <reviewed head>` puts them in a pending review before step 7',
                        'step 6 ends with their publication instead, since prepare refuses a head with a pending draft',
@@ -222,6 +227,7 @@ class AgentFiles(unittest.TestCase):
         self.assertIn('Merging stays off. My own words asking to merge a named PR', rules)
         self.assertIn('submitting any review stays mine, unless that request names auto-post', rules)
         self.assertIn('A `pr-review` request naming auto-fix is that grant for its PR too', rules)
+        self.assertIn('a fix note and a resolve on each of our threads its pushed repair fixed (`post.py --fixed`)', rules)
         self.assertIn('Neither grants a merge, an approval, a dismissal or a force-push.', rules)
         self.assertIn("Each pr-babysit launch gets a `Findings` subsection holding its reading's `findingsTable` verbatim", body)
         readme = ' '.join((AGENTS.parent / 'README.md').read_text().split())
