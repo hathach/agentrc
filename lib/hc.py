@@ -133,7 +133,7 @@ def proc_start(pid):
     if not sys.platform.startswith('linux'):
         return None
     try:
-        with open(f'/proc/{pid}/stat') as f:
+        with open(f'/proc/{pid}/stat', errors='replace') as f:
             return int(f.read().rsplit(')', 1)[1].split()[19])
     except (FileNotFoundError, ProcessLookupError):
         raise Gone(pid) from None

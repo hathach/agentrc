@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'lib'))
 import hc  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import guard_survivors, make_stub, tmpdir  # noqa: E402
+from helpers import cut_comm_stat, guard_survivors, make_stub, proc_open, tmpdir  # noqa: E402
 
 LINUX = sys.platform.startswith('linux')
 
@@ -216,6 +216,11 @@ class ProcessTest(unittest.TestCase):
         with mock.patch('builtins.open', side_effect=PermissionError(13, 'denied')), \
              self.assertRaisesRegex(hc.Error, 'cannot inspect'):
             hc.proc_start(os.getpid())
+
+    @unittest.skipUnless(LINUX, '/proc is Linux-only')
+    def test_a_comm_cut_mid_character_still_gives_the_start_time(self):
+        with mock.patch.object(hc, 'open', proc_open({'/proc/4242/stat': cut_comm_stat(4242, start=777)}), create=True):
+            self.assertEqual(hc.proc_start(4242), 777)
 
     def test_off_linux_there_is_no_start_time(self):
         with mock.patch.object(hc.sys, 'platform', 'darwin'):

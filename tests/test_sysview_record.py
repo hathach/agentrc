@@ -20,7 +20,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import guard_survivors, make_stub, pid_alive, tmpdir  # noqa: E402
+from helpers import cut_comm_stat, guard_survivors, make_stub, pid_alive, tmpdir  # noqa: E402
 
 SCRIPTS = Path(__file__).resolve().parents[1] / 'skills' / 'target-debug' / 'scripts'
 sys.path.insert(0, str(SCRIPTS))
@@ -574,6 +574,17 @@ class StopGroup(unittest.TestCase):
                 mock.patch.object(record.time, 'sleep'), mock.patch.object(record, 'GROUP_S', 0.01):
             self.assertFalse(record.stop_group(proc))
         self.assertEqual([c.args[1] for c in kill.call_args_list], [signal.SIGTERM, signal.SIGKILL])
+
+    def test_a_member_whose_comm_is_cut_mid_character_is_counted(self):
+        proc = tmpdir(self)
+        stats = {4242: cut_comm_stat(4242, pgrp=4242), 4243: cut_comm_stat(4243, state='Z', pgrp=4242),
+                 4244: cut_comm_stat(4244, pgrp=1)}
+        for pid, stat in stats.items():
+            (proc / str(pid)).mkdir()
+            (proc / str(pid) / 'stat').write_bytes(stat)
+        with mock.patch.object(record, 'all_pids', lambda: list(stats)), \
+                mock.patch.object(record, 'Path', lambda p: proc / p.removeprefix('/proc/')):
+            self.assertEqual(record.group_members(4242), [4242])
 
 
 @unittest.skipIf(sys.platform.startswith('linux'), 'the refusal is for other hosts')

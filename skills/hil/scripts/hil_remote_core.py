@@ -663,7 +663,7 @@ def refuse(why):
 def proc_stat(pid):
     """(state, start time) of pid, None when it is gone."""
     try:
-        with open(f'/proc/{int(pid)}/stat') as f:
+        with open(f'/proc/{int(pid)}/stat', errors='replace') as f:   # comm may be cut mid-UTF-8 character
             fields = f.read().rsplit(')', 1)[1].split()
         return fields[0], fields[19]
     except (OSError, IndexError, ValueError, TypeError):

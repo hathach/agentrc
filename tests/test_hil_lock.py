@@ -29,7 +29,7 @@ from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdo
 from pathlib import Path
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import guard_survivors, pid_alive  # noqa: E402
+from helpers import CUT_NAME, cut_comm_stat, guard_survivors, pid_alive, proc_open  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'hil' / 'scripts' / 'hil_lock.py'
 
@@ -2439,6 +2439,22 @@ class HolderFields(LockDir):
         self.patch(hil_lock, 'proc_start', lambda pid: None)
         with self.assertRaisesRegex(OSError, 'start time unreadable'):
             hil_lock.holder_fields('t', [BOARD])
+
+    def test_a_comm_cut_mid_character_still_gives_the_start_and_the_thread_states(self):
+        stat = cut_comm_stat(4242, state='Z', start=777)
+        files = {'/proc/4242/stat': stat, '/proc/4242/task/4242/stat': stat}
+        self.patch(hil_lock.os, 'listdir', lambda path: ['4242'])
+        with mock.patch.object(hil_lock, 'open', proc_open(files), create=True):
+            self.assertEqual(hil_lock.proc_start(4242), '777')
+            self.assertTrue(hil_lock._exited(4242, '777'))
+
+    def test_a_holder_whose_comm_is_cut_mid_character_still_has_its_ids(self):
+        status = (b'Name:\t' + CUT_NAME.encode()[:15] + b'\nUid:\t1000\t1000\t1000\t1000\n'
+                  b'Gid:\t1001\t1001\t1001\t1001\nGroups:\t4 20 \n')
+        files = {'/proc/4242/status': status, '/proc/4242/stat': cut_comm_stat(4242, start=777)}
+        self.patch(hil_lock.os, 'geteuid', lambda: 0)
+        with mock.patch.object(hil_lock, 'open', proc_open(files), create=True):
+            self.assertEqual(hil_lock._holder_ids(4242, '777'), (1000, 1001, [4, 20]))
 
 
 class Cheap(LockDir):

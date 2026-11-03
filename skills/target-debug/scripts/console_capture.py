@@ -175,7 +175,7 @@ def other_openers(device):
         for fd in fds:
             try:
                 if os.readlink(f'/proc/{pid}/fd/{fd}') == device:
-                    with open(f'/proc/{pid}/comm') as f:
+                    with open(f'/proc/{pid}/comm', errors='replace') as f:   # may be cut mid-UTF-8 character
                         found.append({'pid': int(pid), 'comm': f.read().strip()})
                     break
             except OSError:

@@ -456,7 +456,7 @@ def _survey(root: int) -> dict:
         if not name.isdigit():
             continue
         try:
-            with open(f'/proc/{name}/stat') as f:
+            with open(f'/proc/{name}/stat', errors='replace') as f:   # comm may be cut mid-UTF-8 character
                 text = f.read()
         except FileNotFoundError:
             continue
@@ -512,7 +512,7 @@ def _supervise(job: dict) -> int:
         fcntl.flock(lock, fcntl.LOCK_EX)       # held until this process ends
         st = os.fstat(lock)
         record['lock'] = [st.st_dev, st.st_ino]
-        with open('/proc/self/stat') as f:
+        with open('/proc/self/stat', errors='replace') as f:
             record['start'] = int(f.read().rpartition(')')[2].split()[19])
         _write_record(job['record'], {**record, 'cleanup': 'pending'})
     except Exception as e:

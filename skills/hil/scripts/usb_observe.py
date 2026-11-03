@@ -280,7 +280,7 @@ def _proc_stat(pid) -> tuple | None:
     """(comm, state, starttime, ppid, pgrp) from /proc/<pid>/stat, or None when the process
     is gone."""
     try:
-        with open(f'{PROC_ROOT}/{pid}/stat') as f:
+        with open(f'{PROC_ROOT}/{pid}/stat', errors='replace') as f:   # comm may be cut mid-UTF-8 character
             text = f.read()
     except (OSError, ValueError):
         return None

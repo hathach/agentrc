@@ -39,7 +39,7 @@ def session_state(receipt) -> str:
     if closed:
         return 'ended' if rec.get('cleanup') == 'done' else 'unresolved'
     try:
-        with open(f'/proc/{pid}/stat') as f:
+        with open(f'/proc/{pid}/stat', errors='replace') as f:   # comm may be cut mid-UTF-8 character
             fields = f.read().rsplit(')', 1)[1].split()
     except (FileNotFoundError, ProcessLookupError):
         return 'unresolved'

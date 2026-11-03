@@ -23,7 +23,7 @@ import warnings
 from pathlib import Path
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import guard_survivors  # noqa: E402
+from helpers import cut_comm_stat, guard_survivors, proc_open  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / 'skills' / 'hil' / 'scripts'
@@ -1622,6 +1622,11 @@ class SessionState(unittest.TestCase):
                 raise PermissionError(13, 'Permission denied', str(path))
             return real(path, *a, **kw)
         with mock.patch.object(oe.receipt_state, 'open', guarded, create=True):
+            self.assertEqual(oe.session_state(self.rec), 'running')
+
+    def test_a_comm_cut_mid_character_is_still_running(self):
+        stat = cut_comm_stat(self.p.pid, start=self.rec['startTime'])
+        with mock.patch.object(oe.receipt_state, 'open', proc_open({f'/proc/{self.p.pid}/stat': stat}), create=True):
             self.assertEqual(oe.session_state(self.rec), 'running')
 
     def test_a_receipt_that_is_not_well_formed_is_unreadable(self):

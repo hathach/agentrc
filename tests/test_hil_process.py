@@ -26,7 +26,7 @@ from contextlib import contextmanager, redirect_stdout, suppress
 from pathlib import Path
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import guard_survivors  # noqa: E402
+from helpers import CUT_NAME, cut_comm_stat, guard_survivors, proc_open  # noqa: E402
 
 SCRIPTS = Path(__file__).resolve().parents[1] / 'skills' / 'hil' / 'scripts'
 
@@ -1277,6 +1277,31 @@ class RunTracked(unittest.TestCase):
             got = hp._survey(os.getpid())
         self.assertNotIn(p.pid, [x['pid'] for x in got['processes']])
         self.assertIn(p.pid, got['unreadable'])
+
+    def test_a_comm_cut_mid_character_is_surveyed_as_text(self):
+        files = {'/proc/4242/stat': cut_comm_stat(4242, ppid=4000), '/proc/4243/stat': cut_comm_stat(4243, ppid=4242)}
+        with mock.patch.object(hp.os, 'listdir', lambda path: ['self', '4242', '4243']), \
+                mock.patch.object(hp, 'open', proc_open(files), create=True):
+            got = hp._survey(4000)
+        self.assertEqual([(x['pid'], x['state']) for x in got['processes']], [(4242, 'S'), (4243, 'S')])
+        self.assertEqual(got['processes'][0]['comm'], CUT_NAME[:5] + '\ufffd')
+        json.dumps(got)
+
+    def test_a_supervisor_whose_comm_is_cut_mid_character_still_reads_its_start(self):
+        res = self.child(f"""
+            ctypes.CDLL(None).prctl(15, {CUT_NAME!r}.encode(), 0, 0, 0)     # PR_SET_NAME: /proc/self/stat
+            rfd, wfd = os.pipe()
+            job = {{'cmd': 'true', 'cwd': None, 'timeout': 20, 'settle': 5, 'reap_grace': 2, 'binary': False,
+                   'split_stderr': False, 'report_fd': wfd, 'token': 't', 'lock': os.path.join(S, 'l'),
+                   'record': os.path.join(S, 'r')}}
+            rc = hp._supervise(job)
+            with open('/proc/self/stat', 'rb') as f:
+                start = int(f.read().rpartition(b')')[2].split()[19])
+            msgs = [json.loads(x) for x in os.read(rfd, 1 << 16).decode().splitlines() if x]
+            report(rc=rc, start=start, hello=[m['hello']['start'] for m in msgs if 'hello' in m])
+        """)
+        self.assertEqual(res['rc'], 0)
+        self.assertEqual(res['hello'], [res['start']])
 
     def test_the_supervisor_entry_refuses_other_usage(self):
         r = subprocess.run([sys.executable, '-I', str(SCRIPTS / 'hil_process.py')], capture_output=True, text=True,

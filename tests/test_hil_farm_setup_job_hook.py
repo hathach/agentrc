@@ -14,7 +14,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import guard_survivors  # noqa: E402
+from helpers import cut_comm_stat, guard_survivors  # noqa: E402
 
 FARM = Path(__file__).resolve().parent.parent / 'skills' / 'hil-farm-setup' / 'scripts'
 spec = importlib.util.spec_from_file_location('job_hook', FARM / 'job_hook.py')
@@ -115,6 +115,13 @@ class JobHook(unittest.TestCase):
             return None if pid == 901 else real(pid)    # 901 exits between the listing and the walk
         with mock.patch.object(hook, 'parent', parent):
             self.assertEqual(hook.survivors(UNIT), [900])
+
+    def test_a_comm_cut_mid_character_still_gives_the_parent(self):
+        self.procs = {**CHAIN, 900: 1}
+        self.sync()
+        (self.proc / '900' / 'stat').write_bytes(cut_comm_stat(900, ppid=1))
+        self.assertEqual(hook.parent(900), 1)
+        self.assertEqual(hook.survivors(UNIT), [900])
 
     def test_a_pid_that_joins_during_the_scan_is_seen(self):
         self.procs = {**CHAIN, 900: 1}

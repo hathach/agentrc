@@ -236,7 +236,7 @@ def end_errors(result, log):
 
 def start_time(pid):
     try:
-        with open(f'/proc/{pid}/stat') as f:
+        with open(f'/proc/{pid}/stat', errors='replace') as f:   # comm may be cut mid-UTF-8 character
             return f.read().rsplit(')', 1)[1].split()[19]
     except (OSError, IndexError):
         return None

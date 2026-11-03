@@ -757,7 +757,7 @@ def children_of():
     table = {}
     for stat in Path('/proc').glob('[0-9]*/stat'):
         try:
-            fields = stat.read_text().rsplit(')', 1)[1].split()
+            fields = stat.read_text(errors='replace').rsplit(')', 1)[1].split()   # comm may be cut mid-UTF-8 character
             table.setdefault(int(fields[1]), []).append(int(stat.parent.name))
         except (OSError, ValueError, IndexError):
             continue
