@@ -13,7 +13,7 @@ it is taken; it prints {committed, detail}: committed false, with git's last
 lines, when git made no commit (a hook that fails or modifies a file stops it),
 or before staging anything when the message is blank. --skip-hooks adds the
 comma-separated pre-commit hook ids IDS to the SKIP the commit's hooks see:
-the ones hooks.py found failing on HEAD too. detail is bounded to
+the ones hooks.py found failing on HEAD in the same words (baselineFailed). detail is bounded to
 DETAIL_MAX characters, terminal escapes and control characters dropped, so a
 relay can copy it. With --receipt, FILE must not exist yet; the line, with R,
 the parent P (HEAD before) and PATH, is saved there for a caller whose copy of
@@ -69,7 +69,6 @@ sys.path.insert(0, str(Path(__file__).parent))
 from facts import FULL_SHA, Unusable, attempt, attribution_in, git, report, run, sealed, status  # noqa: E402
 
 DETAIL_MAX = 500
-# A pre-commit hook id as --skip-hooks takes it: no comma, space or shell metacharacter.
 ESCAPE = re.compile(r'\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|.)')
 
 
