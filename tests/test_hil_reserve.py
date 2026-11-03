@@ -281,7 +281,7 @@ class Rosters(Fixture):
     def test_both_shapes_resolve_dedupe_and_sort(self):
         r = hr.load_rosters([(str(TINYUSB), 'name'), (str(TINYUF2), 'tinyuf2.lock')])
         # tinyusb lists raspberry_pi_pico2 and stm32h743eval twice (one parked); tinyuf2's imxrt1064_evk
-        # aliases to mimxrt1064_evk, which tinyusb also names; its stm32f303disco has no alias field
+        # locks as mimxrt1064_evk, which tinyusb also names; its stm32f303disco has no lock field
         self.assertEqual(r['locks'], ['mimxrt1064_evk', 'raspberry_pi_pico2', 'stm32f303disco', 'stm32h743eval'])
         self.assertEqual(r['identities']['e6633861a3978538'], {'raspberry_pi_pico2'})
         self.assertEqual(r['identities']['000725299165'], {'mimxrt1064_evk'})   # tinyuf2 flasher.uid
@@ -323,21 +323,20 @@ class Rosters(Fixture):
         with self.assertRaisesRegex(hr.Refused, 'uid x1 names two boards: a and b'):
             hr.load_rosters([(str(bad), 'name')])
 
-    def test_a_registered_board_is_one_dut_by_any_of_its_uids(self):
-        uid, entry = next((u, e) for u, e in hr.hil_boards.registry().items() if e.get('aliases'))
+    def test_a_registered_board_is_one_board_by_its_probe_whatever_its_uid(self):
+        probe = next(iter(hr.hil_boards.registry()))
         a, b = Path(self.td.name) / 'a.json', Path(self.td.name) / 'b.json'
-        a.write_text(json.dumps({'boards': [{'name': 'a', 'uid': uid}]}))
-        b.write_text(json.dumps({'boards': [{'name': 'b', 'uid': entry['aliases'][0]}]}))
+        a.write_text(json.dumps({'boards': [{'name': 'a', 'uid': 'FW-A', 'probe': probe}]}))
+        b.write_text(json.dumps({'boards': [{'name': 'b', 'uid': 'FW-B', 'probe': probe}]}))
         got = hr.load_rosters([(str(a), 'name')])
-        self.assertEqual(got['identities'][entry['aliases'][0].lower()], {'a'})
-        self.assertEqual(got['identities'][entry['flasher']['uid'].lower()], {'a'})
-        with self.assertRaisesRegex(hr.Refused, f'uid {entry["aliases"][0]} names two boards: a and b'):
+        self.assertEqual(got['identities'], {'fw-a': {'a'}, probe.lower(): {'a'}})
+        with self.assertRaisesRegex(hr.Refused, f'probe {probe.lower()} names two boards: a and b'):
             hr.load_rosters([(str(a), 'name'), (str(b), 'name')])
 
     def test_a_roster_carrying_a_registered_boards_flasher_refuses(self):
-        uid, entry = next(iter(hr.hil_boards.registry().items()))
+        probe, entry = next(iter(hr.hil_boards.registry().items()))
         bad = Path(self.td.name) / 'bad.json'
-        bad.write_text(json.dumps({'boards': [{'name': 'a', 'uid': uid, 'flasher': entry['flasher']}]}))
+        bad.write_text(json.dumps({'boards': [{'name': 'a', 'uid': 'X', 'probe': probe, 'flasher': entry['flasher']}]}))
         with self.assertRaisesRegex(hr.Refused, "come from agentrc's board registry"):
             hr.load_rosters([(str(bad), 'name')])
 

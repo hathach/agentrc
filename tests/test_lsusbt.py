@@ -24,7 +24,7 @@ NAMES = {'001:001': 'Linux Foundation 2.0 root hub', '001:002': 'Terminus Techno
          '001:011': 'SEGGER J-Link', '001:012': 'Espressif USB JTAG/serial debug unit',
          '001:013': 'Silicon Labs CP210x', '001:014': 'Logitech Keyboard'}
 SERIALS = {(1, 1): '0000:00:14.0', (1, 11): '000681295394', (1, 12): '84:F7:03:C0:84:E4', (1, 13): 'ABC123'}
-BOARDS = {'boards': [{'name': 'esp32s3', 'uid': '84F703C084E4'},
+BOARDS = {'boards': [{'name': 'esp32s3', 'uid': '84F703C084E4', 'probe': '3ea619acd1cdeb11a0a0b806e93fd3f1'},
                      {'name': 'stm32h7', 'uid': '1234', 'flasher': {'name': 'jlink', 'uid': '681295394'}}]}
 
 
@@ -104,17 +104,9 @@ class LsusbtTest(unittest.TestCase):
         self.assertIn('        |__ Port 003: Dev 013: [12M] Silicon Labs CP210x [3ea619acd1cdeb11a0a0b806e93fd3f1] '
                       'esp32s3 flasher', self.run_lsusbt())
 
-    def test_a_registered_board_reporting_an_alias_is_labeled(self):
-        for roster_uid in ('0C81464124010B20FF0A08CC2C', '0C81464124010B20FF0A08CC2C000000'):
-            with self.subTest(roster_uid=roster_uid):
-                self.json.write_text(json.dumps({'boards': [{'name': 'max32', 'uid': roster_uid}]}))
-                for serial in ('0C81464124010B20FF0A08CC2C', '0C81464124010B20FF0A08CC2C000000'):
-                    (self.sysfs / '1-13' / 'serial').write_text(f'{serial}\n')
-                    self.assertIn(f'        |__ Port 003: Dev 013: [12M] Silicon Labs CP210x [{serial}] max32 device',
-                                  self.run_lsusbt())
-
     def test_a_roster_carrying_a_registered_boards_flasher_fails(self):
         self.json.write_text(json.dumps({'boards': [{'name': 'esp32s3', 'uid': '84F703C084E4',
+                                                     'probe': '3ea619acd1cdeb11a0a0b806e93fd3f1',
                                                      'flasher': {'name': 'esptool', 'uid': 'x'}}]}))
         self.assert_fails(self.invoke(), "come from agentrc's board registry")
 

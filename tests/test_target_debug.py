@@ -595,12 +595,12 @@ while not os.path.exists(os.environ['FAKE_STOP']):
 close()
 """
 
-# k64f, max32, h743 and pico are farm boards by their board uid (flashers from agentrc's registry); the rest
+# k64f, max32, h743 and pico are farm boards by their probe (flashers from agentrc's registry); the rest
 # are bench boards carrying their own (hil_boards.resolve)
 STATE_BOARDS = [
-    {'name': 'k64f', 'uid': 'FFFF1A00FFFFFFFF1031454E0F000280'},
-    {'name': 'max32', 'uid': '0C81464124010B20FF0A08CC2C'},
-    {'name': 'h743', 'uid': '110018000951383432343236'},
+    {'name': 'k64f', 'uid': 'FFFF1A00FFFFFFFF1031454E0F000280', 'probe': '000621000000'},
+    {'name': 'max32', 'uid': '0C81464124010B20FF0A08CC2C', 'probe': 'E6614C311B597D32'},
+    {'name': 'h743', 'uid': '110018000951383432343236', 'probe': '004C00343137510F39383538'},
     {'name': 'p4', 'uid': 'B-p4', 'flasher': {'name': 'esptool', 'uid': '4ea4f48f', 'args': '-b 1500000'}},
     {'name': 'no_uid', 'uid': 'B-no_uid', 'flasher': {'name': 'jlink', 'args': '-device X'}},
     {'name': 'no_dev', 'uid': 'B-no_dev', 'flasher': {'name': 'jlink', 'uid': '1'}},
@@ -609,7 +609,7 @@ STATE_BOARDS = [
                                                         'args': '-f x.cfg'}},
     {'name': 'twin', 'uid': 'B-twin1', 'flasher': {'name': 'jlink', 'uid': '1', 'args': '-device X'}},
     {'name': 'twin', 'uid': 'B-twin2', 'flasher': {'name': 'jlink', 'uid': '2', 'args': '-device X'}},
-    {'name': 'pico', 'uid': 'E6614C311B764A37'},
+    {'name': 'pico', 'uid': 'E6614C311B764A37', 'probe': 'E6614103E72C1D2F'},
 ]
 
 

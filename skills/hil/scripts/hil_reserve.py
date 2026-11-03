@@ -156,9 +156,9 @@ def _identities(obj, out):
 
 def load_rosters(specs):
     """[(file, selector)] -> {'locks': sorted lock names, 'identities': {identity: {locks}}}.
-    Each entry is resolved through agentrc's board registry (hil_boards), so its probe serial and
-    its board's aliases are identities too. A DUT under two lock names, by its uid or one its
-    registry entry names, is a conflict; any other identity may serve several."""
+    Each entry is resolved through agentrc's board registry (hil_boards), so its probe serial is an
+    identity too. A board under two lock names, by its registered probe or its uid, is a conflict;
+    any other identity may serve several."""
     locks, ids, duts, raw_of = set(), {}, {}, {}
     for path, selector in specs:
         try:
@@ -182,13 +182,11 @@ def load_rosters(specs):
                 e = hil_boards.resolve(e)
             except ValueError as err:
                 raise Refused(f'roster {path}: {err}')
-            found, uid = set(), e['uid']
-            registered = hil_boards.lookup(uid)
-            board = (registered[0] if registered else uid).strip().lower()
-            if duts.setdefault(board, lock) != lock:
-                raise Refused(f'uid {uid} names two boards: {duts[board]} and {lock}')
-            if registered:
-                found |= {a.strip().lower() for a in (registered[0], *registered[1].get('aliases', ()))}
+            for key in ('uid', 'probe'):
+                board = (key, e[key].strip().lower()) if key in e else None
+                if board and duts.setdefault(board, lock) != lock:
+                    raise Refused(f'{key} {board[1]} names two boards: {duts[board]} and {lock}')
+            found = set()
             _identities(e, found)
             for raw in found:
                 i = identity(raw)

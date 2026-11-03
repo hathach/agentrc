@@ -54,10 +54,10 @@ BENCH = [
     {'name': 'stlink_args', 'flasher': {'name': 'stlink', 'uid': '3', 'args': '--connect-under-reset'}},
 ]
 REGISTRY = MODULES['rtt'].hil_boards().registry()
-K64F_UID = next(uid for uid, e in REGISTRY.items() if e['name'] == 'frdm_k64f')
+K64F = next(probe for probe, e in REGISTRY.items() if e['name'] == 'frdm_k64f')
 BOARDS = [{**b, 'uid': f'BENCH-{i}'} for i, b in enumerate(BENCH)] + [
-    {'name': 'frdm_k64f', 'uid': K64F_UID},
-    {'name': 'frdm_k64f_again', 'uid': K64F_UID, 'flasher': REGISTRY[K64F_UID]['flasher']},
+    {'name': 'frdm_k64f', 'uid': 'K64F', 'probe': K64F},
+    {'name': 'frdm_k64f_again', 'uid': 'K64F', 'probe': K64F, 'flasher': {**REGISTRY[K64F]['flasher'], 'uid': K64F}},
 ]
 
 # (board, what the resolver says) - a string is the refusal, a dict the flasher it returns
@@ -65,7 +65,7 @@ RESOLVE_CASES = [
     ('k64f', BENCH[0]['flasher']),
     ('max32', BENCH[1]['flasher']),
     ('h743', BENCH[2]['flasher']),
-    ('frdm_k64f', REGISTRY[K64F_UID]['flasher']),
+    ('frdm_k64f', {**REGISTRY[K64F]['flasher'], 'uid': K64F}),
     ('frdm_k64f_again', "come from agentrc's board registry"),
     ('bare', {'name': 'jlink', 'uid': '77'}),
     ('p4', "flashed over 'esptool', which is no debug-probe route"),
@@ -73,7 +73,7 @@ RESOLVE_CASES = [
     ('blank_uid', "uid must be a non-empty string"),
     ('int_uid', "uid must be a non-empty string"),
     ('no_kind', 'flasher: name None is none of'),
-    ('no_flasher', 'is not in agentrc'),
+    ('no_flasher', 'names neither a registered probe nor a flasher'),
     ('twin', '2 entries of that name'),
     ('absent', '0 entries of that name'),
     ('stlink_args', "a stlink entry's args are not openocd's"),
@@ -160,7 +160,8 @@ class Resolver(Config):
                 self.assertIn(want, str(cm.exception), name)
 
     def test_every_registered_board_resolves_or_is_refused_cleanly(self):
-        self.config.write_text(json.dumps({'boards': [{'name': e['name'], 'uid': uid} for uid, e in REGISTRY.items()]}))
+        self.config.write_text(json.dumps({'boards': [{'name': e['name'], 'uid': f'U{i}', 'probe': probe}
+                                                      for i, (probe, e) in enumerate(REGISTRY.items())]}))
         routes = {}
         for e in REGISTRY.values():
             try:

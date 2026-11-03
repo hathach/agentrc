@@ -793,8 +793,8 @@ def hil_boards():
 
 
 def hil_flasher(path, board):
-    """The `flasher` of one board in a project's HIL config json ({"boards": [{"name", "uid"}]}):
-    its board's in agentrc's registry by uid, or an unregistered bench board's own
+    """The `flasher` of one board in a project's HIL config json ({"boards": [{"name", "uid", "probe"}]}):
+    its probe's in agentrc's registry, or an unregistered bench board's own
     (hil_boards.resolve). Raises ValueError. Kept identical in rtt.py and probe_state.py (see
     rtt.py's module docstring)."""
     try:

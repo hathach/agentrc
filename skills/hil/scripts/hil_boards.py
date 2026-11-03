@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
-"""The farm's board registry (`skills/hil/boards.json`): which debug probe each rig board is
-wired to and how it is driven, keyed by the board's uid. Each board has one probe, so its
-`flasher` and `flasher_recover` are farm facts, not a project's; a project roster names the
-board by `uid` and gets them here. Stdlib only.
+"""The farm's board registry (`skills/hil/boards.json`): how each rig board is flashed, keyed by
+the serial of the debug probe it is wired to. Each board has one probe, so its `flasher` and
+`flasher_recover` are farm facts, not a project's. A project roster names the board by
+`probe` and keeps its own `uid`, the serial its firmware reports, which differs per firmware.
+Stdlib only.
 
-  {"boards": {"<board uid>": {"name": <label>, "aliases": [<uid>, ...],
-                              "flasher": {name, uid, args, vid_pid, verify, note},
-                              "flasher_recover": {name, args, vid_pid, verify, note}}}}
+  {"boards": {"<probe serial>": {"name": <label>,
+                                 "flasher": {name, args, vid_pid, verify, note},
+                                 "flasher_recover": {name, args, vid_pid, verify, note}}}}
 
-`aliases` are the other serials one board reports (each firmware forms its USB serial its own
-way); a uid matches its key or an alias exactly. `name` is a label: rosters keep their own.
+`name` is a label: rosters keep their own.
 
-resolve(entry) is a roster entry with its board's `flasher` (and `flasher_recover`) filled in,
-a new dict. A registered board's entry that carries either itself is refused as a duplicate;
-an unregistered board (a bench board on a dev PC) keeps its own, unless its probe is a
-registered board's. resolve_roster(roster) resolves `boards` and `boards-skip`. Both raise
-ValueError naming every problem.
+resolve(entry) is a roster entry with its board's `flasher` (its `uid` the probe serial) and
+`flasher_recover` filled in, a new dict. An entry with `probe` that also carries either is
+refused as a duplicate; one without `probe` (a bench board on a dev PC) keeps its own, unless
+its probe is a registered board's. resolve_roster(roster) resolves `boards` and `boards-skip`.
+Both raise ValueError naming every problem.
 
   hil_boards.py roster FILE    the resolved roster as JSON (exit 1 refused, 2 usage)
 """
@@ -34,7 +34,7 @@ FILES = ('skills/hil/scripts/hil_load.py', 'skills/hil/scripts/usb_observe.py', 
 PHYSICAL = ('flasher', 'flasher_recover')
 FLASHER_NAMES = ('jlink', 'stlink', 'openocd', 'lm4flash', 'esptool', 'pyocd', 'openocd_esp')
 _FLASHER_KEYS = {'name', 'uid', 'args', 'vid_pid', 'verify', 'note'}
-_ENTRY_KEYS = {'name', 'aliases', *PHYSICAL}
+_ENTRY_KEYS = {'name', *PHYSICAL}
 
 
 def _hil_load():
@@ -62,12 +62,13 @@ def _no_duplicate_keys(pairs):
     return dict(pairs)
 
 
-def flasher_problem(flasher, *, recover=False) -> str:
-    """Why `flasher` is not a well-formed flasher dict, or ''. A recovery flasher has no uid:
-    it reaches the board through the primary's probe."""
+def flasher_problem(flasher, *, has_uid=True) -> str:
+    """Why `flasher` is not a well-formed flasher dict, or ''. A bench board's primary flasher
+    names its probe by `uid`; a recovery flasher reaches the board through the primary's probe,
+    and a registered flasher's probe is its registry key, so neither has one."""
     if not isinstance(flasher, dict):
         return f'not an object: {flasher!r}'
-    extra = set(flasher) - (_FLASHER_KEYS - {'uid'} if recover else _FLASHER_KEYS)
+    extra = set(flasher) - (_FLASHER_KEYS if has_uid else _FLASHER_KEYS - {'uid'})
     if extra:
         return f'unknown key(s) {", ".join(sorted(extra))}'
     if flasher.get('name') not in FLASHER_NAMES:
@@ -75,7 +76,7 @@ def flasher_problem(flasher, *, recover=False) -> str:
     for key in ('uid', 'args', 'vid_pid', 'note'):
         if key in flasher and not (isinstance(flasher[key], str) and flasher[key].strip()):
             return f'{key} must be a non-empty string, got {flasher[key]!r}'
-    if not recover and 'uid' not in flasher:
+    if has_uid and 'uid' not in flasher:
         return 'no uid (the probe serial)'
     if 'vid_pid' in flasher and not usb_observe.valid_vid_pid(flasher['vid_pid']):
         return f'vid_pid must be "0xVVVV 0xPPPP" pairs, got {flasher["vid_pid"]!r}'
@@ -85,37 +86,26 @@ def flasher_problem(flasher, *, recover=False) -> str:
 
 
 def _check(boards: dict, path) -> list:
-    problems, owner, probes = [], {}, []
-    for uid, e in boards.items():
+    problems, probes = [], []
+    for probe, e in boards.items():
+        if not probe.strip():
+            problems.append('an empty probe serial')
+        for other in probes:
+            if usb_observe.jlink_serial_match(probe, other):
+                problems.append(f'{probe}: the same probe as {other}')
+        probes.append(probe)
         if not isinstance(e, dict):
-            problems.append(f'{uid}: not an object')
+            problems.append(f'{probe}: not an object')
             continue
         if set(e) - _ENTRY_KEYS:
-            problems.append(f'{uid}: unknown key(s) {", ".join(sorted(set(e) - _ENTRY_KEYS))}')
+            problems.append(f'{probe}: unknown key(s) {", ".join(sorted(set(e) - _ENTRY_KEYS))}')
         if not (isinstance(e.get('name'), str) and e['name'].strip()):
-            problems.append(f'{uid}: no name')
-        aliases = e.get('aliases', [])
-        if not (isinstance(aliases, list) and all(isinstance(a, str) and a.strip() for a in aliases)):
-            problems.append(f'{uid}: aliases must be a list of non-empty strings')
-            aliases = []
-        for ident in (uid, *aliases):
-            if not ident.strip():
-                problems.append(f'{uid}: an empty board uid')
-            elif ident.casefold() in owner:
-                problems.append(f'{uid}: board uid {ident} is also {owner[ident.casefold()]}\'s')
-            else:
-                owner[ident.casefold()] = uid
+            problems.append(f'{probe}: no name')
         if 'flasher' not in e:
-            problems.append(f'{uid}: no flasher')
+            problems.append(f'{probe}: no flasher')
         for key in PHYSICAL:
-            if key in e and (why := flasher_problem(e[key], recover=key == 'flasher_recover')):
-                problems.append(f'{uid}: {key}: {why}')
-        if isinstance(e.get('flasher'), dict) and isinstance(e['flasher'].get('uid'), str):
-            probe = e['flasher']['uid']
-            for other, serial in probes:
-                if usb_observe.jlink_serial_match(probe, serial):
-                    problems.append(f'{uid}: probe {probe} is also {other}\'s')
-            probes.append((uid, probe))
+            if key in e and (why := flasher_problem(e[key], has_uid=False)):
+                problems.append(f'{probe}: {key}: {why}')
     return [f'{path}: {p}' for p in problems]
 
 
@@ -123,7 +113,7 @@ _cache: dict = {}
 
 
 def registry(path=REGISTRY) -> dict:
-    """{board uid: entry} of the registry at `path`, validated; ValueError naming every problem."""
+    """{probe serial: entry} of the registry at `path`, validated; ValueError naming every problem."""
     path = os.path.realpath(path)
     if path not in _cache:
         try:
@@ -133,20 +123,12 @@ def registry(path=REGISTRY) -> dict:
             raise ValueError(f'board registry {path}: {e}') from e
         boards = doc.get('boards') if isinstance(doc, dict) and set(doc) == {'boards'} else None
         if not isinstance(boards, dict):
-            raise ValueError(f'board registry {path}: expected {{"boards": {{"<board uid>": {{...}}}}}}')
+            raise ValueError(f'board registry {path}: expected {{"boards": {{"<probe serial>": {{...}}}}}}')
         problems = _check(boards, path)
         if problems:
             raise ValueError('; '.join(problems))
         _cache[path] = boards
     return _cache[path]
-
-
-def lookup(uid, path=REGISTRY):
-    """(registered uid, a copy of its entry) for a board uid that is a key or an alias, else None."""
-    for key, e in registry(path).items():
-        if uid == key or uid in e.get('aliases', ()):
-            return key, copy.deepcopy(e)
-    return None
 
 
 def _resolve(entry, path) -> tuple:
@@ -156,24 +138,28 @@ def _resolve(entry, path) -> tuple:
         return None, f'{label}: not an object'
     uid = entry.get('uid')
     if not (isinstance(uid, str) and uid.strip()):
-        return None, f'{label}: no uid (the board serial its probe is registered by)'
-    found = lookup(uid, path)
+        return None, f'{label}: no uid (the serial its firmware reports)'
     inline = [k for k in PHYSICAL if k in entry]
-    if found:
-        key, reg = found
+    if 'probe' in entry:
+        probe = entry['probe']
+        reg = registry(path).get(probe) if isinstance(probe, str) else None
+        if reg is None:
+            return None, f'{label}: probe {probe!r} is not in agentrc\'s board registry'
         if inline:
-            return None, (f'{label}: {" and ".join(inline)} of board {uid} come from agentrc\'s board registry '
+            return None, (f'{label}: {" and ".join(inline)} of probe {probe} come from agentrc\'s board registry '
                           f'({reg["name"]}); drop them from the roster')
-        return {**copy.deepcopy(entry), **{k: reg[k] for k in PHYSICAL if k in reg}}, ''
+        out = copy.deepcopy({**entry, **{k: reg[k] for k in PHYSICAL if k in reg}})
+        out['flasher']['uid'] = probe
+        return out, ''
     if 'flasher' not in entry:
-        return None, f'{label}: board {uid} is not in agentrc\'s board registry and its entry names no flasher'
+        return None, f'{label}: board {uid} names neither a registered probe nor a flasher of its own'
     for key in inline:
-        if why := flasher_problem(entry[key], recover=key == 'flasher_recover'):
+        if why := flasher_problem(entry[key], has_uid=key == 'flasher'):
             return None, f'{label}: {key}: {why}'
     probe = entry['flasher']['uid']
     for key, reg in registry(path).items():
-        if usb_observe.jlink_serial_match(probe, reg['flasher']['uid']):
-            return None, f'{label}: probe {probe} is registered board {key}\'s ({reg["name"]})'
+        if usb_observe.jlink_serial_match(probe, key):
+            return None, f'{label}: probe {probe} is registered ({reg["name"]}): name it as "probe": "{key}" instead'
     return copy.deepcopy(entry), ''
 
 

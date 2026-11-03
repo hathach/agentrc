@@ -221,7 +221,7 @@ records the raw stream on the rig before the board's final park, and `sysview_ci
   the rig roster's "`--force` for v0.1" note predates esptool 5.2.0.
 - The espressif BSP installs no UART driver, so UART0 log writes take the polled VFS path (`espressif.md`, "Console
   perturbation").
-- The registry's `esptool` uid (`skills/hil/boards.json`) is whatever port the rig flashes through: the CP2102N **flasher** serial on the S3 and
+- An `esptool` board's probe serial (its `skills/hil/boards.json` key) is whatever port the rig flashes through: the CP2102N **flasher** serial on the S3 and
   P4 rig boards, never the USB-Serial-JTAG device there; openocd's `adapter serial` is the chip MAC with colons, read
   from the device. carried over (S3/P4 rig boards). On the S31 the flasher port is the USB-Serial-JTAG CDC itself, so
   its uid is the chip MAC with colons, the same string openocd takes. verified 2026-10-14 htpc
