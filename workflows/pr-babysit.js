@@ -99,16 +99,10 @@ if (!deferralsArg.every(deferralShaped) || new Set(deferralsArg.map(d => d.findi
   throw new Error('deferrals must be [{ findingId: "<commentId>#<n>", commentDigest, issueUrl?: "https://github.com/<owner>/<repo>/issues/<n>", reason }], one per finding, ' +
     'no issueUrl being the PR owner\'s decision not to fix it; or [{ issueUrl, reason }], one per out-of-scope topic, holding the findings its issue covers')
 }
-// A workflow-built line names its finding by place: the claim has no length bound.
+// A workflow-built line names its finding by place, never quoting its claim.
 const deferralAnswer = (d) => d.issueUrl ? `Real, and out of this PR's scope: ${d.reason}. Tracked in ${d.issueUrl}.` : `Left as is, by the PR owner's decision: ${d.reason}.`
-// Measured as posted, point by point, never cut: a point over the limit is not posted.
-const REPLY_WORDS = 60, REPLY_LINE_CHARS = 300 // words per point; about 3 rendered lines
-const overLength = (body) => body.split(/\n\s*\n|\n(?=[-*+] )/).some(p => p.split(/\s+/).filter(w => w && !/^[-*+]$/.test(w)).length > REPLY_WORDS) ||
-  body.split('\n').some(l => l.length > REPLY_LINE_CHARS)
-// The place is one word on its own line, the answer an indented line under it: what a launch measures is what a cycle posts.
+// The place on its own line, the answer an indented line under it.
 const deferralPoint = (place, d) => `- ${place}:\n  ${deferralAnswer(d)}`
-const longReasons = deferralsArg.filter(d => overLength(deferralPoint('X', d))).map(d => d.findingId)
-if (longReasons.length) throw new Error(`deferral reason too long for its reply (${REPLY_WORDS} words, a line ${REPLY_LINE_CHARS} characters with the issue URL): ${longReasons.join(', ')}`)
 const FULL_SHA = /^[0-9a-f]{40}$/
 // The caller's verified replies on comments this run handed it, each judged to answer the whole comment at headSha.
 const settlementsArg = args.replySettlements ?? []
@@ -883,11 +877,7 @@ const RECEIPTS = withSeal({
 
 const COVERS = verdictList('findingId', 'string', 'covers', { type: ['boolean', 'null'] })
 
-// A place a launch cannot measure as one short word is named by its finding id.
-const deferralLine = (f) => {
-  const place = `${f.file}:${f.line}`
-  return deferralPoint(/\s/.test(place) || `- ${place}:`.length > REPLY_LINE_CHARS ? f.findingId : place, f.deferral)
-}
+const deferralLine = (f) => deferralPoint(`${f.file}:${f.line}`, f.deferral)
 
 // Across launches only the last cycle's publication outcome is read (pendingOf).
 const history = restored && restored.last ? [restored.last] : []
@@ -1935,8 +1925,8 @@ const answeredByHand = (f) => { const a = answeredWith.get(f.commentId); return 
 
 const publishReplies = async (label, drafts, how, cycle, digestOf) => {
   // A reply that exists with the wrong content, or a draft that cannot be posted, is a repair: the caller's, never answered again on top.
-  const repair = (commentId, replyId, error, draft) => {
-    debtEntry(commentId).repair = { replyId, error: replyId ? error : `no reply posted: ${error}`, ...(draft ? { draft } : {}) }
+  const repair = (commentId, replyId, error) => {
+    debtEntry(commentId).repair = { replyId, error: replyId ? error : `no reply posted: ${error}` }
     log(replyId
       ? `cycle ${cycle}: reply ${replyId} to comment ${commentId} exists with the wrong content (${error}) — handed to the caller, not another reply`
       : `cycle ${cycle}: no reply posted to comment ${commentId} (${error}) — handed to the caller, who checks the thread for an earlier attempt`)
@@ -1949,10 +1939,6 @@ const publishReplies = async (label, drafts, how, cycle, digestOf) => {
     const a = d && d.attempt
     if (a && (a.how !== how || a.digest !== digestOf.get(commentId))) {
       repair(commentId, null, `offered ${a.how} is stale (${a.how !== how ? `now owes a ${how}` : 'comment edited'})`)
-      continue
-    }
-    if (overLength(a ? a.body : body)) {
-      repair(commentId, null, `over length: a point exceeds ${REPLY_WORDS} words or a line ${REPLY_LINE_CHARS} characters`, a ? a.body : body)
       continue
     }
     if (a && a.body !== body) log(`cycle ${cycle}: comment ${commentId} keeps the body already offered, not this cycle's redraft`)
@@ -2611,7 +2597,6 @@ const runLanes = async (cycle, entry, lanes) => {
     const reviewPrompt =
       `Validate the bot review findings on PR #${args.pr} per your procedure. ${IN_CHECKOUT}` +
       `Harvest with exactly \`${PY} ${HARVEST_SCRIPT} --pr ${args.pr} --repo ${shq(repo)} --reviewers ${reviewers.join(',')}${waitedOn.length ? ` --auto-run ${waitedOn.join(',')}` : ''}\`. ` +
-      `A drafted reply is posted only when each point has at most ${REPLY_WORDS} words and no line is over ${REPLY_LINE_CHARS} characters. ` +
       (owedLastCycle.length > 0
         ? 'These comments still owe an answer from an earlier cycle; report every finding on each as its body stands now, ' +
           `those listed by findingId among them, so they can be reconciled: ${JSON.stringify(owedLastCycle)}. ` : '') +
@@ -2853,7 +2838,6 @@ const runLanes = async (cycle, entry, lanes) => {
       if (!d || f.verdict !== 'valid') continue
       if (d.digest !== f.commentDigest) return refusedDeferral(`${f.findingId}: its comment was edited since it was deferred; decide again`)
       f.deferral = { ...(d.issueUrl ? { issueUrl: d.issueUrl } : {}), reason: d.reason }
-      if (overLength(deferralLine(f))) return refusedDeferral(`${f.findingId}: its reply point would exceed ${REPLY_WORDS} words or a line ${REPLY_LINE_CHARS} characters; pass a shorter reason`)
     }
     const deferredOn = (commentId) => r.findings.filter(f => f.deferral && f.commentId === commentId)
     const withDeferred = (commentId, body) => deferredOn(commentId).length
