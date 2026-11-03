@@ -20,11 +20,9 @@ threads (GraphQL addPullRequestReviewThreadReply), an answer only while the thre
 it was judged on and the answer still matches its digest. Nothing is public until the human submits it on
 GitHub, choosing the event; deleting a comment or reply before that declines it. The review is `drafted`.
 
-Text over its length limit, measured here (a comment moved into the body as the line it posts, renderedLine; one
-saved before that form as the whole comment), is never cut: a pending review names it in overLength for the human to
-shorten, and --auto never submits it; an answer counts only where it is published, never under --auto. A body
-line whose first line no check verified (firstLineUnchecked) is named the same way and also holds --auto. Held text
-is measured afresh from the saved draft on every run, so no retry submits it: the pending review is handed over.
+Text is never measured for length. A body line whose first line no check verified (firstLineUnchecked) is named for
+the human to check and holds --auto; it is read afresh from the saved draft on every run, so no retry submits it: the
+pending review is handed over.
 
 --auto takes the same path, refusing APPROVE: the pending review with its fix notes (never its answers), then, while the
 head is still the draft's and every note reads back, a submit with the draft's event (its intent stored first, never
@@ -563,29 +561,6 @@ def publish_draft(repo, pr, led, review, login, recovering, persist):
     return {'status': 'drafted' if done else 'partial' if ok else 'uncertain', 'review': rec['review'], 'staged': staged}
 
 
-# The workflow's limits (workflows/pr-review.js LIMIT), measured again at the gate: a saved draft is not trusted to
-# carry its own marks.
-COMMENT_WORDS, REPLY_WORDS, LINE_CHARS = 80, 60, 300
-
-
-def too_long(text, limit):
-    text = text or ''
-    return len([w for w in text.split() if w not in ('-', '*', '+')]) > limit or any(len(x) > LINE_CHARS for x in text.split('\n'))
-
-
-def over_length(led, review, answers=True):
-    """What is too long for its limit, named for the human to shorten before submitting; a comment moved into the
-    body is measured as the line it posts (renderedLine), or, saved before that form, as the whole comment it posts."""
-    d = review['draft']
-    long = [f"{c['path']}:{c['line']}" for c in d['comments'] + d.get('moved', [])
-            if too_long(c.get('renderedLine', c['body']), COMMENT_WORDS)]
-    long += [f"fix note on {r['findingId']}" for r in d['replies'] if too_long(r['body'], REPLY_WORDS)]
-    if answers:
-        long += [f"answer on {f['id']}" for f, x in answers_of(led, review)
-                 if too_long(x['answer']['body'], REPLY_WORDS)]
-    return list(dict.fromkeys(long))
-
-
 def read_manifest(path, head):
     """--fixed FILE: {"reviewedHead": SHA, "findings": [{id, claimDigest, verdict, checkedSha, note, evidence}]}, each
     row a fix check that verified its finding's repair on `head`."""
@@ -606,8 +581,7 @@ def read_manifest(path, head):
         why = (f"its fix check is {r.get('verdict')!r}, not 'verified'" if r.get('verdict') != 'verified' else
                f"its fix check judged {r.get('checkedSha')}, not the expected head" if r.get('checkedSha') != head else
                'it names no claimDigest' if not r.get('claimDigest') else
-               'its note is not one short line' if not isinstance(note, str) or not note.strip() or '\n' in note.strip()
-               or too_long(fix_body(head, note), REPLY_WORDS) else
+               'its note is not one nonempty line' if not isinstance(note, str) or not note.strip() or '\n' in note.strip() else
                f"its evidence {r.get('evidence')!r} is not a file" if not isinstance(r.get('evidence'), str) or not Path(r['evidence']).is_file()
                else None)
         if why:
@@ -793,8 +767,8 @@ def collect(argv):
             declined(led, review, a.reason)
             persist()
             return {'status': 'declined', 'review': None}
-        long, unchecked = over_length(led, review, answers=not a.auto), first_line_unchecked(review)
-        named = {'overLength': long, 'firstLineUnchecked': unchecked}
+        unchecked = first_line_unchecked(review)
+        named = {'firstLineUnchecked': unchecked}
         handed = (review['receipts'].get('review') or {}).get('handedOver')
         if a.auto and handed:
             return {'status': review['status'], 'review': review['receipts']['review'], 'handedOver': handed, **named}
@@ -804,10 +778,8 @@ def collect(argv):
         event = review['draft']['event']
         if a.auto and event == 'APPROVE':
             raise Unusable('auto-post never approves; publish it without --auto for the human to submit')
-        # Measured from the saved draft, which never changes, so every run and retry holds the same text.
-        hold = '; '.join(why for why in (
-            long and f"over-length text for the human to shorten ({', '.join(long)})",
-            unchecked and f"comments whose first line no check verified ({', '.join(unchecked)})") if why)
+        # Read from the saved draft, which never changes, so every run and retry holds the same text.
+        hold = f"comments whose first line no check verified ({', '.join(unchecked)})" if unchecked else ''
         rec = review['receipts']
         sent = bool((rec.get('review') or {}).get('sent')) and not (rec.get('review') or {}).get('verified')
         head = pr_head(repo, a.pr)
@@ -822,8 +794,7 @@ def collect(argv):
         answers = [p for p in review.get('answerPublications', []) if p.get('auto') and p['status'] in DRAFTS]
         if answers and review['status'] == 'posted' and not recovering:
             out['answers'] = ({'status': 'deferred'} if a.defer_answers else
-                              {**publish_draft(repo, a.pr, led, answers[-1], login, False, persist),
-                               'overLength': over_length(led, answers[-1])})
+                              publish_draft(repo, a.pr, led, answers[-1], login, False, persist))
         return out
 
 
