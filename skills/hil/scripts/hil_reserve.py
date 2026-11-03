@@ -181,7 +181,7 @@ def load_rosters(specs):
                 lock = hil_boards.lock_name(e, None if own is _ABSENT else own)
             except ValueError as err:
                 raise Refused(f'roster {path}: {err}')
-            if not isinstance(lock, str) or not LOCK_NAME_RE.match(lock):
+            if not LOCK_NAME_RE.match(lock):
                 raise Refused(f'roster {path}: {e["name"]}: lock name {lock!r} is not a plain file name')
             locks.add(lock)
             try:
