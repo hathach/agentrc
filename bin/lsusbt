@@ -11,10 +11,9 @@
 # uids recorded in a boards JSON (default: $HOME/code/tinyusb/test/hil/tinyusb.json).
 # A serial matching a board's `uid` is that board acting as a USB device; one
 # matching its `flasher.uid` (agentrc's board registry gives it) is that board's
-# flasher/debugger. Matches append
-# `<board> device` or `<board> flasher`. A `uid` is the serial that project's
-# firmware reports: label a board running another project's firmware with that
-# project's JSON.
+# flasher/debugger. Matches append `<board> device` or `<board> flasher`. A `uid`
+# is the serial that project's firmware reports: label a board running another
+# project's firmware with that project's JSON.
 #
 # By default only the lines that resolved to a board are printed, plus root hubs and
 # hubs so the surviving lines keep their bus/port context; -v prints the whole tree.

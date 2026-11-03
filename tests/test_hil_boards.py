@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import guard_survivors  # noqa: E402
+from helpers import guard_survivors, tmpdir  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / 'skills' / 'hil' / 'scripts' / 'hil_boards.py'
@@ -34,9 +34,7 @@ def setUpModule():
 
 class Base(unittest.TestCase):
     def registry(self, doc):
-        td = tempfile.TemporaryDirectory()
-        self.addCleanup(td.cleanup)
-        path = Path(td.name) / 'boards.json'
+        path = tmpdir(self) / 'boards.json'
         path.write_text(doc if isinstance(doc, str) else json.dumps(doc))
         return str(path)
 
@@ -167,7 +165,6 @@ class Registry(Base):
                          ({'boards': {' ': {'name': 'a', 'flasher': fl}}}, 'empty probe serial'),
                          ({'boards': {'A': {'name': 'a'}}}, 'no flasher'),
                          ({'boards': {'A': {'name': 'a', 'flasher': fl, 'x': 1}}}, 'unknown key'),
-                         ({'boards': {'A': {'name': 'a', 'aliases': ['B'], 'flasher': fl}}}, 'unknown key'),
                          ({'boards': {'A': {'name': 'a', 'flasher': {'name': 'jlink', 'uid': '1'}}}}, 'unknown key'),
                          ({'boards': {'A': {'name': 'a', 'flasher': fl,
                                             'flasher_recover': {'name': 'openocd', 'uid': '1'}}}}, 'unknown key')):

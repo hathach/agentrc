@@ -14,9 +14,8 @@ lacks it (tinyuf2: `tinyuf2.lock`; tinyusb: the default, `name`). A registered e
 SELECTOR field names another lock is refused. Identities are every `uid`, `uart_uid` and
 `serial` string in an entry, compared in the form udev's usb_id gives a serial (whitespace
 runs and unsafe characters as `_`), case-insensitively; two roster identities that become one
-that way are refused. The
-contract's Hosts/rosters is the roster list: the check refuses what the rosters do not
-explain, it never infers an inventory.
+that way are refused. The contract's Hosts/rosters is the roster list: the check refuses what
+the rosters do not explain, it never infers an inventory.
 
 check (read-only, exit 0 covered / 1 refused / 2 usage): walks the device directories under
 the busport's root port (`--scope hub`: its parent hub, which hub-cycle uses) twice within
@@ -179,15 +178,12 @@ def load_rosters(specs):
                 raise Refused(f'roster {path}: {e["name"]}: lock name {own!r} is not a plain file name')
             try:
                 lock = hil_boards.lock_name(e, None if own is _ABSENT else own)
-            except ValueError as err:
-                raise Refused(f'roster {path}: {err}')
-            if not LOCK_NAME_RE.match(lock):
-                raise Refused(f'roster {path}: {e["name"]}: lock name {lock!r} is not a plain file name')
-            locks.add(lock)
-            try:
+                if not LOCK_NAME_RE.match(lock):
+                    raise Refused(f'roster {path}: {e["name"]}: lock name {lock!r} is not a plain file name')
                 e = hil_boards.resolve(e)
             except ValueError as err:
                 raise Refused(f'roster {path}: {err}')
+            locks.add(lock)
             uid = e['uid'].strip().lower()
             if duts.setdefault(uid, lock) != lock:
                 raise Refused(f'uid {uid} names two boards: {duts[uid]} and {lock}')

@@ -20,6 +20,7 @@ Both raise ValueError naming every problem. lock_name(entry, own) is an entry's 
 
   hil_boards.py roster FILE         the resolved roster as JSON (exit 1 refused, 2 usage)
   hil_boards.py lock FILE BOARD     the board lock of FILE's entry named BOARD, boards-skip included
+                                    (lock_name without `own`: a project lock field is not read)
 """
 
 from __future__ import annotations
