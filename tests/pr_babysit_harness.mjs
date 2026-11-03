@@ -6850,6 +6850,9 @@ test('incomplete or inconsistent hook evidence admits nothing and commits nothin
     // hooks.py never excuses a hook that rewrote files, nor an id the commit's SKIP cannot name
     [b => gen(b, { passed: false, failed: [{ hook: 'gen-doc', error: 'x' }], baselineFailed: ['gen-doc'] }), /excused hook\(s\) modified files or cannot be skipped: gen-doc/],
     [{ passed: false, failed: [{ hook: 'a,b', error: 'x' }], baselineFailed: ['a,b'] }, /excused hook\(s\) modified files or cannot be skipped: a,b/],
+    // SKIP strips each id and drops an empty one; only the offending id is named
+    [{ passed: false, failed: [{ hook: '', error: 'x' }], baselineFailed: [''] }, /excused hook\(s\) modified files or cannot be skipped: $/],
+    [{ passed: false, failed: [{ hook: 'ok', error: 'x' }, { hook: ' a', error: 'x' }], baselineFailed: ['ok', ' a'] }, /excused hook\(s\) modified files or cannot be skipped:  a$/],
   ]) {
     const { result, labels } = await run({ ...publishing, hooks })
     assert.match(result.history[0].reviewPushFailed.detail, expected)
@@ -6883,11 +6886,15 @@ test('a failure no hook owns, and hook output the excused hooks never judged, ar
   assert.equal(named.result.history[0].reviewPushFailed.detail, 'the repository hooks do not pass on the fix, and pre-commit named no failing hook')
   // hooks.py's own entry when the run without the excused failed naming no hook: the cause, not the excused hook
   const unowned = { hook: '(pre-commit)', error: 'pre-commit exited 1 with unit-test skipped, naming no hook' }
-  const { result } = await run({ ...publishing, hooks: { passed: false, failed: [{ hook: 'unit-test', error: 'x' }, unowned], baselineFailed: ['unit-test'] } })
-  assert.equal(result.history[0].reviewPushFailed.detail, `the repository hooks do not pass on the fix: (pre-commit): ${unowned.error}`)
-  const generated = await run({ ...publishing, hooks: b => gen(b, { passed: false, failed: [{ hook: 'unit-test', error: 'x' }], baselineFailed: ['unit-test'] }) })
+  const unowning = await run({ ...publishing, hooks: { passed: false, failed: [{ hook: 'unit-test', error: 'x' }, unowned], baselineFailed: ['unit-test'] } })
+  assert.equal(unowning.result.history[0].reviewPushFailed.detail, `the repository hooks do not pass on the fix: (pre-commit): ${unowned.error}`)
+  const excusedGen = b => gen(b, { passed: false, failed: [{ hook: 'unit-test', error: 'x' }], baselineFailed: ['unit-test'] })
+  const generated = await run({ ...publishing, hooks: excusedGen })
   assert.equal(generated.result.history[0].reviewPushFailed.detail, 'hook output outside the fix scope, never judged by the excused hook(s) unit-test: docs/boards.rst')
-  for (const r of [named, generated]) assert.ok(!r.labels.some(l => l.startsWith('commit#')))
+  // a protected path is named as such, excused hooks or not
+  const guarded = await run({ ...publishing, args: { ...publishing.args, protected: '^docs/' }, hooks: excusedGen })
+  assert.equal(guarded.result.history[0].reviewPushFailed.detail, 'a hook regenerated a protected path: docs/boards.rst')
+  for (const r of [named, unowning, generated, guarded]) assert.ok(!r.labels.some(l => l.startsWith('commit#')))
 })
 
 test('a commit whose content differs from what the hooks left is never pushed', async () => {
