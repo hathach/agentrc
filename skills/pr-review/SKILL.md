@@ -49,8 +49,8 @@ unchanged, `same` when this head was reviewed already. On `same`, launch in
 with the request's words as `--reason`. Under `auto-fix`, prepare's
 `repair.submittedReview` names our review submitted on this head, the human's
 submit included: the run repairs from it (§4 step 6) without reviewing the head
-again. With `deferredAnswers`, the answers an earlier auto-fix deferred on it,
-the discussion is skipped, since that run judged its pushback. A null
+again. When prepare's line has `deferredAnswers`, the answers an earlier
+auto-fix deferred on it, the discussion is skipped, since that run judged its pushback. A null
 `submittedReview` repairs nothing, for `repair.submittedWhy`; `auto-fix full`
 reviews the head again and repairs from that review. An `overCap` answer merged
 everything into one group: report it and launch.
@@ -188,7 +188,7 @@ sequence:
    or {choice: 'boards', boards: [rows]}, hardwareRelevant, autoPost,
    dimensions?}` (`mode: 'discussion'` for prepare's `same`). `dimensions`
    comes from the project's instruction file when it names review dimensions.
-   Under auto-fix with prepare's `deferredAnswers`, steps 3 to 5 are skipped
+   Under auto-fix, when prepare's line has `deferredAnswers`, steps 3 to 5 are skipped
    and step 6 starts from `submittedReview`.
 4. `result.py --output <the launch's output file>`; when its `status` is
    `reviewed`, `ledger.py save --pr N --output <it>`. Any other status saves
@@ -258,6 +258,8 @@ sequence:
    HIL rows, the receipts, `post.py`'s `firstLineUnchecked`
    and the result's `heldThreads`; never the draft's text. Under auto-fix also the repair state,
    whether the repair took this run's review or reused submitted review `submittedReview.reviewId`,
+   the answers the closing plain `post.py` skipped as stale and the pending review it left, which blocks
+   the next run until the human settles it,
    the held findings, the repair and pr-babysit receipts, the `--fixed`
    receipts, the recheck's post,
    and the review state GitHub shows (`gh pr view N --json
