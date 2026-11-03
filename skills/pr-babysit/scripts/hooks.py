@@ -21,10 +21,12 @@ failed and baselineFailed explain a failure: failed, {hook, error} for each hook
 the first pass's last run failed, error its first output line; and
 baselineFailed, the ids among those that, rerun alone in a detached worktree of
 HEAD on the same PATHs, fail there with the same output (comparable: its lines
-in any order, the tree's path read as the checkout's, durations and temporary
-names masked), so they are no evidence against the change (#378). A hook
-that ever modified files is never rerun there, nor one whose id SKIP cannot
-name, and each rerun gets a clean HEAD tree. The tree has only what HEAD
+in any order, the tree's path read as the checkout's, times, durations, worker
+numbers and temporary names masked), so they are no evidence against the change
+(#378). A hook that ever modified files is never rerun there, nor one whose id
+SKIP cannot name or another hook in the config takes as its alias (SKIP skips
+that hook too), nor any when the config cannot be read or PyYAML is missing;
+each rerun gets a clean HEAD tree. The tree has only what HEAD
 tracks: a hook that needs the checkout's ignored files (fetched dependencies)
 fails there differently and stays counted. A change that leaves a hook's
 output the same once masked is still excused: a hook that prints only a count
@@ -33,9 +35,9 @@ it only in numbers; CI runs the hook on the pushed head. When every failure is
 excused, the hooks run once more on the change, with its retry, and SKIP naming
 the excused ones, as the commit will, so a fail_fast stop cannot hide a hook
 the change breaks: what fails there joins failed, and a failed run that names
-no hook adds the failure `(pre-commit)`. SKIP also skips a hook whose alias is
-an excused id, there and at the commit, so such a hook may go unrun on the
-change until CI. pre-commit runs with core.abbrev pinned (#377), which the
+no hook adds the failure `(pre-commit)`. An alias only a remote repository's
+own manifest declares is not seen, so such a hook may go unrun on the change
+until CI. pre-commit runs with core.abbrev pinned (#377), which the
 hooks' own git commands inherit.
 Exit 0 with that line; exit 2 with {"error": ...} when the facts cannot be
 collected or pre-commit's output contradicts its exit status.
@@ -56,6 +58,11 @@ from facts import Unusable, checkout_top, git, report, status  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
 import windows  # noqa: E402
 
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
 CONFIG = '.pre-commit-config.yaml'
 DEADLINE = 540
 HOOK_ID = '- hook id: '
@@ -70,10 +77,13 @@ ERROR_CHARS = 200
 CLEANUP = 20
 # The failure a run that failed naming no hook adds: not a hook id, so never excused or skipped.
 UNOWNED = '(pre-commit)'
-# What differs between two runs of the same failure: a number standing alone (a duration with its unit, a line
-# number, a count, a pid, an address), or a name tempfile made. A digit inside a word (usb2.c, E501) names a file,
-# rule or symbol, so it stays.
-VARYING = re.compile(r'\b(?:0x[0-9a-fA-F]+|\d+(?:\.\d+)*(?:[mµun]?s)?)\b|\btmp\w{8}\b')
+# What differs between two runs of the same failure: a number standing alone (a duration with its units, a line
+# number, a count, a pid, an address), an ISO 8601 time, a pytest-xdist worker's number, or a name tempfile, mktemp
+# or gcc made. Any other digit inside a word (usb2.c, E501) names a file, rule or symbol, so it stays.
+UNIT = r'(?:[hm]|min|sec|[mµun]?s)'
+VARYING = re.compile(r'\b\d{4}-\d\d-\d\dT\d\d:\d\d(?::\d\d(?:[.,]\d+)?)?Z?'
+                     rf'|\b(?:0x[0-9a-fA-F]+|\d+(?:\.\d+)*(?:{UNIT}(?:\d+(?:\.\d+)?{UNIT})*)?)\b|(?<=\[gw)\d+(?=\])'
+                     r'|\btmp(?:\w{8}|\.[A-Za-z0-9]{10})\b|(?<=[/\\])cc(?![a-z]{6})[A-Za-z0-9]{6}(?=\.)')
 
 
 def status_paths(records):
@@ -245,10 +255,24 @@ def as_checkout(text, root):
 
 def comparable(text, root):
     """What of a hook's output its HEAD rerun must repeat: its lines, in any order (a parallel runner's), with root
-    read as the checkout and each number standing alone (a duration, a line number, a count) and tempfile's names
-    masked. A violation the change adds is a line more."""
+    read as the checkout and what VARYING names masked: each number standing alone (a duration, a line number, a
+    count), a time, a pytest-xdist worker's number and a temporary file's name. A violation the change adds is a
+    line more."""
     lines = (VARYING.sub('#', line).strip() for line in as_checkout(text, root).splitlines())
     return sorted(line for line in lines if line)
+
+
+def aliases():
+    """Each alias the config gives a hook under another id, or None when the config cannot be read: SKIP naming it
+    skips that hook too (pre-commit's commands/run.py)."""
+    if yaml is None:
+        return None
+    try:
+        config = yaml.safe_load(Path(CONFIG).read_text(encoding='utf-8'))
+        return {h['alias'] for repo in config['repos'] for h in repo['hooks']
+                if h.get('alias') not in (None, '', h['id'])}
+    except (OSError, ValueError, yaml.YAMLError, KeyError, TypeError, AttributeError):
+        return None
 
 
 def registration(tree):
@@ -334,10 +358,11 @@ def run_hooks(paths, deadline=DEADLINE):
     start = time.monotonic()
     code, ids, failures = passes(paths, deadline, start, 'run')
     # A hook that rewrote files is judged by what it wrote, never excused by HEAD; nor is an id SKIP cannot name,
-    # which the commit could not skip.
+    # which the commit could not skip, or one whose SKIP would also skip another hook, unrun on the change.
+    aliased = aliases()
     expected = {}
     for f in failures:
-        if f['hook'] not in ids and ',' not in f['hook']:
+        if aliased is not None and f['hook'] not in {*ids, *aliased} and ',' not in f['hook']:
             expected.setdefault(f['hook'], []).append(comparable(f['output'], os.getcwd()))
     excused = baseline(expected, paths, deadline, start) if expected else []
     if excused and {f['hook'] for f in failures} <= set(excused):

@@ -316,6 +316,18 @@ class HooksTest(unittest.TestCase):
         self.assertEqual(out['failed'], [{'hook': 'broken', 'error': 'nope'}, {'hook': 'picky', 'error': 'a.txt'}])
         self.assertEqual(out['baselineFailed'], ['broken'])
 
+    def test_an_id_another_hook_takes_as_its_alias_is_never_excused(self):
+        # SKIP=broken would skip picky too (pre-commit matches aliases), and fail_fast stopped the run before it.
+        picky = HOOK.format(id='picky') + '    alias: broken\n'
+        (self.repo / '.pre-commit-config.yaml').write_text(
+            'fail_fast: true\n' + CONFIG.format(HOOK.format(id='broken') + picky))
+        self.configure()
+        (self.repo / 'a.txt').write_text('bad\n')
+        code, out = self.run_script('a.txt')
+        self.assertEqual((code, out['passed']), (0, False))
+        self.assertEqual(out['failed'], [{'hook': 'broken', 'error': 'nope'}])
+        self.assertEqual(out['baselineFailed'], [])
+
     def test_a_hook_the_change_breaks_passes_on_head(self):
         self.configure('picky')
         (self.repo / 'a.txt').write_text('bad\n')
@@ -575,6 +587,15 @@ class RunHooksTest(unittest.TestCase):
             ran, passed, ids, failures, excused = hooks.run_hooks(['a.txt'])
         self.assertEqual((ids, [f['hook'] for f in failures], excused), (['fmt'], ['broken'], ['broken']))
 
+    def test_nothing_is_rerun_on_head_when_the_config_cannot_be_read(self):
+        # Its aliases unknown, SKIP could skip a hook that never ran on the change.
+        Path(hooks.CONFIG).write_text('repos: [\n')
+        with mock.patch.object(hooks, 'pre_commit', return_value=(1, self.BROKEN)), \
+                mock.patch.object(hooks, 'baseline') as baseline:
+            *_, excused = hooks.run_hooks(['a.txt'])
+        baseline.assert_not_called()
+        self.assertEqual(excused, [])
+
     def test_an_id_skip_cannot_name_is_never_rerun_on_head(self):
         out = self.BROKEN.replace('broken', 'a,b')
         with mock.patch.object(hooks, 'pre_commit', return_value=(1, out)), \
@@ -605,8 +626,23 @@ class AsCheckoutTest(unittest.TestCase):
         self.assertEqual(hooks.comparable('a.c:12:3: E501 in 0.5s (pid 4242) at 0x7f00ab\n', '/x'),
                          hooks.comparable('a.c:14:9: E501 in 125ms (pid 77) at 0x7f11cd\n', '/x'))
         for head, change in (('usb2.c:1: bad\n', 'cdc1.c:1: bad\n'), ('a.c:1: E501 bad\n', 'a.c:1: E502 bad\n'),
-                             ('a.c:1: x1 unused\n', 'a.c:1: x2 unused\n')):
+                             ('a.c:1: x1 unused\n', 'a.c:1: x2 unused\n'),
+                             ('src/ccdriver.c: bad\n', 'src/ccsensor.c: bad\n'),
+                             ('gw1 unused\n', 'gw2 unused\n'),
+                             ('a.c:1: v2m bad\n', 'a.c:1: v3m bad\n')):
             self.assertNotEqual(hooks.comparable(head, '/x'), hooks.comparable(change, '/x'), change)
+
+    def test_times_compound_durations_worker_numbers_and_tool_temp_names_are_masked(self):
+        # Run-varying words that hold a digit: an ISO time, 3m12s, pytest-xdist's [gwN] failure header, gcc's and
+        # mktemp's temporary names.
+        for head, change in (('at 2026-11-03T12:34:56Z\n', 'at 2026-11-04T01:02:03.250Z\n'),
+                             ('at 2026-11-03T12:34:56+07:00\n', 'at 2026-11-03T12:35:07+07:00\n'),
+                             ('took 3m12s\n', 'took 4m01s\n'), ('took 12.5sec\n', 'took 9.1sec\n'),
+                             ('[gw0] linux -- Python 3.12.3 /usr/bin/python\n',
+                              '[gw3] linux -- Python 3.12.3 /usr/bin/python\n'),
+                             ('/tmp/ccAb12Cd.o: undefined reference\n', '/tmp/cco1y76V.o: undefined reference\n'),
+                             ('/tmp/tmp.Ab3dE5fG7h: denied\n', '/tmp/tmp.yiJuMi1EqI: denied\n')):
+            self.assertEqual(hooks.comparable(head, '/x'), hooks.comparable(change, '/x'), change)
 
 
 class ResultsTest(unittest.TestCase):
