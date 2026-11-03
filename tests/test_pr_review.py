@@ -2051,33 +2051,33 @@ class Pushback(PostCase):
         with self.assertRaisesRegex(facts.Unusable, '--defer-answers goes with --auto'):
             self.post('--defer-answers')
 
-    def deferred(self):
-        """Our review submitted on the head by an auto-fix run, its answer to the contributor's pushback deferred."""
+    def upheld_again(self, *extra, comments=()):
+        """A second review of the head, pr7-f1 upheld on the contributor's pushback with an answer, plus `extra` findings
+        and their `comments`."""
         rec = self.dispute('upheld', {'body': 'Still stands.', 'resolve': False})
         self.comment(950, 'contrib', 'intentional')
-        self.save(self.result_for(self.p, findings=[{'id': 'pr7-f1', 'status': 'upheld', 'disputes': [rec]},
-                                                    {'file': 'src/core/a.c', 'line': 1, 'why': 'a shadows a global', 'severity': 'medium',
-                                                     'dimension': 'correctness', 'status': 'open'}],
-                                  draft={'event': 'COMMENT', 'body': 'Again.', 'replies': [],
-                                         'comments': [{'path': 'src/core/a.c', 'line': 1, 'body': 'a shadows a global', 'finding': 1}]}),
-                  reason='again')
+        self.save(self.result_for(self.p, findings=[{'id': 'pr7-f1', 'status': 'upheld', 'disputes': [rec]}, *extra],
+                                  draft={'event': 'COMMENT', 'body': 'Again.', 'comments': list(comments), 'replies': []}), reason='again')
+
+    def deferred(self):
+        """Our review submitted on the head by an auto-fix run, its answer to the contributor's pushback deferred."""
+        self.upheld_again({'file': 'src/core/a.c', 'line': 1, 'why': 'a shadows a global', 'severity': 'medium',
+                           'dimension': 'correctness', 'status': 'open'},
+                          comments=[{'path': 'src/core/a.c', 'line': 1, 'body': 'a shadows a global', 'finding': 1}])
         self.assertEqual(self.post('--auto', '--defer-answers')['answers'], {'status': 'deferred'})
 
     def test_auto_fix_on_the_same_head_reuses_our_submitted_review_and_lets_its_deferred_answers_wait(self):
         self.deferred()
         p = self.prepare('--auto-fix')
         rid = self.review()['receipts']['review']['reviewId']
-        self.assertEqual((p['mode'], p['repair']['submittedReview'], p['repair']['submittedWhy'], p['deferredAnswers']),
-                         ('same', {'head': self.head, 'reviewId': rid}, None, 1))
+        self.assertEqual((p['mode'], p['repair']['submittedReview'], p['repair']['deferredAnswers']), ('same', rid, 1))
+        self.assertNotIn('submittedWhy', p['repair'])
         with self.assertRaisesRegex(facts.Unusable, 'a pending draft'):
             self.prepare()
-        good = self.led()
-        bundle = good['reviews'][-1]['answerPublications'][0]
-        not_auto, sent, two = (json.loads(json.dumps(good)) for _ in range(3))
+        not_auto, sent, two, other = (self.led() for _ in range(4))
         not_auto['reviews'][-1]['answerPublications'][0]['auto'] = False
         sent['reviews'][-1]['answerPublications'][0]['receipts'] = {'answer': {'sent': True}}
-        two['reviews'][-1]['answerPublications'].append({**bundle, 'auto': False})
-        other = json.loads(json.dumps(good))
+        two['reviews'][-1]['answerPublications'].append({**two['reviews'][-1]['answerPublications'][0], 'auto': False})
         other['reviews'][0].setdefault('answerPublications', []).append(other['reviews'][-1]['answerPublications'].pop())
         for name, led in (('not auto', not_auto), ('sent', sent), ('two bundles', two), ("another review's", other)):
             Path(self.p['ledger']).write_text(json.dumps(led))
@@ -2098,10 +2098,7 @@ class Pushback(PostCase):
         self.assertEqual([d['findingId'] for d in self.disputes(snap)], ['pr7-f1'], 'the newer reply waits for its judgment')
 
     def test_auto_fix_reuses_a_handed_over_review_once_the_human_submitted_it(self):
-        rec = self.dispute('upheld', {'body': 'Still stands.', 'resolve': False})
-        self.comment(950, 'contrib', 'intentional')
-        self.save(self.result_for(self.p, findings=[{'id': 'pr7-f1', 'status': 'upheld', 'disputes': [rec]}],
-                                  draft={'event': 'COMMENT', 'body': 'Again.', 'comments': [], 'replies': []}), reason='again')
+        self.upheld_again()
         self.crash_at('POST')
         with self.assertRaises(KeyboardInterrupt):
             self.post('--auto', '--defer-answers')
@@ -2111,7 +2108,8 @@ class Pushback(PostCase):
             self.prepare('--auto-fix')
         self.gh.submit(self.review()['receipts']['review']['reviewId'])
         p = self.prepare('--auto-fix')
-        self.assertEqual((p['mode'], p['repair']['submittedReview']['head'], p['deferredAnswers']), ('same', self.head, 1))
+        self.assertEqual((p['mode'], p['repair']['submittedReview'], p['repair']['deferredAnswers']),
+                         ('same', self.review()['receipts']['review']['reviewId'], 1))
         out = self.post()
         self.assertEqual([(e['kind'], e['state']) for e in out['staged']], [('answer', 'staged')], 'plain post.py still publishes them')
 
@@ -2121,13 +2119,10 @@ class Pushback(PostCase):
         p = self.prepare('--auto-fix')
         self.assertEqual((p['mode'], p['repair']['submittedReview']), ('same', None))
         self.assertRegex(p['repair']['submittedWhy'], 'not one submitted on')
-        self.assertNotIn('deferredAnswers', p)
+        self.assertNotIn('deferredAnswers', p['repair'])
 
     def test_deferred_answers_leave_the_recheck_free_and_are_judged_again_on_the_repaired_head(self):
-        rec = self.dispute('upheld', {'body': 'Still stands.', 'resolve': False})
-        self.comment(950, 'contrib', 'intentional')
-        self.save(self.result_for(self.p, findings=[{'id': 'pr7-f1', 'status': 'upheld', 'disputes': [rec]}],
-                                  draft={'event': 'COMMENT', 'body': 'Again.', 'comments': [], 'replies': []}), reason='again')
+        self.upheld_again()
         self.assertEqual(self.post('--auto', '--defer-answers')['answers'], {'status': 'deferred'})
         self.commit('src/core/c.c', 'int c;\n', 'repair')
         self.head = self.push_pr()
