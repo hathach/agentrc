@@ -1,6 +1,7 @@
 """Tests for pr-review's scripts: real git in temporary repositories, a fake GitHub behind gh."""
 import contextlib
 import errno
+import hashlib
 import importlib.util
 import json
 import os
@@ -789,6 +790,14 @@ class Ledger(Case):
         self.commit('src/core/a.c', 'int a;\n' * 20 + 'int b;\n', 'b')
         self.push_pr()
         self.p = self.prepare()
+
+    def test_snapshot_of_an_empty_ledger_holds_nothing_standing(self):
+        snap = self.tmp / 'threads.json'
+        snap.write_text(json.dumps({'repo': REPO, 'pr': PR, 'comments': [], 'threads': []}))
+        manifest = self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--threads', str(snap), '--head', self.p['head'],
+                                      '--snapshot', str(self.tmp)])
+        self.assertEqual(json.loads(Path(manifest['file']).read_bytes()), {'reviews': 0, 'last': None, 'open': [],
+                                                                              'disputes': []})
 
     def test_save_refuses_a_word_off_the_scale_before_anything_is_stored(self):
         for word in ('major', 'severe', None):
@@ -1756,6 +1765,65 @@ class Pushback(PostCase):
             self.call(ledger, [*show, '--threads', str(snap), '--head', self.head[:12]])
         with self.assertRaisesRegex(facts.Unusable, 'needs --threads'):
             self.call(ledger, [*show, '--head', self.head])
+
+    def test_snapshot_writes_the_workflows_view_to_a_content_named_file_and_prints_its_manifest(self):
+        snap = self.snapshot((950, 'contrib', 'intentional', False))
+        show = ['show', '--pr', str(PR), '--repo', REPO, '--threads', str(snap), '--head', self.head]
+        where = self.tmp / 'facts-snap'
+        where.mkdir()
+        manifest = self.call(ledger, [*show, '--snapshot', str(where)])
+        payload = Path(manifest['file']).read_bytes()
+        self.assertTrue(payload.isascii())
+        plain = self.call(ledger, show)
+        view = {k: v for k, v in plain.items() if k not in ('ledger', 'answers')}
+        view['open'] = [{k: v for k, v in f.items() if k not in ('impact', 'severityReason')} for f in plain['open']]
+        self.assertEqual(json.loads(payload), view, 'the plain answer less what the workflow never reads')
+        self.assertEqual((len(view['open']), len(view['disputes'])), (1, 1))
+        self.assertEqual(Path(manifest['file']).name, f"ledger-{hashlib.sha256(payload).hexdigest()}.json")
+        self.assertEqual(manifest, {'repo': REPO, 'pr': PR, 'head': self.head, 'file': manifest['file'],
+                                    'digest': facts.fnv1a(payload.decode()), 'length': len(payload)})
+        Path(manifest['file']).write_bytes(payload + b' ')
+        self.assertEqual(self.call(ledger, [*show, '--snapshot', str(where)]), manifest, 'a rerun names the same file')
+        self.assertEqual(Path(manifest['file']).read_bytes(), payload, 'and writes it anew, so a damaged one is repaired')
+        changed = self.snapshot((950, 'contrib', 'intentional, see line 3', False))
+        later = self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--threads', str(changed), '--head', self.head,
+                                   '--snapshot', str(where)])
+        self.assertNotEqual(later['file'], manifest['file'])
+        self.assertEqual(Path(manifest['file']).read_bytes(), payload, 'a later answer leaves the earlier file as it was')
+        with self.assertRaisesRegex(facts.Unusable, 'is not a directory'):
+            self.call(ledger, [*show, '--snapshot', str(where / 'missing')])
+        for bad in (['show', '--pr', str(PR), '--repo', REPO, '--threads', str(snap)],
+                    [*show, '--fixable']):
+            with self.assertRaisesRegex(facts.Unusable, '--snapshot needs --threads and --head, and not --fixable'):
+                self.call(ledger, [*bad, '--snapshot', str(where)])
+
+    def test_a_finding_read_back_from_the_snapshot_saves_with_its_whole_text(self):
+        path = Path(self.p['ledger'])
+        led = json.loads(path.read_text())
+        text = {'why': 'b is read before set — “é” \\ "q" ' * 40, 'severityReason': 'graded ✓ ' * 30,
+                'impact': {'consequence': 'wrong data ' * 50, 'path': 'p', 'recovery': 'r', 'variants': 'v'}, 'confidence': 'high'}
+        led['reviews'][0]['findings'][0].update(text)
+        path.write_text(json.dumps(led))
+        snap = self.snapshot((950, 'contrib', 'intentional', False))
+        manifest = self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--threads', str(snap), '--head', self.head,
+                                      '--snapshot', str(snap.parent)])
+        row = json.loads(Path(manifest['file']).read_bytes())['open'][0]
+        self.assertEqual((row['why'], row['confidence']), (text['why'], text['confidence']))
+        self.assertFalse({'impact', 'severityReason'} & set(row))
+        grade = {k: row[k] for k in ('severity', 'confidence')}  # the workflow's gradeOf(f), its absent members dropped
+        self.save(self.result_for(self.p, mode='discussion', findings=[{'id': row['id'], 'status': 'upheld', **grade,
+                                                                        'disputes': [self.dispute('upheld')]}]))
+        self.assertEqual({k: self.finding()[k] for k in text}, text, 'a discussion merge keeps the stored grading')
+        self.save(self.result_for(self.p, findings=[{'id': row['id'], 'file': row['file'], 'line': row['line'], 'status': 'open', **grade}]),
+                  reason='again')
+        saved = self.led()['reviews'][-1]['findings'][0]
+        self.assertEqual({k: saved[k] for k in text}, text, 'number() carries the record, its grading included')
+        regrade = {'severity': 'medium', 'confidence': 'low', 'severityReason': 'worse', 'impact': {**text['impact'], 'path': 'q'}}
+        self.mark_posted(self.p)
+        self.save(self.result_for(self.p, findings=[{'id': row['id'], 'file': row['file'], 'line': row['line'], 'status': 'open', **regrade}]),
+                  reason='regraded')
+        saved = self.led()['reviews'][-1]['findings'][0]
+        self.assertEqual({k: saved[k] for k in regrade}, regrade, 'a regrade replaces it')
 
     def test_a_snapshot_of_another_repository_or_none_named_is_refused(self):
         snap = self.snapshot((950, 'contrib', 'intentional', False))
