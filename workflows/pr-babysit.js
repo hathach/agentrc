@@ -245,7 +245,7 @@ if (args.stateRef != null) {
     if (!env) return false
     if (typeof env.error === 'string') { cause = `state_transfer.py: ${env.error}`; return false }
     if (!fresh(env) || env.pad !== pad) { cause = 'the envelope metadata is malformed'; return false }
-    if (length && env.length !== length) { reset('the envelope length changed'); return false }
+    if (length && env.length !== length) { cause = 'the envelope length changed'; reset(cause); return false }
     length = env.length
     const want = new Set(asked || indices().slice(0, PER_CALL))
     const byIndex = new Map()
