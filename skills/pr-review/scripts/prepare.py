@@ -38,7 +38,10 @@ headBranch), {state, why}: `available` with push access to the head repository, 
 edits from maintainers, push access to the base; `unavailable` when this account has neither; `unknown` when gh cannot
 tell. Only when available, it binds the review branch to the head branch through a remote of the head repository
 (head_remote, bind_upstream) and adds {remote, addedRemote}; a binding it cannot make refuses. Without --auto-fix
-nothing of this runs.
+nothing of this runs. On a `same` head it also adds `submittedReview` {head, reviewId}, our review submitted on that
+head (by the human included), which the repair then takes its findings from, else null with `submittedWhy`; one unsent
+answer bundle an earlier auto-fix deferred on that review no longer refuses the run, and `deferredAnswers` counts its
+answers, which wait for the repair to end.
 
 --release unlocks the pr-review-<N> sibling whose lock carries the token, once
 the run that took it has ended; nothing locked by it is a no-op, and while
@@ -63,7 +66,8 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from ledger import ONLINE, last, ledger_dir, ledger_path, load, locked, publications, refuse_unsettled, repo_of, store  # noqa: E402
+from ledger import (ONLINE, last, ledger_dir, ledger_path, load, locked, publications, refuse_unsettled, repo_of, store,  # noqa: E402
+                    submitted_last)
 from post import sync  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'pr-babysit' / 'scripts'))
@@ -221,6 +225,21 @@ def repair_target(repo, head_repo, info, branch, head):
     remote, added = head_remote(repo, head_repo, branch)
     bind_upstream(branch, remote, info['headRefName'], head)
     return {'state': state, 'why': why, 'remote': remote, 'addedRemote': added}
+
+
+def reused_review(led, head):
+    """auto-fix on a head we reviewed already: ({submittedReview, submittedWhy}, the deferred answer bundle or None).
+    The repair takes its findings from our review submitted on the head, by the human included. One unsent bundle of
+    answers an earlier auto-fix deferred on that review (post.py --defer-answers) waits for the repair to end instead
+    of refusing the run; any other pending draft on the head still refuses it."""
+    try:
+        rev = submitted_last(led, head)
+    except Unusable as e:
+        return {'submittedReview': None, 'submittedWhy': str(e)}, None
+    reuse = {'submittedReview': {'head': head, 'reviewId': rev['receipts']['review'].get('reviewId')}, 'submittedWhy': None}
+    pending = [p for p, _ in publications(led) if p['head'] == head and p['status'] == 'pending']
+    bundles = [p for p in rev.get('answerPublications', []) if p in pending and p.get('auto') and not p.get('receipts')]
+    return reuse, (bundles[0] if len(pending) == 1 and bundles else None)
 
 
 def remote_for(repo):
@@ -396,7 +415,6 @@ def prepare(a):
     with locked(path):
         led = load(path, repo, a.pr)
         synced = sync(repo, a.pr, led, lambda: store(path, led))
-        refuse_unsettled(led, head, ('pending',))
         online = [r for r, _ in publications(led) if r['status'] in ONLINE]
         if online and online[-1]['status'] == 'drafted':
             raise Unusable(f"your pending review of {online[-1]['head']} is still open on the PR: submit or delete it on GitHub first")
@@ -405,8 +423,13 @@ def prepare(a):
             raise Unusable(f"a review POST for {online[-1]['head']} may have landed unseen: reconcile it first with "
                            f"post.py --pr {a.pr} --expected-head {online[-1]['head']}{auto}, which only looks for it by its marker")
         mode, scope_base, prior = mode_of(led, head, merge_base, a.full)
+        reuse, deferred = reused_review(led, head) if a.auto_fix and mode == 'same' else (None, None)
+        if not deferred:
+            refuse_unsettled(led, head, ('pending',))
         wt, branch = worktree(top, a.pr, head, token)
         repair = repair_target(repo, head_repo_of(info), info, branch, head) if a.auto_fix else None
+        if reuse is not None:
+            repair = {**repair, **reuse}
         pr_paths = changed(merge_base, head)
         scope = pr_paths if mode != 'incremental' else changed(scope_base, head)
         groups, over = groups_of(scope, a.max_groups)
@@ -434,6 +457,7 @@ def prepare(a):
         'tooling': [p for p in pr_paths if TOOLING.search(p)], 'ci': ci,
         'ledger': path.as_posix(), 'facts': facts.as_posix(), 'synced': synced, 'changedFile': changed_file and changed_file.as_posix(),
         **({'repair': repair} if a.auto_fix else {}),
+        **({'deferredAnswers': len(deferred['answers'])} if deferred else {}),
     }
 
 
