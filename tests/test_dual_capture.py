@@ -10,7 +10,7 @@ import unittest
 from unittest import mock
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import guard_survivors  # noqa: E402
+from helpers import CUT_NAME, guard_survivors, proc_stat  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'target-debug' / 'scripts' / 'dual_capture.py'
 _spec = importlib.util.spec_from_file_location('dual_capture', SCRIPT)
@@ -217,25 +217,76 @@ class DualCaptureTest(unittest.TestCase):
                               capture_output=True, text=True, timeout=60)
 
     def test_an_orphan_first_seen_in_the_grace_gets_sigterm(self):
-        # the tool forks in its SIGTERM handler and exits at once: the child reparents here unseen
-        log = self.d / 'orphan.log'
-        leader = ('import os, signal, sys, time\n'
+        # the tool forks in its SIGTERM handler and exits: the child reparents here unseen, as the leaders'
+        # children are hidden from track(); the delay holds the leader past several grace polls
+        prelude = ('leaders = []\n'
+                   'def popen(*a, **k):\n'
+                   '    p = real(*a, **k)\n'
+                   '    leaders.append(p.pid)\n'
+                   '    return p\n'
+                   'real_children = dual_capture.children\n'
+                   'dual_capture.children = lambda pid: set() if pid in leaders else real_children(pid)\n')
+        for delay in (0, 0.3):
+            with self.subTest(delay=delay):
+                log, self.out = self.d / f'orphan-{delay}.log', self.d / f'out-{delay}'
+                leader = ('import os, signal, sys, time\n'
+                          'def term(*_):\n'
+                          '    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})\n'
+                          '    if os.fork():\n'
+                          f'        time.sleep({delay}); os._exit(0)\n'
+                          f'    log = open({str(log)!r}, "a", buffering=1)\n'
+                          '    def bye(*_): log.write("TERM\\n"); os._exit(0)\n'
+                          '    signal.signal(signal.SIGTERM, bye)\n'
+                          '    signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})\n'
+                          '    while True: time.sleep(1)\n'
+                          'signal.signal(signal.SIGTERM, term)\n'
+                          'while True: time.sleep(1)')
+                proc = self.driver(prelude, '--a', self.side('host', leader), '--b', self.side('target', 'pass'),
+                                   '--timeout', '1', '--grace', '3')
+                self.assertEqual(proc.returncode, 1, proc.stderr)
+                out = json.loads(proc.stdout)
+                self.assertEqual(log.read_text(), 'TERM\n', out)
+                self.assertEqual(len(out['orphans']['pids']), 1)
+                self.assertEqual(out['orphans']['left'], [])
+                self.assertFalse(out['sides'][0]['killed'])
+
+    def test_a_child_seen_in_the_grace_before_its_leader_exits_gets_sigterm(self):
+        # the tool forks in its SIGTERM handler and exits only once track() has recorded the child under it,
+        # so adopt() skips the orphan as seen (#374)
+        log, pidfile, release = self.d / 'child.log', self.d / 'child.pid', self.d / 'release'
+        leader = ('import os, signal, time\n'
                   'def term(*_):\n'
                   '    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})\n'
                   '    if os.fork():\n'
+                  f'        while not os.path.exists({str(release)!r}): time.sleep(0.01)\n'
                   '        os._exit(0)\n'
                   f'    log = open({str(log)!r}, "a", buffering=1)\n'
                   '    def bye(*_): log.write("TERM\\n"); os._exit(0)\n'
                   '    signal.signal(signal.SIGTERM, bye)\n'
+                  f'    open({str(pidfile)!r} + ".tmp", "w").write(str(os.getpid()))\n'
+                  f'    os.replace({str(pidfile)!r} + ".tmp", {str(pidfile)!r})\n'
                   '    signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})\n'
                   '    while True: time.sleep(1)\n'
                   'signal.signal(signal.SIGTERM, term)\n'
                   'while True: time.sleep(1)')
-        rc, out, err = self.run_cli(self.side('host', leader), self.side('target', 'pass'),
-                                    '--timeout', '1', '--grace', '3')
-        self.assertEqual(rc, 1, err)
+        prelude = ('real_track = dual_capture.track\n'
+                   'def track(seen, tops):\n'
+                   '    real_track(seen, tops)\n'
+                   f'    if tops and os.path.exists({str(pidfile)!r}) and int(open({str(pidfile)!r}).read()) in seen:\n'
+                   f'        open({str(release)!r}, "w").close()\n'
+                   'dual_capture.track = track\n'
+                   'popen = real\n')
+        proc = self.driver(prelude, '--a', self.side('host', leader), '--b', self.side('target', 'pass'),
+                           '--timeout', '1', '--grace', '20')
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        out = json.loads(proc.stdout)
+        self.assertTrue(release.exists())
         self.assertEqual(log.read_text(), 'TERM\n', out)
-        self.assertEqual(out['orphans']['left'], [])
+        host = out['sides'][0]
+        self.assertFalse(host['killed'])
+        self.assertNotIn('descendantsLeft', host)
+        self.assertNotIn('orphans', out)
+        self.assertFalse(alive(int(pidfile.read_text())))
 
     def test_no_group_sigkill_once_the_leader_is_reaped(self):
         # the leader exits leaving a group member that ignores SIGTERM; its pgid is no longer ours to signal
@@ -340,6 +391,19 @@ class DualCaptureTest(unittest.TestCase):
         self.assertEqual(rc, 3, err)
         self.assertIn('startError', out['sides'][1])
         self.assertTrue(out['sides'][0]['stopped'])
+
+    def test_a_live_process_whose_comm_is_cut_mid_character_is_read(self):
+        code = ('import ctypes, sys; ctypes.CDLL(None).prctl(15, sys.argv[1].encode(), 0, 0, 0)  # PR_SET_NAME\n'
+                'print(flush=True); input()')
+        child = subprocess.Popen([sys.executable, '-c', code, CUT_NAME], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        try:
+            child.stdout.readline()
+            with open(f'/proc/{child.pid}/stat', 'rb') as f:
+                raw = f.read()
+            self.assertIn(b'(' + CUT_NAME.encode()[:15] + b')', raw)
+            self.assertEqual(dual_capture.stat(child.pid), proc_stat(child.pid)[1:])
+        finally:
+            child.communicate(b'\n', timeout=10)
 
     def test_a_reused_pid_below_a_live_process_is_tracked_again(self):
         table = {1: ('S', 's1'), 101: ('S', 'new'), 202: ('S', 's202')}

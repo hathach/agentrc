@@ -120,7 +120,7 @@ def adopt(sides, strays):
 def stat(pid):
     """(state, start time) from /proc/<pid>/stat, or None when it is gone."""
     try:
-        with open(f'/proc/{pid}/stat') as f:
+        with open(f'/proc/{pid}/stat', errors='replace') as f:   # comm may be cut mid-UTF-8 character
             fields = f.read().rsplit(')', 1)[1].split()
         return fields[0], fields[19]
     except (OSError, IndexError):
@@ -240,11 +240,17 @@ def main(argv=None):
             # SIGTERM to the leader's group only: a live tool stops what it started in its own order
             # (rtt.py's server sits in a session of its own); what outlived its leader gets it directly
             signal_pids([-pid for pid in roots(s)] or left(s['seen']), signal.SIGTERM)
+            s['termed'] = set(s['seen'].items())
         end = time.monotonic() + a.grace
         while True:
             for s in running:
                 track(s['seen'], roots(s))
                 note_exit(s)
+                if not roots(s):
+                    # forked after the group's SIGTERM and outlived the leader: adopt() skips it as seen
+                    new = left({p: t for p, t in s['seen'].items() if (p, t) not in s['termed']})
+                    signal_pids(new, signal.SIGTERM)
+                    s['termed'].update((pid, s['seen'][pid]) for pid in new)
             # before adopt: a process seen gone has already reparented its orphans here
             busy = any(lingering(s) for s in running)
             signal_pids(left(adopt(sides, strays)), signal.SIGTERM)
