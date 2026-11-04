@@ -55,7 +55,7 @@ sys.exit(rc)
 
 def hc_inventory(at, terminals, foregrounds=None, raw=None):
     """Writes the hc stub's answers to at: `hc ls` lists terminals, live unless one says otherwise, and
-    `hc get <t>` gives foregrounds[t] as its foreground's cwd (no foreground when absent); raw maps a command
+    `hc get <t>` gives foregrounds[t] as its foreground's cwd (a null foreground when absent); raw maps a command
     line, or `<line> #<n>` its nth call, to [exit, stdout, stderr(, seconds it hangs first)] in place of either.
     The call counts restart."""
     terminals = [{'state': 'live', 'agent': 'bash', **t} for t in terminals]
@@ -878,14 +878,16 @@ class WorktreeChildren(unittest.TestCase):
             {'address': 't9', 'cwd': str(child), 'state': 'finished'},
             {'address': 'ci/t3', 'cwd': str(child)},  # another machine's
             {'address': 't10', 'cwd': str(self.t)},  # ended between the listing and the look
-            {'address': 't11', 'cwd': str(self.t)}],  # moved in since the listing
+            {'address': 't11', 'cwd': str(self.t)},  # moved in since the listing
+            {'address': 't12', 'cwd': str(self.t)}],  # its shell moved in, running a foreground hc cannot read
             {'t7': child / 'build'}, raw={'get t10': [3, '', '{"error": {"kind": "not_found"}}'],
-                                           'get t11': [0, json.dumps({'cwd': str(child), 'foreground': None}), '']})
+                                           'get t11': [0, json.dumps({'cwd': str(child), 'foreground': None}), ''],
+                                           'get t12': [0, json.dumps({'cwd': str(child)}), '']})
         done = self.cleanup()
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
         self.assertIn(f'kept {child}: herdr-core terminals work there: t7 rev (parent / 1) in {child / "build"}; '
-                      f't8 (in no herdr-app space) in {child}; t11 (in no herdr-app space) in {child}; close them, then retry\n',
-                      done.stdout)
+                      f't8 (in no herdr-app space) in {child}; t11 (in no herdr-app space) in {child}; '
+                      f't12 (in no herdr-app space) in {child}; close them, then retry\n', done.stdout)
         self.assertTrue(child.is_dir())
         self.assertFalse(other.exists())
 
@@ -904,7 +906,6 @@ class WorktreeChildren(unittest.TestCase):
                      {'get t7': [0, json.dumps({'cwd': str(self.t), 'foreground': {'cwd': '.'}}), '']}, listed],
                  'get fails': [{'get t7': [1, '', 'lost']}, listed],
                  'exit 3 but not not_found': [{'get t7': [3, '', '{"error": {"kind": "needs_target"}}']}, listed],
-                 'get without foreground': [{'get t7': [0, json.dumps({'cwd': str(self.t)}), '']}, listed],
                  'get without cwd': [{'get t7': [0, '{"foreground": null}', '']}, listed],
                  'a foreground without cwd': [{'get t7': [0, json.dumps({'cwd': str(self.t), 'foreground': {}}), '']},
                                               listed]}
@@ -916,6 +917,14 @@ class WorktreeChildren(unittest.TestCase):
                 self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
                 self.assertIn(f'kept {child}: cannot list herdr-core terminals', done.stdout)
                 self.assertTrue(child.is_dir())
+
+    def test_a_foreground_hc_cannot_read_goes_unseen(self):
+        child = self.child()
+        hc_inventory(self.hc, [{'address': 't7', 'cwd': str(self.t)}],
+                     raw={'get t7': [0, json.dumps({'cwd': str(self.t)}), '']})  # `sudo` running there
+        done = self.cleanup()
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertFalse(child.exists())
 
     def test_a_terminal_whose_listing_is_inside_keeps_the_child_without_a_look(self):
         child = self.child()
