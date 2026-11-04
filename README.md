@@ -149,8 +149,9 @@ and write UTF-8 themselves, so no `-X utf8` or `PYTHONUTF8` is needed. Bash's
 - a `python3` that is a native CPython 3.12+ (python.org's install manager or
   MSYS2's mingw build), not the WindowsApps alias and not MSYS2's
   `/usr/bin/python3`, for the workflows' script calls and the simplify gate's
-  wrapper; PyYAML in it for the tests, and for `pr-babysit`'s `harvest.py`, which
-  `pr-review` also imports, to date a head by its pull_request runs (without it
+  wrapper; PyYAML, pytest and pytest-xdist in it for the tests, and PyYAML for
+  `pr-babysit`'s `harvest.py`, which `pr-review` also imports, to date a head by
+  its pull_request runs (without it
   they go unread and the harvest says so). `install.py` registers a Python hook as
   `'<the python that ran install.py>' '<hook>.py'`, since a hook that cannot
   start lets the tool call through; rerun it after replacing that Python, and
@@ -390,13 +391,13 @@ guard denies its memory writes.
 ## Tests
 
 ```sh
-python -X utf8 -m unittest discover -s tests
+python -X utf8 -m pytest -n auto --dist worksteal -p no:cacheprovider -q tests
 ```
 
-Needs PyYAML. The pre-commit hook (`pre-commit install`) runs the same tests in parallel under
-pytest-xdist, `python -X utf8 -m pytest -n 8 --dist worksteal tests`, which keeps it well inside
-pr-babysit's 540 s hook deadline; CI runs them that way too, sharded across jobs
-(`.github/workflows/tests.yml`), and `--shard I/K` (`tests/conftest.py`) runs one part of it.
+Needs PyYAML, pytest and pytest-xdist; `BUILD.md` is the full contract. The pre-commit hook
+(`pre-commit install`) runs the same command with `-n 8`, well inside pr-babysit's 540 s hook
+deadline; CI shards it across jobs (`.github/workflows/tests.yml`), and `--shard I/K`
+(`tests/conftest.py`) runs one part of it.
 Where Git for Windows has `core.fsmonitor=true` (an installer option), each
 temporary test repository leaves a `git fsmonitor--daemon` behind; run the suite
 with `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0=false`.
