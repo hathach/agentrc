@@ -27,8 +27,10 @@ worker number and temporary name masked), so they are no evidence against the
 change (#378). A hook that ever modified files is never rerun there, nor one
 whose id SKIP cannot name, more than one config entry uses or another hook in
 the config takes as its alias (SKIP skips those hooks too, and a fail_fast stop
-at one leaves the rest unchecked), nor any when the config cannot be read or
-PyYAML is missing; notRerun is {hook, why} for each failed hook not rerun
+at one leaves the rest unchecked), nor any when the config cannot be read:
+with PyYAML, or without it by pre-commit's own interpreter when the #! line of
+pre-commit's entry script names a python by absolute path (not on Windows);
+notRerun is {hook, why} for each failed hook not rerun
 there. Each rerun gets a clean HEAD tree. The tree has only what HEAD
 tracks: a hook that needs the checkout's ignored files (fetched dependencies)
 fails there differently and stays counted. A change that leaves a hook's
@@ -47,6 +49,7 @@ Exit 0 with that line; exit 2 with {"error": ...} when the facts cannot be
 collected or pre-commit's output contradicts its exit status.
 """
 
+import json
 import os
 import re
 import shutil
@@ -66,6 +69,7 @@ try:
     import yaml
 except ImportError:
     yaml = None
+YAML_ERRORS = (yaml.YAMLError,) if yaml else ()
 
 CONFIG = '.pre-commit-config.yaml'
 DEADLINE = 540
@@ -79,6 +83,9 @@ NEXT = re.compile(r'[.)](Passed|Failed|Skipped)$')
 ERROR_CHARS = 200
 # Seconds past the deadline the HEAD worktree's removal may take, and its registration's prune after it.
 CLEANUP = 20
+# Run by pre-commit's own interpreter, which depends on PyYAML, when this one lacks it: the config as JSON.
+LOAD_CONFIG = 'import json, sys, yaml; print(json.dumps(yaml.safe_load(open(sys.argv[1], encoding="utf-8"))))'
+SHEBANG_PYTHON = re.compile(r'python[\d.]*')
 # The failure a run that failed naming no hook adds: not a hook id, so never excused or skipped.
 UNOWNED = '(pre-commit)'
 # What points git at a repository or its index; set by a caller, it would send HEAD's tree's resets and reruns to the
@@ -316,18 +323,59 @@ def comparable(text, root):
     return sorted(line for line in lines if line)
 
 
-def shared_names():
+def pre_commit_python():
+    """(the interpreter and argument the #! line of the pre-commit on PATH names, its entry script's directory), or
+    None when that line names no python by absolute path: a Windows launcher, a wrapper script, env, or distlib's
+    /bin/sh form for a long or spaced path."""
+    found = shutil.which('pre-commit')
+    if not found:
+        return None
+    script = os.path.realpath(found)
+    try:
+        with open(script, 'rb') as f:
+            line = f.readline(512)
+    except OSError:
+        return None
+    # The kernel passes what follows the interpreter as one argument.
+    words = line[2:].decode('utf-8', 'replace').strip().split(None, 1) if line.startswith(b'#!') else []
+    if not (words and os.path.isabs(words[0]) and SHEBANG_PYTHON.fullmatch(os.path.basename(words[0]))):
+        return None
+    return words, os.path.dirname(script)
+
+
+def pre_commits_load(deadline, start):
+    """(the config as pre-commit's own interpreter loads it, '') or (None, why it was not read)."""
+    found = pre_commit_python()
+    if not found:
+        return None, "PyYAML is not installed, nor is pre-commit's interpreter known, so the config was not read"
+    argv, where = found
+    try:
+        # Run where the entry script lies, so it imports as pre-commit does, nothing from the checkout.
+        code, out, err = bounded([*argv, '-c', LOAD_CONFIG, os.path.abspath(CONFIG)], deadline, start,
+                                 'reading the config', cwd=where)
+    except OSError as e:
+        return None, f"pre-commit's {argv[0]} cannot run ({type(e).__name__})"
+    if code:
+        last = (err.strip().splitlines() or [f'exit {code}'])[-1]
+        return None, f"pre-commit's {argv[0]} cannot read {CONFIG} ({last[:ERROR_CHARS]})"
+    return json.loads(out), ''
+
+
+def shared_names(deadline, start):
     """(each name SKIP would skip more than one hook by, ''), or (None, why) when the config cannot be read: an alias
     the config gives a hook under another id, and an id more than one entry uses (pre-commit's commands/run.py)."""
-    if yaml is None:
-        return None, 'PyYAML is not installed, so the config was not read'
     try:
-        config = yaml.safe_load(Path(CONFIG).read_text(encoding='utf-8'))
+        if yaml:
+            config = yaml.safe_load(Path(CONFIG).read_text(encoding='utf-8'))
+        else:
+            config, why = pre_commits_load(deadline, start)
+            if why:
+                return None, why
         entries = [h for repo in config['repos'] for h in repo['hooks']]
         ids = [h['id'] for h in entries]
         return ({h['alias'] for h in entries if h.get('alias') not in (None, '', h['id'])}
                 | {i for i in ids if ids.count(i) > 1}), ''
-    except (OSError, ValueError, yaml.YAMLError, KeyError, TypeError, AttributeError) as e:
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, *YAML_ERRORS) as e:
         return None, f'{CONFIG} cannot be read ({type(e).__name__})'
 
 
@@ -421,7 +469,7 @@ def run_hooks(paths, deadline=DEADLINE):
         return False, True, [], [], [], []
     start = time.monotonic()
     code, ids, failures = passes(paths, deadline, start, 'run')
-    shared, unread = shared_names()
+    shared, unread = shared_names(deadline, start) if failures else (set(), '')
     found, excused, not_rerun = failures, [], {}
     while True:
         expected = {}

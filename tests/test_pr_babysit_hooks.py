@@ -235,6 +235,19 @@ class HooksTest(unittest.TestCase):
         self.assertEqual(len(self.worktrees()), 1, 'the HEAD worktree is removed')
         self.assertEqual(out['snapshotBefore'], out['snapshotAfter'])
 
+    @unittest.skipIf(os.name == 'nt', "a Windows pre-commit is a launcher, not a #! script")
+    def test_without_pyyaml_a_hook_failing_on_head_too_is_excused_through_pre_commits_python(self):
+        if not hooks.pre_commit_python():
+            self.skipTest("the pre-commit on PATH has no #! line naming a python")
+        self.configure('ok', 'broken')
+        (self.repo / 'a.txt').write_text('edited\n')
+        no_yaml = ("import runpy, sys; sys.modules['yaml'] = None; sys.argv.pop(0); "
+                   "runpy.run_path(sys.argv[0], run_name='__main__')")
+        done = subprocess.run([sys.executable, '-c', no_yaml, str(SCRIPT), 'a.txt'], cwd=self.repo, env=self.env,
+                              capture_output=True, text=True)
+        out = json.loads(done.stdout.splitlines()[-1])
+        self.assertEqual((done.returncode, out['baselineFailed'], out['notRerun']), (0, ['broken'], []))
+
     def test_each_head_rerun_starts_from_a_clean_head(self):
         # nolitter fails here only on what litter left: on HEAD it must not inherit litter's rerun.
         self.configure('litter', 'nolitter')
@@ -700,14 +713,52 @@ class RunHooksTest(unittest.TestCase):
         self.assertEqual([n['hook'] for n in not_rerun], ['broken'])
         self.assertRegex(not_rerun[0]['why'], rf'^{hooks.CONFIG} cannot be read \(\w+Error\)$')
 
-    def test_nothing_is_rerun_on_head_without_pyyaml_and_the_failure_says_why(self):
-        with mock.patch.object(hooks, 'yaml', None), \
+    def test_nothing_is_rerun_on_head_without_pyyaml_or_a_known_pre_commit_python_and_the_failure_says_why(self):
+        with mock.patch.object(hooks, 'yaml', None), mock.patch.object(hooks, 'pre_commit_python', return_value=None), \
                 mock.patch.object(hooks, 'pre_commit', return_value=(1, self.BROKEN)), \
                 mock.patch.object(hooks, 'baseline') as baseline:
             *_, failures, excused, not_rerun = hooks.run_hooks(['a.txt'])
         baseline.assert_not_called()
         self.assertEqual(([f['hook'] for f in failures], excused), (['broken'], []))
-        self.assertEqual(not_rerun, [{'hook': 'broken', 'why': 'PyYAML is not installed, so the config was not read'}])
+        self.assertEqual(not_rerun, [{'hook': 'broken', 'why': (
+            "PyYAML is not installed, nor is pre-commit's interpreter known, so the config was not read")}])
+
+    def without_pyyaml(self, config, interpreter=sys.executable):
+        """run_hooks' excused and notRerun without PyYAML here, the pre-commit on PATH a symlink to an entry script
+        whose #! line names interpreter."""
+        Path(hooks.CONFIG).write_text(config)
+        for d in ('bin', 'venv'):
+            os.mkdir(d)
+        Path('venv', 'pre-commit').write_text(f'#!{interpreter}\n')
+        os.symlink(os.path.abspath('venv/pre-commit'), 'bin/pre-commit')
+        os.chmod('venv/pre-commit', 0o755)
+        with mock.patch.object(hooks, 'yaml', None), mock.patch.dict(os.environ, {'PATH': os.path.abspath('bin')}), \
+                mock.patch.object(hooks, 'pre_commit', return_value=(1, self.BROKEN)), \
+                mock.patch.object(hooks, 'baseline', return_value=['broken']) as baseline:
+            *_, excused, not_rerun = hooks.run_hooks(['a.txt'])
+        return baseline, excused, not_rerun
+
+    @unittest.skipIf(os.name == 'nt' or ' ' in sys.executable, "a Windows pre-commit is a launcher, not a #! script")
+    def test_without_pyyaml_pre_commits_own_python_reads_the_config(self):
+        baseline, excused, not_rerun = self.without_pyyaml(CONFIG.format(HOOK.format(id='broken')))
+        baseline.assert_called_once()
+        self.assertEqual((excused, not_rerun), (['broken'], []))
+
+    @unittest.skipIf(os.name == 'nt' or ' ' in sys.executable, "a Windows pre-commit is a launcher, not a #! script")
+    def test_without_pyyaml_an_id_pre_commits_python_reads_as_shared_is_never_rerun(self):
+        baseline, excused, not_rerun = self.without_pyyaml(CONFIG.format(HOOK.format(id='broken') * 2))
+        baseline.assert_not_called()
+        self.assertEqual((excused, not_rerun), ([], [{'hook': 'broken', 'why': 'SKIP would skip another hook by it'}]))
+
+    @unittest.skipIf(os.name == 'nt', "a Windows pre-commit is a launcher, not a #! script")
+    def test_without_pyyaml_a_pre_commit_python_that_cannot_load_the_config_reruns_nothing(self):
+        Path('python3').write_text('#!/bin/sh\necho "ModuleNotFoundError: No module named \'yaml\'" >&2; exit 1\n')
+        os.chmod('python3', 0o755)
+        python = os.path.abspath('python3')
+        baseline, excused, not_rerun = self.without_pyyaml('repos: []\n', python)
+        baseline.assert_not_called()
+        self.assertEqual((excused, not_rerun), ([], [{'hook': 'broken', 'why': (
+            f"pre-commit's {python} cannot read {hooks.CONFIG} (ModuleNotFoundError: No module named 'yaml')")}]))
 
     def test_an_id_skip_cannot_name_is_never_rerun_on_head(self):
         out = self.BROKEN.replace('broken', 'a,b')
@@ -716,6 +767,31 @@ class RunHooksTest(unittest.TestCase):
             *_, excused, not_rerun = hooks.run_hooks(['a.txt'])
         baseline.assert_not_called()
         self.assertEqual((excused, not_rerun), ([], [{'hook': 'a,b', 'why': 'SKIP cannot name it'}]))
+
+
+class PreCommitPythonTest(unittest.TestCase):
+    def entry(self, first_line):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        script = Path(tmp.name, 'pre-commit')
+        script.write_bytes(first_line + b'\nfrom pre_commit.main import main\n')
+        with mock.patch.object(hooks.shutil, 'which', return_value=str(script)):
+            return hooks.pre_commit_python(), os.path.realpath(tmp.name)
+
+    def test_the_interpreter_and_its_one_argument_are_read_as_the_kernel_does(self):
+        found, where = self.entry(b'#! /usr/bin/python3 -s -E')
+        self.assertEqual(found, (['/usr/bin/python3', '-s -E'], where))
+        found, where = self.entry(b'#!/opt/venvs/pre-commit/bin/python3.12')
+        self.assertEqual(found, (['/opt/venvs/pre-commit/bin/python3.12'], where))
+
+    def test_a_line_naming_no_python_by_absolute_path_is_no_interpreter(self):
+        # env, distlib's /bin/sh form for a long path, a launcher .exe, a relative path, or no #! at all
+        for line in (b'#!/usr/bin/env python3', b'#!/bin/sh', b'MZ\x90\x00', b'#!python', b'#!', b'import sys'):
+            self.assertIsNone(self.entry(line)[0], line)
+
+    def test_no_pre_commit_on_path_is_no_interpreter(self):
+        with mock.patch.object(hooks.shutil, 'which', return_value=None):
+            self.assertIsNone(hooks.pre_commit_python())
 
 
 class AsCheckoutTest(unittest.TestCase):
