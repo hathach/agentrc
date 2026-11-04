@@ -44,7 +44,10 @@ while every new failure is excused, and a failed run that names no hook adds the
 failure `(pre-commit)`. An alias only a remote repository's own manifest
 declares is not seen, so such a hook may go unrun on the change until CI.
 pre-commit runs with core.abbrev pinned at the length HEAD abbreviates to
-when the first run starts (#377), which the hooks' own git commands inherit.
+when the first run starts (#377), possibly a digit over git's default, which
+the hooks' own git commands inherit. git still lengthens an abbreviation a
+hook's new object makes ambiguous, so rarely a hook that changed nothing is in
+modifiedBy.
 Exit 0 with that line; exit 2 with {"error": ...} when the facts cannot be
 collected or pre-commit's output contradicts its exit status.
 """
@@ -202,7 +205,8 @@ def kill_tree(proc):
 
 @functools.cache
 def abbrev_length():
-    """The length HEAD abbreviates to in the checkout, measured at the first run, before any hook writes an object."""
+    """The length of HEAD's unique abbreviation in the checkout, measured at the first run, before any hook writes an
+    object: git's default length, or more where HEAD's prefix is ambiguous."""
     return len(git('rev-parse', '--short', 'HEAD').strip())
 
 
@@ -210,8 +214,9 @@ def pinned_abbrev(env, length):
     """env with core.abbrev at length. pre-commit decides a hook modified files by comparing `git diff` text before
     and after it; git's automatic length follows the packed object count, so a hook that adds a pack mid-run can
     lengthen the unstaged diff's abbreviated `index` hashes at the count's boundary, and that alone failed it (#377).
-    Any fixed length skips that count (object-name.c, find_unique_abbrev_r); the checkout's own gives the hooks' git
-    commands the abbreviations a commit's hooks get."""
+    Any fixed length skips that count (object-name.c, find_unique_abbrev_r); the checkout's measured one gives the
+    hooks' git commands about the abbreviations a commit's hooks get, where 40 would not. Below 40 git still lengthens
+    a diffed blob's hash when a hook's new object shares its prefix (about 2 x files x new objects / 16^length)."""
     count = env.get('GIT_CONFIG_COUNT') or '0'
     if not count.isdigit():
         raise Unusable(f'GIT_CONFIG_COUNT is {count!r}, not a count')
