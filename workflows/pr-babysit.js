@@ -1724,7 +1724,7 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
   // hooks.py never excuses a hook that rewrote files, nor an id SKIP cannot name or would skip another entry by
   const unskippable = hooks.baselineFailed.filter(h => hooks.modifiedBy.includes(h) || !h || h.includes(',') || h !== h.trim() ||
     failedIds.filter(i => i === h).length > 1)
-  // a failure hooks.py never reran on HEAD carries its reason, a missing PyYAML say, into the refusal
+  // a failure hooks.py never reran on HEAD carries its reason, such as an unreadable hook config, into the refusal
   const notRerun = new Map(hooks.notRerun.map(n => [n.hook, n.why]))
   const failures = (fs) => fs.map(f => `${f.hook}: ${f.error}${notRerun.has(f.hook) ? ` (not rerun on HEAD: ${notRerun.get(f.hook)})` : ''}`).join('; ')
   const hookWhy = outside.length ? `tree changed outside the fix scope before the hooks ran: ${outside.join(', ')}`

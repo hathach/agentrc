@@ -6878,9 +6878,9 @@ test('a failing hook is refused by name and first line unless it fails on HEAD t
   assert.ok(plain.calls.find(c => c.label === 'commit#1-review').prompt.includes('commits.py commit --receipt '), 'nothing excused, nothing skipped')
   assert.ok(logs.some(l => l.endsWith(`push#1-review: hook(s) failing on HEAD too, not counted against the fix: unit-test: preprocessing failed; drivers-coverage: ${cov.error}`)))
   // a failure hooks.py never reran on HEAD is refused with the reason it gave
-  const unread = await run({ ...publishing, hooks: { passed: false, failed: [unit], notRerun: [{ hook: 'unit-test', why: 'PyYAML is not installed, so the config was not read' }] } })
+  const unread = await run({ ...publishing, hooks: { passed: false, failed: [unit], notRerun: [{ hook: 'unit-test', why: "PyYAML is not installed, nor is pre-commit's interpreter known, so the config was not read" }] } })
   assert.equal(unread.result.history[0].reviewPushFailed.detail,
-    'the repository hooks do not pass on the fix: unit-test: preprocessing failed (not rerun on HEAD: PyYAML is not installed, so the config was not read)')
+    "the repository hooks do not pass on the fix: unit-test: preprocessing failed (not rerun on HEAD: PyYAML is not installed, nor is pre-commit's interpreter known, so the config was not read)")
 })
 
 test('a failure no hook owns, and hook output the excused hooks never judged, are refused by cause', async () => {
