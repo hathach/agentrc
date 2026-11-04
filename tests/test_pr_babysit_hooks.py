@@ -463,8 +463,9 @@ class HooksTest(unittest.TestCase):
     def pack(self, count):
         """Add count blobs in one pack: 16383 packed objects abbreviate to 7 hex digits, 16384 to 8."""
         blobs = ''.join(f'blob\ndata {len(str(i)) + 1}\n{i}\n' for i in range(count))
-        subprocess.run(['git', 'fast-import', '--quiet'], input=blobs, cwd=self.repo, env=self.env, check=True,
-                       capture_output=True, text=True)
+        # Bytes: text mode writes '\n' as '\r\n' on Windows and corrupts the stream.
+        subprocess.run(['git', 'fast-import', '--quiet'], input=blobs.encode(), cwd=self.repo, env=self.env, check=True,
+                       capture_output=True)
 
     def test_a_hook_adding_a_pack_across_the_abbrev_boundary_is_no_modification(self):
         # Unpinned, the pack packer adds lengthens the unstaged diff's index hashes and pre-commit reports it
