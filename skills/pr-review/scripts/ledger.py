@@ -95,8 +95,6 @@ import windows  # noqa: E402
 VERSION = 2
 CUT = 160
 OPEN = ('open', 'upheld', 'disputed')
-# The holds whose text on the PR the ledger cannot vouch for: no receipt places it, or the PR reads otherwise.
-UNVOUCHED = ('unmapped', 'deleted', 'edited')
 # The one scale (finding-verifier.md's Severity section); P0-P4 are its report aliases.
 LEVELS = ('critical', 'high', 'medium', 'low', 'nit')
 CONFIDENCE = ('high', 'medium', 'low')
@@ -584,7 +582,7 @@ def fixable(led, snapshot, head):
             # The text the PR shows, as the human edited it, and the digest a repair's fix check names.
             fix.append({**open_row(f, {}), 'claimDigest': digest(claim(f))})
     return {'fix': sorted(fix, key=by_severity), 'held': held,
-            'autoPost': not any(h['why'] in UNVOUCHED for h in held)}
+            'autoPost': not any(h['why'] in ('unmapped', 'deleted', 'edited') for h in held)}
 
 
 def add_answers(review, head, answers, auto=False):
