@@ -360,6 +360,7 @@ test('a muted finding stating an issue its group\'s text lacks posts too, counte
   assert.deepEqual(result.draft.comments.map(c => c.body), ['**high**: rf_tv zeroed', '**nit**: the reference comment removed'])
   assert.deepEqual([result.verdict.reasons, result.findings.map(f => [f.defect, 'beside' in f, f.muted])], [['1 blocking finding(s) open'], [[0, false, false], [0, false, false]]],
     'a member posted beside its group is not muted')
+  assert.deepEqual(result.findings.map(f => f.lead), [true, false], 'a member posted beside its group is not its lead: its comment states only itself')
   assert.ok(logs.some(l => /beside its group, src\/core\/a\.c:10: the removed reference comment/.test(l)))
   const flagged = await run(BASE, { audit: pair, group, write: written, 'check-draft': { bad: [1], firstBad: [], summaryBad: false }, beyond: { beyond: [{ finding: 0, issue: 'x' }] } })
   assert.deepEqual([flagged.result.draft.comments[1].body, flagged.result.draft.comments[1].firstLineUnchecked], ['**nit**: rf_tv zeroed, and the reference comment removed', true],
@@ -372,9 +373,10 @@ test('a muted finding stating an issue its group\'s text lacks posts too, counte
   assert.match(narrow.result.draft.comments[0].body, /SETUP/)
   const behind = await run(BASE, { audit: audited(finding('change latches lost', 'medium')), claims, judge: () => confirmedAs('medium'),
     group: { groups: [{ findings: [0], claims: ['55#1'] }] } })
-  assert.deepEqual([behind.result.draft.comments.length, behind.result.findings.map(f => f.muted)], [0, [true]], 'a claim stating it mutes our finding')
+  assert.deepEqual([behind.result.draft.comments.length, behind.result.findings.map(f => [f.muted, f.lead])], [0, [[true, true]]], 'a claim stating it mutes our finding')
   const none = await run(BASE, { audit: pair })
   assert.ok(!none.labels.includes('beyond'), 'nothing muted, nothing to ask')
+  assert.deepEqual(none.result.findings.map(f => [f.muted, f.lead]), [[false, false], [false, false]], 'written on every finding, grouped or not')
 })
 
 test('a dead or malformed answer on muted findings posts them all and leaves coverage unproven', async () => {
@@ -401,7 +403,7 @@ test('a dead or malformed answer on muted findings posts them all and leaves cov
     recheck: { state: 'open', reason: 'still' }, group })
   assert.deepEqual(lead.result.draft.comments.map(c => [c.finding, c.body]), [[0, '**high**: w pr7-f1']], 'a group mate\'s comment never states the lead: it gets its own')
   assert.doesNotMatch(lead.result.draft.body, /w pr7-f2/, 'its own comment states the muted member')
-  assert.deepEqual(lead.result.findings.map(f => [f.id, f.muted]), [['pr7-f1', false], ['pr7-f2', true]], 'a lead given its own comment is not muted')
+  assert.deepEqual(lead.result.findings.map(f => [f.id, f.muted, f.lead]), [['pr7-f1', false, true], ['pr7-f2', true, false]], 'a lead given its own comment is not muted')
 })
 
 test('a threads receipt that is not the script\'s line is asked again once on a fresh label, else the launch blocks (#150)', async () => {

@@ -218,14 +218,13 @@ sequence:
       set (the human's edit) over its draft `why`. A `grouped` held finding,
       one the review left out because its group's printed text, still
       standing on the PR, states its defect, gets no repair of its own and
-      does not itself stop auto-post; the recheck judges it again. The
-      repairs get chief's
-      commit check, simplification pass, validation and a whole-task review
-      from the reviewed head to the repair tip. Before pr-babysit runs, chief
-      keeps in its directory a `--fixed` manifest: `reviewedHead`, and for
-      each finding whose fix check verified its repair `{id, claimDigest`
-      (from `--fixable`)`, verdict: "verified", checkedSha, note` (one
-      line)`, evidence` (the retained verifier result's path)`}`.
+      does not itself stop auto-post; the recheck judges it again. The repairs
+      get chief's commit check, simplification pass, validation and a
+      whole-task review from the reviewed head to the repair tip. Before
+      pr-babysit runs, chief keeps in its directory a `--fixed` manifest:
+      `reviewedHead`, and for each finding whose fix check verified its repair
+      `{id, claimDigest` (from `--fixable`)`, verdict: "verified", checkedSha,
+      note` (one line)`, evidence` (the retained verifier result's path)`}`.
    3. pr-babysit from the review worktree, its branch bound by prepare, with
       `adoptHead` the repair tip when there are repairs (none otherwise: it
       still answers the bots), `autoPush`, `markSonar` and the repository's

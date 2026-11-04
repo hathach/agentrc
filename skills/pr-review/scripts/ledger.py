@@ -48,12 +48,13 @@ words, which a repair's fix check names) when the text it stands in on the PR is
 receipt of ours recorded, unedited, and nobody but us or a bot has replied
 on its thread since our last verified answer; else in `held` with why: `disputed`, `unmapped` (no receipt places
 its text), `grouped` (unmapped and `muted`: the review left it out because its group's printed text states its
-defect, and that text still stands: a thread claim of that review, or a mate not muted and not held `unmapped`,
-`deleted` or `edited`), `deleted`, `edited` (the inline comment, or the body of the review it was moved into, reads
-otherwise) or `replied`. `autoPost` is false when any is held `unmapped`, `deleted` or `edited`: a recheck would judge
+defect, and that text still stands: a claim of that review whose comment the snapshot still lists, or the group's
+`lead` finding not muted and not held `unmapped`, `deleted` or `edited`), `deleted`, `edited` (the inline comment, or
+the body of the review it was moved into, reads otherwise) or `replied`. `autoPost` is false when any is held
+`unmapped`, `deleted` or `edited`: a recheck would judge
 text the ledger no longer holds, so its review goes to the human as a pending one. A `grouped` one has no text of its
 own on the PR to diverge, so it does not; a muted one whose group's text the human deleted, edited or dropped, or one
-in a review saved before `muted` existed, is held `unmapped`.
+in a review saved before `muted` or `lead` existed, is held `unmapped`.
 
 The disputes join the threads.py snapshot to the findings whose inline comment our
 own verified review posted (commentId, recorded by post.py from its read-back):
@@ -567,9 +568,12 @@ def fixable(led, snapshot, head):
     rev = submitted_last(led, head)
     hold = holder(led, snapshot)
     standing = [(f, hold(f)) for f in rev.get('findings', []) if f['status'] in OPEN]
-    # The defects whose group's printed text still stands: a thread claim, or a mate's own text as we posted it.
-    stated = ({c.get('defect') for c in rev.get('claims') or []}
-              | {f.get('defect') for f, why in standing if not f.get('muted') and why not in UNVOUCHED}) - {None}
+    # The defects whose group's printed text still stands: a claim whose comment is on the PR, or the lead's own text
+    # as we posted it; a mate posted beside its group states only itself.
+    on_pr = {c['id'] for c in snapshot.get('comments', [])}
+    stated = ({c.get('defect') for c in rev.get('claims') or [] if c.get('commentId') in on_pr}
+              | {f.get('defect') for f, why in standing
+                 if f.get('lead') and not f.get('muted') and why not in UNVOUCHED}) - {None}
     fix, held = [], []
     for f, why in standing:
         if why == 'unmapped' and f.get('muted') and f.get('defect') in stated:

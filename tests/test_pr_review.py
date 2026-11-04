@@ -2476,13 +2476,13 @@ class Fixable(PostCase):
         self.assertEqual(([f['id'] for f in got['fix']], got['held']), (['pr7-f1'], []))
 
     def group(self, change=None, muted=True):
-        """The setUp review as one defect, its second finding left out as the muted member (no text of its own);
-        muted=None leaves the key out, as a review saved before the flag does."""
+        """The setUp review as one defect led by its first finding, its second left out as the muted member (no text
+        of its own); muted=None leaves the key out, as a review saved before the flag does."""
         led = json.loads(self.pristine)
         rev = led['reviews'][-1]
         rev['draft']['moved'] = []
-        for f in rev['findings']:
-            f['defect'] = 0
+        for k, f in enumerate(rev['findings']):
+            f.update(defect=0, lead=k == 0)
         if muted is None:
             rev['findings'][1].pop('muted', None)
         else:
@@ -2529,18 +2529,44 @@ class Fixable(PostCase):
         self.assertEqual(self.outcome(self.group()), ([], [('pr7-f1', 'deleted'), ('pr7-f2', 'unmapped')], False))
         self.assertEqual(self.outcome(self.group(lambda r: r['findings'][0].update(status='dropped'))), ([], [('pr7-f2', 'unmapped')], False))
 
-    def test_a_thread_claim_of_the_group_states_a_muted_finding_whose_lead_text_is_gone(self):
+    def test_a_lead_saved_without_the_flag_or_a_mate_posted_beside_its_group_does_not_state_it(self):
+        self.assertEqual(self.outcome(self.group(lambda r: r['findings'][0].pop('lead'))), (['pr7-f1'], [('pr7-f2', 'unmapped')], False))
+
+        def beside(r):
+            # The lead dropped; pr7-f1's comment, still standing, is that of a mate posted beside its group.
+            r['findings'].append({**r['findings'][0], 'id': 'pr7-f3', 'commentId': None, 'status': 'dropped'})
+            r['findings'][0]['lead'] = False
+        self.assertEqual(self.outcome(self.group(beside)), (['pr7-f1'], [('pr7-f2', 'unmapped')], False))
+
+    def bot_claim(self, resolved=False):
+        """A bot's inline comment 900, on its own thread, claiming the group's defect; the change adding its claim."""
+        self.gh.inline.append({'id': 900, 'path': 'src/core/a.c', 'line': 1, 'body': 'a shadows a global', 'created_at': self.gh.tick(),
+                               'user': {'login': 'bot[bot]', 'type': 'Bot'}})
+        self.gh.threads.append({'id': 'T900', 'isResolved': resolved, 'isOutdated': False, 'comments': {'nodes': [{'databaseId': 900}]}})
+
         def claimed(r):
             r['findings'][0]['status'] = 'dropped'
-            r['claims'] = [{'commentId': 900, 'author': 'bot', 'claim': 'a shadows a global', 'verdict': 'confirmed',
+            r['claims'] = [{'commentId': 900, 'author': 'bot[bot]', 'claim': 'a shadows a global', 'verdict': 'confirmed',
                             'severity': 'medium', 'defect': 0}]
-        self.assertEqual(self.outcome(self.group(claimed)), ([], [('pr7-f2', 'grouped')], True))
+        return claimed
+
+    def test_a_thread_claim_of_the_group_states_a_muted_finding_whose_lead_text_is_gone(self):
+        self.assertEqual(self.outcome(self.group(self.bot_claim())), ([], [('pr7-f2', 'grouped')], True))
+
+    def test_a_claim_on_a_resolved_thread_still_states_its_group(self):
+        self.assertEqual(self.outcome(self.group(self.bot_claim(resolved=True))), ([], [('pr7-f2', 'grouped')], True))
+
+    def test_a_claim_whose_comment_is_gone_from_the_pr_no_longer_states_its_group(self):
+        claimed = self.bot_claim()
+        self.gh.inline = [c for c in self.gh.inline if c['id'] != 900]
+        self.gh.threads = [t for t in self.gh.threads if t['id'] != 'T900']
+        self.assertEqual(self.outcome(self.group(claimed)), ([], [('pr7-f2', 'unmapped')], False))
 
     def test_a_carried_finding_the_latest_review_no_longer_mutes_is_unmapped(self):
         lead = {'id': 'pr7-f1', 'file': 'src/core/a.c', 'line': 21, 'why': 'b is never initialised', 'severity': 'high',
-                'dimension': 'correctness', 'status': 'open', 'defect': 0, 'muted': False}
+                'dimension': 'correctness', 'status': 'open', 'defect': 0, 'muted': False, 'lead': True}
         mate = {'file': 'src/core/c.c', 'line': 1, 'why': 'b is never initialised, seen from c', 'severity': 'high',
-                'dimension': 'concurrency', 'status': 'open', 'defect': 0, 'muted': True}
+                'dimension': 'concurrency', 'status': 'open', 'defect': 0, 'muted': True, 'lead': False}
         self.assertEqual(self.outcome(self.carried([lead, mate])), (['pr7-f1'], [('pr7-f3', 'grouped')], True))
         self.assertEqual(self.outcome(self.carried([lead, {**mate, 'id': 'pr7-f3', 'defect': None, 'muted': False}], 'd')),
                          (['pr7-f1'], [('pr7-f3', 'unmapped')], False), 'the saved record keeps no stale muted')
