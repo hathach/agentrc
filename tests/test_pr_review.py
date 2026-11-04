@@ -2476,11 +2476,17 @@ class Fixable(PostCase):
         self.assertEqual(([f['id'] for f in got['fix']], got['held']), (['pr7-f1'], []))
 
     def group(self, change=None, muted=True):
-        """The setUp review with its second finding left out as its group's muted member (no text of its own)."""
+        """The setUp review as one defect, its second finding left out as the muted member (no text of its own);
+        muted=None leaves the key out, as a review saved before the flag does."""
         led = json.loads(self.pristine)
         rev = led['reviews'][-1]
         rev['draft']['moved'] = []
-        rev['findings'][1]['muted'] = muted
+        for f in rev['findings']:
+            f['defect'] = 0
+        if muted is None:
+            rev['findings'][1].pop('muted', None)
+        else:
+            rev['findings'][1]['muted'] = muted
         if change:
             change(rev)
         Path(self.p['ledger']).write_text(json.dumps(led))
@@ -2511,11 +2517,24 @@ class Fixable(PostCase):
                                'user': {'login': 'contrib'}})
         self.gh.threads[0]['comments']['nodes'].append({'databaseId': 950})
         self.assertEqual(self.outcome(self.group()), ([], [('pr7-f1', 'replied'), ('pr7-f2', 'grouped')], True))
+
+    def test_a_muted_finding_whose_group_text_no_longer_stands_is_unmapped(self):
+        self.assertEqual(self.outcome(self.group(lambda r: r['findings'][0].update(defect=1))), (['pr7-f1'], [('pr7-f2', 'unmapped')], False),
+                         'a lead of another defect does not state it')
+        # The lead's text edited or deleted on the PR, or deleted from the pending review before the human submitted it.
         next(c for c in self.gh.inline if c['id'] == self.root)['body'] = 'edited'
-        self.assertEqual(self.outcome(self.group()), ([], [('pr7-f1', 'edited'), ('pr7-f2', 'grouped')], False))
+        self.assertEqual(self.outcome(self.group()), ([], [('pr7-f1', 'edited'), ('pr7-f2', 'unmapped')], False))
         self.gh.inline = [c for c in self.gh.inline if c['id'] != self.root]
         self.gh.threads = []
-        self.assertEqual(self.outcome(self.group()), ([], [('pr7-f1', 'deleted'), ('pr7-f2', 'grouped')], False))
+        self.assertEqual(self.outcome(self.group()), ([], [('pr7-f1', 'deleted'), ('pr7-f2', 'unmapped')], False))
+        self.assertEqual(self.outcome(self.group(lambda r: r['findings'][0].update(status='dropped'))), ([], [('pr7-f2', 'unmapped')], False))
+
+    def test_a_thread_claim_of_the_group_states_a_muted_finding_whose_lead_text_is_gone(self):
+        def claimed(r):
+            r['findings'][0]['status'] = 'dropped'
+            r['claims'] = [{'commentId': 900, 'author': 'bot', 'claim': 'a shadows a global', 'verdict': 'confirmed',
+                            'severity': 'medium', 'defect': 0}]
+        self.assertEqual(self.outcome(self.group(claimed)), ([], [('pr7-f2', 'grouped')], True))
 
     def test_a_carried_finding_the_latest_review_no_longer_mutes_is_unmapped(self):
         lead = {'id': 'pr7-f1', 'file': 'src/core/a.c', 'line': 21, 'why': 'b is never initialised', 'severity': 'high',
