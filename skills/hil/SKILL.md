@@ -184,7 +184,7 @@ dispatch.
 
 ## Board registry
 
-Each rig board is wired to one probe, so how it is flashed is a farm fact, kept once
+Each shared-farm board is wired to one probe, so how it is flashed is a farm fact, kept once
 for every project in `boards.json` beside this page and keyed by that probe's serial:
 its `flasher` (without `uid`: the key is it) and optional `flasher_recover` (the
 shapes below) and a `name`, the board's lock name on every host (Board locks): unique,
@@ -196,8 +196,8 @@ name, tests and project fields, never the registry's.
 `scripts/hil_boards.py` is the one reader, and its docstring states what it refuses:
 every consumer that needs a board's flasher resolves the roster entry through it
 (`resolve`, `resolve_roster`, or `hil_boards.py roster FILE`); the resolved
-`flasher.uid` is the probe serial, and a bench board on a dev PC, without `probe`,
-keeps a flasher of its own. A reader that needs only names reads the roster raw; one
+`flasher.uid` is the probe serial, and a board without `probe` (a bench board on a dev PC,
+or a rig one project owns) keeps a flasher of its own. A reader that needs only names reads the roster raw; one
 that needs a lock name takes `lock_name(entry, own)`, `own` being the project's lock
 field. `hil_boards.py lock FILE BOARD` prints the registry name, or a bench board's
 roster name, never a project lock field: a contract with one takes it through its

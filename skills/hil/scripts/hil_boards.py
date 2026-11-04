@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The farm's board registry (`skills/hil/boards.json`): how each rig board is flashed, keyed by
+"""The farm's board registry (`skills/hil/boards.json`): how each shared-farm board is flashed, keyed by
 the serial of the debug probe it is wired to. Each board has one probe, so its `flasher` and
 `flasher_recover` are farm facts, not a project's. A project roster names the board by
 `probe` and keeps its own `uid`, the serial its firmware reports, which differs per firmware.
@@ -14,7 +14,7 @@ plain file name, and renamed only with a migration of the locks and records nami
 
 resolve(entry) is a roster entry with its board's `flasher` (its `uid` the probe serial) and
 `flasher_recover` filled in, a new dict. An entry with `probe` that also carries either is
-refused as a duplicate; one without `probe` (a bench board on a dev PC) keeps its own, unless
+refused as a duplicate; one without `probe` (a bench board, or a rig one project owns) keeps its own, unless
 its probe is a registered board's. resolve_roster(roster) resolves `boards` and `boards-skip`.
 Both raise ValueError naming every problem. lock_name(entry, own) is an entry's board lock.
 
