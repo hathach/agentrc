@@ -85,7 +85,8 @@ ERROR_CHARS = 200
 CLEANUP = 20
 # Run by pre-commit's own interpreter, which depends on PyYAML, when this one lacks it: the config as JSON.
 LOAD_CONFIG = 'import json, sys, yaml; print(json.dumps(yaml.safe_load(open(sys.argv[1], encoding="utf-8"))))'
-SHEBANG_PYTHON = re.compile(r'python[\d.]*')
+# Any CPython or PyPy build's name: python3, python3.12, python3.13t, python3-dbg, pypy3.
+SHEBANG_PYTHON = re.compile(r'(?:python|pypy)[\w.-]*')
 # The failure a run that failed naming no hook adds: not a hook id, so never excused or skipped.
 UNOWNED = '(pre-commit)'
 # What points git at a repository or its index; set by a caller, it would send HEAD's tree's resets and reruns to the
@@ -97,11 +98,12 @@ C_ESCAPES = {b'a': b'\a', b'b': b'\b', b'f': b'\f', b'n': b'\n', b'r': b'\r', b'
 # What differs between two runs of the same failure: a number standing alone (a duration with its units, a line
 # number, a count, a pid, an address), an ISO 8601 time, a pytest-xdist worker's number, or a name tempfile, mktemp
 # or gcc made. Any other digit inside a word (usb2.c, E501) names a file, rule or symbol, so it stays. An
-# all-lowercase gcc name (about 1 in 180) stays too, as a source such as ccdriver.c reads alike: it only fails safe.
+# all-lowercase gcc name is masked only directly in a tmp or temp directory, as a source such as ccdriver.c reads alike.
 UNIT = r'(?:[hm]|min|sec|[mµun]?s)'
 VARYING = re.compile(r'\b\d{4}-\d\d-\d\dT\d\d:\d\d(?::\d\d(?:[.,]\d+)?)?Z?'
                      rf'|\b(?:0x[0-9a-fA-F]+|\d+(?:\.\d+)*(?:{UNIT}(?:\d+(?:\.\d+)?{UNIT})*)?)\b|(?<=\[gw)\d+(?=\])'
-                     r'|\btmp(?:\w{8}|\.[A-Za-z0-9]{10})\b|(?<=[/\\])cc(?![a-z]{6})[A-Za-z0-9]{6}(?=\.)')
+                     r'|\btmp(?:\w{8}|\.[A-Za-z0-9]{10})\b|(?<=[/\\])cc(?![a-z]{6})[A-Za-z0-9]{6}(?=\.)'
+                     r'|(?i:(?<=[/\\]tmp[/\\])|(?<=[/\\]temp[/\\]))cc[a-z]{6}(?=\.)')
 
 
 def status_paths(records):

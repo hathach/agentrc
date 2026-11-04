@@ -2,6 +2,7 @@
 import importlib.util
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -245,6 +246,7 @@ class HooksTest(unittest.TestCase):
                    "runpy.run_path(sys.argv[0], run_name='__main__')")
         done = subprocess.run([sys.executable, '-c', no_yaml, str(SCRIPT), 'a.txt'], cwd=self.repo, env=self.env,
                               capture_output=True, text=True)
+        self.assertTrue(done.stdout.strip(), done.stderr)
         out = json.loads(done.stdout.splitlines()[-1])
         self.assertEqual((done.returncode, out['baselineFailed'], out['notRerun']), (0, ['broken'], []))
 
@@ -383,6 +385,7 @@ class HooksTest(unittest.TestCase):
         self.assertEqual((code, out['passed']), (0, False))
         self.assertEqual([f['hook'] for f in out['failed']], ['broken', 'nocc', 'picky'])
         self.assertEqual(out['baselineFailed'], ['broken', 'nocc'])
+        self.assertEqual(out['notRerun'], [], 'picky was rerun on HEAD and passed there')
 
     def test_an_id_another_hook_takes_as_its_alias_is_never_excused(self):
         # SKIP=broken would skip picky too (pre-commit matches aliases), and fail_fast stopped the run before it.
@@ -702,6 +705,21 @@ class RunHooksTest(unittest.TestCase):
             ran, passed, ids, failures, excused, _ = hooks.run_hooks(['a.txt'])
         self.assertEqual((ids, [f['hook'] for f in failures], excused), (['fmt'], ['broken'], ['broken']))
 
+    def test_a_hook_the_run_without_the_excused_finds_unexcusable_is_never_rerun_and_says_why(self):
+        # fail_fast hid them behind broken: one rewrites files there, one SKIP cannot name, one shares its id.
+        Path(hooks.CONFIG).write_text(CONFIG.format(''.join(HOOK.format(id=i) for i in ('broken', 'dup', 'dup'))))
+        fmt = 'fmt' + '.' * 70 + 'Failed\n- hook id: fmt\n- exit code: 1\n- files were modified by this hook\n'
+        hidden = fmt + self.BROKEN.replace('broken', 'a,b') + self.BROKEN.replace('broken', 'dup')
+        with mock.patch.object(hooks, 'pre_commit', lambda *a, skip=(), **k: (1, hidden if skip else self.BROKEN)), \
+                mock.patch.object(hooks, 'baseline', return_value=['broken']) as baseline:
+            _, _, ids, failures, excused, not_rerun = hooks.run_hooks(['a.txt'])
+        baseline.assert_called_once()
+        self.assertEqual((ids, excused), (['fmt'], ['broken']))
+        self.assertEqual([f['hook'] for f in failures], ['broken', 'fmt', 'a,b', 'dup'])
+        self.assertEqual(not_rerun, [{'hook': 'fmt', 'why': 'it modified files'},
+                                     {'hook': 'a,b', 'why': 'SKIP cannot name it'},
+                                     {'hook': 'dup', 'why': 'SKIP would skip another hook by it'}])
+
     def test_nothing_is_rerun_on_head_when_the_config_cannot_be_read(self):
         # Its aliases unknown, SKIP could skip a hook that never ran on the change.
         Path(hooks.CONFIG).write_text('repos: [\n')
@@ -711,7 +729,7 @@ class RunHooksTest(unittest.TestCase):
         baseline.assert_not_called()
         self.assertEqual(excused, [])
         self.assertEqual([n['hook'] for n in not_rerun], ['broken'])
-        self.assertRegex(not_rerun[0]['why'], rf'^{hooks.CONFIG} cannot be read \(\w+Error\)$')
+        self.assertRegex(not_rerun[0]['why'], rf'^{re.escape(hooks.CONFIG)} cannot be read \(\w+Error\)$')
 
     def test_nothing_is_rerun_on_head_without_pyyaml_or_a_known_pre_commit_python_and_the_failure_says_why(self):
         with mock.patch.object(hooks, 'yaml', None), mock.patch.object(hooks, 'pre_commit_python', return_value=None), \
@@ -726,6 +744,8 @@ class RunHooksTest(unittest.TestCase):
     def without_pyyaml(self, config, interpreter=sys.executable):
         """run_hooks' excused and notRerun without PyYAML here, the pre-commit on PATH a symlink to an entry script
         whose #! line names interpreter."""
+        if ' ' in interpreter or not hooks.SHEBANG_PYTHON.fullmatch(os.path.basename(interpreter)):
+            self.skipTest(f'a #! line cannot name {interpreter} as a python: a space splits it, or its name is not one')
         Path(hooks.CONFIG).write_text(config)
         for d in ('bin', 'venv'):
             os.mkdir(d)
@@ -738,13 +758,13 @@ class RunHooksTest(unittest.TestCase):
             *_, excused, not_rerun = hooks.run_hooks(['a.txt'])
         return baseline, excused, not_rerun
 
-    @unittest.skipIf(os.name == 'nt' or ' ' in sys.executable, "a Windows pre-commit is a launcher, not a #! script")
+    @unittest.skipIf(os.name == 'nt', "a Windows pre-commit is a launcher, not a #! script")
     def test_without_pyyaml_pre_commits_own_python_reads_the_config(self):
         baseline, excused, not_rerun = self.without_pyyaml(CONFIG.format(HOOK.format(id='broken')))
         baseline.assert_called_once()
         self.assertEqual((excused, not_rerun), (['broken'], []))
 
-    @unittest.skipIf(os.name == 'nt' or ' ' in sys.executable, "a Windows pre-commit is a launcher, not a #! script")
+    @unittest.skipIf(os.name == 'nt', "a Windows pre-commit is a launcher, not a #! script")
     def test_without_pyyaml_an_id_pre_commits_python_reads_as_shared_is_never_rerun(self):
         baseline, excused, not_rerun = self.without_pyyaml(CONFIG.format(HOOK.format(id='broken') * 2))
         baseline.assert_not_called()
@@ -759,6 +779,23 @@ class RunHooksTest(unittest.TestCase):
         baseline.assert_not_called()
         self.assertEqual((excused, not_rerun), ([], [{'hook': 'broken', 'why': (
             f"pre-commit's {python} cannot read {hooks.CONFIG} (ModuleNotFoundError: No module named 'yaml')")}]))
+
+    @unittest.skipIf(os.name == 'nt', "a Windows pre-commit is a launcher, not a #! script")
+    def test_without_pyyaml_a_pre_commit_python_that_cannot_start_reruns_nothing(self):
+        python = os.path.abspath('python3')
+        baseline, excused, not_rerun = self.without_pyyaml('repos: []\n', python)
+        baseline.assert_not_called()
+        self.assertEqual((excused, not_rerun), ([], [{'hook': 'broken', 'why': (
+            f"pre-commit's {python} cannot run (FileNotFoundError)")}]))
+
+    @unittest.skipIf(os.name == 'nt', "a Windows pre-commit is a launcher, not a #! script")
+    def test_without_pyyaml_a_pre_commit_python_printing_no_json_reruns_nothing(self):
+        Path('python3').write_text('#!/bin/sh\necho not json\n')
+        os.chmod('python3', 0o755)
+        baseline, excused, not_rerun = self.without_pyyaml('repos: []\n', os.path.abspath('python3'))
+        baseline.assert_not_called()
+        self.assertEqual((excused, not_rerun), ([], [{'hook': 'broken', 'why': (
+            f'{hooks.CONFIG} cannot be read (JSONDecodeError)')}]))
 
     def test_an_id_skip_cannot_name_is_never_rerun_on_head(self):
         out = self.BROKEN.replace('broken', 'a,b')
@@ -781,8 +818,10 @@ class PreCommitPythonTest(unittest.TestCase):
     def test_the_interpreter_and_its_one_argument_are_read_as_the_kernel_does(self):
         found, where = self.entry(b'#! /usr/bin/python3 -s -E')
         self.assertEqual(found, (['/usr/bin/python3', '-s -E'], where))
-        found, where = self.entry(b'#!/opt/venvs/pre-commit/bin/python3.12')
-        self.assertEqual(found, (['/opt/venvs/pre-commit/bin/python3.12'], where))
+        for python in (b'/opt/venvs/pre-commit/bin/python3.12', b'/usr/bin/python3.13t', b'/usr/bin/python3-dbg',
+                       b'/opt/pypy/bin/pypy3'):
+            found, where = self.entry(b'#!' + python)
+            self.assertEqual(found, ([python.decode()], where))
 
     def test_a_line_naming_no_python_by_absolute_path_is_no_interpreter(self):
         # env, distlib's /bin/sh form for a long path, a launcher .exe, a relative path, or no #! at all
@@ -830,6 +869,8 @@ class AsCheckoutTest(unittest.TestCase):
                              ('[gw0] linux -- Python 3.12.3 /usr/bin/python\n',
                               '[gw3] linux -- Python 3.12.3 /usr/bin/python\n'),
                              ('/tmp/ccAb12Cd.o: undefined reference\n', '/tmp/cco1y76V.o: undefined reference\n'),
+                             ('/tmp/ccabcdef.o: undefined reference\n', '/tmp/ccAb12Cd.o: undefined reference\n'),
+                             ('C:\\T\\Temp\\ccqwerty.o: undefined\n', 'C:\\T\\Temp\\cc3Xy7Zq.o: undefined\n'),
                              ('/tmp/tmp.Ab3dE5fG7h: denied\n', '/tmp/tmp.yiJuMi1EqI: denied\n')):
             self.assertEqual(hooks.comparable(head, '/x'), hooks.comparable(change, '/x'), change)
 
