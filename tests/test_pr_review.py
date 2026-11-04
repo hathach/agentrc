@@ -2510,13 +2510,14 @@ class Fixable(PostCase):
         self.assertEqual(self.outcome(self.group(lambda r: r['draft'].update(moved=json.loads(self.pristine)['reviews'][-1]['draft']['moved']))),
                          (['pr7-f1', 'pr7-f2'], [], True))
 
-    def test_a_held_group_mate_keeps_its_own_hold_beside_a_grouped_member(self):
+    def test_a_contested_lead_no_longer_states_its_group(self):
+        # The recheck may withdraw a disputed or replied lead and judge its muted mate without the lead's thread.
         self.assertEqual(self.outcome(self.group(lambda r: r['findings'][0].update(status='disputed'))),
-                         ([], [('pr7-f1', 'disputed'), ('pr7-f2', 'grouped')], True))
+                         ([], [('pr7-f1', 'disputed'), ('pr7-f2', 'unmapped')], False))
         self.gh.inline.append({'id': 950, 'in_reply_to_id': self.root, 'body': 'intentional', 'created_at': self.gh.tick(),
                                'user': {'login': 'contrib'}})
         self.gh.threads[0]['comments']['nodes'].append({'databaseId': 950})
-        self.assertEqual(self.outcome(self.group()), ([], [('pr7-f1', 'replied'), ('pr7-f2', 'grouped')], True))
+        self.assertEqual(self.outcome(self.group()), ([], [('pr7-f1', 'replied'), ('pr7-f2', 'unmapped')], False))
 
     def test_a_muted_finding_whose_group_text_no_longer_stands_is_unmapped(self):
         self.assertEqual(self.outcome(self.group(lambda r: r['findings'][0].update(defect=1))), (['pr7-f1'], [('pr7-f2', 'unmapped')], False),
@@ -2552,6 +2553,17 @@ class Fixable(PostCase):
 
     def test_a_thread_claim_of_the_group_states_a_muted_finding_whose_lead_text_is_gone(self):
         self.assertEqual(self.outcome(self.group(self.bot_claim())), ([], [('pr7-f2', 'grouped')], True))
+
+    def test_a_claim_led_group_holds_every_muted_finding_grouped_while_its_comment_is_listed(self):
+        claimed = self.bot_claim()
+
+        def led_by_claim(r):
+            claimed(r)
+            r['findings'][0].update(status='open', muted=True, commentId=None)
+        self.assertEqual(self.outcome(self.group(led_by_claim)), ([], [('pr7-f1', 'grouped'), ('pr7-f2', 'grouped')], True))
+        self.gh.inline = [c for c in self.gh.inline if c['id'] != 900]
+        self.gh.threads = [t for t in self.gh.threads if t['id'] != 'T900']
+        self.assertEqual(self.outcome(self.group(led_by_claim)), ([], [('pr7-f1', 'unmapped'), ('pr7-f2', 'unmapped')], False))
 
     def test_a_claim_on_a_resolved_thread_still_states_its_group(self):
         self.assertEqual(self.outcome(self.group(self.bot_claim(resolved=True))), ([], [('pr7-f2', 'grouped')], True))

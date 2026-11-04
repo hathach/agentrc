@@ -44,17 +44,16 @@ file is always written anew, atomically, so a rerun reads the same bytes and a d
 --fixable, with a fresh threads.py snapshot, prints what an auto-fix repair may take from the review posted on
 SHA, which must be the last review on the PR: each standing finding as `fix` (its row, as show lists it, with
 `published`, its comment text as the human edited it, or null, and `claimDigest`, the digest of that text or its own
-words, which a repair's fix check names) when the text it stands in on the PR is the one a
-receipt of ours recorded, unedited, and nobody but us or a bot has replied
-on its thread since our last verified answer; else in `held` with why: `disputed`, `unmapped` (no receipt places
-its text), `grouped` (unmapped and `muted`: the review left it out because its group's printed text states its
-defect, and that text still stands: a claim of that review whose comment the snapshot still lists, or the group's
-`lead` finding not muted and not held `unmapped`, `deleted` or `edited`), `deleted`, `edited` (the inline comment, or
-the body of the review it was moved into, reads otherwise) or `replied`. `autoPost` is false when any is held
-`unmapped`, `deleted` or `edited`: a recheck would judge
-text the ledger no longer holds, so its review goes to the human as a pending one. A `grouped` one has no text of its
-own on the PR to diverge, so it does not; a muted one whose group's text the human deleted, edited or dropped, or one
-in a review saved before `muted` or `lead` existed, is held `unmapped`.
+words, which a repair's fix check names) when the text it stands in on the PR is the one a receipt of ours recorded,
+unedited, and nobody but us or a bot has replied on its thread since our last verified answer; else in `held` with
+why: `disputed`, `unmapped` (no receipt places its text), `grouped` (unmapped and `muted`: the review left it out
+because its group's printed text states its defect, and that text still stands: a claim of that review whose comment
+the snapshot still lists, or the group's `lead` finding, not muted and itself in `fix`), `deleted`, `edited` (the
+inline comment, or the body of the review it was moved into, reads otherwise) or `replied`. `autoPost` is false when
+any is held `unmapped`, `deleted` or `edited`: a recheck would judge text the ledger no longer holds, so its review
+goes to the human as a pending one. A `grouped` one has no text of its own on the PR to diverge, so it does not; a
+muted one whose group's text the human deleted, edited, dropped or contested, or one in a review saved before `muted`
+existed, is held `unmapped`, and one in a review saved before `lead` existed is grouped only through a listed claim.
 
 The disputes join the threads.py snapshot to the findings whose inline comment our
 own verified review posted (commentId, recorded by post.py from its read-back):
@@ -569,11 +568,12 @@ def fixable(led, snapshot, head):
     hold = holder(led, snapshot)
     standing = [(f, hold(f)) for f in rev.get('findings', []) if f['status'] in OPEN]
     # The defects whose group's printed text still stands: a claim whose comment is on the PR, or the lead's own text
-    # as we posted it; a mate posted beside its group states only itself.
+    # as we posted it, uncontested (a recheck may withdraw a disputed or replied lead and judge its mate without it);
+    # a mate posted beside its group states only itself.
     on_pr = {c['id'] for c in snapshot.get('comments', [])}
     stated = ({c.get('defect') for c in rev.get('claims') or [] if c.get('commentId') in on_pr}
               | {f.get('defect') for f, why in standing
-                 if f.get('lead') and not f.get('muted') and why not in UNVOUCHED}) - {None}
+                 if f.get('lead') and not f.get('muted') and why is None}) - {None}
     fix, held = [], []
     for f, why in standing:
         if why == 'unmapped' and f.get('muted') and f.get('defect') in stated:
