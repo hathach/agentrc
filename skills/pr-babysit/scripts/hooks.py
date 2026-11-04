@@ -30,21 +30,21 @@ the config takes as its alias (SKIP skips those hooks too, and a fail_fast stop
 at one leaves the rest unchecked), nor any when the config cannot be read:
 with PyYAML, or without it by pre-commit's own interpreter when the #! line of
 pre-commit's entry script names a python by absolute path (not on Windows);
-notRerun is {hook, why} for each failed hook not rerun
-there. Each rerun gets a clean HEAD tree. The tree has only what HEAD
-tracks: a hook that needs the checkout's ignored files (fetched dependencies)
-fails there differently and stays counted. A change that leaves a hook's
-output the same once masked is still excused: a hook that prints only a count
-of its violations, or a new violation replacing one of HEAD's that differs from
-it only in numbers; CI runs the hook on the pushed head. When every failure is
-excused, the hooks run once more on the change, with its retry, and SKIP naming
-the excused ones, as the commit will, so a fail_fast stop cannot hide a hook
-the change breaks: what fails there joins failed and is rerun on HEAD in turn,
-the hooks running again while every new failure is excused, and a failed run
-that names no hook adds the failure `(pre-commit)`. An alias only a remote
-repository's own manifest declares is not seen, so such a hook may go unrun on
-the change until CI. pre-commit runs with core.abbrev pinned (#377), which the
-hooks' own git commands inherit.
+notRerun is {hook, why} for each failed hook not rerun there. Each rerun gets a
+clean HEAD tree. The tree has only what HEAD tracks: a hook that needs the
+checkout's ignored files (fetched dependencies) fails there differently and
+stays counted. A change that leaves a hook's output the same once masked is
+still excused: a hook that prints only a count of its violations, or a new
+violation replacing one of HEAD's that differs from it only in numbers; CI runs
+the hook on the pushed head. When every failure is excused, the hooks run once
+more on the change, with its retry, and SKIP naming the excused ones, as the
+commit will, so a fail_fast stop cannot hide a hook the change breaks: what
+fails there joins failed and is rerun on HEAD in turn, the hooks running again
+while every new failure is excused, and a failed run that names no hook adds the
+failure `(pre-commit)`. An alias only a remote repository's own manifest
+declares is not seen, so such a hook may go unrun on the change until CI.
+pre-commit runs with core.abbrev pinned (#377), which the hooks' own git
+commands inherit.
 Exit 0 with that line; exit 2 with {"error": ...} when the facts cannot be
 collected or pre-commit's output contradicts its exit status.
 """
