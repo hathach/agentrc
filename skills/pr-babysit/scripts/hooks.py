@@ -338,7 +338,8 @@ def pre_commit_python():
         return None
     # The kernel passes what follows the interpreter as one argument.
     words = line[2:].decode('utf-8', 'replace').strip().split(None, 1) if line.startswith(b'#!') else []
-    if not (words and os.path.isabs(words[0]) and SHEBANG_PYTHON.fullmatch(os.path.basename(words[0]))):
+    # A #! path is POSIX's: absolute from '/', whatever os.path.isabs says on Windows (3.13+ wants a drive there).
+    if not (words and words[0].startswith('/') and SHEBANG_PYTHON.fullmatch(os.path.basename(words[0]))):
         return None
     return words, os.path.dirname(script)
 
