@@ -1280,6 +1280,12 @@ class Commission(Base):
         with self.assertRaisesRegex(H.Refused, 'not proven ended'):
             H.op_restore(restore, None, self.dir / 'run', None, None)
 
+    def test_an_unusable_run_dir_refuses_before_the_lock(self):
+        with mock.patch.object(H, 'Tracker', side_effect=PermissionError('chmod')), \
+                self.assertRaisesRegex(H.Refused, 'run dir .*chmod'):
+            H.cmd_commission(self.args('rig_jlink'))
+        self.assertEqual(self.lock.taken, [])
+
     def test_interrupt_after_the_release_is_not_a_held_board(self):
         ino = [0]
 

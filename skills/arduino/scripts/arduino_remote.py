@@ -292,8 +292,16 @@ def cmd_session_stage(a):
     return 0
 
 
+def own_opt(o):
+    """Whether argparse would read `o` as a session option: `-bX` is `-b X`, a long option's unique prefix is it."""
+    if not o.startswith('--'):
+        return o.startswith('-b')
+    name = o.split('=')[0]
+    return len(name) > 2 and any(own.startswith(name) for own in OWN_OPTS if own.startswith('--'))
+
+
 def session_argv(s, cmd, opts, argv):
-    clash = [o for o in opts if o.split('=')[0] in OWN_OPTS]
+    clash = [o for o in opts if own_opt(o)]
     if clash:
         core.fail(f'{", ".join(clash)} come from the session; leave them out')
     if cmd == 'exec' and not argv:

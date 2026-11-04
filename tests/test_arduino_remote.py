@@ -315,9 +315,15 @@ class Session(Checkout):
                                           '--', 'ls', '-l'])
         R.main(['session', 'exec', 's1', 'gdb', '--build-record', 'r.json', '--sketch', 'echo', '--ex', 'bt'])
         self.assertEqual(self.calls[-1][-7:], ['--build-record', 'r.json', '--sketch', 'echo', '--ex', 'bt', ROSTER])
-        for bad in (['flash', '-b', 'x'], ['flash', '--under-hold=x'], ['exec'], ['lock', 'status'], []):
+        for bad in (['flash', '-b', 'x'], ['flash', '--under-hold=x'], ['exec'], ['lock', 'status'], [],
+                    ['flash', '--stag', 'x'], ['flash', '--stag='], ['flash', '--under', 'x'], ['flash', '--boa', 'x'],
+                    ['flash', '-bX'], ['flash', '-b=X']):
             with self.subTest(bad=bad), self.assertRaises(SystemExit):
                 R.main(['session', 'exec', 's1', *bad])
+        R.main(['session', 'exec', 's1', 'flash', '--bundle', 'b', '--build-record', 'r', '--sketch', 'echo'])
+        self.assertEqual(self.calls[-1][-7:], ['--bundle', 'b', '--build-record', 'r', '--sketch', 'echo', ROSTER])
+        R.main(['session', 'exec', 's1', 'console', '--baud', '9600'])
+        self.assertEqual(self.calls[-1][-3:], ['--baud', '9600', ROSTER])
         with self.assertRaisesRegex(SystemExit, 'no session s9 was opened'):
             R.main(['session', 'exec', 's9', 'exec', '--', 'true'])
 

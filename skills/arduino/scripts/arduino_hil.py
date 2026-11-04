@@ -1148,11 +1148,15 @@ def cmd_commission(args):
                 if 'usb_port' not in board or d['busport'] == board['usb_port']}
     run_dir = P.ROOT / 'build' / 'hil-manual' / f'commission-{args.board}-{time.strftime("%Y%m%d-%H%M%S")}'
     run_dir.mkdir(parents=True, exist_ok=True)
+    try:   # before the protected lock: a failure after it would leave a record that blocks an untouched board
+        tracker = Tracker(run_dir)
+    except OSError as e:
+        raise Refused(f'run dir {run_dir}: {e}')
     try:
         fh = A.lock.take_board_lock(args.board, 'hil_test.py commission', protected=True, locks=[args.board])
     except (A.lock.BoardLocked, A.lock.RecoveryBlocked, A.lock.LockUnavailable) as e:
         raise Refused(f'{args.board}: {e}')
-    tracker, out, touched = Tracker(run_dir), {'board': args.board, 'rosterUid': board['uid']}, False
+    out, touched = {'board': args.board, 'rosterUid': board['uid']}, False
     try:
         why = pending_problem(args.board)
         if why:
