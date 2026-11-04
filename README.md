@@ -149,8 +149,9 @@ and write UTF-8 themselves, so no `-X utf8` or `PYTHONUTF8` is needed. Bash's
 - a `python3` that is a native CPython 3.12+ (python.org's install manager or
   MSYS2's mingw build), not the WindowsApps alias and not MSYS2's
   `/usr/bin/python3`, for the workflows' script calls and the simplify gate's
-  wrapper; PyYAML in it for the tests, and for `pr-babysit`'s `harvest.py`, which
-  `pr-review` also imports, to date a head by its pull_request runs (without it
+  wrapper; PyYAML, pytest and pytest-xdist in it for the tests, and PyYAML for
+  `pr-babysit`'s `harvest.py`, which `pr-review` also imports, to date a head by
+  its pull_request runs (without it
   they go unread and the harvest says so). `install.py` registers a Python hook as
   `'<the python that ran install.py>' '<hook>.py'`, since a hook that cannot
   start lets the tool call through; rerun it after replacing that Python, and
