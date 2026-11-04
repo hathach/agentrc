@@ -215,7 +215,10 @@ sequence:
       `prepare.py --check` on it: a moved head ends the repair ("head moved
       before repair"). Chief's writer path fixes the `fix` findings its fix
       policy selects, never a `held` one, each by its `published` text where
-      set (the human's edit) over its draft `why`; the repairs get chief's
+      set (the human's edit) over its draft `why`. A `grouped` held finding,
+      one the review left out because its group's printed text states its
+      defect, gets no repair of its own and does not itself stop auto-post;
+      the recheck judges it again. The repairs get chief's
       commit check, simplification pass, validation and a whole-task review
       from the reviewed head to the repair tip. Before pr-babysit runs, chief
       keeps in its directory a `--fixed` manifest: `reviewedHead`, and for

@@ -2348,6 +2348,7 @@ class Fixable(PostCase):
         self.save(self.result_for(self.p, findings=two, draft=draft, verdict={'event': 'REQUEST_CHANGES', 'reasons': ['r']}))
         self.assertEqual(self.post('--auto')['status'], 'posted')
         self.root = self.review()['findings'][0]['commentId']
+        self.pristine = Path(self.p['ledger']).read_text()
 
     def snap(self):
         snap = self.tmp / 'threads.json'
@@ -2457,19 +2458,73 @@ class Fixable(PostCase):
         got = self.fixable()
         self.assertEqual((self.held(got), got['autoPost']), ([('pr7-f1', 'disputed'), ('pr7-f2', 'unmapped')], False))
 
-    def test_a_carried_finding_is_placed_by_the_review_that_published_it(self):
-        self.commit('src/core/c.c', 'int c;\n', 'c')
+    def carried(self, found, name='c'):
+        """A later review on a new head (a commit of src/core/<name>.c) carrying `found`, posted; the fixable view of it."""
+        self.commit(f'src/core/{name}.c', f'int {name};\n', name)
         head = self.push_pr()
         p = self.prepare()
         self.assertEqual(p['mode'], 'incremental')
-        carried = [{'id': 'pr7-f1', 'file': 'src/core/a.c', 'line': 21, 'why': 'b is never initialised', 'severity': 'high',
-                    'dimension': 'correctness', 'status': 'open'}]
-        self.save(self.result_for(p, findings=carried, draft={'event': 'REQUEST_CHANGES', 'body': 'Still open.', 'comments': [], 'replies': []},
+        self.save(self.result_for(p, findings=found, draft={'event': 'REQUEST_CHANGES', 'body': 'Still open.', 'comments': [], 'replies': []},
                                   verdict={'event': 'REQUEST_CHANGES', 'reasons': ['r']}))
         self.head = head
         self.assertEqual(self.post('--auto')['status'], 'posted')
-        got = self.fixable(head)
+        return self.fixable(head)
+
+    def test_a_carried_finding_is_placed_by_the_review_that_published_it(self):
+        got = self.carried([{'id': 'pr7-f1', 'file': 'src/core/a.c', 'line': 21, 'why': 'b is never initialised', 'severity': 'high',
+                             'dimension': 'correctness', 'status': 'open'}])
         self.assertEqual(([f['id'] for f in got['fix']], got['held']), (['pr7-f1'], []))
+
+    def group(self, change=None, muted=True):
+        """The setUp review with its second finding left out as its group's muted member (no text of its own)."""
+        led = json.loads(self.pristine)
+        rev = led['reviews'][-1]
+        rev['draft']['moved'] = []
+        rev['findings'][1]['muted'] = muted
+        if change:
+            change(rev)
+        Path(self.p['ledger']).write_text(json.dumps(led))
+        return self.fixable()
+
+    def outcome(self, got):
+        return [f['id'] for f in got['fix']], self.held(got), got['autoPost']
+
+    def test_a_muted_finding_is_held_grouped_and_does_not_hold_the_recheck(self):
+        got = self.group()
+        self.assertEqual(([f['id'] for f in got['fix']], got['held'], got['autoPost']),
+                         (['pr7-f1'], [{'findingId': 'pr7-f2', 'commentId': None, 'why': 'grouped'}], True))
+        self.assertEqual(self.outcome(self.group(lambda r: r['findings'].reverse())), (['pr7-f1'], [('pr7-f2', 'grouped')], True))
+
+    def test_an_unplaced_finding_not_muted_stays_unmapped_as_one_saved_before_the_flag(self):
+        for muted in (False, None):
+            with self.subTest(muted=muted):
+                self.assertEqual(self.outcome(self.group(muted=muted)), (['pr7-f1'], [('pr7-f2', 'unmapped')], False))
+
+    def test_a_muted_finding_with_text_of_its_own_on_the_pr_is_judged_by_it(self):
+        self.assertEqual(self.outcome(self.group(lambda r: r['draft'].update(moved=json.loads(self.pristine)['reviews'][-1]['draft']['moved']))),
+                         (['pr7-f1', 'pr7-f2'], [], True))
+
+    def test_a_held_group_mate_keeps_its_own_hold_beside_a_grouped_member(self):
+        self.assertEqual(self.outcome(self.group(lambda r: r['findings'][0].update(status='disputed'))),
+                         ([], [('pr7-f1', 'disputed'), ('pr7-f2', 'grouped')], True))
+        self.gh.inline.append({'id': 950, 'in_reply_to_id': self.root, 'body': 'intentional', 'created_at': self.gh.tick(),
+                               'user': {'login': 'contrib'}})
+        self.gh.threads[0]['comments']['nodes'].append({'databaseId': 950})
+        self.assertEqual(self.outcome(self.group()), ([], [('pr7-f1', 'replied'), ('pr7-f2', 'grouped')], True))
+        next(c for c in self.gh.inline if c['id'] == self.root)['body'] = 'edited'
+        self.assertEqual(self.outcome(self.group()), ([], [('pr7-f1', 'edited'), ('pr7-f2', 'grouped')], False))
+        self.gh.inline = [c for c in self.gh.inline if c['id'] != self.root]
+        self.gh.threads = []
+        self.assertEqual(self.outcome(self.group()), ([], [('pr7-f1', 'deleted'), ('pr7-f2', 'grouped')], False))
+
+    def test_a_carried_finding_the_latest_review_no_longer_mutes_is_unmapped(self):
+        lead = {'id': 'pr7-f1', 'file': 'src/core/a.c', 'line': 21, 'why': 'b is never initialised', 'severity': 'high',
+                'dimension': 'correctness', 'status': 'open', 'defect': 0, 'muted': False}
+        mate = {'file': 'src/core/c.c', 'line': 1, 'why': 'b is never initialised, seen from c', 'severity': 'high',
+                'dimension': 'concurrency', 'status': 'open', 'defect': 0, 'muted': True}
+        self.assertEqual(self.outcome(self.carried([lead, mate])), (['pr7-f1'], [('pr7-f3', 'grouped')], True))
+        self.assertEqual(self.outcome(self.carried([lead, {**mate, 'id': 'pr7-f3', 'defect': None, 'muted': False}], 'd')),
+                         (['pr7-f1'], [('pr7-f3', 'unmapped')], False), 'the saved record keeps no stale muted')
 
     def test_a_carried_finding_the_human_edited_before_submitting_offers_the_published_text(self):
         # The state post.submitted leaves when the human edited the pending comment before submitting it.

@@ -47,9 +47,11 @@ SHA, which must be the last review on the PR: each standing finding as `fix` (it
 words, which a repair's fix check names) when the text it stands in on the PR is the one a
 receipt of ours recorded, unedited, and nobody but us or a bot has replied
 on its thread since our last verified answer; else in `held` with why: `disputed`, `unmapped` (no receipt places
-its text), `deleted`, `edited` (the inline comment, or the body of the review it was moved into, reads otherwise) or
+its text), `grouped` (unmapped and `muted`: the review left it out because its group's printed text states its
+defect), `deleted`, `edited` (the inline comment, or the body of the review it was moved into, reads otherwise) or
 `replied`. `autoPost` is false when any is held `unmapped`, `deleted` or `edited`: a recheck would judge text the
-ledger no longer holds, so its review goes to the human as a pending one.
+ledger no longer holds, so its review goes to the human as a pending one. A `grouped` one has no text of its own on
+the PR to diverge, so it does not; a review saved before `muted` existed holds its muted findings `unmapped`.
 
 The disputes join the threads.py snapshot to the findings whose inline comment our
 own verified review posted (commentId, recorded by post.py from its read-back):
@@ -561,14 +563,15 @@ def fixable(led, snapshot, head):
     rev = submitted_last(led, head)
     hold = holder(led, snapshot)
     fix, held = [], []
-    for f in rev.get('findings', []):
-        if f['status'] in OPEN:
-            why = hold(f)
-            if why:
-                held.append({'findingId': f['id'], 'commentId': f.get('commentId'), 'why': why})
-            else:
-                # The text the PR shows, as the human edited it, and the digest a repair's fix check names.
-                fix.append({**open_row(f, {}), 'claimDigest': digest(claim(f))})
+    for f in (f for f in rev.get('findings', []) if f['status'] in OPEN):
+        why = hold(f)
+        if why == 'unmapped' and f.get('muted'):
+            why = 'grouped'
+        if why:
+            held.append({'findingId': f['id'], 'commentId': f.get('commentId'), 'why': why})
+        else:
+            # The text the PR shows, as the human edited it, and the digest a repair's fix check names.
+            fix.append({**open_row(f, {}), 'claimDigest': digest(claim(f))})
     return {'fix': sorted(fix, key=by_severity), 'held': held,
             'autoPost': not any(h['why'] in ('unmapped', 'deleted', 'edited') for h in held)}
 
