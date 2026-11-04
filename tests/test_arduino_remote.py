@@ -107,6 +107,7 @@ class Run(Checkout):
         self.assertEqual(self.created, ('r1', 'ci.lan', '~/hil-remote/fake-usb'))
         manifest = json.loads(self.staged[R.MANIFEST])
         self.assertEqual(manifest['head'], self.head)
+        self.assertEqual(manifest['agentrc'], {'commit': 'a' * 40, 'dirty': False})
         pinned = [*self.BP.CONTRACT_FILES, ROSTER, f'build/hil/{BOARD}.build.json',
                   f'build/hil/{BOARD}/echo/echo.ino.elf', *(f'agentrc/{f}' for f in self.agentrc['files'])]
         self.assertEqual(sorted(manifest['files']), sorted(pinned))
@@ -114,6 +115,12 @@ class Run(Checkout):
             self.assertEqual(manifest['files'][f], hashlib.sha256(self.staged[f]).hexdigest(), f)
         self.assertEqual(self.calls[0], ['python3', '-u', self.HP.HIL, 'run', '--staged', R.MANIFEST, '--run-dir',
                                          R.RUN_DIR, '-b', BOARD, '-t', 'echo', ROSTER])
+
+    def test_staging_refuses_agentrc_files_changed_since_load(self):
+        (self.agentrc['root'] / 'skills/hil/scripts/hil_lock.py').write_text('# pulled meanwhile\n')
+        with self.assertRaisesRegex(SystemExit, r"agentrc changed since this process loaded it: "
+                                                r"\['skills/hil/scripts/hil_lock.py'\]; rerun"):
+            R.snapshot(tmpdir(self), [], with_agentrc=True)
 
     def test_test_choices_are_the_profiles(self):
         with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit) as e:
@@ -135,7 +142,7 @@ class Run(Checkout):
                  (lambda: self.record(contract={}), r"the contract files \['contract/check.py', 'contract/pin.json'\] "
                                                     r"differ"),
                  (lambda: (self.agentrc['root'] / 'skills/hil/scripts/hil_lock.py').write_text('# another\n'),
-                  'built with agentrc'),
+                  'built with other agentrc files'),
                  (lambda: self.record(board='rig_jlink'), 'it is for rig_jlink, not rig_ocd'))
         for spoil, why in cases:
             with self.subTest(why=why):
@@ -160,7 +167,7 @@ class Run(Checkout):
         (self.root / 'contract/pin.json').write_text('{"commit": "pinned"}\n')
         R.record_files(path, self.head, BOARD)
         (self.agentrc['root'] / fake.SELF).write_text('# a newer engine\n')
-        with self.assertRaisesRegex(SystemExit, 'built with agentrc'):
+        with self.assertRaisesRegex(SystemExit, 'built with other agentrc files'):
             R.record_files(path, self.head, BOARD)
 
     def test_record_files_takes_an_experimental_one_only_unclean(self):
@@ -364,6 +371,20 @@ class Session(Checkout):
             self.main('session', 'stage', 's1', str(rec))
         self.record(board='rig_jlink')
         with self.assertRaisesRegex(SystemExit, 'not rig_ocd'):
+            self.main('session', 'stage', 's1', str(rec))
+
+    def test_stage_refuses_records_of_other_agentrc_files_than_the_session_opened_with(self):
+        self.open()
+        session = self.root / '.hil-remote/s1.session.json'
+        self.assertEqual(json.loads(session.read_text())['agentrc'],
+                         {'commit': 'a' * 40, 'files': self.agentrc['sha256']})
+        rec = self.record(experimental=True)
+        data = json.loads(session.read_text())
+        session.write_text(json.dumps({**data, 'agentrc': {**data['agentrc'], 'commit': 'b' * 40}}))
+        self.main('session', 'stage', 's1', str(rec))   # the commit is provenance: the files decide
+        files = {**data['agentrc']['files'], 'skills/hil/scripts/hil_lock.py': '0' * 64}
+        session.write_text(json.dumps({**data, 'agentrc': {**data['agentrc'], 'files': files}}))
+        with self.assertRaisesRegex(SystemExit, 'not the ones the session opened with'):
             self.main('session', 'stage', 's1', str(rec))
 
 

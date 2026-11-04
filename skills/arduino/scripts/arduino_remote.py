@@ -112,9 +112,11 @@ def snapshot(into, files, with_agentrc=False, bundle=None):
                for k, v in core.snapshot(P.ROOT, [P.ROOT / f for f in files], Path(into) / (bundle or '')).items()}
     if with_agentrc:
         ag = Path(B.P.AGENTRC['root'])
-        closure = B.P.AGENTRC['files']
-        digests.update({f'agentrc/{k}': v for k, v in
-                        core.snapshot(ag, [ag / f for f in closure], Path(into) / 'agentrc').items()})
+        copied = core.snapshot(ag, [ag / f for f in B.P.AGENTRC['files']], Path(into) / 'agentrc')
+        drift = B.agentrc_drift(copied)
+        if drift:
+            core.fail(f'agentrc changed since this process loaded it: {drift}; rerun')
+        digests.update({f'agentrc/{k}': v for k, v in copied.items()})
     return digests
 
 
@@ -148,7 +150,8 @@ def staged_tree(run_id, host, roster, records, head, bundle=None):
         drift = core.checkout_drift(P.ROOT, head)
         if drift:
             core.fail(f'the checkout moved while it was copied: {"; ".join(drift)}')
-        core.write_json(into / MANIFEST, {'head': head, 'files': digests})
+        core.write_json(into / MANIFEST, {'head': head, 'files': digests, 'agentrc': {
+            'commit': B.P.AGENTRC['commit'], 'dirty': B.P.AGENTRC['dirty']}})
         tree = core.create_attempt(P.ROOT, runs(), run_id, host, P.REMOTE_BASE)
         stage(tree, into, {**digests, MANIFEST: core.digest(into / MANIFEST)})
     return tree
@@ -255,7 +258,7 @@ def cmd_session_open(a):
     # unique per attempt: the rig admits a session command by its reason alone, and run ids repeat across libraries
     reason = f'arduino-hil session {tree.dir} {secrets.token_hex(8)}'
     data = {'runId': a.run_id, 'board': a.board, 'reason': reason, 'roster': roster, 'head': head,
-            'restoreRecord': record[1][0], 'held': False}
+            'restoreRecord': record[1][0], 'agentrc': record[0]['agentrc'], 'held': False}
     core.write_json(session_path(a.run_id), data)
     rc = rig(tree, [P.HIL, 'lock', 'hold', a.board, '--reason', reason])
     if rc:
@@ -274,6 +277,10 @@ def cmd_session_stage(a):
     """Stage the records into a new bundle dir of their own: records share build/hil/<board>/<sketch>/, so one
     staged over another would replace the images an earlier record, the restore's included, pins."""
     s = session_record(a.run_id)
+    # record_files admits only records of this process's agentrc files; the rig's harness is the one staged at open
+    if B.contract_identity()['agentrc']['files'] != (s.get('agentrc') or {}).get('files'):
+        core.fail('this agentrc\'s files are not the ones the session opened with, so the rig would refuse records '
+                  'built with them: close the session and open a new one')
     tree = core.load_attempt(P.ROOT, runs(), a.run_id)
     records = [record_files(r, s['head'], s['board'], clean=False) for r in a.records]
     bundle = f'bundles/{time.strftime("%Y%m%d-%H%M%S")}-{secrets.token_hex(4)}'   # unique: stages may run at once

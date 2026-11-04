@@ -226,9 +226,13 @@ def record_problems(rec, board, head, experimental_ok, where):
                      if rec.get('contract', {}).get(f) != current['contract'].get(f))
     if changed:
         why.append(f'the contract files {changed} differ from the ones it was built with: rebuild it')
-    if rec.get('agentrc') != current['agentrc']:
-        why.append(f'it was built with agentrc {str(rec.get("agentrc", {}).get("commit"))[:12]}\'s files, this '
-                   f'harness loads {current["agentrc"]["commit"][:12]}\'s: rebuild it')
+    drift = B.agentrc_drift(current['agentrc']['files'])
+    if drift:
+        why.append(f'agentrc changed since this harness loaded it: {drift}; rerun')
+    built = rec.get('agentrc') or {}
+    if built.get('files') != current['agentrc']['files']:   # the commit is provenance only
+        why.append(f'it was built with other agentrc files (agentrc {str(built.get("commit"))[:12]}) than this '
+                   f'harness loads (agentrc {current["agentrc"]["commit"][:12]}): rebuild it')
     if rec['board'] != board:
         why.append(f'it is for {rec["board"]}, not {board}')
     if rec['experimental'] and not experimental_ok:

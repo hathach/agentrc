@@ -5,6 +5,7 @@ library/ holds ci-arduino filter files: Basic/echo skips the host_ci platform (.
 build only on host_ci and dev_b (.test.only), Nowhere/nowhere on no board, Skip/askip on all but dev_a (.test.skip).
 test/hil/sketches/probe is a HIL sketch outside examples/."""
 import copy
+import hashlib
 import json
 import shutil
 import types
@@ -54,13 +55,14 @@ def library(dest):
 
 
 def agentrc(dest):
-    """A stand-in agentrc checkout holding the files a record binds: {commit, root, files} as agentrc_pin.identity()
-    gives it."""
+    """A stand-in agentrc checkout holding the files a record binds, as agentrc_pin.identity() gives it."""
     files = [SELF, 'skills/hil/scripts/hil_lock.py']
     for f in files:
         (Path(dest) / f).parent.mkdir(parents=True, exist_ok=True)
         (Path(dest) / f).write_text(f'# agentrc {f}\n')
-    return {'commit': 'a' * 40, 'root': Path(dest).resolve(), 'files': files}
+    root = Path(dest).resolve()
+    return {'commit': 'a' * 40, 'root': root, 'files': files, 'dirty': False, 'source': 'installed',
+            'sha256': {f: hashlib.sha256((root / f).read_bytes()).hexdigest() for f in files}}
 
 
 def classify_source(path):

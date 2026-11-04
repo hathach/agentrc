@@ -21,10 +21,13 @@ retries, recovery) apply unchanged; these scripts load its `hil_*` scripts throu
 
 ## A library's side
 
-- `.claude/skills/hil-contract/scripts/agentrc_pin.py`: fetches the pinned commit (`test/hil/agentrc.json`, `{url,
-  commit}`) into `~/.cache/<library>/agentrc-<commit>` and loads the engines from it, or from `agentrc/` in a tree
-  staged on a rig. It is the one piece each library copies: code cannot fetch itself. Its `ENGINES` closure is what a
-  rig tree carries and what a record binds.
+- `.claude/skills/hil-contract/scripts/agentrc_pin.py`: selects the agentrc the contracts load and loads the
+  engines from it: `agentrc/` in a tree staged on a rig (its `manifest.json` names the commit); in CI (`GITHUB_ACTIONS`
+  or `CI` true, any other value refused) the commit `test/hil/agentrc.json` pins (`{url, commit}`), fetched into
+  `~/.cache/<library>/agentrc-<commit>`; otherwise the installed agentrc, `"${AGENTRC_DIR:-$HOME/.claude}"`, never
+  fetched. It is the one piece each library copies: code cannot find itself. Its `ENGINES` closure is what a rig tree
+  carries and what a record binds, with the commit of the one checkout the closure resolves into and whether the
+  closure differs from it; it refuses engines whose `PROFILE_API` is not the library's before loading any.
 - `.claude/skills/build/scripts/check_build.py`: the build profile (board table with CI's FQBNs from
   adafruit/ci-arduino `all_platforms.py` plus the rig boards, representatives per family, source classification,
   HIL sketches per role, VID:PID adapter, extra dependencies) and `main()`, which binds it to `arduino_build.py`.
@@ -33,7 +36,7 @@ retries, recovery) apply unchanged; these scripts load its `hil_*` scripts throu
   run the first HIL sketch).
   `hil_remote.py` is a wrapper around `arduino_remote.py`.
 - Rosters `test/hil/ci.json` (the farm) and a gitignored `test/hil/local.json` (a dev PC's boards); contract tests in
-  `.claude/test/`, run by pre-commit after `agentrc_pin.py fetch`. A farm board names its probe (`"probe"`, the `hil`
+  `.claude/test/`, run by pre-commit through `agentrc_pin.py test`. A farm board names its probe (`"probe"`, the `hil`
   skill's board registry), which supplies its flasher, under the registry's name, which is its board lock; a dev PC's
   unregistered board keeps a flasher of its own.
 
@@ -53,12 +56,14 @@ retries, recovery) apply unchanged; these scripts load its `hil_*` scripts throu
   dependency or one of their transitive `depends=` from its resolved directory, one bundled with the core, or a
   prepared user copy shadowing a library the build's own core bundles (hashed before any compile and recorded with
   `shadows`); any other fails the sketch.
-- **The HIL build record** (schema 2) binds a run to its firmware: HEAD and a clean tree, the FQBN, the core
-  (`{id, version, install_dir}`, and `{commit, dirty}` when it is a git checkout: a dirty core's exact bytes are not
+- **The HIL build record** (schema 2) binds a run to its firmware: HEAD and a clean tree, the FQBN, the core (`{id,
+  version, install_dir}`, and `{commit, dirty}` when it is a git checkout: a dirty core's exact bytes are not
   identified), the resolved dependencies, the roster's sha256, the library's contract files and the agentrc engines'
-  closure by sha256, and per sketch its images, load spans, VID:PID and used libraries. The harness, and
-  `hil_remote.py` before staging, refuse a record whose library, schema, contract files or agentrc files differ from
-  the ones running: rebuild it.
+  closure by sha256 with its commit (provenance: the digests decide), and per sketch its images, load spans, VID:PID
+  and used libraries. The harness, and `hil_remote.py` before staging, refuse a record whose library, schema, contract
+  files or agentrc files differ from the ones running: rebuild it. Each process freezes the agentrc closure's digests
+  when it loads it and refuses to write, admit or stage a record once those files have changed under it; a manual
+  session refuses records built with other agentrc files than the ones it opened with.
 - **DUT identity**: the roster `uid` is the DUT's USB serial; `usb_port` additionally pins its bus port. `no_serial`
   (with `usb_port`) is for firmware that reports no serial (ESP32 under Arduino): the serial-less device at that port.
   `hil_test.py commission` finds and confirms either under the restoration sketch.
@@ -71,7 +76,8 @@ retries, recovery) apply unchanged; these scripts load its `hil_*` scripts throu
 ## Adding a library
 
 1. Copy `agentrc_pin.py` from a library that has it, changing only its cache namespace, and pin a commit of this
-   repository that has `skills/arduino/`.
+   repository that has `skills/arduino/` for CI. Its `PROFILE_API` is `arduino_build.py`'s: a change to the profile
+   names the engines read bumps it there and in every library's copy together.
 2. Write the build profile: CI's matrix boards with their FQBNs, the rig boards it will run on (named as in agentrc's
    board registry, each with its `span`), representatives, classification of its `src/` tree, HIL sketches. Prove it
    with `check_build.py --select-only` on representative diffs and a full `--record` build per rig board.
@@ -81,5 +87,5 @@ retries, recovery) apply unchanged; these scripts load its `hil_*` scripts throu
    checks in `hil_test.py`.
 4. Add the boards to `test/hil/ci.json`, commission each (`hil_test.py commission` on the board's host), run the
    battery on the farm (`hil_remote.py run`), and record what no board covers as the contract's Limits.
-5. Contract tests for the profile in `.claude/test/`, a pre-commit hook that fetches the pin and runs them, and a
-   `CLAUDE.md` naming the build and HIL contracts.
+5. Contract tests for the profile in `.claude/test/`, a pre-commit hook running `agentrc_pin.py test` (the installed
+   agentrc locally, the pin in CI), and a `CLAUDE.md` naming the build and HIL contracts.

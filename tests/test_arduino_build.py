@@ -664,6 +664,13 @@ class Record(RecordCase):
         self.assertEqual(rec['contract'], {f: ab.sha256(self.root / f) for f in self.P.CONTRACT_FILES})
         self.assertEqual(rec['agentrc'], {'commit': 'a' * 40, 'files': {
             f: ab.sha256(self.agentrc['root'] / f) for f in self.agentrc['files']}})
+        self.assertEqual(rec['agentrcSource'], {'source': 'installed', 'dirty': False})   # provenance, not compared
+
+    def test_record_refused_when_agentrc_changed_after_it_was_loaded(self):
+        (self.agentrc['root'] / 'skills/hil/scripts/hil_lock.py').write_text('# pulled while building\n')
+        _, err = self.record(self.samd_row())
+        self.assertEqual(err, "agentrc changed since this process loaded it: ['skills/hil/scripts/hil_lock.py']; "
+                              "build again")
 
     def test_contract_identity_skips_absent_contract_files_and_always_binds_this_engine(self):
         (self.root / 'contract/pin.json').unlink()

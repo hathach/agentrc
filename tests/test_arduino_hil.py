@@ -309,14 +309,18 @@ class Admission(Base):
 
     def test_agentrc_drift_refused(self):
         rec = self.record()
-        (self.agentrc['root'] / 'skills/hil/scripts/hil_lock.py').write_text('# another agentrc\n')
-        with self.assertRaisesRegex(H.Refused, f'built with agentrc {"a" * 12}\'s files, this harness loads '
-                                               f'{"a" * 12}\'s: rebuild it'):
+        lock = self.agentrc['root'] / 'skills/hil/scripts/hil_lock.py'
+        loaded = lock.read_text()
+        lock.write_text('# another agentrc\n')
+        with self.assertRaisesRegex(H.Refused, f'built with other agentrc files \\(agentrc {"a" * 12}\\) than this '
+                                               f'harness loads \\(agentrc {"a" * 12}\\): rebuild it'):
             self.admit(rec)
-        rec = self.record()
-        self.agentrc['commit'] = 'b' * 40
-        with self.assertRaisesRegex(H.Refused, f'loads {"b" * 12}\'s'):
+        with self.assertRaisesRegex(H.Refused, r"agentrc changed since this harness loaded it: "
+                                               r"\['skills/hil/scripts/hil_lock.py'\]; rerun"):
             self.admit(rec)
+        lock.write_text(loaded)
+        self.agentrc['commit'] = 'b' * 40   # another commit with the same closure: the files decide
+        self.admit(rec)
 
     def test_image_must_match_the_flasher(self):
         rec = self.record()

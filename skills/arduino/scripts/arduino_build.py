@@ -19,7 +19,11 @@ point, loading this file from the pinned agentrc (its `agentrc_pin.py`). One pro
   classify_source(path) (effect, detail, reason) for the library's own source, or None for the common rules
   vid_pid(build_dir, board, roster_entry)  the VID:PID a device sketch enumerates with, or None (unresolved)
   record_check(board, row, build_dir, roster_entry)  optional: (extra sketch fields or None, error or '')
-  AGENTRC               {commit, root}: the pinned agentrc this process loaded (agentrc_pin.py)
+  AGENTRC               {commit, root, files, sha256, dirty, source}: the agentrc this process loaded (the library's
+                        agentrc_pin.py): its checkout's HEAD, the closure (agentrc-relative) and each file's sha256 as
+                        loaded, whether the closure differs from HEAD, and installed, pin or staged
+
+PROFILE_API is the profile interface the three engines implement; a library's bootstrap refuses any other unloaded.
 
 The JSON contract (stdout's last line, exits 0 pass, 1 failed, 2 usage or a missing prerequisite, 3 uncovered) is
 the library's build SKILL.md.
@@ -45,6 +49,7 @@ FILES = ('skills/hil/boards.json', 'skills/hil/scripts/hil_boards.py', 'skills/h
          'skills/hil/scripts/usb_observe.py')
 SELF = 'skills/arduino/scripts/arduino_build.py'
 SCHEMA = 2
+PROFILE_API = 1   # bump on a change a library profile must follow, arduino_hil's and arduino_remote's included
 COMPILE_TIMEOUT = 900
 BUILD_SCRIPTS = '.claude/skills/build/scripts/'
 HIL_CONTROL = ('.claude/skills/hil-contract/scripts/', 'test/hil/')
@@ -802,6 +807,13 @@ def contract_identity():
             'agentrc': {'commit': P.AGENTRC['commit'], 'files': {f: sha256(agentrc / f) for f in files}}}
 
 
+def agentrc_drift(files):
+    """The closure files whose digests in `files` differ from the ones this process loaded (AGENTRC sha256): an
+    engine already imported runs the loaded bytes, so a record or a stage must not bind newer ones."""
+    loaded = P.AGENTRC['sha256']
+    return sorted(f for f in {*loaded, *files} if loaded.get(f) != files.get(f))
+
+
 def make_record(args, board, rows, before, diff, roster_path, prepared):
     """The HIL's build record, or (None, error)."""
     after, _ = source_identity()
@@ -861,6 +873,10 @@ def make_record(args, board, rows, before, diff, roster_path, prepared):
             **({'segments': [[o, n] for o, n in segments]} if segments else {}), **(extra or {}),
         }
     platform = rows[0]['platform']
+    identity = contract_identity()
+    drift = agentrc_drift(identity['agentrc']['files'])
+    if drift:
+        return None, f'agentrc changed since this process loaded it: {drift}; build again'
     record = {
         'version': SCHEMA, 'kind': 'arduino-hil-build', 'library': P.LIBRARY_NAME, 'board': board,
         'fqbn': P.BOARDS[board]['fqbn'], 'experimental': bool(args.experimental),
@@ -869,7 +885,7 @@ def make_record(args, board, rows, before, diff, roster_path, prepared):
         'platform': {**platform, 'git': platform_git(platform['install_dir'])},
         'dependencies': list(prepared.values()),
         'roster': {'path': rel(roster_path), 'sha256': sha256(roster_path)},
-        **contract_identity(),
+        **identity, 'agentrcSource': {'source': P.AGENTRC['source'], 'dirty': P.AGENTRC['dirty']},
         'span': [lo, hi], 'role': role(board), 'sketches': sketches,
         **({'chip': P.BOARDS[board]['chip']} if 'chip' in P.BOARDS[board] else {}),
         **({'fixture': {'path': P.BOARDS[board]['fixture'], 'sha256': sha256(P.ROOT / P.BOARDS[board]['fixture'])}}
