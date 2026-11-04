@@ -16,7 +16,8 @@ A key not listed here throws before anything runs.
   and every later script the absolute path that interpreter reports; nothing
   searches for another. Preflight checks it imports what the lanes need (PyYAML
   while a bot is waited on) and stops `python-unusable` naming what is missing.
-  Per launch.
+  Without PyYAML `hooks.py` excuses no hook failing on HEAD too, and a push it
+  refuses names that cause. Per launch.
 - `reviewers`: of `copilot`, `coderabbit`, `greptile`, `code-scanning`;
   default `['coderabbit', 'greptile', 'code-scanning']`; `[]` runs no review lane.
 - `autoRun`: the reviewers that run on every push and gate done; default

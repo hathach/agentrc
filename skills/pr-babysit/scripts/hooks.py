@@ -11,23 +11,25 @@ seconds (default 540, inside the 600 a relay's Bash call allows); past that
 the pre-commit process tree is killed and the result is an error. Status lines are `git status --porcelain -z`
 records, each untracked file its own; snapshot lines are `<644|755> <blob> <path>` or `absent - <path>`.
 
-stdout ends with one JSON line {ran, passed, modifiedBy, failed, baselineFailed, before, after,
-snapshotBefore, snapshotAfter, seal} (seal: facts.sealed): passed is the exit
-status of the first pass (the run and its retry), modifiedBy the ids of the
-hooks pre-commit itself said modified files in any run. Without a config: ran
-false, passed true, and the lists empty.
+stdout ends with one JSON line {ran, passed, modifiedBy, failed, baselineFailed,
+notRerun, before, after, snapshotBefore, snapshotAfter, seal} (seal:
+facts.sealed): passed is the exit status of the first pass (the run and its
+retry), modifiedBy the ids of the hooks pre-commit itself said modified files
+in any run. Without a config: ran false, passed true, and the lists empty.
 
 failed and baselineFailed explain a failure: failed, {hook, error} for each hook
 the first pass's last run failed, error its first output line; and
 baselineFailed, the ids among those that, rerun alone in a detached worktree of
 HEAD on the same PATHs, fail there with the same output (comparable: its lines
-in any order, the tree's path read as the checkout's, times, durations, worker
-numbers and temporary names masked), so they are no evidence against the change
-(#378). A hook that ever modified files is never rerun there, nor one whose id
-SKIP cannot name, more than one config entry uses or another hook in the config
-takes as its alias (SKIP skips those hooks too, and a fail_fast stop at one
-leaves the rest unchecked), nor any when the config cannot be read or PyYAML is missing;
-each rerun gets a clean HEAD tree. The tree has only what HEAD
+in any order, the tree's path read as the checkout's, and each number standing
+alone, such as a duration, line number, count, pid or address, each time,
+worker number and temporary name masked), so they are no evidence against the
+change (#378). A hook that ever modified files is never rerun there, nor one
+whose id SKIP cannot name, more than one config entry uses or another hook in
+the config takes as its alias (SKIP skips those hooks too, and a fail_fast stop
+at one leaves the rest unchecked), nor any when the config cannot be read or
+PyYAML is missing; notRerun is {hook, why} for each failed hook not rerun
+there. Each rerun gets a clean HEAD tree. The tree has only what HEAD
 tracks: a hook that needs the checkout's ignored files (fetched dependencies)
 fails there differently and stays counted. A change that leaves a hook's
 output the same once masked is still excused: a hook that prints only a count
@@ -35,10 +37,11 @@ of its violations, or a new violation replacing one of HEAD's that differs from
 it only in numbers; CI runs the hook on the pushed head. When every failure is
 excused, the hooks run once more on the change, with its retry, and SKIP naming
 the excused ones, as the commit will, so a fail_fast stop cannot hide a hook
-the change breaks: what fails there joins failed, and a failed run that names
-no hook adds the failure `(pre-commit)`. An alias only a remote repository's
-own manifest declares is not seen, so such a hook may go unrun on the change
-until CI. pre-commit runs with core.abbrev pinned (#377), which the
+the change breaks: what fails there joins failed and is rerun on HEAD in turn,
+the hooks running again while every new failure is excused, and a failed run
+that names no hook adds the failure `(pre-commit)`. An alias only a remote
+repository's own manifest declares is not seen, so such a hook may go unrun on
+the change until CI. pre-commit runs with core.abbrev pinned (#377), which the
 hooks' own git commands inherit.
 Exit 0 with that line; exit 2 with {"error": ...} when the facts cannot be
 collected or pre-commit's output contradicts its exit status.
@@ -81,11 +84,13 @@ UNOWNED = '(pre-commit)'
 # What points git at a repository or its index; set by a caller, it would send HEAD's tree's resets and reruns to the
 # caller's checkout. The object store stays: HEAD's tree shares it, and resolves HEAD only there.
 OTHER_REPO = ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE')
-# A C-quoted string from its opening quote to its closing one (quote.c unquote_c_style).
-C_QUOTED = re.compile(r'"(?:[^"\\]|\\.)*"', re.DOTALL)
+# A C-quoted string from its opening quote to its closing one, each escape one quote.c unquote_c_style accepts.
+C_QUOTED = re.compile(r'"((?:[^"\\]|\\(?:[abfnrtv"\\]|[0-3][0-7]{2}))*)"', re.DOTALL)
+C_ESCAPES = {b'a': b'\a', b'b': b'\b', b'f': b'\f', b'n': b'\n', b'r': b'\r', b't': b'\t', b'v': b'\v'}
 # What differs between two runs of the same failure: a number standing alone (a duration with its units, a line
 # number, a count, a pid, an address), an ISO 8601 time, a pytest-xdist worker's number, or a name tempfile, mktemp
-# or gcc made. Any other digit inside a word (usb2.c, E501) names a file, rule or symbol, so it stays.
+# or gcc made. Any other digit inside a word (usb2.c, E501) names a file, rule or symbol, so it stays. An
+# all-lowercase gcc name (about 1 in 180) stays too, as a source such as ccdriver.c reads alike: it only fails safe.
 UNIT = r'(?:[hm]|min|sec|[mµun]?s)'
 VARYING = re.compile(r'\b\d{4}-\d\d-\d\dT\d\d:\d\d(?::\d\d(?:[.,]\d+)?)?Z?'
                      rf'|\b(?:0x[0-9a-fA-F]+|\d+(?:\.\d+)*(?:{UNIT}(?:\d+(?:\.\d+)?{UNIT})*)?)\b|(?<=\[gw)\d+(?=\])'
@@ -210,18 +215,32 @@ def other_repo_env(names=OTHER_REPO):
 
 
 def absolute_alternates(value):
-    """value, a GIT_ALTERNATE_OBJECT_DIRECTORIES, with each plain relative entry made absolute. As git parses it
+    """value, a GIT_ALTERNATE_OBJECT_DIRECTORIES, with each relative entry made absolute. As git parses it
     (object-file.c parse_alt_odb_entry), a C-quoted entry, which may hold the separator, runs to its closing quote
-    and one character more; it and a # comment are kept as given."""
+    and one character more, and is read unquoted; one quoted wrongly is a plain entry. A # comment is kept as given."""
     out, pos = [], 0
     while pos < len(value):
         quoted = C_QUOTED.match(value, pos)
         sep = value.find(os.pathsep, pos)
         end = quoted.end() if quoted else len(value) if sep < 0 else sep
         entry = value[pos:end]
-        out += [entry if quoted or not entry or entry.startswith('#') else os.path.abspath(entry), value[end:end + 1]]
+        path = c_unquoted(quoted[1]) if quoted else entry
+        if path and not entry.startswith('#') and not os.path.isabs(path):
+            entry = c_quoted(os.path.abspath(path)) if quoted else os.path.abspath(path)
+        out += [entry, value[end:end + 1]]
         pos = end + 1
     return ''.join(out)
+
+
+def c_unquoted(body):
+    """body, what a C-quoted string holds between its quotes, unquoted as git does."""
+    return os.fsdecode(re.sub(rb'\\([0-3][0-7]{2}|.)', lambda m: bytes([int(m[1], 8)]) if len(m[1]) == 3
+                              else C_ESCAPES.get(m[1], m[1]), os.fsencode(body), flags=re.DOTALL))
+
+
+def c_quoted(path):
+    """path C-quoted, each backslash, quote or control byte an octal escape."""
+    return '"' + os.fsdecode(re.sub(rb'[\\"\x00-\x1f\x7f]', lambda m: b'\\%03o' % m[0][0], os.fsencode(path))) + '"'
 
 
 def bounded(argv, deadline, start, what, cwd=None, env=None):
@@ -298,18 +317,26 @@ def comparable(text, root):
 
 
 def shared_names():
-    """Each name SKIP would skip more than one hook by, or None when the config cannot be read: an alias the config
-    gives a hook under another id, and an id more than one entry uses (pre-commit's commands/run.py)."""
+    """(each name SKIP would skip more than one hook by, ''), or (None, why) when the config cannot be read: an alias
+    the config gives a hook under another id, and an id more than one entry uses (pre-commit's commands/run.py)."""
     if yaml is None:
-        return None
+        return None, 'PyYAML is not installed, so the config was not read'
     try:
         config = yaml.safe_load(Path(CONFIG).read_text(encoding='utf-8'))
         entries = [h for repo in config['repos'] for h in repo['hooks']]
         ids = [h['id'] for h in entries]
         return ({h['alias'] for h in entries if h.get('alias') not in (None, '', h['id'])}
-                | {i for i in ids if ids.count(i) > 1})
-    except (OSError, ValueError, yaml.YAMLError, KeyError, TypeError, AttributeError):
-        return None
+                | {i for i in ids if ids.count(i) > 1}), ''
+    except (OSError, ValueError, yaml.YAMLError, KeyError, TypeError, AttributeError) as e:
+        return None, f'{CONFIG} cannot be read ({type(e).__name__})'
+
+
+def unexcusable(hook, ids, shared, unread):
+    """Why a failure of hook is never rerun on HEAD, or '' when it is. A hook that rewrote files is judged by what it
+    wrote; the commit could not skip an id SKIP cannot name, and SKIP naming one it shares, or one whose aliases are
+    unknown, would also skip another hook, unrun on the change or, past a fail_fast stop, unchecked."""
+    return ('it modified files' if hook in ids else 'SKIP cannot name it' if ',' in hook else unread
+            or ('SKIP would skip another hook by it' if hook in shared else ''))
 
 
 def registration(tree):
@@ -391,28 +418,32 @@ def passes(paths, deadline, start, what, skip=()):
 
 def run_hooks(paths, deadline=DEADLINE):
     if not os.path.exists(CONFIG):
-        return False, True, [], [], []
+        return False, True, [], [], [], []
     start = time.monotonic()
     code, ids, failures = passes(paths, deadline, start, 'run')
-    # A hook that rewrote files is judged by what it wrote, never excused by HEAD; nor is an id SKIP cannot name,
-    # which the commit could not skip, or one whose SKIP would also skip another hook, unrun on the change or, past
-    # a fail_fast stop, unchecked.
-    shared = shared_names()
-    expected = {}
-    for f in failures:
-        if shared is not None and f['hook'] not in {*ids, *shared} and ',' not in f['hook']:
-            expected.setdefault(f['hook'], []).append(comparable(f['output'], os.getcwd()))
-    excused = baseline(expected, paths, deadline, start) if expected else []
-    if excused and {f['hook'] for f in failures} <= set(excused):
+    shared, unread = shared_names()
+    found, excused, not_rerun = failures, [], {}
+    while True:
+        expected = {}
+        for f in found:
+            why = unexcusable(f['hook'], ids, shared, unread)
+            if why:
+                not_rerun.setdefault(f['hook'], why)
+            elif f['hook'] not in excused:
+                expected.setdefault(f['hook'], []).append(comparable(f['output'], os.getcwd()))
+        newly = baseline(expected, paths, deadline, start) if expected else []
+        excused += newly
+        if not newly or not {f['hook'] for f in found} <= set(excused):
+            break
         # fail_fast may have stopped the run at an excused hook: every other hook must pass on the change, as the
-        # commit will run them with the same SKIP.
-        again, more, others = passes(paths, deadline, start, 'without the excused', skip=excused)
+        # commit will run them with the same SKIP, or fail on HEAD too.
+        again, more, found = passes(paths, deadline, start, 'without the excused', skip=excused)
         ids += [h for h in more if h not in ids]
-        failures += others
-        if again and not others:
+        failures += found
+        if again and not found:
             failures.append({'hook': UNOWNED, 'output': '',
                              'error': f"pre-commit exited {again} with {','.join(excused)} skipped, naming no hook"})
-    return True, not code, ids, failures, excused
+    return True, not code, ids, failures, excused, [{'hook': h, 'why': w} for h, w in not_rerun.items()]
 
 
 def collect(argv):
@@ -427,11 +458,12 @@ def collect(argv):
     checkout_top()
     before = status()
     snapshot_before = snapshot(paths, before)
-    ran, passed, ids, failures, base_failed = run_hooks(paths, deadline)
+    ran, passed, ids, failures, base_failed, not_rerun = run_hooks(paths, deadline)
     after = status()
     failed = [{'hook': f['hook'], 'error': f['error']} for f in failures]
     return {'ran': ran, 'passed': passed, 'modifiedBy': ids, 'failed': failed, 'baselineFailed': base_failed,
-            'before': before, 'after': after, 'snapshotBefore': snapshot_before, 'snapshotAfter': snapshot(paths, after)}
+            'notRerun': not_rerun, 'before': before, 'after': after, 'snapshotBefore': snapshot_before,
+            'snapshotAfter': snapshot(paths, after)}
 
 
 if __name__ == '__main__':

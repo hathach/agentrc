@@ -687,13 +687,14 @@ const RECHECK = withSeal({
 })
 const HOOKS = withSeal({
   type: 'object', additionalProperties: false,
-  required: ['ran', 'passed', 'modifiedBy', 'failed', 'baselineFailed', 'before', 'after', 'snapshotBefore', 'snapshotAfter'],
+  required: ['ran', 'passed', 'modifiedBy', 'failed', 'baselineFailed', 'notRerun', 'before', 'after', 'snapshotBefore', 'snapshotAfter'],
   properties: {
     error: { type: 'string' },
     ran: { type: 'boolean' }, passed: { type: 'boolean' },
     modifiedBy: { type: 'array', items: { type: 'string' } },
     failed: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['hook', 'error'], properties: { hook: { type: 'string' }, error: { type: 'string' } } } },
     baselineFailed: { type: 'array', items: { type: 'string' } },
+    notRerun: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['hook', 'why'], properties: { hook: { type: 'string' }, why: { type: 'string' } } } },
     before: { type: 'array', items: { type: 'string' } }, after: { type: 'array', items: { type: 'string' } },
     snapshotBefore: { type: 'array', items: { type: 'string' } }, snapshotAfter: { type: 'array', items: { type: 'string' } },
   },
@@ -1720,14 +1721,17 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
   const blamed = hooks.failed.filter(f => !hooks.baselineFailed.includes(f.hook))
   const excused = hooks.failed.filter(f => hooks.baselineFailed.includes(f.hook))
   const skipIds = [...new Set(excused.map(f => f.hook))]
-  // hooks.py never excuses a hook that rewrote files, nor an id SKIP cannot name: the commit could not skip it
-  const unskippable = hooks.baselineFailed.filter(h => hooks.modifiedBy.includes(h) || !h || h.includes(',') || h !== h.trim())
-  const failures = (fs) => fs.map(f => `${f.hook}: ${f.error}`).join('; ')
+  // hooks.py never excuses a hook that rewrote files, nor an id SKIP cannot name or would skip another entry by
+  const unskippable = hooks.baselineFailed.filter(h => hooks.modifiedBy.includes(h) || !h || h.includes(',') || h !== h.trim() ||
+    failedIds.filter(i => i === h).length > 1)
+  // a failure hooks.py never reran on HEAD carries its reason, a missing PyYAML say, into the refusal
+  const notRerun = new Map(hooks.notRerun.map(n => [n.hook, n.why]))
+  const failures = (fs) => fs.map(f => `${f.hook}: ${f.error}${notRerun.has(f.hook) ? ` (not rerun on HEAD: ${notRerun.get(f.hook)})` : ''}`).join('; ')
   const hookWhy = outside.length ? `tree changed outside the fix scope before the hooks ran: ${outside.join(', ')}`
     : unsteady.length ? `regenerated path(s) no longer a plain modification when the hooks ran: ${unsteady.join(', ')}`
     : (hooks.passed && failedIds.length) || (!hooks.ran && failedIds.length) || hooks.baselineFailed.some(h => !failedIds.includes(h))
       ? 'hook evidence is inconsistent: a hook failed on HEAD without failing on the fix, or failed while the hooks passed or did not run'
-    : unskippable.length ? `hook evidence is inconsistent: excused hook(s) modified files or cannot be skipped: ${unskippable.join(', ')}`
+    : unskippable.length ? `hook evidence is inconsistent: excused hook(s) modified files, cannot be skipped or share an id: ${unskippable.map(h => JSON.stringify(h)).join(', ')}`
     : hooks.ran && !hooks.passed && !failedIds.length ? 'the repository hooks do not pass on the fix, and pre-commit named no failing hook'
     : blamed.length ? `the repository hooks do not pass on the fix: ${failures(blamed)}`
     : !hooks.ran && hooks.modifiedBy.length ? 'hook evidence is inconsistent: hooks reported modifying files without running'

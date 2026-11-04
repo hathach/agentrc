@@ -461,7 +461,7 @@ async function run(opts = {}) {
       const owned = hookQuoted(prompt)
       const status = owned.map(f => ` M ${f}`)
       const snap = owned.map(f => `644 ${blobOf(f)} ${f}`)
-      const base = { ran: true, passed: true, modifiedBy: [], failed: [], baselineFailed: [], before: status, after: status, snapshotBefore: snap, snapshotAfter: snap }
+      const base = { ran: true, passed: true, modifiedBy: [], failed: [], baselineFailed: [], notRerun: [], before: status, after: status, snapshotBefore: snap, snapshotAfter: snap }
       return { ...base, ...(typeof opts.hooks === 'function' ? opts.hooks(base) : opts.hooks) }
     }
     if (label.startsWith('commit#')) {
@@ -6847,12 +6847,13 @@ test('incomplete or inconsistent hook evidence admits nothing and commits nothin
     [{ failed: [{ hook: 'lint', error: 'x' }] }, /evidence is inconsistent/],
     [{ passed: false, failed: [{ hook: 'lint', error: 'x' }], baselineFailed: ['lint', 'other'] }, /evidence is inconsistent/],
     [{ ran: false, passed: false, failed: [{ hook: 'lint', error: 'x' }] }, /evidence is inconsistent/],
-    // hooks.py never excuses a hook that rewrote files, nor an id the commit's SKIP cannot name
-    [b => gen(b, { passed: false, failed: [{ hook: 'gen-doc', error: 'x' }], baselineFailed: ['gen-doc'] }), /excused hook\(s\) modified files or cannot be skipped: gen-doc/],
-    [{ passed: false, failed: [{ hook: 'a,b', error: 'x' }], baselineFailed: ['a,b'] }, /excused hook\(s\) modified files or cannot be skipped: a,b/],
-    // SKIP strips each id and drops an empty one; only the offending id is named
-    [{ passed: false, failed: [{ hook: '', error: 'x' }], baselineFailed: [''] }, /excused hook\(s\) modified files or cannot be skipped: $/],
-    [{ passed: false, failed: [{ hook: 'ok', error: 'x' }, { hook: ' a', error: 'x' }], baselineFailed: ['ok', ' a'] }, /excused hook\(s\) modified files or cannot be skipped:  a$/],
+    // hooks.py never excuses a hook that rewrote files, nor an id the commit's SKIP cannot name or would skip another entry by
+    [b => gen(b, { passed: false, failed: [{ hook: 'gen-doc', error: 'x' }], baselineFailed: ['gen-doc'] }), /excused hook\(s\) modified files, cannot be skipped or share an id: "gen-doc"$/],
+    [{ passed: false, failed: [{ hook: 'a,b', error: 'x' }], baselineFailed: ['a,b'] }, /excused hook\(s\) modified files, cannot be skipped or share an id: "a,b"$/],
+    [{ passed: false, failed: [{ hook: 'unit-test', error: 'x' }, { hook: 'unit-test', error: 'y' }], baselineFailed: ['unit-test'] }, /excused hook\(s\) modified files, cannot be skipped or share an id: "unit-test"$/],
+    // SKIP strips each id and drops an empty one; only the offending id is named, quoted
+    [{ passed: false, failed: [{ hook: '', error: 'x' }], baselineFailed: [''] }, /excused hook\(s\) modified files, cannot be skipped or share an id: ""$/],
+    [{ passed: false, failed: [{ hook: 'ok', error: 'x' }, { hook: ' a', error: 'x' }], baselineFailed: ['ok', ' a'] }, /excused hook\(s\) modified files, cannot be skipped or share an id: " a"$/],
   ]) {
     const { result, labels } = await run({ ...publishing, hooks })
     assert.match(result.history[0].reviewPushFailed.detail, expected)
@@ -6876,9 +6877,10 @@ test('a failing hook is refused by name and first line unless it fails on HEAD t
   const plain = await run({ ...publishing })
   assert.ok(plain.calls.find(c => c.label === 'commit#1-review').prompt.includes('commits.py commit --receipt '), 'nothing excused, nothing skipped')
   assert.ok(logs.some(l => l.endsWith(`push#1-review: hook(s) failing on HEAD too, not counted against the fix: unit-test: preprocessing failed; drivers-coverage: ${cov.error}`)))
-  // entries sharing an id are skipped by it once; a hook that passed is never in the list
-  const one = await run({ ...publishing, hooks: { passed: false, failed: [unit, unit], baselineFailed: ['unit-test'] } })
-  assert.ok(one.calls.find(c => c.label === 'commit#1-review').prompt.includes("commits.py commit --skip-hooks 'unit-test' --receipt "))
+  // a failure hooks.py never reran on HEAD is refused with the reason it gave
+  const unread = await run({ ...publishing, hooks: { passed: false, failed: [unit], notRerun: [{ hook: 'unit-test', why: 'PyYAML is not installed, so the config was not read' }] } })
+  assert.equal(unread.result.history[0].reviewPushFailed.detail,
+    'the repository hooks do not pass on the fix: unit-test: preprocessing failed (not rerun on HEAD: PyYAML is not installed, so the config was not read)')
 })
 
 test('a failure no hook owns, and hook output the excused hooks never judged, are refused by cause', async () => {
@@ -7027,7 +7029,7 @@ test('a commit the audit script cannot read back is not pushed', async () => {
 test('a hook script that reports no evidence stops publication with its error', async () => {
   const { result, labels, calls } = await run({ ...publishing, hooks: { error: 'pre-commit exited 0 but reported hook fmt failed', ran: false, passed: false } })
   assert.match(calls.find(c => c.label === 'hooks#1-review').prompt,
-    /as error, with ran = false, passed = false, modifiedBy = \[\], failed = \[\], baselineFailed = \[\], before = \[\], after = \[\], snapshotBefore = \[\], snapshotAfter = \[\], seal = ''\.$/,
+    /as error, with ran = false, passed = false, modifiedBy = \[\], failed = \[\], baselineFailed = \[\], notRerun = \[\], before = \[\], after = \[\], snapshotBefore = \[\], snapshotAfter = \[\], seal = ''\.$/,
     'the error-case values come from the schema')
   assert.match(result.history[0].reviewPushFailed.detail, /^no hook evidence: pre-commit exited 0/)
   assert.ok(!labels.some(l => l.startsWith('commit#')), 'nothing is committed')

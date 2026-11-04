@@ -34,6 +34,7 @@ HOOK = '''  - id: {id}
 SCRIPTS = {
     'ok': 'exit 0\n',
     'broken': 'echo nope; exit 1\n',
+    'nocc': 'echo "no compiler"; exit 1\n',
     # Appends once, so the second run passes: the case pre-commit's retry is for.
     'fmt': 'for f; do grep -q formatted "$f" || echo formatted >> "$f"; done\n',
     # Rewrites a tracked file outside the paths it was given, as a doc generator does.
@@ -140,7 +141,7 @@ class HooksTest(unittest.TestCase):
         code, out = self.run_script('a.txt')
         self.assertEqual(code, 0)
         self.assertEqual((out['ran'], out['passed'], out['modifiedBy']), (False, True, []))
-        self.assertEqual((out['failed'], out['baselineFailed']), ([], []))
+        self.assertEqual((out['failed'], out['baselineFailed'], out['notRerun']), ([], [], []))
         self.assertEqual(out['before'], [' M a.txt'])
         self.assertEqual(out['before'], out['after'])
         self.assertEqual(self.snap(out['snapshotBefore'])['a.txt'][0], '644')
@@ -270,7 +271,7 @@ class HooksTest(unittest.TestCase):
         # relative to the checkout, where HEAD's tree's commands do not run
         env = {**self.env, 'GIT_OBJECT_DIRECTORY': os.path.join('..', 'objects')}
         code, out = self.run_script('a.txt', env=env)
-        self.assertEqual((code, out.get('error'), out['passed']), (0, None, False))
+        self.assertEqual((code, out.get('error'), out.get('passed')), (0, None, False))
         self.assertEqual(out['baselineFailed'], ['broken', 'litter'])
 
     def test_each_head_rerun_starts_from_heads_tracked_files(self):
@@ -300,7 +301,7 @@ class HooksTest(unittest.TestCase):
         self.assertEqual((code, out['passed'], [f['hook'] for f in out['failed']]), (0, False, ['where']))
         self.assertEqual(out['baselineFailed'], ['where'])
 
-    def test_entries_sharing_an_id_are_excused_only_if_all_fail_alike_on_head(self):
+    def test_an_id_entries_share_is_never_rerun_on_head(self):
         # pre-commit runs, and SKIP drops, every entry with the id: one failing on HEAD excuses none of the others.
         (self.repo / '.pre-commit-config.yaml').write_text(CONFIG.format(
             HOOK.format(id='dup').replace('hooks/dup.sh', 'hooks/broken.sh')
@@ -310,6 +311,7 @@ class HooksTest(unittest.TestCase):
         code, out = self.run_script('a.txt')
         self.assertEqual((code, out['passed'], [f['hook'] for f in out['failed']]), (0, False, ['dup', 'dup']))
         self.assertEqual(out['baselineFailed'], [])
+        self.assertEqual(out['notRerun'], [{'hook': 'dup', 'why': 'SKIP would skip another hook by it'}])
 
     def test_an_id_entries_share_is_never_excused_past_a_fail_fast_stop(self):
         # The first entry fails alike on HEAD and stops both runs; SKIP=dup would skip the second, which the change breaks.
@@ -358,6 +360,17 @@ class HooksTest(unittest.TestCase):
         self.assertEqual(out['failed'], [{'hook': 'broken', 'error': 'nope'}, {'hook': 'picky', 'error': 'a.txt'}])
         self.assertEqual(out['baselineFailed'], ['broken'])
 
+    def test_a_hook_fail_fast_hid_that_fails_on_head_too_is_excused_in_turn(self):
+        # Each stop hides the next hook: nocc fails on HEAD as well, picky only on the change.
+        (self.repo / '.pre-commit-config.yaml').write_text(
+            'fail_fast: true\n' + CONFIG.format(''.join(HOOK.format(id=i) for i in ('broken', 'nocc', 'picky'))))
+        self.configure()
+        (self.repo / 'a.txt').write_text('bad\n')
+        code, out = self.run_script('a.txt')
+        self.assertEqual((code, out['passed']), (0, False))
+        self.assertEqual([f['hook'] for f in out['failed']], ['broken', 'nocc', 'picky'])
+        self.assertEqual(out['baselineFailed'], ['broken', 'nocc'])
+
     def test_an_id_another_hook_takes_as_its_alias_is_never_excused(self):
         # SKIP=broken would skip picky too (pre-commit matches aliases), and fail_fast stopped the run before it.
         picky = HOOK.format(id='picky') + '    alias: broken\n'
@@ -369,6 +382,7 @@ class HooksTest(unittest.TestCase):
         self.assertEqual((code, out['passed']), (0, False))
         self.assertEqual(out['failed'], [{'hook': 'broken', 'error': 'nope'}])
         self.assertEqual(out['baselineFailed'], [])
+        self.assertEqual(out['notRerun'], [{'hook': 'broken', 'why': 'SKIP would skip another hook by it'}])
 
     def test_a_hook_the_change_breaks_passes_on_head(self):
         self.configure('picky')
@@ -395,6 +409,7 @@ class HooksTest(unittest.TestCase):
         self.assertEqual((code, out['passed'], out['modifiedBy']), (0, False, ['grow']))
         self.assertEqual(out['failed'], [{'hook': 'grow', 'error': 'files were modified by this hook'}])
         self.assertEqual(out['baselineFailed'], [])
+        self.assertEqual(out['notRerun'], [{'hook': 'grow', 'why': 'it modified files'}])
         self.assertEqual(len(self.worktrees()), 1)
 
     def test_hooks_run_with_full_length_abbrev_and_a_same_content_rewrite_passes(self):
@@ -551,8 +566,9 @@ class ForgetTest(unittest.TestCase):
     def test_a_lock_that_cannot_be_removed_never_raises(self):
         tmp, tree = self.head_tree()
         with mock.patch.object(hooks, 'git_within', side_effect=hooks.Unusable('git worktree remove: refused')), \
-                mock.patch.object(hooks.Path, 'unlink', side_effect=PermissionError('read-only')):
+                mock.patch.object(hooks.Path, 'unlink', side_effect=PermissionError('read-only')) as unlink:
             hooks.forget(tree, tmp, 10, time.monotonic())
+        unlink.assert_called_once_with(missing_ok=True)
         self.assertFalse(os.path.exists(tmp))
 
     def admin(self, gitdir):
@@ -561,7 +577,6 @@ class ForgetTest(unittest.TestCase):
         (admin / 'gitdir').write_bytes(gitdir)
         return admin
 
-    @unittest.skipIf(os.name == 'nt', 'Windows file names are Unicode: none is not UTF-8')
     def test_another_worktree_registered_at_a_path_that_is_not_utf8_is_passed_over(self):
         self.admin(b'/tmp/bad\xff/.git\n')
         tmp, tree = self.head_tree()
@@ -601,25 +616,47 @@ class PinnedAbbrevTest(unittest.TestCase):
 
 
 class OtherRepoEnvTest(unittest.TestCase):
+    REPO = {'GIT_DIR': '.git', 'GIT_WORK_TREE': '.', 'GIT_COMMON_DIR': '.git', 'GIT_INDEX_FILE': 'index'}
+
     def test_the_object_store_stays_absolute_and_the_repository_goes(self):
-        alternates = os.pathsep.join(['alt', os.path.abspath('abs'), '"quoted"'])
-        with mock.patch.dict(os.environ, {'GIT_DIR': '.git', 'GIT_INDEX_FILE': 'index', 'GIT_OBJECT_DIRECTORY': 'objs',
+        alternates = os.pathsep.join(['alt', os.path.abspath('abs'), hooks.c_quoted(os.path.abspath('quoted'))])
+        with mock.patch.dict(os.environ, {**self.REPO, 'GIT_OBJECT_DIRECTORY': 'objs',
                                           'GIT_ALTERNATE_OBJECT_DIRECTORIES': alternates}):
             env = hooks.other_repo_env()
-        self.assertNotIn('GIT_DIR', env)
-        self.assertNotIn('GIT_INDEX_FILE', env)
+        self.assertFalse(set(self.REPO) & set(env))
         self.assertEqual(env['GIT_OBJECT_DIRECTORY'], os.path.abspath('objs'))
         self.assertEqual(env['GIT_ALTERNATE_OBJECT_DIRECTORIES'],
-                         os.pathsep.join([os.path.abspath('alt'), os.path.abspath('abs'), '"quoted"']))
+                         os.pathsep.join([os.path.abspath('alt'), os.path.abspath('abs'),
+                                          hooks.c_quoted(os.path.abspath('quoted'))]))
 
-    def test_a_quoted_alternate_holding_the_separator_stays_whole(self):
-        # git reads a quoted entry up to its closing quote, past any separator inside it.
-        quoted = '"../a' + os.pathsep + 'l\\"t"'
+    def test_git_without_a_tree_keeps_the_callers_repository_and_drops_only_its_index(self):
+        seen = []
+        with mock.patch.dict(os.environ, self.REPO), \
+                mock.patch.object(hooks, 'bounded', lambda *a: seen.append(a[-1]) or (0, '', '')):
+            hooks.git_within(10, time.monotonic(), 'worktree', 'add')
+            hooks.git_within(10, time.monotonic(), 'reset', cwd='tree')
+        self.assertEqual({k: seen[0].get(k) for k in self.REPO}, {**self.REPO, 'GIT_INDEX_FILE': None})
+        self.assertFalse(set(self.REPO) & set(seen[1]))
+
+    def test_a_quoted_alternate_holding_the_separator_stays_whole_and_is_made_absolute(self):
+        # git reads a quoted entry up to its closing quote, past any separator inside it, and resolves it relative
+        # to where it runs.
+        quoted = '"../a' + os.pathsep + 'l\\"t\\303\\251"'
         alternates = os.pathsep.join([quoted, 'alt', '', '#note', quoted])
         with mock.patch.dict(os.environ, {'GIT_ALTERNATE_OBJECT_DIRECTORIES': alternates}):
             env = hooks.other_repo_env()
+        made = hooks.c_quoted(os.path.abspath('../a' + os.pathsep + 'l"t\u00e9'))
         self.assertEqual(env['GIT_ALTERNATE_OBJECT_DIRECTORIES'],
-                         os.pathsep.join([quoted, os.path.abspath('alt'), '', '#note', quoted]))
+                         os.pathsep.join([made, os.path.abspath('alt'), '', '#note', made]))
+        self.assertEqual(hooks.c_unquoted(made[1:-1]), os.path.abspath('../a' + os.pathsep + 'l"t\u00e9'))
+
+    def test_an_alternate_quoted_wrongly_is_read_as_a_plain_entry(self):
+        # unquote_c_style refuses an unknown escape, so git reads the entry unquoted, up to the separator.
+        alternates = os.pathsep.join(['"bad\\q', 'x"'])
+        with mock.patch.dict(os.environ, {'GIT_ALTERNATE_OBJECT_DIRECTORIES': alternates}):
+            env = hooks.other_repo_env()
+        self.assertEqual(env['GIT_ALTERNATE_OBJECT_DIRECTORIES'],
+                         os.pathsep.join([os.path.abspath('"bad\\q'), os.path.abspath('x"')]))
 
 
 class RunHooksTest(unittest.TestCase):
@@ -638,7 +675,7 @@ class RunHooksTest(unittest.TestCase):
             return (1, '') if skip else (1, self.BROKEN)
         with mock.patch.object(hooks, 'pre_commit', pre_commit), \
                 mock.patch.object(hooks, 'baseline', return_value=['broken']):
-            ran, passed, ids, failures, excused = hooks.run_hooks(['a.txt'])
+            ran, passed, ids, failures, excused, _ = hooks.run_hooks(['a.txt'])
         self.assertEqual((ran, passed, ids, excused), (True, False, [], ['broken']))
         self.assertEqual([(f['hook'], f['error']) for f in failures], [
             ('broken', 'nope'), (hooks.UNOWNED, 'pre-commit exited 1 with broken skipped, naming no hook')])
@@ -649,7 +686,7 @@ class RunHooksTest(unittest.TestCase):
         runs = iter([(1, self.BROKEN), (1, fmt), (0, '')])
         with mock.patch.object(hooks, 'pre_commit', lambda *a, **k: next(runs)), \
                 mock.patch.object(hooks, 'baseline', return_value=['broken']):
-            ran, passed, ids, failures, excused = hooks.run_hooks(['a.txt'])
+            ran, passed, ids, failures, excused, _ = hooks.run_hooks(['a.txt'])
         self.assertEqual((ids, [f['hook'] for f in failures], excused), (['fmt'], ['broken'], ['broken']))
 
     def test_nothing_is_rerun_on_head_when_the_config_cannot_be_read(self):
@@ -657,17 +694,28 @@ class RunHooksTest(unittest.TestCase):
         Path(hooks.CONFIG).write_text('repos: [\n')
         with mock.patch.object(hooks, 'pre_commit', return_value=(1, self.BROKEN)), \
                 mock.patch.object(hooks, 'baseline') as baseline:
-            *_, excused = hooks.run_hooks(['a.txt'])
+            *_, excused, not_rerun = hooks.run_hooks(['a.txt'])
         baseline.assert_not_called()
         self.assertEqual(excused, [])
+        self.assertEqual([n['hook'] for n in not_rerun], ['broken'])
+        self.assertRegex(not_rerun[0]['why'], rf'^{hooks.CONFIG} cannot be read \(\w+Error\)$')
+
+    def test_nothing_is_rerun_on_head_without_pyyaml_and_the_failure_says_why(self):
+        with mock.patch.object(hooks, 'yaml', None), \
+                mock.patch.object(hooks, 'pre_commit', return_value=(1, self.BROKEN)), \
+                mock.patch.object(hooks, 'baseline') as baseline:
+            *_, failures, excused, not_rerun = hooks.run_hooks(['a.txt'])
+        baseline.assert_not_called()
+        self.assertEqual(([f['hook'] for f in failures], excused), (['broken'], []))
+        self.assertEqual(not_rerun, [{'hook': 'broken', 'why': 'PyYAML is not installed, so the config was not read'}])
 
     def test_an_id_skip_cannot_name_is_never_rerun_on_head(self):
         out = self.BROKEN.replace('broken', 'a,b')
         with mock.patch.object(hooks, 'pre_commit', return_value=(1, out)), \
                 mock.patch.object(hooks, 'baseline') as baseline:
-            *_, excused = hooks.run_hooks(['a.txt'])
+            *_, excused, not_rerun = hooks.run_hooks(['a.txt'])
         baseline.assert_not_called()
-        self.assertEqual(excused, [])
+        self.assertEqual((excused, not_rerun), ([], [{'hook': 'a,b', 'why': 'SKIP cannot name it'}]))
 
 
 class AsCheckoutTest(unittest.TestCase):

@@ -151,7 +151,9 @@ and write UTF-8 themselves, so no `-X utf8` or `PYTHONUTF8` is needed. Bash's
   `/usr/bin/python3`, for the workflows' script calls and the simplify gate's
   wrapper; PyYAML in it for the tests, and for `pr-babysit`'s `harvest.py`, which
   `pr-review` also imports, to date a head by its pull_request runs (without it
-  they go unread and the harvest says so). `install.py` registers a Python hook as
+  they go unread and the harvest says so), and its `hooks.py`, to excuse a hook
+  that fails on HEAD too (without it none is, and the refusal says so).
+  `install.py` registers a Python hook as
   `'<the python that ran install.py>' '<hook>.py'`, since a hook that cannot
   start lets the tool call through; rerun it after replacing that Python, and
   name the interpreter the same way in the credit guard's recipe below.
