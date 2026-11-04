@@ -2348,6 +2348,7 @@ class Fixable(PostCase):
         self.save(self.result_for(self.p, findings=two, draft=draft, verdict={'event': 'REQUEST_CHANGES', 'reasons': ['r']}))
         self.assertEqual(self.post('--auto')['status'], 'posted')
         self.root = self.review()['findings'][0]['commentId']
+        self.pristine = Path(self.p['ledger']).read_text()
 
     def snap(self):
         snap = self.tmp / 'threads.json'
@@ -2457,19 +2458,130 @@ class Fixable(PostCase):
         got = self.fixable()
         self.assertEqual((self.held(got), got['autoPost']), ([('pr7-f1', 'disputed'), ('pr7-f2', 'unmapped')], False))
 
-    def test_a_carried_finding_is_placed_by_the_review_that_published_it(self):
-        self.commit('src/core/c.c', 'int c;\n', 'c')
+    def carried(self, found, name='c'):
+        """A later review on a new head (a commit of src/core/<name>.c) carrying `found`, posted; the fixable view of it."""
+        self.commit(f'src/core/{name}.c', f'int {name};\n', name)
         head = self.push_pr()
         p = self.prepare()
         self.assertEqual(p['mode'], 'incremental')
-        carried = [{'id': 'pr7-f1', 'file': 'src/core/a.c', 'line': 21, 'why': 'b is never initialised', 'severity': 'high',
-                    'dimension': 'correctness', 'status': 'open'}]
-        self.save(self.result_for(p, findings=carried, draft={'event': 'REQUEST_CHANGES', 'body': 'Still open.', 'comments': [], 'replies': []},
+        self.save(self.result_for(p, findings=found, draft={'event': 'REQUEST_CHANGES', 'body': 'Still open.', 'comments': [], 'replies': []},
                                   verdict={'event': 'REQUEST_CHANGES', 'reasons': ['r']}))
         self.head = head
         self.assertEqual(self.post('--auto')['status'], 'posted')
-        got = self.fixable(head)
+        return self.fixable(head)
+
+    def test_a_carried_finding_is_placed_by_the_review_that_published_it(self):
+        got = self.carried([{'id': 'pr7-f1', 'file': 'src/core/a.c', 'line': 21, 'why': 'b is never initialised', 'severity': 'high',
+                             'dimension': 'correctness', 'status': 'open'}])
         self.assertEqual(([f['id'] for f in got['fix']], got['held']), (['pr7-f1'], []))
+
+    def group(self, change=None, muted=True):
+        """The setUp review as one defect led by its first finding, its second left out as the muted member (no text
+        of its own); muted=None leaves the key out, as a review saved before the flag does."""
+        led = json.loads(self.pristine)
+        rev = led['reviews'][-1]
+        rev['draft']['moved'] = []
+        for k, f in enumerate(rev['findings']):
+            f.update(defect=0, lead=k == 0)
+        if muted is None:
+            rev['findings'][1].pop('muted', None)
+        else:
+            rev['findings'][1]['muted'] = muted
+        if change:
+            change(rev)
+        Path(self.p['ledger']).write_text(json.dumps(led))
+        return self.fixable()
+
+    def outcome(self, got):
+        return [f['id'] for f in got['fix']], self.held(got), got['autoPost']
+
+    def test_a_muted_finding_is_held_grouped_and_does_not_hold_the_recheck(self):
+        got = self.group()
+        self.assertEqual(([f['id'] for f in got['fix']], got['held'], got['autoPost']),
+                         (['pr7-f1'], [{'findingId': 'pr7-f2', 'commentId': None, 'why': 'grouped'}], True))
+        self.assertEqual(self.outcome(self.group(lambda r: r['findings'].reverse())), (['pr7-f1'], [('pr7-f2', 'grouped')], True))
+
+    def test_an_unplaced_finding_not_muted_stays_unmapped_as_one_saved_before_the_flag(self):
+        for muted in (False, None):
+            with self.subTest(muted=muted):
+                self.assertEqual(self.outcome(self.group(muted=muted)), (['pr7-f1'], [('pr7-f2', 'unmapped')], False))
+
+    def test_a_muted_finding_with_text_of_its_own_on_the_pr_is_judged_by_it(self):
+        self.assertEqual(self.outcome(self.group(lambda r: r['draft'].update(moved=json.loads(self.pristine)['reviews'][-1]['draft']['moved']))),
+                         (['pr7-f1', 'pr7-f2'], [], True))
+
+    def test_a_contested_lead_no_longer_states_its_group(self):
+        # The recheck may withdraw a disputed or replied lead and judge its muted mate without the lead's thread.
+        self.assertEqual(self.outcome(self.group(lambda r: r['findings'][0].update(status='disputed'))),
+                         ([], [('pr7-f1', 'disputed'), ('pr7-f2', 'unmapped')], False))
+        self.gh.inline.append({'id': 950, 'in_reply_to_id': self.root, 'body': 'intentional', 'created_at': self.gh.tick(),
+                               'user': {'login': 'contrib'}})
+        self.gh.threads[0]['comments']['nodes'].append({'databaseId': 950})
+        self.assertEqual(self.outcome(self.group()), ([], [('pr7-f1', 'replied'), ('pr7-f2', 'unmapped')], False))
+
+    def test_a_muted_finding_whose_group_text_no_longer_stands_is_unmapped(self):
+        self.assertEqual(self.outcome(self.group(lambda r: r['findings'][0].update(defect=1))), (['pr7-f1'], [('pr7-f2', 'unmapped')], False),
+                         'a lead of another defect does not state it')
+        # The lead's text edited or deleted on the PR, or deleted from the pending review before the human submitted it.
+        next(c for c in self.gh.inline if c['id'] == self.root)['body'] = 'edited'
+        self.assertEqual(self.outcome(self.group()), ([], [('pr7-f1', 'edited'), ('pr7-f2', 'unmapped')], False))
+        self.gh.inline = [c for c in self.gh.inline if c['id'] != self.root]
+        self.gh.threads = []
+        self.assertEqual(self.outcome(self.group()), ([], [('pr7-f1', 'deleted'), ('pr7-f2', 'unmapped')], False))
+        self.assertEqual(self.outcome(self.group(lambda r: r['findings'][0].update(status='dropped'))), ([], [('pr7-f2', 'unmapped')], False))
+
+    def test_a_lead_saved_without_the_flag_or_a_mate_posted_beside_its_group_does_not_state_it(self):
+        self.assertEqual(self.outcome(self.group(lambda r: r['findings'][0].pop('lead'))), (['pr7-f1'], [('pr7-f2', 'unmapped')], False))
+
+        def beside(r):
+            # The lead dropped; pr7-f1's comment, still standing, is that of a mate posted beside its group.
+            r['findings'].append({**r['findings'][0], 'id': 'pr7-f3', 'commentId': None, 'status': 'dropped'})
+            r['findings'][0]['lead'] = False
+        self.assertEqual(self.outcome(self.group(beside)), (['pr7-f1'], [('pr7-f2', 'unmapped')], False))
+
+    def bot_claim(self, resolved=False):
+        """A bot's inline comment 900, on its own thread, claiming the group's defect; the change adding its claim."""
+        self.gh.inline.append({'id': 900, 'path': 'src/core/a.c', 'line': 1, 'body': 'a shadows a global', 'created_at': self.gh.tick(),
+                               'user': {'login': 'bot[bot]', 'type': 'Bot'}})
+        self.gh.threads.append({'id': 'T900', 'isResolved': resolved, 'isOutdated': False, 'comments': {'nodes': [{'databaseId': 900}]}})
+
+        def claimed(r):
+            r['findings'][0]['status'] = 'dropped'
+            r['claims'] = [{'commentId': 900, 'author': 'bot[bot]', 'claim': 'a shadows a global', 'verdict': 'confirmed',
+                            'severity': 'medium', 'defect': 0}]
+        return claimed
+
+    def test_a_thread_claim_of_the_group_states_a_muted_finding_whose_lead_text_is_gone(self):
+        self.assertEqual(self.outcome(self.group(self.bot_claim())), ([], [('pr7-f2', 'grouped')], True))
+
+    def test_a_claim_led_group_holds_every_muted_finding_grouped_while_its_comment_is_listed(self):
+        claimed = self.bot_claim()
+
+        def led_by_claim(r):
+            claimed(r)
+            r['findings'][0].update(status='open', muted=True, commentId=None)
+        self.assertEqual(self.outcome(self.group(led_by_claim)), ([], [('pr7-f1', 'grouped'), ('pr7-f2', 'grouped')], True))
+        self.gh.inline = [c for c in self.gh.inline if c['id'] != 900]
+        self.gh.threads = [t for t in self.gh.threads if t['id'] != 'T900']
+        self.assertEqual(self.outcome(self.group(led_by_claim)), ([], [('pr7-f1', 'unmapped'), ('pr7-f2', 'unmapped')], False))
+
+    def test_a_claim_on_a_resolved_thread_still_states_its_group(self):
+        self.assertEqual(self.outcome(self.group(self.bot_claim(resolved=True))), ([], [('pr7-f2', 'grouped')], True))
+
+    def test_a_claim_whose_comment_is_gone_from_the_pr_no_longer_states_its_group(self):
+        claimed = self.bot_claim()
+        self.gh.inline = [c for c in self.gh.inline if c['id'] != 900]
+        self.gh.threads = [t for t in self.gh.threads if t['id'] != 'T900']
+        self.assertEqual(self.outcome(self.group(claimed)), ([], [('pr7-f2', 'unmapped')], False))
+
+    def test_a_carried_finding_the_latest_review_no_longer_mutes_is_unmapped(self):
+        lead = {'id': 'pr7-f1', 'file': 'src/core/a.c', 'line': 21, 'why': 'b is never initialised', 'severity': 'high',
+                'dimension': 'correctness', 'status': 'open', 'defect': 0, 'muted': False, 'lead': True}
+        mate = {'file': 'src/core/c.c', 'line': 1, 'why': 'b is never initialised, seen from c', 'severity': 'high',
+                'dimension': 'concurrency', 'status': 'open', 'defect': 0, 'muted': True, 'lead': False}
+        self.assertEqual(self.outcome(self.carried([lead, mate])), (['pr7-f1'], [('pr7-f3', 'grouped')], True))
+        self.assertEqual(self.outcome(self.carried([lead, {**mate, 'id': 'pr7-f3', 'defect': None, 'muted': False}], 'd')),
+                         (['pr7-f1'], [('pr7-f3', 'unmapped')], False), 'the saved record keeps no stale muted')
 
     def test_a_carried_finding_the_human_edited_before_submitting_offers_the_published_text(self):
         # The state post.submitted leaves when the human edited the pending comment before submitting it.

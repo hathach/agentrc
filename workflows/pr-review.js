@@ -515,7 +515,14 @@ while (lines.length && !lines[lines.length - 1]) lines.pop()
 return {
   status: 'reviewed', pr, repo, head, mergeBase, scopeBase, mode: args.mode,
   verdict: { event, reasons },
-  findings: [...carriedOut, ...ours].map(({ group, muted, beside, ...f }) => (!discussion && (f.id || group != null) ? { ...f, defect: group ?? null } : f)),
+  // muted: no comment of its own in this draft, its group's printed text stating it; lead: its group's lead, whose own
+  // text is that printed text unless muted. Always written, since a carried finding's saved record keeps whatever this
+  // result leaves out.
+  findings: [...carriedOut, ...ours].map((x, i) => {
+    const { group, muted, beside, ...f } = x
+    return discussion ? f : { ...f, ...(f.id || group != null ? { defect: group ?? null } : {}),
+      muted: Boolean(muted) && !comments.some(c => c.finding === i), lead: group != null && leadOf.get(group) === x }
+  }),
   claims: claimsOut.map(({ group, ...c }) => (group != null ? { ...c, defect: group } : c)),
   coverage: { dropped: audit.dropped, unverified: audit.unverified, unjudged },
   ci, hil,
