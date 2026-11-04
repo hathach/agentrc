@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { test } from 'node:test'
+import { fileURLToPath } from 'node:url'
 
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
 const body = readFileSync(new URL('../workflows/pr-review.js', import.meta.url), 'utf8')
@@ -8,6 +13,7 @@ const body = readFileSync(new URL('../workflows/pr-review.js', import.meta.url),
 const ABSENT = ['URL', 'URLSearchParams', 'TextEncoder', 'TextDecoder', 'Buffer', 'process', 'fetch', 'structuredClone']
 
 const H = 'b'.repeat(40), MB = 'a'.repeat(40), OLD = 'c'.repeat(40)
+const wordy = (n) => 'w '.repeat(n).trim()
 const BASE = {
   pr: 7, repo: 'o/r', head: H, mergeBase: MB, scopeBase: MB, mode: 'full', groups: ['src/core'],
   factsDir: '/tmp/ledger/7', hil: { choice: 'boards', boards: [{ board: 'b1', verdict: 'pass', regression: 'none', testedHead: 'b'.repeat(40), report: '/r/b1.json' }] },
@@ -19,6 +25,34 @@ const finding = (why, severity = 'high', line = 10, impact = IMP) => ({ file: 's
   impact, severityReason: `graded: ${why}`, verdict: { real: true, reason: `holds: ${why}` } })
 const confirmedAs = (severity, over = {}) => ({ verdict: 'confirmed', reason: 'yes', severity, impact: IMP, severityReason: 'graded', confidence: 'high', ...over })
 const REFUTED = { verdict: 'refuted', reason: 'no', severity: null, impact: null, severityReason: null, confidence: null }
+
+// ledger.py show --snapshot's manifest over `answer` as the snapshot's bytes, and the real state_transfer.py --raw's
+// envelope for the file a manifest named.
+const STATE_TRANSFER = fileURLToPath(new URL('../skills/pr-babysit/scripts/state_transfer.py', import.meta.url))
+const snapshots = new Map()
+const asciiJson = (v) => JSON.stringify(v).replace(/[\u007f-￿]/g, c => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`)
+function fnv1a (text) {
+  let h = 0x811c9dc5
+  for (const ch of text) h = Math.imul(h ^ ch.codePointAt(0), 0x01000193) >>> 0
+  return h.toString(16).padStart(8, '0')
+}
+function manifestOf (answer, a) {
+  const payload = asciiJson(answer)
+  const file = `${a.factsDir.replace(/\\/g, '/')}/ledger-${createHash('sha256').update(payload).digest('hex')}.json`
+  snapshots.set(file, payload)
+  return { repo: a.repo, pr: a.pr, head: a.head, file, digest: fnv1a(payload), length: payload.length }
+}
+function envelopeOf (prompt) {
+  const [, file, ids, pad] = /state_transfer\.py '([^']+)' --raw --chunks ([0-9,]+)( --pad)?\n/.exec(prompt)
+  const dir = mkdtempSync(join(tmpdir(), 'pr-review-ledger-'))
+  try {
+    const at = join(dir, 'ledger.json')
+    writeFileSync(at, snapshots.get(file))
+    const done = spawnSync('python3', [STATE_TRANSFER, at, '--raw', '--chunks', ids, ...(pad ? ['--pad'] : [])], { encoding: 'utf8' })
+    assert.equal(done.status, 0, done.stdout + done.stderr)
+    return JSON.parse(done.stdout.trim().split('\n').at(-1))
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+}
 
 // Stub agents keyed by label; `stubs.<label>` is the value, or a function of the prompt.
 async function run(args, stubs = {}) {
@@ -37,11 +71,23 @@ async function run(args, stubs = {}) {
   }
   const agent = async (prompt, options) => {
     calls.push({ label: options.label, prompt: String(prompt), options })
+    // `stubs.ledgerChunks(envelope, call)` replaces an envelope of the chunks a load asked.
+    if (options.label.startsWith('ledger:load#')) {
+      const env = envelopeOf(prompt)
+      return stubs.ledgerChunks ? stubs.ledgerChunks(env, calls.filter(c => c.label.startsWith('ledger:load#')).length) : env
+    }
     const v = pick(options.label, prompt)
-    // `stubs.disputes` is the ledger answer's disputes, unless that answer names its own.
-    if (options.label === 'ledger') {
-      const l = v === undefined ? defaults.ledger : v
-      return l && typeof l === 'object' && !('disputes' in l) ? { ...l, disputes: stubs.disputes?.disputes ?? [] } : l
+    // `stubs.ledger` is the answer ledger.py show --snapshot writes; `stubs.disputes` its disputes, unless that answer
+    // names its own; the members ledger.py always prints default as it prints them. `stubs.ledgerAsIs` is written
+    // untouched, and `stubs['ledger:manifest']` replaces the manifest.
+    if (options.label === 'ledger:manifest') {
+      if (stubs['ledger:manifest'] !== undefined) return v
+      const l = stubs.ledgerAsIs !== undefined ? stubs.ledgerAsIs : v === undefined ? defaults.ledger : v
+      if (!l || typeof l !== 'object') return l
+      const rows = Array.isArray(l.open) ? { open: l.open.map(f => f && typeof f === 'object' ? { published: null, repair: null, ...f } : f) } : {}
+      const answer = stubs.ledgerAsIs !== undefined ? l
+        : { ...(l.reviews > 0 ? { heldThreads: [] } : {}), ...l, ...rows, ...('disputes' in l ? {} : { disputes: stubs.disputes?.disputes ?? [] }) }
+      return manifestOf(answer, args)
     }
     if (v !== undefined) return v
     if (options.label in defaults) return defaults[options.label]
@@ -49,7 +95,7 @@ async function run(args, stubs = {}) {
       const fs = JSON.parse(/Findings: (\[.*\])$/s.exec(prompt)[1])
       return { summary: '- Overall fine.', comments: fs.map(f => ({ finding: f.finding, body: `**${f.severity}**: ${f.why}` })) }
     }
-    if (options.label === 'check-draft') return { bad: [], summaryBad: false }
+    if (options.label === 'check-draft') return { bad: [], firstBad: [], summaryBad: false }
     if (options.label === 'group') return { groups: [] }
     if (options.label === 'beyond') return { beyond: [] }
     throw new Error(`unstubbed ${options.label}`)
@@ -62,14 +108,16 @@ async function run(args, stubs = {}) {
     return v === undefined ? { confirmed: [], dropped: [], unverified: [] } : (typeof v === 'function' ? v(a) : v)
   }
   const parallel = thunks => Promise.all(thunks.map(t => Promise.resolve().then(t).catch(() => null)))
-  const fn = new AsyncFunction('args', 'agent', 'pipeline', 'parallel', 'phase', 'log', 'workflow', 'budget', ...ABSENT, body)
-  const result = await fn(args, agent, null, parallel, () => {}, m => logs.push(String(m)), workflow, null, ...ABSENT.map(() => undefined))
-  return { result, calls, logs, audits, labels: calls.map(c => c.label) }
+  // Every value the workflow parses, so a test can see the ledger answer it rebuilt.
+  const parsed = []
+  const json = { stringify: JSON.stringify, parse: (t, r) => { const v = JSON.parse(t, r); parsed.push(v); return v } }
+  const fn = new AsyncFunction('args', 'agent', 'pipeline', 'parallel', 'phase', 'log', 'workflow', 'budget', 'JSON', ...ABSENT, body)
+  const result = await fn(args, agent, null, parallel, () => {}, m => logs.push(String(m)), workflow, null, json, ...ABSENT.map(() => undefined))
+  return { result, calls, logs, audits, parsed, labels: calls.map(c => c.label) }
 }
 
 const pinned = (a) => ({ ok: true, head: H, top: '/w', repo: a.repo, pr: a.pr, ci: { state: 'green' }, pins: { mergeBase: a.mergeBase, scopeBase: a.scopeBase, mode: a.mode, groups: a.groups } })
 const board = (verdict, regression, testedHead = H) => ({ board: 'b1', verdict, regression, testedHead, report: '/r/b1.json' })
-const words = (s) => s.split(/\s+/).filter(Boolean).length
 // A list's [minItems, maxItems, id enum], as the runtime is asked to hold an answer to.
 const sized = (schema, key, id) => { const l = schema.properties[key]; return [l.minItems, l.maxItems, l.items.properties[id].enum] }
 const audited = (...fs) => ({ confirmed: [{ dir: 'src/core', dim: 'correctness: x', findings: fs }], dropped: [], unverified: [] })
@@ -145,11 +193,13 @@ test('a clean full review approves only with green CI, full coverage and hardwar
   assert.equal(result.verdict.event, 'APPROVE')
   assert.deepEqual(audits[0], { dirs: ['src/core'], dimensions: audits[0].dimensions, diff: { base: MB, head: H }, root: '/w' })
   assert.equal(audits[0].dimensions.length, 4)
-  assert.ok(calls.filter(c => ['check', 'threads', 'ledger'].includes(c.label)).every(c => c.options.model === 'haiku'))
+  assert.ok(calls.filter(c => ['check', 'threads', 'ledger:manifest'].includes(c.label)).every(c => c.options.model === 'haiku'))
+  assert.ok(calls.filter(c => c.label.startsWith('ledger:load#')).every(c => c.options.model === 'sonnet'))
   assert.match(calls.find(c => c.label === 'check').prompt, /prepare\.py --check --pr 7 --repo o\/r --expected-head b{40}/)
   const at = (l) => calls.findIndex(c => c.label === l)
-  assert.ok(at('threads') < at('ledger'), 'show reads the snapshot threads.py wrote')
-  assert.match(calls[at('ledger')].prompt, /ledger\.py show .*--threads '\/tmp\/ledger\/7\/threads-b{40}\.json' --head b{40}\n/)
+  assert.ok(at('threads') < at('ledger:manifest'), 'show reads the snapshot threads.py wrote')
+  assert.match(calls[at('ledger:manifest')].prompt, /ledger\.py show .*--threads '\/tmp\/ledger\/7\/threads-b{40}\.json' --head b{40} --snapshot '\/tmp\/ledger\/7'\n/)
+  assert.match(calls[at('ledger:load#1')].prompt, /state_transfer\.py '\/tmp\/ledger\/7\/ledger-[0-9a-f]{64}\.json' --raw --chunks 0\n/)
   assert.deepEqual(result.heldThreads, [])
   assert.doesNotMatch(result.draft.body, /agentrc|Claude|generated/i)
 
@@ -199,61 +249,50 @@ test('a blocking finding or a verified regression requests changes; minor ones o
 })
 
 test('a drafted comment that adds a claim, or is lost, falls back to the finding\'s own words', async () => {
-  const flagged = await run(BASE, { audit: audited(finding('a'), finding('b', 'high', 20)), 'check-draft': { bad: [1] } })
+  const flagged = await run(BASE, { audit: audited(finding('a'), finding('b', 'high', 20)), 'check-draft': { bad: [1], firstBad: [] } })
   assert.deepEqual(flagged.result.draft.comments.map(c => c.body), ['**high**: a', '**high**: b'])
   assert.match(flagged.result.draft.body, /Overall fine/, 'a clean summary stays when one comment is flagged')
-  const summary = await run(BASE, { audit: audited(finding('a')), 'check-draft': { bad: [], summaryBad: true } })
+  const summary = await run(BASE, { audit: audited(finding('a')), 'check-draft': { bad: [], firstBad: [], summaryBad: true } })
   assert.doesNotMatch(summary.result.draft.body, /Overall fine/, 'a summary that adds a claim is dropped')
   assert.ok(summary.logs.includes('summary left out: the check found a claim no finding states'))
   const dead = await run(BASE, { audit: audited(finding('a')), write: null })
   assert.deepEqual(dead.result.draft.comments.map(c => c.body), ['**high**: a'])
+  const first = await run(BASE, { audit: audited(finding('a'), finding('b', 'high', 20)), 'check-draft': { bad: [], firstBad: [0], summaryBad: false },
+    write: { summary: '', comments: [{ finding: 0, body: '**high**: a, worded' }, { finding: 1, body: '**high**: b' }] } })
+  assert.deepEqual(first.result.draft.comments.map(c => [c.body, !!c.firstLineUnchecked]), [['**high**: a, worded', true], ['**high**: b', false]],
+    'a first line the check flags keeps its text and holds auto-post')
 })
 
-test('text over its limit is shortened once, then marked long for the human, never cut', async () => {
-  const wordy = (n) => 'w '.repeat(n).trim()
-  const long = { summary: 'Prose, not bullets.', comments: [{ finding: 0, body: wordy(81) }, { finding: 1, body: '**high**: b' }] }
-  const fixed = await run(BASE, { audit: audited(finding('a'), finding('b', 'high', 20)), write: long,
-    shorten: { comments: [{ finding: 0, body: '**high**: a' }], answers: [], summary: '- a is broken' } })
-  const ask = fixed.calls.find(c => c.label === 'shorten')
-  assert.match(ask.prompt, /"finding":0/)
-  // Each list names exactly the ids asked, so the runtime has the agent correct a short answer; no ids, no enum.
-  assert.deepEqual(sized(fixed.calls.find(c => c.label === 'write').options.schema, 'comments', 'finding'), [2, 2, [0, 1]])
-  assert.deepEqual(sized(ask.options.schema, 'comments', 'finding'), [1, 1, [0]])
-  assert.deepEqual(sized(ask.options.schema, 'answers', 'finding'), [0, 0, undefined])
-  const prose = await run(BASE, { audit: audited(finding('a')), write: { summary: 'Prose, not bullets.', comments: [{ finding: 0, body: '**high**: a' }] }, shorten: null })
-  const summaryOnly = prose.calls.find(c => c.label === 'shorten').options.schema
-  assert.deepEqual([sized(summaryOnly, 'comments', 'finding'), sized(summaryOnly, 'answers', 'finding')], [[0, 0, undefined], [0, 0, undefined]])
-  assert.doesNotMatch(ask.prompt, /"body":"\*\*high\*\*: b"/, 'only the text over its limit is sent')
-  assert.deepEqual(fixed.result.draft.comments.map(c => c.body), ['**high**: a', '**high**: b'])
-  assert.ok(!fixed.logs.some(l => /over length/.test(l)))
-  assert.match(fixed.result.draft.body, /^- a is broken$/m)
-  assert.equal(fixed.calls.find(c => c.label === 'check-draft').prompt.includes('**high**: a'), true, 'the claim check reads the shortened text')
-
-  const kept = await run(BASE, { audit: audited(finding('a')), write: { summary: 'Prose.', comments: [{ finding: 0, body: `**high**: ${wordy(80)}` }] }, shorten: null })
-  assert.equal(words(kept.result.draft.comments[0].body), 81, 'never cut')
-  assert.doesNotMatch(kept.result.draft.body, /Prose/, 'a summary still over its format is left out')
-  assert.ok(kept.logs.some(l => /over length, for the human to shorten: src\/core\/a\.c:10$/.test(l)))
-  assert.ok(kept.logs.includes('summary left out: still over its format after shortening'))
-  const line = await run(BASE, { audit: audited(finding('a')), write: { summary: '- ok', comments: [{ finding: 0, body: `**high**: ${'x'.repeat(301)}` }] }, shorten: null })
-  assert.ok(line.logs.some(l => /over length, for the human to shorten: src\/core\/a\.c:10/.test(l)), 'a line over about three rendered lines is long')
-  const edge = await run(BASE, { audit: audited(finding('a')), write: { summary: '- 1\n- 2\n- 3', comments: [{ finding: 0, body: `**high**: ${wordy(77)}\n- ${wordy(2)}` }] } })
-  assert.equal(edge.labels.includes('shorten'), false, 'at the limit nothing is shortened')
-  const bare = { summary: '- ok', comments: [{ finding: 0, body: 'No heading here.' }, { finding: 1, body: '**high**: b\n- 1\n- 2\n- 3\n- 4' }] }
-  const off = await run(BASE, { audit: audited(finding('a'), finding('b', 'high', 20)), write: bare, shorten: null })
-  assert.match(off.calls.find(c => c.label === 'shorten').prompt, /No heading here[\s\S]*- 4/, 'a comment off its format is rewritten')
-  assert.deepEqual(off.result.draft.comments.map(c => c.body), ['**high**: a', '**high**: b'], 'still off its format: the template')
-  const wrong = await run(BASE, { audit: audited(finding('a')), write: { summary: '- ok', comments: [{ finding: 0, body: '**low**: a' }] }, shorten: null })
+test('text of any length is drafted as written: nothing measures, shortens or holds it', async () => {
+  const long = `**high**: ${wordy(200)}\n- ${'x'.repeat(700)}\n- 2\n- 3\n- 4`
+  const summary = `- ${wordy(60)}`
+  const r = await run(BASE, { audit: audited(finding('a'), finding('b', 'high', 20)), write: { summary, comments: [{ finding: 0, body: long }, { finding: 1, body: '**high**: b' }] } })
+  // Each list names exactly the ids asked, so the runtime has the agent correct a short answer.
+  assert.deepEqual(sized(r.calls.find(c => c.label === 'write').options.schema, 'comments', 'finding'), [2, 2, [0, 1]])
+  assert.deepEqual(r.result.draft.comments.map(c => [c.body, c.firstLineUnchecked]), [[long, undefined], ['**high**: b', undefined]],
+    'four bullets and a 700-character line, kept whole')
+  assert.ok(r.result.draft.body.startsWith(`${summary}\n`), 'a long one-bullet summary is kept')
+  assert.equal(r.labels.some(l => l.startsWith('shorten')), false)
+  assert.ok(!r.logs.some(l => /over length|shorten/.test(l)))
+  const write = r.calls.find(c => c.label === 'write').prompt
+  assert.match(write, /only the bullets it needs/)
+  assert.match(write, /as short as it allows/)
+  assert.doesNotMatch(write, /\d+ words|characters|at most 3/, 'the writer is given no length')
+  const prose = await run(BASE, { audit: audited(finding('a')), write: { summary: 'Prose, not bullets.', comments: [{ finding: 0, body: '**high**: a' }] } })
+  assert.doesNotMatch(prose.result.draft.body, /Prose/, 'a summary off its format is left out')
+  assert.ok(prose.logs.includes('summary left out: off its format'))
+  const bare = { summary: '- ok', comments: [{ finding: 0, body: 'No heading here.' }, { finding: 1, body: '**high**: ' }] }
+  const off = await run(BASE, { audit: audited(finding('a'), finding('b', 'high', 20)), write: bare })
+  assert.deepEqual(off.result.draft.comments.map(c => [c.body, c.firstLineUnchecked]), [['**high**: a', true], ['**high**: b', true]],
+    'no heading, or no problem after it: the finding\'s own words')
+  const wrong = await run(BASE, { audit: audited(finding('a')), write: { summary: '- ok', comments: [{ finding: 0, body: '**low**: a' }] } })
   assert.deepEqual(wrong.result.draft.comments.map(c => c.body), ['**high**: a'], 'a heading must name its finding\'s severity')
-  const empty = await run(BASE, { audit: audited(finding('a'), finding('b', 'high', 20)), shorten: null,
-    write: { summary: '- ok', comments: [{ finding: 0, body: '**high**: ' }, { finding: 1, body: '**high**: b\n+ 1\n+ 2\n+ 3\n+ 4' }] } })
-  assert.deepEqual(empty.result.draft.comments.map(c => c.body), ['**high**: a', '**high**: b'], 'no problem after the heading, or 4 bullets of any marker')
-  assert.match(edge.result.draft.body, /- 3/)
   const plus = await run(BASE, { audit: audited(finding('a')), write: { summary: '+ one', comments: [{ finding: 0, body: '**high**: a' }] } })
-  assert.equal(plus.labels.includes('shorten'), false, 'a `+` bullet summary is in format')
+  assert.match(plus.result.draft.body, /^\+ one$/m, 'a `+` bullet summary is in format')
 })
 
 test('open thread claims are judged; a confirmed one covers our same finding and counts once', async () => {
-  const claims = { claims: [{ commentId: 55, threadId: 'T', author: 'coderabbitai[bot]', bot: true, path: 'src/core/a.c', line: 10, claim: 'overrun' },
+  const claims = { claims: [{ commentId: 55, threadId: 'T', author: 'coderabbitai[bot]', bot: true, path: 'src/core/a.c', line: 10, url: 'https://x/c55', claim: 'overrun' },
     { commentId: 56, threadId: 'U', author: 'maint', bot: false, path: null, line: null, claim: 'rename it' }] }
   const judge = (p) => /overrun/.test(p) ? confirmedAs('nit') : REFUTED
   const { result, labels, calls } = await run(BASE, { audit: audited(finding('buffer overrun', 'nit')), claims, judge, group: { groups: [{ findings: [0], claims: ['55#1'] }] } })
@@ -263,7 +302,14 @@ test('open thread claims are judged; a confirmed one covers our same finding and
   assert.deepEqual(['status', 'defect'].map(k => result.findings.find(f => f.why === 'buffer overrun')[k]), ['open', 0], 'still ours to recheck')
   assert.deepEqual(result.claims.map(c => c.defect), [0, undefined])
   assert.deepEqual(result.draft.comments, [], 'a covered finding is not posted again')
-  assert.match(result.draft.body, /@coderabbitai\[bot\] on `src\/core\/a\.c:10`: overrun/)
+  assert.match(result.draft.body, /^Confirmed from other reviewers:\n- @coderabbitai\[bot\] \[comment\]\(https:\/\/x\/c55\), point 1$/m, 'by comment and point, never restating the claim')
+  const apart = await run(BASE, { audit: audited(finding('other', 'medium', 20)), claims, judge: (p) => /overrun/.test(p) ? confirmedAs('high') : REFUTED })
+  for (const label of ['write', 'check-draft']) {
+    assert.match(apart.calls.find(c => c.label === label).prompt, /Already on the PR: \[\{"severity":"high","file":"src\/core\/a\.c","line":10,"author":"coderabbitai\[bot\]"\}\]/,
+      `${label} weighs the confirmed claims by grade and place`)
+  }
+  assert.match(apart.calls.find(c => c.label === 'check-draft').prompt, /"file":"src\/core\/a\.c","line":20,"severity":"medium"/)
+  assert.doesNotMatch(result.draft.body, /overrun/)
   assert.equal(result.verdict.event, 'APPROVE', 'a nit confirmed claim counted once is minor')
   assert.match(calls.find(c => c.label === 'judge:0').prompt, /First find comment 55 in \/tmp\/ledger\/7\/threads-b{40}\.json/)
   const mis = await run(BASE, { claims, judge: () => ({ verdict: 'misattributed', severity: 'high', reason: 'not said' }) })
@@ -298,9 +344,9 @@ test('a thread claim of a group counts once at the strongest grade of all member
   assert.deepEqual(result.findings.map(f => [f.status, f.defect]), [['open', 0], ['open', 0]], 'the findings stay one defect if the thread goes')
   assert.deepEqual(result.claims.map(c => [c.claimId, c.defect]), [['55#1', 0], ['55#2', undefined], ['57#1', 0]])
   assert.deepEqual(result.verdict.reasons, ['1 blocking finding(s) open'], 'the low claims are the high finding: one blocker')
-  assert.match(result.draft.body, /overrun \(our review grades it \*\*high\*\*, `src\/core\/a\.c:10`\)/)
+  assert.match(result.draft.body, /^- @coderabbitai\[bot\] on `src\/core\/a\.c:10`, point 1; our grade \*\*high\*\*$/m, 'no url: its place names it')
   const tie = await run(BASE, { audit: audited(finding('buffer overrun', 'low')), claims, judge, group: { groups: [{ findings: [0], claims: ['55#1'] }] } })
-  assert.doesNotMatch(tie.result.draft.body, /our review grades it/, 'only a stronger grade is named')
+  assert.doesNotMatch(tie.result.draft.body, /our grade/, 'only a stronger grade is named')
 })
 
 test('a muted finding stating an issue its group\'s text lacks posts too, counted once with its group', async () => {
@@ -312,42 +358,52 @@ test('a muted finding stating an issue its group\'s text lacks posts too, counte
   assert.match(calls.find(c => c.label === 'write').prompt, /"alsoState":"the removed reference comment"/)
   assert.match(calls.find(c => c.label === 'check-draft').prompt, /"alsoState":"the removed reference comment"/)
   assert.deepEqual(result.draft.comments.map(c => c.body), ['**high**: rf_tv zeroed', '**nit**: the reference comment removed'])
-  assert.deepEqual([result.verdict.reasons, result.findings.map(f => [f.defect, 'beside' in f])], [['1 blocking finding(s) open'], [[0, false], [0, false]]])
+  assert.deepEqual([result.verdict.reasons, result.findings.map(f => [f.defect, 'beside' in f, f.muted])], [['1 blocking finding(s) open'], [[0, false, false], [0, false, false]]],
+    'a member posted beside its group is not muted')
+  assert.deepEqual(result.findings.map(f => f.lead), [true, false], 'a member posted beside its group is not its lead: its comment states only itself')
   assert.ok(logs.some(l => /beside its group, src\/core\/a\.c:10: the removed reference comment/.test(l)))
-  const flagged = await run(BASE, { audit: pair, group, write: written, 'check-draft': { bad: [1], summaryBad: false }, beyond: { beyond: [{ finding: 0, issue: 'x' }] } })
-  assert.equal(flagged.result.draft.comments[1].body, '**nit**: rf_tv zeroed, and the reference comment removed\n\nholds: rf_tv zeroed, and the reference comment removed', 'the fallback carries its verification, never the issue named')
+  const flagged = await run(BASE, { audit: pair, group, write: written, 'check-draft': { bad: [1], firstBad: [], summaryBad: false }, beyond: { beyond: [{ finding: 0, issue: 'x' }] } })
+  assert.deepEqual([flagged.result.draft.comments[1].body, flagged.result.draft.comments[1].firstLineUnchecked], ['**nit**: rf_tv zeroed, and the reference comment removed', true],
+    'the fallback is the finding\'s own words, never its verification, and holds auto-post as a body line')
   const claims = { claims: [{ commentId: 55, author: 'a[bot]', bot: true, path: 'src/core/a.c', line: 10, claim: 'change latches lost' }] }
   const narrow = await run(BASE, { audit: audited(finding('change latches and a SETUP lost', 'medium')), claims, judge: () => confirmedAs('medium'),
     group: { groups: [{ findings: [0], claims: ['55#1'] }] }, beyond: { beyond: [{ finding: 0, issue: 'the lost SETUP' }] } })
   assert.match(narrow.calls.find(c => c.label === 'beyond').prompt, /"printed":\["change latches lost"\]/)
   assert.deepEqual([narrow.result.draft.comments.length, narrow.result.findings[0].defect], [1, 0], 'a claim stating less no longer hides our finding')
   assert.match(narrow.result.draft.comments[0].body, /SETUP/)
+  const behind = await run(BASE, { audit: audited(finding('change latches lost', 'medium')), claims, judge: () => confirmedAs('medium'),
+    group: { groups: [{ findings: [0], claims: ['55#1'] }] } })
+  assert.deepEqual([behind.result.draft.comments.length, behind.result.findings.map(f => [f.muted, f.lead])], [0, [[true, true]]], 'a claim stating it mutes our finding')
   const none = await run(BASE, { audit: pair })
   assert.ok(!none.labels.includes('beyond'), 'nothing muted, nothing to ask')
+  assert.deepEqual(none.result.findings.map(f => [f.muted, f.lead]), [[false, false], [false, false]], 'written on every finding, grouped or not')
 })
 
 test('a dead or malformed answer on muted findings posts them all and leaves coverage unproven', async () => {
   const nits = audited(finding('a', 'nit'), finding('a too', 'nit'))
   const group = { groups: [{ findings: [0, 1], claims: [] }] }
   const clean = await run(BASE, { audit: nits, group })
-  assert.deepEqual([clean.result.draft.comments.length, clean.result.verdict.event], [1, 'APPROVE'])
+  assert.deepEqual([clean.result.draft.comments.length, clean.result.verdict.event, clean.result.findings.map(f => f.muted)], [1, 'APPROVE', [false, true]])
   for (const beyond of [null, { beyond: 'x' }, { beyond: [{ finding: 9, issue: 'x' }] }, { beyond: [null] }, { beyond: [{ finding: 0, issue: ' ' }] },
     { beyond: [{ finding: 0 }] }, { beyond: [{ finding: 0, issue: 'x' }, { finding: 0, issue: 'y' }] }]) {
     const { result } = await run(BASE, { audit: nits, group, beyond })
     assert.deepEqual([result.draft.comments.length, result.coverage.unjudged, result.verdict.event, result.findings.map(f => f.defect)],
       [2, [{ kind: 'beyond' }], 'COMMENT', [0, 0]], JSON.stringify(beyond))
+    assert.deepEqual(result.findings.map(f => f.muted), [false, false], 'every member posted, none muted')
   }
   const inc = { ...BASE, mode: 'incremental', scopeBase: OLD }
   const row = (id, severity, commentId) => ({ id, status: 'open', file: 'src/core/a.c', line: 10, severity, confidence: 'high', impact: IMP, severityReason: 'g', commentId, why: `w ${id}` })
   const standing = await run(inc, { ledger: { reviews: 1, last: { head: OLD }, open: [row('pr7-f1', 'high', 901), row('pr7-f2', 'low', 902)] }, check: pinned(inc),
     recheck: (p) => ({ state: 'open', reason: /pr7-f2/.test(p) ? 'still, and the reference comment is gone' : 'still' }), group, beyond: { beyond: [{ finding: 0, issue: 'more' }] } })
   assert.match(standing.calls.find(c => c.label === 'beyond').prompt, /"verified":"still, and the reference comment is gone"/)
-  assert.match(standing.result.draft.body, /not stated in full by any comment:\n- \*\*low\*\* `src\/core\/a\.c:10`: w pr7-f2\n  still, and the reference comment is gone$/m, 'its own comment is not enough once its group speaks for it')
+  assert.deepEqual(standing.result.draft.comments, [], 'its own comment states the member beside its group')
+  assert.doesNotMatch(standing.result.draft.body, /pr7-f2|reference comment is gone/, 'no recheck text reaches the body')
   assert.doesNotMatch(standing.result.draft.body, /more/, 'the issue named is never printed')
   const lead = await run(inc, { ledger: { reviews: 1, last: { head: OLD }, open: [row('pr7-f1', 'high', null), row('pr7-f2', 'low', 902)] }, check: pinned(inc),
     recheck: { state: 'open', reason: 'still' }, group })
-  assert.match(lead.result.draft.body, /not stated in full by any comment:\n- \*\*high\*\* `src\/core\/a\.c:10`: w pr7-f1$/m, 'a group mate\'s comment never states the lead')
+  assert.deepEqual(lead.result.draft.comments.map(c => [c.finding, c.body]), [[0, '**high**: w pr7-f1']], 'a group mate\'s comment never states the lead: it gets its own')
   assert.doesNotMatch(lead.result.draft.body, /w pr7-f2/, 'its own comment states the muted member')
+  assert.deepEqual(lead.result.findings.map(f => [f.id, f.muted, f.lead]), [['pr7-f1', false, true], ['pr7-f2', true, false]], 'a lead given its own comment is not muted')
 })
 
 test('a threads receipt that is not the script\'s line is asked again once on a fresh label, else the launch blocks (#150)', async () => {
@@ -374,7 +430,8 @@ test('the script relays run as the relay role', async () => {
   const { calls } = await run({ ...BASE, mode: 'incremental', scopeBase: OLD }, { check: pinned({ ...BASE, mode: 'incremental', scopeBase: OLD }),
     ledger: { reviews: 1, last: { head: OLD }, open: [] }, threads: (prompt, label) => label === 'threads' ? null : { file: `${BASE.factsDir}/threads-${H}.json`, count: 0 } })
   const relays = calls.filter(c => c.options.agentType === 'relay')
-  assert.deepEqual(relays.map(c => c.label), ['check', 'threads', 'threads:retry', 'ledger'], 'one relay reads the ledger and its disputes')
+  assert.deepEqual(relays.map(c => c.label), ['check', 'threads', 'threads:retry', 'ledger:manifest', 'ledger:load#1'],
+    'one snapshot of the ledger and its disputes, read in checked chunks')
 })
 
 test('a ledger answer missing its members, or not of the review prepare pinned, blocks instead of dropping standing findings', async () => {
@@ -397,6 +454,95 @@ test('a ledger answer missing its members, or not of the review prepare pinned, 
   assert.equal((await run(BASE, { ledger: { reviews: 2, open: [] } })).result.verdict.event, 'APPROVE', 'a full review rechecks whatever stands')
   assert.equal((await run(BASE, { ledger: { reviews: 2 } })).result.reason, 'ledger-failed')
   assert.equal((await run(BASE, { ledger: { reviews: 0, last: null, open: [], disputes: null } })).result.reason, 'ledger-failed', 'no disputes is no answer')
+  const row = { ...standing, published: null, repair: { head: OLD, state: 'published', resolved: true } }
+  const whole = { reviews: 1, last: { head: OLD }, open: [row], heldThreads: [], disputes: [] }
+  assert.equal((await run(inc, { check: pinned(inc), ledgerAsIs: whole, recheck: still })).result.status, 'reviewed')
+  const { published, ...unpublished } = row
+  const { repair, ...unrepaired } = row
+  for (const ledger of [{ ...whole, open: [unpublished] }, { ...whole, open: [unrepaired] }, { ...whole, open: [{ ...row, repair: { resolved: true } }] },
+    (({ heldThreads, ...l }) => l)(whole)]) {
+    const { result, labels } = await run(inc, { check: pinned(inc), ledgerAsIs: ledger, recheck: still })
+    assert.deepEqual([result.status, result.reason], ['blocked', 'ledger-failed'], JSON.stringify(ledger))
+    assert.ok(!labels.some(l => l.startsWith('recheck:')), JSON.stringify(ledger))
+  }
+  assert.equal((await run(BASE, { ledgerAsIs: { reviews: 0, last: null, open: [], disputes: [] } })).result.status, 'reviewed', 'an empty ledger prints no heldThreads')
+})
+
+test('a ledger answer past 64 KiB crosses in checked chunks, every text exact, in every mode', async () => {
+  const inc = { ...BASE, mode: 'incremental', scopeBase: OLD }
+  // As ledger.py's view writes a carried row: without its impact and severityReason.
+  const row = (n) => ({ id: `pr7-f${n}`, status: 'open', file: 'src/core/a.c', line: 10 + n, severity: 'low', confidence: 'high', commentId: 900 + n,
+    why: `${wordy(900)} “é” \\ "q" — ${n}`, published: n % 2 ? `**low**: edited by the human — ${n}` : null, repair: null })
+  const open = [...Array(40).keys()].map(row)
+  const disputes = [...Array(30).keys()].map(n => ({ findingId: `pr7-f${n}`, key: `k${n}`, rootCommentId: 900 + n, replies: [{ id: 5000 + n, digest: 'd', author: 'c' }] }))
+  const still = { state: 'open', reason: 'still' }
+  const same = { ...pinned(BASE), pins: { ...pinned(BASE).pins, mode: 'same' } }
+  for (const [a, check, last] of [[BASE, pinned(BASE), OLD], [inc, pinned(inc), OLD], [{ ...BASE, mode: 'discussion' }, same, H]]) {
+    const whole = { reviews: 1, last: { head: last }, open, heldThreads: [], disputes }
+    const m = manifestOf(whole, a)
+    assert.ok(m.length > 64 * 1024, `${m.length} bytes`)
+    const { result, calls, parsed } = await run(a, { check, ledgerAsIs: whole, recheck: still })
+    assert.equal(result.status, 'reviewed', a.mode)
+    assert.deepEqual(parsed.find(v => v && Array.isArray(v.open) && v.open.length === 40), whole, `${a.mode}: the answer rebuilt exactly`)
+    const loads = calls.filter(c => c.label.startsWith('ledger:load#'))
+    assert.equal(loads.length, Math.ceil(Math.ceil(m.length / 512) / 4), 'four chunks a call, each asked once')
+    assert.equal(calls.filter(c => c.label.startsWith('recheck:')).length, a.mode === 'discussion' ? 30 : 40, a.mode)
+    const carried = result.findings.filter(f => f.id)
+    assert.equal(carried.length, a.mode === 'discussion' ? 30 : 40)
+    assert.ok(carried.every(f => f.severity === 'low' && !('impact' in JSON.parse(JSON.stringify(f))) && !('severityReason' in JSON.parse(JSON.stringify(f)))),
+      `${a.mode}: unregraded, the result leaves the grading out and save keeps the ledger's`)
+  }
+  const regrade = { state: 'open', reason: 'still', severity: 'medium', impact: IMP, severityReason: 'worse now', confidence: 'high' }
+  const whole = { reviews: 1, last: { head: OLD }, open: open.slice(0, 1), heldThreads: [], disputes: [] }
+  const { result } = await run(inc, { check: pinned(inc), ledgerAsIs: whole, recheck: regrade })
+  assert.deepEqual((({ severity, impact, severityReason }) => ({ severity, impact, severityReason }))(result.findings[0]),
+    { severity: 'medium', impact: IMP, severityReason: 'worse now' }, 'a regrade carries its whole grading')
+})
+
+test('a mis-copied chunk is asked again, padded after an odd count of misses; one never copied right blocks before any review work', async () => {
+  const inc = { ...BASE, mode: 'incremental', scopeBase: OLD }
+  const row = { id: 'pr7-f1', status: 'open', file: 'src/core/a.c', line: 10, severity: 'high', commentId: 901, why: wordy(600), published: null, repair: null }
+  const whole = { reviews: 1, last: { head: OLD }, open: [row], heldThreads: [], disputes: [] }
+  const still = { state: 'open', reason: 'still' }
+  const flip = (c) => ({ ...c, data: (c.data[0] === 'A' ? 'B' : 'A') + c.data.slice(1) })
+  const resum = (c) => { const d = flip(c); return { ...d, sum: fnv1a(d.data) } }
+  const go = (ledgerChunks) => run(inc, { check: pinned(inc), ledgerAsIs: whole, recheck: still, ledgerChunks })
+  const once = await go((env, call) => call === 1 ? { ...env, chunks: env.chunks.map((c, k) => k ? c : flip(c)) } : env)
+  assert.equal(once.result.status, 'reviewed')
+  const asked = once.calls.filter(c => c.label.startsWith('ledger:load#')).map(c => /--chunks ([0-9,]+)( --pad)?/.exec(c.prompt).slice(1, 3).join(''))
+  assert.deepEqual(asked.slice(-1), ['0 --pad'], 'only the bad chunk is asked again, padded after one miss')
+  const twice = await go((env, call) => call <= 2 ? { ...env, chunks: env.chunks.map(c => c.i ? c : flip(c)) } : env)
+  assert.equal(twice.result.status, 'reviewed')
+  assert.match(twice.calls.filter(c => c.label.startsWith('ledger:load#')).at(-1).prompt, /--chunks 0\n/, 'unpadded again after two')
+  const dup = await go((env, call) => call === 1 ? { ...env, chunks: [...env.chunks, env.chunks[0]] } : env)
+  assert.equal(dup.result.status, 'reviewed', 'a duplicated chunk settles neither copy, and is asked again')
+  const whole2 = await go((env, call) => call === 1 ? { ...env, chunks: env.chunks.map(c => c.i ? c : resum(c)) } : env)
+  assert.equal(whole2.result.status, 'reviewed', 'a chunk changed with its sum fails the digest, and the load starts over')
+  for (const [why, bad] of [['missing or mis-copied', (env) => ({ ...env, chunks: env.chunks.map(c => c.i === 1 ? flip(c) : c) })],
+    ['does not match the manifest digest', (env) => ({ ...env, chunks: env.chunks.map(c => c.i === 1 ? resum(c) : c) })],
+    ['chunks 0,1,2 missing or mis-copied (the envelope metadata is malformed)', (env) => ({ ...env, digest: '00000000' })],
+    ['chunks 0,1,2 missing or mis-copied (state_transfer.py: gone)', () => ({ error: 'gone' })]]) {
+    const { result, labels } = await go(bad)
+    assert.deepEqual([result.status, result.reason], ['blocked', 'ledger-failed'], why)
+    assert.ok(result.detail.includes(why), why)
+    assert.ok(!labels.some(l => l.startsWith('recheck:')), why)
+  }
+})
+
+test('a ledger manifest of another head, path or size blocks before reading', async () => {
+  const inc = { ...BASE, mode: 'incremental', scopeBase: OLD }
+  const row = { id: 'pr7-f1', status: 'open', file: 'src/core/a.c', line: 10, severity: 'high', commentId: 901, why: 'w', published: null, repair: null }
+  const whole = { reviews: 1, last: { head: OLD }, open: [row], heldThreads: [], disputes: [] }
+  const real = manifestOf(whole, inc)
+  const name = real.file.split('/').at(-1)
+  for (const wrong of [{ head: OLD }, { repo: 'o/x' }, { pr: 8 }, { file: `/tmp/other/${name}` }, { file: `${inc.factsDir}/ledger-x.json` },
+    { file: `${inc.factsDir}/../${name}` }, { digest: 'xyz' }, { length: 0 }, { length: 256 * 1024 + 1 }, { error: 'no ledger' }]) {
+    const { result, labels } = await run(inc, { check: pinned(inc), ledgerAsIs: whole, 'ledger:manifest': { ...real, ...wrong } })
+    assert.deepEqual([result.status, result.reason], ['blocked', 'ledger-failed'], JSON.stringify(wrong))
+    assert.ok(!labels.some(l => l.startsWith('ledger:load#')), JSON.stringify(wrong))
+  }
+  const dead = await run(inc, { check: pinned(inc), 'ledger:manifest': null })
+  assert.deepEqual([dead.result.reason, dead.result.detail], ['ledger-failed', 'the ledger relay died'])
 })
 
 test('a draft or check agent that throws takes its null path; a check relay that throws blocks', async () => {
@@ -407,12 +553,10 @@ test('a draft or check agent that throws takes its null path; a check relay that
   assert.deepEqual([write.result.verdict.event, write.result.draft.comments.map(c => c.body)], ['REQUEST_CHANGES', ['**high**: a']])
   const checked = await run(BASE, { audit: audited(finding('a')), write: { summary: '- ok', comments: [{ finding: 0, body: '**high**: a, and more' }] }, 'check-draft': thrown('check-draft') })
   assert.deepEqual(checked.result.draft.comments.map(c => c.body), ['**high**: a'], 'unchecked: the finding\'s own words')
-  const shorten = await run(BASE, { audit: audited(finding('a')), write: { summary: '- ok', comments: [{ finding: 0, body: `**high**: ${'w '.repeat(80).trim()}` }] }, shorten: thrown('shorten') })
-  assert.ok(shorten.logs.some(l => /over length, for the human to shorten/.test(l)))
   const nits = audited(finding('a', 'nit'), finding('a too', 'nit'))
   const beyond = await run(BASE, { audit: nits, group: { groups: [{ findings: [0, 1], claims: [] }] }, beyond: thrown('beyond') })
   assert.deepEqual([beyond.result.draft.comments.length, beyond.result.coverage.unjudged], [2, [{ kind: 'beyond' }]])
-  for (const [label, r] of Object.entries({ check, write, 'check-draft': checked, shorten, beyond })) {
+  for (const [label, r] of Object.entries({ check, write, 'check-draft': checked, beyond })) {
     assert.ok(r.logs.includes(`${label} errored — ${label} exploded`), `${label} logs its error`)
   }
 })
@@ -462,11 +606,15 @@ test('a claims-only group needs a path, and a claim that covered a finding count
     judge: () => confirmedAs('low'), group: { groups: [{ findings: [0], claims: ['55#1'] }] } })
   assert.match(again.calls.find(c => c.label === 'group').prompt, /overrun past the buffer end/, 'standing findings are regrouped every run, whole')
   assert.deepEqual(again.result.verdict.reasons, ['1 blocking finding(s) open'], 'the high finding and its low claim are one defect, counted high')
-  assert.match(again.result.draft.body, /our review grades it \*\*high\*\*/)
-  assert.doesNotMatch(again.result.draft.body, /Still standing/, 'the thread states it')
+  assert.match(again.result.draft.body, /our grade \*\*high\*\*/)
+  assert.deepEqual(again.result.draft.comments, [], 'the thread states it')
   const resolved = await run(inc, { ledger: { reviews: 1, last: { head: OLD }, open: [standingRow] }, check: pinned(inc), recheck: { state: 'open', reason: 'still' } })
   assert.equal(resolved.result.verdict.event, 'REQUEST_CHANGES', 'its thread gone, the finding still stands on its own')
-  assert.match(resolved.result.draft.body, /Still standing from earlier reviews, not stated in full by any comment:\n- \*\*high\*\* `src\/core\/a\.c:10`: overrun past the buffer end/)
+  assert.deepEqual(resolved.result.draft.comments.map(c => [c.finding, c.body]), [[0, '**high**: overrun past the buffer end']], 'stated by no comment, it gets one')
+  assert.match(resolved.calls.find(c => c.label === 'write').prompt, /"why":"overrun past the buffer end"/)
+  const listed = await run(inc, { ledger: { reviews: 1, last: { head: OLD }, open: [{ ...standingRow, inBody: true }] }, check: pinned(inc), recheck: { state: 'open', reason: 'still' } })
+  assert.deepEqual([listed.result.draft.comments, listed.labels.includes('write'), listed.result.verdict.event], [[], false, 'REQUEST_CHANGES'],
+    'a line of our review body the PR still shows states it: nothing is written again')
   const refound = await run(inc, { ledger: { reviews: 1, last: { head: OLD }, open: [{ ...standingRow, commentId: 900 }] }, check: pinned(inc), recheck: { state: 'open', reason: 'still' },
     audit: audited(finding('overrun again', 'medium')), group: { groups: [{ findings: [0, 1], claims: [] }] } })
   assert.deepEqual(refound.result.findings.map(f => [f.id, f.defect]), [['pr7-f1', 0], [undefined, 0]], 'a new copy of a standing finding joins its defect')
@@ -481,14 +629,14 @@ test('findings linked as one defect on an earlier review are regrouped, and coun
   const both = await run(inc, { ledger, check: pinned(inc), recheck: still, group: { groups: [{ findings: [0, 1], claims: [] }] } })
   assert.match(both.calls.find(c => c.label === 'group').prompt, /w pr7-f2/, 'standing findings are regrouped: a push can split them')
   assert.deepEqual([both.result.verdict.reasons, both.result.findings.map(f => f.defect)], [['1 blocking finding(s) open'], [0, 0]])
-  assert.doesNotMatch(both.result.draft.body, /Still standing/, 'the comment on pr7-f1 states the defect')
+  assert.deepEqual(both.result.draft.comments, [], 'the comment on pr7-f1 states the defect')
   const apart = await run(inc, { ledger, check: pinned(inc), recheck: still })
   assert.deepEqual([apart.result.verdict.reasons, apart.result.findings.map(f => f.defect)], [['2 blocking finding(s) open'], [null, null]])
-  assert.match(apart.result.draft.body, /Still standing from earlier reviews, not stated in full by any comment:\n- \*\*high\*\* `src\/core\/a\.c:10`: w pr7-f2$/m, 'split, the one never posted is named')
+  assert.deepEqual(apart.result.draft.comments.map(c => [c.finding, c.body]), [[1, '**high**: w pr7-f2']], 'split, the one never posted gets its comment')
   const dead = await run(inc, { ledger, check: pinned(inc), recheck: still, group: null })
   assert.deepEqual([dead.result.verdict.reasons.slice(0, 1), dead.result.findings.map(f => f.defect)], [['2 blocking finding(s) open'], [null, null]],
     'a failed grouping never falls back to an earlier one')
-  assert.match(dead.result.draft.body, /: w pr7-f2$/m)
+  assert.deepEqual(dead.result.draft.comments.map(c => [c.finding, c.body]), [[1, '**high**: w pr7-f2']])
   const fixed = await run(inc, { ledger, check: pinned(inc), recheck: (p) => /pr7-f1/.test(p) ? { state: 'fixed', reason: 'gone' } : { state: 'open', reason: 'still' } })
   assert.deepEqual(fixed.result.findings.map(f => [f.status, f.defect]), [['fixed', null], ['open', null]], 'the linked one is rechecked on its own')
   assert.deepEqual(fixed.result.verdict.reasons, ['1 blocking finding(s) open'])
@@ -502,7 +650,7 @@ test('an incremental review rechecks earlier findings: fixed ones get a fix note
   assert.deepEqual(fixed.audits[0].diff, { base: OLD, head: H })
   assert.deepEqual(fixed.result.draft.replies.map(r => [r.commentId, r.body]), [[901, 'Fixed in bbbbbbbbbbbb.'], [902, 'Fixed in bbbbbbbbbbbb.']])
   assert.equal(fixed.result.verdict.event, 'APPROVE')
-  assert.match(fixed.result.draft.body, /the changes since cccccccccccc/)
+  assert.doesNotMatch(fixed.result.draft.body, /Reviewed|finding\(s\)|CI: green|Hardware/, 'no count, CI-green or hardware-not-run line')
   assert.deepEqual(fixed.result.draft.resolves, [])
   const deferred = { reviews: 1, last: { head: OLD }, open: [{ ...ledger.open[0], status: 'fixed', resolveDue: { replied: true } }, ledger.open[1]] }
   const again = await run(inc, { ledger: deferred, recheck: () => ({ state: 'fixed', reason: 'guarded now' }), check: pinned(inc) })
@@ -532,6 +680,68 @@ test('an incremental review rechecks earlier findings: fixed ones get a fix note
   assert.equal(lost.result.findings.find(f => f.id === 'pr7-f1').status, 'open')
 })
 
+test('a comment the check flags falls back to its finding\'s own words, whatever their length, with no other round', async () => {
+  const r = await run(BASE, { audit: audited(finding(wordy(100))), 'check-draft': { bad: [0], firstBad: [], summaryBad: false } })
+  assert.deepEqual([r.result.draft.comments[0].body, r.result.draft.comments[0].firstLineUnchecked], [`**high**: ${wordy(100)}`, true])
+  assert.deepEqual(r.labels.filter(l => /^(write|check-draft|shorten)/.test(l)), ['write', 'check-draft'], 'one write, one check')
+  assert.ok(!r.logs.some(l => /over length/.test(l)))
+})
+
+test('a finding an auto-fix repair noted gets no second fix note, and one still standing is raised again on a new comment', async () => {
+  const inc = { ...BASE, mode: 'incremental', scopeBase: OLD }
+  const repaired = (repair) => ({ reviews: 1, last: { head: OLD }, open: [{ id: 'pr7-f1', file: 'src/core/a.c', line: 10, severity: 'high', why: 'overrun past the buffer end', commentId: 901, repair }] })
+  const done = { head: OLD, state: 'published', resolved: true }
+  const fixed = await run(inc, { ledger: repaired(done), recheck: () => ({ state: 'fixed', reason: 'guarded now' }), check: pinned(inc) })
+  assert.deepEqual([fixed.result.draft.replies, fixed.result.draft.resolves, fixed.result.draft.comments], [[], [], []])
+  const unsure = await run(inc, { ledger: repaired({ ...done, state: 'uncertain', resolved: false }), recheck: () => ({ state: 'fixed', reason: 'guarded now' }), check: pinned(inc) })
+  assert.deepEqual(unsure.result.draft.replies, [], 'an unconfirmed note is reconciled, never noted twice')
+  const still = await run(inc, { ledger: repaired(done), recheck: () => ({ state: 'open', reason: 'still overruns' }), check: pinned(inc) })
+  assert.deepEqual(still.result.draft.comments, [{ path: 'src/core/a.c', line: 10, finding: 0,
+    body: '**high**: overrun past the buffer end\n- The repair in cccccccccccc did not fix this; its earlier thread was resolved.', firstLineUnchecked: true }],
+    'no check verified its first line, which is all the body shows of it off the diff')
+  assert.equal(still.result.findings[0].id, 'pr7-f1', 'raised again under its own id')
+  const pair = repaired(done)
+  pair.open.push({ id: 'pr7-f2', file: 'src/core/a.c', line: 10, severity: 'critical', why: 'overrun', commentId: 902 })
+  const both = await run(inc, { ledger: pair, recheck: () => ({ state: 'open', reason: 'still' }), check: pinned(inc), group: { groups: [{ findings: [0, 1], claims: [] }] } })
+  assert.deepEqual([both.result.draft.comments.map(c => c.finding), both.result.findings.map(f => [f.id, f.muted])],
+    [[0], [['pr7-f1', false], ['pr7-f2', false]]], 'the muted member raised again has its own comment, so it is not muted')
+  const edited = repaired(done)
+  edited.open[0].published = '**high**: overrun past the end of buf'
+  assert.equal((await run(inc, { ledger: edited, recheck: () => ({ state: 'open', reason: 'still' }), check: pinned(inc) })).result.draft.comments[0].body,
+    '**high**: overrun past the end of buf\n- The repair in cccccccccccc did not fix this; its earlier thread was resolved.', 'restated as the human edited it')
+  const regraded = { state: 'open', reason: 'still', severity: 'critical', impact: IMP, severityReason: 'graded', confidence: 'high' }
+  assert.equal((await run(inc, { ledger: edited, recheck: () => regraded, check: pinned(inc) })).result.draft.comments[0].body,
+    '**critical**: overrun past the end of buf\n- The repair in cccccccccccc did not fix this; its earlier thread was resolved.', 'a regrade replaces only the old grade marker')
+  const relabelled = repaired(done)
+  relabelled.open[0].published = '**bug**: overrun past the end of buf'
+  assert.equal((await run(inc, { ledger: relabelled, recheck: () => regraded, check: pinned(inc) })).result.draft.comments[0].body,
+    '**bug**: overrun past the end of buf\n- The repair in cccccccccccc did not fix this; its earlier thread was resolved.', 'a heading the human changed is left alone')
+  const NOTE = '\n- The repair in cccccccccccc did not fix this; its earlier thread was resolved.'
+  edited.open[0].published = `**high**: ${wordy(85)} ${'x'.repeat(300)}`
+  const longEdit = await run(inc, { ledger: edited, recheck: () => ({ state: 'open', reason: 'still' }), check: pinned(inc) })
+  assert.deepEqual(longEdit.result.draft.comments.map(c => c.body), [`${edited.open[0].published}${NOTE}`], 'a long human edit is kept whole, its repair note on the comment')
+  assert.doesNotMatch(longEdit.result.draft.body, /Raised again/)
+  assert.equal(longEdit.labels.some(l => l.startsWith('shorten')), false, 'the human\'s own words are never rewritten')
+  const longWhy = repaired(done)
+  longWhy.open[0].why = wordy(85)
+  const unedited = await run(inc, { ledger: longWhy, recheck: () => ({ state: 'open', reason: 'still' }), check: pinned(inc) })
+  assert.deepEqual(unedited.result.draft.comments.map(c => [c.body, c.firstLineUnchecked]), [[`**high**: ${wordy(85)}${NOTE}`, true]])
+  assert.ok(!unedited.logs.some(l => /over length/.test(l)))
+  const visible = await run(inc, { ledger: repaired({ ...done, resolved: false }), recheck: () => ({ state: 'open', reason: 'still' }), check: pinned(inc) })
+  assert.deepEqual(visible.result.draft.comments, [], 'its thread is still open, so its comment still states it')
+  const reopenedThread = { ...repaired(done), heldThreads: [{ findingId: 'pr7-f1', commentId: 901, why: 'reopened after it was resolved' }] }
+  const restated = await run(inc, { ledger: reopenedThread, recheck: () => ({ state: 'open', reason: 'still' }), check: pinned(inc) })
+  assert.deepEqual(restated.result.draft.comments, [], 'reopened since the repair resolved it, its thread states it again')
+  assert.doesNotMatch(still.result.draft.body, /Raised again/, 'the note stays on the comment')
+  const shifted = await run(inc, { ledger: repaired(done), recheck: () => ({ state: 'open', reason: 'still', file: 'src/core/a.c', line: 14 }), check: pinned(inc) })
+  assert.deepEqual([shifted.result.draft.comments.map(c => [c.path, c.line]), shifted.result.findings[0].line], [[['src/core/a.c', 14]], 14],
+    'raised again where the recheck found it on this head')
+  assert.match(shifted.calls.find(c => c.label === 'recheck:pr7-f1').prompt, /`file` and `line` are where it stands/)
+  for (const v of [{ state: 'fixed', reason: 'gone', line: 14 }, { state: 'open', reason: 'still', file: '../x.c', line: 14 }, { state: 'open', reason: 'still', file: '/src/core/a.c', line: 14 }, { state: 'open', reason: 'still', line: 0 }]) {
+    assert.equal((await run(inc, { ledger: repaired(done), recheck: () => v, check: pinned(inc) })).result.findings[0].line, 10, JSON.stringify(v))
+  }
+})
+
 test('args that differ from the pins prepare recorded for this head are blocked before review', async () => {
   for (const pins of [{ mergeBase: OLD, scopeBase: MB, mode: 'full', groups: ['src/core'] }, { mergeBase: MB, scopeBase: MB, mode: 'full', groups: ['src'] }, undefined]) {
     const { result, labels } = await run(BASE, { check: { ...pinned(BASE), pins } })
@@ -555,9 +765,13 @@ test('pushback on our thread is judged with the replies as evidence and answered
   const f1 = result.findings.find(f => f.id === 'pr7-f1')
   assert.equal(f1.status, 'withdrawn')
   assert.deepEqual(f1.disputes, [{ key: 'k1', replies: DISPUTE.replies, judgedHead: H, threadsFile: `${BASE.factsDir}/threads-${H}.json`, state: 'withdrawn', reason: 'the IRQ is masked by the caller',
-    answer: { body: 'Agreed, the caller masks the IRQ first.', resolve: true } }])
+    rootCommentId: 901, answer: { body: 'Agreed, the caller masks the IRQ first.', resolve: true } }])
   assert.deepEqual(result.draft.replies, [], 'a concession is a thread answer awaiting approval, not an auto-granted fix note')
   assert.equal(result.verdict.event, 'COMMENT', 'withdrawn drops the high finding; the medium one still caps')
+  const { rootCommentId, ...rootless } = DISPUTE
+  const lossy = await run(inc, { check: pinned(inc), ledger: LEDGER, disputes: { disputes: [rootless] }, recheck })
+  assert.equal(lossy.result.findings.find(f => f.id === 'pr7-f1').disputes[0].rootCommentId, rootCommentId,
+    'a copy that dropped the root keeps the judged thread: a comment raised again would take over the finding\'s commentId')
 })
 
 test('upheld keeps its severity and leaves the thread open; disputed only blocks approval; a dead verifier records nothing', async () => {
@@ -573,13 +787,13 @@ test('upheld keeps its severity and leaves the thread open; disputed only blocks
   const blocker = await run(inc, { ...base, ledger: LEDGER, recheck: (p) => /pr7-f1/.test(p) ? { state: 'disputed', reason: 'x' } : { state: 'open', reason: 'y' },
     audit: audited(finding('independent overrun')) })
   assert.equal(blocker.result.verdict.event, 'REQUEST_CHANGES', 'an independent blocker still requests changes')
-  assert.match(blocker.result.draft.body, /Blocking: `src\/core\/a\.c:10`; disputed, waiting for a maintainer: `src\/core\/a\.c:10`\./)
+  assert.match(blocker.result.draft.body, /^Blocking: `src\/core\/a\.c:10`\.\n\nDisputed, waiting for a maintainer: `src\/core\/a\.c:10`\.$/m)
   assert.doesNotMatch(blocker.result.draft.body, /Verdict/, 'the human picks the event: the body proposes none')
   assert.doesNotMatch(upheld.result.draft.body, /Disputed/, 'no dispute, no label')
   const bodyClaim = { claims: [{ commentId: 56, threadId: null, author: 'greptile[bot]', bot: true, path: null, line: null, claim: 'race' }] }
   const pathless = await run(inc, { ...base, recheck: () => ({ state: 'disputed', reason: 'x' }), claims: bodyClaim,
     judge: () => confirmedAs('high') })
-  assert.match(pathless.result.draft.body, /Blocking: @greptile\[bot\]'s comment; disputed/, 'a claim with no path is named by its author')
+  assert.match(pathless.result.draft.body, /^Blocking: @greptile\[bot\]'s comment\.\n\nDisputed[\s\S]*^- @greptile\[bot\] comment 56, point 1$/m, 'a claim with no path is named by its author')
   const dead = await run(inc, { ...base, recheck: () => null })
   assert.equal(dead.result.findings[0].disputes, undefined)
   assert.deepEqual(dead.result.coverage.unjudged, [{ kind: 'recheck', id: 'pr7-f1' }])
@@ -604,25 +818,17 @@ test('a discussion run judges only answered findings, with no audit and no claim
   assert.equal(idle.result.status, 'nothing-new')
 })
 
-test('a thread answer over its limit is shortened, then marked long; the answer prompt carries the format', async () => {
+test('a thread answer of any length is kept as the recheck wrote it; the answer prompt carries the format', async () => {
   const inc = { ...BASE, mode: 'incremental', scopeBase: OLD }
   const base = { check: pinned(inc), ledger: { reviews: 1, last: { head: OLD }, open: [LEDGER.open[0]] }, disputes: { disputes: [DISPUTE] } }
-  const wordy = 'w '.repeat(61).trim()
-  const short = await run(inc, { ...base, recheck: () => ({ state: 'upheld', reason: 'r', answer: wordy }),
-    shorten: { comments: [], answers: [{ finding: 'pr7-f1', body: 'Still stands: `a.c:12` reads it unmasked.' }] }, 'check-draft': { bad: [], summaryBad: false, answersBad: [] } })
-  assert.match(short.calls.find(c => c.label === 'recheck:pr7-f1').prompt, /at most 60 words/)
-  assert.deepEqual(short.result.findings[0].disputes[0].answer, { body: 'Still stands: `a.c:12` reads it unmasked.', resolve: false })
-  assert.deepEqual(sized(short.calls.find(c => c.label === 'shorten').options.schema, 'answers', 'finding'), [1, 1, ['pr7-f1']])
-  const kept = await run(inc, { ...base, recheck: () => ({ state: 'upheld', reason: 'r', answer: wordy }), shorten: null })
-  assert.deepEqual(kept.result.findings[0].disputes[0].answer, { body: wordy, resolve: false })
-  assert.ok(kept.logs.some(l => /over length, for the human to shorten: answer on pr7-f1/.test(l)))
-  const added = await run(inc, { ...base, recheck: () => ({ state: 'upheld', reason: 'r', answer: wordy }),
-    shorten: { comments: [], answers: [{ finding: 'pr7-f1', body: 'Still stands, and it leaks.' }] }, 'check-draft': { bad: [], summaryBad: false, answersBad: ['pr7-f1'] } })
-  assert.deepEqual(added.result.findings[0].disputes[0].answer, { body: wordy, resolve: false }, 'a shortening that adds a claim is undone')
-  assert.match(added.calls.find(c => c.label === 'check-draft').prompt, /"shortened":"Still stands, and it leaks\."/, 'with no new comment the one check still runs')
-  const dead = await run(inc, { ...base, recheck: () => ({ state: 'upheld', reason: 'r', answer: wordy }),
-    shorten: { comments: [], answers: [{ finding: 'pr7-f1', body: 'Still stands.' }] }, 'check-draft': null })
-  assert.equal(dead.result.findings[0].disputes[0].answer.body, wordy, 'an unchecked shortening is undone')
+  const long = `${wordy(100)} ${'x'.repeat(400)}`
+  const kept = await run(inc, { ...base, recheck: () => ({ state: 'upheld', reason: 'r', answer: long }) })
+  const ask = kept.calls.find(c => c.label === 'recheck:pr7-f1').prompt
+  assert.match(ask, /the evidence and nothing else, bullets for more than one point/)
+  assert.doesNotMatch(ask, /\d+ words/)
+  assert.deepEqual(kept.result.findings[0].disputes[0].answer, { body: long, resolve: false })
+  assert.equal(kept.labels.some(l => l.startsWith('shorten')), false)
+  assert.ok(!kept.logs.some(l => /over length/.test(l)))
 })
 
 test('a reviewer\'s label never sets our level, and a confirmed claim without its grading is unjudged, never a blocker', async () => {

@@ -65,6 +65,9 @@ jobs:
           if unshare --user --map-root-user --mount true; then echo "restriction not in effect"; exit 1; fi
           sudo apparmor_parser -r skills/usb-sniffer/scripts/usb-sniffer-unshare.apparmor
           unshare --user --map-root-user --mount true
+      - if: runner.os == 'Linux' && matrix.shard == 0
+        name: shellcheck hil-farm-setup
+        run: shellcheck -S warning skills/hil-farm-setup/scripts/*.sh skills/hil-farm-setup/scripts/fw/*.sh
       - name: optional tools found
         run: python -c "import shutil; [print(t, shutil.which(t)) for t in 'python node git bash jq awk pdfinfo pdftotext tshark editcap capinfos openocd kicad-cli xvfb-run pre-commit'.split()]"
       - run: python -X utf8 -m pytest -n 8 --dist worksteal -p no:cacheprovider --durations=20 --shard ${{ matrix.shard }}/${{ matrix.shards }} tests

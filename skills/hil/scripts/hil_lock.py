@@ -1338,6 +1338,11 @@ def is_locked(board: str) -> bool:
     return _alive(read_record(board))
 
 
+def holder_alive(record) -> bool:
+    """is_locked on a record the caller already read, so one read decides both its owner and its liveness."""
+    return _alive(record)
+
+
 def _alive(info) -> bool:
     pid = info.get('pid') if isinstance(info, dict) else None
     if not isinstance(pid, int) or pid <= 0:

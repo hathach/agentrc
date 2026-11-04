@@ -36,11 +36,12 @@ and never pick a rig or host other than its Hosts/rosters gives.
 
 One kernel flock per board, `/tmp/tinyusb-hil-locks/<lock>.lock`, shared by
 every project and CI runner on a host, so tools of different projects exclude
-each other on a shared board. `<lock>` is the contract's lock name for the
-board, which may differ from its roster name. The helper that takes it, and its
-holder record, are the contract's Reservation: a wrapper of this skill's
-`scripts/hil_lock.py` for the project's roster and lock names, and the only
-entry point; the contract says which agentrc commit it loads, and from where.
+each other on a shared board. `<lock>` is a registered board's registry `name`
+(Board registry), whatever a roster calls it, else the contract's lock name for
+the board; `scripts/hil_boards.py`'s `lock_name` gives either. The helper that
+takes it, and its holder record, are the contract's Reservation: a wrapper of
+this skill's `scripts/hil_lock.py` for the project's roster and lock names, and
+the only entry point; the contract says which agentrc commit it loads, and from where.
 The helper creates the dir writable by its owner only; a host whose projects
 run as different OS users widens it once (`sudo install -d -m 1777
 /tmp/tinyusb-hil-locks`), after every project there runs a helper that opens
@@ -181,6 +182,28 @@ Below it only what the table cannot show: held boards with their holders, and
 each blocked board with its token or record and that its recovery is a separate
 dispatch.
 
+## Board registry
+
+Each shared-farm board is wired to one probe, so how it is flashed is a farm fact, kept once
+for every project in `boards.json` beside this page and keyed by that probe's serial:
+its `flasher` (without `uid`: the key is it) and optional `flasher_recover` (the
+shapes below) and a `name`, the board's lock name on every host (Board locks): unique,
+a plain file name, and renamed only with a migration of the locks and records that
+name it. A project roster names the board by `"probe": "<serial>"`, matched exactly,
+and keeps its own `uid` (the serial its firmware reports, which differs per firmware),
+name, tests and project fields, never the registry's.
+
+`scripts/hil_boards.py` is the one reader, and its docstring states what it refuses:
+every consumer that needs a board's flasher resolves the roster entry through it
+(`resolve`, `resolve_roster`, or `hil_boards.py roster FILE`); the resolved
+`flasher.uid` is the probe serial, and a board without `probe` (a bench board on a dev PC,
+or a rig one project owns) keeps a flasher of its own. A reader that needs only names reads the roster raw; one
+that needs a lock name takes `lock_name(entry, own)`, `own` being the project's lock
+field. `hil_boards.py lock FILE BOARD` prints the registry name, or a bench board's
+roster name, never a project lock field: a contract with one takes it through its
+Reservation. A board joins the farm, or its wiring changes, by an agentrc commit to
+`boards.json`, then the project's agentrc pin.
+
 ## Flashers
 
 A runner that flashes or resets through this skill's `scripts/hil_flash.py`
@@ -315,6 +338,7 @@ recovery stay the contract's.
 
 | Script | Gives |
 |---|---|
+| `hil_boards.py` | each board's flasher from the board registry by probe serial (Board registry above) |
 | `hil_load.py` | the one path loader: one module per file per process, a second path under one name refused |
 | `hil_process.py` | `run_cmd`, a bounded command; `run_tracked` and `recheck`, a command whose end is proven |
 | `hil_farm_check.py` | the farm check engine a project's launcher drives with its profile (Farm check above) |

@@ -147,13 +147,13 @@ and write UTF-8 themselves, so no `-X utf8` or `PYTHONUTF8` is needed. Bash's
 `PATH` needs:
 
 - a `python3` that is a native CPython 3.12+ (python.org's install manager or MSYS2's mingw build), not the WindowsApps
-  alias and not MSYS2's `/usr/bin/python3`, for the workflows' script calls and the simplify gate's wrapper; PyYAML in
-  it for the tests, and for `pr-babysit`'s `harvest.py`, which `pr-review` also imports, to date a head by its
-  pull_request runs (without it they go unread and the harvest says so), and its `hooks.py`, to excuse a hook that fails
-  on HEAD too (without it, unless pre-commit's own interpreter can read the config, none is, and the refusal says so).
-  `install.py` registers a Python hook as `'<the python that ran install.py>' '<hook>.py'`, since a hook that cannot
-  start lets the tool call through; rerun it after replacing that Python, and name the interpreter the same way in the
-  credit guard's recipe below.
+  alias and not MSYS2's `/usr/bin/python3`, for the workflows' script calls and the simplify gate's wrapper; PyYAML,
+  pytest and pytest-xdist in it for the tests, and PyYAML for `pr-babysit`'s `harvest.py`, which `pr-review` also
+  imports, to date a head by its pull_request runs (without it they go unread and the harvest says so), and its
+  `hooks.py`, to excuse a hook that fails on HEAD too (without it, unless pre-commit's own interpreter can read the
+  config, none is, and the refusal says so). `install.py` registers a Python hook as
+  `'<the python that ran install.py>' '<hook>.py'`, since a hook that cannot start lets the tool call through; rerun it
+  after replacing that Python, and name the interpreter the same way in the credit guard's recipe below.
 - `bash`, `cygpath` and `git` from Git for Windows or MSYS2: from Python a bare
   `bash` is System32's WSL launcher, so scripts look it up on `PATH`.
   `chief_guard.py` maps `/tmp`-style paths through `cygpath` and denies them
@@ -241,6 +241,8 @@ through its `Build contract:` and `HIL contract:` lines:
 | Skill | Use it to | Start with |
 |---|---|---|
 | [`hil`](skills/hil/SKILL.md) | run a project's HIL tests and judge their results: contract sections, board locks, verdicts, retries; a farm check (each board's probe on the bus and resetting it), never a test verdict | the project's `HIL contract:` page |
+| [`arduino`](skills/arduino/SKILL.md) | the mechanics an Arduino library's build and HIL contracts share: arduino-cli builds against its checkout, prepared dependencies, the HIL build record, the harness and its remote runs; how a further library adopts them | the library's `Build contract:` and `HIL contract:` pages |
+| [`hil-farm-setup`](skills/hil-farm-setup/SKILL.md) | provision or update a Debian 13 HIL farm host: CI runners, pinned flashing tools, udev rules, runner firewall, from a root-owned checkout and the host's file in `hosts/` | `setup.sh install --host hosts/<host>.toml --inputs DIR`, then `verify.sh` |
 | [`target-debug`](skills/target-debug/SKILL.md) | explain what the firmware did: GDB autopsy, faults, RAM trace, PC sampling, SWO, ETM instruction trace (J-Trace + Ozone), SEGGER SystemView scheduling profiles; Espressif chips over USB-Serial-JTAG or pad JTAG with openocd-esp32 (read its `espressif.md` first) | `pc_sample.py --probe <uid> --device <dev> --interface swd --speed 4000 --elf <elf>` |
 | [`rtt`](skills/rtt/SKILL.md) | console or log over a debug probe (SEGGER RTT), live or post-mortem | `rtt.py --backend jlink --probe <serial> --device <dev> --interface swd --speed auto --seconds 20` |
 | [`usb-kernel-debug`](skills/usb-kernel-debug/SKILL.md) | capture Linux host URBs (usbmon); kernel dynamic debug on a host or gadget | `usbcap.py <vid:pid> 10`; `sudo usb_dyndbg.sh on\|off usbcore xhci_hcd` |
@@ -353,7 +355,8 @@ human's own words asking to merge that PR, under chief's merge exception: the
 task then also names the base branch and carries `Merge grant: yes — "<the
 words>"`, else `Merge grant: none`, a line a relaunch copies too. A PR review
 submits under its own PR review exception, as `skills/pr-review/SKILL.md` asks
-it; its pending reviews need no grant, under chief's standing exception.
+it, an auto-fix review with the babysitting of its repairs; its pending reviews
+need no grant, under chief's standing exception.
 Leave the checkout to chief until it exits.
 
 ## Captain session
@@ -386,13 +389,13 @@ guard denies its memory writes.
 ## Tests
 
 ```sh
-python -X utf8 -m unittest discover -s tests
+python -X utf8 -m pytest -n auto --dist worksteal -p no:cacheprovider -q tests
 ```
 
-Needs PyYAML. The pre-commit hook (`pre-commit install`) runs the same tests in parallel under
-pytest-xdist, `python -X utf8 -m pytest -n 8 --dist worksteal tests`, which keeps it well inside
-pr-babysit's 540 s hook deadline; CI runs them that way too, sharded across jobs
-(`.github/workflows/tests.yml`), and `--shard I/K` (`tests/conftest.py`) runs one part of it.
+Needs PyYAML, pytest and pytest-xdist; `BUILD.md` is the full contract. The pre-commit hook
+(`pre-commit install`) runs the same command with `-n 8`, well inside pr-babysit's 540 s hook
+deadline; CI shards it across jobs (`.github/workflows/tests.yml`), and `--shard I/K`
+(`tests/conftest.py`) runs one part of it.
 Where Git for Windows has `core.fsmonitor=true` (an installer option), each
 temporary test repository leaves a `git fsmonitor--daemon` behind; run the suite
 with `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0=false`.

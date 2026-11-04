@@ -1,0 +1,2 @@
+# adafruit/tinyuf2 .claude/skills/hil-contract/commissioning.md, as the farm installs it, with GROUP="adm" as "hil"
+SUBSYSTEM=="block", ATTRS{idVendor}=="0456", ATTRS{idProduct}=="a010", ATTRS{serial}=="0C81464124010B20FF0A08CC2C000000", MODE="0660", GROUP="hil"

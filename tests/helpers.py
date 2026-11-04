@@ -309,3 +309,26 @@ def guarded(setup):
         return setup(case, *args, **kwargs)
     setUp.survivor_guarded = True
     return setUp
+
+
+def load_arduino_engine(rel):
+    """An agentrc Arduino engine as a library's agentrc_pin loads it: through hil_load's bootstrap, registered as
+    agentrc_<stem>."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('agentrc_hil_load', Path(__file__).resolve().parents[1] / 'skills' /
+                                                  'hil' / 'scripts' / 'hil_load.py')
+    if spec.name not in sys.modules:
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        sys.modules.setdefault(spec.name, mod)
+    return sys.modules[spec.name].load(spec.name, spec.origin).load_file(rel)
+
+
+def load_arduino_fixture():
+    """A fresh copy of the fake Arduino library profile (tests/fixtures/arduino_lib/fake_profile.py)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('arduino_fake_profile', Path(__file__).resolve().parent / 'fixtures' /
+                                                  'arduino_lib' / 'fake_profile.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod

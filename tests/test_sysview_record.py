@@ -639,7 +639,7 @@ class Usage(unittest.TestCase):
     def test_openocd_board_is_refused_for_live(self):
         with tempfile.TemporaryDirectory() as d:
             cfg = Path(d) / 'hil.json'
-            cfg.write_text(json.dumps({'boards': [{'name': 'b', 'flasher': {'name': 'openocd', 'uid': '1',
+            cfg.write_text(json.dumps({'boards': [{'name': 'b', 'uid': 'B-b', 'flasher': {'name': 'openocd', 'uid': '1',
                                                                              'args': '-f x'}}]}))
             self.assertIn('over a J-Link only', self.usage('--out', d + '/o', '--hil-config', str(cfg), '--board', 'b',
                                                            '--interface', 'swd', '--speed', '4000', '--addr', '0x1',

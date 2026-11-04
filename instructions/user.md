@@ -210,7 +210,8 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   My request to open the PR, my request to launch chief to babysit a PR, or
   my yes to that offer, is the grant unless I narrow it: launch without a
   further question, following `~/code/agentrc/README.md`'s headless PR
-  publishing recipe.
+  publishing recipe. A `pr-review` request naming auto-fix is that grant for
+  its PR too, carried by the review's own chief; no offer follows it.
 - Merging stays off. My own words asking to merge a named PR ("make a PR for
   issue 123 and chief, and merge when ready") grant chief one squash merge
   of it once ready per `agents/chief.md`'s merge exception, with everything
@@ -221,7 +222,12 @@ Bias toward caution over speed. For trivial tasks, use judgment.
 - Standing grant: on a PR I asked `pr-review` to review, its `post.py` may
   create a pending review and later resolve our own threads whose reply I
   submitted; submitting any review stays mine, unless that request names
-  auto-post, which grants `post.py --auto` that one review.
+  auto-post, which grants `post.py --auto` that one review, or auto-fix,
+  which also grants chief's repair of the PR on its head branch, pr-babysit on
+  it, a fix note and a resolve on each of our threads its pushed repair fixed
+  (`post.py --fixed`), and one auto-posted recheck review on the head the
+  repairs leave.
+  Neither grants a merge, an approval, a dismissal or a force-push.
 - Fixing a review bot's finding outside `pr-babysit`: work from the bot's
   original feedback, not a relay, with its AI fix prompt (Greptile `Prompt
   To Fix With AI`, CodeRabbit `🤖 Prompt for AI Agents`) when it has one, and

@@ -260,6 +260,9 @@ class FlockIsTheOnlyAuthority(LockDir):
             with self.subTest(rec=rec):
                 Path(hil_lock.lock_path(BOARD)).write_text(json.dumps(rec))
                 self.assertFalse(hil_lock.is_locked(BOARD))
+                self.assertFalse(hil_lock.holder_alive(rec))
+        self.assertTrue(hil_lock.holder_alive({'pid': os.getpid()}))
+        self.assertFalse(hil_lock.holder_alive(None))
 
 
 class FailsClosed(LockDir):

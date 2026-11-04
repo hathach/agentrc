@@ -1598,8 +1598,6 @@ def make_backend(a, p):
                              vid_pid=flasher.get('vid_pid'))
         except ValueError as e:
             p.error(str(e))
-        if not a.probe:
-            p.error(f'--board {a.board}: no flasher.uid (probe serial) in {a.hil_config}: give --probe')
         if route == 'jlink' and not a.device:
             p.error(f"--board {a.board}: a jlink entry needs flasher.args '-device NAME', or give --device")
         if route == 'openocd' and not a.cfg:

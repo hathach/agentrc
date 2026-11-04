@@ -34,6 +34,15 @@ def count(envelope):
     return -(-envelope['length'] // transfer.SIZE)
 
 
+def whole(run, file, *flags):
+    """The envelope of a bare call, with every other chunk fetched PER_CALL at a time."""
+    env = run(file, *flags)[1]
+    for k in range(transfer.PER_CALL, count(env), transfer.PER_CALL):
+        ids = ','.join(str(i) for i in range(k, min(k + transfer.PER_CALL, count(env))))
+        env['chunks'] += run(file, *flags, '--chunks', ids)[1]['chunks']
+    return env
+
+
 def decode(envelope):
     return b''.join(base64.b64decode(c['data']) for c in sorted(envelope['chunks'], key=lambda c: c['i']))
 
@@ -123,6 +132,31 @@ class StateTransferTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn(f'(max {transfer.MAX})', out['error'])
 
+    def raw_file(self, payload, name='ledger.json'):
+        path = self.dir / name
+        path.write_bytes(payload)
+        return str(path)
+
+    def test_raw_chunks_rebuild_the_file_bytes_beyond_the_state_limit(self):
+        answer = {'open': [{'id': f'pr7-f{n}', 'why': f'{REASON} \\u00e9 {n}' + 'x' * 900} for n in range(80)]}
+        payload = json.dumps(answer, ensure_ascii=True, separators=(',', ':')).encode('ascii')
+        self.assertGreater(len(payload), transfer.MAX, 'the ledger answer outgrows the state limit')
+        file = self.raw_file(payload)
+        self.assertEqual(self.run_script(file, '--raw')[0], 0)
+        env = whole(self.run_script, file, '--raw')
+        self.assertEqual((env['digest'], env['length']), (transfer.fnv1a(payload.decode('ascii')), len(payload)))
+        self.assertEqual(decode(env), payload)
+
+    def test_raw_takes_ascii_bytes_up_to_its_limit_and_refuses_more_or_other_bytes(self):
+        at = b'{"p":"' + b'a' * (transfer.MAX_RAW - 8) + b'"}'
+        self.assertEqual(len(at), transfer.MAX_RAW)
+        self.assertEqual(self.run_script(self.raw_file(at), '--raw', '--chunks', '0')[0], 0)
+        self.assertEqual(self.run_script(self.raw_file(b'[1, NaN'), '--raw')[0], 0, 'parsing is the reader\'s')
+        for payload, message in [(at + b' ', f'(max {transfer.MAX_RAW})'), ('{"a":"é"}'.encode(), 'is not ASCII')]:
+            code, out = self.run_script(self.raw_file(payload, 'bad.json'), '--raw')
+            self.assertEqual(code, 2, payload[:20])
+            self.assertIn(message, out['error'])
+
     @unittest.skipUnless(shutil.which('node'), 'needs Node.js')
     def test_the_sum_matches_the_workflows_fnv1a(self):
         source = (ROOT / 'workflows' / 'pr-babysit.js').read_text(encoding='utf-8')
@@ -132,6 +166,14 @@ class StateTransferTest(unittest.TestCase):
                              capture_output=True, text=True, check=True).stdout
         self.assertEqual(json.loads(out), [transfer.fnv1a(s) for s in samples])
 
+
+    def test_pr_reviews_loader_helpers_are_pr_babysits_and_its_limit_this_scripts(self):
+        babysit, review = ((ROOT / 'workflows' / f).read_text(encoding='utf-8') for f in ('pr-babysit.js', 'pr-review.js'))
+        for name in ('fromBase64', 'fnv1a'):
+            fn = re.compile(rf'^function {name} \(.*?^\}}', re.S | re.M)
+            self.assertEqual(fn.search(review).group(0), fn.search(babysit).group(0), name)
+        limit = re.search(r'^const LEDGER_MAX = ([0-9 *]+) //', review, re.M).group(1)
+        self.assertEqual(eval(limit), transfer.MAX_RAW)  # noqa: S307  digits and * only
 
     @unittest.skipUnless(shutil.which('node'), 'needs Node.js')
     def test_the_workflow_measures_a_state_as_this_script_does(self):

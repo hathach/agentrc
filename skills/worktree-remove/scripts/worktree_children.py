@@ -17,7 +17,7 @@ for a child with submodules (git refuses those otherwise), so a write racing its
 - no live herdr-core terminal of this machine, one in no herdr-app space included, has its program's or
   foreground process's working directory in it (`hc ls`, `hc get`), checked again right before its removal:
   it would lose that directory, and on Windows hold it open; an `hc` that fails or answers incompletely
-  keeps it, none installed skips this;
+  keeps it, none installed skips this; a foreground `hc get` leaves out, as it does for `sudo`'s, goes unseen;
 - on Linux, no process whose working directory `/proc/<pid>/cwd` this user can read is in it, checked
   again right before its removal too; other users' processes, and every process on other systems, go unseen;
 - not locked; HEAD on a branch, or a detached HEAD reachable from the branches, tags or remotes,
@@ -388,7 +388,7 @@ def terminals_in(trees):
             got = hc_json(hc, 'get', addr)
             if got is None:  # ended since the listing
                 continue
-            fg = got.get('foreground', ())  # null: no foreground process; absent: an incomplete answer
+            fg = got.get('foreground')  # absent or null: nothing known of it (absent seen for `sudo`)
             if not absolute(got.get('cwd')) or not (fg is None or isinstance(fg, dict) and absolute(fg.get('cwd'))):
                 raise Keep(f'cannot list herdr-core terminals: `hc get {addr}` gave no absolute cwd or foreground '
                            f'cwd: {str(got)[:300]}')

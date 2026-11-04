@@ -8,13 +8,14 @@ mutation, after a coverage check of the subtree the operation reaches.
   hil_reserve.py release --token TOKEN
 
 A roster is a project's HIL roster JSON (`boards` and `boards-skip`; a parked board is still
-on the hub). SELECTOR is the dotted field holding the entry's lock name, falling back to
-`name` only when the entry lacks the field (tinyuf2: `tinyuf2.lock`; tinyusb: the default,
-`name`). Identities are every `uid`, `uart_uid` and `serial` string in an entry, compared
-in the form udev's usb_id gives a serial (whitespace runs and unsafe characters as `_`),
-case-insensitively; two roster identities that become one that way are refused. The
-contract's Hosts/rosters is the roster list: the check refuses what the rosters do not
-explain, it never infers an inventory.
+on the hub). An entry with `probe` locks as its registered board's name (hil_boards.lock_name);
+any other entry's lock is the dotted SELECTOR field, falling back to `name` only when the entry
+lacks it (tinyuf2: `tinyuf2.lock`; tinyusb: the default, `name`). A registered entry whose
+SELECTOR field names another lock is refused. Identities are every `uid`, `uart_uid` and
+`serial` string in an entry, compared in the form udev's usb_id gives a serial (whitespace
+runs and unsafe characters as `_`), case-insensitively; two roster identities that become one
+that way are refused. The contract's Hosts/rosters is the roster list: the check refuses what
+the rosters do not explain, it never infers an inventory.
 
 check (read-only, exit 0 covered / 1 refused / 2 usage): walks the device directories under
 the busport's root port (`--scope hub`: its parent hub, which hub-cycle uses) twice within
@@ -72,7 +73,8 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 FILES = ('skills/hil/scripts/hil_load.py', 'skills/hil/scripts/hil_lock.py', 'skills/hil/scripts/hil_process.py',
          'skills/hil/scripts/usb_observe.py', 'skills/usb-kernel-recover/scripts/usb_recover.sh',
-         'skills/usb-kernel-recover/scripts/root_port_cycle.py', 'skills/hil/scripts/hil_root.py')
+         'skills/usb-kernel-recover/scripts/root_port_cycle.py', 'skills/hil/scripts/hil_root.py',
+         'skills/hil/scripts/hil_boards.py', 'skills/hil/boards.json')
 
 
 def _hil_load():
@@ -92,8 +94,9 @@ hil_load.require(__file__, FILES)
 hil_lock = hil_load.load_file('skills/hil/scripts/hil_lock.py')
 uo = hil_load.load_file('skills/hil/scripts/usb_observe.py')
 hil_root = hil_load.load_file('skills/hil/scripts/hil_root.py')
+hil_boards = hil_load.load_file('skills/hil/scripts/hil_boards.py')
 
-LOCK_NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]*$')
+LOCK_NAME_RE = hil_boards.LOCK_NAME_RE
 UDEV_UNSAFE_RE = re.compile(r'[^A-Za-z0-9#+.:=@_-]')   # what usb_id turns into '_' after whitespace runs
 IDENTITY_KEYS = ('uid', 'uart_uid', 'serial')
 HUB_CLASS = '09'
@@ -154,7 +157,9 @@ def _identities(obj, out):
 
 def load_rosters(specs):
     """[(file, selector)] -> {'locks': sorted lock names, 'identities': {identity: {locks}}}.
-    A DUT `uid` under two lock names is a conflict; any other identity may serve several."""
+    Each entry is resolved through agentrc's board registry (hil_boards), so its probe serial is an
+    identity too, and a registered board's lock is the registry's. A DUT uid under two lock names
+    is a conflict; any other identity may serve several."""
     locks, ids, duts, raw_of = set(), {}, {}, {}
     for path, selector in specs:
         try:
@@ -168,17 +173,20 @@ def load_rosters(specs):
         for e in entries:
             if not isinstance(e, dict) or not isinstance(e.get('name'), str) or not e['name']:
                 raise Refused(f'roster {path}: an entry without a name')
-            lock = _field(e, selector)
-            if lock is _ABSENT:
-                lock = e['name']
-            if not isinstance(lock, str) or not LOCK_NAME_RE.match(lock):
-                raise Refused(f'roster {path}: {e["name"]}: lock name {lock!r} is not a plain file name')
+            own = _field(e, selector) if selector != 'name' else _ABSENT
+            if own is not _ABSENT and not isinstance(own, str):
+                raise Refused(f'roster {path}: {e["name"]}: lock name {own!r} is not a plain file name')
+            try:
+                lock = hil_boards.lock_name(e, None if own is _ABSENT else own)
+                if not LOCK_NAME_RE.match(lock):
+                    raise Refused(f'roster {path}: {e["name"]}: lock name {lock!r} is not a plain file name')
+                e = hil_boards.resolve(e)
+            except ValueError as err:
+                raise Refused(f'roster {path}: {err}')
             locks.add(lock)
-            uid = e.get('uid')
-            if isinstance(uid, str) and uid.strip():
-                u = uid.strip().lower()
-                if duts.setdefault(u, lock) != lock:
-                    raise Refused(f'uid {uid} names two boards: {duts[u]} and {lock}')
+            uid = e['uid'].strip().lower()
+            if duts.setdefault(uid, lock) != lock:
+                raise Refused(f'uid {uid} names two boards: {duts[uid]} and {lock}')
             found = set()
             _identities(e, found)
             for raw in found:

@@ -56,6 +56,7 @@ def _hil_load():
 hil_load = _hil_load()
 hil_load.require(__file__, FILES)
 hil_process = hil_load.load_file('skills/hil/scripts/hil_process.py')
+usb_observe = hil_load.load_file('skills/hil/scripts/usb_observe.py')
 
 _VID_PID_WARNED: set = set()   # one warning per probe, not per command
 
@@ -451,6 +452,14 @@ def openocd_cmd_base(flasher: dict) -> list:
             '-c', f'adapter serial {uid}', *vid_pid, *_args(flasher)]
 
 
+# openocd's SMP reset (rp2350.cfg) warm-resets core0 by its own SYSRESETREQ before core1's, so core1 runs on in between;
+# an RCP fault core1 takes there (observed, cause undocumented) is cross-triggered on core0 (RP2350 datasheet 3.6.3.4),
+# whose RCP instructions then stall until a warm reset (3.6.3), timing out `program`'s rcp_init. Halting both cores
+# first: 0 of 655 such failures against 9 of 655 on the Fruit Jam (ci.lan, 2026-11-02; #395). `catch`: a halt request
+# takes no effect while halting is prohibited (Armv8-M ARM DHCSR.C_HALT, B13.4), and then `program` runs as before.
+HALT_BEFORE_PROGRAM_CFG = 'target/rp2350.cfg'
+
+
 # `verify` is on by default, opted out per board with "verify": false. ch32v103r and
 # ch582m opt out: a raw dump_image of their flash is not the image just written (~85% of
 # bytes differ, the same at 0x0 and 0x08000000, shifting with halt vs reset halt, and
@@ -464,7 +473,9 @@ def openocd_cmd_base(flasher: dict) -> list:
 # recovery entries cannot run, so those entries empty the event in the roster instead.
 def flash_openocd(flasher: dict, firmware: str, *, timeout, run=None) -> Operation:
     verify = ' verify' if flasher.get('verify', True) else ''
-    return _once(run, [*openocd_cmd_base(flasher), '-c', f'program {firmware}{verify} reset exit'], timeout=timeout)
+    halt = ['-c', 'init', '-c', 'catch halt'] if HALT_BEFORE_PROGRAM_CFG in (flasher.get('args') or '') else []
+    return _once(run, [*openocd_cmd_base(flasher), *halt, '-c', f'program {firmware}{verify} reset exit'],
+                 timeout=timeout)
 
 
 def reset_openocd(flasher: dict, *, timeout, run=None) -> Operation:
@@ -536,17 +547,13 @@ def rescue_openocd(flasher: dict, flash_out: str = '', *, timeout, run=None) -> 
     return False
 
 
-# openocd's own syntax: one or more complete "0xVVVV 0xPPPP" pairs. Validated rather than merely
+# openocd's own syntax (usb_observe's grammar, which the board registry admits by too). Validated rather than merely
 # tested for truthiness -- `vid_pid` is a hand-edited roster field whose NAME is also used,
 # with a different syntax, by tinyusb's tests.dev_attached, and convoy_safe reads a non-empty
 # value as PROOF the flasher can deliver a recovery past a poisoned node. A typo there
 # silently promised a recovery that openocd would reject at startup. Spaces and tabs only:
 # the value goes verbatim into a Tcl `-c` command, where a newline starts another command.
-_VID_PID_RE = re.compile(r'0x[0-9a-fA-F]{4}[ \t]+0x[0-9a-fA-F]{4}([ \t]+0x[0-9a-fA-F]{4}[ \t]+0x[0-9a-fA-F]{4})*')
-
-
-def valid_vid_pid(value) -> bool:
-    return isinstance(value, str) and bool(_VID_PID_RE.fullmatch(value.strip(' \t')))
+valid_vid_pid = usb_observe.valid_vid_pid
 
 
 def convoy_safe(flasher: dict) -> bool:

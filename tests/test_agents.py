@@ -178,17 +178,44 @@ class AgentFiles(unittest.TestCase):
                        '`replySettlements: [{ commentId, commentDigest, replyId, bodyDigest, headSha }]`'):
             self.assertIn(phrase, takeover)
         review = body.split('Exception for a headless PR review launch:')[1].split('Standing exception for pr-review pending reviews:')[0]
-        for phrase in ("the human's own message asking pr-review to review a PR with auto-post, carried and accepted under the headless PR launch exception's provenance",
+        for phrase in ("the human's own message asking pr-review to review a PR with auto-post or auto-fix, carried and accepted under the headless PR launch exception's provenance",
                        'A relaunch of the same unfinished review on the same head first reconciles any earlier post',
-                       'never submitting a second review'):
+                       'never submitting a second review',
+                       '`post.py --auto`, or under auto-fix a plain `post.py` once the repair ends, puts those in a pending review',
+                       "With auto-fix, the same message, under the headless PR launch exception above, also grants pr-babysit on that PR",
+                       'submitted the same way only while `ledger.py show --fixable` allows it, else created pending',
+                       'a further repair of newly found findings needs a new request',
+                       "a fix note and a resolve on each of our own threads whose repair that pr-babysit pushed and a fix check verified on the PR head, solely through pr-review's `post.py --fixed`",
+                       'Without auto-fix it permits no push; it never permits approval, dismissal, another PR or issue beyond the follow-up issue rule'):
             self.assertIn(phrase, review)
+        self.assertIn('their request that pr-review review a PR with auto-fix', exception)
+        self.assertIn("of our review submitted on it that prepare's `repair.submittedReview` names", body)
+        self.assertIn('An auto-fix repair phase is writer work: its repairs get the commit check, one simplification pass, validation '
+                      'and a whole-task review from the reviewed head to the repair tip before pr-babysit adopts them', body)
         self.assertNotIn('fresh exchange', review)
         skill = ' '.join((AGENTS.parent / 'skills' / 'pr-review' / 'SKILL.md').read_text().split())
         self.assertNotIn('AskUserQuestion', skill)
         for phrase in ("absent words mean pending, no hardware and prepare's mode",
                        'never substitute, drop or default a choice the words made',
                        "no board runs: step 3 takes `hil: {choice: 'none'}`",
-                       'a `discussion` run always takes plain `post.py`'):
+                       'a `discussion` run always takes plain `post.py`',
+                       '| `auto-fix` | `autoPost: true`, then the repair under §3 and §4 |',
+                       '`auto-post` or `auto-fix` and `pending`, `auto-fix` and no push',
+                       'a failed, partial, uncertain or handed-over post ends it there',
+                       'report "review submitted; auto-fix blocked"', 'never a `held` one',
+                       'A crash with repairs unpublished resumes this task with them, never a new prepare',
+                       '`post.py --auto --defer-answers` (auto-fix)',
+                       'whatever becomes of the recheck review; one the recheck finds still standing is raised again on a new comment, '
+                       'unless someone reopened its thread since, which then still states it',
+                       'After each launch whose reading shows the adoption `pushed` or `already-published`',
+                       'its `skipped`, `held` and `uncertain` rows are reported, never worked around',
+                       '`ledger.py show --fixable` and the recheck\'s prepare refuse, and GitHub refuses the repair\'s replies',
+                       'plain `post.py --expected-head <reviewed head>` puts them in a pending review before step 7',
+                       'step 6 ends with their publication instead, since prepare refuses a head with a pending draft',
+                       "Recheck once the PR head is the one pr-babysit left, its last launch reading's `checkout.head`",
+                       'its `head` other than that one stops the recheck before anything is posted ("head moved after repair"), '
+                       'and step 8 releases the lock',
+                       'resolved threads do not clear it'):
             self.assertIn(phrase, skill)
         self.assertIn('pushed SHAs, posted comment IDs and resolved thread IDs', body)
         rules = ' '.join((AGENTS.parent / 'instructions' / 'user.md').read_text().split())
@@ -199,6 +226,9 @@ class AgentFiles(unittest.TestCase):
         self.assertIn('through `pr-babysit` with `autoPush: true` and `markSonar: true`', rules)
         self.assertIn('Merging stays off. My own words asking to merge a named PR', rules)
         self.assertIn('submitting any review stays mine, unless that request names auto-post', rules)
+        self.assertIn('A `pr-review` request naming auto-fix is that grant for its PR too', rules)
+        self.assertIn('a fix note and a resolve on each of our threads its pushed repair fixed (`post.py --fixed`)', rules)
+        self.assertIn('Neither grants a merge, an approval, a dismissal or a force-push.', rules)
         self.assertIn("Each pr-babysit launch gets a `Findings` subsection holding its reading's `findingsTable` verbatim", body)
         readme = ' '.join((AGENTS.parent / 'README.md').read_text().split())
         self.assertIn('A relaunch for the same PR task copies the grant verbatim from the earlier launch task, without asking again, '

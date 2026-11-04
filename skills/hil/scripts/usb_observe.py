@@ -22,6 +22,13 @@ SYSFS_READ_GRACE = 2.0        # default bound on one attribute read; see read_sy
 # a device's bus-port as sysfs names it (5-3.4); `$` still lets .match() accept one trailing newline
 BUSPORT_RE = re.compile(r'^[0-9]+-[0-9]+(\.[0-9]+)*$')
 
+# a flasher's `vid_pid`, openocd's `adapter usb vid_pid`: one or more complete "0xVVVV 0xPPPP" pairs (hil_flash)
+VID_PID_RE = re.compile(r'0x[0-9a-fA-F]{4}[ \t]+0x[0-9a-fA-F]{4}([ \t]+0x[0-9a-fA-F]{4}[ \t]+0x[0-9a-fA-F]{4})*')
+
+
+def valid_vid_pid(value) -> bool:
+    return isinstance(value, str) and bool(VID_PID_RE.fullmatch(value.strip(' \t')))
+
 # Both memos are keyed by the attribute's realpath: usb_scan reads `serial` through
 # /sys/bus/usb/devices/<busport> and usb_node_serial through /sys/dev/char/189:N, and keyed by
 # spelling one wedged device would strand once per spelling.

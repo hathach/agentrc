@@ -1,6 +1,7 @@
 """Tests for pr-review's scripts: real git in temporary repositories, a fake GitHub behind gh."""
 import contextlib
 import errno
+import hashlib
 import importlib.util
 import json
 import os
@@ -50,6 +51,7 @@ def setUpModule():
 class FakeGitHub:
     def __init__(self):
         self.head = None
+        self.state = 'OPEN'
         self.checks = []
         self.checks_code = 0
         self.reviews = {}
@@ -68,7 +70,11 @@ class FakeGitHub:
         self.reply_fails = None
         self.submits = []
         self.submit_fails = False
+        self.notes = []
+        self.note_fails = None
         self.clock = 0
+        self.maintainer_can_modify = True
+        self.perms = {}  # repo: this account's permissions, or a str for gh's error
 
     def tick(self):
         self.clock += 1
@@ -123,11 +129,13 @@ class FakeGitHub:
             fields = argv[argv.index('--json') + 1]
             if fields == 'headRefOid':
                 return 0, json.dumps({'headRefOid': self.head})
+            if fields == 'headRefOid,state':
+                return 0, json.dumps({'headRefOid': self.head, 'state': self.state})
             return 0, json.dumps({'number': PR, 'url': f'https://github.com/{REPO}/pull/{PR}', 'title': 't',
                                   'state': 'OPEN', 'author': {'login': 'contrib'}, 'headRefOid': self.head,
                                   'headRefName': 'feature', 'headRepository': {'name': 'r'},
                                   'headRepositoryOwner': {'login': 'contrib'}, 'isCrossRepository': True,
-                                  'baseRefName': 'main'})
+                                  'maintainerCanModify': self.maintainer_can_modify, 'baseRefName': 'main'})
         if argv[:2] == ['pr', 'checks']:
             return self.checks_code, json.dumps(self.checks) if self.checks else ''
         if argv[:2] == ['api', 'user']:
@@ -144,6 +152,19 @@ class FakeGitHub:
             if self.submit_fails == 'lost':
                 return 1, '', 'HTTP 502'
             return 0, json.dumps({'id': rid, 'state': post.STATE[event]})
+        if argv[0] == 'api' and '--method' in argv and argv[argv.index('--method') + 2].endswith('/replies'):
+            # A standalone reply: public at once, on its root's thread.
+            root = int(argv[argv.index('--method') + 2].split('/')[-2])
+            self.notes.append((root, json.loads(stdin)['body']))
+            if self.note_fails is True:
+                return 1, '', 'HTTP 502'
+            cid = self.next_id = self.next_id + 1
+            self.inline.append({'id': cid, 'in_reply_to_id': root, 'body': json.loads(stdin)['body'], 'user': {'login': ME},
+                                'created_at': self.tick()})
+            next(t for t in self.threads if t['comments']['nodes'][0]['databaseId'] == root)['comments']['nodes'].append({'databaseId': cid})
+            if self.note_fails == 'lost':
+                return 1, '', 'HTTP 502'
+            return 0, json.dumps({'id': cid})
         if argv[0] == 'api' and '--method' in argv:
             self.posts.append(json.loads(stdin))
             if self.post_fails is True:
@@ -172,6 +193,9 @@ class FakeGitHub:
         if argv[0] == 'api':
             path = next(a for a in argv[1:] if a.startswith('repos/')).split('?')[0]
             page = lambda xs: [list(xs)]  # noqa: E731 - --paginate --slurp shape
+            if path.count('/') == 2 and '--jq' in argv and argv[argv.index('--jq') + 1] == '.permissions':
+                got = self.perms.get(path[len('repos/'):])
+                return (1, '', got) if isinstance(got, str) else (0, json.dumps(got))
             m = re.fullmatch(rf'repos/{REPO}/pulls/{PR}/reviews/(\d+)/comments', path)
             if m:
                 return 0, json.dumps(page(self.review_comments.get(int(m.group(1)), [])))
@@ -618,12 +642,162 @@ class Prepare(Case):
         self.assertEqual(prepare.groups_of(nested, 6), (['agents', 'skills/cowork'], False))
 
 
+class AutoFix(Case):
+    """prepare --auto-fix: where repairs would be pushed, and the review branch bound to it."""
+
+    BRANCH = f'pr-review-{PR}'
+
+    def setUp(self):
+        super().setUp()
+        self.commit('src/core/a.c', 'int a;\n' * 20 + 'int b;\n', 'b')
+        self.head = self.push_pr()
+        self.fetched = []
+
+    def fake_fetch(self, remote, branch, at=None):
+        self.fetched.append((remote, branch))
+        sh(self.clone, 'git', 'update-ref', f'refs/remotes/{remote}/{branch}', at or self.gh.head)
+
+    def auto_fix(self, at=None):
+        with mock.patch.object(prepare, 'fetch_head_branch', lambda r, b: self.fake_fetch(r, b, at)):
+            return self.prepare('--auto-fix')
+
+    def config(self, key):
+        return sh(self.clone, 'git', 'config', '--default', '', '--get', key)
+
+    def test_without_it_prepare_reports_no_repair_and_binds_nothing(self):
+        sh(self.clone, 'git', 'remote', 'add', 'contrib', 'git@github.com:contrib/r.git')
+        p = self.prepare()
+        self.assertNotIn('repair', p)
+        self.assertEqual(self.config(f'branch.{self.BRANCH}.remote'), '')
+
+    def test_a_fork_allowing_maintainer_edits_binds_its_remote_as_babysit_preflight_reads_it(self):
+        import preflight
+        sh(self.clone, 'git', 'remote', 'add', 'contrib', 'git@github.com:contrib/r.git')
+        self.gh.perms = {'contrib/r': {'push': False, 'pull': True}, REPO: {'push': True}}
+        p = self.auto_fix()
+        self.assertEqual(p['repair'], {'state': 'available', 'why': f'the PR allows edits from maintainers, and push access to {REPO}',
+                                       'remote': 'contrib', 'addedRemote': False})
+        self.assertEqual((p['headRepo'], p['headBranch'], p['fork']), ('contrib/r', 'feature', True))
+        self.assertEqual(self.fetched, [('contrib', 'feature')])
+        with contextlib.chdir(p['worktree']):
+            remote, urls = preflight.push_urls(self.BRANCH)
+            self.assertEqual((remote, urls, preflight.upstream_branch(self.BRANCH, remote)),
+                             ('contrib', ['git@github.com:contrib/r.git'], 'feature'))
+            self.assertEqual(preflight.bad_push_url(f'https://github.com/{REPO}/pull/{PR}', 'github.com/contrib/r', urls), '')
+        self.assertEqual(self.auto_fix()['repair']['remote'], 'contrib', 'a second prepare finds its own binding')
+
+    def test_push_access_to_the_head_repository_is_enough(self):
+        sh(self.clone, 'git', 'remote', 'add', 'contrib', 'https://github.com/contrib/r')
+        self.gh.perms = {'contrib/r': {'push': True}}
+        self.gh.maintainer_can_modify = False
+        r = self.auto_fix()['repair']
+        self.assertEqual((r['state'], r['why'], r['remote']), ('available', 'push access to contrib/r', 'contrib'))
+
+    def test_no_push_access_anywhere_is_unavailable_and_binds_nothing(self):
+        sh(self.clone, 'git', 'remote', 'add', 'contrib', 'git@github.com:contrib/r.git')
+        self.gh.perms = {'contrib/r': {'push': False}, REPO: {'push': False, 'triage': True}}
+        r = self.auto_fix()['repair']
+        self.assertEqual((r['state'], r['why']), ('unavailable', f'no push access to contrib/r or {REPO}'))
+        self.assertNotIn('remote', r)
+        self.assertEqual((self.fetched, self.config(f'branch.{self.BRANCH}.remote')), ([], ''))
+
+    def test_a_fork_refusing_maintainer_edits_is_unavailable(self):
+        self.gh.perms = {'contrib/r': {'push': False}, REPO: {'admin': True}}
+        self.gh.maintainer_can_modify = False
+        r = self.auto_fix()['repair']
+        self.assertEqual((r['state'], r['why']), ('unavailable', 'no push access to contrib/r, and the PR does not allow edits from maintainers'))
+
+    def test_permissions_gh_cannot_read_are_unknown_not_unavailable(self):
+        self.gh.perms = {'contrib/r': 'gh: Not Found (HTTP 404)', REPO: {'push': False}}
+        r = self.auto_fix()['repair']
+        self.assertEqual(r['state'], 'unknown')
+        self.assertIn('HTTP 404', r['why'])
+        for shown in (None, {}, {'pull': True}, {'push': 'no'}):
+            self.gh.perms = {'contrib/r': shown, REPO: {'push': False}}
+            self.assertEqual(self.auto_fix()['repair']['state'], 'unknown', f'{shown} is not a refusal')
+
+    def test_with_no_remote_for_the_head_one_is_added_like_the_base_and_gh_default_pinned(self):
+        sh(self.clone, 'git', 'config', f'url.{self.remote.as_posix()}.insteadOf', f'git@github.com:{REPO}.git')
+        sh(self.clone, 'git', 'remote', 'set-url', 'origin', f'git@github.com:{REPO}.git')
+        self.gh.perms = {'contrib/r': {'push': True}}
+        r = self.auto_fix()['repair']
+        self.assertEqual((r['remote'], r['addedRemote']), ('pr-head-contrib', True))
+        self.assertEqual(sh(self.clone, 'git', 'remote', 'get-url', 'pr-head-contrib'), 'git@github.com:contrib/r.git')
+        self.assertEqual(self.config('remote.origin.gh-resolved'), 'base')
+        self.assertEqual(facts.gh_repo.checkout_repo(str(self.clone)), REPO)
+
+    def test_an_added_remote_that_leaves_the_checkout_reading_another_repository_is_removed_so_a_rerun_checks_again(self):
+        sh(self.clone, 'git', 'config', f'url.{self.remote.as_posix()}.insteadOf', f'git@github.com:{REPO}.git')
+        sh(self.clone, 'git', 'remote', 'set-url', 'origin', f'git@github.com:{REPO}.git')
+        sh(self.clone, 'git', 'remote', 'add', 'mirror', 'https://github.com/someone/else')
+        sh(self.clone, 'git', 'config', 'remote.mirror.gh-resolved', 'base')
+        self.gh.perms = {'contrib/r': {'push': True}}
+        for _ in range(2):
+            with self.assertRaisesRegex(facts.Unusable, f'no longer reads as {REPO}'):
+                self.auto_fix()
+            self.assertNotIn('pr-head-contrib', sh(self.clone, 'git', 'remote').split())
+
+    def test_a_remote_pushing_elsewhere_is_not_the_head_remote(self):
+        sh(self.clone, 'git', 'remote', 'add', 'contrib', 'git@github.com:contrib/r.git')
+        sh(self.clone, 'git', 'remote', 'set-url', '--push', 'contrib', 'git@github.com:someone/else.git')
+        self.gh.perms = {'contrib/r': {'push': True}}
+        with self.assertRaisesRegex(facts.Unusable, 'not a github.com one to spell it like'):
+            self.auto_fix()
+
+    def test_two_remotes_naming_the_head_repository_refuse_unless_one_is_tracked(self):
+        for name in ('a', 'b'):
+            sh(self.clone, 'git', 'remote', 'add', name, 'git@github.com:contrib/r.git')
+        self.gh.perms = {'contrib/r': {'push': True}}
+        with self.assertRaisesRegex(facts.Unusable, 'remotes a, b all name contrib/r'):
+            self.auto_fix()
+        sh(self.clone, 'git', 'config', f'branch.{self.BRANCH}.remote', 'b')
+        sh(self.clone, 'git', 'config', f'branch.{self.BRANCH}.merge', 'refs/heads/feature')
+        self.assertEqual(self.auto_fix()['repair']['remote'], 'b')
+
+    def test_another_upstream_already_set_is_refused_not_replaced(self):
+        sh(self.clone, 'git', 'remote', 'add', 'contrib', 'git@github.com:contrib/r.git')
+        self.prepare()
+        sh(self.clone, 'git', 'config', f'branch.{self.BRANCH}.remote', 'origin')
+        sh(self.clone, 'git', 'config', f'branch.{self.BRANCH}.merge', 'refs/heads/main')
+        self.gh.perms = {'contrib/r': {'push': True}}
+        with self.assertRaisesRegex(facts.Unusable, 'already tracks origin refs/heads/main'):
+            self.auto_fix()
+        self.assertEqual(self.config(f'branch.{self.BRANCH}.remote'), 'origin')
+
+    def test_a_remote_whose_fetch_refspec_skips_the_head_branch_refuses_and_binds_nothing(self):
+        sh(self.clone, 'git', 'remote', 'add', '-t', 'main', 'contrib', 'git@github.com:contrib/r.git')
+        self.gh.perms = {'contrib/r': {'push': True}}
+        with self.assertRaisesRegex(facts.Unusable, "fetch refspec does not map refs/heads/feature"):
+            self.auto_fix()
+        self.assertEqual((self.config(f'branch.{self.BRANCH}.remote'), self.config(f'branch.{self.BRANCH}.merge')), ('', ''))
+
+    def test_a_head_branch_not_at_the_pinned_head_refuses_and_binds_nothing(self):
+        sh(self.clone, 'git', 'remote', 'add', 'contrib', 'git@github.com:contrib/r.git')
+        self.gh.perms = {'contrib/r': {'push': True}}
+        with self.assertRaisesRegex(facts.Unusable, 'not the PR head'):
+            self.auto_fix(at=self.base)
+        self.assertEqual(self.config(f'branch.{self.BRANCH}.remote'), '')
+
+    def test_it_is_refused_with_check_or_release(self):
+        for extra in (['--check', '--expected-head', self.head], ['--release', '--token', 'ab']):
+            with self.assertRaisesRegex(facts.Unusable, 'is for a prepare'):
+                self.prepare('--auto-fix', *extra)
+
+
 class Ledger(Case):
     def setUp(self):
         super().setUp()
         self.commit('src/core/a.c', 'int a;\n' * 20 + 'int b;\n', 'b')
         self.push_pr()
         self.p = self.prepare()
+
+    def test_snapshot_of_an_empty_ledger_holds_nothing_standing(self):
+        snap = self.tmp / 'threads.json'
+        snap.write_text(json.dumps({'repo': REPO, 'pr': PR, 'comments': [], 'threads': []}))
+        manifest = self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--threads', str(snap), '--head', self.p['head'],
+                                      '--snapshot', str(self.tmp)])
+        self.assertEqual(json.loads(Path(manifest['file']).read_bytes()), {'reviews': 0, 'last': None, 'open': [],
+                                                                              'disputes': []})
 
     def test_save_refuses_a_word_off_the_scale_before_anything_is_stored(self):
         for word in ('major', 'severe', None):
@@ -650,7 +824,7 @@ class Ledger(Case):
         self.assertEqual(rev['status'], 'pending')
         self.assertEqual(rev['findings'][0]['id'], f'pr{PR}-f1')
         self.assertEqual(rev['draft']['comments'][0]['findingId'], f'pr{PR}-f1')
-        self.assertIn('**src/core/a.c:1**: far from the diff', rev['draft']['body'])
+        self.assertEqual(rev['draft']['body'], 'Summary.\n\nNot in an inline comment:\n- `src/core/a.c:1` far from the diff')
         self.assertEqual(rev['draft']['digest'], out['draftDigest'])
         self.assertEqual(self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO])['open'], [], 'a pending draft carries nothing')
         pending = self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--pending'])['pending']
@@ -1059,33 +1233,70 @@ class Post(PostCase):
             self.post()
         self.assertEqual(self.gh.posts, [])
 
-    def test_text_marked_long_is_never_auto_posted_and_is_named_in_a_pending_review(self):
+    def test_long_text_is_auto_posted_whole(self):
         draft = self.result_for(self.p)['draft']
-        self.save(self.result_for(self.p, draft={**draft, 'comments': [{**draft['comments'][0], 'body': ' '.join(['w'] * 81)}]}))
-        with self.assertRaisesRegex(facts.Unusable, r'over-length text \(src/core/a\.c:21\)'):
-            self.post('--auto')
-        self.assertEqual(self.gh.posts, [])
-        out = self.post()
-        self.assertEqual((out['status'], out['overLength']), ('drafted', ['src/core/a.c:21']))
-        self.assertEqual(self.gh.posts[0]['comments'][0]['body'], ' '.join(['w'] * 81), 'the text is never cut')
+        long = ' '.join(['w'] * 200) + '\n- ' + 'x' * 700
+        self.save(self.result_for(self.p, draft={**draft, 'comments': [{**draft['comments'][0], 'body': long}]}))
+        out = self.post('--auto')
+        self.assertEqual((out['status'], len(self.gh.submits)), ('posted', 1))
+        self.assertNotIn('handedOver', out)
+        self.assertNotIn('overLength', out)
+        self.assertEqual(self.gh.posts[0]['comments'][0]['body'], long, 'never cut')
 
-    def test_auto_post_measures_what_it_would_submit_whatever_the_draft_marks(self):
+    def test_a_held_review_is_never_submitted_by_a_retry_after_a_crash(self):
         draft = self.result_for(self.p)['draft']
-        self.save(self.result_for(self.p, draft={**draft, 'comments': [{**draft['comments'][0], 'body': ' '.join(['w'] * 81)}]}))
-        with self.assertRaisesRegex(facts.Unusable, r'over-length text \(src/core/a\.c:21\)'):
-            self.post('--auto')
-        self.post('--decline', '--reason', 'next')
-        self.save(self.result_for(self.p, draft={**draft, 'replies': [{'commentId': 5010, 'body': ' '.join(['w'] * 61), 'findingId': 'pr7-f1'}]}), reason='note')
-        with self.assertRaisesRegex(facts.Unusable, r'over-length text \(fix note on pr7-f1\)'):
-            self.post('--auto')
+        self.save(self.result_for(self.p, draft={**draft, 'comments': [{'path': 'src/core/a.c', 'line': 1, 'body': '**high**: b.\n- only here: b is never initialised', 'finding': 0, 'firstLineUnchecked': True}]}))
+        with mock.patch.object(post, 'publish_review', side_effect=RuntimeError('crash before the POST')):
+            with self.assertRaises(RuntimeError):
+                self.post('--auto')
         self.assertEqual(self.gh.posts, [])
+        out = self.post('--auto')
+        self.assertEqual((out['status'], len(self.gh.posts), self.gh.submits), ('drafted', 1, []))
+        self.assertRegex(out['handedOver'], 'first line no check verified')
 
-    def test_a_long_comment_moved_into_the_body_still_stops_auto_post(self):
+    def test_a_held_review_whose_post_response_is_lost_is_recovered_and_still_handed_over(self):
+        draft = self.result_for(self.p)['draft']
+        self.save(self.result_for(self.p, draft={**draft, 'comments': [{'path': 'src/core/a.c', 'line': 1, 'body': '**high**: b.\n- only here: b is never initialised', 'finding': 0, 'firstLineUnchecked': True}]}))
+        self.gh.post_fails = True
+        self.assertEqual(self.post('--auto')['status'], 'uncertain')
+        self.gh.post_fails = False
+        sent = self.gh.posts[0]
+        rid = self.gh.next_id = self.gh.next_id + 1
+        self.gh.reviews[rid] = {'id': rid, 'node_id': f'PRR_{rid}', 'body': sent['body'], 'state': 'PENDING', 'user': {'login': ME}}
+        self.gh.review_comments[rid] = [{'id': 78, 'path': c['path'], 'line': None, 'drafted_line': c['line'], 'body': c['body']}
+                                        for c in sent['comments']]
+        out = self.post('--auto')
+        self.assertEqual((out['status'], out['review']['recovered'], len(self.gh.posts), self.gh.submits), ('drafted', True, 1, []))
+        self.assertRegex(out['handedOver'], 'first line no check verified', 'recovered by its marker, still handed over')
+
+    def test_a_body_entry_posts_only_its_first_line(self):
+        long = '**low**: short problem.\n- ' + 'cause ' * 90
+        draft = {**self.result_for(self.p)['draft'], 'comments': [{'path': 'src/core/a.c', 'line': 1, 'body': long, 'finding': 0}]}
+        self.save(self.result_for(self.p, draft=draft))
+        self.assertEqual(self.review()['draft']['moved'][0]['renderedLine'], '- `src/core/a.c:1` **low**: short problem.')
+        self.assertNotIn('cause', self.review()['draft']['body'], 'only the first line is posted')
+
+    def test_a_long_body_entry_is_auto_posted_whole(self):
+        draft = {**self.result_for(self.p)['draft'], 'comments': [{'path': 'src/core/a.c', 'line': 1, 'body': '**low**: ' + 'x' * 700, 'finding': 0}]}
+        self.save(self.result_for(self.p, draft=draft))
+        out = self.post('--auto')
+        self.assertEqual((out['status'], len(self.gh.submits)), ('posted', 1))
+        self.assertIn('x' * 700, self.gh.posts[0]['body'])
+
+    def test_a_body_entry_whose_first_line_no_check_verified_is_handed_over_in_a_pending_review(self):
+        unchecked = {'body': '**high**: b.\n- only here: b is never initialised', 'finding': 0, 'firstLineUnchecked': True}
+        self.assertEqual(post.first_line_unchecked({'draft': {'comments': [unchecked], 'moved': []}}), [], 'an inline comment shows whole')
+        draft = {**self.result_for(self.p)['draft'], 'comments': [{'path': 'src/core/a.c', 'line': 1, **unchecked}]}
+        self.save(self.result_for(self.p, draft=draft))
+        out = self.post('--auto')
+        self.assertRegex(out['handedOver'], r'first line no check verified \(src/core/a\.c:1\)')
+        self.assertEqual((out['status'], out['firstLineUnchecked'], len(self.gh.posts), self.gh.submits), ('drafted', ['src/core/a.c:1'], 1, []))
+
+    def test_a_long_comment_moved_into_the_body_is_auto_posted(self):
         draft = self.result_for(self.p)['draft']
         self.save(self.result_for(self.p, draft={**draft, 'comments': [draft['comments'][0], {**draft['comments'][1], 'body': ' '.join(['w'] * 81)}]}))
         self.assertEqual([c['line'] for c in self.review()['draft']['moved']], [1], 'moved into the body, kept as the comment it was')
-        with self.assertRaisesRegex(facts.Unusable, r'over-length text \(src/core/a\.c:1\)'):
-            self.post('--auto')
+        self.assertEqual((self.post('--auto')['status'], len(self.gh.submits)), ('posted', 1))
 
     def test_decline_settles_a_draft_never_created(self):
         self.save(self.result_for(self.p))
@@ -1281,6 +1492,35 @@ class Draft(PostCase):
         self.assertEqual((f2['status'], f2['commentId'], f2['published']), ('open', rid * 10 + 1, 'two, softened'))
         self.assertEqual([f['id'] for f in self.show()['open']], [f2['id']])
 
+    def test_a_held_review_is_handed_over_with_its_fix_notes_staged(self):
+        self.fixed()
+        led = json.loads(Path(self.p['ledger']).read_text())
+        draft = led['reviews'][-1]['draft']
+        draft['replies'][0]['body'] = ' '.join(['w'] * 61)
+        draft['moved'] = [{'path': 'src/core/a.c', 'line': 1, 'body': '**high**: b.', 'finding': 0, 'firstLineUnchecked': True,
+                           'renderedLine': '- `src/core/a.c:1` **high**: b.'}]
+        Path(self.p['ledger']).write_text(json.dumps(led))
+        submits = list(self.gh.submits)
+        out = self.post('--auto')
+        self.assertRegex(out['handedOver'], r'first line no check verified \(src/core/a\.c:1\)')
+        self.assertEqual(([(e['kind'], e['state']) for e in out['staged']], self.gh.submits), ([('fixnote', 'staged')], submits),
+                         'the human gets the whole review, its notes included, and nothing is submitted')
+        self.assertEqual(self.adds()[0]['b'], ' '.join(['w'] * 61), 'never cut')
+        self.assertFalse(self.gh.threads[0]['isResolved'])
+
+    def test_a_long_fix_note_is_auto_posted_whole(self):
+        self.fixed()
+        led = json.loads(Path(self.p['ledger']).read_text())
+        note = ' '.join(['w'] * 100) + ' ' + 'x' * 400
+        led['reviews'][-1]['draft']['replies'][0]['body'] = note
+        Path(self.p['ledger']).write_text(json.dumps(led))
+        submits = len(self.gh.submits)
+        out = self.post('--auto')
+        self.assertEqual((out['status'], len(self.gh.submits)), ('posted', submits + 1))
+        self.assertNotIn('handedOver', out)
+        self.assertEqual([(e['kind'], e['state']) for e in out['staged']], [('fixnote', 'published')])
+        self.assertEqual(self.adds()[0]['b'], note, 'sent whole')
+
     def test_a_fix_note_is_staged_and_its_thread_resolved_only_once_submitted(self):
         root = self.fixed()
         out = self.post()
@@ -1468,8 +1708,9 @@ class Pushback(PostCase):
 
     def snapshot(self, *thread):
         """thread: (id, author, body, bot) after our root comment."""
-        comments = [{'id': self.root, 'author': ME, 'bot': False, 'digest': 'r0', 'body': 'root', 'url': 'https://x/r0'}]
-        comments += [{'id': i, 'author': who, 'bot': bot, 'digest': harvest.digest(body), 'body': body} for i, who, body, bot in thread]
+        comments = [{'kind': 'review', 'id': self.root, 'author': ME, 'bot': False, 'digest': 'r0', 'body': 'root', 'url': 'https://x/r0'}]
+        comments += [{'kind': 'review', 'id': i, 'author': who, 'bot': bot, 'digest': harvest.digest(body), 'body': body}
+                     for i, who, body, bot in thread]
         f = Path(self.p['facts']).parent / f'threads-{self.head}.json'
         f.write_text(json.dumps({'repo': REPO, 'pr': PR, 'viewer': ME, 'comments': comments,
                                  'threads': [{'threadId': 'T', 'resolved': False, 'outdated': False, 'commentIds': [c['id'] for c in comments]}]}))
@@ -1525,6 +1766,65 @@ class Pushback(PostCase):
         with self.assertRaisesRegex(facts.Unusable, 'needs --threads'):
             self.call(ledger, [*show, '--head', self.head])
 
+    def test_snapshot_writes_the_workflows_view_to_a_content_named_file_and_prints_its_manifest(self):
+        snap = self.snapshot((950, 'contrib', 'intentional', False))
+        show = ['show', '--pr', str(PR), '--repo', REPO, '--threads', str(snap), '--head', self.head]
+        where = self.tmp / 'facts-snap'
+        where.mkdir()
+        manifest = self.call(ledger, [*show, '--snapshot', str(where)])
+        payload = Path(manifest['file']).read_bytes()
+        self.assertTrue(payload.isascii())
+        plain = self.call(ledger, show)
+        view = {k: v for k, v in plain.items() if k not in ('ledger', 'answers')}
+        view['open'] = [{k: v for k, v in f.items() if k not in ('impact', 'severityReason')} for f in plain['open']]
+        self.assertEqual(json.loads(payload), view, 'the plain answer less what the workflow never reads')
+        self.assertEqual((len(view['open']), len(view['disputes'])), (1, 1))
+        self.assertEqual(Path(manifest['file']).name, f"ledger-{hashlib.sha256(payload).hexdigest()}.json")
+        self.assertEqual(manifest, {'repo': REPO, 'pr': PR, 'head': self.head, 'file': manifest['file'],
+                                    'digest': facts.fnv1a(payload.decode()), 'length': len(payload)})
+        Path(manifest['file']).write_bytes(payload + b' ')
+        self.assertEqual(self.call(ledger, [*show, '--snapshot', str(where)]), manifest, 'a rerun names the same file')
+        self.assertEqual(Path(manifest['file']).read_bytes(), payload, 'and writes it anew, so a damaged one is repaired')
+        changed = self.snapshot((950, 'contrib', 'intentional, see line 3', False))
+        later = self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--threads', str(changed), '--head', self.head,
+                                   '--snapshot', str(where)])
+        self.assertNotEqual(later['file'], manifest['file'])
+        self.assertEqual(Path(manifest['file']).read_bytes(), payload, 'a later answer leaves the earlier file as it was')
+        with self.assertRaisesRegex(facts.Unusable, 'is not a directory'):
+            self.call(ledger, [*show, '--snapshot', str(where / 'missing')])
+        for bad in (['show', '--pr', str(PR), '--repo', REPO, '--threads', str(snap)],
+                    [*show, '--fixable']):
+            with self.assertRaisesRegex(facts.Unusable, '--snapshot needs --threads and --head, and not --fixable'):
+                self.call(ledger, [*bad, '--snapshot', str(where)])
+
+    def test_a_finding_read_back_from_the_snapshot_saves_with_its_whole_text(self):
+        path = Path(self.p['ledger'])
+        led = json.loads(path.read_text())
+        text = {'why': 'b is read before set — “é” \\ "q" ' * 40, 'severityReason': 'graded ✓ ' * 30,
+                'impact': {'consequence': 'wrong data ' * 50, 'path': 'p', 'recovery': 'r', 'variants': 'v'}, 'confidence': 'high'}
+        led['reviews'][0]['findings'][0].update(text)
+        path.write_text(json.dumps(led))
+        snap = self.snapshot((950, 'contrib', 'intentional', False))
+        manifest = self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--threads', str(snap), '--head', self.head,
+                                      '--snapshot', str(snap.parent)])
+        row = json.loads(Path(manifest['file']).read_bytes())['open'][0]
+        self.assertEqual((row['why'], row['confidence']), (text['why'], text['confidence']))
+        self.assertFalse({'impact', 'severityReason'} & set(row))
+        grade = {k: row[k] for k in ('severity', 'confidence')}  # the workflow's gradeOf(f), its absent members dropped
+        self.save(self.result_for(self.p, mode='discussion', findings=[{'id': row['id'], 'status': 'upheld', **grade,
+                                                                        'disputes': [self.dispute('upheld')]}]))
+        self.assertEqual({k: self.finding()[k] for k in text}, text, 'a discussion merge keeps the stored grading')
+        self.save(self.result_for(self.p, findings=[{'id': row['id'], 'file': row['file'], 'line': row['line'], 'status': 'open', **grade}]),
+                  reason='again')
+        saved = self.led()['reviews'][-1]['findings'][0]
+        self.assertEqual({k: saved[k] for k in text}, text, 'number() carries the record, its grading included')
+        regrade = {'severity': 'medium', 'confidence': 'low', 'severityReason': 'worse', 'impact': {**text['impact'], 'path': 'q'}}
+        self.mark_posted(self.p)
+        self.save(self.result_for(self.p, findings=[{'id': row['id'], 'file': row['file'], 'line': row['line'], 'status': 'open', **regrade}]),
+                  reason='regraded')
+        saved = self.led()['reviews'][-1]['findings'][0]
+        self.assertEqual({k: saved[k] for k in regrade}, regrade, 'a regrade replaces it')
+
     def test_a_snapshot_of_another_repository_or_none_named_is_refused(self):
         snap = self.snapshot((950, 'contrib', 'intentional', False))
         self.assertEqual(len(self.disputes(snap)), 1)
@@ -1536,11 +1836,13 @@ class Pushback(PostCase):
                     with self.assertRaisesRegex(facts.Unusable, f'--threads is a snapshot of .*, not {REPO}#{PR}'):
                         self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--threads', str(snap), *head])
 
-    def test_a_long_answer_is_named_in_its_pending_review(self):
+    def test_a_long_answer_goes_into_its_pending_review_whole(self):
         self.discuss('upheld', {'body': ' '.join(['w'] * 61), 'resolve': False})
         self.comment(950, 'contrib', 'intentional')
         out = self.post()
-        self.assertEqual((out['status'], out['overLength']), ('drafted', ['answer on pr7-f1']))
+        self.assertEqual(out['status'], 'drafted')
+        self.assertNotIn('overLength', out)
+        self.assertEqual(self.adds()[-1]['b'], ' '.join(['w'] * 61))
 
     def test_a_discussion_merges_into_the_review_and_keeps_its_answers_on_it(self):
         out = self.discuss('withdrawn', {'body': 'Agreed, withdrawing.', 'resolve': True})
@@ -1615,6 +1917,15 @@ class Pushback(PostCase):
         self.assertIn(reply, ledger.answered_ids(self.led()))
         self.assertEqual(self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO])['answers'], [])
 
+    def test_a_submitted_answer_on_a_closed_pr_is_recorded_and_never_resolves(self):
+        self.concede()
+        self.gh.submit(self.rid())
+        self.gh.state = 'CLOSED'
+        self.call(post, ['--pr', str(PR), '--repo', REPO, '--sync'])
+        self.assertEqual(self.finding()['disputes'][-1]['answer']['outcome'], 'published', 'the receipt still settles')
+        self.assertFalse(self.gh.threads[0]['isResolved'])
+        self.assertEqual([(m['state'], m['error']) for m in self.pub()['receipts']['resolved']], [('deferred', 'the PR is closed')])
+
     def test_an_edited_concession_reopens_its_finding_answers_the_pushback_and_is_never_resolved(self):
         reply = self.concede()
         self.gh.submit(self.rid(), edit={reply: 'Fair point, but see line 3.'})
@@ -1685,13 +1996,15 @@ class Pushback(PostCase):
         self.comment(955, 'coderabbitai[bot]', 'agree', bot=True)
         self.assertEqual(self.post()['staged'][0]['state'], 'staged')
 
-    def test_auto_posts_despite_a_long_answer_and_names_it_in_the_answers_pending_review(self):
+    def test_auto_posts_with_a_long_answer_and_puts_it_whole_in_the_answers_pending_review(self):
         rec = self.dispute('upheld', {'body': ' '.join(['w'] * 61), 'resolve': False})
         self.comment(950, 'contrib', 'intentional')
         self.save(self.result_for(self.p, findings=[{'id': 'pr7-f1', 'status': 'upheld', 'disputes': [rec]}],
                                   draft={'event': 'COMMENT', 'body': 'Again.', 'comments': [], 'replies': []}), reason='again')
         out = self.post('--auto')
-        self.assertEqual((out['status'], out['answers']['overLength']), ('posted', ['answer on pr7-f1']))
+        self.assertEqual((out['status'], out['answers']['status']), ('posted', 'drafted'))
+        self.assertNotIn('overLength', out['answers'])
+        self.assertEqual(self.adds()[-1]['b'], ' '.join(['w'] * 61))
 
     def test_auto_keeps_one_answer_publication_across_a_crash_and_publishes_it_once_its_review_is_submitted(self):
         rec = self.dispute('upheld', {'body': 'Still stands.', 'resolve': False})
@@ -1712,6 +2025,118 @@ class Pushback(PostCase):
         self.assertEqual(self.led()['reviews'][1]['findings'][0]['status'], 'upheld')
         self.post()
         self.assertEqual(len(self.gh.posts), 3, 'a rerun finds the answers\' pending review, never a second one')
+
+    def test_auto_fix_defers_the_answers_so_the_repair_may_list_its_findings_then_plain_post_publishes_them(self):
+        rec = self.dispute('upheld', {'body': 'Still stands.', 'resolve': False})
+        self.comment(950, 'contrib', 'intentional')
+        self.save(self.result_for(self.p, findings=[{'id': 'pr7-f1', 'status': 'upheld', 'disputes': [rec]},
+                                                    {'file': 'src/core/a.c', 'line': 1, 'why': 'a shadows a global', 'severity': 'medium',
+                                                     'dimension': 'correctness', 'status': 'open'}],
+                                  draft={'event': 'COMMENT', 'body': 'Again.', 'replies': [],
+                                         'comments': [{'path': 'src/core/a.c', 'line': 1, 'body': 'a shadows a global', 'finding': 1}]}),
+                  reason='again')
+        out = self.post('--auto', '--defer-answers')
+        self.assertEqual((out['status'], out['answers']), ('posted', {'status': 'deferred'}))
+        self.assertEqual((len(self.gh.posts), self.adds()), (2, []), 'no pending review holds the answers')
+        with mock.patch.object(post, 'collect', return_value=out), mock.patch('sys.stdout'):
+            self.assertEqual(post.main([]), 0)
+        snap = self.tmp / 'threads.json'
+        self.call(threads, ['--pr', str(PR), '--repo', REPO, '--out', str(snap)])
+        got = self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--fixable', '--threads', str(snap), '--head', self.head])['fixable']
+        self.assertEqual(([f['id'] for f in got['fix']], [h['why'] for h in got['held']]), (['pr7-f2'], ['replied']))
+        with self.assertRaisesRegex(facts.Unusable, 'a pending draft'):
+            self.prepare()
+        out = self.post()
+        self.assertEqual((out['status'], [(e['kind'], e['state']) for e in out['staged']]), ('drafted', [('answer', 'staged')]))
+        with self.assertRaisesRegex(facts.Unusable, '--defer-answers goes with --auto'):
+            self.post('--defer-answers')
+
+    def upheld_again(self, *extra, comments=()):
+        """A second review of the head, pr7-f1 upheld on the contributor's pushback with an answer, plus `extra` findings
+        and their `comments`."""
+        rec = self.dispute('upheld', {'body': 'Still stands.', 'resolve': False})
+        self.comment(950, 'contrib', 'intentional')
+        self.save(self.result_for(self.p, findings=[{'id': 'pr7-f1', 'status': 'upheld', 'disputes': [rec]}, *extra],
+                                  draft={'event': 'COMMENT', 'body': 'Again.', 'comments': list(comments), 'replies': []}), reason='again')
+
+    def deferred(self):
+        """Our review submitted on the head by an auto-fix run, its answer to the contributor's pushback deferred."""
+        self.upheld_again({'file': 'src/core/a.c', 'line': 1, 'why': 'a shadows a global', 'severity': 'medium',
+                           'dimension': 'correctness', 'status': 'open'},
+                          comments=[{'path': 'src/core/a.c', 'line': 1, 'body': 'a shadows a global', 'finding': 1}])
+        self.assertEqual(self.post('--auto', '--defer-answers')['answers'], {'status': 'deferred'})
+
+    def test_auto_fix_on_the_same_head_reuses_our_submitted_review_and_lets_its_deferred_answers_wait(self):
+        self.deferred()
+        p = self.prepare('--auto-fix')
+        rid = self.review()['receipts']['review']['reviewId']
+        self.assertEqual((p['mode'], p['repair']['submittedReview'], p['repair']['deferredAnswers']), ('same', rid, 1))
+        self.assertNotIn('submittedWhy', p['repair'])
+        with self.assertRaisesRegex(facts.Unusable, 'a pending draft'):
+            self.prepare()
+        not_auto, sent, two, other = (self.led() for _ in range(4))
+        not_auto['reviews'][-1]['answerPublications'][0]['auto'] = False
+        sent['reviews'][-1]['answerPublications'][0]['receipts'] = {'answer': {'sent': True}}
+        two['reviews'][-1]['answerPublications'].append({**two['reviews'][-1]['answerPublications'][0], 'auto': False})
+        other['reviews'][0].setdefault('answerPublications', []).append(other['reviews'][-1]['answerPublications'].pop())
+        for name, led in (('not auto', not_auto), ('sent', sent), ('two bundles', two), ("another review's", other)):
+            Path(self.p['ledger']).write_text(json.dumps(led))
+            with self.subTest(name), self.assertRaisesRegex(facts.Unusable, 'a pending draft'):
+                self.prepare('--auto-fix')
+
+    def test_a_reply_after_the_deferred_judgment_keeps_its_finding_held_and_its_stale_answer_out(self):
+        self.deferred()
+        self.comment(951, 'contrib', 'still intentional')
+        snap = self.tmp / 'threads.json'
+        self.call(threads, ['--pr', str(PR), '--repo', REPO, '--out', str(snap)])
+        got = self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--fixable', '--threads', str(snap), '--head', self.head])['fixable']
+        self.assertEqual(([f['id'] for f in got['fix']], [(h['findingId'], h['why']) for h in got['held']]), (['pr7-f2'], [('pr7-f1', 'replied')]))
+        out = self.post()
+        self.assertEqual([(e['findingId'], e['state']) for e in out['staged']], [('pr7-f1', 'skipped')], 'the stale answer is never sent')
+        self.gh.submit(out['review']['reviewId'])
+        snap = self.snapshot((950, 'contrib', 'intentional', False), (951, 'contrib', 'still intentional', False))
+        self.assertEqual([d['findingId'] for d in self.disputes(snap)], ['pr7-f1'], 'the newer reply waits for its judgment')
+
+    def test_auto_fix_reuses_a_handed_over_review_once_the_human_submitted_it(self):
+        self.upheld_again()
+        self.crash_at('POST')
+        with self.assertRaises(KeyboardInterrupt):
+            self.post('--auto', '--defer-answers')
+        out = self.post('--auto', '--defer-answers')
+        self.assertEqual(out['status'], 'drafted', 'handed over')
+        with self.assertRaisesRegex(facts.Unusable, 'still open on the PR'):
+            self.prepare('--auto-fix')
+        self.gh.submit(self.review()['receipts']['review']['reviewId'])
+        p = self.prepare('--auto-fix')
+        self.assertEqual((p['mode'], p['repair']['submittedReview'], p['repair']['deferredAnswers']),
+                         ('same', self.review()['receipts']['review']['reviewId'], 1))
+        out = self.post()
+        self.assertEqual([(e['kind'], e['state']) for e in out['staged']], [('answer', 'staged')], 'plain post.py still publishes them')
+
+    def test_auto_fix_on_the_same_head_without_a_submitted_review_names_why(self):
+        self.save(self.result_for(self.p, draft={'event': 'COMMENT', 'body': 'Again.', 'comments': [], 'replies': []}), reason='again')
+        self.mark_posted(self.p)
+        p = self.prepare('--auto-fix')
+        self.assertEqual((p['mode'], p['repair']['submittedReview']), ('same', None))
+        self.assertRegex(p['repair']['submittedWhy'], 'not one submitted on')
+        self.assertNotIn('deferredAnswers', p['repair'])
+
+    def test_deferred_answers_leave_the_recheck_free_and_are_judged_again_on_the_repaired_head(self):
+        self.upheld_again()
+        self.assertEqual(self.post('--auto', '--defer-answers')['answers'], {'status': 'deferred'})
+        self.commit('src/core/c.c', 'int c;\n', 'repair')
+        self.head = self.push_pr()
+        p = self.prepare()
+        self.assertEqual(p['mode'], 'incremental')
+        self.assertEqual([d['findingId'] for d in self.disputes(self.snapshot((950, 'contrib', 'intentional', False)))], ['pr7-f1'],
+                         'the pushback is judged again on the repaired head')
+        rec = self.dispute('upheld', {'body': 'Still stands after the repair.', 'resolve': False})
+        self.save(self.result_for(p, findings=[{'id': 'pr7-f1', 'status': 'upheld', 'disputes': [rec]}],
+                                  draft={'event': 'COMMENT', 'body': 'Recheck.', 'comments': [], 'replies': []}))
+        out = self.post('--auto')
+        self.assertEqual((out['status'], out['answers']['status']), ('posted', 'drafted'))
+        self.assertEqual([[p['head'] == self.head, p['status']] for p, r in ledger.publications(self.led()) if p is not r],
+                         [[False, 'pending'], [True, 'drafted']], 'the earlier head\'s answers are never published on this one')
 
 
 class Threads(Case):
@@ -1903,19 +2328,648 @@ class Severity(unittest.TestCase):
             self.assertEqual(re.findall(r"'(\w+)'", got), facts_, f'{wf} IMPACT')
 
 
-class Limits(unittest.TestCase):
-    def test_the_gate_measures_drafts_against_the_workflows_limits(self):
-        src = (ROOT / 'workflows' / 'pr-review.js').read_text(encoding='utf-8')
-        got = dict(re.findall(r'(\w+): (\d+)', re.search(r'^const LIMIT = \{([^}]*)\}', src, re.M).group(1)))
-        self.assertEqual((int(got['comment']), int(got['answer']), int(got['lineChars'])),
-                         (post.COMMENT_WORDS, post.REPLY_WORDS, post.LINE_CHARS))
-
-
 class Workflow(unittest.TestCase):
     @unittest.skipUnless(shutil.which('node'), 'needs Node.js')
     def test_stub_harness_passes(self):
         done = subprocess.run(['node', str(ROOT / 'tests' / 'pr_review_harness.mjs')], capture_output=True, encoding='utf-8', errors='replace')
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+
+
+class Fixable(PostCase):
+    """ledger.py show --fixable: what an auto-fix repair may take from the review we submitted."""
+
+    def setUp(self):
+        super().setUp()
+        two = [{'file': 'src/core/a.c', 'line': 21, 'why': 'b is never initialised', 'severity': 'high', 'dimension': 'correctness', 'status': 'open'},
+               {'file': 'src/core/a.c', 'line': 1, 'why': 'a shadows a global', 'severity': 'medium', 'dimension': 'correctness', 'status': 'open'}]
+        draft = {'event': 'REQUEST_CHANGES', 'body': 'Summary.', 'replies': [],
+                 'comments': [{'path': 'src/core/a.c', 'line': 21, 'body': 'b is never initialised', 'finding': 0},
+                              {'path': 'src/core/a.c', 'line': 1, 'body': 'a shadows a global', 'finding': 1}]}
+        self.save(self.result_for(self.p, findings=two, draft=draft, verdict={'event': 'REQUEST_CHANGES', 'reasons': ['r']}))
+        self.assertEqual(self.post('--auto')['status'], 'posted')
+        self.root = self.review()['findings'][0]['commentId']
+        self.pristine = Path(self.p['ledger']).read_text()
+
+    def snap(self):
+        snap = self.tmp / 'threads.json'
+        self.call(threads, ['--pr', str(PR), '--repo', REPO, '--out', str(snap)])
+        return snap, json.loads(snap.read_text())
+
+    def show_fixable(self, snap, head=None):
+        return self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--fixable', '--threads', str(snap),
+                                  '--head', head or self.head])['fixable']
+
+    def fixable(self, head=None):
+        return self.show_fixable(self.snap()[0], head)
+
+    def held(self, got):
+        return [(h['findingId'], h['why']) for h in got['held']]
+
+    def test_an_untouched_review_offers_every_standing_finding_inline_or_moved_into_the_body(self):
+        got = self.fixable()
+        self.assertEqual(([f['id'] for f in got['fix']], got['held'], got['autoPost']), (['pr7-f1', 'pr7-f2'], [], True))
+        self.assertIsNone(self.review()['findings'][1].get('commentId'), 'the second finding stands in the review body')
+
+    def test_an_edited_inline_comment_is_held_and_sends_the_recheck_to_the_human(self):
+        next(c for c in self.gh.inline if c['id'] == self.root)['body'] = 'b is never initialised (edited)'
+        got = self.fixable()
+        self.assertEqual((self.held(got), [f['id'] for f in got['fix']], got['autoPost']), ([('pr7-f1', 'edited')], ['pr7-f2'], False))
+
+    def test_a_deleted_inline_comment_is_held(self):
+        self.gh.inline = [c for c in self.gh.inline if c['id'] != self.root]
+        self.gh.threads = []
+        self.assertEqual(self.held(self.fixable()), [('pr7-f1', 'deleted')])
+
+    def test_an_edited_review_body_holds_the_finding_moved_into_it(self):
+        rid = self.review()['receipts']['review']['reviewId']
+        self.gh.reviews[rid]['body'] = self.gh.reviews[rid]['body'].replace('a shadows', 'a may shadow')
+        got = self.fixable()
+        self.assertEqual((self.held(got), [f['id'] for f in got['fix']], got['autoPost']), ([('pr7-f2', 'edited')], ['pr7-f1'], False))
+
+    def in_body(self):
+        out = self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--threads', str(self.snap()[0])])
+        return {f['id']: f.get('inBody', False) for f in out['open']}
+
+    def test_a_finding_is_in_the_body_only_while_the_pr_shows_that_body_as_posted(self):
+        self.assertEqual(self.in_body(), {'pr7-f1': False, 'pr7-f2': True}, 'the inline one has its thread, not a body line')
+        led = json.loads(Path(self.p['ledger']).read_text())
+        del led['reviews'][-1]['draft']['moved'][0]['renderedLine']
+        Path(self.p['ledger']).write_text(json.dumps(led))
+        self.assertEqual(self.in_body()['pr7-f2'], True, 'a draft saved before renderedLine is placed by its body too')
+        rid = self.review()['receipts']['review']['reviewId']
+        posted = self.gh.reviews[rid]['body']
+        self.gh.reviews[rid]['body'] = posted.replace('a shadows', 'a may shadow')
+        self.assertEqual(self.in_body()['pr7-f2'], False, 'an edited body no longer states it as we did')
+        self.gh.reviews[rid]['body'] = posted
+        del self.gh.reviews[rid]
+        self.assertEqual(self.in_body()['pr7-f2'], False, 'a body the PR no longer shows states nothing')
+
+    def test_a_contributor_reply_holds_the_finding_but_not_the_auto_recheck_and_a_bot_reply_holds_nothing(self):
+        self.gh.inline.append({'id': 950, 'in_reply_to_id': self.root, 'body': 'intentional', 'created_at': self.gh.tick(),
+                               'user': {'login': 'contrib'}})
+        self.gh.threads[0]['comments']['nodes'].append({'databaseId': 950})
+        got = self.fixable()
+        self.assertEqual((self.held(got), got['autoPost']), ([('pr7-f1', 'replied')], True))
+        self.gh.inline[-1]['user'] = {'login': 'bot[bot]', 'type': 'Bot'}
+        self.assertEqual(self.fixable()['held'], [])
+
+    def test_a_snapshot_missing_a_reply_or_the_thread_refuses_rather_than_hide_pushback(self):
+        self.gh.inline.append({'id': 950, 'in_reply_to_id': self.root, 'body': 'intentional', 'created_at': self.gh.tick(),
+                               'user': {'login': 'contrib'}})
+        self.gh.threads[0]['comments']['nodes'].append({'databaseId': 950})
+        for drop in ('reply', 'thread'):
+            snap, got = self.snap()
+            if drop == 'reply':
+                got['comments'] = [c for c in got['comments'] if c['id'] != 950]
+            else:
+                got['threads'] = []
+            snap.write_text(json.dumps(got))
+            with self.assertRaisesRegex(facts.Unusable, "does not hold pr7-f1's whole thread"):
+                self.show_fixable(snap)
+
+    def test_a_disputed_finding_with_edited_text_still_sends_the_recheck_to_the_human(self):
+        led = json.loads(Path(self.p['ledger']).read_text())
+        led['reviews'][-1]['findings'][0]['status'] = 'disputed'
+        Path(self.p['ledger']).write_text(json.dumps(led))
+        next(c for c in self.gh.inline if c['id'] == self.root)['body'] = 'edited'
+        got = self.fixable()
+        self.assertEqual((self.held(got), got['autoPost']), ([('pr7-f1', 'edited')], False))
+
+    def test_an_unsettled_publication_refuses_since_the_last_review_on_the_pr_is_unknown(self):
+        for status in ledger.ONLINE:
+            led = json.loads(Path(self.p['ledger']).read_text())
+            led['reviews'].append({**led['reviews'][-1], 'status': status, 'head': self.head})
+            Path(self.p['ledger']).write_text(json.dumps(led))
+            with self.assertRaisesRegex(facts.Unusable, f'a {status} publication .* is not settled'):
+                self.fixable()
+            led['reviews'].pop()
+            led['reviews'][-1]['answerPublications'] = [{'head': self.head, 'status': status, 'answers': [], 'receipts': {}}]
+            Path(self.p['ledger']).write_text(json.dumps(led))
+            with self.assertRaisesRegex(facts.Unusable, 'is not settled'):
+                self.fixable()
+            del led['reviews'][-1]['answerPublications']
+            Path(self.p['ledger']).write_text(json.dumps(led))
+
+    def test_a_disputed_or_unplaced_finding_is_held(self):
+        led = json.loads(Path(self.p['ledger']).read_text())
+        led['reviews'][-1]['findings'][0]['status'] = 'disputed'
+        led['reviews'][-1]['draft']['moved'] = []
+        Path(self.p['ledger']).write_text(json.dumps(led))
+        got = self.fixable()
+        self.assertEqual((self.held(got), got['autoPost']), ([('pr7-f1', 'disputed'), ('pr7-f2', 'unmapped')], False))
+
+    def carried(self, found, name='c'):
+        """A later review on a new head (a commit of src/core/<name>.c) carrying `found`, posted; the fixable view of it."""
+        self.commit(f'src/core/{name}.c', f'int {name};\n', name)
+        head = self.push_pr()
+        p = self.prepare()
+        self.assertEqual(p['mode'], 'incremental')
+        self.save(self.result_for(p, findings=found, draft={'event': 'REQUEST_CHANGES', 'body': 'Still open.', 'comments': [], 'replies': []},
+                                  verdict={'event': 'REQUEST_CHANGES', 'reasons': ['r']}))
+        self.head = head
+        self.assertEqual(self.post('--auto')['status'], 'posted')
+        return self.fixable(head)
+
+    def test_a_carried_finding_is_placed_by_the_review_that_published_it(self):
+        got = self.carried([{'id': 'pr7-f1', 'file': 'src/core/a.c', 'line': 21, 'why': 'b is never initialised', 'severity': 'high',
+                             'dimension': 'correctness', 'status': 'open'}])
+        self.assertEqual(([f['id'] for f in got['fix']], got['held']), (['pr7-f1'], []))
+
+    def group(self, change=None, muted=True):
+        """The setUp review as one defect led by its first finding, its second left out as the muted member (no text
+        of its own); muted=None leaves the key out, as a review saved before the flag does."""
+        led = json.loads(self.pristine)
+        rev = led['reviews'][-1]
+        rev['draft']['moved'] = []
+        for k, f in enumerate(rev['findings']):
+            f.update(defect=0, lead=k == 0)
+        if muted is None:
+            rev['findings'][1].pop('muted', None)
+        else:
+            rev['findings'][1]['muted'] = muted
+        if change:
+            change(rev)
+        Path(self.p['ledger']).write_text(json.dumps(led))
+        return self.fixable()
+
+    def outcome(self, got):
+        return [f['id'] for f in got['fix']], self.held(got), got['autoPost']
+
+    def test_a_muted_finding_is_held_grouped_and_does_not_hold_the_recheck(self):
+        got = self.group()
+        self.assertEqual(([f['id'] for f in got['fix']], got['held'], got['autoPost']),
+                         (['pr7-f1'], [{'findingId': 'pr7-f2', 'commentId': None, 'why': 'grouped'}], True))
+        self.assertEqual(self.outcome(self.group(lambda r: r['findings'].reverse())), (['pr7-f1'], [('pr7-f2', 'grouped')], True))
+
+    def test_an_unplaced_finding_not_muted_stays_unmapped_as_one_saved_before_the_flag(self):
+        for muted in (False, None):
+            with self.subTest(muted=muted):
+                self.assertEqual(self.outcome(self.group(muted=muted)), (['pr7-f1'], [('pr7-f2', 'unmapped')], False))
+
+    def test_a_muted_finding_with_text_of_its_own_on_the_pr_is_judged_by_it(self):
+        self.assertEqual(self.outcome(self.group(lambda r: r['draft'].update(moved=json.loads(self.pristine)['reviews'][-1]['draft']['moved']))),
+                         (['pr7-f1', 'pr7-f2'], [], True))
+
+    def test_a_contested_lead_no_longer_states_its_group(self):
+        # The recheck may withdraw a disputed or replied lead and judge its muted mate without the lead's thread.
+        self.assertEqual(self.outcome(self.group(lambda r: r['findings'][0].update(status='disputed'))),
+                         ([], [('pr7-f1', 'disputed'), ('pr7-f2', 'unmapped')], False))
+        self.gh.inline.append({'id': 950, 'in_reply_to_id': self.root, 'body': 'intentional', 'created_at': self.gh.tick(),
+                               'user': {'login': 'contrib'}})
+        self.gh.threads[0]['comments']['nodes'].append({'databaseId': 950})
+        self.assertEqual(self.outcome(self.group()), ([], [('pr7-f1', 'replied'), ('pr7-f2', 'unmapped')], False))
+
+    def test_a_muted_finding_whose_group_text_no_longer_stands_is_unmapped(self):
+        self.assertEqual(self.outcome(self.group(lambda r: r['findings'][0].update(defect=1))), (['pr7-f1'], [('pr7-f2', 'unmapped')], False),
+                         'a lead of another defect does not state it')
+        # The lead's text edited or deleted on the PR, or deleted from the pending review before the human submitted it.
+        next(c for c in self.gh.inline if c['id'] == self.root)['body'] = 'edited'
+        self.assertEqual(self.outcome(self.group()), ([], [('pr7-f1', 'edited'), ('pr7-f2', 'unmapped')], False))
+        self.gh.inline = [c for c in self.gh.inline if c['id'] != self.root]
+        self.gh.threads = []
+        self.assertEqual(self.outcome(self.group()), ([], [('pr7-f1', 'deleted'), ('pr7-f2', 'unmapped')], False))
+        self.assertEqual(self.outcome(self.group(lambda r: r['findings'][0].update(status='dropped'))), ([], [('pr7-f2', 'unmapped')], False))
+
+    def test_a_lead_saved_without_the_flag_or_a_mate_posted_beside_its_group_does_not_state_it(self):
+        self.assertEqual(self.outcome(self.group(lambda r: r['findings'][0].pop('lead'))), (['pr7-f1'], [('pr7-f2', 'unmapped')], False))
+
+        def beside(r):
+            # The lead dropped; pr7-f1's comment, still standing, is that of a mate posted beside its group.
+            r['findings'].append({**r['findings'][0], 'id': 'pr7-f3', 'commentId': None, 'status': 'dropped'})
+            r['findings'][0]['lead'] = False
+        self.assertEqual(self.outcome(self.group(beside)), (['pr7-f1'], [('pr7-f2', 'unmapped')], False))
+
+    def bot_claim(self, resolved=False):
+        """A bot's inline comment 900, on its own thread, claiming the group's defect; the change adding its claim."""
+        self.gh.inline.append({'id': 900, 'path': 'src/core/a.c', 'line': 1, 'body': 'a shadows a global', 'created_at': self.gh.tick(),
+                               'user': {'login': 'bot[bot]', 'type': 'Bot'}})
+        self.gh.threads.append({'id': 'T900', 'isResolved': resolved, 'isOutdated': False, 'comments': {'nodes': [{'databaseId': 900}]}})
+
+        def claimed(r):
+            r['findings'][0]['status'] = 'dropped'
+            r['claims'] = [{'commentId': 900, 'author': 'bot[bot]', 'claim': 'a shadows a global', 'verdict': 'confirmed',
+                            'severity': 'medium', 'defect': 0}]
+        return claimed
+
+    def test_a_thread_claim_of_the_group_states_a_muted_finding_whose_lead_text_is_gone(self):
+        self.assertEqual(self.outcome(self.group(self.bot_claim())), ([], [('pr7-f2', 'grouped')], True))
+
+    def test_a_claim_led_group_holds_every_muted_finding_grouped_while_its_comment_is_listed(self):
+        claimed = self.bot_claim()
+
+        def led_by_claim(r):
+            claimed(r)
+            r['findings'][0].update(status='open', muted=True, commentId=None)
+        self.assertEqual(self.outcome(self.group(led_by_claim)), ([], [('pr7-f1', 'grouped'), ('pr7-f2', 'grouped')], True))
+        self.gh.inline = [c for c in self.gh.inline if c['id'] != 900]
+        self.gh.threads = [t for t in self.gh.threads if t['id'] != 'T900']
+        self.assertEqual(self.outcome(self.group(led_by_claim)), ([], [('pr7-f1', 'unmapped'), ('pr7-f2', 'unmapped')], False))
+
+    def test_a_claim_on_a_resolved_thread_still_states_its_group(self):
+        self.assertEqual(self.outcome(self.group(self.bot_claim(resolved=True))), ([], [('pr7-f2', 'grouped')], True))
+
+    def test_a_claim_whose_comment_is_gone_from_the_pr_no_longer_states_its_group(self):
+        claimed = self.bot_claim()
+        self.gh.inline = [c for c in self.gh.inline if c['id'] != 900]
+        self.gh.threads = [t for t in self.gh.threads if t['id'] != 'T900']
+        self.assertEqual(self.outcome(self.group(claimed)), ([], [('pr7-f2', 'unmapped')], False))
+
+    def test_a_carried_finding_the_latest_review_no_longer_mutes_is_unmapped(self):
+        lead = {'id': 'pr7-f1', 'file': 'src/core/a.c', 'line': 21, 'why': 'b is never initialised', 'severity': 'high',
+                'dimension': 'correctness', 'status': 'open', 'defect': 0, 'muted': False, 'lead': True}
+        mate = {'file': 'src/core/c.c', 'line': 1, 'why': 'b is never initialised, seen from c', 'severity': 'high',
+                'dimension': 'concurrency', 'status': 'open', 'defect': 0, 'muted': True, 'lead': False}
+        self.assertEqual(self.outcome(self.carried([lead, mate])), (['pr7-f1'], [('pr7-f3', 'grouped')], True))
+        self.assertEqual(self.outcome(self.carried([lead, {**mate, 'id': 'pr7-f3', 'defect': None, 'muted': False}], 'd')),
+                         (['pr7-f1'], [('pr7-f3', 'unmapped')], False), 'the saved record keeps no stale muted')
+
+    def test_a_carried_finding_the_human_edited_before_submitting_offers_the_published_text(self):
+        # The state post.submitted leaves when the human edited the pending comment before submitting it.
+        edited = 'b is initialised only on the error path'
+        next(c for c in self.gh.inline if c['id'] == self.root)['body'] = edited
+        led = json.loads(Path(self.p['ledger']).read_text())
+        led['reviews'][-1]['findings'][0]['published'] = edited
+        Path(self.p['ledger']).write_text(json.dumps(led))
+        self.commit('src/core/c.c', 'int c;\n', 'c')
+        head = self.push_pr()
+        p = self.prepare()
+        carried = [{'id': 'pr7-f1', 'file': 'src/core/a.c', 'line': 21, 'why': 'b is never initialised', 'severity': 'high',
+                    'dimension': 'correctness', 'status': 'open'}]
+        self.save(self.result_for(p, findings=carried, draft={'event': 'REQUEST_CHANGES', 'body': 'Still open.', 'comments': [], 'replies': []},
+                                  verdict={'event': 'REQUEST_CHANGES', 'reasons': ['r']}))
+        self.head = head
+        self.assertEqual(self.post('--auto')['status'], 'posted')
+        got = self.fixable(head)
+        row = next(f for f in got['fix'] if f['id'] == 'pr7-f1')
+        self.assertEqual((got['held'], row['why'], row.get('published')), ([], 'b is never initialised', edited))
+
+    def test_it_refuses_a_head_that_is_not_the_last_submitted_review(self):
+        with self.assertRaisesRegex(facts.Unusable, 'not one submitted on'):
+            self.fixable(self.base)
+        with self.assertRaisesRegex(facts.Unusable, '--fixable needs --threads and --head'):
+            self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--fixable'])
+
+
+class Repair(PostCase):
+    """post.py --fixed: once an auto-fix repair is pushed, a fix note and a resolve on each finding it fixed."""
+
+    def setUp(self):
+        super().setUp()
+        two = [{'file': 'src/core/a.c', 'line': 21, 'why': 'b is never initialised', 'severity': 'high', 'dimension': 'correctness', 'status': 'open'},
+               {'file': 'src/core/a.c', 'line': 1, 'why': 'a shadows a global', 'severity': 'medium', 'dimension': 'correctness', 'status': 'open'}]
+        draft = {'event': 'COMMENT', 'body': 'Summary.', 'replies': [],
+                 'comments': [{'path': 'src/core/a.c', 'line': 21, 'body': 'b is never initialised', 'finding': 0},
+                              {'path': 'src/core/a.c', 'line': 1, 'body': 'a shadows a global', 'finding': 1}]}
+        self.save(self.result_for(self.p, findings=two, draft=draft))
+        self.assertEqual(self.post('--auto')['status'], 'posted')
+        self.root = self.review()['findings'][0]['commentId']
+        self.reviewed = self.head
+        self.commit('src/core/a.c', 'int a;\n' * 20 + 'int b = 0;\n', 'fix')
+        self.fixed_head = self.push_pr()
+        self.evidence = self.tmp / 'fix-check.json'
+        self.evidence.write_text('{"verdict": "verified"}')
+
+    def row(self, fid='pr7-f1', **over):
+        f = next(f for f in self.review()['findings'] if f['id'] == fid)
+        return {'id': fid, 'claimDigest': ledger.digest(ledger.claim(f)), 'verdict': 'verified', 'checkedSha': self.fixed_head,
+                'note': 'b is now initialised.', 'evidence': str(self.evidence), **over}
+
+    def fixed(self, *rows, head=None):
+        m = self.tmp / 'fixed.json'
+        m.write_text(json.dumps({'reviewedHead': self.reviewed, 'findings': list(rows) or [self.row()]}))
+        return self.call(post, ['--pr', str(PR), '--repo', REPO, '--expected-head', head or self.fixed_head, '--fixed', str(m)])
+
+    def thread(self):
+        return next(t for t in self.gh.threads if t['comments']['nodes'][0]['databaseId'] == self.root)
+
+    def show(self, head=None):
+        snap = self.tmp / 'threads.json'
+        self.call(threads, ['--pr', str(PR), '--repo', REPO, '--out', str(snap)])
+        return self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--threads', str(snap), *(['--head', head] if head else [])])
+
+    def reply(self, author='contrib'):
+        self.gh.inline.append({'id': 950, 'in_reply_to_id': self.root, 'body': 'not fixed for me', 'created_at': self.gh.tick(),
+                               'user': {'login': author}})
+        self.thread()['comments']['nodes'].append({'databaseId': 950})
+
+    def test_a_long_note_is_posted_whole(self):
+        note = ' '.join(['word'] * 70)
+        self.assertEqual(self.fixed(self.row(note=note))['status'], 'repaired')
+        self.assertEqual(self.gh.notes, [(self.root, f'Fixed in {self.fixed_head[:12]}: {note}')])
+
+    def test_a_verified_repair_gets_one_note_and_its_resolve_and_no_review(self):
+        posts, submits = len(self.gh.posts), len(self.gh.submits)
+        out = self.fixed()
+        self.assertEqual(out['status'], 'repaired')
+        self.assertEqual(self.gh.notes, [(self.root, f'Fixed in {self.fixed_head[:12]}: b is now initialised.')])
+        self.assertTrue(self.thread()['isResolved'])
+        self.assertEqual((len(self.gh.posts), len(self.gh.submits)), (posts, submits), 'no review is created or submitted')
+        x = self.review()['repairs'][0]
+        self.assertEqual((x['state'], x['resolve'], x['head'], x['evidence']), ('published', 'resolved', self.fixed_head, str(self.evidence)))
+        mutations = len(self.gh.mutations)
+        self.assertEqual(self.fixed()['status'], 'repaired', 'a rerun returns the receipt')
+        self.assertEqual((len(self.gh.notes), len(self.gh.mutations)), (1, mutations), 'and sends nothing')
+        row = next(o for o in self.show()['open'] if o['id'] == 'pr7-f1')
+        self.assertEqual(row['repair'], {'head': self.fixed_head, 'state': 'published', 'resolved': True},
+                         'the recheck sees the note, so it drafts none')
+
+    def test_rows_no_fix_check_verified_on_this_head_refuse_before_anything_is_sent(self):
+        for over, why in (({'verdict': 'refuted'}, "not 'verified'"), ({'checkedSha': self.reviewed}, 'not the expected head'),
+                          ({'claimDigest': ''}, 'no claimDigest'), ({'evidence': str(self.tmp / 'nope')}, 'is not a file'),
+                          ({'note': 'two\nlines'}, 'not one nonempty line'), ({'note': '  '}, 'not one nonempty line')):
+            with self.assertRaisesRegex(facts.Unusable, why):
+                self.fixed(self.row(**over))
+        with self.assertRaisesRegex(facts.Unusable, 'twice'):
+            self.fixed(self.row(), self.row())
+        nameless = self.row()
+        del nameless['id']
+        for bad in (nameless, {**self.row(), 'id': ''}, {**self.row(), 'id': ['pr7-f1']}, {**self.row(), 'id': 1}):
+            with self.assertRaisesRegex(facts.Unusable, 'not an object with an id', msg=bad.get('id')):
+                self.fixed(self.row('pr7-f2'), bad)
+        out = self.fixed(self.row(checkedSha=self.reviewed), head=self.reviewed)
+        self.assertEqual([(r['state'], r['error']) for r in out['repairs']],
+                         [('skipped', f'the PR head moved to {self.fixed_head}; the repair was checked on {self.reviewed}')])
+        self.assertEqual(self.gh.notes, [])
+
+    def test_a_finding_in_the_body_with_a_changed_claim_or_pushback_is_skipped_and_the_rest_resolve(self):
+        self.reply()
+        out = self.fixed(self.row(), self.row('pr7-f2'))
+        self.assertEqual(out['status'], 'partial')
+        self.assertEqual([(r['findingId'], r['state'], r['error']) for r in out['repairs']],
+                         [('pr7-f1', 'skipped', 'replied'), ('pr7-f2', 'skipped', 'no thread: it stands in the review body')])
+        self.gh.inline = [c for c in self.gh.inline if c['id'] != 950]
+        self.thread()['comments']['nodes'].pop()
+        out = self.fixed(self.row(claimDigest='0' * 16))
+        self.assertEqual(out['repairs'][0]['error'], 'the claim changed since its fix check')
+        self.assertEqual(self.gh.notes, [])
+
+    def test_a_reply_landing_before_the_resolve_defers_it_and_stays_pushback_to_judge(self):
+        orig = self.gh.gh
+        def gh(argv, stdin=None):
+            got = orig(argv, stdin)
+            if argv[0] == 'api' and '--method' in argv and argv[argv.index('--method') + 2].endswith('/replies'):
+                self.reply()
+            return got
+        self.gh.gh = gh
+        out = self.fixed()
+        self.gh.gh = orig
+        self.assertEqual((out['repairs'][0]['state'], out['repairs'][0]['resolve'], out['repairs'][0]['error']),
+                         ('published', 'deferred', 'replied'))
+        self.assertFalse(self.thread()['isResolved'])
+        self.assertEqual(self.fixed()['repairs'][0]['resolve'], 'deferred', 'never resolved past that reply')
+        self.assertEqual(len(self.gh.notes), 1)
+        self.assertEqual([d['findingId'] for d in self.show(self.fixed_head)['disputes']], ['pr7-f1'],
+                         'our note does not count as an answer to the reply it was not sent against')
+
+    def test_a_note_whose_answer_was_lost_is_found_again_and_one_never_seen_is_never_sent_twice(self):
+        self.gh.note_fails = 'lost'
+        self.assertEqual(self.fixed()['status'], 'repaired')
+        self.assertEqual(len(self.gh.notes), 1)
+        self.setUp_second_finding_thread()
+        self.gh.note_fails = True
+        out = self.fixed(self.row('pr7-f3'))
+        self.assertEqual((out['repairs'][0]['state'], out['status']), ('uncertain', 'partial'))
+        self.gh.note_fails = None
+        self.assertEqual(self.fixed(self.row('pr7-f3'))['repairs'][0]['state'], 'uncertain')
+        self.assertEqual(len(self.gh.notes), 2, 'an unconfirmed note is reconciled by hand, never sent again')
+
+    def setUp_second_finding_thread(self):
+        """A third finding with its own thread, added to the posted review as if it had been posted with it."""
+        led = json.loads(Path(self.p['ledger']).read_text())
+        rev = led['reviews'][-1]
+        rev['findings'].append({**rev['findings'][0], 'id': 'pr7-f3', 'commentId': 777, 'why': 'c leaks'})
+        rev['receipts']['review']['commentIds'].append(777)
+        rev['draft']['comments'].append({'path': 'src/core/a.c', 'line': 21, 'body': 'c leaks', 'findingId': 'pr7-f3'})
+        Path(self.p['ledger']).write_text(json.dumps(led))
+        self.gh.inline.append({'id': 777, 'body': 'c leaks', 'path': 'src/core/a.c', 'line': 21, 'user': {'login': ME},
+                               'created_at': self.gh.tick(), 'pull_request_review_id': rev['receipts']['review']['reviewId']})
+        self.gh.threads.append({'id': 'T777', 'isResolved': False, 'isOutdated': False, 'comments': {'nodes': [{'databaseId': 777}]}})
+
+    def test_a_reopened_or_unconfirmed_resolve_is_held_never_resolved_again(self):
+        self.fixed()
+        self.thread()['isResolved'] = False
+        out = self.fixed()
+        self.assertEqual((out['repairs'][0]['state'], out['repairs'][0]['error']), ('held', 'reopened after it was resolved'))
+        self.assertFalse(self.thread()['isResolved'])
+        self.assertEqual(self.show()['heldThreads'], [{'findingId': 'pr7-f1', 'commentId': self.root, 'why': 'reopened after it was resolved'}])
+        led = json.loads(Path(self.p['ledger']).read_text())
+        led['reviews'][-1]['repairs'][0]['resolve'] = 'sent'
+        Path(self.p['ledger']).write_text(json.dumps(led))
+        self.assertEqual(self.fixed()['repairs'][0]['error'], 'resolve unconfirmed')
+
+    def after_note(self, act):
+        """Run act right after the fake GitHub takes a note."""
+        orig = self.gh.gh
+        def gh(argv, stdin=None):
+            got = orig(argv, stdin)
+            if argv[0] == 'api' and '--method' in argv and argv[argv.index('--method') + 2].endswith('/replies'):
+                act()
+            return got
+        self.gh.gh = gh
+
+    def test_a_push_after_one_note_stops_the_next_before_it_is_sent(self):
+        self.setUp_second_finding_thread()
+        self.after_note(lambda: setattr(self.gh, 'head', 'f' * 40))
+        out = self.fixed(self.row(), self.row('pr7-f3'))
+        self.assertEqual([(r['findingId'], r['resolve'], r['error']) for r in out['repairs']],
+                         [('pr7-f1', 'deferred', f"the PR head moved to {'f' * 40} since the repair"),
+                          ('pr7-f3', None, f"the PR head moved to {'f' * 40} since the repair")])
+        self.assertEqual(len(self.gh.notes), 1, 'the second note is never sent on a moved head')
+
+    def test_a_closed_or_merged_pr_takes_no_note_and_no_resolve(self):
+        for state in ('CLOSED', 'MERGED'):
+            self.gh.state = state
+            out = self.fixed()
+            self.assertEqual((out['status'], out['repairs'][0]['state'], out['repairs'][0]['error']),
+                             ('partial', 'skipped', f'the PR is {state.lower()}'))
+        self.assertEqual(self.gh.notes, [])
+        self.gh.state = 'OPEN'
+        self.setUp_second_finding_thread()
+        self.after_note(lambda: setattr(self.gh, 'state', 'MERGED'))
+        out = self.fixed(self.row(), self.row('pr7-f3'))
+        self.assertEqual([(r['findingId'], r['resolve'], r['error']) for r in out['repairs']],
+                         [('pr7-f1', 'deferred', 'the PR is merged'), ('pr7-f3', None, 'the PR is merged')])
+        self.assertEqual(len(self.gh.notes), 1, 'no note is sent once the PR is merged')
+        self.assertFalse(self.thread()['isResolved'])
+
+    def test_a_rerun_on_a_closed_pr_reads_back_a_note_left_sent_and_sends_and_resolves_nothing(self):
+        with mock.patch.object(post, 'settle_note', side_effect=RuntimeError('crash after the POST')):
+            with self.assertRaises(RuntimeError):
+                self.fixed()
+        self.assertEqual(self.review()['repairs'][0]['state'], 'sent')
+        self.gh.state = 'CLOSED'
+        mutations = len(self.gh.mutations)
+        out = self.fixed()
+        self.assertEqual([(r['state'], r['resolve'], r['error']) for r in out['repairs']], [('published', 'deferred', 'the PR is closed')])
+        self.assertEqual((len(self.gh.notes), len(self.gh.mutations)), (1, mutations), 'nothing sent, nothing resolved')
+        self.assertFalse(self.thread()['isResolved'])
+
+    def test_an_edited_repair_note_holds_its_thread_from_a_later_review_despite_an_older_answer(self):
+        self.reply(author=ME)  # an older verified answer of ours on the thread
+        led = json.loads(Path(self.p['ledger']).read_text())
+        led['reviews'][-1]['receipts']['staged'] = [{'kind': 'answer', 'findingId': 'pr7-f1', 'commentId': self.root, 'replyId': 950,
+                                                     'state': 'published', 'resolve': False}]
+        Path(self.p['ledger']).write_text(json.dumps(led))
+        self.after_note(lambda: setattr(self.gh, 'head', 'f' * 40))
+        self.fixed()
+        del self.gh.gh
+        self.gh.head = self.fixed_head
+        self.gh.inline[-1]['body'] = 'Correction: not actually fixed'
+        out = self.fixed()
+        self.assertEqual((out['repairs'][0]['resolve'], out['repairs'][0]['error']), ('deferred', 'our repair note was edited'))
+        sh(self.clone, 'git', 'fetch', '--quiet', 'origin', f'refs/pull/{PR}/head')
+        resolves = [{'findingId': 'pr7-f1', 'commentId': self.root}]
+        for reason in ('recheck', 'another full review'):
+            draft = {'event': 'COMMENT', 'body': reason, 'comments': [], 'replies': [], 'resolves': resolves}
+            self.save(self.result_for(self.p, head=self.fixed_head, findings=[{'id': 'pr7-f1', 'status': 'fixed'}], draft=draft), reason=reason)
+            self.call(post, ['--pr', str(PR), '--repo', REPO, '--expected-head', self.fixed_head, '--auto'])
+            self.assertEqual([(m['state'], m['error']) for m in self.review()['receipts']['resolved']], [('deferred', 'our repair note was edited')])
+        self.assertEqual(self.show()['heldThreads'], [{'findingId': 'pr7-f1', 'commentId': self.root, 'why': 'our repair note was edited'}])
+        self.assertFalse(self.thread()['isResolved'])
+
+    def test_a_note_deferred_on_one_head_resolves_on_another_only_for_the_same_claim(self):
+        self.after_note(lambda: setattr(self.gh, 'head', 'f' * 40))
+        self.assertEqual(self.fixed()['repairs'][0]['resolve'], 'deferred')
+        del self.gh.gh  # the head stays moved; a fix check on it comes next
+        out = self.fixed(self.row(checkedSha='f' * 40, claimDigest='0' * 16), head='f' * 40)
+        self.assertEqual((out['repairs'][0]['resolve'], out['repairs'][0]['error']), ('deferred', 'the claim changed since its fix check'))
+        self.assertFalse(self.thread()['isResolved'])
+        out = self.fixed(self.row(checkedSha='f' * 40), head='f' * 40)
+        self.assertEqual(out['status'], 'repaired')
+        self.assertEqual(self.review()['repairs'][0]['resolveCheck'], {'head': 'f' * 40, 'evidence': str(self.evidence)})
+
+    def test_a_root_edited_after_the_note_is_never_resolved(self):
+        self.after_note(lambda: next(c for c in self.gh.inline if c['id'] == self.root).update(body='b may be uninitialised'))
+        out = self.fixed()
+        self.assertEqual((out['status'], out['repairs'][0]['resolve'], out['repairs'][0]['error']), ('partial', 'deferred', 'edited'))
+        self.assertFalse(self.thread()['isResolved'])
+
+    def test_an_unconfirmed_note_is_shown_to_the_recheck_and_held(self):
+        self.gh.note_fails = True
+        self.fixed()
+        row = next(o for o in self.show()['open'] if o['id'] == 'pr7-f1')
+        self.assertEqual(row['repair'], {'head': self.fixed_head, 'state': 'uncertain', 'resolved': False})
+        self.assertEqual(self.show()['heldThreads'], [{'findingId': 'pr7-f1', 'commentId': self.root, 'why': 'repair note unconfirmed'}])
+
+    def test_a_finding_raised_again_after_its_repair_takes_its_new_comment_as_root_once_published(self):
+        self.fixed()
+        sh(self.clone, 'git', 'fetch', '--quiet', 'origin', f'refs/pull/{PR}/head')
+        draft = {'event': 'COMMENT', 'body': 'Again.', 'replies': [],
+                 'comments': [{'path': 'src/core/a.c', 'line': 21, 'body': '**high**: b is never initialised\n- The repair did not fix this.', 'finding': 0}]}
+        self.save(self.result_for(self.p, head=self.fixed_head, findings=[{'id': 'pr7-f1', 'status': 'open'}], draft=draft), reason='recheck')
+        self.call(post, ['--pr', str(PR), '--repo', REPO, '--expected-head', self.fixed_head, '--auto'])
+        f = self.review()['findings'][0]
+        self.assertNotEqual(f['commentId'], self.root, 'the new comment is its root')
+        row = next(o for o in self.show()['open'] if o['id'] == 'pr7-f1')
+        self.assertEqual((row['repair'], row['resolveDue']), (None, None), 'the old repair stays on the old root')
+        self.assertEqual(json.loads(Path(self.p['ledger']).read_text())['reviews'][-2]['repairs'][0]['commentId'], self.root)
+
+    def recheck(self, comments, replies=()):
+        """A recheck review of the repaired head, saved and submitted with its event."""
+        sh(self.clone, 'git', 'fetch', '--quiet', 'origin', f'refs/pull/{PR}/head')
+        draft = {'event': 'COMMENT', 'body': 'Again.', 'replies': list(replies), 'comments': comments}
+        self.save(self.result_for(self.p, head=self.fixed_head, findings=[{'id': 'pr7-f1', 'status': 'open'}], draft=draft), reason='recheck')
+        return self.call(post, ['--pr', str(PR), '--repo', REPO, '--expected-head', self.fixed_head, '--auto'])
+
+    def test_a_recheck_draft_saved_before_the_repair_note_never_repeats_it(self):
+        sh(self.clone, 'git', 'fetch', '--quiet', 'origin', f'refs/pull/{PR}/head')
+        draft = {'event': 'COMMENT', 'body': 'Fixed.', 'comments': [], 'replies': [{'commentId': self.root, 'body': 'Fixed in abc.', 'findingId': 'pr7-f1'}]}
+        self.save(self.result_for(self.p, head=self.fixed_head, findings=[{'id': 'pr7-f1', 'status': 'fixed'}], draft=draft), reason='recheck')
+        self.fixed()
+        self.assertEqual(self.call(post, ['--pr', str(PR), '--repo', REPO, '--expected-head', self.fixed_head, '--auto'])['status'], 'posted')
+        self.assertEqual((len(self.gh.notes), self.adds()), (1, []), 'only the repair note reaches the thread')
+
+    def upheld_raised_again(self, *flags):
+        """An auto-post whose recheck upholds the pushback on a repaired finding and raises it again on a new comment."""
+        self.fixed()
+        self.reply()
+        d = self.show(self.fixed_head)['disputes'][0]
+        self.assertEqual(d['rootCommentId'], self.root)
+        rec = {'key': d['key'], 'replies': d['replies'], 'judgedHead': self.fixed_head, 'threadsFile': str(self.tmp / 'threads.json'),
+               'state': 'upheld', 'reason': 'r', 'rootCommentId': d['rootCommentId'],
+               'answer': {'body': 'Still stands: b is read before it is set.', 'resolve': False}}
+        sh(self.clone, 'git', 'fetch', '--quiet', 'origin', f'refs/pull/{PR}/head')
+        draft = {'event': 'COMMENT', 'body': 'Again.', 'replies': [],
+                 'comments': [{'path': 'src/core/a.c', 'line': 21, 'body': '**high**: b is never initialised\n- The repair did not fix this.', 'finding': 0}]}
+        self.save(self.result_for(self.p, head=self.fixed_head, findings=[{'id': 'pr7-f1', 'status': 'upheld', 'disputes': [rec]}], draft=draft),
+                  reason='recheck')
+        out = self.call(post, ['--pr', str(PR), '--repo', REPO, '--expected-head', self.fixed_head, '--auto', *flags])
+        self.assertNotEqual(self.review()['findings'][0]['commentId'], self.root, 'the raised-again comment is its root now')
+        return out
+
+    def test_an_upheld_finding_raised_again_answers_its_pushback_on_the_thread_judged(self):
+        out = self.upheld_raised_again()
+        self.assertEqual([(e['commentId'], e['state']) for e in out['answers']['staged']], [(self.root, 'staged')],
+                         'the answer goes on the thread whose pushback it answers')
+
+    def test_a_deferred_answer_on_a_finding_raised_again_lists_the_thread_judged(self):
+        next(c for c in self.gh.inline if c['id'] == self.root)['html_url'] = 'https://x/root'
+        self.assertEqual(self.upheld_raised_again('--defer-answers')['answers'], {'status': 'deferred'})
+        shown = self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO])['answers']
+        self.assertEqual([(a['findingId'], a['commentId'], a['url']) for a in shown], [('pr7-f1', self.root, 'https://x/root')],
+                         'the answer awaiting the human names the thread post.py stages it on')
+
+    def test_a_raised_again_comment_keeps_the_claim_the_human_edited_and_reads_unedited(self):
+        next(c for c in self.gh.inline if c['id'] == self.root)['body'] = 'b may be uninitialised'
+        self.call(post, ['--pr', str(PR), '--repo', REPO, '--sync'])
+        led = json.loads(Path(self.p['ledger']).read_text())
+        led['reviews'][-1]['findings'][0]['published'] = 'b may be uninitialised'
+        Path(self.p['ledger']).write_text(json.dumps(led))
+        self.fixed(self.row())
+        body = 'b may be uninitialised\n- The repair did not fix this.'
+        self.recheck([{'path': 'src/core/a.c', 'line': 21, 'body': body, 'finding': 0}])
+        f = self.review()['findings'][0]
+        self.assertEqual(f['published'], body)
+        snap, _ = Fixable.snap(self)
+        self.assertIsNone(ledger.holder(json.loads(Path(self.p['ledger']).read_text()), json.loads(snap.read_text()))(f),
+                          'its new root reads as published')
+
+    def test_a_finding_raised_again_in_the_body_has_no_thread_and_keeps_its_old_repair(self):
+        self.fixed()
+        self.recheck([{'path': 'src/core/a.c', 'line': 1, 'body': '**high**: b is never initialised\n- The repair did not fix this.', 'finding': 0}])
+        self.assertIsNone(self.review()['findings'][0]['commentId'])
+        row = next(o for o in self.show()['open'] if o['id'] == 'pr7-f1')
+        self.assertEqual((row['commentId'], row['repair']), (None, None))
+        self.reviewed = self.fixed_head  # the recheck is now the review a repair answers
+        self.assertEqual(self.fixed()['repairs'][0]['error'], 'no thread: it stands in the review body')
+
+    def test_a_finding_raised_again_off_the_diff_holds_auto_post_for_its_dropped_lines(self):
+        self.fixed()
+        body = '**high**: b is uninitialised.\n- Only when mode is enabled.\n- The repair in cccccccccccc did not fix this; its earlier thread was resolved.'
+        submits = list(self.gh.submits)
+        out = self.recheck([{'path': 'src/core/a.c', 'line': 1, 'body': body, 'finding': 0, 'firstLineUnchecked': True}])
+        self.assertRegex(out['handedOver'], r'first line no check verified \(src/core/a\.c:1\)')
+        self.assertEqual((self.review()['status'], self.gh.submits), ('drafted', submits), 'pending for the human, never submitted')
+
+    def test_a_saved_draft_never_resolves_a_repaired_thread_reopened_since(self):
+        self.fixed()
+        sh(self.clone, 'git', 'fetch', '--quiet', 'origin', f'refs/pull/{PR}/head')
+        draft = {'event': 'COMMENT', 'body': 'Fixed.', 'comments': [], 'replies': [], 'resolves': [{'findingId': 'pr7-f1', 'commentId': self.root}]}
+        self.save(self.result_for(self.p, head=self.fixed_head, findings=[{'id': 'pr7-f1', 'status': 'fixed'}], draft=draft), reason='recheck')
+        self.thread()['isResolved'] = False
+        resolves = len([m for m in self.gh.mutations if 'resolveReviewThread' in m['query']])
+        self.assertEqual(self.call(post, ['--pr', str(PR), '--repo', REPO, '--expected-head', self.fixed_head, '--auto'])['status'], 'posted')
+        self.assertEqual(len([m for m in self.gh.mutations if 'resolveReviewThread' in m['query']]), resolves)
+        self.assertEqual([(m['state'], m['error']) for m in self.review()['receipts']['resolved']], [('deferred', 'reopened after it was resolved')])
+        self.assertFalse(self.thread()['isResolved'])
+
+    def test_a_pending_review_of_ours_blocks_a_new_note_only(self):
+        self.gh.reviews[1] = {'id': 1, 'body': 'by hand', 'state': 'PENDING', 'user': {'login': ME}}
+        self.assertEqual(self.fixed()['repairs'][0]['error'], 'a pending review of ours is open on the PR')
+        self.assertEqual(self.gh.notes, [])
+
+    def test_a_repaired_note_counts_as_replied_once_a_later_review_finds_it_fixed(self):
+        orig = self.gh.gh
+        def gh(argv, stdin=None):
+            got = orig(argv, stdin)
+            if argv[0] == 'api' and '--method' in argv and argv[argv.index('--method') + 2].endswith('/replies'):
+                self.reply(author='bot[bot]')
+                self.gh.inline[-1]['user']['type'] = 'Bot'
+            return got
+        self.gh.gh = gh
+        self.assertEqual(self.fixed()['status'], 'repaired', 'a bot reply is no pushback')
+        self.gh.gh = orig
+        self.assertEqual(self.review()['repairs'][0]['replyId'] in ledger.answered_ids(json.loads(Path(self.p['ledger']).read_text())), True)
 
 
 if __name__ == '__main__':

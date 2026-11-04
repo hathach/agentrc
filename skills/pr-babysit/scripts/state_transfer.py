@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Hand pr-babysit a saved state in a form no model can "correct" on the way.
 
-  state_transfer.py FILE [--chunks I,J,...] [--pad]
+  state_transfer.py FILE [--chunks I,J,...] [--pad] [--raw]
 
 FILE is a saved Workflow output holding {"result": {"state": ...}}. The state
 is serialized as compact ASCII JSON (every non-ASCII character escaped), cut
@@ -12,11 +12,17 @@ copy error, while the state's own seal stays the check on the whole. --pad
 encodes each slice behind one PAD byte: every base64 group then carries other
 bytes, so a chunk a model mis-copies the same way every time reads differently.
 
+--raw takes FILE's bytes as the payload itself, ASCII up to MAX_RAW bytes,
+such as ledger.py show --snapshot writes; digest is then the payload's fnv1a,
+which the workflow checks on the reassembled whole, and parsing it is the
+reader's.
+
 stdout ends with one JSON line {v, digest, length, size, pad, chunks: [{i, data,
 sum}]}: the first PER_CALL chunks, or those --chunks names, at most PER_CALL;
 a model copying more mangles or truncates them. Exit 0 with that line; exit 2
 with {"error": ...} when FILE holds no state, the state exceeds MAX bytes or
-the arguments are wrong. Never writes.
+the arguments are wrong, and, under --raw, when FILE is not ASCII or exceeds
+MAX_RAW. Never writes.
 """
 
 import base64
@@ -31,6 +37,7 @@ VERSION = 1
 SIZE = 512
 PER_CALL = 4
 MAX = 64 * 1024
+MAX_RAW = 256 * 1024  # a refusal limit, not a cut: at 4 chunks a call, about 128 relay calls a load
 PAD = b' '
 
 
@@ -51,6 +58,18 @@ def load(path):
     return state
 
 
+def load_raw(path):
+    try:
+        payload = Path(path).read_bytes()
+    except OSError as e:
+        raise Unusable(f'cannot read {path}: {e.strerror}')
+    if len(payload) > MAX_RAW:
+        raise Unusable(f'{path} too large: {len(payload)} bytes (max {MAX_RAW})')
+    if not payload.isascii():
+        raise Unusable(f'{path} is not ASCII')
+    return payload
+
+
 def wanted(spec, count):
     try:
         ids = [int(x) for x in spec.split(',')]
@@ -68,18 +87,24 @@ def collect(argv):
     p.add_argument('file')
     p.add_argument('--chunks')
     p.add_argument('--pad', action='store_true')
+    p.add_argument('--raw', action='store_true')
     a = p.parse_args(argv)
-    state = load(a.file)
-    payload = json.dumps(state, ensure_ascii=True, separators=(',', ':')).encode('ascii')
-    if len(payload) > MAX:
-        raise Unusable(f'state too large: {len(payload)} bytes (max {MAX})')
+    if a.raw:
+        payload = load_raw(a.file)
+        sealed = fnv1a(payload.decode('ascii'))
+    else:
+        state = load(a.file)
+        payload = json.dumps(state, ensure_ascii=True, separators=(',', ':')).encode('ascii')
+        if len(payload) > MAX:
+            raise Unusable(f'state too large: {len(payload)} bytes (max {MAX})')
+        sealed = state['digest']
     count = -(-len(payload) // SIZE)
     ids = wanted(a.chunks, count) if a.chunks is not None else range(min(count, PER_CALL))
     chunks = []
     for i in ids:
         data = base64.b64encode((PAD if a.pad else b'') + payload[i * SIZE:(i + 1) * SIZE]).decode('ascii')
         chunks.append({'i': i, 'data': data, 'sum': fnv1a(data)})
-    return {'v': VERSION, 'digest': state['digest'], 'length': len(payload), 'size': SIZE, 'pad': a.pad, 'chunks': chunks}
+    return {'v': VERSION, 'digest': sealed, 'length': len(payload), 'size': SIZE, 'pad': a.pad, 'chunks': chunks}
 
 
 if __name__ == '__main__':
