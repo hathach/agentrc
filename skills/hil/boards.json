@@ -146,19 +146,6 @@
     "000778170924": {
       "name": "stm32f769disco",
       "flasher": {"name": "jlink", "args": "-device stm32f769ni"}
-    },
-    "0673FF575051717867034946": {
-      "name": "stm32l412nucleo",
-      "flasher": {"name": "stlink"}
-    },
-    "0670FF515448787067122222": {
-      "name": "stm32f746disco",
-      "flasher": {"name": "stlink"}
-    },
-    "728973776": {
-      "name": "lpcxpresso43s67",
-      "flasher": {"name": "jlink", "args": "-device LPC43S67_M4"},
-      "flasher_recover": {"name": "openocd", "args": "-f interface/jlink.cfg -c \"transport select swd\" -f target/lpc4357.cfg -c \"adapter speed 4000\"", "verify": false}
     }
   }
 }
