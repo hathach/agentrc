@@ -43,12 +43,13 @@ fails there joins failed and is rerun on HEAD in turn, the hooks running again
 while every new failure is excused, and a failed run that names no hook adds the
 failure `(pre-commit)`. An alias only a remote repository's own manifest
 declares is not seen, so such a hook may go unrun on the change until CI.
-pre-commit runs with core.abbrev pinned (#377), which the hooks' own git
-commands inherit.
+pre-commit runs with core.abbrev pinned at the length HEAD abbreviates to
+when the first run starts (#377), which the hooks' own git commands inherit.
 Exit 0 with that line; exit 2 with {"error": ...} when the facts cannot be
 collected or pre-commit's output contradicts its exit status.
 """
 
+import functools
 import json
 import os
 import re
@@ -199,15 +200,24 @@ def kill_tree(proc):
             pass
 
 
-def pinned_abbrev(env):
-    """env with core.abbrev at full length. pre-commit decides a hook modified files by comparing `git diff` text
-    before and after it; a hook that rewrites a file unchanged can lengthen the unstaged diff's abbreviated `index`
-    hashes at the object store's abbrev boundary, and that alone failed it (#377)."""
+@functools.cache
+def abbrev_length():
+    """The length HEAD abbreviates to in the checkout, measured at the first run, before any hook writes an object."""
+    return len(git('rev-parse', '--short', 'HEAD').strip())
+
+
+def pinned_abbrev(env, length):
+    """env with core.abbrev at length. pre-commit decides a hook modified files by comparing `git diff` text before
+    and after it; git's automatic length follows the packed object count, so a hook that adds a pack mid-run can
+    lengthen the unstaged diff's abbreviated `index` hashes at the count's boundary, and that alone failed it (#377).
+    Any fixed length skips that count (object-name.c, find_unique_abbrev_r); the checkout's own gives the hooks' git
+    commands the abbreviations a commit's hooks get."""
     count = env.get('GIT_CONFIG_COUNT') or '0'
     if not count.isdigit():
         raise Unusable(f'GIT_CONFIG_COUNT is {count!r}, not a count')
     n = int(count)
-    return {**env, 'GIT_CONFIG_COUNT': str(n + 1), f'GIT_CONFIG_KEY_{n}': 'core.abbrev', f'GIT_CONFIG_VALUE_{n}': '40'}
+    return {**env, 'GIT_CONFIG_COUNT': str(n + 1), f'GIT_CONFIG_KEY_{n}': 'core.abbrev',
+            f'GIT_CONFIG_VALUE_{n}': str(length)}
 
 
 def other_repo_env(names=OTHER_REPO):
@@ -276,7 +286,7 @@ def bounded(argv, deadline, start, what, cwd=None, env=None):
 
 def pre_commit(paths, deadline, start, what, hook=None, cwd=None, skip=()):
     """(exit code, stdout) of one pre-commit run, skip added to the SKIP it inherits."""
-    env = pinned_abbrev(other_repo_env() if cwd else os.environ)
+    env = pinned_abbrev(other_repo_env() if cwd else os.environ, abbrev_length())
     if skip:
         env['SKIP'] = ','.join([*filter(None, env.get('SKIP', '').split(',')), *skip])
     try:

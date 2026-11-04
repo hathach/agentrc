@@ -50,7 +50,10 @@ SCRIPTS = {
     'same': 'cp b.txt b.tmp && mv b.tmp b.txt\n',
     # Rewrites its files on every run: the retry never settles it.
     'grow': 'for f; do echo more >> "$f"; done\n',
-    'abbrev': 'test "$(git config core.abbrev)" = 40 || { echo "core.abbrev is $(git config core.abbrev)"; exit 1; }\n',
+    'abbrev': 'test "$(git config core.abbrev)" = "$ABBREV" || { echo "core.abbrev is $(git config core.abbrev)"; exit 1; }\n',
+    # Adds a one-object pack, as a hook running git gc or fetch may: git's automatic abbrev follows the packed count.
+    'packer': 'echo "packer $$ $(date +%s%N)" | git hash-object -w --stdin '
+              '| git pack-objects -q "$(git rev-parse --git-path objects/pack/pack)" >/dev/null\n',
     # Fails everywhere and leaves a file behind; the next one fails wherever that file is.
     'litter': 'echo litter > litter.txt; echo "no compiler"; exit 1\n',
     'nolitter': 'test ! -e litter.txt || { echo "found litter.txt"; exit 1; }\n',
@@ -122,6 +125,10 @@ class HooksTest(unittest.TestCase):
             (self.repo / '.pre-commit-config.yaml').write_text(CONFIG.format(''.join(HOOK.format(id=i) for i in ids)))
         self.git('add', '-A')
         self.git('commit', '-qm', 'base')
+
+    def abbrev(self):
+        """The length git abbreviates HEAD to here, unpinned."""
+        return len(self.git('rev-parse', '--short', 'HEAD').strip())
 
     def run_script(self, *paths, cwd=None, env=None):
         done = subprocess.run([sys.executable, str(SCRIPT), *paths], cwd=cwd or self.repo,
@@ -444,14 +451,31 @@ class HooksTest(unittest.TestCase):
         self.assertEqual(out['notRerun'], [{'hook': 'grow', 'why': 'it modified files'}])
         self.assertEqual(len(self.worktrees()), 1)
 
-    def test_hooks_run_with_full_length_abbrev_and_a_same_content_rewrite_passes(self):
+    def test_hooks_run_with_the_checkouts_abbrev_and_a_same_content_rewrite_passes(self):
         # pre-commit compares `git diff` text around each hook; a stat-only rewrite once lengthened the
-        # unstaged diff's abbreviated index hashes and failed it (#377). Reproducing that takes an object store
-        # at the abbrev boundary: abbrev guards the pin itself, and same shows such a rewrite is not a modification.
+        # unstaged diff's abbreviated index hashes and failed it (#377). abbrev checks the hooks get the length the
+        # checkout abbreviates to, not a full one, and same shows such a rewrite is not a modification.
         self.configure('same', 'abbrev')
         (self.repo / 'a.txt').write_text('edited\n')
-        code, out = self.run_script('a.txt', 'b.txt')
+        code, out = self.run_script('a.txt', 'b.txt', env={**self.env, 'ABBREV': str(self.abbrev())})
         self.assertEqual((code, out['passed'], out['modifiedBy'], out['failed']), (0, True, [], []))
+
+    def pack(self, count):
+        """Add count blobs in one pack: 16383 packed objects abbreviate to 7 hex digits, 16384 to 8."""
+        blobs = ''.join(f'blob\ndata {len(str(i)) + 1}\n{i}\n' for i in range(count))
+        subprocess.run(['git', 'fast-import', '--quiet'], input=blobs, cwd=self.repo, env=self.env, check=True,
+                       capture_output=True, text=True)
+
+    def test_a_hook_adding_a_pack_across_the_abbrev_boundary_is_no_modification(self):
+        # Unpinned, the pack packer adds lengthens the unstaged diff's index hashes and pre-commit reports it
+        # modified files (#377).
+        self.pack(16383)
+        self.configure('packer')
+        (self.repo / 'a.txt').write_text('edited\n')
+        self.assertEqual(self.abbrev(), 7)
+        code, out = self.run_script('a.txt')
+        self.assertEqual((code, out['passed'], out['modifiedBy'], out['failed']), (0, True, [], []))
+        self.assertEqual(self.abbrev(), 8, 'the pack crossed the boundary')
 
     def test_markers_a_hook_prints_are_not_read_as_pre_commits(self):
         self.configure('echo')
@@ -639,12 +663,12 @@ class KillTreeTest(unittest.TestCase):
 
 class PinnedAbbrevTest(unittest.TestCase):
     def test_appends_after_the_callers_own_config_entries(self):
-        env = hooks.pinned_abbrev({'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'core.abbrev', 'GIT_CONFIG_VALUE_0': '7'})
-        self.assertEqual((env['GIT_CONFIG_COUNT'], env['GIT_CONFIG_KEY_1'], env['GIT_CONFIG_VALUE_1']), ('2', 'core.abbrev', '40'))
+        env = hooks.pinned_abbrev({'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'core.abbrev', 'GIT_CONFIG_VALUE_0': '7'}, 9)
+        self.assertEqual((env['GIT_CONFIG_COUNT'], env['GIT_CONFIG_KEY_1'], env['GIT_CONFIG_VALUE_1']), ('2', 'core.abbrev', '9'))
         self.assertEqual(env['GIT_CONFIG_VALUE_0'], '7')
-        self.assertEqual(hooks.pinned_abbrev({})['GIT_CONFIG_KEY_0'], 'core.abbrev')
+        self.assertEqual(hooks.pinned_abbrev({}, 9)['GIT_CONFIG_KEY_0'], 'core.abbrev')
         with self.assertRaisesRegex(hooks.Unusable, 'not a count'):
-            hooks.pinned_abbrev({'GIT_CONFIG_COUNT': 'x'})
+            hooks.pinned_abbrev({'GIT_CONFIG_COUNT': 'x'}, 9)
 
 
 class OtherRepoEnvTest(unittest.TestCase):
