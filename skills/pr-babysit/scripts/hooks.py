@@ -98,12 +98,11 @@ C_ESCAPES = {b'a': b'\a', b'b': b'\b', b'f': b'\f', b'n': b'\n', b'r': b'\r', b'
 # What differs between two runs of the same failure: a number standing alone (a duration with its units, a line
 # number, a count, a pid, an address), an ISO 8601 time, a pytest-xdist worker's number, or a name tempfile, mktemp
 # or gcc made. Any other digit inside a word (usb2.c, E501) names a file, rule or symbol, so it stays. An
-# all-lowercase gcc name is masked only directly in a tmp or temp directory, as a source such as ccdriver.c reads alike.
+# all-lowercase gcc name (about 1 in 180) stays too, as a source such as ccdriver.c reads alike: it only fails safe.
 UNIT = r'(?:[hm]|min|sec|[mµun]?s)'
 VARYING = re.compile(r'\b\d{4}-\d\d-\d\dT\d\d:\d\d(?::\d\d(?:[.,]\d+)?)?Z?'
                      rf'|\b(?:0x[0-9a-fA-F]+|\d+(?:\.\d+)*(?:{UNIT}(?:\d+(?:\.\d+)?{UNIT})*)?)\b|(?<=\[gw)\d+(?=\])'
-                     r'|\btmp(?:\w{8}|\.[A-Za-z0-9]{10})\b|(?<=[/\\])cc(?![a-z]{6})[A-Za-z0-9]{6}(?=\.)'
-                     r'|(?i:(?<=[/\\]tmp[/\\])|(?<=[/\\]temp[/\\]))cc[a-z]{6}(?=\.)')
+                     r'|\btmp(?:\w{8}|\.[A-Za-z0-9]{10})\b|(?<=[/\\])cc(?![a-z]{6})[A-Za-z0-9]{6}(?=\.)')
 
 
 def status_paths(records):

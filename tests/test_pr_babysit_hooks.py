@@ -56,6 +56,8 @@ SCRIPTS = {
     'nolitter': 'test ! -e litter.txt || { echo "found litter.txt"; exit 1; }\n',
     # Names each violation: HEAD's old one and a new one the change adds read differently.
     'lint': 'grep -n bad "$@" && exit 1; exit 0\n',
+    # Names a violation in a tracked directory called temp, its source named as gcc names a temporary file.
+    'templint': 'grep -H bad ./src/temp/*.c; test $? -eq 1\n',
     # Prints where it runs as a native tool would (Git for Windows' sh says /tmp for %TEMP%): HEAD's tree and the
     # checkout must read alike.
     'where': 'echo "$(pwd -W 2>/dev/null || pwd)/a.txt: no compiler"; exit 1\n',
@@ -307,6 +309,20 @@ class HooksTest(unittest.TestCase):
         code, out = self.run_script('a.txt')
         self.assertEqual((code, out['passed']), (0, False))
         self.assertEqual(out['failed'], [{'hook': 'lint', 'error': '1:old bad typo'}])
+        self.assertEqual(out['baselineFailed'], [])
+
+    def test_a_new_violation_in_a_tracked_temp_directory_is_not_excused(self):
+        # HEAD fails on ccdriver.c, the change on ccsensor.c: a lowercase cc name in a temp directory is a source.
+        sources = self.repo / 'src' / 'temp'
+        sources.mkdir(parents=True)
+        (sources / 'ccdriver.c').write_text('bad\n')
+        (sources / 'ccsensor.c').write_text('good\n')
+        self.configure('templint')
+        (sources / 'ccdriver.c').write_text('good\n')
+        (sources / 'ccsensor.c').write_text('bad\n')
+        code, out = self.run_script('a.txt')
+        self.assertEqual((code, out['passed']), (0, False))
+        self.assertEqual(out['failed'], [{'hook': 'templint', 'error': './src/temp/ccsensor.c:bad'}])
         self.assertEqual(out['baselineFailed'], [])
 
     def test_where_a_hook_runs_is_read_alike_on_head_and_the_checkout(self):
@@ -856,6 +872,7 @@ class AsCheckoutTest(unittest.TestCase):
         for head, change in (('usb2.c:1: bad\n', 'cdc1.c:1: bad\n'), ('a.c:1: E501 bad\n', 'a.c:1: E502 bad\n'),
                              ('a.c:1: x1 unused\n', 'a.c:1: x2 unused\n'),
                              ('src/ccdriver.c: bad\n', 'src/ccsensor.c: bad\n'),
+                             ('./src/temp/ccdriver.c:bad\n', './src/temp/ccsensor.c:bad\n'),
                              ('gw1 unused\n', 'gw2 unused\n'),
                              ('a.c:1: v2m bad\n', 'a.c:1: v3m bad\n')):
             self.assertNotEqual(hooks.comparable(head, '/x'), hooks.comparable(change, '/x'), change)
@@ -869,8 +886,6 @@ class AsCheckoutTest(unittest.TestCase):
                              ('[gw0] linux -- Python 3.12.3 /usr/bin/python\n',
                               '[gw3] linux -- Python 3.12.3 /usr/bin/python\n'),
                              ('/tmp/ccAb12Cd.o: undefined reference\n', '/tmp/cco1y76V.o: undefined reference\n'),
-                             ('/tmp/ccabcdef.o: undefined reference\n', '/tmp/ccAb12Cd.o: undefined reference\n'),
-                             ('C:\\T\\Temp\\ccqwerty.o: undefined\n', 'C:\\T\\Temp\\cc3Xy7Zq.o: undefined\n'),
                              ('/tmp/tmp.Ab3dE5fG7h: denied\n', '/tmp/tmp.yiJuMi1EqI: denied\n')):
             self.assertEqual(hooks.comparable(head, '/x'), hooks.comparable(change, '/x'), change)
 
