@@ -390,13 +390,13 @@ guard denies its memory writes.
 ## Tests
 
 ```sh
-python -X utf8 -m unittest discover -s tests
+python -X utf8 -m pytest -n auto --dist worksteal -p no:cacheprovider -q tests
 ```
 
-Needs PyYAML. The pre-commit hook (`pre-commit install`) runs the same tests in parallel under
-pytest-xdist, `python -X utf8 -m pytest -n 8 --dist worksteal tests`, which keeps it well inside
-pr-babysit's 540 s hook deadline; CI runs them that way too, sharded across jobs
-(`.github/workflows/tests.yml`), and `--shard I/K` (`tests/conftest.py`) runs one part of it.
+Needs PyYAML, pytest and pytest-xdist; `BUILD.md` is the full contract. The pre-commit hook
+(`pre-commit install`) runs the same command with `-n 8`, well inside pr-babysit's 540 s hook
+deadline; CI shards it across jobs (`.github/workflows/tests.yml`), and `--shard I/K`
+(`tests/conftest.py`) runs one part of it.
 Where Git for Windows has `core.fsmonitor=true` (an installer option), each
 temporary test repository leaves a `git fsmonitor--daemon` behind; run the suite
 with `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0=false`.
