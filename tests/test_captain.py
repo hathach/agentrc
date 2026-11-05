@@ -845,6 +845,16 @@ class CollectTest(LedgerCase):
         rows = captain.reports()
         self.assertEqual([(r['msg'], r['state']) for r in rows], [(second, 'ready')])
 
+    def test_reports_lists_terminals_by_their_latest_report_newest_first(self):
+        self.terminals['t3'] = pinned('t3')
+        a, b = self.msg_of(self.ask('t2')), self.msg_of(self.ask('t3'))
+        self.report_as('t3', b)
+        self.report_as('t2', a)
+        self.assertEqual([r['msg'] for r in captain.reports()], [a, b])
+        c = self.msg_of(self.ask('t3'))
+        self.report_as('t3', c)
+        self.assertEqual([r['msg'] for r in captain.reports()], [c, a])
+
 
 class EnrollTest(LedgerCase):
     def test_idempotent(self):

@@ -904,15 +904,16 @@ def reports(msgs=()):
     member's id gives its latest report, `<id>:<N>` the one at ledger index N."""
     recs = records(lenient=True)
     requests = asked(recs)
-    answers = {r['msg']: r for r in recs if r['type'] == 'report'}   # a member's latest of many
     if msgs:
+        answers = {r['msg']: r for r in recs if r['type'] == 'report'}   # a member's latest of many
         return [indexed(m, requests, recs) if ':' in m else row(requests[m], answers[m]) if m in answers
                 else unanswered(m, requests, recs) for m in msgs]
-    latest = {}   # by ledger position, never the clock
-    for i, rec in enumerate(recs):
+    latest = {}   # by ledger position, never the clock: newest first
+    for rec in reversed(recs):
         if rec['type'] == 'report':
-            latest[requests[rec['msg']]['target']['address']] = (i, requests[rec['msg']], rec)
-    return [row(req, rep) for _, req, rep in sorted(latest.values(), key=lambda t: -t[0])]
+            req = requests[rec['msg']]
+            latest.setdefault(req['target']['address'], (req, rec))
+    return [row(req, rep) for req, rep in latest.values()]
 
 
 def asked(recs):
