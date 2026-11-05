@@ -920,11 +920,11 @@ def submodules():
         if m:
             state, commit, path = m.groups()
             if state in ' +':   # git appends ` (<describe>)` to these only; the path itself may hold spaces
-                path = re.sub(r' \([^)]*\)$', '', path)
+                path = re.sub(r' \([^ ]*\)$', '', path)
             dirty = False
-            if state != '-':
+            if state != '-':   # =dirty: nested worktrees are their own entries; a gitlink staged here still shows
                 dirty = bool(git('-C', path, 'status', '--porcelain', '--untracked-files=all',
-                                 '--ignore-submodules=all').strip())
+                                 '--ignore-submodules=dirty').strip())
             out.append({'path': path, 'commit': commit, 'state': state, 'dirty': dirty})
     return out
 

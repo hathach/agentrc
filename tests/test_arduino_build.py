@@ -1099,8 +1099,9 @@ class Core(Lib):
                 self.assertEqual(code, 2)
                 self.assertIn('libraries/USB is not initialised', out['error'])
 
-    def test_a_dirty_submodule_counts_whatever_its_ignore_setting(self):
-        """At any depth: an ignore=dirty at the top and one inside the submodule for its own nested one."""
+    def submodule_core(self):
+        """The core as a git checkout with libraries/USB a submodule holding its own `nested` one, both initialised;
+        returns a git runner on the same env as the engine's."""
         env = git_env(GIT_CONFIG_COUNT='1', GIT_CONFIG_KEY_0='protocol.file.allow', GIT_CONFIG_VALUE_0='always')
         environ = mock.patch.dict(os.environ, env, clear=True)   # the engine's own git runs inherit it
         environ.start()
@@ -1126,6 +1127,11 @@ class Core(Lib):
         git(self.root, 'add', '-A')
         git(self.root, 'commit', '-qm', 'core')
         git(self.root, 'submodule', '-q', 'update', '--init', '--recursive')
+        return git
+
+    def test_a_dirty_submodule_counts_whatever_its_ignore_setting(self):
+        """At any depth: an ignore=dirty at the top and one inside the submodule for its own nested one."""
+        git = self.submodule_core()
         git(self.root, 'config', 'submodule.libraries/USB.ignore', 'dirty')
         git(self.root / 'libraries/USB', 'config', 'submodule.nested.ignore', 'dirty')
         ident, _ = ab.source_identity()
@@ -1140,6 +1146,28 @@ class Core(Lib):
                 self.assertEqual(ab.submodule_problems(ident), [f'{path} has changes'])
                 self.assertIn(f'~~ {path}', ident['status'])
                 (self.root / edited).write_text(original)
+
+    def test_a_nested_gitlink_staged_inside_a_submodule_counts(self):
+        """Recursive status compares the nested one to the submodule's index, so only the submodule's own status
+        shows its gitlink moved, whatever either ignore setting says."""
+        git = self.submodule_core()
+        git(self.root, 'config', 'submodule.libraries/USB.ignore', 'dirty')
+        git(self.root / 'libraries/USB', 'config', 'submodule.nested.ignore', 'all')
+        nested = self.root / 'libraries/USB/nested'
+        (nested / 'header.h').write_text('// moved\n')
+        git(nested, 'commit', '-qam', 'moved')
+        git(self.root / 'libraries/USB', 'add', 'nested')
+        ident, _ = ab.source_identity()
+        self.assertEqual([s['state'] for s in ident['submodules']], [' ', ' '])
+        self.assertTrue(ident['dirty'])
+        self.assertEqual(ab.submodule_problems(ident), ['libraries/USB has changes'])
+
+    def test_a_describe_name_with_parentheses_is_not_part_of_the_path(self):
+        git = self.submodule_core()
+        git(self.root / 'libraries/USB', 'tag', 'v1(legacy)')
+        ident, _ = ab.source_identity()
+        self.assertEqual([s['path'] for s in ident['submodules']], ['libraries/USB', 'libraries/USB/nested'])
+        self.assertEqual((ident['dirty'], ab.submodule_problems(ident)), (False, []))
 
     def test_a_core_record_refuses_any_untracked_file(self):
         self.patch(ab, 'source_identity', lambda: ({'head': 'abc', 'dirty': True, 'diffSha256': 'd',
@@ -1187,7 +1215,7 @@ class Core(Lib):
                 {'path': 'libraries/Z', 'commit': '5b48867c', 'state': '-', 'dirty': False},
                 {'path': 'libraries/USB/lib/x', 'commit': '0123abcd', 'state': '+', 'dirty': False}])
         self.assertEqual([c.args for c in git.call_args_list], [('submodule', 'status', '--recursive')] + [
-            ('-C', d, 'status', '--porcelain', '--untracked-files=all', '--ignore-submodules=all')
+            ('-C', d, 'status', '--porcelain', '--untracked-files=all', '--ignore-submodules=dirty')
             for d in ('libraries/USB', 'libraries/USB/lib/x')])
 
     def test_a_submodule_path_keeps_its_spaces_and_parentheses(self):
