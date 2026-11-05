@@ -1991,6 +1991,36 @@ class WatchArmTest(WatchCase):
         self.assertTrue(self.ask().endswith('delivered'))
 
 
+class WatchesTest(WatchCase):
+    def test_lists_each_member_live_gone_or_unknown_with_its_latest_report(self):
+        self.terminals.update((t, pinned(t)) for t in ('t3', 't4', 't5'))
+        self.arm('all')
+        w = self.watch_id()
+        ids = {t: self.joined_as(t) for t in ('t2', 't3', 't4', 't5')}
+        self.report_as('t2', ids['t2'])
+        self.report_as('t2', ids['t2'])
+        n = len(captain.records()) - 1
+        del self.terminals['t3']
+        self.terminals['t4'] = {**pinned('t4'), 'session': None}
+        found = captain.find
+
+        def find(address):
+            if address == 't5':
+                raise captain.hc.Error('hc timed out')
+            return found(address)
+        with mock.patch.object(captain, 'find', find):
+            code, out = self.as_target(captain.watches, address='t1')
+        self.assertEqual(code, 0)
+        self.assertEqual(out.split('\n'), [f'{w}\tall\tcaptain t1 live',
+                                           f'  {ids["t2"]}\tsp · name · t2\tlive\t{ids["t2"]}:{n}',
+                                           f'  {ids["t3"]}\tsp · name · t3\tgone\tno report',
+                                           f'  {ids["t4"]}\tsp · name · t4\tunknown\tno report',
+                                           f'  {ids["t5"]}\tsp · name · t5\tunknown\tno report'])
+
+    def test_no_watch(self):
+        self.assertEqual(self.as_target(captain.watches, address='t1'), (0, 'no watch is open'))
+
+
 class WatchJoinTest(WatchCase):
     def test_a_covered_session_joins_once(self):
         self.arm('all')
