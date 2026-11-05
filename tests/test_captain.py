@@ -1920,7 +1920,8 @@ class WatchCase(LedgerCase):
         return self.as_target(captain.pending, address=address)
 
     def hook_as(self, address, event='Stop', **payload):
-        return self.as_target(captain.hook, {'hook_event_name': event, **payload}, address=address)[0]
+        payload = {'hook_event_name': event, 'session_id': self.terminals[address]['session'], **payload}
+        return self.as_target(captain.hook, payload, address=address)[0]
 
     def member(self, address):
         return [r for r in captain.records() if r['type'] == 'joined' and r['target']['address'] == address]
@@ -2189,6 +2190,38 @@ class WatchHookTest(WatchCase):
         out = json.loads(self.hook_as('t2', 'SessionStart', source='compact'))
         self.assertEqual(out['hookSpecificOutput']['hookEventName'], 'SessionStart')
         self.assertIn(self.member('t2')[0]['msg'], out['hookSpecificOutput']['additionalContext'])
+
+    def test_a_run_nested_in_a_session_is_not_that_session(self):
+        self.arm('all')
+        self.assertIsNone(self.hook_as('t2', session_id='s-nested'), 'a claude -p started from its Bash tool')
+        self.assertEqual(self.member('t2'), [])
+        self.assertIn('decision', self.hook_as('t2'))
+
+    def test_a_registry_stale_after_clear_waits_for_the_next_stop(self):
+        self.arm('all')
+        self.assertIsNone(self.hook_as('t2', 'SessionStart', source='clear', session_id='s-new'))
+        self.assertEqual(self.member('t2'), [])
+        self.terminals['t2'] = {**pinned('t2'), 'session': 's-new'}
+        self.assertIn('decision', self.hook_as('t2'))
+        self.assertEqual(self.member('t2')[0]['target']['session'], 's-new')
+
+    def test_the_session_is_pinned_outside_the_lock_and_a_held_lock_is_waited_for_briefly(self):
+        self.arm('all')
+        real = captain.me
+
+        def me():
+            with open(self.state / 'lock', 'a') as f:   # a second open file: it conflicts even within one process
+                captain.fcntl.flock(f, captain.fcntl.LOCK_EX | captain.fcntl.LOCK_NB)
+                captain.fcntl.flock(f, captain.fcntl.LOCK_UN)
+            return real()
+        with mock.patch.object(captain, 'me', me):
+            self.assertIn('decision', self.hook_as('t2'))
+        self.terminals['t3'] = pinned('t3')
+        with mock.patch.object(captain, 'HOOK_LOCK_S', 0), open(self.state / 'lock', 'a') as held:
+            captain.fcntl.flock(held, captain.fcntl.LOCK_EX)
+            with self.assertRaises(captain.Busy):   # the hook script exits 0 on it
+                self.hook_as('t3')
+        self.assertEqual(self.member('t3'), [])
 
     def test_a_session_that_cannot_be_pinned_is_left_alone(self):
         self.arm('all')

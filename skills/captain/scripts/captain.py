@@ -95,6 +95,8 @@ CLOSED = ('report', 'cancel', 'undelivered', 'outcome', 'withdraw', 'refused')
 RESULTS = ('completed', 'failed', 'rejected', 'needs-clarification')
 REPORT_MAX = 8192
 POLL_S = 2
+LOCK_POLL_S = 0.1
+HOOK_LOCK_S = 10   # well under the hook's 30 s timeout, which me() shares
 NO_ANSWER = 3
 SELECTORS = ('pr:', 'issue:', 'space:')
 SELECTOR = re.compile(r'(pr|issue):(?:([\w.-]+):([\w.-]+):)?(\d+)|space:(.+)')
@@ -250,15 +252,31 @@ def path(name):
     return os.path.join(STATE, name)
 
 
+class Busy(Exception):
+    """The ledger lock stayed held past a bounded wait."""
+
+
 @contextmanager
-def locked():
+def locked(wait_s=None):
     """Every ledger read that decides something and every append happen under this one lock, so two invocations
-    (the captain, or targets reporting) cannot both see a request open and both act on it."""
+    (the captain, or targets reporting) cannot both see a request open and both act on it. wait_s bounds the wait,
+    raising Busy once it lapses: `open`, `ask` and `relay` hold the lock for up to a minute."""
     if not fcntl:
         die('this script needs POSIX file locks', 2)
     os.makedirs(STATE, exist_ok=True)
     with open(path('lock'), 'a') as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
+        if wait_s is None:
+            fcntl.flock(f, fcntl.LOCK_EX)
+        else:
+            deadline = time.monotonic() + wait_s
+            while True:
+                try:
+                    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise Busy(f'the ledger lock stayed held for {wait_s:.0f} s') from None
+                    time.sleep(LOCK_POLL_S)
         yield
 
 
@@ -1392,11 +1410,16 @@ def hook(payload):
     """What a SessionStart (compact, clear) or Stop hook prints, or None: SessionStart joins or re-briefs a covered
     session; Stop joins one not yet a member and holds the stop once with the brief, the member record its loop
     guard, not stop_hook_active, which another Stop hook may have set. A session me() cannot pin, as at startup,
-    raises and is left to its first Stop."""
+    raises and is left to its first Stop, and one finding the lock held past HOOK_LOCK_S to its next. Only the
+    terminal's own session acts: a `claude -p` run from its Bash tool pins as that session but its payload names
+    another, as does a registry not yet updated after a /clear, which the next Stop joins."""
     if not marked():
         return None
-    with locked():
-        member, watch, new = join(me())
+    mine = me()   # hc calls: never under the lock
+    if payload.get('session_id') != mine['session']:
+        return None
+    with locked(HOOK_LOCK_S):
+        member, watch, new = join(mine)
     if not member:
         return None
     brief = watch_brief(member['msg'], watch['captain']['address'])
