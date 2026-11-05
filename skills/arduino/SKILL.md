@@ -131,4 +131,4 @@ changes from a library:
    HIL contracts.
 
 A core follows the same steps with its core-mode profile; its `agentrc_pin.py` copy also refuses engines without
-core mode (`arduino_build.cli_env` absent), since `PROFILE_API` stays 1 for it.
+core mode (`'core'` missing from `arduino_build.PROFILE_FEATURES`), since `PROFILE_API` stays 1 for it.
