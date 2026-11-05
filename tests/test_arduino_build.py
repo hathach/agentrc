@@ -1111,9 +1111,10 @@ class Core(Lib):
 
     def submodule_core(self):
         """The core as a git checkout with libraries/USB a submodule holding its own `nested` one, both initialised;
-        returns a git runner on the same env as the engine's."""
+        returns a git runner on the env the engine inherits, whose git drops GIT_CONFIG_COUNT (a local var): only the
+        runner's file:// clones need protocol.file.allow."""
         env = git_env(GIT_CONFIG_COUNT='1', GIT_CONFIG_KEY_0='protocol.file.allow', GIT_CONFIG_VALUE_0='always')
-        environ = mock.patch.dict(os.environ, env, clear=True)   # the engine's own git runs inherit it
+        environ = mock.patch.dict(os.environ, env, clear=True)
         environ.start()
         self.addCleanup(environ.stop)
 
@@ -1172,6 +1173,16 @@ class Core(Lib):
         self.assertTrue(ident['dirty'])
         self.assertEqual(ab.submodule_problems(ident), ['libraries/USB has changes'])
 
+    def test_a_callers_git_dir_does_not_hide_a_dirty_submodule(self):
+        """A hook's GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE aimed at the superproject would turn the per-submodule status
+        into the superproject's, where ignore=all hides the change."""
+        git = self.submodule_core()
+        git(self.root, 'config', 'submodule.libraries/USB.ignore', 'all')
+        (self.root / 'libraries/USB/library.properties').write_text('// edited\n')
+        with mock.patch.dict(os.environ, {'GIT_DIR': str(self.root / '.git'), 'GIT_WORK_TREE': str(self.root),
+                                          'GIT_INDEX_FILE': str(self.root / '.git/index')}):
+            self.assertIn('~~ libraries/USB\n', ab.worktree_status())
+
     def test_a_describe_name_with_parentheses_is_not_part_of_the_path(self):
         git = self.submodule_core()
         git(self.root / 'libraries/USB', 'tag', 'v1(legacy)')
@@ -1209,7 +1220,8 @@ class Core(Lib):
             self.assertEqual(ab.worktree_status(), '~+ libraries/USB\n~- libraries/Z\n')   # what admission compares
         listed = mock.Mock(returncode=0, stdout=' 3e5369cd libraries/USB (3.7.3)\n', stderr='')
         failed = mock.Mock(returncode=128, stdout='', stderr='fatal: not a git repository')
-        with mock.patch.object(ab.subprocess, 'run', side_effect=[listed, failed]), \
+        with mock.patch.object(ab, '_git_local_vars', return_value=frozenset()), \
+                mock.patch.object(ab.subprocess, 'run', side_effect=[listed, failed]), \
                 contextlib.redirect_stdout(io.StringIO()) as out, self.assertRaises(SystemExit) as e:
             ab.submodules()
         self.assertEqual(e.exception.code, 2)

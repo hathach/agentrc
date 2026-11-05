@@ -114,8 +114,18 @@ def fail(msg, **extra):
     sys.exit(2)
 
 
+@functools.cache
+def _git_local_vars():
+    names = subprocess.run(['git', 'rev-parse', '--local-env-vars'], capture_output=True, text=True).stdout.split()
+    if not names:
+        fail('git rev-parse --local-env-vars listed nothing: cannot keep a caller\'s GIT_* off the checkout')
+    return frozenset(names)
+
+
 def git(*args, check=True):
-    p = subprocess.run(['git', '-C', str(P.ROOT), *args], capture_output=True, text=True)
+    """git in the checkout, deaf to the GIT_* that would aim it elsewhere (a hook's GIT_DIR, GIT_INDEX_FILE...)."""
+    env = {k: v for k, v in os.environ.items() if k not in _git_local_vars()}
+    p = subprocess.run(['git', '-C', str(P.ROOT), *args], capture_output=True, text=True, env=env)
     if check and p.returncode:
         fail(f'git {" ".join(args)}: {p.stderr.strip()}')
     return p.stdout
