@@ -251,14 +251,42 @@ class UsageTest(unittest.TestCase):
 
     def test_a_window_missing_from_the_payload_shows_unknown_not_zero(self):
         cases = {'s37%/ w? F?': {'five_hour': {'utilization': 37}},
-                 's?/ w12% F?': {'limits': [{'kind': 'weekly_all', 'percent': 12}]},
+                 'w12%': {'limits': [{'kind': 'weekly_all', 'percent': 12}]},
+                 'w?': {'limits': [{'kind': 'weekly_all', 'percent': None}]},
                  's0%/ w0% F0%': {'five_hour': {'utilization': 0}, 'seven_day': {'utilization': 0},
                                   'seven_day_opus': {'utilization': 0}},
                  's?/ w? F?': {}}
         for shown, payload in cases.items():
             with self.subTest(payload=payload):
                 (self.cfg / 'statusline-usage.json').write_text(json.dumps(payload))
-                self.assertIn(' ' + shown, self.render())
+                shown_line = self.render()
+                self.assertIn(' ' + shown, shown_line)
+                self.assertNotIn('/ ' + shown, shown_line, 'a limit the account lacks shows nothing')
+
+    def test_the_session_reset_follows_the_session_and_the_inputs_wins(self):
+        cache_reset = datetime.datetime(2030, 2, 3, 9, 30).astimezone().isoformat()
+        five_hour = {'resets_at': datetime.datetime(2030, 1, 2, 12, 0).timestamp()}
+        for cache in ({'limits': [{'kind': 'session', 'percent': 79, 'resets_at': cache_reset},
+                                  {'kind': 'weekly_all', 'percent': 5}]},
+                      {'five_hour': {'utilization': 79, 'resets_at': cache_reset}, 'seven_day': {'utilization': 5}}):
+            with self.subTest(cache=cache):
+                (self.cfg / 'statusline-usage.json').write_text(json.dumps(cache))
+                self.assertIn(' s79% ↻Feb03 09:30/ w5%', self.render())
+                self.assertIn(' s79% ↻Jan02 12:00/ w5%',
+                              self.render(payload=json.dumps({'rate_limits': {'five_hour': five_hour}})))
+
+    def test_the_weekly_reset_keeps_its_precedence_and_needs_a_weekly_limit(self):
+        week, scoped = (datetime.datetime(2030, 2, d, 9, 30).astimezone().isoformat() for d in (3, 4))
+        (self.cfg / 'statusline-usage.json').write_text(json.dumps({
+            'limits': [{'kind': 'weekly_all', 'percent': 5}, {'kind': 'weekly_scoped', 'percent': 1, 'resets_at': scoped}],
+            'seven_day': {'resets_at': week}}))
+        self.assertIn(' w5% F1% ↻Feb03 09:30', self.render())
+        (self.cfg / 'statusline-usage.json').write_text(json.dumps({
+            'limits': [{'kind': 'session', 'percent': 20, 'resets_at': week}]}))
+        payload = {'rate_limits': {'seven_day': {'resets_at': datetime.datetime(2030, 1, 2, 12, 0).timestamp()}}}
+        shown = self.render(payload=json.dumps(payload))
+        self.assertIn(' s20% ↻Feb03 09:30', shown)
+        self.assertNotIn('Jan02', shown, 'no weekly limit shown, so no weekly reset')
 
     def test_crlf_line_ends_from_python_leave_empty_fields_empty(self):
         site = self.home / 'site'
@@ -274,9 +302,9 @@ class UsageTest(unittest.TestCase):
             'limits': [{'kind': 'weekly_all', 'percent': 55, 'resets_at': cache_reset}],
             'spend': {'enabled': True, 'used': {'amount_minor': 3154, 'exponent': 2}}}))
         (self.cfg / 'statusline-codex-usage.json').write_text(json.dumps({'percent': 97}))
-        self.assertIn(' s?/ w55% F? ↻Feb03 09:30 $31.54/ C97%', self.render())
+        self.assertIn(' w55% ↻Feb03 09:30 $31.54/ C97%', self.render())
         payload = {'rate_limits': {'seven_day': {'resets_at': datetime.datetime(2030, 1, 2, 12, 0).timestamp()}}}
-        self.assertIn(' w55% F? ↻Jan02 12:00 $31.54/ C97%', self.render(payload=json.dumps(payload)))
+        self.assertIn(' w55% ↻Jan02 12:00 $31.54/ C97%', self.render(payload=json.dumps(payload)))
 
     def test_malformed_input_or_caches_render_the_rest(self):
         (self.cfg / 'statusline-usage.json').write_text(json.dumps({'five_hour': {'utilization': 37}, 'spend': 'x'}))
