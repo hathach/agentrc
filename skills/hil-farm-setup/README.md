@@ -97,9 +97,7 @@ while a runner runs, and applies:
    S=/usr/local/src/agentrc/skills/hil-farm-setup/scripts/setup.sh
    ssh <admin>@<host> sudo $S runner tinyusb "$(gh api -X POST repos/hathach/tinyusb/actions/runners/registration-token --jq .token)"
    ssh <admin>@<host> sudo $S runner tinyuf2 "$(gh api -X POST repos/adafruit/tinyuf2/actions/runners/registration-token --jq .token)"
-   token=$(gh api -X POST repos/adafruit/Adafruit_TinyUSB_Arduino/actions/runners/registration-token --jq .token)
-   ssh <admin>@<host> sudo $S runner arduino-tinyusb "$token"
-   unset token
+   ssh <admin>@<host> sudo $S runner arduino-tinyusb "$(gh api -X POST repos/adafruit/Adafruit_TinyUSB_Arduino/actions/runners/registration-token --jq .token)"
    ```
 
    Registration leaves the unit disabled and stopped, so no job is scheduled yet, not even after a reboot.
@@ -156,58 +154,27 @@ The actions runner is installed once into each runner root and not updated this 
 
 ## Adding a runner to a host in service
 
-Commit the host file with exactly one new runner table; keep all existing settings unchanged. The new runner uses
-the installed runner package pin, shared device groups (`hil`, `dialout`, `plugdev`, `audio`), udev rules, pinned
-tools and `/tmp/tinyusb-hil-locks`. Addition changes the firewall's user set (and shared hosts' SSH deny list), creates
-only the new account, runner tree, environment, state directories, hook pair and unit, and gives the admin read
-access through the new runner's group. Existing registrations, accounts, hooks, units and job state stay untouched.
-It publishes the host file last and saves the previous one as `host.toml.prev`; retry the same command after a
-failure. It does not update tools or udev rules: deploy those separately with `update` first if needed.
+Commit the host file with exactly one new runner table; keep all existing settings unchanged. A runner with a sudo
+grant (`tinyusb`) comes only with `install`. The new runner uses the installed runner package pin, shared device groups
+(`hil`, `dialout`, `plugdev`, `audio`), udev rules, pinned tools and `/tmp/tinyusb-hil-locks`. Addition changes the
+firewall's user set (and shared hosts' SSH deny list), creates only the new account, runner tree, environment, hook
+pair and unit, and gives the admin read access through the new runner's group; registration makes its `_work`,
+`_diag` and state directories. Existing registrations, accounts, hooks, units and job state stay untouched. It
+publishes the host file last and saves the previous one as `host.toml.prev`; retry the same command after a failure.
+It does not update tools or udev rules: deploy those separately with `update` first if needed.
 
-For the third runner on ci.lan, after the reviewed commit is available, run on ci.lan as `hathach`:
-
-```sh
-sudo git -C /usr/local/src/agentrc fetch
-sudo git -C /usr/local/src/agentrc checkout --detach <commit>
-S=/usr/local/src/agentrc/skills/hil-farm-setup
-pgrep -x Runner.Worker
-```
-
-Continue only when `pgrep` exits 1. Stop both installed runners (and the new unit if a prior attempt created it),
-then add the new runner:
-
-```sh
-sudo systemctl stop hil-runner-tinyusb hil-runner-tinyuf2
-sudo $S/scripts/setup.sh add-runner arduino-tinyusb --host $S/hosts/ci.toml
-sudo /opt/hil-farm/verify.sh --maintenance
-```
-
-Setup refuses if any old or new unit is active, or any `Runner.Worker` remains; it never stops a job itself. A job
-assigned between the idle check and stop can be interrupted: inspect surviving processes and held boards before
-continuing. The new service stays disabled and unregistered. Before registration, use
-`sudo -u ghrunner-arduino-tinyusb` to check read/write access to its assigned `/dev/bus/usb`, tty, hidraw and USB block
-device nodes, the shared lock directory, and the pinned tools on its `.path`, with `farm.toml`'s environment.
-Use a fresh admin login for the new group membership. From the dev PC, register with a one-hour token:
-
-```sh
-S=/usr/local/src/agentrc/skills/hil-farm-setup/scripts/setup.sh
-token=$(gh api -X POST repos/adafruit/Adafruit_TinyUSB_Arduino/actions/runners/registration-token --jq .token)
-ssh hathach@ci.lan sudo $S runner arduino-tinyusb "$token"
-unset token
-```
-
-Registration also leaves the unit disabled. Run Arduino TinyUSB's offline HIL proof under its runner user, then on
-ci.lan:
-
-```sh
-sudo /opt/hil-farm/verify.sh --maintenance
-sudo systemctl start hil-runner-tinyusb hil-runner-tinyuf2
-sudo systemctl enable --now hil-runner-arduino-tinyusb
-sudo /opt/hil-farm/verify.sh
-```
-
-Verification reads the installed host file and checks all three runners. A green HIL workflow in
-`adafruit/Adafruit_TinyUSB_Arduino` then proves the new CI path.
+1. Move the root checkout to the reviewed commit, as for an update.
+2. When `pgrep -x Runner.Worker` exits 1, stop every installed runner unit (and the new one if a prior attempt
+   created it), then `sudo $S/scripts/setup.sh add-runner <runner> --host $S/hosts/<host>.toml` and
+   `sudo /opt/hil-farm/verify.sh --maintenance`. Setup refuses if any old or new unit is active, or any
+   `Runner.Worker` remains; it never stops a job itself. A job assigned between the idle check and the stop can be
+   interrupted: inspect surviving processes and held boards before continuing.
+3. Before registration, check as the new runner user (`sudo -u <user>`) read/write access to its boards'
+   `/dev/bus/usb`, tty, hidraw and USB block device nodes, the shared lock directory, and the pinned tools on its
+   `.path` with `farm.toml`'s environment. Use a fresh admin login for the new group membership.
+4. Register it as in Registration above; the unit stays disabled. Run the repository's offline hardware proof under
+   its runner user, `verify.sh --maintenance` again, restart the other runners, `systemctl enable --now` the new
+   unit, and run `verify.sh`, which checks every runner of the installed host file.
 
 Before a reinstall or update, sync with tinyusb: the `agentrc` tool's commit follows its `lib/agentrc` pin, and
 `scripts/udev/88-tinyusb.rules` is its file with the `adm` group as `hil` and without its catch-all hidraw rule, which

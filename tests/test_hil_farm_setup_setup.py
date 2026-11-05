@@ -230,9 +230,8 @@ class TestSetup(unittest.TestCase):
         self.assertEqual(self.host.with_name('host.toml.prev').read_bytes(), before)
         d = self.tmp / 'runners' / 'arduino-tinyusb'
         self.assertTrue((d / 'bin' / 'Runner.Listener').is_file())
-        self.assertTrue((d / '_work' / 'Adafruit_TinyUSB_Arduino' / 'hil-state').is_dir())
+        self.assertFalse((d / '_work').exists())   # registration makes the runner's dirs
         self.assertEqual(d.stat().st_mode & 0o7777, 0o1770)
-        self.assertEqual((d / '_diag').stat().st_mode & 0o777, 0o750)
         self.assertFalse((d / '.runner').exists())
         self.assertIn('PYTHONNOUSERSITE=1', (d / '.env').read_text())
         self.assertIn(f'ACTIONS_RUNNER_HOOK_JOB_STARTED={self.hooks}/job-started-arduino-tinyusb.sh',
@@ -252,8 +251,6 @@ class TestSetup(unittest.TestCase):
         self.assertIn('passwd -l ghrunner-arduino-tinyusb', calls)
         self.assertIn('usermod -aG ghrunner-arduino-tinyusb hathach', calls)
         self.assertIn('systemctl disable -q hil-runner-arduino-tinyusb', calls)
-        self.assertIn(f'install -d -m 0750 -o ghrunner-arduino-tinyusb -g ghrunner-arduino-tinyusb '
-                      f'{d}/_work {d}/_diag {d}/_work/Adafruit_TinyUSB_Arduino/hil-state', calls)
         self.assertFalse([c for c in calls if c.startswith(('systemctl start', 'systemctl stop', 'visudo'))])
         self.assertEqual([c for c in calls if c.startswith('systemctl enable')], ['systemctl enable -q nftables'])
         self.assertEqual((self.tmp / 'installed' / 'common.sh').read_bytes(), (self.dir / 'common.sh').read_bytes())
@@ -288,6 +285,14 @@ class TestSetup(unittest.TestCase):
         r = self.setup('add-runner', 'arduino-tinyusb', '--host', str(proposed))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assert_existing_untouched()
+
+    def test_addition_refuses_a_sudo_bearing_runner_before_any_change(self):
+        r = subprocess.run(['bash', '-c', '. "$1/setup.sh"; farm() { :; }; runner_conf() { RUNNER_SUDO=/usr/bin/x; }; '
+                            'setup_runner_user() { echo CHANGED; }; add_runner tinyusb', '_', str(self.dir)],
+                           capture_output=True, text=True, env=self.env(), timeout=60)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('needs sudo', r.stderr)
+        self.assertNotIn('CHANGED', r.stdout)
 
     def test_addition_refuses_a_missing_old_runner_before_creating_the_new_user(self):
         proposed = self.addition()

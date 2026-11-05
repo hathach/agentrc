@@ -386,28 +386,27 @@ add_runner() {  # NAME: the proposed host file differs only by this runner
   # The shared runner receipt must still match the pin, and no old runner may need installing.
   HIL_FARM_HOST='' farm verify actions-runner
   runner_conf "$1"
+  # setup_users writes the sudoers file whole; a sudo-bearing runner comes with install
+  [ -z "$RUNNER_SUDO" ] || die "$1 needs sudo ($RUNNER_SUDO): add it with setup.sh install"
   [ ! -e "$RUNNER_DIR/.runner" ] || die "$RUNNER_DIR is already registered"
   setup_runner_user "$1"
-  if [ -n "$RUNNER_SUDO" ]; then
-    local rule="$RUNNER_USER ALL=(root) NOPASSWD: $RUNNER_SUDO"
-    grep -qxF "$rule" /etc/sudoers.d/hil-farm || echo "$rule" >> /etc/sudoers.d/hil-farm
-    visudo -cq || die "sudoers check failed"
-  fi
   shared_host && setup_ssh
   setup_firewall
   farm install actions-runner
   runner_dirs_ok
-  install -d -m 0750 -o "$RUNNER_USER" -g "$RUNNER_USER" "$RUNNER_DIR/_work" "$RUNNER_DIR/_diag" \
-    ${RUNNER_STATE:+"$RUNNER_DIR/$RUNNER_STATE"}
   write_runner_env "$1"
-  chown root:"$RUNNER_USER" "$RUNNER_DIR"
-  chmod 1770 "$RUNNER_DIR"
+  runner_root_mode
   setup_runner_service "$1"
   systemctl disable -q "$RUNNER_UNIT" || die "cannot disable $RUNNER_UNIT"
   install_metadata
   # Publish last: a failed addition retries against the unchanged installed host.
   farm host-install "$HOST_FILE" --add-runner "$1"
   log "added $1, disabled; check access, then setup.sh runner $1 <token> and hardware proof (README)"
+}
+
+runner_root_mode() {  # root's, runner-group-writable and sticky: register_runner says why
+  chown root:"$RUNNER_USER" "$RUNNER_DIR"
+  chmod 1770 "$RUNNER_DIR"
 }
 
 register_runner() {  # NAME TOKEN, checked by the caller
@@ -445,8 +444,7 @@ register_runner() {  # NAME TOKEN, checked by the caller
   [ -f "$RUNNER_DIR/.runner" ] && [ ! -L "$RUNNER_DIR/.runner" ] || die "config.sh left no $RUNNER_DIR/.runner"
   find "$RUNNER_DIR" -maxdepth 1 -type f \( -name .runner -o -name '.credentials*' \) \
     -exec chown -h "$RUNNER_USER:$RUNNER_USER" {} + -exec chmod 0600 {} +
-  chown root:"$RUNNER_USER" "$RUNNER_DIR"
-  chmod 1770 "$RUNNER_DIR"
+  runner_root_mode
   log "registered; after hardware proof: systemctl enable --now $RUNNER_UNIT"
 }
 
