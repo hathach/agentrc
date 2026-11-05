@@ -321,6 +321,24 @@ class Prune(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in self.state.iterdir()),
                          ['2-1', '3-1', '4-1', '5-1', '7-1', '8-1', '9-1', 'notarun', 'outside'])
 
+    def test_a_dir_another_run_removed_is_skipped(self):
+        clean = {'kind': C.SUMMARY_KIND, 'termination': 'completed', 'boards': []}
+        gone, raced = self.run_dir('1-1', clean), self.run_dir('2-1', clean)
+        real_rmtree = shutil.rmtree
+
+        def loads(text):    # another run removes 1-1 between this run's summary read and its stat
+            if gone.exists():
+                real_rmtree(gone)
+            return clean
+
+        def rmtree_raced(path):     # and empties 2-1 under this run's rmtree
+            real_rmtree(path)
+            raise FileNotFoundError(path)
+        with mock.patch.object(C.json, 'loads', side_effect=loads), \
+                mock.patch.object(C.shutil, 'rmtree', side_effect=rmtree_raced):
+            removed = C.prune(self.state, 30, self.state / '9-1')
+        self.assertEqual((removed, raced.exists(), gone.exists()), ([], False, False))
+
 
 class Run(Checkout):
     def setUp(self):

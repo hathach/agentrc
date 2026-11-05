@@ -353,9 +353,12 @@ def prune(state, days, keep):
                         for b in s.get('boards', [])))
         except (OSError, ValueError, AttributeError, TypeError):
             done = False
-        if done and d.stat().st_mtime < cutoff:
-            shutil.rmtree(d)
-            removed.append(d.name)
+        try:
+            if done and d.stat().st_mtime < cutoff:
+                shutil.rmtree(d)
+                removed.append(d.name)
+        except FileNotFoundError:   # a run sharing the state dir pruned it first
+            pass
     return removed
 
 
