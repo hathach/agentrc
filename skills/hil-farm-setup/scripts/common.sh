@@ -19,6 +19,9 @@ runner_conf() {
     # tinyuf2's HIL state root: hil.yml's HIL_OUT parent, hil_remote.py's ciStateRoot
     tinyuf2) RUNNER_USER=ghrunner-tinyuf2 RUNNER_SUDO='' RUNNER_URL=https://github.com/adafruit/tinyuf2
              RUNNER_STATE=_work/tinyuf2/hil-state ;;
+    arduino-tinyusb) RUNNER_USER=ghrunner-arduino-tinyusb RUNNER_SUDO=''
+                    RUNNER_URL=https://github.com/adafruit/Adafruit_TinyUSB_Arduino
+                    RUNNER_STATE=_work/Adafruit_TinyUSB_Arduino/hil-state ;;
   esac
   RUNNER_REG_NAME=${RUNNER_REG_NAMES[$1]} RUNNER_LABELS=${RUNNER_REG_LABELS[$1]}  # its name and labels on GitHub
   RUNNER_NAME=$1
@@ -35,5 +38,8 @@ runner_users() { local n; for n in "${RUNNERS[@]}"; do (runner_conf "$n"; echo "
 SSHD_EXPECT=("pubkeyauthentication yes" "permitrootlogin no" "passwordauthentication no"
   "kbdinteractiveauthentication no" "allowagentforwarding no" "x11forwarding no" "allowusers $ADMIN")
 sshd_effective() { sshd -T -C "user=${1:-$ADMIN},host=devpc,addr=192.0.2.1"; }  # [USER]
-sshd_denies() { sshd_effective "$1" | grep -qx "denyusers $1"; }  # USER
+sshd_denies() {  # USER: sshd prints every denied user on one line
+  sshd_effective "$1" | awk -v user="$1" '$1 == "denyusers" {for (i = 2; i <= NF; i++) if ($i == user) found = 1}
+    END {exit !found}'
+}
 NFT_DROPIN=/etc/systemd/system/nftables.service.d/hil-farm.conf  # a shared host's: its rules and ours in one load

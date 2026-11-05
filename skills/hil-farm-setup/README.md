@@ -2,17 +2,19 @@
 
 Provisions a Debian 13 host as a TinyUSB HIL farm: GitHub Actions runners with pinned flashing and test tools, the
 rig's udev rules, board locks, a firewall for the runner users and the Renesas uPD720201/202 firmware. The host keeps
-no developer credentials. Up to two runners run CI jobs, each as its own user with the same groups and firewall policy
+no developer credentials. Up to three runners run CI jobs, each as its own user with the same groups and firewall policy
 (internet, no LAN):
 
-| Runner    | User               | Repository         | sudo            |
-|-----------|--------------------|--------------------|-----------------|
-| `tinyusb` | `ghrunner`         | `hathach/tinyusb`  | `hil_root` only |
-| `tinyuf2` | `ghrunner-tinyuf2` | `adafruit/tinyuf2` | none            |
+| Runner            | User                       | Repository                          | sudo            |
+| ----------------- | -------------------------- | ----------------------------------- | --------------- |
+| `tinyusb`         | `ghrunner`                 | `hathach/tinyusb`                   | `hil_root` only |
+| `tinyuf2`         | `ghrunner-tinyuf2`         | `adafruit/tinyuf2`                  | none            |
+| `arduino-tinyusb` | `ghrunner-arduino-tinyusb` | `adafruit/Adafruit_TinyUSB_Arduino` | none            |
 
 Each runner root `/opt/actions-runner/<runner>` and its `_work` and `_diag` belong to that runner's group, which holds
-the admin too from its next login (tinyuf2's remote driver reads `_work/tinyuf2/hil-state` over ssh); others, the
-other runner included, get nothing. In `_work` and `_diag` the admin only reads: the units' `UMask=0022` keeps what
+the admin too from its next login. The state roots are `_work/tinyuf2/hil-state` for TinyUF2 and
+`_work/Adafruit_TinyUSB_Arduino/hil-state` for Arduino TinyUSB; others, the other runners included, get nothing.
+In `_work` and `_diag` the admin only reads: the units' `UMask=0022` keeps what
 a job creates group-read-only, so an admin session cannot leave files there the next job cannot remove; hands-on work
 runs from the admin's own checkout, never a runner's. TinyUF2 compiles on GitHub-hosted runners, so the farm carries
 no toolchain for it.
@@ -30,8 +32,10 @@ shared one and every optional field.
 `setup.sh install --host FILE` takes only a committed file of the checkout's `hosts/`, validates it before any change
 and installs it as `/etc/hil-farm/host.toml`; later runs and `verify.sh` read that copy.
 
-A host keeps its identity: `profile`, `admin`, `shared` and its `runner` tables (which runners, their names and
-labels) change only by a reinstall (or, for a runner, its re-registration), and `--host` with a different one refuses.
+A host keeps its identity: `profile`, `admin`, `shared` and existing `runner` names and labels change only by a
+reinstall (or, for a runner, its re-registration), and `--host` with a different one refuses. Runner users, repository
+URLs and sudo grants are fixed in `common.sh`; host files cannot override them. Adding one runner uses the explicit
+`add-runner` operation below, which refuses removal or changes to any existing setting.
 The other fields change with `setup.sh update --host FILE`, which keeps the old file as `host.toml.prev`, refuses
 while a runner runs, and applies:
 
@@ -93,6 +97,9 @@ while a runner runs, and applies:
    S=/usr/local/src/agentrc/skills/hil-farm-setup/scripts/setup.sh
    ssh <admin>@<host> sudo $S runner tinyusb "$(gh api -X POST repos/hathach/tinyusb/actions/runners/registration-token --jq .token)"
    ssh <admin>@<host> sudo $S runner tinyuf2 "$(gh api -X POST repos/adafruit/tinyuf2/actions/runners/registration-token --jq .token)"
+   token=$(gh api -X POST repos/adafruit/Adafruit_TinyUSB_Arduino/actions/runners/registration-token --jq .token)
+   ssh <admin>@<host> sudo $S runner arduino-tinyusb "$token"
+   unset token
    ```
 
    Registration leaves the unit disabled and stopped, so no job is scheduled yet, not even after a reboot.
@@ -134,9 +141,9 @@ Install only after the owner agreed, with the host's earlier runner service, if 
    to check the new pin.
 2. On the host, move the root checkout to that commit: `sudo git -C /usr/local/src/agentrc fetch` and
    `sudo git -C /usr/local/src/agentrc checkout --detach <commit>`.
-3. Stop the runners: when `ssh <admin>@<host> pgrep -x Runner.Worker` prints nothing, `sudo systemctl stop
-   hil-runner-tinyusb hil-runner-tinyuf2`. GitHub has no way to drain a runner, so a job assigned between those two
-   commands is interrupted; check it for surviving processes and held boards, then re-run it.
+3. Stop the runners: when `ssh <admin>@<host> pgrep -x Runner.Worker` exits 1, `sudo systemctl stop
+   hil-runner-tinyusb hil-runner-tinyuf2 hil-runner-arduino-tinyusb`. GitHub has no way to drain a runner, so a job
+   assigned between those two commands is interrupted; check it for surviving processes and held boards, then re-run it.
 4. `S=/usr/local/src/agentrc/skills/hil-farm-setup; sudo $S/scripts/setup.sh update --host $S/hosts/<host>.toml
    <tool>` (or no tool for all of them; add `--inputs DIR` when STM32CubeProgrammer changed). `--host` every time
    applies any change to the host's file, and is a no-op otherwise. It refuses while a runner runs and touches only
@@ -147,11 +154,67 @@ Install only after the owner agreed, with the host's earlier runner service, if 
 
 The actions runner is installed once into each runner root and not updated this way.
 
+## Adding a runner to a host in service
+
+Commit the host file with exactly one new runner table; keep all existing settings unchanged. The new runner uses
+the installed runner package pin, shared device groups (`hil`, `dialout`, `plugdev`, `audio`), udev rules, pinned
+tools and `/tmp/tinyusb-hil-locks`. Addition changes the firewall's user set (and shared hosts' SSH deny list), creates
+only the new account, runner tree, environment, state directories, hook pair and unit, and gives the admin read
+access through the new runner's group. Existing registrations, accounts, hooks, units and job state stay untouched.
+It publishes the host file last and saves the previous one as `host.toml.prev`; retry the same command after a
+failure. It does not update tools or udev rules: deploy those separately with `update` first if needed.
+
+For the third runner on ci.lan, after the reviewed commit is available, run on ci.lan as `hathach`:
+
+```sh
+sudo git -C /usr/local/src/agentrc fetch
+sudo git -C /usr/local/src/agentrc checkout --detach <commit>
+S=/usr/local/src/agentrc/skills/hil-farm-setup
+pgrep -x Runner.Worker
+```
+
+Continue only when `pgrep` exits 1. Stop both installed runners (and the new unit if a prior attempt created it),
+then add the new runner:
+
+```sh
+sudo systemctl stop hil-runner-tinyusb hil-runner-tinyuf2
+sudo $S/scripts/setup.sh add-runner arduino-tinyusb --host $S/hosts/ci.toml
+sudo /opt/hil-farm/verify.sh --maintenance
+```
+
+Setup refuses if any old or new unit is active, or any `Runner.Worker` remains; it never stops a job itself. A job
+assigned between the idle check and stop can be interrupted: inspect surviving processes and held boards before
+continuing. The new service stays disabled and unregistered. Before registration, use
+`sudo -u ghrunner-arduino-tinyusb` to check read/write access to its assigned `/dev/bus/usb`, tty, hidraw and USB block
+device nodes, the shared lock directory, and the pinned tools on its `.path`, with `farm.toml`'s environment.
+Use a fresh admin login for the new group membership. From the dev PC, register with a one-hour token:
+
+```sh
+S=/usr/local/src/agentrc/skills/hil-farm-setup/scripts/setup.sh
+token=$(gh api -X POST repos/adafruit/Adafruit_TinyUSB_Arduino/actions/runners/registration-token --jq .token)
+ssh hathach@ci.lan sudo $S runner arduino-tinyusb "$token"
+unset token
+```
+
+Registration also leaves the unit disabled. Run Arduino TinyUSB's offline HIL proof under its runner user, then on
+ci.lan:
+
+```sh
+sudo /opt/hil-farm/verify.sh --maintenance
+sudo systemctl start hil-runner-tinyusb hil-runner-tinyuf2
+sudo systemctl enable --now hil-runner-arduino-tinyusb
+sudo /opt/hil-farm/verify.sh
+```
+
+Verification reads the installed host file and checks all three runners. A green HIL workflow in
+`adafruit/Adafruit_TinyUSB_Arduino` then proves the new CI path.
+
 Before a reinstall or update, sync with tinyusb: the `agentrc` tool's commit follows its `lib/agentrc` pin, and
 `scripts/udev/88-tinyusb.rules` is its file with the `adm` group as `hil` and without its catch-all hidraw rule, which
 gives every local user every HID device, a shared host owner's too. Likewise `scripts/udev/*-tinyuf2-*.rules`
 are tinyuf2's commissioning rules (`.claude/skills/hil-contract/commissioning.md`) with `adm` as `hil`; its harness
 matches the exclusion lines as written. `common.sh`'s tinyuf2 `RUNNER_STATE` is its `hil_remote.py` `ciStateRoot`.
+Arduino TinyUSB's `RUNNER_STATE` is its workflow's `$(dirname "$GITHUB_WORKSPACE")/hil-state`.
 
 ## Jobs, holds and locks
 
@@ -178,4 +241,5 @@ other private ranges today.
 
 `verify.sh` checks only the install. Hardware proof comes in two parts. Before enabling a runner's unit, prove its
 boards offline: for tinyusb a `hil_remote` smoke run per flasher type and one usbtest battery, for tinyuf2 its own
-commissioning proof. After enabling it, a green master HIL job on that repository proves the CI path.
+commissioning proof, and for Arduino TinyUSB its offline HIL proof under `ghrunner-arduino-tinyusb`. After enabling
+it, a green master HIL job on that repository proves the CI path.

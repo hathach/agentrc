@@ -8,7 +8,7 @@
   farm.py path                      print the farm's PATH
   farm.py runner-path               print the runners' PATH: the farm's plus the host's runner_path
   farm.py host-sh                   print the host file as shell assignments for common.sh
-  farm.py host-install FILE         install FILE as the host file, refusing an identity change
+  farm.py host-install FILE [--add-runner NAME] [--check]   install or check FILE, optionally adding one runner
   farm.py guard                     fail unless every runner is stopped and no job runs
   farm.py trusted PATH...           fail when a non-root user could replace anything on the way to a PATH
   farm.py install [--force] [--inputs DIR] [TOOL...]   fresh install: every tool when none is named
@@ -48,7 +48,7 @@ LOCK_FILE = '/run/hil-farm.lock'
 LINK_ROOTS = ('/usr/local/bin/', '/usr/local/sbin/', '/opt/hil/')
 FIRMWARE_ROOT = '/lib/firmware/'
 INSTALLED_HOST = Path('/etc/hil-farm/host.toml')
-KNOWN_RUNNERS = ('tinyusb', 'tinyuf2')  # common.sh runner_conf
+KNOWN_RUNNERS = ('tinyusb', 'tinyuf2', 'arduino-tinyusb')  # common.sh runner_conf
 
 
 def runner_units(names):
@@ -231,12 +231,21 @@ def host_sh(h):
         assoc('RUNNER_REG_NAMES', lambda r: r['name']), assoc('RUNNER_REG_LABELS', lambda r: ','.join(r['labels']))])
 
 
-def install_host(cfg, src):
+def install_host(cfg, src, add_runner=None, check=False):
     """Make src the installed host file. A host keeps its identity. Refuses while any of its runners runs."""
     new = load_host(cfg, src)
     data = Path(src).read_bytes()
     old = load_host(cfg, INSTALLED_HOST) if INSTALLED_HOST.exists() else None
-    if old is not None:
+    if add_runner is not None:
+        if old is None:
+            raise FarmError('add-runner needs an installed host file; use setup.sh install first')
+        if add_runner in old['runner'] or set(new['runner']) != set(old['runner']) | {add_runner}:
+            raise FarmError(f'add-runner must add only {add_runner}, keeping every installed runner')
+        changed = [k for k in old if k != 'runner' and old[k] != new[k]]
+        changed += [f'runner.{n}' for n, r in old['runner'].items() if r != new['runner'][n]]
+        if changed:
+            raise FarmError(f'add-runner changes existing settings: {", ".join(changed)}')
+    elif old is not None:
         if INSTALLED_HOST.read_bytes() == data:
             return False
         changed = [k for k in IDENTITY if old[k] != new[k]]
@@ -245,7 +254,9 @@ def install_host(cfg, src):
                             'that takes a reinstall, or for a runner its re-registration')
     elif (FARM_HOME / 'farm.toml').exists():
         raise FarmError(f'{FARM_HOME} holds an install with no host file ({INSTALLED_HOST}); that takes a reinstall')
-    guard(sorted(runner_units(new['runner'])))  # the runners are identity: old and new name the same
+    guard(sorted(runner_units(set(new['runner']) | (set(old['runner']) if old else set()))))
+    if check:
+        return False
     INSTALLED_HOST.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
     if old is not None:
         shutil.copyfile(INSTALLED_HOST, INSTALLED_HOST.with_name('host.toml.prev'))
@@ -744,7 +755,10 @@ def main(argv=None):
     sub.add_parser('path')
     sub.add_parser('runner-path')
     sub.add_parser('host-sh')
-    sub.add_parser('host-install').add_argument('file')
+    p = sub.add_parser('host-install')
+    p.add_argument('file')
+    p.add_argument('--add-runner', choices=KNOWN_RUNNERS)
+    p.add_argument('--check', action='store_true')
     sub.add_parser('guard')
     sub.add_parser('trusted').add_argument('paths', nargs='+')
     for cmd in ('install', 'update'):
@@ -766,7 +780,8 @@ def main(argv=None):
             return 0
         if args.cmd == 'host-install':
             with root_lock():
-                print(f'host  {INSTALLED_HOST} {"installed" if install_host(cfg, args.file) else "unchanged"}')
+                changed = install_host(cfg, args.file, args.add_runner, args.check)
+                print(f'host  {INSTALLED_HOST} {"installed" if changed else "checked" if args.check else "unchanged"}')
             return 0
         host = use_host(load_host(cfg)) if args.cmd not in ('fetch', 'env', 'path', 'trusted') else None
         if args.cmd == 'host-sh':

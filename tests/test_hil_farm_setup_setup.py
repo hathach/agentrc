@@ -7,8 +7,13 @@ if os.name == 'nt':
     raise unittest.SkipTest('the HIL farm setup runs on Debian: bash, fcntl, Linux paths')
 
 import shutil
+import hashlib
+import io
+import json
 import subprocess
+import tarfile
 import tempfile
+import tomllib
 import sys
 from pathlib import Path
 
@@ -57,6 +62,8 @@ class TestSetup(unittest.TestCase):
         f = self.dir / 'farm.py'
         text = (FARM / 'farm.py').read_text().replace("INSTALLED_HOST = Path('/etc/hil-farm/host.toml')",
                                                       f"INSTALLED_HOST = Path({str(self.host)!r})")
+        for old, new in getattr(self, 'farm_replacements', {}).items():
+            text = text.replace(old, new)
         if f.read_text() != text:   # unchanged otherwise: registration compares every file around one call
             f.write_text(text)
 
@@ -140,6 +147,163 @@ class TestSetup(unittest.TestCase):
                 self.assertIn(f'ACTIONS_RUNNER_HOOK_JOB_STARTED={self.hooks}/job-started-{name}.sh', env)
                 self.assertIn(f'ACTIONS_RUNNER_HOOK_JOB_COMPLETED={self.hooks}/job-completed-{name}.sh', env)
                 self.assertIn('PYTHONNOUSERSITE=1', env)
+
+    def addition(self):
+        """A two-runner install and ci.toml's proposed third, with real farm decisions and only OS commands stubbed."""
+        ci = (FARM.parent / 'hosts' / 'ci.toml').read_text()
+        self.host = self.tmp / 'installed.toml'
+        self.host.write_text(ci.split('[runner.arduino-tinyusb]')[0])
+        proposed = self.tmp / 'ci.toml'
+        proposed.write_text(ci)
+        roots = self.tmp / 'runners'
+        etc = self.tmp / 'etc'
+        (etc / 'units').mkdir(parents=True)
+        (etc / 'sudoers.d').mkdir()
+        (etc / 'sudoers.d' / 'hil-farm').write_text('ghrunner ALL=(root) NOPASSWD: /usr/local/sbin/hil_root\n')
+        self.hooks.mkdir()
+        (self.hooks / 'job_hook.py').write_text('existing shared hook\n')
+        for name in ('tinyusb', 'tinyuf2'):
+            d = roots / name
+            (d / 'bin').mkdir(parents=True)
+            (d / '_work').mkdir()
+            for f in ('bin/Runner.Listener', '.runner', '.credentials', '.env', '.path', '_work/state'):
+                (d / f).write_text(f'existing {name} {f}\n')
+            (etc / 'units' / f'hil-runner-{name}.service').write_text(f'existing {name}\n')
+            for hook in ('started', 'completed'):
+                (self.hooks / f'job-{hook}-{name}.sh').write_text(f'existing {name}\n')
+        archive = self.tmp / 'runner.tar.gz'
+        with tarfile.open(archive, 'w:gz') as tf:
+            for name in ('bin/Runner.Listener', 'bin/runsvc.sh', 'config.sh'):
+                data = b'#!/bin/sh\n'
+                info = tarfile.TarInfo(name)
+                info.size, info.mode = len(data), 0o755
+                tf.addfile(info, io.BytesIO(data))
+        receipt = self.tmp / 'receipts'
+        receipt.mkdir()
+        pin = tomllib.loads((FARM / 'farm.toml').read_text())['tool']['actions-runner']
+        digest = hashlib.sha256(json.dumps(['actions-runner', pin], sort_keys=True).encode()).hexdigest()
+        (receipt / 'actions-runner.json').write_text(json.dumps({'input': digest, 'version': pin['version']}))
+        self.farm_replacements = {
+            "Path('/opt/hil-farm')": f'Path({str(self.tmp / "installed")!r})',
+            "Path('/var/lib/hil-farm')": f'Path({str(receipt)!r})',
+            '/opt/actions-runner': str(roots),
+            'if os.geteuid() != 0:': 'if False:',
+            'def fetch(url, sha256, dest, form=None):':
+                f'def fetch(url, sha256, dest, form=None):\n    shutil.copyfile({str(archive)!r}, dest)\n    return',
+        }
+        common = self.dir / 'common.sh'
+        common.write_text(common.read_text().replace('/opt/actions-runner', str(roots)))
+        setup = self.dir / 'setup.sh'
+        setup.write_text(setup.read_text().replace('preflight() {', 'preflight() { SOURCE_REV=test; }\nunused() {')
+                         .replace('/etc/systemd/system', str(etc / 'units'))
+                         .replace('/etc/sudoers.d', str(etc / 'sudoers.d'))
+                         .replace('/etc/nftables.conf', str(etc / 'nftables.conf'))
+                         .replace('/opt/hil-farm', str(self.tmp / 'installed'))
+                         .replace('"/home/$RUNNER_USER"', f'"{self.tmp}/home/$RUNNER_USER"'))
+        shutil.copy(FARM / 'verify.sh', self.dir)
+        shutil.copytree(FARM / 'fw', self.dir / 'fw')
+        self.calls = self.tmp / 'calls'
+        self.calls.touch()
+        self.stub('id', f'[ "$1" != -u ] || {{ echo 0; exit; }}; test -d {self.tmp}/home/"$1"')
+        for cmd, body in (
+                ('useradd', f'for u; do :; done; mkdir -p {self.tmp}/home/"$u"'),
+                ('usermod', ':'), ('passwd', ':'), ('chown', ':'), ('nft', ':'), ('visudo', ':'),
+                ('systemctl', 'if [ "$1" = is-active ]; then echo inactive; exit 3; fi'),
+                ('pgrep', 'exit 1'),
+                ('install', 'n=$#; while [ $n -gt 0 ]; do a=$1; shift; n=$((n - 1)); case $a in '
+                 '-o|-g) shift; n=$((n - 1)) ;; *) set -- "$@" "$a" ;; esac; done; exec /usr/bin/install "$@"')):
+            self.stub(cmd, f'echo "{cmd} $*" >> {self.calls}\n{body}')
+        kept = [p for base in (roots, self.hooks, etc) for p in base.rglob('*') if p.is_file()]
+        self.kept = {p: (p.read_bytes(), p.stat().st_mode, p.stat().st_mtime_ns) for p in kept}
+        return proposed
+
+    def assert_existing_untouched(self):
+        self.assertEqual(self.kept, {p: (p.read_bytes(), p.stat().st_mode, p.stat().st_mtime_ns) for p in self.kept})
+
+    def test_add_runner_provisions_only_the_new_runner_and_publishes_the_host(self):
+        proposed = self.addition()
+        before = self.host.read_bytes()
+        r = self.setup('add-runner', 'arduino-tinyusb', '--host', str(proposed))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assert_existing_untouched()
+        self.assertEqual(self.host.read_bytes(), proposed.read_bytes())
+        self.assertEqual(self.host.with_name('host.toml.prev').read_bytes(), before)
+        d = self.tmp / 'runners' / 'arduino-tinyusb'
+        self.assertTrue((d / 'bin' / 'Runner.Listener').is_file())
+        self.assertTrue((d / '_work' / 'Adafruit_TinyUSB_Arduino' / 'hil-state').is_dir())
+        self.assertEqual(d.stat().st_mode & 0o7777, 0o1770)
+        self.assertEqual((d / '_diag').stat().st_mode & 0o777, 0o750)
+        self.assertFalse((d / '.runner').exists())
+        self.assertIn('PYTHONNOUSERSITE=1', (d / '.env').read_text())
+        self.assertIn(f'ACTIONS_RUNNER_HOOK_JOB_STARTED={self.hooks}/job-started-arduino-tinyusb.sh',
+                      (d / '.env').read_text())
+        self.assertTrue((d / '.path').read_text().startswith('/opt/hil/venv/bin:'))
+        unit = (self.tmp / 'etc' / 'units' / 'hil-runner-arduino-tinyusb.service').read_text()
+        self.assertIn('User=ghrunner-arduino-tinyusb\n', unit)
+        self.assertIn('UMask=0022\n', unit)
+        self.assertIn('Requires=nftables.service\n', unit)
+        self.assertIn(f'ConditionPathExists={d}/.runner\n', unit)
+        self.assertIn('start hil-runner-arduino-tinyusb',
+                      (self.hooks / 'job-started-arduino-tinyusb.sh').read_text())
+        self.assertIn('"ghrunner", "ghrunner-tinyuf2", "ghrunner-arduino-tinyusb"',
+                      (self.tmp / 'etc' / 'nftables.conf').read_text())
+        calls = self.calls.read_text().splitlines()
+        self.assertIn('useradd -m -U -s /bin/bash -G hil,dialout,plugdev,audio ghrunner-arduino-tinyusb', calls)
+        self.assertIn('passwd -l ghrunner-arduino-tinyusb', calls)
+        self.assertIn('usermod -aG ghrunner-arduino-tinyusb hathach', calls)
+        self.assertIn('systemctl disable -q hil-runner-arduino-tinyusb', calls)
+        self.assertIn(f'install -d -m 0750 -o ghrunner-arduino-tinyusb -g ghrunner-arduino-tinyusb '
+                      f'{d}/_work {d}/_diag {d}/_work/Adafruit_TinyUSB_Arduino/hil-state', calls)
+        self.assertFalse([c for c in calls if c.startswith(('systemctl start', 'systemctl stop', 'visudo'))])
+        self.assertEqual([c for c in calls if c.startswith('systemctl enable')], ['systemctl enable -q nftables'])
+        self.assertEqual((self.tmp / 'installed' / 'common.sh').read_bytes(), (self.dir / 'common.sh').read_bytes())
+
+    def test_add_runner_guards_old_and_new_units_and_workers_before_mutation(self):
+        proposed = self.addition()
+        before = self.host.read_bytes()
+        for unit in ('tinyusb', 'tinyuf2', 'arduino-tinyusb', None):
+            with self.subTest(unit=unit):
+                self.calls.write_text('')
+                self.stub('systemctl', f'echo "systemctl $*" >> {self.calls}\n'
+                          f'if [ "$2" = "hil-runner-{unit}" ]; then echo active; else echo inactive; exit 3; fi')
+                self.stub('pgrep', 'exit 0' if unit is None else 'exit 1')
+                r = self.setup('add-runner', 'arduino-tinyusb', '--host', str(proposed))
+                self.assertNotEqual(r.returncode, 0)
+                self.assertRegex(r.stderr, 'is active|Runner.Worker is running')
+                self.assertFalse((self.tmp / 'home').exists())
+                self.assertEqual(self.host.read_bytes(), before)
+                self.assert_existing_untouched()
+                self.assertEqual(len(self.calls.read_text().splitlines()), 3)
+
+    def test_failed_addition_keeps_the_old_host_and_retries_without_changing_old_runners(self):
+        proposed = self.addition()
+        before = self.host.read_bytes()
+        self.stub('systemctl', 'case $1 in is-active) echo inactive; exit 3;; disable) exit 1;; esac')
+        r = self.setup('add-runner', 'arduino-tinyusb', '--host', str(proposed))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('cannot disable', r.stderr)
+        self.assertEqual(self.host.read_bytes(), before)
+        self.assert_existing_untouched()
+        self.stub('systemctl', '[ "$1" != is-active ] || { echo inactive; exit 3; }')
+        r = self.setup('add-runner', 'arduino-tinyusb', '--host', str(proposed))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assert_existing_untouched()
+
+    def test_addition_refuses_a_missing_old_runner_before_creating_the_new_user(self):
+        proposed = self.addition()
+        (self.tmp / 'runners' / 'tinyuf2' / 'bin' / 'Runner.Listener').unlink()
+        r = self.setup('add-runner', 'arduino-tinyusb', '--host', str(proposed))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('holds no runner', r.stdout)
+        self.assertFalse((self.tmp / 'home').exists())
+
+    def test_add_runner_requires_a_proposed_host_and_exactly_one_known_runner(self):
+        for args in ([], ['tinyusb'], ['tinyusb', '--host', str(self.host), 'extra'],
+                     ['nope', '--host', str(self.host)], ['tinyusb', '--host', str(self.host), '--inputs', str(self.tmp)]):
+            with self.subTest(args=args):
+                r = self.setup('add-runner', *args)
+                self.assertEqual(r.returncode, 1)
+                self.assertIn('usage: setup.sh add-runner NAME --host FILE', r.stderr)
 
     def register(self, active, disable):
         """register_runner tinyuf2 until its first log line, after the disable: (exit, stderr, systemctl calls,
@@ -240,6 +404,19 @@ class TestSetup(unittest.TestCase):
                 self.assertNotIn('BindsTo', unit)
                 self.assertNotIn('InaccessiblePaths', unit)
                 self.assertIn(f'--name lab-{name} --labels ', (self.tmp / 'config-args').read_text())
+
+    def test_arduino_registration_uses_its_repo_labels_and_state_root(self):
+        self.host = FARM.parent / 'hosts' / 'ci.toml'
+        self.point_host()
+        before, after = self.registration('arduino-tinyusb', 'tinyusb')
+        self.assertEqual(before, after)
+        args = (self.tmp / 'config-args').read_text()
+        self.assertIn('-u ghrunner-arduino-tinyusb --', args)
+        self.assertIn('--url https://github.com/adafruit/Adafruit_TinyUSB_Arduino ', args)
+        self.assertIn('--name arduino-tinyusb --labels arduino-tinyusb ', args)
+        self.assertTrue((self.tmp / 'runners' / 'arduino-tinyusb' / '_work' /
+                         'Adafruit_TinyUSB_Arduino' / 'hil-state').is_dir())
+        self.assertEqual(self.sourced('runner_conf arduino-tinyusb; echo "[$RUNNER_SUDO]"'), '[]\n')
 
     def test_re_registration_never_follows_a_link_a_job_planted(self):
         for name, rel, kind in (('tinyusb', '_work', 'link'), ('tinyusb', '_diag', 'link'),
@@ -576,7 +753,9 @@ class TestSetup(unittest.TestCase):
         setup = self.dir / 'setup.sh'
         setup.write_text(setup.read_text().replace('/etc/ssh/sshd_config.d', str(conf)))
         self.stub('systemctl', ':')
-        for denies, rc in (('denyusers ghrunner', 0), ('denyusers other', 1)):
+        for denies, rc in (('denyusers ghrunner', 0), ('denyusers ghrunner ghrunner-tinyuf2', 0),
+                           ('denyusers ghrunner-tinyuf2 ghrunner', 0), ('denyusers other', 1),
+                           ('denyusers ghrunner-tinyuf2', 1)):
             with self.subTest(denies=denies):
                 self.stub('sshd', f'[ "$1" = -t ] || echo "{denies}"')
                 r = self.run_sourced('setup_ssh')

@@ -1,6 +1,11 @@
 ---
 name: hil-farm-setup
-description: Provision, update or check a Debian 13 HIL farm host for TinyUSB and TinyUF2 CI - GitHub Actions runners with pinned flashing tools, udev rules, board locks, a runner firewall and the Renesas uPD720201 firmware - from a root-owned checkout and the host's file in `hosts/`. Use when rebuilding a farm host, bumping a pinned tool (openocd, J-Link, picotool, STM32CubeProgrammer, the actions runner), registering a runner, or when verify.sh or a runner hold needs judging.
+description: >-
+  Provision, update or check a Debian 13 HIL farm host for TinyUSB, TinyUF2 and Arduino TinyUSB CI - GitHub Actions
+  runners with pinned flashing tools, udev rules, board locks, a runner firewall and the Renesas uPD720201 firmware -
+  from a root-owned checkout and the host's file in `hosts/`. Use when rebuilding a farm host, adding or registering a
+  runner, bumping a pinned tool (openocd, J-Link, picotool, STM32CubeProgrammer, the actions runner), or when verify.sh
+  or a runner hold needs judging.
 ---
 
 # HIL farm setup
@@ -10,9 +15,10 @@ mechanics, each with its usage at the top. This page is what to decide around th
 
 ## Before touching a host
 
-- **A host in service runs CI.** Every `install` or `update` needs both runner units stopped with no `Runner.Worker`:
-  wait until `pgrep -x Runner.Worker` prints nothing, then stop them, and say which job, if any, was interrupted. A
-  host reboot, which a firmware change needs, is the user's call.
+- **A host in service runs CI.** Every `install`, `update` or `add-runner` needs all runner units stopped with no
+  `Runner.Worker`: wait until `pgrep -x Runner.Worker` exits 1, then stop them, and say which job, if any, was
+  interrupted. For an addition, the guard covers the installed and proposed runners. A host reboot, which a firmware
+  change needs, is the user's call.
 - **A shared host is its owner's machine.** Install or update there only with the owner's agreement, and never change
   what the README says stays the owner's.
 - **A host's settings are its file in `hosts/`.** Change them, or add a new host, by a commit; setup takes no other
@@ -25,7 +31,9 @@ mechanics, each with its usage at the top. This page is what to decide around th
 - `verify.sh` checks the install, not the boards. A clean run says nothing about a probe or a DUT; the hardware proof
   in the README does, and a green master HIL job proves the CI path.
 - A refused `host-install` names the identity field that changed: that is a reinstall or a runner re-registration,
-  not a file edit to force through.
+  not a file edit to force through. `setup.sh add-runner NAME --host FILE` admits only one new runner and no other
+  settings changes; the existing runner package must match the pin. It leaves the new unit disabled, including after
+  registration, until its hardware proof. A failed addition keeps the installed host file, so retry the same command.
 - A runner held by `job_hook.py` stays held until someone checks the failed job's processes and boards; clear it by
   the README's steps, not by restarting the unit.
 - A tool whose new install fails its check is not switched; the old one keeps serving. Report the check's output
