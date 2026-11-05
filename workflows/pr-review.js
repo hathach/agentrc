@@ -8,7 +8,7 @@ export const meta = {
 const AGENTRC = '"${AGENTRC_DIR:-$HOME/.claude}"'  // shell text, quoted so a path with spaces stays one word: the agentrc checkout a project install names in AGENTRC_DIR, else the user install
 // args: { pr, repo: 'owner/name', head, mergeBase, scopeBase (full SHAs: prepare.py's
 //          pins; scopeBase is mergeBase on a full review, the last reviewed head on an
-//          incremental one), mode: 'full' | 'incremental' | 'discussion' (the last for prepare.py's
+//          incremental one, or on a recheck after a base merge prepare's synthetic base), mode: 'full' | 'incremental' | 'discussion' (the last for prepare.py's
 //          `same`: the head was reviewed and only pushback on our threads is judged), groups: string[] (prepare.py's),
 //          factsDir (prepare.py's facts file's directory, where threads.py writes),
 //          hil: { choice: 'none' } | { choice: 'boards', boards: [{ board, verdict: 'pass' | 'fail' | 'not-run',
@@ -16,6 +16,9 @@ const AGENTRC = '"${AGENTRC_DIR:-$HOME/.claude}"'  // shell text, quoted so a pa
 //            results: testedHead the SHA the firmware was built from, report the contract's report file),
 //          hardwareRelevant: boolean (the project's selection named boards or the full matrix),
 //          autoPost: boolean (the draft never proposes APPROVE when true),
+//          recheckFrom?: full SHA | null (prepare.py --recheck-from's pin: the head of our submitted review an auto-fix
+//            repaired; this review is its recheck, continuing that review, scanning from the scopeBase prepare pinned
+//            and raising no new nit; groups may be empty: nothing left to scan),
 //          dimensions?: string[] (the project's review dimensions; default DIMENSIONS, logged) }
 // The session directory is the review worktree.
 // No default for hil, hardwareRelevant or autoPost: each changes the verdict.
@@ -25,6 +28,8 @@ if (typeof args === 'string') {
 const SHA = /^[0-9a-f]{40}$/
 // The one scale, defined in finding-verifier.md's Severity section.
 const LEVELS = ['critical', 'high', 'medium', 'low', 'nit']
+// Never above approval, and never raised new on a recheck.
+const MINOR = ['nit']
 const CONFIDENCE = ['high', 'medium', 'low']
 const IMPACT = {
   type: ['object', 'null'], additionalProperties: false,
@@ -39,7 +44,7 @@ const gradeOf = v => Object.fromEntries(Object.keys(GRADE).map(k => [k, v[k]]))
 // A recheck that returns any of the grading returns all of it: null when it returned none, false when incomplete.
 const regradeOf = v => v && Object.keys(GRADE).some(k => v[k] != null) ? graded(v) && gradeOf(v) : null
 const GRADING = 'Grade by the Severity section of your role: severity, impact, severityReason and confidence.'
-const fail = (msg) => { throw new Error(`${msg}; args is { pr, repo, head, mergeBase, scopeBase, mode, groups, factsDir, hil, hardwareRelevant, autoPost, dimensions? }`) }
+const fail = (msg) => { throw new Error(`${msg}; args is { pr, repo, head, mergeBase, scopeBase, mode, groups, factsDir, hil, hardwareRelevant, autoPost, recheckFrom?, dimensions? }`) }
 if (!args || typeof args !== 'object') fail('args must be an object')
 const pr = Number(args.pr)
 if (!Number.isInteger(pr) || pr <= 0) fail('pr must be a positive integer')
@@ -48,8 +53,11 @@ for (const k of ['head', 'mergeBase', 'scopeBase']) if (typeof args[k] !== 'stri
 if (!['full', 'incremental', 'discussion'].includes(args.mode)) fail("mode must be 'full', 'incremental' or 'discussion' (prepare.py's 'same')")
 if ((args.mode === 'incremental') === (args.scopeBase === args.mergeBase)) fail('scopeBase is mergeBase except on an incremental review')
 const discussion = args.mode === 'discussion'
+// An absent recheckFrom is no recheck, as a launch from before it was.
+const recheckFrom = args.recheckFrom ?? null
+if (recheckFrom !== null && !(typeof recheckFrom === 'string' && SHA.test(recheckFrom))) fail('recheckFrom must be a full SHA or null')
 const plainPath = (p) => typeof p === 'string' && /^[A-Za-z0-9._/@+ -]+$/.test(p) && !p.includes('..')
-if (!Array.isArray(args.groups) || !args.groups.length || !args.groups.every(plainPath)) fail('groups must be a nonempty array of repository paths')
+if (!Array.isArray(args.groups) || !(args.groups.length || recheckFrom) || !args.groups.every(plainPath)) fail('groups must be a nonempty array of repository paths, empty only on a recheck')
 // A Windows drive path reads with slashes; any other path stays exactly as given.
 const slashed = (p) => typeof p === 'string' && /^[A-Za-z]:[\\/]/.test(p) ? p.replace(/\\/g, '/') : p
 const factsDir = slashed(args.factsDir)
@@ -92,7 +100,8 @@ const blocked = (reason, detail) => ({ status: 'blocked', reason, detail, pr, he
 
 phase('Check')
 const CI = { type: 'object', properties: { state: { enum: ['green', 'red', 'pending', 'unobserved', 'unknown'] }, counts: { type: 'object' }, actionRequired: { type: 'integer' } }, required: ['state'] }
-const PINS = { type: 'object', properties: { mergeBase: { type: 'string' }, scopeBase: { type: 'string' }, mode: { type: 'string' }, groups: { type: 'array', items: { type: 'string' } } } }
+const PINS = { type: 'object', properties: { mergeBase: { type: 'string' }, scopeBase: { type: 'string' }, mode: { type: 'string' }, groups: { type: 'array', items: { type: 'string' } },
+  recheckFrom: { type: ['string', 'null'] } } }
 const check = await relay('check', 'Check', `python3 ${S}/prepare.py --check --pr ${pr} --repo ${repo} --expected-head ${head}`,
   { type: 'object', properties: { ok: { type: 'boolean' }, head: { type: 'string' }, top: { type: 'string' }, repo: { type: 'string' }, pr: { type: 'integer' }, ci: CI, pins: PINS, error: { type: 'string' } } })
 // The check names the run's repository and PR so its journal identifies the run.
@@ -100,7 +109,7 @@ if (!check || check.error || check.ok !== true || check.head !== head || !check.
   return blocked('check-failed', check ? (check.error || `check answered ${JSON.stringify(check)}`) : 'the check relay died')
 }
 // A scope other than the one prepare pinned could leave changes unreviewed and still approve.
-const want = { mergeBase, scopeBase, mode: discussion ? 'same' : args.mode, groups: args.groups }
+const want = { mergeBase, scopeBase, mode: discussion ? 'same' : args.mode, groups: args.groups, recheckFrom }
 const off = Object.keys(want).filter(k => JSON.stringify(want[k]) !== JSON.stringify((check.pins || {})[k]))
 if (off.length) return blocked('scope-mismatch', `args differ from prepare's pins for this head in ${off.join(', ')}: ${JSON.stringify(check.pins)}`)
 const ci = check.ci
@@ -152,7 +161,7 @@ const rowOk = (f) => f && typeof f.id === 'string' && (f.published === null || t
   (f.repair === null || (f.repair && SHA.test(f.repair.head) && typeof f.repair.state === 'string' && typeof f.repair.resolved === 'boolean'))
 if (!Number.isInteger(prior.reviews) || prior.reviews < 0 || !Array.isArray(prior.open) || !Array.isArray(prior.disputes) || !prior.open.every(rowOk) ||
   (prior.reviews > 0 && !Array.isArray(prior.heldThreads)) ||
-  (args.mode !== 'full' && (prior.reviews < 1 || (prior.last || {}).head !== (discussion ? head : scopeBase)))) {
+  ((args.mode !== 'full' || recheckFrom) && (prior.reviews < 1 || (prior.last || {}).head !== (discussion ? head : recheckFrom || scopeBase)))) {
   const shape = Object.fromEntries(Object.entries(prior).map(([k, v]) => [k, Array.isArray(v) ? `${v.length} rows` : v]))
   return blocked('ledger-failed', `ledger answered ${JSON.stringify(shape)}`)
 }
@@ -203,7 +212,7 @@ const judge = (c, i) => agent(
   // A confirmed claim without its grading is unjudged, like a dead judge.
   { label: `judge:${i}`, phase: 'Judge', agentType: 'finding-verifier', schema: JUDGE },).then(v => v && (v.verdict !== 'confirmed' || graded(v)) ? { ...c, ...v } : null)
 const [audit, rechecked, claims] = await parallel([
-  () => discussion ? NONE : workflow('code-audit', { dirs: args.groups, dimensions, diff: { base: scopeBase, head }, root: check.top }),
+  () => discussion || !args.groups.length ? NONE : workflow('code-audit', { dirs: args.groups, dimensions, diff: { base: scopeBase, head }, root: check.top }),
   () => parallel(carried.map(f => () => agent(recheckPrompt(f),
     { label: `recheck:${f.id}`, phase: 'Review', agentType: 'finding-verifier', schema: RECHECK },
   ))),
@@ -228,10 +237,15 @@ if (misattributed) log(`${misattributed} claim(s) dropped: the comment named doe
 const claimsOut = judged.filter(v => v && v.verdict !== 'misattributed')
 
 phase('Judge')
-const ours = audit.confirmed.flatMap(u => u.findings.map(f => ({
+const found = audit.confirmed.flatMap(u => u.findings.map(f => ({
   source: 'review', file: f.file, line: f.line, dimension: u.dim,
   ...gradeOf(f), why: f.why, snippet: f.snippet, verdictReason: f.verdict.reason, status: 'open',
 })))
+// A recheck raises no new nit, by its verified grade: a nit on a repair would only start another round.
+const raised = (f) => !recheckFrom || !MINOR.includes(f.severity)
+const suppressed = found.filter(f => !raised(f))
+if (suppressed.length) log(`${suppressed.length} new nit(s) not raised on a recheck: ${suppressed.map(f => `${f.file}:${f.line}`).join(', ')}`)
+const ours = found.filter(raised)
 const confirmedClaims = claimsOut.filter(c => c.verdict === 'confirmed')
 // Without new replies a recheck cannot move an upheld or disputed finding back to plain open.
 const statusOf = (f, v) => v.state === 'open' && ['upheld', 'disputed'].includes(f.status) ? f.status : v.state
@@ -349,7 +363,6 @@ const keyOf = (x, own) => x.group != null ? `g${x.group}` : own
 
 // The verdict is this rule, not a model's judgment.
 const BLOCKING = ['critical', 'high']
-const MINOR = ['nit']
 const where = (file, line) => `\`${file}${line ? `:${line}` : ''}\``
 // One entry per defect: each group counts once, at its strongest grade.
 const byDefect = new Map()
@@ -513,7 +526,7 @@ if (lost) lines.push(`C${coverageNote.slice(1)}.`, '')
 while (lines.length && !lines[lines.length - 1]) lines.pop()
 
 return {
-  status: 'reviewed', pr, repo, head, mergeBase, scopeBase, mode: args.mode,
+  status: 'reviewed', pr, repo, head, mergeBase, scopeBase, mode: args.mode, recheckFrom,
   verdict: { event, reasons },
   // muted: no comment of its own in this draft, its group's printed text stating it; lead: its group's lead, whose own
   // text is that printed text unless muted. Always written, since a carried finding's saved record keeps whatever this
@@ -525,6 +538,7 @@ return {
   }),
   claims: claimsOut.map(({ group, ...c }) => (group != null ? { ...c, defect: group } : c)),
   coverage: { dropped: audit.dropped, unverified: audit.unverified, unjudged },
+  suppressed: suppressed.map(({ file, line, dimension, severity, why }) => ({ file, line, dimension, severity, why, reason: 'recheck-nit' })),
   ci, hil,
   heldThreads: prior.heldThreads || [],
   draft: { event, body: lines.join('\n'), comments, replies: fixedReplies, resolves },
