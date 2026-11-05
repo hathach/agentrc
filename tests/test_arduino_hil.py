@@ -847,6 +847,34 @@ class BaseImage(Base):
         self.assertEqual((why, calls), ('base check: x', ['base']))
         self.A.flash.flash_jlink.assert_not_called()
 
+    def test_a_failed_check_after_a_matched_one_reports_no_stale_state(self):
+        base, _ = {**self.base(), 'state': 'matched'}, self.sessions('JLinkExe exit 1')
+        self.A.flash.jlink_verify_differs.return_value = None
+        H.ensure_base(self.flasher, base, self.dir, mock.Mock())
+        self.assertIsNone(base['state'])
+
+    def rewritten(self, why, dev):
+        """flash_and_enumerate after a base rewrite, then (why, dev)."""
+        def fe(name, board, image, *a):
+            image['base']['state'] = 'rewritten: the run at 0x1000 differed'
+            return why, 'detached', dev
+        return mock.patch.object(H, 'flash_and_enumerate', fe)
+
+    def test_every_row_after_a_flash_names_the_base_state(self):
+        image = {'vidPid': '1234:5678', 'elf': 'a.elf', 'hex': 'a.hex', 'base': self.base()}
+        board, said = self.board('rig_jlink'), 'rewritten: the run at 0x1000 differed'
+        self.A.usb.usb_devices.return_value = []
+        for why, dev in (('J-Link flash: x', None), ('', None)):
+            with self.rewritten(why, dev):
+                self.assertEqual(H.step('rig_jlink', board, image, 'echo', self.dir, mock.Mock())['base'], said)
+            with self.rewritten(why, dev):
+                self.assertEqual(H.flash_only('rig_jlink', board, image, self.dir, None)['base'], said)
+        with mock.patch.object(H, 'flash', lambda f, image, *a: image['base'].update(state='matched') or ''):
+            self.assertEqual(H.flash_only('rig_host', self.board('rig_host'), image, self.dir, None)['base'],
+                             'matched')
+        with mock.patch.object(H, 'step', return_value={'pass': False, 'detail': 'x', 'base': said}):
+            self.assertEqual(H.restore('rig_jlink', board, {'echo': image}, self.dir, None)['base'], said)
+
 
 class Step(Base):
     def test_a_test_function_gets_the_roster_board(self):
@@ -1377,6 +1405,15 @@ class Commission(Base):
         self.assertEqual(code, 4)
         self.assertIn('want one 239a:cafe with serial OUID, found 2', result['error'])
         self.assertEqual(result['holder'], {'token': 'tok123'})
+
+    def test_a_failed_flash_names_the_base_state(self):
+        def flash(f, image, *a):
+            image['base']['state'] = 'matched'
+            return 'J-Link flash: x'
+        code, result, _ = self.commission('rig_jlink', {'vidPid': '1234:5678', 'base': {'state': None}}, flash=flash,
+                                          scan=mock.Mock(return_value=[]))
+        self.assertEqual((code, result['base'], result['error']),
+                         (4, 'matched', 'RuntimeError: flash: J-Link flash: x'))
 
     def test_unclean_commission_marks_the_board_pending_and_keeps_a_report(self):
         def detach(*a):

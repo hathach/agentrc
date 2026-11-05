@@ -449,7 +449,9 @@ def jlink_session(flasher, cmds, run_dir, tracker):
 def ensure_base(flasher, base, run_dir, tracker):
     """Check the board holds its base image (each run verified in place) and rewrite it only on a proven
     difference, with no reset or go after it (the sketch's flash resets the target); '' or why it failed. A session
-    that proves nothing (a read failure, no connection) writes nothing."""
+    that proves nothing (a read failure, no connection) writes nothing. `state` names this check's outcome, None until
+    it has one (the dict is shared by every image and step)."""
+    base['state'] = None
     verify = [f'verifybin {path},{start:#x}' for start, path in base['bins']]
     op = jlink_session(flasher, ['halt', *verify], run_dir, tracker)
     why = A.flash.jlink_problem(op)
@@ -635,6 +637,11 @@ def console_tty(board, deadline):
     return node(probes[0], '*:*/tty/tty*', deadline)
 
 
+def base_state(image):
+    """The row field naming what the operation's base check did (None: it proved nothing), for a board with one."""
+    return {'base': image['base']['state']} if image.get('base') else {}
+
+
 def step(name, board, image, test, run_dir, tracker):
     """Flash the test's sketch, wait for the DUT to enumerate anew, run the host check. A dict row."""
     if role(name) == 'host':
@@ -643,15 +650,15 @@ def step(name, board, image, test, run_dir, tracker):
     vid_pid = image['vidPid']
     why, detached, dev = flash_and_enumerate(name, board, image, run_dir, tracker)
     if why:
-        return {'test': test, 'pass': False, 'detail': why, 'detach': detached}
+        return {'test': test, 'pass': False, 'detail': why, 'detach': detached, **base_state(image)}
     if not dev:
         others = [d['busport'] for d in devices(vid_pid)]
         return {'test': test, 'pass': False, 'detail': f'no {vid_pid} {dut_name(board)} enumerated anew within '
-                                                       f'{ENUM_TIMEOUT}s (that VID:PID at: {others})'}
+                                                       f'{ENUM_TIMEOUT}s (that VID:PID at: {others})',
+                **base_state(image)}
     ok, detail = run_test(test, dev, tracker, run_dir, board)
     return {'test': test, 'pass': ok, 'detail': detail, 'device': dev['busport'], 'detach': detached,
-            'seconds': round(time.monotonic() - started, 1),
-            **({'base': image['base']['state']} if image.get('base') else {})}
+            'seconds': round(time.monotonic() - started, 1), **base_state(image)}
 
 
 def run_test(test, dev, tracker, run_dir, board):
@@ -670,7 +677,7 @@ def restore(name, board, images, run_dir, tracker):
     sketch = restore_sketch(name)
     row = step(name, board, images[sketch], P.RESTORE_TEST[role(name)], run_dir, tracker)
     return {'pass': row['pass'], 'state': f'{sketch} restored' if row['pass'] else 'unknown',
-            'evidence': row['detail']}
+            'evidence': row['detail'], **({'base': row['base']} if 'base' in row else {})}
 
 
 # ---- the battery
@@ -1195,15 +1202,17 @@ def flash_only(name, board, image, run_dir, tracker):
     what = written(board['flasher'], image)
     if role(name) == 'host':   # no DUT on this host's bus: the console shows what runs
         why = flash(board['flasher'], image, run_dir, tracker)
-        return {'pass': not why, 'detail': why or f'flashed {what} (a host board: read its console)'}
+        return {'pass': not why, 'detail': why or f'flashed {what} (a host board: read its console)',
+                **base_state(image)}
     why, detached, dev = flash_and_enumerate(name, board, image, run_dir, tracker)
     if why:
-        return {'pass': False, 'detail': why, 'detach': detached}
+        return {'pass': False, 'detail': why, 'detach': detached, **base_state(image)}
     if not dev:
         return {'pass': True, 'detail': f'flashed {what}; no {image["vidPid"]} {dut_name(board)} enumerated (the '
-                                        f'image may not run USB)'}
+                                        f'image may not run USB)', **base_state(image)}
     return {'pass': True, 'detail': f'flashed {what}; enumerated as {image["vidPid"]} at {dev["busport"]}',
-            'device': {'busport': dev['busport'], 'devnum': dev.get('devnum'), 'after': dev['after']}}
+            'device': {'busport': dev['busport'], 'devnum': dev.get('devnum'), 'after': dev['after']},
+            **base_state(image)}
 
 
 def cmd_commission(args):
@@ -1247,6 +1256,7 @@ def cmd_commission(args):
             if action == 'flash':
                 detach(args.board, board, image['vidPid'], tracker)
                 why = flash(board['flasher'], image, run_dir, tracker)
+                out.update(base_state(image))
             else:
                 detach(args.board, board, image['vidPid'], tracker)
                 why = reset(board['flasher'], tracker)
