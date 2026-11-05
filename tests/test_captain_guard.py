@@ -94,7 +94,9 @@ class VerdictTest(unittest.TestCase):
                     f'{RUN} relay pr:12 t2', f'{RUN} collect m-0a1b --wait 1740000', f'{RUN} reports',
                     f'{RUN} cancel m-0a1b', f'{RUN} relay t2 t1b',
                     f'{RUN} relay t2 --entry f0a4846d-6b04-428a-8e4d-a4fc931e6cff --digest 3f9a0c1d2e4b5a67',
-                    f'{RUN} withdraw a-0a1b',
+                    f'{RUN} withdraw a-0a1b', f'{RUN} watch all', f'{RUN} watch t2 pr:12', f'{RUN} watches',
+                    f'{RUN} collect --from 12 --wait 1740000', f'{RUN} reports --json j-0a1b:12 m-0a1b',
+                    f'{RUN} cancel w-0a1b',
                     f'{RUN} open --checkout /home/u/code/repo --account ada --name repo',
                     f'{RUN} open --checkout ~/code/repo --account main',
                     f'python3 {home_script} list']:
@@ -110,6 +112,7 @@ class VerdictTest(unittest.TestCase):
                     f'{RUN} ask ../etc', f'{RUN} ask ~root', 'python3 -c print(1)', f'cd /w && {RUN} list',
                     f'{RUN} ask t2 --file=/etc/passwd', f'{RUN} accept --action a-1',
                     f'{RUN} outcome --action a-1 --result completed', f'{RUN} ask /etc/passwd',
+                    f'{RUN} brief --pending', f'{RUN} brief --for m-1',
                     f'{RUN} open --checkout /home/u/../../etc --account main', f'{RUN} open --name /tmp/x',
                     f'{RUN} open --checkout ~root/x --account main', 'hc send t2 /exit',
                     'hc kill t2', 'hc keys t2 enter', 'hc run --bg claude', 'herdr-app do space.close',

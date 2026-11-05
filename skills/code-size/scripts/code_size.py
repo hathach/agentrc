@@ -37,6 +37,8 @@ Every engine takes flash/RAM buckets from the elf's section and program headers
 (section_buckets()); the other engines' 'all' sums what they attribute.
 
 Profile (a module; required unless marked optional):
+  PROFILE_API: the profile protocol version it follows, the engine's PROFILE_API (now 1); main()
+      refuses another. A profile moves to the new value once it follows the change that bumped it.
   NAME: the project's files label ("TinyUSB"); ROOT: the checkout; OUT_DIR: the reports dir,
       gitignored; BASE_BRANCH: diff's default --base-branch.
   DEFAULT_ENGINE (optional): --engine's default, else membrowse; it must be an offered one.
@@ -96,6 +98,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), '..
 import windows  # noqa: E402
 
 FILES = ('lib/windows.py',)   # imported from the checkout's lib/
+PROFILE_API = 1   # bump on a change a project profile must follow; main() refuses a profile following another
 WINDOWS = os.name == 'nt'
 if WINDOWS:
     import msvcrt
@@ -2199,7 +2202,8 @@ def example_arg(value):
     return example
 
 
-REQUIRED = ('NAME', 'ROOT', 'OUT_DIR', 'BASE_BRANCH', 'filters', 'check', 'build', 'elfs', 'prepare_base')
+REQUIRED = ('PROFILE_API', 'NAME', 'ROOT', 'OUT_DIR', 'BASE_BRANCH', 'filters', 'check', 'build', 'elfs',
+            'prepare_base')
 
 
 def has(*names):
@@ -2212,6 +2216,11 @@ def main(project, argv=None):
     global profile, ROOT, OUT_DIR, verbose
     if missing := [n for n in REQUIRED if not hasattr(project, n)]:
         print(f'code-size: refused: profile {getattr(project, "__file__", project)} lacks {", ".join(missing)}',
+              file=sys.stderr)
+        return 2
+    if project.PROFILE_API != PROFILE_API:
+        print(f'code-size: refused: profile {getattr(project, "__file__", project)} follows profile API '
+              f'{project.PROFILE_API!r}, this engine implements {PROFILE_API}: use an agentrc whose engine does',
               file=sys.stderr)
         return 2
     profile, ROOT, OUT_DIR = project, os.path.abspath(project.ROOT), os.path.abspath(project.OUT_DIR)

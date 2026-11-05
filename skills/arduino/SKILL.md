@@ -1,6 +1,6 @@
 ---
 name: arduino
-description: Shared mechanics of an Arduino library's build and HIL contracts (Adafruit TinyUSB Arduino, Adafruit SPIFlash) - arduino-cli builds against the checkout, prepared dependencies, the HIL build record, the HIL harness and its remote runs. Use when a library's build or HIL contract names it, when adding agent build/HIL support to another Arduino library, or when a record, dependency or identity refusal from one of those contracts needs explaining; also before changing those libraries' C/C++ (format rules).
+description: Shared mechanics of an Arduino library's or core's build and HIL contracts (Adafruit TinyUSB Arduino, Adafruit SPIFlash, the Adafruit SAMD core) - arduino-cli builds against the checkout, prepared dependencies, the HIL build record, the HIL harness and its remote runs. Use when a library's or core's build or HIL contract names it, when adding agent build/HIL support to another Arduino library or core, or when a record, dependency or identity refusal from one of those contracts needs explaining; also before changing those libraries' C/C++ (format rules).
 ---
 
 # arduino — the shared Arduino library contract mechanics
@@ -87,6 +87,32 @@ retries, recovery) apply unchanged; these scripts load its `hil_*` scripts throu
 - TinyUSB Arduino's vendored TinyUSB (the paths its `CLAUDE.md` names) keeps tinyusb's format: fix it in
   hathach/tinyusb under tinyusb's `.clang-format`, then copy it back as that `CLAUDE.md` says.
 
+## A core
+
+An Arduino core (a platform checkout such as adafruit/ArduinoCore-samd) uses the same engines in core mode: its build
+profile names `PLATFORM` (`vendor:arch`) and the other optional names `arduino_build.py`'s docstring lists. What
+changes from a library:
+
+- **Builds** compile through an isolated arduino-cli environment per run (`build/.arduino-cli-<pid>/`): a config
+  whose sketchbook links `hardware/<vendor>/<arch>` to the checkout and holds only the prepared dependencies, the
+  user's data dir (toolchains) unchanged. A build whose platform resolves anywhere but the checkout fails, so neither
+  an installed copy of the core nor a `~/Arduino/hardware` link to another checkout is ever tested by mistake.
+- **Libraries the core bundles** are its own: a user copy of one is never prepared and fails a build that used it
+  (library mode admits such a shadow). Dependencies are the profile's `EXTRA_DEPENDENCIES` and their `depends=`.
+- **Sketches** are every `*.ino` dir under `SKETCH_ROOTS` (the bundled libraries, `extras/` included, as a core's
+  `tools/build_all.py` scans), eligible by that script's `.all.test.skip` / `.<platform>.test.skip` /
+  `.<platform>.test.only` markers and the profile's `exclude()`; they build under their path, since bundled libraries
+  share example names. A changed sketch file selects that sketch before the profile's rules.
+- **Selection** adds two effects for `classify_source`: `boards` (every eligible sketch on the named boards, e.g. a
+  `boards.txt` or `platform.txt` change on CI's matrix) and `sketches` (the named sketches on every representative,
+  e.g. a bundled library's source).
+- **One rig board, several menus**: the profile's `fqbn(board, example)` gives a HIL sketch its own FQBN (a USB stack
+  menu); the record keeps each sketch's FQBN and the report names them (`firmware.fqbns`).
+- **Identity**: a record also binds the submodules (`git submodule status --recursive`) and refuses one that is not
+  initialised, not at its gitlink or dirty (each one's own worktree, at any depth, whatever its `ignore` setting),
+  `--experimental` included: a record's patch carries no submodule bytes. A record also refuses any untracked file.
+  Foreign headers are those from another copy of the core (by `platform.txt` `name=`).
+
 ## CI
 
 `arduino_ci.py` (a library's `hil_ci.py` wraps it) splits a HIL run across GitHub runners: a hosted runner per board
@@ -115,3 +141,6 @@ user. The library's workflow and report comment are its own.
 5. Contract tests for the profile in `.claude/test/`, a pre-commit hook running `agentrc_pin.py test` (the installed
    agentrc locally, the pin in CI) beside the clang-format hook (Code format), and a `CLAUDE.md` naming the build and
    HIL contracts.
+
+A core follows the same steps with its core-mode profile; its `agentrc_pin.py` copy also refuses engines without
+core mode (`'core'` missing from `arduino_build.PROFILE_FEATURES`), since `PROFILE_API` stays 1 for it.

@@ -15,6 +15,7 @@ exit 2 means the facts could not be read, and nothing is filled in.
 ```bash
 S="${AGENTRC_DIR:-$HOME/.claude}/skills/pr-review/scripts"
 python3 "$S/prepare.py" --pr N [--repo O/R] [--full] [--auto-fix]  # checkout top level: pin, worktree, mode; --auto-fix: where repairs would be pushed
+python3 "$S/prepare.py" --pr N --recheck-from SHA              # checkout top level: an auto-fix recheck, scoped to the repair
 python3 "$S/prepare.py" --check --pr N --expected-head SHA       # review worktree: still that head, clean, its pins
 python3 "$S/prepare.py" --release --pr N --token T                # any worktree: unlock that run's review tree
 python3 "$S/threads.py" --pr N --out FILE                         # every comment and thread, bodies in FILE
@@ -148,7 +149,9 @@ pushed, each finding it fixed gets a fix note and its thread resolved
 finds still standing is raised again on a new comment, unless someone reopened
 its thread since, which then still states it. A recheck review the
 ledger cannot vouch for (`ledger.py show --fixable`'s `autoPost` false) stays
-pending for the human. One repair round: what the recheck finds new is
+pending for the human. The recheck reviews only what the repair changed, a base
+merge's own imports left out, and raises no new nit: a nit on a repair would
+only start another round. One repair round: what the recheck finds new is
 reported, and repairing it needs a new request (§1).
 
 ## 4. Launch
@@ -183,7 +186,8 @@ sequence:
 3. The `pr-review` workflow with `{pr, repo, head, mergeBase, scopeBase, mode,
    groups, factsDir: <prepare's facts file's directory>, hil: {choice: 'none'}
    or {choice: 'boards', boards: [rows]}, hardwareRelevant, autoPost,
-   dimensions?}` (`mode: 'discussion'` for prepare's `same`). `dimensions`
+   recheckFrom?, dimensions?}` (`mode: 'discussion'` for prepare's `same`;
+   `recheckFrom` is prepare's, set only on the recheck of step 6.4). `dimensions`
    comes from the project's instruction file when it names review dimensions.
    Under auto-fix with `repair.submittedReview`, steps 3 to 5 are skipped when
    `repair.state` is `available` or `repair` has `deferredAnswers` (the answers
@@ -243,20 +247,26 @@ sequence:
    4. Recheck once the PR head is the one pr-babysit left, its last launch
       reading's `checkout.head`. When that is still the reviewed head and
       answers were deferred, step 6 ends with their publication instead, since
-      prepare refuses a head with a pending draft. Otherwise `prepare.py --pr N`
-      from the launcher's checkout top level, with `--token <it>` when
-      `lock.token` is set: its `head` other than that one stops the recheck
-      before anything is posted ("head moved after repair"), and step 8
-      releases the lock. `same` with no new reply ends it; `same` with replies
-      takes a `discussion` run, pending; any other mode takes steps 1 to 4 on
-      the new head, its hardware rows from runs on that head, then `threads.py`
-      and `ledger.py show --fixable` on the reviewed head again:
-      `autoPost` true takes `post.py --auto` on the new head, else plain
+      prepare refuses a head with a pending draft. Otherwise `prepare.py --pr N
+      --recheck-from <reviewed head>` from the launcher's checkout top level,
+      with `--token <it>` when `lock.token` is set: its `head` other than that
+      one stops the recheck before anything is posted ("head moved after
+      repair"), and step 8 releases the lock. Its scope is the repair: from the
+      reviewed head, or after a base merge from a synthetic base that leaves
+      the merge's imports out; a base merge with a conflict other than contents
+      refuses, and that refusal is reported with the recheck pending; a head
+      the reviewed head is not an ancestor of takes `full`. `same` with no new
+      reply ends it; `same` with replies takes a `discussion` run, pending; any
+      other mode takes steps 1 to 4 on the new head, its hardware rows from runs
+      on that head, then `threads.py` and `ledger.py show --fixable` on the
+      reviewed head again: `autoPost` true takes `post.py --auto` on the new head, else plain
       `post.py`, naming the held findings. A blocker prepare or post names is
       reported, never worked around.
 7. Report the verdict and its reasons, the counts, coverage lost, the CI and
    HIL rows, the receipts, `post.py`'s `firstLineUnchecked`
-   and the result's `heldThreads`; never the draft's text. Under auto-fix also the repair state,
+   and the result's `heldThreads`; never the draft's text. A recheck also
+   reports its scope base and `suppressedNits`, the new nits it did not raise.
+   Under auto-fix also the repair state,
    whether the repair took this run's review or reused submitted review `repair.submittedReview`,
    the answers the closing plain `post.py` skipped as stale and the pending review it left, which blocks
    the next run until the human settles it,

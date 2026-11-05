@@ -47,7 +47,8 @@ PUBLISH = {'create': {'--repo': REPO, '--allow-repo': REPO, '--title-file': None
                       '--label': 'follow-up'},
            'comment': {'--repo': REPO, '--allow-repo': REPO, '--issue': None, '--body-file': None}}
 ISSUE = re.compile(r'[1-9][0-9]{0,11}')
-SUBCOMMANDS = ('list', 'enroll', 'ask', 'collect', 'reports', 'cancel', 'relay', 'withdraw', 'open')
+SUBCOMMANDS = ('list', 'enroll', 'ask', 'watch', 'watches', 'collect', 'reports', 'cancel', 'relay', 'withdraw',
+               'open')
 TOKEN = re.compile(r'[A-Za-z0-9][A-Za-z0-9:._=-]*|--[a-z][a-z-]*')
 CHECKOUT = re.compile(r'(?:/|~/)[A-Za-z0-9._/-]*')   # a path, only as the value of open's --checkout
 SHELL = re.compile(r'[^A-Za-z0-9 :._=/~,-]')   # any quoting, expansion, redirection, separator or newline

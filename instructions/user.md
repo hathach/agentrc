@@ -76,11 +76,13 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   confusing one.
 - Match the surrounding file's comment density and style; don't add comments
   to untouched code while editing something nearby.
-- Same rule for commit messages and PR descriptions: imperative subject, and a
+- Same rule for commit messages and PR titles: imperative subject. A commit
   body only when there is a *why* the diff cannot show (cause, trade-off,
-  measurement, spec/issue reference). A one-line message is a fine message.
+  measurement, spec/issue reference). A one-line commit is a fine commit.
 - PR descriptions: keep scope focused, link relevant issues, and state the
-  test/build evidence there rather than in commit bodies.
+  test/build evidence there rather than in commit bodies. Give the cause a
+  `## Problem` section and the fix a `## Solution` section, never one paragraph
+  running into the other.
 - Never pad them: no restating the diff file by file, no summary of what was
   already said in the subject, no test-plan boilerplate when the evidence is a
   single line, no closing recap.
@@ -131,7 +133,9 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   with `brief` then `report`, nothing else, and no recap. A
   `RELAYED HUMAN INSTRUCTION` is the human's words only as `accept` prints
   them: act on them under your normal rules, never wider, and close it with
-  `outcome`. Run each as
+  `outcome`. A `STATUS WATCH` brief, from a hook or `brief --pending`, is
+  reported at the end of each task as it says, never wider; if a compaction
+  leaves it out of view, run `brief --pending`. Run each as
   `python3 ~/.claude/skills/captain/scripts/captain.py`, taking only the id
   and the option names from the message, never its script path or variables.
 - After each implementation step of a plan, send the other agent that step's

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""The Arduino build mechanics a library's build contract runs (agentrc `arduino` skill): selection, arduino-cli
-compiles against the library's checkout, dependency and header provenance, image span checks and the HIL build
+"""The Arduino build mechanics a library's or a core's build contract runs (agentrc `arduino` skill): selection,
+arduino-cli compiles against the checkout, dependency and header provenance, image span checks and the HIL build
 record. Stdlib only.
 
 A library's `check_build.py` is its profile: it defines the names below and calls run(profile) from its own entry
@@ -24,7 +24,18 @@ point, loading this file from the pinned agentrc (its `agentrc_pin.py`). One pro
                         agentrc_pin.py): its checkout's HEAD, the closure (agentrc-relative) and each file's sha256 as
                         loaded, whether the closure differs from HEAD, and installed, pin or staged
 
+A core's profile (an Arduino platform checkout, e.g. adafruit:samd) adds these, all optional for a library:
+
+  PLATFORM              'vendor:arch': core mode. Sketches compile through an isolated sketchbook whose
+                        hardware/<vendor>/<arch> is ROOT; LIBRARY_NAME is the platform's name (platform.txt `name=`)
+  SKETCH_ROOTS          dirs whose *.ino sketch dirs are the examples (a library: ('examples',))
+  exclude(board, example)  True drops a sketch the core's CI never builds on that board, beside the
+                        .all.test.skip / .<filters>.test.skip / .<filters>.test.only markers its build_all.py reads
+                        (honoured in a library too)
+  fqbn(board, example)  the FQBN a sketch builds with on `board` (default the board's): one rig board, two menus
+
 PROFILE_API is the profile interface the three engines implement; a library's bootstrap refuses any other unloaded.
+PROFILE_FEATURES names the additive capabilities a bootstrap may require of these engines ('core': core mode).
 
 The JSON contract (stdout's last line, exits 0 pass, 1 failed, 2 usage or a missing prerequisite, 3 uncovered) is
 the library's build SKILL.md.
@@ -51,6 +62,7 @@ FILES = ('skills/hil/boards.json', 'skills/hil/scripts/hil_boards.py', 'skills/h
 SELF = 'skills/arduino/scripts/arduino_build.py'
 SCHEMA = 2
 PROFILE_API = 1   # bump on a change a library profile must follow, arduino_hil's and arduino_remote's included
+PROFILE_FEATURES = ('core',)
 COMPILE_TIMEOUT = 900
 BUILD_SCRIPTS = '.claude/skills/build/scripts/'
 HIL_CONTROL = ('.claude/skills/hil-contract/scripts/', 'test/hil/')
@@ -103,8 +115,18 @@ def fail(msg, **extra):
     sys.exit(2)
 
 
+@functools.cache
+def _git_local_vars():
+    names = subprocess.run(['git', 'rev-parse', '--local-env-vars'], capture_output=True, text=True).stdout.split()
+    if not names:
+        fail('git rev-parse --local-env-vars listed nothing: cannot keep a caller\'s GIT_* off the checkout')
+    return frozenset(names)
+
+
 def git(*args, check=True):
-    p = subprocess.run(['git', '-C', str(P.ROOT), *args], capture_output=True, text=True)
+    """git in the checkout, deaf to the GIT_* that would aim it elsewhere (a hook's GIT_DIR, GIT_INDEX_FILE...)."""
+    env = {k: v for k, v in os.environ.items() if k not in _git_local_vars()}
+    p = subprocess.run(['git', '-C', str(P.ROOT), *args], capture_output=True, text=True, env=env)
     if check and p.returncode:
         fail(f'git {" ".join(args)}: {p.stderr.strip()}')
     return p.stdout
@@ -124,35 +146,62 @@ def rel(path):
 
 # ---- examples and ci-arduino's filters
 
+def core_mode():
+    return bool(getattr(P, 'PLATFORM', None))
+
+
+def sketch_roots():
+    return tuple(getattr(P, 'SKETCH_ROOTS', ('examples',)))
+
+
+def is_example(path):
+    return path.startswith(tuple(r + '/' for r in sketch_roots()))
+
+
 @functools.lru_cache(maxsize=None)
-def _examples(root):
-    return sorted({Path(p.parent).resolve().relative_to(root).as_posix() for p in (root / 'examples').rglob('*.ino')})
+def _examples(root, roots):
+    return sorted({Path(p.parent).resolve().relative_to(root).as_posix() for r in roots
+                   for p in (root / r).rglob('*.ino')})
 
 
 def examples():
-    """Every sketch dir (holding an .ino) under examples/, repo-relative, sorted."""
-    return _examples(P.ROOT)
+    """Every sketch dir (holding an .ino) under the sketch roots, repo-relative, sorted."""
+    return _examples(P.ROOT, sketch_roots())
 
 
 @functools.lru_cache(maxsize=None)
-def _eligible(root, platform, example):
+def _eligible(root, platform, example, core):
+    """ci-arduino's markers, or a core's tools/build_all.py ones (adafruit SAMD and nRF52): .all.test.skip in place
+    of .skip.txt."""
     folder = root / example
     if (folder / f'.{platform}.test.skip').exists():
         return False
-    skip_txt = folder / '.skip.txt'
-    if skip_txt.exists() and any(line.strip() == platform for line in skip_txt.read_text().splitlines()):
-        return False
+    if core:
+        if (folder / '.all.test.skip').exists():
+            return False
+    else:
+        skip_txt = folder / '.skip.txt'
+        if skip_txt.exists() and any(line.strip() == platform for line in skip_txt.read_text().splitlines()):
+            return False
     if any(folder.glob('.*.test.only')):
         return (folder / f'.{platform}.test.only').exists()
     return True
 
 
 def eligible(board, example):
-    """ci-arduino build_platform.py test_examples_in_folder, for the board's filter platform. A HIL sketch outside
-    examples/ is eligible on the rig boards whose role runs it, and nowhere else."""
-    if not example.startswith('examples/'):
+    """ci-arduino build_platform.py test_examples_in_folder (a core: its build_all.py markers) and the profile's
+    exclude(), for the board's filter platform. A HIL sketch outside the sketch roots is eligible on the rig boards whose role runs it,
+    and nowhere else."""
+    if not is_example(example):
         return 'span' in P.BOARDS[board] and example in hil_sketches(board)
-    return _eligible(P.ROOT, P.BOARDS[board].get('filters', board), example)
+    exclude = getattr(P, 'exclude', None)
+    return (_eligible(P.ROOT, P.BOARDS[board].get('filters', board), example, core_mode())
+            and not (exclude and exclude(board, example)))
+
+
+def fqbn(board, example):
+    hook = getattr(P, 'fqbn', None)
+    return hook(board, example) if hook else P.BOARDS[board]['fqbn']
 
 
 # ---- selection
@@ -171,14 +220,24 @@ def hil_sketch_of(path):
     """The HIL sketch dir outside examples/ holding `path`, or None."""
     for sketches in P.HIL_SKETCHES.values():
         for s in sketches:
-            if not s.startswith('examples/') and path.startswith(s + '/'):
+            if not is_example(s) and path.startswith(s + '/'):
                 return s
     return None
 
 
+def example_of(path):
+    """The example sketch dir holding `path`, or None."""
+    return next((ex for ex in examples() if path.startswith(ex + '/')), None)
+
+
 def classify(path):
-    """(effect, detail, reason) for one changed path, first match wins: the library's source rules, then the
-    common ones. effect: family | shared | example | hil_sketch | tests | fixture | hil | nothing | uncovered."""
+    """(effect, detail, reason) for one changed path, first match wins: in a core an example sketch's own files, the
+    profile's source rules, then the common ones. effect: family | shared | boards | sketches | example | hil_sketch |
+    tests | fixture | hil | nothing | uncovered; `boards` builds every eligible sketch on the boards its detail names,
+    `sketches` the sketch dirs its detail names on every representative."""
+    ex = example_of(path)
+    if core_mode() and ex:
+        return 'example', ex, 'example sketch'
     own = P.classify_source(path)
     if own:
         return own
@@ -186,10 +245,9 @@ def classify(path):
         return 'shared', None, 'name= and depends= decide which libraries every build may use'
     if path.startswith('src/'):
         return 'shared', None, 'shared library code'
-    if path.startswith('examples/'):
-        for ex in examples():
-            if path.startswith(ex + '/'):
-                return 'example', ex, 'example sketch'
+    if is_example(path):
+        if ex:
+            return 'example', ex, 'example sketch'
         if path.endswith(('.md', '.txt', '.js', '.json', '.py', '.html')):
             return 'nothing', None, 'example documentation or host-side helper'
         return 'uncovered', None, 'under examples/ but in no sketch dir'
@@ -213,6 +271,7 @@ def classify(path):
 def select(paths, roster=None, only_examples=None):
     builds, tests, out_paths, uncovered = {}, set(), [], []
     hil_picked, hil_full = set(), False
+    reps = [b for f in P.REPRESENTATIVES for b in P.REPRESENTATIVES[f]]
 
     def add(board, exs):
         builds.setdefault(board, set()).update(e for e in exs if eligible(board, e) and
@@ -223,13 +282,19 @@ def select(paths, roster=None, only_examples=None):
         out_paths.append({'path': path, 'rule': effect, 'reason': reason})
         if effect == 'uncovered':
             uncovered.append({'path': path, 'reason': reason})
-        elif effect in ('family', 'shared'):
-            families = [detail] if effect == 'family' else list(P.REPRESENTATIVES)
-            boards = [b for f in families for b in P.REPRESENTATIVES[f]]
+        elif effect in ('family', 'shared', 'boards'):
+            boards = (detail if effect == 'boards' else
+                      P.REPRESENTATIVES[detail] if effect == 'family' else reps)
             for b in boards:
                 add(b, examples())
             if roster:
+                families = {P.BOARDS[b]['family'] for b in boards}
                 hil_picked.update(b for b in roster if P.BOARDS[b]['family'] in families)
+        elif effect == 'sketches':
+            uncovered += [{'path': path, 'reason': f'{s} is eligible on no representative'} for s in detail
+                          if not any(eligible(b, s) for b in reps)]
+            for b in reps:
+                add(b, detail)
         elif effect == 'example':
             if not buildable(detail):
                 uncovered.append({'path': path, 'reason': 'sketch eligible on no board this contract builds'})
@@ -280,6 +345,8 @@ def uncovered_by_roster(paths, roster):
             reached.add(detail)
         elif effect == 'shared':
             reached.update(P.REPRESENTATIVES)
+        elif effect == 'boards':
+            reached.update(P.BOARDS[b]['family'] for b in detail)
     covered = {P.BOARDS[b]['family'] for b in roster}
     return [{'family': f, 'reason': 'no roster board of this family on this host'} for f in sorted(reached - covered)]
 
@@ -347,8 +414,9 @@ def depends(props_path):
 
 
 def declared_dependencies():
-    """library.properties `depends=` plus the profile's EXTRA_DEPENDENCIES, in order."""
-    return list(dict.fromkeys([*depends(P.ROOT / 'library.properties'), *P.EXTRA_DEPENDENCIES]))
+    """library.properties `depends=` (a core has none) plus the profile's EXTRA_DEPENDENCIES, in order."""
+    own = [] if core_mode() else depends(P.ROOT / 'library.properties')
+    return list(dict.fromkeys([*own, *P.EXTRA_DEPENDENCIES]))
 
 
 def _cli_json(*args):
@@ -412,16 +480,23 @@ def prepared_dependencies():
     transitively, as installed in the user's libraries, checked once before any compile; exit 2 naming the
     `arduino-cli lib install` line when one is missing. A user copy of a library a core bundles joins too, marked
     `shadowOnly` (unexplained_libraries admits it per build), so it is hashed before any compile like the rest.
+    In a core a library it bundles is its own: never a user copy, its depends= read from the bundled one.
     Nothing is installed here: the environment is prepared beforehand, never during parallel builds."""
     installed = {}
     for item in _cli_json('lib', 'list').get('installed_libraries', []):
         lib = item.get('library', {})
         if lib.get('location') == 'user' and lib.get('name'):
             installed.setdefault(lib['name'], lib)
-    order, missing, todo = [], [], declared_dependencies()
+    own = bundled_libraries(str(P.ROOT)) if core_mode() else {}
+    order, missing, todo, seen_own = [], [], declared_dependencies(), set()
     while todo:
         name = todo.pop(0)
-        if name in order or name in missing or name == P.LIBRARY_NAME:
+        if name in order or name in missing or name == P.LIBRARY_NAME or name in seen_own:
+            continue
+        if name in own:
+            seen_own.add(name)
+            props = Path(own[name]) / 'library.properties'
+            todo += depends(props)
             continue
         if name not in installed:
             missing.append(name)
@@ -433,6 +508,8 @@ def prepared_dependencies():
         fail(f'dependencies not installed: {missing}',
              remedy='arduino-cli lib install ' + ' '.join(f'"{n}"' for n in missing))
     prepared = {n: _lib_identity(installed[n]) for n in order}
+    if core_mode():
+        return prepared
     bundled = core_bundled_names()
     for n in sorted(set(installed) & bundled - set(order) - {P.LIBRARY_NAME}):
         prepared[n] = {**_lib_identity(installed[n]), 'shadowOnly': True}
@@ -500,7 +577,7 @@ def tool_version():
 
 def foreign_headers(build_dir):
     """Headers a build's .d files took from another copy of this library (a core's bundled one, another checkout),
-    each with its counterpart path here and whether the bytes match."""
+    or in a core from another copy of the core, each with its counterpart path here and whether the bytes match."""
     found, roots, seen = {}, {}, set()
     for dfile in Path(build_dir).rglob('*.d'):
         text = dfile.read_text(errors='replace').replace('\\\n', ' ')
@@ -508,7 +585,7 @@ def foreign_headers(build_dir):
             if token.endswith(':') or not token.startswith('/') or token in seen:
                 continue
             seen.add(token)
-            p = Path(token)
+            p = Path(os.path.realpath(token)) if core_mode() else Path(token)   # the sketchbook links to ROOT
             if P.ROOT in p.parents:
                 continue
             root = library_root(p, roots)
@@ -522,14 +599,15 @@ def foreign_headers(build_dir):
 
 
 def library_root(path, cache):
-    """The root of the copy of this library that `path` sits in, or None."""
+    """The root of the copy of this library (a core: of this platform, by platform.txt `name=`) that `path` sits in,
+    or None."""
     walked, root = [], None
     for parent in path.parents:
         if parent in cache:
             root = cache[parent]
             break
         walked.append(parent)
-        props = parent / 'library.properties'
+        props = parent / ('platform.txt' if core_mode() else 'library.properties')
         if props.exists():
             name = re.search(r'^name=(.*)$', props.read_text(errors='replace'), re.M)
             root = parent if name and name.group(1).strip() == P.LIBRARY_NAME else None
@@ -541,23 +619,43 @@ def library_root(path, cache):
 
 def sketch_source(board, example, build_dir):
     """The sketch dir to compile: the example, or for a board with a `fixture` a copy of it beside the build dir with
-    the fixture added (examples stay untouched)."""
+    the fixture added (examples stay untouched), one per build key and named as the sketch, as arduino-cli needs."""
     fixture = P.BOARDS[board].get('fixture')
     if not fixture:
         return P.ROOT / example
-    copy = build_dir.parent / '.sketch' / Path(example).name
+    copy = build_dir.parent / '.sketch' / build_dir.name / Path(example).name
     shutil.rmtree(copy, ignore_errors=True)
     shutil.copytree(P.ROOT / example, copy)
     shutil.copy2(P.ROOT / fixture, copy / Path(fixture).name)
     return copy
 
 
-def compile_sketch(board, example, build_dir, properties, prepared):
+def cli_env(at, prepared):
+    """A core's isolated arduino-cli environment under `at`: a config whose directories.user is a sketchbook with
+    hardware/<vendor>/<arch> linked to ROOT and libraries/ holding links to the prepared dependencies only, so no user
+    copy shadows a library the core bundles and no other copy of the core is in reach; data (toolchains) and
+    downloads stay the user's. Returns the config path."""
+    vendor, arch = P.PLATFORM.split(':')
+    shutil.rmtree(at, ignore_errors=True)
+    (at / 'sketchbook' / 'hardware' / vendor).mkdir(parents=True)
+    (at / 'sketchbook' / 'hardware' / vendor / arch).symlink_to(P.ROOT, target_is_directory=True)
+    libs = at / 'sketchbook' / 'libraries'
+    libs.mkdir()
+    for dep in prepared.values():
+        (libs / Path(dep['dir']).name).symlink_to(Path(dep['dir']).resolve(), target_is_directory=True)
+    config = _cli_json('config', 'dump').get('config', {})
+    config.setdefault('directories', {})['user'] = str(at / 'sketchbook')
+    path = at / 'arduino-cli.yaml'
+    path.write_text(json.dumps(config))   # JSON is YAML
+    return path
+
+
+def compile_sketch(board, example, build_dir, properties, prepared, config=None):
     shutil.rmtree(build_dir, ignore_errors=True)
     build_dir.mkdir(parents=True)
-    fqbn = P.BOARDS[board]['fqbn']
-    cmd = ['arduino-cli', 'compile', '--clean', '--format', 'json', '--warnings', 'all', '--fqbn', fqbn,
-           '--library', str(P.ROOT), '--build-path', str(build_dir)]
+    fqbn_ = fqbn(board, example)
+    cmd = ['arduino-cli', 'compile', '--clean', '--format', 'json', '--warnings', 'all', '--fqbn', fqbn_,
+           *(['--config-file', str(config)] if config else ['--library', str(P.ROOT)]), '--build-path', str(build_dir)]
     for prop in properties:
         cmd += ['--build-property', prop]
     cmd.append(str(sketch_source(board, example, build_dir)))
@@ -581,20 +679,29 @@ def compile_sketch(board, example, build_dir, properties, prepared):
         missing = re.search(r'(Platform .* is not found|platform not installed|Error resolving FQBN[^\n]*)', err)
         if missing:
             row.update(status='error', firstError=missing.group(0),
-                       remedy=f'arduino-cli core install {":".join(fqbn.split(":")[:2])}')
+                       remedy=f'arduino-cli core install {":".join(fqbn_.split(":")[:2])}')
         else:
             lines = [ln for ln in err.splitlines() if 'error' in ln.lower()]
             row.update(status='failed', firstError=(lines or err.strip().splitlines()[-1:] or ['(no output)'])[0])
         return row
     result = out.get('builder_result', {})
     used_libs = result.get('used_libraries', [])
-    used = [lib for lib in used_libs if lib.get('name') == P.LIBRARY_NAME]
-    if not used or Path(used[0]['install_dir']).resolve() != P.ROOT:
-        row.update(status='failed', firstError=f'{P.LIBRARY_NAME} came from '
-                   f'{used[0]["install_dir"] if used else "nowhere"}, not this checkout')
-        return row
     platform = result.get('board_platform') or {}
     build_platform = result.get('build_platform') or {}
+    if core_mode():
+        wrong = [f'{p.get("id")} from {p.get("install_dir")}' for p in (platform, build_platform)
+                 if not p.get('install_dir') or Path(p['install_dir']).resolve() != P.ROOT]
+        if wrong:
+            row.update(status='failed', firstError=f'the platform came from {wrong}, not this checkout')
+            return row
+        platform = {**platform, 'install_dir': str(P.ROOT)}
+        build_platform = {**build_platform, 'install_dir': str(P.ROOT)}
+    else:
+        used = [lib for lib in used_libs if lib.get('name') == P.LIBRARY_NAME]
+        if not used or Path(used[0]['install_dir']).resolve() != P.ROOT:
+            row.update(status='failed', firstError=f'{P.LIBRARY_NAME} came from '
+                       f'{used[0]["install_dir"] if used else "nowhere"}, not this checkout')
+            return row
     bad, shadows = unexplained_libraries(used_libs, prepared,
                                          [platform.get('install_dir'), build_platform.get('install_dir')])
     if bad:
@@ -609,8 +716,13 @@ def compile_sketch(board, example, build_dir, properties, prepared):
             row.update(status='failed', firstError=f'{boot_app0} missing: the ESP core layout changed')
             return row
         shutil.copy2(boot_app0, build_dir / boot_app0.name)
-    row.update(status='ok', platform=platform, buildPlatform=build_platform, shadows=shadows,
-               vidPid=P.vid_pid(build_dir, board, None), foreignHeaders=foreign_headers(build_dir),
+    headers = foreign_headers(build_dir)
+    if core_mode() and headers:   # the isolated environment reaches no other copy: one leaking in fails the sketch
+        row.update(status='failed', foreignHeaders=headers,
+                   firstError=f'compiled against another copy of the core: {[h["path"] for h in headers][:3]}')
+        return row
+    row.update(status='ok', fqbn=fqbn_, platform=platform, buildPlatform=build_platform, shadows=shadows,
+               vidPid=P.vid_pid(build_dir, board, None), foreignHeaders=headers,
                libraries=[{'name': lib.get('name'), 'version': lib.get('version'), 'dir': lib.get('install_dir')}
                           for lib in used_libs],
                artifacts=sorted(rel(f) for f in build_dir.glob('*.ino.*') if f.suffix in ('.elf', '.hex', '.bin',
@@ -618,26 +730,32 @@ def compile_sketch(board, example, build_dir, properties, prepared):
     return row
 
 
+def build_key(example):
+    """The build dir name of a sketch under <root>/<board>/: its basename, or in a core, whose bundled libraries
+    share example names, its whole path for an example (HIL sketches keep the basename the record keys on)."""
+    return example.replace('/', '--') if core_mode() and is_example(example) else Path(example).name
+
+
 def basename_clashes(plan):
-    """Pairs of one board's sketches sharing a basename: both would build into, and the HIL record key on,
-    <root>/<board>/<basename>, the second replacing the first."""
+    """Pairs of one board's sketches sharing a build key: both would build into, and the HIL record key on,
+    <root>/<board>/<key>, the second replacing the first."""
     clashes = []
     for board, exs in plan.items():
         seen = {}
         for e in exs:
-            first = seen.setdefault(Path(e).name, e)
+            first = seen.setdefault(build_key(e), e)
             if first != e:
                 clashes.append(f'{board}: {first} and {e}')
     return clashes
 
 
-def build_all(jobs, plan, root, properties, prepared):
+def build_all(jobs, plan, root, properties, prepared, config=None):
     clashes = basename_clashes(plan)
     if clashes:
         fail(f'sketches sharing a basename would build into one dir: {"; ".join(clashes)}; rename one')
     rows = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
-        futures = [pool.submit(compile_sketch, b, e, root / b / Path(e).name, properties, prepared)
+        futures = [pool.submit(compile_sketch, b, e, root / b / build_key(e), properties, prepared, config)
                    for b, exs in plan.items() for e in exs]
         for f in concurrent.futures.as_completed(futures):
             rows.append(f.result())
@@ -788,11 +906,52 @@ def merge(spans):
 
 # ---- HIL record
 
-def source_identity():
+def worktree_status(subs=None):
+    """`git status --porcelain` of the checkout, plus `~<state> <path>` for each submodule (`subs`, by default
+    submodules()), at any depth, not at its gitlink (state + - U) or whose own worktree has changes (~~): an `ignore`
+    setting at any level hides both from the superproject's status."""
     status = git('status', '--porcelain', '--untracked-files=all')
+    status += ''.join(f'~{"~" if s["state"] == " " else s["state"]} {s["path"]}\n'
+                      for s in (submodules() if subs is None else subs) if s['state'] != ' ' or s['dirty'])
+    return status
+
+
+def source_identity():
+    subs = submodules()
+    status = worktree_status(subs)
     diff = git('diff', 'HEAD', '--binary')
-    return {'head': git('rev-parse', 'HEAD').strip(), 'dirty': bool(status.strip()),
-            'diffSha256': hashlib.sha256(diff.encode()).hexdigest(), 'status': status}, diff
+    ident = {'head': git('rev-parse', 'HEAD').strip(), 'dirty': bool(status.strip()),
+             'diffSha256': hashlib.sha256(diff.encode()).hexdigest(), 'status': status}
+    if subs:
+        ident['submodules'] = subs
+    return ident, diff
+
+
+def submodules():
+    """[{path, commit, state}] of the checkout's submodules, recursive: state is git's status prefix, ' ' at the
+    gitlink, '-' not initialised, '+' at another commit, 'U' conflicted. A core bundles libraries this way."""
+    out = []
+    for line in git('submodule', 'status', '--recursive').splitlines():
+        m = re.match(r'^([ +\-U])([0-9a-f]+) (.+)$', line)
+        if m:
+            state, commit, path = m.groups()
+            if state in ' +':   # git appends ` (<describe>)` to these only; the path itself may hold spaces
+                path = re.sub(r' \([^ ]*\)$', '', path)
+            dirty = False
+            if state != '-':   # =dirty: nested worktrees are their own entries; a gitlink staged here still shows
+                dirty = bool(git('-C', path, 'status', '--porcelain', '--untracked-files=all',
+                                 '--ignore-submodules=dirty').strip())
+            out.append({'path': path, 'commit': commit, 'state': state, 'dirty': dirty})
+    return out
+
+
+def submodule_problems(ident):
+    """Why the checkout's submodules keep a record from binding their bytes, [] when they do not: each must be
+    initialised at its gitlink, and clean (the record's patch carries no submodule content)."""
+    subs = ident.get('submodules', [])
+    return [f'{s["path"]} is {"not initialised" if s["state"] == "-" else "not at its gitlink"}'
+            for s in subs if s['state'] != ' '] + [f'{s["path"]} has changes' for s in subs
+                                                   if s['state'] == ' ' and s['dirty']]
 
 
 def platform_git(install_dir):
@@ -872,7 +1031,8 @@ def make_record(args, board, rows, before, diff, roster_path, prepared):
         if Path(row['example']).name in sketches:
             return None, f'{row["example"]}: another sketch of this record has its basename'
         sketches[Path(row['example']).name] = {
-            'example': row['example'], 'buildDir': row['buildDir'], 'elf': rel(elf),
+            'example': row['example'], 'fqbn': row.get('fqbn', P.BOARDS[board]['fqbn']), 'buildDir': row['buildDir'],
+            'elf': rel(elf),
             'hex': rel(hexfile) if hexfile else None, 'image': image, 'loadSpans': [[s, e] for s, e in spans],
             'vidPid': vid_pid, 'foreignHeaders': row['foreignHeaders'], 'libraries': row.get('libraries', []),
             'sha256': {rel(f): sha256(f) for f in files},
@@ -886,7 +1046,7 @@ def make_record(args, board, rows, before, diff, roster_path, prepared):
     record = {
         'version': SCHEMA, 'kind': 'arduino-hil-build', 'library': P.LIBRARY_NAME, 'board': board,
         'fqbn': P.BOARDS[board]['fqbn'], 'experimental': bool(args.experimental),
-        'source': {k: before[k] for k in ('head', 'dirty', 'diffSha256')},
+        'source': {k: before[k] for k in ('head', 'dirty', 'diffSha256', 'submodules') if k in before},
         'buildProperties': args.build_property, 'arduinoCli': tool_version(),
         'platform': {**platform, 'git': platform_git(platform['install_dir'])},
         'dependencies': list(prepared.values()),
@@ -981,9 +1141,13 @@ def main(argv=None):
         if before['dirty'] and not args.experimental:
             fail('a HIL record needs a clean tree (commit first), or --experimental', dirty=before['status'])
         untracked = [ln[3:] for ln in before['status'].splitlines() if ln.startswith('?? ') and
-                     ln[3:].startswith(SOURCE_DIRS)]
+                     (core_mode() or ln[3:].startswith(SOURCE_DIRS))]   # a core's whole tree is its source
         if untracked:
             fail(f'untracked source would be missing from the record patch: {untracked}')
+        stale = submodule_problems(before)
+        if stale:
+            fail(f'a HIL record binds submodules at their gitlinks, clean: {stale}',
+                 remedy='git submodule update --init --recursive')
     prepared = prepared_dependencies() if any(sel['builds'].values()) else {}
     build_root = P.ROOT / 'build'
     shared = build_root / 'hil'
@@ -996,7 +1160,13 @@ def main(argv=None):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             fail(f'{rel(shared)} is in use by another build or HIL run (its .lock is held)')
-    rows = build_all(args.jobs, sel['builds'], root, args.build_property, prepared)
+    cli_dir = build_root / f'.arduino-cli-{os.getpid()}' if core_mode() and any(sel['builds'].values()) else None
+    try:
+        config = cli_env(cli_dir, prepared) if cli_dir else None
+        rows = build_all(args.jobs, sel['builds'], root, args.build_property, prepared, config)
+    finally:
+        if cli_dir:
+            shutil.rmtree(cli_dir, ignore_errors=True)
     tests = run_tests(sel['tests'])
     record_error, record_path = None, None
     deps = used_dependencies(prepared, rows)
@@ -1023,7 +1193,8 @@ def main(argv=None):
     first = (errors or failed or [{}])[0]
     out = {
         'version': SCHEMA, 'pass': not errors and not failed and not record_error and not sel['uncovered'],
-        'input': {k: before[k] for k in ('head', 'dirty')}, 'narrowed': narrowed, 'boards': rows, 'tests': tests,
+        'input': {k: before[k] for k in ('head', 'dirty', 'submodules') if k in before}, 'narrowed': narrowed,
+        'boards': rows, 'tests': tests,
         'paths': sel['paths'], 'uncovered': sel['uncovered'],
         'dependencies': list(deps.values()),
         'nothingToBuild': not rows and not tests,

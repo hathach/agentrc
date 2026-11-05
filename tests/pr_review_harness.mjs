@@ -64,7 +64,7 @@ async function run(args, stubs = {}) {
     return typeof v === 'function' ? v(prompt, label) : v
   }
   const defaults = {
-    check: { ok: true, head: H, top: '/w', repo: args.repo, pr: args.pr, ci: { state: 'green', counts: {} }, pins: { mergeBase: args.mergeBase, scopeBase: args.scopeBase, mode: args.mode, groups: args.groups } },
+    check: { ok: true, head: H, top: '/w', repo: args.repo, pr: args.pr, ci: { state: 'green', counts: {} }, pins: { mergeBase: args.mergeBase, scopeBase: args.scopeBase, mode: args.mode, groups: args.groups, recheckFrom: null } },
     threads: { file: `${BASE.factsDir}/threads-${H}.json`, count: 0 },
     ledger: { reviews: 0, open: [] },
     claims: { claims: [] },
@@ -116,7 +116,7 @@ async function run(args, stubs = {}) {
   return { result, calls, logs, audits, parsed, labels: calls.map(c => c.label) }
 }
 
-const pinned = (a) => ({ ok: true, head: H, top: '/w', repo: a.repo, pr: a.pr, ci: { state: 'green' }, pins: { mergeBase: a.mergeBase, scopeBase: a.scopeBase, mode: a.mode, groups: a.groups } })
+const pinned = (a) => ({ ok: true, head: H, top: '/w', repo: a.repo, pr: a.pr, ci: { state: 'green' }, pins: { mergeBase: a.mergeBase, scopeBase: a.scopeBase, mode: a.mode, groups: a.groups, recheckFrom: a.recheckFrom ?? null } })
 const board = (verdict, regression, testedHead = H) => ({ board: 'b1', verdict, regression, testedHead, report: '/r/b1.json' })
 // A list's [minItems, maxItems, id enum], as the runtime is asked to hold an answer to.
 const sized = (schema, key, id) => { const l = schema.properties[key]; return [l.minItems, l.maxItems, l.items.properties[id].enum] }
@@ -866,4 +866,58 @@ test('a recheck regrades only with the facts behind it; without them the old lev
   const partial = await run(inc, { ...base, recheck: () => ({ state: 'open', reason: 'still', impact: facts.impact }) })
   assert.deepEqual([partial.result.findings[0].severityReason, partial.result.coverage.unjudged], ['old', [{ kind: 'regrade', id: 'pr7-f1' }]],
     'facts without their level are an incomplete regrade')
+})
+
+// An auto-fix recheck (prepare --recheck-from R): R the reviewed head, S the synthetic base a base merge needs.
+const S = 'd'.repeat(40)
+const RECHECK = { ...BASE, mode: 'incremental', scopeBase: S, recheckFrom: OLD }
+const STANDING = { reviews: 1, last: { head: OLD }, open: [] }
+
+test('a recheck scans from the base prepare pinned and continues the review submitted on the reviewed head', async () => {
+  for (const recheckFrom of ['x', OLD.slice(1), 7]) await assert.rejects(run({ ...RECHECK, recheckFrom }), /recheckFrom/, String(recheckFrom))
+  const ok = await run(RECHECK, { check: pinned(RECHECK), ledger: STANDING, audit: audited(finding('overrun')) })
+  assert.equal(ok.result.status, 'reviewed')
+  assert.deepEqual(ok.audits[0].diff, { base: S, head: H })
+  assert.equal(ok.result.recheckFrom, OLD)
+  assert.equal((await run(RECHECK, { check: pinned(RECHECK), ledger: { ...STANDING, last: { head: S } } })).result.reason, 'ledger-failed')
+  assert.equal((await run(RECHECK, { check: pinned({ ...RECHECK, recheckFrom: null }), ledger: STANDING })).result.reason, 'scope-mismatch', 'pins of no recheck')
+  const plain = { ...BASE, mode: 'incremental', scopeBase: S }
+  assert.equal((await run(plain, { check: pinned(RECHECK), ledger: STANDING })).result.reason, 'scope-mismatch', 'a recheck launched as a plain review')
+  const legacy = { ...BASE, mode: 'incremental', scopeBase: OLD }
+  assert.equal((await run(legacy, { check: pinned(legacy), ledger: STANDING })).result.status, 'reviewed', 'args from before recheckFrom')
+  assert.equal((await run({ ...legacy, recheckFrom: null }, { check: pinned(legacy), ledger: STANDING })).result.status, 'reviewed')
+  const full = { ...BASE, recheckFrom: OLD }
+  assert.equal((await run(full, { check: pinned(full), ledger: STANDING })).result.status, 'reviewed', 'rewritten history: a full recheck')
+  for (const ledger of [{ ...STANDING, last: { head: MB } }, { reviews: 0, open: [] }]) {
+    assert.equal((await run(full, { check: pinned(full), ledger })).result.reason, 'ledger-failed', JSON.stringify(ledger))
+  }
+})
+
+test('a recheck with nothing left to scan runs no audit and still rechecks what stands', async () => {
+  await assert.rejects(run({ ...BASE, groups: [] }), /groups/)
+  const empty = { ...RECHECK, groups: [] }
+  const ledger = { reviews: 1, last: { head: OLD }, open: [{ id: 'pr7-f1', file: 'src/core/a.c', line: 10, severity: 'low', commentId: 901 }] }
+  const { result, audits, labels } = await run(empty, { check: pinned(empty), ledger, recheck: () => ({ state: 'fixed', reason: 'gone' }) })
+  assert.deepEqual([result.status, audits.length], ['reviewed', 0])
+  assert.ok(labels.includes('recheck:pr7-f1'))
+  assert.deepEqual(result.draft.replies.map(r => r.commentId), [901])
+})
+
+// code-audit returns the verifier's grade, the scanner's only a guess (code_audit_harness.mjs): that grade is the one read.
+test('a recheck raises no new nit; a plain review and what already stands keep theirs', async () => {
+  const audit = audited(finding('naming', 'nit', 10), finding('off by one', 'low', 20))
+  const carriedNit = { id: 'pr7-f1', file: 'src/core/a.c', line: 30, severity: 'nit', commentId: 901 }
+  const ledger = { ...STANDING, open: [carriedNit] }
+  const still = () => ({ state: 'open', reason: 'still' })
+  for (const a of [RECHECK, { ...BASE, recheckFrom: OLD }]) {
+    const { result, logs } = await run(a, { check: pinned(a), ledger, audit, recheck: still })
+    assert.deepEqual(result.findings.map(f => [f.id ?? null, f.severity]), [['pr7-f1', 'nit'], [null, 'low']], a.mode)
+    assert.deepEqual(result.suppressed, [{ file: 'src/core/a.c', line: 10, dimension: 'correctness: x', severity: 'nit', why: 'naming', reason: 'recheck-nit' }])
+    assert.deepEqual(result.draft.comments.map(c => [c.line, c.finding]), [[20, 1]], 'the comment indexes the low, the nit has none')
+    assert.ok(logs.some(l => /1 new nit\(s\) not raised on a recheck/.test(l)))
+  }
+  const plainArgs = { ...BASE, mode: 'incremental', scopeBase: OLD }
+  const plain = await run(plainArgs, { check: pinned(plainArgs), ledger, audit, recheck: still })
+  assert.deepEqual(plain.result.findings.map(f => f.severity), ['nit', 'nit', 'low'])
+  assert.deepEqual(plain.result.suppressed, [])
 })

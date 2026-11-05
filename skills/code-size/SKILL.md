@@ -10,7 +10,8 @@ both named by the `## Code size` section of the skill or document its `CLAUDE.md
 `Build contract:` line names. Read that section first: it gives the launcher, the default engine
 and board, what is sized, and the project's limits. No section means the project has not adopted
 this skill: measure nothing rather than compose a build. The engine's module docstring defines the
-commands, the engines and the profile protocol; `<launcher> <command> --help` the flags.
+commands, the engines and the profile protocol; `<launcher> <command> --help` the flags. A
+profile declares the `PROFILE_API` it follows; the engine refuses one other than its own.
 
 `report` sizes the working tree, uncommitted changes included. `diff` sizes the working tree against
 a base ref (default the profile's `BASE_BRANCH`), pairs elfs by board and elf path, and reports
