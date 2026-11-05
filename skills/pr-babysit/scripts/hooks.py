@@ -37,7 +37,9 @@ a clean HEAD tree, checked out without the repository's git hooks; removing it
 removes its own registration, no other, and stderr names what stays. The tree has
 only what HEAD tracks: a hook that needs the
 checkout's ignored files (fetched dependencies) fails there differently and
-stays counted. A change that leaves a hook's output the same once masked is
+stays counted. A failed hook's output runs to the last later result that may be pre-commit's own, as one it printed
+may look alike: one followed by two hooks that printed output takes the first in, so it stays counted too. A change
+that leaves a hook's output the same once masked is
 still excused: a hook that prints only a count of its violations, or a new
 violation replacing one of HEAD's that differs from it only in numbers; CI runs
 the hook on the pushed head. When every failure is excused, the hooks run once
@@ -187,16 +189,17 @@ def own_runs(lines, cols):
 
 def printed(lines, k, starts):
     """What the hook whose `- ` block ends above lines[k] printed, from the blank line pre-commit puts first: up to
-    the blank line pre-commit ends it with, under its last line, above the first own run (starts) to follow such
-    a pair; else to the end. A result-shaped line or block the hook printed itself ends nothing unless all that
-    follows it reads as pre-commit's, and lines in no shape pre-commit prints are all kept: a cut output can excuse a
-    hook, a long one only fails to."""
+    the blank line pre-commit ends it with, under its last line, above the last own run (starts) before the end to
+    follow such a pair; else to the end. A result-shaped line or block the hook printed itself ends nothing unless all
+    that follows it reads as pre-commit's, and lines in no shape pre-commit prints are all kept. Which of those runs
+    is pre-commit's next cannot be told, so the last ends it, though it may take in the hooks between: a cut output
+    can excuse a hook, a long one only fails to."""
     if k in starts:
         return []
     if lines[k]:
         return lines[k:]
     n = len(lines)
-    end = min(m for m in starts if m == n or m > k + 1 and not lines[m - 1] and lines[m - 2].strip())
+    end = max((m for m in starts if k + 1 < m < n and not lines[m - 1] and lines[m - 2].strip()), default=n)
     return lines[k:end - (end < n)]
 
 
@@ -212,7 +215,7 @@ def first_error(lines, block):
 
 def results(output, exit_code):
     """(ids of the hooks whose own `- ` block says they modified files, {hook, error, output} of each failed hook,
-    output its whole `- ` block and what it printed, up to pre-commit's next result line).
+    output its whole `- ` block and what it printed, up to the last line that may be pre-commit's next result).
 
     A block counts only directly under a result line; the hook's output follows
     the block after a blank line, so a marker it echoes is not read as one."""

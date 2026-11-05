@@ -79,6 +79,9 @@ SCRIPTS = {
     # The same with a `- hook id:` line under it, as pre-commit prints a block under its result.
     'header': f'printf "no compiler\\nReport{"." * 67}Passed\\n- hook id: nested\\n\\n"; '
               'grep -q edited "$@" && echo "a.txt: new"; exit 1\n',
+    # Prints, after a blank line, a verbose result, its block and its output, as a hook running pre-commit does.
+    'nested': f'printf "no compiler\\n\\nReport{"." * 67}Passed\\n- hook id: nested\\n- duration: 0.1s\\n\\n'
+              'checked\\n"; grep -q edited "$@" && echo "a.txt: new"; exit 1\n',
 }
 
 
@@ -465,6 +468,14 @@ class HooksTest(unittest.TestCase):
         code, out = self.run_script('a.txt')
         self.assertEqual((code, out['passed']), (0, False))
         self.assertEqual(out['failed'], [{'hook': 'header', 'error': 'no compiler'}])
+        self.assertEqual(out['baselineFailed'], [])
+
+    def test_what_a_hook_prints_after_a_verbose_result_of_its_own_is_compared_with_head(self):
+        self.configure('nested', 'ok')
+        (self.repo / 'a.txt').write_text('edited\n')
+        code, out = self.run_script('a.txt')
+        self.assertEqual((code, out['passed']), (0, False))
+        self.assertEqual(out['failed'], [{'hook': 'nested', 'error': 'no compiler'}])
         self.assertEqual(out['baselineFailed'], [])
 
     def test_a_verbose_hook_after_a_failure_ends_its_output_skipped_or_not(self):
@@ -1043,6 +1054,12 @@ class ResultsTest(unittest.TestCase):
             with self.subTest(said):
                 out = f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n\n{said}\n\ngen{"." * 70}Passed\n'
                 self.assertEqual(hooks.results(out, 1)[1][0]['output'], f'- exit code: 1\n\n{said}')
+
+    def test_a_verbose_result_block_and_output_the_hook_printed_are_its_output_too(self):
+        # Either result may be pre-commit's next: the output runs to the last, so it can only fail to match HEAD's.
+        said = f'x.c:1: bad\n\nReport{"." * 67}Passed\n- hook id: nested\n- duration: 0.1s\n\nx.c:2: new'
+        out = f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n\n{said}\n\ngen{"." * 70}Passed\n'
+        self.assertEqual(hooks.results(out, 1)[1][0]['output'], f'- exit code: 1\n\n{said}')
 
     def test_a_verbose_block_under_the_next_result_ends_the_output(self):
         for after in (f'ok{"." * 51}(no files to check)Skipped\n- hook id: ok\n',
