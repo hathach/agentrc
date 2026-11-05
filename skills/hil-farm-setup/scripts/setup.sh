@@ -389,6 +389,11 @@ add_runner() {  # NAME: the proposed host file differs only by this runner
   # setup_users writes the sudoers file whole; a sudo-bearing runner comes with install
   [ -z "$RUNNER_SUDO" ] || die "$1 needs sudo ($RUNNER_SUDO): add it with setup.sh install"
   [ ! -e "$RUNNER_DIR/.runner" ] || die "$RUNNER_DIR is already registered"
+  # install_metadata publishes the checkout's pins: they must be the installed ones
+  local f
+  for f in "$B/farm.toml" "$B"/*.lock; do
+    cmp -s "$f" "$FARM_HOME/${f##*/}" || die "${f##*/} differs from the installed one; run setup.sh update first"
+  done
   setup_runner_user "$1"
   shared_host && setup_ssh
   setup_firewall

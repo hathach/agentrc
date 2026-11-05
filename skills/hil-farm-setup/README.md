@@ -161,7 +161,8 @@ firewall's user set (and shared hosts' SSH deny list), creates only the new acco
 pair and unit, and gives the admin read access through the new runner's group; registration makes its `_work`,
 `_diag` and state directories. Existing registrations, accounts, hooks, units and job state stay untouched. It
 publishes the host file last and saves the previous one as `host.toml.prev`; retry the same command after a failure.
-It does not update tools or udev rules: deploy those separately with `update` first if needed.
+It does not update tools or udev rules: it refuses while the checkout's `farm.toml` or a lock file differs from
+`/opt/hil-farm`'s copy, and udev rules need `update` first if changed.
 
 1. Move the root checkout to the reviewed commit, as for an update.
 2. When `pgrep -x Runner.Worker` exits 1, stop every installed runner unit (and the new one if a prior attempt

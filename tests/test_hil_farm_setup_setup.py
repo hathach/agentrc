@@ -183,6 +183,9 @@ class TestSetup(unittest.TestCase):
         pin = tomllib.loads((FARM / 'farm.toml').read_text())['tool']['actions-runner']
         digest = hashlib.sha256(json.dumps(['actions-runner', pin], sort_keys=True).encode()).hexdigest()
         (receipt / 'actions-runner.json').write_text(json.dumps({'input': digest, 'version': pin['version']}))
+        (self.tmp / 'installed').mkdir()
+        for f in ('farm.toml', 'requirements.lock', 'pyocd.lock'):
+            shutil.copy(FARM / f, self.tmp / 'installed')
         self.farm_replacements = {
             "Path('/opt/hil-farm')": f'Path({str(self.tmp / "installed")!r})',
             "Path('/var/lib/hil-farm')": f'Path({str(receipt)!r})',
@@ -301,6 +304,26 @@ class TestSetup(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn('holds no runner', r.stdout)
         self.assertFalse((self.tmp / 'home').exists())
+
+    def test_addition_refuses_moved_tool_pins_before_creating_the_new_user(self):
+        proposed = self.addition()
+        before = self.host.read_bytes()
+        installed = {p: p.read_bytes() for p in (self.tmp / 'installed').iterdir()}
+        for f, old, new in (('farm.toml', 'version = "0.12.0+dev-g0ce7431"', 'version = "0.12.0+dev-gnewer"'),
+                            ('pyocd.lock', 'pyocd==0.45.1', 'pyocd==0.45.2')):
+            with self.subTest(file=f):
+                moved = self.dir / f
+                pinned = moved.read_text()
+                self.assertIn(old, pinned)
+                moved.write_text(pinned.replace(old, new))
+                r = self.setup('add-runner', 'arduino-tinyusb', '--host', str(proposed))
+                moved.write_text(pinned)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn(f'{f} differs from the installed one; run setup.sh update first', r.stderr)
+                self.assertFalse((self.tmp / 'home').exists())
+                self.assertEqual(self.host.read_bytes(), before)
+                self.assertEqual({p: p.read_bytes() for p in (self.tmp / 'installed').iterdir()}, installed)
+                self.assert_existing_untouched()
 
     def test_add_runner_requires_a_proposed_host_and_exactly_one_known_runner(self):
         for args in ([], ['tinyusb'], ['tinyusb', '--host', str(self.host), 'extra'],
