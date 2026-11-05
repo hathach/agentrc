@@ -156,6 +156,13 @@ class Admit(Checkout):
         (self.tree / R.MANIFEST).write_text(json.dumps(m))
         self.assertRefused('outside the tree')
 
+    def test_refuses_a_tree_whose_manifest_pins_no_roster(self):
+        m = json.loads((self.tree / R.MANIFEST).read_text())
+        del m['files'][ROSTER]
+        (self.tree / R.MANIFEST).write_text(json.dumps(m))
+        (self.tree / ROSTER).unlink()
+        self.assertRefused('pins no')
+
     def test_refuses_a_roster_other_than_the_checkouts(self):
         fake.roster(self.root / ROSTER, rig_ocd={'uid': 'OTHER'})
         self.assertRefused('not this checkout')
@@ -226,7 +233,7 @@ class Loop(unittest.TestCase):
         with mock.patch.object(C.time, 'monotonic', lambda: t[0]):
             res, calls = self.run_board([row('not-run', locked=True)] * 3, lock_wait=600,
                                         each=lambda: t.__setitem__(0, t[0] + 400))
-        self.assertEqual((res['verdict'], len(calls)), ('not-run', 3))   # the wait starts at the first lock: 400, 800
+        self.assertEqual((res['verdict'], len(calls)), ('not-run', 2))   # the wait starts with the first locked attempt
         self.assertIn('lock wait', res['detail'])
 
     def test_deadline_stops_a_start_and_denies_a_retry(self):
@@ -240,6 +247,30 @@ class Loop(unittest.TestCase):
         res, calls = self.run_board([row('not-run', locked=True)] * 3, clock_left=lambda n: 10 if n < 2 else 0)
         self.assertEqual((res['verdict'], len(calls)), ('not-run', 2))
         self.assertIn('deadline', res['detail'])
+
+    def test_a_fail_stands_when_its_retry_is_locked_out(self):
+        res, calls = self.run_board([row('fail'), row('not-run', locked=True)], clock_left=lambda n: 10 if n < 2 else 0)
+        self.assertEqual((res['verdict'], res['tests'][0]['pass']), ('fail', False))
+        self.assertIn('retry not run: deadline', res['retry'])
+        t = [0.0]
+        with mock.patch.object(C.time, 'monotonic', lambda: t[0]):
+            res, calls = self.run_board([row('fail')] + [row('not-run', locked=True)] * 3, lock_wait=600,
+                                        each=lambda: t.__setitem__(0, t[0] + 400))
+        self.assertEqual(res['verdict'], 'fail')
+        self.assertIn('lock wait', res['retry'])
+        res, _ = self.run_board([row('fail'), row('not-run')])   # the retry refused, say the probe gone
+        self.assertEqual((res['verdict'], res['retry']), ('fail', 'retry not run: not-run detail'))
+
+    def test_the_lock_wait_is_checked_before_readmission_and_counts_an_admitted_wait(self):
+        t = [100.0]
+        with mock.patch.object(C.time, 'monotonic', lambda: t[0]):
+            res, calls = self.run_board([row('not-run', locked=True), row('pass')], lock_wait=30,
+                                        each=lambda: t.__setitem__(0, t[0] + 33))
+        self.assertEqual((res['verdict'], len(calls)), ('not-run', 1))
+        with mock.patch.object(C.time, 'monotonic', lambda: t[0]):
+            res, calls = self.run_board([row('not-run', locked=True), row('pass')], lock_wait=600,
+                                        each=lambda: t.__setitem__(0, t[0] + 10))
+        self.assertEqual((res['verdict'], res['waitedS']), ('pass', 20))   # from the first locked attempt's start
 
     def test_a_signal_starts_no_attempt(self):
         res, calls = self.run_board([row('pass')], stop={'signal': True})
@@ -268,13 +299,15 @@ class Prune(unittest.TestCase):
         self.run_dir('4-1', None)
         self.run_dir('5-1', {**clean, 'termination': 'aborted'})
         self.run_dir('notarun', clean)
+        linked = self.run_dir('9-1', None)
+        (linked / C.SUMMARY).symlink_to(self.run_dir('outside', clean) / C.SUMMARY)
         target = self.run_dir('6-1', clean)
         (self.state / '7-1').symlink_to(target)
         keep = self.run_dir('8-1', clean)
         removed = C.prune(self.state, 30, keep)
         self.assertEqual(removed, ['1-1', '6-1'])
         self.assertEqual(sorted(p.name for p in self.state.iterdir()),
-                         ['2-1', '3-1', '4-1', '5-1', '7-1', '8-1', 'notarun'])
+                         ['2-1', '3-1', '4-1', '5-1', '7-1', '8-1', '9-1', 'notarun', 'outside'])
 
 
 class Run(Checkout):
@@ -312,6 +345,25 @@ class Run(Checkout):
 
     def test_exit_codes(self):
         self.assertEqual(self.run_cmd({BOARD: [row('pass')]})[0], 0)
+
+    def test_an_aborted_run_exits_2_even_when_its_boards_passed(self):
+        def battery(tree, board, run_dir, roster):
+            C.signal.getsignal(C.signal.SIGTERM)(C.signal.SIGTERM, None)
+            return 0, row('pass')
+        handlers = {}
+        with mock.patch.object(C, 'battery', battery), \
+                mock.patch.object(C.signal, 'signal', lambda s, h: handlers.__setitem__(s, h)), \
+                mock.patch.object(C.signal, 'getsignal', lambda s: handlers[s]):
+            rc, s = self.main('run', '--hosted', str(self.hosted), '--head', self.head, '--run-id', HEAD_RUN,
+                              '--attempt', '1', '--out', str(self.state / f'{HEAD_RUN}-1'), '-b', BOARD,
+                              str(self.root / ROSTER))
+        self.assertEqual((rc, s['termination'], s['boards'][0]['verdict']), (2, 'aborted', 'pass'))
+
+    def test_an_unreadable_tree_is_one_boards_refusal(self):
+        with mock.patch.object(C, 'admit_tree', side_effect=FileNotFoundError('gone')):
+            rc, s = self.run_cmd({})
+        self.assertEqual((rc, s['boards'][0]['verdict']), (1, 'not-run'))
+        self.assertIn('gone', s['boards'][0]['detail'])
 
     def test_a_blocker_exits_2(self):
         rc, s = self.run_cmd({BOARD: [row('blocker', holder={'token': 't'})]})

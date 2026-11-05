@@ -22,7 +22,7 @@ with its HIL profile (arduino_hil.py's names; HIL, the checkout-relative hil_tes
       older than --prune-days whose summary shows every board finished clean; nothing else is ever removed.
 
 Exits: setup/pack 0 done, 2 refused; run 0 every board passed, 1 a board failed or did not run, 2 a blocker (a
-cleanup holder, a recovery blocker, a run without a report) or refused before any board.
+cleanup holder, a recovery blocker, a run without a report), a run a signal aborted, or refused before any board.
 """
 
 import argparse
@@ -190,6 +190,8 @@ def admit_tree(src, board, head, run_id, roster):
     if wrong:
         raise Refused(f'{src} is not run {run_id}\'s {board} at {head[:12]}: {wrong}')
     pinned = manifest['files']
+    if roster not in pinned:
+        raise Refused(f'{src}: its manifest pins no {roster}')
     bad = [r for r in pinned if not isinstance(r, str) or r.startswith('/') or '..' in Path(r).parts]
     if bad:
         raise Refused(f'{src}: manifest paths outside the tree: {bad[:5]}')
@@ -245,17 +247,22 @@ def attempt_entry(run_dir, code, row, seconds):
 
 def run_board(board, tree, out, roster, clock, lock_wait, stop):
     """The board's attempts and result. Locked: admitted again every LOCK_POLL s within lock_wait; a fail: one
-    retry. No attempt starts past the deadline or after a signal."""
+    retry, the fail standing until a retry runs. No attempt starts past the deadline, the lock wait or a signal."""
     res = new_result(board)
-    wait_start, retried = None, False
+    lock_since, failed = None, None   # failed: the fail awaiting its retry
+
+    def unresolved(why):
+        if failed:
+            res['retry'] = f'retry not run: {why}'
+            return finish(res, 'fail', failed['detail'], failed)
+        return finish(res, 'not-run', f'not run: {why}')
     while True:
+        last = res['attempts'][-1] if res['attempts'] else None
         if stop['signal'] or clock.left() <= 0:
             why = 'aborted by a signal' if stop['signal'] else 'deadline'
-            if not res['attempts'] or res['attempts'][-1].get('locked'):
-                return finish(res, 'not-run', f'not run: {why}' + (f' (last: {res["attempts"][-1]["detail"]})'
-                                                                   if res['attempts'] else ''))
-            res['retry'] = f'retry not run: {why}'
-            return finish(res, res['attempts'][-1]['verdict'], res['attempts'][-1]['detail'])
+            return unresolved(why + (f' (last: {last["detail"]})' if last and last.get('locked') else ''))
+        if lock_since is not None and time.monotonic() - lock_since >= lock_wait:
+            return unresolved(f'locked past the {lock_wait:g}s lock wait: {last["detail"]}')
         run_dir = out / board / f'run-{len(res["attempts"]) + 1}'
         log(f'{board}: attempt {len(res["attempts"]) + 1} ({run_dir})')
         t = time.monotonic()
@@ -263,22 +270,21 @@ def run_board(board, tree, out, roster, clock, lock_wait, stop):
         a = attempt_entry(run_dir, code, row, time.monotonic() - t)
         res['attempts'].append(a)
         log(f'{board}: {a["verdict"]} {a["detail"]}')
+        if lock_since is not None:
+            res['waitedS'] = round(time.monotonic() - lock_since)
         if a.get('locked'):
-            wait_start = wait_start or time.monotonic()
-            waited = time.monotonic() - wait_start
-            res['waitedS'] = round(waited)
-            if waited >= lock_wait:
-                return finish(res, 'not-run', f'locked past the {lock_wait}s lock wait: {a["detail"]}')
-            nap = min(LOCK_POLL, lock_wait - waited, max(0.0, clock.left()))
+            lock_since = t if lock_since is None else lock_since
+            nap = min(LOCK_POLL, lock_wait - (time.monotonic() - lock_since), clock.left())
             while nap > 0 and not stop['signal']:
                 time.sleep(min(1.0, nap))
                 nap -= 1.0
             continue
-        if a['verdict'] == 'fail' and not retried:
-            retried = True
+        if a['verdict'] == 'fail' and failed is None:
+            failed = a
             continue
-        if a['verdict'] == 'pass' and retried:
-            res['flaky'] = True
+        if failed and a['verdict'] == 'not-run':   # the retry was refused, not run
+            return unresolved(a['detail'])
+        res['flaky'] = bool(failed) and a['verdict'] == 'pass'
         return finish(res, a['verdict'], a['detail'])
 
 
@@ -286,10 +292,11 @@ def new_result(board):
     return {'board': board, 'attempts': [], 'flaky': False, 'retry': '', 'waitedS': 0}
 
 
-def finish(res, verdict, detail):
-    last = next((a for a in reversed(res['attempts']) if 'tests' in a), None)
-    res.update(verdict=verdict, detail=detail, tests=last['tests'] if last else [],
-               cleanup=last['cleanup'] if last else None, firmware=last['firmware'] if last else None,
+def finish(res, verdict, detail, src=None):
+    """res with its verdict, and the tests, cleanup and firmware of `src` (default: its last attempt that ran)."""
+    src = src or next((a for a in reversed(res['attempts']) if 'tests' in a and not a.get('locked')), None)
+    res.update(verdict=verdict, detail=detail, tests=src['tests'] if src else [],
+               cleanup=src['cleanup'] if src else None, firmware=src['firmware'] if src else None,
                runS=sum(a['seconds'] for a in res['attempts']))
     return res
 
@@ -301,8 +308,11 @@ def prune(state, days, keep):
     for d in sorted(Path(state).iterdir()):
         if d == keep or d.is_symlink() or not d.is_dir() or not RUN_NAME.fullmatch(d.name):
             continue
+        summary = d / SUMMARY
         try:
-            s = json.loads((d / SUMMARY).read_text())
+            if summary.is_symlink() or not summary.is_file():
+                raise ValueError('no summary of its own')
+            s = json.loads(summary.read_text())
             done = (s.get('kind') == SUMMARY_KIND and s.get('termination') == 'completed' and
                     all(b.get('verdict') in FINISHED and (b.get('cleanup') or {}).get('holder') is None
                         for b in s.get('boards', [])))
@@ -341,11 +351,11 @@ def cmd_run(a):
             admit_tree(Path(a.hosted) / b, b, a.head, a.run_id, roster_rel)
             tree = out / b / 'tree'
             shutil.copytree(Path(a.hosted) / b, tree)
-        except Refused as e:
+        except (Refused, OSError) as e:
             results.append(finish(new_result(b), 'not-run', f'not run: {e}'))
             continue
         results.append(run_board(b, tree, out, roster_rel, clock, a.lock_wait, stop))
-    code = 2 if any(r['verdict'] == 'blocker' for r in results) else \
+    code = 2 if stop['signal'] or any(r['verdict'] == 'blocker' for r in results) else \
         0 if results and all(r['verdict'] == 'pass' for r in results) else 1
     summary = {'kind': SUMMARY_KIND, 'version': 1, 'head': a.head, 'runId': a.run_id, 'attempt': a.attempt,
                'roster': roster_rel, 'termination': 'aborted' if stop['signal'] else 'completed',
