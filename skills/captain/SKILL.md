@@ -131,15 +131,22 @@ opened or replaced in a target terminal since refuses, and you preview again.
   with `· needs you` when the report names a need, `accepted`, an outcome, `withdrawn`, `cancelled`, `undelivered` or
   `refused by the session that replaced its target`, when another session took the target's terminal before the
   send; `pending from <M>: <msg>...` means the wait lapsed: re-arm, or `cancel` what will not answer. While a watch
-  is open, keep that Monitor on `collect --from <M>` with no ids, M from the last line of the collect before (`done
-  from <M>` or `pending from <M>: ...`; the first one after `watch` has no `--from`), and re-arm it at each lapse until
-  a `watch ended <watch>` or `cancelled <watch>` line names the watch's id: it prints `watching <member>` as a session
-  joins and `reported <member>:<N>` for each report, N naming that one report.
+  is open, keep that Monitor on `collect --from <M>` with no ids, M from `watch`'s `armed from <M>` line for the first
+  one and from the last line of the collect before after that (`done from <M>` or `pending from <M>: ...`), and
+  re-arm it at each lapse until a `watch ended <watch>` or `cancelled <watch>` line names the watch's id: it prints
+  `watching <member>` as a session joins and `reported <member>:<N>` for each report, N naming that one report. A
+  `watch` that widens the open watch leaves that Monitor as it is. If the cursor is lost, re-arm with no `--from`: it
+  prints only what lands from then on, and `watches` names each member's latest report. While the watch is open, an
+  `ask` or `relay` starts no Monitor of its own: the watch's collect follows every request and relay sent after its
+  cursor and prints their lines too, but never `done`, so the table is due once each id they printed has its closing
+  line - `reported <msg>`, an outcome, `cancelled`, `undelivered` or `refused ...` - or at the next lapse, with
+  `reports` marking any still open.
 - **The table** comes from `reports --json <msg>...` with this collection's request ids and those `not asked` named, run
-  once `collect` ended or lapsed, never from Monitor lines, which a long line can cut: each id gets the report that
-  answered it, even one a later report from that session superseded; a watch's report is `<member>:<N>` as the
-  `reported` line named it, one row per line, so a later report never hides an earlier need. If the output itself is
-  abbreviated, run it again with fewer ids, down to one; a row still cut says so, its needs never pieced together.
+  once `collect` ended, lapsed or, sharing a watch's Monitor, closed each id, never from Monitor lines, which a long
+  line can cut: each id gets the report that answered it, even one a later report from that session superseded; a
+  watch's report is `<member>:<N>` as the `reported` line named it, one row per line, so a later report never hides an
+  earlier need. If the output itself is abbreviated, run it again with fewer ids, down to one; a row still cut says so,
+  its needs never pieced together.
 - **File** a follow-up issue as `agents/captain.md` says, from a title and a body drafted under
   `~/.cache/agentrc/captain/drafts/`:
 

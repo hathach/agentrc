@@ -1942,7 +1942,7 @@ class WatchArmTest(WatchCase):
         self.terminals = {'t1': CAPTAIN}
         code, out = self.arm('all')
         self.assertEqual(code, 0)
-        self.assertIn('armed: every session, new ones too', out)
+        self.assertIn(f'armed from {len(captain.records())}: every session, new ones too', out)
         [w] = [r for r in captain.records() if r['type'] == 'watch']
         self.assertEqual((w['scope'], w['captain']['address']), ('all', 't1'))
         self.assertTrue(captain.marked())
@@ -1952,7 +1952,7 @@ class WatchArmTest(WatchCase):
         self.terminals['t3'] = pinned('t3')
         self.arm('t2')
         code, out = self.arm('t3')
-        self.assertIn('widened', out)
+        self.assertIn(f'widened from {len(captain.records())}: t3', out)
         types = [r['type'] for r in captain.records()]
         self.assertEqual((types.count('watch'), types.count('watch-extend')), (1, 1))
 
@@ -2266,12 +2266,15 @@ class WatchCollectTest(WatchCase):
             code = captain.collect(list(msgs), 0, start)
         return code, [c.args[0] for c in out.call_args_list]
 
+    def cursor(self, line):
+        return int(line.split(' from ')[1].split(':')[0])
+
     def test_follows_members_reports_and_the_end(self):
-        self.arm('all')
+        start = self.cursor(self.arm('all')[1])
         w = self.watch_id()
-        m = self.joined_as('t2')
+        m = self.joined_as('t2')   # before the first collect starts: the cursor `watch` printed still covers it
         self.report_as('t2', m, {**GOOD, 'needs': 'merge'})
-        code, lines = self.collect()
+        code, lines = self.collect(start=start)
         n = len(captain.records())
         self.assertEqual(code, captain.NO_ANSWER)
         self.assertEqual(lines, [f'watching {m} · sp · name · t2', f'reported {m}:{n - 1} · ready · needs you',
@@ -2281,6 +2284,29 @@ class WatchCollectTest(WatchCase):
         code, lines = self.collect(start=n)
         self.assertEqual((code, lines), (0, [f'reported {m}:{n} · ready', f'cancelled {w}',
                                              f'done from {len(captain.records())}']))
+
+    def test_a_collect_without_a_cursor_replays_nothing(self):
+        self.arm('all')
+        w = self.watch_id()
+        m = self.joined_as('t2')
+        self.report_as('t2', m)
+        n = len(captain.records())
+        self.assertEqual(self.collect(), (captain.NO_ANSWER, [f'pending from {n}: {m} {w}']))
+        self.terminals['t3'] = pinned('t3')
+        self.arm('t3')   # widened: the running collect follows it, a lost cursor re-arms without one
+        self.report_as('t2', m)
+        code, lines = self.collect()
+        self.assertEqual(lines, [f'pending from {len(captain.records())}: {m} {w}'])
+
+    def test_a_request_sent_during_a_watch_is_followed_by_its_collect(self):
+        start = self.cursor(self.arm('all')[1])
+        m = self.joined_as('t2')
+        self.terminals['t3'] = pinned('t3')
+        msg = self.msg_of(self.ask('t3'))
+        self.report_as('t3', msg)
+        code, lines = self.collect(start=start)
+        self.assertEqual(lines[1:], [f'reported {msg} · ready', f'pending from {len(captain.records())}: {m} '
+                                     f'{self.watch_id()}'])
 
     def test_a_lock_held_past_the_deadline_still_prints_the_cursor(self):
         self.arm('all')

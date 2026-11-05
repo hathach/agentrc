@@ -849,10 +849,11 @@ def collect(msgs, wait_ms, start=None):
     `done from <M>`, once none is pending; NO_ANSWER when wait_ms lapse first, printing `pending from <M>: <ids>`,
     M ahead of a list that grows with a watch's members so a display cutting long lines cannot cut it.
     M is the index of the first record not yet read, for --from: records from there are printed, while what is
-    closed is judged on the whole ledger. A strict read under the lock first: a torn ledger must not look like
-    nothing to wait for. A watch whose captain was replaced or ended is settled here too, at the start and at each
-    poll while one is followed, or nothing else might end it; that poll waits for the lock only until wait_ms
-    lapse, so the pending line still prints before the caller's timeout."""
+    closed is judged on the whole ledger. Without ids or --from, printing starts at the ledger's end, so a re-arm
+    that lost its cursor replays no watch's past reports. A strict read under the lock first: a torn ledger must
+    not look like nothing to wait for. A watch whose captain was replaced or ended is settled here too, at the start
+    and at each poll while one is followed, or nothing else might end it; that poll waits for the lock only until
+    wait_ms lapse, so the pending line still prints before the caller's timeout."""
     with locked():
         recs = records()
         opened = len(recs)   # a watch settle ends now was open when this collect began
@@ -865,7 +866,7 @@ def collect(msgs, wait_ms, start=None):
         die(f'no request, relay, watch or member {", ".join(sorted(unknown))}', NO_ANSWER)
     base = opened if start is None else start
     deadline = time.monotonic() + wait_ms / 1000
-    shown = start or 0   # the ledger is append-only: records before this were printed already
+    shown = start if start is not None else 0 if msgs else opened   # records before this were printed already
     while True:
         items.update((r['msg'], r) for r in recs[shown:] if r['type'] in FOLLOWED)
         following = followed(recs, msgs, base)
@@ -1437,7 +1438,8 @@ def hook(payload):
 
 
 def arm(targets, mine):
-    """Start the enrolled captain's watch, or widen the one open: `all`, or the named sessions."""
+    """Start the enrolled captain's watch, or widen the one open: `all`, or the named sessions. Prints the cursor
+    for the watch's first collect, so a session joining before it starts is not missed."""
     with locked():
         captain = require_captain(mine)
         if targets == ['all']:
@@ -1462,8 +1464,9 @@ def arm(targets, mine):
         else:
             msg = new_id('w', recs)
             append({'type': 'watch', 'msg': msg, 'captain': captain, 'scope': scope})
+        cursor = len(recs) + 1
     named = 'every session, new ones too' if scope == 'all' else terminals([scope])
-    print(f'watch {msg} {"widened" if watch else "armed"}: {named}')
+    print(f'watch {msg} {"widened" if watch else "armed"} from {cursor}: {named}')
     return 0
 
 
