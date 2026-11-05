@@ -124,9 +124,10 @@ changes from a library:
   target after a clean `halt` and found it different is a difference: then the runs are rewritten and verified, with
   no reset or go before the sketch's flash, and the row's `base` says `matched` or which run differed. A check that
   proves nothing (no connection, a failed or partial read, a timeout) writes nothing and fails the step. A rewrite
-  may erase the rest of each flash page a run touches, so those pages must be the base's. The board's budget and
-  each step's reserve grow by a check and a rewrite. Through J-Link only: a record refuses a base on any other
-  flasher.
+  may erase the rest of each flash page a run touches, so those pages must be the base's. Only runs are checked: a
+  word the boot reads that the HEX leaves unprogrammed (the MBR's bootloader address at 0xFF8) is a run of its
+  erased value in a profile HEX, or another image's bytes there pass as `matched`. The board's budget and each step's
+  reserve grow by a check and a rewrite. Through J-Link only: a record refuses a base on any other flasher.
 
 ## CI
 
