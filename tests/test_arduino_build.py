@@ -1149,9 +1149,25 @@ class Core(Lib):
         self.assertEqual(row['status'], 'failed')
         self.assertIn('another copy of the core', row['firstError'])
 
+    def test_a_submodule_off_its_gitlink_or_unreadable_is_never_clean(self):
+        subs = [{'path': 'libraries/USB', 'commit': 'a', 'state': '+', 'dirty': False},
+                {'path': 'libraries/Z', 'commit': 'b', 'state': '-', 'dirty': False},
+                {'path': 'libraries/W', 'commit': 'c', 'state': ' ', 'dirty': False}]
+        with mock.patch.object(ab, 'git', return_value=''), mock.patch.object(ab, 'submodules', return_value=subs):
+            self.assertEqual(ab.worktree_status(), '~+ libraries/USB\n~- libraries/Z\n')   # what admission compares
+        failed = mock.Mock(returncode=128, stdout='', stderr='fatal: not a git repository')
+        with mock.patch.object(ab, 'git', return_value=' 3e5369cd libraries/USB (3.7.3)\n'), \
+                mock.patch.object(ab.subprocess, 'run', return_value=failed), \
+                contextlib.redirect_stdout(io.StringIO()) as out, self.assertRaises(SystemExit) as e:
+            ab.submodules()
+        self.assertEqual(e.exception.code, 2)
+        self.assertIn('libraries/USB: fatal: not a git repository', json.loads(out.getvalue())['error'])
+
     def test_submodule_status_is_parsed_recursively(self):
         out = (' 3e5369cd libraries/USB (3.7.3)\n-5b48867c libraries/Z\n+0123abcd libraries/USB/lib/x (v1)\n')
-        with mock.patch.object(ab, 'git', return_value=out) as git:
+        clean = mock.Mock(returncode=0, stdout='', stderr='')
+        with mock.patch.object(ab, 'git', return_value=out) as git, mock.patch.object(ab.subprocess, 'run',
+                                                                                    return_value=clean):
             self.assertEqual(ab.submodules(), [
                 {'path': 'libraries/USB', 'commit': '3e5369cd', 'state': ' ', 'dirty': False},
                 {'path': 'libraries/Z', 'commit': '5b48867c', 'state': '-', 'dirty': False},

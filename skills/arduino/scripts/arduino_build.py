@@ -901,11 +901,13 @@ def merge(spans):
 # ---- HIL record
 
 def worktree_status():
-    """`git status --porcelain` of the checkout; a core's adds `~~ <path>` for each submodule, at any depth, whose own
-    worktree has changes: an `ignore` setting at any level hides them from the superproject's status."""
+    """`git status --porcelain` of the checkout; a core's adds `~<state> <path>` for each submodule, at any depth, not
+    at its gitlink (state + - U) or whose own worktree has changes (~~): an `ignore` setting at any level hides both
+    from the superproject's status."""
     status = git('status', '--porcelain', '--untracked-files=all')
     if core_mode():
-        status += ''.join(f'~~ {s["path"]}\n' for s in submodules() if s['dirty'])
+        status += ''.join(f'~{"~" if s["state"] == " " else s["state"]} {s["path"]}\n' for s in submodules()
+                          if s['state'] != ' ' or s['dirty'])
     return status
 
 
@@ -926,9 +928,13 @@ def submodules():
     for line in git('submodule', 'status', '--recursive').splitlines():
         m = re.match(r'^([ +\-U])([0-9a-f]+) (\S+)', line)
         if m:
-            dirty = m.group(1) != '-' and bool(subprocess.run(
-                ['git', '-C', str(P.ROOT / m.group(3)), 'status', '--porcelain', '--untracked-files=all',
-                 '--ignore-submodules=all'], capture_output=True, text=True).stdout.strip())
+            dirty = False
+            if m.group(1) != '-':
+                p = subprocess.run(['git', '-C', str(P.ROOT / m.group(3)), 'status', '--porcelain',
+                                    '--untracked-files=all', '--ignore-submodules=all'], capture_output=True, text=True)
+                if p.returncode:
+                    fail(f'git status in submodule {m.group(3)}: {p.stderr.strip()}')
+                dirty = bool(p.stdout.strip())
             out.append({'path': m.group(3), 'commit': m.group(2), 'state': m.group(1), 'dirty': dirty})
     return out
 
