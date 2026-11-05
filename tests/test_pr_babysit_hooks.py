@@ -482,9 +482,7 @@ class HooksTest(unittest.TestCase):
         for ids in (('nested', 'ok'), ('nested',)):
             with self.subTest(ids):
                 (self.repo / 'a.txt').write_text('a\n')
-                config = CONFIG.format(''.join(HOOK.format(id=i) for i in ids))
-                (self.repo / '.pre-commit-config.yaml').write_text(config)
-                self.configure()
+                self.configure(*ids)
                 (self.repo / 'a.txt').write_text('edited\n')
                 code, out = self.run_script('a.txt')
                 self.assertEqual((code, out['passed']), (0, False))
