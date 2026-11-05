@@ -96,7 +96,8 @@ RESULTS = ('completed', 'failed', 'rejected', 'needs-clarification')
 REPORT_MAX = 8192
 POLL_S = 2
 LOCK_POLL_S = 0.1
-HOOK_LOCK_S = 10   # well under the hook's 30 s timeout, which me() shares
+# The hook's lock wait alone: its 30 s timeout also spans my_session()'s hc calls, up to HC_TIMEOUT_S each.
+HOOK_LOCK_S = 10
 NO_ANSWER = 3
 SELECTORS = ('pr:', 'issue:', 'space:')
 SELECTOR = re.compile(r'(pr|issue):(?:([\w.-]+):([\w.-]+):)?(\d+)|space:(.+)')
@@ -457,6 +458,10 @@ def resolve(args):
 
 
 def me():
+    return identity(my_session())
+
+
+def my_session():
     """The pinned session this process runs under: the terminal whose Claude Code process is one of its ancestors,
     never HC_TERMINAL_ID, which any process can set."""
     chain = set(hc.ancestors(os.getpid()))
@@ -465,7 +470,7 @@ def me():
         die(f'cannot tell which agent session runs this ({len(mine)} match)', 2)
     if unpinned(mine[0]):
         die(f'cannot pin this session ({mine[0]["address"]}): {", ".join(unpinned(mine[0]))}', 2)
-    return identity(mine[0])
+    return mine[0]
 
 
 def live(ident):
@@ -1375,9 +1380,10 @@ def covers(watch, recs, ident):
     return any(tuple(a) in known for a in anchors(ident))
 
 
-def join(mine):
-    """(member record, its watch, new) for mine in the open watch covering it, joining it first; (None, why, False)
-    otherwise. Under the lock."""
+def join(session):
+    """(member record, its watch, new) for session, as my_session() pinned it, in the open watch covering it, joining
+    it first; (None, why, False) otherwise. Under the lock, with no hc call."""
+    mine = identity(session)
     recs = records()
     watch, state = settle(recs)
     if not watch:
@@ -1389,9 +1395,8 @@ def join(mine):
         return member, watch, False
     if not covers(watch, recs, mine):
         return None, 'the open watch does not cover this session', False
-    found = find(mine['address'])
     return append({'type': 'joined', 'msg': new_id('j', recs), 'watch': watch['msg'], 'target': mine,
-                   'handle': found['handle'] if found else mine['address']}), watch, True
+                   'handle': session['handle']}), watch, True
 
 
 def member_watch(member, recs, mine):
@@ -1408,7 +1413,7 @@ def member_watch(member, recs, mine):
 def pending():
     """A session's own lookup: join the open watch covering it, if any, and print what to do."""
     with locked():
-        member, watch, _ = join(me())
+        member, watch, _ = join(my_session())
     print(watch_brief(member['msg'], watch['captain']['address']) if member else f'none: {watch}')
     return 0
 
@@ -1416,17 +1421,17 @@ def pending():
 def hook(payload):
     """What a SessionStart (compact, clear) or Stop hook prints, or None: SessionStart joins or re-briefs a covered
     session; Stop joins one not yet a member and holds the stop once with the brief, the member record its loop
-    guard, not stop_hook_active, which another Stop hook may have set. A session me() cannot pin, as at startup,
-    raises and is left to its first Stop, and one finding the lock held past HOOK_LOCK_S to its next. Only the
+    guard, not stop_hook_active, which another Stop hook may have set. A session my_session() cannot pin, as at
+    startup, raises and is left to its first Stop, and one finding the lock held past HOOK_LOCK_S to its next. Only the
     terminal's own session acts: a `claude -p` run from its Bash tool pins as that session but its payload names
     another, as does a registry not yet updated after a /clear, which the next Stop joins."""
     if not marked():
         return None
-    mine = me()   # hc calls: never under the lock
-    if payload.get('session_id') != mine['session']:
+    session = my_session()   # hc calls: never under the lock
+    if payload.get('session_id') != session['session']:
         return None
     with locked(HOOK_LOCK_S):
-        member, watch, new = join(mine)
+        member, watch, new = join(session)
     if not member:
         return None
     brief = watch_brief(member['msg'], watch['captain']['address'])

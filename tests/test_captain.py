@@ -371,7 +371,7 @@ class LedgerCase(unittest.TestCase):
             (captain, 'find', lambda address: dict(self.terminals[address]) if address in self.terminals else None),
             (captain, 'read_screen', lambda address: self.screens.get(address, EMPTY)),
             (captain, 'submit', self._submit),
-            (captain, 'me', lambda: captain.identity(self.terminals[self.me])),
+            (captain, 'my_session', lambda: dict(self.terminals[self.me])),
             (captain, 'config_dir', lambda account: str(self.state / 'config')),   # never the real ~/.claude
         ]:
             patcher = mock.patch.object(target, attr, value)
@@ -2211,7 +2211,7 @@ class WatchUnchangedTest(WatchCase):
 class WatchHookTest(WatchCase):
     def test_no_marker_reads_nothing(self):
         with mock.patch.object(captain, 'records', side_effect=AssertionError('read')), \
-             mock.patch.object(captain, 'me', side_effect=AssertionError('pinned')):
+             mock.patch.object(captain, 'my_session', side_effect=AssertionError('pinned')):
             self.assertIsNone(captain.hook({'hook_event_name': 'Stop'}))
 
     def test_a_marker_that_cannot_be_inspected_counts_as_present(self):
@@ -2249,15 +2249,17 @@ class WatchHookTest(WatchCase):
 
     def test_the_session_is_pinned_outside_the_lock_and_a_held_lock_is_waited_for_briefly(self):
         self.arm('all')
-        real = captain.me
+        real = captain.my_session
 
-        def me():
+        def my_session():
             with open(self.state / 'lock', 'a') as f:   # a second open file: it conflicts even within one process
                 captain.fcntl.flock(f, captain.fcntl.LOCK_EX | captain.fcntl.LOCK_NB)
                 captain.fcntl.flock(f, captain.fcntl.LOCK_UN)
             return real()
-        with mock.patch.object(captain, 'me', me):
+        with mock.patch.object(captain, 'my_session', my_session), \
+             mock.patch.object(captain, 'find', side_effect=AssertionError('hc under the lock')):
             self.assertIn('decision', self.hook_as('t2'))
+        self.assertEqual(self.member('t2')[0]['handle'], 'sp · name · t2')
         self.terminals['t3'] = pinned('t3')
         with mock.patch.object(captain, 'HOOK_LOCK_S', 0), open(self.state / 'lock', 'a') as held:
             captain.fcntl.flock(held, captain.fcntl.LOCK_EX)
@@ -2267,7 +2269,7 @@ class WatchHookTest(WatchCase):
 
     def test_a_session_that_cannot_be_pinned_is_left_alone(self):
         self.arm('all')
-        with mock.patch.object(captain, 'me', side_effect=lambda: captain.die('cannot tell', 2)), \
+        with mock.patch.object(captain, 'my_session', side_effect=lambda: captain.die('cannot tell', 2)), \
              mock.patch('sys.stderr'), self.assertRaises(SystemExit):   # the hook script exits 0 on it
             captain.hook({'hook_event_name': 'Stop'})
         self.assertEqual(self.member('t2'), [])
