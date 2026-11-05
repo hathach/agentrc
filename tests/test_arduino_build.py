@@ -253,6 +253,11 @@ class Selection(Lib):
         self.assertEqual(sel['hil'], {'boards': ['rig_ocd'], 'full': True, 'uncovered': []})
         self.assertEqual(sel['tests'], ['hil'])
 
+    def test_hil_change_runs_every_contract_test_but_the_builds(self):
+        self.patch(self.P, 'CONTRACT_TESTS', {**self.P.CONTRACT_TESTS, 'hil_ci': '.claude/test/test_hil_ci.py'})
+        for path in ('test/hil/ci.json', 'test/hil/sketches/probe/probe.ino'):
+            self.assertEqual(ab.select([path], roster=['rig_ocd'])['tests'], ['hil', 'hil_ci'], path)
+
     def test_hil_selection_names_families_the_roster_lacks(self):
         sel = ab.select(['src/ports/fa/x.cpp', 'src/fake.h'], roster=['rig_ocd'])
         self.assertEqual(sel['hil']['boards'], ['rig_ocd'])

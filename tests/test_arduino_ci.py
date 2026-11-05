@@ -13,6 +13,7 @@ import contextlib
 import hashlib
 import io
 import json
+import shutil
 import subprocess
 import sys
 import time
@@ -97,7 +98,7 @@ class Pack(Checkout):
         for f in pinned:
             self.assertEqual(manifest['files'][f], hashlib.sha256((tree / f).read_bytes()).hexdigest(), f)
         self.assertEqual(json.loads((tree / C.PROVENANCE).read_text()),
-                         {'board': BOARD, 'head': self.head, 'runId': HEAD_RUN, 'attempt': 1, 'roster': ROSTER})
+                         {'board': BOARD, 'head': self.head, 'runId': HEAD_RUN, 'attempt': 1})
         self.assertEqual(sorted(p.name for p in out.iterdir()), [BOARD])   # no temporary dir left
 
     def test_refuses_a_dirty_tree_and_a_second_pack(self):
@@ -130,7 +131,7 @@ class Admit(Checkout):
         self.assertIn(fragment, str(cm.exception))
 
     def test_admits_this_runs_tree(self):
-        self.assertEqual(self.admit()['board'], BOARD)
+        self.assertIsNone(self.admit())   # admitted: no refusal
 
     def test_refuses_another_run_head_or_board(self):
         self.assertRefused('runId', run_id='78')
@@ -408,21 +409,42 @@ class Setup(Checkout):
     def test_installs_the_way_ci_arduino_does_for_the_boards_ci_platform(self):
         d = self.ci({'dev_a': ['vend:arch:dev_a', '0x1', None]})
         versions = self.tmp / 'versions.json'
-        with mock.patch.object(C, 'versions', lambda: {'cli': {'VersionString': '1.2.3'}}):
+        with mock.patch.object(C, 'versions', lambda platform: {'platform': platform}), \
+                mock.patch.object(C.shutil, 'which', return_value=None):
             rc, res = self.main('setup', '--board', BOARD, '--ci', str(d), '--versions', str(versions))
         self.assertEqual((rc, res['platform'], res['ciPlatform']), (0, 'vend:arch', 'dev_a'))
         self.assertEqual(sys.modules['build_platform'].CALLS,
                          [['deps'], ['vend:arch', ['vend:arch:dev_a', '0x1', None]]])
-        self.assertEqual(json.loads(versions.read_text()), {'cli': {'VersionString': '1.2.3'}})
+        self.assertEqual(json.loads(versions.read_text()), {'platform': 'vend:arch'})
+
+    def test_keeps_ci_arduino_and_its_arduino_cli_out_of_the_checkouts_status(self):
+        d = self.ci({'dev_a': ['vend:arch:dev_a', '0x1', None]})
+        ci, cli = self.root / 'ci', self.root / 'bin [x]'
+        shutil.copytree(d, ci)
+        cli.mkdir()
+        exclude = self.root / '.git' / 'info' / 'exclude'
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        exclude.write_text('# own')
+        for _ in range(2):   # a second setup adds nothing
+            with mock.patch.object(C, 'versions', lambda platform: {}), \
+                    mock.patch.object(C.shutil, 'which', return_value=str(cli / 'arduino-cli')):
+                self.assertEqual(self.main('setup', '--board', BOARD, '--ci', str(ci))[0], 0)
+        self.assertEqual(exclude.read_text(), '# own\n/ci/\n/bin \\[x]/\n')
+        out = subprocess.run(['git', 'status', '--porcelain'], cwd=self.root, capture_output=True, text=True)
+        self.assertEqual(out.stdout, '')
+
+    def test_never_excludes_the_checkout_or_a_dir_outside_it(self):
+        with mock.patch.object(C.P, 'ROOT', self.root):
+            self.assertEqual(C.exclude_from_checkout([self.root, self.tmp / 'elsewhere']), [])
 
     def test_refuses_a_board_whose_core_is_not_what_ci_arduino_installs(self):
         d = self.ci({'dev_a': ['other:arch:dev_a', '0x1', None]})
         versions = self.tmp / 'versions.json'
-        with mock.patch.object(C, 'versions', lambda: {}):
+        with mock.patch.object(C, 'versions', lambda platform: {'platform': platform}):
             rc, res = self.main('setup', '--board', BOARD, '--ci', str(d), '--versions', str(versions))
         self.assertEqual(rc, 2)
         self.assertIn('ci-arduino installs other:arch', res['error'])
-        self.assertTrue(versions.is_file())   # written whatever the outcome
+        self.assertEqual(json.loads(versions.read_text()), {'platform': None})   # written whatever the outcome
 
     def test_refuses_a_board_without_a_ci_platform(self):
         d = self.ci({})

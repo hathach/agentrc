@@ -12,7 +12,8 @@ point, loading this file from the pinned agentrc (its `agentrc_pin.py`). One pro
   REPRESENTATIVES       {family: [boards]} a change to that family's code builds
   HIL_SKETCHES          {role: (sketch dirs, the first the restoration image)}
   SMOKE_BOARDS          boards whose restoration sketch a build-contract change builds (one per image kind)
-  CONTRACT_TESTS        {name: test script}; a change to `.claude/test/test_<name>.py` runs it
+  CONTRACT_TESTS        {name: test script}; a change to `.claude/test/test_<name>.py` runs it, a HIL change
+                        every one but `build`
   NOTHING               path prefixes that build nothing (docs, agent and repo metadata)
   EXTRA_DEPENDENCIES    libraries the examples use beyond library.properties `depends=` (CI's install list)
   CONTRACT_FILES        library files a HIL record binds by sha256 (the wrapper scripts, the agentrc pin)
@@ -250,10 +251,10 @@ def select(paths, roster=None, only_examples=None):
         elif effect == 'hil_sketch':
             for b in P.BOARDS:
                 add(b, [detail])
-            tests.update(t for t in ('hil', 'hil_remote') if t in P.CONTRACT_TESTS)
+            tests.update(hil_tests())
             hil_full = True
         elif effect == 'hil':
-            tests.update(t for t in ('hil', 'hil_remote') if t in P.CONTRACT_TESTS)
+            tests.update(hil_tests())
             hil_full = True
     result = {
         'builds': {b: sorted(e) for b, e in sorted(builds.items()) if e},
@@ -263,6 +264,11 @@ def select(paths, roster=None, only_examples=None):
         result['hil'] = {'boards': sorted(roster) if hil_full else sorted(hil_picked), 'full': hil_full,
                          'uncovered': uncovered_by_roster(paths, roster)}
     return result
+
+
+def hil_tests():
+    """Every contract test but the build's: a change the battery covers can break any HIL script."""
+    return {t for t in P.CONTRACT_TESTS if t != 'build'}
 
 
 def uncovered_by_roster(paths, roster):

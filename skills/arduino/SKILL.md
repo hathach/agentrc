@@ -91,10 +91,10 @@ retries, recovery) apply unchanged; these scripts load its `hil_*` scripts throu
 
 `arduino_ci.py` (a library's `hil_ci.py` wraps it) splits a HIL run across GitHub runners: a hosted runner per board
 sets the board up through adafruit/ci-arduino's own `install_library_deps()` and `install_platform()` (latest
-releases, nothing pinned), builds the clean record and packs the tree `hil_remote.py` would stage, with a
-`provenance.json` naming the run; the rig runner admits each packed tree against its run, head and roster and runs the
-battery in it board by board, with a lock wait, one retry of a fail and a deadline, into a state dir kept across runs
-(`summary.json` per run, finished clean runs pruned). The admission checks consistency, not trust: a pull request's
+releases, nothing pinned; ci-arduino and its arduino-cli kept out of the checkout's status), builds the clean record
+and packs the tree `hil_remote.py` would stage, with a `provenance.json` naming the run; the rig runner admits each
+packed tree against its run, head and roster and runs the battery in it board by board, with a lock wait, one retry of
+a fail and a deadline, into a state dir kept across runs (`summary.json` per run, finished clean runs pruned). The admission checks consistency, not trust: a pull request's
 code, harness included, runs on the rig as the runner's user. The library's workflow and report comment are its own.
 
 ## Adding a library

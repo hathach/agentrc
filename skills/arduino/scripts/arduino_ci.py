@@ -6,14 +6,16 @@ with its HIL profile (arduino_hil.py's names; HIL, the checkout-relative hil_tes
   setup --board B --ci DIR [--versions FILE]
       (hosted) set B up as adafruit/ci-arduino's build_platform.py does before it builds (DIR: its checkout, the
       library at $GITHUB_WORKSPACE): its install_library_deps() and install_platform() for B's CI platform
-      (BOARDS[B]['filters']). Refuses a board whose FQBN's vendor:arch is not the one that installs. --versions
-      writes arduino-cli's `version`, `core list` and `lib list` (JSON) there, whatever the outcome.
+      (BOARDS[B]['filters']). Refuses a board whose FQBN's vendor:arch is not the one that installs. Adds DIR and
+      arduino-cli's dir to the checkout's info/exclude when inside it (the record needs a clean tree). --versions
+      writes {platform: vendor:arch or null, cli: `version`, cores: `core list`} (arduino-cli JSON) there, whatever
+      the outcome.
   pack --board B --record FILE --out DIR --run-id N --attempt N [--roster R]
       (hosted) the tree hil_remote.py would stage for B's clean record at HEAD (contract files, roster, agentrc
       closure, record and images, manifest.json), under DIR/B, with provenance.json {board, head, runId, attempt}.
   run --hosted DIR --head SHA --run-id N --out DIR [-b B]... [--lock-wait S] [--deadline S] [--prune-days N] ROSTER
       (rig) one board at a time: DIR/B admitted (provenance and manifest name this run, B and SHA; every file pinned
-      by the manifest, no link, no stray file; its roster this checkout's) and copied to OUT/B/tree, then
+      by the manifest, no link, no stray file; its roster this checkout's) and moved to OUT/B/tree, then
       `hil_test.py run --staged` there, each attempt in OUT/B/run-<n>. A locked board is admitted again every
       LOCK_POLL s up to --lock-wait; a fail is retried once (the `hil` Caller rules: a passing retry is flaky).
       Every attempt starts only before the --deadline (seconds from start; a started battery always finishes its
@@ -73,7 +75,6 @@ hil_load = _hil_load()
 hil_load.require(__file__, FILES)
 R = hil_load.load_file('skills/arduino/scripts/arduino_remote.py')
 H = R.H
-B = R.B
 P = None   # the bound HIL profile
 
 
@@ -98,6 +99,10 @@ def log(msg):
 
 # ---- hosted: setup and pack
 
+def vendor_arch_of(fqbn):
+    return ':'.join(fqbn.split(':', 2)[:2])
+
+
 def ci_platform(board, ci_dir):
     """(build_platform module, vendor:arch, its ALL_PLATFORMS entry) for `board`'s CI platform."""
     if board not in P.BUILD.BOARDS or 'filters' not in P.BUILD.BOARDS[board]:
@@ -111,16 +116,39 @@ def ci_platform(board, ci_dir):
     entry = bp.ALL_PLATFORMS.get(platform)
     if not isinstance(entry, list):
         raise Refused(f'{platform} (the CI platform of {board}) is no ci-arduino platform')
-    vendor_arch = ':'.join(entry[0].split(':', 2)[:2])
-    own = ':'.join(P.BUILD.BOARDS[board]['fqbn'].split(':', 2)[:2])
+    vendor_arch = vendor_arch_of(entry[0])
+    own = vendor_arch_of(P.BUILD.BOARDS[board]['fqbn'])
     if own != vendor_arch:
         raise Refused(f'{board} builds with {own}, ci-arduino installs {vendor_arch} for {platform}')
     return bp, vendor_arch, entry
 
 
-def versions():
-    out = {}
-    for key, argv in (('cli', ['version']), ('cores', ['core', 'list']), ('libraries', ['lib', 'list'])):
+def exclude_from_checkout(dirs):
+    """Anchored info/exclude entries for each of `dirs` strictly inside the checkout, the file's own kept."""
+    root = P.ROOT.resolve()
+    p = subprocess.run(['git', 'rev-parse', '--git-path', 'info/exclude'], cwd=root, capture_output=True, text=True)
+    if p.returncode:
+        raise Refused(f'{root} is no git checkout: {p.stderr.strip()}')
+    exclude = root / p.stdout.strip()
+    text = exclude.read_text() if exclude.is_file() else ''
+    have = text.splitlines()
+    new = []
+    for d in dirs:
+        d = Path(d).resolve()
+        if d != root and root in d.parents:
+            line = '/' + re.sub(r'([*?\[\\])', r'\\\1', d.relative_to(root).as_posix()) + '/'
+            if line not in have + new:
+                new.append(line)
+    if new:
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        with open(exclude, 'a') as f:
+            f.write(('\n' if text and not text.endswith('\n') else '') + '\n'.join(new) + '\n')
+    return new
+
+
+def versions(platform):
+    out = {'platform': platform}
+    for key, argv in (('cli', ['version']), ('cores', ['core', 'list'])):
         try:
             p = subprocess.run(['arduino-cli', *argv, '--json'], capture_output=True, text=True, timeout=120)
             out[key] = json.loads(p.stdout) if p.returncode == 0 else {'error': p.stderr.strip()[-400:]}
@@ -130,13 +158,16 @@ def versions():
 
 
 def cmd_setup(a):
+    vendor_arch = None
     try:
         bp, vendor_arch, entry = ci_platform(a.board, a.ci)
+        cli = shutil.which('arduino-cli')
+        exclude_from_checkout([a.ci] + ([os.path.dirname(cli)] if cli else []))
         bp.install_library_deps()   # exits non-zero itself on a failed install
         bp.install_platform(vendor_arch, entry)
     finally:
         if a.versions:
-            Path(a.versions).write_text(json.dumps(versions()) + '\n')
+            Path(a.versions).write_text(json.dumps(versions(vendor_arch)) + '\n')
     emit({'board': a.board, 'platform': vendor_arch, 'ciPlatform': P.BUILD.BOARDS[a.board]['filters']})
     return 0
 
@@ -153,7 +184,7 @@ def cmd_pack(a):
     try:
         R.pack(tmp, roster, [record], head)
         R.core.write_json(tmp / PROVENANCE, {'board': a.board, 'head': head, 'runId': a.run_id,
-                                             'attempt': a.attempt, 'roster': roster})
+                                             'attempt': a.attempt})
         tmp.rename(out)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -203,7 +234,6 @@ def admit_tree(src, board, head, run_id, roster):
         raise Refused(f'{src}: unpinned {stray[:5]}, missing {missing[:5]}, changed {changed[:5]}')
     if R.core.digest(src / roster) != R.core.digest(P.ROOT / roster):
         raise Refused(f'{src}: its {roster} is not this checkout\'s')
-    return prov
 
 
 # ---- rig: the board loop
@@ -235,10 +265,11 @@ def battery(tree, board, run_dir, roster):
 
 
 def attempt_entry(run_dir, code, row, seconds):
+    base = {'runDir': str(run_dir), 'exit': code, 'seconds': round(seconds)}
     if row is None:
-        return {'runDir': str(run_dir), 'exit': code, 'verdict': 'blocker', 'seconds': round(seconds),
+        return {**base, 'verdict': 'blocker',
                 'detail': f'no readable report (exit {code}): see {run_dir.with_suffix(".log").name}'}
-    return {'runDir': str(run_dir), 'exit': code, 'verdict': row['verdict'], 'seconds': round(seconds),
+    return {**base, 'verdict': row['verdict'],
             'locked': bool(row.get('locked')) and not row.get('recoveryBlocker'), 'detail': row.get('detail', ''),
             'tests': [{k: t.get(k) for k in ('test', 'pass', 'detail')} for t in row.get('tests', [])],
             'cleanup': {k: row.get('cleanup', {}).get(k) for k in ('pass', 'state', 'holder')},
@@ -262,8 +293,9 @@ def run_board(board, tree, out, roster, clock, lock_wait, stop):
             why = 'aborted by a signal' if stop['signal'] else 'deadline'
             return unresolved(why + (f' (last: {last["detail"]})' if last and last.get('locked') else ''))
         if lock_since is not None:
-            res['waitedS'] = round(waited + time.monotonic() - lock_since)
-            if waited + time.monotonic() - lock_since >= lock_wait:
+            wait = waited + time.monotonic() - lock_since
+            res['waitedS'] = round(wait)
+            if wait >= lock_wait:
                 return unresolved(f'locked past the {lock_wait:g}s lock wait: {last["detail"]}')
         run_dir = out / board / f'run-{len(res["attempts"]) + 1}'
         log(f'{board}: attempt {len(res["attempts"]) + 1} ({run_dir})')
@@ -353,7 +385,8 @@ def cmd_run(a):
         try:
             admit_tree(Path(a.hosted) / b, b, a.head, a.run_id, roster_rel)
             tree = out / b / 'tree'
-            shutil.copytree(Path(a.hosted) / b, tree)
+            tree.parent.mkdir()   # the parent first: a rename, not move()'s copy fallback
+            shutil.move(Path(a.hosted) / b, tree)
         except (Refused, OSError) as e:
             results.append(finish(new_result(b), 'not-run', f'not run: {e}'))
             continue
@@ -379,7 +412,7 @@ def parse(argv):
     s = sub.add_parser('setup')
     s.add_argument('--board', required=True)
     s.add_argument('--ci', required=True, help='the adafruit/ci-arduino checkout')
-    s.add_argument('--versions', help='write arduino-cli, core and library versions (JSON) here')
+    s.add_argument('--versions', help='write the platform and arduino-cli and core versions (JSON) here')
     p = sub.add_parser('pack')
     p.add_argument('--board', required=True)
     p.add_argument('--record', required=True)
