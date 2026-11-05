@@ -2099,6 +2099,72 @@ class WatchReportTest(WatchCase):
                 self.assertIn('missing', captain.reports([ref])[0])
 
 
+class WatchUnchangedTest(WatchCase):
+    """A member's transcript: a task, the watch brief a hook gave it, then the task end it reported."""
+
+    def setUp(self):
+        super().setUp()
+        self.transcript = self.state / 'config' / 'projects' / '-w' / 's-t2.jsonl'
+        self.transcript.parent.mkdir(parents=True)
+        self.arm('all')
+        self.m = self.joined_as('t2')
+        self.log({'type': 'user', 'promptSource': 'typed', 'origin': {'kind': 'human'},
+                  'message': {'content': 'fix it'}},
+                 {'type': 'attachment', 'content': captain.watch_brief(self.m, 't1')})
+        self.ref = self.reported()
+
+    def log(self, *entries, raw=b''):
+        with open(self.transcript, 'ab') as f:
+            f.write(b''.join(json.dumps(e).encode() + b'\n' for e in entries) + raw)
+
+    def reported(self, extra=''):
+        """One task end reported, its call and output logged as Claude Code writes them: the report's ref."""
+        self.log({'type': 'assistant', 'message': {'content': [
+            {'type': 'tool_use', 'name': 'Bash', 'input': {'command': f'report --for {self.m} --file -'}}]}})
+        n = len(captain.records())
+        self.report_as('t2', self.m)
+        ref = f'{self.m}:{n}'
+        self.log({'type': 'user', 'message': {'content': [
+                     {'type': 'tool_result', 'content': f'recorded {ref}{extra}'}]}},
+                 {'type': 'assistant', 'message': {'content': [{'type': 'text', 'text': 'Fixed.'}]}})
+        return ref
+
+    def asked(self):
+        line = self.ask()
+        if line.endswith('delivered'):
+            captain.cancel(self.msg_of(line), self.ident)
+        return line
+
+    def test_nothing_new_since_a_watch_report_is_not_asked(self):
+        line = self.asked()
+        self.assertIn(f'not asked, nothing new since its report {self.ref} at', line)
+        self.assertEqual(self.typed, [])
+        [row] = captain.reports([self.ref])
+        self.assertEqual((row['msg'], row['task']), (self.ref, GOOD['task']))
+
+    def test_a_later_turn_is_asked(self):
+        self.log({'type': 'user', 'promptSource': 'typed', 'origin': {'kind': 'human'},
+                  'message': {'content': 'and now this'}})
+        self.assertTrue(self.asked().endswith('delivered'))
+
+    def test_asked_when_it_cannot_be_shown(self):
+        cases = {'torn line': lambda: self.log(raw=b'{"type": "user", "mess'),
+                 'later report not logged': lambda: self.report_as('t2', self.m),
+                 'other output': lambda: self.reported(extra=' and more'),
+                 'only quoted': lambda: self.transcript.write_bytes(json.dumps(
+                     {'type': 'user', 'isCompactSummary': True, 'message': {
+                         'content': f'earlier: recorded {self.ref}'}}).encode() + b'\n')}
+        for why, change in cases.items():
+            with self.subTest(why):
+                saved_ledger = (self.state / captain.LEDGER).read_bytes()
+                saved = self.transcript.read_bytes()
+                change()
+                self.assertTrue(self.asked().endswith('delivered'))
+                self.transcript.write_bytes(saved)
+                (self.state / captain.LEDGER).write_bytes(saved_ledger)
+        self.assertIn('not asked', self.asked())
+
+
 class WatchHookTest(WatchCase):
     def test_no_marker_reads_nothing(self):
         with mock.patch.object(captain, 'records', side_effect=AssertionError('read')), \

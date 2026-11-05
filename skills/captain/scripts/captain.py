@@ -588,12 +588,29 @@ def new_turn(entry):
     return entry.get('type') == 'user' and not entry.get('isMeta') and not results
 
 
+def anchor(entry, ref, member):
+    """Whether a transcript entry is what a report's turn starts from: a watch member's own report call returning,
+    its output naming the report; a request's prompt as typed."""
+    if member:
+        blocks = content(entry)
+        return (isinstance(entry, dict) and entry.get('type') == 'user' and isinstance(blocks, list)
+                and len(blocks) == 1 and isinstance(blocks[0], dict) and blocks[0].get('type') == 'tool_result'
+                and not blocks[0].get('is_error') and (plain_text(blocks[0].get('content')) or '').strip()
+                == f'recorded {ref}')
+    words = plain_text(content(entry))
+    return bool(human_input(entry) and words and unwrapped(words) == status_prompt(ref))
+
+
 def unchanged(target, recs):
-    """target's last report when its transcript starts no turn after the request that report answered, so asking
-    again would only repeat it; None, so the target is asked, whenever that cannot be shown."""
+    """(target's last report, the id `reports` gives it by) when its transcript starts no turn after the request that
+    report answered or, for a watch member's, after the report call, so asking again would only repeat it; None, so
+    the target is asked, whenever that cannot be shown."""
     last = last_report(target, recs)
     if not last:
         return None
+    member = asked(recs)[last['msg']]['type'] == 'joined'
+    # a member reports many times: its report call's output names this one by ledger index, `reports` as well
+    ref = f'{last["msg"]}:{next(i for i, r in enumerate(recs) if r is last)}' if member else last['msg']
     config = config_dir(target['account'])
     found = transcripts(config, target['session']) if config else []
     if len(found) != 1:
@@ -603,16 +620,15 @@ def unchanged(target, recs):
             data = f.read()
     except OSError:
         return None
-    at = data.find(last['msg'].encode())
+    at = data.find((f'recorded {ref}' if member else ref).encode())
     *lines, torn = data[data.rfind(b'\n', 0, at) + 1:].split(b'\n') if at >= 0 else [b'']
     if not lines or torn:   # not there, or a partly written line that may be a new turn
         return None
     try:
         entries = (json.loads(line) for line in lines)   # lazily: the first new turn ends the walk
         for entry in entries:   # a record of the API request that carried it may quote it first
-            words = plain_text(content(entry))
-            if human_input(entry) and words and unwrapped(words) == status_prompt(last['msg']):
-                return None if any(new_turn(e) for e in entries) else last
+            if anchor(entry, ref, member):
+                return None if any(new_turn(e) for e in entries) else (last, ref)
             if new_turn(entry):
                 return None   # a summary or tool output quoting the id is not the request
         return None
@@ -628,10 +644,11 @@ def ask(address, mine, force=False):
         target, why = sendable(address, recs, mine)
         if why:
             return f'{address}: refused, {why}'
-        last = not force and unchanged(target, recs)
-        if last:
+        found = not force and unchanged(target, recs)
+        if found:
+            last, ref = found
             at = time.strftime('%H:%M', time.localtime(last['at']))
-            return f'{address}: not asked, nothing new since its report {last["msg"]} at {at}'
+            return f'{address}: not asked, nothing new since its report {ref} at {at}'
         msg = new_id('m', recs)
         return deliver('request', msg, captain, target, status_prompt(msg))
 
