@@ -50,7 +50,7 @@ posix_only = unittest.skipIf(os.name == 'nt', 'needs a POSIX shell and signals')
 
 def stub_profile(root):
     return types.SimpleNamespace(
-        NAME='TinyUSB', ROOT=str(root), OUT_DIR=str(root / 'out'), BASE_BRANCH='master',
+        PROFILE_API=sd.PROFILE_API, NAME='TinyUSB', ROOT=str(root), OUT_DIR=str(root / 'out'), BASE_BRANCH='master',
         filters=lambda checkout: [sd.filter_arg(os.path.join(checkout, 'src'))],
         check=mock.Mock(return_value=[]), build=mock.Mock(return_value=None),
         elfs=lambda build, example: glob.glob(os.path.join(glob.escape(build), example or '**', '*.elf'),
@@ -3137,6 +3137,16 @@ class ProfileProtocol(ProfileCase):
                 self.assertEqual(sd.main(project, ['report', '-b', 'b']), 2)
             self.assertIn(f'lacks {name}', err.getvalue())
             self.assertFalse(Path(self.profile.OUT_DIR).exists())
+        self.profile.check.assert_not_called()
+        self.profile.build.assert_not_called()
+
+    def test_a_profile_of_another_profile_api_is_refused_before_any_work(self):
+        project = types.SimpleNamespace(**{**vars(self.profile), 'PROFILE_API': sd.PROFILE_API + 1})
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(sd.main(project, ['report', '-b', 'b']), 2)
+        self.assertIn(f'follows profile API {sd.PROFILE_API + 1}, this engine implements {sd.PROFILE_API}',
+                      err.getvalue())
+        self.assertFalse(Path(self.profile.OUT_DIR).exists())
         self.profile.check.assert_not_called()
         self.profile.build.assert_not_called()
 
