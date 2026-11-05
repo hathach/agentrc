@@ -1062,6 +1062,16 @@ class Core(Lib):
         self.assertEqual((sketchbook / 'hardware/fake/core').resolve(), self.root)
         self.assertEqual([p.name for p in (sketchbook / 'libraries').iterdir()], ['Dep_C'])
 
+    def test_a_failed_cli_env_leaves_no_environment_behind(self):
+        self.patch(ab, 'source_identity', lambda: ({'head': 'abc', 'dirty': False, 'status': ''}, ''))
+        self.patch(ab, 'prepared_dependencies', lambda: {})
+        self.patch(ab, 'build_all', mock.Mock(side_effect=AssertionError('compiled')))
+        with mock.patch.object(ab.subprocess, 'run', return_value=mock.Mock(returncode=1, stdout='', stderr='bad')):
+            code, out = self.run_main(['--board', 'm4', '--example', 'libraries/Wire/examples/scan'])
+        self.assertEqual(code, 2)
+        self.assertIn('config dump', out['error'])
+        self.assertFalse((self.root / f'build/.arduino-cli-{os.getpid()}').exists())
+
     def test_foreign_core_header_is_flagged_and_the_linked_checkout_is_not(self):
         other = self.tmp / 'other_core'
         shutil.copytree(self.root, other)

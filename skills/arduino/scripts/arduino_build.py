@@ -1144,13 +1144,13 @@ def main(argv=None):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             fail(f'{rel(shared)} is in use by another build or HIL run (its .lock is held)')
-    config = cli_env(build_root / f'.arduino-cli-{os.getpid()}', prepared) \
-        if core_mode() and any(sel['builds'].values()) else None
+    cli_dir = build_root / f'.arduino-cli-{os.getpid()}' if core_mode() and any(sel['builds'].values()) else None
     try:
+        config = cli_env(cli_dir, prepared) if cli_dir else None
         rows = build_all(args.jobs, sel['builds'], root, args.build_property, prepared, config)
     finally:
-        if config:
-            shutil.rmtree(config.parent, ignore_errors=True)
+        if cli_dir:
+            shutil.rmtree(cli_dir, ignore_errors=True)
     tests = run_tests(sel['tests'])
     record_error, record_path = None, None
     deps = used_dependencies(prepared, rows)
