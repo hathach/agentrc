@@ -30,9 +30,11 @@ A core's profile (an Arduino platform checkout, e.g. adafruit:samd) adds these, 
   SKETCH_ROOTS          dirs whose *.ino sketch dirs are the examples (a library: ('examples',))
   exclude(board, example)  True drops a sketch the core's CI never builds on that board, beside the
                         .all.test.skip / .<filters>.test.skip / .<filters>.test.only markers its build_all.py reads
+                        (honoured in a library too)
   fqbn(board, example)  the FQBN a sketch builds with on `board` (default the board's): one rig board, two menus
 
 PROFILE_API is the profile interface the three engines implement; a library's bootstrap refuses any other unloaded.
+PROFILE_FEATURES names the additive capabilities a bootstrap may require of these engines ('core': core mode).
 
 The JSON contract (stdout's last line, exits 0 pass, 1 failed, 2 usage or a missing prerequisite, 3 uncovered) is
 the library's build SKILL.md.
@@ -59,6 +61,7 @@ FILES = ('skills/hil/boards.json', 'skills/hil/scripts/hil_boards.py', 'skills/h
 SELF = 'skills/arduino/scripts/arduino_build.py'
 SCHEMA = 2
 PROFILE_API = 1   # bump on a change a library profile must follow, arduino_hil's and arduino_remote's included
+PROFILE_FEATURES = ('core',)
 COMPILE_TIMEOUT = 900
 BUILD_SCRIPTS = '.claude/skills/build/scripts/'
 HIL_CONTROL = ('.claude/skills/hil-contract/scripts/', 'test/hil/')
@@ -156,41 +159,33 @@ def examples():
 
 
 @functools.lru_cache(maxsize=None)
-def _eligible(root, platform, example):
+def _eligible(root, platform, example, core):
+    """ci-arduino's markers, or a core's tools/build_all.py ones (adafruit SAMD and nRF52): .all.test.skip in place
+    of .skip.txt."""
     folder = root / example
     if (folder / f'.{platform}.test.skip').exists():
         return False
-    skip_txt = folder / '.skip.txt'
-    if skip_txt.exists() and any(line.strip() == platform for line in skip_txt.read_text().splitlines()):
-        return False
-    if any(folder.glob('.*.test.only')):
-        return (folder / f'.{platform}.test.only').exists()
-    return True
-
-
-@functools.lru_cache(maxsize=None)
-def _eligible_core(root, platform, example):
-    """A core's tools/build_all.py markers (adafruit SAMD and nRF52): .all.test.skip, .<platform>.test.skip, and
-    .<platform>.test.only when any .*.test.only is present."""
-    folder = root / example
-    if (folder / '.all.test.skip').exists() or (folder / f'.{platform}.test.skip').exists():
-        return False
+    if core:
+        if (folder / '.all.test.skip').exists():
+            return False
+    else:
+        skip_txt = folder / '.skip.txt'
+        if skip_txt.exists() and any(line.strip() == platform for line in skip_txt.read_text().splitlines()):
+            return False
     if any(folder.glob('.*.test.only')):
         return (folder / f'.{platform}.test.only').exists()
     return True
 
 
 def eligible(board, example):
-    """ci-arduino build_platform.py test_examples_in_folder (a core: its build_all.py markers and exclude()), for the
-    board's filter platform. A HIL sketch outside the sketch roots is eligible on the rig boards whose role runs it,
+    """ci-arduino build_platform.py test_examples_in_folder (a core: its build_all.py markers) and the profile's
+    exclude(), for the board's filter platform. A HIL sketch outside the sketch roots is eligible on the rig boards whose role runs it,
     and nowhere else."""
     if not is_example(example):
         return 'span' in P.BOARDS[board] and example in hil_sketches(board)
-    platform = P.BOARDS[board].get('filters', board)
-    if not core_mode():
-        return _eligible(P.ROOT, platform, example)
     exclude = getattr(P, 'exclude', None)
-    return _eligible_core(P.ROOT, platform, example) and not (exclude and exclude(board, example))
+    return (_eligible(P.ROOT, P.BOARDS[board].get('filters', board), example, core_mode())
+            and not (exclude and exclude(board, example)))
 
 
 def fqbn(board, example):
@@ -229,8 +224,9 @@ def classify(path):
     profile's source rules, then the common ones. effect: family | shared | boards | sketches | example | hil_sketch |
     tests | fixture | hil | nothing | uncovered; `boards` builds every eligible sketch on the boards its detail names,
     `sketches` the sketch dirs its detail names on every representative."""
-    if core_mode() and example_of(path):
-        return 'example', example_of(path), 'example sketch'
+    ex = example_of(path)
+    if core_mode() and ex:
+        return 'example', ex, 'example sketch'
     own = P.classify_source(path)
     if own:
         return own
@@ -239,7 +235,6 @@ def classify(path):
     if path.startswith('src/'):
         return 'shared', None, 'shared library code'
     if is_example(path):
-        ex = example_of(path)
         if ex:
             return 'example', ex, 'example sketch'
         if path.endswith(('.md', '.txt', '.js', '.json', '.py', '.html')):
@@ -265,6 +260,7 @@ def classify(path):
 def select(paths, roster=None, only_examples=None):
     builds, tests, out_paths, uncovered = {}, set(), [], []
     hil_picked, hil_full = set(), False
+    reps = [b for f in P.REPRESENTATIVES for b in P.REPRESENTATIVES[f]]
 
     def add(board, exs):
         builds.setdefault(board, set()).update(e for e in exs if eligible(board, e) and
@@ -275,24 +271,18 @@ def select(paths, roster=None, only_examples=None):
         out_paths.append({'path': path, 'rule': effect, 'reason': reason})
         if effect == 'uncovered':
             uncovered.append({'path': path, 'reason': reason})
-        elif effect in ('family', 'shared'):
-            families = [detail] if effect == 'family' else list(P.REPRESENTATIVES)
-            boards = [b for f in families for b in P.REPRESENTATIVES[f]]
+        elif effect in ('family', 'shared', 'boards'):
+            boards = (detail if effect == 'boards' else
+                      P.REPRESENTATIVES[detail] if effect == 'family' else reps)
             for b in boards:
                 add(b, examples())
             if roster:
-                hil_picked.update(b for b in roster if P.BOARDS[b]['family'] in families)
-        elif effect == 'boards':
-            for b in detail:
-                add(b, examples())
-            if roster:
-                families = {P.BOARDS[b]['family'] for b in detail}
+                families = {P.BOARDS[b]['family'] for b in boards}
                 hil_picked.update(b for b in roster if P.BOARDS[b]['family'] in families)
         elif effect == 'sketches':
-            unbuilt = [s for s in detail if not any(eligible(b, s) for f in P.REPRESENTATIVES
-                                                    for b in P.REPRESENTATIVES[f])]
-            uncovered += [{'path': path, 'reason': f'{s} is eligible on no representative'} for s in unbuilt]
-            for b in {b for f in P.REPRESENTATIVES for b in P.REPRESENTATIVES[f]}:
+            uncovered += [{'path': path, 'reason': f'{s} is eligible on no representative'} for s in detail
+                          if not any(eligible(b, s) for b in reps)]
+            for b in reps:
                 add(b, detail)
         elif effect == 'example':
             if not buildable(detail):
@@ -900,24 +890,24 @@ def merge(spans):
 
 # ---- HIL record
 
-def worktree_status():
-    """`git status --porcelain` of the checkout; a core's adds `~<state> <path>` for each submodule, at any depth, not
-    at its gitlink (state + - U) or whose own worktree has changes (~~): an `ignore` setting at any level hides both
-    from the superproject's status."""
+def worktree_status(subs=None):
+    """`git status --porcelain` of the checkout, plus `~<state> <path>` for each submodule (`subs`, by default
+    submodules()), at any depth, not at its gitlink (state + - U) or whose own worktree has changes (~~): an `ignore`
+    setting at any level hides both from the superproject's status."""
     status = git('status', '--porcelain', '--untracked-files=all')
-    if core_mode():
-        status += ''.join(f'~{"~" if s["state"] == " " else s["state"]} {s["path"]}\n' for s in submodules()
-                          if s['state'] != ' ' or s['dirty'])
+    status += ''.join(f'~{"~" if s["state"] == " " else s["state"]} {s["path"]}\n'
+                      for s in (submodules() if subs is None else subs) if s['state'] != ' ' or s['dirty'])
     return status
 
 
 def source_identity():
-    status = worktree_status()
+    subs = submodules()
+    status = worktree_status(subs)
     diff = git('diff', 'HEAD', '--binary')
     ident = {'head': git('rev-parse', 'HEAD').strip(), 'dirty': bool(status.strip()),
              'diffSha256': hashlib.sha256(diff.encode()).hexdigest(), 'status': status}
-    if core_mode():
-        ident['submodules'] = submodules()
+    if subs:
+        ident['submodules'] = subs
     return ident, diff
 
 
@@ -930,11 +920,8 @@ def submodules():
         if m:
             dirty = False
             if m.group(1) != '-':
-                p = subprocess.run(['git', '-C', str(P.ROOT / m.group(3)), 'status', '--porcelain',
-                                    '--untracked-files=all', '--ignore-submodules=all'], capture_output=True, text=True)
-                if p.returncode:
-                    fail(f'git status in submodule {m.group(3)}: {p.stderr.strip()}')
-                dirty = bool(p.stdout.strip())
+                dirty = bool(git('-C', m.group(3), 'status', '--porcelain', '--untracked-files=all',
+                                 '--ignore-submodules=all').strip())
             out.append({'path': m.group(3), 'commit': m.group(2), 'state': m.group(1), 'dirty': dirty})
     return out
 

@@ -84,6 +84,15 @@ def setUpModule():
 
 
 
+
+def cli_compile(used, platform_id, version, install_dir, build_install_dir, success=True, err=''):
+    """arduino-cli compile --json's result as compile_sketch parses it."""
+    out = {'success': success, 'compiler_err': err, 'builder_result': {
+        'used_libraries': used, 'board_platform': {'id': platform_id, 'version': version, 'install_dir': install_dir},
+        'build_platform': {'id': platform_id, 'install_dir': build_install_dir}}}
+    return mock.Mock(returncode=0 if success else 1, stdout=json.dumps(out), stderr='')
+
+
 class Lib(unittest.TestCase):
     """A fresh copy of the fake library, its build profile bound for the test."""
 
@@ -388,10 +397,7 @@ class Provenance(Lib):
 
     def fake_compile(self, used=None, success=True, err='', platform='/x'):
         used = [{'name': fake.NAME, 'install_dir': str(self.root)}] if used is None else used
-        out = {'success': success, 'compiler_err': err, 'builder_result': {
-            'used_libraries': used, 'board_platform': {'id': 'vend:arch', 'version': '1.0', 'install_dir': platform},
-            'build_platform': {'id': 'vend:arch', 'install_dir': '/y'}}}
-        return mock.Mock(returncode=0 if success else 1, stdout=json.dumps(out), stderr='')
+        return cli_compile(used, 'vend:arch', '1.0', platform, '/y', success, err)
 
     def compile(self, proc, board='rig_jlink', prepared=None):
         with mock.patch.object(ab.subprocess, 'run', **({'side_effect': proc} if isinstance(proc, Exception) else
@@ -936,11 +942,7 @@ class Core(Lib):
 
     def fake_compile(self, platform=None, used=()):
         platform = str(self.root) if platform is None else platform
-        out = {'success': True, 'builder_result': {
-            'used_libraries': list(used),
-            'board_platform': {'id': 'fake:core', 'version': '1.0.0', 'install_dir': platform},
-            'build_platform': {'id': 'fake:core', 'install_dir': platform}}}
-        return mock.Mock(returncode=0, stdout=json.dumps(out), stderr='')
+        return cli_compile(list(used), 'fake:core', '1.0.0', platform, platform)
 
     def core_roster(self):
         roster = self.root / 'test/hil/ci.json'
@@ -1155,24 +1157,26 @@ class Core(Lib):
                 {'path': 'libraries/W', 'commit': 'c', 'state': ' ', 'dirty': False}]
         with mock.patch.object(ab, 'git', return_value=''), mock.patch.object(ab, 'submodules', return_value=subs):
             self.assertEqual(ab.worktree_status(), '~+ libraries/USB\n~- libraries/Z\n')   # what admission compares
+        listed = mock.Mock(returncode=0, stdout=' 3e5369cd libraries/USB (3.7.3)\n', stderr='')
         failed = mock.Mock(returncode=128, stdout='', stderr='fatal: not a git repository')
-        with mock.patch.object(ab, 'git', return_value=' 3e5369cd libraries/USB (3.7.3)\n'), \
-                mock.patch.object(ab.subprocess, 'run', return_value=failed), \
+        with mock.patch.object(ab.subprocess, 'run', side_effect=[listed, failed]), \
                 contextlib.redirect_stdout(io.StringIO()) as out, self.assertRaises(SystemExit) as e:
             ab.submodules()
         self.assertEqual(e.exception.code, 2)
-        self.assertIn('libraries/USB: fatal: not a git repository', json.loads(out.getvalue())['error'])
+        error = json.loads(out.getvalue())['error']
+        self.assertIn('-C libraries/USB status', error)
+        self.assertIn('fatal: not a git repository', error)
 
     def test_submodule_status_is_parsed_recursively(self):
         out = (' 3e5369cd libraries/USB (3.7.3)\n-5b48867c libraries/Z\n+0123abcd libraries/USB/lib/x (v1)\n')
-        clean = mock.Mock(returncode=0, stdout='', stderr='')
-        with mock.patch.object(ab, 'git', return_value=out) as git, mock.patch.object(ab.subprocess, 'run',
-                                                                                    return_value=clean):
+        with mock.patch.object(ab, 'git', side_effect=lambda *a: out if a[0] == 'submodule' else '') as git:
             self.assertEqual(ab.submodules(), [
                 {'path': 'libraries/USB', 'commit': '3e5369cd', 'state': ' ', 'dirty': False},
                 {'path': 'libraries/Z', 'commit': '5b48867c', 'state': '-', 'dirty': False},
                 {'path': 'libraries/USB/lib/x', 'commit': '0123abcd', 'state': '+', 'dirty': False}])
-        git.assert_called_once_with('submodule', 'status', '--recursive')
+        self.assertEqual([c.args for c in git.call_args_list], [('submodule', 'status', '--recursive')] + [
+            ('-C', d, 'status', '--porcelain', '--untracked-files=all', '--ignore-submodules=all')
+            for d in ('libraries/USB', 'libraries/USB/lib/x')])
 
 
 if __name__ == '__main__':

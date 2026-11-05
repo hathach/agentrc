@@ -166,7 +166,7 @@ def core_profile(root, agentrc_identity, **over):
         'BOARDS': copy.deepcopy(CORE_BOARDS), 'REPRESENTATIVES': copy.deepcopy(CORE_REPRESENTATIVES),
         'HIL_SKETCHES': dict(CORE_HIL_SKETCHES), 'SMOKE_BOARDS': ('rig_m4',), 'EXTRA_DEPENDENCIES': ('Dep C',),
         'classify_source': core_classify,
-        'exclude': lambda board, ex: ex.startswith('libraries/USB/') and 'tusb' not in board and ex.endswith('echo'),
+        'exclude': lambda board, ex: ex == 'libraries/USB/examples/echo' and 'tusb' not in board,
         'fqbn': lambda board, ex: 'fake:core:m4:usb=tusb' if ex == 'test/hil/core_cdc_tusb' else
         CORE_BOARDS[board]['fqbn'],
         **over})

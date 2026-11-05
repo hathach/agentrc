@@ -86,7 +86,6 @@ retries, recovery) apply unchanged; these scripts load its `hil_*` scripts throu
 - TinyUSB Arduino's vendored TinyUSB (the paths its `CLAUDE.md` names) keeps tinyusb's format: fix it in
   hathach/tinyusb under tinyusb's `.clang-format`, then copy it back as that `CLAUDE.md` says.
 
-
 ## A core
 
 An Arduino core (a platform checkout such as adafruit/ArduinoCore-samd) uses the same engines in core mode: its build
