@@ -8,7 +8,11 @@ point, loading this file from the pinned agentrc (its `agentrc_pin.py`). One pro
 
   ROOT                  the library checkout (Path)
   LIBRARY_NAME          library.properties `name=`: how arduino-cli's used_libraries names it
-  BOARDS                {board: {fqbn, family, [filters, span, role, chip, fixture]}}; a rig board has `span`
+  BOARDS                {board: {fqbn, family, [filters, span, role, chip, fixture, base, base_exclude]}}; a rig
+                        board has `span`; `base` (feature 'base') is the checkout-relative Intel HEX files a J-Link
+                        rig board must hold under its sketches (a SoftDevice, a bootloader and its settings), checked
+                        before every flash and rewritten only when proven different (base_runs()), and
+                        `base_exclude` the address ranges [lo, hi) of those files never checked or written (UICR)
   REPRESENTATIVES       {family: [boards]} a change to that family's code builds
   HIL_SKETCHES          {role: (sketch dirs, the first the restoration image)}
   SMOKE_BOARDS          boards whose restoration sketch a build-contract change builds (one per image kind)
@@ -35,7 +39,8 @@ A core's profile (an Arduino platform checkout, e.g. adafruit:samd) adds these, 
   fqbn(board, example)  the FQBN a sketch builds with on `board` (default the board's): one rig board, two menus
 
 PROFILE_API is the profile interface the three engines implement; a library's bootstrap refuses any other unloaded.
-PROFILE_FEATURES names the additive capabilities a bootstrap may require of these engines ('core': core mode).
+PROFILE_FEATURES names the additive capabilities a bootstrap may require of these engines ('core': core mode,
+'base': a rig board's base image).
 
 The JSON contract (stdout's last line, exits 0 pass, 1 failed, 2 usage or a missing prerequisite, 3 uncovered) is
 the library's build SKILL.md.
@@ -62,7 +67,7 @@ FILES = ('skills/hil/boards.json', 'skills/hil/scripts/hil_boards.py', 'skills/h
 SELF = 'skills/arduino/scripts/arduino_build.py'
 SCHEMA = 2
 PROFILE_API = 1   # bump on a change a library profile must follow, arduino_hil's and arduino_remote's included
-PROFILE_FEATURES = ('core',)
+PROFILE_FEATURES = ('core', 'base')
 COMPILE_TIMEOUT = 900
 BUILD_SCRIPTS = '.claude/skills/build/scripts/'
 HIL_CONTROL = ('.claude/skills/hil-contract/scripts/', 'test/hil/')
@@ -870,6 +875,33 @@ def hex_runs(path):
     return [(start, bytes(data)) for start, data in runs]
 
 
+def base_runs(board, root=None):
+    """([(start, bytes)] of the board's base HEX files (BOARDS `base`) outside its `base_exclude` ranges, sorted, or
+    None (no base), and '' or why they cannot be a base: a run partly excluded, two runs overlapping or one inside the
+    board's span, where its sketches load."""
+    files = P.BOARDS[board].get('base')
+    if not files:
+        return None, ''
+    exclude = [tuple(r) for r in P.BOARDS[board].get('base_exclude', ())]
+    lo, hi = P.BOARDS[board]['span']
+    runs = []
+    for f in files:
+        for start, data in hex_runs(Path(root or P.ROOT) / f):
+            end = start + len(data)
+            if any(a <= start and end <= b for a, b in exclude):
+                continue
+            if any(start < b and a < end for a, b in exclude):
+                return None, f'{f}: [{start:#x}, {end:#x}) is partly inside an excluded range {exclude}'
+            if start < hi and lo < end:
+                return None, f'{f}: [{start:#x}, {end:#x}) overlaps the board span [{lo:#x}, {hi:#x})'
+            runs.append((start, data))
+    runs.sort()
+    for (a, da), (b, _) in zip(runs, runs[1:]):
+        if a + len(da) > b:
+            return None, f'base runs at {a:#x} and {b:#x} overlap'
+    return runs, ''
+
+
 def esp_segments(build_dir, lo):
     """([(offset, file)], '') of the build's flash_args (the ESP core writes it: a line of options, then one
     "<offset> <file>" per line), or (None, why): no image on the options line, every file present in the build dir,
@@ -997,6 +1029,12 @@ def make_record(args, board, rows, before, diff, roster_path, prepared):
     flasher = entry['flasher']['name']
     if flasher not in IMAGE_KIND:
         return None, f'{board}: flasher {flasher!r} has no image kind; must be one of {sorted(IMAGE_KIND)}'
+    base, why = base_runs(board)
+    if why:
+        return None, f'{board}: base image: {why}'
+    if base is not None and flasher != 'jlink':
+        return None, f'{board}: a base image is checked and written through J-Link only, this roster flashes it ' \
+                     f'with {flasher}'
     image = IMAGE_KIND[flasher]   # what the harness flashes for this probe
     host = role(board) == 'host'
     sketches = {}
@@ -1064,6 +1102,9 @@ def make_record(args, board, rows, before, diff, roster_path, prepared):
         **({'chip': P.BOARDS[board]['chip']} if 'chip' in P.BOARDS[board] else {}),
         **({'fixture': {'path': P.BOARDS[board]['fixture'], 'sha256': sha256(P.ROOT / P.BOARDS[board]['fixture'])}}
            if 'fixture' in P.BOARDS[board] else {}),
+        **({'base': {'files': {f: sha256(P.ROOT / f) for f in P.BOARDS[board]['base']},
+                     'exclude': [list(r) for r in P.BOARDS[board].get('base_exclude', ())],
+                     'segments': [[s, s + len(d)] for s, d in base]}} if base is not None else {}),
     }
     if args.experimental:
         patch = Path(args.record).with_suffix('.patch')

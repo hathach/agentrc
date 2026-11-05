@@ -237,6 +237,10 @@ def record_problems(rec, board, head, experimental_ok, where):
         why.append(f'it is for {rec["board"]}, not {board}')
     if rec['experimental'] and not experimental_ok:
         why.append('it is experimental: the battery and restore take clean records only')
+    want = B.P.BOARDS.get(board, {}).get('base')
+    if sorted(want or ()) != sorted((rec.get('base') or {}).get('files', {})):
+        why.append(f'its base image {sorted((rec.get("base") or {}).get("files", {}))} is not the profile\'s '
+                   f'{sorted(want or ())}: rebuild it')
     if head is not None and rec['source']['head'] != head:
         why.append(f'it was built at {rec["source"]["head"][:12]}, the {where} is at {head[:12]}: rebuild it')
     return why
@@ -285,7 +289,49 @@ def admit(record_path, board, roster_path, run_dir, *, manifest=None, experiment
                         'vidPid': s['vidPid'], 'sha256': s['sha256'], 'dir': str(dest),
                         'fqbn': s.get('fqbn', rec['fqbn']),
                         'segments': s.get('segments'), 'chip': rec.get('chip')}
+    if rec.get('base'):
+        base_image = admit_base(rec, board, Path(base or P.ROOT), Path(run_dir))
+        for image in images.values():
+            image['base'] = base_image
     return rec, images
+
+
+def write_hex(runs, path):
+    """Intel HEX of [(start, bytes)] runs: extended linear address records, 16 data bytes per line."""
+    lines, upper = [], None
+    for start, data in runs:
+        for off in range(0, len(data), 16):
+            addr, chunk = start + off, data[off:off + 16]
+            if addr >> 16 != upper:
+                upper = addr >> 16
+                lines.append(bytes([2, 0, 0, 4]) + upper.to_bytes(2, 'big'))
+            lines.append(bytes([len(chunk)]) + (addr & 0xffff).to_bytes(2, 'big') + b'\0' + chunk)
+    lines.append(bytes([0, 0, 0, 1]))
+    Path(path).write_text(''.join(f':{r.hex().upper()}{(-sum(r)) & 0xff:02X}\n' for r in lines))
+
+
+def admit_base(rec, board, root, run_dir):
+    """The record's base image prepared in run_dir/base: {'hex' (its runs outside the excluded ranges), 'bins'
+    [(start, file)], 'segments', 'state' (set by ensure_base)}, once its files hash as recorded and their runs are
+    the recorded segments; Refused otherwise."""
+    for rel_path, digest in rec['base']['files'].items():
+        src = root / rel_path
+        if not src.is_file() or B.sha256(src) != digest:
+            raise Refused(f'base image {rel_path} is missing or changed since the record')
+    runs, why = B.base_runs(board, root=root)
+    if why or runs is None:
+        raise Refused(f'base image: {why or "the profile names none"}')
+    if [[s, s + len(d)] for s, d in runs] != rec['base']['segments']:
+        raise Refused('base image runs differ from the record\'s segments: rebuild it')
+    out = run_dir / 'base'
+    out.mkdir(parents=True, exist_ok=True)
+    write_hex(runs, out / 'base.hex')
+    bins = []
+    for start, data in runs:
+        path = out / f'base-{start:08x}.bin'
+        path.write_bytes(data)
+        bins.append((start, str(path)))
+    return {'hex': str(out / 'base.hex'), 'bins': bins, 'segments': rec['base']['segments'], 'state': None}
 
 
 # ---- tracked children and flashing
@@ -384,6 +430,10 @@ def flash(flasher, image, run_dir, tracker):
         return f'openocd transcript lacks {missing}' if missing else ''
     if not image['hex']:
         return 'no HEX for a J-Link flash'
+    if image.get('base'):
+        why = ensure_base(flasher, image['base'], run_dir, tracker)
+        if why:
+            return why
     op = A.flash.flash_jlink(flasher, image['hex'], timeout=FLASH_TIMEOUT, run=tracker.run, workdir=str(run_dir))
     tracker.check()
     why = A.flash.jlink_problem(op)
@@ -400,6 +450,54 @@ def flash(flasher, image, run_dir, tracker):
     tracker.check()
     why = A.flash.jlink_problem(op)
     return f'J-Link verify: {why}' if why else ''
+
+
+def jlink_session(flasher, cmds, run_dir, tracker):
+    op = A.flash.run_jlink_commands(flasher, cmds, interface='SWD', speed=4000, autoconnect=True,
+                                    device=jlink_device(flasher), timeout=VERIFY_TIMEOUT, run=tracker.run,
+                                    workdir=str(run_dir))
+    tracker.check()
+    return op
+
+
+def base_mismatch(op):
+    """The verifybin command a J-Link session stopped at with 'Verify failed' after every earlier command completed
+    cleanly: a proven difference of the target from that file. None for anything else (no connection, a failed read,
+    a timeout), which proves nothing about the target."""
+    last = op.attempts[-1]
+    if last.kind != 'exited':
+        return None
+    out = A.process.cmd_stdout_text(last.result.stdout)
+    preamble = re.split(r'(?m)^J-Link>', out, maxsplit=1)[0]
+    if re.search(A.flash.JLINK_ERRORS, preamble):
+        return None
+    judged = A.flash.jlink_judgment(out, (last.script or '').splitlines()[:-1])['commands']
+    if not judged or any(j['error'] or not j['done'] for j in judged[:-1]):
+        return None
+    stop = judged[-1]
+    return stop['command'] if stop['command'].startswith('verifybin ') and stop['error'] == 'Verify failed' else None
+
+
+def ensure_base(flasher, base, run_dir, tracker):
+    """Check the board holds its base image (each run verified in place) and rewrite it only on a proven
+    difference, leaving the CPU halted for the sketch's flash; '' or why it failed. A session that proves nothing
+    (a read failure, no connection) writes nothing."""
+    verify = [f'verifybin {path},{start:#x}' for start, path in base['bins']]
+    op = jlink_session(flasher, ['halt', *verify], run_dir, tracker)
+    why = A.flash.jlink_problem(op)
+    if not why:
+        base['state'] = 'matched'
+        return ''
+    differs = base_mismatch(op)
+    if not differs:
+        return f'base check: {why} (nothing written)'
+    op = jlink_session(flasher, ['halt', f'loadfile {base["hex"]}', *verify], run_dir, tracker)
+    why = A.flash.jlink_problem(op)
+    if why:
+        base['state'] = 'unknown'
+        return f'base rewrite after {differs.split()[1].split(",")[1]} differed: {why}'
+    base['state'] = f'rewritten: the run at {differs.split()[1].split(",")[1]} differed'
+    return ''
 
 
 def detach(name, board, vid_pid, tracker):
@@ -584,7 +682,8 @@ def step(name, board, image, test, run_dir, tracker):
                                                        f'{ENUM_TIMEOUT}s (that VID:PID at: {others})'}
     ok, detail = run_test(test, dev, tracker, run_dir, board)
     return {'test': test, 'pass': ok, 'detail': detail, 'device': dev['busport'], 'detach': detached,
-            'seconds': round(time.monotonic() - started, 1)}
+            'seconds': round(time.monotonic() - started, 1),
+            **({'base': image['base']['state']} if image.get('base') else {})}
 
 
 def run_test(test, dev, tracker, run_dir, board):

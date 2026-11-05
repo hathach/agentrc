@@ -28,6 +28,9 @@ from helpers import guard_survivors, load_arduino_engine, load_arduino_fixture, 
 
 H = load_arduino_engine('skills/arduino/scripts/arduino_hil.py')
 fake = load_arduino_fixture()
+REAL = argparse.Namespace(flash=H.A.flash, process=H.A.process)   # before Base swaps H.A for stubs
+# JLinkExe V9.78 on ci.lan's nrf52840dk: a base check whose first verifybin found tinyusb's firmware at 0x0
+VERIFY_FAILED = (Path(__file__).resolve().parent / 'fixtures' / 'arduino_lib' / 'jlink_base_verify_failed.txt')
 
 
 def sha(data):
@@ -759,6 +762,113 @@ class Flash(Base):
         self.assertEqual((t.receipts, t.pending), ([{'pid': 1}], [{'receipt': {'pid': 1}}]))
         t._note('unknown', None, ['openocd'])
         self.assertIn('unrecheckable', t.pending[-1]['receipt'])
+
+
+def ihex(start, data):
+    out = [bytes([2, 0, 0, 4]) + (start >> 16).to_bytes(2, 'big')]
+    out += [bytes([len(data[o:o + 16])]) + ((start + o) & 0xffff).to_bytes(2, 'big') + b'\0' + data[o:o + 16]
+            for o in range(0, len(data), 16)]
+    return ''.join(f':{r.hex().upper()}{(-sum(r)) & 0xff:02X}\n' for r in out) + ':00000001FF\n'
+
+
+class BaseImage(Base):
+    """A rig board's base image: admitted with its record, checked before every J-Link flash, rewritten only on a
+    proven difference."""
+
+    def setUp(self):
+        super().setUp()
+        (self.root / 'sd.hex').write_text(ihex(0x1000, bytes(range(32))))
+        (self.root / 'uicr.hex').write_text(ihex(0x10001014, bytes(8)))
+        self.BP.BOARDS['rig_jlink'].update(base=('sd.hex', 'uicr.hex'), base_exclude=((0x10001000, 0x10002000),))
+        self.flasher = {'name': 'jlink', 'uid': '123456', 'args': '-device X'}
+
+    def base_record(self, **over):
+        files = {f: sha((self.root / f).read_bytes()) for f in ('sd.hex', 'uicr.hex')}
+        return self.record(base={'files': files, 'exclude': [[0x10001000, 0x10002000]],
+                                 'segments': [[0x1000, 0x1020]], **over})
+
+    def admit(self, rec):
+        with mock.patch.object(H, 'git_identity', return_value=('abc', '')):
+            return H.admit(rec, 'rig_jlink', self.roster, self.dir / 'run')
+
+    def test_admission_writes_the_runs_it_checks_and_never_the_excluded_ones(self):
+        _, images = self.admit(self.base_record())
+        base = images['echo']['base']
+        self.assertEqual(H.B.hex_runs(base['hex']), [(0x1000, bytes(range(32)))])
+        self.assertEqual([(a, Path(f).read_bytes()) for a, f in base['bins']], [(0x1000, bytes(range(32)))])
+        self.assertIsNone(base['state'])
+
+    def test_admission_refuses_a_base_that_is_not_the_records(self):
+        with self.assertRaisesRegex(H.Refused, 'runs differ from the record'):
+            self.admit(self.base_record(segments=[[0x1000, 0x1010]]))
+        rec = self.base_record()
+        (self.root / 'sd.hex').write_text(ihex(0x1000, bytes(32)))
+        with self.assertRaisesRegex(H.Refused, 'base image sd.hex is missing or changed since the record'):
+            self.admit(rec)
+        with self.assertRaisesRegex(H.Refused, r"its base image \[\] is not the profile's \['sd.hex', 'uicr.hex'\]"):
+            self.admit(self.record())
+        (self.root / 'sd.hex').write_text(ihex(0x1000, bytes(range(32))))
+        rec = self.base_record()
+        del self.BP.BOARDS['rig_jlink']['base']
+        with self.assertRaisesRegex(H.Refused, r"is not the profile's \[\]: rebuild it"):
+            self.admit(rec)
+
+    def sessions(self, *problems):
+        """run_jlink_commands' scripts, each session judged by the next of `problems`."""
+        self.A.flash.jlink_problem.side_effect = list(problems)
+        self.A.flash.run_jlink_commands.side_effect = lambda f, cmds, **kw: mock.Mock(cmds=cmds)
+        return lambda: [c[0][1] for c in self.A.flash.run_jlink_commands.call_args_list]
+
+    def test_a_matching_base_is_left_alone(self):
+        base = {'hex': 'b.hex', 'bins': [(0x1000, 'b-1000.bin')], 'state': None}
+        scripts = self.sessions('')
+        self.assertEqual(H.ensure_base(self.flasher, base, self.dir, mock.Mock()), '')
+        self.assertEqual((scripts(), base['state']), ([['halt', 'verifybin b-1000.bin,0x1000']], 'matched'))
+
+    def test_a_proven_difference_rewrites_the_base_and_leaves_the_cpu_halted(self):
+        base = {'hex': 'b.hex', 'bins': [(0x1000, 'b-1000.bin')], 'state': None}
+        scripts = self.sessions('stopped', '')
+        with mock.patch.object(H, 'base_mismatch', return_value='verifybin b-1000.bin,0x1000'):
+            self.assertEqual(H.ensure_base(self.flasher, base, self.dir, mock.Mock()), '')
+        self.assertEqual(scripts()[1], ['halt', 'loadfile b.hex', 'verifybin b-1000.bin,0x1000'])   # no r, no go
+        self.assertEqual(base['state'], 'rewritten: the run at 0x1000 differed')
+        scripts = self.sessions('stopped', 'loadfile failed')
+        with mock.patch.object(H, 'base_mismatch', return_value='verifybin b-1000.bin,0x1000'):
+            self.assertIn('base rewrite after 0x1000 differed: loadfile failed',
+                          H.ensure_base(self.flasher, base, self.dir, mock.Mock()))
+        self.assertEqual(base['state'], 'unknown')
+
+    def test_a_check_that_proves_nothing_writes_nothing(self):
+        base = {'hex': 'b.hex', 'bins': [(0x1000, 'b-1000.bin')], 'state': None}
+        scripts = self.sessions('JLinkExe exit 1')
+        with mock.patch.object(H, 'base_mismatch', return_value=None):
+            why = H.ensure_base(self.flasher, base, self.dir, mock.Mock())
+        self.assertEqual(why, 'base check: JLinkExe exit 1 (nothing written)')
+        self.assertEqual(len(scripts()), 1)
+        self.assertIsNone(base['state'])
+
+    def op(self, out, script, kind='exited'):
+        result = mock.Mock(stdout=out.encode(), stderr=b'', returncode=1)
+        return mock.Mock(attempts=[mock.Mock(kind=kind, result=result, script='\n'.join([*script, 'exit']))])
+
+    def test_only_a_verify_failure_after_a_clean_connect_is_a_difference(self):
+        self.patch(H, 'A', argparse.Namespace(**{**vars(self.A), **vars(REAL)}))
+        out = VERIFY_FAILED.read_text()
+        script = ['halt', 'verifybin BASE/base-00000000.bin,0x0', 'verifybin BASE/base-00001000.bin,0x1000']
+        self.assertEqual(H.base_mismatch(self.op(out, script)), 'verifybin BASE/base-00000000.bin,0x0')
+        self.assertIsNone(H.base_mismatch(self.op(out, script, kind='timed_out')))
+        unread = out.replace('Verify failed @ address 0x00000001.\nExpected 04 read 00\nERROR: Verify failed.',
+                             'Could not read memory.')
+        self.assertIsNone(H.base_mismatch(self.op(unread, script)))
+        unhalted = out.replace('PC = 000004F2', 'CPU is not halted')
+        self.assertIsNone(H.base_mismatch(self.op(unhalted, script)))
+
+    def test_a_jlink_flash_checks_the_base_first_and_the_row_names_its_state(self):
+        calls = []
+        with mock.patch.object(H, 'ensure_base', lambda f, b, d, t: calls.append('base') or 'base check: x'):
+            why = H.flash(self.flasher, {'hex': 'a.hex', 'base': {'state': None}}, self.dir, mock.Mock())
+        self.assertEqual((why, calls), ('base check: x', ['base']))
+        self.A.flash.flash_jlink.assert_not_called()
 
 
 class Step(Base):
