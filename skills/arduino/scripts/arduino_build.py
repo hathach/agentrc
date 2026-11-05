@@ -544,6 +544,12 @@ def bundled_libraries(platform_dir):
     return out
 
 
+def within(path, dirs):
+    """True when `path` sits inside one of `dirs` (None entries skipped)."""
+    where = Path(path).resolve()
+    return any(d and Path(d).resolve() in where.parents for d in dirs)
+
+
 def unexplained_libraries(used, prepared, platform_dirs):
     """(bad, shadows): the used_libraries entries that are neither this library from its checkout, a prepared
     dependency from its installed dir, nor one bundled with a core the build used; and {name: core copy} of the
@@ -555,7 +561,7 @@ def unexplained_libraries(used, prepared, platform_dirs):
         name, where = lib.get('name'), Path(lib.get('install_dir', '')).resolve()
         if name == P.LIBRARY_NAME:
             continue   # compile_sketch checks it came from the checkout
-        if any(d and Path(d).resolve() in where.parents for d in platform_dirs):
+        if within(where, platform_dirs):
             continue
         dep = prepared.get(name)
         if dep and Path(dep['dir']).resolve() == where:
@@ -1019,10 +1025,12 @@ def make_record(args, board, rows, before, diff, roster_path, prepared):
             return None, f'{row["example"]}: the {image.upper()} writes {[(hex(s), hex(e)) for s, e in spans]} ' \
                          f'outside the board span [{lo:#x}, {hi:#x})'
         if not args.experimental:
-            bad = [h for h in row['foreignHeaders'] if not h['matches']]
+            # a core's bundled copy lags the library between core releases: recorded, the report shows the drift
+            cores = [(row.get(k) or {}).get('install_dir') for k in ('platform', 'buildPlatform')]
+            bad = [h['path'] for h in row['foreignHeaders'] if not h['matches'] and not within(h['path'], cores)]
             if bad:
-                return None, f'{row["example"]}: compiled against headers that differ from this checkout: ' \
-                             f'{[h["path"] for h in bad]}'
+                return None, f'{row["example"]}: compiled against headers outside the core that differ from this ' \
+                             f'checkout: {bad}'
         extra = {}
         if getattr(P, 'record_check', None):
             extra, why = P.record_check(board, {**row, 'loadSpans': spans}, build_dir, entry)

@@ -751,10 +751,18 @@ class Record(RecordCase):
         self.assertEqual(err, 'examples/Basic/echo: too big')
         self.assertEqual(seen[0], ('rig_jlink', [(0x4000, 0x4020)], 'echo', ab.rig_roster(self.roster)['rig_jlink']))
 
-    def test_drifted_core_header_refused_unless_experimental(self):
-        hdr = [{'path': '/core/x.h', 'matches': False}]
+    def test_drifted_header_of_the_build_core_is_recorded(self):
+        hdr = [{'path': '/x/libraries/Lib/src/a.h', 'counterpart': 'src/a.h', 'matches': False},
+               {'path': '/b/libraries/Lib/src/c.h', 'counterpart': 'src/c.h', 'matches': False}]
+        row = {**self.samd_row(headers=hdr), 'buildPlatform': {'id': 'vend:arch', 'install_dir': '/b'}}
+        rec, err = self.record(row)
+        self.assertIsNone(err)
+        self.assertEqual(rec['sketches']['echo']['foreignHeaders'], hdr)
+
+    def test_drifted_header_outside_the_core_refused_unless_experimental(self):
+        hdr = [{'path': '/core/x.h', 'matches': False}, {'path': '/x/y.h', 'matches': False}]
         _, err = self.record(self.samd_row(headers=hdr))
-        self.assertIn('differ from this checkout', err)
+        self.assertIn("outside the core that differ from this checkout: ['/core/x.h']", err)
         rec, err = self.record(self.samd_row(headers=hdr), experimental=True)
         self.assertIsNone(err)
         self.assertTrue(rec['experimental'])

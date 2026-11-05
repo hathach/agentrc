@@ -808,8 +808,8 @@ class Step(Base):
 
 
 class Battery(Base):
-    def run_board(self, step=None, restore=None, admit=None, probe=''):
-        rec = self.record()
+    def run_board(self, step=None, restore=None, admit=None, probe='', **over):
+        rec = self.record(**over)
         board = self.board('rig_jlink')
         with mock.patch.object(H, 'probe_present', return_value=probe), \
                 mock.patch.object(H, 'admit', admit or (lambda *a, **k: (json.loads(rec.read_text()),
@@ -830,6 +830,14 @@ class Battery(Base):
         self.assertEqual(len(self.lock.released), 1)
         self.assertEqual(row['firmware']['head'], 'abc')
         self.assertEqual(row['firmware']['fqbns'], {'echo': 'vend:arch:rig_jlink'})
+        self.assertEqual(row['firmware']['driftedHeaders'], [])
+
+    def test_firmware_names_the_headers_a_core_copy_drifted(self):
+        hdr = lambda c, m: {'path': f'/core/{c}', 'counterpart': c, 'matches': m}
+        sketches = {'echo': {'foreignHeaders': [hdr('src/b.h', False), hdr('src/ok.h', True)]},
+                    'info': {'foreignHeaders': [hdr('src/a.h', False), hdr('src/b.h', False)]}}
+        row = self.run_board(sketches=sketches)
+        self.assertEqual(row['firmware']['driftedHeaders'], ['src/a.h', 'src/b.h'])
 
     def test_failed_test_is_a_fail_after_cleanup(self):
         row = self.run_board(step=lambda *a: {'test': 'echo', 'pass': False, 'detail': 'no echo'})
