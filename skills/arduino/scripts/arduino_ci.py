@@ -361,6 +361,8 @@ def prune(state, days, keep):
                 removed.append(d.name)
         except FileNotFoundError:   # a run sharing the state dir pruned it first
             pass
+        except OSError as e:        # a stuck dir must not stop the boards' run
+            log(f'prune: {d}: {e}')
     return removed
 
 

@@ -339,6 +339,22 @@ class Prune(unittest.TestCase):
             removed = C.prune(self.state, 30, self.state / '9-1')
         self.assertEqual((removed, raced.exists(), gone.exists()), ([], False, False))
 
+    def test_a_dir_it_cannot_remove_is_logged_and_skipped(self):
+        clean = {'kind': C.SUMMARY_KIND, 'termination': 'completed', 'boards': []}
+        stuck, other = self.run_dir('1-1', clean), self.run_dir('2-1', clean)
+        real_rmtree = shutil.rmtree
+
+        def rmtree(path):
+            if Path(path) == stuck:
+                raise PermissionError(13, 'Permission denied', str(path))
+            real_rmtree(path)
+        with mock.patch.object(C.shutil, 'rmtree', side_effect=rmtree), \
+                mock.patch.object(C.sys, 'stderr', io.StringIO()) as err:
+            removed = C.prune(self.state, 30, self.state / '9-1')
+        self.assertEqual((removed, stuck.exists(), other.exists()), (['2-1'], True, False))
+        self.assertIn(f'prune: {stuck}: ', err.getvalue())
+        self.assertIn('Permission denied', err.getvalue())
+
 
 class Run(Checkout):
     def setUp(self):
