@@ -33,8 +33,11 @@ mechanics, each with its usage at the top. This page is what to decide around th
 - A refused `host-install` names the identity field that changed: that is a reinstall or a runner re-registration,
   not a file edit to force through. `setup.sh add-runner NAME --host FILE` admits only one new runner and no other
   settings changes; the existing runner package must match the pin, and the checkout's `farm.toml` and locks the
-  installed ones (else `update` first). It leaves the new unit disabled, including after registration, until its
-  hardware proof. A failed addition keeps the installed host file, so retry the same command.
+  installed ones. Other pin or lock changes clear with `setup.sh update` without `--host` (its host-install refuses a
+  file that adds a runner), then the same `add-runner`. A changed actions-runner pin does not: `update` skips the
+  runner yet publishes the new pin, so add the runner from a commit with the installed one, or migrate the runners
+  outside this procedure first. It leaves the new unit disabled, including after registration, until its hardware
+  proof. A failed addition keeps the installed host file, so retry the same command.
 - A runner held by `job_hook.py` stays held until someone checks the failed job's processes and boards; clear it by
   the README's steps, not by restarting the unit.
 - A tool whose new install fails its check is not switched; the old one keeps serving. Report the check's output

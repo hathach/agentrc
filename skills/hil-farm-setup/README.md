@@ -162,7 +162,10 @@ pair and unit, and gives the admin read access through the new runner's group; r
 `_diag` and state directories. Existing registrations, accounts, hooks, units and job state stay untouched. It
 publishes the host file last and saves the previous one as `host.toml.prev`; retry the same command after a failure.
 It does not update tools or udev rules: it refuses while the checkout's `farm.toml` or a lock file differs from
-`/opt/hil-farm`'s copy, and udev rules need `update` first if changed.
+`/opt/hil-farm`'s copy, and udev rules need `update` first if changed. Run that `update` without `--host`, since its
+host-install refuses a host file that adds a runner, then retry `add-runner`. A changed actions-runner pin cannot be
+cleared that way: `update` skips the runner package but publishes the new pin, so the addition stays refused. Add
+the runner from a commit carrying the installed runners' pin, or migrate the runners outside this procedure first.
 
 1. Move the root checkout to the reviewed commit, as for an update.
 2. When `pgrep -x Runner.Worker` exits 1, stop every installed runner unit (and the new one if a prior attempt
