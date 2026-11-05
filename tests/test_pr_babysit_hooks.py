@@ -92,6 +92,17 @@ SCRIPTS = {
     # Prints, after a blank line, a nested run's failed result, its block and its output, alike on HEAD and the change.
     'nestedfail': f'printf "x.c:1: bad\\n\\nReport{"." * 67}Failed\\n- hook id: nested\\n- exit code: 1\\n'
                   '- files were modified by this hook\\n\\nchecked\\n"; exit 1\n',
+    # Prints, between blank lines, a failed result of target's in pre-commit's shape, then what target prints first.
+    'lead': f'printf "old\\n\\ntarget{"." * 67}Failed\\n- hook id: target\\n- exit code: 1\\n\\nmarker\\n"; exit 1\n',
+    # On HEAD prints lead's tail and that result before what it prints on the change too.
+    'target': f'grep -q edited "$@" || printf "marker\\n\\ntarget{"." * 67}Failed\\n- hook id: target\\n'
+              '- exit code: 1\\n\\n"; echo new; exit 1\n',
+    # Passes, printing two failed results of hooks the config lacks with no blank line between them.
+    'reports': f'printf "Report{"." * 67}Failed\\n- hook id: nested1\\n- exit code: 1\\n'
+               f'Report{"." * 67}Failed\\n- hook id: nested2\\n- exit code: 1\\n"\n',
+    # Passes, printing a failed result of nocc's and nocc's output.
+    'pv': f'printf "Report{"." * 67}Failed\\n- hook id: nocc\\n- exit code: 1\\n\\nno compiler\\n"\n',
+    'zhook': 'grep -q edited "$@" && { echo "z: new"; exit 1; }; exit 0\n',
 }
 
 
@@ -514,6 +525,37 @@ class HooksTest(unittest.TestCase):
         self.assertEqual((code, out['passed'], out['modifiedBy']), (0, False, []))
         self.assertEqual(out['failed'], [{'hook': 'nestedfail', 'error': 'x.c:1: bad'}])
         self.assertEqual((out['baselineFailed'], out['notRerun']), (['nestedfail'], []))
+
+    def test_a_failed_result_a_hook_prints_naming_a_configured_hook_never_hides_that_hooks_own(self):
+        self.configure('lead', 'target')
+        (self.repo / 'a.txt').write_text('edited\n')
+        code, out = self.run_script('a.txt')
+        self.assertEqual((code, out['passed']), (0, False))
+        self.assertEqual(out['failed'], [{'hook': 'lead', 'error': 'old'}, {'hook': 'target', 'error': 'marker'},
+                                         {'hook': 'target', 'error': 'new'}])
+        self.assertEqual(out['baselineFailed'], ['lead'])
+
+    def test_a_failed_result_a_passing_hook_prints_never_hides_a_later_hooks_failure(self):
+        verbose = HOOK.format(id='pv') + '    verbose: true\n'
+        (self.repo / '.pre-commit-config.yaml').write_text(CONFIG.format(verbose + HOOK.format(id='zhook')
+                                                                         + HOOK.format(id='nocc')))
+        self.configure()
+        (self.repo / 'a.txt').write_text('edited\n')
+        code, out = self.run_script('a.txt')
+        self.assertEqual((code, out['passed']), (0, False))
+        self.assertEqual([f['hook'] for f in out['failed']], ['nocc', 'zhook', 'nocc'])
+        self.assertNotIn('zhook', out['baselineFailed'])
+
+    def test_a_failed_result_with_no_end_pre_commits_next_may_be_at_stays_a_counted_failure(self):
+        verbose = HOOK.format(id='reports') + '    verbose: true\n'
+        (self.repo / '.pre-commit-config.yaml').write_text(CONFIG.format(verbose + HOOK.format(id='broken')))
+        self.configure()
+        (self.repo / 'a.txt').write_text('edited\n')
+        code, out = self.run_script('a.txt')
+        self.assertEqual((code, out['passed']), (0, False))
+        self.assertEqual(out['failed'], [{'hook': 'nested1', 'error': 'exit code: 1'},
+                                         {'hook': 'broken', 'error': 'nope'}])
+        self.assertEqual(out['baselineFailed'], ['broken'])
 
     def test_hooks_failing_alike_on_head_are_each_excused_whatever_follows(self):
         (self.repo / '.pre-commit-config.yaml').write_text(CONFIG.format(''.join(
@@ -1097,7 +1139,7 @@ class ResultsTest(unittest.TestCase):
 
     def test_a_result_line_and_block_the_hook_printed_are_its_output_too(self):
         # A result line ends the output only below the blank line under its last line, with a block pre-commit
-        # prints under that result and all that follows in pre-commit's shape.
+        # prints under that result and all that follows in pre-commit's shape. nested is no hook the config runs.
         for said in (f'x.c:1: bad\nReport{"." * 67}Passed\n- hook id: nested\n- duration: 0.1s\n\nx.c:2: new',
                      f'x.c:1: bad\n\nReport{"." * 67}Passed\n- hook id: nested\n\nx.c:2: new',
                      f'x.c:1: bad\n\nReport{"." * 67}Failed\n- hook id: nested\n\nx.c:2: new',
@@ -1105,18 +1147,18 @@ class ResultsTest(unittest.TestCase):
                      f'x.c:1: bad\n\nReport{"." * 60}Skipped\n\nx.c:2: new'):
             with self.subTest(said):
                 out = f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n\n{said}\n\ngen{"." * 70}Passed\n'
-                failures = hooks.results(out, 1)[1]
+                failures = hooks.results(out, 1, ['fmt', 'gen'])[1]
                 self.assertEqual([f['hook'] for f in failures], ['fmt'])
                 self.assertEqual(failures[0]['outputs'][0], (f'- exit code: 1\n\n{said}', None))
 
     def test_a_failed_result_the_hook_printed_counts_only_where_pre_commits_next_may_be(self):
         # Under a blank line in pre-commit's shape, nested's result may end fmt's output only where the config runs
-        # nested after fmt, or where the config is unread.
+        # nested after fmt, or where the config is unread; it counts wherever the config runs nested.
         said = (f'x.c:1: bad\n\nReport{"." * 67}Failed\n- hook id: nested\n- exit code: 1\n'
                 '- files were modified by this hook\n\nx.c:2: new')
         out = f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n\n{said}\n\ngen{"." * 70}Passed\n'
         for order, found in ((None, ['fmt', 'nested']), (['fmt', 'nested', 'gen'], ['fmt', 'nested']),
-                             (['fmt', 'gen'], ['fmt']), (['nested', 'fmt', 'gen'], ['fmt'])):
+                             (['fmt', 'gen'], ['fmt']), (['nested', 'fmt', 'gen'], ['fmt', 'nested'])):
             with self.subTest(order):
                 ids, failures = hooks.results(out, 1, order)
                 self.assertEqual(([f['hook'] for f in failures], ids), (found, found[1:]))

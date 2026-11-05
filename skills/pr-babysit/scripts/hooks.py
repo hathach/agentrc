@@ -40,7 +40,8 @@ checkout's ignored files (fetched dependencies) fails there differently and
 stays counted. Run alone there, all a hook prints after its block is its own; on the change its output may end at
 any later result shaped as pre-commit's whose block, if one follows, names a hook the config runs after it, as a
 result it printed may look alike, or at the end, and it is excused only when HEAD's matches it at one of those. A
-result inside its output at each of those is one it printed, no other hook's failure or rewrite. A
+result inside its output at each of those whose block names an id the config lacks is one it printed, no other hook's
+failure or rewrite; one naming a configured id, or any when the config is unread, stays counted. A
 line only the change prints keeps it counted, unless it follows all HEAD's output under such a result, as a nested
 pre-commit run naming a later hook's id would print. A change that leaves a hook's output the same once masked is
 still excused: a hook that prints only a count of its violations, or a new
@@ -222,15 +223,16 @@ def results(output, exit_code, order=None):
 
     A block counts only directly under a result line; the hook's output follows
     the block after a blank line, so a marker it echoes is not read as one. Under
-    a failed hook's block, a result counts only at or past an end of its output
-    where pre-commit's next result may be (follows(), order the config's, None
-    unread): one only inside it at each is a result the hook printed itself."""
+    a failed hook's block, a result naming an id order (the config's, None
+    unread) lacks counts only at or past an end of its output where pre-commit's
+    next result may be (follows()): pre-commit's own results name configured ids,
+    so one only inside it at each is a result the hook printed itself."""
     lines = output.splitlines()
     runs = {}
     ids, failures = [], []
     first_end = 0  # of the last failed hook's output, where pre-commit's next result may be
     for i, line in enumerate(lines):
-        if not (line.startswith(HOOK_ID) and i and RESULT.search(lines[i - 1])) or i - 1 < first_end:
+        if not (line.startswith(HOOK_ID) and i and RESULT.search(lines[i - 1])):
             continue
         hook = line[len(HOOK_ID):].strip()
         failed = lines[i - 1].endswith('Failed')
@@ -241,6 +243,8 @@ def results(output, exit_code, order=None):
             block.append(tail)
         if not hook:
             raise Unusable(f'pre-commit printed an empty hook id under: {lines[i - 1]}')
+        if i - 1 < first_end and order is not None and hook not in order:
+            continue
         if failed and not exit_code:
             raise Unusable(f'pre-commit exited 0 but reported hook {hook} failed')
         if MODIFIED in block:
@@ -253,7 +257,8 @@ def results(output, exit_code, order=None):
                 runs[cols] = own_runs(lines, cols)
             k = i + 1 + len(block)
             cuts = ends(lines, k, runs[cols])
-            first_end = min(m for m, after in cuts if follows(hook, after, order))
+            # No end accepted: the whole output, which then skips only results naming unconfigured ids.
+            first_end = min((m for m, after in cuts if follows(hook, after, order)), default=len(lines))
             failures.append({'hook': hook, 'error': first_error(lines[k:cuts[0][0]], block),
                              'outputs': [('\n'.join([*block, *lines[k:m]]).rstrip(), after) for m, after in cuts]})
     return ids, failures
