@@ -2,6 +2,7 @@
 """Pin a PR for pr-review and check a pinned one has not moved.
 
   prepare.py --pr N [--repo OWNER/NAME] [--max-groups 6] [--full] [--auto-fix]   # from the checkout's top level
+  prepare.py --pr N --recheck-from SHA [--repo OWNER/NAME] [--max-groups 6]      # an auto-fix recheck, from the same place
   prepare.py --check --pr N --expected-head SHA [--repo OWNER/NAME]  # from the review worktree top level
   prepare.py --release --pr N --token T [--repo OWNER/NAME]           # from any worktree of the repository
 
@@ -43,6 +44,15 @@ head (by the human included), which the repair takes its findings from, else nul
 answer bundle an earlier auto-fix deferred on that review no longer refuses the run: `deferredAnswers` counts its
 answers, which wait for the repair to end.
 
+--recheck-from R is the auto-fix recheck after a repair from our review submitted on R, which must be the last review
+on the ledger. Its scope is what the repair changed: `same` when the head is still R, `incremental` from R when the
+merge base is unchanged, and when a base merge moved it, `incremental` from a synthetic commit S, git's default merge
+of R and the new merge base (parents R and it, fixed identity and dates, so a repeated prepare gives the same SHA),
+kept by refs/pr-review-scope/<N>/<head>: `git diff S head` is the repair, later fixes and a content conflict's
+resolution (`conflicts` names those paths), without what the merge brought in. Exact only for a default-strategy base
+merge: what another strategy dropped reads as a change. Any other conflict kind is refused, never widened; a head R is
+not an ancestor of takes `full`. `recheckFrom` is R in the JSON and the pins, null on any other prepare.
+
 --release unlocks the pr-review-<N> sibling whose lock carries the token, once
 the run that took it has ended; nothing locked by it is a no-op, and while
 another run of the PR holds its tree the call is refused.
@@ -51,7 +61,7 @@ another run of the PR holds its tree the call is refused.
 head agree, the checkout is clean and the ledger is readable; it prints the
 head's CI summary again, the checkout's real top, the repository and PR it
 checked, and the pins prepare recorded for that head (mode, merge base, scope
-base, groups), for the caller to compare with its own.
+base, groups, recheckFrom), for the caller to compare with its own.
 
 stdout ends with one JSON line; the full changed-path list and every check go
 to the facts file the line names, beside the ledger. {"error": ...}, exit 2,
@@ -71,7 +81,7 @@ from ledger import (ONLINE, last, ledger_dir, ledger_path, load, locked, publica
 from post import sync  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'pr-babysit' / 'scripts'))
-from facts import FULL_SHA, HOST, Parser, Unusable, checkout_repo, checkout_top, git, github_repo, report, run  # noqa: E402
+from facts import FULL_SHA, HOST, Parser, Unusable, attempt, checkout_repo, checkout_top, git, github_repo, report, run  # noqa: E402
 
 # Paths that run when a PR is built or tested; their diff is read before any build.
 TOOLING = re.compile(r'(^|/)(CMakeLists\.txt|Makefile|[^/]+\.(cmake|mk|py|sh|ps1|bat))$'
@@ -402,6 +412,60 @@ def mode_of(led, head, merge_base, full):
     return 'full', merge_base, rev['head']
 
 
+def ancestor(a, b):
+    return run('git', 'merge-base', '--is-ancestor', a, b, ok=(0, 1))[0] == 0
+
+
+def merged_base(pr, reviewed, merge_base, head):
+    """(S, content-conflict paths): the commit `git diff S head` scopes a recheck through, git's default merge of the
+    reviewed head and the moved merge base. A conflict of any kind but contents is refused: its resolution need not
+    show in that diff."""
+    code, out = run('git', 'merge-tree', '--write-tree', '--name-only', '-z', reviewed, merge_base, ok=(0, 1))
+    fields = out.split('\0')
+    tree, conflicts = fields[0], []
+    if code == 1:
+        if '' not in fields[1:]:
+            raise Unusable(f'git merge-tree {reviewed} {merge_base} reported a conflict it did not name')
+        i = fields.index('', 1)
+        conflicts = fields[1:i]
+        kinds = set()
+        i += 1
+        while i < len(fields) and fields[i].isdigit():
+            n = int(fields[i])
+            paths, kind = fields[i + 1:i + 1 + n], fields[i + 1 + n]
+            if kind.startswith('CONFLICT'):
+                kinds.add(kind)
+                if kind != 'CONFLICT (contents)':
+                    raise Unusable(f"the base merge since {reviewed} has a {kind} conflict in {', '.join(paths)}: a scoped "
+                                   'recheck reads only a contents conflict; the recheck is pending')
+            i += 3 + n
+        if not kinds or not conflicts:
+            raise Unusable(f'git merge-tree {reviewed} {merge_base} reported a conflict it did not name')
+    if not FULL_SHA.match(tree):
+        raise Unusable(f'git merge-tree {reviewed} {merge_base} wrote no tree: {out[:200]!r}')
+    who = 'pr-review <pr-review@localhost> 0 +0000'
+    code, sha, err = attempt('git', 'hash-object', '-t', 'commit', '-w', '--stdin',
+                             input=f'tree {tree}\nparent {reviewed}\nparent {merge_base}\nauthor {who}\ncommitter {who}\n\n'
+                                   f'pr-review recheck base of {head}\n')
+    if code or not FULL_SHA.match(sha.strip()):
+        raise Unusable(f'git hash-object could not write the recheck base: {err.strip()}')
+    git('update-ref', f'refs/pr-review-scope/{pr}/{head}', sha.strip())
+    return sha.strip(), conflicts
+
+
+def recheck_of(led, pr, reviewed, head, merge_base):
+    """(mode, scope base, prior head, conflicts) of the recheck after a repair from our review submitted on reviewed."""
+    rev = submitted_last(led, reviewed)
+    if head == reviewed:
+        return 'same', merge_base, head, []
+    if not ancestor(reviewed, head):
+        return 'full', merge_base, reviewed, []
+    if rev.get('mergeBase') == merge_base:
+        return 'incremental', reviewed, reviewed, []
+    scope_base, conflicts = merged_base(pr, reviewed, merge_base, head)
+    return 'incremental', scope_base, reviewed, conflicts
+
+
 def prepare(a):
     top = checkout_top()
     repo = repo_of(a.repo)
@@ -422,7 +486,10 @@ def prepare(a):
             auto = ' --auto' if online[-1].get('publish') == 'auto' else ''
             raise Unusable(f"a review POST for {online[-1]['head']} may have landed unseen: reconcile it first with "
                            f"post.py --pr {a.pr} --expected-head {online[-1]['head']}{auto}, which only looks for it by its marker")
-        mode, scope_base, prior = mode_of(led, head, merge_base, a.full)
+        if a.recheck_from:
+            mode, scope_base, prior, conflicts = recheck_of(led, a.pr, a.recheck_from, head, merge_base)
+        else:
+            (mode, scope_base, prior), conflicts = mode_of(led, head, merge_base, a.full), []
         reuse = reused_review(led, head) if a.auto_fix and mode == 'same' else {}
         if 'deferredAnswers' not in reuse:
             refuse_unsettled(led, head, ('pending',))
@@ -434,8 +501,10 @@ def prepare(a):
         ci, checks = ci_summary(repo, a.pr)
         facts = facts_path(repo, a.pr, head)
         facts.parent.mkdir(parents=True, exist_ok=True)
-        pins = {'head': head, 'mergeBase': merge_base, 'scopeBase': scope_base, 'mode': mode, 'groups': groups}
-        facts.write_text(json.dumps({**pins, 'changed': pr_paths, 'scope': scope, 'checks': checks}, indent=1) + '\n', encoding='utf-8')
+        pins = {'head': head, 'mergeBase': merge_base, 'scopeBase': scope_base, 'mode': mode, 'groups': groups,
+                'recheckFrom': a.recheck_from}
+        facts.write_text(json.dumps({**pins, 'changed': pr_paths, 'scope': scope, 'conflicts': conflicts, 'checks': checks},
+                                    indent=1) + '\n', encoding='utf-8')
         # The selector reads one path a line: a path that line splitting breaks cannot go in the file.
         listing = ''.join(f'{p}\n' for p in pr_paths)
         changed_file = facts.with_name(f'changed-{head}.txt') if listing.splitlines() == pr_paths else None
@@ -450,7 +519,8 @@ def prepare(a):
         'author': (info.get('author') or {}).get('login'), 'fork': bool(info.get('isCrossRepository')),
         'headRepo': head_repo, 'headBranch': info['headRefName'], 'baseBranch': info['baseRefName'],
         'head': head, 'base': base, 'mergeBase': merge_base, 'worktree': wt, 'branch': branch,
-        'mode': mode, 'scopeBase': scope_base, 'priorHead': prior, 'lock': lock,
+        'mode': mode, 'scopeBase': scope_base, 'priorHead': prior, 'recheckFrom': a.recheck_from, 'conflicts': conflicts,
+        'lock': lock,
         'changed': len(pr_paths), 'scoped': len(scope), 'groups': groups, 'overCap': over,
         'tooling': [p for p in pr_paths if TOOLING.search(p)], 'ci': ci,
         'ledger': path.as_posix(), 'facts': facts.as_posix(), 'synced': synced, 'changedFile': changed_file and changed_file.as_posix(),
@@ -477,7 +547,8 @@ def check(a):
     except (OSError, ValueError):
         raise Unusable(f'no prepare facts for {local} at {facts}: run prepare first')
     return {'ok': True, 'head': local, 'top': Path(os.path.realpath(top)).as_posix(), 'repo': repo, 'pr': a.pr, 'ci': ci_summary(repo, a.pr)[0],
-            'pins': {k: pinned[k] for k in ('mergeBase', 'scopeBase', 'mode', 'groups')}}
+            # A prepare from before --recheck-from pinned no recheck.
+            'pins': {**{k: pinned[k] for k in ('mergeBase', 'scopeBase', 'mode', 'groups')}, 'recheckFrom': pinned.get('recheckFrom')}}
 
 
 def release(a):
@@ -507,6 +578,7 @@ def collect(argv):
     p.add_argument('--max-groups', type=int, default=6)
     p.add_argument('--full', action='store_true')
     p.add_argument('--auto-fix', action='store_true')
+    p.add_argument('--recheck-from')
     a = p.parse_args(argv)
     if a.max_groups < 1:
         raise Unusable('--max-groups must be at least 1')
@@ -514,6 +586,11 @@ def collect(argv):
         raise Unusable(f'--token must be the hex token prepare reported, not {a.token!r}')
     if a.auto_fix and (a.check or a.release):
         raise Unusable('--auto-fix is for a prepare, not --check or --release')
+    if a.recheck_from is not None:
+        if not FULL_SHA.match(a.recheck_from):
+            raise Unusable(f'--recheck-from takes the reviewed head, a full SHA, not {a.recheck_from!r}')
+        if a.full or a.auto_fix or a.check or a.release:
+            raise Unusable('--recheck-from is a prepare of its own: not with --full, --auto-fix, --check or --release')
     if a.release:
         if not a.token:
             raise Unusable('--release needs --token, the token of the lock to release')

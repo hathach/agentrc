@@ -589,7 +589,13 @@ class Prepare(Case):
         p = self.prepare()
         os.chdir(p['worktree'])
         ok = self.call(prepare, ['--check', '--pr', str(PR), '--repo', REPO, '--expected-head', head])
-        self.assertEqual(ok['pins'], {'mergeBase': p['mergeBase'], 'scopeBase': p['scopeBase'], 'mode': 'full', 'groups': p['groups']})
+        want = {'mergeBase': p['mergeBase'], 'scopeBase': p['scopeBase'], 'mode': 'full', 'groups': p['groups'], 'recheckFrom': None}
+        self.assertEqual(ok['pins'], want)
+        pinned = json.loads(Path(p['facts']).read_text())
+        del pinned['recheckFrom']
+        Path(p['facts']).write_text(json.dumps(pinned))
+        self.assertEqual(self.call(prepare, ['--check', '--pr', str(PR), '--repo', REPO, '--expected-head', head])['pins'], want,
+                         "a prepare from before --recheck-from pinned no recheck")
         self.assertEqual(ok['top'], Path(os.path.realpath(p['worktree'])).as_posix())
         self.assertEqual((ok['repo'], ok['pr']), (REPO, PR))
         with self.assertRaisesRegex(facts.Unusable, 'a full SHA'):
@@ -640,6 +646,160 @@ class Prepare(Case):
         # #271: skills/cowork/scripts was scanned again under skills/cowork.
         nested = ['skills/cowork/SKILL.md', 'skills/cowork/scripts/cowork.py', 'agents/coworker.md']
         self.assertEqual(prepare.groups_of(nested, 6), (['agents', 'skills/cowork'], False))
+
+
+class Recheck(Case):
+    """prepare --recheck-from R: the auto-fix recheck scans only what the repair changed, a base merge's imports left out."""
+
+    LINES = [f'int v{i};\n' for i in range(20)]
+
+    def text(self, **edits):
+        return ''.join(edits.get(f'l{i}', line) for i, line in enumerate(self.LINES))
+
+    def setUp(self):
+        super().setUp()
+        self.commit('src/core/a.c', self.text(), 'lines')
+        sh(self.work, 'git', 'push', '--quiet', 'origin', 'HEAD:main')
+        self.base = sh(self.work, 'git', 'rev-parse', 'HEAD')
+        self.commit('src/core/a.c', self.text(l5='int pr;\n'), 'pr')
+        self.reviewed = self.push_pr()
+        p = self.prepare()
+        self.save(self.result_for(p))
+        led = json.loads(Path(p['ledger']).read_text())
+        led['reviews'][-1].update(status='posted', receipts={'review': {'submitted': True}})
+        Path(p['ledger']).write_text(json.dumps(led))
+
+    def on_main(self, path, text, msg):
+        """A commit on the base branch, the PR's own branch checked out again after it."""
+        sh(self.work, 'git', 'fetch', '--quiet', 'origin')
+        sh(self.work, 'git', 'checkout', '--quiet', '--detach', 'origin/main')
+        self.commit(path, text, msg)
+        sh(self.work, 'git', 'push', '--quiet', 'origin', 'HEAD:main')
+        sh(self.work, 'git', 'checkout', '--quiet', 'main')
+
+    def merge_main(self, *strategy):
+        sh(self.work, 'git', 'fetch', '--quiet', 'origin')
+        return subprocess.run(['git', 'merge', '--quiet', '--no-edit', *strategy, 'origin/main'], cwd=self.work,
+                              capture_output=True, text=True, env=git_env()).returncode
+
+    def recheck(self):
+        return self.prepare('--recheck-from', self.reviewed)
+
+    def scan(self, p):
+        return sh(self.clone, 'git', 'diff', p['scopeBase'], p['head'])
+
+    def test_a_repair_without_a_base_merge_is_incremental_from_the_reviewed_head(self):
+        self.commit('src/fix/f.c', 'int f;\n', 'repair')
+        self.push_pr()
+        p = self.recheck()
+        self.assertEqual((p['mode'], p['scopeBase'], p['priorHead'], p['recheckFrom']),
+                         ('incremental', self.reviewed, self.reviewed, self.reviewed))
+        self.assertEqual(p['groups'], ['src/fix'])
+
+    def test_a_base_merge_leaves_its_imports_out_and_keeps_the_repair_and_a_later_fix(self):
+        self.commit('src/fix/f.c', 'int f;\n', 'repair')
+        self.on_main('src/usb/m.c', 'int main_only;\n', 'main: new file')
+        self.on_main('src/core/a.c', self.text(l15='int main_far;\n'), 'main: same file, far from the PR')
+        self.assertEqual(self.merge_main(), 0)
+        self.commit('src/ci/c.c', 'int ci;\n', 'pr-babysit fix')
+        head = self.push_pr()
+        before = (sh(self.clone, 'git', 'rev-parse', 'HEAD'), sh(self.clone, 'git', 'status', '--porcelain'))
+        p = self.recheck()
+        self.assertEqual((p['mode'], p['priorHead'], p['recheckFrom']), ('incremental', self.reviewed, self.reviewed))
+        self.assertNotIn(p['scopeBase'], (self.reviewed, p['mergeBase']))
+        self.assertEqual(sh(self.clone, 'git', 'diff', '--name-only', p['scopeBase'], head).split(), ['src/ci/c.c', 'src/fix/f.c'])
+        self.assertEqual(p['groups'], ['src/ci', 'src/fix'])
+        self.assertEqual(p['conflicts'], [])
+        self.assertEqual(sh(self.clone, 'git', 'log', '--format=%s', f"{p['scopeBase']}..{head}").splitlines(),
+                         ['pr-babysit fix', "Merge remote-tracking branch 'origin/main'", 'repair'])
+        self.assertEqual(sh(self.clone, 'git', 'rev-parse', f'refs/pr-review-scope/{PR}/{head}'), p['scopeBase'])
+        self.assertEqual(sh(p['worktree'], 'git', 'cat-file', '-t', p['scopeBase']), 'commit')
+        self.assertEqual((sh(self.clone, 'git', 'rev-parse', 'HEAD'), sh(self.clone, 'git', 'status', '--porcelain')), before)
+        self.assertEqual(self.recheck()['scopeBase'], p['scopeBase'], 'the same inputs give the same base')
+        os.chdir(p['worktree'])
+        try:
+            pins = self.call(prepare, ['--check', '--pr', str(PR), '--repo', REPO, '--expected-head', head])['pins']
+        finally:
+            os.chdir(self.clone)
+        self.assertEqual((pins['recheckFrom'], pins['scopeBase']), (self.reviewed, p['scopeBase']))
+        q = self.prepare()
+        self.assertEqual((q['mode'], q['recheckFrom']), ('full', None), 'an ordinary prepare after a base merge is unchanged')
+
+    def test_two_base_merges_leave_both_imports_out(self):
+        self.commit('src/fix/f.c', 'int f;\n', 'repair')
+        self.on_main('src/usb/m.c', 'int one;\n', 'main 1')
+        self.assertEqual(self.merge_main(), 0)
+        self.commit('src/fix/g.c', 'int g;\n', 'repair 2')
+        self.on_main('src/usb/n.c', 'int two;\n', 'main 2')
+        self.assertEqual(self.merge_main(), 0)
+        self.push_pr()
+        p = self.recheck()
+        self.assertEqual(sh(self.clone, 'git', 'diff', '--name-only', p['scopeBase'], p['head']).split(),
+                         ['src/fix/f.c', 'src/fix/g.c'])
+
+    def test_a_content_conflict_puts_its_resolution_in_scope_and_not_the_base_side_elsewhere(self):
+        self.on_main('src/core/a.c', self.text(l5='int main5;\n', l15='int main_far;\n'), 'main: the same line')
+        self.assertNotEqual(self.merge_main(), 0)
+        (self.work / 'src/core/a.c').write_text(self.text(l5='int resolved;\n', l15='int main_far;\n'))
+        sh(self.work, 'git', 'commit', '--quiet', '-am', 'merge main, resolved')
+        self.push_pr()
+        p = self.recheck()
+        self.assertEqual((p['mode'], p['conflicts'], p['groups']), ('incremental', ['src/core/a.c'], ['src/core']))
+        diff = self.scan(p)
+        self.assertIn('+int resolved;', diff)
+        self.assertNotIn('main_far', diff)
+
+    def test_another_conflict_kind_is_refused_never_widened(self):
+        sh(self.work, 'git', 'fetch', '--quiet', 'origin')
+        sh(self.work, 'git', 'checkout', '--quiet', '--detach', 'origin/main')
+        sh(self.work, 'git', 'rm', '--quiet', 'src/core/a.c')
+        sh(self.work, 'git', 'commit', '--quiet', '-m', 'main: delete a.c')
+        sh(self.work, 'git', 'push', '--quiet', 'origin', 'HEAD:main')
+        sh(self.work, 'git', 'checkout', '--quiet', 'main')
+        self.assertNotEqual(self.merge_main(), 0)
+        sh(self.work, 'git', 'add', 'src/core/a.c')
+        sh(self.work, 'git', 'commit', '--quiet', '-m', 'merge main, kept a.c')
+        self.push_pr()
+        with self.assertRaisesRegex(facts.Unusable, r'CONFLICT \(modify/delete\).*src/core/a\.c'):
+            self.recheck()
+
+    def test_a_clean_merge_alone_leaves_nothing_to_scan(self):
+        self.on_main('src/usb/m.c', 'int main_only;\n', 'main')
+        self.assertEqual(self.merge_main(), 0)
+        self.push_pr()
+        p = self.recheck()
+        self.assertEqual((p['mode'], p['groups'], p['scoped']), ('incremental', [], 0))
+
+    def test_a_merge_that_drops_the_base_side_shows_it_as_scope(self):
+        """Exact scope is claimed only for a default merge: what `-s ours` discarded reads as the repair's change."""
+        self.on_main('src/usb/m.c', 'int main_only;\n', 'main')
+        self.assertEqual(self.merge_main('-s', 'ours'), 0)
+        self.push_pr()
+        self.assertEqual(self.recheck()['groups'], ['src/usb'])
+
+    def test_a_rewritten_history_is_a_full_recheck(self):
+        sh(self.work, 'git', 'commit', '--quiet', '--amend', '-m', 'pr again')
+        self.push_pr(force=True)
+        p = self.recheck()
+        self.assertEqual((p['mode'], p['scopeBase'], p['priorHead'], p['recheckFrom']),
+                         ('full', p['mergeBase'], self.reviewed, self.reviewed))
+
+    def test_the_reviewed_head_must_be_our_last_review_submitted_on_it(self):
+        self.commit('src/fix/f.c', 'int f;\n', 'repair')
+        head = self.push_pr()
+        with self.assertRaisesRegex(facts.Unusable, 'not one submitted on'):
+            self.prepare('--recheck-from', head)
+        ledger_file = Path(self.recheck()['ledger'])
+        led = json.loads(ledger_file.read_text())
+        led['reviews'][-1]['receipts'] = {}
+        ledger_file.write_text(json.dumps(led))
+        with self.assertRaisesRegex(facts.Unusable, 'not one submitted on'):
+            self.recheck()
+        for extra in (['--full'], ['--auto-fix'], ['--check', '--expected-head', head]):
+            with self.assertRaisesRegex(facts.Unusable, '--recheck-from'):
+                self.prepare('--recheck-from', self.reviewed, *extra)
+        with self.assertRaisesRegex(facts.Unusable, 'full SHA'):
+            self.prepare('--recheck-from', self.reviewed[:12])
 
 
 class AutoFix(Case):
