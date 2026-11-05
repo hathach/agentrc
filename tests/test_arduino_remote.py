@@ -191,6 +191,16 @@ class Run(Checkout):
             self.main('run', '--run-id', 'r5', '-b', BOARD)
         self.assertEqual(self.calls, [])
 
+    def test_a_submodule_change_an_ignore_hides_is_refused_before_the_rig(self):
+        dirty = [{'path': 'libraries/X', 'commit': 'a', 'state': ' ', 'dirty': True}]
+        with mock.patch.object(R.B, 'submodules', return_value=dirty), \
+                self.assertRaisesRegex(SystemExit, r'not clean.*\n~~ libraries/X'):
+            self.main('run', '--run-id', 'r6', '-b', BOARD)
+        with mock.patch.object(R.B, 'submodules', side_effect=[[], dirty]), \
+                self.assertRaisesRegex(SystemExit, 'moved while it was copied: libraries/X has changes'):
+            self.main('run', '--run-id', 'r7', '-b', BOARD)
+        self.assertEqual((self.calls, self.staged), ([], {}))
+
     def test_unknown_board_and_foreign_roster_refused(self):
         with self.assertRaisesRegex(SystemExit, 'not in the roster'):
             self.main('run', '--run-id', 'r4', '-b', 'nope')

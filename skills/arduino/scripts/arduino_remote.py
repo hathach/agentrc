@@ -83,7 +83,7 @@ def rel(path):
 
 def head_of_clean_tree():
     head = core.git(P.ROOT, 'rev-parse', 'HEAD')
-    dirty = core.git(P.ROOT, 'status', '--porcelain', '--untracked-files=normal')
+    dirty = B.worktree_status().strip()   # what local admission compares: an `ignore` hides no submodule change
     if dirty:
         core.fail(f'the tree is not clean, so the staged harness would not be HEAD\'s:\n{dirty}')
     return head
@@ -147,7 +147,7 @@ def staged_tree(run_id, host, roster, records, head, bundle=None):
         into = Path(tmp)
         digests = snapshot(into, [*P.BUILD.CONTRACT_FILES, roster], True)
         digests.update(snapshot_records(into, records, bundle))
-        drift = core.checkout_drift(P.ROOT, head)
+        drift = core.checkout_drift(P.ROOT, head) + B.submodule_problems({'submodules': B.submodules()})
         if drift:
             core.fail(f'the checkout moved while it was copied: {"; ".join(drift)}')
         core.write_json(into / MANIFEST, {'head': head, 'files': digests, 'agentrc': {
