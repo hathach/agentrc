@@ -17,7 +17,8 @@ from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'target-debug' / 'scripts' / 'esp_session.py'
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import SURVIVOR_GUARD_OFF, end, guard_survivors, proc_stat, reap_if_ours  # noqa: E402
+from helpers import (SURVIVOR_GUARD_OFF, cut_comm_stat, end, guard_survivors, proc_open, proc_stat,  # noqa: E402
+                     reap_if_ours)
 
 # openocd-esp32 stand-in: --version banner; init/shutdown sessions; a server that logs its examination and
 # listening lines and answers the Tcl commands esp_session sends, with core states in FAKE_STATE.
@@ -667,6 +668,10 @@ class Receipts(unittest.TestCase):
         self.assertFalse(es.same_process({**me, 'startTime': '1'}))
         self.assertFalse(es.same_process({**me, 'argv': ['not-this']}))
         self.assertFalse(es.same_process({k: v for k, v in me.items() if k != 'startTime'}))
+
+    def test_a_comm_cut_mid_character_still_gives_the_start_time(self):
+        with mock.patch.object(es, 'open', proc_open({'/proc/4242/stat': cut_comm_stat(4242, start=777)}), create=True):
+            self.assertEqual(es.start_time(4242), '777')
 
     def test_same_process_refuses_without_proc(self):
         with mock.patch.object(es, 'cmdline', return_value=None):

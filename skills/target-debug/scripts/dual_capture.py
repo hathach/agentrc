@@ -14,10 +14,11 @@ its working directory in <out>, so relative output paths land there.
 Both sides are started, then waited for until both exit or --timeout passes. --timeout is a
 backstop: give each tool its own duration and a --timeout beyond the longer one. A side still
 running then gets SIGTERM to its process group, so the tool runs its own shutdown (rtt.py stops
-its probe server, which sits in a session of its own); a descendant that outlives its tool, one
-that left the group included, gets SIGTERM itself; whatever is left of the side after --grace
-seconds gets SIGKILL. The same happens to a side whose tool exited leaving descendants, to the
-other side when one cannot start, and to both on SIGINT or SIGTERM. What each side wrote is kept.
+its probe server, which sits in a session of its own) and the descendants it already has, in the
+group or not, are left to it; one first seen after that signal and outliving its tool gets SIGTERM
+itself; whatever is left of the side after --grace seconds gets SIGKILL. The same happens to a
+side whose tool exited leaving descendants, each of which gets the SIGTERM itself, to the other
+side when one cannot start, and to both on SIGINT or SIGTERM. What each side wrote is kept.
 This script is the subreaper of both sides, so a descendant orphaned before it was seen
 reparents here: it is stopped the same way and reported under orphans, its side unknown.
 
@@ -120,7 +121,7 @@ def adopt(sides, strays):
 def stat(pid):
     """(state, start time) from /proc/<pid>/stat, or None when it is gone."""
     try:
-        with open(f'/proc/{pid}/stat') as f:
+        with open(f'/proc/{pid}/stat', errors='replace') as f:   # comm may be cut mid-UTF-8 character
             fields = f.read().rsplit(')', 1)[1].split()
         return fields[0], fields[19]
     except (OSError, IndexError):
@@ -240,11 +241,17 @@ def main(argv=None):
             # SIGTERM to the leader's group only: a live tool stops what it started in its own order
             # (rtt.py's server sits in a session of its own); what outlived its leader gets it directly
             signal_pids([-pid for pid in roots(s)] or left(s['seen']), signal.SIGTERM)
+            s['termed'] = set(s['seen'].items())
         end = time.monotonic() + a.grace
         while True:
             for s in running:
                 track(s['seen'], roots(s))
                 note_exit(s)
+                if not roots(s):
+                    # forked after the group's SIGTERM and outlived the leader: adopt() skips it as seen
+                    new = left({p: t for p, t in s['seen'].items() if (p, t) not in s['termed']})
+                    signal_pids(new, signal.SIGTERM)
+                    s['termed'].update((pid, s['seen'][pid]) for pid in new)
             # before adopt: a process seen gone has already reparented its orphans here
             busy = any(lingering(s) for s in running)
             signal_pids(left(adopt(sides, strays)), signal.SIGTERM)

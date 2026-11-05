@@ -4,6 +4,7 @@ their test."""
 import contextlib
 import ctypes
 import functools
+import io
 import os
 import select
 import signal
@@ -113,11 +114,33 @@ SURVIVOR_GRACE = 2      # seconds a process the test's cleanup already ended get
 def proc_stat(pid):
     """(ppid, state, start time) of pid, or of the thread 'pid/task/tid', None once it is gone."""
     try:
-        with open(f'/proc/{pid}/stat') as f:
+        with open(f'/proc/{pid}/stat', errors='replace') as f:
             fields = f.read().rsplit(')', 1)[1].split()
     except (OSError, IndexError):
         return None
     return int(fields[1]), fields[0], fields[19]
+
+
+CUT_NAME = 'a测试测试测试'     # prctl(PR_SET_NAME) keeps 15 bytes, so its comm ends mid-character: not UTF-8 (#380)
+
+
+def cut_comm_stat(pid, ppid=1, state='S', pgrp=None, start=4243):
+    """/proc/<pid>/stat as the kernel writes it for a process named CUT_NAME; starttime is field 22."""
+    return (f'{pid} ('.encode() + CUT_NAME.encode()[:15]
+            + f') {state} {ppid} {pgrp or pid} {" ".join(["0"] * 16)} {start} 0 0\n'.encode())
+
+
+def proc_open(files):
+    """An open() serving files ({path: bytes}) as /proc does, UTF-8 in text mode (strict unless errors= says
+    otherwise); other paths open as usual."""
+    real = open
+
+    def fake(path, mode='r', *a, **k):
+        if str(path) not in files:
+            return real(path, mode, *a, **k)
+        raw = io.BytesIO(files[str(path)])
+        return raw if 'b' in mode else io.TextIOWrapper(raw, encoding='utf-8', errors=k.get('errors'))
+    return fake
 
 
 def exited(pid):

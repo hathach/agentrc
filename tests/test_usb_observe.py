@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import guard_survivors  # noqa: E402
+from helpers import cut_comm_stat, guard_survivors  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'hil' / 'scripts' / 'usb_observe.py'
 NODE = '/dev/bus/usb/003/007'
@@ -496,6 +496,13 @@ class HolderLookup(unittest.TestCase):
         self.rig.process(14, comm='a) b', argv=TESTUSB_ARGV)
         self.assertEqual(uo.dstate_holders('testusb'), [{'pid': 10, 'start': '4242', 'node': NODE}])
         self.assertEqual([h['pid'] for h in uo.dstate_holders('a) b')], [14], 'comm may contain ") "')
+
+    def test_a_comm_cut_mid_character_is_still_a_live_process(self):
+        self.rig.process(10)
+        self.rig.process(15)
+        (self.rig.root / 'proc' / '15' / 'stat').write_bytes(cut_comm_stat(15, state='D', start=4242))
+        self.assertEqual([h['pid'] for h in uo.dstate_holders('testusb')], [10])
+        self.assertTrue(uo.proc_holds({'pid': 15, 'start': '4242', 'node': NODE}))
 
     def test_reaped_zombie_and_recycled_pids_no_longer_hold(self):
         self.rig.process(30)

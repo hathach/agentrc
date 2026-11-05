@@ -127,7 +127,7 @@ def group_members(pgid):
     out = []
     for pid in all_pids():
         try:
-            stat = Path(f'/proc/{pid}/stat').read_text()
+            stat = Path(f'/proc/{pid}/stat').read_text(errors='replace')   # comm may be cut mid-UTF-8 character
         except OSError:
             continue
         fields = stat[stat.rindex(')') + 2:].split()    # after "pid (comm) ": state, ppid, pgrp, ...

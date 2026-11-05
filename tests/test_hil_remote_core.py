@@ -9,6 +9,7 @@ HOME, rsync (behind a logging shim) reaches its server through that ssh and the 
 helper and its detached supervisor execute for real. Windows cannot exec the #! fakes, so there
 only the refusals and units run, and Windows mocks are not Windows evidence. Plumbing only: the
 real transport, and a launch surviving a real ssh session's end, are proved by a run on a rig."""
+import ast
 import contextlib
 import importlib.util
 import io
@@ -29,7 +30,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import guard_survivors  # noqa: E402
+from helpers import cut_comm_stat, guard_survivors, proc_open  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'hil' / 'scripts' / 'hil_remote_core.py'
 
@@ -728,6 +729,12 @@ class CopyBack(Rig):
 
 
 class Units(unittest.TestCase):
+    def test_the_rig_reads_a_comm_cut_mid_character_as_a_live_process(self):
+        fn = next(n for n in ast.parse(rc_.RIG_PY).body if isinstance(n, ast.FunctionDef) and n.name == 'proc_stat')
+        rig = {'open': proc_open({'/proc/4242/stat': cut_comm_stat(4242, start=777)})}
+        exec(compile(ast.Module([fn], []), 'rig', 'exec'), rig)
+        self.assertEqual(rig['proc_stat'](4242), ('S', '777'))
+
     def test_snapshot_pins_the_bytes_it_copied(self):
         with tempfile.TemporaryDirectory() as td:
             root, into = Path(td) / 'checkout', Path(td) / 'snap'

@@ -475,7 +475,7 @@ def proc_start(pid):
     """The process start time (clock ticks since boot, proc(5) field 22, as recorded), or
     None when it is gone."""
     try:
-        with open(f'/proc/{pid}/stat') as f:
+        with open(f'/proc/{pid}/stat', errors='replace') as f:   # comm may be cut mid-UTF-8 character
             return f.read().rpartition(')')[2].split()[19]
     except (OSError, IndexError):
         return None
@@ -548,7 +548,7 @@ def _exited(pid, start) -> bool:
     before exit_notify() makes it one (kernel/exit.c v6.12 :934, :959), and its fd dir is then
     EACCES. A zombie creates no thread, so an unchanged task set around the scan has no live one."""
     def state(t):
-        with open(f'/proc/{pid}/task/{t}/stat') as f:
+        with open(f'/proc/{pid}/task/{t}/stat', errors='replace') as f:
             return f.read().rpartition(')')[2].split()[0]
     try:
         tasks = sorted(os.listdir(f'/proc/{pid}/task'))
@@ -650,7 +650,7 @@ def _holder_ids(pid, start):
     so the holder's receipts are rechecked as the holder."""
     if os.geteuid() != 0:
         return None
-    with open(f'/proc/{pid}/status') as f:
+    with open(f'/proc/{pid}/status', errors='replace') as f:   # Name: is comm, maybe cut mid-UTF-8 character
         fields = {k: v.split() for k, _, v in (line.partition(':') for line in f)}
     if proc_start(pid) != start:
         raise OSError(errno.ESRCH, f'pid {pid} is not the recorded holder')

@@ -57,7 +57,7 @@ def unit_pids(unit):
 def parent(pid):
     """ppid, or None once the process is gone. comm may hold spaces and ')': parse after the last ')'."""
     try:
-        stat = (PROC / str(pid) / 'stat').read_text()
+        stat = (PROC / str(pid) / 'stat').read_text(errors='replace')
     except FileNotFoundError:
         return None
     return int(stat.rpartition(')')[2].split()[1])

@@ -73,12 +73,14 @@ SETTLED = ('coderabbit', 'greptile')
 AUTHOR = {'code-scanning': 'github-advanced-security'}
 HEAD_ACTIVITIES = {'opened', 'synchronize', 'reopened', 'ready_for_review'}
 CR_PAUSED = '<!-- This is an auto-generated comment: review paused by coderabbit.ai -->'
+CR_RESUME = '`@coderabbitai resume` resumes it'
 CR_RATE = '<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->'
 CR_WALKTHROUGH = '<!-- This is an auto-generated comment: summarize by coderabbit.ai -->'
 CR_RATE_STATUS = 'review rate limited'
 # A repository CodeRabbit reviews only on request: a box in its summary comment, ticked once asked, or these words beside it (#324).
 CR_TRIGGER_BOX = re.compile(r'^(?P<pre>(?:> )?- \[)(?P<mark>[ xX])(?P<post>\][^\n]*Trigger (?:a manual )?review[^\n]*)$', re.M)
 CR_MANUAL_ONLY = 'does not receive automatic reviews'
+CR_MANUAL_SKIP = 'review skipped: manual review required'
 CR_COUNTDOWN = re.compile(r'Next included review available in ([^.*\n]+)\.')
 COUNTDOWN_TERM = re.compile(r'(\d+) (hour|minute|second)s?')
 # CodeRabbit's included reviews come back within the hour: the reset a notice without a countdown is given.
@@ -185,7 +187,7 @@ def coderabbit(head, statuses, checks, issue, event_at):
     if tied:
         return record('coderabbit', 'unknown', 'a notice and a status or run on the head share one timestamp', [*ev, f"comment {tied['id']}"])
     if pause and (latest_at is None or stamp(pause['updated_at']) > latest_at):
-        return record('coderabbit', 'settled', 'reviews paused on this PR', [*ev, f"pause in comment {pause['id']}"], None, 'paused')
+        return record('coderabbit', 'settled', f'reviews paused on this PR; {CR_RESUME}', [*ev, f"pause in comment {pause['id']}"], None, 'paused')
     if by_status or by_run:
         # Its notice may be edited a second before the status or run (#138, #336): one after the head event with no
         # other CodeRabbit status or run between them is the limit's too.
@@ -211,7 +213,10 @@ def coderabbit(head, statuses, checks, issue, event_at):
         return limited_record('rate-limited after the head event', limited or fresh[0], why, ev, None)
     if s and run_ and s_at == run_at:
         a, b = coderabbit_status(s, ev, head), coderabbit_run(run_, ev, head, stickies)
-        if (a['state'], a['kind']) != (b['state'], b['kind']):
+        # A manual-review skip is askable and a no-files one is not (#372): which of them each reads must agree too.
+        def reading(r):
+            return r['state'], r['kind'], r['reason'].lower().startswith(CR_MANUAL_SKIP)
+        if reading(a) != reading(b):
             return record('coderabbit', 'unknown', 'its status and check run disagree at one timestamp', ev)
     if s and (run_ is None or s_at >= run_at):
         return coderabbit_status(s, ev, head)
@@ -266,11 +271,18 @@ def coderabbit_run(run_, ev, head, stickies):
     if rate_run(run_):
         return record('coderabbit', 'settled', f"check run: {(run_.get('output') or {}).get('title')}", ev, head, 'limited')
     title = ((run_.get('output') or {}).get('title') or '').strip()
-    if run_['status'] == 'completed' and run_.get('conclusion') == 'skipped' and title.lower().startswith('review skipped'):
-        # A check run gives no skip reason: the summary comment tells a manual-review skip, read as its status says it, from any other.
-        why = manual_only(stickies)
-        return record('coderabbit', 'settled', f'Review skipped: manual review required (check run; {why})' if why else f'check run skipped: {title}',
-                      ev, head, 'skipped')
+    if run_['status'] == 'completed' and run_.get('conclusion') == 'skipped':
+        lowered = title.lower()
+        if lowered.startswith('review skipped'):
+            # A check run gives no skip reason: the summary comment tells a manual-review skip, read as its status says it, from any other.
+            why = manual_only(stickies)
+            return record('coderabbit', 'settled', f'Review skipped: manual review required (check run; {why})' if why else f'check run skipped: {title}',
+                          ev, head, 'skipped')
+        if lowered.startswith('no files to review'):
+            # Terminal for the head (#372): no Trigger review box asks it again, whatever the summary holds.
+            return record('coderabbit', 'settled', f'check run skipped: {title}', ev, head, 'skipped')
+        if lowered.startswith('review paused'):
+            return record('coderabbit', 'settled', f'check run: {title}; {CR_RESUME}', ev, head, 'paused')
     return record('coderabbit', 'unknown', f"check run {run_['status']}/{run_.get('conclusion')} is not one this reads", ev)
 
 

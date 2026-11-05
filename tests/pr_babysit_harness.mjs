@@ -8189,6 +8189,32 @@ test('a transfer that never checks out blocks before preflight with the stateRef
   assert.match(refused.result.detail, /state_transfer\.py: cannot read/)
 })
 
+test('chunks still missing when the transfer gives up keep the failure that left them so (#410)', async () => {
+  const { state, stateRef } = await savedForLoad()
+  const first = transferOf(state)
+  const missing = [0, ...[...Array(Math.ceil(first.length / 512)).keys()].slice(first.chunks.length)].join(',')
+  for (const [cause, fail] of [['state_transfer.py: gone', () => ({ error: 'gone' })],
+    ['the envelope metadata is malformed', (env) => ({ ...env, digest: '00000000' })],
+    ['loader died: boom', () => { throw new Error('boom') }]]) {
+    const { result } = await loadWith(state, stateRef, (env, label) => label === 'state:load#1' ? { ...env, chunks: env.chunks.slice(1) } : fail(env))
+    assert.equal(result.reason, 'state-transfer-failed', cause)
+    assert.equal(result.detail, `chunks ${missing} missing or mis-copied (${cause})`)
+  }
+})
+
+test('a changed envelope length is the failure it leaves, not an earlier reply\'s in its round', async () => {
+  const { state, stateRef } = await savedLarge()
+  // Each round with a length asks 4,5,6,7 then 8: the first dies, the second resets the length.
+  const { labels, result } = await loadWith(state, stateRef, (env) => {
+    if (env.chunks.some(c => c.i === 8)) return { ...env, length: env.length - 1 }
+    if (env.chunks.some(c => c.i === 0)) return env
+    throw new Error('boom')
+  })
+  assert.equal(result.reason, 'state-transfer-failed')
+  assert.equal(labels.length, 9, 'six rounds, the budget')
+  assert.equal(result.detail, 'the envelope length changed')
+})
+
 test('stateRef is refused when malformed or given with state', async () => {
   const { state, stateDigest } = (await run({ args: { yieldAfterCycle: true, maxCycles: 3 } })).result
   await assert.rejects(run({ args: { stateRef: { outputFile: '/x', digest: stateDigest }, state } }), /state or stateRef, not both/)

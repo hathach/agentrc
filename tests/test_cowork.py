@@ -29,7 +29,7 @@ SKILL = ROOT / 'skills' / 'cowork' / 'SKILL.md'
 sys.path.insert(0, str(SCRIPT.parent))
 import cowork  # noqa: E402
 sys.path.insert(0, str(ROOT / 'tests'))
-from helpers import guard_survivors, make_stub, pid_alive  # noqa: E402
+from helpers import cut_comm_stat, guard_survivors, make_stub, pid_alive  # noqa: E402
 
 # Stand-ins for the real CLIs: record argv, stdin, cwd and environment, then emit an
 # event stream. With FAKE_GATE set they hold until that file exists, so a test can
@@ -1045,6 +1045,13 @@ class CoworkTest(unittest.TestCase):
             if victim.poll() is None:
                 victim.kill()
             victim.wait()
+
+    def test_a_child_whose_comm_is_cut_mid_character_is_still_in_the_tree(self):
+        proc = Path(self.tmp.name) / 'proc'
+        (proc / '4242').mkdir(parents=True)
+        (proc / '4242' / 'stat').write_bytes(cut_comm_stat(4242, ppid=4000))
+        with mock.patch.object(cowork, 'Path', lambda p: proc if p == '/proc' else Path(p)):
+            self.assertEqual(cowork.children_of(), {4000: [4242]})
 
     @unittest.skipIf(os.name != 'nt', 'the stand-ins are launchers on Windows only')
     def test_a_launcher_runs_a_stand_in_under_a_non_ascii_path(self):

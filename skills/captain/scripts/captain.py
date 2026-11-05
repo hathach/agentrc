@@ -568,7 +568,8 @@ def refusal(target):
         return f'it is {target["status"]}'
     state = input_state(read_screen(target['address']))
     if state != 'empty':
-        return ('its input line shows text, a draft or a suggestion hc read cannot tell apart' if state == 'text'
+        return ('its input line shows text, a draft or a suggestion hc read cannot tell apart; '
+                'promptSuggestionEnabled: false in its Claude Code settings turns suggestions off' if state == 'text'
                 else 'its screen is not a recognized input line')
     return None
 

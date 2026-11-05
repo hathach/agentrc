@@ -220,6 +220,7 @@ if (args.stateRef != null) {
     },
   }
   let why = ''
+  let cause = '' // this round's failure behind a still-missing chunk
   let length = 0
   let got = new Map()
   let idle = 0
@@ -232,9 +233,9 @@ if (args.stateRef != null) {
     env.digest === ref.digest && Array.isArray(env.chunks)
   const take = (env, asked, pad) => {
     if (!env) return false
-    if (typeof env.error === 'string') { why = `state_transfer.py: ${env.error}`; return false }
-    if (!fresh(env) || env.pad !== pad) { why = 'the envelope metadata is malformed'; return false }
-    if (length && env.length !== length) { reset('the envelope length changed'); return false }
+    if (typeof env.error === 'string') { cause = `state_transfer.py: ${env.error}`; return false }
+    if (!fresh(env) || env.pad !== pad) { cause = 'the envelope metadata is malformed'; return false }
+    if (length && env.length !== length) { cause = 'the envelope length changed'; reset(cause); return false }
     length = env.length
     const want = new Set(asked || indices().slice(0, PER_CALL))
     const byIndex = new Map()
@@ -253,6 +254,7 @@ if (args.stateRef != null) {
   // Idle rounds end the load only once every missing chunk was asked padded too.
   const untried = () => length > 0 && missingOf().some(i => (failed.get(i) || 0) < 2)
   for (let round = 1; args.state == null && (idle < 2 || untried()) && round <= ROUNDS; round++) {
+    cause = ''
     const missing = length ? missingOf() : null
     const groups = missing ? [false, true].flatMap(pad => groupsOf(missing.filter(i => padded(i) === pad), PER_CALL).map(asked => ({ asked, pad })))
       : [{ asked: null, pad: false }]
@@ -261,13 +263,13 @@ if (args.stateRef != null) {
       'Its last stdout line is one JSON object: return it unchanged as your answer. The chunk data is opaque base64; ' +
       'copy every character exactly and change, reorder, drop or add nothing.',
       { label: `state:load#${++call}`, agentType: 'relay', model: 'sonnet', effort: 'low', schema: ENVELOPE },
-    ).catch(e => { why = `loader died: ${e && e.message}`; return null })))
+    ).catch(e => { cause = `loader died: ${e && e.message}`; return null })))
     let added = false
     replies.forEach((env, g) => { added = take(env, groups[g].asked, groups[g].pad) || added })
     for (const { asked } of groups) for (const i of asked || indices().slice(0, PER_CALL)) if (!got.has(i)) failed.set(i, (failed.get(i) || 0) + 1)
     const left = missingOf()
     idle = added && left.length ? 0 : idle + 1
-    if (!length || left.length) { if (length) why = `chunks ${left.join(',')} missing or mis-copied`; continue }
+    if (!length || left.length) { why = length ? `chunks ${left.join(',')} missing or mis-copied${cause ? ` (${cause})` : ''}` : cause || why; continue }
     let st = null
     try { st = JSON.parse(indices().map(i => got.get(i)).join('')) } catch {}
     if (st && st.digest === ref.digest && sealOf(st) === ref.digest) { args.state = st; break }

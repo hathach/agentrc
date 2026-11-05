@@ -12,8 +12,9 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import guard_survivors  # noqa: E402
+from helpers import CUT_NAME, guard_survivors, proc_open  # noqa: E402
 
 try:
     import termios
@@ -25,6 +26,18 @@ SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'target-debug' / 'scri
 
 def setUpModule():
     guard_survivors(__name__)
+
+
+@unittest.skipIf(os.name == 'nt', 'reads /proc')
+class OtherOpeners(unittest.TestCase):
+    def test_an_opener_whose_comm_is_cut_mid_character_is_listed(self):
+        m = load_module()
+        listing = {'/proc': ['4242'], '/proc/4242/fd': ['3']}
+        comm = {'/proc/4242/comm': CUT_NAME.encode()[:15] + b'\n'}
+        with mock.patch.object(m.os, 'listdir', listing.__getitem__), \
+                mock.patch.object(m.os, 'readlink', lambda path: '/dev/ttyACM0'), \
+                mock.patch.object(m, 'open', proc_open(comm), create=True):
+            self.assertEqual(m.other_openers('/dev/ttyACM0'), [{'pid': 4242, 'comm': CUT_NAME[:5] + '\ufffd'}])
 
 
 @unittest.skipIf(os.name == 'nt', 'ptys are POSIX')
