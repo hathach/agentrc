@@ -15,6 +15,7 @@ names them) for usage, exits and limits; this page is what they share and how a 
 | `scripts/arduino_build.py`  | selection, compiles, dependency and header provenance, image span checks, the HIL build record            |
 | `scripts/arduino_hil.py`    | record admission, flashing, DUT identity, the board lifecycle, manual sessions, commissioning, the report |
 | `scripts/arduino_remote.py` | staging a run or a session on a rig (default ci.lan) and collecting it                                    |
+| `scripts/arduino_ci.py`     | CI: a hosted runner's ci-arduino setup and packed tree per board, the rig runner's battery over them      |
 
 Each script's docstring lists the profile names a library supplies. The `hil` skill's rules (locks, verdicts,
 retries, recovery) apply unchanged; these scripts load its `hil_*` scripts through `hil_load.py`.
@@ -85,6 +86,16 @@ retries, recovery) apply unchanged; these scripts load its `hil_*` scripts throu
   has its own) formats in that tree's style, and v15 cannot parse tinyusb's file.
 - TinyUSB Arduino's vendored TinyUSB (the paths its `CLAUDE.md` names) keeps tinyusb's format: fix it in
   hathach/tinyusb under tinyusb's `.clang-format`, then copy it back as that `CLAUDE.md` says.
+
+## CI
+
+`arduino_ci.py` (a library's `hil_ci.py` wraps it) splits a HIL run across GitHub runners: a hosted runner per board
+sets the board up through adafruit/ci-arduino's own `install_library_deps()` and `install_platform()` (latest
+releases, nothing pinned), builds the clean record and packs the tree `hil_remote.py` would stage, with a
+`provenance.json` naming the run; the rig runner admits each packed tree against its run, head and roster and runs the
+battery in it board by board, with a lock wait, one retry of a fail and a deadline, into a state dir kept across runs
+(`summary.json` per run, finished clean runs pruned). The admission checks consistency, not trust: a pull request's
+code, harness included, runs on the rig as the runner's user. The library's workflow and report comment are its own.
 
 ## Adding a library
 
