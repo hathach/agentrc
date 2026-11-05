@@ -862,6 +862,23 @@ class BaseImage(Base):
         self.assertIsNone(H.base_mismatch(self.op(unread, script)))
         unhalted = out.replace('PC = 000004F2', 'CPU is not halted')
         self.assertIsNone(H.base_mismatch(self.op(unhalted, script)))
+        # nothing short of this script's own read finding a difference authorizes a write
+        self.assertIsNone(H.base_mismatch(self.op(out.replace('J-Link>halt\n', ''), script)))
+        self.assertIsNone(H.base_mismatch(self.op(out, ['halt', 'verifybin BASE/other.bin,0x0'])))
+        self.assertIsNone(H.base_mismatch(self.op(out.replace('ERROR: Verify failed.', 'ERROR: Verify failed.\n'
+                                                                                      'Could not read memory.'),
+                                                  script)))
+        self.assertIsNone(H.base_mismatch(self.op(out.replace('Reading 2816 bytes data', 'Reading'), script)))
+        stderr = self.op(out, script)
+        stderr.attempts[-1].result.stderr = b'Could not read memory.\n'
+        self.assertIsNone(H.base_mismatch(stderr))
+
+    def test_admission_parses_the_bytes_it_hashed(self):
+        seen = []
+        real = H.B.base_runs
+        with mock.patch.object(H.B, 'base_runs', lambda b, root: seen.append(root) or real(b, root=root)):
+            self.admit(self.base_record())
+        self.assertEqual(seen, [self.dir / 'run' / 'base' / 'files'])   # the run dir's copies, never the checkout
 
     def test_a_jlink_flash_checks_the_base_first_and_the_row_names_its_state(self):
         calls = []

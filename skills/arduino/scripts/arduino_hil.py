@@ -312,19 +312,21 @@ def write_hex(runs, path):
 
 def admit_base(rec, board, root, run_dir):
     """The record's base image prepared in run_dir/base: {'hex' (its runs outside the excluded ranges), 'bins'
-    [(start, file)], 'segments', 'state' (set by ensure_base)}, once its files hash as recorded and their runs are
-    the recorded segments; Refused otherwise."""
+    [(start, file)], 'segments', 'state' (set by ensure_base)}, parsed from the run dir's copies of its files once
+    those hash as recorded and their runs are the recorded segments; Refused otherwise."""
+    out = run_dir / 'base'
     for rel_path, digest in rec['base']['files'].items():
         src = root / rel_path
-        if not src.is_file() or B.sha256(src) != digest:
+        data = src.read_bytes() if src.is_file() else None
+        if data is None or hashlib.sha256(data).hexdigest() != digest:
             raise Refused(f'base image {rel_path} is missing or changed since the record')
-    runs, why = B.base_runs(board, root=root)
+        (out / 'files' / rel_path).parent.mkdir(parents=True, exist_ok=True)
+        (out / 'files' / rel_path).write_bytes(data)
+    runs, why = B.base_runs(board, root=out / 'files')
     if why or runs is None:
         raise Refused(f'base image: {why or "the profile names none"}')
     if [[s, s + len(d)] for s, d in runs] != rec['base']['segments']:
         raise Refused('base image runs differ from the record\'s segments: rebuild it')
-    out = run_dir / 'base'
-    out.mkdir(parents=True, exist_ok=True)
     write_hex(runs, out / 'base.hex')
     bins = []
     for start, data in runs:
@@ -460,28 +462,43 @@ def jlink_session(flasher, cmds, run_dir, tracker):
     return op
 
 
+# what JLinkExe (V9.78) prints for a verifybin whose read completed and differed from the file
+VERIFY_READ = r'^Reading \d+ bytes data from target memory @ 0x[0-9A-F]+\.$'
+VERIFY_DIFFERS = r'^Verify failed @ address 0x[0-9A-F]+\.\nExpected [0-9A-F]{2} read [0-9A-F]{2}\nERROR: Verify failed\.$'
+
+
 def base_mismatch(op):
-    """The verifybin command a J-Link session stopped at with 'Verify failed' after every earlier command completed
-    cleanly: a proven difference of the target from that file. None for anything else (no connection, a failed read,
-    a timeout), which proves nothing about the target."""
+    """The verifybin command a J-Link session stopped at, having read the target and found it different from that
+    file: the session's echoes are its script's own commands in order up to it, `halt` completed cleanly first, every
+    command before it completed, and its output holds the read and the difference with no other failure line, nor
+    does the preamble or stderr. A proven difference; None for anything else (no connection, a failed or partial
+    read, a timeout, another script), which proves nothing about the target."""
     last = op.attempts[-1]
     if last.kind != 'exited':
         return None
+    script = (last.script or '').splitlines()[:-1]
     out = A.process.cmd_stdout_text(last.result.stdout)
     preamble = re.split(r'(?m)^J-Link>', out, maxsplit=1)[0]
-    if re.search(A.flash.JLINK_ERRORS, preamble):
+    if any(re.search(A.flash.JLINK_ERRORS, text) for text in (preamble,
+                                                               A.process.cmd_stdout_text(last.result.stderr))):
         return None
-    judged = A.flash.jlink_judgment(out, (last.script or '').splitlines()[:-1])['commands']
-    if not judged or any(j['error'] or not j['done'] for j in judged[:-1]):
+    judged = A.flash.jlink_judgment(out, script)['commands']
+    if len(judged) < 2 or [j['command'] for j in judged] != script[:len(judged)] or script[0] != 'halt' or \
+            any(j['error'] or not j['done'] for j in judged[:-1]):
         return None
-    stop = judged[-1]
-    return stop['command'] if stop['command'].startswith('verifybin ') and stop['error'] == 'Verify failed' else None
+    stop = judged[-1]['command']
+    chunk = A.flash.jlink_after(out, stop)[-1]
+    if not stop.startswith('verifybin ') or not re.search(VERIFY_READ, chunk, re.M) or \
+            not re.search(VERIFY_DIFFERS, chunk, re.M) or \
+            re.search(A.flash.JLINK_ERRORS, re.sub(VERIFY_DIFFERS, '', chunk, flags=re.M)):
+        return None
+    return stop
 
 
 def ensure_base(flasher, base, run_dir, tracker):
     """Check the board holds its base image (each run verified in place) and rewrite it only on a proven
-    difference, leaving the CPU halted for the sketch's flash; '' or why it failed. A session that proves nothing
-    (a read failure, no connection) writes nothing."""
+    difference, with no reset or go after it (the sketch's flash resets the target); '' or why it failed. A session
+    that proves nothing (a read failure, no connection) writes nothing."""
     verify = [f'verifybin {path},{start:#x}' for start, path in base['bins']]
     op = jlink_session(flasher, ['halt', *verify], run_dir, tracker)
     why = A.flash.jlink_problem(op)

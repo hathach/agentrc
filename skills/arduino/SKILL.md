@@ -120,10 +120,12 @@ changes from a library:
   SoftDevice, bootloader and its settings) names those HEX files as `BOARDS[...]['base']`, with the address ranges
   never touched as `base_exclude` (UICR). The record binds the files and their runs, which must lie outside the
   board's span; the harness admits them with the record and, before every J-Link flash (battery, commissioning, a
-  manual flash or restore), verifies each run in place. Only a `verifybin` that fails after a clean connect is a
-  difference: then the runs are rewritten and verified with the CPU left halted for the sketch's flash, and the row's
-  `base` says `matched` or which run differed. A check that proves nothing (no connection, a failed read, a timeout)
-  writes nothing and fails the step. Through J-Link only: a record refuses a base on any other flasher.
+  manual flash or restore), verifies each run in place. Only a `verifybin` of the check's own script that read the
+  target after a clean `halt` and found it different is a difference: then the runs are rewritten and verified, with
+  no reset or go before the sketch's flash, and the row's `base` says `matched` or which run differed. A check that
+  proves nothing (no connection, a failed or partial read, a timeout) writes nothing and fails the step. A rewrite
+  may erase the rest of each flash page a run touches, so those pages must be the base's. Through J-Link only: a
+  record refuses a base on any other flasher.
 
 ## CI
 

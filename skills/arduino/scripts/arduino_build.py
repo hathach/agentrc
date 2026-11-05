@@ -12,7 +12,8 @@ point, loading this file from the pinned agentrc (its `agentrc_pin.py`). One pro
                         board has `span`; `base` (feature 'base') is the checkout-relative Intel HEX files a J-Link
                         rig board must hold under its sketches (a SoftDevice, a bootloader and its settings), checked
                         before every flash and rewritten only when proven different (base_runs()), and
-                        `base_exclude` the address ranges [lo, hi) of those files never checked or written (UICR)
+                        `base_exclude` the address ranges [lo, hi) of those files never checked or written (UICR).
+                        A rewrite may erase the rest of each flash page a run touches: those pages must be the base's
   REPRESENTATIVES       {family: [boards]} a change to that family's code builds
   HIL_SKETCHES          {role: (sketch dirs, the first the restoration image)}
   SMOKE_BOARDS          boards whose restoration sketch a build-contract change builds (one per image kind)
