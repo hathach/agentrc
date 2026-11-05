@@ -771,6 +771,16 @@ class Recheck(Case):
         with self.assertRaisesRegex(facts.Unusable, r'CONFLICT \(modify/delete\).*src/core/a\.c'):
             self.recheck()
 
+    def test_a_recheck_s_suppressed_nits_are_saved_with_its_review_and_never_stand(self):
+        self.commit('src/fix/f.c', 'int f;\n', 'repair')
+        self.push_pr()
+        p = self.recheck()
+        nit = {'file': 'src/fix/f.c', 'line': 1, 'dimension': 'correctness', 'severity': 'nit', 'why': 'naming', 'reason': 'recheck-nit'}
+        self.save(self.result_for(p, recheckFrom=self.reviewed, suppressed=[nit]))
+        rev = json.loads(Path(p['ledger']).read_text())['reviews'][-1]
+        self.assertEqual((rev['recheckFrom'], rev['suppressed']), (self.reviewed, [nit]))
+        self.assertNotIn('naming', [f['why'] for f in rev['findings']])
+
     def test_a_clean_merge_alone_leaves_nothing_to_scan(self):
         self.on_main('src/usb/m.c', 'int main_only;\n', 'main')
         self.assertEqual(self.merge_main(), 0)
@@ -2437,11 +2447,14 @@ class Result(unittest.TestCase):
                                   'findings': [{'status': 'open', 'severity': 'high'}, {'status': 'covered', 'severity': 'low'}],
                                   'claims': [{'verdict': 'refuted'}], 'coverage': {'dropped': [1], 'unverified': [], 'unjudged': []},
                                   'ci': {'state': 'green'}, 'hil': None, 'heldThreads': [{'findingId': 'pr7-f1', 'why': 'resolve unconfirmed'}],
+                                  'suppressed': [{'why': 'secret nit', 'severity': 'nit', 'reason': 'recheck-nit'}],
                                   'draft': {'body': 'secret words', 'comments': [{}], 'replies': []}}}, f)
         out = result.collect(['--output', f.name])
         self.assertEqual((out['event'], out['findings'], out['openBySeverity'], out['claims'], out['coverage']['dropped']),
                          ('REQUEST_CHANGES', {'open': 1, 'covered': 1}, {'P1 high': 1}, {'refuted': 1}, 1))
         self.assertNotIn('secret words', json.dumps(out))
+        self.assertNotIn('secret nit', json.dumps(out))
+        self.assertEqual(out['suppressedNits'], 1)
         self.assertEqual(out['heldThreads'], [{'findingId': 'pr7-f1', 'why': 'resolve unconfirmed'}])
         Path(f.name).write_text('')
         self.assertEqual(result.collect(['--output', f.name])['status'], 'no-result')
