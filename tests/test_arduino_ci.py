@@ -270,7 +270,18 @@ class Loop(unittest.TestCase):
         with mock.patch.object(C.time, 'monotonic', lambda: t[0]):
             res, calls = self.run_board([row('not-run', locked=True), row('pass')], lock_wait=600,
                                         each=lambda: t.__setitem__(0, t[0] + 10))
-        self.assertEqual((res['verdict'], res['waitedS']), ('pass', 20))   # from the first locked attempt's start
+        self.assertEqual((res['verdict'], res['waitedS']), ('pass', 10))   # until the admitted attempt's start
+
+    def test_the_lock_wait_ends_at_admission_and_never_denies_a_later_retry(self):
+        t = [100.0]
+        steps = iter([31, 700, 10])   # locked 31 s, a 700 s fail, the retry
+
+        def each():
+            t[0] += next(steps)
+        with mock.patch.object(C.time, 'monotonic', lambda: t[0]):
+            res, calls = self.run_board([row('not-run', locked=True), row('fail'), row('pass')], lock_wait=600,
+                                        each=each)
+        self.assertEqual((res['verdict'], res['flaky'], len(calls), res['waitedS']), ('pass', True, 3, 31))
 
     def test_a_signal_starts_no_attempt(self):
         res, calls = self.run_board([row('pass')], stop={'signal': True})
@@ -357,7 +368,9 @@ class Run(Checkout):
             rc, s = self.main('run', '--hosted', str(self.hosted), '--head', self.head, '--run-id', HEAD_RUN,
                               '--attempt', '1', '--out', str(self.state / f'{HEAD_RUN}-1'), '-b', BOARD,
                               str(self.root / ROSTER))
-        self.assertEqual((rc, s['termination'], s['boards'][0]['verdict']), (2, 'aborted', 'pass'))
+        self.assertEqual((rc, s['termination'], s['boards'][0]['verdict']), (2, 'aborted', 'blocker'))
+        self.assertIn('aborted by a signal (pass', s['boards'][0]['detail'])
+        self.assertEqual(s['boards'][0]['attempts'][0]['verdict'], 'pass')   # the attempt's own evidence kept
 
     def test_an_unreadable_tree_is_one_boards_refusal(self):
         with mock.patch.object(C, 'admit_tree', side_effect=FileNotFoundError('gone')):

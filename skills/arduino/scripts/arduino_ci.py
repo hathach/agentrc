@@ -249,7 +249,7 @@ def run_board(board, tree, out, roster, clock, lock_wait, stop):
     """The board's attempts and result. Locked: admitted again every LOCK_POLL s within lock_wait; a fail: one
     retry, the fail standing until a retry runs. No attempt starts past the deadline, the lock wait or a signal."""
     res = new_result(board)
-    lock_since, failed = None, None   # failed: the fail awaiting its retry
+    lock_since, waited, failed = None, 0.0, None   # lock_since: awaiting admission; failed: the fail awaiting a retry
 
     def unresolved(why):
         if failed:
@@ -261,8 +261,10 @@ def run_board(board, tree, out, roster, clock, lock_wait, stop):
         if stop['signal'] or clock.left() <= 0:
             why = 'aborted by a signal' if stop['signal'] else 'deadline'
             return unresolved(why + (f' (last: {last["detail"]})' if last and last.get('locked') else ''))
-        if lock_since is not None and time.monotonic() - lock_since >= lock_wait:
-            return unresolved(f'locked past the {lock_wait:g}s lock wait: {last["detail"]}')
+        if lock_since is not None:
+            res['waitedS'] = round(waited + time.monotonic() - lock_since)
+            if waited + time.monotonic() - lock_since >= lock_wait:
+                return unresolved(f'locked past the {lock_wait:g}s lock wait: {last["detail"]}')
         run_dir = out / board / f'run-{len(res["attempts"]) + 1}'
         log(f'{board}: attempt {len(res["attempts"]) + 1} ({run_dir})')
         t = time.monotonic()
@@ -270,15 +272,16 @@ def run_board(board, tree, out, roster, clock, lock_wait, stop):
         a = attempt_entry(run_dir, code, row, time.monotonic() - t)
         res['attempts'].append(a)
         log(f'{board}: {a["verdict"]} {a["detail"]}')
-        if lock_since is not None:
-            res['waitedS'] = round(time.monotonic() - lock_since)
         if a.get('locked'):
             lock_since = t if lock_since is None else lock_since
-            nap = min(LOCK_POLL, lock_wait - (time.monotonic() - lock_since), clock.left())
+            nap = min(LOCK_POLL, lock_wait - waited - (time.monotonic() - lock_since), clock.left())
             while nap > 0 and not stop['signal']:
                 time.sleep(min(1.0, nap))
                 nap -= 1.0
             continue
+        if lock_since is not None:   # admitted: the wait ends where this attempt started
+            waited += t - lock_since
+            res['waitedS'], lock_since = round(waited), None
         if a['verdict'] == 'fail' and failed is None:
             failed = a
             continue
@@ -355,7 +358,11 @@ def cmd_run(a):
             results.append(finish(new_result(b), 'not-run', f'not run: {e}'))
             continue
         results.append(run_board(b, tree, out, roster_rel, clock, a.lock_wait, stop))
-    code = 2 if stop['signal'] or any(r['verdict'] == 'blocker' for r in results) else \
+    if stop['signal']:   # the `hil` run rules: an aborted run leaves every requested board a blocker
+        for r in results:
+            if r['verdict'] != 'blocker':
+                r.update(verdict='blocker', detail=f'run aborted by a signal ({r["verdict"]}: {r["detail"]})')
+    code = 2 if any(r['verdict'] == 'blocker' for r in results) else \
         0 if results and all(r['verdict'] == 'pass' for r in results) else 1
     summary = {'kind': SUMMARY_KIND, 'version': 1, 'head': a.head, 'runId': a.run_id, 'attempt': a.attempt,
                'roster': roster_rel, 'termination': 'aborted' if stop['signal'] else 'completed',
