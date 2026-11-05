@@ -8,7 +8,7 @@ export const meta = {
 const AGENTRC = '"${AGENTRC_DIR:-$HOME/.claude}"'  // shell text, quoted so a path with spaces stays one word: the agentrc checkout a project install names in AGENTRC_DIR, else the user install
 // args: { pr, repo: 'owner/name', head, mergeBase, scopeBase (full SHAs: prepare.py's
 //          pins; scopeBase is mergeBase on a full review, the last reviewed head on an
-//          incremental one), mode: 'full' | 'incremental' | 'discussion' (the last for prepare.py's
+//          incremental one, or on a recheck after a base merge prepare's synthetic base), mode: 'full' | 'incremental' | 'discussion' (the last for prepare.py's
 //          `same`: the head was reviewed and only pushback on our threads is judged), groups: string[] (prepare.py's),
 //          factsDir (prepare.py's facts file's directory, where threads.py writes),
 //          hil: { choice: 'none' } | { choice: 'boards', boards: [{ board, verdict: 'pass' | 'fail' | 'not-run',
