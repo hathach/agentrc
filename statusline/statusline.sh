@@ -128,8 +128,16 @@ def codex(d):
     if not isinstance(p,(int,float)): return ""
     rs=when(d.get("resets_at"),epoch)
     return pct("C",p)+reset_tag(rs)
+SEP="\033[90m/"+R+" "
+def live_session(sess_in):  # the session % with its reset from the input; None when it has no %
+    p=get(sess_in,"used_percentage")
+    if not isinstance(p,(int,float)): return None
+    return pct("s",p)+reset_tag(when(get(sess_in,"resets_at"),epoch))
+def no_usage(sess_in, week_epoch):  # cache unusable: the live session % beside unknown weeklies, else "" (placeholder)
+    live=live_session(sess_in)
+    return (live+SEP+pct("w",None)+" "+pct("F",None) if live else ""), when(week_epoch,epoch)
 def usage(d, sess_in, week_epoch):  # session / week(all) / week(Fable) percentages, and the weekly reset
-    if not isinstance(d,dict) or d.get("error"): return "",when(week_epoch,epoch)  # error/rate-limit body
+    if not isinstance(d,dict) or d.get("error"): return no_usage(sess_in, week_epoch)  # error/rate-limit body
     lims={}; resets={}
     kinds={"session":"sess","weekly":"week","weekly_all":"week","weekly_scoped":"fable"}
     for l in (d.get("limits") or []):  # every limit the account has: a kind it does not list is not shown
@@ -139,17 +147,15 @@ def usage(d, sess_in, week_epoch):  # session / week(all) / week(Fable) percenta
         for k,w in (("sess","five_hour"),("week","seven_day"),("fable","seven_day_opus")):
             lims[k]=get(d,w,"utilization"); resets[k]=get(d,w,"resets_at")
         if all(p is None for p in lims.values()):
-            return "",when(week_epoch,epoch)  # nothing usable -> render nothing rather than a fake 0%/0%/0%
+            return no_usage(sess_in, week_epoch)  # nothing usable -> no fake 0%/0%/0%
     weekly=" ".join(pct(lbl,lims[k]) for k,lbl in (("week","w"),("fable","F")) if k in lims)
     groups=[weekly]
     if "sess" in lims:  # % and reset from one source: a cached % may predate the live window
-        p=get(sess_in,"used_percentage"); live=isinstance(p,(int,float))
-        rs=when(get(sess_in,"resets_at"),epoch) if live else when(resets["sess"],iso)
-        groups.insert(0, pct("s",p if live else lims["sess"])+reset_tag(rs))
+        groups.insert(0, live_session(sess_in) or pct("s",lims["sess"])+reset_tag(when(resets["sess"],iso)))
     # weekly reset ONLY: the input -> weekly_all -> seven_day window -> Fable-scoped weekly
     reset=(when(week_epoch,epoch) or when(resets.get("week"),iso) or when(get(d,"seven_day","resets_at"),iso)
            or when(resets.get("fable"),iso))
-    return ("\033[90m/"+R+" ").join(g for g in groups if g), reset if weekly else ""
+    return SEP.join(g for g in groups if g), reset if weekly else ""
 def credits(d):  # extra-usage credits already spent; minor units -> "$31.54"
     sp=d.get("spend") or {}
     amt=(sp.get("used") or {}).get("amount_minor"); exp=(sp.get("used") or {}).get("exponent")
@@ -166,8 +172,9 @@ try: d=json.load(sys.stdin)
 except Exception: d={}
 cache=load(sys.argv[1])
 week_epoch=get(d,"rate_limits","seven_day","resets_at")
-use, reset=guard(usage, cache, get(d,"rate_limits","five_hour"), week_epoch,
-                 default=("",when(week_epoch,epoch)))
+sess_in=get(d,"rate_limits","five_hour")
+use, reset=guard(usage, cache, sess_in, week_epoch,
+                 default=guard(no_usage, sess_in, week_epoch, default=("",when(week_epoch,epoch))))
 print(get(d,"workspace","current_dir") or "")
 print(get(d,"session_id") or "")
 print(get(d,"transcript_path") or "")

@@ -331,6 +331,19 @@ class UsageTest(unittest.TestCase):
                     path.unlink(missing_ok=True)
                 self.assertIn(shown, self.render(payload=payload))
 
+    def test_without_a_usable_cache_the_inputs_session_percent_still_shows(self):
+        sess_at, week_at = later(40, 12, 0), later(72, 9, 30)
+        payload = json.dumps({'rate_limits': {'five_hour': {'used_percentage': 42, 'resets_at': sess_at.timestamp()},
+                                              'seven_day': {'resets_at': week_at.timestamp()}}})
+        for cache in (None, {'error': {'type': 'rate_limit_error'}}, {'limits': [{'kind': 'five_hour', 'percent': 40}]}):
+            with self.subTest(cache=cache):
+                path = self.cfg / 'statusline-usage.json'
+                if cache:
+                    path.write_text(json.dumps(cache))
+                else:
+                    path.unlink(missing_ok=True)
+                self.assertIn(f' s42% ↻{stamp(sess_at)}/ w? F? ↻{stamp(week_at)}', self.render(payload=payload))
+
     def test_crlf_line_ends_from_python_leave_empty_fields_empty(self):
         site = self.home / 'site'
         site.mkdir()
