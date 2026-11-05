@@ -3,6 +3,8 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
@@ -801,7 +803,7 @@ class CollectTest(LedgerCase):
         msg = self.msg_of(self.ask())
         with mock.patch('builtins.print') as out:
             self.assertEqual(captain.collect([msg], 0), captain.NO_ANSWER)
-        self.assertEqual(out.call_args_list[-1].args[0], f'pending {msg} from {len(captain.records())}')
+        self.assertEqual(out.call_args_list[-1].args[0], f'pending from {len(captain.records())}: {msg}')
 
     def test_cancelled_request_is_reported_as_such(self):
         msg = self.msg_of(self.ask())
@@ -2273,12 +2275,33 @@ class WatchCollectTest(WatchCase):
         n = len(captain.records())
         self.assertEqual(code, captain.NO_ANSWER)
         self.assertEqual(lines, [f'watching {m} · sp · name · t2', f'reported {m}:{n - 1} · ready · needs you',
-                                 f'pending {m} {w} from {n}'])
+                                 f'pending from {n}: {m} {w}'])
         self.report_as('t2', m)
         captain.cancel(w, self.ident)
         code, lines = self.collect(start=n)
         self.assertEqual((code, lines), (0, [f'reported {m}:{n} · ready', f'cancelled {w}',
                                              f'done from {len(captain.records())}']))
+
+    def test_a_lock_held_past_the_deadline_still_prints_the_cursor(self):
+        self.arm('all')
+        m = self.joined_as('t2')
+        n = len(captain.records())
+        real, held, grabbed = captain.time.sleep, open(self.state / 'lock', 'a'), []
+        self.addCleanup(held.close)
+        release = threading.Timer(5, captain.fcntl.flock, (held, captain.fcntl.LOCK_UN))
+        self.addCleanup(release.cancel)
+
+        def sleep(s):   # another process takes the lock while collect waits between polls
+            if not grabbed:
+                captain.fcntl.flock(held, captain.fcntl.LOCK_EX)
+                release.start()
+                grabbed.append(True)
+            real(s)
+        began = time.monotonic()
+        with mock.patch.object(captain.time, 'sleep', side_effect=sleep), mock.patch('builtins.print') as out:
+            self.assertEqual(captain.collect([], 50), captain.NO_ANSWER)
+        self.assertLess(time.monotonic() - began, 3, 'waited for the lock past the deadline')
+        self.assertEqual(out.call_args_list[-1].args[0], f'pending from {n}: {m} {self.watch_id()}')
 
     def test_collect_ends_a_watch_whose_captain_is_gone(self):
         self.arm('all')

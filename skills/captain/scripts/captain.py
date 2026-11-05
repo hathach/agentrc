@@ -846,11 +846,13 @@ def watch_event(i, rec, items):
 def collect(msgs, wait_ms, start=None):
     """Print each followed item's events as they land: a request's or relay's report or outcome, cancellation,
     withdrawal or refusal; a watch's members joining and every report they send, and its end. Exit 0, printing
-    `done from <M>`, once none is pending; NO_ANSWER when wait_ms lapse first, printing `pending <ids> from <M>`.
+    `done from <M>`, once none is pending; NO_ANSWER when wait_ms lapse first, printing `pending from <M>: <ids>`,
+    M ahead of a list that grows with a watch's members so a display cutting long lines cannot cut it.
     M is the index of the first record not yet read, for --from: records from there are printed, while what is
     closed is judged on the whole ledger. A strict read under the lock first: a torn ledger must not look like
     nothing to wait for. A watch whose captain was replaced or ended is settled here too, at the start and at each
-    poll while one is followed, or nothing else might end it."""
+    poll while one is followed, or nothing else might end it; that poll waits for the lock only until wait_ms
+    lapse, so the pending line still prints before the caller's timeout."""
     with locked():
         recs = records()
         opened = len(recs)   # a watch settle ends now was open when this collect began
@@ -881,13 +883,16 @@ def collect(msgs, wait_ms, start=None):
             print(f'done from {shown}', flush=True)
             return 0
         if time.monotonic() >= deadline:
-            print(f'pending {" ".join(sorted(pending))} from {shown}', flush=True)
+            print(f'pending from {shown}: {" ".join(sorted(pending))}', flush=True)
             return NO_ANSWER
         time.sleep(POLL_S)
         if any(items[m]['type'] in WATCHED for m in pending):
-            with locked():   # strict: under the lock no append is half written
-                recs = records()
-                settle(recs)
+            try:
+                with locked(max(0, deadline - time.monotonic())):   # strict: under the lock no append is half written
+                    recs = records()
+                    settle(recs)
+            except Busy:
+                pass   # the deadline passed: the next pass prints the cursor
         else:
             recs = records(lenient=True)
 

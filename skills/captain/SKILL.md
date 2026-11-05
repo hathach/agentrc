@@ -130,10 +130,10 @@ opened or replaced in a target terminal since refuses, and you preview again.
   answer that already landed. A failure shows as the Monitor's exit code. Each line is `reported <msg> · <state>`,
   with `· needs you` when the report names a need, `accepted`, an outcome, `withdrawn`, `cancelled`, `undelivered` or
   `refused by the session that replaced its target`, when another session took the target's terminal before the
-  send; `pending <msg>... from <M>` means the wait lapsed: re-arm, or `cancel` what will not answer. While a watch is
-  open, keep that Monitor on `collect --from <M>` with no ids, M from the last line of the collect before (`done from
-  <M>` or `pending ... from <M>`; the first one after `watch` has no `--from`), and re-arm it at each lapse until a
-  `watch ended <watch>` or `cancelled <watch>` line names the watch's id: it prints `watching <member>` as a session
+  send; `pending from <M>: <msg>...` means the wait lapsed: re-arm, or `cancel` what will not answer. While a watch
+  is open, keep that Monitor on `collect --from <M>` with no ids, M from the last line of the collect before (`done
+  from <M>` or `pending from <M>: ...`; the first one after `watch` has no `--from`), and re-arm it at each lapse until
+  a `watch ended <watch>` or `cancelled <watch>` line names the watch's id: it prints `watching <member>` as a session
   joins and `reported <member>:<N>` for each report, N naming that one report.
 - **The table** comes from `reports --json <msg>...` with this collection's request ids and those `not asked` named, run
   once `collect` ended or lapsed, never from Monitor lines, which a long line can cut: each id gets the report that
