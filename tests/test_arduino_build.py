@@ -1062,14 +1062,15 @@ class Core(Lib):
                          [('cores/fake/main.cpp', False)])
 
     def test_submodules_bind_at_their_gitlinks_clean(self):
-        ident = {'status': ' M libraries/USB\n', 'submodules': [
-            {'path': 'libraries/USB', 'commit': 'a', 'state': ' '},
-            {'path': 'libraries/Z', 'commit': 'b', 'state': '-'},
-            {'path': 'libraries/Y', 'commit': 'c', 'state': '+'}]}
+        ident = {'submodules': [
+            {'path': 'libraries/USB', 'commit': 'a', 'state': ' ', 'dirty': True},
+            {'path': 'libraries/Z', 'commit': 'b', 'state': '-', 'dirty': False},
+            {'path': 'libraries/Y', 'commit': 'c', 'state': '+', 'dirty': False}]}
         self.assertEqual(ab.submodule_problems(ident), ['libraries/Z is not initialised',
                                                         'libraries/Y is not at its gitlink',
                                                         'libraries/USB has changes'])
-        self.assertEqual(ab.submodule_problems({'status': '', 'submodules': ident['submodules'][:1]}), [])
+        clean = {**ident['submodules'][0], 'dirty': False}
+        self.assertEqual(ab.submodule_problems({'submodules': [clean]}), [])
 
     def test_record_refused_unless_submodules_are_at_their_gitlinks(self):
         roster = self.core_roster()
@@ -1085,6 +1086,7 @@ class Core(Lib):
                 self.assertIn('libraries/USB is not initialised', out['error'])
 
     def test_a_dirty_submodule_counts_whatever_its_ignore_setting(self):
+        """At any depth: an ignore=dirty at the top and one inside the submodule for its own nested one."""
         env = git_env(GIT_CONFIG_COUNT='1', GIT_CONFIG_KEY_0='protocol.file.allow', GIT_CONFIG_VALUE_0='always')
         environ = mock.patch.dict(os.environ, env, clear=True)   # the engine's own git runs inherit it
         environ.start()
@@ -1092,9 +1094,16 @@ class Core(Lib):
 
         def git(where, *a):
             subprocess.run(['git', '-C', str(where), *a], check=True, capture_output=True, env=env)
+        nested = self.tmp / 'nested_upstream'
+        nested.mkdir()
+        (nested / 'header.h').write_text('// nested\n')
+        git(nested, 'init', '-q', '-b', 'main')
+        git(nested, 'add', '-A')
+        git(nested, 'commit', '-qm', 'nested')
         sub = self.tmp / 'usb_upstream'
         shutil.copytree(self.root / 'libraries/USB', sub)
         git(sub, 'init', '-q', '-b', 'main')
+        git(sub, 'submodule', '-q', 'add', str(nested), 'nested')
         git(sub, 'add', '-A')
         git(sub, 'commit', '-qm', 'usb')
         shutil.rmtree(self.root / 'libraries/USB')
@@ -1102,13 +1111,21 @@ class Core(Lib):
         git(self.root, 'submodule', '-q', 'add', str(sub), 'libraries/USB')
         git(self.root, 'add', '-A')
         git(self.root, 'commit', '-qm', 'core')
+        git(self.root, 'submodule', '-q', 'update', '--init', '--recursive')
         git(self.root, 'config', 'submodule.libraries/USB.ignore', 'dirty')
+        git(self.root / 'libraries/USB', 'config', 'submodule.nested.ignore', 'dirty')
         ident, _ = ab.source_identity()
         self.assertEqual((ident['dirty'], ab.submodule_problems(ident)), (False, []))
-        (self.root / 'libraries/USB/library.properties').write_text('name=Fake USB\n# edited\n')
-        ident, _ = ab.source_identity()
-        self.assertTrue(ident['dirty'])
-        self.assertEqual(ab.submodule_problems(ident), ['libraries/USB has changes'])
+        for edited, path in (('libraries/USB/nested/header.h', 'libraries/USB/nested'),
+                             ('libraries/USB/library.properties', 'libraries/USB')):
+            with self.subTest(edited=edited):
+                original = (self.root / edited).read_text()
+                (self.root / edited).write_text(original + '// edited\n')
+                ident, _ = ab.source_identity()
+                self.assertTrue(ident['dirty'])
+                self.assertEqual(ab.submodule_problems(ident), [f'{path} has changes'])
+                self.assertIn(f'~~ {path}', ident['status'])
+                (self.root / edited).write_text(original)
 
     def test_a_core_record_refuses_any_untracked_file(self):
         self.patch(ab, 'source_identity', lambda: ({'head': 'abc', 'dirty': True, 'diffSha256': 'd',
@@ -1135,9 +1152,10 @@ class Core(Lib):
     def test_submodule_status_is_parsed_recursively(self):
         out = (' 3e5369cd libraries/USB (3.7.3)\n-5b48867c libraries/Z\n+0123abcd libraries/USB/lib/x (v1)\n')
         with mock.patch.object(ab, 'git', return_value=out) as git:
-            self.assertEqual(ab.submodules(), [{'path': 'libraries/USB', 'commit': '3e5369cd', 'state': ' '},
-                                               {'path': 'libraries/Z', 'commit': '5b48867c', 'state': '-'},
-                                               {'path': 'libraries/USB/lib/x', 'commit': '0123abcd', 'state': '+'}])
+            self.assertEqual(ab.submodules(), [
+                {'path': 'libraries/USB', 'commit': '3e5369cd', 'state': ' ', 'dirty': False},
+                {'path': 'libraries/Z', 'commit': '5b48867c', 'state': '-', 'dirty': False},
+                {'path': 'libraries/USB/lib/x', 'commit': '0123abcd', 'state': '+', 'dirty': False}])
         git.assert_called_once_with('submodule', 'status', '--recursive')
 
 

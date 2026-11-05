@@ -900,13 +900,17 @@ def merge(spans):
 
 # ---- HIL record
 
-def status_args():
-    """git status options: a core's also count a submodule dirty whatever its `ignore` setting says."""
-    return ('status', '--porcelain', '--untracked-files=all', *(['--ignore-submodules=none'] if core_mode() else []))
+def worktree_status():
+    """`git status --porcelain` of the checkout; a core's adds `~~ <path>` for each submodule, at any depth, whose own
+    worktree has changes: an `ignore` setting at any level hides them from the superproject's status."""
+    status = git('status', '--porcelain', '--untracked-files=all')
+    if core_mode():
+        status += ''.join(f'~~ {s["path"]}\n' for s in submodules() if s['dirty'])
+    return status
 
 
 def source_identity():
-    status = git(*status_args())
+    status = worktree_status()
     diff = git('diff', 'HEAD', '--binary')
     ident = {'head': git('rev-parse', 'HEAD').strip(), 'dirty': bool(status.strip()),
              'diffSha256': hashlib.sha256(diff.encode()).hexdigest(), 'status': status}
@@ -922,7 +926,10 @@ def submodules():
     for line in git('submodule', 'status', '--recursive').splitlines():
         m = re.match(r'^([ +\-U])([0-9a-f]+) (\S+)', line)
         if m:
-            out.append({'path': m.group(3), 'commit': m.group(2), 'state': m.group(1)})
+            dirty = m.group(1) != '-' and bool(subprocess.run(
+                ['git', '-C', str(P.ROOT / m.group(3)), 'status', '--porcelain', '--untracked-files=all',
+                 '--ignore-submodules=all'], capture_output=True, text=True).stdout.strip())
+            out.append({'path': m.group(3), 'commit': m.group(2), 'state': m.group(1), 'dirty': dirty})
     return out
 
 
@@ -930,10 +937,9 @@ def submodule_problems(ident):
     """Why the checkout's submodules keep a record from binding their bytes, [] when they do not: each must be
     initialised at its gitlink, and clean (the record's patch carries no submodule content)."""
     subs = ident.get('submodules', [])
-    why = [f'{s["path"]} is {"not initialised" if s["state"] == "-" else "not at its gitlink"}'
-           for s in subs if s['state'] != ' ']
-    at_gitlink = {s['path'] for s in subs if s['state'] == ' '}
-    return why + [f'{ln[3:]} has changes' for ln in ident['status'].splitlines() if ln[3:] in at_gitlink]
+    return [f'{s["path"]} is {"not initialised" if s["state"] == "-" else "not at its gitlink"}'
+            for s in subs if s['state'] != ' '] + [f'{s["path"]} has changes' for s in subs
+                                                   if s['state'] == ' ' and s['dirty']]
 
 
 def platform_git(install_dir):

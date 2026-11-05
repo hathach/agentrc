@@ -278,6 +278,14 @@ class Admission(Base):
         self.assertEqual((images['echo']['vidPid'], images['echo']['hex']), ('1234:5678', None))
         self.assertEqual(images['echo']['fqbn'], json.loads(self.record().read_text())['fqbn'])   # no per-sketch one
 
+    def test_admission_sees_the_build_sides_worktree_status(self):
+        # a core's dirty submodule hidden by an ignore setting: the build side reports it, admission refuses on it
+        with mock.patch.object(H.B, 'worktree_status', return_value='~~ libraries/USB/nested\n'):
+            self.assertEqual(H.git_identity()[1], '~~ libraries/USB/nested')
+            with mock.patch.object(H, 'git_identity', return_value=('abc', H.B.worktree_status().strip())), \
+                    self.assertRaisesRegex(H.Refused, 'changes since the record'):
+                H.admit(self.record(), 'rig_jlink', self.roster, self.dir / 'run')
+
     def test_a_sketchs_own_fqbn_is_carried(self):
         rec = self.record()
         data = json.loads(rec.read_text())

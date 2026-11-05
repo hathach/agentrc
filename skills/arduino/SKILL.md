@@ -109,7 +109,8 @@ changes from a library:
 - **One rig board, several menus**: the profile's `fqbn(board, example)` gives a HIL sketch its own FQBN (a USB stack
   menu); the record keeps each sketch's FQBN and the report names them (`firmware.fqbns`).
 - **Identity**: a record also binds the submodules (`git submodule status --recursive`) and refuses one that is not
-  initialised, not at its gitlink or dirty, `--experimental` included: a record's patch carries no submodule bytes.
+  initialised, not at its gitlink or dirty (each one's own worktree, at any depth, whatever its `ignore` setting),
+  `--experimental` included: a record's patch carries no submodule bytes. A record also refuses any untracked file.
   Foreign headers are those from another copy of the core (by `platform.txt` `name=`).
 
 ## Adding a library
