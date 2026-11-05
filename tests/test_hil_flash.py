@@ -902,6 +902,8 @@ class JLinkJudgment(unittest.TestCase):
         self.assertTrue(any('Skipped. Contents already match' in jlink_fixture(n) for n in self.manifest),
                         'an already-matching image is recorded too')
         for name, m in self.manifest.items():
+            if 'verifyDiffers' in m:   # a recorded failure: VerifyDiffers judges it
+                continue
             with self.subTest(name):
                 self.assertEqual(hf.jlink_judgment(jlink_fixture(name), m['commands']),
                                  {'ok': True, 'problem': '', 'commands': mock.ANY})
@@ -1006,6 +1008,40 @@ def op_of(*outs, script='halt\nr\ngo\nexit\n', stderr=''):
     """A reset_jlink Operation of these (rc, stdout, error) attempts."""
     return hf.Operation([hf._record(['JLinkExe'], script, subprocess.CompletedProcess([], rc, out, stderr), err)
                          for rc, out, err in outs])
+
+
+class VerifyDiffers(unittest.TestCase):
+    """A verifybin that read the target and found it different, the only failure that proves something about the
+    target: the recorded session stopped by it (MANIFEST.json verifyDiffers), and every variant that proves nothing."""
+    NAME = 'V9.78-nrf52840dk-halt-verifybin-differs.txt'
+
+    def setUp(self):
+        self.m = json.loads((JLINK_CORPUS / 'MANIFEST.json').read_text())[self.NAME]
+        self.out = jlink_fixture(self.NAME)
+
+    def op(self, out=None, script=None, rc=1, stderr='', err=None):
+        script = '\n'.join([*(script or self.m['commands']), 'exit']) + '\n'
+        return op_of((rc, self.out if out is None else out, err), script=script, stderr=stderr)
+
+    def test_the_recorded_difference_is_proven(self):
+        self.assertEqual(hf.jlink_verify_differs(self.op()), self.m['verifyDiffers'])
+        self.assertIn("echoed ['halt', 'verifybin /x/base-00000000.bin,0x0'], not the script", hf.jlink_problem(op_of(
+            (0, self.out, None), script='\n'.join([*self.m['commands'], 'exit']) + '\n')))
+
+    def test_nothing_short_of_this_scripts_own_completed_read_proves_a_difference(self):
+        differs = 'Verify failed @ address 0x00000001.\nExpected 04 read 00\nERROR: Verify failed.'
+        cases = {'timed out': self.op(err=subprocess.TimeoutExpired('JLinkExe', 1)),
+                 'no read': self.op(self.out.replace(differs, 'Could not read memory.')),
+                 'a read failure after the difference': self.op(self.out.replace(differs,
+                                                                                 differs + '\nCould not read memory.')),
+                 'a partial read': self.op(self.out.replace('Reading 2816 bytes data', 'Reading')),
+                 'not halted first': self.op(self.out.replace('PC = 000004F2', 'CPU is not halted')),
+                 'the halt echo missing': self.op(self.out.replace('J-Link>halt\n', '')),
+                 'another script': self.op(script=['halt', 'verifybin /x/other.bin,0x0']),
+                 'a failure on stderr': self.op(stderr='Could not read memory.\n')}
+        for why, op in cases.items():
+            with self.subTest(why):
+                self.assertIsNone(hf.jlink_verify_differs(op))
 
 
 class EsptoolProblem(unittest.TestCase):

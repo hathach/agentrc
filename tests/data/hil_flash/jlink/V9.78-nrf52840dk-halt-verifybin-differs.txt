@@ -64,8 +64,8 @@ FPS20= 00000000, FPS21= 00000000, FPS22= 00000000, FPS23= 00000000
 FPS24= 00000000, FPS25= 00000000, FPS26= 00000000, FPS27= 00000000
 FPS28= 00000000, FPS29= 00000000, FPS30= 00000000, FPS31= 00000000
 FPSCR= 00000000
-J-Link>verifybin BASE/base-00000000.bin,0x0
-Loading binary file BASE/base-00000000.bin
+J-Link>verifybin /x/base-00000000.bin,0x0
+Loading binary file /x/base-00000000.bin
 Reading 2816 bytes data from target memory @ 0x00000000.
 Verify failed @ address 0x00000001.
 Expected 04 read 00

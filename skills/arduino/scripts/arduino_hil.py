@@ -71,6 +71,7 @@ REAP = 10   # agentrc hil_process.REAP_GRACE, per tracked child
 STEP_MAX = VERIFY_TIMEOUT + DETACH_WAIT + FLASH_TIMEOUT + VERIFY_TIMEOUT + ENUM_TIMEOUT + TEST_TIMEOUT + \
     4 * (REAP + SETTLE)
 CLEANUP_RESERVE = STEP_MAX   # the restore is one more such step
+BASE_MAX = 2 * VERIFY_TIMEOUT   # a base image's check and rewrite before a flash (ensure_base), added per step
 PENDING_KIND = 'arduino-hil'   # every Arduino library's: a board's pending children block all of them
 
 
@@ -237,10 +238,9 @@ def record_problems(rec, board, head, experimental_ok, where):
         why.append(f'it is for {rec["board"]}, not {board}')
     if rec['experimental'] and not experimental_ok:
         why.append('it is experimental: the battery and restore take clean records only')
-    want = B.P.BOARDS.get(board, {}).get('base')
-    if sorted(want or ()) != sorted((rec.get('base') or {}).get('files', {})):
-        why.append(f'its base image {sorted((rec.get("base") or {}).get("files", {}))} is not the profile\'s '
-                   f'{sorted(want or ())}: rebuild it')
+    want, have = sorted(B.P.BOARDS.get(board, {}).get('base') or ()), sorted((rec.get('base') or {}).get('files', {}))
+    if want != have:
+        why.append(f'its base image {have} is not the profile\'s {want}: rebuild it')
     if head is not None and rec['source']['head'] != head:
         why.append(f'it was built at {rec["source"]["head"][:12]}, the {where} is at {head[:12]}: rebuild it')
     return why
@@ -277,13 +277,8 @@ def admit(record_path, board, roster_path, run_dir, *, manifest=None, experiment
             raise Refused(f'{record_path}: {name} records a {s.get("image")} image, a {flasher} board flashes the '
                           f'{want}: rebuild against this roster')
         dest = Path(run_dir) / 'images' / name
-        dest.mkdir(parents=True, exist_ok=True)
         for rel, digest in s['sha256'].items():
-            src = Path(base or P.ROOT) / rel
-            data = src.read_bytes() if src.is_file() else None
-            if data is None or hashlib.sha256(data).hexdigest() != digest:
-                raise Refused(f'{rel} is missing or changed since the record')
-            (dest / Path(rel).name).write_bytes(data)
+            pinned_copy(Path(base or P.ROOT) / rel, digest, dest / Path(rel).name, rel)
         images[name] = {'elf': str(dest / Path(s['elf']).name),
                         'hex': str(dest / Path(s['hex']).name) if s.get('hex') else None,
                         'vidPid': s['vidPid'], 'sha256': s['sha256'], 'dir': str(dest),
@@ -296,44 +291,39 @@ def admit(record_path, board, roster_path, run_dir, *, manifest=None, experiment
     return rec, images
 
 
-def write_hex(runs, path):
-    """Intel HEX of [(start, bytes)] runs: extended linear address records, 16 data bytes per line."""
-    lines, upper = [], None
-    for start, data in runs:
-        for off in range(0, len(data), 16):
-            addr, chunk = start + off, data[off:off + 16]
-            if addr >> 16 != upper:
-                upper = addr >> 16
-                lines.append(bytes([2, 0, 0, 4]) + upper.to_bytes(2, 'big'))
-            lines.append(bytes([len(chunk)]) + (addr & 0xffff).to_bytes(2, 'big') + b'\0' + chunk)
-    lines.append(bytes([0, 0, 0, 1]))
-    Path(path).write_text(''.join(f':{r.hex().upper()}{(-sum(r)) & 0xff:02X}\n' for r in lines))
+def pinned_copy(src, digest, dest, name):
+    """Copy src to dest once its bytes hash as `digest`, so the copy is the bytes checked; Refused naming `name`."""
+    data = src.read_bytes() if src.is_file() else None
+    if data is None or hashlib.sha256(data).hexdigest() != digest:
+        raise Refused(f'{name} is missing or changed since the record')
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(data)
 
 
 def admit_base(rec, board, root, run_dir):
     """The record's base image prepared in run_dir/base: {'hex' (its runs outside the excluded ranges), 'bins'
-    [(start, file)], 'segments', 'state' (set by ensure_base)}, parsed from the run dir's copies of its files once
-    those hash as recorded and their runs are the recorded segments; Refused otherwise."""
+    [(start, file)], 'state' (set by ensure_base)}, parsed from the run dir's copies of its files once those hash as
+    recorded and their runs are the recorded segments; Refused otherwise."""
     out = run_dir / 'base'
     for rel_path, digest in rec['base']['files'].items():
-        src = root / rel_path
-        data = src.read_bytes() if src.is_file() else None
-        if data is None or hashlib.sha256(data).hexdigest() != digest:
-            raise Refused(f'base image {rel_path} is missing or changed since the record')
-        (out / 'files' / rel_path).parent.mkdir(parents=True, exist_ok=True)
-        (out / 'files' / rel_path).write_bytes(data)
+        pinned_copy(root / rel_path, digest, out / 'files' / rel_path, f'base image {rel_path}')
     runs, why = B.base_runs(board, root=out / 'files')
     if why or runs is None:
         raise Refused(f'base image: {why or "the profile names none"}')
     if [[s, s + len(d)] for s, d in runs] != rec['base']['segments']:
         raise Refused('base image runs differ from the record\'s segments: rebuild it')
-    write_hex(runs, out / 'base.hex')
+    B.write_hex(runs, out / 'base.hex')
+    return {'hex': str(out / 'base.hex'), 'bins': write_bins(runs, out / 'base'), 'state': None}
+
+
+def write_bins(runs, prefix):
+    """[(start, file)]: each run as <prefix>-<start>.bin, what a verifybin compares."""
     bins = []
     for start, data in runs:
-        path = out / f'base-{start:08x}.bin'
+        path = Path(f'{prefix}-{start:08x}.bin')
         path.write_bytes(data)
         bins.append((start, str(path)))
-    return {'hex': str(out / 'base.hex'), 'bins': bins, 'segments': rec['base']['segments'], 'state': None}
+    return bins
 
 
 # ---- tracked children and flashing
@@ -441,15 +431,9 @@ def flash(flasher, image, run_dir, tracker):
     why = A.flash.jlink_problem(op)
     if why:
         return f'J-Link flash: {why}'
-    cmds = []
-    for i, (addr, data) in enumerate(B.hex_runs(image['hex'])):
-        path = Path(run_dir) / f'verify-{Path(image["hex"]).stem}-{i}.bin'
-        path.write_bytes(data)
-        cmds.append(f'verifybin {path},{addr:#x}')
-    op = A.flash.run_jlink_commands(flasher, cmds + ['r', 'go'], interface='SWD', speed=4000, autoconnect=True,
-                                    device=jlink_device(flasher), timeout=VERIFY_TIMEOUT, run=tracker.run,
-                                    workdir=str(run_dir))
-    tracker.check()
+    bins = write_bins(B.hex_runs(image['hex']), Path(run_dir) / f'verify-{Path(image["hex"]).stem}')
+    op = jlink_session(flasher, [f'verifybin {path},{addr:#x}' for addr, path in bins] + ['r', 'go'], run_dir,
+                       tracker)
     why = A.flash.jlink_problem(op)
     return f'J-Link verify: {why}' if why else ''
 
@@ -462,39 +446,6 @@ def jlink_session(flasher, cmds, run_dir, tracker):
     return op
 
 
-# what JLinkExe (V9.78) prints for a verifybin whose read completed and differed from the file
-VERIFY_READ = r'^Reading \d+ bytes data from target memory @ 0x[0-9A-F]+\.$'
-VERIFY_DIFFERS = r'^Verify failed @ address 0x[0-9A-F]+\.\nExpected [0-9A-F]{2} read [0-9A-F]{2}\nERROR: Verify failed\.$'
-
-
-def base_mismatch(op):
-    """The verifybin command a J-Link session stopped at, having read the target and found it different from that
-    file: the session's echoes are its script's own commands in order up to it, `halt` completed cleanly first, every
-    command before it completed, and its output holds the read and the difference with no other failure line, nor
-    does the preamble or stderr. A proven difference; None for anything else (no connection, a failed or partial
-    read, a timeout, another script), which proves nothing about the target."""
-    last = op.attempts[-1]
-    if last.kind != 'exited':
-        return None
-    script = (last.script or '').splitlines()[:-1]
-    out = A.process.cmd_stdout_text(last.result.stdout)
-    preamble = re.split(r'(?m)^J-Link>', out, maxsplit=1)[0]
-    if any(re.search(A.flash.JLINK_ERRORS, text) for text in (preamble,
-                                                               A.process.cmd_stdout_text(last.result.stderr))):
-        return None
-    judged = A.flash.jlink_judgment(out, script)['commands']
-    if len(judged) < 2 or [j['command'] for j in judged] != script[:len(judged)] or script[0] != 'halt' or \
-            any(j['error'] or not j['done'] for j in judged[:-1]):
-        return None
-    stop = judged[-1]['command']
-    chunk = A.flash.jlink_after(out, stop)[-1]
-    if not stop.startswith('verifybin ') or not re.search(VERIFY_READ, chunk, re.M) or \
-            not re.search(VERIFY_DIFFERS, chunk, re.M) or \
-            re.search(A.flash.JLINK_ERRORS, re.sub(VERIFY_DIFFERS, '', chunk, flags=re.M)):
-        return None
-    return stop
-
-
 def ensure_base(flasher, base, run_dir, tracker):
     """Check the board holds its base image (each run verified in place) and rewrite it only on a proven
     difference, with no reset or go after it (the sketch's flash resets the target); '' or why it failed. A session
@@ -505,15 +456,15 @@ def ensure_base(flasher, base, run_dir, tracker):
     if not why:
         base['state'] = 'matched'
         return ''
-    differs = base_mismatch(op)
+    differs = A.flash.jlink_verify_differs(op)
     if not differs:
         return f'base check: {why} (nothing written)'
+    at = differs.rsplit(',', 1)[1]
     op = jlink_session(flasher, ['halt', f'loadfile {base["hex"]}', *verify], run_dir, tracker)
     why = A.flash.jlink_problem(op)
     if why:
-        base['state'] = 'unknown'
-        return f'base rewrite after {differs.split()[1].split(",")[1]} differed: {why}'
-    base['state'] = f'rewritten: the run at {differs.split()[1].split(",")[1]} differed'
+        return f'base rewrite after the run at {at} differed: {why}'
+    base['state'] = f'rewritten: the run at {at} differed'
     return ''
 
 
@@ -808,8 +759,10 @@ def run_board(name, board, tests, record_path, roster_path, run_root, manifest):
                            'fqbns': {k: v['fqbn'] for k, v in images.items()},   # a core's sketches may differ
                            'driftedHeaders': sorted({h['counterpart'] for s in rec['sketches'].values()
                                                      for h in s.get('foreignHeaders', []) if not h['matches']})}
+        extra = BASE_MAX if rec.get('base') else 0   # each step and the restore may check and rewrite the base
+        budget, need = BOARD_BUDGET + (len(tests) + 1) * extra, STEP_MAX + CLEANUP_RESERVE + 2 * extra
         for test in tests:
-            if BOARD_BUDGET - (time.monotonic() - started) < STEP_MAX + CLEANUP_RESERVE:
+            if budget - (time.monotonic() - started) < need:
                 row['tests'].append({'test': test, 'pass': False, 'detail': 'not run: board budget left too small'})
                 continue
             row['ran'] = True

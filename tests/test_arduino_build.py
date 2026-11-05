@@ -825,8 +825,7 @@ class BaseRecord(RecordCase):
         self.assertIsNone(err)
         self.assertEqual(rec['base'], {'files': {f: ab.sha256(self.root / f) for f in ('sd.hex', 'settings.hex',
                                                                                          'uicr.hex')},
-                                       'exclude': [[0x10001000, 0x10002000]],
-                                       'segments': [[0x1000, 0x1020], [0xff000, 0xff004]]})
+                                       'segments': [[0x1000, 0x1020], [0xff000, 0xff004]]})   # no UICR run
         del self.P.BOARDS['rig_jlink']['base']
         self.assertNotIn('base', self.record(self.samd_row())[0])   # a board without one records none
 
@@ -846,8 +845,10 @@ class BaseRecord(RecordCase):
         _, err = self.record(self.row([(0x4000, 0x20)]))
         self.assertIn('a base image is checked and written through J-Link only', err)
 
-    def test_base_is_a_declared_feature(self):
-        self.assertIn('base', ab.PROFILE_FEATURES)
+    def test_write_hex_is_hex_runs_inverse(self):
+        runs = [(0x1000, bytes(range(40))), (0x1fff8, bytes(16)), (0x10001014, bytes(8))]   # across 64 KiB records
+        ab.write_hex(runs, self.root / 'w.hex')
+        self.assertEqual(ab.hex_runs(self.root / 'w.hex'), runs)
 
 
 class EspRecord(RecordCase):

@@ -10,10 +10,8 @@ point, loading this file from the pinned agentrc (its `agentrc_pin.py`). One pro
   LIBRARY_NAME          library.properties `name=`: how arduino-cli's used_libraries names it
   BOARDS                {board: {fqbn, family, [filters, span, role, chip, fixture, base, base_exclude]}}; a rig
                         board has `span`; `base` (feature 'base') is the checkout-relative Intel HEX files a J-Link
-                        rig board must hold under its sketches (a SoftDevice, a bootloader and its settings), checked
-                        before every flash and rewritten only when proven different (base_runs()), and
-                        `base_exclude` the address ranges [lo, hi) of those files never checked or written (UICR).
-                        A rewrite may erase the rest of each flash page a run touches: those pages must be the base's
+                        rig board must hold under its sketches, `base_exclude` the address ranges [lo, hi) of them
+                        never checked or written (SKILL.md, Base image)
   REPRESENTATIVES       {family: [boards]} a change to that family's code builds
   HIL_SKETCHES          {role: (sketch dirs, the first the restoration image)}
   SMOKE_BOARDS          boards whose restoration sketch a build-contract change builds (one per image kind)
@@ -876,6 +874,20 @@ def hex_runs(path):
     return [(start, bytes(data)) for start, data in runs]
 
 
+def write_hex(runs, path):
+    """Intel HEX of [(start, bytes)] runs (hex_runs' inverse): extended linear address records, 16 data bytes a line."""
+    lines, upper = [], None
+    for start, data in runs:
+        for off in range(0, len(data), 16):
+            addr, chunk = start + off, data[off:off + 16]
+            if addr >> 16 != upper:
+                upper = addr >> 16
+                lines.append(bytes([2, 0, 0, 4]) + upper.to_bytes(2, 'big'))
+            lines.append(bytes([len(chunk)]) + (addr & 0xffff).to_bytes(2, 'big') + b'\0' + chunk)
+    lines.append(bytes([0, 0, 0, 1]))
+    Path(path).write_text(''.join(f':{r.hex().upper()}{(-sum(r)) & 0xff:02X}\n' for r in lines))
+
+
 def base_runs(board, root=None):
     """([(start, bytes)] of the board's base HEX files (BOARDS `base`) outside its `base_exclude` ranges, sorted, or
     None (no base), and '' or why they cannot be a base: a run partly excluded, two runs overlapping or one inside the
@@ -1104,7 +1116,6 @@ def make_record(args, board, rows, before, diff, roster_path, prepared):
         **({'fixture': {'path': P.BOARDS[board]['fixture'], 'sha256': sha256(P.ROOT / P.BOARDS[board]['fixture'])}}
            if 'fixture' in P.BOARDS[board] else {}),
         **({'base': {'files': {f: sha256(P.ROOT / f) for f in P.BOARDS[board]['base']},
-                     'exclude': [list(r) for r in P.BOARDS[board].get('base_exclude', ())],
                      'segments': [[s, s + len(d)] for s, d in base]}} if base is not None else {}),
     }
     if args.experimental:
