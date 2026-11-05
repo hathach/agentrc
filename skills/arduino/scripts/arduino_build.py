@@ -28,8 +28,8 @@ A core's profile (an Arduino platform checkout, e.g. adafruit:samd) adds these, 
   PLATFORM              'vendor:arch': core mode. Sketches compile through an isolated sketchbook whose
                         hardware/<vendor>/<arch> is ROOT; LIBRARY_NAME is the platform's name (platform.txt `name=`)
   SKETCH_ROOTS          dirs whose *.ino sketch dirs are the examples (a library: ('examples',))
-  exclude(board, example)  True drops a sketch the core's CI never builds on that board (beside the
-                        .all.test.skip / .<filters>.test.skip / .<filters>.test.only markers a core's build_all.py reads)
+  exclude(board, example)  True drops a sketch the core's CI never builds on that board, beside the
+                        .all.test.skip / .<filters>.test.skip / .<filters>.test.only markers its build_all.py reads
   fqbn(board, example)  the FQBN a sketch builds with on `board` (default the board's): one rig board, two menus
 
 PROFILE_API is the profile interface the three engines implement; a library's bootstrap refuses any other unloaded.
@@ -710,8 +710,13 @@ def compile_sketch(board, example, build_dir, properties, prepared, config=None)
             row.update(status='failed', firstError=f'{boot_app0} missing: the ESP core layout changed')
             return row
         shutil.copy2(boot_app0, build_dir / boot_app0.name)
+    headers = foreign_headers(build_dir)
+    if core_mode() and headers:   # the isolated environment reaches no other copy: one leaking in fails the sketch
+        row.update(status='failed', foreignHeaders=headers,
+                   firstError=f'compiled against another copy of the core: {[h["path"] for h in headers][:3]}')
+        return row
     row.update(status='ok', fqbn=fqbn_, platform=platform, buildPlatform=build_platform, shadows=shadows,
-               vidPid=P.vid_pid(build_dir, board, None), foreignHeaders=foreign_headers(build_dir),
+               vidPid=P.vid_pid(build_dir, board, None), foreignHeaders=headers,
                libraries=[{'name': lib.get('name'), 'version': lib.get('version'), 'dir': lib.get('install_dir')}
                           for lib in used_libs],
                artifacts=sorted(rel(f) for f in build_dir.glob('*.ino.*') if f.suffix in ('.elf', '.hex', '.bin',
@@ -895,8 +900,13 @@ def merge(spans):
 
 # ---- HIL record
 
+def status_args():
+    """git status options: a core's also count a submodule dirty whatever its `ignore` setting says."""
+    return ('status', '--porcelain', '--untracked-files=all', *(['--ignore-submodules=none'] if core_mode() else []))
+
+
 def source_identity():
-    status = git('status', '--porcelain', '--untracked-files=all')
+    status = git(*status_args())
     diff = git('diff', 'HEAD', '--binary')
     ident = {'head': git('rev-parse', 'HEAD').strip(), 'dirty': bool(status.strip()),
              'diffSha256': hashlib.sha256(diff.encode()).hexdigest(), 'status': status}
@@ -1113,7 +1123,7 @@ def main(argv=None):
         if before['dirty'] and not args.experimental:
             fail('a HIL record needs a clean tree (commit first), or --experimental', dirty=before['status'])
         untracked = [ln[3:] for ln in before['status'].splitlines() if ln.startswith('?? ') and
-                     ln[3:].startswith(SOURCE_DIRS)]
+                     (core_mode() or ln[3:].startswith(SOURCE_DIRS))]   # a core's whole tree is its source
         if untracked:
             fail(f'untracked source would be missing from the record patch: {untracked}')
         stale = submodule_problems(before)
@@ -1165,7 +1175,8 @@ def main(argv=None):
     first = (errors or failed or [{}])[0]
     out = {
         'version': SCHEMA, 'pass': not errors and not failed and not record_error and not sel['uncovered'],
-        'input': {k: before[k] for k in ('head', 'dirty', 'submodules') if k in before}, 'narrowed': narrowed, 'boards': rows, 'tests': tests,
+        'input': {k: before[k] for k in ('head', 'dirty', 'submodules') if k in before}, 'narrowed': narrowed,
+        'boards': rows, 'tests': tests,
         'paths': sel['paths'], 'uncovered': sel['uncovered'],
         'dependencies': list(deps.values()),
         'nothingToBuild': not rows and not tests,

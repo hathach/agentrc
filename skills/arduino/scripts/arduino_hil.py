@@ -210,7 +210,7 @@ def verify_staged(manifest_path):
 def git_identity():
     def git(*a):
         return subprocess.run(['git', '-C', str(P.ROOT), *a], capture_output=True, text=True).stdout
-    return git('rev-parse', 'HEAD').strip(), git('status', '--porcelain', '--untracked-files=all').strip()
+    return git('rev-parse', 'HEAD').strip(), git(*B.status_args()).strip()
 
 
 def record_problems(rec, board, head, experimental_ok, where):

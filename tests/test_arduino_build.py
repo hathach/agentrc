@@ -937,9 +937,16 @@ class Core(Lib):
     def fake_compile(self, platform=None, used=()):
         platform = str(self.root) if platform is None else platform
         out = {'success': True, 'builder_result': {
-            'used_libraries': list(used), 'board_platform': {'id': 'fake:core', 'version': '1.0.0', 'install_dir': platform},
+            'used_libraries': list(used),
+            'board_platform': {'id': 'fake:core', 'version': '1.0.0', 'install_dir': platform},
             'build_platform': {'id': 'fake:core', 'install_dir': platform}}}
         return mock.Mock(returncode=0, stdout=json.dumps(out), stderr='')
+
+    def core_roster(self):
+        roster = self.root / 'test/hil/ci.json'
+        roster.write_text(json.dumps({'boards': [{'name': 'rig_m4', 'uid': 'U', 'flasher': {
+            'name': 'jlink', 'uid': '1', 'args': '-device X'}, 'arduino': {'tests': ['cdc']}}]}))
+        return roster
 
     def compile(self, proc, example='libraries/Wire/examples/scan', board='m4', prepared=None):
         with mock.patch.object(ab.subprocess, 'run', return_value=proc) as run:
@@ -1056,7 +1063,8 @@ class Core(Lib):
 
     def test_submodules_bind_at_their_gitlinks_clean(self):
         ident = {'status': ' M libraries/USB\n', 'submodules': [
-            {'path': 'libraries/USB', 'commit': 'a', 'state': ' '}, {'path': 'libraries/Z', 'commit': 'b', 'state': '-'},
+            {'path': 'libraries/USB', 'commit': 'a', 'state': ' '},
+            {'path': 'libraries/Z', 'commit': 'b', 'state': '-'},
             {'path': 'libraries/Y', 'commit': 'c', 'state': '+'}]}
         self.assertEqual(ab.submodule_problems(ident), ['libraries/Z is not initialised',
                                                         'libraries/Y is not at its gitlink',
@@ -1064,9 +1072,7 @@ class Core(Lib):
         self.assertEqual(ab.submodule_problems({'status': '', 'submodules': ident['submodules'][:1]}), [])
 
     def test_record_refused_unless_submodules_are_at_their_gitlinks(self):
-        roster = self.root / 'test/hil/ci.json'
-        roster.write_text(json.dumps({'boards': [{'name': 'rig_m4', 'uid': 'U', 'flasher': {
-            'name': 'jlink', 'uid': '1', 'args': '-device X'}, 'arduino': {'tests': ['cdc']}}]}))
+        roster = self.core_roster()
         ident = {'head': 'abc', 'dirty': False, 'diffSha256': 'd', 'status': '',
                  'submodules': [{'path': 'libraries/USB', 'commit': 'a', 'state': '-'}]}
         self.patch(ab, 'source_identity', lambda: (ident, ''))
@@ -1077,6 +1083,54 @@ class Core(Lib):
                                            str(self.root / 'build/hil/rig_m4.build.json'), *extra])
                 self.assertEqual(code, 2)
                 self.assertIn('libraries/USB is not initialised', out['error'])
+
+    def test_a_dirty_submodule_counts_whatever_its_ignore_setting(self):
+        env = git_env(GIT_CONFIG_COUNT='1', GIT_CONFIG_KEY_0='protocol.file.allow', GIT_CONFIG_VALUE_0='always')
+        environ = mock.patch.dict(os.environ, env, clear=True)   # the engine's own git runs inherit it
+        environ.start()
+        self.addCleanup(environ.stop)
+
+        def git(where, *a):
+            subprocess.run(['git', '-C', str(where), *a], check=True, capture_output=True, env=env)
+        sub = self.tmp / 'usb_upstream'
+        shutil.copytree(self.root / 'libraries/USB', sub)
+        git(sub, 'init', '-q', '-b', 'main')
+        git(sub, 'add', '-A')
+        git(sub, 'commit', '-qm', 'usb')
+        shutil.rmtree(self.root / 'libraries/USB')
+        git(self.root, 'init', '-q', '-b', 'main')
+        git(self.root, 'submodule', '-q', 'add', str(sub), 'libraries/USB')
+        git(self.root, 'add', '-A')
+        git(self.root, 'commit', '-qm', 'core')
+        git(self.root, 'config', 'submodule.libraries/USB.ignore', 'dirty')
+        ident, _ = ab.source_identity()
+        self.assertEqual((ident['dirty'], ab.submodule_problems(ident)), (False, []))
+        (self.root / 'libraries/USB/library.properties').write_text('name=Fake USB\n# edited\n')
+        ident, _ = ab.source_identity()
+        self.assertTrue(ident['dirty'])
+        self.assertEqual(ab.submodule_problems(ident), ['libraries/USB has changes'])
+
+    def test_a_core_record_refuses_any_untracked_file(self):
+        self.patch(ab, 'source_identity', lambda: ({'head': 'abc', 'dirty': True, 'diffSha256': 'd',
+                                                    'status': '?? variants/new/variant.h\n', 'submodules': []}, ''))
+        self.patch(ab, 'build_all', mock.Mock(side_effect=AssertionError('compiled')))
+        code, out = self.run_main(['--board', 'rig_m4', '--shared', '--hil-config', str(self.core_roster()), '--record',
+                                   str(self.root / 'build/hil/r.json'), '--experimental'])
+        self.assertEqual(code, 2)
+        self.assertIn('variants/new/variant.h', out['error'])
+
+    def test_a_header_from_another_copy_of_the_core_fails_the_sketch(self):
+        other = self.tmp / 'other_core'
+        shutil.copytree(self.root, other)
+        build = self.root / 'b'
+
+        def run(cmd, **kw):   # the compile leaves a .d naming the other copy's (identical) header
+            (build / 'main.cpp.d').write_text(f'main.cpp.o: {other}/cores/fake/main.cpp\n')
+            return self.fake_compile()
+        with mock.patch.object(ab.subprocess, 'run', side_effect=run):
+            row = ab.compile_sketch('m4', 'libraries/Wire/examples/scan', build, [], {}, self.tmp / 'cli.yaml')
+        self.assertEqual(row['status'], 'failed')
+        self.assertIn('another copy of the core', row['firstError'])
 
     def test_submodule_status_is_parsed_recursively(self):
         out = (' 3e5369cd libraries/USB (3.7.3)\n-5b48867c libraries/Z\n+0123abcd libraries/USB/lib/x (v1)\n')
