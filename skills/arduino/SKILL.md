@@ -1,6 +1,6 @@
 ---
 name: arduino
-description: Shared mechanics of an Arduino library's build and HIL contracts (Adafruit TinyUSB Arduino, Adafruit SPIFlash) - arduino-cli builds against the checkout, prepared dependencies, the HIL build record, the HIL harness and its remote runs. Use when a library's build or HIL contract names it, when adding agent build/HIL support to another Arduino library, or when a record, dependency or identity refusal from one of those contracts needs explaining.
+description: Shared mechanics of an Arduino library's build and HIL contracts (Adafruit TinyUSB Arduino, Adafruit SPIFlash) - arduino-cli builds against the checkout, prepared dependencies, the HIL build record, the HIL harness and its remote runs. Use when a library's build or HIL contract names it, when adding agent build/HIL support to another Arduino library, or when a record, dependency or identity refusal from one of those contracts needs explaining; also before changing those libraries' C/C++ (format rules).
 ---
 
 # arduino — the shared Arduino library contract mechanics
@@ -73,6 +73,19 @@ retries, recovery) apply unchanged; these scripts load its `hil_*` scripts throu
   `hil` skill) and records unproven children under the one pending kind `arduino-hil`, so two libraries, and tinyusb
   or tinyuf2, exclude each other on a shared board, and one library's leftover children block the others.
 
+## Code format
+
+- The library's `.pre-commit-config.yaml` is authoritative: its clang-format hook (v15) on C, C++ and headers minus
+  the hook's `exclude` list; CI runs the same hook. Format through it, never a `clang-format` from `PATH` (another
+  version formats differently): `pre-commit run --files <changed files>` rewrites them in place and reports failed
+  when it changed any; read the rewrite.
+- Neither library has a `.clang-format`, so clang-format falls back to LLVM style; never add one or copy tinyusb's.
+  clang-format takes the first `.clang-format` above the file, so format only in a checkout with none above its root
+  (`~/Arduino/libraries/<lib>`, its `.worktrees/`): one nested under tinyusb or a core's `libraries/` (arduino-esp32
+  has its own) formats in that tree's style, and v15 cannot parse tinyusb's file.
+- TinyUSB Arduino's vendored TinyUSB (the paths its `CLAUDE.md` names) keeps tinyusb's format: fix it in
+  hathach/tinyusb under tinyusb's `.clang-format`, then copy it back as that `CLAUDE.md` says.
+
 ## Adding a library
 
 1. Copy `agentrc_pin.py` from a library that has it, changing only its cache namespace, and pin a commit of this
@@ -88,4 +101,5 @@ retries, recovery) apply unchanged; these scripts load its `hil_*` scripts throu
 4. Add the boards to `test/hil/ci.json`, commission each (`hil_test.py commission` on the board's host), run the
    battery on the farm (`hil_remote.py run`), and record what no board covers as the contract's Limits.
 5. Contract tests for the profile in `.claude/test/`, a pre-commit hook running `agentrc_pin.py test` (the installed
-   agentrc locally, the pin in CI), and a `CLAUDE.md` naming the build and HIL contracts.
+   agentrc locally, the pin in CI) beside the clang-format hook (Code format), and a `CLAUDE.md` naming the build and
+   HIL contracts.
