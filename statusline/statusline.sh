@@ -3,10 +3,11 @@
 #   grey   hostname            (short form)
 #   blue   working dir         ($HOME shown as ~)
 #   dim    email domain · model · effort · context %
-#   usage  session / week(all) / week(Fable)  from /api/oauth/usage; a limit the account lacks is omitted
+#   usage  session / week(all) / week(Fable)  from /api/oauth/usage; a limit its list lacks is omitted,
+#          a raw window it lacks shows ?
 #   $      extra-usage credits spent (after the weekly reset)
 #   C      Codex week, from the codex app-server (account/rateLimits/read)
-#   ↻      reset time, local, short form (HH:MM today, else "MonDD HH:MM");
+#   ↻      reset time, local, short form (HH:MM today, else "MonDD HH:MM"), none once past;
 #          one after the session %, one after the Claude weekly %s, one after the Codex %
 #   #N     open PRs this session linked, newest first, by check state: ✓ passed, ● running, ✗ failed, ? unknown
 #
@@ -85,9 +86,10 @@ if [ -f "$cx_fetch" ] && command -v codex >/dev/null 2>&1 \
 fi
 
 # ---- one python3 reads the status-line JSON input, the account's org and both usage caches, a field per line ----
-# The input's rate_limits.seven_day is the authoritative weekly window (fresh, no rate-limit), so its reset wins
-# over the cache's. org from oauthAccount: config-dir-local first, then ~/.claude.json for the default dir only
-# (each config dir is a different account; do NOT cross-fall-back into the other).
+# The input's rate_limits windows are authoritative (fresh, no rate-limit): its seven_day reset wins over the
+# cache's, and its five_hour gives the session % with its reset. org from oauthAccount: config-dir-local first,
+# then ~/.claude.json for the default dir only (each config dir is a different account; do NOT cross-fall-back
+# into the other).
 accounts=("$CFG/.claude.json")
 { [ "$CFG" = "$HOME/.claude" ] || [ "$CFG" -ef "$HOME/.claude" ]; } && accounts+=("$HOME/.claude.json")
 fields=$(printf '%s' "$input" | python3 -c '
@@ -106,10 +108,11 @@ def guard(f, *a, default=""):  # a malformed section renders as absent and leave
 def pct(lbl, p):  # green <50%, yellow <80%, red >=80%; None: the window is missing from the payload, not unused
     if p is None: return LBL+lbl+R+"\033[92m?"+R
     return LBL+lbl+R+("\033[91m" if p>=80 else ("\033[93m" if p>=50 else "\033[92m"))+str(round(p))+"%"+R
-def when(v, parse):  # local short form: today -> HH:MM, else "Jul29 HH:MM"
+def when(v, parse):  # local short form: today -> HH:MM, else "Jul29 HH:MM"; a past one (stale cache) -> ""
     try:
-        t=parse(v).astimezone()
-        return t.strftime("%H:%M" if t.date()==datetime.datetime.now().astimezone().date() else "%b%d %H:%M")
+        t=parse(v).astimezone(); now=datetime.datetime.now().astimezone()
+        if t<now: return ""
+        return t.strftime("%H:%M" if t.date()==now.date() else "%b%d %H:%M")
     except Exception: return ""
 epoch=datetime.datetime.fromtimestamp; iso=datetime.datetime.fromisoformat
 def reset_tag(rs): return " \033[33m↻"+rs+R if rs else ""
@@ -125,25 +128,27 @@ def codex(d):
     if not isinstance(p,(int,float)): return ""
     rs=when(d.get("resets_at"),epoch)
     return pct("C",p)+reset_tag(rs)
-def usage(d, sess_epoch, week_epoch):  # session / week(all) / week(Fable) percentages, and the weekly reset
+def usage(d, sess_in, week_epoch):  # session / week(all) / week(Fable) percentages, and the weekly reset
     if not isinstance(d,dict) or d.get("error"): return "",when(week_epoch,epoch)  # error/rate-limit body
-    lims={}; resets={}; listed=bool(d.get("limits"))
-    if listed:  # every limit the account has: a kind it does not list is not shown
-        kinds={"session":"sess","weekly":"week","weekly_all":"week","weekly_scoped":"fable"}
-        for l in d["limits"]:
-            k=kinds.get(l.get("kind"))
-            if k: lims[k]=l.get("percent"); resets[k]=l.get("resets_at") or resets.get(k)
-    else:  # fallbacks to the raw window objects
+    lims={}; resets={}
+    kinds={"session":"sess","weekly":"week","weekly_all":"week","weekly_scoped":"fable"}
+    for l in (d.get("limits") or []):  # every limit the account has: a kind it does not list is not shown
+        k=kinds.get(l.get("kind"))
+        if k: lims[k]=l.get("percent"); resets[k]=l.get("resets_at") or resets.get(k)
+    if not lims:  # no kind it knows is listed -> fallbacks to the raw window objects
         for k,w in (("sess","five_hour"),("week","seven_day"),("fable","seven_day_opus")):
             lims[k]=get(d,w,"utilization"); resets[k]=get(d,w,"resets_at")
-    if not listed and all(p is None for p in lims.values()):
-        return "",when(week_epoch,epoch)  # nothing usable -> render nothing rather than a fake 0%/0%/0%
+        if all(p is None for p in lims.values()):
+            return "",when(week_epoch,epoch)  # nothing usable -> render nothing rather than a fake 0%/0%/0%
     weekly=" ".join(pct(lbl,lims[k]) for k,lbl in (("week","w"),("fable","F")) if k in lims)
     groups=[weekly]
-    if "sess" in lims:
-        groups.insert(0, pct("s",lims["sess"])+reset_tag(when(sess_epoch,epoch) or when(resets["sess"],iso)))
+    if "sess" in lims:  # % and reset from one source: a cached % may predate the live window
+        p=get(sess_in,"used_percentage"); live=isinstance(p,(int,float))
+        rs=when(get(sess_in,"resets_at"),epoch) if live else when(resets["sess"],iso)
+        groups.insert(0, pct("s",p if live else lims["sess"])+reset_tag(rs))
     # weekly reset ONLY: the input -> weekly_all -> seven_day window -> Fable-scoped weekly
-    reset=when(week_epoch,epoch) or when(resets.get("week") or get(d,"seven_day","resets_at") or resets.get("fable"),iso)
+    reset=(when(week_epoch,epoch) or when(resets.get("week"),iso) or when(get(d,"seven_day","resets_at"),iso)
+           or when(resets.get("fable"),iso))
     return ("\033[90m/"+R+" ").join(g for g in groups if g), reset if weekly else ""
 def credits(d):  # extra-usage credits already spent; minor units -> "$31.54"
     sp=d.get("spend") or {}
@@ -161,7 +166,7 @@ try: d=json.load(sys.stdin)
 except Exception: d={}
 cache=load(sys.argv[1])
 week_epoch=get(d,"rate_limits","seven_day","resets_at")
-use, reset=guard(usage, cache, get(d,"rate_limits","five_hour","resets_at"), week_epoch,
+use, reset=guard(usage, cache, get(d,"rate_limits","five_hour"), week_epoch,
                  default=("",when(week_epoch,epoch)))
 print(get(d,"workspace","current_dir") or "")
 print(get(d,"session_id") or "")

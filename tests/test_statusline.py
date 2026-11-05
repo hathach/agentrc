@@ -263,30 +263,64 @@ class UsageTest(unittest.TestCase):
                 self.assertRegex(shown_line, ' ' + re.escape(shown) + r'(?= ↻| \$|/|$)')  # reset, credits, codex/PRs
                 self.assertNotIn('/ ' + shown, shown_line, 'a limit the account lacks shows nothing')
 
-    def test_the_session_reset_follows_the_session_and_the_inputs_wins(self):
+    def test_the_session_percent_and_reset_come_from_one_source_and_the_inputs_wins(self):
         cache_reset = datetime.datetime(2030, 2, 3, 9, 30).astimezone().isoformat()
-        five_hour = {'resets_at': datetime.datetime(2030, 1, 2, 12, 0).timestamp()}
+        live_reset = datetime.datetime(2030, 1, 2, 12, 0).timestamp()
         for cache in ({'limits': [{'kind': 'session', 'percent': 79, 'resets_at': cache_reset},
                                   {'kind': 'weekly_all', 'percent': 5}]},
                       {'five_hour': {'utilization': 79, 'resets_at': cache_reset}, 'seven_day': {'utilization': 5}}):
-            with self.subTest(cache=cache):
-                (self.cfg / 'statusline-usage.json').write_text(json.dumps(cache))
-                self.assertIn(' s79% ↻Feb03 09:30/ w5%', self.render())
-                self.assertIn(' s79% ↻Jan02 12:00/ w5%',
-                              self.render(payload=json.dumps({'rate_limits': {'five_hour': five_hour}})))
+            (self.cfg / 'statusline-usage.json').write_text(json.dumps(cache))
+            for five_hour, shown in ((None, ' s79% ↻Feb03 09:30/ w5%'),
+                                     ({'resets_at': live_reset}, ' s79% ↻Feb03 09:30/ w5%'),
+                                     ({'used_percentage': 12, 'resets_at': live_reset}, ' s12% ↻Jan02 12:00/ w5%'),
+                                     ({'used_percentage': 12}, ' s12%/ w5%')):
+                with self.subTest(cache=cache, five_hour=five_hour):
+                    payload = {'rate_limits': {'five_hour': five_hour}} if five_hour else {}
+                    self.assertIn(shown, self.render(payload=json.dumps(payload)))
+
+    def test_a_past_reset_is_not_shown(self):
+        past = (datetime.datetime.now() - datetime.timedelta(hours=1)).astimezone().isoformat()
+        (self.cfg / 'statusline-usage.json').write_text(json.dumps({
+            'limits': [{'kind': 'session', 'percent': 90, 'resets_at': past},
+                       {'kind': 'weekly_all', 'percent': 5, 'resets_at': past}]}))
+        shown = self.render()
+        self.assertIn(' s90%/ w5%', shown)
+        self.assertNotIn('↻', shown)
 
     def test_the_weekly_reset_keeps_its_precedence_and_needs_a_weekly_limit(self):
-        week, scoped = (datetime.datetime(2030, 2, d, 9, 30).astimezone().isoformat() for d in (3, 4))
-        (self.cfg / 'statusline-usage.json').write_text(json.dumps({
-            'limits': [{'kind': 'weekly_all', 'percent': 5}, {'kind': 'weekly_scoped', 'percent': 1, 'resets_at': scoped}],
-            'seven_day': {'resets_at': week}}))
-        self.assertIn(' w5% F1% ↻Feb03 09:30', self.render())
+        week, scoped, week_all = (datetime.datetime(2030, 2, d, 9, 30).astimezone().isoformat() for d in (3, 4, 5))
+        for week_all_reset, shown in ((None, '↻Feb03'), (week_all, '↻Feb05'), ('garbage', '↻Feb03')):
+            with self.subTest(week_all_reset=week_all_reset):  # an unparseable reset falls back to the next source
+                (self.cfg / 'statusline-usage.json').write_text(json.dumps({
+                    'limits': [{'kind': 'weekly_all', 'percent': 5, 'resets_at': week_all_reset},
+                               {'kind': 'weekly_scoped', 'percent': 1, 'resets_at': scoped}],
+                    'seven_day': {'resets_at': week}}))
+                self.assertIn(' w5% F1% ' + shown + ' 09:30', self.render())
         (self.cfg / 'statusline-usage.json').write_text(json.dumps({
             'limits': [{'kind': 'session', 'percent': 20, 'resets_at': week}]}))
         payload = {'rate_limits': {'seven_day': {'resets_at': datetime.datetime(2030, 1, 2, 12, 0).timestamp()}}}
         shown = self.render(payload=json.dumps(payload))
         self.assertIn(' s20% ↻Feb03 09:30', shown)
-        self.assertNotIn('Jan02', shown, 'no weekly limit shown, so no weekly reset')
+        self.assertEqual(shown.count('↻'), 1, 'no weekly limit shown, so no weekly reset')
+
+    def test_without_a_known_listed_limit_the_inputs_weekly_reset_still_shows(self):
+        cache_reset = datetime.datetime(2030, 2, 3, 9, 30).astimezone().isoformat()
+        unknown = {'limits': [{'kind': 'five_hour', 'percent': 40}]}
+        payload = json.dumps({'rate_limits': {'seven_day': {
+            'resets_at': datetime.datetime(2030, 1, 2, 12, 0).timestamp()}}})
+        placeholder = ' s?/ w? F? ↻Jan02 12:00'
+        raw = {**unknown, 'five_hour': {'utilization': 40}, 'seven_day': {'utilization': 10, 'resets_at': cache_reset}}
+        for cache, shown in ((raw, ' s40%/ w10% F? ↻Jan02 12:00'),
+                             (unknown, placeholder),
+                             ({'error': {'type': 'rate_limit_error'}, 'seven_day': {'utilization': 10}}, placeholder),
+                             (None, placeholder)):
+            with self.subTest(cache=cache):
+                path = self.cfg / 'statusline-usage.json'
+                if cache:
+                    path.write_text(json.dumps(cache))
+                else:
+                    path.unlink(missing_ok=True)
+                self.assertIn(shown, self.render(payload=payload))
 
     def test_crlf_line_ends_from_python_leave_empty_fields_empty(self):
         site = self.home / 'site'
