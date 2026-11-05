@@ -839,6 +839,15 @@ class BaseRecord(RecordCase):
                 _, err = self.record(self.samd_row())
                 self.assertIn(why, err)
 
+    def test_a_base_with_nothing_to_verify_is_refused(self):
+        self.base(('uicr.hex', (0x10001014, bytes(8))), exclude=((0x10001000, 0x10002000),))   # all excluded
+        _, err = self.record(self.samd_row())
+        self.assertIn('uicr.hex: no runs outside the excluded ranges', err)
+        (self.root / 'eof.hex').write_text(':00000001FF\n')
+        self.P.BOARDS['rig_jlink'].update(base=('eof.hex',), base_exclude=())
+        _, err = self.record(self.samd_row())
+        self.assertIn('eof.hex: no runs outside the excluded ranges', err)
+
     def test_a_base_is_written_through_jlink_only(self):
         self.base(('sd.hex', (0x1000, bytes(32))))
         self.flasher({'name': 'openocd', 'uid': 'E66'})

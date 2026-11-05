@@ -802,6 +802,11 @@ class BaseImage(Base):
         with self.assertRaisesRegex(H.Refused, r"is not the profile's \[\]: rebuild it"):
             self.admit(rec)
 
+    def test_admission_refuses_a_base_with_nothing_to_verify(self):
+        (self.root / 'sd.hex').write_text(':00000001FF\n')   # EOF only; uicr.hex's run is all excluded
+        with self.assertRaisesRegex(H.Refused, 'base image: sd.hex, uicr.hex: no runs outside the excluded ranges'):
+            self.admit(self.base_record(segments=[]))
+
     def sessions(self, *problems):
         """run_jlink_commands' scripts, each session judged by the next of `problems`."""
         self.A.flash.jlink_problem.side_effect = list(problems)
@@ -820,7 +825,7 @@ class BaseImage(Base):
         base, scripts = self.base(), self.sessions('stopped', '')
         self.A.flash.jlink_verify_differs.return_value = 'verifybin b-1000.bin,0x1000'
         self.assertEqual(H.ensure_base(self.flasher, base, self.dir, mock.Mock()), '')
-        self.assertEqual(scripts()[1], ['halt', 'loadfile b.hex', 'verifybin b-1000.bin,0x1000'])
+        self.assertEqual(scripts()[1], ['halt', 'loadfile b.hex 0 noreset', 'verifybin b-1000.bin,0x1000'])
         self.assertEqual(base['state'], 'rewritten: the run at 0x1000 differed')
         self.sessions('stopped', 'loadfile failed')
         self.assertEqual(H.ensure_base(self.flasher, self.base(), self.dir, mock.Mock()),

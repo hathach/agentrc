@@ -462,7 +462,9 @@ def ensure_base(flasher, base, run_dir, tracker):
     if not differs:
         return f'base check: {why} (nothing written)'
     at = differs.rsplit(',', 1)[1]
-    op = jlink_session(flasher, ['halt', f'loadfile {base["hex"]}', *verify], run_dir, tracker)
+    # loadfile resets the target unless told noreset, which needs the address its .hex form ignores (J-Link
+    # Commander, LoadFile)
+    op = jlink_session(flasher, ['halt', f'loadfile {base["hex"]} 0 noreset', *verify], run_dir, tracker)
     why = A.flash.jlink_problem(op)
     if why:
         return f'base rewrite after the run at {at} differed: {why}'

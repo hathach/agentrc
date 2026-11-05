@@ -890,8 +890,8 @@ def write_hex(runs, path):
 
 def base_runs(board, root=None):
     """([(start, bytes)] of the board's base HEX files (BOARDS `base`) outside its `base_exclude` ranges, sorted, or
-    None (no base), and '' or why they cannot be a base: a run partly excluded, two runs overlapping or one inside the
-    board's span, where its sketches load."""
+    None (no base), and '' or why they cannot be a base: no run outside the excluded ranges, a run partly excluded, two
+    runs overlapping or one inside the board's span, where its sketches load."""
     files = P.BOARDS[board].get('base')
     if not files:
         return None, ''
@@ -908,6 +908,8 @@ def base_runs(board, root=None):
             if start < hi and lo < end:
                 return None, f'{f}: [{start:#x}, {end:#x}) overlaps the board span [{lo:#x}, {hi:#x})'
             runs.append((start, data))
+    if not any(data for _, data in runs):   # nothing to verify would pass as matched
+        return None, f'{", ".join(files)}: no runs outside the excluded ranges'
     runs.sort()
     for (a, da), (b, _) in zip(runs, runs[1:]):
         if a + len(da) > b:
