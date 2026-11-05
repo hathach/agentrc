@@ -76,6 +76,9 @@ SCRIPTS = {
     'once': 'if [ ! -e "$ONCE" ]; then : > "$ONCE"; : > b.txt; fi; echo "no compiler"; exit 1\n',
     # Prints, after a blank line, a line shaped as pre-commit's next result, then what only the change brings in.
     'mimic': f'printf "no compiler\\n\\nReport{"." * 67}Passed\\n"; grep -q edited "$@" && echo "a.txt: new"; exit 1\n',
+    # The same with a `- hook id:` line under it, as pre-commit prints a block under its result.
+    'header': f'printf "no compiler\\nReport{"." * 67}Passed\\n- hook id: nested\\n\\n"; '
+              'grep -q edited "$@" && echo "a.txt: new"; exit 1\n',
 }
 
 
@@ -455,6 +458,29 @@ class HooksTest(unittest.TestCase):
         self.assertEqual((code, out['passed']), (0, False))
         self.assertEqual(out['failed'], [{'hook': 'mimic', 'error': 'no compiler'}])
         self.assertEqual(out['baselineFailed'], [])
+
+    def test_what_a_hook_prints_after_a_block_of_its_own_is_compared_with_head(self):
+        self.configure('header', 'ok')
+        (self.repo / 'a.txt').write_text('edited\n')
+        code, out = self.run_script('a.txt')
+        self.assertEqual((code, out['passed']), (0, False))
+        self.assertEqual(out['failed'], [{'hook': 'header', 'error': 'no compiler'}])
+        self.assertEqual(out['baselineFailed'], [])
+
+    def test_a_verbose_hook_after_a_failure_ends_its_output_skipped_or_not(self):
+        # pre-commit prints a verbose hook's `- hook id:` under its Skipped result too: no output of broken's.
+        ok = HOOK.format(id='ok') + '    verbose: true\n'
+        for case, hook, env in (('no files', ok.replace('\\.txt$', '\\.none$'), {}), ('SKIP', ok, {'SKIP': 'ok'}),
+                                ('passed', ok, {})):
+            with self.subTest(case):
+                (self.repo / 'a.txt').write_text('a\n')
+                (self.repo / '.pre-commit-config.yaml').write_text(CONFIG.format(HOOK.format(id='broken') + hook))
+                self.git('add', '-A')
+                self.git('commit', '-qm', case, '--allow-empty')
+                (self.repo / 'a.txt').write_text('edited\n')
+                code, out = self.run_script('a.txt', env={**self.env, **env})
+                self.assertEqual((code, out['failed']), (0, [{'hook': 'broken', 'error': 'nope'}]))
+                self.assertEqual(out['baselineFailed'], ['broken'])
 
     def test_a_hook_head_does_not_configure_is_never_excused_by_it(self):
         # pre-commit refusing an unknown id exits 1 on HEAD, but that is not the hook failing there.
@@ -1005,6 +1031,28 @@ class ResultsTest(unittest.TestCase):
                f'doc{"." * 50}(no files to check)Skipped\ncut{"." * 70}Failed\n- hook id: cut\n- exit code: 1\n')
         self.assertEqual([f['output'] for f in hooks.results(out, 1)[1]],
                          [f'- exit code: 1\n\n{said}', '- exit code: 1'])
+
+    def test_a_result_line_and_block_the_hook_printed_are_its_output_too(self):
+        # A result line ends the output only below the blank line under its last line, with a block pre-commit
+        # prints under that result and all that follows in pre-commit's shape.
+        for said in (f'x.c:1: bad\nReport{"." * 67}Passed\n- hook id: nested\n- duration: 0.1s\n\nx.c:2: new',
+                     f'x.c:1: bad\n\nReport{"." * 67}Passed\n- hook id: nested\n\nx.c:2: new',
+                     f'x.c:1: bad\n\nReport{"." * 67}Failed\n- hook id: nested\n\nx.c:2: new',
+                     f'x.c:1: bad\n\nReport{"." * 60}Skipped\n- hook id: nested\n\nx.c:2: new',
+                     f'x.c:1: bad\n\nReport{"." * 60}Skipped\n\nx.c:2: new'):
+            with self.subTest(said):
+                out = f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n\n{said}\n\ngen{"." * 70}Passed\n'
+                self.assertEqual(hooks.results(out, 1)[1][0]['output'], f'- exit code: 1\n\n{said}')
+
+    def test_a_verbose_block_under_the_next_result_ends_the_output(self):
+        for after in (f'ok{"." * 51}(no files to check)Skipped\n- hook id: ok\n',
+                      f'ok{"." * 70}Skipped\n- hook id: ok\n',
+                      f'ok{"." * 71}Passed\n- hook id: ok\n- duration: 0s\n\nall good\n\n',
+                      f'ok{"." * 71}Failed\n- hook id: ok\n- duration: 0.02s\n- exit code: 1\n'
+                      '- files were modified by this hook\n'):
+            with self.subTest(after):
+                out = f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n\nx.c:1: bad\n\n{after}'
+                self.assertEqual(hooks.results(out, 1)[1][0]['output'], '- exit code: 1\n\nx.c:1: bad')
 
     def test_terminal_escapes_and_control_characters_never_reach_the_error(self):
         out = f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n\n\x1b[31m\x1b[0m\n\x1b[31merror:\x07\tbad\x1b[0m\n'

@@ -90,8 +90,15 @@ MODIFIED = '- files were modified by this hook'
 # pre-commit pads a hook's name with dots to its result, then prints the
 # hook's `- ` block only when it failed or runs verbose (commands/run.py).
 RESULT = re.compile(r'\.(Passed|Failed)$')
-# Any hook's result line, `(no files to check)Skipped` included: where the hook output above it ends.
+# Any hook's result line, `(no files to check)Skipped` included.
 NEXT = re.compile(r'[.)](Passed|Failed|Skipped)$')
+# The `- ` block pre-commit prints under each result when it prints one (commands/run.py _run_single_hook): the hook
+# id, the duration when it ran verbose, its exit code when not 0, and the modified-files line.
+BLOCKS = {'Skipped': re.compile(r'- hook id: .+'),
+          'Passed': re.compile(r'- hook id: .+\n- duration: [\d.]+s'),
+          'Failed': re.compile(r'- hook id: .+(?:\n- duration: [\d.]+s)?'
+                               r'(?:\n- exit code: -?\d+(?:\n- files were modified by this hook)?'
+                               r'|\n- files were modified by this hook)')}
 ERROR_CHARS = 200
 # Seconds past the deadline the HEAD worktree's removal may take.
 CLEANUP = 20
@@ -156,15 +163,41 @@ def width(line):
     return sum(2 if unicodedata.east_asian_width(c) in 'FW' else 1 for c in line)
 
 
-def printed(lines, cols):
-    """What the hook printed: lines, all from its `- ` block to the next block's result line, less the result lines
-    ending them. pre-commit ends a hook's output with a blank line and pads every result line to one width, cols, so
-    only the run of those below that blank line is its own; a result-like line above it, after a blank line or not,
-    the hook printed."""
+def own_runs(lines, cols):
+    """The indexes from which the rest of lines can be pre-commit's own output, len(lines) included: a result line
+    padded to cols, the block BLOCKS allows under it, then the end, the next such run, or, under a block not a
+    Skipped one, a blank line and what the hook printed, which may be anything (commands/run.py _run_single_hook)."""
     n = len(lines)
-    while n and NEXT.search(lines[n - 1]) and width(lines[n - 1]) == cols:
-        n -= 1
-    return lines[:n]
+    starts = {n}
+    for j in range(n - 1, -1, -1):
+        found = NEXT.search(lines[j])
+        if not found or width(lines[j]) != cols:
+            continue
+        k = j + 1
+        while k < n and lines[k].startswith('- '):
+            k += 1
+        status, block = found[1], '\n'.join(lines[j + 1:k])
+        shaped = BLOCKS[status].fullmatch(block) if block else status != 'Failed'
+        # pre-commit prints a hook's output stripped, so its first line is never blank.
+        if shaped and (k in starts or block and status != 'Skipped' and not lines[k] and k + 1 < n
+                       and lines[k + 1].strip()):
+            starts.add(j)
+    return starts
+
+
+def printed(lines, k, starts):
+    """What the hook whose `- ` block ends above lines[k] printed, from the blank line pre-commit puts first: up to
+    the blank line pre-commit ends it with, under its last line, above the first own run (starts) to follow such
+    a pair; else to the end. A result-shaped line or block the hook printed itself ends nothing unless all that
+    follows it reads as pre-commit's, and lines in no shape pre-commit prints are all kept: a cut output can excuse a
+    hook, a long one only fails to."""
+    if k in starts:
+        return []
+    if lines[k]:
+        return lines[k:]
+    n = len(lines)
+    end = min(m for m in starts if m == n or m > k + 1 and not lines[m - 1] and lines[m - 2].strip())
+    return lines[k:end - (end < n)]
 
 
 def first_error(lines, block):
@@ -179,16 +212,17 @@ def first_error(lines, block):
 
 def results(output, exit_code):
     """(ids of the hooks whose own `- ` block says they modified files, {hook, error, output} of each failed hook,
-    output its whole `- ` block and what it printed).
+    output its whole `- ` block and what it printed, up to pre-commit's next result line).
 
     A block counts only directly under a result line; the hook's output follows
     the block after a blank line, so a marker it echoes is not read as one."""
     lines = output.splitlines()
-    heads = [i for i, line in enumerate(lines) if line.startswith(HOOK_ID) and i and RESULT.search(lines[i - 1])]
+    runs = {}
     ids, failures = [], []
-    # Each block's lines end at the next block's result line.
-    for i, end in zip(heads, [*heads[1:], len(lines) + 1]):
-        hook = lines[i][len(HOOK_ID):].strip()
+    for i, line in enumerate(lines):
+        if not (line.startswith(HOOK_ID) and i and RESULT.search(lines[i - 1])):
+            continue
+        hook = line[len(HOOK_ID):].strip()
         failed = lines[i - 1].endswith('Failed')
         block = []
         for tail in lines[i + 1:]:
@@ -204,7 +238,10 @@ def results(output, exit_code):
                 raise Unusable(f'pre-commit reported hook {hook} passed and modified files')
             ids.append(hook)
         if failed:
-            said = printed(lines[i + 1 + len(block):end - 1], width(lines[i - 1]))
+            cols = width(lines[i - 1])
+            if cols not in runs:
+                runs[cols] = own_runs(lines, cols)
+            said = printed(lines, i + 1 + len(block), runs[cols])
             failures.append({'hook': hook, 'error': first_error(said, block),
                              'output': '\n'.join([*block, *said]).rstrip()})
     return ids, failures
