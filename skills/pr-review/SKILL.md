@@ -249,17 +249,17 @@ sequence:
       answers were deferred, step 6 ends with their publication instead, since
       prepare refuses a head with a pending draft. Otherwise `prepare.py --pr N
       --recheck-from <reviewed head>` from the launcher's checkout top level,
-      with `--token <it>` when `lock.token` is set. Its scope is the repair: from
-      the reviewed head, or after a base merge from a synthetic base that leaves
+      with `--token <it>` when `lock.token` is set: its `head` other than that
+      one stops the recheck before anything is posted ("head moved after
+      repair"), and step 8 releases the lock. Its scope is the repair: from the
+      reviewed head, or after a base merge from a synthetic base that leaves
       the merge's imports out; a base merge with a conflict other than contents
       refuses, and that refusal is reported with the recheck pending; a head
-      the reviewed head is not an ancestor of takes `full`. Its `head` other
-      than the one pr-babysit left stops the recheck before anything is posted
-      ("head moved after repair"), and step 8 releases the lock. `same` with no new reply ends it; `same` with replies
-      takes a `discussion` run, pending; any other mode takes steps 1 to 4 on
-      the new head, its hardware rows from runs on that head, then `threads.py`
-      and `ledger.py show --fixable` on the reviewed head again:
-      `autoPost` true takes `post.py --auto` on the new head, else plain
+      the reviewed head is not an ancestor of takes `full`. `same` with no new
+      reply ends it; `same` with replies takes a `discussion` run, pending; any
+      other mode takes steps 1 to 4 on the new head, its hardware rows from runs
+      on that head, then `threads.py` and `ledger.py show --fixable` on the
+      reviewed head again: `autoPost` true takes `post.py --auto` on the new head, else plain
       `post.py`, naming the held findings. A blocker prepare or post names is
       reported, never worked around.
 7. Report the verdict and its reasons, the counts, coverage lost, the CI and
