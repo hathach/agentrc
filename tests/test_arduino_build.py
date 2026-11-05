@@ -864,7 +864,7 @@ class Fixture(Lib):
     def test_fixture_board_compiles_a_copy_with_the_fixture(self):
         build = self.root / 'build/hil/rig_esp/echo'
         src = ab.sketch_source('rig_esp', 'examples/Basic/echo', build)
-        self.assertEqual(src, self.root / 'build/hil/rig_esp/.sketch/echo')
+        self.assertEqual(src, self.root / 'build/hil/rig_esp/.sketch/echo/echo')
         self.assertEqual(sorted(p.name for p in src.iterdir()), ['.skip.txt', 'echo.ino', 'fixture.cpp'])
         self.assertEqual(sorted(p.name for p in (self.root / 'examples/Basic/echo').iterdir()),
                          ['.skip.txt', 'echo.ino'])   # the example untouched
@@ -999,6 +999,18 @@ class Core(Lib):
         self.assertEqual(ab.build_key('test/hil/core_cdc'), 'core_cdc')
         self.assertEqual(ab.basename_clashes({'m4': ['libraries/Wire/examples/scan', 'libraries/USB/examples/scan']}),
                          [])
+
+    def test_same_named_examples_on_a_fixture_board_compile_their_own_copies(self):
+        self.P.BOARDS['m4']['fixture'] = 'cores/fake/main.cpp'
+        examples = ('libraries/Wire/examples/scan', 'libraries/USB/examples/scan')
+        for e in examples:
+            (self.root / e / 'scan.ino').write_text(f'// {e}\n')
+        srcs =[ab.sketch_source('m4', e, self.root / 'b/m4' / ab.build_key(e)) for e in examples]
+        self.assertNotEqual(*srcs)
+        for e, src in zip(examples, srcs):
+            self.assertEqual(src.name, 'scan')   # arduino-cli needs the dir named as its .ino
+            self.assertEqual((src / 'scan.ino').read_text(), f'// {e}\n')
+            self.assertTrue((src / 'main.cpp').is_file())
 
     def test_compile_uses_the_isolated_config_and_the_sketchs_fqbn(self):
         row, cmd = self.compile(self.fake_compile(), example='test/hil/core_cdc_tusb', board='rig_m4')
@@ -1177,6 +1189,15 @@ class Core(Lib):
         self.assertEqual([c.args for c in git.call_args_list], [('submodule', 'status', '--recursive')] + [
             ('-C', d, 'status', '--porcelain', '--untracked-files=all', '--ignore-submodules=all')
             for d in ('libraries/USB', 'libraries/USB/lib/x')])
+
+    def test_a_submodule_path_keeps_its_spaces_and_parentheses(self):
+        out = (' 3e5369cd libs/my lib (v1)\n+0123abcd libs/odd (x) (heads/main)\n-5b48867c libs/new (y)\n'
+               'U0000000 libs/in conflict\n')
+        with mock.patch.object(ab, 'git', side_effect=lambda *a: out if a[0] == 'submodule' else '') as git:
+            self.assertEqual([s['path'] for s in ab.submodules()],
+                             ['libs/my lib', 'libs/odd (x)', 'libs/new (y)', 'libs/in conflict'])
+        self.assertEqual([c.args[1] for c in git.call_args_list[1:]], ['libs/my lib', 'libs/odd (x)',
+                                                                        'libs/in conflict'])
 
 
 if __name__ == '__main__':

@@ -603,11 +603,11 @@ def library_root(path, cache):
 
 def sketch_source(board, example, build_dir):
     """The sketch dir to compile: the example, or for a board with a `fixture` a copy of it beside the build dir with
-    the fixture added (examples stay untouched)."""
+    the fixture added (examples stay untouched), one per build key and named as the sketch, as arduino-cli needs."""
     fixture = P.BOARDS[board].get('fixture')
     if not fixture:
         return P.ROOT / example
-    copy = build_dir.parent / '.sketch' / Path(example).name
+    copy = build_dir.parent / '.sketch' / build_dir.name / Path(example).name
     shutil.rmtree(copy, ignore_errors=True)
     shutil.copytree(P.ROOT / example, copy)
     shutil.copy2(P.ROOT / fixture, copy / Path(fixture).name)
@@ -916,13 +916,16 @@ def submodules():
     gitlink, '-' not initialised, '+' at another commit, 'U' conflicted. A core bundles libraries this way."""
     out = []
     for line in git('submodule', 'status', '--recursive').splitlines():
-        m = re.match(r'^([ +\-U])([0-9a-f]+) (\S+)', line)
+        m = re.match(r'^([ +\-U])([0-9a-f]+) (.+)$', line)
         if m:
+            state, commit, path = m.groups()
+            if state in ' +':   # git appends ` (<describe>)` to these only; the path itself may hold spaces
+                path = re.sub(r' \([^)]*\)$', '', path)
             dirty = False
-            if m.group(1) != '-':
-                dirty = bool(git('-C', m.group(3), 'status', '--porcelain', '--untracked-files=all',
+            if state != '-':
+                dirty = bool(git('-C', path, 'status', '--porcelain', '--untracked-files=all',
                                  '--ignore-submodules=all').strip())
-            out.append({'path': m.group(3), 'commit': m.group(2), 'state': m.group(1), 'dirty': dirty})
+            out.append({'path': path, 'commit': commit, 'state': state, 'dirty': dirty})
     return out
 
 
