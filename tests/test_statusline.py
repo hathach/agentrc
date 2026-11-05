@@ -260,7 +260,7 @@ class UsageTest(unittest.TestCase):
             with self.subTest(payload=payload):
                 (self.cfg / 'statusline-usage.json').write_text(json.dumps(payload))
                 shown_line = self.render()
-                self.assertIn(' ' + shown, shown_line)
+                self.assertRegex(shown_line, ' ' + re.escape(shown) + r'(?= ↻| \$|/|$)')  # reset, credits, codex/PRs
                 self.assertNotIn('/ ' + shown, shown_line, 'a limit the account lacks shows nothing')
 
     def test_the_session_reset_follows_the_session_and_the_inputs_wins(self):
