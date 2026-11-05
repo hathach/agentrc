@@ -666,6 +666,14 @@ class Record(RecordCase):
             f: ab.sha256(self.agentrc['root'] / f) for f in self.agentrc['files']}})
         self.assertEqual(rec['agentrcSource'], {'source': 'installed', 'dirty': False})   # provenance, not compared
 
+    def test_record_takes_each_sketchs_fqbn(self):
+        rec, err = self.record(self.samd_row())
+        self.assertEqual(rec['sketches']['echo']['fqbn'], rec['fqbn'])   # a library's: the board's
+        rec, err = self.record({**self.samd_row(), 'fqbn': 'vend:arch:rig_jlink:usb=b'})
+        self.assertIsNone(err)
+        self.assertEqual((rec['fqbn'], rec['sketches']['echo']['fqbn']), ('vend:arch:rig_jlink',
+                                                                          'vend:arch:rig_jlink:usb=b'))
+
     def test_record_refused_when_agentrc_changed_after_it_was_loaded(self):
         (self.agentrc['root'] / 'skills/hil/scripts/hil_lock.py').write_text('# pulled while building\n')
         _, err = self.record(self.samd_row())
@@ -915,6 +923,168 @@ class Usage(Lib):
         self.run_main(['--board', 'dev_a', '--example', 'examples/HID/inout', '--example', 'examples/Basic/echo',
                        '--example', 'examples/HID/inout/', '--example', 'examples/Basic/echo'])
         self.assertEqual(plans, [{'dev_a': ['examples/HID/inout', 'examples/Basic/echo']}])
+
+
+class Core(Lib):
+    """Core mode: the checkout is an Arduino platform (PLATFORM), its bundled libraries' sketches the examples."""
+
+    def setUp(self):
+        super().setUp()
+        self.root = fake.core(self.tmp / 'core')
+        self.P = fake.core_profile(self.root, self.agentrc)
+        self.patch(ab, 'P', self.P)
+
+    def fake_compile(self, platform=None, used=()):
+        platform = str(self.root) if platform is None else platform
+        out = {'success': True, 'builder_result': {
+            'used_libraries': list(used), 'board_platform': {'id': 'fake:core', 'version': '1.0.0', 'install_dir': platform},
+            'build_platform': {'id': 'fake:core', 'install_dir': platform}}}
+        return mock.Mock(returncode=0, stdout=json.dumps(out), stderr='')
+
+    def compile(self, proc, example='libraries/Wire/examples/scan', board='m4', prepared=None):
+        with mock.patch.object(ab.subprocess, 'run', return_value=proc) as run:
+            row = ab.compile_sketch(board, example, self.root / 'b', [], prepared or {}, self.tmp / 'cli.yaml')
+        return row, run.call_args[0][0]
+
+    def test_sketches_are_every_ino_dir_under_the_sketch_roots(self):
+        self.assertEqual(ab.examples(), sorted(s for s in fake.CORE_SKETCHES if s.startswith('libraries/')))
+
+    def test_eligibility_takes_the_build_all_markers_and_exclude(self):
+        got = {b: [e for e in ab.examples() if ab.eligible(b, e)] for b in ('m0', 'm0_tusb', 'm4')}
+        self.assertNotIn('libraries/Wire/examples/skipped', sum(got.values(), []))     # .all.test.skip
+        self.assertEqual([b for b in got if 'libraries/Wire/examples/only' in got[b]], ['m4'])   # .m4.test.only
+        self.assertEqual([b for b in got if 'libraries/USB/examples/echo' in got[b]], ['m0_tusb'])   # exclude()
+        self.assertTrue(ab.eligible('rig_m4', 'test/hil/core_cdc'))   # a HIL sketch, its rig board only
+        self.assertFalse(ab.eligible('m4', 'test/hil/core_cdc'))
+
+    def test_selection_rules(self):
+        cases = {
+            'libraries/USB/examples/scan/scan.ino': ('example', 'libraries/USB/examples/scan'),   # before the profile
+            'libraries/USB/src/usb.cpp': ('sketches', [s for s in fake.CORE_SKETCHES if 'libraries/USB/' in s]),
+            'platform.txt': ('boards', ('m0', 'm0_tusb', 'm4')),
+            'cores/fake/main.cpp': ('shared', None),
+        }
+        for path, want in cases.items():
+            with self.subTest(path=path):
+                self.assertEqual(ab.classify(path)[:2], want)
+        sel = ab.select(['platform.txt'], roster=['rig_m4'])
+        self.assertEqual(sorted(sel['builds']), ['m0', 'm0_tusb', 'm4'])
+        self.assertIn('libraries/SDU/extras/Boot', sel['builds']['m4'])
+        self.assertEqual(sel['hil']['boards'], ['rig_m4'])   # a board of a family it reaches
+        sel = ab.select(['libraries/USB/src/usb.cpp'])
+        self.assertEqual(sel['builds'], {'m0': ['libraries/USB/examples/scan'],
+                                         'm0_tusb': ['libraries/USB/examples/echo', 'libraries/USB/examples/scan'],
+                                         'm4': ['libraries/USB/examples/scan']})
+        self.assertEqual(sel['uncovered'], [])
+        self.assertEqual(ab.uncovered_by_roster(['platform.txt'], ['rig_m4']),
+                         [{'family': 'c21', 'reason': 'no roster board of this family on this host'}])
+
+    def test_a_sketch_no_representative_builds_is_uncovered(self):
+        self.P.classify_source = lambda path: ('sketches', ['libraries/Wire/examples/skipped'], 'w')
+        self.assertEqual(ab.select(['libraries/Wire/Wire.cpp'])['uncovered'],
+                         [{'path': 'libraries/Wire/Wire.cpp',
+                           'reason': 'libraries/Wire/examples/skipped is eligible on no representative'}])
+
+    def test_examples_build_under_their_path_and_hil_sketches_under_their_name(self):
+        self.assertEqual(ab.build_key('libraries/Wire/examples/scan'), 'libraries--Wire--examples--scan')
+        self.assertEqual(ab.build_key('test/hil/core_cdc'), 'core_cdc')
+        self.assertEqual(ab.basename_clashes({'m4': ['libraries/Wire/examples/scan', 'libraries/USB/examples/scan']}),
+                         [])
+
+    def test_compile_uses_the_isolated_config_and_the_sketchs_fqbn(self):
+        row, cmd = self.compile(self.fake_compile(), example='test/hil/core_cdc_tusb', board='rig_m4')
+        self.assertEqual(row['status'], 'ok', row.get('firstError'))
+        self.assertNotIn('--library', cmd)
+        self.assertEqual(cmd[cmd.index('--config-file') + 1], str(self.tmp / 'cli.yaml'))
+        self.assertEqual((cmd[cmd.index('--fqbn') + 1], row['fqbn']), ('fake:core:m4:usb=tusb',) * 2)
+        self.assertEqual(row['platform']['install_dir'], str(self.root))
+
+    def test_platform_through_a_link_to_the_checkout_is_this_checkout(self):
+        link = self.tmp / 'sketchbook/hardware/fake/core'
+        link.parent.mkdir(parents=True)
+        link.symlink_to(self.root)
+        row, _ = self.compile(self.fake_compile(str(link)))
+        self.assertEqual(row['status'], 'ok', row.get('firstError'))
+        self.assertEqual(row['platform']['install_dir'], str(self.root))   # resolved for the record
+
+    def test_platform_from_another_copy_fails(self):
+        row, _ = self.compile(self.fake_compile('/home/u/Arduino/hardware/fake/core'))
+        self.assertEqual(row['status'], 'failed')
+        self.assertIn('not this checkout', row['firstError'])
+
+    def test_bundled_library_from_a_user_copy_fails(self):
+        user = self.dep('Wire')['library']
+        row, _ = self.compile(self.fake_compile(used=[user]))
+        self.assertEqual(row['status'], 'failed')
+        self.assertIn('Wire from', row['firstError'])
+        row, _ = self.compile(self.fake_compile(used=[{'name': 'Wire', 'install_dir': str(self.root /
+                                                                                       'libraries/Wire')}]))
+        self.assertEqual(row['status'], 'ok', row.get('firstError'))
+
+    def test_prepared_dependencies_never_take_a_user_copy_of_a_bundled_library(self):
+        libs = [self.dep('Dep C', 'Fake USB'), self.dep('Dep U'), self.dep('Wire'), self.dep('Fake USB')]
+        with mock.patch.object(ab, '_cli_json', return_value={'installed_libraries': libs}):
+            prepared = ab.prepared_dependencies()
+        self.assertEqual(list(prepared), ['Dep C', 'Dep U'])   # Fake USB bundled; its depends= from the bundled copy
+        self.assertFalse(any(d.get('shadowOnly') for d in prepared.values()))
+        (self.root / 'library.properties').write_text('depends=Never\n')
+        self.assertEqual(ab.declared_dependencies(), ['Dep C'])   # a core declares no depends=
+
+    def test_cli_env_links_the_checkout_and_only_the_prepared_libraries(self):
+        dep = self.dep('Dep C')['library']
+        data = {'config': {'directories': {'data': '/d', 'user': '/home/u/Arduino'}, 'x': 1}}
+        with mock.patch.object(ab, '_cli_json', return_value=data):
+            cfg = ab.cli_env(self.tmp / 'env', {'Dep C': {'dir': dep['install_dir']}})
+        conf = json.loads(cfg.read_text())
+        sketchbook = Path(conf['directories']['user'])
+        self.assertEqual((conf['directories']['data'], conf['x']), ('/d', 1))
+        self.assertEqual((sketchbook / 'hardware/fake/core').resolve(), self.root)
+        self.assertEqual([p.name for p in (sketchbook / 'libraries').iterdir()], ['Dep_C'])
+
+    def test_foreign_core_header_is_flagged_and_the_linked_checkout_is_not(self):
+        other = self.tmp / 'other_core'
+        shutil.copytree(self.root, other)
+        (other / 'cores/fake/main.cpp').write_text('// drifted\n')
+        link = self.tmp / 'sketchbook/hardware/fake/core'
+        link.parent.mkdir(parents=True)
+        link.symlink_to(self.root)
+        build = self.tmp / 'b'
+        build.mkdir()
+        (build / 'main.cpp.d').write_text(f'main.cpp.o: {other}/cores/fake/main.cpp {link}/cores/fake/main.cpp\n')
+        self.assertEqual([(h['counterpart'], h['matches']) for h in ab.foreign_headers(build)],
+                         [('cores/fake/main.cpp', False)])
+
+    def test_submodules_bind_at_their_gitlinks_clean(self):
+        ident = {'status': ' M libraries/USB\n', 'submodules': [
+            {'path': 'libraries/USB', 'commit': 'a', 'state': ' '}, {'path': 'libraries/Z', 'commit': 'b', 'state': '-'},
+            {'path': 'libraries/Y', 'commit': 'c', 'state': '+'}]}
+        self.assertEqual(ab.submodule_problems(ident), ['libraries/Z is not initialised',
+                                                        'libraries/Y is not at its gitlink',
+                                                        'libraries/USB has changes'])
+        self.assertEqual(ab.submodule_problems({'status': '', 'submodules': ident['submodules'][:1]}), [])
+
+    def test_record_refused_unless_submodules_are_at_their_gitlinks(self):
+        roster = self.root / 'test/hil/ci.json'
+        roster.write_text(json.dumps({'boards': [{'name': 'rig_m4', 'uid': 'U', 'flasher': {
+            'name': 'jlink', 'uid': '1', 'args': '-device X'}, 'arduino': {'tests': ['cdc']}}]}))
+        ident = {'head': 'abc', 'dirty': False, 'diffSha256': 'd', 'status': '',
+                 'submodules': [{'path': 'libraries/USB', 'commit': 'a', 'state': '-'}]}
+        self.patch(ab, 'source_identity', lambda: (ident, ''))
+        self.patch(ab, 'build_all', mock.Mock(side_effect=AssertionError('compiled')))
+        for extra in ([], ['--experimental']):
+            with self.subTest(extra=extra):
+                code, out = self.run_main(['--board', 'rig_m4', '--shared', '--hil-config', str(roster), '--record',
+                                           str(self.root / 'build/hil/rig_m4.build.json'), *extra])
+                self.assertEqual(code, 2)
+                self.assertIn('libraries/USB is not initialised', out['error'])
+
+    def test_submodule_status_is_parsed_recursively(self):
+        out = (' 3e5369cd libraries/USB (3.7.3)\n-5b48867c libraries/Z\n+0123abcd libraries/USB/lib/x (v1)\n')
+        with mock.patch.object(ab, 'git', return_value=out) as git:
+            self.assertEqual(ab.submodules(), [{'path': 'libraries/USB', 'commit': '3e5369cd', 'state': ' '},
+                                               {'path': 'libraries/Z', 'commit': '5b48867c', 'state': '-'},
+                                               {'path': 'libraries/USB/lib/x', 'commit': '0123abcd', 'state': '+'}])
+        git.assert_called_once_with('submodule', 'status', '--recursive')
 
 
 if __name__ == '__main__':

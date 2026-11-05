@@ -276,6 +276,15 @@ class Admission(Base):
         self.assertEqual(Path(images['echo']['elf']).read_bytes(), b'elf')
         self.assertTrue(images['echo']['elf'].startswith(str(self.dir / 'run')))
         self.assertEqual((images['echo']['vidPid'], images['echo']['hex']), ('1234:5678', None))
+        self.assertEqual(images['echo']['fqbn'], json.loads(self.record().read_text())['fqbn'])   # no per-sketch one
+
+    def test_a_sketchs_own_fqbn_is_carried(self):
+        rec = self.record()
+        data = json.loads(rec.read_text())
+        data['sketches']['echo']['fqbn'] = 'vend:arch:rig_jlink:usb=other'
+        rec.write_text(json.dumps(data))
+        _, images = self.admit(rec)
+        self.assertEqual(images['echo']['fqbn'], 'vend:arch:rig_jlink:usb=other')
 
     def test_refusals(self):
         rec = self.record()
@@ -796,7 +805,8 @@ class Battery(Base):
         board = self.board('rig_jlink')
         with mock.patch.object(H, 'probe_present', return_value=probe), \
                 mock.patch.object(H, 'admit', admit or (lambda *a, **k: (json.loads(rec.read_text()),
-                                                                         {'echo': {'sha256': {}}}))), \
+                                                                         {'echo': {'sha256': {},
+                                                                                   'fqbn': 'vend:arch:rig_jlink'}}))), \
                 mock.patch.object(H, 'step', step or (lambda *a: {'test': 'echo', 'pass': True, 'detail': 'ok'})), \
                 mock.patch.object(H, 'restore', restore or (lambda *a: {'pass': True, 'state': 'echo restored',
                                                                         'evidence': 'ok'})), \
@@ -811,6 +821,7 @@ class Battery(Base):
         self.assertEqual(self.lock.taken[0][3]['locks'], ['rig_jlink'])
         self.assertEqual(len(self.lock.released), 1)
         self.assertEqual(row['firmware']['head'], 'abc')
+        self.assertEqual(row['firmware']['fqbns'], {'echo': 'vend:arch:rig_jlink'})
 
     def test_failed_test_is_a_fail_after_cleanup(self):
         row = self.run_board(step=lambda *a: {'test': 'echo', 'pass': False, 'detail': 'no echo'})

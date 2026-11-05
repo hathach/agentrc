@@ -114,3 +114,59 @@ def roster(path, **entries):
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     Path(path).write_text(json.dumps(data))
     return Path(path)
+
+
+CORE_NAME = 'Fake Core Boards'
+CORE_BOARDS = {
+    'm0': {'fqbn': 'fake:core:m0', 'family': 'c21'},
+    'm0_tusb': {'fqbn': 'fake:core:m0:usb=tusb', 'family': 'c21', 'filters': 'm0:usb=tusb'},
+    'm4': {'fqbn': 'fake:core:m4', 'family': 'c51'},
+    'rig_m4': {'fqbn': 'fake:core:m4:usb=arduino', 'family': 'c51', 'filters': 'm4', 'span': (0x4000, 0x80000)},
+}
+CORE_REPRESENTATIVES = {'c21': ['m0', 'm0_tusb'], 'c51': ['m4']}
+CORE_HIL_SKETCHES = {'device': ('test/hil/core_cdc', 'test/hil/core_cdc_tusb')}
+# a core's tree: Wire/scan and USB/scan share a basename, USB/echo builds only on tusb boards (exclude()),
+# Wire/skipped skips everywhere, Wire/only builds on m4 only, SDU/extras/Boot sits outside examples/
+CORE_SKETCHES = ('libraries/Wire/examples/scan', 'libraries/Wire/examples/skipped', 'libraries/Wire/examples/only',
+                 'libraries/USB/examples/scan', 'libraries/USB/examples/echo', 'libraries/SDU/extras/Boot',
+                 'test/hil/core_cdc', 'test/hil/core_cdc_tusb')
+
+
+def core(dest):
+    """A fake Arduino core checkout at dest, resolved: platform.txt, bundled libraries with their sketches."""
+    root = Path(dest)
+    (root / 'cores/fake').mkdir(parents=True)
+    (root / 'cores/fake/main.cpp').write_text('int main() {}\n')
+    (root / 'platform.txt').write_text(f'name={CORE_NAME}\nversion=1.0.0\n')
+    for lib, props in (('Wire', 'name=Wire\n'), ('USB', 'name=Fake USB\ndepends=Wire, Dep U\n'), ('SDU', 'name=SDU\n')):
+        (root / 'libraries' / lib).mkdir(parents=True)
+        (root / 'libraries' / lib / 'library.properties').write_text(props)
+    for sketch in CORE_SKETCHES:
+        (root / sketch).mkdir(parents=True, exist_ok=True)
+        (root / sketch / f'{Path(sketch).name}.ino').write_text('void setup() {}\nvoid loop() {}\n')
+    (root / 'libraries/Wire/examples/skipped/.all.test.skip').write_text('')
+    (root / 'libraries/Wire/examples/only/.m4.test.only').write_text('')
+    return root.resolve()
+
+
+def core_classify(path):
+    if path.startswith('cores/'):
+        return 'shared', None, 'core runtime'
+    if path == 'platform.txt':
+        return 'boards', ('m0', 'm0_tusb', 'm4'), 'every recipe'
+    if path.startswith('libraries/'):
+        lib = path.split('/')[1]
+        return 'sketches', [s for s in CORE_SKETCHES if s.startswith(f'libraries/{lib}/')], f'bundled {lib}'
+    return None
+
+
+def core_profile(root, agentrc_identity, **over):
+    return build_profile(root, agentrc_identity, **{
+        'LIBRARY_NAME': CORE_NAME, 'PLATFORM': 'fake:core', 'SKETCH_ROOTS': ('libraries',),
+        'BOARDS': copy.deepcopy(CORE_BOARDS), 'REPRESENTATIVES': copy.deepcopy(CORE_REPRESENTATIVES),
+        'HIL_SKETCHES': dict(CORE_HIL_SKETCHES), 'SMOKE_BOARDS': ('rig_m4',), 'EXTRA_DEPENDENCIES': ('Dep C',),
+        'classify_source': core_classify,
+        'exclude': lambda board, ex: ex.startswith('libraries/USB/') and 'tusb' not in board and ex.endswith('echo'),
+        'fqbn': lambda board, ex: 'fake:core:m4:usb=tusb' if ex == 'test/hil/core_cdc_tusb' else
+        CORE_BOARDS[board]['fqbn'],
+        **over})

@@ -283,6 +283,7 @@ def admit(record_path, board, roster_path, run_dir, *, manifest=None, experiment
         images[name] = {'elf': str(dest / Path(s['elf']).name),
                         'hex': str(dest / Path(s['hex']).name) if s.get('hex') else None,
                         'vidPid': s['vidPid'], 'sha256': s['sha256'], 'dir': str(dest),
+                        'fqbn': s.get('fqbn', rec['fqbn']),
                         'segments': s.get('segments'), 'chip': rec.get('chip')}
     return rec, images
 
@@ -687,7 +688,8 @@ def run_board(name, board, tests, record_path, roster_path, run_root, manifest):
             row['detail'] = f'refused: {e}'
             return row
         row['firmware'] = {'buildRecord': str(record_path), 'head': rec['source']['head'], 'fqbn': rec['fqbn'],
-                           'platform': rec['platform'], 'sketches': {k: v['sha256'] for k, v in images.items()}}
+                           'platform': rec['platform'], 'sketches': {k: v['sha256'] for k, v in images.items()},
+                           'fqbns': {k: v['fqbn'] for k, v in images.items()}}   # a core's sketches may differ
         for test in tests:
             if BOARD_BUDGET - (time.monotonic() - started) < STEP_MAX + CLEANUP_RESERVE:
                 row['tests'].append({'test': test, 'pass': False, 'detail': 'not run: board budget left too small'})
