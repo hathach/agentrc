@@ -241,9 +241,10 @@ const found = audit.confirmed.flatMap(u => u.findings.map(f => ({
   ...gradeOf(f), why: f.why, snippet: f.snippet, verdictReason: f.verdict.reason, status: 'open',
 })))
 // A recheck raises no new nit, by its verified grade: a nit on a repair would only start another round.
-const suppressed = recheckFrom ? found.filter(f => f.severity === 'nit') : []
+const raised = (f) => !recheckFrom || f.severity !== 'nit'
+const suppressed = found.filter(f => !raised(f))
 if (suppressed.length) log(`${suppressed.length} new nit(s) not raised on a recheck: ${suppressed.map(f => `${f.file}:${f.line}`).join(', ')}`)
-const ours = found.filter(f => !suppressed.includes(f))
+const ours = found.filter(raised)
 const confirmedClaims = claimsOut.filter(c => c.verdict === 'confirmed')
 // Without new replies a recheck cannot move an upheld or disputed finding back to plain open.
 const statusOf = (f, v) => v.state === 'open' && ['upheld', 'disputed'].includes(f.status) ? f.status : v.state
