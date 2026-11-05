@@ -3,6 +3,8 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
@@ -369,7 +371,7 @@ class LedgerCase(unittest.TestCase):
             (captain, 'find', lambda address: dict(self.terminals[address]) if address in self.terminals else None),
             (captain, 'read_screen', lambda address: self.screens.get(address, EMPTY)),
             (captain, 'submit', self._submit),
-            (captain, 'me', lambda: captain.identity(self.terminals[self.me])),
+            (captain, 'my_session', lambda: dict(self.terminals[self.me])),
             (captain, 'config_dir', lambda account: str(self.state / 'config')),   # never the real ~/.claude
         ]:
             patcher = mock.patch.object(target, attr, value)
@@ -735,8 +737,9 @@ class BriefTest(LedgerCase):
         self.assertNotIn(self.msg, captain.open_items(captain.records()))
         with mock.patch('builtins.print') as out:
             self.assertEqual(captain.collect([self.msg], 0), 0)
-        self.assertTrue(out.call_args_list[-1].args[0].startswith(
+        self.assertTrue(out.call_args_list[-2].args[0].startswith(
             f'refused by the session that replaced its target {self.msg}'))
+        self.assertTrue(out.call_args_list[-1].args[0].startswith('done from '))
         self.assertEqual(captain.reports([self.msg]), [{'handle': 'sp · name · t2', 'msg': self.msg,
                                                         'missing': 'refused by the session that replaced its target'}])
 
@@ -767,7 +770,7 @@ class BriefTest(LedgerCase):
 class CollectTest(LedgerCase):
     def test_prints_each_report_then_ends(self):
         msg = self.msg_of(self.ask())
-        reported = mock.patch.object(captain, 'records', side_effect=self._report_on_second_read(msg))
+        reported = mock.patch.object(captain, 'records', side_effect=self._report_on_first_poll(msg))
         with mock.patch('builtins.print') as out, reported:
             self.assertEqual(captain.collect([], 1000), 0)
         self.assertEqual(out.call_args_list[0].args[0], f'reported {msg} · ready')
@@ -784,14 +787,15 @@ class CollectTest(LedgerCase):
         [row] = captain.reports([msg])
         self.assertEqual(row['needs'], long['needs'])   # the whole text, from reports
 
-    def _report_on_second_read(self, msg):
-        """The report lands while collect waits: its first read sees the request still open."""
+    def _report_on_first_poll(self, msg):
+        """The report lands while collect waits: its reads under the lock see the request still open."""
         real, calls = captain.records, []
 
         def read(lenient=False):
-            calls.append(1)
-            if len(calls) == 2:
-                self.report_as('t2', msg)
+            if lenient:   # a poll, outside the lock
+                calls.append(1)
+                if len(calls) == 1:
+                    self.report_as('t2', msg)
             return real(lenient=lenient)
         return read
 
@@ -799,7 +803,7 @@ class CollectTest(LedgerCase):
         msg = self.msg_of(self.ask())
         with mock.patch('builtins.print') as out:
             self.assertEqual(captain.collect([msg], 0), captain.NO_ANSWER)
-        self.assertEqual(out.call_args_list[-1].args[0], f'pending {msg}')
+        self.assertEqual(out.call_args_list[-1].args[0], f'pending from {len(captain.records())}: {msg}')
 
     def test_cancelled_request_is_reported_as_such(self):
         msg = self.msg_of(self.ask())
@@ -840,6 +844,16 @@ class CollectTest(LedgerCase):
         self.report_as('t2', second)
         rows = captain.reports()
         self.assertEqual([(r['msg'], r['state']) for r in rows], [(second, 'ready')])
+
+    def test_reports_lists_terminals_by_their_latest_report_newest_first(self):
+        self.terminals['t3'] = pinned('t3')
+        a, b = self.msg_of(self.ask('t2')), self.msg_of(self.ask('t3'))
+        self.report_as('t3', b)
+        self.report_as('t2', a)
+        self.assertEqual([r['msg'] for r in captain.reports()], [a, b])
+        c = self.msg_of(self.ask('t3'))
+        self.report_as('t3', c)
+        self.assertEqual([r['msg'] for r in captain.reports()], [c, a])
 
 
 class EnrollTest(LedgerCase):
@@ -1545,7 +1559,7 @@ class AcceptTest(RelayCase):
         self.assertEqual(self.count('refused'), 1)
         with mock.patch('builtins.print') as out:
             self.assertEqual(captain.collect([self.action], 0), 0)
-        self.assertTrue(out.call_args_list[-1].args[0].startswith(
+        self.assertTrue(out.call_args_list[-2].args[0].startswith(
             f'refused by the session that replaced its target {self.action}'))
 
     def test_no_refusal_once_accepted(self):
@@ -1660,7 +1674,8 @@ class WithdrawTest(RelayCase):
             self.assertEqual(captain.collect([self.action], 0), 0)
         self.assertEqual([c.args[0] for c in out.call_args_list],
                          [f'accepted {self.action} · sp · name · t2',
-                          f'completed {self.action} · sp · name · t2 · merged at 1234'])
+                          f'completed {self.action} · sp · name · t2 · merged at 1234',
+                          f'done from {len(captain.records())}'])
 
 
 class OpenTest(LedgerCase):
@@ -1899,6 +1914,496 @@ class OpenStubTest(unittest.TestCase):
         self.assertEqual((code, line.splitlines()[-1]), (0, 't9: ready · claude/main'), line)
         self.assertTrue((self.home / '.claude' / 'sessions').is_dir())
 
+
+class WatchCase(LedgerCase):
+    """A watch armed by the enrolled captain t1; its captain's liveness and each session's pin set per test."""
+
+    def setUp(self):
+        super().setUp()
+        self.owner = 'live'
+        patcher = mock.patch.object(captain, 'owner_state', lambda watch: self.owner)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def arm(self, *targets):
+        return self.as_target(captain.arm, list(targets), self.ident, address='t1')
+
+    def pending_as(self, address):
+        return self.as_target(captain.pending, address=address)
+
+    def hook_as(self, address, event='Stop', **payload):
+        payload = {'hook_event_name': event, 'session_id': self.terminals[address]['session'], **payload}
+        return self.as_target(captain.hook, payload, address=address)[0]
+
+    def member(self, address):
+        return [r for r in captain.records() if r['type'] == 'joined' and r['target']['address'] == address]
+
+    def joined_as(self, address):
+        """The member id the session at address gets on joining."""
+        self.pending_as(address)
+        return self.member(address)[-1]['msg']
+
+    def watch_id(self):
+        return next(r['msg'] for r in captain.records() if r['type'] == 'watch')
+
+
+class WatchArmTest(WatchCase):
+    def test_all_arms_with_no_other_session_and_types_nothing(self):
+        self.terminals = {'t1': CAPTAIN}
+        code, out = self.arm('all')
+        self.assertEqual(code, 0)
+        self.assertIn(f'armed from {len(captain.records())}: every session, new ones too', out)
+        [w] = [r for r in captain.records() if r['type'] == 'watch']
+        self.assertEqual((w['scope'], w['captain']['address']), ('all', 't1'))
+        self.assertTrue(captain.marked())
+        self.assertEqual(self.typed, [])
+
+    def test_a_second_watch_widens_the_open_one(self):
+        self.terminals['t3'] = pinned('t3')
+        self.arm('t2')
+        code, out = self.arm('t3')
+        self.assertIn(f'widened from {len(captain.records())}: t3', out)
+        types = [r['type'] for r in captain.records()]
+        self.assertEqual((types.count('watch'), types.count('watch-extend')), (1, 1))
+
+    def test_named_targets_refuse_this_session_unpinned_and_missing(self):
+        self.terminals['t3'] = {**pinned('t3'), 'session': None}
+        for address in ('t1', 't3', 't9'):
+            with self.subTest(address), self.assertRaises(SystemExit), mock.patch('sys.stderr'):
+                self.arm(address)
+        self.assertEqual(captain.records(), [])
+        self.assertFalse(captain.marked())
+
+    def test_the_marker_is_durable_before_the_watch_is_recorded(self):
+        with mock.patch.object(captain, 'write_json', side_effect=OSError(28, 'No space left on device')), \
+             self.assertRaises(OSError):
+            self.arm('all')
+        self.assertEqual(captain.records(), [])
+
+    def test_only_the_enrolled_captain_arms(self):
+        self.replace_captain()
+        with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
+            self.arm('all')
+
+    def test_cancel_ends_the_watch_and_removes_the_marker(self):
+        self.arm('all')
+        self.pending_as('t2')
+        w = self.watch_id()
+        self.assertEqual(captain.cancel(w, self.ident), 0)
+        self.assertFalse(captain.marked())
+        with self.assertRaises(SystemExit) as e, mock.patch('sys.stderr'):
+            self.report_as('t2', self.member('t2')[0]['msg'])
+        self.assertEqual(e.exception.code, 2)
+
+    def test_a_watch_never_holds_the_request_slot(self):
+        self.arm('all')
+        self.pending_as('t2')
+        self.assertTrue(self.ask().endswith('delivered'))
+
+
+class WatchesTest(WatchCase):
+    def test_lists_each_member_live_gone_or_unknown_with_its_latest_report(self):
+        self.terminals.update((t, pinned(t)) for t in ('t3', 't4', 't5'))
+        self.arm('all')
+        w = self.watch_id()
+        ids = {t: self.joined_as(t) for t in ('t2', 't3', 't4', 't5')}
+        self.report_as('t2', ids['t2'])
+        self.report_as('t2', ids['t2'])
+        n = len(captain.records()) - 1
+        del self.terminals['t3']
+        self.terminals['t4'] = {**pinned('t4'), 'session': None}
+        found = captain.find
+
+        def find(address):
+            if address == 't5':
+                raise captain.hc.Error('hc timed out')
+            return found(address)
+        with mock.patch.object(captain, 'find', find):
+            code, out = self.as_target(captain.watches, address='t1')
+        self.assertEqual(code, 0)
+        self.assertEqual(out.split('\n'), [f'{w}\tall\tcaptain t1 live',
+                                           f'  {ids["t2"]}\tsp · name · t2\tlive\t{ids["t2"]}:{n}',
+                                           f'  {ids["t3"]}\tsp · name · t3\tgone\tno report',
+                                           f'  {ids["t4"]}\tsp · name · t4\tunknown\tno report',
+                                           f'  {ids["t5"]}\tsp · name · t5\tunknown\tno report'])
+
+    def test_no_watch(self):
+        self.assertEqual(self.as_target(captain.watches, address='t1'), (0, 'no watch is open'))
+
+
+class WatchJoinTest(WatchCase):
+    def test_a_covered_session_joins_once(self):
+        self.arm('all')
+        code, out = self.pending_as('t2')
+        [m] = self.member('t2')
+        self.assertIn(f'STATUS WATCH {m["msg"]} from the agent session in terminal t1', out)
+        self.assertIn(f'report --for {m["msg"]} --file -', out)
+        self.assertNotIn('captain', out.lower().replace(captain.INSTALLED.lower(), ''))   # names no role
+        self.pending_as('t2')
+        self.assertEqual(len(self.member('t2')), 1)
+
+    def test_the_captain_itself_is_never_covered(self):
+        self.arm('all')
+        self.assertEqual(self.pending_as('t1')[1], 'none: the open watch does not cover this session')
+
+    def test_no_watch_or_an_uncertain_captain_joins_nobody(self):
+        self.assertEqual(self.pending_as('t2')[1], 'none: no watch is open')
+        self.arm('all')
+        self.owner = 'unknown'
+        self.assertIn('cannot confirm', self.pending_as('t2')[1])
+        self.assertEqual(self.count('watch-end'), 0)
+        self.assertTrue(captain.marked(), 'an unknown captain keeps its watch')
+
+    def test_a_replaced_or_ended_captain_ends_the_watch(self):
+        for why, act in (('replaced', self.replace_captain), ('ended', lambda: setattr(self, 'owner', 'ended'))):
+            with self.subTest(why):
+                (self.state / captain.LEDGER).unlink(missing_ok=True)
+                self.enroll_captain()
+                self.owner = 'live'
+                self.arm('all')
+                act()
+                self.assertEqual(self.pending_as('t2')[1], 'none: no watch is open')
+                self.assertEqual(self.count('watch-end'), 1)
+                self.assertFalse(captain.marked())
+                captain.write_json(captain.ENROLLED, {**captain.identity(CAPTAIN), 'generation': 'g'})
+                with mock.patch('builtins.print'):
+                    captain.enroll(True)
+                self.ident = captain.identity(CAPTAIN)
+
+    def test_a_named_watch_follows_restarts_and_resumes(self):
+        self.terminals.update(t3=pinned('t3'), t5=pinned('t5'))
+        self.arm('t2')
+        self.assertIn('does not cover', self.pending_as('t3')[1])
+        self.terminals['t2'] = {**pinned('t2'), 'pid': 11, 'started': 21, 'session': 's-new'}   # restarted in t2
+        self.pending_as('t2')
+        self.terminals['t5'] = {**pinned('t5'), 'session': 's-new'}   # that session resumed in t5
+        self.pending_as('t5')
+        self.terminals['t5'] = {**pinned('t5'), 'pid': 12, 'started': 22, 'session': 's-newer'}   # t5 restarted
+        self.pending_as('t5')
+        self.assertEqual([len(self.member(a)) for a in ('t2', 't3', 't5')], [1, 0, 2])
+
+    def test_a_session_uuid_matches_only_in_its_account(self):
+        self.terminals['t5'] = {**pinned('t5'), 'session': 's-t2', 'account': 'ada'}
+        self.arm('t2')
+        self.assertIn('does not cover', self.pending_as('t5')[1])
+
+    def test_a_restarted_session_cannot_report_as_its_predecessor(self):
+        self.arm('all')
+        old = self.joined_as('t2')
+        self.terminals['t2'] = {**pinned('t2'), 'pid': 11, 'started': 21}
+        with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
+            self.report_as('t2', old)
+        self.assertEqual(self.count('report'), 0)
+
+
+class WatchReportTest(WatchCase):
+    def test_every_report_is_kept_and_none_closes_the_member(self):
+        self.arm('all')
+        m = self.joined_as('t2')
+        self.assertEqual((self.report_as('t2', m), self.report_as('t2', m)), (0, 0))   # two task ends, same JSON
+        self.assertEqual(self.count('report'), 2)
+        f = self.state / 'r3.json'
+        f.write_text(json.dumps(GOOD), encoding='utf-8')
+        n = len(captain.records())
+        self.assertEqual(self.as_target(captain.report, m, str(f)), (0, f'recorded {m}:{n}'))
+        self.assertEqual(captain.records()[n]['type'], 'report')
+        self.assertNotIn(m, captain.closed(captain.records()))
+
+    def test_reports_pick_the_latest_by_ledger_order(self):
+        """A member's first report, then a request's, then the member's next: the member's next is the latest."""
+        self.arm('all')
+        m = self.joined_as('t2')
+        self.report_as('t2', m, {**GOOD, 'task': 'W1'})
+        self.report_as('t2', self.msg_of(self.ask()), {**GOOD, 'task': 'R'})
+        self.report_as('t2', m, {**GOOD, 'task': 'W2'})
+        self.assertEqual([r['task'] for r in captain.reports()], ['W2'])
+        self.assertEqual(captain.reports([m])[0]['task'], 'W2')
+        for clock in ('equal', 'backwards'):   # a stamp may tie or step back; ledger order decides
+            with self.subTest(clock):
+                lines = (self.state / captain.LEDGER).read_text(encoding='utf-8').splitlines()
+                recs = [json.loads(line) for line in lines]
+                for n, r in enumerate(recs):
+                    r['at'] = 5 if clock == 'equal' else 100 - n
+                (self.state / captain.LEDGER).write_text(''.join(json.dumps(r) + '\n' for r in recs), encoding='utf-8')
+                self.assertEqual([r['task'] for r in captain.reports()], ['W2'])
+
+    def test_a_report_is_fetched_by_its_ledger_index(self):
+        self.arm('all')
+        m = self.joined_as('t2')
+        self.assertEqual(captain.reports([m]), [{'handle': 'sp · name · t2', 'msg': m,
+                                                 'missing': 'watching, no report received'}])
+        self.report_as('t2', m, {**GOOD, 'needs': 'merge it'})
+        self.report_as('t2', m, {**GOOD, 'needs': ''})
+        first = next(i for i, r in enumerate(captain.records()) if r['type'] == 'report')
+        [row] = captain.reports([f'{m}:{first}'])
+        self.assertEqual((row['msg'], row['needs']), (f'{m}:{first}', 'merge it'))
+        for ref in (f'{m}:0', f'{m}:999', f'j-other:{first}', f'{m}:x'):
+            with self.subTest(ref):
+                self.assertIn('missing', captain.reports([ref])[0])
+
+
+class WatchUnchangedTest(WatchCase):
+    """A member's transcript: a task, the watch brief a hook gave it, then the task end it reported."""
+
+    def setUp(self):
+        super().setUp()
+        self.transcript = self.state / 'config' / 'projects' / '-w' / 's-t2.jsonl'
+        self.transcript.parent.mkdir(parents=True)
+        self.arm('all')
+        self.m = self.joined_as('t2')
+        self.log({'type': 'user', 'promptSource': 'typed', 'origin': {'kind': 'human'},
+                  'message': {'content': 'fix it'}},
+                 {'type': 'attachment', 'content': captain.watch_brief(self.m, 't1')})
+        self.ref = self.reported()
+
+    def log(self, *entries, raw=b''):
+        with open(self.transcript, 'ab') as f:
+            f.write(b''.join(json.dumps(e).encode() + b'\n' for e in entries) + raw)
+
+    def reported(self, extra=''):
+        """One task end reported, its call and output logged as Claude Code writes them: the report's ref."""
+        self.log({'type': 'assistant', 'message': {'content': [
+            {'type': 'tool_use', 'name': 'Bash', 'input': {'command': f'report --for {self.m} --file -'}}]}})
+        n = len(captain.records())
+        self.report_as('t2', self.m)
+        ref = f'{self.m}:{n}'
+        self.log({'type': 'user', 'message': {'content': [
+                     {'type': 'tool_result', 'content': f'recorded {ref}{extra}'}]}},
+                 {'type': 'assistant', 'message': {'content': [{'type': 'text', 'text': 'Fixed.'}]}})
+        return ref
+
+    def asked(self):
+        line = self.ask()
+        if line.endswith('delivered'):
+            captain.cancel(self.msg_of(line), self.ident)
+        return line
+
+    def test_nothing_new_since_a_watch_report_is_not_asked(self):
+        line = self.asked()
+        self.assertIn(f'not asked, nothing new since its report {self.ref} at', line)
+        self.assertEqual(self.typed, [])
+        [row] = captain.reports([self.ref])
+        self.assertEqual((row['msg'], row['task']), (self.ref, GOOD['task']))
+
+    def test_a_later_turn_is_asked(self):
+        self.log({'type': 'user', 'promptSource': 'typed', 'origin': {'kind': 'human'},
+                  'message': {'content': 'and now this'}})
+        self.assertTrue(self.asked().endswith('delivered'))
+
+    def test_asked_when_it_cannot_be_shown(self):
+        cases = {'torn line': lambda: self.log(raw=b'{"type": "user", "mess'),
+                 'later report not logged': lambda: self.report_as('t2', self.m),
+                 'other output': lambda: self.reported(extra=' and more'),
+                 'only quoted': lambda: self.transcript.write_bytes(json.dumps(
+                     {'type': 'user', 'isCompactSummary': True, 'message': {
+                         'content': f'earlier: recorded {self.ref}'}}).encode() + b'\n')}
+        for why, change in cases.items():
+            with self.subTest(why):
+                saved_ledger = (self.state / captain.LEDGER).read_bytes()
+                saved = self.transcript.read_bytes()
+                change()
+                self.assertTrue(self.asked().endswith('delivered'))
+                self.transcript.write_bytes(saved)
+                (self.state / captain.LEDGER).write_bytes(saved_ledger)
+        self.assertIn('not asked', self.asked())
+
+
+class WatchHookTest(WatchCase):
+    def test_no_marker_reads_nothing(self):
+        with mock.patch.object(captain, 'records', side_effect=AssertionError('read')), \
+             mock.patch.object(captain, 'my_session', side_effect=AssertionError('pinned')):
+            self.assertIsNone(captain.hook({'hook_event_name': 'Stop'}))
+
+    def test_a_marker_that_cannot_be_inspected_counts_as_present(self):
+        with mock.patch.object(captain.os, 'stat', side_effect=PermissionError(13, 'denied')):
+            self.assertTrue(captain.marked())
+
+    def test_stop_joins_and_holds_the_stop_once_whatever_stop_hook_active_says(self):
+        self.arm('all')
+        out = json.loads(self.hook_as('t2', stop_hook_active=True))
+        self.assertEqual(out['decision'], 'block')
+        self.assertIn(f'STATUS WATCH {self.member("t2")[0]["msg"]}', out['reason'])
+        self.assertIsNone(self.hook_as('t2'))
+        self.assertIsNone(self.hook_as('t1'), 'the captain is never held')
+
+    def test_session_start_rebriefs_a_member(self):
+        self.arm('all')
+        self.pending_as('t2')
+        out = json.loads(self.hook_as('t2', 'SessionStart', source='compact'))
+        self.assertEqual(out['hookSpecificOutput']['hookEventName'], 'SessionStart')
+        self.assertIn(self.member('t2')[0]['msg'], out['hookSpecificOutput']['additionalContext'])
+
+    def test_a_run_nested_in_a_session_is_not_that_session(self):
+        self.arm('all')
+        self.assertIsNone(self.hook_as('t2', session_id='s-nested'), 'a claude -p started from its Bash tool')
+        self.assertEqual(self.member('t2'), [])
+        self.assertIn('decision', self.hook_as('t2'))
+
+    def test_a_registry_stale_after_clear_waits_for_the_next_stop(self):
+        self.arm('all')
+        self.assertIsNone(self.hook_as('t2', 'SessionStart', source='clear', session_id='s-new'))
+        self.assertEqual(self.member('t2'), [])
+        self.terminals['t2'] = {**pinned('t2'), 'session': 's-new'}
+        self.assertIn('decision', self.hook_as('t2'))
+        self.assertEqual(self.member('t2')[0]['target']['session'], 's-new')
+
+    def test_the_session_is_pinned_outside_the_lock_and_a_held_lock_is_waited_for_briefly(self):
+        self.arm('all')
+        real = captain.my_session
+
+        def my_session():
+            with open(self.state / 'lock', 'a') as f:   # a second open file: it conflicts even within one process
+                captain.fcntl.flock(f, captain.fcntl.LOCK_EX | captain.fcntl.LOCK_NB)
+                captain.fcntl.flock(f, captain.fcntl.LOCK_UN)
+            return real()
+        with mock.patch.object(captain, 'my_session', my_session), \
+             mock.patch.object(captain, 'find', side_effect=AssertionError('hc under the lock')):
+            self.assertIn('decision', self.hook_as('t2'))
+        self.assertEqual(self.member('t2')[0]['handle'], 'sp · name · t2')
+        self.terminals['t3'] = pinned('t3')
+        with mock.patch.object(captain, 'HOOK_LOCK_S', 0), open(self.state / 'lock', 'a') as held:
+            captain.fcntl.flock(held, captain.fcntl.LOCK_EX)
+            with self.assertRaises(captain.Busy):   # the hook script exits 0 on it
+                self.hook_as('t3')
+        self.assertEqual(self.member('t3'), [])
+
+    def test_a_session_that_cannot_be_pinned_is_left_alone(self):
+        self.arm('all')
+        with mock.patch.object(captain, 'my_session', side_effect=lambda: captain.die('cannot tell', 2)), \
+             mock.patch('sys.stderr'), self.assertRaises(SystemExit):   # the hook script exits 0 on it
+            captain.hook({'hook_event_name': 'Stop'})
+        self.assertEqual(self.member('t2'), [])
+
+    def test_the_hook_script_never_fails_a_session(self):
+        hook = ROOT / 'hooks' / 'captain' / 'captain_hook.py'
+        env = {**os.environ, 'AGENTRC_CAPTAIN_DIR': str(self.state)}
+        for stdin in ('{"hook_event_name": "Stop"}', 'not json'):
+            with self.subTest(stdin):
+                done = subprocess.run([sys.executable, str(hook)], input=stdin, capture_output=True, text=True,
+                                      env=env, timeout=30)
+                self.assertEqual((done.returncode, done.stdout), (0, ''))
+
+
+class OwnerStateTest(unittest.TestCase):
+    WATCH = {'captain': {**captain.identity(CAPTAIN), 'generation': 'g'}}
+
+    def state(self, start=20, session='s-t1', error=None):
+        with mock.patch.object(captain.hc, 'proc_start', side_effect=error, return_value=start), \
+             mock.patch.object(captain, 'registered', return_value=session):
+            return captain.owner_state(self.WATCH)
+
+    def test_from_proc_and_the_registry(self):
+        self.assertEqual(self.state(), 'live')
+        self.assertEqual(self.state(error=captain.hc.Gone(10)), 'ended')
+        self.assertEqual(self.state(start=99), 'ended', 'pid reused')
+        self.assertEqual(self.state(session='s-cleared'), 'ended', '/clear')
+        self.assertEqual(self.state(session=None), 'unknown')
+        self.assertEqual(self.state(error=captain.hc.Error('x')), 'unknown')
+        self.assertEqual(self.state(start=None), 'unknown', 'off Linux')
+
+
+class WatchCollectTest(WatchCase):
+    def collect(self, *msgs, start=None):
+        with mock.patch('builtins.print') as out:
+            code = captain.collect(list(msgs), 0, start)
+        return code, [c.args[0] for c in out.call_args_list]
+
+    def cursor(self, line):
+        return int(line.split(' from ')[1].split(':')[0])
+
+    def test_follows_members_reports_and_the_end(self):
+        start = self.cursor(self.arm('all')[1])
+        w = self.watch_id()
+        m = self.joined_as('t2')   # before the first collect starts: the cursor `watch` printed still covers it
+        self.report_as('t2', m, {**GOOD, 'needs': 'merge'})
+        code, lines = self.collect(start=start)
+        n = len(captain.records())
+        self.assertEqual(code, captain.NO_ANSWER)
+        self.assertEqual(lines, [f'watching {m} · sp · name · t2', f'reported {m}:{n - 1} · ready · needs you',
+                                 f'pending from {n}: {m} {w}'])
+        self.report_as('t2', m)
+        captain.cancel(w, self.ident)
+        code, lines = self.collect(start=n)
+        self.assertEqual((code, lines), (0, [f'reported {m}:{n} · ready', f'cancelled {w}',
+                                             f'done from {len(captain.records())}']))
+
+    def test_a_collect_without_a_cursor_replays_nothing(self):
+        self.arm('all')
+        w = self.watch_id()
+        m = self.joined_as('t2')
+        self.report_as('t2', m)
+        n = len(captain.records())
+        self.assertEqual(self.collect(), (captain.NO_ANSWER, [f'pending from {n}: {m} {w}']))
+        self.terminals['t3'] = pinned('t3')
+        self.arm('t3')   # widened: the running collect follows it, a lost cursor re-arms without one
+        self.report_as('t2', m)
+        code, lines = self.collect()
+        self.assertEqual(lines, [f'pending from {len(captain.records())}: {m} {w}'])
+
+    def test_a_request_sent_during_a_watch_is_followed_by_its_collect(self):
+        start = self.cursor(self.arm('all')[1])
+        m = self.joined_as('t2')
+        self.terminals['t3'] = pinned('t3')
+        msg = self.msg_of(self.ask('t3'))
+        self.report_as('t3', msg)
+        code, lines = self.collect(start=start)
+        self.assertEqual(lines[1:], [f'reported {msg} · ready', f'pending from {len(captain.records())}: {m} '
+                                     f'{self.watch_id()}'])
+
+    def test_a_lock_held_past_the_deadline_still_prints_the_cursor(self):
+        self.arm('all')
+        m = self.joined_as('t2')
+        n = len(captain.records())
+        real, held, grabbed = captain.time.sleep, open(self.state / 'lock', 'a'), []
+        self.addCleanup(held.close)
+        release = threading.Timer(5, captain.fcntl.flock, (held, captain.fcntl.LOCK_UN))
+        self.addCleanup(release.cancel)
+
+        def sleep(s):   # another process takes the lock while collect waits between polls
+            if not grabbed:
+                captain.fcntl.flock(held, captain.fcntl.LOCK_EX)
+                release.start()
+                grabbed.append(True)
+            real(s)
+        began = time.monotonic()
+        with mock.patch.object(captain.time, 'sleep', side_effect=sleep), mock.patch('builtins.print') as out:
+            self.assertEqual(captain.collect([], 50), captain.NO_ANSWER)
+        self.assertLess(time.monotonic() - began, 3, 'waited for the lock past the deadline')
+        self.assertEqual(out.call_args_list[-1].args[0], f'pending from {n}: {m} {self.watch_id()}')
+
+    def test_collect_ends_a_watch_whose_captain_is_gone(self):
+        self.arm('all')
+        self.owner = 'ended'
+        code, lines = self.collect()
+        self.assertEqual(code, 0)
+        self.assertTrue(lines[0].startswith('watch ended w-'), lines)
+        self.assertFalse(captain.marked())
+
+    def test_a_member_s_collect_ends_when_its_captain_goes_while_it_waits(self):
+        self.arm('all')
+        m = self.joined_as('t2')
+        ends = mock.patch.object(captain.time, 'sleep', side_effect=lambda s: setattr(self, 'owner', 'ended'))
+        with ends, mock.patch('builtins.print') as out:   # the captain goes while collect waits
+            self.assertEqual(captain.collect([m], 1000), 0)
+        self.assertTrue(any(str(c.args[0]).startswith('done from') for c in out.call_args_list))
+        self.assertEqual(self.count('watch-end'), 1)
+
+    def test_an_item_closed_before_the_cursor_is_not_pending(self):
+        msg = self.msg_of(self.ask())
+        self.report_as('t2', msg)
+        self.assertEqual(self.collect(msg, start=len(captain.records()))[1], [f'done from {len(captain.records())}'])
+
+    def test_a_watch_opened_after_the_cursor_is_followed(self):
+        n = len(captain.records())
+        self.arm('all')
+        self.pending_as('t2')
+        code, lines = self.collect(start=n)
+        self.assertEqual(lines[0], f'watching {self.member("t2")[0]["msg"]} · sp · name · t2')
+
+    def test_a_cursor_outside_the_ledger_refuses(self):
+        for start in (-1, len(captain.records()) + 1):
+            with self.subTest(start), self.assertRaises(SystemExit), mock.patch('sys.stderr'):
+                self.collect(start=start)
 
 if __name__ == '__main__':
     unittest.main()

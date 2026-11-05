@@ -383,6 +383,13 @@ it in its own terminal:
 claude --agent captain
 ```
 
+A watch has sessions report at the end of each task, new and restarted ones too, until the captain session that
+started it ends. It types into no session: `hooks/captain`, installed with the captain skill, lets a covered session
+join it at its next Stop or after a compaction or `/clear`, and costs a Python start and one marker-file check while
+no watch is open. Another config dir (`~/.claude-ada` here) needs the hook's two entries from
+`hooks/captain/hooks.json` in its own `settings.json`, as the `credit-guard` recipe above does for its own; a session
+started before its settings held them joins only once restarted.
+
 Its memory is shared across accounts: an account whose config directory is not
 `~/.claude` links its `agent-memory` there, as the ada account does with
 `ln -s ~/.claude/agent-memory ~/.claude-ada/agent-memory`; without that link the

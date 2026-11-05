@@ -16,9 +16,12 @@ reported its status, latest first: an order, not how long one has been idle.
 python3 ~/.claude/skills/captain/scripts/captain.py list [--json]                   # every other Claude Code session, latest change first
 python3 ~/.claude/skills/captain/scripts/captain.py enroll [--replace]              # make this session the captain
 python3 ~/.claude/skills/captain/scripts/captain.py ask <target>... [--force]       # one status request per idle target
-python3 ~/.claude/skills/captain/scripts/captain.py collect [<msg>...] [--wait MS]  # each answer as it lands
+python3 ~/.claude/skills/captain/scripts/captain.py watch <target>...               # those sessions report each task end
+python3 ~/.claude/skills/captain/scripts/captain.py watch all                       # every session, new and restarted too
+python3 ~/.claude/skills/captain/scripts/captain.py watches                         # the open watch and its members
+python3 ~/.claude/skills/captain/scripts/captain.py collect [<msg>...] [--wait MS] [--from N]  # each answer as it lands
 python3 ~/.claude/skills/captain/scripts/captain.py reports [--json] [<msg>...]     # latest per session, or by request
-python3 ~/.claude/skills/captain/scripts/captain.py cancel <msg>                    # close a request or relay left open
+python3 ~/.claude/skills/captain/scripts/captain.py cancel <msg>                    # close a request, relay or watch
 python3 ~/.claude/skills/captain/scripts/captain.py relay <target>...               # show the human's newest message
 python3 ~/.claude/skills/captain/scripts/captain.py relay <terminal>... --entry <uuid> --digest <hex>  # send what it showed
 python3 ~/.claude/skills/captain/scripts/captain.py withdraw <action>               # take back a relay
@@ -109,17 +112,41 @@ opened or replaced in a target terminal since refuses, and you preview again.
   but never close one, type `/exit`, kill a process or terminal, or ask a target to close itself. `cancel` closes a
   ledger item only. A relayed instruction that ends a target's own work, such as removing its worktree, is the
   target's to do under its own rules.
+- **Watch** when the human wants to hear each time a session finishes, not once: `watch all`, their bare "watch"
+  included, or `watch <target>...`. It types into no session: each session it covers joins it itself, through
+  `hooks/captain` at its next Stop or after a compaction or `/clear`, and from then on reports at the end of each task,
+  a blocker or a need for the human included. `all` covers every other session, new ones and restarts too; named
+  targets cover those sessions, a restart in their terminal and a resume of one elsewhere, and a new terminal only
+  under `all`. A later `watch` widens the one open watch. It ends when this session ends, exits, is cleared or
+  replaced as captain, or on `cancel <watch>` on the human's word; no one session stops alone. A session joins only
+  once its turn ends, so one that has not worked since says nothing. A watch holds no request slot: asks and relays
+  to a watched session go as usual. `watches` lists it and its members, each live, gone or unknown; a restarted
+  session is a new member. A member with no report may be working still or may have lost its brief, which nothing
+  confirms: it gets the brief again at a compaction, `/clear` or its own `brief --pending`, and an `ask` reaches it
+  meanwhile.
 - **Collect** under one Monitor, at its maximum `timeout_ms`, on
   `python3 ~/.claude/skills/captain/scripts/captain.py collect <msg>... --wait <ms>` with the ids `ask` and `relay`
   printed and `<ms>` a minute under the timeout: without ids it waits only for what is still open, and misses an
   answer that already landed. A failure shows as the Monitor's exit code. Each line is `reported <msg> · <state>`,
   with `· needs you` when the report names a need, `accepted`, an outcome, `withdrawn`, `cancelled`, `undelivered` or
   `refused by the session that replaced its target`, when another session took the target's terminal before the
-  send; `pending <msg>...` means the wait lapsed: re-arm, or `cancel` what will not answer.
+  send; `pending from <M>: <msg>...` means the wait lapsed: re-arm, or `cancel` what will not answer. While a watch
+  is open, keep that Monitor on `collect --from <M>` with no ids, M from `watch`'s `armed from <M>` line for the first
+  one and from the last line of the collect before after that (`done from <M>` or `pending from <M>: ...`), and
+  re-arm it at each lapse until a `watch ended <watch>` or `cancelled <watch>` line names the watch's id: it prints
+  `watching <member>` as a session joins and `reported <member>:<N>` for each report, N naming that one report. A
+  `watch` that widens the open watch leaves that Monitor as it is. If the cursor is lost, re-arm with no `--from`: it
+  prints only what lands from then on, and `watches` names each member's latest report. While the watch is open, an
+  `ask` or `relay` starts no Monitor of its own: the watch's collect follows every request and relay sent after its
+  cursor and prints their lines too, but never `done`, so the table is due once each id they printed has its closing
+  line - `reported <msg>`, an outcome, `cancelled`, `undelivered` or `refused ...` - or at the next lapse, with
+  `reports` marking any still open.
 - **The table** comes from `reports --json <msg>...` with this collection's request ids and those `not asked` named, run
-  once `collect` ended or lapsed, never from Monitor lines, which a long line can cut: each id gets the report that
-  answered it, even one a later report from that session superseded. If the output itself is abbreviated, run it again
-  with fewer ids, down to one; a row still cut says so, its needs never pieced together.
+  once `collect` ended, lapsed or, sharing a watch's Monitor, closed each id, never from Monitor lines, which a long
+  line can cut: each id gets the report that answered it, even one a later report from that session superseded; a
+  watch's report is `<member>:<N>` as the `reported` line named it, one row per line, so a later report never hides an
+  earlier need. If the output itself is abbreviated, run it again with fewer ids, down to one; a row still cut says so,
+  its needs never pieced together.
 - **File** a follow-up issue as `agents/captain.md` says, from a title and a body drafted under
   `~/.cache/agentrc/captain/drafts/`:
 
@@ -148,3 +175,9 @@ from the ledger, once, and only while the session that sent it is still the enro
 prompt line, under your own rules and never wider: a merge still needs the human's words to name the PR, and a message
 addressed to several sessions grants you only your part. Then run `outcome` as `accept` prints; ask a question back
 as `needs-clarification`, never through a dialog.
+
+A watch's brief, `STATUS WATCH <member> ...`, reaches you through `hooks/captain`: at a Stop, which it holds once with
+the brief, or after a compaction or `/clear`. Do what it says: report each task end as its final tool action, before
+your completion message, until `report` says the watch ended. If a compaction leaves the brief out of view, `brief
+--pending` joins the open watch covering this session or prints its brief again; `none` means there is nothing to
+report to.
