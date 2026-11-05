@@ -60,6 +60,10 @@ class InstallTest(unittest.TestCase):
     def commands(self, data):
         return {e: [h['command'] for g in gs for h in g['hooks']] for e, gs in data.get('hooks', {}).items()}
 
+    def gate_stops(self, data):
+        """The simplify gate's Stop commands, other hooks' left out."""
+        return [c for c in self.commands(data)['Stop'] if 'simplify-gate' in c]
+
     # --- selection ------------------------------------------------------------
 
     def test_nothing_is_selected_by_default_and_bad_selections_are_usage_errors(self):
@@ -123,10 +127,12 @@ class InstallTest(unittest.TestCase):
         self.ok('install', '--skill')
         launcher = (self.claude / 'hooks' / 'simplify-gate' / 'simplify-gate').as_posix()  # bash runs it, also on Windows
         guards = [guard_command(self.claude / 'hooks' / 'headless-chief' / g) for g in ('shadow_guard.py', 'chief_guard.py')]
+        watch = guard_command(self.claude / 'hooks' / 'captain' / 'captain_hook.py')
         data = self.settings()
         self.assertEqual(data['model'], 'x')
-        self.assertEqual(self.commands(data), {'SessionStart': ['other'], 'Stop': ['other-stop', launcher],
+        self.assertEqual(self.commands(data), {'SessionStart': ['other', watch], 'Stop': ['other-stop', watch, launcher],
                                                'UserPromptSubmit': [launcher], 'PreToolUse': guards})
+        self.assertEqual(data['hooks']['SessionStart'][-1]['matcher'], 'compact|clear')
         self.assertEqual([g['matcher'] for g in data['hooks']['PreToolUse']], ['Workflow|Agent', 'Bash|Write'])
         stop = data['hooks']['Stop'][-1]['hooks'][0]
         self.assertEqual(stop['timeout'], 650)
@@ -152,7 +158,7 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stderr)
         data = json.loads((home / '.claude' / 'settings.json').read_text())
         launcher = (home / '.claude' / 'hooks' / 'simplify-gate' / 'simplify-gate').as_posix()
-        command = data['hooks']['Stop'][0]['hooks'][0]['command']
+        [command] = self.gate_stops(data)
         self.assertEqual(command, f"'{launcher}'")
         if os.name == 'nt':  # Claude Code runs it through bash: a backslash path would lose its separators
             done = subprocess.run([shutil.which('bash'), '-c', f'printf %s {command}'], capture_output=True, text=True)
@@ -176,7 +182,7 @@ class InstallTest(unittest.TestCase):
         (self.claude / 'settings.json').write_text(json.dumps({'hooks': {'Stop': [
             {'hooks': [{'type': 'command', 'command': command}]} for command in old]}}))
         self.ok('install', '--skill')
-        self.assertEqual(self.commands(self.settings())['Stop'], [Path(launcher).as_posix()])
+        self.assertEqual(self.gate_stops(self.settings()), [Path(launcher).as_posix()])
 
     def test_a_home_with_quotes_or_spaces_keeps_one_entry_per_hook(self):
         for name in ("O'Brien", "O'Brien Doe", 'John Doe'):
@@ -198,7 +204,7 @@ class InstallTest(unittest.TestCase):
                                           text=True, env=env)
                     self.assertEqual(done.returncode, 0, done.stderr)
                     data = json.loads((claude / 'settings.json').read_text())
-                    self.assertEqual(self.commands(data)['Stop'], [shlex.quote(launcher.as_posix())])
+                    self.assertEqual(self.gate_stops(data), [shlex.quote(launcher.as_posix())])
                     self.assertEqual(self.commands(data)['PreToolUse'].count(guard_command(guard)), 1)
                     self.assertEqual(len(self.commands(data)['PreToolUse']), 2, 'each guard once')
                 done = subprocess.run([sys.executable, str(SCRIPT), 'remove', '--skill'], capture_output=True,
@@ -460,10 +466,12 @@ class ProjectInstallTest(unittest.TestCase):
         data = self.local()
         self.assertEqual(data['env'], {'AGENTRC_DIR': ROOT.as_posix()})
         hooks = claude / 'hooks'
+        watch = guard_command(hooks / 'captain' / 'captain_hook.py')
         self.assertEqual(TestCommands.of(data), {
+            'SessionStart': [watch],
             'PreToolUse': [guard_command(hooks / 'headless-chief' / g) for g in ('shadow_guard.py', 'chief_guard.py')],
             'UserPromptSubmit': [shlex.quote((hooks / 'simplify-gate' / 'simplify-gate').as_posix())],
-            'Stop': [shlex.quote((hooks / 'simplify-gate' / 'simplify-gate').as_posix())]})
+            'Stop': [watch, shlex.quote((hooks / 'simplify-gate' / 'simplify-gate').as_posix())]})
         self.assertFalse((claude / 'settings.local.json.before-agentrc').exists())
         self.assertEqual(self.status(), '', 'every link and settings.local.json excluded')
         block = self.block()
@@ -811,7 +819,8 @@ class ProjectInstallTest(unittest.TestCase):
         self.git('add', '-A')
         self.git('commit', '-qm', 'own hook')
         self.ok('install', '--project', str(self.repo), '--skill', '--skip-clashes')
-        self.assertEqual(sorted(TestCommands.of(self.local())), ['Stop', 'UserPromptSubmit'], 'no PreToolUse guard')
+        self.assertEqual(sorted(TestCommands.of(self.local())), ['SessionStart', 'Stop', 'UserPromptSubmit'],
+                         'no PreToolUse guard')
 
     def test_a_dead_link_of_ours_is_pruned_with_its_entry(self):
         self.ok('install', '--project', str(self.repo), '--workflow')
