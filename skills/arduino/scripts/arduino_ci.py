@@ -13,15 +13,17 @@ with its HIL profile (arduino_hil.py's names; HIL, the checkout-relative hil_tes
   pack --board B --record FILE --out DIR --run-id N --attempt N [--roster R]
       (hosted) the tree hil_remote.py would stage for B's clean record at HEAD (contract files, roster, agentrc
       closure, record and images, manifest.json), under DIR/B, with provenance.json {board, head, runId, attempt}.
-  run --hosted DIR --head SHA --run-id N --out DIR [-b B]... [--lock-wait S] [--deadline S] [--prune-days N] ROSTER
+  run --hosted DIR --head SHA --run-id N --attempt N --out DIR [-b B]... [--lock-wait S] [--deadline S]
+      [--prune-days N] ROSTER
       (rig) one board at a time: DIR/B admitted (provenance and manifest name this run, B and SHA; every file pinned
       by the manifest, no link, no stray file; its roster this checkout's) and moved to OUT/B/tree, then
       `hil_test.py run --staged` there, each attempt in OUT/B/run-<n>. A locked board is admitted again every
       LOCK_POLL s up to --lock-wait; a fail is retried once (the `hil` Caller rules: a passing retry is flaky).
       Every attempt starts only before the --deadline (seconds from start; a started battery always finishes its
       restore); a board it stops is not-run "deadline", a fail it denies a retry stays failed. Writes
-      OUT/summary.json, also the last stdout line. Before the boards, removes OUT's siblings named <run>-<attempt>
-      older than --prune-days whose summary shows every board finished clean; nothing else is ever removed.
+      OUT/summary.json, recording --attempt (admission ignores the tree's), also the last stdout line. Before the
+      boards, removes OUT's siblings named <run>-<attempt> older than --prune-days whose summary shows every board
+      finished clean; nothing else is ever removed.
 
 Exits: setup/pack 0 done, 2 refused; run 0 every board passed, 1 a board failed or did not run, 2 a blocker (a
 cleanup holder, a recovery blocker, a run without a report), a run a signal aborted, or refused before any board.
