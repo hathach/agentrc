@@ -331,8 +331,8 @@ recovery stay the contract's. Linux only.
 
 ## Shared mechanisms
 
-A project's harness loads these from the agentrc it pins, as it loads the lock
-helper; each script's docstring is its contract. They carry mechanics only:
+A project's harness loads these from the agentrc its bootstrap selects, as it
+loads the lock helper; each script's docstring is its contract. They carry mechanics only:
 rosters, the boards and cases a run selects, images, retries, report fields and
 recovery stay the contract's.
 
@@ -340,6 +340,7 @@ recovery stay the contract's.
 |---|---|
 | `hil_boards.py` | each board's flasher from the board registry by probe serial (Board registry above) |
 | `hil_load.py` | the one path loader: one module per file per process, a second path under one name refused |
+| `agentrc_source.py` | the identity of the agentrc a harness loads: its closure, commit and digests, the staged copy and its manifest, drift, the record comparison |
 | `hil_process.py` | `run_cmd`, a bounded command; `run_tracked` and `recheck`, a command whose end is proven |
 | `hil_farm_check.py` | the farm check engine a project's launcher drives with its profile (Farm check above) |
 | `hil_report_notice.py` | the unavailable notice and the report writer lock, loadable when the core is not (`write_unavailable`) |
@@ -362,6 +363,15 @@ recovery stay the contract's.
   that is missing. What a harness requires and stages is each script it loads
   plus its `FILES`, never a restated list; `hil_report_notice.py` and
   `hil_openocd_esp_receipt.py` load alone.
+- A project's bootstrap picks its agentrc without importing any: the staged
+  copy when `<project root>/.agentrc/` exists (a staging driver writes it; any
+  gap there is an error, never a fall-through), the project's pinned commit in
+  CI (`GITHUB_ACTIONS` or `CI` true, a malformed value refused; only CI
+  fetches it), else the installed `"${AGENTRC_DIR:-$HOME/.claude}"`. It checks
+  `agentrc_source.py`'s `API` literal before running it, then binds the
+  identity `frozen()` takes once per process. Records bind `portable()`,
+  the commit and closure digests, and admission refuses a record that binds
+  none or another (`mismatch`); a stage copies the closure with `stage()`.
 - The farm check engine releases a board it reserved (`protected=True`) only
   once every process it started there is proven ended: `run_tracked`'s
   `done`, or a `recheck` of its receipt that answers `done`. Anything else
