@@ -696,6 +696,14 @@ class Recheck(Case):
                          ('incremental', self.reviewed, self.reviewed, self.reviewed))
         self.assertEqual(p['groups'], ['src/fix'])
 
+    def test_an_unmoved_head_is_the_same_head_and_an_unmerged_base_is_no_merge(self):
+        self.assertEqual(self.recheck()['mode'], 'same')
+        self.commit('src/fix/f.c', 'int f;\n', 'repair')
+        self.push_pr()
+        self.on_main('src/usb/m.c', 'int main_only;\n', 'main, not merged')
+        p = self.recheck()
+        self.assertEqual((p['mode'], p['scopeBase'], p['mergeBase']), ('incremental', self.reviewed, self.base))
+
     def test_a_base_merge_leaves_its_imports_out_and_keeps_the_repair_and_a_later_fix(self):
         self.commit('src/fix/f.c', 'int f;\n', 'repair')
         self.on_main('src/usb/m.c', 'int main_only;\n', 'main: new file')
@@ -795,7 +803,7 @@ class Recheck(Case):
         ledger_file.write_text(json.dumps(led))
         with self.assertRaisesRegex(facts.Unusable, 'not one submitted on'):
             self.recheck()
-        for extra in (['--full'], ['--auto-fix'], ['--check', '--expected-head', head]):
+        for extra in (['--full'], ['--auto-fix'], ['--check', '--expected-head', head], ['--release', '--token', 'ab']):
             with self.assertRaisesRegex(facts.Unusable, '--recheck-from'):
                 self.prepare('--recheck-from', self.reviewed, *extra)
         with self.assertRaisesRegex(facts.Unusable, 'full SHA'):
