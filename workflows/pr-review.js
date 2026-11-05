@@ -28,6 +28,8 @@ if (typeof args === 'string') {
 const SHA = /^[0-9a-f]{40}$/
 // The one scale, defined in finding-verifier.md's Severity section.
 const LEVELS = ['critical', 'high', 'medium', 'low', 'nit']
+// Never above approval, and never raised new on a recheck.
+const MINOR = ['nit']
 const CONFIDENCE = ['high', 'medium', 'low']
 const IMPACT = {
   type: ['object', 'null'], additionalProperties: false,
@@ -108,8 +110,7 @@ if (!check || check.error || check.ok !== true || check.head !== head || !check.
 }
 // A scope other than the one prepare pinned could leave changes unreviewed and still approve.
 const want = { mergeBase, scopeBase, mode: discussion ? 'same' : args.mode, groups: args.groups, recheckFrom }
-const pinsOf = (p) => p && { ...p, recheckFrom: p.recheckFrom ?? null }
-const off = Object.keys(want).filter(k => JSON.stringify(want[k]) !== JSON.stringify((pinsOf(check.pins) || {})[k]))
+const off = Object.keys(want).filter(k => JSON.stringify(want[k]) !== JSON.stringify((check.pins || {})[k]))
 if (off.length) return blocked('scope-mismatch', `args differ from prepare's pins for this head in ${off.join(', ')}: ${JSON.stringify(check.pins)}`)
 const ci = check.ci
 
@@ -241,7 +242,7 @@ const found = audit.confirmed.flatMap(u => u.findings.map(f => ({
   ...gradeOf(f), why: f.why, snippet: f.snippet, verdictReason: f.verdict.reason, status: 'open',
 })))
 // A recheck raises no new nit, by its verified grade: a nit on a repair would only start another round.
-const raised = (f) => !recheckFrom || f.severity !== 'nit'
+const raised = (f) => !recheckFrom || !MINOR.includes(f.severity)
 const suppressed = found.filter(f => !raised(f))
 if (suppressed.length) log(`${suppressed.length} new nit(s) not raised on a recheck: ${suppressed.map(f => `${f.file}:${f.line}`).join(', ')}`)
 const ours = found.filter(raised)
@@ -362,7 +363,6 @@ const keyOf = (x, own) => x.group != null ? `g${x.group}` : own
 
 // The verdict is this rule, not a model's judgment.
 const BLOCKING = ['critical', 'high']
-const MINOR = ['nit']
 const where = (file, line) => `\`${file}${line ? `:${line}` : ''}\``
 // One entry per defect: each group counts once, at its strongest grade.
 const byDefect = new Map()

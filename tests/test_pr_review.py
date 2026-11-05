@@ -670,10 +670,14 @@ class Recheck(Case):
         Path(p['ledger']).write_text(json.dumps(led))
 
     def on_main(self, path, text, msg):
-        """A commit on the base branch, the PR's own branch checked out again after it."""
+        """A commit on the base branch, None text deleting path, the PR's own branch checked out again after it."""
         sh(self.work, 'git', 'fetch', '--quiet', 'origin')
         sh(self.work, 'git', 'checkout', '--quiet', '--detach', 'origin/main')
-        self.commit(path, text, msg)
+        if text is None:
+            sh(self.work, 'git', 'rm', '--quiet', path)
+            sh(self.work, 'git', 'commit', '--quiet', '-m', msg)
+        else:
+            self.commit(path, text, msg)
         sh(self.work, 'git', 'push', '--quiet', 'origin', 'HEAD:main')
         sh(self.work, 'git', 'checkout', '--quiet', 'main')
 
@@ -758,12 +762,7 @@ class Recheck(Case):
         self.assertNotIn('main_far', diff)
 
     def test_another_conflict_kind_is_refused_never_widened(self):
-        sh(self.work, 'git', 'fetch', '--quiet', 'origin')
-        sh(self.work, 'git', 'checkout', '--quiet', '--detach', 'origin/main')
-        sh(self.work, 'git', 'rm', '--quiet', 'src/core/a.c')
-        sh(self.work, 'git', 'commit', '--quiet', '-m', 'main: delete a.c')
-        sh(self.work, 'git', 'push', '--quiet', 'origin', 'HEAD:main')
-        sh(self.work, 'git', 'checkout', '--quiet', 'main')
+        self.on_main('src/core/a.c', None, 'main: delete a.c')
         self.assertNotEqual(self.merge_main(), 0)
         sh(self.work, 'git', 'add', 'src/core/a.c')
         sh(self.work, 'git', 'commit', '--quiet', '-m', 'merge main, kept a.c')

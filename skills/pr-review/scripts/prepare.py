@@ -400,20 +400,19 @@ def hold(top, pr, wt, token):
     return {'state': 'held', 'token': token} if run_of(reason, pr) == token else {'state': 'foreign', 'token': None}
 
 
+def ancestor(a, b):
+    return run('git', 'merge-base', '--is-ancestor', a, b, ok=(0, 1))[0] == 0
+
+
 def mode_of(led, head, merge_base, full):
     rev = last(led)
     if full or not rev:
         return 'full', merge_base, rev and rev['head']
     if rev['head'] == head:
         return 'same', merge_base, head
-    ancestor = run('git', 'merge-base', '--is-ancestor', rev['head'], head, ok=(0, 1))[0] == 0
-    if ancestor and rev.get('mergeBase') == merge_base:
+    if ancestor(rev['head'], head) and rev.get('mergeBase') == merge_base:
         return 'incremental', rev['head'], rev['head']
     return 'full', merge_base, rev['head']
-
-
-def ancestor(a, b):
-    return run('git', 'merge-base', '--is-ancestor', a, b, ok=(0, 1))[0] == 0
 
 
 def merged_base(pr, reviewed, merge_base, head):
@@ -428,18 +427,18 @@ def merged_base(pr, reviewed, merge_base, head):
             raise Unusable(f'git merge-tree {reviewed} {merge_base} reported a conflict it did not name')
         i = fields.index('', 1)
         conflicts = fields[1:i]
-        kinds = set()
+        named = False
         i += 1
         while i < len(fields) and fields[i].isdigit():
             n = int(fields[i])
             paths, kind = fields[i + 1:i + 1 + n], fields[i + 1 + n]
             if kind.startswith('CONFLICT'):
-                kinds.add(kind)
+                named = True
                 if kind != 'CONFLICT (contents)':
                     raise Unusable(f"the base merge since {reviewed} has a {kind} conflict in {', '.join(paths)}: a scoped "
                                    'recheck reads only a contents conflict; the recheck is pending')
             i += 3 + n
-        if not kinds or not conflicts:
+        if not named or not conflicts:
             raise Unusable(f'git merge-tree {reviewed} {merge_base} reported a conflict it did not name')
     if not FULL_SHA.match(tree):
         raise Unusable(f'git merge-tree {reviewed} {merge_base} wrote no tree: {out[:200]!r}')
@@ -454,16 +453,13 @@ def merged_base(pr, reviewed, merge_base, head):
 
 
 def recheck_of(led, pr, reviewed, head, merge_base):
-    """(mode, scope base, prior head, conflicts) of the recheck after a repair from our review submitted on reviewed."""
-    rev = submitted_last(led, reviewed)
-    if head == reviewed:
-        return 'same', merge_base, head, []
-    if not ancestor(reviewed, head):
-        return 'full', merge_base, reviewed, []
-    if rev.get('mergeBase') == merge_base:
-        return 'incremental', reviewed, reviewed, []
-    scope_base, conflicts = merged_base(pr, reviewed, merge_base, head)
-    return 'incremental', scope_base, reviewed, conflicts
+    """(mode, scope base, conflicts) of the recheck after a repair from our review submitted on reviewed: mode_of's,
+    but a base merge since, which moved the merge base, scopes from merged_base's commit instead of the whole PR."""
+    submitted_last(led, reviewed)
+    mode, scope_base, _ = mode_of(led, head, merge_base, False)
+    if mode != 'full' or not ancestor(reviewed, head):
+        return mode, scope_base, []
+    return ('incremental', *merged_base(pr, reviewed, merge_base, head))
 
 
 def prepare(a):
@@ -486,10 +482,12 @@ def prepare(a):
             auto = ' --auto' if online[-1].get('publish') == 'auto' else ''
             raise Unusable(f"a review POST for {online[-1]['head']} may have landed unseen: reconcile it first with "
                            f"post.py --pr {a.pr} --expected-head {online[-1]['head']}{auto}, which only looks for it by its marker")
+        conflicts = []
         if a.recheck_from:
-            mode, scope_base, prior, conflicts = recheck_of(led, a.pr, a.recheck_from, head, merge_base)
+            mode, scope_base, conflicts = recheck_of(led, a.pr, a.recheck_from, head, merge_base)
+            prior = a.recheck_from
         else:
-            (mode, scope_base, prior), conflicts = mode_of(led, head, merge_base, a.full), []
+            mode, scope_base, prior = mode_of(led, head, merge_base, a.full)
         reuse = reused_review(led, head) if a.auto_fix and mode == 'same' else {}
         if 'deferredAnswers' not in reuse:
             refuse_unsettled(led, head, ('pending',))
