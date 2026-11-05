@@ -37,6 +37,8 @@ Every engine takes flash/RAM buckets from the elf's section and program headers
 (section_buckets()); the other engines' 'all' sums what they attribute.
 
 Profile (a module; required unless marked optional):
+  PROFILE_API: the profile protocol version it follows, the engine's PROFILE_API (now 1); main()
+      refuses another. A profile moves to the new value once it follows the change that bumped it.
   NAME: the project's files label ("TinyUSB"); ROOT: the checkout; OUT_DIR: the reports dir,
       gitignored; BASE_BRANCH: diff's default --base-branch.
   DEFAULT_ENGINE (optional): --engine's default, else membrowse; it must be an offered one.
