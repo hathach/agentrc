@@ -2551,6 +2551,14 @@ class Fixable(PostCase):
         self.assertEqual(([f['id'] for f in got['fix']], got['held'], got['autoPost']), (['pr7-f1', 'pr7-f2'], [], True))
         self.assertIsNone(self.review()['findings'][1].get('commentId'), 'the second finding stands in the review body')
 
+    def test_a_recheck_s_suppressed_nit_is_nothing_to_repair_or_hold(self):
+        led = json.loads(Path(self.p['ledger']).read_text())
+        led['reviews'][-1]['suppressed'] = [{'file': 'src/core/a.c', 'line': 5, 'dimension': 'correctness', 'severity': 'nit',
+                                            'why': 'naming', 'reason': 'recheck-nit'}]
+        Path(self.p['ledger']).write_text(json.dumps(led))
+        got = self.fixable()
+        self.assertEqual(([f['id'] for f in got['fix']], got['held'], got['autoPost']), (['pr7-f1', 'pr7-f2'], [], True))
+
     def test_an_edited_inline_comment_is_held_and_sends_the_recheck_to_the_human(self):
         next(c for c in self.gh.inline if c['id'] == self.root)['body'] = 'b is never initialised (edited)'
         got = self.fixable()
