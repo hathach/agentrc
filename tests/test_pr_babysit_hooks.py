@@ -1,5 +1,7 @@
 """Tests for pr-babysit's hooks.py against real pre-commit runs in a temp repository."""
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import re
@@ -8,6 +10,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -182,7 +185,7 @@ class HooksTest(unittest.TestCase):
         log = Path(self.repo.parent) / 'runs.log'
         code, out = self.run_script('a.txt', env={**self.env, 'HOOK_LOG': str(log)})
         self.assertEqual((code, out['ran'], out['passed'], out['modifiedBy']), (0, True, False, []))
-        # the HEAD rerun is the hook alone in another tree, never a second pass here
+        # the HEAD rerun is the hook alone in another tree; the pass after it skips the excused hook
         self.assertEqual(log.read_text().splitlines(), ['run', 'run'])
         self.assertEqual(out['baselineFailed'], ['counted'])
 
@@ -258,6 +261,17 @@ class HooksTest(unittest.TestCase):
         self.assertTrue(done.stdout.strip(), done.stderr)
         out = json.loads(done.stdout.splitlines()[-1])
         self.assertEqual((done.returncode, out['baselineFailed'], out['notRerun']), (0, ['broken'], []))
+
+    def test_heads_tree_is_checked_out_without_the_repositorys_git_hooks(self):
+        # A post-checkout hook failing, or writing into the tree, would fail or change the first rerun.
+        self.configure('ok', 'broken')
+        hook = self.repo / '.git' / 'hooks' / 'post-checkout'
+        hook.write_text('#!/bin/sh\necho hooked > hooked.txt; exit 1\n')
+        hook.chmod(0o755)
+        (self.repo / 'a.txt').write_text('edited\n')
+        code, out = self.run_script('a.txt')
+        self.assertEqual((code, out.get('error'), out['baselineFailed']), (0, None, ['broken']))
+        self.assertEqual(len(self.worktrees()), 1)
 
     def test_each_head_rerun_starts_from_a_clean_head(self):
         # nolitter fails here only on what litter left: on HEAD it must not inherit litter's rerun.
@@ -452,9 +466,9 @@ class HooksTest(unittest.TestCase):
         self.assertEqual(len(self.worktrees()), 1)
 
     def test_hooks_run_with_the_checkouts_abbrev_and_a_same_content_rewrite_passes(self):
-        # pre-commit compares `git diff` text around each hook; a stat-only rewrite once lengthened the
-        # unstaged diff's abbreviated index hashes and failed it (#377). abbrev checks the hooks get the length the
-        # checkout abbreviates to, not a full one, and same shows such a rewrite is not a modification.
+        # pre-commit compares `git diff` text around each hook: same's stat-only rewrite leaves it alike, pinned or
+        # not. abbrev checks the hooks get the length the checkout abbreviates to, not a full one; the pack test
+        # below is the one that fails unpinned (#377).
         self.configure('same', 'abbrev')
         (self.repo / 'a.txt').write_text('edited\n')
         code, out = self.run_script('a.txt', 'b.txt', env={**self.env, 'ABBREV': str(self.abbrev())})
@@ -587,7 +601,7 @@ class ForgetTest(unittest.TestCase):
         cwd = os.getcwd()
         os.chdir(self.repo)
         self.addCleanup(os.chdir, cwd)
-        patch = mock.patch.dict(os.environ, self.env)
+        patch = mock.patch.dict(os.environ, self.env, clear=True)
         patch.start()
         self.addCleanup(patch.stop)
 
@@ -616,17 +630,44 @@ class ForgetTest(unittest.TestCase):
                 raise hooks.Unusable('git worktree remove: refused')
             return real(deadline, start, *argv, cwd=cwd)
         with mock.patch.object(hooks, 'git_within', failing_remove):
-            hooks.forget(tree, tmp, 10, time.monotonic())
+            hooks.forget(tmp, 10, time.monotonic())
         self.assertFalse(os.path.exists(tmp))
         self.assertEqual(len(self.worktrees()), 1)
 
-    def test_a_lock_that_cannot_be_removed_never_raises(self):
+    def test_another_worktree_whose_tree_is_missing_keeps_its_registration(self):
+        # A moved or unmounted worktree of the user's is prunable, but not this run's to drop.
+        other = self.repo.parent / 'other'
+        self.git('worktree', 'add', '--detach', '--quiet', str(other), 'HEAD')
+        shutil.rmtree(other)
         tmp, tree = self.head_tree()
-        with mock.patch.object(hooks, 'git_within', side_effect=hooks.Unusable('git worktree remove: refused')), \
-                mock.patch.object(hooks.Path, 'unlink', side_effect=PermissionError('read-only')) as unlink:
-            hooks.forget(tree, tmp, 10, time.monotonic())
-        unlink.assert_called_once_with(missing_ok=True)
+        with mock.patch.object(hooks, 'git_within', side_effect=hooks.Unusable('git worktree remove: refused')):
+            hooks.forget(tmp, 10, time.monotonic())
         self.assertFalse(os.path.exists(tmp))
+        self.assertEqual(len(self.worktrees()), 2, 'the head tree goes, the other stays registered')
+
+    def test_what_cannot_be_removed_is_named_and_never_raises(self):
+        tmp, tree = self.head_tree()
+        admin = hooks.registration(tree)
+        stderr = io.StringIO()
+        with mock.patch.object(hooks, 'git_within', side_effect=hooks.Unusable('git worktree remove: refused')), \
+                mock.patch.object(hooks.shutil, 'rmtree'), contextlib.redirect_stderr(stderr):
+            hooks.forget(tmp, 10, time.monotonic())
+        self.assertIn(f"HEAD's worktree could not be removed: {tmp}, {admin}", stderr.getvalue())
+        self.assertTrue(admin.exists(), 'a registration whose tree stays is kept')
+
+    @unittest.skipUnless(threading.current_thread() is threading.main_thread(), 'handlers run on the main thread')
+    def test_a_signal_during_the_cleanup_is_delivered_after_it(self):
+        tmp, tree = self.head_tree()
+        held = signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+        self.addCleanup(signal.signal, signal.SIGTERM, held)
+
+        def terminated_remove(*_, **__):
+            signal.raise_signal(signal.SIGTERM)
+            raise hooks.Unusable('git worktree remove: killed')
+        with mock.patch.object(hooks, 'git_within', terminated_remove), self.assertRaises(SystemExit):
+            hooks.forget(tmp, 10, time.monotonic())
+        self.assertFalse(os.path.exists(tmp))
+        self.assertEqual(len(self.worktrees()), 1)
 
     def admin(self, gitdir):
         admin = self.repo / '.git' / 'worktrees' / 'other'
@@ -894,7 +935,7 @@ class AsCheckoutTest(unittest.TestCase):
         # A pid, a line, a duration or an address differs between runs; a file, rule or symbol naming a digit does not.
         self.assertEqual(hooks.comparable('a.c:12:3: E501 in 0.5s (pid 4242) at 0x7f00ab\n', '/x'),
                          hooks.comparable('a.c:14:9: E501 in 125ms (pid 77) at 0x7f11cd\n', '/x'))
-        for head, change in (('usb2.c:1: bad\n', 'cdc1.c:1: bad\n'), ('a.c:1: E501 bad\n', 'a.c:1: E502 bad\n'),
+        for head, change in (('usb2.c:1: bad\n', 'usb3.c:1: bad\n'), ('a.c:1: E501 bad\n', 'a.c:1: E502 bad\n'),
                              ('a.c:1: x1 unused\n', 'a.c:1: x2 unused\n'),
                              ('src/ccdriver.c: bad\n', 'src/ccsensor.c: bad\n'),
                              ('./src/temp/ccdriver.c:bad\n', './src/temp/ccsensor.c:bad\n'),
@@ -925,7 +966,7 @@ class ResultsTest(unittest.TestCase):
             hooks.results(f'fmt{"." * 70}Passed\n- hook id: fmt\n- files were modified by this hook\n', 1)
 
     def test_a_failed_hook_carries_its_first_output_line(self):
-        out = (f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n\n\n{"=" * 70}\n  error: no compiler  \nmore\n'
+        out = (f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n\n\n{"=" * 70}\n  error: no compiler  \nmore\n\n'
                f'gen{"." * 70}Failed\n- hook id: gen\n- exit code: 2\n'
                f'doc{"." * 50}(no files to check)Skipped\n'
                f'cut{"." * 70}Failed\n- hook id: cut\n- exit code: 1\n\n{"x" * 300}\n')
@@ -938,6 +979,16 @@ class ResultsTest(unittest.TestCase):
         self.assertEqual([f['output'] for f in hooks.results(out, 1)[1]], [
             f'- exit code: 1\n\n\n{"=" * 70}\n  error: no compiler  \nmore', '- exit code: 2',
             f'- exit code: 1\n\n{"x" * 300}'])
+
+    def test_a_result_line_the_hook_printed_is_its_output(self):
+        # pre-commit pads its own result lines to one width and prints a hook's output between blank lines.
+        said = f'x.c:1: bad\n\nReport.....Passed\nx.c:2: worse\nstep{"." * 69}Failed\nx.c:3: worst'
+        out = f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n\n{said}\n\ngen{"." * 70}Passed\n'
+        self.assertEqual([f['output'] for f in hooks.results(out, 1)[1]], [f'- exit code: 1\n\n{said}'])
+
+    def test_terminal_escapes_and_control_characters_never_reach_the_error(self):
+        out = f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n\n\x1b[31m\x1b[0m\n\x1b[31merror:\x07\tbad\x1b[0m\n'
+        self.assertEqual(hooks.results(out, 1)[1][0]['error'], 'error:  bad')
 
     def test_only_the_block_under_a_result_line_counts(self):
         out = (f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n\n'

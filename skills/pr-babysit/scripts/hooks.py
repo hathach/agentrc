@@ -7,9 +7,10 @@ Run from the checkout's top level. Prints the tree status and a snapshot of
 PATH plus every path the status names, runs `pre-commit run --files PATH...`
 when .pre-commit-config.yaml exists (once more if it failed after a hook
 modified files), then the status and snapshot again. All runs, the HEAD reruns below included, get N
-seconds (default 540, inside the 600 a relay's Bash call allows); past that
-the pre-commit process tree is killed and the result is an error. Status lines are `git status --porcelain -z`
-records, each untracked file its own; snapshot lines are `<644|755> <blob> <path>` or `absent - <path>`.
+seconds (default 540), and removing HEAD's tree after them CLEANUP (20) more, inside the 600 a relay's Bash call
+allows; past N the pre-commit process tree is killed and the result is an error. Status lines are
+`git status --porcelain -z` records, each untracked file its own; snapshot lines are `<644|755> <blob> <path>` or
+`absent - <path>`.
 
 stdout ends with one JSON line {ran, passed, modifiedBy, failed, baselineFailed,
 notRerun, before, after, snapshotBefore, snapshotAfter, seal} (seal:
@@ -30,8 +31,11 @@ the config takes as its alias (SKIP skips those hooks too, and a fail_fast stop
 at one leaves the rest unchecked), nor any when the config cannot be read:
 with PyYAML, or without it by pre-commit's own interpreter when the #! line of
 pre-commit's entry script names a python by absolute path (not on Windows);
-notRerun is {hook, why} for each failed hook not rerun there. Each rerun gets a
-clean HEAD tree. The tree has only what HEAD tracks: a hook that needs the
+notRerun is {hook, why} for each failed hook not rerun there; error and why hold
+no terminal escapes or control characters, as commits.py's detail. Each rerun gets
+a clean HEAD tree, checked out without the repository's git hooks; removing it
+removes its own registration, no other, and stderr names what stays. The tree has
+only what HEAD tracks: a hook that needs the
 checkout's ignored files (fetched dependencies) fails there differently and
 stays counted. A change that leaves a hook's output the same once masked is
 still excused: a hook that prints only a count of its violations, or a new
@@ -52,6 +56,7 @@ Exit 0 with that line; exit 2 with {"error": ...} when the facts cannot be
 collected or pre-commit's output contradicts its exit status.
 """
 
+import contextlib
 import functools
 import json
 import os
@@ -61,10 +66,13 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import unicodedata
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
+from commits import bounded as copyable  # noqa: E402
 from facts import Unusable, checkout_top, git, report, status  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
 import windows  # noqa: E402
@@ -85,7 +93,7 @@ RESULT = re.compile(r'\.(Passed|Failed)$')
 # Any hook's result line, `(no files to check)Skipped` included: where the hook output above it ends.
 NEXT = re.compile(r'[.)](Passed|Failed|Skipped)$')
 ERROR_CHARS = 200
-# Seconds past the deadline the HEAD worktree's removal may take, and its registration's prune after it.
+# Seconds past the deadline the HEAD worktree's removal may take.
 CLEANUP = 20
 # Run by pre-commit's own interpreter, which depends on PyYAML, when this one lacks it: the config as JSON.
 LOAD_CONFIG = 'import json, sys, yaml; print(json.dumps(yaml.safe_load(open(sys.argv[1], encoding="utf-8"))))'
@@ -143,20 +151,27 @@ def snapshot(paths, records):
     return lines
 
 
-def printed(lines):
-    """What the hook printed: its lines up to the next hook's result."""
+def width(line):
+    """line's width as pre-commit pads its result lines (commands/run.py _len_cjk): a wide character counts two."""
+    return sum(2 if unicodedata.east_asian_width(c) in 'FW' else 1 for c in line)
+
+
+def printed(lines, cols):
+    """What the hook printed: its lines up to the next hook's result. pre-commit prints a hook's output between blank
+    lines and pads every result line to one width, cols, so a result-like line the hook printed is its output."""
     for n, line in enumerate(lines):
-        if NEXT.search(line):
+        if NEXT.search(line) and width(line) == cols and not (n and lines[n - 1]):
             return lines[:n]
     return lines
 
 
 def first_error(lines, block):
-    """The first line with a word the hook printed, skipping rules such as unittest's `=====`; its last `- ` line
-    when it printed none."""
+    """The first line with a word the hook printed, skipping rules such as unittest's `=====`, bounded for a relay to
+    copy; its last `- ` line when it printed none."""
     for line in lines:
-        if re.search(r'[^\W_]', line):
-            return line.strip()[:ERROR_CHARS]
+        text = copyable(line).strip()
+        if re.search(r'[^\W_]', text):
+            return text[:ERROR_CHARS]
     return block[-1][2:] if block else 'no output'
 
 
@@ -187,7 +202,7 @@ def results(output, exit_code):
                 raise Unusable(f'pre-commit reported hook {hook} passed and modified files')
             ids.append(hook)
         if failed:
-            said = printed(lines[i + 1 + len(block):])
+            said = printed(lines[i + 1 + len(block):], width(lines[i - 1]))
             failures.append({'hook': hook, 'error': first_error(said, block),
                              'output': '\n'.join([*block, *said]).rstrip()})
     return ids, failures
@@ -306,7 +321,8 @@ def git_within(deadline, start, *argv, cwd=None):
     """git argv, held to the same deadline as the hooks: a checkout filter or hook of its own can hang it."""
     # `worktree add` checks HEAD out into GIT_INDEX_FILE when set: the caller's index, its staged changes lost.
     env = other_repo_env() if cwd else other_repo_env(('GIT_INDEX_FILE',))
-    code, _, err = bounded(['git', *argv], deadline, start, f'git {argv[0]}', cwd, env)
+    command = next(a for a in argv if not a.startswith('-') and '=' not in a)
+    code, _, err = bounded(['git', *argv], deadline, start, f'git {command}', cwd, env)
     if code:
         raise Unusable(f"git {' '.join(argv)}: {err.strip()}")
 
@@ -373,7 +389,7 @@ def pre_commits_load(deadline, start):
     except OSError as e:
         return None, f"pre-commit's {argv[0]} cannot run ({type(e).__name__})"
     if code:
-        last = (err.strip().splitlines() or [f'exit {code}'])[-1]
+        last = copyable((err.strip().splitlines() or [f'exit {code}'])[-1]).strip()
         return None, f"pre-commit's {argv[0]} cannot read {CONFIG} ({last[:ERROR_CHARS]})"
     return json.loads(out), ''
 
@@ -422,26 +438,43 @@ def registration(tree):
     return None
 
 
-def forget(tree, tmp, deadline, start):
-    """Remove the HEAD worktree and its registration, one a kill left half made and locked included; a failure here
-    never hides the run's own result."""
+@contextlib.contextmanager
+def signals_held():
+    """Ctrl-C and SIGTERM delivered once the block ends, not inside it; a no-op off the main thread, where Python runs
+    no handler."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    caught = []
+    held = {s: signal.signal(s, lambda n, _: caught.append(n)) for s in (signal.SIGINT, signal.SIGTERM)}
     try:
-        git_within(deadline + CLEANUP, start, 'worktree', 'remove', '--force', '--force', tree)
-    except Unusable:
-        pass
-    admin = registration(tree)
-    shutil.rmtree(tmp, ignore_errors=True)
-    if admin:
+        yield
+    finally:
+        for s, handler in held.items():
+            signal.signal(s, signal.SIG_DFL if handler is None else handler)
+        if caught:
+            signal.raise_signal(caught[0])
+
+
+def forget(tmp, deadline, start):
+    """Remove the HEAD worktree in tmp and its registration, one a kill left half made and locked included, a signal
+    held till done so it cannot cut that short; a failure here never hides the run's own result, and stderr names
+    what stays."""
+    tree = os.path.join(tmp, 'head')
+    with signals_held():
         try:
-            # `worktree add` keeps the entry locked while it initializes, and prune spares a locked entry.
-            (admin / 'locked').unlink(missing_ok=True)
-        except OSError:
-            pass
-        try:
-            # prune drops only an entry whose tree is gone, so it runs after the tree is deleted.
-            git_within(CLEANUP, time.monotonic(), 'worktree', 'prune')
+            git_within(deadline + CLEANUP, start, 'worktree', 'remove', '--force', '--force', tree)
         except Unusable:
             pass
+        admin = registration(tree)
+        shutil.rmtree(tmp, ignore_errors=True)
+        if admin and not os.path.lexists(tree):
+            # What `git worktree prune` does to this entry alone: prune drops every unlocked entry whose tree is
+            # missing, another session's moved or unmounted worktree included.
+            shutil.rmtree(admin, ignore_errors=True)
+        left = [str(p) for p in (tmp, admin) if p and os.path.lexists(p)]
+        if left:
+            print(f"hooks.py: HEAD's worktree could not be removed: {', '.join(left)}", file=sys.stderr)
 
 
 def baseline(expected, paths, deadline, start):
@@ -451,9 +484,11 @@ def baseline(expected, paths, deadline, start):
     entry under its id, never pre-commit refusing an id HEAD's config does not have."""
     failing = []
     tmp = tempfile.mkdtemp(prefix='hooks-base-')
-    tree = os.path.join(tmp, 'head')
     try:
-        git_within(deadline, start, 'worktree', 'add', '--detach', '--quiet', tree, 'HEAD')
+        tree = os.path.join(tmp, 'head')
+        # tmp holds no hook: a post-checkout or reference-transaction hook would change or fail HEAD's tree.
+        git_within(deadline, start, '-c', f'core.hooksPath={tmp}', 'worktree', 'add', '--detach', '--quiet', tree,
+                   'HEAD')
         for i, (hook, outputs) in enumerate(expected.items()):
             if i:
                 # What an earlier rerun rewrote or left behind could fail the next one: each gets HEAD as is.
@@ -463,7 +498,7 @@ def baseline(expected, paths, deadline, start):
             if [comparable(f['output'], tree) for f in results(out, code)[1] if f['hook'] == hook] == outputs:
                 failing.append(hook)
     finally:
-        forget(tree, tmp, deadline, start)
+        forget(tmp, deadline, start)
     return failing
 
 
