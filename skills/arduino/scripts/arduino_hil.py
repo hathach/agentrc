@@ -764,6 +764,10 @@ def render(body):
                 lines.append(f'- {r["board"]} {t["test"]}: {t["detail"]}')
         if r['detail']:
             lines.append(f'- {r["board"]}: {r["detail"]}')
+        drifted = (r.get('firmware') or {}).get('driftedHeaders')
+        if drifted:
+            lines.append(f'- {r["board"]}: its core\'s bundled copy of the library differs from the checkout in '
+                         f'{", ".join(drifted)}; the result covers that mix')
     return '\n'.join(lines) + '\n'
 
 

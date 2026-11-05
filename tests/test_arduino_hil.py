@@ -1339,6 +1339,11 @@ class Report(Base):
         self.assertIn('b echo: no echo', md)
         self.assertIn('caveat: aborted', md)
         self.assertEqual((H.verdict(row), H.exit_code([row]), H.exit_code([])), ('fail', 1, 1))
+        self.assertNotIn('bundled copy', md)
+        row['firmware'] = {'driftedHeaders': ['src/a.h', 'src/b.h']}
+        self.assertIn('- b: its core\'s bundled copy of the library differs from the checkout in src/a.h, src/b.h; '
+                      'the result covers that mix', H.render({'pass': True, 'caveat': '', 'exitCode': 0,
+                                                             'results': [row]}))
 
     def test_schema_is_the_profiles(self):
         self.A.report.BodySchema = lambda **kw: kw

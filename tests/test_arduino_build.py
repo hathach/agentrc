@@ -399,6 +399,9 @@ class Provenance(Lib):
         got = [(h['counterpart'], h['matches']) for h in ab.foreign_headers(build)]
         self.assertEqual(sorted(got), [('src/fake.h', False), ('src/fake.h', True), ('src/only_there.h', False),
                                        ('src/ports/fa/port.cpp', False)])
+        core = {Path(h['path']): h['core'] for h in ab.foreign_headers(build, [None, str(d / 'core')])}
+        self.assertEqual(core, {same: True, other: True, gone: True, spaced / 'src/fake.h': False})
+        self.assertFalse(any(h['core'] for h in ab.foreign_headers(build)))
 
     def fake_compile(self, used=None, success=True, err='', platform='/x'):
         used = [{'name': fake.NAME, 'install_dir': str(self.root)}] if used is None else used
@@ -752,15 +755,15 @@ class Record(RecordCase):
         self.assertEqual(seen[0], ('rig_jlink', [(0x4000, 0x4020)], 'echo', ab.rig_roster(self.roster)['rig_jlink']))
 
     def test_drifted_header_of_the_build_core_is_recorded(self):
-        hdr = [{'path': '/x/libraries/Lib/src/a.h', 'counterpart': 'src/a.h', 'matches': False},
-               {'path': '/b/libraries/Lib/src/c.h', 'counterpart': 'src/c.h', 'matches': False}]
-        row = {**self.samd_row(headers=hdr), 'buildPlatform': {'id': 'vend:arch', 'install_dir': '/b'}}
-        rec, err = self.record(row)
+        hdr = [{'path': '/x/libraries/Lib/src/a.h', 'counterpart': 'src/a.h', 'matches': False, 'core': True},
+               {'path': '/x/libraries/Lib/src/b.h', 'counterpart': 'src/b.h', 'matches': True, 'core': True}]
+        rec, err = self.record(self.samd_row(headers=hdr))
         self.assertIsNone(err)
         self.assertEqual(rec['sketches']['echo']['foreignHeaders'], hdr)
 
     def test_drifted_header_outside_the_core_refused_unless_experimental(self):
-        hdr = [{'path': '/core/x.h', 'matches': False}, {'path': '/x/y.h', 'matches': False}]
+        hdr = [{'path': '/core/x.h', 'matches': False, 'core': False},
+               {'path': '/x/y.h', 'matches': False, 'core': True}]
         _, err = self.record(self.samd_row(headers=hdr))
         self.assertIn("outside the core that differ from this checkout: ['/core/x.h']", err)
         rec, err = self.record(self.samd_row(headers=hdr), experimental=True)

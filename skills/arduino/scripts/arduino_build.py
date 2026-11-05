@@ -581,9 +581,10 @@ def tool_version():
     return _cli_json('version').get('VersionString')
 
 
-def foreign_headers(build_dir):
+def foreign_headers(build_dir, cores=()):
     """Headers a build's .d files took from another copy of this library (a core's bundled one, another checkout),
-    or in a core from another copy of the core, each with its counterpart path here and whether the bytes match."""
+    or in a core from another copy of the core, each with its counterpart path here, whether the bytes match and
+    whether it lies in one of the build's `cores`."""
     found, roots, seen = {}, {}, set()
     for dfile in Path(build_dir).rglob('*.d'):
         text = dfile.read_text(errors='replace').replace('\\\n', ' ')
@@ -600,7 +601,7 @@ def foreign_headers(build_dir):
                 digest, exists = sha256(p), counterpart.exists()
                 found[token] = {'path': token, 'counterpart': rel(counterpart) if exists else
                                 p.relative_to(root).as_posix(), 'sha256': digest,
-                                'matches': exists and digest == sha256(counterpart)}
+                                'matches': exists and digest == sha256(counterpart), 'core': within(p, cores)}
     return sorted(found.values(), key=lambda h: h['path'])
 
 
@@ -708,8 +709,8 @@ def compile_sketch(board, example, build_dir, properties, prepared, config=None)
             row.update(status='failed', firstError=f'{P.LIBRARY_NAME} came from '
                        f'{used[0]["install_dir"] if used else "nowhere"}, not this checkout')
             return row
-    bad, shadows = unexplained_libraries(used_libs, prepared,
-                                         [platform.get('install_dir'), build_platform.get('install_dir')])
+    cores = [platform.get('install_dir'), build_platform.get('install_dir')]
+    bad, shadows = unexplained_libraries(used_libs, prepared, cores)
     if bad:
         row.update(status='failed', firstError=f'compiled against libraries outside the prepared dependencies and '
                    f'the core: {bad}', remedy='add them to library.properties depends= or the profile\'s '
@@ -722,7 +723,7 @@ def compile_sketch(board, example, build_dir, properties, prepared, config=None)
             row.update(status='failed', firstError=f'{boot_app0} missing: the ESP core layout changed')
             return row
         shutil.copy2(boot_app0, build_dir / boot_app0.name)
-    headers = foreign_headers(build_dir)
+    headers = foreign_headers(build_dir, cores)
     if core_mode() and headers:   # the isolated environment reaches no other copy: one leaking in fails the sketch
         row.update(status='failed', foreignHeaders=headers,
                    firstError=f'compiled against another copy of the core: {[h["path"] for h in headers][:3]}')
@@ -1026,8 +1027,7 @@ def make_record(args, board, rows, before, diff, roster_path, prepared):
                          f'outside the board span [{lo:#x}, {hi:#x})'
         if not args.experimental:
             # a core's bundled copy lags the library between core releases: recorded, the report shows the drift
-            cores = [(row.get(k) or {}).get('install_dir') for k in ('platform', 'buildPlatform')]
-            bad = [h['path'] for h in row['foreignHeaders'] if not h['matches'] and not within(h['path'], cores)]
+            bad = [h['path'] for h in row['foreignHeaders'] if not h['matches'] and not h['core']]
             if bad:
                 return None, f'{row["example"]}: compiled against headers outside the core that differ from this ' \
                              f'checkout: {bad}'
