@@ -76,11 +76,13 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   confusing one.
 - Match the surrounding file's comment density and style; don't add comments
   to untouched code while editing something nearby.
-- Same rule for commit messages and PR descriptions: imperative subject, and a
+- Same rule for commit messages and PR titles: imperative subject. A commit
   body only when there is a *why* the diff cannot show (cause, trade-off,
-  measurement, spec/issue reference). A one-line message is a fine message.
+  measurement, spec/issue reference). A one-line commit is a fine commit.
 - PR descriptions: keep scope focused, link relevant issues, and state the
-  test/build evidence there rather than in commit bodies.
+  test/build evidence there rather than in commit bodies. Give the cause a
+  `## Problem` section and the fix a `## Solution` section, never one paragraph
+  running into the other.
 - Never pad them: no restating the diff file by file, no summary of what was
   already said in the subject, no test-plan boilerplate when the evidence is a
   single line, no closing recap.
