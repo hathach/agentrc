@@ -254,7 +254,7 @@ def install_host(cfg, src, add_runner=None, check=False):
                             'that takes a reinstall, or for a runner its re-registration')
     elif (FARM_HOME / 'farm.toml').exists():
         raise FarmError(f'{FARM_HOME} holds an install with no host file ({INSTALLED_HOST}); that takes a reinstall')
-    guard(sorted(runner_units(set(new['runner']) | (set(old['runner']) if old else set()))))
+    guard(sorted(runner_units(new['runner'])))
     if check:
         return False
     INSTALLED_HOST.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
