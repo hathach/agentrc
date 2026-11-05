@@ -595,6 +595,8 @@ class ForgetTest(unittest.TestCase):
         self.repo.mkdir()
         self.env = git_env()
         self.git('init', '-q')
+        # git 2.56's auto maintenance, detached by the commit below, prunes the prunable entries these tests make
+        self.git('config', 'maintenance.auto', 'false')
         (self.repo / 'a.txt').write_text('a\n')
         self.git('add', '-A')
         self.git('commit', '-qm', 'base')
