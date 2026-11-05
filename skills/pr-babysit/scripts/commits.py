@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Commit by path, and read back what commits hold, for pr-babysit to audit before it publishes.
 
-  commits.py commit [--skip-hooks IDS] [--receipt FILE --request R] PATH...  commit exactly PATH, with the message on stdin
+  commits.py commit [--skip-hooks IDS] [--receipt FILE --request R] PATH...  commit exactly PATH, with the message
+    on stdin
   commits.py receipt FILE --request R --parent P PATH...  read back what a `commit --receipt FILE` printed
   commits.py head --parent P PATH...  audit the commit at HEAD, made on P from PATH
   commits.py chain FROM TO --published P --base B --tip T  audit FROM..TO for adoption (full SHAs), P the PR's head,
@@ -194,7 +195,8 @@ def outcome(paths, skip=()):
     # --literal-pathspecs: a file named like pathspec magic, such as `:(top)*`, is that file only.
     before = git('rev-parse', 'HEAD').strip()
     git('--literal-pathspecs', 'add', '--', *paths)
-    code, out, err = attempt('git', '--literal-pathspecs', 'commit', '--only', '-F', '-', '--', *paths, input=message, env=env)
+    code, out, err = attempt('git', '--literal-pathspecs', 'commit', '--only', '-F', '-', '--', *paths, input=message,
+                             env=env)
     said = (out + err).strip().splitlines()
     tail = ' / '.join(said[-5:])
     after = git('rev-parse', 'HEAD').strip()
