@@ -74,6 +74,8 @@ SCRIPTS = {
     'headslow': 'if grep -q edited "$@"; then echo fails; exit 1; fi; echo $$ > "$HOOK_PID"; sleep 30\n',
     # Empties b.txt on its first run anywhere, then fails without modifying anything, on HEAD in the same words.
     'once': 'if [ ! -e "$ONCE" ]; then : > "$ONCE"; : > b.txt; fi; echo "no compiler"; exit 1\n',
+    # Prints, after a blank line, a line shaped as pre-commit's next result, then what only the change brings in.
+    'mimic': f'printf "no compiler\\n\\nReport{"." * 67}Passed\\n"; grep -q edited "$@" && echo "a.txt: new"; exit 1\n',
 }
 
 
@@ -445,6 +447,14 @@ class HooksTest(unittest.TestCase):
         self.assertEqual(out['failed'], [{'hook': 'picky', 'error': 'a.txt'}])
         self.assertEqual(out['baselineFailed'], [])
         self.assertEqual(len(self.worktrees()), 1)
+
+    def test_what_a_hook_prints_after_a_result_line_of_its_own_is_compared_with_head(self):
+        self.configure('mimic', 'ok')
+        (self.repo / 'a.txt').write_text('edited\n')
+        code, out = self.run_script('a.txt')
+        self.assertEqual((code, out['passed']), (0, False))
+        self.assertEqual(out['failed'], [{'hook': 'mimic', 'error': 'no compiler'}])
+        self.assertEqual(out['baselineFailed'], [])
 
     def test_a_hook_head_does_not_configure_is_never_excused_by_it(self):
         # pre-commit refusing an unknown id exits 1 on HEAD, but that is not the hook failing there.
@@ -987,6 +997,14 @@ class ResultsTest(unittest.TestCase):
         said = f'x.c:1: bad\n\nReport.....Passed\nx.c:2: worse\nstep{"." * 69}Failed\nx.c:3: worst'
         out = f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n\n{said}\n\ngen{"." * 70}Passed\n'
         self.assertEqual([f['output'] for f in hooks.results(out, 1)[1]], [f'- exit code: 1\n\n{said}'])
+
+    def test_a_result_line_the_hook_printed_after_a_blank_line_is_its_output_too(self):
+        # Only the result lines below pre-commit's own blank line end the output: what follows a mimic stays in it.
+        said = f'x.c:1: bad\n\nReport{"." * 67}Passed\nx.c:2: new'
+        out = (f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n\n{said}\n\ngen{"." * 70}Passed\n'
+               f'doc{"." * 50}(no files to check)Skipped\ncut{"." * 70}Failed\n- hook id: cut\n- exit code: 1\n')
+        self.assertEqual([f['output'] for f in hooks.results(out, 1)[1]],
+                         [f'- exit code: 1\n\n{said}', '- exit code: 1'])
 
     def test_terminal_escapes_and_control_characters_never_reach_the_error(self):
         out = f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n\n\x1b[31m\x1b[0m\n\x1b[31merror:\x07\tbad\x1b[0m\n'

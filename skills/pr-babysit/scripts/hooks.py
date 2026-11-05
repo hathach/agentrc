@@ -157,12 +157,14 @@ def width(line):
 
 
 def printed(lines, cols):
-    """What the hook printed: its lines up to the next hook's result. pre-commit prints a hook's output between blank
-    lines and pads every result line to one width, cols, so a result-like line the hook printed is its output."""
-    for n, line in enumerate(lines):
-        if NEXT.search(line) and width(line) == cols and not (n and lines[n - 1]):
-            return lines[:n]
-    return lines
+    """What the hook printed: lines, all from its `- ` block to the next block's result line, less the result lines
+    ending them. pre-commit ends a hook's output with a blank line and pads every result line to one width, cols, so
+    only the run of those below that blank line is its own; a result-like line above it, after a blank line or not,
+    the hook printed."""
+    n = len(lines)
+    while n and NEXT.search(lines[n - 1]) and width(lines[n - 1]) == cols:
+        n -= 1
+    return lines[:n]
 
 
 def first_error(lines, block):
@@ -182,11 +184,11 @@ def results(output, exit_code):
     A block counts only directly under a result line; the hook's output follows
     the block after a blank line, so a marker it echoes is not read as one."""
     lines = output.splitlines()
+    heads = [i for i, line in enumerate(lines) if line.startswith(HOOK_ID) and i and RESULT.search(lines[i - 1])]
     ids, failures = [], []
-    for i, line in enumerate(lines):
-        if not (line.startswith(HOOK_ID) and i and RESULT.search(lines[i - 1])):
-            continue
-        hook = line[len(HOOK_ID):].strip()
+    # Each block's lines end at the next block's result line.
+    for i, end in zip(heads, [*heads[1:], len(lines) + 1]):
+        hook = lines[i][len(HOOK_ID):].strip()
         failed = lines[i - 1].endswith('Failed')
         block = []
         for tail in lines[i + 1:]:
@@ -202,7 +204,7 @@ def results(output, exit_code):
                 raise Unusable(f'pre-commit reported hook {hook} passed and modified files')
             ids.append(hook)
         if failed:
-            said = printed(lines[i + 1 + len(block):], width(lines[i - 1]))
+            said = printed(lines[i + 1 + len(block):end - 1], width(lines[i - 1]))
             failures.append({'hook': hook, 'error': first_error(said, block),
                              'output': '\n'.join([*block, *said]).rstrip()})
     return ids, failures
