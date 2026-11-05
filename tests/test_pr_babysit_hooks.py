@@ -89,6 +89,9 @@ SCRIPTS = {
     # Under what it prints on HEAD too, prints on the change only a nested run's verbose result and its output.
     'appends': f'echo "x.c:1: bad"; grep -q edited "$@" && printf "\\nReport{"." * 67}Passed\\n- hook id: sub\\n'
                '- duration: 0.1s\\n\\nx.c:2: new\\n"; exit 1\n',
+    # Prints, after a blank line, a nested run's failed result, its block and its output, alike on HEAD and the change.
+    'nestedfail': f'printf "x.c:1: bad\\n\\nReport{"." * 67}Failed\\n- hook id: nested\\n- exit code: 1\\n'
+                  '- files were modified by this hook\\n\\nchecked\\n"; exit 1\n',
 }
 
 
@@ -504,6 +507,14 @@ class HooksTest(unittest.TestCase):
         self.assertEqual(out['failed'], [{'hook': 'appends', 'error': 'x.c:1: bad'}])
         self.assertEqual(out['baselineFailed'], [])
 
+    def test_a_failed_result_a_hook_prints_alike_on_head_is_no_failure_of_a_hook_the_config_lacks(self):
+        self.configure('nestedfail', 'ok')
+        (self.repo / 'a.txt').write_text('edited\n')
+        code, out = self.run_script('a.txt')
+        self.assertEqual((code, out['passed'], out['modifiedBy']), (0, False, []))
+        self.assertEqual(out['failed'], [{'hook': 'nestedfail', 'error': 'x.c:1: bad'}])
+        self.assertEqual((out['baselineFailed'], out['notRerun']), (['nestedfail'], []))
+
     def test_hooks_failing_alike_on_head_are_each_excused_whatever_follows(self):
         (self.repo / '.pre-commit-config.yaml').write_text(CONFIG.format(''.join(
             HOOK.format(id=i).replace(f'hooks/{i}.sh', 'hooks/nocc.sh') for i in ('aaa', 'bbb', 'ccc'))))
@@ -872,10 +883,12 @@ class RunHooksTest(unittest.TestCase):
         self.assertEqual((ids, [f['hook'] for f in failures], excused), (['fmt'], ['broken'], ['broken']))
 
     def test_a_hook_the_run_without_the_excused_finds_unexcusable_is_never_rerun_and_says_why(self):
-        # fail_fast hid them behind broken: one rewrites files there, one SKIP cannot name, one shares its id.
-        Path(hooks.CONFIG).write_text(CONFIG.format(''.join(HOOK.format(id=i) for i in ('broken', 'dup', 'dup'))))
+        # fail_fast hid them behind broken: one rewrites files there, one SKIP cannot name, one shares its id. The
+        # config runs them in that order, and pre-commit ends each hook's output with a blank line.
+        ids = ('broken', 'fmt', 'a,b', 'dup', 'dup')
+        Path(hooks.CONFIG).write_text(CONFIG.format(''.join(HOOK.format(id=i) for i in ids)))
         fmt = 'fmt' + '.' * 70 + 'Failed\n- hook id: fmt\n- exit code: 1\n- files were modified by this hook\n'
-        hidden = fmt + self.BROKEN.replace('broken', 'a,b') + self.BROKEN.replace('broken', 'dup')
+        hidden = fmt + self.BROKEN.replace('broken', 'a,b') + '\n' + self.BROKEN.replace('broken', 'dup')
         with mock.patch.object(hooks, 'pre_commit', lambda *a, skip=(), **k: (1, hidden if skip else self.BROKEN)), \
                 mock.patch.object(hooks, 'baseline', return_value=['broken']) as baseline:
             _, _, ids, failures, excused, not_rerun = hooks.run_hooks(['a.txt'])
@@ -1092,7 +1105,25 @@ class ResultsTest(unittest.TestCase):
                      f'x.c:1: bad\n\nReport{"." * 60}Skipped\n\nx.c:2: new'):
             with self.subTest(said):
                 out = f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n\n{said}\n\ngen{"." * 70}Passed\n'
-                self.assertEqual(hooks.results(out, 1)[1][0]['outputs'][0], (f'- exit code: 1\n\n{said}', None))
+                failures = hooks.results(out, 1)[1]
+                self.assertEqual([f['hook'] for f in failures], ['fmt'])
+                self.assertEqual(failures[0]['outputs'][0], (f'- exit code: 1\n\n{said}', None))
+
+    def test_a_failed_result_the_hook_printed_counts_only_where_pre_commits_next_may_be(self):
+        # Under a blank line in pre-commit's shape, nested's result may end fmt's output only where the config runs
+        # nested after fmt, or where the config is unread.
+        said = (f'x.c:1: bad\n\nReport{"." * 67}Failed\n- hook id: nested\n- exit code: 1\n'
+                '- files were modified by this hook\n\nx.c:2: new')
+        out = f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n\n{said}\n\ngen{"." * 70}Passed\n'
+        for order, found in ((None, ['fmt', 'nested']), (['fmt', 'nested', 'gen'], ['fmt', 'nested']),
+                             (['fmt', 'gen'], ['fmt']), (['nested', 'fmt', 'gen'], ['fmt'])):
+            with self.subTest(order):
+                ids, failures = hooks.results(out, 1, order)
+                self.assertEqual(([f['hook'] for f in failures], ids), (found, found[1:]))
+        # pre-commit's own results past an end stay counted, a passed and a skipped one between them
+        out = (f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n\nx.c:1: bad\n\ngen{"." * 70}Passed\n'
+               f'doc{"." * 50}(no files to check)Skipped\ncut{"." * 70}Failed\n- hook id: cut\n- exit code: 1\n')
+        self.assertEqual([f['hook'] for f in hooks.results(out, 1, ['fmt', 'gen', 'doc', 'cut'])[1]], ['fmt', 'cut'])
 
     def test_a_verbose_result_the_hook_printed_may_end_its_output_naming_a_later_hook(self):
         # Either result may be pre-commit's next; nested's ends fmt only where the config runs nested after fmt.

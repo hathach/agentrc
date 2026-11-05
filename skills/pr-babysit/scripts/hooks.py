@@ -40,6 +40,7 @@ checkout's ignored files (fetched dependencies) fails there differently and
 stays counted. Run alone there, all a hook prints after its block is its own; on the change its output may end at
 any later result shaped as pre-commit's whose block, if one follows, names a hook the config runs after it, as a
 result it printed may look alike, or at the end, and it is excused only when HEAD's matches it at one of those. A
+result inside its output at each of those is one it printed, no other hook's failure or rewrite. A
 line only the change prints keeps it counted, unless it follows all HEAD's output under such a result, as a nested
 pre-commit run naming a later hook's id would print. A change that leaves a hook's output the same once masked is
 still excused: a hook that prints only a count of its violations, or a new
@@ -215,17 +216,21 @@ def first_error(lines, block):
     return block[-1][2:] if block else 'no output'
 
 
-def results(output, exit_code):
+def results(output, exit_code, order=None):
     """(ids of the hooks whose own `- ` block says they modified files, {hook, error, outputs} of each failed hook,
     outputs an (output, after) for each of its ends: its whole `- ` block and what it printed up to there).
 
     A block counts only directly under a result line; the hook's output follows
-    the block after a blank line, so a marker it echoes is not read as one."""
+    the block after a blank line, so a marker it echoes is not read as one. Under
+    a failed hook's block, a result counts only at or past an end of its output
+    where pre-commit's next result may be (follows(), order the config's, None
+    unread): one only inside it at each is a result the hook printed itself."""
     lines = output.splitlines()
     runs = {}
     ids, failures = [], []
+    first_end = 0  # of the last failed hook's output, where pre-commit's next result may be
     for i, line in enumerate(lines):
-        if not (line.startswith(HOOK_ID) and i and RESULT.search(lines[i - 1])):
+        if not (line.startswith(HOOK_ID) and i and RESULT.search(lines[i - 1])) or i - 1 < first_end:
             continue
         hook = line[len(HOOK_ID):].strip()
         failed = lines[i - 1].endswith('Failed')
@@ -248,9 +253,16 @@ def results(output, exit_code):
                 runs[cols] = own_runs(lines, cols)
             k = i + 1 + len(block)
             cuts = ends(lines, k, runs[cols])
+            first_end = min(m for m, after in cuts if follows(hook, after, order))
             failures.append({'hook': hook, 'error': first_error(lines[k:cuts[0][0]], block),
                              'outputs': [('\n'.join([*block, *lines[k:m]]).rstrip(), after) for m, after in cuts]})
     return ids, failures
+
+
+def follows(hook, after, order):
+    """Whether pre-commit's next result after hook's output may be one whose block names after (None: no block
+    follows): any when order, the config's ids in run order, is None, else one order runs after hook."""
+    return after is None or order is None or hook in order and after in order[order.index(hook) + 1:]
 
 
 def kill_tree(proc):
@@ -557,18 +569,16 @@ def compared(failure, order):
     """comparable() of the failed hook's output at each end pre-commit's next result may be: the end, or a result
     whose block, when one follows, names a hook order runs after it. One the hook printed may name any, so a change
     that adds a nested pre-commit run's result under HEAD's output stays counted unless it names such a hook."""
-    hook = failure['hook']
-    later = order[order.index(hook) + 1:] if hook in order else []
-    return [comparable(out, os.getcwd()) for out, after in failure['outputs'] if after is None or after in later]
+    return [comparable(out, os.getcwd()) for out, after in failure['outputs'] if follows(failure['hook'], after, order)]
 
 
-def passes(paths, deadline, start, what, skip=()):
+def passes(paths, deadline, start, what, config, skip=()):
     """(exit code, ids of the hooks that modified files, the last run's failures) of pre-commit on paths, run once
-    more when it failed after a hook modified files."""
+    more when it failed after a hook modified files; config() is config_ids', read once a run fails."""
     ids = []
     for attempt in (1, 2):
         code, out = pre_commit(paths, deadline, start, f'{what} {attempt}', skip=skip)
-        modified, failures = results(out, code)
+        modified, failures = results(out, code, config()[1] if code else None)
         ids += [h for h in modified if h not in ids]
         # A rerun repairs what a hook rewrote; the same failure again only spends another pass (#140).
         if not code or not modified:
@@ -580,8 +590,9 @@ def run_hooks(paths, deadline=DEADLINE):
     if not os.path.exists(CONFIG):
         return False, True, [], [], [], []
     start = time.monotonic()
-    code, ids, failures = passes(paths, deadline, start, 'run')
-    shared, order, unread = config_ids(deadline, start) if failures else (set(), [], '')
+    config = functools.cache(lambda: config_ids(deadline, start))
+    code, ids, failures = passes(paths, deadline, start, 'run', config)
+    shared, order, unread = config() if failures else (set(), [], '')
     found, excused, not_rerun = failures, [], {}
     while True:
         expected = {}
@@ -597,7 +608,7 @@ def run_hooks(paths, deadline=DEADLINE):
             break
         # fail_fast may have stopped the run at an excused hook: every other hook must pass on the change, as the
         # commit will run them with the same SKIP, or fail on HEAD too.
-        again, more, found = passes(paths, deadline, start, 'without the excused', skip=excused)
+        again, more, found = passes(paths, deadline, start, 'without the excused', config, skip=excused)
         ids += [h for h in more if h not in ids]
         failures += found
         if again and not found:
