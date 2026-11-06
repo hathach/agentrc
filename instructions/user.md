@@ -250,6 +250,12 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   tracker, or without authority to publish to it (a headless session), put
   the same issue-ready handoff in the final message and name the action
   that needs my authorization.
+- File a deferred defect only with a concrete supported trigger, its
+  consequence, and evidence: an observed occurrence, an executable
+  reproduction or a verified causal path in the source; state its provenance
+  and what stays uncertain. A reviewer's unconfirmed hypothesis gets an
+  explicit disposition in the review or task handoff, not an issue. An
+  enhancement I asked for stays eligible.
 
 # Reference docs
 - Hardware manuals, datasheets, reference manuals, errata, schematics and spec
