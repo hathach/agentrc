@@ -4,13 +4,15 @@
 
 The rig gets binaries only: the library's contract files, the roster, the build records with their images and the
 agentrc closure the harness loads, each pinned by digest in manifest.json, in a create-only attempt dir
-<P.REMOTE_BASE>/<run-id> (agentrc hil_remote_core). Local records and collections live under .hil-remote/.
+<P.REMOTE_BASE>/<run-id> (agentrc hil_remote_core). Local records and collections live under P.REMOTE_RUNS.
 
 A library's `hil_remote.py` calls run(profile, argv) with its HIL profile (arduino_hil.py), which adds:
 
   REMOTE_BASE    the rig dir attempts go under, one per library (~/hil-remote/<library>)
   REMOTE_ROSTER  the roster `run` and `session open` default to
   HIL            the library's hil_test.py, checkout-relative (what runs on the rig)
+  REMOTE_RUNS    optional: the checkout-relative dir of local records and collections (default .hil-remote), for a
+                 checkout whose .gitignore the library cannot edit: it must be ignored, a record needs a clean tree
 
 The usage and exits are the library's HIL SKILL.md (Execution).
 """
@@ -70,7 +72,7 @@ def bind(profile):
 
 
 def runs():
-    return P.ROOT / '.hil-remote'
+    return P.ROOT / getattr(P, 'REMOTE_RUNS', '.hil-remote')
 
 
 def rel(path):

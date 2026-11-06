@@ -232,6 +232,16 @@ class Session(Checkout):
         self.assertEqual(out['restoreRecord'], f'build/hil/{BOARD}.build.json')
         self.assertNotEqual(self.open()['reason'], out['reason'])   # the same run id again, another library's say
 
+    def test_a_profile_keeps_its_records_under_its_remote_runs(self):
+        with mock.patch.object(self.HP, 'REMOTE_RUNS', 'build/.hil-remote', create=True):
+            self.assertEqual(R.runs(), self.root / 'build/.hil-remote')
+            self.open()
+            self.assertTrue((self.root / 'build/.hil-remote/s1.session.json').is_file())
+            rc, closed = self.main('session', 'close', 's1')
+            self.assertEqual((rc, closed['closed']), (0, True))
+        self.assertFalse((self.root / '.hil-remote').exists())
+        self.assertEqual(R.runs(), self.root / '.hil-remote')
+
     def test_open_without_the_hold_says_so_and_acts_under_none(self):
         self.rig_exit['lock'] = 1
         rc, out = self.main('session', 'open', '--run-id', 's1', '-b', BOARD)
