@@ -18,14 +18,15 @@ flags; other arguments become an unrecognised count), and the repository's own s
 never command text. Exit 0 complete, 1 partial (a root missing or unreadable), 2 refused.
 """
 import argparse
-import datetime
+import functools
 import json
 import os
 import re
-import subprocess
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from audit import Refused, aware, create, git  # noqa: E402
 
 INTERPRETERS = re.compile(r'^(?:python(?:3(?:\.\d+)?)?|py|bash|sh|zsh|node|pwsh)$')
 PREFIXES = {'sudo', 'env', 'timeout', 'nohup', 'exec', 'time', 'command', 'nice', 'stdbuf', 'setsid'}
@@ -51,37 +52,22 @@ BUILTIN_AGENTS = {'general-purpose', 'Explore', 'Plan', 'fork', 'claude-code-gui
 LOCATORS = 50
 
 
-class Refused(Exception):
-    pass
-
-
-def git(repo, *args):
-    r = subprocess.run(['git', '-C', str(repo), *args], capture_output=True, text=True, encoding='utf-8',
-                       errors='replace')
-    if r.returncode:
-        raise Refused(f'git {" ".join(args)}: {r.stderr.strip()}')
-    return r.stdout
-
-
-def aware(text):
-    t = datetime.datetime.fromisoformat(text.replace('Z', '+00:00'))
-    return t if t.tzinfo else t.astimezone()
-
-
 class Repo:
     """The audited repository: its worktrees, tracked files at head, and the vocabulary of its scripts."""
 
     def __init__(self, path, head):
-        self.top = Path(git(path, 'rev-parse', '--show-toplevel').strip())
+        self.top = Path(git(path, 'rev-parse', '--show-toplevel').stdout.strip())
         self.name = self.top.name
         self.checkouts = [Path(os.path.realpath(line[9:])) for line in
-                          git(path, 'worktree', 'list', '--porcelain').splitlines() if line.startswith('worktree ')]
-        self.files = set(git(path, 'ls-tree', '-r', '--name-only', '-z', head).split('\0')) - {''}
+                          git(path, 'worktree', 'list', '--porcelain').stdout.splitlines()
+                          if line.startswith('worktree ')]
+        self.files = set(git(path, 'ls-tree', '-r', '--name-only', '-z', head).stdout.split('\0')) - {''}
         self.head = head
         self.skills = {f.split('/')[1] for f in self.files if re.fullmatch(r'skills/[^/]+/SKILL\.md', f)}
         self.agents = {f[7:-3] for f in self.files if re.fullmatch(r'agents/[^/]+\.md', f)}
         self.workflows = {f[10:-3] for f in self.files if re.fullmatch(r'workflows/[^/]+\.js', f)}
         self._vocab = {}
+        self._realpath = functools.lru_cache(maxsize=4096)(os.path.realpath)
 
     def rel(self, path, cwd=None, remote=False):
         """(repo-relative path, 'attributed'|'unattributed') for a path naming a repository file, else None. A path
@@ -91,7 +77,7 @@ class Repo:
             if not cwd and not remote:
                 return None
             p = Path(cwd or '/') / p
-        real = Path(os.path.realpath(p)) if not remote else None
+        real = self.real(p) if not remote else None
         for c in self.checkouts if not remote else ():
             if real.is_relative_to(c):
                 rel = real.relative_to(c).as_posix()
@@ -106,7 +92,7 @@ class Repo:
     def vocab(self, rel):
         if rel not in self._vocab:
             try:
-                src = git(self.top, 'show', f'{self.head}:{rel}')
+                src = git(self.top, 'show', f'{self.head}:{rel}').stdout
             except Refused:
                 src = ''
             if rel.endswith('.sh'):
@@ -116,10 +102,14 @@ class Repo:
                 self._vocab[rel] = (set(SUB.findall(src)), set(FLAG.findall(src)))
         return self._vocab[rel]
 
+    def real(self, path):
+        """realpath, cached for an absolute path: tool calls name the same few directories thousands of times."""
+        return Path(self._realpath(str(path)) if os.path.isabs(path) else os.path.realpath(path))
+
     def cwd_class(self, cwd):
         if not cwd:
             return 'none'
-        real = Path(os.path.realpath(cwd))
+        real = self.real(cwd)
         if any(real.is_relative_to(c) for c in self.checkouts):
             return 'repo'
         if any(part == self.name or part.startswith(f'{self.name}-') for part in Path(cwd).parts):
@@ -748,9 +738,7 @@ def main(argv=None):
             roots.append(entry)
     tally.unresolved_results()
     agg = report(tally, roots, stats, window)
-    fd = os.open(args.out, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, 'w', encoding='utf-8') as f:
-        json.dump(dict(agg, locators=dict(tally.locators)), f, indent=1)
+    create(args.out, json.dumps(dict(agg, locators=dict(tally.locators)), indent=1), mode=0o600)
     print(render(agg))
     return 1 if partial else 0
 

@@ -50,8 +50,7 @@ RUN=~/.local/state/agentrc/repo-audit/<repo>/<date>     # private: transcripts a
   name the test that keeps each still-relevant incident covered.
 - Prompt text that is mechanics an agent re-derives each run becomes a script; a script that only wraps one tool's
   command line becomes a recipe line.
-- Each deferred defect keeps a concrete trigger, consequence and evidence; a reviewer's unconfirmed hypothesis gets
-  a disposition in the handoff, not an issue.
+- A deferred defect is filed, or given a disposition, as the user rules' Follow-ups say.
 
 ## End
 

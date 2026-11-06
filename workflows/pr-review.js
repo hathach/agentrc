@@ -122,7 +122,7 @@ const relay = async (label, phase, cmd) => {
   emitCount.set(name, n)
   const file = `${dir}/${name}.${n}.${fnv1a(cmd)}.js`
   const ran = await agent(`${IN}Run exactly \`AGENTRC_EMIT='${file}' ${cmd}\` and answer only its exit status as exit, AGENTRC_EMIT kept exactly as written: ` +
-    'the script writes its JSON line to that file, where the workflow reads it. Only when it printed no JSON line at all, also give what went wrong as error, in its own words.',
+    'the script writes its JSON line to that file, where the workflow reads it, and prints only a note. Only on a nonzero exit, also give what went wrong as error, in its own words.',
   { label, phase, agentType: 'relay', model: 'haiku', effort: 'low', schema: RAN }).catch(quiet(label))
   // Exit 3: the script ran nothing, meeting the file an attempt a resume cut short claimed; with no line there, that
   // attempt's outcome is unknown, as a dead relay's.
@@ -138,7 +138,7 @@ const relay = async (label, phase, cmd) => {
   }
   return m ? { error: `${file} holds no line written for it` } : ran ? { error: `the script wrote no line (exit ${ran.exit})${ran.error ? `: ${ran.error}` : ''}` } : null
 }
-// Every relay here only reads (threads.py and ledger.py write content-named facts files): one that brought no line back
+// Every relay here only reads (threads.py writes only its facts file): one that brought no line back
 // gets one fresh attempt, its own file.
 const relayOnce = async (label, phase, cmd) => (await relay(label, phase, cmd)) ?? relay(`${label}:retry`, phase, cmd)
 const blocked = (reason, detail) => ({ status: 'blocked', reason, detail, pr, head })
@@ -159,33 +159,16 @@ phase('Context')
 const threadsFile = `${factsDir}/threads-${head}.json`
 const threadsOut = await relayOnce('threads', 'Context', `python3 ${S}/threads.py --pr ${pr} --repo ${repo} --out '${threadsFile}'`)
 if (!threadsOut || threadsOut.error || threadsOut.file !== threadsFile) return blocked('threads-failed', threadsOut ? threadsOut.error || 'wrong file' : 'the threads relay died')
-// One read gives the standing findings and the pushback on them, from the same ledger and snapshot. ledger.py writes
-// the workflow's view of that answer to a content-named file and prints a manifest (#407); state_transfer.py --raw
-// emits the file's text whole, checked against the manifest's digest.
+// One read gives the standing findings and the pushback on them, from the same ledger and snapshot: ledger.py show
+// --view, the workflow's view of that answer, bound to the repository, PR and head it was read for.
 // A carried row comes without its impact and severityReason: unregraded, the result leaves them out and save keeps
 // the ledger's.
-const manifest = await relayOnce('ledger:manifest', 'Context',
-  `python3 ${S}/ledger.py show --pr ${pr} --repo ${repo} --threads '${threadsFile}' --head ${head} --snapshot '${factsDir}'`)
-if (!manifest || manifest.error) return blocked('ledger-failed', manifest ? manifest.error : 'the ledger relay died')
-const snapshotDir = factsDir.replace(/(.)\/+$/, '$1')
-// The path goes into a command: only the one ledger.py names under factsDir for this repository, PR and head.
-if (manifest.repo !== repo || manifest.pr !== pr || manifest.head !== head || typeof manifest.file !== 'string' ||
-    !manifest.file.startsWith(`${snapshotDir}/`) || !/^ledger-[0-9a-f]{64}\.json$/.test(manifest.file.slice(snapshotDir.length + 1)) ||
-    !/^[0-9a-f]{8}$/.test(manifest.digest || '') || !Number.isInteger(manifest.length) || manifest.length < 1) {
-  return blocked('ledger-failed', `ledger manifest answered ${JSON.stringify(manifest)}`)
+const prior = await relayOnce('ledger', 'Context',
+  `python3 ${S}/ledger.py show --pr ${pr} --repo ${repo} --threads '${threadsFile}' --head ${head} --view`)
+if (!prior || prior.error) return blocked('ledger-failed', prior ? prior.error : 'the ledger relay died')
+if (prior.repo !== repo || prior.pr !== pr || prior.head !== head) {
+  return blocked('ledger-failed', `the ledger view is for ${prior.repo}#${prior.pr} at ${prior.head}, not ${repo}#${pr} at ${head}`)
 }
-// stdout stays out of the relay's context: the text can run to hundreds of KB.
-const loaded = await relayOnce('ledger:load', 'Context', `python3 ${AGENTRC}/skills/pr-babysit/scripts/state_transfer.py '${manifest.file}' --raw > /dev/null`)
-const loadedWhy = !loaded ? 'the ledger load relay died' : loaded.error ? `state_transfer.py: ${loaded.error}`
-  : typeof loaded.text !== 'string' || loaded.digest !== manifest.digest || fnv1a(loaded.text) !== manifest.digest ? 'the loaded ledger answer does not match the manifest digest' : null
-if (loadedWhy) {
-  log(`ledger: ${loadedWhy}`)
-  return blocked('ledger-failed', loadedWhy)
-}
-// The bytes are ledger.py's, yet Python writes JSON JavaScript refuses (NaN).
-let prior = null
-try { prior = JSON.parse(loaded.text) } catch {}
-if (!prior || typeof prior !== 'object') return blocked('ledger-failed', 'the ledger snapshot is not JSON')
 // A copy missing members must not read as nothing standing: an incremental or discussion run continues the review prepare pinned.
 // A row without its published text or repair record would restate the draft, or never raise a failed repair again;
 // heldThreads is printed whenever a review is on the ledger.
@@ -576,7 +559,7 @@ return {
   draft: { event, body: lines.join('\n'), comments, replies: fixedReplies, resolves },
 }
 
-// seal.fnv1a: 32-bit FNV-1a over code points, state_transfer.py's digest of a --raw text.
+// seal.fnv1a: 32-bit FNV-1a over code points.
 function fnv1a (text) {
   let h = 0x811c9dc5
   for (const ch of text) h = Math.imul(h ^ ch.codePointAt(0), 0x01000193) >>> 0

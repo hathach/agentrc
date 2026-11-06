@@ -18,10 +18,8 @@ import os
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
-
-
-class Refused(Exception):
-    pass
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from audit import Refused, create  # noqa: E402
 
 
 def load(data):
@@ -112,8 +110,7 @@ def main(argv=None):
     except (Refused, OSError, ValueError) as e:
         print(f'refused: {e}', file=sys.stderr)
         return 2
-    with open(args.out, 'x', encoding='utf-8') as f:
-        json.dump(result, f, indent=1)
+    create(args.out, json.dumps(result, indent=1))
     unit = result['unit']
     print(f"unit {unit}; provenance {'recorded' if result['provenance'] != 'unknown' else 'unknown'}; "
           f"unmeasured {'counted' if tests else 'unknown (no --tests)'}")

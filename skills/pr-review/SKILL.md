@@ -19,7 +19,7 @@ python3 "$S/prepare.py" --pr N --recheck-from SHA              # checkout top le
 python3 "$S/prepare.py" --check --pr N --expected-head SHA       # review worktree: still that head, clean, its pins
 python3 "$S/prepare.py" --release --pr N --token T                # any worktree: unlock that run's review tree
 python3 "$S/threads.py" --pr N --out FILE                         # every comment and thread, bodies in FILE
-python3 "$S/ledger.py" show --pr N [--finding ID | --draft | --pending | --threads FILE [--head SHA [--snapshot DIR]]]  # standing findings, unpublished answers; --draft: the saved review; --pending: the newest one not yet submitted or confirmed, which plain show never lists; --head: replies on our threads still to judge; --snapshot: that answer written to DIR, only its manifest printed (the workflow's read)
+python3 "$S/ledger.py" show --pr N [--finding ID | --draft | --pending | --threads FILE [--head SHA [--view]]]  # standing findings, unpublished answers; --draft: the saved review; --pending: the newest one not yet submitted or confirmed, which plain show never lists; --head: replies on our threads still to judge; --view: that answer as the workflow reads it, bound to repo, PR and head
 python3 "$S/ledger.py" show --pr N --fixable --threads FILE --head SHA  # what an auto-fix repair may take from the review submitted on SHA, each with its claimDigest
 python3 "$S/ledger.py" save --pr N --output FILE [--reason TEXT]  # a finished launch's result, as a pending draft
 python3 "$S/ledger.py" next --pr N --head SHA --publish WORDS [--token T] [--review-output FILE] [--manifest FILE] [--babysit-reading FILE]  # §4: the run's next step
@@ -196,8 +196,7 @@ recipe does not settle, go to step 7 with their error or `why`.
    recheckFrom?, dimensions?}` (`mode: 'discussion'` for prepare's `same`;
    `recheckFrom` is prepare's, set only on the recheck of step 6.4). `dimensions`
    comes from the project's instruction file when it names review dimensions.
-   Then `result.py --output <it>`, and the `ledger.py save` next names, with the request's words as `--reason` for
-   a head already posted.
+   Then `result.py --output <it>`, and the save next names, adding the request's words as `--reason` when it asks.
 4. `post`: `post.py` (pending), `post.py --auto` (auto-post) or `post.py --auto --defer-answers` (auto-fix); a
    `discussion` run always takes plain `post.py`. Its exit 1 names what it could not confirm; under auto-fix a
    failed, partial, uncertain or handed-over post ends it there.
@@ -213,10 +212,8 @@ recipe does not settle, go to step 7 with their error or `why`.
       retained verifier result's path)`}`, empty when none did.
    2. `babysit`: pr-babysit from the review worktree with `adoptHead` the repair tip when there are repairs (none
       otherwise: it still answers the bots), `autoPush`, `markSonar` and the repository's reviewer and trigger
-      arguments, its own repairs reviewed under the completion rule. next relaunches it under chief's rules after a
-      stop another launch continues (yielded, reviews pending, a rate limit), ends step 6 on a spent budget or an
-      unchanged blocker with the recheck pending, and blocks on any other stop. A crash with repairs unpublished
-      resumes this task with them, never a new prepare.
+      arguments, its own repairs reviewed under the completion rule; a relaunch next names runs under chief's rules.
+      A crash with repairs unpublished resumes this task with them, never a new prepare.
    3. `fixed`: After each launch whose reading shows the adoption `pushed` or `already-published`, its fix notes;
       when pr-babysit's own repairs moved the head past `checkedSha`, one `finding-verifier` batch checks those
       findings again on the new head first and the rows name it; its `skipped`, `held` and `uncertain` rows are
@@ -224,8 +221,7 @@ recipe does not settle, go to step 7 with their error or `why`.
    4. `recheck`: Recheck once the PR head is the one pr-babysit left, its last launch reading's `checkout.head`,
       from the launcher's checkout top level; its `head` other than that one stops the recheck before anything is
       posted ("head moved after repair"). A base merge prepare refuses is reported with the recheck pending. Steps
-      1 to 4 then run on the recheck's head, its hardware rows from runs on that head, and its post is `--auto` only
-      while `ledger.py show --fixable` allows it.
+      1 to 4 then run on the recheck's head, its hardware rows from runs on that head.
 7. Report the verdict and its reasons, the counts, coverage lost, the CI and
    HIL rows, the receipts, `post.py`'s `firstLineUnchecked`
    and the result's `heldThreads`; never the draft's text. A recheck also

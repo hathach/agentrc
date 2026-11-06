@@ -158,8 +158,9 @@ pages in order join into the entry. A link it has none for, or whose entry has a
 failure or a list of starts too large for a line, is left out of both. The caller checks what comes
 back against its own digests.
 
-Under AGENTRC_EMIT the line is also written to the file it names, claimed before anything runs (exit 3 at once, nothing
-done, when that file is there): lib/seal.py's emit, which a workflow reads instead of a model's copy.
+Under AGENTRC_EMIT the line goes to the file it names instead of stdout, claimed before anything runs
+(exit 3 at once, nothing done, when that file is there): lib/seal.py's emit, which a workflow reads instead
+of a model's copy.
 """
 
 import argparse

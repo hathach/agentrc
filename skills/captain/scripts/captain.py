@@ -835,17 +835,25 @@ def watch_event(i, rec, items):
     return None
 
 
-def stored(name, recs):
-    """The ledger index the enrolled captain last stored in name, or None: none stored, another captain's, or one
-    past the end of recs."""
+def read_mark(name):
+    """(generation, at) as stored in name, or None: missing or malformed. Each caller reads afresh."""
     try:
         with open(path(name), encoding='utf-8') as f:
             mark = json.load(f)
-        ours = mark['generation'] == generation()
-        at = mark['at']
+        return mark['generation'], mark['at']
     except (OSError, ValueError, KeyError, TypeError):
         return None
-    return at if ours and type(at) is int and 0 <= at <= len(recs) else None
+
+
+def stored(name, recs):
+    """The ledger index the enrolled captain last stored in name, or None: none stored, another captain's, or one
+    past the end of recs."""
+    mark = read_mark(name)
+    try:
+        at = mark[1] if mark and mark[0] == generation() else None
+    except (OSError, ValueError):   # an unreadable enrolment: no mark is ours
+        return None
+    return at if type(at) is int and 0 <= at <= len(recs) else None
 
 
 def generation():
@@ -857,13 +865,9 @@ def store(name, at, fence):
     generation; never behind what that captain stored already, so a slower reader cannot roll it back."""
     if fence is None or fence != generation():
         return
-    try:
-        with open(path(name), encoding='utf-8') as f:
-            mark = json.load(f)
-        if mark['generation'] == fence and type(mark['at']) is int and mark['at'] > at:
-            return
-    except (OSError, ValueError, KeyError, TypeError):
-        pass
+    mark = read_mark(name)
+    if mark and mark[0] == fence and type(mark[1]) is int and mark[1] > at:
+        return
     write_json(name, {'generation': fence, 'at': at})
 
 

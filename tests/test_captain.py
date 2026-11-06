@@ -2074,6 +2074,13 @@ class WatchCollectTest(WatchCase):
         self.assertIsNone(captain.stored(captain.COLLECTED, recs))
         (self.state / captain.COLLECTED).write_text('{', encoding='utf-8')
         self.assertIsNone(captain.stored(captain.COLLECTED, recs))
+        with captain.locked():
+            captain.store(captain.COLLECTED, 1, 'next')   # a malformed cursor is replaced
+        self.assertEqual(captain.stored(captain.COLLECTED, recs), 1)
+        captain.write_json(captain.COLLECTED, {'generation': generation, 'at': 2})
+        with captain.locked():
+            captain.store(captain.COLLECTED, 1, 'next')   # an earlier enrollment's further cursor does not hold it
+        self.assertEqual(captain.stored(captain.COLLECTED, recs), 1)
 
     def test_a_request_sent_during_a_watch_is_followed_by_its_collect(self):
         self.arm('all')

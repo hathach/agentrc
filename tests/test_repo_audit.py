@@ -158,6 +158,29 @@ class Start(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn('no single latest marker', err)
 
+    def test_the_shortstat_matches_git_from_the_numstat(self):
+        r = self.repo
+        base = r.commit({'f.txt': 'a\nb\nc\nd\ne\nf\n', 'b.bin': b'\0\1'})
+        r.git('mv', 'f.txt', 'g.txt')
+        r.git('commit', '-q', '-m', 'rename')
+        renamed = r.git('rev-parse', 'HEAD')
+        (r.path / 'g.txt').chmod(0o755)         # else a later add -A stages the old mode back
+        r.git('update-index', '--chmod=+x', 'g.txt')
+        r.git('commit', '-q', '-m', 'mode')
+        mode = r.git('rev-parse', 'HEAD')
+        binary = r.commit({'b.bin': b'\0\3'})
+        added = r.commit({'g.txt': 'a\nb\nc\nd\ne\nf\nx\n'})
+        removed = r.commit({'g.txt': 'b\nc\nd\ne\nf\nx\n'})
+        cases = [(base, base, ''), (base, renamed, '1 file changed, 0 insertions(+), 0 deletions(-)'),
+                 (renamed, mode, '1 file changed, 0 insertions(+), 0 deletions(-)'),
+                 (mode, binary, '1 file changed, 0 insertions(+), 0 deletions(-)'),
+                 (binary, added, '1 file changed, 1 insertion(+)'), (added, removed, '1 file changed, 1 deletion(-)'),
+                 (base, removed, '2 files changed, 1 insertion(+), 1 deletion(-)'),
+                 (self.base, removed, '6 files changed, 10 insertions(+), 1 deletion(-)')]
+        with mock.patch.dict(os.environ, git_env(), clear=True):
+            for a, b, want in cases:
+                self.assertEqual(audit.shortstat(audit.numstat(r.path, a, b)), want, (a, b))
+
 
 class Finish(unittest.TestCase):
     def setUp(self):

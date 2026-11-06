@@ -161,7 +161,8 @@ def locked(path):
 
 
 def report(collect, argv, seal=False, limits=False):
-    """Emit collect(argv) as the last stdout line, sealed when asked, and return 0, or {"error"} and 2 (seal.emit)."""
+    """Emit collect(argv) as the last stdout line (the AGENTRC_EMIT file instead, seal.emit), sealed when asked, and
+    return 0, or {"error"} and 2."""
     try:
         facts = collect(argv)
     except Unusable as e:

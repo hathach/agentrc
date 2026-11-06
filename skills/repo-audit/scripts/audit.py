@@ -15,6 +15,7 @@ import argparse
 import codecs
 import datetime
 import json
+import os
 import re
 import subprocess
 import sys
@@ -134,6 +135,20 @@ def numstat(repo, base, end):
     return rows
 
 
+def shortstat(rows):
+    """git diff --shortstat's line from numstat rows: a binary file counts as changed, its lines do not."""
+    if not rows:
+        return ''
+    ins = sum(a for a, _, _ in rows if a is not None)
+    dels = sum(d for _, d, _ in rows if d is not None)
+    parts = [f'{len(rows)} file{"s" * (len(rows) != 1)} changed']
+    if ins or not dels:
+        parts.append(f'{ins} insertion{"s" * (ins != 1)}(+)')
+    if dels or not ins:
+        parts.append(f'{dels} deletion{"s" * (dels != 1)}(-)')
+    return ', '.join(parts)
+
+
 def diff_path(text):
     """A path from a ---/+++ header: None for /dev/null, git's C-style quoting undone."""
     text = text.rstrip('\t')         # git ends a header naming a path with a space in a tab
@@ -190,7 +205,7 @@ def inventory(repo, base, end):
     return {
         'base': base, 'end': end,
         'commits': int(git(repo, 'rev-list', '--count', f'{base}..{end}').stdout),
-        'shortstat': git(repo, 'diff', '--shortstat', '-M', base, end).stdout.strip(),
+        'shortstat': shortstat(stat),
         'files': [len(before), len(after)],
         'bytes': [sum(before.values()), sum(after.values())],
         'test_bytes': [sum(s for p, s in before.items() if is_test_path(p)),
@@ -227,17 +242,24 @@ def summary(inv):
     return '\n'.join(lines)
 
 
-def create(path, text):
-    with open(path, 'x', encoding='utf-8') as f:
+def create(path, text, mode=0o666):
+    """Write text to a new file, mode masked by the umask; FileExistsError when path exists."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_BINARY', 0)    # newlines translated once, by Python
+    with os.fdopen(os.open(path, flags, mode), 'w', encoding='utf-8') as f:
         f.write(text)
+
+
+def aware(text):
+    """An ISO 8601 time, a naive one taken as local; ValueError when text is not one."""
+    t = datetime.datetime.fromisoformat(text.replace('Z', '+00:00'))
+    return t if t.tzinfo else t.astimezone()
 
 
 def when(text):
     try:
-        t = datetime.datetime.fromisoformat(text.replace('Z', '+00:00'))
+        return aware(text)
     except ValueError:
         raise Refused(f'{text}: not an ISO 8601 time') from None
-    return t if t.tzinfo else t.astimezone()
 
 
 def start(args):

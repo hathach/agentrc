@@ -86,16 +86,17 @@ EMIT_TO, emit_fd = claim()
 
 
 def emit(line, code):
-    """Print line as the last stdout line and return code; under AGENTRC_EMIT also write it to the file claimed at
+    """Print line as the last stdout line and return code; under AGENTRC_EMIT write it instead to the file claimed at
     import, as a data module a workflow loads with workflow({scriptPath}) (`return {"emit": <that path>, "line":
-    line}`), so no model copies it. A claimed file a run leaves empty is one that died before its line."""
+    line}`, compact ASCII JSON), so no model copies it, and print only a note naming that file. A claimed file a run
+    leaves empty is one that died before its line."""
     global emit_fd
-    text = json.dumps(line)
-    print(text)
     if emit_fd is None:
+        print(json.dumps(line))
         return code
     fd, emit_fd = emit_fd, None
     with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as f:
         f.write("export const meta = { name: 'emit', description: 'a script line' }\n"
-                f'return {{"emit": {json.dumps(EMIT_TO)}, "line": {text}}}\n')
+                f"return {json.dumps({'emit': EMIT_TO, 'line': line}, separators=(',', ':'))}\n")
+    print(f'the line is in {EMIT_TO}')
     return code

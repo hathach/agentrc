@@ -8,6 +8,8 @@ there, so pre-commit imports as it does. ARG... is pre-commit's command line;
 stdout, stderr and the exit status are pre-commit's own. RECORDS, an existing
 file, gets one JSON line per record, each flushed:
   {record: start, version, supported}, then, for a supported version only:
+  {record: hooks, hooks: [{id, alias, stages}]}: every hook the config and
+    manifests resolve to, at any stage, in config order;
   {record: roster, failFast, hooks: [{id, alias, failFast}]}: the hooks the run
     selected, in run order, after the config and manifests are resolved;
     failFast, the config's or --fail-fast;
@@ -28,7 +30,8 @@ sys.path[0] = sys.argv[1]
 import inspect  # noqa: E402
 import json  # noqa: E402
 
-# Each version whose commands/run.py source was read: _run_hooks(config, hooks, skips, args) calls
+# Each version whose commands/run.py source was read: run() selects its hooks from all_hooks(config, store), a module
+# global, whose Hooks carry id, alias and stages (repository.py, hook.py); _run_hooks(config, hooks, skips, args) calls
 # _run_single_hook(classifier, hook, skips, cols, diff_before, ...) -> (failed, diff_after) by module global per hook
 # in order, a hook's files modified when diff_after differs from diff_before, and
 # languages[hook.language].run_hook(...) -> (retcode, out) once for each hook it executes.
@@ -54,8 +57,13 @@ def observe(write, only):
     from pre_commit.all_languages import languages
     from pre_commit.commands import run
 
-    run_hooks, run_single_hook = run._run_hooks, run._run_single_hook
+    all_hooks, run_hooks, run_single_hook = run.all_hooks, run._run_hooks, run._run_single_hook
     roster, done = [], []
+
+    def observed_all(config, store):
+        found = all_hooks(config, store)
+        write(record='hooks', hooks=[{'id': h.id, 'alias': h.alias, 'stages': list(h.stages)} for h in found])
+        return found
 
     def observed_hooks(config, hooks, skips, args):
         roster[:] = hooks
@@ -85,7 +93,7 @@ def observe(write, only):
               modified=diff_before != diff_after, failed=bool(failed), output=out.decode('utf-8', 'replace'))
         return failed, diff_after
 
-    run._run_hooks, run._run_single_hook = observed_hooks, observed_single
+    run.all_hooks, run._run_hooks, run._run_single_hook = observed_all, observed_hooks, observed_single
 
 
 def main(argv):

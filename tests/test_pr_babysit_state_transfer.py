@@ -1,4 +1,4 @@
-"""Tests for pr-babysit's state_transfer.py, and the AGENTRC_EMIT file every facts.py report writes."""
+"""Tests for pr-babysit's state_transfer.py, and the AGENTRC_EMIT file every facts.py report writes (lib/seal.py's emit)."""
 import importlib.util
 import json
 import os
@@ -13,8 +13,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from helpers import git_env, guard_survivors  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'lib'))
+from seal import fnv1a  # noqa: E402
 SCRIPT = ROOT / 'skills' / 'pr-babysit' / 'scripts' / 'state_transfer.py'
 FACTS = ROOT / 'skills' / 'pr-babysit' / 'scripts' / 'facts.py'
+EMIT_STUB = ROOT / 'tests' / 'emit_stub.mjs'
 spec = importlib.util.spec_from_file_location('pr_babysit_state_transfer', SCRIPT)
 transfer = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(transfer)
@@ -60,46 +63,50 @@ class StateTransferTest(unittest.TestCase):
         return str(path)
 
     def run_script(self, *argv, emit=None):
+        """(exit, the JSON line stdout ends with), or under emit (exit, stdout whole)."""
         env = {k: v for k, v in os.environ.items() if k != 'AGENTRC_EMIT'}
         if emit:
             env['AGENTRC_EMIT'] = str(emit)
         done = subprocess.run([sys.executable, str(SCRIPT), *argv], capture_output=True, text=True, encoding='utf-8', env=env)
-        return done.returncode, json.loads(done.stdout.splitlines()[-1])
+        return done.returncode, done.stdout if emit and done.returncode != 3 else json.loads(done.stdout.splitlines()[-1])
 
     def test_the_line_is_the_state_whole(self):
         code, out = self.run_script(self.file)
         self.assertEqual((code, out), (0, {'digest': 'cd1574aa', 'state': STATE}))
 
     @unittest.skipUnless(shutil.which('node'), 'needs Node.js')
-    def test_the_emitted_module_loads_as_the_line_with_its_own_path(self):
+    def test_the_emitted_module_loads_as_the_line_with_its_own_path_and_stdout_only_names_it(self):
         at = self.dir / 'state.1.js'
+        _, line = self.run_script(self.file)
         code, out = self.run_script(self.file, emit=at)
-        self.assertEqual(code, 0)
-        self.assertEqual(load(at), {'emit': str(at), 'line': out}, 'nulls, empty strings and U+2028 arrive as written')
+        self.assertEqual((code, out), (0, f'the line is in {at}\n'), 'the line stays out of a relay\'s context')
+        self.assertEqual(load(at), {'emit': str(at), 'line': line}, 'nulls, empty strings and U+2028 arrive as written')
 
     @unittest.skipUnless(shutil.which('node'), 'needs Node.js')
-    def test_raw_is_the_file_text_exactly_with_its_digest(self):
-        text = json.dumps({'open': [{'id': f'pr7-f{n}', 'why': f'{REASON} é {n}' + 'x' * 900} for n in range(80)]}) + '\r\n'
-        path = self.dir / 'ledger.json'
-        path.write_bytes(text.encode('utf-8'))
-        self.assertGreater(len(text), transfer.MAX, 'a ledger answer outgrows the state limit')
-        at = self.dir / 'ledger.1.js'
-        code, out = self.run_script(str(path), '--raw', emit=at)
-        self.assertEqual((code, out), (0, {'digest': transfer.fnv1a(text), 'text': text}))
-        self.assertEqual(load(at)['line'], out)
-        self.assertEqual(self.run_script(self.saved('[1, NaN', 'nan.json'), '--raw')[0], 0, "parsing is the reader's")
+    def test_the_emitted_file_is_the_harness_stubs_module_byte_for_byte(self):
+        state = {**STATE, 'odd': '\u2028 \x7f \U0001F600 \ud800 \t', 'none': None, '': ''}
+        at = self.dir / 'state.1.js'
+        self.assertEqual(self.run_script(self.saved(json.dumps({'result': {'state': state}}), 'odd.output'), emit=at)[0], 0)
+        stub = ("const { moduleOf } = await import(process.argv[1])\n"
+                "const { readFileSync } = await import('node:fs')\n"
+                "process.stdout.write(moduleOf(process.argv[2], JSON.parse(readFileSync(0, 'utf8'))))\n")
+        done = subprocess.run(['node', '--input-type=module', '-e', stub, EMIT_STUB.as_uri(), str(at)], capture_output=True,
+                              input=json.dumps(load(at)['line']), text=True, encoding='utf-8')
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout, at.read_text(encoding='utf-8'), "the harnesses' moduleOf builds what seal.emit writes")
 
     def test_a_bad_file_or_argument_is_an_error_line(self):
         (self.dir / 'latin1.json').write_bytes(b'"\xe9"')
         cases = [
             ((str(self.dir / 'missing'),), 'cannot read'),
-            ((str(self.dir / 'latin1.json'), '--raw'), 'is not UTF-8'),
+            ((str(self.dir / 'latin1.json'),), 'is not UTF-8'),
             ((self.saved('{not json', 'bad.output'),), 'is not JSON'),
             ((self.saved({'result': {'pass': True}}, 'none.output'),), 'holds no result.state object'),
             ((self.saved({'result': {'state': {'version': 3}}}, 'nodigest.output'),), 'has no digest'),
             ((self.saved({'result': {'state': {'digest': 'x', 'pad': 'a' * transfer.MAX}}}, 'big.output'),), f'(max {transfer.MAX})'),
             ((), 'usage'),
             ((self.file, '--chunks', '0'), 'usage'),
+            ((self.file, '--raw'), 'usage'),
         ]
         for argv, message in cases:
             code, out = self.run_script(*argv)
@@ -109,9 +116,8 @@ class StateTransferTest(unittest.TestCase):
     @unittest.skipUnless(shutil.which('node'), 'needs Node.js')
     def test_an_error_line_is_emitted_too(self):
         at = self.dir / 'state.1.js'
-        code, out = self.run_script(str(self.dir / 'missing'), emit=at)
-        self.assertEqual(code, 2)
-        self.assertEqual(load(at)['line'], out)
+        self.assertEqual(self.run_script(str(self.dir / 'missing'), emit=at)[0], 2)
+        self.assertEqual(load(at)['line'], self.run_script(str(self.dir / 'missing'))[1])
 
     def test_an_existing_emit_file_is_never_overwritten_and_nothing_runs(self):
         at = self.dir / 'state.1.js'
@@ -140,7 +146,7 @@ class StateTransferTest(unittest.TestCase):
             fn = re.search(r'^function fnv1a \(text\) \{.*?^\}', source, re.S | re.M).group(0)
             out = subprocess.run(['node', '-e', f'{fn}\nconsole.log(JSON.stringify({json.dumps(samples)}.map(fnv1a)))'],
                                  capture_output=True, text=True, check=True).stdout
-            self.assertEqual(json.loads(out), [transfer.fnv1a(s) for s in samples], name)
+            self.assertEqual(json.loads(out), [fnv1a(s) for s in samples], name)
 
     @unittest.skipUnless(shutil.which('node'), 'needs Node.js')
     def test_the_workflow_measures_a_state_as_this_script_does(self):

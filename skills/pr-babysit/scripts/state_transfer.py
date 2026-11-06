@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 """Hand a workflow a saved file whole, so no model copies it on the way.
 
-  state_transfer.py FILE [--raw]
+  state_transfer.py FILE
 
 FILE is a saved Workflow output holding {"result": {"state": ...}}: the line is
 {digest, state}, digest the state's own. The state must carry its digest and stay
 within MAX bytes as compact ASCII JSON, the measure pr-babysit's STATE_MAX takes.
---raw takes FILE's text as it is, such as ledger.py show --snapshot writes: the
-line is {digest, text}, digest the text's fnv1a, and parsing it is the reader's.
 
 The workflow runs it under AGENTRC_EMIT and loads the file that names (facts.py's
-report, lib/seal.py's emit); stdout gets the same line. Exit 0 with that line;
-exit 2 with {"error": ...} when FILE cannot be read, holds no state, the state
-exceeds MAX bytes or the arguments are wrong. Never writes but the emitted file.
+report, lib/seal.py's emit), which then gets the line instead of stdout. Exit 0
+with that line; exit 2 with {"error": ...} when FILE cannot be read, holds no
+state, the state exceeds MAX bytes or the arguments are wrong. Never writes but
+the emitted file.
 """
 
 import json
@@ -20,14 +19,14 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from facts import Parser, Unusable, fnv1a, report  # noqa: E402
+from facts import Parser, Unusable, report  # noqa: E402
 
 MAX = 64 * 1024
 
 
 def read(path):
     try:
-        with open(path, encoding='utf-8', newline='') as f:  # newline='': the text its digest is taken over, as written
+        with open(path, encoding='utf-8') as f:
             return f.read()
     except OSError as e:
         raise Unusable(f'cannot read {path}: {e.strerror}')
@@ -55,11 +54,7 @@ def state_of(path):
 def collect(argv):
     p = Parser(prog='state_transfer.py', add_help=False)
     p.add_argument('file')
-    p.add_argument('--raw', action='store_true')
     a = p.parse_args(argv)
-    if a.raw:
-        text = read(a.file)
-        return {'digest': fnv1a(text), 'text': text}
     state = state_of(a.file)
     return {'digest': state['digest'], 'state': state}
 

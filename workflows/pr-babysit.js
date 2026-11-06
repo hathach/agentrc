@@ -202,7 +202,9 @@ const EMIT = '<AGENTRC_EMIT>' // where a relay command takes its file
 const EMIT_REFUSED = 3 // lib/seal.py's
 const RAN = { type: 'object', additionalProperties: false, required: ['exit'], properties: { exit: { type: 'integer' }, error: { type: 'string' } } }
 const RETURN_EXIT = 'and answer only its exit status as exit, AGENTRC_EMIT kept exactly as written: the script writes its JSON line to that file, ' +
-  'where the workflow reads it. Only when it printed no JSON line at all, also give what went wrong as error, in its own words.'
+  'where the workflow reads it, and prints only a note. Only on a nonzero exit, also give what went wrong as error, in its own words.'
+// A relay prompt's command, `script` a Python script with its arguments, run under the file emitted() names it.
+const runExactly = (script, extra = '') => `run exactly \`${EMIT}${PY} ${script}\` ${RETURN_EXIT}${extra}`
 const EMIT_DIR = { type: 'object', additionalProperties: false, required: ['dir'], properties: { dir: { type: 'string' }, error: { type: 'string' } } }
 let emitDir = null
 // The one path a relay copies: a mis-copy names no directory a run wrote into (mkdtemp's name, never-overwritten files).
@@ -260,14 +262,14 @@ if (args.stateRef != null) {
       !/^[0-9a-f]{8}$/.test(ref.digest || '')) {
     throw new Error('stateRef must be { outputFile: a plain absolute path ([A-Za-z0-9._ /-], no leading //), digest: the result\'s 8-hex stateDigest }')
   }
-  // state_transfer.py emits the saved state whole; stdout stays out of the relay's context. Read-only: a load that
-  // brought no state back, short of the script's own error, gets one fresh attempt.
-  const load = (label) => emitted(`${IN_CHECKOUT}Editing nothing, run exactly \`${EMIT}${PY} ${STATE_SCRIPT} '${file}' > /dev/null\` ${RETURN_EXIT}`,
+  // state_transfer.py emits the saved state whole. Read-only: a load that brought no line back gets one fresh attempt;
+  // a line, a refusal or a digest that does not match, is that file's answer.
+  const load = (label) => emitted(`${IN_CHECKOUT}Editing nothing, ${runExactly(`${STATE_SCRIPT} '${file}'`)}`,
     { label, phase: 'Triage', agentType: 'relay', model: 'haiku', effort: 'low' })
   const stateOf = ({ line }) => line && !line.error && line.digest === ref.digest && line.state && typeof line.state === 'object' &&
     line.state.digest === ref.digest && sealOf(line.state) === ref.digest ? line.state : null
   let got = await load('state:load')
-  if (!stateOf(got) && !(got.line && got.line.error)) got = await load('state:load.retry')
+  if (!got.line) got = await load('state:load.retry')
   const { line, why } = got
   const st = stateOf(got)
   if (st) args.state = st
@@ -817,9 +819,9 @@ const settles = (r) => r.verified === true && r.replyId !== null &&
 // the first run's saved receipt instead, so a reply that run posted is not reported as found there (#53).
 const runReplyScript = (label, mode, task, rules, payload) => {
   const run = (as, what, only = '') => relayRun(
-    `${IN_CHECKOUT}${what}: write exactly this JSON to a new temporary file, a name without quotes, and run ` +
-    `\`${EMIT}${PY} ${REPLY_SCRIPT} --pr ${args.pr} --repo ${shq(repo)} --${mode} '<that file>' --receipt ${shq(`${pinned.receipts.trim()}/${label}.json`)}${only}\`, ` +
-    `${RETURN_EXIT} ${rules}${payload}`,
+    `${IN_CHECKOUT}${what}: write exactly this JSON to a new temporary file, a name without quotes, and ` +
+    runExactly(`${REPLY_SCRIPT} --pr ${args.pr} --repo ${shq(repo)} --${mode} '<that file>' --receipt ${shq(`${pinned.receipts.trim()}/${label}.json`)}${only}`,
+      ` ${rules}${payload}`),
     { label: as, phase: 'Push', model: 'haiku', schema: RECEIPTS },
   )
   // A run that brought no line of reply.py's back (a resume meeting its empty claim, a dead relay, a line off its seal,
@@ -1357,9 +1359,9 @@ const buildCheck = async (tag, owned) => {
   if (plan.command === null) { log(`build#${tag}: no build applies — ${plan.reason}`); return null }
   // --flag=value throughout: a value such as -DBOARD=x must not read as a flag.
   const r = await relayRun(
-    `${IN_CHECKOUT}From the checkout's top level, editing nothing, run exactly \`${EMIT}${PY} ${BUILD_SCRIPT}${owned.map(f => ` --path=${shq(f)}`).join('')} --command=${shq(plan.command)}` +
-    `${plan.setup ? ` --setup=${shq(plan.setup)}` : ''}${plan.requires.map(t => ` --require=${shq(t)}`).join('')}\` ` +
-    RETURN_EXIT,
+    `${IN_CHECKOUT}From the checkout's top level, editing nothing, ` +
+    runExactly(`${BUILD_SCRIPT}${owned.map(f => ` --path=${shq(f)}`).join('')} --command=${shq(plan.command)}` +
+      `${plan.setup ? ` --setup=${shq(plan.setup)}` : ''}${plan.requires.map(t => ` --require=${shq(t)}`).join('')}`),
     { label: `build#${tag}`, phase: 'Fix', model: 'haiku', effort: 'low', schema: BUILD_RUN },
   )
   const why = !r ? 'no sealed receipt (the relay died or its line failed its seal)' : r.error ? r.error
@@ -1429,8 +1431,7 @@ const fixAndVerify = async (workIn, tag, rejectable = false) => {
   const plain = candidates.filter(f => !refusal.has(f))
   if (plain.length > 0) {
     const v = await relayRun(
-      `${IN_CHECKOUT}From the checkout's top level, editing nothing, run exactly \`${EMIT}${PY} ${SCOPE_SCRIPT}${plain.map(f => ` --path=${shq(f)}`).join('')}\` ` +
-      RETURN_EXIT,
+      `${IN_CHECKOUT}From the checkout's top level, editing nothing, ${runExactly(`${SCOPE_SCRIPT}${plain.map(f => ` --path=${shq(f)}`).join('')}`)}`,
       { label: 'scope:check', phase: 'Fix', model: 'haiku', effort: 'low', schema: SCOPE_CHECK },
     )
     const usable = v && !v.error
@@ -1643,7 +1644,7 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
   }
   // Identity is an exact SHA, never a count.
   const now = await relayOnce(
-    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`${EMIT}${PY} ${PREFLIGHT_SCRIPT} --recheck\` ` + RETURN_EXIT,
+    `${IN_CHECKOUT}Editing and committing nothing, ${runExactly(`${PREFLIGHT_SCRIPT} --recheck`)}`,
     { label: `recheck#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low', schema: RECHECK },
   )
   if (!now) return { pass: false, committed: false, detail: 'recheck agent died', sha: '' }
@@ -1671,10 +1672,9 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
   // A required hook may regenerate files outside the scope: run the hooks first and admit only what appeared after they reported changes, the checked files unchanged; the committer never picks a path.
   const quoted = checked.map(shq).join(' ')
   const hooks = await relayRun(
-    `${IN_CHECKOUT}Editing nothing by hand, from the checkout's top level run exactly \`${EMIT}${PY} ${HOOKS_SCRIPT} ${quoted}\` ` +
+    `${IN_CHECKOUT}Editing nothing by hand, from the checkout's top level ` +
     // A repository's hooks may run its whole test suite: hooks.py stops them before this limit (#140).
-    `in the foreground with a Bash timeout of 600000 ms, the tool's maximum, ` +
-    RETURN_EXIT,
+    runExactly(`${HOOKS_SCRIPT} ${quoted}`, ' Run it in the foreground with a Bash timeout of 600000 ms, the tool\'s maximum.'),
     { label: `hooks#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low', schema: HOOKS },
   )
   if (!hooks) return { pass: false, committed: false, detail: 'hook agent died', sha: '' }
@@ -1756,10 +1756,9 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
     `The fixes: ${JSON.stringify(brief.claims)}; read \`git --literal-pathspecs diff -- ${scope.map(shq).join(' ')}\` for what changed. ` +
     // A file, not a here-document: no delimiter can collide with the message.
     // An installed pre-commit hook runs again on the commit: the hooks excused above stay excused there, the others run.
-    `Then run exactly \`${EMIT}${PY} ${COMMITS_SCRIPT} commit ${skipIds.length ? `--skip-hooks ${shq(skipIds.join(','))} ` : ''}--receipt ${receiptFile} --request ${shq(commitLabel)} ${scope.map(shq).join(' ')} < '<that file>'; rm -f '<that file>'\` ` +
-    'in the foreground with a Bash timeout of 600000 ms, the tool\'s maximum: an installed pre-commit hook runs again on the commit. ' +
-    'Do not push. Change nothing else, and never add a file a hook touched and retry. ' +
-    RETURN_EXIT,
+    'Then ' + runExactly(`${COMMITS_SCRIPT} commit ${skipIds.length ? `--skip-hooks ${shq(skipIds.join(','))} ` : ''}--receipt ${receiptFile} --request ${shq(commitLabel)} ${scope.map(shq).join(' ')} < '<that file>'; rm -f '<that file>'`,
+      ' Run it in the foreground with a Bash timeout of 600000 ms, the tool\'s maximum: an installed pre-commit hook runs again on the commit. ' +
+      'Do not push. Change nothing else, and never add a file a hook touched and retry.'),
     { label: commitLabel, phase: 'Push', model: 'haiku', effort: 'low', schema: COMMIT, fileTool: true },
   )
   // A lost or error copy is recovered from the script's own receipt, never by a second commit; with none, the HEAD read-back settles it, else committed stays null.
@@ -1773,8 +1772,7 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
   if (!lost && !said.committed) return { pass: false, committed: false, detail: said.detail || 'no commit was created', sha: '' }
 
   const seen = await relayOnce(
-    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`${EMIT}${PY} ${COMMITS_SCRIPT} head --parent ${expectedHead} ${scope.map(shq).join(' ')}\` ` +
-    RETURN_EXIT,
+    `${IN_CHECKOUT}Editing and committing nothing, ${runExactly(`${COMMITS_SCRIPT} head --parent ${expectedHead} ${scope.map(shq).join(' ')}`)}`,
     { label: `audit#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low', schema: AUDIT },
   )
   const sha = seen ? seen.sha.trim() : ''
@@ -1821,8 +1819,7 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
 // Read-only; a receipt bound to another request, parent or scope is none.
 const readCommitReceipt = async (label, file, scope) => {
   const r = await relayOnce(
-    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`${EMIT}${PY} ${COMMITS_SCRIPT} receipt ${file} --request ${shq(label)} --parent ${expectedHead} ${scope.map(shq).join(' ')}\` ` +
-    RETURN_EXIT,
+    `${IN_CHECKOUT}Editing and committing nothing, ${runExactly(`${COMMITS_SCRIPT} receipt ${file} --request ${shq(label)} --parent ${expectedHead} ${scope.map(shq).join(' ')}`)}`,
     { label: `receipt:${label}`, phase: 'Push', model: 'haiku', effort: 'low', schema: COMMIT_RECEIPT },
   )
   const why = !r ? 'the read-back agent died' : r.error ? r.error
@@ -1834,10 +1831,9 @@ const readCommitReceipt = async (label, file, scope) => {
 
 // Push one audited SHA, never the branch. Landed only when every pinned URL (and the PR, for an adoption) reads it back; failed only when every URL answered without it; else unknown. null when the agent died.
 const pushExact = async (sha, label, prToo = false) => {
-  const prompt = `${IN_CHECKOUT}Committing, amending and forcing nothing, run exactly ` +
-    `\`${EMIT}${PY} ${PUSH_SCRIPT} --remote '${pinned.remote.trim()}' --branch '${pinned.prBranch.trim()}' --sha ${sha} ` +
-    `${pinned.pushUrls.map(u => `--push-url '${u}'`).join(' ')} --open-pr ${args.pr}${prToo ? ` --pr ${args.pr}` : ''} --repo ${shq(repo)}\` ` +
-    RETURN_EXIT
+  const prompt = `${IN_CHECKOUT}Committing, amending and forcing nothing, ` +
+    runExactly(`${PUSH_SCRIPT} --remote '${pinned.remote.trim()}' --branch '${pinned.prBranch.trim()}' --sha ${sha} ` +
+      `${pinned.pushUrls.map(u => `--push-url '${u}'`).join(' ')} --open-pr ${args.pr}${prToo ? ` --pr ${args.pr}` : ''} --repo ${shq(repo)}`)
   const opts = { label, phase: 'Push', model: 'haiku', effort: 'low', schema: PUSH }
   // A retry finds a push that landed; it cannot prove one did not.
   const first = await relayRun(prompt, opts)
@@ -1867,7 +1863,7 @@ const pushExact = async (sha, label, prToo = false) => {
 
 const PR_STATE = withSeal({ type: 'object', additionalProperties: false, required: ['state'], properties: { error: { type: 'string' }, state: { type: 'string' } } })
 const readPrState = async (tag) => {
-  const r = await relayOnce(`${IN_CHECKOUT}Editing and committing nothing, run exactly \`${EMIT}${PY} ${PREFLIGHT_SCRIPT} --state ${args.pr} --repo ${shq(repo)}\` ` + RETURN_EXIT,
+  const r = await relayOnce(`${IN_CHECKOUT}Editing and committing nothing, ${runExactly(`${PREFLIGHT_SCRIPT} --state ${args.pr} --repo ${shq(repo)}`)}`,
     { label: `prstate#${tag}`, phase: 'Triage', model: 'haiku', effort: 'low', schema: PR_STATE })
   if (!r || r.error || !['OPEN', 'MERGED', 'CLOSED'].includes(r.state)) log(`prstate#${tag}: PR #${args.pr} state unread — ${!r ? 'the relay died' : r.error || JSON.stringify(r.state)}`)
   return r && !r.error ? r.state : null
@@ -2026,9 +2022,9 @@ const settleSonar = async (cycle, entry, ended) => {
   // One receipt per request and cycle: the CI lane after the review lane's line was lost, or a resumed relay, replays the run that marked (#55).
   const receipt = `${pinned.receipts.trim()}/sonar-${cycle}-${fnv1a(JSON.stringify({ head: expectedHead, items }))}.json`
   const r = await relayRun(
-    `${IN_CHECKOUT}Mark SonarCloud issues on PR #${args.pr}: write exactly this JSON to a new temporary file, a name without quotes, and run ` +
-    `\`${EMIT}${PY} ${SONAR_SCRIPT} --pr ${args.pr} --repo ${shq(repo)} --head ${expectedHead} --manifest '<that file>' --receipt ${shq(receipt)}\` ` + RETURN_EXIT +
-    ` Change nothing on SonarCloud or GitHub yourself. Manifest: ${JSON.stringify({ items })}`,
+    `${IN_CHECKOUT}Mark SonarCloud issues on PR #${args.pr}: write exactly this JSON to a new temporary file, a name without quotes, and ` +
+    runExactly(`${SONAR_SCRIPT} --pr ${args.pr} --repo ${shq(repo)} --head ${expectedHead} --manifest '<that file>' --receipt ${shq(receipt)}`,
+      ` Change nothing on SonarCloud or GitHub yourself. Manifest: ${JSON.stringify({ items })}`),
     { label, phase: 'Push', model: 'haiku', effort: 'low', schema: SONAR })
   if (!r) { log(`${label}: no answer — the issues stay owed`); return 0 }
   if (r.error) { sonarDown = r.error; log(`${label}: ${r.error} — the issues stay owed, nothing more is asked this launch`); return 0 }
@@ -2093,8 +2089,7 @@ const relayTrigger = async (cycle, kind, script, task, flag, outcomes) => {
   // No fresh attempt for a CodeRabbit request: it reads before it comments with no lock, so a first attempt still
   // running could comment twice; Greptile's trigger claims its head under a lock first.
   const t = await (kind === 'crrequest' ? relayRun : relayOnce)(
-    `${IN_CHECKOUT}${task}: run \`${EMIT}${PY} ${script} --pr ${args.pr} --repo ${shq(repo)} --head ${expectedHead}${flag}\` ` +
-    RETURN_EXIT + ' Change nothing on GitHub yourself.',
+    `${IN_CHECKOUT}${task}: ${runExactly(`${script} --pr ${args.pr} --repo ${shq(repo)} --head ${expectedHead}${flag}`, ' Change nothing on GitHub yourself.')}`,
     { label, phase: 'Push', model: 'haiku', effort: 'low', schema: TRIGGER })
   const known = !!t && !t.error && outcomes.includes(t.outcome)
   const outcome = known ? t.outcome : 'failed'
@@ -2262,9 +2257,8 @@ const ciLaneRun = async (cycle, lanes, entry) => {
     const head = queried = expectedHead
     const prompt = (command) =>
       `${IN_CHECKOUT}Editing and committing nothing, ${payload ? 'write exactly the JSON below to a new temporary file, a name without quotes, and ' : ''}` +
-      `run exactly \`${EMIT}${PY} ${COLLECT_SCRIPT} ${command} --repo ${shq(repo)} --pr ${args.pr} --head ${head}${payload ? " < '<that file>'" : ''}\` ` +
-      'in the foreground with a Bash timeout of 600000 ms, the tool\'s maximum, ' + RETURN_EXIT +
-      (payload ? `\n${JSON.stringify(payload)}` : '')
+      runExactly(`${COLLECT_SCRIPT} ${command} --repo ${shq(repo)} --pr ${args.pr} --head ${head}${payload ? " < '<that file>'" : ''}`,
+        ' Run it in the foreground with a Bash timeout of 600000 ms, the tool\'s maximum.' + (payload ? `\n${JSON.stringify(payload)}` : ''))
     const opts = { label, phase: 'Triage', model: 'haiku', effort: 'low', schema, contract: COLLECT_CONTRACT }
     // A skew stops the cycle (runLanes); to every reader here its line is an error.
     const skewed = (got) => {
@@ -2583,8 +2577,8 @@ let lastRead = null
 let quotaRead = null
 const probeReviews = async (cycle) => {
   const p = await relayRun(
-    `${IN_CHECKOUT}Editing nothing, run exactly \`${EMIT}${PY} ${HARVEST_SCRIPT} --pr ${args.pr} --repo ${shq(repo)} --reviewers ${reviewers.join(',')}` +
-    `${waitedOn.length ? ` --auto-run ${waitedOn.join(',')}` : ''} --probe\` ` + RETURN_EXIT,
+    `${IN_CHECKOUT}Editing nothing, ` +
+    runExactly(`${HARVEST_SCRIPT} --pr ${args.pr} --repo ${shq(repo)} --reviewers ${reviewers.join(',')}${waitedOn.length ? ` --auto-run ${waitedOn.join(',')}` : ''} --probe`),
     { label: `reviews:probe#${cycle}`, phase: 'Triage', model: 'haiku', effort: 'low', schema: PROBE },
   )
   // GitHub refused the probe: the validator's harvest would be refused too
@@ -3251,9 +3245,9 @@ if (cyclesUsed >= maxCycles) {
   return finish(stop(lastCycle, 'budget-exhausted'))
 }
 const pinned = await relayOnce(
-  `${IN_CHECKOUT}Editing and committing nothing, run exactly \`${EMIT}${PY} ${PREFLIGHT_SCRIPT} --pr ${args.pr}${NEEDED.map(p => ` --needs ${p}`).join('')}` +
-  `${MODULES.map(m => ` --module ${m}`).join('')}${repo ? ` --repo ${shq(repo)}` : ''}\` ` +
-  RETURN_EXIT,
+  `${IN_CHECKOUT}Editing and committing nothing, ` +
+  runExactly(`${PREFLIGHT_SCRIPT} --pr ${args.pr}${NEEDED.map(p => ` --needs ${p}`).join('')}` +
+    `${MODULES.map(m => ` --module ${m}`).join('')}${repo ? ` --repo ${shq(repo)}` : ''}`),
   { label: 'preflight', phase: 'Triage', model: 'haiku', effort: 'low', schema: PIN },
 )
 if (!pinned) return finish(stop(lastCycle, 'preflight-died'))
@@ -3354,8 +3348,7 @@ if (adoptHead !== null) {
   if (p && !retry) log(`preflight: the unpublished candidate (${p.stage}) is left to this adoption of ${adoptHead.slice(0, 7)}: PR #${args.pr} heads ${X.slice(0, 7)}, and only the audited chain may publish`)
   if (tip !== base) log(`preflight: ${pinned.prBaseBranch} is at ${tip.slice(0, 7)}, not the base ${base.slice(0, 7)} GitHub recorded at the PR's last push; a merge may come from either`)
   const audit = await relayOnce(
-    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`${EMIT}${PY} ${COMMITS_SCRIPT} chain ${X} ${adoptHead} --published ${prHead} --base ${base} --tip ${tip}\` ` +
-    RETURN_EXIT,
+    `${IN_CHECKOUT}Editing and committing nothing, ${runExactly(`${COMMITS_SCRIPT} chain ${X} ${adoptHead} --published ${prHead} --base ${base} --tip ${tip}`)}`,
     { label: 'adopt:audit', phase: 'Triage', model: 'haiku', effort: 'low', schema: ADOPT_AUDIT },
   )
   const shas = audit ? audit.commits : []
@@ -3415,7 +3408,7 @@ if (rebased) {
   const notes = [...answeredWith].filter(([id, a]) => a.how === 'fixNote' && !(debt.get(id) && debt.get(id).rejudge))
   const shas = [...new Set(notes.map(([, a]) => a.sha).filter(Boolean))]
   const read = shas.length ? await relayOnce(
-    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`${EMIT}${PY} ${COMMITS_SCRIPT} cited ${rebased.to} ${shas.join(' ')}\` ` + RETURN_EXIT,
+    `${IN_CHECKOUT}Editing and committing nothing, ${runExactly(`${COMMITS_SCRIPT} cited ${rebased.to} ${shas.join(' ')}`)}`,
     { label: 'rebase:cited', phase: 'Triage', model: 'haiku', effort: 'low', schema: CITED },
   ) : null
   const unread = !shas.length ? null : !read ? 'the relay died' : read.error ? read.error

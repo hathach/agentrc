@@ -43,13 +43,12 @@ count, pid or address, each time, worker number and temporary name masked), so
 they are no evidence against the change (#378). The change's side is the
 original ordered run, never a later lone run, so a failure caused by what an
 earlier hook left is judged as it happened. A hook that ever modified files is
-never rerun there, nor one whose id SKIP cannot name (a comma, or padding the
-config gives it), more than one config entry uses or another hook in the config
-takes as its alias, nor one SKIP naming it would not select alone among the
-hooks the run selected, a remote manifest's aliases included (SKIP skips those
-hooks too, and a fail_fast stop at one leaves the rest unchecked), nor any when
-the config cannot be read: with PyYAML, or without it by pre-commit's own
-interpreter; notRerun is {hook, why} for each
+never rerun there, nor one SKIP naming it would not select alone (it cannot
+name an id with a comma, or the padding the config gives it) among the hooks the
+run selected and those pre-commit resolves at any stage, aliases a remote
+manifest gives included (the commit's SKIP skips a commit-msg hook too, and a
+fail_fast stop at one leaves the rest unchecked), nor any when hook_runner.py's
+record of every stage's hooks is missing or malformed; notRerun is {hook, why} for each
 failed hook not rerun there; failed's error and notRerun's why hold no terminal
 escapes or control characters, as commits.py's detail. Each rerun gets a clean
 HEAD tree, checked out and reset without the repository's git hooks; removing it
@@ -61,8 +60,8 @@ hook must fail without modifying files. A change that leaves a hook's output the
 same once masked is still excused: a hook that prints only a count of its
 violations, or a new violation replacing one of HEAD's that differs from it only
 in numbers; CI runs the hook on the pushed head. When every failure is excused
-and a hook may stop the run early (fail_fast set on the whole config or a hook,
-or left to a remote repository's manifest by a hook's entry), the hooks run once
+and a hook may stop the run early (fail_fast on the config or a hook as
+pre-commit resolved it, a remote manifest's included), the hooks run once
 more on the change, with its retry, and SKIP naming the excused ones, as the
 commit will, so a fail_fast stop cannot hide a hook the change breaks: what
 fails there joins failed and is rerun on HEAD in turn, the hooks running again
@@ -102,20 +101,12 @@ from facts import Unusable, checkout_top, git, report, status  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
 import windows  # noqa: E402
 
-try:
-    import yaml
-except ImportError:
-    yaml = None
-YAML_ERRORS = (yaml.YAMLError,) if yaml else ()
-
 CONFIG = '.pre-commit-config.yaml'
 DEADLINE = 540
 RUNNER = Path(__file__).resolve().with_name('hook_runner.py')
 ERROR_CHARS = 200
 # Seconds past the deadline the HEAD worktree's removal may take.
 CLEANUP = 20
-# Run by pre-commit's own interpreter, which depends on PyYAML, when this one lacks it: the config as JSON.
-LOAD_CONFIG = 'import json, sys, yaml; print(json.dumps(yaml.safe_load(open(sys.argv[1], encoding="utf-8"))))'
 # Any CPython or PyPy build's name: python3, python3.12, python3.13t, python3-dbg, pypy3, python.exe.
 SHEBANG_PYTHON = re.compile(r'(?:python|pypy)[\w.-]*')
 # The #! line pip's Windows launcher (distlib's ScriptMaker) puts between its stub and the archive it runs.
@@ -193,7 +184,8 @@ def attributed(text, code):
     """(the roster record, the hook records) hook_runner.py left in text for a run that exited code, checked whole:
     one start of a supported version, the roster, a hook record per roster entry in order up to the end or a fail_fast
     stop at a failed one, and the end with code. Unattributed when they are not; Unusable when they say a hook
-    failed and pre-commit exited 0."""
+    failed and pre-commit exited 0. The roster's everywhere is the hooks record between start and roster, every hook
+    at any stage, or None when it is missing or malformed."""
     if text is None:
         raise Unattributed('the pre-commit on PATH is no entry hook_runner.py stands in for, so it ran as is')
     try:
@@ -205,6 +197,10 @@ def attributed(text, code):
         raise Unattributed('it left no records')
     if not records[0].get('supported'):
         raise Unattributed(f"pre-commit {records[0].get('version')} is not a version hook_runner.py supports")
+    everywhere = None
+    if kinds[1:2] == ['hooks']:
+        everywhere = records.pop(1).get('hooks')
+        kinds.pop(1)
     if kinds[1:2] != ['roster'] or kinds[-1] != 'end' or set(kinds[2:-1]) - {'hook'}:
         raise Unattributed('its records stop short')
     roster, ran, end = records[1], records[2:-1], records[-1]
@@ -225,7 +221,10 @@ def attributed(text, code):
             raise Unattributed(f"its records contradict pre-commit's exit status {code}")
     except (KeyError, TypeError, IndexError):
         raise Unattributed('its records are malformed')
-    return roster, ran
+    whole = isinstance(everywhere, list) and all(
+        isinstance(h, dict) and isinstance(h.get('id'), str) and isinstance(h.get('alias'), str)
+        and isinstance(h.get('stages'), list) for h in everywhere)
+    return {**roster, 'everywhere': everywhere if whole else None}, ran
 
 
 def first_error(record):
@@ -239,8 +238,8 @@ def first_error(record):
 
 
 def results(text, code):
-    """(ids of the hooks that modified files, {hook, index, error, output} of each failed hook, the roster's hooks) of
-    one run from its records; a run they cannot attribute modified nothing it can name and, when it failed, has one
+    """(ids of the hooks that modified files, {hook, index, error, output} of each failed hook, attributed()'s roster)
+    of one run from its records; a run they cannot attribute modified nothing it can name and, when it failed, has one
     failure UNOWNED says why, with no roster."""
     try:
         roster, ran = attributed(text, code)
@@ -249,17 +248,30 @@ def results(text, code):
             else [], None
     return ([r['id'] for r in ran if r['modified']],
             [{'hook': r['id'], 'index': r['index'], 'error': first_error(r), 'output': r['output']}
-             for r in ran if r['failed']], roster['hooks'])
+             for r in ran if r['failed']], roster)
 
 
 def unselected(failure, roster):
-    """Why SKIP naming failure's hook would not skip that hook alone among roster, the hooks its run selected once
-    pre-commit resolved the config and the manifests, aliases and fail_fast stops included; '' when it would."""
+    """Why SKIP naming failure's hook would not skip that hook alone, as pre-commit resolved the config and the
+    manifests, aliases included: among roster's hooks, those its run selected, and its everywhere, those of every
+    stage, which the commit runs with the same SKIP; '' when it would."""
     names = {s.strip() for s in failure['hook'].split(',') if s.strip()}
-    selected = [i for i, h in enumerate(roster) if h['id'] in names or h['alias'] in names]
-    if selected == [failure['index']]:
-        return ''
-    return 'SKIP would skip another hook by it' if failure['index'] in selected else 'SKIP cannot name it'
+    selected = [i for i, h in enumerate(roster['hooks']) if h['id'] in names or h['alias'] in names]
+    if failure['index'] not in selected:
+        return 'SKIP cannot name it'
+    # The run's hooks are among every stage's: none named there is a record that contradicts the run.
+    named = sum(h['id'] in names or h['alias'] in names for h in roster['everywhere'] or ())
+    if not named:
+        return "hook_runner.py's record of the hooks at every stage is missing or malformed"
+    if len(selected) > 1 or named > 1:
+        return 'SKIP would skip another hook by it'
+    return ''
+
+
+def may_stop(roster):
+    """Whether a hook may stop roster's run early: fail_fast on the config, the run or a hook as pre-commit resolved
+    it, a remote manifest's included."""
+    return roster['failFast'] or any(h['failFast'] for h in roster['hooks'])
 
 
 def kill_tree(proc):
@@ -459,6 +471,7 @@ def launcher_entry(data):
         return None
 
 
+@functools.cache
 def pre_commit_python():
     """(the interpreter and argument the pre-commit on PATH starts, that entry's resolved path), or None when they are
     not known or the entry does more than call pre-commit's main() as pip's own does (standard_entry()): then
@@ -498,59 +511,6 @@ def pre_commit_python():
     if not (words and absolute(words[0]) and SHEBANG_PYTHON.fullmatch(name(words[0])) and standard_entry(body)):
         return None
     return words, entry
-
-
-def pre_commits_load(deadline, start):
-    """(the config as pre-commit's own interpreter loads it, '') or (None, why it was not read)."""
-    found = pre_commit_python()
-    if not found:
-        return None, "PyYAML is not installed, nor is pre-commit's interpreter known, so the config was not read"
-    argv, entry = found
-    try:
-        # Run where the entry script lies, so it imports as pre-commit does, nothing from the checkout.
-        code, out, err = bounded([*argv, '-c', LOAD_CONFIG, os.path.abspath(CONFIG)], deadline, start,
-                                 'reading the config', cwd=os.path.dirname(entry))
-    except OSError as e:
-        return None, copyable(f"pre-commit's {argv[0]} cannot run ({type(e).__name__})")
-    if code:
-        last = copyable((err.strip().splitlines() or [f'exit {code}'])[-1]).strip()
-        return None, copyable(f"pre-commit's {argv[0]} cannot read {CONFIG} ({last[:ERROR_CHARS]})")
-    return json.loads(out), ''
-
-
-def config_ids(deadline, start):
-    """({each id SKIP cannot skip that hook alone by: why}, whether a hook may stop the run early, ''), or (None,
-    None, why) when it cannot be read; a remote repository's manifest may set a hook's fail_fast unless the hook's entry
-    sets it.
-    SKIP's names would also skip another hook: an alias the config gives a hook under another id, and an id more than
-    one entry uses; and it strips each name, so a padded id it cannot name (pre-commit's commands/run.py)."""
-    try:
-        if yaml:
-            config = yaml.safe_load(Path(CONFIG).read_text(encoding='utf-8'))
-        else:
-            config, why = pre_commits_load(deadline, start)
-            if why:
-                return None, None, why
-        entries = [h for repo in config['repos'] for h in repo['hooks']]
-        ids = [h['id'] for h in entries]
-        shared = {i: 'SKIP would skip another hook by it' for i in ids if ids.count(i) > 1}
-        shared |= {h['alias']: 'SKIP would skip another hook by it' for h in entries
-                   if h.get('alias') not in (None, '', h['id'])}
-        shared |= {i: 'SKIP cannot name it' for i in ids if i != i.strip()}
-        stops = bool(config.get('fail_fast')) or any(h.get('fail_fast', repo['repo'] not in ('local', 'meta'))
-                                                     for repo in config['repos'] for h in repo['hooks'])
-        return shared, stops, ''
-    except (OSError, ValueError, KeyError, TypeError, AttributeError, *YAML_ERRORS) as e:
-        return None, None, f'{CONFIG} cannot be read ({type(e).__name__})'
-
-
-def unexcusable(hook, ids, shared, unread):
-    """Why a failure of hook is never rerun on HEAD, or '' when it is. A hook that rewrote files is judged by what it
-    wrote; the commit could not skip an id SKIP cannot name, and SKIP naming one it shares, or one whose aliases are
-    unknown, would also skip another hook, unrun on the change or, past a fail_fast stop, unchecked; shared is
-    config_ids'."""
-    return ('it modified files' if hook in ids else 'SKIP cannot name it' if ',' in hook else unread
-            or shared.get(hook, ''))
 
 
 def registers(admin, tree):
@@ -678,15 +638,14 @@ def run_hooks(paths, deadline=DEADLINE, start=None):
         return False, True, [], [], [], []
     start = time.monotonic() if start is None else start
     code, ids, failures, roster = passes(paths, deadline, start, 'run')
-    shared, stops, unread = config_ids(deadline, start) if any(f['hook'] != UNOWNED for f in failures) \
-        else ({}, False, '')
     found, excused, not_rerun = failures, [], {}
     while True:
         expected = {}
         for f in found:
             if f['hook'] == UNOWNED:
                 continue
-            why = unexcusable(f['hook'], ids, shared, unread) or unselected(f, roster)
+            # A hook that rewrote files is judged by what it wrote.
+            why = 'it modified files' if f['hook'] in ids else unselected(f, roster)
             if why:
                 not_rerun.setdefault(f['hook'], why)
             elif f['hook'] not in excused:
@@ -695,7 +654,7 @@ def run_hooks(paths, deadline=DEADLINE, start=None):
         excused += newly
         for hook, why in late.items():
             not_rerun.setdefault(hook, why)
-        if not newly or not {f['hook'] for f in found} <= set(excused) or not stops:
+        if not newly or not {f['hook'] for f in found} <= set(excused) or not may_stop(roster):
             break
         # fail_fast may have stopped the run at an excused hook: every other hook must pass on the change, as the
         # commit will run them with the same SKIP, or fail on HEAD too.

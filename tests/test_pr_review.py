@@ -1,7 +1,6 @@
 """Tests for pr-review's scripts: real git in temporary repositories, a fake GitHub behind gh."""
 import contextlib
 import errno
-import hashlib
 import importlib.util
 import json
 import os
@@ -968,13 +967,11 @@ class Ledger(Case):
         self.push_pr()
         self.p = self.prepare()
 
-    def test_snapshot_of_an_empty_ledger_holds_nothing_standing(self):
+    def test_the_view_of_an_empty_ledger_holds_nothing_standing(self):
         snap = self.tmp / 'threads.json'
         snap.write_text(json.dumps({'repo': REPO, 'pr': PR, 'comments': [], 'threads': []}))
-        manifest = self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--threads', str(snap), '--head', self.p['head'],
-                                      '--snapshot', str(self.tmp)])
-        self.assertEqual(json.loads(Path(manifest['file']).read_bytes()), {'reviews': 0, 'last': None, 'open': [],
-                                                                              'disputes': []})
+        view = self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--threads', str(snap), '--head', self.p['head'], '--view'])
+        self.assertEqual(view, {'repo': REPO, 'pr': PR, 'head': self.p['head'], 'reviews': 0, 'last': None, 'open': [], 'disputes': []})
 
     def test_save_refuses_a_word_off_the_scale_before_anything_is_stored(self):
         for word in ('major', 'severe', None):
@@ -1923,36 +1920,19 @@ class Pushback(PostCase):
         with self.assertRaisesRegex(facts.Unusable, 'needs --threads'):
             self.call(ledger, [*show, '--head', self.head])
 
-    def test_snapshot_writes_the_workflows_view_to_a_content_named_file_and_prints_its_manifest(self):
+    def test_view_is_the_workflows_projection_bound_to_its_repository_pr_and_head(self):
         snap = self.snapshot((950, 'contrib', 'intentional', False))
         show = ['show', '--pr', str(PR), '--repo', REPO, '--threads', str(snap), '--head', self.head]
-        where = self.tmp / 'facts-snap'
-        where.mkdir()
-        manifest = self.call(ledger, [*show, '--snapshot', str(where)])
-        payload = Path(manifest['file']).read_bytes()
-        self.assertTrue(payload.isascii())
+        view = self.call(ledger, [*show, '--view'])
         plain = self.call(ledger, show)
-        view = {k: v for k, v in plain.items() if k not in ('ledger', 'answers')}
-        view['open'] = [{k: v for k, v in f.items() if k not in ('impact', 'severityReason')} for f in plain['open']]
-        self.assertEqual(json.loads(payload), view, 'the plain answer less what the workflow never reads')
+        want = {k: v for k, v in plain.items() if k not in ('ledger', 'answers')}
+        want['open'] = [{k: v for k, v in f.items() if k not in ('impact', 'severityReason')} for f in plain['open']]
+        self.assertEqual(view, {'repo': REPO, 'pr': PR, 'head': self.head, **want}, 'the plain answer less what the workflow never reads')
         self.assertEqual((len(view['open']), len(view['disputes'])), (1, 1))
-        self.assertEqual(Path(manifest['file']).name, f"ledger-{hashlib.sha256(payload).hexdigest()}.json")
-        self.assertEqual(manifest, {'repo': REPO, 'pr': PR, 'head': self.head, 'file': manifest['file'],
-                                    'digest': facts.fnv1a(payload.decode()), 'length': len(payload)})
-        Path(manifest['file']).write_bytes(payload + b' ')
-        self.assertEqual(self.call(ledger, [*show, '--snapshot', str(where)]), manifest, 'a rerun names the same file')
-        self.assertEqual(Path(manifest['file']).read_bytes(), payload, 'and writes it anew, so a damaged one is repaired')
-        changed = self.snapshot((950, 'contrib', 'intentional, see line 3', False))
-        later = self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--threads', str(changed), '--head', self.head,
-                                   '--snapshot', str(where)])
-        self.assertNotEqual(later['file'], manifest['file'])
-        self.assertEqual(Path(manifest['file']).read_bytes(), payload, 'a later answer leaves the earlier file as it was')
-        with self.assertRaisesRegex(facts.Unusable, 'is not a directory'):
-            self.call(ledger, [*show, '--snapshot', str(where / 'missing')])
         for bad in (['show', '--pr', str(PR), '--repo', REPO, '--threads', str(snap)],
                     [*show, '--fixable']):
-            with self.assertRaisesRegex(facts.Unusable, '--snapshot needs --threads and --head, and not --fixable'):
-                self.call(ledger, [*bad, '--snapshot', str(where)])
+            with self.assertRaisesRegex(facts.Unusable, '--view needs --threads and --head, and not --fixable'):
+                self.call(ledger, [*bad, '--view'])
 
     def test_a_finding_read_back_from_the_snapshot_saves_with_its_whole_text(self):
         path = Path(self.p['ledger'])
@@ -1962,9 +1942,7 @@ class Pushback(PostCase):
         led['reviews'][0]['findings'][0].update(text)
         path.write_text(json.dumps(led))
         snap = self.snapshot((950, 'contrib', 'intentional', False))
-        manifest = self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--threads', str(snap), '--head', self.head,
-                                      '--snapshot', str(snap.parent)])
-        row = json.loads(Path(manifest['file']).read_bytes())['open'][0]
+        row = self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--threads', str(snap), '--head', self.head, '--view'])['open'][0]
         self.assertEqual((row['why'], row['confidence']), (text['why'], text['confidence']))
         self.assertFalse({'impact', 'severityReason'} & set(row))
         grade = {k: row[k] for k in ('severity', 'confidence')}  # the workflow's gradeOf(f), its absent members dropped
@@ -2839,6 +2817,18 @@ class Repair(PostCase):
         got = nxt('--publish', 'auto-fix', '--manifest', str(manifest), '--babysit-reading', str(reading), '--token', 'ab12')
         self.assertEqual((got['step'], Path(got['argv'][1]).name, got['argv'][2:]),
                          ('recheck', 'prepare.py', ['--recheck-from', self.reviewed, '--token', 'ab12', '--pr', str(PR), '--repo', REPO]))
+
+    def test_next_refuses_a_file_it_reads_that_holds_no_object(self):
+        nxt = lambda *extra: self.call(ledger, ['next', '--pr', str(PR), '--repo', REPO, '--head', self.reviewed,  # noqa: E731
+                                                '--publish', 'auto-post', *extra])
+        listed = self.tmp / 'listed.json'
+        listed.write_text('progress\n[1]\n')
+        for flag in ('--manifest', '--babysit-reading'):
+            with self.assertRaisesRegex(facts.Unusable, f'{flag} {re.escape(str(listed))} is not an object'):
+                nxt(flag, str(listed))
+        Path(ledger.facts_path(REPO, PR, self.reviewed)).write_text('"pins"')
+        with self.assertRaisesRegex(facts.Unusable, 'prepare facts .* is not an object'):
+            nxt()
 
 
     def test_a_long_note_is_posted_whole(self):

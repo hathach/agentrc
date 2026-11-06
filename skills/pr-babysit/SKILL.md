@@ -39,7 +39,7 @@ python3 "$S/coderabbit_trigger.py" --pr N [--repo R] --head <sha> [--request]  #
 python3 "$S/greptile_trigger.py" --pr N [--repo R] --head <sha>  # comment `@greptileai` once per head, recorded under the git common dir
 python3 "$S/build.py" --path 'src/a.c' --command 'make -C <BUILD>' [--setup L] [--require T]  # build the checkout as it stands
 python3 "$S/scope_check.py" --path 'src/a.c' --path 'test/test_a.c'  # which paths a fix writer may edit or create
-python3 "$S/state_transfer.py" <saved output> [--raw]  # a stateRef's state whole with its digest; --raw: the file's own text and its fnv1a (pr-review's ledger snapshot)
+python3 "$S/state_transfer.py" <saved output>  # a stateRef's state whole with its digest
 python3 "$S/facts.py" emit-dir                 # a new directory for one launch's AGENTRC_EMIT files; ones unwritten for 14 days go
 python3 "$S/launch_result.py" --output <saved output> [--state-ref F:D] [--checkout DIR] [--keys]  # the caller's reading of a launch; --keys: settled failures' keys too
 python3 "$S/merge.py" --pr-url <url> --base <branch> --checkout DIR --output <saved output> --state-digest D [--waive BOT] [--merge]  # chief's merge gate; inspects without --merge; --waive drops a bot from the required reviews on the owner's word, recorded as `waived`
@@ -61,20 +61,9 @@ launch, lists the `blockers` to settle before continuing, and shows as `pinned`
 the arguments the state is fixed to, which a continuation passes unchanged.
 A launch on a PR no longer open stops `pr-merged` or `pr-closed`, at preflight or at the CI lane's next read; nothing is left to continue. Every GitHub or SonarCloud write reads the state first (`preflight.py --state`, or `push.py --open-pr` for a push) and goes on only for an OPEN PR; an unreadable state stops `pr-state-unread`.
 `preflight.py`, `harvest.py`, `scope_check.py`, `state_transfer.py`, `launch_result.py` and `commits.py` only read, except that
-each writes its AGENTRC_EMIT file, `preflight.py` creates the launch's receipts directory and `commits.py commit` stages and commits exactly its paths, saving its receipt; `hooks.py` runs the repository's
-hooks, which may rewrite files, through `hook_runner.py` under pre-commit's own interpreter (its entry script's `#!`
-line, or the one pip's `pre-commit.exe` carries), which records what pre-commit itself says each hook did. A
-`pre-commit` that is no pip entry for pre-commit's `main()`, such as a wrapper, runs as is; that run, or one on a
-pre-commit version `hook_runner.py` does not list, names no hook and excuses none. It
-reruns each failed hook that rewrote nothing alone in a temporary detached worktree of HEAD, then removes it with its
-registration, no other worktree's: one failing there, unmodifying, with the output it printed in the change's run is
-excused, left out of the workflow's verdict and skipped at the commit. A hook whose id SKIP cannot name, or would skip
-another hook by, a remote manifest's alias included, is never rerun, nor any when the config cannot be read, with
-PyYAML or, lacking it, by pre-commit's own interpreter; its `notRerun` entry says why, and so does the refusal. A rerun
-the deadline or an error cuts short gets one too, as do those after it, and the failures stay counted. When every
-failure is excused and a hook may stop the run early (fail_fast in the config, or left to a remote repository's
-manifest), it runs the hooks again with those skipped, rerunning what fails there on HEAD in turn, so a fail_fast stop
-hides none; `build.py`
+each writes its AGENTRC_EMIT file, `preflight.py` creates the launch's receipts directory and `commits.py commit` stages and commits exactly its paths, saving its receipt; `hooks.py` runs the repository's hooks, which may rewrite
+files, and reruns failed ones alone in a temporary worktree of HEAD it then removes with its registration; its
+docstring says which failures that excuses from the verdict and the commit's SKIP; `build.py`
 builds the checkout in a fresh build directory; `push.py` publishes `<sha>` and reads back
 where it landed, `sonar.py` comments on and resolves SonarCloud issues, and `coderabbit_trigger.py` edits
 CodeRabbit's summary comment to tick its Trigger review box, or with `--request` posts one `@coderabbitai review` comment, and `greptile_trigger.py` posts one `@greptileai` comment, and `merge.py --merge` merges the PR. Run any of them by hand only with the user's authorization to publish there.

@@ -94,8 +94,9 @@ that saved line and never runs the request: PATH absent, it exits 2 with no
 GitHub call, for a caller that must not post again (an earlier run that may
 still be running, or died between its receipt and its line).
 
-Under AGENTRC_EMIT the line is also written to the file it names, claimed before anything runs (exit 3 at once, nothing
-done, when that file is there): lib/seal.py's emit, which a workflow reads instead of a model's copy.
+Under AGENTRC_EMIT the line goes to the file it names instead of stdout, claimed before anything runs
+(exit 3 at once, nothing done, when that file is there): lib/seal.py's emit, which a workflow reads instead
+of a model's copy.
 """
 
 import argparse

@@ -1,21 +1,15 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test as nodeTest } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { ABSENT, AsyncFunction, emitDirs, emitOf, loadModule, moduleOf } from './emit_stub.mjs'
 
-const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
 // The body runs as the runtime runs it; `meta` is exposed so its value, not its spelling, is checked.
 const body = readFileSync(new URL('../workflows/pr-babysit.js', import.meta.url), 'utf8')
   .replace(/^export const meta = /m, 'const meta = globalThis.__meta = ')
-
-// Node gives the workflow body globals the runtime sandbox does not, so a test
-// run here is more forgiving than production: `new URL` cost this workflow every
-// run, refusing each one at preflight, while the suite stayed green. Shadowing
-// them as parameters makes the body fail here the way it fails there.
-const ABSENT = ['URL', 'URLSearchParams', 'TextEncoder', 'TextDecoder', 'Buffer', 'process', 'fetch', 'structuredClone']
 
 const GREEN = { status: 'green', infraRerun: [], realFailures: [] }
 const RUNNING = { status: 'running', infraRerun: [], realFailures: [] }
@@ -156,9 +150,6 @@ const transferOf = (state) => {
     return JSON.parse(done.stdout.trim().split('\n').at(-1))
   } finally { rmSync(dir, { recursive: true, force: true }) }
 }
-// The file a relay command hands its script as AGENTRC_EMIT, and the module lib/seal.py's emit writes there.
-const emitOf = (prompt) => String(prompt).match(/AGENTRC_EMIT='([^']+)' /)?.[1]
-const moduleOf = (file, line) => `export const meta = { name: 'emit', description: 'a script line' }\nreturn ${JSON.stringify({ emit: file, line })}\n`
 
 // The paths a prompt's command hands a script after `prefix`, each quoted as
 // shq quotes it (a `'` inside a path is `'\\''`).
@@ -222,15 +213,7 @@ async function run(opts = {}) {
   let live = 0 // how far this run still follows opts.resume
   const loads = [] // each scriptPath workflow() loaded
   // facts.py emit-dir's directory: opts.emitDir, else a new one this run removes unless opts.keepEmit.
-  let emitMade = null
-  const emitDir = () => {
-    if (opts.emitDir) return opts.emitDir
-    if (!emitMade) {
-      emitMade = `${mkdtempSync(join(tmpdir(), 'pr-babysit-emit-')).replace(/\\/g, '/')}/agentrc-emit/r1`
-      mkdirSync(emitMade, { recursive: true })
-    }
-    return emitMade
-  }
+  const emit = emitDirs('pr-babysit-emit-', opts.emitDir, opts.keepEmit)
 
   // One harvest per cycle, whichever of the validator and the probe (#359) asks for it first.
   const readings = new Map()
@@ -271,7 +254,7 @@ async function run(opts = {}) {
   const agent = async (prompt, options) => {
     const label = options.label
     // facts.py emit-dir, the transport's own bootstrap, is in the journal only.
-    if (label === 'emit:dir') return { dir: emitDir() }
+    if (label === 'emit:dir') return { dir: emit.dir() }
     calls.push({
       label, prompt: String(prompt), agentType: options.agentType,
       phase: options.phase, schema: options.schema, model: options.model,
@@ -632,15 +615,11 @@ async function run(opts = {}) {
   const pipeline = (items, first, second) =>
     settle(items.map(async item => second(await first(item), item)))
   const parallel = (thunks) => settle(thunks.map(fn => fn()))
-  // workflow({scriptPath}) as the runtime runs it: the file's body, its return value the result; an unreadable file
-  // throws. pr-babysit nests nothing else, and a child nests nothing.
+  // pr-babysit nests nothing but a data module (emit_stub.mjs's loadModule).
   const workflow = async (ref, a) => {
     if (!ref || typeof ref.scriptPath !== 'string') throw new Error('pr-babysit nests only a data module, by scriptPath')
-    const text = readFileSync(ref.scriptPath, 'utf8').replace(/^export const meta = /m, 'const meta = ')
     loads.push(ref.scriptPath)
-    const nested = () => { throw new Error('a child workflow nests nothing') }
-    return new AsyncFunction('args', 'agent', 'pipeline', 'parallel', 'phase', 'log', 'workflow', 'budget', ...ABSENT, text)(
-      a, nested, pipeline, parallel, () => {}, (m) => logs.push(String(m)), nested, null, ...ABSENT.map(() => undefined))
+    return loadModule(ref.scriptPath, a, { pipeline, parallel, log: (m) => logs.push(String(m)) })
   }
 
   // nap()'s real delay is minutes; fire it immediately and record where in the
@@ -708,10 +687,10 @@ async function run(opts = {}) {
         assert.match(value.replace(/^'(.*)'$/, '$1'), /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/, `${label}: coderabbit_trigger.py's ISO contract`)
       }
     }
-    return { result, logs, labels: calls.map(c => c.label), calls, napPoints, napMs, journal, loads, emitDir: emitMade }
+    return { result, logs, labels: calls.map(c => c.label), calls, napPoints, napMs, journal, loads, emitDir: emit.made }
   } finally {
     globalThis.setTimeout = realTimeout
-    if (emitMade && !opts.keepEmit) rmSync(emitMade.split('/agentrc-emit/')[0], { recursive: true, force: true })
+    emit.cleanup()
   }
 }
 
@@ -6497,7 +6476,7 @@ test('a path with a space or a quote survives status, snapshot, diff-tree and ls
 
 test('a hook script that reports no evidence stops publication with its error', async () => {
   const { result, labels, calls } = await run({ ...publishing, hooks: { error: 'pre-commit exited 0 but reported hook fmt failed', ran: false, passed: false } })
-  assert.match(calls.find(c => c.label === 'hooks#1-review').prompt, /`AGENTRC_EMIT='[^']+\/hooks_1-review\.1\.[0-9a-f]{8}\.js' .*hooks\.py 'src\/a\.c'` .* and answer only its exit status as exit/)
+  assert.match(calls.find(c => c.label === 'hooks#1-review').prompt, /`AGENTRC_EMIT='[^']+\/hooks_1-review\.1\.[0-9a-f]{8}\.js' .*hooks\.py 'src\/a\.c'` and answer only its exit status as exit/)
   assert.match(result.history[0].reviewPushFailed.detail, /^no hook evidence: pre-commit exited 0/)
   assert.ok(!labels.some(l => l.startsWith('commit#')), 'nothing is committed')
 })
@@ -7575,17 +7554,17 @@ test('stateRef loads the saved state whole from the file state_transfer.py emits
   const { state, stateRef } = await savedForLoad()
   const loaded = await loadWith(state, stateRef)
   assert.deepEqual(loaded.labels.slice(0, 2), ['state:load', 'preflight'])
-  assert.match(loaded.calls[0].prompt, /run exactly `AGENTRC_EMIT='[^']+\/agentrc-emit\/r1\/state_load\.1\.[0-9a-f]{8}\.js' python3 "\$\{AGENTRC_DIR:-\$HOME\/\.claude\}"\/skills\/pr-babysit\/scripts\/state_transfer\.py '\/tmp\/tasks\/w1\.output' > \/dev\/null`/)
+  assert.match(loaded.calls[0].prompt, /run exactly `AGENTRC_EMIT='[^']+\/agentrc-emit\/r1\/state_load\.1\.[0-9a-f]{8}\.js' python3 "\$\{AGENTRC_DIR:-\$HOME\/\.claude\}"\/skills\/pr-babysit\/scripts\/state_transfer\.py '\/tmp\/tasks\/w1\.output'` /)
   assert.equal(loaded.calls[0].agentType, 'relay')
   assert.match(loaded.loads[0], /\/state_load\.1\.[0-9a-f]{8}\.js$/, 'the state comes from the file, by workflow()')
   assert.equal(loaded.result.state.cyclesUsed, 2, 'the loaded state carries the budget')
   assert.equal(loaded.result.state.decisions[0][1].reason, REASON, 'free text arrives byte for byte')
   const windows = await loadWith(state, { ...stateRef, outputFile: 'C:\\Users\\me\\tasks\\w1.output' })
-  assert.match(windows.calls[0].prompt, /state_transfer\.py 'C:\/Users\/me\/tasks\/w1\.output' > /, 'a Windows path, spelled with slashes')
+  assert.match(windows.calls[0].prompt, /state_transfer\.py 'C:\/Users\/me\/tasks\/w1\.output'` /, 'a Windows path, spelled with slashes')
   assert.equal(windows.result.state.cyclesUsed, 2)
   // launch_result.py's path on a host whose user name has a blank: single-quoted, it stays one word.
   const spaced = await loadWith(state, { ...stateRef, outputFile: 'C:\\Users\\John Smith\\tasks\\w1.output' })
-  assert.match(spaced.calls[0].prompt, /state_transfer\.py 'C:\/Users\/John Smith\/tasks\/w1\.output' > /)
+  assert.match(spaced.calls[0].prompt, /state_transfer\.py 'C:\/Users\/John Smith\/tasks\/w1\.output'` /)
   assert.equal(spaced.result.state.cyclesUsed, 2)
 })
 
@@ -7624,7 +7603,7 @@ test('a state that does not check out, or no line of this run, blocks before pre
   // The live loader's "correction" (146 -> 144): the state stays well formed and keeps its digest, so only the seal can tell.
   const forged = await loadWith(state, stateRef, onLoad(a => JSON.parse(JSON.stringify(a).replace('SKILL.md:146', 'SKILL.md:144'))))
   const other = seal({ ...state, maxCycles: 9 })
-  // A read-only load gets one fresh attempt, short of the script's own error.
+  // A read-only load that brought no line back gets one fresh attempt; a line, refused or off the digest, is the file's answer.
   for (const [got, detail] of [
     [forged, /does not match stateRef\.digest/],
     [await loadWith(state, stateRef, onLoad(() => ({ digest: stateRef.digest, state: other }))), /does not match stateRef\.digest/],
@@ -7634,7 +7613,7 @@ test('a state that does not check out, or no line of this run, blocks before pre
   ]) {
     assert.deepEqual([got.result.status, got.result.reason, got.result.stateRef], ['blocked', 'state-transfer-failed', stateRef])
     assert.match(got.result.detail, detail)
-    assert.deepEqual(got.labels, /^state_transfer/.test(got.result.detail) ? ['state:load'] : ['state:load', 'state:load.retry'], 'nothing past the loader runs')
+    assert.deepEqual(got.labels, /^the relay died$/.test(got.result.detail) ? ['state:load', 'state:load.retry'] : ['state:load'], 'nothing past the loader runs')
   }
 })
 

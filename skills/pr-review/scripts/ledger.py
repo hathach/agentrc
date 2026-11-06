@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """pr-review's per-PR ledger: what each review of a PR found, drafted and posted.
 
-  ledger.py show --pr N [--repo OWNER/NAME] [--finding ID | --draft | --pending | --threads FILE [--head SHA [--snapshot DIR]]]
+  ledger.py show --pr N [--repo OWNER/NAME] [--finding ID | --draft | --pending | --threads FILE [--head SHA [--view]]]
   ledger.py show --pr N --fixable --threads FILE --head SHA [--repo OWNER/NAME]
   ledger.py save --pr N --output FILE [--repo OWNER/NAME] [--reason TEXT]
   ledger.py next --pr N --head SHA --publish pending|auto-post|auto-fix [--repo OWNER/NAME] [--token T]
@@ -36,12 +36,11 @@ it marks inBody each finding the snapshot shows as a line of our review body,
 unedited, so a later review states it again only once that line is gone;
 --head adds the disputes on that head.
 
---snapshot writes the workflow's view of that answer, compact ASCII JSON, to DIR/ledger-<sha256>.json and prints only
-a manifest {repo, pr, head, file, digest, length}: the file's fnv1a and length, so the workflow copies it through
-state_transfer.py --raw's checked chunks instead of a model copying one long line. The view leaves out what the
-workflow never reads: the ledger path, the unpublished answers and each open row's impact and severityReason, which
-save keeps from the ledger when a result does not regrade the finding. The name is the content's sha256, and the
-file is always written anew, atomically, so a rerun reads the same bytes and a damaged file is repaired.
+--view prints instead the pr-review workflow's view of that answer, bound to the repository, PR and head it was
+read for (repo, pr, head): it leaves out what the workflow never reads, the ledger path, the unpublished answers and
+each open row's impact and severityReason, which save keeps from the ledger when a result does not regrade the
+finding. The workflow runs it under AGENTRC_EMIT and loads the line from that file (lib/seal.py's emit), so no
+model copies it.
 
 --fixable, with a fresh threads.py snapshot, prints what an auto-fix repair may take from the review posted on
 SHA, which must be the last review on the PR: each standing finding as `fix` (its row, as show lists it, with
@@ -96,7 +95,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'pr-babysit' / 'scripts'))
-from facts import FULL_SHA, Parser, Unusable, fnv1a, git, locked, report  # noqa: E402
+from facts import FULL_SHA, Parser, Unusable, git, locked, report  # noqa: E402
 from launch_result import ENDED, STALLED, load_output  # noqa: E402
 from harvest import digest as body_digest, gh_json  # noqa: E402  the digest threads.py records
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
@@ -716,22 +715,10 @@ UNREAD = ('ledger', 'answers')
 UNREAD_ROW = ('impact', 'severityReason')
 
 
-def write_snapshot(where, answer, repo, pr, head):
+def workflow_view(answer, repo, pr, head):
     view = {k: v for k, v in answer.items() if k not in UNREAD}
     view['open'] = [{k: v for k, v in f.items() if k not in UNREAD_ROW} for f in answer['open']]
-    payload = json.dumps(view, ensure_ascii=True, separators=(',', ':')).encode('ascii')
-    folder = Path(where)
-    if not folder.is_dir():
-        raise Unusable(f'--snapshot {where} is not a directory')
-    path = folder / f'ledger-{hashlib.sha256(payload).hexdigest()}.json'
-    tmp = path.with_suffix(f'.{os.getpid()}.tmp')
-    try:
-        tmp.write_bytes(payload)
-        windows.replace(tmp, path)
-    except OSError as e:
-        raise Unusable(f'cannot write the snapshot {path}: {e.strerror}')
-    return {'repo': repo, 'pr': pr, 'head': head, 'file': path.as_posix(), 'digest': fnv1a(payload.decode('ascii')),
-            'length': len(payload)}
+    return {'repo': repo, 'pr': pr, 'head': head, **view}
 
 
 def read_snapshot(path, repo, pr):
@@ -955,16 +942,19 @@ def recheck_step(led, facts, live, cmd, report, review, reading, fixable_now):
 
 
 def read_json(path, what):
-    """A file's JSON, or its last nonempty line's (a script's stdout saved whole)."""
+    """A file's JSON object, or its last nonempty line's (a script's stdout saved whole); None for an empty file."""
     try:
         text = Path(path).read_text(encoding='utf-8')
         lines = [x for x in text.splitlines() if x.strip()]
         try:
-            return json.loads(text)
+            value = json.loads(text)
         except ValueError:
-            return json.loads(lines[-1]) if lines else None
+            value = json.loads(lines[-1]) if lines else None
     except (OSError, ValueError) as e:
         raise Unusable(f'{what} {path} unreadable: {e}')
+    if value is not None and not isinstance(value, dict):
+        raise Unusable(f'{what} {path} is not an object')
+    return value
 
 
 def next_of(a, repo):
@@ -973,16 +963,10 @@ def next_of(a, repo):
     led = load(ledger_path(repo, a.pr), repo, a.pr)
     path = facts_path(repo, a.pr, a.head)
     facts = read_json(path, 'prepare facts') if path.exists() else None
-    if facts is not None and not isinstance(facts, dict):
-        raise Unusable(f'prepare facts {path} is not an object')
     facts = facts and {**facts, 'head': a.head}
     pr = gh_json('pr', 'view', str(a.pr), '--repo', repo, '--json', 'headRefOid,state')
     manifest = a.manifest and read_json(a.manifest, '--manifest')
-    if manifest is not None and not isinstance(manifest, dict):
-        raise Unusable(f'--manifest {a.manifest} is not an object')
     reading = a.babysit_reading and read_json(a.babysit_reading, '--babysit-reading')
-    if reading is not None and not isinstance(reading, dict):
-        raise Unusable(f'--babysit-reading {a.babysit_reading} is not an object')
     review = a.review_output and {'path': Path(a.review_output).resolve().as_posix(),
                                   'result': (load_output(a.review_output) or {}).get('result')}
 
@@ -1007,7 +991,7 @@ def collect(argv):
     which.add_argument('--threads')
     sub.choices['show'].add_argument('--head')
     sub.choices['show'].add_argument('--fixable', action='store_true')
-    sub.choices['show'].add_argument('--snapshot')
+    sub.choices['show'].add_argument('--view', action='store_true')
     sub.choices['save'].add_argument('--output', required=True)
     sub.choices['save'].add_argument('--reason')
     nxt = sub.choices['next']
@@ -1024,8 +1008,8 @@ def collect(argv):
     path = ledger_path(repo, a.pr)
     if a.cmd == 'show' and a.fixable and not (a.threads and a.head):
         p.error('--fixable needs --threads and --head')
-    if a.cmd == 'show' and a.snapshot is not None and (a.fixable or not a.head):
-        p.error('--snapshot needs --threads and --head, and not --fixable')
+    if a.cmd == 'show' and a.view and (a.fixable or not a.head):
+        p.error('--view needs --threads and --head, and not --fixable')
     if getattr(a, 'head', None) is not None:
         if not a.threads:
             p.error('--head needs --threads')
@@ -1038,7 +1022,7 @@ def collect(argv):
             return {'ledger': path.as_posix(), 'fixable': fixable(led, snapshot, a.head)}
         out = {'ledger': path.as_posix(), **show(led, a.finding, a.draft, snapshot, a.pending)}
         out = {**out, 'disputes': disputes(led, snapshot, a.head)} if a.head else out
-        return write_snapshot(a.snapshot, out, repo, a.pr, a.head) if a.snapshot is not None else out
+        return workflow_view(out, repo, a.pr, a.head) if a.view else out
     result = (load_output(a.output) or {}).get('result')
     if not isinstance(result, dict):
         raise Unusable(f'--output {a.output} holds no Workflow result')
