@@ -35,6 +35,9 @@ OPERAND = {'exec': 'a', 'sudo': 'CDghpRrTtUu', 'env': 'aCSu', 'timeout': 'ks', '
 LONG_OPERAND = {'--argv0', '--chdir', '--close-from', '--group', '--host', '--prompt', '--chroot', '--role', '--type',
                 '--command-timeout', '--other-user', '--user', '--unset', '--split-string', '--kill-after',
                 '--signal', '--adjustment', '--input', '--output', '--error'}
+# a prefix's options that change what runs or where (a split command line, another directory, root or host)
+REDIRECTING = {'env': 'CS', 'sudo': 'DRh'}
+LONG_REDIRECTING = {'env': {'--chdir', '--split-string'}, 'sudo': {'--chdir', '--chroot', '--host'}}
 READERS = {'cat', 'sed', 'head', 'tail', 'less', 'grep', 'rg', 'wc', 'vim', 'vi', 'nano', 'diff', 'ls', 'awk',
            'chmod', 'cp', 'mv', 'rm', 'git', 'stat', 'file', 'readlink', 'realpath', 'test', '['}
 OPERATORS = {';', '&', '|', '&&', '||', '(', ')', ';;', '|&'}
@@ -363,6 +366,19 @@ def takes_operand(prefix, opt):
     return first == len(letters) - 1
 
 
+def redirects(prefix, opt):
+    """Whether prefix's option word opt is one of REDIRECTING, alone, last in a cluster or with its operand joined."""
+    if opt.startswith('--'):
+        return opt.split('=', 1)[0] in LONG_REDIRECTING.get(prefix, ())
+    first = next((c for c in opt[1:] if c in OPERAND.get(prefix, '')), None) if opt.startswith('-') else None
+    return first is not None and first in REDIRECTING.get(prefix, '')
+
+
+def may_run_script(seg):
+    return (not all(re.fullmatch(r'\w+=.*', t) for t in seg)
+            and any('/' in t or '$' in t or t.endswith(('.py', '.sh', '.mjs')) for t in seg))
+
+
 def assign(tok, env):
     name, value = tok.split('=', 1)
     w = Word(value)
@@ -402,8 +418,7 @@ def parse(command, tally, ctx, cwd, env, remote=False):
             mode = 'only' if len(segs) == 1 and not after else 'proven' if only_and else 'none'
         uncertain |= seg[0] == 'exec'   # it replaced the shell (or only redirected it: unknown) for later segments
         if mode == 'conditional':      # nothing applied: no assignment, no cd, no invocation
-            if not all(re.fullmatch(r'\w+=.*', t) for t in seg) and any('/' in t or '$' in t or t.endswith(('.py', '.sh', '.mjs'))
-                                                                       for t in seg):
+            if may_run_script(seg):
                 tally.unknown['conditional_invocation'] += 1
             continue
         if seg and all(re.fullmatch(r'\w+=.*', t) for t in seg):
@@ -420,10 +435,16 @@ def parse(command, tally, ctx, cwd, env, remote=False):
                 elif '=' in t and background:
                     env.pop(t.split('=', 1)[0], None)
             continue
+        whole, redirected = seg, False
         while seg and (seg[0] in PREFIXES or re.fullmatch(r'\w+=.*', seg[0])):
             prefix, seg = seg[0], seg[1:]
             while seg and (seg[0].startswith('-') or re.fullmatch(r'\d+[smh]?', seg[0])):
+                redirected |= redirects(prefix, seg[0])
                 seg = seg[1 + takes_operand(prefix, seg[0]):]
+        if redirected:      # never followed: what runs, or where, is not what the words say
+            if may_run_script(whole):
+                tally.unknown['unparsed_prefix'] += 1
+            continue
         if not seg:
             continue
         head = seg[0]

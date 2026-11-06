@@ -336,6 +336,27 @@ class Usage(unittest.TestCase):
         self.assertEqual((t['invoke'], t['ok'], t['subcommands']), (7, 7, {'send': 7}))
         self.assertEqual(agg['unknown'], {})
 
+    def test_a_prefix_option_that_changes_what_runs_is_not_followed(self):
+        s, rel, repo = self.script, 'skills/tool/scripts/tool.py', self.repo.path.as_posix()
+        split = "'python3 -c print(1)'"
+        commands = [f'env -S {split} {s} send', f'env -iS {split} {s} send', f'env --split-string {split} {s} send',
+                    f'env --split-string={split} {s} send', f'env -C / python3 {rel} send',
+                    f'env -C/ python3 {rel} send', f'env --chdir / python3 {rel} send',
+                    f'env --chdir=/ python3 {rel} send', f'sudo -D / python3 {rel} send',
+                    f'sudo -ED/ python3 {rel} send', f'sudo --chdir=/ python3 {rel} send',
+                    f'sudo -R /mnt python3 {s} send', f'sudo --chroot /mnt python3 {s} send',
+                    f'sudo -h host python3 {s} send', f'sudo --host=host python3 {s} send']
+        records = [r for i, c in enumerate(commands) for r in (use(f'x{i}', 'Bash', {'command': c}, cwd=repo),
+                                                               result(f'x{i}'))]
+        claude(self.root / 'p' / 's1.jsonl', records + [
+            use('a', 'Bash', {'command': f'sudo -Eu root env -u X python3 {rel} send'}, cwd=repo), result('a'),
+        ])
+        self.usage()
+        agg = json.loads(self.out.read_text())
+        t = agg['scripts']['skills/tool/scripts/tool.py']
+        self.assertEqual((t['invoke'], t['ok'], t['subcommands']), (1, 1, {'send': 1}))
+        self.assertEqual(agg['unknown'], {'unparsed_prefix': len(commands)})
+
     def test_installed_links_attribute_and_foreign_paths_do_not(self):
         installed = tmpdir(self) / 'claude' / 'skills'
         installed.mkdir(parents=True)
