@@ -44,12 +44,14 @@ has only what HEAD tracks: a hook that needs the checkout's ignored files
 there, all a hook prints after its block is its own; on the change its output
 may end at any later result shaped as pre-commit's whose block, if one follows,
 names a hook the config runs after it, as a result it printed may look alike, or
-at the end, and it is excused only when HEAD's matches it at one of those. A
+at the end, and it is excused only when HEAD's matches it at one of those. None
+before a result showing a hook that passed and printed counts: it and that output
+may be the hook's own. A
 result inside its output at each of those whose block names an id the config
 lacks is one it printed, no other hook's failure or rewrite; one naming a
 configured id, or any when the config is unread, stays counted. A line only the
 change prints keeps it counted, unless it follows all HEAD's output under such a
-result, as a nested pre-commit run naming a later hook's id would print. A
+result showing that later hook failed, which counts as that hook's failure. A
 change that leaves a hook's output the same once masked is still excused: a hook
 that prints only a count of its violations, or a new
 violation replacing one of HEAD's that differs from it only in numbers; CI runs
@@ -203,19 +205,30 @@ def own_runs(lines, cols):
     return starts
 
 
+def passed_with_output(lines, j):
+    """Whether lines[j], a result line, shows a hook that passed and printed: a verbose block, then a blank line."""
+    k = j + 1
+    while k < len(lines) and lines[k].startswith('- '):
+        k += 1
+    return lines[j].endswith('Passed') and j + 1 < k < len(lines) and not lines[k]
+
+
 def ends(lines, k, starts):
     """Each (end, after) where what the hook whose `- ` block ends above lines[k] printed may end: each own run
     (starts) under the blank line pre-commit ends a hook's output with, under its last line, which may be
     pre-commit's next result or one the hook printed itself, as that cannot be told, then the end of lines. after is
     the id the first `- ` block from there names, None when only result lines follow. A run right under the block
-    ends a hook that printed nothing, and lines in no shape pre-commit prints there run to the end."""
+    ends a hook that printed nothing, and lines in no shape pre-commit prints there run to the end. No run with a
+    passed hook's output at or past it ends it: that result and what follows it may be the hook's own, a line only it
+    prints among them, and the lines alone cannot tell which, so the hook's output runs past it."""
     n = len(lines)
     if k in starts:
         found = [k]
     elif lines[k]:
         found = [n]
     else:
-        found = [*(m for m in sorted(starts) if k + 1 < m < n and not lines[m - 1] and lines[m - 2].strip()), n]
+        talked = max((s for s in starts if k < s < n and passed_with_output(lines, s)), default=k + 1)
+        found = [*(m for m in sorted(starts) if talked < m < n and not lines[m - 1] and lines[m - 2].strip()), n]
     return [(m, next((x[len(HOOK_ID):].strip() for x in lines[m:] if x.startswith(HOOK_ID)), None)) for m in found]
 
 
@@ -622,7 +635,8 @@ def baseline(expected, paths, deadline, start):
 def compared(failure, order):
     """comparable() of the failed hook's output at each end pre-commit's next result may be: the end, or a result
     whose block, when one follows, names a hook order runs after it. One the hook printed may name any, so a change
-    that adds a nested pre-commit run's result under HEAD's output stays counted unless it names such a hook."""
+    that adds a nested pre-commit run's result under HEAD's output stays counted unless it names such a hook, and
+    whatever it names when it shows a hook that passed and printed (ends())."""
     return [comparable(out, os.getcwd()) for out, after in failure['outputs'] if follows(failure['hook'], after, order)]
 
 

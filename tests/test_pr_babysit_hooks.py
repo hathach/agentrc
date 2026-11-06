@@ -550,6 +550,16 @@ class HooksTest(unittest.TestCase):
         self.assertEqual(out['failed'], [{'hook': 'appends', 'error': 'x.c:1: bad'}])
         self.assertEqual(out['baselineFailed'], [])
 
+    def test_a_verbose_result_the_change_adds_naming_a_later_hook_never_ends_heads_output(self):
+        # sub runs after appends, but appends may have printed its result too, x.c:2 then its own.
+        (self.repo / '.pre-commit-config.yaml').write_text(CONFIG.format(
+            HOOK.format(id='appends') + HOOK.format(id='sub').replace('hooks/sub.sh', 'hooks/ok.sh')))
+        self.configure()
+        (self.repo / 'a.txt').write_text('edited\n')
+        code, out = self.run_script('a.txt')
+        self.assertEqual(out['failed'], [{'hook': 'appends', 'error': 'x.c:1: bad'}])
+        self.assertEqual(out['baselineFailed'], [])
+
     def test_a_failed_result_a_hook_prints_alike_on_head_is_no_failure_of_a_hook_the_config_lacks(self):
         self.configure('nestedfail', 'ok')
         (self.repo / 'a.txt').write_text('edited\n')
@@ -1389,27 +1399,35 @@ class ResultsTest(unittest.TestCase):
                f'doc{"." * 50}(no files to check)Skipped\ncut{"." * 70}Failed\n- hook id: cut\n- exit code: 1\n')
         self.assertEqual([f['hook'] for f in hooks.results(out, 1, ['fmt', 'gen', 'doc', 'cut'])[1]], ['fmt', 'cut'])
 
-    def test_a_verbose_result_the_hook_printed_may_end_its_output_naming_a_later_hook(self):
-        # Either result may be pre-commit's next; nested's ends fmt only where the config runs nested after fmt.
+    def test_a_verbose_result_with_output_never_ends_the_output_whatever_it_names(self):
+        # A passed hook's verbose result and output may be pre-commit's next or one fmt printed, x.c:2 then its own:
+        # fmt's output runs past it, even where it names a hook the config runs after fmt and that hook's result
+        # follows.
         said = f'x.c:1: bad\n\nReport{"." * 67}Passed\n- hook id: nested\n- duration: 0.1s\n\nx.c:2: new'
         out = f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n\n{said}\n\ngen{"." * 70}Passed\n'
         fmt = hooks.results(out, 1)[1][0]
-        self.assertEqual(fmt['outputs'], [('- exit code: 1\n\nx.c:1: bad', 'nested'),
-                                          (f'- exit code: 1\n\n{said}', None),
+        self.assertEqual(fmt['outputs'], [(f'- exit code: 1\n\n{said}', None),
                                           (f'- exit code: 1\n\n{said}\n\ngen{"." * 70}Passed', None)])
-        for order, ends in ((['fmt', 'gen'], 2), (['nested', 'fmt', 'gen'], 2), (['fmt', 'nested', 'gen'], 3)):
+        for order in (['fmt', 'gen'], ['nested', 'fmt', 'gen'], ['fmt', 'nested', 'gen']):
             with self.subTest(order):
-                self.assertEqual(len(hooks.compared(fmt, order)), ends)
+                self.assertNotIn(hooks.comparable('- exit code: 1\n\nx.c:1: bad', '/'), hooks.compared(fmt, order))
+        said = f'x.c:1: bad\n\ngen{"." * 70}Passed\n- hook id: gen\n- duration: 0.1s\n\nx.c:2: new'
+        out = f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n\n{said}\n\ngen{"." * 70}Passed\n'
+        fmt = hooks.results(out, 1, ['fmt', 'gen'])[1][0]
+        self.assertEqual([after for _, after in fmt['outputs']], [None, None])
 
     def test_a_verbose_block_under_the_next_result_ends_the_output(self):
         for after in (f'ok{"." * 51}(no files to check)Skipped\n- hook id: ok\n',
                       f'ok{"." * 70}Skipped\n- hook id: ok\n',
-                      f'ok{"." * 71}Passed\n- hook id: ok\n- duration: 0s\n\nall good\n\n',
                       f'ok{"." * 71}Failed\n- hook id: ok\n- duration: 0.02s\n- exit code: 1\n'
                       '- files were modified by this hook\n'):
             with self.subTest(after):
                 out = f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n\nx.c:1: bad\n\n{after}'
                 self.assertEqual(hooks.results(out, 1)[1][0]['outputs'][0], ('- exit code: 1\n\nx.c:1: bad', 'ok'))
+        # One that passed and printed may be fmt's own, all good then its output too.
+        said = f'x.c:1: bad\n\nok{"." * 71}Passed\n- hook id: ok\n- duration: 0s\n\nall good'
+        out = f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n\n{said}\n\n'
+        self.assertEqual(hooks.results(out, 1)[1][0]['outputs'], [(f'- exit code: 1\n\n{said}', None)])
 
     def test_terminal_escapes_and_control_characters_never_reach_the_error(self):
         out = f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n\n\x1b[31m\x1b[0m\n\x1b[31merror:\x07\tbad\x1b[0m\n'
