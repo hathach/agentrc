@@ -309,9 +309,17 @@ test('a blocking finding or a verified regression requests changes; minor ones o
 })
 
 test('a drafted comment that adds a claim, or is lost, falls back to the finding\'s own words', async () => {
-  const flagged = await run(BASE, { audit: audited(finding('a'), finding('b', 'high', 20)), 'check-draft': { bad: [1], firstBad: [] } })
-  assert.deepEqual(flagged.result.draft.comments.map(c => c.body), ['**high**: a', '**high**: b'])
-  assert.match(flagged.result.draft.body, /Overall fine/, 'a clean summary stays when one comment is flagged')
+  // A flagged comment falls back whatever its length, after one write and one check.
+  for (const [findings, bad, bodies] of [
+    [[finding('a'), finding('b', 'high', 20)], [1], ['**high**: a', '**high**: b']],
+    [[finding(wordy(100))], [0], [`**high**: ${wordy(100)}`]],
+  ]) {
+    const flagged = await run(BASE, { audit: audited(...findings), 'check-draft': { bad, firstBad: [], summaryBad: false } })
+    assert.deepEqual(flagged.result.draft.comments.map(c => c.body), bodies)
+    assert.deepEqual(bad.map(i => flagged.result.draft.comments[i].firstLineUnchecked), bad.map(() => true), 'a fallback\'s first line is unchecked')
+    assert.deepEqual(flagged.labels.filter(l => /^(write|check-draft)/.test(l)), ['write', 'check-draft'], 'no other round')
+    assert.match(flagged.result.draft.body, /Overall fine/, 'a clean summary stays when one comment is flagged')
+  }
   const summary = await run(BASE, { audit: audited(finding('a')), 'check-draft': { bad: [], firstBad: [], summaryBad: true } })
   assert.doesNotMatch(summary.result.draft.body, /Overall fine/, 'a summary that adds a claim is dropped')
   assert.ok(summary.logs.includes('summary left out: the check found a claim no finding states'))
@@ -744,13 +752,6 @@ test('an incremental review rechecks earlier findings: fixed ones get a fix note
   assert.equal(lost.result.findings.find(f => f.id === 'pr7-f1').status, 'open')
 })
 
-test('a comment the check flags falls back to its finding\'s own words, whatever their length, with no other round', async () => {
-  const r = await run(BASE, { audit: audited(finding(wordy(100))), 'check-draft': { bad: [0], firstBad: [], summaryBad: false } })
-  assert.deepEqual([r.result.draft.comments[0].body, r.result.draft.comments[0].firstLineUnchecked], [`**high**: ${wordy(100)}`, true])
-  assert.deepEqual(r.labels.filter(l => /^(write|check-draft|shorten)/.test(l)), ['write', 'check-draft'], 'one write, one check')
-  assert.ok(!r.logs.some(l => /over length/.test(l)))
-})
-
 test('a finding an auto-fix repair noted gets no second fix note, and one still standing is raised again on a new comment', async () => {
   const inc = { ...BASE, mode: 'incremental', scopeBase: OLD }
   const repaired = (repair) => ({ reviews: 1, last: { head: OLD }, open: [{ id: 'pr7-f1', file: 'src/core/a.c', line: 10, severity: 'high', why: 'overrun past the buffer end', commentId: 901, repair }] })
@@ -785,12 +786,10 @@ test('a finding an auto-fix repair noted gets no second fix note, and one still 
   const longEdit = await run(inc, { ledger: edited, recheck: () => ({ state: 'open', reason: 'still' }), check: pinned(inc) })
   assert.deepEqual(longEdit.result.draft.comments.map(c => c.body), [`${edited.open[0].published}${NOTE}`], 'a long human edit is kept whole, its repair note on the comment')
   assert.doesNotMatch(longEdit.result.draft.body, /Raised again/)
-  assert.equal(longEdit.labels.some(l => l.startsWith('shorten')), false, 'the human\'s own words are never rewritten')
   const longWhy = repaired(done)
   longWhy.open[0].why = wordy(85)
   const unedited = await run(inc, { ledger: longWhy, recheck: () => ({ state: 'open', reason: 'still' }), check: pinned(inc) })
   assert.deepEqual(unedited.result.draft.comments.map(c => [c.body, c.firstLineUnchecked]), [[`**high**: ${wordy(85)}${NOTE}`, true]])
-  assert.ok(!unedited.logs.some(l => /over length/.test(l)))
   const visible = await run(inc, { ledger: repaired({ ...done, resolved: false }), recheck: () => ({ state: 'open', reason: 'still' }), check: pinned(inc) })
   assert.deepEqual(visible.result.draft.comments, [], 'its thread is still open, so its comment still states it')
   const reopenedThread = { ...repaired(done), heldThreads: [{ findingId: 'pr7-f1', commentId: 901, why: 'reopened after it was resolved' }] }
@@ -891,8 +890,6 @@ test('a thread answer of any length is kept as the recheck wrote it; the answer 
   assert.match(ask, /the evidence and nothing else, bullets for more than one point/)
   assert.doesNotMatch(ask, /\d+ words/)
   assert.deepEqual(kept.result.findings[0].disputes[0].answer, { body: long, resolve: false })
-  assert.equal(kept.labels.some(l => l.startsWith('shorten')), false)
-  assert.ok(!kept.logs.some(l => /over length/.test(l)))
 })
 
 test('a reviewer\'s label never sets our level, and a confirmed claim without its grading is unjudged, never a blocker', async () => {
