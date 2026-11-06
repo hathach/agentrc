@@ -523,6 +523,9 @@ class Esp(Base):
         self.assertEqual(self.A.flash.esptool_port.call_count, 4)      # the tty afresh each time
 
     def test_gdb_runs_espressif_openocd_on_the_usb_serial_jtag(self):
+        which = mock.patch.object(H.shutil, 'which', return_value='/usr/local/bin/xtensa-esp32s3-elf-gdb')
+        which.start()
+        self.addCleanup(which.stop)
         esp = self.A.esp()
         esp.admit.return_value = ('esp32s3', ['board/esp32s3-builtin.cfg'])
         esp.find_openocd.return_value = {'exe': '/o/bin/openocd', 'scripts': '/o/scripts'}
@@ -545,6 +548,29 @@ class Esp(Base):
         self.assertIn('foreach t [target names] { $t configure -event gdb-detach { resume } }', pipe)
         esp.admit.return_value = ('esp32p4', ['board/esp32p4-builtin.cfg'])
         with self.assertRaisesRegex(ValueError, 'names esp32p4'):
+            H.gdb_argv('rig_esp', board, 'fw.elf', [])
+
+    def test_gdb_on_an_espressif_route_is_the_chips(self):
+        esp = self.A.esp()
+        esp.find_openocd.return_value = {'exe': '/o/bin/openocd', 'scripts': '/o/scripts'}
+        self.A.esp = lambda: esp
+        board = self.board('rig_esp')
+        for chip, gdb in (('esp32s3', 'xtensa-esp32s3-elf-gdb'), ('esp32', 'xtensa-esp32-elf-gdb'),
+                          ('esp32p4', 'riscv32-esp-elf-gdb'), ('esp32c6', 'riscv32-esp-elf-gdb')):
+            esp.admit.return_value = (chip, [f'board/{chip}-builtin.cfg'])
+            with self.subTest(chip), mock.patch.dict(H.B.P.BOARDS['rig_esp'], chip=chip), \
+                    mock.patch.object(H, 'usj_at', return_value='11-1.2'), \
+                    mock.patch.object(H.shutil, 'which', return_value=f'/usr/local/bin/{gdb}'):
+                self.assertEqual(H.gdb_argv('rig_esp', board, 'fw.elf', [])[0], gdb)
+        with mock.patch.object(H, 'usj_at', return_value='11-1.2'), mock.patch.object(H.shutil, 'which',
+                                                                                      return_value=None), \
+                self.assertRaisesRegex(RuntimeError, 'xtensa-esp32s3-elf-gdb, the esp32s3 gdb, is not on PATH'):
+            esp.admit.return_value = ('esp32s3', ['board/esp32s3-builtin.cfg'])
+            H.gdb_argv('rig_esp', board, 'fw.elf', [])
+        esp.admit.return_value = ('esp32c2', ['board/esp32c2-builtin.cfg'])
+        with mock.patch.dict(H.B.P.BOARDS['rig_esp'], chip='esp32c2'), \
+                mock.patch.object(H, 'usj_at', return_value='11-1.2'), \
+                self.assertRaisesRegex(RuntimeError, 'no Espressif gdb listed for esp32c2'):
             H.gdb_argv('rig_esp', board, 'fw.elf', [])
 
     def test_flash_names_what_the_flasher_wrote(self):
