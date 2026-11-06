@@ -299,6 +299,19 @@ class Usage(unittest.TestCase):
         self.assertNotIn('SECRETVALUE', out + self.out.read_text())
         self.assertNotIn('bogus', out)
 
+    def test_exec_runs_its_command_and_nothing_after_it(self):
+        s = self.script
+        claude(self.root / 'p' / 's1.jsonl', [
+            use('a', 'Bash', {'command': f'exec python3 {s} send'}), result('a'),
+            use('b', 'Bash', {'command': f'exec python3 {s} send; python3 {s} send'}),
+            use('c', 'Bash', {'command': f'exec 2>/dev/null; python3 {s} send'}),
+        ])
+        self.usage()
+        agg = json.loads(self.out.read_text())
+        t = agg['scripts']['skills/tool/scripts/tool.py']
+        self.assertEqual((t['invoke'], t['ok'], t['result_unknown']), (2, 1, 1))
+        self.assertEqual(agg['unknown'], {'conditional_invocation': 2})
+
     def test_installed_links_attribute_and_foreign_paths_do_not(self):
         installed = tmpdir(self) / 'claude' / 'skills'
         installed.mkdir(parents=True)

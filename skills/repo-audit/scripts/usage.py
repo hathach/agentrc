@@ -35,7 +35,7 @@ READERS = {'cat', 'sed', 'head', 'tail', 'less', 'grep', 'rg', 'wc', 'vim', 'vi'
 OPERATORS = {';', '&', '|', '&&', '||', '(', ')', ';;', '|&'}
 SUBST = re.compile(r'\$\((.*)\)|`([^`]*)`')
 SHELL_KEYWORDS = {'if', 'then', 'elif', 'else', 'fi', 'for', 'while', 'until', 'do', 'done', 'case', 'esac', '{',
-                  '}', '!', 'function', 'exit', 'return', 'exec'}
+                  '}', '!', 'function', 'exit', 'return'}
 # the only statement shapes an exec script may hold for its calls to count: [const x =] [text(] [await] CALL [)] [;]
 JS_PLAIN = re.compile(r'(?:\s*(?:(?:const|let|var)\s+\w+\s*=\s*)?(?:text\(\s*)?(?:await\s+)?CALL\s*\)?\s*;?)*\s*')
 HEREDOC = re.compile(r'<<-?\s*([\'"]?)(\w+)\1')
@@ -359,8 +359,8 @@ def parse(command, tally, ctx, cwd, env, remote=False):
     """Every repository script the command runs or reads; returns [(script key, mode, deferred)]. mode says what
     the call's status proves: 'only' (the sole command), 'proven' (only && follows: success proves it succeeded),
     'after-and' (ran only if the commands before it succeeded: counted once the call succeeds), 'none'. From the
-    first ||, ( or ) or shell keyword on, nothing is known to run: script-like commands count as conditional and
-    assignments and cd are not applied."""
+    first ||, ( or ) or shell keyword on, or after an exec, nothing is known to run: script-like commands count as
+    conditional and assignments and cd are not applied."""
     invoked = []
     try:
         segs = segments(command)
@@ -369,8 +369,10 @@ def parse(command, tally, ctx, cwd, env, remote=False):
         return invoked
     uncertain = False       # from the first ||, grouping or shell keyword on, nothing is known to run
     background = bool(segs) and '&' in segs[0][2]  # & backgrounds a whole list: no state applies anywhere
+    replaced = False        # an exec before this segment replaced the shell (or only redirected it: unknown)
     for before, seg, after in segs:
-        uncertain |= before in ('||', '(', ')') or seg[0] in SHELL_KEYWORDS
+        uncertain |= before in ('||', '(', ')') or seg[0] in SHELL_KEYWORDS or replaced
+        replaced = seg[0] == 'exec'
         # a pipeline element or a background command runs in a subshell: its assignments and cd stay there
         subshell = background or before in ('|', '|&') or bool(after) and after[0] in ('|', '|&')
         if any(re.search(r'[/.](?:py|sh|mjs)\b|/', inner) for t in seg for pair in SUBST.findall(t) for inner in pair):
