@@ -302,6 +302,17 @@ class HooksTest(unittest.TestCase):
         self.assertEqual((code, out.get('error'), out['baselineFailed']), (0, None, ['broken']))
         self.assertEqual(len(self.worktrees()), 1)
 
+    def test_heads_tree_is_reset_between_reruns_without_the_repositorys_git_hooks(self):
+        # reset --hard updates HEAD through a ref transaction; a failing reference-transaction hook would fail it.
+        self.configure('broken', 'nocc')
+        hook = self.repo / '.git' / 'hooks' / 'reference-transaction'
+        hook.write_text('#!/bin/sh\nexit 1\n')
+        hook.chmod(0o755)
+        (self.repo / 'a.txt').write_text('edited\n')
+        code, out = self.run_script('a.txt')
+        self.assertEqual((code, out.get('error'), out['baselineFailed']), (0, None, ['broken', 'nocc']))
+        self.assertEqual(len(self.worktrees()), 1)
+
     def test_each_head_rerun_starts_from_a_clean_head(self):
         # nolitter fails here only on what litter left: on HEAD it must not inherit litter's rerun.
         self.configure('litter', 'nolitter')
@@ -415,15 +426,17 @@ class HooksTest(unittest.TestCase):
         self.assertEqual(out['failed'], [{'hook': 'once', 'error': 'no compiler'}])
         self.assertEqual(out['baselineFailed'], [])
 
-    def test_a_head_rerun_past_the_deadline_is_killed_and_its_worktree_removed(self):
+    def test_a_head_rerun_past_the_deadline_is_killed_its_worktree_removed_and_the_failure_kept(self):
         self.configure('headslow')
         (self.repo / 'a.txt').write_text('edited\n')
         pid = Path(self.repo.parent) / 'hook.pid'
         # The deadline covers the change's run and `worktree add` too: Windows' slow pre-commit startup needs more.
         deadline = '20' if os.name == 'nt' else '6'
         code, out = self.run_script('--deadline-seconds', deadline, 'a.txt', env={**self.env, 'HOOK_PID': str(pid)})
-        self.assertEqual(code, 2)
-        self.assertRegex(out['error'], rf'did not finish within {deadline} s \(HEAD headslow\)')
+        self.assertEqual((code, out['passed'], out['failed']), (0, False, [{'hook': 'headslow', 'error': 'fails'}]))
+        self.assertEqual(([n['hook'] for n in out['notRerun']], out['baselineFailed']), (['headslow'], []))
+        late = rf'did not finish within {deadline} s \((HEAD headslow|git worktree)\)'
+        self.assertRegex(out['notRerun'][0]['why'], rf'^HEAD ran out of time: \S+ {late}')
         self.assertEqual(len(self.worktrees()), 1, 'the HEAD worktree is removed')
         # an MSYS pid is not a Windows one; no pid, the kill came before the hook started
         if os.name != 'nt' and pid.exists() and pid.read_text().strip():
@@ -721,7 +734,7 @@ class HooksTest(unittest.TestCase):
 
 
 class ForgetTest(unittest.TestCase):
-    """forget's cleanup of the HEAD worktree, with git alone: no pre-commit runs."""
+    """forget's cleanup of the HEAD worktree, and baseline's around it, with git alone: no pre-commit runs."""
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -782,15 +795,64 @@ class ForgetTest(unittest.TestCase):
         self.assertFalse(os.path.exists(tmp))
         self.assertEqual(len(self.worktrees()), 2, 'the head tree goes, the other stays registered')
 
+    def forget_with(self, tmp, rmtree, deadline=10):
+        """forget(tmp) with its `worktree remove` refused and shutil.rmtree(tmp) replaced by rmtree(tmp, the real
+        rmtree); its stderr."""
+        real = shutil.rmtree
+
+        def removal(path, *a, **k):
+            return rmtree(path, real) if os.fspath(path) == tmp else real(path, *a, **k)
+        stderr = io.StringIO()
+        with mock.patch.object(hooks, 'git_within', side_effect=hooks.Unusable('git worktree remove: refused')), \
+                mock.patch.object(hooks.shutil, 'rmtree', removal), contextlib.redirect_stderr(stderr):
+            hooks.forget(tmp, deadline, time.monotonic())
+        return stderr.getvalue()
+
     def test_what_cannot_be_removed_is_named_and_never_raises(self):
         tmp, tree = self.head_tree()
         admin = hooks.registration(tree)
-        stderr = io.StringIO()
-        with mock.patch.object(hooks, 'git_within', side_effect=hooks.Unusable('git worktree remove: refused')), \
-                mock.patch.object(hooks.shutil, 'rmtree'), contextlib.redirect_stderr(stderr):
-            hooks.forget(tmp, 10, time.monotonic())
-        self.assertIn(f"HEAD's worktree could not be removed: {tmp}, {admin}", stderr.getvalue())
+        stderr = self.forget_with(tmp, lambda *_: None)
+        self.assertIn(f"HEAD's worktree could not be removed: {tmp}, {admin}", stderr)
         self.assertTrue(admin.exists(), 'a registration whose tree stays is kept')
+
+    def test_an_entry_another_worktree_took_once_the_tree_went_is_kept(self):
+        # Another session's prune, then its `worktree add`, may reuse the name of an entry whose tree is gone.
+        tmp, tree = self.head_tree()
+        admin = hooks.registration(tree)
+        theirs = self.repo.parent / 'theirs' / '.git'
+
+        def removed_then_taken(path, rmtree):
+            rmtree(path)
+            (admin / 'gitdir').write_text(f'{theirs}\n')
+        self.forget_with(tmp, removed_then_taken)
+        self.assertEqual((admin / 'gitdir').read_text(), f'{theirs}\n')
+
+    def test_a_tree_slow_to_delete_is_left_past_the_cleanups_budget_and_named(self):
+        tmp, tree = self.head_tree()
+        released, removing = threading.Event(), []
+
+        def slow(*_):
+            removing.append(threading.current_thread())
+            released.wait(30)
+        started = time.monotonic()
+        try:
+            with mock.patch.object(hooks, 'CLEANUP', 0):
+                stderr = self.forget_with(tmp, slow, deadline=0)
+            self.assertLess(time.monotonic() - started, 10)
+            self.assertIn(f"HEAD's worktree could not be removed: {tmp}", stderr)
+        finally:
+            # a thread alive past the test would make another test's fork warn
+            released.set()
+            for thread in removing:
+                thread.join(10)
+
+    def test_a_rerun_the_deadline_cuts_short_leaves_it_and_those_after_it_unjudged(self):
+        late = hooks.Late('pre-commit did not finish within 9 s (HEAD a)')
+        with mock.patch.object(hooks, 'pre_commit', side_effect=late):
+            failing, unjudged = hooks.baseline({'a': [], 'b': []}, ['a.txt'], 10, time.monotonic())
+        self.assertEqual(failing, [])
+        self.assertEqual(unjudged, {h: f'HEAD ran out of time: {late}' for h in 'ab'})
+        self.assertEqual(len(self.worktrees()), 1)
 
     @unittest.skipUnless(threading.current_thread() is threading.main_thread(), 'handlers run on the main thread')
     def test_a_signal_during_the_cleanup_is_delivered_after_it(self):
@@ -909,18 +971,61 @@ class RunHooksTest(unittest.TestCase):
         def pre_commit(paths, deadline, start, what, hook=None, cwd=None, skip=()):
             return (1, '') if skip else (1, self.BROKEN)
         with mock.patch.object(hooks, 'pre_commit', pre_commit), \
-                mock.patch.object(hooks, 'baseline', return_value=['broken']):
+                mock.patch.object(hooks, 'baseline', return_value=(['broken'], {})):
             ran, passed, ids, failures, excused, _ = hooks.run_hooks(['a.txt'])
         self.assertEqual((ran, passed, ids, excused), (True, False, [], ['broken']))
         self.assertEqual([(f['hook'], f['error']) for f in failures], [
             ('broken', 'nope'), (hooks.UNOWNED, 'pre-commit exited 1 with broken skipped, naming no hook')])
+
+    def test_a_run_without_the_excused_past_the_deadline_is_its_own_failure(self):
+        late = hooks.Late('pre-commit did not finish within 540 s (without the excused 1)')
+
+        def pre_commit(paths, deadline, start, what, hook=None, cwd=None, skip=()):
+            if skip:
+                raise late
+            return 1, self.BROKEN
+        with mock.patch.object(hooks, 'pre_commit', pre_commit), \
+                mock.patch.object(hooks, 'baseline', return_value=(['broken'], {})):
+            _, passed, _, failures, excused, _ = hooks.run_hooks(['a.txt'])
+        self.assertEqual((passed, excused), (False, ['broken']))
+        self.assertEqual([(f['hook'], f['error']) for f in failures], [('broken', 'nope'), (hooks.UNOWNED, str(late))])
+
+    def test_the_ids_a_run_without_the_excused_names_reach_its_failure_copyable(self):
+        escaped = '\x1b[31mbroken\x07'
+
+        def pre_commit(paths, deadline, start, what, hook=None, cwd=None, skip=()):
+            return (1, '') if skip else (1, self.BROKEN.replace('- hook id: broken', f'- hook id: {escaped}'))
+        with mock.patch.object(hooks, 'pre_commit', pre_commit), \
+                mock.patch.object(hooks, 'baseline', return_value=([escaped], {})):
+            failures = hooks.run_hooks(['a.txt'])[3]
+        self.assertEqual(failures[-1], {'hook': hooks.UNOWNED,
+                                        'error': 'pre-commit exited 1 with broken  skipped, naming no hook'})
+
+    def test_a_padded_id_is_read_as_its_block_names_it_and_never_rerun_on_head(self):
+        # pre-commit prints a padded id as is, and SKIP strips each name it gives, so it cannot skip that hook.
+        Path(hooks.CONFIG).write_text(CONFIG.format(HOOK.format(id='broken') + HOOK.format(id="'pad '")))
+        pad = f'pad {"." * 72}Failed\n- hook id: pad \n- exit code: 1\n\nworse\n'
+        with mock.patch.object(hooks, 'pre_commit', return_value=(1, f'{self.BROKEN}\n{pad}')), \
+                mock.patch.object(hooks, 'baseline', return_value=(['broken'], {})) as baseline:
+            _, _, _, failures, excused, not_rerun = hooks.run_hooks(['a.txt'])
+        self.assertEqual(list(baseline.call_args.args[0]), ['broken'])
+        self.assertEqual(([f['hook'] for f in failures], excused), (['broken', 'pad'], ['broken']))
+        self.assertEqual(not_rerun, [{'hook': 'pad', 'why': 'SKIP cannot name it'}])
+
+    def test_a_head_rerun_the_deadline_cut_short_says_why(self):
+        why = 'HEAD ran out of time: pre-commit did not finish within 540 s (HEAD broken)'
+        with mock.patch.object(hooks, 'pre_commit', return_value=(1, self.BROKEN)), \
+                mock.patch.object(hooks, 'baseline', return_value=([], {'broken': why})):
+            *_, failures, excused, not_rerun = hooks.run_hooks(['a.txt'])
+        self.assertEqual(([f['hook'] for f in failures], excused), (['broken'], []))
+        self.assertEqual(not_rerun, [{'hook': 'broken', 'why': why}])
 
     def test_the_run_without_the_excused_gets_its_retry(self):
         # A formatter fail_fast hid rewrites in that run and passes on its retry, as it would with fail_fast off.
         fmt = 'fmt' + '.' * 70 + 'Failed\n- hook id: fmt\n- exit code: 1\n- files were modified by this hook\n'
         runs = iter([(1, self.BROKEN), (1, fmt), (0, '')])
         with mock.patch.object(hooks, 'pre_commit', lambda *a, **k: next(runs)), \
-                mock.patch.object(hooks, 'baseline', return_value=['broken']):
+                mock.patch.object(hooks, 'baseline', return_value=(['broken'], {})):
             ran, passed, ids, failures, excused, _ = hooks.run_hooks(['a.txt'])
         self.assertEqual((ids, [f['hook'] for f in failures], excused), (['fmt'], ['broken'], ['broken']))
 
@@ -932,7 +1037,7 @@ class RunHooksTest(unittest.TestCase):
         fmt = 'fmt' + '.' * 70 + 'Failed\n- hook id: fmt\n- exit code: 1\n- files were modified by this hook\n'
         hidden = fmt + self.BROKEN.replace('broken', 'a,b') + '\n' + self.BROKEN.replace('broken', 'dup')
         with mock.patch.object(hooks, 'pre_commit', lambda *a, skip=(), **k: (1, hidden if skip else self.BROKEN)), \
-                mock.patch.object(hooks, 'baseline', return_value=['broken']) as baseline:
+                mock.patch.object(hooks, 'baseline', return_value=(['broken'], {})) as baseline:
             _, _, ids, failures, excused, not_rerun = hooks.run_hooks(['a.txt'])
         baseline.assert_called_once()
         self.assertEqual((ids, excused), (['fmt'], ['broken']))
@@ -975,7 +1080,7 @@ class RunHooksTest(unittest.TestCase):
         os.chmod('venv/pre-commit', 0o755)
         with mock.patch.object(hooks, 'yaml', None), mock.patch.dict(os.environ, {'PATH': os.path.abspath('bin')}), \
                 mock.patch.object(hooks, 'pre_commit', return_value=(1, self.BROKEN)), \
-                mock.patch.object(hooks, 'baseline', return_value=['broken']) as baseline:
+                mock.patch.object(hooks, 'baseline', return_value=(['broken'], {})) as baseline:
             *_, excused, not_rerun = hooks.run_hooks(['a.txt'])
         return baseline, excused, not_rerun
 
@@ -1000,6 +1105,18 @@ class RunHooksTest(unittest.TestCase):
         baseline.assert_not_called()
         self.assertEqual((excused, not_rerun), ([], [{'hook': 'broken', 'why': (
             f"pre-commit's {python} cannot read {hooks.CONFIG} (ModuleNotFoundError: No module named 'yaml')")}]))
+
+    @unittest.skipIf(os.name == 'nt', "a Windows pre-commit is a launcher, not a #! script")
+    def test_without_pyyaml_why_holds_no_terminal_escapes_or_control_characters(self):
+        # Its interpreter's path and its last stderr line are copied into why, which a relay copies on.
+        os.mkdir('e\x1b[31mx')
+        python = os.path.abspath('e\x1b[31mx/python3')
+        Path(python).write_text('#!/bin/sh\nprintf "\\033[31mModuleNotFoundError:\\a\\tyaml\\033[0m\\n" >&2; exit 1\n')
+        os.chmod(python, 0o755)
+        baseline, excused, not_rerun = self.without_pyyaml('repos: []\n', python)
+        baseline.assert_not_called()
+        self.assertEqual((excused, not_rerun), ([], [{'hook': 'broken', 'why': (
+            f"pre-commit's {os.path.abspath('ex/python3')} cannot read {hooks.CONFIG} (ModuleNotFoundError:  yaml)")}]))
 
     @unittest.skipIf(os.name == 'nt', "a Windows pre-commit is a launcher, not a #! script")
     def test_without_pyyaml_a_pre_commit_python_that_cannot_start_reruns_nothing(self):
@@ -1091,6 +1208,8 @@ class AsCheckoutTest(unittest.TestCase):
                              ('[gw0] linux -- Python 3.12.3 /usr/bin/python\n',
                               '[gw3] linux -- Python 3.12.3 /usr/bin/python\n'),
                              ('/tmp/ccAb12Cd.o: undefined reference\n', '/tmp/cco1y76V.o: undefined reference\n'),
+                             (f'{tempfile.gettempdir()}/ccabcdef.s: Error\n',
+                              f'{tempfile.gettempdir()}/ccAb12Cd.s: Error\n'),
                              ('/tmp/tmp.Ab3dE5fG7h: denied\n', '/tmp/tmp.yiJuMi1EqI: denied\n')):
             self.assertEqual(hooks.comparable(head, '/x'), hooks.comparable(change, '/x'), change)
 
@@ -1143,13 +1262,32 @@ class ResultsTest(unittest.TestCase):
         for said in (f'x.c:1: bad\nReport{"." * 67}Passed\n- hook id: nested\n- duration: 0.1s\n\nx.c:2: new',
                      f'x.c:1: bad\n\nReport{"." * 67}Passed\n- hook id: nested\n\nx.c:2: new',
                      f'x.c:1: bad\n\nReport{"." * 67}Failed\n- hook id: nested\n\nx.c:2: new',
-                     f'x.c:1: bad\n\nReport{"." * 60}Skipped\n- hook id: nested\n\nx.c:2: new',
-                     f'x.c:1: bad\n\nReport{"." * 60}Skipped\n\nx.c:2: new'):
+                     f'x.c:1: bad\n\nReport{"." * 66}Skipped\n- hook id: nested\n\nx.c:2: new'):
             with self.subTest(said):
                 out = f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n\n{said}\n\ngen{"." * 70}Passed\n'
                 failures = hooks.results(out, 1, ['fmt', 'gen'])[1]
                 self.assertEqual([f['hook'] for f in failures], ['fmt'])
                 self.assertEqual(failures[0]['outputs'][0], (f'- exit code: 1\n\n{said}', None))
+
+    def test_a_result_of_another_width_the_hook_printed_never_ends_its_output(self):
+        # pre-commit pads all its result lines to one width: a narrower one in pre-commit's shape is the hook's own.
+        said = f'x.c:1: bad\n\nReport{"." * 60}Passed\n- hook id: nested\n- duration: 0.1s\n\nx.c:2: new'
+        out = f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n\n{said}\n\ngen{"." * 70}Passed\n'
+        self.assertEqual([after for _, after in hooks.results(out, 1)[1][0]['outputs']], [None, None])
+
+    def test_a_result_under_two_blank_lines_is_the_hooks_own_output(self):
+        # pre-commit strips a hook's output and ends it with one blank line: under two, a result shaped as pre-commit's
+        # next, or a block over two, is what the hook printed.
+        for said in (f'x.c:1: bad\n\n\ngen{"." * 70}Passed',
+                     f'x.c:1: bad\n\ngen{"." * 70}Failed\n- hook id: gen\n- exit code: 1\n\n\nmore'):
+            with self.subTest(said):
+                out = f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n\n{said}\n'
+                self.assertEqual(len(hooks.results(out, 1, ['fmt', 'gen'])[1][0]['outputs']), 1)
+
+    def test_a_wide_character_counts_two_columns_in_a_result_line(self):
+        # pre-commit pads by display width (_len_cjk): 检查's two characters take four columns, as gen's 79.
+        out = f'检查{"." * 69}Failed\n- hook id: check\n- exit code: 1\n\nx.c:1: bad\n\ngen{"." * 70}Passed\n'
+        self.assertEqual(hooks.results(out, 1)[1][0]['outputs'][0], ('- exit code: 1\n\nx.c:1: bad', None))
 
     def test_a_failed_result_the_hook_printed_counts_only_where_pre_commits_next_may_be(self):
         # Under a blank line in pre-commit's shape, nested's result may end fmt's output only where the config runs

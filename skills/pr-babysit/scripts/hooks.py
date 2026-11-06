@@ -7,8 +7,9 @@ Run from the checkout's top level. Prints the tree status and a snapshot of
 PATH plus every path the status names, runs `pre-commit run --files PATH...`
 when .pre-commit-config.yaml exists (once more if it failed after a hook
 modified files), then the status and snapshot again. All runs, the HEAD reruns below included, get N
-seconds (default 540), and removing HEAD's tree after them CLEANUP (20) more, inside the 600 a relay's Bash call
-allows; past N the pre-commit process tree is killed and the result is an error. Status lines are
+seconds (default 540) from the start, and removing HEAD's tree after them CLEANUP (20) more, inside the 600 a relay's
+Bash call allows; past N the pre-commit process tree is killed: on the first pass the result is an error, on a HEAD
+rerun its hook and those left are in notRerun, and on a later pass it is the failure `(pre-commit)`. Status lines are
 `git status --porcelain -z` records, each untracked file its own; snapshot lines are `<644|755> <blob> <path>` or
 `absent - <path>`.
 
@@ -26,14 +27,14 @@ in any order, the tree's path read as the checkout's, and each number standing
 alone, such as a duration, line number, count, pid or address, each time,
 worker number and temporary name masked), so they are no evidence against the
 change (#378). A hook that ever modified files is never rerun there, nor one
-whose id SKIP cannot name, more than one config entry uses or another hook in
+whose id SKIP cannot name (a comma, or padding the config gives it), more than one config entry uses or another hook in
 the config takes as its alias (SKIP skips those hooks too, and a fail_fast stop
 at one leaves the rest unchecked), nor any when the config cannot be read:
 with PyYAML, or without it by pre-commit's own interpreter when the #! line of
 pre-commit's entry script names a python by absolute path (not on Windows);
-notRerun is {hook, why} for each failed hook not rerun there; error and why hold
-no terminal escapes or control characters, as commits.py's detail. Each rerun gets
-a clean HEAD tree, checked out without the repository's git hooks; removing it
+notRerun is {hook, why} for each failed hook not rerun there; failed's error and
+notRerun's why hold no terminal escapes or control characters, as commits.py's detail. Each rerun gets
+a clean HEAD tree, checked out and reset without the repository's git hooks; removing it
 removes its own registration, no other, and stderr names what stays. The tree has
 only what HEAD tracks: a hook that needs the
 checkout's ignored files (fetched dependencies) fails there differently and
@@ -123,7 +124,8 @@ C_ESCAPES = {b'a': b'\a', b'b': b'\b', b'f': b'\f', b'n': b'\n', b'r': b'\r', b'
 # What differs between two runs of the same failure: a number standing alone (a duration with its units, a line
 # number, a count, a pid, an address), an ISO 8601 time, a pytest-xdist worker's number, or a name tempfile, mktemp
 # or gcc made. Any other digit inside a word (usb2.c, E501) names a file, rule or symbol, so it stays. An
-# all-lowercase gcc name (about 1 in 180) stays too, as a source such as ccdriver.c reads alike: it only fails safe.
+# all-lowercase gcc name (about 1 in 180) stays too outside the temp dir (temp_gcc()), as a source such as ccdriver.c
+# reads alike.
 UNIT = r'(?:[hm]|min|sec|[mµun]?s)'
 VARYING = re.compile(r'\b\d{4}-\d\d-\d\dT\d\d:\d\d(?::\d\d(?:[.,]\d+)?)?Z?'
                      rf'|\b(?:0x[0-9a-fA-F]+|\d+(?:\.\d+)*(?:{UNIT}(?:\d+(?:\.\d+)?{UNIT})*)?)\b|(?<=\[gw)\d+(?=\])'
@@ -343,8 +345,13 @@ def c_quoted(path):
     return '"' + os.fsdecode(re.sub(rb'[\\"\x00-\x1f\x7f]', lambda m: b'\\%03o' % m[0][0], os.fsencode(path))) + '"'
 
 
+class Late(Unusable):
+    """A command the deadline cut short."""
+
+
 def bounded(argv, deadline, start, what, cwd=None, env=None):
-    """(exit code, stdout, stderr) of argv, its whole process tree killed once `deadline` seconds from `start` pass."""
+    """(exit code, stdout, stderr) of argv, its whole process tree killed once `deadline` seconds from `start` pass
+    (Late)."""
     group = {'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == 'nt' else {'start_new_session': True}
     proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf-8',
                             errors='replace', cwd=cwd, env=env, **group)
@@ -357,8 +364,8 @@ def bounded(argv, deadline, start, what, cwd=None, env=None):
             proc.communicate(timeout=5)
         except subprocess.TimeoutExpired:
             # A descendant in another session outlived the kill and still holds the output pipe.
-            raise Unusable(f'{late}; a process it started survived the kill and may still be running')
-        raise Unusable(f'{late}; its process group was killed, though a process that left it may survive')
+            raise Late(f'{late}; a process it started survived the kill and may still be running')
+        raise Late(f'{late}; its process group was killed, though a process that left it may survive')
     except BaseException:
         # Its own process group spares the hooks the caller's Ctrl-C or kill, so they go down with this run.
         kill_tree(proc)
@@ -410,12 +417,20 @@ def as_checkout(text, root):
     return text
 
 
+@functools.cache
+def temp_gcc():
+    """A gcc temporary name directly in the temp dir this run and its hooks share, where an all-lowercase one is
+    gcc's too."""
+    after = '|'.join(rf'(?<={re.escape(s)}[/\\])' for s in spellings(tempfile.gettempdir()))
+    return re.compile(rf'(?:{after})cc[A-Za-z0-9]{{6}}(?=\.)', re.IGNORECASE if os.name == 'nt' else 0)
+
+
 def comparable(text, root):
     """What of a hook's output its HEAD rerun must repeat: its lines, in any order (a parallel runner's), with root
-    read as the checkout and what VARYING names masked: each number standing alone (a duration, a line number, a
-    count), a time, a pytest-xdist worker's number and a temporary file's name. A violation the change adds is a
-    line more."""
-    lines = (VARYING.sub('#', line).strip() for line in as_checkout(text, root).splitlines())
+    read as the checkout and what VARYING and temp_gcc() name masked: each number standing alone (a duration, a line
+    number, a count), a time, a pytest-xdist worker's number and a temporary file's name. A violation the change adds
+    is a line more."""
+    lines = (VARYING.sub('#', line).strip() for line in temp_gcc().sub('#', as_checkout(text, root)).splitlines())
     return sorted(line for line in lines if line)
 
 
@@ -451,17 +466,18 @@ def pre_commits_load(deadline, start):
         code, out, err = bounded([*argv, '-c', LOAD_CONFIG, os.path.abspath(CONFIG)], deadline, start,
                                  'reading the config', cwd=where)
     except OSError as e:
-        return None, f"pre-commit's {argv[0]} cannot run ({type(e).__name__})"
+        return None, copyable(f"pre-commit's {argv[0]} cannot run ({type(e).__name__})")
     if code:
         last = copyable((err.strip().splitlines() or [f'exit {code}'])[-1]).strip()
-        return None, f"pre-commit's {argv[0]} cannot read {CONFIG} ({last[:ERROR_CHARS]})"
+        return None, copyable(f"pre-commit's {argv[0]} cannot read {CONFIG} ({last[:ERROR_CHARS]})")
     return json.loads(out), ''
 
 
 def config_ids(deadline, start):
-    """(each name SKIP would skip more than one hook by, each entry's id in the order pre-commit runs them, ''), or
-    (None, None, why) when the config cannot be read: SKIP's are an alias the config gives a hook under another id,
-    and an id more than one entry uses (pre-commit's commands/run.py)."""
+    """({each id SKIP cannot skip that hook alone by: why}, each entry's id stripped, as hooks' blocks are read, in the
+    order pre-commit runs them, ''), or (None, None, why) when the config cannot be read. SKIP's names would also skip
+    another hook: an alias the config gives a hook under another id, and an id more than one entry uses; and it strips
+    each name, so a padded id it cannot name (pre-commit's commands/run.py)."""
     try:
         if yaml:
             config = yaml.safe_load(Path(CONFIG).read_text(encoding='utf-8'))
@@ -471,8 +487,11 @@ def config_ids(deadline, start):
                 return None, None, why
         entries = [h for repo in config['repos'] for h in repo['hooks']]
         ids = [h['id'] for h in entries]
-        return ({h['alias'] for h in entries if h.get('alias') not in (None, '', h['id'])}
-                | {i for i in ids if ids.count(i) > 1}), ids, ''
+        shared = {i: 'SKIP would skip another hook by it' for i in ids if ids.count(i) > 1}
+        shared |= {h['alias']: 'SKIP would skip another hook by it' for h in entries
+                   if h.get('alias') not in (None, '', h['id'])}
+        shared |= {i.strip(): 'SKIP cannot name it' for i in ids if i != i.strip()}
+        return shared, [i.strip() for i in ids], ''
     except (OSError, ValueError, KeyError, TypeError, AttributeError, *YAML_ERRORS) as e:
         return None, None, f'{CONFIG} cannot be read ({type(e).__name__})'
 
@@ -480,9 +499,21 @@ def config_ids(deadline, start):
 def unexcusable(hook, ids, shared, unread):
     """Why a failure of hook is never rerun on HEAD, or '' when it is. A hook that rewrote files is judged by what it
     wrote; the commit could not skip an id SKIP cannot name, and SKIP naming one it shares, or one whose aliases are
-    unknown, would also skip another hook, unrun on the change or, past a fail_fast stop, unchecked."""
+    unknown, would also skip another hook, unrun on the change or, past a fail_fast stop, unchecked; shared is
+    config_ids'."""
     return ('it modified files' if hook in ids else 'SKIP cannot name it' if ',' in hook else unread
-            or ('SKIP would skip another hook by it' if hook in shared else ''))
+            or shared.get(hook, ''))
+
+
+def registers(admin, tree):
+    """Whether admin, an administrative directory, registers tree as a worktree."""
+    try:
+        gitdir = (admin / 'gitdir').read_text(encoding='utf-8').strip()
+    except (OSError, ValueError):  # unreadable or not UTF-8: another worktree's entry
+        return False
+    # worktree.useRelativePaths writes it relative to the admin dir (git's worktree.c), never the cwd.
+    return os.path.normcase(os.path.realpath(admin / gitdir)) == os.path.normcase(
+        os.path.realpath(os.path.join(tree, '.git')))
 
 
 def registration(tree):
@@ -491,16 +522,7 @@ def registration(tree):
         common = Path(git('rev-parse', '--git-common-dir').strip()).resolve()
     except Unusable:
         return None
-    want = os.path.normcase(os.path.realpath(os.path.join(tree, '.git')))
-    for admin in (common / 'worktrees').glob('*'):
-        try:
-            gitdir = (admin / 'gitdir').read_text(encoding='utf-8').strip()
-            # worktree.useRelativePaths writes it relative to the admin dir (git's worktree.c), never the cwd.
-            if os.path.normcase(os.path.realpath(admin / gitdir)) == want:
-                return admin
-        except (OSError, ValueError):  # unreadable or not UTF-8: another worktree's entry
-            continue
-    return None
+    return next((admin for admin in (common / 'worktrees').glob('*') if registers(admin, tree)), None)
 
 
 @contextlib.contextmanager
@@ -522,9 +544,9 @@ def signals_held():
 
 
 def forget(tmp, deadline, start):
-    """Remove the HEAD worktree in tmp and its registration, one a kill left half made and locked included, a signal
-    held till done so it cannot cut that short; a failure here never hides the run's own result, and stderr names
-    what stays."""
+    """Remove the HEAD worktree in tmp and its registration, one a kill left half made and locked included, within
+    CLEANUP past the deadline, a signal held till done so it cannot cut that short; a failure here never hides the
+    run's own result, and stderr names what stays."""
     tree = os.path.join(tmp, 'head')
     with signals_held():
         try:
@@ -532,8 +554,12 @@ def forget(tmp, deadline, start):
         except Unusable:
             pass
         admin = registration(tree)
-        shutil.rmtree(tmp, ignore_errors=True)
-        if admin and not os.path.lexists(tree):
+        # What a failed remove left can take long to delete: past the budget it stays, and is named, a second at least.
+        removal = threading.Thread(target=shutil.rmtree, args=(tmp, True), daemon=True)
+        removal.start()
+        removal.join(max(deadline + CLEANUP - (time.monotonic() - start), 1))
+        # Read again: once its tree is gone, another session's prune and `worktree add` may reuse the entry's name.
+        if admin and not os.path.lexists(tree) and registers(admin, tree):
             # What `git worktree prune` does to this entry alone: prune drops every unlocked entry whose tree is
             # missing, another session's moved or unmounted worktree included.
             shutil.rmtree(admin, ignore_errors=True)
@@ -543,31 +569,35 @@ def forget(tmp, deadline, start):
 
 
 def baseline(expected, paths, deadline, start):
-    """The ids among expected's ({hook: for each of its Failed blocks on the change, its outputs at each end}) that
-    fail on HEAD as they failed on the change: each rerun alone on the same paths in a detached worktree of HEAD, so
-    what the host lacks (a compiler, a codepage, /dev/null) fails it there in the same words, without the change.
-    Alone, all the hook prints after its first Failed block, to the end, is its own; every block on the change must
-    end with that at one of its ends. Never pre-commit refusing an id HEAD's config does not have."""
-    failing = []
+    """(the ids among expected's ({hook: for each of its Failed blocks on the change, its outputs at each end}) that
+    fail on HEAD as they failed on the change, {hook: why} of those the deadline left unjudged): each rerun alone on
+    the same paths in a detached worktree of HEAD, so what the host lacks (a compiler, a codepage, /dev/null) fails it
+    there in the same words, without the change. Alone, all the hook prints after its first Failed block, to the end,
+    is its own; every block on the change must end with that at one of its ends. Never pre-commit refusing an id
+    HEAD's config does not have."""
+    failing, judged = [], 0
     tmp = tempfile.mkdtemp(prefix='hooks-base-')
     try:
         tree = os.path.join(tmp, 'head')
         # tmp holds no hook: a post-checkout or reference-transaction hook would change or fail HEAD's tree.
-        git_within(deadline, start, '-c', f'core.hooksPath={tmp}', 'worktree', 'add', '--detach', '--quiet', tree,
-                   'HEAD')
-        for i, (hook, outputs) in enumerate(expected.items()):
-            if i:
+        no_hooks = ('-c', f'core.hooksPath={tmp}')
+        git_within(deadline, start, *no_hooks, 'worktree', 'add', '--detach', '--quiet', tree, 'HEAD')
+        for hook, outputs in expected.items():
+            if judged:
                 # What an earlier rerun rewrote or left behind could fail the next one: each gets HEAD as is.
-                git_within(deadline, start, 'reset', '--quiet', '--hard', 'HEAD', cwd=tree)
+                git_within(deadline, start, *no_hooks, 'reset', '--quiet', '--hard', 'HEAD', cwd=tree)
                 git_within(deadline, start, 'clean', '-qffdx', cwd=tree)
             code, out = pre_commit(paths, deadline, start, f'HEAD {hook}', hook=hook, cwd=tree)
             whole = next((comparable(f['outputs'][-1][0], tree) for f in results(out, code)[1] if f['hook'] == hook),
                          None)
             if whole is not None and all(whole in each for each in outputs):
                 failing.append(hook)
+            judged += 1
+    except Late as e:
+        return failing, {hook: copyable(f'HEAD ran out of time: {e}') for hook in list(expected)[judged:]}
     finally:
         forget(tmp, deadline, start)
-    return failing
+    return failing, {}
 
 
 def compared(failure, order):
@@ -591,13 +621,13 @@ def passes(paths, deadline, start, what, config, skip=()):
     return code, ids, failures
 
 
-def run_hooks(paths, deadline=DEADLINE):
+def run_hooks(paths, deadline=DEADLINE, start=None):
     if not os.path.exists(CONFIG):
         return False, True, [], [], [], []
-    start = time.monotonic()
+    start = time.monotonic() if start is None else start
     config = functools.cache(lambda: config_ids(deadline, start))
     code, ids, failures = passes(paths, deadline, start, 'run', config)
-    shared, order, unread = config() if failures else (set(), [], '')
+    shared, order, unread = config() if failures else ({}, [], '')
     found, excused, not_rerun = failures, [], {}
     while True:
         expected = {}
@@ -607,18 +637,24 @@ def run_hooks(paths, deadline=DEADLINE):
                 not_rerun.setdefault(f['hook'], why)
             elif f['hook'] not in excused:
                 expected.setdefault(f['hook'], []).append(compared(f, order))
-        newly = baseline(expected, paths, deadline, start) if expected else []
+        newly, late = baseline(expected, paths, deadline, start) if expected else ([], {})
         excused += newly
+        for hook, why in late.items():
+            not_rerun.setdefault(hook, why)
         if not newly or not {f['hook'] for f in found} <= set(excused):
             break
         # fail_fast may have stopped the run at an excused hook: every other hook must pass on the change, as the
         # commit will run them with the same SKIP, or fail on HEAD too.
-        again, more, found = passes(paths, deadline, start, 'without the excused', config, skip=excused)
+        try:
+            again, more, found = passes(paths, deadline, start, 'without the excused', config, skip=excused)
+        except Late as e:
+            failures.append({'hook': UNOWNED, 'error': copyable(str(e))})
+            break
         ids += [h for h in more if h not in ids]
         failures += found
         if again and not found:
-            failures.append({'hook': UNOWNED,
-                             'error': f"pre-commit exited {again} with {','.join(excused)} skipped, naming no hook"})
+            failures.append({'hook': UNOWNED, 'error': copyable(
+                f"pre-commit exited {again} with {','.join(excused)} skipped, naming no hook")})
     return True, not code, ids, failures, excused, [{'hook': h, 'why': w} for h, w in not_rerun.items()]
 
 
@@ -631,10 +667,11 @@ def collect(argv):
     paths = argv
     if not paths:
         raise Unusable('usage: hooks.py [--deadline-seconds N] PATH...')
+    start = time.monotonic()
     checkout_top()
     before = status()
     snapshot_before = snapshot(paths, before)
-    ran, passed, ids, failures, base_failed, not_rerun = run_hooks(paths, deadline)
+    ran, passed, ids, failures, base_failed, not_rerun = run_hooks(paths, deadline, start)
     after = status()
     failed = [{'hook': f['hook'], 'error': f['error']} for f in failures]
     return {'ran': ran, 'passed': passed, 'modifiedBy': ids, 'failed': failed, 'baselineFailed': base_failed,
