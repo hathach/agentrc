@@ -127,7 +127,7 @@ expect = "v2.23.0"
 
 [tool.hil-venv]
 kind = "pip"
-lock = "requirements.lock"  # esptool is sdist-only: built offline against Debian's python3-setuptools
+lock = "requirements.lock"  # esptool, adafruit-nrfutil: sdist-only, built offline against Debian's python3-setuptools
 system_site_packages = true  # python3-hid
 no_build_isolation = true
 links = { "/opt/hil/venv" = "." }
