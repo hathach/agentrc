@@ -915,7 +915,7 @@ def collect(msgs, wait_ms):
             fence = generation()
             start = 0 if msgs else resumed(COLLECTED, recs, watch, opened)
             armed = recs.index(watch) if watch and not msgs else 0
-            by_id = unwatched(recs[:armed])
+            by_id = unwatched(recs[:armed]) if start < armed else set()
     except Busy:
         print('pending: the ledger lock stayed held', flush=True)
         return NO_ANSWER
