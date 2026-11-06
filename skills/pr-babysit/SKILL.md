@@ -5,8 +5,15 @@ description: Fact-collector scripts of the pr-babysit workflow, its publishing p
 
 # pr-babysit's scripts
 
-Each script prints one JSON line, the last on stdout; the workflow's agent
-returns that line unchanged and the workflow decides. An `{"error": ...}` line
+Each script prints one JSON line, the last on stdout, and the workflow decides
+on it. Under `AGENTRC_EMIT=<file>`, as the workflow's relay runs it, the script
+also writes that line to the new `<file>` as a data module the workflow loads
+with `workflow({scriptPath})`, so no model copies it (`lib/seal.py`'s `emit`);
+the file is claimed before the script does anything, so a rerun meeting one
+already there exits 3 at once, nothing done. `facts.py emit-dir` makes a
+launch's directory for those files under the git common dir; that path is the
+one value a model copies, and the files' self-naming and seals give
+consistency, not freshness. An `{"error": ...}` line
 with exit 2 means the facts could not be collected or contradict each other:
 the workflow refuses to publish, and the caller never fills in what is
 missing. Each script's docstring says what it reports.
@@ -32,7 +39,8 @@ python3 "$S/coderabbit_trigger.py" --pr N [--repo R] --head <sha> [--request]  #
 python3 "$S/greptile_trigger.py" --pr N [--repo R] --head <sha>  # comment `@greptileai` once per head, recorded under the git common dir
 python3 "$S/build.py" --path 'src/a.c' --command 'make -C <BUILD>' [--setup L] [--require T]  # build the checkout as it stands
 python3 "$S/scope_check.py" --path 'src/a.c' --path 'test/test_a.c'  # which paths a fix writer may edit or create
-python3 "$S/state_transfer.py" <saved output> [--chunks I,J] [--pad] [--raw]  # a stateRef's state as checksummed base64 chunks; --pad shifts their text; --raw: the file's own bytes (pr-review's ledger snapshot)
+python3 "$S/state_transfer.py" <saved output> [--raw]  # a stateRef's state whole with its digest; --raw: the file's own text and its fnv1a (pr-review's ledger snapshot)
+python3 "$S/facts.py" emit-dir                 # a new directory for one launch's AGENTRC_EMIT files; ones unwritten for 14 days go
 python3 "$S/launch_result.py" --output <saved output> [--state-ref F:D] [--checkout DIR] [--keys]  # the caller's reading of a launch; --keys: settled failures' keys too
 python3 "$S/merge.py" --pr-url <url> --base <branch> --checkout DIR --output <saved output> --state-digest D [--waive BOT] [--merge]  # chief's merge gate; inspects without --merge; --waive drops a bot from the required reviews on the owner's word, recorded as `waived`
 ```
@@ -53,7 +61,7 @@ launch, lists the `blockers` to settle before continuing, and shows as `pinned`
 the arguments the state is fixed to, which a continuation passes unchanged.
 A launch on a PR no longer open stops `pr-merged` or `pr-closed`, at preflight or at the CI lane's next read; nothing is left to continue. Every GitHub or SonarCloud write reads the state first (`preflight.py --state`, or `push.py --open-pr` for a push) and goes on only for an OPEN PR; an unreadable state stops `pr-state-unread`.
 `preflight.py`, `harvest.py`, `scope_check.py`, `state_transfer.py`, `launch_result.py` and `commits.py` only read, except that
-`preflight.py` creates the launch's receipts directory and `commits.py commit` stages and commits exactly its paths, saving its receipt; `hooks.py` runs the repository's
+each writes its AGENTRC_EMIT file, `preflight.py` creates the launch's receipts directory and `commits.py commit` stages and commits exactly its paths, saving its receipt; `hooks.py` runs the repository's
 hooks, which may rewrite files, through `hook_runner.py` under pre-commit's own interpreter (its entry script's `#!`
 line, or the one pip's `pre-commit.exe` carries), which records what pre-commit itself says each hook did. A
 `pre-commit` that is no pip entry for pre-commit's `main()`, such as a wrapper, runs as is; that run, or one on a

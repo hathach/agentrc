@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -27,7 +27,7 @@ const confirmedAs = (severity, over = {}) => ({ verdict: 'confirmed', reason: 'y
 const REFUTED = { verdict: 'refuted', reason: 'no', severity: null, impact: null, severityReason: null, confidence: null }
 
 // ledger.py show --snapshot's manifest over `answer` as the snapshot's bytes, and the real state_transfer.py --raw's
-// envelope for the file a manifest named.
+// line for the file a manifest named.
 const STATE_TRANSFER = fileURLToPath(new URL('../skills/pr-babysit/scripts/state_transfer.py', import.meta.url))
 const snapshots = new Map()
 const asciiJson = (v) => JSON.stringify(v).replace(/[\u007f-￿]/g, c => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`)
@@ -42,22 +42,41 @@ function manifestOf (answer, a) {
   snapshots.set(file, payload)
   return { repo: a.repo, pr: a.pr, head: a.head, file, digest: fnv1a(payload), length: payload.length }
 }
-function envelopeOf (prompt) {
-  const [, file, ids, pad] = /state_transfer\.py '([^']+)' --raw --chunks ([0-9,]+)( --pad)?\n/.exec(prompt)
+function transferOf (prompt) {
+  const [, file] = /state_transfer\.py '([^']+)' --raw > \/dev\/null`/.exec(prompt)
   const dir = mkdtempSync(join(tmpdir(), 'pr-review-ledger-'))
   try {
     const at = join(dir, 'ledger.json')
     writeFileSync(at, snapshots.get(file))
-    const done = spawnSync('python3', [STATE_TRANSFER, at, '--raw', '--chunks', ids, ...(pad ? ['--pad'] : [])], { encoding: 'utf8' })
+    const done = spawnSync('python3', [STATE_TRANSFER, at, '--raw'], { encoding: 'utf8' })
     assert.equal(done.status, 0, done.stdout + done.stderr)
     return JSON.parse(done.stdout.trim().split('\n').at(-1))
   } finally { rmSync(dir, { recursive: true, force: true }) }
 }
+// The file a relay command hands its script as AGENTRC_EMIT, and the module lib/seal.py's emit writes there.
+const emitOf = (prompt) => String(prompt).match(/`AGENTRC_EMIT='([^']+)' /)?.[1]
+const moduleOf = (file, line) => `export const meta = { name: 'emit', description: 'a script line' }\nreturn ${JSON.stringify({ emit: file, line })}\n`
 
-// Stub agents keyed by label; `stubs.<label>` is the value, or a function of the prompt.
-async function run(args, stubs = {}) {
+// Stub agents keyed by label; `stubs.<label>` is the value, or a function of the prompt. A relay's stub is its script's
+// line, which lands in the file its command names as lib/seal.py's emit writes it, claimed before the script runs (one
+// there is exit 3, nothing run), null a relay that died before it wrote; the relay answers its exit. `opts.resume` is an earlier run's journal, answered
+// in order as the runtime's resume answers the unchanged prefix; `opts.emitDir` is facts.py emit-dir's directory,
+// else a new one, removed unless `opts.keepEmit`.
+async function run(args, stubs = {}, opts = {}) {
   const calls = []
   const logs = []
+  const journal = []
+  const loads = []
+  let live = 0
+  let emitMade = null
+  const emitDir = () => {
+    if (opts.emitDir) return opts.emitDir
+    if (!emitMade) {
+      emitMade = `${mkdtempSync(join(tmpdir(), 'pr-review-emit-')).replace(/\\/g, '/')}/agentrc-emit/r1`
+      mkdirSync(emitMade, { recursive: true })
+    }
+    return emitMade
+  }
   const pick = (label, prompt) => {
     const key = Object.keys(stubs).find(k => k === label) ?? Object.keys(stubs).find(k => label.startsWith(k + ':'))
     const v = key === undefined ? undefined : stubs[key]
@@ -69,18 +88,21 @@ async function run(args, stubs = {}) {
     ledger: { reviews: 0, open: [] },
     claims: { claims: [] },
   }
-  const agent = async (prompt, options) => {
+  const stub = async (prompt, options) => {
     calls.push({ label: options.label, prompt: String(prompt), options })
-    // `stubs.ledgerChunks(envelope, call)` replaces an envelope of the chunks a load asked.
-    if (options.label.startsWith('ledger:load#')) {
-      const env = envelopeOf(prompt)
-      return stubs.ledgerChunks ? stubs.ledgerChunks(env, calls.filter(c => c.label.startsWith('ledger:load#')).length) : env
+    if (options.label === 'emit:dir') return { dir: emitDir() }
+    // A relay's fresh attempt (`<label>:retry`) runs the same script.
+    const base = options.label.replace(/:retry$/, '')
+    // `stubs['ledger:load']` replaces state_transfer.py --raw's line, or is a function of it.
+    if (base === 'ledger:load') {
+      const v = stubs['ledger:load']
+      return v === undefined ? transferOf(prompt) : typeof v === 'function' ? v(transferOf(prompt)) : v
     }
     const v = pick(options.label, prompt)
     // `stubs.ledger` is the answer ledger.py show --snapshot writes; `stubs.disputes` its disputes, unless that answer
     // names its own; the members ledger.py always prints default as it prints them. `stubs.ledgerAsIs` is written
     // untouched, and `stubs['ledger:manifest']` replaces the manifest.
-    if (options.label === 'ledger:manifest') {
+    if (base === 'ledger:manifest') {
       if (stubs['ledger:manifest'] !== undefined) return v
       const l = stubs.ledgerAsIs !== undefined ? stubs.ledgerAsIs : v === undefined ? defaults.ledger : v
       if (!l || typeof l !== 'object') return l
@@ -90,7 +112,7 @@ async function run(args, stubs = {}) {
       return manifestOf(answer, args)
     }
     if (v !== undefined) return v
-    if (options.label in defaults) return defaults[options.label]
+    if (base in defaults) return defaults[base]
     if (options.label === 'write') {
       const fs = JSON.parse(/Findings: (\[.*\])$/s.exec(prompt)[1])
       return { summary: '- Overall fine.', comments: fs.map(f => ({ finding: f.finding, body: `**${f.severity}**: ${f.why}` })) }
@@ -100,8 +122,43 @@ async function run(args, stubs = {}) {
     if (options.label === 'beyond') return { beyond: [] }
     throw new Error(`unstubbed ${options.label}`)
   }
+  const agent = async (prompt, options) => {
+    const at = journal.length
+    const cached = opts.resume && live === at && opts.resume[at]
+    if (cached && cached.prompt === String(prompt) && cached.label === options.label) {
+      live++
+      journal.push(cached)
+      return structuredClone(cached.answer)
+    }
+    const entry = { label: options.label, prompt: String(prompt) }
+    journal.push(entry)
+    const file = emitOf(prompt)
+    let answer = null
+    try {
+      if (file === undefined) answer = await stub(prompt, options)
+      else if (existsSync(file)) answer = { exit: 3 }
+      else {
+        writeFileSync(file, '') // the claim, before the script runs anything
+        const line = await stub(prompt, options)
+        if (line !== null) {
+          writeFileSync(file, moduleOf(file, line))
+          answer = { exit: line && line.error ? 2 : 0 }
+        }
+      }
+    } finally { entry.answer = structuredClone(answer) }
+    return answer
+  }
   const audits = []
+  // workflow({scriptPath}) as the runtime runs it: the file's body, its return value the result; an unreadable file
+  // throws. Else the one named child, code-audit.
   const workflow = async (name, a) => {
+    if (name && typeof name.scriptPath === 'string') {
+      const text = readFileSync(name.scriptPath, 'utf8').replace(/^export const meta = /m, 'const meta = ')
+      loads.push(name.scriptPath)
+      const nested = () => { throw new Error('a child workflow nests nothing') }
+      return new AsyncFunction('args', 'agent', 'pipeline', 'parallel', 'phase', 'log', 'workflow', 'budget', ...ABSENT, text)(
+        a, nested, null, null, () => {}, () => {}, nested, null, ...ABSENT.map(() => undefined))
+    }
     assert.equal(name, 'code-audit')
     audits.push(a)
     const v = stubs.audit
@@ -112,8 +169,12 @@ async function run(args, stubs = {}) {
   const parsed = []
   const json = { stringify: JSON.stringify, parse: (t, r) => { const v = JSON.parse(t, r); parsed.push(v); return v } }
   const fn = new AsyncFunction('args', 'agent', 'pipeline', 'parallel', 'phase', 'log', 'workflow', 'budget', 'JSON', ...ABSENT, body)
-  const result = await fn(args, agent, null, parallel, () => {}, m => logs.push(String(m)), workflow, null, json, ...ABSENT.map(() => undefined))
-  return { result, calls, logs, audits, parsed, labels: calls.map(c => c.label) }
+  try {
+    const result = await fn(args, agent, null, parallel, () => {}, m => logs.push(String(m)), workflow, null, json, ...ABSENT.map(() => undefined))
+    return { result, calls, logs, audits, parsed, journal, loads, emitDir: emitMade, labels: calls.map(c => c.label).filter(l => l !== 'emit:dir') }
+  } finally {
+    if (emitMade && !opts.keepEmit) rmSync(emitMade.split('/agentrc-emit/')[0], { recursive: true, force: true })
+  }
 }
 
 const pinned = (a) => ({ ok: true, head: H, top: '/w', repo: a.repo, pr: a.pr, ci: { state: 'green' }, pins: { mergeBase: a.mergeBase, scopeBase: a.scopeBase, mode: a.mode, groups: a.groups, recheckFrom: a.recheckFrom ?? null } })
@@ -184,7 +245,7 @@ test('a failed, moved-head or unidentified check stops before any review work', 
     const { result, labels } = await run(BASE, { check })
     assert.equal(result.status, 'blocked')
     assert.equal(result.reason, 'check-failed')
-    assert.deepEqual(labels, ['check'])
+    assert.deepEqual(labels, check === null ? ['check', 'check:retry'] : ['check'], 'a dead relay gets one fresh attempt')
   }
 })
 
@@ -193,13 +254,12 @@ test('a clean full review approves only with green CI, full coverage and hardwar
   assert.equal(result.verdict.event, 'APPROVE')
   assert.deepEqual(audits[0], { dirs: ['src/core'], dimensions: audits[0].dimensions, diff: { base: MB, head: H }, root: '/w' })
   assert.equal(audits[0].dimensions.length, 4)
-  assert.ok(calls.filter(c => ['check', 'threads', 'ledger:manifest'].includes(c.label)).every(c => c.options.model === 'haiku'))
-  assert.ok(calls.filter(c => c.label.startsWith('ledger:load#')).every(c => c.options.model === 'sonnet'))
+  assert.ok(calls.filter(c => ['emit:dir', 'check', 'threads', 'ledger:manifest', 'ledger:load'].includes(c.label)).every(c => c.options.model === 'haiku'))
   assert.match(calls.find(c => c.label === 'check').prompt, /prepare\.py --check --pr 7 --repo o\/r --expected-head b{40}/)
   const at = (l) => calls.findIndex(c => c.label === l)
   assert.ok(at('threads') < at('ledger:manifest'), 'show reads the snapshot threads.py wrote')
-  assert.match(calls[at('ledger:manifest')].prompt, /ledger\.py show .*--threads '\/tmp\/ledger\/7\/threads-b{40}\.json' --head b{40} --snapshot '\/tmp\/ledger\/7'\n/)
-  assert.match(calls[at('ledger:load#1')].prompt, /state_transfer\.py '\/tmp\/ledger\/7\/ledger-[0-9a-f]{64}\.json' --raw --chunks 0\n/)
+  assert.match(calls[at('ledger:manifest')].prompt, /ledger\.py show .*--threads '\/tmp\/ledger\/7\/threads-b{40}\.json' --head b{40} --snapshot '\/tmp\/ledger\/7'` /)
+  assert.match(calls[at('ledger:load')].prompt, /`AGENTRC_EMIT='[^']+\/ledger_load\.1\.[0-9a-f]{8}\.js' python3 .*\/skills\/pr-babysit\/scripts\/state_transfer\.py '\/tmp\/ledger\/7\/ledger-[0-9a-f]{64}\.json' --raw > \/dev\/null` /)
   assert.deepEqual(result.heldThreads, [])
   assert.doesNotMatch(result.draft.body, /agentrc|Claude|generated/i)
 
@@ -406,32 +466,29 @@ test('a dead or malformed answer on muted findings posts them all and leaves cov
   assert.deepEqual(lead.result.findings.map(f => [f.id, f.muted, f.lead]), [['pr7-f1', false, true], ['pr7-f2', true, false]], 'a lead given its own comment is not muted')
 })
 
-test('a threads receipt that is not the script\'s line is asked again once on a fresh label, else the launch blocks (#150)', async () => {
+test('a threads line that is not of the file asked for, the script\'s error, or a relay dead twice blocks the launch', async () => {
   const file = `${BASE.factsDir}/threads-${H}.json`
-  const wrapped = { file: JSON.stringify({ file, count: 3 }) }
-  const once = await run(BASE, { threads: (prompt, label) => label === 'threads' ? wrapped : { file, count: 3 } })
-  assert.notEqual(once.result.status, 'blocked')
-  assert.deepEqual(once.labels.filter(l => l.startsWith('threads')), ['threads', 'threads:retry'])
-  assert.equal(once.calls.find(c => c.label === 'threads:retry').options.model, 'sonnet')
-  const twice = await run(BASE, { threads: wrapped })
-  assert.deepEqual([twice.result.status, twice.result.reason], ['blocked', 'threads-failed'])
-  // The script's own error is its answer: nothing to copy better.
+  // #150's string-wrapped copy, now only as a script could print it: no line of that file.
+  const wrapped = await run(BASE, { threads: { file: JSON.stringify({ file, count: 3 }) } })
+  assert.deepEqual([wrapped.result.status, wrapped.result.reason, wrapped.result.detail], ['blocked', 'threads-failed', 'wrong file'])
   const failed = await run(BASE, { threads: { file: '', error: 'gh: HTTP 502' } })
-  assert.deepEqual([failed.result.reason, failed.labels.includes('threads:retry')], ['threads-failed', false])
-  const thrown = (label) => { throw new Error(`${label} exploded`) }
-  const died = await run(BASE, { threads: (prompt, label) => label === 'threads' ? thrown(label) : { file, count: 3 } })
-  assert.notEqual(died.result.status, 'blocked', 'a relay that throws gets the retry too')
-  const dead = await run(BASE, { threads: (prompt, label) => thrown(label) })
+  assert.deepEqual([failed.result.reason, failed.result.detail], ['threads-failed', 'gh: HTTP 502'])
+  const dead = await run(BASE, { threads: (prompt, label) => { throw new Error(`${label} exploded`) } })
   assert.deepEqual([dead.result.reason, dead.result.detail], ['threads-failed', 'the threads relay died'])
   assert.deepEqual(dead.logs.filter(l => / errored — /.test(l)), ['threads errored — threads exploded', 'threads:retry errored — threads:retry exploded'])
+  for (const r of [wrapped, failed]) assert.deepEqual(r.labels.filter(l => l.startsWith('threads')), ['threads'])
+  const revived = await run(BASE, { threads: (prompt, label) => label === 'threads' ? null : { file, count: 3 } })
+  assert.deepEqual([revived.result.status, revived.labels.filter(l => l.startsWith('threads'))], ['reviewed', ['threads', 'threads:retry']], 'a dead relay gets one fresh attempt')
 })
 
 test('the script relays run as the relay role', async () => {
   const { calls } = await run({ ...BASE, mode: 'incremental', scopeBase: OLD }, { check: pinned({ ...BASE, mode: 'incremental', scopeBase: OLD }),
-    ledger: { reviews: 1, last: { head: OLD }, open: [] }, threads: (prompt, label) => label === 'threads' ? null : { file: `${BASE.factsDir}/threads-${H}.json`, count: 0 } })
+    ledger: { reviews: 1, last: { head: OLD }, open: [] } })
   const relays = calls.filter(c => c.options.agentType === 'relay')
-  assert.deepEqual(relays.map(c => c.label), ['check', 'threads', 'threads:retry', 'ledger:manifest', 'ledger:load#1'],
-    'one snapshot of the ledger and its disputes, read in checked chunks')
+  assert.deepEqual(relays.map(c => c.label), ['emit:dir', 'check', 'threads', 'ledger:manifest', 'ledger:load'],
+    'one snapshot of the ledger and its disputes, read whole from the file its load emits')
+  assert.ok(relays.slice(1).every(c => /^The working tree is the review checkout\. Run exactly `AGENTRC_EMIT='[^']+' python3 /.test(c.prompt) &&
+    c.prompt.includes('answer only its exit status as exit') && c.options.schema.required[0] === 'exit'), 'each answers only its exit')
 })
 
 test('a ledger answer missing its members, or not of the review prepare pinned, blocks instead of dropping standing findings', async () => {
@@ -468,7 +525,7 @@ test('a ledger answer missing its members, or not of the review prepare pinned, 
   assert.equal((await run(BASE, { ledgerAsIs: { reviews: 0, last: null, open: [], disputes: [] } })).result.status, 'reviewed', 'an empty ledger prints no heldThreads')
 })
 
-test('a ledger answer past 64 KiB crosses in checked chunks, every text exact, in every mode', async () => {
+test('a ledger answer past 64 KiB crosses whole through one emitted file, every text exact, in every mode', async () => {
   const inc = { ...BASE, mode: 'incremental', scopeBase: OLD }
   // As ledger.py's view writes a carried row: without its impact and severityReason.
   const row = (n) => ({ id: `pr7-f${n}`, status: 'open', file: 'src/core/a.c', line: 10 + n, severity: 'low', confidence: 'high', commentId: 900 + n,
@@ -484,8 +541,7 @@ test('a ledger answer past 64 KiB crosses in checked chunks, every text exact, i
     const { result, calls, parsed } = await run(a, { check, ledgerAsIs: whole, recheck: still })
     assert.equal(result.status, 'reviewed', a.mode)
     assert.deepEqual(parsed.find(v => v && Array.isArray(v.open) && v.open.length === 40), whole, `${a.mode}: the answer rebuilt exactly`)
-    const loads = calls.filter(c => c.label.startsWith('ledger:load#'))
-    assert.equal(loads.length, Math.ceil(Math.ceil(m.length / 512) / 4), 'four chunks a call, each asked once')
+    assert.equal(calls.filter(c => c.label.startsWith('ledger:load')).length, 1, 'one load')
     assert.equal(calls.filter(c => c.label.startsWith('recheck:')).length, a.mode === 'discussion' ? 30 : 40, a.mode)
     const carried = result.findings.filter(f => f.id)
     assert.equal(carried.length, a.mode === 'discussion' ? 30 : 40)
@@ -499,47 +555,55 @@ test('a ledger answer past 64 KiB crosses in checked chunks, every text exact, i
     { severity: 'medium', impact: IMP, severityReason: 'worse now' }, 'a regrade carries its whole grading')
 })
 
-test('a mis-copied chunk is asked again, padded after an odd count of misses; one never copied right blocks before any review work', async () => {
+test('a loaded ledger text off the manifest\'s digest, a load error or a dead load blocks before any review work', async () => {
   const inc = { ...BASE, mode: 'incremental', scopeBase: OLD }
   const row = { id: 'pr7-f1', status: 'open', file: 'src/core/a.c', line: 10, severity: 'high', commentId: 901, why: wordy(600), published: null, repair: null }
   const whole = { reviews: 1, last: { head: OLD }, open: [row], heldThreads: [], disputes: [] }
   const still = { state: 'open', reason: 'still' }
-  const flip = (c) => ({ ...c, data: (c.data[0] === 'A' ? 'B' : 'A') + c.data.slice(1) })
-  const resum = (c) => { const d = flip(c); return { ...d, sum: fnv1a(d.data) } }
-  const go = (ledgerChunks) => run(inc, { check: pinned(inc), ledgerAsIs: whole, recheck: still, ledgerChunks })
-  const once = await go((env, call) => call === 1 ? { ...env, chunks: env.chunks.map((c, k) => k ? c : flip(c)) } : env)
-  assert.equal(once.result.status, 'reviewed')
-  const asked = once.calls.filter(c => c.label.startsWith('ledger:load#')).map(c => /--chunks ([0-9,]+)( --pad)?/.exec(c.prompt).slice(1, 3).join(''))
-  assert.deepEqual(asked.slice(-1), ['0 --pad'], 'only the bad chunk is asked again, padded after one miss')
-  const twice = await go((env, call) => call <= 2 ? { ...env, chunks: env.chunks.map(c => c.i ? c : flip(c)) } : env)
-  assert.equal(twice.result.status, 'reviewed')
-  assert.match(twice.calls.filter(c => c.label.startsWith('ledger:load#')).at(-1).prompt, /--chunks 0\n/, 'unpadded again after two')
-  const dup = await go((env, call) => call === 1 ? { ...env, chunks: [...env.chunks, env.chunks[0]] } : env)
-  assert.equal(dup.result.status, 'reviewed', 'a duplicated chunk settles neither copy, and is asked again')
-  const whole2 = await go((env, call) => call === 1 ? { ...env, chunks: env.chunks.map(c => c.i ? c : resum(c)) } : env)
-  assert.equal(whole2.result.status, 'reviewed', 'a chunk changed with its sum fails the digest, and the load starts over')
-  for (const [why, bad] of [['missing or mis-copied', (env) => ({ ...env, chunks: env.chunks.map(c => c.i === 1 ? flip(c) : c) })],
-    ['does not match the manifest digest', (env) => ({ ...env, chunks: env.chunks.map(c => c.i === 1 ? resum(c) : c) })],
-    ['chunks 0,1,2 missing or mis-copied (the envelope metadata is malformed)', (env) => ({ ...env, digest: '00000000' })],
-    ['chunks 0,1,2 missing or mis-copied (state_transfer.py: gone)', () => ({ error: 'gone' })]]) {
-    const { result, labels } = await go(bad)
+  const go = (load) => run(inc, { check: pinned(inc), ledgerAsIs: whole, recheck: still, 'ledger:load': load })
+  assert.equal((await go(undefined)).result.status, 'reviewed')
+  // The live loader's "correction": the text changed, its digest kept, or both changed together.
+  const edit = (l) => l.text.replace('"high"', '"low"')
+  for (const [why, load] of [['does not match the manifest digest', (l) => ({ ...l, text: edit(l) })],
+    ['does not match the manifest digest', (l) => ({ text: edit(l), digest: fnv1a(edit(l)) })],
+    ['state_transfer.py: cannot read x: No such file or directory', { error: 'cannot read x: No such file or directory' }],
+    ['the ledger load relay died', null]]) {
+    const { result, labels } = await go(load)
     assert.deepEqual([result.status, result.reason], ['blocked', 'ledger-failed'], why)
-    assert.ok(result.detail.includes(why), why)
+    assert.ok(result.detail.endsWith(why), result.detail)
     assert.ok(!labels.some(l => l.startsWith('recheck:')), why)
   }
 })
 
-test('a ledger manifest of another head, path or size blocks before reading', async () => {
+test('a resumed review reloads the lines its relays wrote; a file there before a live run is reloaded only when it names itself', async () => {
+  const first = await run(BASE, {}, { keepEmit: true })
+  try {
+    assert.deepEqual(first.loads.map(f => f.split('/').at(-1).split('.')[0]), ['check', 'threads', 'ledger_manifest', 'ledger_load'])
+    const resumed = await run(BASE, {}, { resume: first.journal })
+    assert.deepEqual(resumed.calls, [], 'no agent ran again')
+    assert.deepEqual([resumed.loads, resumed.result], [first.loads, first.result])
+    const again = await run(BASE, {}, { emitDir: first.emitDir })
+    assert.deepEqual(again.result, first.result)
+    assert.ok(again.logs.includes('check: the line an earlier attempt of this call wrote, reloaded'), again.logs.join('\n'))
+    writeFileSync(first.loads[0], readFileSync(first.loads[1], 'utf8'))
+    // A file there that names another: the check ran nothing (exit 3) and its outcome is unknown; its fresh attempt runs.
+    const foreign = await run(BASE, {}, { emitDir: first.emitDir })
+    assert.ok(foreign.logs.includes(`check: an earlier attempt of this call claimed ${first.loads[0]} and left no line of it — its outcome is unknown`), foreign.logs.join('\n'))
+    assert.deepEqual([foreign.labels[0], foreign.result.status], ['check:retry', 'reviewed'])
+  } finally { rmSync(first.emitDir.split('/agentrc-emit/')[0], { recursive: true, force: true }) }
+})
+
+test('a ledger manifest of another head, path or digest blocks before reading', async () => {
   const inc = { ...BASE, mode: 'incremental', scopeBase: OLD }
   const row = { id: 'pr7-f1', status: 'open', file: 'src/core/a.c', line: 10, severity: 'high', commentId: 901, why: 'w', published: null, repair: null }
   const whole = { reviews: 1, last: { head: OLD }, open: [row], heldThreads: [], disputes: [] }
   const real = manifestOf(whole, inc)
   const name = real.file.split('/').at(-1)
   for (const wrong of [{ head: OLD }, { repo: 'o/x' }, { pr: 8 }, { file: `/tmp/other/${name}` }, { file: `${inc.factsDir}/ledger-x.json` },
-    { file: `${inc.factsDir}/../${name}` }, { digest: 'xyz' }, { length: 0 }, { length: 256 * 1024 + 1 }, { error: 'no ledger' }]) {
+    { file: `${inc.factsDir}/../${name}` }, { digest: 'xyz' }, { length: 0 }, { error: 'no ledger' }]) {
     const { result, labels } = await run(inc, { check: pinned(inc), ledgerAsIs: whole, 'ledger:manifest': { ...real, ...wrong } })
     assert.deepEqual([result.status, result.reason], ['blocked', 'ledger-failed'], JSON.stringify(wrong))
-    assert.ok(!labels.some(l => l.startsWith('ledger:load#')), JSON.stringify(wrong))
+    assert.ok(!labels.includes('ledger:load'), JSON.stringify(wrong))
   }
   const dead = await run(inc, { check: pinned(inc), 'ledger:manifest': null })
   assert.deepEqual([dead.result.reason, dead.result.detail], ['ledger-failed', 'the ledger relay died'])

@@ -91,19 +91,60 @@ log(`PR ${repo}#${pr} ${args.mode} review of ${head.slice(0, 12)} (scope from ${
 
 // An agent that throws is no answer, as one that returns nothing; the error is logged.
 const quiet = (label) => (e) => { log(`${label} errored — ${e && e.message}`); return null }
-// A relay runs one script and returns its last stdout line: the script decides, the model copies.
-const relay = (label, phase, cmd, schema) => agent(
-  `${IN}Run exactly: ${cmd}\nIts last stdout line is one JSON object: return it unchanged as your answer.`,
-  { label, phase, agentType: 'relay', model: 'haiku', effort: 'low', schema },
-).catch(quiet(label))
+// No model copies a script's line (pr-babysit.js's emitted): a relay runs the script with AGENTRC_EMIT naming a new file
+// in this launch's directory (facts.py emit-dir), answers only its exit status, and workflow() loads the line the
+// script wrote there as a data module (lib/seal.py's emit). A file's name holds its label, count and command's fnv1a: a
+// resume's replayed relays reload what they wrote, and a file there before a live run (exit 3) is reloaded only when
+// it names itself.
+const EMIT_REFUSED = 3 // lib/seal.py's
+const RAN = { type: 'object', additionalProperties: false, required: ['exit'], properties: { exit: { type: 'integer' }, error: { type: 'string' } } }
+let emitDir = null
+// The one path a relay copies: a mis-copy names no directory a run wrote into (mkdtemp's name, never-overwritten files).
+// A trust boundary: nothing here proves the directory fresh or this launch's; an existing one handed back would replay
+// its files, whose self-naming gives consistency, not freshness.
+const emitDirOf = () => emitDir ??= agent(
+  `${IN}Editing nothing, run exactly \`python3 ${AGENTRC}/skills/pr-babysit/scripts/facts.py emit-dir\` and return the dir member of its last stdout line as dir, ` +
+  'character for character. If that line is {"error": ...}, or there is none, return its error, or what went wrong, as error, with dir = \'\'.',
+  { label: 'emit:dir', phase: 'Check', agentType: 'relay', model: 'haiku', effort: 'low',
+    schema: { type: 'object', additionalProperties: false, required: ['dir'], properties: { dir: { type: 'string' }, error: { type: 'string' } } } },
+).then(r => {
+  if (r && /^(?:[A-Za-z]:)?\/(?!\/)[^'\n]*\/agentrc-emit\/[A-Za-z0-9_]+$/.test(r.dir)) return r.dir
+  log(`emit:dir: no directory for the scripts' lines — ${r ? r.error || JSON.stringify(r.dir) : 'the relay died'}`)
+  return null
+}, quiet('emit:dir'))
+const emitCount = new Map()
+// A relay runs one script: its line as the script wrote it, else { error }, or null when the relay died leaving none.
+const relay = async (label, phase, cmd) => {
+  const dir = await emitDirOf()
+  if (!dir) return { error: 'no directory for the line (facts.py emit-dir failed)' }
+  const name = label.replace(/[^A-Za-z0-9._-]/g, '_')
+  const n = (emitCount.get(name) || 0) + 1
+  emitCount.set(name, n)
+  const file = `${dir}/${name}.${n}.${fnv1a(cmd)}.js`
+  const ran = await agent(`${IN}Run exactly \`AGENTRC_EMIT='${file}' ${cmd}\` and answer only its exit status as exit, AGENTRC_EMIT kept exactly as written: ` +
+    'the script writes its JSON line to that file, where the workflow reads it. Only when it printed no JSON line at all, also give what went wrong as error, in its own words.',
+  { label, phase, agentType: 'relay', model: 'haiku', effort: 'low', schema: RAN }).catch(quiet(label))
+  // Exit 3: the script ran nothing, meeting the file an attempt a resume cut short claimed; with no line there, that
+  // attempt's outcome is unknown, as a dead relay's.
+  const m = await workflow({ scriptPath: file }).catch(() => null)
+  const refused = !!ran && ran.exit === EMIT_REFUSED
+  if (m && m.emit === file && m.line && typeof m.line === 'object' && !Array.isArray(m.line)) {
+    if (refused) log(`${label}: the line an earlier attempt of this call wrote, reloaded`)
+    return m.line
+  }
+  if (refused) {
+    log(`${label}: an earlier attempt of this call claimed ${file} and left no line of it — its outcome is unknown`)
+    return null
+  }
+  return m ? { error: `${file} holds no line written for it` } : ran ? { error: `the script wrote no line (exit ${ran.exit})${ran.error ? `: ${ran.error}` : ''}` } : null
+}
+// Every relay here only reads (threads.py and ledger.py write content-named facts files): one that brought no line back
+// gets one fresh attempt, its own file.
+const relayOnce = async (label, phase, cmd) => (await relay(label, phase, cmd)) ?? relay(`${label}:retry`, phase, cmd)
 const blocked = (reason, detail) => ({ status: 'blocked', reason, detail, pr, head })
 
 phase('Check')
-const CI = { type: 'object', properties: { state: { enum: ['green', 'red', 'pending', 'unobserved', 'unknown'] }, counts: { type: 'object' }, actionRequired: { type: 'integer' } }, required: ['state'] }
-const PINS = { type: 'object', properties: { mergeBase: { type: 'string' }, scopeBase: { type: 'string' }, mode: { type: 'string' }, groups: { type: 'array', items: { type: 'string' } },
-  recheckFrom: { type: ['string', 'null'] } } }
-const check = await relay('check', 'Check', `python3 ${S}/prepare.py --check --pr ${pr} --repo ${repo} --expected-head ${head}`,
-  { type: 'object', properties: { ok: { type: 'boolean' }, head: { type: 'string' }, top: { type: 'string' }, repo: { type: 'string' }, pr: { type: 'integer' }, ci: CI, pins: PINS, error: { type: 'string' } } })
+const check = await relayOnce('check', 'Check', `python3 ${S}/prepare.py --check --pr ${pr} --repo ${repo} --expected-head ${head}`)
 // The check names the run's repository and PR so its journal identifies the run.
 if (!check || check.error || check.ok !== true || check.head !== head || !check.top || check.repo !== repo || check.pr !== pr) {
   return blocked('check-failed', check ? (check.error || `check answered ${JSON.stringify(check)}`) : 'the check relay died')
@@ -116,39 +157,30 @@ const ci = check.ci
 
 phase('Context')
 const threadsFile = `${factsDir}/threads-${head}.json`
-const THREADS = { type: 'object', properties: { file: { type: 'string' }, count: { type: 'integer' }, error: { type: 'string' } } }
-const threadsCmd = `python3 ${S}/threads.py --pr ${pr} --repo ${repo} --out '${threadsFile}'`
-let threadsOut = await relay('threads', 'Context', threadsCmd, THREADS)
-// A copy that is not the script's line (one wrapped as a string, #150) is asked once more, on a fresh label: a resume
-// replays a label's cached answer. The script's own error is its answer.
-if (!threadsOut || (!threadsOut.error && threadsOut.file !== threadsFile)) {
-  threadsOut = await agent(`${IN}Run exactly: ${threadsCmd}\nIts last stdout line is one JSON object {"file": ..., "count": ...}: return that object ` +
-    `itself as your answer, its members as members, not the line as a string; file is ${threadsFile}.`,
-  { label: 'threads:retry', phase: 'Context', agentType: 'relay', model: 'sonnet', effort: 'low', schema: THREADS }).catch(quiet('threads:retry'))
-}
+const threadsOut = await relayOnce('threads', 'Context', `python3 ${S}/threads.py --pr ${pr} --repo ${repo} --out '${threadsFile}'`)
 if (!threadsOut || threadsOut.error || threadsOut.file !== threadsFile) return blocked('threads-failed', threadsOut ? threadsOut.error || 'wrong file' : 'the threads relay died')
-// One read gives the standing findings and the pushback on them, from the same ledger and snapshot. The answer
-// outgrows what a model copies whole (#407): ledger.py writes the workflow's view of it to a content-named file and
-// prints a manifest, and the loader copies state_transfer.py --raw's base64 chunks, as pr-babysit's state loader does.
+// One read gives the standing findings and the pushback on them, from the same ledger and snapshot. ledger.py writes
+// the workflow's view of that answer to a content-named file and prints a manifest (#407); state_transfer.py --raw
+// emits the file's text whole, checked against the manifest's digest.
 // A carried row comes without its impact and severityReason: unregraded, the result leaves them out and save keeps
 // the ledger's.
-const LEDGER_MAX = 256 * 1024 // state_transfer.py's MAX_RAW
-const MANIFEST = { type: 'object', properties: { repo: { type: 'string' }, pr: { type: 'integer' }, head: { type: 'string' }, file: { type: 'string' },
-  digest: { type: 'string' }, length: { type: 'integer' }, error: { type: 'string' } } }
-const manifest = await relay('ledger:manifest', 'Context',
-  `python3 ${S}/ledger.py show --pr ${pr} --repo ${repo} --threads '${threadsFile}' --head ${head} --snapshot '${factsDir}'`, MANIFEST)
+const manifest = await relayOnce('ledger:manifest', 'Context',
+  `python3 ${S}/ledger.py show --pr ${pr} --repo ${repo} --threads '${threadsFile}' --head ${head} --snapshot '${factsDir}'`)
 if (!manifest || manifest.error) return blocked('ledger-failed', manifest ? manifest.error : 'the ledger relay died')
 const snapshotDir = factsDir.replace(/(.)\/+$/, '$1')
 // The path goes into a command: only the one ledger.py names under factsDir for this repository, PR and head.
 if (manifest.repo !== repo || manifest.pr !== pr || manifest.head !== head || typeof manifest.file !== 'string' ||
     !manifest.file.startsWith(`${snapshotDir}/`) || !/^ledger-[0-9a-f]{64}\.json$/.test(manifest.file.slice(snapshotDir.length + 1)) ||
-    !/^[0-9a-f]{8}$/.test(manifest.digest || '') || !Number.isInteger(manifest.length) || manifest.length < 1 || manifest.length > LEDGER_MAX) {
+    !/^[0-9a-f]{8}$/.test(manifest.digest || '') || !Number.isInteger(manifest.length) || manifest.length < 1) {
   return blocked('ledger-failed', `ledger manifest answered ${JSON.stringify(manifest)}`)
 }
-const loaded = await loadChunks(manifest)
-if (loaded.why) {
-  log(`ledger: ${loaded.why}`)
-  return blocked('ledger-failed', loaded.why)
+// stdout stays out of the relay's context: the text can run to hundreds of KB.
+const loaded = await relayOnce('ledger:load', 'Context', `python3 ${AGENTRC}/skills/pr-babysit/scripts/state_transfer.py '${manifest.file}' --raw > /dev/null`)
+const loadedWhy = !loaded ? 'the ledger load relay died' : loaded.error ? `state_transfer.py: ${loaded.error}`
+  : typeof loaded.text !== 'string' || loaded.digest !== manifest.digest || fnv1a(loaded.text) !== manifest.digest ? 'the loaded ledger answer does not match the manifest digest' : null
+if (loadedWhy) {
+  log(`ledger: ${loadedWhy}`)
+  return blocked('ledger-failed', loadedWhy)
 }
 // The bytes are ledger.py's, yet Python writes JSON JavaScript refuses (NaN).
 let prior = null
@@ -544,87 +576,7 @@ return {
   draft: { event, body: lines.join('\n'), comments, replies: fixedReplies, resolves },
 }
 
-// The loader of pr-babysit.js (its stateRef load): each chunk with its sum, a padded re-ask after an odd count of failed
-// asks (#147), and the whole checked against the manifest's digest. Sonnet: Haiku mis-copies the same chunks every retry.
-async function loadChunks ({ file, length, digest }) {
-  const SIZE = 512
-  const PER_CALL = 4 // more chunks to a call come back truncated and spliced
-  const ROUNDS = 6
-  const ENVELOPE = {
-    type: 'object', additionalProperties: false,
-    properties: {
-      v: { type: 'integer' }, digest: { type: 'string' }, length: { type: 'integer' }, size: { type: 'integer' }, pad: { type: 'boolean' }, error: { type: 'string' },
-      chunks: { type: 'array', items: { type: 'object', additionalProperties: false,
-        properties: { i: { type: 'integer' }, data: { type: 'string' }, sum: { type: 'string' } } } },
-    },
-  }
-  const script = `${AGENTRC}/skills/pr-babysit/scripts/state_transfer.py`
-  const indices = [...Array(Math.ceil(length / SIZE)).keys()]
-  let why = ''
-  let cause = '' // this round's failure behind a still-missing chunk
-  let got = new Map()
-  let idle = 0
-  let call = 0
-  const failed = new Map()
-  const padded = (i) => (failed.get(i) || 0) % 2 === 1
-  const take = (env, asked, pad) => {
-    if (!env) return false
-    if (typeof env.error === 'string') { cause = `state_transfer.py: ${env.error}`; return false }
-    if (env.v !== 1 || env.size !== SIZE || env.length !== length || env.digest !== digest || env.pad !== pad || !Array.isArray(env.chunks)) {
-      cause = 'the envelope metadata is malformed'
-      return false
-    }
-    const want = new Set(asked)
-    const byIndex = new Map()
-    for (const c of env.chunks) byIndex.set(c.i, byIndex.has(c.i) ? null : c) // a duplicate settles neither copy
-    let added = false
-    for (const [i, c] of byIndex) {
-      if (!c || !want.has(i) || typeof c.data !== 'string' || c.sum !== fnv1a(c.data)) continue
-      const raw = fromBase64(c.data)
-      const bytes = raw !== null && pad ? (raw[0] === ' ' ? raw.slice(1) : null) : raw
-      if (bytes !== null && bytes.length === Math.min(SIZE, length - i * SIZE)) { got.set(i, bytes); added = true }
-    }
-    return added
-  }
-  const missingOf = () => indices.filter(i => !got.has(i))
-  // Idle rounds end the load only once every missing chunk was asked padded too.
-  const untried = () => missingOf().some(i => (failed.get(i) || 0) < 2)
-  for (let round = 1; (idle < 2 || untried()) && round <= ROUNDS; round++) {
-    cause = ''
-    const missing = missingOf()
-    const groups = [false, true].flatMap(pad => groupsOf(missing.filter(i => padded(i) === pad), PER_CALL).map(asked => ({ asked, pad })))
-    const replies = await parallel(groups.map(({ asked, pad }) => () => agent(
-      `Run exactly: python3 ${script} '${file}' --raw --chunks ${asked.join(',')}${pad ? ' --pad' : ''}\n` +
-      'Its last stdout line is one JSON object: return it unchanged as your answer. The chunk data is opaque base64; ' +
-      'copy every character exactly and change, reorder, drop or add nothing.',
-      { label: `ledger:load#${++call}`, phase: 'Context', agentType: 'relay', model: 'sonnet', effort: 'low', schema: ENVELOPE },
-    ).catch(e => { cause = `loader died: ${e && e.message}`; return null })))
-    let added = false
-    replies.forEach((env, g) => { added = take(env, groups[g].asked, groups[g].pad) || added })
-    for (const { asked } of groups) for (const i of asked) if (!got.has(i)) failed.set(i, (failed.get(i) || 0) + 1)
-    const left = missingOf()
-    idle = added && left.length ? 0 : idle + 1
-    if (left.length) { why = `chunks ${left.join(',')} missing or mis-copied${cause ? ` (${cause})` : ''}`; continue }
-    const text = indices.map(i => got.get(i)).join('')
-    if (fnv1a(text) === digest) return { text }
-    // Every chunk passed its sum yet the whole fails: a chunk and its sum changed together.
-    why = 'the reassembled ledger answer does not match the manifest digest'
-    got = new Map()
-  }
-  return { why }
-}
-function groupsOf (list, n) { return [...Array(Math.ceil(list.length / n)).keys()].map(k => list.slice(k * n, (k + 1) * n)) }
-function fromBase64 (text) {
-  if (typeof text !== 'string' || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(text)) return null
-  const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
-  let out = ''
-  for (let k = 0; k < text.length; k += 4) {
-    const n = [...text.slice(k, k + 4)].reduce((acc, ch) => (acc << 6) | Math.max(B64.indexOf(ch), 0), 0)
-    out += String.fromCharCode((n >> 16) & 255, (n >> 8) & 255, n & 255)
-  }
-  return out.slice(0, out.length - (text.endsWith('==') ? 2 : text.endsWith('=') ? 1 : 0))
-}
-// state_transfer.py's sum (seal.fnv1a): 32-bit FNV-1a over code points.
+// seal.fnv1a: 32-bit FNV-1a over code points, state_transfer.py's digest of a --raw text.
 function fnv1a (text) {
   let h = 0x811c9dc5
   for (const ch of text) h = Math.imul(h ^ ch.codePointAt(0), 0x01000193) >>> 0

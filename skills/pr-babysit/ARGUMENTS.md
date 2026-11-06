@@ -134,7 +134,8 @@ A key not listed here throws before anything runs.
 - `lane`: `both` (default) or `reviews`; `reviews` runs the review lane alone,
   needs `yieldAfterCycle` and never declares the PR done.
 - `state` or `stateRef: { outputFile, digest }`: a previous launch's state, or
-  the saved output holding it and its `stateDigest`, loaded as checksummed chunks.
+  the saved output holding it and its `stateDigest`, loaded whole from the file
+  `state_transfer.py` emits and checked against that digest.
   `launch_result.py`'s `stateRef` names a copy it keeps outside the Workflow
   task directory, so a host reset does not take the state with it. Nothing
   prunes those copies: one is needed only while a caller may continue from its

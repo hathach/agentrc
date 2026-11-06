@@ -1,12 +1,15 @@
-"""The seal pr-babysit checks a relayed fact line against, and the rate-limit facts beside a refused gh call.
+"""The seal pr-babysit checks a script's fact line against, the rate-limit facts beside a refused gh call, and the
+line's way to the workflow (emit).
 
-One copy for every script whose line a relay carries: pr-babysit's facts.py, ci-rerun's collect.py and
+One copy for every script whose line a relay runs: pr-babysit's facts.py, ci-rerun's collect.py and
 pr-reply's reply.py.
 """
 
 import json
+import os
 import re
 import subprocess
+import sys
 import time
 
 RATE_LIMITED = re.compile(r'rate limit|HTTP 429', re.I)
@@ -56,3 +59,43 @@ def sealed(facts):
     canonical JSON with null members left out, so a copy that drops one still matches."""
     # Top-level error stays out: a checked line has none, and a relay may fill in error: ''.
     return {**facts, 'seal': fnv1a(canonical({k: v for k, v in facts.items() if k != 'error'}))}
+
+
+# The exit status when the file AGENTRC_EMIT names cannot be claimed: a file there is an earlier run's, and this run
+# does nothing.
+EMIT_REFUSED = 3
+
+
+def claim():
+    """Claim the file AGENTRC_EMIT names before the script does anything: created empty with O_EXCL, so a rerun that
+    meets an earlier run's file, finished or cut short, exits EMIT_REFUSED at once with nothing done; popped, so no
+    child the script starts (a hook running these scripts) claims it too."""
+    path = os.environ.pop('AGENTRC_EMIT', None)
+    if not path:
+        return None, None
+    try:
+        return path, os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except OSError as e:
+        why = f'AGENTRC_EMIT {path}: {e.strerror}: nothing was run'
+        print(why, file=sys.stderr)
+        print(json.dumps({'error': why}))
+        sys.exit(EMIT_REFUSED)
+
+
+EMIT_TO, emit_fd = claim()
+
+
+def emit(line, code):
+    """Print line as the last stdout line and return code; under AGENTRC_EMIT also write it to the file claimed at
+    import, as a data module a workflow loads with workflow({scriptPath}) (`return {"emit": <that path>, "line":
+    line}`), so no model copies it. A claimed file a run leaves empty is one that died before its line."""
+    global emit_fd
+    text = json.dumps(line)
+    print(text)
+    if emit_fd is None:
+        return code
+    fd, emit_fd = emit_fd, None
+    with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as f:
+        f.write("export const meta = { name: 'emit', description: 'a script line' }\n"
+                f'return {{"emit": {json.dumps(EMIT_TO)}, "line": {text}}}\n')
+    return code

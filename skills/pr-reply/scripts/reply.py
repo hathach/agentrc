@@ -5,6 +5,7 @@
   reply.py --pr N --inspect COMMENT[:REPLY] [COMMENT[:REPLY] ...] [--repo OWNER/NAME]
   reply.py --pr N --reuse FILE [--repo OWNER/NAME] [--receipt PATH]
   reply.py --pr N --edit FILE [--repo OWNER/NAME] [--receipt PATH]
+  reply.py --pr N --manifest|--reuse|--edit FILE [--repo OWNER/NAME] --receipt PATH --replay-only
 
 FILE: {"replies": [{"commentId": <int>, "body": "<text>", "digest": "<fnv1a>",
 "secondAnswer": <bool>}, ...]}, digest being the caller's FNV-1a (32-bit, over code points, 8 hex) of the body,
@@ -88,7 +89,13 @@ the save fails, the line is printed with exit 2; PATH present, the saved line
 is printed and its code returned with no GitHub call, when PATH holds this
 request ({repo as given, pr, mode, entries}) and a line whose seal matches;
 anything else there exits 2. A run that dies or fails to save leaves no
-receipt, and its rerun reports only what it did itself.
+receipt, and its rerun reports only what it did itself. --replay-only prints
+that saved line and never runs the request: PATH absent, it exits 2 with no
+GitHub call, for a caller that must not post again (an earlier run that may
+still be running, or died between its receipt and its line).
+
+Under AGENTRC_EMIT the line is also written to the file it names, claimed before anything runs (exit 3 at once, nothing
+done, when that file is there): lib/seal.py's emit, which a workflow reads instead of a model's copy.
 """
 
 import argparse
@@ -102,7 +109,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import comment_digest  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
 import gh_repo  # noqa: E402
-from seal import RATE_LIMITED, fnv1a, sealed  # noqa: E402
+from seal import RATE_LIMITED, emit, fnv1a, sealed  # noqa: E402
 
 THREADS_QUERY = ('query($o:String!,$r:String!,$p:Int!,$c:String){repository(owner:$o,name:$r){'
                  'pullRequest(number:$p){reviewThreads(first:100,after:$c){pageInfo{hasNextPage endCursor}'
@@ -549,14 +556,14 @@ def saved_receipt(path, request):
 def failed(message, **members):
     """Exit 2 before anything is posted: a relay copies the last stdout line, and with none it improvises (#115)."""
     print(f'reply.py: {message}', file=sys.stderr)
-    print(json.dumps({'error': message, **members}))
-    return 2
+    return emit({'error': message, **members}, 2)
 
 
 class Parser(argparse.ArgumentParser):
     def error(self, message):
-        print(json.dumps({'error': f'usage: {message}'}))
-        super().error(message)
+        code = emit({'error': f'usage: {message}'}, 2)
+        self.print_usage(sys.stderr)
+        self.exit(code, f'{self.prog}: error: {message}\n')
 
 
 def main(argv=None):
@@ -570,6 +577,7 @@ def main(argv=None):
     p.add_argument('--repo', help="OWNER/NAME (default: the one GitHub repository the checkout's remotes name)")
     p.add_argument('--digest', metavar='TEXT', help='print the digest of TEXT and exit')
     p.add_argument('--receipt', metavar='PATH', help='replay the receipt saved at PATH, else save this run\'s there')
+    p.add_argument('--replay-only', action='store_true', help='replay the receipt saved at PATH; with none, run nothing')
     a = p.parse_args(argv)
     if a.digest is not None:
         print(fnv1a(a.digest))
@@ -578,6 +586,8 @@ def main(argv=None):
         p.error('--pr and one of --manifest, --inspect, --reuse or --edit are required')
     if a.receipt and a.inspect:
         p.error('--receipt is for --manifest, --reuse and --edit')
+    if a.replay_only and not a.receipt:
+        p.error('--replay-only needs --receipt')
     try:
         replies = load_entries(a.manifest, 'replies', 'manifest', check_reply) if a.manifest else None
         reuses = load_entries(a.reuse, 'reuses', 'reuse file', check_reuse) if a.reuse else None
@@ -588,8 +598,9 @@ def main(argv=None):
     except (OSError, ValueError, json.JSONDecodeError) as e:
         return failed(str(e))
     if saved:
-        print(json.dumps(saved[0]))
-        return saved[1]
+        return emit(saved[0], saved[1])
+    if a.replay_only:
+        return failed(f'no receipt saved at {a.receipt}: nothing was run')
     repo = a.repo
     if not repo:
         try:
@@ -602,8 +613,7 @@ def main(argv=None):
         return failed(str(e))
     if a.inspect:
         inspected = [inspect(poster, c, r) for c, r in a.inspect]
-        print(json.dumps(sealed({'inspected': inspected})))
-        return 0 if all(i['error'] is None for i in inspected) else 1
+        return emit(sealed({'inspected': inspected}), 0 if all(i['error'] is None for i in inspected) else 1)
     try:
         pending = poster.pending_review() if replies else None
     except ApiError as e:
@@ -629,8 +639,7 @@ def main(argv=None):
         except OSError as e:
             print(f'reply.py: receipt not saved: {e}', file=sys.stderr)
             code = 2
-    print(json.dumps(line))
-    return code
+    return emit(line, code)
 
 
 if __name__ == '__main__':

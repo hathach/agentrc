@@ -192,6 +192,60 @@ if (adoptReviewedProtected.some(e => new Set(e.paths).size !== e.paths.length)) 
 if (adoptReviewedProtected.length && args.adoptHead == null) throw new Error('adoptReviewedProtected goes with the adoptHead it was given for')
 const reviewedChange = (sha, f) => adoptReviewedProtected.some(e => e.sha === sha && e.paths.includes(f))
 
+// No model copies a script's line (#423, #443, #452): a relay runs the script with AGENTRC_EMIT naming a new file, the
+// script writes its line there as a data module (lib/seal.py's emit) and workflow() loads it; the relay answers only
+// the exit status. The files live in this launch's directory, fresh under the git common dir (facts.py emit-dir), one
+// name per call: its label, its count and its command's fnv1a, so a resume's replayed relays reload what they wrote and
+// an edited command never meets an older file.
+const FACTS_SCRIPT = `${AGENTRC}/skills/pr-babysit/scripts/facts.py`
+const EMIT = '<AGENTRC_EMIT>' // where a relay command takes its file
+const EMIT_REFUSED = 3 // lib/seal.py's
+const RAN = { type: 'object', additionalProperties: false, required: ['exit'], properties: { exit: { type: 'integer' }, error: { type: 'string' } } }
+const RETURN_EXIT = 'and answer only its exit status as exit, AGENTRC_EMIT kept exactly as written: the script writes its JSON line to that file, ' +
+  'where the workflow reads it. Only when it printed no JSON line at all, also give what went wrong as error, in its own words.'
+const EMIT_DIR = { type: 'object', additionalProperties: false, required: ['dir'], properties: { dir: { type: 'string' }, error: { type: 'string' } } }
+let emitDir = null
+// The one path a relay copies: a mis-copy names no directory a run wrote into (mkdtemp's name, never-overwritten files).
+// A trust boundary: nothing here proves the directory fresh or this launch's; an existing one handed back would replay
+// its files, whose self-naming and seals give consistency, not freshness.
+const emitDirOf = () => emitDir ??= agent(
+  `${IN_CHECKOUT}Editing and committing nothing, run exactly \`${PY} ${FACTS_SCRIPT} emit-dir\` and return the dir member of its last stdout line as dir, ` +
+  'character for character. If that line is {"error": ...}, or there is none, return its error, or what went wrong, as error, with dir = \'\'.',
+  { label: 'emit:dir', phase: 'Triage', agentType: 'relay', model: 'haiku', effort: 'low', schema: EMIT_DIR },
+).then(r => {
+  if (r && /^(?:[A-Za-z]:)?\/(?!\/)[^'\n]*\/agentrc-emit\/[A-Za-z0-9_]+$/.test(r.dir)) return r.dir
+  log(`emit:dir: no directory for the scripts' lines — ${r ? r.error || JSON.stringify(r.dir) : 'the relay died'}`)
+  return null
+}, e => { log(`emit:dir errored — ${e && e.message}`); return null })
+const emitCount = new Map()
+// One relay's run: { line } as its script wrote it, else { why }, dead when the relay died and left no line.
+const emitted = async (prompt, { label, ...opts }) => {
+  if (!prompt.includes(EMIT)) throw new Error(`${label}: its command names no ${EMIT}`)
+  const dir = await emitDirOf()
+  if (!dir) return { why: 'no directory for the line (facts.py emit-dir failed)' }
+  const name = label.replace(/[^A-Za-z0-9._-]/g, '_')
+  const n = (emitCount.get(name) || 0) + 1
+  emitCount.set(name, n)
+  const file = `${dir}/${name}.${n}.${fnv1a(prompt)}.js`
+  const ran = await agent(prompt.replace(EMIT, `AGENTRC_EMIT=${shq(file)} `), { label, ...opts, schema: RAN })
+    .catch(e => { log(`${label} errored — ${e && e.message}`); return null })
+  // A relay that died after its script wrote still leaves the line. A file there before the run (exit 3: the script
+  // ran nothing) is this call's own from an attempt a resume cut short: its line when it names this file, else that
+  // attempt's outcome is unknown, as a dead relay's.
+  const m = await workflow({ scriptPath: file }).catch(() => null)
+  const refused = !!ran && ran.exit === EMIT_REFUSED
+  if (m && m.emit === file && m.line && typeof m.line === 'object' && !Array.isArray(m.line)) {
+    if (refused) log(`${label}: the line an earlier attempt of this call wrote, reloaded`)
+    return { line: m.line }
+  }
+  if (refused) {
+    log(`${label}: an earlier attempt of this call claimed ${file} and left no line of it — its outcome is unknown`)
+    return { dead: true, why: 'an earlier attempt left no line: its outcome is unknown' }
+  }
+  return { dead: !m && !ran, why: m ? `${file} holds no line written for it` : !ran ? 'the relay died'
+    : `the script wrote no line (exit ${ran.exit})${ran.error ? `: ${ran.error}` : ''}` }
+}
+
 if (args.state != null && args.stateRef != null) throw new Error('pass state or stateRef, not both')
 const STATE_SCRIPT = `${AGENTRC}/skills/pr-babysit/scripts/state_transfer.py`
 // state_transfer.py's MAX, over its own measure: compact JSON with every non-ASCII UTF-16 unit escaped as \uXXXX.
@@ -206,78 +260,21 @@ if (args.stateRef != null) {
       !/^[0-9a-f]{8}$/.test(ref.digest || '')) {
     throw new Error('stateRef must be { outputFile: a plain absolute path ([A-Za-z0-9._ /-], no leading //), digest: the result\'s 8-hex stateDigest }')
   }
-  // A model copying text "corrects" it, so the loader copies state_transfer.py's base64 chunks, each with a sum, and the seal checks the whole. Sonnet: Haiku mis-copies the same chunks on every retry.
-  const SIZE = 512
-  const PER_CALL = 4 // more chunks to a call come back truncated and spliced
-  const ROUNDS = 6
-  const ENVELOPE = {
-    type: 'object', additionalProperties: false,
-    properties: {
-      v: { type: 'integer' }, digest: { type: 'string' }, length: { type: 'integer' }, size: { type: 'integer' }, pad: { type: 'boolean' }, error: { type: 'string' },
-      chunks: { type: 'array', items: { type: 'object', additionalProperties: false,
-        properties: { i: { type: 'integer' }, data: { type: 'string' }, sum: { type: 'string' } } } },
-    },
-  }
-  let why = ''
-  let cause = '' // this round's failure behind a still-missing chunk
-  let length = 0
-  let got = new Map()
-  let idle = 0
-  let call = 0
-  // Asks each chunk has failed: a re-ask after an odd count goes padded (#147), so a deterministic mis-copy reads other text.
-  const failed = new Map()
-  const padded = (i) => (failed.get(i) || 0) % 2 === 1
-  const reset = (reason) => { why = reason; length = 0; got = new Map() }
-  const fresh = (env) => env.v === 1 && env.size === SIZE && Number.isInteger(env.length) && env.length > 0 && env.length <= STATE_MAX &&
-    env.digest === ref.digest && Array.isArray(env.chunks)
-  const take = (env, asked, pad) => {
-    if (!env) return false
-    if (typeof env.error === 'string') { cause = `state_transfer.py: ${env.error}`; return false }
-    if (!fresh(env) || env.pad !== pad) { cause = 'the envelope metadata is malformed'; return false }
-    if (length && env.length !== length) { cause = 'the envelope length changed'; reset(cause); return false }
-    length = env.length
-    const want = new Set(asked || indices().slice(0, PER_CALL))
-    const byIndex = new Map()
-    for (const c of env.chunks) byIndex.set(c.i, byIndex.has(c.i) ? null : c) // a duplicate settles neither copy
-    let added = false
-    for (const [i, c] of byIndex) {
-      if (!c || !want.has(i) || typeof c.data !== 'string' || c.sum !== fnv1a(c.data)) continue
-      const raw = fromBase64(c.data)
-      const bytes = raw !== null && pad ? (raw[0] === ' ' ? raw.slice(1) : null) : raw
-      if (bytes !== null && bytes.length === Math.min(SIZE, length - i * SIZE)) { got.set(i, bytes); added = true }
-    }
-    return added
-  }
-  const indices = () => [...Array(Math.ceil(length / SIZE)).keys()]
-  const missingOf = () => indices().filter(i => !got.has(i))
-  // Idle rounds end the load only once every missing chunk was asked padded too.
-  const untried = () => length > 0 && missingOf().some(i => (failed.get(i) || 0) < 2)
-  for (let round = 1; args.state == null && (idle < 2 || untried()) && round <= ROUNDS; round++) {
-    cause = ''
-    const missing = length ? missingOf() : null
-    const groups = missing ? [false, true].flatMap(pad => groupsOf(missing.filter(i => padded(i) === pad), PER_CALL).map(asked => ({ asked, pad })))
-      : [{ asked: null, pad: false }]
-    const replies = await parallel(groups.map(({ asked, pad }) => () => agent(
-      `Run exactly: ${PY} ${STATE_SCRIPT} '${file}'${asked ? ` --chunks ${asked.join(',')}${pad ? ' --pad' : ''}` : ''}\n` +
-      'Its last stdout line is one JSON object: return it unchanged as your answer. The chunk data is opaque base64; ' +
-      'copy every character exactly and change, reorder, drop or add nothing.',
-      { label: `state:load#${++call}`, agentType: 'relay', model: 'sonnet', effort: 'low', schema: ENVELOPE },
-    ).catch(e => { cause = `loader died: ${e && e.message}`; return null })))
-    let added = false
-    replies.forEach((env, g) => { added = take(env, groups[g].asked, groups[g].pad) || added })
-    for (const { asked } of groups) for (const i of asked || indices().slice(0, PER_CALL)) if (!got.has(i)) failed.set(i, (failed.get(i) || 0) + 1)
-    const left = missingOf()
-    idle = added && left.length ? 0 : idle + 1
-    if (!length || left.length) { why = length ? `chunks ${left.join(',')} missing or mis-copied${cause ? ` (${cause})` : ''}` : cause || why; continue }
-    let st = null
-    try { st = JSON.parse(indices().map(i => got.get(i)).join('')) } catch {}
-    if (st && st.digest === ref.digest && sealOf(st) === ref.digest) { args.state = st; break }
-    // Every chunk passed its sum yet the whole fails: a chunk and its sum changed together.
-    reset('the reassembled state does not match stateRef.digest')
-  }
-  if (args.state == null) {
-    log(`state: ${why}; the output file is untouched`)
-    return { pass: false, status: 'blocked', reason: 'state-transfer-failed', detail: why, stateRef: ref }
+  // state_transfer.py emits the saved state whole; stdout stays out of the relay's context. Read-only: a load that
+  // brought no state back, short of the script's own error, gets one fresh attempt.
+  const load = (label) => emitted(`${IN_CHECKOUT}Editing nothing, run exactly \`${EMIT}${PY} ${STATE_SCRIPT} '${file}' > /dev/null\` ${RETURN_EXIT}`,
+    { label, phase: 'Triage', agentType: 'relay', model: 'haiku', effort: 'low' })
+  const stateOf = ({ line }) => line && !line.error && line.digest === ref.digest && line.state && typeof line.state === 'object' &&
+    line.state.digest === ref.digest && sealOf(line.state) === ref.digest ? line.state : null
+  let got = await load('state:load')
+  if (!stateOf(got) && !(got.line && got.line.error)) got = await load('state:load.retry')
+  const { line, why } = got
+  const st = stateOf(got)
+  if (st) args.state = st
+  else {
+    const detail = !line ? why : line.error ? `state_transfer.py: ${line.error}` : 'the loaded state does not match stateRef.digest'
+    log(`state: ${detail}; the output file is untouched`)
+    return { pass: false, status: 'blocked', reason: 'state-transfer-failed', detail, stateRef: ref }
   }
 }
 // CI knowledge per head, so a relaunch neither re-reads nor re-judges: re-runs (sure false for a lost judge) and each run link's verdict digest; verdicts live in collect.py's store. placedWith = `<ciNotes digest>:<base job>` an unclassified verdict was judged with.
@@ -388,7 +385,7 @@ const REQUIRED_CHECK = {
   properties: { context: { type: 'string' }, app: { type: 'integer' }, state: { type: 'string' }, bucket: { enum: ['pass', 'pending', 'fail', 'missing'] } },
 }
 // collect.py's CONTRACT: the members its lines hold, which these schemas read. A line of another is a collector older or newer
-// than this workflow copy, whose relayed copy can never pass its seal: told apart before the seal (#293).
+// than this workflow copy, whose line its schema may not fit: told apart before the seal and the shape (#293).
 const COLLECT_CONTRACT = 1
 const collectorLine = (schema) => withSeal({ ...schema, required: [...schema.required, 'contract'], properties: { ...schema.properties, contract: { type: 'integer' } } })
 const INVENTORY = collectorLine({
@@ -658,7 +655,7 @@ const COMMIT = withSeal({
   required: ['committed', 'detail'],
   properties: { error: { type: 'string' }, committed: { type: 'boolean' }, detail: { type: 'string' } },
 })
-// commits.py's saved commit line, read back when the committer's copy was lost (#266).
+// commits.py's saved commit line, read back when the committer's line was lost or failed its seal (#266).
 const COMMIT_RECEIPT = withSeal({
   type: 'object', additionalProperties: false,
   required: ['request', 'parent', 'scope', 'committed', 'detail', 'sha'],
@@ -735,40 +732,30 @@ const BUILD_SCRIPT = `${AGENTRC}/skills/pr-babysit/scripts/build.py`
 const SCOPE_SCRIPT = `${AGENTRC}/skills/pr-babysit/scripts/scope_check.py`
 const COLLECT_SCRIPT = `${AGENTRC}/skills/ci-rerun/scripts/collect.py`
 // The preflight checks each is installed: a session's cached workflow definition can outlive a script it calls (#38).
-const NEEDED = [REPLY_SCRIPT, HOOKS_SCRIPT, COMMITS_SCRIPT, PUSH_SCRIPT, SONAR_SCRIPT, CRTRIGGER_SCRIPT, GTRIGGER_SCRIPT, HARVEST_SCRIPT, BUILD_SCRIPT, SCOPE_SCRIPT, COLLECT_SCRIPT, STATE_SCRIPT]
+const NEEDED = [REPLY_SCRIPT, HOOKS_SCRIPT, COMMITS_SCRIPT, PUSH_SCRIPT, SONAR_SCRIPT, CRTRIGGER_SCRIPT, GTRIGGER_SCRIPT, HARVEST_SCRIPT, BUILD_SCRIPT, SCOPE_SCRIPT, COLLECT_SCRIPT, STATE_SCRIPT, FACTS_SCRIPT]
 function shq (s) { return `'${String(s).replace(/'/g, `'\\''`)}'` }
-const relayed = (schema) => {
-  const EMPTY = { boolean: 'false', string: "''", array: '[]', integer: '0' }
-  const empty = schema.required.map(k => {
-    const type = schema.properties[k].type
-    if (nullable(schema.properties[k])) return `${k} = null`
-    if (!(type in EMPTY)) throw new Error(`relayed: no empty value for ${k}`)
-    return `${k} = ${EMPTY[type]}`
-  })
-  // #33: a Haiku copy of a line without error once wrote `"error": ,` five times over.
-  return 'and return the JSON object on its last stdout line unchanged; a line without error gets no error member. ' +
-    `If that line is {"error": ...}, or there is none, return its error, or what went wrong, as error, with ${empty.join(', ')}.`
-}
-// A relay copy must hold every member its script prints, a null one too: an optional one lets a copy drop a real value (#47, #50).
-// Only what a schema names in `nullsOmitted`, members its script leaves out when null, may be missing; one that is comes back null.
+// The workflow's own check of a script's line against its schema: a member its schema allows null may be left out (a
+// script drops a null one) and reads null; an error line's other required members read empty.
 const nullable = (p) => !!p && Array.isArray(p.type) && p.type.includes('null')
-const lenient = (s) => {
-  if (!s || typeof s !== 'object') return s
-  const { nullsOmitted, ...out } = s
-  if (s.properties) {
-    out.properties = Object.fromEntries(Object.entries(s.properties).map(([k, p]) => [k, lenient(p)]))
-    if (s.required && nullsOmitted) out.required = s.required.filter(k => !nullsOmitted.includes(k))
+const EMPTY = { boolean: () => false, string: () => '', array: () => [], integer: () => 0 }
+const isType = (t, v) => t === 'null' ? v === null : t === 'array' ? Array.isArray(v) : t === 'integer' ? Number.isInteger(v)
+  : t === 'object' ? !!v && typeof v === 'object' && !Array.isArray(v) : typeof v === t
+const shape = (s, v, at = 'line') => {
+  const off = (why) => { throw new Error(`${at} ${why}`) }
+  if (s.type !== undefined && ![].concat(s.type).some(t => isType(t, v))) off(`is ${JSON.stringify(v)}`)
+  if (s.enum && !s.enum.includes(v)) off(`is ${JSON.stringify(v)}`)
+  if (Array.isArray(v)) {
+    if (v.length < (s.minItems ?? 0) || v.length > (s.maxItems ?? Infinity)) off(`has ${v.length} items`)
+    return s.items ? v.map((x, i) => shape(s.items, x, `${at}[${i}]`)) : v
   }
-  if (s.items) out.items = lenient(s.items)
-  return out
-}
-const withNulls = (s, v) => {
-  if (Array.isArray(v)) return s && s.items ? v.map(x => withNulls(s.items, x)) : v
-  if (!v || typeof v !== 'object' || !s || !s.properties) return v
+  if (!v || typeof v !== 'object' || !s.properties) return v
   const out = { ...v }
   for (const [k, p] of Object.entries(s.properties)) {
-    if (k in out) out[k] = withNulls(p, out[k])
-    else if (nullable(p) && (s.required || []).includes(k)) out[k] = null
+    if (k in out) out[k] = shape(p, out[k], `${at}.${k}`)
+    else if (!(s.required || []).includes(k)) continue
+    else if (nullable(p)) out[k] = null
+    else if (at === 'line' && typeof v.error === 'string' && p.type in EMPTY) out[k] = EMPTY[p.type]()
+    else off(`has no ${k}`)
   }
   return out
 }
@@ -778,75 +765,81 @@ let githubLimit = null
 // review lane meets ends that wait at its next poll, not at the slice's end. The collector's own limit ends it already.
 let ciStopFile = null
 let ciStopSent = null
-const STOPPED = { type: 'object', additionalProperties: false, required: ['stopped'], properties: { stopped: { type: 'boolean' }, error: { type: 'string' } } }
 const noteLimit = (limit, from = '') => {
   if (githubLimit) return
   githubLimit = limit
   if (!ciStopFile || from.startsWith('ci:')) return
-  ciStopSent = relayRun(
-    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`touch -- ${shq(ciStopFile)} && echo '{"stopped": true}'\` ` + relayed(STOPPED),
-    { label: 'stop:ci', phase: 'Triage', model: 'haiku', effort: 'low', schema: STOPPED },
-  )
+  ciStopSent = agent(
+    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`touch -- ${shq(ciStopFile)}\` and answer its exit status as exit.`,
+    { label: 'stop:ci', phase: 'Triage', agentType: 'relay', model: 'haiku', effort: 'low', schema: RAN },
+  ).catch(quiet('stop:ci'))
 }
-// A copy that fails its script's seal is no answer; an error line carries no seal.
+// A line off its schema, of another collect.py contract or failing its seal is no answer; an error line carries no seal.
 // The Bash-only relay type carries no skill index; fileTool keeps the default subagent for a prompt that writes with a file tool.
-const relayAgent = async (prompt, { fileTool, contract, ...opts }) => {
-  const v = await agent(prompt, { ...(fileTool ? {} : { agentType: 'relay' }), ...opts, schema: lenient(opts.schema) }).then(x => x && withNulls(opts.schema, x))
-  // Before the seal, which a line of another contract never matches however often it is copied (#293).
-  if (v && !v.error && contract !== undefined && v.contract !== contract) {
-    return { ...v, skew: true, error: `collect.py prints output contract ${v.contract}, and this launch's workflow script reads ${contract}: ` +
+const relayAgent = async (prompt, { fileTool, contract, schema, ...opts }) => {
+  const { line, why, dead } = await emitted(prompt, { ...(fileTool ? {} : { agentType: 'relay' }), ...opts })
+  if (dead) return null
+  // Before the seal and the shape, which a line of another contract never meets (#293).
+  if (line && !line.error && contract !== undefined && line.contract !== contract) {
+    return { ...shape(schema, { error: '' }), skew: true, error: `collect.py prints output contract ${line.contract ?? 0}, and this launch's workflow script reads ${contract}: ` +
       'the launch runs a workflow copy older or newer than the installed collector. Relaunch from the installed file (Workflow ' +
       'scriptPath "${AGENTRC_DIR:-$HOME/.claude}/workflows/pr-babysit.js", expanded in the shell first), in a fresh session after an agentrc update; no retry clears it' }
   }
-  if (v && !v.error && opts.schema.properties.seal && !sealMatches(v)) {
-    log(`${opts.label}: the relayed copy does not match its seal`)
-    // Bounded: the copy can carry a whole hook log (#266).
-    const copy = JSON.stringify(v)
-    log(`${opts.label}: the rejected copy: ${copy.length > 600 ? `${copy.slice(0, 600)}… (${copy.length} characters)` : copy}`)
+  if (line && !line.error && schema.properties.seal && !sealMatches(line)) {
+    // Bounded: the line can carry a whole hook log (#266).
+    const text = JSON.stringify(line)
+    log(`${opts.label}: the line does not match its seal: ${text.length > 600 ? `${text.slice(0, 600)}… (${text.length} characters)` : text}`)
     return null
   }
-  if (v && v.rateLimit) noteLimit({ error: v.error, ...v.rateLimit }, opts.label)
-  return v
+  let v
+  try { v = shape(schema, line ?? { error: why }) } catch (e) {
+    log(`${opts.label}: the script's line is off its schema — ${e.message}`)
+    return null
+  }
+  if (v.rateLimit) noteLimit({ error: v.error, ...v.rateLimit }, opts.label)
+  // No line of the script's: its error is the transport's, which a caller tells from one the script printed.
+  return line ? v : { ...v, transport: true }
 }
-// A dead or unsealed relay gets one fresh Sonnet agent (Haiku mis-copies a long line); only for a script safe to run twice.
 const quiet = (label) => (e) => { log(`${label} errored — ${e && e.message}`); return null }
 const relayRun = (prompt, opts) => relayAgent(prompt, opts).catch(quiet(opts.label))
-// A recovery is logged: a lone mismatch line reads as an open failure (#50).
+// A read-only relay that brought no line back gets one fresh attempt, its own file; a recovery is logged: a lone
+// failure line reads as an open one (#50). A writer's relay gets none: reply and sonar rely on a later ask replaying
+// their receipt (#53, #55), a push on pushExact's read-back, a commit on its receipt.
 const relayRetry = async (prompt, opts) => {
-  const r = await relayRun(prompt, { ...opts, label: `${opts.label}.retry`, model: 'sonnet' })
-  if (r && !r.error) log(`${opts.label}: relay recovered on the Sonnet retry`)
+  const r = await relayRun(prompt, { ...opts, label: `${opts.label}.retry` })
+  if (r && !r.error) log(`${opts.label}: relay recovered on the retry`)
   return r
 }
 const relayOnce = async (prompt, opts, retryPrompt = prompt) => (await relayRun(prompt, opts)) ?? relayRetry(retryPrompt, opts)
 const settles = (r) => r.verified === true && r.replyId !== null &&
   (r.kind === 'issue' || r.kind === 'review-body' || (r.kind === 'review' && r.resolved === true))
-// A rerun is safe: reply.py reuses a reply of ours rather than post again. The retry replays the first run's
-// saved receipt instead, so a reply that run posted is not reported as found there (#53).
-const runReplyScript = (label, mode, task, rules, payload) => relayOnce(
-  `${IN_CHECKOUT}${task}: write exactly this JSON to a new temporary file, a name without quotes, and run ` +
-  `\`${PY} ${REPLY_SCRIPT} --pr ${args.pr} --repo ${shq(repo)} --${mode} '<that file>' --receipt ${shq(`${pinned.receipts.trim()}/${label}.json`)}\`, then return its last stdout line unchanged: every member it prints, a null one too, and none it leaves out. ` +
-  'If that line is {"error": ...}, or there is none, return its error, or what went wrong, as error, with receipts = [], seal = \'\', and its pendingReview member when it has one. ' +
-  rules + payload,
-  { label, phase: 'Push', model: 'haiku', schema: RECEIPTS },
-).then(out => {
-  // reply.py names a rate limit only in error text: the line's, or a sealed receipt's when it struck mid-batch.
-  const said = !out ? undefined : (out.error ? [out.error] : out.receipts.map(r => r.error)).find(e => e && /rate limit|HTTP 429/i.test(e))
-  if (said) noteLimit({ error: `reply.py: ${said}`, observedAt: null, resetAt: null, secondary: /secondary/i.test(said) })
-  if (out && out.error && out.pendingReview && !pendingReview) pendingReview = { review: out.pendingReview.id, login: out.pendingReview.login, detail: out.error }
-  return out
-})
+// A rerun is safe: reply.py reuses a reply of ours rather than post again, and a rerun of the same request replays
+// the first run's saved receipt instead, so a reply that run posted is not reported as found there (#53).
+const runReplyScript = (label, mode, task, rules, payload) => {
+  const run = (as, what, only = '') => relayRun(
+    `${IN_CHECKOUT}${what}: write exactly this JSON to a new temporary file, a name without quotes, and run ` +
+    `\`${EMIT}${PY} ${REPLY_SCRIPT} --pr ${args.pr} --repo ${shq(repo)} --${mode} '<that file>' --receipt ${shq(`${pinned.receipts.trim()}/${label}.json`)}${only}\`, ` +
+    `${RETURN_EXIT} ${rules}${payload}`,
+    { label: as, phase: 'Push', model: 'haiku', schema: RECEIPTS },
+  )
+  // A run that brought no line of reply.py's back (a resume meeting its empty claim, a dead relay, a line off its seal,
+  // a script that died after posting) may have posted and saved its receipt first: --replay-only reads that receipt
+  // back and never posts; with none the outcome stays unknown (#53). A line reply.py printed, its error too, is its own.
+  const replayed = async () => {
+    const r = await run(`${label}.replay`, `${task}, only from the receipt an earlier run saved`, ' --replay-only')
+    if (r && !r.error) { log(`${label}: recovered from reply.py's saved receipt`); return r }
+    return null
+  }
+  return run(label, task).then(async out => out && !out.transport ? out : (await replayed()) ?? out).then(out => {
+    // reply.py names a rate limit only in error text: the line's, or a sealed receipt's when it struck mid-batch.
+    const said = !out ? undefined : (out.error ? [out.error] : out.receipts.map(r => r.error)).find(e => e && /rate limit|HTTP 429/i.test(e))
+    if (said) noteLimit({ error: `reply.py: ${said}`, observedAt: null, resetAt: null, secondary: /secondary/i.test(said) })
+    if (out && out.error && out.pendingReview && !pendingReview) pendingReview = { review: out.pendingReview.id, login: out.pendingReview.login, detail: out.error }
+    return out
+  })
+}
 // The posting account's pending review, which GitHub refuses every review reply beside (#321): a human submits or deletes it.
 let pendingReview = null
-function fromBase64 (text) {
-  if (typeof text !== 'string' || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(text)) return null
-  const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
-  let out = ''
-  for (let k = 0; k < text.length; k += 4) {
-    const n = [...text.slice(k, k + 4)].reduce((acc, ch) => (acc << 6) | Math.max(B64.indexOf(ch), 0), 0)
-    out += String.fromCharCode((n >> 16) & 255, (n >> 8) & 255, n & 255)
-  }
-  return out.slice(0, out.length - (text.endsWith('==') ? 2 : text.endsWith('=') ? 1 : 0))
-}
 // Same function as reply.py: the body's checksum rides in the manifest and its receipt.
 function fnv1a (text) {
   let h = 0x811c9dc5
@@ -864,7 +857,6 @@ const RECEIPTS = withSeal({
       items: {
         type: 'object', additionalProperties: false,
         required: ['commentId', 'kind', 'replyId', 'digest', 'sent', 'posted', 'verified', 'resolved', 'error'],
-        nullsOmitted: ['resolved', 'error'],
         properties: {
           commentId: { type: 'integer' }, kind: { type: ['string', 'null'] }, replyId: { type: ['integer', 'null'] },
           digest: { type: 'string' }, sent: { type: 'boolean' }, posted: { type: 'boolean' }, verified: { type: ['boolean', 'null'] }, resolved: { type: ['boolean', 'null'] },
@@ -1365,12 +1357,12 @@ const buildCheck = async (tag, owned) => {
   if (plan.command === null) { log(`build#${tag}: no build applies — ${plan.reason}`); return null }
   // --flag=value throughout: a value such as -DBOARD=x must not read as a flag.
   const r = await relayRun(
-    `${IN_CHECKOUT}From the checkout's top level, editing nothing, run exactly \`${PY} ${BUILD_SCRIPT}${owned.map(f => ` --path=${shq(f)}`).join('')} --command=${shq(plan.command)}` +
+    `${IN_CHECKOUT}From the checkout's top level, editing nothing, run exactly \`${EMIT}${PY} ${BUILD_SCRIPT}${owned.map(f => ` --path=${shq(f)}`).join('')} --command=${shq(plan.command)}` +
     `${plan.setup ? ` --setup=${shq(plan.setup)}` : ''}${plan.requires.map(t => ` --require=${shq(t)}`).join('')}\` ` +
-    relayed(BUILD_RUN),
+    RETURN_EXIT,
     { label: `build#${tag}`, phase: 'Fix', model: 'haiku', effort: 'low', schema: BUILD_RUN },
   )
-  const why = !r ? 'no sealed receipt (the relay died or its copy failed its seal)' : r.error ? r.error
+  const why = !r ? 'no sealed receipt (the relay died or its line failed its seal)' : r.error ? r.error
     : r.revision !== expectedHead ? `the receipt is for ${String(r.revision).slice(0, 7)}, not ${expectedHead.slice(0, 7)}`
     : r.command !== plan.command.replaceAll('<BUILD>', r.buildDir) ? 'the receipt is for another command'
     : !['setup', 'prerequisite', 'build'].includes(r.stage) ? `the receipt names no step it stopped in (${JSON.stringify(r.stage)})`
@@ -1437,8 +1429,8 @@ const fixAndVerify = async (workIn, tag, rejectable = false) => {
   const plain = candidates.filter(f => !refusal.has(f))
   if (plain.length > 0) {
     const v = await relayRun(
-      `${IN_CHECKOUT}From the checkout's top level, editing nothing, run exactly \`${PY} ${SCOPE_SCRIPT}${plain.map(f => ` --path=${shq(f)}`).join('')}\` ` +
-      relayed(SCOPE_CHECK),
+      `${IN_CHECKOUT}From the checkout's top level, editing nothing, run exactly \`${EMIT}${PY} ${SCOPE_SCRIPT}${plain.map(f => ` --path=${shq(f)}`).join('')}\` ` +
+      RETURN_EXIT,
       { label: 'scope:check', phase: 'Fix', model: 'haiku', effort: 'low', schema: SCOPE_CHECK },
     )
     const usable = v && !v.error
@@ -1651,7 +1643,7 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
   }
   // Identity is an exact SHA, never a count.
   const now = await relayOnce(
-    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`${PY} ${PREFLIGHT_SCRIPT} --recheck\` ` + relayed(RECHECK),
+    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`${EMIT}${PY} ${PREFLIGHT_SCRIPT} --recheck\` ` + RETURN_EXIT,
     { label: `recheck#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low', schema: RECHECK },
   )
   if (!now) return { pass: false, committed: false, detail: 'recheck agent died', sha: '' }
@@ -1679,10 +1671,10 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
   // A required hook may regenerate files outside the scope: run the hooks first and admit only what appeared after they reported changes, the checked files unchanged; the committer never picks a path.
   const quoted = checked.map(shq).join(' ')
   const hooks = await relayRun(
-    `${IN_CHECKOUT}Editing nothing by hand, from the checkout's top level run exactly \`${PY} ${HOOKS_SCRIPT} ${quoted}\` ` +
+    `${IN_CHECKOUT}Editing nothing by hand, from the checkout's top level run exactly \`${EMIT}${PY} ${HOOKS_SCRIPT} ${quoted}\` ` +
     // A repository's hooks may run its whole test suite: hooks.py stops them before this limit (#140).
     `in the foreground with a Bash timeout of 600000 ms, the tool's maximum, ` +
-    relayed(HOOKS),
+    RETURN_EXIT,
     { label: `hooks#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low', schema: HOOKS },
   )
   if (!hooks) return { pass: false, committed: false, detail: 'hook agent died', sha: '' }
@@ -1764,10 +1756,10 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
     `The fixes: ${JSON.stringify(brief.claims)}; read \`git --literal-pathspecs diff -- ${scope.map(shq).join(' ')}\` for what changed. ` +
     // A file, not a here-document: no delimiter can collide with the message.
     // An installed pre-commit hook runs again on the commit: the hooks excused above stay excused there, the others run.
-    `Then run exactly \`${PY} ${COMMITS_SCRIPT} commit ${skipIds.length ? `--skip-hooks ${shq(skipIds.join(','))} ` : ''}--receipt ${receiptFile} --request ${shq(commitLabel)} ${scope.map(shq).join(' ')} < '<that file>'; rm -f '<that file>'\` ` +
+    `Then run exactly \`${EMIT}${PY} ${COMMITS_SCRIPT} commit ${skipIds.length ? `--skip-hooks ${shq(skipIds.join(','))} ` : ''}--receipt ${receiptFile} --request ${shq(commitLabel)} ${scope.map(shq).join(' ')} < '<that file>'; rm -f '<that file>'\` ` +
     'in the foreground with a Bash timeout of 600000 ms, the tool\'s maximum: an installed pre-commit hook runs again on the commit. ' +
     'Do not push. Change nothing else, and never add a file a hook touched and retry. ' +
-    relayed(COMMIT),
+    RETURN_EXIT,
     { label: commitLabel, phase: 'Push', model: 'haiku', effort: 'low', schema: COMMIT, fileTool: true },
   )
   // A lost or error copy is recovered from the script's own receipt, never by a second commit; with none, the HEAD read-back settles it, else committed stays null.
@@ -1781,8 +1773,8 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
   if (!lost && !said.committed) return { pass: false, committed: false, detail: said.detail || 'no commit was created', sha: '' }
 
   const seen = await relayOnce(
-    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`${PY} ${COMMITS_SCRIPT} head --parent ${expectedHead} ${scope.map(shq).join(' ')}\` ` +
-    relayed(AUDIT),
+    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`${EMIT}${PY} ${COMMITS_SCRIPT} head --parent ${expectedHead} ${scope.map(shq).join(' ')}\` ` +
+    RETURN_EXIT,
     { label: `audit#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low', schema: AUDIT },
   )
   const sha = seen ? seen.sha.trim() : ''
@@ -1826,11 +1818,11 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
   return { ...push, committed: true, sha, ...(generatedPaths.length ? { generated: generatedPaths } : {}) }
 }
 
-// Read-only, so a lost copy gets the usual fresh agent; a receipt bound to another request, parent or scope is none.
+// Read-only; a receipt bound to another request, parent or scope is none.
 const readCommitReceipt = async (label, file, scope) => {
   const r = await relayOnce(
-    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`${PY} ${COMMITS_SCRIPT} receipt ${file} --request ${shq(label)} --parent ${expectedHead} ${scope.map(shq).join(' ')}\` ` +
-    relayed(COMMIT_RECEIPT),
+    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`${EMIT}${PY} ${COMMITS_SCRIPT} receipt ${file} --request ${shq(label)} --parent ${expectedHead} ${scope.map(shq).join(' ')}\` ` +
+    RETURN_EXIT,
     { label: `receipt:${label}`, phase: 'Push', model: 'haiku', effort: 'low', schema: COMMIT_RECEIPT },
   )
   const why = !r ? 'the read-back agent died' : r.error ? r.error
@@ -1843,9 +1835,9 @@ const readCommitReceipt = async (label, file, scope) => {
 // Push one audited SHA, never the branch. Landed only when every pinned URL (and the PR, for an adoption) reads it back; failed only when every URL answered without it; else unknown. null when the agent died.
 const pushExact = async (sha, label, prToo = false) => {
   const prompt = `${IN_CHECKOUT}Committing, amending and forcing nothing, run exactly ` +
-    `\`${PY} ${PUSH_SCRIPT} --remote '${pinned.remote.trim()}' --branch '${pinned.prBranch.trim()}' --sha ${sha} ` +
+    `\`${EMIT}${PY} ${PUSH_SCRIPT} --remote '${pinned.remote.trim()}' --branch '${pinned.prBranch.trim()}' --sha ${sha} ` +
     `${pinned.pushUrls.map(u => `--push-url '${u}'`).join(' ')} --open-pr ${args.pr}${prToo ? ` --pr ${args.pr}` : ''} --repo ${shq(repo)}\` ` +
-    relayed(PUSH)
+    RETURN_EXIT
   const opts = { label, phase: 'Push', model: 'haiku', effort: 'low', schema: PUSH }
   // A retry finds a push that landed; it cannot prove one did not.
   const first = await relayRun(prompt, opts)
@@ -1875,7 +1867,7 @@ const pushExact = async (sha, label, prToo = false) => {
 
 const PR_STATE = withSeal({ type: 'object', additionalProperties: false, required: ['state'], properties: { error: { type: 'string' }, state: { type: 'string' } } })
 const readPrState = async (tag) => {
-  const r = await relayOnce(`${IN_CHECKOUT}Editing and committing nothing, run exactly \`${PY} ${PREFLIGHT_SCRIPT} --state ${args.pr} --repo ${shq(repo)}\` ` + relayed(PR_STATE),
+  const r = await relayOnce(`${IN_CHECKOUT}Editing and committing nothing, run exactly \`${EMIT}${PY} ${PREFLIGHT_SCRIPT} --state ${args.pr} --repo ${shq(repo)}\` ` + RETURN_EXIT,
     { label: `prstate#${tag}`, phase: 'Triage', model: 'haiku', effort: 'low', schema: PR_STATE })
   if (!r || r.error || !['OPEN', 'MERGED', 'CLOSED'].includes(r.state)) log(`prstate#${tag}: PR #${args.pr} state unread — ${!r ? 'the relay died' : r.error || JSON.stringify(r.state)}`)
   return r && !r.error ? r.state : null
@@ -2031,11 +2023,11 @@ const settleSonar = async (cycle, entry, ended) => {
   if (!markSonar || sonarDown || entry.sonar || items.length === 0) return 0
   if (await ended('sonar')) return 0
   const label = `sonar#${cycle}`
-  // One receipt per request and cycle: a retry, or the CI lane after both copies were lost, replays the run that marked (#55).
+  // One receipt per request and cycle: the CI lane after the review lane's line was lost, or a resumed relay, replays the run that marked (#55).
   const receipt = `${pinned.receipts.trim()}/sonar-${cycle}-${fnv1a(JSON.stringify({ head: expectedHead, items }))}.json`
-  const r = await relayOnce(
+  const r = await relayRun(
     `${IN_CHECKOUT}Mark SonarCloud issues on PR #${args.pr}: write exactly this JSON to a new temporary file, a name without quotes, and run ` +
-    `\`${PY} ${SONAR_SCRIPT} --pr ${args.pr} --repo ${shq(repo)} --head ${expectedHead} --manifest '<that file>' --receipt ${shq(receipt)}\` ` + relayed(SONAR) +
+    `\`${EMIT}${PY} ${SONAR_SCRIPT} --pr ${args.pr} --repo ${shq(repo)} --head ${expectedHead} --manifest '<that file>' --receipt ${shq(receipt)}\` ` + RETURN_EXIT +
     ` Change nothing on SonarCloud or GitHub yourself. Manifest: ${JSON.stringify({ items })}`,
     { label, phase: 'Push', model: 'haiku', effort: 'low', schema: SONAR })
   if (!r) { log(`${label}: no answer — the issues stay owed`); return 0 }
@@ -2098,9 +2090,11 @@ const triggerCodeRabbit = async (cycle, r, bots, ended) => {
 // One trigger script's run through a relay: its line, and the outcome, `failed` for a line it cannot read.
 const relayTrigger = async (cycle, kind, script, task, flag, outcomes) => {
   const label = `${kind}#${cycle}`
-  const t = await relayOnce(
-    `${IN_CHECKOUT}${task}: run \`${PY} ${script} --pr ${args.pr} --repo ${shq(repo)} --head ${expectedHead}${flag}\` ` +
-    relayed(TRIGGER) + ' Change nothing on GitHub yourself.',
+  // No fresh attempt for a CodeRabbit request: it reads before it comments with no lock, so a first attempt still
+  // running could comment twice; Greptile's trigger claims its head under a lock first.
+  const t = await (kind === 'crrequest' ? relayRun : relayOnce)(
+    `${IN_CHECKOUT}${task}: run \`${EMIT}${PY} ${script} --pr ${args.pr} --repo ${shq(repo)} --head ${expectedHead}${flag}\` ` +
+    RETURN_EXIT + ' Change nothing on GitHub yourself.',
     { label, phase: 'Push', model: 'haiku', effort: 'low', schema: TRIGGER })
   const known = !!t && !t.error && outcomes.includes(t.outcome)
   const outcome = known ? t.outcome : 'failed'
@@ -2268,8 +2262,8 @@ const ciLaneRun = async (cycle, lanes, entry) => {
     const head = queried = expectedHead
     const prompt = (command) =>
       `${IN_CHECKOUT}Editing and committing nothing, ${payload ? 'write exactly the JSON below to a new temporary file, a name without quotes, and ' : ''}` +
-      `run exactly \`${PY} ${COLLECT_SCRIPT} ${command} --repo ${shq(repo)} --pr ${args.pr} --head ${head}${payload ? " < '<that file>'" : ''}\` ` +
-      'in the foreground with a Bash timeout of 600000 ms, the tool\'s maximum, ' + relayed(schema) +
+      `run exactly \`${EMIT}${PY} ${COLLECT_SCRIPT} ${command} --repo ${shq(repo)} --pr ${args.pr} --head ${head}${payload ? " < '<that file>'" : ''}\` ` +
+      'in the foreground with a Bash timeout of 600000 ms, the tool\'s maximum, ' + RETURN_EXIT +
       (payload ? `\n${JSON.stringify(payload)}` : '')
     const opts = { label, phase: 'Triage', model: 'haiku', effort: 'low', schema, contract: COLLECT_CONTRACT }
     // A skew stops the cycle (runLanes); to every reader here its line is an error.
@@ -2320,7 +2314,7 @@ const ciLaneRun = async (cycle, lanes, entry) => {
   const stop = `${pinned.receipts.trim()}/ci-stop-${cycle}`
   for (let k = 1; ; k++) {
     const slice = Math.min(lanes.reviewDone ? 540 : 180, left)
-    // A --brief slice still running prints no checks, so a relay copies nothing it reads again; the budget's last slice is whole.
+    // A --brief slice still running prints no checks, so its line carries nothing read again; the budget's last slice is whole.
     last = left - slice < 30
     ciStopFile = lanes.reviewDone ? null : stop
     inv = await collect(`ci:collect#${cycle}.${k}`, `inventory --wait-seconds ${slice}${last ? '' : ' --brief'}${ignoring} --stop-file ${shq(stop)}`, INVENTORY)
@@ -2589,8 +2583,8 @@ let lastRead = null
 let quotaRead = null
 const probeReviews = async (cycle) => {
   const p = await relayRun(
-    `${IN_CHECKOUT}Editing nothing, run exactly \`${PY} ${HARVEST_SCRIPT} --pr ${args.pr} --repo ${shq(repo)} --reviewers ${reviewers.join(',')}` +
-    `${waitedOn.length ? ` --auto-run ${waitedOn.join(',')}` : ''} --probe\` ` + relayed(PROBE),
+    `${IN_CHECKOUT}Editing nothing, run exactly \`${EMIT}${PY} ${HARVEST_SCRIPT} --pr ${args.pr} --repo ${shq(repo)} --reviewers ${reviewers.join(',')}` +
+    `${waitedOn.length ? ` --auto-run ${waitedOn.join(',')}` : ''} --probe\` ` + RETURN_EXIT,
     { label: `reviews:probe#${cycle}`, phase: 'Triage', model: 'haiku', effort: 'low', schema: PROBE },
   )
   // GitHub refused the probe: the validator's harvest would be refused too
@@ -3257,9 +3251,9 @@ if (cyclesUsed >= maxCycles) {
   return finish(stop(lastCycle, 'budget-exhausted'))
 }
 const pinned = await relayOnce(
-  `${IN_CHECKOUT}Editing and committing nothing, run exactly \`${PY} ${PREFLIGHT_SCRIPT} --pr ${args.pr}${NEEDED.map(p => ` --needs ${p}`).join('')}` +
+  `${IN_CHECKOUT}Editing and committing nothing, run exactly \`${EMIT}${PY} ${PREFLIGHT_SCRIPT} --pr ${args.pr}${NEEDED.map(p => ` --needs ${p}`).join('')}` +
   `${MODULES.map(m => ` --module ${m}`).join('')}${repo ? ` --repo ${shq(repo)}` : ''}\` ` +
-  relayed(PIN),
+  RETURN_EXIT,
   { label: 'preflight', phase: 'Triage', model: 'haiku', effort: 'low', schema: PIN },
 )
 if (!pinned) return finish(stop(lastCycle, 'preflight-died'))
@@ -3360,8 +3354,8 @@ if (adoptHead !== null) {
   if (p && !retry) log(`preflight: the unpublished candidate (${p.stage}) is left to this adoption of ${adoptHead.slice(0, 7)}: PR #${args.pr} heads ${X.slice(0, 7)}, and only the audited chain may publish`)
   if (tip !== base) log(`preflight: ${pinned.prBaseBranch} is at ${tip.slice(0, 7)}, not the base ${base.slice(0, 7)} GitHub recorded at the PR's last push; a merge may come from either`)
   const audit = await relayOnce(
-    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`${PY} ${COMMITS_SCRIPT} chain ${X} ${adoptHead} --published ${prHead} --base ${base} --tip ${tip}\` ` +
-    relayed(ADOPT_AUDIT),
+    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`${EMIT}${PY} ${COMMITS_SCRIPT} chain ${X} ${adoptHead} --published ${prHead} --base ${base} --tip ${tip}\` ` +
+    RETURN_EXIT,
     { label: 'adopt:audit', phase: 'Triage', model: 'haiku', effort: 'low', schema: ADOPT_AUDIT },
   )
   const shas = audit ? audit.commits : []
@@ -3421,7 +3415,7 @@ if (rebased) {
   const notes = [...answeredWith].filter(([id, a]) => a.how === 'fixNote' && !(debt.get(id) && debt.get(id).rejudge))
   const shas = [...new Set(notes.map(([, a]) => a.sha).filter(Boolean))]
   const read = shas.length ? await relayOnce(
-    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`${PY} ${COMMITS_SCRIPT} cited ${rebased.to} ${shas.join(' ')}\` ` + relayed(CITED),
+    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`${EMIT}${PY} ${COMMITS_SCRIPT} cited ${rebased.to} ${shas.join(' ')}\` ` + RETURN_EXIT,
     { label: 'rebase:cited', phase: 'Triage', model: 'haiku', effort: 'low', schema: CITED },
   ) : null
   const unread = !shas.length ? null : !read ? 'the relay died' : read.error ? read.error

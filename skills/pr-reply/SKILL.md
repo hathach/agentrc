@@ -33,6 +33,7 @@ python3 "$R" --pr <N> --reuse <file.json>
 python3 "$R" --pr <N> --edit <file.json>
 # file.json: {"edits": [{"commentId": ..., "replyId": ..., "body": "...", "digest": "...", "bodyDigest": "...", "originalDigest": "..."}]}
 python3 "$R" --pr <N> --manifest <file.json> --receipt <path>   # also --reuse, --edit: replay a saved run
+python3 "$R" --pr <N> --manifest <file.json> --receipt <path> --replay-only   # the saved run only; none: exit 2, nothing posted
 ```
 
 Every entry carries its body's digest (`--digest` by hand); the script refuses
