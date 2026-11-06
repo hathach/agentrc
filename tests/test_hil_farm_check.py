@@ -257,6 +257,21 @@ class Engine(unittest.TestCase):
         self.take()
         self.assertEqual(self.check()['previousCleanupFailure']['id'], f['id'], 'the next check reports it')
 
+    def test_a_run_without_a_receipt_logs_a_marker_no_later_restore_resolves(self):
+        def lost(cmd, cwd=None, **kw):
+            e = OSError('supervisor died')
+            e.cleanup, e.receipt = 'unknown', None
+            raise e
+        patch(self, eng.hil_process, 'run_tracked', lost)
+        row = self.check()
+        marker = {'unrecheckable': [RESET]}
+        self.assertEqual((row['status'], row['cleanup']['released'], row['cleanup']['receipts']),
+                         ('blocked', True, [marker]))
+        f = latest_failure(lk, 'b')
+        self.assertEqual(f['receipts'], [marker])
+        self.assertRegex(lk.resolve_restored('b', [f], evidence='a later restore')[0], f'{f["id"]} stays open')
+        self.assertEqual(latest_failure(lk, 'b')['id'], f['id'])
+
     def test_a_reset_proven_ended_on_recheck_releases(self):
         self.outcomes[RESET] = (0, 'pending', 'ok')
         self.rechecks[RESET] = 'done'

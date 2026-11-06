@@ -114,7 +114,8 @@ nothing in it through a link.
   command it builds (`usb-kernel-recover`'s `root-cycle` or `hub-cycle`),
   and, when anything but a clean, fully re-enumerated outcome follows,
   releases them with the blocker logged in each board's cleanup log
-  (`end_failed`) and exits 1. A controller operation has no
+  (`end_failed`; a surviving process as an `unrecheckable` receipt, so that
+  failure stays open) and exits 1. A controller operation has no
   inspected reservation yet; a contract refuses it. A runner that
   cycles one hub port under the board's own lock is a limitation of this rule,
   not an exemption, recorded in the contract's Limits with what else the cycle
@@ -383,8 +384,9 @@ recovery stay the contract's.
   either way: cleanly once every process it started there is proven ended
   (`run_tracked`'s `done`, or a `recheck` of its receipt that answers
   `done`), otherwise through `end_failed`, the open receipts logged in its
-  cleanup log. `run_tracked` only supplies the evidence; any other
-  caller enforces its own reservation policy.
+  cleanup log; a run that left no receipt is logged as an `unrecheckable`
+  one, which keeps its failure open. `run_tracked` only supplies the
+  evidence; any other caller enforces its own reservation policy.
 - `run_tracked`'s `state_dir` is the caller's: a directory of its uid that no
   other user can write, in a parent of its uid or root's that no other user
   can write unless sticky. Only those two are checked: the caller keeps every

@@ -761,6 +761,20 @@ class Run(Fixture):
                 self.assertIn(f'surviving pids [{orphan}]',
                               latest_failure(hr.hil_lock, 'raspberry_pi_pico2')['detail'])
 
+    def test_a_survivors_logged_failure_stays_open_after_a_later_restore(self):
+        p = self.run_run(action='survivor')
+        line = p.blocker()
+        orphan = int(Path(str(self.argv_out) + '.pid').read_text())
+        self.addCleanup(lambda: os.kill(orphan, signal.SIGKILL) if hr.hil_lock.proc_start(orphan) else None)
+        self.assertEqual(p.wait(), 1, line)
+        for lock in self.records():
+            f = latest_failure(hr.hil_lock, lock)
+            [marker] = f['receipts']
+            self.assertEqual((marker['unrecheckable'][-3:], marker['survivors']), (['root-cycle', '3-1.1', 'E6633861A3978538'], [orphan]))
+            self.assertRegex(hr.hil_lock.resolve_restored(lock, [f], evidence='a later restore')[0],
+                             f'{f["id"]} stays open')
+            self.assertEqual(latest_failure(hr.hil_lock, lock)['id'], f['id'], lock)
+
     def test_sigterm_during_the_command_is_forwarded_and_ends_as_a_blocker(self):
         p = self.run_run(action='hang')
         self.wait_for(lambda: self.argv_out.exists(), 'the command to start')

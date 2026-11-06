@@ -44,8 +44,9 @@ mutation) with an unchanged subtree, no survivor and no noted signal releases an
 Any other outcome is a blocker that ends with this run (agentrc#464): the BLOCKER line names
 the problems, hil_lock.end_failed logs them in every board's cleanup log, which the next task
 on each board reports, and every lock is released. A survivor is named, not waited for; it
-reparents to init once this process exits. A reservation killed outright leaves its records,
-which the next task on each board logs. Exit 0 released, 1 blocker or refused, 2 usage.
+reparents to init once this process exits, and nothing can recheck it, so its logged failure
+stays open. A reservation killed outright leaves its records, which the next task on each
+board logs. Exit 0 released, 1 blocker or refused, 2 usage.
 
 Signals: SIGINT/SIGTERM/SIGHUP before the command release the untouched reservation and
 exit 130; during the command SIGINT/SIGTERM are forwarded to its process group, while SIGHUP
@@ -404,13 +405,13 @@ class Reservation:
         self.phase = 'post'
         return os.waitstatus_to_exitcode(status)    # a signal death stays negative, as Popen's
 
-    def end_blocked(self, problems) -> int:
-        """A blocker: named on both streams, logged on every board (hil_lock.end_failed), and every
-        lock released; returns the exit status, 1. A log or output failure is reported where
-        possible and never keeps a lock."""
+    def end_blocked(self, problems, receipts=()) -> int:
+        """A blocker: named on both streams, logged on every board (hil_lock.end_failed, with
+        `receipts`), and every lock released; returns the exit status, 1. A log or output failure
+        is reported where possible and never keeps a lock."""
         detail = '; '.join(problems)
         errors = hil_lock.end_failed(dict(zip(self.locks, self.handles)), self.reason, detail=detail,
-                                     tool='hil_reserve', token=self.token)
+                                     receipts=receipts, tool='hil_reserve', token=self.token)
         self.handles = []
         unlogged = '; '.join(f'{b}: {", ".join(e)}' for b, e in sorted(errors.items()))
         for stream in (sys.stdout, sys.stderr):
@@ -477,12 +478,14 @@ def cmd_run(args):
     print('hil_reserve: holding ' + ' '.join(res.locks) + '\nhil_reserve: ' + ' '.join(argv), flush=True)
     rc = res.run(argv)
     deadline = time.monotonic() + args.budget      # one deadline for everything that follows the command
-    problems = []
+    problems, unproven = [], []
     if rc != 0:
         problems.append(f'command exited {rc}')
     left = survivors(res.pgid)
     if left:
         problems.append(f'surviving pids {left}')
+        # a survivor has no receipt to recheck: the marker keeps its logged failure open (resolve_restored)
+        unproven.append({'unrecheckable': argv, 'survivors': left})
     if rc == REFUSED_UNWRITTEN and not left:
         # the script refused before its first write: proven only if the subtree is unchanged
         try:
@@ -507,7 +510,7 @@ def cmd_run(args):
     problems += gaps_left
     problems = res.noted + problems       # noted last: a signal can land during the reconciliation
     if problems:
-        return res.end_blocked(problems)
+        return res.end_blocked(problems, unproven)
     res.release()
     print(f'hil_reserve: released {len(res.locks)} lock(s); {len(nodes)} node(s) back under '
           f'{SCOPE_NAME[scope]} {top(args.busport, scope)}')

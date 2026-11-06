@@ -355,7 +355,10 @@ def _new_cleanup(result: str) -> dict:
 
 def _cleanup_from(open_ops: list, result: str) -> dict:
     cleanup = _new_cleanup(result)
-    cleanup['receipts'] = [e['receipt'] for e in open_ops if e['receipt'] is not None]
+    # a run without a receipt (its supervisor died) can never be rechecked: as the Arduino engine's, its
+    # marker keeps the logged failure open (resolve_restored); a retained session is its own evidence
+    cleanup['receipts'] = [e['receipt'] if e['receipt'] is not None else {'unrecheckable': [e['cmd']]}
+                           for e in open_ops if not e.get('retained')]
     cleanup['evidence'] = [f'not proven ended ({e["cleanup"]}): {e["cmd"]}' for e in open_ops]
     if retained := [r for e in open_ops for r in e.get('retained', ())]:
         cleanup['retained'] = retained
