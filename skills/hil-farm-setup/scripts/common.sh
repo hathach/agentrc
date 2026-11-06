@@ -22,6 +22,9 @@ runner_conf() {
     arduino-tinyusb) RUNNER_USER=ghrunner-arduino-tinyusb RUNNER_SUDO=''
                     RUNNER_URL=https://github.com/adafruit/Adafruit_TinyUSB_Arduino
                     RUNNER_STATE=_work/Adafruit_TinyUSB_Arduino/hil-state ;;
+    nrf52-bootloader) RUNNER_USER=ghrunner-nrf52-bootloader RUNNER_SUDO=''
+                      RUNNER_URL=https://github.com/adafruit/Adafruit_nRF52_Bootloader
+                      RUNNER_STATE=_work/Adafruit_nRF52_Bootloader/hil-state ;;
   esac
   RUNNER_REG_NAME=${RUNNER_REG_NAMES[$1]} RUNNER_LABELS=${RUNNER_REG_LABELS[$1]}  # its name and labels on GitHub
   RUNNER_NAME=$1

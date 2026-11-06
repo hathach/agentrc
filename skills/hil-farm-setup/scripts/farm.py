@@ -48,7 +48,7 @@ LOCK_FILE = '/run/hil-farm.lock'
 LINK_ROOTS = ('/usr/local/bin/', '/usr/local/sbin/', '/opt/hil/')
 FIRMWARE_ROOT = '/lib/firmware/'
 INSTALLED_HOST = Path('/etc/hil-farm/host.toml')
-KNOWN_RUNNERS = ('tinyusb', 'tinyuf2', 'arduino-tinyusb')  # common.sh runner_conf
+KNOWN_RUNNERS = ('tinyusb', 'tinyuf2', 'arduino-tinyusb', 'nrf52-bootloader')  # common.sh runner_conf
 
 
 def runner_units(names):

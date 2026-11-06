@@ -149,10 +149,10 @@ class TestSetup(unittest.TestCase):
                 self.assertIn('PYTHONNOUSERSITE=1', env)
 
     def addition(self):
-        """A two-runner install and ci.toml's proposed third, with real farm decisions and only OS commands stubbed."""
+        """A three-runner install and ci.toml's proposed fourth, with real farm decisions and only OS commands stubbed."""
         ci = (FARM.parent / 'hosts' / 'ci.toml').read_text()
         self.host = self.tmp / 'installed.toml'
-        self.host.write_text(ci.split('[runner.arduino-tinyusb]')[0])
+        self.host.write_text(ci.split('\n[runner.nrf52-bootloader]')[0])
         proposed = self.tmp / 'ci.toml'
         proposed.write_text(ci)
         roots = self.tmp / 'runners'
@@ -162,7 +162,7 @@ class TestSetup(unittest.TestCase):
         (etc / 'sudoers.d' / 'hil-farm').write_text('ghrunner ALL=(root) NOPASSWD: /usr/local/sbin/hil_root\n')
         self.hooks.mkdir()
         (self.hooks / 'job_hook.py').write_text('existing shared hook\n')
-        for name in ('tinyusb', 'tinyuf2'):
+        for name in ('tinyusb', 'tinyuf2', 'arduino-tinyusb'):
             d = roots / name
             (d / 'bin').mkdir(parents=True)
             (d / '_work').mkdir()
@@ -226,34 +226,34 @@ class TestSetup(unittest.TestCase):
     def test_add_runner_provisions_only_the_new_runner_and_publishes_the_host(self):
         proposed = self.addition()
         before = self.host.read_bytes()
-        r = self.setup('add-runner', 'arduino-tinyusb', '--host', str(proposed))
+        r = self.setup('add-runner', 'nrf52-bootloader', '--host', str(proposed))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assert_existing_untouched()
         self.assertEqual(self.host.read_bytes(), proposed.read_bytes())
         self.assertEqual(self.host.with_name('host.toml.prev').read_bytes(), before)
-        d = self.tmp / 'runners' / 'arduino-tinyusb'
+        d = self.tmp / 'runners' / 'nrf52-bootloader'
         self.assertTrue((d / 'bin' / 'Runner.Listener').is_file())
         self.assertFalse((d / '_work').exists())   # registration makes the runner's dirs
         self.assertEqual(d.stat().st_mode & 0o7777, 0o1770)
         self.assertFalse((d / '.runner').exists())
         self.assertIn('PYTHONNOUSERSITE=1', (d / '.env').read_text())
-        self.assertIn(f'ACTIONS_RUNNER_HOOK_JOB_STARTED={self.hooks}/job-started-arduino-tinyusb.sh',
+        self.assertIn(f'ACTIONS_RUNNER_HOOK_JOB_STARTED={self.hooks}/job-started-nrf52-bootloader.sh',
                       (d / '.env').read_text())
         self.assertTrue((d / '.path').read_text().startswith('/opt/hil/venv/bin:'))
-        unit = (self.tmp / 'etc' / 'units' / 'hil-runner-arduino-tinyusb.service').read_text()
-        self.assertIn('User=ghrunner-arduino-tinyusb\n', unit)
+        unit = (self.tmp / 'etc' / 'units' / 'hil-runner-nrf52-bootloader.service').read_text()
+        self.assertIn('User=ghrunner-nrf52-bootloader\n', unit)
         self.assertIn('UMask=0022\n', unit)
         self.assertIn('Requires=nftables.service\n', unit)
         self.assertIn(f'ConditionPathExists={d}/.runner\n', unit)
-        self.assertIn('start hil-runner-arduino-tinyusb',
-                      (self.hooks / 'job-started-arduino-tinyusb.sh').read_text())
-        self.assertIn('"ghrunner", "ghrunner-tinyuf2", "ghrunner-arduino-tinyusb"',
+        self.assertIn('start hil-runner-nrf52-bootloader',
+                      (self.hooks / 'job-started-nrf52-bootloader.sh').read_text())
+        self.assertIn('"ghrunner", "ghrunner-tinyuf2", "ghrunner-arduino-tinyusb", "ghrunner-nrf52-bootloader"',
                       (self.tmp / 'etc' / 'nftables.conf').read_text())
         calls = self.calls.read_text().splitlines()
-        self.assertIn('useradd -m -U -s /bin/bash -G hil,dialout,plugdev,audio ghrunner-arduino-tinyusb', calls)
-        self.assertIn('passwd -l ghrunner-arduino-tinyusb', calls)
-        self.assertIn('usermod -aG ghrunner-arduino-tinyusb hathach', calls)
-        self.assertIn('systemctl disable -q hil-runner-arduino-tinyusb', calls)
+        self.assertIn('useradd -m -U -s /bin/bash -G hil,dialout,plugdev,audio ghrunner-nrf52-bootloader', calls)
+        self.assertIn('passwd -l ghrunner-nrf52-bootloader', calls)
+        self.assertIn('usermod -aG ghrunner-nrf52-bootloader hathach', calls)
+        self.assertIn('systemctl disable -q hil-runner-nrf52-bootloader', calls)
         self.assertFalse([c for c in calls if c.startswith(('systemctl start', 'systemctl stop', 'visudo'))])
         self.assertEqual([c for c in calls if c.startswith('systemctl enable')], ['systemctl enable -q nftables'])
         self.assertEqual((self.tmp / 'installed' / 'common.sh').read_bytes(), (self.dir / 'common.sh').read_bytes())
@@ -261,31 +261,31 @@ class TestSetup(unittest.TestCase):
     def test_add_runner_guards_old_and_new_units_and_workers_before_mutation(self):
         proposed = self.addition()
         before = self.host.read_bytes()
-        for unit in ('tinyusb', 'tinyuf2', 'arduino-tinyusb', None):
+        for unit in ('tinyusb', 'tinyuf2', 'arduino-tinyusb', 'nrf52-bootloader', None):
             with self.subTest(unit=unit):
                 self.calls.write_text('')
                 self.stub('systemctl', f'echo "systemctl $*" >> {self.calls}\n'
                           f'if [ "$2" = "hil-runner-{unit}" ]; then echo active; else echo inactive; exit 3; fi')
                 self.stub('pgrep', 'exit 0' if unit is None else 'exit 1')
-                r = self.setup('add-runner', 'arduino-tinyusb', '--host', str(proposed))
+                r = self.setup('add-runner', 'nrf52-bootloader', '--host', str(proposed))
                 self.assertNotEqual(r.returncode, 0)
                 self.assertRegex(r.stderr, 'is active|Runner.Worker is running')
                 self.assertFalse((self.tmp / 'home').exists())
                 self.assertEqual(self.host.read_bytes(), before)
                 self.assert_existing_untouched()
-                self.assertEqual(len(self.calls.read_text().splitlines()), 3)
+                self.assertEqual(len(self.calls.read_text().splitlines()), 4)
 
     def test_failed_addition_keeps_the_old_host_and_retries_without_changing_old_runners(self):
         proposed = self.addition()
         before = self.host.read_bytes()
         self.stub('systemctl', 'case $1 in is-active) echo inactive; exit 3;; disable) exit 1;; esac')
-        r = self.setup('add-runner', 'arduino-tinyusb', '--host', str(proposed))
+        r = self.setup('add-runner', 'nrf52-bootloader', '--host', str(proposed))
         self.assertNotEqual(r.returncode, 0)
         self.assertIn('cannot disable', r.stderr)
         self.assertEqual(self.host.read_bytes(), before)
         self.assert_existing_untouched()
         self.stub('systemctl', '[ "$1" != is-active ] || { echo inactive; exit 3; }')
-        r = self.setup('add-runner', 'arduino-tinyusb', '--host', str(proposed))
+        r = self.setup('add-runner', 'nrf52-bootloader', '--host', str(proposed))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assert_existing_untouched()
 
@@ -300,7 +300,7 @@ class TestSetup(unittest.TestCase):
     def test_addition_refuses_a_missing_old_runner_before_creating_the_new_user(self):
         proposed = self.addition()
         (self.tmp / 'runners' / 'tinyuf2' / 'bin' / 'Runner.Listener').unlink()
-        r = self.setup('add-runner', 'arduino-tinyusb', '--host', str(proposed))
+        r = self.setup('add-runner', 'nrf52-bootloader', '--host', str(proposed))
         self.assertNotEqual(r.returncode, 0)
         self.assertIn('holds no runner', r.stdout)
         self.assertFalse((self.tmp / 'home').exists())
@@ -316,7 +316,7 @@ class TestSetup(unittest.TestCase):
                 pinned = moved.read_text()
                 self.assertIn(old, pinned)
                 moved.write_text(pinned.replace(old, new))
-                r = self.setup('add-runner', 'arduino-tinyusb', '--host', str(proposed))
+                r = self.setup('add-runner', 'nrf52-bootloader', '--host', str(proposed))
                 moved.write_text(pinned)
                 self.assertNotEqual(r.returncode, 0)
                 self.assertIn(f'{f} differs from the installed one; run setup.sh update first', r.stderr)
@@ -445,6 +445,19 @@ class TestSetup(unittest.TestCase):
         self.assertTrue((self.tmp / 'runners' / 'arduino-tinyusb' / '_work' /
                          'Adafruit_TinyUSB_Arduino' / 'hil-state').is_dir())
         self.assertEqual(self.sourced('runner_conf arduino-tinyusb; echo "[$RUNNER_SUDO]"'), '[]\n')
+
+    def test_nrf52_bootloader_registration_uses_its_repo_labels_and_state_root(self):
+        self.host = FARM.parent / 'hosts' / 'ci.toml'
+        self.point_host()
+        before, after = self.registration('nrf52-bootloader', 'tinyusb')
+        self.assertEqual(before, after)
+        args = (self.tmp / 'config-args').read_text()
+        self.assertIn('-u ghrunner-nrf52-bootloader --', args)
+        self.assertIn('--url https://github.com/adafruit/Adafruit_nRF52_Bootloader ', args)
+        self.assertIn('--name nrf52-bootloader --labels nrf52-bootloader ', args)
+        self.assertTrue((self.tmp / 'runners' / 'nrf52-bootloader' / '_work' /
+                         'Adafruit_nRF52_Bootloader' / 'hil-state').is_dir())
+        self.assertEqual(self.sourced('runner_conf nrf52-bootloader; echo "[$RUNNER_SUDO]"'), '[]\n')
 
     def test_re_registration_never_follows_a_link_a_job_planted(self):
         for name, rel, kind in (('tinyusb', '_work', 'link'), ('tinyusb', '_diag', 'link'),

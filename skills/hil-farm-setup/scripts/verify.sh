@@ -53,6 +53,7 @@ check "python3 on PATH is the installed hil-venv" python3 -c 'import json, os, s
 d = json.load(open("/var/lib/hil-farm/hil-venv.json"))["dir"]
 sys.exit(os.path.realpath(sys.prefix) != os.path.realpath(d))'
 check "python imports esptool serial usb hid" python3 -c 'import esptool, serial, usb.core, hid'
+check "adafruit-nrfutil" adafruit-nrfutil version
 check "libmtp loads" python3 -c 'import ctypes.util, sys; sys.exit(ctypes.util.find_library("mtp") is None)'
 
 rejects() { nft list table inet hil_farm | awk '/reject/ {for (i = 1; i < NF; i++) if ($i == "packets") s += $(i + 1)} END {print s + 0}'; }

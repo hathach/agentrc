@@ -536,7 +536,7 @@ class TestRunnerInstall(FarmCase):
         self.t = {'kind': 'runner', 'url': 'https://example.test/runner.tgz', 'sha256': sha(data), 'version': '2'}
 
     def test_the_same_pin_goes_into_every_runner_dir(self):
-        self.assertEqual(len(self.dirs), 3)
+        self.assertEqual(len(self.dirs), 4)
         farm.install_tool('actions-runner', self.t, False)
         for d in self.dirs:
             self.assertEqual(Path(d, 'bin/Runner.Listener').read_bytes(), b'listener')
@@ -900,7 +900,8 @@ class TestGuard(unittest.TestCase):
 
     def test_every_runner_unit_is_asked(self):
         asked = [c.args[0][2] for c in self.guard_with('inactive', 1).call_args_list if c.args[0][0] == 'systemctl']
-        self.assertEqual(asked, ['hil-runner-tinyusb', 'hil-runner-tinyuf2', 'hil-runner-arduino-tinyusb'])
+        self.assertEqual(asked, ['hil-runner-tinyusb', 'hil-runner-tinyuf2', 'hil-runner-arduino-tinyusb',
+                                 'hil-runner-nrf52-bootloader'])
 
     def test_one_running_unit_refuses(self):
         for running in farm.RUNNER_UNITS:
