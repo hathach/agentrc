@@ -125,6 +125,10 @@ def setUpModule():
     guard_survivors(__name__)
 
 
+def worktrees(git):
+    return [line for line in git('worktree', 'list', '--porcelain').splitlines() if line.startswith('worktree ')]
+
+
 class RepoConfigTest(unittest.TestCase):
     def test_the_suite_hook_runs_for_a_change_to_any_tracked_file(self):
         config = yaml.safe_load((SCRIPT.parents[3] / hooks.CONFIG).read_text(encoding='utf-8'))
@@ -264,7 +268,7 @@ class HooksTest(unittest.TestCase):
         self.assertRegex(out['error'], r'did not finish within 2 s .*may still be running')
 
     def worktrees(self):
-        return [line for line in self.git('worktree', 'list', '--porcelain').splitlines() if line.startswith('worktree ')]
+        return worktrees(self.git)
 
     def test_a_failing_hook_is_named_with_its_first_line_and_rerun_on_head(self):
         # A host that cannot run a hook fails it on HEAD too: that is no evidence against the change (#378).
@@ -760,7 +764,7 @@ class ForgetTest(unittest.TestCase):
                               capture_output=True, text=True).stdout
 
     def worktrees(self):
-        return [line for line in self.git('worktree', 'list', '--porcelain').splitlines() if line.startswith('worktree ')]
+        return worktrees(self.git)
 
     def head_tree(self):
         tmp = tempfile.mkdtemp(prefix='hooks-base-')
@@ -845,6 +849,19 @@ class ForgetTest(unittest.TestCase):
             released.set()
             for thread in removing:
                 thread.join(10)
+
+    def test_heads_tree_stays_locked_while_it_runs_and_goes_after(self):
+        # Unlocked, another session's prune could drop its entry once the tree goes, and its `worktree add` take the
+        # name before forget deletes the entry.
+        seen = []
+
+        def pre_commit(*_, **__):
+            seen.append(self.git('worktree', 'list', '--porcelain'))
+            return 0, ''
+        with mock.patch.object(hooks, 'pre_commit', pre_commit):
+            hooks.baseline({'a': []}, ['a.txt'], 10, time.monotonic())
+        self.assertIn('\nlocked', seen[0])
+        self.assertEqual(len(self.worktrees()), 1)
 
     def test_a_rerun_the_deadline_cuts_short_leaves_it_and_those_after_it_unjudged(self):
         late = hooks.Late('pre-commit did not finish within 9 s (HEAD a)')
@@ -962,7 +979,8 @@ class RunHooksTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        Path(tmp.name, hooks.CONFIG).write_text('repos: []\n')
+        # fail_fast: once every failure is excused, the hooks run again without them
+        Path(tmp.name, hooks.CONFIG).write_text('fail_fast: true\nrepos: []\n')
         cwd = os.getcwd()
         os.chdir(tmp.name)
         self.addCleanup(os.chdir, cwd)
@@ -1020,6 +1038,20 @@ class RunHooksTest(unittest.TestCase):
         self.assertEqual(([f['hook'] for f in failures], excused), (['broken'], []))
         self.assertEqual(not_rerun, [{'hook': 'broken', 'why': why}])
 
+    def test_without_fail_fast_every_hook_ran_and_none_runs_again(self):
+        remote = 'repos:\n- repo: https://example.com/hooks\n  rev: v1\n  hooks:\n  - id: broken\n'
+        # a remote repository's manifest may set fail_fast unless the hook's entry says
+        for config in ('repos: []\n', CONFIG.format(HOOK.format(id='broken')), remote + '    fail_fast: false\n',
+                       CONFIG.format(HOOK.format(id='broken') + '    fail_fast: true\n'), remote):
+            with self.subTest(config):
+                Path(hooks.CONFIG).write_text(config)
+                runs = mock.Mock(side_effect=lambda *_, skip=(), **__: (0, '') if skip else (1, self.BROKEN))
+                with mock.patch.object(hooks, 'pre_commit', runs) as pre_commit, \
+                        mock.patch.object(hooks, 'baseline', return_value=(['broken'], {})):
+                    *_, failures, excused, _ = hooks.run_hooks(['a.txt'])
+                self.assertEqual(([f['hook'] for f in failures], excused), (['broken'], ['broken']))
+                self.assertEqual(pre_commit.call_count, 2 if config.endswith(('true\n', 'broken\n')) else 1)
+
     def test_the_run_without_the_excused_gets_its_retry(self):
         # A formatter fail_fast hid rewrites in that run and passes on its retry, as it would with fail_fast off.
         fmt = 'fmt' + '.' * 70 + 'Failed\n- hook id: fmt\n- exit code: 1\n- files were modified by this hook\n'
@@ -1033,7 +1065,7 @@ class RunHooksTest(unittest.TestCase):
         # fail_fast hid them behind broken: one rewrites files there, one SKIP cannot name, one shares its id. The
         # config runs them in that order, and pre-commit ends each hook's output with a blank line.
         ids = ('broken', 'fmt', 'a,b', 'dup', 'dup')
-        Path(hooks.CONFIG).write_text(CONFIG.format(''.join(HOOK.format(id=i) for i in ids)))
+        Path(hooks.CONFIG).write_text('fail_fast: true\n' + CONFIG.format(''.join(HOOK.format(id=i) for i in ids)))
         fmt = 'fmt' + '.' * 70 + 'Failed\n- hook id: fmt\n- exit code: 1\n- files were modified by this hook\n'
         hidden = fmt + self.BROKEN.replace('broken', 'a,b') + '\n' + self.BROKEN.replace('broken', 'dup')
         with mock.patch.object(hooks, 'pre_commit', lambda *a, skip=(), **k: (1, hidden if skip else self.BROKEN)), \
@@ -1172,6 +1204,12 @@ class PreCommitPythonTest(unittest.TestCase):
 
 
 class AsCheckoutTest(unittest.TestCase):
+    def test_a_temp_dir_inside_the_checkout_is_no_temp_dir(self):
+        # Read as the checkout first, its path would end at a boundary the temp dir's could follow.
+        root = '/srv/co'
+        self.assertNotEqual(hooks.comparable(f'{root}{tempfile.gettempdir()}/ccdriver.c: bad\n', root),
+                            hooks.comparable(f'{root}{tempfile.gettempdir()}/ccsensor.c: bad\n', root))
+
     def test_every_spelling_of_the_tree_reads_as_the_placeholder(self):
         tree = os.path.join(tempfile.gettempdir(), 'hooks-base-x', 'head')
         posix = tree.replace('\\', '/')
@@ -1195,6 +1233,11 @@ class AsCheckoutTest(unittest.TestCase):
                              ('a.c:1: x1 unused\n', 'a.c:1: x2 unused\n'),
                              ('src/ccdriver.c: bad\n', 'src/ccsensor.c: bad\n'),
                              ('./src/temp/ccdriver.c:bad\n', './src/temp/ccsensor.c:bad\n'),
+                             # a source directory whose path ends as the temp dir's does is no temp dir
+                             (f'./src{tempfile.gettempdir()}/ccdriver.c: bad\n',
+                              f'./src{tempfile.gettempdir()}/ccsensor.c: bad\n'),
+                             (f'/srv/build{tempfile.gettempdir()}/ccdriver.c: bad\n',
+                              f'/srv/build{tempfile.gettempdir()}/ccsensor.c: bad\n'),
                              ('gw1 unused\n', 'gw2 unused\n'),
                              ('a.c:1: v2m bad\n', 'a.c:1: v3m bad\n')):
             self.assertNotEqual(hooks.comparable(head, '/x'), hooks.comparable(change, '/x'), change)

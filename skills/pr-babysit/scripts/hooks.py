@@ -47,13 +47,15 @@ line only the change prints keeps it counted, unless it follows all HEAD's outpu
 pre-commit run naming a later hook's id would print. A change that leaves a hook's output the same once masked is
 still excused: a hook that prints only a count of its violations, or a new
 violation replacing one of HEAD's that differs from it only in numbers; CI runs
-the hook on the pushed head. When every failure is excused, the hooks run once
-more on the change, with its retry, and SKIP naming the excused ones, as the
-commit will, so a fail_fast stop cannot hide a hook the change breaks: what
-fails there joins failed and is rerun on HEAD in turn, the hooks running again
-while every new failure is excused, and a failed run that names no hook adds the
-failure `(pre-commit)`. An alias only a remote repository's own manifest
-declares is not seen, so such a hook may go unrun on the change until CI.
+the hook on the pushed head. When every failure is excused and a hook may stop
+the run early (fail_fast set on the whole config or a hook, or left to a remote
+repository's manifest by a hook's entry), the hooks run once more on the change,
+with its retry, and SKIP naming the excused ones, as the commit will, so a
+fail_fast stop cannot hide a hook the change breaks: what fails there joins
+failed and is rerun on HEAD in turn, the hooks running again while every new
+failure is excused, and a failed run that names no hook adds the failure
+`(pre-commit)`. An alias only a remote repository's own manifest declares is not
+seen, so such a hook may go unrun on the change until CI.
 pre-commit runs with core.abbrev pinned at the length HEAD abbreviates to
 when the first run starts (#377), possibly a digit over git's default, which
 the hooks' own git commands inherit. git still lengthens an abbreviation a
@@ -79,7 +81,7 @@ import unicodedata
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from commits import bounded as copyable  # noqa: E402
+from commits import bounded as copyable, with_skip  # noqa: E402
 from facts import Unusable, checkout_top, git, report, status  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
 import windows  # noqa: E402
@@ -377,7 +379,7 @@ def pre_commit(paths, deadline, start, what, hook=None, cwd=None, skip=()):
     """(exit code, stdout) of one pre-commit run, skip added to the SKIP it inherits."""
     env = pinned_abbrev(other_repo_env() if cwd else os.environ, abbrev_length())
     if skip:
-        env['SKIP'] = ','.join([*filter(None, env.get('SKIP', '').split(',')), *skip])
+        env = with_skip(env, skip)
     # Neither -v nor --show-diff-on-failure, and stdout alone: pre-commit prints nothing past its last hook, so all
     # a hook run alone prints after its block is its own (baseline).
     try:
@@ -420,9 +422,10 @@ def as_checkout(text, root):
 @functools.cache
 def temp_gcc():
     """A gcc temporary name directly in the temp dir this run and its hooks share, where an all-lowercase one is
-    gcc's too."""
-    after = '|'.join(rf'(?<={re.escape(s)}[/\\])' for s in spellings(tempfile.gettempdir()))
-    return re.compile(rf'(?:{after})cc[A-Za-z0-9]{{6}}(?=\.)', re.IGNORECASE if os.name == 'nt' else 0)
+    gcc's too; the dir as a whole path, not one ending a source path such as src/tmp. Group 1 is the dir."""
+    dirs = '|'.join(re.escape(s) for s in spellings(tempfile.gettempdir()))
+    return re.compile(rf'(?<![\w.~/\\-])((?:{dirs})[/\\])cc[A-Za-z0-9]{{6}}(?=\.)',
+                      re.IGNORECASE if os.name == 'nt' else 0)
 
 
 def comparable(text, root):
@@ -430,7 +433,7 @@ def comparable(text, root):
     read as the checkout and what VARYING and temp_gcc() name masked: each number standing alone (a duration, a line
     number, a count), a time, a pytest-xdist worker's number and a temporary file's name. A violation the change adds
     is a line more."""
-    lines = (VARYING.sub('#', line).strip() for line in temp_gcc().sub('#', as_checkout(text, root)).splitlines())
+    lines = (VARYING.sub('#', line).strip() for line in as_checkout(temp_gcc().sub(r'\1#', text), root).splitlines())
     return sorted(line for line in lines if line)
 
 
@@ -475,25 +478,28 @@ def pre_commits_load(deadline, start):
 
 def config_ids(deadline, start):
     """({each id SKIP cannot skip that hook alone by: why}, each entry's id stripped, as hooks' blocks are read, in the
-    order pre-commit runs them, ''), or (None, None, why) when the config cannot be read. SKIP's names would also skip
-    another hook: an alias the config gives a hook under another id, and an id more than one entry uses; and it strips
-    each name, so a padded id it cannot name (pre-commit's commands/run.py)."""
+    order pre-commit runs them, whether a hook may stop the run early, ''), or (None, None, None, why) when it cannot be
+    read; a remote repository's manifest may set a hook's fail_fast unless the hook's entry sets it.
+    SKIP's names would also skip another hook: an alias the config gives a hook under another id, and an id more than
+    one entry uses; and it strips each name, so a padded id it cannot name (pre-commit's commands/run.py)."""
     try:
         if yaml:
             config = yaml.safe_load(Path(CONFIG).read_text(encoding='utf-8'))
         else:
             config, why = pre_commits_load(deadline, start)
             if why:
-                return None, None, why
+                return None, None, None, why
         entries = [h for repo in config['repos'] for h in repo['hooks']]
         ids = [h['id'] for h in entries]
         shared = {i: 'SKIP would skip another hook by it' for i in ids if ids.count(i) > 1}
         shared |= {h['alias']: 'SKIP would skip another hook by it' for h in entries
                    if h.get('alias') not in (None, '', h['id'])}
         shared |= {i.strip(): 'SKIP cannot name it' for i in ids if i != i.strip()}
-        return shared, [i.strip() for i in ids], ''
+        stops = bool(config.get('fail_fast')) or any(h.get('fail_fast', repo['repo'] not in ('local', 'meta'))
+                                                     for repo in config['repos'] for h in repo['hooks'])
+        return shared, [i.strip() for i in ids], stops, ''
     except (OSError, ValueError, KeyError, TypeError, AttributeError, *YAML_ERRORS) as e:
-        return None, None, f'{CONFIG} cannot be read ({type(e).__name__})'
+        return None, None, None, f'{CONFIG} cannot be read ({type(e).__name__})'
 
 
 def unexcusable(hook, ids, shared, unread):
@@ -581,7 +587,8 @@ def baseline(expected, paths, deadline, start):
         tree = os.path.join(tmp, 'head')
         # tmp holds no hook: a post-checkout or reference-transaction hook would change or fail HEAD's tree.
         no_hooks = ('-c', f'core.hooksPath={tmp}')
-        git_within(deadline, start, *no_hooks, 'worktree', 'add', '--detach', '--quiet', tree, 'HEAD')
+        # Locked till forget: another session's prune could drop the entry once the tree goes, and its name be reused.
+        git_within(deadline, start, *no_hooks, 'worktree', 'add', '--lock', '--detach', '--quiet', tree, 'HEAD')
         for hook, outputs in expected.items():
             if judged:
                 # What an earlier rerun rewrote or left behind could fail the next one: each gets HEAD as is.
@@ -627,7 +634,7 @@ def run_hooks(paths, deadline=DEADLINE, start=None):
     start = time.monotonic() if start is None else start
     config = functools.cache(lambda: config_ids(deadline, start))
     code, ids, failures = passes(paths, deadline, start, 'run', config)
-    shared, order, unread = config() if failures else ({}, [], '')
+    shared, order, stops, unread = config() if failures else ({}, [], False, '')
     found, excused, not_rerun = failures, [], {}
     while True:
         expected = {}
@@ -641,7 +648,7 @@ def run_hooks(paths, deadline=DEADLINE, start=None):
         excused += newly
         for hook, why in late.items():
             not_rerun.setdefault(hook, why)
-        if not newly or not {f['hook'] for f in found} <= set(excused):
+        if not newly or not {f['hook'] for f in found} <= set(excused) or not stops:
             break
         # fail_fast may have stopped the run at an excused hook: every other hook must pass on the change, as the
         # commit will run them with the same SKIP, or fail on HEAD too.

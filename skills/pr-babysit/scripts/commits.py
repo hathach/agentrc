@@ -180,7 +180,12 @@ def skip_env(ids):
     for i in ids:
         if not i or i != i.strip():
             raise Unusable(f'--skip-hooks {i!r} names no hook SKIP can skip')
-    return {**os.environ, 'SKIP': ','.join([*filter(None, os.environ.get('SKIP', '').split(',')), *ids])}
+    return with_skip(os.environ, ids)
+
+
+def with_skip(env, ids):
+    """env with ids added to the SKIP it holds."""
+    return {**env, 'SKIP': ','.join([*filter(None, env.get('SKIP', '').split(',')), *ids])}
 
 
 def outcome(paths, skip=()):
