@@ -64,6 +64,10 @@ RESTORE_FAILED = 6   # restore --release: the restore failed or was refused, the
 GDB_SERVER = ['-c', 'gdb port pipe', '-c', 'gdb memory_map disable', '-c', 'gdb breakpoint_override hard']
 # An RP2040 SMP resume restores core1 only after each core is polled (target-debug gdb.md, verified on the Pico)
 GDB_DETACH_RESUME = {'target/rp2040.cfg': '{ foreach u [target names] { $u arp_poll }; resume }'}   # by debug cfg
+# Espressif's gdb per Xtensa chip, the rest RISC-V (target-debug espressif.md; hil-farm-setup farm.toml installs them):
+# gdb-multiarch has no Xtensa ESP target
+ESP_GDB = {'esp32': 'xtensa-esp32-elf-gdb', 'esp32s2': 'xtensa-esp32s2-elf-gdb', 'esp32s3': 'xtensa-esp32s3-elf-gdb'}
+ESP_GDB_RISCV = 'riscv32-esp-elf-gdb'
 # Probe commands, by the openocd flasher's target cfg, that take the DUT off the bus before a flash or console reset.
 # A probe reset leaves the RP2040/RP2350 USB controller out of reset, and a USB stack's init resets and reconnects it
 # within microseconds, so without this the host never sees the new image arrive: clear SIE_CTRL.PULLUP_EN
@@ -1185,7 +1189,7 @@ def esp_openocd(dbg, chip):
 
 
 def gdb_argv(name, board, elf, commands):
-    """gdb-multiarch in batch mode over an openocd it starts on a pipe, configured by the roster's debug.openocd and
+    """gdb in batch mode (gdb-multiarch; Espressif's for the chip on debug.tool openocd-esp32) over an openocd it starts on a pipe, configured by the roster's debug.openocd and
     pinned to the board's probe. The firmware must run on once gdb ends:
     - openocd halts the target on gdb's connect and has no default gdb-detach handler, so one resumes it; it runs when
       the connection closes (gdb_server.c gdb_connection_closed), i.e. when gdb exits, not at `detach`;
@@ -1195,8 +1199,13 @@ def gdb_argv(name, board, elf, commands):
       made a hardware one (openocd.texi, gdb_breakpoint_override).
     debug.tool openocd-esp32 runs Espressif's openocd on the chip's USB-Serial/JTAG (debug.uid, esp_openocd)."""
     dbg = board['debug']
+    gdb = 'gdb-multiarch'
     if dbg.get('tool') == 'openocd-esp32':
-        openocd = esp_openocd(dbg, B.P.BOARDS[name]['chip'])
+        chip = B.P.BOARDS[name]['chip']
+        openocd = esp_openocd(dbg, chip)
+        gdb = ESP_GDB.get(chip, ESP_GDB_RISCV)
+        if not shutil.which(gdb):
+            raise RuntimeError(f'{gdb}, the {chip} gdb, is not on PATH')
     else:
         probe = {'name': 'openocd', 'uid': board['flasher']['uid'], 'args': dbg['openocd']}
         if board['flasher']['name'] == 'openocd' and 'vid_pid' in board['flasher']:
@@ -1205,7 +1214,7 @@ def gdb_argv(name, board, elf, commands):
     cfgs = shlex.split(dbg['openocd'])   # the silicon: the RP2350 boards share the rp2040 build family
     handler = next((h for cfg, h in GDB_DETACH_RESUME.items() if cfg in cfgs), '{ resume }')
     openocd += [*GDB_SERVER, '-c', f'foreach t [target names] {{ $t configure -event gdb-detach {handler} }}']
-    return ['gdb-multiarch', '-batch', '-nx', '-ex', f'target extended-remote | {shlex.join(openocd)}',
+    return [gdb, '-batch', '-nx', '-ex', f'target extended-remote | {shlex.join(openocd)}',
             *(w for c in commands for w in ('-ex', c)), elf]
 
 
