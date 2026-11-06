@@ -161,7 +161,8 @@ def diff_path(text):
 
 def count_test_defs(repo, base, end):
     """{test file: [added, removed]} counting test function heads in the diff of test paths."""
-    out = git(repo, '-c', 'core.quotePath=false', 'diff', '-U0', '--no-color', '-M', base, end).stdout
+    out = git(repo, '-c', 'core.quotePath=false', 'diff', '-U0', '--no-color', '-M', '--src-prefix=a/',
+              '--dst-prefix=b/', base, end).stdout
     counts, old, path = defaultdict(lambda: [0, 0]), None, None
     for line in out.splitlines():
         if line.startswith('--- '):

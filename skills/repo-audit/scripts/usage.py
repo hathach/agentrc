@@ -64,9 +64,10 @@ class Repo:
     def __init__(self, path, head):
         self.top = Path(git(path, 'rev-parse', '--show-toplevel').stdout.strip())
         self.name = self.top.name
-        self.checkouts = [Path(os.path.realpath(line[9:])) for line in
-                          git(path, 'worktree', 'list', '--porcelain').stdout.splitlines()
-                          if line.startswith('worktree ')]
+        # deepest first: a worktree nested in the main checkout must match before it
+        self.checkouts = sorted((Path(os.path.realpath(line[9:])) for line in
+                                 git(path, 'worktree', 'list', '--porcelain').stdout.splitlines()
+                                 if line.startswith('worktree ')), key=lambda c: len(c.parts), reverse=True)
         self.files = set(git(path, 'ls-tree', '-r', '--name-only', '-z', head).stdout.split('\0')) - {''}
         self.head = head
         self.skills = {f.split('/')[1] for f in self.files if re.fullmatch(r'skills/[^/]+/SKILL\.md', f)}

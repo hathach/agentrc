@@ -135,6 +135,12 @@ class Start(unittest.TestCase):
         inv = json.loads((self.out / 'inventory.json').read_text(encoding='utf-8'))
         self.assertEqual(sorted(inv['tests_added_removed']), [[0, 2, 'tests/test_a.py'], [1, 0, 'tests/test é b.py']])
 
+    def test_a_noprefix_config_does_not_change_the_paths(self):
+        self.repo.git('config', 'diff.noprefix', 'true')
+        self.assertEqual(self.start('--base', self.base)[0], 0)
+        inv = json.loads((self.out / 'inventory.json').read_text())
+        self.assertEqual(inv['tests_added_removed'], [[2, 1, 'tests/test_a.py']])
+
     @unittest.skipUnless(os.name == 'posix', 'a double quote cannot be in a Windows file name')
     def test_a_name_git_quotes_is_decoded(self):
         self.repo.commit({'tests/café "q".py': 'def test_q():\n  pass\n'})
@@ -330,6 +336,16 @@ class Usage(unittest.TestCase):
         self.assertEqual(agg['scripts']['skills/tool/scripts/tool.py']['invoke'], 1)
         self.assertEqual(agg['unattributed'], {'skills/tool/scripts/tool.py': 1})
         self.assertEqual(agg['unknown'], {'unresolved_variable': 1})
+
+    def test_a_worktree_nested_in_the_main_checkout_attributes(self):
+        nested = self.repo.path / '.worktrees' / 'b'
+        self.repo.git('worktree', 'add', '-q', str(nested), '-b', 'b')
+        claude(self.root / 'p' / 's1.jsonl', [
+            use('a', 'Bash', {'command': f'python3 {nested.as_posix()}/skills/tool/scripts/tool.py send'})])
+        self.usage()
+        agg = json.loads(self.out.read_text())
+        self.assertEqual(agg['scripts']['skills/tool/scripts/tool.py']['invoke'], 1)
+        self.assertEqual(agg['unattributed'], {})
 
     def test_callers_names_and_doc_reads(self):
         claude(self.root / 'p' / 's1' / 'subagents' / 'workflows' / 'wf_1' / 'agent-1.jsonl', [

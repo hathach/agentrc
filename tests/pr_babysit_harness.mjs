@@ -214,6 +214,7 @@ async function run(opts = {}) {
   const loads = [] // each scriptPath workflow() loaded
   // facts.py emit-dir's directory: opts.emitDir, else a new one this run removes unless opts.keepEmit.
   const emit = emitDirs('pr-babysit-emit-', opts.emitDir, opts.keepEmit)
+  let dirCalls = 0 // facts.py emit-dir runs; opts.dirAnswer(n) answers the nth instead (undefined: the directory)
 
   // One harvest per cycle, whichever of the validator and the probe (#359) asks for it first.
   const readings = new Map()
@@ -254,7 +255,11 @@ async function run(opts = {}) {
   const agent = async (prompt, options) => {
     const label = options.label
     // facts.py emit-dir, the transport's own bootstrap, is in the journal only.
-    if (label === 'emit:dir') return { dir: emit.dir() }
+    if (label === 'emit:dir') {
+      const answer = opts.dirAnswer ? opts.dirAnswer(++dirCalls) : undefined
+      if (answer instanceof Error) throw answer
+      return answer === undefined ? { dir: emit.dir() } : answer
+    }
     calls.push({
       label, prompt: String(prompt), agentType: options.agentType,
       phase: options.phase, schema: options.schema, model: options.model,
@@ -7622,6 +7627,16 @@ test('a state that does not check out, or no line of this run, blocks before pre
     assert.deepEqual([got.result.status, got.result.reason, got.result.stateRef], ['blocked', 'state-transfer-failed', stateRef])
     assert.match(got.result.detail, detail)
     assert.deepEqual(got.labels, /^the relay died$/.test(got.result.detail) ? ['state:load', 'state:load.retry'] : ['state:load'], 'nothing past the loader runs')
+  }
+})
+
+test('a failed emit-dir read is asked again by the next relay, the load\'s retry included', async () => {
+  const { state, stateRef } = await savedForLoad()
+  for (const answer of [{ dir: '', error: 'no git dir' }, { dir: '/tmp/agentrc-emit/r1x/' }, null, new Error('boom')]) {
+    const got = await run({ args: { yieldAfterCycle: true, maxCycles: 3, stateRef }, load: state, dirAnswer: n => n === 1 ? answer : undefined })
+    assert.deepEqual(got.labels.slice(0, 2), ['state:load.retry', 'preflight'], JSON.stringify(answer))
+    assert.deepEqual(got.journal.slice(0, 2).map(j => j.label), ['emit:dir', 'emit:dir'])
+    assert.equal(got.result.state.cyclesUsed, 2)
   }
 })
 

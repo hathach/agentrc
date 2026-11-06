@@ -221,7 +221,10 @@ const emitDirOf = () => emitDir ??= agent(
   if (r && /^(?:[A-Za-z]:)?\/(?!\/)[^'\n]*\/agentrc-emit\/[A-Za-z0-9_]+$/.test(r.dir)) return r.dir
   log(`emit:dir: no directory for the scripts' lines — ${r ? r.error || JSON.stringify(r.dir) : 'the relay died'}`)
   return null
-}, e => { log(`emit:dir errored — ${e && e.message}`); return null })
+}, e => { log(`emit:dir errored — ${e && e.message}`); return null }).then(dir => {
+  if (!dir) emitDir = null // only a directory is kept: the next relay, a .retry included, asks again
+  return dir
+})
 const emitCount = new Map()
 // One relay's run: { line } as its script wrote it, else { why }, dead when the relay died and left no line.
 const emitted = async (prompt, { label, ...opts }) => {

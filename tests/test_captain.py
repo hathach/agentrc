@@ -2092,6 +2092,22 @@ class WatchCollectTest(WatchCase):
         code, lines = self.collect()
         self.assertEqual(lines[1:], [f'reported {msg} · ready', f'pending: {m} {self.watch_id()}'])
 
+    def test_a_new_watch_keeps_the_last_watch_s_unseen_reports_but_no_request_collected_by_id(self):
+        self.arm('t2')
+        w = self.watch_id()
+        m = self.joined_as('t2')
+        self.collect()
+        self.report_as('t2', m)   # after the stored cursor: its line is still due
+        n = len(captain.records()) - 1
+        captain.cancel(w, self.ident)
+        self.terminals['t3'] = pinned('t3')
+        msg = self.msg_of(self.ask('t3'))
+        self.report_as('t3', msg)
+        self.assertEqual(self.collect(msg)[1], [f'reported {msg} · ready', 'done'])
+        self.arm('all')
+        new = [r['msg'] for r in captain.records() if r['type'] == 'watch'][-1]
+        self.assertEqual(self.collect()[1], [f'reported {m}:{n} · ready', f'cancelled {w}', f'pending: {new}'])
+
     def test_a_collect_stops_when_the_captain_is_replaced_and_follows_nothing_new(self):
         msg = self.msg_of(self.ask())   # open: the collect waits for it
         new = captain.identity(pinned('t4'))
