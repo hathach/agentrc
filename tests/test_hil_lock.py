@@ -1610,13 +1610,33 @@ class CleanupLog(LockDir):
         malformed = ({'receipts': 'r'}, {'receipts': {}}, {'retained': ''}, {'receipts': [], 'task': {'receipts': 0}})
         for i, fields in enumerate(malformed):   # hand-written lines: log_cleanup_failure lists its evidence
             hil_lock._log_append(BOARD, {'event': 'failed', 'id': f'hand-{i}', **fields})
+
+        def taken_over(predecessor, prior=None):   # an older helper's takeover journal
+            return {'token': 't', 'predecessor': json.dumps(predecessor) if isinstance(predecessor, dict)
+                    else predecessor, 'prior': prior}
+        holder = {'role': hil_lock.CLEANUP_ROLE, 'pid': 9}
+        journals = {'journal-open-child': taken_over({**holder, 'receipts': [{'pid': 7}]}),
+                    'journal-open-session': taken_over(holder, taken_over({**holder, 'retained': ['/open.json']})),
+                    'journal-unreadable': {'unreadable': 'x'},
+                    'journal-predecessor-unreadable': taken_over('{cut'),
+                    'journal-prior-unreadable': taken_over(holder, {}),
+                    'journal-malformed': taken_over({**holder, 'receipts': 'r'}),
+                    'journal-resolved': taken_over('', taken_over(b'~{"reason": "x"}'.decode(),
+                                                                  taken_over({**holder, 'receipts': [{'ok': 1}]})))}
+        for jid, journal in journals.items():
+            hil_lock._log_append(BOARD, {'event': 'failed', 'id': jid, 'how': 'found-left',
+                                         'task': {**holder, 'reason': 'takeover'}, 'journal': journal})
         failures = hil_lock.open_cleanup_failures(BOARD) + [{'unavailable': 'no id'}]
         notes = hil_lock.resolve_restored(BOARD, failures, evidence='restored')
         left = [f['id'] for f in hil_lock.open_cleanup_failures(BOARD)]
-        self.assertEqual(left, [f['id'] for f in failures[:4]] + [f'hand-{i}' for i in range(len(malformed))])
-        self.assertEqual(len(notes), 8)
+        self.assertEqual(left, [f['id'] for f in failures[:4]] + [f'hand-{i}' for i in range(len(malformed))]
+                         + list(journals)[:-1])
+        self.assertEqual(len(notes), 14)
         self.assertIn('not proven ended', notes[1])
-        self.assertTrue(all('malformed' in n for n in notes[4:]), notes[4:])
+        self.assertTrue(all('malformed' in n for n in notes[4:8]), notes[4:8])
+        self.assertIn('not proven ended', notes[9])
+        self.assertTrue(all('journal cannot be read' in n for n in notes[10:13]), notes[10:13])
+        self.assertIn('malformed', notes[13])
 
     def test_a_session_command_logs_a_failure_without_the_flock(self):
         self.acquire()   # a detached hold: the command logging runs under it, not as its holder

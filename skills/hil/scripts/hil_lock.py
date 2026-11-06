@@ -634,22 +634,45 @@ def _evidence(failure, task, key):
     return own if own not in (None, []) else task.get(key, [])
 
 
+def _journal_records(journal):
+    """The holder records an older helper's takeover journal kept as `predecessor`s down its
+    `prior` chain, or None when a link cannot be read; an empty or acquiring one kept none."""
+    recs = []
+    while True:
+        if not isinstance(journal, dict) or not isinstance(journal.get('predecessor'), str):
+            return None
+        data = journal['predecessor'].encode()
+        state, rec = _parse(data)
+        if state == 'record':
+            recs.append(rec)
+        elif state == 'unreadable' and not _acquiring(data):
+            return None
+        journal = journal.get('prior')
+        if journal is None:
+            return recs
+
+
 def resolve_restored(board, failures, **evidence) -> list:
     """After the caller restored `board`: mark restored (cleanup_restored, with `evidence`) each of
     `failures` (its take's `cleanup_failures`, or open_cleanup_failures under its hold) whose own
-    evidence is resolved: every receipt, a legacy task record's included, rechecks `done` as the
-    caller, and every session it retained reads ended (_release_blocker). Returns why each other
-    one stays open or its restoration was not logged; a failure without an id is skipped."""
+    evidence is resolved: every receipt, a legacy task record's and those its takeover journal kept
+    included, rechecks `done` as the caller, and every session they retained reads ended
+    (_release_blocker). Returns why each other one stays open or its restoration was not logged;
+    a failure without an id is skipped."""
     notes = []
     for f in failures:
         fid = f.get('id')
         if not isinstance(fid, str):
             continue
         task = f.get('task') if isinstance(f.get('task'), dict) else {}
-        receipts, retained = (_evidence(f, task, k) for k in ('receipts', 'retained'))
-        if not isinstance(receipts, list) or not isinstance(retained, list):
+        held = _journal_records(f['journal']) if 'journal' in f else []
+        if held is None:
+            notes.append(f'{fid} stays open: its takeover journal cannot be read')
+            continue
+        receipts, retained = ([_evidence(f, task, k)] + [r.get(k, []) for r in held] for k in ('receipts', 'retained'))
+        if not all(isinstance(x, list) for x in receipts + retained):
             notes.append(f'{fid} stays open: its evidence is malformed')
-        elif why := _release_blocker(receipts, retained=retained):
+        elif why := _release_blocker(sum(receipts, []), retained=sum(retained, [])):
             notes.append(f'{fid} stays open: {why}')
         else:
             try:

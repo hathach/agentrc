@@ -214,6 +214,22 @@ class Loop(unittest.TestCase):
         res, calls = self.run_board([row('fail'), row('fail')])
         self.assertEqual((res['verdict'], res['flaky'], len(calls)), ('fail', False, 2))
 
+    def test_an_earlier_failed_cleanup_is_kept_and_logged_on_a_passing_run(self):
+        failure = {'id': 'f1', 'at': 't', 'how': 'restore', 'reason': 'ci', 'pid': 3, 'detail': 'no echo'}
+        first = {**row('fail'), 'previousCleanupFailure': failure, 'openCleanupFailures': 2,
+                 'previousPending': 'children an older engine recorded pending: x'}
+        with mock.patch.object(C, 'log') as log:
+            res, _ = self.run_board([first, row('pass')])
+        self.assertEqual((res['verdict'], res['previousCleanupFailure'], res['openCleanupFailures'],
+                          res['previousPending']), ('pass', failure, 2, first['previousPending']))
+        self.assertEqual(res['attempts'][0]['previousCleanupFailure'], failure)
+        self.assertNotIn('previousCleanupFailure', res['attempts'][1])
+        lines = [c.args[0] for c in log.call_args_list]
+        self.assertTrue(any("earlier task's cleanup failed" in m and 'id f1' in m for m in lines), lines)
+        self.assertIn(f'{BOARD}: {first["previousPending"]}', lines)
+        res, _ = self.run_board([row('pass')])
+        self.assertFalse(any(k in res or k in res['attempts'][0] for k in C.EARLIER))
+
     def test_blocker_and_not_run_are_never_retried(self):
         for verdict in ('blocker', 'not-run'):
             res, calls = self.run_board([row(verdict)])

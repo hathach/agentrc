@@ -985,7 +985,7 @@ def _manual(args):
     held_by(args.board, args.under_hold)   # first: restore --release releases after any later refusal
     if args.cmd == 'restore' and args.release:
         return _restore_and_release(args)
-    out, code, _ = _session_op(args)
+    out, code, _ = _session_op(args, session_run_dir(args))
     emit(out)
     return code
 
@@ -998,15 +998,18 @@ def _session_inputs(args):
     return roster, manifest
 
 
-def _session_op(args):
-    """(the command's JSON, its exit code, the interrupt it turned into exit 4 or None). A restore records its outcome
-    in the board's cleanup log: one that failed, was refused or raised as a failure, a passing one as the restoration
-    of the failure seen before it ran."""
+def session_run_dir(args):
+    return P.ROOT / 'build' / 'hil-manual' / f'{args.board}-{args.cmd}-{time.strftime("%Y%m%d-%H%M%S")}'
+
+
+def _session_op(args, run_dir):
+    """(the command's JSON, its exit code, the interrupt it turned into exit 4 or None), the JSON also in run_dir's
+    result.json. A restore records its outcome in the board's cleanup log: one that failed, was refused or raised as a
+    failure, a passing one as the restoration of the failure seen before it ran."""
     found = A.lock.open_cleanup_failures(args.board)
     tracker, extra, interrupt = None, {}, None
     try:
         roster, manifest = _session_inputs(args)
-        run_dir = P.ROOT / 'build' / 'hil-manual' / f'{args.board}-{args.cmd}-{time.strftime("%Y%m%d-%H%M%S")}'
         run_dir.mkdir(parents=True, exist_ok=True)
         tracker = Tracker(run_dir)
         extra = A.lock.failure_report(found)
@@ -1045,8 +1048,9 @@ def _restore_and_release(args):
     Exit 0 restored and released, RESTORE_FAILED released after a restore that failed or was refused,
     RELEASE_FAILED not released (the hold may still stand); an interrupt propagates once the release ran."""
     out, code, interrupted = {'pass': False, 'board': args.board}, None, None
+    run_dir = session_run_dir(args)
     try:
-        out, code, interrupted = _session_op(args)
+        out, code, interrupted = _session_op(args, run_dir)
     except Exception as e:
         out['error'] = '; '.join([str(e) if isinstance(e, Refused) else f'{type(e).__name__}: {e}',
                                   *getattr(e, '__notes__', ())])
@@ -1061,6 +1065,11 @@ def _restore_and_release(args):
     else:
         code = 0 if restored else RESTORE_FAILED
     out['pass'] = code == 0
+    try:   # the final verdict, released included, replaces the restore's own result.json
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / 'result.json').write_text(json.dumps(out) + '\n')
+    except OSError as e:
+        out['resultError'] = f'{run_dir / "result.json"} not written: {e}'
     emit(out)
     if interrupted is not None:
         raise interrupted

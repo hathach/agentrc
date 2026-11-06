@@ -1243,6 +1243,27 @@ class Manual(Base):
                 self.assertEqual(json.loads(out.getvalue())['pass'], code == 0)
                 self.assertEqual(len(self.lock.logged), logged)
 
+    def test_restore_release_keeps_the_final_verdict_in_result_json(self):
+        args = self.held(cmd='restore', build_record=str(self.record()), report=None, release=True)
+        with mock.patch.object(H, 'restore', return_value={'pass': True, 'state': 'echo restored', 'evidence': 'e'}), \
+                mock.patch.object(H, 'git_identity', return_value=('abc', '')), \
+                mock.patch.object(H.Tracker, '__init__', fake_tracker_init), \
+                mock.patch.object(H, 'release_hold', return_value={'exit': 1, 'output': 'ssh dropped'}), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(H.manual(args), H.RELEASE_FAILED)
+        result = json.loads(next((self.root / 'build/hil-manual').glob('rig_jlink-restore-*/result.json')).read_text())
+        self.assertEqual(result, json.loads(out.getvalue()))
+        self.assertEqual((result['pass'], result['restored'], result['released']),
+                         (False, True, {'exit': 1, 'output': 'ssh dropped'}))
+
+    def test_restore_release_refused_before_its_run_dir_still_keeps_a_result(self):
+        args = self.held(cmd='restore', build_record=str(self.record()), report=None, release=True,
+                         staged='manifest.json')
+        code, out, _ = self.release_restore(args, verify_staged=mock.Mock(side_effect=H.Refused('staged tree changed')))
+        self.assertEqual(code, H.RESTORE_FAILED)
+        result = json.loads(next((self.root / 'build/hil-manual').glob('rig_jlink-restore-*/result.json')).read_text())
+        self.assertEqual(result, out)
+
     def test_restore_release_releases_before_an_interrupt_propagates(self):
         args = self.held(cmd='restore', build_record=str(self.record()), report=None, release=True)
         with mock.patch.object(H, 'restore', side_effect=KeyboardInterrupt), \
