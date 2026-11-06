@@ -1847,14 +1847,15 @@ const pushExact = async (sha, label, prToo = false) => {
   const opts = { label, phase: 'Push', model: 'haiku', effort: 'low', schema: PUSH }
   // A retry finds a push that landed; it cannot prove one did not.
   const first = await relayRun(prompt, opts)
-  const r = first ?? await relayRetry(prompt, opts)
+  const lost = !first || first.transport
+  const r = lost ? (await relayRetry(prompt, opts)) ?? first : first
   if (!r) return null
   const unknown = (detail) => ({ pass: false, detail, published: 'unknown' })
   if (r.error) return unknown(r.error)
   // push.py pushed nothing to a PR it did not read OPEN; the caller stops on it. A retry cannot prove the first attempt did not land.
   if (r.prState !== 'OPEN') {
     const prState = r.prState === 'MERGED' || r.prState === 'CLOSED' ? r.prState.toLowerCase() : 'unread'
-    return { pass: false, detail: r.detail, prState, ...(first ? {} : { published: 'unknown' }) }
+    return { pass: false, detail: r.detail, prState, ...(lost ? { published: 'unknown' } : {}) }
   }
   if (r.heads.map(h => h.url).join('\n') !== pinned.pushUrls.join('\n')) return unknown(`the receipt names ${r.heads.map(h => h.url).join(', ') || 'no destination'}`)
   const heads = r.heads.map(h => h.head === null ? null : h.head.trim())
@@ -1862,7 +1863,7 @@ const pushExact = async (sha, label, prToo = false) => {
   if (heads.every(h => h === sha) && prHead === sha) return { pass: true, detail: r.detail }
   if (heads.every(h => h !== null && h !== sha)) {
     const detail = (!r.pushed && r.detail) || `${r.heads[0].url} heads ${heads[0].slice(0, 7) || 'nothing'} after the push, not ${sha.slice(0, 7)}`
-    return first ? { pass: false, detail } : unknown(`${detail}, after an earlier attempt lost its receipt`)
+    return lost ? unknown(`${detail}, after an earlier attempt lost its receipt`) : { pass: false, detail }
   }
   const unread = r.heads.filter((h, i) => heads[i] === null).map(h => h.url)
   return unknown(unread.length ? `no read-back from ${unread.join(', ')}`
@@ -2277,9 +2278,9 @@ const ciLaneRun = async (cycle, lanes, entry) => {
     }
     return relayRun(prompt(command), opts).then(got => {
       // A retry after a rate limit would only call GitHub again.
-      if (got || githubLimit) return skewed(got)
+      if ((got && !got.transport) || githubLimit) return skewed(got)
       shortened = shortened || /--wait-seconds [1-9]/.test(command)
-      return relayRetry(prompt(command.replace(/--wait-seconds \d+/, '--wait-seconds 0')), opts).then(skewed)
+      return relayRetry(prompt(command.replace(/--wait-seconds \d+/, '--wait-seconds 0')), opts).then(r => skewed(r ?? got))
     })
   }
   // A slice retried without its wait leaves the budget short of a whole wait.

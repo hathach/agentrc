@@ -1827,6 +1827,15 @@ test('the CI lane waits out its budget in slices, 30 minutes by default', async 
 const inventoryWaits = (calls, cycle) => calls.filter(c => c.label.startsWith(`ci:collect#${cycle}.`) && / inventory /.test(c.prompt))
   .map(c => Number(c.prompt.match(/inventory --wait-seconds (\d+)/)[1]))
 
+test('a collector killed before its line is retried without its wait, and a failed retry keeps the first error', async () => {
+  const killed = await run({ killedAfter: (l) => l === 'ci:collect#1.1', args: { maxCycles: 1 } })
+  assert.match(killed.calls.find(c => c.label === 'ci:collect#1.1.retry')?.prompt ?? '', /inventory --wait-seconds 0 /, killed.labels.join(', '))
+  assert.equal(killed.result.state.last.ciCollectFailed, undefined)
+  const both = await run({ killedAfter: (l) => l.startsWith('ci:collect#1.1'), args: { maxCycles: 1 } })
+  assert.ok(both.labels.includes('ci:collect#1.1.retry'), both.labels.join(', '))
+  assert.equal(both.result.state.last.ciCollectFailed.error, 'the script wrote no line (exit 137)')
+})
+
 test("a review bot's own check is left to the review lane, and CI settles once the review pass is done (#80)", async () => {
   const onlyBot = { ...RUNNING, pending: 0, registered: 0, waiting: 'none', ignored: ['CodeRabbit'] }
   const reads = (calls) => calls.filter(c => c.label.startsWith('ci:collect#') && / inventory /.test(c.prompt))
@@ -3456,6 +3465,17 @@ test('a publisher receipt whose line does not match its seal is no answer, never
   assert.ok(commit.logs.some(l => l.startsWith('commit#1-review: the line does not match its seal: {')))
   assert.ok(commit.labels.some(l => l.startsWith('push#')), 'the push went ahead')
   assert.equal(commit.result.history[0].reviewPushFailed, undefined)
+})
+
+test('a push killed before its line is retried, and a retry that finds the branch elsewhere stays unknown', async () => {
+  const killed = await run({ reviews: oneValid, killedAfter: (l) => l === 'push#1-review' })
+  assert.ok(killed.labels.includes('push#1-review.retry'), killed.labels.join(', '))
+  assert.equal(killed.result.history[0].reviewPushFailed, undefined)
+  assert.ok(killed.logs.includes('push#1-review: relay recovered on the retry'), killed.logs.join('\n'))
+  const rejected = ({ seal, ...a }) => sealLine({ ...a, pushed: false, detail: ' ! [rejected] non-fast-forward', heads: a.heads.map(h => ({ ...h, head: FOREIGN })) })
+  const moved = await run({ reviews: oneValid, killedAfter: (l) => l === 'push#1-review', garble: (l, a) => l === 'push#1-review.retry' ? rejected(a) : a })
+  assert.equal(moved.result.state.pending.stage, 'publication-unknown')
+  assert.match(moved.result.history[0].reviewPushFailed.detail, /non-fast-forward, after an earlier attempt lost its receipt$/)
 })
 
 test("a commit line that fails its seal, or none, is recovered from the script's receipt, never by a second commit (#266)", async () => {
