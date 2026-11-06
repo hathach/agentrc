@@ -15,6 +15,8 @@ mkdir -p "$HOME/.cache/agentrc-tmp" && TMPDIR="$HOME/.cache/agentrc-tmp" python 
   on a change. About a minute with 16 workers (`-n auto` counts physical cores where psutil imports). The serial
   `python -X utf8 -m unittest discover -s tests` runs the same tests many times slower and is no verification, nor is
   a path or `-k` after `tests`: only quicker checks while working.
+- A `pre-commit` on PATH, which pr-babysit's hook tests then run, must be a version `hook_runner.py`'s `SUPPORTED`
+  lists; CI pins one.
 - `buildOk` is true only when the command exits 0 and its last line reports `passed` with no `N failed` or `N error(s)`
   count (`xfailed` and `xpassed` are not failures).
   `notes` quotes that line (`N passed, M skipped ... in Ts`); on a failure, the first failing test's id and its error.
