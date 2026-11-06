@@ -1831,7 +1831,8 @@ test('a collector killed before its line is retried without its wait, and a fail
   const killed = await run({ killedAfter: (l) => l === 'ci:collect#1.1', args: { maxCycles: 1 } })
   assert.match(killed.calls.find(c => c.label === 'ci:collect#1.1.retry')?.prompt ?? '', /inventory --wait-seconds 0 /, killed.labels.join(', '))
   assert.equal(killed.result.state.last.ciCollectFailed, undefined)
-  const both = await run({ killedAfter: (l) => l.startsWith('ci:collect#1.1'), args: { maxCycles: 1 } })
+  // A retry that returns nothing leaves the first attempt's own error.
+  const both = await run({ killedAfter: (l) => l === 'ci:collect#1.1', throwOn: (l) => l === 'ci:collect#1.1.retry', args: { maxCycles: 1 } })
   assert.ok(both.labels.includes('ci:collect#1.1.retry'), both.labels.join(', '))
   assert.equal(both.result.state.last.ciCollectFailed.error, 'the script wrote no line (exit 137)')
 })
