@@ -169,10 +169,10 @@ class Admit(Checkout):
         self.assertRefused('not this checkout')
 
 
-def row(verdict, locked=False, tests=None, holder=None):
+def row(verdict, locked=False, tests=None, cleanup_pass=True):
     return {'verdict': verdict, 'locked': locked, 'recoveryBlocker': False, 'detail': f'{verdict} detail',
             'tests': tests or [{'test': 'echo', 'pass': verdict == 'pass', 'detail': 'x'}],
-            'cleanup': {'pass': holder is None, 'state': 'restored', 'holder': holder},
+            'cleanup': {'pass': cleanup_pass, 'state': 'restored' if cleanup_pass else 'unknown', 'released': True},
             'firmware': {'fqbn': 'vend:arch:rig_ocd', 'platform': {'id': 'vend:arch', 'version': '1.0'}}}
 
 
@@ -304,10 +304,10 @@ class Prune(unittest.TestCase):
 
     def test_removes_only_old_runs_that_finished_clean(self):
         clean = {'kind': C.SUMMARY_KIND, 'termination': 'completed',
-                 'boards': [{'verdict': 'pass', 'cleanup': {'holder': None}}, {'verdict': 'not-run', 'cleanup': None}]}
+                 'boards': [{'verdict': 'pass', 'cleanup': {'released': True}}, {'verdict': 'not-run', 'cleanup': None}]}
         self.run_dir('1-1', clean)
         self.run_dir('2-1', clean, age_days=1)
-        self.run_dir('3-1', {**clean, 'boards': [{'verdict': 'blocker', 'cleanup': {'holder': {'token': 't'}}}]})
+        self.run_dir('3-1', {**clean, 'boards': [{'verdict': 'blocker', 'cleanup': {'pass': False, 'released': True}}]})
         self.run_dir('4-1', None)
         self.run_dir('5-1', {**clean, 'termination': 'aborted'})
         self.run_dir('notarun', clean)
@@ -414,7 +414,7 @@ class Run(Checkout):
         self.assertIn('gone', s['boards'][0]['detail'])
 
     def test_a_blocker_exits_2(self):
-        rc, s = self.run_cmd({BOARD: [row('blocker', holder={'token': 't'})]})
+        rc, s = self.run_cmd({BOARD: [row('blocker', cleanup_pass=False)]})
         self.assertEqual(rc, 2)
 
     def test_refuses_an_out_dir_not_named_run_attempt_and_an_unknown_board(self):

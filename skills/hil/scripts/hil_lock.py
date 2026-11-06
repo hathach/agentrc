@@ -7,6 +7,7 @@ import argparse
 import contextlib
 import errno
 import fcntl
+import hashlib
 import importlib.util
 import json
 import math
@@ -16,7 +17,6 @@ import secrets
 import select
 import signal
 import stat
-import subprocess
 import sys
 import time
 
@@ -43,18 +43,21 @@ BOARD_LOCK_DIR = '/tmp/tinyusb-hil-locks'
 CI_REASON = 'hil_test.py'
 # records naming these are never signalled by `release`, with or without the protected mark
 PROTECTED_REASONS = {CI_REASON, 'farm_check'}
-# a holder record role that never frees on its own: a recovery blocker (`hil` Board locks)
+# the role of an older helper's cleanup holder, a process that kept a board past its task
 CLEANUP_ROLE = 'cleanup-holder'
-RECOVERY_BLOCKER = "recovery blocker: release it only through the project's recovery procedure"
+RECOVERY_BLOCKER = ("an older helper's cleanup holder, which never frees on its own: its project's "
+                    "`hil_lock.py release --token` ends it")
+CLEANUP_OWED = 'cleanupOwed'  # record mark of a taker whose task restores the board; older helpers ignore it
 HOLD_KIND = 'hil_lock-hold'   # `holder` of a record this CLI's own hold process wrote
-JOURNAL = '.takeover'         # <board>.takeover: an unfinished or live recovery takeover
-REWRITING = b'#'              # byte 0 of a record being rewritten: unreadable, so a blocker
+JOURNAL = '.takeover'         # <board>.takeover: an older helper's recovery takeover, live or left
+CLEANUP_LOG = '.cleanup.jsonl'   # <board>.cleanup.jsonl: the board's failed cleanups and restorations
+LOG_WAIT = 5.0                # s a cleanup-log reader or writer waits for its mutex
+REWRITING = b'#'              # byte 0 of a record being rewritten: unreadable
 ACQUIRING = b'~'              # byte 0 while take_board_lock writes its first record: a free board
 DIR_MODE = 0o755
 SHARE_STEP = (f'a second OS user needs the lock dir sticky and world-writable, a one-time host step '
               f'once every project on the host runs this helper: sudo install -d -m 1777 {BOARD_LOCK_DIR}')
 RELEASE_WAIT = 3.0            # s a signalled holder gets to clear its records and exit
-HANDOFF_WAIT = 10.0           # s a handed-over cleanup holder gets for each step of the handoff
 _NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._+-]*\Z')
 
 
@@ -68,10 +71,8 @@ class BoardLocked(RuntimeError):
 
 
 class RecoveryBlocked(BoardLocked):
-    """The board carries an unresolved recovery, never waited out: on a free flock, the record
-    of a cleanup holder or a protected run that died, or a takeover journal, which only a
-    recovery takeover clears; on a held flock, a live cleanup holder or a takeover journal,
-    which the project's recovery procedure ends."""
+    """The flock is held by an older helper's cleanup holder (its record's `role`), which never
+    frees on its own, so it is never waited out; its project's `release --token` ends it."""
 
 
 class ReleaseRefused(RuntimeError):
@@ -252,7 +253,7 @@ def write_record(fh, reason: str, **extra) -> None:
     `extra` adds a tool's own fields (hil_reserve: token, start, locks, role). Overwritten in
     place, inode kept, behind REWRITING, a non-JSON first byte that is restored last: an
     interrupted rewrite leaves the old record or an unreadable one, never an empty record or a
-    valid splice of new and old bytes that a blocker would vanish as."""
+    valid splice of new and old bytes that a cleanup-owing record would vanish as."""
     _write_record(fh, REWRITING, reason, extra)
 
 
@@ -281,8 +282,9 @@ def clear_record(fh) -> bool:
 
 
 def release_board_lock(fh) -> None:
-    """A taker's clean exit: clear the record, then drop the flock. A protected taker that
-    only closes the handle leaves its record as a recovery blocker."""
+    """A taker's exit: clear the record, then drop the flock. It says nothing about the board's
+    state: a task whose cleanup failed ends with end_failed, one that restored a board recorded
+    as failed says so with cleanup_restored."""
     clear_record(fh)
     fh.close()
 
@@ -312,35 +314,12 @@ def read_record(board: str):
 
 
 def journal_state(board: str):
-    """None without a journal, else its dict ({} when it cannot be read: still a blocker)."""
+    """None without a journal, else its dict ({} when it cannot be read)."""
     try:
         state, rec = _parse(_read_file(board, JOURNAL))
     except OSError:
         return {}
     return None if state == 'absent' else rec or {}
-
-
-def takeover_predecessor(board: str, token: str):
-    """(state, record), as record_state gives them, of what the takeover holding `board` under
-    `token` replaced: the oldest journal's predecessor, so a takeover of a dead taker names the
-    original holder. LookupError says why it cannot be told: no journal, `token` not at the
-    head of the chain, or a chain element that cannot be read."""
-    _check_name(board)
-    journal = journal_state(board)
-    if journal is None:
-        raise LookupError(f'{board} has no takeover journal')
-    if not journal or journal.get('token') != token:
-        raise LookupError(f'{board}{JOURNAL} is not the takeover of token {token}'
-                          f'{"" if journal else ": it cannot be read"}')
-    while True:
-        if not isinstance(journal.get('token'), str) or not isinstance(journal.get('predecessor'), str):
-            raise LookupError(f'{board}{JOURNAL}: the takeover of token {journal.get("token")!r} kept no predecessor')
-        prior = journal.get('prior')
-        if prior is None:
-            return _parse(journal['predecessor'].encode())
-        if not isinstance(prior, dict) or not prior:
-            raise LookupError(f'{board}{JOURNAL} names an earlier takeover that cannot be read')
-        journal = prior
 
 
 def is_cleanup_holder(info) -> bool:
@@ -349,33 +328,33 @@ def is_cleanup_holder(info) -> bool:
 
 def is_protected(info) -> bool:
     """`release` never signals it; a malformed mark never cancels the legacy names."""
-    return isinstance(info, dict) and (info.get('protected') is True or info.get('reason') in PROTECTED_REASONS)
+    return isinstance(info, dict) and (info.get('protected') is True or info.get(CLEANUP_OWED) is True
+                                       or info.get('reason') in PROTECTED_REASONS)
 
 
-def is_recovery_blocker(info) -> bool:
-    """A record that, left behind on a free flock, means its cleanup never happened (so does
-    one that cannot be read: see _blocker)."""
-    return is_cleanup_holder(info) or (isinstance(info, dict) and info.get('protected') is True)
+def _owes_cleanup(info) -> bool:
+    """A record that, left behind on a free flock, means its task ended without its cleanup: this
+    helper's mark, an older helper's `protected` one, or an older helper's cleanup holder."""
+    return is_cleanup_holder(info) or (isinstance(info, dict) and (info.get('protected') is True
+                                                                   or info.get(CLEANUP_OWED) is True))
 
 
 def holder_text(info) -> str:
-    """A holder record for a message; a cleanup holder is named a recovery blocker."""
+    """A holder record for a message; an older helper's cleanup holder is named as one."""
     if not isinstance(info, dict):
         return 'unknown holder'
     text = json.dumps(info)
-    return f'{text} ({RECOVERY_BLOCKER})' if info.get('role') == CLEANUP_ROLE else text
+    return f'{text} ({RECOVERY_BLOCKER})' if is_cleanup_holder(info) else text
 
 
 def _held_refusal(board) -> BoardLocked:
-    """Why a flock another process holds refuses `board`: RecoveryBlocked for a cleanup holder or
-    with a takeover journal, else BoardLocked (contention)."""
-    rec, journal = read_record(board), journal_state(board)
+    """Why a flock another process holds refuses `board`: RecoveryBlocked for an older helper's
+    cleanup holder that is alive as recorded, else BoardLocked (contention: a taker still logging
+    a dead holder's record holds the flock under it)."""
+    rec = read_record(board)
     why = f'board locked: {holder_text(rec)}'
-    if journal is not None:
-        why += f'; takeover journal {json.dumps(journal)}'
-    if is_cleanup_holder(rec):     # holder_text names it a recovery blocker
-        return RecoveryBlocked(why)
-    return BoardLocked(why) if journal is None else RecoveryBlocked(f'{why} ({RECOVERY_BLOCKER})')
+    live = is_cleanup_holder(rec) and _alive(rec) and rec.get('start') in (None, proc_start(rec['pid']))
+    return RecoveryBlocked(why) if live else BoardLocked(why)
 
 
 def _handle_record(fh) -> bytes:
@@ -383,20 +362,54 @@ def _handle_record(fh) -> bytes:
     return os.pread(fd, os.fstat(fd).st_size, 0)
 
 
-def _blocker(board, fh) -> str:
-    """Why a board whose flock we now hold must not be taken, or ''."""
-    journal = journal_state(board)
-    if journal is not None:
-        return f'takeover journal {json.dumps(journal)}'
+def _leftover(board, fh):
+    """What a task that ended without its cleanup left on the board whose flock we now hold, as a
+    failure event's fields, or None: a record owing cleanup, one that cannot be read (cut short
+    mid-write, it may have owed one), or an older helper's takeover journal not yet logged (its
+    `journalDigest`; one this user cannot unlink stays, logged once)."""
+    found = {}
+    try:
+        raw = _read_file(board, JOURNAL)
+    except OSError as e:          # its bytes unknown: logged, never unlinked
+        raw = f'cannot be read: {e}'.encode()
+        found['journalKept'] = True
+    if raw is not None:
+        state, journal = _parse(raw)
+        found['journal'] = journal if state == 'record' else {'unreadable': raw[:2000].decode(errors='backslashreplace')}
+        found['journalDigest'] = hashlib.sha256(raw).hexdigest()
     data = _handle_record(fh)
-    if _acquiring(data):
-        return ''
     state, rec = _parse(data)
-    if state == 'record' and is_recovery_blocker(rec):
-        return f'stale record {json.dumps(rec)}'
-    if state == 'unreadable':      # a record cut short mid-write may have been a blocker
-        return f'unreadable record {data[:200]!r}'
-    return ''
+    if state == 'record' and _owes_cleanup(rec):
+        found['task'] = rec
+    elif state == 'unreadable' and not _acquiring(data):
+        found['task'] = {'unreadable': data[:2000].decode(errors='backslashreplace')}
+    if 'task' not in found and 'journalDigest' in found and _logged_journal(board, found['journalDigest']):
+        return None
+    if not found:
+        return None
+    task = found.get('task') or {}
+    return {'how': 'found-left', 'reason': task.get('reason'), 'pid': task.get('pid'),
+            'detail': task.get('detail') or 'the task ended without its cleanup', **found}
+
+
+def _logged_journal(board, digest) -> bool:
+    try:
+        return any(e.get('journalDigest') == digest for e in cleanup_events(board))
+    except OSError:
+        return False
+
+
+def _unlink_journal(board, left) -> None:
+    """Once `left` is logged: its journal goes when this user may unlink it (in the sticky dir,
+    only its owner or root)."""
+    if 'journalDigest' not in left or left.get('journalKept'):
+        return
+    with contextlib.suppress(OSError):
+        dfd = _open_dir()
+        try:
+            os.unlink(board + JOURNAL, dir_fd=dfd)
+        finally:
+            os.close(dfd)
 
 
 def _unavailable(e) -> LockUnavailable:
@@ -405,25 +418,27 @@ def _unavailable(e) -> LockUnavailable:
 
 
 def _valid_group(locks, board) -> bool:
-    """A protected group as its taker declares it: unique valid lock names, `board` among them."""
+    """A group as its taker declares it: unique valid lock names, `board` among them."""
     return (isinstance(locks, (list, tuple)) and all(isinstance(b, str) and _NAME.match(b) for b in locks)
             and board in locks and len(set(locks)) == len(locks))
 
 
 def take_board_lock(board: str, reason: str, *, protected=False, **extra):
     """Take the board's flock and record ourselves as its holder; returns the open handle
-    (keep it referenced; release_board_lock ends it). Raises BoardLocked when another session
-    holds the board, RecoveryBlocked when a recovery is unresolved (a free flock with a
-    blocker record or a journal, or one a cleanup holder holds or that has a journal), and
-    LockUnavailable when the lock cannot be taken or recorded (fail-closed).
+    (keep it referenced; release_board_lock or end_failed ends it). Raises BoardLocked when
+    another process holds the flock (RecoveryBlocked when that is an older helper's cleanup
+    holder), and LockUnavailable when the lock cannot be taken or recorded (fail-closed). A
+    free flock is always taken: what a task that ended without its cleanup left there
+    (_leftover) is appended to the board's cleanup log first, never a refusal.
 
-    `protected` marks the record: `release` never signals it, and a record left on a free
-    flock is a recovery blocker, so its taker must end with release_board_lock. It also
-    declares the taker's group on that first record, before any hardware access: `locks`,
-    the names of every board the run takes (unique, this one among them; default this board
-    alone), so a takeover from any member takes the group (agentrc#197). A taker of several
-    boards that fails partway ends the ones it took with release_board_lock; a record that
-    could not be cleared stays a blocker naming the whole group. A malformed group raises
+    The handle's `cleanup_failures` are the board's open failed cleanups (open_cleanup_failures),
+    for the caller's report before any hardware access, the leftover found now last with
+    `noteError` when its append failed (failure_report renders them).
+
+    `protected` marks the record `cleanupOwed`: a task that restores the board, so `release`
+    never signals it and a record it leaves is logged as a failed cleanup. It also declares
+    the task's group on that first record: `locks`, the names of every board the task takes
+    (unique, this one among them; default this board alone). A malformed group raises
     ValueError before anything is touched."""
     if protected:
         try:
@@ -433,8 +448,7 @@ def take_board_lock(board: str, reason: str, *, protected=False, **extra):
         locks = extra.get('locks', [board])
         if not _valid_group(locks, board):
             raise ValueError(f'protected group {locks!r:.200} must be unique valid lock names, {board} among them')
-        locks = list(locks)
-        extra = {'protected': True, **extra, 'locks': locks}
+        extra = {CLEANUP_OWED: True, **extra, 'locks': list(locks)}
     try:
         fh = flock_nb(board)
     except BlockingIOError:
@@ -442,14 +456,11 @@ def take_board_lock(board: str, reason: str, *, protected=False, **extra):
     except OSError as e:
         raise _unavailable(e) from e
     try:
-        why = _blocker(board, fh)
+        left = _leftover(board, fh)
     except OSError as e:
         fh.close()
         raise LockUnavailable(f'board lock unavailable: holder record: {e}') from e
-    if why:
-        fh.close()
-        raise RecoveryBlocked(f'board {board}: {why} ({RECOVERY_BLOCKER}: '
-                              f'`hil_lock.py hold --take-over {board}` under a recovery dispatch)')
+    note_error = _log_leftover(board, left)
     # announce ourselves so the other side's conflict message is truthful
     try:
         _write_record(fh, ACQUIRING, reason, extra)
@@ -460,7 +471,192 @@ def take_board_lock(board: str, reason: str, *, protected=False, **extra):
         except OSError:
             pass
         raise LockUnavailable(f'board lock unavailable: holder record: {e}') from e
+    fh.cleanup_failures = open_cleanup_failures(board) + ([dict(left, noteError=note_error)] if note_error else [])
     return fh
+
+
+def _log_leftover(board, left) -> str:
+    """Append what `left` (_leftover's) found to the board's cleanup log, then unlink a journal
+    it archived; '' when done or nothing was left, else why it was not logged (kept unlinked)."""
+    if not left:
+        return ''
+    try:
+        _log_failure(board, left)
+    except (OSError, TimeoutError) as e:
+        return f'cleanup log not written: {e}'
+    _unlink_journal(board, left)
+    return ''
+
+
+# --- cleanup log ----------------------------------------------------------------------------
+# <board>.cleanup.jsonl beside the lock file: one JSON event per line, `failed` (a task's cleanup
+# did not end proven, or a leftover was found) or `restored` (a later task restored the board
+# after the failure it names). 0666 and never renamed or unlinked, so every runner's uid appends
+# to it in a sticky dir; reads and appends are serialised by <log>.mutex, not the board flock, and
+# a torn last line is cut before the next append.
+def _log_name(board) -> str:
+    _check_name(board)
+    return board + CLEANUP_LOG
+
+
+@contextlib.contextmanager
+def _log_locked(board, create=True):
+    """The log's mutex held, waited for at most LOG_WAIT (TimeoutError past it); yields the lock
+    dir's fd. A reader (create=False) creates nothing: FileNotFoundError without the dir or the
+    mutex, which every append creates before its log, so there is nothing to read yet."""
+    dfd = _open_dir(create=create)
+    try:
+        fd = _open_file(dfd, _log_name(board) + '.mutex', os.O_RDWR, create=create)
+        try:
+            deadline = time.monotonic() + LOG_WAIT
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f'{_log_name(board)}.mutex held past {LOG_WAIT}s') from None
+                    time.sleep(0.05)
+            yield dfd
+        finally:
+            os.close(fd)
+    finally:
+        os.close(dfd)
+
+
+def _log_append(board, event: dict) -> dict:
+    """Append `event`, stamped, durably; OSError or TimeoutError when it cannot be."""
+    event = {'v': 1, **event, 'board': board, 'at': time.strftime('%Y-%m-%dT%H:%M:%S%z'), 'uid': os.geteuid()}
+    line = (json.dumps(event) + '\n').encode()
+    with _log_locked(board) as dfd:
+        fd = _open_file(dfd, _log_name(board), os.O_RDWR | os.O_APPEND, create=True)
+        try:
+            os.ftruncate(fd, _whole_lines(fd))     # an earlier append's torn line goes
+            _write_all(fd, line)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.fsync(dfd)
+    return event
+
+
+def _log_failure(board, fields: dict) -> dict:
+    return _log_append(board, {'event': 'failed', 'id': secrets.token_hex(8), **fields})
+
+
+def cleanup_events(board) -> list:
+    """Every whole event in the board's cleanup log, oldest first, read under its mutex (an
+    append may cut a torn tail first); OSError (TimeoutError among them) when it cannot be read."""
+    try:
+        with _log_locked(board, create=False):
+            data = _read_file(board, CLEANUP_LOG) or b''
+    except FileNotFoundError:
+        data = b''
+    events = []
+    for line in data[:data.rfind(b'\n') + 1].splitlines():
+        with contextlib.suppress(ValueError):
+            event = json.loads(line)
+            if isinstance(event, dict):
+                events.append(event)
+    return events
+
+
+def open_cleanup_failures(board) -> list:
+    """The board's `failed` events no `restored` event names, oldest first: each stays open until
+    a task proves its own evidence resolved, whatever failed after it. `[{'unavailable': why}]`
+    when the log cannot be read."""
+    try:
+        events = cleanup_events(board)
+    except OSError as e:
+        return [{'unavailable': f'cleanup log unreadable: {e}'}]
+    restored = {e['failure'] for e in events if e.get('event') == 'restored' and isinstance(e.get('failure'), str)}
+    # a failure whose id is not a string can never be named restored: it stays open
+    return [e for e in events if e.get('event') == 'failed'
+            and not (isinstance(e.get('id'), str) and e['id'] in restored)]
+
+
+def end_failed(handles, reason, *, detail, receipts=(), retained=(), **extra) -> dict:
+    """End a task whose cleanup did not end proven: on every board of `handles` ({board: handle}),
+    append a `failed` event (the holder record, `detail`, the run_tracked `receipts` and the
+    `retained` sessions not proven ended, `extra`), clear the record and drop the flock, going on
+    whatever fails. Returns {board: [error text]} for the boards where a step failed."""
+    errors, interrupted = {}, []
+
+    def guard(boards, what, step, default=None):
+        """step(), its failure noted on `boards`; an interrupt is kept until every board is released."""
+        try:
+            return step()
+        except BaseException as e:
+            if not isinstance(e, Exception):
+                interrupted.append(e)
+            for b in boards:
+                errors.setdefault(b, []).append(f'{what}: {e!r:.200}')
+            return default
+    receipts = guard(handles, 'cleanup log not written: receipts', lambda: list(receipts), [])
+    retained = guard(handles, 'cleanup log not written: retained', lambda: list(retained), [])
+    for b, fh in handles.items():
+        guard([b], 'cleanup log not written', lambda: _log_ended(b, fh, reason, detail, receipts, retained, extra))
+        if not guard([b], 'record not cleared', lambda: clear_record(fh), True):
+            errors.setdefault(b, []).append('record not cleared')
+        guard([b], 'close', fh.close)
+    if interrupted:
+        raise interrupted[0]
+    return errors
+
+
+def _log_ended(board, fh, reason, detail, receipts, retained, extra) -> None:
+    try:
+        state, rec = _parse(_handle_record(fh))
+    except OSError:
+        state, rec = 'unreadable', None
+    log_cleanup_failure(board, reason, detail=detail, task=rec if state == 'record' else None, receipts=receipts,
+                        retained=retained, **extra)
+
+
+def log_cleanup_failure(board, reason, *, detail, task=None, receipts=(), retained=(), **extra) -> dict:
+    """Append a `failed` event for a task whose cleanup did not end proven (how: ended-failed),
+    for a caller that does not own the board's flock, as a session command under a detached
+    hold: end_failed is the flock owner's. Returns the event; OSError (TimeoutError among
+    them), TypeError or ValueError when it cannot be appended."""
+    return _log_failure(board, {'how': 'ended-failed', 'reason': reason, 'pid': os.getpid(), 'detail': detail,
+                                'task': task, 'receipts': list(receipts), 'retained': list(retained), **extra})
+
+
+def cleanup_restored(board, failure_id, **evidence) -> dict:
+    """Append a `restored` event for the failure `failure_id` (resolve_restored decides which);
+    every other failure stays open. OSError or TimeoutError when it cannot be appended."""
+    return _log_append(board, {'event': 'restored', 'failure': failure_id, 'pid': os.getpid(), **evidence})
+
+
+def _evidence(failure, task, key):
+    """The failure's own `key`, or its legacy task record's when its own is absent or empty."""
+    own = failure.get(key)
+    return own if own not in (None, []) else task.get(key, [])
+
+
+def resolve_restored(board, failures, **evidence) -> list:
+    """After the caller restored `board`: mark restored (cleanup_restored, with `evidence`) each of
+    `failures` (its take's `cleanup_failures`, or open_cleanup_failures under its hold) whose own
+    evidence is resolved: every receipt, a legacy task record's included, rechecks `done` as the
+    caller, and every session it retained reads ended (_release_blocker). Returns why each other
+    one stays open or its restoration was not logged; a failure without an id is skipped."""
+    notes = []
+    for f in failures:
+        fid = f.get('id')
+        if not isinstance(fid, str):
+            continue
+        task = f.get('task') if isinstance(f.get('task'), dict) else {}
+        receipts, retained = (_evidence(f, task, k) for k in ('receipts', 'retained'))
+        if not isinstance(receipts, list) or not isinstance(retained, list):
+            notes.append(f'{fid} stays open: its evidence is malformed')
+        elif why := _release_blocker(receipts, retained=retained):
+            notes.append(f'{fid} stays open: {why}')
+        else:
+            try:
+                cleanup_restored(board, fid, **evidence)
+            except OSError as e:
+                notes.append(f'{fid} restoration not logged: {e}')
+    return notes
 
 
 def acquire_board_lock(board_name, reason=CI_REASON, **kw):
@@ -579,7 +775,7 @@ def _wait_cleared(boards, pid, start, deadline) -> list:
 
 
 def _process():
-    """hil_process, loaded on first use: only the hand-over and a release predicate need it."""
+    """hil_process, loaded on first use: only a release predicate needs it."""
     return hil_load.load_file('skills/hil/scripts/hil_process.py')
 
 
@@ -592,8 +788,8 @@ def _receipt_text(r) -> str:
 def _release_receipts(recs, key='receipts') -> list:
     """The release predicate of a cleanup holder's records `recs`: the run_tracked receipts in
     their `receipts`, every one of which must recheck `done`, or with key='retained' the
-    sessions a provider left running, every one of which must read ended (_retained_state);
-    none when they carry no such key (a takeover's or hil_reserve's holder). ValueError when
+    sessions a provider left running, every one of which must read ended (retained_state);
+    none when they carry no such key (an older helper's takeover or hil_reserve holder). ValueError when
     the records disagree or it is not a list."""
     named = [(key in r, r.get(key)) for r in recs]
     if any(n != named[0] for n in named):
@@ -606,12 +802,12 @@ def _release_receipts(recs, key='receipts') -> list:
     return receipts
 
 
-def _retained_state(receipt) -> str:
+def retained_state(receipt) -> str:
     """'ended' once the session receipt at path `receipt` (esp_session's receipt format) is
     hil_openocd_esp's, whole and closed after its reviewed end, as `hil_openocd_esp.py end` leaves
     it on exit 0 (`tool` 'hil_openocd_esp', its `pid` and `startTime`, `closed` true, `cleanup`
     'done'), else why not. A receipt kept as a record, not a path, is never reread, so never
-    ended: its board needs a recovery takeover."""
+    ended: its holder is not released by token."""
     if not isinstance(receipt, str):
         return 'not a receipt path, so never proven ended'
     try:
@@ -740,7 +936,7 @@ def _release_blocker(receipts, holder=None, retained=()) -> str:
     """Why the release predicate is false now, or '' when every one of `receipts` rechecks `done`
     and every one of `retained` reads ended. `holder`, (pid, start), is whose ownership context
     rechecks the receipts (_holder_ids)."""
-    sessions = [f'{r!r:.120} {s}' for r, s in ((r, _retained_state(r)) for r in retained) if s != 'ended']
+    sessions = [f'{r!r:.120} {s}' for r, s in ((r, retained_state(r)) for r in retained) if s != 'ended']
     why = (f'its retained sessions are not proven ended (end each with `hil_openocd_esp.py end --receipt`, '
            f'exit 0): {"; ".join(sessions)}') if sessions else ''
     return '; '.join(w for w in (why, _receipts_blocker(receipts, holder)) if w)
@@ -763,8 +959,8 @@ def release_token(token: str):
     """End the token's holder: its token, pid, start, role, lock set and release predicate agree
     on every board that carries the token, it is alive as recorded, its predicate holds,
     rechecked as the holder (_holder_ids), and SIGUSR1 reaches it through a pidfd; returns
-    (pid, boards) once its records and flocks are gone. A dead holder is refused: its boards
-    need a recovery takeover."""
+    (pid, boards) once its records and flocks are gone. A dead holder is refused: its flocks
+    are free, and the next task takes its boards."""
     found = {}
     for b in lock_names():
         rec = read_record(b)
@@ -793,8 +989,8 @@ def release_token(token: str):
     if live != start:
         gone = (f'holder pid {pid} of token {token} is gone' if live is None else
                 f'pid {pid} is not the recorded holder (start {live} != {start})')
-        raise ReleaseRefused(f'not signalled: {gone}; its boards need a recovery takeover '
-                             f'(`hil_lock.py hold --take-over {lockset[0]}`)')
+        raise ReleaseRefused(f'not signalled: {gone}; its flocks are free and the next task takes '
+                             f'{", ".join(sorted(found))}')
     why = _release_blocker(receipts, (pid, start), retained)
     if why:
         raise ReleaseRefused(f'not signalled: holder pid {pid} of token {token} keeps '
@@ -816,354 +1012,6 @@ def release_token(token: str):
         raise ReleaseRefused(f'signalled, but holder pid {pid} left its records or flocks on {", ".join(left)}'
                              + (f': {why}' if why else ''))
     return pid, sorted(found)
-
-
-# --- recovery takeover ----------------------------------------------------------------------
-def _links(b):
-    """(names, problem): the boards `b`'s readable record and journal chain declare as their lock
-    sets (None when they declare none: an older helper's record, or one cut short mid-write),
-    and why the set they cover is unknown, or '': a journal that cannot be read, or a `locks`
-    present but not a non-empty list of names, whose names still count so discovery reaches
-    this board and refuses there."""
-    names, problem = None, ''
-    journal = journal_state(b)
-    if journal == {}:
-        problem = f'{b}{JOURNAL} cannot be read'
-    chain = [read_record(b)]
-    while isinstance(journal, dict) and journal:
-        chain.append(journal)
-        journal = journal.get('prior')
-    for rec in chain:
-        if not isinstance(rec, dict) or 'locks' not in rec:
-            continue
-        locks = rec['locks']
-        if not isinstance(locks, list) or not locks or not all(isinstance(n, str) for n in locks):
-            problem = problem or f'{b}: lock set {locks!r:.80} is not a list of names'
-        readable = [n for n in locks if isinstance(n, str)] if isinstance(locks, list) else []
-        if readable:
-            names = (names or []) + readable
-    return names, problem
-
-
-def _declared(b):
-    """_links' names; OSError when the set they cover is unknown."""
-    names, problem = _links(b)
-    if problem:
-        raise OSError(errno.EINVAL, f'{problem}, so the lock set it covers is unknown: inspect it by hand')
-    return names
-
-
-def _naming() -> dict:
-    """{board: [every board whose readable record or journal chain names it]}: a board whose
-    chain is partly unknown still names what is readable; the takeover refuses on reaching it."""
-    named = {}
-    for b in sorted(set(lock_names()) | set(journal_names())):
-        for n in _links(b)[0] or []:
-            named.setdefault(n, []).append(b)
-    return named
-
-
-def _lock_set(board) -> list:
-    """The board plus every board its record or journal chain names, transitively. A board
-    that names none also adds every board naming it, so a group its other members declare is
-    taken whole from any member (agentrc#197)."""
-    todo, seen, naming = [board], set(), None
-    while todo:
-        b = todo.pop()
-        if b in seen:
-            continue
-        _check_name(b)
-        seen.add(b)
-        names = _declared(b)
-        if names is None:
-            if naming is None:
-                naming = _naming()
-            names = naming.get(b, [])
-        todo += names
-    return sorted(seen)
-
-
-def _write_journal(dfd, board, content) -> None:
-    """Replace <board>.takeover durably: a crash leaves the old journal or the new one."""
-    _replace_file(dfd, board + JOURNAL, json.dumps(content).encode())
-
-
-def _foreign_journals(boards) -> str:
-    """The journals of `boards` this user cannot replace, or '': a sticky dir lets only a
-    file's owner, the dir's owner or root rename over or unlink it."""
-    euid = os.geteuid()
-    if euid == 0:
-        return ''
-    dfd = _open_dir()
-    try:
-        st = os.fstat(dfd)
-        if not st.st_mode & stat.S_ISVTX or st.st_uid == euid:
-            return ''
-        foreign = []
-        for b in boards:
-            try:
-                uid = os.stat(b + JOURNAL, dir_fd=dfd, follow_symlinks=False).st_uid
-            except FileNotFoundError:
-                continue
-            if uid != euid:
-                foreign.append(f'{b}{JOURNAL} (uid {uid})')
-    finally:
-        os.close(dfd)
-    return ', '.join(foreign)
-
-
-def _drop_flocks(handles) -> None:
-    """A failed takeover's cleanup: close every handle and touch no record or journal."""
-    for fh in handles.values():
-        try:
-            fh.close()
-        except OSError:
-            pass
-
-
-def take_over(board: str, reason: str, detail=''):
-    """Recovery takeover of `board` and every board its record or journal chain names (one
-    naming none, an older helper's record or one cut short, adds every board naming it), all
-    or nothing; returns (token, {board: handle}). Each board first gets a journal holding
-    its predecessor's record bytes and any earlier journal, then a cleanup-holder record:
-    a crash anywhere leaves a journal, so the boards stay blocked. Only release_token of
-    this live holder, after the recovery succeeded, clears records and journals.
-    Run only under a recovery dispatch naming these boards, as the OS user owning any
-    journal on them, or root."""
-    try:
-        boards = _lock_set(board)
-    except OSError as e:
-        raise _unavailable(e) from e
-    handles = {}
-    try:
-        for b in boards:
-            handles[b] = flock_nb(b)
-    except BlockingIOError:
-        _drop_flocks(handles)
-        raise BoardLocked(f'board locked: {holder_text(read_record(b))}') from None
-    except OSError as e:
-        _drop_flocks(handles)
-        raise _unavailable(e) from e
-    try:
-        again = _lock_set(board)
-    except OSError as e:
-        again = e
-    if again != boards:
-        _drop_flocks(handles)
-        raise LockUnavailable(f'takeover of {board}: its lock set changed while it was taken '
-                              f'({boards} -> {again}); nothing modified, run it again')
-    try:
-        foreign = _foreign_journals(boards)
-    except OSError as e:
-        _drop_flocks(handles)
-        raise _unavailable(e) from e
-    if foreign:
-        _drop_flocks(handles)
-        raise LockUnavailable(f'takeover of {board}: {foreign} belong to another OS user, and the sticky '
-                              f'lock dir lets only their owner or root replace them; nothing modified: run '
-                              f'the takeover and its `release --token` as that user or root')
-    token = secrets.token_hex(8)
-    try:
-        fields = holder_fields(token, boards)
-        dfd = _open_dir()
-        try:
-            for b in boards:
-                _write_journal(dfd, b, {'token': token, 'pid': os.getpid(), 'start': fields['start'],
-                                        'locks': boards,
-                                        'predecessor': _handle_record(handles[b]).decode(errors='backslashreplace'),
-                                        'prior': journal_state(b)})
-        finally:
-            os.close(dfd)
-        for b in boards:
-            write_record(handles[b], reason, holder=HOLD_KIND, role=CLEANUP_ROLE, detail=detail, **fields)
-            os.fsync(handles[b].fileno())
-    except (OSError, ValueError) as e:
-        _drop_flocks(handles)          # the journals written so far keep every board blocked
-        raise LockUnavailable(f'takeover of {", ".join(boards)} failed: {e}; '
-                              f'journals left: {", ".join(journal_names()) or "none"}') from e
-    return token, handles
-
-
-def end_takeover(handles) -> None:
-    """The takeover holder's exit after a successful recovery: records, then journals."""
-    for fh in handles.values():
-        clear_record(fh)
-    try:
-        dfd = _open_dir()
-    except OSError:
-        dfd = None                 # the journals stay: still blocked, never silently clean
-    if dfd is not None:
-        for b in handles:
-            try:
-                os.unlink(b + JOURNAL, dir_fd=dfd)
-            except OSError:
-                pass               # left behind, it keeps the board a recovery blocker
-        os.close(dfd)
-    for fh in handles.values():
-        fh.close()
-
-
-# --- cleanup holders ------------------------------------------------------------------------
-def arm_release() -> int:
-    """Before a cleanup holder's records name it, from the main thread: SIGUSR1, release_token's
-    signal, then only writes its number to the returned descriptor, whichever thread receives
-    it, so a release that comes at once is never lost and never kills a holder with threads
-    of its own (hil_reserve's usb_observe readers). A signal mask cannot do that: it is per
-    thread, and those threads already run."""
-    r, w = os.pipe()
-    os.set_blocking(w, False)
-    signal.set_wakeup_fd(w)                            # first: a signal that lands next is written
-    signal.signal(signal.SIGUSR1, lambda *_: None)    # a handler, so no thread ever takes the default action
-    signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGUSR1})   # a mask inherited across exec would keep it pending
-    return r
-
-
-def wait_for_release(wake, handles) -> None:
-    """A cleanup holder's wait on `wake`, arm_release's descriptor, until a SIGUSR1 finds the
-    release predicate of its own records over `handles` holding (_release_receipts): the
-    authority release_token's own check only anticipates. A record that cannot be read, or
-    records that disagree, never hold. The caller then ends the hold its own way
-    (release_board_lock, or end_takeover for a takeover)."""
-    handles = list(handles)
-    while True:
-        if signal.SIGUSR1 in os.read(wake, 512) and _releasable(handles):   # other signals' numbers too
-            return
-
-
-def _releasable(handles) -> bool:
-    recs = []
-    for fh in handles:
-        try:
-            state, rec = _parse(_handle_record(fh))
-        except OSError:
-            return False
-        if state != 'record':
-            return False
-        recs.append(rec)
-    try:
-        return not _release_blocker(_release_receipts(recs), None, _release_receipts(recs, 'retained'))
-    except ValueError:
-        return False
-
-
-def _holder_argv(job: dict) -> list:
-    return [sys.executable, '-I', os.path.abspath(__file__), '--cleanup-holder', json.dumps(job)]
-
-
-def _handed_group(board, fh):
-    """The group the protected record behind `fh` declares (a record without one: `board`
-    alone), or None when the record is not shown protected."""
-    try:
-        state, rec = _parse(_handle_record(fh))
-    except OSError:
-        return None
-    if state != 'record' or rec.get('protected') is not True:
-        return None
-    return rec.get('locks', [board])
-
-
-def hand_to_cleanup_holder(handles, reason, *, detail, receipts=(), wait=HANDOFF_WAIT, **extra) -> str:
-    """Hand the flocks of `handles` ({board: handle} taken with take_board_lock(...,
-    protected=True)) to a cleanup holder, a fresh interpreter given their descriptors, so the
-    caller can go on or exit; returns its token once the holder confirmed the hold. Unless
-    every record is shown protected and declares exactly the handed boards as its group,
-    raises ValueError with nothing touched: the caller still owns every handle. Otherwise a
-    failed handoff, each wait bounded by `wait`, raises LockUnavailable (an interrupt
-    propagates) and leaves every board a recovery blocker whose takeover takes the group.
-    With `receipts` (hil_process.run_tracked's) the holder releases only once every one
-    rechecks `done`, and with `retained=` (session receipt paths a provider left running) only
-    once every one reads ended (_retained_state); `extra` adds fields to every record it
-    writes, so a failed handoff's protected record keeps them too. Past the ValueError
-    the caller closes its handles either way, never clearing them. Needs hil_process.py
-    beside this file."""
-    receipts, locks = list(receipts), sorted(handles)
-    groups = {b: _handed_group(b, fh) for b, fh in handles.items()}
-    unprotected = [b for b, g in groups.items() if g is None]
-    if unprotected:
-        raise ValueError(f'cleanup holder handoff refused: {", ".join(unprotected)} not taken protected; '
-                         f'nothing changed, the caller still holds every board')
-    other = [f'{b} declares {g!r:.80}' for b, g in groups.items()
-             if not _valid_group(g, b) or sorted(g) != locks]
-    if other:
-        raise ValueError(f'cleanup holder handoff refused: the group taken protected is not the handed boards '
-                         f'{locks} ({"; ".join(other)}); nothing changed, the caller still holds every board')
-    unwritten = []
-    for b, fh in handles.items():
-        try:
-            write_record(fh, reason, protected=True, detail=detail, receipts=receipts, **extra, locks=locks)
-        except OSError as e:
-            unwritten.append(f'{b}: {e}')
-    fds, proc, reports = {}, None, None
-    try:
-        process = _process()
-        fds['hello_r'], fds['hello_w'] = os.pipe()
-        reports = process._Reports(fds.pop('hello_r'))     # owns and closes it from here on
-        fds['go_r'], fds['go_w'] = os.pipe()
-        job = {'locks': {b: fh.fileno() for b, fh in handles.items()}, 'hello_fd': fds['hello_w'],
-               'go_fd': fds['go_r'], 'wait': wait}
-        proc = subprocess.Popen(_holder_argv(job), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL, start_new_session=True,
-                                pass_fds=(*job['locks'].values(), fds['hello_w'], fds['go_r']))
-        for k in ('hello_w', 'go_r'):
-            os.close(fds.pop(k))
-        hello = reports.next(time.monotonic() + wait)
-        if hello is None or 'pid' not in hello or 'start' not in hello:
-            raise RuntimeError(f'no readiness within {wait}s: {hello!r}')
-        pid, start = hello['pid'], hello['start']
-        if pid != proc.pid or start is None or proc_start(pid) != start:
-            raise RuntimeError(f'readiness from pid {pid} is not the holder started as {proc.pid}')
-        token = secrets.token_hex(8)
-        for fh in handles.values():
-            write_record(fh, reason, protected=True, role=CLEANUP_ROLE, detail=detail, receipts=receipts, **extra,
-                         pid=pid, start=start, token=token, locks=locks)
-        os.write(fds['go_w'], b'1')
-        if reports.next(time.monotonic() + wait) != {'held': True}:
-            raise RuntimeError('the holder did not confirm the handoff')
-        return token
-    except BaseException as e:
-        if proc is not None:
-            try:
-                proc.kill()
-            except OSError:
-                pass
-            try:
-                proc.wait(timeout=wait)
-            except (subprocess.TimeoutExpired, KeyboardInterrupt):
-                pass
-        if not isinstance(e, Exception):
-            raise
-        lost = f' (protected record not written on {"; ".join(unwritten)})' if unwritten else ''
-        raise LockUnavailable(f'cleanup holder handoff failed: {e!r:.200}{lost}') from e
-    finally:
-        for fd in fds.values():
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-        if reports is not None:
-            reports.close()
-
-
-def _handed_holder(job: dict) -> int:
-    """The cleanup holder hand_to_cleanup_holder starts: report readiness, keep the inherited
-    flocks once the handing process recorded it as their holder, confirm, and hold until
-    released. Not handed over within `wait`, it exits, dropping only its copies."""
-    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-        signal.signal(sig, signal.SIG_IGN)
-    wake = arm_release()
-    handles = [os.fdopen(fd, 'r+') for fd in job['locks'].values()]
-    process, pid = _process(), os.getpid()
-    process._send(job['hello_fd'], {'pid': pid, 'start': proc_start(pid)})
-    ready = select.select([job['go_fd']], [], [], job['wait'])[0]
-    if not ready or os.read(job['go_fd'], 1) != b'1':
-        return 1
-    process._send(job['hello_fd'], {'held': True})
-    os.close(job['hello_fd'])
-    os.close(job['go_fd'])
-    wait_for_release(wake, handles)
-    for fh in handles:
-        release_board_lock(fh)
-    return 0
 
 
 # --- pending sessions -----------------------------------------------------------------------
@@ -1356,7 +1204,7 @@ def _alive(info) -> bool:
     return True
 
 
-def cmd_hold(boards, reason, take_over_board=None):
+def cmd_hold(boards, reason):
     boards = list(dict.fromkeys(boards))   # a repeated name would conflict with its own flock
     # No pre-check: the holder's own LOCK_NB flock is the only authority, since a recorded
     # pid may be stale or recycled. The holder signals success through this pipe because a
@@ -1380,12 +1228,7 @@ def cmd_hold(boards, reason, take_over_board=None):
                 msg = '0holder exited before its readiness was acknowledged'
         os.close(ack_w)     # unacknowledged, the holder reads EOF and bows out
         if msg.startswith('1'):
-            if take_over_board:
-                token, held = msg[1:].split(' ', 1)
-                print(f'took over: {held} (cleanup holder, token {token}); after the recovery succeeds: '
-                      f'hil_lock.py release --token {token}')
-            else:
-                print(f'held: {", ".join(boards)}')
+            print(f'held: {", ".join(boards)}')
             return 0
         if msg[1:]:
             print(f'ERROR: {msg[1:]}', file=sys.stderr)
@@ -1418,22 +1261,6 @@ def cmd_hold(boards, reason, take_over_board=None):
         except OSError:
             return False
 
-    if take_over_board:
-        # a takeover holder is a cleanup holder: SIGTERM never ends it, release --token does
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        wake = arm_release()   # before its records name it: the token works at once
-        try:
-            token, handles = take_over(take_over_board, reason)
-        except (BoardLocked, LockUnavailable) as e:
-            report(f'0{e}')
-            os._exit(1)
-        if not report(f'1{token} {", ".join(handles)}'):
-            os._exit(1)        # no end_takeover: the journals and records stay recovery blockers
-        os.close(w_fd)
-        wait_for_release(wake, handles.values())
-        end_takeover(handles)
-        os._exit(0)
-
     handles = []
     start = proc_start(os.getpid())
 
@@ -1454,7 +1281,7 @@ def cmd_hold(boards, reason, take_over_board=None):
             signal.pthread_sigmask(signal.SIG_SETMASK, mask)
         ready = report('1')
     except (BoardLocked, LockUnavailable) as e:
-        # lost a race, a blocker, or a record failed: clear every record we wrote (the
+        # lost a race, an older helper's cleanup holder, or a record failed: clear every record we wrote (the
         # flocks go with the exit) so no stale owned record outlives this holder
         for h in reversed(handles):
             clear_record(h)
@@ -1501,14 +1328,15 @@ def _release_one(b, victims) -> int:
     except OSError as e:
         print(f'ERROR: {b}: {e}', file=sys.stderr)
         return 1
-    # flock was free: only a stale record remained — clear it, unless it blocks a recovery
+    # flock was free: only a stale record remained — log what its task left owed, then clear it
     try:
         try:
-            why = _blocker(b, fh)
+            left = _leftover(b, fh)
         except OSError as e:
-            why = f'record cannot be read: {e}'
-        if why:
-            print(f'ERROR: {b}: {why} — kept ({RECOVERY_BLOCKER})', file=sys.stderr)
+            print(f'ERROR: {b}: record cannot be read: {e} — kept', file=sys.stderr)
+            return 1
+        if why := _log_leftover(b, left):
+            print(f'ERROR: {b}: its task left its cleanup owed and the {why} — kept', file=sys.stderr)
             return 1
         clear_record(fh)
         return 0
@@ -1580,21 +1408,49 @@ def cmd_release_token(token):
     return 0
 
 
+def failure_text(f) -> str:
+    """One logged failure (open_cleanup_failures') for a message."""
+    if 'unavailable' in f:
+        return f['unavailable']
+    what = f.get('reason') or 'unknown task'
+    return (f'last failed cleanup {f.get("at")} ({f.get("how")}, {what} pid {f.get("pid")}, id {f.get("id")}): '
+            f'{f.get("detail")}' + (f'; receipts {json.dumps(f["receipts"])}' if f.get('receipts') else '')
+            + (f'; retained {json.dumps(f["retained"])}' if f.get('retained') else '')
+            + (f'; {f["noteError"]}' if f.get('noteError') else ''))
+
+
+def failure_report(failures) -> dict:
+    """A report row's keys for the open failed cleanups a task found (its take's
+    `cleanup_failures`): the latest whole, and how many are open when more than one."""
+    if not failures:
+        return {}
+    out = {'previousCleanupFailure': failures[-1]}
+    if len(failures) > 1:
+        out['openCleanupFailures'] = len(failures)
+    return out
+
+
 def cmd_status():
     lines = []
-    for b in sorted(set(lock_names()) | set(journal_names())):
+    for b in sorted(set(lock_names()) | set(journal_names()) | set(_names(CLEANUP_LOG, skip_hidden=True))):
         journal = journal_state(b)
         data, state, info = _record(b)
         if _alive(info):
             lines.append(f'{b}: {holder_text(info)}')
-        elif state == 'record' and is_recovery_blocker(info):
-            lines.append(f'{b}: stale {json.dumps(info)} ({RECOVERY_BLOCKER})')
+        elif state == 'record' and _owes_cleanup(info):
+            lines.append(f'{b}: stale {json.dumps(info)} (its task ended without its cleanup; the next task takes '
+                         f'the board)')
         elif _acquiring(data):
             lines.append(f'{b}: acquisition in progress or interrupted (free once its taker is gone)')
         elif state == 'unreadable':
-            lines.append(f'{b}: unreadable record ({RECOVERY_BLOCKER} unless its holder still runs)')
+            lines.append(f'{b}: unreadable record (the next task takes the board unless its holder still runs)')
         if journal is not None:
-            lines.append(f'{b}: takeover journal {json.dumps(journal)} ({RECOVERY_BLOCKER})')
+            lines.append(f'{b}: takeover journal of an older helper {json.dumps(journal)} (left unless its '
+                         f'holder still holds the board)')
+        failures = open_cleanup_failures(b)
+        if failures:
+            earlier = f' ({len(failures) - 1} earlier still open)' if len(failures) > 1 else ''
+            lines.append(f'{b}: {failure_text(failures[-1])}{earlier}')
     print('\n'.join(lines) if lines else 'no locks')
     return 0
 
@@ -1604,25 +1460,25 @@ _CLI_USAGE = """Per-board advisory locks for a HIL host, shared by every project
 Arbitrates board access between dev sessions and project runners, which lock
 themselves. Locks are kernel flocks: the kernel releases them automatically
 when the holder process dies, and holders clear their lock-file record on
-release so records stay truthful (/tmp also clears on reboot). A record a
-cleanup holder or a protected run leaves on a free flock, or a takeover
-journal, is a recovery blocker: no one takes the board until a recovery
-takeover ends it.
+release so records stay truthful (/tmp also clears on reboot). A lock ends
+with the task that took it: a free flock is always taken, and what a task
+that ended without its cleanup left there is logged in the board's cleanup
+log (<board>.cleanup.jsonl), which `status` shows, never a refusal.
 
 Usage:
   hil_lock.py hold BOARD [BOARD...] --reason TEXT
-  hil_lock.py hold --take-over BOARD --reason TEXT   (recovery dispatch only)
   hil_lock.py release BOARD [BOARD...] | release --all | release --token TOKEN
   hil_lock.py status
 
 A holder process holds ALL boards given in one `hold` call; releasing any of
-them ends that holder and releases all of its boards. A takeover holder is a
-cleanup holder over the blocked board's whole lock set; only `release --token`
-ends it, once the recovery succeeded. A cleanup holder that records a release
-predicate (the run_tracked receipts it waits for, the provider sessions in its
-`retained`) ends only once that holds:
-until then `release --token` refuses, naming what is still open.
+them ends that holder and releases all of its boards. `release --token` ends
+an older helper's cleanup holder, which never frees on its own, once its
+release predicate (the run_tracked receipts it waits for, the provider
+sessions in its `retained`) holds: until then it refuses, naming what is
+still open.
 """
+TAKE_OVER_GONE = ('--take-over is gone (agentrc#464): a free board is taken by the next task, and a live older '
+                  "helper's cleanup holder ends with `release --token`")
 
 
 def main():
@@ -1631,7 +1487,7 @@ def main():
     sub = ap.add_subparsers(dest='cmd', required=True)
     p_hold = sub.add_parser('hold')
     p_hold.add_argument('boards', nargs='*')
-    p_hold.add_argument('--take-over', metavar='BOARD')
+    p_hold.add_argument('--take-over', metavar='BOARD', help=argparse.SUPPRESS)
     p_hold.add_argument('--reason', required=True)
     p_rel = sub.add_parser('release')
     p_rel.add_argument('boards', nargs='*')
@@ -1640,9 +1496,11 @@ def main():
     sub.add_parser('status')
     a = ap.parse_args()
     if a.cmd == 'hold':
-        if bool(a.boards) == bool(a.take_over):
-            ap.error('name boards, or one --take-over BOARD')
-        sys.exit(cmd_hold(a.boards, a.reason, a.take_over))
+        if a.take_over:
+            ap.error(TAKE_OVER_GONE)
+        if not a.boards:
+            ap.error('name the boards to hold')
+        sys.exit(cmd_hold(a.boards, a.reason))
     if a.cmd == 'release':
         if a.token:
             if a.boards or a.all:
@@ -1656,6 +1514,4 @@ def main():
 
 
 if __name__ == '__main__':
-    if sys.argv[1:2] == ['--cleanup-holder'] and len(sys.argv) == 3:   # started by hand_to_cleanup_holder
-        sys.exit(_handed_holder(json.loads(sys.argv[2])))
     main()

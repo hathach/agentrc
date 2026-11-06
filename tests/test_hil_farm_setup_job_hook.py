@@ -6,6 +6,7 @@ import unittest
 if os.name == 'nt':
     raise unittest.SkipTest('the HIL farm setup runs on Debian: bash, fcntl, Linux paths')
 
+import contextlib
 import importlib.util
 import shutil
 import tempfile
@@ -71,16 +72,36 @@ class JobHook(unittest.TestCase):
             self.assertEqual(self.run_hook('start')[0], 0)
         self.assertEqual(self.marker(), '78-1-hil-tinyusb')
 
-    def test_a_job_that_never_completed_holds(self):
+    def test_a_job_that_never_completed_only_warns_once_nothing_of_it_runs(self):
         (self.tmp / 'marker').write_text('70-1-hil-tinyusb\n')
         rc, err = self.run_hook('start')
-        self.assertEqual(rc, 1)
-        self.assertIn('job 70-1-hil-tinyusb never reached its completed hook', err)
-        self.assertEqual(self.marker(), '70-1-hil-tinyusb')
+        self.assertEqual(rc, 0)
+        self.assertIn('job 70-1-hil-tinyusb never reached its completed hook; nothing of it runs', err)
+        self.assertEqual(self.marker(), '77-1-hil-tinyusb')
+
+    def test_a_job_that_never_completed_still_holds_on_any_doubt(self):
+        def unsettled(unit):
+            raise hook.Hold('the cgroup kept gaining processes')
+        for why, make, reason in (
+                ('a survivor', lambda s: (self.procs.update({900: 1}), self.sync()), 'processes left'),
+                ('unsettled', lambda s: s.enter_context(mock.patch.object(hook, 'survivors', unsettled)),
+                 'kept gaining'),
+                ('no job id', lambda s: os.environ.pop('GITHUB_JOB'), 'no GITHUB_RUN_ID')):
+            with self.subTest(why), mock.patch.dict(os.environ, JOB), contextlib.ExitStack() as stack:
+                self.procs = dict(CHAIN)
+                self.sync()
+                (self.tmp / 'marker').write_text('70-1-hil-tinyusb\n')
+                make(stack)
+                rc, err = self.run_hook('start')
+                self.assertEqual(rc, 1, why)
+                self.assertIn(reason, err)
+                self.assertEqual(self.marker(), '70-1-hil-tinyusb')
 
     def test_a_refused_jobs_complete_leaves_the_hold(self):
+        self.procs = {**CHAIN, 900: 1}
+        self.sync()
         (self.tmp / 'marker').write_text('70-1-hil-tinyusb\n')
-        self.run_hook('start')
+        self.assertEqual(self.run_hook('start')[0], 1)
         self.assertEqual(self.run_hook('complete')[0], 0)
         self.assertEqual(self.marker(), '70-1-hil-tinyusb')
 

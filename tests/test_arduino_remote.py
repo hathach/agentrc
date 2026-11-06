@@ -327,6 +327,19 @@ class Session(Checkout):
         record = json.loads((self.root / '.hil-remote/s1.session.json').read_text())
         self.assertEqual((record['held'], record['closed']), (False, True))
 
+    def test_close_whose_restore_failed_is_closed_and_fails(self):
+        self.open()
+        self.rig_exit['restore'] = R.H.RESTORE_FAILED   # released on the rig, the failure in the board's cleanup log
+        rc, closed = self.main('session', 'close', 's1')
+        self.assertEqual((rc, closed['closed']), (R.H.RESTORE_FAILED, True))
+        self.assertIn('cleanup log', closed['note'])
+        record = json.loads((self.root / '.hil-remote/s1.session.json').read_text())
+        self.assertEqual((record['held'], record['closed']), (False, True))
+        self.rig_exit['restore'] = R.H.RELEASE_FAILED
+        self.open()
+        rc, closed = self.main('session', 'close', 's1')
+        self.assertEqual((rc, closed['closed']), (R.H.RELEASE_FAILED, False))
+
     def test_exec_adds_the_session_options_and_keeps_argv_after_the_roster(self):
         out = self.open()
         self.assertEqual(R.main(['session', 'exec', 's1', 'exec', '--timeout', '9', '--', 'ls', '-l']), 0)

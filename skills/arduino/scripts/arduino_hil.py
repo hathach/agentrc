@@ -16,8 +16,9 @@ run(profile, argv), loading this file from the pinned agentrc (its `agentrc_pin.
   step_host(name, board, image, test, run_dir, tracker)  required when a roster board has role host
 
 The usage, exits and report are the library's HIL SKILL.md; the shared rules are agentrc's `hil` and `arduino`
-skills. Locks, pending sessions and recovery are agentrc's `hil_lock.py` under the kind PENDING_KIND, the same for
-every library, so two libraries on one physical board exclude each other.
+skills. Locks and the board's cleanup log are agentrc's `hil_lock.py`, the same for every library, so two libraries
+on one physical board exclude each other; a lock ends with its run or session command, a failed cleanup logged
+(agentrc#464). PENDING_KIND names the pending-session record an older engine kept: reported, never a refusal.
 """
 
 import argparse
@@ -58,6 +59,8 @@ CONSOLE_MAX = 120   # one console capture, seconds
 BOARD_BUDGET = 900
 EXEC_MAX = 600   # one session exec or gdb child
 NOT_HELD = 3   # a readable holder record shows no live hold under the caller's reason
+RELEASE_FAILED = 5   # restore --release: the hold may still stand
+RESTORE_FAILED = 6   # restore --release: the restore failed or was refused, the hold released
 GDB_SERVER = ['-c', 'gdb port pipe', '-c', 'gdb memory_map disable', '-c', 'gdb breakpoint_override hard']
 # An RP2040 SMP resume restores core1 only after each core is polled (target-debug gdb.md, verified on the Pico)
 GDB_DETACH_RESUME = {'target/rp2040.cfg': '{ foreach u [target names] { $u arp_poll }; resume }'}   # by debug cfg
@@ -72,7 +75,7 @@ STEP_MAX = VERIFY_TIMEOUT + DETACH_WAIT + FLASH_TIMEOUT + VERIFY_TIMEOUT + ENUM_
     4 * (REAP + SETTLE)
 CLEANUP_RESERVE = STEP_MAX   # the restore is one more such step
 BASE_MAX = 2 * VERIFY_TIMEOUT   # a base image's check and rewrite before a flash (ensure_base), added per step
-PENDING_KIND = 'arduino-hil'   # every Arduino library's: a board's pending children block all of them
+PENDING_KIND = 'arduino-hil'   # an older engine's pending-session record, every Arduino library's
 
 
 def _hil_load():
@@ -357,7 +360,7 @@ class Tracker:
             self.receipts.append(receipt)
         if cleanup != 'done':
             self.unclean = f'{Path(str(argv[0])).name}: cleanup {cleanup}'
-            # no receipt (the supervisor died): a session nothing can recheck, cleared only by a reviewed recovery
+            # no receipt (the supervisor died): a session nothing can recheck, so its logged failure stays open
             self.pending.append({'receipt': receipt if receipt is not None else
                                  {'unrecheckable': [str(a) for a in argv], 'at': time.time()}})
 
@@ -689,22 +692,32 @@ def proven_ended(receipt):
     return 'unrecheckable' not in receipt and A.process.recheck(receipt) == 'done'
 
 
-def pending_problem(name):
-    """'' when no earlier invocation left a child on the board unproven, else why (agentrc PendingSessions)."""
+def legacy_pending(name):
+    """'' unless an older engine's pending-session record lists children not proven ended (agentrc PendingSessions):
+    reported, never a refusal; cleared once they are."""
     try:
         A.lock.PendingSessions(name, PENDING_KIND).clear(lambda s: proven_ended(s['receipt']))
-    except A.lock.PendingRefused as e:
-        return f'pending children of an earlier invocation: {e}'
+    except (A.lock.PendingRefused, OSError) as e:
+        return f'children an older engine recorded pending: {e}'
     return ''
 
 
-def mark_pending(name, tracker):
-    """Record the unproven children so every later invocation refuses until they end; errors as text."""
+def note_restored(name, failures, evidence):
+    """The board was restored: agentrc hil_lock marks restored each open failure this task found whose own evidence is
+    resolved and keeps every other open. '' or why some were not marked."""
     try:
-        A.lock.PendingSessions(name, PENDING_KIND).add(tracker.pending)
-        return ''
+        return '; '.join(A.lock.resolve_restored(name, failures, evidence=evidence))
     except Exception as e:
-        return f'pending record not written: {e}'
+        return f'restorations not logged: {e}'
+
+
+def log_failure(name, detail, pending):
+    """A cleanup this session command (no flock of its own) could not prove; '' or why it was not logged."""
+    try:
+        A.lock.log_cleanup_failure(name, 'hil_test.py', detail=detail, receipts=[p['receipt'] for p in pending])
+    except Exception as e:
+        return f'cleanup log not written: {e}'
+    return ''
 
 
 def probe_present(flasher):
@@ -730,7 +743,7 @@ def run_board(name, board, tests, record_path, roster_path, run_root, manifest):
     run_dir = Path(run_root) / name
     run_dir.mkdir(parents=True, exist_ok=True)
     row = {'board': name, 'ran': False, 'pass': False, 'locked': False, 'recoveryBlocker': False, 'tests': [],
-           'cleanup': {'pass': True, 'state': 'untouched', 'evidence': '', 'holder': None, 'receipts': []},
+           'cleanup': {'pass': True, 'state': 'untouched', 'evidence': '', 'released': False, 'receipts': []},
            'firmware': None, 'detail': ''}
     why = probe_present(board['flasher'])
     if why:
@@ -752,12 +765,11 @@ def run_board(name, board, tests, record_path, roster_path, run_root, manifest):
     except A.lock.LockUnavailable as e:
         row.update(detail=f'board lock unavailable: {e}')
         return row
-    started, unclean = time.monotonic(), ''
+    started, unclean, found = time.monotonic(), '', fh.cleanup_failures
+    row.update(A.lock.failure_report(found))
     try:
-        why = pending_problem(name)
-        if why:
-            row.update(recoveryBlocker=True, detail=why)
-            return row
+        if why := legacy_pending(name):
+            row['previousPending'] = why
         try:
             rec, images = admit(record_path, name, roster_path, run_dir, manifest=manifest)
         except Refused as e:
@@ -791,24 +803,33 @@ def run_board(name, board, tests, record_path, roster_path, run_root, manifest):
         row['interrupted'] = not isinstance(e, Exception)
     finally:
         row['cleanup']['receipts'] = list(tracker.receipts)
-        if tracker.pending:   # unrecheckable ones included: every later invocation refuses until a reviewed clear
-            row['cleanup'].update(pending=list(tracker.pending), markError=mark_pending(name, tracker))
-        if row['cleanup']['pass']:
-            A.lock.release_board_lock(fh)
-        else:
-            row['cleanup']['holder'] = hand_over(fh, name, row, tracker)
+        if tracker.pending:   # unrecheckable ones included: the board's cleanup log keeps them
+            row['cleanup']['pending'] = list(tracker.pending)
+        end_run(fh, name, row, tracker, found)
     return row
 
 
-def hand_over(fh, name, row, tracker):
-    """Keep the board held for recovery: a cleanup holder, or the protected record left as the blocker."""
-    try:
-        token = A.lock.hand_to_cleanup_holder({name: fh}, 'hil_test.py', detail=row['cleanup']['evidence'],
-                                              receipts=tuple(tracker.receipts))
-        return {'token': token}
-    except Exception as e:   # the protected record stays on the free flock: a recovery blocker naming this run
-        fh.close()
-        return {'token': None, 'error': f'hand-over failed, protected record left as the blocker: {e}'}
+def end_run(fh, name, row, tracker, found):
+    """The board's lock ends with this run (agentrc#464): released, or ended through end_failed with the cleanup it
+    could not prove logged; a restore that passed marks the open failures the take found restored."""
+    c = row['cleanup']
+    if c['pass']:
+        A.lock.release_board_lock(fh)
+        if row['ran'] and (why := note_restored(name, found, f'{name}: {c["state"]}')):
+            c['restoredNote'] = why
+    else:
+        end_failed(fh, name, c, c['evidence'] or row['detail'], tracker)
+    c['released'] = True
+
+
+def end_failed(fh, name, cleanup, detail, tracker):
+    """End the board's lock through agentrc's end_failed, the tracker's unproven children logged; `cleanup` (a row's)
+    records the release and any log error."""
+    errors = A.lock.end_failed({name: fh}, 'hil_test.py', detail=detail,
+                               receipts=[p['receipt'] for p in tracker.pending])
+    cleanup['released'] = True
+    if errors.get(name):
+        cleanup['logError'] = '; '.join(errors[name])
 
 
 REPORT_BODY_KEYS = ('pass', 'caveat', 'exitCode', 'results')
@@ -852,7 +873,7 @@ def render(body):
 def verdict(row):
     """The `hil` skill's verdict of one report row."""
     c = row['cleanup']
-    if row['recoveryBlocker'] or c.get('holder') or c['state'] in ('pending', 'unknown') and row['ran']:
+    if row['recoveryBlocker'] or not c['pass'] or c['state'] in ('pending', 'unknown') and row['ran']:
         return 'blocker'
     if not row['ran']:
         return 'not-run'
@@ -860,7 +881,7 @@ def verdict(row):
 
 
 def exit_code(rows):
-    if any(r['cleanup'].get('holder') for r in rows):
+    if any(not r['cleanup']['pass'] for r in rows):     # a failed cleanup: logged, the board released
         return 4
     return 0 if rows and all(r['pass'] for r in rows) else 1
 
@@ -961,30 +982,88 @@ def manual(args):
 def _manual(args):
     """A session command on a board the caller holds: OPS[args.cmd](args, board, run_dir, tracker, manifest) -> row.
     The JSON goes to stdout and to result.json in the run dir, which outlives a dropped ssh session."""
+    held_by(args.board, args.under_hold)   # first: restore --release releases after any later refusal
+    if args.cmd == 'restore' and args.release:
+        return _restore_and_release(args)
+    out, code, _ = _session_op(args)
+    emit(out)
+    return code
+
+
+def _session_inputs(args):
     manifest = verify_staged(args.staged) if args.staged else None
     roster = load_roster(args.roster)
     if args.board not in roster:
         raise Refused(f'{args.board} is not in {args.roster}')
-    why = pending_problem(args.board)   # before held_by: a not-held answer must not hide unproven children
-    if why:
-        raise Refused(why)
-    held_by(args.board, args.under_hold)
-    run_dir = P.ROOT / 'build' / 'hil-manual' / f'{args.board}-{args.cmd}-{time.strftime("%Y%m%d-%H%M%S")}'
-    run_dir.mkdir(parents=True, exist_ok=True)
-    tracker = Tracker(run_dir)
+    return roster, manifest
+
+
+def _session_op(args):
+    """(the command's JSON, its exit code, the interrupt it turned into exit 4 or None). A restore records its outcome
+    in the board's cleanup log: one that failed, was refused or raised as a failure, a passing one as the restoration
+    of the failure seen before it ran."""
+    found = A.lock.open_cleanup_failures(args.board)
+    tracker, extra, interrupt = None, {}, None
     try:
+        roster, manifest = _session_inputs(args)
+        run_dir = P.ROOT / 'build' / 'hil-manual' / f'{args.board}-{args.cmd}-{time.strftime("%Y%m%d-%H%M%S")}'
+        run_dir.mkdir(parents=True, exist_ok=True)
+        tracker = Tracker(run_dir)
+        extra = A.lock.failure_report(found)
+        if why := legacy_pending(args.board):
+            extra['previousPending'] = why
         row = OPS[args.cmd](args, roster[args.board], run_dir, tracker, manifest)
-        out, code = {'pass': row['pass'], 'board': args.board, **row, 'survivors': [], 'log': str(tracker.log)}, \
-            0 if row['pass'] else 1
+        out, code = {'pass': row['pass'], 'board': args.board, **row, 'survivors': [], 'log': str(tracker.log),
+                     **extra}, 0 if row['pass'] else 1
     except BaseException as e:   # an interrupt or crash can leave a child as unproven as Unclean does
-        if not tracker.pending and not isinstance(e, Unclean):
+        pending = tracker.pending if tracker else []
+        if not pending and not isinstance(e, Unclean):
+            why = args.cmd == 'restore' and log_failure(
+                args.board, f'restore refused or raised: {type(e).__name__}: {e}', [])
+            if why and isinstance(e, Refused):
+                raise Refused(f'{e}; {why}') from e
+            if why:
+                e.add_note(why)
             raise
-        out, code = {'pass': False, 'board': args.board,
-                     'error': f'a child outlived its operation: {type(e).__name__}: {e}',
-                     'survivors': tracker.pending, 'markError': mark_pending(args.board, tracker),
-                     'note': 'keep the hold: every later invocation refuses until these end (Recovery)'}, 4
+        error = f'a child outlived its operation: {type(e).__name__}: {e}'
+        out, code = {'pass': False, 'board': args.board, 'error': error, 'survivors': pending,
+                     'logError': log_failure(args.board, error, pending),
+                     'note': "logged in the board's cleanup log, which the next task on it reports", **extra}, 4
+        interrupt = None if isinstance(e, Exception) else e
+    else:
+        if args.cmd == 'restore':
+            why = (note_restored(args.board, found, f'{args.board}: {row.get("state")}') if row['pass'] else
+                   log_failure(args.board, f'restore failed: {row.get("evidence")}', tracker.pending))
+            if why:
+                out['cleanupLog'] = why
     (run_dir / 'result.json').write_text(json.dumps(out) + '\n')
+    return out, code, interrupt
+
+
+def _restore_and_release(args):
+    """restore --release: the hold is released whatever the restore did, inside the caller's one_session_command.
+    Exit 0 restored and released, RESTORE_FAILED released after a restore that failed or was refused,
+    RELEASE_FAILED not released (the hold may still stand); an interrupt propagates once the release ran."""
+    out, code, interrupted = {'pass': False, 'board': args.board}, None, None
+    try:
+        out, code, interrupted = _session_op(args)
+    except Exception as e:
+        out['error'] = '; '.join([str(e) if isinstance(e, Refused) else f'{type(e).__name__}: {e}',
+                                  *getattr(e, '__notes__', ())])
+    except BaseException as e:
+        out['error'], interrupted = f'{type(e).__name__}: {e}', e
+    finally:
+        out['released'] = release_hold(args.board)
+    restored = code == 0 and out.get('pass') is True
+    out['restored'] = restored
+    if out['released']['exit'] != 0:
+        code = RELEASE_FAILED
+    else:
+        code = 0 if restored else RESTORE_FAILED
+    out['pass'] = code == 0
     emit(out)
+    if interrupted is not None:
+        raise interrupted
     return code
 
 
@@ -1022,11 +1101,7 @@ def op_restore(args, board, run_dir, tracker, manifest):
         if open_receipts:
             raise Refused(f'children of the failed run are not proven ended: {open_receipts}')
     meta, _, images = admit_sketch(args, restore_sketch(args.board), run_dir, manifest, False)
-    row = {**meta, **restore(args.board, board, images, run_dir, tracker)}
-    if args.release and row['pass']:
-        row['released'] = release_hold(args.board)
-        row['pass'] = row['released']['exit'] == 0
-    return row
+    return {**meta, **restore(args.board, board, images, run_dir, tracker)}
 
 
 def release_hold(name):
@@ -1236,7 +1311,7 @@ def cmd_commission(args):
                 if 'usb_port' not in board or d['busport'] == board['usb_port']}
     run_dir = P.ROOT / 'build' / 'hil-manual' / f'commission-{args.board}-{time.strftime("%Y%m%d-%H%M%S")}'
     run_dir.mkdir(parents=True, exist_ok=True)
-    try:   # before the protected lock: a failure after it would leave a record that blocks an untouched board
+    try:   # before the lock: a failure after it would leave a record the next task logs as a failed cleanup
         tracker = Tracker(run_dir)
     except OSError as e:
         raise Refused(f'run dir {run_dir}: {e}')
@@ -1246,9 +1321,9 @@ def cmd_commission(args):
         raise Refused(f'{args.board}: {e}')
     out, touched = {'board': args.board, 'rosterUid': board['uid']}, False
     try:
-        why = pending_problem(args.board)
-        if why:
-            raise Refused(why)
+        out.update(A.lock.failure_report(fh.cleanup_failures))
+        if why := legacy_pending(args.board):
+            out['previousPending'] = why
         _, images = admit(Path(args.record_dir) / f'{args.board}.build.json', args.board, args.roster, run_dir)
         image = images[restore_sketch(args.board)]
         observed = []
@@ -1294,20 +1369,20 @@ def cmd_commission(args):
     except Refused:
         A.lock.release_board_lock(fh)
         raise
-    except BaseException as e:   # after hardware access: the board stays held for recovery
+    except BaseException as e:   # after hardware access: the board's state is unknown, its failure logged
         if not touched:
             A.lock.release_board_lock(fh)
             raise
         out['error'] = f'{type(e).__name__}: {e}'
         row = {'board': args.board, 'cleanup': {'evidence': out['error'], 'receipts': list(tracker.receipts)}}
-        if tracker.pending:   # as run_board: every later invocation refuses until they end
-            row['cleanup'].update(pending=list(tracker.pending), markError=mark_pending(args.board, tracker))
-        out['holder'] = row['cleanup']['holder'] = hand_over(fh, args.board, row, tracker)
+        if tracker.pending:
+            row['cleanup']['pending'] = list(tracker.pending)
+        end_failed(fh, args.board, row['cleanup'], out['error'], tracker)
         out['results'] = [row]   # result.json is a `restore --report` input
         (run_dir / 'result.json').write_text(json.dumps(out) + '\n')
         emit(out)
         return 4
-    else:   # outside the handlers: an interrupt during the release must not hand over a released lock
+    else:   # outside the handlers: an interrupt during the release must not end the board as failed
         A.lock.release_board_lock(fh)
     emit(out)
     return 0 if out.get('matchesRoster') else 1
@@ -1350,7 +1425,8 @@ def parse(argv):
         if name == 'restore':
             m.add_argument('--report', help="a failed run's report: its children must be proven ended first")
             m.add_argument('--release', action='store_true',
-                           help="release the hold once the board's restoration sketch is restored")
+                           help='then release the hold whatever the restore did (exit 0 restored, '
+                                f'{RESTORE_FAILED} restore failed, {RELEASE_FAILED} not released)')
         if name in ('gdb', 'exec'):
             m.add_argument('--timeout', type=float, default=60, help=f'seconds, at most {EXEC_MAX}')
         if name == 'gdb':

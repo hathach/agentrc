@@ -26,7 +26,8 @@ with its HIL profile (arduino_hil.py's names; HIL, the checkout-relative hil_tes
       finished clean; nothing else is ever removed.
 
 Exits: setup/pack 0 done, 2 refused; run 0 every board passed, 1 a board failed or did not run, 2 a blocker (a
-cleanup holder, a recovery blocker, a run without a report), a run a signal aborted, or refused before any board.
+failed cleanup, logged and the board released, an older helper's cleanup holder, a run without a report), a run a
+signal aborted, or refused before any board.
 """
 
 import argparse
@@ -274,7 +275,7 @@ def attempt_entry(run_dir, code, row, seconds):
     return {**base, 'verdict': row['verdict'],
             'locked': bool(row.get('locked')) and not row.get('recoveryBlocker'), 'detail': row.get('detail', ''),
             'tests': [{k: t.get(k) for k in ('test', 'pass', 'detail')} for t in row.get('tests', [])],
-            'cleanup': {k: row.get('cleanup', {}).get(k) for k in ('pass', 'state', 'holder')},
+            'cleanup': {k: row.get('cleanup', {}).get(k) for k in ('pass', 'state', 'released')},
             'firmware': row.get('firmware')}
 
 
@@ -351,8 +352,7 @@ def prune(state, days, keep):
                 raise ValueError('no summary of its own')
             s = json.loads(summary.read_text())
             done = (s.get('kind') == SUMMARY_KIND and s.get('termination') == 'completed' and
-                    all(b.get('verdict') in FINISHED and (b.get('cleanup') or {}).get('holder') is None
-                        for b in s.get('boards', [])))
+                    all(b.get('verdict') in FINISHED for b in s.get('boards', [])))
         except (OSError, ValueError, AttributeError, TypeError):
             done = False
         try:

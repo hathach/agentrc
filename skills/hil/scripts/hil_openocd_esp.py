@@ -28,7 +28,7 @@ reviewed end is `reset run`, then `shutdown` and its exit confirmed within CLEAN
 it follows success and a command that failed and returned. An init that failed, a command
 still outstanding (timed out, interrupted, its connection lost or answered by a foreign
 server) or a reset run that failed gets no reset and no shutdown: the operation's cleanup is
-`pending` and its receipt names the server left running, for the caller's cleanup holder. A
+`pending` and its receipt names the server left running, for the caller's cleanup log. A
 server that exited on its own leaves cleanup `unknown` (`done` when it exited before init was
 asked, so no adapter was opened). There is no bare init/shutdown: examining a running app
 built with the end-of-stack watchpoint panics it, and only the reset run brings it back.
@@ -126,20 +126,21 @@ def ci_refusal() -> str:
     if not job:
         return ''
     return (f'openocd_esp is refused under a CI job ({", ".join(job)} set): the runner kills the job\'s '
-            f'processes at its end, and that the openocd server or a cleanup holder survives it is not established')
+            f'processes at its end, and that the openocd server survives it is not established')
 
 
 def refusal(*, retains_lock=False) -> str:
     """Why an openocd_esp session, or board access preparing one (read_security, a consumer's own
     esptool session), is refused in this process ('' when admitted): ci_refusal(), or a caller
-    that does not declare `retains_lock=True`, that it keeps the board lock through a session
-    left pending (hands it to a cleanup holder rather than release it). Deny by default: anything
-    but True refuses."""
+    that does not declare `retains_lock=True`, that it holds the board lock through each
+    operation and logs a session left pending in the board's cleanup log (end_failed's
+    `retained`). Deny by default: anything but True refuses."""
     if why := ci_refusal():
         return why
     if retains_lock is not True:
         return ('openocd_esp is refused to a caller that does not declare retains_lock=True: a session it leaves '
-                'running needs the board lock kept through its cleanup, which this caller has not undertaken')
+                "running must be logged in the board's cleanup log by its lock's holder, which this caller has "
+                'not undertaken')
     return ''
 
 
@@ -940,8 +941,8 @@ def flash_openocd_esp(flasher: dict, segments, *, security, workdir, timeout, op
 
     `security` is the caller's evidence that flash encryption and secure boot are off
     (admit_security, such as read_security's), required and recorded as `session['security']`.
-    `retains_lock=True` is the caller's declaration that it keeps the board lock through a
-    session left pending; without it the flash is refused (refusal).
+    `retains_lock=True` is the caller's declaration that it holds the board lock through the
+    operation and logs a session left pending (refusal); without it the flash is refused.
 
     Nothing is written without a `reset init` whose event hooks all passed, within
     RESET_INIT_ATTEMPTS (_reset_init), nor a segment whose erased sectors leave bank 0; no reset
