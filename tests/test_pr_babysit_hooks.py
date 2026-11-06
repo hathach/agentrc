@@ -447,6 +447,21 @@ class HooksTest(unittest.TestCase):
             hook = int(pid.read_text())
             self.wait_for(lambda: not running(hook), f'the hook ({hook}) outlived the kill')
 
+    def test_a_head_tree_git_cannot_check_out_leaves_the_failure_counted_and_unjudged(self):
+        # A required smudge filter that fails stops `worktree add`; the change's failures must survive it.
+        (self.repo / 'c.bin').write_text('c\n')
+        (self.repo / '.gitattributes').write_text('c.bin filter=broken\n')
+        for key, value in (('clean', 'cat'), ('smudge', 'false'), ('required', 'true')):
+            self.git('config', f'filter.broken.{key}', value)
+        self.configure('nocc')
+        (self.repo / 'a.txt').write_text('edited\n')
+        code, out = self.run_script('a.txt')
+        self.assertEqual((code, out['passed'], out['failed']), (0, False, [{'hook': 'nocc', 'error': 'no compiler'}]))
+        self.assertEqual(([n['hook'] for n in out['notRerun']], out['baselineFailed']), (['nocc'], []))
+        self.assertRegex(out['notRerun'][0]['why'], r'^HEAD could not judge it: git .*worktree add .*smudge filter')
+        self.assertNotIn('\n', out['notRerun'][0]['why'])
+        self.assertEqual(len(self.worktrees()), 1, 'the HEAD worktree is removed')
+
     def test_a_fail_fast_stop_at_an_excused_hook_still_runs_the_rest_on_the_change(self):
         self.configure('broken', 'picky')
         (self.repo / '.pre-commit-config.yaml').write_text(
@@ -860,7 +875,7 @@ class ForgetTest(unittest.TestCase):
             return 0, ''
         with mock.patch.object(hooks, 'pre_commit', pre_commit):
             hooks.baseline({'a': []}, ['a.txt'], 10, time.monotonic())
-        self.assertIn('\nlocked', seen[0])
+        self.assertIn(f'\nlocked pr-babysit hooks.py (pid {os.getpid()})', seen[0])
         self.assertEqual(len(self.worktrees()), 1)
 
     def test_a_rerun_the_deadline_cuts_short_leaves_it_and_those_after_it_unjudged(self):

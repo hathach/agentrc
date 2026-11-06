@@ -576,7 +576,7 @@ def forget(tmp, deadline, start):
 
 def baseline(expected, paths, deadline, start):
     """(the ids among expected's ({hook: for each of its Failed blocks on the change, its outputs at each end}) that
-    fail on HEAD as they failed on the change, {hook: why} of those the deadline left unjudged): each rerun alone on
+    fail on HEAD as they failed on the change, {hook: why} of those left unjudged): each rerun alone on
     the same paths in a detached worktree of HEAD, so what the host lacks (a compiler, a codepage, /dev/null) fails it
     there in the same words, without the change. Alone, all the hook prints after its first Failed block, to the end,
     is its own; every block on the change must end with that at one of its ends. Never pre-commit refusing an id
@@ -588,7 +588,9 @@ def baseline(expected, paths, deadline, start):
         # tmp holds no hook: a post-checkout or reference-transaction hook would change or fail HEAD's tree.
         no_hooks = ('-c', f'core.hooksPath={tmp}')
         # Locked till forget: another session's prune could drop the entry once the tree goes, and its name be reused.
-        git_within(deadline, start, *no_hooks, 'worktree', 'add', '--lock', '--detach', '--quiet', tree, 'HEAD')
+        reason = f'pr-babysit hooks.py (pid {os.getpid()}) reruns failed hooks here'
+        git_within(deadline, start, *no_hooks, 'worktree', 'add', '--lock', '--reason', reason, '--detach', '--quiet',
+                   tree, 'HEAD')
         for hook, outputs in expected.items():
             if judged:
                 # What an earlier rerun rewrote or left behind could fail the next one: each gets HEAD as is.
@@ -600,8 +602,10 @@ def baseline(expected, paths, deadline, start):
             if whole is not None and all(whole in each for each in outputs):
                 failing.append(hook)
             judged += 1
-    except Late as e:
-        return failing, {hook: copyable(f'HEAD ran out of time: {e}') for hook in list(expected)[judged:]}
+    except Unusable as e:
+        # A checkout filter, git or pre-commit failing in HEAD's tree is no verdict on the change: its failures stay.
+        why = f'HEAD ran out of time: {e}' if isinstance(e, Late) else f'HEAD could not judge it: {e}'
+        return failing, {hook: copyable(why) for hook in list(expected)[judged:]}
     finally:
         forget(tmp, deadline, start)
     return failing, {}
