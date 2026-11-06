@@ -124,14 +124,14 @@ OTHER_REPO = ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE')
 C_QUOTED = re.compile(r'"((?:[^"\\]|\\(?:[abfnrtv"\\]|[0-3][0-7]{2}))*)"', re.DOTALL)
 C_ESCAPES = {b'a': b'\a', b'b': b'\b', b'f': b'\f', b'n': b'\n', b'r': b'\r', b't': b'\t', b'v': b'\v'}
 # What differs between two runs of the same failure: a number standing alone (a duration with its units, a line
-# number, a count, a pid, an address), an ISO 8601 time, a pytest-xdist worker's number, or a name tempfile, mktemp
-# or gcc made. Any other digit inside a word (usb2.c, E501) names a file, rule or symbol, so it stays. An
-# all-lowercase gcc name (about 1 in 180) stays too outside the temp dir (temp_gcc()), as a source such as ccdriver.c
-# reads alike.
+# number, a count, a pid, an address), an ISO 8601 time, a pytest-xdist worker's number, or a name tempfile or mktemp
+# made, as a path's last part, since an identifier such as tmpcounter1 reads alike. Any other digit inside a word
+# (usb2.c, E501) names a file, rule or symbol, so it stays. A gcc name is masked only directly in the temp dir
+# (temp_gcc()), as a source such as cc2640r2.c or ccdriver.c reads alike.
 UNIT = r'(?:[hm]|min|sec|[mµun]?s)'
 VARYING = re.compile(r'\b\d{4}-\d\d-\d\dT\d\d:\d\d(?::\d\d(?:[.,]\d+)?)?Z?'
                      rf'|\b(?:0x[0-9a-fA-F]+|\d+(?:\.\d+)*(?:{UNIT}(?:\d+(?:\.\d+)?{UNIT})*)?)\b|(?<=\[gw)\d+(?=\])'
-                     r'|\btmp(?:\w{8}|\.[A-Za-z0-9]{10})\b|(?<=[/\\])cc(?![a-z]{6})[A-Za-z0-9]{6}(?=\.)')
+                     r'|(?<=[/\\])tmp(?:[a-z0-9_]{8}|\.[A-Za-z0-9]{10})\b')
 
 
 def status_paths(records):

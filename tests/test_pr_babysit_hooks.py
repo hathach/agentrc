@@ -1254,6 +1254,11 @@ class AsCheckoutTest(unittest.TestCase):
                              (f'/srv/build{tempfile.gettempdir()}/ccdriver.c: bad\n',
                               f'/srv/build{tempfile.gettempdir()}/ccsensor.c: bad\n'),
                              ('gw1 unused\n', 'gw2 unused\n'),
+                             # a source named as gcc names a temporary file, outside the temp dir
+                             ('hw/bsp/cc2640r2.c: bad\n', 'hw/bsp/cc1352p7.c: bad\n'),
+                             ('src/ccDriver.c: bad\n', 'src/ccSensor.c: bad\n'),
+                             # an identifier named as tempfile names a file
+                             ('a.c:1: tmpcounter1 unused\n', 'a.c:1: tmpindexes2 unused\n'),
                              ('a.c:1: v2m bad\n', 'a.c:1: v3m bad\n')):
             self.assertNotEqual(hooks.comparable(head, '/x'), hooks.comparable(change, '/x'), change)
 
@@ -1265,7 +1270,8 @@ class AsCheckoutTest(unittest.TestCase):
                              ('took 3m12s\n', 'took 4m01s\n'), ('took 12.5sec\n', 'took 9.1sec\n'),
                              ('[gw0] linux -- Python 3.12.3 /usr/bin/python\n',
                               '[gw3] linux -- Python 3.12.3 /usr/bin/python\n'),
-                             ('/tmp/ccAb12Cd.o: undefined reference\n', '/tmp/cco1y76V.o: undefined reference\n'),
+                             (f'{tempfile.gettempdir()}/ccAb12Cd.o: undefined reference\n',
+                              f'{tempfile.gettempdir()}/cco1y76V.o: undefined reference\n'),
                              (f'{tempfile.gettempdir()}/ccabcdef.s: Error\n',
                               f'{tempfile.gettempdir()}/ccAb12Cd.s: Error\n'),
                              ('/tmp/tmp.Ab3dE5fG7h: denied\n', '/tmp/tmp.yiJuMi1EqI: denied\n')):
