@@ -262,6 +262,11 @@ class Selection(Lib):
         self.assertEqual(sel['hil'], {'boards': ['rig_ocd'], 'full': True, 'uncovered': []})
         self.assertEqual(sel['tests'], ['hil'])
 
+    def test_hil_change_runs_every_contract_test_but_the_builds(self):
+        self.patch(self.P, 'CONTRACT_TESTS', {**self.P.CONTRACT_TESTS, 'hil_ci': '.claude/test/test_hil_ci.py'})
+        for path in ('test/hil/ci.json', 'test/hil/sketches/probe/probe.ino'):
+            self.assertEqual(ab.select([path], roster=['rig_ocd'])['tests'], ['hil', 'hil_ci'], path)
+
     def test_hil_selection_names_families_the_roster_lacks(self):
         sel = ab.select(['src/ports/fa/x.cpp', 'src/fake.h'], roster=['rig_ocd'])
         self.assertEqual(sel['hil']['boards'], ['rig_ocd'])
@@ -394,6 +399,9 @@ class Provenance(Lib):
         got = [(h['counterpart'], h['matches']) for h in ab.foreign_headers(build)]
         self.assertEqual(sorted(got), [('src/fake.h', False), ('src/fake.h', True), ('src/only_there.h', False),
                                        ('src/ports/fa/port.cpp', False)])
+        core = {Path(h['path']): h['core'] for h in ab.foreign_headers(build, [None, str(d / 'core')])}
+        self.assertEqual(core, {same: True, other: True, gone: True, spaced / 'src/fake.h': False})
+        self.assertFalse(any(h['core'] for h in ab.foreign_headers(build)))
 
     def fake_compile(self, used=None, success=True, err='', platform='/x'):
         used = [{'name': fake.NAME, 'install_dir': str(self.root)}] if used is None else used
@@ -746,10 +754,18 @@ class Record(RecordCase):
         self.assertEqual(err, 'examples/Basic/echo: too big')
         self.assertEqual(seen[0], ('rig_jlink', [(0x4000, 0x4020)], 'echo', ab.rig_roster(self.roster)['rig_jlink']))
 
-    def test_drifted_core_header_refused_unless_experimental(self):
-        hdr = [{'path': '/core/x.h', 'matches': False}]
+    def test_drifted_header_of_the_build_core_is_recorded(self):
+        hdr = [{'path': '/x/libraries/Lib/src/a.h', 'counterpart': 'src/a.h', 'matches': False, 'core': True},
+               {'path': '/x/libraries/Lib/src/b.h', 'counterpart': 'src/b.h', 'matches': True, 'core': True}]
+        rec, err = self.record(self.samd_row(headers=hdr))
+        self.assertIsNone(err)
+        self.assertEqual(rec['sketches']['echo']['foreignHeaders'], hdr)
+
+    def test_drifted_header_outside_the_core_refused_unless_experimental(self):
+        hdr = [{'path': '/core/x.h', 'matches': False, 'core': False},
+               {'path': '/x/y.h', 'matches': False, 'core': True}]
         _, err = self.record(self.samd_row(headers=hdr))
-        self.assertIn('differ from this checkout', err)
+        self.assertIn("outside the core that differ from this checkout: ['/core/x.h']", err)
         rec, err = self.record(self.samd_row(headers=hdr), experimental=True)
         self.assertIsNone(err)
         self.assertTrue(rec['experimental'])

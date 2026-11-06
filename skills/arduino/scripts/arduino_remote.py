@@ -140,20 +140,26 @@ def stage(tree, into, digests):
         core.fail(f'staged files differ on {tree.host}: {", ".join(bad[:5])}')
 
 
+def pack(into, roster, records, head, bundle=None):
+    """The harness, roster, agentrc closure and records (record_files already checked; under `bundle` when given)
+    copied into the local dir `into`, pinned by its manifest.json; the digests to verify a copy of it by."""
+    into = Path(into)
+    digests = snapshot(into, [*P.BUILD.CONTRACT_FILES, roster], True)
+    digests.update(snapshot_records(into, records, bundle))
+    drift = core.checkout_drift(P.ROOT, head) + B.submodule_problems({'submodules': B.submodules()})
+    if drift:
+        core.fail(f'the checkout moved while it was copied: {"; ".join(drift)}')
+    core.write_json(into / MANIFEST, {'head': head, 'files': digests, 'agentrc': {
+        'commit': B.P.AGENTRC['commit'], 'dirty': B.P.AGENTRC['dirty']}})
+    return {**digests, MANIFEST: core.digest(into / MANIFEST)}
+
+
 def staged_tree(run_id, host, roster, records, head, bundle=None):
-    """Create attempt run_id on host holding the harness, roster, agentrc closure and records (record_files
-    already checked; under `bundle` when given), the snapshot pinned by manifest.json; its Tree."""
+    """Create attempt run_id on host holding pack()'s tree; its Tree."""
     with tempfile.TemporaryDirectory(prefix='hil-remote-') as tmp:
-        into = Path(tmp)
-        digests = snapshot(into, [*P.BUILD.CONTRACT_FILES, roster], True)
-        digests.update(snapshot_records(into, records, bundle))
-        drift = core.checkout_drift(P.ROOT, head) + B.submodule_problems({'submodules': B.submodules()})
-        if drift:
-            core.fail(f'the checkout moved while it was copied: {"; ".join(drift)}')
-        core.write_json(into / MANIFEST, {'head': head, 'files': digests, 'agentrc': {
-            'commit': B.P.AGENTRC['commit'], 'dirty': B.P.AGENTRC['dirty']}})
+        digests = pack(tmp, roster, records, head, bundle)
         tree = core.create_attempt(P.ROOT, runs(), run_id, host, P.REMOTE_BASE)
-        stage(tree, into, {**digests, MANIFEST: core.digest(into / MANIFEST)})
+        stage(tree, tmp, digests)
     return tree
 
 

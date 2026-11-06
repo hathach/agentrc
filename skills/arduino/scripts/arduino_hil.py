@@ -689,7 +689,9 @@ def run_board(name, board, tests, record_path, roster_path, run_root, manifest):
             return row
         row['firmware'] = {'buildRecord': str(record_path), 'head': rec['source']['head'], 'fqbn': rec['fqbn'],
                            'platform': rec['platform'], 'sketches': {k: v['sha256'] for k, v in images.items()},
-                           'fqbns': {k: v['fqbn'] for k, v in images.items()}}   # a core's sketches may differ
+                           'fqbns': {k: v['fqbn'] for k, v in images.items()},   # a core's sketches may differ
+                           'driftedHeaders': sorted({h['counterpart'] for s in rec['sketches'].values()
+                                                     for h in s.get('foreignHeaders', []) if not h['matches']})}
         for test in tests:
             if BOARD_BUDGET - (time.monotonic() - started) < STEP_MAX + CLEANUP_RESERVE:
                 row['tests'].append({'test': test, 'pass': False, 'detail': 'not run: board budget left too small'})
@@ -762,6 +764,10 @@ def render(body):
                 lines.append(f'- {r["board"]} {t["test"]}: {t["detail"]}')
         if r['detail']:
             lines.append(f'- {r["board"]}: {r["detail"]}')
+        drifted = (r.get('firmware') or {}).get('driftedHeaders')
+        if drifted:
+            lines.append(f'- {r["board"]}: its core\'s bundled copy of the library differs from the checkout in '
+                         f'{", ".join(drifted)}; the result covers that mix')
     return '\n'.join(lines) + '\n'
 
 

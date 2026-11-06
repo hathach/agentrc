@@ -12,7 +12,8 @@ point, loading this file from the pinned agentrc (its `agentrc_pin.py`). One pro
   REPRESENTATIVES       {family: [boards]} a change to that family's code builds
   HIL_SKETCHES          {role: (sketch dirs, the first the restoration image)}
   SMOKE_BOARDS          boards whose restoration sketch a build-contract change builds (one per image kind)
-  CONTRACT_TESTS        {name: test script}; a change to `.claude/test/test_<name>.py` runs it
+  CONTRACT_TESTS        {name: test script}; a change to `.claude/test/test_<name>.py` runs it, a HIL change
+                        every one but `build`
   NOTHING               path prefixes that build nothing (docs, agent and repo metadata)
   EXTRA_DEPENDENCIES    libraries the examples use beyond library.properties `depends=` (CI's install list)
   CONTRACT_FILES        library files a HIL record binds by sha256 (the wrapper scripts, the agentrc pin)
@@ -315,10 +316,10 @@ def select(paths, roster=None, only_examples=None):
         elif effect == 'hil_sketch':
             for b in P.BOARDS:
                 add(b, [detail])
-            tests.update(t for t in ('hil', 'hil_remote') if t in P.CONTRACT_TESTS)
+            tests.update(hil_tests())
             hil_full = True
         elif effect == 'hil':
-            tests.update(t for t in ('hil', 'hil_remote') if t in P.CONTRACT_TESTS)
+            tests.update(hil_tests())
             hil_full = True
     result = {
         'builds': {b: sorted(e) for b, e in sorted(builds.items()) if e},
@@ -328,6 +329,11 @@ def select(paths, roster=None, only_examples=None):
         result['hil'] = {'boards': sorted(roster) if hil_full else sorted(hil_picked), 'full': hil_full,
                          'uncovered': uncovered_by_roster(paths, roster)}
     return result
+
+
+def hil_tests():
+    """Every contract test but the build's: a change the battery covers can break any HIL script."""
+    return {t for t in P.CONTRACT_TESTS if t != 'build'}
 
 
 def uncovered_by_roster(paths, roster):
@@ -538,6 +544,12 @@ def bundled_libraries(platform_dir):
     return out
 
 
+def within(path, dirs):
+    """True when `path` sits inside one of `dirs` (None entries skipped)."""
+    where = Path(path).resolve()
+    return any(d and Path(d).resolve() in where.parents for d in dirs)
+
+
 def unexplained_libraries(used, prepared, platform_dirs):
     """(bad, shadows): the used_libraries entries that are neither this library from its checkout, a prepared
     dependency from its installed dir, nor one bundled with a core the build used; and {name: core copy} of the
@@ -549,7 +561,7 @@ def unexplained_libraries(used, prepared, platform_dirs):
         name, where = lib.get('name'), Path(lib.get('install_dir', '')).resolve()
         if name == P.LIBRARY_NAME:
             continue   # compile_sketch checks it came from the checkout
-        if any(d and Path(d).resolve() in where.parents for d in platform_dirs):
+        if within(where, platform_dirs):
             continue
         dep = prepared.get(name)
         if dep and Path(dep['dir']).resolve() == where:
@@ -569,9 +581,10 @@ def tool_version():
     return _cli_json('version').get('VersionString')
 
 
-def foreign_headers(build_dir):
+def foreign_headers(build_dir, cores=()):
     """Headers a build's .d files took from another copy of this library (a core's bundled one, another checkout),
-    or in a core from another copy of the core, each with its counterpart path here and whether the bytes match."""
+    or in a core from another copy of the core, each with its counterpart path here, whether the bytes match and
+    whether it lies in one of the build's `cores`."""
     found, roots, seen = {}, {}, set()
     for dfile in Path(build_dir).rglob('*.d'):
         text = dfile.read_text(errors='replace').replace('\\\n', ' ')
@@ -588,7 +601,7 @@ def foreign_headers(build_dir):
                 digest, exists = sha256(p), counterpart.exists()
                 found[token] = {'path': token, 'counterpart': rel(counterpart) if exists else
                                 p.relative_to(root).as_posix(), 'sha256': digest,
-                                'matches': exists and digest == sha256(counterpart)}
+                                'matches': exists and digest == sha256(counterpart), 'core': within(p, cores)}
     return sorted(found.values(), key=lambda h: h['path'])
 
 
@@ -696,8 +709,8 @@ def compile_sketch(board, example, build_dir, properties, prepared, config=None)
             row.update(status='failed', firstError=f'{P.LIBRARY_NAME} came from '
                        f'{used[0]["install_dir"] if used else "nowhere"}, not this checkout')
             return row
-    bad, shadows = unexplained_libraries(used_libs, prepared,
-                                         [platform.get('install_dir'), build_platform.get('install_dir')])
+    cores = [platform.get('install_dir'), build_platform.get('install_dir')]
+    bad, shadows = unexplained_libraries(used_libs, prepared, cores)
     if bad:
         row.update(status='failed', firstError=f'compiled against libraries outside the prepared dependencies and '
                    f'the core: {bad}', remedy='add them to library.properties depends= or the profile\'s '
@@ -710,7 +723,7 @@ def compile_sketch(board, example, build_dir, properties, prepared, config=None)
             row.update(status='failed', firstError=f'{boot_app0} missing: the ESP core layout changed')
             return row
         shutil.copy2(boot_app0, build_dir / boot_app0.name)
-    headers = foreign_headers(build_dir)
+    headers = foreign_headers(build_dir, cores)
     if core_mode() and headers:   # the isolated environment reaches no other copy: one leaking in fails the sketch
         row.update(status='failed', foreignHeaders=headers,
                    firstError=f'compiled against another copy of the core: {[h["path"] for h in headers][:3]}')
@@ -1013,10 +1026,11 @@ def make_record(args, board, rows, before, diff, roster_path, prepared):
             return None, f'{row["example"]}: the {image.upper()} writes {[(hex(s), hex(e)) for s, e in spans]} ' \
                          f'outside the board span [{lo:#x}, {hi:#x})'
         if not args.experimental:
-            bad = [h for h in row['foreignHeaders'] if not h['matches']]
+            # a core's bundled copy lags the library between core releases: recorded, the report shows the drift
+            bad = [h['path'] for h in row['foreignHeaders'] if not h['matches'] and not h['core']]
             if bad:
-                return None, f'{row["example"]}: compiled against headers that differ from this checkout: ' \
-                             f'{[h["path"] for h in bad]}'
+                return None, f'{row["example"]}: compiled against headers outside the core that differ from this ' \
+                             f'checkout: {bad}'
         extra = {}
         if getattr(P, 'record_check', None):
             extra, why = P.record_check(board, {**row, 'loadSpans': spans}, build_dir, entry)

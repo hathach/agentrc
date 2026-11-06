@@ -15,6 +15,7 @@ names them) for usage, exits and limits; this page is what they share and how a 
 | `scripts/arduino_build.py`  | selection, compiles, dependency and header provenance, image span checks, the HIL build record            |
 | `scripts/arduino_hil.py`    | record admission, flashing, DUT identity, the board lifecycle, manual sessions, commissioning, the report |
 | `scripts/arduino_remote.py` | staging a run or a session on a rig (default ci.lan) and collecting it                                    |
+| `scripts/arduino_ci.py`     | CI: a hosted runner's ci-arduino setup and packed tree per board, the rig runner's battery over them      |
 
 Each script's docstring lists the profile names a library supplies. The `hil` skill's rules (locks, verdicts,
 retries, recovery) apply unchanged; these scripts load its `hil_*` scripts through `hil_load.py`.
@@ -59,9 +60,13 @@ retries, recovery) apply unchanged; these scripts load its `hil_*` scripts throu
 - **The HIL build record** (schema 2) binds a run to its firmware: HEAD and a clean tree, the FQBN, the core (`{id,
   version, install_dir}`, and `{commit, dirty}` when it is a git checkout: a dirty core's exact bytes are not
   identified), the resolved dependencies, the roster's sha256, the library's contract files and the agentrc engines'
-  closure by sha256 with its commit (provenance: the digests decide), and per sketch its images, load spans, VID:PID
-  and used libraries. The harness, and `hil_remote.py` before staging, refuse a record whose library, schema, contract
-  files or agentrc files differ from the ones running: rebuild it. Each process freezes the agentrc closure's digests
+  closure by sha256 with its commit (provenance: the digests decide), and per sketch its images, load spans, VID:PID,
+  foreign headers and used libraries. Without `--experimental`, a foreign header that differs from the checkout
+  refuses the record unless it is the build's own core's copy: a core's bundled copy lags the library between core
+  releases, so it is recorded and the report names it (`firmware.driftedHeaders`), results covering that exact mix
+  and no ABI verdict beyond it.
+  The harness, and `hil_remote.py` before staging, refuse a record whose library, schema, contract files or agentrc
+  files differ from the ones running: rebuild it. Each process freezes the agentrc closure's digests
   when it loads it and refuses to write, admit or stage a record once those files have changed under it; a manual
   session refuses records built with other agentrc files than the ones it opened with.
 - **DUT identity**: the roster `uid` is the DUT's USB serial; `usb_port` additionally pins its bus port. `no_serial`
@@ -111,6 +116,17 @@ changes from a library:
   initialised, not at its gitlink or dirty (each one's own worktree, at any depth, whatever its `ignore` setting),
   `--experimental` included: a record's patch carries no submodule bytes. A record also refuses any untracked file.
   Foreign headers are those from another copy of the core (by `platform.txt` `name=`).
+
+## CI
+
+`arduino_ci.py` (a library's `hil_ci.py` wraps it) splits a HIL run across GitHub runners: a hosted runner per board
+sets the board up through adafruit/ci-arduino's own `install_library_deps()` and `install_platform()` (latest
+releases, nothing pinned; ci-arduino and its arduino-cli kept out of the checkout's status), builds the clean record
+and packs the tree `hil_remote.py` would stage, with a `provenance.json` naming the run; the rig runner admits each
+packed tree against its run, head and roster and runs the battery in it board by board, with a lock wait, one retry of
+a fail and a deadline, into a state dir kept across runs (`summary.json` per run, finished clean runs pruned). The
+admission checks consistency, not trust: a pull request's code, harness included, runs on the rig as the runner's
+user. The library's workflow and report comment are its own.
 
 ## Adding a library
 
