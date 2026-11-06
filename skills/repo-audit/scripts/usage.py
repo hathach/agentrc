@@ -369,10 +369,8 @@ def parse(command, tally, ctx, cwd, env, remote=False):
         return invoked
     uncertain = False       # from the first ||, grouping or shell keyword on, nothing is known to run
     background = bool(segs) and '&' in segs[0][2]  # & backgrounds a whole list: no state applies anywhere
-    replaced = False        # an exec before this segment replaced the shell (or only redirected it: unknown)
     for before, seg, after in segs:
-        uncertain |= before in ('||', '(', ')') or seg[0] in SHELL_KEYWORDS or replaced
-        replaced = seg[0] == 'exec'
+        uncertain |= before in ('||', '(', ')') or seg[0] in SHELL_KEYWORDS
         # a pipeline element or a background command runs in a subshell: its assignments and cd stay there
         subshell = background or before in ('|', '|&') or bool(after) and after[0] in ('|', '|&')
         if any(re.search(r'[/.](?:py|sh|mjs)\b|/', inner) for t in seg for pair in SUBST.findall(t) for inner in pair):
@@ -384,6 +382,7 @@ def parse(command, tally, ctx, cwd, env, remote=False):
             mode = 'after-and' if only_and else 'conditional'
         else:
             mode = 'only' if len(segs) == 1 and not after else 'proven' if only_and else 'none'
+        uncertain |= seg[0] == 'exec'   # it replaced the shell (or only redirected it: unknown) for later segments
         if mode == 'conditional':      # nothing applied: no assignment, no cd, no invocation
             if not all(re.fullmatch(r'\w+=.*', t) for t in seg) and any('/' in t or '$' in t or t.endswith(('.py', '.sh', '.mjs'))
                                                                        for t in seg):
