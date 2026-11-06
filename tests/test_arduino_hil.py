@@ -1274,6 +1274,27 @@ class Manual(Base):
             H.manual(args)
         release.assert_called_once_with('rig_jlink')
 
+    def test_a_signal_as_the_release_begins_waits_until_it_ran_and_its_verdict_is_out(self):
+        args = self.held(cmd='restore', build_record=str(self.record()), report=None, release=True)
+        self.A.process.InterruptHold = load_arduino_engine('skills/hil/scripts/hil_process.py').InterruptHold
+        prev = signal.signal(signal.SIGINT, signal.default_int_handler)
+        self.addCleanup(signal.signal, signal.SIGINT, prev)
+        released = []
+
+        def release_hold(name):
+            signal.raise_signal(signal.SIGINT)
+            released.append(name)
+            return {'exit': 0}
+        with mock.patch.object(H, 'restore', return_value={'pass': True, 'state': 'echo restored', 'evidence': 'e'}), \
+                mock.patch.object(H, 'git_identity', return_value=('abc', '')), \
+                mock.patch.object(H.Tracker, '__init__', fake_tracker_init), \
+                mock.patch.object(H, 'release_hold', release_hold), \
+                contextlib.redirect_stdout(io.StringIO()) as out, self.assertRaises(KeyboardInterrupt):
+            H.manual(args)
+        self.assertEqual(released, ['rig_jlink'])
+        self.assertEqual(json.loads(out.getvalue())['released'], {'exit': 0})
+        self.assertIs(signal.getsignal(signal.SIGINT), signal.default_int_handler)
+
     def release_restore(self, args, **patches):
         """restore --release under the given patches: (exit, JSON, release_hold mock); an interrupt propagates."""
         with contextlib.ExitStack() as stack:

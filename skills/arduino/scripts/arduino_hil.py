@@ -1047,30 +1047,36 @@ def _restore_and_release(args):
     """restore --release: the hold is released whatever the restore did, inside the caller's one_session_command.
     Exit 0 restored and released, RESTORE_FAILED released after a restore that failed or was refused,
     RELEASE_FAILED not released (the hold may still stand); an interrupt propagates once the release ran."""
-    out, code, interrupted = {'pass': False, 'board': args.board}, None, None
+    out, code, interrupted, hold = {'pass': False, 'board': args.board}, None, None, None
     run_dir = session_run_dir(args)
     try:
-        out, code, interrupted = _session_op(args, run_dir)
-    except Exception as e:
-        out['error'] = '; '.join([str(e) if isinstance(e, Refused) else f'{type(e).__name__}: {e}',
-                                  *getattr(e, '__notes__', ())])
-    except BaseException as e:
-        out['error'], interrupted = f'{type(e).__name__}: {e}', e
+        try:
+            out, code, interrupted = _session_op(args, run_dir)
+        except Exception as e:
+            out['error'] = '; '.join([str(e) if isinstance(e, Refused) else f'{type(e).__name__}: {e}',
+                                      *getattr(e, '__notes__', ())])
+        except BaseException as e:
+            out['error'], interrupted = f'{type(e).__name__}: {e}', e
+        finally:
+            # a signal from here on waits until the release ran and its verdict is out
+            hold = A.process.InterruptHold()
+            out['released'] = release_hold(args.board)
+        restored = code == 0 and out.get('pass') is True
+        out['restored'] = restored
+        if out['released']['exit'] != 0:
+            code = RELEASE_FAILED
+        else:
+            code = 0 if restored else RESTORE_FAILED
+        out['pass'] = code == 0
+        try:   # the final verdict, released included, replaces the restore's own result.json
+            run_dir.mkdir(parents=True, exist_ok=True)
+            (run_dir / 'result.json').write_text(json.dumps(out) + '\n')
+        except OSError as e:
+            out['resultError'] = f'{run_dir / "result.json"} not written: {e}'
+        emit(out)
     finally:
-        out['released'] = release_hold(args.board)
-    restored = code == 0 and out.get('pass') is True
-    out['restored'] = restored
-    if out['released']['exit'] != 0:
-        code = RELEASE_FAILED
-    else:
-        code = 0 if restored else RESTORE_FAILED
-    out['pass'] = code == 0
-    try:   # the final verdict, released included, replaces the restore's own result.json
-        run_dir.mkdir(parents=True, exist_ok=True)
-        (run_dir / 'result.json').write_text(json.dumps(out) + '\n')
-    except OSError as e:
-        out['resultError'] = f'{run_dir / "result.json"} not written: {e}'
-    emit(out)
+        if hold is not None:
+            hold.release()
     if interrupted is not None:
         raise interrupted
     return code
