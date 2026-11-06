@@ -7,7 +7,7 @@
 #                              never users, sudo, ssh, firewall or the runner's registration
 #   setup.sh add-runner NAME --host FILE
 #                              add one runner to an installed host, disabled and unregistered; existing runners stay
-#   setup.sh runner <tinyusb|tinyuf2|arduino-tinyusb> <token>
+#   setup.sh runner <tinyusb|tinyuf2|arduino-tinyusb|nrf52-bootloader> <token>
 #                              register that runner as its user (token from the dev PC), its unit left disabled
 #                              and stopped; enable --now it only after hardware proof
 # --host FILE installs FILE as /etc/hil-farm/host.toml (last for add-runner); otherwise the installed one is used.
