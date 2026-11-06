@@ -10,33 +10,31 @@ does not recognize is reported, never assumed safe.
   captain.py ask <target>... [--force]           send each idle target a status request, unless unchanged
   captain.py watch <target>...|all               have sessions report each task end, new and restarted ones too
   captain.py watches                             the open watch and its members
-  captain.py collect [<msg>...] [--wait MS] [--from N]
-                                                 print each report as it lands
+  captain.py collect [<msg>...] [--wait MS]      print each report as it lands
   captain.py reports [<msg>[:<N>]...]            the latest report from each target, or those requests' reports
+  captain.py reports --new                       every watch report since the last --new
   captain.py cancel <msg>                        close a request, relay or watch no answer will close
   captain.py relay <target>... [--entry <uuid> --digest <hex>]
                                                  show, then relay, the human's newest message
-  captain.py withdraw <action>                   take back a relay
-  captain.py open --checkout <dir> --account <main|ada> [--name <name>]
-                                                 start a Claude Code session in a new terminal
   captain.py brief --for <msg> | --pending       a target reads what a status request asks, or joins a watch
   captain.py report --for <msg> --file <json|->  a target answers a status request
   captain.py accept --action <action>            a target takes a relay and reads its words
   captain.py outcome --action <action> --result <result> [--note-file <file|->]
                                                  a target says how a relay ended
 
-A target is a terminal address (t7) or a selector: pr:N, pr:<owner>:<repo>:N, issue:N, issue:<owner>:<repo>:N,
-matched against each live session's latest report, or space:<herdr space id or name>. A selector must match exactly
-one session; `all`, alone, is every live session. A relay with --entry names addresses only.
+A target is a terminal address (t7) or space:<herdr space id or name>, which must match exactly one session; `all`,
+alone, is every live session. A relay with --entry names addresses only.
 
-A message that opens `tell <name>... [to]`, each name an address, space id or name, or selector, is relayed without
-that opening when the names are exactly the relay's targets, and refused when they are not or cannot be told apart
-from the instruction. One addressed to every session (`tell all|everyone|every session to|:`) is relayed without it
-when the targets are exactly the live sessions, at the preview and at the send; the preview's digest covers the text,
-the target terminals and the session pinned in each. A message hc pasted (`<hc from=...>`) is never the human's.
+A message that opens `tell <name>... [to]`, each name an address, space id or name, or space:<id or name>, is relayed
+without that opening when the names are exactly the relay's targets, and refused when they are not or cannot be told
+apart from the instruction. One addressed to every session (`tell all|everyone|every session to|:`) is relayed
+without it when the targets are exactly the live sessions, at the preview and at the send; the preview's digest
+covers the text, the target terminals and the session pinned in each. A message hc pasted (`<hc from=...>`) is
+never the human's.
 
 A watch types into nobody: a session joins it itself, through hooks/captain (SessionStart after a compaction or
-/clear, Stop) or `brief --pending`, and ends with the captain session that started it.
+/clear, Stop) or `brief --pending`, and ends with the captain session that started it. A collect without ids
+resumes where the enrolled captain's last one stopped, and `reports --new` where its last one did.
 """
 
 import argparse
@@ -62,11 +60,8 @@ import hc  # noqa: E402
 
 CONFIG_DIRS = {'main': None, 'ada': os.path.expanduser('~/.claude-ada')}   # main is CLAUDE_CONFIG_DIR unset
 DEFAULT_CONFIG = '~/.claude'   # where main, CLAUDE_CONFIG_DIR unset, keeps its transcripts
-START_S = 60   # how long open waits for Claude Code to report a status
 HC_TIMEOUT_S = 30
-ENV = '/usr/bin/env'   # starts Claude Code with the account's environment
 CLAUDE_APP = 'claude-code'
-TERMINAL_NAME = re.compile(r'[a-z0-9_-]{1,32}')   # what hc takes as a terminal name
 RULE = re.compile(r'^─{20,}')  # the top rule may end in a session label: ──── alo68 ─
 BLANK = ' \xa0\t\r'
 CLAUDE_HINTS = re.compile(r'⏵⏵|\? for shortcuts|shift\+tab|esc to interrupt')
@@ -76,6 +71,9 @@ HC_TAG = re.compile(r'<\s*/?\s*hc\b', re.I)
 HC_WRAPPED = re.compile(r'<hc from="[^"<>]*"(?: [a-z]+="[^"<>]*")*>(.*)</hc>', re.S)
 STATE = os.environ.get('AGENTRC_CAPTAIN_DIR') or os.path.expanduser('~/.cache/agentrc/captain')
 LEDGER, ENROLLED = 'ledger-hc.jsonl', 'enrolled-hc.json'   # ledger.jsonl and enrolled.json pinned Herdr panes
+# where the enrolled captain's last collect without ids, and its last `reports --new`, stopped reading
+COLLECTED, TABLED = 'collected-hc.json', 'tabled-hc.json'
+TABLING = 'tabled.lock'   # serializes `reports --new` without holding the ledger lock while it prints
 INSTALLED = (os.environ.get('AGENTRC_CAPTAIN_SCRIPT')
              or os.path.expanduser('~/.claude/skills/captain/scripts/captain.py'))
 IDENTITY = ('address', 'created', 'kind', 'cwd', 'session', 'pid', 'started', 'account')
@@ -83,6 +81,7 @@ ASKABLE = ('idle', 'done')
 REPORT = {'task': str, 'prs': list, 'state': str, 'evidence': str, 'chief': str, 'needs': str, 'next': str}
 OPTIONAL = {'issues': list}   # a report without it names no issue
 STATES = ('ready', 'in-progress', 'blocked', 'needs-human', 'done', 'idle')
+# withdraw and withdraw-requested have no writer since `withdraw` was removed: kept so an older ledger still reads
 RECORDS = ('request', 'report', 'cancel', 'delivered', 'undelivered', 'uncertain',
            'relay', 'accepted', 'outcome', 'withdraw', 'withdraw-requested', 'refused',
            'watch', 'watch-extend', 'joined', 'watch-end')
@@ -99,10 +98,9 @@ LOCK_POLL_S = 0.1
 # The hook's lock wait alone: its 30 s timeout also spans my_session()'s hc calls, up to HC_TIMEOUT_S each.
 HOOK_LOCK_S = 10
 NO_ANSWER = 3
-SELECTORS = ('pr:', 'issue:', 'space:')
-SELECTOR = re.compile(r'(pr|issue):(?:([\w.-]+):([\w.-]+):)?(\d+)|space:(.+)')
+SPACE = 'space:'
 TELL = re.compile(r'\s*tell\s+', re.I)
-NAME = re.compile(r'[^\s,:;&]+(?::[^\s,:;&]+)*')   # a selector keeps its inner colons
+NAME = re.compile(r'[^\s,:;&]+(?::[^\s,:;&]+)*')   # space:<name> keeps its colon
 ADDRESS = re.compile(r't[0-9][0-9a-z]*', re.I)   # a local hc terminal: t7, t1b
 JOIN = re.compile(r'\s*,?\s*(?:and|&)\s+|\s*,\s*', re.I)
 TO = re.compile(r'\s+to\s+|\s*[:,]\s*|\s+', re.I)
@@ -258,14 +256,14 @@ class Busy(Exception):
 
 
 @contextmanager
-def locked(wait_s=None):
+def locked(wait_s=None, name='lock'):
     """Every ledger read that decides something and every append happen under this one lock, so two invocations
     (the captain, or targets reporting) cannot both see a request open and both act on it. wait_s bounds the wait,
-    raising Busy once it lapses: `open`, `ask` and `relay` hold the lock for up to a minute."""
+    raising Busy once it lapses: `ask` and `relay` hold the lock for up to a minute. name picks another lock."""
     if not fcntl:
         die('this script needs POSIX file locks', 2)
     os.makedirs(STATE, exist_ok=True)
-    with open(path('lock'), 'a') as f:
+    with open(path(name), 'a') as f:
         if wait_s is None:
             fcntl.flock(f, fcntl.LOCK_EX)
         else:
@@ -412,23 +410,15 @@ def everyone():
     return [pin(s) for s in sessions()]
 
 
-def selected(match, session, recs):
-    """Whether session is one a selector match names: by herdr space id or name, or by a PR or issue in the latest
-    report this session, as pinned now, gave; a bare number matches it in any repository."""
-    kind, owner, repo, number, space = match.groups()
-    if space is not None:
-        return space in (session.get('space_id'), session.get('space'))
-    last = last_report(session, recs)
-    named = last['report'].get('prs' if kind == 'pr' else 'issues', []) if last else []
-    if owner:
-        return f'{owner}/{repo}#{number}'.lower() in (r.lower() for r in named)
-    return any(r.endswith(f'#{number}') for r in named)
+def in_space(space, session):
+    """Whether session runs in the herdr space with this id or name."""
+    return space in (session.get('space_id'), session.get('space'))
 
 
 def resolve(args):
-    """{address: the argument naming it} for the target arguments, an address as given, a selector replaced by the
-    address of the one session it matches; one terminal named twice goes once. Dies, so nothing is sent, when any
-    selector matches none or several. `all` is every live session, and only alone."""
+    """{address: the argument naming it} for the target arguments, an address as given, space:<id or name> replaced
+    by the address of the one session in it; one terminal named twice goes once. Dies, so nothing is sent, when a
+    space holds none or several. `all` is every live session, and only alone."""
     if 'all' in args:
         if len(args) > 1:
             die('all names every live session, not one to join with other targets; nothing sent', 2)
@@ -436,19 +426,15 @@ def resolve(args):
         if not found:
             die('all: no live session; nothing sent', 2)
         return found
-    if any(a.startswith(SELECTORS) for a in args):
-        with locked():
-            recs = records()
-        live = everyone()
+    live = everyone() if any(a.startswith(SPACE) for a in args) else []
     found = {}
     for arg in args:
         address = arg
-        if arg.startswith(SELECTORS):
-            match = SELECTOR.fullmatch(arg)
-            if not match:
-                die(f'{arg}: not a selector (pr:N, pr:<owner>:<repo>:N, issue:N, issue:<owner>:<repo>:N, '
-                    'space:<space id or name>); nothing sent', 2)
-            hits = [s for s in live if selected(match, s, recs)]
+        if arg.startswith(SPACE):
+            space = arg.removeprefix(SPACE)
+            if not space:
+                die(f'{arg}: not a space (space:<space id or name>); nothing sent', 2)
+            hits = [s for s in live if in_space(space, s)]
             if len(hits) != 1:
                 die(f'{arg}: ' + ('; '.join(s['handle'] for s in hits) + ' all match' if hits
                                   else 'no live session matches') + '; nothing sent', 2)
@@ -488,8 +474,8 @@ def require_captain(mine):
 
 
 def open_items(recs):
-    """Requests and relays not yet closed: by a report or outcome, a cancel or withdraw, or a refusal before any
-    input was sent."""
+    """Requests and relays not yet closed: by a report or outcome, a cancel, or a refusal before any input was
+    sent."""
     shut = closed(recs)
     return {r['msg']: r for r in recs if r['type'] in ITEMS and r['msg'] not in shut}
 
@@ -794,7 +780,7 @@ def one_line(text):
     return ' '.join(text.split())
 
 
-EVENTS = {'cancel': 'cancelled', 'undelivered': 'undelivered', 'withdraw': 'withdrawn', 'accepted': 'accepted',
+EVENTS = {'cancel': 'cancelled', 'undelivered': 'undelivered', 'accepted': 'accepted',
           'refused': 'refused by the session that replaced its target'}
 
 
@@ -849,31 +835,79 @@ def watch_event(i, rec, items):
     return None
 
 
-def collect(msgs, wait_ms, start=None):
-    """Print each followed item's events as they land: a request's or relay's report or outcome, cancellation,
-    withdrawal or refusal; a watch's members joining and every report they send, and its end. Exit 0, printing
-    `done from <M>`, once none is pending; NO_ANSWER when wait_ms lapse first, printing `pending from <M>: <ids>`,
-    M ahead of a list that grows with a watch's members so a display cutting long lines cannot cut it.
-    M is the index of the first record not yet read, for --from: records from there are printed, while what is
-    closed is judged on the whole ledger. Without ids or --from, printing starts at the ledger's end, so a re-arm
-    that lost its cursor replays no watch's past reports. A strict read under the lock first: a torn ledger must
-    not look like nothing to wait for. A watch whose captain was replaced or ended is settled here too, at the start
-    and at each poll while one is followed, or nothing else might end it; that poll waits for the lock only until
-    wait_ms lapse, so the pending line still prints before the caller's timeout."""
-    with locked():
-        recs = records()
-        opened = len(recs)   # a watch settle ends now was open when this collect began
-        settle(recs)
-    if start is not None and not 0 <= start <= len(recs):
-        die(f'--from {start} is outside the ledger, 0 to {len(recs)}', NO_ANSWER)
+def stored(name, recs):
+    """The ledger index the enrolled captain last stored in name, or None: none stored, another captain's, or one
+    past the end of recs."""
+    try:
+        with open(path(name), encoding='utf-8') as f:
+            mark = json.load(f)
+        ours = mark['generation'] == generation()
+        at = mark['at']
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return at if ours and type(at) is int and 0 <= at <= len(recs) else None
+
+
+def generation():
+    return (enrolled() or {}).get('generation')
+
+
+def store(name, at, fence):
+    """Store ledger index at in name, under the lock the caller holds, while fence is still the enrolled captain's
+    generation; never behind what that captain stored already, so a slower reader cannot roll it back."""
+    if fence is None or fence != generation():
+        return
+    try:
+        with open(path(name), encoding='utf-8') as f:
+            mark = json.load(f)
+        if mark['generation'] == fence and type(mark['at']) is int and mark['at'] > at:
+            return
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    write_json(name, {'generation': fence, 'at': at})
+
+
+def resumed(name, recs, watch, default):
+    """Where a reader without ids starts: the index stored in name; with none, the open watch's own record, so a lost
+    cursor loses none of its reports, or else default."""
+    at = stored(name, recs)
+    if at is None and watch:
+        at = recs.index(watch)
+    return default if at is None else at
+
+
+def collect(msgs, wait_ms):
+    """Print each followed item's events as they land: a request's or relay's report or outcome, cancellation or
+    refusal; a watch's members joining and every report they send, and its end. Exit 0, printing `done`, once none
+    is pending; NO_ANSWER when wait_ms lapse first, printing `pending: <ids>`. With ids, every event on them is
+    printed. Without, printing resumes where the enrolled captain's last collect without ids stopped (COLLECTED,
+    stored as this one ends), following what was open there and whatever opened since; with no such cursor, at the
+    open watch's start, else at the ledger's end. What is closed is judged on the whole ledger. A strict read under
+    the lock first: a torn ledger must not look like nothing to wait for. A watch whose captain was replaced or ended
+    is settled here too, at the start and at each poll while one is followed, or nothing else might end it. Every
+    lock wait ends with wait_ms, so the pending line still prints before the caller's timeout. A collect belongs to
+    the captain enrolled when it began: once another enrolls, it prints its pending line and stores nothing."""
+    deadline = time.monotonic() + wait_ms / 1000
+    try:
+        with locked(wait_ms / 1000):
+            recs = records()
+            opened = len(recs)   # a watch settle ends now was open when this collect began
+            watch, _ = settle(recs)
+            fence = generation()
+            start = 0 if msgs else resumed(COLLECTED, recs, watch, opened)
+    except Busy:
+        print('pending: the ledger lock stayed held', flush=True)
+        return NO_ANSWER
     items = {r['msg']: r for r in recs if r['type'] in FOLLOWED}
     unknown = set(msgs) - set(items)
     if unknown:
         die(f'no request, relay, watch or member {", ".join(sorted(unknown))}', NO_ANSWER)
-    base = opened if start is None else start
-    deadline = time.monotonic() + wait_ms / 1000
-    shown = start if start is not None else 0 if msgs else opened   # records before this were printed already
+    base = shown = start   # printing starts at shown
+    pending = set()
     while True:
+        if generation() != fence:   # read after recs: an enrollment precedes anything its captain records
+            print(f'pending: {" ".join(sorted(pending))}', flush=True)
+            return NO_ANSWER
         items.update((r['msg'], r) for r in recs[shown:] if r['type'] in FOLLOWED)
         following = followed(recs, msgs, base)
         for i in range(shown, len(recs)):
@@ -886,11 +920,15 @@ def collect(msgs, wait_ms, start=None):
                 print(line, flush=True)
         shown = len(recs)
         pending = following - closed(recs)
+        lapsed = time.monotonic() >= deadline
+        if not msgs and (lapsed or not pending):
+            with suppress(Busy), locked(max(0, deadline - time.monotonic())):
+                store(COLLECTED, shown, fence)   # unstored, the next collect prints these lines again
         if not pending:
-            print(f'done from {shown}', flush=True)
+            print('done', flush=True)
             return 0
-        if time.monotonic() >= deadline:
-            print(f'pending from {shown}: {" ".join(sorted(pending))}', flush=True)
+        if lapsed:
+            print(f'pending: {" ".join(sorted(pending))}', flush=True)
             return NO_ANSWER
         time.sleep(POLL_S)
         if any(items[m]['type'] in WATCHED for m in pending):
@@ -899,7 +937,7 @@ def collect(msgs, wait_ms, start=None):
                     recs = records()
                     settle(recs)
             except Busy:
-                pass   # the deadline passed: the next pass prints the cursor
+                pass   # the deadline passed: the next pass prints the pending line
         else:
             recs = records(lenient=True)
 
@@ -920,6 +958,27 @@ def reports(msgs=()):
             req = requests[rec['msg']]
             latest.setdefault(req['target']['address'], (req, rec))
     return [row(req, rep) for req, rep in latest.values()]
+
+
+def new_reports(emit=lambda rows: None):
+    """A row for every report a watch member sent since the enrolled captain's last call, oldest first, each named
+    `<member>:<N>` as collect printed it; resumes as collect does (TABLED), from the open watch's start when nothing
+    is stored. Under TABLING, so two calls never give one row twice, and stored only once emit has shown the rows:
+    rows a failed print lost come again. The ledger lock is released while emit runs, which a slow reader may hold
+    up."""
+    with locked(name=TABLING):
+        with locked():
+            recs = records()
+            fence = generation()
+            ends = watch_ends(recs)
+            watch = next((r for r in reversed(recs) if r['type'] == 'watch' and r['msg'] not in ends), None)
+            requests, start = asked(recs), resumed(TABLED, recs, watch, len(recs))
+        rows = [{**row(requests[r['msg']], r), 'msg': f'{r["msg"]}:{i}'} for i, r in enumerate(recs[start:], start)
+                if r['type'] == 'report' and requests[r['msg']]['type'] == 'joined']
+        emit(rows)
+        with locked():
+            store(TABLED, len(recs), fence)
+    return rows
 
 
 def asked(recs):
@@ -1046,17 +1105,17 @@ def newest(captain, sending):
     return entry, words
 
 
-def named(token, live, recs):
-    """The addresses of the live sessions token names: by address, herdr space id or name, or selector."""
-    if token.startswith(SELECTORS):
-        match = SELECTOR.fullmatch(token)
-        return {s['address'] for s in live if selected(match, s, recs)} if match else set()
+def named(token, live):
+    """The addresses of the live sessions token names: by address, herdr space id or name, or space:<id or name>."""
+    if token.startswith(SPACE):
+        space = token.removeprefix(SPACE)
+        return {s['address'] for s in live if space and in_space(space, s)}
     token = token.casefold()
     return {s['address'] for s in live
             if token in (s.get(k) and s[k].casefold() for k in ('address', 'space_id', 'space'))}
 
 
-def instruction(words, addresses, live, recs):
+def instruction(words, addresses, live):
     """(text, None): what a relay to addresses sends, words without an opening `tell <name>... [to]` whose names are
     exactly addresses; (None, why) when that opening names anyone else or cannot be split from the instruction. Preview
     and send both call this, and the send checks the preview's digest of it."""
@@ -1066,12 +1125,12 @@ def instruction(words, addresses, live, recs):
     pos, found = tell.end(), set()
     first = EVERY_WORD.match(words, pos)
     if first:
-        return broadcast(words, first, addresses, live, recs)
+        return broadcast(words, first, addresses, live)
     while True:
         name = NAME.match(words, pos)
         if name and EVERY_WORD.fullmatch(name.group()):
             return None, f'"{name.group()}" addresses every session, not one to join with other names'
-        hits = named(name.group(), live, recs) if name else set()
+        hits = named(name.group(), live) if name else set()
         if not hits:
             return None, f'it opens with "tell" and {name.group()!r} names no live session' if name else \
                 'it opens with "tell" and no session name follows'
@@ -1084,10 +1143,10 @@ def instruction(words, addresses, live, recs):
         pos = name.end()
         join = JOIN.match(words, pos)
         following = join and NAME.match(words, join.end())
-        # an address or selector is a recipient even when it names no one, never the instruction's first word
+        # an address or space: is a recipient even when it names no one, never the instruction's first word
         if not (following and (':' in following.group() or ADDRESS.fullmatch(following.group())
                                or EVERY_WORD.fullmatch(following.group())
-                               or named(following.group(), live, recs))):
+                               or named(following.group(), live))):
             joiner = join and join.group().strip(' \t\r\n,')
             if joiner:
                 return None, f'{joiner!r} after {name.group()!r} may join another name or start the instruction'
@@ -1106,9 +1165,9 @@ class Stale(str):
     """A refusal a new preview cures: the sessions changed, not the human's words."""
 
 
-def broadcast(words, first, addresses, live, recs):
+def broadcast(words, first, addresses, live):
     """instruction() for a message opening `tell all|everyone|every session`, first its opening word."""
-    if named(first.group(), live, recs):
+    if named(first.group(), live):
         return None, f'"{first.group()}" also names a session; address it by space:<name>, or every session another way'
     every = EVERY_ONE.match(words, first.start())
     if not every:
@@ -1137,11 +1196,11 @@ def digest(text, pinned):
     return hashlib.sha256(json.dumps([text, sorted(pinned.items())]).encode('utf-8')).hexdigest()[:16]
 
 
-def relay_text(words, addresses, recs):
+def relay_text(words, addresses):
     """The text a relay to addresses sends; dies, so nothing is sent, when instruction() refuses it."""
     if not TELL.match(words):   # unaddressed: sent as written, no session listing needed
         return words
-    text, why = instruction(words, addresses, everyone(), recs)
+    text, why = instruction(words, addresses, everyone())
     if isinstance(why, Stale):
         die(f'{why}: run list, then preview again with every address it shows', 2)
     if why:
@@ -1154,14 +1213,13 @@ def preview(targets, mine):
     nothing."""
     with locked():
         captain = require_captain(mine)
-        recs = records()
     entry, words = newest(captain, sending=False)
     found = {address: find(address) for address in targets}
     for address, arg in targets.items():
         target = found[address]
         print(f'to {arg}: {target["handle"]} ({target["status"]})' if target
               else f'to {arg}: no Claude Code terminal there')
-    text = relay_text(words, list(targets), recs)
+    text = relay_text(words, list(targets))
     print(f'entry {entry} digest {digest(text, pins(found))}\n{text}')
     return 0
 
@@ -1197,8 +1255,8 @@ def relay(addresses, entry, sent, mine):
     """Relay the human's newest message, which must still be entry and still read as the preview's digest sent, to
     each address, recorded before it is typed. The transcript is read once for every target: a message the human sends
     after that is not seen."""
-    if any(p.startswith(SELECTORS) or p == 'all' for p in addresses):
-        die('a relay names the addresses the preview printed, never a selector or all', 2)
+    if any(p.startswith(SPACE) or p == 'all' for p in addresses):
+        die('a relay names the addresses the preview printed, never a space or all', 2)
     if not sent:
         die('a relay names the digest the preview printed (--digest)', 2)
     with locked():
@@ -1207,7 +1265,7 @@ def relay(addresses, entry, sent, mine):
         if latest != entry:
             die(f"{entry} is not the human's newest message; preview again", 2)
         pinned = pins({address: find(address) for address in addresses})
-        quote = relay_text(words, addresses, records())
+        quote = relay_text(words, addresses)
         if sent != digest(quote, pinned):
             die('the text, terminals or sessions this relay would send to are not the ones the preview showed; '
                 'preview again', 2)
@@ -1271,26 +1329,6 @@ def outcome(action, result, note):
         if result in ('completed', 'failed') and not first(recs, 'accepted', action):
             die(f'relay {action} was not accepted, so it cannot have {result}', 2)
         append({'type': 'outcome', 'msg': action, 'result': result, 'note': note})
-    return 0
-
-
-def withdraw(action, mine):
-    """Take back a relay: before acceptance it can no longer be accepted; after, the request is recorded but nothing
-    stops the target, and the relay stays open until its outcome or the human's cancel."""
-    with locked():
-        require_captain(mine)
-        recs = records()
-        item = open_items(recs).get(action)
-        if not item or item['type'] != 'relay':
-            die(f'no open relay {action}', 3)
-        if not first(recs, 'accepted', action):
-            append({'type': 'withdraw', 'msg': action})
-            print(f'withdrawn {action}: it can no longer be accepted')
-            return 0
-        if not first(recs, 'withdraw-requested', action):
-            append({'type': 'withdraw-requested', 'msg': action})
-    print(f'{action} was accepted already and may be running or done: the withdrawal is recorded, nothing stops it. '
-          "It stays open until its outcome, or `cancel` on the human's word.")
     return 0
 
 
@@ -1445,8 +1483,8 @@ def hook(payload):
 
 
 def arm(targets, mine):
-    """Start the enrolled captain's watch, or widen the one open: `all`, or the named sessions. Prints the cursor
-    for the watch's first collect, so a session joining before it starts is not missed."""
+    """Start the enrolled captain's watch, or widen the one open: `all`, or the named sessions. A new watch moves the
+    captain's stored cursors to its start, so a session joining before the first collect is not missed."""
     with locked():
         captain = require_captain(mine)
         if targets == ['all']:
@@ -1470,10 +1508,12 @@ def arm(targets, mine):
             msg = watch['msg']
         else:
             msg = new_id('w', recs)
+            for name in (COLLECTED, TABLED):   # kept when set: the last watch's untabled reports stay due
+                if stored(name, recs) is None:
+                    store(name, len(recs), captain['generation'])
             append({'type': 'watch', 'msg': msg, 'captain': captain, 'scope': scope})
-        cursor = len(recs) + 1
     named = 'every session, new ones too' if scope == 'all' else terminals([scope])
-    print(f'watch {msg} {"widened" if watch else "armed"} from {cursor}: {named}')
+    print(f'watch {msg} {"widened" if watch else "armed"}: {named}')
     return 0
 
 
@@ -1516,75 +1556,16 @@ def enroll(replace):
     return 0
 
 
-def wait_started(address):
-    """Wait, at most START_S, for the program at address to stop working: Claude Code reports idle once ready, and
-    a trust prompt or a login reports nothing. None, or hc's error; a message to the captain ends hc wait early, so
-    it waits again."""
-    deadline = time.monotonic() + START_S
-    while (left := int(deadline - time.monotonic())) > 0:
-        rc, body, _, msg = hc.run('wait', '--json', '--timeout', str(left), '--', address,
-                                  timeout=left + HC_TIMEOUT_S)
-        if rc != 0:
-            return msg
-        if not isinstance(body, dict):
-            return 'hc wait answered no JSON object'
-        if body.get('reason') != 'message':
-            return None
-    return None
-
-
-def not_ready(session, checkout, account_name):
-    """Why a session just opened is not the one asked for, idle at an empty input line, or None."""
-    if not session:
-        return 'no Claude Code status from the terminal'
-    if unpinned(session):
-        return f'identity not pinned: {", ".join(unpinned(session))}'
-    if session['cwd'] != checkout:
-        return f'it runs in {session["cwd"]}'
-    if session['account'] != account_name:
-        return f'it runs under account {session["account"]}'
-    return refusal(session)
-
-
-def terminal_name(name, root):
-    """name, or one made from the checkout's directory name, as hc takes it."""
-    if name is None:
-        name = re.sub(r'[^a-z0-9_-]+', '-', os.path.basename(root).lower()).strip('-')[:32] or 'claude'
-    if not TERMINAL_NAME.fullmatch(name):
-        die(f'{name}: an hc terminal name is 1-32 of a-z, 0-9, - and _', 2)
-    return name
-
-
-def open_session(checkout, account_name, name, mine):
-    """A new terminal on an existing checkout, a tab in the captain's herdr space, with Claude Code started under the
-    account named; ready only once it is pinned there with an empty input line. Anything else, such as a trust
-    prompt, is left for the human: nothing is answered, closed or retried. It has no parent, so it outlives the
-    captain and hc types no notes about it into the captain."""
-    root = canonical(os.path.expanduser(checkout))
-    if not root or not os.path.isdir(root):
-        die(f'{checkout} is not an existing directory', 2)
-    name = terminal_name(name, root)
-    config = CONFIG_DIRS[account_name]
-    # explicit either way: the terminal's environment comes from hc, not from this process
-    account_env = [f'CLAUDE_CONFIG_DIR={config}'] if config else ['-u', 'CLAUDE_CONFIG_DIR']
-    with locked():   # held to the end: a captain replaced meanwhile must not go on opening
-        require_captain(mine)
-        space = ((get(mine['address']) or {}).get('labels') or {}).get('herdr.space')
-        labels = ['--label', f'herdr.space={space}'] if space else []
-        address = hc.call('run', '--json', '--bg', '--no-parent', '--name', name, '--cwd', root, *labels, '--',
-                          ENV, *account_env, 'claude', timeout=HC_TIMEOUT_S).get('address')
-        if not hc.is_local(address):
-            die(f'hc run answered no local terminal address ({address!r}); look at `hc ls`', 5)
-        # first, so a failure below still names the terminal
-        print(f'{address}: opened {name} · {root}' + ('' if space else f' · in no space: hc attach {address}'),
-              flush=True)
-        err = wait_started(address)
-        why = f'Claude Code did not start: {err}' if err else not_ready(find(address), root, account_name)
-    if why:
-        print(f'{address}: not ready: {why}. Look at the terminal; nothing was answered or closed')
-        return 2
-    print(f'{address}: ready · claude/{account_name}')
-    return 0
+def show_rows(rows, as_json):
+    if as_json:
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+    for r in [] if as_json else rows:
+        if 'missing' in r:
+            print(f'{r["msg"]}\t{r["missing"]}')
+            continue
+        prs = ' '.join(r['prs']) or '-'
+        print(f'{r["handle"]}\t{one_line(r["task"])}\t{prs}\t{r["state"]}\t{one_line(r["needs"]) or "-"}')
+    sys.stdout.flush()   # a failed write raises here, before --new stores its cursor
 
 
 def main():
@@ -1600,23 +1581,18 @@ def main():
     c = sub.add_parser('collect', help='print each report as it lands')
     c.add_argument('msgs', nargs='*')
     c.add_argument('--wait', type=int, default=60000, metavar='MS')
-    c.add_argument('--from', dest='start', type=int, metavar='N', help='the cursor a previous collect printed')
     wt = sub.add_parser('watch', help='have sessions report each task end until this captain session ends')
     wt.add_argument('targets', nargs='+')
     sub.add_parser('watches', help='the open watch and its members')
     rp = sub.add_parser('reports', help="the latest report from each target, or the named requests' reports")
     rp.add_argument('msgs', nargs='*')
     rp.add_argument('--json', action='store_true')
+    rp.add_argument('--new', action='store_true', help='every watch report since the last --new')
     sub.add_parser('cancel', help='close a request, relay or watch no answer will close').add_argument('msg')
     rl = sub.add_parser('relay', help="show the human's newest message; with --entry and --digest, relay it")
     rl.add_argument('addresses', nargs='+')
     rl.add_argument('--entry', metavar='UUID')
     rl.add_argument('--digest', metavar='HEX', help='the digest the preview printed')
-    sub.add_parser('withdraw', help='take back a relay').add_argument('action')
-    op = sub.add_parser('open', help='start a Claude Code session in a new terminal on an existing checkout')
-    op.add_argument('--checkout', required=True)
-    op.add_argument('--account', required=True, choices=sorted(CONFIG_DIRS))
-    op.add_argument('--name')
     ac = sub.add_parser('accept', help='take a relay and print its message (run by the target)')
     ac.add_argument('--action', required=True)
     o = sub.add_parser('outcome', help='say how a relay ended (run by the target)')
@@ -1656,20 +1632,17 @@ def main():
         if a.cmd == 'outcome':
             return outcome(a.action, a.result, read_text(a.note_file) if a.note_file else '')
         if a.cmd == 'collect':
-            return collect(a.msgs, a.wait, a.start)
+            return collect(a.msgs, a.wait)
         if a.cmd == 'watches':
             return watches()
         if a.cmd == 'reports':
-            rows = reports(a.msgs)
-            if a.json:
-                print(json.dumps(rows, indent=2, ensure_ascii=False))
-                return 0
-            for r in rows:
-                if 'missing' in r:
-                    print(f'{r["msg"]}\t{r["missing"]}')
-                    continue
-                prs = ' '.join(r['prs']) or '-'
-                print(f'{r["handle"]}\t{one_line(r["task"])}\t{prs}\t{r["state"]}\t{one_line(r["needs"]) or "-"}')
+            if a.new and a.msgs:
+                die('reports --new takes no ids', 2)
+            show = lambda rows: show_rows(rows, a.json)  # noqa: E731
+            if a.new:
+                new_reports(show)
+            else:
+                show(reports(a.msgs))
             return 0
         mine = me()
         if a.cmd == 'ask':
@@ -1682,10 +1655,6 @@ def main():
             return arm(['all'] if a.targets == ['all'] else list(resolve(a.targets)), mine)
         if a.cmd == 'relay':
             return relay(a.addresses, a.entry, a.digest, mine) if a.entry else preview(resolve(a.addresses), mine)
-        if a.cmd == 'withdraw':
-            return withdraw(a.action, mine)
-        if a.cmd == 'open':
-            return open_session(a.checkout, a.account, a.name, mine)
     except Corrupt as e:
         die(f'ledger corrupt, nothing decided until it is reconciled by hand: {e}', 4)
     except hc.Error as e:

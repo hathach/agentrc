@@ -47,10 +47,8 @@ PUBLISH = {'create': {'--repo': REPO, '--allow-repo': REPO, '--title-file': None
                       '--label': 'follow-up'},
            'comment': {'--repo': REPO, '--allow-repo': REPO, '--issue': None, '--body-file': None}}
 ISSUE = re.compile(r'[1-9][0-9]{0,11}')
-SUBCOMMANDS = ('list', 'enroll', 'ask', 'watch', 'watches', 'collect', 'reports', 'cancel', 'relay', 'withdraw',
-               'open')
+SUBCOMMANDS = ('list', 'enroll', 'ask', 'watch', 'watches', 'collect', 'reports', 'cancel', 'relay')
 TOKEN = re.compile(r'[A-Za-z0-9][A-Za-z0-9:._=-]*|--[a-z][a-z-]*')
-CHECKOUT = re.compile(r'(?:/|~/)[A-Za-z0-9._/-]*')   # a path, only as the value of open's --checkout
 SHELL = re.compile(r'[^A-Za-z0-9 :._=/~,-]')   # any quoting, expansion, redirection, separator or newline
 
 
@@ -95,10 +93,7 @@ def command(cmd, monitor=False):
                 '`python3 ~/.claude/skills/captain/scripts/<script>`')
     if words[2] not in SUBCOMMANDS:
         return f'captain.py {words[2]} is not a captain subcommand ({", ".join(SUBCOMMANDS)})'
-    args = words[3:]
-    bad = [w for i, w in enumerate(args)
-           if not (TOKEN.fullmatch(w) or (i and args[i - 1] == '--checkout' and CHECKOUT.fullmatch(w)
-                                          and '..' not in w.split('/')))]
+    bad = [w for w in words[3:] if not TOKEN.fullmatch(w)]
     if bad:
         return f'unexpected argument {bad[0]!r}'
     return None

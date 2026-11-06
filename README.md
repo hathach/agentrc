@@ -364,13 +364,12 @@ Leave the checkout to chief until it exits.
 ## Captain session
 
 `agents/captain.md` is one seat over the other Claude Code sessions in this host's
-hc terminals (Codex terminals are left out): it lists them, opens new ones on existing
-checkouts under either account, asks the idle ones for status, reports one table
-and carries the human's own words, read from its own transcript, to the sessions
-they name. It checks what sessions report with read-only git and gh lookups and
-the files sessions and chiefs leave, and keeps its own memory, but never does the
-sessions' work; the one thing it publishes is a follow-up issue in hathach/agentrc
-for a defect in its own tooling, on the human's word. Its guard,
+hc terminals (Codex terminals are left out): it lists them, asks the idle ones for
+status, reports one table and carries the human's own words, read from its own
+transcript, to the sessions they name. It checks what sessions report with read-only
+git and gh lookups and the files sessions and chiefs leave, and keeps its own memory,
+but never does the sessions' work; the one thing it publishes is a follow-up issue in
+hathach/agentrc for a defect in its own tooling, on the human's word. Its guard,
 `skills/captain/scripts/captain_guard.py`, declared as a hook in the agent file so
 it applies on every account, names in its docstring the calls it allows. It reads
 sessions from hc terminals, each pinned to the session Claude Code registered under
