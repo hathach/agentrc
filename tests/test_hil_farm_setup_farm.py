@@ -536,7 +536,7 @@ class TestRunnerInstall(FarmCase):
         self.t = {'kind': 'runner', 'url': 'https://example.test/runner.tgz', 'sha256': sha(data), 'version': '2'}
 
     def test_the_same_pin_goes_into_every_runner_dir(self):
-        self.assertEqual(len(self.dirs), 2)
+        self.assertEqual(len(self.dirs), 3)
         farm.install_tool('actions-runner', self.t, False)
         for d in self.dirs:
             self.assertEqual(Path(d, 'bin/Runner.Listener').read_bytes(), b'listener')
@@ -620,7 +620,7 @@ def keep_host_globals(case):
 class TestRunnersMatchCommon(unittest.TestCase):
     def test_farm_py_and_common_sh_name_the_same_runners(self):
         here = Path(__file__).resolve().parent.parent / 'skills' / 'hil-farm-setup' / 'scripts'
-        for host in sorted(HOSTS.glob('*.toml')):
+        for host in sorted(HOSTS.glob('*.toml')) + sorted((here.parent / 'hosts').glob('*.toml')):
             with self.subTest(host=host.name):
                 out = subprocess.run(['bash', '-c', '. "$1"; for n in "${RUNNERS[@]}"; do runner_conf "$n"; '
                                       'echo "$n $RUNNER_DIR $RUNNER_UNIT"; done', '_', str(here / 'common.sh')],
@@ -813,6 +813,55 @@ class TestInstallHost(unittest.TestCase):
                                                                                   'admin = "admin"\nshared = false'))
         self.assertTrue(self.install(f))
 
+    def added(self):
+        text = (HOSTS / 'dedicated.toml').read_text()
+        return self.write('added.toml', text + '\n[runner.arduino-tinyusb]\n'
+                          'name = "arduino-tinyusb"\nlabels = ["arduino-tinyusb"]\n')
+
+    def test_addition_is_explicit_and_publishes_only_after_the_check(self):
+        self.install(HOSTS / 'dedicated.toml')
+        before = self.installed.read_bytes()
+        src = self.added()
+        with self.assertRaisesRegex(farm.FarmError, 'changes runner of this host'):
+            self.install(src)
+        self.assertFalse(farm.install_host(farm.load(), src, 'arduino-tinyusb', check=True))
+        self.assertEqual(self.installed.read_bytes(), before)
+        self.assertFalse(self.installed.with_name('host.toml.prev').exists())
+        self.assertEqual(self.guarded[-1], ['hil-runner-arduino-tinyusb', 'hil-runner-tinyuf2', 'hil-runner-tinyusb'])
+        self.assertTrue(farm.install_host(farm.load(), src, 'arduino-tinyusb'))
+        self.assertEqual(self.installed.read_bytes(), src.read_bytes())
+        self.assertEqual(self.installed.with_name('host.toml.prev').read_bytes(), before)
+
+    def test_addition_refuses_changes_to_existing_settings(self):
+        self.install(HOSTS / 'dedicated.toml')
+        before = self.installed.read_bytes()
+        for old, new in (('name = "lab-tinyusb"', 'name = "changed"'),
+                         ('labels = ["tinyuf2"]', 'labels = ["changed"]'),
+                         ('admin = "admin"', 'admin = "changed"'),
+                         ('profile = "lab"', 'profile = "lab"\nrunner_path = ["/other"]'),
+                         ('[runner.tinyuf2]', '[runner.tinyuf2]\nuser = "other"'),
+                         ('[runner.tinyusb]', '[runner.tinyusb]\nurl = "https://github.com/other/repo"')):
+            with self.subTest(new=new):
+                src = self.added()
+                self.assertIn(old, src.read_text())
+                src.write_text(src.read_text().replace(old, new))
+                with self.assertRaises(farm.FarmError):
+                    farm.install_host(farm.load(), src, 'arduino-tinyusb')
+                self.assertEqual(self.installed.read_bytes(), before)
+        self.assertEqual(len(self.guarded), 1)
+
+    def test_addition_refuses_removal_an_existing_target_and_a_fresh_host(self):
+        src = self.added()
+        with self.assertRaisesRegex(farm.FarmError, 'needs an installed host'):
+            farm.install_host(farm.load(), src, 'arduino-tinyusb')
+        self.install(HOSTS / 'dedicated.toml')
+        text = src.read_text()
+        src.write_text(text[:text.index('[runner.tinyuf2]')] + text[text.index('[runner.arduino-tinyusb]'):])
+        with self.assertRaisesRegex(farm.FarmError, 'keeping every installed runner'):
+            farm.install_host(farm.load(), src, 'arduino-tinyusb')
+        with self.assertRaisesRegex(farm.FarmError, 'must add only tinyusb'):
+            farm.install_host(farm.load(), self.added(), 'tinyusb')
+
     def test_guard_refusal_changes_nothing(self):
         farm.guard.side_effect = farm.FarmError('hil-runner-tinyusb is active')
         with self.assertRaisesRegex(farm.FarmError, 'is active'):
@@ -851,7 +900,7 @@ class TestGuard(unittest.TestCase):
 
     def test_every_runner_unit_is_asked(self):
         asked = [c.args[0][2] for c in self.guard_with('inactive', 1).call_args_list if c.args[0][0] == 'systemctl']
-        self.assertEqual(asked, ['hil-runner-tinyusb', 'hil-runner-tinyuf2'])
+        self.assertEqual(asked, ['hil-runner-tinyusb', 'hil-runner-tinyuf2', 'hil-runner-arduino-tinyusb'])
 
     def test_one_running_unit_refuses(self):
         for running in farm.RUNNER_UNITS:

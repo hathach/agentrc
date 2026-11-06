@@ -5,12 +5,14 @@
 #   setup.sh update [--host FILE] [--inputs DIR] [TOOL...]
 #                              converge tools, firmware, udev rules and the environment on this farm.toml;
 #                              never users, sudo, ssh, firewall or the runner's registration
-#   setup.sh runner <tinyusb|tinyuf2> <token>
+#   setup.sh add-runner NAME --host FILE
+#                              add one runner to an installed host, disabled and unregistered; existing runners stay
+#   setup.sh runner <tinyusb|tinyuf2|arduino-tinyusb> <token>
 #                              register that runner as its user (token from the dev PC), its unit left disabled
 #                              and stopped; enable --now it only after hardware proof
-# --host FILE installs FILE as the host file (/etc/hil-farm/host.toml) first; without it the installed one is used.
+# --host FILE installs FILE as /etc/hil-farm/host.toml (last for add-runner); otherwise the installed one is used.
 # --inputs DIR holds the files of farm.toml's kind "local" tools (STM32CubeProgrammer's tar), needed only to (re)install
-# them. install and update refuse while a runner service runs; stop it when idle and start it after verify.sh.
+# them. install, update and add-runner refuse while a runner service runs; stop it when idle, start after verify.sh.
 # Run as root from a root-owned checkout with no uncommitted changes.
 set -euo pipefail
 umask 022  # whatever sudo passed: the runners read and traverse what root creates (tools, .env, profile.d)
@@ -138,14 +140,8 @@ setup_users() {
     chmod 0700 "$ADMIN_HOME"
   fi
   for name in "${RUNNERS[@]}"; do
+    setup_runner_user "$name"
     runner_conf "$name"
-    if ! id "$RUNNER_USER" >/dev/null 2>&1; then
-      useradd -m -U -s /bin/bash -G "$(IFS=,; echo "${RUNNER_GROUPS[*]}")" "$RUNNER_USER"
-    fi
-    passwd -l "$RUNNER_USER" >/dev/null
-    chmod 0750 "/home/$RUNNER_USER"
-    # the admin reads each runner's root, _work and _diag through its group (tinyuf2's driver reads its hil-state)
-    usermod -aG "$RUNNER_USER" "$ADMIN"
     [ -z "$RUNNER_SUDO" ] || sudoers+=("$RUNNER_USER ALL=(root) NOPASSWD: $RUNNER_SUDO")
   done
 
@@ -153,6 +149,17 @@ setup_users() {
   chmod 0440 /etc/sudoers.d/hil-farm
   visudo -cq || die "sudoers check failed"
 }
+
+setup_runner_user() (
+  runner_conf "$1"
+  if ! id "$RUNNER_USER" >/dev/null 2>&1; then
+    useradd -m -U -s /bin/bash -G "$(IFS=,; echo "${RUNNER_GROUPS[*]}")" "$RUNNER_USER"
+  fi
+  passwd -l "$RUNNER_USER" >/dev/null
+  chmod 0750 "/home/$RUNNER_USER"
+  # the admin reads each runner's root, _work and _diag through its group
+  usermod -aG "$RUNNER_USER" "$ADMIN"
+)
 
 setup_ssh() {
   log ssh
@@ -237,16 +244,20 @@ EOF
 install_tools() {  # [update] [TOOL...]
   log tools
   farm "$@" ${INPUTS:+--inputs "$INPUTS"}
+  install_metadata
+  write_env
+}
+
+install_metadata() {
   install -d -m 0755 "$FARM_HOME"
   install -m 0644 "$B/farm.toml" "$B"/*.lock "$B/common.sh" "$FARM_HOME/"
   install -m 0755 "$B/farm.py" "$B/verify.sh" "$FARM_HOME/"
   echo "agentrc $SOURCE_REV" > "$FARM_HOME/SOURCE"
   chmod 0644 "$FARM_HOME/SOURCE"
   install -D -m 0755 "$B/fw/renesas_fw_check.sh" "$FARM_HOME/fw/renesas_fw_check.sh"
-  write_env
 }
 
-write_env() {  # the farm's environment files and every registered runner's
+write_env() {  # the farm's environment files and every installed runner's
   local path name
   for name in "${RUNNERS[@]}"; do write_runner_env "$name"; done
   if shared_host; then return 0; fi  # the owner's sessions keep their own environment
@@ -257,9 +268,9 @@ write_env() {  # the farm's environment files and every registered runner's
   } > /etc/profile.d/hil-farm.sh
 }
 
-write_runner_env() (  # NAME: its .env and .path, once registered
+write_runner_env() (  # NAME: its .env and .path, once installed
   runner_conf "$1"
-  [ -f "$RUNNER_DIR/.runner" ] || exit 0
+  [ -d "$RUNNER_DIR/bin" ] || exit 0
   farm runner-path > "$RUNNER_DIR/.path"
   runner_env > "$RUNNER_DIR/.env"
 )
@@ -370,6 +381,39 @@ runner_dirs_ok() {  # each runner-owned dir, and every component of its path und
   done
 }
 
+add_runner() {  # NAME: the proposed host file differs only by this runner
+  farm host-install "$HOST_FILE" --add-runner "$1" --check
+  # The shared runner receipt must still match the pin, and no old runner may need installing.
+  HIL_FARM_HOST='' farm verify actions-runner
+  runner_conf "$1"
+  # setup_users writes the sudoers file whole; a sudo-bearing runner comes with install
+  [ -z "$RUNNER_SUDO" ] || die "$1 needs sudo ($RUNNER_SUDO): add it with setup.sh install"
+  [ ! -e "$RUNNER_DIR/.runner" ] || die "$RUNNER_DIR is already registered"
+  # install_metadata publishes the checkout's pins: they must be the installed ones
+  local f
+  for f in "$B/farm.toml" "$B"/*.lock; do
+    cmp -s "$f" "$FARM_HOME/${f##*/}" || die "${f##*/} differs from the installed one; run setup.sh update first"
+  done
+  setup_runner_user "$1"
+  shared_host && setup_ssh
+  setup_firewall
+  farm install actions-runner
+  runner_dirs_ok
+  write_runner_env "$1"
+  runner_root_mode
+  setup_runner_service "$1"
+  systemctl disable -q "$RUNNER_UNIT" || die "cannot disable $RUNNER_UNIT"
+  install_metadata
+  # Publish last: a failed addition retries against the unchanged installed host.
+  farm host-install "$HOST_FILE" --add-runner "$1"
+  log "added $1, disabled; check access, then setup.sh runner $1 <token> and hardware proof (README)"
+}
+
+runner_root_mode() {  # root's, runner-group-writable and sticky: register_runner says why
+  chown root:"$RUNNER_USER" "$RUNNER_DIR"
+  chmod 1770 "$RUNNER_DIR"
+}
+
 register_runner() {  # NAME TOKEN, checked by the caller
   local token=$2
   runner_conf "$1"
@@ -405,8 +449,7 @@ register_runner() {  # NAME TOKEN, checked by the caller
   [ -f "$RUNNER_DIR/.runner" ] && [ ! -L "$RUNNER_DIR/.runner" ] || die "config.sh left no $RUNNER_DIR/.runner"
   find "$RUNNER_DIR" -maxdepth 1 -type f \( -name .runner -o -name '.credentials*' \) \
     -exec chown -h "$RUNNER_USER:$RUNNER_USER" {} + -exec chmod 0600 {} +
-  chown root:"$RUNNER_USER" "$RUNNER_DIR"
-  chmod 1770 "$RUNNER_DIR"
+  runner_root_mode
   log "registered; after hardware proof: systemctl enable --now $RUNNER_UNIT"
 }
 
@@ -445,6 +488,13 @@ case "$CMD" in
     for name in "${RUNNERS[@]}"; do setup_runner_service "$name"; done
     log "done; run $FARM_HOME/verify.sh --maintenance, then start the runner units (reboot first if firmware changed)"
     ;;
+  add-runner)
+    if [ -z "$HOST_FILE" ] || [ -n "$INPUTS" ] || [ ${#ARGS[@]} != 1 ] || ! runner_conf "${ARGS[0]}"; then
+      die "usage: setup.sh add-runner NAME --host FILE"
+    fi
+    preflight
+    add_runner "${ARGS[0]}"
+    ;;
   runner)
     if [ -n "$HOST_FILE$INPUTS" ] || [ ${#ARGS[@]} != 2 ] || [ -z "${ARGS[1]}" ] || ! runner_conf "${ARGS[0]}"; then
       die "usage: setup.sh $RUNNER_USAGE"
@@ -453,5 +503,5 @@ case "$CMD" in
     register_runner "${ARGS[0]}" "${ARGS[1]}"
     ;;
   *) die "usage: setup.sh install [--host FILE] [--inputs DIR] | update [--host FILE] [--inputs DIR] [TOOL...]" \
-       "| $RUNNER_USAGE" ;;
+       "| add-runner NAME --host FILE | $RUNNER_USAGE" ;;
 esac

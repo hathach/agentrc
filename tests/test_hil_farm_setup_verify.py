@@ -180,6 +180,30 @@ class TestVerify(unittest.TestCase):
         self.assertIn('skip  tinyusb runner not registered yet (setup.sh runner tinyusb <token>)', out)
         self.assertIn('skip  tinyuf2 runner not registered yet (setup.sh runner tinyuf2 <token>)', out)
 
+    def test_ci_checks_all_three_runners_including_arduino_access_state_and_maintenance(self):
+        self.host = FARM.parent / 'hosts' / 'ci.toml'
+        for name in ('tinyusb', 'tinyuf2', 'arduino-tinyusb'):
+            self.register(name)
+        self.stub('sudo', 'if [ "$3" = ghrunner ]; then echo "User ghrunner may run the following commands:"; '
+                  'echo "    (root) NOPASSWD: /usr/local/sbin/hil_root"; '
+                  'else echo "User $3 is not allowed to run sudo on ci."; fi')
+        out = self.verify().stdout
+        for name, user in (('tinyusb', 'ghrunner'), ('tinyuf2', 'ghrunner-tinyuf2'),
+                           ('arduino-tinyusb', 'ghrunner-arduino-tinyusb')):
+            self.assertIn(f'FAIL  {name} runner service active', out)
+            self.assertIn(f'FAIL  {user} groups', out)
+            self.assertIn(f'FAIL  {user} reaches github', out)
+            self.assertRegex(out, f'FAIL  {user} to \\S* not rejected by the hil_farm table')
+            self.assertIn(f'ok    {name} runner .env sets ACTIONS_RUNNER_HOOK_JOB_STARTED', out)
+        self.assertIn('ok    ghrunner-arduino-tinyusb has no sudo', out)
+        self.assertIn('FAIL  hathach reads arduino-tinyusb runner _work/Adafruit_TinyUSB_Arduino/hil-state', out)
+        self.assertIn(f'ok    ghrunner cannot read {self.runners}/arduino-tinyusb/.credentials', out)
+        self.assertIn(f'ok    ghrunner-arduino-tinyusb cannot read {self.runners}/tinyuf2/.credentials', out)
+        self.assertIn('ok    runners stopped, no job (maintenance)', self.verify('--maintenance').stdout)
+        self.stub('systemctl', 'if [ "$2" = hil-runner-arduino-tinyusb ]; then echo active; '
+                  'else echo inactive; exit 3; fi')
+        self.assertIn('FAIL  runners stopped, no job (maintenance)', self.verify('--maintenance').stdout)
+
     def test_a_registered_runner_is_checked_with_its_own_unit_and_hooks(self):
         self.register('tinyusb')
         self.register('tinyuf2', hooks_of='tinyusb')
