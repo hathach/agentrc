@@ -163,7 +163,7 @@ const quotedAfter = (prefix) => (prompt) => {
   const m = String(prompt).match(new RegExp(`${prefix.source} ((?:${SHQ.source} ?)+)`))
   return m ? [...m[1].matchAll(SHQ)].map(t => t[0].slice(1, -1).replaceAll(`'\\''`, `'`)) : []
 }
-const pathLine = quotedAfter(/commits\.py commit --receipt '[^']*' --request '[^']*'/)
+const pathLine = quotedAfter(new RegExp(`commits\\.py commit (?:--skip-hooks ${SHQ.source} )?--receipt ${SHQ.source} --request ${SHQ.source}`))
 const auditScope = quotedAfter(/commits\.py head --parent [0-9a-f]{40}/)
 // A deterministic 40-hex blob id per path, shared by the hook snapshot and the audit's ls-tree.
 const blobOf = (f) => [...f].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 0xffffffff, 7).toString(16).padStart(40, '0')
@@ -461,7 +461,7 @@ async function run(opts = {}) {
       const owned = hookQuoted(prompt)
       const status = owned.map(f => ` M ${f}`)
       const snap = owned.map(f => `644 ${blobOf(f)} ${f}`)
-      const base = { ran: true, passed: true, modifiedBy: [], before: status, after: status, snapshotBefore: snap, snapshotAfter: snap }
+      const base = { ran: true, passed: true, modifiedBy: [], failed: [], baselineFailed: [], notRerun: [], before: status, after: status, snapshotBefore: snap, snapshotAfter: snap }
       return { ...base, ...(typeof opts.hooks === 'function' ? opts.hooks(base) : opts.hooks) }
     }
     if (label.startsWith('commit#')) {
@@ -6797,11 +6797,63 @@ test('incomplete or inconsistent hook evidence admits nothing and commits nothin
     [{ snapshotBefore: [], snapshotAfter: [] }, /evidence is incomplete: no snapshot for src\/a\.c/],
     [b => gen(b, { snapshotAfter: b.snapshotAfter }), /evidence is incomplete: no snapshot for docs\/boards\.rst/],
     [{ ran: false, modifiedBy: ['gen-doc'] }, /evidence is inconsistent/],
+    [{ failed: [{ hook: 'lint', error: 'x' }] }, /evidence is inconsistent/],
+    [{ passed: false, failed: [{ hook: 'lint', error: 'x' }], baselineFailed: ['lint', 'other'] }, /evidence is inconsistent/],
+    [{ ran: false, passed: false, failed: [{ hook: 'lint', error: 'x' }] }, /evidence is inconsistent/],
+    // hooks.py never excuses a hook that rewrote files, nor an id the commit's SKIP cannot name or would skip another entry by
+    [b => gen(b, { passed: false, failed: [{ hook: 'gen-doc', error: 'x' }], baselineFailed: ['gen-doc'] }), /excused hook\(s\) modified files, cannot be skipped or share an id: "gen-doc"$/],
+    [{ passed: false, failed: [{ hook: 'a,b', error: 'x' }], baselineFailed: ['a,b'] }, /excused hook\(s\) modified files, cannot be skipped or share an id: "a,b"$/],
+    [{ passed: false, failed: [{ hook: 'unit-test', error: 'x' }, { hook: 'unit-test', error: 'y' }], baselineFailed: ['unit-test'] }, /excused hook\(s\) modified files, cannot be skipped or share an id: "unit-test"$/],
+    // SKIP strips each id and drops an empty one; only the offending id is named, quoted
+    [{ passed: false, failed: [{ hook: '', error: 'x' }], baselineFailed: [''] }, /excused hook\(s\) modified files, cannot be skipped or share an id: ""$/],
+    [{ passed: false, failed: [{ hook: 'ok', error: 'x' }, { hook: ' a', error: 'x' }], baselineFailed: ['ok', ' a'] }, /excused hook\(s\) modified files, cannot be skipped or share an id: " a"$/],
   ]) {
     const { result, labels } = await run({ ...publishing, hooks })
     assert.match(result.history[0].reviewPushFailed.detail, expected)
     assert.ok(!labels.some(l => l.startsWith('commit#')), String(expected))
   }
+})
+
+test('a failing hook is refused by name and first line unless it fails on HEAD too', async () => {
+  // A host that cannot run a hook (a broken compiler, a codepage) fails it with or without the fix (#378).
+  const unit = { hook: 'unit-test', error: 'preprocessing failed' }
+  const cov = { hook: 'drivers-coverage', error: "UnicodeDecodeError: 'gbk' codec can't decode" }
+  const refused = await run({ ...publishing, hooks: { passed: false, failed: [unit, cov], baselineFailed: ['drivers-coverage'] } })
+  assert.equal(refused.result.history[0].reviewPushFailed.detail, 'the repository hooks do not pass on the fix: unit-test: preprocessing failed')
+  assert.ok(!refused.labels.some(l => l.startsWith('commit#')))
+  assert.ok(refused.logs.some(l => l.endsWith('refusing to publish — the repository hooks do not pass on the fix: unit-test: preprocessing failed')))
+
+  const { result, logs, calls } = await run({ ...publishing, hooks: { passed: false, failed: [unit, cov], baselineFailed: ['unit-test', 'drivers-coverage'] } })
+  assert.equal(result.history[0].reviewPush.pass, true, 'the fix is published')
+  // an installed pre-commit hook reruns them on the commit: only the excused ones are skipped there
+  assert.ok(calls.find(c => c.label === 'commit#1-review').prompt.includes("commits.py commit --skip-hooks 'unit-test,drivers-coverage' --receipt "))
+  // shq quotes a `'` in an id as `'\\''`: the scope after it still reads
+  const quote = { hook: "it's", error: 'x' }
+  const quoted = await run({ ...publishing, hooks: { passed: false, failed: [quote], baselineFailed: [quote.hook] } })
+  assert.deepEqual(pathLine(quoted.calls.find(c => c.label === 'commit#1-review').prompt), ['src/a.c'])
+  const plain = await run({ ...publishing })
+  assert.ok(plain.calls.find(c => c.label === 'commit#1-review').prompt.includes('commits.py commit --receipt '), 'nothing excused, nothing skipped')
+  assert.ok(logs.some(l => l.endsWith(`push#1-review: hook(s) failing on HEAD too, not counted against the fix: unit-test: preprocessing failed; drivers-coverage: ${cov.error}`)))
+  // a failure hooks.py never reran on HEAD is refused with the reason it gave
+  const unread = await run({ ...publishing, hooks: { passed: false, failed: [unit], notRerun: [{ hook: 'unit-test', why: "PyYAML is not installed, nor is pre-commit's interpreter known, so the config was not read" }] } })
+  assert.equal(unread.result.history[0].reviewPushFailed.detail,
+    "the repository hooks do not pass on the fix: unit-test: preprocessing failed (not rerun on HEAD: PyYAML is not installed, nor is pre-commit's interpreter known, so the config was not read)")
+})
+
+test('a failure no hook owns, and hook output the excused hooks never judged, are refused by cause', async () => {
+  const named = await run({ ...publishing, hooks: { passed: false } })
+  assert.equal(named.result.history[0].reviewPushFailed.detail, 'the repository hooks do not pass on the fix, and pre-commit named no failing hook')
+  // hooks.py's own entry when the run without the excused failed naming no hook: the cause, not the excused hook
+  const unowned = { hook: '(pre-commit)', error: 'pre-commit exited 1 with unit-test skipped, naming no hook' }
+  const unowning = await run({ ...publishing, hooks: { passed: false, failed: [{ hook: 'unit-test', error: 'x' }, unowned], baselineFailed: ['unit-test'] } })
+  assert.equal(unowning.result.history[0].reviewPushFailed.detail, `the repository hooks do not pass on the fix: (pre-commit): ${unowned.error}`)
+  const excusedGen = b => gen(b, { passed: false, failed: [{ hook: 'unit-test', error: 'x' }], baselineFailed: ['unit-test'] })
+  const generated = await run({ ...publishing, hooks: excusedGen })
+  assert.equal(generated.result.history[0].reviewPushFailed.detail, 'hook output outside the fix scope, never judged by the excused hook(s) unit-test: docs/boards.rst')
+  // a protected path is named as such, excused hooks or not
+  const guarded = await run({ ...publishing, args: { ...publishing.args, protected: '^docs/' }, hooks: excusedGen })
+  assert.equal(guarded.result.history[0].reviewPushFailed.detail, 'a hook regenerated a protected path: docs/boards.rst')
+  for (const r of [named, unowning, generated, guarded]) assert.ok(!r.labels.some(l => l.startsWith('commit#')))
 })
 
 test('a commit whose content differs from what the hooks left is never pushed', async () => {
@@ -6934,7 +6986,7 @@ test('a commit the audit script cannot read back is not pushed', async () => {
 test('a hook script that reports no evidence stops publication with its error', async () => {
   const { result, labels, calls } = await run({ ...publishing, hooks: { error: 'pre-commit exited 0 but reported hook fmt failed', ran: false, passed: false } })
   assert.match(calls.find(c => c.label === 'hooks#1-review').prompt,
-    /as error, with ran = false, passed = false, modifiedBy = \[\], before = \[\], after = \[\], snapshotBefore = \[\], snapshotAfter = \[\], seal = ''\.$/,
+    /as error, with ran = false, passed = false, modifiedBy = \[\], failed = \[\], baselineFailed = \[\], notRerun = \[\], before = \[\], after = \[\], snapshotBefore = \[\], snapshotAfter = \[\], seal = ''\.$/,
     'the error-case values come from the schema')
   assert.match(result.history[0].reviewPushFailed.detail, /^no hook evidence: pre-commit exited 0/)
   assert.ok(!labels.some(l => l.startsWith('commit#')), 'nothing is committed')

@@ -102,11 +102,11 @@ def run(*argv, ok=(0,)):
         raise Unusable(f"{' '.join(argv)}: output is not UTF-8")
 
 
-def attempt(*argv, input=None):
+def attempt(*argv, input=None, env=None):
     """(exit status, stdout, stderr), replacing bad bytes: unlike run, a failure is part of the receipt."""
     try:
         # bytes in: a text-mode stdin on Windows writes each \n as \r\n
-        done = subprocess.run(argv, capture_output=True, env=gh_env(argv),
+        done = subprocess.run(argv, capture_output=True, env=env or gh_env(argv),
                               input=None if input is None else input.encode('utf-8', 'replace'))
     except FileNotFoundError:
         raise Unusable(f'{argv[0]} is not installed')

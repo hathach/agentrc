@@ -679,11 +679,14 @@ const RECHECK = withSeal({
 })
 const HOOKS = withSeal({
   type: 'object', additionalProperties: false,
-  required: ['ran', 'passed', 'modifiedBy', 'before', 'after', 'snapshotBefore', 'snapshotAfter'],
+  required: ['ran', 'passed', 'modifiedBy', 'failed', 'baselineFailed', 'notRerun', 'before', 'after', 'snapshotBefore', 'snapshotAfter'],
   properties: {
     error: { type: 'string' },
     ran: { type: 'boolean' }, passed: { type: 'boolean' },
     modifiedBy: { type: 'array', items: { type: 'string' } },
+    failed: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['hook', 'error'], properties: { hook: { type: 'string' }, error: { type: 'string' } } } },
+    baselineFailed: { type: 'array', items: { type: 'string' } },
+    notRerun: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['hook', 'why'], properties: { hook: { type: 'string' }, why: { type: 'string' } } } },
     before: { type: 'array', items: { type: 'string' } }, after: { type: 'array', items: { type: 'string' } },
     snapshotBefore: { type: 'array', items: { type: 'string' } }, snapshotAfter: { type: 'array', items: { type: 'string' } },
   },
@@ -1705,9 +1708,24 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
     (snapBefore.get(f).blob !== snapAfter.get(f).blob || snapBefore.get(f).mode !== snapAfter.get(f).mode))
   const ownedChanged = changedBy(owned)
   const regeneratedChanged = changedBy(regenerated)
+  // A hook that fails on HEAD's tree too fails for the host, not the fix (#378); any other failure refuses, named.
+  const failedIds = hooks.failed.map(f => f.hook)
+  const blamed = hooks.failed.filter(f => !hooks.baselineFailed.includes(f.hook))
+  const excused = hooks.failed.filter(f => hooks.baselineFailed.includes(f.hook))
+  const skipIds = [...new Set(excused.map(f => f.hook))]
+  // hooks.py never excuses a hook that rewrote files, nor an id SKIP cannot name or would skip another entry by
+  const unskippable = hooks.baselineFailed.filter(h => hooks.modifiedBy.includes(h) || !h || h.includes(',') || h !== h.trim() ||
+    failedIds.filter(i => i === h).length > 1)
+  // a failure hooks.py never reran on HEAD carries its reason, such as an unreadable hook config, into the refusal
+  const notRerun = new Map(hooks.notRerun.map(n => [n.hook, n.why]))
+  const failures = (fs) => fs.map(f => `${f.hook}: ${f.error}${notRerun.has(f.hook) ? ` (not rerun on HEAD: ${notRerun.get(f.hook)})` : ''}`).join('; ')
   const hookWhy = outside.length ? `tree changed outside the fix scope before the hooks ran: ${outside.join(', ')}`
     : unsteady.length ? `regenerated path(s) no longer a plain modification when the hooks ran: ${unsteady.join(', ')}`
-    : hooks.ran && !hooks.passed ? 'the repository hooks do not pass on the fix'
+    : (hooks.passed && failedIds.length) || (!hooks.ran && failedIds.length) || hooks.baselineFailed.some(h => !failedIds.includes(h))
+      ? 'hook evidence is inconsistent: a hook failed on HEAD without failing on the fix, or failed while the hooks passed or did not run'
+    : unskippable.length ? `hook evidence is inconsistent: excused hook(s) modified files, cannot be skipped or share an id: ${unskippable.map(h => JSON.stringify(h)).join(', ')}`
+    : hooks.ran && !hooks.passed && !failedIds.length ? 'the repository hooks do not pass on the fix, and pre-commit named no failing hook'
+    : blamed.length ? `the repository hooks do not pass on the fix: ${failures(blamed)}`
     : !hooks.ran && hooks.modifiedBy.length ? 'hook evidence is inconsistent: hooks reported modifying files without running'
     : !hooks.ran && regenerated.length ? `regenerated path(s) have no hook to vouch for them: ${regenerated.join(', ')}`
     : created.length ? `a hook created or renamed file(s): ${created.map(pathOf).join(', ')}`
@@ -1716,11 +1734,14 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
     : regeneratedChanged.length ? `a hook changed a regenerated path after the build left it: ${regeneratedChanged.join(', ')}`
     : hookPaths.length && !(hooks.ran && hooks.modifiedBy.length) ? `path(s) changed outside the fix scope by no hook: ${hookPaths.join(', ')}`
     : generatedProtected.length ? `a hook regenerated a protected path: ${generatedProtected.join(', ')}`
+    // the HEAD reruns judged only the checked paths, and the commit would skip the excused hooks on these too
+    : hookPaths.length && skipIds.length ? `hook output outside the fix scope, never judged by the excused hook(s) ${skipIds.join(', ')}: ${hookPaths.join(', ')}`
     : null
   if (hookWhy) {
     log(`push#${cycle}-${what}: refusing to publish — ${hookWhy}`)
     return { pass: false, committed: false, detail: hookWhy, sha: '' }
   }
+  if (excused.length) log(`push#${cycle}-${what}: hook(s) failing on HEAD too, not counted against the fix: ${failures(excused)}`)
   if (regenerated.length) log(`push#${cycle}-${what}: build output admitted into the commit: ${regenerated.join(', ')}`)
   if (hookPaths.length) log(`push#${cycle}-${what}: hook output admitted into the commit: ${hookPaths.join(', ')}`)
   const generatedPaths = [...new Set([...regenerated, ...hookPaths])]
@@ -1743,7 +1764,8 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
     'no trailer or line crediting an agent, model, tool or session — no Co-Authored-By, Claude-Session, Generated-with or the like: the repository\'s human is the sole author. ' +
     `The fixes: ${JSON.stringify(brief.claims)}; read \`git --literal-pathspecs diff -- ${scope.map(shq).join(' ')}\` for what changed. ` +
     // A file, not a here-document: no delimiter can collide with the message.
-    `Then run exactly \`${PY} ${COMMITS_SCRIPT} commit --receipt ${receiptFile} --request ${shq(commitLabel)} ${scope.map(shq).join(' ')} < '<that file>'; rm -f '<that file>'\` ` +
+    // An installed pre-commit hook runs again on the commit: the hooks excused above stay excused there, the others run.
+    `Then run exactly \`${PY} ${COMMITS_SCRIPT} commit ${skipIds.length ? `--skip-hooks ${shq(skipIds.join(','))} ` : ''}--receipt ${receiptFile} --request ${shq(commitLabel)} ${scope.map(shq).join(' ')} < '<that file>'; rm -f '<that file>'\` ` +
     'in the foreground with a Bash timeout of 600000 ms, the tool\'s maximum: an installed pre-commit hook runs again on the commit. ' +
     'Do not push. Change nothing else, and never add a file a hook touched and retry. ' +
     relayed(COMMIT),
