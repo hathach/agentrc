@@ -970,6 +970,23 @@ class LeftCleanup(LockDir):
         self.assertRegex(taken_failure(self.acquire())['noteError'], 'No space left')
         self.assertTrue(journal.exists())
 
+    def test_a_leftover_not_logged_stays_when_our_record_write_fails(self):
+        pid = self.dead_record(cleanupOwed=True, detail='restore failed')
+        old = self.lock_bytes()
+
+        def cut_short(fh, *a):
+            os.pwrite(fh.fileno(), hil_lock.ACQUIRING, 0)
+            raise OSError(28, 'No space left on device')
+        with mock.patch.object(hil_lock, '_log_append', mock.Mock(side_effect=OSError(28, 'No space left on device'))), \
+                mock.patch.object(hil_lock, '_write_record', cut_short), \
+                self.assertRaises(hil_lock.LockUnavailable) as cm:
+            self.acquire()
+        self.assertIn('leftover kept for the next taker, cleanup log not written', str(cm.exception))
+        self.assertEqual(self.lock_bytes(), old)
+        f = taken_failure(self.acquire())
+        self.assertEqual((f['pid'], f['detail']), (pid, 'restore failed'))
+        self.assertNotIn('noteError', f)
+
     def test_a_dead_cleanup_holders_record_under_a_live_taker_is_contention(self):
         """A taker logging a dead holder's record holds the flock with that record still in place."""
         dead = subprocess.Popen([sys.executable, '-c', ''])

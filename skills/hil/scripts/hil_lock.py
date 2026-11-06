@@ -281,6 +281,18 @@ def clear_record(fh) -> bool:
     return True
 
 
+def _restore_record(fh, data: bytes) -> bool:
+    """Put back the record `data` a failed rewrite may have cut short; first byte first, so an
+    interrupted restore reads as unreadable (logged), never as ACQUIRING. False when it failed."""
+    try:
+        fd = fh.fileno()
+        _pwrite_all(fd, data, 0)
+        os.ftruncate(fd, len(data))
+    except OSError:
+        return False
+    return True
+
+
 def release_board_lock(fh) -> None:
     """A taker's exit: clear the record, then drop the flock. It says nothing about the board's
     state: a task whose cleanup failed ends with end_failed, one that restored a board recorded
@@ -456,6 +468,7 @@ def take_board_lock(board: str, reason: str, *, protected=False, **extra):
     except OSError as e:
         raise _unavailable(e) from e
     try:
+        found = _handle_record(fh)
         left = _leftover(board, fh)
     except OSError as e:
         fh.close()
@@ -465,12 +478,18 @@ def take_board_lock(board: str, reason: str, *, protected=False, **extra):
     try:
         _write_record(fh, ACQUIRING, reason, extra)
     except OSError as e:
-        clear_record(fh)
+        why = f'board lock unavailable: holder record: {e}'
+        if not note_error:
+            clear_record(fh)
+        elif _restore_record(fh, found):     # the leftover's only evidence when no journal holds it
+            why += f'; leftover kept for the next taker, {note_error}'
+        else:
+            why += f'; leftover record not restored, {note_error}'
         try:
             fh.close()   # even a failing close lets the fd (and flock) go
         except OSError:
             pass
-        raise LockUnavailable(f'board lock unavailable: holder record: {e}') from e
+        raise LockUnavailable(why) from e
     fh.cleanup_failures = open_cleanup_failures(board) + ([dict(left, noteError=note_error)] if note_error else [])
     return fh
 

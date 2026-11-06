@@ -169,6 +169,27 @@ class JobHook(unittest.TestCase):
                 self.assertEqual(self.run_hook('start')[0], 1, why)
                 self.assertIsNone(self.marker())
 
+    def test_only_a_survivor_hold_tells_the_operator_to_end_processes(self):
+        ending = 'ends those processes'
+        self.procs = {**CHAIN, 900: 1}
+        self.sync()
+        rc, err = self.run_hook('start')
+        self.assertEqual(rc, 1)
+        self.assertIn(ending, err)
+        cases = {'unreadable cgroup': lambda: shutil.rmtree(self.cg),
+                 'no job id': lambda: os.environ.pop('GITHUB_JOB'),
+                 'OSError': lambda: (self.tmp / 'marker').mkdir()}
+        for why, make in cases.items():
+            with self.subTest(why), mock.patch.dict(os.environ, JOB):
+                self.procs = dict(CHAIN)
+                self.cg.mkdir(parents=True, exist_ok=True)
+                self.sync()
+                make()
+                rc, err = self.run_hook('start')
+                self.assertEqual(rc, 1, why)
+                self.assertNotIn(ending, err)
+                self.assertIn('resolves that reason', err)
+
     def test_only_its_own_units_cgroup_counts(self):
         other = self.tmp / 'cg' / 'hil-runner-tinyuf2.service'
         other.mkdir()

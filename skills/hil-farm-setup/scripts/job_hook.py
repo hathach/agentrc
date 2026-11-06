@@ -15,7 +15,8 @@ unreadable or unsettled cgroup, no job id) refuses.
 
 The marker is the runner user's own file, so each runner has its own: a guard against accidents in
 trusted jobs, not a boundary.
-An operator clears a hold by checking the named processes and the boards, then ending those processes.
+An operator clears a hold on left processes by checking them and the boards, then ending them, and
+any other hold by resolving the reason it names.
 """
 import os
 import sys
@@ -28,7 +29,12 @@ DONE = ' done'
 
 
 class Hold(Exception):
-    pass
+    advice = 'An operator resolves that reason; the next job starts once it is gone.'
+
+
+class Survivors(Hold):
+    advice = ('An operator checks the named processes and the boards, then ends those processes; the next job '
+              'starts once none is left.')
 
 
 def _raise(e):
@@ -119,7 +125,7 @@ def start(unit):
     prev = held()
     left = survivors(unit)
     if left:
-        raise Hold(f'processes left from an earlier job: {describe(left)}')
+        raise Survivors(f'processes left from an earlier job: {describe(left)}')
     me = job_id()
     if prev is not None and not prev.endswith(DONE):
         print(f'HIL farm: job {prev} never reached its completed hook; nothing of it runs, so this job proceeds '
@@ -140,8 +146,7 @@ def main(argv):
     try:
         (start if argv[0] == 'start' else complete)(argv[1])
     except (Hold, OSError) as e:
-        print(f'HIL farm held: {e}. An operator checks the named processes and the boards, then ends those '
-              'processes; the next job starts once none is left.', file=sys.stderr)
+        print(f'HIL farm held: {e}. {getattr(e, "advice", Hold.advice)}', file=sys.stderr)
         return 1
     return 0
 

@@ -199,8 +199,9 @@ hook refuses while that runner unit's cgroup still holds anything besides the ru
 or cannot be read. A previous job that never reached its completed hook (a killed worker, a host crash, marked in that
 runner user's `~/.hil-job-active`) is only a warning once nothing of it runs: its board locks ended with its
 processes, and the next task on each board logs what it left in the board's cleanup log (`hil_lock.py status`). That
-says no job process survived, not that its boards were restored. To clear a hold, check the processes the failed job
-names and the boards, then end those processes.
+says no job process survived, not that its boards were restored. To clear a hold on left processes, check the
+processes the failed job names and the boards, then end those processes; any other hold clears once the reason it
+names is resolved.
 
 Board locks live in `/tmp/tinyusb-hil-locks`, root-owned and sticky (1777) so the admin and `ghrunner` share them.
 They are cooperative: `ghrunner` owns the lock files it creates and can unlink one under a holder, and it opens the
