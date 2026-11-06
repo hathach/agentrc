@@ -23,7 +23,6 @@ python3 "$S/ledger.py" show --pr N [--finding ID | --draft | --pending | --threa
 python3 "$S/ledger.py" show --pr N --fixable --threads FILE --head SHA  # what an auto-fix repair may take from the review submitted on SHA, each with its claimDigest
 python3 "$S/ledger.py" save --pr N --output FILE [--reason TEXT]  # a finished launch's result, as a pending draft
 python3 "$S/post.py" --pr N --expected-head SHA [--auto [--defer-answers]]  # a pending GitHub review; --auto: submit it; --defer-answers: keep its answers for a later plain run
-python3 "$S/post.py" --pr N --expected-head SHA --decline --reason TEXT
 python3 "$S/post.py" --pr N --expected-head SHA --fixed FILE        # auto-fix: a fix note and a resolve on each repaired finding's thread
 python3 "$S/post.py" --pr N --sync                                # record what the human did on GitHub (prepare runs it)
 python3 "$S/result.py" --output FILE                              # a launch, condensed: counts, never bodies

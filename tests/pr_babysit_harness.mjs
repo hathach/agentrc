@@ -694,8 +694,9 @@ test('args validation', async () => {
   await assert.rejects(run({ args: { maxCycles: 0 } }), /maxCycles must be/)
   await assert.rejects(run({ args: { ciWait: 0 } }), /ciWait must be a positive integer/)
   await assert.rejects(run({ args: { ciWait: 1.5 } }), /ciWait must be a positive integer/)
-  await assert.rejects(run({ args: { lane: 'review' } }), /lane must be 'both', 'ci' or 'reviews'/)
-  await assert.rejects(run({ args: { lane: 'ci' } }), /needs yieldAfterCycle/)
+  await assert.rejects(run({ args: { lane: 'review' } }), /lane must be 'both' or 'reviews'/)
+  await assert.rejects(run({ args: { lane: 'ci', yieldAfterCycle: true } }), /lane must be 'both' or 'reviews'/)
+  await assert.rejects(run({ args: { lane: 'reviews' } }), /needs yieldAfterCycle/)
 })
 
 test('an unknown reviewer or a malformed protected pattern throws before any agent runs', async () => {
@@ -913,8 +914,8 @@ test('an interpreter missing a module the lanes need stops at preflight, naming 
   assert.deepEqual(labels, ['preflight'])
   const unnamed = await run({ reviews: oneValid, preflight: { python: ' ' } })
   assert.deepEqual([unnamed.result.reason, unnamed.result.detail], ['python-unusable', 'preflight names no interpreter'])
-  // A CI-only launch, or one waiting on no bot, imports nothing beyond the standard library.
-  for (const args of [{ reviewers: [] }, { lane: 'ci', yieldAfterCycle: true }, { reviewers: ['copilot'] }]) {
+  // A launch waiting on no bot imports nothing beyond the standard library.
+  for (const args of [{ reviewers: [] }, { reviewers: ['copilot'] }]) {
     const ci = await run({ args })
     assert.doesNotMatch(ci.calls[0].prompt, /--module/, JSON.stringify(args))
     assert.equal(ci.result.reason === 'python-unusable', false)
@@ -1174,8 +1175,6 @@ test('findings rows: a fix keeps its commit through a later stale, an edit is a 
   assert.equal(first.result.rollup.rows.find(r => r.state === 'accepted').accepted, byKey().reason)
   const again = await run({ args: { ...YIELD, state: first.result.state, acceptedFailures: [byKey()] }, reviews: WAITING, ci: red })
   assert.deepEqual([...new Set(again.result.rollup.rows.map(r => r.lastCycle))], [2], "the carried cycle is the previous launch's")
-  const ciOnly = await run({ args: { ...YIELD, lane: 'ci' }, ci: red })
-  assert.deepEqual(ciOnly.result.rollup.observed, { reviews: false, ci: true })
 })
 
 test('a launch rollup counts its own cycles, each finding and CI failure once', async () => {
@@ -1578,7 +1577,7 @@ test('consumers inside the batch\'s own files are searched too', async () => {
 
 test('the CI lane gets its own compatibility check', async () => {
   const { calls } = await run({
-    args: { lane: 'ci', yieldAfterCycle: true, maxCycles: 3 },
+    args: { yieldAfterCycle: true, maxCycles: 3 },
     ci: { status: 'red', infraRerun: [], realFailures: [{ check: 'build / arm', firstError: 'boom', files: ['src/a.c'], verdict: 'real' }] },
   })
   assert.deepEqual(calls.filter(c => c.label.startsWith('compat#')).map(c => c.label), ['compat#1-ci'])
@@ -1599,7 +1598,7 @@ test('groups the overlap merge joins get one writer and one verifier, and every 
   // Two CI failures with different scope keys that both name src/a.c: two groups
   // from groupWork, one after the merge.
   const { result, calls, logs } = await run({
-    args: { lane: 'ci', yieldAfterCycle: true, maxCycles: 3 },
+    args: { yieldAfterCycle: true, maxCycles: 3 },
     ci: { status: 'red', infraRerun: [], realFailures: [
       { check: 'build / arm', firstError: 'boom in a', files: ['src/a.c'], verdict: 'real' },
       { check: 'build / riscv', firstError: 'boom in the bsp', files: ['hw/bsp/x/board.c', 'src/a.c'], verdict: 'real' },
@@ -1740,8 +1739,7 @@ test('the CI lane waits out its budget in slices, 30 minutes by default', async 
   assert.equal(calls.find(c => c.label === 'ci:collect#1.1').model, 'haiku')
   const long = await run({ ci: RUNNING, args: { ciWait: 90, maxCycles: 1 } })
   assert.equal(slices(long.calls).reduce((a, b) => a + b), 90 * 60)
-  const ciOnly = await run({ ci: RUNNING, args: { lane: 'ci', yieldAfterCycle: true, maxCycles: 1 } })
-  assert.equal(slices(ciOnly.calls)[0], 540, 'no review lane to wait for')
+  assert.ok(slices(calls).includes(540), 'longer once the review pass is done')
   const green = await run()
   assert.deepEqual(green.labels.filter(l => l.startsWith('ci:')), ['ci:collect#1.1'], 'a settled inventory needs no judge, nor a full read')
 })
@@ -1772,7 +1770,7 @@ test("a review bot's own check is left to the review lane, and CI settles once t
   const stuck = await run({ ci: { ...RUNNING, pending: 2, waiting: 'same', ignored: ['CodeRabbit'] }, args: { maxCycles: 4 } })
   assert.equal(stuck.result.reason, 'ci-stuck')
   // Only when the review lane waits on CodeRabbit.
-  for (const args of [{ lane: 'ci', yieldAfterCycle: true }, { reviewers: [] }, { reviewers: ['greptile'] },
+  for (const args of [{ reviewers: [] }, { reviewers: ['greptile'] },
     { reviewers: ['coderabbit', 'greptile'], autoRun: ['greptile'] }]) {
     const { calls } = await run({ ci: onlyBot, args: { ...args, maxCycles: 1 } })
     assert.ok(reads(calls).length && reads(calls).every(c => !/--ignore-check/.test(c.prompt)), JSON.stringify(args))
@@ -1802,10 +1800,6 @@ test('CI that saw nothing move through two whole waits on one head stops ci-stuc
   const { head, registered, pending, waiting } = first.result.state.last.ciWaited
   const reordered = seal({ ...first.result.state, last: { ...first.result.state.last, ciWaited: { waiting, pending, registered, head } } })
   assert.equal((await run({ ci: stuck, args: { ...YIELD, state: reordered } })).result.reason, 'ci-stuck')
-  // A CI-only launch stops on it too.
-  const CI_ONLY = { ...YIELD, lane: 'ci' }
-  const ciFirst = await run({ ci: stuck, args: CI_ONLY })
-  assert.equal((await run({ ci: stuck, args: { ...CI_ONLY, state: ciFirst.result.state } })).result.reason, 'ci-stuck')
   // A slice its relay retried ran without its wait: no whole wait, on either kind of head.
   const retried = (l) => /^ci:collect#\d+\.1$/.test(l)
   const short = await run({ ci: stuck, throwOn: retried, args: { maxCycles: 3, ciWait: 1 } })
@@ -2926,10 +2920,6 @@ test('a PR merged or closed mid-launch ends both lanes at the CI lane\'s next re
   })
   assert.equal(refuting.result.reason, 'pr-merged')
   assert.equal(refuting.labels.some(l => l.startsWith('replies#')), false, refuting.labels.join(', '))
-  // The CI lane alone stops the same way.
-  const ciOnly = await run({ ci: ended('closed'), args: { lane: 'ci', yieldAfterCycle: true, maxCycles: 3 } })
-  assert.equal(ciOnly.result.reason, 'pr-closed')
-  assert.deepEqual(ciOnly.labels.filter(l => l.startsWith('ci:')), ['ci:collect#1.1'])
 })
 
 test('fix notes are not posted once the CI lane reads the merge during the push', async () => {
@@ -2971,7 +2961,7 @@ test('a GitHub write reads the PR state first, and goes on only for a verified O
 })
 
 test('the CI judge, which may re-run checks, is dispatched only for a PR read OPEN just before', async () => {
-  const args = { lane: 'ci', yieldAfterCycle: true, maxCycles: 3 }
+  const args = { yieldAfterCycle: true, maxCycles: 3 }
   const judge = (labels) => labels.filter(l => /^(prstate#|ci:judge#)/.test(l))
   const merged = await run({ ...redWith(PVS), prState: 'MERGED', args })
   assert.equal(merged.result.reason, 'pr-merged')
@@ -3037,7 +3027,6 @@ test('a PR conflicting with its base stops, judging nothing, whatever its checks
   for (const [name, over] of [
     ['passing checks', {}],
     ['only accepted failures', { realFailures: [PVS], args: { acceptedFailures: [byKey()] } }],
-    ['the CI lane alone', { args: { lane: 'ci', yieldAfterCycle: true, maxCycles: 3 } }],
   ]) {
     const { result, labels, logs } = await run({
       ci: { status: 'conflicting', infraRerun: [], realFailures: over.realFailures ?? [] }, args: { maxCycles: 3, ...over.args },
@@ -4173,8 +4162,8 @@ test('a settlement is refused at another head, on a held, changed or not handed-
   const held = await run({ reviews: edited, preflight: at, challenge: () => ({ verdict: 'unknown', reason: 'cannot tell' }), args: { ...YIELD, state, replySettlements: [settlement] } })
   assert.equal(held.calls.some(c => c.label.startsWith('reuse#')), false)
   assert.deepEqual(held.result.settlements, [{ commentId: 1, outcome: 'refused', why: 'a point of the comment is held' }])
-  const ciOnly = await run({ reviews: edited, preflight: at, args: { ...YIELD, lane: 'ci', state, replySettlements: [settlement] } })
-  assert.deepEqual(ciOnly.result.settlements, [{ commentId: 1, outcome: 'not processed', why: 'no review harvest in this launch' }])
+  const unharvested = await run({ throwOn: (l) => l.startsWith('reviews#'), preflight: at, args: { ...YIELD, state, replySettlements: [settlement] } })
+  assert.deepEqual(unharvested.result.settlements, [{ commentId: 1, outcome: 'not processed', why: 'no review harvest in this launch' }])
 })
 
 test('a reuse relay that drops a member gets one fresh relay, and the settlement still lands (#47)', async () => {
@@ -5669,32 +5658,6 @@ test('a rejected receipt that names a reply still blocks a repost', async () => 
   assert.deepEqual(result.state.debt.find(([id]) => id === 2)[1].repair, { replyId: 502, error: 'receipt for a different body' })
 })
 
-test('a ci launch watches CI and never runs the validator', async () => {
-  // Chief saw only a check conclude: this launch spends no opus on a harvest.
-  const { result, labels, logs } = await run({
-    args: { lane: 'ci', yieldAfterCycle: true, maxCycles: 3 },
-    ci: { status: 'red', infraRerun: [], realFailures: [{ check: 'build', firstError: 'boom', files: ['src/a.c'], verdict: 'real' }] },
-  })
-  assert.equal(labels.some(l => l.startsWith('reviews#') || l.startsWith('challenge#') || l.startsWith('replies#')), false)
-  assert.ok(labels.includes('ci:collect#1.1') && labels.includes('ci:judge#1'))
-  assert.ok(labels.some(l => l.startsWith('fix:')), 'the CI fix still runs')
-  assert.equal(result.status, 'paused')
-  assert.equal(result.observation.lane, 'ci')
-  assert.equal(result.observation.reviews, null, 'nobody looked at reviews')
-  assert.equal(result.history[0].reviews, null)
-  assert.match(summaries(logs)[0], /reviews not observed this launch/)
-})
-
-test('a ci launch cannot declare the PR done, even green', async () => {
-  const { result, logs } = await run({
-    args: { lane: 'ci', yieldAfterCycle: true, maxCycles: 3 },
-    ci: { status: 'green', infraRerun: [], realFailures: [] },
-  })
-  assert.equal(result.status, 'paused')
-  assert.equal(result.pass, false)
-  assert.ok(logs.some(l => /ci lane only — reviews not observed, no verdict this launch/.test(l)), logs.join('\n'))
-})
-
 test('a reviews launch runs no CI watcher and still fixes and pushes', async () => {
   const { result, labels, logs } = await run({
     args: { lane: 'reviews', yieldAfterCycle: true, maxCycles: 3 },
@@ -5719,18 +5682,18 @@ test('a reviews launch with settled bots still declares nothing', async () => {
 })
 
 test('the lane is not part of the state a launch must match', async () => {
-  const first = await run({ args: { lane: 'ci', yieldAfterCycle: true, maxCycles: 3 } })
+  const first = await run({ args: { lane: 'reviews', yieldAfterCycle: true, maxCycles: 3 } })
   assert.equal(first.result.state.config.lane, undefined)
   const second = await run({ args: { lane: 'reviews', yieldAfterCycle: true, maxCycles: 3, state: first.result.state }, reviews: { findings: [], replies: [], bots: 'reviewed' } })
-  assert.equal(second.result.state.cyclesUsed, 2, 'the budget is shared across lanes')
+  assert.equal(second.result.state.cyclesUsed, 2, 'the budget is shared across launches')
   const third = await run({ args: { yieldAfterCycle: true, maxCycles: 3, state: second.result.state }, reviews: { findings: [], replies: [], bots: 'reviewed' } })
   assert.equal(third.result.status, 'complete', `only the both launch completes (got ${third.result.reason})`)
-  assert.deepEqual(third.result.history.map(e => e.lane), ['reviews', 'both'], 'a launch carries only the previous launch\'s last cycle')
+  assert.deepEqual(third.result.history.map(e => [e.cycle, e.lane]), [[2, 'reviews'], [3, 'both']], 'a launch carries only the previous launch\'s last cycle')
   assert.equal(third.result.state.last.lane, 'both')
 })
 
 test('debt and the pushed head carry across a lane switch', async () => {
-  // reviews pushes and owes a refutation, ci keeps both, both pays it and completes.
+  // reviews pushes and owes a refutation, both pays it and completes.
   const reviews1 = { findings: [finding({ commentId: 1 }), invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'not so' }], bots: 'reviewed' }
   const first = await run({
     args: { lane: 'reviews', yieldAfterCycle: true, maxCycles: 4 },
@@ -5740,20 +5703,13 @@ test('debt and the pushed head carry across a lane switch', async () => {
   assert.equal(first.result.state.expectedHead, shaFor(1))
   assert.deepEqual(first.result.outstanding, [2])
   const second = await run({
-    args: { lane: 'ci', yieldAfterCycle: true, maxCycles: 4, state: first.result.state },
-    preflight: { head: shaFor(1), prHead: shaFor(1) },
-  })
-  assert.equal(second.result.status, 'paused')
-  assert.deepEqual(second.result.outstanding, [2], 'the ci launch keeps the reply owed')
-  assert.equal(second.result.state.expectedHead, shaFor(1))
-  const third = await run({
-    args: { yieldAfterCycle: true, maxCycles: 4, state: second.result.state },
+    args: { yieldAfterCycle: true, maxCycles: 4, state: first.result.state },
     preflight: { head: shaFor(1), prHead: shaFor(1) },
     reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'not so' }], bots: 'reviewed' },
     challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
   })
-  assert.equal(third.result.status, 'complete', `the both launch pays and completes (got ${third.result.reason})`)
-  assert.equal(third.result.state.debt.length, 0)
+  assert.equal(second.result.status, 'complete', `the both launch pays and completes (got ${second.result.reason})`)
+  assert.equal(second.result.state.debt.length, 0)
 })
 
 test('a dry run still runs the fixers it is allowed to run', async () => {
@@ -8585,9 +8541,6 @@ test("Greptile's confidence check is read by collect.py as a gate, never judged 
   assert.equal(other.result.reason, 'ci-red-greptile-gate')
   assert.equal(other.labels.some(l => l.startsWith('fix:') || l.startsWith('ci:judge')), false)
   assert.ok(other.logs.some(l => /— it is not a confidence result this reads: inspect the check on GitHub/.test(l)), other.logs.join('\n'))
-  // In the CI lane alone it is never fixed either.
-  const ciOnly = await run({ ci: { status: 'red', infraRerun: [], realFailures: [GREPTILE_GATE] }, args: { lane: 'ci', autoPush: true, yieldAfterCycle: true, maxCycles: 1 } })
-  assert.equal(ciOnly.labels.some(l => l.startsWith('fix:') || l.startsWith('ci:judge')), false, ciOnly.labels.join(', '))
   // The same name from an Actions job is an ordinary CI failure.
   const job = await gateRun([{ ...GREPTILE_GATE, workflow: 'review', link: undefined }], { args: { autoPush: false, maxCycles: 1 } })
   assert.ok(job.labels.includes('ci:judge#1'), 'a job with a workflow is judged')
@@ -8669,7 +8622,7 @@ test('yieldOnChange pauses when the handoffs change, and refuses yieldAfterCycle
   assert.deepEqual(second.result.handoffs.map(h => h.commentId), [1])
   assert.ok(second.logs.some(l => /pausing for the caller — the handoffs changed/.test(l)), second.logs.join('\n'))
   await assert.rejects(run({ args: { ...ON, yieldAfterCycle: true } }), /two ways to pause/)
-  await assert.rejects(run({ args: { ...ON, lane: 'ci' } }), /needs yieldAfterCycle/)
+  await assert.rejects(run({ args: { ...ON, lane: 'reviews' } }), /needs yieldAfterCycle/)
 })
 
 test('a launch that runs several cycles returns every cycle\'s publication receipts', async () => {

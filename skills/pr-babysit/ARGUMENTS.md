@@ -130,8 +130,8 @@ A key not listed here throws before anything runs.
   cycle that only waited (CI settling, bots pending, owed replies, a SonarCloud
   re-read) goes on in the same launch. A stop and the last cycle end the launch
   as without it. Not with `yieldAfterCycle` or a single lane.
-- `lane`: `both` (default), `ci` or `reviews`; a single lane needs
-  `yieldAfterCycle` and never declares the PR done.
+- `lane`: `both` (default) or `reviews`; `reviews` runs the review lane alone,
+  needs `yieldAfterCycle` and never declares the PR done.
 - `state` or `stateRef: { outputFile, digest }`: a previous launch's state, or
   the saved output holding it and its `stateDigest`, loaded as checksummed chunks.
   `launch_result.py`'s `stateRef` names a copy it keeps outside the Workflow

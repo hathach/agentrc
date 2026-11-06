@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Pin a PR for pr-review and check a pinned one has not moved.
 
-  prepare.py --pr N [--repo OWNER/NAME] [--max-groups 6] [--full] [--auto-fix]   # from the checkout's top level
-  prepare.py --pr N --recheck-from SHA [--repo OWNER/NAME] [--max-groups 6]      # an auto-fix recheck, from the same place
+  prepare.py --pr N [--repo OWNER/NAME] [--full] [--auto-fix]       # from the checkout's top level
+  prepare.py --pr N --recheck-from SHA [--repo OWNER/NAME]          # an auto-fix recheck, from the same place
   prepare.py --check --pr N --expected-head SHA [--repo OWNER/NAME]  # from the review worktree top level
   prepare.py --release --pr N --token T [--repo OWNER/NAME]           # from any worktree of the repository
 
@@ -27,7 +27,7 @@ pending, or a post never confirmed, refuses the run. It reads the ledger to choo
 reviewed already, `incremental` when the last reviewed head is an ancestor and
 the merge base is unchanged (scope: last head..head), else `full` (scope:
 merge base..head); --full forces full. The scope's changed directories become
-at most --max-groups review groups, merging to shallower directories when they
+at most MAX_GROUPS review groups, merging to shallower directories when they
 exceed it. `tooling` lists the PR's changed paths that execute when the PR is
 built or tested (build files, scripts, CI, the HIL harness): the caller reads
 their diff before building anything. `ci` summarises the head's checks:
@@ -91,6 +91,7 @@ PENDING = {'PENDING', 'QUEUED', 'IN_PROGRESS', 'WAITING', 'REQUESTED', 'EXPECTED
 FAILED = {'FAILURE', 'ERROR', 'TIMED_OUT', 'STARTUP_FAILURE', 'CANCELLED', 'STALE'}
 RUN_LOCK = re.compile(r'pr-review (\d+) running ([0-9a-f]+)')
 WRITE = ('admin', 'maintain', 'push')
+MAX_GROUPS = 6
 
 
 def gh_json(*argv, ok=(0,)):
@@ -495,7 +496,7 @@ def prepare(a):
         repair = {**repair_target(repo, head_repo_of(info), info, branch, head), **reuse} if a.auto_fix else None
         pr_paths = changed(merge_base, head)
         scope = pr_paths if mode != 'incremental' else changed(scope_base, head)
-        groups, over = groups_of(scope, a.max_groups)
+        groups, over = groups_of(scope, MAX_GROUPS)
         ci, checks = ci_summary(repo, a.pr)
         facts = facts_path(repo, a.pr, head)
         facts.parent.mkdir(parents=True, exist_ok=True)
@@ -573,13 +574,10 @@ def collect(argv):
     p.add_argument('--release', action='store_true')
     p.add_argument('--token')
     p.add_argument('--expected-head')
-    p.add_argument('--max-groups', type=int, default=6)
     p.add_argument('--full', action='store_true')
     p.add_argument('--auto-fix', action='store_true')
     p.add_argument('--recheck-from')
     a = p.parse_args(argv)
-    if a.max_groups < 1:
-        raise Unusable('--max-groups must be at least 1')
     if a.token is not None and not re.fullmatch(r'[0-9a-f]+', a.token):
         raise Unusable(f'--token must be the hex token prepare reported, not {a.token!r}')
     if a.auto_fix and (a.check or a.release):

@@ -69,8 +69,8 @@ review, no findings) that post.py publishes the new answers through. save reads 
 checks it is a result for this PR, and appends it as a review whose draft is
 `pending`: each comment anchored on a line the PR diff adds or keeps, else
 moved into the body, and the draft's digest fixed before anything is posted.
-A pending draft already on the ledger for that head is refused: post it,
-decline it, or say why a second review is due (--reason).
+A pending draft already on the ledger for that head is refused: post it
+or say why a second review is due (--reason).
 
 stdout ends with one JSON line; {"error": ...} and exit 2 when the ledger or
 the output cannot be read, or they disagree.
@@ -226,7 +226,7 @@ def refuse_unsettled(led, head, statuses=UNSETTLED):
     got = [p for p, _ in publications(led) if p['head'] == head and p['status'] in statuses]
     if got:
         raise Unusable(f"a {got[-1]['status']} draft {got[-1]['draft']['digest']} for {head} is on the ledger: "
-                       'post, reconcile or decline it first')
+                       'post or reconcile it first')
 
 
 def last(led):

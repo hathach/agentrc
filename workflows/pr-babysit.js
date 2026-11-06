@@ -131,7 +131,7 @@ const buildCmd = typeof args.build === 'string' && args.build.trim() ? args.buil
 const yieldAfterCycle = args.yieldAfterCycle === true
 const yieldOnChange = args.yieldOnChange === true
 const lane = args.lane === undefined ? 'both' : args.lane
-if (!['both', 'ci', 'reviews'].includes(lane)) throw new Error("lane must be 'both', 'ci' or 'reviews'")
+if (!['both', 'reviews'].includes(lane)) throw new Error("lane must be 'both' or 'reviews'")
 if (lane !== 'both' && !yieldAfterCycle) throw new Error(`lane '${lane}' runs one lane for one cycle: it needs yieldAfterCycle`)
 if (yieldOnChange && yieldAfterCycle) throw new Error('yieldOnChange and yieldAfterCycle are two ways to pause: pass one')
 const ciLane = lane !== 'reviews'
@@ -145,9 +145,8 @@ const greptileTrigger = args.greptileTrigger ?? false
 if (typeof greptileTrigger !== 'boolean') throw new Error('greptileTrigger must be a boolean')
 if (greptileTrigger && args.autoPush !== true) throw new Error('greptileTrigger comments `@greptileai` on the PR: it needs autoPush')
 if (greptileTrigger && !reviewers.includes('greptile')) throw new Error(`greptileTrigger needs greptile in reviewers ${JSON.stringify(reviewers)}`)
-const reviewLane = lane !== 'ci'
 // CodeRabbit's own check, by its exact name: the review lane waits on it, so CI leaves it out (#80). Never SonarCloud or code scanning, which are CI.
-const ciIgnored = reviewLane && autoRun.includes('coderabbit') ? ['CodeRabbit'] : []
+const ciIgnored = autoRun.includes('coderabbit') ? ['CodeRabbit'] : []
 const STATE_VERSION = 4
 // A state crosses its caller, so it is sealed: canonical key order, any change fails the digest.
 const canonical = (v) => Array.isArray(v) ? `[${v.map(canonical).join(',')}]`
@@ -1634,7 +1633,7 @@ const cycleSummary = (entry) => {
     ])
   }
   const head = `cycle ${entry.cycle} summary — CI ${entry.ci && acceptedOnly(entry.ci) ? 'red, accepted failures only' : entry.ci ? entry.ci.status : entry.lane === 'reviews' ? 'not observed this launch' : 'unknown'}, ` +
-    `${entry.lane === 'ci' ? 'reviews not observed this launch' : reviewers.length === 0 ? 'no reviewers requested'
+    `${reviewers.length === 0 ? 'no reviewers requested'
       : entry.bots ? `reviews: ${botsLine(entry.bots)}` : 'no review data'}` +
     `${entry.error ? `, ERROR: ${entry.error}` : ''}`
   return rows.length === 0
@@ -2565,7 +2564,7 @@ const ciLaneRun = async (cycle, lanes, entry) => {
 // Returns null to re-arm, or the final result.
 const runCycle = async (cycle, entry) => {
   // prState: 'merged' or 'closed' once read so, 'unread' when a read before a write failed; the review lane then stops at its next step.
-  const lanes = { reviewDone: !reviewLane, reviewPublishing: false, ended: false, prState: null }
+  const lanes = { reviewDone: false, reviewPublishing: false, ended: false, prState: null }
   const verdict = await runLanes(cycle, entry, lanes)
   // The CI lane settles last, so it can read the merge after the review lane stopped for another reason.
   if (lanes.prState === 'merged' || lanes.prState === 'closed') return prEnded(cycle, lanes.prState)
@@ -2630,8 +2629,8 @@ const runLanes = async (cycle, entry, lanes) => {
         ? 'Our fix notes on these comments are not yet posted; for a stale finding on one, set fixedBy to its sha when that commit\'s change is what fixed the finding: ' +
           `${JSON.stringify(unpostedNotes().map(([commentId, d]) => ({ commentId, sha: d.attempt.repair.sha })))}. ` : '')
     const nobody = { findings: [], replies: [], bots: [] }
-    const probed = reviewLane && reviewers.length > 0 && quotaRead && quotaRead.head === expectedHead ? await probeReviews(cycle) : null
-    const r = !reviewLane || reviewers.length === 0
+    const probed = reviewers.length > 0 && quotaRead && quotaRead.head === expectedHead ? await probeReviews(cycle) : null
+    const r = reviewers.length === 0
       ? nobody
       : probed || await agent(reviewPrompt, {
         label: `reviews#${cycle}`, phase: 'Triage', agentType: 'pr-review-validator', schema: REVIEWS,
@@ -2652,8 +2651,8 @@ const runLanes = async (cycle, entry, lanes) => {
       entry.error = `harvest.py failed: ${r.harvestError}`
       return stop(cycle, 'harvest-failed', { detail: r.harvestError })
     }
-    if (reviewLane && reviewers.length === 0) log(`cycle ${cycle}: no reviewers requested — CI lane only`)
-    entry.reviews = reviewLane ? r : null
+    if (reviewers.length === 0) log(`cycle ${cycle}: no reviewers requested — CI lane only`)
+    entry.reviews = r
     // A harvest not about this head, or missing an auto-run bot, settles nothing.
     if (r !== nobody) {
       const why = reviewsWhy(r)
@@ -2663,9 +2662,9 @@ const runLanes = async (cycle, entry, lanes) => {
         return stop(cycle, 'review-report-unusable', { detail: why })
       }
     }
-    if (reviewLane && r !== nobody) reviewedCycles.set(cycle, r.findings)
+    if (r !== nobody) reviewedCycles.set(cycle, r.findings)
     entry.bots = r === nobody
-      ? (reviewLane ? { waitedMin: 0, since: null, clock: null, bots: [] } : null)
+      ? { waitedMin: 0, since: null, clock: null, bots: [] }
       : settleBots(r)
     if (r !== nobody) await triggerCodeRabbit(cycle, r, entry.bots, ended)
     const unasked = r !== nobody ? await requestGreptile(cycle, r, entry.bots, lanes, ended) : null
@@ -3132,10 +3131,6 @@ const runLanes = async (cycle, entry, lanes) => {
       log(`cycle ${cycle}: CI on ${expectedHead.slice(0, 7)}: the re-run of ${c.unregistered.join(', ')} has not registered within ${ciWait} minutes — observe it before relaunching`)
       return stop(cycle, 'ci-stuck', { head: expectedHead, unregistered: c.unregistered })
     }
-    if (!reviewLane) {
-      log(`cycle ${cycle}: ci lane only — reviews not observed, no verdict this launch`)
-      return null
-    }
     // A required check that failed with nothing left to repair or re-run: no fix here makes GitHub accept the merge.
     if (nothingToRepair(c) && c.requiredFailed) {
       const names = c.requiredFailed.map(requiredName)
@@ -3255,7 +3250,7 @@ const PIN = withSeal({
   },
 })
 // The modules the enabled lanes import beyond the standard library: harvest.py dates a head for the bots waited on from workflow files.
-const MODULES = reviewLane && reviewers.length && waitedOn.length ? ['yaml'] : []
+const MODULES = reviewers.length && waitedOn.length ? ['yaml'] : []
 const PACKAGE = { yaml: 'PyYAML' }
 if (cyclesUsed >= maxCycles) {
   log(`state: ${cyclesUsed} of ${maxCycles} cycles already used — nothing left to run`)

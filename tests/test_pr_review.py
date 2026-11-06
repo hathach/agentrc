@@ -370,7 +370,7 @@ class Prepare(Case):
         self.push_pr()
         p = self.prepare()
         self.save(self.result_for(p))
-        with self.assertRaisesRegex(facts.Unusable, 'pending draft .* post, reconcile or decline it first'):
+        with self.assertRaisesRegex(facts.Unusable, 'pending draft .* post or reconcile it first'):
             self.prepare()
         self.mark_posted(p)
         self.assertEqual(self.prepare()['mode'], 'same')
@@ -1051,12 +1051,6 @@ class Ledger(Case):
         with self.assertRaisesRegex(facts.Unusable, 'uncertain draft'):
             self.save(self.result_for(self.p), reason='again')
 
-    def test_a_declined_review_carries_nothing(self):
-        self.save(self.result_for(self.p))
-        self.call(post, ['--pr', str(PR), '--repo', REPO, '--expected-head', self.p['head'], '--decline', '--reason', 'no'])
-        self.assertEqual(self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO])['open'], [])
-        self.assertEqual(self.prepare()['mode'], 'full', 'a declined head is not a reviewed head')
-
     def test_an_absolute_or_backslashed_comment_path_is_refused(self):
         r = self.result_for(self.p)
         r['draft']['comments'][0]['path'] = '/abs/src/core/a.c'
@@ -1474,20 +1468,6 @@ class Post(PostCase):
         self.save(self.result_for(self.p, draft={**draft, 'comments': [draft['comments'][0], {**draft['comments'][1], 'body': ' '.join(['w'] * 81)}]}))
         self.assertEqual([c['line'] for c in self.review()['draft']['moved']], [1], 'moved into the body, kept as the comment it was')
         self.assertEqual((self.post('--auto')['status'], len(self.gh.submits)), ('posted', 1))
-
-    def test_decline_settles_a_draft_never_created(self):
-        self.save(self.result_for(self.p))
-        self.assertEqual(self.post('--decline', '--reason', 'not now')['status'], 'declined')
-        self.assertEqual((self.review()['status'], self.gh.posts), ('declined', []))
-        with self.assertRaisesRegex(facts.Unusable, 'no pending draft'):
-            self.post()
-
-    def test_a_partial_or_uncertain_draft_cannot_be_declined(self):
-        self.save(self.result_for(self.p))
-        self.gh.post_fails = True
-        self.post('--auto')
-        with self.assertRaisesRegex(facts.Unusable, 'reconcile it, do not decline it'):
-            self.post('--decline', '--reason', 'x')
 
 
 class Draft(PostCase):
@@ -2139,11 +2119,6 @@ class Pushback(PostCase):
         self.prepare()
         self.assertEqual(auto()['status'], 'withdrawn')
         self.assertTrue(self.gh.threads[0]['isResolved'])
-
-    def test_a_declined_answer_record_reopens_its_concession(self):
-        self.discuss('withdrawn', {'body': 'Agreed, withdrawing.', 'resolve': True})
-        self.post('--decline', '--reason', 'no')
-        self.assertEqual(self.finding()['status'], 'open')
 
     def test_a_reply_after_the_judgment_keeps_the_answer_out_until_rejudged(self):
         self.discuss('upheld', {'body': 'Still stands.', 'resolve': False})
