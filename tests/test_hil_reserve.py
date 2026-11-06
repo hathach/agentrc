@@ -1,7 +1,7 @@
 """hil_reserve.py against a fake sysfs tree, a temp lock dir and stub `sudo`/recovery
 scripts: roster resolution across both projects' shapes, the coverage refusals, the
-all-or-nothing hold, the one command it builds, and the cleanup-holder outcome with its
-token-bound release. `run` is exercised in a forked child that shares this process's
+all-or-nothing hold, the one command it builds, and the blocker outcome, logged on every
+board and every lock released (agentrc#464). `run` is exercised in a forked child that shares this process's
 patched module state, so the production command line stays intact and a test can patch
 one function in the child before it starts. Stubs prove the plumbing; the hardware rungs
 are the skill's own validation."""
@@ -25,7 +25,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import guard_survivors  # noqa: E402
+from helpers import guard_survivors, latest_failure  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'hil' / 'scripts' / 'hil_reserve.py'
 DATA = Path(__file__).resolve().parent / 'data' / 'hil_reserve'
@@ -247,12 +247,6 @@ class Fixture(unittest.TestCase):
     def held(self):
         return {k for k, v in self.records().items() if v}
 
-    def recovered(self):
-        """A killed reservation leaves protected records: recovery blockers until a takeover
-        ends them. Stands in for that recovery between two runs."""
-        for fn in os.listdir(self.locks):
-            (self.locks / fn).write_text('')
-
     def flock_free(self, lock):
         with open(self.locks / f'{lock}.lock', 'r+') as f:
             try:
@@ -268,13 +262,18 @@ class Fixture(unittest.TestCase):
             time.sleep(0.05)
         self.fail(f'timed out waiting for {what}')
 
-    def assert_cleanup_holder(self, child, token):
+    def assert_ended_blocked(self, child, token):
+        """The run ended with exit 1, every lock released and its blocker logged on every board."""
+        self.assertEqual(child.wait(), 1)
         recs = self.records()
         self.assertEqual(set(recs), {'mimxrt1064_evk', 'raspberry_pi_pico2', 'stm32f303disco', 'stm32h743eval'})
-        for rec in recs.values():
-            self.assertEqual((rec['role'], rec['token'], rec['pid']), ('cleanup-holder', token, child.pid))
-            self.assertEqual(sorted(rec['locks']), sorted(recs))
-        self.assertIsNone(child.poll())
+        self.assertEqual(self.held(), set())
+        for lock in recs:
+            self.assertTrue(self.flock_free(lock), lock)
+            f = latest_failure(hr.hil_lock, lock)
+            self.assertEqual((f['how'], f['tool'], f['token'], f['pid'], f['task']['token']),
+                             ('ended-failed', 'hil_reserve', token, child.pid, token))
+            self.assertEqual(sorted(f['task']['locks']), sorted(recs))
 
 
 class Rosters(Fixture):
@@ -551,15 +550,6 @@ class Run(Fixture):
         self.assertEqual(self.held(), set())
         self.assertTrue(all(self.flock_free(l) for l in self.records()))
 
-    def test_unreadable_holder_fields_refuse_before_any_lock(self):
-        def patch(m):
-            m.hil_lock.proc_start = lambda pid: None
-        p = self.run_run(patch=patch)
-        out = p.output()
-        self.assertEqual((p.returncode, 'refused: holder record fields: ' in out), (1, True), out)
-        self.assertFalse(self.argv_out.exists())
-        self.assertEqual(self.records(), {})
-
     def test_a_root_cycle_refusal_before_its_mutation_releases_when_the_subtree_is_unchanged(self):
         p = self.run_run(action='refuse')
         out = p.output()
@@ -589,34 +579,25 @@ class Run(Fixture):
         self.assertFalse(self.argv_out.exists())
         self.assertEqual(self.held(), set())
 
-    def test_a_failed_command_keeps_the_locks_as_a_cleanup_holder_until_a_token_release(self):
+    def test_a_failed_command_is_a_blocker_logged_on_every_board_and_released(self):
         p = self.run_run(action='fail')
         line = p.blocker()
         self.assertIn('command exited 7', line)
-        token = token_of(line)
-        self.assert_cleanup_holder(p, token)
-        p.send_signal(signal.SIGTERM)                   # ignored in the cleanup state
-        time.sleep(0.3)
-        self.assertIsNone(p.poll())
-        rc, out = main('release', '--token', 'nope')
-        self.assertEqual((rc, 'no holder record carries token nope' in out), (1, True), out)
-        rc, out = main('release', '--token', token)
-        self.assertEqual(rc, 0, out)
-        self.assertIn(f'released 4 lock(s) of holder {p.pid}', out)
-        self.assertEqual(p.wait(), 1)
-        self.assertEqual(self.held(), set())
+        self.assertIn("released 4 lock(s), the blocker logged in each board's cleanup log", line)
+        self.assert_ended_blocked(p, token_of(line))
+        self.assertIn('command exited 7', latest_failure(hr.hil_lock, 'raspberry_pi_pico2')['detail'])
+        q = self.run_run()                              # the next task takes every board and reports the failure
+        out = q.output()
+        self.assertEqual(q.returncode, 0, out)
+        for lock in ('mimxrt1064_evk', 'raspberry_pi_pico2', 'stm32f303disco', 'stm32h743eval'):
+            self.assertIn(f"hil_reserve: {lock}: an earlier task's cleanup failed: ", out)
+        self.assertIn('command exited 7', out.split('hil_reserve: holding')[0])
+        self.assertIn('command exited 7', latest_failure(hr.hil_lock, 'raspberry_pi_pico2')['detail'])
 
-    def test_a_hangup_does_not_end_a_cleanup_hold(self):
-        p = self.run_run(action='fail')
-        token = token_of(p.blocker())
-        p.send_signal(signal.SIGHUP)                    # the terminal or SSH session that launched it went away
-        time.sleep(0.3)
-        self.assert_cleanup_holder(p, token)
-        self.assertFalse(self.flock_free('raspberry_pi_pico2'))
-        rc, out = main('release', '--token', token)
-        self.assertEqual(rc, 0, out)
-        self.assertEqual(p.wait(), 1)
-        self.assertEqual(self.held(), set())
+    def test_release_is_gone(self):
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as cm:
+            hr.main(['release', '--token', 't'])
+        self.assertEqual(cm.exception.code, 2)
 
     def test_a_hangup_during_the_command_is_ignored_and_before_it_releases(self):
         p = self.run_run(action='hang')
@@ -629,12 +610,8 @@ class Run(Fixture):
         line = p.blocker()
         self.assertIn('SIGHUP ignored during command', line)
         self.assertIn('SIGTERM forwarded', line)
-        p.kill()                                        # frees the flocks, leaves recovery blockers
+        self.assertEqual(p.wait(), 1)
         self.argv_out.unlink()
-        refused = self.run_run()
-        self.assertIn('recovery blocker', refused.output())
-        self.assertNotEqual(refused.returncode, 0)
-        self.recovered()
 
         def before(m):
             real, calls = m.check, []
@@ -663,20 +640,18 @@ class Run(Fixture):
         self.assertEqual(self.held(), set())
         self.assertTrue(all(self.flock_free(l) for l in self.records()))
 
-    def test_a_cleanup_record_that_cannot_be_written_still_holds(self):
+    def test_a_blocker_whose_log_cannot_be_written_still_releases(self):
         def patch(m):
-            real = m.Reservation.record
-
-            def record(self, role=None, detail=''):
-                if role:
-                    raise OSError('no space')
-                real(self, role, detail)
-            m.Reservation.record = record
+            def no_space(board, event):
+                raise OSError(28, 'No space left on device')
+            m.hil_lock._log_append = no_space
         p = self.run_run(action='fail', patch=patch)
         line = p.blocker()
-        self.assertIn('cleanup record could not be written: no space', line)
-        self.assertIsNone(p.poll())
-        self.assertFalse(self.flock_free('raspberry_pi_pico2'))
+        self.assertIn('not logged: mimxrt1064_evk: cleanup log not written', line)
+        self.assertIn('No space left on device', line)
+        self.assertEqual(p.wait(), 1)
+        self.assertEqual(self.held(), set())
+        self.assertTrue(self.flock_free('raspberry_pi_pico2'))
 
     def test_a_missing_sibling_after_a_successful_command_is_a_blocker_once_the_budget_is_spent(self):
         p = self.run_run(action='drop-sibling')
@@ -684,7 +659,7 @@ class Run(Fixture):
         self.assertIn('3-1.3 (serial 000725299165) not back: absent', line)
         self.assertIn('not restored within 2 s', line)
         self.assertNotIn('command exited', line)
-        self.assert_cleanup_holder(p, token_of(line))
+        self.assert_ended_blocked(p, token_of(line))
 
     def test_a_sibling_that_returns_within_the_budget_releases(self):
         p = self.run_run(action='drop-sibling')
@@ -718,7 +693,7 @@ class Run(Fixture):
         line = p.blocker()
         self.assertIn('coverage check over budget', line)
         self.assertIn('not restored within 1 s', line)
-        self.assert_cleanup_holder(p, token_of(line))
+        self.assert_ended_blocked(p, token_of(line))
 
     def test_a_wedged_target_is_admitted_by_its_udev_record_and_restored_only_by_sysfs(self):
         (self.sys / '3-1.1' / 'serial').unlink()             # the wedged read gives nothing
@@ -729,8 +704,7 @@ class Run(Fixture):
         line = p.blocker()
         self.assertEqual(self.argv_out.read_text().split(), ['root-cycle', '3-1.1', 'E6633861A3978538'])
         self.assertIn('3-1.1 (serial E6633861A3978538 (udev)) not back: serial unreadable', line)
-        p.kill()
-        self.recovered()
+        self.assertEqual(p.wait(), 1)
         q = self.run_run(action='cure')                      # re-enumerated: sysfs answers again
         out = q.output()
         self.assertEqual(q.returncode, 0, out)
@@ -769,13 +743,12 @@ class Run(Fixture):
     def test_an_unreadable_class_or_a_new_node_after_the_command_is_a_blocker(self):
         p = self.run_run(action='unreadable-class')
         self.assertIn('3-1: class unreadable', p.blocker())
-        p.kill()
-        self.recovered()
+        self.assertEqual(p.wait(), 1)
         self.dev('3-1', cls='09')
         q = self.run_run(action='new-node', busport='3-1.2')
         self.assertIn('3-1.9: new node (serial new)', q.blocker())
 
-    def test_a_survivor_keeps_the_locks_even_after_it_is_gone(self):
+    def test_a_survivor_is_named_and_never_keeps_the_locks(self):
         for action in ('survivor', 'survivor-same-group'):
             with self.subTest(action=action):
                 p = self.run_run(action=action)
@@ -783,26 +756,24 @@ class Run(Fixture):
                 orphan = int(Path(str(self.argv_out) + '.pid').read_text())
                 self.addCleanup(lambda o=orphan: os.kill(o, signal.SIGKILL) if hr.hil_lock.proc_start(o) else None)
                 self.assertIn(f'surviving pids [{orphan}]', line)
-                os.kill(orphan, signal.SIGKILL)
-                time.sleep(0.3)
-                self.assertIsNone(p.poll())      # still a cleanup holder: the survivor leaving frees nothing
-                self.assertEqual(self.records()['raspberry_pi_pico2']['role'], 'cleanup-holder')
-                p.kill()
-                self.recovered()
+                self.assert_ended_blocked(p, token_of(line))
+                self.assertIsNotNone(hr.hil_lock.proc_start(orphan), 'released while the survivor still runs')
+                self.assertIn(f'surviving pids [{orphan}]',
+                              latest_failure(hr.hil_lock, 'raspberry_pi_pico2')['detail'])
 
-    def test_a_survivor_stays_a_child_of_the_cleanup_holder_until_the_token_release(self):
+    def test_a_survivors_logged_failure_stays_open_after_a_later_restore(self):
         p = self.run_run(action='survivor')
-        token = p.token()
+        line = p.blocker()
         orphan = int(Path(str(self.argv_out) + '.pid').read_text())
         self.addCleanup(lambda: os.kill(orphan, signal.SIGKILL) if hr.hil_lock.proc_start(orphan) else None)
-        ppid = Path(f'/proc/{orphan}/stat').read_text().rpartition(')')[2].split()[1]
-        self.assertEqual(int(ppid), p.pid)       # the holder is this process, still the subreaper
-        self.assert_cleanup_holder(p, token)
-        self.assertNotIn('receipts', self.records()['raspberry_pi_pico2'])     # no release predicate
-        rc, out = main('release', '--token', token)
-        self.assertEqual(rc, 0, out)
-        self.assertEqual(p.wait(), 1)
-        self.assertEqual(self.held(), set())
+        self.assertEqual(p.wait(), 1, line)
+        for lock in self.records():
+            f = latest_failure(hr.hil_lock, lock)
+            [marker] = f['receipts']
+            self.assertEqual((marker['unrecheckable'][-3:], marker['survivors']), (['root-cycle', '3-1.1', 'E6633861A3978538'], [orphan]))
+            self.assertRegex(hr.hil_lock.resolve_restored(lock, [f], evidence='a later restore')[0],
+                             f'{f["id"]} stays open')
+            self.assertEqual(latest_failure(hr.hil_lock, lock)['id'], f['id'], lock)
 
     def test_sigterm_during_the_command_is_forwarded_and_ends_as_a_blocker(self):
         p = self.run_run(action='hang')
@@ -841,10 +812,9 @@ class Run(Fixture):
                         self.assertIn('SIGHUP ignored during command', line)
                     self.assertIn('SIGTERM forwarded', line)
                     self.assertIn('command exited -15', line)
-                    self.assertEqual(self.records()['raspberry_pi_pico2']['role'], 'cleanup-holder')
-                    p.kill()
+                    self.assertEqual(p.wait(), 1)
+                    self.assertEqual(self.held(), set())
                     self.argv_out.unlink(missing_ok=True)      # a SIGTERM may end the stub before it writes
-                    self.recovered()
 
     def test_the_command_starts_unblocked_with_default_dispositions_and_the_mask_is_restored(self):
         mask_after = Path(self.td.name) / 'mask-after'
@@ -868,7 +838,6 @@ class Run(Fixture):
         ignored = int(status['SigIgn'], 16)
         for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGPIPE, signal.SIGXFSZ):
             self.assertFalse(ignored & bit(s), s.name)
-        self.assertTrue(ignored & bit(signal.SIGUSR1))      # inherited, as Popen left it
 
     def test_a_forwarded_sigterm_reaches_the_commands_trap_and_a_hangup_does_not(self):
         p = self.run_run(action='trap')
@@ -884,7 +853,7 @@ class Run(Fixture):
         self.assertIn('SIGHUP ignored during command', out)
         self.assertIn('SIGTERM forwarded', out)
         self.assertIn('command exited 7', out)
-        self.assert_cleanup_holder(p, token_of(out.splitlines()[-1]))
+        self.assert_ended_blocked(p, token_of(out.splitlines()[-1]))
 
     def test_a_lost_progress_reader_does_not_abandon_the_command(self):
         marker = Path(self.td.name) / 'progress-attempted'
@@ -942,82 +911,12 @@ class Run(Fixture):
 
             def survivors(pgid):
                 os.kill(os.getpid(), signal.SIGTERM)       # during reconciliation
-                os.kill(os.getpid(), signal.SIGUSR1)       # not yet a cleanup holder: ignored
                 return real(pgid)
             m.survivors = survivors
         q = self.run_run(action='fail', patch=after)
         line = q.blocker()
         self.assertIn('SIGTERM ignored during post', line)
-        self.assertIsNone(q.poll())
-
-    def test_release_refuses_the_wrong_holder_a_live_mutation_and_a_reused_pid(self):
-        first = self.run_run(action='fail')
-        tok1 = first.token()
-        other = Path(self.td.name) / 'other.json'
-        other.write_text(json.dumps({'boards': [{'name': 'other-board', 'uid': 'unrelated-keyboard',
-                                                 'flasher': {'name': 'jlink', 'uid': 'other-probe'}}]}))
-        second = self.fork_main('run', 'root-cycle', '3-2', '--roster', str(other), '--reason', 't', action='fail')
-        tok2 = second.token()
-        self.assertNotEqual(tok1, tok2)
-        rc, out = main('release', '--token', tok1)        # two valid holders: only the first goes
-        self.assertEqual(rc, 0, out)
-        self.assertEqual(first.wait(), 1)
-        self.assertIsNone(second.poll())
-        self.assertEqual(self.held(), {'other-board'})
-        rec = self.records()['other-board']
-        rec.pop('role')                                    # a live mutation: a token but no cleanup role
-        (self.locks / 'other-board.lock').write_text(json.dumps(rec))
-        rc, out = main('release', '--token', tok2)
-        self.assertEqual((rc, 'not a cleanup holder' in out), (1, True), out)
-        rec['role'], rec['start'] = 'cleanup-holder', '1'  # a reused pid: the start time does not match
-        (self.locks / 'other-board.lock').write_text(json.dumps(rec))
-        rc, out = main('release', '--token', tok2)
-        self.assertEqual((rc, 'is not the recorded holder' in out), (1, True), out)
-        self.assertIsNone(second.poll())
-
-    def test_release_checks_every_record_not_just_the_first(self):
-        p = self.run_run(action='fail')
-        tok = p.token()
-        rec = self.records()['stm32h743eval']
-        rec['locks'] = ['stm32h743eval']                    # one record disagrees about the lock set
-        (self.locks / 'stm32h743eval.lock').write_text(json.dumps(rec))
-        rc, out = main('release', '--token', tok)
-        self.assertEqual((rc, 'the record on stm32h743eval disagrees' in out), (1, True), out)
-        self.assertIsNone(p.poll())
-
-    def test_release_refuses_a_holder_that_exits_after_validation_before_delivery(self):
-        p = self.run_run(action='fail')
-        tok = p.token()
-        real = signal.pidfd_send_signal
-
-        def send(fd, sig):
-            p.kill()                                        # gone after the identity check passed
-            return real(fd, sig)                            # the pidfd names the dead process, not a reused pid
-        hr.signal.pidfd_send_signal = send
-        self.addCleanup(setattr, hr.signal, 'pidfd_send_signal', real)
-        rc, out = main('release', '--token', tok)
-        self.assertEqual((rc, f'delivery failed: holder pid {p.pid}' in out), (1, True), out)
-
-    def test_release_refuses_without_pidfd_support(self):
-        p = self.run_run(action='fail')
-        tok = p.token()
-        for mod, name in ((hr.os, 'pidfd_open'), (hr.signal, 'pidfd_send_signal')):
-            real = getattr(mod, name)
-            delattr(mod, name)
-            try:
-                rc, out = main('release', '--token', tok)
-            finally:
-                setattr(mod, name, real)
-            self.assertEqual((rc, 'pidfd) is unavailable' in out), (1, True), out)
-        self.assertIsNone(p.poll())
-
-    def test_release_refuses_a_holder_that_already_exited(self):
-        p = self.run_run(action='fail')
-        tok = p.token()
-        p.kill()
-        rc, out = main('release', '--token', tok)      # the kernel dropped the flocks; the records are stale
-        self.assertEqual((rc, f'holder pid {p.pid} of token {tok} is gone' in out), (1, True), out)
-        self.assertIn('recovery takeover', out)
+        self.assertEqual(q.wait(), 1)
 
 
 class HubScope(Fixture):
@@ -1065,14 +964,16 @@ class HubScope(Fixture):
         self.assertEqual((p.returncode, 'refused before writing anything' in out), (1, True), out)
         self.assertEqual(self.held(), set())
         p = self.run_hub(action='refuse-drop')
-        self.assertIn('command exited 3', p.blocker())
-        self.assertEqual(len(self.held()), 4)
+        line = p.blocker()
+        self.assertIn('command exited 3', line)
+        self.assert_ended_blocked(p, token_of(line))
 
 
 class RootCycleScript(Fixture):
     """The real usb_recover.sh root-cycle under `run`, its root_port_cycle.py stubbed through the
     script's non-root seams: a refusal before the power-off (exit 3) releases, while a surviving
-    run, or a hung one ended at the bound, keeps every reservation, even with power restored."""
+    run, or a hung one ended at the bound, is a blocker logged on every board, even with power
+    restored."""
 
     def setUp(self):
         super().setUp()
@@ -1101,7 +1002,7 @@ class RootCycleScript(Fixture):
         self.assertEqual(self.runs(), ['check'])
         self.assertEqual(self.held(), set())
 
-    def test_a_surviving_off_keeps_every_reservation(self):
+    def test_a_surviving_off_is_a_blocker_on_every_board(self):
         p = self.run_run(action='off=survive')
         line = p.blocker()
         orphan = int(Path(str(self.argv_out) + '.pid').read_text())
@@ -1109,9 +1010,9 @@ class RootCycleScript(Fixture):
         self.assertIn('command exited 1', line)
         self.assertIn(f'surviving pids [{orphan}]', line)
         self.assertEqual(self.runs(), ['check', 'off'])          # no power-on after a survivor
-        self.assert_cleanup_holder(p, token_of(line))
+        self.assert_ended_blocked(p, token_of(line))
 
-    def test_a_sigterm_during_a_hung_off_powers_on_and_keeps_every_reservation(self):
+    def test_a_sigterm_during_a_hung_off_powers_on_and_is_a_blocker_on_every_board(self):
         # the forwarded SIGTERM ends the off request and fires the script's trap, well before the bound
         p = self.run_run(action='off=hang')
         self.wait_for(lambda: 'off' in self.runs(), 'the power-off run')
@@ -1122,7 +1023,7 @@ class RootCycleScript(Fixture):
         self.assertIn('SIGTERM forwarded', line)
         self.assertIn('command exited 1', line)
         self.assertEqual(self.runs(), ['check', 'off', 'on'])
-        self.assert_cleanup_holder(p, token_of(line))
+        self.assert_ended_blocked(p, token_of(line))
 
 
 class RecoverScriptChoice(unittest.TestCase):

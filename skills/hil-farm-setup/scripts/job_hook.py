@@ -4,16 +4,19 @@
   job_hook.py start UNIT      before each job (ACTIONS_RUNNER_HOOK_JOB_STARTED), as that runner's user
   job_hook.py complete UNIT   after it (ACTIONS_RUNNER_HOOK_JOB_COMPLETED), an always() post step
 
-`start` refuses the job (exit 1) while the marker names a job that never reached `complete`
-(a killed worker, a host crash), or while the runner unit's cgroup subtree holds any process
+`start` refuses the job (exit 1) while the runner unit's cgroup subtree holds any process
 besides this hook and its ancestors: what is left from an earlier job, root helpers
-included. It decides only at the next start, after the runner's orphan cleanup, which runs
-after every post step (runner v2.338.0 JobExtension.FinalizeJob). `complete` only marks its
-own job reached. Any doubt (an unreadable cgroup, no job id) refuses.
+included. A marker naming a job that never reached `complete` (a killed worker, a host
+crash) is only a warning once that scan is clean: its board locks ended with its processes,
+and the next task on each board logs what it left as a failed cleanup (agentrc#464). It decides only at
+the next start, after the runner's orphan cleanup, which runs after every post step (runner
+v2.338.0 JobExtension.FinalizeJob). `complete` only marks its own job reached. Any doubt (an
+unreadable or unsettled cgroup, no job id) refuses.
 
 The marker is the runner user's own file, so each runner has its own: a guard against accidents in
 trusted jobs, not a boundary.
-An operator clears a hold by checking the named processes and the boards, then removing it.
+An operator clears a hold on left processes by checking them and the boards, then ending them, and
+any other hold by resolving the reason it names.
 """
 import os
 import sys
@@ -26,7 +29,12 @@ DONE = ' done'
 
 
 class Hold(Exception):
-    pass
+    advice = 'An operator resolves that reason; the next job starts once it is gone.'
+
+
+class Survivors(Hold):
+    advice = ('An operator checks the named processes and the boards, then ends those processes; the next job '
+              'starts once none is left.')
 
 
 def _raise(e):
@@ -115,12 +123,14 @@ def held():
 
 def start(unit):
     prev = held()
-    if prev is not None and not prev.endswith(DONE):
-        raise Hold(f'job {prev} never reached its completed hook')
     left = survivors(unit)
     if left:
-        raise Hold(f'processes left from an earlier job: {describe(left)}')
-    MARKER.write_text(job_id() + '\n')
+        raise Survivors(f'processes left from an earlier job: {describe(left)}')
+    me = job_id()
+    if prev is not None and not prev.endswith(DONE):
+        print(f'HIL farm: job {prev} never reached its completed hook; nothing of it runs, so this job proceeds '
+              "(the next task on each of its boards logs what it left: hil_lock.py status)", file=sys.stderr)
+    MARKER.write_text(me + '\n')
 
 
 def complete(_unit):        # the unit only keeps main's dispatch uniform
@@ -136,8 +146,7 @@ def main(argv):
     try:
         (start if argv[0] == 'start' else complete)(argv[1])
     except (Hold, OSError) as e:
-        print(f'HIL farm held: {e}. An operator checks for leftover processes and the boards, then removes {MARKER}.',
-              file=sys.stderr)
+        print(f'HIL farm held: {e}. {getattr(e, "advice", Hold.advice)}', file=sys.stderr)
         return 1
     return 0
 

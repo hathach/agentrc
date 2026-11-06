@@ -194,12 +194,14 @@ Arduino TinyUSB's and the nRF52 bootloader's `RUNNER_STATE` is their workflow's
 
 ## Jobs, holds and locks
 
-A job that may have left processes behind holds its runner (`job_hook.py`, one hook pair per runner): the next job's
-start hook refuses while the previous job never reached its completed hook (a killed worker, a host crash) or while
-that runner unit's cgroup still holds anything besides the runner itself, root helpers included. A cancelled or
-timed-out job that leaves nothing running releases on its own; that says no job process survived, not that its boards
-were restored. To clear a hold, check the processes the failed job names and the boards, then remove that runner
-user's `~/.hil-job-active`.
+A job that left processes behind holds its runner (`job_hook.py`, one hook pair per runner): the next job's start
+hook refuses while that runner unit's cgroup still holds anything besides the runner itself, root helpers included,
+or cannot be read. A previous job that never reached its completed hook (a killed worker, a host crash, marked in that
+runner user's `~/.hil-job-active`) is only a warning once nothing of it runs: its board locks ended with its
+processes, and the next task on each board logs what it left in the board's cleanup log (`hil_lock.py status`). That
+says no job process survived, not that its boards were restored. To clear a hold on left processes, check the
+processes the failed job names and the boards, then end those processes; any other hold clears once the reason it
+names is resolved.
 
 Board locks live in `/tmp/tinyusb-hil-locks`, root-owned and sticky (1777) so the admin and `ghrunner` share them.
 They are cooperative: `ghrunner` owns the lock files it creates and can unlink one under a holder, and it opens the

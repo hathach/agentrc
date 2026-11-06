@@ -56,52 +56,52 @@ nothing in it through a link.
 - Never pre-hold a board for a tool that locks itself: it refuses your hold as a
   conflict.
 - Report a refused hold with its holder and reason; wait only within the task's
-  lock-wait budget. A recovery blocker never frees on its own and is never
-  waited on, for every project: a cleanup holder (`role: cleanup-holder`), live
-  or dead; a record marked `protected: true` left on a free flock, its run
-  having died before its cleanup; or a takeover journal (`<lock>.takeover`).
-  The contract's Recovery ends it, under a recovery dispatch naming the board:
-  `hil_lock.py hold --take-over <lock>` holds the blocker's whole lock set as a
-  cleanup holder, journalling each record it replaces, and once the recovery
-  succeeded `hil_lock.py release --token <token>` ends that live holder. A
-  dead holder is never released by token; it is taken over. A takeover that
-  finds a journal owned by another OS user in a sticky lock dir refuses up
-  front, changing nothing, and names that uid: run it and its `release --token`
-  as that user or root.
-- A taker whose interrupted run needs recovery takes with `protected=True` and
-  ends with `release_board_lock`, or hands its held locks to a cleanup holder
-  with `hand_to_cleanup_holder`. A protected take declares the run's whole
-  group, `locks=` every board it takes (default the board alone), on the
-  board's first record, before any hardware access, so a takeover from any
-  member takes the group; a taker failing partway ends what it took, and a
-  record it could not clear stays a blocker naming the group. The hand-over
-  refuses, changing nothing, unless the handed boards are exactly that group,
-  and loads `scripts/hil_process.py` (in the lock helper's `FILES`, below). A
-  record that declares no group (an older helper's, or one cut short) is
-  taken over with every board whose record names it. Given the receipts of runs
-  not proven ended, the handed-over holder clears only once each rechecks `done`, and
-  `release --token` refuses up front naming the open receipt, rechecked as the
-  holder's OS user when root releases it. A cleanup holder of its own waits in
-  `wait_for_release` and then ends its hold itself. `takeover_predecessor`
-  reads the record a takeover replaced. `release` never signals a protected record,
-  a cleanup holder or a runner reason (`hil_test.py`, `farm_check`), and
-  signals only `hil_lock.py hold`'s own holder, proven by its start time and
-  its flock. A record from a helper older than the mark
-  carries none and is
-  taken like any other: protection across projects holds once every project
-  on the host runs this helper.
-- A session a consumer cannot prove ended outlives its run in the board's
-  pending-session record, `hil_lock.PendingSessions(<lock>, <kind>)`
-  (`<lock>.<kind>-pending.json` in the lock dir), so every later invocation,
-  whatever its run dir or project, refuses while it lists one or cannot be
-  read; an unreadable record is kept. `add` lists sessions, each a dict with a
-  `receipt`; `clear(ended)` removes the record only once the consumer's
-  `ended` holds for every session, otherwise refusing with their receipts;
-  `clear(ended, note=..., **evidence)`, only after a separately reviewed
-  recovery, removes it whatever it holds, once note, evidence and content are
-  logged (`cleared()`). It needs no board lock; another OS user can read it
-  but not replace or remove it. What a receipt means and how its session is
-  recovered stay the consumer's; the class docstring has the mechanics.
+  lock-wait budget. A lock ends with the task that took it, whatever its
+  outcome: no hold outlives its task for recovery, and no manual unlock step
+  follows a failed cleanup. A detached manual hold (`hil_lock.py hold`, a
+  project's manual session) is the exception: it lasts until its holder
+  releases it, and a failed cleanup under it is logged all the same. The
+  flock is the only refusal. A free flock is
+  always taken; what a task that ended without its cleanup left there (a
+  record marked `cleanupOwed`, an unreadable record, an older helper's
+  takeover journal) is first appended to the board's cleanup log as a failed
+  cleanup, never a refusal. An older helper's cleanup holder
+  (`role: cleanup-holder`) still holds its flock and never frees on its own:
+  a taker refuses it as a recovery blocker and never waits on it, and the
+  contract's Recovery ends it with that project's `hil_lock.py release
+  --token <token>`. `hil_lock.py hold --take-over` is gone.
+- The cleanup log, `<lock>.cleanup.jsonl` in the lock dir (0666, never
+  removed), keeps one JSON line per event: `failed` (its `id`; `how`,
+  `ended-failed` or `found-left`; the task's record, `detail`, the `receipts`
+  of children not proven ended and the provider sessions it `retained`) and
+  `restored`, naming the failure a later task restored the board after. A
+  failure stays open until a `restored` event names it, whatever failed after
+  it (`open_cleanup_failures`). `hil_lock.py status` shows the latest open one
+  and how many earlier ones are; a taker's handle carries them
+  (`cleanup_failures`) for its report before any hardware access, and its run
+  reports them beside its result (`failure_report`, `failure_text`).
+- A taker that restores the board takes with `protected=True`, which marks its
+  record `cleanupOwed` and declares its whole group, `locks=` every board it
+  takes (default the board alone), on the board's first record. It ends with
+  `release_board_lock` after a proven cleanup, otherwise with
+  `end_failed(handles, reason, detail=..., receipts=..., retained=...)`, which
+  logs the failure on every board of the group, clears each record and drops
+  each flock whatever fails and returns the errors per board; an interrupt is
+  re-raised once every handle is released. A
+  session command run under a hold it did not take logs with
+  `log_cleanup_failure`. Only a task that restored the board marks failures
+  restored, through `resolve_restored`: each one whose receipts recheck ended
+  and whose retained sessions read ended, the others kept open.
+  `release` never signals a protected record or a runner reason
+  (`hil_test.py`, `farm_check`), and signals only `hil_lock.py hold`'s own
+  holder, proven by its start time and its flock. A record from a helper older
+  than the mark carries none and is taken like any other: the farm-wide rule
+  holds once every project on the host pins a helper with it.
+- `hil_lock.PendingSessions(<lock>, <kind>)` (`<lock>.<kind>-pending.json` in
+  the lock dir) is the pending-session record of a consumer that still keeps
+  one; its class docstring has the mechanics. agentrc's Arduino engine
+  rechecks the sessions an older engine left there, reports those not proven
+  ended and clears the record once every one is, never refusing on it.
 - A rig-wide operation, one that can reset or renumber a board you do not
   hold (a hub's power, a root-port cycle, a controller rebind), holds every
   board on the host first, across every project's roster there; a contract's
@@ -112,9 +112,10 @@ nothing in it through a link.
   port, or under the hub for a hub-port cycle, is not explained by those
   rosters, holds every board of every roster in one process around the one
   command it builds (`usb-kernel-recover`'s `root-cycle` or `hub-cycle`),
-  and keeps the locks as a cleanup holder until the contract's
-  recovery procedure releases them by token when anything but a clean,
-  fully re-enumerated outcome follows. A controller operation has no
+  and, when anything but a clean, fully re-enumerated outcome follows,
+  releases them with the blocker logged in each board's cleanup log
+  (`end_failed`; a surviving process as an `unrecheckable` receipt, so that
+  failure stays open) and exits 1. A controller operation has no
   inspected reservation yet; a contract refuses it. A runner that
   cycles one hub port under the board's own lock is a limitation of this rule,
   not an exemption, recorded in the contract's Limits with what else the cycle
@@ -154,22 +155,24 @@ older, or the reverse.
 
 The check takes each free board's lock itself (`farm_check`, protected). A held
 board is reported `locked`, its probe still shown, and skipped: never waited on,
-released or bypassed. A recovery blocker is reported `blocked` and left to the
-contract's Recovery. Never kill a running check: one killed outright leaves its
-board blocked for a recovery takeover. An interrupt (SIGINT) ends it after the
-current board's cleanup.
+released or bypassed. An older helper's cleanup holder is reported `blocked`
+and left to the contract's Recovery. Never kill a running check: one killed
+outright leaves its board's cleanup unproven, which the next task on it logs as
+a failed cleanup. An interrupt (SIGINT) ends it after the current board's
+cleanup. A row notes an earlier task's open failed cleanup on its board.
 
 - Statuses: `ok` (the probe reset the board), `failed` (no probe, an ambiguous
   one, or a failed reset), `unsupported` (the probe has no reset-only mode),
   `locked`, `blocked`. `ok` says the probe reached and reset the board now, not
   that its firmware, USB or anything else works.
-- A `blocked` row's cleanup names its blocker: a cleanup holder's `token`, which
-  Recovery releases with `hil_lock.py release --token` (refused until every
-  process the check ran through `ctx.run` is proven ended, and every session in
-  its cleanup's `retained`, one the profile's provider left running, an
-  openocd_esp server, has its receipt closed as ended), or a protected record,
-  which needs a recovery takeover that does not check `retained`. Recovery ends
-  each retained session first (`hil_openocd_esp.py end --receipt`, exit 0).
+- A `blocked` row is a cleanup the check could not prove, a process it ran
+  through `ctx.run` not proven ended or a session in its cleanup's `retained`
+  (one the profile's provider left running, an openocd_esp server) not closed
+  as ended, or an older helper's cleanup holder. The check releases its own
+  board either way, the failure logged in the board's cleanup log with those
+  receipts and sessions, which the next task on it reports. Recovery, a
+  separate dispatch, ends each retained session (`hil_openocd_esp.py end
+  --receipt`, exit 0).
 - Exit 0 no failed row, 1 a failed row or an aborted check, 2 refused before any
   board, 4 any blocked row. `locked` and `unsupported` rows are unverified, not
   healthy: read the table, never `$?` alone.
@@ -179,8 +182,8 @@ current board's cleanup.
 
 Paste the table whole with its footer, never a digest like "27/27 healthy".
 Below it only what the table cannot show: held boards with their holders, and
-each blocked board with its token or record and that its recovery is a separate
-dispatch.
+each blocked board with what its cleanup log entry or older holder names and
+that its recovery is a separate dispatch.
 
 ## Board registry
 
@@ -299,14 +302,15 @@ recovery stay the contract's. Linux only.
   evidence, or a chip outside `SECURITY_CHIPS` (ESP32-P4, ESP32-S3), is
   refused.
   Flash, reset and `read_security` run only for a caller that passes
-  `retains_lock=True`, declaring it keeps the board lock through a session
-  left pending, and never under a CI job (`RUNNER_TRACKING_ID` or
+  `retains_lock=True`, declaring it holds the board lock through each
+  operation and logs a session it leaves pending, and never under a CI job (`RUNNER_TRACKING_ID` or
   `GITHUB_ACTIONS` set; `end` stays available); anything else is refused before any access, and a
   consumer calls `refusal(retains_lock=True)` before its own preparatory
   sessions. Each operation is one session, bounded by its `timeout`, that is
   never killed: it ends with `reset run` and a confirmed shutdown, or leaves
-  cleanup `pending` with the session's receipt for the caller's cleanup
-  holder, and no retry, restore or test may overlap it.
+  cleanup `pending` with the session's receipt, which the caller logs as
+  retained in the board's cleanup log, and no retry, restore or test of that
+  task may overlap it.
   `session_state(receipt)` is a session's state for lock retention, by pid
   and start time alone, from `hil_openocd_esp_receipt.py`, which loads alone
   for a lock keeper. The module and function docstrings have the
@@ -319,9 +323,10 @@ recovery stay the contract's. Linux only.
   needs a separately reviewed recovery), or the last command sent is not known
   to have run. Exit 0 closes the receipt with the results and keeps it, and a
   rerun on it exits 0 again; anything else (refusal, failure, timeout,
-  interrupt) exits 1 with the receipt open and the board held (2: bad usage or
-  an unreadable receipt). Releasing the board's cleanup holder (`hil_lock.py
-  release --token TOKEN`) after exit 0 stays the caller's step.
+  interrupt) exits 1 with the receipt open (2: bad usage or an unreadable
+  receipt). An older helper's cleanup holder waiting on the session is
+  released by that helper's `hil_lock.py release --token TOKEN` after exit 0,
+  the caller's step.
 - rc 0 means the tool reported success, not that the target runs the image;
   the project's own checks decide that. rc 124 from the default runner means
   it killed the tool's process group on the timeout and reaped it for a
@@ -375,12 +380,13 @@ recovery stay the contract's.
   identity `frozen()` takes once per process. Records bind `portable()`,
   the commit and closure digests, and admission refuses a record that binds
   none or another (`mismatch`); a stage copies the closure with `stage()`.
-- The farm check engine releases a board it reserved (`protected=True`) only
-  once every process it started there is proven ended: `run_tracked`'s
-  `done`, or a `recheck` of its receipt that answers `done`. Anything else
-  keeps a cleanup holder or the protected record for the contract's
-  Recovery. `run_tracked` only supplies the evidence; any other
-  caller enforces its own reservation policy.
+- The farm check engine releases a board it reserved (`protected=True`)
+  either way: cleanly once every process it started there is proven ended
+  (`run_tracked`'s `done`, or a `recheck` of its receipt that answers
+  `done`), otherwise through `end_failed`, the open receipts logged in its
+  cleanup log; a run that left no receipt is logged as an `unrecheckable`
+  one, which keeps its failure open. `run_tracked` only supplies the
+  evidence; any other caller enforces its own reservation policy.
 - `run_tracked`'s `state_dir` is the caller's: a directory of its uid that no
   other user can write, in a parent of its uid or root's that no other user
   can write unless sticky. Only those two are checked: the caller keeps every
@@ -414,8 +420,8 @@ blocker.
 Each requested board gets one:
 
 - **blocker**, which takes precedence: the board's state is unsafe or unknown,
-  or the run was inconclusive (held after a failed cleanup, wedged, aborted, no
-  report).
+  or the run was inconclusive (a failed cleanup, logged with the board
+  released; wedged, aborted, no report).
 - **pass**: the requested validation ran and passed, and any cleanup the
   contract requires succeeded.
 - **fail**: the validation ran and established a failure.

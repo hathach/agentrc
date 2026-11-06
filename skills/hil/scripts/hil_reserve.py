@@ -5,7 +5,6 @@ mutation, after a coverage check of the subtree the operation reaches.
 
   hil_reserve.py check <busport> [--scope root|hub] --roster FILE [SELECTOR] ...
   hil_reserve.py run root-cycle|hub-cycle <busport> --roster FILE [SELECTOR] ... --reason TEXT
-  hil_reserve.py release --token TOKEN
 
 A roster is a project's HIL roster JSON (`boards` and `boards-skip`; a parked board is still
 on the hub). An entry with `probe` locks as its registered board's name (hil_boards.lock_name);
@@ -39,24 +38,22 @@ udev record is admission evidence, never restoration evidence), nothing new, all
 covered. That restoration check repeats twice a second until it holds or one budget has
 passed since the command ended, every read bounded by that same deadline, since siblings
 re-enumerate one after another after the target. Only a restored subtree releases the
-locks, and only restoration gaps may clear by waiting: a non-zero exit, a survivor or a
-signal stays a blocker, except that an exit 3 (the script refused before its first
+locks cleanly, and only restoration gaps may clear by waiting: a non-zero exit, a survivor or
+a signal stays a blocker, except that an exit 3 (the script refused before its first
 mutation) with an unchanged subtree, no survivor and no noted signal releases and refuses.
-Any other outcome turns the records into `role: cleanup-holder` records and keeps this
-process alive holding the locks, as the shared rule requires; the blocker line prints the
-reservation token, and `release --token` (hil_lock.release_token, the same as
-`hil_lock.py release --token`) is the contract recovery procedure's release step once
-restoration is established. The records are marked protected, so a reservation killed
-outright leaves recovery blockers that only a recovery takeover (`hil_lock.py hold
---take-over`) clears. Exit 0 released, 1 blocker (run) or refused (release), 2 usage.
+Any other outcome is a blocker that ends with this run (agentrc#464): the BLOCKER line names
+the problems, hil_lock.end_failed logs them in every board's cleanup log, which the next task
+on each board reports, and every lock is released. A survivor is named, not waited for; it
+reparents to init once this process exits, and nothing can recheck it, so its logged failure
+stays open. A reservation killed outright leaves its records, which the next task on each
+board logs. Exit 0 released, 1 blocker or refused, 2 usage.
 
 Signals: SIGINT/SIGTERM/SIGHUP before the command release the untouched reservation and
 exit 130; during the command SIGINT/SIGTERM are forwarded to its process group, while SIGHUP
 (a lost terminal or SSH session, not a request to abort) is noted and ignored so the mutation
-completes; afterwards all three are noted and ignored, so a hangup never ends a cleanup hold.
-The command starts with no signal blocked, so its own traps see what is forwarded.
-A command that cannot be started at all releases the reservation and refuses. SIGUSR1 is
-ignored until the cleanup-holder state.
+completes; afterwards all three are noted and ignored, so the reconciliation completes and
+its outcome is logged. The command starts with no signal blocked, so its own traps see what
+is forwarded. A command that cannot be started at all releases the reservation and refuses.
 """
 import argparse
 import ctypes
@@ -325,18 +322,14 @@ class Reservation:
     def __init__(self, locks, reason):
         self.locks, self.reason = locks, reason
         self.token = secrets.token_hex(8)
-        try:
-            self._own = {'tool': 'hil_reserve', **hil_lock.holder_fields(self.token, locks)}
-        except (OSError, ValueError) as e:
-            raise Refused(f'holder record fields: {e}')
+        self._own = {'tool': 'hil_reserve', 'token': self.token, 'locks': list(locks)}
         self.handles = []
-        self.phase = 'pre'          # pre -> spawn -> command -> post -> cleanup
+        self.phase = 'pre'          # pre -> spawn -> command -> post
         self.pgid = None
         self.noted = []
         self.deferred = []
 
     def install_signals(self):
-        signal.signal(signal.SIGUSR1, signal.SIG_IGN)     # meaningful only as a cleanup holder
         for s in HANDLED_SIGNALS:
             signal.signal(s, self._on_signal)
 
@@ -359,22 +352,11 @@ class Reservation:
             return
         self.noted.append(f'{name} ignored during {self.phase}')
 
-    def fields(self, role=None, detail=''):
-        """This reservation's own record fields, beyond the shared pid/reason/since."""
-        rec = dict(self._own)
-        if role:
-            rec.update(role=role, detail=detail)
-        return rec
-
-    def record(self, role=None, detail=''):
-        for fh in self.handles:
-            hil_lock.write_record(fh, self.reason, **self.fields(role, detail))
-
     def acquire(self):
         try:
             for lock in self.locks:
-                self.handles.append(hil_lock.take_board_lock(lock, self.reason, protected=True, **self.fields()))
-        except (hil_lock.BoardLocked, hil_lock.LockUnavailable) as e:
+                self.handles.append(hil_lock.take_board_lock(lock, self.reason, protected=True, **self._own))
+        except (hil_lock.BoardLocked, hil_lock.LockUnavailable, ValueError) as e:
             self.release()
             raise Refused(f'{lock}: {e}')
 
@@ -423,29 +405,23 @@ class Reservation:
         self.phase = 'post'
         return os.waitstatus_to_exitcode(status)    # a signal death stays negative, as Popen's
 
-    def hold_as_cleanup_holder(self, problems):
-        """Never returns: the records, protected since acquire, say cleanup-holder and only
-        release_token's SIGUSR1 ends the hold, in this process, which stays the subreaper of the
-        command's descendants.
-        A record or output failure is reported where possible and never abandons the hold."""
-        self.phase = 'cleanup'
+    def end_blocked(self, problems, receipts=()) -> int:
+        """A blocker: named on both streams, logged on every board (hil_lock.end_failed, with
+        `receipts`), and every lock released; returns the exit status, 1. A log or output failure
+        is reported where possible and never keeps a lock."""
         detail = '; '.join(problems)
-        wake = hil_lock.arm_release()
-        try:
-            self.record(role=hil_lock.CLEANUP_ROLE, detail=detail)
-        except OSError as e:
-            detail += f'; cleanup record could not be written: {e}'
+        errors = hil_lock.end_failed(dict(zip(self.locks, self.handles)), self.reason, detail=detail,
+                                     receipts=receipts, tool='hil_reserve', token=self.token)
+        self.handles = []
+        unlogged = '; '.join(f'{b}: {", ".join(e)}' for b, e in sorted(errors.items()))
         for stream in (sys.stdout, sys.stderr):
             try:
                 print(f'hil_reserve: BLOCKER token {self.token} pid {os.getpid()}: {detail}; restoration not '
-                      f'established, holding {len(self.locks)} lock(s) until '
-                      f'`hil_reserve.py release --token {self.token}`', file=stream, flush=True)
+                      f'established; released {len(self.locks)} lock(s), the blocker logged in each board\'s '
+                      f'cleanup log' + (f' (not logged: {unlogged})' if unlogged else ''), file=stream, flush=True)
             except (OSError, ValueError):
                 pass
-        hil_lock.wait_for_release(wake, self.handles)
-        self.release()
-        os._exit(1)
-
+        return 1
 
 def restoration_gaps(before, busport, rosters, deadline, scope='root'):
     """What keeps the subtree from counting as back: coverage from a fresh sysfs-only walk,
@@ -492,17 +468,24 @@ def cmd_run(args):
     except Refused:
         res.release()
         raise
+    for lock, fh in zip(res.locks, res.handles):
+        if failures := fh.cleanup_failures:
+            more = f' ({len(failures) - 1} earlier still open)' if len(failures) > 1 else ''
+            print(f'hil_reserve: {lock}: an earlier task\'s cleanup failed: {hil_lock.failure_text(failures[-1])}{more}',
+                  flush=True)
     target = again[args.busport]      # the latest look: a raw sysfs serial over the udev form the script would refuse
     argv = ['sudo', '-n', RECOVER_SCRIPT, args.verb, args.busport, target['serial'] or target['udev']]
     print('hil_reserve: holding ' + ' '.join(res.locks) + '\nhil_reserve: ' + ' '.join(argv), flush=True)
     rc = res.run(argv)
     deadline = time.monotonic() + args.budget      # one deadline for everything that follows the command
-    problems = []
+    problems, unproven = [], []
     if rc != 0:
         problems.append(f'command exited {rc}')
     left = survivors(res.pgid)
     if left:
         problems.append(f'surviving pids {left}')
+        # a survivor has no receipt to recheck: the marker keeps its logged failure open (resolve_restored)
+        unproven.append({'unrecheckable': argv, 'survivors': left})
     if rc == REFUSED_UNWRITTEN and not left:
         # the script refused before its first write: proven only if the subtree is unchanged
         try:
@@ -527,19 +510,10 @@ def cmd_run(args):
     problems += gaps_left
     problems = res.noted + problems       # noted last: a signal can land during the reconciliation
     if problems:
-        res.hold_as_cleanup_holder(problems)   # never returns
+        return res.end_blocked(problems, unproven)
     res.release()
     print(f'hil_reserve: released {len(res.locks)} lock(s); {len(nodes)} node(s) back under '
           f'{SCOPE_NAME[scope]} {top(args.busport, scope)}')
-    return 0
-
-
-def cmd_release(args):
-    try:
-        pid, boards = hil_lock.release_token(args.token)
-    except hil_lock.ReleaseRefused as e:
-        raise Refused(str(e))
-    print(f'hil_reserve: released {len(boards)} lock(s) of holder {pid} (token {args.token})')
     return 0
 
 
@@ -562,12 +536,8 @@ def main(argv=None):
     p_run.add_argument('busport')
     p_run.add_argument('--reason', required=True)
     add_roster_args(p_run)
-    p_rel = sub.add_parser('release')
-    p_rel.add_argument('--token', required=True)
     args = ap.parse_args(argv)
     try:
-        if args.cmd == 'release':
-            return cmd_release(args)
         if not uo.BUSPORT_RE.match(args.busport):
             ap.error(f'bad busport: {args.busport}')
         specs = []

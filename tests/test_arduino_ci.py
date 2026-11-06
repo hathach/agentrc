@@ -169,10 +169,10 @@ class Admit(Checkout):
         self.assertRefused('not this checkout')
 
 
-def row(verdict, locked=False, tests=None, holder=None):
+def row(verdict, locked=False, tests=None, cleanup_pass=True):
     return {'verdict': verdict, 'locked': locked, 'recoveryBlocker': False, 'detail': f'{verdict} detail',
             'tests': tests or [{'test': 'echo', 'pass': verdict == 'pass', 'detail': 'x'}],
-            'cleanup': {'pass': holder is None, 'state': 'restored', 'holder': holder},
+            'cleanup': {'pass': cleanup_pass, 'state': 'restored' if cleanup_pass else 'unknown', 'released': True},
             'firmware': {'fqbn': 'vend:arch:rig_ocd', 'platform': {'id': 'vend:arch', 'version': '1.0'}}}
 
 
@@ -213,6 +213,22 @@ class Loop(unittest.TestCase):
         self.assertEqual((res['verdict'], res['flaky'], calls), ('pass', True, ['run-1', 'run-2']))
         res, calls = self.run_board([row('fail'), row('fail')])
         self.assertEqual((res['verdict'], res['flaky'], len(calls)), ('fail', False, 2))
+
+    def test_an_earlier_failed_cleanup_is_kept_and_logged_on_a_passing_run(self):
+        failure = {'id': 'f1', 'at': 't', 'how': 'restore', 'reason': 'ci', 'pid': 3, 'detail': 'no echo'}
+        first = {**row('fail'), 'previousCleanupFailure': failure, 'openCleanupFailures': 2,
+                 'previousPending': 'children an older engine recorded pending: x'}
+        with mock.patch.object(C, 'log') as log:
+            res, _ = self.run_board([first, row('pass')])
+        self.assertEqual((res['verdict'], res['previousCleanupFailure'], res['openCleanupFailures'],
+                          res['previousPending']), ('pass', failure, 2, first['previousPending']))
+        self.assertEqual(res['attempts'][0]['previousCleanupFailure'], failure)
+        self.assertNotIn('previousCleanupFailure', res['attempts'][1])
+        lines = [c.args[0] for c in log.call_args_list]
+        self.assertTrue(any("earlier task's cleanup failed" in m and 'id f1' in m for m in lines), lines)
+        self.assertIn(f'{BOARD}: {first["previousPending"]}', lines)
+        res, _ = self.run_board([row('pass')])
+        self.assertFalse(any(k in res or k in res['attempts'][0] for k in C.EARLIER))
 
     def test_blocker_and_not_run_are_never_retried(self):
         for verdict in ('blocker', 'not-run'):
@@ -304,10 +320,10 @@ class Prune(unittest.TestCase):
 
     def test_removes_only_old_runs_that_finished_clean(self):
         clean = {'kind': C.SUMMARY_KIND, 'termination': 'completed',
-                 'boards': [{'verdict': 'pass', 'cleanup': {'holder': None}}, {'verdict': 'not-run', 'cleanup': None}]}
+                 'boards': [{'verdict': 'pass', 'cleanup': {'released': True}}, {'verdict': 'not-run', 'cleanup': None}]}
         self.run_dir('1-1', clean)
         self.run_dir('2-1', clean, age_days=1)
-        self.run_dir('3-1', {**clean, 'boards': [{'verdict': 'blocker', 'cleanup': {'holder': {'token': 't'}}}]})
+        self.run_dir('3-1', {**clean, 'boards': [{'verdict': 'blocker', 'cleanup': {'pass': False, 'released': True}}]})
         self.run_dir('4-1', None)
         self.run_dir('5-1', {**clean, 'termination': 'aborted'})
         self.run_dir('notarun', clean)
@@ -414,7 +430,7 @@ class Run(Checkout):
         self.assertIn('gone', s['boards'][0]['detail'])
 
     def test_a_blocker_exits_2(self):
-        rc, s = self.run_cmd({BOARD: [row('blocker', holder={'token': 't'})]})
+        rc, s = self.run_cmd({BOARD: [row('blocker', cleanup_pass=False)]})
         self.assertEqual(rc, 2)
 
     def test_refuses_an_out_dir_not_named_run_attempt_and_an_unknown_board(self):

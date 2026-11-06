@@ -53,16 +53,13 @@ class FakeLock:
         pass
 
     def __init__(self):
-        self.taken, self.released, self.handed, self.hand_fails = [], [], [], False
-        self.records, self.pending = {}, {}
+        self.taken, self.released, self.ended, self.logged, self.restored = [], [], [], [], []
+        self.records, self.pending, self.failures, self.end_errors = {}, {}, {}, {}
         lock = self
 
         class PendingSessions:
             def __init__(self, name, kind):
                 self.key = (name, kind)
-
-            def add(self, sessions):
-                lock.pending.setdefault(self.key, []).extend(sessions)
 
             def clear(self, ended):
                 left = [s for s in lock.pending.get(self.key, []) if not ended(s)]
@@ -73,16 +70,39 @@ class FakeLock:
 
     def take_board_lock(self, board, reason, protected=False, **extra):
         self.taken.append((board, reason, protected, extra))
-        return mock.Mock(name=f'fh-{board}')
+        fh = mock.Mock(name=f'fh-{board}')
+        fh.cleanup_failures = self.open_cleanup_failures(board)
+        return fh
 
     def release_board_lock(self, fh):
         self.released.append(fh)
 
-    def hand_to_cleanup_holder(self, handles, reason, detail, receipts=()):
-        if self.hand_fails:
-            raise self.LockUnavailable('no holder')
-        self.handed.append((list(handles), detail, receipts))
-        return 'tok123'
+    def end_failed(self, handles, reason, *, detail, receipts=(), retained=(), **extra):
+        self.ended.append((list(handles), detail, list(receipts)))
+        return {b: e for b, e in self.end_errors.items() if b in handles}
+
+    def log_cleanup_failure(self, board, reason, *, detail, receipts=(), **extra):
+        self.logged.append((board, detail, list(receipts)))
+        return {'event': 'failed', 'id': 'f2'}
+
+    def open_cleanup_failures(self, board):
+        return [f for f in self.failures.get(board, []) if (board, f.get('id')) not in self.restored]
+
+    def resolve_restored(self, board, failures, **evidence):   # the real rule is hil_lock's, tested there
+        notes = []
+        for f in failures:
+            if f.get('stays'):
+                notes.append(f'{f["id"]} stays open')
+            elif 'id' in f:
+                self.restored.append((board, f['id']))
+        return notes
+
+    def failure_report(self, failures):
+        out = {'previousCleanupFailure': failures[-1]} if failures else {}
+        return {**out, 'openCleanupFailures': len(failures)} if len(failures) > 1 else out
+
+    def cleanup_restored(self, board, failure_id, **evidence):
+        self.restored.append((board, failure_id))
 
     def read_record(self, board):
         return self.records.get(board)
@@ -197,7 +217,7 @@ class Binding(Base):
     def test_budget_reserve_covers_the_restore(self):
         self.assertGreaterEqual(H.CLEANUP_RESERVE, H.FLASH_TIMEOUT + H.VERIFY_TIMEOUT + H.ENUM_TIMEOUT +
                                 H.TEST_TIMEOUT)
-        self.assertEqual(H.PENDING_KIND, 'arduino-hil')   # every library's: one board's leftovers block them all
+        self.assertEqual(H.PENDING_KIND, 'arduino-hil')   # every library's older record, reported by each
 
 
 class Roster(Base):
@@ -964,40 +984,60 @@ class Battery(Base):
         self.assertEqual((H.verdict(row), len(self.lock.released)), ('fail', 1))
         self.assertEqual(H.exit_code([row]), 1)
 
-    def test_surviving_child_hands_the_board_to_a_cleanup_holder(self):
+    def test_surviving_child_ends_the_lock_and_logs_its_receipt(self):
         def step(*a):
+            a[-1].pending.append({'receipt': {'pid': 7}})
             raise H.Unclean('openocd: cleanup pending')
         row = self.run_board(step=step)
         self.assertEqual(H.verdict(row), 'blocker')
-        self.assertEqual(row['cleanup']['state'], 'pending')
-        self.assertEqual(row['cleanup']['holder'], {'token': 'tok123'})
-        self.assertEqual(self.lock.handed[0][2], ('r1',))
-        self.assertEqual(self.lock.released, [])
+        self.assertEqual((row['cleanup']['state'], row['cleanup']['released']), ('pending', True))
+        self.assertEqual(self.lock.ended, [(['rig_jlink'], row['cleanup']['evidence'], [{'pid': 7}])])
+        self.assertEqual((self.lock.released, self.lock.pending), ([], {}))
+        self.assertNotIn('logError', row['cleanup'])
         self.assertEqual(H.exit_code([row]), 4)
 
-    def test_unrecheckable_child_is_recorded_pending_and_reported(self):
+    def test_unrecheckable_child_is_logged_and_the_next_run_proceeds(self):
         lost = {'receipt': {'unrecheckable': ['JLinkExe'], 'at': 1.0}}
 
         def step(*a):
             a[-1].pending.append(lost)
             raise H.Unclean('JLinkExe: cleanup unknown')
         row = self.run_board(step=step)
-        self.assertEqual(self.lock.pending[('rig_jlink', H.PENDING_KIND)], [lost])
-        self.assertEqual((row['cleanup']['pending'], row['cleanup']['markError']), ([lost], ''))
-        self.assertEqual((H.verdict(row), row['cleanup']['holder']), ('blocker', {'token': 'tok123'}))
-        row = self.run_board()   # a later run refuses until a reviewed clear
-        self.assertEqual((H.verdict(row), row['recoveryBlocker'], row['ran']), ('blocker', True, False))
-        self.A.process.recheck.assert_not_called()
+        self.assertEqual((row['cleanup']['pending'], H.verdict(row)), ([lost], 'blocker'))
+        self.assertEqual(self.lock.ended[0][2], [lost['receipt']])
+        self.lock.failures['rig_jlink'] = [{'id': 'f1', 'receipts': [lost['receipt']], 'stays': True}]
+        row = self.run_board()   # the next run is not refused: it reports the failure and runs
+        self.assertEqual((H.verdict(row), row['ran'], row['previousCleanupFailure']['id']), ('pass', True, 'f1'))
+        self.assertEqual((row['cleanup']['restoredNote'], self.lock.restored), ('f1 stays open', []))
 
-    def test_failed_restore_keeps_the_board(self):
+    def test_a_passing_restore_marks_the_earlier_failure_restored(self):
+        self.lock.failures['rig_jlink'] = [{'id': 'f1', 'receipts': [{'pid': 9}]}]
+        self.A.process.recheck.return_value = 'done'
+        row = self.run_board()
+        self.assertEqual((H.verdict(row), self.lock.restored), ('pass', [('rig_jlink', 'f1')]))
+        self.assertNotIn('restoredNote', row['cleanup'])
+
+    def test_a_passing_restore_hands_every_open_failure_to_hil_lock(self):
+        self.lock.failures['rig_jlink'] = [{'id': 'fA', 'stays': True}, {'id': 'fB'}]
+        row = self.run_board()
+        self.assertEqual((row['previousCleanupFailure']['id'], row['openCleanupFailures']), ('fB', 2))
+        self.assertEqual(self.lock.restored, [('rig_jlink', 'fB')])
+        self.assertEqual(row['cleanup']['restoredNote'], 'fA stays open')
+
+    def test_a_failed_restore_resolves_nothing(self):
+        self.lock.failures['rig_jlink'] = [{'id': 'f1'}]
+        self.run_board(restore=lambda *a: {'pass': False, 'state': 'unknown', 'evidence': 'no echo'})
+        self.assertEqual(self.lock.restored, [])
+
+    def test_failed_restore_releases_the_board_and_logs_it(self):
         row = self.run_board(restore=lambda *a: {'pass': False, 'state': 'unknown', 'evidence': 'no echo'})
-        self.assertEqual((H.verdict(row), row['cleanup']['holder']), ('blocker', {'token': 'tok123'}))
+        self.assertEqual((H.verdict(row), row['cleanup']['released']), ('blocker', True))
+        self.assertEqual(self.lock.ended, [(['rig_jlink'], 'no echo', [])])
 
-    def test_failed_hand_over_leaves_the_protected_record(self):
-        self.lock.hand_fails = True
+    def test_an_unlogged_failure_is_reported(self):
+        self.lock.end_errors = {'rig_jlink': ['log: disk full']}
         row = self.run_board(restore=lambda *a: {'pass': False, 'state': 'unknown', 'evidence': 'x'})
-        self.assertIsNone(row['cleanup']['holder']['token'])
-        self.assertIn('protected record left', row['cleanup']['holder']['error'])
+        self.assertEqual((row['cleanup']['logError'], row['cleanup']['released']), ('log: disk full', True))
         self.assertEqual(H.exit_code([row]), 4)
 
     def test_harness_error_is_a_blocker(self):
@@ -1013,20 +1053,23 @@ class Battery(Base):
         self.assertEqual((H.verdict(row), row['cleanup']['state'], len(self.lock.released)),
                          ('not-run', 'untouched', 1))
 
-    def test_pending_children_of_an_earlier_run_block_the_board(self):
+    def test_an_older_engines_pending_children_are_reported_not_a_refusal(self):
         self.lock.pending[('rig_jlink', H.PENDING_KIND)] = [{'receipt': {'pid': 9}}]
         self.A.process.recheck.return_value = 'pending'
         row = self.run_board()
-        self.assertEqual((H.verdict(row), row['recoveryBlocker'], len(self.lock.released)), ('blocker', True, 1))
+        self.assertEqual((H.verdict(row), row['ran'], len(self.lock.released)), ('pass', True, 1))
+        self.assertIn('older engine', row['previousPending'])
         self.A.process.recheck.return_value = 'done'
-        self.assertEqual(H.verdict(self.run_board()), 'pass')
+        row = self.run_board()
+        self.assertNotIn('previousPending', row)
+        self.assertEqual(self.lock.pending, {})
 
-    def test_interrupt_keeps_the_row_and_its_holder(self):
+    def test_interrupt_keeps_the_row_and_ends_the_lock(self):
         def step(*a):
             raise KeyboardInterrupt
         row = self.run_board(step=step)
         self.assertTrue(row['interrupted'])
-        self.assertEqual(row['cleanup']['holder'], {'token': 'tok123'})
+        self.assertEqual((row['cleanup']['released'], len(self.lock.ended)), (True, 1))
 
     def test_absent_probe_is_not_run_before_the_lock(self):
         row = self.run_board(probe='probe 1 is not on this host\'s bus')
@@ -1109,10 +1152,10 @@ class Manual(Base):
         return argparse.Namespace(**{'board': 'rig_jlink', 'under_hold': 'mine', 'roster': str(self.roster),
                                      'staged': None, 'bundle': None, **kw})
 
-    def test_unclean_manual_flash_marks_the_board_pending(self):
+    def test_unclean_manual_flash_logs_a_failed_cleanup(self):
         for exc in (H.Unclean('JLinkExe: cleanup pending'), RuntimeError('boom'), KeyboardInterrupt()):
             with self.subTest(exc=type(exc).__name__):
-                self.lock.pending.clear()
+                self.lock.logged.clear()
                 args = self.held(cmd='flash', build_record=str(self.record(experimental=True)), sketch='echo')
 
                 def unclean(*a):
@@ -1122,10 +1165,8 @@ class Manual(Base):
                         mock.patch.object(H, 'flash_only', unclean), contextlib.redirect_stdout(io.StringIO()), \
                         mock.patch.object(H.Tracker, '__init__', fake_tracker_init):
                     self.assertEqual(H.manual(args), 4)
-                    self.A.process.recheck.return_value = 'pending'
-                    with self.assertRaisesRegex(H.Refused, 'pending children'):
-                        H.manual(args)
-                self.assertEqual(self.lock.pending[('rig_jlink', H.PENDING_KIND)], [{'receipt': {'pid': 7}}])
+                self.assertEqual([(b, r) for b, _, r in self.lock.logged], [('rig_jlink', [{'pid': 7}])])
+                self.assertEqual(self.lock.pending, {})
 
     def test_staged_flash_admits_against_the_manifest_and_keeps_a_result(self):
         rec = self.record()
@@ -1146,7 +1187,7 @@ class Manual(Base):
         with contextlib.redirect_stdout(io.StringIO()) as out:
             self.assertEqual(H.manual(args), 4)
         self.assertEqual(json.loads(out.getvalue())['survivors'], [{'receipt': {'pid': 5}}])
-        self.assertEqual(self.lock.pending[('rig_jlink', H.PENDING_KIND)], [{'receipt': {'pid': 5}}])
+        self.assertEqual([r for _, _, r in self.lock.logged], [[{'pid': 5}]])
 
     def test_one_session_command_at_a_time(self):
         args = self.held(cmd='exec', argv=['true'], timeout=5)
@@ -1182,16 +1223,135 @@ class Manual(Base):
                 H.op_restore(args, None, self.dir / 'run', None, None)
         restore.assert_not_called()
 
-    def test_restore_release_passes_only_when_the_hold_ends(self):
-        args = self.held(build_record=str(self.record()), report=None, release=True)
+    def test_restore_release_releases_the_hold_whatever_the_restore_did(self):
+        args = self.held(cmd='restore', build_record=str(self.record()), report=None, release=True)
         restored = {'pass': True, 'state': 'echo restored', 'evidence': 'echo'}
-        for exit_code, ok in ((0, True), (1, False)):
-            with mock.patch.object(H, 'restore', return_value=restored), \
-                    mock.patch.object(H, 'git_identity', return_value=('abc', '')), \
-                    mock.patch.object(H, 'release_hold', return_value={'exit': exit_code}) as release:
-                row = H.op_restore(args, None, self.dir / 'run', None, None)
-            release.assert_called_once_with('rig_jlink')
-            self.assertEqual(row['pass'], ok)
+        failed = {'pass': False, 'state': 'unknown', 'evidence': 'no echo'}
+        for restore, release_exit, code, logged in ((restored, 0, 0, 0), (failed, 0, H.RESTORE_FAILED, 1),
+                                                    (restored, 1, H.RELEASE_FAILED, 0),
+                                                    (H.Refused('stale'), 0, H.RESTORE_FAILED, 1)):
+            with self.subTest(restore=restore, release_exit=release_exit):
+                self.lock.logged.clear()
+                outcome = {'side_effect': restore} if isinstance(restore, Exception) else {'return_value': restore}
+                with mock.patch.object(H, 'restore', **outcome), \
+                        mock.patch.object(H, 'git_identity', return_value=('abc', '')), \
+                        mock.patch.object(H.Tracker, '__init__', fake_tracker_init), \
+                        mock.patch.object(H, 'release_hold', return_value={'exit': release_exit}) as release, \
+                        contextlib.redirect_stdout(io.StringIO()) as out:
+                    self.assertEqual(H.manual(args), code)
+                release.assert_called_once_with('rig_jlink')
+                self.assertEqual(json.loads(out.getvalue())['pass'], code == 0)
+                self.assertEqual(len(self.lock.logged), logged)
+
+    def test_restore_release_keeps_the_final_verdict_in_result_json(self):
+        args = self.held(cmd='restore', build_record=str(self.record()), report=None, release=True)
+        with mock.patch.object(H, 'restore', return_value={'pass': True, 'state': 'echo restored', 'evidence': 'e'}), \
+                mock.patch.object(H, 'git_identity', return_value=('abc', '')), \
+                mock.patch.object(H.Tracker, '__init__', fake_tracker_init), \
+                mock.patch.object(H, 'release_hold', return_value={'exit': 1, 'output': 'ssh dropped'}), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(H.manual(args), H.RELEASE_FAILED)
+        result = json.loads(next((self.root / 'build/hil-manual').glob('rig_jlink-restore-*/result.json')).read_text())
+        self.assertEqual(result, json.loads(out.getvalue()))
+        self.assertEqual((result['pass'], result['restored'], result['released']),
+                         (False, True, {'exit': 1, 'output': 'ssh dropped'}))
+
+    def test_restore_release_refused_before_its_run_dir_still_keeps_a_result(self):
+        args = self.held(cmd='restore', build_record=str(self.record()), report=None, release=True,
+                         staged='manifest.json')
+        code, out, _ = self.release_restore(args, verify_staged=mock.Mock(side_effect=H.Refused('staged tree changed')))
+        self.assertEqual(code, H.RESTORE_FAILED)
+        result = json.loads(next((self.root / 'build/hil-manual').glob('rig_jlink-restore-*/result.json')).read_text())
+        self.assertEqual(result, out)
+
+    def test_restore_release_releases_before_an_interrupt_propagates(self):
+        args = self.held(cmd='restore', build_record=str(self.record()), report=None, release=True)
+        with mock.patch.object(H, 'restore', side_effect=KeyboardInterrupt), \
+                mock.patch.object(H, 'git_identity', return_value=('abc', '')), \
+                mock.patch.object(H.Tracker, '__init__', fake_tracker_init), \
+                mock.patch.object(H, 'release_hold', return_value={'exit': 0}) as release, \
+                contextlib.redirect_stdout(io.StringIO()), self.assertRaises(KeyboardInterrupt):
+            H.manual(args)
+        release.assert_called_once_with('rig_jlink')
+
+    def test_a_signal_as_the_release_begins_waits_until_it_ran_and_its_verdict_is_out(self):
+        args = self.held(cmd='restore', build_record=str(self.record()), report=None, release=True)
+        self.A.process.InterruptHold = load_arduino_engine('skills/hil/scripts/hil_process.py').InterruptHold
+        prev = signal.signal(signal.SIGINT, signal.default_int_handler)
+        self.addCleanup(signal.signal, signal.SIGINT, prev)
+        released = []
+
+        def release_hold(name):
+            signal.raise_signal(signal.SIGINT)
+            released.append(name)
+            return {'exit': 0}
+        with mock.patch.object(H, 'restore', return_value={'pass': True, 'state': 'echo restored', 'evidence': 'e'}), \
+                mock.patch.object(H, 'git_identity', return_value=('abc', '')), \
+                mock.patch.object(H.Tracker, '__init__', fake_tracker_init), \
+                mock.patch.object(H, 'release_hold', release_hold), \
+                contextlib.redirect_stdout(io.StringIO()) as out, self.assertRaises(KeyboardInterrupt):
+            H.manual(args)
+        self.assertEqual(released, ['rig_jlink'])
+        self.assertEqual(json.loads(out.getvalue())['released'], {'exit': 0})
+        self.assertIs(signal.getsignal(signal.SIGINT), signal.default_int_handler)
+
+    def release_restore(self, args, **patches):
+        """restore --release under the given patches: (exit, JSON, release_hold mock); an interrupt propagates."""
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(H, 'git_identity', return_value=('abc', '')))
+            stack.enter_context(mock.patch.object(H.Tracker, '__init__', patches.pop('tracker', fake_tracker_init)))
+            for name, value in patches.items():
+                stack.enter_context(mock.patch.object(H, name, value))
+            release = stack.enter_context(mock.patch.object(H, 'release_hold', return_value={'exit': 0}))
+            out = stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            try:
+                return H.manual(args), json.loads(out.getvalue()), release
+            finally:
+                release.assert_called_once_with('rig_jlink')
+
+    def test_restore_release_releases_after_a_refused_input_or_setup_and_logs_it(self):
+        def no_dir(self, run_dir):
+            raise OSError('read-only file system')
+        for patches, staged, why in (
+                ({'verify_staged': mock.Mock(side_effect=H.Refused('staged tree changed'))}, 'manifest.json',
+                 'staged tree changed'), ({'tracker': no_dir}, None, 'read-only file system')):
+            with self.subTest(why):
+                self.lock.logged.clear()
+                args = self.held(cmd='restore', build_record=str(self.record()), report=None, release=True,
+                                 staged=staged)
+                code, out, _ = self.release_restore(args, **patches)
+                self.assertEqual(code, H.RESTORE_FAILED)
+                self.assertIn(why, out['error'])
+                self.assertEqual(len(self.lock.logged), 1)
+                self.assertIn(why, self.lock.logged[0][1])
+
+    def test_an_unlogged_restore_failure_says_so(self):
+        args = self.held(cmd='restore', build_record=str(self.record()), report=None, release=True)
+        with mock.patch.object(self.lock, 'log_cleanup_failure', side_effect=OSError('disk full')):
+            code, out, _ = self.release_restore(args, restore=mock.Mock(side_effect=H.Refused('stale')))
+        self.assertEqual(code, H.RESTORE_FAILED)
+        self.assertIn('cleanup log not written: disk full', out['error'])
+
+    def test_restore_release_propagates_an_interrupt_with_pending_children(self):
+        args = self.held(cmd='restore', build_record=str(self.record()), report=None, release=True)
+
+        def interrupted(*a):
+            a[-1].pending.append({'receipt': {'pid': 7}})
+            raise KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            self.release_restore(args, restore=interrupted)
+        self.assertEqual([r for _, _, r in self.lock.logged], [[{'pid': 7}]])
+
+    def test_a_passing_manual_restore_marks_the_earlier_failure_restored(self):
+        self.lock.failures['rig_jlink'] = [{'id': 'f1', 'receipts': []}]
+        args = self.held(cmd='restore', build_record=str(self.record()), report=None, release=False)
+        with mock.patch.object(H, 'restore', return_value={'pass': True, 'state': 'echo restored', 'evidence': 'e'}), \
+                mock.patch.object(H, 'git_identity', return_value=('abc', '')), \
+                mock.patch.object(H.Tracker, '__init__', fake_tracker_init), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(H.manual(args), 0)
+        self.assertEqual(self.lock.restored, [('rig_jlink', 'f1')])
+        self.assertEqual(json.loads(out.getvalue())['previousCleanupFailure']['id'], 'f1')
 
     def test_release_ends_only_a_hold_under_its_reason_and_restores_nothing(self):
         self.lock.records['rig_jlink'] = {'reason': 'other', 'pid': 1}
@@ -1282,7 +1442,7 @@ class Manual(Base):
         with mock.patch.object(self.lock, 'is_locked', return_value=False):   # a second read, unreadable
             H.held_by('rig_jlink', 'mine')   # the one record read decides owner and liveness
 
-    def test_a_session_command_not_held_exits_not_held_unless_the_record_is_unreadable_or_children_pend(self):
+    def test_a_session_command_not_held_exits_not_held_unless_the_record_is_unreadable(self):
         argv = ['exec', '-b', 'rig_jlink', '--under-hold', 'mine', str(self.roster), '--', 'true']
         with mock.patch.object(H, 'git_identity', return_value=('abc', '')):
             self.assertEqual(self.main(argv)[0], H.NOT_HELD)   # its holder gone: a restore released it, or it died
@@ -1293,9 +1453,7 @@ class Manual(Base):
             del self.lock.records['rig_jlink']
             self.lock.pending[('rig_jlink', H.PENDING_KIND)] = [{'receipt': {'pid': 7}}]
             self.A.process.recheck.return_value = 'pending'
-            code, out = self.main(argv)
-            self.assertEqual(code, 2)
-            self.assertIn('pending children', out['error'])
+            self.assertEqual(self.main(argv)[0], H.NOT_HELD)   # an older engine's pending record refuses nothing
 
     def test_check_runs_a_device_test_without_flashing(self):
         args = argparse.Namespace(board='rig_ocd', test=None)
@@ -1409,7 +1567,7 @@ class Commission(Base):
         code, result, _ = self.commission('rig_ocd', {'vidPid': '239a:cafe'}, flash=bump, reset=bump)
         self.assertEqual(code, 4)
         self.assertIn('want one 239a:cafe with serial OUID, found 2', result['error'])
-        self.assertEqual(result['holder'], {'token': 'tok123'})
+        self.assertEqual((result['results'][0]['cleanup']['released'], len(self.lock.ended)), (True, 1))
 
     def test_a_failed_flash_names_the_base_state(self):
         def flash(f, image, *a):
@@ -1420,18 +1578,17 @@ class Commission(Base):
         self.assertEqual((code, result['base'], result['error']),
                          (4, 'matched', 'RuntimeError: flash: J-Link flash: x'))
 
-    def test_unclean_commission_marks_the_board_pending_and_keeps_a_report(self):
+    def test_unclean_commission_logs_its_children_and_keeps_a_report(self):
         def detach(*a):
             a[-1]._note('pending', {'pid': 7}, ['JLinkExe'])
             a[-1].check()
         code, result, _ = self.commission('rig_jlink', {'vidPid': '1234:5678'}, detach=detach,
                                           scan=mock.Mock(return_value=[]))
         self.assertEqual(code, 4)
-        self.assertEqual(self.lock.pending[('rig_jlink', H.PENDING_KIND)], [{'receipt': {'pid': 7}}])
+        self.assertEqual((self.lock.ended[0][2], self.lock.pending), ([{'pid': 7}], {}))
         self.A.process.recheck.return_value = 'pending'
-        self.assertIn('pending children', H.pending_problem('rig_jlink'))
         report = next(self.root.glob('build/hil-manual/commission-rig_jlink-*/result.json'))
-        self.assertEqual(json.loads(report.read_text())['holder'], {'token': 'tok123'})
+        self.assertTrue(json.loads(report.read_text())['results'][0]['cleanup']['released'])
         restore = argparse.Namespace(board='rig_jlink', report=str(report))
         with self.assertRaisesRegex(H.Refused, 'not proven ended'):
             H.op_restore(restore, None, self.dir / 'run', None, None)
@@ -1454,7 +1611,7 @@ class Commission(Base):
         with mock.patch.object(self.lock, 'release_board_lock', release), self.assertRaises(KeyboardInterrupt):
             self.commission('rig_jlink', {'vidPid': '1234:5678'}, detach=detach, flash=mock.Mock(return_value=''),
                             reset=mock.Mock(return_value=''), scan=lambda *a: [{'serial': 'JUID', 'ino': ino[0]}])
-        self.assertEqual((len(self.lock.released), self.lock.handed), (1, []))
+        self.assertEqual((len(self.lock.released), self.lock.ended), (1, []))
         self.assertFalse(list(self.root.glob('build/hil-manual/commission-rig_jlink-*/result.json')))
 
 

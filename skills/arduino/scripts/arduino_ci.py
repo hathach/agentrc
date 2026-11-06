@@ -26,7 +26,8 @@ with its HIL profile (arduino_hil.py's names; HIL, the checkout-relative hil_tes
       finished clean; nothing else is ever removed.
 
 Exits: setup/pack 0 done, 2 refused; run 0 every board passed, 1 a board failed or did not run, 2 a blocker (a
-cleanup holder, a recovery blocker, a run without a report), a run a signal aborted, or refused before any board.
+failed cleanup, logged and the board released, an older helper's cleanup holder, a run without a report), a run a
+signal aborted, or refused before any board.
 """
 
 import argparse
@@ -60,6 +61,7 @@ DEADLINE = 3600
 PRUNE_DAYS = 30
 RUN_NAME = re.compile(r'[0-9]+-[0-9]+')   # a state dir's <run id>-<attempt>
 FINISHED = ('pass', 'fail', 'not-run')   # verdicts that leave nothing for recovery
+EARLIER = ('previousCleanupFailure', 'openCleanupFailures', 'previousPending')   # a row's report of an earlier task
 
 
 def _hil_load():
@@ -274,8 +276,8 @@ def attempt_entry(run_dir, code, row, seconds):
     return {**base, 'verdict': row['verdict'],
             'locked': bool(row.get('locked')) and not row.get('recoveryBlocker'), 'detail': row.get('detail', ''),
             'tests': [{k: t.get(k) for k in ('test', 'pass', 'detail')} for t in row.get('tests', [])],
-            'cleanup': {k: row.get('cleanup', {}).get(k) for k in ('pass', 'state', 'holder')},
-            'firmware': row.get('firmware')}
+            'cleanup': {k: row.get('cleanup', {}).get(k) for k in ('pass', 'state', 'released')},
+            'firmware': row.get('firmware'), **{k: row[k] for k in EARLIER if row.get(k)}}
 
 
 def run_board(board, tree, out, roster, clock, lock_wait, stop):
@@ -306,6 +308,10 @@ def run_board(board, tree, out, roster, clock, lock_wait, stop):
         a = attempt_entry(run_dir, code, row, time.monotonic() - t)
         res['attempts'].append(a)
         log(f'{board}: {a["verdict"]} {a["detail"]}')
+        if f := a.get('previousCleanupFailure'):
+            log(f'{board}: an earlier task\'s cleanup failed: {H.A.lock.failure_text(f)}'[:300])
+        if a.get('previousPending'):
+            log(f'{board}: {a["previousPending"]}'[:300])
         if a.get('locked'):
             lock_since = t if lock_since is None else lock_since
             nap = min(LOCK_POLL, lock_wait - waited - (time.monotonic() - lock_since), clock.left())
@@ -330,11 +336,15 @@ def new_result(board):
 
 
 def finish(res, verdict, detail, src=None):
-    """res with its verdict, and the tests, cleanup and firmware of `src` (default: its last attempt that ran)."""
+    """res with its verdict, and the tests, cleanup and firmware of `src` (default: its last attempt that ran); an
+    earlier task's failed cleanup or pending children from the first attempt reporting them, which a passing restore
+    may have resolved before a later one ran."""
     src = src or next((a for a in reversed(res['attempts']) if 'tests' in a and not a.get('locked')), None)
     res.update(verdict=verdict, detail=detail, tests=src['tests'] if src else [],
                cleanup=src['cleanup'] if src else None, firmware=src['firmware'] if src else None,
                runS=sum(a['seconds'] for a in res['attempts']))
+    earlier = next((a for a in res['attempts'] if any(k in a for k in EARLIER)), {})
+    res.update({k: earlier[k] for k in EARLIER if k in earlier})
     return res
 
 
@@ -351,8 +361,7 @@ def prune(state, days, keep):
                 raise ValueError('no summary of its own')
             s = json.loads(summary.read_text())
             done = (s.get('kind') == SUMMARY_KIND and s.get('termination') == 'completed' and
-                    all(b.get('verdict') in FINISHED and (b.get('cleanup') or {}).get('holder') is None
-                        for b in s.get('boards', [])))
+                    all(b.get('verdict') in FINISHED for b in s.get('boards', [])))
         except (OSError, ValueError, AttributeError, TypeError):
             done = False
         try:

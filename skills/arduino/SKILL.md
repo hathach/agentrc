@@ -75,8 +75,15 @@ retries, recovery) apply unchanged; these scripts load its `hil_*` scripts throu
 - **Probe detach**: before a flash or console reset through an openocd flasher whose args name `target/rp2040.cfg`
   or `target/rp2350.cfg`, the engine clears the USB pull-up so the host sees the new image enumerate.
 - **Locks**: every library's harness takes the same physical board lock (`/tmp/tinyusb-hil-locks/<name>.lock`, the
-  `hil` skill) and records unproven children under the one pending kind `arduino-hil`, so two libraries, and tinyusb
-  or tinyuf2, exclude each other on a shared board, and one library's leftover children block the others.
+  `hil` skill), so two libraries, and tinyusb or tinyuf2, exclude each other on a shared board. A run's or
+  commission's lock ends with it: a cleanup it could not prove (a failed restore, children not proven ended) is a
+  blocker, logged in the board's cleanup log with the board released, and the next run on the board, whatever
+  library, reports it (`previousCleanupFailure`). A manual session's detached hold stays until `restore --release`,
+  `release` or `session close`; a session command that leaves a child unproven, or a restore that fails, logs the
+  failure under it. A passing restore marks restored each open failure whose children and retained
+  sessions are proven ended. `restore --release` releases the hold whatever the restore did: exit 0 restored, 6
+  restore failed (released), 5 not released; `session close` counts 6 closed. An older engine's pending record
+  (kind `arduino-hil`) is reported (`previousPending`), never a refusal.
 
 ## Code format
 

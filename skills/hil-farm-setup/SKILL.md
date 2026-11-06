@@ -38,7 +38,7 @@ mechanics, each with its usage at the top. This page is what to decide around th
   runner yet publishes the new pin, so add the runner from a commit with the installed one, or migrate the runners
   outside this procedure first. It leaves the new unit disabled, including after registration, until its hardware
   proof. A failed addition keeps the installed host file, so retry the same command.
-- A runner held by `job_hook.py` stays held until someone checks the failed job's processes and boards; clear it by
-  the README's steps, not by restarting the unit.
+- A runner held by `job_hook.py` stays held while a failed job's processes are left; clear it by the README's steps,
+  not by restarting the unit.
 - A tool whose new install fails its check is not switched; the old one keeps serving. Report the check's output
   rather than retrying with `--force`.

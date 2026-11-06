@@ -25,7 +25,7 @@ import types
 from pathlib import Path
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import guard_survivors  # noqa: E402
+from helpers import guard_survivors, latest_failure  # noqa: E402
 
 SCRIPTS = Path(__file__).resolve().parents[1] / 'skills' / 'hil' / 'scripts'
 
@@ -149,7 +149,7 @@ class Engine(unittest.TestCase):
     def test_a_free_board_is_reset_under_the_protected_reason_and_released(self):
         row = self.check()
         rec = self.p.records[0]
-        self.assertEqual((rec['reason'], rec['protected']), ('farm_check', True))
+        self.assertEqual((rec['reason'], rec['cleanupOwed']), ('farm_check', True))
         self.assertIn('farm_check', lk.PROTECTED_REASONS)
         self.assertEqual((row['status'], row['probe'], row['location'], self.ran), ('ok', '✅ stlink', '1-1', [RESET]))
         self.assertEqual((row['cleanup']['result'], row['cleanup']['released']), ('released', True))
@@ -241,17 +241,36 @@ class Engine(unittest.TestCase):
         self.assertIn('ValueError', row['note'][0])
 
     # --- processes not proven ended -------------------------------------------------------------
-    def test_a_reset_not_proven_ended_keeps_the_protected_record(self):
+    def test_a_reset_not_proven_ended_releases_the_board_and_logs_its_receipt(self):
         self.outcomes[RESET] = (0, 'unknown', 'ok')
         row = self.check()
-        self.assertEqual((row['status'], row['check_status'], row['cleanup']['result'], row['cleanup']['blocker']),
-                         ('blocked', 'ok', 'unresolved', 'stale-record'))
-        self.assertEqual(row['cleanup']['receipts'], [{'token': RESET, 'lock': '/nonexistent'}])
-        self.assertEqual(self.doc(row)['rows'][0]['coverage'], 'blocked-after')
-        rec = lk.read_record('b')
-        self.assertEqual((rec['reason'], rec['protected']), ('farm_check', True))
-        with self.assertRaises(lk.RecoveryBlocked):
-            self.take()
+        receipt = {'token': RESET, 'lock': '/nonexistent'}
+        self.assertEqual((row['status'], row['check_status'], row['cleanup']['result'], row['cleanup']['released']),
+                         ('blocked', 'ok', 'unresolved', True))
+        self.assertEqual(row['cleanup']['receipts'], [receipt])
+        doc = self.doc(row)
+        self.assertEqual((doc['rows'][0]['coverage'], eng.exit_status(doc)), ('blocked-after', 4))
+        self.assertIn('released with its cleanup unresolved', row['note'][-1])
+        self.assertEqual(lk.record_state('b')[0], 'empty')
+        f = latest_failure(lk, 'b')
+        self.assertEqual((f['how'], f['reason'], f['receipts']), ('ended-failed', 'farm_check', [receipt]))
+        self.take()
+        self.assertEqual(self.check()['previousCleanupFailure']['id'], f['id'], 'the next check reports it')
+
+    def test_a_run_without_a_receipt_logs_a_marker_no_later_restore_resolves(self):
+        def lost(cmd, cwd=None, **kw):
+            e = OSError('supervisor died')
+            e.cleanup, e.receipt = 'unknown', None
+            raise e
+        patch(self, eng.hil_process, 'run_tracked', lost)
+        row = self.check()
+        marker = {'unrecheckable': [RESET]}
+        self.assertEqual((row['status'], row['cleanup']['released'], row['cleanup']['receipts']),
+                         ('blocked', True, [marker]))
+        f = latest_failure(lk, 'b')
+        self.assertEqual(f['receipts'], [marker])
+        self.assertRegex(lk.resolve_restored('b', [f], evidence='a later restore')[0], f'{f["id"]} stays open')
+        self.assertEqual(latest_failure(lk, 'b')['id'], f['id'])
 
     def test_a_reset_proven_ended_on_recheck_releases(self):
         self.outcomes[RESET] = (0, 'pending', 'ok')
@@ -289,23 +308,29 @@ class Engine(unittest.TestCase):
             self.assertEqual(self.check()['status'], 'locked')
         self.assertEqual(self.ran, [])
 
-    def test_a_stale_protected_record_is_blocked_before_the_reset(self):
-        self.stale(protected=True)
-        row = self.check()
-        self.assertEqual((row['status'], self.ran), ('blocked', []))
-        doc = self.doc(row)
-        self.assertEqual((doc['rows'][0]['coverage'], eng.exit_status(doc)), ('blocked-before', 4))
+    def test_a_stale_cleanup_owing_record_is_reported_and_the_board_reset(self):
+        for mark in ({'protected': True}, {'cleanupOwed': True}, {'role': lk.CLEANUP_ROLE}):
+            with self.subTest(mark=mark):
+                self.ran.clear()
+                self.stale(detail='restore failed', **mark)
+                row = self.check()
+                self.assertEqual((row['status'], self.ran), ('ok', [RESET]))
+                self.assertEqual(row['previousCleanupFailure']['how'], 'found-left')
+                self.assertIn("an earlier task's cleanup failed", row['note'][0])
+                self.assertIn('restore failed', row['note'][0])
 
-    def test_a_live_cleanup_holder_is_blocked_not_locked(self):
+    def test_a_live_older_cleanup_holder_is_blocked_before_the_reset(self):
         self.hold('hil_reserve', role=lk.CLEANUP_ROLE)
-        self.assertEqual(self.check()['status'], 'blocked')
+        row = self.check()
+        doc = self.doc(row)
+        self.assertEqual((row['status'], self.ran, doc['rows'][0]['coverage'], eng.exit_status(doc)),
+                         ('blocked', [], 'blocked-before', 4))
 
-    def test_a_held_board_with_a_takeover_journal_is_blocked_not_locked(self):
+    def test_a_held_board_with_a_takeover_journal_is_locked(self):
         self.hold()
         (self.locks / ('b' + lk.JOURNAL)).write_text(json.dumps({'token': 't', 'locks': ['b']}))
         row = self.check()
-        self.assertEqual((row['status'], self.ran), ('blocked', []))
-        self.assertIn('takeover journal', row['note'][-1])
+        self.assertEqual((row['status'], self.ran), ('locked', []))
 
     def test_an_unusable_lock_is_an_error_not_a_holder(self):
         self.locks.mkdir()
@@ -382,153 +407,34 @@ class Engine(unittest.TestCase):
                 ctx.retain('openocd_esp session', receipts)
         self.p.reset = retaining
 
-    def test_a_retained_session_hands_the_board_to_a_cleanup_holder_released_once_it_ended(self):
+    def test_a_retained_session_releases_the_board_with_its_receipts_logged(self):
         receipt = self.d / ('r' * 200) / ('r' * 200) / ('r' * 200 + '.json')     # past the detail's 500 characters
-        receipts = [str(receipt)]
+        receipts = [str(receipt), {'pid': 7, 'startTime': '1', 'log': '/s/l'}]
         self.retain_after_reset(receipts)
-        patch(self, eng, 'HOLDER_READY', 5)
         row = self.check()
-        self.assertEqual((row['status'], row['cleanup']['blocker'], row['cleanup']['retained']),
-                         ('blocked', 'cleanup-holder', receipts))
-        rec = lk.read_record('b')
-        self.assertTrue(lk.is_cleanup_holder(rec))
-        self.assertEqual(rec['retained'], receipts)
+        self.assertEqual((row['status'], row['cleanup']['released'], row['cleanup']['retained']),
+                         ('blocked', True, receipts))
         self.assertIn('`hil_openocd_esp.py end --receipt`', row['note'][-1])
-        self.assertIn('release --token refuses until each ended', row['note'][-1])
-        token = row['cleanup']['token']
-        with self.assertRaisesRegex(lk.ReleaseRefused, 'retained sessions are not proven ended'):
-            lk.release_token(token)
-        self.assertEqual(lk.read_record('b'), rec)
-        receipt.parent.mkdir(parents=True)
-        # as `hil_openocd_esp.py end` leaves it
-        receipt.write_text(json.dumps({'tool': 'hil_openocd_esp', 'pid': 4242, 'startTime': '123456', 'closed': True,
-                                       'cleanup': 'done'}))
-        lk.release_token(token)
-        self.assertIsNone(lk.read_record('b'))
+        self.assertEqual(lk.record_state('b')[0], 'empty')
+        self.assertEqual(latest_failure(lk, 'b')['retained'], receipts)
+        self.take()
 
-    def test_a_failed_handoff_keeps_the_retained_receipts_in_the_protected_record(self):
-        receipts = ['/s/r1.json', {'pid': 7, 'startTime': '1', 'log': '/s/l'}]
-        self.retain_after_reset(receipts)
-        patch(self, eng, 'HOLDER_READY', 1)
-        patch(self, lk, '_holder_argv', lambda job: ['/nonexistent/holder'])
-        row = self.check()
-        self.assert_failed_handoff(row)
-        self.assertEqual(row['cleanup']['retained'], receipts)
-        rec = lk.read_record('b')
-        self.assertEqual((rec['protected'], rec['retained']), (True, receipts))
-        self.assertNotIn('role', rec)
-        self.assertIn('a takeover does not check them', row['note'][-1])
-
-    # --- handing a survivor's board to a cleanup holder -----------------------------------------
-    def handoff(self, argv=None, popen=None):
-        """A reset that leaves a survivor (`pending`) with the holder's start replaced."""
-        self.outcomes[RESET] = (0, 'pending', 'ok')
-        self.rechecks[RESET] = 'pending'
-        patch(self, eng, 'HOLDER_READY', 1)
-        if argv is not None:
-            patch(self, lk, '_holder_argv', lambda job: argv(job))
-        if popen is not None:
-            patch(self, eng.subprocess, 'Popen', popen)
-        t = time.monotonic()
-        row = self.check()
-        self.assertLess(time.monotonic() - t, 8, 'every wait of the handoff is bounded')
-        doc = self.doc(row)
-        self.assertEqual((row['status'], row['coverage'], row['check_status'], eng.exit_status(doc)),
-                         ('blocked', 'blocked-after', 'ok', 4))
-        self.assertEqual(row['cleanup']['receipts'], [{'token': RESET, 'lock': '/nonexistent'}])
-        with self.assertRaises(lk.BoardLocked):   # RecoveryBlocked, or the holder's live flock
-            self.take()
-        return row
-
-    def assert_failed_handoff(self, row):
-        self.assertEqual(row['cleanup']['blocker'], 'stale-record')
-        self.assertIn('cleanup holder handoff failed', row['cleanup']['evidence'][-1])
-        rec = lk.read_record('b')
-        self.assertTrue(rec['protected'])
-
-    def test_a_holder_that_cannot_start_leaves_the_protected_record(self):
-        def popen(*a, **kw):
-            raise OSError(24, 'Too many open files')
-        row = self.handoff(popen=popen)
-        self.assert_failed_handoff(row)
-        self.assertEqual(lk.read_record('b')['reason'], 'farm_check')
-        self.assertNotIn('role', lk.read_record('b'))
-
-    def test_a_stopped_holder_is_not_waited_on(self):
-        self.assert_failed_handoff(self.handoff(lambda job: ['sh', '-c', 'kill -STOP $$']))
-
-    def test_a_holder_that_registers_late_is_ended(self):
-        real = lk._holder_argv
-
-        def late(job):      # the delay in the holder's own process, so ending it leaves no survivor
-            return [sys.executable, '-c', 'import os, sys, time; time.sleep(3); os.execv(sys.argv[1], sys.argv[1:])',
-                    *real(job)]
-        self.assert_failed_handoff(self.handoff(late))
-        self.assertNotIn('role', lk.read_record('b'))
-
-    def test_a_holder_that_dies_after_its_readiness_stays_a_blocker(self):
-        fake = ('import json, os, sys\n'
-                'job = json.loads(sys.argv[1])\n'
-                'start = open(f"/proc/{os.getpid()}/stat").read().rpartition(")")[2].split()[19]\n'
-                'os.write(job["hello_fd"], (json.dumps({"pid": os.getpid(), "start": start}) + "\\n").encode())\n'
-                'os.read(job["go_fd"], 1)\n')
-        row = self.handoff(lambda job: [sys.executable, '-c', fake, json.dumps(job)])
-        self.assert_failed_handoff(row)
-        self.assertTrue(lk.is_cleanup_holder(lk.read_record('b')), 'a record naming the dead holder')
-
-    def test_pipes_that_cannot_be_made_keep_the_blocked_row_and_leak_nothing(self):
-        real = os.pipe
-        for fail_at in (1, 2):
-            with self.subTest(fail_at=fail_at):
-                calls = []
-
-                def pipe():
-                    calls.append(1)
-                    if len(calls) == fail_at:
-                        raise OSError(24, 'Too many open files')
-                    return real()
-                before = sorted(os.listdir('/proc/self/fd'))
-                with mock.patch.object(eng.os, 'pipe', pipe):
-                    row = self.handoff()
-                self.assert_failed_handoff(row)
-                self.assertIn('Too many open files', row['cleanup']['evidence'][-1])
-                self.assertEqual(sorted(os.listdir('/proc/self/fd')), before)
-                lk.release_board_lock(lk.flock_nb('b'))   # the test's own stand-in for the recovery
-                self.ran.clear()
-
-    def test_an_interrupt_as_the_holder_starts_leaves_no_untracked_holder(self):
-        spawned = []
-        real = subprocess.Popen
-
-        def popen(*a, **kw):
-            p = real(*a, **kw)
-            spawned.append(p)
-            signal.raise_signal(signal.SIGINT)    # lands before Popen returns to the engine
-            return p
-        row = self.handoff(lambda job: ['sh', '-c', 'kill -STOP $$'], popen=popen)
-        self.assertTrue(row['interrupted'])
-        self.assert_failed_handoff(row)
-        self.assertIsNotNone(spawned[0].poll(), 'the stopped holder is ended, not left holding the flock')
-        self.assertNotIn('role', lk.read_record('b'))
-
-    def test_an_interrupt_during_finalization_keeps_the_blocked_row_and_stops_the_farm(self):
+    def test_an_interrupt_during_finalization_still_releases_and_stops_the_farm(self):
         self.outcomes[RESET] = (0, 'unknown', 'ok')
         self.p.boards = [dict(BOARD), dict(BOARD, name='c')]
-        real = lk.write_record
+        real = lk._log_failure
 
-        def write_record(fh, reason, **extra):
-            if 'detail' in extra:      # the blocker record, not the take's own
-                signal.raise_signal(signal.SIGINT)
-            return real(fh, reason, **extra)
-        patch(self, eng.hil_lock, 'write_record', write_record)
+        def log_failure(board, fields):
+            signal.raise_signal(signal.SIGINT)
+            return real(board, fields)
+        patch(self, eng.hil_lock, '_log_failure', log_failure)
         rows, aborted = eng.check_farm(self.p, self.p.boards, self.args, state_dir=str(self.state))
         doc = eng.farm_document('rig', 'r.json', rows, {}, 0)
         self.assertEqual((aborted, [r['name'] for r in rows], eng.exit_status(doc, aborted)), (True, ['b'], 4))
-        self.assertEqual((rows[0]['status'], rows[0]['cleanup']['blocker'], rows[0]['interrupted']),
-                         ('blocked', 'stale-record', True))
-        self.assertEqual(lk.read_record('b')['detail'][:30], 'farm check cleanup unresolved:')
-        with self.assertRaises(lk.RecoveryBlocked):   # the engine's descriptor is closed
-            self.take()
+        self.assertEqual((rows[0]['status'], rows[0]['cleanup']['released'], rows[0]['interrupted']),
+                         ('blocked', True, True))
+        self.assertEqual(latest_failure(lk, 'b')['detail'][:30], 'farm check cleanup unresolved:')
+        self.take()
 
     def interrupt_before_finalization(self):
         real, calls = eng._end_reservation, []
@@ -557,23 +463,31 @@ class Engine(unittest.TestCase):
         self.assertEqual((row['status'], row['interrupted'], row['cleanup']['result']), ('ok', True, 'released'))
         self.take()
 
+    def test_a_recheck_that_raises_keeps_the_receipts_and_retained_sessions(self):
+        self.outcomes[RESET] = (0, 'pending', 'ok')
+        self.retain_after_reset(['/s/r1.json'])
+        patch(self, eng.hil_process, 'recheck', mock.Mock(side_effect=KeyError('lock')))
+        row = self.check()
+        receipt = {'token': RESET, 'lock': '/nonexistent'}
+        self.assertEqual((row['status'], row['cleanup']['released'], row['cleanup']['receipts'],
+                          row['cleanup']['retained']), ('blocked', True, [receipt], ['/s/r1.json']))
+        self.assertIn('finalization failed', row['cleanup']['evidence'][-1])
+        f = latest_failure(lk, 'b')
+        self.assertEqual((f['receipts'], f['retained']), ([receipt], ['/s/r1.json']))
+        self.take()
+
     def test_an_interrupt_before_finalization_keeps_a_pending_resets_receipt(self):
         self.outcomes[RESET] = (0, 'pending', '')
         self.rechecks[RESET] = 'pending'
-        patch(self, eng, 'HOLDER_READY', 2)
         self.interrupt_before_finalization()
         row = self.check()
         receipt = {'token': RESET, 'lock': '/nonexistent'}
-        rec = lk.read_record('b')
-        if isinstance(rec, dict) and isinstance(rec.get('pid'), int) and rec['pid'] != os.getpid():
-            self.addCleanup(Process.kill, rec['pid'])
-        self.assertEqual((row['status'], row['interrupted'], row['cleanup']['receipts'], row['cleanup']['blocker']),
-                         ('blocked', True, [receipt], 'cleanup-holder'))
-        self.assertEqual((rec['receipts'], rec['token']), ([receipt], row['cleanup']['token']))
-        with self.assertRaises(lk.BoardLocked):
-            self.take()
+        self.assertEqual((row['status'], row['interrupted'], row['cleanup']['receipts'], row['cleanup']['released']),
+                         ('blocked', True, [receipt], True))
+        self.assertEqual(latest_failure(lk, 'b')['receipts'], [receipt])
+        self.take()
 
-    def test_a_record_that_cannot_be_cleared_keeps_the_board_blocked(self):
+    def test_a_record_that_cannot_be_cleared_is_released_and_logged(self):
         real = lk.take_board_lock
 
         def take(*a, **kw):
@@ -584,28 +498,12 @@ class Engine(unittest.TestCase):
         row = self.check()
         doc = self.doc(row)
         self.assertEqual((row['status'], row['check_status'], row['cleanup']['result'], row['cleanup']['released'],
-                          eng.exit_status(doc)), ('blocked', 'ok', 'release-failed', False, 4))
+                          eng.exit_status(doc)), ('blocked', 'ok', 'release-failed', True, 4))
         self.assertIn('the record could not be cleared', row['cleanup']['evidence'])
+        self.assertEqual(row['cleanup']['logErrors'], ['record not cleared'])
         patch(self, eng.hil_lock, 'take_board_lock', real)
-        with self.assertRaises(lk.RecoveryBlocked):
-            self.take()
-
-    def test_a_handed_over_holder_keeps_the_board(self):
-        row = self.handoff()
-        rec = lk.read_record('b')
-        self.addCleanup(Process.kill, rec['pid'])
-        self.assertEqual((row['cleanup']['blocker'], row['cleanup']['token']), ('cleanup-holder', rec['token']))
-        self.assertTrue(lk.is_cleanup_holder(rec))
-        self.assertTrue(lk._holds_flock(rec['pid'], lk.lock_path('b')))
-        self.assertTrue(rec['receipts'])         # its release predicate
-        patch(self, eng.hil_process, 'recheck', RECHECK)
-        signals = []
-        with mock.patch.object(lk.signal, 'pidfd_send_signal', lambda fd, sig: signals.append(sig)):
-            # its receipt cannot be rechecked: unknown, refused up front naming it and the holder
-            with self.assertRaisesRegex(lk.ReleaseRefused, rf"not signalled: holder pid {rec['pid']} .* "
-                                        r'not proven ended: receipt STM32_Programmer_CLI .* unknown'):
-                lk.release_token(rec['token'])
-        self.assertEqual(signals, [])
+        self.take()          # the record it left is the next task's to log
+        self.assertEqual(latest_failure(lk, 'b')['how'], 'found-left')
 
     # --- interruption ---------------------------------------------------------------------------
     def test_an_interrupted_reset_proven_ended_releases_and_stops_the_farm(self):
@@ -807,7 +705,7 @@ class Main(unittest.TestCase):
         self.assertIs(eng.hil_lock, engine_lock)
 
     def test_a_lock_module_without_the_farm_check_reason_is_refused(self):
-        api = eng.LOCK_FUNCTIONS + eng.LOCK_EXCEPTIONS + ('CLEANUP_ROLE', 'PROTECTED_REASONS')
+        api = eng.LOCK_FUNCTIONS + eng.LOCK_EXCEPTIONS + ('PROTECTED_REASONS',)
         old = types.SimpleNamespace(**{a: getattr(lk, a) for a in api})
         old.PROTECTED_REASONS = {'hil_test.py'}
         code, _, err = self.run_main(self.cfg, lock_module=old, check=lambda *a, **kw: self.fail('checked'))
@@ -817,8 +715,8 @@ class Main(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn('take_board_lock', err)
         # present but of the wrong type: refused before the engine runs, not a crash inside it
-        for name, value in (('take_board_lock', None), ('RecoveryBlocked', None), ('RecoveryBlocked', int),
-                            ('CLEANUP_ROLE', None), ('PROTECTED_REASONS', None), ('PROTECTED_REASONS', 'farm_check')):
+        for name, value in (('take_board_lock', None), ('end_failed', None), ('RecoveryBlocked', None),
+                            ('RecoveryBlocked', int), ('PROTECTED_REASONS', None), ('PROTECTED_REASONS', 'farm_check')):
             with self.subTest(name=name, value=value):
                 bad = types.SimpleNamespace(**{a: getattr(lk, a) for a in api})
                 setattr(bad, name, value)
@@ -1016,57 +914,25 @@ class Process(unittest.TestCase):
         self.assertEqual(r['operations'][0]['attempts'][0]['kind'], 'interrupted')
         self.take()
 
-    def test_abrupt_death_leaves_no_report_and_a_blocker(self):
+    def test_abrupt_death_leaves_no_report_and_the_next_task_logs_it(self):
         p = self.start('slow')
         self.wait_for('resetting')
         p.kill()
         out, _ = p.communicate(timeout=30)
         self.assertEqual(out, '')
-        with self.assertRaises(lk.RecoveryBlocked):
-            self.take()
+        self.take()
+        self.assertEqual(latest_failure(lk, 'farmb')['task']['reason'], 'farm_check')
 
-    def test_a_surviving_child_is_kept_by_a_live_cleanup_holder(self):
+    def test_a_surviving_child_is_reported_and_the_board_released(self):
         code, r, _ = self.finish(self.start('survivor'))
         survivor = self.wait_for('survivor')
-        token = r['cleanup'].get('token')
-        self.addCleanup(lambda: [self.kill(p) for p in [(lk.read_record('farmb') or {}).get('pid')] if isinstance(p, int)])
-        self.assertEqual((code, r['status'], r['check_status'], r['cleanup']['result'], r['cleanup']['blocker']),
-                         (4, 'blocked', 'ok', 'unresolved', 'cleanup-holder'))
+        self.assertEqual((code, r['status'], r['check_status'], r['cleanup']['result'], r['cleanup']['released']),
+                         (4, 'blocked', 'ok', 'unresolved', True))
         listed = [x['pid'] for rc in r['cleanup']['receipts'] for x in (rc['survivors'] or {}).get('processes', ())]
         self.assertIn(survivor, listed)
-        with self.assertRaises(lk.BoardLocked):
-            self.take()
-        self.assertTrue(lk.is_cleanup_holder(lk.read_record('farmb')))
-        with self.assertRaisesRegex(lk.ReleaseRefused, 'not signalled: .* not proven ended: receipt .* pending'):
-            lk.release_token(token)      # its survivor still runs
-        self.kill(survivor)
-        deadline = time.monotonic() + 20
-        while True:
-            try:
-                lk.release_token(token)
-                break
-            except lk.ReleaseRefused:
-                self.assertLess(time.monotonic(), deadline)
-                time.sleep(0.05)
-        self.take()
-
-    def test_a_holder_whose_supervisor_died_is_never_released_by_token(self):
-        code, r, _ = self.finish(self.start('survivor'))
-        survivor = self.wait_for('survivor')
-        holder = lk.read_record('farmb')['pid']
-        self.addCleanup(self.kill, holder)
-        self.assertEqual((code, r['cleanup']['blocker']), (4, 'cleanup-holder'))
-        receipt = r['cleanup']['receipts'][0]
-        self.kill(receipt['supervisor']['pid'])
-        deadline = time.monotonic() + 10
-        while eng.hil_process.recheck(receipt) != 'unknown':
-            self.assertLess(time.monotonic(), deadline)
-            time.sleep(0.05)
-        self.kill(survivor)      # gone too, but nothing proves it any more
-        with self.assertRaisesRegex(lk.ReleaseRefused, 'not signalled: .* not proven ended: receipt .* unknown'):
-            lk.release_token(r['cleanup']['token'])
-        with self.assertRaises(lk.BoardLocked):
-            self.take()
+        self.take()                          # its survivor still runs; the board is not held for it
+        f = latest_failure(lk, 'farmb')
+        self.assertEqual(f['receipts'][0]['token'], r['cleanup']['receipts'][0]['token'])
 
 
 if __name__ == '__main__':

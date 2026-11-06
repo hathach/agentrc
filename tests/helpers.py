@@ -355,3 +355,14 @@ def load_arduino_fixture():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+def latest_failure(lock_module, board):
+    """The latest open failed cleanup of `board` in hil_lock's cleanup log, else None."""
+    failures = lock_module.open_cleanup_failures(board)
+    return failures[-1] if failures else None
+
+
+def taken_failure(fh):
+    """The latest open failed cleanup a take found (its handle's cleanup_failures), else None."""
+    return fh.cleanup_failures[-1] if fh.cleanup_failures else None

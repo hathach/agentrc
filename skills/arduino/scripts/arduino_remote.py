@@ -353,17 +353,21 @@ def cmd_session_close(a):
     tree = core.load_attempt(P.ROOT, runs(), a.run_id)
     rc = rig(tree, session_argv(s, 'restore', ['--bundle', RESTORE_BUNDLE, '--build-record', s['restoreRecord'],
                                                '--release'], []))
-    closed = rc in (0, H.NOT_HELD)
+    # only these codes confirm the hold is gone; any other, an ssh failure included, may leave it standing
+    closed = rc in (0, H.RESTORE_FAILED, H.NOT_HELD)
     core.write_json(session_path(a.run_id), {**s, 'held': not closed, 'closed': closed})
     out = {'runId': a.run_id, 'board': s['board'], 'closed': closed, 'restoreExit': rc}
     if rc == H.NOT_HELD:
         out['note'] = ("the rig holds the board under this session's reason no more (an earlier restore released it, "
                        'or its holder died): closed, the restore unconfirmed')
+    elif rc == H.RESTORE_FAILED:
+        out['note'] = ("closed and released, the restore failed: its JSON above, and the board's cleanup log on the "
+                       'rig, which the next task on the board reports')
     elif rc:
-        out['note'] = ('not released: the restore or the release failed (its JSON above, or no answer from the rig); '
-                       'rerun session close, and recover under the hold only if it keeps failing')
+        out['note'] = ('not closed: the release did not complete (its JSON above, or no answer from the rig); rerun '
+                       'session close')
     print(json.dumps(out))
-    return 0 if closed else rc
+    return 0 if rc in (0, H.NOT_HELD) else rc
 
 
 def parse(argv):
