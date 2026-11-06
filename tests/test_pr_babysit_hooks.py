@@ -143,6 +143,11 @@ def setUpModule():
 ENTRY = ("# -*- coding: utf-8 -*-\nimport re\nimport sys\nfrom pre_commit.main import main\n"
          "if __name__ == '__main__':\n    sys.argv[0] = re.sub(r'(-script\\.pyw|\\.exe)?$', '', sys.argv[0])\n"
          "    sys.exit(main())\n")
+# What pip 25.2 and 26.0 on write instead (wheel.py PipScriptMaker), the latter CI's pip.
+PIP_ENTRIES = ("import sys\nfrom pre_commit.main import main\nif __name__ == '__main__':\n"
+               "    if sys.argv[0].endswith('.exe'):\n        sys.argv[0] = sys.argv[0][:-4]\n    sys.exit(main())\n",
+               "import sys\nfrom pre_commit.main import main\nif __name__ == '__main__':\n"
+               "    sys.argv[0] = sys.argv[0].removesuffix('.exe')\n    sys.exit(main())\n")
 # A wrapper doing more before it calls main(): only it runs that.
 WRAPPER = "import os, sys\nos.environ['REQUIRED_CHECK'] = 'yes'\nfrom pre_commit.main import main\nsys.exit(main())\n"
 
@@ -1453,9 +1458,11 @@ class PreCommitPythonTest(unittest.TestCase):
 
     def test_only_an_entry_calling_pre_commits_main_as_pip_writes_it_is_stood_in_for(self):
         # installer (distro packages) writes the same script with double quotes, its coding line optional
-        for body in (ENTRY.replace("'", '"'), ENTRY.split('\n', 1)[1], ENTRY.replace('\n', '\r\n')):
+        for body in (ENTRY.replace("'", '"'), ENTRY.split('\n', 1)[1], ENTRY.replace('\n', '\r\n'), *PIP_ENTRIES):
             with self.subTest(body):
                 self.assertIsNotNone(self.entry(b'#!/usr/bin/python3', body)[0])
+        for body in PIP_ENTRIES:
+            self.assertIsNotNone(self.launcher(b'#!C:\\Python313\\python.exe\r\n', body)[0], body)
         for body in (WRAPPER, ENTRY + 'print(1)\n', ENTRY.replace('main()', 'main(["run"])'), '',
                      ENTRY.replace("== '__main__'", '== "__main__\''), ENTRY + ' ' * 4096 + 'def (\n'):
             with self.subTest(body):

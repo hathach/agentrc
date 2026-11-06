@@ -115,9 +115,16 @@ LAUNCHER_SHEBANG = re.compile(rb'#!([^\r\n]+)\r?\n(?=PK\x03\x04)')
 # distlib's: the only entry hook_runner.py stands in for, as it does nothing else; a wrapper may set up more.
 ENTRY_SCRIPT = ("import re\nimport sys\nfrom pre_commit.main import main\nif __name__ == '__main__':\n"
                 "    sys.argv[0] = re.sub(r'(-script\\.pyw|\\.exe)?$', '', sys.argv[0])\n    sys.exit(main())\n")
-# Each exact form of it an installer writes: distlib's quotes or installer's, a coding line or not, LF or CRLF.
+# pip's own template in place of distlib's (wheel.py PipScriptMaker), from pip 25.2 and from 26.0; the same in the
+# __main__.py of its Windows launcher.
+PIP_ENTRY_SCRIPTS = (
+    "import sys\nfrom pre_commit.main import main\nif __name__ == '__main__':\n"
+    "    if sys.argv[0].endswith('.exe'):\n        sys.argv[0] = sys.argv[0][:-4]\n    sys.exit(main())\n",
+    "import sys\nfrom pre_commit.main import main\nif __name__ == '__main__':\n"
+    "    sys.argv[0] = sys.argv[0].removesuffix('.exe')\n    sys.exit(main())\n")
+# Each exact form of them an installer writes: distlib's quotes or installer's, a coding line or not, LF or CRLF.
 ENTRY_SCRIPTS = {(coding + body).replace('\n', eol).encode()
-                 for body in (ENTRY_SCRIPT, ENTRY_SCRIPT.replace("'", '"'))
+                 for body in (ENTRY_SCRIPT, ENTRY_SCRIPT.replace("'", '"'), *PIP_ENTRY_SCRIPTS)
                  for coding in ('', '# -*- coding: utf-8 -*-\n') for eol in ('\n', '\r\n')}
 # Bytes past which an entry script is no standard one.
 ENTRY_MAX = 1024
