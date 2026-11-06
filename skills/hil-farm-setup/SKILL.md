@@ -1,11 +1,11 @@
 ---
 name: hil-farm-setup
 description: >-
-  Provision, update or check a Debian 13 HIL farm host for TinyUSB, TinyUF2, Arduino TinyUSB and nRF52 bootloader CI - GitHub Actions
-  runners with pinned flashing tools, udev rules, board locks, a runner firewall and the Renesas uPD720201 firmware -
-  from a root-owned checkout and the host's file in `hosts/`. Use when rebuilding a farm host, adding or registering a
-  runner, bumping a pinned tool (openocd, J-Link, picotool, STM32CubeProgrammer, the actions runner), or when verify.sh
-  or a runner hold needs judging.
+  Provision, update or check a Debian 13 HIL farm host for TinyUSB, TinyUF2, Arduino TinyUSB and nRF52 bootloader CI -
+  GitHub Actions runners with pinned flashing tools, udev rules, board locks, a runner firewall and the Renesas
+  uPD720201 firmware - from a root-owned checkout and the host's file in `hosts/`. Use when rebuilding a farm host,
+  adding or registering a runner, bumping a pinned tool (openocd, J-Link, picotool, STM32CubeProgrammer, the actions
+  runner), or when verify.sh or a runner hold needs judging.
 ---
 
 # HIL farm setup
