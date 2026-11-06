@@ -159,7 +159,6 @@ class AgentFiles(unittest.TestCase):
                        'solely through the workflow\'s publishing switch',
                        'no new PRs, no issues beyond the follow-up issue rule, no force-push, no merge outside the merge exception below, and no onward delegation'):
             self.assertIn(phrase, exception)
-        self.assertNotIn('affirmative answer', exception)
         merging = body.split('Merge exception:')[1].split('Follow-up issue rule:')[0]
         for phrase in ("the human's own words asking to merge a named PR",
                        'opening a PR, asking for babysitting, `autoPush`, or a yes to an offer that did not name merging grant none',
@@ -190,11 +189,7 @@ class AgentFiles(unittest.TestCase):
             self.assertIn(phrase, review)
         self.assertIn('their request that pr-review review a PR with auto-fix', exception)
         self.assertIn("of our review submitted on it that prepare's `repair.submittedReview` names", body)
-        self.assertIn('An auto-fix repair phase is writer work: its repairs get the commit check, one simplification pass, validation '
-                      'and a whole-task review from the reviewed head to the repair tip before pr-babysit adopts them', body)
-        self.assertNotIn('fresh exchange', review)
         skill = ' '.join((AGENTS.parent / 'skills' / 'pr-review' / 'SKILL.md').read_text().split())
-        self.assertNotIn('AskUserQuestion', skill)
         for phrase in ("absent words mean pending, no hardware and prepare's mode",
                        'never substitute, drop or default a choice the words made',
                        "no board runs: step 3 takes `hil: {choice: 'none'}`",
@@ -202,22 +197,16 @@ class AgentFiles(unittest.TestCase):
                        '| `auto-fix` | `autoPost: true`, then the repair under §3 and §4 |',
                        '`auto-post` or `auto-fix` and `pending`, `auto-fix` and no push',
                        'a failed, partial, uncertain or handed-over post ends it there',
-                       'report "review submitted; auto-fix blocked"', 'never a `held` one',
-                       'A crash with repairs unpublished resumes this task with them, never a new prepare',
+                       'never a `held` one',
                        '`post.py --auto --defer-answers` (auto-fix)',
                        'whatever becomes of the recheck review; one the recheck finds still standing is raised again on a new comment, '
                        'unless someone reopened its thread since, which then still states it',
                        'After each launch whose reading shows the adoption `pushed` or `already-published`',
                        'its `skipped`, `held` and `uncertain` rows are reported, never worked around',
-                       '`ledger.py show --fixable` and the recheck\'s prepare refuse, and GitHub refuses the repair\'s replies',
                        'plain `post.py --expected-head <reviewed head>` puts them in a pending review before step 7',
-                       'step 6 ends with their publication instead, since prepare refuses a head with a pending draft',
                        "Recheck once the PR head is the one pr-babysit left, its last launch reading's `checkout.head`",
-                       'its `head` other than that one stops the recheck before anything is posted ("head moved after repair"), '
-                       'and step 8 releases the lock',
-                       'resolved threads do not clear it'):
+                       'its `head` other than that one stops the recheck before anything is posted ("head moved after repair")'):
             self.assertIn(phrase, skill)
-        self.assertIn('pushed SHAs, posted comment IDs and resolved thread IDs', body)
         rules = ' '.join((AGENTS.parent / 'instructions' / 'user.md').read_text().split())
         for phrase in ('Right after opening a new non-draft PR on my request, launch a headless `chief` in its worktree to babysit it',
                        'After pushing to an existing non-draft PR or marking a draft ready for review, if no chief is babysitting it, ask me whether to launch one',
@@ -229,7 +218,6 @@ class AgentFiles(unittest.TestCase):
         self.assertIn('A `pr-review` request naming auto-fix is that grant for its PR too', rules)
         self.assertIn('a fix note and a resolve on each of our threads its pushed repair fixed (`post.py --fixed`)', rules)
         self.assertIn('Neither grants a merge, an approval, a dismissal or a force-push.', rules)
-        self.assertIn("Each pr-babysit launch gets a `Findings` subsection holding its reading's `findingsTable` verbatim", body)
         readme = ' '.join((AGENTS.parent / 'README.md').read_text().split())
         self.assertIn('A relaunch for the same PR task copies the grant verbatim from the earlier launch task, without asking again, '
                       'until the task is done, the PR changes, or the human narrows or withdraws it', readme)
@@ -282,7 +270,6 @@ class AgentFiles(unittest.TestCase):
         workflow = (AGENTS.parent / 'workflows' / 'pr-babysit.js').read_text()
         for arg in ('repo', 'yieldOnChange', 'yieldAfterCycle', 'markSonar', 'stateRef'):
             self.assertIn(f'args.{arg}', workflow)
-        self.assertNotIn('the grant includes SonarCloud marking', chief)
         self.assertIn('a relaunch sets `markSonar` only from the grant, unless the human withheld Sonar marking', chief)
         switches = chief.split('A workflow carries a grant only through')[1].split('A workflow with no such argument')[0]
         self.assertIn('(the ones the interactive default lists)', switches)

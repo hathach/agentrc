@@ -63,8 +63,8 @@ head's CI summary again, the checkout's real top, the repository and PR it
 checked, and the pins prepare recorded for that head (mode, merge base, scope
 base, groups, recheckFrom), for the caller to compare with its own.
 
-stdout ends with one JSON line; the full changed-path list and every check go
-to the facts file the line names, beside the ledger. {"error": ...}, exit 2,
+stdout ends with one JSON line; the full changed-path list, every check and `repair` go
+to the facts file the line names, beside the ledger, where ledger.py next reads them. {"error": ...}, exit 2,
 when a fact cannot be read or the pins disagree.
 """
 
@@ -76,7 +76,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from ledger import (ONLINE, last, ledger_dir, ledger_path, load, locked, publications, refuse_unsettled, repo_of, store,  # noqa: E402
+from ledger import (ONLINE, facts_path, last, ledger_path, load, locked, publications, refuse_unsettled, repo_of, store,  # noqa: E402
                     submitted_last)
 from post import sync  # noqa: E402
 
@@ -262,10 +262,6 @@ def remote_for(repo):
         if re.search(rf'[:/]{re.escape(repo)}(\.git)?/?$', url):
             return name
     raise Unusable(f'no remote of this checkout is {repo} (remotes: {", ".join(sorted(set(names))) or "none"})')
-
-
-def facts_path(repo, pr, head):
-    return ledger_dir(repo) / str(pr) / f'prepare-{head}.json'
 
 
 def ci_summary(repo, pr):
@@ -502,8 +498,8 @@ def prepare(a):
         facts.parent.mkdir(parents=True, exist_ok=True)
         pins = {'head': head, 'mergeBase': merge_base, 'scopeBase': scope_base, 'mode': mode, 'groups': groups,
                 'recheckFrom': a.recheck_from}
-        facts.write_text(json.dumps({**pins, 'changed': pr_paths, 'scope': scope, 'conflicts': conflicts, 'checks': checks},
-                                    indent=1) + '\n', encoding='utf-8')
+        facts.write_text(json.dumps({**pins, 'changed': pr_paths, 'scope': scope, 'conflicts': conflicts, 'checks': checks,
+                                     'repair': repair}, indent=1) + '\n', encoding='utf-8')
         # The selector reads one path a line: a path that line splitting breaks cannot go in the file.
         listing = ''.join(f'{p}\n' for p in pr_paths)
         changed_file = facts.with_name(f'changed-{head}.txt') if listing.splitlines() == pr_paths else None

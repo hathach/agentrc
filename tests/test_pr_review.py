@@ -2815,6 +2815,32 @@ class Repair(PostCase):
                                'user': {'login': author}})
         self.thread()['comments']['nodes'].append({'databaseId': 950})
 
+    def test_next_walks_an_auto_fix_from_the_submitted_review_through_its_fix_notes_to_the_recheck(self):
+        facts_file = Path(ledger.facts_path(REPO, PR, self.reviewed))
+        pins = json.loads(facts_file.read_text())
+        self.assertIsNone(pins['repair'], 'a prepare without --auto-fix pins no repair')
+        out = self.tmp / 'out.json'
+        nxt = lambda *extra: self.call(ledger, ['next', '--pr', str(PR), '--repo', REPO, '--head', self.reviewed,  # noqa: E731
+                                                '--review-output', str(out), *extra])
+        self.assertEqual(self.review()['output'], out.resolve().as_posix(), 'a saved review names the launch it came from')
+        self.assertEqual(nxt('--publish', 'auto-post')['step'], 'report')
+        self.assertEqual(nxt('--publish', 'auto-fix')['step'], 'blocked', 'auto-fix words on a prepare without --auto-fix')
+        facts_file.write_text(json.dumps({**pins, 'repair': {'state': 'available', 'why': 'push access'}}))
+        manifest, reading = self.tmp / 'fixed.json', self.tmp / 'reading.json'
+        manifest.write_text(json.dumps({'reviewedHead': self.reviewed, 'findings': [self.row()]}))
+        reading.write_text('progress\n' + json.dumps({'result': {'pass': True}, 'receipts': {'adoption': {'publication': 'pushed'}},
+                                                       'checkout': {'head': self.fixed_head}, 'stateRef': {'digest': 'L1'}}) + '\n')
+        got = nxt('--publish', 'auto-fix', '--manifest', str(manifest), '--babysit-reading', str(reading), '--token', 'ab12')
+        self.assertEqual((got['step'], got['argv'][2:]), ('fixed', ['--expected-head', self.fixed_head, '--fixed', str(manifest),
+                                                                    '--launch', 'L1', '--pr', str(PR), '--repo', REPO]))
+        self.assertEqual(Path(got['argv'][1]).name, 'post.py')
+        self.assertEqual(self.call(post, got['argv'][2:])['status'], 'repaired')
+        self.assertEqual(self.review()['fixedLaunches'], ['L1'])
+        got = nxt('--publish', 'auto-fix', '--manifest', str(manifest), '--babysit-reading', str(reading), '--token', 'ab12')
+        self.assertEqual((got['step'], Path(got['argv'][1]).name, got['argv'][2:]),
+                         ('recheck', 'prepare.py', ['--recheck-from', self.reviewed, '--token', 'ab12', '--pr', str(PR), '--repo', REPO]))
+
+
     def test_a_long_note_is_posted_whole(self):
         note = ' '.join(['word'] * 70)
         self.assertEqual(self.fixed(self.row(note=note))['status'], 'repaired')
@@ -3134,6 +3160,222 @@ class Repair(PostCase):
         self.gh.gh = orig
         self.assertEqual(self.review()['repairs'][0]['replyId'] in ledger.answered_ids(json.loads(Path(self.p['ledger']).read_text())), True)
 
+
+R, N, X = '1' * 40, '2' * 40, '3' * 40  # the reviewed head, the head a repair left, any other head
+AVAILABLE, UNAVAILABLE = {'state': 'available', 'why': 'push access'}, {'state': 'unavailable', 'why': 'no push access'}
+DISPUTE = {'key': 'k1', 'judgedHead': R}
+
+
+def outcome(head=R, status='reviewed', mode='full', recheck_from=None, path='out.json', answer='conceded'):
+    """A launch's output file; a discussion judges one reply on pr7-f1, answering it unless answer is None."""
+    findings = ([{'id': 'pr7-f1', 'status': 'open', 'disputes': [{**DISPUTE, 'judgedHead': head,
+                                                                  **({'answer': {'body': answer}} if answer else {})}]}]
+                if mode == 'discussion' else [])
+    return {'path': path, 'result': {'status': status, 'reason': 'why', 'pr': PR, 'head': head, 'mode': mode,
+                                     'recheckFrom': recheck_from, 'findings': findings}}
+
+
+def pub(head=R, status='posted', review=None, sent=None, bundle=None, launches=(), answers_of=None, legacy=False):
+    """A review of ours on `head`, saved from launch `review` (legacy: before saves recorded it); bundle, the status of
+    the answers an auto-fix deferred on it; answers_of, the discussion merged into it and its answer publication."""
+    got = sent or ({'submitted': True} if status == 'posted' else {})
+    r = {'head': head, 'status': status, 'receipts': {'review': got} if got else {}, 'findings': [], 'draft': {'digest': 'd'}}
+    if review and not legacy:
+        r['output'] = review['path']
+    if bundle:
+        r['answerPublications'] = [{'head': head, 'answers': [['pr7-f1', 'a']], 'status': bundle, 'auto': True,
+                                    'receipts': {'review': {'verified': True}} if bundle != 'pending' else {}, 'draft': {'digest': 'b'}}]
+    if answers_of:
+        d = answers_of['result']['findings'][0]['disputes'][0]
+        r['findings'] = [{'id': 'pr7-f1', 'status': 'open', 'disputes': [d]}]
+        r['discussions'] = [answers_of['path']]
+        if d.get('answer'):
+            r['answerPublications'] = [{'head': head, 'answers': [['pr7-f1', ledger.digest(d['answer']['body'])]], 'status': 'pending',
+                                        'receipts': {}, 'draft': {'digest': 'c'}, 'output': answers_of['path']}]
+    if launches:
+        r['fixedLaunches'] = list(launches)
+    return r
+
+
+MANIFEST = {'path': 'fixed.json', 'reviewedHead': R, 'findings': [{'id': 'pr7-f1'}]}
+
+
+def reading(left=N, passed=True, adoption=None, reason=None, launch='L1'):
+    return {'result': {'pass': passed, 'reason': reason}, 'receipts': {'adoption': adoption and {'publication': adoption}},
+            'checkout': {'head': left} if left else None, 'stateRef': {'outputFile': 'b.json', 'digest': launch}}
+
+
+FULL, SAME, SAME_NONE = outcome(), outcome(mode='discussion'), outcome(mode='discussion', answer=None)
+RECHECK, RECHECK_SAME = outcome(N, recheck_from=R), outcome(R, mode='discussion', recheck_from=R)
+POST = ['post.py', '--expected-head']
+FIX = {'publish': 'auto-fix', 'repair': AVAILABLE, 'review': FULL}
+# (name, next_step's inputs, (step, postMode, argv)): one row per branch of the recipe's steps 3 to 6.4.
+TRANSITIONS = [
+    ('no prepare facts for the head', {'facts': None}, ('blocked', None, None)),
+    ('a closed PR', {'state': 'CLOSED'}, ('report', None, None)),
+    ('auto-fix words on a prepare without --auto-fix', {'publish': 'auto-fix'}, ('blocked', None, None)),
+    ('pending words on a prepare with --auto-fix', {'repair': AVAILABLE}, ('blocked', None, None)),
+    ('nothing launched yet', {}, ('review', 'pending', None)),
+    ('the head moved before the review', {'live': X, 'publish': 'auto-post'}, ('report', None, None)),
+    ('a launch that did not review', {'review': outcome(status='blocked')}, ('report', None, None)),
+    ('an empty launch output', {'review': {'path': 'out.json', 'result': None}}, ('report', None, None)),
+    ('an earlier phase\'s output is not this one\'s', {'review': outcome(X)}, ('review', 'pending', None)),
+    ('a reviewed launch not saved yet', {'review': FULL}, ('review', 'pending', ['ledger.py', 'save', '--output', 'out.json'])),
+    ('a second review of a posted head needs the request\'s words', {'review': FULL, 'reviews': [pub(review=outcome(path='old.json'))]},
+     ('review', 'pending', None)),
+    ('the same result from another launch is still this launch\'s to save', {'publish': 'auto-post', 'review': FULL,
+                                                                            'reviews': [pub(review=outcome(path='old.json'))]},
+     ('review', 'auto', None)),
+    ('a draft saved before saves recorded their launch: prepare left none, so it is this run\'s',
+     {'review': FULL, 'reviews': [pub(status='pending', review=FULL, legacy=True)]}, ('post', 'pending', POST + [R])),
+    ('a posted review saved before saves recorded their launch', {'review': FULL, 'reviews': [pub(review=FULL, legacy=True)]},
+     ('blocked', None, None)),
+    ('pending: the saved draft', {'review': FULL, 'reviews': [pub(status='pending', review=FULL)]}, ('post', 'pending', POST + [R])),
+    ('auto-post: the saved draft', {'publish': 'auto-post', 'review': FULL, 'reviews': [pub(status='pending', review=FULL)]},
+     ('post', 'auto', POST + [R, '--auto'])),
+    ('auto-fix: the saved draft', {**FIX, 'reviews': [pub(status='pending', review=FULL)]},
+     ('post', 'auto-defer', POST + [R, '--auto', '--defer-answers'])),
+    ('a discussion not saved yet', {'mode': 'same', 'review': SAME, 'reviews': [pub()]},
+     ('review', 'pending', ['ledger.py', 'save', '--output', 'out.json'])),
+    ('a discussion with no dispute record, a regrade, not saved yet',
+     {'mode': 'same', 'review': {**SAME_NONE, 'result': {**SAME_NONE['result'], 'findings': [{'id': 'pr7-f1', 'severity': 'low'}]}},
+      'reviews': [pub()]}, ('review', 'pending', ['ledger.py', 'save', '--output', 'out.json'])),
+    ('the same answer from an earlier discussion is not this one\'s publication',
+     {'mode': 'same', 'review': SAME, 'reviews': [{**pub(answers_of=SAME), 'discussions': ['old.json', 'out.json'], 'answerPublications': [
+         {**pub(answers_of=SAME)['answerPublications'][0], 'status': 'posted', 'output': 'old.json', 'receipts': {'review': {'verified': True}}},
+         pub(answers_of=SAME)['answerPublications'][0]]}]},
+     ('post', 'pending', POST + [R])),
+    ('a discussion posted before saves recorded their launch may be this one',
+     {'mode': 'same', 'review': SAME, 'reviews': [{**pub(answers_of=SAME), 'discussions': [], 'answerPublications': [
+         {k: v for k, v in pub(answers_of=SAME)['answerPublications'][0].items() if k != 'output'} | {
+             'status': 'posted', 'receipts': {'review': {'verified': True}}}]}]},
+     ('blocked', None, None)),
+    ('a discussion always posts plain', {'publish': 'auto-post', 'mode': 'same', 'review': SAME, 'reviews': [pub(answers_of=SAME)]},
+     ('post', 'pending', POST + [R])),
+    ('a discussion with no answer', {'mode': 'same', 'review': SAME_NONE, 'reviews': [pub(answers_of=SAME_NONE)]}, ('report', None, None)),
+    ('a post GitHub refused', {'review': FULL, 'reviews': [pub(status='pending', review=FULL, sent={'sent': False})]}, ('report', None, None)),
+    ('auto-fix: a handed-over post ends it', {**FIX, 'reviews': [pub(status='drafted', review=FULL, sent={'handedOver': 'held text'})]},
+     ('report', None, None)),
+    ('auto-fix: an uncertain post ends it', {**FIX, 'reviews': [pub(status='uncertain', review=FULL, sent={'sent': True})]},
+     ('report', None, None)),
+    ('auto-post: submitted', {'publish': 'auto-post', 'review': FULL, 'reviews': [pub(review=FULL)], 'token': 'ab'},
+     ('report', None, ['prepare.py', '--release', '--token', 'ab'])),
+    ('auto-fix blocked', {**FIX, 'repair': UNAVAILABLE, 'reviews': [pub(review=FULL)]}, ('report', None, None)),
+    ('auto-fix blocked publishes its deferred answers', {**FIX, 'repair': UNAVAILABLE, 'reviews': [pub(review=FULL, bundle='pending')]},
+     ('publish-answers', 'pending', POST + [R])),
+    ('head moved before repair: the answers wait', {**FIX, 'live': X, 'reviews': [pub(review=FULL, bundle='pending')]}, ('report', None, None)),
+    ('auto-fix: repair', {**FIX, 'reviews': [pub(review=FULL)]}, ('repair', None, None)),
+    ('auto-fix: the repairs go to pr-babysit', {**FIX, 'reviews': [pub(review=FULL)], 'manifest': MANIFEST}, ('babysit', None, None)),
+    ('a manifest for another review', {**FIX, 'reviews': [pub(review=FULL)], 'manifest': {**MANIFEST, 'reviewedHead': X}},
+     ('blocked', None, None)),
+    ('a reading without the manifest', {**FIX, 'reviews': [pub(review=FULL)], 'reading': reading(), 'live': N}, ('blocked', None, None)),
+    ('the adoption pushed: fix notes', {**FIX, 'reviews': [pub(review=FULL)], 'manifest': MANIFEST, 'live': N,
+                                        'reading': reading(passed=False, adoption='already-published', reason='yielded')},
+     ('fixed', None, POST + [N, '--fixed', 'fixed.json', '--launch', 'L1'])),
+    ('fix notes again after a later launch shows the adoption, on the same head', {**FIX, 'live': N, 'manifest': MANIFEST,
+                                                                                   'reviews': [pub(review=FULL, launches=['L1'])],
+                                                                                   'reading': reading(adoption='already-published', launch='L2')},
+     ('fixed', None, POST + [N, '--fixed', 'fixed.json', '--launch', 'L2'])),
+    ('a reading naming no launch', {**FIX, 'reviews': [pub(review=FULL)], 'manifest': MANIFEST, 'live': N,
+                                    'reading': reading(adoption='pushed', launch=None)}, ('blocked', None, None)),
+    ('fix notes done, the launch yielded: relaunch', {**FIX, 'live': N, 'reviews': [pub(review=FULL, launches=['L1'])], 'manifest': MANIFEST,
+                                                      'reading': reading(passed=False, adoption='pushed', reason='yielded')},
+     ('babysit', None, None)),
+    ('a launch that threw: relaunch from its stateRef', {**FIX, 'live': N, 'reviews': [pub(review=FULL)], 'manifest': MANIFEST,
+                                                         'reading': {**reading(), 'result': None}}, ('babysit', None, None)),
+    ('the cycle budget spent ends pr-babysit: the deferred answers', {**FIX, 'reviews': [pub(review=FULL, bundle='pending')], 'manifest': MANIFEST,
+                                                                      'reading': reading(R, passed=False, reason='budget-exhausted')},
+     ('publish-answers', 'pending', POST + [R])),
+    ('reviews pending on a spent budget ends pr-babysit', {**FIX, 'live': N, 'reviews': [pub(review=FULL)], 'manifest': MANIFEST,
+                                                           'reading': {**reading(passed=False, reason='reviews-pending'),
+                                                                       'budget': {'cyclesUsed': 3, 'maxCycles': 3}}},
+     ('report', None, None)),
+    ('an unchanged blocker ends pr-babysit', {**FIX, 'live': N, 'reviews': [pub(review=FULL)], 'manifest': MANIFEST,
+                                              'reading': reading(passed=False, reason='ci-red-rig-side')}, ('report', None, None)),
+    ('a stop the recipe does not place', {**FIX, 'live': N, 'reviews': [pub(review=FULL)], 'manifest': MANIFEST,
+                                          'reading': reading(passed=False, reason='wrong-head')}, ('blocked', None, None)),
+    ('no fix check verified: no fix notes', {**FIX, 'live': N, 'reviews': [pub(review=FULL)], 'manifest': {**MANIFEST, 'findings': []},
+                                             'reading': reading(adoption='pushed'), 'token': 'ab'},
+     ('recheck', None, ['prepare.py', '--recheck-from', R, '--token', 'ab'])),
+    ('a reading with no checkout', {**FIX, 'reviews': [pub(review=FULL)], 'manifest': MANIFEST, 'reading': reading(left=None)},
+     ('blocked', None, None)),
+    ('head moved after repair', {**FIX, 'live': X, 'reviews': [pub(review=FULL)], 'manifest': MANIFEST, 'reading': reading()},
+     ('report', None, None)),
+    ('pr-babysit left the reviewed head: the deferred answers', {**FIX, 'reviews': [pub(review=FULL, bundle='pending')], 'manifest': MANIFEST,
+                                                                 'reading': reading(left=R)}, ('publish-answers', 'pending', POST + [R])),
+    ('and once they are published, report', {**FIX, 'reviews': [pub(review=FULL, bundle='drafted')], 'manifest': MANIFEST,
+                                             'reading': reading(left=R)}, ('report', None, None)),
+    ('pr-babysit left the reviewed head, no answers: a same-head recheck', {**FIX, 'reviews': [pub(review=FULL)], 'manifest': MANIFEST,
+                                                                            'reading': reading(left=R)},
+     ('recheck', None, ['prepare.py', '--recheck-from', R])),
+    ('a reviewed head with our submitted review: repair from it', {'publish': 'auto-fix', 'mode': 'same', 'reviews': [pub()],
+                                                                   'repair': {**AVAILABLE, 'submittedReview': 9}}, ('repair', None, None)),
+    ('its deferred answers, auto-fix blocked', {'publish': 'auto-fix', 'mode': 'same', 'reviews': [pub(bundle='pending')],
+                                                'repair': {**UNAVAILABLE, 'submittedReview': 9, 'deferredAnswers': 1}},
+     ('publish-answers', 'pending', POST + [R])),
+    ('a reviewed head, auto-fix blocked: the discussion first', {'publish': 'auto-fix', 'mode': 'same', 'reviews': [pub()],
+                                                                 'repair': {**UNAVAILABLE, 'submittedReview': 9}}, ('review', 'pending', None)),
+    ('then auto-fix blocked', {'publish': 'auto-fix', 'mode': 'same', 'review': SAME, 'repair': {**UNAVAILABLE, 'submittedReview': 9},
+                               'reviews': [{**pub(answers_of=SAME), 'answerPublications': [
+                                   {**pub(answers_of=SAME)['answerPublications'][0], 'status': 'drafted',
+                                    'receipts': {'review': {'verified': True}}}]}]},
+     ('report', None, None)),
+    ('no submitted review: the discussion repairs nothing', {'publish': 'auto-fix', 'mode': 'same', 'review': SAME_NONE,
+                                                             'reviews': [pub(sent={'verified': True}, answers_of=SAME_NONE)],
+                                                             'repair': {**AVAILABLE, 'submittedReview': None, 'submittedWhy': 'not submitted'}},
+     ('report', None, None)),
+    ('recheck: pending words', {'recheck': R, 'head': N, 'reading': reading()}, ('blocked', None, None)),
+    ('recheck: no reading', {'publish': 'auto-fix', 'recheck': R, 'head': N}, ('blocked', None, None)),
+    ('recheck: the head moved after repair', {'publish': 'auto-fix', 'recheck': R, 'head': N, 'reading': reading(X)}, ('report', None, None)),
+    ('recheck: the review', {'publish': 'auto-fix', 'recheck': R, 'head': N, 'live': N, 'reading': reading(), 'mode': 'incremental',
+                             'review': FULL}, ('review', None, None)),
+    ('recheck: the ledger vouches, auto', {'publish': 'auto-fix', 'recheck': R, 'head': N, 'live': N, 'reading': reading(),
+                                           'mode': 'incremental', 'review': RECHECK, 'reviews': [pub(), pub(N, 'pending', RECHECK)],
+                                           'fixable': {'fix': [], 'held': [], 'autoPost': True}},
+     ('post', 'auto', POST + [N, '--auto'])),
+    ('recheck: held text, pending', {'publish': 'auto-fix', 'recheck': R, 'head': N, 'live': N, 'reading': reading(),
+                                     'mode': 'incremental', 'review': RECHECK, 'reviews': [pub(), pub(N, 'pending', RECHECK)],
+                                     'fixable': {'fix': [], 'held': [{'findingId': 'pr7-f1', 'why': 'edited'}], 'autoPost': False}},
+     ('post', 'pending', POST + [N])),
+    ('recheck: show --fixable refuses', {'publish': 'auto-fix', 'recheck': R, 'head': N, 'live': N, 'reading': reading(),
+                                         'mode': 'incremental', 'review': RECHECK, 'reviews': [pub(), pub(N, 'pending', RECHECK)],
+                                         'fixable': facts.Unusable('rerun threads.py')}, ('blocked', None, None)),
+    ('recheck: posted', {'publish': 'auto-fix', 'recheck': R, 'head': N, 'live': N, 'reading': reading(), 'mode': 'incremental',
+                         'review': RECHECK, 'reviews': [pub(), pub(N, review=RECHECK)]}, ('report', None, None)),
+    ('recheck on the same head: no new reply', {'publish': 'auto-fix', 'recheck': R, 'reading': reading(R), 'mode': 'same',
+                                                'review': outcome(status='nothing-new'), 'reviews': [pub()]}, ('report', None, None)),
+    ('recheck on the same head: replies, pending', {'publish': 'auto-fix', 'recheck': R, 'reading': reading(R), 'mode': 'same',
+                                                    'review': RECHECK_SAME, 'reviews': [pub(answers_of=RECHECK_SAME)]},
+     ('post', 'pending', POST + [R])),
+]
+
+
+class Next(unittest.TestCase):
+    """ledger.py next: the recipe's transitions, owned by next_step and read whole from this table."""
+
+    def run_row(self, publish='pending', head=R, mode='full', recheck=None, repair=None, facts=False, state='OPEN', live=R,
+                reviews=(), review=None, manifest=None, reading=None, fixable=None, token=None):
+        led = {'v': ledger.VERSION, 'repo': REPO, 'pr': PR, 'reviews': list(reviews)}
+        pins = None if facts is None else {'head': head, 'mode': mode, 'recheckFrom': recheck, 'repair': repair}
+
+        def fixable_now(h):
+            self.assertEqual(h, R, 'the recheck asks show --fixable of the reviewed head')
+            if isinstance(fixable, Exception):
+                raise fixable
+            return fixable
+        return ledger.next_step(led, pins, {'head': live, 'state': state}, publish, lambda s, *a: [s, *a], review, manifest, reading,
+                                fixable_now, token)
+
+    def test_each_transition(self):
+        for name, given, want in TRANSITIONS:
+            with self.subTest(name):
+                got = self.run_row(**given)
+                self.assertEqual((got['step'], got['postMode'], got['argv']), want, got['why'])
+                self.assertTrue(got['why'])
+
+    def test_every_step_is_reached(self):
+        steps = {want[0] for _, _, want in TRANSITIONS}
+        self.assertEqual(steps, {'review', 'post', 'repair', 'babysit', 'fixed', 'publish-answers', 'recheck', 'report', 'blocked'})
 
 if __name__ == '__main__':
     unittest.main()

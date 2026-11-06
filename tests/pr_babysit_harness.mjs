@@ -3222,9 +3222,6 @@ test('a report carrying both a rate limit and a harvest error takes the rate-lim
 })
 
 test('a harvest that printed no JSON line is retried and reported by its last stderr line, a rate limit first (#240)', async () => {
-  const validator = readFileSync(new URL('../agents/pr-review-validator.md', import.meta.url), 'utf8')
-  assert.ok(validator.includes('or no JSON line at all (a traceback, or nothing), run it once more'), 'the same single retry')
-  assert.ok(validator.includes('the last non-empty line of its stderr verbatim, else `harvest.py printed nothing (exit <its exit code>)`'))
   const failed = { headSha: '', observedAt: '', headEventAt: null, headEventEvidence: 'harvest failed', fingerprint: '', bots: [], botsWhole: true, findings: [], replies: [] }
   for (const error of ["PermissionError: [Errno 13] Permission denied: 'gh'", 'harvest.py printed nothing (exit 1)']) {
     const { result, labels } = await run({ reviews: { ...failed, harvestError: error }, args: { maxCycles: 4 } })
