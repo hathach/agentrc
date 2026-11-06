@@ -228,7 +228,10 @@ recovery stay the contract's. Linux only.
   A J-Link session can exit 0 with every command failed: `jlink_problem(op)`
   judges its last attempt, each command from its own output chunk against the
   command file it ran (`jlink_judgment`, from recorded transcripts; an
-  unknown command or output shape fails). `esptool_problem(op)` judges a
+  unknown command or output shape fails). `jlink_verify_differs(op)` names
+  the `verifybin` a session stopped at having read the target and found it
+  different, the one failure that proves something about the target; any
+  other failure gives None. `esptool_problem(op)` judges a
   `flash_esptool` by its last attempt's exit status and the known failures
   esptool exits 0 on (a refused reset, a skipped empty image),
   `esptool_runtime()` the esptool the flash and its helper sessions run (one

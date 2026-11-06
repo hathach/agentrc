@@ -71,6 +71,7 @@ REAP = 10   # agentrc hil_process.REAP_GRACE, per tracked child
 STEP_MAX = VERIFY_TIMEOUT + DETACH_WAIT + FLASH_TIMEOUT + VERIFY_TIMEOUT + ENUM_TIMEOUT + TEST_TIMEOUT + \
     4 * (REAP + SETTLE)
 CLEANUP_RESERVE = STEP_MAX   # the restore is one more such step
+BASE_MAX = 2 * VERIFY_TIMEOUT   # a base image's check and rewrite before a flash (ensure_base), added per step
 PENDING_KIND = 'arduino-hil'   # every Arduino library's: a board's pending children block all of them
 
 
@@ -237,6 +238,9 @@ def record_problems(rec, board, head, experimental_ok, where):
         why.append(f'it is for {rec["board"]}, not {board}')
     if rec['experimental'] and not experimental_ok:
         why.append('it is experimental: the battery and restore take clean records only')
+    want, have = sorted(B.P.BOARDS.get(board, {}).get('base') or ()), sorted((rec.get('base') or {}).get('files', {}))
+    if want != have:
+        why.append(f'its base image {have} is not the profile\'s {want}: rebuild it')
     if head is not None and rec['source']['head'] != head:
         why.append(f'it was built at {rec["source"]["head"][:12]}, the {where} is at {head[:12]}: rebuild it')
     return why
@@ -273,19 +277,53 @@ def admit(record_path, board, roster_path, run_dir, *, manifest=None, experiment
             raise Refused(f'{record_path}: {name} records a {s.get("image")} image, a {flasher} board flashes the '
                           f'{want}: rebuild against this roster')
         dest = Path(run_dir) / 'images' / name
-        dest.mkdir(parents=True, exist_ok=True)
         for rel, digest in s['sha256'].items():
-            src = Path(base or P.ROOT) / rel
-            data = src.read_bytes() if src.is_file() else None
-            if data is None or hashlib.sha256(data).hexdigest() != digest:
-                raise Refused(f'{rel} is missing or changed since the record')
-            (dest / Path(rel).name).write_bytes(data)
+            pinned_copy(Path(base or P.ROOT) / rel, digest, dest / Path(rel).name, rel)
         images[name] = {'elf': str(dest / Path(s['elf']).name),
                         'hex': str(dest / Path(s['hex']).name) if s.get('hex') else None,
                         'vidPid': s['vidPid'], 'sha256': s['sha256'], 'dir': str(dest),
                         'fqbn': s.get('fqbn', rec['fqbn']),
                         'segments': s.get('segments'), 'chip': rec.get('chip')}
+    if rec.get('base'):
+        base_image = admit_base(rec, board, Path(base or P.ROOT), Path(run_dir))
+        for image in images.values():
+            image['base'] = base_image
     return rec, images
+
+
+def pinned_copy(src, digest, dest, name):
+    """Copy src to dest once its bytes hash as `digest`, so the copy is the bytes checked; Refused naming `name`."""
+    data = src.read_bytes() if src.is_file() else None
+    if data is None or hashlib.sha256(data).hexdigest() != digest:
+        raise Refused(f'{name} is missing or changed since the record')
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(data)
+
+
+def admit_base(rec, board, root, run_dir):
+    """The record's base image prepared in run_dir/base: {'hex' (its runs outside the excluded ranges), 'bins'
+    [(start, file)], 'state' (set by ensure_base)}, parsed from the run dir's copies of its files once those hash as
+    recorded and their runs are the recorded segments; Refused otherwise."""
+    out = run_dir / 'base'
+    for rel_path, digest in rec['base']['files'].items():
+        pinned_copy(root / rel_path, digest, out / 'files' / rel_path, f'base image {rel_path}')
+    runs, why = B.base_runs(board, root=out / 'files')
+    if why or runs is None:
+        raise Refused(f'base image: {why or "the profile names none"}')
+    if [[s, s + len(d)] for s, d in runs] != rec['base']['segments']:
+        raise Refused('base image runs differ from the record\'s segments: rebuild it')
+    B.write_hex(runs, out / 'base.hex')
+    return {'hex': str(out / 'base.hex'), 'bins': write_bins(runs, out / 'base'), 'state': None}
+
+
+def write_bins(runs, prefix):
+    """[(start, file)]: each run as <prefix>-<start>.bin, what a verifybin compares."""
+    bins = []
+    for start, data in runs:
+        path = Path(f'{prefix}-{start:08x}.bin')
+        path.write_bytes(data)
+        bins.append((start, str(path)))
+    return bins
 
 
 # ---- tracked children and flashing
@@ -384,22 +422,54 @@ def flash(flasher, image, run_dir, tracker):
         return f'openocd transcript lacks {missing}' if missing else ''
     if not image['hex']:
         return 'no HEX for a J-Link flash'
+    if image.get('base'):
+        why = ensure_base(flasher, image['base'], run_dir, tracker)
+        if why:
+            return why
     op = A.flash.flash_jlink(flasher, image['hex'], timeout=FLASH_TIMEOUT, run=tracker.run, workdir=str(run_dir))
     tracker.check()
     why = A.flash.jlink_problem(op)
     if why:
         return f'J-Link flash: {why}'
-    cmds = []
-    for i, (addr, data) in enumerate(B.hex_runs(image['hex'])):
-        path = Path(run_dir) / f'verify-{Path(image["hex"]).stem}-{i}.bin'
-        path.write_bytes(data)
-        cmds.append(f'verifybin {path},{addr:#x}')
-    op = A.flash.run_jlink_commands(flasher, cmds + ['r', 'go'], interface='SWD', speed=4000, autoconnect=True,
+    bins = write_bins(B.hex_runs(image['hex']), Path(run_dir) / f'verify-{Path(image["hex"]).stem}')
+    op = jlink_session(flasher, [f'verifybin {path},{addr:#x}' for addr, path in bins] + ['r', 'go'], run_dir,
+                       tracker)
+    why = A.flash.jlink_problem(op)
+    return f'J-Link verify: {why}' if why else ''
+
+
+def jlink_session(flasher, cmds, run_dir, tracker):
+    op = A.flash.run_jlink_commands(flasher, cmds, interface='SWD', speed=4000, autoconnect=True,
                                     device=jlink_device(flasher), timeout=VERIFY_TIMEOUT, run=tracker.run,
                                     workdir=str(run_dir))
     tracker.check()
+    return op
+
+
+def ensure_base(flasher, base, run_dir, tracker):
+    """Check the board holds its base image (each run verified in place) and rewrite it only on a proven
+    difference, with no reset or go after it (the sketch's flash resets the target); '' or why it failed. A session
+    that proves nothing (a read failure, no connection) writes nothing. `state` names this check's outcome, None until
+    it has one (the dict is shared by every image and step)."""
+    base['state'] = None
+    verify = [f'verifybin {path},{start:#x}' for start, path in base['bins']]
+    op = jlink_session(flasher, ['halt', *verify], run_dir, tracker)
     why = A.flash.jlink_problem(op)
-    return f'J-Link verify: {why}' if why else ''
+    if not why:
+        base['state'] = 'matched'
+        return ''
+    differs = A.flash.jlink_verify_differs(op)
+    if not differs:
+        return f'base check: {why} (nothing written)'
+    at = differs.rsplit(',', 1)[1]
+    # loadfile resets the target unless told noreset, which needs the address its .hex form ignores (J-Link
+    # Commander, LoadFile)
+    op = jlink_session(flasher, ['halt', f'loadfile {base["hex"]} 0 noreset', *verify], run_dir, tracker)
+    why = A.flash.jlink_problem(op)
+    if why:
+        return f'base rewrite after the run at {at} differed: {why}'
+    base['state'] = f'rewritten: the run at {at} differed'
+    return ''
 
 
 def detach(name, board, vid_pid, tracker):
@@ -569,6 +639,11 @@ def console_tty(board, deadline):
     return node(probes[0], '*:*/tty/tty*', deadline)
 
 
+def base_state(image):
+    """The row field naming what the operation's base check did (None: it proved nothing), for a board with one."""
+    return {'base': image['base']['state']} if image.get('base') else {}
+
+
 def step(name, board, image, test, run_dir, tracker):
     """Flash the test's sketch, wait for the DUT to enumerate anew, run the host check. A dict row."""
     if role(name) == 'host':
@@ -577,14 +652,15 @@ def step(name, board, image, test, run_dir, tracker):
     vid_pid = image['vidPid']
     why, detached, dev = flash_and_enumerate(name, board, image, run_dir, tracker)
     if why:
-        return {'test': test, 'pass': False, 'detail': why, 'detach': detached}
+        return {'test': test, 'pass': False, 'detail': why, 'detach': detached, **base_state(image)}
     if not dev:
         others = [d['busport'] for d in devices(vid_pid)]
         return {'test': test, 'pass': False, 'detail': f'no {vid_pid} {dut_name(board)} enumerated anew within '
-                                                       f'{ENUM_TIMEOUT}s (that VID:PID at: {others})'}
+                                                       f'{ENUM_TIMEOUT}s (that VID:PID at: {others})',
+                **base_state(image)}
     ok, detail = run_test(test, dev, tracker, run_dir, board)
     return {'test': test, 'pass': ok, 'detail': detail, 'device': dev['busport'], 'detach': detached,
-            'seconds': round(time.monotonic() - started, 1)}
+            'seconds': round(time.monotonic() - started, 1), **base_state(image)}
 
 
 def run_test(test, dev, tracker, run_dir, board):
@@ -603,7 +679,7 @@ def restore(name, board, images, run_dir, tracker):
     sketch = restore_sketch(name)
     row = step(name, board, images[sketch], P.RESTORE_TEST[role(name)], run_dir, tracker)
     return {'pass': row['pass'], 'state': f'{sketch} restored' if row['pass'] else 'unknown',
-            'evidence': row['detail']}
+            'evidence': row['detail'], **({'base': row['base']} if 'base' in row else {})}
 
 
 # ---- the battery
@@ -692,8 +768,10 @@ def run_board(name, board, tests, record_path, roster_path, run_root, manifest):
                            'fqbns': {k: v['fqbn'] for k, v in images.items()},   # a core's sketches may differ
                            'driftedHeaders': sorted({h['counterpart'] for s in rec['sketches'].values()
                                                      for h in s.get('foreignHeaders', []) if not h['matches']})}
+        extra = BASE_MAX if rec.get('base') else 0   # each step and the restore may check and rewrite the base
+        budget, need = BOARD_BUDGET + (len(tests) + 1) * extra, STEP_MAX + CLEANUP_RESERVE + 2 * extra
         for test in tests:
-            if BOARD_BUDGET - (time.monotonic() - started) < STEP_MAX + CLEANUP_RESERVE:
+            if budget - (time.monotonic() - started) < need:
                 row['tests'].append({'test': test, 'pass': False, 'detail': 'not run: board budget left too small'})
                 continue
             row['ran'] = True
@@ -1126,15 +1204,17 @@ def flash_only(name, board, image, run_dir, tracker):
     what = written(board['flasher'], image)
     if role(name) == 'host':   # no DUT on this host's bus: the console shows what runs
         why = flash(board['flasher'], image, run_dir, tracker)
-        return {'pass': not why, 'detail': why or f'flashed {what} (a host board: read its console)'}
+        return {'pass': not why, 'detail': why or f'flashed {what} (a host board: read its console)',
+                **base_state(image)}
     why, detached, dev = flash_and_enumerate(name, board, image, run_dir, tracker)
     if why:
-        return {'pass': False, 'detail': why, 'detach': detached}
+        return {'pass': False, 'detail': why, 'detach': detached, **base_state(image)}
     if not dev:
         return {'pass': True, 'detail': f'flashed {what}; no {image["vidPid"]} {dut_name(board)} enumerated (the '
-                                        f'image may not run USB)'}
+                                        f'image may not run USB)', **base_state(image)}
     return {'pass': True, 'detail': f'flashed {what}; enumerated as {image["vidPid"]} at {dev["busport"]}',
-            'device': {'busport': dev['busport'], 'devnum': dev.get('devnum'), 'after': dev['after']}}
+            'device': {'busport': dev['busport'], 'devnum': dev.get('devnum'), 'after': dev['after']},
+            **base_state(image)}
 
 
 def cmd_commission(args):
@@ -1178,6 +1258,7 @@ def cmd_commission(args):
             if action == 'flash':
                 detach(args.board, board, image['vidPid'], tracker)
                 why = flash(board['flasher'], image, run_dir, tracker)
+                out.update(base_state(image))
             else:
                 detach(args.board, board, image['vidPid'], tracker)
                 why = reset(board['flasher'], tracker)

@@ -116,6 +116,18 @@ changes from a library:
   initialised, not at its gitlink or dirty (each one's own worktree, at any depth, whatever its `ignore` setting),
   `--experimental` included: a record's patch carries no submodule bytes. A record also refuses any untracked file.
   Foreign headers are those from another copy of the core (by `platform.txt` `name=`).
+- **Base image** (feature `base`): a rig board whose sketches run only above other firmware (an nRF52's MBR,
+  SoftDevice, bootloader and its settings) names those HEX files as `BOARDS[...]['base']`, with the address ranges
+  never touched as `base_exclude` (UICR). The record binds the files and their runs, which must lie outside the
+  board's span; the harness admits them with the record and, before every J-Link flash (battery, commissioning, a
+  manual flash or restore), verifies each run in place. Only a `verifybin` of the check's own script that read the
+  target after a clean `halt` and found it different is a difference: then the runs are rewritten and verified, with
+  no reset or go before the sketch's flash, and the row's `base` says `matched` or which run differed. A check that
+  proves nothing (no connection, a failed or partial read, a timeout) writes nothing and fails the step. A rewrite
+  may erase the rest of each flash page a run touches, so those pages must be the base's. Only runs are checked: a
+  word the boot reads that the HEX leaves unprogrammed (the MBR's bootloader address at 0xFF8) is a run of its
+  erased value in a profile HEX, or another image's bytes there pass as `matched`. The board's budget and each step's
+  reserve grow by a check and a rewrite. Through J-Link only: a record refuses a base on any other flasher.
 
 ## CI
 
@@ -147,4 +159,5 @@ user. The library's workflow and report comment are its own.
    HIL contracts.
 
 A core follows the same steps with its core-mode profile; its `agentrc_pin.py` copy also refuses engines without
-core mode (`'core'` missing from `arduino_build.PROFILE_FEATURES`), since `PROFILE_API` stays 1 for it.
+core mode (`'core'` missing from `arduino_build.PROFILE_FEATURES`), and one whose rig board has a base image without
+`'base'`, since `PROFILE_API` stays 1 for it.

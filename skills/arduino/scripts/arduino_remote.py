@@ -90,12 +90,13 @@ def head_of_clean_tree():
 
 
 def record_files(path, head, board, clean=True):
-    """The checkout-relative files a build record stages (itself, its images, an experimental record's patch),
-    refusing one the rig would refuse (H.record_problems)."""
+    """The checkout-relative files a build record stages (itself, its images, its base image's files, an
+    experimental record's patch), refusing one the rig would refuse (H.record_problems)."""
     try:
         rec = json.loads(Path(path).read_text())
         why = H.record_problems(rec, board, head, not clean, 'HEAD')
-        files = [rel(path), *(f for s in rec['sketches'].values() for f in s['sha256'])]
+        files = [rel(path), *(f for s in rec['sketches'].values() for f in s['sha256']),
+                 *(rec.get('base') or {}).get('files', {})]
     except (OSError, ValueError, KeyError, TypeError) as e:
         core.fail(f'build record {path}: {e!r}')
     if why:
@@ -125,6 +126,7 @@ def snapshot_records(into, records, bundle=None):
     digests = snapshot(into, [f for _, fs in records for f in fs], bundle=bundle)
     for rec, _ in records:
         pinned = {f: d for s in rec['sketches'].values() for f, d in s['sha256'].items()}
+        pinned.update((rec.get('base') or {}).get('files', {}))
         if rec.get('patch'):
             pinned[rec['patch']['path']] = rec['patch']['sha256']
         bad = [f for f, d in pinned.items() if digests.get(f'{bundle}/{f}' if bundle else f) != d]

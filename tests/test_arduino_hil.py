@@ -761,6 +761,126 @@ class Flash(Base):
         self.assertIn('unrecheckable', t.pending[-1]['receipt'])
 
 
+class BaseImage(Base):
+    """A rig board's base image: admitted with its record, checked before every J-Link flash, rewritten only on a
+    proven difference."""
+
+    def setUp(self):
+        super().setUp()
+        H.B.write_hex([(0x1000, bytes(range(32)))], self.root / 'sd.hex')
+        H.B.write_hex([(0x10001014, bytes(8))], self.root / 'uicr.hex')
+        self.BP.BOARDS['rig_jlink'].update(base=('sd.hex', 'uicr.hex'), base_exclude=((0x10001000, 0x10002000),))
+        self.flasher = {'name': 'jlink', 'uid': '123456', 'args': '-device X'}
+
+    def base_record(self, **over):
+        files = {f: sha((self.root / f).read_bytes()) for f in ('sd.hex', 'uicr.hex')}
+        return self.record(base={'files': files, 'segments': [[0x1000, 0x1020]], **over})
+
+    def admit(self, rec):
+        with mock.patch.object(H, 'git_identity', return_value=('abc', '')):
+            return H.admit(rec, 'rig_jlink', self.roster, self.dir / 'run')
+
+    def test_admission_writes_the_runs_it_checks_and_never_the_excluded_ones(self):
+        _, images = self.admit(self.base_record())
+        base = images['echo']['base']
+        self.assertEqual(H.B.hex_runs(base['hex']), [(0x1000, bytes(range(32)))])
+        self.assertEqual([(a, Path(f).read_bytes()) for a, f in base['bins']], [(0x1000, bytes(range(32)))])
+        self.assertIsNone(base['state'])
+
+    def test_admission_refuses_a_base_that_is_not_the_records(self):
+        with self.assertRaisesRegex(H.Refused, 'runs differ from the record'):
+            self.admit(self.base_record(segments=[[0x1000, 0x1010]]))
+        rec = self.base_record()
+        H.B.write_hex([(0x1000, bytes(32))], self.root / 'sd.hex')
+        with self.assertRaisesRegex(H.Refused, 'base image sd.hex is missing or changed since the record'):
+            self.admit(rec)
+        with self.assertRaisesRegex(H.Refused, r"its base image \[\] is not the profile's \['sd.hex', 'uicr.hex'\]"):
+            self.admit(self.record())
+        H.B.write_hex([(0x1000, bytes(range(32)))], self.root / 'sd.hex')
+        rec = self.base_record()
+        del self.BP.BOARDS['rig_jlink']['base']
+        with self.assertRaisesRegex(H.Refused, r"is not the profile's \[\]: rebuild it"):
+            self.admit(rec)
+
+    def test_admission_refuses_a_base_with_nothing_to_verify(self):
+        (self.root / 'sd.hex').write_text(':00000001FF\n')   # EOF only; uicr.hex's run is all excluded
+        with self.assertRaisesRegex(H.Refused, 'base image: sd.hex, uicr.hex: no runs outside the excluded ranges'):
+            self.admit(self.base_record(segments=[]))
+
+    def sessions(self, *problems):
+        """run_jlink_commands' scripts, each session judged by the next of `problems`."""
+        self.A.flash.jlink_problem.side_effect = list(problems)
+        self.A.flash.run_jlink_commands.side_effect = lambda f, cmds, **kw: mock.Mock(cmds=cmds)
+        return lambda: [c[0][1] for c in self.A.flash.run_jlink_commands.call_args_list]
+
+    def base(self):
+        return {'hex': 'b.hex', 'bins': [(0x1000, 'b-1000.bin')], 'state': None}
+
+    def test_a_matching_base_is_left_alone(self):
+        base, scripts = self.base(), self.sessions('')
+        self.assertEqual(H.ensure_base(self.flasher, base, self.dir, mock.Mock()), '')
+        self.assertEqual((scripts(), base['state']), ([['halt', 'verifybin b-1000.bin,0x1000']], 'matched'))
+
+    def test_a_proven_difference_rewrites_the_base_with_no_reset_or_go(self):
+        base, scripts = self.base(), self.sessions('stopped', '')
+        self.A.flash.jlink_verify_differs.return_value = 'verifybin b-1000.bin,0x1000'
+        self.assertEqual(H.ensure_base(self.flasher, base, self.dir, mock.Mock()), '')
+        self.assertEqual(scripts()[1], ['halt', 'loadfile b.hex 0 noreset', 'verifybin b-1000.bin,0x1000'])
+        self.assertEqual(base['state'], 'rewritten: the run at 0x1000 differed')
+        self.sessions('stopped', 'loadfile failed')
+        self.assertEqual(H.ensure_base(self.flasher, self.base(), self.dir, mock.Mock()),
+                         'base rewrite after the run at 0x1000 differed: loadfile failed')
+
+    def test_a_check_that_proves_nothing_writes_nothing(self):
+        base, scripts = self.base(), self.sessions('JLinkExe exit 1')
+        self.A.flash.jlink_verify_differs.return_value = None
+        why = H.ensure_base(self.flasher, base, self.dir, mock.Mock())
+        self.assertEqual((why, len(scripts()), base['state']),
+                         ('base check: JLinkExe exit 1 (nothing written)', 1, None))
+
+    def test_admission_parses_the_bytes_it_hashed(self):
+        seen = []
+        real = H.B.base_runs
+        with mock.patch.object(H.B, 'base_runs', lambda b, root: seen.append(root) or real(b, root=root)):
+            self.admit(self.base_record())
+        self.assertEqual(seen, [self.dir / 'run' / 'base' / 'files'])   # the run dir's copies, never the checkout
+
+    def test_a_jlink_flash_checks_the_base_first_and_the_row_names_its_state(self):
+        calls = []
+        with mock.patch.object(H, 'ensure_base', lambda f, b, d, t: calls.append('base') or 'base check: x'):
+            why = H.flash(self.flasher, {'hex': 'a.hex', 'base': {'state': None}}, self.dir, mock.Mock())
+        self.assertEqual((why, calls), ('base check: x', ['base']))
+        self.A.flash.flash_jlink.assert_not_called()
+
+    def test_a_failed_check_after_a_matched_one_reports_no_stale_state(self):
+        base, _ = {**self.base(), 'state': 'matched'}, self.sessions('JLinkExe exit 1')
+        self.A.flash.jlink_verify_differs.return_value = None
+        H.ensure_base(self.flasher, base, self.dir, mock.Mock())
+        self.assertIsNone(base['state'])
+
+    def rewritten(self, why, dev):
+        """flash_and_enumerate after a base rewrite, then (why, dev)."""
+        def fe(name, board, image, *a):
+            image['base']['state'] = 'rewritten: the run at 0x1000 differed'
+            return why, 'detached', dev
+        return mock.patch.object(H, 'flash_and_enumerate', fe)
+
+    def test_every_row_after_a_flash_names_the_base_state(self):
+        image = {'vidPid': '1234:5678', 'elf': 'a.elf', 'hex': 'a.hex', 'base': self.base()}
+        board, said = self.board('rig_jlink'), 'rewritten: the run at 0x1000 differed'
+        self.A.usb.usb_devices.return_value = []
+        for why, dev in (('J-Link flash: x', None), ('', None)):
+            with self.rewritten(why, dev):
+                self.assertEqual(H.step('rig_jlink', board, image, 'echo', self.dir, mock.Mock())['base'], said)
+            with self.rewritten(why, dev):
+                self.assertEqual(H.flash_only('rig_jlink', board, image, self.dir, None)['base'], said)
+        with mock.patch.object(H, 'flash', lambda f, image, *a: image['base'].update(state='matched') or ''):
+            self.assertEqual(H.flash_only('rig_host', self.board('rig_host'), image, self.dir, None)['base'],
+                             'matched')
+        with mock.patch.object(H, 'step', return_value={'pass': False, 'detail': 'x', 'base': said}):
+            self.assertEqual(H.restore('rig_jlink', board, {'echo': image}, self.dir, None)['base'], said)
+
+
 class Step(Base):
     def test_a_test_function_gets_the_roster_board(self):
         seen = mock.Mock(return_value=(True, 'echoed'))
@@ -1290,6 +1410,15 @@ class Commission(Base):
         self.assertEqual(code, 4)
         self.assertIn('want one 239a:cafe with serial OUID, found 2', result['error'])
         self.assertEqual(result['holder'], {'token': 'tok123'})
+
+    def test_a_failed_flash_names_the_base_state(self):
+        def flash(f, image, *a):
+            image['base']['state'] = 'matched'
+            return 'J-Link flash: x'
+        code, result, _ = self.commission('rig_jlink', {'vidPid': '1234:5678', 'base': {'state': None}}, flash=flash,
+                                          scan=mock.Mock(return_value=[]))
+        self.assertEqual((code, result['base'], result['error']),
+                         (4, 'matched', 'RuntimeError: flash: J-Link flash: x'))
 
     def test_unclean_commission_marks_the_board_pending_and_keeps_a_report(self):
         def detach(*a):

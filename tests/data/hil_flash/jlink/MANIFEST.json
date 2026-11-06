@@ -737,6 +737,46 @@
   "source": "hathach/tinyusb farm check -v on ci.lan, 2026-10-23 (tinyusb 3fa7b06d2, agentrc e11c6a3)",
   "version": "V9.78"
  },
+ "V9.78-nrf52840dk-halt-verifybin-differs.txt": {
+  "argv": [
+   "JLinkExe",
+   "-USB",
+   "683944004",
+   "-device",
+   "nrf52840_xxaa",
+   "-if",
+   "SWD",
+   "-speed",
+   "4000",
+   "-autoconnect",
+   "1",
+   "-NoGui",
+   "1",
+   "-ExitOnError",
+   "1",
+   "-CommandFile",
+   "/x/hil_jlink_3nawghem.jlink"
+  ],
+  "board": "nrf52840dk",
+  "cleanup": "done (the base was rewritten, the battery passed, the lock released)",
+  "commands": [
+   "halt",
+   "verifybin /x/base-00000000.bin,0x0",
+   "verifybin /x/base-00001000.bin,0x1000",
+   "verifybin /x/base-000f4000.bin,0xf4000",
+   "verifybin /x/base-000fd800.bin,0xfd800",
+   "verifybin /x/base-000ff000.bin,0xff000"
+  ],
+  "device": "nrf52840_xxaa",
+  "exe": "/opt/SEGGER/JLink_V978/JLinkExe",
+  "host": "ci.lan",
+  "returncode": 1,
+  "returncodeEvidence": "the harness log's [exit 1]: -ExitOnError ended the script at the failed verifybin",
+  "route": "swd",
+  "source": "adafruit/Adafruit_nRF52_Arduino HIL run nrf52-core-hil-1 on ci.lan, 2026-11-05: arduino_hil's base check found tinyusb's firmware at 0x0",
+  "verifyDiffers": "verifybin /x/base-00000000.bin,0x0",
+  "version": "V9.78"
+ },
  "V9.78-nrf5340dk-halt-r-go.txt": {
   "argv": [
    "JLinkExe",

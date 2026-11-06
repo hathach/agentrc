@@ -810,6 +810,56 @@ class Record(RecordCase):
         self.assertIn('rig_jlink is not in', out['error'])
 
 
+class BaseRecord(RecordCase):
+    """A rig board's base image (BOARDS base): its runs outside base_exclude, bound by sha256 and segment."""
+
+    def base(self, *files, exclude=()):
+        for name, (start, data) in files:
+            (self.root / name).write_text(ihex(start, data))
+        self.P.BOARDS['rig_jlink'].update(base=tuple(n for n, _ in files), base_exclude=exclude)
+
+    def test_the_record_binds_the_base_files_and_their_runs_outside_the_excluded_ranges(self):
+        self.base(('sd.hex', (0x1000, bytes(32))), ('settings.hex', (0xff000, b'\x01\0\0\0')),
+                  ('uicr.hex', (0x10001014, bytes(8))), exclude=((0x10001000, 0x10002000),))
+        rec, err = self.record(self.samd_row())
+        self.assertIsNone(err)
+        self.assertEqual(rec['base'], {'files': {f: ab.sha256(self.root / f) for f in ('sd.hex', 'settings.hex',
+                                                                                         'uicr.hex')},
+                                       'segments': [[0x1000, 0x1020], [0xff000, 0xff004]]})   # no UICR run
+        del self.P.BOARDS['rig_jlink']['base']
+        self.assertNotIn('base', self.record(self.samd_row())[0])   # a board without one records none
+
+    def test_a_base_the_board_cannot_hold_is_refused(self):
+        cases = ((((0x3ff0, bytes(32)),), (), 'overlaps the board span'),
+                 (((0x1000, bytes(32)), (0x1010, bytes(32))), (), 'base runs at 0x1000 and 0x1010 overlap'),
+                 (((0x1000, bytes(32)),), ((0x1010, 0x2000),), 'partly inside an excluded range'))
+        for runs, exclude, why in cases:
+            with self.subTest(why=why):
+                self.base(*((f'b{i}.hex', r) for i, r in enumerate(runs)), exclude=exclude)
+                _, err = self.record(self.samd_row())
+                self.assertIn(why, err)
+
+    def test_a_base_with_nothing_to_verify_is_refused(self):
+        self.base(('uicr.hex', (0x10001014, bytes(8))), exclude=((0x10001000, 0x10002000),))   # all excluded
+        _, err = self.record(self.samd_row())
+        self.assertIn('uicr.hex: no runs outside the excluded ranges', err)
+        (self.root / 'eof.hex').write_text(':00000001FF\n')
+        self.P.BOARDS['rig_jlink'].update(base=('eof.hex',), base_exclude=())
+        _, err = self.record(self.samd_row())
+        self.assertIn('eof.hex: no runs outside the excluded ranges', err)
+
+    def test_a_base_is_written_through_jlink_only(self):
+        self.base(('sd.hex', (0x1000, bytes(32))))
+        self.flasher({'name': 'openocd', 'uid': 'E66'})
+        _, err = self.record(self.row([(0x4000, 0x20)]))
+        self.assertIn('a base image is checked and written through J-Link only', err)
+
+    def test_write_hex_is_hex_runs_inverse(self):
+        runs = [(0x1000, bytes(range(40))), (0x1fff8, bytes(16)), (0x10001014, bytes(8))]   # across 64 KiB records
+        ab.write_hex(runs, self.root / 'w.hex')
+        self.assertEqual(ab.hex_runs(self.root / 'w.hex'), runs)
+
+
 class EspRecord(RecordCase):
     """An esptool board's record: the core's flash_args segments."""
 

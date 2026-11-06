@@ -350,6 +350,21 @@ def _last_exited(op, tool: str) -> tuple:
     return '', hil_process.cmd_stdout_text(last.result.stdout)
 
 
+def _jlink_outside(op, out: str) -> tuple:
+    """(problem, the command file's commands without its closing exit) of a J-Link session's
+    last attempt judged outside its commands: a command file ending in exit, and no failure line
+    (JLINK_ERRORS) before the first echo or on stderr."""
+    lines = (op.attempts[-1].script or '').splitlines()
+    if not lines or lines[-1] != 'exit':
+        return 'no command file ending in exit to judge against', []
+    preamble = re.split(r'(?m)^J-Link>', out, maxsplit=1)[0]
+    for where, text in (('before the first command', preamble),
+                        ('on stderr', hil_process.cmd_stdout_text(op.attempts[-1].result.stderr))):
+        if said := re.search(JLINK_ERRORS, text):
+            return f'failed {where} ({said[0]!r})', []
+    return '', lines[:-1]
+
+
 def jlink_problem(op) -> str:
     """Why a J-Link session Operation (flash_jlink, reset_jlink, run_jlink_commands,
     sysresetreq_jlink) did not complete its command file, '' when it did: its last attempt,
@@ -358,15 +373,42 @@ def jlink_problem(op) -> str:
     problem, out = _last_exited(op, 'JLinkExe')
     if problem:
         return problem
-    lines = (op.attempts[-1].script or '').splitlines()
-    if not lines or lines[-1] != 'exit':
-        return 'no command file ending in exit to judge against'
-    preamble = re.split(r'(?m)^J-Link>', out, maxsplit=1)[0]
-    for where, text in (('before the first command', preamble),
-                        ('on stderr', hil_process.cmd_stdout_text(op.attempts[-1].result.stderr))):
-        if said := re.search(JLINK_ERRORS, text):
-            return f'failed {where} ({said[0]!r})'
-    return jlink_judgment(out, lines[:-1])['problem']
+    problem, commands = _jlink_outside(op, out)
+    return problem or jlink_judgment(out, commands)['problem']
+
+
+# what JLinkExe (V9.78) prints for a verifybin whose read completed and differed from the file
+VERIFY_READ = r'^Reading \d+ bytes data from target memory @ 0x[0-9A-F]+\.$'
+VERIFY_DIFFERS = (r'^Verify failed @ address 0x[0-9A-F]+\.\nExpected [0-9A-F]{2} read [0-9A-F]{2}\n'
+                  r'ERROR: Verify failed\.$')
+
+
+def jlink_verify_differs(op) -> str | None:
+    """The verifybin command a J-Link session's last attempt stopped at (-ExitOnError) having
+    read the target and found it different from that file, or None. Only a proven difference
+    counts: the attempt exited, its echoes are its command file's own commands in order up to
+    that one, the first a halt, every earlier one completed with no failure line, and that
+    one's chunk holds the read and the difference and no other failure line, nor do the
+    preamble or stderr. A failed or partial read, no connection or a timeout proves nothing
+    about the target."""
+    last = op.attempts[-1]
+    if last.kind != 'exited':
+        return None
+    out = hil_process.cmd_stdout_text(last.result.stdout)
+    problem, script = _jlink_outside(op, out)
+    if problem:
+        return None
+    judged = jlink_judgment(out, script)['commands']
+    if len(judged) < 2 or [j['command'] for j in judged] != script[:len(judged)] or \
+            script[0] != 'halt' or any(j['error'] or not j['done'] for j in judged[:-1]):
+        return None
+    stop = judged[-1]['command']
+    chunk = jlink_after(out, stop)[-1]
+    if not stop.startswith('verifybin ') or not re.search(VERIFY_READ, chunk, re.M) or \
+            not re.search(VERIFY_DIFFERS, chunk, re.M) or \
+            re.search(JLINK_ERRORS, re.sub(VERIFY_DIFFERS, '', chunk, flags=re.M)):
+        return None
+    return stop
 
 
 # Cortex-M SCB AIRCR and the SYSRESETREQ write tinyuf2's runner issues to it

@@ -170,6 +170,16 @@ class Run(Checkout):
         with self.assertRaisesRegex(SystemExit, 'built with other agentrc files'):
             R.record_files(path, self.head, BOARD)
 
+    def test_a_base_images_files_are_staged_and_pinned_with_the_record(self):
+        base = self.root / 'base.hex'
+        base.write_text(':00000001FF\n')
+        self.BP.BOARDS[BOARD]['base'] = ('base.hex',)
+        path = self.record(base={'files': {'base.hex': hashlib.sha256(base.read_bytes()).hexdigest()}})
+        self.assertEqual(R.record_files(path, self.head, BOARD)[1][-1], 'base.hex')
+        base.write_text(':00000001FF\n\n')
+        with self.assertRaisesRegex(SystemExit, 'base.hex changed since the build record'):
+            R.snapshot_records(self.root / 'stage', [R.record_files(path, self.head, BOARD)])
+
     def test_record_files_takes_an_experimental_one_only_unclean(self):
         path = self.record(experimental=True, patch={'path': f'build/hil/{BOARD}.build.patch', 'sha256': 'x'})
         with self.assertRaisesRegex(SystemExit, 'experimental'):
