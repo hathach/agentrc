@@ -567,6 +567,11 @@ class Esp(Base):
                 self.assertRaisesRegex(RuntimeError, 'xtensa-esp32s3-elf-gdb, the esp32s3 gdb, is not on PATH'):
             esp.admit.return_value = ('esp32s3', ['board/esp32s3-builtin.cfg'])
             H.gdb_argv('rig_esp', board, 'fw.elf', [])
+        esp.admit.return_value = ('esp32c2', ['board/esp32c2-builtin.cfg'])
+        with mock.patch.dict(H.B.P.BOARDS['rig_esp'], chip='esp32c2'), \
+                mock.patch.object(H, 'usj_at', return_value='11-1.2'), \
+                self.assertRaisesRegex(RuntimeError, 'no Espressif gdb listed for esp32c2'):
+            H.gdb_argv('rig_esp', board, 'fw.elf', [])
 
     def test_flash_names_what_the_flasher_wrote(self):
         image = {'elf': '/r/echo.ino.elf', 'hex': '/r/echo.ino.hex', 'segments': [[0, 'a'], [1, 'b']]}

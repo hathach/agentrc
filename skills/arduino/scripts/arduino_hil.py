@@ -64,10 +64,10 @@ RESTORE_FAILED = 6   # restore --release: the restore failed or was refused, the
 GDB_SERVER = ['-c', 'gdb port pipe', '-c', 'gdb memory_map disable', '-c', 'gdb breakpoint_override hard']
 # An RP2040 SMP resume restores core1 only after each core is polled (target-debug gdb.md, verified on the Pico)
 GDB_DETACH_RESUME = {'target/rp2040.cfg': '{ foreach u [target names] { $u arp_poll }; resume }'}   # by debug cfg
-# Espressif's gdb per Xtensa chip, the rest RISC-V (target-debug espressif.md; hil-farm-setup farm.toml installs them):
+# Espressif's gdb per chip whose datasheet names its core, Xtensa or RISC-V (hil-farm-setup farm.toml installs them):
 # gdb-multiarch has no Xtensa ESP target
-ESP_GDB = {'esp32': 'xtensa-esp32-elf-gdb', 'esp32s2': 'xtensa-esp32s2-elf-gdb', 'esp32s3': 'xtensa-esp32s3-elf-gdb'}
-ESP_GDB_RISCV = 'riscv32-esp-elf-gdb'
+ESP_GDB = {'esp32': 'xtensa-esp32-elf-gdb', 'esp32s2': 'xtensa-esp32s2-elf-gdb', 'esp32s3': 'xtensa-esp32s3-elf-gdb',
+           'esp32c3': 'riscv32-esp-elf-gdb', 'esp32c6': 'riscv32-esp-elf-gdb', 'esp32p4': 'riscv32-esp-elf-gdb'}
 # Probe commands, by the openocd flasher's target cfg, that take the DUT off the bus before a flash or console reset.
 # A probe reset leaves the RP2040/RP2350 USB controller out of reset, and a USB stack's init resets and reconnects it
 # within microseconds, so without this the host never sees the new image arrive: clear SIE_CTRL.PULLUP_EN
@@ -1203,7 +1203,9 @@ def gdb_argv(name, board, elf, commands):
     if dbg.get('tool') == 'openocd-esp32':
         chip = B.P.BOARDS[name]['chip']
         openocd = esp_openocd(dbg, chip)
-        gdb = ESP_GDB.get(chip, ESP_GDB_RISCV)
+        gdb = ESP_GDB.get(chip)
+        if not gdb:
+            raise RuntimeError(f'no Espressif gdb listed for {chip} (ESP_GDB)')
         if not shutil.which(gdb):
             raise RuntimeError(f'{gdb}, the {chip} gdb, is not on PATH')
     else:
