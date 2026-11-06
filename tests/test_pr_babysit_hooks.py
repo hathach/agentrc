@@ -458,7 +458,7 @@ class HooksTest(unittest.TestCase):
         code, out = self.run_script('a.txt')
         self.assertEqual((code, out['passed'], out['failed']), (0, False, [{'hook': 'nocc', 'error': 'no compiler'}]))
         self.assertEqual(([n['hook'] for n in out['notRerun']], out['baselineFailed']), (['nocc'], []))
-        self.assertRegex(out['notRerun'][0]['why'], r'^HEAD could not judge it: git .*worktree add .*smudge filter')
+        self.assertRegex(out['notRerun'][0]['why'], r'^HEAD could not judge it: git worktree: .*smudge filter')
         self.assertNotIn('\n', out['notRerun'][0]['why'])
         self.assertEqual(len(self.worktrees()), 1, 'the HEAD worktree is removed')
 
@@ -875,7 +875,20 @@ class ForgetTest(unittest.TestCase):
             return 0, ''
         with mock.patch.object(hooks, 'pre_commit', pre_commit):
             hooks.baseline({'a': []}, ['a.txt'], 10, time.monotonic())
-        self.assertIn(f'\nlocked pr-babysit hooks.py (pid {os.getpid()})', seen[0])
+        self.assertRegex(seen[0], r'\nlocked\b')
+        self.assertEqual(len(self.worktrees()), 1)
+
+    def test_a_rerun_head_cannot_judge_leaves_it_and_those_after_it_unjudged_and_keeps_those_before(self):
+        said = '- exit code: 1\n\nbad'
+        runs = [(1, f'a{"." * 70}Failed\n- hook id: a\n{said}\n'),
+                # pre-commit's output contradicting its exit status
+                (0, f'b{"." * 70}Failed\n- hook id: b\n{said}\n')]
+        expected = {h: [[hooks.comparable(said, '/x')]] for h in 'abc'}
+        with mock.patch.object(hooks, 'pre_commit', side_effect=runs):
+            failing, unjudged = hooks.baseline(expected, ['a.txt'], 10, time.monotonic())
+        self.assertEqual(failing, ['a'])
+        self.assertEqual(list(unjudged), ['b', 'c'])
+        self.assertTrue(all(why.startswith('HEAD could not judge it: ') for why in unjudged.values()), unjudged)
         self.assertEqual(len(self.worktrees()), 1)
 
     def test_a_rerun_the_deadline_cuts_short_leaves_it_and_those_after_it_unjudged(self):
@@ -1257,8 +1270,11 @@ class AsCheckoutTest(unittest.TestCase):
                              # a source named as gcc names a temporary file, outside the temp dir
                              ('hw/bsp/cc2640r2.c: bad\n', 'hw/bsp/cc1352p7.c: bad\n'),
                              ('src/ccDriver.c: bad\n', 'src/ccSensor.c: bad\n'),
-                             # an identifier named as tempfile names a file
+                             # an identifier or a source named as tempfile names a file
                              ('a.c:1: tmpcounter1 unused\n', 'a.c:1: tmpindexes2 unused\n'),
+                             ('src/tmpcounter1.c: bad\n', 'src/tmpindexes2.c: bad\n'),
+                             ('src/tmpl_engine.c:3: E1 bad\n', 'src/tmpl_loader.c:3: E1 bad\n'),
+                             ('/x/src/tmpl_engine.c:3: E1 bad\n', '/x/src/tmpl_loader.c:3: E1 bad\n'),
                              ('a.c:1: v2m bad\n', 'a.c:1: v3m bad\n')):
             self.assertNotEqual(hooks.comparable(head, '/x'), hooks.comparable(change, '/x'), change)
 
@@ -1274,7 +1290,11 @@ class AsCheckoutTest(unittest.TestCase):
                               f'{tempfile.gettempdir()}/cco1y76V.o: undefined reference\n'),
                              (f'{tempfile.gettempdir()}/ccabcdef.s: Error\n',
                               f'{tempfile.gettempdir()}/ccAb12Cd.s: Error\n'),
-                             ('/tmp/tmp.Ab3dE5fG7h: denied\n', '/tmp/tmp.yiJuMi1EqI: denied\n')):
+                             ('/tmp/tmp.Ab3dE5fG7h: denied\n', '/tmp/tmp.yiJuMi1EqI: denied\n'),
+                             # Python's repr of a Windows path, and one tempfile name inside another
+                             ("'C:\\\\Users\\\\u\\\\AppData\\\\Local\\\\Temp\\\\tmpl1lb44ri'\n",
+                              "'C:\\\\Users\\\\u\\\\AppData\\\\Local\\\\Temp\\\\tmpld2ovkrs'\n"),
+                             ('/tmp/tmpab12cd_x/tmpabcdefgh.json: bad\n', '/tmp/tmpzz98yy_w/tmpzyxwvuts.json: bad\n')):
             self.assertEqual(hooks.comparable(head, '/x'), hooks.comparable(change, '/x'), change)
 
 

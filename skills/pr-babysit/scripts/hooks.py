@@ -10,10 +10,10 @@ modified files), then the status and snapshot again. All runs, the HEAD reruns
 below included, get N seconds (default 540) from the start, and removing HEAD's
 tree after them CLEANUP (20) more, inside the 600 a relay's Bash call allows;
 past N the pre-commit process tree is killed: on the first pass the result is an
-error, on a HEAD rerun its hook and those left are in notRerun, and on a later
-pass it is the failure `(pre-commit)`. Status lines are
-`git status --porcelain -z` records, each untracked file its own; snapshot lines
-are `<644|755> <blob> <path>` or `absent - <path>`.
+error, and on a later pass the failure `(pre-commit)`. A HEAD rerun the deadline
+or an error cuts short leaves its hook and those after it in notRerun. Status
+lines are `git status --porcelain -z` records, each untracked file its own;
+snapshot lines are `<644|755> <blob> <path>` or `absent - <path>`.
 
 stdout ends with one JSON line {ran, passed, modifiedBy, failed, baselineFailed,
 notRerun, before, after, snapshotBefore, snapshotAfter, seal} (seal:
@@ -68,7 +68,7 @@ the hooks' own git commands inherit. git still lengthens an abbreviation a
 hook's new object makes ambiguous, so rarely a hook that changed nothing is in
 modifiedBy.
 Exit 0 with that line; exit 2 with {"error": ...} when the facts cannot be
-collected or pre-commit's output contradicts its exit status.
+collected or pre-commit's output on the change contradicts its exit status.
 """
 
 import contextlib
@@ -130,14 +130,16 @@ OTHER_REPO = ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE')
 C_QUOTED = re.compile(r'"((?:[^"\\]|\\(?:[abfnrtv"\\]|[0-3][0-7]{2}))*)"', re.DOTALL)
 C_ESCAPES = {b'a': b'\a', b'b': b'\b', b'f': b'\f', b'n': b'\n', b'r': b'\r', b't': b'\t', b'v': b'\v'}
 # What differs between two runs of the same failure: a number standing alone (a duration with its units, a line
-# number, a count, a pid, an address), an ISO 8601 time, a pytest-xdist worker's number, or a name tempfile or mktemp
-# made, as a path's last part, since an identifier such as tmpcounter1 reads alike. Any other digit inside a word
-# (usb2.c, E501) names a file, rule or symbol, so it stays. A gcc name is masked only directly in the temp dir
-# (temp_gcc()), as a source such as cc2640r2.c or ccdriver.c reads alike.
+# number, a count, a pid, an address), an ISO 8601 time or a pytest-xdist worker's number. Any other digit inside a word
+# (usb2.c, E501) names a file, rule or symbol, so it stays.
 UNIT = r'(?:[hm]|min|sec|[mµun]?s)'
 VARYING = re.compile(r'\b\d{4}-\d\d-\d\dT\d\d:\d\d(?::\d\d(?:[.,]\d+)?)?Z?'
-                     rf'|\b(?:0x[0-9a-fA-F]+|\d+(?:\.\d+)*(?:{UNIT}(?:\d+(?:\.\d+)?{UNIT})*)?)\b|(?<=\[gw)\d+(?=\])'
-                     r'|(?<=[/\\])tmp(?:[a-z0-9_]{8}|\.[A-Za-z0-9]{10})\b')
+                     rf'|\b(?:0x[0-9a-fA-F]+|\d+(?:\.\d+)*(?:{UNIT}(?:\d+(?:\.\d+)?{UNIT})*)?)\b|(?<=\[gw)\d+(?=\])')
+# A name tempfile or mktemp made, as any component of an absolute path outside the checkout, since a source such as
+# src/tmpcounter1.c reads alike; the path runs to a space or quote, so a name past a space in it stays. A gcc name is
+# masked only directly in the temp dir (temp_gcc()), as a source such as cc2640r2.c or ccdriver.c reads alike.
+ABSOLUTE = re.compile(r'''(?<![\w.~/\\<>-])(?:[A-Za-z]:)?[/\\][^\s'"<>]*''')
+TEMP_NAME = re.compile(r'(?<=[/\\])tmp(?:[a-z0-9_]{8}|\.[A-Za-z0-9]{10})\b')
 
 
 def status_paths(records):
@@ -403,7 +405,8 @@ def git_within(deadline, start, *argv, cwd=None):
     command = next(a for a in argv if not a.startswith('-') and '=' not in a)
     code, _, err = bounded(['git', *argv], deadline, start, f'git {command}', cwd, env)
     if code:
-        raise Unusable(f"git {' '.join(argv)}: {err.strip()}")
+        # git's own error first: a long temp dir in argv would otherwise push it past what copyable() keeps.
+        raise Unusable(f"git {command}: {err.strip()} (git {' '.join(argv)})")
 
 
 def spellings(path):
@@ -436,10 +439,11 @@ def temp_gcc():
 
 def comparable(text, root):
     """What of a hook's output its HEAD rerun must repeat: its lines, in any order (a parallel runner's), with root
-    read as the checkout and what VARYING and temp_gcc() name masked: each number standing alone (a duration, a line
-    number, a count), a time, a pytest-xdist worker's number and a temporary file's name. A violation the change adds
-    is a line more."""
-    lines = (VARYING.sub('#', line).strip() for line in as_checkout(temp_gcc().sub(r'\1#', text), root).splitlines())
+    read as the checkout and what VARYING, TEMP_NAME and temp_gcc() name masked: each number standing alone (a
+    duration, a line number, a count), a time, a pytest-xdist worker's number and a temporary file's name. A violation
+    the change adds is a line more."""
+    text = ABSOLUTE.sub(lambda path: TEMP_NAME.sub('#', path[0]), as_checkout(temp_gcc().sub(r'\1#', text), root))
+    lines = (VARYING.sub('#', line).strip() for line in text.splitlines())
     return sorted(line for line in lines if line)
 
 
@@ -594,9 +598,7 @@ def baseline(expected, paths, deadline, start):
         # tmp holds no hook: a post-checkout or reference-transaction hook would change or fail HEAD's tree.
         no_hooks = ('-c', f'core.hooksPath={tmp}')
         # Locked till forget: another session's prune could drop the entry once the tree goes, and its name be reused.
-        reason = f'pr-babysit hooks.py (pid {os.getpid()}) reruns failed hooks here'
-        git_within(deadline, start, *no_hooks, 'worktree', 'add', '--lock', '--reason', reason, '--detach', '--quiet',
-                   tree, 'HEAD')
+        git_within(deadline, start, *no_hooks, 'worktree', 'add', '--lock', '--detach', '--quiet', tree, 'HEAD')
         for hook, outputs in expected.items():
             if judged:
                 # What an earlier rerun rewrote or left behind could fail the next one: each gets HEAD as is.
