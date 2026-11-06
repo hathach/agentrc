@@ -592,6 +592,8 @@ def end_failed(handles, reason, *, detail, receipts=(), retained=(), **extra) ->
             for b in boards:
                 errors.setdefault(b, []).append(f'{what}: {e!r:.200}')
             return default
+    # a signal between the guarded steps waits until every board is released (None: the guards alone)
+    hold = guard((), 'interrupt hold', lambda: _process().InterruptHold())
     receipts = guard(handles, 'cleanup log not written: receipts', lambda: list(receipts), [])
     retained = guard(handles, 'cleanup log not written: retained', lambda: list(retained), [])
     for b, fh in handles.items():
@@ -599,6 +601,8 @@ def end_failed(handles, reason, *, detail, receipts=(), retained=(), **extra) ->
         if not guard([b], 'record not cleared', lambda: clear_record(fh), True):
             errors.setdefault(b, []).append('record not cleared')
         guard([b], 'close', fh.close)
+    if hold is not None:
+        guard((), 'deferred interrupt', hold.release)
     if interrupted:
         raise interrupted[0]
     return errors
@@ -798,7 +802,7 @@ def _wait_cleared(boards, pid, start, deadline) -> list:
 
 
 def _process():
-    """hil_process, loaded on first use: only a release predicate needs it."""
+    """hil_process, loaded on first use: only a release predicate and end_failed need it."""
     return hil_load.load_file('skills/hil/scripts/hil_process.py')
 
 

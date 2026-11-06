@@ -13,6 +13,7 @@ if os.name == 'nt':
 import ast
 import fcntl
 import importlib.util
+import inspect
 import io
 import json
 import re
@@ -1733,6 +1734,39 @@ class CleanupLog(LockDir):
                     self.assertTrue(self.flock_is_free() if b == BOARD else True)
                     if where != 'clear_record' or b != BOARD:
                         self.assertEqual(hil_lock.record_state(b)[0], 'empty', (where, b))
+
+    def test_a_signal_between_the_steps_still_logs_and_releases_every_board_then_propagates(self):
+        boards = [BOARD, BOARD + '-2']
+        fhs = {b: hil_lock.take_board_lock(b, 'selftest run', protected=True, locks=boards) for b in boards}
+        prev = signal.signal(signal.SIGINT, signal.default_int_handler)
+        self.addCleanup(signal.signal, signal.SIGINT, prev)
+        lines, first = inspect.getsourcelines(hil_lock.end_failed)
+        # the first board's failure is logged, its record not yet cleared: no patched callable reaches here
+        gap = first + next(i for i, line in enumerate(lines) if "'record not cleared'" in line)
+        fired = []
+
+        def local(frame, event, arg):
+            if not fired and event == 'line' and frame.f_lineno == gap:
+                fired.append(1)
+                signal.raise_signal(signal.SIGINT)
+            return local
+
+        def tracer(frame, event, arg):
+            return local if frame.f_code is hil_lock.end_failed.__code__ else None
+        prev_trace = sys.gettrace()
+        sys.settrace(tracer)
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                hil_lock.end_failed(fhs, 'selftest run', detail='d')
+        finally:
+            sys.settrace(prev_trace)
+        self.assertTrue(fired)
+        for b in boards:
+            self.assertTrue(fhs[b].closed, b)
+            self.assertEqual(hil_lock.record_state(b)[0], 'empty', b)
+            self.assertEqual(latest_failure(hil_lock, b)['detail'], 'd', b)
+            hil_lock.flock_nb(b).close()      # BlockingIOError while still held
+        self.assertIs(signal.getsignal(signal.SIGINT), signal.default_int_handler)
 
     def test_iterable_receipts_reach_every_board(self):
         boards = [BOARD, BOARD + '-2']
