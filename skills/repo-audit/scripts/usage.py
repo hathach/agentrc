@@ -30,6 +30,11 @@ from audit import Refused, aware, create, git  # noqa: E402
 
 INTERPRETERS = re.compile(r'^(?:python(?:3(?:\.\d+)?)?|py|bash|sh|zsh|node|pwsh)$')
 PREFIXES = {'sudo', 'env', 'timeout', 'nohup', 'exec', 'time', 'command', 'nice', 'stdbuf', 'setsid'}
+# a prefix's options whose operand may be the next word, so that word is not the command
+OPERAND = {'exec': 'a', 'sudo': 'CDghpRrTtUu', 'env': 'aCSu', 'timeout': 'ks', 'nice': 'n', 'stdbuf': 'eio'}
+LONG_OPERAND = {'--argv0', '--chdir', '--close-from', '--group', '--host', '--prompt', '--chroot', '--role', '--type',
+                '--command-timeout', '--other-user', '--user', '--unset', '--split-string', '--kill-after',
+                '--signal', '--adjustment', '--input', '--output', '--error'}
 READERS = {'cat', 'sed', 'head', 'tail', 'less', 'grep', 'rg', 'wc', 'vim', 'vi', 'nano', 'diff', 'ls', 'awk',
            'chmod', 'cp', 'mv', 'rm', 'git', 'stat', 'file', 'readlink', 'realpath', 'test', '['}
 OPERATORS = {';', '&', '|', '&&', '||', '(', ')', ';;', '|&'}
@@ -346,6 +351,18 @@ def segments(command):
     return [(b, w, ops[i:]) for b, w, i in segs]
 
 
+def takes_operand(prefix, opt):
+    """Whether prefix's option word opt leaves its operand to the next word: a short cluster ending in an option
+    that takes one, or a long option that takes one written without =."""
+    if opt.startswith('--'):
+        return opt in LONG_OPERAND and prefix in OPERAND
+    if not opt.startswith('-'):   # a duration or niceness
+        return False
+    letters = opt[1:]
+    first = next((i for i, c in enumerate(letters) if c in OPERAND.get(prefix, '')), None)
+    return first == len(letters) - 1
+
+
 def assign(tok, env):
     name, value = tok.split('=', 1)
     w = Word(value)
@@ -404,9 +421,9 @@ def parse(command, tally, ctx, cwd, env, remote=False):
                     env.pop(t.split('=', 1)[0], None)
             continue
         while seg and (seg[0] in PREFIXES or re.fullmatch(r'\w+=.*', seg[0])):
-            seg = seg[1:]
+            prefix, seg = seg[0], seg[1:]
             while seg and (seg[0].startswith('-') or re.fullmatch(r'\d+[smh]?', seg[0])):
-                seg = seg[1:]
+                seg = seg[1 + takes_operand(prefix, seg[0]):]
         if not seg:
             continue
         head = seg[0]

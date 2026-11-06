@@ -318,6 +318,24 @@ class Usage(unittest.TestCase):
         self.assertEqual((t['invoke'], t['ok'], t['result_unknown']), (2, 1, 1))
         self.assertEqual(agg['unknown'], {'conditional_invocation': 2})
 
+    def test_a_prefix_option_s_operand_is_not_the_command(self):
+        s = self.script
+        claude(self.root / 'p' / 's1.jsonl', [
+            use('a', 'Bash', {'command': f"exec -a {s} python3 -c 'print(1)'"}), result('a'),
+            use('b', 'Bash', {'command': f'exec -a foo python3 {s} send'}), result('b'),
+            use('c', 'Bash', {'command': f'sudo -u root python3 {s} send'}), result('c'),
+            use('d', 'Bash', {'command': f'sudo -Eu root python3 {s} send'}), result('d'),
+            use('e', 'Bash', {'command': f'env -u X python3 {s} send'}), result('e'),
+            use('f', 'Bash', {'command': f'timeout -s KILL 5 python3 {s} send'}), result('f'),
+            use('g', 'Bash', {'command': f'stdbuf -o L nice -n 5 python3 {s} send'}), result('g'),
+            use('h', 'Bash', {'command': f'sudo --user root timeout --signal=KILL 15s {s} send'}), result('h'),
+        ])
+        self.usage()
+        agg = json.loads(self.out.read_text())
+        t = agg['scripts']['skills/tool/scripts/tool.py']
+        self.assertEqual((t['invoke'], t['ok'], t['subcommands']), (7, 7, {'send': 7}))
+        self.assertEqual(agg['unknown'], {})
+
     def test_installed_links_attribute_and_foreign_paths_do_not(self):
         installed = tmpdir(self) / 'claude' / 'skills'
         installed.mkdir(parents=True)
