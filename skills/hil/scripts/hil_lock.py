@@ -374,11 +374,12 @@ def _handle_record(fh) -> bytes:
     return os.pread(fd, os.fstat(fd).st_size, 0)
 
 
-def _leftover(board, fh):
+def _leftover(board, fh, data=None):
     """What a task that ended without its cleanup left on the board whose flock we now hold, as a
     failure event's fields, or None: a record owing cleanup, one that cannot be read (cut short
     mid-write, it may have owed one), or an older helper's takeover journal not yet logged (its
-    `journalDigest`; one this user cannot unlink stays, logged once)."""
+    `journalDigest`; one this user cannot unlink stays, logged once). `data`: the record's bytes
+    when the caller already read them under this flock."""
     found = {}
     try:
         raw = _read_file(board, JOURNAL)
@@ -389,7 +390,8 @@ def _leftover(board, fh):
         state, journal = _parse(raw)
         found['journal'] = journal if state == 'record' else {'unreadable': raw[:2000].decode(errors='backslashreplace')}
         found['journalDigest'] = hashlib.sha256(raw).hexdigest()
-    data = _handle_record(fh)
+    if data is None:
+        data = _handle_record(fh)
     state, rec = _parse(data)
     if state == 'record' and _owes_cleanup(rec):
         found['task'] = rec
@@ -469,7 +471,7 @@ def take_board_lock(board: str, reason: str, *, protected=False, **extra):
         raise _unavailable(e) from e
     try:
         found = _handle_record(fh)
-        left = _leftover(board, fh)
+        left = _leftover(board, fh, data=found)
     except OSError as e:
         fh.close()
         raise LockUnavailable(f'board lock unavailable: holder record: {e}') from e
