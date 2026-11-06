@@ -7,4 +7,4 @@ repos:
         pass_filenames: false
         always_run: true
         language: python
-        additional_dependencies: [pyyaml, pytest==9.1.1, pytest-xdist==3.8.0]
+        additional_dependencies: [pyyaml, pytest==9.1.1, pytest-xdist==3.8.0, coverage==7.6.0]
