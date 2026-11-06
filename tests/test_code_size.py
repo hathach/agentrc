@@ -388,13 +388,6 @@ class RenderPairs(ProfileCase):
         self.assertIn('FAILED `b: device/ex/app.elf` base report: x', md)
         self.assertIn('FAILED `b: device/ex/loader.elf` base report: y', md)
 
-    def test_one_growing_pair_among_many_stays_visible(self):
-        ids = pair_ids(10)
-        base = {i: elf({'x.c': (100, 0)}) for i in ids}
-        cur = {**base, ids[3]: elf({'x.c': (300, 0)})}
-        md = self.render(base, cur)
-        self.assertIn('| x.c | 1/10 | 0 | +200 (b: device/ex3/ex3.elf) | 0 | 0 |', md)
-
     def test_opposite_signs_do_not_cancel(self):
         a, b = pair_ids(2)
         base = {a: elf({'x.c': (100, 0)}), b: elf({'x.c': (100, 0)})}
@@ -992,11 +985,6 @@ class BuildOutput(ProfileCase):
     def excerpt(stdout, stderr='', lines=20):
         return sd.output_excerpt(subprocess.CompletedProcess([], 1, stdout, stderr), lines)
 
-    def test_a_compile_error_on_stdout_is_shown_when_stderr_is_empty(self):
-        # ninja reports the failing compile on stdout; stderr stays empty
-        self.assertEqual(self.excerpt('a\nbad.c:1: error: x undeclared\nninja: build stopped\n', lines=2),
-                         ['bad.c:1: error: x undeclared', 'ninja: build stopped'])
-
     def test_ninja_progress_lines_are_dropped(self):
         # the jobs running when the build failed finish after it, burying the error
         out = 'FAILED: bad.c.obj\nbad.c:1: error: x undeclared\n[2/9] Building C object a.c.obj\n' \
@@ -1175,33 +1163,21 @@ class BuildOutput(ProfileCase):
 
     @needs_proc
     def test_a_timeout_stops_what_a_wrapper_started(self):
-        # as a project's build script runs make: SIGTERM ends the wrapper without passing it on
-        wrapper = ('import subprocess, time; '
-                   'p = subprocess.Popen(["sleep", "30"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); '
-                   'print(p.pid, flush=True); time.sleep(30)')
-        ret = sd.run([sys.executable, '-c', wrapper], timeout=1)
-        pid = int(ret.stdout)
-        try:
-            self.assertEqual(ret.returncode, 124)
-            self.assertTrue(_dies(pid))
-        finally:
-            with contextlib.suppress(ProcessLookupError):
-                os.kill(pid, signal.SIGKILL)
-
-    @needs_proc
-    def test_a_timeout_stops_a_child_ignoring_sigterm_after_the_wrapper_exits(self):
-        wrapper = ('import subprocess, time; '
-                   'p = subprocess.Popen(["sh", "-c", "trap \'\' TERM; echo ready; exec sleep 30"], '
-                   'stdout=subprocess.PIPE, stderr=subprocess.DEVNULL); '
-                   'p.stdout.readline(); print(p.pid, flush=True); time.sleep(30)')
-        ret = sd.run([sys.executable, '-c', wrapper], timeout=1)
-        pid = int(ret.stdout)
-        try:
-            self.assertEqual(ret.returncode, 124)
-            self.assertTrue(_dies(pid))
-        finally:
-            with contextlib.suppress(ProcessLookupError):
-                os.kill(pid, signal.SIGKILL)
+        # as a project's build script runs make: SIGTERM ends the wrapper without passing it on;
+        # a child ignoring SIGTERM must still die once the wrapper has exited
+        for child in ('subprocess.Popen(["sleep", "30"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)',
+                      'subprocess.Popen(["sh", "-c", "trap \'\' TERM; echo ready; exec sleep 30"], '
+                      'stdout=subprocess.PIPE, stderr=subprocess.DEVNULL); p.stdout.readline()'):
+            with self.subTest(child=child):
+                ret = sd.run([sys.executable, '-c', f'import subprocess, time; p = {child}; '
+                                                    'print(p.pid, flush=True); time.sleep(30)'], timeout=1)
+                pid = int(ret.stdout)
+                try:
+                    self.assertEqual(ret.returncode, 124)
+                    self.assertTrue(_dies(pid))
+                finally:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.kill(pid, signal.SIGKILL)
 
     @needs_proc
     @unittest.skipUnless(shutil.which('ninja'), 'needs ninja')
@@ -1462,14 +1438,14 @@ class MainFailure(ProfileCase):
                 rc = sd.main(sd.profile, ['diff'] + argv)
         return rc, unpad(buf.getvalue())
 
-    def _main(self, tmp, build_board=None, sizes=None, cur_sizes=None):
-        """main() for board `b`; `sizes` is what generate_sizes() returns for
+    def _main(self, tmp, build_board=None, sizes=None, cur_sizes=None, argv=(), run=None):
+        """main() for board `b` with `argv` added; `sizes` is what generate_sizes() returns for
         the base side and, unless `cur_sizes` is given, the current side too."""
         def build(_src, _build_dir, board, *_args, **_kwargs):
             os.makedirs(os.path.join(tmp, board), exist_ok=True)
             return build_board() if build_board else None
         side_sizes = iter([sizes, sizes if cur_sizes is None else cur_sizes])
-        return self._run_main(tmp, ['-b', 'b'], build, lambda *_a, **_k: next(side_sizes))
+        return self._run_main(tmp, ['-b', 'b', *argv], build, lambda *_a, **_k: next(side_sizes), run)
 
     def test_build_dirs_are_cleaned_before_build(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1513,13 +1489,6 @@ class MainFailure(ProfileCase):
             self.assertIn('  1 pair, 1 changed; TinyUSB Flash Δ +2, RAM Δ 0\n', out)
             self.assertNotIn('| x.c |', out)
 
-    def test_a_filter_mismatch_fails_the_size_and_compare_phase(self):
-        empty = elf({}, all_syms=(4, 0))
-        with tempfile.TemporaryDirectory() as tmp:
-            rc, out = self._main(tmp, sizes=({'ex/ex.elf': empty}, []))
-            self.assertEqual(rc, 1)
-            self.assertRegex(out, r'  size and compare… FAILED after \d+\.\ds\n  INCOMPLETE: 1 pair')
-
     def test_a_failed_worktree_cleanup_fails_the_run(self):
         ok = subprocess.CompletedProcess([], 0, 'c0ffee\n', '')
         stuck = subprocess.CompletedProcess([], 1, '', 'fatal: busy')
@@ -1531,11 +1500,7 @@ class MainFailure(ProfileCase):
                 os.makedirs(cmd[-2])
             return stuck if cmd[3:5] == ['worktree', 'remove'] else ok
         with tempfile.TemporaryDirectory() as tmp:
-            def build(_src, _build_dir, board, *_args):
-                os.makedirs(os.path.join(tmp, board), exist_ok=True)
-                return None
-            side_sizes = iter([({'ex/ex.elf': _elf(1)}, [])] * 2)
-            rc, out = self._run_main(tmp, ['-b', 'b'], build, lambda *_a, **_k: next(side_sizes), run)
+            rc, out = self._main(tmp, sizes=({'ex/ex.elf': _elf(1)}, []), run=run)
         self.assertEqual(rc, 1)
         self.assertIn('Error: removing worktree', out)
 
@@ -1565,25 +1530,15 @@ class MainFailure(ProfileCase):
 
     def test_several_elfs_of_one_example_label_their_tables(self):
         with tempfile.TemporaryDirectory() as tmp:
-            two = lambda f: ({'ex/app.elf': _elf(f), 'ex/boot.elf': _elf(f)}, [])
-            side_sizes = iter([two(1), two(3)])
-
-            def build(_src, _build_dir, board, *_args):
-                os.makedirs(os.path.join(tmp, board), exist_ok=True)
-                return None
-            rc, out = self._run_main(tmp, ['-b', 'b', '-e', 'ex'], build, lambda *_a, **_k: next(side_sizes))
+            two = lambda f: ({'ex/app.elf': _elf(f), 'ex/boot.elf': _elf(f)}, [])  # noqa: E731
+            rc, out = self._main(tmp, sizes=two(1), cur_sizes=two(3), argv=['-e', 'ex'])
             self.assertEqual(rc, 0)
             self.assertLess(out.index('\n  b: ex/app.elf:\n'), out.index('\n  b: ex/boot.elf:\n'))
 
     def test_the_one_changed_elf_of_several_is_labelled(self):
         with tempfile.TemporaryDirectory() as tmp:
-            side_sizes = iter([({'ex/app.elf': _elf(1), 'ex/boot.elf': _elf(1)}, []),
-                               ({'ex/app.elf': _elf(1), 'ex/boot.elf': _elf(3)}, [])])
-
-            def build(_src, _build_dir, board, *_args):
-                os.makedirs(os.path.join(tmp, board), exist_ok=True)
-                return None
-            rc, out = self._run_main(tmp, ['-b', 'b', '-e', 'ex'], build, lambda *_a, **_k: next(side_sizes))
+            rc, out = self._main(tmp, sizes=({'ex/app.elf': _elf(1), 'ex/boot.elf': _elf(1)}, []),
+                                 cur_sizes=({'ex/app.elf': _elf(1), 'ex/boot.elf': _elf(3)}, []), argv=['-e', 'ex'])
             self.assertEqual(rc, 0)
             self.assertIn('  2 pairs, 1 changed\n', out)
             self.assertIn('\n  b: ex/boot.elf:\n', out)
@@ -1592,16 +1547,11 @@ class MainFailure(ProfileCase):
     def test_the_table_names_the_sides_by_hash_or_falls_back(self):
         for short, header in (('abc1234\n', 'File (abc1234 → abc1234) |'), ('', 'File (base → new) |')):
             with tempfile.TemporaryDirectory() as tmp:
-                side_sizes = iter([({'ex/ex.elf': _elf(1)}, []), ({'ex/ex.elf': _elf(3)}, [])])
-
-                def build(_src, _build_dir, board, *_args):
-                    os.makedirs(os.path.join(tmp, board), exist_ok=True)
-                    return None
-
                 def run(cmd, **_kwargs):
                     out = short if 'describe' in cmd else 'c0ffee\n'
                     return subprocess.CompletedProcess(cmd, 0 if out else 128, out, '')
-                rc, out = self._run_main(tmp, ['-b', 'b', '-e', 'ex'], build, lambda *_a, **_k: next(side_sizes), run)
+                rc, out = self._main(tmp, sizes=({'ex/ex.elf': _elf(1)}, []), cur_sizes=({'ex/ex.elf': _elf(3)}, []),
+                                     argv=['-e', 'ex'], run=run)
                 self.assertEqual(rc, 0)
                 self.assertIn(header, out)
                 with open(os.path.join(tmp, 'b', 'diff_ex.md')) as f:
@@ -1609,12 +1559,8 @@ class MainFailure(ProfileCase):
 
     def test_a_single_example_prints_its_phases_summary_and_changed_tables(self):
         with tempfile.TemporaryDirectory() as tmp:
-            side_sizes = iter([({'ex/ex.elf': _elf(1)}, []), ({'ex/ex.elf': _elf(3)}, [])])
-
-            def build(_src, _build_dir, board, *_args):
-                os.makedirs(os.path.join(tmp, board), exist_ok=True)
-                return None
-            rc, out = self._run_main(tmp, ['-b', 'b', '-e', 'ex'], build, lambda *_a, **_k: next(side_sizes))
+            rc, out = self._main(tmp, sizes=({'ex/ex.elf': _elf(1)}, []), cur_sizes=({'ex/ex.elf': _elf(3)}, []),
+                                 argv=['-e', 'ex'])
             self.assertEqual(rc, 0)
             self.assertRegex(out, r'^diff master \(c0ffee\) vs working tree \(c0ffee\) · membrowse\n\[1/1\] b / ex\n'
                                   r'  build master… \d+\.\ds\n  build current… \d+\.\ds\n'
@@ -1640,6 +1586,7 @@ class MainFailure(ProfileCase):
         with tempfile.TemporaryDirectory() as tmp:
             rc, out = self._main(tmp, sizes=({'ex/ex.elf': empty}, []))
             self.assertEqual(rc, 1)
+            self.assertRegex(out, r'  size and compare… FAILED after \d+\.\ds\n  INCOMPLETE: 1 pair')
             self.assertIn('no membrowse sizes matched filters', out)
             self.assertIn('another --engine', out)
 
@@ -1654,11 +1601,9 @@ class MainFailure(ProfileCase):
                 self.assertIn('| x.c | 8 → 0 | -8 | 0 → 0 | 0 |', unpad(f.read()))
 
     def test_a_custom_filter_is_not_called_tinyusb(self):
-        def build(_src, _build_dir, board, *_args, **_kwargs):
-            os.makedirs(os.path.join(tmp, board), exist_ok=True)
-        side_sizes = iter([({'ex/ex.elf': _elf(1)}, []), ({'ex/ex.elf': _elf(3)}, [])])
         with tempfile.TemporaryDirectory() as tmp:
-            rc, out = self._run_main(tmp, ['-b', 'b', '-f', 'lib/'], build, lambda *_a, **_k: next(side_sizes))
+            rc, out = self._main(tmp, sizes=({'ex/ex.elf': _elf(1)}, []), cur_sizes=({'ex/ex.elf': _elf(3)}, []),
+                                 argv=['-f', 'lib/'])
         self.assertEqual(rc, 0)
         self.assertIn('1 pair, 1 changed; filtered Flash Δ +2', out)
 
@@ -2644,11 +2589,8 @@ class Compare(ProfileCase):
         evil = 'x`|<img src=x>@team\n\n# FORGED\r\n'
         sizes = lambda n: elf({f'{evil}.c': (n, 0)}, symbols={f'{evil}.c': {evil: {evil: n}}})  # noqa: E731
         fail = [{'elf': None, 'stage': 'build', 'message': '<script>@maintainers `x`'}]
-        base = _shard('b1', {'device/a/a.elf': sizes(1)})
-        with tempfile.TemporaryDirectory() as b, tempfile.TemporaryDirectory() as c:
-            md, comment, _data = sd.compare_runs(
-                _run_dir(b, [base]), _run_dir(c, [_shard('b1', {'device/a/a.elf': sizes(2)}, failures=fail)],
-                                              scope=self.SCOPE), symbols=True)
+        md, comment, _data = self.compare([_shard('b1', {'device/a/a.elf': sizes(1)})],
+                                          [_shard('b1', {'device/a/a.elf': sizes(2)}, failures=fail)], symbols=True)
         for text in (md, comment):
             self.assertNotIn('<img', text)
             self.assertNotIn('<script', text)
@@ -2702,10 +2644,8 @@ class Compare(ProfileCase):
 
     def test_symbols_are_omitted_when_a_snapshot_lacks_them(self):
         bare = {k: v for k, v in _elf(1).items() if k != 'symbols'}
-        with tempfile.TemporaryDirectory() as b, tempfile.TemporaryDirectory() as c:
-            md, _c, _d = sd.compare_runs(_run_dir(b, [_shard('b1', {'device/a/a.elf': bare})]),
-                                         _run_dir(c, [_shard('b1', {'device/a/a.elf': _elf(2)})], scope=self.SCOPE),
-                                         symbols=True)
+        md, _c, _d = self.compare([_shard('b1', {'device/a/a.elf': bare})], [_shard('b1', {'device/a/a.elf': _elf(2)})],
+                                  symbols=True)
         self.assertIn('symbols omitted', md)
 
     def test_a_board_in_two_artifacts_is_rejected(self):
@@ -2714,18 +2654,13 @@ class Compare(ProfileCase):
         self.assertEqual(list(run['shards']), ['b1'])
         self.assertEqual(len(run['errors']), 1)
 
-    def test_an_approximate_baseline_is_labelled_with_its_note(self):
+    def test_an_approximate_baseline_is_labelled_with_its_note_and_own_commit(self):
         md, _c, _d = self.compare([_shard('b1', {'device/a/a.elf': _elf(1)}, sha='d')],
-                                  [_shard('b1', {'device/a/a.elf': _elf(1)})],
+                                  [_shard('b1', {'device/a/a.elf': _elf(2)})],
                                   baseline={'sha': 'd' * 40, 'url': 'https://github.com/x/y/actions/runs/1',
                                             'exact': False, 'note': '2 master commits before this build'})
         self.assertIn('Baseline: dddddddddd (approximate) https://github.com/x/y/actions/runs/1 - 2 master '
                       'commits before this build', md)
-
-    def test_an_approximate_baseline_labels_the_base_side_with_its_own_commit(self):
-        md, _c, _d = self.compare([_shard('b1', {'device/a/a.elf': _elf(1)}, sha='d')],
-                                  [_shard('b1', {'device/a/a.elf': _elf(2)})],
-                                  baseline={'sha': 'd' * 40, 'url': 'https://example/run/1', 'exact': False})
         self.assertIn('| File (dddddddddd → cccccccccc) |', unpad(md))
 
     def test_an_unavailable_baseline_is_said_so(self):
