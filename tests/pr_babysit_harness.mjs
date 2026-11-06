@@ -4237,6 +4237,14 @@ test('a reply is published by the script from a workflow-built manifest', async 
   assert.deepEqual(replies, [{ commentId: 2, body: 'not so', digest: fnv1a('not so') }])
 })
 
+test('a manifest the relay writes carries no backslash-semicolon for the Bash tool to rewrite (#417)', async () => {
+  const body = 'run `find . -exec rm {} \\;` and C:\\path'
+  const { calls } = await run({ reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body }], bots: 'reviewed' } })
+  const c = calls.find(x => x.label === 'replies#1')
+  assert.doesNotMatch(c.prompt, /\\;/, 'no backslash-semicolon in the prompt')
+  assert.deepEqual(manifestOf(calls, 'replies#1'), [{ commentId: 2, body, digest: fnv1a(body) }], 'the body arrives whole')
+})
+
 test('a reply that landed with the wrong body is a repair for the caller, never reposted, inspected or edited', async () => {
   const wrong = {
     args: { autoPush: true, maxCycles: 2 },

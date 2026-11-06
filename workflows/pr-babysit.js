@@ -152,6 +152,9 @@ const STATE_VERSION = 4
 const canonical = (v) => Array.isArray(v) ? `[${v.map(canonical).join(',')}]`
   : v && typeof v === 'object' ? `{${Object.keys(v).sort().map(k => `${JSON.stringify(k)}:${canonical(v[k])}`).join(',')}}`
   : JSON.stringify(v)
+// JSON a relay writes to a file for a script: a literal backslash as \u005c, so no `\;` reaches the Bash tool,
+// which rewrites it (#417). Every backslash JSON.stringify emits starts an escape, so its `\\` pairs are exactly them.
+const inbound = (v) => JSON.stringify(v).replace(/\\\\/g, '\\u005c')
 const sealOf = ({ digest, ...st }) => fnv1a(canonical(JSON.parse(JSON.stringify(st))))
 // facts.py's seal: fnv1a over the canonical JSON without null members.
 const bare = (v) => Array.isArray(v) ? v.map(bare)
@@ -1361,7 +1364,8 @@ const buildCheck = async (tag, owned) => {
   const r = await relayRun(
     `${IN_CHECKOUT}From the checkout's top level, editing nothing, ` +
     runExactly(`${BUILD_SCRIPT}${owned.map(f => ` --path=${shq(f)}`).join('')} --command=${shq(plan.command)}` +
-      `${plan.setup ? ` --setup=${shq(plan.setup)}` : ''}${plan.requires.map(t => ` --require=${shq(t)}`).join('')}`),
+      `${plan.setup ? ` --setup=${shq(plan.setup)}` : ''}${plan.requires.map(t => ` --require=${shq(t)}`).join('')}`,
+      ' Run it in the foreground with a Bash timeout of 600000 ms, the tool\'s maximum.'),
     { label: `build#${tag}`, phase: 'Fix', model: 'haiku', effort: 'low', schema: BUILD_RUN },
   )
   const why = !r ? 'no sealed receipt (the relay died or its line failed its seal)' : r.error ? r.error
@@ -1965,7 +1969,7 @@ const publishReplies = async (label, drafts, how, cycle, digestOf) => {
   if (pendingReview) return { pass: false, detail: `not sent: pending review ${pendingReview.review} of ${pendingReview.login}`, receipts: [], replied: [] }
   const out = await runReplyScript(label, 'manifest', `Publish these replies on PR #${args.pr}`,
     'Do not post, edit or delete anything yourself and do not change a body; the script posts once, reads back and resolves. ',
-    `Manifest: ${JSON.stringify({ replies })}`)
+    `Manifest: ${inbound({ replies })}`)
   const expected = new Map(replies.map(r => [r.commentId, r.digest]))
   // An error line skips the seal check, so receipts beside it prove nothing.
   const receipts = out && !out.error ? out.receipts.filter(r => expected.has(r.commentId)) : []
@@ -2024,7 +2028,7 @@ const settleSonar = async (cycle, entry, ended) => {
   const r = await relayRun(
     `${IN_CHECKOUT}Mark SonarCloud issues on PR #${args.pr}: write exactly this JSON to a new temporary file, a name without quotes, and ` +
     runExactly(`${SONAR_SCRIPT} --pr ${args.pr} --repo ${shq(repo)} --head ${expectedHead} --manifest '<that file>' --receipt ${shq(receipt)}`,
-      ` Change nothing on SonarCloud or GitHub yourself. Manifest: ${JSON.stringify({ items })}`),
+      ` Change nothing on SonarCloud or GitHub yourself. Manifest: ${inbound({ items })}`),
     { label, phase: 'Push', model: 'haiku', effort: 'low', schema: SONAR })
   if (!r) { log(`${label}: no answer — the issues stay owed`); return 0 }
   if (r.error) { sonarDown = r.error; log(`${label}: ${r.error} — the issues stay owed, nothing more is asked this launch`); return 0 }
@@ -2227,7 +2231,7 @@ const settleCaller = async (cycle, digestOf, held, ended) => {
   if (!ready.length || await ended('reuse')) return []
   const out = await runReplyScript(`reuse#${cycle}`, 'reuse', `Settle these comments on PR #${args.pr} on the replies already there`,
     'The script posts nothing; do not post, edit or delete anything yourself. ',
-    `Reuses: ${JSON.stringify({ reuses: ready.map(s => ({ commentId: s.commentId, replyId: s.replyId, bodyDigest: s.bodyDigest, originalDigest: s.commentDigest })) })}`)
+    `Reuses: ${inbound({ reuses: ready.map(s => ({ commentId: s.commentId, replyId: s.replyId, bodyDigest: s.bodyDigest, originalDigest: s.commentDigest })) })}`)
   const settled = []
   for (const s of ready) {
     const mine = (out && !out.error ? out.receipts : []).filter(r => r.commentId === s.commentId)
@@ -2258,7 +2262,7 @@ const ciLaneRun = async (cycle, lanes, entry) => {
     const prompt = (command) =>
       `${IN_CHECKOUT}Editing and committing nothing, ${payload ? 'write exactly the JSON below to a new temporary file, a name without quotes, and ' : ''}` +
       runExactly(`${COLLECT_SCRIPT} ${command} --repo ${shq(repo)} --pr ${args.pr} --head ${head}${payload ? " < '<that file>'" : ''}`,
-        ' Run it in the foreground with a Bash timeout of 600000 ms, the tool\'s maximum.' + (payload ? `\n${JSON.stringify(payload)}` : ''))
+        ' Run it in the foreground with a Bash timeout of 600000 ms, the tool\'s maximum.' + (payload ? `\n${inbound(payload)}` : ''))
     const opts = { label, phase: 'Triage', model: 'haiku', effort: 'low', schema, contract: COLLECT_CONTRACT }
     // A skew stops the cycle (runLanes); to every reader here its line is an error.
     const skewed = (got) => {
