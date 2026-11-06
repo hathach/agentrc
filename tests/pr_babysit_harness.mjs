@@ -7640,6 +7640,16 @@ test('a failed emit-dir read is asked again by the next relay, the load\'s retry
   }
 })
 
+test('a preflight that got no emit directory is asked again on its retry, which asks for the directory again', async () => {
+  for (const answer of [{ dir: '', error: 'no git dir' }, null, new Error('boom')]) {
+    const got = await run({ reviews: oneValid, dirAnswer: n => n === 1 ? answer : undefined })
+    assert.deepEqual(got.labels.slice(0, 1), ['preflight.retry'], JSON.stringify(answer))
+    assert.deepEqual(got.journal.slice(0, 2).map(j => j.label), ['emit:dir', 'emit:dir'])
+    assert.ok(got.logs.includes('preflight: relay recovered on the retry'), got.logs.join('\n'))
+    assert.equal(got.result.cycles, 1, got.result.reason)
+  }
+})
+
 test('a resumed launch reloads the lines its relays wrote; a file there before a live run is reloaded only when it names itself', async () => {
   const reviews = { findings: [invalidFinding({ commentId: 2 })], replies: [{ commentId: 2, body: 'not so' }], bots: 'reviewed' }
   const args = { yieldAfterCycle: true, maxCycles: 3 }

@@ -512,6 +512,10 @@ def pre_commit_python():
             words = [python, *rest.split(None, 0)] if closed else []
         else:
             words = text.split(None, 1)
+        # distlib's launcher pastes the rest into the command line ("<python>" <rest> "<exe>" <args>), which python.exe
+        # splits on spaces and tabs; quoting rules are not modelled, so a quote leaves it to the launcher.
+        if len(words) == 2:
+            words = [] if '"' in words[1] else [words[0], *re.split(r'[ \t]+', words[1])]
         absolute, name = ntpath.isabs, ntpath.basename
     else:
         head, _, body = data.partition(b'\n') if len(data) <= ENTRY_MAX else (b'', b'', b'')

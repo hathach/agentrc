@@ -1447,12 +1447,16 @@ class PreCommitPythonTest(unittest.TestCase):
                                (b'#!"C:\\Program Files\\Python313\\python.exe"\n',
                                 ['C:\\Program Files\\Python313\\python.exe']),
                                (b'#!"C:\\Program Files\\Python313\\python.exe" -E\n',
-                                ['C:\\Program Files\\Python313\\python.exe', '-E'])):
+                                ['C:\\Program Files\\Python313\\python.exe', '-E']),
+                               (b'#!"C:\\Program Files\\Python313\\python.exe" -E -s\n',
+                                ['C:\\Program Files\\Python313\\python.exe', '-E', '-s']),
+                               (b'#!C:\\Python313\\python.exe -E\t -s\r\n', ['C:\\Python313\\python.exe', '-E', '-s'])):
             with self.subTest(shebang):
                 found, entry = self.launcher(shebang)
                 self.assertEqual(found, (words, entry))
-        # no archive after it, a relative python, an unclosed quote, or no python at all
-        for shebang in (b'', b'#!python.exe\n', b'#!"C:\\Program Files\\python.exe\n', b'#!C:\\tools\\uv.exe\n'):
+        # no archive after it, a relative python, an unclosed quote, a quoted option, or no python at all
+        for shebang in (b'', b'#!python.exe\n', b'#!"C:\\Program Files\\python.exe\n',
+                        b'#!C:\\Python313\\python.exe -X "utf8"\n', b'#!C:\\tools\\uv.exe\n'):
             with self.subTest(shebang):
                 self.assertIsNone(self.launcher(shebang)[0])
         self.assertIsNone(self.launcher(b'#!C:\\Python313\\python.exe\n', WRAPPER)[0], 'a wrapper')

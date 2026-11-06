@@ -818,7 +818,10 @@ const relayRetry = async (prompt, opts) => {
   if (r && !r.error) log(`${opts.label}: relay recovered on the retry`)
   return r
 }
-const relayOnce = async (prompt, opts, retryPrompt = prompt) => (await relayRun(prompt, opts)) ?? relayRetry(retryPrompt, opts)
+const relayOnce = async (prompt, opts, retryPrompt = prompt) => {
+  const r = await relayRun(prompt, opts)
+  return r && !r.transport ? r : (await relayRetry(retryPrompt, opts)) ?? r
+}
 const settles = (r) => r.verified === true && r.replyId !== null &&
   (r.kind === 'issue' || r.kind === 'review-body' || (r.kind === 'review' && r.resolved === true))
 // A rerun is safe: reply.py reuses a reply of ours rather than post again, and a rerun of the same request replays

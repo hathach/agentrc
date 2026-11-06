@@ -141,6 +141,20 @@ class Start(unittest.TestCase):
         inv = json.loads((self.out / 'inventory.json').read_text())
         self.assertEqual(inv['tests_added_removed'], [[2, 1, 'tests/test_a.py']])
 
+    def test_an_external_diff_does_not_change_the_counts(self):
+        self.repo.git('config', 'diff.external', 'true')
+        self.assertEqual(self.start('--base', self.base)[0], 0)
+        inv = json.loads((self.out / 'inventory.json').read_text())
+        self.assertEqual(inv['tests_added_removed'], [[2, 1, 'tests/test_a.py']])
+
+    def test_a_textconv_driver_does_not_change_the_counts(self):
+        self.repo.git('config', 'diff.hide.textconv', 'sed -e s/def/xx/')
+        (self.repo.path / '.git' / 'info').mkdir(exist_ok=True)
+        (self.repo.path / '.git' / 'info' / 'attributes').write_text('*.py diff=hide\n')
+        self.assertEqual(self.start('--base', self.base)[0], 0)
+        inv = json.loads((self.out / 'inventory.json').read_text())
+        self.assertEqual(inv['tests_added_removed'], [[2, 1, 'tests/test_a.py']])
+
     @unittest.skipUnless(os.name == 'posix', 'a double quote cannot be in a Windows file name')
     def test_a_name_git_quotes_is_decoded(self):
         self.repo.commit({'tests/café "q".py': 'def test_q():\n  pass\n'})
