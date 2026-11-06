@@ -218,7 +218,7 @@ class HooksTest(unittest.TestCase):
         log = Path(self.repo.parent) / 'runs.log'
         code, out = self.run_script('a.txt', env={**self.env, 'HOOK_LOG': str(log)})
         self.assertEqual((code, out['ran'], out['passed'], out['modifiedBy']), (0, True, False, []))
-        # the HEAD rerun is the hook alone in another tree; the pass after it skips the excused hook
+        # the change's run, then HEAD's rerun of the hook alone in another tree; without fail_fast no pass follows
         self.assertEqual(log.read_text().splitlines(), ['run', 'run'])
         self.assertEqual(out['baselineFailed'], ['counted'])
 

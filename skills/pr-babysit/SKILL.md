@@ -55,15 +55,14 @@ A launch on a PR no longer open stops `pr-merged` or `pr-closed`, at preflight o
 `preflight.py`, `harvest.py`, `scope_check.py`, `state_transfer.py`, `launch_result.py` and `commits.py` only read, except that
 `preflight.py` creates the launch's receipts directory and `commits.py commit` stages and commits exactly its paths, saving its receipt; `hooks.py` runs the repository's
 hooks, which may rewrite files. It reruns each failed hook that rewrote nothing alone in a temporary detached worktree
-of HEAD, then removes it with its registration, no other worktree's: one failing there with the same output is
-excused, left out of the workflow's verdict and skipped at the commit. A hook whose id SKIP cannot name, or would
-skip another hook by, is never rerun, nor any when the config cannot be read, with PyYAML or, lacking it, by
-pre-commit's own interpreter (its entry script's `#!` line); its `notRerun` entry says why, and so does the refusal.
-A rerun the deadline or an error cuts short gets one too, as do those after it, and the failures stay counted.
-When every failure is excused and a hook may stop the run early (fail_fast in the config, or left to a remote
-repository's manifest), it runs the hooks again with those skipped, rerunning what fails there on HEAD in turn, so a
-fail_fast stop hides none; `build.py` builds the checkout in a fresh
-build directory; `push.py` publishes `<sha>` and reads back
+of HEAD, then removes it with its registration, no other worktree's: one failing there with the same output is excused,
+left out of the workflow's verdict and skipped at the commit. A hook whose id SKIP cannot name, or would skip another
+hook by, is never rerun, nor any when the config cannot be read, with PyYAML or, lacking it, by pre-commit's own
+interpreter (its entry script's `#!` line); its `notRerun` entry says why, and so does the refusal. A rerun the deadline
+or an error cuts short gets one too, as do those after it, and the failures stay counted. When every failure is excused
+and a hook may stop the run early (fail_fast in the config, or left to a remote repository's manifest), it runs the
+hooks again with those skipped, rerunning what fails there on HEAD in turn, so a fail_fast stop hides none; `build.py`
+builds the checkout in a fresh build directory; `push.py` publishes `<sha>` and reads back
 where it landed, `sonar.py` comments on and resolves SonarCloud issues, and `coderabbit_trigger.py` edits
 CodeRabbit's summary comment to tick its Trigger review box, or with `--request` posts one `@coderabbitai review` comment, and `greptile_trigger.py` posts one `@greptileai` comment, and `merge.py --merge` merges the PR. Run any of them by hand only with the user's authorization to publish there.
 

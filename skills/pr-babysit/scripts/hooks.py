@@ -6,12 +6,14 @@
 Run from the checkout's top level. Prints the tree status and a snapshot of
 PATH plus every path the status names, runs `pre-commit run --files PATH...`
 when .pre-commit-config.yaml exists (once more if it failed after a hook
-modified files), then the status and snapshot again. All runs, the HEAD reruns below included, get N
-seconds (default 540) from the start, and removing HEAD's tree after them CLEANUP (20) more, inside the 600 a relay's
-Bash call allows; past N the pre-commit process tree is killed: on the first pass the result is an error, on a HEAD
-rerun its hook and those left are in notRerun, and on a later pass it is the failure `(pre-commit)`. Status lines are
-`git status --porcelain -z` records, each untracked file its own; snapshot lines are `<644|755> <blob> <path>` or
-`absent - <path>`.
+modified files), then the status and snapshot again. All runs, the HEAD reruns
+below included, get N seconds (default 540) from the start, and removing HEAD's
+tree after them CLEANUP (20) more, inside the 600 a relay's Bash call allows;
+past N the pre-commit process tree is killed: on the first pass the result is an
+error, on a HEAD rerun its hook and those left are in notRerun, and on a later
+pass it is the failure `(pre-commit)`. Status lines are
+`git status --porcelain -z` records, each untracked file its own; snapshot lines
+are `<644|755> <blob> <path>` or `absent - <path>`.
 
 stdout ends with one JSON line {ran, passed, modifiedBy, failed, baselineFailed,
 notRerun, before, after, snapshotBefore, snapshotAfter, seal} (seal:
@@ -27,25 +29,29 @@ in any order, the tree's path read as the checkout's, and each number standing
 alone, such as a duration, line number, count, pid or address, each time,
 worker number and temporary name masked), so they are no evidence against the
 change (#378). A hook that ever modified files is never rerun there, nor one
-whose id SKIP cannot name (a comma, or padding the config gives it), more than one config entry uses or another hook in
-the config takes as its alias (SKIP skips those hooks too, and a fail_fast stop
-at one leaves the rest unchecked), nor any when the config cannot be read:
-with PyYAML, or without it by pre-commit's own interpreter when the #! line of
-pre-commit's entry script names a python by absolute path (not on Windows);
-notRerun is {hook, why} for each failed hook not rerun there; failed's error and
-notRerun's why hold no terminal escapes or control characters, as commits.py's detail. Each rerun gets
-a clean HEAD tree, checked out and reset without the repository's git hooks; removing it
-removes its own registration, no other, and stderr names what stays. The tree has
-only what HEAD tracks: a hook that needs the
-checkout's ignored files (fetched dependencies) fails there differently and
-stays counted. Run alone there, all a hook prints after its block is its own; on the change its output may end at
-any later result shaped as pre-commit's whose block, if one follows, names a hook the config runs after it, as a
-result it printed may look alike, or at the end, and it is excused only when HEAD's matches it at one of those. A
-result inside its output at each of those whose block names an id the config lacks is one it printed, no other hook's
-failure or rewrite; one naming a configured id, or any when the config is unread, stays counted. A
-line only the change prints keeps it counted, unless it follows all HEAD's output under such a result, as a nested
-pre-commit run naming a later hook's id would print. A change that leaves a hook's output the same once masked is
-still excused: a hook that prints only a count of its violations, or a new
+whose id SKIP cannot name (a comma, or padding the config gives it), more than
+one config entry uses or another hook in the config takes as its alias (SKIP
+skips those hooks too, and a fail_fast stop at one leaves the rest unchecked),
+nor any when the config cannot be read: with PyYAML, or without it by
+pre-commit's own interpreter when the #! line of pre-commit's entry script names
+a python by absolute path (not on Windows); notRerun is {hook, why} for each
+failed hook not rerun there; failed's error and notRerun's why hold no terminal
+escapes or control characters, as commits.py's detail. Each rerun gets a clean
+HEAD tree, checked out and reset without the repository's git hooks; removing it
+removes its own registration, no other, and stderr names what stays. The tree
+has only what HEAD tracks: a hook that needs the checkout's ignored files
+(fetched dependencies) fails there differently and stays counted. Run alone
+there, all a hook prints after its block is its own; on the change its output
+may end at any later result shaped as pre-commit's whose block, if one follows,
+names a hook the config runs after it, as a result it printed may look alike, or
+at the end, and it is excused only when HEAD's matches it at one of those. A
+result inside its output at each of those whose block names an id the config
+lacks is one it printed, no other hook's failure or rewrite; one naming a
+configured id, or any when the config is unread, stays counted. A line only the
+change prints keeps it counted, unless it follows all HEAD's output under such a
+result, as a nested pre-commit run naming a later hook's id would print. A
+change that leaves a hook's output the same once masked is still excused: a hook
+that prints only a count of its violations, or a new
 violation replacing one of HEAD's that differs from it only in numbers; CI runs
 the hook on the pushed head. When every failure is excused and a hook may stop
 the run early (fail_fast set on the whole config or a hook, or left to a remote
