@@ -156,26 +156,16 @@ records the raw stream on the rig before the board's final park, and `sysview_ci
 - ch32v307v_r1_1v0 at level 4 dropped off the bus under sustained CDC traffic. The old notes blame the recorder's
   interrupt masking in one place and, after an A/B, persistent SDI debug access in another; which applies to this
   drop is unresolved.
-- Measured windows: metro_m4_express's attach-only stream decoded 2.4–5.6 s of a 15 s workload; a post-mortem ring
-  of 16 KB held ~20–25 ms of CDC bulk on same54_xplained, and one of 4096 B decoded to 0.16 s on ch32v307v_r1_1v0.
-- Reference numbers (`cdc_msc_freertos`, level 4): same54_xplained over live J-Link had ISR 96/98/99 p50 27–33 µs,
-  `tud_task` p50 23 µs and overflow 0 at 16 KB. stm32h743nucleo over OpenOCD had ISR 117 (OTG_FS IRQn 101 + 16) at
-  p50 4.3 µs; the old skill also claims a matching J-Link capture, which its board notes contradict (no J-Link
-  wired), so treat that comparison as unestablished.
-- 2026-10-22 on ci.lan with these scripts, firmware from 49e49f810 at level 4, a CDC burst as the workload:
-  - stm32f407disco `cdc_msc_freertos` (its on-board ST-LINK runs J-Link firmware, serial 000773661813), same image
-    over both streaming routes: live J-Link 8.4 s, ISR 83 p50/p99 18.1/21.1 µs, SysTick 8.8/10.1, `tud_task` (#512)
-    23.4/26.2, ready→run 7.2, overflow 131; OpenOCD RTT (`interface/jlink.cfg`) 17.1 s, ISR 83 18.1/22.4, SysTick
-    8.8/10.1, overflow 1136, and SystemView reported errors loading the capture (-161).
-  - Its post-mortem build's 64 KiB ring decoded to 12205 events, only the last 158 (6 ms) timed, consistent with an
-    earlier J-Link session's close having stopped CYCCNT (2026-10-23: dumped after a reflash, 9187 events over 243 ms,
-    all timed).
-  - metro_m4_express `cdc_msc_freertos` live J-Link: a 21.7 s window for `--duration-ms 8000` (the trace starts at
-    boot; why is not established), ISR 96/98/99 p50 35.8/37.4/32.6 µs, overflow 10.
-  - raspberry_pi_pico `cdc_msc` OpenOCD RTT: 17.7 s, ISR 21 (n 19829) p50/p99 8/15 µs in whole microseconds,
-    overflow 0.
-  - ch32v307v_r1_1v0 `cdc_msc` post-mortem dump of its 4 KB ring: 0.147 s, the function table populated and no ISR
-    rows.
+- Capture windows (the runs: agentrc#251, 394d2ef): a post-mortem ring of 16 KB held ~20–25 ms of CDC bulk on
+  same54_xplained, one of 4096 B decoded to 0.16 s on ch32v307v_r1_1v0, and metro_m4_express's attach-only stream
+  2.4–5.6 s of a 15 s workload. stm32f407disco's 64 KiB post-mortem ring, dumped after an earlier J-Link session's
+  close, decoded to 12205 events with only the last 158 (6 ms) timed; dumped after a reflash, 9187 events over 243 ms,
+  all timed. metro_m4_express's live J-Link window ran from boot (21.7 s for `--duration-ms 8000`; why is not
+  established), and raspberry_pi_pico's timestamps are whole microseconds.
+- The route comparison behind `sysview.md`'s OpenOCD loss figure (stm32f407disco `cdc_msc_freertos` level 4, ci.lan
+  2026-10-22, firmware 49e49f810): live J-Link 8.4 s, ISR 83 p50 18.1 µs, SysTick 8.8, `tud_task` 23.4, overflow 131;
+  OpenOCD RTT (`interface/jlink.cfg`) 17.1 s, ISR 83 p50 18.1 µs, SysTick 8.8, overflow 1136. Per-board reference
+  numbers (same54_xplained, stm32h743nucleo): agentrc#251 (394d2ef).
 - nanoch32v203's 838.5 Hz tick is a probe artifact, not a board clock bug (tinyusb#4296, 2026-10-23, WCH-LinkE with
   OpenOCD 0.12.0+dev-02620 `wlinke`): attaching to the running CH32V203 left it on HSI ×15 with HSE off
   (RCC_CTLR `0x03008a83`, CFGR0 `0x00b4040a`; tick 838.3–838.8 Hz) until a reset; `reset halt` then `resume` in the same
@@ -189,21 +179,20 @@ records the raw stream on the rig before the board's final park, and `sysview_ci
     stopped near 100 KB with a 64 KB ring's backlog undrained, a ~8 s window for a 15 s workload. Pass
     `-c "adapter speed 4000"` on the capture route (the 4 MHz limit is not checked: the MAX32666 datasheet is not in
     the library); loss stays nonzero even at 10 MHz.
-  - Bare-metal builds leave the USB IRQ at priority 0, which the BASEPRI 0x20 RTT lock never masks: the ISR
-    corrupts half-built packets (wrong function ids, negative timestamp deltas the GUI turns into +0.699 s each).
-    Moving the IRQ to priority 1 removed every corrupt packet. The PRIMASK lock (tinyusb#4294) fixes it at any
-    priority: 0 corrupt rows in three 4 MHz captures, 2026-10-29.
+  - Bare-metal builds leave the USB IRQ at priority 0, which a BASEPRI 0x20 RTT lock never masks: the ISR corrupted
+    half-built packets (wrong function ids, negative timestamp deltas) until the PRIMASK lock (tinyusb#4294) fixed it at
+    any priority; the experiments behind it are in this file at agentrc#353 (12d1443).
 - max32650 and max32690 take the same TMR timestamp route (`hw/bsp/maxim/sysview_max32_tmr.h`) from tinyusb#4356
   (8bfefdc83): their user guides do not document the DWT cycle counter. Build-verified only; on hardware, still to
   check: `board_init` completing (max32690's MSDK timer init waits on clock-ready and write-done without a bound), the
   counter's progress and rate, max32690's carry between its cascaded 16-bit halves, the full rollover, and decoded
   captures under USB and FreeRTOS load.
 - stm32f407disco `cdc_msc_freertos` at level 4 produces about 50k events/s under the CDC burst, more than an RTT read
-  drains (tinyusb#4351, 2026-10-29, 64 KiB buffer): OpenOCD at its 2 MHz SWD clock delivered 58-67 KB/s and lost 79 %
-  of the events, and J-Link firmware on the on-board ST-LINK at 4 MHz lost 61 %. OpenOCD's 1024-byte RTT read per poll
-  is not the limit: a build reading 8 KiB moved 64.5 KB/s against 60.7, the same cost per byte. Bare-metal `cdc_msc`
-  (about 11k events/s) loses nothing over a 15 s CDC burst with its 1 s idle gaps; 0.5 s and 0.1 s gaps, the only
-  shorter ones tried, overflowed.
+  drains (tinyusb#4351, 64 KiB buffer): OpenOCD at its 2 MHz SWD clock delivered 58-67 KB/s and lost 79 % of the events,
+  J-Link firmware on the on-board ST-LINK at 4 MHz 61 %; OpenOCD's 1024-byte RTT read per poll is not the limit (an
+  8 KiB read cost the same per byte; measurements in this file at agentrc#353, 12d1443). Bare-metal `cdc_msc` (about
+  11k events/s) loses nothing over a 15 s CDC burst with its 1 s idle gaps; 0.5 s and 0.1 s gaps, the only shorter
+  ones tried, overflowed.
 
 ## Espressif integration
 
@@ -237,49 +226,20 @@ records the raw stream on the rig before the board's final park, and `sysview_ci
   and the rebuild recipe is in `espressif.md`, "The end-of-stack watchpoint". Here `idf.py` takes
   `-C examples/device/<example> -DBOARD=<board>` as well, `family.cmake` puts `sdkconfig` in the build directory, and an
   override file passed as `-DSDKCONFIG_DEFAULTS` loses: the example's CMakeLists appends its own defaults after it.
-- Fresh-executor runs of the documented recipe, 2026-10-16 (hw-validator from an isolated config, openocd 20260703,
-  tinyusb ea1d867ce). "Recipe" is attach, 1 s halt and resume, `thbreak tud_task_ext` with backtrace and thread list,
-  the breakpoint budget probe and a clean end with the device answering; "load" is the host traffic during a baseline, a
-  debug window holding the halt and the hit, and an after-window. The chip behaviour behind each verdict is in
-  `espressif.md` (Attach, "The end-of-stack watchpoint", the variant sections):
-
-  | Board, example                                                                   | Recipe                                                                                             | Under load |
-  | -------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- | --- |
-  | P4 Function-EV v1.4 (chip v1.0), cdc_msc_freertos stock                          | refuted (below)                                                                                    | 8 KiB MSC ops 12.8 ms before the attach, ~10 s after; one run lost CDC and MSC around the attach, another's CDC probe timed out 5 s after it with no sustained traffic |
-  | P4, cdc_msc_freertos, watchpoint off                                             | all verified (8 tasks, the CDC echo after `shutdown` reproduced)                                   | no echo or MSC op lost; the only gaps (1.09 s, 1.00 s) at the halt and the hit; service kept after `shutdown` |
-  | P4, cdc_msc_throughput                                                           | all verified (5 tasks at connect, 3 hardware breakpoints, 2 s halt)                                | 80/80 MSC ops of 16 MiB with CDC both ways; host-to-device CDC kept through a 1.1 s halt and one hit, zero kernel messages; device-to-host CDC had stalled before the attach (below), so that direction is unverified |
-  | S31 CoreBoard, cdc_msc_freertos stock                                            | refuted (below)                                                                                    | under a 100 ms CDC echo loop and the 8 KiB RAM-disk loop, the first MSC ops after the attach took 11-12 s and CDC writes timed out before the 1 s halt |
-  | S31, cdc_msc_freertos, watchpoint off                                            | all verified (9 tasks)                                                                             | no echo lost across baseline and window (985/985), no kernel line; service kept after `shutdown` |
-  | S31, cdc_msc_throughput                                                          | all verified (6 tasks at connect)                                                                  | 16 MiB MSC ops and 1 MiB CDC writes all completed; one 1.017 s CDC RX gap at the halt; no new kernel message |
-  | Metro ESP32-S3 rev B, pad JTAG, `espressif_s3_devkitc` build of cdc_msc_freertos | all verified (8 tasks); idle, `usbd` reaches `tud_task_ext` within ~0.9 s                          | CDC echo loop and the 8 KiB RAM-disk loop: no malformed echo, I/O error, read mismatch or kernel error |
-  | Metro, cdc_msc_throughput                                                        | all verified (5 threads at the hit)                                                                | 125 s window: one 1.029 s CDC RX gap at the halt, 50 CDC writes of 1 MiB and 3 direct MSC ops of 16 MiB all completed, zero kernel messages; the writes (~127 s) and the MSC ops (138 s) each ran longer than the window, and the full-speed link carried all three streams at once |
-  | Kaluga S2 (FT2232HL by `adapter usb location`), cdc_msc_freertos                 | all verified (tasks usbd/IDLE/blinky/cdc/io); its end-of-stack watchpoint absent from openocd `wp` | 8 KiB RAM-disk loop and a CDC echo every ~100 ms: no echo or dd op lost, the only extended gap the halt (1.105 s) |
-  | Kaluga, cdc_msc_throughput                                                       | all verified                                                                                       | 120 s with the device enumerated throughout, zero kernel messages: one 16 MiB MSC op takes 42-45 s at full speed, the 1 s halt a 1.2 s CDC RX gap |
-
-  The two refuted rows: the P4 recovered through a kernel port power cycle in one run and needed `init; shutdown` or
-  `reset run` from openocd in both, with no final whole-flash verification; the S31 stayed unavailable after `shutdown`
-  and its esptool reset started the Breakpoint boot loop until `init; shutdown`, flash verified intact. Behind them:
-  2630 `debug_reason=00000001` halts in a six-minute P4 session and 1247 on the S31; the P4 reset with "panic'ed
-  (Breakpoint)", `rst:0xc`, on one attach in three and once logged a PMP Store access fault (contribution unresolved);
-  the S31 parked in the panic handler on one attach in two (backtrace `vTaskSwitchContext` → `vPortSetStackWatchpoint` →
-  `esp_cpu_set_watchpoint(wp_num=3)` → `esp_panic_handler`); the matched P4 builds inserted two hardware breakpoints
-  with the option on and three without, and openocd logged "could not remove watchpoint #0" at shutdown; the S31
-  inserted four either way, and `wp` listed the firmware watchpoint only after their deletion and resume; its
-  non-panicking stock attach listed nine tasks. An earlier stock-build attach on the P4 (2026-10-15, before these runs)
-  had been clean: no reset, `thbreak tud_task_ext` hit in `usbd` with a symbolized backtrace, eight tasks listed, CDC
-  echo after `shutdown`.
-- target-debug script runs, 2026-10-16 (htpc, openocd 20260703, esptool 5.5.0, the builds above): `esp_session.py
-  inspect` on the P4, the S31, the Kaluga S2 (by USB location) and the Metro S3 (ESP-Prog serial) ended with every core
-  running, an empty console capture and the app devices' USB numbers unchanged; with gdb hung after the connect and
-  killed at `--timeout`, the Tcl side resumed both P4 cores. `esp_verify.py` matched the flashed builds on the P4, the
-  S31 (USJ) and the Kaluga S2 (UART) and named the bootloader and app mismatches against other builds.
-  `console_capture.py` opens with `--lines low` or `leave` reset none of the P4, the S31 and the Metro (no banner in
-  6 s, USB numbers kept); a USJ-driven reset of the P4 (DTR low, RTS high) kept the whole ROM banner in the capture.
-  Later the same day: `esp_verify.py` matched the Metro's cdc_msc_throughput over ESP-Prog channel B after a forced
-  download boot (`espressif.md`, "ESP32-S3"; esptool 5.2.0's stub upload failed there with "Serial data stream
-  stopped", 5.5.0 passed); with the end-of-stack watchpoint build (cdc_msc_freertos, option on) the
-  Metro's budget stayed exactly 2 and the S31's attach panicked ("The end-of-stack watchpoint"); both boards were put
-  back on their option-off images and verified.
+- Run records, 2026-10-16 (htpc, openocd 20260703, tinyusb ea1d867ce): a fresh hw-validator from an isolated config ran
+  the documented recipe (attach, 1 s halt and resume, `thbreak tud_task_ext` with backtrace and thread list, the
+  breakpoint budget probe, a clean end with the device answering) under host traffic on the P4 Function-EV v1.4 (chip
+  v1.0), the S31 CoreBoard, the Metro ESP32-S3 rev B (pad JTAG) and the Kaluga S2 (FT2232HL by `adapter usb location`),
+  each with `cdc_msc_freertos` and `cdc_msc_throughput`. Per-board results, load windows and the refuted runs' evidence:
+  agentrc#101 (76d8e22). The stock `cdc_msc_freertos`, end-of-stack watchpoint on, refuted the recipe on the P4 and the
+  S31 (`espressif.md`, "The end-of-stack watchpoint"); every other board and build verified. What `espressif.md` cites
+  from them: the matched P4 builds inserted two hardware breakpoints with the option on and three without; the S31
+  listed 9 tasks with it off (as did its non-panicking stock attach) and 6 at connect on `cdc_msc_throughput`; an
+  earlier stock-build attach on the P4 (2026-10-15) had been clean (no reset, `thbreak tud_task_ext` hit in `usbd` with
+  a symbolized backtrace, eight tasks, CDC echo after `shutdown`).
+- Script runs, 2026-10-16 (`esp_session.py inspect`, `esp_verify.py`, `console_capture.py` on the same boards and
+  builds, esptool 5.5.0): agentrc#103 (e023357). esptool 5.2.0's stub upload failed on the Metro over ESP-Prog channel B
+  ("Serial data stream stopped") where 5.5.0 passed.
 - cdc_msc_throughput: its CDC interface is `usb-TinyUSB_Throughput_<serial>-if00`, and its CDC filler is NUL bytes
   without a newline: a canonical-mode tty delivers nothing of it to `cat` and mimics a device-to-host stall; set raw
   mode on the reader's own fd (`techniques.md` "Log capture").

@@ -82,50 +82,22 @@ and touches nothing under `~/.claude`, `~/.codex` or `~/.local`:
 ~/code/agentrc/install.py remove --project ~/code/tinyusb --skill --agent --workflow
 ```
 
-- `<dir>` must be a repository's or a linked worktree's top level. Claude Code
-  finds project skills, agents and workflows only up to the work tree root,
-  and reads project settings, hooks and `env` included, only from the
-  directory the session starts in, so **install every worktree** a session
-  starts in, and start sessions at its top level.
-- Skills, a skill's hook, agents (the `.md` only) and workflows link into
-  `<dir>/.claude/{skills,hooks,agents,workflows}`. The hooks are registered in
-  `<dir>/.claude/settings.local.json`, never the tracked `settings.json`, by
-  absolute path as user-wide, with `env.AGENTRC_DIR`, this checkout. The
-  agentrc paths the agents, workflows and skill recipes name are
-  `"${AGENTRC_DIR:-$HOME/.claude}/..."` (`$HOME/.codex` for Codex), so they
-  resolve to this checkout in a project install and to the user-wide links
-  otherwise; a model that reads one by path expands it in the shell first. A
-  skill names a sibling skill's page relative to its own directory, its
-  symlink resolved, which reaches this checkout either way. `captain` is the
-  exception (below).
-- `--claude-md` is opt-in: it links `instructions/user.md`, the owner's
-  personal rules, as `<dir>/CLAUDE.local.md`, Claude Code's per-user
-  instructions for that project, so those rules and the co-words hold in that
-  work tree only. A link, because an `@`-import of a file outside the project
-  loads only once approved interactively, never in a headless session.
-- Each link, and `settings.local.json` unless git already ignores it, gets a
-  line in one marked block of the repository's `.git/info/exclude`, which its
-  worktrees share; a line stays while any worktree has our link there, so `git
-  status` stays clean everywhere. `remove` drops the links, our hooks and
-  `AGENTRC_DIR` (once no link of ours is left), the file once it is empty, and
-  the lines no worktree needs. Since the block is shared, a project's own
-  untracked file at the path of our link in another worktree is hidden from
-  `git status` too.
-- A destination the repository tracks, or a real file or nonempty directory
-  there, such as the project's own skill of the same name, refuses before any
-  change; `--skip-clashes` leaves it and skips that agentrc entry (and the
-  hook registration with a skipped hook, and a skipped skill's hook, whose
-  link and registration from an earlier install go, unless every selected
-  entry is skipped: then `install` changes nothing). A directory left with
-  only `__pycache__` from a skill the project has since moved out is named as
-  such; delete it. Pruning leaves a tracked link alone.
-- Both actions refuse a symlinked directory between `<dir>` and a destination,
-  `.claude` itself included, which would carry them out of the work tree, and a
-  `settings.local.json` that is tracked or a link, since they rewrite it.
-- Project mode is Claude Code only: `--bin` and `--statusline` are user-wide
-  and refused with `--project`, and Codex's
-  own skills and agents have no project install. A Codex coworker needs no
-  `CLAUDE.local.md`: `cowork` sends it its rules.
+`install.py --help`, its docstring, gives the rules: what links where, the hooks and `AGENTRC_DIR` in
+`settings.local.json`, the shared `.git/info/exclude` block, which flags are user-wide only, and what refuses. Beyond
+those:
+
+- **Install every worktree** a session starts in, and start sessions at its top level.
+- The agentrc paths the agents, workflows and skill recipes name are `"${AGENTRC_DIR:-$HOME/.claude}/..."`
+  (`$HOME/.codex` for Codex); a model that reads one by path expands it in the shell first. A skill names a sibling
+  skill's page relative to its own directory, its symlink resolved, which reaches this checkout either way.
+- `--claude-md` is opt-in: the owner's personal rules and the co-words then hold in that work tree only. A link,
+  because an `@`-import of a file outside the project loads only once approved interactively, never in a headless
+  session. A Codex coworker needs no `CLAUDE.local.md`: `cowork` sends it its rules.
+- Since the exclude block is shared, a project's own untracked file at the path of our link in another worktree is
+  hidden from `git status` too.
+- `--skip-clashes` also takes out a skipped skill's hook link and registration left by an earlier install; when every
+  selected entry is skipped, `install` changes nothing. A directory left with only `__pycache__` from a skill the
+  project has since moved out is named as such; delete it.
 - A user-wide install on the same host is not supported beside a project
   install: the hooks are registered twice and race, and the `headless-chief`
   shadow check misjudges links into a different checkout. A project install
