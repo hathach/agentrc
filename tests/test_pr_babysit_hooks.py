@@ -439,9 +439,10 @@ class HooksTest(unittest.TestCase):
         (self.repo / 'a.txt').write_text('edited\n')
         bin_dir = Path(self.repo.parent) / 'bin'
         bin_dir.mkdir()
-        make_stub(bin_dir, 'pre-commit', WRAPPER)
+        stub = make_stub(bin_dir, 'pre-commit', WRAPPER)
         env = {**self.env, 'PATH': f"{bin_dir}{os.pathsep}{self.env['PATH']}"}
-        self.assertEqual(subprocess.run(['pre-commit', 'run', '--files', 'a.txt'], cwd=self.repo, env=env,
+        # By path: Windows looks a bare name up on this process's PATH, not env's, and would find the real pre-commit.
+        self.assertEqual(subprocess.run([str(stub), 'run', '--files', 'a.txt'], cwd=self.repo, env=env,
                                         capture_output=True).returncode, 1, 'the wrapper fails required')
         code, out = self.run_script('a.txt', env=env)
         self.assertEqual((code, out['passed'], out['baselineFailed']), (0, False, []))
@@ -1476,6 +1477,15 @@ class PreCommitPythonTest(unittest.TestCase):
     def test_no_pre_commit_on_path_is_no_interpreter(self):
         with mock.patch.object(hooks.shutil, 'which', return_value=None):
             self.assertIsNone(hooks.pre_commit_python())
+
+    def test_a_pre_commit_run_as_is_is_the_one_judged(self):
+        # A wrapper pre-commit.cmd ahead of a pip pre-commit.exe on PATH: Windows would run the .exe by a bare name.
+        wrapper = os.path.abspath('pre-commit.cmd')
+        with mock.patch.object(hooks.shutil, 'which', return_value=wrapper), \
+                mock.patch.object(hooks, 'abbrev_length', return_value=7), \
+                mock.patch.object(hooks, 'bounded', return_value=(1, '', '')) as bounded:
+            self.assertEqual(hooks.pre_commit(['a.txt'], 10, time.monotonic(), 'test'), (1, None))
+        self.assertEqual(bounded.call_args.args[0][0], wrapper)
 
 
 class AsCheckoutTest(unittest.TestCase):

@@ -391,8 +391,12 @@ def pre_commit(paths, deadline, start, what, hook=None, cwd=None, skip=()):
     argv = ['run', '--color', 'never', *([hook] if hook else []), '--files', *paths]
     found = pre_commit_python()
     if not found:
+        # The pre-commit judged, by path: Windows' CreateProcess looks a bare name up in its own order (its own
+        # directory first, .exe only), not shutil.which's.
+        on_path = shutil.which('pre-commit')
         try:
-            return bounded(['pre-commit', *argv], deadline, start, what, cwd, env)[0], None
+            return bounded([os.path.abspath(on_path) if on_path else 'pre-commit', *argv], deadline, start, what,
+                           cwd, env, 'pre-commit')[0], None
         except FileNotFoundError:
             raise Unusable(f'{CONFIG} exists but pre-commit is not installed')
     python, entry = found
