@@ -52,6 +52,12 @@ BUILTIN_AGENTS = {'general-purpose', 'Explore', 'Plan', 'fork', 'claude-code-gui
 LOCATORS = 50
 
 
+def shell_abs(path):
+    """Absolute as bash sees it: git-bash on Windows takes /x as absolute; ntpath.isabs does not since 3.13, nor
+    does pathlib."""
+    return str(path).startswith('/') or os.path.isabs(path)
+
+
 class Repo:
     """The audited repository: its worktrees, tracked files at head, and the vocabulary of its scripts."""
 
@@ -73,7 +79,7 @@ class Repo:
         """(repo-relative path, 'attributed'|'unattributed') for a path naming a repository file, else None. A path
         on another host never attributes: it names a file there, not in these worktrees."""
         p = Path(path)
-        if not p.is_absolute():
+        if not shell_abs(path):
             if not cwd and not remote:
                 return None
             p = Path(cwd or '/') / p
@@ -410,7 +416,7 @@ def parse(command, tally, ctx, cwd, env, remote=False):
         if head == 'cd' and len(seg) > 1:
             try:
                 target = expand(seg[1], env)
-                cwd = target if os.path.isabs(target) else os.path.join(cwd or '/', target)
+                cwd = target if shell_abs(target) else os.path.join(cwd or '/', target)
             except KeyError:
                 cwd = None
             ctx = dict(ctx, cwd_class='remote' if remote else tally.repo.cwd_class(cwd))
@@ -450,7 +456,7 @@ def parse(command, tally, ctx, cwd, env, remote=False):
             continue
         if '/' not in path and not path.endswith(('.py', '.sh', '.mjs')):
             continue
-        if not os.path.isabs(path) and cwd is None and not remote:
+        if not shell_abs(path) and cwd is None and not remote:
             tally.unknown['unknown_cwd'] += 1       # a relative script after a cd whose effect is unknown
             continue
         hit = tally.repo.rel(path, cwd, remote)

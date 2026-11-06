@@ -3,12 +3,13 @@ import contextlib
 import importlib.util
 import io
 import json
+import ntpath
 import os
 import subprocess
 import sys
 import textwrap
 import unittest
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from helpers import git_env, guard_survivors, tmpdir  # noqa: E402
@@ -62,7 +63,10 @@ class Repo:
                 p.unlink()
                 continue
             p.parent.mkdir(parents=True, exist_ok=True)
-            (p.write_bytes if isinstance(body, bytes) else p.write_text)(body)
+            if isinstance(body, bytes):
+                p.write_bytes(body)
+            else:
+                p.write_text(body, newline='\n')      # LF on Windows too: sizes are counted in bytes
         self.git('add', '-A')
         self.git('commit', '-q', '-m', msg)
         return self.git('rev-parse', 'HEAD')
@@ -241,7 +245,8 @@ class Usage(unittest.TestCase):
         run(audit.main, 'start', '--repo', str(self.repo.path), '--base', head, '--head', head, '--since', SINCE,
             '--until', UNTIL, '--out', str(self.run_dir))
         self.root = tmpdir(self)
-        self.script = self.repo.path / 'skills/tool/scripts/tool.py'
+        # a command is parsed as bash would: a Windows path in it takes forward slashes
+        self.script = PurePosixPath(self.repo.path.as_posix(), 'skills/tool/scripts/tool.py')
         self.out = tmpdir(self) / 'usage.json'
 
     def usage(self, *extra):
@@ -268,7 +273,8 @@ class Usage(unittest.TestCase):
             use('l', 'Bash', {'command': f'X=$(pwd)/{s.name}; python3 "$X" send 2>&1 >/dev/null'}),
             use('m', 'Bash', {'command': f'false && python3 {s} send'}), result('m', error=True),
             use('n', 'Bash', {'command': f'python3 {s} send &'}), result('n'),
-            use('o', 'Bash', {'command': f"R={self.repo.path}; python3 '$R'\"/skills/tool/scripts/tool.py\" send"}),
+            use('o', 'Bash', {'command': f"R={self.repo.path.as_posix()}; "
+                                         "python3 '$R'\"/skills/tool/scripts/tool.py\" send"}),
             use('p', 'Bash', {'command': f'true || R={s}; python3 "$R" send'}),    # the skipped assignment
             use('q', 'Bash', {'command': f'true || (python3 {s} send)'}),
             use('r', 'Bash', {'command': f'if true; then python3 {s} send; fi'}),
@@ -301,8 +307,8 @@ class Usage(unittest.TestCase):
         elsewhere.parent.mkdir(parents=True)
         elsewhere.write_text(TOOL)
         claude(self.root / 'p' / 's1.jsonl', [
-            use('a', 'Bash', {'command': f'python3 {installed}/tool/scripts/tool.py send'}),
-            use('b', 'Bash', {'command': f'python3 {elsewhere} send'}),
+            use('a', 'Bash', {'command': f'python3 {installed.as_posix()}/tool/scripts/tool.py send'}),
+            use('b', 'Bash', {'command': f'python3 {elsewhere.as_posix()} send'}),
             use('c', 'Bash', {'command': 'python3 /gone/worktree/skills/tool/scripts/tool.py send'}),
             use('d', 'Bash', {'command': 'python3 "$UNSET/tool.py" send'}),
         ])
@@ -377,7 +383,8 @@ class Usage(unittest.TestCase):
         code, out, _ = self.usage('--claude-root', str(self.root / 'missing'))
         self.assertEqual(code, 1)
         self.assertIn('missing', out)
-        self.assertEqual(oct(self.out.stat().st_mode & 0o777), '0o600')
+        if os.name == 'posix':          # Windows keeps only a read-only bit
+            self.assertEqual(oct(self.out.stat().st_mode & 0o777), '0o600')
         self.assertEqual(self.usage()[0], 2)
         if os.name == 'posix' and os.geteuid() != 0:
             locked = self.root / 'locked'
@@ -388,6 +395,13 @@ class Usage(unittest.TestCase):
             code, out, _ = self.usage()
             self.assertEqual(code, 1)
             self.assertIn('partly unreadable', out)
+
+
+class ShellAbs(unittest.TestCase):
+    def test_a_root_relative_path_is_absolute_under_windows_path_rules_too(self):
+        with mock.patch('os.path.isabs', ntpath.isabs):      # Python 3.13+ on Windows: '/x' is not absolute
+            self.assertEqual([usage.shell_abs(p) for p in ('/gone/x', 'C:/x', 'C:\\x', 'x/y', 'C:x')],
+                             [True, True, True, False, False])
 
 
 class Overlap(unittest.TestCase):
