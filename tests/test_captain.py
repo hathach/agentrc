@@ -2108,6 +2108,20 @@ class WatchCollectTest(WatchCase):
         new = [r['msg'] for r in captain.records() if r['type'] == 'watch'][-1]
         self.assertEqual(self.collect()[1], [f'reported {m}:{n} · ready', f'cancelled {w}', f'pending: {new}'])
 
+    def test_a_new_watch_keeps_a_request_the_last_watch_followed(self):
+        self.arm('t2')
+        w = self.watch_id()
+        self.collect()
+        self.terminals['t3'] = pinned('t3')
+        msg = self.msg_of(self.ask('t3'))   # opened during the watch: only the collect without ids follows it
+        self.report_as('t3', msg, {**GOOD, 'needs': 'merge'})
+        captain.cancel(w, self.ident)
+        self.arm('all')
+        new = [r['msg'] for r in captain.records() if r['type'] == 'watch'][-1]
+        self.assertEqual(self.collect()[1], [f'reported {msg} · ready · needs you', f'cancelled {w}',
+                                             f'pending: {new}'])
+        self.assertEqual(self.collect()[1], [f'pending: {new}'])
+
     def test_a_collect_stops_when_the_captain_is_replaced_and_follows_nothing_new(self):
         msg = self.msg_of(self.ask())   # open: the collect waits for it
         new = captain.identity(pinned('t4'))

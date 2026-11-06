@@ -821,6 +821,19 @@ def followed(recs, msgs, base):
     return wanted | {r['msg'] for r in recs if r['type'] == 'joined' and r['watch'] in wanted}
 
 
+def unwatched(recs):
+    """The ids of the requests and relays in recs opened while no watch was open: those are collected by id."""
+    watches, found = set(), set()
+    for r in recs:
+        if r['type'] == 'watch':
+            watches.add(r['msg'])
+        elif r['type'] in WATCH_ENDS:
+            watches.discard(r['msg'])
+        elif r['type'] in ITEMS and not watches:
+            found.add(r['msg'])
+    return found
+
+
 def watch_event(i, rec, items):
     """The collect line for record i on a watch or a member of one, or None."""
     if rec['type'] == 'joined':
@@ -886,13 +899,13 @@ def collect(msgs, wait_ms):
     is pending; NO_ANSWER when wait_ms lapse first, printing `pending: <ids>`. With ids, every event on them is
     printed. Without, printing resumes where the enrolled captain's last collect without ids stopped (COLLECTED,
     stored as this one ends), following what was open there and whatever opened since; with no such cursor, at the
-    open watch's start, else at the ledger's end. A cursor from before the open watch prints only watch events until
-    that watch's start: the requests and relays there were collected by id. What is closed is judged on the whole
-    ledger. A strict read under the lock first: a torn ledger must not look like nothing to wait for. A watch whose
-    captain was replaced or ended is settled here too, at the start and at each poll while one is followed, or nothing
-    else might end it. Every lock wait ends with wait_ms, so the pending line still prints before the caller's
-    timeout. A collect belongs to the captain enrolled when it began: once another enrolls, it prints its pending line
-    and stores nothing."""
+    open watch's start, else at the ledger's end. A cursor from before the open watch skips, until that watch's start,
+    the events of requests and relays opened while no watch was open: those were collected by id. What is closed is
+    judged on the whole ledger. A strict read under the lock first: a torn ledger must not look like nothing to wait
+    for. A watch whose captain was replaced or ended is settled here too, at the start and at each poll while one is
+    followed, or nothing else might end it. Every lock wait ends with wait_ms, so the pending line still prints before
+    the caller's timeout. A collect belongs to the captain enrolled when it began: once another enrolls, it prints its
+    pending line and stores nothing."""
     deadline = time.monotonic() + wait_ms / 1000
     try:
         with locked(wait_ms / 1000):
@@ -902,6 +915,7 @@ def collect(msgs, wait_ms):
             fence = generation()
             start = 0 if msgs else resumed(COLLECTED, recs, watch, opened)
             armed = recs.index(watch) if watch and not msgs else 0
+            by_id = unwatched(recs[:armed])
     except Busy:
         print('pending: the ledger lock stayed held', flush=True)
         return NO_ANSWER
@@ -920,7 +934,7 @@ def collect(msgs, wait_ms):
         for i in range(shown, len(recs)):
             rec = recs[i]
             item = items.get(rec['msg'])
-            if rec['msg'] not in following or not item or (i < armed and item['type'] not in WATCHED):
+            if rec['msg'] not in following or not item or (i < armed and rec['msg'] in by_id):
                 continue
             line = watch_event(i, rec, items) if item['type'] in WATCHED else event(item, rec)
             if line:
@@ -1492,7 +1506,8 @@ def hook(payload):
 def arm(targets, mine):
     """Start the enrolled captain's watch, or widen the one open: `all`, or the named sessions. A new watch sets the
     captain's unset cursors to its start, so a session joining before the first collect is not missed, and keeps a set
-    one, so the last watch's unseen reports stay due; collect skips the requests and relays before the new watch."""
+    one, so the last watch's unseen reports stay due; collect skips the requests and relays opened before it while no
+    watch was open."""
     with locked():
         captain = require_captain(mine)
         if targets == ['all']:
