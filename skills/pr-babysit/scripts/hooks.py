@@ -18,65 +18,72 @@ snapshot lines are `<644|755> <blob> <path>` or `absent - <path>`.
 stdout ends with one JSON line {ran, passed, modifiedBy, failed, baselineFailed,
 notRerun, before, after, snapshotBefore, snapshotAfter, seal} (seal:
 facts.sealed): passed is the exit status of the first pass (the run and its
-retry), modifiedBy the ids of the hooks pre-commit itself said modified files
-in any run. Without a config: ran false, passed true, and the lists empty.
+retry), modifiedBy the ids of the hooks whose files pre-commit itself found
+modified in any run. Without a config: ran false, passed true, and the lists empty.
+
+What each hook did is pre-commit's own account, never read off its stdout: every
+run goes through hook_runner.py under pre-commit's own interpreter, named by the
+#! line of pre-commit's entry script, or on Windows of the archive pip's
+pre-commit.exe launcher carries, as an absolute path to a python, when that
+entry only calls pre-commit's main() as pip writes it; it records the
+hooks pre-commit selected once the config and manifests are resolved and, per
+hook, whether it ran, failed or modified files, and its whole output. A run
+through any other pre-commit, such as a wrapper (it then runs as is), or whose records are
+missing, partial, inconsistent or from a pre-commit version hook_runner.py does
+not support, names no hook: when it failed, failed holds `(pre-commit)` saying
+why, modifiedBy nothing from it, and it gets no retry.
 
 failed and baselineFailed explain a failure: failed, {hook, error} for each hook
-the first pass's last run failed, error its first output line; and
-baselineFailed, the ids among those that, rerun alone in a detached worktree of
-HEAD on the same PATHs, fail there with the same output (comparable: its lines
-in any order, the tree's path read as the checkout's, and each number standing
-alone, such as a duration, line number, count, pid or address, each time,
-worker number and temporary name masked), so they are no evidence against the
-change (#378). A hook that ever modified files is never rerun there, nor one
-whose id SKIP cannot name (a comma, or padding the config gives it), more than
-one config entry uses or another hook in the config takes as its alias (SKIP
-skips those hooks too, and a fail_fast stop at one leaves the rest unchecked),
-nor any when the config cannot be read: with PyYAML, or without it by
-pre-commit's own interpreter when the #! line of pre-commit's entry script names
-a python by absolute path (not on Windows); notRerun is {hook, why} for each
+the first pass's last run failed, error the first line with a word in its
+output; and baselineFailed, the ids among those that, rerun alone in a detached
+worktree of HEAD on the same PATHs, fail there with the output they printed in
+that run (comparable: its lines in any order, the tree's path read as the
+checkout's, and each number standing alone, such as a duration, line number,
+count, pid or address, each time, worker number and temporary name masked), so
+they are no evidence against the change (#378). The change's side is the
+original ordered run, never a later lone run, so a failure caused by what an
+earlier hook left is judged as it happened. A hook that ever modified files is
+never rerun there, nor one SKIP naming it would not select alone (it cannot
+name an id with a comma, or the padding the config gives it) among the hooks the
+run selected and those pre-commit resolves at any stage, aliases a remote
+manifest gives included (the commit's SKIP skips a commit-msg hook too, and a
+fail_fast stop at one leaves the rest unchecked), nor any when hook_runner.py's
+record of every stage's hooks is missing or malformed; notRerun is {hook, why} for each
 failed hook not rerun there; failed's error and notRerun's why hold no terminal
 escapes or control characters, as commits.py's detail. Each rerun gets a clean
 HEAD tree, checked out and reset without the repository's git hooks; removing it
 removes its own registration, no other, and stderr names what stays. The tree
 has only what HEAD tracks: a hook that needs the checkout's ignored files
-(fetched dependencies) fails there differently and stays counted. Run alone
-there, all a hook prints after its block is its own; on the change its output
-may end at any later result shaped as pre-commit's whose block, if one follows,
-names a hook the config runs after it, as a result it printed may look alike, or
-at the end, and it is excused only when HEAD's matches it at one of those. None
-before a result showing a hook that passed and printed counts: it and that output
-may be the hook's own. A
-result inside its output at each of those whose block names an id the config
-lacks is one it printed, no other hook's failure or rewrite; one naming a
-configured id, or any when the config is unread, stays counted. A line only the
-change prints keeps it counted, unless it follows all HEAD's output under such a
-result showing that later hook failed, which counts as that hook's failure. A
-change that leaves a hook's output the same once masked is still excused: a hook
-that prints only a count of its violations, or a new
-violation replacing one of HEAD's that differs from it only in numbers; CI runs
-the hook on the pushed head. When every failure is excused and a hook may stop
-the run early (fail_fast set on the whole config or a hook, or left to a remote
-repository's manifest by a hook's entry), the hooks run once more on the change,
-with its retry, and SKIP naming the excused ones, as the commit will, so a
-fail_fast stop cannot hide a hook the change breaks: what fails there joins
-failed and is rerun on HEAD in turn, the hooks running again while every new
-failure is excused, and a failed run that names no hook adds the failure
-`(pre-commit)`. An alias only a remote repository's own manifest declares is not
-seen, so such a hook may go unrun on the change until CI.
+(fetched dependencies) fails there differently and stays counted. There
+pre-commit must select that hook alone, by its id, before running it, and the
+hook must fail without modifying files. A change that leaves a hook's output the
+same once masked is still excused: a hook that prints only a count of its
+violations, or a new violation replacing one of HEAD's that differs from it only
+in numbers; CI runs the hook on the pushed head. When every failure is excused
+and a hook may stop the run early (fail_fast on the config or a hook as
+pre-commit resolved it, a remote manifest's included), the hooks run once
+more on the change, with its retry, and SKIP naming the excused ones, as the
+commit will, so a fail_fast stop cannot hide a hook the change breaks: what
+fails there joins failed and is rerun on HEAD in turn, the hooks running again
+while every new failure is excused, and a failed run that names no hook adds the
+failure `(pre-commit)`.
 pre-commit runs with core.abbrev pinned at the length HEAD abbreviates to
 when the first run starts (#377), possibly a digit over git's default, which
 the hooks' own git commands inherit. git still lengthens an abbreviation a
 hook's new object makes ambiguous, so rarely a hook that changed nothing is in
 modifiedBy.
 Exit 0 with that line; exit 2 with {"error": ...} when the facts cannot be
-collected or pre-commit's output on the change contradicts its exit status.
+collected or a run's records on the change say a hook failed while pre-commit
+exited 0.
 """
 
 import contextlib
 import functools
+import io
 import json
+import ntpath
 import os
+import posixpath
 import re
 import shutil
 import signal
@@ -85,7 +92,7 @@ import sys
 import tempfile
 import threading
 import time
-import unicodedata
+import zipfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -94,35 +101,33 @@ from facts import Unusable, checkout_top, git, report, status  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
 import windows  # noqa: E402
 
-try:
-    import yaml
-except ImportError:
-    yaml = None
-YAML_ERRORS = (yaml.YAMLError,) if yaml else ()
-
 CONFIG = '.pre-commit-config.yaml'
 DEADLINE = 540
-HOOK_ID = '- hook id: '
-MODIFIED = '- files were modified by this hook'
-# pre-commit pads a hook's name with dots to its result, then prints the
-# hook's `- ` block only when it failed or runs verbose (commands/run.py).
-RESULT = re.compile(r'\.(Passed|Failed)$')
-# Any hook's result line, `(no files to check)Skipped` included.
-NEXT = re.compile(r'[.)](Passed|Failed|Skipped)$')
-# The `- ` block pre-commit prints under each result when it prints one (commands/run.py _run_single_hook): the hook
-# id, the duration when it ran verbose, its exit code when not 0, and the modified-files line.
-BLOCKS = {'Skipped': re.compile(r'- hook id: .+'),
-          'Passed': re.compile(r'- hook id: .+\n- duration: [\d.]+s'),
-          'Failed': re.compile(r'- hook id: .+(?:\n- duration: [\d.]+s)?'
-                               r'(?:\n- exit code: -?\d+(?:\n- files were modified by this hook)?'
-                               r'|\n- files were modified by this hook)')}
+RUNNER = Path(__file__).resolve().with_name('hook_runner.py')
 ERROR_CHARS = 200
 # Seconds past the deadline the HEAD worktree's removal may take.
 CLEANUP = 20
-# Run by pre-commit's own interpreter, which depends on PyYAML, when this one lacks it: the config as JSON.
-LOAD_CONFIG = 'import json, sys, yaml; print(json.dumps(yaml.safe_load(open(sys.argv[1], encoding="utf-8"))))'
-# Any CPython or PyPy build's name: python3, python3.12, python3.13t, python3-dbg, pypy3.
+# Any CPython or PyPy build's name: python3, python3.12, python3.13t, python3-dbg, pypy3, python.exe.
 SHEBANG_PYTHON = re.compile(r'(?:python|pypy)[\w.-]*')
+# The #! line pip's Windows launcher (distlib's ScriptMaker) puts between its stub and the archive it runs.
+LAUNCHER_SHEBANG = re.compile(rb'#!([^\r\n]+)\r?\n(?=PK\x03\x04)')
+# What follows the #! line of the console script pip (distlib) and installer write for pre-commit's main(), quotes as
+# distlib's: the only entry hook_runner.py stands in for, as it does nothing else; a wrapper may set up more.
+ENTRY_SCRIPT = ("import re\nimport sys\nfrom pre_commit.main import main\nif __name__ == '__main__':\n"
+                "    sys.argv[0] = re.sub(r'(-script\\.pyw|\\.exe)?$', '', sys.argv[0])\n    sys.exit(main())\n")
+# pip's own template in place of distlib's (wheel.py PipScriptMaker), from pip 25.2 and from 26.0; the same in the
+# __main__.py of its Windows launcher.
+PIP_ENTRY_SCRIPTS = (
+    "import sys\nfrom pre_commit.main import main\nif __name__ == '__main__':\n"
+    "    if sys.argv[0].endswith('.exe'):\n        sys.argv[0] = sys.argv[0][:-4]\n    sys.exit(main())\n",
+    "import sys\nfrom pre_commit.main import main\nif __name__ == '__main__':\n"
+    "    sys.argv[0] = sys.argv[0].removesuffix('.exe')\n    sys.exit(main())\n")
+# Each exact form of them an installer writes: distlib's quotes or installer's, a coding line or not, LF or CRLF.
+ENTRY_SCRIPTS = {(coding + body).replace('\n', eol).encode()
+                 for body in (ENTRY_SCRIPT, ENTRY_SCRIPT.replace("'", '"'), *PIP_ENTRY_SCRIPTS)
+                 for coding in ('', '# -*- coding: utf-8 -*-\n') for eol in ('\n', '\r\n')}
+# Bytes past which an entry script is no standard one.
+ENTRY_MAX = 1024
 # The failure a run that failed naming no hook adds: not a hook id, so never excused or skipped.
 UNOWNED = '(pre-commit)'
 # What points git at a repository or its index; set by a caller, it would send HEAD's tree's resets and reruns to the
@@ -178,121 +183,102 @@ def snapshot(paths, records):
     return lines
 
 
-def width(line):
-    """line's width as pre-commit pads its result lines (commands/run.py _len_cjk): a wide character counts two."""
-    return sum(2 if unicodedata.east_asian_width(c) in 'FW' else 1 for c in line)
+class Unattributed(Exception):
+    """Why a run's records attribute nothing to any hook."""
 
 
-def own_runs(lines, cols):
-    """The indexes from which the rest of lines can be pre-commit's own output, len(lines) included: a result line
-    padded to cols, the block BLOCKS allows under it, then the end, the next such run, or, under a block not a
-    Skipped one, a blank line and what the hook printed, which may be anything (commands/run.py _run_single_hook)."""
-    n = len(lines)
-    starts = {n}
-    for j in range(n - 1, -1, -1):
-        found = NEXT.search(lines[j])
-        if not found or width(lines[j]) != cols:
-            continue
-        k = j + 1
-        while k < n and lines[k].startswith('- '):
-            k += 1
-        status, block = found[1], '\n'.join(lines[j + 1:k])
-        shaped = BLOCKS[status].fullmatch(block) if block else status != 'Failed'
-        # pre-commit prints a hook's output stripped, so its first line is never blank.
-        if shaped and (k in starts or block and status != 'Skipped' and not lines[k] and k + 1 < n
-                       and lines[k + 1].strip()):
-            starts.add(j)
-    return starts
+def attributed(text, code):
+    """(the roster record, the hook records) hook_runner.py left in text for a run that exited code, checked whole:
+    one start of a supported version, the roster, a hook record per roster entry in order up to the end or a fail_fast
+    stop at a failed one, and the end with code. Unattributed when they are not; Unusable when they say a hook
+    failed and pre-commit exited 0. The roster's everywhere is the hooks record between start and roster, every hook
+    at any stage, or None when it is missing or malformed."""
+    if text is None:
+        raise Unattributed('the pre-commit on PATH is no entry hook_runner.py stands in for, so it ran as is')
+    try:
+        records = [json.loads(line) for line in text.splitlines()]
+        kinds = [r['record'] for r in records]
+    except (ValueError, TypeError, KeyError):
+        raise Unattributed('its records are malformed')
+    if kinds[:1] != ['start']:
+        raise Unattributed('it left no records')
+    if not records[0].get('supported'):
+        raise Unattributed(f"pre-commit {records[0].get('version')} is not a version hook_runner.py supports")
+    everywhere = None
+    if kinds[1:2] == ['hooks']:
+        everywhere = records.pop(1).get('hooks')
+        kinds.pop(1)
+    if kinds[1:2] != ['roster'] or kinds[-1] != 'end' or set(kinds[2:-1]) - {'hook'}:
+        raise Unattributed('its records stop short')
+    roster, ran, end = records[1], records[2:-1], records[-1]
+    try:
+        ids = [h['id'] for h in roster['hooks']]
+        if roster.get('refused'):
+            raise Unattributed(f"it selected {', '.join(ids) or 'no hook'}, not that hook alone")
+        failed = [r['id'] for r in ran if r['failed']]
+        if failed and not code:
+            raise Unusable(f'pre-commit exited 0 but its records say hook {failed[0]} failed')
+        if ([r['index'] for r in ran] != list(range(len(ran))) or [r['id'] for r in ran] != ids[:len(ran)]
+                or len(ran) > len(ids) or any(r['modified'] and not r['failed'] for r in ran)):
+            raise Unattributed('its records contradict themselves')
+        if len(ran) < len(ids) and not (ran and ran[-1]['failed'] and (
+                roster['failFast'] or roster['hooks'][len(ran) - 1]['failFast'])):
+            raise Unattributed('its records contradict themselves')
+        if end['code'] != code or bool(failed) != bool(code):
+            raise Unattributed(f"its records contradict pre-commit's exit status {code}")
+    except (KeyError, TypeError, IndexError):
+        raise Unattributed('its records are malformed')
+    whole = isinstance(everywhere, list) and all(
+        isinstance(h, dict) and isinstance(h.get('id'), str) and isinstance(h.get('alias'), str)
+        and isinstance(h.get('stages'), list) for h in everywhere)
+    return {**roster, 'everywhere': everywhere if whole else None}, ran
 
 
-def passed_with_output(lines, j):
-    """Whether lines[j], a result line, shows a hook that passed and printed: a verbose block, then a blank line."""
-    k = j + 1
-    while k < len(lines) and lines[k].startswith('- '):
-        k += 1
-    return lines[j].endswith('Passed') and j + 1 < k < len(lines) and not lines[k]
-
-
-def ends(lines, k, starts):
-    """Each (end, after) where what the hook whose `- ` block ends above lines[k] printed may end: each own run
-    (starts) under the blank line pre-commit ends a hook's output with, under its last line, which may be
-    pre-commit's next result or one the hook printed itself, as that cannot be told, then the end of lines. after is
-    the id the first `- ` block from there names, None when only result lines follow. A run right under the block
-    ends a hook that printed nothing, and lines in no shape pre-commit prints there run to the end. No run with a
-    passed hook's output at or past it ends it: that result and what follows it may be the hook's own, a line only it
-    prints among them, and the lines alone cannot tell which, so the hook's output runs past it."""
-    n = len(lines)
-    if k in starts:
-        found = [k]
-    elif lines[k]:
-        found = [n]
-    else:
-        talked = max((s for s in starts if k < s < n and passed_with_output(lines, s)), default=k + 1)
-        found = [*(m for m in sorted(starts) if talked < m < n and not lines[m - 1] and lines[m - 2].strip()), n]
-    return [(m, next((x[len(HOOK_ID):].strip() for x in lines[m:] if x.startswith(HOOK_ID)), None)) for m in found]
-
-
-def first_error(lines, block):
+def first_error(record):
     """The first line with a word the hook printed, skipping rules such as unittest's `=====`, bounded for a relay to
-    copy; its last `- ` line when it printed none."""
-    for line in lines:
+    copy; what failed it when it printed none."""
+    for line in record['output'].splitlines():
         text = copyable(line).strip()
         if re.search(r'[^\W_]', text):
             return text[:ERROR_CHARS]
-    return block[-1][2:] if block else 'no output'
+    return 'files were modified by this hook' if record['modified'] else f"exit code: {record['retcode']}"
 
 
-def results(output, exit_code, order=None):
-    """(ids of the hooks whose own `- ` block says they modified files, {hook, error, outputs} of each failed hook,
-    outputs an (output, after) for each of its ends: its whole `- ` block and what it printed up to there).
-
-    A block counts only directly under a result line; the hook's output follows
-    the block after a blank line, so a marker it echoes is not read as one. Under
-    a failed hook's block, a result naming an id order (the config's, None
-    unread) lacks counts only at or past an end of its output where pre-commit's
-    next result may be (follows()): pre-commit's own results name configured ids,
-    so one only inside it at each is a result the hook printed itself."""
-    lines = output.splitlines()
-    runs = {}
-    ids, failures = [], []
-    first_end = 0  # of the last failed hook's output, where pre-commit's next result may be
-    for i, line in enumerate(lines):
-        if not (line.startswith(HOOK_ID) and i and RESULT.search(lines[i - 1])):
-            continue
-        hook = line[len(HOOK_ID):].strip()
-        failed = lines[i - 1].endswith('Failed')
-        block = []
-        for tail in lines[i + 1:]:
-            if not tail.startswith('- '):
-                break
-            block.append(tail)
-        if not hook:
-            raise Unusable(f'pre-commit printed an empty hook id under: {lines[i - 1]}')
-        if i - 1 < first_end and order is not None and hook not in order:
-            continue
-        if failed and not exit_code:
-            raise Unusable(f'pre-commit exited 0 but reported hook {hook} failed')
-        if MODIFIED in block:
-            if not failed:
-                raise Unusable(f'pre-commit reported hook {hook} passed and modified files')
-            ids.append(hook)
-        if failed:
-            cols = width(lines[i - 1])
-            if cols not in runs:
-                runs[cols] = own_runs(lines, cols)
-            k = i + 1 + len(block)
-            cuts = ends(lines, k, runs[cols])
-            # No end accepted: the whole output, which then skips only results naming unconfigured ids.
-            first_end = min((m for m, after in cuts if follows(hook, after, order)), default=len(lines))
-            failures.append({'hook': hook, 'error': first_error(lines[k:cuts[0][0]], block),
-                             'outputs': [('\n'.join([*block, *lines[k:m]]).rstrip(), after) for m, after in cuts]})
-    return ids, failures
+def results(text, code):
+    """(ids of the hooks that modified files, {hook, index, error, output} of each failed hook, attributed()'s roster)
+    of one run from its records; a run they cannot attribute modified nothing it can name and, when it failed, has one
+    failure UNOWNED says why, with no roster."""
+    try:
+        roster, ran = attributed(text, code)
+    except Unattributed as e:
+        return [], [{'hook': UNOWNED, 'error': copyable(f'pre-commit exited {code} naming no hook: {e}')}] if code \
+            else [], None
+    return ([r['id'] for r in ran if r['modified']],
+            [{'hook': r['id'], 'index': r['index'], 'error': first_error(r), 'output': r['output']}
+             for r in ran if r['failed']], roster)
 
 
-def follows(hook, after, order):
-    """Whether pre-commit's next result after hook's output may be one whose block names after (None: no block
-    follows): any when order, the config's ids in run order, is None, else one order runs after hook."""
-    return after is None or order is None or hook in order and after in order[order.index(hook) + 1:]
+def unselected(failure, roster):
+    """Why SKIP naming failure's hook would not skip that hook alone, as pre-commit resolved the config and the
+    manifests, aliases included: among roster's hooks, those its run selected, and its everywhere, those of every
+    stage, which the commit runs with the same SKIP; '' when it would."""
+    names = {s.strip() for s in failure['hook'].split(',') if s.strip()}
+    selected = [i for i, h in enumerate(roster['hooks']) if h['id'] in names or h['alias'] in names]
+    if failure['index'] not in selected:
+        return 'SKIP cannot name it'
+    # The run's hooks are among every stage's: none named there is a record that contradicts the run.
+    named = sum(h['id'] in names or h['alias'] in names for h in roster['everywhere'] or ())
+    if not named:
+        return "hook_runner.py's record of the hooks at every stage is missing or malformed"
+    if len(selected) > 1 or named > 1:
+        return 'SKIP would skip another hook by it'
+    return ''
+
+
+def may_stop(roster):
+    """Whether a hook may stop roster's run early: fail_fast on the config, the run or a hook as pre-commit resolved
+    it, a remote manifest's included."""
+    return roster['failFast'] or any(h['failFast'] for h in roster['hooks'])
 
 
 def kill_tree(proc):
@@ -372,9 +358,9 @@ class Late(Unusable):
     """A command the deadline cut short."""
 
 
-def bounded(argv, deadline, start, what, cwd=None, env=None):
+def bounded(argv, deadline, start, what, cwd=None, env=None, name=None):
     """(exit code, stdout, stderr) of argv, its whole process tree killed once `deadline` seconds from `start` pass
-    (Late)."""
+    (Late, naming the command name, by default argv[0])."""
     group = {'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == 'nt' else {'start_new_session': True}
     proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf-8',
                             errors='replace', cwd=cwd, env=env, **group)
@@ -382,7 +368,7 @@ def bounded(argv, deadline, start, what, cwd=None, env=None):
         out, err = proc.communicate(timeout=max(deadline - (time.monotonic() - start), 0))
     except subprocess.TimeoutExpired:
         kill_tree(proc)
-        late = f'{argv[0]} did not finish within {deadline} s ({what})'
+        late = f'{name or argv[0]} did not finish within {deadline} s ({what})'
         try:
             proc.communicate(timeout=5)
         except subprocess.TimeoutExpired:
@@ -397,18 +383,35 @@ def bounded(argv, deadline, start, what, cwd=None, env=None):
 
 
 def pre_commit(paths, deadline, start, what, hook=None, cwd=None, skip=()):
-    """(exit code, stdout) of one pre-commit run, skip added to the SKIP it inherits."""
+    """(exit code, hook_runner.py's records) of one pre-commit run, skip added to the SKIP it inherits; the records
+    None when pre-commit's interpreter is unknown and it ran as is. With hook, only that hook alone runs."""
     env = pinned_abbrev(other_repo_env() if cwd else os.environ, abbrev_length())
     if skip:
         env = with_skip(env, skip)
-    # Neither -v nor --show-diff-on-failure, and stdout alone: pre-commit prints nothing past its last hook, so all
-    # a hook run alone prints after its block is its own (baseline).
+    argv = ['run', '--color', 'never', *([hook] if hook else []), '--files', *paths]
+    found = pre_commit_python()
+    if not found:
+        # The pre-commit judged, by path: Windows' CreateProcess looks a bare name up in its own order (its own
+        # directory first, .exe only), not shutil.which's.
+        on_path = shutil.which('pre-commit')
+        try:
+            return bounded([os.path.abspath(on_path) if on_path else 'pre-commit', *argv], deadline, start, what,
+                           cwd, env, 'pre-commit')[0], None
+        except FileNotFoundError:
+            raise Unusable(f'{CONFIG} exists but pre-commit is not installed')
+    python, entry = found
+    # What the entry script has as sys.path[0]: its directory, or the launcher itself, run as a zip archive.
+    path0 = entry if entry.lower().endswith('.exe') else os.path.dirname(entry)
+    fd, records = tempfile.mkstemp(prefix='hooks-records-')
+    os.close(fd)
     try:
-        code, out, _ = bounded(['pre-commit', 'run', '--color', 'never', *([hook] if hook else []), '--files', *paths],
-                               deadline, start, what, cwd, env)
+        code = bounded([*python, str(RUNNER), path0, records, *(['--only', hook] if hook else []), *argv], deadline,
+                       start, what, cwd, env, 'pre-commit')[0]
+        return code, Path(records).read_text(encoding='utf-8', errors='replace')
     except FileNotFoundError:
-        raise Unusable(f'{CONFIG} exists but pre-commit is not installed')
-    return code, out
+        raise Unusable(f"pre-commit's {python[0]} cannot run")
+    finally:
+        os.unlink(records)
 
 
 def git_within(deadline, start, *argv, cwd=None):
@@ -460,78 +463,69 @@ def comparable(text, root):
     return sorted(line for line in lines if line)
 
 
+def standard_entry(body):
+    """Whether body, all an entry runs after its #! line, is one of ENTRY_SCRIPTS, byte for byte."""
+    return body in ENTRY_SCRIPTS
+
+
+def launcher_entry(data):
+    """(the #! line pip's pre-commit.exe launcher data carries, the __main__.py of the archive it runs), or None."""
+    found = list(LAUNCHER_SHEBANG.finditer(data))
+    if not found:
+        return None
+    try:
+        with zipfile.ZipFile(io.BytesIO(data[found[-1].end():])) as archive:
+            if archive.namelist() != ['__main__.py']:
+                return None
+            return found[-1][1], archive.read('__main__.py')
+    except (zipfile.BadZipFile, OSError, ValueError):
+        return None
+
+
+@functools.cache
 def pre_commit_python():
-    """(the interpreter and argument the #! line of the pre-commit on PATH names, its entry script's directory), or
-    None when that line names no python by absolute path: a Windows launcher, a wrapper script, env, or distlib's
-    /bin/sh form for a long or spaced path."""
+    """(the interpreter and argument the pre-commit on PATH starts, that entry's resolved path), or None when they are
+    not known or the entry does more than call pre-commit's main() as pip's own does (standard_entry()): then
+    hook_runner.py cannot stand in for it. A POSIX entry script's #! line must name a python by absolute path: not a
+    wrapper script, env, or distlib's /bin/sh form for a long or spaced path. pip's pre-commit.exe on Windows runs the
+    #! line it carries right before its appended archive, an absolute path to a python.exe, quoted when it holds a
+    space."""
     found = shutil.which('pre-commit')
     if not found:
         return None
-    script = os.path.realpath(found)
+    entry = os.path.realpath(found)
+    launcher = entry.lower().endswith('.exe')
     try:
-        with open(script, 'rb') as f:
-            line = f.readline(512)
+        with open(entry, 'rb') as f:
+            # Read whole: an entry script past ENTRY_MAX is no standard one, whatever its start.
+            data = f.read() if launcher else f.read(ENTRY_MAX + 1)
     except OSError:
         return None
-    # The kernel passes what follows the interpreter as one argument.
-    words = line[2:].decode('utf-8', 'replace').strip().split(None, 1) if line.startswith(b'#!') else []
-    # A #! path is POSIX's: absolute from '/', whatever os.path.isabs says on Windows (3.13+ wants a drive there).
-    if not (words and words[0].startswith('/') and SHEBANG_PYTHON.fullmatch(os.path.basename(words[0]))):
-        return None
-    return words, os.path.dirname(script)
-
-
-def pre_commits_load(deadline, start):
-    """(the config as pre-commit's own interpreter loads it, '') or (None, why it was not read)."""
-    found = pre_commit_python()
-    if not found:
-        return None, "PyYAML is not installed, nor is pre-commit's interpreter known, so the config was not read"
-    argv, where = found
-    try:
-        # Run where the entry script lies, so it imports as pre-commit does, nothing from the checkout.
-        code, out, err = bounded([*argv, '-c', LOAD_CONFIG, os.path.abspath(CONFIG)], deadline, start,
-                                 'reading the config', cwd=where)
-    except OSError as e:
-        return None, copyable(f"pre-commit's {argv[0]} cannot run ({type(e).__name__})")
-    if code:
-        last = copyable((err.strip().splitlines() or [f'exit {code}'])[-1]).strip()
-        return None, copyable(f"pre-commit's {argv[0]} cannot read {CONFIG} ({last[:ERROR_CHARS]})")
-    return json.loads(out), ''
-
-
-def config_ids(deadline, start):
-    """({each id SKIP cannot skip that hook alone by: why}, each entry's id stripped, as hooks' blocks are read, in the
-    order pre-commit runs them, whether a hook may stop the run early, ''), or (None, None, None, why) when it cannot be
-    read; a remote repository's manifest may set a hook's fail_fast unless the hook's entry sets it.
-    SKIP's names would also skip another hook: an alias the config gives a hook under another id, and an id more than
-    one entry uses; and it strips each name, so a padded id it cannot name (pre-commit's commands/run.py)."""
-    try:
-        if yaml:
-            config = yaml.safe_load(Path(CONFIG).read_text(encoding='utf-8'))
+    if launcher:
+        found = launcher_entry(data)
+        if not found:
+            return None
+        line, body = found
+        text = line.decode('utf-8', 'replace').strip()
+        if text.startswith('"'):
+            python, closed, rest = text[1:].partition('"')
+            words = [python, *rest.split(None, 0)] if closed else []
         else:
-            config, why = pre_commits_load(deadline, start)
-            if why:
-                return None, None, None, why
-        entries = [h for repo in config['repos'] for h in repo['hooks']]
-        ids = [h['id'] for h in entries]
-        shared = {i: 'SKIP would skip another hook by it' for i in ids if ids.count(i) > 1}
-        shared |= {h['alias']: 'SKIP would skip another hook by it' for h in entries
-                   if h.get('alias') not in (None, '', h['id'])}
-        shared |= {i.strip(): 'SKIP cannot name it' for i in ids if i != i.strip()}
-        stops = bool(config.get('fail_fast')) or any(h.get('fail_fast', repo['repo'] not in ('local', 'meta'))
-                                                     for repo in config['repos'] for h in repo['hooks'])
-        return shared, [i.strip() for i in ids], stops, ''
-    except (OSError, ValueError, KeyError, TypeError, AttributeError, *YAML_ERRORS) as e:
-        return None, None, None, f'{CONFIG} cannot be read ({type(e).__name__})'
-
-
-def unexcusable(hook, ids, shared, unread):
-    """Why a failure of hook is never rerun on HEAD, or '' when it is. A hook that rewrote files is judged by what it
-    wrote; the commit could not skip an id SKIP cannot name, and SKIP naming one it shares, or one whose aliases are
-    unknown, would also skip another hook, unrun on the change or, past a fail_fast stop, unchecked; shared is
-    config_ids'."""
-    return ('it modified files' if hook in ids else 'SKIP cannot name it' if ',' in hook else unread
-            or shared.get(hook, ''))
+            words = text.split(None, 1)
+        # distlib's launcher pastes the rest into the command line ("<python>" <rest> "<exe>" <args>), which python.exe
+        # splits on spaces and tabs; quoting rules are not modelled, so a quote leaves it to the launcher.
+        if len(words) == 2:
+            words = [] if '"' in words[1] else [words[0], *re.split(r'[ \t]+', words[1])]
+        absolute, name = ntpath.isabs, ntpath.basename
+    else:
+        head, _, body = data.partition(b'\n') if len(data) <= ENTRY_MAX else (b'', b'', b'')
+        # The kernel passes what follows the interpreter as one argument.
+        words = head[2:].decode('utf-8', 'replace').strip().split(None, 1) if head.startswith(b'#!') else []
+        # A #! path is POSIX's: absolute from '/', whatever os.path.isabs says on Windows (3.13+ wants a drive there).
+        absolute, name = (lambda p: p.startswith('/')), posixpath.basename
+    if not (words and absolute(words[0]) and SHEBANG_PYTHON.fullmatch(name(words[0])) and standard_entry(body)):
+        return None
+    return words, entry
 
 
 def registers(admin, tree):
@@ -598,12 +592,11 @@ def forget(tmp, deadline, start):
 
 
 def baseline(expected, paths, deadline, start):
-    """(the ids among expected's ({hook: for each of its Failed blocks on the change, its outputs at each end}) that
-    fail on HEAD as they failed on the change, {hook: why} of those left unjudged): each rerun alone on
-    the same paths in a detached worktree of HEAD, so what the host lacks (a compiler, a codepage, /dev/null) fails it
-    there in the same words, without the change. Alone, all the hook prints after its first Failed block, to the end,
-    is its own; every block on the change must end with that at one of its ends. Never pre-commit refusing an id
-    HEAD's config does not have."""
+    """(the ids among expected's ({hook: comparable() of its output in each run it failed on the change}) that fail on
+    HEAD as they failed on the change, {hook: why} of those left unjudged): each rerun alone on the same paths in a
+    detached worktree of HEAD, so what the host lacks (a compiler, a codepage, /dev/null) fails it there in the same
+    words, without the change. HEAD's pre-commit must select that hook alone by its id before running it, and the hook
+    fail there without modifying files; never pre-commit refusing an id HEAD's config does not have."""
     failing, judged = [], 0
     tmp = tempfile.mkdtemp(prefix='hooks-base-')
     try:
@@ -617,10 +610,8 @@ def baseline(expected, paths, deadline, start):
                 # What an earlier rerun rewrote or left behind could fail the next one: each gets HEAD as is.
                 git_within(deadline, start, *no_hooks, 'reset', '--quiet', '--hard', 'HEAD', cwd=tree)
                 git_within(deadline, start, 'clean', '-qffdx', cwd=tree)
-            code, out = pre_commit(paths, deadline, start, f'HEAD {hook}', hook=hook, cwd=tree)
-            whole = next((comparable(f['outputs'][-1][0], tree) for f in results(out, code)[1] if f['hook'] == hook),
-                         None)
-            if whole is not None and all(whole in each for each in outputs):
+            if fails_alike(hook, outputs, *pre_commit(paths, deadline, start, f'HEAD {hook}', hook=hook, cwd=tree),
+                           tree):
                 failing.append(hook)
             judged += 1
     except Unusable as e:
@@ -632,62 +623,63 @@ def baseline(expected, paths, deadline, start):
     return failing, {}
 
 
-def compared(failure, order):
-    """comparable() of the failed hook's output at each end pre-commit's next result may be: the end, or a result
-    whose block, when one follows, names a hook order runs after it. One the hook printed may name any, so a change
-    that adds a nested pre-commit run's result under HEAD's output stays counted unless it names such a hook, and
-    whatever it names when it shows a hook that passed and printed (ends())."""
-    return [comparable(out, os.getcwd()) for out, after in failure['outputs'] if follows(failure['hook'], after, order)]
+def fails_alike(hook, outputs, code, records, tree):
+    """Whether HEAD's run of hook alone, which exited code leaving records, failed with each of outputs and modified
+    nothing."""
+    try:
+        roster, ran = attributed(records, code)
+    except Unattributed:
+        return False
+    return ([h['id'] for h in roster['hooks']] == [hook] and len(ran) == 1 and ran[0]['failed']
+            and not ran[0]['modified'] and all(comparable(ran[0]['output'], tree) == each for each in outputs))
 
 
-def passes(paths, deadline, start, what, config, skip=()):
-    """(exit code, ids of the hooks that modified files, the last run's failures) of pre-commit on paths, run once
-    more when it failed after a hook modified files; config() is config_ids', read once a run fails."""
+def passes(paths, deadline, start, what, skip=()):
+    """(exit code, ids of the hooks that modified files, the last run's failures, its roster) of pre-commit on paths,
+    run once more when it failed after a hook modified files."""
     ids = []
     for attempt in (1, 2):
-        code, out = pre_commit(paths, deadline, start, f'{what} {attempt}', skip=skip)
-        modified, failures = results(out, code, config()[1] if code else None)
+        code, records = pre_commit(paths, deadline, start, f'{what} {attempt}', skip=skip)
+        modified, failures, roster = results(records, code)
         ids += [h for h in modified if h not in ids]
         # A rerun repairs what a hook rewrote; the same failure again only spends another pass (#140).
         if not code or not modified:
             break
-    return code, ids, failures
+    return code, ids, failures, roster
 
 
 def run_hooks(paths, deadline=DEADLINE, start=None):
     if not os.path.exists(CONFIG):
         return False, True, [], [], [], []
     start = time.monotonic() if start is None else start
-    config = functools.cache(lambda: config_ids(deadline, start))
-    code, ids, failures = passes(paths, deadline, start, 'run', config)
-    shared, order, stops, unread = config() if failures else ({}, [], False, '')
+    code, ids, failures, roster = passes(paths, deadline, start, 'run')
     found, excused, not_rerun = failures, [], {}
     while True:
         expected = {}
         for f in found:
-            why = unexcusable(f['hook'], ids, shared, unread)
+            if f['hook'] == UNOWNED:
+                continue
+            # A hook that rewrote files is judged by what it wrote.
+            why = 'it modified files' if f['hook'] in ids else unselected(f, roster)
             if why:
                 not_rerun.setdefault(f['hook'], why)
             elif f['hook'] not in excused:
-                expected.setdefault(f['hook'], []).append(compared(f, order))
+                expected.setdefault(f['hook'], []).append(comparable(f['output'], os.getcwd()))
         newly, late = baseline(expected, paths, deadline, start) if expected else ([], {})
         excused += newly
         for hook, why in late.items():
             not_rerun.setdefault(hook, why)
-        if not newly or not {f['hook'] for f in found} <= set(excused) or not stops:
+        if not newly or not {f['hook'] for f in found} <= set(excused) or not may_stop(roster):
             break
         # fail_fast may have stopped the run at an excused hook: every other hook must pass on the change, as the
         # commit will run them with the same SKIP, or fail on HEAD too.
         try:
-            again, more, found = passes(paths, deadline, start, 'without the excused', config, skip=excused)
+            _, more, found, roster = passes(paths, deadline, start, 'without the excused', skip=excused)
         except Late as e:
             failures.append({'hook': UNOWNED, 'error': copyable(str(e))})
             break
         ids += [h for h in more if h not in ids]
         failures += found
-        if again and not found:
-            failures.append({'hook': UNOWNED, 'error': copyable(
-                f"pre-commit exited {again} with {','.join(excused)} skipped, naming no hook")})
     return True, not code, ids, failures, excused, [{'hook': h, 'why': w} for h, w in not_rerun.items()]
 
 

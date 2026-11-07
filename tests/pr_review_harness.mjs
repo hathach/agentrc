@@ -1,16 +1,10 @@
 import assert from 'node:assert/strict'
-import { spawnSync } from 'node:child_process'
-import { createHash } from 'node:crypto'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { test } from 'node:test'
-import { fileURLToPath } from 'node:url'
+import { ABSENT, AsyncFunction, emitDirs, emitOf, loadModule, moduleOf } from './emit_stub.mjs'
 
-const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
 const body = readFileSync(new URL('../workflows/pr-review.js', import.meta.url), 'utf8')
   .replace(/^export const meta = /m, 'const meta = globalThis.__meta = ')
-const ABSENT = ['URL', 'URLSearchParams', 'TextEncoder', 'TextDecoder', 'Buffer', 'process', 'fetch', 'structuredClone']
 
 const H = 'b'.repeat(40), MB = 'a'.repeat(40), OLD = 'c'.repeat(40)
 const wordy = (n) => 'w '.repeat(n).trim()
@@ -26,38 +20,18 @@ const finding = (why, severity = 'high', line = 10, impact = IMP) => ({ file: 's
 const confirmedAs = (severity, over = {}) => ({ verdict: 'confirmed', reason: 'yes', severity, impact: IMP, severityReason: 'graded', confidence: 'high', ...over })
 const REFUTED = { verdict: 'refuted', reason: 'no', severity: null, impact: null, severityReason: null, confidence: null }
 
-// ledger.py show --snapshot's manifest over `answer` as the snapshot's bytes, and the real state_transfer.py --raw's
-// envelope for the file a manifest named.
-const STATE_TRANSFER = fileURLToPath(new URL('../skills/pr-babysit/scripts/state_transfer.py', import.meta.url))
-const snapshots = new Map()
-const asciiJson = (v) => JSON.stringify(v).replace(/[\u007f-￿]/g, c => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`)
-function fnv1a (text) {
-  let h = 0x811c9dc5
-  for (const ch of text) h = Math.imul(h ^ ch.codePointAt(0), 0x01000193) >>> 0
-  return h.toString(16).padStart(8, '0')
-}
-function manifestOf (answer, a) {
-  const payload = asciiJson(answer)
-  const file = `${a.factsDir.replace(/\\/g, '/')}/ledger-${createHash('sha256').update(payload).digest('hex')}.json`
-  snapshots.set(file, payload)
-  return { repo: a.repo, pr: a.pr, head: a.head, file, digest: fnv1a(payload), length: payload.length }
-}
-function envelopeOf (prompt) {
-  const [, file, ids, pad] = /state_transfer\.py '([^']+)' --raw --chunks ([0-9,]+)( --pad)?\n/.exec(prompt)
-  const dir = mkdtempSync(join(tmpdir(), 'pr-review-ledger-'))
-  try {
-    const at = join(dir, 'ledger.json')
-    writeFileSync(at, snapshots.get(file))
-    const done = spawnSync('python3', [STATE_TRANSFER, at, '--raw', '--chunks', ids, ...(pad ? ['--pad'] : [])], { encoding: 'utf8' })
-    assert.equal(done.status, 0, done.stdout + done.stderr)
-    return JSON.parse(done.stdout.trim().split('\n').at(-1))
-  } finally { rmSync(dir, { recursive: true, force: true }) }
-}
-
-// Stub agents keyed by label; `stubs.<label>` is the value, or a function of the prompt.
-async function run(args, stubs = {}) {
+// Stub agents keyed by label; `stubs.<label>` is the value, or a function of the prompt. A relay's stub is its script's
+// line, which lands in the file its command names as lib/seal.py's emit writes it, claimed before the script runs (one
+// there is exit 3, nothing run), null a relay that died before it wrote; the relay answers its exit. `opts.resume` is an earlier run's journal, answered
+// in order as the runtime's resume answers the unchanged prefix; `opts.emitDir` is facts.py emit-dir's directory,
+// else a new one, removed unless `opts.keepEmit`.
+async function run(args, stubs = {}, opts = {}) {
   const calls = []
   const logs = []
+  const journal = []
+  const loads = []
+  let live = 0
+  const emit = emitDirs('pr-review-emit-', opts.emitDir, opts.keepEmit)
   const pick = (label, prompt) => {
     const key = Object.keys(stubs).find(k => k === label) ?? Object.keys(stubs).find(k => label.startsWith(k + ':'))
     const v = key === undefined ? undefined : stubs[key]
@@ -69,28 +43,27 @@ async function run(args, stubs = {}) {
     ledger: { reviews: 0, open: [] },
     claims: { claims: [] },
   }
-  const agent = async (prompt, options) => {
+  const stub = async (prompt, options) => {
     calls.push({ label: options.label, prompt: String(prompt), options })
-    // `stubs.ledgerChunks(envelope, call)` replaces an envelope of the chunks a load asked.
-    if (options.label.startsWith('ledger:load#')) {
-      const env = envelopeOf(prompt)
-      return stubs.ledgerChunks ? stubs.ledgerChunks(env, calls.filter(c => c.label.startsWith('ledger:load#')).length) : env
-    }
+    if (options.label === 'emit:dir') return { dir: emit.dir() }
+    // A relay's fresh attempt (`<label>:retry`) runs the same script.
+    const base = options.label.replace(/:retry$/, '')
     const v = pick(options.label, prompt)
-    // `stubs.ledger` is the answer ledger.py show --snapshot writes; `stubs.disputes` its disputes, unless that answer
-    // names its own; the members ledger.py always prints default as it prints them. `stubs.ledgerAsIs` is written
-    // untouched, and `stubs['ledger:manifest']` replaces the manifest.
-    if (options.label === 'ledger:manifest') {
-      if (stubs['ledger:manifest'] !== undefined) return v
+    // `stubs.ledger` is the answer ledger.py show --view prints, bound to the run's repository, PR and head unless it
+    // names its own; `stubs.disputes` its disputes, unless that answer names its own; the members ledger.py always
+    // prints default as it prints them. `stubs.ledgerAsIs` is printed with only the binding added, and
+    // `stubs.ledgerLine` replaces the line whole.
+    if (base === 'ledger') {
+      if (stubs.ledgerLine !== undefined) return stubs.ledgerLine
       const l = stubs.ledgerAsIs !== undefined ? stubs.ledgerAsIs : v === undefined ? defaults.ledger : v
       if (!l || typeof l !== 'object') return l
       const rows = Array.isArray(l.open) ? { open: l.open.map(f => f && typeof f === 'object' ? { published: null, repair: null, ...f } : f) } : {}
       const answer = stubs.ledgerAsIs !== undefined ? l
         : { ...(l.reviews > 0 ? { heldThreads: [] } : {}), ...l, ...rows, ...('disputes' in l ? {} : { disputes: stubs.disputes?.disputes ?? [] }) }
-      return manifestOf(answer, args)
+      return { repo: args.repo, pr: args.pr, head: args.head, ...answer }
     }
     if (v !== undefined) return v
-    if (options.label in defaults) return defaults[options.label]
+    if (base in defaults) return defaults[base]
     if (options.label === 'write') {
       const fs = JSON.parse(/Findings: (\[.*\])$/s.exec(prompt)[1])
       return { summary: '- Overall fine.', comments: fs.map(f => ({ finding: f.finding, body: `**${f.severity}**: ${f.why}` })) }
@@ -100,20 +73,50 @@ async function run(args, stubs = {}) {
     if (options.label === 'beyond') return { beyond: [] }
     throw new Error(`unstubbed ${options.label}`)
   }
+  const agent = async (prompt, options) => {
+    const at = journal.length
+    const cached = opts.resume && live === at && opts.resume[at]
+    if (cached && cached.prompt === String(prompt) && cached.label === options.label) {
+      live++
+      journal.push(cached)
+      return structuredClone(cached.answer)
+    }
+    const entry = { label: options.label, prompt: String(prompt) }
+    journal.push(entry)
+    const file = emitOf(prompt)
+    let answer = null
+    try {
+      if (file === undefined) answer = await stub(prompt, options)
+      else if (existsSync(file)) answer = { exit: 3 }
+      else {
+        writeFileSync(file, '') // the claim, before the script runs anything
+        const line = await stub(prompt, options)
+        if (line !== null) {
+          writeFileSync(file, moduleOf(file, line))
+          answer = { exit: line && line.error ? 2 : 0 }
+        }
+      }
+    } finally { entry.answer = structuredClone(answer) }
+    return answer
+  }
   const audits = []
+  // A data module (emit_stub.mjs's loadModule), else the one named child, code-audit.
   const workflow = async (name, a) => {
+    if (name && typeof name.scriptPath === 'string') {
+      loads.push(name.scriptPath)
+      return loadModule(name.scriptPath, a)
+    }
     assert.equal(name, 'code-audit')
     audits.push(a)
     const v = stubs.audit
     return v === undefined ? { confirmed: [], dropped: [], unverified: [] } : (typeof v === 'function' ? v(a) : v)
   }
   const parallel = thunks => Promise.all(thunks.map(t => Promise.resolve().then(t).catch(() => null)))
-  // Every value the workflow parses, so a test can see the ledger answer it rebuilt.
-  const parsed = []
-  const json = { stringify: JSON.stringify, parse: (t, r) => { const v = JSON.parse(t, r); parsed.push(v); return v } }
-  const fn = new AsyncFunction('args', 'agent', 'pipeline', 'parallel', 'phase', 'log', 'workflow', 'budget', 'JSON', ...ABSENT, body)
-  const result = await fn(args, agent, null, parallel, () => {}, m => logs.push(String(m)), workflow, null, json, ...ABSENT.map(() => undefined))
-  return { result, calls, logs, audits, parsed, labels: calls.map(c => c.label) }
+  const fn = new AsyncFunction('args', 'agent', 'pipeline', 'parallel', 'phase', 'log', 'workflow', 'budget', ...ABSENT, body)
+  try {
+    const result = await fn(args, agent, null, parallel, () => {}, m => logs.push(String(m)), workflow, null, ...ABSENT.map(() => undefined))
+    return { result, calls, logs, audits, journal, loads, emitDir: emit.made, labels: calls.map(c => c.label).filter(l => l !== 'emit:dir') }
+  } finally { emit.cleanup() }
 }
 
 const pinned = (a) => ({ ok: true, head: H, top: '/w', repo: a.repo, pr: a.pr, ci: { state: 'green' }, pins: { mergeBase: a.mergeBase, scopeBase: a.scopeBase, mode: a.mode, groups: a.groups, recheckFrom: a.recheckFrom ?? null } })
@@ -184,7 +187,7 @@ test('a failed, moved-head or unidentified check stops before any review work', 
     const { result, labels } = await run(BASE, { check })
     assert.equal(result.status, 'blocked')
     assert.equal(result.reason, 'check-failed')
-    assert.deepEqual(labels, ['check'])
+    assert.deepEqual(labels, check === null ? ['check', 'check:retry'] : ['check'], 'a dead relay gets one fresh attempt')
   }
 })
 
@@ -193,13 +196,11 @@ test('a clean full review approves only with green CI, full coverage and hardwar
   assert.equal(result.verdict.event, 'APPROVE')
   assert.deepEqual(audits[0], { dirs: ['src/core'], dimensions: audits[0].dimensions, diff: { base: MB, head: H }, root: '/w' })
   assert.equal(audits[0].dimensions.length, 4)
-  assert.ok(calls.filter(c => ['check', 'threads', 'ledger:manifest'].includes(c.label)).every(c => c.options.model === 'haiku'))
-  assert.ok(calls.filter(c => c.label.startsWith('ledger:load#')).every(c => c.options.model === 'sonnet'))
+  assert.ok(calls.filter(c => ['emit:dir', 'check', 'threads', 'ledger'].includes(c.label)).every(c => c.options.model === 'haiku'))
   assert.match(calls.find(c => c.label === 'check').prompt, /prepare\.py --check --pr 7 --repo o\/r --expected-head b{40}/)
   const at = (l) => calls.findIndex(c => c.label === l)
-  assert.ok(at('threads') < at('ledger:manifest'), 'show reads the snapshot threads.py wrote')
-  assert.match(calls[at('ledger:manifest')].prompt, /ledger\.py show .*--threads '\/tmp\/ledger\/7\/threads-b{40}\.json' --head b{40} --snapshot '\/tmp\/ledger\/7'\n/)
-  assert.match(calls[at('ledger:load#1')].prompt, /state_transfer\.py '\/tmp\/ledger\/7\/ledger-[0-9a-f]{64}\.json' --raw --chunks 0\n/)
+  assert.ok(at('threads') < at('ledger'), 'show reads the snapshot threads.py wrote')
+  assert.match(calls[at('ledger')].prompt, /`AGENTRC_EMIT='[^']+\/ledger\.1\.[0-9a-f]{8}\.js' python3 .*\/skills\/pr-review\/scripts\/ledger\.py show .*--threads '\/tmp\/ledger\/7\/threads-b{40}\.json' --head b{40} --view` /)
   assert.deepEqual(result.heldThreads, [])
   assert.doesNotMatch(result.draft.body, /agentrc|Claude|generated/i)
 
@@ -249,9 +250,17 @@ test('a blocking finding or a verified regression requests changes; minor ones o
 })
 
 test('a drafted comment that adds a claim, or is lost, falls back to the finding\'s own words', async () => {
-  const flagged = await run(BASE, { audit: audited(finding('a'), finding('b', 'high', 20)), 'check-draft': { bad: [1], firstBad: [] } })
-  assert.deepEqual(flagged.result.draft.comments.map(c => c.body), ['**high**: a', '**high**: b'])
-  assert.match(flagged.result.draft.body, /Overall fine/, 'a clean summary stays when one comment is flagged')
+  // A flagged comment falls back whatever its length, after one write and one check.
+  for (const [findings, bad, bodies] of [
+    [[finding('a'), finding('b', 'high', 20)], [1], ['**high**: a', '**high**: b']],
+    [[finding(wordy(100))], [0], [`**high**: ${wordy(100)}`]],
+  ]) {
+    const flagged = await run(BASE, { audit: audited(...findings), 'check-draft': { bad, firstBad: [], summaryBad: false } })
+    assert.deepEqual(flagged.result.draft.comments.map(c => c.body), bodies)
+    assert.deepEqual(bad.map(i => flagged.result.draft.comments[i].firstLineUnchecked), bad.map(() => true), 'a fallback\'s first line is unchecked')
+    assert.deepEqual(flagged.labels.filter(l => /^(write|check-draft)/.test(l)), ['write', 'check-draft'], 'no other round')
+    assert.match(flagged.result.draft.body, /Overall fine/, 'a clean summary stays when one comment is flagged')
+  }
   const summary = await run(BASE, { audit: audited(finding('a')), 'check-draft': { bad: [], firstBad: [], summaryBad: true } })
   assert.doesNotMatch(summary.result.draft.body, /Overall fine/, 'a summary that adds a claim is dropped')
   assert.ok(summary.logs.includes('summary left out: the check found a claim no finding states'))
@@ -406,32 +415,29 @@ test('a dead or malformed answer on muted findings posts them all and leaves cov
   assert.deepEqual(lead.result.findings.map(f => [f.id, f.muted, f.lead]), [['pr7-f1', false, true], ['pr7-f2', true, false]], 'a lead given its own comment is not muted')
 })
 
-test('a threads receipt that is not the script\'s line is asked again once on a fresh label, else the launch blocks (#150)', async () => {
+test('a threads line that is not of the file asked for, the script\'s error, or a relay dead twice blocks the launch', async () => {
   const file = `${BASE.factsDir}/threads-${H}.json`
-  const wrapped = { file: JSON.stringify({ file, count: 3 }) }
-  const once = await run(BASE, { threads: (prompt, label) => label === 'threads' ? wrapped : { file, count: 3 } })
-  assert.notEqual(once.result.status, 'blocked')
-  assert.deepEqual(once.labels.filter(l => l.startsWith('threads')), ['threads', 'threads:retry'])
-  assert.equal(once.calls.find(c => c.label === 'threads:retry').options.model, 'sonnet')
-  const twice = await run(BASE, { threads: wrapped })
-  assert.deepEqual([twice.result.status, twice.result.reason], ['blocked', 'threads-failed'])
-  // The script's own error is its answer: nothing to copy better.
+  // #150's string-wrapped copy, now only as a script could print it: no line of that file.
+  const wrapped = await run(BASE, { threads: { file: JSON.stringify({ file, count: 3 }) } })
+  assert.deepEqual([wrapped.result.status, wrapped.result.reason, wrapped.result.detail], ['blocked', 'threads-failed', 'wrong file'])
   const failed = await run(BASE, { threads: { file: '', error: 'gh: HTTP 502' } })
-  assert.deepEqual([failed.result.reason, failed.labels.includes('threads:retry')], ['threads-failed', false])
-  const thrown = (label) => { throw new Error(`${label} exploded`) }
-  const died = await run(BASE, { threads: (prompt, label) => label === 'threads' ? thrown(label) : { file, count: 3 } })
-  assert.notEqual(died.result.status, 'blocked', 'a relay that throws gets the retry too')
-  const dead = await run(BASE, { threads: (prompt, label) => thrown(label) })
+  assert.deepEqual([failed.result.reason, failed.result.detail], ['threads-failed', 'gh: HTTP 502'])
+  const dead = await run(BASE, { threads: (prompt, label) => { throw new Error(`${label} exploded`) } })
   assert.deepEqual([dead.result.reason, dead.result.detail], ['threads-failed', 'the threads relay died'])
   assert.deepEqual(dead.logs.filter(l => / errored — /.test(l)), ['threads errored — threads exploded', 'threads:retry errored — threads:retry exploded'])
+  for (const r of [wrapped, failed]) assert.deepEqual(r.labels.filter(l => l.startsWith('threads')), ['threads'])
+  const revived = await run(BASE, { threads: (prompt, label) => label === 'threads' ? null : { file, count: 3 } })
+  assert.deepEqual([revived.result.status, revived.labels.filter(l => l.startsWith('threads'))], ['reviewed', ['threads', 'threads:retry']], 'a dead relay gets one fresh attempt')
 })
 
 test('the script relays run as the relay role', async () => {
   const { calls } = await run({ ...BASE, mode: 'incremental', scopeBase: OLD }, { check: pinned({ ...BASE, mode: 'incremental', scopeBase: OLD }),
-    ledger: { reviews: 1, last: { head: OLD }, open: [] }, threads: (prompt, label) => label === 'threads' ? null : { file: `${BASE.factsDir}/threads-${H}.json`, count: 0 } })
+    ledger: { reviews: 1, last: { head: OLD }, open: [] } })
   const relays = calls.filter(c => c.options.agentType === 'relay')
-  assert.deepEqual(relays.map(c => c.label), ['check', 'threads', 'threads:retry', 'ledger:manifest', 'ledger:load#1'],
-    'one snapshot of the ledger and its disputes, read in checked chunks')
+  assert.deepEqual(relays.map(c => c.label), ['emit:dir', 'check', 'threads', 'ledger'],
+    'one view of the ledger and its disputes, read whole from the file ledger.py emits')
+  assert.ok(relays.slice(1).every(c => /^The working tree is the review checkout\. Run exactly `AGENTRC_EMIT='[^']+' python3 /.test(c.prompt) &&
+    c.prompt.includes('answer only its exit status as exit') && c.options.schema.required[0] === 'exit'), 'each answers only its exit')
 })
 
 test('a ledger answer missing its members, or not of the review prepare pinned, blocks instead of dropping standing findings', async () => {
@@ -468,7 +474,7 @@ test('a ledger answer missing its members, or not of the review prepare pinned, 
   assert.equal((await run(BASE, { ledgerAsIs: { reviews: 0, last: null, open: [], disputes: [] } })).result.status, 'reviewed', 'an empty ledger prints no heldThreads')
 })
 
-test('a ledger answer past 64 KiB crosses in checked chunks, every text exact, in every mode', async () => {
+test('a ledger answer past 64 KiB crosses whole through one emitted file, every text exact, in every mode', async () => {
   const inc = { ...BASE, mode: 'incremental', scopeBase: OLD }
   // As ledger.py's view writes a carried row: without its impact and severityReason.
   const row = (n) => ({ id: `pr7-f${n}`, status: 'open', file: 'src/core/a.c', line: 10 + n, severity: 'low', confidence: 'high', commentId: 900 + n,
@@ -479,13 +485,15 @@ test('a ledger answer past 64 KiB crosses in checked chunks, every text exact, i
   const same = { ...pinned(BASE), pins: { ...pinned(BASE).pins, mode: 'same' } }
   for (const [a, check, last] of [[BASE, pinned(BASE), OLD], [inc, pinned(inc), OLD], [{ ...BASE, mode: 'discussion' }, same, H]]) {
     const whole = { reviews: 1, last: { head: last }, open, heldThreads: [], disputes }
-    const m = manifestOf(whole, a)
-    assert.ok(m.length > 64 * 1024, `${m.length} bytes`)
-    const { result, calls, parsed } = await run(a, { check, ledgerAsIs: whole, recheck: still })
-    assert.equal(result.status, 'reviewed', a.mode)
-    assert.deepEqual(parsed.find(v => v && Array.isArray(v.open) && v.open.length === 40), whole, `${a.mode}: the answer rebuilt exactly`)
-    const loads = calls.filter(c => c.label.startsWith('ledger:load#'))
-    assert.equal(loads.length, Math.ceil(Math.ceil(m.length / 512) / 4), 'four chunks a call, each asked once')
+    const size = JSON.stringify(whole).length
+    assert.ok(size > 64 * 1024, `${size} bytes`)
+    const { result, calls, loads } = await run(a, { check, ledgerAsIs: whole, recheck: still }, { keepEmit: true })
+    try {
+      assert.equal(result.status, 'reviewed', a.mode)
+      assert.deepEqual((await loadModule(loads.find(f => /\/ledger\.1\./.test(f)))).line, { repo: a.repo, pr: a.pr, head: a.head, ...whole },
+        `${a.mode}: the line ledger.py wrote, whole`)
+    } finally { rmSync(loads[0].split('/agentrc-emit/')[0], { recursive: true, force: true }) }
+    assert.equal(calls.filter(c => c.label.startsWith('ledger')).length, 1, 'one read')
     assert.equal(calls.filter(c => c.label.startsWith('recheck:')).length, a.mode === 'discussion' ? 30 : 40, a.mode)
     const carried = result.findings.filter(f => f.id)
     assert.equal(carried.length, a.mode === 'discussion' ? 30 : 40)
@@ -499,50 +507,41 @@ test('a ledger answer past 64 KiB crosses in checked chunks, every text exact, i
     { severity: 'medium', impact: IMP, severityReason: 'worse now' }, 'a regrade carries its whole grading')
 })
 
-test('a mis-copied chunk is asked again, padded after an odd count of misses; one never copied right blocks before any review work', async () => {
-  const inc = { ...BASE, mode: 'incremental', scopeBase: OLD }
-  const row = { id: 'pr7-f1', status: 'open', file: 'src/core/a.c', line: 10, severity: 'high', commentId: 901, why: wordy(600), published: null, repair: null }
-  const whole = { reviews: 1, last: { head: OLD }, open: [row], heldThreads: [], disputes: [] }
-  const still = { state: 'open', reason: 'still' }
-  const flip = (c) => ({ ...c, data: (c.data[0] === 'A' ? 'B' : 'A') + c.data.slice(1) })
-  const resum = (c) => { const d = flip(c); return { ...d, sum: fnv1a(d.data) } }
-  const go = (ledgerChunks) => run(inc, { check: pinned(inc), ledgerAsIs: whole, recheck: still, ledgerChunks })
-  const once = await go((env, call) => call === 1 ? { ...env, chunks: env.chunks.map((c, k) => k ? c : flip(c)) } : env)
-  assert.equal(once.result.status, 'reviewed')
-  const asked = once.calls.filter(c => c.label.startsWith('ledger:load#')).map(c => /--chunks ([0-9,]+)( --pad)?/.exec(c.prompt).slice(1, 3).join(''))
-  assert.deepEqual(asked.slice(-1), ['0 --pad'], 'only the bad chunk is asked again, padded after one miss')
-  const twice = await go((env, call) => call <= 2 ? { ...env, chunks: env.chunks.map(c => c.i ? c : flip(c)) } : env)
-  assert.equal(twice.result.status, 'reviewed')
-  assert.match(twice.calls.filter(c => c.label.startsWith('ledger:load#')).at(-1).prompt, /--chunks 0\n/, 'unpadded again after two')
-  const dup = await go((env, call) => call === 1 ? { ...env, chunks: [...env.chunks, env.chunks[0]] } : env)
-  assert.equal(dup.result.status, 'reviewed', 'a duplicated chunk settles neither copy, and is asked again')
-  const whole2 = await go((env, call) => call === 1 ? { ...env, chunks: env.chunks.map(c => c.i ? c : resum(c)) } : env)
-  assert.equal(whole2.result.status, 'reviewed', 'a chunk changed with its sum fails the digest, and the load starts over')
-  for (const [why, bad] of [['missing or mis-copied', (env) => ({ ...env, chunks: env.chunks.map(c => c.i === 1 ? flip(c) : c) })],
-    ['does not match the manifest digest', (env) => ({ ...env, chunks: env.chunks.map(c => c.i === 1 ? resum(c) : c) })],
-    ['chunks 0,1,2 missing or mis-copied (the envelope metadata is malformed)', (env) => ({ ...env, digest: '00000000' })],
-    ['chunks 0,1,2 missing or mis-copied (state_transfer.py: gone)', () => ({ error: 'gone' })]]) {
-    const { result, labels } = await go(bad)
-    assert.deepEqual([result.status, result.reason], ['blocked', 'ledger-failed'], why)
-    assert.ok(result.detail.includes(why), why)
-    assert.ok(!labels.some(l => l.startsWith('recheck:')), why)
-  }
-})
-
-test('a ledger manifest of another head, path or size blocks before reading', async () => {
+test('a ledger line of another repository, PR or head, an error or a dead relay blocks before any review work', async () => {
   const inc = { ...BASE, mode: 'incremental', scopeBase: OLD }
   const row = { id: 'pr7-f1', status: 'open', file: 'src/core/a.c', line: 10, severity: 'high', commentId: 901, why: 'w', published: null, repair: null }
   const whole = { reviews: 1, last: { head: OLD }, open: [row], heldThreads: [], disputes: [] }
-  const real = manifestOf(whole, inc)
-  const name = real.file.split('/').at(-1)
-  for (const wrong of [{ head: OLD }, { repo: 'o/x' }, { pr: 8 }, { file: `/tmp/other/${name}` }, { file: `${inc.factsDir}/ledger-x.json` },
-    { file: `${inc.factsDir}/../${name}` }, { digest: 'xyz' }, { length: 0 }, { length: 256 * 1024 + 1 }, { error: 'no ledger' }]) {
-    const { result, labels } = await run(inc, { check: pinned(inc), ledgerAsIs: whole, 'ledger:manifest': { ...real, ...wrong } })
+  const still = { state: 'open', reason: 'still' }
+  assert.equal((await run(inc, { check: pinned(inc), ledgerAsIs: whole, recheck: still })).result.status, 'reviewed')
+  for (const wrong of [{ head: OLD }, { repo: 'o/x' }, { pr: 8 }]) {
+    const { result, labels } = await run(inc, { check: pinned(inc), ledgerAsIs: { ...whole, ...wrong }, recheck: still })
     assert.deepEqual([result.status, result.reason], ['blocked', 'ledger-failed'], JSON.stringify(wrong))
-    assert.ok(!labels.some(l => l.startsWith('ledger:load#')), JSON.stringify(wrong))
+    assert.match(result.detail, /^the ledger view is for /, JSON.stringify(wrong))
+    assert.ok(!labels.some(l => l.startsWith('recheck:')), JSON.stringify(wrong))
   }
-  const dead = await run(inc, { check: pinned(inc), 'ledger:manifest': null })
-  assert.deepEqual([dead.result.reason, dead.result.detail], ['ledger-failed', 'the ledger relay died'])
+  const failed = await run(inc, { check: pinned(inc), ledgerLine: { error: 'no ledger' } })
+  assert.deepEqual([failed.result.reason, failed.result.detail, failed.labels.filter(l => l.startsWith('ledger'))], ['ledger-failed', 'no ledger', ['ledger']])
+  const dead = await run(inc, { check: pinned(inc), ledgerLine: null })
+  assert.deepEqual([dead.result.reason, dead.result.detail, dead.labels.filter(l => l.startsWith('ledger'))],
+    ['ledger-failed', 'the ledger relay died', ['ledger', 'ledger:retry']])
+})
+
+test('a resumed review reloads the lines its relays wrote; a file there before a live run is reloaded only when it names itself', async () => {
+  const first = await run(BASE, {}, { keepEmit: true })
+  try {
+    assert.deepEqual(first.loads.map(f => f.split('/').at(-1).split('.')[0]), ['check', 'threads', 'ledger'])
+    const resumed = await run(BASE, {}, { resume: first.journal })
+    assert.deepEqual(resumed.calls, [], 'no agent ran again')
+    assert.deepEqual([resumed.loads, resumed.result], [first.loads, first.result])
+    const again = await run(BASE, {}, { emitDir: first.emitDir })
+    assert.deepEqual(again.result, first.result)
+    assert.ok(again.logs.includes('check: the line an earlier attempt of this call wrote, reloaded'), again.logs.join('\n'))
+    writeFileSync(first.loads[0], readFileSync(first.loads[1], 'utf8'))
+    // A file there that names another: the check ran nothing (exit 3) and its outcome is unknown; its fresh attempt runs.
+    const foreign = await run(BASE, {}, { emitDir: first.emitDir })
+    assert.ok(foreign.logs.includes(`check: an earlier attempt of this call claimed ${first.loads[0]} and left no line of it — its outcome is unknown`), foreign.logs.join('\n'))
+    assert.deepEqual([foreign.labels[0], foreign.result.status], ['check:retry', 'reviewed'])
+  } finally { rmSync(first.emitDir.split('/agentrc-emit/')[0], { recursive: true, force: true }) }
 })
 
 test('a draft or check agent that throws takes its null path; a check relay that throws blocks', async () => {
@@ -680,13 +679,6 @@ test('an incremental review rechecks earlier findings: fixed ones get a fix note
   assert.equal(lost.result.findings.find(f => f.id === 'pr7-f1').status, 'open')
 })
 
-test('a comment the check flags falls back to its finding\'s own words, whatever their length, with no other round', async () => {
-  const r = await run(BASE, { audit: audited(finding(wordy(100))), 'check-draft': { bad: [0], firstBad: [], summaryBad: false } })
-  assert.deepEqual([r.result.draft.comments[0].body, r.result.draft.comments[0].firstLineUnchecked], [`**high**: ${wordy(100)}`, true])
-  assert.deepEqual(r.labels.filter(l => /^(write|check-draft|shorten)/.test(l)), ['write', 'check-draft'], 'one write, one check')
-  assert.ok(!r.logs.some(l => /over length/.test(l)))
-})
-
 test('a finding an auto-fix repair noted gets no second fix note, and one still standing is raised again on a new comment', async () => {
   const inc = { ...BASE, mode: 'incremental', scopeBase: OLD }
   const repaired = (repair) => ({ reviews: 1, last: { head: OLD }, open: [{ id: 'pr7-f1', file: 'src/core/a.c', line: 10, severity: 'high', why: 'overrun past the buffer end', commentId: 901, repair }] })
@@ -721,12 +713,10 @@ test('a finding an auto-fix repair noted gets no second fix note, and one still 
   const longEdit = await run(inc, { ledger: edited, recheck: () => ({ state: 'open', reason: 'still' }), check: pinned(inc) })
   assert.deepEqual(longEdit.result.draft.comments.map(c => c.body), [`${edited.open[0].published}${NOTE}`], 'a long human edit is kept whole, its repair note on the comment')
   assert.doesNotMatch(longEdit.result.draft.body, /Raised again/)
-  assert.equal(longEdit.labels.some(l => l.startsWith('shorten')), false, 'the human\'s own words are never rewritten')
   const longWhy = repaired(done)
   longWhy.open[0].why = wordy(85)
   const unedited = await run(inc, { ledger: longWhy, recheck: () => ({ state: 'open', reason: 'still' }), check: pinned(inc) })
   assert.deepEqual(unedited.result.draft.comments.map(c => [c.body, c.firstLineUnchecked]), [[`**high**: ${wordy(85)}${NOTE}`, true]])
-  assert.ok(!unedited.logs.some(l => /over length/.test(l)))
   const visible = await run(inc, { ledger: repaired({ ...done, resolved: false }), recheck: () => ({ state: 'open', reason: 'still' }), check: pinned(inc) })
   assert.deepEqual(visible.result.draft.comments, [], 'its thread is still open, so its comment still states it')
   const reopenedThread = { ...repaired(done), heldThreads: [{ findingId: 'pr7-f1', commentId: 901, why: 'reopened after it was resolved' }] }
@@ -827,8 +817,6 @@ test('a thread answer of any length is kept as the recheck wrote it; the answer 
   assert.match(ask, /the evidence and nothing else, bullets for more than one point/)
   assert.doesNotMatch(ask, /\d+ words/)
   assert.deepEqual(kept.result.findings[0].disputes[0].answer, { body: long, resolve: false })
-  assert.equal(kept.labels.some(l => l.startsWith('shorten')), false)
-  assert.ok(!kept.logs.some(l => /over length/.test(l)))
 })
 
 test('a reviewer\'s label never sets our level, and a confirmed claim without its grading is unjudged, never a blocker', async () => {

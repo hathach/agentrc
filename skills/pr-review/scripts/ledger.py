@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """pr-review's per-PR ledger: what each review of a PR found, drafted and posted.
 
-  ledger.py show --pr N [--repo OWNER/NAME] [--finding ID | --draft | --pending | --threads FILE [--head SHA [--snapshot DIR]]]
+  ledger.py show --pr N [--repo OWNER/NAME] [--finding ID | --draft | --pending | --threads FILE [--head SHA [--view]]]
   ledger.py show --pr N --fixable --threads FILE --head SHA [--repo OWNER/NAME]
   ledger.py save --pr N --output FILE [--repo OWNER/NAME] [--reason TEXT]
+  ledger.py next --pr N --head SHA --publish pending|auto-post|auto-fix [--repo OWNER/NAME] [--token T]
+                 [--review-output FILE] [--manifest FILE] [--babysit-reading FILE]
 
 The ledger is <git common dir>/agentrc/pr-review/<owner>__<name>/<N>.json,
 one per PR, shared by every worktree of the clone. Only this script and
@@ -34,12 +36,11 @@ it marks inBody each finding the snapshot shows as a line of our review body,
 unedited, so a later review states it again only once that line is gone;
 --head adds the disputes on that head.
 
---snapshot writes the workflow's view of that answer, compact ASCII JSON, to DIR/ledger-<sha256>.json and prints only
-a manifest {repo, pr, head, file, digest, length}: the file's fnv1a and length, so the workflow copies it through
-state_transfer.py --raw's checked chunks instead of a model copying one long line. The view leaves out what the
-workflow never reads: the ledger path, the unpublished answers and each open row's impact and severityReason, which
-save keeps from the ledger when a result does not regrade the finding. The name is the content's sha256, and the
-file is always written anew, atomically, so a rerun reads the same bytes and a damaged file is repaired.
+--view prints instead the pr-review workflow's view of that answer, bound to the repository, PR and head it was
+read for (repo, pr, head): it leaves out what the workflow never reads, the ledger path, the unpublished answers and
+each open row's impact and severityReason, which save keeps from the ledger when a result does not regrade the
+finding. The workflow runs it under AGENTRC_EMIT and loads the line from that file (lib/seal.py's emit), so no
+model copies it.
 
 --fixable, with a fresh threads.py snapshot, prints what an auto-fix repair may take from the review posted on
 SHA, which must be the last review on the PR: each standing finding as `fix` (its row, as show lists it, with
@@ -69,8 +70,17 @@ review, no findings) that post.py publishes the new answers through. save reads 
 checks it is a result for this PR, and appends it as a review whose draft is
 `pending`: each comment anchored on a line the PR diff adds or keeps, else
 moved into the body, and the draft's digest fixed before anything is posted.
-A pending draft already on the ledger for that head is refused: post it,
-decline it, or say why a second review is due (--reason).
+A pending draft already on the ledger for that head is refused: post it
+or say why a second review is due (--reason). A review records the output file it was saved from (`output`), and a
+discussion's in its review's `discussions` and on its answer publication, the launch next asks after.
+
+next prints the run's next step after a prepare on --head (its facts file names the mode, recheckFrom and repair):
+{step, argv, postMode, why}, step one of review, post, repair, babysit, fixed, publish-answers, recheck, report or
+blocked; argv the exact command when the step is one (report's is the lock release), postMode auto, auto-defer or
+pending for a step that posts. It reads the ledger, the PR's live head and state, and the files the run has so far:
+--review-output (this phase's pr-review launch), --manifest (the auto-fix repair's --fixed manifest) and
+--babysit-reading (launch_result.py's JSON line for pr-babysit's latest launch). A state the recipe does not settle is
+`blocked`, with why, never a guess. next_step() is the transition, pure, so one table test reads it whole.
 
 stdout ends with one JSON line; {"error": ...} and exit 2 when the ledger or
 the output cannot be read, or they disagree.
@@ -85,9 +95,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'pr-babysit' / 'scripts'))
-from facts import FULL_SHA, Parser, Unusable, fnv1a, git, locked, report  # noqa: E402
-from launch_result import load_output  # noqa: E402
-from harvest import digest as body_digest  # noqa: E402  the digest threads.py records
+from facts import FULL_SHA, Parser, Unusable, git, locked, report  # noqa: E402
+from launch_result import ENDED, STALLED, load_output  # noqa: E402
+from harvest import digest as body_digest, gh_json  # noqa: E402  the digest threads.py records
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
 import gh_repo  # noqa: E402
 import windows  # noqa: E402
@@ -152,6 +162,10 @@ def ledger_dir(repo):
 
 def ledger_path(repo, pr):
     return ledger_dir(repo) / f'{pr}.json'
+
+
+def facts_path(repo, pr, head):
+    return ledger_dir(repo) / str(pr) / f'prepare-{head}.json'
 
 
 def load(path, repo, pr):
@@ -226,7 +240,7 @@ def refuse_unsettled(led, head, statuses=UNSETTLED):
     got = [p for p, _ in publications(led) if p['head'] == head and p['status'] in statuses]
     if got:
         raise Unusable(f"a {got[-1]['status']} draft {got[-1]['draft']['digest']} for {head} is on the ledger: "
-                       'post, reconcile or decline it first')
+                       'post or reconcile it first')
 
 
 def last(led):
@@ -585,14 +599,15 @@ def fixable(led, snapshot, head):
             'autoPost': not any(h['why'] in ('unmapped', 'deleted', 'edited') for h in held)}
 
 
-def add_answers(review, head, answers, auto=False):
+def add_answers(review, head, answers, auto=False, output=None):
     """Append to `review` the publication of `answers` ((finding id, answer digest) pairs) to its findings;
-    `auto` marks the one an auto-post run keeps with its send intent."""
+    `auto` marks the one an auto-post run keeps with its send intent, `output` the discussion it came from."""
     pubs = review.setdefault('answerPublications', [])
     draft = {'event': None, 'body': '', 'comments': [], 'replies': []}
     draft['digest'] = digest({'head': head, 'answers': answers, 'n': len(pubs)})
     pubs.append({'head': head, 'answers': [list(a) for a in answers], 'status': 'pending',
-                 'draft': draft, 'receipts': {}, 'reviewedAt': now(), **({'auto': True} if auto else {})})
+                 'draft': draft, 'receipts': {}, 'reviewedAt': now(), **({'auto': True} if auto else {}),
+                 **({'output': output} if output else {})})
 
 
 def open_disputes(findings, head=None):
@@ -622,7 +637,7 @@ def open_answers(findings):
     return [(f['id'], d['answer']['digest']) for f, d in open_disputes(findings)]
 
 
-def merge_discussion(led, result):
+def merge_discussion(led, result, output=None):
     rev = last(led)
     if not rev or rev['head'] != result['head']:
         raise Unusable(f"a discussion result is for the last reviewed head, and {result['head']} is not it")
@@ -638,7 +653,9 @@ def merge_discussion(led, result):
         hold_withdrawal(old, standing)
     answers = open_answers(by_id[f['id']] for f in result['findings'])
     if answers:
-        add_answers(rev, result['head'], answers)
+        add_answers(rev, result['head'], answers, output=output)
+    if output:
+        rev.setdefault('discussions', []).append(output)
     return {'saved': True, 'head': result['head'], 'mode': 'discussion', 'findings': len(result['findings']),
             'answers': len(answers)}
 
@@ -652,7 +669,7 @@ def with_answer_digests(result):
     return result
 
 
-def save(led, result, reason):
+def save(led, result, reason, output=None):
     for key in ('pr', 'head', 'mergeBase', 'verdict', 'findings', 'draft'):
         if key not in result:
             raise Unusable(f'the output result has no {key}: not a pr-review result')
@@ -661,7 +678,7 @@ def save(led, result, reason):
     refuse_off_scale(result)
     result = with_answer_digests(result)
     if result.get('mode') == 'discussion':
-        return merge_discussion(led, result)
+        return merge_discussion(led, result, output)
     for key in ('head', 'mergeBase'):
         if not FULL_SHA.match(str(result[key])):
             raise Unusable(f'the output {key} is not a full SHA')
@@ -686,7 +703,7 @@ def save(led, result, reason):
     draft = anchor({**result['draft'], 'comments': comments}, result['mergeBase'], result['head'])
     draft['digest'] = digest({k: draft[k] for k in ('event', 'body', 'comments', 'replies')})
     review = {**result, 'findings': findings, 'draft': draft, 'status': 'pending', 'receipts': {},
-              'reason': reason, 'reviewedAt': now()}
+              'reason': reason, 'reviewedAt': now(), **({'output': output} if output else {})}
     led['reviews'].append(review)
     return {'saved': True, 'head': result['head'], 'draftDigest': draft['digest'], 'event': draft['event'],
             'inline': len(draft['comments']), 'moved': len(result['draft']['comments']) - len(draft['comments']),
@@ -698,22 +715,10 @@ UNREAD = ('ledger', 'answers')
 UNREAD_ROW = ('impact', 'severityReason')
 
 
-def write_snapshot(where, answer, repo, pr, head):
+def workflow_view(answer, repo, pr, head):
     view = {k: v for k, v in answer.items() if k not in UNREAD}
     view['open'] = [{k: v for k, v in f.items() if k not in UNREAD_ROW} for f in answer['open']]
-    payload = json.dumps(view, ensure_ascii=True, separators=(',', ':')).encode('ascii')
-    folder = Path(where)
-    if not folder.is_dir():
-        raise Unusable(f'--snapshot {where} is not a directory')
-    path = folder / f'ledger-{hashlib.sha256(payload).hexdigest()}.json'
-    tmp = path.with_suffix(f'.{os.getpid()}.tmp')
-    try:
-        tmp.write_bytes(payload)
-        windows.replace(tmp, path)
-    except OSError as e:
-        raise Unusable(f'cannot write the snapshot {path}: {e.strerror}')
-    return {'repo': repo, 'pr': pr, 'head': head, 'file': path.as_posix(), 'digest': fnv1a(payload.decode('ascii')),
-            'length': len(payload)}
+    return {'repo': repo, 'pr': pr, 'head': head, **view}
 
 
 def read_snapshot(path, repo, pr):
@@ -727,10 +732,255 @@ def read_snapshot(path, repo, pr):
     return snapshot
 
 
+HERE = Path(__file__).resolve().parent
+# The post.py flags of each publishing choice; a discussion run and an answer bundle always take the plain one.
+POST_MODE = {'pending': 'pending', 'auto-post': 'auto', 'auto-fix': 'auto-defer'}
+POST_FLAGS = {'pending': (), 'auto': ('--auto',), 'auto-defer': ('--auto', '--defer-answers')}
+PUBLISHED = ('pushed', 'already-published')
+
+
+def step(name, why, argv=None, post=None):
+    return {'step': name, 'argv': argv, 'postMode': post, 'why': why}
+
+
+def post_outcome(pub):
+    """What post.py left of a publication: unposted (never tried), failed, uncertain, handed over, drafted, posted or
+    declined."""
+    got = (pub.get('receipts') or {}).get('review') or {}
+    if pub['status'] == 'pending':
+        return 'failed' if got else 'unposted'
+    return 'handed over' if got.get('handedOver') else pub['status']
+
+
+def deferred_bundle(rev):
+    """The answers post.py --auto --defer-answers kept unsent on our review, or None."""
+    return next((a for a in rev.get('answerPublications', []) if a.get('auto') and a['status'] == 'pending'
+                 and a['head'] == rev['head'] and not (a.get('receipts') or {}).get('review')), None)
+
+
+def bundle_sent(rev):
+    """Whether this run published the deferred answers: prepare refuses while a publication of ours is online."""
+    return any(a.get('auto') and a['head'] == rev['head'] and post_outcome(a) not in ('unposted', 'posted', 'declined')
+               for a in rev.get('answerPublications', []))
+
+
+# pr-babysit stops another launch continues from, and stops that end it (launch_result's stalled stops and a spent budget).
+CONTINUED = ('yielded', 'reviews-pending', 'github-rate-limited')
+FINAL = ('budget-exhausted', 'held-awaiting-caller', *STALLED, *ENDED)
+
+
+def next_step(led, facts, live, publish, cmd, review=None, manifest=None, reading=None, fixable_now=None, token=None):
+    """The run's next step after a prepare whose facts are `facts` (None: none on the ledger), from the ledger, the
+    PR's `live` {head, state} and the run's files so far: `review` {result} of this phase's launch, `manifest`
+    {path, reviewedHead, findings}, `reading` (launch_result.py's), fixable_now(head) (show --fixable on a fresh
+    snapshot); `cmd(script, *args)` spells a command."""
+    release = cmd('prepare.py', '--release', '--token', token) if token else None
+
+    def report(why):
+        return step('report', why, release)
+    if facts is None:
+        return step('blocked', 'no prepare facts for --head on the ledger: prepare.py on it first')
+    head, recheck_from, repair = facts['head'], facts.get('recheckFrom'), facts.get('repair')
+    if live['state'] != 'OPEN':
+        return report(f"the PR is {str(live['state']).lower()}")
+    if (publish == 'auto-fix') != bool(recheck_from or repair):
+        return step('blocked', f"--publish {publish} does not match the prepare of {head}, "
+                               f"{'a recheck' if recheck_from else 'with --auto-fix' if repair else 'without --auto-fix'}")
+    same = facts['mode'] == 'same'
+    if recheck_from:
+        return recheck_step(led, facts, live, cmd, report, review, reading, fixable_now)
+    skip = publish == 'auto-fix' and same and repair.get('submittedReview') and (
+        repair['state'] == 'available' or repair.get('deferredAnswers'))
+    if skip:
+        return repair_step(led, head, repair, live, cmd, report, manifest, reading, token)
+    mode = 'pending' if same else POST_MODE[publish]
+    got = launch_of(led, review, head, None, cmd, mode, live, report)
+    if got['step']:
+        return got['step']
+    outcome = post_outcome(got['pub']) if got['pub'] else 'nothing to publish'
+    if outcome == 'unposted':
+        what = 'the discussion\'s answers' if same else 'the review'
+        return step('post', f'{mode} post of {what} saved on {head}', cmd('post.py', '--expected-head', head, *POST_FLAGS[mode]), mode)
+    if publish != 'auto-fix':
+        return report(f'post: {outcome}')
+    if same:
+        return report(f"post: {outcome}; review submitted; auto-fix blocked: {repair['why']}" if repair.get('submittedReview')
+                      else f"post: {outcome}; the auto-fix repairs nothing: {repair.get('submittedWhy')}")
+    if outcome != 'posted':
+        return report(f'post: {outcome}, which ends auto-fix there')
+    return repair_step(led, head, repair, live, cmd, report, manifest, reading, token)
+
+
+def launch_of(led, review, head, recheck_from, cmd, mode, live, report):
+    """{step} when this phase's review launch still decides the step, else {pub}: the publication saved from it, None
+    for a discussion with no answer."""
+    r = (review or {}).get('result') if review else None
+    ours = review is not None and (not isinstance(r, dict) or r.get('head') == head and (
+        r.get('status') != 'reviewed' or r.get('recheckFrom') == recheck_from))
+    if not ours:
+        if live['head'] != head:
+            return {'step': report(f"the PR head moved to {live['head']} since prepare pinned {head}")}
+        what = 'recheck' if recheck_from else 'review'
+        return {'step': step('review', f'launch the pr-review {what} of {head}, then result.py; save it when reviewed; '
+                                       'pass its output as --review-output', post=mode)}
+    if not isinstance(r, dict):
+        return {'step': report('the review launch returned nothing')}
+    if r.get('status') != 'reviewed':
+        return {'step': report(f"the review launch ended {r.get('status')}: {r.get('reason')}")}
+    save = cmd('ledger.py', 'save', '--output', review['path'])
+    if r.get('mode') == 'discussion':
+        return discussion_of(led, head, review['path'], save, mode)
+    on_head = [x for x in led['reviews'] if x['head'] == head]
+    # prepare refused an unsettled draft on this head, so one there now is this run's save, recorded or not.
+    mine = [x for x in on_head if x.get('output') == review['path'] or x['status'] in DRAFTS]
+    if mine:
+        return {'step': None, 'pub': mine[-1]}
+    if any(x['status'] == 'posted' and 'output' not in x for x in on_head):
+        return {'step': step('blocked', f'a review of {head} posted before saves recorded their launch may be this one: if it is, '
+                                        f"report it; else {' '.join(save)} --reason <the request's words>")}
+    again = any(x['status'] == 'posted' for x in on_head)
+    return {'step': step('review', 'save the reviewed launch' + (", with --reason and the request's words: the head was "
+                                                                  'posted before' if again else ''), None if again else save, mode)}
+
+
+def discussion_of(led, head, path, save, mode):
+    """launch_of for a discussion: saved once the last review lists its output, its publication the answers carrying
+    that output, or, saved before discussions recorded it, the unsettled one prepare left none of."""
+    rev = last(led) or {}
+    pubs = [a for a in rev.get('answerPublications', []) if not a.get('auto') and a['head'] == head]
+    mine = [a for a in pubs if a.get('output') == path] or [a for a in pubs if 'output' not in a and a['status'] in DRAFTS]
+    if not mine and path not in rev.get('discussions', []):
+        if any('output' not in a for a in pubs):
+            return {'step': step('blocked', f'answers on {head} published before saves recorded their launch may be this one: if '
+                                            f"they are, report them; else {' '.join(save)}")}
+        return {'step': step('review', 'save the reviewed discussion', save, mode)}
+    return {'step': None, 'pub': (mine or [None])[-1]}
+
+
+def repair_step(led, head, repair, live, cmd, report, manifest, reading, token):
+    """Auto-fix after our review submitted on `head`: repair, pr-babysit, fix notes, then the recheck."""
+    rev = last(led)
+    if not rev or rev['head'] != head or not ((rev.get('receipts') or {}).get('review') or {}).get('submitted'):
+        return step('blocked', f'the last review on the PR is not one submitted on {head}')
+    bundle = deferred_bundle(rev)
+
+    def end(why):
+        if bundle and live['head'] == head:
+            return step('publish-answers', f'{why}; the deferred answers go into a pending review, then report',
+                        cmd('post.py', '--expected-head', head), 'pending')
+        return report(why)
+    if repair['state'] != 'available':
+        return end(f"review submitted; auto-fix blocked: {repair['why']}")
+    if manifest and manifest.get('reviewedHead') != head:
+        return step('blocked', f"the --fixed manifest is for {manifest.get('reviewedHead')}, not the reviewed head {head}")
+    if reading is None:
+        if live['head'] != head:
+            return end(f"head moved before repair: the PR head is {live['head']}")
+        if manifest is None:
+            return step('repair', f'repair the fix findings of our review submitted on {head}; pass the --fixed manifest')
+        return step('babysit', 'launch pr-babysit on the repairs; pass its reading as --babysit-reading')
+    if manifest is None:
+        return step('blocked', 'a pr-babysit reading without the repair\'s --fixed manifest')
+    adoption = ((reading.get('receipts') or {}).get('adoption') or {}).get('publication')
+    launch = (reading.get('stateRef') or {}).get('digest') if isinstance(reading.get('stateRef'), dict) else None
+    if adoption in PUBLISHED and manifest.get('findings'):
+        if not launch:
+            return step('blocked', 'the pr-babysit reading names no stateRef digest to key its fix notes by')
+        if launch not in rev.get('fixedLaunches', []):
+            return step('fixed', f"launch {launch}'s adoption is {adoption}: fix notes on {live['head']}",
+                        cmd('post.py', '--expected-head', live['head'], '--fixed', manifest['path'], '--launch', launch))
+    result = reading.get('result')
+    if not isinstance(result, dict):
+        return step('babysit', 'the launch returned nothing: relaunch it from the stateRef it was given')
+    if result.get('pass') is not True:
+        reason, budget = result.get('reason'), reading.get('budget') or {}
+        if isinstance(budget.get('cyclesUsed'), int) and isinstance(budget.get('maxCycles'), int) and \
+                budget['cyclesUsed'] >= budget['maxCycles']:
+            return end(f"pr-babysit stopped {reason} with its cycle budget spent ({budget['cyclesUsed']} of {budget['maxCycles']}): a "
+                       "larger maxCycles is the user's decision; the recheck is pending")
+        if reason in CONTINUED:
+            return step('babysit', f"pr-babysit stopped {reason}: relaunch it under chief's rules")
+        if reason in FINAL:
+            return end(f'pr-babysit ended {reason} without passing; the recheck is pending')
+        first = (reading.get('blockers') or ['none named'])[0]
+        return step('blocked', f'pr-babysit stopped {reason}, which the recipe does not place; first blocker: {first}')
+    left = (reading.get('checkout') or {}).get('head')
+    if not left:
+        return step('blocked', 'the pr-babysit reading names no checkout.head: read the launch with --checkout')
+    if live['head'] != left:
+        return end(f"head moved after repair: pr-babysit left {left}, the PR head is {live['head']}")
+    if left == head and (bundle or bundle_sent(rev)):
+        return end('pr-babysit left the reviewed head')
+    return step('recheck', f'prepare the recheck of {left} from the launcher\'s checkout top level, then pass its head as --head',
+                cmd('prepare.py', '--recheck-from', head, *(('--token', token) if token else ())))
+
+
+def recheck_step(led, facts, live, cmd, report, review, reading, fixable_now):
+    """The recheck, after a repair from our review submitted on facts' recheckFrom."""
+    head, reviewed = facts['head'], facts['recheckFrom']
+    left = ((reading or {}).get('checkout') or {}).get('head')
+    if not left:
+        return step('blocked', "a recheck needs pr-babysit's last reading with its checkout.head (--babysit-reading)")
+    if left != head:
+        return report(f'head moved after repair: pr-babysit left {left}, the recheck pinned {head}')
+    same = facts['mode'] == 'same'
+    got = launch_of(led, review, head, reviewed, cmd, 'pending' if same else None, live, report)
+    if got['step']:
+        return got['step']
+    outcome = post_outcome(got['pub']) if got['pub'] else 'nothing to publish'
+    if outcome != 'unposted':
+        return report(f'recheck post: {outcome}')
+    if same:
+        return step('post', 'the recheck discussion\'s answers, pending', cmd('post.py', '--expected-head', head), 'pending')
+    try:
+        fx = fixable_now(reviewed)
+    except Unusable as e:
+        return step('blocked', f'ledger.py show --fixable on {reviewed}: {e}')
+    held = ', '.join(f"{h['findingId']} ({h['why']})" for h in fx['held']) or 'none'
+    mode = 'auto' if fx['autoPost'] else 'pending'
+    return step('post', f'recheck post, {mode}: held {held}', cmd('post.py', '--expected-head', head, *POST_FLAGS[mode]), mode)
+
+
+def read_json(path, what):
+    """A file's JSON object, or its last nonempty line's (a script's stdout saved whole); None for an empty file."""
+    try:
+        text = Path(path).read_text(encoding='utf-8')
+        lines = [x for x in text.splitlines() if x.strip()]
+        try:
+            value = json.loads(text)
+        except ValueError:
+            value = json.loads(lines[-1]) if lines else None
+    except (OSError, ValueError) as e:
+        raise Unusable(f'{what} {path} unreadable: {e}')
+    if value is not None and not isinstance(value, dict):
+        raise Unusable(f'{what} {path} is not an object')
+    return value
+
+
+def next_of(a, repo):
+    """ledger.py next's I/O around next_step."""
+    from threads import snapshot  # threads imports this module
+    led = load(ledger_path(repo, a.pr), repo, a.pr)
+    path = facts_path(repo, a.pr, a.head)
+    facts = read_json(path, 'prepare facts') if path.exists() else None
+    facts = facts and {**facts, 'head': a.head}
+    pr = gh_json('pr', 'view', str(a.pr), '--repo', repo, '--json', 'headRefOid,state')
+    manifest = a.manifest and read_json(a.manifest, '--manifest')
+    reading = a.babysit_reading and read_json(a.babysit_reading, '--babysit-reading')
+    review = a.review_output and {'path': Path(a.review_output).resolve().as_posix(),
+                                  'result': (load_output(a.review_output) or {}).get('result')}
+
+    def cmd(script, *args):
+        return [sys.executable, (HERE / script).as_posix(), *args, '--pr', str(a.pr), '--repo', repo]
+    return next_step(led, facts, {'head': pr['headRefOid'], 'state': pr.get('state')}, a.publish, cmd, review,
+                     manifest and {**manifest, 'path': a.manifest}, reading,
+                     lambda h: fixable(led, snapshot(repo, a.pr), h), a.token)
+
+
 def collect(argv):
     p = Parser(prog='ledger.py')
     sub = p.add_subparsers(dest='cmd', required=True)
-    for name in ('show', 'save'):
+    for name in ('show', 'save', 'next'):
         s = sub.add_parser(name)
         s.add_argument('--pr', type=int, required=True)
         s.add_argument('--repo')
@@ -741,16 +991,25 @@ def collect(argv):
     which.add_argument('--threads')
     sub.choices['show'].add_argument('--head')
     sub.choices['show'].add_argument('--fixable', action='store_true')
-    sub.choices['show'].add_argument('--snapshot')
+    sub.choices['show'].add_argument('--view', action='store_true')
     sub.choices['save'].add_argument('--output', required=True)
     sub.choices['save'].add_argument('--reason')
+    nxt = sub.choices['next']
+    nxt.add_argument('--head', required=True)
+    nxt.add_argument('--publish', required=True, choices=tuple(POST_MODE))
+    for flag in ('--token', '--review-output', '--manifest', '--babysit-reading'):
+        nxt.add_argument(flag)
     a = p.parse_args(argv)
     repo = repo_of(a.repo)
+    if a.cmd == 'next':
+        if not FULL_SHA.match(a.head):
+            raise Unusable('--head must be a full SHA')
+        return next_of(a, repo)
     path = ledger_path(repo, a.pr)
     if a.cmd == 'show' and a.fixable and not (a.threads and a.head):
         p.error('--fixable needs --threads and --head')
-    if a.cmd == 'show' and a.snapshot is not None and (a.fixable or not a.head):
-        p.error('--snapshot needs --threads and --head, and not --fixable')
+    if a.cmd == 'show' and a.view and (a.fixable or not a.head):
+        p.error('--view needs --threads and --head, and not --fixable')
     if getattr(a, 'head', None) is not None:
         if not a.threads:
             p.error('--head needs --threads')
@@ -763,7 +1022,7 @@ def collect(argv):
             return {'ledger': path.as_posix(), 'fixable': fixable(led, snapshot, a.head)}
         out = {'ledger': path.as_posix(), **show(led, a.finding, a.draft, snapshot, a.pending)}
         out = {**out, 'disputes': disputes(led, snapshot, a.head)} if a.head else out
-        return write_snapshot(a.snapshot, out, repo, a.pr, a.head) if a.snapshot is not None else out
+        return workflow_view(out, repo, a.pr, a.head) if a.view else out
     result = (load_output(a.output) or {}).get('result')
     if not isinstance(result, dict):
         raise Unusable(f'--output {a.output} holds no Workflow result')
@@ -771,7 +1030,7 @@ def collect(argv):
         raise Unusable(f"the launch ended {result.get('status')!r} ({result.get('reason')}): nothing to save")
     with locked(path):
         led = load(path, repo, a.pr)
-        out = save(led, result, a.reason)
+        out = save(led, result, a.reason, Path(a.output).resolve().as_posix())  # next's launch identity
         store(path, led)
     return {'ledger': path.as_posix(), **out}
 

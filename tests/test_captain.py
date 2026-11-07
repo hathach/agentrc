@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'skills' / 'captain' / 'scripts'))
 import captain  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import guard_survivors, make_stub, tmpdir  # noqa: E402
+from helpers import guard_survivors, tmpdir  # noqa: E402
 
 RULE = '─' * 40
 FOOTER = '  host:~/w example.com Opus 5.5 high\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent\n'
@@ -265,43 +265,12 @@ def ran(code=0, body=None, kind=None, msg=''):
 
 
 class HcTest(unittest.TestCase):
-    """captain's use of lib/hc.py: a hung or missing hc fails like any hc error instead of holding the ledger lock."""
+    """captain's use of lib/hc.py: an hc failure exits 5; lib/hc.py's own tests cover a hung or missing hc."""
 
     def setUp(self):
         patcher = mock.patch.object(captain.hc, 'program', return_value='hc')   # Windows CI has no hc.exe on PATH
         patcher.start()
         self.addCleanup(patcher.stop)
-
-    def hangs(self, *args, timeout=None, **kw):
-        raise subprocess.TimeoutExpired(args[0], timeout)
-
-    def test_timed_out_call_fails(self):
-        with mock.patch.object(subprocess, 'run', side_effect=self.hangs) as run:
-            self.assertEqual(captain.submit('t2', 'hi', 'idle', 't1')[0], 'uncertain')
-            self.assertEqual(run.call_args.kwargs['timeout'], captain.HC_TIMEOUT_S)
-            self.assertTrue(captain.wait_started('t2'))
-            for call in (lambda: captain.get('t2'), lambda: captain.read_screen('t2')):
-                with self.assertRaises(captain.hc.Error):
-                    call()
-
-    def test_wait_outwaits_hc_s_own_limit(self):
-        with mock.patch.object(subprocess, 'run', side_effect=self.hangs) as run:
-            captain.wait_started('t2')
-        argv = run.call_args.args[0]
-        self.assertGreater(run.call_args.kwargs['timeout'], int(argv[argv.index('--timeout') + 1]))
-
-    def test_a_message_to_the_captain_does_not_end_the_wait(self):
-        answers = [ran(body={'reason': 'message'}), ran(body={'reason': 'status', 'status': 'idle'})]
-        with mock.patch.object(captain.hc, 'run', side_effect=answers) as run:
-            self.assertIsNone(captain.wait_started('t2'))
-        self.assertEqual(run.call_count, 2)
-        with mock.patch.object(captain.hc, 'run', return_value=ran(body=None)):
-            self.assertIn('no JSON object', captain.wait_started('t2'))
-
-    def test_missing_hc_fails(self):
-        with mock.patch.object(subprocess, 'run', side_effect=FileNotFoundError('hc')), \
-             self.assertRaises(captain.hc.Error):
-            captain.get('t2')
 
     def test_an_hc_failure_exits_5(self):
         with mock.patch.object(sys, 'argv', ['captain.py', 'list']), mock.patch('sys.stderr'), \
@@ -608,6 +577,14 @@ class ReportTest(LedgerCase):
         self.assertNotIn('report', [r['type'] for r in captain.records()])
 
 
+class ReportFieldsTest(unittest.TestCase):
+    def test_issues_are_validated_like_prs(self):
+        self.assertIsNone(captain.validate({**GOOD, 'issues': ['o/r#7']}))
+        self.assertIsNone(captain.validate(GOOD))
+        self.assertIsNotNone(captain.validate({**GOOD, 'issues': ['#7']}))
+        self.assertIsNotNone(captain.validate({**GOOD, 'issues': 'o/r#7'}))
+
+
 class UnchangedTest(LedgerCase):
     """The target's transcript as Claude Code writes it: its reporting turn, the request as hc pasted it, then
     whatever came after."""
@@ -739,7 +716,7 @@ class BriefTest(LedgerCase):
             self.assertEqual(captain.collect([self.msg], 0), 0)
         self.assertTrue(out.call_args_list[-2].args[0].startswith(
             f'refused by the session that replaced its target {self.msg}'))
-        self.assertTrue(out.call_args_list[-1].args[0].startswith('done from '))
+        self.assertEqual(out.call_args_list[-1].args[0], 'done')
         self.assertEqual(captain.reports([self.msg]), [{'handle': 'sp · name · t2', 'msg': self.msg,
                                                         'missing': 'refused by the session that replaced its target'}])
 
@@ -803,7 +780,7 @@ class CollectTest(LedgerCase):
         msg = self.msg_of(self.ask())
         with mock.patch('builtins.print') as out:
             self.assertEqual(captain.collect([msg], 0), captain.NO_ANSWER)
-        self.assertEqual(out.call_args_list[-1].args[0], f'pending from {len(captain.records())}: {msg}')
+        self.assertEqual(out.call_args_list[-1].args[0], f'pending: {msg}')
 
     def test_cancelled_request_is_reported_as_such(self):
         msg = self.msg_of(self.ask())
@@ -1141,11 +1118,10 @@ class AddressingTest(AddressedCase):
         self.assertEqual(captain.records()[0]['quote'], 'merge 318')
 
     def test_every_way_of_naming_the_targets(self):
-        self.report_as('t2', self.msg_of(self.ask()))
         cases = [('Tell Code: merge 318', ['t2'], 'merge 318'),
                  ('tell t2, merge 318', ['t2'], 'merge 318'),
                  ('tell sp2 merge 318', ['t2'], 'merge 318'),
-                 ('tell pr:12 to merge it', ['t2'], 'merge it'),
+                 ('tell space:code to merge it', ['t2'], 'merge it'),
                  ('tell code and docs to rebase\nthen push', ['t2', 't3'], 'rebase\nthen push'),
                  ('tell code, docs & sp3 to rebase', ['t2', 't3'], 'rebase')]
         for words, addresses, want in cases:
@@ -1160,9 +1136,9 @@ class AddressingTest(AddressedCase):
     def test_only_an_addressed_message_lists_the_sessions(self):
         listed, everyone = [], captain.everyone
         with mock.patch.object(captain, 'everyone', lambda: listed.append(1) or everyone()):
-            self.assertEqual(captain.relay_text('merge 318', ['t2'], []), 'merge 318')
+            self.assertEqual(captain.relay_text('merge 318', ['t2']), 'merge 318')
             self.assertEqual(listed, [])
-            self.assertEqual(captain.relay_text('tell code to merge 318', ['t2'], []), 'merge 318')
+            self.assertEqual(captain.relay_text('tell code to merge 318', ['t2']), 'merge 318')
             self.assertEqual(listed, [1])
 
     def test_addressing_anyone_else_or_ambiguously_refuses_at_preview(self):
@@ -1185,9 +1161,7 @@ class AddressingTest(AddressedCase):
 
     def test_a_name_for_several_sessions_refuses_even_when_all_are_targets(self):
         self.terminals['t4'] = {**pinned('t4'), 'space': 'code'}
-        self.report_as('t2', self.msg_of(self.ask()))
-        self.report_as('t4', self.msg_of(self.ask('t4')))
-        for words in ('tell space:code to merge 318', 'tell code to merge 318', 'tell pr:12 to merge 318'):
+        for words in ('tell space:code to merge 318', 'tell code to merge 318'):
             with self.subTest(words):
                 self.assertIn('not one session', self.refused(words, 't2', 't4'))
         self.assertEqual(self.shown('tell t2 and sp4 to merge 318', 't2', 't4')[0], 'merge 318')
@@ -1203,7 +1177,7 @@ class AddressingTest(AddressedCase):
         text, entry, digest = self.shown('tell sp2, merge to finish', 't2')
         self.assertEqual(text, 'merge to finish')
         self.terminals['t2'] = {**self.terminals['t2'], 'space': 'merge'}
-        self.assertEqual(captain.instruction('tell sp2, merge to finish', ['t2'], captain.everyone(), [])[0],
+        self.assertEqual(captain.instruction('tell sp2, merge to finish', ['t2'], captain.everyone())[0],
                          'finish')   # the same words now parse differently
         with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
             self.relay(entry, 't2', digest=digest)
@@ -1227,15 +1201,7 @@ class BroadcastTest(AddressedCase):
 
     EVERY = ('t2', 't3')
 
-    def test_tell_all_previews_and_sends_to_every_live_session(self):
-        text, entry, digest = self.shown('tell all to continue', *self.EVERY)
-        self.assertEqual(text, 'continue')
-        lines = self.relay(entry, *self.EVERY, digest=digest)
-        self.assertTrue(all(line.endswith('delivered') for line in lines), lines)
-        self.assertEqual(sorted(address for address, _ in self.typed), list(self.EVERY))
-        self.assertEqual([r['quote'] for r in captain.records() if r['type'] == 'relay'], ['continue'] * 2)
-
-    def test_the_all_target_is_expanded_at_the_preview_and_the_send_names_the_addresses(self):
+    def test_the_all_target_previews_every_live_session_and_the_send_names_the_addresses(self):
         text, entry, digest = self.shown('tell all to continue', 'all')
         self.assertEqual(text, 'continue')
         self.assertEqual(self.preview('all').split('\n')[:2], ['to all: sp · name · t2 (idle)', 'to all: sp · name · t3 (idle)'])
@@ -1244,6 +1210,8 @@ class BroadcastTest(AddressedCase):
         self.assertEqual(self.typed, [])
         lines = self.relay(entry, *self.EVERY, digest=digest)
         self.assertTrue(all(line.endswith('delivered') for line in lines), lines)
+        self.assertEqual(sorted(address for address, _ in self.typed), list(self.EVERY))
+        self.assertEqual([r['quote'] for r in captain.records() if r['type'] == 'relay'], ['continue'] * 2)
 
     def test_all_stands_alone_and_needs_a_live_session(self):
         for args in (['all', 't2'], ['t2', 'all']):
@@ -1262,35 +1230,34 @@ class BroadcastTest(AddressedCase):
             with self.subTest(words):
                 self.assertEqual(self.shown(words, *self.EVERY)[0], want)
 
-    def test_a_qualified_or_mixed_all_refuses_at_preview(self):
-        cases = [('tell all tinyusb sessions to merge', 'not as "all'),
-                 ('tell all and code to merge', 'not as "all'),
-                 ('tell all, code to merge', 'not one to join'),
-                 ('tell all continue', 'not as "all'),
-                 ('tell every sessions to merge', 'not as "all'),
-                 ('tell code and all to merge', 'not one to join'),
-                 ('tell all to   ', 'nothing follows'),
-                 ('tell everyone:', 'nothing follows')]
-        for words, why in cases:
-            with self.subTest(words):
-                why_not = self.refused(words, *self.EVERY)
-                self.assertIn(why, why_not)
-                self.assertIn('ask the human to restate it', why_not)
-        self.assertEqual((self.typed, captain.records()), ([], []))
-
-    def test_all_joined_to_a_name_refuses(self):
-        for words in ('tell code, everyone: continue', 'tell code, all to continue', 'tell code & every: go'):
-            with self.subTest(words):
-                self.assertIn('not one to join', self.refused(words, 't2'))
+    def test_any_other_form_of_all_refuses(self):
+        """Qualified, joined to a name, with nothing after it, or also a session's space name: nothing sent."""
+        def check(cases):
+            for words, addresses, why in cases:
+                with self.subTest(words):
+                    why_not = self.refused(words, *addresses)
+                    self.assertIn(why, why_not)
+                    self.assertIn('ask the human to restate it', why_not)
+        check([('tell all tinyusb sessions to merge', self.EVERY, 'not as "all'),
+               ('tell all and code to merge', self.EVERY, 'not as "all'),
+               ('tell all, code to merge', self.EVERY, 'not one to join'),
+               ('tell all continue', self.EVERY, 'not as "all'),
+               ('tell every sessions to merge', self.EVERY, 'not as "all'),
+               ('tell code and all to merge', self.EVERY, 'not one to join'),
+               ('tell all to   ', self.EVERY, 'nothing follows'),
+               ('tell everyone:', self.EVERY, 'nothing follows'),
+               ('tell code, everyone: continue', ['t2'], 'not one to join'),
+               ('tell code, all to continue', ['t2'], 'not one to join'),
+               ('tell code & every: go', ['t2'], 'not one to join')])
         with self.assertRaises(SystemExit), mock.patch('builtins.print') as out:
             captain.relay(['t2'], self.say('tell code, everyone: continue'), 'any', self.ident)
         self.assertIn('not one to join', out.call_args.args[0])
-        self.assertEqual((self.typed, captain.records()), ([], []))
-
-    def test_all_joined_to_a_name_refuses_even_as_a_label(self):
         self.terminals['t4'] = {**pinned('t4'), 'space': 'all'}
-        self.assertIn('not one to join', self.refused('tell code and all to merge', 't2', 't4'))
+        check([('tell code and all to merge', ['t2', 't4'], 'not one to join'),
+               ('tell all to merge', [*self.EVERY, 't4'], 'also names a session'),
+               ('tell all:merge', [*self.EVERY, 't4'], 'also names a session')])
         self.assertEqual((self.typed, captain.records()), ([], []))
+        self.assertEqual(self.shown('tell space:all to merge', 't4')[0], 'merge')
 
     def test_all_needs_exactly_the_live_sessions(self):
         for addresses, why in ((['t2'], 'not targeted: t3'), ([*self.EVERY, 't99'], 'not live: t99')):
@@ -1300,32 +1267,27 @@ class BroadcastTest(AddressedCase):
                 self.assertIn('preview again', why_not)
                 self.assertNotIn('restate', why_not)
         self.assertEqual((self.typed, captain.records()), ([], []))
-
-    def test_no_target_or_no_live_session_is_not_every_session(self):
         live = captain.everyone()
         for addresses, sessions in (([], live), (['t2'], []), ([], [])):
             with self.subTest(addresses=addresses, live=len(sessions)):
-                text, why = captain.instruction('tell all to continue', addresses, sessions, [])
+                text, why = captain.instruction('tell all to continue', addresses, sessions)
                 self.assertIsNone(text)
                 self.assertIsInstance(why, captain.Stale)
 
-    def test_a_session_opening_or_closing_after_the_preview_refuses_the_send(self):
+    def test_a_session_opened_closed_or_replaced_after_the_preview_refuses_the_send(self):
         _, entry, digest = self.shown('tell all to continue', *self.EVERY)
         self.terminals['t4'] = pinned('t4')
         for addresses in (self.EVERY, (*self.EVERY, 't4')):
             with self.subTest(addresses), self.assertRaises(SystemExit), mock.patch('sys.stderr'):
                 self.relay(entry, *addresses, digest=digest)
-        del self.terminals['t4'], self.terminals['t3']
-        with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
-            self.relay(entry, *self.EVERY, digest=digest)
-        self.assertEqual((self.typed, captain.records()), ([], []))
-
-    def test_a_session_replaced_in_a_terminal_after_the_preview_refuses_the_send(self):
-        _, entry, digest = self.shown('tell all to continue', *self.EVERY)
+        del self.terminals['t4']
         self.terminals['t3'] = {**self.terminals['t3'], 'pid': 11, 'started': 21, 'session': 's-new'}
         with self.assertRaises(SystemExit), mock.patch('builtins.print') as out:
             captain.relay(list(self.EVERY), entry, digest, self.ident)
         self.assertIn('preview again', out.call_args.args[0])
+        del self.terminals['t3']
+        with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
+            self.relay(entry, *self.EVERY, digest=digest)
         self.assertEqual((self.typed, captain.records()), ([], []))
 
     def test_a_session_replaced_during_the_send_is_refused(self):
@@ -1339,13 +1301,6 @@ class BroadcastTest(AddressedCase):
         self.assertTrue(lines[0].endswith('delivered'))
         self.assertIn('not the one the preview showed', lines[1])
         self.assertEqual([address for address, _ in self.typed], ['t2'])
-
-    def test_a_name_that_is_also_a_session_refuses(self):
-        self.terminals['t3'] = {**pinned('t3'), 'space': 'all'}
-        for words in ('tell all to merge', 'tell all:merge'):
-            with self.subTest(words):
-                self.assertIn('also names a session', self.refused(words, *self.EVERY))
-        self.assertEqual(self.shown('tell space:all to merge', 't3')[0], 'merge')
 
     def test_a_working_session_is_a_target_refused_at_the_send_and_retried(self):
         self.terminals['t3'] = {**self.terminals['t3'], 'status': 'working'}
@@ -1428,15 +1383,12 @@ class DigestTest(AddressedCase):
         self.assertEqual((self.typed, captain.records()), ([], []))
 
 
-class SelectorTest(RelayCase):
-    """Selectors resolve against the live sessions and each one's latest report, before anything is sent."""
+class SpaceTargetTest(RelayCase):
+    """space:<id or name> resolves against the live sessions before anything is sent."""
 
     def setUp(self):
         super().setUp()
         self.terminals['t3'] = {**pinned('t3'), 'space': 'other'}
-
-    def reported(self, address, **change):
-        self.report_as(address, self.msg_of(self.ask(address)), {**GOOD, **change})
 
     def resolve(self, *args):
         return list(captain.resolve(list(args)))
@@ -1446,75 +1398,26 @@ class SelectorTest(RelayCase):
             captain.resolve(list(args))
         return ''.join(c.args[0] for c in err.write.call_args_list)
 
-    def test_pr_selectors(self):
-        self.reported('t2')
-        for arg in ('pr:12', 'pr:o:r:12', 'pr:O:R:12'):
-            with self.subTest(arg):
-                self.assertEqual(self.resolve(arg), ['t2'])
-        self.assertIn('no live session matches', self.refuses('pr:112'))
-        self.assertIn('no live session matches', self.refuses('pr:p:q:12'))
-
-    def test_a_bare_number_in_two_repositories_refuses(self):
-        self.reported('t2')
-        self.reported('t3', prs=['p/q#12'])
-        why = self.refuses('pr:12')
-        self.assertIn('t2', why)
-        self.assertIn('t3', why)
-        self.assertEqual(self.resolve('pr:o:r:12'), ['t2'])
-
-    def test_issue_selectors_read_only_the_issues_field(self):
-        self.reported('t2', issues=['o/r#7'])
-        self.reported('t3', task='fix issue 7')   # a legacy report, the number only in prose
-        self.assertEqual(self.resolve('issue:7'), ['t2'])
-        self.assertIn('no live session', self.refuses('issue:12'))   # a PR number is not an issue
-
-    def test_a_restarted_session_s_old_report_matches_nothing(self):
-        self.reported('t2')
-        self.terminals['t2'] = {**pinned('t2'), 'started': 99}
-        self.assertIn('no live session matches', self.refuses('pr:12'))
-
-    def test_space_selectors(self):
+    def test_one_session_by_space_id_or_name(self):
         self.assertEqual(self.resolve('space:sp3'), ['t3'])
         self.assertEqual(self.resolve('space:other'), ['t3'])
+        self.assertEqual(self.resolve('t3', 'space:other'), ['t3'])   # one terminal named twice goes once
+        self.assertIn('no live session matches', self.refuses('space:missing'))
+        self.assertIn('not a space', self.refuses('space:'))
         self.terminals['t4'] = pinned('t4')
         self.assertIn('all match', self.refuses('space:sp'))   # two spaces share the name
         self.terminals['t31'] = {**pinned('t31'), 'space_id': 'sp3', 'space': 'other'}
-        self.assertIn('all match', self.refuses('space:sp3'))   # two terminals in one space
-
-    def test_unsupported_selectors_refuse(self):
-        for arg in ('pr:abc', 'pr:o:12', 'issue:', 'space:'):
-            with self.subTest(arg):
-                self.assertIn('not a selector', self.refuses(arg))
-
-    def test_aliases_of_one_terminal_go_once(self):
-        self.reported('t2')
-        self.assertEqual(self.resolve('t2', 'pr:12'), ['t2'])
-
-    def test_preview_shows_the_terminal_a_selector_names(self):
-        self.reported('t2')
-        self.say('merge o/r#12')
-        with mock.patch('builtins.print') as out:
-            captain.preview(captain.resolve(['pr:12']), self.ident)
-        self.assertIn('to pr:12: sp · name · t2 (idle)', [c.args[0] for c in out.call_args_list])
-
-    def test_a_relay_never_takes_a_selector(self):
-        self.reported('t2')
-        uid = self.say('merge o/r#12')
-        with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
-            self.relay(uid, 'pr:12')
-        self.assertEqual([r for r in captain.records() if r['type'] == 'relay'], [])
-
-    def test_one_bad_selector_sends_nothing(self):
-        self.reported('t2')
-        self.typed.clear()
-        self.refuses('pr:12', 'pr:99')
+        self.assertIn('all match', self.refuses('t2', 'space:sp3'))   # two terminals in one space
         self.assertEqual(self.typed, [])
 
-    def test_issues_are_validated_like_prs(self):
-        self.assertIsNone(captain.validate({**GOOD, 'issues': ['o/r#7']}))
-        self.assertIsNone(captain.validate(GOOD))
-        self.assertIsNotNone(captain.validate({**GOOD, 'issues': ['#7']}))
-        self.assertIsNotNone(captain.validate({**GOOD, 'issues': 'o/r#7'}))
+    def test_preview_shows_the_terminal_and_the_send_takes_only_addresses(self):
+        uid = self.say('merge o/r#12')
+        with mock.patch('builtins.print') as out:
+            captain.preview(captain.resolve(['space:other']), self.ident)
+        self.assertIn('to space:other: sp · name · t3 (idle)', [c.args[0] for c in out.call_args_list])
+        with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
+            self.relay(uid, 'space:other')
+        self.assertEqual([r for r in captain.records() if r['type'] == 'relay'], [])
 
 
 class AcceptTest(RelayCase):
@@ -1636,36 +1539,10 @@ class OutcomeTest(RelayCase):
         self.replace_captain()
         self.assertEqual(self.as_target(captain.outcome, self.action, 'failed', 'conflict')[0], 0)
 
-
-class WithdrawTest(RelayCase):
-    def setUp(self):
-        super().setUp()
-        self.action = self.relayed()
-
-    def withdraw(self):
-        with mock.patch('builtins.print') as out:
-            captain.withdraw(self.action, self.ident)
-        return out.call_args_list[0].args[0]
-
-    def test_before_acceptance_it_cannot_be_accepted(self):
-        self.assertIn('withdrawn', self.withdraw())
-        with self.assertRaises(SystemExit):
-            self.as_target(captain.accept, self.action)
-
-    def test_after_acceptance_it_stays_open_until_the_outcome(self):
-        self.as_target(captain.accept, self.action)
-        self.assertIn('nothing stops it', self.withdraw())
-        self.withdraw()
-        self.assertEqual(self.count('withdraw-requested'), 1)
-        self.assertIn(self.action, captain.open_items(captain.records()))
-        self.as_target(captain.outcome, self.action, 'completed', 'merged before I saw it')
+    def test_a_withdrawn_relay_from_an_older_ledger_reads_closed(self):
+        captain.append({'type': 'withdraw', 'msg': self.action})
+        captain.append({'type': 'withdraw-requested', 'msg': self.action})
         self.assertNotIn(self.action, captain.open_items(captain.records()))
-
-    def test_status_requests_are_not_withdrawn(self):
-        self.as_target(captain.outcome, self.action, 'rejected', '')
-        msg = self.msg_of(self.ask())
-        with self.assertRaises(SystemExit), mock.patch('builtins.print'):
-            captain.withdraw(msg, self.ident)
 
     def test_collect_prints_each_event(self):
         self.as_target(captain.accept, self.action)
@@ -1674,245 +1551,7 @@ class WithdrawTest(RelayCase):
             self.assertEqual(captain.collect([self.action], 0), 0)
         self.assertEqual([c.args[0] for c in out.call_args_list],
                          [f'accepted {self.action} · sp · name · t2',
-                          f'completed {self.action} · sp · name · t2 · merged at 1234',
-                          f'done from {len(captain.records())}'])
-
-
-class OpenTest(LedgerCase):
-    """hc run, get and wait replaced; run puts the session it would start in the terminal table."""
-
-    def setUp(self):
-        super().setUp()
-        self.checkout = os.path.realpath(tmpdir(self))
-        self.created = []
-        self.session = {'cwd': self.checkout, 'account': 'ada'}
-        self.space = 'sp1'
-        self.start_error = None
-        for target, attr, value in [(captain.hc, 'call', self._call), (captain, 'get', self._get),
-                                    (captain, 'wait_started', lambda address: self.start_error)]:
-            patcher = mock.patch.object(target, attr, value)
-            patcher.start()
-            self.addCleanup(patcher.stop)
-
-    def _call(self, command, *args, timeout):
-        self.assertEqual((command, args[0]), ('run', '--json'))
-        self.created.append(args)
-        if self.session is not None:
-            self.terminals['t7'] = {**pinned('t7'), **self.session}
-        return {'address': 't7', 'state': 'live'}
-
-    def _get(self, address):
-        self.assertEqual(address, 't1')   # the captain's own terminal, for its space
-        return {'address': 't1', 'labels': {'herdr.space': self.space} if self.space else {}}
-
-    def open(self, checkout=None, account='ada', name=None):
-        with mock.patch('builtins.print') as out:
-            code = captain.open_session(checkout or self.checkout, account, name, self.ident)
-        return code, '\n'.join(c.args[0] for c in out.call_args_list)
-
-    def program(self):
-        """The argv hc run starts, after its own options."""
-        args = self.created[0]
-        return list(args[args.index('--') + 1:])
-
-    def test_ready_under_the_account_named(self):
-        code, line = self.open()
-        self.assertEqual(code, 0)
-        self.assertIn('t7: ready', line)
-        args = self.created[0]
-        self.assertEqual(self.program(), [captain.ENV, f'CLAUDE_CONFIG_DIR={captain.CONFIG_DIRS["ada"]}', 'claude'])
-        self.assertEqual(args[args.index('--cwd') + 1], self.checkout)
-        self.assertEqual(args[args.index('--label') + 1], 'herdr.space=sp1')   # a new tab in the captain's space
-        self.assertIn('--no-parent', args)   # outlives the captain, and no notes about it are typed into it
-        self.assertIn('--bg', args)
-        self.assertEqual(self.typed, [])
-
-    def test_main_unsets_the_config_dir(self):
-        """The terminal's environment is hc's, not the captain's: main is unset explicitly, never inherited."""
-        self.session['account'] = 'main'
-        self.assertEqual(self.open(account='main')[0], 0)
-        self.assertEqual(self.program(), [captain.ENV, '-u', 'CLAUDE_CONFIG_DIR', 'claude'])
-
-    def test_a_captain_in_no_space_opens_a_hidden_terminal_and_says_so(self):
-        self.space = None
-        code, line = self.open()
-        self.assertEqual(code, 0)
-        self.assertNotIn('--label', self.created[0])
-        self.assertIn('t7: opened', line)
-        self.assertIn('in no space: hc attach t7', line)
-
-    def test_names(self):
-        self.open(name='repo_1')
-        self.assertEqual(self.created[-1][self.created[-1].index('--name') + 1], 'repo_1')
-        self.open()
-        made = self.created[-1][self.created[-1].index('--name') + 1]
-        self.assertTrue(captain.TERMINAL_NAME.fullmatch(made), made)
-        self.assertEqual(captain.terminal_name(None, '/w/My Repo.v2'), 'my-repo-v2')
-        self.assertEqual(captain.terminal_name(None, '/w/...'), 'claude')
-        for bad in ('My Repo', 'x' * 33, '', 'a/b'):
-            with self.subTest(bad), self.assertRaises(SystemExit), mock.patch('sys.stderr'):
-                self.open(name=bad)
-        self.assertEqual(len(self.created), 2)
-
-    def test_not_ready_is_reported_never_answered(self):
-        cases = {
-            'did not start': ({}, 'no answer within 90 s', None),
-            'no Claude Code status': (None, None, None),
-            'account main': ({'account': 'main'}, None, None),
-            'runs in /elsewhere': ({'cwd': '/elsewhere'}, None, None),
-            'not pinned': ({'pid': None}, None, None),
-            'not a recognized input line': ({}, None, 'Quick safety check: Is this a project you trust?\n❯ No, exit'),
-            'shows text': ({}, None, boxed('❯\xa0Try "fix lint errors"')),
-        }
-        for why, (session, error, text) in cases.items():
-            with self.subTest(why):
-                self.terminals.pop('t7', None)
-                self.session = None if session is None else {'cwd': self.checkout, 'account': 'ada', **session}
-                self.start_error = error
-                self.screens = {'t7': text} if text else {}
-                code, line = self.open()
-                self.assertEqual(code, 2)
-                self.assertIn('t7: not ready', line)
-                self.assertIn(why, line)
-        self.assertEqual(self.typed, [])
-
-    def test_a_failure_after_creation_still_names_the_terminal(self):
-        with mock.patch.object(captain, 'find', side_effect=SystemExit(5)), mock.patch('builtins.print') as out, \
-             self.assertRaises(SystemExit):
-            captain.open_session(self.checkout, 'ada', None, self.ident)
-        self.assertIn('t7: opened', out.call_args_list[0].args[0])
-
-    def test_a_replacement_waits_for_the_open_to_finish(self):
-        real = captain.locked
-
-        @contextmanager
-        def replaced_then_lock():
-            self.replace_captain()
-            with real():
-                yield
-        with mock.patch.object(captain, 'locked', replaced_then_lock), self.assertRaises(SystemExit):
-            self.open()
-        self.assertEqual(self.created, [])
-
-    def test_missing_checkout_creates_nothing(self):
-        with self.assertRaises(SystemExit):
-            self.open(os.path.join(self.checkout, 'nonesuch'))
-        with self.assertRaises(SystemExit):
-            self.open('relative/dir')
-        self.assertEqual(self.created, [])
-
-    def test_only_the_enrolled_captain(self):
-        self.replace_captain()
-        with self.assertRaises(SystemExit):
-            self.open()
-        self.assertEqual(self.created, [])
-
-
-# An hc that runs what `hc run` is given for real, so the account env reaches a real process's /proc environ
-HC_STUB = r"""
-import json, os, subprocess, sys, time
-state = os.environ['HC_STUB_DIR']
-cmd, rest = sys.argv[1], [a for a in sys.argv[2:] if a != '--json']
-started = os.path.join(state, 't9.json')
-if cmd == 'run':
-    opts, i = {}, 0
-    while rest[i] != '--':
-        if rest[i] in ('--bg', '--no-parent'):
-            i += 1
-        else:
-            opts[rest[i]] = rest[i + 1]
-            i += 2
-    proc = subprocess.Popen(rest[i + 1:], cwd=opts['--cwd'], start_new_session=True, stdin=subprocess.DEVNULL,
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    with open(started, 'w') as f:
-        json.dump({'pid': proc.pid, 'cwd': opts['--cwd'], 'name': opts['--name']}, f)
-    print(json.dumps({'address': 't9', 'state': 'live'}))
-elif cmd == 'wait':
-    deadline = time.time() + 20
-    while not os.path.exists(os.path.join(state, 'registered')) and time.time() < deadline:
-        time.sleep(0.05)
-    print(json.dumps({'reason': 'status', 'status': 'idle'}))
-elif cmd == 'get' and rest == ['--', 't1']:
-    print(json.dumps({'address': 't1', 'state': 'live', 'labels': {'herdr.space': 'sp1'}}))
-elif cmd == 'get' and rest == ['--', 't9'] and os.path.exists(started):
-    with open(started) as f:
-        t = json.load(f)
-    print(json.dumps({'address': 't9', 'state': 'live', 'created_ms': 1, 'name': t['name'], 'status_ms': 5,
-                      'foreground': {'argv': ['claude'], 'cwd': t['cwd'], 'name': 'claude', 'pid': t['pid']},
-                      'labels': {'herdr.space': 'sp1', 'where': 'w / 2'},
-                      'status': {'app': 'claude-code', 'state': 'idle'}}))
-elif cmd == 'read':
-    print(os.environ['HC_STUB_SCREEN'])
-else:
-    print(json.dumps({'error': {'kind': 'not_found', 'message': 'no terminal'}}), file=sys.stderr)
-    sys.exit(3)
-"""
-# A Claude Code that registers itself as the real one does, in its own config dir, then waits to be killed
-CLAUDE_STUB = r"""
-import json, os, time
-config = os.environ.get('CLAUDE_CONFIG_DIR') or os.path.join(os.environ['HOME'], '.claude')
-pid = os.getpid()
-with open(f'/proc/{pid}/stat') as f:
-    start = f.read().rsplit(')', 1)[1].split()[19]
-os.makedirs(os.path.join(config, 'sessions'), exist_ok=True)
-with open(os.path.join(config, 'sessions', f'{pid}.json'), 'w') as f:
-    json.dump({'pid': pid, 'sessionId': 'sess-1', 'procStart': start, 'cwd': os.getcwd()}, f)
-open(os.path.join(os.environ['HC_STUB_DIR'], 'registered'), 'w').close()
-time.sleep(120)
-"""
-
-
-@unittest.skipIf(not sys.platform.startswith('linux'), 'the captain reads /proc')
-class OpenStubTest(unittest.TestCase):
-    """open through a stub hc on PATH that really starts the program: the account comes from that process's own
-    environment, so CLAUDE_CONFIG_DIR is proved to reach it, set for ada and unset for main even when the caller's
-    environment sets it."""
-
-    def setUp(self):
-        root = tmpdir(self)
-        self.home, self.state, bin_dir = root / 'home', root / 'state', root / 'bin'
-        for d in (self.home, self.state, bin_dir):
-            d.mkdir()
-        self.checkout = root / 'repo'
-        self.checkout.mkdir()
-        make_stub(bin_dir, 'hc', HC_STUB)
-        make_stub(bin_dir, 'claude', CLAUDE_STUB)
-        env = mock.patch.dict(os.environ, {'PATH': f'{bin_dir}{os.pathsep}{os.environ["PATH"]}',
-                                           'HOME': str(self.home), 'HC_STUB_DIR': str(self.state),
-                                           'HC_STUB_SCREEN': EMPTY, 'CLAUDE_CONFIG_DIR': str(root / 'callers')})
-        env.start()
-        self.addCleanup(env.stop)
-        for attr, value in [('STATE', str(root / 'captain')), ('START_S', 20),
-                            ('CONFIG_DIRS', {'main': None, 'ada': str(self.home / '.claude-ada')})]:
-            patcher = mock.patch.object(captain, attr, value)
-            patcher.start()
-            self.addCleanup(patcher.stop)
-        self.addCleanup(self.kill_claude)
-        self.mine = captain.identity(pinned('t1'))
-        os.makedirs(captain.STATE)
-        captain.write_json(captain.ENROLLED, {**self.mine, 'generation': 'g'})
-
-    def kill_claude(self):
-        try:
-            with open(self.state / 't9.json') as f:
-                os.kill(json.load(f)['pid'], 9)
-        except (OSError, ValueError):
-            pass
-
-    def open(self, account):
-        with mock.patch('builtins.print') as out:
-            code = captain.open_session(str(self.checkout), account, None, self.mine)
-        return code, '\n'.join(c.args[0] for c in out.call_args_list)
-
-    def test_ada_runs_under_its_config_dir(self):
-        code, line = self.open('ada')
-        self.assertEqual((code, line.splitlines()[-1]), (0, 't9: ready · claude/ada'), line)
-        self.assertTrue((self.home / '.claude-ada' / 'sessions').is_dir())
-
-    def test_main_runs_with_the_config_dir_unset(self):
-        code, line = self.open('main')
-        self.assertEqual((code, line.splitlines()[-1]), (0, 't9: ready · claude/main'), line)
-        self.assertTrue((self.home / '.claude' / 'sessions').is_dir())
+                          f'completed {self.action} · sp · name · t2 · merged at 1234', 'done'])
 
 
 class WatchCase(LedgerCase):
@@ -1952,9 +1591,12 @@ class WatchArmTest(WatchCase):
         self.terminals = {'t1': CAPTAIN}
         code, out = self.arm('all')
         self.assertEqual(code, 0)
-        self.assertIn(f'armed from {len(captain.records())}: every session, new ones too', out)
-        [w] = [r for r in captain.records() if r['type'] == 'watch']
+        self.assertIn('armed: every session, new ones too', out)
+        recs = captain.records()
+        [w] = [r for r in recs if r['type'] == 'watch']
         self.assertEqual((w['scope'], w['captain']['address']), ('all', 't1'))
+        for name in (captain.COLLECTED, captain.TABLED):   # its first collect and table start at it
+            self.assertEqual(captain.stored(name, recs), recs.index(w))
         self.assertTrue(captain.marked())
         self.assertEqual(self.typed, [])
 
@@ -1962,7 +1604,7 @@ class WatchArmTest(WatchCase):
         self.terminals['t3'] = pinned('t3')
         self.arm('t2')
         code, out = self.arm('t3')
-        self.assertIn(f'widened from {len(captain.records())}: t3', out)
+        self.assertIn('widened: t3', out)
         types = [r['type'] for r in captain.records()]
         self.assertEqual((types.count('watch'), types.count('watch-extend')), (1, 1))
 
@@ -2142,6 +1784,69 @@ class WatchReportTest(WatchCase):
                 self.assertIn('missing', captain.reports([ref])[0])
 
 
+class NewReportsTest(WatchCase):
+    def test_every_member_report_since_the_last_call_once(self):
+        self.arm('all')
+        m = self.joined_as('t2')
+        self.terminals['t3'] = pinned('t3')
+        k = self.joined_as('t3')
+        self.report_as('t2', m, {**GOOD, 'needs': 'merge it'})
+        self.report_as('t2', m)   # a later report never hides the earlier need
+        self.report_as('t3', self.msg_of(self.ask('t3')))   # a request's report is collected by its id
+        first, second = [i for i, r in enumerate(captain.records()) if r['type'] == 'report' and r['msg'] == m]
+        self.assertEqual(captain.new_reports(), [{'handle': 'sp · name · t2', 'msg': f'{m}:{first}',
+                                                  **GOOD, 'needs': 'merge it'},
+                                                 {'handle': 'sp · name · t2', 'msg': f'{m}:{second}', **GOOD}])
+        self.assertEqual(captain.new_reports(), [])
+        self.report_as('t3', k)
+        self.assertEqual([r['msg'] for r in captain.new_reports()], [f'{k}:{len(captain.records()) - 1}'])
+        os.unlink(self.state / captain.TABLED)   # lost: from the open watch's start again, nothing missed
+        self.assertEqual(len(captain.new_reports()), 3)
+
+    def test_nothing_without_a_watch_or_a_mark(self):
+        self.report_as('t2', self.msg_of(self.ask()))
+        self.assertEqual(captain.new_reports(), [])
+
+    def test_rows_a_failed_print_lost_come_again(self):
+        self.arm('all')
+        m = self.joined_as('t2')
+        self.report_as('t2', m)
+
+        def broken(rows):
+            raise BrokenPipeError
+        with self.assertRaises(BrokenPipeError):
+            captain.new_reports(broken)
+        self.assertEqual([r['msg'] for r in captain.new_reports()], [f'{m}:{len(captain.records()) - 1}'])
+
+    def test_concurrent_calls_give_each_row_once(self):
+        self.arm('all')
+        m = self.joined_as('t2')
+        self.report_as('t2', m)
+        given = []
+        concurrently(lambda: captain.new_reports(lambda rows: given.extend(rows) or time.sleep(0.2)))
+        self.assertEqual([r['msg'] for r in given], [f'{m}:{len(captain.records()) - 1}'])
+
+    def test_the_ledger_lock_is_free_while_the_rows_print(self):
+        """A slow reader of the output must not hold up reports, cancels, enrollment or hooks."""
+        self.arm('all')
+        self.report_as('t2', self.joined_as('t2'))
+        free = []
+
+        def emit(rows):
+            with captain.locked(0):
+                free.append(len(rows))
+        captain.new_reports(emit)
+        self.assertEqual(free, [1])
+
+    def test_a_new_watch_keeps_the_last_watch_s_untabled_reports(self):
+        self.arm('all')
+        m = self.joined_as('t2')
+        self.report_as('t2', m, {**GOOD, 'needs': 'merge it'})
+        captain.cancel(self.watch_id(), self.ident)
+        self.arm('all')
+        self.assertEqual([r['needs'] for r in captain.new_reports()], ['merge it'])
+
+
 class WatchUnchangedTest(WatchCase):
     """A member's transcript: a task, the watch brief a hook gave it, then the task end it reported."""
 
@@ -2303,57 +2008,149 @@ class OwnerStateTest(unittest.TestCase):
 
 
 class WatchCollectTest(WatchCase):
-    def collect(self, *msgs, start=None):
+    def collect(self, *msgs, wait_ms=0):
         with mock.patch('builtins.print') as out:
-            code = captain.collect(list(msgs), 0, start)
+            code = captain.collect(list(msgs), wait_ms)
         return code, [c.args[0] for c in out.call_args_list]
 
-    def cursor(self, line):
-        return int(line.split(' from ')[1].split(':')[0])
-
-    def test_follows_members_reports_and_the_end(self):
-        start = self.cursor(self.arm('all')[1])
+    def test_follows_members_reports_and_the_end_from_where_the_last_collect_stopped(self):
+        self.arm('all')
         w = self.watch_id()
-        m = self.joined_as('t2')   # before the first collect starts: the cursor `watch` printed still covers it
+        m = self.joined_as('t2')   # before the first collect starts: the cursor `watch` stored still covers it
         self.report_as('t2', m, {**GOOD, 'needs': 'merge'})
-        code, lines = self.collect(start=start)
+        code, lines = self.collect()
         n = len(captain.records())
         self.assertEqual(code, captain.NO_ANSWER)
         self.assertEqual(lines, [f'watching {m} · sp · name · t2', f'reported {m}:{n - 1} · ready · needs you',
-                                 f'pending from {n}: {m} {w}'])
+                                 f'pending: {m} {w}'])
+        self.assertEqual(self.collect(), (captain.NO_ANSWER, [f'pending: {m} {w}']))   # a re-arm repeats nothing
         self.report_as('t2', m)
         captain.cancel(w, self.ident)
-        code, lines = self.collect(start=n)
-        self.assertEqual((code, lines), (0, [f'reported {m}:{n} · ready', f'cancelled {w}',
-                                             f'done from {len(captain.records())}']))
+        self.assertEqual(self.collect(), (0, [f'reported {m}:{n} · ready', f'cancelled {w}', 'done']))
 
-    def test_a_collect_without_a_cursor_replays_nothing(self):
+    def test_a_lost_cursor_resumes_at_the_open_watch_and_loses_no_report(self):
+        """#446 item 3: a re-arm that lost its cursor once skipped the gap, and an earlier needs-you with it."""
         self.arm('all')
         w = self.watch_id()
         m = self.joined_as('t2')
+        self.collect()
+        self.report_as('t2', m, {**GOOD, 'needs': 'merge'})
+        n = len(captain.records()) - 1
+        os.unlink(self.state / captain.COLLECTED)
+        self.assertEqual(self.collect()[1], [f'watching {m} · sp · name · t2',
+                                             f'reported {m}:{n} · ready · needs you', f'pending: {m} {w}'])
+
+    def test_a_widened_watch_keeps_the_cursor(self):
+        self.arm('t2')
+        self.collect()
+        m = self.joined_as('t2')
         self.report_as('t2', m)
-        n = len(captain.records())
-        self.assertEqual(self.collect(), (captain.NO_ANSWER, [f'pending from {n}: {m} {w}']))
         self.terminals['t3'] = pinned('t3')
-        self.arm('t3')   # widened: the running collect follows it, a lost cursor re-arms without one
-        self.report_as('t2', m)
-        code, lines = self.collect()
-        self.assertEqual(lines, [f'pending from {len(captain.records())}: {m} {w}'])
+        self.arm('t3')
+        self.assertEqual(self.collect()[1][:2], [f'watching {m} · sp · name · t2',
+                                                 f'reported {m}:{len(captain.records()) - 2} · ready'])
+
+    def test_without_a_watch_or_a_cursor_it_starts_at_the_ledger_end_then_resumes(self):
+        self.report_as('t2', self.msg_of(self.ask()))
+        self.assertEqual(self.collect(), (0, ['done']))
+        msg = self.msg_of(self.ask())
+        self.report_as('t2', msg)
+        self.assertEqual(self.collect(), (0, [f'reported {msg} · ready', 'done']))
+
+    def test_a_cursor_is_the_enrolled_captain_s_inside_the_ledger_and_never_rolls_back(self):
+        self.msg_of(self.ask())
+        recs = captain.records()
+        generation = captain.enrolled()['generation']
+        with captain.locked():
+            captain.store(captain.COLLECTED, 2, generation)
+            captain.store(captain.COLLECTED, 1, generation)   # a slower reader's older position
+        self.assertEqual(captain.stored(captain.COLLECTED, recs), 2)
+        with captain.locked():
+            captain.store(captain.COLLECTED, 3, 'replaced')   # a collect fenced to an earlier enrollment
+        self.assertEqual(captain.stored(captain.COLLECTED, recs), 2)
+        captain.write_json(captain.COLLECTED, {'generation': generation, 'at': len(recs) + 1})   # past the end
+        self.assertIsNone(captain.stored(captain.COLLECTED, recs))
+        captain.write_json(captain.ENROLLED, {**captain.enrolled(), 'generation': 'next'})
+        self.assertIsNone(captain.stored(captain.COLLECTED, recs))
+        (self.state / captain.COLLECTED).write_text('{', encoding='utf-8')
+        self.assertIsNone(captain.stored(captain.COLLECTED, recs))
+        with captain.locked():
+            captain.store(captain.COLLECTED, 1, 'next')   # a malformed cursor is replaced
+        self.assertEqual(captain.stored(captain.COLLECTED, recs), 1)
+        captain.write_json(captain.COLLECTED, {'generation': generation, 'at': 2})
+        with captain.locked():
+            captain.store(captain.COLLECTED, 1, 'next')   # an earlier enrollment's further cursor does not hold it
+        self.assertEqual(captain.stored(captain.COLLECTED, recs), 1)
 
     def test_a_request_sent_during_a_watch_is_followed_by_its_collect(self):
-        start = self.cursor(self.arm('all')[1])
+        self.arm('all')
         m = self.joined_as('t2')
         self.terminals['t3'] = pinned('t3')
         msg = self.msg_of(self.ask('t3'))
         self.report_as('t3', msg)
-        code, lines = self.collect(start=start)
-        self.assertEqual(lines[1:], [f'reported {msg} · ready', f'pending from {len(captain.records())}: {m} '
-                                     f'{self.watch_id()}'])
+        self.assertEqual(self.collect(msg)[1], [f'reported {msg} · ready', 'done'])   # with ids: the cursor stays
+        code, lines = self.collect()
+        self.assertEqual(lines[1:], [f'reported {msg} · ready', f'pending: {m} {self.watch_id()}'])
 
-    def test_a_lock_held_past_the_deadline_still_prints_the_cursor(self):
+    def test_a_new_watch_keeps_the_last_watch_s_unseen_reports_but_no_request_collected_by_id(self):
+        self.arm('t2')
+        w = self.watch_id()
+        m = self.joined_as('t2')
+        self.collect()
+        self.report_as('t2', m)   # after the stored cursor: its line is still due
+        n = len(captain.records()) - 1
+        captain.cancel(w, self.ident)
+        self.terminals['t3'] = pinned('t3')
+        msg = self.msg_of(self.ask('t3'))
+        self.report_as('t3', msg)
+        self.assertEqual(self.collect(msg)[1], [f'reported {msg} · ready', 'done'])
+        self.arm('all')
+        new = [r['msg'] for r in captain.records() if r['type'] == 'watch'][-1]
+        self.assertEqual(self.collect()[1], [f'reported {m}:{n} · ready', f'cancelled {w}', f'pending: {new}'])
+
+    def test_a_new_watch_keeps_a_request_the_last_watch_followed(self):
+        self.arm('t2')
+        w = self.watch_id()
+        self.collect()
+        self.terminals['t3'] = pinned('t3')
+        msg = self.msg_of(self.ask('t3'))   # opened during the watch: only the collect without ids follows it
+        self.report_as('t3', msg, {**GOOD, 'needs': 'merge'})
+        captain.cancel(w, self.ident)
+        self.arm('all')
+        new = [r['msg'] for r in captain.records() if r['type'] == 'watch'][-1]
+        self.assertEqual(self.collect()[1], [f'reported {msg} · ready · needs you', f'cancelled {w}',
+                                             f'pending: {new}'])
+        self.assertEqual(self.collect()[1], [f'pending: {new}'])
+
+    def test_a_collect_stops_when_the_captain_is_replaced_and_follows_nothing_new(self):
+        msg = self.msg_of(self.ask())   # open: the collect waits for it
+        new = captain.identity(pinned('t4'))
+
+        def replaced(s):
+            captain.write_json(captain.ENROLLED, {**new, 'generation': 'next'})
+            captain.arm(['all'], new)
+            with captain.locked():
+                captain.join(pinned('t2'))
+        with mock.patch.object(captain.time, 'sleep', side_effect=replaced), mock.patch('builtins.print') as out:
+            self.assertEqual(captain.collect([], 5000), captain.NO_ANSWER)
+        self.assertEqual([c.args[0] for c in out.call_args_list][-1], f'pending: {msg}')
+        self.assertFalse(any('watching' in str(c.args[0]) for c in out.call_args_list))
+        watch = next(i for i, r in enumerate(captain.records()) if r['type'] == 'watch')
+        self.assertEqual(json.loads((self.state / captain.COLLECTED).read_text()), {'generation': 'next', 'at': watch})
+
+    def test_the_first_lock_wait_ends_with_the_deadline(self):
+        """#446 item 1: a collect waiting on a lock held by a relay must still print before the Monitor's timeout."""
+        self.arm('all')
+        held = open(self.state / 'lock', 'a')
+        self.addCleanup(held.close)
+        captain.fcntl.flock(held, captain.fcntl.LOCK_EX)
+        began = time.monotonic()
+        self.assertEqual(self.collect(wait_ms=50), (captain.NO_ANSWER, ['pending: the ledger lock stayed held']))
+        self.assertLess(time.monotonic() - began, 3)
+
+    def test_a_lock_held_past_the_deadline_still_prints_the_pending_line(self):
         self.arm('all')
         m = self.joined_as('t2')
-        n = len(captain.records())
         real, held, grabbed = captain.time.sleep, open(self.state / 'lock', 'a'), []
         self.addCleanup(held.close)
         release = threading.Timer(5, captain.fcntl.flock, (held, captain.fcntl.LOCK_UN))
@@ -2366,10 +2163,11 @@ class WatchCollectTest(WatchCase):
                 grabbed.append(True)
             real(s)
         began = time.monotonic()
-        with mock.patch.object(captain.time, 'sleep', side_effect=sleep), mock.patch('builtins.print') as out:
-            self.assertEqual(captain.collect([], 50), captain.NO_ANSWER)
+        with mock.patch.object(captain.time, 'sleep', side_effect=sleep):
+            code, lines = self.collect(wait_ms=50)
+        self.assertEqual(code, captain.NO_ANSWER)
         self.assertLess(time.monotonic() - began, 3, 'waited for the lock past the deadline')
-        self.assertEqual(out.call_args_list[-1].args[0], f'pending from {n}: {m} {self.watch_id()}')
+        self.assertEqual(lines[-1], f'pending: {m} {self.watch_id()}')
 
     def test_collect_ends_a_watch_whose_captain_is_gone(self):
         self.arm('all')
@@ -2383,27 +2181,11 @@ class WatchCollectTest(WatchCase):
         self.arm('all')
         m = self.joined_as('t2')
         ends = mock.patch.object(captain.time, 'sleep', side_effect=lambda s: setattr(self, 'owner', 'ended'))
-        with ends, mock.patch('builtins.print') as out:   # the captain goes while collect waits
-            self.assertEqual(captain.collect([m], 1000), 0)
-        self.assertTrue(any(str(c.args[0]).startswith('done from') for c in out.call_args_list))
+        with ends:   # the captain goes while collect waits
+            code, lines = self.collect(m, wait_ms=1000)
+        self.assertEqual((code, lines[-1]), (0, 'done'))
         self.assertEqual(self.count('watch-end'), 1)
 
-    def test_an_item_closed_before_the_cursor_is_not_pending(self):
-        msg = self.msg_of(self.ask())
-        self.report_as('t2', msg)
-        self.assertEqual(self.collect(msg, start=len(captain.records()))[1], [f'done from {len(captain.records())}'])
-
-    def test_a_watch_opened_after_the_cursor_is_followed(self):
-        n = len(captain.records())
-        self.arm('all')
-        self.pending_as('t2')
-        code, lines = self.collect(start=n)
-        self.assertEqual(lines[0], f'watching {self.member("t2")[0]["msg"]} · sp · name · t2')
-
-    def test_a_cursor_outside_the_ledger_refuses(self):
-        for start in (-1, len(captain.records()) + 1):
-            with self.subTest(start), self.assertRaises(SystemExit), mock.patch('sys.stderr'):
-                self.collect(start=start)
 
 if __name__ == '__main__':
     unittest.main()

@@ -133,6 +133,14 @@ STALLED = {
 }
 
 
+# What settles a blocker that names no stop reason of its own.
+REVALIDATED = ('duplicate-finding-ids', 'review-report-unusable')
+REVALIDATE = 'a `reviews` or `both` relaunch with the same stateRef runs the validator again; listed again unchanged, report it'
+CIRCLECI = 'ci/circleci: '  # CircleCI's status context, the only check whose stored verdict a relaunch collects again (#319)
+RECOLLECT = 'a relaunch with the same stateRef collects its whole log once and judges it again; listed again, report it'
+UNRECOLLECTED = 'a relaunch reads no more of its log: report it'
+
+
 ASKS = {'tick': 'a Trigger review tick', 'request': 'an `@coderabbitai review` comment'}
 
 
@@ -195,14 +203,29 @@ def finding_verdicts(findings, comment_id):
     return sorted({f.get('verdict') for f in findings if f.get('commentId') == comment_id})
 
 
-def receipts(cycles, findings):
+def unpublished_repair(pending):
+    """(push lane, sha, the relaunch that settles it, what the heads blocker adds) for a review or CI repair the state
+    holds unpublished after its push failed or went unknown, else None."""
+    if not (isinstance(pending, dict) and pending.get('lane') in ('review', 'ci') and pending.get('sha')
+            and pending.get('stage') in ('push-failed', 'publication-unknown')):
+        return None
+    sha, parent = pending['sha'], str(pending.get('parent') or '')
+    return (f"{pending['lane']}Push", sha,
+            f"the {pending['lane']} repair {sha[:8]} on {parent[:8]} is unpublished ({pending['stage']}): relaunch with the same "
+            f'stateRef and adoptHead {sha}, the checkout left at it, while the PR head is still {parent[:8]}; '
+            'once the PR head moved, that launch stops adopt-pending',
+            f"the checkout holds the unpublished {pending['lane']} repair, settled by its adoptHead relaunch")
+
+
+def receipts(cycles, findings, unpublished=None):
     """Pushes, replies, bot asks and the adoption every cycle of the launch recorded, verbatim, and what about them blocks.
 
     A reply batch's `pass` is the workflow's own verdict that every comment it
     owed is settled, its detail naming any that is not; the receipts are evidence.
     A later batch of the same kind supersedes an earlier one's verdict, since it
     retries what that one left unsettled. Each receipt carries the verdicts its
-    own cycle harvested, the last harvest where a cycle recorded none.
+    own cycle harvested, the last harvest where a cycle recorded none. A push the state holds as `unpublished`
+    names the relaunch that settles it.
     """
     pushes, replies, asks, blocking, adoption, batches = [], [], [], [], None, {}
     for actions in cycles:
@@ -213,7 +236,8 @@ def receipts(cycles, findings):
             if p:
                 pushes.append({'lane': lane, **p})
                 if p.get('pass') is not True or p.get('committed') is None:
-                    blocking.append(f'uncertain publication: {lane}: {cut(p.get("detail", ""))}')
+                    settle = unpublished and unpublished[:2] == (lane, p.get('sha'))
+                    blocking.append(f'uncertain publication: {lane}: {cut(p.get("detail", ""))}' + (f'; {unpublished[2]}' if settle else ''))
         for kind in ('refutedPosts', 'fixNotePosts', 'deferralPosts'):
             posts = actions.get(kind)
             if posts:
@@ -405,10 +429,12 @@ def summarize(output, output_path, state_ref=None, tree=None, keys=False):
             'ci': ci and ci_summary(ci, keys),
         }
         # A launch that ran several cycles lists each cycle's actions; an older output has the last one only.
-        summary['receipts'], blocking = receipts(obs.get('launchActions') or [actions], reviews.get('findings') or [])
+        pending = (result.get('state') or {}).get('pending')
+        unpublished = unpublished_repair(pending)
+        summary['receipts'], blocking = receipts(obs.get('launchActions') or [actions], reviews.get('findings') or [], unpublished)
         blockers += blocking
         if actions.get('error'):
-            blockers.append(f'action error: {cut(actions["error"])}')
+            blockers.append(f'action error: {cut(actions["error"])}' + (f'; {REVALIDATE}' if result.get('reason') in REVALIDATED else ''))
         unsettled = {st.get('commentId'): f"settlement {st.get('outcome')}: {cut(st.get('why') or '')}"
                      for st in result.get('settlements') or [] if st.get('outcome') != 'settled'}
         for h in result.get('handoffs') or []:
@@ -426,12 +452,16 @@ def summarize(output, output_path, state_ref=None, tree=None, keys=False):
                             f"{last.get('outcome', 'not asked')}{': ' + cut(last['detail']) if last.get('detail') else ''}")
         for f in (ci or {}).get('realFailures') or []:
             if f.get('complete') is not True:
-                blockers.append(f'CI evidence incomplete for {f.get("check")} / {f.get("cell")}')
+                blockers.append(f'CI evidence incomplete for {f.get("check")} / {f.get("cell")}: '
+                                + (RECOLLECT if str(f.get('check')).startswith(CIRCLECI) else UNRECOLLECTED))
         # reviewedHead is where the last cycle began; a push it made moves the state past it.
         heads = {k: v for k, v in (('result', result.get('head')), ('state', (result.get('state') or {}).get('expectedHead')),
                                    ('checkout', tree and tree['head'])) if v}
         if len(set(heads.values())) > 1:
-            blockers.append(f'heads disagree: {heads}')
+            # the checkout at the unpublished repair, every other head at its parent
+            repair = unpublished and (heads.get('checkout') == unpublished[1]
+                                      and {v for k, v in heads.items() if k != 'checkout'} == {pending.get('parent')})
+            blockers.append(f'heads disagree: {heads}' + (f'; {unpublished[3]}' if repair else ''))
     dirty = [l for l in (tree or {}).get('dirty') or [] if not ide_drift(l)]
     if tree and len(dirty) < len(tree['dirty']):
         notes.append(f'ignoring {len(tree["dirty"]) - len(dirty)} dirty .idea/ path(s) (IDE metadata)')

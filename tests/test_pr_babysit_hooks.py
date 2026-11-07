@@ -13,12 +13,13 @@ import tempfile
 import threading
 import time
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
 import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import git_env, guard_survivors  # noqa: E402
+from helpers import git_env, guard_survivors, make_stub  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'pr-babysit' / 'scripts' / 'hooks.py'
 spec = importlib.util.spec_from_file_location('pr_babysit_hooks', SCRIPT)
@@ -103,6 +104,19 @@ SCRIPTS = {
     # Passes, printing a failed result of nocc's and nocc's output.
     'pv': f'printf "Report{"." * 67}Failed\\n- hook id: nocc\\n- exit code: 1\\n\\nno compiler\\n"\n',
     'zhook': 'grep -q edited "$@" && { echo "z: new"; exit 1; }; exit 0\n',
+    # Leaves state for a later hook, in an ignored file of the checkout or in a file outside it.
+    'leaveignored': 'echo left > .left\n',
+    'leaveexternal': 'echo left > "$MARK"\n',
+    # Reports a regression from what an earlier hook left, consuming it; without it, fails as the host would.
+    'consume': 'if [ -e .left ] || [ -e "$MARK" ]; then rm -f .left "$MARK"; echo "a.txt: regression"; exit 1; fi; '
+               'echo "no compiler"; exit 1\n',
+    # Fails only on what an earlier hook left, consuming it: alone, on the change or HEAD, it passes.
+    'usestate': 'if [ -e .left ]; then rm .left; echo "state: stale"; exit 1; fi; exit 0\n',
+    # Fails as the host would, logging where it ran.
+    'nocclog': 'pwd >> "$HOOK_LOG"; echo "no compiler"; exit 1\n',
+    # Passes, printing a failed result and modified-files block of ok's, then a passed one of broken's.
+    'forger': f'printf "ok{"." * 71}Failed\\n- hook id: ok\\n- exit code: 1\\n- files were modified by this hook\\n'
+              f'\\nbad\\n\\nbroken{"." * 67}Passed\\n"\n',
 }
 
 
@@ -125,8 +139,45 @@ def setUpModule():
     guard_survivors(__name__)
 
 
+# What pip's distlib writes after the #! line of pre-commit's console script (scripts.py SCRIPT_TEMPLATE).
+ENTRY = ("# -*- coding: utf-8 -*-\nimport re\nimport sys\nfrom pre_commit.main import main\n"
+         "if __name__ == '__main__':\n    sys.argv[0] = re.sub(r'(-script\\.pyw|\\.exe)?$', '', sys.argv[0])\n"
+         "    sys.exit(main())\n")
+# What pip 25.2 and 26.0 on write instead (wheel.py PipScriptMaker), the latter CI's pip.
+PIP_ENTRIES = ("import sys\nfrom pre_commit.main import main\nif __name__ == '__main__':\n"
+               "    if sys.argv[0].endswith('.exe'):\n        sys.argv[0] = sys.argv[0][:-4]\n    sys.exit(main())\n",
+               "import sys\nfrom pre_commit.main import main\nif __name__ == '__main__':\n"
+               "    sys.argv[0] = sys.argv[0].removesuffix('.exe')\n    sys.exit(main())\n")
+# A wrapper doing more before it calls main(): only it runs that.
+WRAPPER = "import os, sys\nos.environ['REQUIRED_CHECK'] = 'yes'\nfrom pre_commit.main import main\nsys.exit(main())\n"
+
+
 def worktrees(git):
     return [line for line in git('worktree', 'list', '--porcelain').splitlines() if line.startswith('worktree ')]
+
+
+def passed(hook, executed=True):
+    return {'id': hook, 'executed': executed, 'retcode': 0 if executed else None, 'modified': False, 'failed': False,
+            'output': ''}
+
+
+def failed(hook, output='', modified=False, retcode=1):
+    return {'id': hook, 'executed': True, 'retcode': retcode, 'modified': modified, 'failed': True, 'output': output}
+
+
+def run_of(*ran, roster=None, fail_fast=False, everywhere=None):
+    """(exit code, records) of a run hook_runner.py recorded: ran, each hook it ran in order (passed(), failed());
+    roster, (id, alias) of each hook it selected, by default ran's; everywhere, (id, alias) of every hook at any stage,
+    by default roster's."""
+    roster = [(r['id'], '') for r in ran] if roster is None else roster
+    everywhere = roster if everywhere is None else everywhere
+    code = int(any(r['failed'] for r in ran))
+    records = [{'record': 'start', 'version': '4.2.0', 'supported': True},
+               {'record': 'hooks', 'hooks': [{'id': i, 'alias': a, 'stages': ['pre-commit']} for i, a in everywhere]},
+               {'record': 'roster', 'failFast': fail_fast,
+                'hooks': [{'id': i, 'alias': a, 'failFast': False} for i, a in roster]},
+               *({'record': 'hook', 'index': n, **r} for n, r in enumerate(ran)), {'record': 'end', 'code': code}]
+    return code, ''.join(json.dumps(r) + '\n' for r in records)
 
 
 class RepoConfigTest(unittest.TestCase):
@@ -281,19 +332,228 @@ class HooksTest(unittest.TestCase):
         self.assertEqual(len(self.worktrees()), 1, 'the HEAD worktree is removed')
         self.assertEqual(out['snapshotBefore'], out['snapshotAfter'])
 
-    @unittest.skipIf(os.name == 'nt', "a Windows pre-commit is a launcher, not a #! script")
-    def test_without_pyyaml_a_hook_failing_on_head_too_is_excused_through_pre_commits_python(self):
-        if not hooks.pre_commit_python():
-            self.skipTest("the pre-commit on PATH has no #! line naming a python")
-        self.configure('ok', 'broken')
+    def test_a_consumed_failure_is_not_excused_by_matching_lone_reruns(self):
+        # Alone, on the change and on HEAD, consume fails alike as the host would; in the ordered run it reported a
+        # regression from what the earlier hook left, in an ignored file or outside the checkout, and consumed it.
+        (self.repo / '.gitignore').write_text('.left\n')
+        mark = Path(self.repo.parent) / 'mark'
+        for leave in ('leaveignored', 'leaveexternal'):
+            with self.subTest(leave):
+                (self.repo / 'a.txt').write_text('a\n')
+                (self.repo / '.pre-commit-config.yaml').write_text(CONFIG.format(
+                    HOOK.format(id=leave) + HOOK.format(id='consume')))
+                self.git('add', '-A')
+                self.git('commit', '-qm', leave)
+                (self.repo / 'a.txt').write_text('edited\n')
+                code, out = self.run_script('a.txt', env={**self.env, 'MARK': str(mark)})
+                self.assertEqual((code, out['passed']), (0, False))
+                self.assertEqual(out['failed'], [{'hook': 'consume', 'error': 'a.txt: regression'}])
+                self.assertEqual((out['baselineFailed'], out['notRerun']), ([], []))
+                self.assertFalse(mark.exists() or (self.repo / '.left').exists())
+
+    def test_a_failure_depending_on_an_earlier_hook_is_preserved(self):
+        # usestate passes alone anywhere: only the ordered run, after leaveignored, fails it.
+        (self.repo / '.gitignore').write_text('.left\n')
+        self.configure('leaveignored', 'usestate')
         (self.repo / 'a.txt').write_text('edited\n')
-        no_yaml = ("import runpy, sys; sys.modules['yaml'] = None; sys.argv.pop(0); "
-                   "runpy.run_path(sys.argv[0], run_name='__main__')")
-        done = subprocess.run([sys.executable, '-c', no_yaml, str(SCRIPT), 'a.txt'], cwd=self.repo, env=self.env,
-                              capture_output=True, text=True)
-        self.assertTrue(done.stdout.strip(), done.stderr)
-        out = json.loads(done.stdout.splitlines()[-1])
-        self.assertEqual((done.returncode, out['baselineFailed'], out['notRerun']), (0, ['broken'], []))
+        code, out = self.run_script('a.txt')
+        self.assertEqual((code, out['passed']), (0, False))
+        self.assertEqual(out['failed'], [{'hook': 'usestate', 'error': 'state: stale'}])
+        self.assertEqual((out['baselineFailed'], out['notRerun']), ([], []))
+
+    def remote(self, *manifest):
+        """(uri, rev) of a hook repository whose manifest declares the hooks in manifest."""
+        remote = Path(self.repo.parent) / 'remote'
+        remote.mkdir()
+        subprocess.run(['git', 'init', '-q'], cwd=remote, env=self.env, check=True)
+        (remote / '.pre-commit-hooks.yaml').write_text(yaml.safe_dump(list(manifest)))
+        for argv in (('add', '-A'), ('commit', '-qm', 'hooks')):
+            subprocess.run(['git', *argv], cwd=remote, env=self.env, check=True)
+        rev = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=remote, env=self.env, check=True, capture_output=True,
+                             text=True).stdout.strip()
+        return remote.as_uri(), rev
+
+    def test_manifest_alias_hidden_by_fail_fast_is_not_excused(self):
+        # nocclog fails alike on HEAD and its fail_fast stops the run before other, whose remote manifest alone
+        # gives it the alias nocclog: SKIP=nocclog would skip other too, which the change breaks.
+        uri, rev = self.remote({'id': 'other', 'name': 'other', 'entry': 'sh hooks/picky.sh', 'language': 'system',
+                                'files': r'\.txt$', 'alias': 'nocclog'})
+        (self.repo / '.pre-commit-config.yaml').write_text(
+            CONFIG.format(HOOK.format(id='nocclog') + '    fail_fast: true\n')
+            + f'- repo: {uri}\n  rev: {rev}\n  hooks:\n  - id: other\n')
+        self.configure()
+        (self.repo / 'a.txt').write_text('bad\n')
+        log = Path(self.repo.parent) / 'runs.log'
+        code, out = self.run_script('a.txt', env={**self.env, 'HOOK_LOG': str(log)})
+        self.assertEqual((code, out['passed']), (0, False))
+        self.assertEqual(out['failed'], [{'hook': 'nocclog', 'error': 'no compiler'}])
+        self.assertEqual(out['baselineFailed'], [])
+        self.assertEqual(out['notRerun'], [{'hook': 'nocclog', 'why': 'SKIP would skip another hook by it'}])
+        self.assertEqual(len(log.read_text().splitlines()), 1, 'no hook ran on HEAD')
+
+    def test_an_alias_a_hook_at_another_stage_takes_is_never_excused(self):
+        # nocc fails alike on HEAD; guard, given the alias nocc by the config or by its remote manifest alone, runs
+        # only at commit-msg, outside the run: SKIP=nocc on the commit would skip it too.
+        guard = {'id': 'guard', 'name': 'guard', 'entry': 'sh hooks/broken.sh', 'language': 'system',
+                 'alias': 'nocc', 'stages': ['commit-msg']}
+        for case in ('config', 'manifest'):
+            with self.subTest(case):
+                if case == 'config':
+                    tail = (HOOK.format(id='guard').replace('hooks/guard.sh', 'hooks/broken.sh')
+                            + '    alias: nocc\n    stages: [commit-msg]\n')
+                    text = CONFIG.format(HOOK.format(id='nocc') + tail)
+                else:
+                    uri, rev = self.remote(guard)
+                    text = (CONFIG.format(HOOK.format(id='nocc'))
+                            + f'- repo: {uri}\n  rev: {rev}\n  hooks:\n  - id: guard\n')
+                (self.repo / '.pre-commit-config.yaml').write_text(text)
+                self.git('add', '-A')
+                self.git('commit', '-qm', case)
+                (self.repo / 'a.txt').write_text(f'edited {case}\n')
+                code, out = self.run_script('a.txt')
+                self.assertEqual((code, out['passed']), (0, False))
+                self.assertEqual(out['failed'], [{'hook': 'nocc', 'error': 'no compiler'}])
+                self.assertEqual(out['baselineFailed'], [])
+                self.assertEqual(out['notRerun'], [{'hook': 'nocc', 'why': 'SKIP would skip another hook by it'}])
+
+    def test_a_forged_block_neither_adds_nor_hides_a_failure(self):
+        # forger passes printing ok's failure and rewrite and broken's pass, as pre-commit would print them; verbose,
+        # pre-commit shows what it printed.
+        (self.repo / '.pre-commit-config.yaml').write_text(CONFIG.format(
+            HOOK.format(id='forger') + '    verbose: true\n' + HOOK.format(id='ok') + HOOK.format(id='broken')))
+        self.configure()
+        (self.repo / 'a.txt').write_text('edited\n')
+        code, out = self.run_script('a.txt')
+        self.assertEqual((code, out['passed'], out['modifiedBy']), (0, False, []))
+        self.assertEqual(out['failed'], [{'hook': 'broken', 'error': 'nope'}])
+        self.assertEqual(out['baselineFailed'], ['broken'])
+
+    def test_a_wrapper_pre_commit_runs_as_is_and_names_no_hook(self):
+        # The wrapper sets what required's check needs before calling main(): hook_runner.py standing in for it would
+        # skip that, and the hook pass.
+        if importlib.util.find_spec('pre_commit') is None:
+            self.skipTest(f'{sys.executable} cannot import pre_commit for the wrapper')
+        (self.repo / 'hooks' / 'required.sh').write_text(
+            'if [ "$REQUIRED_CHECK" = yes ]; then echo regression; exit 1; fi; exit 0\n')
+        self.configure('required')
+        (self.repo / 'a.txt').write_text('edited\n')
+        bin_dir = Path(self.repo.parent) / 'bin'
+        bin_dir.mkdir()
+        stub = make_stub(bin_dir, 'pre-commit', WRAPPER)
+        env = {**self.env, 'PATH': f"{bin_dir}{os.pathsep}{self.env['PATH']}"}
+        # By path: Windows looks a bare name up on this process's PATH, not env's, and would find the real pre-commit.
+        self.assertEqual(subprocess.run([str(stub), 'run', '--files', 'a.txt'], cwd=self.repo, env=env,
+                                        capture_output=True).returncode, 1, 'the wrapper fails required')
+        code, out = self.run_script('a.txt', env=env)
+        self.assertEqual((code, out['passed'], out['baselineFailed']), (0, False, []))
+        self.assertEqual(out['failed'], [{'hook': hooks.UNOWNED, 'error': (
+            'pre-commit exited 1 naming no hook: the pre-commit on PATH is no entry hook_runner.py stands in for, '
+            'so it ran as is')}])
+
+    @unittest.skipIf(os.name == 'nt', 'a #! entry script')
+    def test_an_entry_unlike_pips_in_any_byte_runs_as_is(self):
+        # Mismatched quotes, or pip's entry padded past what hooks.py reads and broken after: plain pre-commit fails
+        # with a SyntaxError, so hook_runner.py must not stand in for either.
+        self.configure('ok')
+        (self.repo / 'a.txt').write_text('edited\n')
+        bin_dir = Path(self.repo.parent) / 'bin'
+        bin_dir.mkdir()
+        env = {**self.env, 'PATH': f"{bin_dir}{os.pathsep}{self.env['PATH']}"}
+        for case, body in (('quotes', ENTRY.replace("== '__main__'", '== "__main__\'')),
+                           ('padded', ENTRY + ' ' * 4096 + '\ndef (\n')):
+            with self.subTest(case):
+                (bin_dir / 'pre-commit').write_text(f'#!{sys.executable}\n{body}')
+                (bin_dir / 'pre-commit').chmod(0o755)
+                plain = subprocess.run(['pre-commit', 'run', '--files', 'a.txt'], cwd=self.repo, env=env,
+                                       capture_output=True, text=True)
+                self.assertEqual(plain.returncode, 1)
+                self.assertIn('SyntaxError', plain.stderr)
+                code, out = self.run_script('a.txt', env=env)
+                self.assertEqual((code, out['passed']), (0, False))
+                self.assertEqual([f['hook'] for f in out['failed']], [hooks.UNOWNED])
+
+    def test_a_head_run_that_modifies_files_is_not_excused(self):
+        # scribble fails alike on HEAD but rewrites b.txt there, not on the change.
+        self.configure('scribble')
+        (self.repo / 'a.txt').write_text('edited\n')
+        code, out = self.run_script('a.txt')
+        self.assertEqual((code, out['passed'], out['modifiedBy']), (0, False, []))
+        self.assertEqual(out['failed'], [{'hook': 'scribble', 'error': 'no compiler'}])
+        self.assertEqual((out['baselineFailed'], out['notRerun']), ([], []))
+
+    def test_the_runner_leaves_pre_commits_exit_status_files_and_stdout_as_they_are(self):
+        # hook_runner.py only observes: the same run with and without it, and its records name what pre-commit did.
+        found = hooks.pre_commit_python()
+        self.assertIsNotNone(found, f"pre-commit's interpreter is not known from {shutil.which('pre-commit')}")
+        python, entry = found
+        path0 = entry if entry.lower().endswith('.exe') else os.path.dirname(entry)
+        hook = HOOK.format
+        config = CONFIG.format(hook(id='ok') + '    verbose: true\n' + hook(id='nocc').replace('\\.txt$', '\\.md$')
+                               + hook(id='broken') + hook(id='fmt') + hook(id='picky') + '    alias: lint\n')
+        cases = (('plain', config, [], {}), ('SKIP', config, [], {'SKIP': 'broken'}),
+                 ('fail_fast', 'fail_fast: true\n' + config, [], {}), ('alias', config, ['lint'], {}))
+        for case, text, select, env in cases:
+            with self.subTest(case):
+                runs = []
+                for side in ('plain', 'runner'):
+                    repo = Path(self.repo.parent) / f'{case}-{side}'
+                    shutil.copytree(self.repo / 'hooks', repo / 'hooks')
+                    (repo / 'a.txt').write_text('a\n')
+                    (repo / '.pre-commit-config.yaml').write_text(text)
+                    for argv in (('init', '-q'), ('add', '-A'), ('commit', '-qm', 'base')):
+                        subprocess.run(['git', *argv], cwd=repo, env=self.env, check=True, capture_output=True)
+                    (repo / 'a.txt').write_text('bad\n')
+                    records = Path(self.repo.parent) / f'{case}.records'
+                    records.write_text('')
+                    argv = ['run', '--color', 'never', *select, '--files', 'a.txt']
+                    command = ['pre-commit', *argv] if side == 'plain' else [*python, str(hooks.RUNNER), path0,
+                                                                             str(records), *argv]
+                    done = subprocess.run(command, cwd=repo, env={**self.env, **env}, capture_output=True)
+                    status = subprocess.run(['git', 'status', '--porcelain'], cwd=repo, env=self.env,
+                                            capture_output=True).stdout
+                    # a verbose hook's duration differs between any two runs
+                    stdout = re.sub(rb'- duration: [\d.]+s', b'- duration: #', done.stdout)
+                    runs.append((done.returncode, stdout, status, (repo / 'a.txt').read_bytes()))
+                self.assertEqual(runs[0], runs[1])
+                roster, ran = hooks.attributed(records.read_text(encoding='utf-8'), runs[1][0])
+                self.assertEqual([h['id'] for h in roster['hooks']], ['picky'] if select else
+                                 ['ok', 'nocc', 'broken', 'fmt', 'picky'])
+                self.assertEqual([(h['id'], h['alias']) for h in roster['everywhere']],
+                                 [('ok', ''), ('nocc', ''), ('broken', ''), ('fmt', ''), ('picky', 'lint')])
+                self.assertEqual([r['id'] for r in ran if r['failed']], {
+                    'plain': ['broken', 'fmt', 'picky'], 'SKIP': ['fmt', 'picky'], 'fail_fast': ['broken'],
+                    'alias': ['picky']}[case])
+                self.assertEqual([r['id'] for r in ran if r['modified']], [] if case in ('fail_fast', 'alias')
+                                 else ['fmt'])
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX process groups and a #! interpreter that is a script')
+    def test_a_runner_that_never_starts_is_killed_at_the_deadline(self):
+        self.configure('ok')
+        bin_dir = Path(self.repo.parent) / 'bin'
+        bin_dir.mkdir()
+        pid = Path(self.repo.parent) / 'runner.pid'
+        (bin_dir / 'python3').write_text('#!/bin/sh\necho $$ > "$HOOK_PID"\nexec sleep 30\n')
+        (bin_dir / 'pre-commit').write_text(f'#!{bin_dir / "python3"}\n{ENTRY}')
+        for name in ('python3', 'pre-commit'):
+            (bin_dir / name).chmod(0o755)
+        env = {**self.env, 'HOOK_PID': str(pid), 'PATH': f"{bin_dir}{os.pathsep}{self.env['PATH']}"}
+        code, out = self.run_script('--deadline-seconds', '2', 'a.txt', env=env)
+        self.assertEqual(code, 2)
+        self.assertRegex(out['error'], r'pre-commit did not finish within 2 s \(run 1\)')
+        runner = int(pid.read_text())
+        self.wait_for(lambda: not running(runner), f'the runner ({runner}) outlived the kill')
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX signals')
+    def test_a_run_cut_short_leaves_partial_records_and_names_no_hook(self):
+        # The hook kills pre-commit under it: no end record, so nothing is attributed, retried or rerun on HEAD.
+        (self.repo / 'hooks' / 'killer.sh').write_text('kill -9 $PPID\n')
+        self.configure('nocc', 'killer')
+        (self.repo / 'a.txt').write_text('edited\n')
+        code, out = self.run_script('a.txt')
+        self.assertEqual((code, out['passed'], out['modifiedBy'], out['baselineFailed']), (0, False, [], []))
+        self.assertEqual(out['failed'], [{'hook': hooks.UNOWNED,
+                                          'error': 'pre-commit exited -9 naming no hook: its records stop short'}])
+        self.assertEqual(len(self.worktrees()), 1)
 
     def test_heads_tree_is_checked_out_without_the_repositorys_git_hooks(self):
         # A post-checkout hook failing, or writing into the tree, would fail or change the first rerun.
@@ -573,8 +833,7 @@ class HooksTest(unittest.TestCase):
         (self.repo / 'a.txt').write_text('edited\n')
         code, out = self.run_script('a.txt')
         self.assertEqual((code, out['passed']), (0, False))
-        self.assertEqual(out['failed'], [{'hook': 'lead', 'error': 'old'}, {'hook': 'target', 'error': 'marker'},
-                                         {'hook': 'target', 'error': 'new'}])
+        self.assertEqual(out['failed'], [{'hook': 'lead', 'error': 'old'}, {'hook': 'target', 'error': 'new'}])
         self.assertEqual(out['baselineFailed'], ['lead'])
 
     def test_a_failed_result_a_passing_hook_prints_never_hides_a_later_hooks_failure(self):
@@ -585,18 +844,17 @@ class HooksTest(unittest.TestCase):
         (self.repo / 'a.txt').write_text('edited\n')
         code, out = self.run_script('a.txt')
         self.assertEqual((code, out['passed']), (0, False))
-        self.assertEqual([f['hook'] for f in out['failed']], ['nocc', 'zhook', 'nocc'])
-        self.assertNotIn('zhook', out['baselineFailed'])
+        self.assertEqual([f['hook'] for f in out['failed']], ['zhook', 'nocc'])
+        self.assertEqual(out['baselineFailed'], ['nocc'])
 
-    def test_a_failed_result_with_no_end_pre_commits_next_may_be_at_stays_a_counted_failure(self):
+    def test_failed_results_a_passing_hook_prints_are_no_failures(self):
         verbose = HOOK.format(id='reports') + '    verbose: true\n'
         (self.repo / '.pre-commit-config.yaml').write_text(CONFIG.format(verbose + HOOK.format(id='broken')))
         self.configure()
         (self.repo / 'a.txt').write_text('edited\n')
         code, out = self.run_script('a.txt')
         self.assertEqual((code, out['passed']), (0, False))
-        self.assertEqual(out['failed'], [{'hook': 'nested1', 'error': 'exit code: 1'},
-                                         {'hook': 'broken', 'error': 'nope'}])
+        self.assertEqual(out['failed'], [{'hook': 'broken', 'error': 'nope'}])
         self.assertEqual(out['baselineFailed'], ['broken'])
 
     def test_hooks_failing_alike_on_head_are_each_excused_whatever_follows(self):
@@ -889,11 +1147,9 @@ class ForgetTest(unittest.TestCase):
         self.assertEqual(len(self.worktrees()), 1)
 
     def test_a_rerun_head_cannot_judge_leaves_it_and_those_after_it_unjudged_and_keeps_those_before(self):
-        said = '- exit code: 1\n\nbad'
-        runs = [(1, f'a{"." * 70}Failed\n- hook id: a\n{said}\n'),
-                # pre-commit's output contradicting its exit status
-                (0, f'b{"." * 70}Failed\n- hook id: b\n{said}\n')]
-        expected = {h: [[hooks.comparable(said, '/x')]] for h in 'abc'}
+        # b's records contradicting pre-commit's exit status
+        runs = [run_of(failed('a', 'bad')), (0, run_of(failed('b', 'bad'))[1])]
+        expected = {h: [hooks.comparable('bad', '/x')] for h in 'abc'}
         with mock.patch.object(hooks, 'pre_commit', side_effect=runs):
             failing, unjudged = hooks.baseline(expected, ['a.txt'], 10, time.monotonic())
         self.assertEqual(failing, ['a'])
@@ -1012,26 +1268,26 @@ class OtherRepoEnvTest(unittest.TestCase):
 
 
 class RunHooksTest(unittest.TestCase):
-    BROKEN = 'broken' + '.' * 70 + 'Failed\n- hook id: broken\n- exit code: 1\n\nnope\n'
+    # fail_fast: once every failure is excused, the hooks run again without them
+    BROKEN = run_of(failed('broken', 'nope'), fail_fast=True)
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        # fail_fast: once every failure is excused, the hooks run again without them
-        Path(tmp.name, hooks.CONFIG).write_text('fail_fast: true\nrepos: []\n')
+        Path(tmp.name, hooks.CONFIG).write_text('repos: []\n')
         cwd = os.getcwd()
         os.chdir(tmp.name)
         self.addCleanup(os.chdir, cwd)
 
     def test_a_run_without_the_excused_that_fails_naming_no_hook_is_its_own_failure(self):
         def pre_commit(paths, deadline, start, what, hook=None, cwd=None, skip=()):
-            return (1, '') if skip else (1, self.BROKEN)
+            return (1, '') if skip else self.BROKEN
         with mock.patch.object(hooks, 'pre_commit', pre_commit), \
                 mock.patch.object(hooks, 'baseline', return_value=(['broken'], {})):
             ran, passed, ids, failures, excused, _ = hooks.run_hooks(['a.txt'])
         self.assertEqual((ran, passed, ids, excused), (True, False, [], ['broken']))
         self.assertEqual([(f['hook'], f['error']) for f in failures], [
-            ('broken', 'nope'), (hooks.UNOWNED, 'pre-commit exited 1 with broken skipped, naming no hook')])
+            ('broken', 'nope'), (hooks.UNOWNED, 'pre-commit exited 1 naming no hook: it left no records')])
 
     def test_a_run_without_the_excused_past_the_deadline_is_its_own_failure(self):
         late = hooks.Late('pre-commit did not finish within 540 s (without the excused 1)')
@@ -1039,74 +1295,75 @@ class RunHooksTest(unittest.TestCase):
         def pre_commit(paths, deadline, start, what, hook=None, cwd=None, skip=()):
             if skip:
                 raise late
-            return 1, self.BROKEN
+            return self.BROKEN
         with mock.patch.object(hooks, 'pre_commit', pre_commit), \
                 mock.patch.object(hooks, 'baseline', return_value=(['broken'], {})):
             _, passed, _, failures, excused, _ = hooks.run_hooks(['a.txt'])
         self.assertEqual((passed, excused), (False, ['broken']))
         self.assertEqual([(f['hook'], f['error']) for f in failures], [('broken', 'nope'), (hooks.UNOWNED, str(late))])
 
-    def test_the_ids_a_run_without_the_excused_names_reach_its_failure_copyable(self):
-        escaped = '\x1b[31mbroken\x07'
+    def test_why_a_run_names_no_hook_reaches_its_failure_copyable(self):
+        start = {'record': 'start', 'version': '\x1b[31m9.9\x07', 'supported': False}
 
-        def pre_commit(paths, deadline, start, what, hook=None, cwd=None, skip=()):
-            return (1, '') if skip else (1, self.BROKEN.replace('- hook id: broken', f'- hook id: {escaped}'))
+        def pre_commit(paths, deadline, start_, what, hook=None, cwd=None, skip=()):
+            return (1, json.dumps(start)) if skip else self.BROKEN
         with mock.patch.object(hooks, 'pre_commit', pre_commit), \
-                mock.patch.object(hooks, 'baseline', return_value=([escaped], {})):
+                mock.patch.object(hooks, 'baseline', return_value=(['broken'], {})):
             failures = hooks.run_hooks(['a.txt'])[3]
-        self.assertEqual(failures[-1], {'hook': hooks.UNOWNED,
-                                        'error': 'pre-commit exited 1 with broken  skipped, naming no hook'})
+        self.assertEqual(failures[-1], {'hook': hooks.UNOWNED, 'error': (
+            'pre-commit exited 1 naming no hook: pre-commit 9.9  is not a version hook_runner.py supports')})
 
-    def test_a_padded_id_is_read_as_its_block_names_it_and_never_rerun_on_head(self):
-        # pre-commit prints a padded id as is, and SKIP strips each name it gives, so it cannot skip that hook.
-        Path(hooks.CONFIG).write_text(CONFIG.format(HOOK.format(id='broken') + HOOK.format(id="'pad '")))
-        pad = f'pad {"." * 72}Failed\n- hook id: pad \n- exit code: 1\n\nworse\n'
-        with mock.patch.object(hooks, 'pre_commit', return_value=(1, f'{self.BROKEN}\n{pad}')), \
+    def test_a_padded_id_is_named_as_pre_commit_holds_it_and_never_rerun_on_head(self):
+        # SKIP strips each name it gives, so it cannot skip that hook.
+        run = run_of(failed('broken', 'nope'), failed('pad ', 'worse'))
+        with mock.patch.object(hooks, 'pre_commit', return_value=run), \
                 mock.patch.object(hooks, 'baseline', return_value=(['broken'], {})) as baseline:
             _, _, _, failures, excused, not_rerun = hooks.run_hooks(['a.txt'])
         self.assertEqual(list(baseline.call_args.args[0]), ['broken'])
-        self.assertEqual(([f['hook'] for f in failures], excused), (['broken', 'pad'], ['broken']))
-        self.assertEqual(not_rerun, [{'hook': 'pad', 'why': 'SKIP cannot name it'}])
+        self.assertEqual(([f['hook'] for f in failures], excused), (['broken', 'pad '], ['broken']))
+        self.assertEqual(not_rerun, [{'hook': 'pad ', 'why': 'SKIP cannot name it'}])
 
     def test_a_head_rerun_the_deadline_cut_short_says_why(self):
         why = 'HEAD ran out of time: pre-commit did not finish within 540 s (HEAD broken)'
-        with mock.patch.object(hooks, 'pre_commit', return_value=(1, self.BROKEN)), \
+        with mock.patch.object(hooks, 'pre_commit', return_value=self.BROKEN), \
                 mock.patch.object(hooks, 'baseline', return_value=([], {'broken': why})):
             *_, failures, excused, not_rerun = hooks.run_hooks(['a.txt'])
         self.assertEqual(([f['hook'] for f in failures], excused), (['broken'], []))
         self.assertEqual(not_rerun, [{'hook': 'broken', 'why': why}])
 
     def test_without_fail_fast_every_hook_ran_and_none_runs_again(self):
-        remote = 'repos:\n- repo: https://example.com/hooks\n  rev: v1\n  hooks:\n  - id: broken\n'
-        # a remote repository's manifest may set fail_fast unless the hook's entry says
-        for config in ('repos: []\n', CONFIG.format(HOOK.format(id='broken')), remote + '    fail_fast: false\n',
-                       CONFIG.format(HOOK.format(id='broken') + '    fail_fast: true\n'), remote):
-            with self.subTest(config):
-                Path(hooks.CONFIG).write_text(config)
-                runs = mock.Mock(side_effect=lambda *_, skip=(), **__: (0, '') if skip else (1, self.BROKEN))
+        # fail_fast as the roster resolved it: the config's or the run's, or a hook's, a remote manifest's included
+        code, text = self.BROKEN
+        roster = json.loads(text.splitlines()[2])
+        for case, fail_fast, hook_fail_fast in (('none', False, False), ('config', True, False), ('hook', False, True)):
+            with self.subTest(case):
+                record = {**roster, 'failFast': fail_fast,
+                          'hooks': [{**roster['hooks'][0], 'failFast': hook_fail_fast}]}
+                run = (code, text.replace(json.dumps(roster), json.dumps(record)))
+                runs = mock.Mock(side_effect=lambda *_, skip=(), **__: run_of() if skip else run)
                 with mock.patch.object(hooks, 'pre_commit', runs) as pre_commit, \
                         mock.patch.object(hooks, 'baseline', return_value=(['broken'], {})):
                     *_, failures, excused, _ = hooks.run_hooks(['a.txt'])
                 self.assertEqual(([f['hook'] for f in failures], excused), (['broken'], ['broken']))
-                self.assertEqual(pre_commit.call_count, 2 if config.endswith(('true\n', 'broken\n')) else 1)
+                self.assertEqual(pre_commit.call_count, 1 if case == 'none' else 2)
 
     def test_the_run_without_the_excused_gets_its_retry(self):
         # A formatter fail_fast hid rewrites in that run and passes on its retry, as it would with fail_fast off.
-        fmt = 'fmt' + '.' * 70 + 'Failed\n- hook id: fmt\n- exit code: 1\n- files were modified by this hook\n'
-        runs = iter([(1, self.BROKEN), (1, fmt), (0, '')])
+        runs = iter([self.BROKEN, run_of(failed('fmt', modified=True, retcode=0)), run_of()])
         with mock.patch.object(hooks, 'pre_commit', lambda *a, **k: next(runs)), \
                 mock.patch.object(hooks, 'baseline', return_value=(['broken'], {})):
             ran, passed, ids, failures, excused, _ = hooks.run_hooks(['a.txt'])
         self.assertEqual((ids, [f['hook'] for f in failures], excused), (['fmt'], ['broken'], ['broken']))
 
     def test_a_hook_the_run_without_the_excused_finds_unexcusable_is_never_rerun_and_says_why(self):
-        # fail_fast hid them behind broken: one rewrites files there, one SKIP cannot name, one shares its id. The
-        # config runs them in that order, and pre-commit ends each hook's output with a blank line.
+        # fail_fast hid them behind broken: one rewrites files there, one SKIP cannot name, one shares its id.
         ids = ('broken', 'fmt', 'a,b', 'dup', 'dup')
         Path(hooks.CONFIG).write_text('fail_fast: true\n' + CONFIG.format(''.join(HOOK.format(id=i) for i in ids)))
-        fmt = 'fmt' + '.' * 70 + 'Failed\n- hook id: fmt\n- exit code: 1\n- files were modified by this hook\n'
-        hidden = fmt + self.BROKEN.replace('broken', 'a,b') + '\n' + self.BROKEN.replace('broken', 'dup')
-        with mock.patch.object(hooks, 'pre_commit', lambda *a, skip=(), **k: (1, hidden if skip else self.BROKEN)), \
+        roster = [(i, '') for i in ids]
+        first = run_of(failed('broken', 'nope'), roster=roster, fail_fast=True)
+        hidden = run_of(passed('broken', executed=False), failed('fmt', modified=True), failed('a,b', 'nope'),
+                        failed('dup', 'nope'), passed('dup'))
+        with mock.patch.object(hooks, 'pre_commit', lambda *a, skip=(), **k: hidden if skip else first), \
                 mock.patch.object(hooks, 'baseline', return_value=(['broken'], {})) as baseline:
             _, _, ids, failures, excused, not_rerun = hooks.run_hooks(['a.txt'])
         baseline.assert_called_once()
@@ -1116,98 +1373,31 @@ class RunHooksTest(unittest.TestCase):
                                      {'hook': 'a,b', 'why': 'SKIP cannot name it'},
                                      {'hook': 'dup', 'why': 'SKIP would skip another hook by it'}])
 
-    def test_nothing_is_rerun_on_head_when_the_config_cannot_be_read(self):
-        # Its aliases unknown, SKIP could skip a hook that never ran on the change.
-        Path(hooks.CONFIG).write_text('repos: [\n')
-        with mock.patch.object(hooks, 'pre_commit', return_value=(1, self.BROKEN)), \
+    def test_nothing_is_rerun_on_head_without_a_whole_record_of_every_stages_hooks(self):
+        # Every stage's aliases unknown, SKIP could skip a hook the commit runs at another stage.
+        code, text = self.BROKEN
+        lines = text.splitlines(keepends=True)
+        for case, records in (('missing', lines[:1] + lines[2:]),
+                              ('malformed', [lines[0], json.dumps({'record': 'hooks', 'hooks': [{'id': 'broken'}]})
+                                             + '\n', *lines[2:]])):
+            with self.subTest(case), mock.patch.object(hooks, 'pre_commit', return_value=(code, ''.join(records))), \
+                    mock.patch.object(hooks, 'baseline') as baseline:
+                *_, failures, excused, not_rerun = hooks.run_hooks(['a.txt'])
+            baseline.assert_not_called()
+            self.assertEqual(([f['hook'] for f in failures], excused), (['broken'], []))
+            self.assertEqual(not_rerun, [{'hook': 'broken', 'why': (
+                "hook_runner.py's record of the hooks at every stage is missing or malformed")}])
+
+    def test_an_alias_a_hook_at_another_stage_takes_is_never_rerun_on_head(self):
+        run = run_of(failed('broken', 'nope'), everywhere=[('broken', ''), ('guard', 'broken')])
+        with mock.patch.object(hooks, 'pre_commit', return_value=run), \
                 mock.patch.object(hooks, 'baseline') as baseline:
             *_, excused, not_rerun = hooks.run_hooks(['a.txt'])
-        baseline.assert_not_called()
-        self.assertEqual(excused, [])
-        self.assertEqual([n['hook'] for n in not_rerun], ['broken'])
-        self.assertRegex(not_rerun[0]['why'], rf'^{re.escape(hooks.CONFIG)} cannot be read \(\w+Error\)$')
-
-    def test_nothing_is_rerun_on_head_without_pyyaml_or_a_known_pre_commit_python_and_the_failure_says_why(self):
-        with mock.patch.object(hooks, 'yaml', None), mock.patch.object(hooks, 'pre_commit_python', return_value=None), \
-                mock.patch.object(hooks, 'pre_commit', return_value=(1, self.BROKEN)), \
-                mock.patch.object(hooks, 'baseline') as baseline:
-            *_, failures, excused, not_rerun = hooks.run_hooks(['a.txt'])
-        baseline.assert_not_called()
-        self.assertEqual(([f['hook'] for f in failures], excused), (['broken'], []))
-        self.assertEqual(not_rerun, [{'hook': 'broken', 'why': (
-            "PyYAML is not installed, nor is pre-commit's interpreter known, so the config was not read")}])
-
-    def without_pyyaml(self, config, interpreter=sys.executable):
-        """run_hooks' excused and notRerun without PyYAML here, the pre-commit on PATH a symlink to an entry script
-        whose #! line names interpreter."""
-        if ' ' in interpreter or not hooks.SHEBANG_PYTHON.fullmatch(os.path.basename(interpreter)):
-            self.skipTest(f'a #! line cannot name {interpreter} as a python: a space splits it, or its name is not one')
-        Path(hooks.CONFIG).write_text(config)
-        for d in ('bin', 'venv'):
-            os.mkdir(d)
-        Path('venv', 'pre-commit').write_text(f'#!{interpreter}\n')
-        os.symlink(os.path.abspath('venv/pre-commit'), 'bin/pre-commit')
-        os.chmod('venv/pre-commit', 0o755)
-        with mock.patch.object(hooks, 'yaml', None), mock.patch.dict(os.environ, {'PATH': os.path.abspath('bin')}), \
-                mock.patch.object(hooks, 'pre_commit', return_value=(1, self.BROKEN)), \
-                mock.patch.object(hooks, 'baseline', return_value=(['broken'], {})) as baseline:
-            *_, excused, not_rerun = hooks.run_hooks(['a.txt'])
-        return baseline, excused, not_rerun
-
-    @unittest.skipIf(os.name == 'nt', "a Windows pre-commit is a launcher, not a #! script")
-    def test_without_pyyaml_pre_commits_own_python_reads_the_config(self):
-        baseline, excused, not_rerun = self.without_pyyaml(CONFIG.format(HOOK.format(id='broken')))
-        baseline.assert_called_once()
-        self.assertEqual((excused, not_rerun), (['broken'], []))
-
-    @unittest.skipIf(os.name == 'nt', "a Windows pre-commit is a launcher, not a #! script")
-    def test_without_pyyaml_an_id_pre_commits_python_reads_as_shared_is_never_rerun(self):
-        baseline, excused, not_rerun = self.without_pyyaml(CONFIG.format(HOOK.format(id='broken') * 2))
         baseline.assert_not_called()
         self.assertEqual((excused, not_rerun), ([], [{'hook': 'broken', 'why': 'SKIP would skip another hook by it'}]))
 
-    @unittest.skipIf(os.name == 'nt', "a Windows pre-commit is a launcher, not a #! script")
-    def test_without_pyyaml_a_pre_commit_python_that_cannot_load_the_config_reruns_nothing(self):
-        Path('python3').write_text('#!/bin/sh\necho "ModuleNotFoundError: No module named \'yaml\'" >&2; exit 1\n')
-        os.chmod('python3', 0o755)
-        python = os.path.abspath('python3')
-        baseline, excused, not_rerun = self.without_pyyaml('repos: []\n', python)
-        baseline.assert_not_called()
-        self.assertEqual((excused, not_rerun), ([], [{'hook': 'broken', 'why': (
-            f"pre-commit's {python} cannot read {hooks.CONFIG} (ModuleNotFoundError: No module named 'yaml')")}]))
-
-    @unittest.skipIf(os.name == 'nt', "a Windows pre-commit is a launcher, not a #! script")
-    def test_without_pyyaml_why_holds_no_terminal_escapes_or_control_characters(self):
-        # Its interpreter's path and its last stderr line are copied into why, which a relay copies on.
-        os.mkdir('e\x1b[31mx')
-        python = os.path.abspath('e\x1b[31mx/python3')
-        Path(python).write_text('#!/bin/sh\nprintf "\\033[31mModuleNotFoundError:\\a\\tyaml\\033[0m\\n" >&2; exit 1\n')
-        os.chmod(python, 0o755)
-        baseline, excused, not_rerun = self.without_pyyaml('repos: []\n', python)
-        baseline.assert_not_called()
-        self.assertEqual((excused, not_rerun), ([], [{'hook': 'broken', 'why': (
-            f"pre-commit's {os.path.abspath('ex/python3')} cannot read {hooks.CONFIG} (ModuleNotFoundError:  yaml)")}]))
-
-    @unittest.skipIf(os.name == 'nt', "a Windows pre-commit is a launcher, not a #! script")
-    def test_without_pyyaml_a_pre_commit_python_that_cannot_start_reruns_nothing(self):
-        python = os.path.abspath('python3')
-        baseline, excused, not_rerun = self.without_pyyaml('repos: []\n', python)
-        baseline.assert_not_called()
-        self.assertEqual((excused, not_rerun), ([], [{'hook': 'broken', 'why': (
-            f"pre-commit's {python} cannot run (FileNotFoundError)")}]))
-
-    @unittest.skipIf(os.name == 'nt', "a Windows pre-commit is a launcher, not a #! script")
-    def test_without_pyyaml_a_pre_commit_python_printing_no_json_reruns_nothing(self):
-        Path('python3').write_text('#!/bin/sh\necho not json\n')
-        os.chmod('python3', 0o755)
-        baseline, excused, not_rerun = self.without_pyyaml('repos: []\n', os.path.abspath('python3'))
-        baseline.assert_not_called()
-        self.assertEqual((excused, not_rerun), ([], [{'hook': 'broken', 'why': (
-            f'{hooks.CONFIG} cannot be read (JSONDecodeError)')}]))
-
     def test_an_id_skip_cannot_name_is_never_rerun_on_head(self):
-        out = self.BROKEN.replace('broken', 'a,b')
-        with mock.patch.object(hooks, 'pre_commit', return_value=(1, out)), \
+        with mock.patch.object(hooks, 'pre_commit', return_value=run_of(failed('a,b', 'nope'))), \
                 mock.patch.object(hooks, 'baseline') as baseline:
             *_, excused, not_rerun = hooks.run_hooks(['a.txt'])
         baseline.assert_not_called()
@@ -1215,21 +1405,73 @@ class RunHooksTest(unittest.TestCase):
 
 
 class PreCommitPythonTest(unittest.TestCase):
-    def entry(self, first_line):
+    def setUp(self):
+        # Cached per process: each case changes what it reads.
+        hooks.pre_commit_python.cache_clear()
+        self.addCleanup(hooks.pre_commit_python.cache_clear)
+
+    def entry(self, first_line, body=ENTRY):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         script = Path(tmp.name, 'pre-commit')
-        script.write_bytes(first_line + b'\nfrom pre_commit.main import main\n')
+        script.write_bytes(first_line + b'\n' + body.encode())
+        hooks.pre_commit_python.cache_clear()
         with mock.patch.object(hooks.shutil, 'which', return_value=str(script)):
-            return hooks.pre_commit_python(), os.path.realpath(tmp.name)
+            return hooks.pre_commit_python(), os.path.realpath(script)
+
+    def launcher(self, shebang, body=ENTRY):
+        """pre_commit_python() of a pre-commit.exe as pip's distlib writes one: a launcher stub, shebang, then the
+        zip archive it runs, body its __main__.py."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, 'w') as z:
+            z.writestr('__main__.py', body)
+        exe = Path(tmp.name, 'pre-commit.exe')
+        exe.write_bytes(b'MZ\x90\x00 launcher stub ' + shebang + archive.getvalue())
+        hooks.pre_commit_python.cache_clear()
+        with mock.patch.object(hooks.shutil, 'which', return_value=str(exe)):
+            return hooks.pre_commit_python(), os.path.realpath(exe)
 
     def test_the_interpreter_and_its_one_argument_are_read_as_the_kernel_does(self):
-        found, where = self.entry(b'#! /usr/bin/python3 -s -E')
-        self.assertEqual(found, (['/usr/bin/python3', '-s -E'], where))
+        found, entry = self.entry(b'#! /usr/bin/python3 -s -E')
+        self.assertEqual(found, (['/usr/bin/python3', '-s -E'], entry))
         for python in (b'/opt/venvs/pre-commit/bin/python3.12', b'/usr/bin/python3.13t', b'/usr/bin/python3-dbg',
                        b'/opt/pypy/bin/pypy3'):
-            found, where = self.entry(b'#!' + python)
-            self.assertEqual(found, ([python.decode()], where))
+            found, entry = self.entry(b'#!' + python)
+            self.assertEqual(found, ([python.decode()], entry))
+
+    def test_a_windows_launcher_runs_the_python_its_archive_names(self):
+        for shebang, words in ((b'#!C:\\hostedtoolcache\\Python\\3.13\\x64\\python.exe\r\n',
+                                ['C:\\hostedtoolcache\\Python\\3.13\\x64\\python.exe']),
+                               (b'#!"C:\\Program Files\\Python313\\python.exe"\n',
+                                ['C:\\Program Files\\Python313\\python.exe']),
+                               (b'#!"C:\\Program Files\\Python313\\python.exe" -E\n',
+                                ['C:\\Program Files\\Python313\\python.exe', '-E']),
+                               (b'#!"C:\\Program Files\\Python313\\python.exe" -E -s\n',
+                                ['C:\\Program Files\\Python313\\python.exe', '-E', '-s']),
+                               (b'#!C:\\Python313\\python.exe -E\t -s\r\n', ['C:\\Python313\\python.exe', '-E', '-s'])):
+            with self.subTest(shebang):
+                found, entry = self.launcher(shebang)
+                self.assertEqual(found, (words, entry))
+        # no archive after it, a relative python, an unclosed quote, a quoted option, or no python at all
+        for shebang in (b'', b'#!python.exe\n', b'#!"C:\\Program Files\\python.exe\n',
+                        b'#!C:\\Python313\\python.exe -X "utf8"\n', b'#!C:\\tools\\uv.exe\n'):
+            with self.subTest(shebang):
+                self.assertIsNone(self.launcher(shebang)[0])
+        self.assertIsNone(self.launcher(b'#!C:\\Python313\\python.exe\n', WRAPPER)[0], 'a wrapper')
+
+    def test_only_an_entry_calling_pre_commits_main_as_pip_writes_it_is_stood_in_for(self):
+        # installer (distro packages) writes the same script with double quotes, its coding line optional
+        for body in (ENTRY.replace("'", '"'), ENTRY.split('\n', 1)[1], ENTRY.replace('\n', '\r\n'), *PIP_ENTRIES):
+            with self.subTest(body):
+                self.assertIsNotNone(self.entry(b'#!/usr/bin/python3', body)[0])
+        for body in PIP_ENTRIES:
+            self.assertIsNotNone(self.launcher(b'#!C:\\Python313\\python.exe\r\n', body)[0], body)
+        for body in (WRAPPER, ENTRY + 'print(1)\n', ENTRY.replace('main()', 'main(["run"])'), '',
+                     ENTRY.replace("== '__main__'", '== "__main__\''), ENTRY + ' ' * 4096 + 'def (\n'):
+            with self.subTest(body):
+                self.assertIsNone(self.entry(b'#!/usr/bin/python3', body)[0])
 
     def test_a_line_naming_no_python_by_absolute_path_is_no_interpreter(self):
         # env, distlib's /bin/sh form for a long path, a launcher .exe, a relative path, or no #! at all
@@ -1239,6 +1481,15 @@ class PreCommitPythonTest(unittest.TestCase):
     def test_no_pre_commit_on_path_is_no_interpreter(self):
         with mock.patch.object(hooks.shutil, 'which', return_value=None):
             self.assertIsNone(hooks.pre_commit_python())
+
+    def test_a_pre_commit_run_as_is_is_the_one_judged(self):
+        # A wrapper pre-commit.cmd ahead of a pip pre-commit.exe on PATH: Windows would run the .exe by a bare name.
+        wrapper = os.path.abspath('pre-commit.cmd')
+        with mock.patch.object(hooks.shutil, 'which', return_value=wrapper), \
+                mock.patch.object(hooks, 'abbrev_length', return_value=7), \
+                mock.patch.object(hooks, 'bounded', return_value=(1, '', '')) as bounded:
+            self.assertEqual(hooks.pre_commit(['a.txt'], 10, time.monotonic(), 'test'), (1, None))
+        self.assertEqual(bounded.call_args.args[0][0], wrapper)
 
 
 class AsCheckoutTest(unittest.TestCase):
@@ -1308,136 +1559,100 @@ class AsCheckoutTest(unittest.TestCase):
             self.assertEqual(hooks.comparable(head, '/x'), hooks.comparable(change, '/x'), change)
 
 
-class ResultsTest(unittest.TestCase):
-    FAILED = 'fmt' + '.' * 70 + 'Failed'
+class RecordsTest(unittest.TestCase):
+    """What results() and attributed() take from hook_runner.py's records, and what they refuse."""
 
-    def test_output_contradicting_the_exit_status_is_refused(self):
-        with self.assertRaisesRegex(hooks.Unusable, 'exited 0'):
-            hooks.results(f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n', 0)
-        with self.assertRaisesRegex(hooks.Unusable, 'passed and modified'):
-            hooks.results(f'fmt{"." * 70}Passed\n- hook id: fmt\n- files were modified by this hook\n', 1)
+    def records(self, *records):
+        return ''.join(json.dumps(r) + '\n' for r in records)
+
+    def test_records_saying_a_hook_failed_while_pre_commit_exited_0_are_refused(self):
+        with self.assertRaisesRegex(hooks.Unusable, 'exited 0 but its records say hook fmt failed'):
+            hooks.results(run_of(failed('fmt', 'bad'))[1], 0)
 
     def test_a_failed_hook_carries_its_first_output_line(self):
-        out = (f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n\n\n{"=" * 70}\n  error: no compiler  \nmore\n\n'
-               f'gen{"." * 70}Failed\n- hook id: gen\n- exit code: 2\n'
-               f'doc{"." * 50}(no files to check)Skipped\n'
-               f'cut{"." * 70}Failed\n- hook id: cut\n- exit code: 1\n\n{"x" * 300}\n')
-        self.assertEqual([{k: f[k] for k in ('hook', 'error')} for f in hooks.results(out, 1)[1]], [
-            {'hook': 'fmt', 'error': 'error: no compiler'},
-            {'hook': 'gen', 'error': 'exit code: 2'},
-            {'hook': 'cut', 'error': 'x' * hooks.ERROR_CHARS},
+        code, text = run_of(failed('fmt', f'\n\n{"=" * 70}\n  error: no compiler  \nmore\n'), failed('gen', retcode=2),
+                            passed('doc', executed=False), failed('cut', 'x' * 300), failed('fix', modified=True))
+        modified, failures, roster = hooks.results(text, code)
+        self.assertEqual([{k: f[k] for k in ('hook', 'index', 'error')} for f in failures], [
+            {'hook': 'fmt', 'index': 0, 'error': 'error: no compiler'},
+            {'hook': 'gen', 'index': 1, 'error': 'exit code: 2'},
+            {'hook': 'cut', 'index': 3, 'error': 'x' * hooks.ERROR_CHARS},
+            {'hook': 'fix', 'index': 4, 'error': 'files were modified by this hook'},
         ])
-        # what the HEAD rerun is compared on: the block and everything printed, up to each result that may be the
-        # next, with the id its block names, or the end
-        failures = hooks.results(out, 1)[1]
-        self.assertEqual([f['outputs'][0] for f in failures], [
-            (f'- exit code: 1\n\n\n{"=" * 70}\n  error: no compiler  \nmore', 'gen'), ('- exit code: 2', 'cut'),
-            (f'- exit code: 1\n\n{"x" * 300}', None)])
-        self.assertEqual([[after for _, after in f['outputs']] for f in failures], [['gen', None], ['cut'], [None]])
-        self.assertEqual(failures[0]['outputs'][-1][0], out[out.index('- exit code: 1'):].rstrip())
-
-    def test_a_result_line_the_hook_printed_is_its_output(self):
-        # pre-commit pads its own result lines to one width and prints a hook's output between blank lines.
-        said = f'x.c:1: bad\n\nReport.....Passed\nx.c:2: worse\nstep{"." * 69}Failed\nx.c:3: worst'
-        out = f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n\n{said}\n\ngen{"." * 70}Passed\n'
-        self.assertEqual([f['outputs'][0] for f in hooks.results(out, 1)[1]], [(f'- exit code: 1\n\n{said}', None)])
-
-    def test_a_result_line_the_hook_printed_after_a_blank_line_is_its_output_too(self):
-        # Only the result lines below pre-commit's own blank line end the output: what follows a mimic stays in it.
-        said = f'x.c:1: bad\n\nReport{"." * 67}Passed\nx.c:2: new'
-        out = (f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n\n{said}\n\ngen{"." * 70}Passed\n'
-               f'doc{"." * 50}(no files to check)Skipped\ncut{"." * 70}Failed\n- hook id: cut\n- exit code: 1\n')
-        self.assertEqual([f['outputs'][0] for f in hooks.results(out, 1)[1]],
-                         [(f'- exit code: 1\n\n{said}', 'cut'), ('- exit code: 1', None)])
-
-    def test_a_result_line_and_block_the_hook_printed_are_its_output_too(self):
-        # A result line ends the output only below the blank line under its last line, with a block pre-commit
-        # prints under that result and all that follows in pre-commit's shape. nested is no hook the config runs.
-        for said in (f'x.c:1: bad\nReport{"." * 67}Passed\n- hook id: nested\n- duration: 0.1s\n\nx.c:2: new',
-                     f'x.c:1: bad\n\nReport{"." * 67}Passed\n- hook id: nested\n\nx.c:2: new',
-                     f'x.c:1: bad\n\nReport{"." * 67}Failed\n- hook id: nested\n\nx.c:2: new',
-                     f'x.c:1: bad\n\nReport{"." * 66}Skipped\n- hook id: nested\n\nx.c:2: new'):
-            with self.subTest(said):
-                out = f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n\n{said}\n\ngen{"." * 70}Passed\n'
-                failures = hooks.results(out, 1, ['fmt', 'gen'])[1]
-                self.assertEqual([f['hook'] for f in failures], ['fmt'])
-                self.assertEqual(failures[0]['outputs'][0], (f'- exit code: 1\n\n{said}', None))
-
-    def test_a_result_of_another_width_the_hook_printed_never_ends_its_output(self):
-        # pre-commit pads all its result lines to one width: a narrower one in pre-commit's shape is the hook's own.
-        said = f'x.c:1: bad\n\nReport{"." * 60}Passed\n- hook id: nested\n- duration: 0.1s\n\nx.c:2: new'
-        out = f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n\n{said}\n\ngen{"." * 70}Passed\n'
-        self.assertEqual([after for _, after in hooks.results(out, 1)[1][0]['outputs']], [None, None])
-
-    def test_a_result_under_two_blank_lines_is_the_hooks_own_output(self):
-        # pre-commit strips a hook's output and ends it with one blank line: under two, a result shaped as pre-commit's
-        # next, or a block over two, is what the hook printed.
-        for said in (f'x.c:1: bad\n\n\ngen{"." * 70}Passed',
-                     f'x.c:1: bad\n\ngen{"." * 70}Failed\n- hook id: gen\n- exit code: 1\n\n\nmore'):
-            with self.subTest(said):
-                out = f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n\n{said}\n'
-                self.assertEqual(len(hooks.results(out, 1, ['fmt', 'gen'])[1][0]['outputs']), 1)
-
-    def test_a_wide_character_counts_two_columns_in_a_result_line(self):
-        # pre-commit pads by display width (_len_cjk): 检查's two characters take four columns, as gen's 79.
-        out = f'检查{"." * 69}Failed\n- hook id: check\n- exit code: 1\n\nx.c:1: bad\n\ngen{"." * 70}Passed\n'
-        self.assertEqual(hooks.results(out, 1)[1][0]['outputs'][0], ('- exit code: 1\n\nx.c:1: bad', None))
-
-    def test_a_failed_result_the_hook_printed_counts_only_where_pre_commits_next_may_be(self):
-        # Under a blank line in pre-commit's shape, nested's result may end fmt's output only where the config runs
-        # nested after fmt, or where the config is unread; it counts wherever the config runs nested.
-        said = (f'x.c:1: bad\n\nReport{"." * 67}Failed\n- hook id: nested\n- exit code: 1\n'
-                '- files were modified by this hook\n\nx.c:2: new')
-        out = f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n\n{said}\n\ngen{"." * 70}Passed\n'
-        for order, found in ((None, ['fmt', 'nested']), (['fmt', 'nested', 'gen'], ['fmt', 'nested']),
-                             (['fmt', 'gen'], ['fmt']), (['nested', 'fmt', 'gen'], ['fmt', 'nested'])):
-            with self.subTest(order):
-                ids, failures = hooks.results(out, 1, order)
-                self.assertEqual(([f['hook'] for f in failures], ids), (found, found[1:]))
-        # pre-commit's own results past an end stay counted, a passed and a skipped one between them
-        out = (f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n\nx.c:1: bad\n\ngen{"." * 70}Passed\n'
-               f'doc{"." * 50}(no files to check)Skipped\ncut{"." * 70}Failed\n- hook id: cut\n- exit code: 1\n')
-        self.assertEqual([f['hook'] for f in hooks.results(out, 1, ['fmt', 'gen', 'doc', 'cut'])[1]], ['fmt', 'cut'])
-
-    def test_a_verbose_result_with_output_never_ends_the_output_whatever_it_names(self):
-        # A passed hook's verbose result and output may be pre-commit's next or one fmt printed, x.c:2 then its own:
-        # fmt's output runs past it, even where it names a hook the config runs after fmt and that hook's result
-        # follows.
-        said = f'x.c:1: bad\n\nReport{"." * 67}Passed\n- hook id: nested\n- duration: 0.1s\n\nx.c:2: new'
-        out = f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n\n{said}\n\ngen{"." * 70}Passed\n'
-        fmt = hooks.results(out, 1)[1][0]
-        self.assertEqual(fmt['outputs'], [(f'- exit code: 1\n\n{said}', None),
-                                          (f'- exit code: 1\n\n{said}\n\ngen{"." * 70}Passed', None)])
-        for order in (['fmt', 'gen'], ['nested', 'fmt', 'gen'], ['fmt', 'nested', 'gen']):
-            with self.subTest(order):
-                self.assertNotIn(hooks.comparable('- exit code: 1\n\nx.c:1: bad', '/'), hooks.compared(fmt, order))
-        said = f'x.c:1: bad\n\ngen{"." * 70}Passed\n- hook id: gen\n- duration: 0.1s\n\nx.c:2: new'
-        out = f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n\n{said}\n\ngen{"." * 70}Passed\n'
-        fmt = hooks.results(out, 1, ['fmt', 'gen'])[1][0]
-        self.assertEqual([after for _, after in fmt['outputs']], [None, None])
-
-    def test_a_verbose_block_under_the_next_result_ends_the_output(self):
-        for after in (f'ok{"." * 51}(no files to check)Skipped\n- hook id: ok\n',
-                      f'ok{"." * 70}Skipped\n- hook id: ok\n',
-                      f'ok{"." * 71}Failed\n- hook id: ok\n- duration: 0.02s\n- exit code: 1\n'
-                      '- files were modified by this hook\n'):
-            with self.subTest(after):
-                out = f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n\nx.c:1: bad\n\n{after}'
-                self.assertEqual(hooks.results(out, 1)[1][0]['outputs'][0], ('- exit code: 1\n\nx.c:1: bad', 'ok'))
-        # One that passed and printed may be fmt's own, all good then its output too.
-        said = f'x.c:1: bad\n\nok{"." * 71}Passed\n- hook id: ok\n- duration: 0s\n\nall good'
-        out = f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n\n{said}\n\n'
-        self.assertEqual(hooks.results(out, 1)[1][0]['outputs'], [(f'- exit code: 1\n\n{said}', None)])
+        # what the HEAD rerun is compared on: all the hook printed in this run
+        self.assertEqual(failures[0]['output'], f'\n\n{"=" * 70}\n  error: no compiler  \nmore\n')
+        self.assertEqual((modified, [h['id'] for h in roster['hooks']]), (['fix'], ['fmt', 'gen', 'doc', 'cut', 'fix']))
 
     def test_terminal_escapes_and_control_characters_never_reach_the_error(self):
-        out = f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n\n\x1b[31m\x1b[0m\n\x1b[31merror:\x07\tbad\x1b[0m\n'
-        self.assertEqual(hooks.results(out, 1)[1][0]['error'], 'error:  bad')
+        code, text = run_of(failed('fmt', '\x1b[31m\x1b[0m\n\x1b[31merror:\x07\tbad\x1b[0m\n'))
+        self.assertEqual(hooks.results(text, code)[1][0]['error'], 'error:  bad')
 
-    def test_only_the_block_under_a_result_line_counts(self):
-        out = (f'{self.FAILED}\n- hook id: fmt\n- exit code: 1\n\n'
-               '- hook id: fake\n- files were modified by this hook\n\n'
-               f'gen{"." * 70}Failed\n- hook id: gen\n- files were modified by this hook\n')
-        self.assertEqual(hooks.results(out, 1)[0], ['gen'])
+    def test_a_fail_fast_stop_leaves_the_rest_of_the_roster_unrun(self):
+        roster = [('ok', ''), ('broken', ''), ('nocc', '')]
+        code, text = run_of(passed('ok'), failed('broken', 'nope'), roster=roster, fail_fast=True)
+        self.assertEqual([f['hook'] for f in hooks.results(text, code)[1]], ['broken'])
+        code, text = run_of(passed('ok'), failed('broken', 'nope'), roster=roster)
+        self.assertEqual(hooks.results(text, code)[1][0]['hook'], hooks.UNOWNED, 'no stop explains nocc unrun')
+
+    def test_records_that_cannot_attribute_a_run_name_no_hook(self):
+        start = {'record': 'start', 'version': '4.2.0', 'supported': True}
+        roster = {'record': 'roster', 'failFast': False, 'hooks': [{'id': 'a', 'alias': '', 'failFast': False}]}
+        hook = {'record': 'hook', 'index': 0, **failed('a', 'bad')}
+        end = {'record': 'end', 'code': 1}
+        for why, text in (
+                ('the pre-commit on PATH is no entry hook_runner.py stands in for, so it ran as is', None),
+                ('it left no records', ''),
+                ('its records are malformed', self.records(start)[:-5]),
+                ('pre-commit 9.9 is not a version hook_runner.py supports',
+                 self.records({**start, 'version': '9.9', 'supported': False})),
+                ('its records stop short', self.records(start, roster, hook)),
+                ('its records stop short', self.records(start, hook, end)),
+                ('it selected a, a, not that hook alone',
+                 self.records(start, {**roster, 'hooks': roster['hooks'] * 2, 'refused': True}, end)),
+                ('its records contradict themselves', self.records(start, roster, {**hook, 'index': 1}, end)),
+                ('its records contradict themselves', self.records(start, roster, {**hook, 'id': 'b'}, end)),
+                ('its records contradict themselves', self.records(start, roster, hook, hook, end)),
+                ('its records contradict themselves', self.records(
+                    start, {**roster, 'hooks': roster['hooks'] * 2}, hook, end)),
+                ("its records contradict pre-commit's exit status 1", self.records(start, {**roster, 'hooks': []},
+                                                                                     end)),
+                ("its records contradict pre-commit's exit status 1", self.records(
+                    start, roster, hook, {**end, 'code': 3})),
+                ('its records are malformed', self.records(start, roster, {'record': 'hook', 'index': 0}, end))):
+            with self.subTest(why):
+                self.assertEqual(hooks.results(text, 1), ([], [{
+                    'hook': hooks.UNOWNED, 'error': f'pre-commit exited 1 naming no hook: {why}'}], None))
+                with self.assertRaisesRegex(hooks.Unattributed, f'^{re.escape(why)}$'):
+                    hooks.attributed(text, 1)
+        # a run that passed has no failure to name
+        self.assertEqual(hooks.results(None, 0), ([], [], None))
+
+    def test_skip_must_select_the_failed_hook_alone_among_the_roster(self):
+        selected = [{'id': 'a', 'alias': ''}, {'id': 'b', 'alias': 'a'}, {'id': 'c', 'alias': ''},
+                    {'id': 'c', 'alias': ''}, {'id': ' d', 'alias': ''}, {'id': 'e', 'alias': ''}]
+        # e's alias taken by a hook at another stage
+        roster = {'hooks': selected, 'everywhere': [*selected, {'id': 'f', 'alias': 'e'}]}
+        for hook, index, why in (('a', 0, 'SKIP would skip another hook by it'), ('b', 1, ''),
+                                 ('c', 2, 'SKIP would skip another hook by it'), (' d', 4, 'SKIP cannot name it'),
+                                 ('a,b', 0, 'SKIP would skip another hook by it'),
+                                 ('e', 5, 'SKIP would skip another hook by it')):
+            with self.subTest(hook):
+                self.assertEqual(hooks.unselected({'hook': hook, 'index': index}, roster), why)
+        for everywhere in (None, selected[:1]):
+            self.assertEqual(hooks.unselected({'hook': 'b', 'index': 1}, {**roster, 'everywhere': everywhere}),
+                             "hook_runner.py's record of the hooks at every stage is missing or malformed")
+
+    def test_every_stages_hooks_come_whole_or_not_at_all(self):
+        code, text = run_of(failed('a', 'bad'))
+        start, everywhere, *rest = text.splitlines(keepends=True)
+        self.assertEqual(hooks.attributed(text, code)[0]['everywhere'],
+                         [{'id': 'a', 'alias': '', 'stages': ['pre-commit']}])
+        for case, records in (('missing', [start, *rest]),
+                              ('no stages', [start, everywhere.replace(', "stages": ["pre-commit"]', ''), *rest]),
+                              ('not a list', [start, json.dumps({'record': 'hooks', 'hooks': {}}) + '\n', *rest])):
+            with self.subTest(case):
+                roster, ran = hooks.attributed(''.join(records), code)
+                self.assertEqual((roster['everywhere'], [r['id'] for r in ran]), (None, ['a']))
 
 
 if __name__ == '__main__':

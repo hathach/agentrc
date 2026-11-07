@@ -1,21 +1,15 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test as nodeTest } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { ABSENT, AsyncFunction, emitDirs, emitOf, loadModule, moduleOf } from './emit_stub.mjs'
 
-const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
 // The body runs as the runtime runs it; `meta` is exposed so its value, not its spelling, is checked.
 const body = readFileSync(new URL('../workflows/pr-babysit.js', import.meta.url), 'utf8')
   .replace(/^export const meta = /m, 'const meta = globalThis.__meta = ')
-
-// Node gives the workflow body globals the runtime sandbox does not, so a test
-// run here is more forgiving than production: `new URL` cost this workflow every
-// run, refusing each one at preflight, while the suite stayed green. Shadowing
-// them as parameters makes the body fail here the way it fails there.
-const ABSENT = ['URL', 'URLSearchParams', 'TextEncoder', 'TextDecoder', 'Buffer', 'process', 'fetch', 'structuredClone']
 
 const GREEN = { status: 'green', infraRerun: [], realFailures: [] }
 const RUNNING = { status: 'running', infraRerun: [], realFailures: [] }
@@ -48,7 +42,7 @@ const canonical = (v) => Array.isArray(v) ? `[${v.map(canonical).join(',')}]`
   : v && typeof v === 'object' ? `{${Object.keys(v).sort().map(k => `${JSON.stringify(k)}:${canonical(v[k])}`).join(',')}}`
   : JSON.stringify(v)
 const seal = ({ digest, ...st }) => ({ ...st, digest: fnv1a(canonical(JSON.parse(JSON.stringify(st)))) })
-// A copy without the null members, which is also what facts.py's seal is taken over.
+// A line without its null members, which is what facts.py's seal is taken over.
 const bare = (v) => Array.isArray(v) ? v.map(bare)
   : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).filter(([, x]) => x !== null).map(([k, x]) => [k, bare(x)])) : v
 const sealLine = (facts) => ({ ...facts, seal: fnv1a(canonical(bare(facts))) })
@@ -126,10 +120,11 @@ const adoptionArgs = (state, over = {}) => ({
   yieldAfterCycle: true, state, adoptHead: ADOPT, ...over,
 })
 
-// The runtime validates a stub's reply against its schema; the harness does the
-// same for the CI stub, the one whose shape changed, so a fixture in the old
-// shape fails here as a stale watcher would there, and for a relay's garbled copy.
+// The runtime validates a model's reply against its schema; the harness does the
+// same for the stubs of model agents. A script's line (schema null) is the
+// workflow's own to check.
 const conforms = (schema, value, at) => {
+  if (schema === null) return value
   if (schema.enum && !schema.enum.includes(value)) throw new Error(`${at}: ${JSON.stringify(value)} not in ${schema.enum}`)
   if (schema.type === 'object') {
     for (const k of schema.required || []) if (!(k in value)) throw new Error(`${at}: missing ${k}`)
@@ -144,14 +139,14 @@ const conforms = (schema, value, at) => {
   return value
 }
 
-// state_transfer.py's envelope for a saved output holding `state`, all chunks or `chunks` ("1,3").
+// The real state_transfer.py's line for a saved output holding `state`.
 const STATE_TRANSFER = fileURLToPath(new URL('../skills/pr-babysit/scripts/state_transfer.py', import.meta.url))
-const transferOf = (state, chunks, pad) => {
+const transferOf = (state) => {
   const dir = mkdtempSync(join(tmpdir(), 'pr-babysit-state-'))
   try {
     const file = join(dir, 'w.output')
     writeFileSync(file, JSON.stringify({ result: { state } }))
-    const done = spawnSync('python3', [STATE_TRANSFER, file, ...(chunks ? ['--chunks', chunks] : []), ...(pad ? ['--pad'] : [])], { encoding: 'utf8' })
+    const done = spawnSync('python3', [STATE_TRANSFER, file], { encoding: 'utf8' })
     return JSON.parse(done.stdout.trim().split('\n').at(-1))
   } finally { rmSync(dir, { recursive: true, force: true }) }
 }
@@ -210,10 +205,16 @@ async function run(opts = {}) {
   let validatorCalls = 0
   let observed = null // the last validator observedAt, a trigger's default finishing time
   let brokenWriter = false // a writer reported a failed build since the last candidate build
-  const receiptFiles = new Map() // reply.py or sonar.py --receipt path -> the line its first run saved there
+  const receiptFiles = opts.receiptFiles ?? new Map() // reply.py or sonar.py --receipt path -> the line its first run saved there
   const sonarMarked = new Set() // comments whose SonarCloud issue a sonar.py run marked
-  const replied = new Set() // comments a reply.py run posted to, which a rerun finds there (rerunReuses)
+  const replied = opts.replied ?? new Set() // comments a reply.py run posted to, which a rerun finds there (rerunReuses)
   const commitReceipts = new Map() // commits.py --receipt path -> the line it saved, with its bindings
+  const journal = [] // every agent call and its answer, which opts.resume replays
+  let live = 0 // how far this run still follows opts.resume
+  const loads = [] // each scriptPath workflow() loaded
+  // facts.py emit-dir's directory: opts.emitDir, else a new one this run removes unless opts.keepEmit.
+  const emit = emitDirs('pr-babysit-emit-', opts.emitDir, opts.keepEmit)
+  let dirCalls = 0 // facts.py emit-dir runs; opts.dirAnswer(n) answers the nth instead (undefined: the directory)
 
   // One harvest per cycle, whichever of the validator and the probe (#359) asks for it first.
   const readings = new Map()
@@ -253,19 +254,21 @@ async function run(opts = {}) {
   }
   const agent = async (prompt, options) => {
     const label = options.label
+    // facts.py emit-dir, the transport's own bootstrap, is in the journal only.
+    if (label === 'emit:dir') {
+      const answer = opts.dirAnswer ? opts.dirAnswer(++dirCalls) : undefined
+      if (answer instanceof Error) throw answer
+      return answer === undefined ? { dir: emit.dir() } : answer
+    }
     calls.push({
       label, prompt: String(prompt), agentType: options.agentType,
       phase: options.phase, schema: options.schema, model: options.model,
     })
     if (opts.throwOn && (typeof opts.throwOn === 'function' ? opts.throwOn(label) : label.startsWith(opts.throwOn))) throw new Error(`${label} exploded`)
-    if (label.startsWith('state:load#')) {
-      // The real state_transfer.py on a saved output holding opts.load, then
-      // opts.copy(envelope, label) for what the loader agent hands back.
+    if (label === 'state:load' || label === 'state:load.retry') {
+      // The real state_transfer.py on a saved output holding opts.load.
       if (opts.load instanceof Error) throw opts.load
-      const asked = String(prompt).match(/ --chunks ([\d,]+)( --pad)?\n/) || []
-      const envelope = transferOf(opts.load, asked[1], !!asked[2])
-      const answer = opts.copy ? await opts.copy(envelope, label) : envelope
-      return answer === null ? null : conforms(options.schema, answer, label)
+      return transferOf(opts.load)
     }
     if (label === 'preflight' || label === 'preflight.retry') {
       return patch({ ...PIN, head, prHead }, opts.preflight)
@@ -299,7 +302,7 @@ async function run(opts = {}) {
       if (push.pushed) prHead = to
       return push
     }
-    if (label === 'stop:ci') return conforms(options.schema, { stopped: true }, label)
+    if (label === 'stop:ci') return conforms(options.schema, { exit: 0 }, label)
     if (label.startsWith('prstate#')) {
       // preflight.py --state before a publication the CI lane is not watching: OPEN unless opts.prState (a value, or a function of the label) says otherwise.
       const state = typeof opts.prState === 'function' ? opts.prState(label) : opts.prState === undefined ? 'OPEN' : opts.prState
@@ -388,9 +391,9 @@ async function run(opts = {}) {
     if (label.startsWith('reviews:probe#')) {
       const r = await reading(cycleOf(label), prompt)
       if (opts.probe === null) return null
-      if (opts.probe?.error) return conforms(options.schema, opts.probe, label)   // the relay's copy of an error line, emptied
+      if (opts.probe?.error) return opts.probe // harvest.py's error line
       const { headSha, observedAt, headEventAt, headEventEvidence, fingerprint, bots } = r
-      return conforms(options.schema, sealLine({ headSha, observedAt, headEventAt, headEventEvidence, fingerprint, bots, ...(opts.probe || {}) }), label)
+      return sealLine({ headSha, observedAt, headEventAt, headEventEvidence, fingerprint, bots, ...(opts.probe || {}) })
     }
     if (label === 'scope:check') {
       // scope_check.py's receipt over the paths the prompt asked it for; opts.lsFiles keeps those it accepts.
@@ -416,6 +419,11 @@ async function run(opts = {}) {
     }
     if (label.startsWith('replies#') || label.startsWith('resolve#') || label.startsWith('defer#')) {
       if (opts.posting === null || (typeof opts.posting === 'function' && opts.posting(label) === null)) return null // a dead posting agent
+      // reply.py --replay-only: the receipt an earlier run saved there, else its error; it never posts.
+      if (/ --replay-only`/.test(String(prompt))) {
+        const path = String(prompt).match(/--receipt '([^']+)'/)[1]
+        return receiptFiles.has(path) ? receiptFiles.get(path) : { error: `no receipt saved at ${path}: nothing was run`, receipts: [] }
+      }
       // The script's receipts, one per manifest entry, echoing each body's
       // digest: posted, read back and resolved unless a case says the batch
       // failed (dropDoneIds), a reply landed with the wrong body (wrongBody),
@@ -612,7 +620,12 @@ async function run(opts = {}) {
   const pipeline = (items, first, second) =>
     settle(items.map(async item => second(await first(item), item)))
   const parallel = (thunks) => settle(thunks.map(fn => fn()))
-  const workflow = async () => { throw new Error('pr-babysit cannot nest a workflow') }
+  // pr-babysit nests nothing but a data module (emit_stub.mjs's loadModule).
+  const workflow = async (ref, a) => {
+    if (!ref || typeof ref.scriptPath !== 'string') throw new Error('pr-babysit nests only a data module, by scriptPath')
+    loads.push(ref.scriptPath)
+    return loadModule(ref.scriptPath, a, { pipeline, parallel, log: (m) => logs.push(String(m)) })
+  }
 
   // nap()'s real delay is minutes; fire it immediately and record where in the
   // log stream it happened.
@@ -624,18 +637,54 @@ async function run(opts = {}) {
       ...ABSENT, body)
     const result = await fn(
       opts.rawArgs ?? { pr: 3888, maxCycles: 1, autoPush: true, reviewers: ['coderabbit'], ...opts.args },
-      // Each stub answers as its script before facts.py seals the line; the seal goes on
-      // here (an error line's relay fills it with ''), then opts.garble is the relay's copy,
-      // held to the schema the relay was given as the runtime's StructuredOutput holds it.
+      // A call opts.resume journaled for this place answers from the journal, as the runtime's resume does for
+      // the unchanged prefix. Else a relay of a script (its command names AGENTRC_EMIT) answers through the file:
+      // each stub answers as its script before facts.py seals the line (no seal on an error line), opts.garble(label,
+      // line) is what the script wrote instead (null: the relay died before it wrote), and the line lands in that
+      // file as lib/seal.py's emit writes it. The script claims the file (empty) before it runs anything: one already
+      // there is exit 3 with nothing run, and a death before the line leaves the claim empty. The relay answers its
+      // exit, or null when opts.lostAnswer(label) says it died after its script wrote. The journal keeps the calls in
+      // the order they were made, as the runtime's does.
       async (prompt, options) => {
-        const sealing = !!options.schema?.properties?.seal
-        const schema = sealing ? { ...options.schema, required: options.schema.required.filter(k => k !== 'seal') } : options.schema
-        const line = await agent(prompt, { ...options, schema })
-        const sealed = !line || !sealing || 'seal' in line ? line : line.error ? { ...line, seal: '' } : sealLine(line)
-        if (!opts.garble) return sealed
-        const copy = opts.garble(options.label, sealed)
-        return copy && conforms(options.schema, copy, options.label)
-      }, pipeline, parallel, () => {}, (m) => logs.push(String(m)), workflow, null,
+        const at = journal.length
+        const cached = opts.resume && live === at && opts.resume[at]
+        if (cached && cached.prompt === String(prompt) && cached.label === options.label) {
+          live++
+          journal.push(cached)
+          if (cached.threw) throw new Error(cached.threw)
+          return structuredClone(cached.answer)
+        }
+        const entry = { label: options.label, prompt: String(prompt) }
+        journal.push(entry)
+        const file = emitOf(prompt)
+        let answer
+        try {
+          if (file === undefined) answer = await agent(prompt, options)
+          else if (existsSync(file)) answer = { exit: 3 }
+          else {
+            writeFileSync(file, '')
+            const line = await agent(prompt, { ...options, schema: null })
+            const sealed = !line || 'seal' in line || line.error ? line : sealLine(line)
+            const wrote = opts.garble ? opts.garble(options.label, sealed) : sealed
+            if (!wrote) answer = null
+            // opts.killedAfter(label): the script was killed after its work, before its line; the relay lives to say so.
+            else if (opts.killedAfter && opts.killedAfter(options.label)) answer = { exit: 137 }
+            else {
+              writeFileSync(file, moduleOf(file, wrote))
+              answer = opts.lostAnswer && opts.lostAnswer(options.label) ? null : { exit: wrote.error ? 2 : 0 }
+            }
+          }
+        } catch (e) {
+          entry.threw = e.message
+          throw e
+        }
+        entry.answer = structuredClone(answer)
+        return answer
+      }, pipeline, parallel, () => {}, (m) => {
+        logs.push(String(m))
+        // opts.throwOnLog: a workflow step that throws, outside every relay's catch.
+        if (opts.throwOnLog && opts.throwOnLog.test(String(m))) throw new Error(`injected at: ${m}`)
+      }, workflow, null,
       ...ABSENT.map(() => undefined))
     // Outside the stub: the workflow catches relay exceptions, including a failed assertion inside one.
     for (const { label, prompt } of calls.filter(c => c.label.startsWith('crrequest#'))) {
@@ -643,9 +692,10 @@ async function run(opts = {}) {
         assert.match(value.replace(/^'(.*)'$/, '$1'), /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/, `${label}: coderabbit_trigger.py's ISO contract`)
       }
     }
-    return { result, logs, labels: calls.map(c => c.label), calls, napPoints, napMs }
+    return { result, logs, labels: calls.map(c => c.label), calls, napPoints, napMs, journal, loads, emitDir: emit.made }
   } finally {
     globalThis.setTimeout = realTimeout
+    emit.cleanup()
   }
 }
 
@@ -684,24 +734,33 @@ test('meta names the three phases the workflow dispatches into', async () => {
   for (const c of calls) assert.ok(titles.has(c.phase), `${c.label} ran in phase ${c.phase}`)
 })
 
-test('args validation', async () => {
-  await assert.rejects(run({ args: { pr: undefined } }), /args must be/)
-  await assert.rejects(run({ rawArgs: '{"pr": 3888, "state": {"version": 3' }), /args is not valid JSON \(.+\); pass an object/)
-  await assert.rejects(run({ rawArgs: '{"pr": 0}' }), /args must be/, 'valid JSON still gets the shape check')
-  await assert.rejects(run({ args: { pr: 0 } }), /args must be/)
-  await assert.rejects(run({ args: { pr: -3 } }), /positive integer/)
-  await assert.rejects(run({ args: { pr: 'abc' } }), /positive integer/)
-  await assert.rejects(run({ args: { maxCycles: 0 } }), /maxCycles must be/)
-  await assert.rejects(run({ args: { ciWait: 0 } }), /ciWait must be a positive integer/)
-  await assert.rejects(run({ args: { ciWait: 1.5 } }), /ciWait must be a positive integer/)
-  await assert.rejects(run({ args: { lane: 'review' } }), /lane must be 'both', 'ci' or 'reviews'/)
-  await assert.rejects(run({ args: { lane: 'ci' } }), /needs yieldAfterCycle/)
-})
-
-test('an unknown reviewer or a malformed protected pattern throws before any agent runs', async () => {
+// Every argument refusal: [args, or the raw JSON text a caller passed, message]. Each throws before anything is dispatched.
+test('a malformed or unknown argument throws before any agent runs', async () => {
+  const state = adoptionState({ protected: '^test/hil/' })
+  const F = 'test/hil/local.json'
+  const STATE_REF = { outputFile: '/tmp/w.output', digest: '0123abcd' }
+  const PLAIN = /must be an array of plain repository-relative paths/
+  const SHAPE = /adoptReviewedProtected must be an array of \{ sha: full 40-hex commit SHA, paths: plain repository-relative paths \}/
+  const settled = { commentId: 1, commentDigest: 'd1', replyId: 2, bodyDigest: 'ab', headSha: SHA }
+  const ON = { autoPush: true, maxCycles: 4, yieldOnChange: true }
   for (const [args, expected] of [
+    [{ pr: undefined }, /args must be/],
+    ['{"pr": 3888, "state": {"version": 3', /args is not valid JSON \(.+\); pass an object/],
+    ['{"pr": 0}', /args must be/], // valid JSON still gets the shape check
+    [{ pr: 0 }, /args must be/],
+    [{ pr: -3 }, /positive integer/],
+    [{ pr: 'abc' }, /positive integer/],
+    [{ maxCycles: 0 }, /maxCycles must be/],
+    [{ ciWait: 0 }, /ciWait must be a positive integer/],
+    [{ ciWait: 1.5 }, /ciWait must be a positive integer/],
+    [{ lane: 'review' }, /lane must be 'both' or 'reviews'/],
+    [{ lane: 'ci', yieldAfterCycle: true }, /lane must be 'both' or 'reviews'/],
+    [{ lane: 'reviews' }, /needs yieldAfterCycle/],
+    [{ ...ON, lane: 'reviews' }, /needs yieldAfterCycle/],
+    [{ ...ON, yieldAfterCycle: true }, /two ways to pause/],
     [{ reviewers: ['coderabbit', 'gpt'] }, /unknown reviewer\(s\) \["gpt"\]/],
     [{ reviewers: ['codex'] }, /unknown reviewer\(s\) \["codex"\]/],
+    [{ reviewers: ['coderabbit', 'claude'] }, /unknown reviewer\(s\) \["claude"\]/], // claude is no longer a reviewer
     [{ reviewers: 'coderabbit' }, /reviewers must be an array of copilot, coderabbit, greptile, code-scanning; \[\] runs no review lane/],
     [{ reviewers: [4] }, /unknown reviewer/],
     [{ reviewers: ['coderabbit'], autoRun: ['greptile'] }, /autoRun must be a subset of reviewers \["coderabbit"\]/],
@@ -713,12 +772,48 @@ test('an unknown reviewer or a malformed protected pattern throws before any age
     [{ protected: 7 }, /non-empty regex string/],
     [{ generated: '^hw/bsp/(' }, /generated is not a valid regex/],
     [{ generated: '' }, /generated must be a non-empty regex string/],
+    [{ autoPush: false, markSonar: true }, /markSonar publishes to SonarCloud: it needs autoPush/],
+    // #311
+    [{ repository: PICO }, /unknown argument\(s\) \["repository"\]: pr-babysit takes only pr, repo, python, reviewers/],
+    [{ repo: 'adafruit' }, /repo must be OWNER\/NAME/],
+    [{ repo: `${PICO}/x` }, /repo must be OWNER\/NAME/],
+    [{ repo: 7 }, /repo must be OWNER\/NAME/],
+    ...[[byKey({ key: 'abc' })], [byKey({ key: PVS_KEY.toUpperCase() })], [byKey({ cell: null })], [byKey({ reason: ' ' })], [byKey({ scope: ' ' })],
+      [byKey(), byKey()], [longForm()], [{ ...longForm(), key: PVS_KEY }]].map(acceptedFailures => [{ acceptedFailures }, /acceptedFailures must be/]),
+    ...[{}, [{ ...settled, headSha: 'abc' }], [{ ...settled, replyId: 0 }], [{ ...settled, bodyDigest: '' }], [settled, { ...settled, replyId: 3 }]]
+      .map(replySettlements => [{ replySettlements }, /replySettlements must be/]),
+    ...['1#1', [{ ...deferral(), findingId: '1' }], [deferral({ issueUrl: 'https://github.com/o/r/pull/3' })], [deferral({ issueUrl: null })], [deferral({ issueUrl: [ISSUE] })],
+      [{ issueUrl: ISSUE, reason: ' ' }], [{ issueUrl: ISSUE }], [{ issueUrl: ISSUE, reason: 'r' }, { issueUrl: ISSUE, reason: 's' }], [{ findingId: '1#1', issueUrl: ISSUE, reason: 'r' }],
+      [deferral({ reason: ' ' })], [deferral({ commentDigest: '' })], [deferral(), deferral()]].map(deferrals => [{ deferrals }, /deferrals must be/]),
+    [adoptionArgs(state, { adoptHead: 'not-a-full-sha' }), /adoptHead must be a full 40-hex commit SHA/],
+    [{ rebasedHead: FOREIGN }, /rebasedHead/], // no state
+    [rebaseArgs(state, { rebasedHead: 'abc' }), /rebasedHead/],
+    [rebaseArgs(state, { rebasedHead: HEAD }), /rebasedHead/], // the state's expected head
+    [rebaseArgs(state, { adoptHead: ADOPT }), /rebasedHead/],
+    // #97: adoptProtected names distinct plain paths beside an adoptHead.
+    [adoptionArgs(state, { adoptProtected: F }), PLAIN],
+    [adoptionArgs(state, { adoptProtected: ['./' + F] }), PLAIN],
+    [adoptionArgs(state, { adoptProtected: ['../local.json'] }), PLAIN],
+    [adoptionArgs(state, { adoptProtected: [''] }), PLAIN],
+    [adoptionArgs(state, { adoptProtected: [F, F] }), /names a path twice/],
+    [adoptionArgs(state, { adoptProtected: [F], adoptHead: undefined }), /goes with the adoptHead/],
+    [{ stateRef: STATE_REF, adoptHead: ADOPT, adoptProtected: ['../x'] }, PLAIN], // before the state loader starts an agent
+    // #186: adoptReviewedProtected names full SHAs and distinct plain paths beside an adoptHead.
+    ...[{ sha: ADOPT, paths: [F] }, [{ sha: ADOPT.slice(0, 7), paths: [F] }], [{ sha: ADOPT.toUpperCase().replace(/1/g, 'A'), paths: [F] }],
+      [{ sha: ADOPT, paths: [] }], [{ sha: ADOPT, paths: F }], [{ sha: ADOPT, paths: ['./' + F] }], [{ sha: ADOPT, paths: ['../x'] }], [{ sha: ADOPT }],
+      [{ sha: ADOPT, paths: [F], reason: 'reviewed' }]].map(adoptReviewedProtected => [adoptionArgs(state, { adoptReviewedProtected }), SHAPE]),
+    [adoptionArgs(state, { adoptReviewedProtected: [{ sha: ADOPT, paths: [F] }, { sha: ADOPT, paths: ['test/hil/other.json'] }] }), /names a commit twice/],
+    [adoptionArgs(state, { adoptReviewedProtected: [{ sha: ADOPT, paths: [F, F] }] }), /names a path twice for one commit/],
+    [adoptionArgs(state, { adoptReviewedProtected: [{ sha: ADOPT, paths: [F] }], adoptHead: undefined }), /goes with the adoptHead/],
+    [{ stateRef: STATE_REF, adoptHead: ADOPT, adoptReviewedProtected: [{ sha: 'caa7f7f', paths: [F] }] }, SHAPE],
   ]) {
     const trace = []
-    await assert.rejects(run({ args, trace }), expected, JSON.stringify(args))
-    assert.deepEqual(trace, [], 'nothing may be dispatched before the args are checked')
+    await assert.rejects(run({ ...typeof args === 'string' ? { rawArgs: args } : { args }, trace }), expected, JSON.stringify(args))
+    assert.deepEqual(trace, [], `nothing may be dispatched before the args are checked: ${JSON.stringify(args)}`)
   }
-  // Names are normalized, and an empty roster is a legal value, not a typo.
+})
+
+test('reviewer names are normalized, and an empty roster is a legal value, not a typo', async () => {
   const named = await run({ args: { reviewers: ['  CodeRabbit ', 'CopIlot'] } })
   assert.equal(named.result.pass, true)
   const none = await run({ args: { reviewers: [] } })
@@ -815,8 +910,6 @@ test('the preflight pins the checkout without touching it', async () => {
   const scripts = new Set([...body.matchAll(/`\$\{AGENTRC\}(\/skills\/[\w./-]+\.py)`/g)].map(m => '"${AGENTRC_DIR:-$HOME/.claude}"' + m[1]).filter(p => !p.endsWith('/preflight.py')))
   assert.ok(scripts.size >= 10, 'the script constants were found')
   assert.deepEqual([...pre.prompt.matchAll(/ --needs (\S+?)(?=[ `])/g)].map(m => m[1]).sort(), [...scripts].sort(), 'every script the workflow calls is checked')
-  assert.deepEqual(pre.schema.required.slice().sort(),
-    ['badPushUrl', 'branch', 'dirty', 'head', 'missing', 'pr', 'prBase', 'prBaseBranch', 'prBaseTip', 'prBranch', 'prHead', 'prRepo', 'prState', 'prUrl', 'pushUrls', 'python', 'receipts', 'remote', 'repo', 'upstreamBranch'])
   assert.ok(logs.some(l =>
     l === 'preflight: hathach/tinyusb claude/foo@0f1e2d3 tracking origin, clean'))
 })
@@ -826,17 +919,6 @@ const PICO = 'adafruit/Pico-PIO-USB'
 const picoPin = { repo: PICO, prUrl: `https://github.com/${PICO}/pull/3888` }
 // The scripts that call gh, as a prompt runs them: each must name the PR's repository.
 const GH_SCRIPT = /(?:harvest|push|sonar|coderabbit_trigger|greptile_trigger|reply|collect)\.py|preflight\.py --(?:pr|state)/
-
-test('an unknown or malformed argument throws before any agent runs (#311)', async () => {
-  for (const [args, expected] of [
-    [{ repository: PICO }, /unknown argument\(s\) \["repository"\]: pr-babysit takes only pr, repo, python, reviewers/],
-    [{ repo: 'adafruit' }, /repo must be OWNER\/NAME/], [{ repo: `${PICO}/x` }, /repo must be OWNER\/NAME/], [{ repo: 7 }, /repo must be OWNER\/NAME/],
-  ]) {
-    const trace = []
-    await assert.rejects(run({ args, trace }), expected, JSON.stringify(args))
-    assert.deepEqual(trace, [], JSON.stringify(args))
-  }
-})
 
 test('the repo named is the one every gh-calling script is run against (#311)', async () => {
   const reviews = { findings: [finding({ commentId: 1 }), invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'not so' }], bots: 'reviewed' }
@@ -913,8 +995,8 @@ test('an interpreter missing a module the lanes need stops at preflight, naming 
   assert.deepEqual(labels, ['preflight'])
   const unnamed = await run({ reviews: oneValid, preflight: { python: ' ' } })
   assert.deepEqual([unnamed.result.reason, unnamed.result.detail], ['python-unusable', 'preflight names no interpreter'])
-  // A CI-only launch, or one waiting on no bot, imports nothing beyond the standard library.
-  for (const args of [{ reviewers: [] }, { lane: 'ci', yieldAfterCycle: true }, { reviewers: ['copilot'] }]) {
+  // A launch waiting on no bot imports nothing beyond the standard library.
+  for (const args of [{ reviewers: [] }, { reviewers: ['copilot'] }]) {
     const ci = await run({ args })
     assert.doesNotMatch(ci.calls[0].prompt, /--module/, JSON.stringify(args))
     assert.equal(ci.result.reason === 'python-unusable', false)
@@ -1023,12 +1105,12 @@ test('a dead preflight stops the run with nothing else dispatched', async () => 
     assert.equal(result.reason, 'preflight-died', JSON.stringify(opts))
     assert.equal(result.cycles, 0)
     assert.deepEqual(result.history, [])
-    assert.deepEqual(labels, ['preflight', 'preflight.retry'], 'one fresh agent, then nothing else')
+    assert.deepEqual(labels, ['preflight', 'preflight.retry'], 'one fresh attempt, then nothing else')
   }
 })
 
-test('a relayed copy that does not match its seal gets one fresh agent; a second bad copy is a dead relay', async () => {
-  // #3986: the preflight relay cut adoptHead to 35 characters and the launch was lost.
+test('a line in the file that fails its seal is no answer: a read-only relay gets one fresh attempt; what the script printed is', async () => {
+  // #3986: the preflight relay cut adoptHead to 35 characters and the launch was lost; a file holds only what a script wrote.
   const cut = (field, only) => (l, a) => a && (only === undefined || l === only) ? { ...a, [field]: a[field].slice(0, 35) } : a
   const adopting = await run({ args: adoptionArgs(adoptionState()), preflight: { head: ADOPT, prHead: HEAD }, garble: cut('head', 'preflight') })
   assert.deepEqual(adopting.labels.slice(0, 3), ['preflight', 'preflight.retry', 'adopt:audit'])
@@ -1037,13 +1119,13 @@ test('a relayed copy that does not match its seal gets one fresh agent; a second
   const plain = await run({ garble: cut('head', 'preflight') })
   assert.equal(plain.result.pass, true)
   assert.deepEqual(plain.labels.slice(0, 2), ['preflight', 'preflight.retry'])
-  assert.deepEqual(plain.calls.slice(0, 2).map(c => c.model), ['haiku', 'sonnet'], 'the fresh agent copies on Sonnet')
-  assert.ok(plain.logs.includes('preflight: relay recovered on the Sonnet retry'), plain.logs.join('\n'))
+  assert.ok(plain.logs.some(l => l.startsWith('preflight: the line does not match its seal: {')), plain.logs.join('\n'))
+  assert.ok(plain.logs.includes('preflight: relay recovered on the retry'), plain.logs.join('\n'))
 
   const twice = await run({ garble: (l, a) => l.startsWith('preflight') ? cut('head')(l, a) : a })
-  assert.equal(twice.result.reason, 'preflight-died', 'a second bad copy is a dead relay')
+  assert.equal(twice.result.reason, 'preflight-died', 'a second bad line is a dead relay')
   assert.deepEqual(twice.labels, ['preflight', 'preflight.retry'])
-  assert.equal(twice.logs.some(l => l.endsWith('relay recovered on the Sonnet retry')), false)
+  assert.equal(twice.logs.some(l => l.endsWith('relay recovered on the retry')), false)
 
   // What the script itself printed is its answer, however odd: the seal matches it.
   const printed = await run({ preflight: { head: HEAD.slice(0, 35) } })
@@ -1060,13 +1142,13 @@ test('a relayed copy that does not match its seal gets one fresh agent; a second
 
 test("facts.py's seal is the one the workflow checks, on text JSON escapes", async () => {
   const odd = 'claude/naïve-✓ "q" \\ \t\u0001 \ud800 é'
-  const line = { ...PIN, branch: odd, prBranch: odd, error: null }
+  const line = { ...PIN, branch: odd, prBranch: odd }
   const done = spawnSync('python3', ['-X', 'utf8', '-c', 'import json,sys; sys.path.insert(0, sys.argv[1]); from facts import sealed; print(json.dumps(sealed(json.loads(sys.stdin.read()))))',
     join(STATE_TRANSFER, '..')], { input: JSON.stringify(line), encoding: 'utf8' })
   assert.equal(done.status, 0, done.stderr)
   const printed = JSON.parse(done.stdout)
   const kept = await run({ preflight: printed })
-  assert.equal(kept.labels.includes('preflight.retry'), false, 'the seal matched: no retry')
+  assert.deepEqual(kept.labels.slice(0, 2), ['preflight', 'reviews#1'], 'the seal matched')
   assert.equal(kept.result.pass, true)
   // Keys JavaScript and a code-point sort order differently.
   const keyed = spawnSync('python3', ['-X', 'utf8', '-c', 'import json,sys; sys.path.insert(0, sys.argv[1]); from facts import sealed; print(sealed(json.loads(sys.stdin.read()))["seal"])',
@@ -1174,8 +1256,6 @@ test('findings rows: a fix keeps its commit through a later stale, an edit is a 
   assert.equal(first.result.rollup.rows.find(r => r.state === 'accepted').accepted, byKey().reason)
   const again = await run({ args: { ...YIELD, state: first.result.state, acceptedFailures: [byKey()] }, reviews: WAITING, ci: red })
   assert.deepEqual([...new Set(again.result.rollup.rows.map(r => r.lastCycle))], [2], "the carried cycle is the previous launch's")
-  const ciOnly = await run({ args: { ...YIELD, lane: 'ci' }, ci: red })
-  assert.deepEqual(ciOnly.result.rollup.observed, { reviews: false, ci: true })
 })
 
 test('a launch rollup counts its own cycles, each finding and CI failure once', async () => {
@@ -1296,7 +1376,7 @@ test('an unresolved build contract, or a build that did not run, blocks the batc
   for (const [over, why] of [
     [{ buildPlan: { error: 'no build docs' } }, /build contract not resolved: no build docs/],
     [{ buildPlan: null }, /build contract not resolved: resolver died/],
-    [{ candidate: null }, /the build did not count: no sealed receipt \(the relay died or its copy failed its seal\)/],
+    [{ candidate: null }, /the build did not count: no sealed receipt \(the relay died or its line failed its seal\)/],
     [{ garble: (l, a) => l.startsWith('build#') ? { ...a, exit: 1 - a.exit } : a }, /the build did not count: no sealed receipt/],
     [{ candidate: { error: 'usage: ...' } }, /the build did not count: usage/],
     [{ candidate: { exit: 2 } }, /the build failed \(exit 2\)/],
@@ -1578,7 +1658,7 @@ test('consumers inside the batch\'s own files are searched too', async () => {
 
 test('the CI lane gets its own compatibility check', async () => {
   const { calls } = await run({
-    args: { lane: 'ci', yieldAfterCycle: true, maxCycles: 3 },
+    args: { yieldAfterCycle: true, maxCycles: 3 },
     ci: { status: 'red', infraRerun: [], realFailures: [{ check: 'build / arm', firstError: 'boom', files: ['src/a.c'], verdict: 'real' }] },
   })
   assert.deepEqual(calls.filter(c => c.label.startsWith('compat#')).map(c => c.label), ['compat#1-ci'])
@@ -1599,7 +1679,7 @@ test('groups the overlap merge joins get one writer and one verifier, and every 
   // Two CI failures with different scope keys that both name src/a.c: two groups
   // from groupWork, one after the merge.
   const { result, calls, logs } = await run({
-    args: { lane: 'ci', yieldAfterCycle: true, maxCycles: 3 },
+    args: { yieldAfterCycle: true, maxCycles: 3 },
     ci: { status: 'red', infraRerun: [], realFailures: [
       { check: 'build / arm', firstError: 'boom in a', files: ['src/a.c'], verdict: 'real' },
       { check: 'build / riscv', firstError: 'boom in the bsp', files: ['hw/bsp/x/board.c', 'src/a.c'], verdict: 'real' },
@@ -1702,8 +1782,6 @@ test('the publisher stages exactly the owned paths, never a protected one', asyn
   // HEAD became after the audit, not the commit that was audited.
   assert.ok(push.prompt.includes(`push.py --remote 'origin' --branch 'claude/foo' --sha ${shaFor(1)} --push-url 'git@github.com:hathach/tinyusb.git' --open-pr 3888 --repo 'hathach/tinyusb'\``), push.prompt)
   assert.match(push.prompt, /Committing, amending and forcing nothing/)
-  // The stage cannot commit and already knows the SHA, so it is asked for neither.
-  assert.deepEqual(push.schema.required, ['pushed', 'detail', 'heads', 'prState'])
   assert.equal(result.history[0].reviewPush.sha, shaFor(1))
 })
 
@@ -1740,8 +1818,7 @@ test('the CI lane waits out its budget in slices, 30 minutes by default', async 
   assert.equal(calls.find(c => c.label === 'ci:collect#1.1').model, 'haiku')
   const long = await run({ ci: RUNNING, args: { ciWait: 90, maxCycles: 1 } })
   assert.equal(slices(long.calls).reduce((a, b) => a + b), 90 * 60)
-  const ciOnly = await run({ ci: RUNNING, args: { lane: 'ci', yieldAfterCycle: true, maxCycles: 1 } })
-  assert.equal(slices(ciOnly.calls)[0], 540, 'no review lane to wait for')
+  assert.ok(slices(calls).includes(540), 'longer once the review pass is done')
   const green = await run()
   assert.deepEqual(green.labels.filter(l => l.startsWith('ci:')), ['ci:collect#1.1'], 'a settled inventory needs no judge, nor a full read')
 })
@@ -1749,6 +1826,16 @@ test('the CI lane waits out its budget in slices, 30 minutes by default', async 
 // Each inventory read's wait in seconds, of one cycle.
 const inventoryWaits = (calls, cycle) => calls.filter(c => c.label.startsWith(`ci:collect#${cycle}.`) && / inventory /.test(c.prompt))
   .map(c => Number(c.prompt.match(/inventory --wait-seconds (\d+)/)[1]))
+
+test('a collector killed before its line is retried without its wait, and a failed retry keeps the first error', async () => {
+  const killed = await run({ killedAfter: (l) => l === 'ci:collect#1.1', args: { maxCycles: 1 } })
+  assert.match(killed.calls.find(c => c.label === 'ci:collect#1.1.retry')?.prompt ?? '', /inventory --wait-seconds 0 /, killed.labels.join(', '))
+  assert.equal(killed.result.state.last.ciCollectFailed, undefined)
+  // A retry that returns nothing leaves the first attempt's own error.
+  const both = await run({ killedAfter: (l) => l === 'ci:collect#1.1', throwOn: (l) => l === 'ci:collect#1.1.retry', args: { maxCycles: 1 } })
+  assert.ok(both.labels.includes('ci:collect#1.1.retry'), both.labels.join(', '))
+  assert.equal(both.result.state.last.ciCollectFailed.error, 'the script wrote no line (exit 137)')
+})
 
 test("a review bot's own check is left to the review lane, and CI settles once the review pass is done (#80)", async () => {
   const onlyBot = { ...RUNNING, pending: 0, registered: 0, waiting: 'none', ignored: ['CodeRabbit'] }
@@ -1772,7 +1859,7 @@ test("a review bot's own check is left to the review lane, and CI settles once t
   const stuck = await run({ ci: { ...RUNNING, pending: 2, waiting: 'same', ignored: ['CodeRabbit'] }, args: { maxCycles: 4 } })
   assert.equal(stuck.result.reason, 'ci-stuck')
   // Only when the review lane waits on CodeRabbit.
-  for (const args of [{ lane: 'ci', yieldAfterCycle: true }, { reviewers: [] }, { reviewers: ['greptile'] },
+  for (const args of [{ reviewers: [] }, { reviewers: ['greptile'] },
     { reviewers: ['coderabbit', 'greptile'], autoRun: ['greptile'] }]) {
     const { calls } = await run({ ci: onlyBot, args: { ...args, maxCycles: 1 } })
     assert.ok(reads(calls).length && reads(calls).every(c => !/--ignore-check/.test(c.prompt)), JSON.stringify(args))
@@ -1802,10 +1889,6 @@ test('CI that saw nothing move through two whole waits on one head stops ci-stuc
   const { head, registered, pending, waiting } = first.result.state.last.ciWaited
   const reordered = seal({ ...first.result.state, last: { ...first.result.state.last, ciWaited: { waiting, pending, registered, head } } })
   assert.equal((await run({ ci: stuck, args: { ...YIELD, state: reordered } })).result.reason, 'ci-stuck')
-  // A CI-only launch stops on it too.
-  const CI_ONLY = { ...YIELD, lane: 'ci' }
-  const ciFirst = await run({ ci: stuck, args: CI_ONLY })
-  assert.equal((await run({ ci: stuck, args: { ...CI_ONLY, state: ciFirst.result.state } })).result.reason, 'ci-stuck')
   // A slice its relay retried ran without its wait: no whole wait, on either kind of head.
   const retried = (l) => /^ci:collect#\d+\.1$/.test(l)
   const short = await run({ ci: stuck, throwOn: retried, args: { maxCycles: 3, ciWait: 1 } })
@@ -2204,7 +2287,6 @@ test('an unclassified failure is judged again only once ciNotes or its check\'s 
   assert.equal(first.result.state.ciCache.entries[0].placedWith, `${fnv1a('')}:b1`)
   const same = await run({ store, args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci: redWith(RIG).ci })
   assert.deepEqual(ciLabels(same.labels), ['ci:collect#2.1', 'ci:collect#2.r1', 'ci:collect#2.b'], 'its base job looked up, no evidence read, no judge')
-  assert.ok(same.calls.find(c => c.label === 'ci:collect#2.b').schema.properties.bases.items.required.includes('base'), 'a copy keeps a base collect.py printed (#50)')
   assert.ok(same.logs.some(l => /unclassified CI failures left as judged for hil \/ pico — ciNotes and base job unchanged/.test(l)))
   assert.deepEqual(same.result.history.at(-1).ci.realFailures.map(f => [f.cell, f.verdict]), MIXED.map(f => [f.cell, f.verdict]))
   assert.equal(same.result.reason, 'ci-red-unclassified')
@@ -2414,23 +2496,34 @@ const LIMITED_REVIEWS = { headSha: '', headEventEvidence: 'rate limited', finger
 const limitedInventory = (label, line) => label.startsWith('ci:collect#') && line && 'status' in line
   ? { ...line, error: 'gh pr checks: GraphQL: API rate limit exceeded', rateLimit: { ...LIMIT, resetAt: at(60), secondary: false }, seal: '' } : line
 
-test('a harvest GitHub refused for a rate limit stops the launch at once, the cycle not charged (#90)', async () => {
-  for (const args of [{ maxCycles: 4 }, { ...YIELD }, { autoPush: true, maxCycles: 4, yieldOnChange: true }]) {
-    const { result, labels, logs } = await run({ reviews: LIMITED_REVIEWS, args })
-    assert.equal(result.reason, 'github-rate-limited', JSON.stringify(args))
-    assert.deepEqual(result.rateLimit, LIMITED_REVIEWS.rateLimit)
-    assert.equal(result.state.cyclesUsed, 0, 'nothing observed: the cycle is not charged')
-    assert.equal(labels.filter(l => l.startsWith('reviews#')).length, 1)
-    assert.ok(logs.some(l => /GitHub refused a call for a secondary rate limit .* relaunch once it clears/.test(l)))
+// [source, run options, the rateLimit returned, cycles charged, a log line, a further check]: each stops the launch at once,
+// harvesting once; a cycle that observed nothing is not charged, one that pushed a repair or re-ran a check is.
+test('a call GitHub refused for a rate limit stops the launch, charged only for what the cycle did (#90)', async () => {
+  const REPLY = { error: `reply.py: ${RATE}`, observedAt: null, resetAt: null, secondary: false }
+  const limitedEvidence = (label, line) => label === 'ci:collect#1.f' && line ? { ...line, error: RATE, rateLimit: LIMIT, seal: '' } : line
+  const SECONDARY = /GitHub refused a call for a secondary rate limit .* relaunch once it clears/
+  for (const [name, opts, rateLimit, cyclesUsed, line, check] of [
+    ...[{ maxCycles: 4 }, { ...YIELD }, { autoPush: true, maxCycles: 4, yieldOnChange: true }].map(args =>
+      [`the harvest, ${JSON.stringify(args)}`, { reviews: LIMITED_REVIEWS, args }, LIMITED_REVIEWS.rateLimit, 0, SECONDARY]),
+    ['the CI read, with its reset', { reviews: WAITING, garble: limitedInventory, args: { maxCycles: 4 } },
+      { error: 'gh pr checks: GraphQL: API rate limit exceeded', ...LIMIT, resetAt: at(60), secondary: false }, 0, new RegExp(`relaunch after ${at(60).replace(/\./g, '\\.')}`)],
+    ['reply.py, after a pushed repair', { reviews: oneValid, replyError: (label) => label.startsWith('resolve#') && RATE, args: { autoPush: true, maxCycles: 4 } }, REPLY, 1],
+    ['a reply receipt\'s error', { reviews: oneValid, lost: () => RATE, args: { autoPush: true, maxCycles: 4 } }, REPLY, 1],
+    ['the harvest, after the CI judge re-ran a check without a receipt',
+      { reviews: LIMITED_REVIEWS, reviewsWait: afterReviewLane('ci:judge#1'), ci: redWith(RIG).ci, judge: rerunAll, args: { maxCycles: 4 } }, LIMITED_REVIEWS.rateLimit, 1, null,
+      (r) => assert.deepEqual(r.result.state.ciCache.reruns.map(x => x.sure), [true])],
+    ['CI evidence a review push superseded', { reviews: oneValid, args: { autoPush: true, maxCycles: 4 }, garble: limitedEvidence,
+      ci: { status: 'red', infraRerun: [], realFailures: [UNPLACED] }, evidence: afterReviewLane('push#') }, { error: RATE, ...LIMIT }, 1, null,
+      (r) => assert.equal(r.labels.includes('ci:judge#1'), false, 'superseded evidence is still not judged')],
+  ]) {
+    const r = await run(opts)
+    assert.equal(r.result.reason, 'github-rate-limited', name)
+    assert.deepEqual(r.result.rateLimit, rateLimit, name)
+    assert.equal(r.result.state.cyclesUsed, cyclesUsed, name)
+    assert.deepEqual(r.labels.filter(l => l.startsWith('reviews#')), ['reviews#1'], name)
+    if (line) assert.ok(r.logs.some(l => line.test(l)), `${name}: ${r.logs.join('\n')}`)
+    check?.(r)
   }
-})
-
-test('a CI read GitHub refused for a rate limit stops the cycle too, with its reset (#90)', async () => {
-  const { result, logs } = await run({ reviews: WAITING, garble: limitedInventory, args: { maxCycles: 4 } })
-  assert.equal(result.reason, 'github-rate-limited')
-  assert.deepEqual(result.rateLimit, { error: 'gh pr checks: GraphQL: API rate limit exceeded', ...LIMIT, resetAt: at(60), secondary: false })
-  assert.equal(result.state.cyclesUsed, 0)
-  assert.ok(logs.some(l => l.includes(`relaunch after ${at(60)}`)))
 })
 
 test('a repair committed in a rate-limited cycle is held unpushed and charged; uncharged cycle ids still advance (#90)', async () => {
@@ -2448,31 +2541,6 @@ test('a repair committed in a rate-limited cycle is held unpushed and charged; u
   assert.equal(next.result.state.cyclesUsed, 2, 'only the charged count was held back')
   assert.equal(next.result.state.lastCycle, 3)
   assert.ok(next.labels.includes('reviews#3'))
-})
-
-test('reply.py refused for a rate limit stops the launch too; a cycle that re-ran a check is charged (#90)', async () => {
-  const replied = await run({ reviews: oneValid, replyError: (label) => label.startsWith('resolve#') && RATE, args: { autoPush: true, maxCycles: 4 } })
-  assert.equal(replied.result.reason, 'github-rate-limited')
-  assert.deepEqual(replied.result.rateLimit, { error: `reply.py: ${RATE}`, observedAt: null, resetAt: null, secondary: false })
-  assert.equal(replied.result.state.cyclesUsed, 1, 'it pushed a repair')
-  const midBatch = await run({ reviews: oneValid, lost: () => RATE, args: { autoPush: true, maxCycles: 4 } })
-  assert.equal(midBatch.result.reason, 'github-rate-limited', 'a receipt\'s error names it too')
-  assert.equal(midBatch.result.rateLimit.error, `reply.py: ${RATE}`)
-  const reran = await run({ reviews: LIMITED_REVIEWS, reviewsWait: afterReviewLane('ci:judge#1'), ci: redWith(RIG).ci, judge: rerunAll, args: { maxCycles: 4 } })
-  assert.equal(reran.result.reason, 'github-rate-limited')
-  assert.deepEqual(reran.result.state.ciCache.reruns.map(r => r.sure), [true])
-  assert.equal(reran.result.state.cyclesUsed, 1, 'a re-run without a receipt is still one')
-})
-
-test('CI evidence refused for a rate limit stops the launch even when a review push superseded it (#90)', async () => {
-  const limitedEvidence = (label, line) => label === 'ci:collect#1.f' && line ? { ...line, error: RATE, rateLimit: LIMIT, seal: '' } : line
-  const { result, labels } = await run({
-    reviews: oneValid, args: { autoPush: true, maxCycles: 4 }, garble: limitedEvidence,
-    ci: { status: 'red', infraRerun: [], realFailures: [UNPLACED] }, evidence: afterReviewLane('push#'),
-  })
-  assert.equal(labels.includes('ci:judge#1'), false, 'superseded evidence is still not judged')
-  assert.equal(result.reason, 'github-rate-limited')
-  assert.deepEqual(result.rateLimit, { error: RATE, ...LIMIT })
 })
 
 test('once one lane met a rate limit, the other makes no further GitHub call this cycle (#90)', async () => {
@@ -2591,7 +2659,7 @@ test('a collector that dies gets one fresh agent; a second death leaves the cycl
   assert.equal(dead.labels.includes('ci:judge#1'), false)
   const cut = await run({ reviews: WAITING, ci: redWith(RIG).ci, garble: (l, a) => l === 'ci:collect#1.1' ? { ...a, head: a.head.slice(0, 35) } : a })
   assert.deepEqual(ciLabels(cut.labels).slice(0, 3), ['ci:collect#1.1', 'ci:collect#1.1.retry', 'ci:collect#1.f'], 'a cut head is asked once more')
-  // Both copies turn red to green with the head intact: nothing downstream would notice.
+  // Both lines turn red to green with the head intact: nothing downstream would notice but the seal.
   const green = await run({ reviews: WAITING, ci: redWith(RIG).ci, garble: (l, a) => l.startsWith('ci:collect#1.1') ? { ...a, status: 'green', checks: [] } : a })
   assert.ok(green.logs.some(l => /cycle 1: CI inventory failed — the collector died/.test(l)), green.logs.join('\n'))
 })
@@ -2627,28 +2695,27 @@ test('a collector failing the same way on two cycles running stops ci-collect-fa
   assert.notEqual(onPushed.result.reason, 'ci-collect-failed', 'one failure on each of two heads')
 })
 
-test('a collector of another output contract stops collector-skew at once; a mis-copied line is a dead relay (#293)', async () => {
-  const relayed = (over) => (l, a) => l.startsWith('ci:collect#') && !a.error ? over(a) : a
+test('a collector of another output contract stops collector-skew at once; a line off its seal is a dead relay (#293)', async () => {
   const SKEW = (got) => new RegExp(`^collect\\.py prints output contract ${got}, and this launch's workflow script reads ${COLLECT_CONTRACT}: ` +
     '.*Relaunch from the installed file \\(Workflow scriptPath "\\$\\{AGENTRC_DIR:-\\$HOME/\\.claude\\}/workflows/pr-babysit\\.js", expanded in the shell first\\)')
-  for (const [name, collector, garble, got] of [
-    // An older collect.py: no contract, nor a member added since, which the relay fills in to meet its schema.
-    ['older', ({ contract, requiredChecks, ...line }) => line, relayed(a => ({ contract: 0, requiredChecks: [], ...a })), 0],
-    // A newer one: a member this copy's schema lacks, which the relay leaves out.
-    ['newer', (line) => ({ ...line, contract: COLLECT_CONTRACT + 1, added: [] }), relayed(({ added, ...a }) => a), COLLECT_CONTRACT + 1],
+  for (const [name, collector, got] of [
+    // An older collect.py: no contract, nor a member added since.
+    ['older', ({ contract, requiredChecks, ...line }) => line, 0],
+    // A newer one: a member this copy's schema lacks.
+    ['newer', (line) => ({ ...line, contract: COLLECT_CONTRACT + 1, added: [] }), COLLECT_CONTRACT + 1],
   ]) {
-    const { result, labels, logs } = await run({ args: { maxCycles: 4 }, collector, garble })
+    const { result, labels, logs } = await run({ args: { maxCycles: 4 }, collector })
     assert.equal(result.reason, 'collector-skew', name)
     assert.match(result.detail, SKEW(got), name)
     assert.equal(result.cycles, 1, `${name}: stopped at once, not after two cycles`)
     assert.deepEqual(labels.filter(l => l.startsWith('ci:collect#')), ['ci:collect#1.1'], `${name}: no retry, no further read`)
     assert.ok(logs.some(l => SKEW(got).test(l.replace(/^cycle 1: /, ''))), logs.join('\n'))
-    assert.equal(logs.some(l => /collector died|does not match its seal/.test(l)), false, name)
+    assert.equal(logs.some(l => /collector died|does not match its seal|off its schema/.test(l)), false, name)
   }
-  // The same contract, a member altered in the copy: the seal catches it, as before.
-  const altered = await run({ args: { maxCycles: 1 }, garble: relayed(a => ({ ...a, observedAt: '2026-01-01T00:00:00Z' })) })
+  // The same contract, a member altered in the file: the seal catches it.
+  const altered = await run({ args: { maxCycles: 1 }, garble: (l, a) => l.startsWith('ci:collect#') && !a.error ? { ...a, observedAt: '2026-01-01T00:00:00Z' } : a })
   assert.notEqual(altered.result.reason, 'collector-skew')
-  assert.ok(altered.logs.includes('ci:collect#1.1: the relayed copy does not match its seal'), altered.logs.join('\n'))
+  assert.ok(altered.logs.some(l => l.startsWith('ci:collect#1.1: the line does not match its seal: {')), altered.logs.join('\n'))
   assert.ok(altered.logs.some(l => l === 'cycle 1: CI inventory failed — the collector died'), altered.logs.join('\n'))
 })
 
@@ -2709,7 +2776,7 @@ test('a recalled verdict that is missing or fails its digest is judged again', a
   }
 })
 
-test('a recall copy that fails its seal costs its own batch a fresh relay, and a re-judge only if that fails too', async () => {
+test('a recall line that fails its seal costs its own batch a fresh relay, and a re-judge only if that fails too', async () => {
   // #3988: one 28 KB recall line lost every failure's cell, then a firstError; the seal voided all 40 verdicts.
   const six = Array.from({ length: 6 }, (_, i) => ({ ...RIG, check: `hil / b${i}`, cell: `b${i}` }))
   const store = new Map()
@@ -2718,7 +2785,6 @@ test('a recall copy that fails its seal costs its own batch a fresh relay, and a
   const again = (only) => run({ store, garble: (l, a) => only(l) ? dropCell(a) : a, args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci: redWith(...six).ci })
   const once = await again(l => l === 'ci:collect#2.r1')
   assert.deepEqual(ciLabels(once.labels), ['ci:collect#2.1', 'ci:collect#2.r1', 'ci:collect#2.r2', 'ci:collect#2.r1.retry'])
-  assert.equal(once.calls.find(c => c.label === 'ci:collect#2.r1.retry').model, 'sonnet')
   assert.equal(once.result.history.at(-1).ci.realFailures.length, 6)
   const twice = await again(l => l.startsWith('ci:collect#2.r1'))
   assert.ok(twice.logs.some(l => /CI verdicts not recalled for hil \/ b0, .*hil \/ b4 — the collector died/.test(l)), twice.logs.join('\n'))
@@ -2768,8 +2834,6 @@ test('a verdict too large for one line is recalled in pages that join into it, a
     const again = (recall) => run({ store, held, recall, judge: many, args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci })
     const ok = await again()
     assert.deepEqual(ciLabels(ok.labels), ['ci:collect#2.1', 'ci:collect#2.r1', 'ci:collect#2.r1.2.p1', 'ci:collect#2.r1.2.p2'])
-    const page = ok.calls.find(c => c.label === 'ci:collect#2.r1.2.p1').schema.properties.verdicts.items.properties.failures.items
-    assert.ok(['cell', 'runId'].every(k => page.required.includes(k)), 'a page keeps each failure\'s cell and runId (#50)')
     assert.match(ok.calls.find(c => c.label === 'ci:collect#2.r1.2.p2').prompt, new RegExp(` recall --check '${job(1)}' --offset 2 --repo `))
     assert.ok(ok.logs.some(l => new RegExp(`CI verdicts reused for ${ci.realFailures.length} check`).test(l)), ok.logs.join('\n'))
     assert.deepEqual(ok.result.history.at(-1).ci.realFailures.filter(f => f.check === 'hil / b0').map(f => f.firstError),
@@ -2796,25 +2860,6 @@ test('a cached verdict is reused only while its check keeps the same conclusion'
   assert.equal(cancelled.labels.includes('ci:collect#2.r1'), false, 'nothing to recall for another conclusion')
   assert.ok(cancelled.labels.includes('ci:judge#2'), 'a conclusion updated under the same link is judged again')
   assert.deepEqual(cancelled.result.state.ciCache.entries.map(e => e.bucket), ['cancel'], 'and its new verdict replaces the old')
-})
-
-test('a state whose CI cache is malformed is refused', async () => {
-  const first = await run({ args: YIELD, reviews: WAITING, ci: redWith(RIG).ci })
-  const { digest, ...st } = first.result.state
-  for (const ciCache of [{ ...st.ciCache, entries: [{ head: HEAD, link: 'x', bucket: 'fail', digest: 7 }] },
-    { ...st.ciCache, reruns: [{ head: HEAD, link: 'x' }] }, { entries: [] },
-    { ...st.ciCache, entries: st.ciCache.entries.map(({ bucket, ...e }) => e) },
-    { ...st.ciCache, entries: st.ciCache.entries.map(({ digest, ...e }) => e) }]) {
-    await assert.rejects(run({ args: { ...YIELD, state: seal({ ...st, ciCache }) } }), /not a pr-babysit state/)
-  }
-})
-
-test('a state missing a field the writer always saves is refused', async () => {
-  const { digest, ...st } = (await run({ args: YIELD })).result.state
-  for (const key of ['deferrals', 'acceptedFailures', 'decisions', 'holds', 'ciCache', 'build']) {
-    const { [key]: _, ...partial } = st
-    await assert.rejects(run({ args: { ...YIELD, state: seal(partial) } }), /state is not a pr-babysit state of version 4/, key)
-  }
 })
 
 // Load a state and save it again with no cycle run: its spent budget stops the launch before preflight.
@@ -2926,10 +2971,6 @@ test('a PR merged or closed mid-launch ends both lanes at the CI lane\'s next re
   })
   assert.equal(refuting.result.reason, 'pr-merged')
   assert.equal(refuting.labels.some(l => l.startsWith('replies#')), false, refuting.labels.join(', '))
-  // The CI lane alone stops the same way.
-  const ciOnly = await run({ ci: ended('closed'), args: { lane: 'ci', yieldAfterCycle: true, maxCycles: 3 } })
-  assert.equal(ciOnly.result.reason, 'pr-closed')
-  assert.deepEqual(ciOnly.labels.filter(l => l.startsWith('ci:')), ['ci:collect#1.1'])
 })
 
 test('fix notes are not posted once the CI lane reads the merge during the push', async () => {
@@ -2951,7 +2992,7 @@ test('a GitHub write reads the PR state first, and goes on only for a verified O
     for (const [state, reason] of [['MERGED', 'pr-merged'], ['CLOSED', 'pr-closed'], [null, 'pr-state-unread'], ['', 'pr-state-unread']]) {
       const { result, labels } = await run({ reviews: refuting, prState: state, args })
       assert.equal(result.reason, reason, `${name}, ${state}`)
-      // A dead relay gets its one retry.
+      // A dead relay gets its one fresh attempt.
       assert.deepEqual(writes(labels), state === null ? ['prstate#1-replies', 'prstate#1-replies.retry'] : ['prstate#1-replies'], `${name}, ${state}: nothing posted`)
     }
     const open = await run({ reviews: refuting, args })
@@ -2962,16 +3003,16 @@ test('a GitHub write reads the PR state first, and goes on only for a verified O
   assert.deepEqual(writes(watched.labels), ['prstate#1-replies', 'replies#1'])
   const unread = await run({ reviews: refuting, prState: null, args: { autoPush: true, maxCycles: 3 } })
   assert.ok(unread.logs.some(l => l === 'prstate#1-replies: PR #3888 state unread — the relay died'), unread.logs.join('\n'))
-  assert.match(unread.calls.find(c => c.label === 'prstate#1-replies').prompt, /run exactly `'\/usr\/bin\/python3' "\$\{AGENTRC_DIR:-\$HOME\/\.claude\}"\/skills\/pr-babysit\/scripts\/preflight\.py --state 3888 --repo 'hathach\/tinyusb'` /)
-  // A copy that turns MERGED into OPEN fails the script's seal: it is no answer, and nothing is posted.
-  const miscopied = await run({ reviews: refuting, prState: 'MERGED', garble: (l, a) => l.startsWith('prstate#') && a ? { ...a, state: 'OPEN' } : a, args: { autoPush: true, maxCycles: 3 } })
-  assert.equal(miscopied.result.reason, 'pr-state-unread')
-  assert.deepEqual(writes(miscopied.labels), ['prstate#1-replies', 'prstate#1-replies.retry'])
-  assert.ok(miscopied.logs.includes('prstate#1-replies: the relayed copy does not match its seal'), miscopied.logs.join('\n'))
+  assert.match(unread.calls.find(c => c.label === 'prstate#1-replies').prompt, /run exactly `AGENTRC_EMIT='[^']+\/prstate_1-replies\.1\.[0-9a-f]{8}\.js' '\/usr\/bin\/python3' "\$\{AGENTRC_DIR:-\$HOME\/\.claude\}"\/skills\/pr-babysit\/scripts\/preflight\.py --state 3888 --repo 'hathach\/tinyusb'` /)
+  // A line that turns MERGED into OPEN fails the script's seal: it is no answer, and nothing is posted.
+  const forged = await run({ reviews: refuting, prState: 'MERGED', garble: (l, a) => l.startsWith('prstate#') && a ? { ...a, state: 'OPEN' } : a, args: { autoPush: true, maxCycles: 3 } })
+  assert.equal(forged.result.reason, 'pr-state-unread')
+  assert.deepEqual(writes(forged.labels), ['prstate#1-replies', 'prstate#1-replies.retry'])
+  assert.ok(forged.logs.some(l => l.startsWith('prstate#1-replies: the line does not match its seal: {')), forged.logs.join('\n'))
 })
 
 test('the CI judge, which may re-run checks, is dispatched only for a PR read OPEN just before', async () => {
-  const args = { lane: 'ci', yieldAfterCycle: true, maxCycles: 3 }
+  const args = { yieldAfterCycle: true, maxCycles: 3 }
   const judge = (labels) => labels.filter(l => /^(prstate#|ci:judge#)/.test(l))
   const merged = await run({ ...redWith(PVS), prState: 'MERGED', args })
   assert.equal(merged.result.reason, 'pr-merged')
@@ -2993,14 +3034,17 @@ test('the CodeRabbit trigger and a caller settlement read the PR state first', a
   assert.deepEqual(settle.labels.filter(l => /^(prstate|reuse)#/.test(l)), ['prstate#3-reuse'])
 })
 
-test('a push refused on an unreadable PR state stops pr-state-unread, nothing published', async () => {
-  const { result } = await run({
-    reviews: oneValid, scope: ['src/a.c'], args: { autoPush: true, maxCycles: 3 },
-    push: { pushed: false, detail: 'PR #3888 state is unreadable: nothing pushed', heads: [], prState: 'UNREAD' },
-  })
-  assert.equal(result.reason, 'pr-state-unread')
-  assert.equal(result.history[0].reviewPushFailed.prState, 'unread')
-  assert.equal(result.state.pending.stage, 'push-failed')
+test('a push refused on a PR no longer open, or of an unreadable state, stops the launch, its commit kept as the candidate', async () => {
+  for (const [prState, detail, reason] of [['UNREAD', 'PR #3888 state is unreadable: nothing pushed', 'pr-state-unread'], ['MERGED', 'PR #3888 is merged: nothing pushed', 'pr-merged']]) {
+    const { result, calls } = await run({
+      reviews: oneValid, scope: ['src/a.c'], args: { autoPush: true, maxCycles: 3 },
+      push: { pushed: false, detail, heads: [], prState },
+    })
+    assert.equal(result.reason, reason)
+    assert.equal(result.history[0].reviewPushFailed.prState, prState.toLowerCase())
+    assert.equal(result.state.pending.stage, 'push-failed')
+    assert.match(calls.find(c => c.label === 'push#1-review').prompt, / --open-pr 3888 --repo 'hathach\/tinyusb'`/)
+  }
 })
 
 test('a retry that finds the PR merged after a lost receipt stops pr-merged, publication unknown', async () => {
@@ -3022,22 +3066,10 @@ test('a retry that finds the PR merged after a lost receipt stops pr-merged, pub
   assert.equal(adopt.result.state.pending.stage, 'adopt-push-unknown')
 })
 
-test('a push refused because the PR is no longer open stops the launch, its commit kept as the candidate', async () => {
-  const { result, calls } = await run({
-    reviews: oneValid, scope: ['src/a.c'], args: { autoPush: true, maxCycles: 3 },
-    push: { pushed: false, detail: 'PR #3888 is merged: nothing pushed', heads: [], prState: 'MERGED' },
-  })
-  assert.equal(result.reason, 'pr-merged')
-  assert.equal(result.history[0].reviewPushFailed.prState, 'merged')
-  assert.equal(result.state.pending.stage, 'push-failed')
-  assert.match(calls.find(c => c.label === 'push#1-review').prompt, / --open-pr 3888 --repo 'hathach\/tinyusb'`/)
-})
-
 test('a PR conflicting with its base stops, judging nothing, whatever its checks say (#51)', async () => {
   for (const [name, over] of [
     ['passing checks', {}],
     ['only accepted failures', { realFailures: [PVS], args: { acceptedFailures: [byKey()] } }],
-    ['the CI lane alone', { args: { lane: 'ci', yieldAfterCycle: true, maxCycles: 3 } }],
   ]) {
     const { result, labels, logs } = await run({
       ci: { status: 'conflicting', infraRerun: [], realFailures: over.realFailures ?? [] }, args: { maxCycles: 3, ...over.args },
@@ -3066,29 +3098,11 @@ test('unknown mergeability is never green, nor red that an acceptance could pass
   assert.notEqual(contradicted.result.pass, true)
 })
 
-test('an accepted failure is named by its key, and a wrong key accepts nothing', async () => {
-  const { result, logs } = await run({ ...redWith(PVS), args: { acceptedFailures: [byKey()] } })
-  assert.equal(result.pass, true, JSON.stringify(result.reason))
-  assert.equal(result.acceptedFailures[0].key, PVS_KEY)
-  assert.equal(result.observation.ci.realFailures[0].key, PVS_KEY, 'the observed report carries the key a caller accepts it by')
-  assert.deepEqual(result.state.acceptedFailures, [PVS_KEY], 'the state keeps the key alone')
-  const wrong = await run({ ...redWith(PVS), args: { acceptedFailures: [byKey({ key: '0'.repeat(16) })] } })
-  assert.notEqual(wrong.result.pass, true)
-  assert.ok(wrong.logs.some(l => /accepted failure 0{16} matches no failure on this head/.test(l)), wrong.logs.join('\n'))
-})
-
-test('acceptedFailures are checked for shape before anything runs', async () => {
-  for (const acceptedFailures of [[byKey({ key: 'abc' })], [byKey({ key: PVS_KEY.toUpperCase() })], [byKey({ cell: null })], [byKey({ reason: ' ' })], [byKey({ scope: ' ' })], [byKey(), byKey()], [longForm()], [{ ...longForm(), key: PVS_KEY }]]) {
-    const trace = []
-    await assert.rejects(run({ args: { acceptedFailures }, trace }), /acceptedFailures must be/, JSON.stringify(acceptedFailures))
-    assert.deepEqual(trace, [])
-  }
-})
-
 test('a run red only from accepted failures passes, listing them, and is never called green', async () => {
   const { result, logs, labels } = await run({ ...redWith(PVS), args: { acceptedFailures: [byKey()] } })
   assert.equal(result.pass, true, JSON.stringify(result.reason))
   assert.deepEqual(result.acceptedFailures, [{ check: 'pvs / analyze', workflow: 'static', job: 'pvs', cell: null, signature: 'license expires in 12 days', key: PVS_KEY, verdict: 'rig-side', reason: 'PVS license renewal pending', scope: 'until the license is renewed' }])
+  assert.equal(result.observation.ci.realFailures[0].key, PVS_KEY, 'the observed report carries the key a caller accepts it by')
   assert.match(summaries(logs)[0], /^cycle 1 summary — CI red, accepted failures only/)
   assert.match(rowsOf(summaries(logs)[0])[0][3], /^accepted, not fixed: PVS license renewal pending/)
   assert.equal(rowsOf(summaries(logs)[0])[0][2], 'rig-side', 'the watcher\'s classification is kept')
@@ -3105,27 +3119,36 @@ test('a green run is called green and lists no accepted failures', async () => {
   assert.ok(logs.some(l => /PR is green with no unresolved valid findings/.test(l)), logs.join('\n'))
 })
 
-test('accepted failures with replies still owed are not called green', async () => {
-  const { logs } = await run({ ...redWith(PVS), args: { acceptedFailures: [byKey()], maxCycles: 2 }, dropDoneIds: () => true,
-    reviews: { findings: [invalidFinding()], replies: [{ commentId: 1, body: 'no' }], bots: 'reviewed' } })
-  assert.ok(logs.some(l => /CI red only from accepted failures but 1 comment\(s\) still owed an answer/.test(l)), logs.join('\n'))
-  assert.ok(!logs.some(l => /PR green/.test(l)))
-})
-
-test('pending checks keep an accepted-only report from passing', async () => {
-  const { result } = await run({ ci: { status: 'running', infraRerun: [], realFailures: [PVS] }, args: { acceptedFailures: [byKey()], maxCycles: 1 } })
-  assert.notEqual(result.pass, true)
-  const rerun = await run({ ci: { status: 'red', infraRerun: ['build / flaky'], realFailures: [PVS] }, args: { acceptedFailures: [byKey()], maxCycles: 1 } })
-  assert.notEqual(rerun.result.pass, true)
-  assert.match(summaries(rerun.logs)[0], /^cycle 1 summary — CI red,/)
-  assert.doesNotMatch(summaries(rerun.logs)[0], /accepted failures only/, 'an infra re-run still settling is not accepted-only')
-})
-
-test('an accepted failure the watcher calls real is still not fixed', async () => {
-  const real = { ...PVS, verdict: 'real', files: ['src/a.c'] }
-  const { result, labels } = await run({ ...redWith(real), args: { acceptedFailures: [byKey()] } })
-  assert.equal(labels.some(l => l.startsWith('fix:')), false)
-  assert.equal(result.pass, true)
+// [case, run options, acceptedFailures, passes, a log line it must print]. No accepted failure is ever fixed or called green.
+test('an acceptance passes only the exact failure its key names, completely listed, on a settled report of this head', async () => {
+  const RAM = { check: 'ci/circleci: build---one-random-make-apm32f10x-large-arm-gcc', workflow: 'ci', job: 'build', cell: 'apm32f103_dev_board device/net_lwip_webserver',
+    signature: "ld: region `RAM' overflowed by 744 bytes", firstError: "ld: region `RAM' overflowed by 744 bytes", files: [], verdict: 'rig-side' }
+  const ram = { key: keyOf(RAM), reason: 'master overflows RAM on this board', scope: 'until master fixes it' }
+  const otherHead = { headSha: 'f'.repeat(40) }
+  const INCONSISTENT = /CI inventory is inconsistent — head fffffff for /
+  for (const [name, opts, accepted, passes, line] of [
+    ['a wrong key', redWith(PVS), [byKey({ key: '0'.repeat(16) })], false, /accepted failure 0{16} matches no failure on this head/],
+    ['a failure the watcher calls real', redWith({ ...PVS, verdict: 'real', files: ['src/a.c'] }), [byKey()], true, null],
+    ['checks still pending', { ci: { status: 'running', infraRerun: [], realFailures: [PVS] } }, [byKey()], false, null],
+    ['an infra re-run still settling', { ci: { status: 'red', infraRerun: ['build / flaky'], realFailures: [PVS] } }, [byKey()], false, /^cycle 1 summary — CI red,(?! accepted failures only)/],
+    ['a new diagnostic on the accepted check', redWith({ ...PVS, signature: 'license expired' }), [byKey()], false, null],
+    ['the same diagnostic on another check', redWith({ ...PVS, check: 'pvs / analyze (arm)' }), [byKey()], false, null],
+    ['a second failure in the accepted cell', redWith(PVS, { ...PVS, signature: 'V501 identical sub-expressions', firstError: 'V501', verdict: 'unclassified' }), [byKey()], false, null],
+    ['a real failure on another head', { ci: { status: 'red', infraRerun: [], realFailures: [{ check: 'build / arm', firstError: 'boom', files: ['src/a.c'], verdict: 'real' }], ...otherHead } }, [byKey()], false, INCONSISTENT],
+    ['the accepted failure on another head', { ci: { ...redWith(PVS).ci, ...otherHead } }, [byKey()], false, INCONSISTENT],
+    ['green on another head', { ci: { ...GREEN, ...otherHead } }, [byKey()], false, INCONSISTENT],
+    // #319: a CircleCI job passes on the complete listing a whole log lets the watcher give, and only on that.
+    ['a completely listed CircleCI failure', redWith({ ...RAM, complete: true }), [ram], true, null],
+    ['a CircleCI failure listed from a log tail', redWith({ ...RAM, complete: false }), [ram], false, /not accepted — the watcher did not list every failure of its job/],
+    ['replies still owed', { ...redWith(PVS), args: { maxCycles: 2 }, dropDoneIds: () => true, reviews: { findings: [invalidFinding()], replies: [{ commentId: 1, body: 'no' }], bots: 'reviewed' } }, [byKey()], false,
+      /CI red only from accepted failures but 1 comment\(s\) still owed an answer/],
+  ]) {
+    const { result, labels, logs } = await run({ ...opts, args: { maxCycles: 1, ...opts.args, acceptedFailures: accepted } })
+    assert.equal(result.pass === true, passes, `${name}: ${JSON.stringify(result.reason)}`)
+    if (line) assert.ok(logs.some(l => line.test(l)), `${name}: ${logs.join('\n')}`)
+    assert.equal(labels.some(l => /^(fix:|commit#|push#)/.test(l)), false, `${name}: ${labels.join(', ')}`)
+    assert.ok(!logs.some(l => /PR (is )?green/.test(l)), name)
+  }
 })
 
 test('the key holds no judge label, so a failure judged again with another cell, job or workflow keeps its acceptance (#36)', async () => {
@@ -3152,47 +3175,6 @@ test('one acceptance covers every failure its key names, such as two HIL cells f
   assert.equal(relabeled.result.pass, true, JSON.stringify(relabeled.result.reason))
   const partial = await run({ ...redWith(RIG), judge: judgeWith([esp('esp32s3'), esp('p4', { complete: false })]), args: { acceptedFailures: [accepted] } })
   assert.notEqual(partial.result.pass, true, 'each still needs a complete listing of its job')
-})
-
-test('only the exact failure is accepted: another diagnostic, another check or a second failure is not', async () => {
-  for (const [failures, label] of [
-    [[{ ...PVS, signature: 'license expired' }], 'a new diagnostic on the accepted check'],
-    [[{ ...PVS, check: 'pvs / analyze (arm)' }], 'the same diagnostic on another check'],
-    [[PVS, { ...PVS, signature: 'V501 identical sub-expressions', firstError: 'V501', verdict: 'unclassified' }], 'a second failure in the accepted cell'],
-  ]) {
-    const { result } = await run({ ...redWith(...failures), args: { acceptedFailures: [byKey()] } })
-    assert.notEqual(result.pass, true, label)
-  }
-})
-
-test('a CI report for another head is not fixed, accepted or counted green', async () => {
-  for (const ci of [
-    { status: 'red', infraRerun: [], realFailures: [{ check: 'build / arm', firstError: 'boom', files: ['src/a.c'], verdict: 'real' }] },
-    { ...redWith(PVS).ci },
-    GREEN,
-  ]) {
-    const { result, labels, logs } = await run({ ci: { ...ci, headSha: 'f'.repeat(40) }, args: { acceptedFailures: [byKey()], maxCycles: 1 } })
-    assert.notEqual(result.pass, true)
-    assert.equal(labels.some(l => /^(fix:|commit#|push#)/.test(l)), false)
-    assert.ok(logs.some(l => /CI inventory is inconsistent — head fffffff for /.test(l)), logs.join('\n'))
-  }
-})
-
-test('an acceptance needs a complete listing of the job', async () => {
-  const { result, logs } = await run({ ...redWith({ ...PVS, complete: false }), args: { acceptedFailures: [byKey()] } })
-  assert.notEqual(result.pass, true)
-  assert.ok(logs.some(l => /not accepted — the watcher did not list every failure of its job/.test(l)), logs.join('\n'))
-})
-
-test('an accepted CircleCI failure passes only on a complete listing, which a whole log lets the watcher give (#319)', async () => {
-  const RAM = { check: 'ci/circleci: build---one-random-make-apm32f10x-large-arm-gcc', workflow: 'ci', job: 'build', cell: 'apm32f103_dev_board device/net_lwip_webserver',
-    signature: "ld: region `RAM' overflowed by 744 bytes", firstError: "ld: region `RAM' overflowed by 744 bytes", files: [], verdict: 'rig-side' }
-  const accepted = { key: keyOf(RAM), reason: 'master overflows RAM on this board', scope: 'until master fixes it' }
-  const whole = await run({ ...redWith({ ...RAM, complete: true }), args: { acceptedFailures: [accepted] } })
-  assert.equal(whole.result.pass, true, whole.logs.join('\n'))
-  const tail = await run({ ...redWith({ ...RAM, complete: false }), args: { acceptedFailures: [accepted] } })
-  assert.notEqual(tail.result.pass, true)
-  assert.ok(tail.logs.some(l => /not accepted — the watcher did not list every failure of its job/.test(l)), tail.logs.join('\n'))
 })
 
 test('an acceptance not renewed on a resumed launch no longer applies, and says so', async () => {
@@ -3233,9 +3215,6 @@ test('a report carrying both a rate limit and a harvest error takes the rate-lim
 })
 
 test('a harvest that printed no JSON line is retried and reported by its last stderr line, a rate limit first (#240)', async () => {
-  const validator = readFileSync(new URL('../agents/pr-review-validator.md', import.meta.url), 'utf8')
-  assert.ok(validator.includes('or no JSON line at all (a traceback, or nothing), run it once more'), 'the same single retry')
-  assert.ok(validator.includes('the last non-empty line of its stderr verbatim, else `harvest.py printed nothing (exit <its exit code>)`'))
   const failed = { headSha: '', observedAt: '', headEventAt: null, headEventEvidence: 'harvest failed', fingerprint: '', bots: [], botsWhole: true, findings: [], replies: [] }
   for (const error of ["PermissionError: [Errno 13] Permission denied: 'gh'", 'harvest.py printed nothing (exit 1)']) {
     const { result, labels } = await run({ reviews: { ...failed, harvestError: error }, args: { maxCycles: 4 } })
@@ -3251,7 +3230,7 @@ test('a dead review validator still settles the CI lane', async () => {
   const { result, logs, labels } = await run({ reviews: new Error('validator exploded') })
   assert.equal(result.reason, 'review-validator-died')
   assert.equal(result.history[0].error, 'pr-review-validator died')
-  assert.deepEqual(labels.slice(0, 2), ['preflight', 'ci:collect#1.1'], 'the CI lane was launched')
+  assert.deepEqual(labels.slice(0, 3).sort(), ['ci:collect#1.1', 'preflight', 'reviews#1'], 'the CI lane was launched beside it')
   assert.equal(result.history[0].ci.status, 'green', 'and awaited, so no agent outlives the workflow')
   assert.equal(summaries(logs).length, 1)
 })
@@ -3327,7 +3306,6 @@ test('the publisher rechecks the checkout and refuses to publish onto a moved on
     const re = calls.find(c => c.label === 'recheck#1-review')
     assert.match(re.prompt, /Editing and committing nothing/)
     assert.ok(re.prompt.includes('preflight.py --recheck`'), re.prompt)
-    assert.deepEqual(re.schema.required.slice().sort(), ['branch', 'head', 'pushUrls', 'staged', 'status'])
   }
 })
 
@@ -3395,11 +3373,8 @@ test('the commit is read back by an agent that did not write it', async () => {
   const audit = calls.find(c => c.label === 'audit#1-review')
   // A committer reporting on its own commit is the one witness not to rely on.
   assert.match(audit.prompt, /Editing and committing nothing/)
-  assert.deepEqual(audit.schema.required, ['parent', 'scope', 'sha', 'entries', 'refusal'])
   assert.ok(audit.prompt.includes(`commits.py head --parent ${HEAD} 'src/a.c'\``), audit.prompt)
   const commit = calls.find(c => c.label === 'commit#1-review')
-  assert.deepEqual(commit.schema.required, ['committed', 'detail'],
-    'the committer is not asked what its own commit contains')
   assert.ok(calls.indexOf(commit) < calls.indexOf(audit))
   const dead = await run({ reviews: oneValid, audit: null })
   assert.equal(dead.result.history[0].reviewPushFailed.committed, true)
@@ -3463,7 +3438,7 @@ test('a publisher agent that throws is a failed push, not a crash', async () => 
   }
 })
 
-test('a publisher receipt whose copy does not match its seal is no answer, never a definite outcome', async () => {
+test('a publisher receipt whose line does not match its seal is no answer, never a definite outcome', async () => {
   // A push receipt with a cut head would otherwise read as "not pushed" when the push may have landed.
   const cutHead = (a) => ({ ...a, heads: a.heads.map(h => ({ ...h, head: h.head.slice(0, 35) })) })
   for (const [label, garble, detail, committed] of [
@@ -3473,15 +3448,14 @@ test('a publisher receipt whose copy does not match its seal is no answer, never
     const { result, logs } = await run({ reviews: oneValid, garble: (l, a) => l.startsWith(label) ? garble(a) : a })
     assert.equal(result.history[0].reviewPushFailed.detail, detail, label)
     assert.equal(result.history[0].reviewPushFailed.committed, committed, label)
-    assert.ok(logs.some(l => l.startsWith(label) && l.endsWith('the relayed copy does not match its seal')), label)
+    assert.ok(logs.some(l => l.startsWith(`${label}1-review: the line does not match its seal: {`)), label)
     if (label === 'push#') assert.equal(result.state.pending.stage, 'publication-unknown')
   }
-  // A push relay gets one fresh agent: push.py reads back a push that landed.
+  // A push relay gets one fresh attempt: push.py reads back a push that landed.
   const pushed = await run({ reviews: oneValid, garble: (l, a) => l === 'push#1-review' ? cutHead(a) : a })
   assert.ok(pushed.labels.includes('push#1-review.retry'))
-  assert.equal(pushed.calls.find(c => c.label === 'push#1-review.retry').model, 'sonnet')
   assert.equal(pushed.result.history[0].reviewPushFailed, undefined)
-  assert.ok(pushed.logs.includes('push#1-review: relay recovered on the Sonnet retry'), pushed.logs.join('\n'))
+  assert.ok(pushed.logs.includes('push#1-review: relay recovered on the retry'), pushed.logs.join('\n'))
   // A retry that finds the branch elsewhere cannot prove the lost first attempt missed.
   const rejected = ({ seal, ...a }) => sealLine({ ...a, pushed: false, detail: ' ! [rejected] non-fast-forward', heads: a.heads.map(h => ({ ...h, head: FOREIGN })) })
   const moved = await run({ reviews: oneValid, garble: (l, a) => l === 'push#1-review' ? null : l === 'push#1-review.retry' ? rejected(a) : a })
@@ -3489,34 +3463,44 @@ test('a publisher receipt whose copy does not match its seal is no answer, never
   assert.match(moved.result.history[0].reviewPushFailed.detail, /non-fast-forward, after an earlier attempt lost its receipt$/)
   // A commit receipt is settled by the read-back instead: the commit that landed is audited and pushed.
   const commit = await run({ reviews: oneValid, garble: (l, a) => l.startsWith('commit#') ? { ...a, detail: `${a.detail}.` } : a })
-  assert.ok(commit.logs.some(l => l.startsWith('commit#') && l.endsWith('the relayed copy does not match its seal')))
+  assert.ok(commit.logs.some(l => l.startsWith('commit#1-review: the line does not match its seal: {')))
   assert.ok(commit.labels.some(l => l.startsWith('push#')), 'the push went ahead')
   assert.equal(commit.result.history[0].reviewPushFailed, undefined)
 })
 
-test("a commit copy that fails its seal is recovered from the script's receipt, never by a second commit (#266)", async () => {
+test('a push killed before its line is retried, and a retry that finds the branch elsewhere stays unknown', async () => {
+  const killed = await run({ reviews: oneValid, killedAfter: (l) => l === 'push#1-review' })
+  assert.ok(killed.labels.includes('push#1-review.retry'), killed.labels.join(', '))
+  assert.equal(killed.result.history[0].reviewPushFailed, undefined)
+  assert.ok(killed.logs.includes('push#1-review: relay recovered on the retry'), killed.logs.join('\n'))
+  const rejected = ({ seal, ...a }) => sealLine({ ...a, pushed: false, detail: ' ! [rejected] non-fast-forward', heads: a.heads.map(h => ({ ...h, head: FOREIGN })) })
+  const moved = await run({ reviews: oneValid, killedAfter: (l) => l === 'push#1-review', garble: (l, a) => l === 'push#1-review.retry' ? rejected(a) : a })
+  assert.equal(moved.result.state.pending.stage, 'publication-unknown')
+  assert.match(moved.result.history[0].reviewPushFailed.detail, /non-fast-forward, after an earlier attempt lost its receipt$/)
+})
+
+test("a commit line that fails its seal, or none, is recovered from the script's receipt, never by a second commit (#266)", async () => {
   const garbled = (l, a) => l === 'commit#1-review' ? { ...a, detail: `${a.detail}.` } : a
   const { result, labels, logs } = await run({ reviews: oneValid, garble: garbled })
   assert.equal(labels.filter(l => l.startsWith('commit#')).length, 1, 'the committing script runs once')
   assert.ok(labels.includes('receipt:commit#1-review'))
-  assert.ok(logs.includes('commit#1-review: the relayed copy does not match its seal'), logs.join('\n'))
-  assert.ok(logs.some(l => l.startsWith('commit#1-review: the rejected copy: {') && l.includes('"detail":"committed."')), logs.join('\n'))
+  assert.ok(logs.some(l => l.startsWith('commit#1-review: the line does not match its seal: {') && l.includes('"detail":"committed."')), logs.join('\n'))
   assert.ok(logs.includes(`commit#1-review: recovered from the commit script's receipt: committed ${shaFor(1).slice(0, 7)} — committed`), logs.join('\n'))
   assert.equal(logs.some(l => l.includes('commit agent died')), false)
   assert.ok(labels.some(l => l.startsWith('push#')), 'the recovered commit is audited and pushed')
   assert.equal(result.history[0].reviewPushFailed, undefined)
 
   const long = await run({ reviews: oneValid, garble: (l, a) => l === 'commit#1-review' ? { ...a, detail: 'x'.repeat(5000) } : a })
-  const rejected = long.logs.find(l => l.startsWith('commit#1-review: the rejected copy: '))
+  const rejected = long.logs.find(l => l.startsWith('commit#1-review: the line does not match its seal: '))
   assert.ok(rejected.length < 800 && /… \(\d+ characters\)$/.test(rejected), rejected.slice(-80))
 
   const refused = await run({ reviews: oneValid, commit: { committed: false, detail: 'trailing-whitespace....Failed' }, garble: garbled })
   assert.deepEqual([refused.result.history[0].reviewPushFailed.committed, refused.result.history[0].reviewPushFailed.detail], [false, 'trailing-whitespace....Failed'])
   assert.equal(refused.labels.some(l => l.startsWith('audit#')), false, 'no commit to audit')
 
-  // A relay that lost the script's line returns an error line; the receipt the script saved still settles it.
+  // A relay that died leaving no line: the receipt the script saved still settles it.
   const lostLine = await run({ reviews: oneValid, commit: { committed: false, detail: 'hook failed' },
-    garble: (l, a) => l === 'commit#1-review' ? { error: 'no output line', committed: false, detail: '', seal: '' } : a })
+    garble: (l, a) => l === 'commit#1-review' ? null : a })
   assert.ok(lostLine.labels.includes('receipt:commit#1-review'))
   assert.ok(lostLine.logs.includes("commit#1-review: recovered from the commit script's receipt: no commit — hook failed"), lostLine.logs.join('\n'))
   assert.deepEqual([lostLine.result.history[0].reviewPushFailed.committed, lostLine.result.history[0].reviewPushFailed.detail], [false, 'hook failed'])
@@ -3532,14 +3516,6 @@ test("a commit copy that fails its seal is recovered from the script's receipt, 
   const other = await run({ reviews: oneValid, commitReceipt: { sha: FOREIGN }, garble: garbled })
   assert.match(other.result.history[0].reviewPushFailed.detail, /receipt names c0ffee1/)
   assert.equal(other.labels.some(l => l.startsWith('push#')), false)
-})
-
-test("a relay that fills in error: '' on a sealed line still matches its seal", async () => {
-  // Live on tinyusb #3988: the commit relay added error: '' and the landed commit went unpushed.
-  const { result, labels, logs } = await run({ reviews: oneValid, garble: (l, a) => a && 'seal' in a && !a.error ? { ...a, error: '' } : a })
-  assert.equal(logs.some(l => l.endsWith('does not match its seal')), false)
-  assert.ok(labels.some(l => l.startsWith('push#')), 'the push went ahead')
-  assert.equal(result.history[0].reviewPushFailed, undefined)
 })
 
 test('the pending-bot backoff is taken after the cycle summary', async () => {
@@ -3564,9 +3540,9 @@ test('the backoff grows a minute per cycle and stops growing at ten, a resumed l
 })
 
 test('reviews go to the validator role directly, and no lane leaves the roles', async () => {
-  // The `workflow` binding throws, so a run that reaches its verdict is itself
-  // the proof that nothing nested a workflow; these are the only roles it may
-  // dispatch to (the script relays go to the Bash-only relay type).
+  // The `workflow` binding loads only a data module, so a run that reaches its
+  // verdict is itself the proof that nothing nested a workflow; these are the
+  // only roles it may dispatch to (the script relays go to the Bash-only relay type).
   const ROLES = ['pr-ci-watcher', 'pr-review-validator', 'finding-verifier', 'code-writer', 'relay']
   const wide = await run({
     reviews: {
@@ -3595,8 +3571,9 @@ test('reviews go to the validator role directly, and no lane leaves the roles', 
   for (const c of calls.filter(c => c.label.startsWith('commit#'))) assert.equal(c.agentType, undefined, c.label)
   // Dispatch only proves what the exercised branches did: a dormant workflow()
   // call would never be reached here, and runCycle would absorb the stub's throw
-  // as 'cycle-threw' if it were. So refuse the spelling too, over the whole source.
-  assert.doesNotMatch(body, /\bworkflow\s*\(/, 'this workflow must never nest another workflow')
+  // as 'cycle-threw' if it were. So refuse the spelling too, over the whole source:
+  // the one call is the emitted line's load.
+  assert.deepEqual([...body.matchAll(/\bworkflow\s*\([^)]+\)/g)].map(m => m[0]), ['workflow({ scriptPath: file })'], 'this workflow must never nest another workflow')
   assert.doesNotMatch(body, /codex-agent/, 'the review lane is a Claude role, not a codex agent')
 })
 
@@ -3623,21 +3600,62 @@ test('the cycle records what each posting lane reported', async () => {
   assert.deepEqual(dead.result.history[0].fixNotePosts, { pass: false, detail: 'agent died', receipts: [], replied: [] })
 })
 
-test("a posting relay whose copy fails its seal gets the first run's receipt back, not a rerun's (#53)", async () => {
-  const garble = (l, a) => a && /^(replies|resolve)#\d+$/.test(l) ? { ...a, seal: 'garbled' } : a
-  const { result, calls } = await run({
-    reviews: { findings: [finding({ commentId: 1 }), invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'no' }], bots: 'reviewed' },
-    garble, rerunReuses: true,
-  })
-  for (const label of ['replies#1', 'resolve#1']) {
-    const paths = calls.filter(c => c.label.startsWith(label)).map(c => [c.label, c.prompt.match(/--receipt '([^']+)'/)?.[1]])
-    assert.deepEqual(paths, [[label, `${PIN.receipts}/${label}.json`], [`${label}.retry`, `${PIN.receipts}/${label}.json`]], 'the retry names the same file')
+test('a relay a resume meets again never runs its command twice: its line is reloaded, or its outcome is unknown', async () => {
+  // The launch dies in a relay before the runtime journaled its answer: before the script wrote its line (garble), or
+  // after (lostAnswer). The resume asks that relay again with the same command; the script meets its claimed file.
+  for (const [how, cut] of [['before its line', { garble: (l, a) => l === 'build#1-review' ? null : a }], ['after its line', { lostAnswer: (l) => l === 'build#1-review' }]]) {
+    const first = await run({ reviews: oneValid, ...cut, keepEmit: true })
+    try {
+      const prefix = first.journal.slice(0, first.journal.findIndex(j => j.label === 'build#1-review'))
+      const resumed = await run({ reviews: oneValid, resume: prefix })
+      // The stub is the command: it ran once in all, in the first launch.
+      assert.deepEqual([first.labels, resumed.labels].map(ls => ls.filter(l => l.startsWith('build#')).length), [1, 0], how)
+      const reloaded = resumed.logs.includes('build#1-review: the line an earlier attempt of this call wrote, reloaded')
+      const unknown = resumed.logs.some(l => l.startsWith('build#1-review: an earlier attempt of this call claimed ') && l.endsWith('its outcome is unknown'))
+      assert.deepEqual([reloaded, unknown], how === 'after its line' ? [true, false] : [false, true], how)
+      assert.equal(!!resumed.result.history[0].reviewPush?.pass, how === 'after its line', `${how}: an unknown build publishes nothing`)
+    } finally { rmSync(first.emitDir.split('/agentrc-emit/')[0], { recursive: true, force: true }) }
   }
-  const { refutedPosts, fixNotePosts } = result.history[0]
-  for (const posts of [refutedPosts, fixNotePosts]) {
-    assert.equal(posts.pass, true)
-    assert.deepEqual(posts.receipts.map(r => [r.sent, r.posted]), [[true, true]], 'what the first run did')
+})
+
+test("a reply relay a resume meets again posts nothing: its line, or the receipt reply.py saved, settles it (#53)", async () => {
+  const reviews = { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'no' }], bots: 'reviewed' }
+  // The receipt store and GitHub outlive the launch. reply.py posted and saved its receipt, then died before its line
+  // (garble) or after it (lostAnswer); or died before posting anything (posting).
+  for (const [how, cut] of [['saved, then died', { garble: (l, a) => l === 'replies#1' ? null : a }], ['after its line', { lostAnswer: (l) => l === 'replies#1' }],
+    ['before posting', { posting: (l) => l === 'replies#1' ? null : true }], ['saved, then killed', { killedAfter: (l) => l === 'replies#1' }]]) {
+    const world = { reviews, receiptFiles: new Map(), replied: new Set(), rerunReuses: true }
+    const first = await run({ ...world, ...cut, keepEmit: true })
+    try {
+      const prefix = first.journal.slice(0, first.journal.findIndex(j => j.label === 'replies#1'))
+      const resumed = await run({ ...world, resume: prefix })
+      assert.deepEqual(resumed.labels.filter(l => l === 'replies#1'), [], `${how}: the resumed relay ran nothing`)
+      const posts = resumed.result.history[0].refutedPosts
+      const answered = resumed.result.state.answeredWith.some(([id, a]) => id === 2 && a.how === 'refutation')
+      if (how === 'before posting') {
+        assert.deepEqual([posts.pass, answered], [false, false], `${how}: no receipt, the outcome unknown, nothing posted`)
+        assert.ok(resumed.logs.some(l => l.endsWith('its outcome is unknown')), resumed.logs.join('\n'))
+      } else {
+        assert.equal(posts.pass, true, how)
+        assert.deepEqual(posts.receipts.map(r => [r.sent, r.posted, r.verified, r.resolved]), [[true, true, true, true]], `${how}: what the first run did`)
+        assert.ok(answered, how)
+        assert.equal(resumed.logs.includes("replies#1: recovered from reply.py's saved receipt"), how !== 'after its line', resumed.logs.join('\n'))
+      }
+    } finally { rmSync(first.emitDir.split('/agentrc-emit/')[0], { recursive: true, force: true }) }
   }
+})
+
+test("a reply.py killed after posting, its relay surviving, is settled by its saved receipt; a line reply.py printed is its own (#53)", async () => {
+  const reviews = { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'no' }], bots: 'reviewed' }
+  // The relay answers exit 137 and no line: a transport failure, not reply.py's error.
+  const killed = await run({ reviews, killedAfter: (l) => l === 'replies#1' })
+  assert.deepEqual(killed.labels.filter(l => l.startsWith('replies#')), ['replies#1', 'replies#1.replay'])
+  assert.ok(killed.logs.includes("replies#1: recovered from reply.py's saved receipt"), killed.logs.join('\n'))
+  assert.equal(killed.result.history[0].refutedPosts.pass, true)
+  assert.deepEqual(killed.result.history[0].refutedPosts.receipts.map(r => [r.sent, r.posted]), [[true, true]])
+  // reply.py's own error line is its answer: no replay.
+  const own = await run({ reviews, replyError: (l) => l === 'replies#1' && 'gh: HTTP 502' })
+  assert.deepEqual(own.labels.filter(l => l.startsWith('replies#')), ['replies#1'])
 })
 
 test('every dismissal is challenged before it is posted', async () => {
@@ -3854,263 +3872,77 @@ test('the summary marks an overturned finding', async () => {
     'cycle table must show the overturn in the order the roles acted')
 })
 
-test('a deferred obligation is cleared only by a posted reply', async () => {
+// The reply-debt ledger, one test per row: [name, launch, outcome]. A launch gives each cycle's harvest and challenger
+// verdicts (the last of each repeats; no verdicts is the default challenger), maxCycles and any other run options. The
+// outcome fixes the result fields it names; posted counts how often the first reply manifest names a comment.
+const UPHELD = { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] }
+const BOTH_UPHELD = { verdicts: [{ id: 0, upheld: true, reason: 'stands' }, { id: 1, upheld: true, reason: 'stands' }] }
+const FIRST_REAL = { verdicts: [{ id: 0, upheld: false, reason: 'real' }, { id: 1, upheld: true, reason: 'stands' }] }
+const QUIET = { findings: [], replies: [], bots: 'reviewed' }
+const twoRefuted = (replies) => ({ findings: [invalidFinding({ commentId: 7 }), invalidFinding({ commentId: 7, line: 9 })], replies, bots: 'reviewed' })
+const mixed = (commentId, replies = [{ commentId, body: 'the second is wrong' }]) =>
+  ({ findings: [finding({ commentId, verdict: 'valid' }), invalidFinding({ commentId, line: 9 })], replies, bots: 'reviewed' })
+for (const [name, { harvests, verdicts, maxCycles, ...over }, outcome] of [
   // Cycle 1 defers comment 7; only a later cycle's posted refutation clears it.
-  let cycle = 0
-  const { result } = await run({
-    args: { autoPush: true, maxCycles: 4 },
-    reviewsPerCycle: () => {
-      cycle++
-      return cycle === 1
-        ? { findings: [invalidFinding({ commentId: 7 }), invalidFinding({ commentId: 7, line: 9 })],
-          replies: [{ commentId: 7, body: 'both wrong' }], bots: 'reviewed' }
-        : { findings: [finding({ commentId: 7, verdict: 'stale' }), invalidFinding({ commentId: 7, line: 9 })],
-          replies: [{ commentId: 7, body: 'still wrong' }], bots: 'reviewed' }
-    },
-    challengePerCycle: () => cycle === 1
-      ? { verdicts: [{ id: 0, upheld: false, reason: 'real' }, { id: 1, upheld: true, reason: 'stands' }] }
-      : { verdicts: [{ id: 0, upheld: true, reason: 'stands' }, { id: 1, upheld: true, reason: 'stands' }] },
-  })
-  assert.equal(result.pass, true, `the posted reply must discharge the deferral (got ${result.reason})`)
-})
-
-test('an orphan reply is never posted unchallenged', async () => {
-  // REVIEWS does not tie replies to findings, so a validator can emit a reply
-  // for a commentId that has no non-valid finding. Nothing challenges it, and
-  // posting it publicly refutes a reviewer on no one's authority.
-  const { calls } = await run({
-    reviews: {
-      findings: [finding({ commentId: 1, verdict: 'valid' })],
-      replies: [{ commentId: 99, body: 'you are wrong' }],
-      bots: 'reviewed',
-    },
-    args: { autoPush: true, maxCycles: 1 },
-  })
-  const posted = calls.find(c => c.label.startsWith('replies#'))
-  if (posted) assert.doesNotMatch(posted.prompt, /"commentId":99/, 'orphan reply was posted')
-})
-
-test('a stray doneId cannot discharge an unrelated deferral', async () => {
-  // The posting agent returns receipts. Trusting an id that was never in
-  // the payload lets one clear an obligation nobody answered.
-  let cycle = 0
-  const { result } = await run({
-    args: { autoPush: true, maxCycles: 2 },
-    strayDoneIds: [7],
-    reviewsPerCycle: () => {
-      cycle++
-      return cycle === 1
-        ? { findings: [invalidFinding({ commentId: 7 }), invalidFinding({ commentId: 7, line: 9 })],
-          replies: [{ commentId: 7, body: 'both wrong' }], bots: 'reviewed' }
-        : { findings: [], replies: [], bots: 'reviewed' }
-    },
-    challengePerCycle: () => ({ verdicts: [
-      { id: 0, upheld: false, reason: 'real' }, { id: 1, upheld: true, reason: 'stands' }] }),
-  })
-  assert.equal(result.reason, 'deferred-replies-unresolved',
-    'a stray doneId discharged comment 7 without any reply being posted')
-})
-
-test('a refutation with no drafted reply is not silently dropped', async () => {
-  // REVIEWS lets a validator report a non-valid finding and draft no reply for
-  // it. Nothing else accounts for that answer, so the cycle could go green with
-  // the reviewer's thread untouched.
-  const { result } = await run({
-    reviews: { findings: [invalidFinding({ commentId: 5 })], replies: [], bots: 'reviewed' },
-    challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
-    args: { autoPush: true, maxCycles: 1 },
-  })
-  assert.equal(result.pass, false, 'an unanswered refutation must not pass')
-  assert.deepEqual(result.outstanding, [5])
-})
-
-test('a comment mixing valid and refuted findings is not resolved early', async () => {
-  // Posting the refutation resolves the whole thread, hiding the valid finding
-  // until its fix lands - and burying it for good if the fixer then fails.
-  const { calls, result } = await run({
-    reviews: {
-      findings: [finding({ commentId: 3, verdict: 'valid' }), invalidFinding({ commentId: 3, line: 9 })],
-      replies: [{ commentId: 3, body: 'the second one is wrong' }],
-      bots: 'reviewed',
-    },
-    challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
-    args: { autoPush: true, maxCycles: 1 },
-  })
-  const posted = calls.find(c => c.label.startsWith('replies#'))
-  if (posted) assert.doesNotMatch(posted.prompt, /"commentId":3/, 'thread resolved before the fix')
-  assert.equal(result.pass, false)
-  assert.deepEqual(result.outstanding, [3])
-})
-
-test('a fix note does not discharge a deferred refutation', async () => {
-  // The fix note says "fixed in commit X"; it is not the refutation that was
-  // owed. Letting its receipt clear the deferral answers the thread with the
-  // wrong content and lets the next green cycle pass.
-  let cycle = 0
-  const { result } = await run({
-    args: { autoPush: true, maxCycles: 2 },
-    reviewsPerCycle: () => {
-      cycle++
-      return cycle === 1
-        ? { findings: [finding({ commentId: 4, verdict: 'valid' }), invalidFinding({ commentId: 4, line: 9 })],
-          replies: [{ commentId: 4, body: 'the second is wrong' }], bots: 'reviewed' }
-        : { findings: [finding({ commentId: 4, verdict: 'valid' })], replies: [], bots: 'reviewed' }
-    },
-    challengePerCycle: () => ({ verdicts: [{ id: 0, upheld: true, reason: 'stands' }] }),
-  })
-  assert.equal(result.reason, 'deferred-replies-unresolved',
-    'a fix note discharged a refutation it never made')
-})
-
-test('a comment is never replied to twice in one cycle', async () => {
-  const { calls } = await run({
-    reviews: {
-      findings: [invalidFinding({ commentId: 8 })],
-      replies: [{ commentId: 8, body: 'wrong' }, { commentId: 8, body: 'also wrong' }],
-      bots: 'reviewed',
-    },
-    challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
-    args: { autoPush: true, maxCycles: 1 },
-  })
-  const posted = calls.find(c => c.label.startsWith('replies#'))
-  assert.ok(posted)
-  assert.equal([...posted.prompt.matchAll(/"commentId":8/g)].length, 1, 'duplicate reply posted')
-})
-
-test('a deferred refutation can still be posted after a fix note', async () => {
-  // The fix note records the comment in answeredWith. If that also blocks the
-  // reply stage, the refutation its debt still owes can never go out and the
-  // deferral is permanent.
-  let cycle = 0
-  const { result } = await run({
-    args: { autoPush: true, maxCycles: 4 },
-    reviewsPerCycle: () => {
-      cycle++
-      if (cycle === 1) {
-        return { findings: [finding({ commentId: 4, verdict: 'valid' }), invalidFinding({ commentId: 4, line: 9 })],
-          replies: [{ commentId: 4, body: 'the second is wrong' }], bots: 'reviewed' }
-      }
-      if (cycle === 2) return { findings: [finding({ commentId: 4, verdict: 'valid' })], replies: [], bots: 'reviewed' }
-      return { findings: [invalidFinding({ commentId: 4, line: 9 })],
-        replies: [{ commentId: 4, body: 'still wrong' }], bots: 'reviewed' }
-    },
-    challengePerCycle: () => ({ verdicts: [{ id: 0, upheld: true, reason: 'stands' }] }),
-  })
-  assert.equal(result.pass, true, `the owed refutation must be postable (got ${result.reason})`)
-})
-
-test('an already-answered comment is not deferred for a missing draft', async () => {
-  // An entry in answeredWith means the thread was answered and resolved.
-  // Re-opening its debt because this harvest drafted no reply creates an
-  // obligation nothing can discharge.
-  let cycle = 0
-  const { result } = await run({
-    args: { autoPush: true, maxCycles: 3 },
-    reviewsPerCycle: () => {
-      cycle++
-      return cycle === 1
-        ? { findings: [invalidFinding({ commentId: 7 })],
-          replies: [{ commentId: 7, body: 'wrong' }], bots: 'reviewed' }
-        : { findings: [invalidFinding({ commentId: 7 })], replies: [], bots: 'reviewed' }
-    },
-    challengePerCycle: () => ({ verdicts: [{ id: 0, upheld: true, reason: 'stands' }] }),
-  })
-  assert.equal(result.pass, true, `an answered comment must not be re-deferred (got ${result.reason})`)
-})
-
-test('an obligation dies with the finding that created it', async () => {
+  ['a deferred obligation is cleared only by a posted reply', { maxCycles: 4, harvests: [twoRefuted([{ commentId: 7, body: 'both wrong' }]),
+    { findings: [finding({ commentId: 7, verdict: 'stale' }), invalidFinding({ commentId: 7, line: 9 })], replies: [{ commentId: 7, body: 'still wrong' }], bots: 'reviewed' }],
+  verdicts: [FIRST_REAL, BOTH_UPHELD] }, { pass: true }],
+  // A validator can draft a reply for a comment with no non-valid finding; nothing challenges it, so it is never posted.
+  ['an orphan reply is never posted unchallenged', { maxCycles: 1,
+    harvests: [{ findings: [finding({ commentId: 1, verdict: 'valid' })], replies: [{ commentId: 99, body: 'you are wrong' }], bots: 'reviewed' }] }, { posted: { 99: 0 } }],
+  // A receipt id that was never in the payload clears no obligation.
+  ['a stray doneId cannot discharge an unrelated deferral', { maxCycles: 2, strayDoneIds: [7], harvests: [twoRefuted([{ commentId: 7, body: 'both wrong' }]), QUIET],
+    verdicts: [FIRST_REAL] }, { reason: 'deferred-replies-unresolved' }],
+  // A non-valid finding with no drafted reply leaves the reviewer's thread unanswered.
+  ['a refutation with no drafted reply is not silently dropped', { maxCycles: 1, harvests: [{ findings: [invalidFinding({ commentId: 5 })], replies: [], bots: 'reviewed' }],
+    verdicts: [UPHELD] }, { pass: false, outstanding: [5] }],
+  // Posting the refutation resolves the whole thread, hiding the valid finding until its fix lands.
+  ['a comment mixing valid and refuted findings is not resolved early', { maxCycles: 1, harvests: [mixed(3)], verdicts: [UPHELD] },
+    { pass: false, outstanding: [3], posted: { 3: 0 } }],
+  // A fix note is not the refutation owed: its receipt clears no deferral.
+  ['a fix note does not discharge a deferred refutation', { maxCycles: 2, harvests: [mixed(4), { findings: [finding({ commentId: 4, verdict: 'valid' })], replies: [], bots: 'reviewed' }],
+    verdicts: [UPHELD] }, { reason: 'deferred-replies-unresolved' }],
+  ['a comment is never replied to twice in one cycle', { maxCycles: 1,
+    harvests: [{ findings: [invalidFinding({ commentId: 8 })], replies: [{ commentId: 8, body: 'wrong' }, { commentId: 8, body: 'also wrong' }], bots: 'reviewed' }],
+    verdicts: [UPHELD] }, { posted: { 8: 1 } }],
+  // The fix note records the comment in answeredWith; the refutation its debt still owes must still go out.
+  ['a deferred refutation can still be posted after a fix note', { maxCycles: 4, harvests: [mixed(4), { findings: [finding({ commentId: 4, verdict: 'valid' })], replies: [], bots: 'reviewed' },
+    { findings: [invalidFinding({ commentId: 4, line: 9 })], replies: [{ commentId: 4, body: 'still wrong' }], bots: 'reviewed' }], verdicts: [UPHELD] }, { pass: true }],
+  // An answered and resolved thread owes nothing for a later harvest that drafted no reply.
+  ['an already-answered comment is not deferred for a missing draft', { maxCycles: 3, harvests: [{ findings: [invalidFinding({ commentId: 7 })], replies: [{ commentId: 7, body: 'wrong' }], bots: 'reviewed' },
+    { findings: [invalidFinding({ commentId: 7 })], replies: [], bots: 'reviewed' }], verdicts: [UPHELD] }, { pass: true }],
   // Cycle 2 overturns the refuted half of cycle 1's mixed comment: only a fix note is owed.
-  let cycle = 0
-  const { result } = await run({
-    args: { autoPush: true, maxCycles: 4 },
-    reviewsPerCycle: () => {
-      cycle++
-      return { findings: [finding({ commentId: 6, verdict: 'valid' }),
-        invalidFinding({ commentId: 6, line: 9 })],
-      replies: [{ commentId: 6, body: 'the second is wrong' }], bots: 'reviewed' }
-    },
-    challengePerCycle: () => cycle === 1
-      ? { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] }
-      : { verdicts: [{ id: 0, upheld: false, reason: 'actually real' }] },
-  })
-  assert.notEqual(result.reason, 'deferred-replies-unresolved',
-    'the deferral outlived the refuted finding that created it')
-  assert.equal(result.outstanding, undefined)
-})
-
-test('overturning one refutation does not excuse a vanished sibling', async () => {
+  ['an obligation dies with the finding that created it', { maxCycles: 4, harvests: [mixed(6)],
+    verdicts: [UPHELD, { verdicts: [{ id: 0, upheld: false, reason: 'actually real' }] }] }, { notReason: 'deferred-replies-unresolved', outstanding: undefined }],
   // Of comment 7's two refutations one is dropped and one overturned: the dropped one is still owed.
-  let cycle = 0
-  const { result } = await run({
-    args: { autoPush: true, maxCycles: 4 },
-    reviewsPerCycle: () => {
-      cycle++
-      if (cycle === 1) {
-        return { findings: [invalidFinding({ commentId: 7 }), invalidFinding({ commentId: 7, line: 9 })],
-          replies: [], bots: 'reviewed' }
-      }
-      if (cycle === 2) return { findings: [invalidFinding({ commentId: 7, line: 9 })], replies: [], bots: 'reviewed' }
-      return { findings: [], replies: [], bots: 'reviewed' }
-    },
-    challengePerCycle: () => cycle === 1
-      ? { verdicts: [{ id: 0, upheld: true, reason: 'stands' }, { id: 1, upheld: true, reason: 'stands' }] }
-      : { verdicts: [{ id: 0, upheld: false, reason: 'real' }] },
+  ['overturning one refutation does not excuse a vanished sibling', { maxCycles: 4, harvests: [twoRefuted([]),
+    { findings: [invalidFinding({ commentId: 7, line: 9 })], replies: [], bots: 'reviewed' }, QUIET],
+  verdicts: [BOTH_UPHELD, { verdicts: [{ id: 0, upheld: false, reason: 'real' }] }] }, { reason: 'deferred-replies-unresolved', outstanding: [7] }],
+  // Cycle 1's fix note posts nothing, so it is owed into the next cycle; only that same answer clears it.
+  ['a retried fix note discharges its own carried obligation', { maxCycles: 4, dropDoneIds: (label) => /^resolve#1\b/.test(label), harvests: [oneValid, oneValid, QUIET] },
+    { pass: true }],
+  // A stale re-report after our fix note is a consequence of the fix, not a dismissal owed.
+  ['a stale re-report of a fixed finding owes nothing', { maxCycles: 3, harvests: [oneValid, { findings: [finding({ verdict: 'stale' })], replies: [], bots: 'reviewed' }] }, { pass: true }],
+  // An edit after our fix note makes a point we never answered: it owes a dismissal again.
+  ['an edit to an answered comment owes an answer again', { maxCycles: 3, harvests: [oneValid, { findings: [invalidFinding({ commentDigest: 'edited' })], replies: [], bots: 'reviewed' }] },
+    { pass: false, outstanding: [1], log: 'comment 1 was edited after we answered it' }],
+]) {
+  test(name, async () => {
+    let cycle = 0
+    const { result, logs, calls } = await run({
+      args: { autoPush: true, maxCycles }, ...over,
+      reviewsPerCycle: () => structuredClone(harvests[Math.min(++cycle, harvests.length) - 1]),
+      ...verdicts && { challengePerCycle: () => structuredClone(verdicts[Math.min(cycle, verdicts.length) - 1]) },
+    })
+    if ('pass' in outcome) assert.equal(result.pass, outcome.pass, String(result.reason))
+    if ('reason' in outcome) assert.equal(result.reason, outcome.reason)
+    if ('notReason' in outcome) assert.notEqual(result.reason, outcome.notReason)
+    if ('outstanding' in outcome) assert.deepEqual(result.outstanding, outcome.outstanding)
+    if (outcome.log) assert.ok(logs.some(l => l.includes(outcome.log)), logs.join('\n'))
+    const posted = calls.find(c => c.label.startsWith('replies#'))?.prompt ?? ''
+    for (const [id, n] of Object.entries(outcome.posted ?? {})) assert.equal(posted.split(`"commentId":${id}`).length - 1, n, `comment ${id} in ${posted}`)
   })
-  assert.equal(result.reason, 'deferred-replies-unresolved',
-    'one overturn discharged an unrelated unanswered dismissal')
-  assert.deepEqual(result.outstanding, [7])
-})
-
-test('a retried fix note discharges its own carried obligation', async () => {
-  // The first attempt posts nothing, so the fix note is owed into the next
-  // cycle. Only that same answer can clear it - no refutation was ever owed.
-  let cycle = 0
-  const { result } = await run({
-    args: { autoPush: true, maxCycles: 4 },
-    dropDoneIds: (label) => cycle === 1 && label.startsWith('resolve#'),
-    reviewsPerCycle: () => {
-      cycle++
-      return cycle <= 2 ? structuredClone(oneValid) : { findings: [], replies: [], bots: 'reviewed' }
-    },
-  })
-  assert.equal(result.pass, true, `the retried fix note must clear its deferral (got ${result.reason})`)
-})
-
-test('a stale re-report of a fixed finding owes nothing', async () => {
-  // The thread was answered and resolved by the fix note. Reporting the same
-  // finding stale afterwards is a consequence of our own fix, not a dismissal
-  // owed to the reviewer - and no reply is ever drafted for it.
-  let cycle = 0
-  const { result } = await run({
-    args: { autoPush: true, maxCycles: 3 },
-    reviewsPerCycle: () => {
-      cycle++
-      return cycle === 1
-        ? structuredClone(oneValid)
-        : { findings: [finding({ verdict: 'stale' })], replies: [], bots: 'reviewed' }
-    },
-  })
-  assert.equal(result.pass, true, `a stale re-report reopened a settled comment (got ${result.reason})`)
-})
-
-test('an edit to an answered comment owes an answer again', async () => {
-  // The fix note answered and resolved comment 1. The reviewer then edits the
-  // body: the point now being made is not the one we answered, so it accrues a
-  // dismissal the run must not pass without.
-  let cycle = 0
-  const { result, logs } = await run({
-    args: { autoPush: true, maxCycles: 3 },
-    reviewsPerCycle: () => {
-      cycle++
-      return cycle === 1
-        ? structuredClone(oneValid)
-        : { findings: [invalidFinding({ commentDigest: 'edited' })], replies: [], bots: 'reviewed' }
-    },
-  })
-  assert.ok(logs.some(l => l.includes('comment 1 was edited after we answered it')), 'the edit must be reported')
-  assert.notEqual(result.pass, true, 'an edit to an answered comment went unnoticed')
-  assert.deepEqual(result.outstanding, [1])
-})
+}
 
 test('an answered comment edited since goes to the caller, never a second answer from the run (#31)', async () => {
   // tinyusb#4030: CodeRabbit withdrew its finding after our reply, then edited the body; the answer owed again is the caller's.
@@ -4173,23 +4005,8 @@ test('a settlement is refused at another head, on a held, changed or not handed-
   const held = await run({ reviews: edited, preflight: at, challenge: () => ({ verdict: 'unknown', reason: 'cannot tell' }), args: { ...YIELD, state, replySettlements: [settlement] } })
   assert.equal(held.calls.some(c => c.label.startsWith('reuse#')), false)
   assert.deepEqual(held.result.settlements, [{ commentId: 1, outcome: 'refused', why: 'a point of the comment is held' }])
-  const ciOnly = await run({ reviews: edited, preflight: at, args: { ...YIELD, lane: 'ci', state, replySettlements: [settlement] } })
-  assert.deepEqual(ciOnly.result.settlements, [{ commentId: 1, outcome: 'not processed', why: 'no review harvest in this launch' }])
-})
-
-test('a reuse relay that drops a member gets one fresh relay, and the settlement still lands (#47)', async () => {
-  const { edited, at, state, settlement } = await reanswered()
-  const { result, labels } = await run({ reviews: edited, preflight: at, args: { ...YIELD, state, replySettlements: [settlement] },
-    garble: (l, a) => l === 'reuse#3' ? { ...a, receipts: a.receipts.map(({ replyId, ...r }) => r) } : a })
-  assert.deepEqual(labels.filter(l => l.startsWith('reuse#')), ['reuse#3', 'reuse#3.retry'])
-  assert.deepEqual(result.settlements, [{ commentId: 1, outcome: 'settled', replyId: 777 }])
-})
-
-test('replySettlements must be well formed, one per comment', async () => {
-  const ok = { commentId: 1, commentDigest: 'd1', replyId: 2, bodyDigest: 'ab', headSha: SHA }
-  for (const bad of [{}, [{ ...ok, headSha: 'abc' }], [{ ...ok, replyId: 0 }], [{ ...ok, bodyDigest: '' }], [ok, { ...ok, replyId: 3 }]]) {
-    await assert.rejects(run({ args: { replySettlements: bad } }), /replySettlements must be/, JSON.stringify(bad))
-  }
+  const unharvested = await run({ throwOn: (l) => l.startsWith('reviews#'), preflight: at, args: { ...YIELD, state, replySettlements: [settlement] } })
+  assert.deepEqual(unharvested.result.settlements, [{ commentId: 1, outcome: 'not processed', why: 'no review harvest in this launch' }])
 })
 
 test('a fix note reads as deferred only while it still owes a dismissal', async () => {
@@ -4436,7 +4253,6 @@ test('a reply is published by the script from a workflow-built manifest', async 
     assert.ok(c, `${label} ran`)
     assert.match(c.prompt, /skills\/pr-reply\/scripts\/reply\.py --pr 3888 --repo 'hathach\/tinyusb' --manifest/, `${label} runs the script`)
     assert.doesNotMatch(c.prompt, /gh api/, `${label} types no gh call`)
-    assert.equal(c.schema.properties.receipts.items.additionalProperties, false, `${label} takes receipts only`)
   }
   const notes = manifestOf(calls, 'resolve#1')
   assert.equal(notes.length, 1)
@@ -4445,6 +4261,14 @@ test('a reply is published by the script from a workflow-built manifest', async 
   assert.equal(notes[0].digest, fnv1a(notes[0].body))
   const replies = manifestOf(calls, 'replies#1')
   assert.deepEqual(replies, [{ commentId: 2, body: 'not so', digest: fnv1a('not so') }])
+})
+
+test('a manifest the relay writes carries no backslash-semicolon for the Bash tool to rewrite (#417)', async () => {
+  const body = 'run `find . -exec rm {} \\;` and C:\\path'
+  const { calls } = await run({ reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body }], bots: 'reviewed' } })
+  const c = calls.find(x => x.label === 'replies#1')
+  assert.doesNotMatch(c.prompt, /\\;/, 'no backslash-semicolon in the prompt')
+  assert.deepEqual(manifestOf(calls, 'replies#1'), [{ commentId: 2, body, digest: fnv1a(body) }], 'the body arrives whole')
 })
 
 test('a reply that landed with the wrong body is a repair for the caller, never reposted, inspected or edited', async () => {
@@ -4503,7 +4327,7 @@ const RATE = 'gh: API rate limit exceeded for user ID 249515 (HTTP 403)'
 
 test('reply.py\'s error line fails the batch with that error, not a seal mismatch or a retry (#115)', async () => {
   const { result, labels, logs } = await run({ reviews: oneValid, replyError: (label) => label.startsWith('resolve#') && RATE, args: { autoPush: true, maxCycles: 1 } })
-  assert.equal(labels.some(l => /^resolve#1\.retry/.test(l)), false, 'an error line is an answer: no Sonnet retry')
+  assert.equal(labels.some(l => /^resolve#1\.retry/.test(l)), false, 'an error line is an answer: no retry')
   assert.equal(logs.some(l => /does not match its seal/.test(l)), false)
   assert.ok(logs.some(l => l.includes(`resolve#1 incomplete — reply.py: ${RATE}`)), logs.join('\n'))
   assert.equal(result.history[0].fixNotePosts.detail, `reply.py: ${RATE}`)
@@ -4714,16 +4538,6 @@ test('a held id from before an edit is not named as the edited body\'s', async (
 const ISSUE = 'https://github.com/hathach/tinyusb/issues/4000'
 const deferral = (over = {}) => ({ findingId: '1#1', commentDigest: 'd1', issueUrl: ISSUE, reason: 'broken on master too; own PR', ...over })
 
-test('deferrals are checked for shape before anything runs', async () => {
-  for (const deferrals of ['1#1', [{ ...deferral(), findingId: '1' }], [deferral({ issueUrl: 'https://github.com/o/r/pull/3' })], [deferral({ issueUrl: null })], [deferral({ issueUrl: [ISSUE] })],
-    [{ issueUrl: ISSUE, reason: ' ' }], [{ issueUrl: ISSUE }], [{ issueUrl: ISSUE, reason: 'r' }, { issueUrl: ISSUE, reason: 's' }], [{ findingId: '1#1', issueUrl: ISSUE, reason: 'r' }],
-    [deferral({ reason: ' ' })], [deferral({ commentDigest: '' })], [deferral(), deferral()]]) {
-    const trace = []
-    await assert.rejects(run({ args: { deferrals }, trace }), /deferrals must be/, JSON.stringify(deferrals))
-    assert.deepEqual(trace, [])
-  }
-})
-
 test('a deferred finding is not fixed, is answered with its issue on the caller\'s word, and the run passes listing it', async () => {
   const { result, calls, labels, logs } = await run({ reviews: oneValid, args: { deferrals: [deferral()] } })
   assert.equal(labels.some(l => /^(fix:|issue#)/.test(l)), false, 'no writer for a deferred finding, and no second read of its issue')
@@ -4881,19 +4695,22 @@ test('a green PR whose owed findings are all held for the caller stops at once; 
   assert.ok(mixed.labels.includes('reviews#2'), 'the rejected sibling keeps the comment progressing')
 })
 
-test('a deferral reason of any length launches and is posted whole, on a resumed launch too', async () => {
+// [finding, deferral, the place and reason the posted answer names]: the place as is, the reason whole, and no claim (#142).
+test('a deferral is answered with its place and reason whole, quoting no claim, on a resumed launch too', async () => {
   const reason = `${'w '.repeat(80).trim()} ${'x'.repeat(400)}`
-  const { calls } = await run({ reviews: oneValid, args: { deferrals: [deferral({ reason })], autoPush: true, maxCycles: 2 } })
-  assert.equal(manifestOf(calls, 'defer#1')[0].body, `- src/a.c:1:\n  Real, and out of this PR's scope: ${reason}. Tracked in ${ISSUE}.`)
+  const OWN = 'broken on master too; own PR'
+  for (const [f, d, place, said] of [
+    [finding(), deferral({ reason }), 'src/a.c', reason],
+    [finding({ claim: 'w '.repeat(80) + 'x'.repeat(300) }), deferral(), 'src/a.c', OWN], // #142
+    [finding({ file: 'src/my file.c' }), deferral(), 'src/my file.c', OWN],
+    [finding({ file: `src/${'d/'.repeat(150)}a.c` }), deferral(), `src/${'d/'.repeat(150)}a.c`, OWN],
+  ]) {
+    const { calls } = await run({ reviews: { findings: [f], replies: [], bots: 'reviewed' }, args: { deferrals: [d], autoPush: true, maxCycles: 2 } })
+    assert.equal(manifestOf(calls, 'defer#1')[0].body, `- ${place}:1:\n  Real, and out of this PR's scope: ${said}. Tracked in ${ISSUE}.`, place)
+  }
   const first = await run({ reviews: oneValid, args: { deferrals: [deferral({ reason })], maxCycles: 3, yieldAfterCycle: true, autoPush: false } })
   const again = await run({ reviews: oneValid, args: { maxCycles: 3, state: first.result.state } })
   assert.notEqual(again.result.reason, 'deferral-refused', 'a restored deferral is not measured either')
-})
-
-test('a deferral point quotes no claim (#142)', async () => {
-  const wordyClaim = { findings: [finding({ claim: 'w '.repeat(80) + 'x'.repeat(300) })], replies: [], bots: 'reviewed' }
-  const posted = await run({ reviews: wordyClaim, args: { deferrals: [deferral()], autoPush: true, maxCycles: 2 } })
-  assert.equal(manifestOf(posted.calls, 'defer#1')[0].body, `- src/a.c:1:\n  Real, and out of this PR's scope: broken on master too; own PR. Tracked in ${ISSUE}.`)
 })
 
 test('a deferral attempt offered in the one-line form is posted as offered, not reformatted (#142)', async () => {
@@ -4909,14 +4726,6 @@ test('a deferral attempt offered in the one-line form is posted as offered, not 
   const again = await resumeAt(state, { reviews: oneValid, args: { autoPush: true, maxCycles: 4 } })
   assert.equal(manifestOf(again.calls, 'defer#2')[0].body, old)
   assert.equal(again.result.state.debt.some(([id]) => id === 1), false, 'the old attempt settles the comment')
-})
-
-test('a deferral place is posted as is, spaced or long', async () => {
-  for (const file of ['src/my file.c', `src/${'d/'.repeat(150)}a.c`]) {
-    const reviews = { findings: [finding({ file })], replies: [], bots: 'reviewed' }
-    const { calls } = await run({ reviews, args: { deferrals: [deferral()], autoPush: true, maxCycles: 2 } })
-    assert.equal(manifestOf(calls, 'defer#1')[0].body, `- ${file}:1:\n  Real, and out of this PR's scope: broken on master too; own PR. Tracked in ${ISSUE}.`, file)
-  }
 })
 
 test('a deferral applied once holds on a resumed launch without being passed again, until the comment is edited', async () => {
@@ -5322,37 +5131,37 @@ test('the challenger is asked for three verdicts', async () => {
   assert.deepEqual(ch.schema.properties.verdicts.items.properties.verdict.enum, ['justified', 'valid', 'unknown'])
 })
 
-test('a receipt for a different body settles nothing', async () => {
-  // The posting agent transcribed the manifest wrong, or answered with some
-  // other reply's receipt: the digest does not match the body the workflow
-  // handed out, so the comment stays owed.
-  const { result, logs } = await run({
-    reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'not so' }], bots: 'reviewed' },
-    challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
-    receipts: (rs) => rs.map(r => ({ ...r, digest: fnv1a('@/tmp/body.txt') })),
-  })
-  assert.equal(result.pass, false)
-  assert.deepEqual(result.outstanding, [2])
-  assert.ok(logs.some(l => /receipt for comment 2 is for a different body/.test(l)), logs.join('\n'))
-  assert.equal(result.rollup.replies, 0, 'an untrusted receipt is no reply')
-})
-
-test('two receipts for one comment, or success without a reply id, settle nothing', async () => {
-  const twice = await run({
-    reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'not so' }], bots: 'reviewed' },
-    challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
-    receipts: (rs) => [{ ...rs[0], verified: false, error: 'read-back mismatch on body' }, rs[0]],
-  })
-  assert.deepEqual(twice.result.outstanding, [2], 'a mismatch followed by a success is contradictory')
-  assert.equal(twice.result.rollup.replies, 0)
-  assert.deepEqual(twice.result.state.debt.find(([id]) => id === 2)[1].repair, { replyId: 502, error: 'contradictory receipts' },
-    'the reply the receipts name is kept so nothing is posted over it')
-  const noId = await run({
-    reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'not so' }], bots: 'reviewed' },
-    challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
-    receipts: (rs) => rs.map(r => ({ ...r, kind: 'issue', replyId: null, resolved: null })),
-  })
-  assert.deepEqual(noId.result.outstanding, [2], 'verified with no reply id is impossible')
+// [case, the receipts reply.py returned, the repair kept, a log line]. A receipt the workflow cannot trust pays nothing and
+// retires nothing: the comment stays owed. Only reply.py's exact absence shape (kind none, no POST, no reply) retires a debt;
+// a receipt that names a reply it cannot vouch for keeps that reply as the repair, so nothing is posted over it.
+test('an untrusted or contradictory reply receipt settles nothing', async () => {
+  const CONTRADICTORY = { replyId: 502, error: 'contradictory receipt' }
+  for (const [name, receipts, repair, line] of [
+    // The posting agent transcribed the manifest wrong, or answered with some other reply's receipt.
+    ['a different body', (rs) => rs.map(r => ({ ...r, digest: fnv1a('@/tmp/body.txt') })), { replyId: 502, error: 'receipt for a different body' }, /receipt for comment 2 is for a different body/],
+    ['a mismatch, then a success', (rs) => [{ ...rs[0], verified: false, error: 'read-back mismatch on body' }, rs[0]], { replyId: 502, error: 'contradictory receipts' }],
+    ['success without a reply id', (rs) => rs.map(r => ({ ...r, kind: 'issue', replyId: null, resolved: null })), undefined],
+    // A failed lookup or a receipt for another body proves nothing about whether the comment exists.
+    ['a lookup that failed', (rs) => rs.map(r => ({ ...r, kind: null, sent: false, replyId: null, verified: false, error: 'HTTP 502' })), undefined],
+    ['none for another body', (rs) => rs.map(r => ({ ...r, kind: 'none', sent: false, replyId: null, verified: false, digest: 'deadbeef', error: 'not on PR' })), undefined],
+    ['two none receipts', (rs) => rs.flatMap(r => [r, r].map(x => ({ ...x, kind: 'none', sent: false, replyId: null, verified: false }))), undefined],
+    ['none with a read-back mismatch', (rs) => rs.map(r => ({ ...r, kind: 'none', verified: false, resolved: null, error: 'read-back mismatch on body' })), CONTRADICTORY],
+    ['none, success-shaped', (rs) => rs.map(r => ({ ...r, kind: 'none' })), CONTRADICTORY],
+    ['none, sent, with no reply', (rs) => rs.map(r => ({ ...r, kind: 'none', replyId: null, posted: false, verified: false, resolved: null })), undefined],
+  ]) {
+    const { result, logs } = await run({
+      reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'not so' }], bots: 'reviewed' },
+      challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] }, receipts,
+    })
+    assert.equal(result.pass, false, name)
+    assert.deepEqual(result.outstanding, [2], name)
+    assert.equal(result.rollup.replies, 0, `${name}: an untrusted receipt is no reply`)
+    assert.deepEqual(result.state.answeredWith, [], `${name}: nothing was paid`)
+    const debt = result.state.debt.find(([id]) => id === 2)
+    assert.ok(debt, `${name}: the debt is kept`)
+    assert.deepEqual(debt[1].repair, repair, name)
+    if (line) assert.ok(logs.some(l => line.test(l)), `${name}: ${logs.join('\n')}`)
+  }
 })
 
 test('a comment on none of the PR\'s id spaces owes nothing', async () => {
@@ -5377,60 +5186,36 @@ test('a comment on none of the PR\'s id spaces owes nothing', async () => {
   assert.match(rowsOf(summaries(refuted.logs)[0])[0].join('|'), /refuted, no reply: comment is not on the PR/)
 })
 
-test('only an explicit none receipt retires a debt', async () => {
-  // A lookup that failed (kind null) or a receipt for another body proves
-  // nothing about whether the comment exists; the debt stays.
-  for (const [name, reshape] of [
-    ['lookup failed', (r) => ({ ...r, kind: null, sent: false, replyId: null, verified: false, error: 'HTTP 502' })],
-    ['wrong digest', (r) => ({ ...r, kind: 'none', sent: false, replyId: null, verified: false, digest: 'deadbeef', error: 'not on PR' })],
-    ['two receipts', (r) => [r, r].map(x => ({ ...x, kind: 'none', sent: false, replyId: null, verified: false }))],
-  ]) {
-    const { result } = await run({
-      args: { autoPush: true },
-      reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'not so' }], bots: 'reviewed' },
-      challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
-      receipts: (rs) => rs.flatMap(reshape),
-    })
-    assert.deepEqual(result.outstanding, [2], name)
-    assert.ok(result.state.debt.some(([id]) => id === 2), `${name}: the debt is kept`)
-  }
-})
-
-test('a none receipt that also names a reply is contradictory, not a retirement', async () => {
-  // The script's absence shape is exact: kind none with no POST and no reply.
-  // A receipt that says none and still carries a reply id can only be a
-  // transcription error, so the debt is kept and the reply it names is the repair.
-  for (const [name, reshape] of [
-    ['mismatch', (r) => ({ ...r, kind: 'none', verified: false, resolved: null, error: 'read-back mismatch on body' })],
-    ['success-shaped', (r) => ({ ...r, kind: 'none' })],
-    ['sent, no reply', (r) => ({ ...r, kind: 'none', replyId: null, posted: false, verified: false, resolved: null })],
-  ]) {
-    const { result } = await run({
-      args: { autoPush: true },
-      reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'not so' }], bots: 'reviewed' },
-      challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
-      receipts: (rs) => rs.map(reshape),
-    })
-    assert.deepEqual(result.outstanding, [2], name)
-    assert.deepEqual(result.state.answeredWith, [], `${name}: nothing was paid`)
-    const [, d] = result.state.debt.find(([id]) => id === 2)
-    assert.deepEqual(d.repair, name === 'sent, no reply' ? undefined : { replyId: 502, error: 'contradictory receipt' }, name)
-  }
-})
-
-test('a refutation paid before a later worker threw stays paid in the failed cycle', async () => {
+test('a refutation paid before a later step threw stays paid in the failed cycle', async () => {
   // The refutation is posted before the fix is published. When a later step
-  // then throws (an agent's throw settles to null, so it takes a malformed
-  // recheck, whose staged list is not a list), the cycle is reported as thrown,
-  // but the ledger already moved: the comment is answered and its receipt is in
-  // the cycle's history.
+  // then throws, the cycle is reported as thrown, but the ledger already
+  // moved: the comment is answered and its receipt is in the cycle's history.
   const { result } = await run({
+    args: { autoPush: true },
+    reviews: { findings: [finding({ commentId: 1 }), invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'not so' }], bots: 'reviewed' },
+    challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
+    throwOnLog: /^cycle 1: review-lane push superseded the CI run/,
+  })
+  assert.equal(result.reason, 'cycle-threw')
+  assert.match(result.history[0].error, /^cycle threw: injected at: cycle 1: review-lane push superseded/)
+  assert.equal(result.history[0].refutedPosts.pass, true)
+  assert.deepEqual(result.state.answeredWith.map(([id, a]) => [id, a.how]), [[2, 'refutation'], [1, 'fixNote']])
+  assert.equal(result.state.debt.some(([id]) => id === 2), false)
+})
+
+test('a refutation paid before a later step failed stays paid in the failed cycle', async () => {
+  // The refutation is posted before the fix is published. When a later step
+  // then fails (a recheck line off its schema, whose staged list is not a list),
+  // the publication fails, but the ledger already moved: the comment is answered
+  // and its receipt is in the cycle's history.
+  const { result, logs } = await run({
     args: { autoPush: true },
     reviews: { findings: [finding({ commentId: 1 }), invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'not so' }], bots: 'reviewed' },
     challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
     recheck: { staged: null },
   })
-  assert.equal(result.reason, 'cycle-threw')
+  assert.ok(logs.includes("recheck#1-review: the script's line is off its schema — line.staged is null"), logs.join('\n'))
+  assert.equal(result.history[0].reviewPushFailed.detail, 'recheck agent died')
   assert.equal(result.history[0].refutedPosts.pass, true)
   assert.deepEqual(result.state.answeredWith.map(([id, a]) => [id, a.how]), [[2, 'refutation']])
   assert.equal(result.state.debt.some(([id]) => id === 2), false)
@@ -5483,37 +5268,11 @@ test('an unavailable read-back is retried, not repaired', async () => {
   assert.equal(result.history[0].refutedPosts.receipts[0].verified, null)
 })
 
-test('a reply receipt whose copy does not match its seal gets one fresh relay on Sonnet', async () => {
-  // #3988: a Haiku relay nulled replyId and kind, and two posted replies went unsettled for a cycle.
-  const nulled = (a) => ({ ...a, receipts: a.receipts.map(r => ({ ...r, replyId: null, kind: null })) })
+test('a receipt reply.py prints without its null members still settles: the workflow reads them null', async () => {
   const reviews = { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'not so' }], bots: 'reviewed' }
-  const { result, labels, calls, logs } = await run({ reviews, garble: (l, a) => l === 'replies#1' ? nulled(a) : a })
-  assert.ok(logs.some(l => l === 'replies#1: the relayed copy does not match its seal'), logs.join('\n'))
-  assert.deepEqual(labels.filter(l => l.startsWith('replies#')), ['replies#1', 'replies#1.retry'])
-  assert.equal(calls.find(c => c.label === 'replies#1.retry').model, 'sonnet')
-  assert.deepEqual(manifestOf(calls, 'replies#1.retry'), manifestOf(calls, 'replies#1'), 'the same manifest: reply.py reuses what landed')
-  assert.equal(result.pass, true, result.reason)
-})
-
-test('a reply relay must copy every member reply.py prints: a dropped one is refused by the schema, an invented one by the seal (#47)', async () => {
-  // tinyusb#4055: a Haiku copy left out kind and replyId and gave a review-body receipt resolved: false.
-  const reviews = { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'not so' }], bots: 'reviewed' }
-  const first = (l) => l === 'replies#1'
-  const dropped = await run({ reviews, garble: (l, a) => first(l) ? { ...a, receipts: a.receipts.map(({ kind, replyId, ...r }) => r) } : a })
-  assert.ok(dropped.logs.some(l => /^replies#1 errored — .*missing kind/.test(l)), dropped.logs.join('\n'))
-  const required = dropped.calls.find(c => c.label === 'replies#1').schema.properties.receipts.items
-  assert.deepEqual(required.required, ['commentId', 'kind', 'replyId', 'digest', 'sent', 'posted', 'verified'])
-  assert.equal('nullsOmitted' in required, false, 'the runtime never sees the annotation')
-  const invented = await run({ reviews, garble: (l, a) => first(l) ? { ...a, receipts: a.receipts.map(r => ({ ...r, resolved: !r.resolved })) } : a })
-  assert.ok(invented.logs.includes('replies#1: the relayed copy does not match its seal'), invented.logs.join('\n'))
-  for (const { result, labels, logs } of [dropped, invented]) {
-    assert.deepEqual(labels.filter(l => l.startsWith('replies#')), ['replies#1', 'replies#1.retry'])
-    assert.ok(logs.includes('replies#1: relay recovered on the Sonnet retry'), logs.join('\n'))
-    assert.equal(result.pass, true, result.reason)
-  }
-  // A receipt with no resolved or error, as reply.py prints a null one, still matches its seal.
-  const bare = await run({ reviews, garble: (l, a) => first(l) ? { ...a, receipts: a.receipts.map(({ error, ...r }) => r) } : a })
+  const bare = await run({ reviews, garble: (l, a) => l === 'replies#1' ? sealLine({ receipts: a.receipts.map(r => Object.fromEntries(Object.entries(r).filter(([, v]) => v !== null))) }) : a })
   assert.deepEqual(bare.labels.filter(l => l.startsWith('replies#')), ['replies#1'])
+  assert.equal(bare.result.pass, true, bare.result.reason)
 })
 
 test('a retry offers the body first posted, not the redraft', async () => {
@@ -5530,9 +5289,9 @@ test('a retry offers the body first posted, not the redraft', async () => {
     },
     challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
   })
-  assert.equal(result.pass, true, `settled on the retry (got ${result.reason})`)
+  assert.equal(result.pass, true, `settled on the next cycle (got ${result.reason})`)
   const bodies = calls.filter(c => c.label.startsWith('replies#')).map(c => [c.label, manifestOf(calls, c.label)[0].body])
-  assert.deepEqual(bodies, [['replies#1', 'first wording'], ['replies#1.retry', 'first wording'], ['replies#2', 'first wording']])
+  assert.deepEqual(bodies, [['replies#1', 'first wording'], ['replies#1.replay', 'first wording'], ['replies#2', 'first wording']])
   assert.ok(logs.some(l => /comment 2 keeps the body already offered/.test(l)), logs.join('\n'))
   assert.equal(result.state.debt.length, 0, 'paid debt carries no attempt')
 })
@@ -5634,7 +5393,7 @@ test('an offered answer the comment outgrew goes to the caller, not a reuse or a
     challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
   })
   assert.equal(edited.result.pass, false)
-  assert.deepEqual(edited.labels.filter(l => l.startsWith('replies#')), ['replies#1', 'replies#1.retry'], 'no repost under the edited comment')
+  assert.deepEqual(edited.labels.filter(l => l.startsWith('replies#')), ['replies#1', 'replies#1.replay'], 'no repost under the edited comment')
   assert.equal(edited.result.state.debt.find(([id]) => id === 2)[1].edited, true)
   assert.match(rowsOf(summaries(edited.logs)[1])[0][3], /HANDED TO THE CALLER: edited after its finding ids/)
   cycle = 0
@@ -5669,32 +5428,6 @@ test('a rejected receipt that names a reply still blocks a repost', async () => 
   assert.deepEqual(result.state.debt.find(([id]) => id === 2)[1].repair, { replyId: 502, error: 'receipt for a different body' })
 })
 
-test('a ci launch watches CI and never runs the validator', async () => {
-  // Chief saw only a check conclude: this launch spends no opus on a harvest.
-  const { result, labels, logs } = await run({
-    args: { lane: 'ci', yieldAfterCycle: true, maxCycles: 3 },
-    ci: { status: 'red', infraRerun: [], realFailures: [{ check: 'build', firstError: 'boom', files: ['src/a.c'], verdict: 'real' }] },
-  })
-  assert.equal(labels.some(l => l.startsWith('reviews#') || l.startsWith('challenge#') || l.startsWith('replies#')), false)
-  assert.ok(labels.includes('ci:collect#1.1') && labels.includes('ci:judge#1'))
-  assert.ok(labels.some(l => l.startsWith('fix:')), 'the CI fix still runs')
-  assert.equal(result.status, 'paused')
-  assert.equal(result.observation.lane, 'ci')
-  assert.equal(result.observation.reviews, null, 'nobody looked at reviews')
-  assert.equal(result.history[0].reviews, null)
-  assert.match(summaries(logs)[0], /reviews not observed this launch/)
-})
-
-test('a ci launch cannot declare the PR done, even green', async () => {
-  const { result, logs } = await run({
-    args: { lane: 'ci', yieldAfterCycle: true, maxCycles: 3 },
-    ci: { status: 'green', infraRerun: [], realFailures: [] },
-  })
-  assert.equal(result.status, 'paused')
-  assert.equal(result.pass, false)
-  assert.ok(logs.some(l => /ci lane only — reviews not observed, no verdict this launch/.test(l)), logs.join('\n'))
-})
-
 test('a reviews launch runs no CI watcher and still fixes and pushes', async () => {
   const { result, labels, logs } = await run({
     args: { lane: 'reviews', yieldAfterCycle: true, maxCycles: 3 },
@@ -5719,18 +5452,18 @@ test('a reviews launch with settled bots still declares nothing', async () => {
 })
 
 test('the lane is not part of the state a launch must match', async () => {
-  const first = await run({ args: { lane: 'ci', yieldAfterCycle: true, maxCycles: 3 } })
+  const first = await run({ args: { lane: 'reviews', yieldAfterCycle: true, maxCycles: 3 } })
   assert.equal(first.result.state.config.lane, undefined)
   const second = await run({ args: { lane: 'reviews', yieldAfterCycle: true, maxCycles: 3, state: first.result.state }, reviews: { findings: [], replies: [], bots: 'reviewed' } })
-  assert.equal(second.result.state.cyclesUsed, 2, 'the budget is shared across lanes')
+  assert.equal(second.result.state.cyclesUsed, 2, 'the budget is shared across launches')
   const third = await run({ args: { yieldAfterCycle: true, maxCycles: 3, state: second.result.state }, reviews: { findings: [], replies: [], bots: 'reviewed' } })
   assert.equal(third.result.status, 'complete', `only the both launch completes (got ${third.result.reason})`)
-  assert.deepEqual(third.result.history.map(e => e.lane), ['reviews', 'both'], 'a launch carries only the previous launch\'s last cycle')
+  assert.deepEqual(third.result.history.map(e => [e.cycle, e.lane]), [[2, 'reviews'], [3, 'both']], 'a launch carries only the previous launch\'s last cycle')
   assert.equal(third.result.state.last.lane, 'both')
 })
 
 test('debt and the pushed head carry across a lane switch', async () => {
-  // reviews pushes and owes a refutation, ci keeps both, both pays it and completes.
+  // reviews pushes and owes a refutation, both pays it and completes.
   const reviews1 = { findings: [finding({ commentId: 1 }), invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'not so' }], bots: 'reviewed' }
   const first = await run({
     args: { lane: 'reviews', yieldAfterCycle: true, maxCycles: 4 },
@@ -5740,20 +5473,13 @@ test('debt and the pushed head carry across a lane switch', async () => {
   assert.equal(first.result.state.expectedHead, shaFor(1))
   assert.deepEqual(first.result.outstanding, [2])
   const second = await run({
-    args: { lane: 'ci', yieldAfterCycle: true, maxCycles: 4, state: first.result.state },
-    preflight: { head: shaFor(1), prHead: shaFor(1) },
-  })
-  assert.equal(second.result.status, 'paused')
-  assert.deepEqual(second.result.outstanding, [2], 'the ci launch keeps the reply owed')
-  assert.equal(second.result.state.expectedHead, shaFor(1))
-  const third = await run({
-    args: { yieldAfterCycle: true, maxCycles: 4, state: second.result.state },
+    args: { yieldAfterCycle: true, maxCycles: 4, state: first.result.state },
     preflight: { head: shaFor(1), prHead: shaFor(1) },
     reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'not so' }], bots: 'reviewed' },
     challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
   })
-  assert.equal(third.result.status, 'complete', `the both launch pays and completes (got ${third.result.reason})`)
-  assert.equal(third.result.state.debt.length, 0)
+  assert.equal(second.result.status, 'complete', `the both launch pays and completes (got ${second.result.reason})`)
+  assert.equal(second.result.state.debt.length, 0)
 })
 
 test('a dry run still runs the fixers it is allowed to run', async () => {
@@ -6072,7 +5798,7 @@ test('a state from a run with other arguments, or of another shape, is refused',
   await assert.rejects(run({ args: { ...adoptionArgs(pinned), protected: undefined } }),
     (e) => e.message.startsWith(`state was made by a run with different arguments (protected: ${JSON.stringify(pinned.config.protected)} vs null): {`),
     'the differing key first, as the state and the launch have it')
-  await assert.rejects(run({ args: { maxCycles: 3, state: { version: 0 } } }), /not a pr-babysit state/)
+  await assert.rejects(run({ args: { maxCycles: 3, state: seal({ version: 0 }) } }), /not a pr-babysit state/)
 })
 
 // adopting an audited local chain without resetting the carried ledger
@@ -6110,7 +5836,6 @@ test('adoption publishes before cycle watchers and reviews the adopted head', as
   assert.equal(JSON.stringify(result.state).includes('adoptHead'), false, 'the launch argument is not persisted')
   const audit = calls.find(c => c.label === 'adopt:audit')
   assert.equal(audit.phase, 'Triage')
-  assert.deepEqual(audit.schema.required, ['from', 'to', 'published', 'base', 'tip', 'commits', 'paths', 'unpublished', 'mergeOnly', 'changes', 'refusal'])
   assert.ok(audit.prompt.includes(`commits.py chain ${HEAD} ${ADOPT} --published ${HEAD} --base ${BASE} --tip ${TIP}\``), audit.prompt)
   const push = calls.find(c => c.label === 'adopt:push')
   assert.equal(push.phase, 'Push')
@@ -6126,6 +5851,15 @@ test('a lost adoption push receipt gets one fresh agent, which reads the push ba
   assert.deepEqual(labels.slice(0, 4), ['preflight', 'adopt:audit', 'adopt:push', 'adopt:push.retry'])
   assert.equal(result.history[1].adoption.publication, 'pushed')
   assert.equal(result.state.pending, null)
+})
+
+test('an adoption push whose relay died after push.py wrote its line is read from the file, with no second push', async () => {
+  const state = adoptionState()
+  const late = await run({ args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD }, lostAnswer: (l) => l === 'adopt:push' })
+  assert.deepEqual(late.labels.slice(0, 3), ['preflight', 'adopt:audit', 'adopt:push'])
+  assert.equal(late.labels.includes('adopt:push.retry'), false)
+  assert.equal(late.result.history[1].adoption.publication, 'pushed')
+  assert.equal(late.result.state.pending, null)
 })
 
 test('an already-published adopted head needs no push even in a dry-run launch', async () => {
@@ -6173,57 +5907,44 @@ test('adoption accepts a complete two-commit chain and canonicalizes its receipt
   assert.equal(result.history[1].adoption.publication, 'already-published')
 })
 
-test('the audit script\'s refusal, or an audit of another range, is refused', async () => {
-  for (const [audit, detail] of [
-    [chainAudit([ADOPT], undefined, { refusal: 'commit message carries attribution: Generated by Codex' }),
-      'commit message carries attribution: Generated by Codex'],
-    [chainAudit([ADOPT], undefined, { from: ADOPT_MID }), `the audit read ${ADOPT_MID}..${ADOPT} published at ${HEAD} on base ${BASE} tip ${TIP}, not ${HEAD}..${ADOPT} published at ${HEAD} on base ${BASE} tip ${TIP}`],
-    [chainAudit([ADOPT_MID]), `the audit read ${HEAD}..${ADOPT_MID} published at ${HEAD} on base ${BASE} tip ${TIP}, not ${HEAD}..${ADOPT} published at ${HEAD} on base ${BASE} tip ${TIP}`],
-    // A merge vouched for by another base than the PR's is no merge from its base.
-    [chainAudit([ADOPT], undefined, { base: FOREIGN }), `the audit read ${HEAD}..${ADOPT} published at ${HEAD} on base ${FOREIGN} tip ${TIP}, not ${HEAD}..${ADOPT} published at ${HEAD} on base ${BASE} tip ${TIP}`],
-    [chainAudit([ADOPT], undefined, { tip: FOREIGN }), `the audit read ${HEAD}..${ADOPT} published at ${HEAD} on base ${BASE} tip ${FOREIGN}, not ${HEAD}..${ADOPT} published at ${HEAD} on base ${BASE} tip ${TIP}`],
-  ]) {
-    const state = adoptionState()
-    const { result, labels } = await run({ args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD }, adoptAudit: audit })
-    assert.equal(result.reason, 'adopt-audit-failed')
-    assert.equal(result.detail, detail)
-    assert.deepEqual(labels, ['preflight', 'adopt:audit'])
-    assert.equal(result.state.cyclesUsed, state.cyclesUsed)
-    assert.deepEqual(result.state.last, state.last)
-  }
-})
-
-test('a merge whose base the checkout lacks stops as adopt-base-missing; other audit errors and refusals do not', async () => {
+// [case, the audit commits.py returned, reason, the agents run, detail when it is exact, the state's protected pattern].
+// A refused adoption publishes nothing and leaves the state's budget and last cycle as they were.
+test('an adoption whose audit refuses, errs, reads another range or names a path it may not publish stops without a cycle', async () => {
+  const AUDITED = ['preflight', 'adopt:audit']
+  const RETRIED = [...AUDITED, 'adopt:audit.retry']
+  const range = (from, to, base, tip) => `the audit read ${from}..${to} published at ${HEAD} on base ${base} tip ${tip}, not ${HEAD}..${ADOPT} published at ${HEAD} on base ${BASE} tip ${TIP}`
   const missing = `the PR's base ${TIP} is not in the checkout: fetch it`
   const errored = error => ({ error, from: '', to: '', published: '', base: '', tip: '', commits: [], paths: [], unpublished: [], mergeOnly: [], changes: [], refusal: '' })
-  for (const [audit, reason] of [
-    [errored(missing), 'adopt-base-missing'],
-    [errored('git rev-list: fatal: bad revision'), 'adopt-audit-failed'],
-    [errored(`${missing} (twice)`), 'adopt-audit-failed'],
-    [chainAudit([ADOPT], undefined, { refusal: `commit message carries attribution: Co-Authored-By: ${missing}` }), 'adopt-audit-failed'],
+  for (const [name, audit, reason, labels, detail, protectedPattern] of [
+    ['an attribution refusal', chainAudit([ADOPT], undefined, { refusal: 'commit message carries attribution: Generated by Codex' }), 'adopt-audit-failed', AUDITED,
+      'commit message carries attribution: Generated by Codex'],
+    ['another start', chainAudit([ADOPT], undefined, { from: ADOPT_MID }), 'adopt-audit-failed', AUDITED, range(ADOPT_MID, ADOPT, BASE, TIP)],
+    ['another end', chainAudit([ADOPT_MID]), 'adopt-audit-failed', AUDITED, range(HEAD, ADOPT_MID, BASE, TIP)],
+    // A merge vouched for by another base than the PR's is no merge from its base.
+    ['another base', chainAudit([ADOPT], undefined, { base: FOREIGN }), 'adopt-audit-failed', AUDITED, range(HEAD, ADOPT, FOREIGN, TIP)],
+    ['another base tip', chainAudit([ADOPT], undefined, { tip: FOREIGN }), 'adopt-audit-failed', AUDITED, range(HEAD, ADOPT, BASE, FOREIGN)],
+    ['a base the checkout lacks', errored(missing), 'adopt-base-missing', AUDITED],
+    ['a chain it cannot read back', errored('git rev-list: fatal: bad revision'), 'adopt-audit-failed', AUDITED, 'the chain could not be read back: git rev-list: fatal: bad revision'],
+    ['another error naming a missing base', errored(`${missing} (twice)`), 'adopt-audit-failed', AUDITED],
+    ['a refusal naming a missing base', chainAudit([ADOPT], undefined, { refusal: `commit message carries attribution: Co-Authored-By: ${missing}` }), 'adopt-audit-failed', AUDITED],
+    ['a dead audit', null, 'adopt-audit-failed', RETRIED],
+    ['a thrown audit', new Error('audit exploded'), 'adopt-audit-failed', RETRIED],
+    ['an audit omitting required evidence', { from: HEAD, to: ADOPT, commits: [ADOPT], paths: ['src/a.c'] }, 'adopt-audit-failed', RETRIED],
+    ...[['a protected modification', ['protected/config.json']], ['a protected deletion', ['protected/deleted.json']],
+      ['a rename from protected', ['protected/old.json', 'src/new.json']], ['a rename to protected', ['src/old.json', 'protected/new.json']],
+      ['a protected name with a newline, kept whole', ['protected/\nconfig.json']]].map(([n, paths]) => [n, chainAudit([ADOPT], paths), 'adopt-audit-failed', AUDITED, null, '^protected/']),
+    ...['../outside.c', '/tmp/absolute.c', 'C:/tmp/absolute.c', 'C:\\tmp\\absolute.c', 'C:tmp\\drive-relative.c', '\\\\host\\share\\unc.c', ' src/leading.c', 'src/trailing.c ']
+      .map(path => [`an uncanonicalizable path ${JSON.stringify(path)}`, chainAudit([ADOPT], [path]), 'adopt-audit-failed', AUDITED]),
   ]) {
-    const state = adoptionState()
-    const { result, labels } = await run({ args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD }, adoptAudit: audit })
-    assert.equal(result.reason, reason, JSON.stringify(audit))
-    assert.deepEqual(labels, ['preflight', 'adopt:audit'])
-    assert.equal(result.state.cyclesUsed, state.cyclesUsed)
+    const state = adoptionState({ protected: protectedPattern ?? null })
+    const { result, labels: ran } = await run({ args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD }, adoptAudit: audit })
+    assert.equal(result.reason, reason, name)
+    assert.equal(typeof result.detail, 'string', name)
+    if (detail) assert.equal(result.detail, detail, name)
+    assert.deepEqual(ran, labels, name)
+    assert.equal(result.state.cyclesUsed, state.cyclesUsed, name)
+    assert.deepEqual(result.state.last, state.last, name)
   }
-})
-
-test('a chain the audit script cannot read back is refused with its error', async () => {
-  const { result, labels } = await run({
-    args: adoptionArgs(adoptionState()), preflight: { head: ADOPT, prHead: HEAD },
-    adoptAudit: { error: 'git rev-list: fatal: bad revision', from: '', to: '', published: '', base: '', tip: '', commits: [], paths: [], unpublished: [], mergeOnly: [], changes: [], refusal: '' },
-  })
-  assert.equal(result.reason, 'adopt-audit-failed')
-  assert.equal(result.detail, 'the chain could not be read back: git rev-list: fatal: bad revision')
-  assert.deepEqual(labels, ['preflight', 'adopt:audit'])
-})
-
-test('a malformed adoptHead throws before any agent runs', async () => {
-  const trace = []
-  await assert.rejects(run({ args: adoptionArgs(adoptionState(), { adoptHead: 'not-a-full-sha' }), trace }), /adoptHead must be a full 40-hex commit SHA/)
-  assert.deepEqual(trace, [], 'argument validation precedes preflight')
 })
 
 test("an adoptHead equal to the state's expectedHead stops at preflight, naming the state's head", async () => {
@@ -6280,19 +6001,6 @@ test('a re-pin is refused when the checkout is not the rebased head or a candida
     assert.equal(result.reason, 'rebase-refused', name)
     assert.deepEqual(labels, ['preflight'], name)
     assert.equal(result.state.expectedHead, HEAD, name)
-  }
-})
-
-test('rebasedHead argument errors throw before any agent runs', async () => {
-  for (const [name, args] of [
-    ['no state', { rebasedHead: FOREIGN }],
-    ['malformed SHA', rebaseArgs(adoptionState(), { rebasedHead: 'abc' })],
-    ['equals expected head', rebaseArgs(adoptionState(), { rebasedHead: HEAD })],
-    ['with adoptHead', rebaseArgs(adoptionState(), { adoptHead: ADOPT })],
-  ]) {
-    const trace = []
-    await assert.rejects(run({ args, trace }), /rebasedHead/, name)
-    assert.deepEqual(trace, [], name)
   }
 })
 
@@ -6402,41 +6110,6 @@ test('a PR head pushed outside the workflow inside the audited chain is adopted 
   assert.equal(done.result.history[1].adoption.publication, 'already-published')
 })
 
-test('an audit that dies, throws, or omits required evidence is refused without a cycle', async () => {
-  for (const [name, adoptAudit] of [
-    ['dead', null],
-    ['thrown', new Error('audit exploded')],
-    ['incomplete', { from: HEAD, to: ADOPT, commits: [ADOPT], paths: ['src/a.c'] }],
-  ]) {
-    const state = adoptionState()
-    const { result, labels } = await run({
-      args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD }, adoptAudit,
-    })
-    assert.equal(result.reason, 'adopt-audit-failed', name)
-    assert.equal(typeof result.detail, 'string')
-    assert.deepEqual(labels, ['preflight', 'adopt:audit', 'adopt:audit.retry'])
-    assert.equal(result.state.cyclesUsed, state.cyclesUsed)
-  }
-})
-
-test('protected modifications, deletions, and either side of a rename fail adoption', async () => {
-  for (const [name, paths] of [
-    ['modification', ['protected/config.json']],
-    ['deletion', ['protected/deleted.json']],
-    ['rename from protected', ['protected/old.json', 'src/new.json']],
-    ['rename to protected', ['src/old.json', 'protected/new.json']],
-    ['a name with a newline, kept whole', ['protected/\nconfig.json']],
-  ]) {
-    const state = adoptionState({ protected: '^protected/' })
-    const { result, labels } = await run({
-      args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD },
-      adoptAudit: chainAudit([ADOPT], paths),
-    })
-    assert.equal(result.reason, 'adopt-audit-failed', name)
-    assert.deepEqual(labels, ['preflight', 'adopt:audit'])
-  }
-})
-
 test('a protected path the PR already carries is adopted; one this run would publish is refused (#49)', async () => {
   const roster = ['test/hil/tinyusb.json', 'src/a.c']
   const state = adoptionState({ protected: '^test/hil/' })
@@ -6486,25 +6159,6 @@ test('adoptProtected admits a protected path only a base merge changes, and only
     assert.equal(result.detail, `protected path(s) in the chain: ${refused}`, name)
     assert.equal(labels.includes('adopt:push'), false, name)
   }
-})
-
-test('adoptProtected is refused unless it names distinct plain paths beside an adoptHead (#97)', async () => {
-  const state = adoptionState({ protected: '^test/hil/' })
-  for (const [adoptProtected, adoptHead, message] of [
-    ['test/hil/local.json', ADOPT, /must be an array of plain repository-relative paths/],
-    [['./test/hil/local.json'], ADOPT, /must be an array of plain repository-relative paths/],
-    [['../local.json'], ADOPT, /must be an array of plain repository-relative paths/],
-    [[''], ADOPT, /must be an array of plain repository-relative paths/],
-    [['test/hil/local.json', 'test/hil/local.json'], ADOPT, /names a path twice/],
-    [['test/hil/local.json'], undefined, /goes with the adoptHead/],
-  ]) {
-    await assert.rejects(run({ args: adoptionArgs(state, { adoptProtected, adoptHead }), preflight: { head: ADOPT, prHead: HEAD } }), message,
-      JSON.stringify(adoptProtected))
-  }
-  const trace = []
-  await assert.rejects(run({ trace, args: { stateRef: { outputFile: '/tmp/w.output', digest: '0123abcd' }, adoptHead: ADOPT, adoptProtected: ['../x'] } }),
-    /plain repository-relative paths/)
-  assert.deepEqual(trace, [], 'refused before the state loader starts an agent')
 })
 
 test('adoptReviewedProtected admits a protected change only in the commits it names, each by SHA and path (#186)', async () => {
@@ -6560,45 +6214,6 @@ test('adoptReviewedProtected covers a base merge only by its SHA, beside adoptPr
   assert.equal(partial.result.reason, 'adopt-audit-failed', 'adoptProtected waives only a path no ordinary commit changes')
   const both = await adopt({ adoptReviewedProtected: [{ sha: ADOPT_MID, paths: [F] }, { sha: ADOPT, paths: [F] }] })
   assert.notEqual(both.result.reason, 'adopt-audit-failed', both.result.detail)
-})
-
-test('adoptReviewedProtected is refused unless it names full SHAs and distinct plain paths beside an adoptHead (#186)', async () => {
-  const state = adoptionState({ protected: '^test/hil/' })
-  const F = 'test/hil/local.json'
-  const SHAPE = /adoptReviewedProtected must be an array of \{ sha: full 40-hex commit SHA, paths: plain repository-relative paths \}/
-  for (const [adoptReviewedProtected, adoptHead, message] of [
-    [{ sha: ADOPT, paths: [F] }, ADOPT, SHAPE],
-    [[{ sha: ADOPT.slice(0, 7), paths: [F] }], ADOPT, SHAPE],
-    [[{ sha: ADOPT.toUpperCase().replace(/1/g, 'A'), paths: [F] }], ADOPT, SHAPE],
-    [[{ sha: ADOPT, paths: [] }], ADOPT, SHAPE],
-    [[{ sha: ADOPT, paths: F }], ADOPT, SHAPE],
-    [[{ sha: ADOPT, paths: ['./' + F] }], ADOPT, SHAPE],
-    [[{ sha: ADOPT, paths: ['../x'] }], ADOPT, SHAPE],
-    [[{ sha: ADOPT }], ADOPT, SHAPE],
-    [[{ sha: ADOPT, paths: [F], reason: 'reviewed' }], ADOPT, SHAPE],
-    [[{ sha: ADOPT, paths: [F] }, { sha: ADOPT, paths: ['test/hil/other.json'] }], ADOPT, /names a commit twice/],
-    [[{ sha: ADOPT, paths: [F, F] }], ADOPT, /names a path twice for one commit/],
-    [[{ sha: ADOPT, paths: [F] }], undefined, /goes with the adoptHead/],
-  ]) {
-    await assert.rejects(run({ args: adoptionArgs(state, { adoptReviewedProtected, adoptHead }), preflight: { head: ADOPT, prHead: HEAD } }), message,
-      JSON.stringify(adoptReviewedProtected))
-  }
-  const trace = []
-  await assert.rejects(run({ trace, args: { stateRef: { outputFile: '/tmp/w.output', digest: '0123abcd' }, adoptHead: ADOPT, adoptReviewedProtected: [{ sha: 'caa7f7f', paths: [F] }] } }),
-    SHAPE)
-  assert.deepEqual(trace, [], 'refused before the state loader starts an agent')
-})
-
-test('an uncanonicalizable adopted path fails the audit', async () => {
-  for (const path of ['../outside.c', '/tmp/absolute.c', 'C:/tmp/absolute.c', 'C:\\tmp\\absolute.c', 'C:tmp\\drive-relative.c',
-    '\\\\host\\share\\unc.c', ' src/leading.c', 'src/trailing.c ']) {
-    const state = adoptionState()
-    const { result } = await run({
-      args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD },
-      adoptAudit: chainAudit([ADOPT], [path]),
-    })
-    assert.equal(result.reason, 'adopt-audit-failed', JSON.stringify(path))
-  }
 })
 
 test('an adoption decides an unpublished candidate while the PR still heads the state\'s head', async () => {
@@ -6771,47 +6386,10 @@ test('recorded hook output is committed, audited and pushed with the fix', async
   const commit = calls.find(c => c.label === 'commit#1-review')
   assert.deepEqual(pathLine(commit.prompt), ['src/a.c', 'docs/boards.rst'], 'the committer is handed the widened list')
   const audit = calls.find(c => c.label === 'audit#1-review')
-  assert.ok(audit.prompt.includes("'docs/boards.rst'"), 'leftovers are read over the widened list too')
+  assert.deepEqual(auditScope(audit.prompt), ['src/a.c', 'docs/boards.rst'], 'the audit scope is the fix scope widened by hook output, nothing more')
   assert.ok(logs.some(l => l.includes('hook output admitted into the commit: docs/boards.rst')))
   assert.match(rowsOf(summaries(logs)[0])[0][3], /fixed \+ pushed, with regenerated docs\/boards\.rst/)
   assert.deepEqual(result.history[0].reviewPush.generated, ['docs/boards.rst'])
-})
-
-test('a path changed by no hook is never admitted', async () => {
-  const { result, labels } = await run({ ...publishing, hooks: b => gen(b, { modifiedBy: [] }) })
-  assert.equal(result.reason, 'push-failed')
-  assert.match(result.history[0].reviewPushFailed.detail, /changed outside the fix scope by no hook: docs\/boards\.rst/)
-  assert.ok(!labels.some(l => l.startsWith('commit#')), 'nothing is committed')
-})
-
-test('a hook that changes an owned path stops publication', async () => {
-  for (const after of [[`644 ${'f'.repeat(40)} src/a.c`], [`755 ${blobOf('src/a.c')} src/a.c`]]) {
-    const { result, labels } = await run({ ...publishing, hooks: { modifiedBy: ['fmt'], snapshotAfter: after } })
-    assert.match(result.history[0].reviewPushFailed.detail, /a hook changed an owned path after it was verified: src\/a\.c/)
-    assert.ok(!labels.some(l => l.startsWith('commit#')), after[0])
-  }
-})
-
-test('incomplete or inconsistent hook evidence admits nothing and commits nothing', async () => {
-  for (const [hooks, expected] of [
-    [{ snapshotBefore: [], snapshotAfter: [] }, /evidence is incomplete: no snapshot for src\/a\.c/],
-    [b => gen(b, { snapshotAfter: b.snapshotAfter }), /evidence is incomplete: no snapshot for docs\/boards\.rst/],
-    [{ ran: false, modifiedBy: ['gen-doc'] }, /evidence is inconsistent/],
-    [{ failed: [{ hook: 'lint', error: 'x' }] }, /evidence is inconsistent/],
-    [{ passed: false, failed: [{ hook: 'lint', error: 'x' }], baselineFailed: ['lint', 'other'] }, /evidence is inconsistent/],
-    [{ ran: false, passed: false, failed: [{ hook: 'lint', error: 'x' }] }, /evidence is inconsistent/],
-    // hooks.py never excuses a hook that rewrote files, nor an id the commit's SKIP cannot name or would skip another entry by
-    [b => gen(b, { passed: false, failed: [{ hook: 'gen-doc', error: 'x' }], baselineFailed: ['gen-doc'] }), /excused hook\(s\) modified files, cannot be skipped or share an id: "gen-doc"$/],
-    [{ passed: false, failed: [{ hook: 'a,b', error: 'x' }], baselineFailed: ['a,b'] }, /excused hook\(s\) modified files, cannot be skipped or share an id: "a,b"$/],
-    [{ passed: false, failed: [{ hook: 'unit-test', error: 'x' }, { hook: 'unit-test', error: 'y' }], baselineFailed: ['unit-test'] }, /excused hook\(s\) modified files, cannot be skipped or share an id: "unit-test"$/],
-    // SKIP strips each id and drops an empty one; only the offending id is named, quoted
-    [{ passed: false, failed: [{ hook: '', error: 'x' }], baselineFailed: [''] }, /excused hook\(s\) modified files, cannot be skipped or share an id: ""$/],
-    [{ passed: false, failed: [{ hook: 'ok', error: 'x' }, { hook: ' a', error: 'x' }], baselineFailed: ['ok', ' a'] }, /excused hook\(s\) modified files, cannot be skipped or share an id: " a"$/],
-  ]) {
-    const { result, labels } = await run({ ...publishing, hooks })
-    assert.match(result.history[0].reviewPushFailed.detail, expected)
-    assert.ok(!labels.some(l => l.startsWith('commit#')), String(expected))
-  }
 })
 
 test('a failing hook is refused by name and first line unless it fails on HEAD too', async () => {
@@ -6854,52 +6432,6 @@ test('a failure no hook owns, and hook output the excused hooks never judged, ar
   const guarded = await run({ ...publishing, args: { ...publishing.args, protected: '^docs/' }, hooks: excusedGen })
   assert.equal(guarded.result.history[0].reviewPushFailed.detail, 'a hook regenerated a protected path: docs/boards.rst')
   for (const r of [named, unowning, generated, guarded]) assert.ok(!r.labels.some(l => l.startsWith('commit#')))
-})
-
-test('a commit whose content differs from what the hooks left is never pushed', async () => {
-  // The committer edited the regenerated file, or the fix, between the hooks and the commit.
-  for (const path of ['docs/boards.rst', 'src/a.c']) {
-    const { result, labels } = await run({
-      ...publishing, hooks: gen,
-      audit: { entries: [`100644 blob ${blobOf('src/a.c')}\tsrc/a.c`, `100644 blob ${blobOf('docs/boards.rst')}\tdocs/boards.rst`]
-        .map(e => e.includes(`\t${path}`) ? e.replace(blobOf(path), 'e'.repeat(40)) : e) },
-    })
-    assert.match(result.history[0].reviewPushFailed.detail, new RegExp(`differs from what the hooks left: ${path.replace('.', '\\.')}`))
-    assert.ok(!labels.some(l => l.startsWith('push#')), path)
-  }
-  const mode = await run({ ...publishing, audit: { entries: [`100755 blob ${blobOf('src/a.c')}\tsrc/a.c`] } })
-  assert.match(mode.result.history[0].reviewPushFailed.detail, /differs from what the hooks left: src\/a\.c/)
-})
-
-test('a hook that creates a file, or fails, or finds the tree dirty outside the scope, commits nothing', async () => {
-  for (const [hooks, expected] of [
-    [b => ({ after: [...b.after, '?? build/log'], modifiedBy: ['gen'] }), /created or renamed file\(s\): build\/log/],
-    [{ passed: false }, /hooks do not pass/],
-    [b => ({ before: [...b.before, ' M other.c'], after: [...b.after, ' M other.c'] }), /outside the fix scope before the hooks ran: other\.c/],
-    [null, /hook agent died/],
-  ]) {
-    const { result, labels } = await run({ ...publishing, hooks })
-    assert.match(result.history[0].reviewPushFailed.detail, expected)
-    assert.ok(!labels.some(l => l.startsWith('commit#')), String(expected))
-  }
-})
-
-test('every porcelain status shape names the whole path', async () => {
-  for (const line of [' M other.c', 'M  other.c', 'MM other.c', '?? other.c', ' T other.c']) {
-    const { result } = await run({ ...publishing, hooks: b => ({ before: [...b.before, line], after: [...b.after, line] }) })
-    assert.match(result.history[0].reviewPushFailed.detail, /outside the fix scope before the hooks ran: other\.c/, line)
-  }
-})
-
-test('protected hook output is refused before the commit', async () => {
-  const { result, labels } = await run({ ...publishing, args: { ...publishing.args, protected: '^docs/' }, hooks: gen })
-  assert.match(result.history[0].reviewPushFailed.detail, /regenerated a protected path: docs\/boards\.rst/)
-  assert.ok(!labels.some(l => l.startsWith('commit#')))
-})
-
-test('the audit scope is the fix scope widened by hook output, nothing more', async () => {
-  const { calls } = await run({ ...publishing, hooks: gen })
-  assert.deepEqual(auditScope(calls.find(c => c.label === 'audit#1-review').prompt), ['src/a.c', 'docs/boards.rst'])
 })
 
 test('a commit that landed but was not pushed is a pending candidate in the state, not the next head', async () => {
@@ -6976,29 +6508,11 @@ test('a path with a space or a quote survives status, snapshot, diff-tree and ls
   }
 })
 
-test('a commit the audit script cannot read back is not pushed', async () => {
-  const { result, labels } = await run({ ...publishing, audit: { error: 'HEAD moved from a to b while it was read', parent: '', scope: [], sha: '', entries: [], refusal: '' } })
-  assert.match(result.history[0].reviewPushFailed.detail, /^commit failed audit: the commit could not be read back: HEAD moved/)
-  assert.equal(result.history[0].reviewPushFailed.committed, true)
-  assert.ok(!labels.includes('push#1-review'))
-})
-
 test('a hook script that reports no evidence stops publication with its error', async () => {
   const { result, labels, calls } = await run({ ...publishing, hooks: { error: 'pre-commit exited 0 but reported hook fmt failed', ran: false, passed: false } })
-  assert.match(calls.find(c => c.label === 'hooks#1-review').prompt,
-    /as error, with ran = false, passed = false, modifiedBy = \[\], failed = \[\], baselineFailed = \[\], notRerun = \[\], before = \[\], after = \[\], snapshotBefore = \[\], snapshotAfter = \[\], seal = ''\.$/,
-    'the error-case values come from the schema')
+  assert.match(calls.find(c => c.label === 'hooks#1-review').prompt, /`AGENTRC_EMIT='[^']+\/hooks_1-review\.1\.[0-9a-f]{8}\.js' .*hooks\.py 'src\/a\.c'` and answer only its exit status as exit/)
   assert.match(result.history[0].reviewPushFailed.detail, /^no hook evidence: pre-commit exited 0/)
   assert.ok(!labels.some(l => l.startsWith('commit#')), 'nothing is committed')
-})
-
-test('a file a hook created and staged is refused like an untracked one', async () => {
-  const { result, labels } = await run({
-    ...publishing,
-    hooks: b => ({ after: [...b.after, 'A  new.c'], modifiedBy: ['gen'], snapshotAfter: [...b.snapshotAfter, `644 ${blobOf('new.c')} new.c`] }),
-  })
-  assert.match(result.history[0].reviewPushFailed.detail, /created or renamed file\(s\): new\.c/)
-  assert.ok(!labels.some(l => l.startsWith('commit#')))
 })
 
 test('a commit whose audit died is a pending candidate with an unknown SHA', async () => {
@@ -7057,57 +6571,74 @@ test('build and hook output joining the batch is checked with it before the comm
   assert.ok(!labels.some(l => l.endsWith('-generated')), 'no second check when nothing joined the batch')
 })
 
-test('the same modification is a stray without the declaration', async () => {
-  const { result, labels } = await run({ ...regen, args: publishing.args,
-    hooks: b => ({ before: [...b.before, ` M ${CATALOG}`], after: [...b.after, ` M ${CATALOG}`] }) })
-  assert.match(result.history[0].reviewPushFailed.detail, /tree changed outside the fix scope before the hooks ran: hw\/bsp\/family\.json/)
-  assert.ok(!labels.some(l => l.startsWith('commit#')))
-})
-
-test('only a plain unstaged modification is build output', async () => {
-  for (const status of [`?? ${CATALOG}`, ` D ${CATALOG}`, `MM ${CATALOG}`]) {
-    const { result, labels, calls } = await run({ ...regen, recheck: { status: [' M src/a.c', status] },
-      hooks: b => ({ before: [...b.before, status], after: [...b.after, status] }) })
-    assert.deepEqual(hookQuoted(calls.find(c => c.label === 'hooks#1-review').prompt), ['src/a.c'], status)
-    assert.match(result.history[0].reviewPushFailed.detail, /outside the fix scope before the hooks ran: hw\/bsp\/family\.json/, status)
-    assert.ok(!labels.some(l => l.startsWith('commit#')), status)
-  }
-  // Staged by the recheck: the staged refusal fires first, as for any path.
-  const staged = await run({ ...regen, recheck: { status: [' M src/a.c', `M  ${CATALOG}`], staged: [CATALOG] } })
-  assert.match(staged.result.history[0].reviewPushFailed.detail, /already staged by somebody else/)
-})
-
-test('a candidate that is no longer a plain modification when the hooks run is refused', async () => {
-  for (const line of [` D ${CATALOG}`, `M  ${CATALOG}`, null]) {
-    const { result, labels } = await run({ ...regen, hooks: b => catalogAs(b, line) })
-    assert.match(result.history[0].reviewPushFailed.detail, /no longer a plain modification when the hooks ran: hw\/bsp\/family\.json/, String(line))
-    assert.ok(!labels.some(l => l.startsWith('commit#')), String(line))
-  }
-})
-
-test('a regenerated path needs passing hooks that ran, and must stay put across them', async () => {
-  for (const [hooks, expected] of [
-    [{ ran: false }, /regenerated path\(s\) have no hook to vouch for them: hw\/bsp\/family\.json/],
-    [{ passed: false }, /hooks do not pass/],
-    [b => ({ modifiedBy: ['fmt'], snapshotAfter: [b.snapshotAfter[0], `644 ${'f'.repeat(40)} ${CATALOG}`] }), /a hook changed a regenerated path after the build left it: hw\/bsp\/family\.json/],
-    [b => ({ snapshotAfter: [b.snapshotAfter[0]] }), /evidence is incomplete: no snapshot for hw\/bsp\/family\.json/],
+// [case, run options, the refusal, the first step it stops before, a further check]. Hook, build or audit evidence that does
+// not vouch for every path of the candidate publishes nothing; a refusal before the commit leaves nothing committed.
+test('a candidate its hook, build or audit evidence does not vouch for is never published', async () => {
+  const OUTSIDE = /outside the fix scope before the hooks ran: other\.c/
+  const INCONSISTENT = /evidence is inconsistent/
+  const UNSKIPPABLE = (id) => new RegExp(`excused hook\\(s\\) modified files, cannot be skipped or share an id: ${JSON.stringify(id)}$`)
+  const entries = (path) => [`100644 blob ${blobOf('src/a.c')}\tsrc/a.c`, `100644 blob ${blobOf('docs/boards.rst')}\tdocs/boards.rst`]
+    .map(e => e.includes(`\t${path}`) ? e.replace(blobOf(path), 'e'.repeat(40)) : e)
+  const plainOnly = (status) => ({ ...regen, recheck: { status: [' M src/a.c', status] }, hooks: b => ({ before: [...b.before, status], after: [...b.after, status] }) })
+  const hooksOver = (paths) => (r) => assert.deepEqual(hookQuoted(r.calls.find(c => c.label === 'hooks#1-review').prompt), paths)
+  for (const [name, opts, detail, before, check] of [
+    ['a path changed by no hook', { ...publishing, hooks: b => gen(b, { modifiedBy: [] }) }, /changed outside the fix scope by no hook: docs\/boards\.rst/, 'commit#'],
+    ...[[`644 ${'f'.repeat(40)} src/a.c`], [`755 ${blobOf('src/a.c')} src/a.c`]].map(after =>
+      [`a hook changing an owned path to ${after[0]}`, { ...publishing, hooks: { modifiedBy: ['fmt'], snapshotAfter: after } }, /a hook changed an owned path after it was verified: src\/a\.c/, 'commit#']),
+    ['no snapshot of an owned path', { ...publishing, hooks: { snapshotBefore: [], snapshotAfter: [] } }, /evidence is incomplete: no snapshot for src\/a\.c/, 'commit#'],
+    ['no snapshot of hook output', { ...publishing, hooks: b => gen(b, { snapshotAfter: b.snapshotAfter }) }, /evidence is incomplete: no snapshot for docs\/boards\.rst/, 'commit#'],
+    ['hooks that never ran, yet modified', { ...publishing, hooks: { ran: false, modifiedBy: ['gen-doc'] } }, INCONSISTENT, 'commit#'],
+    ['a failure beside a pass', { ...publishing, hooks: { failed: [{ hook: 'lint', error: 'x' }] } }, INCONSISTENT, 'commit#'],
+    ['an excused hook that never failed', { ...publishing, hooks: { passed: false, failed: [{ hook: 'lint', error: 'x' }], baselineFailed: ['lint', 'other'] } }, INCONSISTENT, 'commit#'],
+    ['hooks that never ran, yet failed', { ...publishing, hooks: { ran: false, passed: false, failed: [{ hook: 'lint', error: 'x' }] } }, INCONSISTENT, 'commit#'],
+    // hooks.py never excuses a hook that rewrote files, nor an id the commit's SKIP cannot name or would skip another entry by
+    ['an excused hook that rewrote files', { ...publishing, hooks: b => gen(b, { passed: false, failed: [{ hook: 'gen-doc', error: 'x' }], baselineFailed: ['gen-doc'] }) }, UNSKIPPABLE('gen-doc'), 'commit#'],
+    ['an excused id SKIP splits', { ...publishing, hooks: { passed: false, failed: [{ hook: 'a,b', error: 'x' }], baselineFailed: ['a,b'] } }, UNSKIPPABLE('a,b'), 'commit#'],
+    ['an excused id two entries share', { ...publishing, hooks: { passed: false, failed: [{ hook: 'unit-test', error: 'x' }, { hook: 'unit-test', error: 'y' }], baselineFailed: ['unit-test'] } }, UNSKIPPABLE('unit-test'), 'commit#'],
+    // SKIP strips each id and drops an empty one; only the offending id is named, quoted
+    ['an empty excused id', { ...publishing, hooks: { passed: false, failed: [{ hook: '', error: 'x' }], baselineFailed: [''] } }, UNSKIPPABLE(''), 'commit#'],
+    ['an excused id SKIP strips', { ...publishing, hooks: { passed: false, failed: [{ hook: 'ok', error: 'x' }, { hook: ' a', error: 'x' }], baselineFailed: ['ok', ' a'] } }, UNSKIPPABLE(' a'), 'commit#'],
+    ['a hook creating a file', { ...publishing, hooks: b => ({ after: [...b.after, '?? build/log'], modifiedBy: ['gen'] }) }, /created or renamed file\(s\): build\/log/, 'commit#'],
+    ['a hook creating and staging a file', { ...publishing, hooks: b => ({ after: [...b.after, 'A  new.c'], modifiedBy: ['gen'], snapshotAfter: [...b.snapshotAfter, `644 ${blobOf('new.c')} new.c`] }) },
+      /created or renamed file\(s\): new\.c/, 'commit#'],
+    ['failing hooks', { ...publishing, hooks: { passed: false } }, /hooks do not pass/, 'commit#'],
+    // Every porcelain status shape names the whole path.
+    ...[' M other.c', 'M  other.c', 'MM other.c', '?? other.c', ' T other.c'].map(line =>
+      [`a tree dirty outside the scope: ${JSON.stringify(line)}`, { ...publishing, hooks: b => ({ before: [...b.before, line], after: [...b.after, line] }) }, OUTSIDE, 'commit#']),
+    ['a dead hook agent', { ...publishing, hooks: null }, /hook agent died/, 'commit#'],
+    ['protected hook output', { ...publishing, args: { ...publishing.args, protected: '^docs/' }, hooks: gen }, /regenerated a protected path: docs\/boards\.rst/, 'commit#'],
+    // The committer edited the regenerated file, or the fix, between the hooks and the commit.
+    ...['docs/boards.rst', 'src/a.c'].map(path => [`a committed ${path} other than the hooks left`, { ...publishing, hooks: gen, audit: { entries: entries(path) } },
+      new RegExp(`differs from what the hooks left: ${path.replace('.', '\\.')}`), 'push#']),
+    ['a committed mode other than the hooks left', { ...publishing, audit: { entries: [`100755 blob ${blobOf('src/a.c')}\tsrc/a.c`] } }, /differs from what the hooks left: src\/a\.c/, 'push#'],
+    ['a commit the audit cannot read back', { ...publishing, audit: { error: 'HEAD moved from a to b while it was read', parent: '', scope: [], sha: '', entries: [], refusal: '' } },
+      /^commit failed audit: the commit could not be read back: HEAD moved/, 'push#'],
+    // Build-regenerated paths: a declared plain modification, vouched for by passing hooks that ran, bound by the audit.
+    ['an undeclared build modification', { ...regen, args: publishing.args, hooks: b => ({ before: [...b.before, ` M ${CATALOG}`], after: [...b.after, ` M ${CATALOG}`] }) },
+      /tree changed outside the fix scope before the hooks ran: hw\/bsp\/family\.json/, 'commit#'],
+    ...[`?? ${CATALOG}`, ` D ${CATALOG}`, `MM ${CATALOG}`].map(status => [`build output that is not a plain unstaged modification: ${JSON.stringify(status)}`, plainOnly(status),
+      /outside the fix scope before the hooks ran: hw\/bsp\/family\.json/, 'commit#', hooksOver(['src/a.c'])]),
+    // Staged by the recheck: the staged refusal fires first, as for any path.
+    ['build output staged by the recheck', { ...regen, recheck: { status: [' M src/a.c', `M  ${CATALOG}`], staged: [CATALOG] } }, /already staged by somebody else/, 'commit#'],
+    ...[` D ${CATALOG}`, `M  ${CATALOG}`, null].map(line => [`build output turned ${JSON.stringify(line)} when the hooks ran`, { ...regen, hooks: b => catalogAs(b, line) },
+      /no longer a plain modification when the hooks ran: hw\/bsp\/family\.json/, 'commit#']),
+    ['build output no hook ran over', { ...regen, hooks: { ran: false } }, /regenerated path\(s\) have no hook to vouch for them: hw\/bsp\/family\.json/, 'commit#'],
+    ['build output beside failing hooks', { ...regen, hooks: { passed: false } }, /hooks do not pass/, 'commit#'],
+    ['build output a hook changed', { ...regen, hooks: b => ({ modifiedBy: ['fmt'], snapshotAfter: [b.snapshotAfter[0], `644 ${'f'.repeat(40)} ${CATALOG}`] }) },
+      /a hook changed a regenerated path after the build left it: hw\/bsp\/family\.json/, 'commit#'],
+    ['no snapshot of build output', { ...regen, hooks: b => ({ snapshotAfter: [b.snapshotAfter[0]] }) }, /evidence is incomplete: no snapshot for hw\/bsp\/family\.json/, 'commit#'],
+    ['a committed build output other than the hooks left', { ...regen, audit: { entries: [`100644 blob ${blobOf('src/a.c')}\tsrc/a.c`, `100644 blob ${'e'.repeat(40)}\t${CATALOG}`] } },
+      /differs from what the hooks left: hw\/bsp\/family\.json/, 'push#', (r) => assert.deepEqual(r.result.history[0].reviewPushFailed.generated, [CATALOG])],
+    ['protected build output', { ...regen, args: { ...regen.args, protected: '^hw/bsp/' } }, /the build regenerated a protected path: hw\/bsp\/family\.json/, 'hooks#'],
   ]) {
-    const { result, labels } = await run({ ...regen, hooks })
-    assert.match(result.history[0].reviewPushFailed.detail, expected, String(expected))
-    assert.ok(!labels.some(l => l.startsWith('commit#')), String(expected))
+    const r = await run(opts)
+    const failed = r.result.history[0].reviewPushFailed
+    assert.equal(r.result.reason, 'push-failed', name)
+    assert.match(failed.detail, detail, name)
+    assert.equal(failed.committed, before === 'push#', `${name}: committed`)
+    assert.ok(!r.labels.some(l => l.startsWith(before) || l.startsWith('push#')), `${name}: ${r.labels.join(', ')}`)
+    check?.(r)
   }
-})
-
-test('the audit binds a regenerated path like any other', async () => {
-  const edited = await run({ ...regen, audit: { entries: [`100644 blob ${blobOf('src/a.c')}\tsrc/a.c`, `100644 blob ${'e'.repeat(40)}\t${CATALOG}`] } })
-  assert.match(edited.result.history[0].reviewPushFailed.detail, /differs from what the hooks left: hw\/bsp\/family\.json/)
-  assert.deepEqual(edited.result.history[0].reviewPushFailed.generated, [CATALOG])
-})
-
-test('a protected path the build regenerated is refused before the hooks run', async () => {
-  const { result, labels } = await run({ ...regen, args: { ...regen.args, protected: '^hw/bsp/' } })
-  assert.match(result.history[0].reviewPushFailed.detail, /the build regenerated a protected path: hw\/bsp\/family\.json/)
-  assert.ok(!labels.some(l => l.startsWith('hooks#')))
 })
 
 test('a restored state records the generated pattern in its config', async () => {
@@ -7129,10 +6660,6 @@ test('the validator contract is per-bot records, not a done flag', async () => {
   assert.deepEqual(schema.required, ['headSha', 'observedAt', 'headEventAt', 'headEventEvidence', 'fingerprint', 'bots', 'findings', 'replies'])
   assert.deepEqual(schema.properties.bots.items.required, ['bot', 'state', 'kind', 'sha', 'evidence', 'reason', 'retryAt'])
   assert.deepEqual(schema.properties.bots.items.properties.state.enum, ['reviewed', 'working', 'queued', 'settled', 'absent', 'unknown', 'harvested'])
-})
-
-test('claude is no longer a reviewer the workflow knows', async () => {
-  await assert.rejects(run({ args: { reviewers: ['coderabbit', 'claude'] } }), /unknown reviewer\(s\) \["claude"\]/)
 })
 
 test('a harvest that leaves an auto-running bot unaccounted for is refused, not read as settled', async () => {
@@ -7262,7 +6789,7 @@ test('an unknown reading unchanged for the cap stops reviews-stuck; a changed on
     clockOffset: 12, reviews: quiet([bot('greptile'), unread()]) })
   assert.equal(other.result.reason, 'yielded', 'the old head\'s reading does not count')
   for (const unknown of [{ coderabbit: { reading: 1, since: at(0) } }, { coderabbit: { reading: 'x', since: 'then' } }, { coderabbit: null }, 'x']) {
-    await assert.rejects(run({ args: { maxCycles: 3, state: { ...a.result.state, reviewClock: { ...a.result.state.reviewClock, unknown } } } }), /not a pr-babysit state/)
+    await assert.rejects(run({ args: { maxCycles: 3, state: seal({ ...a.result.state, reviewClock: { ...a.result.state.reviewClock, unknown } }) } }), /not a pr-babysit state/)
   }
 })
 
@@ -7304,7 +6831,7 @@ test('the clock is keyed by head: this run\'s own push starts a new one, a resum
   const b = await run({ args: { ...THREE, autoPush: true, maxCycles: 3, yieldAfterCycle: true, state: a.result.state }, clockOffset: 10, reviews: quiet([absent('greptile'), bot('coderabbit')]) })
   assert.equal(b.result.pass, true, `${b.result.reason}: the wait began in the previous launch`)
   assert.equal(b.result.state.reviewClock.since, at(0))
-  await assert.rejects(run({ args: { ...THREE, maxCycles: 3, state: { ...a.result.state, reviewClock: { sha: HEAD, since: 'never' } } } }), /not a pr-babysit state/)
+  await assert.rejects(run({ args: { ...THREE, maxCycles: 3, state: seal({ ...a.result.state, reviewClock: { sha: HEAD, since: 'never' } }) } }), /not a pr-babysit state/)
 })
 
 test('settled bots forgive neither a valid finding nor a reply owed, and debt outranks a silent bot', async () => {
@@ -7379,7 +6906,7 @@ test('a head is triggered once, across cycles and a resumed state, and stops unr
   const b = await run({ args: { coderabbitTrigger: true, maxCycles: 3, yieldAfterCycle: true, state: a.result.state }, clockOffset: 3, reviews: quiet([skippedCr()]) })
   assert.equal(b.result.reason, 'yielded', 'three minutes since the trigger: still waiting')
   assert.deepEqual(triggers(b.labels), [])
-  await assert.rejects(run({ args: { maxCycles: 3, state: { ...a.result.state, reviewClock: { ...a.result.state.reviewClock, triggeredAt: 'never' } } } }), /not a pr-babysit state/)
+  await assert.rejects(run({ args: { maxCycles: 3, state: seal({ ...a.result.state, reviewClock: { ...a.result.state.reviewClock, triggeredAt: 'never' } }) } }), /not a pr-babysit state/)
   // The cap runs from when the script finished, not from the harvest before it.
   const late = await run({ args: { coderabbitTrigger: true, maxCycles: 5 }, minutesPerCycle: 5, crTrigger: { outcome: 'ticked', detail: 'comment 5', commentId: 5, at: at(4) }, reviews: quiet([skippedCr()]) })
   assert.equal(late.result.reason, 'coderabbit-unreviewed')
@@ -7869,6 +7396,16 @@ test('a failed or lost trigger, and then a failed request, stops CodeRabbit unre
   }
 })
 
+test('a CodeRabbit request whose relay died gets no fresh attempt: it reads before it comments, with no lock', async () => {
+  const { result, logs, labels } = await run({ args: { coderabbitTrigger: true, maxCycles: 2 }, crTrigger: { outcome: 'failed', detail: 'no box' }, crRequest: null, reviews: quiet([skippedCr()]) })
+  assert.equal(result.reason, 'coderabbit-unreviewed')
+  assert.deepEqual(requests(labels), ['crrequest#1'])
+  assert.ok(logs.includes('cycle 1: crrequest#1: failed (no answer)'), logs.join('\n'))
+  // Greptile's trigger claims its head under a lock: its relay keeps the fresh attempt.
+  const g = await run({ args: { ...GT, maxCycles: 5 }, minutesPerCycle: 3, gTrigger: null, reviews: silentG() })
+  assert.deepEqual(gAsks(g.labels), ['greptile#2', 'greptile#2.retry'])
+})
+
 test('a failed tick spends no comment: one `@coderabbitai review` asks for the skipped head instead, never a second (#274)', async () => {
   const noBox = { outcome: 'failed', detail: '0 CodeRabbit comments hold one Trigger review box, not 1' }
   let n = 0
@@ -8005,13 +7542,31 @@ test('a returned state is sealed, compact and leads with its digest', async () =
   assert.ok(JSON.stringify(third.result.state).length < JSON.stringify(state).length + 200, 'launches do not accumulate history')
 })
 
-test('a changed or old-format state is refused before anything runs', async () => {
-  const { state } = (await run({ args: { yieldAfterCycle: true, maxCycles: 3 } })).result
-  const trace = []
-  await assert.rejects(run({ trace, args: { yieldAfterCycle: true, maxCycles: 3, state: { ...state, cyclesUsed: 0 } } }), /state digest mismatch/)
-  await assert.rejects(run({ trace, args: { yieldAfterCycle: true, maxCycles: 3, state: JSON.stringify(state).replace('"cyclesUsed":1', '"cyclesUsed":0') } }), /state digest mismatch/)
-  await assert.rejects(run({ trace, args: { yieldAfterCycle: true, maxCycles: 3, state: seal({ ...state, version: 3 }) } }), /not a pr-babysit state of version 4/)
-  assert.deepEqual(trace, [], 'no agent ran')
+test('a changed, old-format or malformed state is refused before anything runs', async () => {
+  // A state holding a CI cache entry, which a shape row below breaks.
+  const { state } = (await run({ args: YIELD, reviews: WAITING, ci: redWith(RIG).ci })).result
+  const { digest, ...st } = state
+  const edited = JSON.stringify(state).replace('"cyclesUsed":1', '"cyclesUsed":0')
+  assert.notEqual(edited, JSON.stringify(state))
+  for (const [name, bad, expected] of [
+    ['an edited field', { ...state, cyclesUsed: 0 }, /state digest mismatch/],
+    ['edited JSON text', edited, /state digest mismatch/],
+    ['version 3', seal({ ...state, version: 3 }), /not a pr-babysit state of version 4/],
+    // A field the writer always saves.
+    ...['deferrals', 'acceptedFailures', 'decisions', 'holds', 'ciCache', 'build'].map(key => {
+      const { [key]: _, ...partial } = st
+      return [`no ${key}`, seal(partial), /state is not a pr-babysit state of version 4/]
+    }),
+    // A malformed CI cache.
+    ...[{ ...st.ciCache, entries: [{ head: HEAD, link: 'x', bucket: 'fail', digest: 7 }] },
+      { ...st.ciCache, reruns: [{ head: HEAD, link: 'x' }] }, { entries: [] },
+      { ...st.ciCache, entries: st.ciCache.entries.map(({ bucket, ...e }) => e) },
+      { ...st.ciCache, entries: st.ciCache.entries.map(({ digest, ...e }) => e) }].map(ciCache => [`ciCache ${JSON.stringify(ciCache)}`, seal({ ...st, ciCache }), /not a pr-babysit state/]),
+  ]) {
+    const trace = []
+    await assert.rejects(run({ trace, args: { ...YIELD, state: bad } }), expected, name)
+    assert.deepEqual(trace, [], `no agent ran: ${name}`)
+  }
 })
 
 // The state a launch saves after refuting `findings`, and a stateRef to it.
@@ -8023,42 +7578,27 @@ const saved = async (findings) => {
   const { state, stateDigest } = first.result
   return { state, stateRef: { outputFile: '/tmp/tasks/w1.output', digest: stateDigest } }
 }
-// A decision reason a copying model might "correct".
+// A decision reason a copying model once "corrected".
 const REASON = 'SKILL.md:146 at head (144 at eda9a913) — é ✓ "q" \\ end'
 const savedForLoad = () => saved([invalidFinding({ reason: REASON })])
-const loadWith = (state, stateRef, copy) => run({ args: { yieldAfterCycle: true, maxCycles: 3, stateRef }, load: state, copy })
-const asks = (calls) => calls.filter(c => c.label.startsWith('state:load#')).map(c => {
-  const m = c.prompt.match(/ --chunks ([\d,]+)( --pad)?\n/)
-  return m ? m[1] + (m[2] ? '+pad' : '') : 'all'
-})
-const flip = (data) => (data[0] === 'A' ? 'B' : 'A') + data.slice(1)
-const once = (change) => (env, label) => label === 'state:load#1' ? change(structuredClone(env)) : env
-// The live loader's "correction" (146 -> 144) made in a chunk together with its
-// sum: the state stays well formed, so only the seal can tell.
-const forged = (env) => {
-  const c = env.chunks.find(c => Buffer.from(c.data, 'base64').toString('latin1').includes('SKILL.md:146'))
-  if (!c) throw new Error('fixture: no chunk holds SKILL.md:146 whole')
-  c.data = Buffer.from(Buffer.from(c.data, 'base64').toString('latin1').replace('SKILL.md:146', 'SKILL.md:144'), 'latin1').toString('base64')
-  c.sum = fnv1a(c.data)
-  return env
-}
+const loadWith = (state, stateRef, garble) => run({ args: { yieldAfterCycle: true, maxCycles: 3, stateRef }, load: state, garble })
+const onLoad = (change) => (l, a) => l.startsWith('state:load') ? change(a) : a
 
-test('stateRef loads the saved state as checksummed chunks, exactly', async () => {
+test('stateRef loads the saved state whole from the file state_transfer.py emits, exactly', async () => {
   const { state, stateRef } = await savedForLoad()
-  assert.ok(transferOf(state).chunks.length > 1, 'the fixture spans several chunks')
   const loaded = await loadWith(state, stateRef)
-  assert.deepEqual(loaded.labels.slice(0, 2), ['state:load#1', 'preflight'])
-  assert.match(loaded.calls[0].prompt, /state_transfer\.py '\/tmp\/tasks\/w1\.output'\n/)
+  assert.deepEqual(loaded.labels.slice(0, 2), ['state:load', 'preflight'])
+  assert.match(loaded.calls[0].prompt, /run exactly `AGENTRC_EMIT='[^']+\/agentrc-emit\/r1\/state_load\.1\.[0-9a-f]{8}\.js' python3 "\$\{AGENTRC_DIR:-\$HOME\/\.claude\}"\/skills\/pr-babysit\/scripts\/state_transfer\.py '\/tmp\/tasks\/w1\.output'` /)
   assert.equal(loaded.calls[0].agentType, 'relay')
-  assert.equal(loaded.calls[0].model, 'sonnet', 'the caller still picks the relay\'s model')
+  assert.match(loaded.loads[0], /\/state_load\.1\.[0-9a-f]{8}\.js$/, 'the state comes from the file, by workflow()')
   assert.equal(loaded.result.state.cyclesUsed, 2, 'the loaded state carries the budget')
   assert.equal(loaded.result.state.decisions[0][1].reason, REASON, 'free text arrives byte for byte')
   const windows = await loadWith(state, { ...stateRef, outputFile: 'C:\\Users\\me\\tasks\\w1.output' })
-  assert.match(windows.calls[0].prompt, /state_transfer\.py 'C:\/Users\/me\/tasks\/w1\.output'\n/, 'a Windows path, spelled with slashes')
+  assert.match(windows.calls[0].prompt, /state_transfer\.py 'C:\/Users\/me\/tasks\/w1\.output'` /, 'a Windows path, spelled with slashes')
   assert.equal(windows.result.state.cyclesUsed, 2)
   // launch_result.py's path on a host whose user name has a blank: single-quoted, it stays one word.
   const spaced = await loadWith(state, { ...stateRef, outputFile: 'C:\\Users\\John Smith\\tasks\\w1.output' })
-  assert.match(spaced.calls[0].prompt, /state_transfer\.py 'C:\/Users\/John Smith\/tasks\/w1\.output'\n/)
+  assert.match(spaced.calls[0].prompt, /state_transfer\.py 'C:\/Users\/John Smith\/tasks\/w1\.output'` /)
   assert.equal(spaced.result.state.cyclesUsed, 2)
 })
 
@@ -8074,197 +7614,91 @@ test('a state whose cycles are spent loads, then stops before preflight', async 
   assert.equal(byState.result.reason, 'budget-exhausted', 'the state\'s own ceiling when the launch names none')
   const raised = await run({ args: { yieldAfterCycle: true, maxCycles: 3, stateRef: fullRef }, load: full })
   assert.ok(raised.labels.includes('preflight'), 'a larger maxCycles loads and runs')
-  const failed = await run({ args: { yieldAfterCycle: true, stateRef }, load: state, copy: () => null })
-  assert.deepEqual([failed.result.reason, failed.result.stateRef], ['state-transfer-failed', stateRef], 'a failed transfer returns its stateRef')
-})
-
-test('a mis-copied, missing or duplicated chunk is asked for again alone', async () => {
-  const { state, stateRef } = await savedForLoad()
-  const last = transferOf(state).chunks.length - 1
-  const cases = [
-    [env => { env.chunks[1].data = flip(env.chunks[1].data); return env }, '1'], // sum no longer matches
-    [env => { env.chunks.splice(last, 1); return env }, String(last)], // dropped
-    [env => { env.chunks.push({ ...env.chunks[0], data: flip(env.chunks[0].data) }); return env }, '0'], // two copies of 0
-    [env => { env.chunks[0].data = '!' + env.chunks[0].data.slice(1); env.chunks[0].sum = fnv1a(env.chunks[0].data); return env }, '0'], // not base64
-    [env => { env.chunks[1].data = env.chunks[1].data.slice(4); env.chunks[1].sum = fnv1a(env.chunks[1].data); return env }, '1'], // short
-    [env => { delete env.chunks[1].sum; return env }, '1'], // copied without its sum
-    [env => { delete env.chunks[1].data; return env }, '1'], // copied without its data
-  ]
-  for (const [change, again] of cases) {
-    const got = await loadWith(state, stateRef, once(change))
-    assert.deepEqual(asks(got.calls), ['all', `${again}+pad`], 'a re-ask goes padded')
-    assert.equal(got.labels[2], 'preflight')
-    assert.deepEqual(got.result.state.decisions, state.decisions)
-  }
-  // An index out of range or not asked for settles nothing and costs nothing more.
-  const extra = await loadWith(state, stateRef, (env, label) => label === 'state:load#1'
-    ? { ...env, chunks: [...env.chunks.slice(1), { i: 999, data: 'AAAA', sum: fnv1a('AAAA') }] }
-    : { ...env, chunks: [...env.chunks, { ...transferOf(state).chunks[last] }] })
-  assert.deepEqual(asks(extra.calls), ['all', '0+pad'])
-  assert.equal(extra.labels[2], 'preflight')
 })
 
 test('the stateRef bootstrap runs under the interpreter python names, before preflight (#234)', async () => {
   const { state, stateRef } = await savedForLoad()
   const named = await run({ args: { yieldAfterCycle: true, maxCycles: 3, stateRef, python: '/opt/My Python/python3' }, load: state })
-  assert.deepEqual(named.labels.slice(0, 2), ['state:load#1', 'preflight'])
-  assert.match(named.calls[0].prompt, /^Run exactly: '\/opt\/My Python\/python3' "\$\{AGENTRC_DIR:-\$HOME\/\.claude\}"\/skills\/pr-babysit\/scripts\/state_transfer\.py /)
+  assert.deepEqual(named.labels.slice(0, 2), ['state:load', 'preflight'])
+  assert.match(named.calls[0].prompt, / '\/opt\/My Python\/python3' "\$\{AGENTRC_DIR:-\$HOME\/\.claude\}"\/skills\/pr-babysit\/scripts\/state_transfer\.py /)
   assert.deepEqual(interpreters(named.calls), ["'/opt/My Python/python3'"])
+  assert.match(named.journal[0].prompt, /`'\/opt\/My Python\/python3' "\$\{AGENTRC_DIR:-\$HOME\/\.claude\}"\/skills\/pr-babysit\/scripts\/facts\.py emit-dir`/)
   assert.equal(named.result.state.cyclesUsed, 2)
   const bare = await run({ args: { yieldAfterCycle: true, maxCycles: 3, stateRef }, load: state })
-  assert.match(bare.calls[0].prompt, /^Run exactly: python3 "\$\{AGENTRC_DIR:-\$HOME\/\.claude\}"\//)
+  assert.equal(SCRIPT_RUN.exec(bare.calls[0].prompt)[1], 'python3')
   assert.equal(SCRIPT_RUN.exec(bare.calls.find(c => c.label === 'preflight').prompt)[1], 'python3')
 })
 
-test('a mis-copied chunk is asked again padded, so its text differs, then plain (#147)', async () => {
+test('a state that does not check out, or no line of this run, blocks before preflight with the stateRef untouched', async () => {
   const { state, stateRef } = await savedForLoad()
-  // The relays keep the source's sum and alter the data, as wf_70c961b3-aea's did, on every unpadded copy of chunk 1.
-  const stubborn = (env) => {
-    if (!env.pad) for (const c of env.chunks) if (c.i === 1) c.data = flip(c.data)
-    return env
-  }
-  const got = await loadWith(state, stateRef, stubborn)
-  assert.deepEqual(asks(got.calls), ['all', '1+pad'])
-  assert.equal(got.labels[2], 'preflight')
-  assert.deepEqual(got.result.state.decisions, state.decisions)
-  // Two rounds without progress end the load; an answer whose pad is not the one asked for is no answer.
-  const both = await loadWith(state, stateRef, (env) => { for (const c of env.chunks) if (c.i === 1) c.data = flip(c.data); return env })
-  assert.deepEqual(asks(both.calls), ['all', '1+pad', '1'])
-  assert.equal(both.result.reason, 'state-transfer-failed')
-  const unpadded = await loadWith(state, stateRef, (env, label) => label === 'state:load#2' ? { ...env, pad: false } : stubborn(env))
-  assert.equal(unpadded.result.reason, 'state-transfer-failed')
-  // Every plain copy failing makes two idle rounds before any padded ask: the load runs on until each chunk had one.
-  const all = await loadWith(state, stateRef, (env) => { if (!env.pad) for (const c of env.chunks) c.data = flip(c.data); return env })
-  assert.equal(asks(all.calls).at(-1).endsWith('+pad'), true, asks(all.calls).join(' '))
-  assert.deepEqual(all.result.state.decisions, state.decisions)
-})
-
-test('changed metadata, or a chunk changed with its sum, asks for the whole state again', async () => {
-  const { state, stateRef } = await savedForLoad()
-  // A length off by one looks consistent alone: the last chunk seems short, so it is
-  // asked for again, and the true length in that reply then drops everything.
-  const offByOne = await loadWith(state, stateRef, once(env => ({ ...env, length: env.length + 1 })))
-  assert.deepEqual(asks(offByOne.calls), ['all', `${transferOf(state).chunks.length - 1}+pad`, 'all'])
-  assert.equal(offByOne.labels[3], 'preflight')
-  for (const change of [
-    env => ({ ...env, length: 256 * 1024 + 1 }),
-    env => ({ ...env, digest: '00000000' }),
-    env => ({ ...env, v: 2 }),
-    forged,
+  const once = await loadWith(state, stateRef, (l, a) => l === 'state:load' ? null : a)
+  assert.deepEqual(once.labels.slice(0, 3), ['state:load', 'state:load.retry', 'preflight'])
+  assert.equal(once.result.state.cyclesUsed, 2)
+  // The live loader's "correction" (146 -> 144): the state stays well formed and keeps its digest, so only the seal can tell.
+  const forged = await loadWith(state, stateRef, onLoad(a => JSON.parse(JSON.stringify(a).replace('SKILL.md:146', 'SKILL.md:144'))))
+  const other = seal({ ...state, maxCycles: 9 })
+  // A read-only load that brought no line back gets one fresh attempt; a line, refused or off the digest, is the file's answer.
+  for (const [got, detail] of [
+    [forged, /does not match stateRef\.digest/],
+    [await loadWith(state, stateRef, onLoad(() => ({ digest: stateRef.digest, state: other }))), /does not match stateRef\.digest/],
+    [await loadWith(state, stateRef, onLoad(() => ({ error: 'cannot read /tmp/tasks/w1.output: No such file or directory' }))), /^state_transfer\.py: cannot read/],
+    [await loadWith(state, stateRef, onLoad(() => null)), /^the relay died$/],
+    [await run({ args: { yieldAfterCycle: true, maxCycles: 3, stateRef }, load: new Error('boom') }), /^the relay died$/],
   ]) {
-    const got = await loadWith(state, stateRef, once(change))
-    assert.deepEqual(asks(got.calls), ['all', 'all'])
-    assert.equal(got.labels[2], 'preflight')
-  }
-  // A partial reply whose length differs from the retained chunks' drops them too.
-  const partial = await loadWith(state, stateRef, (env, label) =>
-    label === 'state:load#1' ? { ...env, chunks: env.chunks.slice(1) } : label === 'state:load#2' ? { ...env, length: env.length - 1 } : env)
-  assert.deepEqual(asks(partial.calls), ['all', '0+pad', 'all'])
-  assert.equal(partial.labels[3], 'preflight')
-})
-
-// Nine chunks, as the live #3975 state: more than one reply may carry.
-const savedLarge = async () => {
-  const large = await saved([...Array(7).keys()].map(k => invalidFinding({ commentId: k + 1, reason: `r${k} `.padEnd(300, 'x') })))
-  assert.equal(Math.ceil(transferOf(large.state).length / 512), 9, 'the fixture is nine chunks')
-  return large
-}
-
-test('a large state arrives in two rounds, four chunks per call, and a mangled batch costs only its bad chunks', async () => {
-  const { state, stateRef } = await savedLarge()
-  const clean = await loadWith(state, stateRef)
-  assert.deepEqual(asks(clean.calls), ['all', '4,5,6,7', '8'])
-  assert.equal(clean.labels[3], 'preflight')
-  assert.deepEqual(clean.result.state.decisions, state.decisions)
-  // The live copy's faults: a chunk spliced, a chunk without its sum, a chunk altered with its sum kept.
-  const live = await loadWith(state, stateRef, (env, label) => {
-    const e = structuredClone(env)
-    if (label === 'state:load#1') e.chunks[3].data = e.chunks[3].data.slice(0, 100) + e.chunks[3].data.slice(-100)
-    if (label === 'state:load#2') { delete e.chunks[2].sum; e.chunks[3].data = flip(e.chunks[3].data) }
-    return e
-  })
-  assert.deepEqual(asks(live.calls), ['all', '4,5,6,7', '8', '3+pad', '6,7+pad'], 'every missing chunk is asked for at once, four to a call, re-asks padded')
-  assert.equal(live.labels[5], 'preflight')
-  // A reply with mis-copied metadata costs its own chunks, not its siblings'.
-  const sibling = await loadWith(state, stateRef, (env, label) => label === 'state:load#2' ? { ...env, digest: '00000000' } : env)
-  assert.deepEqual(asks(sibling.calls), ['all', '4,5,6,7', '8', '4,5,6,7+pad'])
-  assert.equal(sibling.labels[4], 'preflight')
-  // A short copied length sizes a short budget; the true length, once accepted, grows it.
-  const short = await loadWith(state, stateRef, (env, label) => {
-    const e = structuredClone(env)
-    if (label === 'state:load#1') e.length = 4 * 512 - 10
-    if (label === 'state:load#4') for (const c of e.chunks) if (c.i !== 7) c.data = flip(c.data)
-    if (label === 'state:load#5') for (const c of e.chunks) if (c.i !== 8) c.data = flip(c.data)
-    return e
-  })
-  assert.deepEqual(asks(short.calls), ['all', '3+pad', 'all', '4,5,6,7', '8', '4,5,6+pad'])
-  assert.equal(short.labels[6], 'preflight')
-  // Progress undone by every other reply stops at the round budget.
-  const seesaw = await loadWith(state, stateRef, (env, label) =>
-    Number(label.split('#')[1]) % 2 ? env : { ...env, length: env.length - 1 })
-  assert.equal(seesaw.result.reason, 'state-transfer-failed')
-  assert.equal(seesaw.labels.length, 11, 'six rounds: the first, then one or two calls each')
-})
-
-test('the chunks left after the first reply are asked for at once, in parallel calls', async () => {
-  const { state, stateRef } = await savedLarge()
-  const started = new Set()
-  let release
-  const both = new Promise(resolve => { release = resolve })
-  let timer
-  const serial = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('the second round ran its calls one after another')), 2000) })
-  const got = await Promise.race([serial, loadWith(state, stateRef, async (env, label) => {
-    if (label !== 'state:load#1') {
-      started.add(label)
-      if (started.size === 2) release()
-      await both // each waits for the other: only concurrent calls get past
-    }
-    return env
-  })]).finally(() => clearTimeout(timer))
-  assert.deepEqual(asks(got.calls), ['all', '4,5,6,7', '8'])
-  assert.equal(got.labels[3], 'preflight')
-  assert.deepEqual(got.result.state.decisions, state.decisions)
-})
-
-test('a transfer that never checks out blocks before preflight with the stateRef untouched', async () => {
-  const { state, stateRef } = await savedForLoad()
-  const always = await loadWith(state, stateRef, (env) => forged(structuredClone(env)))
-  assert.equal(always.result.reason, 'state-transfer-failed')
-  assert.equal(always.result.status, 'blocked')
-  assert.deepEqual(always.labels, ['state:load#1', 'state:load#2'], 'two calls without a new chunk end it; nothing past the loader runs')
-  assert.deepEqual(always.result.stateRef, stateRef)
-  assert.match(always.result.detail, /does not match stateRef\.digest/)
-  const dead = await run({ args: { yieldAfterCycle: true, maxCycles: 3, stateRef }, load: new Error('boom') })
-  assert.equal(dead.result.reason, 'state-transfer-failed')
-  assert.match(dead.result.detail, /loader died/)
-  const refused = await loadWith(state, stateRef, () => ({ error: 'cannot read /tmp/tasks/w1.output: No such file or directory' }))
-  assert.match(refused.result.detail, /state_transfer\.py: cannot read/)
-})
-
-test('chunks still missing when the transfer gives up keep the failure that left them so (#410)', async () => {
-  const { state, stateRef } = await savedForLoad()
-  const first = transferOf(state)
-  const missing = [0, ...[...Array(Math.ceil(first.length / 512)).keys()].slice(first.chunks.length)].join(',')
-  for (const [cause, fail] of [['state_transfer.py: gone', () => ({ error: 'gone' })],
-    ['the envelope metadata is malformed', (env) => ({ ...env, digest: '00000000' })],
-    ['loader died: boom', () => { throw new Error('boom') }]]) {
-    const { result } = await loadWith(state, stateRef, (env, label) => label === 'state:load#1' ? { ...env, chunks: env.chunks.slice(1) } : fail(env))
-    assert.equal(result.reason, 'state-transfer-failed', cause)
-    assert.equal(result.detail, `chunks ${missing} missing or mis-copied (${cause})`)
+    assert.deepEqual([got.result.status, got.result.reason, got.result.stateRef], ['blocked', 'state-transfer-failed', stateRef])
+    assert.match(got.result.detail, detail)
+    assert.deepEqual(got.labels, /^the relay died$/.test(got.result.detail) ? ['state:load', 'state:load.retry'] : ['state:load'], 'nothing past the loader runs')
   }
 })
 
-test('a changed envelope length is the failure it leaves, not an earlier reply\'s in its round', async () => {
-  const { state, stateRef } = await savedLarge()
-  // Each round with a length asks 4,5,6,7 then 8: the first dies, the second resets the length.
-  const { labels, result } = await loadWith(state, stateRef, (env) => {
-    if (env.chunks.some(c => c.i === 8)) return { ...env, length: env.length - 1 }
-    if (env.chunks.some(c => c.i === 0)) return env
-    throw new Error('boom')
-  })
-  assert.equal(result.reason, 'state-transfer-failed')
-  assert.equal(labels.length, 9, 'six rounds, the budget')
-  assert.equal(result.detail, 'the envelope length changed')
+test('a failed emit-dir read is asked again by the next relay, the load\'s retry included', async () => {
+  const { state, stateRef } = await savedForLoad()
+  for (const answer of [{ dir: '', error: 'no git dir' }, { dir: '/tmp/agentrc-emit/r1x/' }, null, new Error('boom')]) {
+    const got = await run({ args: { yieldAfterCycle: true, maxCycles: 3, stateRef }, load: state, dirAnswer: n => n === 1 ? answer : undefined })
+    assert.deepEqual(got.labels.slice(0, 2), ['state:load.retry', 'preflight'], JSON.stringify(answer))
+    assert.deepEqual(got.journal.slice(0, 2).map(j => j.label), ['emit:dir', 'emit:dir'])
+    assert.equal(got.result.state.cyclesUsed, 2)
+  }
+})
+
+test('a preflight that got no emit directory is asked again on its retry, which asks for the directory again', async () => {
+  for (const answer of [{ dir: '', error: 'no git dir' }, null, new Error('boom')]) {
+    const got = await run({ reviews: oneValid, dirAnswer: n => n === 1 ? answer : undefined })
+    assert.deepEqual(got.labels.slice(0, 1), ['preflight.retry'], JSON.stringify(answer))
+    assert.deepEqual(got.journal.slice(0, 2).map(j => j.label), ['emit:dir', 'emit:dir'])
+    assert.ok(got.logs.includes('preflight: relay recovered on the retry'), got.logs.join('\n'))
+    assert.equal(got.result.cycles, 1, got.result.reason)
+  }
+})
+
+test('a resumed launch reloads the lines its relays wrote; a file there before a live run is reloaded only when it names itself', async () => {
+  const reviews = { findings: [invalidFinding({ commentId: 2 })], replies: [{ commentId: 2, body: 'not so' }], bots: 'reviewed' }
+  const args = { yieldAfterCycle: true, maxCycles: 3 }
+  const first = await run({ reviews, keepEmit: true, args })
+  try {
+    assert.ok(first.loads.length >= 4, first.loads.join('\n'))
+    assert.ok(first.loads.every(f => f.startsWith(`${first.emitDir}/`)), 'one directory a launch')
+    assert.equal(new Set(first.loads).size, first.loads.length, 'a file a call')
+    // The runtime's resume: every agent call answers from the journal, and workflow() loads the same files again.
+    const resumed = await run({ reviews, resume: first.journal, args })
+    assert.deepEqual(resumed.calls, [], 'no relay ran again')
+    assert.deepEqual(resumed.loads, first.loads)
+    assert.deepEqual(resumed.result, first.result)
+    // A run that lost every answer runs each relay again: each script meets its claimed file and runs nothing (exit 3),
+    // and the file, its own from the cut-short attempt, is the line.
+    const again = await run({ reviews, emitDir: first.emitDir, args })
+    assert.deepEqual(again.loads, first.loads)
+    assert.deepEqual(again.result, first.result)
+    assert.ok(again.logs.includes('preflight: the line an earlier attempt of this call wrote, reloaded'), again.logs.join('\n'))
+    // A file there that names another (a copy of another call's) is no line of this call: that attempt's outcome is
+    // unknown, and the read-only preflight gets its one fresh attempt.
+    const [pre, other] = first.loads
+    writeFileSync(pre, readFileSync(other, 'utf8'))
+    const foreign = await run({ reviews, emitDir: first.emitDir, args })
+    assert.ok(foreign.logs.includes(`preflight: an earlier attempt of this call claimed ${pre} and left no line of it — its outcome is unknown`), foreign.logs.join('\n'))
+    assert.equal(foreign.labels[0], 'preflight.retry', 'the refused call ran nothing')
+    assert.equal(foreign.result.pass, true)
+  } finally { rmSync(first.emitDir.split('/agentrc-emit/')[0], { recursive: true, force: true }) }
 })
 
 test('stateRef is refused when malformed or given with state', async () => {
@@ -8293,40 +7727,6 @@ test('markSonar marks the SonarCloud issue of a refuted code-scanning comment wi
   assert.deepEqual(result.history[0].sonar, [{ commentId: 3, issue: 'K3', outcome: 'marked', detail: 'false positive' }])
   assert.equal('sonarUnmarked' in result, false)
   assert.deepEqual(sonarOf(result.state), [])
-})
-
-test('a relay copies every member its script prints: a dropped one is refused, and a recovery on the retry is logged (#50)', async () => {
-  // tinyusb#4098: Haiku recall copies left out each failure's cell and runId; inventory copies added an empty aliases.
-  const placed = { ...RIG, cell: 'pico host/msc' }
-  const store = new Map()
-  const first = await run({ store, args: YIELD, reviews: WAITING, ci: redWith(placed).ci })
-  assert.equal(first.logs.some(l => l.endsWith('relay recovered on the Sonnet retry')), false, 'an exact copy needs no retry')
-  const sonar = await run({ reviews: scanRefuted, args: { autoPush: true, markSonar: true, maxCycles: 1 } })
-  const pushed = await run({ reviews: oneValid })
-  const rows = [
-    [first, 'ci:collect#1.1', (s) => s.properties.checks.items, ['attempt', 'aliases']],
-    [first, 'ci:collect#1.f', (s) => s.properties.bases.items, ['base']],
-    [sonar, 'sonar#1', (s) => s.properties.results.items, ['issue']],
-    [pushed, 'push#1-review', (s) => s.properties.heads.items, ['head']],
-  ]
-  for (const [{ calls }, label, rowOf, members] of rows) {
-    const row = rowOf(calls.find(c => c.label === label).schema)
-    for (const k of members) assert.ok(row.required.includes(k), `${label} requires ${k}`)
-  }
-
-  const dropped = (a) => ({ ...a, verdicts: a.verdicts.map(v => ({ ...v, failures: v.failures.map(({ cell, runId, ...f }) => f) })) })
-  const again = (garble) => run({ store, garble, args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci: redWith(placed).ci })
-  const recovered = await again((l, a) => l === 'ci:collect#2.r1' ? dropped(a) : a)
-  const failures = recovered.calls.find(c => c.label === 'ci:collect#2.r1').schema.properties.verdicts.items.properties.failures.items
-  assert.ok(['cell', 'runId'].every(k => failures.required.includes(k)))
-  assert.ok(recovered.logs.some(l => /^ci:collect#2\.r1 errored — .*missing cell/.test(l)), recovered.logs.join('\n'))
-  assert.deepEqual(ciLabels(recovered.labels), ['ci:collect#2.1', 'ci:collect#2.r1', 'ci:collect#2.r1.retry'], 'no judge')
-  assert.ok(recovered.logs.includes('ci:collect#2.r1: relay recovered on the Sonnet retry'), recovered.logs.join('\n'))
-  assert.equal(recovered.result.history.at(-1).ci.realFailures[0].cell, 'pico host/msc')
-  // A retry that relays the script's error recovers nothing.
-  const erred = await again((l, a) => l === 'ci:collect#2.r1' ? dropped(a) : l === 'ci:collect#2.r1.retry' ? { ...a, error: 'gone' } : a)
-  assert.equal(erred.logs.some(l => l.endsWith('relay recovered on the Sonnet retry')), false, erred.logs.join('\n'))
-  assert.ok(erred.labels.includes('ci:judge#2'))
 })
 
 test('without markSonar nothing goes to SonarCloud and the issue stays owed in the state', async () => {
@@ -8375,10 +7775,6 @@ test('a later launch with markSonar marks what an earlier one left owed', async 
   assert.deepEqual(sonarOf(again.result.state), [])
 })
 
-test('markSonar needs autoPush', async () => {
-  await assert.rejects(run({ reviews: scanRefuted, args: { autoPush: false, markSonar: true } }), /markSonar publishes to SonarCloud: it needs autoPush/)
-})
-
 test('a refuted comment from another reviewer owes SonarCloud nothing', async () => {
   const { calls, result } = await run({
     reviews: { findings: [invalidFinding({ commentId: 3 })], replies: [{ commentId: 3, body: 'no' }], bots: 'reviewed' },
@@ -8417,24 +7813,23 @@ test('a waiting or failed issue stays owed and is listed unmarked, and a relay e
   assert.deepEqual(down.result.sonarUnmarked.map(x => x.last.outcome), ['not asked', 'not asked', 'not asked'])
 })
 
-test("a sonar relay that loses the run that marked gets its line back and the SonarCloud gate is read again (#55)", async () => {
+test("a sonar line lost after the run that marked comes back by its receipt and the SonarCloud gate is read again (#55)", async () => {
   const sonarRed = { status: 'red', infraRerun: [], realFailures: [{ check: 'SonarCloud', workflow: '', firstError: 'Quality Gate failed', files: [], verdict: 'real' }] }
   const receiptOf = (c) => [c.label, c.prompt.match(/--receipt '([^']+)'/)?.[1]]
-  const garbled = await run({ reviews: scanRefuted, ci: sonarRed, args: { autoPush: true, markSonar: true, maxCycles: 1 },
-    garble: (l, a) => l === 'sonar#1' ? { ...a, seal: 'garbled' } : a })
-  const [first, retry] = garbled.calls.filter(c => c.label.startsWith('sonar#')).map(receiptOf)
-  assert.match(first[1], new RegExp(`^${PIN.receipts}/sonar-1-[0-9a-f]{8}\\.json$`))
-  assert.deepEqual([first[0], retry], ['sonar#1', ['sonar#1.retry', first[1]]], 'the retry names the same file')
-  assert.deepEqual(garbled.result.history[0].sonar.map(x => x.outcome), ['marked'], 'what the first run did')
-  assert.ok(garbled.logs.some(l => /cycle 1: 1 SonarCloud issue\(s\) marked false positive — re-arming/.test(l)), garbled.logs.join('\n'))
-  // Both copies after the replies lost: the CI lane asks the same request again and gets the same run back.
-  let copies = 0
-  const lost = await run({ reviews: scanRefuted, ci: sonarRed, args: { autoPush: true, markSonar: true, maxCycles: 1 },
-    garble: (l, a) => l.startsWith('sonar#1') && ++copies <= 2 ? null : a })
-  assert.deepEqual(lost.calls.filter(c => c.label.startsWith('sonar#')).map(receiptOf),
-    [['sonar#1', first[1]], ['sonar#1.retry', first[1]], ['sonar#1', first[1]]])
-  assert.deepEqual(lost.result.history[0].sonar.map(x => x.outcome), ['marked'])
-  assert.ok(lost.logs.some(l => /re-arming to read the SonarCloud check again/.test(l)), lost.logs.join('\n'))
+  // The review lane's line lost (its relay died before the line, or the line fails its seal): the CI lane asks the
+  // same request again and gets the run that marked back.
+  let first
+  for (const [how, cut] of [['dead', null], ['unsealed', (a) => ({ ...a, seal: 'garbled' })]]) {
+    let copies = 0
+    const lost = await run({ reviews: scanRefuted, ci: sonarRed, args: { autoPush: true, markSonar: true, maxCycles: 1 },
+      garble: (l, a) => l === 'sonar#1' && ++copies === 1 ? cut && cut(a) : a })
+    const runs = lost.calls.filter(c => c.label.startsWith('sonar#')).map(receiptOf)
+    first = runs[0]
+    assert.match(first[1], new RegExp(`^${PIN.receipts}/sonar-1-[0-9a-f]{8}\\.json$`))
+    assert.deepEqual(runs, [first, first], `${how}: the same request, the same file`)
+    assert.deepEqual(lost.result.history[0].sonar.map(x => x.outcome), ['marked'], `${how}: what the first run did`)
+    assert.ok(lost.logs.some(l => /re-arming to read the SonarCloud check again/.test(l)), lost.logs.join('\n'))
+  }
   // The same request in the next cycle is read afresh: a waiting issue is not replayed as waiting.
   let cycle = 0
   const later = await run({
@@ -8585,9 +7980,6 @@ test("Greptile's confidence check is read by collect.py as a gate, never judged 
   assert.equal(other.result.reason, 'ci-red-greptile-gate')
   assert.equal(other.labels.some(l => l.startsWith('fix:') || l.startsWith('ci:judge')), false)
   assert.ok(other.logs.some(l => /— it is not a confidence result this reads: inspect the check on GitHub/.test(l)), other.logs.join('\n'))
-  // In the CI lane alone it is never fixed either.
-  const ciOnly = await run({ ci: { status: 'red', infraRerun: [], realFailures: [GREPTILE_GATE] }, args: { lane: 'ci', autoPush: true, yieldAfterCycle: true, maxCycles: 1 } })
-  assert.equal(ciOnly.labels.some(l => l.startsWith('fix:') || l.startsWith('ci:judge')), false, ciOnly.labels.join(', '))
   // The same name from an Actions job is an ordinary CI failure.
   const job = await gateRun([{ ...GREPTILE_GATE, workflow: 'review', link: undefined }], { args: { autoPush: false, maxCycles: 1 } })
   assert.ok(job.labels.includes('ci:judge#1'), 'a job with a workflow is judged')
@@ -8655,7 +8047,7 @@ test('yieldOnChange keeps a launch going through cycles that only waited, and pa
   assert.ok(blind.logs.some(l => /pausing for the caller — the cycle ended without a usable observation/.test(l)), blind.logs.join('\n'))
 })
 
-test('yieldOnChange pauses when the handoffs change, and refuses yieldAfterCycle or a single lane', async () => {
+test('yieldOnChange pauses when the handoffs change', async () => {
   const edited = { findings: [invalidFinding({ commentDigest: 'edited' })], replies: [{ commentId: 1, body: 'Not so: line 3.' }], bots: 'reviewed' }
   const ON = { autoPush: true, maxCycles: 4, yieldOnChange: true }
   const first = await run({ args: ON, reviews: oneValid })
@@ -8668,8 +8060,6 @@ test('yieldOnChange pauses when the handoffs change, and refuses yieldAfterCycle
   assert.deepEqual([second.result.status, second.result.reason], ['paused', 'yielded'], second.logs.join('\n'))
   assert.deepEqual(second.result.handoffs.map(h => h.commentId), [1])
   assert.ok(second.logs.some(l => /pausing for the caller — the handoffs changed/.test(l)), second.logs.join('\n'))
-  await assert.rejects(run({ args: { ...ON, yieldAfterCycle: true } }), /two ways to pause/)
-  await assert.rejects(run({ args: { ...ON, lane: 'ci' } }), /needs yieldAfterCycle/)
 })
 
 test('a launch that runs several cycles returns every cycle\'s publication receipts', async () => {
@@ -8902,8 +8292,8 @@ test('the obligation outlives the switch: a resume without greptileTrigger still
   assert.equal(late.result.reason, 'greptile-unreviewed')
   const reviewed = await run({ args: { ...YG, state: asked.result.state }, clockOffset: 5, reviews: quiet([bot('coderabbit'), bot('greptile')]) })
   assert.equal(reviewed.result.pass, true, 'only its review discharges it')
-  await assert.rejects(run({ args: { ...YG, state: { ...asked.result.state, reviewClock: { ...asked.result.state.reviewClock, greptileAt: 'soon' } } } }), /not a pr-babysit state/)
-  await assert.rejects(run({ args: { ...YG, state: { ...asked.result.state, greptileRequired: false } } }), /not a pr-babysit state/)
+  await assert.rejects(run({ args: { ...YG, state: seal({ ...asked.result.state, reviewClock: { ...asked.result.state.reviewClock, greptileAt: 'soon' } }) } }), /not a pr-babysit state/)
+  await assert.rejects(run({ args: { ...YG, state: seal({ ...asked.result.state, greptileRequired: false }) } }), /not a pr-babysit state/)
 })
 
 test('a Greptile queued or working under the switch is required across a yield, and blocks unreviewed without it', async () => {

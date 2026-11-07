@@ -4,9 +4,8 @@ settle what the human did with it.
 
   post.py --pr N --expected-head SHA [--repo OWNER/NAME]           # a pending review for the human to finish
   post.py --pr N --expected-head SHA --auto [--defer-answers] [--repo OWNER/NAME]  # submit it
-  post.py --pr N --expected-head SHA --decline --reason TEXT [--repo OWNER/NAME]
   post.py --pr N --sync [--repo OWNER/NAME]
-  post.py --pr N --expected-head SHA --fixed FILE [--repo OWNER/NAME]   # auto-fix: notes and resolves for a pushed repair
+  post.py --pr N --expected-head SHA --fixed FILE [--launch ID] [--repo OWNER/NAME]   # auto-fix: notes and resolves for a pushed repair
 
 Uses only the draft ledger.py saved for that head, never a regenerated one. Its review body ends with the marker
 <!-- agentrc-pr-review:<head>:<draft digest> -->. Before creating anything it refuses unless the PR head is still
@@ -59,14 +58,15 @@ ours; on a PR closed or merged, or a head other than SHA, before the run it send
 note and still reads back and reports the rest. One record per
 finding and root (ledger.py's repairs) across runs and heads: a rerun returns it, retries a deferred resolve only on a
 fix check of the same claim, never resends an unconfirmed note, and holds a resolve left sent or a thread reopened since.
-A body-moved finding has no thread to note. A later review's draft never repeats a repair note.
+A body-moved finding has no thread to note. A later review's draft never repeats a repair note. A run with --launch
+records that pr-babysit launch (its stateRef digest) in the review's fixedLaunches, so ledger.py next asks once a launch.
 
 A write is stored as sent before it is sent, so a run that dies in it only looks for it afterwards (a review by
-its marker, a reply by its thread and body digest), never sends it twice. --decline records that the human
-declined a draft never created. A POST GitHub itself refused (its rate limit or Validation Failed, on a 403, 422 or
+its marker, a reply by its thread and body digest), never sends it twice.
+A POST GitHub itself refused (its rate limit or Validation Failed, on a 403, 422 or
 429) whose marker does not read back right after created nothing: the review stays pending and unsent, reported
 failed, and a later run may POST it again; one that does read back is recovered. Any other error stays sent. stdout ends with
-one JSON line; exit 0 when drafted, posted, declined, synced or repaired (--fixed: every row noted and resolved), 1 when failed, partial, uncertain or handed over,
+one JSON line; exit 0 when drafted, posted, synced or repaired (--fixed: every row noted and resolved), 1 when failed, partial, uncertain or handed over,
 2 with {"error": ...} when nothing was attempted.
 """
 
@@ -666,7 +666,7 @@ def settle_note(repo, pr, led, f, x, row, head, login, persist):
     persist()
 
 
-def fix_notes(repo, pr, led, m, head, persist):
+def fix_notes(repo, pr, led, m, head, persist, launch=None):
     """A fix note and a resolve on each repaired finding's thread of the last review, which must be the one submitted on
     the reviewed head; per finding, one record across runs and heads (ledger.py's repairs). Each send and each resolve
     reads the PR afresh first."""
@@ -708,6 +708,9 @@ def fix_notes(repo, pr, led, m, head, persist):
             send_note(repo, pr, x, persist)
         settle_note(repo, pr, led, f, x, row, head, login, persist)
         out.append(receipt(x))
+    if launch and launch not in rev.setdefault('fixedLaunches', []):
+        rev['fixedLaunches'].append(launch)
+        persist()
     done = all(r['resolve'] in SETTLED and r['state'] == 'published' for r in out)
     return {'status': 'repaired' if done else 'partial', 'repairs': out}
 
@@ -729,19 +732,18 @@ def collect(argv):
     p.add_argument('--repo')
     p.add_argument('--auto', action='store_true')
     p.add_argument('--defer-answers', action='store_true')
-    p.add_argument('--decline', action='store_true')
-    p.add_argument('--reason')
     p.add_argument('--sync', action='store_true')
     p.add_argument('--fixed')
+    p.add_argument('--launch')
     a = p.parse_args(argv)
-    if a.fixed and (a.auto or a.decline or a.sync or a.defer_answers):
+    if a.launch and not a.fixed:
+        raise Unusable('--launch goes with --fixed')
+    if a.fixed and (a.auto or a.sync or a.defer_answers):
         raise Unusable('--fixed takes only --pr, --repo and --expected-head')
-    if a.sync and (a.auto or a.decline or a.expected_head):
+    if a.sync and (a.auto or a.expected_head):
         raise Unusable('--sync takes only --pr and --repo')
     if not a.sync and not FULL_SHA.match(a.expected_head or ''):
         raise Unusable('--expected-head must be a full SHA')
-    if a.decline and not a.reason:
-        raise Unusable('--decline needs --reason')
     if a.defer_answers and not a.auto:
         raise Unusable('--defer-answers goes with --auto')
     repo = repo_of(a.repo)
@@ -754,18 +756,12 @@ def collect(argv):
         # What the human already submitted or deleted on GitHub is recorded first: it is no longer a draft.
         sync(repo, a.pr, led, persist)
         if a.fixed:
-            return fix_notes(repo, a.pr, led, read_manifest(a.fixed, a.expected_head), a.expected_head, persist)
+            return fix_notes(repo, a.pr, led, read_manifest(a.fixed, a.expected_head), a.expected_head, persist, a.launch)
         todo = [p for p, r in publications(led) if p['head'] == a.expected_head and p['status'] in UNSETTLED
                 and (p is r or not a.auto)]
         if not todo:
             raise Unusable(f'no pending draft for {a.expected_head} on the ledger')
         review = todo[-1]
-        if a.decline and review['status'] != 'pending':
-            raise Unusable(f"the draft is {review['status']}: part of it may be on GitHub; reconcile it, do not decline it")
-        if a.decline:
-            declined(led, review, a.reason)
-            persist()
-            return {'status': 'declined', 'review': None}
         unchecked = first_line_unchecked(review)
         handed = (review['receipts'].get('review') or {}).get('handedOver')
         if a.auto and handed:
@@ -803,7 +799,7 @@ def main(argv):
         print(json.dumps({'error': str(e)}))
         return 2
     print(json.dumps(out))
-    done = out['status'] in ('posted', 'declined', 'drafted', 'synced', 'repaired') and 'handedOver' not in out
+    done = out['status'] in ('posted', 'drafted', 'synced', 'repaired') and 'handedOver' not in out
     return 0 if done and ('answers' not in out or out['answers']['status'] in ('drafted', 'deferred')) else 1
 
 

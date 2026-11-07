@@ -82,50 +82,22 @@ and touches nothing under `~/.claude`, `~/.codex` or `~/.local`:
 ~/code/agentrc/install.py remove --project ~/code/tinyusb --skill --agent --workflow
 ```
 
-- `<dir>` must be a repository's or a linked worktree's top level. Claude Code
-  finds project skills, agents and workflows only up to the work tree root,
-  and reads project settings, hooks and `env` included, only from the
-  directory the session starts in, so **install every worktree** a session
-  starts in, and start sessions at its top level.
-- Skills, a skill's hook, agents (the `.md` only) and workflows link into
-  `<dir>/.claude/{skills,hooks,agents,workflows}`. The hooks are registered in
-  `<dir>/.claude/settings.local.json`, never the tracked `settings.json`, by
-  absolute path as user-wide, with `env.AGENTRC_DIR`, this checkout. The
-  agentrc paths the agents, workflows and skill recipes name are
-  `"${AGENTRC_DIR:-$HOME/.claude}/..."` (`$HOME/.codex` for Codex), so they
-  resolve to this checkout in a project install and to the user-wide links
-  otherwise; a model that reads one by path expands it in the shell first. A
-  skill names a sibling skill's page relative to its own directory, its
-  symlink resolved, which reaches this checkout either way. `captain` is the
-  exception (below).
-- `--claude-md` is opt-in: it links `instructions/user.md`, the owner's
-  personal rules, as `<dir>/CLAUDE.local.md`, Claude Code's per-user
-  instructions for that project, so those rules and the co-words hold in that
-  work tree only. A link, because an `@`-import of a file outside the project
-  loads only once approved interactively, never in a headless session.
-- Each link, and `settings.local.json` unless git already ignores it, gets a
-  line in one marked block of the repository's `.git/info/exclude`, which its
-  worktrees share; a line stays while any worktree has our link there, so `git
-  status` stays clean everywhere. `remove` drops the links, our hooks and
-  `AGENTRC_DIR` (once no link of ours is left), the file once it is empty, and
-  the lines no worktree needs. Since the block is shared, a project's own
-  untracked file at the path of our link in another worktree is hidden from
-  `git status` too.
-- A destination the repository tracks, or a real file or nonempty directory
-  there, such as the project's own skill of the same name, refuses before any
-  change; `--skip-clashes` leaves it and skips that agentrc entry (and the
-  hook registration with a skipped hook, and a skipped skill's hook, whose
-  link and registration from an earlier install go, unless every selected
-  entry is skipped: then `install` changes nothing). A directory left with
-  only `__pycache__` from a skill the project has since moved out is named as
-  such; delete it. Pruning leaves a tracked link alone.
-- Both actions refuse a symlinked directory between `<dir>` and a destination,
-  `.claude` itself included, which would carry them out of the work tree, and a
-  `settings.local.json` that is tracked or a link, since they rewrite it.
-- Project mode is Claude Code only: `--bin` and `--statusline` are user-wide
-  and refused with `--project`, and Codex's
-  own skills and agents have no project install. A Codex coworker needs no
-  `CLAUDE.local.md`: `cowork` sends it its rules.
+`install.py --help`, its docstring, gives the rules: what links where, the hooks and `AGENTRC_DIR` in
+`settings.local.json`, the shared `.git/info/exclude` block, which flags are user-wide only, and what refuses. Beyond
+those:
+
+- **Install every worktree** a session starts in, and start sessions at its top level.
+- The agentrc paths the agents, workflows and skill recipes name are `"${AGENTRC_DIR:-$HOME/.claude}/..."`
+  (`$HOME/.codex` for Codex); a model that reads one by path expands it in the shell first. A skill names a sibling
+  skill's page relative to its own directory, its symlink resolved, which reaches this checkout either way.
+- `--claude-md` is opt-in: the owner's personal rules and the co-words then hold in that work tree only. A link,
+  because an `@`-import of a file outside the project loads only once approved interactively, never in a headless
+  session. A Codex coworker needs no `CLAUDE.local.md`: `cowork` sends it its rules.
+- Since the exclude block is shared, a project's own untracked file at the path of our link in another worktree is
+  hidden from `git status` too.
+- `--skip-clashes` also takes out a skipped skill's hook link and registration left by an earlier install; when every
+  selected entry is skipped, `install` changes nothing. A directory left with only `__pycache__` from a skill the
+  project has since moved out is named as such; delete it.
 - A user-wide install on the same host is not supported beside a project
   install: the hooks are registered twice and race, and the `headless-chief`
   shadow check misjudges links into a different checkout. A project install
@@ -149,12 +121,10 @@ and write UTF-8 themselves, so no `-X utf8` or `PYTHONUTF8` is needed. Bash's
 - a `python3` that is a native CPython 3.12+ (python.org's install manager or MSYS2's mingw build), not the WindowsApps
   alias and not MSYS2's `/usr/bin/python3`, for the workflows' script calls and the simplify gate's wrapper; PyYAML,
   pytest and pytest-xdist in it for the tests, and PyYAML for `pr-babysit`'s `harvest.py`, which `pr-review` also
-  imports, to date a head by its pull_request runs (without it they go unread and the harvest says so), and for
-  `pr-babysit`'s `hooks.py`, to excuse a hook that fails on HEAD too: without PyYAML no such hook is excused here, as
-  the fallback to pre-commit's own interpreter needs a `#!` entry script, which Windows' `pre-commit.exe` is not, and
-  pr-babysit refuses to push the fix, naming why. `install.py` registers a Python hook as
-  `'<the python that ran install.py>' '<hook>.py'`, since a hook that cannot start lets the tool call through; rerun it
-  after replacing that Python, and name the interpreter the same way in the credit guard's recipe below.
+  imports, to date a head by its pull_request runs (without it they go unread and the harvest says so). `install.py`
+  registers a Python hook as `'<the python that ran install.py>' '<hook>.py'`, since a hook that cannot start lets the
+  tool call through; rerun it after replacing that Python, and name the interpreter the same way in the credit guard's
+  recipe below.
 - `bash`, `cygpath` and `git` from Git for Windows or MSYS2: from Python a bare
   `bash` is System32's WSL launcher, so scripts look it up on `PATH`.
   `chief_guard.py` maps `/tmp`-style paths through `cygpath` and denies them
@@ -211,6 +181,7 @@ Agent collaboration and PRs:
 | [`pr-review`](skills/pr-review/SKILL.md) | review someone else's PR in one request, such as `/pr-review N auto-post boards: <ids>`: pin it, run the pr-review workflow on the boards named (none by default), leave a pending review for you to submit (or submit it under auto-post); re-review after a push | `prepare.py --pr N` |
 | [`ci-rerun`](skills/ci-rerun/SKILL.md) | read a failed CircleCI job's or Read the Docs build's log, rerun it once after an infra failure | `circleci.py log <job>`, `rerun <job>...`, `rtd.py log <url>` |
 | [`headless-chief`](skills/headless-chief/SKILL.md) | launch a headless `chief` and follow its status lines while it runs, its report when it exits | `chief_run.py --out <dir> --worktree <wt> --task-file <task>` |
+| [`repo-audit`](skills/repo-audit/SKILL.md) | audit what grew since the last audit: range, growth, transcript usage and test-overlap evidence, then the reviewed end tagged `audit/<date>` | `audit.py start --repo . --head origin/main ...` |
 | [`worktree-remove`](skills/worktree-remove/SKILL.md) | remove a worktree when its task is done, run from outside it: check it, gate on pending follow-ups and PR state, close the hc terminals working in it when run from one, then git removes it and `scripts/worktree_children.py` its clean `<name>--*` siblings and its branches whose commits are on their remote or a PR head | `worktree_remove.py [PATH] --dry-run [--pending <item>]`, `--proceed <token>` |
 
 Hardware documentation, from the Calibre library at `~/Documents/calibre-library`
@@ -363,13 +334,12 @@ Leave the checkout to chief until it exits.
 ## Captain session
 
 `agents/captain.md` is one seat over the other Claude Code sessions in this host's
-hc terminals (Codex terminals are left out): it lists them, opens new ones on existing
-checkouts under either account, asks the idle ones for status, reports one table
-and carries the human's own words, read from its own transcript, to the sessions
-they name. It checks what sessions report with read-only git and gh lookups and
-the files sessions and chiefs leave, and keeps its own memory, but never does the
-sessions' work; the one thing it publishes is a follow-up issue in hathach/agentrc
-for a defect in its own tooling, on the human's word. Its guard,
+hc terminals (Codex terminals are left out): it lists them, asks the idle ones for
+status, reports one table and carries the human's own words, read from its own
+transcript, to the sessions they name. It checks what sessions report with read-only
+git and gh lookups and the files sessions and chiefs leave, and keeps its own memory,
+but never does the sessions' work; the one thing it publishes is a follow-up issue in
+hathach/agentrc for a defect in its own tooling, on the human's word. Its guard,
 `skills/captain/scripts/captain_guard.py`, declared as a hook in the agent file so
 it applies on every account, names in its docstring the calls it allows. It reads
 sessions from hc terminals, each pinned to the session Claude Code registered under

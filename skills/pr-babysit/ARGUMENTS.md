@@ -16,9 +16,7 @@ A key not listed here throws before anything runs.
   and every later script the absolute path that interpreter reports; nothing
   searches for another. Preflight checks it imports what the lanes need (PyYAML
   while a bot is waited on) and stops `python-unusable` naming what is missing.
-  Without PyYAML `hooks.py` reads the hook config with pre-commit's own
-  interpreter; where it cannot, it excuses no hook failing on HEAD too, and a
-  push it refuses names that cause. Per launch.
+  Per launch.
 - `reviewers`: of `copilot`, `coderabbit`, `greptile`, `code-scanning`;
   default `['coderabbit', 'greptile', 'code-scanning']`; `[]` runs no review lane.
 - `autoRun`: the reviewers that run on every push and gate done; default
@@ -130,10 +128,11 @@ A key not listed here throws before anything runs.
   cycle that only waited (CI settling, bots pending, owed replies, a SonarCloud
   re-read) goes on in the same launch. A stop and the last cycle end the launch
   as without it. Not with `yieldAfterCycle` or a single lane.
-- `lane`: `both` (default), `ci` or `reviews`; a single lane needs
-  `yieldAfterCycle` and never declares the PR done.
+- `lane`: `both` (default) or `reviews`; `reviews` runs the review lane alone,
+  needs `yieldAfterCycle` and never declares the PR done.
 - `state` or `stateRef: { outputFile, digest }`: a previous launch's state, or
-  the saved output holding it and its `stateDigest`, loaded as checksummed chunks.
+  the saved output holding it and its `stateDigest`, loaded whole from the file
+  `state_transfer.py` emits and checked against that digest.
   `launch_result.py`'s `stateRef` names a copy it keeps outside the Workflow
   task directory, so a host reset does not take the state with it. Nothing
   prunes those copies: one is needed only while a caller may continue from its

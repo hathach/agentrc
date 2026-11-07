@@ -257,7 +257,7 @@ class MergeTest(unittest.TestCase):
         cases = {
             'blocked': ({'status': 'blocked', 'pass': False, 'reason': 'greptile-unreviewed'}, 'stopped greptile-unreviewed'),
             'paused': ({'status': 'paused', 'pass': False}, 'status paused'),
-            'a ci lane': ({'observation': {**launch_output()['result']['observation'], 'lane': 'ci'}}, 'lane ci'),
+            'a reviews lane': ({'observation': {**launch_output()['result']['observation'], 'lane': 'reviews'}}, 'lane reviews'),
             'a handoff': ({'handoffs': [{'commentId': 5, 'why': 'edited after we answered it'}]}, "comment 5 is the caller's"),
             'an unsettled settlement': ({'settlements': [{'commentId': 6, 'outcome': 'failed', 'why': 'gone'}]}, 'comment 6: settlement failed'),
         }

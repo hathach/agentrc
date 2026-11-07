@@ -157,6 +157,10 @@ that page as its one verdict, the entry with only that page's failures, and the
 pages in order join into the entry. A link it has none for, or whose entry has a
 failure or a list of starts too large for a line, is left out of both. The caller checks what comes
 back against its own digests.
+
+Under AGENTRC_EMIT the line goes to the file it names instead of stdout, claimed before anything runs
+(exit 3 at once, nothing done, when that file is there): lib/seal.py's emit, which a workflow reads instead
+of a model's copy.
 """
 
 import argparse
@@ -180,7 +184,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
 import greptile  # noqa: E402
 from check_runs import latest_run, newest  # noqa: E402
 import windows  # noqa: E402
-from seal import fnv1a, rate_limit, sealed, utc  # noqa: E402
+from seal import emit, fnv1a, rate_limit, sealed, utc  # noqa: E402
 
 POLL = 30
 ACTIONS_JOB = re.compile(r'^https://github\.com/[^/]+/[^/]+/actions/runs/\d+/job/(\d+)')
@@ -1276,8 +1280,7 @@ def main(argv=None):
         out, rc = finished(out), 0
     except Failed as e:
         out, rc = {'head': a.head, 'error': str(e), **({'rateLimit': e.limit} if e.limit else {})}, 1
-    print(json.dumps(out))
-    return rc
+    return emit(out, rc)
 
 
 if __name__ == '__main__':

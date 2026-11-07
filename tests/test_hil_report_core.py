@@ -623,36 +623,6 @@ class ArchiveAndWithdraw(Dir):
         self.run_attempt(TINYUSB, usb_body([usb_row('b1', t='pass')]), attempt_id='a1')
         self.before = self.files()
 
-    def test_archive_current_archives_like_start_attempt_and_seals(self):
-        self.assertEqual(core.archive_current(self.d, TINYUSB), 'a1')
-        self.assertEqual(core.archive_current(self.d, TINYUSB), 'a1')   # idempotent
-        self.assertEqual(self.files(), self.before)                     # the pair stays in place
-        rec = core.paths(self.d, TINYUSB)[2] / 'a1'
-        self.assertEqual((rec / 'hil_report.json').read_bytes(), self.before[0])
-        self.assertEqual((rec / 'hil_report.md').read_bytes(), self.before[1])
-        with self.assertRaises(core.ReportError) as cm:
-            core.publish(self.d, TINYUSB, usb_body([]), self.meta(TINYUSB, core.Attempt('a1', None, None, None, None)))
-        self.assertEqual(cm.exception.stage, 'sealed')
-        a = core.start_attempt(self.d, TINYUSB, True, 'a2')   # the same record, reused
-        self.assertEqual(a.previous_attempt, 'a1')
-
-    def test_archive_current_shares_start_attempts_rules(self):
-        empty = self.d.parent / 'empty'
-        self.assertIsNone(core.archive_current(empty, TINYUSB))
-        core.paths(self.d, TINYUSB)[0].write_text('{')
-        self.assertTrue(core.archive_current(self.d, TINYUSB).startswith('corrupt-'))
-        core.paths(self.d, TINYUSB)[0].write_text(json.dumps({**usb_body([]), '_hil': {'version': 99}}))
-        with self.assertRaises(core.ReportError) as cm:
-            core.archive_current(self.d, TINYUSB)
-        self.assertEqual(cm.exception.stage, 'predecessor')
-        core.paths(self.d, TINYUSB)[0].write_bytes(self.before[0])
-        broken = TINYUSB._replace(render=lambda b: 1 / 0)
-        shutil.rmtree(core.paths(self.d, TINYUSB)[2])
-        with self.assertRaises(core.ReportError) as cm:
-            core.archive_current(self.d, broken)
-        self.assertEqual((cm.exception.stage, cm.exception.published), ('render', ()))
-        self.assertFalse(core.paths(self.d, TINYUSB)[2].exists())
-
     def failed_abort_publish(self):
         """a2 accumulates onto the passing a1, aborts, and its abort report fails to publish."""
         a2 = core.start_attempt(self.d, TINYUSB, True, 'a2')

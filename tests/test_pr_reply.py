@@ -674,6 +674,29 @@ class ReceiptFileTest(ReplyCase):
             self.assertIn(why, err)
         self.assertEqual(len(self.gh.mutations), 2, 'only the first run posted')
 
+    def test_replay_only_prints_a_saved_receipt_and_never_runs_the_request(self):
+        self.gh.review_comment(10)
+        path = os.path.join(self.tmp, 'replies#1.json')
+        manifest = self.json_file({'replies': [{'commentId': 10, 'body': 'not so', 'digest': reply.fnv1a('not so')}]})
+
+        def replay():
+            out = io.StringIO()
+            with redirect_stdout(out), redirect_stderr(io.StringIO()), \
+                    mock.patch.object(reply, 'gh', side_effect=AssertionError('a replay calls GitHub')):
+                rc = reply.main(['--pr', str(PR), '--repo', REPO, '--manifest', manifest, '--receipt', path, '--replay-only'])
+            return rc, out.getvalue()
+        self.assertEqual(replay(), (2, json.dumps({'error': f'no receipt saved at {path}: nothing was run'}) + '\n'))
+        self.assertEqual(self.gh.mutations, [], 'no receipt: nothing posted')
+        rc, first, _ = self.run_saved(path)
+        self.assertEqual(replay(), (rc, first))
+        self.assertEqual(len(self.gh.mutations), 2, 'only the run that saved it posted')
+
+    def test_replay_only_needs_a_receipt(self):
+        out = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            reply.main(['--pr', str(PR), '--repo', REPO, '--manifest', self.json_file({'replies': []}), '--replay-only'])
+        self.assertEqual(json.loads(out.getvalue()), {'error': 'usage: --replay-only needs --receipt'})
+
     def test_a_receipt_that_cannot_be_saved_is_exit_2_with_the_line(self):
         self.gh.review_comment(10)
         path = os.path.join(self.tmp, 'replies#1.json')

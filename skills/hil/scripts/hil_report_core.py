@@ -485,13 +485,6 @@ def _archive_current(report_dir: Path, schema: BodySchema, attempt_id: str | Non
     return aid, reading, legacy
 
 
-def archive_current(report_dir, schema: BodySchema) -> str | None:
-    """Archive the current pair as start_attempt does, and seal it: its archive id, or None
-    when there is no current report. The pair stays in place."""
-    with _writer(Path(report_dir), schema):
-        return _archive_current(Path(report_dir), schema)[0]
-
-
 def withdraw_current(report_dir, schema: BodySchema, attempt_id: str, reason: str) -> str | None:
     """For an attempt whose publication failed: archive the current report (sealing it; an
     existing identical archive is reused without rendering), verify the archived JSON, then

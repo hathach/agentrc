@@ -8,11 +8,12 @@ secondary when none is exhausted or gh names a secondary limit."""
 
 import argparse
 import errno
-import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -24,7 +25,7 @@ except ImportError:  # Windows
     import msvcrt
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
-from seal import canonical, fnv1a, rate_limit, sealed, utc  # noqa: E402,F401  re-exported for the scripts
+from seal import canonical, emit, fnv1a, rate_limit, sealed, utc  # noqa: E402,F401  re-exported for the scripts
 import gh_repo  # noqa: E402
 from gh_repo import HOST, REPO, github_repo  # noqa: E402,F401  re-exported for the scripts
 
@@ -160,21 +161,41 @@ def locked(path):
 
 
 def report(collect, argv, seal=False, limits=False):
-    """Print collect(argv) as the last stdout line, sealed when asked, and return 0, or {"error"} and 2."""
+    """Emit collect(argv) as the last stdout line (the AGENTRC_EMIT file instead, seal.emit), sealed when asked, and
+    return 0, or {"error"} and 2."""
     try:
         facts = collect(argv)
     except Unusable as e:
-        print(json.dumps({'error': str(e), **({'rateLimit': e.limit} if limits and isinstance(e, RateLimited) else {})}))
-        return 2
-    print(json.dumps(sealed(facts) if seal else facts))
-    return 0
+        return emit({'error': str(e), **({'rateLimit': e.limit} if limits and isinstance(e, RateLimited) else {})}, 2)
+    return emit(sealed(facts) if seal else facts, 0)
+
+
+EMIT_KEEP = 14 * 86400  # seconds an emit directory outlives its last write: a launch resumed later reloads its files
+
+
+def emit_dir():
+    """A new directory for one workflow launch's emitted lines, under the checkout's git common dir; directories there
+    unwritten for EMIT_KEEP go."""
+    parent = Path(git('rev-parse', '--path-format=absolute', '--git-common-dir').strip()) / 'agentrc-emit'
+    parent.mkdir(exist_ok=True)
+    for old in parent.iterdir():
+        try:
+            if old.is_dir() and time.time() - old.stat().st_mtime > EMIT_KEEP:
+                shutil.rmtree(old)
+        except OSError:
+            pass
+    return {'dir': Path(tempfile.mkdtemp(prefix='', dir=parent)).as_posix()}
 
 
 def collect(argv):
     if argv == ['repo']:
         return {'repo': checkout_repo()}
-    raise Unusable('usage: facts.py repo')
+    if argv == ['emit-dir']:
+        return emit_dir()
+    raise Unusable('usage: facts.py repo | emit-dir')
 
 
-if __name__ == '__main__':  # `repo`: the checkout's one repository, for a prompt that must name it (fix-issue's triage)
+# `repo`: the checkout's one repository, for a prompt that must name it (fix-issue's triage); `emit-dir`: a workflow's
+# AGENTRC_EMIT directory.
+if __name__ == '__main__':
     sys.exit(report(collect, sys.argv[1:]))

@@ -90,15 +90,13 @@ class VerdictTest(unittest.TestCase):
     def test_plain_script_calls_pass(self):
         home_script = (Path.home() / '.claude/skills/captain/scripts/captain.py').as_posix()
         for cmd in [f'{RUN} list', f'{RUN} list --json', f'{RUN} enroll', f'{RUN} enroll --replace',
-                    f'{RUN} ask t2 t1b', f'{RUN} ask pr:12 pr:hathach:agentrc:12 issue:7 space:sp9580d0 space:my-label',
-                    f'{RUN} relay pr:12 t2', f'{RUN} collect m-0a1b --wait 1740000', f'{RUN} reports',
+                    f'{RUN} ask t2 t1b', f'{RUN} ask space:sp9580d0 space:my-label',
+                    f'{RUN} relay space:code t2', f'{RUN} collect m-0a1b --wait 1740000', f'{RUN} reports',
                     f'{RUN} cancel m-0a1b', f'{RUN} relay t2 t1b',
                     f'{RUN} relay t2 --entry f0a4846d-6b04-428a-8e4d-a4fc931e6cff --digest 3f9a0c1d2e4b5a67',
-                    f'{RUN} withdraw a-0a1b', f'{RUN} watch all', f'{RUN} watch t2 pr:12', f'{RUN} watches',
-                    f'{RUN} collect --from 12 --wait 1740000', f'{RUN} reports --json j-0a1b:12 m-0a1b',
-                    f'{RUN} cancel w-0a1b',
-                    f'{RUN} open --checkout /home/u/code/repo --account ada --name repo',
-                    f'{RUN} open --checkout ~/code/repo --account main',
+                    f'{RUN} watch all', f'{RUN} watch t2 space:code', f'{RUN} watches',
+                    f'{RUN} collect --wait 1740000', f'{RUN} reports --json j-0a1b:12 m-0a1b',
+                    f'{RUN} reports --json --new', f'{RUN} cancel w-0a1b',
                     f'python3 {home_script} list']:
             with self.subTest(cmd):
                 self.assertIsNone(self.verdict('Bash', command=cmd))
@@ -113,8 +111,8 @@ class VerdictTest(unittest.TestCase):
                     f'{RUN} ask t2 --file=/etc/passwd', f'{RUN} accept --action a-1',
                     f'{RUN} outcome --action a-1 --result completed', f'{RUN} ask /etc/passwd',
                     f'{RUN} brief --pending', f'{RUN} brief --for m-1',
-                    f'{RUN} open --checkout /home/u/../../etc --account main', f'{RUN} open --name /tmp/x',
-                    f'{RUN} open --checkout ~root/x --account main', 'hc send t2 /exit',
+                    f'{RUN} open --checkout /home/u/code/repo --account ada', f'{RUN} open --account main',
+                    f'{RUN} withdraw a-1', 'hc send t2 /exit',
                     'hc kill t2', 'hc keys t2 enter', 'hc run --bg claude', 'herdr-app do space.close',
                     'kill 1234', 'pkill claude',
                     f'{RUN} close t2', f'{RUN} kill t2', None]:
@@ -126,8 +124,7 @@ class VerdictTest(unittest.TestCase):
         text = (Path(__file__).resolve().parents[1] / 'skills' / 'captain' / 'SKILL.md').read_text(encoding='utf-8')
         sample = {'<terminal>...': 't2', '<msg>...': 'm-1', '<msg>': 'm-1', '<ms>': '1740000', 'MS': '1740000',
                   '<uuid>': 'f0a4846d-6b04-428a-8e4d-a4fc931e6cff', '<hex>': '3f9a0c1d2e4b5a67', '<action>': 'a-1',
-                  '<target>...': 'pr:12',
-                  '<dir>': '/home/u/code/repo', '<main|ada>': 'ada', '<name>': 'repo'}
+                  '<target>...': 't2'}
         found = re.findall(r'(python3 ~/\.claude/skills/captain/scripts/captain\.py [^`#\n]*)', text)
         self.assertGreaterEqual(len(found), 10)
         for cmd in found:
