@@ -531,11 +531,55 @@ class LaunchResultTest(unittest.TestCase):
             'reply batch did not pass: deferralPosts: nothing publishable',
             'uncertain publication: adoption aaaaaaaa..bbbbbbbb: unknown',
             'action error: gh died',
-            'CI evidence incomplete for hil-tinyusb (tinyusb.json) / l476 msc',
+            'CI evidence incomplete for hil-tinyusb (tinyusb.json) / l476 msc: a relaunch reads no more of its log: report it',
             f"heads disagree: {{'result': '{NEXT}', 'state': '{HEAD}'}}"])
         self.assertEqual(s['receipts']['pushes'][0]['detail'], 'push died' + ' z' * 200, 'a push receipt is never cut')
         self.assertEqual(s['receipts']['replies'][0], {'batch': 'refutedPosts', 'findingVerdicts': [], 'commentId': 9, 'kind': 'review', 'sent': True,
                                                        'posted': True, 'verified': False, 'error': None})
+
+    def test_an_unpublished_repair_names_the_adoption_relaunch_that_settles_it(self):
+        def failed(lane, stage, checkout=NEXT):
+            data = output(result={'reason': 'push-failed', 'status': 'blocked', 'head': None,
+                                  'state': {'expectedHead': HEAD, 'pending': {'sha': NEXT, 'parent': HEAD, 'lane': lane, 'stage': stage}}})
+            actions = data['result']['observation']['actions']
+            actions.pop('reviewPush')
+            actions[f'{lane}Push'] = {'pass': False, 'committed': True, 'sha': NEXT, 'detail': 'push rejected'}
+            return launch_result.summarize(data, '/t/w.output', tree={'branch': 'pr', 'head': checkout, 'dirty': []})['blockers']
+        for lane in ('review', 'ci'):
+            for stage in ('push-failed', 'publication-unknown'):
+                with self.subTest(lane=lane, stage=stage):
+                    self.assertEqual(failed(lane, stage), [
+                        f'uncertain publication: {lane}Push: push rejected; the {lane} repair bbbbbbbb on aaaaaaaa is unpublished '
+                        f'({stage}): relaunch with the same stateRef and adoptHead {NEXT}, the checkout left at it, while the PR '
+                        'head is still aaaaaaaa; once the PR head moved, that launch stops adopt-pending',
+                        f"heads disagree: {{'state': '{HEAD}', 'checkout': '{NEXT}'}}; the checkout holds the unpublished {lane} "
+                        'repair, settled by its adoptHead relaunch'])
+        audited = failed('review', 'audit-blocked')
+        self.assertFalse([b for b in audited if 'adoptHead' in b], 'an audit-blocked candidate is refused adoption')
+        elsewhere = failed('review', 'push-failed', checkout='c' * 40)
+        self.assertEqual([b for b in elsewhere if b.startswith('heads disagree')], [f"heads disagree: {{'state': '{HEAD}', 'checkout': '{'c' * 40}'}}"],
+                         'a checkout off the repair is not the one its adoption settles')
+
+    def test_an_unusable_validator_report_is_settled_by_a_relaunch_that_runs_it_again(self):
+        for reason, error in (('duplicate-finding-ids', 'duplicate findingId'),
+                              ('review-report-unusable', 'validator report unusable: no bots')):
+            with self.subTest(reason):
+                data = output(result={'reason': reason, 'status': 'blocked'})
+                data['result']['observation']['actions'].update(reviewPush=None, error=error)
+                self.assertEqual(self.run_it(data)[1]['blockers'], [
+                    f'action error: {error}; a `reviews` or `both` relaunch with the same stateRef runs the validator again; '
+                    'listed again unchanged, report it'])
+
+    def test_incomplete_ci_evidence_is_relaunched_for_only_on_a_circleci_check(self):
+        # #319: a relaunch collects a stored CircleCI verdict's whole log once; an Actions verdict is reused as judged.
+        data = output()
+        data['result']['observation']['ci']['realFailures'] = [
+            {**failure('build', complete=False), 'check': 'ci/circleci: build'},
+            {**failure('arm', complete=False), 'check': 'build / arm'}]
+        self.assertEqual(self.run_it(data)[1]['blockers'], [
+            'CI evidence incomplete for ci/circleci: build / build: a relaunch with the same stateRef collects its whole log '
+            'once and judges it again; listed again, report it',
+            'CI evidence incomplete for build / arm / arm: a relaunch reads no more of its log: report it'])
 
     def test_a_handed_off_comment_and_a_settlement_that_did_not_settle_are_blockers(self):
         data = output()
