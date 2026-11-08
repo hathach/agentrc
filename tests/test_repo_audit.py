@@ -815,9 +815,15 @@ class Record(unittest.TestCase):
 
     def test_an_oversized_report_refuses(self):
         self.audit(outcome='word ' * 14000)
-        code, _, err = self.report([{'id': 'suite', 'result': 'pass', 'ref': 'CI run 9'}])
+        item = {'id': 'suite', 'result': 'pass', 'ref': 'CI run 9'}
+        code, _, err = self.report([item])
         self.assertEqual(code, 2)
         self.assertIn("over GitHub's 65536", err)
+        with mock.patch.object(audit, 'COMMENT_LIMIT', 10 ** 6):
+            size = len(self.report([item])[1])
+        for limit, want in ((size, 0), (size - 1, 2)):     # the limit counts every character printed
+            with self.subTest(limit=limit), mock.patch.object(audit, 'COMMENT_LIMIT', limit):
+                self.assertEqual(self.report([item])[0], want)
 
     def test_a_pr_base_out_of_order_reads_invalid(self):
         self.repo.git('checkout', '-q', '-b', 'side')

@@ -894,13 +894,13 @@ def report(args):
     if problems:
         raise Refused('\n'.join(problems))
     body = render(repo, rec, end, results['items']) + \
-        f'\n```text\n{VALIDATION}\n{json.dumps({"end": end, "items": results["items"]}, indent=1)}\n```'
+        f'\n```text\n{VALIDATION}\n{json.dumps({"end": end, "items": results["items"]}, indent=1)}\n```\n'
     if report_blocks(body) != [{'end': end, 'items': results['items']}]:
         raise Refused('the rendered report hides or adds a validation block: a record string escaped its line')
     if len(body) > COMMENT_LIMIT:
         raise Refused(f'the comment is {len(body)} characters, over GitHub\'s {COMMENT_LIMIT}: shorten the record\'s '
                       'texts')
-    print(body)
+    print(body, end='')
     return 0
 
 
