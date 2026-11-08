@@ -16,10 +16,12 @@ and the newest validation report, a PR comment by an account with write permissi
 first line is `repo-audit-validation: 1` and then {"end": E, "items": [{"id", "result": "pass"|"fail", "ref"}]}
 (no other fields; ref non-empty), passes every expected item recorded as covered. A newer report whose author's
 permission cannot be read leaves the record provisional; no older report stands in for it. A caller without push
-access cannot read permissions (HTTP 403): then only the repository's owner (author_association OWNER) counts. The
-comments are listed twice; listings that differ leave the record provisional. It prints `complete`, `provisional`
-(the report is missing, malformed, names another end, fails or misses an item) or `invalid` (a PR or ref GitHub
-does not have included), each reason after it. Exit 0 complete, 1 otherwise, 2 refused.
+access cannot read permissions (HTTP 403): then only the owner of a user's repository (author_association OWNER)
+counts, never an organisation's (MEMBER), so check an organisation's record with push access. The comments are
+listed twice; a second listing that lost or reordered the first's comments refuses (run it again). It prints
+`complete`, `provisional` (the report is missing, malformed, names another end, fails or misses an item) or
+`invalid` (a PR or ref GitHub does not have included; a repository that answers 404 too, as one the caller cannot
+see does, refuses), each reason after it. Exit 0 complete, 1 otherwise, 2 refused.
 
 report checks the record at E as check does, without the validation comment, and that FILE's {"end", "items":
 [{"id", "result", "ref"}]} names E, the commit its results were taken on, and exactly the record's covered items;
@@ -29,19 +31,20 @@ it prints the comment body. It posts nothing:
 start takes the base from a complete record (its end E, kind `audit`) or from --base with its kind (`bootstrap` for
 a first audit, refused when head holds a record; `override` to replace one); anything else refuses, offering the
 record's own base as an override when it is an ancestor of head. Whatever the base, DIR/carried.json holds the blob
-id of the record at head (null without one) and, from a schema-valid record of this repository, its live decisions,
-open items and policy. It writes DIR/inventory.json, DIR/carried.json, then DIR/run.json, and prints the growth
-summary. DIR defaults to $XDG_STATE_HOME
+id of the record at head (null without one) and, from a schema-valid record of this repository, its pr, live
+decisions, open items and policy. It writes DIR/inventory.json, DIR/carried.json, then DIR/run.json, and prints the
+growth summary. DIR defaults to $XDG_STATE_HOME
 (~/.local/state) agentrc/repo-audit/<identity key>/<time>-<random>, created exclusively. --since/--until bound the
 transcript window usage.py reads (ISO 8601; default the base commit's committer time and now).
 
-finish checks the run's repository again in --repo (default the checkout start ran in): that the checkout is clean at
---head R, R descends from the run's base and start head, and R holds the record start read (another audit's record
-merged since refuses); the lead's review FILE against the record schema, the run's range and carried items and the
-privacy rules; and that the review's PR is open on its repository with head R. It refuses a `.claude` or record
-path that is a symbolic link or an ignored record path, then writes the record through a new file renamed over it
-and prints how to commit it. Exit 0 done, 2 refused (with every reason on stderr). Shallow or grafted history, or a
-replace ref, is refused before any command.
+finish checks, in the run's repository at --repo (default the checkout start ran in), the lead's review FILE
+against the record schema, the run's range and carried items and the privacy rules, and that the review's PR is
+open on its repository with head R; then, after that GitHub read, that the checkout is clean at --head R, R
+descends from the run's base and start head, and R holds the record start read (this audit's own record commit, or
+another audit's record merged since, refuses). It refuses a `.claude` or record path that is a symbolic link or an
+ignored record path, then writes the record through a new file renamed over it and prints how to commit it. Exit 0
+done, 2 refused (with every reason on stderr). Shallow or grafted history, or a replace ref, is refused before any
+command; so is a run dir of another audit.py version.
 
 FILE is one JSON object; a field the schema does not name is refused at any depth:
   range       "<base>..<R>" in full SHAs: the run's range, so a review written before R moved refuses
@@ -106,16 +109,20 @@ ITEM_ID = re.compile(r'[A-Za-z0-9][\w.-]*')
 STAGE_NAME = re.compile(r'[a-z][a-z0-9-]*')
 TOTAL_NAME = re.compile(r'[a-z][A-Za-z0-9]*')
 DATE = re.compile(r'\d{4}-\d{2}-\d{2}')
-# a session id is session_01 + base62, case-sensitive: register names like OTGSC_B_SESSION_VALID are not one
+UUID = r'\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b'
+# a session id is session_01 + base62, case-sensitive: register names like OTGSC_B_SESSION_VALID are not one; sudo,
+# the filters and a $VAR are case-sensitive too, so prose ("Sudo rights", "base | HEAD", "$6/launch") passes
 PRIVATE = re.compile(r'/home/|/Users/|~/|/tmp/|C:\\Users|\.jsonl|claude\.ai/code/session'
-                     r'|(?-i:\bsession_01[0-9A-Za-z]{8})|toolu_|chatgpt\.com/(?:c|codex|share)/'
-                     r'|\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b'
-                     r'|\$\(|\d>&\d|/dev/null|(?:^|\s)sudo\s|(?:^|\n)\s*\$ '
-                     r'|\|\s*(?:grep|sed|awk|head|tail|xargs|tee|jq)\b|\$\{?\w+\}?/', re.I)
-CI_URL = re.compile(r'https://app\.circleci\.com/\S*')       # its workflow and job ids are UUIDs
+                     r'|(?-i:\bsession_01[0-9A-Za-z]{8})|toolu_|chatgpt\.com/(?:c|codex|share)/|' + UUID +
+                     r'|\$\(|\d>&\d|/dev/null|(?-i:(?:^|\s)sudo\s)|(?:^|\n)\s*\$ '
+                     r'|(?-i:\|\s*(?:grep|sed|awk|head|tail|xargs|tee|jq)\b|\$\{?[A-Za-z_]\w*\}?/)', re.I)
+CI_URL = re.compile(r'https://app\.circleci\.com/\S*', re.I)      # its workflow and job ids are UUIDs
+CI_ID = re.compile(UUID, re.I)
 FENCE = re.compile(r'^```[^\n]*\n(.*?)^```[ \t]*$', re.M | re.S)
 LIVE = {'new', 'carried'}
 SETTLED = {'carried', 'resolved', 'superseded'}
+RUN_FORMAT = 3
+LEFT = re.compile(r'\.claude/\.audit\.json\.[0-9a-f]{8}\.tmp')     # finish's new record, before its rename
 
 
 class Refused(Exception):
@@ -284,7 +291,8 @@ def diff_path(text):
 def count_test_defs(repo, base, end):
     """{test file: [added, removed]} counting test function heads in the diff of test paths."""
     out = git(repo, '-c', 'core.quotePath=false', 'diff', '-U0', '--no-color', '--no-ext-diff', '--no-textconv',
-              '-M', '--ignore-submodules=none', '--src-prefix=a/', '--dst-prefix=b/', base, end).stdout
+              '-M', '--ignore-submodules=none', '--submodule=short', '--src-prefix=a/', '--dst-prefix=b/', base,
+              end).stdout
     counts, old, path = defaultdict(lambda: [0, 0]), None, None
     for line in out.splitlines():
         if line.startswith('--- '):
@@ -631,7 +639,7 @@ def private(value, where='', found=None):
     elif isinstance(value, list):
         for i, v in enumerate(value):
             private(v, f'{where}[{i}]', found)
-    elif isinstance(value, str) and (m := PRIVATE.search(CI_URL.sub(' ', value))):
+    elif isinstance(value, str) and (m := PRIVATE.search(CI_URL.sub(lambda u: CI_ID.sub('id', u[0]), value))):
         found.append((where.lstrip('.'), m.group()))
     return found
 
@@ -689,10 +697,12 @@ def validation_problems(rec, end):
     expected item recorded as covered."""
     pr = rec['pr']
     url = f'repos/{pr["repo"]}/issues/{pr["number"]}/comments'
-    # pages are numbered: a comment deleted during a read shifts another across a page boundary, out of the listing
+    # pages are numbered: a comment deleted during a read shifts another across a page boundary, out of the listing;
+    # one appended between the two listings shifts none
+    first = [c.get('id') for c in api(url, paginate=True)]
     listed = api(url, paginate=True)
-    if [c.get('id') for c in listed] != [c.get('id') for c in api(url, paginate=True)]:
-        return [f'the comments on {pr["repo"]}#{pr["number"]} changed while they were read: check again']
+    if first != [c.get('id') for c in listed][:len(first)]:
+        raise Refused(f'the comments on {pr["repo"]}#{pr["number"]} changed while they were read: run it again')
     comments = sorted(listed, key=lambda c: (c.get('created_at') or '', c.get('id') or 0))
     writers = {}
     for c in reversed(comments):
@@ -743,6 +753,13 @@ def end_problems(repo, rec, end):
     except HttpError as e:
         if e.status != 404:
             raise
+        try:
+            api(f'repos/{pr["repo"]}')
+        except HttpError as r:
+            if r.status != 404:
+                raise
+            raise Refused(f'{pr["repo"]} cannot be read ({r}): GitHub answers 404 for a repository the token cannot '
+                          'see too') from None
         return [f'{where} does not exist: {e}']
     if not data.get('merged'):
         return [f'{where} is not merged']
@@ -757,9 +774,11 @@ def end_problems(repo, rec, end):
         return problems + [f'{where} has no head SHA']
     if not has_commit(repo, p):
         ref = f'refs/pull/{pr["number"]}/head'
-        fetched = git(repo, 'fetch', '-q', '--no-tags', '--no-recurse-submodules', '--no-write-fetch-head',
-                      f'{GITHUB}{pr["repo"]}.git', ref, check=False)
-        if fetched.returncode and "couldn't find remote ref" in fetched.stderr:
+        url = f'{GITHUB}{pr["repo"]}.git'
+        fetched = git(repo, 'fetch', '-q', '--no-tags', '--no-recurse-submodules', '--no-write-fetch-head', url, ref,
+                      check=False)
+        # exit 2: no such ref, whatever language the fetch's message came in
+        if fetched.returncode and git(repo, 'ls-remote', '--exit-code', url, ref, check=False).returncode == 2:
             return problems + [f'{pr["repo"]} has no {ref}']
         if fetched.returncode:
             raise Refused(f'git fetch {ref}: {fetched.stderr.strip()}')
@@ -914,13 +933,15 @@ def start(args):
     status = git(repo, '--no-optional-locks', 'status', '--porcelain').stdout.splitlines()
     tool = Path(__file__).resolve().parent
     tool_rev = git(tool, 'rev-parse', 'HEAD', check=False).stdout.strip() or None
-    run = {'format': 2, 'repo': str(repo), 'identity': roots, 'base': base, 'baseKind': base_kind,
+    run = {'format': RUN_FORMAT, 'repo': str(repo), 'identity': roots, 'base': base, 'baseKind': base_kind,
            'start_head': head, 'since': since, 'until': until, 'tool_revision': tool_rev,
            'dirty': sum(not s.startswith('??') for s in status), 'untracked': sum(s.startswith('??') for s in status)}
     inv = inventory(repo, base, head)
     create(out / 'inventory.json', json.dumps(inv, indent=1) + '\n')
     create(out / 'carried.json', json.dumps(carried, indent=1) + '\n')
-    create(out / 'run.json', json.dumps(run, indent=1) + '\n')      # last: a run.json means the others are whole
+    # last: a run.json means start wrote the others; unsynced, a crash can still lose them (finish refuses a lost
+    # carried.json)
+    create(out / 'run.json', json.dumps(run, indent=1) + '\n')
     print(f'run dir: {out}')
     print(f'window: {since} .. {until}')
     if carried['record'] and carried['pr'] is None:
@@ -931,11 +952,24 @@ def start(args):
     return 0
 
 
-def require(data, path, keys):
-    """Refuse a run file start did not write whole, or that was edited since."""
-    missing = [k for k in keys if k not in data] if isinstance(data, dict) else ['an object']
-    if missing:
-        raise Refused(f'{path} lacks {", ".join(missing)}: start again')
+def is_sha(v):
+    return isinstance(v, str) and bool(SHA.fullmatch(v))
+
+
+RUN_FIELDS = {'repo': lambda v: isinstance(v, str) and bool(v),
+              'identity': lambda v: isinstance(v, list) and bool(v) and all(map(is_sha, v)),
+              'base': is_sha, 'baseKind': lambda v: v in ('audit', 'bootstrap', 'override'), 'start_head': is_sha}
+CARRIED_FIELDS = {'record': lambda v: v is None or isinstance(v, str), 'decisions': lambda v: True,
+                  'open': lambda v: True}
+
+
+def require(data, path, fields):
+    """Refuse a run file start did not write whole, or that was edited since: fields maps each key to its test."""
+    if not isinstance(data, dict):
+        raise Refused(f'{path} lacks an object: start again')
+    bad = [k for k, ok in fields.items() if k not in data or not ok(data[k])]
+    if bad:
+        raise Refused(f'{path} lacks a valid {", ".join(bad)}: start again')
     return data
 
 
@@ -960,15 +994,44 @@ def pr_problems(pr, head):
     return problems
 
 
+def checkout_problems(repo, run, record, reviewed):
+    """Why the checkout cannot take the record commit on the reviewed head."""
+    problems = []
+    if git(repo, 'rev-parse', 'HEAD').stdout.strip() != reviewed:
+        problems.append(f'HEAD of {repo} is not --head {reviewed[:12]}: the record commit goes on the reviewed head')
+    dirty = [s[3:] for s in git(repo, '--no-optional-locks', 'status', '--porcelain', '--untracked-files=all')
+             .stdout.splitlines() if s[3:] != RECORD]
+    left = [p for p in dirty if LEFT.fullmatch(p)]
+    if left:
+        problems.append(f'{", ".join(left)}: left by an interrupted finish; delete it')
+    dirty = [p for p in dirty if p not in left]
+    if dirty:
+        problems.append(f'{repo} has {len(dirty)} uncommitted paths (first: {dirty[0]}): the record commit holds the '
+                        'record alone')
+    for name in ('base', 'start_head'):
+        if not is_ancestor(repo, run[name], reviewed):
+            problems.append(f'--head {reviewed[:12]} does not descend from the run\'s {name} {run[name][:12]}')
+    if record_blob(repo, reviewed) != record:
+        problems.append(f'{RECORD} at --head {reviewed[:12]} is not the one start read at {run["start_head"][:12]}: '
+                        'this audit\'s own record commit P is on it (drop P, then finish on R) or another audit\'s '
+                        'record landed since (start again from it)')
+    for link in ('.claude', RECORD):
+        if (repo / link).is_symlink():
+            problems.append(f'{link} is a symbolic link: the record goes only into a regular file in .claude/')
+    if git(repo, 'check-ignore', '-q', '--', RECORD, check=False).returncode == 0:
+        problems.append(f'{RECORD} is ignored by git: its commit would fail')
+    return problems
+
+
 def finish(args):
     out = Path(args.run)
     run = read_json(out / 'run.json')
-    if not isinstance(run, dict) or run.get('format') != 2:
+    if not isinstance(run, dict) or run.get('format') != RUN_FORMAT:
         raise Refused(f'{out} is a run of an older audit.py: start again')
-    require(run, out / 'run.json', ('repo', 'identity', 'base', 'baseKind', 'start_head'))
+    require(run, out / 'run.json', RUN_FIELDS)
     if not (out / 'carried.json').is_file():
         raise Refused(f'{out} has no carried.json: start did not complete; start again')
-    prior = require(read_json(out / 'carried.json'), out / 'carried.json', ('record', 'decisions', 'open'))
+    prior = require(read_json(out / 'carried.json'), out / 'carried.json', CARRIED_FIELDS)
     try:
         carried = {i['id'] for i in prior['decisions'] + prior['open']}
     except (TypeError, KeyError):
@@ -983,45 +1046,30 @@ def finish(args):
     reviewed = commit(repo, args.head)
     if identity(repo, reviewed) != run['identity']:
         raise Refused(f'{repo} is not the repository this run audited')
-    problems = []
-    if git(repo, 'rev-parse', 'HEAD').stdout.strip() != reviewed:
-        problems.append(f'HEAD of {repo} is not --head {reviewed[:12]}: the record commit goes on the reviewed head')
-    dirty = [s for s in git(repo, '--no-optional-locks', 'status', '--porcelain', '--untracked-files=all')
-             .stdout.splitlines() if s[3:] != RECORD]
-    if dirty:
-        problems.append(f'{repo} has {len(dirty)} uncommitted paths (first: {dirty[0][3:]}): the record commit '
-                        'holds the record alone')
-    for name in ('base', 'start_head'):
-        if not is_ancestor(repo, run[name], reviewed):
-            problems.append(f'--head {reviewed[:12]} does not descend from the run\'s {name} {run[name][:12]}')
-    if record_blob(repo, reviewed) != prior['record']:
-        problems.append(f'{RECORD} at --head {reviewed[:12]} is not the one start read at {run["start_head"][:12]}: '
-                        'another audit\'s record landed since; start again from it')
-    for link in ('.claude', RECORD):
-        if (repo / link).is_symlink():
-            problems.append(f'{link} is a symbolic link: the record goes only into a regular file in .claude/')
-    if git(repo, 'check-ignore', '-q', '--', RECORD, check=False).returncode == 0:
-        problems.append(f'{RECORD} is ignored by git: its commit would fail')
     review = read_json(args.review)
     s = Shape()
     if s.obj(review, 'review', REVIEW_FIELDS):
         check_review(s, review, f'{run["base"]}..{reviewed}', carried)
-    problems += s.problems
+    problems = s.problems + [f'{w}: looks private ({m!r})' for w, m in private(review)]
     if not s.problems:
         problems += uncovered(repo, run['base'], reviewed, review['coverage']) + pr_problems(review['pr'], reviewed)
-    problems += [f'{w}: looks private ({m!r})' for w, m in private(review)]
+    # the checkout last, after the GitHub read: another agent may commit, check out or edit meanwhile
+    problems += checkout_problems(repo, run, prior['record'], reviewed)
     if problems:
         raise Refused('\n'.join(problems))
     record = {'schema': SCHEMA, 'identity': run['identity'], 'base': run['base'], 'baseKind': run['baseKind'],
               'reviewedHead': reviewed, 'completed': datetime.datetime.now().astimezone().isoformat(timespec='seconds'),
               **{k: review[k] for k in RECORDED}}
-    (repo / '.claude').mkdir(exist_ok=True)
     new = repo / '.claude' / f'.audit.json.{secrets.token_hex(4)}.tmp'
     try:
-        create(new, json.dumps(record, indent=2, ensure_ascii=False) + '\n', newline='\n')
-        os.replace(new, repo / RECORD)       # a link raced in at RECORD is replaced, never written through
-    finally:
-        new.unlink(missing_ok=True)
+        (repo / '.claude').mkdir(exist_ok=True)
+        try:
+            create(new, json.dumps(record, indent=2, ensure_ascii=False) + '\n', newline='\n')
+            os.replace(new, repo / RECORD)       # a link raced in at RECORD is replaced, never written through
+        finally:
+            new.unlink(missing_ok=True)
+    except OSError as e:
+        raise Refused(f'{RECORD} was not written: {e}') from None
     print(f'wrote {RECORD}; read it, then commit it alone as the PR\'s last commit:')
     print(f'  git add -- {RECORD} && git commit --only -- {RECORD}')
     print('nothing may follow it: the PR merges with that commit as its head, its parent the reviewed head')

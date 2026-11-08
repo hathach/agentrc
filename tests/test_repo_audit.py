@@ -281,6 +281,23 @@ class Start(unittest.TestCase):
         self.assertEqual(sorted(row[2] for row in inv['areas']), ['lib/dep', 'lib/new'])     # gone -> new: a rename
         self.assertTrue(inv['shortstat'].startswith('2 files changed'), inv['shortstat'])
 
+    def test_a_submodule_s_own_tests_are_not_counted(self):
+        dep = Repo(self)
+        dep.commit({'test/test_x.c': 'void test_a(void) {}\n'})
+        r = self.repo
+        subprocess.run(['git', '-C', str(r.path), '-c', 'protocol.file.allow=always', 'submodule', '-q', 'add',
+                        str(dep.path), 'lib/sub'], check=True, capture_output=True, env=git_env())
+        r.git('commit', '-q', '-m', 'pin')
+        pinned = r.git('rev-parse', 'HEAD')
+        (r.path / 'lib' / 'sub' / 'test' / 'test_x.c').write_text('void test_a(void) {}\nvoid test_b(void) {}\n',
+                                                                 newline='\n')
+        r.git('-C', 'lib/sub', 'commit', '-q', '-am', 'more')
+        r.git('add', 'lib/sub')
+        r.git('commit', '-q', '-m', 'bump')
+        r.git('config', 'diff.submodule', 'diff')         # would inline the submodule's diff
+        self.assertEqual(self.start('--base', pinned)[0], 0)
+        self.assertEqual(self.inventory()['tests_added_removed'], [])
+
     def test_unity_definitions_count_and_prototypes_do_not(self):
         self.repo.commit({'test/unit/test_dcd.c': 'void test_open(void);\nvoid test_open(void)\n{\n}\n'
                                                   'void test_close(void) { TEST_ASSERT(1); }\n'
@@ -349,7 +366,7 @@ class Hub:
 
     def __init__(self, case):
         self.root = tmpdir(case)
-        self.pulls, self.comments, self.calls = {}, {}, []
+        self.pulls, self.comments, self.calls, self.hidden = {}, {}, [], set()
         self.roles = {'alice': {'permission': 'write', 'role_name': 'maintain'},
                       'bob': {'permission': 'read', 'role_name': 'triage'}}
 
@@ -361,8 +378,12 @@ class Hub:
     def gh(self, args):
         self.calls.append(args)
         path = args[-1]
+        if m := re.fullmatch(r'repos/([^/]+/[^/]+)', path):
+            hidden = m[1] in self.hidden
+            return (1, '{"message":"Not Found"}', 'gh: Not Found (HTTP 404)') if hidden else \
+                (0, json.dumps({'full_name': m[1]}), '')
         if m := re.fullmatch(r'repos/([^/]+/[^/]+)/pulls/(\d+)', path):
-            pr = self.pulls.get((m[1], int(m[2])))
+            pr = None if m[1] in self.hidden else self.pulls.get((m[1], int(m[2])))
             return (0, json.dumps(pr), '') if pr else (1, '{"message":"Not Found"}', 'gh: Not Found (HTTP 404)')
         if m := re.fullmatch(r'repos/([^/]+/[^/]+)/issues/(\d+)/comments\?per_page=100', path):
             return 0, json.dumps([self.comments.get((m[1], int(m[2])), [])]), ''
@@ -478,6 +499,15 @@ class Record(unittest.TestCase):
         subprocess.run(['git', '-C', str(self.hub.bare('o/r')), 'update-ref', '-d', 'refs/pull/7/head'], check=True,
                        env=git_env())
         self.assertStatus('invalid', 'o/r has no refs/pull/7/head', repo=clone)
+        git = audit.git
+
+        def translated(repo, *args, **kw):
+            r = git(repo, *args, **kw)
+            if 'fetch' in args and r.returncode:
+                r.stderr = 'fatal: Remote-Referenz refs/pull/7/head nicht gefunden\n'
+            return r
+        with mock.patch.object(audit, 'git', translated):
+            self.assertStatus('invalid', 'o/r has no refs/pull/7/head', repo=clone)
 
     def test_a_pr_github_does_not_have_reads_invalid_and_start_offers_the_override(self):
         self.audit()
@@ -487,6 +517,10 @@ class Record(unittest.TestCase):
             code, _, err = start(self.repo.path, tmpdir(self) / 'run')
         self.assertEqual(code, 2)
         self.assertIn(f'pass --base {self.base} --base-kind override', err)
+        self.hub.hidden.add('o/r')          # private, and the caller's token cannot see it: GitHub answers 404 too
+        code, out, err = self.check()
+        self.assertEqual(code, 2, out + err)
+        self.assertIn('o/r cannot be read', err)
         with mock.patch.object(audit, 'gh', return_value=(1, '', 'gh: Service Unavailable (HTTP 503)')):
             code, _, err = run(audit.main, 'check', '--repo', str(self.repo.path), '--head', 'main')
         self.assertEqual((code, 'HTTP 503' in err), (2, True))      # a failed read stays a refusal
@@ -598,21 +632,33 @@ class Record(unittest.TestCase):
         self.hub.comment('o/r', 7, 'alice', validation(self.end, ('suite', 'fail')))
         self.assertStatus('provisional', 'validation report by alice: suite is fail')
 
-    def test_comments_changed_between_two_listings_leave_the_record_provisional(self):
+    def test_comments_lost_between_two_listings_refuse_and_an_appended_one_is_read(self):
         self.audit()
         listings = []
 
-        def gh(args):
-            answer = self.hub.gh(args)
-            if args[-1].endswith('/comments?per_page=100'):
-                listings.append(args)
-                if len(listings) == 1:      # a comment deleted during the first read
-                    self.hub.comments[('o/r', 7)].pop(0)
-            return answer
-        with mock.patch.object(audit, 'gh', gh):
+        def during_first_read(change):
+            def gh(args):
+                answer = self.hub.gh(args)
+                if args[-1].endswith('/comments?per_page=100'):
+                    listings.append(args)
+                    if len(listings) == 1:
+                        change()
+                return answer
+            listings.clear()
+            return mock.patch.object(audit, 'gh', gh)
+        with during_first_read(lambda: self.hub.comment('o/r', 7, 'alice', validation(self.end, ('suite', 'fail')))):
             self.assertEqual(audit.validation_problems(self.record(), self.end),
-                             ['the comments on o/r#7 changed while they were read: check again'])
+                             ['validation report by alice: suite is fail'])
         self.assertEqual(len(listings), 2)
+        with during_first_read(lambda: self.hub.comments[('o/r', 7)].pop(0)):
+            with self.assertRaisesRegex(audit.Refused, 'the comments on o/r#7 changed while they were read: run it '
+                                                       'again'):
+                audit.validation_problems(self.record(), self.end)
+        with during_first_read(lambda: self.hub.comments[('o/r', 7)].pop(0)):
+            code, _, err = start(self.repo.path, tmpdir(self) / 'run')
+        self.assertEqual(code, 2)
+        self.assertIn('changed while they were read', err)
+        self.assertNotIn('--base-kind override', err)       # a transient read offers no re-audit
 
     def test_a_listing_that_is_not_pages_is_refused(self):
         with mock.patch.object(audit, 'gh', return_value=(0, '{"message": "x"}', '')):
@@ -777,7 +823,37 @@ class Finish(unittest.TestCase):
         code, _, err = self.finish(review(self.base, head), head)
         self.assertEqual(code, 2, err)
         self.assertIn(f'{audit.RECORD} at --head {head[:12]} is not the one start read at {self.head[:12]}', err)
+        self.assertIn('this audit\'s own record commit P is on it (drop P, then finish on R)', err)
         self.assertEqual((self.repo.path / audit.RECORD).read_text(), other)
+
+    def test_the_checkout_is_checked_after_the_github_read(self):
+        read, elsewhere = audit.pr_problems, tmpdir(self)
+
+        def moved(change):
+            def pr_problems(*args):
+                problems = read(*args)
+                change()        # another agent, while the GitHub read took its seconds
+                return problems
+            return mock.patch.object(audit, 'pr_problems', pr_problems)
+        with moved(lambda: self.repo.commit({'b.txt': 'b\n'})):
+            self.refused(f'HEAD of {self.repo.path} is not --head {self.head[:12]}')
+        self.repo.git('reset', '-q', '--hard', self.head)
+        with moved(lambda: (self.repo.path / '.claude').symlink_to(elsewhere, target_is_directory=True)):
+            self.refused('.claude is a symbolic link')
+        self.assertEqual(list(elsewhere.iterdir()), [])
+
+    def test_a_temp_file_an_interrupted_finish_left_is_named(self):
+        (self.repo.path / '.claude').mkdir()
+        (self.repo.path / '.claude' / '.audit.json.deadbeef.tmp').write_text('{')
+        err = self.refused('.claude/.audit.json.deadbeef.tmp: left by an interrupted finish; delete it')
+        self.assertNotIn('uncommitted paths', err)
+
+    def test_a_record_that_cannot_be_written_is_refused(self):
+        (self.repo.path / audit.RECORD).mkdir(parents=True)     # an empty directory: git status shows nothing
+        code, _, err = self.finish(review(self.base, self.head))
+        self.assertEqual(code, 2, err)
+        self.assertIn(f'{audit.RECORD} was not written', err)
+        self.assertEqual([p.name for p in (self.repo.path / '.claude').iterdir()], ['audit.json'])
 
     def test_a_record_path_through_a_symbolic_link_is_refused(self):
         victim = tmpdir(self) / 'victim.txt'
@@ -810,8 +886,15 @@ class Finish(unittest.TestCase):
         carried = (self.out / 'carried.json').read_text()
         for name, body, reason in (('run.json', '{', 'run.json is not JSON'),
                                    ('run.json', json.dumps(dict(data, format=1)), 'a run of an older audit.py'),
+                                   ('run.json', json.dumps(dict(data, format=2)), 'a run of an older audit.py'),
                                    ('run.json', json.dumps({k: v for k, v in data.items() if k != 'repo'}),
-                                    'run.json lacks repo: start again'),
+                                    'run.json lacks a valid repo: start again'),
+                                   ('run.json', json.dumps(dict(data, repo=None, base=5, start_head=None)),
+                                    'run.json lacks a valid repo, base, start_head: start again'),
+                                   ('run.json', json.dumps(dict(data, identity=[5], baseKind='audit-ish')),
+                                    'run.json lacks a valid identity, baseKind: start again'),
+                                   ('carried.json', json.dumps({'record': 5, 'decisions': [], 'open': []}),
+                                    'carried.json lacks a valid record: start again'),
                                    ('carried.json', None, 'has no carried.json: start did not complete'),
                                    ('carried.json', '[]', 'carried.json lacks an object'),
                                    ('carried.json', json.dumps({'record': None, 'decisions': {}, 'open': []}),
@@ -913,11 +996,13 @@ class Finish(unittest.TestCase):
         for where in ('outcome', 'policy[0].question', 'policy[0].answer', 'claims[0].claim', 'coverage[0].batch'):
             self.assertIn(f'{where}: looks private', err)
         shell = ['cd x && python3 "$RUN/a.py"', 'n=$(ls)', 'make 2>&1', 'x >/dev/null', 'run sudo make',
-                 '$ make all', 'log | grep x']
+                 '$ make all', 'log | grep x', 'cp a ${OUT}/b', 'https://app.circleci.com/x,/home/me/a.jsonl']
         self.assertEqual([bool(audit.private(c)) for c in shell], [True] * len(shell))
         usb = ['OTGSC_B_SESSION_VALID stays', 'session_id', 'USBC_INTUSB_SESSION_REQ', 'tud_session_end()',
                'https://app.circleci.com/pipelines/github/o/r/1/workflows/123e4567-e89b-12d3-a456-426614174000/jobs/2',
-               'a || b && c', 'rate 5 MB/s', 'software|hardware']
+               'https://APP.CircleCI.com/pipelines/github/o/r/1/workflows/123E4567-E89B-12D3-A456-426614174000',
+               'a || b && c', 'rate 5 MB/s', 'software|hardware', 'cost cut from $34/launch to $6/launch',
+               'Sudo rights stay with the owner', 'compare base | HEAD']
         self.assertEqual(audit.private(usb), [])
         usage_ = review(self.base, self.head)['usage']
         self.refused("usage.hosts: not a host count: ['htpc', 'ci']", usage=dict(usage_, hosts=['htpc', 'ci']))
