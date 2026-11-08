@@ -445,20 +445,30 @@ def trusted_dir(path: str) -> str:
 
 
 def _own_dir(path: str, mode: int) -> None:
-    """`path` created if missing, then set to `mode` whatever the umask; refused (PermissionError), and never
-    chmodded, unless it is a real directory of ours."""
-    with contextlib.suppress(FileExistsError):
-        os.makedirs(path, mode)
+    """`path`, absolute and normalized, created if missing, then set to `mode` whatever the umask; refused
+    (PermissionError), and never chmodded, unless its last component is a real directory of ours. Its ancestors are
+    the caller's to trust, as in trusted_dir."""
+    head, tail = os.path.split(path)
+    if not tail:
+        raise PermissionError(f'{path}: want a directory below /')
+    os.makedirs(head, exist_ok=True)
+    parent = os.open(head, os.O_PATH | os.O_DIRECTORY)
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    except OSError as e:
-        if e.errno in (errno.ELOOP, errno.ENOTDIR):
-            raise PermissionError(f'{path}: want a directory, not a link or a file') from e
-        raise
+        with contextlib.suppress(FileExistsError):
+            os.mkdir(tail, mode, dir_fd=parent)
+        try:
+            # O_PATH needs no read permission on the directory itself (an umask of 0777, a mode of 0300)
+            fd = os.open(tail, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+        except OSError as e:
+            if e.errno in (errno.ELOOP, errno.ENOTDIR):
+                raise PermissionError(f'{path}: want a directory, not a link or a file') from e
+            raise
+    finally:
+        os.close(parent)
     try:
         if os.fstat(fd).st_uid != os.geteuid():
             raise PermissionError(f'{path}: want a directory of uid {os.geteuid()}')
-        os.fchmod(fd, mode)
+        os.chmod(f'/proc/self/fd/{fd}', mode)    # fchmod refuses an O_PATH descriptor; this names its inode
     finally:
         os.close(fd)
 
@@ -466,10 +476,11 @@ def _own_dir(path: str, mode: int) -> None:
 def state_dir(parent: str, name: str = 'ops') -> str:
     """A run_tracked state dir: `parent` (the caller's run dir) and `parent/name` created as needed and set to 0o755
     and 0o700 whatever the umask, then returned through trusted_dir. An existing one of them is secured only when it
-    is a real directory of ours; a link or another user's is refused (PermissionError) and left as it is."""
+    is a real directory of ours; a link or another user's is refused (PermissionError) and left as it is, however
+    `parent` is spelled (a trailing slash, `.` or `..` are resolved lexically first)."""
     if not isinstance(name, str) or name in ('', '.', '..') or '/' in name or '\0' in name:
         raise ValueError(f'state dir name {name!r}: want a single path component')
-    parent = os.fspath(parent)
+    parent = os.path.abspath(os.fspath(parent))
     _own_dir(parent, 0o755)
     path = os.path.join(parent, name)
     _own_dir(path, 0o700)

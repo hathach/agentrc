@@ -711,6 +711,29 @@ class StateDir(unittest.TestCase):
             hp.state_dir(os.path.join(self.top, 'dangling'))
         self.assertFalse(os.path.lexists(os.path.join(self.top, 'gone')))
 
+    def test_a_link_is_refused_however_it_is_spelled(self):
+        real = os.path.join(self.top, 'real')
+        os.mkdir(real, 0o700)
+        os.symlink(real, os.path.join(self.top, 'link'))
+        run = os.path.join(self.top, 'run')
+        os.mkdir(run)
+        os.symlink(real, os.path.join(run, 'ops'))
+        for spelling in ('link/', 'link//', 'link/.', 'run/../link/', 'run/ops/', 'run/ops/.'):
+            with self.subTest(spelling=spelling), self.assertRaisesRegex(PermissionError, 'link'):
+                hp.state_dir(os.path.join(self.top, spelling))
+            self.assertEqual((mode(real), os.listdir(real)), (0o700, []))
+
+    def test_any_umask_and_an_unreadable_dir_of_ours(self):
+        with umask(0o777):
+            got = hp.state_dir(os.path.join(self.top, 'run'))
+        self.assertEqual((mode(os.path.dirname(got)), mode(got)), (0o755, 0o700))
+        run = os.path.join(self.top, 'run2')
+        os.makedirs(os.path.join(run, 'ops'))
+        os.chmod(os.path.join(run, 'ops'), 0o300)
+        os.chmod(run, 0o300)
+        got = hp.state_dir(run)
+        self.assertEqual((mode(run), mode(got)), (0o755, 0o700))
+
     def test_a_file_is_refused(self):
         Path(self.top, 'run').write_text('')
         with self.assertRaisesRegex(PermissionError, 'file'):
