@@ -1071,6 +1071,8 @@ def release_token(token: str):
 PENDING = '-pending.json'           # <lock>.<kind>-pending.json, beside the board's lock file
 PENDING_MUTEX = '.mutex'            # <record>.mutex: never replaced or removed; not '.lock', a board's suffix
 PENDING_CLEARED = '.cleared.jsonl'  # <record>.cleared.jsonl: every clear made after a reviewed recovery
+PENDING_CLAIM = '-claim.'           # <lock>.<kind>-claim.<seq>.<token>.json: one invocation's claim, its owner's file
+CLAIM_RETIRED = '.retired'          # <claim file>.retired: an ended claim its reader may not unlink (sticky dir)
 
 
 class PendingRefused(RuntimeError):
@@ -1095,13 +1097,22 @@ class PendingSessions(os.PathLike):
     session, is unreadable: kept as it is, and it refuses.
 
     A consumer's invocations claim the board in it write-ahead (claim, remove, claim_entry,
-    claim_alive, invocation_state, settle); the `hil` skill's Board locks has the protocol."""
+    claim_alive, invocation_state, settle); the `hil` skill's Board locks has the protocol. Each
+    claim is a file of its own, <lock>.<kind>-claim.<seq>.<token>.json (0644, written once, `seq`
+    its order), so in a sticky dir every OS user writes its own claim and never another's; one
+    proven ended that its reader may not unlink is retired by <claim file>.retired, a file the
+    reader owns, and is no longer listed once its claimant is gone. read and remove cover the
+    record and the claims; add and clear only the record. An unreadable claim file refuses as an
+    unreadable record does."""
 
     def __init__(self, lock, kind):
         _check_name(lock)
         _check_name(kind)
         self.lock, self.suffix = lock, f'.{kind}{PENDING}'
         self.name = lock + self.suffix
+        self.claim_prefix = f'{lock}.{kind}{PENDING_CLAIM}'
+        self._claim_file = re.compile(re.escape(self.claim_prefix) + rf'(\d+)\.[0-9a-f]{{16}}\.json'
+                                      rf'({re.escape(CLAIM_RETIRED)})?\Z')
 
     @property
     def path(self) -> str:
@@ -1138,10 +1149,62 @@ class PendingSessions(os.PathLike):
         sessions = rec.get('sessions') if isinstance(rec, dict) else None
         return sessions if _sessions_ok(sessions) else None
 
+    def _scan(self, dfd):
+        """({claim file: seq}, {claim files with a retired mark}, the highest seq any of them has)."""
+        claims, retired, top = {}, set(), 0
+        for fn in os.listdir(dfd):
+            if m := self._claim_file.match(fn):
+                top = max(top, int(m[1]))
+                if m[2]:
+                    retired.add(fn[:-len(CLAIM_RETIRED)])
+                else:
+                    claims[fn] = int(m[1])
+        return claims, retired, top
+
+    def _claims(self, dfd, tidy=False):
+        """[(file, claim)] of the claims listed, oldest first; None when a claim file is unreadable. A retired
+        claim is listed while its claimant runs; `tidy` unlinks the retired claims and the marks this user may."""
+        claims, retired, _ = self._scan(dfd)
+        found, gone = [], retired - set(claims)
+        for name in sorted(claims, key=claims.get):
+            try:
+                fd = _open_file(dfd, name, os.O_RDONLY)
+                with os.fdopen(fd, 'rb') as f:
+                    entry = json.loads(f.read())
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError):
+                return None
+            if not (isinstance(entry, dict) and _is_claim(entry.get('receipt'))):
+                return None
+            if name not in retired or claim_alive(entry):
+                found.append((name, entry))
+            elif tidy:
+                with contextlib.suppress(PermissionError):
+                    os.unlink(name, dir_fd=dfd)
+                    gone.add(name)
+        if tidy:
+            for name in gone:
+                with contextlib.suppress(FileNotFoundError, PermissionError):
+                    os.unlink(name + CLAIM_RETIRED, dir_fd=dfd)
+        return found
+
+    def _listed(self, dfd, tidy=False):
+        """(the record's sessions, [(file, claim)] of the claims); PendingRefused when either is unreadable."""
+        sessions, claims = self._read(), self._claims(dfd, tidy)
+        if sessions is None or claims is None:
+            what = self.path if sessions is None else f'a claim file {self.claim_prefix}*'
+            raise PendingRefused(f'{what} is unreadable: kept as it is')
+        return sessions, claims
+
     def read(self):
-        """The sessions it lists, [] without a record; None when it is unreadable."""
-        with self._locked():
-            return self._read()
+        """The sessions it lists, the record's then the claims, [] without any; None when one is unreadable."""
+        with self._locked() as dfd:
+            try:
+                sessions, claims = self._listed(dfd)
+            except PendingRefused:
+                return None
+            return sessions + [e for _, e in claims]
 
     def add(self, sessions) -> list:
         """List `sessions` too, each one whose receipt no listed session has, and return what the
@@ -1164,34 +1227,60 @@ class PendingSessions(os.PathLike):
             return merged
 
     def claim(self, entry) -> list:
-        """List `entry`, this invocation's claim (claim_entry), write-ahead: before its first tool,
-        so one killed at any point is still named. Returns every other session listed, for the
-        caller to judge (invocation_state); of two claiming at once, the later lists the earlier.
-        Raises as add() does, ValueError too for an entry that is not a claim."""
+        """List `entry`, this invocation's claim (claim_entry), write-ahead in a claim file of its
+        own: before its first tool, so one killed at any point is still named. Returns every other
+        session listed, for the caller to judge (invocation_state); of two claiming at once, the
+        later lists the earlier. ValueError for an entry that is not a claim and PendingRefused
+        for an unreadable record or claim file, both before anything is written; OSError when
+        its claim file cannot be written."""
         if not (isinstance(entry, dict) and _is_claim(entry.get('receipt'))):
             raise ValueError(f'a claim is a session whose receipt is {{ops, pid, start}}: {entry!r:.200}')
-        return [e for e in self.add([entry]) if e['receipt'] != entry['receipt']]
+        with self._locked() as dfd:
+            sessions, claims = self._listed(dfd, tidy=True)
+            listed = sessions + [e for _, e in claims]
+            if all(e['receipt'] != entry['receipt'] for e in listed):
+                name = f'{self.claim_prefix}{self._scan(dfd)[2] + 1}.{secrets.token_hex(8)}.json'
+                _replace_file(dfd, name, json.dumps(entry).encode())
+            return [e for e in listed if e['receipt'] != entry['receipt']]
 
     def remove(self, entry) -> list:
         """Remove exactly the session whose receipt is `entry`'s, every other kept, and return what
-        the record still lists; the record goes once it lists none, and one it does not list
-        changes nothing. ValueError for a malformed session and PendingRefused for an unreadable
-        record, kept as it is; OSError when it cannot be replaced or removed."""
+        is still listed; the record goes once it lists none, a claim's file goes, or is retired
+        when it is another OS user's in a sticky dir, and one not listed changes nothing.
+        ValueError for a malformed session and PendingRefused for an unreadable record or claim
+        file, kept as they are; OSError when one cannot be replaced, removed or retired."""
         if not _sessions_ok([entry]):
             raise ValueError(f'a pending session is a dict with a receipt: {entry!r:.200}')
         with self._locked() as dfd:
-            sessions = self._read()
-            if sessions is None:
-                raise PendingRefused(f'{self.path} is unreadable: kept as it is')
+            sessions, claims = self._listed(dfd, tidy=True)
             left = [e for e in sessions if e['receipt'] != entry['receipt']]
-            if len(left) == len(sessions):
-                return left
-            if left:
-                _replace_file(dfd, self.name, json.dumps({'sessions': left}, indent=1).encode())
-            else:
-                with contextlib.suppress(FileNotFoundError):
-                    os.unlink(self.name, dir_fd=dfd)
+            if len(left) < len(sessions):
+                if left:
+                    _replace_file(dfd, self.name, json.dumps({'sessions': left}, indent=1).encode())
+                else:
+                    with contextlib.suppress(FileNotFoundError):
+                        os.unlink(self.name, dir_fd=dfd)
+            for name, e in claims:
+                if e['receipt'] != entry['receipt']:
+                    left.append(e)
+                elif self._retire(dfd, name) and claim_alive(e):    # retired, listed while its claimant runs
+                    left.append(e)
             return left
+
+    def _retire(self, dfd, name) -> bool:
+        """Unlink the claim file `name` with its mark, or, when it is another OS user's in the sticky
+        dir, mark it retired in a file this user owns: True then."""
+        try:
+            os.unlink(name, dir_fd=dfd)
+        except PermissionError:
+            _replace_file(dfd, name + CLAIM_RETIRED, json.dumps(
+                {'uid': os.geteuid(), 'at': time.strftime('%Y-%m-%dT%H:%M:%S%z')}).encode())
+            return True
+        except FileNotFoundError:
+            pass
+        with contextlib.suppress(FileNotFoundError, PermissionError):
+            os.unlink(name + CLAIM_RETIRED, dir_fd=dfd)
+        return False
 
     def clear(self, ended, note=None, **evidence) -> dict:
         """Remove the record once `ended(session)`, the consumer's reading of its receipt, is

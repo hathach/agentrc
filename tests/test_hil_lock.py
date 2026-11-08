@@ -11,6 +11,7 @@ if os.name == 'nt':
     raise unittest.SkipTest('hil_lock requires POSIX flock and fork')
 
 import ast
+import errno
 import fcntl
 import importlib.util
 import inspect
@@ -2098,6 +2099,22 @@ class Pending(LockDir):
         self.assertEqual([f for f in os.listdir(shared) if f.startswith('.')], [])
 
 
+CLAIM_AS = r'''
+import importlib.util, json, os, sys
+spec = importlib.util.spec_from_file_location('agentrc_hil_lock', sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+m.BOARD_LOCK_DIR, lock, kind, uid = sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5])
+os.setgroups([])
+os.setresgid(uid, uid, uid)
+os.setresuid(uid, uid, uid)
+record = m.PendingSessions(lock, kind)
+entry = m.claim_entry('/', 'theirs')
+others = record.claim(entry)
+print(json.dumps({'entry': entry, 'others': others, 'left': [record.remove(s) for s in others]}))
+'''
+
+
 class Claims(LockDir):
     """PendingSessions.claim and remove, and invocation_state, logged_tokens and settle: the write-ahead claim a
     consumer's invocation makes before its first tool, judged against real claimant processes and real run_tracked
@@ -2172,22 +2189,75 @@ class Claims(LockDir):
         self.assertEqual(sorted(len(others) for _, others in seen), [0, 1])   # the later lists the earlier
         self.assertEqual(len(self.record.read()), 2)
 
+    def claim_files(self):
+        """{name: claim} of every claim file, and the names of every retired mark."""
+        names = sorted(f for f in os.listdir(self.dir) if f.startswith(self.record.claim_prefix))
+        return ({f: json.loads(Path(self.dir, f).read_text()) for f in names if f.endswith('.json')},
+                [f for f in names if f.endswith(hil_lock.CLAIM_RETIRED)])
+
     def test_a_completion_while_another_is_alive_removes_only_its_own(self):
         other, theirs = claimant(self, self.dir, BOARD, self.KIND, self.run / 'a')
         me = self.mine()
         self.record.claim(me)
-        before = self.record.read()
+        self.assertEqual(list(self.claim_files()[0].values()), [theirs['entry'], me])   # a file each, in order
         self.assertEqual(self.record.remove(me), [theirs['entry']])
         self.assertEqual(self.record.read(), [theirs['entry']])
         self.assertEqual(hil_lock.invocation_state(theirs['entry']), ('alive', []))
-        self.assertNotEqual(before, self.record.read())
-        data = Path(self.record.path).read_bytes()
+        files = self.claim_files()
+        self.assertEqual((list(files[0].values()), files[1]), ([theirs['entry']], []))
         self.assertEqual(self.record.remove(me), [theirs['entry']])   # not listed: nothing changes
-        self.assertEqual(Path(self.record.path).read_bytes(), data)
+        self.assertEqual(self.claim_files(), files)
         self.assertEqual(self.record.remove(theirs['entry']), [])
+        self.assertEqual(self.claim_files(), ({}, []))
+        self.assertEqual(self.record.remove(me), [])       # none at all
         self.assertFalse(os.path.exists(self.record.path))
-        self.assertEqual(self.record.remove(me), [])       # no record at all
+
+    def test_a_record_an_older_claim_left_is_listed_and_removed(self):
+        older = {'receipt': {'ops': '/x', 'pid': 1, 'start': '2'}, 'cmd': 'older'}
+        self.record.add([older])
+        me = self.mine()
+        self.assertEqual(self.record.claim(me), [older])
+        self.assertEqual(self.record.read(), [older, me])
+        self.assertEqual(self.record.remove(older), [me])
         self.assertFalse(os.path.exists(self.record.path))
+
+    def test_an_unreadable_claim_file_refuses_and_is_kept(self):
+        bad = Path(self.dir, f'{self.record.claim_prefix}1.{"0" * 16}.json')
+        for data in (b'{', b'{"receipt": "path"}'):
+            with self.subTest(data=data):
+                bad.write_bytes(data)
+                self.assertIsNone(self.record.read())
+                with self.assertRaisesRegex(hil_lock.PendingRefused, 'unreadable'):
+                    self.record.claim(self.mine())
+                with self.assertRaisesRegex(hil_lock.PendingRefused, 'unreadable'):
+                    self.record.remove(self.mine())
+                self.assertEqual(sorted(os.listdir(self.dir)), sorted([bad.name, self.record.name + '.mutex']))
+
+    def test_a_claim_another_user_owns_is_retired_by_a_mark_and_never_hidden_while_alive(self):
+        dead = {'receipt': {'ops': '/x', 'pid': 2 ** 22 + 1, 'start': '2'}, 'cmd': 'dead'}     # beyond pid_max
+        live, theirs = claimant(self, self.dir, BOARD, self.KIND, self.run / 'a')
+        self.record.claim(dead)
+        unlink = os.unlink
+
+        def sticky(name, *a, **k):     # as the sticky bit refuses another user's file
+            if name.endswith('.json') and name.startswith(self.record.claim_prefix):
+                raise PermissionError(errno.EPERM, 'Operation not permitted', name)
+            return unlink(name, *a, **k)
+        with mock.patch.object(hil_lock.os, 'unlink', sticky):
+            self.assertEqual(self.record.remove(dead), [theirs['entry']])
+            self.assertEqual(self.record.remove(theirs['entry']), [theirs['entry']])   # retired, but alive: listed
+            me = self.mine()
+            self.assertEqual(self.record.claim(me), [theirs['entry']])
+        claims, marks = self.claim_files()
+        self.assertEqual(list(claims.values()), [theirs['entry'], dead, me])    # theirs, dead: never unlinked
+        self.assertEqual(sorted(marks), sorted(f'{n}{hil_lock.CLAIM_RETIRED}' for n, c in claims.items()
+                                               if c in (dead, theirs['entry'])))
+        self.assertEqual(self.record.read(), [theirs['entry'], me])
+        live.stdin.close()
+        live.wait()
+        self.assertEqual(self.record.read(), [me])     # its claimant gone: retired
+        self.assertEqual(self.record.claim(me), [])    # the owner may unlink: retired claims and their marks go
+        self.assertEqual(self.claim_files(), ({n: c for n, c in claims.items() if c == me}, []))
 
     def test_remove_keeps_an_unreadable_record_and_refuses_a_malformed_entry(self):
         Path(self.record.path).write_bytes(b'{')
@@ -2196,6 +2266,37 @@ class Claims(LockDir):
         self.assertEqual(Path(self.record.path).read_bytes(), b'{')
         with self.assertRaises(ValueError):
             self.record.remove({'cmd': 'x'})
+
+    def test_another_os_user_claims_beside_a_dead_claim_and_retires_it(self):
+        if os.geteuid() == 0:
+            argv = [sys.executable]
+        elif shutil.which('sudo') and subprocess.run(['sudo', '-n', 'true'], capture_output=True).returncode == 0:
+            argv = ['sudo', '-n', sys.executable]
+        else:
+            self.skipTest('needs root, or sudo -n, to act as another OS user')
+        shared = tempfile.mkdtemp(prefix='hil-lock-claim-', dir='/tmp')
+        root = argv[:-1]
+        self.addCleanup(subprocess.run, [*root, 'rm', '-rf', shared])
+        os.chmod(shared, 0o1777)
+        subprocess.run([*root, 'chown', '0:0', shared], check=True)    # as the host step makes it: root's
+        self.patch(hil_lock, 'BOARD_LOCK_DIR', shared)
+        dead = {'receipt': {'ops': '/x', 'pid': 2 ** 22 + 1, 'start': '2'}, 'cmd': 'dead'}     # beyond pid_max
+        self.record.claim(dead)
+        ours = sorted(os.listdir(shared))
+        r = subprocess.run([*argv, '-I', '-c', CLAIM_AS, str(SCRIPT), shared, BOARD, self.KIND, '65534'],
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = json.loads(r.stdout)
+        self.assertEqual((out['others'], out['left']), ([dead], [[out['entry']]]))   # claimed, and retired ours
+        self.assertTrue(set(ours) < set(os.listdir(shared)))              # our claim file kept: theirs to mark only
+        self.assertEqual(self.record.read(), [out['entry']])              # ours retired, theirs dead
+        me = self.mine()
+        self.assertEqual(self.record.claim(me), [out['entry']])
+        self.assertEqual(self.record.remove(out['entry']), [me])         # theirs: removed, or retired by our mark
+        self.assertEqual(self.record.read(), [me])
+        self.assertEqual(self.record.remove(me), [])
+        self.assertEqual(self.record.read(), [])
+        self.assertEqual([f for f in os.listdir(shared) if f.startswith('.')], [])
 
     def test_a_dead_claimant_whose_child_still_runs_is_unresolved_and_pending_until_it_ends(self):
         dead, child = killed_claimant(self, self.dir, BOARD, self.KIND, self.run / 'dead')

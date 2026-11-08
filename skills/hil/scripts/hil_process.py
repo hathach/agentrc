@@ -37,7 +37,9 @@ Contract:
   for as long as a receipt names the directory; `state_dir` creates one in the caller's run dir
   whatever the umask. Files of a `done` run are removed only once
   the verdict is on the result or exception; the others stay for recheck and are the
-  caller's to remove (`tidy`, once a recheck answers `done`). A missing file reads as unknown.
+  caller's to remove (`tidy`, once a recheck answers `done`). A missing file reads as unknown,
+  unless the lock is held: a supervisor still starting, pending. A supervisor whose hello
+  cannot reach its caller runs nothing: its record says `done` and it exits.
   `recheck_dir` rechecks and tidies every operation in a state dir from its files alone.
 """
 
@@ -414,13 +416,15 @@ def _rebuilt(err: dict) -> Exception:
     return RuntimeError(f"{err.get('type')}: {err.get('message')}")
 
 
-def _send(fd: int, msg: dict) -> None:
+def _send(fd: int, msg: dict) -> bool:
+    """Whether `msg` reached the pipe; False once the caller is gone, the record still saying how this ends."""
     data = (json.dumps(msg) + '\n').encode()
     try:
         while data:
             data = data[os.write(fd, data):]
     except OSError:
-        pass        # the caller is gone; the record still says how this ends
+        return False
+    return True
 
 
 def _write_record(path: str, rec: dict) -> None:
@@ -566,7 +570,10 @@ def _supervise(job: dict) -> int:
     except Exception as e:
         _send(fd, {'result': _error(e), 'cleanup': 'done'})     # nothing started
         return 1
-    _send(fd, {'hello': {'pid': record['pid'], 'start': record['start'], 'lock': record['lock']}})
+    if not _send(fd, {'hello': {'pid': record['pid'], 'start': record['start'], 'lock': record['lock']}}):
+        # the caller died before its hello and may have been judged by its files alone: the board may be another's
+        _write_record(job['record'], {**record, 'cleanup': 'done'})
+        return 1
     track = {}
     try:
         phase['now'] = 'run'
@@ -709,15 +716,36 @@ def _receipt(base: str, token: str, supervisor) -> dict:
             'log': f'{base}.log', 'survivors': None}
 
 
+def _held_lock(path: str) -> list | None:
+    """[dev, ino] of the lock at `path` while a process holds it, else None."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        st = os.fstat(fd)
+        return [st.st_dev, st.st_ino]
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+    return None
+
+
 def _dir_receipt(state_dir: str, token: str, found: set) -> dict:
-    """The receipt of `token`'s files, the supervisor's identity from its record; else a diagnostic
-    entry: `token`, `unrecheckable` (why) and the `files` there, which recheck answers unknown."""
+    """The receipt of `token`'s files, the supervisor's identity from its record, or from its held lock
+    alone while a file is missing (a supervisor still starting, which recheck answers pending); else a
+    diagnostic entry: `token`, `unrecheckable` (why) and the `files` there, which recheck answers unknown."""
     base = os.path.join(state_dir, f'{_OP_PREFIX}{token}')
     paths = {ext: f'{base}.{ext}' for ext in _OP_FILES}
 
     def unrecheckable(why: str) -> dict:
         return {'token': token, 'unrecheckable': why, 'files': [paths[ext] for ext in _OP_FILES if ext in found]}
     if missing := [ext for ext in _OP_FILES if ext not in found]:
+        if 'lock' in found and (held := _held_lock(paths['lock'])):
+            return _receipt(base, token, {'pid': None, 'start': None, 'lock': held})
         return unrecheckable(f'no {" or ".join(f".{ext}" for ext in missing)} file')
     try:
         with os.fdopen(os.open(paths['json'], os.O_RDONLY | os.O_NOFOLLOW)) as f:
@@ -736,7 +764,8 @@ def recheck_dir(state_dir: str, keep=()) -> tuple:
     """(verdict, open entries) for every run_tracked operation with a file in `state_dir`, from
     those files alone. Each is rebuilt as a receipt whose supervisor identity is its record's,
     and rechecked; one whose lock, record or log is missing, or whose record is unreadable or
-    names no lock of its own, is unknown. A `done` one is tidied unless its token is in `keep`.
+    names no lock of its own, is unknown, except that a missing file with the lock held is pending,
+    its receipt naming that lock alone. A `done` one is tidied unless its token is in `keep`.
     verdict: 'done' when every one is done (none found included), 'pending' when the open ones
     all are, else 'unknown'. Open entries: receipts recheck and tidy accept, or diagnostics with
     `unrecheckable` (why) and the `files` left, which recheck answers unknown; an untrusted or

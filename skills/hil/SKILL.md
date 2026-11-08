@@ -107,7 +107,10 @@ nothing in it through a link.
   is still named. Under the flock it took, or under the caller's hold:
   1. `claim(claim_entry(<ops dir>, <cmd>))` before its first tool lists
      `{ops, pid, start}`, its run_tracked state dir resolved, and returns the
-     others; of two racing claims the later lists the earlier.
+     others; of two racing claims the later lists the earlier. Each claim is
+     a file its claimant owns, so on a dir shared by OS users every user
+     claims; `remove` of another user's claim there, which the sticky bit
+     keeps from being unlinked, retires it with a mark file the remover owns.
   2. Any other `claim_alive` (its pid runs with its start and a thread
      that has not exited, or runs with its start unreadable) refuses this
      attempt before anything is judged: two commands under one hold. Only
@@ -437,7 +440,11 @@ recovery stay the contract's.
   lock, record or log is missing or whose record is unreadable or names no lock
   of its own, a diagnostic `{token, unrecheckable, files}` that `recheck`
   answers `unknown` and a human removes; an untrusted or unreadable state dir
-  is `('unknown', [{unrecheckable}])`.
+  is `('unknown', [{unrecheckable}])`. A file missing while the lock is held
+  is a supervisor still starting: a receipt naming that lock alone, `pending`.
+  A supervisor whose hello cannot reach its caller runs nothing and records
+  `done`: a caller killed mid-start, its files read `unknown`, leaves no tool
+  to start on a board handed on.
 - A report is published through `hil_report_core`: the JSON is authoritative
   and the Markdown a view `prepare_pair` regenerates from it. An attempt that
   cannot publish recovers through `recover_publish` (a Markdown repair, or a

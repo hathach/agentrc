@@ -830,6 +830,22 @@ class RecheckDir(unittest.TestCase):
         self.assertEqual([hp.recheck(e) for e in entries], ['unknown'] * 4)
         self.assertEqual(len(os.listdir(self.d)), 6)
 
+    def test_a_held_lock_without_its_record_is_pending_until_the_record_says_done(self):
+        """A supervisor still starting: its lock held, its record not written yet."""
+        receipt = self.op('k', files=('lock', 'log'))
+        lock_id = receipt['supervisor']['lock']
+        starting = {**receipt, 'supervisor': {'pid': None, 'start': None, 'lock': lock_id}}
+        fd = os.open(receipt['lock'], os.O_RDONLY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            self.assertEqual(hp.recheck_dir(self.d), ('pending', [starting]))
+            self.assertEqual(hp.recheck(starting), 'pending')
+            self.op('k', files=('json',), record=json.dumps({'token': 'k', 'pid': 7, 'start': 8, 'lock': lock_id,
+                                                              'cleanup': 'done'}))
+        finally:
+            os.close(fd)
+        self.assertEqual(hp.recheck(starting), 'done')
+
     def test_a_forged_or_malformed_record_is_unknown(self):
         other = self.op('o')
         cases = {'json': ('not json', 'record unreadable'), 'list': ('[1]', 'record of another operation'),
@@ -1588,6 +1604,22 @@ class RunTracked(unittest.TestCase):
         """)
         self.assertEqual(res['rc'], 0)
         self.assertEqual(res['hello'], [res['start']])
+
+    def test_a_supervisor_whose_caller_is_gone_before_its_hello_runs_nothing(self):
+        """Its files may already have been judged unknown and the board handed on: the command never starts."""
+        res = self.child("""
+            rfd, wfd = os.pipe()
+            os.close(rfd)
+            ran = os.path.join(D, 'ran')
+            job = {'cmd': ['touch', ran], 'cwd': None, 'timeout': 20, 'settle': 5, 'reap_grace': 2, 'binary': False,
+                   'split_stderr': False, 'report_fd': wfd, 'token': 't', 'lock': os.path.join(S, 'l'),
+                   'record': os.path.join(S, 'r')}
+            rc = hp._supervise(job)
+            with open(job['record']) as f:
+                rec = json.load(f)
+            report(rc=rc, ran=os.path.exists(ran), record=rec['cleanup'])
+        """)
+        self.assertEqual((res['rc'], res['ran'], res['record']), (1, False, 'done'))
 
     def test_the_supervisor_entry_refuses_other_usage(self):
         r = subprocess.run([sys.executable, '-I', str(SCRIPTS / 'hil_process.py')], capture_output=True, text=True,
