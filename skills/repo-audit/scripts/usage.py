@@ -78,11 +78,16 @@ class Repo:
                                  if line.startswith('worktree ')), key=lambda c: len(c.parts), reverse=True)
         self.files = set(git(path, 'ls-tree', '-r', '--name-only', '-z', head).stdout.split('\0')) - {''}
         self.head = head
-        self.skills = {f.split('/')[1] for f in self.files if re.fullmatch(r'skills/[^/]+/SKILL\.md', f)}
-        self.agents = {f[7:-3] for f in self.files if re.fullmatch(r'agents/[^/]+\.md', f)}
-        self.workflows = {f[10:-3] for f in self.files if re.fullmatch(r'workflows/[^/]+\.js', f)}
+        self.skills = self.catalog(r'skills/([^/]+)/SKILL\.md')
+        self.agents = self.catalog(r'agents/([^/]+)\.md')
+        self.workflows = self.catalog(r'workflows/([^/]+)\.js')
         self._vocab = {}
         self._realpath = functools.lru_cache(maxsize=4096)(os.path.realpath)
+
+    def catalog(self, pattern):
+        """Names in the top-level layout and under .claude/, each once; a tracked .agents -> .claude link is one
+        file to git, so its tree is never listed twice."""
+        return {m.group(1) for f in self.files if (m := re.fullmatch(rf'(?:\.claude/)?{pattern}', f))}
 
     def rel(self, path, cwd=None, remote=False):
         """(repo-relative path, 'attributed'|'unattributed') for a path naming a repository file, else None. A path

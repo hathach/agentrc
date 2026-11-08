@@ -5,6 +5,7 @@ import io
 import json
 import ntpath
 import os
+import re
 import subprocess
 import sys
 import textwrap
@@ -71,9 +72,15 @@ class Repo:
         self.git('commit', '-q', '-m', msg)
         return self.git('rev-parse', 'HEAD')
 
-    def marker(self, name, rev, message=None):
-        target = self.git('rev-parse', rev)
-        self.git('tag', '-a', name, rev, '-m', message or f'{audit.MARKER}\nprevious: {"0" * 40}\nend: {target}\n')
+
+def start(repo, out, *extra, head='main', window=True):
+    """audit.py start on repo into out; --base takes --base-kind bootstrap unless extra names a kind."""
+    argv = ['start', '--repo', str(repo), '--head', head, '--out', str(out), *extra]
+    if '--base' in extra and '--base-kind' not in extra:
+        argv += ['--base-kind', 'bootstrap']
+    if window:
+        argv += ['--since', SINCE, '--until', UNTIL]
+    return run(audit.main, *argv)
 
 
 class Start(unittest.TestCase):
@@ -86,101 +93,159 @@ class Start(unittest.TestCase):
                                       'new.txt': 'x\n' * 40})
         self.out = tmpdir(self) / 'run'
 
-    def start(self, *extra):
-        return run(audit.main, 'start', '--repo', str(self.repo.path), '--head', 'main', '--since', SINCE,
-                   '--until', UNTIL, '--out', str(self.out), *extra)
+    def start(self, *extra, **kw):
+        return start(self.repo.path, self.out, *extra, **kw)
+
+    def inventory(self):
+        return json.loads((self.out / 'inventory.json').read_text(encoding='utf-8'))
 
     def test_inventory_counts_files_tests_prose_renames_and_binaries(self):
         code, out, _ = self.start('--base', self.base)
         self.assertEqual(code, 0)
-        inv = json.loads((self.out / 'inventory.json').read_text())
+        inv = self.inventory()
         self.assertEqual((inv['commits'], inv['files']), (1, [3, 4]))
         self.assertEqual(inv['tests_added_removed'], [[2, 1, 'tests/test_a.py']])
-        self.assertEqual(inv['prose_growth'], [[8, 4, 'skills/a/SKILL.md']])
         self.assertEqual(inv['binary_changed'], ['img.bin'])
         self.assertNotIn('old.txt', json.dumps(inv['areas']))      # a rename counts under its new path
         run_json = json.loads((self.out / 'run.json').read_text())
         self.assertEqual((run_json['base'], run_json['start_head']), (self.base, self.head))
-        self.assertEqual(run_json['identity'], [self.base])
+        self.assertEqual((run_json['identity'], run_json['baseKind']), ([self.base], 'bootstrap'))
+        self.assertFalse((self.out / 'carried.json').exists())
         self.assertIn('1 commits', out)
+
+    def test_growth_is_ranked_over_every_kind_and_summarised_per_kind(self):
+        base = self.repo.commit({'keep.txt': 'k\n'})       # setUp's files and this one stay unchanged
+        self.repo.commit({'src/a.c': 'c\n' * 50, 'doc.md': 'd\n' * 5, 'b.py': 'p\n', 'img.bin': None})
+        code, out, _ = self.start('--base', base)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.inventory()['growth'], [[100, 100, 'c', 'src/a.c'], [10, 10, 'prose', 'doc.md'],
+                                                      [0, -3, 'other', 'img.bin'], [2, 2, 'python', 'b.py']])
+        ranked = out.split('== largest byte changes per kind (bytes now, change)\n')[1].split('\n==')[0]
+        self.assertEqual([line.split() for line in ranked.splitlines()],
+                         [['--', 'c'], ['100', '+100', 'src/a.c'], ['--', 'python'], ['2', '+2', 'b.py'],
+                          ['--', 'prose'], ['10', '+10', 'doc.md'], ['--', 'other'], ['0', '-3', 'img.bin']])
 
     def test_output_directory_and_window_are_checked(self):
         self.assertEqual(self.start('--base', self.base)[0], 0)
         code, _, err = self.start('--base', self.base)
-        self.assertEqual(code, 2)
-        self.assertIn('exists', err)
-        code, _, err = run(audit.main, 'start', '--repo', str(self.repo.path), '--head', 'main', '--base', self.base,
-                           '--since', UNTIL, '--until', SINCE, '--out', str(self.out) + '2')
+        self.assertEqual((code, 'exists' in err), (2, True))
+        code, _, err = start(self.repo.path, str(self.out) + '2', '--base', self.base, '--since', UNTIL, '--until',
+                             SINCE, window=False)
         self.assertEqual((code, '--since' in err), (2, True))
 
-    def test_without_base_or_marker_it_refuses(self):
-        self.repo.git('tag', 'audit/lightweight', self.base)
-        self.repo.marker('audit/v10', self.base, f'repo-audit-marker: 10\nprevious: {"0" * 40}\nend: {self.base}\n')
-        self.repo.marker('audit/other-end', self.head, f'{audit.MARKER}\nprevious: {"0" * 40}\nend: {self.base}\n')
+    def test_the_window_defaults_to_the_base_commit_until_now(self):
+        code, out, err = self.start('--base', self.base, window=False)
+        self.assertEqual(code, 0, err)
+        run_json = json.loads((self.out / 'run.json').read_text())
+        committed = audit.aware(self.repo.git('log', '-1', '--format=%cI', self.base))
+        self.assertEqual(audit.aware(run_json['since']), committed)
+        self.assertLess(audit.aware(run_json['until']) - audit.aware(run_json['since']), audit.datetime.timedelta(1))
+        self.assertIn(f"window: {run_json['since']} .. {run_json['until']}", out)
+
+    def test_without_a_record_or_base_it_refuses(self):
         code, _, err = self.start()
         self.assertEqual(code, 2)
-        for name in ('audit/lightweight', 'audit/v10', 'audit/other-end'):     # malformed: reported, never used
-            self.assertIn(name, err)
-        self.assertIn('pass --base', err)
+        self.assertIn(f'no {audit.RECORD}', err)
+        self.assertIn('--base-kind bootstrap', err)
+        self.assertFalse(self.out.exists())
+
+    def test_a_base_takes_its_kind(self):
+        code, _, err = run(audit.main, 'start', '--repo', str(self.repo.path), '--head', 'main', '--base', self.base,
+                           '--out', str(self.out))
+        self.assertEqual((code, 'go together' in err), (2, True))
+        self.assertEqual(self.start('--base', self.base, '--base-kind', 'override')[0], 0)
+        self.assertEqual(json.loads((self.out / 'run.json').read_text())['baseKind'], 'override')
+
+    def test_the_default_run_dir_is_private_and_unique_within_a_second(self):
+        state = tmpdir(self)
+        argv = ('start', '--repo', str(self.repo.path), '--head', 'main', '--base', self.base, '--base-kind',
+                'bootstrap', '--since', SINCE, '--until', UNTIL)
+        with mock.patch.dict(os.environ, {'XDG_STATE_HOME': str(state)}), \
+                mock.patch.object(audit.time, 'strftime', return_value='20260101T000000'):
+            first, second = run(audit.main, *argv), run(audit.main, *argv)
+            with mock.patch.object(audit.secrets, 'token_hex', return_value='abcdef'):
+                self.assertEqual(run(audit.main, *argv)[0], 0)
+                code, _, err = run(audit.main, *argv)
+        self.assertEqual((code, 'exists' in err), (2, True))
+        self.assertEqual((first[0], second[0]), (0, 0))
+        made = [Path(re.search(r'run dir: (.*)', out).group(1)) for _, out, _ in (first, second)]
+        self.assertNotEqual(made[0], made[1])
+        key = audit.hashlib.sha256(self.base.encode()).hexdigest()[:12]      # the one root commit
+        for d in made:
+            self.assertEqual(d.parent, state / 'agentrc' / 'repo-audit' / key)
+            self.assertRegex(d.name, r'^20260101T000000-[0-9a-f]{6}$')
+            self.assertTrue((d / 'run.json').is_file())
+            if os.name == 'posix':
+                self.assertEqual(d.stat().st_mode & 0o777, 0o700)
 
     def test_a_window_compares_instants_not_text(self):
-        code, _, _ = run(audit.main, 'start', '--repo', str(self.repo.path), '--head', 'main', '--base', self.base,
-                         '--since', '2026-01-01T10:00:00+07:00', '--until', '2026-01-01T04:00:00Z', '--out',
-                         str(self.out))
+        code, _, _ = self.start('--base', self.base, '--since', '2026-01-01T10:00:00+07:00', '--until',
+                                '2026-01-01T04:00:00Z', window=False)
         self.assertEqual(code, 0)
 
     def test_a_deleted_test_file_counts_its_removed_tests(self):
         self.repo.commit({'tests/test_a.py': None, 'tests/test é b.py': 'def test_q():\n  pass\n'})
         self.assertEqual(self.start('--base', self.head)[0], 0)
-        inv = json.loads((self.out / 'inventory.json').read_text(encoding='utf-8'))
-        self.assertEqual(sorted(inv['tests_added_removed']), [[0, 2, 'tests/test_a.py'], [1, 0, 'tests/test é b.py']])
+        self.assertEqual(sorted(self.inventory()['tests_added_removed']),
+                         [[0, 2, 'tests/test_a.py'], [1, 0, 'tests/test é b.py']])
 
     def test_a_noprefix_config_does_not_change_the_paths(self):
         self.repo.git('config', 'diff.noprefix', 'true')
         self.assertEqual(self.start('--base', self.base)[0], 0)
-        inv = json.loads((self.out / 'inventory.json').read_text())
-        self.assertEqual(inv['tests_added_removed'], [[2, 1, 'tests/test_a.py']])
+        self.assertEqual(self.inventory()['tests_added_removed'], [[2, 1, 'tests/test_a.py']])
 
     def test_an_external_diff_does_not_change_the_counts(self):
         self.repo.git('config', 'diff.external', 'true')
         self.assertEqual(self.start('--base', self.base)[0], 0)
-        inv = json.loads((self.out / 'inventory.json').read_text())
-        self.assertEqual(inv['tests_added_removed'], [[2, 1, 'tests/test_a.py']])
+        self.assertEqual(self.inventory()['tests_added_removed'], [[2, 1, 'tests/test_a.py']])
 
     def test_a_textconv_driver_does_not_change_the_counts(self):
         self.repo.git('config', 'diff.hide.textconv', 'sed -e s/def/xx/')
         (self.repo.path / '.git' / 'info').mkdir(exist_ok=True)
         (self.repo.path / '.git' / 'info' / 'attributes').write_text('*.py diff=hide\n')
         self.assertEqual(self.start('--base', self.base)[0], 0)
-        inv = json.loads((self.out / 'inventory.json').read_text())
-        self.assertEqual(inv['tests_added_removed'], [[2, 1, 'tests/test_a.py']])
+        self.assertEqual(self.inventory()['tests_added_removed'], [[2, 1, 'tests/test_a.py']])
 
     @unittest.skipUnless(os.name == 'posix', 'a double quote cannot be in a Windows file name')
     def test_a_name_git_quotes_is_decoded(self):
         self.repo.commit({'tests/café "q".py': 'def test_q():\n  pass\n'})
         self.assertEqual(self.start('--base', self.head)[0], 0)
-        inv = json.loads((self.out / 'inventory.json').read_text(encoding='utf-8'))
-        self.assertEqual(inv['tests_added_removed'], [[1, 0, 'tests/café "q".py']])
+        self.assertEqual(self.inventory()['tests_added_removed'], [[1, 0, 'tests/café "q".py']])
 
-    def test_the_latest_marker_by_ancestry_is_the_base(self):
-        self.repo.marker('audit/z-older', self.base)
-        mid = self.repo.git('rev-parse', 'HEAD~0')
-        self.repo.marker('audit/a-newer', mid)
-        self.repo.commit({'more.txt': 'm\n'})
-        self.assertEqual(self.start()[0], 0)
-        run_json = json.loads((self.out / 'run.json').read_text())
-        self.assertEqual((run_json['base'], run_json['marker']), (mid, 'audit/a-newer'))
+    def test_bytes_and_lines_are_totalled_by_kind(self):
+        r = self.repo
+        base = r.commit({'src/a.c': 'x\n', 'doc.md': 'd\n', 'tests/t.md': 't\n', 'a.py': 'p\n'})
+        r.commit({'src/a.c': 'x\ny\n', 'src/b.h': 'h\n', 'doc.md': None, 'tests/t.md': 't\nu\n'})
+        self.assertEqual(self.start('--base', base)[0], 0)
+        kinds = self.inventory()['kinds']
+        before = {'c': 2, 'python': 44, 'prose': 10, 'other': 85}      # with setUp's files
+        self.assertEqual({k: v['bytes'][0] for k, v in kinds.items()}, before)
+        self.assertEqual({k: v['bytes'][1] - v['bytes'][0] for k, v in kinds.items()},
+                         {'c': 4, 'python': 0, 'prose': -2, 'other': 2})
+        self.assertEqual({k: v['lines'] for k, v in kinds.items()},
+                         {'c': [2, 0], 'python': [0, 0], 'prose': [0, 1], 'other': [1, 0]})
 
-    def test_markers_on_diverged_branches_are_ambiguous(self):
-        self.repo.git('checkout', '-q', '-b', 'side', self.base)
-        side = self.repo.commit({'side.txt': 's\n'})
-        self.repo.git('checkout', '-q', 'main')
-        self.repo.marker('audit/one', self.head)
-        self.repo.marker('audit/two', side)
-        self.repo.git('merge', '-q', '--no-edit', 'side')
-        code, _, err = self.start()
-        self.assertEqual(code, 2)
-        self.assertIn('no single latest marker', err)
+    def test_submodule_pins_are_listed_with_both_commits(self):
+        r = self.repo
+        one, two = self.base, self.head
+        r.git('update-index', '--add', '--cacheinfo', f'160000,{one},lib/dep')
+        r.git('update-index', '--add', '--cacheinfo', f'160000,{one},lib/gone')
+        r.git('commit', '-q', '-m', 'pin')
+        pinned = r.git('rev-parse', 'HEAD')
+        r.git('update-index', '--cacheinfo', f'160000,{two},lib/dep')
+        r.git('update-index', '--force-remove', 'lib/gone')
+        r.git('update-index', '--add', '--cacheinfo', f'160000,{one},lib/new')
+        r.git('commit', '-q', '-m', 'bump')
+        self.assertEqual(self.start('--base', pinned)[0], 0)
+        self.assertEqual(self.inventory()['gitlinks'],
+                         [['lib/dep', one, two], ['lib/gone', one, None], ['lib/new', None, one]])
+
+    def test_unity_definitions_count_and_prototypes_do_not(self):
+        self.repo.commit({'test/unit/test_dcd.c': 'void test_open(void);\nvoid test_open(void)\n{\n}\n'
+                                                  'void test_close(void) { TEST_ASSERT(1); }\n'
+                                                  'static void helper(void);\n'})
+        self.assertEqual(self.start('--base', self.head)[0], 0)
+        self.assertEqual(self.inventory()['tests_added_removed'], [[2, 0, 'test/unit/test_dcd.c']])
 
     def test_the_shortstat_matches_git_from_the_numstat(self):
         r = self.repo
@@ -206,39 +271,525 @@ class Start(unittest.TestCase):
                 self.assertEqual(audit.shortstat(audit.numstat(r.path, a, b)), want, (a, b))
 
 
+def review(base, reviewed, **fields):
+    """A review file finish accepts for the range base..reviewed, fields replacing its own."""
+    r = {'range': f'{base}..{reviewed}', 'pr': {'repo': 'o/r', 'number': 7}, 'outcome': 'growth reviewed, one cut',
+         'stages': {name: {'status': 'completed', 'ref': 'o/r#7'} for name in audit.STAGES},
+         'coverage': [{'batch': 'all', 'paths': ['**']}],
+         'claims': [{'claim': 'FIFO flush needs a wait', 'document': 'RM0090', 'revision': '19',
+                     'section': '34.17.2', 'variants': ['STM32F4'], 'status': 'verified'}],
+         'decisions': [{'id': 'd1', 'text': 'keep the retry', 'status': 'new'}],
+         'open': [{'id': 'o1', 'text': 'split the parser', 'status': 'new', 'ref': 'o/r#8'}],
+         'policy': [{'question': 'deprecate tu_x?', 'answer': 'keep it', 'date': '2026-11-08'}],
+         'usage': {'totals': {'sessions': 3, 'toolCalls': 40}, 'hosts': 2, 'window': {'since': SINCE, 'until': UNTIL}},
+         'validation': {'expected': [
+             {'id': 'suite', 'check': 'BUILD.md suite', 'kind': 'software', 'source': 'BUILD.md', 'status': 'covered',
+              'ref': 'CI run 1 on R'},
+             {'id': 'hil', 'check': 'HIL battery', 'kind': 'hardware', 'source': 'HIL contract', 'status': 'excluded',
+              'owner': 'no rig board for it this time'},
+             {'id': 'size', 'check': 'code size', 'kind': 'software', 'source': 'build contract code-size section',
+              'status': 'inapplicable', 'reason': 'no firmware changed'}]}}
+    r.update(fields)
+    return r
+
+
+def validation(end, *items):
+    body = json.dumps({'end': end, 'items': [{'id': i, 'result': res, 'ref': 'CI run 1'} for i, res in items]})
+    return f'Validated.\n\n```text\n{audit.VALIDATION}\n{body}\n```\n'
+
+
+class Hub:
+    """GitHub, stubbed: pull requests, issue comments and permission bodies per repository (None: the read fails),
+    and GITHUB's git side as bare repositories under root."""
+
+    def __init__(self, case):
+        self.root = tmpdir(case)
+        self.pulls, self.comments, self.calls = {}, {}, []
+        self.roles = {'alice': {'permission': 'write', 'role_name': 'maintain'},
+                      'bob': {'permission': 'read', 'role_name': 'triage'}}
+
+    def comment(self, slug, number, login, body):
+        listed = self.comments.setdefault((slug, number), [])
+        listed.append({'id': len(listed) + 1, 'user': {'login': login}, 'body': body,
+                       'created_at': f'2026-11-0{len(listed) + 1}T00:00:00Z'})
+
+    def gh(self, args):
+        self.calls.append(args)
+        path = args[-1]
+        if m := re.fullmatch(r'repos/([^/]+/[^/]+)/pulls/(\d+)', path):
+            pr = self.pulls.get((m[1], int(m[2])))
+            return (0, json.dumps(pr), '') if pr else (1, '{"message":"Not Found"}', 'gh: Not Found (HTTP 404)')
+        if m := re.fullmatch(r'repos/([^/]+/[^/]+)/issues/(\d+)/comments\?per_page=100', path):
+            return 0, json.dumps([self.comments.get((m[1], int(m[2])), [])]), ''
+        if m := re.fullmatch(r'repos/([^/]+/[^/]+)/collaborators/([^/]+)/permission', path):
+            body = self.roles.get(m[2], {'permission': 'read', 'role_name': 'read'})
+            return (1, '', 'gh: Service Unavailable (HTTP 503)') if body is None else (0, json.dumps(body), '')
+        raise AssertionError(f'unexpected gh {args}')
+
+    def bare(self, slug):
+        path = self.root / slug
+        path = path.with_name(path.name + '.git')
+        if not path.exists():
+            subprocess.run(['git', 'init', '-q', '--bare', str(path)], check=True, env=git_env())
+        return path
+
+
+class Record(unittest.TestCase):
+    """An audit of base..R that lands as o/r#7: finish writes the record, P commits it on R, E squashes P on main."""
+
+    def setUp(self):
+        self.hub = Hub(self)
+        self.repo = Repo(self)
+        self.base = self.repo.commit({'a.txt': '1\n'})
+
+    def audit(self, moved=False, merge='squash', unchecked_coverage=False, **fields):
+        r = self.repo
+        r.git('checkout', '-q', '-b', 'audit')
+        self.reviewed = r.commit({'a.txt': '2\n'})
+        self.run_dir = tmpdir(self) / 'run'
+        code, _, err = start(r.path, self.run_dir, '--base', self.base, head='audit')
+        self.assertEqual(code, 0, err)
+        file = tmpdir(self) / 'review.json'
+        file.write_text(json.dumps(review(self.base, self.reviewed, **fields)))
+        with mock.patch.object(audit, 'uncovered', return_value=[]) if unchecked_coverage else \
+                contextlib.nullcontext():
+            code, out, err = run(audit.main, 'finish', '--run', str(self.run_dir), '--head', self.reviewed,
+                                 '--review', str(file))
+        self.assertEqual(code, 0, err)
+        r.git('add', '--', audit.RECORD)
+        r.git('commit', '-q', '--only', '-m', 'Record the audit', '--', audit.RECORD)
+        self.pr_head = r.git('rev-parse', 'HEAD')
+        r.git('push', '-q', str(self.hub.bare('o/r')), f'{self.pr_head}:refs/pull/7/head')
+        r.git('checkout', '-q', 'main')
+        if moved:
+            r.commit({'b.txt': 'later\n'})
+        if merge == 'squash':
+            r.git('merge', '-q', '--squash', 'audit')
+            r.git('commit', '-q', '-m', 'Audit (#7)')
+        else:
+            r.git('merge', '-q', '--no-ff', '-m', 'Merge pull request #7', 'audit')
+        self.end = r.git('rev-parse', 'HEAD')
+        self.hub.pulls[('o/r', 7)] = {'merged': True, 'merge_commit_sha': self.end, 'head': {'sha': self.pr_head}}
+        self.hub.comment('o/r', 7, 'alice', validation(self.end, ('suite', 'pass')))
+
+    def check(self, repo=None):
+        with mock.patch.multiple(audit, gh=self.hub.gh, GITHUB=self.hub.root.as_posix() + '/'):
+            return run(audit.main, 'check', '--repo', str(repo or self.repo.path), '--head', 'main')
+
+    def assertStatus(self, status, reason='', repo=None):
+        code, out, err = self.check(repo)
+        self.assertEqual((code, out.split('\n')[0].split(':')[0]), (0 if status == 'complete' else 1, status),
+                         out + err)
+        self.assertIn(reason, out)
+        return out
+
+    def record(self):
+        return json.loads((self.repo.path / audit.RECORD).read_text())
+
+    def test_none(self):
+        self.assertStatus('invalid', f'no {audit.RECORD}')
+
+    def test_a_squash_merged_record_is_complete_and_the_next_start_takes_its_end(self):
+        self.audit(decisions=[{'id': 'd1', 'text': 'keep', 'status': 'new'},
+                              {'id': 'd0', 'text': 'old', 'status': 'resolved'}])
+        out = self.assertStatus('complete')
+        self.assertIn(f'end {self.end}, o/r#7', out)
+        later = self.repo.commit({'c.txt': 'c\n'})
+        nxt = tmpdir(self) / 'next'
+        with mock.patch.object(audit, 'gh', self.hub.gh):
+            code, _, err = start(self.repo.path, nxt)
+        self.assertEqual(code, 0, err)
+        run_json = json.loads((nxt / 'run.json').read_text())
+        self.assertEqual((run_json['base'], run_json['baseKind'], run_json['start_head']), (self.end, 'audit', later))
+        carried = json.loads((nxt / 'carried.json').read_text())
+        self.assertEqual(([d['id'] for d in carried['decisions']], [o['id'] for o in carried['open']]),
+                         (['d1'], ['o1']))      # a resolved item stays in history, not carried
+        self.assertEqual(carried['policy'], review(self.base, self.base)['policy'])
+        file = tmpdir(self) / 'review.json'         # the carried ids must each be settled by the next finish
+        file.write_text(json.dumps(review(self.end, later, decisions=[], open=[])))
+        code, _, err = run(audit.main, 'finish', '--run', str(nxt), '--head', later, '--review', str(file))
+        self.assertEqual(code, 2)
+        self.assertIn('carried item d1 is missing', err)
+        self.assertIn('carried item o1 is missing', err)
+
+    def test_a_pr_head_absent_here_is_fetched_from_the_recorded_repository(self):
+        self.audit()
+        clone = tmpdir(self) / 'clone'
+        subprocess.run(['git', 'clone', '-q', '--no-local', '--single-branch', '--branch', 'main',
+                        str(self.repo.path), str(clone)], check=True, env=git_env())
+
+        def has(sha):
+            return subprocess.run(['git', '-C', str(clone), 'cat-file', '-e', sha], capture_output=True,
+                                  env=git_env()).returncode == 0
+        self.assertFalse(has(self.pr_head))
+        self.assertStatus('complete', repo=clone)
+        self.assertTrue(has(self.pr_head))
+        self.hub.pulls[('o/r', 7)]['head']['sha'] = '1' * 40     # the API names a head refs/pull/7/head is not
+        self.assertStatus('invalid', f'refs/pull/7/head of o/r did not bring the head the API names, {"1" * 40}',
+                          repo=clone)
+
+    def test_the_recorded_repository_is_asked_never_origin(self):
+        self.audit()
+        self.repo.git('remote', 'add', 'origin', 'https://github.com/fork/r.git')
+        self.hub.pulls[('fork/r', 7)] = self.hub.pulls[('o/r', 7)]
+        self.hub.pulls[('o/r', 7)] = {'merged': True, 'merge_commit_sha': self.base, 'head': {'sha': self.base}}
+        self.assertStatus('invalid', f'o/r#7 merged as {self.base}')
+        self.assertFalse([c for c in self.hub.calls if 'fork/r' in c[-1]])
+
+    def test_an_unmerged_pr(self):
+        self.audit()
+        self.hub.pulls[('o/r', 7)]['merged'] = False
+        self.assertStatus('invalid', 'o/r#7 is not merged')
+
+    def test_a_later_commit_touching_the_record(self):
+        self.audit()
+        rec = self.record()
+        self.repo.commit({audit.RECORD: json.dumps(dict(rec, outcome='edited by hand'))})      # record only
+        self.assertStatus('invalid', 'but the record last changed in')
+        self.repo.git('reset', '-q', '--hard', self.end)
+        self.repo.commit({audit.RECORD: json.dumps(rec, indent=1), 'a.txt': '3\n'})            # with other code
+        self.assertStatus('invalid', 'but the record last changed in')
+
+    def test_main_moved_between_review_and_merge(self):
+        self.audit(moved=True)
+        self.assertStatus('invalid', 'another tree than PR head')
+
+    def test_an_up_to_date_ordinary_merge_reads_invalid(self):
+        self.audit(merge='merge')
+        self.assertEqual(self.repo.git('rev-parse', 'main^{tree}'), self.repo.git('rev-parse', 'audit^{tree}'))
+        self.assertStatus('invalid', f'but the record last changed in {self.pr_head}, by an ordinary merge: the '
+                                     'record verifies only after a squash or rebase merge')
+
+    def test_a_record_whose_coverage_misses_a_changed_path(self):
+        self.audit(unchecked_coverage=True, coverage=[{'batch': 'docs', 'paths': ['docs/**']}])
+        self.assertStatus('invalid', f'coverage: 1 paths changed in {self.base[:12]}..{self.reviewed[:12]} match no '
+                                     'batch glob: a.txt')
+
+    def test_the_pr_head_must_be_the_record_alone_on_the_reviewed_head(self):
+        self.audit()
+        self.repo.git('checkout', '-q', 'audit')
+        after = self.repo.commit({'a.txt': '9\n'})
+        self.repo.git('reset', '-q', '--hard', self.reviewed)
+        record = self.repo.git('show', f'{self.pr_head}:{audit.RECORD}') + '\n'
+        wider = self.repo.commit({'a.txt': '9\n', audit.RECORD: record})
+        self.repo.git('checkout', '-q', 'main')
+        for head, reason in ((after, 'not the reviewed head'), (wider, f'changes more than {audit.RECORD}')):
+            with self.subTest(reason):
+                self.hub.pulls[('o/r', 7)]['head']['sha'] = head
+                self.assertStatus('invalid', reason)
+
+    def test_validation_reports(self):
+        self.audit()
+        rec, comments = self.record(), self.hub.comments[('o/r', 7)]
+        self.hub.roles.update(carol=None, dave={'permission': 'write', 'role_name': 'release-engineer'},
+                              erin={'role_name': 'release-engineer'})
+        item = {'id': 'suite', 'result': 'pass', 'ref': 'CI run 1'}
+
+        def block(report):
+            return f'```\n{audit.VALIDATION}\n{json.dumps(report)}\n```'
+        cases = [([], 'no validation report on o/r#7 by an account with write access'),
+                 ([('alice', validation(self.end, ('suite', 'fail')))], 'suite is fail'),
+                 ([('alice', validation(self.end, ('other', 'pass')))], 'expected item suite (BUILD.md suite) is'),
+                 ([('alice', validation(self.base, ('suite', 'pass')))], f'names end {self.base}, not'),
+                 ([('bob', validation(self.end, ('suite', 'pass')))], 'by an account with write access'),
+                 ([('alice', validation(self.end, ('suite', 'pass'))),
+                   ('alice', validation(self.end, ('suite', 'fail')))], 'suite is fail'),      # the newest one wins
+                 ([('alice', '```\nrepo-audit-validation: 1\n{not json\n```')], 'report: not an object'),
+                 ([('alice', validation(self.end, ('suite', 'pass'))),
+                   ('carol', validation(self.end, ('suite', 'fail')))],
+                  'validation report 2 by carol: permission unknown: gh api'),
+                 ([('alice', validation(self.end, ('suite', 'pass'))),
+                   ('dave', validation(self.end, ('suite', 'fail')))], 'suite is fail'),     # custom role, write base
+                 ([('alice', validation(self.end, ('suite', 'pass'))),
+                   ('erin', validation(self.end, ('suite', 'fail')))], 'by erin: permission unknown'),
+                 ([('alice', block({'end': self.end, 'items': [item], 'by': 'x'}))], 'report: unknown field by'),
+                 ([('alice', block({'end': self.end, 'items': [dict(item, result='skipped')]}))],
+                  "report.items[0].result: 'skipped' is not one of fail, pass"),
+                 ([('alice', block({'end': self.end, 'items': [item, item]}))], 'report.items: id suite used 2 times')]
+        for ref in ({}, {'ref': None}, {'ref': ''}, {'ref': {'run': 1}}):
+            bad = {k: v for k, v in item.items() if k != 'ref'} | ref
+            cases.append(([('alice', block({'end': self.end, 'items': [bad]}))], 'report.items[0]'))
+        with mock.patch.object(audit, 'gh', self.hub.gh):
+            for posted, reason in cases:
+                with self.subTest(reason):
+                    comments.clear()
+                    for login, body in posted:
+                        self.hub.comment('o/r', 7, login, body)
+                    problems = audit.validation_problems(rec, self.end)
+                    self.assertTrue(problems)
+                    self.assertIn(reason, '\n'.join(problems))
+        comments.clear()
+        self.hub.comment('o/r', 7, 'alice', validation(self.end, ('suite', 'pass')))
+        self.hub.comment('o/r', 7, 'bob', validation(self.end, ('suite', 'fail')))      # no write access: ignored
+        self.assertStatus('complete')
+        self.hub.comment('o/r', 7, 'alice', validation(self.end, ('suite', 'fail')))
+        self.assertStatus('provisional', 'validation report by alice: suite is fail')
+
+    def test_a_listing_that_is_not_pages_is_refused(self):
+        with mock.patch.object(audit, 'gh', return_value=(0, '{"message": "x"}', '')):
+            with self.assertRaisesRegex(audit.Refused, 'not a list of pages'):
+                audit.api('repos/o/r/issues/7/comments', paginate=True)
+
+    def test_a_malformed_record_or_another_identity(self):
+        self.audit()
+        rec = self.record()
+        old_style = dict(rec, branchPoint=self.base, open=[{'id': 'o1', 'kind': 'deferred', 'text': 't',
+                                                             'status': 'new'}])
+        for body, reason in ((dict(rec, extra=1), 'record: unknown field extra'),
+                             (dict(rec, usage=dict(rec['usage'], hostNames=['ci'])), 'usage: unknown field hostNames'),
+                             (dict(rec, stages={}), 'stages: missing coverage'),
+                             (dict(rec, range=f'{self.base}..{self.reviewed}'), 'record: unknown field range'),
+                             (old_style, 'record: unknown field branchPoint'),
+                             (old_style, 'open[0]: unknown field kind'),
+                             (dict(rec, validation={'expected': [dict(rec['validation']['expected'][0], ref='')]}),
+                              "validation.expected[0].ref: not a non-empty string")):
+            with self.subTest(reason):
+                self.assertIn(reason, '\n'.join(audit.check_record(body)))
+        with mock.patch.dict(os.environ, git_env(), clear=True):
+            for body, reason in (('{', 'is not JSON'),
+                                 (json.dumps(dict(rec, identity=['0' * 40])), 'identity differs')):
+                with self.subTest(reason):
+                    self.repo.git('reset', '-q', '--hard', self.end)
+                    head = self.repo.commit({audit.RECORD: body})
+                    self.assertIn(reason, '\n'.join(audit.provenance(self.repo.path, head)[0]))
+        self.repo.git('reset', '-q', '--hard', self.end)
+        self.repo.commit({audit.RECORD: json.dumps(dict(rec, extra=1))})
+        self.assertStatus('invalid', 'record: unknown field extra')
+
+    def test_a_shallow_clone_or_a_replaced_commit_is_refused(self):
+        self.audit()
+        shallow = tmpdir(self) / 'shallow'
+        subprocess.run(['git', 'clone', '-q', '--depth', '1', self.repo.path.as_uri(), str(shallow)], check=True,
+                       env=git_env())
+        code, _, err = self.check(shallow)
+        self.assertEqual((code, 'shallow' in err), (2, True))
+        self.repo.git('replace', self.end, self.base)
+        code, _, err = self.check()
+        self.assertEqual((code, 'refs/replace' in err), (2, True))
+        with mock.patch.object(audit, 'gh', self.hub.gh):
+            code, _, err = start(self.repo.path, tmpdir(self) / 'run', '--base', self.base, '--base-kind', 'override')
+        self.assertEqual((code, 'refs/replace' in err), (2, True))
+
+    def test_start_on_an_invalid_record_offers_its_base_as_an_override(self):
+        self.audit()
+        self.hub.pulls[('o/r', 7)]['merged'] = False
+        with mock.patch.object(audit, 'gh', self.hub.gh):
+            code, _, err = start(self.repo.path, tmpdir(self) / 'run')
+        self.assertEqual(code, 2)
+        self.assertIn('record is invalid', err)
+        self.assertIn(f'pass --base {self.base} --base-kind override', err)
+        self.repo.commit({audit.RECORD: json.dumps(dict(self.record(), base='1' * 40))})     # not an ancestor
+        with mock.patch.object(audit, 'gh', self.hub.gh):
+            code, _, err = start(self.repo.path, tmpdir(self) / 'run')
+        self.assertEqual(code, 2)
+        self.assertNotIn('--base-kind override', err)
+
+    def report(self, items, head=None, tested=None):
+        file = tmpdir(self) / 'results.json'
+        file.write_text(json.dumps({'end': tested or head or self.end, 'items': items}))
+        with mock.patch.multiple(audit, gh=self.hub.gh, GITHUB=self.hub.root.as_posix() + '/'):
+            return run(audit.main, 'report', '--repo', str(self.repo.path), '--head', head or self.end, '--results',
+                       str(file))
+
+    def test_report_prints_the_comment_check_then_accepts(self):
+        self.audit()
+        self.hub.comments[('o/r', 7)].clear()
+        items = [{'id': 'suite', 'result': 'pass', 'ref': 'CI run 9 on E'}]
+        code, out, err = self.report(items)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(audit.report_blocks(out), [{'end': self.end, 'items': items}])
+        self.hub.comment('o/r', 7, 'alice', out)
+        self.assertStatus('complete')
+
+    def test_report_refuses(self):
+        self.audit()
+        item = {'id': 'suite', 'result': 'pass', 'ref': 'CI run 9'}
+        for items, reason in (([dict(item, id='other')], "missing ['suite'], not expected ['other']"),
+                              ([item, dict(item, id='other')], "missing [], not expected ['other']"),
+                              ([dict(item, ref='/home/me/log')], 'looks private'),
+                              ([dict(item, result='ok')], "report.items[0].result: 'ok' is not one of")):
+            with self.subTest(reason):
+                code, _, err = self.report(items)
+                self.assertEqual(code, 2, err)
+                self.assertIn(reason, err)
+        for tested in (self.reviewed, self.pr_head):       # results taken before the merge are not E's
+            with self.subTest(tested=tested):
+                code, _, err = self.report([item], tested=tested)
+                self.assertEqual(code, 2, err)
+                self.assertIn(f'report.end: names {tested}, not --head {self.end}', err)
+        later = self.repo.commit({'c.txt': 'c\n'})
+        code, _, err = self.report([item], head=later)
+        self.assertEqual(code, 2)
+        self.assertIn(f'is not the merge commit that last changed the record, {self.end}', err)
+        self.hub.pulls[('o/r', 7)]['merged'] = False
+        code, _, err = self.report([item])
+        self.assertEqual(code, 2)
+        self.assertIn('o/r#7 is not merged', err)
+
+
 class Finish(unittest.TestCase):
     def setUp(self):
         self.repo = Repo(self)
+        self.root = self.repo.commit({'a.txt': '0\n'})
         self.base = self.repo.commit({'a.txt': '1\n'})
+        self.repo.git('checkout', '-q', '-b', 'audit')
         self.head = self.repo.commit({'a.txt': '2\n'})
         self.out = tmpdir(self) / 'run'
-        run(audit.main, 'start', '--repo', str(self.repo.path), '--base', self.base, '--head', self.head,
-            '--since', SINCE, '--until', UNTIL, '--out', str(self.out))
+        start(self.repo.path, self.out, '--base', self.base, head=self.head)
 
-    def test_finish_writes_the_aggregate_and_a_tag_message_draft(self):
-        end = self.repo.commit({'b.txt': '3\n'})
-        code, out, _ = run(audit.main, 'finish', '--run', str(self.out), '--end', end)
-        self.assertEqual(code, 0)
-        msg = (self.out / 'tag-message.txt').read_text()
-        self.assertTrue(msg.startswith(audit.MARKER))
-        self.assertIn(f'previous: {self.base}', msg)
-        self.assertIn(f'end: {end}', msg)
-        self.assertEqual(json.loads((self.out / 'finish-inventory.json').read_text())['commits'], 2)
-        self.assertEqual(self.repo.git('tag'), '')       # no tag is created
+    def finish(self, review_json, head=None):
+        file = tmpdir(self) / 'review.json'
+        file.write_text(json.dumps(review_json))
+        return run(audit.main, 'finish', '--run', str(self.out), '--head', head or self.head, '--review', str(file))
 
-    def test_an_end_before_the_start_head_is_refused(self):
-        code, _, err = run(audit.main, 'finish', '--run', str(self.out), '--end', self.base)
-        self.assertEqual(code, 2)
-        self.assertIn('start_head', err)
+    def refused(self, reason, head=None, **fields):
+        code, _, err = self.finish(review(self.base, self.head, **fields), head)
+        self.assertEqual(code, 2, err)
+        self.assertIn(reason, err)
+        self.assertFalse((self.repo.path / audit.RECORD).exists())
+        return err
+
+    def test_finish_writes_the_record_from_the_run_and_the_review(self):
+        code, out, err = self.finish(review(self.base, self.head))
+        self.assertEqual(code, 0, err)
+        self.assertIn(f'git add -- {audit.RECORD} && git commit --only -- {audit.RECORD}', out)
+        rec = json.loads((self.repo.path / audit.RECORD).read_text())
+        self.assertEqual({k: rec[k] for k in ('schema', 'identity', 'base', 'baseKind', 'reviewedHead')},
+                         {'schema': 1, 'identity': [self.root], 'base': self.base, 'baseKind': 'bootstrap',
+                          'reviewedHead': self.head})
+        self.assertEqual({k: v for k, v in rec.items() if k not in audit.RECORD_FIELDS},
+                         {k: v for k, v in review(self.base, self.head).items() if k != 'range'})
+        self.assertEqual(sorted(p.name for p in self.out.iterdir()), ['inventory.json', 'run.json'])
+        self.assertEqual(self.finish(review(self.base, self.head))[0], 0)       # a rewrite after a review round
+
+    def test_stages_and_the_range(self):
+        stages = review(self.base, self.head)['stages']
+        self.refused('stages: missing coreview', stages={k: v for k, v in stages.items() if k != 'coreview'})
+        self.refused('stages.claims: missing reason', stages=dict(stages, claims={'status': 'inapplicable'}))
+        self.refused('stages.claims: unknown field range',
+                     stages=dict(stages, claims=dict(stages['claims'], range=f'{self.base}..{self.head}')))
+        self.refused(f"range: '{self.base}..{self.base}' is not this run's range {self.base}..{self.head}",
+                     range=f'{self.base}..{self.base}')
+
+    def test_the_reviewed_head_must_be_the_clean_checked_out_descendant(self):
+        self.repo.git('checkout', '-q', '-b', 'side', self.root)
+        side = self.repo.commit({'s.txt': 's\n'})
+        err = self.refused('does not descend from the run\'s base', head=side)
+        self.assertIn("does not descend from the run's start_head", err)
+        self.repo.git('checkout', '-q', 'audit')
+        self.refused(f'HEAD of {self.repo.path} is not --head {self.base[:12]}', head=self.base)
+        (self.repo.path / 'stray.txt').write_text('x')
+        self.refused('1 uncommitted paths (first: stray.txt)')
 
     def test_another_repository_is_refused(self):
         other = Repo(self)
         other.commit({'x': 'y'})
         data = json.loads((self.out / 'run.json').read_text())
         (self.out / 'run.json').write_text(json.dumps(dict(data, repo=str(other.path))))
-        code, _, err = run(audit.main, 'finish', '--run', str(self.out), '--end', 'HEAD')
+        code, _, err = self.finish(review(self.base, self.head), head='HEAD')
         self.assertEqual(code, 2)
         self.assertIn('not the repository', err)
+
+    def test_carried_items_are_settled(self):
+        (self.out / 'carried.json').write_text(json.dumps({
+            'decisions': [{'id': 'd1', 'text': 'keep', 'status': 'new'}],
+            'open': [{'id': 'o9', 'text': 'x', 'status': 'carried'}], 'policy': []}))
+        self.refused('carried item o9 is missing')
+        self.refused("decisions[0].by: 'zz' is no other item's id",
+                     decisions=[{'id': 'd1', 'text': 'keep', 'status': 'superseded', 'by': 'zz'}],
+                     open=[{'id': 'o9', 'text': 'x', 'status': 'resolved'}])
+        self.refused('carried item d1 must be carried, resolved or superseded',
+                     open=[{'id': 'o9', 'text': 'x', 'status': 'resolved'}])
+        code, _, err = self.finish(review(self.base, self.head, decisions=[
+            {'id': 'd1', 'text': 'keep', 'status': 'superseded', 'by': 'd2'},
+            {'id': 'd2', 'text': 'keep, simpler', 'status': 'new'}],
+            open=[{'id': 'o9', 'text': 'x', 'status': 'carried'}]))
+        self.assertEqual(code, 0, err)
+
+    def test_expected_validation(self):
+        expected = review(self.base, self.head)['validation']['expected']
+        software, hardware = expected[0], expected[1]
+        cases = [('validation.expected: empty', []),
+                 ('validation.expected: no software item', [hardware]),
+                 ('validation.expected: no hardware item', [software]),
+                 ('validation.expected[0]: missing source', [{k: v for k, v in software.items() if k != 'source'},
+                                                             hardware]),
+                 ("validation.expected[0].kind: 'firmware' is not one of", [dict(software, kind='firmware'), hardware]),
+                 ('validation.expected[0]: missing ref', [{k: v for k, v in software.items() if k != 'ref'}, hardware]),
+                 ('validation.expected[1]: missing owner', [software, {k: v for k, v in hardware.items()
+                                                                        if k != 'owner'}]),
+                 ('hil is required-pending', [software, dict({k: v for k, v in hardware.items() if k != 'owner'},
+                                                             status='required-pending')])]
+        for reason, items in cases:
+            with self.subTest(reason):
+                self.refused(reason, validation={'expected': items})
+        agentrc = dict({k: v for k, v in hardware.items() if k != 'owner'}, status='inapplicable',
+                       reason='no firmware in agentrc')
+        code, _, err = self.finish(review(self.base, self.head, validation={'expected': [software, agentrc]}))
+        self.assertEqual(code, 0, err)
+
+    def test_private_looking_strings_and_host_names(self):
+        err = self.refused('looks private', outcome='see /home/me/x.jsonl', policy=[
+            {'question': 'session_01AbC', 'answer': 'toolu_01x', 'date': '2026-11-08'}],
+            claims=[{'claim': 'https://chatgpt.com/c/abc', 'document': 'd', 'revision': '1', 'section': '1',
+                     'variants': ['x'], 'status': 'pending'}],
+            coverage=[{'batch': '123e4567-e89b-12d3-a456-426614174000', 'paths': ['**']}])
+        for where in ('outcome', 'policy[0].question', 'policy[0].answer', 'claims[0].claim', 'coverage[0].batch'):
+            self.assertIn(f'{where}: looks private', err)
+        usage_ = review(self.base, self.head)['usage']
+        self.refused("usage.hosts: not a host count: ['htpc', 'ci']", usage=dict(usage_, hosts=['htpc', 'ci']))
+        self.refused("usage.totals: 'ci.lan': a total", usage=dict(usage_, totals={'ci.lan': 3}))
+        self.refused('usage: missing window', usage={'totals': {'sessions': 1}, 'hosts': 1})
+
+    def test_malformed_nested_values_are_listed_not_raised(self):
+        (self.out / 'carried.json').write_text(json.dumps({'decisions': [], 'open': [{'id': 'o1'}], 'policy': []}))
+        usage_ = review(self.base, self.head)['usage']
+        expected = review(self.base, self.head)['validation']['expected']
+        err = self.refused('decisions[0].status: {', decisions=[{'id': 'd1', 'text': 't', 'status': {'x': 1}}],
+                           open=[{'id': 'o1', 'text': 't', 'status': ['carried']}],
+                           claims=[dict(review(self.base, self.head)['claims'][0], status={'s': 1})],
+                           usage=dict(usage_, window={'until': 5}),
+                           validation={'expected': [dict(expected[0], status=['covered']), *expected[1:]]})
+        for reason in ('open[0].status: [', 'carried item o1 must be', 'claims[0].status: {',
+                       'usage.window: missing since', "validation.expected[0].status: ['covered']"):
+            self.assertIn(reason, err)
+        self.assertNotIn('Traceback', err)
+        self.refused("decisions[0].by: ['d2'] is no other", decisions=[
+            {'id': 'd1', 'text': 't', 'status': 'superseded', 'by': ['d2']},
+            {'id': 'd2', 'text': 't', 'status': 'new'}])
+
+    def test_the_coverage_ledger_must_match_every_changed_path(self):
+        r = self.repo
+        (r.path / 'lib' / 'dep').mkdir(parents=True)      # an unpopulated submodule, not a deletion
+        r.commit({'gone.txt': 'g\n', 'old/name.txt': 'same\n' * 20, 'src/deep/a.c': 'a\n'})
+        r.git('update-index', '--add', '--cacheinfo', f'160000,{self.base},lib/dep')
+        r.git('commit', '-q', '-m', 'pin')
+        base = r.git('rev-parse', 'HEAD')
+        for name, body in (('gone.txt', None), ('old/name.txt', None), ('new/name.txt', 'same\n' * 20),
+                           ('src/deep/a.c', 'b\n')):
+            if body is None:
+                (r.path / name).unlink()
+            else:
+                (r.path / name).parent.mkdir(parents=True, exist_ok=True)
+                (r.path / name).write_text(body)
+        r.git('add', '-A')
+        r.git('update-index', '--cacheinfo', f'160000,{self.head},lib/dep')
+        r.git('commit', '-q', '-m', 'move, delete, bump')
+        end = r.git('rev-parse', 'HEAD')
+        self.assertIn('R100\x00old/name.txt\x00new/name.txt', r.git('diff', '--name-status', '-z', '-M', base, end))
+        self.out = tmpdir(self) / 'run2'
+        start(r.path, self.out, '--base', base, head=end)
+        for globs, missed in ((['docs/**'], 'gone.txt, lib/dep, new/name.txt, old/name.txt, src/deep/a.c'),
+                              (['*', 'lib/*', 'new/*', 'old/*', 'src/*'], 'src/deep/a.c'),
+                              (['src/**', 'lib/dep', '*/name.txt'], 'gone.txt')):
+            with self.subTest(globs):
+                code, _, err = self.finish(review(base, end, coverage=[{'batch': 'b', 'paths': globs}]), head=end)
+                self.assertEqual(code, 2, err)
+                n = len(missed.split(', '))
+                self.assertIn(f'coverage: {n} paths changed in {base[:12]}..{end[:12]} match no batch glob: {missed}',
+                              err)
+        code, _, err = self.finish(review(base, end, coverage=[{'batch': 'b', 'paths': ['**']}]), head=end)
+        self.assertEqual(code, 0, err)
 
 
 def claude(path, records):
@@ -262,8 +813,7 @@ class Usage(unittest.TestCase):
         head = self.repo.commit({'skills/tool/scripts/tool.py': TOOL, 'skills/tool/SKILL.md': 'x\n',
                                  'agents/helper.md': 'x\n', 'workflows/flow.js': 'x\n'})
         self.run_dir = tmpdir(self) / 'run'
-        run(audit.main, 'start', '--repo', str(self.repo.path), '--base', head, '--head', head, '--since', SINCE,
-            '--until', UNTIL, '--out', str(self.run_dir))
+        start(self.repo.path, self.run_dir, '--base', head, head=head)
         self.root = tmpdir(self)
         # a command is parsed as bash would: a Windows path in it takes forward slashes
         self.script = PurePosixPath(self.repo.path.as_posix(), 'skills/tool/scripts/tool.py')
@@ -418,6 +968,26 @@ class Usage(unittest.TestCase):
         self.assertEqual(agg['workflows'], {'flow': 1})
         self.assertEqual(agg['docs_read'], {'skills/tool/SKILL.md': 1})
         self.assertNotIn('private-thing', out)
+
+    def test_the_claude_layout_is_catalogued_once_through_its_agents_alias(self):
+        self.repo.commit({'.claude/skills/build/SKILL.md': 'x\n', '.claude/skills/tool/SKILL.md': 'x\n',
+                          '.claude/agents/runner.md': 'x\n', '.claude/workflows/ship.js': 'x\n'})
+        (self.repo.path / '.agents').symlink_to('.claude')
+        self.repo.commit({})
+        head = self.repo.git('rev-parse', 'HEAD')
+        self.assertEqual(self.repo.git('ls-tree', '--name-only', head, '.agents'), '.agents')     # one link entry
+        self.run_dir = tmpdir(self) / 'run2'
+        start(self.repo.path, self.run_dir, '--base', head, head=head)
+        alias = self.repo.path / '.agents' / 'skills' / 'build' / 'SKILL.md'
+        claude(self.root / 'p' / 's1.jsonl', [
+            use('a', 'Skill', {'skill': 'build'}), use('b', 'Skill', {'skill': 'tool'}),
+            use('c', 'Agent', {'subagent_type': 'runner'}), use('d', 'Workflow', {'scriptPath': '/x/ship-wf_1.js'}),
+            use('e', 'Read', {'file_path': str(alias)})])
+        self.usage()
+        agg = json.loads(self.out.read_text())
+        self.assertEqual((agg['skills'], agg['agents'], agg['workflows']),
+                         ({'build': 1, 'tool': 1}, {'runner': 1}, {'ship': 1}))
+        self.assertEqual(agg['docs_read'], {'.claude/skills/build/SKILL.md': 1})
 
     def test_codex_exec_and_function_calls(self):
         root = tmpdir(self)
