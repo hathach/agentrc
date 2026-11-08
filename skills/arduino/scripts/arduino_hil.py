@@ -739,6 +739,12 @@ def log_failure(name, detail, pending, task=None):
     return ''
 
 
+def with_logged(found, fresh):
+    """`found` (a take's or a session's open failures) plus each of `fresh`, the log read now, whose id it lacks."""
+    ids = {f.get('id') for f in found}
+    return found + [f for f in fresh if f.get('id') not in ids]
+
+
 def claim(name, tracker, found):
     """Name this invocation in the board's claim record before its first tool, under the board's lock or the caller's
     hold (agentrc hil_lock PendingSessions.claim). An earlier invocation's claim leaves the record once it ended, or
@@ -755,8 +761,9 @@ def claim(name, tracker, found):
     try:
         if alive := [s['receipt'] for s in others if A.lock.claim_alive(s)]:
             raise InUse(f'another invocation on {name} is running: {alive}', found)
-        # read after the gate: a claimant alive at the take may have logged, and so keeps, a receipt since
-        keep = A.lock.logged_tokens(found + A.lock.open_cleanup_failures(name))
+        # read after the gate: a claimant alive at the take may have logged a receipt since, to report and keep
+        found = with_logged(found, A.lock.open_cleanup_failures(name))
+        keep = A.lock.logged_tokens(found)
         for s in others:
             state, receipts = A.lock.invocation_state(s, keep)
             if state == 'alive':   # not after the gate, but a live claim is never removed
@@ -767,7 +774,7 @@ def claim(name, tracker, found):
                                       [{'receipt': r} for r in new], task=s['receipt']):
                     notes.append(why)   # its claim stays, for the next attempt to log
                     continue
-                found = A.lock.open_cleanup_failures(name)
+                found = with_logged(found, A.lock.open_cleanup_failures(name))
             try:
                 record.remove(s)
             except (OSError, A.lock.PendingRefused) as e:

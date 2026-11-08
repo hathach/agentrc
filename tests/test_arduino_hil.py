@@ -1179,8 +1179,12 @@ class Battery(Base):
             self.lock.failures['rig_jlink'].append({'id': 'f9', 'receipts': [{'token': 't2'}]})
             return fh
         self.lock.take_board_lock = taken
-        self.run_board()
+        resolved = []
+        self.lock.resolve_restored = lambda board, failures, **ev: resolved.append([f['id'] for f in failures]) or []
+        row = self.run_board()
         self.assertEqual(self.lock.judged[0][1], {'t1', 't2'})
+        self.assertEqual((row['previousCleanupFailure']['id'], row['openCleanupFailures']), ('f9', 2))
+        self.assertEqual(resolved, [['f0', 'f9']])   # each once
 
     def test_an_earlier_invocations_unproven_children_are_logged_then_settled(self):
         other = self.other('unresolved', [{'token': 't1'}])
@@ -1910,6 +1914,45 @@ class ClaimsOnTheRealLock(Base):
         self.assertIn('is running', row['detail'])
         self.assertEqual(REAL.process.recheck(logged[0]['receipts'][0]), 'done')
         self.assertEqual(REAL.lock.resolve_restored('rig_jlink', logged, evidence='restored'), [])
+
+    def test_a_failure_another_claimant_logged_after_the_take_is_reported_and_resolved(self):
+        dead, child = killed_claimant(self, self.locks, 'rig_jlink', H.CLAIM_KIND, self.dir / 'dead')
+        live, _ = claimant(self, self.locks, 'rig_jlink', H.CLAIM_KIND, self.dir / 'live')
+        real, logged = REAL.lock.PendingSessions.claim, []
+
+        def claim(record, entry):
+            others = real(record, entry)
+            if entry['receipt']['pid'] == os.getpid():   # the live claimant logs the dead one, removes it and exits
+                receipts = REAL.lock.invocation_state(dead)[1]
+                logged.append(REAL.lock.log_cleanup_failure('rig_jlink', 'live', detail='x', task=dead['receipt'],
+                                                            receipts=receipts))
+                record.remove(dead)
+                live.stdin.close()
+                live.wait()
+                kill_quietly(child)
+                deadline = time.monotonic() + 10
+                while REAL.process.recheck(receipts[0]) != 'done':
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(0.1)
+            return others
+        resolved, resolve_restored = [], REAL.lock.resolve_restored
+
+        def resolve(board, failures, **evidence):
+            resolved.append([f['id'] for f in failures])
+            return resolve_restored(board, failures, **evidence)
+        with mock.patch.object(REAL.lock.PendingSessions, 'claim', claim), \
+                mock.patch.object(REAL.lock, 'resolve_restored', resolve), \
+                mock.patch.object(H, 'probe_present', return_value=''), \
+                mock.patch.object(H, 'admit', return_value=({'source': {'head': 'abc'}, 'fqbn': 'f', 'platform': {},
+                                                             'sketches': {}}, {'echo': {'sha256': {}, 'fqbn': 'f'}})), \
+                mock.patch.object(H, 'step', return_value={'test': 'echo', 'pass': True, 'detail': 'ok'}), \
+                mock.patch.object(H, 'restore', return_value={'pass': True, 'state': 'echo restored',
+                                                              'evidence': 'ok'}):
+            row = H.run_board('rig_jlink', self.board('rig_jlink'), ['echo'], self.dir / 'rec.json', self.roster,
+                              self.dir / 'run', None)
+        self.assertEqual((H.verdict(row), row['previousCleanupFailure']['id']), ('pass', logged[0]['id']))
+        self.assertEqual(resolved, [[logged[0]['id']]])
+        self.assertEqual(REAL.lock.open_cleanup_failures('rig_jlink'), [])   # its receipt kept, so resolved
 
     def test_an_exited_unreaped_claimant_is_not_alive(self):
         zombie, _ = claimant(self, self.locks, 'rig_jlink', H.CLAIM_KIND, self.dir / 'zombie')
