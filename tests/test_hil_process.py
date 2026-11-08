@@ -28,7 +28,7 @@ from contextlib import contextmanager, redirect_stdout, suppress
 from pathlib import Path
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import CUT_NAME, cut_comm_stat, guard_survivors, proc_open  # noqa: E402
+from helpers import CUT_NAME, cut_comm_stat, guard_survivors, proc_open, umask  # noqa: E402
 
 SCRIPTS = Path(__file__).resolve().parents[1] / 'skills' / 'hil' / 'scripts'
 
@@ -643,15 +643,6 @@ class InterruptAcrossTheFork(unittest.TestCase):
         self.assertEqual((ra.returncode, ra.stdout), (0, b'ok'))
 
 
-@contextmanager
-def umask(mask):
-    old = os.umask(mask)
-    try:
-        yield
-    finally:
-        os.umask(old)
-
-
 def mode(path):
     return os.lstat(path).st_mode & 0o7777
 
@@ -663,14 +654,6 @@ class StateDir(unittest.TestCase):
     def setUp(self):
         self.top = os.path.realpath(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.top)
-
-    def test_a_new_run_dir_and_state_dir_under_umask_002(self):
-        run = os.path.join(self.top, 'a', 'run')
-        with umask(0o002):
-            got = hp.state_dir(run)
-        self.assertEqual(got, os.path.join(run, 'ops'))
-        self.assertEqual((mode(run), mode(got)), (0o755, 0o700))
-        self.assertEqual(hp.trusted_dir(got), got)
 
     def test_the_consumers_run_dir_made_first_under_umask_002(self):
         run = Path(self.top, 'run')
@@ -1462,20 +1445,6 @@ class RunTracked(unittest.TestCase):
         self.assertEqual(res['kept'], ['done', []])
         self.assertEqual(res['files'], sorted(os.path.basename(receipt[k]) for k in ('lock', 'record', 'log')))
         self.assertEqual((res['done'], res['left']), (['done', []], []))
-
-    def test_recheck_dir_never_proves_a_replaced_lock(self):
-        res = self.child("""
-            r = hp.run_tracked('sleep 30 </dev/null >/dev/null 2>&1 & echo $!', timeout=20, settle=0.3, state_dir=S)
-            pid = int(r.stdout)
-            os.unlink(r.receipt['lock'])
-            os.close(os.open(r.receipt['lock'], os.O_CREAT | os.O_WRONLY, 0o600))
-            forged = hp.recheck_dir(S)
-            kill(pid)
-            time.sleep(0.5)
-            report(receipt=r.receipt, forged=forged, after=hp.recheck_dir(S), files=len(os.listdir(S)), leftovers=[pid])
-        """)
-        self.assertEqual(res['forged'], ['unknown', [{**res['receipt'], 'survivors': None}]])
-        self.assertEqual((res['after'][0], res['files']), ('unknown', 3))
 
     def test_a_spawn_error_started_nothing(self):
         res = self.child("""

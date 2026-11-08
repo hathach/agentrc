@@ -703,6 +703,12 @@ def recheck(receipt: dict) -> str:
 _OP_PREFIX, _OP_FILES = 'hil_op_', ('lock', 'json', 'log')
 
 
+def _receipt(base: str, token: str, supervisor) -> dict:
+    """The receipt of the operation whose files are `base`.{lock,json,log}."""
+    return {'token': token, 'supervisor': supervisor, 'lock': f'{base}.lock', 'record': f'{base}.json',
+            'log': f'{base}.log', 'survivors': None}
+
+
 def _dir_receipt(state_dir: str, token: str, found: set) -> dict:
     """The receipt of `token`'s files, the supervisor's identity from its record; else a diagnostic
     entry: `token`, `unrecheckable` (why) and the `files` there, which recheck answers unknown."""
@@ -723,8 +729,7 @@ def _dir_receipt(state_dir: str, token: str, found: set) -> dict:
     lock = rec.get('lock')
     if not (isinstance(lock, list) and len(lock) == 2 and all(type(v) is int for v in lock)):
         return unrecheckable('record names no lock')
-    return {'token': token, 'supervisor': {'pid': rec.get('pid'), 'start': rec.get('start'), 'lock': lock},
-            'lock': paths['lock'], 'record': paths['json'], 'log': paths['log'], 'survivors': None}
+    return _receipt(base, token, {'pid': rec.get('pid'), 'start': rec.get('start'), 'lock': lock})
 
 
 def recheck_dir(state_dir: str, keep=()) -> tuple:
@@ -771,12 +776,12 @@ def run_tracked(cmd: str | list, cwd: str | None = None, *, timeout: float, sett
         # the job crosses to the supervisor as JSON: path-like arguments as run_cmd's Popen takes them
         argv = cmd if isinstance(cmd, str) else [os.fspath(a) for a in cmd]
         cwd = None if cwd is None else os.fspath(cwd)
-        base = os.path.join(trusted_dir(state_dir), f'{_OP_PREFIX}{secrets.token_hex(8)}')
+        token = secrets.token_hex(8)
+        base = os.path.join(trusted_dir(state_dir), f'{_OP_PREFIX}{token}')
         log = open(f'{base}.log', 'xb')
     except BaseException as e:
         raise _attach(e, 'done', None)
-    receipt = {'token': os.path.basename(base)[len(_OP_PREFIX):], 'supervisor': None, 'lock': f'{base}.lock',
-               'record': f'{base}.json', 'log': f'{base}.log', 'survivors': None}
+    receipt = _receipt(base, token, None)
     rfd, wfd = os.pipe()
     reports = _Reports(rfd)
     job = {'cmd': argv, 'cwd': cwd, 'env': env, 'timeout': timeout, 'settle': settle, 'reap_grace': reap_grace,
