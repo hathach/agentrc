@@ -10,6 +10,9 @@ one sysfs file, device or program it touches. Recovery's usb_recover is a separa
   hil_root.py modprobe                   modprobe usbtest
   hil_root.py dmesg                      the kernel log lines naming usbtest
   hil_root.py reset-tt BUSPORT           Reset_TT on the multi-TT hub port BUSPORT names
+  hil_root.py netns BUSPORT PID          move the USB network interface of BUSPORT's device into
+                                         PID's network namespace, one an unprivileged user
+                                         namespace owns; prints its ifindex and name
 
 Exit 2 refuses a request; otherwise the operation's own status, its error on stderr.
 Callers build the argv with `argv()`.
@@ -20,6 +23,7 @@ from __future__ import annotations
 import fcntl
 import os
 import re
+import socket
 import stat
 import struct
 import subprocess
@@ -29,6 +33,7 @@ from pathlib import Path
 FILES = ()                                  # it loads and launches nothing by path
 INSTALLED = '/usr/local/sbin/hil_root'      # a rig's root-owned copy, the CI user's sudo grant
 SYS_USB = Path('/sys/bus/usb/devices')
+PROC = Path('/proc')
 PATTERN_PARAM = Path('/sys/module/usbtest/parameters/pattern')
 DEV_USB = '/dev/bus/usb'
 DMESG, MODPROBE = '/usr/bin/dmesg', '/usr/sbin/modprobe'
@@ -39,6 +44,15 @@ _BUSPORT = re.compile(r'[1-9][0-9]*-[1-9][0-9]*(\.[1-9][0-9]*)*\Z')
 _CTRLTRANSFER = struct.Struct('@BBHHHIP')                   # struct usbdevfs_ctrltransfer
 USBDEVFS_CONTROL = 0xC0005500 | _CTRLTRANSFER.size << 16   # _IOWR('U', 0, ...)
 RESET_TT = 9
+
+# A board's USB network function, never a host NIC: these class drivers only, and a locally
+# administered MAC (IEEE 802 U/L bit), which a NIC's burned-in, globally unique one never is
+NET_DRIVERS = ('cdc_ether', 'cdc_ncm', 'cdc_eem', 'rndis_host')
+NS_GET_USERNS = 0xb701                  # _IO(0xb7, 0x1), v6.12 include/uapi/linux/nsfs.h
+RTM_NEWLINK, NLMSG_ERROR, IFLA_NET_NS_FD = 16, 2, 28       # v6.12 include/uapi/linux/rtnetlink.h
+NLM_F_REQUEST_ACK = 0x1 | 0x4
+_NLMSGHDR = struct.Struct('=IHHII')                         # len, type, flags, seq, pid
+_IFINFOMSG = struct.Struct('=BxHiII')                       # family, type, index, flags, change
 
 
 class Refused(Exception):
@@ -143,7 +157,79 @@ def reset_tt(busport):
         os.close(fd)
 
 
-VERBS = {'pattern': pattern, 'modprobe': modprobe, 'dmesg': dmesg, 'reset-tt': reset_tt}
+def usb_netdev(busport):
+    """(ifindex, name) of the one network interface BUSPORT's device has, refused unless a board's
+    USB network function drives it (NET_DRIVERS, a locally administered MAC)."""
+    if not _BUSPORT.match(busport):
+        raise Refused(f'busport {busport!r}: expected BUS-PORT[.PORT...]')
+    try:
+        found = list((SYS_USB / busport).glob(f'{busport}:*/net/*'))
+        if len(found) != 1:
+            raise Refused(f'{busport}: expected one network interface, found {sorted(p.name for p in found)}')
+        net = found[0]
+        driver = os.path.basename(os.readlink(net.parent.parent / 'driver'))
+        if driver not in NET_DRIVERS:
+            raise Refused(f'{busport}: {net.name} is driven by {driver}, not a USB network function')
+        if not int(_read(net / 'address').split(':')[0], 16) & 0x02:
+            raise Refused(f'{busport}: {net.name} has a globally unique MAC, not a board\'s')
+        return int(_read(net / 'ifindex')), net.name
+    except (OSError, ValueError) as e:
+        raise Refused(f'{busport}: {getattr(e, "strerror", None) or e}')
+
+
+def sandbox_netns(pid):
+    """An fd on PID's network namespace, refused unless a user namespace other than the initial
+    one owns it: an unprivileged process's sandbox, never the host's or a root container's. Held
+    open, so a PID reused after this check cannot redirect the move."""
+    if not pid.isdecimal() or int(pid) < 2:
+        raise Refused(f'pid {pid!r}: expected a process id')
+    try:
+        fd = os.open(PROC / pid / 'ns' / 'net', os.O_RDONLY)
+    except OSError as e:
+        raise Refused(f'pid {pid}: {e.strerror or e}')
+    try:
+        owner = fcntl.ioctl(fd, NS_GET_USERNS)
+        try:
+            st, init = os.fstat(owner), os.stat(PROC / '1' / 'ns' / 'user')
+        finally:
+            os.close(owner)
+        if (st.st_dev, st.st_ino) == (init.st_dev, init.st_ino):
+            raise Refused(f'pid {pid}: its network namespace is not owned by an unprivileged user namespace')
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def move_link(ifindex, nsfd):
+    """RTM_NEWLINK moving ifindex into the namespace nsfd names, by index: a device that
+    re-enumerated since has a new one, so a stale index fails rather than moving its successor."""
+    attr = struct.pack('=HHI', 8, IFLA_NET_NS_FD, nsfd)
+    body = _IFINFOMSG.pack(socket.AF_UNSPEC, 0, ifindex, 0, 0) + attr
+    msg = _NLMSGHDR.pack(_NLMSGHDR.size + len(body), RTM_NEWLINK, NLM_F_REQUEST_ACK, 1, 0) + body
+    with socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, socket.NETLINK_ROUTE) as s:
+        s.settimeout(5)
+        s.send(msg)
+        reply = s.recv(4096)
+    _, kind, _, seq, _ = _NLMSGHDR.unpack_from(reply)
+    if kind != NLMSG_ERROR or seq != 1:
+        raise OSError(f'unexpected netlink reply type {kind}')
+    err, = struct.unpack_from('=i', reply, _NLMSGHDR.size)
+    if err:
+        raise OSError(-err, os.strerror(-err))
+
+
+def netns(busport, pid):
+    ifindex, name = usb_netdev(busport)
+    fd = sandbox_netns(pid)
+    try:
+        move_link(ifindex, fd)
+    finally:
+        os.close(fd)
+    print(ifindex, name)
+
+
+VERBS = {'pattern': pattern, 'modprobe': modprobe, 'dmesg': dmesg, 'reset-tt': reset_tt, 'netns': netns}
 
 
 def main(args) -> int:
