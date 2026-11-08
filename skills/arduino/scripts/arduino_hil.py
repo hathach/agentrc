@@ -740,9 +740,10 @@ def log_failure(name, detail, pending, task=None):
 
 
 def with_logged(found, fresh):
-    """`found` (a take's or a session's open failures) plus each of `fresh`, the log read now, whose id it lacks."""
-    ids = {f.get('id') for f in found}
-    return found + [f for f in fresh if f.get('id') not in ids]
+    """`found` (a take's or a session's open failures) plus each of `fresh`, the log read now, it lacks: by id, or
+    whole for one whose id is not a string (the log keeps those open, and they may be unhashable)."""
+    ids = {f['id'] for f in found if isinstance(f.get('id'), str)}
+    return found + [f for f in fresh if (f['id'] not in ids if isinstance(f.get('id'), str) else f not in found)]
 
 
 def claim(name, tracker, found):
@@ -769,7 +770,8 @@ def claim(name, tracker, found):
             if state == 'alive':   # not after the gate, but a live claim is never removed
                 continue
             unsettled += receipts
-            if new := [r for r in receipts if not (isinstance(r, dict) and r.get('token') in keep)]:
+            if new := [r for r in receipts if not (isinstance(r, dict) and isinstance(r.get('token'), str)
+                                                    and r['token'] in keep)]:
                 if why := log_failure(name, 'an earlier invocation ended with children not proven ended',
                                       [{'receipt': r} for r in new], task=s['receipt']):
                     notes.append(why)   # its claim stays, for the next attempt to log
@@ -795,7 +797,8 @@ def unclaim(name, entry, tracker):
     if entry is None:
         return ''
     try:
-        verdict, _ = A.process.recheck_dir(tracker.state_dir, {p['receipt'].get('token') for p in tracker.pending})
+        keep = {t for p in tracker.pending if isinstance(t := p['receipt'].get('token'), str)}
+        verdict, _ = A.process.recheck_dir(tracker.state_dir, keep)
         if verdict != 'done':
             return f'claim kept: its operations recheck {verdict}'
         A.lock.PendingSessions(name, CLAIM_KIND).remove(entry)

@@ -95,7 +95,7 @@ class FakeLock:
         return session.get('state', 'ended'), session.get('receipts', [])
 
     def logged_tokens(self, failures):
-        return {r['token'] for f in failures for r in f.get('receipts', []) if 'token' in r}
+        return {r['token'] for f in failures for r in f.get('receipts', []) if isinstance(r.get('token'), str)}
 
     def settle(self, receipts, wait, busy=None):
         self.settled.append(list(receipts))
@@ -1213,6 +1213,24 @@ class Battery(Base):
         row = self.run_board()
         self.assertEqual((H.verdict(row), self.lock.logged, self.lock.settled), ('pass', [], [[{'token': 't1'}]]))
         self.assertEqual(self.lock.claims['rig_jlink'], [])
+
+    def test_failures_and_receipts_with_malformed_ids_are_kept_never_hashed(self):
+        odd = [{'id': [], 'receipts': []}, {'id': {'x': 1}, 'receipts': [{'token': ['t']}]}, {'receipts': []}]
+        self.lock.failures['rig_jlink'] = [dict(f) for f in odd]
+        take = self.lock.take_board_lock
+
+        def taken(*a, **k):   # the log read after the gate names them again, and one more
+            fh = take(*a, **k)
+            self.lock.failures['rig_jlink'] += [dict(f) for f in odd] + [{'id': [1], 'receipts': []}]
+            return fh
+        self.lock.take_board_lock = taken
+        self.other('unresolved', [{'token': ['t']}, {'token': {'x': 1}}, {'token': 't2'}])
+        resolved = []
+        self.lock.resolve_restored = lambda board, failures, **ev: resolved.append(failures) or []
+        row = self.run_board()
+        self.assertEqual((H.verdict(row), row['ran']), ('pass', True))
+        self.assertEqual(self.lock.logged[0][2], [{'token': ['t']}, {'token': {'x': 1}}, {'token': 't2'}])
+        self.assertEqual([f.get('id') for f in resolved[0]], [[], {'x': 1}, None, [1], 'f1'])
 
     def test_an_earlier_claim_whose_log_failed_stays_for_the_next_attempt(self):
         other = self.other('unresolved', [{'token': 't1'}])

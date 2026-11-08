@@ -2304,7 +2304,8 @@ class Claims(LockDir):
 
     def test_logged_tokens_reads_only_whole_receipts(self):
         failures = [{'receipts': [{'token': 'a'}, {'unrecheckable': ['x']}, 'path']}, {'receipts': 'x'},
-                    {'unavailable': 'unreadable'}, {'receipts': [{'token': 'b'}, {'token': 3}]}]
+                    {'unavailable': 'unreadable'}, {'receipts': [{'token': 'b'}, {'token': 3}, {'token': ['c']},
+                                                                  {'token': {'d': 1}}]}, {'id': [], 'receipts': []}]
         self.assertEqual(hil_lock.logged_tokens(failures), {'a', 'b'})
 
 
