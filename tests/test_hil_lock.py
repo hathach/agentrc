@@ -2115,6 +2115,32 @@ print(json.dumps({'entry': entry, 'others': others, 'left': [record.remove(s) fo
 '''
 
 
+# As uid argv[5]: judge the claim argv[6] as a consumer would (invocation_state, settle), then claim the board and,
+# with nothing pending, remove that claim (which retires it) and its own; argv: hil_lock.py, lock dir, lock, kind.
+JUDGE_AS = r'''
+import importlib.util, json, os, sys
+spec = importlib.util.spec_from_file_location('agentrc_hil_lock', sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+m.BOARD_LOCK_DIR, lock, kind = sys.argv[2:5]
+uid, dead = int(sys.argv[5]), json.loads(sys.argv[6])
+m._process()            # loaded before the uid changes: it may not read the checkout
+os.setgroups([])
+os.setresgid(uid, uid, uid)
+os.setresuid(uid, uid, uid)
+record = m.PendingSessions(lock, kind)
+entry = m.claim_entry('/', 'judge')
+claimed = dead in record.claim(entry)
+state, receipts = m.invocation_state(dead)
+states = m.settle(receipts, 0.3)[0]
+if 'pending' not in states:
+    record.remove(dead)
+record.remove(entry)
+print(json.dumps({'hidden': m._process()._proc_hides_others(), 'claimed': claimed, 'state': state,
+                  'states': states, 'runs': m.open_runs(receipts, states)}))
+'''
+
+
 class Claims(LockDir):
     """PendingSessions.claim and remove, and invocation_state, logged_tokens and settle: the write-ahead claim a
     consumer's invocation makes before its first tool, judged against real claimant processes and real run_tracked
@@ -2297,6 +2323,42 @@ class Claims(LockDir):
         self.assertEqual(self.record.remove(me), [])
         self.assertEqual(self.record.read(), [])
         self.assertEqual([f for f in os.listdir(shared) if f.startswith('.')], [])
+
+    def test_another_os_user_is_held_off_while_a_dead_claimants_child_runs_then_admitted(self):
+        """agentrc#484 X1: the other user cannot read the claimant's 0700 ops dir, so its supervisors decide from
+        /proc; it was admitted (unknown) while the child still ran."""
+        if os.geteuid() == 0:
+            argv = [sys.executable]
+        elif shutil.which('sudo') and subprocess.run(['sudo', '-n', 'true'], capture_output=True).returncode == 0:
+            argv = ['sudo', '-n', sys.executable]
+        else:
+            self.skipTest('needs root, or sudo -n, to act as another OS user')
+        shared = tempfile.mkdtemp(prefix='hil-lock-claim-', dir='/tmp')
+        root = argv[:-1]
+        self.addCleanup(subprocess.run, [*root, 'rm', '-rf', shared])
+        os.chmod(shared, 0o1777)
+        subprocess.run([*root, 'chown', '0:0', shared], check=True)
+        self.patch(hil_lock, 'BOARD_LOCK_DIR', shared)
+        dead, child = killed_claimant(self, shared, BOARD, self.KIND, self.run / 'dead')
+
+        def judged():
+            r = subprocess.run([*argv, '-I', '-c', JUDGE_AS, str(SCRIPT), shared, BOARD, self.KIND, '65534',
+                                json.dumps(dead)], capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            return json.loads(r.stdout)
+        out = judged()
+        if out['hidden']:
+            self.skipTest("/proc hides other users' processes here")
+        self.assertEqual((out['state'], out['states'], out['claimed']), ('unresolved', ['pending'], True))
+        self.assertIn('or root', out['runs'][0])                         # who can clear it
+        self.assertEqual(self.record.read(), [dead])                     # kept, theirs withdrawn
+        receipt = hil_lock.invocation_state(dead)[1][0]
+        kill_quietly(child, signal.SIGKILL)
+        wait_done(hil_lock._process().recheck, receipt)
+        out = judged()
+        self.assertEqual((out['state'], out['states'], out['claimed']), ('unresolved', ['unknown'], True))
+        self.assertEqual(self.record.read(), [])                         # retired: none of its supervisors runs
+        self.assertEqual(hil_lock.invocation_state(dead), ('ended', []))  # its files untouched until ours tidies them
 
     def test_a_dead_claimant_whose_child_still_runs_is_unresolved_and_pending_until_it_ends(self):
         dead, child = killed_claimant(self, self.dir, BOARD, self.KIND, self.run / 'dead')

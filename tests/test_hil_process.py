@@ -895,6 +895,64 @@ class RecheckDir(unittest.TestCase):
         self.assertEqual(hp.recheck_dir(os.path.join(self.d, 'gone'))[0], 'unknown')
 
 
+
+class ForeignStateDir(unittest.TestCase):
+    """A state dir of another uid, rechecked from /proc alone; the real supervisor's case is RunTracked's."""
+
+    MOUNT = '25 30 0:23 / /proc rw,nosuid,nodev {} - proc proc {}\n'
+
+    def hides(self, mounts, euid=1000):
+        with mock.patch.object(hp.os, 'geteuid', return_value=euid), \
+                mock.patch('builtins.open', mock.mock_open(read_data=mounts)):
+            return hp._proc_hides_others()
+
+    def test_proc_hides_others_when_mounted_hidepid_or_unreadable(self):
+        for opts, hidden in (('rw', False), ('rw,hidepid=0', False), ('rw,hidepid=off', False),
+                             ('rw,hidepid=1', True), ('rw,hidepid=2', True), ('rw,hidepid=invisible', True),
+                             ('rw,hidepid=ptraceable,gid=4', True)):
+            with self.subTest(opts=opts):
+                self.assertEqual(self.hides(self.MOUNT.format('shared:12', opts)), hidden)
+        shadowed = self.MOUNT.format('shared:12', 'rw') + self.MOUNT.format('master:1', 'rw,hidepid=2')
+        self.assertTrue(self.hides(shadowed))                   # the later mount is the one /proc names
+        self.assertTrue(self.hides('26 30 0:24 / /sys rw - sysfs sysfs rw\n'))      # no /proc mount found
+        self.assertFalse(self.hides(self.MOUNT.format('shared:12', 'rw,hidepid=2'), euid=0))
+        with mock.patch.object(hp.os, 'geteuid', return_value=1000), \
+                mock.patch('builtins.open', side_effect=PermissionError(errno.EACCES, 'denied')):
+            self.assertTrue(hp._proc_hides_others())
+
+    def test_a_dir_of_another_uid_is_one_entry_rechecked_from_proc_and_never_read(self):
+        top = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, top)
+        d = os.path.join(top, 'state')
+        os.mkdir(d, 0o700)
+        Path(d, 'hil_op_a.log').write_text('')
+        entry = {'token': f'foreign:{d}', 'foreign': d, 'uid': os.geteuid()}
+        with mock.patch.object(hp.os, 'geteuid', return_value=os.geteuid() + 1), \
+                mock.patch.object(hp, '_proc_hides_others', return_value=False):
+            self.assertEqual(hp.recheck_dir(d), ('unknown', [entry]))     # no supervisor of it in /proc
+            with mock.patch.object(hp, '_proc_hides_others', return_value=True):
+                self.assertEqual(hp.recheck_dir(d), ('pending', [entry]))
+            with mock.patch('builtins.open', side_effect=PermissionError(errno.EACCES, 'denied')):
+                self.assertEqual(hp.recheck(entry), 'pending')         # a command line it cannot read
+            with mock.patch.object(hp, 'PROC_SCAN_BOUND', 0.01), \
+                    mock.patch.object(hp, '_supervisors_in', side_effect=lambda _: time.sleep(0.3) or []):
+                self.assertEqual(hp.recheck(entry), 'pending')         # not listed within its bound
+            self.assertEqual(hp.recheck({'token': 'foreign:1', 'foreign': 1}), 'pending')
+        self.assertEqual(os.listdir(d), ['hil_op_a.log'])
+
+    def test_a_dir_beyond_a_directory_we_cannot_search_is_foreign(self):
+        d = '/nonexistent/beyond/state'
+        real_stat = os.stat
+
+        def stat(path, *a, **k):
+            if path == d:
+                raise PermissionError(errno.EACCES, 'Permission denied', path)
+            return real_stat(path, *a, **k)
+        with mock.patch.object(hp, 'trusted_dir', side_effect=PermissionError(errno.EACCES, 'denied')), \
+                mock.patch.object(hp.os, 'stat', stat), mock.patch.object(hp, '_proc_hides_others', return_value=True):
+            self.assertEqual(hp.recheck_dir(d), ('pending', [{'token': f'foreign:{d}', 'foreign': d, 'uid': None}]))
+
+
 # The prelude of every run_tracked case: hil_process loaded by file path as `hp`, the case's
 # state dir as `S`, scratch dir `D`, and report(), whose JSON line the test reads back.
 TRACKED_CHILD = """
@@ -1461,6 +1519,30 @@ class RunTracked(unittest.TestCase):
         self.assertEqual(res['kept'], ['done', []])
         self.assertEqual(res['files'], sorted(os.path.basename(receipt[k]) for k in ('lock', 'record', 'log')))
         self.assertEqual((res['done'], res['left']), (['done', []], []))
+
+    def test_recheck_dir_of_another_uid_follows_its_supervisor_in_proc_until_it_ends(self):
+        res = self.child("""
+            r = hp.run_tracked('sleep 30 </dev/null >/dev/null 2>&1 & echo $!', timeout=20, settle=0.3, state_dir=S)
+            pid = int(r.stdout)
+            uid, os.geteuid = os.geteuid(), lambda: uid + 1      # S as another uid sees it
+            hidden = hp._proc_hides_others()
+            live = hp.recheck_dir(S)
+            kill(pid)
+            deadline = time.monotonic() + 10
+            while hp.recheck_dir(S)[0] == 'pending' and time.monotonic() < deadline:
+                time.sleep(0.05)
+            ended, files = hp.recheck_dir(S), sorted(os.listdir(S))
+            os.geteuid = lambda: uid
+            report(uid=uid, path=os.path.abspath(S), receipt=r.receipt, hidden=hidden, live=live, ended=ended,
+                   files=files, done=hp.recheck_dir(S), leftovers=[pid])
+        """)
+        if res['hidden']:
+            self.skipTest('/proc hides other users\' processes here')
+        entry = {'token': f'foreign:{res["path"]}', 'foreign': res['path'], 'uid': res['uid']}
+        self.assertEqual(res['live'], ['pending', [entry]])
+        self.assertEqual(res['ended'], ['unknown', [entry]])      # none left, but its records are not ours to read
+        self.assertEqual(res['files'], sorted(os.path.basename(res['receipt'][k]) for k in ('lock', 'record', 'log')))
+        self.assertEqual(res['done'], ['done', []])
 
     def test_a_spawn_error_started_nothing(self):
         res = self.child("""

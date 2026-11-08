@@ -40,7 +40,10 @@ Contract:
   caller's to remove (`tidy`, once a recheck answers `done`). A missing file reads as unknown,
   unless the lock is held: a supervisor still starting, pending. A supervisor whose hello
   cannot reach its caller runs nothing: its record says `done` and it exits.
-  `recheck_dir` rechecks and tidies every operation in a state dir from its files alone.
+  `recheck_dir` rechecks and tidies every operation in a state dir from its files alone; one of
+  another uid, whose files it may not trust, is pending while /proc shows a supervisor of an
+  operation there (its command line) or may hide one (hidepid, an unreadable command line),
+  else unknown.
 """
 
 from __future__ import annotations
@@ -389,6 +392,7 @@ PR_SET_CHILD_SUBREAPER = 36
 WAIT_ALL = 0x40000000       # __WALL (uapi linux/wait.h): a clone child is a child too
 SETTLE_POLL = 0.05
 SURVEY_BOUND = 1.0          # the supervisor's best-effort survivor listing, names only
+PROC_SCAN_BOUND = 5.0       # another uid's supervisors listed from /proc: past it, nothing is proven
 # On top of timeout + reap_grace + settle: the supervisor's interpreter start, survey and report.
 SUPERVISOR_MARGIN = 5.0
 
@@ -529,13 +533,17 @@ def _survey(root: int) -> dict:
     return {'processes': sorted(found, key=lambda p: p['pid']), 'unreadable': sorted(unreadable)}
 
 
-def _bounded_survey(root: int) -> dict | None:
-    # a /proc read can block (stat takes exec_update_lock), so the listing never holds up the report
+def _bounded(fn, bound: float):
+    # a /proc read can block (stat takes exec_update_lock, cmdline the mm's lock): fn() or None past `bound` s
     out = []
-    t = threading.Thread(target=lambda: out.append(_survey(root)), daemon=True)
+    t = threading.Thread(target=lambda: out.append(fn()), daemon=True)
     t.start()
-    t.join(SURVEY_BOUND)
+    t.join(bound)
     return out[0] if out else None
+
+
+def _bounded_survey(root: int) -> dict | None:
+    return _bounded(lambda: _survey(root), SURVEY_BOUND)
 
 
 def _supervise(job: dict) -> int:
@@ -677,7 +685,10 @@ def recheck(receipt: dict) -> str:
     """'done', 'pending' or 'unknown' for a run_tracked receipt, from its supervisor's own
     state: its lock, the file it created, is held while it lives, and its record, a file of
     ours, says `done` only once nothing is left. Anything unverifiable is unknown, a receipt
-    without a token or paths included (recheck_dir's `unrecheckable` entries)."""
+    without a token or paths included (recheck_dir's `unrecheckable` entries). An entry recheck_dir
+    made for a state dir of another uid is rechecked from /proc alone (_foreign_state)."""
+    if isinstance(receipt, dict) and 'foreign' in receipt:
+        return _foreign_state(receipt)
     try:
         token = receipt['token']
         trusted_dir(os.path.dirname(receipt['lock']))
@@ -760,6 +771,83 @@ def _dir_receipt(state_dir: str, token: str, found: set) -> dict:
     return _receipt(base, token, {'pid': rec.get('pid'), 'start': rec.get('start'), 'lock': lock})
 
 
+def _proc_hides_others() -> bool:
+    """Whether /proc may hide another uid's processes from us: mounted hidepid other than 0 (proc(5)), or its
+    mount unreadable; never for root."""
+    if os.geteuid() == 0:
+        return False
+    try:
+        with open('/proc/self/mountinfo', errors='replace') as f:
+            lines = [line.split() for line in f]
+    except OSError:
+        return True
+    procs = [f for f in lines if len(f) > 4 and f[4] == '/proc' and '-' in f and f[f.index('-') + 1:][:1] == ['proc']]
+    if not procs:
+        return True
+    opts = ','.join(procs[-1][5:]).split(',')          # the mount's options and its super options
+    return any(o.startswith('hidepid=') and o not in ('hidepid=0', 'hidepid=off') for o in opts)
+
+
+def _supervisors_in(state_dir: str) -> list | None:
+    """The pids /proc shows running a supervisor (this file's `--supervise JOB`, as run_tracked starts it) of an
+    operation in `state_dir`, from their command lines alone; None when /proc may not show every process to us."""
+    if _proc_hides_others():
+        return None
+    dirs = {os.path.abspath(state_dir), os.path.realpath(state_dir)}
+    try:
+        names = os.listdir('/proc')
+    except OSError:
+        return None
+    pids = []
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            with open(f'/proc/{name}/cmdline', 'rb') as f:
+                argv = f.read().split(b'\0')
+        except (FileNotFoundError, ProcessLookupError):
+            continue                    # gone
+        except OSError:
+            return None
+        if b'--supervise' not in argv:
+            continue
+        try:
+            lock = json.loads(argv[argv.index(b'--supervise') + 1])['lock']
+        except (IndexError, ValueError, TypeError, KeyError):
+            continue
+        if isinstance(lock, str) and os.path.dirname(lock) in dirs:
+            pids.append(int(name))
+    return pids
+
+
+def _foreign_state(entry: dict) -> str:
+    """'pending' while /proc shows a supervisor of an operation in the entry's state dir, or cannot show every
+    process within PROC_SCAN_BOUND; 'unknown' once it shows none: the dir's records, of another uid, prove no `done`.
+    A supervisor lives until it has reaped every descendant, so /proc shows it for as long as its lock is held."""
+    d = entry.get('foreign')
+    if not isinstance(d, str):
+        return 'pending'
+    return 'unknown' if _bounded(lambda: _supervisors_in(d), PROC_SCAN_BOUND) == [] else 'pending'
+
+
+def _foreign_entry(state_dir: str) -> dict | None:
+    """recheck_dir's entry for a state dir of another uid, or one beyond a directory we cannot search: its files
+    are not ours to trust, so it is rechecked from /proc (_foreign_state), `uid` its owner when known. None for
+    any other."""
+    try:
+        st = os.stat(state_dir)
+    except PermissionError:
+        uid = None
+    except (OSError, TypeError, ValueError):
+        return None
+    else:
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid == os.geteuid():
+            return None
+        uid = st.st_uid
+    path = os.path.abspath(state_dir)
+    return {'token': f'foreign:{path}', 'foreign': path, 'uid': uid}
+
+
 def recheck_dir(state_dir: str, keep=()) -> tuple:
     """(verdict, open entries) for every run_tracked operation with a file in `state_dir`, from
     those files alone. Each is rebuilt as a receipt whose supervisor identity is its record's,
@@ -768,12 +856,17 @@ def recheck_dir(state_dir: str, keep=()) -> tuple:
     its receipt naming that lock alone. A `done` one is tidied unless its token is in `keep`.
     verdict: 'done' when every one is done (none found included), 'pending' when the open ones
     all are, else 'unknown'. Open entries: receipts recheck and tidy accept, or diagnostics with
-    `unrecheckable` (why) and the `files` left, which recheck answers unknown; an untrusted or
-    unreadable state_dir is ('unknown', [{'unrecheckable': why}])."""
+    `unrecheckable` (why) and the `files` left, which recheck answers unknown. A state_dir of another
+    uid, or one we cannot reach, is (its recheck, [{'token', 'foreign': its path, 'uid'}]): 'pending'
+    while /proc shows a supervisor of an operation there or cannot show every process, else
+    'unknown', and nothing in it is read or tidied; any other untrusted or unreadable state_dir is
+    ('unknown', [{'unrecheckable': why}])."""
     try:
         real = trusted_dir(state_dir)
         names = os.listdir(real)
     except OSError as e:
+        if (entry := _foreign_entry(state_dir)) is not None:
+            return recheck(entry), [entry]
         return 'unknown', [{'unrecheckable': f'{state_dir}: {e}'}]
     found = {}
     for name in names:

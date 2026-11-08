@@ -828,6 +828,10 @@ def _process():
 
 
 def _receipt_text(r) -> str:
+    if isinstance(r, dict) and 'foreign' in r:
+        owner = f'uid {r["uid"]}' if isinstance(r.get('uid'), int) else 'its owner'
+        return (f'operations in {r["foreign"]!r:.200} (uid {os.geteuid()} cannot recheck them: rerun as {owner} or '
+                f'root, or have either remove that claim\'s file in {BOARD_LOCK_DIR} once none runs)')
     sup = r.get('supervisor') if isinstance(r, dict) else None
     pid = sup.get('pid') if isinstance(sup, dict) else None
     return f'receipt {r.get("token")} (supervisor pid {pid})' if isinstance(r, dict) else f'receipt {r!r:.80}'
@@ -1391,7 +1395,9 @@ def invocation_state(session, keep=()) -> tuple:
     is gone and recheck_dir of its ops dir answers done; else 'unresolved' with recheck_dir's open
     entries, full receipts or diagnostics. recheck_dir tidies what it proves done except the
     tokens in `keep`, so call it only after claim_alive is False for every other claim, `keep`
-    read after that (Board locks). A session that is not a claim (an older consumer's) is
+    read after that (Board locks). An ops dir of another uid, whose files this uid may not trust,
+    is never 'ended': its one entry rechecks pending while /proc shows a supervisor there or may
+    hide one, else unknown (recheck_dir). A session that is not a claim (an older consumer's) is
     'unresolved' with its own receipt unless that rechecks done."""
     r = session.get('receipt') if isinstance(session, dict) else None
     if not _is_claim(r):
