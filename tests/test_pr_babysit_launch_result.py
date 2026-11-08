@@ -551,7 +551,8 @@ class LaunchResultTest(unittest.TestCase):
                     self.assertEqual(failed(lane, stage), [
                         f'uncertain publication: {lane}Push: push rejected; the {lane} repair bbbbbbbb on aaaaaaaa is unpublished '
                         f'({stage}): relaunch with the same stateRef and adoptHead {NEXT}, the checkout left at it, while the PR '
-                        'head is still aaaaaaaa; once the PR head moved, that launch stops adopt-pending',
+                        'head is still aaaaaaaa; once the PR heads bbbbbbbb, that launch reconciles it as published; moved elsewhere, '
+                        'it stops adopt-pending',
                         f"heads disagree: {{'state': '{HEAD}', 'checkout': '{NEXT}'}}; the checkout holds the unpublished {lane} "
                         'repair, settled by its adoptHead relaunch'])
         audited = failed('review', 'audit-blocked')

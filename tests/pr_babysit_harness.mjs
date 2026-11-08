@@ -6312,6 +6312,182 @@ test('rejected or dead adoption pushes preserve the ledger and recover without r
   }
 })
 
+// #443: a candidate recorded unpublished whose push landed after all, made by a real failing launch.
+const RED_ARM = { status: 'red', infraRerun: [], realFailures: [{ check: 'build / arm', firstError: 'boom', files: ['src/a.c'], verdict: 'real' }] }
+const UNPUBLISHED = [['review', 'publication-unknown'], ['review', 'push-failed'], ['ci', 'publication-unknown'], ['ci', 'push-failed'],
+  ['adopt', 'adopt-push-unknown'], ['adopt', 'adopt-push-failed']]
+const unpublished = async (lane, stage) => {
+  const failing = stage === 'publication-unknown' ? { throwOn: 'push#' } : { push: null }
+  if (lane === 'review') return (await run({ reviews: oneValid, args: { maxCycles: 4 }, ...failing })).result.state
+  if (lane === 'ci') return (await run({ ci: RED_ARM, args: { maxCycles: 4 }, ...failing })).result.state
+  const adoptPush = stage === 'adopt-push-unknown' ? null : receiptOf(HEAD, HEAD, ' ! [rejected] non-fast-forward', false)
+  return (await run({ args: adoptionArgs(adoptionState()), preflight: { head: ADOPT, prHead: HEAD }, adoptPush })).result.state
+}
+const resumeArgs = (state, over = {}) => adoptionArgs(state, { adoptHead: undefined, ...over })
+const RECONCILED = /^preflight: the (review|ci|adopt) candidate [0-9a-f]{7} on [0-9a-f]{7}, recorded [a-z-]+, is published: PR #3888 heads it/
+
+test('a candidate recorded unpublished that the PR heads exactly is reconciled, and the launch continues from it (#443)', async () => {
+  for (const [lane, stage] of UNPUBLISHED) {
+    const name = `${lane} ${stage}`
+    const state = await unpublished(lane, stage)
+    const p = state.pending
+    assert.equal(p.stage, stage, name)
+    const { result, labels, logs } = await run({ args: resumeArgs(state), preflight: { head: p.sha, prHead: p.sha } })
+    assert.ok(result.pass || result.reason === 'yielded', `${name}: ${result.reason}`)
+    assert.ok(logs.some(l => RECONCILED.test(l)), `${name}: ${logs.join('\n')}`)
+    const evidence = result.history[0]
+    const failure = lane === 'adopt' ? { publication: state.last.adoption.publication, detail: state.last.adoption.detail } : state.last[`${lane}PushFailed`]
+    assert.deepEqual(evidence.reconciled, { lane, stage, sha: p.sha, parent: p.parent, failure }, name)
+    if (lane === 'adopt') {
+      assert.equal(evidence.adoption.publication, 'already-published', name)
+      assert.match(evidence.adoption.detail, new RegExp(`PR #3888 heads ${p.sha.slice(0, 7)}, read back by a later preflight`), name)
+    } else assert.equal(evidence[`${lane}PushFailed`], undefined, `${name}: the failure is retired, kept only as evidence`)
+    assert.equal(labels.some(l => /^(push#|adopt:)/.test(l)), false, `${name}: nothing is pushed again`)
+    assert.equal(result.history[1].head, p.sha, name)
+    assert.equal(result.state.pending, null, name)
+    assert.equal(result.state.expectedHead, p.sha, name)
+    assert.equal(result.state.cyclesUsed, state.cyclesUsed + 1, name)
+  }
+})
+
+test('a reconciliation stopped early emits a state the candidate does not come back to, and that state resumes (#443)', async () => {
+  const state = await unpublished('review', 'publication-unknown')
+  const p = state.pending
+  assert.ok(state.debt.length, 'the failed launch owes a fix note')
+  // A descendant whose audit agent dies: the launch stops in preflight, after the reconciliation.
+  const stopped = await run({ args: resumeArgs(state, { adoptHead: ADOPT }), preflight: { head: ADOPT, prHead: p.sha }, adoptAudit: null })
+  assert.equal(stopped.result.reason, 'adopt-audit-failed')
+  const st = stopped.result.state
+  assert.equal(st.pending, null)
+  assert.equal(st.expectedHead, p.sha)
+  assert.equal(st.cyclesUsed, state.cyclesUsed)
+  assert.deepEqual(st.last.reconciled, { lane: 'review', stage: 'publication-unknown', sha: p.sha, parent: p.parent, failure: state.last.reviewPushFailed })
+  assert.equal('reviewPushFailed' in st.last, false)
+  for (const k of ['debt', 'answeredWith', 'decisions', 'holds', 'deferrals']) assert.deepEqual(st[k], state[k], `${k} kept, none settled`)
+  // The emitted state survives state_transfer.py and a stateRef load whole.
+  const line = transferOf(st)
+  assert.equal(line.digest, st.digest)
+  assert.deepEqual(line.state, st)
+  const { state: _, ...rest } = resumeArgs(st)
+  const again = await run({
+    args: { ...rest, stateRef: { outputFile: '/tmp/tasks/w1.output', digest: st.digest } }, load: st, preflight: { head: p.sha, prHead: p.sha },
+  })
+  assert.notEqual(again.result.reason, 'stale-head', again.logs.join('\n'))
+  assert.equal(again.logs.some(l => RECONCILED.test(l)), false, 'nothing is left to reconcile')
+  assert.deepEqual(again.result.history[0].reconciled, st.last.reconciled)
+  assert.equal(again.result.state.pending, null)
+  assert.equal(again.result.state.expectedHead, p.sha)
+  // The checkout must stand at the reconciled head, as at any other.
+  const parent = await run({ args: resumeArgs(st), preflight: { head: p.parent, prHead: p.parent } })
+  assert.equal(parent.result.reason, 'stale-head')
+  assert.equal(parent.result.expected, p.sha)
+})
+
+test('a chain on a reconciled candidate is adopted from it (#443)', async () => {
+  for (const [lane, stage] of [['review', 'publication-unknown'], ['adopt', 'adopt-push-unknown']]) {
+    const state = await unpublished(lane, stage)
+    const p = state.pending
+    const next = lane === 'adopt' ? ADOPT_MID : ADOPT
+    const { result, labels, calls } = await run({ args: resumeArgs(state, { adoptHead: next }), preflight: { head: next, prHead: p.sha } })
+    assert.deepEqual(labels.slice(0, 3), ['preflight', 'adopt:audit', 'adopt:push'], lane)
+    assert.match(calls.find(c => c.label === 'adopt:audit').prompt, new RegExp(`commits\\.py chain ${p.sha} ${next} --published ${p.sha} `), lane)
+    assert.deepEqual(result.history[0].reconciled.sha, p.sha, lane)
+    assert.deepEqual([result.history[1].adoption.from, result.history[1].adoption.to, result.history[1].adoption.publication], [p.sha, next, 'pushed'], lane)
+    assert.equal(result.state.expectedHead, next, lane)
+    assert.equal(result.state.pending, null, lane)
+  }
+})
+
+test('retrying the adoption of a reconciled candidate adopts nothing new and stops on no refusal (#443)', async () => {
+  for (const [lane, stage] of [['review', 'publication-unknown'], ['ci', 'push-failed']]) {
+    const state = await unpublished(lane, stage)
+    const p = state.pending
+    const { result, labels, logs } = await run({ args: resumeArgs(state, { adoptHead: p.sha }), preflight: { head: p.sha, prHead: p.sha } })
+    assert.notEqual(result.reason, 'adopt-audit-failed', result.detail)
+    assert.ok(logs.includes(`preflight: ${p.sha.slice(0, 7)} is the ${lane} repair reconciled above: nothing left to adopt`), logs.join('\n'))
+    assert.equal(labels.some(l => l.startsWith('adopt:')), false, lane)
+    assert.equal(result.state.expectedHead, p.sha, lane)
+    assert.equal(result.state.pending, null, lane)
+    // The checkout still has to stand at it.
+    const off = await run({ args: resumeArgs(state, { adoptHead: p.sha }), preflight: { head: p.parent, prHead: p.sha } })
+    assert.equal(off.result.reason, 'stale-head', lane)
+    assert.equal(off.result.expected, p.sha, lane)
+  }
+  // A reconciled adoption retried is audited from its own parent and read as already published, so the launch shows it.
+  for (const stage of ['adopt-push-unknown', 'adopt-push-failed']) {
+    const state = await unpublished('adopt', stage)
+    const { result, labels, calls } = await run({ args: adoptionArgs(state), preflight: { head: ADOPT, prHead: ADOPT } })
+    assert.match(calls.find(c => c.label === 'adopt:audit').prompt, new RegExp(`commits\\.py chain ${HEAD} ${ADOPT} --published ${ADOPT} `), stage)
+    assert.equal(labels.includes('adopt:push'), false, stage)
+    assert.equal(result.history[0].reconciled.stage, stage)
+    assert.equal(result.history[1].adoption.publication, 'already-published', stage)
+    assert.deepEqual(result.observation.launchActions[0].adoption, result.history[1].adoption, stage)
+    assert.equal(result.state.expectedHead, ADOPT, stage)
+  }
+})
+
+test('only an exact live head reconciles: a rewritten or moved head, and every other stage, keep their stops (#443)', async () => {
+  const state = await unpublished('review', 'publication-unknown')
+  const p = state.pending
+  for (const [name, args, preflight, reason] of [
+    ['a rewritten head', resumeArgs(state), { head: FOREIGN, prHead: FOREIGN }, 'stale-head'],
+    ['a rewritten head re-pinned', resumeArgs(state, { rebasedHead: FOREIGN }), { head: FOREIGN, prHead: FOREIGN }, 'rebase-refused'],
+    ['an adoption on a moved head', resumeArgs(state, { adoptHead: ADOPT }), { head: ADOPT, prHead: FOREIGN }, 'adopt-pending'],
+    // A descendant of the candidate proves nothing by ancestry.
+    ['a head past the candidate', resumeArgs(state), { head: ADOPT, prHead: ADOPT }, 'stale-head'],
+  ]) {
+    const { result, logs } = await run({ args, preflight })
+    assert.equal(result.reason, reason, name)
+    assert.equal(logs.some(l => RECONCILED.test(l)), false, name)
+    assert.deepEqual(result.state.pending, p, name)
+    assert.deepEqual(result.state.last, state.last, name)
+    assert.equal(result.state.expectedHead, state.expectedHead, name)
+  }
+  for (const [stage, failed] of [
+    ['audit-blocked', { pass: false, committed: true, detail: 'commit failed audit: the audit read src/b.c on 0f1e2d3, not this commit', sha: ADOPT }],
+    ['audit-unknown', { pass: false, committed: true, detail: 'audit agent died after the commit landed', sha: '' }],
+    ['push-unknown', { pass: false, committed: null, detail: 'commit agent died', sha: '' }],
+  ]) {
+    const pending = { sha: stage === 'audit-blocked' ? ADOPT : null, parent: HEAD, lane: 'review', stage }
+    const held = adoptionState({ pending, last: { cycle: 1, head: HEAD, reviewPushFailed: failed } })
+    const { result, logs } = await run({ args: resumeArgs(held), preflight: { head: ADOPT, prHead: ADOPT } })
+    assert.equal(result.reason, 'stale-head', stage)
+    assert.equal(logs.some(l => RECONCILED.test(l)), false, stage)
+    assert.deepEqual(result.state.pending, pending, stage)
+  }
+})
+
+test('a wrong remote stops before any reconciliation (#443)', async () => {
+  const bad = 'git@evil.example:hathach/tinyusb.git'
+  const real = await unpublished('review', 'publication-unknown')
+  const state = seal({ ...real, pin: { ...real.pin, pushUrls: [bad] } })
+  const p = state.pending
+  const { result, labels, logs } = await run({ args: resumeArgs(state), preflight: { head: p.sha, prHead: p.sha, pushUrls: [bad], badPushUrl: bad } })
+  assert.equal(result.reason, 'wrong-remote')
+  assert.deepEqual(labels, ['preflight'])
+  assert.equal(logs.some(l => RECONCILED.test(l)), false)
+  assert.deepEqual(result.state.pending, p)
+  assert.deepEqual(result.state.last, state.last)
+  assert.equal(result.state.expectedHead, p.parent)
+  // Ahead of a stale head too: the remote is checked before the heads are.
+  const stale = await run({ args: resumeArgs(state), preflight: { head: FOREIGN, prHead: FOREIGN, pushUrls: [bad], badPushUrl: bad } })
+  assert.equal(stale.result.reason, 'wrong-remote')
+})
+
+test('a rebasedHead naming the candidate the PR heads has nothing to re-pin; a later rewrite re-pins from it (#443)', async () => {
+  const state = await unpublished('review', 'publication-unknown')
+  const p = state.pending
+  const { result, labels, logs } = await run({ args: resumeArgs(state, { rebasedHead: p.sha }), preflight: { head: p.sha, prHead: p.sha } })
+  assert.notEqual(result.reason, 'rebase-refused', result.detail)
+  assert.ok(logs.includes(`preflight: rebasedHead ${p.sha.slice(0, 7)} is the candidate reconciled above: nothing to re-pin`), logs.join('\n'))
+  assert.equal(labels.includes('rebase:cited'), false)
+  assert.equal(result.history.some(e => e.rebased), false)
+  assert.equal(result.state.expectedHead, p.sha)
+  const later = await run({ args: resumeArgs(result.state, { rebasedHead: FOREIGN }), preflight: { head: FOREIGN, prHead: FOREIGN } })
+  assert.deepEqual(later.result.history.at(-1).rebased, { from: p.sha, to: FOREIGN })
+  assert.equal(later.result.state.expectedHead, FOREIGN)
+})
+
 test('old bot timing cannot settle reviewers on a newly adopted head', async () => {
   const reviewers = ['greptile', 'coderabbit']
   const state = adoptionState({

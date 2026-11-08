@@ -213,7 +213,7 @@ def unpublished_repair(pending):
     return (f"{pending['lane']}Push", sha,
             f"the {pending['lane']} repair {sha[:8]} on {parent[:8]} is unpublished ({pending['stage']}): relaunch with the same "
             f'stateRef and adoptHead {sha}, the checkout left at it, while the PR head is still {parent[:8]}; '
-            'once the PR head moved, that launch stops adopt-pending',
+            f'once the PR heads {sha[:8]}, that launch reconciles it as published; moved elsewhere, it stops adopt-pending',
             f"the checkout holds the unpublished {pending['lane']} repair, settled by its adoptHead relaunch")
 
 
