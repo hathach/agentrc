@@ -23,7 +23,9 @@ Everything below that says "the build contract" or "the HIL contract" means thos
    record, `.claude/audit.json`, when it is complete, writes the private run dir (path printed; `$RUN` below) and
    prints the growth. When it refuses, or for a first audit, the owner picks the base: `--base <sha> --base-kind
    bootstrap` for a first audit, `override` to replace a record. A submodule pin change in the growth is a
-   dependency delta to review, not an audit of the dependency.
+   dependency delta to review, not an audit of the dependency. Run it, and `check`, with push access to the record's
+   repository: without it only a user-owned repository's owner counts as a validation report's writer, so an
+   organisation's record reads provisional.
 2. Usage, where transcripts exist: `python3 "$A/usage.py" --run $RUN --claude-root ~/.claude/projects
    [--claude-root <other config>/projects] --codex-root ~/.codex/sessions --out $RUN/usage.json`. It measures
    maintainer tooling on this host only, never deployed firmware or external API use; zero is a lead, never proof.
@@ -31,7 +33,7 @@ Everything below that says "the build contract" or "the HIL contract" means thos
    contracts and workflows before calling anything unused. Run it on each host whose sessions matter, each from its
    own `start` on the same head with the first run's window and base (`--since`/`--until` from its `run.json`, and
    `--base <its base> --base-kind <its kind>` unless that kind is `audit`), and record totals with the host count.
-   With no transcripts anywhere, record `"hosts": 0, "totals": {}`: unmeasured, never zero use.
+   With no transcripts anywhere, record `"hosts": 0, "totals": {}` and the run's window: unmeasured, never zero use.
 3. Python per-test coverage, only for a pytest suite (agentrc's `tests`, tinyusb's `test/hil/test`), beside, never
    instead of, the build contract's run: serial and in-process (pytest-xdist workers and subprocesses measure
    nothing), with arcs (`branch = True`), and its provenance in `$RUN/provenance.json`. agentrc's:
@@ -102,15 +104,20 @@ Everything below that says "the build contract" or "the HIL contract" means thos
 
 ## Record and end
 
-1. With every stage done, on the audit PR's head R (pushed, clean, nothing after it):
+1. From the audit PR's opening to its merge nothing else may push to it: open it as a draft or with the owner
+   declining babysitting, decline every later offer to babysit it, stop a running chief (`headless-chief`'s
+   `kill <launcher pid>`) or `pr-babysit` with `autoPush`, and use no "Update branch".
+   With every stage done, on the audit PR's head R (pushed, clean, nothing after it):
    `python3 "$A/audit.py" finish --run $RUN --head R --review <review.json>` writes `.claude/audit.json` from the
    review file, whose shape `audit.py`'s docstring defines; add `--repo <checkout of R>` when R is not checked out
    where start ran. Read it for anything private and for correctness, co-review it, then commit only that file as the
    PR's last commit P; put the co-review's reference in a PR comment. The PR body carries
-   `Audit range (planned): <base>..R`, a hint only.
-2. Nothing may push to the PR after P: stop its babysitter first (a chief or `pr-babysit` with `autoPush`), and use
-   no "Update branch". If the base branch moves or a commit lands on P anyway, drop P, bring R up to date, review the
-   new commits into the ledger, rewrite the review's `range`, run finish again and commit the new record.
+   `Audit range (planned): <base>..R`, a hint only. finish refuses text that looks private, shell command shapes
+   included: reword it as prose.
+2. Nothing may push to the PR after P. If the base branch moves or a commit lands on P anyway, drop P (revert it, or
+   on the owner's word reset the branch to R and force-push it), bring R up to date, review the new commits into the
+   ledger, re-run validation for the new range on the new R, rewrite the review's `range`, run finish again, then
+   read and co-review the new record before committing it.
 3. The PR merges by squash or rebase, up to date with its base branch: an ordinary merge commit or a stale branch
    makes the record invalid.
 4. After the merge, validate the merge commit E against the record's `validation.expected`, software and hardware,
