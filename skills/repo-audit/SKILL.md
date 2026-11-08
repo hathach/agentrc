@@ -85,7 +85,8 @@ Everything below that says "the build contract" or "the HIL contract" means thos
   code across ports sharing an IP, merged only after naming the shared invariant and keeping variant differences.
 - A workaround or errata block stays unless `read-doc` shows its trigger cannot occur on any supported part.
 - Measure flash and RAM per board and image with the build contract's code-size section, the range's growth and the
-  audit's own reduction apart, never summed across boards. Lines and prompt bytes are secondary.
+  audit's own reduction apart, never summed across boards, and put them in the record's `outcome` with their revisions
+  and refs. Lines and prompt bytes are secondary.
 
 ## Completion review
 
@@ -110,7 +111,10 @@ Everything below that says "the build contract" or "the HIL contract" means thos
    With every stage done, on the audit PR's head R (pushed, clean, nothing after it):
    `python3 "$A/audit.py" finish --run $RUN --head R --review <review.json>` writes `.claude/audit.json` from the
    review file, whose shape `audit.py`'s docstring defines; add `--repo <checkout of R>` when R is not checked out
-   where start ran. Read it for anything private and for correctness, co-review it, then commit only that file as the
+   where start ran. It requires R up to date with the PR's base branch and records that branch's tip as the PR base,
+   which splits the audit's own changes from the range's growth in the report. `outcome` leads that report: the
+   useful result, public API and support consequences (deprecations first), flash and RAM, in a few sentences.
+   Read it for anything private and for correctness, co-review it, then commit only that file as the
    PR's last commit P; put the co-review's reference in a PR comment. The PR body carries
    `Audit range (planned): <base>..R`, a hint only. finish refuses text that looks private, shell command shapes
    included: reword it as prose.
@@ -121,8 +125,8 @@ Everything below that says "the build contract" or "the HIL contract" means thos
 3. The PR merges by squash or rebase, up to date with its base branch: an ordinary merge commit or a stale branch
    makes the record invalid.
 4. After the merge, validate the merge commit E against the record's `validation.expected`, software and hardware,
-   then `python3 "$A/audit.py" report --repo . --head E --results <results.json>` prints the validation comment;
-   post it with `gh pr comment <pr.number> --repo <pr.repo> -F <body>`, the record's PR (the owner's grant for the
+   then `python3 "$A/audit.py" report --repo . --head E --results <results.json>` prints the audit report with the
+   validation block, one comment; post it with `gh pr comment <pr.number> --repo <pr.repo> -F <body>`, the record's PR (the owner's grant for the
    audit covers it). The record is never edited after the merge.
 5. `python3 "$A/audit.py" check --repo . --head origin/<default branch>` must report `complete`; the audit is done
-   only then.
+   only then. Give the owner the report comment's link and its status and outcome lines.

@@ -6,6 +6,7 @@ import json
 import ntpath
 import os
 import re
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -159,7 +160,7 @@ class Start(unittest.TestCase):
 
     def test_a_base_over_a_record_is_an_override_that_still_carries_its_items(self):
         rec = dict({k: v for k, v in review(self.base, self.head).items() if k != 'range'}, schema=audit.SCHEMA,
-                   identity=[self.base], base=self.base, baseKind='bootstrap', reviewedHead=self.head,
+                   identity=[self.base], base=self.base, baseKind='bootstrap', prBase=self.base, reviewedHead=self.head,
                    completed=SINCE, decisions=[{'id': 'd1', 'text': 'keep', 'status': 'new'},
                                                {'id': 'd0', 'text': 'old', 'status': 'resolved'}])
         self.assertEqual(audit.check_record(rec), [])
@@ -352,7 +353,7 @@ def review(base, reviewed, **fields):
 
 
 def open_pr(head, repo='o/r'):
-    return {'state': 'open', 'merged': False, 'head': {'sha': head}, 'base': {'repo': {'full_name': repo}}}
+    return {'state': 'open', 'merged': False, 'head': {'sha': head}, 'base': {'repo': {'full_name': repo}, 'ref': 'main'}}
 
 
 def validation(end, *items):
@@ -410,7 +411,7 @@ class Record(unittest.TestCase):
         self.repo = Repo(self)
         self.base = self.repo.commit({'a.txt': '1\n'})
 
-    def audit(self, moved=False, merge='squash', unchecked_coverage=False, **fields):
+    def audit(self, moved=False, merge='squash', unchecked_coverage=False, pr_base=None, **fields):
         r = self.repo
         r.git('checkout', '-q', '-b', 'audit')
         self.reviewed = r.commit({'a.txt': '2\n'})
@@ -420,11 +421,15 @@ class Record(unittest.TestCase):
         file = tmpdir(self) / 'review.json'
         file.write_text(json.dumps(review(self.base, self.reviewed, **fields)))
         self.hub.pulls[('o/r', 7)] = open_pr(self.reviewed)
+        r.git('push', '-q', str(self.hub.bare('o/r')), 'main:refs/heads/main')
         with mock.patch.object(audit, 'uncovered', return_value=[]) if unchecked_coverage else \
-                contextlib.nullcontext(), mock.patch.object(audit, 'gh', self.hub.gh):
+                contextlib.nullcontext(), mock.patch.multiple(audit, gh=self.hub.gh, GITHUB=self.hub.root.as_posix() + '/'):
             code, out, err = run(audit.main, 'finish', '--run', str(self.run_dir), '--head', self.reviewed,
                                  '--review', str(file))
         self.assertEqual(code, 0, err)
+        if pr_base:
+            rec = json.loads((r.path / audit.RECORD).read_text())
+            (r.path / audit.RECORD).write_text(json.dumps(dict(rec, prBase=pr_base), indent=2) + '\n')
         r.git('add', '--', audit.RECORD)
         r.git('commit', '-q', '--only', '-m', 'Record the audit', '--', audit.RECORD)
         self.pr_head = r.git('rev-parse', 'HEAD')
@@ -435,6 +440,8 @@ class Record(unittest.TestCase):
         if merge == 'squash':
             r.git('merge', '-q', '--squash', 'audit')
             r.git('commit', '-q', '-m', 'Audit (#7)')
+        elif merge == 'ff':
+            r.git('merge', '-q', '--ff-only', 'audit')
         else:
             r.git('merge', '-q', '--no-ff', '-m', 'Merge pull request #7', 'audit')
         self.end = r.git('rev-parse', 'HEAD')
@@ -736,6 +743,58 @@ class Record(unittest.TestCase):
         self.hub.comment('o/r', 7, 'alice', out)
         self.assertStatus('complete')
 
+    def test_the_report_names_the_audit_s_own_changes_apart_from_the_range_s_growth(self):
+        self.repo.git('checkout', '-q', '-b', 'side')
+        side = self.repo.commit({'side.txt': 's\n'})
+        self.repo.git('checkout', '-q', 'main')
+        grown = self.repo.commit({'tests/test_g.py': 'def test_g():\n  pass\n', 'src/g.c': 'int g;\n'})
+        self.audit(merge='ff', decisions=[{'id': 'd1', 'text': 'cut the\n```text\nshim', 'status': 'new',
+                                           'ref': 'o/r#5'}],
+                   outcome='```', usage={'totals': {}, 'hosts': 0, 'window': {'since': SINCE, 'until': UNTIL}})
+        self.assertEqual(self.end, self.pr_head)        # a fast-forward: M, not merge-base(R, E), splits the range
+        self.assertEqual(self.record()['prBase'], grown)
+        shutil.rmtree(self.run_dir)                     # the report needs only the record, git and the results
+        self.hub.comments[('o/r', 7)].clear()
+        code, out, err = self.report([{'id': 'suite', 'result': 'pass', 'ref': 'CI run 9 on E'}])
+        self.assertEqual(code, 0, err)
+        own = out.split("### This audit's changes")[1].split('### Growth')[0]
+        growth = out.split('### Growth since the base')[1].split('### Decisions')[0]
+        self.assertIn('| everything else | 1 | 1 |', own)        # a.txt 1 -> 2
+        self.assertIn('| tests | 2 | 0 |', growth)
+        self.assertIn('test functions +1 -0', growth)
+        self.assertIn('validation on', out)
+        self.assertIn('1/1 covered checks pass', out)
+        self.assertIn('- **Outcome:** ```', out)
+        self.assertIn('- `d1` new: cut the ```text shim (o/r#5)', out)
+        self.assertIn('- usage: not measured', out)
+        self.assertIn('- `hil` hardware: HIL battery (HIL contract): excluded: no rig board for it this time', out)
+        self.assertEqual(len(audit.report_blocks(out)), 1)
+        self.hub.comment('o/r', 7, 'alice', out)
+        self.assertStatus('complete')
+        self.assertNotIn(side, out)
+
+    def test_a_failing_report_says_so_and_check_reads_it_provisional(self):
+        self.audit()
+        self.hub.comments[('o/r', 7)].clear()
+        code, out, err = self.report([{'id': 'suite', 'result': 'fail', 'ref': 'CI run 9'}])
+        self.assertEqual(code, 0, err)
+        self.assertIn(f'**validation FAILED on `{self.end[:12]}`: suite**', out)
+        self.hub.comment('o/r', 7, 'alice', out)
+        self.assertStatus('provisional', 'suite is fail')
+
+    def test_an_oversized_report_refuses(self):
+        self.audit(outcome='word ' * 14000)
+        code, _, err = self.report([{'id': 'suite', 'result': 'pass', 'ref': 'CI run 9'}])
+        self.assertEqual(code, 2)
+        self.assertIn("over GitHub's 65536", err)
+
+    def test_a_pr_base_out_of_order_reads_invalid(self):
+        self.repo.git('checkout', '-q', '-b', 'side')
+        side = self.repo.commit({'side.txt': 's\n'})
+        self.repo.git('checkout', '-q', 'main')
+        self.audit(pr_base=side)
+        self.assertStatus('invalid', f'the PR base {side[:12]} is not ordered with the reviewed head')
+
     def test_report_refuses(self):
         self.audit()
         item = {'id': 'suite', 'result': 'pass', 'ref': 'CI run 9'}
@@ -772,7 +831,8 @@ class Finish(unittest.TestCase):
         self.out = tmpdir(self) / 'run'
         start(self.repo.path, self.out, '--base', self.base, head=self.head)
         self.hub = Hub(self)
-        patch = mock.patch.object(audit, 'gh', self.hub.gh)
+        self.repo.git('push', '-q', str(self.hub.bare('o/r')), 'main:refs/heads/main')
+        patch = mock.patch.multiple(audit, gh=self.hub.gh, GITHUB=self.hub.root.as_posix() + '/')
         patch.start()
         self.addCleanup(patch.stop)
 
@@ -796,9 +856,9 @@ class Finish(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertIn(f'git add -- {audit.RECORD} && git commit --only -- {audit.RECORD}', out)
         rec = json.loads((self.repo.path / audit.RECORD).read_text())
-        self.assertEqual({k: rec[k] for k in ('schema', 'identity', 'base', 'baseKind', 'reviewedHead')},
+        self.assertEqual({k: rec[k] for k in ('schema', 'identity', 'base', 'baseKind', 'prBase', 'reviewedHead')},
                          {'schema': 1, 'identity': [self.root], 'base': self.base, 'baseKind': 'bootstrap',
-                          'reviewedHead': self.head})
+                          'prBase': self.base, 'reviewedHead': self.head})
         self.assertEqual({k: v for k, v in rec.items() if k not in audit.RECORD_FIELDS},
                          {k: v for k, v in review(self.base, self.head).items() if k != 'range'})
         self.assertEqual(sorted(p.name for p in self.out.iterdir()), ['carried.json', 'inventory.json', 'run.json'])
@@ -816,6 +876,17 @@ class Finish(unittest.TestCase):
                 self.refused(reason)
         self.hub.pulls[('o/r', 7)] = open_pr(self.head, 'O/R')       # GitHub's own case of the name
         self.assertEqual(self.finish(review(self.base, self.head))[0], 0)
+
+    def test_the_base_branch_must_sit_between_the_run_s_base_and_r(self):
+        self.repo.git('checkout', '-q', 'main')
+        moved = self.repo.commit({'b.txt': 'later\n'})
+        self.repo.git('push', '-q', str(self.hub.bare('o/r')), 'main:refs/heads/main')
+        self.repo.git('checkout', '-q', 'audit')
+        self.refused(f'the base branch main at {moved[:12]} is not in --head {self.head[:12]}: bring R up to date')
+        self.repo.git('push', '-q', '-f', str(self.hub.bare('o/r')), f'{self.root}:refs/heads/main')
+        self.refused(f'the base branch main at {self.root[:12]} does not descend from the run\'s base')
+        self.hub.pulls[('o/r', 7)] = dict(open_pr(self.head), base={'repo': {'full_name': 'o/r'}, 'ref': 'gone'})
+        self.refused('o/r refs/heads/gone cannot be read')
 
     def test_a_record_that_landed_at_r_since_start_is_not_overwritten(self):
         other = json.dumps({'decisions': 'another audit merged this'}) + '\n'
@@ -1042,6 +1113,7 @@ class Finish(unittest.TestCase):
         r.git('update-index', '--add', '--cacheinfo', f'160000,{self.base},lib/dep')
         r.git('commit', '-q', '-m', 'pin')
         base = r.git('rev-parse', 'HEAD')
+        r.git('push', '-q', '-f', str(self.hub.bare('o/r')), f'{base}:refs/heads/main')
         for name, body in (('gone.txt', None), ('old/name.txt', None), ('new/name.txt', 'same\n' * 20),
                            ('src/deep/a.c', 'b\n')):
             if body is None:
