@@ -111,13 +111,11 @@ Everything below that says "the build contract" or "the HIL contract" means thos
    With every stage done, on the audit PR's head R (pushed, clean, nothing after it):
    `python3 "$A/audit.py" finish --run $RUN --head R --review <review.json>` writes `.claude/audit.json` from the
    review file, whose shape `audit.py`'s docstring defines; add `--repo <checkout of R>` when R is not checked out
-   where start ran. It requires R up to date with the PR's base branch and records that branch's tip as the PR base,
-   which splits the audit's own changes from the range's growth in the report. `outcome` leads that report: the
-   useful result, public API and support consequences (deprecations first), flash and RAM, in a few sentences.
-   Read it for anything private and for correctness, co-review it, then commit only that file as the
-   PR's last commit P; put the co-review's reference in a PR comment. The PR body carries
-   `Audit range (planned): <base>..R`, a hint only. finish refuses text that looks private, shell command shapes
-   included: reword it as prose.
+   where start ran; it requires R up to date with the PR's base branch. `outcome` leads the audit report: the useful
+   result and the public API and support consequences (deprecations first), in a few sentences. Read the record for
+   anything private and for correctness, co-review it, then commit only that file as the PR's last commit P; put the
+   co-review's reference in a PR comment. The PR body carries `Audit range (planned): <base>..R`, a hint only.
+   finish refuses text that looks private, shell command shapes included: reword it as prose.
 2. Nothing may push to the PR after P. If the base branch moves or a commit lands on P anyway, drop P (revert it, or
    on the owner's word reset the branch to R and force-push it), bring R up to date, review the new commits into the
    ledger, re-run validation for the new range on the new R, rewrite the review's `range`, run finish again, then
@@ -126,7 +124,7 @@ Everything below that says "the build contract" or "the HIL contract" means thos
    makes the record invalid.
 4. After the merge, validate the merge commit E against the record's `validation.expected`, software and hardware,
    then `python3 "$A/audit.py" report --repo . --head E --results <results.json>` prints the audit report with the
-   validation block, one comment; post it with `gh pr comment <pr.number> --repo <pr.repo> -F <body>`, the record's PR (the owner's grant for the
-   audit covers it). The record is never edited after the merge.
+   validation block, one comment; post it with `gh pr comment <pr.number> --repo <pr.repo> -F <body>`, the record's
+   PR (the owner's grant for the audit covers it). The record is never edited after the merge.
 5. `python3 "$A/audit.py" check --repo . --head origin/<default branch>` must report `complete`; the audit is done
    only then. Give the owner the report comment's link and its status and outcome lines.

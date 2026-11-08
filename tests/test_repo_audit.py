@@ -353,7 +353,8 @@ def review(base, reviewed, **fields):
 
 
 def open_pr(head, repo='o/r'):
-    return {'state': 'open', 'merged': False, 'head': {'sha': head}, 'base': {'repo': {'full_name': repo}, 'ref': 'main'}}
+    return {'state': 'open', 'merged': False, 'head': {'sha': head},
+            'base': {'repo': {'full_name': repo}, 'ref': 'main'}}
 
 
 def validation(end, *items):
@@ -395,6 +396,14 @@ class Hub:
             return (1, '', 'gh: Service Unavailable (HTTP 503)') if body is None else (0, json.dumps(body), '')
         raise AssertionError(f'unexpected gh {args}')
 
+    def patch(self):
+        """audit's GitHub reads and git URLs pointed at this hub."""
+        return mock.patch.multiple(audit, gh=self.gh, GITHUB=self.root.as_posix() + '/')
+
+    def branch(self, repo, rev, name='main', slug='o/r'):
+        """slug's branch name set to rev, as a push or a force-push would."""
+        repo.git('push', '-q', '-f', str(self.bare(slug)), f'{rev}:refs/heads/{name}')
+
     def bare(self, slug):
         path = self.root / slug
         path = path.with_name(path.name + '.git')
@@ -421,9 +430,9 @@ class Record(unittest.TestCase):
         file = tmpdir(self) / 'review.json'
         file.write_text(json.dumps(review(self.base, self.reviewed, **fields)))
         self.hub.pulls[('o/r', 7)] = open_pr(self.reviewed)
-        r.git('push', '-q', str(self.hub.bare('o/r')), 'main:refs/heads/main')
+        self.hub.branch(r, 'main')
         with mock.patch.object(audit, 'uncovered', return_value=[]) if unchecked_coverage else \
-                contextlib.nullcontext(), mock.patch.multiple(audit, gh=self.hub.gh, GITHUB=self.hub.root.as_posix() + '/'):
+                contextlib.nullcontext(), self.hub.patch():
             code, out, err = run(audit.main, 'finish', '--run', str(self.run_dir), '--head', self.reviewed,
                                  '--review', str(file))
         self.assertEqual(code, 0, err)
@@ -449,7 +458,7 @@ class Record(unittest.TestCase):
         self.hub.comment('o/r', 7, 'alice', validation(self.end, ('suite', 'pass')))
 
     def check(self, repo=None):
-        with mock.patch.multiple(audit, gh=self.hub.gh, GITHUB=self.hub.root.as_posix() + '/'):
+        with self.hub.patch():
             return run(audit.main, 'check', '--repo', str(repo or self.repo.path), '--head', 'main')
 
     def assertStatus(self, status, reason='', repo=None):
@@ -729,7 +738,7 @@ class Record(unittest.TestCase):
     def report(self, items, head=None, tested=None):
         file = tmpdir(self) / 'results.json'
         file.write_text(json.dumps({'end': tested or head or self.end, 'items': items}))
-        with mock.patch.multiple(audit, gh=self.hub.gh, GITHUB=self.hub.root.as_posix() + '/'):
+        with self.hub.patch():
             return run(audit.main, 'report', '--repo', str(self.repo.path), '--head', head or self.end, '--results',
                        str(file))
 
@@ -763,7 +772,7 @@ class Record(unittest.TestCase):
         self.assertIn('| tests | 2 | 0 |', growth)
         self.assertIn('test functions +1 -0', growth)
         self.assertIn('validation on', out)
-        self.assertIn('1/1 covered checks pass', out)
+        self.assertIn('all 1 covered checks pass', out)
         self.assertIn('- **Outcome:** ```', out)
         self.assertIn('- `d1` new: cut the ```text shim (o/r#5)', out)
         self.assertIn('- usage: not measured', out)
@@ -788,6 +797,13 @@ class Record(unittest.TestCase):
         self.hub.comment('o/r', 7, 'alice', out)
         self.assertStatus('complete')
 
+    def test_a_report_whose_block_does_not_read_back_refuses(self):
+        self.audit(outcome='cut\n```')
+        with mock.patch.object(audit, 'one_line', str):        # a renderer that lets a string escape its line
+            code, _, err = self.report([{'id': 'suite', 'result': 'pass', 'ref': 'CI run 9'}])
+        self.assertEqual(code, 2)
+        self.assertIn('hides or adds a validation block', err)
+
     def test_a_failing_report_says_so_and_check_reads_it_provisional(self):
         self.audit()
         self.hub.comments[('o/r', 7)].clear()
@@ -808,7 +824,7 @@ class Record(unittest.TestCase):
         side = self.repo.commit({'side.txt': 's\n'})
         self.repo.git('checkout', '-q', 'main')
         self.audit(pr_base=side)
-        self.assertStatus('invalid', f'the PR base {side[:12]} is not ordered with the reviewed head')
+        self.assertStatus('invalid', f'the PR base {side[:12]} is not in the reviewed head')
 
     def test_report_refuses(self):
         self.audit()
@@ -846,8 +862,8 @@ class Finish(unittest.TestCase):
         self.out = tmpdir(self) / 'run'
         start(self.repo.path, self.out, '--base', self.base, head=self.head)
         self.hub = Hub(self)
-        self.repo.git('push', '-q', str(self.hub.bare('o/r')), 'main:refs/heads/main')
-        patch = mock.patch.multiple(audit, gh=self.hub.gh, GITHUB=self.hub.root.as_posix() + '/')
+        self.hub.branch(self.repo, 'main')
+        patch = self.hub.patch()
         patch.start()
         self.addCleanup(patch.stop)
 
@@ -895,10 +911,10 @@ class Finish(unittest.TestCase):
     def test_the_base_branch_must_sit_between_the_run_s_base_and_r(self):
         self.repo.git('checkout', '-q', 'main')
         moved = self.repo.commit({'b.txt': 'later\n'})
-        self.repo.git('push', '-q', str(self.hub.bare('o/r')), 'main:refs/heads/main')
+        self.hub.branch(self.repo, 'main')
         self.repo.git('checkout', '-q', 'audit')
         self.refused(f'the base branch main at {moved[:12]} is not in --head {self.head[:12]}: bring R up to date')
-        self.repo.git('push', '-q', '-f', str(self.hub.bare('o/r')), f'{self.root}:refs/heads/main')
+        self.hub.branch(self.repo, self.root)
         self.refused(f'the base branch main at {self.root[:12]} does not descend from the run\'s base')
         self.hub.pulls[('o/r', 7)] = dict(open_pr(self.head), base={'repo': {'full_name': 'o/r'}, 'ref': 'gone'})
         self.refused('o/r refs/heads/gone cannot be read')
@@ -1128,7 +1144,7 @@ class Finish(unittest.TestCase):
         r.git('update-index', '--add', '--cacheinfo', f'160000,{self.base},lib/dep')
         r.git('commit', '-q', '-m', 'pin')
         base = r.git('rev-parse', 'HEAD')
-        r.git('push', '-q', '-f', str(self.hub.bare('o/r')), f'{base}:refs/heads/main')
+        self.hub.branch(r, base)
         for name, body in (('gone.txt', None), ('old/name.txt', None), ('new/name.txt', 'same\n' * 20),
                            ('src/deep/a.c', 'b\n')):
             if body is None:
