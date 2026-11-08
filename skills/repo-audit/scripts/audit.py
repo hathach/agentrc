@@ -613,7 +613,7 @@ GLOB = {'**/': '(?:.*/)?', '**': '.*', '*': '[^/]*', '?': '[^/]'}
 
 def glob_re(pattern):
     """A coverage glob as a regex: ** spans directories, * and ? stay within one."""
-    return re.compile(''.join(GLOB.get(t) or re.escape(t) for t in re.split(r'(\*\*/|\*\*|\*|\?)', pattern)))
+    return re.compile(''.join(GLOB.get(t) or re.escape(t) for t in re.split(r'(\*\*/|\*\*|\*|\?)', pattern)), re.S)
 
 
 def changed_paths(repo, base, end):
@@ -896,7 +896,7 @@ def report(args):
 
 
 def one_line(v):
-    """A record string on one line: printed after a fixed prefix, no value can open a fence or a heading."""
+    """A record string or git path on one line: printed after a fixed prefix, it cannot open a fence or a heading."""
     return ' '.join(str(v).split())
 
 
@@ -936,7 +936,7 @@ def render(repo, rec, end, items):
            f'### Growth since the base `{base[:12]}..{m[:12]}`', '', *change_rows(growth)]
     if growth['gitlinks']:
         out += ['', 'Submodule pins changed (a dependency delta, not audited here):',
-                *(f'- `{p}` {(o or "-")[:12]} -> {(n or "-")[:12]}' for p, o, n in growth['gitlinks'])]
+                *(f'- `{one_line(p)}` {(o or "-")[:12]} -> {(n or "-")[:12]}' for p, o, n in growth['gitlinks'])]
     out += ['', '### Decisions', '', *map(item_line, rec['decisions']), '',
             '### Deferred work', '', *map(item_line, sorted(rec['open'], key=lambda o: o['status'] not in LIVE)), '',
             f'### Validation on `{end[:12]}`', '']

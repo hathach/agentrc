@@ -747,6 +747,9 @@ class Record(unittest.TestCase):
         self.repo.git('checkout', '-q', '-b', 'side')
         side = self.repo.commit({'side.txt': 's\n'})
         self.repo.git('checkout', '-q', 'main')
+        (self.repo.path / 'dep\n```text').mkdir()       # an unpopulated submodule, which add -A keeps
+        self.repo.git('update-index', '--add', '--cacheinfo', f'160000,{side},dep\n```text')    # git's own path
+        self.repo.git('commit', '-q', '-m', 'pin')
         grown = self.repo.commit({'tests/test_g.py': 'def test_g():\n  pass\n', 'src/g.c': 'int g;\n'})
         self.audit(merge='ff', decisions=[{'id': 'd1', 'text': 'cut the\n```text\nshim', 'status': 'new',
                                            'ref': 'o/r#5'}],
@@ -767,6 +770,7 @@ class Record(unittest.TestCase):
         self.assertIn('- **Outcome:** ```', out)
         self.assertIn('- `d1` new: cut the ```text shim (o/r#5)', out)
         self.assertIn('- usage: not measured', out)
+        self.assertIn(f'- `dep ```text` - -> {side[:12]}', out)
         self.assertIn('- `hil` hardware: HIL battery (HIL contract): excluded: no rig board for it this time', out)
         self.assertEqual(len(audit.report_blocks(out)), 1)
         self.hub.comment('o/r', 7, 'alice', out)
