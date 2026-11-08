@@ -771,7 +771,7 @@ class Finish(unittest.TestCase):
                 (r.path / name).unlink()
             else:
                 (r.path / name).parent.mkdir(parents=True, exist_ok=True)
-                (r.path / name).write_text(body)
+                (r.path / name).write_text(body, newline='\n')
         r.git('add', '-A')
         r.git('update-index', '--cacheinfo', f'160000,{self.head},lib/dep')
         r.git('commit', '-q', '-m', 'move, delete, bump')
