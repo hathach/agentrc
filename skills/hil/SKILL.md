@@ -98,10 +98,32 @@ nothing in it through a link.
   than the mark carries none and is taken like any other: the farm-wide rule
   holds once every project on the host pins a helper with it.
 - `hil_lock.PendingSessions(<lock>, <kind>)` (`<lock>.<kind>-pending.json` in
-  the lock dir) is the pending-session record of a consumer that still keeps
-  one; its class docstring has the mechanics. agentrc's Arduino engine
-  rechecks the sessions an older engine left there, reports those not proven
-  ended and clears the record once every one is, never refusing on it.
+  the lock dir) is a consumer's per-board record; its class docstring has the
+  mechanics. agentrc's Arduino engine rechecks the sessions an older engine
+  left in its `arduino-hil` record, reports those not proven ended and clears
+  the record once every one is, never refusing on it.
+- Taking the lock is no permission to touch the probe: an invocation claims
+  the board write-ahead in its consumer's record, so one killed at any point
+  is still named. Under the flock it took, or under the caller's hold:
+  1. `claim(claim_entry(<ops dir>, <cmd>))` before its first tool lists
+     `{ops, pid, start}`, its run_tracked state dir resolved, and returns the
+     others; of two racing claims the later lists the earlier.
+  2. `invocation_state(<other>, keep=logged_tokens(<open failures>))` judges
+     each: `alive` (its pid runs with its start, or runs with its start
+     unreadable) refuses this attempt, two commands under one hold; `ended`
+     (gone, its ops dir `recheck_dir` done) is removed; `unresolved` (gone,
+     an operation not proven ended) has its receipts not yet logged appended
+     with `log_cleanup_failure(..., task=<its claim>, receipts=...)`, never
+     `end_failed` on a hold it does not own, and is removed once they are,
+     the refreshed `open_cleanup_failures` reported (`failure_report`).
+  3. `settle(<unresolved receipts>, <wait>, busy=<its own probe-use check>)`:
+     still occupied after the wait, the attempt removes its claim, ends and
+     releases a lock it took. The next attempt does not find that claim: the
+     logged failure is reported and refuses nothing.
+  4. At its end, once `recheck_dir` of its ops dir answers `done` (keeping
+     the files of receipts it logged, which `resolve_restored` rechecks), it
+     `remove`s exactly its own claim before its lock goes; an unclean end
+     keeps it, for the next attempt to judge.
 - A rig-wide operation, one that can reset or renumber a board you do not
   hold (a hub's power, a root-port cycle, a controller rebind), holds every
   board on the host first, across every project's roster there; a contract's

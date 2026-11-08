@@ -1087,7 +1087,17 @@ class PendingSessions(os.PathLike):
     consumer's. Every read, write and removal holds an flock on <record>.mutex (0666, never
     removed), so the board lock need not be held; the record is replaced atomically and fsynced
     with its dir (_replace_file), 0644. A record that cannot be parsed, or lists a malformed
-    session, is unreadable: kept as it is, and it refuses."""
+    session, is unreadable: kept as it is, and it refuses.
+
+    A consumer's invocations claim the board in it write-ahead (claim, claim_entry): under the
+    board's flock or the caller's hold, it claims before its first tool; refuses this attempt
+    when another invocation_state is 'alive' (two commands under one hold); removes an 'ended'
+    one; logs an 'unresolved' one's new receipts (log_cleanup_failure, task its claim; never
+    end_failed on a hold it does not own) and removes it once logged, refreshes and reports
+    open_cleanup_failures (failure_report), then settles those receipts plus its own probe-use
+    check (settle) and, still occupied, removes its claim, ends the attempt and releases a lock
+    it took. A clean end removes its own claim once recheck_dir of its ops dir answers done,
+    keeping the files of receipts it logged, before its lock goes."""
 
     def __init__(self, lock, kind):
         _check_name(lock)
@@ -1154,6 +1164,36 @@ class PendingSessions(os.PathLike):
             if len(merged) > listed:
                 _replace_file(dfd, self.name, json.dumps({'sessions': merged}, indent=1).encode())
             return merged
+
+    def claim(self, entry) -> list:
+        """List `entry`, this invocation's claim (claim_entry), write-ahead: before its first tool,
+        so one killed at any point is still named. Returns every other session listed, for the
+        caller to judge (invocation_state); of two claiming at once, the later lists the earlier.
+        Raises as add() does, ValueError too for an entry that is not a claim."""
+        if not (isinstance(entry, dict) and _is_claim(entry.get('receipt'))):
+            raise ValueError(f'a claim is a session whose receipt is {{ops, pid, start}}: {entry!r:.200}')
+        return [e for e in self.add([entry]) if e['receipt'] != entry['receipt']]
+
+    def remove(self, entry) -> list:
+        """Remove exactly the session whose receipt is `entry`'s, every other kept, and return what
+        the record still lists; the record goes once it lists none, and one it does not list
+        changes nothing. ValueError for a malformed session and PendingRefused for an unreadable
+        record, kept as it is; OSError when it cannot be replaced or removed."""
+        if not _sessions_ok([entry]):
+            raise ValueError(f'a pending session is a dict with a receipt: {entry!r:.200}')
+        with self._locked() as dfd:
+            sessions = self._read()
+            if sessions is None:
+                raise PendingRefused(f'{self.path} is unreadable: kept as it is')
+            left = [e for e in sessions if e['receipt'] != entry['receipt']]
+            if len(left) == len(sessions):
+                return left
+            if left:
+                _replace_file(dfd, self.name, json.dumps({'sessions': left}, indent=1).encode())
+            else:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(self.name, dir_fd=dfd)
+            return left
 
     def clear(self, ended, note=None, **evidence) -> dict:
         """Remove the record once `ended(session)`, the consumer's reading of its receipt, is
@@ -1222,6 +1262,79 @@ def _ended(ended, session) -> bool:
         return ended(session) is True
     except Exception:
         return False
+
+
+SETTLE_POLL = 0.5   # s between rechecks while settle waits
+
+
+def _is_claim(receipt) -> bool:
+    return (isinstance(receipt, dict) and isinstance(receipt.get('ops'), str) and type(receipt.get('pid')) is int
+            and receipt['pid'] > 0 and isinstance(receipt.get('start'), str))
+
+
+def claim_entry(ops, cmd) -> dict:
+    """This invocation's claim for PendingSessions.claim: {'receipt': {'ops', 'pid', 'start'},
+    'cmd': cmd}, `ops` the run_tracked state dir of every tool it starts, resolved. OSError when
+    its own start time cannot be read: without it a later reader cannot tell it from a reused pid."""
+    pid = os.getpid()
+    start = proc_start(pid)
+    if start is None:
+        raise OSError(errno.ESRCH, f'pid {pid}: own start time unreadable')
+    return {'receipt': {'ops': os.path.realpath(ops), 'pid': pid, 'start': start}, 'cmd': cmd}
+
+
+def _claimant_alive(receipt) -> bool:
+    start = proc_start(receipt['pid'])
+    if start is not None:
+        return start == receipt['start']    # another start: the pid was reused
+    try:
+        os.kill(receipt['pid'], 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True       # running, its start unreadable (another user's /proc under hidepid): never read as dead
+
+
+def invocation_state(session, keep=()) -> tuple:
+    """(state, receipts) of another invocation's session PendingSessions.claim returned:
+    'alive' while its pid runs with its recorded start, or runs with its start unreadable;
+    'ended' once it is gone and recheck_dir of its ops dir answers done (that tidies them, except
+    the tokens in `keep`: logged_tokens of the board's open failures, which resolve_restored
+    still rechecks); else 'unresolved' with recheck_dir's open entries, full receipts or
+    diagnostics. A session that is not a claim (an older consumer's) is 'unresolved' with its
+    own receipt unless that rechecks done."""
+    r = session.get('receipt') if isinstance(session, dict) else None
+    if not _is_claim(r):
+        return ('ended', []) if _rechecks([r])[0] == 'done' else ('unresolved', [r])
+    if _claimant_alive(r):
+        return 'alive', []
+    try:
+        verdict, entries = _process().recheck_dir(r['ops'], keep)
+    except Exception as e:      # a missing hil_process proves nothing
+        verdict, entries = 'unknown', [{'unrecheckable': f'{r["ops"]}: {e!r:.80}'}]
+    return ('ended', []) if verdict == 'done' else ('unresolved', entries)
+
+
+def logged_tokens(failures) -> set:
+    """The tokens of the receipts `failures` (open_cleanup_failures') name: the `keep` that holds
+    their files for resolve_restored."""
+    return {r['token'] for f in failures if isinstance(f, dict) and isinstance(f.get('receipts'), list)
+            for r in f['receipts'] if isinstance(r, dict) and isinstance(r.get('token'), str)}
+
+
+def settle(receipts, wait, busy=None) -> list:
+    """Recheck `receipts` (unresolved invocations') until each is done and `busy()`, the
+    consumer's own check that no tool still uses its probe, names nothing, for at most `wait` s.
+    [] once settled, else what still occupies the board: each receipt not done with its state,
+    then what busy() named."""
+    deadline = time.monotonic() + wait
+    while True:
+        left = [f'{_receipt_text(r)} {s}' for r, s in zip(receipts, _rechecks(receipts)) if s != 'done']
+        left += list(busy() or ()) if busy else []
+        if not left or time.monotonic() >= deadline:
+            return left
+        time.sleep(min(SETTLE_POLL, max(0, deadline - time.monotonic())))
 
 
 # --- operator CLI (hold/release/status) ------------------------------------

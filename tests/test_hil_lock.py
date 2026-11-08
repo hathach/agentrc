@@ -32,8 +32,8 @@ from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdo
 from pathlib import Path
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import (CUT_NAME, cut_comm_stat, guard_survivors, latest_failure, pid_alive, proc_open,  # noqa: E402
-                     taken_failure)
+from helpers import (CUT_NAME, claimant, cut_comm_stat, guard_survivors, kill_quietly, killed_claimant,  # noqa: E402
+                     latest_failure, pid_alive, proc_open, taken_failure)
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'hil' / 'scripts' / 'hil_lock.py'
 
@@ -2103,6 +2103,191 @@ class Pending(LockDir):
                 theirs.clear(lambda e: True)
             self.assertEqual(theirs.read(), [{'receipt': 'theirs'}])
         self.assertEqual([f for f in os.listdir(shared) if f.startswith('.')], [])
+
+
+class Claims(LockDir):
+    """PendingSessions.claim and remove, and invocation_state, logged_tokens and settle: the write-ahead claim a
+    consumer's invocation makes before its first tool, judged against real claimant processes and real run_tracked
+    supervisors (agentrc#467)."""
+
+    KIND = 'selftest-claim'
+
+    def setUp(self):
+        super().setUp()
+        self.record = hil_lock.PendingSessions(BOARD, self.KIND)
+        self.run = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.run, True)
+
+    def mine(self):
+        return hil_lock.claim_entry(hil_lock._process().state_dir(str(self.run / 'mine'), 'ops'), 'selftest')
+
+    def settled(self, receipt, wait=10):
+        deadline = time.monotonic() + wait
+        while hil_lock._process().recheck(receipt) != 'done':
+            self.assertLess(time.monotonic(), deadline, 'the supervisor never recorded done')
+            _sleep(0.1)
+
+    def test_a_claim_is_listed_write_ahead_and_returns_the_others(self):
+        me = self.mine()
+        self.assertEqual((me['cmd'], me['receipt']['pid'], me['receipt']['start']),
+                         ('selftest', os.getpid(), hil_lock.proc_start(os.getpid())))
+        self.assertEqual(me['receipt']['ops'], os.path.realpath(me['receipt']['ops']))
+        other = {'receipt': {'ops': '/x', 'pid': 1, 'start': '2'}, 'cmd': 'other'}
+        self.assertEqual(self.record.claim(other), [])
+        self.assertEqual(self.record.claim(me), [other])
+        self.assertEqual(self.record.claim(me), [other])     # claimed once
+        self.assertEqual(self.record.read(), [other, me])
+        for bad in ({'receipt': 'path'}, {'receipt': {'ops': '/x', 'pid': 0, 'start': '2'}},
+                    {'receipt': {'ops': '/x', 'pid': 1, 'start': None}}, {'cmd': 'x'}, 'x'):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self.record.claim(bad)
+        with mock.patch.object(hil_lock, 'proc_start', return_value=None), self.assertRaises(OSError):
+            hil_lock.claim_entry('/x', 'selftest')
+
+    def test_of_two_concurrent_claimants_the_later_sees_the_earlier_alive(self):
+        first, a = claimant(self, self.dir, BOARD, self.KIND, self.run / 'a')
+        second, b = claimant(self, self.dir, BOARD, self.KIND, self.run / 'b')
+        self.assertEqual(self.record.read(), [a['entry'], b['entry']])
+        others = self.record.claim(self.mine())
+        self.assertEqual(others, [a['entry'], b['entry']])
+        self.assertEqual([hil_lock.invocation_state(s) for s in others], [('alive', []), ('alive', [])])
+        first.stdin.close()
+        first.wait()
+        self.assertEqual(hil_lock.invocation_state(a['entry']), ('ended', []))   # gone, nothing left in its ops
+
+    def test_racing_claims_are_serialised_by_the_mutex(self):
+        go_r, go_w = os.pipe()
+        out_r, out_w = os.pipe()
+        pids = []
+        for n in range(2):
+            pid = os.fork()
+            if pid == 0:
+                code = 1
+                try:
+                    os.close(go_w)
+                    os.read(go_r, 1)
+                    entry = {'receipt': {'ops': f'/ops/{n}', 'pid': os.getpid(), 'start': hil_lock.proc_start(
+                        os.getpid())}, 'cmd': str(n)}
+                    others = self.record.claim(entry)
+                    os.write(out_w, (json.dumps([n, [e['cmd'] for e in others]]) + '\n').encode())
+                    code = 0
+                finally:
+                    os._exit(code)
+            pids.append(pid)
+        os.close(out_w)
+        os.close(go_r)
+        os.write(go_w, b'gg')
+        os.close(go_w)
+        with os.fdopen(out_r) as f:
+            seen = sorted(json.loads(line) for line in f)
+        for pid in pids:
+            self.assertEqual(os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]), 0)
+        self.assertEqual(sorted(len(others) for _, others in seen), [0, 1])   # the later lists the earlier
+        self.assertEqual(len(self.record.read()), 2)
+
+    def test_a_completion_while_another_is_alive_removes_only_its_own(self):
+        other, theirs = claimant(self, self.dir, BOARD, self.KIND, self.run / 'a')
+        me = self.mine()
+        self.record.claim(me)
+        before = self.record.read()
+        self.assertEqual(self.record.remove(me), [theirs['entry']])
+        self.assertEqual(self.record.read(), [theirs['entry']])
+        self.assertEqual(hil_lock.invocation_state(theirs['entry']), ('alive', []))
+        self.assertNotEqual(before, self.record.read())
+        data = Path(self.record.path).read_bytes()
+        self.assertEqual(self.record.remove(me), [theirs['entry']])   # not listed: nothing changes
+        self.assertEqual(Path(self.record.path).read_bytes(), data)
+        self.assertEqual(self.record.remove(theirs['entry']), [])
+        self.assertFalse(os.path.exists(self.record.path))
+        self.assertEqual(self.record.remove(me), [])       # no record at all
+        self.assertFalse(os.path.exists(self.record.path))
+
+    def test_remove_keeps_an_unreadable_record_and_refuses_a_malformed_entry(self):
+        Path(self.record.path).write_bytes(b'{')
+        with self.assertRaisesRegex(hil_lock.PendingRefused, 'unreadable'):
+            self.record.remove(self.mine())
+        self.assertEqual(Path(self.record.path).read_bytes(), b'{')
+        with self.assertRaises(ValueError):
+            self.record.remove({'cmd': 'x'})
+
+    def test_a_dead_claimant_whose_child_still_runs_is_unresolved_logged_and_never_settles(self):
+        dead, child = killed_claimant(self, self.dir, BOARD, self.KIND, self.run / 'dead')
+        fh = hil_lock.take_board_lock(BOARD, 'selftest', protected=True)
+        me = self.mine()
+        others = self.record.claim(me)
+        self.assertEqual(others, [dead])
+        state, receipts = hil_lock.invocation_state(dead)
+        self.assertEqual((state, len(receipts)), ('unresolved', 1))
+        self.assertEqual(hil_lock._process().recheck(receipts[0]), 'pending')
+        hil_lock.log_cleanup_failure(BOARD, 'selftest', detail='earlier invocation', task=dead['receipt'],
+                                     receipts=receipts)
+        self.record.remove(dead)
+        found = hil_lock.open_cleanup_failures(BOARD)
+        self.assertEqual((found[-1]['task'], found[-1]['receipts']), (dead['receipt'], receipts))
+        self.assertEqual(hil_lock.failure_report(found)['previousCleanupFailure']['id'], found[-1]['id'])
+        keep = hil_lock.logged_tokens(found)
+        self.assertEqual(keep, {receipts[0]['token']})
+        left = hil_lock.settle(receipts, 0.3)
+        self.assertEqual(len(left), 1)
+        self.assertIn('pending', left[0])
+        self.assertEqual(self.record.remove(me), [])      # still occupied: the attempt ends, its lock released
+        hil_lock.release_board_lock(fh)
+        self.assertTrue(self.flock_is_free())
+        kill_quietly(child)
+        self.settled(receipts[0])
+        self.assertEqual(hil_lock.invocation_state(dead, keep), ('ended', []))
+        self.assertEqual(len(os.listdir(dead['receipt']['ops'])), 3)    # kept: the logged failure rechecks them
+        self.assertEqual(hil_lock.resolve_restored(BOARD, found, evidence='restored'), [])
+        self.assertEqual(hil_lock.open_cleanup_failures(BOARD), [])
+
+    def test_a_dead_claimant_whose_children_ended_is_ended_and_tidied(self):
+        dead, child = killed_claimant(self, self.dir, BOARD, self.KIND, self.run / 'dead')
+        ops = dead['receipt']['ops']
+        self.assertEqual(hil_lock.invocation_state(dead)[0], 'unresolved')
+        kill_quietly(child)
+        receipt = hil_lock.invocation_state(dead)[1][0]
+        self.settled(receipt)
+        self.assertEqual(hil_lock.settle([receipt], 5), [])
+        self.assertEqual(hil_lock.invocation_state(dead), ('ended', []))
+        self.assertEqual(os.listdir(ops), [])
+
+    def test_a_running_claimant_whose_start_cannot_be_read_is_alive(self):
+        live = subprocess.Popen(['sleep', '30'])
+        self.addCleanup(live.wait)
+        self.addCleanup(live.kill)
+        entry = {'receipt': {'ops': str(self.run / 'none'), 'pid': live.pid, 'start': hil_lock.proc_start(live.pid)},
+                 'cmd': 'x'}
+        self.assertEqual(hil_lock.invocation_state(entry), ('alive', []))
+        with mock.patch.object(hil_lock, 'proc_start', return_value=None):
+            self.assertEqual(hil_lock.invocation_state(entry), ('alive', []))
+            with mock.patch.object(hil_lock.os, 'kill', side_effect=PermissionError):
+                self.assertEqual(hil_lock.invocation_state(entry), ('alive', []))
+        reused = {'receipt': dict(entry['receipt'], start='1'), 'cmd': 'x'}    # another start: the pid was reused
+        state, receipts = hil_lock.invocation_state(reused)
+        self.assertEqual((state, [list(r) for r in receipts]), ('unresolved', [['unrecheckable']]))
+        live.kill()
+        live.wait()
+        self.assertEqual(hil_lock.invocation_state(entry)[0], 'unresolved')    # gone; its ops dir is missing
+
+    def test_a_session_that_is_not_a_claim_stands_on_its_own_receipt(self):
+        live = {'token': 't', 'lock': '/nonexistent/hil_op_t.lock', 'record': '/nonexistent/hil_op_t.json'}
+        for session in ({'receipt': '/run/receipt.json'}, {'receipt': live}):
+            with self.subTest(session=session):
+                self.assertEqual(hil_lock.invocation_state(session), ('unresolved', [session['receipt']]))
+        with mock.patch.object(hil_lock, '_rechecks', return_value=['done']):
+            self.assertEqual(hil_lock.invocation_state({'receipt': live}), ('ended', []))
+
+    def test_settle_waits_for_the_consumers_own_probe_check_too(self):
+        users = [['JLinkExe -USB 123'], ['JLinkExe -USB 123'], []]
+        self.patch(hil_lock, 'SETTLE_POLL', 0.01)
+        self.assertEqual(hil_lock.settle([], 5, busy=lambda: users.pop(0)), [])
+        self.assertEqual(users, [])
+        self.assertEqual(hil_lock.settle([], 0.05, busy=lambda: ['JLinkExe -USB 123']), ['JLinkExe -USB 123'])
+
+    def test_logged_tokens_reads_only_whole_receipts(self):
+        failures = [{'receipts': [{'token': 'a'}, {'unrecheckable': ['x']}, 'path']}, {'receipts': 'x'},
+                    {'unavailable': 'unreadable'}, {'receipts': [{'token': 'b'}, {'token': 3}]}]
+        self.assertEqual(hil_lock.logged_tokens(failures), {'a', 'b'})
 
 
 class RechecksAs(LockDir):
