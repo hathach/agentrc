@@ -734,6 +734,22 @@ class StateDir(unittest.TestCase):
         got = hp.state_dir(run)
         self.assertEqual((mode(run), mode(got)), (0o755, 0o700))
 
+    def test_missing_ancestors_are_usable_whatever_the_umask(self):
+        for missing in (('a',), ('b', 'c')):
+            run = os.path.join(self.top, *missing, 'run')
+            with self.subTest(missing=missing), umask(0o777):
+                got = hp.state_dir(run)
+            made = [os.path.join(self.top, *missing[:i + 1]) for i in range(len(missing))]
+            self.assertEqual([mode(p) for p in (*made, run, got)], [0o755] * (len(made) + 1) + [0o700])
+
+    def test_a_refused_ancestor_leaves_nothing_behind(self):
+        Path(self.top, 'file').write_text('')
+        os.symlink(os.path.join(self.top, 'gone'), os.path.join(self.top, 'dangling'))
+        for top in ('file', 'dangling'):
+            with self.subTest(top=top), umask(0o777), self.assertRaises(OSError):
+                hp.state_dir(os.path.join(self.top, top, 'x', 'run'))
+        self.assertEqual(sorted(os.listdir(self.top)), ['dangling', 'file'])
+
     def test_a_file_is_refused(self):
         Path(self.top, 'run').write_text('')
         with self.assertRaisesRegex(PermissionError, 'file'):

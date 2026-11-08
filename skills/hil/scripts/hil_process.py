@@ -446,12 +446,13 @@ def trusted_dir(path: str) -> str:
 
 def _own_dir(path: str, mode: int) -> None:
     """`path`, absolute and normalized, created if missing, then set to `mode` whatever the umask; refused
-    (PermissionError), and never chmodded, unless its last component is a real directory of ours. Its ancestors are
-    the caller's to trust, as in trusted_dir."""
+    (PermissionError), and never chmodded, unless its last component is a real directory of ours. A missing ancestor
+    is made the same way at 0o755; an existing one is the caller's to trust, as in trusted_dir."""
     head, tail = os.path.split(path)
     if not tail:
         raise PermissionError(f'{path}: want a directory below /')
-    os.makedirs(head, exist_ok=True)
+    if not os.path.lexists(head):
+        _own_dir(head, 0o755)
     parent = os.open(head, os.O_PATH | os.O_DIRECTORY)
     try:
         with contextlib.suppress(FileExistsError):
@@ -477,7 +478,8 @@ def state_dir(parent: str, name: str = 'ops') -> str:
     """A run_tracked state dir: `parent` (the caller's run dir) and `parent/name` created as needed and set to 0o755
     and 0o700 whatever the umask, then returned through trusted_dir. An existing one of them is secured only when it
     is a real directory of ours; a link or another user's is refused (PermissionError) and left as it is, however
-    `parent` is spelled (a trailing slash, `.` or `..` are resolved lexically first)."""
+    `parent` is spelled (a trailing slash, `.` or `..` are resolved lexically first). Missing ancestors of `parent`
+    are created 0o755."""
     if not isinstance(name, str) or name in ('', '.', '..') or '/' in name or '\0' in name:
         raise ValueError(f'state dir name {name!r}: want a single path component')
     parent = os.path.abspath(os.fspath(parent))
