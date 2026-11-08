@@ -66,7 +66,7 @@ class BoundedRead(unittest.TestCase):
     def test_the_bound_is_the_default_not_an_opt_in(self):
         """An opt-in bound that ONE call site forgets lets a single wedged DUT stall every
         worker, not one. Three call sites forgot it once."""
-        for fn in (uo.read_sysfs, uo.usb_scan, uo.usb_node_serial):
+        for fn in (uo.read_sysfs, uo.usb_scan, uo.usb_absent, uo.usb_node_serial):
             default = inspect.signature(fn).parameters['timeout'].default
             self.assertEqual(default, uo.SYSFS_READ_GRACE,
                              f'{fn.__name__} must be bounded without being asked')
@@ -416,6 +416,75 @@ class UsbScan(unittest.TestCase):
         self.assertEqual([d['busport'] for d in uo.usb_scan(vid='cafe', serial='uid1')], ['1-1'],
                          'serial matches case-insensitively')
         self.assertEqual(uo.usb_scan(vid='cafe', serial='UID2'), [])
+
+
+class UsbAbsent(unittest.TestCase):
+    """usb_scan leaves out a device whose serial it could not read, which is right for finding
+    a board but wrong for proving one gone: a wedged device with the right VID:PID could be it."""
+
+    setUp = UsbScan.setUp
+    dev = UsbScan.dev
+    ID = ('cafe', '4010')
+
+    def wedged(self, name):
+        """A matching device whose serial read never answers; returns a callback that ends the
+        stranded reader."""
+        d = self.dev(name, *self.ID, serial=None)
+        os.mkfifo(d / 'serial')
+
+        def release():
+            deadline = time.monotonic() + 5
+            while True:
+                try:
+                    # EOF for the blocked reader; ENXIO until its thread has reached open()
+                    return os.close(os.open(d / 'serial', os.O_WRONLY | os.O_NONBLOCK))
+                except OSError:
+                    if time.monotonic() > deadline:
+                        raise
+                    time.sleep(0.01)
+        return release
+
+    def test_a_timed_out_serial_is_not_absence(self):
+        release = self.wedged('1-1')
+        self.assertFalse(uo.usb_absent(self.ID, 'UID1', timeout=0.05))
+        self.assertEqual(uo.usb_scan(self.ID, timeout=0.05), [], 'usb_scan returned an inconclusive device')
+        release()
+
+    def test_a_missing_serial_is_not_absence(self):
+        self.dev('1-1', *self.ID, serial=None)
+        self.assertFalse(uo.usb_absent(self.ID, 'UID1'))
+
+    def test_a_readable_other_serial_is_absence(self):
+        self.dev('1-1', *self.ID, serial='OTHER')
+        self.assertTrue(uo.usb_absent(self.ID, 'UID1'))
+
+    def test_the_matching_serial_is_presence_case_aside(self):
+        self.dev('1-1', *self.ID, serial='UID1')
+        self.assertFalse(uo.usb_absent(self.ID, 'uid1'))
+
+    def test_one_inconclusive_match_beside_a_conclusive_one_is_not_absence(self):
+        self.dev('1-1', *self.ID, serial='OTHER')
+        release = self.wedged('1-2')
+        self.assertFalse(uo.usb_absent(self.ID, 'UID1', timeout=0.05))
+        self.assertEqual([d['busport'] for d in uo.usb_scan(self.ID, timeout=0.05)], ['1-1'])
+        release()
+
+    def test_a_re_enumeration_during_the_read_is_not_absence(self):
+        self.dev('1-1', *self.ID, serial='OTHER')
+        real = uo.read_sysfs
+
+        def replacing(path, *a, **k):
+            os.rename(self.root / '1-1', self.root / 'old')       # the new node gets a new inode
+            self.dev('1-1', *self.ID, serial='OTHER')
+            return real(path, *a, **k)
+        patch(self, uo, 'read_sysfs', replacing)
+        self.assertFalse(uo.usb_absent(self.ID, 'UID1'))
+
+    def test_no_vid_pid_match_is_absence(self):
+        self.dev('1-1', *self.ID, serial='UID1')
+        self.assertTrue(uo.usb_absent(('cafe', '4012'), 'UID1'))
+        self.assertTrue(uo.usb_absent(vid='beef', serial='UID1'))
+        self.assertEqual(self.reads, [])
 
 
 class FakeRig:

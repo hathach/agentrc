@@ -137,8 +137,12 @@ helper and any cleanup state.
 - A runner that watches the bus (is the board enumerated, which process holds
   its usbfs node) loads this skill's `scripts/usb_observe.py` the way it loads
   the lock helper, one module instance per process; it observes only. Its
-  `jlink_serial_match` and `jlink_serial_candidates` decide whether a J-Link's
-  zero-padded serial is a roster uid.
+  `usb_scan` finds a present device and leaves out one whose `serial` read is
+  inconclusive (missing, unreadable, timed out, or across a re-enumeration);
+  an absence check uses `usb_absent(vid_pid, serial)`, which is false while
+  any VID:PID match is inconclusive. Its `jlink_serial_match` and
+  `jlink_serial_candidates` decide whether a J-Link's zero-padded serial is a
+  roster uid.
 
 ## Farm check
 
