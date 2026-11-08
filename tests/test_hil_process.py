@@ -9,6 +9,8 @@ if os.name == 'nt':
     raise unittest.SkipTest('hil_process needs POSIX sessions and process groups')
 
 import ast
+import errno
+import fcntl
 import importlib.util
 import inspect
 import io
@@ -744,6 +746,117 @@ class StateDir(unittest.TestCase):
         self.assertFalse(os.path.exists(run), 'a refused name created nothing')
 
 
+class RecheckDir(unittest.TestCase):
+    """recheck_dir over hil_op_<token>.{lock,json,log} files laid out by hand: a live supervisor's
+    lock is a flock this process holds; the real supervisor's cases are RunTracked's."""
+
+    def setUp(self):
+        top = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, top)
+        self.d = os.path.join(top, 'state')
+        os.mkdir(self.d, 0o700)
+
+    def op(self, token, cleanup='done', record=None, files=('lock', 'json', 'log')):
+        """The receipt recheck_dir rebuilds for `token`'s files, the record `{token, pid, start,
+        lock, cleanup}` unless `record` replaces its text."""
+        base = os.path.join(self.d, f'hil_op_{token}')
+        lock_id = None
+        if 'lock' in files:
+            os.close(os.open(f'{base}.lock', os.O_CREAT | os.O_WRONLY, 0o600))
+            st = os.stat(f'{base}.lock')
+            lock_id = [st.st_dev, st.st_ino]
+        if 'json' in files:
+            with open(os.open(f'{base}.json', os.O_CREAT | os.O_WRONLY, 0o600), 'w') as f:
+                f.write(record if record is not None else
+                        json.dumps({'token': token, 'pid': 7, 'start': 8, 'lock': lock_id, 'cleanup': cleanup}))
+        if 'log' in files:
+            Path(f'{base}.log').write_text('')
+        return {'token': token, 'supervisor': {'pid': 7, 'start': 8, 'lock': lock_id}, 'lock': f'{base}.lock',
+                'record': f'{base}.json', 'log': f'{base}.log', 'survivors': None}
+
+    def hold(self, receipt):
+        fd = os.open(receipt['lock'], os.O_RDONLY)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+
+    def test_none_found_is_done_and_other_files_are_not_operations(self):
+        for name in ('notes.txt', 'hil_op_.log', 'hil_op_a.json.tmp', 'hil_op_b.txt'):
+            Path(self.d, name).write_text('')
+        self.assertEqual(hp.recheck_dir(self.d), ('done', []))
+        self.assertEqual(len(os.listdir(self.d)), 4)
+
+    def test_done_is_tidied_unless_kept_and_pending_stays_open(self):
+        self.op('a')
+        kept = self.op('b')
+        live = self.op('c', cleanup='pending')
+        self.hold(live)
+        self.assertEqual(hp.recheck_dir(self.d, keep=('b',)), ('pending', [live]))
+        self.assertEqual(sorted(os.listdir(self.d)),
+                         sorted(os.path.basename(p) for r in (kept, live) for p in (r['lock'], r['record'], r['log'])))
+        self.assertEqual(hp.recheck(kept), 'done')
+
+    def test_an_incomplete_file_set_is_unknown_and_kept(self):
+        for token, files in (('l', ('log',)), ('k', ('lock', 'log')), ('r', ('lock', 'json')), ('j', ('json',))):
+            self.op(token, files=files)
+        verdict, entries = hp.recheck_dir(self.d)
+        self.assertEqual(verdict, 'unknown')
+        self.assertEqual([(e['token'], e['unrecheckable'], [os.path.basename(p) for p in e['files']]) for e in entries],
+                         [('j', 'no .lock or .log file', ['hil_op_j.json']),
+                          ('k', 'no .json file', ['hil_op_k.lock', 'hil_op_k.log']),
+                          ('l', 'no .lock or .json file', ['hil_op_l.log']),
+                          ('r', 'no .log file', ['hil_op_r.lock', 'hil_op_r.json'])])
+        self.assertEqual([hp.recheck(e) for e in entries], ['unknown'] * 4)
+        self.assertEqual(len(os.listdir(self.d)), 6)
+
+    def test_a_forged_or_malformed_record_is_unknown(self):
+        other = self.op('o')
+        cases = {'json': ('not json', 'record unreadable'), 'list': ('[1]', 'record of another operation'),
+                 'tok': (json.dumps({'token': 'x', 'lock': [1, 2], 'cleanup': 'done'}), 'record of another operation'),
+                 'nolock': (json.dumps({'token': 'nolock', 'cleanup': 'done'}), 'record names no lock')}
+        for token, (text, _) in cases.items():
+            self.op(token, record=text)
+        # done, but naming another operation's lock, or written where another user could write it
+        wrong = self.op('wrong', record=json.dumps({'token': 'wrong', 'lock': other['supervisor']['lock'],
+                                                    'cleanup': 'done'}))
+        loose = self.op('loose')
+        os.chmod(loose['record'], 0o620)
+        os.symlink(other['record'], os.path.join(self.d, 'hil_op_link.json'))
+        self.op('link', files=('lock', 'log'))
+        verdict, entries = hp.recheck_dir(self.d, keep=('o',))
+        self.assertEqual(verdict, 'unknown')
+        by_token = {e['token']: e for e in entries}
+        self.assertEqual(sorted(by_token), sorted([*cases, 'wrong', 'loose', 'link']))
+        for token, (_, why) in cases.items():
+            self.assertTrue(by_token[token]['unrecheckable'].startswith(why), by_token[token])
+        self.assertTrue(by_token['link']['unrecheckable'].startswith('record unreadable'))
+        self.assertEqual(by_token['wrong']['supervisor']['lock'], other['supervisor']['lock'])
+        self.assertEqual(by_token['loose'], loose)
+
+    def test_a_replaced_lock_is_unknown(self):
+        receipt = self.op('a')
+        old = os.open(receipt['lock'], os.O_RDONLY)    # its inode stays taken, so the new lock's differs
+        self.addCleanup(os.close, old)
+        os.unlink(receipt['lock'])
+        os.close(os.open(receipt['lock'], os.O_CREAT | os.O_WRONLY, 0o600))
+        self.assertEqual(hp.recheck_dir(self.d), ('unknown', [receipt]))
+        self.assertEqual(len(os.listdir(self.d)), 3)
+
+    def test_pending_and_unknown_together_are_unknown(self):
+        self.hold(self.op('a', cleanup='pending'))
+        self.op('b', files=('log',))
+        self.assertEqual([e['token'] for e in hp.recheck_dir(self.d)[1]], ['a', 'b'])
+        self.assertEqual(hp.recheck_dir(self.d)[0], 'unknown')
+
+    def test_an_untrusted_or_missing_state_dir_is_unknown(self):
+        self.op('a')
+        os.chmod(self.d, 0o770)
+        verdict, entries = hp.recheck_dir(self.d)
+        self.assertEqual((verdict, len(entries), hp.recheck(entries[0])), ('unknown', 1, 'unknown'))
+        self.assertIn(self.d, entries[0]['unrecheckable'])
+        self.assertEqual(len(os.listdir(self.d)), 3)
+        self.assertEqual(hp.recheck_dir(os.path.join(self.d, 'gone'))[0], 'unknown')
+
+
 # The prelude of every run_tracked case: hil_process loaded by file path as `hp`, the case's
 # state dir as `S`, scratch dir `D`, and report(), whose JSON line the test reads back.
 TRACKED_CHILD = """
@@ -1254,8 +1367,9 @@ class RunTracked(unittest.TestCase):
         """)
 
     def test_an_interrupt_right_after_the_files_go_still_says_done(self):
-        for name, nth, cmd, alarm in (('normal completion', 0, 'true', None),
-                                      ('interrupted completion', 1, 'sleep 30', 0.5)):
+        # the first tidy(receipt) is the spawn failure's
+        for name, nth, cmd, alarm in (('normal completion', 1, 'true', None),
+                                      ('interrupted completion', 2, 'sleep 30', 0.5)):
             with self.subTest(name):
                 res = self._interrupt_after('tidy(receipt)', nth, cmd, alarm)
                 self.assertEqual(res['fired'], 1)
@@ -1286,6 +1400,43 @@ class RunTracked(unittest.TestCase):
                 report(cleanup=e.cleanup, has_receipt=e.receipt is not None, after=settled(e.receipt))
         """)
         self.assertEqual((res['cleanup'], res['has_receipt'], res['after']), ('unknown', True, 'done'))
+
+    def test_recheck_dir_follows_a_live_supervisor_until_it_ends(self):
+        res = self.child("""
+            empty = hp.recheck_dir(S)
+            r = hp.run_tracked('sleep 30 </dev/null >/dev/null 2>&1 & echo $!', timeout=20, settle=0.3, state_dir=S)
+            pid = int(r.stdout)
+            hp.run_tracked('true', timeout=20, settle=1, state_dir=S)
+            live = hp.recheck_dir(S)
+            again = hp.recheck(live[1][0])
+            kill(pid)
+            settled(r.receipt)
+            kept = hp.recheck_dir(S, keep=(r.receipt['token'],))
+            files = sorted(os.listdir(S))
+            report(empty=empty, receipt=r.receipt, live=live, again=again, kept=kept, files=files,
+                   done=hp.recheck_dir(S), left=os.listdir(S), leftovers=[pid])
+        """)
+        receipt = res['receipt']
+        self.assertEqual(res['empty'], ['done', []])
+        self.assertEqual(res['live'], ['pending', [{**receipt, 'survivors': None}]])
+        self.assertEqual(res['again'], 'pending')
+        self.assertEqual(res['kept'], ['done', []])
+        self.assertEqual(res['files'], sorted(os.path.basename(receipt[k]) for k in ('lock', 'record', 'log')))
+        self.assertEqual((res['done'], res['left']), (['done', []], []))
+
+    def test_recheck_dir_never_proves_a_replaced_lock(self):
+        res = self.child("""
+            r = hp.run_tracked('sleep 30 </dev/null >/dev/null 2>&1 & echo $!', timeout=20, settle=0.3, state_dir=S)
+            pid = int(r.stdout)
+            os.unlink(r.receipt['lock'])
+            os.close(os.open(r.receipt['lock'], os.O_CREAT | os.O_WRONLY, 0o600))
+            forged = hp.recheck_dir(S)
+            kill(pid)
+            time.sleep(0.5)
+            report(receipt=r.receipt, forged=forged, after=hp.recheck_dir(S), files=len(os.listdir(S)), leftovers=[pid])
+        """)
+        self.assertEqual(res['forged'], ['unknown', [{**res['receipt'], 'survivors': None}]])
+        self.assertEqual((res['after'][0], res['files']), ('unknown', 3))
 
     def test_a_spawn_error_started_nothing(self):
         res = self.child("""
@@ -1378,6 +1529,16 @@ class RunTracked(unittest.TestCase):
             Path(receipt['log']).write_text('')
             hp.tidy({'lock': None, 'log': receipt['log']})     # no record path, an unusable lock path
             self.assertEqual(os.listdir(d), [])
+
+    def test_a_supervisor_that_never_starts_leaves_no_file(self):
+        with tempfile.TemporaryDirectory() as top:
+            d = os.path.join(top, 'state')
+            os.mkdir(d, 0o700)
+            eagain = OSError(errno.EAGAIN, 'Resource temporarily unavailable')
+            with mock.patch.object(hp.subprocess, 'Popen', side_effect=eagain), self.assertRaises(OSError) as cm:
+                hp.run_tracked(['true'], timeout=T, settle=1, state_dir=d)
+            self.assertEqual((cm.exception.errno, cm.exception.cleanup, cm.exception.receipt, os.listdir(d)),
+                             (errno.EAGAIN, 'done', None, []))
 
     def test_the_survey_lists_unreadable_entries_apart(self):
         p = subprocess.Popen(['sleep', '30'])

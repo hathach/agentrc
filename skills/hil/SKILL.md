@@ -353,7 +353,7 @@ recovery stay the contract's.
 | `hil_boards.py` | each board's flasher from the board registry by probe serial (Board registry above) |
 | `hil_load.py` | the one path loader: one module per file per process, a second path under one name refused |
 | `agentrc_source.py` | the identity of the agentrc a harness loads: its closure, commit and digests, the staged copy and its manifest, drift, the record comparison |
-| `hil_process.py` | `run_cmd`, a bounded command; `run_tracked` and `recheck`, a command whose end is proven; `state_dir`, a directory it trusts |
+| `hil_process.py` | `run_cmd`, a bounded command; `run_tracked` and `recheck`, a command whose end is proven; `state_dir`, a directory it trusts; `recheck_dir`, every operation in one |
 | `hil_farm_check.py` | the farm check engine a project's launcher drives with its profile (Farm check above) |
 | `hil_report_notice.py` | the unavailable notice and the report writer lock, loadable when the core is not (`write_unavailable`) |
 | `hil_openocd_esp_receipt.py` | an `openocd_esp` session's state from its receipt, loadable without the provider (`session_state`) |
@@ -399,6 +399,16 @@ recovery stay the contract's.
   0755 and `run_dir/name` 0700, each created or, when it is already a real
   directory of the caller's, chmodded; a link or another user's directory is
   refused (`PermissionError`) and left as it is.
+- `recheck_dir(state_dir, keep=())` owns run_tracked's file layout: it
+  rebuilds a receipt for each operation with a file in the state dir, the
+  supervisor's identity from its record, rechecks it, and tidies a `done` one
+  unless its token is in `keep`. It returns `(verdict, open)`: `done` when every
+  operation is (none included), `pending` when every open one is, else
+  `unknown`. `open` lists receipts `recheck` and `tidy` take, or, for one whose
+  lock, record or log is missing or whose record is unreadable or names no lock
+  of its own, a diagnostic `{token, unrecheckable, files}` that `recheck`
+  answers `unknown` and a human removes; an untrusted or unreadable state dir
+  is `('unknown', [{unrecheckable}])`.
 - A report is published through `hil_report_core`: the JSON is authoritative
   and the Markdown a view `prepare_pair` regenerates from it. An attempt that
   cannot publish recovers through `recover_publish` (a Markdown repair, or a

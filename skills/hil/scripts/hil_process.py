@@ -38,6 +38,7 @@ Contract:
   whatever the umask. Files of a `done` run are removed only once
   the verdict is on the result or exception; the others stay for recheck and are the
   caller's to remove (`tidy`, once a recheck answers `done`). A missing file reads as unknown.
+  `recheck_dir` rechecks and tidies every operation in a state dir from its files alone.
 """
 
 from __future__ import annotations
@@ -655,11 +656,13 @@ def tidy(receipt) -> None:
 def recheck(receipt: dict) -> str:
     """'done', 'pending' or 'unknown' for a run_tracked receipt, from its supervisor's own
     state: its lock, the file it created, is held while it lives, and its record, a file of
-    ours, says `done` only once nothing is left. Anything unverifiable is unknown."""
+    ours, says `done` only once nothing is left. Anything unverifiable is unknown, a receipt
+    without a token or paths included (recheck_dir's `unrecheckable` entries)."""
     try:
+        token = receipt['token']
         trusted_dir(os.path.dirname(receipt['lock']))
         fd = os.open(receipt['lock'], os.O_RDONLY | os.O_NOFOLLOW)
-    except OSError:
+    except (OSError, KeyError, TypeError):
         return 'unknown'
     try:
         st = os.fstat(fd)
@@ -677,11 +680,70 @@ def recheck(receipt: dict) -> str:
         except (OSError, ValueError):
             return 'unknown'
         ours = stat.S_ISREG(rst.st_mode) and rst.st_uid == os.geteuid() and not rst.st_mode & 0o022
-        done = ours and isinstance(rec, dict) and rec.get('token') == receipt['token'] \
+        done = ours and isinstance(rec, dict) and rec.get('token') == token \
             and rec.get('lock') == lock_id and rec.get('cleanup') == 'done'
         return 'done' if done else 'unknown'
     finally:
         os.close(fd)
+
+
+_OP_PREFIX, _OP_FILES = 'hil_op_', ('lock', 'json', 'log')
+
+
+def _dir_receipt(state_dir: str, token: str, found: set) -> dict:
+    """The receipt of `token`'s files, the supervisor's identity from its record; else a diagnostic
+    entry: `token`, `unrecheckable` (why) and the `files` there, which recheck answers unknown."""
+    base = os.path.join(state_dir, f'{_OP_PREFIX}{token}')
+    paths = {ext: f'{base}.{ext}' for ext in _OP_FILES}
+
+    def unrecheckable(why: str) -> dict:
+        return {'token': token, 'unrecheckable': why, 'files': [paths[ext] for ext in _OP_FILES if ext in found]}
+    if missing := [ext for ext in _OP_FILES if ext not in found]:
+        return unrecheckable(f'no {" or ".join(f".{ext}" for ext in missing)} file')
+    try:
+        with os.fdopen(os.open(paths['json'], os.O_RDONLY | os.O_NOFOLLOW)) as f:
+            rec = json.load(f)
+    except (OSError, ValueError) as e:
+        return unrecheckable(f'record unreadable: {e}')
+    if not isinstance(rec, dict) or rec.get('token') != token:
+        return unrecheckable('record of another operation')
+    lock = rec.get('lock')
+    if not (isinstance(lock, list) and len(lock) == 2 and all(type(v) is int for v in lock)):
+        return unrecheckable('record names no lock')
+    return {'token': token, 'supervisor': {'pid': rec.get('pid'), 'start': rec.get('start'), 'lock': lock},
+            'lock': paths['lock'], 'record': paths['json'], 'log': paths['log'], 'survivors': None}
+
+
+def recheck_dir(state_dir: str, keep=()) -> tuple:
+    """(verdict, open entries) for every run_tracked operation with a file in `state_dir`, from
+    those files alone. Each is rebuilt as a receipt whose supervisor identity is its record's,
+    and rechecked; one whose lock, record or log is missing, or whose record is unreadable or
+    names no lock of its own, is unknown. A `done` one is tidied unless its token is in `keep`.
+    verdict: 'done' when every one is done (none found included), 'pending' when the open ones
+    all are, else 'unknown'. Open entries: receipts recheck and tidy accept, or diagnostics with
+    `unrecheckable` (why) and the `files` left, which recheck answers unknown; an untrusted or
+    unreadable state_dir is ('unknown', [{'unrecheckable': why}])."""
+    try:
+        real = trusted_dir(state_dir)
+        names = os.listdir(real)
+    except OSError as e:
+        return 'unknown', [{'unrecheckable': f'{state_dir}: {e}'}]
+    found = {}
+    for name in names:
+        stem, _, ext = name.partition('.')
+        if stem.startswith(_OP_PREFIX) and stem != _OP_PREFIX and ext in _OP_FILES:
+            found.setdefault(stem[len(_OP_PREFIX):], set()).add(ext)
+    verdicts, entries = set(), []
+    for token in sorted(found):
+        entry = _dir_receipt(real, token, found[token])
+        verdict = 'unknown' if 'unrecheckable' in entry else recheck(entry)
+        if verdict == 'done':
+            if token not in keep:
+                tidy(entry)
+            continue
+        verdicts.add(verdict)
+        entries.append(entry)
+    return ('done' if not verdicts else 'pending' if verdicts == {'pending'} else 'unknown'), entries
 
 
 def run_tracked(cmd: str | list, cwd: str | None = None, *, timeout: float, settle: float, state_dir: str,
@@ -696,11 +758,11 @@ def run_tracked(cmd: str | list, cwd: str | None = None, *, timeout: float, sett
         # the job crosses to the supervisor as JSON: path-like arguments as run_cmd's Popen takes them
         argv = cmd if isinstance(cmd, str) else [os.fspath(a) for a in cmd]
         cwd = None if cwd is None else os.fspath(cwd)
-        base = os.path.join(trusted_dir(state_dir), f'hil_op_{secrets.token_hex(8)}')
+        base = os.path.join(trusted_dir(state_dir), f'{_OP_PREFIX}{secrets.token_hex(8)}')
         log = open(f'{base}.log', 'xb')
     except BaseException as e:
         raise _attach(e, 'done', None)
-    receipt = {'token': os.path.basename(base)[len('hil_op_'):], 'supervisor': None, 'lock': f'{base}.lock',
+    receipt = {'token': os.path.basename(base)[len(_OP_PREFIX):], 'supervisor': None, 'lock': f'{base}.lock',
                'record': f'{base}.json', 'log': f'{base}.log', 'survivors': None}
     rfd, wfd = os.pipe()
     reports = _Reports(rfd)
@@ -717,6 +779,7 @@ def run_tracked(cmd: str | list, cwd: str | None = None, *, timeout: float, sett
         os.close(wfd)
         log.close()
         _attach(e, 'done', None)        # no supervisor, so no operation either
+        tidy(receipt)
         hold.release()
         raise
     os.close(wfd)
