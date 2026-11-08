@@ -2221,6 +2221,23 @@ class Claims(LockDir):
         return ({f: json.loads(Path(self.dir, f).read_text()) for f in names if f.endswith('.json')},
                 [f for f in names if f.endswith(hil_lock.CLAIM_RETIRED)])
 
+    def as_another_user(self):
+        """(argv running python as root, a root-owned 01777 claim dir it shares with us as BOARD_LOCK_DIR); skips
+        without root or sudo -n."""
+        if os.geteuid() == 0:
+            argv = [sys.executable]
+        elif shutil.which('sudo') and subprocess.run(['sudo', '-n', 'true'], capture_output=True).returncode == 0:
+            argv = ['sudo', '-n', sys.executable]
+        else:
+            self.skipTest('needs root, or sudo -n, to act as another OS user')
+        shared = tempfile.mkdtemp(prefix='hil-lock-claim-', dir='/tmp')
+        root = argv[:-1]
+        self.addCleanup(subprocess.run, [*root, 'rm', '-rf', shared])
+        os.chmod(shared, 0o1777)
+        subprocess.run([*root, 'chown', '0:0', shared], check=True)    # as the host step makes it: root's
+        self.patch(hil_lock, 'BOARD_LOCK_DIR', shared)
+        return argv, shared
+
     def test_a_completion_while_another_is_alive_removes_only_its_own(self):
         other, theirs = claimant(self, self.dir, BOARD, self.KIND, self.run / 'a')
         me = self.mine()
@@ -2294,18 +2311,7 @@ class Claims(LockDir):
             self.record.remove({'cmd': 'x'})
 
     def test_another_os_user_claims_beside_a_dead_claim_and_retires_it(self):
-        if os.geteuid() == 0:
-            argv = [sys.executable]
-        elif shutil.which('sudo') and subprocess.run(['sudo', '-n', 'true'], capture_output=True).returncode == 0:
-            argv = ['sudo', '-n', sys.executable]
-        else:
-            self.skipTest('needs root, or sudo -n, to act as another OS user')
-        shared = tempfile.mkdtemp(prefix='hil-lock-claim-', dir='/tmp')
-        root = argv[:-1]
-        self.addCleanup(subprocess.run, [*root, 'rm', '-rf', shared])
-        os.chmod(shared, 0o1777)
-        subprocess.run([*root, 'chown', '0:0', shared], check=True)    # as the host step makes it: root's
-        self.patch(hil_lock, 'BOARD_LOCK_DIR', shared)
+        argv, shared = self.as_another_user()
         dead = {'receipt': {'ops': '/x', 'pid': 2 ** 22 + 1, 'start': '2'}, 'cmd': 'dead'}     # beyond pid_max
         self.record.claim(dead)
         ours = sorted(os.listdir(shared))
@@ -2327,18 +2333,7 @@ class Claims(LockDir):
     def test_another_os_user_is_held_off_while_a_dead_claimants_child_runs_then_admitted(self):
         """agentrc#484 X1: the other user cannot read the claimant's 0700 ops dir, so its supervisors decide from
         /proc; it was admitted (unknown) while the child still ran."""
-        if os.geteuid() == 0:
-            argv = [sys.executable]
-        elif shutil.which('sudo') and subprocess.run(['sudo', '-n', 'true'], capture_output=True).returncode == 0:
-            argv = ['sudo', '-n', sys.executable]
-        else:
-            self.skipTest('needs root, or sudo -n, to act as another OS user')
-        shared = tempfile.mkdtemp(prefix='hil-lock-claim-', dir='/tmp')
-        root = argv[:-1]
-        self.addCleanup(subprocess.run, [*root, 'rm', '-rf', shared])
-        os.chmod(shared, 0o1777)
-        subprocess.run([*root, 'chown', '0:0', shared], check=True)
-        self.patch(hil_lock, 'BOARD_LOCK_DIR', shared)
+        argv, shared = self.as_another_user()
         dead, child = killed_claimant(self, shared, BOARD, self.KIND, self.run / 'dead')
 
         def judged():
