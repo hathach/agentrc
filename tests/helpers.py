@@ -397,9 +397,27 @@ def claimant(case, lock_dir, board, kind, run_dir, cmd=''):
     return p, json.loads(p.stdout.readline())
 
 
-def kill_quietly(pid):
+def kill_quietly(pid, sig=signal.SIGTERM):
     with contextlib.suppress(ProcessLookupError):
-        os.kill(pid, signal.SIGKILL)
+        os.kill(pid, sig)
+
+
+def wait_done(recheck, receipt, wait=10):
+    """Until `recheck` (hil_process's) answers done for `receipt`; AssertionError past `wait` s."""
+    deadline = time.monotonic() + wait
+    while recheck(receipt) != 'done':
+        if time.monotonic() > deadline:
+            raise AssertionError(f'{receipt.get("token")} never rechecked done')
+        time.sleep(0.1)
+
+
+@contextlib.contextmanager
+def umask(mask):
+    old = os.umask(mask)
+    try:
+        yield
+    finally:
+        os.umask(old)
 
 
 # a child that outlives its command: its run_tracked supervisor stays, holding its lock (`pending`); prints its pid
@@ -411,7 +429,7 @@ def killed_claimant(case, lock_dir, board, kind, run_dir, cmd=LEFT_CHILD):
     still runs under its supervisor: (its claim entry, the child's pid, killed by a cleanup)."""
     p, out = claimant(case, lock_dir, board, kind, run_dir, cmd)
     child = int(out['stdout'])
-    case.addCleanup(kill_quietly, child)
+    case.addCleanup(kill_quietly, child, signal.SIGKILL)
     p.kill()
     p.wait()
     return out['entry'], child

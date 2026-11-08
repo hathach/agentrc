@@ -33,7 +33,7 @@ from pathlib import Path
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from helpers import (CUT_NAME, claimant, cut_comm_stat, guard_survivors, kill_quietly, killed_claimant,  # noqa: E402
-                     latest_failure, pid_alive, proc_open, taken_failure)
+                     latest_failure, pid_alive, proc_open, proc_stat, taken_failure, wait_done)
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'hil' / 'scripts' / 'hil_lock.py'
 
@@ -436,7 +436,7 @@ class DetachedHolder(LockDir):
             self.assertEqual(hil_lock.cmd_hold(boards, 'selftest hold'), 0)
         info = hil_lock.read_record(BOARD)
         pid = info['pid']
-        self.addCleanup(self.kill_quietly, pid)
+        self.addCleanup(kill_quietly, pid)
         self.assertIn('held: ', out.getvalue())
         self.assertNotEqual(pid, os.getpid())
         self.assertNotEqual(os.getsid(pid), os.getsid(0))
@@ -470,7 +470,7 @@ class DetachedHolder(LockDir):
         self.patch(hil_lock, 'clear_record', slow_second_clear)
         with quiet():
             self.assertEqual(hil_lock.cmd_hold(boards, 'selftest hold'), 0)
-        self.addCleanup(self.kill_quietly, hil_lock.read_record(BOARD)['pid'])
+        self.addCleanup(kill_quietly, hil_lock.read_record(BOARD)['pid'])
         with quiet():
             self.assertEqual(hil_lock.cmd_release([BOARD]), 0)
         for b in boards:
@@ -486,7 +486,7 @@ class DetachedHolder(LockDir):
         self.patch(hil_lock, 'clear_record', clear_then_linger)
         with quiet():
             self.assertEqual(hil_lock.cmd_hold([BOARD], 'selftest hold'), 0)
-        self.addCleanup(self.kill_quietly, hil_lock.read_record(BOARD)['pid'])
+        self.addCleanup(kill_quietly, hil_lock.read_record(BOARD)['pid'])
         with quiet():
             self.assertEqual(hil_lock.cmd_release([BOARD]), 0)
         self.assertTrue(self.flock_is_free())
@@ -503,7 +503,7 @@ class DetachedHolder(LockDir):
         self.patch(hil_lock, 'clear_record', slow_other_clear)
         with quiet():
             self.assertEqual(hil_lock.cmd_hold([BOARD, other], 'selftest hold'), 0)
-        self.addCleanup(self.kill_quietly, hil_lock.read_record(BOARD)['pid'])
+        self.addCleanup(kill_quietly, hil_lock.read_record(BOARD)['pid'])
         self.patch(hil_lock, '_boards_of', lambda pid, start: [])     # as if scanned before `other` was recorded
         with quiet():
             self.assertEqual(hil_lock.cmd_release([BOARD]), 0)
@@ -518,7 +518,7 @@ class DetachedHolder(LockDir):
             with self.subTest(named=named), ExitStack() as stack:
                 with quiet():
                     self.assertEqual(hil_lock.cmd_hold([BOARD, other], 'selftest hold'), 0)
-                stack.callback(self.kill_quietly, hil_lock.read_record(BOARD)['pid'])
+                stack.callback(kill_quietly, hil_lock.read_record(BOARD)['pid'])
 
                 def signal_then_replace(fd, sig):
                     real(fd, sig)
@@ -550,7 +550,7 @@ class DetachedHolder(LockDir):
         with quiet():
             self.assertEqual(hil_lock.cmd_hold([BOARD], 'selftest hold'), 0)
         pid = hil_lock.read_record(BOARD)['pid']
-        self.addCleanup(self.kill_quietly, pid)
+        self.addCleanup(kill_quietly, pid)
         real = hil_lock.signal.pidfd_send_signal
         self.patch(hil_lock.signal, 'pidfd_send_signal', lambda fd, sig: real(fd, signal.SIGKILL))
         self.patch(hil_lock, 'RELEASE_WAIT', 0.2)
@@ -569,7 +569,7 @@ class DetachedHolder(LockDir):
         self.patch(hil_lock, 'clear_record', failing_other_clear)
         with quiet():
             self.assertEqual(hil_lock.cmd_hold([BOARD, other], 'selftest hold'), 0)
-        self.addCleanup(self.kill_quietly, hil_lock.read_record(BOARD)['pid'])
+        self.addCleanup(kill_quietly, hil_lock.read_record(BOARD)['pid'])
         real_scan, scans = hil_lock._boards_of, []
 
         def first_scan_before_other(pid, start):
@@ -594,7 +594,7 @@ class DetachedHolder(LockDir):
     def test_a_repeated_name_holds_once(self):
         with quiet() as (out, _):
             self.assertEqual(hil_lock.cmd_hold([BOARD, BOARD], 'selftest hold'), 0)
-        self.addCleanup(self.kill_quietly, hil_lock.read_record(BOARD)['pid'])
+        self.addCleanup(kill_quietly, hil_lock.read_record(BOARD)['pid'])
         self.assertEqual(out.getvalue().strip(), f'held: {BOARD}')
         self.assertTrue(hil_lock.is_locked(BOARD))
 
@@ -666,7 +666,7 @@ class DetachedHolder(LockDir):
                 text = holder.read_text() if holder.exists() else ''
                 _sleep(0.01)
             pid = int(text)
-            self.addCleanup(self.kill_quietly, pid, signal.SIGKILL)     # a takeover holder ignores SIGTERM
+            self.addCleanup(kill_quietly, pid, signal.SIGKILL)     # a takeover holder ignores SIGTERM
             while time.monotonic() < deadline:
                 if not pid_alive(pid):
                     return True
@@ -697,7 +697,7 @@ class DetachedHolder(LockDir):
         with quiet() as (_, err):
             self.assertEqual(hil_lock.cmd_hold([BOARD], 'selftest hold'), 1)
         if rec := hil_lock.read_record(BOARD):
-            self.addCleanup(self.kill_quietly, rec['pid'], signal.SIGKILL)
+            self.addCleanup(kill_quietly, rec['pid'], signal.SIGKILL)
         self.assertIn('holder failed to acquire locks', err.getvalue())
         deadline = time.monotonic() + 10
         while not self.flock_is_free() and time.monotonic() < deadline:
@@ -709,13 +709,6 @@ class DetachedHolder(LockDir):
         deadline = time.monotonic() + 10
         while any(hil_lock.read_record(b) for b in boards) and time.monotonic() < deadline:
             _sleep(0.02)
-
-    @staticmethod
-    def kill_quietly(pid, sig=signal.SIGTERM):
-        try:
-            os.kill(pid, sig)
-        except ProcessLookupError:
-            pass
 
 
 class SafeFiles(LockDir):
@@ -869,7 +862,7 @@ class SignalsOnlyProvenHolds(LockDir):
         with quiet():
             self.assertEqual(hil_lock.cmd_hold([BOARD], 'selftest hold'), 0)
         pid = hil_lock.read_record(BOARD)['pid']
-        self.addCleanup(DetachedHolder.kill_quietly, pid)
+        self.addCleanup(kill_quietly, pid)
         with quiet() as (out, _):
             self.assertEqual(hil_lock.cmd_release([BOARD]), 0)
         self.assertEqual(self.signals, [signal.SIGTERM])
@@ -915,7 +908,7 @@ class LeftCleanup(LockDir):
         with quiet():
             self.assertEqual(hil_lock.cmd_hold([BOARD], 'selftest hold'), 0)
         rec = hil_lock.read_record(BOARD)
-        self.addCleanup(DetachedHolder.kill_quietly, rec['pid'])
+        self.addCleanup(kill_quietly, rec['pid'])
         self.assertEqual(rec['reason'], 'selftest hold')
         self.assertEqual(len([e for e in hil_lock.cleanup_events(BOARD) if e['event'] == 'failed']), 2)
 
@@ -1376,7 +1369,7 @@ def start_legacy_holder(test, boards, uid=None, **fields):
     os.close(w)
 
     def reap():
-        DetachedHolder.kill_quietly(pid, signal.SIGKILL)
+        kill_quietly(pid, signal.SIGKILL)
         with suppress(ChildProcessError):     # reaped by the test
             os.waitpid(pid, 0)
     test.addCleanup(reap)
@@ -2121,12 +2114,6 @@ class Claims(LockDir):
     def mine(self):
         return hil_lock.claim_entry(hil_lock._process().state_dir(str(self.run / 'mine'), 'ops'), 'selftest')
 
-    def settled(self, receipt, wait=10):
-        deadline = time.monotonic() + wait
-        while hil_lock._process().recheck(receipt) != 'done':
-            self.assertLess(time.monotonic(), deadline, 'the supervisor never recorded done')
-            _sleep(0.1)
-
     def test_a_claim_is_listed_write_ahead_and_returns_the_others(self):
         me = self.mine()
         self.assertEqual((me['cmd'], me['receipt']['pid'], me['receipt']['start']),
@@ -2210,44 +2197,29 @@ class Claims(LockDir):
         with self.assertRaises(ValueError):
             self.record.remove({'cmd': 'x'})
 
-    def test_a_dead_claimant_whose_child_still_runs_is_unresolved_logged_and_never_settles(self):
+    def test_a_dead_claimant_whose_child_still_runs_is_unresolved_and_pending_until_it_ends(self):
         dead, child = killed_claimant(self, self.dir, BOARD, self.KIND, self.run / 'dead')
-        fh = hil_lock.take_board_lock(BOARD, 'selftest', protected=True)
-        me = self.mine()
-        others = self.record.claim(me)
-        self.assertEqual(others, [dead])
         state, receipts = hil_lock.invocation_state(dead)
         self.assertEqual((state, len(receipts)), ('unresolved', 1))
-        self.assertEqual(hil_lock._process().recheck(receipts[0]), 'pending')
-        hil_lock.log_cleanup_failure(BOARD, 'selftest', detail='earlier invocation', task=dead['receipt'],
-                                     receipts=receipts)
-        self.record.remove(dead)
-        found = hil_lock.open_cleanup_failures(BOARD)
-        self.assertEqual((found[-1]['task'], found[-1]['receipts']), (dead['receipt'], receipts))
-        self.assertEqual(hil_lock.failure_report(found)['previousCleanupFailure']['id'], found[-1]['id'])
-        keep = hil_lock.logged_tokens(found)
-        self.assertEqual(keep, {receipts[0]['token']})
-        left = hil_lock.settle(receipts, 0.3)
-        self.assertEqual(len(left), 1)
-        self.assertIn('pending', left[0])
-        self.assertEqual(self.record.remove(me), [])      # still occupied: the attempt ends, its lock released
-        hil_lock.release_board_lock(fh)
-        self.assertTrue(self.flock_is_free())
-        kill_quietly(child)
-        self.settled(receipts[0])
+        self.assertEqual(hil_lock.settle(receipts, 0.3), (['pending'], []))      # waited out, still pending
+        failure = hil_lock.log_cleanup_failure(BOARD, 'selftest', detail='earlier', task=dead['receipt'],
+                                               receipts=receipts)
+        keep = hil_lock.logged_tokens(hil_lock.open_cleanup_failures(BOARD))
+        self.assertEqual(keep, {hil_lock.receipt_token(receipts[0])})
+        kill_quietly(child, signal.SIGKILL)
+        wait_done(hil_lock._process().recheck, receipts[0])
         self.assertEqual(hil_lock.invocation_state(dead, keep), ('ended', []))
         self.assertEqual(len(os.listdir(dead['receipt']['ops'])), 3)    # kept: the logged failure rechecks them
-        self.assertEqual(hil_lock.resolve_restored(BOARD, found, evidence='restored'), [])
-        self.assertEqual(hil_lock.open_cleanup_failures(BOARD), [])
+        self.assertEqual(hil_lock.resolve_restored(BOARD, [failure], evidence='restored'), [])
 
     def test_a_dead_claimant_whose_children_ended_is_ended_and_tidied(self):
         dead, child = killed_claimant(self, self.dir, BOARD, self.KIND, self.run / 'dead')
         ops = dead['receipt']['ops']
         self.assertEqual(hil_lock.invocation_state(dead)[0], 'unresolved')
-        kill_quietly(child)
+        kill_quietly(child, signal.SIGKILL)
         receipt = hil_lock.invocation_state(dead)[1][0]
-        self.settled(receipt)
-        self.assertEqual(hil_lock.settle([receipt], 5), [])
+        wait_done(hil_lock._process().recheck, receipt)
+        self.assertEqual(hil_lock.settle([receipt], 5), (['done'], []))
         self.assertEqual(hil_lock.invocation_state(dead), ('ended', []))
         self.assertEqual(os.listdir(ops), [])
 
@@ -2256,12 +2228,33 @@ class Claims(LockDir):
         self.assertTrue(hil_lock.claim_alive(out['entry']))
         p.kill()                               # not waited: a zombie whose /proc start still matches
         deadline = time.monotonic() + 10
-        while Path(f'/proc/{p.pid}/stat').read_text().rpartition(')')[2].split()[0] != 'Z':
+        while proc_stat(p.pid)[1] != 'Z':
             self.assertLess(time.monotonic(), deadline)
             _sleep(0.05)
         self.assertEqual(hil_lock.proc_start(p.pid), out['entry']['receipt']['start'])
         self.assertFalse(hil_lock.claim_alive(out['entry']))
         self.assertEqual(hil_lock.invocation_state(out['entry']), ('ended', []))
+
+    def test_a_zombie_leader_with_a_live_thread_is_alive(self):
+        exit_nr = {'x86_64': 60, 'aarch64': 93}.get(os.uname().machine)
+        if exit_nr is None:
+            self.skipTest(f'no exit(2) syscall number for {os.uname().machine}')
+        # the leader ends only itself (exit(2), not exit_group); its other thread keeps running
+        code = (f'import ctypes, sys, threading, time\n'
+                f'threading.Thread(target=time.sleep, args=(30,)).start()\n'
+                f'print("ready", flush=True)\nctypes.CDLL(None).syscall({exit_nr}, 0)\n')
+        p = subprocess.Popen([sys.executable, '-I', '-c', code], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(p.wait)
+        self.addCleanup(p.kill)
+        self.addCleanup(p.stdout.close)
+        self.assertEqual(p.stdout.readline().strip(), 'ready')
+        start = hil_lock.proc_start(p.pid)
+        deadline = time.monotonic() + 10
+        while proc_stat(p.pid)[1] != 'Z':
+            self.assertLess(time.monotonic(), deadline)
+            _sleep(0.05)
+        entry = {'receipt': {'ops': str(self.run / 'none'), 'pid': p.pid, 'start': start}, 'cmd': 'x'}
+        self.assertTrue(hil_lock.claim_alive(entry))
 
     def test_a_running_claimant_whose_start_cannot_be_read_is_alive(self):
         live = subprocess.Popen(['sleep', '30'])
@@ -2298,15 +2291,23 @@ class Claims(LockDir):
     def test_settle_waits_for_the_consumers_own_probe_check_too(self):
         users = [['JLinkExe -USB 123'], ['JLinkExe -USB 123'], []]
         self.patch(hil_lock, 'SETTLE_POLL', 0.01)
-        self.assertEqual(hil_lock.settle([], 5, busy=lambda: users.pop(0)), [])
+        self.assertEqual(hil_lock.settle([], 5, busy=lambda: users.pop(0)), ([], []))
         self.assertEqual(users, [])
-        self.assertEqual(hil_lock.settle([], 0.05, busy=lambda: ['JLinkExe -USB 123']), ['JLinkExe -USB 123'])
+        self.assertEqual(hil_lock.settle([], 0.05, busy=lambda: ['JLinkExe -USB 123']), ([], ['JLinkExe -USB 123']))
+
+    def test_settle_returns_at_once_when_nothing_is_pending(self):
+        never = {'token': 'u', 'unrecheckable': 'no .json file', 'files': []}
+        started = time.monotonic()
+        self.assertEqual(hil_lock.settle([never], 30), (['unknown'], []))
+        self.assertLess(time.monotonic() - started, 5)
 
     def test_logged_tokens_reads_only_whole_receipts(self):
         failures = [{'receipts': [{'token': 'a'}, {'unrecheckable': ['x']}, 'path']}, {'receipts': 'x'},
                     {'unavailable': 'unreadable'}, {'receipts': [{'token': 'b'}, {'token': 3}, {'token': ['c']},
                                                                   {'token': {'d': 1}}]}, {'id': [], 'receipts': []}]
         self.assertEqual(hil_lock.logged_tokens(failures), {'a', 'b'})
+        self.assertEqual([hil_lock.receipt_token(r) for r in ({'token': 'a'}, {'token': ['c']}, 'path', None)],
+                         ['a', None, None, None])
 
 
 class RechecksAs(LockDir):
@@ -2464,7 +2465,7 @@ class UnreadableRecords(LockDir):
         with quiet():
             self.assertEqual(hil_lock.cmd_hold([BOARD], 'selftest hold'), 0)
         pid = hil_lock.read_record(BOARD)['pid']
-        self.addCleanup(DetachedHolder.kill_quietly, pid)
+        self.addCleanup(kill_quietly, pid)
 
         def garble(fd, sig):                       # stands in for a holder whose cleanup went wrong
             Path(hil_lock.lock_path(BOARD)).write_bytes(b'\xff')

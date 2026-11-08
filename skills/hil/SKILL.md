@@ -108,21 +108,25 @@ nothing in it through a link.
   1. `claim(claim_entry(<ops dir>, <cmd>))` before its first tool lists
      `{ops, pid, start}`, its run_tracked state dir resolved, and returns the
      others; of two racing claims the later lists the earlier.
-  2. Any other `claim_alive` (its pid runs with its start and has not
-     exited, or runs with its start unreadable) refuses this attempt before
-     anything is judged: two commands under one hold. Only then,
-     `invocation_state(<other>, keep=logged_tokens(<open failures read
+  2. Any other `claim_alive` (its pid runs with its start and a thread
+     that has not exited, or runs with its start unreadable) refuses this
+     attempt before anything is judged: two commands under one hold. Only
+     then, `invocation_state(<other>, keep=logged_tokens(<open failures read
      now>))` judges each, tidying what it proves done: a live claimant may
-     have logged a receipt since the take. `ended`
-     (gone, its ops dir `recheck_dir` done) is removed; `unresolved` (gone,
-     an operation not proven ended) has its receipts not yet logged appended
-     with `log_cleanup_failure(..., task=<its claim>, receipts=...)`, never
-     `end_failed` on a hold it does not own, and is removed once they are,
-     the refreshed `open_cleanup_failures` reported (`failure_report`).
-  3. `settle(<unresolved receipts>, <wait>, busy=<its own probe-use check>)`:
-     still occupied after the wait, the attempt removes its claim, ends and
-     releases a lock it took. The next attempt does not find that claim: the
-     logged failure is reported and refuses nothing.
+     have logged a receipt since the take. An `ended` one (gone, its ops dir
+     `recheck_dir` done) is removed. An `unresolved` one (gone, an operation
+     not proven ended) has its receipts not yet logged appended with
+     `log_cleanup_failure(..., task=<its claim>, receipts=...)`, never
+     `end_failed` on a hold it does not own; the open failures are read once
+     more and reported (`failure_report`).
+  3. `settle(<unresolved receipts>, <wait>, busy=<its own probe-use check>)`
+     rechecks until none is `pending`; only a `pending` receipt, a child
+     proven still running, or what `busy` names holds the board. An
+     unresolved claim with a receipt still pending stays, so the next attempt
+     judges it again without logging it again, and this attempt removes its
+     own claim, ends and releases a lock it took. One with none pending
+     (done or `unknown`, which is logged and never waited on) is removed,
+     unless its log append failed: then it stays for the next attempt to log.
   4. At its end, once `recheck_dir` of its ops dir answers `done` (keeping
      the files of receipts it logged, which `resolve_restored` rechecks), it
      `remove`s exactly its own claim before its lock goes; an unclean end

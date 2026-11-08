@@ -999,8 +999,13 @@ def _receipts_blocker(receipts, holder) -> str:
         states = [f'unknown (the holder\'s ids: {e!r:.80})'] * len(receipts)
     else:
         states = _rechecks(receipts) if ids is None else _rechecks_as(ids, receipts)
-    open_runs = [f'{_receipt_text(r)} {s}' for r, s in zip(receipts, states) if s != 'done']
-    return f'its operations are not proven ended: {"; ".join(open_runs)}' if open_runs else ''
+    runs = open_runs(receipts, states)
+    return f'its operations are not proven ended: {"; ".join(runs)}' if runs else ''
+
+
+def open_runs(receipts, states) -> list:
+    """Each of `receipts` whose state (its `states` entry) is not done, as text with that state."""
+    return [f'{_receipt_text(r)} {s}' for r, s in zip(receipts, states) if s != 'done']
 
 
 def release_token(token: str):
@@ -1089,16 +1094,8 @@ class PendingSessions(os.PathLike):
     with its dir (_replace_file), 0644. A record that cannot be parsed, or lists a malformed
     session, is unreadable: kept as it is, and it refuses.
 
-    A consumer's invocations claim the board in it write-ahead (claim, claim_entry): under the
-    board's flock or the caller's hold, it claims before its first tool; refuses this attempt
-    when another is claim_alive (two commands under one hold), before judging any; then, its
-    `keep` read anew (logged_tokens of open_cleanup_failures), judges each (invocation_state):
-    removes an 'ended' one; logs an 'unresolved' one's new receipts (log_cleanup_failure, task its claim; never
-    end_failed on a hold it does not own) and removes it once logged, refreshes and reports
-    open_cleanup_failures (failure_report), then settles those receipts plus its own probe-use
-    check (settle) and, still occupied, removes its claim, ends the attempt and releases a lock
-    it took. A clean end removes its own claim once recheck_dir of its ops dir answers done,
-    keeping the files of receipts it logged, before its lock goes."""
+    A consumer's invocations claim the board in it write-ahead (claim, remove, claim_entry,
+    claim_alive, invocation_state, settle); the `hil` skill's Board locks has the protocol."""
 
     def __init__(self, lock, kind):
         _check_name(lock)
@@ -1276,7 +1273,8 @@ def _is_claim(receipt) -> bool:
 def claim_entry(ops, cmd) -> dict:
     """This invocation's claim for PendingSessions.claim: {'receipt': {'ops', 'pid', 'start'},
     'cmd': cmd}, `ops` the run_tracked state dir of every tool it starts, resolved. OSError when
-    its own start time cannot be read: without it a later reader cannot tell it from a reused pid."""
+    its own start time cannot be read: without it a later reader cannot tell it from a reused
+    pid."""
     pid = os.getpid()
     start = proc_start(pid)
     if start is None:
@@ -1285,41 +1283,27 @@ def claim_entry(ops, cmd) -> dict:
 
 
 def _claimant_alive(receipt) -> bool:
-    try:
-        with open(f'/proc/{receipt["pid"]}/stat', errors='replace') as f:
-            fields = f.read().rpartition(')')[2].split()
-        state, start = fields[0], fields[19]          # proc(5) fields 3 and 22
-    except (OSError, IndexError):
-        start = None
-    if start is not None:
-        # another start: the pid was reused; a zombie or dead task has exited, unreaped
-        return start == receipt['start'] and state not in ('Z', 'X', 'x')
-    try:
-        os.kill(receipt['pid'], 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        pass
-    return True       # running, its start unreadable (another user's /proc under hidepid): never read as dead
+    start = proc_start(receipt['pid'])
+    if start is None:      # gone, or its start unreadable (hidepid): only a vanished pid reads as dead
+        return _alive(receipt)
+    return start == receipt['start'] and not _exited(receipt['pid'], start)    # another start: a reused pid
 
 
 def claim_alive(session) -> bool:
     """Whether the invocation of a claim PendingSessions.claim returned still runs: its pid with
-    its recorded start time and not exited, or running with its start unreadable (never read as
-    dead). It reads only /proc: the gate before any invocation_state, which tidies."""
+    its recorded start and a thread not exited, or a live pid whose start cannot be read (never
+    read as dead). It reads only /proc, so it is the gate before any invocation_state."""
     r = session.get('receipt') if isinstance(session, dict) else None
     return _is_claim(r) and _claimant_alive(r)
 
 
 def invocation_state(session, keep=()) -> tuple:
-    """(state, receipts) of another invocation's session PendingSessions.claim returned, judged
-    only once claim_alive is False for every other session listed and with `keep` read after
-    that: a live claimant may log, and so keep, a receipt an earlier read did not name.
-    'alive' while claim_alive; 'ended' once it is gone and recheck_dir of its ops dir answers
-    done (that tidies them, except the tokens in `keep`: logged_tokens of the board's open
-    failures, which resolve_restored still rechecks); else 'unresolved' with recheck_dir's open entries, full receipts or
-    diagnostics. A session that is not a claim (an older consumer's) is 'unresolved' with its
-    own receipt unless that rechecks done."""
+    """(state, receipts) of another invocation's claim: 'alive' while claim_alive; 'ended' once it
+    is gone and recheck_dir of its ops dir answers done; else 'unresolved' with recheck_dir's open
+    entries, full receipts or diagnostics. recheck_dir tidies what it proves done except the
+    tokens in `keep`, so call it only after claim_alive is False for every other claim, `keep`
+    read after that (Board locks). A session that is not a claim (an older consumer's) is
+    'unresolved' with its own receipt unless that rechecks done."""
     r = session.get('receipt') if isinstance(session, dict) else None
     if not _is_claim(r):
         return ('ended', []) if _rechecks([r])[0] == 'done' else ('unresolved', [r])
@@ -1332,24 +1316,31 @@ def invocation_state(session, keep=()) -> tuple:
     return ('ended', []) if verdict == 'done' else ('unresolved', entries)
 
 
+def receipt_token(receipt):
+    """A run_tracked receipt's token when it is a string, else None: the only tokens a `keep`
+    holds, so a malformed one is never hashed."""
+    return receipt['token'] if isinstance(receipt, dict) and isinstance(receipt.get('token'), str) else None
+
+
 def logged_tokens(failures) -> set:
     """The tokens of the receipts `failures` (open_cleanup_failures') name: the `keep` that holds
     their files for resolve_restored."""
-    return {r['token'] for f in failures if isinstance(f, dict) and isinstance(f.get('receipts'), list)
-            for r in f['receipts'] if isinstance(r, dict) and isinstance(r.get('token'), str)}
+    return {t for f in failures if isinstance(f, dict) and isinstance(f.get('receipts'), list)
+            for r in f['receipts'] if (t := receipt_token(r))}
 
 
-def settle(receipts, wait, busy=None) -> list:
-    """Recheck `receipts` (unresolved invocations') until each is done and `busy()`, the
-    consumer's own check that no tool still uses its probe, names nothing, for at most `wait` s.
-    [] once settled, else what still occupies the board: each receipt not done with its state,
-    then what busy() named."""
+def settle(receipts, wait, busy=None) -> tuple:
+    """(states, named): recheck `receipts` until none is 'pending' and `busy()`, the consumer's
+    own check that no tool still uses its probe, names nothing, for at most `wait` s; each
+    receipt's last state and what busy() last named. Only 'pending' turns done by waiting, so it
+    returns at once once none is: a transient error (EMFILE) reads 'unknown' and is not
+    retried, which a caller that refuses on it pays as a refusal (fail-closed)."""
     deadline = time.monotonic() + wait
     while True:
-        left = [f'{_receipt_text(r)} {s}' for r, s in zip(receipts, _rechecks(receipts)) if s != 'done']
-        left += list(busy() or ()) if busy else []
-        if not left or time.monotonic() >= deadline:
-            return left
+        states = _rechecks(receipts)
+        named = list(busy() or ()) if busy else []
+        if 'pending' not in states and not named or time.monotonic() >= deadline:
+            return states, named
         time.sleep(min(SETTLE_POLL, max(0, deadline - time.monotonic())))
 
 

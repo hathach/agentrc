@@ -83,7 +83,7 @@ CLEANUP_RESERVE = STEP_MAX   # the restore is one more such step
 BASE_MAX = 2 * VERIFY_TIMEOUT   # a base image's check and rewrite before a flash (ensure_base), added per step
 PENDING_KIND = 'arduino-hil'   # an older engine's pending-session record, every Arduino library's
 CLAIM_KIND = 'arduino-hil-claim'   # the invocations claiming a board (agentrc#467), every Arduino library's
-CLAIM_SETTLE = 30   # s an earlier invocation's unproven children get to end before an attempt gives the board up
+CLAIM_SETTLE = 30   # s an earlier invocation's still-running children get to end before an attempt gives the board up
 
 
 def _hil_load():
@@ -746,19 +746,25 @@ def with_logged(found, fresh):
     return found + [f for f in fresh if (f['id'] not in ids if isinstance(f.get('id'), str) else f not in found)]
 
 
+def add_claim_note(d, why):
+    """Append `why`, when there is one, to `d`'s claimNote."""
+    if why:
+        d['claimNote'] = '; '.join(filter(None, (d.get('claimNote'), why)))
+
+
 def claim(name, tracker, found):
     """Name this invocation in the board's claim record before its first tool, under the board's lock or the caller's
-    hold (agentrc hil_lock PendingSessions.claim). An earlier invocation's claim leaves the record once it ended, or
-    once its new unproven children are logged; those children then get CLAIM_SETTLE to end. Returns (entry, `found`
-    refreshed, '' or what was not logged or removed); Refused when the record cannot name this invocation, InUse
-    while another invocation is alive or an earlier one's children still run, this claim removed again."""
+    hold, and judge the earlier claims there (agentrc `hil` skill, Board locks). Returns (entry, `found` with what the
+    log holds now, '' or what was not logged or removed); Refused when the record cannot name this invocation, InUse
+    while another invocation is alive or a child of an earlier one still runs after CLAIM_SETTLE, this claim removed
+    and that earlier one kept."""
     record = A.lock.PendingSessions(name, CLAIM_KIND)
     try:
         entry = A.lock.claim_entry(tracker.state_dir, 'hil_test.py')
         others = record.claim(entry)
     except (OSError, ValueError, A.lock.PendingRefused) as e:
         raise Refused(f"the board's claim record could not name this invocation: {type(e).__name__}: {e}")
-    notes, unsettled = [], []
+    notes, earlier, logged = [], [], False
     try:
         if alive := [s['receipt'] for s in others if A.lock.claim_alive(s)]:
             raise InUse(f'another invocation on {name} is running: {alive}', found)
@@ -769,21 +775,30 @@ def claim(name, tracker, found):
             state, receipts = A.lock.invocation_state(s, keep)
             if state == 'alive':   # not after the gate, but a live claim is never removed
                 continue
-            unsettled += receipts
-            if new := [r for r in receipts if not (isinstance(r, dict) and isinstance(r.get('token'), str)
-                                                    and r['token'] in keep)]:
-                if why := log_failure(name, 'an earlier invocation ended with children not proven ended',
-                                      [{'receipt': r} for r in new], task=s['receipt']):
-                    notes.append(why)   # its claim stays, for the next attempt to log
-                    continue
-                found = with_logged(found, A.lock.open_cleanup_failures(name))
-            try:
-                record.remove(s)
-            except (OSError, A.lock.PendingRefused) as e:
-                notes.append(f'earlier claim not removed: {e}')
-        if left := A.lock.settle(unsettled, CLAIM_SETTLE):
-            raise InUse(f'children of an earlier invocation on {name} not proven ended after {CLAIM_SETTLE}s: '
-                        f'{left}', found)
+            why = ''
+            if new := [r for r in receipts if A.lock.receipt_token(r) not in keep]:
+                why = log_failure(name, 'an earlier invocation ended with children not proven ended',
+                                  [{'receipt': r} for r in new], task=s['receipt'])
+                logged = logged or not why
+                if why:
+                    notes.append(why)
+            earlier.append((s, receipts, bool(why)))
+        if logged:
+            found = with_logged(found, A.lock.open_cleanup_failures(name))
+        states = iter(A.lock.settle([r for _, receipts, _ in earlier for r in receipts], CLAIM_SETTLE)[0])
+        running = []
+        for s, receipts, unlogged in earlier:
+            # only a proven-live child holds the board; its claim stays for the next attempt to judge again
+            if pending := [r for r in receipts if next(states) == 'pending']:
+                running += pending
+            elif not unlogged:   # one whose log failed stays, for the next attempt to log
+                try:
+                    record.remove(s)
+                except (OSError, A.lock.PendingRefused) as e:
+                    notes.append(f'earlier claim not removed: {e}')
+        if running:
+            raise InUse(f'children of an earlier invocation on {name} still run after {CLAIM_SETTLE}s: '
+                        f'{A.lock.open_runs(running, ["pending"] * len(running))}', found)
     except InUse:
         with contextlib.suppress(OSError, A.lock.PendingRefused):
             record.remove(entry)
@@ -797,7 +812,7 @@ def unclaim(name, entry, tracker):
     if entry is None:
         return ''
     try:
-        keep = {t for p in tracker.pending if isinstance(t := p['receipt'].get('token'), str)}
+        keep = {t for p in tracker.pending if (t := A.lock.receipt_token(p['receipt']))}
         verdict, _ = A.process.recheck_dir(tracker.state_dir, keep)
         if verdict != 'done':
             return f'claim kept: its operations recheck {verdict}'
@@ -866,8 +881,7 @@ def run_board(name, board, tests, record_path, roster_path, run_root, manifest):
             row['detail'] = f'refused: {e}'
             return row
         row.update(A.lock.failure_report(found))
-        if why:
-            row['claimNote'] = why
+        add_claim_note(row, why)
         try:
             rec, images = admit(record_path, name, roster_path, run_dir, manifest=manifest)
         except Refused as e:
@@ -903,8 +917,7 @@ def run_board(name, board, tests, record_path, roster_path, run_root, manifest):
         row['cleanup']['receipts'] = list(tracker.receipts)
         if tracker.pending:   # unrecheckable ones included: the board's cleanup log keeps them
             row['cleanup']['pending'] = list(tracker.pending)
-        if why := unclaim(name, entry, tracker):
-            row['claimNote'] = '; '.join(filter(None, (row.get('claimNote'), why)))
+        add_claim_note(row, unclaim(name, entry, tracker))
         end_run(fh, name, row, tracker, found)
     return row
 
@@ -1115,7 +1128,8 @@ def _session_op(args, run_dir):
         if why := legacy_pending(args.board):
             extra['previousPending'] = why
         entry, found, why = claim(args.board, tracker, found)
-        extra.update(A.lock.failure_report(found), **({'claimNote': why} if why else {}))
+        extra.update(A.lock.failure_report(found))
+        add_claim_note(extra, why)
         row = OPS[args.cmd](args, roster[args.board], run_dir, tracker, manifest)
         out, code = {'pass': row['pass'], 'board': args.board, **row, 'survivors': [], 'log': str(tracker.log),
                      **extra}, 0 if row['pass'] else 1
@@ -1147,8 +1161,7 @@ def _session_op(args, run_dir):
                 out['cleanupLog'] = why
     finally:
         claim_note = unclaim(args.board, entry, tracker)
-    if claim_note:
-        out['claimNote'] = '; '.join(filter(None, (out.get('claimNote'), claim_note)))
+    add_claim_note(out, claim_note)
     (run_dir / 'result.json').write_text(json.dumps(out) + '\n')
     return out, code, interrupt
 
@@ -1455,14 +1468,14 @@ def cmd_commission(args):
     out, touched, entry = {'board': args.board, 'rosterUid': board['uid']}, False, None
 
     def unclaimed():
-        if why := unclaim(args.board, entry, tracker):
-            out['claimNote'] = '; '.join(filter(None, (out.get('claimNote'), why)))
+        add_claim_note(out, unclaim(args.board, entry, tracker))
     try:
         out.update(A.lock.failure_report(fh.cleanup_failures))
         if why := legacy_pending(args.board):
             out['previousPending'] = why
         entry, found, why = claim(args.board, tracker, fh.cleanup_failures)
-        out.update(A.lock.failure_report(found), **({'claimNote': why} if why else {}))
+        out.update(A.lock.failure_report(found))
+        add_claim_note(out, why)
         _, images = admit(Path(args.record_dir) / f'{args.board}.build.json', args.board, args.roster, run_dir)
         image = images[restore_sketch(args.board)]
         observed = []
