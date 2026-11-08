@@ -747,9 +747,6 @@ class Record(unittest.TestCase):
         self.repo.git('checkout', '-q', '-b', 'side')
         side = self.repo.commit({'side.txt': 's\n'})
         self.repo.git('checkout', '-q', 'main')
-        (self.repo.path / 'dep\n```text').mkdir()       # an unpopulated submodule, which add -A keeps
-        self.repo.git('update-index', '--add', '--cacheinfo', f'160000,{side},dep\n```text')    # git's own path
-        self.repo.git('commit', '-q', '-m', 'pin')
         grown = self.repo.commit({'tests/test_g.py': 'def test_g():\n  pass\n', 'src/g.c': 'int g;\n'})
         self.audit(merge='ff', decisions=[{'id': 'd1', 'text': 'cut the\n```text\nshim', 'status': 'new',
                                            'ref': 'o/r#5'}],
@@ -770,12 +767,26 @@ class Record(unittest.TestCase):
         self.assertIn('- **Outcome:** ```', out)
         self.assertIn('- `d1` new: cut the ```text shim (o/r#5)', out)
         self.assertIn('- usage: not measured', out)
-        self.assertIn(f'- `dep ```text` - -> {side[:12]}', out)
         self.assertIn('- `hil` hardware: HIL battery (HIL contract): excluded: no rig board for it this time', out)
         self.assertEqual(len(audit.report_blocks(out)), 1)
         self.hub.comment('o/r', 7, 'alice', out)
         self.assertStatus('complete')
         self.assertNotIn(side, out)
+
+    @unittest.skipIf(os.name == 'nt', 'Windows forbids a newline in a file name')
+    def test_a_git_path_cannot_open_a_fence(self):
+        path = 'dep\n```text'
+        (self.repo.path / path).mkdir()         # an unpopulated submodule, which add -A keeps
+        self.repo.git('update-index', '--add', '--cacheinfo', f'160000,{self.base},{path}')
+        self.repo.git('commit', '-q', '-m', 'pin')
+        self.audit()
+        self.hub.comments[('o/r', 7)].clear()
+        code, out, err = self.report([{'id': 'suite', 'result': 'pass', 'ref': 'CI run 9'}])
+        self.assertEqual(code, 0, err)
+        self.assertIn(f'- `dep ```text` - -> {self.base[:12]}', out)
+        self.assertEqual(len(audit.report_blocks(out)), 1)
+        self.hub.comment('o/r', 7, 'alice', out)
+        self.assertStatus('complete')
 
     def test_a_failing_report_says_so_and_check_reads_it_provisional(self):
         self.audit()
