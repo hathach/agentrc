@@ -110,7 +110,8 @@ class Start(unittest.TestCase):
         run_json = json.loads((self.out / 'run.json').read_text())
         self.assertEqual((run_json['base'], run_json['start_head']), (self.base, self.head))
         self.assertEqual((run_json['identity'], run_json['baseKind']), ([self.base], 'bootstrap'))
-        self.assertFalse((self.out / 'carried.json').exists())
+        self.assertEqual(json.loads((self.out / 'carried.json').read_text()),
+                         {'record': None, 'pr': None, 'decisions': [], 'open': [], 'policy': []})
         self.assertIn('1 commits', out)
 
     def test_growth_is_ranked_over_every_kind_and_summarised_per_kind(self):
@@ -155,6 +156,43 @@ class Start(unittest.TestCase):
         self.assertEqual((code, 'go together' in err), (2, True))
         self.assertEqual(self.start('--base', self.base, '--base-kind', 'override')[0], 0)
         self.assertEqual(json.loads((self.out / 'run.json').read_text())['baseKind'], 'override')
+
+    def test_a_base_over_a_record_is_an_override_that_still_carries_its_items(self):
+        rec = dict({k: v for k, v in review(self.base, self.head).items() if k != 'range'}, schema=audit.SCHEMA,
+                   identity=[self.base], base=self.base, baseKind='bootstrap', reviewedHead=self.head,
+                   completed=SINCE, decisions=[{'id': 'd1', 'text': 'keep', 'status': 'new'},
+                                               {'id': 'd0', 'text': 'old', 'status': 'resolved'}])
+        self.assertEqual(audit.check_record(rec), [])
+        self.repo.commit({audit.RECORD: json.dumps(rec)})
+        code, _, err = self.start('--base', self.base)
+        self.assertEqual(code, 2)
+        self.assertIn(f'holds {audit.RECORD}: a base replacing it is --base-kind override', err)
+        self.assertFalse(self.out.exists())
+        self.assertEqual(self.start('--base', self.base, '--base-kind', 'override')[0], 0)
+        carried = json.loads((self.out / 'carried.json').read_text())
+        self.assertEqual(carried['record'], self.repo.git('rev-parse', f'HEAD:{audit.RECORD}'))
+        self.assertEqual(([d['id'] for d in carried['decisions']], [o['id'] for o in carried['open']],
+                          carried['policy'], carried['pr']), (['d1'], ['o1'], rec['policy'], rec['pr']))
+        self.repo.commit({audit.RECORD: '{'})
+        out2 = tmpdir(self) / 'run2'
+        code, out, err = start(self.repo.path, out2, '--base', self.base, '--base-kind', 'override')
+        self.assertEqual(code, 0, err)
+        self.assertIn('is no valid record of this repository: nothing carried from it', out)
+        carried = json.loads((out2 / 'carried.json').read_text())
+        self.assertEqual((carried['record'], carried['decisions'], carried['open']),
+                         (self.repo.git('rev-parse', f'HEAD:{audit.RECORD}'), [], []))
+
+    def test_status_is_read_without_taking_the_index_lock(self):
+        calls, git = [], audit.git
+
+        def spy(repo, *args, **kw):
+            calls.append(args)
+            return git(repo, *args, **kw)
+        with mock.patch.object(audit, 'git', spy):
+            self.assertEqual(self.start('--base', self.base)[0], 0)
+        status = [c for c in calls if 'status' in c]
+        self.assertTrue(status)
+        self.assertTrue(all(c[:2] == ('--no-optional-locks', 'status') for c in status), status)
 
     def test_the_default_run_dir_is_private_and_unique_within_a_second(self):
         state = tmpdir(self)
@@ -236,9 +274,12 @@ class Start(unittest.TestCase):
         r.git('update-index', '--force-remove', 'lib/gone')
         r.git('update-index', '--add', '--cacheinfo', f'160000,{one},lib/new')
         r.git('commit', '-q', '-m', 'bump')
+        r.git('config', 'diff.ignoreSubmodules', 'all')      # the inventory agrees with itself all the same
         self.assertEqual(self.start('--base', pinned)[0], 0)
-        self.assertEqual(self.inventory()['gitlinks'],
-                         [['lib/dep', one, two], ['lib/gone', one, None], ['lib/new', None, one]])
+        inv = self.inventory()
+        self.assertEqual(inv['gitlinks'], [['lib/dep', one, two], ['lib/gone', one, None], ['lib/new', None, one]])
+        self.assertEqual(sorted(row[2] for row in inv['areas']), ['lib/dep', 'lib/new'])     # gone -> new: a rename
+        self.assertTrue(inv['shortstat'].startswith('2 files changed'), inv['shortstat'])
 
     def test_unity_definitions_count_and_prototypes_do_not(self):
         self.repo.commit({'test/unit/test_dcd.c': 'void test_open(void);\nvoid test_open(void)\n{\n}\n'
@@ -293,6 +334,10 @@ def review(base, reviewed, **fields):
     return r
 
 
+def open_pr(head, repo='o/r'):
+    return {'state': 'open', 'merged': False, 'head': {'sha': head}, 'base': {'repo': {'full_name': repo}}}
+
+
 def validation(end, *items):
     body = json.dumps({'end': end, 'items': [{'id': i, 'result': res, 'ref': 'CI run 1'} for i, res in items]})
     return f'Validated.\n\n```text\n{audit.VALIDATION}\n{body}\n```\n'
@@ -308,9 +353,9 @@ class Hub:
         self.roles = {'alice': {'permission': 'write', 'role_name': 'maintain'},
                       'bob': {'permission': 'read', 'role_name': 'triage'}}
 
-    def comment(self, slug, number, login, body):
+    def comment(self, slug, number, login, body, association='COLLABORATOR'):
         listed = self.comments.setdefault((slug, number), [])
-        listed.append({'id': len(listed) + 1, 'user': {'login': login}, 'body': body,
+        listed.append({'id': len(listed) + 1, 'user': {'login': login}, 'body': body, 'author_association': association,
                        'created_at': f'2026-11-0{len(listed) + 1}T00:00:00Z'})
 
     def gh(self, args):
@@ -323,6 +368,8 @@ class Hub:
             return 0, json.dumps([self.comments.get((m[1], int(m[2])), [])]), ''
         if m := re.fullmatch(r'repos/([^/]+/[^/]+)/collaborators/([^/]+)/permission', path):
             body = self.roles.get(m[2], {'permission': 'read', 'role_name': 'read'})
+            if body == 403:         # what a caller without push access gets for anyone
+                return 1, '{"status":"403"}', 'gh: Must have push access to view collaborator permission. (HTTP 403)'
             return (1, '', 'gh: Service Unavailable (HTTP 503)') if body is None else (0, json.dumps(body), '')
         raise AssertionError(f'unexpected gh {args}')
 
@@ -351,8 +398,9 @@ class Record(unittest.TestCase):
         self.assertEqual(code, 0, err)
         file = tmpdir(self) / 'review.json'
         file.write_text(json.dumps(review(self.base, self.reviewed, **fields)))
+        self.hub.pulls[('o/r', 7)] = open_pr(self.reviewed)
         with mock.patch.object(audit, 'uncovered', return_value=[]) if unchecked_coverage else \
-                contextlib.nullcontext():
+                contextlib.nullcontext(), mock.patch.object(audit, 'gh', self.hub.gh):
             code, out, err = run(audit.main, 'finish', '--run', str(self.run_dir), '--head', self.reviewed,
                                  '--review', str(file))
         self.assertEqual(code, 0, err)
@@ -427,6 +475,21 @@ class Record(unittest.TestCase):
         self.hub.pulls[('o/r', 7)]['head']['sha'] = '1' * 40     # the API names a head refs/pull/7/head is not
         self.assertStatus('invalid', f'refs/pull/7/head of o/r did not bring the head the API names, {"1" * 40}',
                           repo=clone)
+        subprocess.run(['git', '-C', str(self.hub.bare('o/r')), 'update-ref', '-d', 'refs/pull/7/head'], check=True,
+                       env=git_env())
+        self.assertStatus('invalid', 'o/r has no refs/pull/7/head', repo=clone)
+
+    def test_a_pr_github_does_not_have_reads_invalid_and_start_offers_the_override(self):
+        self.audit()
+        del self.hub.pulls[('o/r', 7)]
+        self.assertStatus('invalid', 'o/r#7 does not exist: gh api repos/o/r/pulls/7: gh: Not Found (HTTP 404)')
+        with mock.patch.object(audit, 'gh', self.hub.gh):
+            code, _, err = start(self.repo.path, tmpdir(self) / 'run')
+        self.assertEqual(code, 2)
+        self.assertIn(f'pass --base {self.base} --base-kind override', err)
+        with mock.patch.object(audit, 'gh', return_value=(1, '', 'gh: Service Unavailable (HTTP 503)')):
+            code, _, err = run(audit.main, 'check', '--repo', str(self.repo.path), '--head', 'main')
+        self.assertEqual((code, 'HTTP 503' in err), (2, True))      # a failed read stays a refusal
 
     def test_the_recorded_repository_is_asked_never_origin(self):
         self.audit()
@@ -519,11 +582,37 @@ class Record(unittest.TestCase):
                     self.assertTrue(problems)
                     self.assertIn(reason, '\n'.join(problems))
         comments.clear()
+        self.hub.roles['owner'] = 403          # the caller has no push access: the endpoint answers 403 for anyone
+        for association, problems in (('OWNER', []), ('MEMBER', ['by owner: permission unknown'])):
+            with self.subTest(association), mock.patch.object(audit, 'gh', self.hub.gh):
+                comments.clear()
+                self.hub.comment('o/r', 7, 'owner', validation(self.end, ('suite', 'pass')), association)
+                got = audit.validation_problems(rec, self.end)
+                self.assertEqual(len(got), len(problems), got)
+                for want, have in zip(problems, got):
+                    self.assertIn(want, have)
+        comments.clear()
         self.hub.comment('o/r', 7, 'alice', validation(self.end, ('suite', 'pass')))
         self.hub.comment('o/r', 7, 'bob', validation(self.end, ('suite', 'fail')))      # no write access: ignored
         self.assertStatus('complete')
         self.hub.comment('o/r', 7, 'alice', validation(self.end, ('suite', 'fail')))
         self.assertStatus('provisional', 'validation report by alice: suite is fail')
+
+    def test_comments_changed_between_two_listings_leave_the_record_provisional(self):
+        self.audit()
+        listings = []
+
+        def gh(args):
+            answer = self.hub.gh(args)
+            if args[-1].endswith('/comments?per_page=100'):
+                listings.append(args)
+                if len(listings) == 1:      # a comment deleted during the first read
+                    self.hub.comments[('o/r', 7)].pop(0)
+            return answer
+        with mock.patch.object(audit, 'gh', gh):
+            self.assertEqual(audit.validation_problems(self.record(), self.end),
+                             ['the comments on o/r#7 changed while they were read: check again'])
+        self.assertEqual(len(listings), 2)
 
     def test_a_listing_that_is_not_pages_is_refused(self):
         with mock.patch.object(audit, 'gh', return_value=(0, '{"message": "x"}', '')):
@@ -636,11 +725,18 @@ class Finish(unittest.TestCase):
         self.head = self.repo.commit({'a.txt': '2\n'})
         self.out = tmpdir(self) / 'run'
         start(self.repo.path, self.out, '--base', self.base, head=self.head)
+        self.hub = Hub(self)
+        patch = mock.patch.object(audit, 'gh', self.hub.gh)
+        patch.start()
+        self.addCleanup(patch.stop)
 
-    def finish(self, review_json, head=None):
+    def finish(self, review_json, head=None, *extra):
+        """finish on head; the review's PR is open on o/r with that head unless the test set it."""
         file = tmpdir(self) / 'review.json'
         file.write_text(json.dumps(review_json))
-        return run(audit.main, 'finish', '--run', str(self.out), '--head', head or self.head, '--review', str(file))
+        head = head or self.head
+        self.hub.pulls.setdefault(('o/r', 7), open_pr(self.repo.git('rev-parse', head)))
+        return run(audit.main, 'finish', '--run', str(self.out), '--head', head, '--review', str(file), *extra)
 
     def refused(self, reason, head=None, **fields):
         code, _, err = self.finish(review(self.base, self.head, **fields), head)
@@ -659,8 +755,86 @@ class Finish(unittest.TestCase):
                           'reviewedHead': self.head})
         self.assertEqual({k: v for k, v in rec.items() if k not in audit.RECORD_FIELDS},
                          {k: v for k, v in review(self.base, self.head).items() if k != 'range'})
-        self.assertEqual(sorted(p.name for p in self.out.iterdir()), ['inventory.json', 'run.json'])
+        self.assertEqual(sorted(p.name for p in self.out.iterdir()), ['carried.json', 'inventory.json', 'run.json'])
         self.assertEqual(self.finish(review(self.base, self.head))[0], 0)       # a rewrite after a review round
+        self.assertEqual([p.name for p in (self.repo.path / '.claude').iterdir()], ['audit.json'])
+        self.assertNotIn(b'\r\n', (self.repo.path / audit.RECORD).read_bytes())
+
+    def test_the_pr_must_be_open_on_its_repository_with_head_r(self):
+        for pr, reason in ((None, 'pr: o/r#7 cannot be read: gh api repos/o/r/pulls/7: gh: Not Found (HTTP 404)'),
+                           (dict(open_pr(self.head), state='closed'), "pr: o/r#7 is 'closed', not open"),
+                           (open_pr(self.base), f'pr: o/r#7 has head {self.base}, not --head {self.head}: push R'),
+                           (open_pr(self.head, 'fork/r'), 'pr: o/r#7 targets fork/r, not o/r')):
+            with self.subTest(reason):
+                self.hub.pulls[('o/r', 7)] = pr
+                self.refused(reason)
+        self.hub.pulls[('o/r', 7)] = open_pr(self.head, 'O/R')       # GitHub's own case of the name
+        self.assertEqual(self.finish(review(self.base, self.head))[0], 0)
+
+    def test_a_record_that_landed_at_r_since_start_is_not_overwritten(self):
+        other = json.dumps({'decisions': 'another audit merged this'}) + '\n'
+        head = self.repo.commit({audit.RECORD: other})
+        code, _, err = self.finish(review(self.base, head), head)
+        self.assertEqual(code, 2, err)
+        self.assertIn(f'{audit.RECORD} at --head {head[:12]} is not the one start read at {self.head[:12]}', err)
+        self.assertEqual((self.repo.path / audit.RECORD).read_text(), other)
+
+    def test_a_record_path_through_a_symbolic_link_is_refused(self):
+        victim = tmpdir(self) / 'victim.txt'
+        victim.write_text('ORIGINAL', newline='\n')
+        (self.repo.path / '.claude').mkdir()
+        (self.repo.path / audit.RECORD).symlink_to(victim)          # untracked: the dirty check passes it
+        code, _, err = self.finish(review(self.base, self.head))
+        self.assertEqual(code, 2, err)
+        self.assertIn(f'{audit.RECORD} is a symbolic link', err)
+        self.assertEqual(victim.read_text(), 'ORIGINAL')
+        (self.repo.path / audit.RECORD).unlink()
+        (self.repo.path / '.claude').rmdir()
+        elsewhere = tmpdir(self)
+        (self.repo.path / '.claude').symlink_to(elsewhere, target_is_directory=True)
+        head = self.repo.commit({})                 # a tracked link: the checkout is clean
+        self.out = tmpdir(self) / 'run2'
+        self.assertEqual(start(self.repo.path, self.out, '--base', self.base, head=head)[0], 0)
+        code, _, err = self.finish(review(self.base, head), head)
+        self.assertEqual(code, 2, err)
+        self.assertIn('.claude is a symbolic link', err)
+        self.assertEqual(list(elsewhere.iterdir()), [])
+
+    def test_an_ignored_record_path_is_refused(self):
+        (self.repo.path / '.git' / 'info').mkdir(exist_ok=True)
+        (self.repo.path / '.git' / 'info' / 'exclude').write_text('.claude/\n')
+        self.refused(f'{audit.RECORD} is ignored by git')
+
+    def test_run_files_cut_short_or_edited_are_refused(self):
+        data = json.loads((self.out / 'run.json').read_text())
+        carried = (self.out / 'carried.json').read_text()
+        for name, body, reason in (('run.json', '{', 'run.json is not JSON'),
+                                   ('run.json', json.dumps(dict(data, format=1)), 'a run of an older audit.py'),
+                                   ('run.json', json.dumps({k: v for k, v in data.items() if k != 'repo'}),
+                                    'run.json lacks repo: start again'),
+                                   ('carried.json', None, 'has no carried.json: start did not complete'),
+                                   ('carried.json', '[]', 'carried.json lacks an object'),
+                                   ('carried.json', json.dumps({'record': None, 'decisions': {}, 'open': []}),
+                                    'decisions and open are not lists of items')):
+            with self.subTest(reason):
+                (self.out / 'run.json').write_text(json.dumps(data))
+                (self.out / 'carried.json').write_text(carried)
+                if body is None:
+                    (self.out / name).unlink()
+                else:
+                    (self.out / name).write_text(body)
+                self.assertNotIn('Traceback', self.refused(reason))
+
+    def test_finish_runs_in_another_checkout_of_r_with_repo(self):
+        other = tmpdir(self) / 'wt'
+        self.repo.git('worktree', 'add', '-q', '--detach', str(other), self.head)
+        code, _, err = self.finish(review(self.base, self.head), None, '--repo', str(other))
+        self.assertEqual(code, 0, err)
+        self.assertTrue((other / audit.RECORD).is_file())
+        self.assertFalse((self.repo.path / audit.RECORD).exists())
+        data = json.loads((self.out / 'run.json').read_text())
+        (self.out / 'run.json').write_text(json.dumps(dict(data, repo=str(tmpdir(self) / 'gone'))))
+        self.refused('the checkout start ran in, is gone: pass --repo')
 
     def test_stages_and_the_range(self):
         stages = review(self.base, self.head)['stages']
@@ -691,7 +865,7 @@ class Finish(unittest.TestCase):
         self.assertIn('not the repository', err)
 
     def test_carried_items_are_settled(self):
-        (self.out / 'carried.json').write_text(json.dumps({
+        (self.out / 'carried.json').write_text(json.dumps({'record': None,
             'decisions': [{'id': 'd1', 'text': 'keep', 'status': 'new'}],
             'open': [{'id': 'o9', 'text': 'x', 'status': 'carried'}], 'policy': []}))
         self.refused('carried item o9 is missing')
@@ -719,7 +893,9 @@ class Finish(unittest.TestCase):
                  ('validation.expected[1]: missing owner', [software, {k: v for k, v in hardware.items()
                                                                         if k != 'owner'}]),
                  ('hil is required-pending', [software, dict({k: v for k, v in hardware.items() if k != 'owner'},
-                                                             status='required-pending')])]
+                                                             status='required-pending')]),
+                 ("validation.expected[1].status: 'deferred' is not one of",       # deferring never covers it
+                  [software, dict({k: v for k, v in hardware.items() if k != 'owner'}, status='deferred')])]
         for reason, items in cases:
             with self.subTest(reason):
                 self.refused(reason, validation={'expected': items})
@@ -730,19 +906,35 @@ class Finish(unittest.TestCase):
 
     def test_private_looking_strings_and_host_names(self):
         err = self.refused('looks private', outcome='see /home/me/x.jsonl', policy=[
-            {'question': 'session_01AbC', 'answer': 'toolu_01x', 'date': '2026-11-08'}],
+            {'question': 'session_01AbCdEfGhJkMnPq', 'answer': 'toolu_01x', 'date': '2026-11-08'}],
             claims=[{'claim': 'https://chatgpt.com/c/abc', 'document': 'd', 'revision': '1', 'section': '1',
                      'variants': ['x'], 'status': 'pending'}],
             coverage=[{'batch': '123e4567-e89b-12d3-a456-426614174000', 'paths': ['**']}])
         for where in ('outcome', 'policy[0].question', 'policy[0].answer', 'claims[0].claim', 'coverage[0].batch'):
             self.assertIn(f'{where}: looks private', err)
+        shell = ['cd x && python3 "$RUN/a.py"', 'n=$(ls)', 'make 2>&1', 'x >/dev/null', 'run sudo make',
+                 '$ make all', 'log | grep x']
+        self.assertEqual([bool(audit.private(c)) for c in shell], [True] * len(shell))
+        usb = ['OTGSC_B_SESSION_VALID stays', 'session_id', 'USBC_INTUSB_SESSION_REQ', 'tud_session_end()',
+               'https://app.circleci.com/pipelines/github/o/r/1/workflows/123e4567-e89b-12d3-a456-426614174000/jobs/2',
+               'a || b && c', 'rate 5 MB/s', 'software|hardware']
+        self.assertEqual(audit.private(usb), [])
         usage_ = review(self.base, self.head)['usage']
         self.refused("usage.hosts: not a host count: ['htpc', 'ci']", usage=dict(usage_, hosts=['htpc', 'ci']))
         self.refused("usage.totals: 'ci.lan': a total", usage=dict(usage_, totals={'ci.lan': 3}))
         self.refused('usage: missing window', usage={'totals': {'sessions': 1}, 'hosts': 1})
 
+    def test_usage_with_no_transcripts_is_recorded_unmeasured(self):
+        usage_ = review(self.base, self.head)['usage']
+        self.refused('usage.totals: totals from no host', usage=dict(usage_, hosts=0))
+        self.refused('usage.totals: empty: give the totals', usage=dict(usage_, totals={}))
+        self.refused('usage.hosts: not a host count: -1', usage=dict(usage_, hosts=-1, totals={}))
+        code, _, err = self.finish(review(self.base, self.head, usage=dict(usage_, hosts=0, totals={})))
+        self.assertEqual(code, 0, err)
+
     def test_malformed_nested_values_are_listed_not_raised(self):
-        (self.out / 'carried.json').write_text(json.dumps({'decisions': [], 'open': [{'id': 'o1'}], 'policy': []}))
+        (self.out / 'carried.json').write_text(json.dumps({'record': None, 'decisions': [], 'open': [{'id': 'o1'}],
+                                                           'policy': []}))
         usage_ = review(self.base, self.head)['usage']
         expected = review(self.base, self.head)['validation']['expected']
         err = self.refused('decisions[0].status: {', decisions=[{'id': 'd1', 'text': 't', 'status': {'x': 1}}],

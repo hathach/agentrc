@@ -4,7 +4,7 @@
   audit.py check --repo PATH --head REF
   audit.py start --repo PATH --head REF [--base REF --base-kind bootstrap|override] [--since TIME] [--until TIME]
                  [--out DIR]
-  audit.py finish --run DIR --head REF --review FILE
+  audit.py finish --run DIR --head REF --review FILE [--repo PATH]
   audit.py report --repo PATH --head E --results FILE
 
 The record is `.claude/audit.json`, committed by the audit PR as its last commit P (parent R, the reviewed head).
@@ -15,26 +15,33 @@ and has E's tree (so only a squash or rebase merge verifies); the coverage globs
 and the newest validation report, a PR comment by an account with write permission holding a fenced block whose
 first line is `repo-audit-validation: 1` and then {"end": E, "items": [{"id", "result": "pass"|"fail", "ref"}]}
 (no other fields; ref non-empty), passes every expected item recorded as covered. A newer report whose author's
-permission cannot be read leaves the record provisional; no older report stands in for it. It prints `complete`,
-`provisional` (the report is missing, malformed, names another end, fails or misses an item) or `invalid`, each
-reason after it. Exit 0 complete, 1 otherwise, 2 refused.
+permission cannot be read leaves the record provisional; no older report stands in for it. A caller without push
+access cannot read permissions (HTTP 403): then only the repository's owner (author_association OWNER) counts. The
+comments are listed twice; listings that differ leave the record provisional. It prints `complete`, `provisional`
+(the report is missing, malformed, names another end, fails or misses an item) or `invalid` (a PR or ref GitHub
+does not have included), each reason after it. Exit 0 complete, 1 otherwise, 2 refused.
 
 report checks the record at E as check does, without the validation comment, and that FILE's {"end", "items":
 [{"id", "result", "ref"}]} names E, the commit its results were taken on, and exactly the record's covered items;
 it prints the comment body. It posts nothing:
-`gh pr comment N -F <body>` does. Exit 0 printed, 2 refused.
+`gh pr comment <pr.number> --repo <pr.repo> -F <body>` does. Exit 0 printed, 2 refused.
 
-start takes the base from a complete record (its end E, kind `audit`, its live decisions, open items and policy in
-DIR/carried.json) or from --base with its kind (`bootstrap` for a first audit, `override` to replace a record);
-anything else refuses, offering the record's own base as an override when it is an ancestor of head. It writes
-DIR/run.json and DIR/inventory.json and prints the growth summary. DIR defaults to $XDG_STATE_HOME
+start takes the base from a complete record (its end E, kind `audit`) or from --base with its kind (`bootstrap` for
+a first audit, refused when head holds a record; `override` to replace one); anything else refuses, offering the
+record's own base as an override when it is an ancestor of head. Whatever the base, DIR/carried.json holds the blob
+id of the record at head (null without one) and, from a schema-valid record of this repository, its live decisions,
+open items and policy. It writes DIR/inventory.json, DIR/carried.json, then DIR/run.json, and prints the growth
+summary. DIR defaults to $XDG_STATE_HOME
 (~/.local/state) agentrc/repo-audit/<identity key>/<time>-<random>, created exclusively. --since/--until bound the
 transcript window usage.py reads (ISO 8601; default the base commit's committer time and now).
 
-finish checks the run's repository again, that its checkout is clean at --head R and R descends from the run's base
-and start head, and the lead's review FILE against the record schema, the run's range and carried items and the
-privacy rules; it then writes the record into the checkout and prints how to commit it. Exit 0 done, 2 refused
-(with every reason on stderr). Shallow or grafted history, or a replace ref, is refused before any command.
+finish checks the run's repository again in --repo (default the checkout start ran in): that the checkout is clean at
+--head R, R descends from the run's base and start head, and R holds the record start read (another audit's record
+merged since refuses); the lead's review FILE against the record schema, the run's range and carried items and the
+privacy rules; and that the review's PR is open on its repository with head R. It refuses a `.claude` or record
+path that is a symbolic link or an ignored record path, then writes the record through a new file renamed over it
+and prints how to commit it. Exit 0 done, 2 refused (with every reason on stderr). Shallow or grafted history, or a
+replace ref, is refused before any command.
 
 FILE is one JSON object; a field the schema does not name is refused at any depth:
   range       "<base>..<R>" in full SHAs: the run's range, so a review written before R moved refuses
@@ -48,7 +55,8 @@ FILE is one JSON object; a field the schema does not name is refused at any dept
   decisions   [{id, text, status, by?, ref?}]
   open        [{id, text, status, by?, ref?}]: deferred work
   policy      [{question, answer, date: YYYY-MM-DD}]
-  usage       {totals: {camelCaseName: number}, hosts: count, window: {since, until}}: totals across hosts only
+  usage       {totals: {camelCaseName: number}, hosts: count, window: {since, until}}: totals across hosts only;
+              hosts 0 with totals {} when no transcripts were read (not measured, never zero use)
   validation  {expected: [{id, check, kind: software|hardware, source (the selector or contract that produced
               it), status: covered + ref (its run on R) | inapplicable + reason | excluded + owner (the owner's
               words)}]}, with at least one software and one hardware item; required-pending refuses. The script
@@ -57,7 +65,8 @@ FILE is one JSON object; a field the schema does not name is refused at any dept
 The record holds these fields but range (base and reviewedHead carry it). An item's status is new, carried,
 resolved or superseded (+ by, another item's id). Each id carried.json lists must appear carried, resolved or
 superseded; only those may be carried. Strings that look private refuse: home or /tmp paths, .jsonl, session URLs
-and ids, toolu_ ids, ChatGPT conversation links, bare UUIDs.
+and ids, toolu_ ids, ChatGPT conversation links, bare UUIDs outside a CircleCI URL, and shell command shapes ($(,
+2>&1, /dev/null, sudo, a `$ ` prompt, a pipe into a filter, a $VAR/ path).
 """
 import argparse
 import codecs
@@ -97,9 +106,13 @@ ITEM_ID = re.compile(r'[A-Za-z0-9][\w.-]*')
 STAGE_NAME = re.compile(r'[a-z][a-z0-9-]*')
 TOTAL_NAME = re.compile(r'[a-z][A-Za-z0-9]*')
 DATE = re.compile(r'\d{4}-\d{2}-\d{2}')
-PRIVATE = re.compile(r'/home/|/Users/|~/|/tmp/|C:\\Users|\.jsonl|claude\.ai/code/session|session_[0-9A-Za-z]|toolu_'
-                     r'|chatgpt\.com/(?:c|codex|share)/'
-                     r'|\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b', re.I)
+# a session id is session_01 + base62, case-sensitive: register names like OTGSC_B_SESSION_VALID are not one
+PRIVATE = re.compile(r'/home/|/Users/|~/|/tmp/|C:\\Users|\.jsonl|claude\.ai/code/session'
+                     r'|(?-i:\bsession_01[0-9A-Za-z]{8})|toolu_|chatgpt\.com/(?:c|codex|share)/'
+                     r'|\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b'
+                     r'|\$\(|\d>&\d|/dev/null|(?:^|\s)sudo\s|(?:^|\n)\s*\$ '
+                     r'|\|\s*(?:grep|sed|awk|head|tail|xargs|tee|jq)\b|\$\{?\w+\}?/', re.I)
+CI_URL = re.compile(r'https://app\.circleci\.com/\S*')       # its workflow and job ids are UUIDs
 FENCE = re.compile(r'^```[^\n]*\n(.*?)^```[ \t]*$', re.M | re.S)
 LIVE = {'new', 'carried'}
 SETTLED = {'carried', 'resolved', 'superseded'}
@@ -107,6 +120,14 @@ SETTLED = {'carried', 'resolved', 'superseded'}
 
 class Refused(Exception):
     pass
+
+
+class HttpError(Refused):
+    """A GitHub read that got an HTTP error status back, status None when gh named none."""
+
+    def __init__(self, message, status):
+        super().__init__(message)
+        self.status = status
 
 
 def git(repo, *args, check=True):
@@ -128,7 +149,8 @@ def api(path, paginate=False):
         path += f'{"&" if "?" in path else "?"}per_page=100'
     rc, out, err = gh(['api', *(['--paginate', '--slurp'] if paginate else []), path])
     if rc:
-        raise Refused(f'gh api {path}: {err.strip() or out.strip()}')
+        status = re.search(r'\(HTTP (\d{3})\)', err)
+        raise HttpError(f'gh api {path}: {err.strip() or out.strip()}', status and int(status[1]))
     try:
         data = json.loads(out)
     except ValueError:
@@ -207,7 +229,7 @@ def tree(repo, rev):
 
 def numstat(repo, base, end):
     """[(added|None, deleted|None, path)] with None for a binary file; a rename counts under its new path."""
-    out = git(repo, 'diff', '--numstat', '-z', '-M', base, end).stdout.split('\0')
+    out = git(repo, 'diff', '--numstat', '-z', '-M', '--ignore-submodules=none', base, end).stdout.split('\0')
     rows, i = [], 0
     while i < len(out):
         rec = out[i]
@@ -262,7 +284,7 @@ def diff_path(text):
 def count_test_defs(repo, base, end):
     """{test file: [added, removed]} counting test function heads in the diff of test paths."""
     out = git(repo, '-c', 'core.quotePath=false', 'diff', '-U0', '--no-color', '--no-ext-diff', '--no-textconv',
-              '-M', '--src-prefix=a/', '--dst-prefix=b/', base, end).stdout
+              '-M', '--ignore-submodules=none', '--src-prefix=a/', '--dst-prefix=b/', base, end).stdout
     counts, old, path = defaultdict(lambda: [0, 0]), None, None
     for line in out.splitlines():
         if line.startswith('--- '):
@@ -359,10 +381,10 @@ def per_kind(growth, name):
     return [f'-- {name}', *(f'{s:9d} {g:+9d} {p}' for s, g, _, p in rows)] if rows else []
 
 
-def create(path, text, mode=0o666):
+def create(path, text, mode=0o666, newline=None):
     """Write text to a new file, mode masked by the umask; FileExistsError when path exists."""
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_BINARY', 0)    # newlines translated once, by Python
-    with os.fdopen(os.open(path, flags, mode), 'w', encoding='utf-8') as f:
+    with os.fdopen(os.open(path, flags, mode), 'w', encoding='utf-8', newline=newline) as f:
         f.write(text)
 
 
@@ -528,15 +550,20 @@ def check_review(s, r, rng=None, carried=None):
     # totals across hosts with their count: a host name has no field to go in
     if 'usage' in r and s.obj(r['usage'], 'usage', ('totals', 'hosts', 'window')):
         u = r['usage']
-        totals = u.get('totals')
-        if isinstance(totals, dict) and totals:
+        totals, hosts = u.get('totals'), u.get('hosts')
+        if type(hosts) is not int or hosts < 0:
+            s.bad('usage.hosts', f'not a host count: {hosts!r}'[:200])
+            hosts = None
+        if not isinstance(totals, dict):
+            s.bad('usage.totals', 'not an object of totals across hosts')
+        else:
             for k, v in totals.items():
                 if not TOTAL_NAME.fullmatch(k) or type(v) not in (int, float) or v < 0:
                     s.bad('usage.totals', f'{k!r}: a total is a camelCase name and a non-negative number')
-        else:
-            s.bad('usage.totals', 'not a non-empty object of totals across hosts')
-        if type(u.get('hosts')) is not int or u['hosts'] < 1:
-            s.bad('usage.hosts', f'not a host count: {u.get("hosts")!r}'[:200])
+            if hosts == 0 and totals:
+                s.bad('usage.totals', 'totals from no host: hosts 0 means no transcripts were read')
+            elif hosts and not totals:
+                s.bad('usage.totals', 'empty: give the totals across hosts, or hosts 0 when no transcripts were read')
         win = u.get('window')
         if s.obj(win, 'usage.window', ('since', 'until')) and s.time(win.get('since'), 'usage.window.since') \
                 and s.time(win.get('until'), 'usage.window.until') and aware(win['since']) >= aware(win['until']):
@@ -604,7 +631,7 @@ def private(value, where='', found=None):
     elif isinstance(value, list):
         for i, v in enumerate(value):
             private(v, f'{where}[{i}]', found)
-    elif isinstance(value, str) and (m := PRIVATE.search(value)):
+    elif isinstance(value, str) and (m := PRIVATE.search(CI_URL.sub(' ', value))):
         found.append((where.lstrip('.'), m.group()))
     return found
 
@@ -661,8 +688,12 @@ def validation_problems(rec, end):
     """Why the record's validation is not complete: the newest report by a writer must name end and pass every
     expected item recorded as covered."""
     pr = rec['pr']
-    comments = sorted(api(f'repos/{pr["repo"]}/issues/{pr["number"]}/comments', paginate=True),
-                      key=lambda c: (c.get('created_at') or '', c.get('id') or 0))
+    url = f'repos/{pr["repo"]}/issues/{pr["number"]}/comments'
+    # pages are numbered: a comment deleted during a read shifts another across a page boundary, out of the listing
+    listed = api(url, paginate=True)
+    if [c.get('id') for c in listed] != [c.get('id') for c in api(url, paginate=True)]:
+        return [f'the comments on {pr["repo"]}#{pr["number"]} changed while they were read: check again']
+    comments = sorted(listed, key=lambda c: (c.get('created_at') or '', c.get('id') or 0))
     writers = {}
     for c in reversed(comments):
         blocks = report_blocks(c.get('body') or '')
@@ -676,8 +707,13 @@ def validation_problems(rec, end):
                 if level not in LEVELS:
                     raise Refused(f'no permission level in {str(perm)[:200]}')
             except Refused as e:
-                # this report may be the newest valid one: an older one must not stand in for it
-                return [f'validation report {c.get("html_url") or c.get("id")} by {login}: permission unknown: {e}']
+                # a caller without push access gets 403 for anyone; the repository's owner needs no lookup
+                if isinstance(e, HttpError) and e.status == 403 and c.get('author_association') == 'OWNER':
+                    level = 'admin'
+                else:
+                    # this report may be the newest valid one: an older one must not stand in for it
+                    return [f'validation report {c.get("html_url") or c.get("id")} by {login}: permission unknown: '
+                            f'{e}']
             writers[login] = level in WRITERS
         if writers[login]:
             return report_problems(blocks[-1], rec, end, login)
@@ -701,8 +737,13 @@ def report_problems(report, rec, end, login):
 def end_problems(repo, rec, end):
     """Why E is not the recorded PR's merge of P = R + the record."""
     pr = rec['pr']
-    data = api(f'repos/{pr["repo"]}/pulls/{pr["number"]}')
     where = f'{pr["repo"]}#{pr["number"]}'
+    try:
+        data = api(f'repos/{pr["repo"]}/pulls/{pr["number"]}')
+    except HttpError as e:
+        if e.status != 404:
+            raise
+        return [f'{where} does not exist: {e}']
     if not data.get('merged'):
         return [f'{where} is not merged']
     problems, merged = [], data.get('merge_commit_sha')
@@ -716,8 +757,12 @@ def end_problems(repo, rec, end):
         return problems + [f'{where} has no head SHA']
     if not has_commit(repo, p):
         ref = f'refs/pull/{pr["number"]}/head'
-        git(repo, 'fetch', '-q', '--no-tags', '--no-recurse-submodules', '--no-write-fetch-head',
-            f'{GITHUB}{pr["repo"]}.git', ref)
+        fetched = git(repo, 'fetch', '-q', '--no-tags', '--no-recurse-submodules', '--no-write-fetch-head',
+                      f'{GITHUB}{pr["repo"]}.git', ref, check=False)
+        if fetched.returncode and "couldn't find remote ref" in fetched.stderr:
+            return problems + [f'{pr["repo"]} has no {ref}']
+        if fetched.returncode:
+            raise Refused(f'git fetch {ref}: {fetched.stderr.strip()}')
         if not has_commit(repo, p):
             return problems + [f'{ref} of {pr["repo"]} did not bring the head the API names, {p}']
     parents = git(repo, 'rev-list', '--parents', '-n1', p).stdout.split()[1:]
@@ -813,13 +858,35 @@ def report(args):
     return 0
 
 
+def record_blob(repo, rev):
+    """The object id of the record at rev, None without one."""
+    return git(repo, 'rev-parse', '--verify', '--quiet', f'{rev}:{RECORD}', check=False).stdout.strip() or None
+
+
+def carry(repo, head):
+    """carried.json: the record at head, for finish to find unchanged at R, and from a schema-valid record of this
+    repository its live items and policy, whichever base the run takes."""
+    blob = record_blob(repo, head)
+    carried = {'record': blob, 'pr': None, 'decisions': [], 'open': [], 'policy': []}
+    try:
+        rec = json.loads(git(repo, 'cat-file', 'blob', blob).stdout) if blob else None
+    except (Refused, ValueError):
+        rec = None
+    if rec is not None and not check_record(rec) and rec['identity'] == identity(repo, head):
+        carried.update(pr=rec['pr'], decisions=[d for d in rec['decisions'] if d['status'] in LIVE],
+                       open=[o for o in rec['open'] if o['status'] in LIVE], policy=rec['policy'])
+    return carried
+
+
 def start(args):
     repo = toplevel(args.repo)
     head = commit(repo, args.head)
     if bool(args.base) != bool(args.base_kind):
         raise Refused('--base and --base-kind go together')
-    carried = None
+    carried = carry(repo, head)
     if args.base:
+        if args.base_kind == 'bootstrap' and carried['record']:
+            raise Refused(f'{head[:12]} holds {RECORD}: a base replacing it is --base-kind override')
         base, base_kind = commit(repo, args.base), args.base_kind
     else:
         status, reasons, rec, end = verify(repo, head)
@@ -829,8 +896,6 @@ def start(args):
                 if SHA.fullmatch(str(prior)) and is_ancestor(repo, prior, head) else ''
             raise Refused(f'the last audit record is {status}:\n' + '\n'.join(f'- {r}' for r in reasons) + hint)
         base, base_kind = end, 'audit'
-        carried = {'pr': rec['pr'], 'decisions': [d for d in rec['decisions'] if d['status'] in LIVE],
-                   'open': [o for o in rec['open'] if o['status'] in LIVE], 'policy': rec['policy']}
     if not is_ancestor(repo, base, head):
         raise Refused(f'base {base[:12]} is not an ancestor of head {head[:12]}')
     since = when(args.since) if args.since else \
@@ -846,59 +911,104 @@ def start(args):
         key = hashlib.sha256('\n'.join(roots).encode()).hexdigest()[:12]
         out = state_dir() / key / f'{time.strftime("%Y%m%dT%H%M%S")}-{secrets.token_hex(3)}'
     out.mkdir(parents=True, exist_ok=False, mode=0o700)
-    status = git(repo, 'status', '--porcelain').stdout.splitlines()
+    status = git(repo, '--no-optional-locks', 'status', '--porcelain').stdout.splitlines()
     tool = Path(__file__).resolve().parent
     tool_rev = git(tool, 'rev-parse', 'HEAD', check=False).stdout.strip() or None
     run = {'format': 2, 'repo': str(repo), 'identity': roots, 'base': base, 'baseKind': base_kind,
            'start_head': head, 'since': since, 'until': until, 'tool_revision': tool_rev,
            'dirty': sum(not s.startswith('??') for s in status), 'untracked': sum(s.startswith('??') for s in status)}
     inv = inventory(repo, base, head)
-    create(out / 'run.json', json.dumps(run, indent=1) + '\n')
     create(out / 'inventory.json', json.dumps(inv, indent=1) + '\n')
-    if carried is not None:
-        create(out / 'carried.json', json.dumps(carried, indent=1) + '\n')
+    create(out / 'carried.json', json.dumps(carried, indent=1) + '\n')
+    create(out / 'run.json', json.dumps(run, indent=1) + '\n')      # last: a run.json means the others are whole
     print(f'run dir: {out}')
     print(f'window: {since} .. {until}')
+    if carried['record'] and carried['pr'] is None:
+        print(f'note: {RECORD} at head is no valid record of this repository: nothing carried from it')
     if run['dirty'] or run['untracked']:
         print(f"note: {run['dirty']} modified and {run['untracked']} untracked paths are not in this inventory")
     print(summary(inv))
     return 0
 
 
+def require(data, path, keys):
+    """Refuse a run file start did not write whole, or that was edited since."""
+    missing = [k for k in keys if k not in data] if isinstance(data, dict) else ['an object']
+    if missing:
+        raise Refused(f'{path} lacks {", ".join(missing)}: start again')
+    return data
+
+
+def pr_problems(pr, head):
+    """Why the review's PR is not open on its base repository with head R."""
+    where = f'pr: {pr["repo"]}#{pr["number"]}'
+    try:
+        data = api(f'repos/{pr["repo"]}/pulls/{pr["number"]}')
+    except Refused as e:
+        return [f'{where} cannot be read: {e}']
+    if not isinstance(data, dict):
+        return [f'{where}: not a pull request: {str(data)[:200]}']
+    problems = []
+    target = str(((data.get('base') or {}).get('repo') or {}).get('full_name'))
+    if target.lower() != pr['repo'].lower():
+        problems.append(f'{where} targets {target}, not {pr["repo"]}')
+    if data.get('state') != 'open':
+        problems.append(f'{where} is {data.get("state")!r}, not open')
+    got = (data.get('head') or {}).get('sha')
+    if got != head:
+        problems.append(f'{where} has head {got}, not --head {head}: push R to it first')
+    return problems
+
+
 def finish(args):
     out = Path(args.run)
-    run = json.loads((out / 'run.json').read_text(encoding='utf-8'))
-    if run.get('format') != 2:
+    run = read_json(out / 'run.json')
+    if not isinstance(run, dict) or run.get('format') != 2:
         raise Refused(f'{out} is a run of an older audit.py: start again')
-    repo = Path(run['repo'])
-    if not repo.is_dir():
-        raise Refused(f'{repo} is not the repository this run audited')
-    plain_history(repo)
+    require(run, out / 'run.json', ('repo', 'identity', 'base', 'baseKind', 'start_head'))
+    if not (out / 'carried.json').is_file():
+        raise Refused(f'{out} has no carried.json: start did not complete; start again')
+    prior = require(read_json(out / 'carried.json'), out / 'carried.json', ('record', 'decisions', 'open'))
+    try:
+        carried = {i['id'] for i in prior['decisions'] + prior['open']}
+    except (TypeError, KeyError):
+        raise Refused(f'{out / "carried.json"}: decisions and open are not lists of items: start again') from None
+    if args.repo:
+        repo = toplevel(args.repo)
+    else:
+        repo = Path(run['repo'])
+        if not repo.is_dir():
+            raise Refused(f'{repo}, the checkout start ran in, is gone: pass --repo with a checkout of --head')
+        plain_history(repo)
     reviewed = commit(repo, args.head)
     if identity(repo, reviewed) != run['identity']:
         raise Refused(f'{repo} is not the repository this run audited')
     problems = []
     if git(repo, 'rev-parse', 'HEAD').stdout.strip() != reviewed:
         problems.append(f'HEAD of {repo} is not --head {reviewed[:12]}: the record commit goes on the reviewed head')
-    dirty = [s for s in git(repo, 'status', '--porcelain', '--untracked-files=all').stdout.splitlines()
-             if s[3:] != RECORD]
+    dirty = [s for s in git(repo, '--no-optional-locks', 'status', '--porcelain', '--untracked-files=all')
+             .stdout.splitlines() if s[3:] != RECORD]
     if dirty:
         problems.append(f'{repo} has {len(dirty)} uncommitted paths (first: {dirty[0][3:]}): the record commit '
                         'holds the record alone')
     for name in ('base', 'start_head'):
         if not is_ancestor(repo, run[name], reviewed):
             problems.append(f'--head {reviewed[:12]} does not descend from the run\'s {name} {run[name][:12]}')
-    carried = set()
-    if (out / 'carried.json').exists():
-        prior = json.loads((out / 'carried.json').read_text(encoding='utf-8'))
-        carried = {i['id'] for i in prior['decisions'] + prior['open']}
+    if record_blob(repo, reviewed) != prior['record']:
+        problems.append(f'{RECORD} at --head {reviewed[:12]} is not the one start read at {run["start_head"][:12]}: '
+                        'another audit\'s record landed since; start again from it')
+    for link in ('.claude', RECORD):
+        if (repo / link).is_symlink():
+            problems.append(f'{link} is a symbolic link: the record goes only into a regular file in .claude/')
+    if git(repo, 'check-ignore', '-q', '--', RECORD, check=False).returncode == 0:
+        problems.append(f'{RECORD} is ignored by git: its commit would fail')
     review = read_json(args.review)
     s = Shape()
     if s.obj(review, 'review', REVIEW_FIELDS):
         check_review(s, review, f'{run["base"]}..{reviewed}', carried)
     problems += s.problems
     if not s.problems:
-        problems += uncovered(repo, run['base'], reviewed, review['coverage'])
+        problems += uncovered(repo, run['base'], reviewed, review['coverage']) + pr_problems(review['pr'], reviewed)
     problems += [f'{w}: looks private ({m!r})' for w, m in private(review)]
     if problems:
         raise Refused('\n'.join(problems))
@@ -906,8 +1016,12 @@ def finish(args):
               'reviewedHead': reviewed, 'completed': datetime.datetime.now().astimezone().isoformat(timespec='seconds'),
               **{k: review[k] for k in RECORDED}}
     (repo / '.claude').mkdir(exist_ok=True)
-    with open(repo / RECORD, 'w', encoding='utf-8', newline='\n') as f:
-        f.write(json.dumps(record, indent=2, ensure_ascii=False) + '\n')
+    new = repo / '.claude' / f'.audit.json.{secrets.token_hex(4)}.tmp'
+    try:
+        create(new, json.dumps(record, indent=2, ensure_ascii=False) + '\n', newline='\n')
+        os.replace(new, repo / RECORD)       # a link raced in at RECORD is replaced, never written through
+    finally:
+        new.unlink(missing_ok=True)
     print(f'wrote {RECORD}; read it, then commit it alone as the PR\'s last commit:')
     print(f'  git add -- {RECORD} && git commit --only -- {RECORD}')
     print('nothing may follow it: the PR merges with that commit as its head, its parent the reviewed head')
@@ -932,6 +1046,7 @@ def main(argv=None):
     f.add_argument('--run', required=True)
     f.add_argument('--head', required=True)
     f.add_argument('--review', required=True)
+    f.add_argument('--repo')
     r = sub.add_parser('report')
     r.add_argument('--repo', required=True)
     r.add_argument('--head', required=True)
