@@ -225,11 +225,12 @@ class ResetTt(Sysfs):
 
 
 class Netns(Sysfs):
-    """netns finds the board's one USB network interface, opens a sandbox's namespace and moves
-    the interface into it by ifindex; the kernel move itself is stubbed."""
+    """netns finds a board's (NETNS_VIDS) one USB network interface, opens a sandbox's namespace and
+    moves the interface into it by ifindex; the kernel move itself is stubbed."""
 
     def setUp(self):
         super().setUp()
+        self.owner_uid = 1000
         self.proc = self.root / 'proc'
         (self.proc / '1' / 'ns').mkdir(parents=True)
         (self.proc / '1' / 'ns' / 'user').write_text('')
@@ -242,6 +243,9 @@ class Netns(Sysfs):
         real_open, real_close = os.open, os.close
 
         def ioctl(fd, req, *arg):
+            if req == 0xb704:                   # NS_GET_OWNER_UID
+                self.assertEqual(arg, (bytes(4),))
+                return struct.pack('=I', self.owner_uid)
             self.assertEqual(req, 0xb701)
             return real_open(self.owner, os.O_RDONLY)
 
@@ -253,11 +257,15 @@ class Netns(Sysfs):
             p = mock.patch.object(target, name, value)
             p.start()
             self.addCleanup(p.stop)
+        p = mock.patch.dict(os.environ, {'SUDO_UID': '1000'})
+        p.start()
+        self.addCleanup(p.stop)
 
-    def netdev(self, busport, name='usb7', driver='cdc_ncm', mac='02:02:84:6a:96:00', ifindex=7, intf='1.0'):
+    def netdev(self, busport, name='usb7', driver='cdc_ncm', mac='02:02:84:6a:96:00', ifindex=7, intf='1.0',
+               vid='cafe'):
         d = self.usb / busport
         if not d.exists():
-            self.dev(busport)
+            self.dev(busport, vid=vid)
         i = d / f'{busport}:{intf}'
         (i / 'net' / name).mkdir(parents=True)
         drivers = self.root / 'drivers' / driver
@@ -283,6 +291,24 @@ class Netns(Sysfs):
         self.owner = self.proc / '1' / 'ns' / 'user'
         self.assertIn('not owned by an unprivileged user namespace', self.refused('1-2', '4321'))
 
+    def test_a_user_namespace_root_created_refuses(self):
+        # `sudo unshare --user --map-root-user --net`: not the initial user namespace, but root's
+        self.owner_uid = 0
+        self.assertIn('created by root', self.refused('1-2', '4321'))
+        with mock.patch.dict(os.environ):
+            os.environ.pop('SUDO_UID')
+            self.assertIn('created by root', self.refused('1-2', '4321'))
+
+    def test_a_user_namespace_another_user_created_refuses(self):
+        self.owner_uid = 1001
+        self.assertIn('created by uid 1001, not the sudo caller 1000', self.refused('1-2', '4321'))
+
+    def test_without_sudo_any_unprivileged_creator_is_accepted(self):
+        self.owner_uid = 1001
+        with mock.patch.dict(os.environ):
+            os.environ.pop('SUDO_UID')
+            self.assertEqual(self.main('netns', '1-2', '4321')[:2], (0, '7 usb7\n'))
+
     def test_a_missing_process_and_malformed_pids_refuse(self):
         for pid in ('999', '1', '0', '-5', '4321 ', '../1', ''):
             with self.subTest(pid=pid):
@@ -296,12 +322,29 @@ class Netns(Sysfs):
     def test_a_host_nic_refuses(self):
         self.netdev('1-3', name='enx1', driver='r8152')
         self.assertIn('driven by r8152', self.refused('1-3', '4321'))
-        self.netdev('1-4', name='enx2', driver='cdc_ether', mac='00:e0:4c:68:00:01')
-        self.assertIn('globally unique MAC', self.refused('1-4', '4321'))
+
+    def test_a_cdc_nic_that_is_not_a_board_refuses_whatever_its_mac(self):
+        # a host USB Ethernet adapter or tethered phone on a CDC driver, with a cloned or
+        # randomized locally administered MAC: its vendor id is the boundary, not its MAC
+        for busport, driver, vid in (('1-4', 'cdc_ether', '0bda'), ('1-5.1', 'cdc_ncm', '18d1'),
+                                     ('1-6', 'rndis_host', '04e8')):
+            with self.subTest(busport=busport):
+                self.netdev(busport, name=f'enx{busport}', driver=driver, vid=vid)
+                self.assertIn(f'vendor id {vid} is not a board', self.refused(busport, '4321'))
+
+    def test_an_interface_replaced_while_checked_refuses(self):
+        ifindex = self.usb / '1-2' / '1-2:1.0' / 'net' / 'usb7' / 'ifindex'
+        real_readlink = os.readlink
+
+        def readlink(path):              # the device re-enumerates between the two ifindex reads
+            ifindex.write_text('9\n')
+            return real_readlink(path)
+        with mock.patch.object(hr.os, 'readlink', readlink):
+            self.assertIn('changed while it was checked', self.refused('1-2', '4321'))
 
     def test_none_or_several_interfaces_refuse(self):
-        self.dev('1-5')
-        self.assertIn('expected one network interface', self.refused('1-5', '4321'))
+        self.dev('1-3')
+        self.assertIn('expected one network interface', self.refused('1-3', '4321'))
         self.netdev('1-2', name='usb8', intf='1.2', ifindex=8)
         self.assertIn("['usb7', 'usb8']", self.refused('1-2', '4321'))
 

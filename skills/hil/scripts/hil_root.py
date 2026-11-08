@@ -3,16 +3,18 @@
 only, and it imports nothing beside it.
 
 A rig may grant its CI user sudo on an installed copy of this file (INSTALLED), so it takes
-no path, command or environment from its caller: each verb checks its arguments against the
-one sysfs file, device or program it touches. Recovery's usb_recover is a separate grant.
+no path, command or environment from its caller (only the SUDO_UID sudo itself sets): each verb
+checks its arguments against the one sysfs file, device or program it touches. Recovery's
+usb_recover is a separate grant.
 
   hil_root.py pattern 0|1                usbtest's pattern parameter
   hil_root.py modprobe                   modprobe usbtest
   hil_root.py dmesg                      the kernel log lines naming usbtest
   hil_root.py reset-tt BUSPORT           Reset_TT on the multi-TT hub port BUSPORT names
-  hil_root.py netns BUSPORT PID          move the USB network interface of BUSPORT's device into
-                                         PID's network namespace, one an unprivileged user
-                                         namespace owns; prints its ifindex and name
+  hil_root.py netns BUSPORT PID          move the USB network interface of BUSPORT's device, a
+                                         board (NETNS_VIDS), into PID's network namespace, one
+                                         a user namespace the sudo caller (never root) created
+                                         owns; prints its ifindex and name
 
 Exit 2 refuses a request; otherwise the operation's own status, its error on stderr.
 Callers build the argv with `argv()`.
@@ -45,10 +47,14 @@ _CTRLTRANSFER = struct.Struct('@BBHHHIP')                   # struct usbdevfs_ct
 USBDEVFS_CONTROL = 0xC0005500 | _CTRLTRANSFER.size << 16   # _IOWR('U', 0, ...)
 RESET_TT = 9
 
-# A board's USB network function, never a host NIC: these class drivers only, and a locally
-# administered MAC (IEEE 802 U/L bit), which a NIC's burned-in, globally unique one never is
+# A board's USB network function, never a host NIC: a board's vendor id and one of these class
+# drivers. The id is the boundary because the caller cannot change a host NIC's (a host cdc_ether
+# or cdc_ncm adapter, a tethered phone), and a board claiming one moves only itself. A MAC is not:
+# hosts clone or randomize locally administered ones. 0xcafe: the TinyUSB examples' test VID.
+NETNS_VIDS = ('cafe',)
 NET_DRIVERS = ('cdc_ether', 'cdc_ncm', 'cdc_eem', 'rndis_host')
 NS_GET_USERNS = 0xb701                  # _IO(0xb7, 0x1), v6.12 include/uapi/linux/nsfs.h
+NS_GET_OWNER_UID = 0xb704               # _IO(0xb7, 0x4): a user namespace's creator uid (uid_t)
 RTM_NEWLINK, NLMSG_ERROR, IFLA_NET_NS_FD = 16, 2, 28       # v6.12 include/uapi/linux/rtnetlink.h
 NLM_F_REQUEST_ACK = 0x1 | 0x4
 _NLMSGHDR = struct.Struct('=IHHII')                         # len, type, flags, seq, pid
@@ -158,8 +164,10 @@ def reset_tt(busport):
 
 
 def usb_netdev(busport):
-    """(ifindex, name) of the one network interface BUSPORT's device has, refused unless a board's
-    USB network function drives it (NET_DRIVERS, a locally administered MAC)."""
+    """(ifindex, name) of the one network interface BUSPORT's device has, refused unless the device
+    is a board (NETNS_VIDS) and a USB network class driver (NET_DRIVERS) drives it. The ifindex is
+    read before the checks and again after: a device re-enumerated meanwhile gets a new one, so the
+    one returned is the one checked."""
     if not _BUSPORT.match(busport):
         raise Refused(f'busport {busport!r}: expected BUS-PORT[.PORT...]')
     try:
@@ -167,20 +175,25 @@ def usb_netdev(busport):
         if len(found) != 1:
             raise Refused(f'{busport}: expected one network interface, found {sorted(p.name for p in found)}')
         net = found[0]
+        ifindex = int(_read(net / 'ifindex'))
+        vid = _read(SYS_USB / busport / 'idVendor')
+        if vid not in NETNS_VIDS:
+            raise Refused(f'{busport}: vendor id {vid} is not a board\'s ({", ".join(NETNS_VIDS)})')
         driver = os.path.basename(os.readlink(net.parent.parent / 'driver'))
         if driver not in NET_DRIVERS:
             raise Refused(f'{busport}: {net.name} is driven by {driver}, not a USB network function')
-        if not int(_read(net / 'address').split(':')[0], 16) & 0x02:
-            raise Refused(f'{busport}: {net.name} has a globally unique MAC, not a board\'s')
-        return int(_read(net / 'ifindex')), net.name
+        if int(_read(net / 'ifindex')) != ifindex:
+            raise Refused(f'{busport}: {net.name} changed while it was checked')
+        return ifindex, net.name
     except (OSError, ValueError) as e:
         raise Refused(f'{busport}: {getattr(e, "strerror", None) or e}')
 
 
 def sandbox_netns(pid):
     """An fd on PID's network namespace, refused unless a user namespace other than the initial
-    one owns it: an unprivileged process's sandbox, never the host's or a root container's. Held
-    open, so a PID reused after this check cannot redirect the move."""
+    one owns it and a user other than root created that one -- the sudo caller (SUDO_UID, which
+    sudo sets) when there is one: an unprivileged process's sandbox, never the host's or a root
+    container's. Held open, so a PID reused after this check cannot redirect the move."""
     if not pid.isdecimal() or int(pid) < 2:
         raise Refused(f'pid {pid!r}: expected a process id')
     try:
@@ -191,10 +204,16 @@ def sandbox_netns(pid):
         owner = fcntl.ioctl(fd, NS_GET_USERNS)
         try:
             st, init = os.fstat(owner), os.stat(PROC / '1' / 'ns' / 'user')
+            uid, = struct.unpack('=I', fcntl.ioctl(owner, NS_GET_OWNER_UID, bytes(4)))
         finally:
             os.close(owner)
         if (st.st_dev, st.st_ino) == (init.st_dev, init.st_ino):
             raise Refused(f'pid {pid}: its network namespace is not owned by an unprivileged user namespace')
+        if uid == 0:
+            raise Refused(f'pid {pid}: its user namespace was created by root')
+        caller = os.environ.get('SUDO_UID')
+        if caller is not None and str(uid) != caller:
+            raise Refused(f'pid {pid}: its user namespace was created by uid {uid}, not the sudo caller {caller}')
     except BaseException:
         os.close(fd)
         raise
