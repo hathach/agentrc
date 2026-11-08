@@ -533,10 +533,13 @@ def _survey(root: int) -> dict:
     return {'processes': sorted(found, key=lambda p: p['pid']), 'unreadable': sorted(unreadable)}
 
 
-def _bounded(fn, bound: float):
-    # a /proc read can block (stat takes exec_update_lock, cmdline the mm's lock): fn() or None past `bound` s
+def _bounded(fn, bound: float, last: list | None = None):
+    # a /proc read can block (stat takes exec_update_lock, cmdline the mm's lock): fn() or None past `bound` s;
+    # `last` keeps the thread, so a caller can start no other while one is still blocked
     out = []
     t = threading.Thread(target=lambda: out.append(fn()), daemon=True)
+    if last is not None:
+        last[:] = [t]
     t.start()
     t.join(bound)
     return out[0] if out else None
@@ -771,11 +774,24 @@ def _dir_receipt(state_dir: str, token: str, found: set) -> dict:
     return _receipt(base, token, {'pid': rec.get('pid'), 'start': rec.get('start'), 'lock': lock})
 
 
+def _proc_exemptions() -> tuple[bool, set] | None:
+    """(CAP_SYS_PTRACE effective, our fsgid and supplementary gids) from /proc/self/status; None when unreadable, or
+    outside the init user namespace: a hidepid mount's ptrace check and gid= are against init's caps and gids."""
+    try:
+        if os.readlink('/proc/self/ns/user') != f'user:[{0xEFFFFFFD}]':       # PROC_USER_INIT_INO
+            return None
+        with open('/proc/self/status', errors='replace') as f:
+            status = dict(line.split(':', 1) for line in f if ':' in line)
+        return (int(status['CapEff'], 16) >> 19 & 1 == 1,                       # CAP_SYS_PTRACE
+                {int(status['Gid'].split()[3]), *map(int, status['Groups'].split())})
+    except (OSError, KeyError, ValueError, IndexError):
+        return None
+
+
 def _proc_hides_others() -> bool:
-    """Whether /proc may hide another uid's processes from us: mounted hidepid other than 0 (proc(5)), or its
-    mount unreadable; never for root."""
-    if os.geteuid() == 0:
-        return False
+    """Whether /proc may hide another uid's processes from us: mounted hidepid other than 0 (proc(5)), unless we have
+    CAP_SYS_PTRACE or, for hidepid 1 or 2, are in its gid= group, 0 when absent (fs/proc/base.c has_pid_permissions);
+    or its mount unreadable, or our status for a mount that needs it (_proc_exemptions)."""
     try:
         with open('/proc/self/mountinfo', errors='replace') as f:
             lines = [line.split() for line in f]
@@ -785,12 +801,25 @@ def _proc_hides_others() -> bool:
     if not procs:
         return True
     opts = ','.join(procs[-1][5:]).split(',')          # the mount's options and its super options
-    return any(o.startswith('hidepid=') and o not in ('hidepid=0', 'hidepid=off') for o in opts)
+    hidepid = [o[len('hidepid='):] for o in opts if o.startswith('hidepid=')]
+    if not hidepid or hidepid[-1] in ('0', 'off'):
+        return False
+    exempt = _proc_exemptions()
+    if exempt is None:
+        return True
+    ptrace, gids = exempt
+    if ptrace:
+        return False
+    if hidepid[-1] not in ('1', 'noaccess', '2', 'invisible'):
+        return True                 # ptraceable, or a mode we do not know: gid= exempts no one
+    gid = ([o[len('gid='):] for o in opts if o.startswith('gid=')] or ['0'])[-1]
+    return not (gid.isdigit() and int(gid) in gids)
 
 
 def _supervisors_in(state_dir: str) -> list | None:
-    """The pids /proc shows running a supervisor (this file's `--supervise JOB`, as run_tracked starts it) of an
-    operation in `state_dir`, from their command lines alone; None when /proc may not show every process to us."""
+    """[pid] of the first process /proc shows running a supervisor (this file's `--supervise JOB`, as run_tracked
+    starts it) of an operation in `state_dir`, from command lines alone, else []; None when /proc may not show every
+    process to us."""
     if _proc_hides_others():
         return None
     dirs = {os.path.abspath(state_dir), os.path.realpath(state_dir)}
@@ -798,7 +827,6 @@ def _supervisors_in(state_dir: str) -> list | None:
         names = os.listdir('/proc')
     except OSError:
         return None
-    pids = []
     for name in names:
         if not name.isdigit():
             continue
@@ -816,18 +844,22 @@ def _supervisors_in(state_dir: str) -> list | None:
         except (IndexError, ValueError, TypeError, KeyError):
             continue
         if isinstance(lock, str) and os.path.dirname(lock) in dirs:
-            pids.append(int(name))
-    return pids
+            return [int(name)]          # one is proof enough: read no command line that may block after it
+    return []
+
+
+_proc_scan: list = []       # _foreign_state's last scan thread
 
 
 def _foreign_state(entry: dict) -> str:
     """'pending' while /proc shows a supervisor of an operation in the entry's state dir, or cannot show every
-    process within PROC_SCAN_BOUND; 'unknown' once it shows none: the dir's records, of another uid, prove no `done`.
-    A supervisor lives until it has reaped every descendant, so /proc shows it for as long as its lock is held."""
+    process within PROC_SCAN_BOUND, or an earlier scan is still blocked (one such thread, not one per poll); 'unknown'
+    once it shows none: the dir's records, of another uid, prove no `done`. A supervisor lives until it has reaped
+    every descendant, so /proc shows it for as long as its lock is held."""
     d = entry.get('foreign')
-    if not isinstance(d, str):
+    if not isinstance(d, str) or any(t.is_alive() for t in _proc_scan):
         return 'pending'
-    return 'unknown' if _bounded(lambda: _supervisors_in(d), PROC_SCAN_BOUND) == [] else 'pending'
+    return 'unknown' if _bounded(lambda: _supervisors_in(d), PROC_SCAN_BOUND, _proc_scan) == [] else 'pending'
 
 
 def _foreign_entry(state_dir: str) -> dict | None:

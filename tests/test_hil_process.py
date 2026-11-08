@@ -901,8 +901,8 @@ class ForeignStateDir(unittest.TestCase):
 
     MOUNT = '25 30 0:23 / /proc rw,nosuid,nodev {} - proc proc {}\n'
 
-    def hides(self, mounts, euid=1000):
-        with mock.patch.object(hp.os, 'geteuid', return_value=euid), \
+    def hides(self, mounts, exempt=(False, {1000})):
+        with mock.patch.object(hp, '_proc_exemptions', return_value=exempt), \
                 mock.patch('builtins.open', mock.mock_open(read_data=mounts)):
             return hp._proc_hides_others()
 
@@ -915,10 +915,54 @@ class ForeignStateDir(unittest.TestCase):
         shadowed = self.MOUNT.format('shared:12', 'rw') + self.MOUNT.format('master:1', 'rw,hidepid=2')
         self.assertTrue(self.hides(shadowed))                   # the later mount is the one /proc names
         self.assertTrue(self.hides('26 30 0:24 / /sys rw - sysfs sysfs rw\n'))      # no /proc mount found
-        self.assertFalse(self.hides(self.MOUNT.format('shared:12', 'rw,hidepid=2'), euid=0))
-        with mock.patch.object(hp.os, 'geteuid', return_value=1000), \
-                mock.patch('builtins.open', side_effect=PermissionError(errno.EACCES, 'denied')):
+        with mock.patch('builtins.open', side_effect=PermissionError(errno.EACCES, 'denied')):
             self.assertTrue(hp._proc_hides_others())
+
+    def test_hidepid_exempts_cap_sys_ptrace_and_its_gid_group_only(self):
+        """agentrc#484 Y1/J2: root was exempt without CAP_SYS_PTRACE, and a member of the mount's gid= was not."""
+        for opts, exempt, hidden in (
+                ('rw,hidepid=2,gid=4', (False, {0}), True),             # root without CAP_SYS_PTRACE, not in gid 4
+                ('rw,hidepid=2,gid=4', (True, {1000}), False),
+                ('rw,hidepid=ptraceable', (True, {1000}), False),
+                ('rw,hidepid=2,gid=4', (False, {4, 1000}), False),
+                ('rw,hidepid=noaccess,gid=4', (False, {4}), False),
+                ('rw,hidepid=invisible', (False, {0}), False),          # no gid=: group 0
+                ('rw,hidepid=ptraceable,gid=4', (False, {4}), True),    # ptraceable ignores gid=
+                ('rw,hidepid=2', None, True),                           # status unreadable, or another user ns
+                ('rw', None, False)):
+            with self.subTest(opts=opts, exempt=exempt):
+                self.assertEqual(self.hides(self.MOUNT.format('shared:12', opts), exempt), hidden)
+
+    def test_proc_exemptions_read_cap_sys_ptrace_and_gids_in_the_init_user_ns_only(self):
+        status = 'Name:\tx\nGid:\t0\t0\t0\t7\nGroups:\t4 20 \nCapEff:\t{}\n'
+        init = 'user:[4026531837]'
+
+        def exemptions(data, ns=init):
+            with mock.patch.object(hp.os, 'readlink', return_value=ns), \
+                    mock.patch('builtins.open', mock.mock_open(read_data=data)):
+                return hp._proc_exemptions()
+        self.assertEqual(exemptions(status.format('0000000000080000')), (True, {7, 4, 20}))
+        self.assertEqual(exemptions(status.format('00000000a80425fb')), (False, {7, 4, 20}))   # no bit 19
+        self.assertIsNone(exemptions(status.format('000001ffffffffff'), 'user:[4026532001]'))
+        self.assertIsNone(exemptions('Name:\tx\n'))
+        with mock.patch.object(hp.os, 'readlink', return_value=init), \
+                mock.patch('builtins.open', side_effect=PermissionError(errno.EACCES, 'denied')):
+            self.assertIsNone(hp._proc_exemptions())
+
+    def test_supervisors_in_stops_at_the_first_supervisor_found(self):
+        d = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d)
+        argv = {'7': [b'sleep', b'9'], '8': [b'python', b'--supervise', json.dumps({'lock': f'{d}/a.lock'}).encode()]}
+        opened = []
+
+        def proc_open(path, mode='r', *a, **k):
+            opened.append(path)
+            return io.BytesIO(b'\0'.join(argv[path.split('/')[2]]))
+        with mock.patch.object(hp, '_proc_hides_others', return_value=False), \
+                mock.patch.object(hp.os, 'listdir', return_value=['self', '7', '8', '9']), \
+                mock.patch('builtins.open', side_effect=proc_open):
+            self.assertEqual(hp._supervisors_in(d), [8])
+        self.assertEqual(opened, ['/proc/7/cmdline', '/proc/8/cmdline'])       # 9 never read
 
     def test_a_dir_of_another_uid_is_one_entry_rechecked_from_proc_and_never_read(self):
         top = os.path.realpath(tempfile.mkdtemp())
@@ -934,9 +978,20 @@ class ForeignStateDir(unittest.TestCase):
                 self.assertEqual(hp.recheck_dir(d), ('pending', [entry]))
             with mock.patch('builtins.open', side_effect=PermissionError(errno.EACCES, 'denied')):
                 self.assertEqual(hp.recheck(entry), 'pending')         # a command line it cannot read
-            with mock.patch.object(hp, 'PROC_SCAN_BOUND', 0.01), \
-                    mock.patch.object(hp, '_supervisors_in', side_effect=lambda _: time.sleep(0.3) or []):
+            release, scans = threading.Event(), []
+            self.addCleanup(release.set)
+
+            def blocked(_):
+                scans.append(1)
+                release.wait(10)
+                return []
+            with mock.patch.object(hp, 'PROC_SCAN_BOUND', 0.01), mock.patch.object(hp, '_supervisors_in', blocked):
                 self.assertEqual(hp.recheck(entry), 'pending')         # not listed within its bound
+                self.assertEqual(hp.recheck(entry), 'pending')         # nor while that scan is still blocked
+                self.assertEqual(len(scans), 1)                         # and no second scan thread started
+                release.set()
+                hp._proc_scan[0].join(5)
+                self.assertEqual(hp.recheck(entry), 'unknown')
             self.assertEqual(hp.recheck({'token': 'foreign:1', 'foreign': 1}), 'pending')
         self.assertEqual(os.listdir(d), ['hil_op_a.log'])
 
