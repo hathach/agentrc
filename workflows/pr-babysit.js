@@ -3323,23 +3323,20 @@ if (pinned.badPushUrl) {
 // #443: a candidate whose push was refused or went unread may have landed after all. Only the live PR head being its exact
 // commit proves that, never ancestry or a rebasedHead; its failure stays in the state as the evidence.
 let reconciled = null
-const landed = restored && restored.pin && restored.pending
-const source = landed && history.length ? history[history.length - 1][landed.lane === 'adopt' ? 'adoption' : `${landed.lane}PushFailed`] : null
-if (source && landed.sha && landed.sha === pinned.prHead.trim() && (landed.lane === 'adopt' ? source.to : source.sha) === landed.sha &&
-  ['publication-unknown', 'push-failed', 'adopt-push-unknown', 'adopt-push-failed'].includes(landed.stage)) {
-  const last = { ...history[history.length - 1] }
-  if (landed.lane === 'adopt') {
-    reconciled = { lane: 'adopt', stage: landed.stage, sha: landed.sha, parent: landed.parent, failure: { publication: source.publication, detail: source.detail } }
-    last.adoption = { ...source, publication: 'already-published', detail: `PR #${args.pr} heads ${landed.sha.slice(0, 7)}, read back by a later preflight` }
-  } else {
-    reconciled = { lane: landed.lane, stage: landed.stage, sha: landed.sha, parent: landed.parent, failure: source }
-    delete last[`${landed.lane}PushFailed`]
-  }
-  last.reconciled = reconciled
+const candidate = restored && restored.pin && restored.pending
+const source = candidate && history.length ? history[history.length - 1][candidate.lane === 'adopt' ? 'adoption' : `${candidate.lane}PushFailed`] : null
+if (source && candidate.sha && candidate.sha === pinned.prHead.trim() && (candidate.lane === 'adopt' ? source.to : source.sha) === candidate.sha &&
+  ['publication-unknown', 'push-failed', 'adopt-push-unknown', 'adopt-push-failed'].includes(candidate.stage)) {
+  const { lane, stage, sha, parent } = candidate
+  const failure = lane === 'adopt' ? { publication: source.publication, detail: source.detail } : source
+  reconciled = { lane, stage, sha, parent, failure }
+  const last = { ...history[history.length - 1], reconciled }
+  if (lane === 'adopt') last.adoption = { ...source, publication: 'already-published', detail: `PR #${args.pr} heads ${sha.slice(0, 7)}, read back by a later preflight` }
+  else delete last[`${lane}PushFailed`]
   history[history.length - 1] = last
-  expectedHead = landed.sha
+  expectedHead = sha
   restored = { ...restored, expectedHead, pending: pendingOf() }
-  log(`preflight: the ${landed.lane} candidate ${landed.sha.slice(0, 7)} on ${landed.parent.slice(0, 7)}, recorded ${landed.stage}, is published: PR #${args.pr} heads it; ` +
+  log(`preflight: the ${lane} candidate ${sha.slice(0, 7)} on ${parent.slice(0, 7)}, recorded ${stage}, is published: PR #${args.pr} heads it; ` +
     'continuing from it, its debt, answers and decisions kept')
 }
 if (rebasedHead !== null) {
@@ -3434,8 +3431,9 @@ if (adopting) {
   }
   adoption = { from: X, to: adoptHead, commits: shas, paths: [...new Set(paths.map(canon))], published: prHead === adoptHead }
 }
-if (rebasedHead !== null && rebasedHead === restored.expectedHead) log(`preflight: rebasedHead ${rebasedHead.slice(0, 7)} is the candidate reconciled above: nothing to re-pin`)
-const rebased = rebasedHead !== null && rebasedHead !== restored.expectedHead ? { from: restored.expectedHead, to: rebasedHead } : null
+const repinned = rebasedHead !== null && !(reconciled && rebasedHead === reconciled.sha)
+if (rebasedHead !== null && !repinned) log(`preflight: rebasedHead ${rebasedHead.slice(0, 7)} is the candidate reconciled above: nothing to re-pin`)
+const rebased = repinned ? { from: restored.expectedHead, to: rebasedHead } : null
 if (rebased) log(`preflight: re-pinned ${rebased.from.slice(0, 7)} -> ${rebased.to.slice(0, 7)}, the PR history the caller rewrote, unaudited; cycles, answers, decisions, holds and deferrals kept`)
 // A rewrite renamed our repair commits: a pending fix note keeps its body but can no longer be posted on a judgment naming one.
 if (rebased) for (const d of debt.values()) if (d.attempt) delete d.attempt.repair
