@@ -480,6 +480,12 @@ class UsbAbsent(unittest.TestCase):
         patch(self, uo, 'read_sysfs', replacing)
         self.assertFalse(uo.usb_absent(self.ID, 'UID1'))
 
+    def test_without_a_serial_any_match_is_presence_and_no_serial_is_read(self):
+        self.wedged('1-1')    # a read would strand a reader: none is made
+        self.assertFalse(uo.usb_absent(self.ID))
+        self.assertTrue(uo.usb_absent(('cafe', '4012')))
+        self.assertEqual(self.reads, [])
+
     def test_no_vid_pid_match_is_absence(self):
         self.dev('1-1', *self.ID, serial='UID1')
         self.assertTrue(uo.usb_absent(('cafe', '4012'), 'UID1'))

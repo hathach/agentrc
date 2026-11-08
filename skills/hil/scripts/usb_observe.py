@@ -262,8 +262,11 @@ def usb_absent(vid_pid=None, serial=None, vid=None, timeout=SYSFS_READ_GRACE) ->
     False while any device matching vid_pid/vid has a serial that is missing, unreadable or
     timed out, or re-enumerated while it was read: that device could be the one sought, so it
     cannot establish absence. True only when every match's serial was read and differs, or
-    nothing matches. Stops at the first device that rules absence out.
+    nothing matches. Stops at the first device that rules absence out; without `serial`, any
+    match does, and no serial is read.
     """
+    if serial is None:
+        return not usb_devices(vid_pid, vid)
     for _, sn in _with_serials(vid_pid, vid, timeout):
         if sn is None or serial is None or sn.lower() == serial.lower():
             return False
