@@ -1091,8 +1091,9 @@ class PendingSessions(os.PathLike):
 
     A consumer's invocations claim the board in it write-ahead (claim, claim_entry): under the
     board's flock or the caller's hold, it claims before its first tool; refuses this attempt
-    when another invocation_state is 'alive' (two commands under one hold); removes an 'ended'
-    one; logs an 'unresolved' one's new receipts (log_cleanup_failure, task its claim; never
+    when another is claim_alive (two commands under one hold), before judging any; then, its
+    `keep` read anew (logged_tokens of open_cleanup_failures), judges each (invocation_state):
+    removes an 'ended' one; logs an 'unresolved' one's new receipts (log_cleanup_failure, task its claim; never
     end_failed on a hold it does not own) and removes it once logged, refreshes and reports
     open_cleanup_failures (failure_report), then settles those receipts plus its own probe-use
     check (settle) and, still occupied, removes its claim, ends the attempt and releases a lock
@@ -1284,9 +1285,15 @@ def claim_entry(ops, cmd) -> dict:
 
 
 def _claimant_alive(receipt) -> bool:
-    start = proc_start(receipt['pid'])
+    try:
+        with open(f'/proc/{receipt["pid"]}/stat', errors='replace') as f:
+            fields = f.read().rpartition(')')[2].split()
+        state, start = fields[0], fields[19]          # proc(5) fields 3 and 22
+    except (OSError, IndexError):
+        start = None
     if start is not None:
-        return start == receipt['start']    # another start: the pid was reused
+        # another start: the pid was reused; a zombie or dead task has exited, unreaped
+        return start == receipt['start'] and state not in ('Z', 'X', 'x')
     try:
         os.kill(receipt['pid'], 0)
     except ProcessLookupError:
@@ -1296,18 +1303,27 @@ def _claimant_alive(receipt) -> bool:
     return True       # running, its start unreadable (another user's /proc under hidepid): never read as dead
 
 
+def claim_alive(session) -> bool:
+    """Whether the invocation of a claim PendingSessions.claim returned still runs: its pid with
+    its recorded start time and not exited, or running with its start unreadable (never read as
+    dead). It reads only /proc: the gate before any invocation_state, which tidies."""
+    r = session.get('receipt') if isinstance(session, dict) else None
+    return _is_claim(r) and _claimant_alive(r)
+
+
 def invocation_state(session, keep=()) -> tuple:
-    """(state, receipts) of another invocation's session PendingSessions.claim returned:
-    'alive' while its pid runs with its recorded start, or runs with its start unreadable;
-    'ended' once it is gone and recheck_dir of its ops dir answers done (that tidies them, except
-    the tokens in `keep`: logged_tokens of the board's open failures, which resolve_restored
-    still rechecks); else 'unresolved' with recheck_dir's open entries, full receipts or
+    """(state, receipts) of another invocation's session PendingSessions.claim returned, judged
+    only once claim_alive is False for every other session listed and with `keep` read after
+    that: a live claimant may log, and so keep, a receipt an earlier read did not name.
+    'alive' while claim_alive; 'ended' once it is gone and recheck_dir of its ops dir answers
+    done (that tidies them, except the tokens in `keep`: logged_tokens of the board's open
+    failures, which resolve_restored still rechecks); else 'unresolved' with recheck_dir's open entries, full receipts or
     diagnostics. A session that is not a claim (an older consumer's) is 'unresolved' with its
     own receipt unless that rechecks done."""
     r = session.get('receipt') if isinstance(session, dict) else None
     if not _is_claim(r):
         return ('ended', []) if _rechecks([r])[0] == 'done' else ('unresolved', [r])
-    if _claimant_alive(r):
+    if claim_alive(session):
         return 'alive', []
     try:
         verdict, entries = _process().recheck_dir(r['ops'], keep)

@@ -143,6 +143,11 @@ class InUse(Refused):
         self.found = found
 
 
+def refusal_report(e):
+    """The report keys a refusal carries: an InUse's open failures, the ones its claim logged included."""
+    return A.lock.failure_report(e.found) if isinstance(e, InUse) else {}
+
+
 class Unclean(Exception):
     """A child's end is not proven: nothing more may touch the board."""
 
@@ -746,13 +751,16 @@ def claim(name, tracker, found):
         others = record.claim(entry)
     except (OSError, ValueError, A.lock.PendingRefused) as e:
         raise Refused(f"the board's claim record could not name this invocation: {type(e).__name__}: {e}")
-    keep = A.lock.logged_tokens(found)
-    judged = [(s, *A.lock.invocation_state(s, keep)) for s in others]
     notes, unsettled = [], []
     try:
-        if alive := [s['receipt'] for s, state, _ in judged if state == 'alive']:
+        if alive := [s['receipt'] for s in others if A.lock.claim_alive(s)]:
             raise InUse(f'another invocation on {name} is running: {alive}', found)
-        for s, state, receipts in judged:
+        # read after the gate: a claimant alive at the take may have logged, and so keeps, a receipt since
+        keep = A.lock.logged_tokens(found + A.lock.open_cleanup_failures(name))
+        for s in others:
+            state, receipts = A.lock.invocation_state(s, keep)
+            if state == 'alive':   # not after the gate, but a live claim is never removed
+                continue
             unsettled += receipts
             if new := [r for r in receipts if not (isinstance(r, dict) and r.get('token') in keep)]:
                 if why := log_failure(name, 'an earlier invocation ended with children not proven ended',
@@ -1106,9 +1114,14 @@ def _session_op(args, run_dir):
         if not pending and not isinstance(e, Unclean):
             why = args.cmd == 'restore' and log_failure(
                 args.board, f'restore refused or raised: {type(e).__name__}: {e}', [])
+            if isinstance(e, InUse):   # its claim may have logged an earlier invocation's failure: kept with it
+                with contextlib.suppress(OSError):
+                    (run_dir / 'result.json').write_text(json.dumps(
+                        {'pass': False, 'board': args.board, 'error': '; '.join(filter(None, (str(e), why))),
+                         **extra, **refusal_report(e)}) + '\n')
             if why and isinstance(e, Refused):
-                raise Refused(f'{e}; {why}') from e
-            if why:
+                e.args = (f'{e}; {why}',)   # its type and report kept
+            elif why:
                 e.add_note(why)
             raise
         error = f'a child outlived its operation: {type(e).__name__}: {e}'
@@ -1142,6 +1155,7 @@ def _restore_and_release(args):
         except Exception as e:
             out['error'] = '; '.join([str(e) if isinstance(e, Refused) else f'{type(e).__name__}: {e}',
                                       *getattr(e, '__notes__', ())])
+            out.update(refusal_report(e))
         except BaseException as e:
             out['error'], interrupted = f'{type(e).__name__}: {e}', e
         finally:
@@ -1599,5 +1613,5 @@ def main(argv=None):
             return cmd_release(args)
         return cmd_report(args)
     except Refused as e:
-        emit({'pass': False, 'error': str(e)})
+        emit({'pass': False, 'error': str(e), **refusal_report(e)})
         return NOT_HELD if isinstance(e, NotHeld) else 2

@@ -2251,6 +2251,18 @@ class Claims(LockDir):
         self.assertEqual(hil_lock.invocation_state(dead), ('ended', []))
         self.assertEqual(os.listdir(ops), [])
 
+    def test_an_exited_claimant_not_yet_reaped_is_not_alive(self):
+        p, out = claimant(self, self.dir, BOARD, self.KIND, self.run / 'z')
+        self.assertTrue(hil_lock.claim_alive(out['entry']))
+        p.kill()                               # not waited: a zombie whose /proc start still matches
+        deadline = time.monotonic() + 10
+        while Path(f'/proc/{p.pid}/stat').read_text().rpartition(')')[2].split()[0] != 'Z':
+            self.assertLess(time.monotonic(), deadline)
+            _sleep(0.05)
+        self.assertEqual(hil_lock.proc_start(p.pid), out['entry']['receipt']['start'])
+        self.assertFalse(hil_lock.claim_alive(out['entry']))
+        self.assertEqual(hil_lock.invocation_state(out['entry']), ('ended', []))
+
     def test_a_running_claimant_whose_start_cannot_be_read_is_alive(self):
         live = subprocess.Popen(['sleep', '30'])
         self.addCleanup(live.wait)
@@ -2258,7 +2270,13 @@ class Claims(LockDir):
         entry = {'receipt': {'ops': str(self.run / 'none'), 'pid': live.pid, 'start': hil_lock.proc_start(live.pid)},
                  'cmd': 'x'}
         self.assertEqual(hil_lock.invocation_state(entry), ('alive', []))
-        with mock.patch.object(hil_lock, 'proc_start', return_value=None):
+        real_open = open
+
+        def unreadable(path, *a, **k):
+            if path == f'/proc/{live.pid}/stat':
+                raise PermissionError(13, 'hidepid')
+            return real_open(path, *a, **k)
+        with mock.patch('builtins.open', unreadable):
             self.assertEqual(hil_lock.invocation_state(entry), ('alive', []))
             with mock.patch.object(hil_lock.os, 'kill', side_effect=PermissionError):
                 self.assertEqual(hil_lock.invocation_state(entry), ('alive', []))

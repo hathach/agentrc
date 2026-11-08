@@ -108,9 +108,12 @@ nothing in it through a link.
   1. `claim(claim_entry(<ops dir>, <cmd>))` before its first tool lists
      `{ops, pid, start}`, its run_tracked state dir resolved, and returns the
      others; of two racing claims the later lists the earlier.
-  2. `invocation_state(<other>, keep=logged_tokens(<open failures>))` judges
-     each: `alive` (its pid runs with its start, or runs with its start
-     unreadable) refuses this attempt, two commands under one hold; `ended`
+  2. Any other `claim_alive` (its pid runs with its start and has not
+     exited, or runs with its start unreadable) refuses this attempt before
+     anything is judged: two commands under one hold. Only then,
+     `invocation_state(<other>, keep=logged_tokens(<open failures read
+     now>))` judges each, tidying what it proves done: a live claimant may
+     have logged a receipt since the take. `ended`
      (gone, its ops dir `recheck_dir` done) is removed; `unresolved` (gone,
      an operation not proven ended) has its receipts not yet logged appended
      with `log_cleanup_failure(..., task=<its claim>, receipts=...)`, never
