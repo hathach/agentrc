@@ -640,6 +640,110 @@ class InterruptAcrossTheFork(unittest.TestCase):
         self.assertEqual((r.returncode, r.stdout), (0, 'ok'))
         self.assertEqual((ra.returncode, ra.stdout), (0, b'ok'))
 
+
+@contextmanager
+def umask(mask):
+    old = os.umask(mask)
+    try:
+        yield
+    finally:
+        os.umask(old)
+
+
+def mode(path):
+    return os.lstat(path).st_mode & 0o7777
+
+
+class StateDir(unittest.TestCase):
+    """state_dir: a run dir and its state dir run_tracked trusts, whatever the umask; a link or
+    another user's directory is refused and left as it is."""
+
+    def setUp(self):
+        self.top = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.top)
+
+    def test_a_new_run_dir_and_state_dir_under_umask_002(self):
+        run = os.path.join(self.top, 'a', 'run')
+        with umask(0o002):
+            got = hp.state_dir(run)
+        self.assertEqual(got, os.path.join(run, 'ops'))
+        self.assertEqual((mode(run), mode(got)), (0o755, 0o700))
+        self.assertEqual(hp.trusted_dir(got), got)
+
+    def test_the_consumers_run_dir_made_first_under_umask_002(self):
+        run = Path(self.top, 'run')
+        with umask(0o002):
+            run.mkdir()
+            self.assertEqual(mode(run), 0o775)
+            (run / 'plain').mkdir(0o700)
+            with self.assertRaises(PermissionError):    # what run_tracked refuses without state_dir
+                hp.trusted_dir(str(run / 'plain'))
+            got = hp.state_dir(run, 'tracked')
+        self.assertEqual((got, mode(run), mode(got)), (str(run / 'tracked'), 0o755, 0o700))
+
+    def test_existing_dirs_of_ours_are_secured(self):
+        run = os.path.join(self.top, 'run')
+        os.makedirs(os.path.join(run, 'ops'))
+        os.chmod(run, 0o777)
+        os.chmod(os.path.join(run, 'ops'), 0o777)
+        Path(run, 'ops', 'kept').write_text('x')
+        got = hp.state_dir(run)
+        self.assertEqual((mode(run), mode(got), os.listdir(got)), (0o755, 0o700, ['kept']))
+
+    def test_a_link_is_refused_and_left_as_it_is(self):
+        real = os.path.join(self.top, 'real')
+        os.mkdir(real)
+        os.chmod(real, 0o777)
+        os.symlink(real, os.path.join(self.top, 'run'))
+        with self.assertRaisesRegex(PermissionError, 'link'):
+            hp.state_dir(os.path.join(self.top, 'run'))
+        self.assertEqual((mode(real), os.listdir(real)), (0o777, []))
+        run = os.path.join(self.top, 'run2')
+        os.mkdir(run)
+        os.symlink(real, os.path.join(run, 'ops'))
+        with self.assertRaisesRegex(PermissionError, 'link'):
+            hp.state_dir(run)
+        self.assertEqual(mode(real), 0o777)
+        os.symlink(os.path.join(self.top, 'gone'), os.path.join(self.top, 'dangling'))
+        with self.assertRaisesRegex(PermissionError, 'link'):
+            hp.state_dir(os.path.join(self.top, 'dangling'))
+        self.assertFalse(os.path.lexists(os.path.join(self.top, 'gone')))
+
+    def test_a_file_is_refused(self):
+        Path(self.top, 'run').write_text('')
+        with self.assertRaisesRegex(PermissionError, 'file'):
+            hp.state_dir(os.path.join(self.top, 'run'))
+
+    def test_another_users_dir_is_refused_and_never_chmodded(self):
+        run = os.path.join(self.top, 'run')
+        os.mkdir(run)
+        os.chmod(run, 0o775)
+        with mock.patch.object(hp.os, 'geteuid', return_value=os.geteuid() + 1), \
+                self.assertRaisesRegex(PermissionError, 'uid'):
+            hp.state_dir(run)
+        self.assertEqual((mode(run), os.listdir(run)), (0o775, []))
+        os.chmod(run, 0o755)
+        os.mkdir(os.path.join(run, 'ops'))
+        os.chmod(os.path.join(run, 'ops'), 0o770)
+        real_fstat = os.fstat
+
+        def foreign_ops(fd):
+            st = real_fstat(fd)
+            if st.st_ino != os.stat(os.path.join(run, 'ops')).st_ino:
+                return st
+            return mock.Mock(st_uid=st.st_uid + 1)
+        with mock.patch.object(hp.os, 'fstat', foreign_ops), self.assertRaisesRegex(PermissionError, 'uid'):
+            hp.state_dir(run)
+        self.assertEqual(mode(os.path.join(run, 'ops')), 0o770)
+
+    def test_a_name_must_be_one_path_component(self):
+        run = os.path.join(self.top, 'run')
+        for name in ('', '.', '..', 'a/b', '/abs', 'a\0b', None, b'ops'):
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, 'single path component'):
+                hp.state_dir(run, name)
+        self.assertFalse(os.path.exists(run), 'a refused name created nothing')
+
+
 # The prelude of every run_tracked case: hil_process loaded by file path as `hp`, the case's
 # state dir as `S`, scratch dir `D`, and report(), whose JSON line the test reads back.
 TRACKED_CHILD = """
@@ -1031,6 +1135,19 @@ class RunTracked(unittest.TestCase):
                                       'loose parent': ['refused', 'done', None, []],
                                       'sticky parent': ['done', []]})
         self.assertEqual(res['ran'], ['ran-sticky'])
+
+    def test_a_state_dir_made_under_umask_002_is_trusted(self):
+        """The consumer's sequence on a runner whose umask is 002: its run dir first, then state_dir."""
+        res = self.child("""
+            os.umask(0o002)
+            run = os.path.join(D, 'runs', 'board')
+            os.makedirs(run)
+            s = hp.state_dir(run, 'tracked')
+            r = hp.run_tracked('printf ok', timeout=20, settle=1, state_dir=s)
+            report(a=[r.returncode, r.stdout, r.cleanup], modes=[os.stat(p).st_mode & 0o777 for p in (run, s)],
+                   files=os.listdir(s))
+        """)
+        self.assertEqual((res['a'], res['modes'], res['files']), ([0, 'ok', 'done'], [0o755, 0o700], []))
 
     def test_a_replaced_lock_or_record_is_never_done(self):
         """What a user who could write the state dir would do: an unlocked lock and a matching

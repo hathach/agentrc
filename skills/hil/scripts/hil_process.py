@@ -34,7 +34,8 @@ Contract:
   write unless sticky: run_tracked (PermissionError, before anything starts) and recheck
   (unknown) check those two only (`trusted_dir`), since a replaced lock or record would forge
   `done`. Higher ancestors are not checked; the caller must keep them trusted and unchanged
-  for as long as a receipt names the directory. Files of a `done` run are removed only once
+  for as long as a receipt names the directory; `state_dir` creates one in the caller's run dir
+  whatever the umask. Files of a `done` run are removed only once
   the verdict is on the result or exception; the others stay for recheck and are the
   caller's to remove (`tidy`, once a recheck answers `done`). A missing file reads as unknown.
 """
@@ -44,6 +45,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import ctypes
+import errno
 import fcntl
 import json
 import math
@@ -439,6 +441,38 @@ def trusted_dir(path: str) -> str:
     if parent.st_uid not in (os.geteuid(), 0) or parent.st_mode & 0o022 and not parent.st_mode & stat.S_ISVTX:
         raise PermissionError(f'{real}: another user can replace it through its parent')
     return real
+
+
+def _own_dir(path: str, mode: int) -> None:
+    """`path` created if missing, then set to `mode` whatever the umask; refused (PermissionError), and never
+    chmodded, unless it is a real directory of ours."""
+    with contextlib.suppress(FileExistsError):
+        os.makedirs(path, mode)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as e:
+        if e.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise PermissionError(f'{path}: want a directory, not a link or a file') from e
+        raise
+    try:
+        if os.fstat(fd).st_uid != os.geteuid():
+            raise PermissionError(f'{path}: want a directory of uid {os.geteuid()}')
+        os.fchmod(fd, mode)
+    finally:
+        os.close(fd)
+
+
+def state_dir(parent: str, name: str = 'ops') -> str:
+    """A run_tracked state dir: `parent` (the caller's run dir) and `parent/name` created as needed and set to 0o755
+    and 0o700 whatever the umask, then returned through trusted_dir. An existing one of them is secured only when it
+    is a real directory of ours; a link or another user's is refused (PermissionError) and left as it is."""
+    if not isinstance(name, str) or name in ('', '.', '..') or '/' in name or '\0' in name:
+        raise ValueError(f'state dir name {name!r}: want a single path component')
+    parent = os.fspath(parent)
+    _own_dir(parent, 0o755)
+    path = os.path.join(parent, name)
+    _own_dir(path, 0o700)
+    return trusted_dir(path)
 
 
 def _become_subreaper() -> None:

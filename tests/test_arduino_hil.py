@@ -806,6 +806,18 @@ class Flash(Base):
         t._note('unknown', None, ['openocd'])
         self.assertIn('unrecheckable', t.pending[-1]['receipt'])
 
+    def test_tracker_state_dir_is_trusted_under_umask_002(self):
+        self.A.process = load_arduino_engine('skills/hil/scripts/hil_process.py')
+        run_dir = self.dir / 'run' / 'b'
+        old = os.umask(0o002)
+        try:
+            run_dir.mkdir(parents=True)   # run_board's order: the run dir, then the tracker
+            t = H.Tracker(run_dir)
+        finally:
+            os.umask(old)
+        self.assertEqual(t.state_dir, self.A.process.trusted_dir(str(run_dir / 'tracked')))
+        self.assertEqual([p.stat().st_mode & 0o777 for p in (run_dir, run_dir / 'tracked')], [0o755, 0o700])
+
 
 class BaseImage(Base):
     """A rig board's base image: admitted with its record, checked before every J-Link flash, rewritten only on a

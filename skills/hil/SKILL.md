@@ -349,7 +349,7 @@ recovery stay the contract's.
 | `hil_boards.py` | each board's flasher from the board registry by probe serial (Board registry above) |
 | `hil_load.py` | the one path loader: one module per file per process, a second path under one name refused |
 | `agentrc_source.py` | the identity of the agentrc a harness loads: its closure, commit and digests, the staged copy and its manifest, drift, the record comparison |
-| `hil_process.py` | `run_cmd`, a bounded command; `run_tracked` and `recheck`, a command whose end is proven |
+| `hil_process.py` | `run_cmd`, a bounded command; `run_tracked` and `recheck`, a command whose end is proven; `state_dir`, a directory it trusts |
 | `hil_farm_check.py` | the farm check engine a project's launcher drives with its profile (Farm check above) |
 | `hil_report_notice.py` | the unavailable notice and the report writer lock, loadable when the core is not (`write_unavailable`) |
 | `hil_openocd_esp_receipt.py` | an `openocd_esp` session's state from its receipt, loadable without the provider (`session_state`) |
@@ -391,6 +391,10 @@ recovery stay the contract's.
   other user can write, in a parent of its uid or root's that no other user
   can write unless sticky. Only those two are checked: the caller keeps every
   higher ancestor trusted and unchanged while any receipt names the directory.
+  `state_dir(run_dir, name='ops')` makes one whatever the umask: the run dir
+  0755 and `run_dir/name` 0700, each created or, when it is already a real
+  directory of the caller's, chmodded; a link or another user's directory is
+  refused (`PermissionError`) and left as it is.
 - A report is published through `hil_report_core`: the JSON is authoritative
   and the Markdown a view `prepare_pair` regenerates from it. An attempt that
   cannot publish recovers through `recover_publish` (a Markdown repair, or a

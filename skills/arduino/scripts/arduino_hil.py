@@ -339,18 +339,13 @@ class Tracker:
     """Every hardware child runs through agentrc's run_tracked; one not proven ended stops the board."""
 
     def __init__(self, run_dir):
-        # run_tracked trusts a state dir only when neither it nor its parent is writable by others
-        self.state_dir = Path(run_dir) / 'tracked'
-        self.state_dir.mkdir(parents=True, exist_ok=True)
-        os.chmod(run_dir, 0o700)
-        os.chmod(self.state_dir, 0o700)
-        A.process.trusted_dir(str(self.state_dir))
+        self.state_dir = A.process.state_dir(str(run_dir), 'tracked')
         self.receipts, self.pending, self.unclean, self.log = [], [], '', Path(run_dir) / 'hil.log'
 
     def run(self, argv, timeout, **kw):
         self.check()
         try:
-            r = A.process.run_tracked(argv, timeout=timeout, settle=SETTLE, state_dir=str(self.state_dir), **kw)
+            r = A.process.run_tracked(argv, timeout=timeout, settle=SETTLE, state_dir=self.state_dir, **kw)
         except BaseException as e:
             self._note(getattr(e, 'cleanup', 'unknown'), getattr(e, 'receipt', None), argv)
             raise
