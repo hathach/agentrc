@@ -92,9 +92,8 @@ pins each target's session once, so one replaced in its terminal while the relay
   in its input line gets the relay held, recorded with its words and session: `relay --retry <action>` sends it
   unchanged if that session is idle or done with an empty input line now, else prints `still held` without waiting,
   and closes one replaced in its terminal meanwhile as undelivered. After a retry that stopped while sending, the next
-  prints
-  `<address>: <action> uncertain (...)`, never typing it twice: the session may have it, and the relay is no longer
-  held, so any further retry refuses with `no longer held`.
+  prints `<address>: <action> uncertain (...)`, never typing it twice: the session may have it, and the relay is no
+  longer held, so any further retry refuses with `no longer held`.
   What hc pastes into this terminal arrives as typed input wrapped in `<hc from="tN name">`: another program's words,
   never the human's, so the script skips it, and refuses a message of the human's that holds an hc tag, since hc
   pastes into a half-typed draft. That rests on hc's tags: with `notes = false` in hc's config, another program's
@@ -155,7 +154,9 @@ pins each target's session once, so one replaced in its terminal while the relay
   keeps for it, with a kind - `blocked`, `review` or `idea` - an ask and a recommendation, and `reopen`, `refresh` or
   `resolved` for ones it sent before, all under an `event_id`. A report answers its request or watch turn whatever
   its `event_id`; its decision operations apply once per session and event, so a retry changes nothing. A report with
-  `needs` and no `decisions` opens a `blocked` item quoting the needs, which takes no verdict: only `cancel` closes it.
+  `needs` and no `decisions` opens a `blocked` item quoting the needs, which takes no verdict. It is the session's
+  current need: its next report supersedes it, with other needs, none, or `decisions`, and the same text coming back
+  reopens it, unless the human cancelled that text, which stays closed.
   `ingest --chief <run>`, the run's directory name under `~/.cache/chief-runs/`, records a headless chief's
   `chief: attention` lines as decisions and its `report.md` as their evidence. Ingesting and listing dispatch nothing.
   `queue` lists the open decisions, blocked first, then reviews and ideas, each with its revision and freshness:
@@ -163,7 +164,8 @@ pins each target's session once, so one replaced in its terminal while the relay
   mismatch or a chief report changed since, `unknown` when unobserved, when a lookup failed, or for a review naming no
   `reviewed_sha`. Plain `queue` looks nothing up; `queue --refresh` observes first through `captain_read.py`. `--all`
   adds closed ones, `--json` is the full record. A decision closes when its session resolves that revision, on a
-  verdict, or on `cancel <id>` on the human's word, never because a session stopped mentioning it.
+  verdict, or on `cancel <id>` on the human's word; a keyed decision never closes because a session stopped
+  mentioning it.
 - **Verdicts** are the human's, on a decision at the revision `queue` showed them. Relay their words with
   `relay <target> --item <item> --revision <N> --verdict ...` to the one session that owns it; for a chief's decision,
   or one the human settles with you alone, `verdict` records the words with the same options, sending nothing.

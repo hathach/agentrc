@@ -2293,7 +2293,7 @@ class DecisionTest(DecisionCase):
         self.assertEqual((item['legacy'], item['content'], item['key']),
                          (True, {'kind': 'blocked', 'ask': 'approve the merge'}, None))
         self.report_as('t2', self.m, GOOD)
-        self.assertEqual(self.items()[0]['state'], 'open', 'an empty need closes nothing')
+        self.assertEqual(self.items()[0]['closure']['why'], 'superseded', 'the session needs nothing now')
 
     def test_cancel_closes_an_open_decision_once(self):
         self.send(decision('merge'))
@@ -2302,6 +2302,102 @@ class DecisionTest(DecisionCase):
         self.assertEqual(self.item()['closure']['why'], 'cancelled')
         with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
             captain.cancel(iid, self.ident)
+
+
+class LegacyNeedsTest(DecisionCase):
+    """A report's bare needs are its session's current need, superseded by the session's next report."""
+
+    def need(self, text, address='t2', member=None, event=None):
+        """t2, or address as member, reports needs with no decisions: what the report printed."""
+        f = self.state / 'r.json'
+        f.write_text(json.dumps({**GOOD, 'needs': text, **({'event_id': event} if event else {})}), encoding='utf-8')
+        return self.as_target(captain.report, member or self.m, str(f), address=address)[1]
+
+    def needs(self):
+        """{needs text: (state, closure reason, revision)} of the legacy items."""
+        return {i['content']['ask']: (i['state'], (i['closure'] or {}).get('why'), i['revision'])
+                for i in self.items() if i['legacy']}
+
+    def cancel(self, text):
+        iid = next(i['id'] for i in self.items() if i['legacy'] and i['content']['ask'] == text)
+        with mock.patch('builtins.print'):
+            captain.cancel(iid, self.ident)
+
+    def test_the_next_report_supersedes_with_other_needs_none_or_decisions(self):
+        self.need('merge #12?')
+        self.need('rebase first?')
+        self.assertEqual(self.needs(), {'merge #12?': ('closed', 'superseded', 1), 'rebase first?': ('open', None, 1)})
+        self.need('')
+        self.assertEqual(self.needs()['rebase first?'], ('closed', 'superseded', 1))
+        self.need('ci red?')
+        self.send()
+        self.assertEqual(self.needs()['ci red?'], ('closed', 'superseded', 1), 'decisions, empty ones too')
+
+    def test_needs_with_decisions_open_no_item_and_keyed_decisions_are_untouched(self):
+        self.send(decision('merge'), needs='see decisions')
+        self.need('ci red?')
+        self.need('')
+        self.assertEqual(self.needs(), {'ci red?': ('closed', 'superseded', 1)})
+        self.assertEqual(self.item()['state'], 'open')
+
+    def test_the_same_needs_again_change_nothing_and_superseded_text_reopens(self):
+        self.need('merge #12?')
+        self.need('merge #12?')
+        self.assertEqual(self.needs(), {'merge #12?': ('open', None, 1)})
+        opened = next(i['opened'] for i in self.items())
+        self.need('')
+        self.need('merge #12?')
+        self.assertEqual(self.needs(), {'merge #12?': ('open', None, 2)})
+        self.assertEqual(next(i['opened'] for i in self.items()), opened)
+
+    def test_text_the_human_cancelled_stays_closed(self):
+        self.need('merge #12?')
+        self.cancel('merge #12?')
+        self.need('merge #12?')
+        self.need('other')
+        self.need('merge #12?')
+        self.assertEqual(self.needs()['merge #12?'], ('closed', 'cancelled', 1))
+
+    def test_each_session_supersedes_only_its_own_and_a_silent_one_keeps_it(self):
+        self.terminals['t3'] = pinned('t3')
+        t3 = self.joined_as('t3')
+        self.need('merge #12?')
+        self.need('review #13?', address='t3', member=t3)
+        self.need('')
+        self.assertEqual(self.needs(), {'merge #12?': ('closed', 'superseded', 1), 'review #13?': ('open', None, 1)})
+
+    def test_a_request_answer_and_a_watch_report_both_count(self):
+        self.need('merge #12?')
+        msg = self.msg_of(self.ask())
+        self.report_as('t2', msg, {**GOOD, 'needs': 'rebase first?'})
+        self.assertEqual(self.needs(), {'merge #12?': ('closed', 'superseded', 1), 'rebase first?': ('open', None, 1)})
+
+    def test_an_old_event_sent_again_supersedes_nothing_even_from_where_its_session_moved(self):
+        self.need('merge #12?', event='e1')
+        self.need('rebase first?', event='e2')
+        self.need('merge #12?', event='e1')
+        self.terminals['t3'] = {**pinned('t3'), 'session': 's-t2'}   # the same session resumed in t3
+        del self.terminals['t2']
+        self.need('merge #12?', address='t3', member=self.joined_as('t3'), event='e1')
+        self.assertEqual(self.needs(), {'merge #12?': ('closed', 'superseded', 1), 'rebase first?': ('open', None, 1)})
+        self.assertEqual(next(i for i in self.items() if i['state'] == 'open')['owner']['address'], 't3')
+
+    def test_a_ledger_shaped_like_a_long_running_one_lists_each_session_s_latest_need(self):
+        latest = {}
+        for n, address in enumerate(('t3', 't4', 't5', 't6', 't7')):
+            self.terminals[address] = pinned(address)
+            member = self.joined_as(address)
+            for k in range(n + 2):   # repeated and reworded needs, then the latest
+                self.need(f'{address} need {k // 2}', address=address, member=member)
+            latest[address] = '' if address == 't4' else 'cancel me' if address == 't6' else f'{address} need {n}'
+            self.need(latest[address], address=address, member=member)
+        self.cancel('cancel me')
+        self.need('cancel me', address='t6', member=self.member('t6')[-1]['msg'])
+        with mock.patch('builtins.print') as out:
+            captain.queue(False, True)
+        listed = [i['ask'] for i in json.loads(out.call_args_list[0].args[0])['items']]
+        self.assertEqual(sorted(listed), ['t3 need 0', 't5 need 2', 't7 need 4'])
+        self.assertEqual(sum(i['state'] == 'open' for i in self.items() if i['legacy']), 3, 'the rest kept, closed')
 
 
 class FreshnessTest(DecisionCase):
@@ -2476,7 +2572,7 @@ class VerdictTest(VerdictCase):
         self.report_as('t2', member, {**GOOD, 'needs': 'merge #12?'})
         [legacy] = self.items()
         self.say('merge it')
-        self.assertIn('only `cancel`', self.refused(captain.verdict, (legacy, 1, 'decision'), None, self.ident))
+        self.assertIn('takes no verdict', self.refused(captain.verdict, (legacy, 1, 'decision'), None, self.ident))
 
     def test_a_verdict_needs_its_captain_still_running(self):
         self.report(decision('merge', kind='blocked'))
