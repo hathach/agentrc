@@ -848,8 +848,8 @@ def event_owner(recs):
 
 
 def earlier_event(recs, source, payload):
-    """The index of the report this session sent before under payload's event_id, or None; dies when that report
-    differs, so a reused id never applies other operations."""
+    """The ref, `<msg>:<index>`, of the report this session sent before under payload's event_id, through any request
+    or watch, or None; dies when that report differs, so a reused id never applies other operations."""
     event = payload.get('event_id')
     if not event:
         return None
@@ -861,7 +861,7 @@ def earlier_event(recs, source, payload):
                 and (owner['target']['account'], owner['target']['session']) == me:
             if r['report'] != payload:
                 die(f'event_id {event} was sent before with a different report', 2)
-            return i
+            return f'{r["msg"]}:{i}'
     return None
 
 
@@ -897,13 +897,14 @@ def report(msg, file):
             member_watch(member, recs, mine)
             again = earlier_event(recs, member, payload)
             if again is not None:
-                print(f'recorded {msg}:{again}')
+                print(f'recorded {again}')
                 return 0
             append({'type': 'report', 'msg': msg, 'report': payload})
             print(f'recorded {msg}:{len(recs)}')   # every report is kept, so a blind retry would duplicate one
             return 0
         requested(msg, recs, mine)
-        earlier_event(recs, source, payload)   # dies on a reused event_id; an identical one is deduplicated later
+        # dies on a reused event_id; an identical one still answers this request, its operations applied once
+        earlier_event(recs, source, payload)
         earlier = first(recs, 'report', msg)
         if earlier:
             if earlier['report'] == payload:
@@ -1189,6 +1190,9 @@ def apply_report(found, i, source, payload):
     """Fold one report's decision operations into found. The owner is the reporting session's account and session,
     never a payload field; its handle and pinned target follow the latest report."""
     owner = source['target']
+    for item in found.values():   # an authenticated report refreshes where its session runs, never relay targets
+        if (item['owner'].get('account'), item['owner'].get('session')) == (owner['account'], owner['session']):
+            item['owner'], item['handle'] = owner, source['handle']
     ids = {}
     for d in payload.get('decisions', []):
         iid = ids[d['key']] = item_id('d', owner['account'], owner['session'], d['key'])
@@ -1196,7 +1200,6 @@ def apply_report(found, i, source, payload):
         if not item:
             found[iid] = new_item(iid, i, source, d['key'], d)
             continue
-        item['owner'], item['handle'] = owner, source['handle']
         reopen = d['key'] in payload.get('reopen', [])
         if d != item['content'] or reopen or d['key'] in payload.get('refresh', []):
             revise(item, i, d, reopen)

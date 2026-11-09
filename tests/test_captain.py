@@ -2159,7 +2159,10 @@ class DecisionTest(WatchCase):
         return {**GOOD, 'event_id': event, 'decisions': list(decisions), **ops}
 
     def send(self, *decisions, address='t2', member=None, event=None, **ops):
-        return self.report_as(address, member or self.m, self.payload(decisions, event, ops))
+        """What the report printed."""
+        f = self.state / 'r.json'
+        f.write_text(json.dumps(self.payload(decisions, event, ops)), encoding='utf-8')
+        return self.as_target(captain.report, member or self.m, str(f), address=address)[1]
 
     def refused(self, *decisions, event=None, payload=None, **ops):
         """Why t2's report is rejected, nothing recorded."""
@@ -2197,12 +2200,28 @@ class DecisionTest(WatchCase):
         self.assertEqual(self.count('report'), 1)
         self.assertIn('different report', self.refused(decision('merge', ask='other'), event='e'))
 
-    def test_an_event_sent_through_a_request_too_applies_once(self):
-        self.send(decision('merge'), reopen=[], event='e')
+    def test_an_event_sent_through_a_request_too_answers_it_and_applies_once(self):
+        self.send(decision('merge'), event='e')
+        n = len(captain.records()) - 1
         msg = self.msg_of(self.ask())
-        self.send(decision('merge'), reopen=[], event='e', member=msg)
-        self.assertEqual(self.count('report'), 2)
+        self.send(decision('merge'), event='e', member=msg)
+        self.assertEqual(self.count('report'), 2, 'the request is answered')
         self.assertEqual(self.item()['revision'], 1)
+        self.assertEqual(self.send(decision('merge'), event='e'), f'recorded {self.m}:{n}')
+
+    def test_a_retry_through_the_watch_names_the_report_first_recorded(self):
+        msg = self.msg_of(self.ask())
+        self.send(decision('merge'), event='e', member=msg)
+        n = len(captain.records()) - 1
+        self.assertEqual(self.send(decision('merge'), event='e'), f'recorded {msg}:{n}')
+
+    def test_a_resumed_session_s_report_moves_all_its_items(self):
+        self.send(decision('merge'), decision('ci'))
+        self.report_as('t2', self.m, {**GOOD, 'needs': 'approve'})
+        self.terminals['t3'] = {**pinned('t3'), 'session': 's-t2'}   # the same session resumed in t3
+        self.send(refresh=['merge'], address='t3', member=self.joined_as('t3'))
+        self.assertEqual({i['owner']['address'] for i in self.items()}, {'t3'})
+        self.assertEqual([i['revision'] for i in self.items()], [2, 1, 1])
 
     def test_a_changed_decision_is_a_revision_an_unchanged_one_is_not(self):
         self.send(decision('merge'))
