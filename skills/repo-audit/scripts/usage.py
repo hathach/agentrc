@@ -14,8 +14,14 @@ symlinks included) into one of its worktrees; a path that names a repository fil
 
 stdout holds aggregates only: repository file names, the argparse vocabulary of each script (subcommands and long
 flags; other arguments become an unrecognised count), and the repository's own skill, agent and workflow names
-(others are `other`). FILE (create-only, mode 0600) adds per-key locators, transcript path:line and tool-call id,
-never command text. Exit 0 complete, 1 partial (a root missing or unreadable), 2 refused.
+(others are `other`; a project-local one, under .claude/, only from a session in one of its worktrees or in a
+removed one, a directory that no longer exists with a path part that is the main checkout's name or starts with
+`<name>-`, or, for a workflow, from a script path that resolves into a worktree, a script path that no longer exists
+going by the session's directory). Its `totals` carry the camelCase names a record's usage.totals takes: toolCalls
+(every call read), scriptInvocations, unattributedInvocations, skillLoads, agentLaunches and workflowRuns (the
+repository's own, agentLaunches without built-in agents) and docReads; the record sums each across hosts. FILE
+(create-only, mode 0600) adds per-key locators, transcript path:line and tool-call id, never command text. Exit 0
+complete, 1 partial (a root missing or unreadable), 2 refused.
 """
 import argparse
 import functools
@@ -71,18 +77,39 @@ class Repo:
 
     def __init__(self, path, head):
         self.top = Path(git(path, 'rev-parse', '--show-toplevel').stdout.strip())
-        self.name = self.top.name
+        listed = [line[9:] for line in git(path, 'worktree', 'list', '--porcelain').stdout.splitlines()
+                  if line.startswith('worktree ')]
+        self.name = Path(listed[0]).name        # the main worktree's, listed first: the audit runs in a task worktree
         # deepest first: a worktree nested in the main checkout must match before it
-        self.checkouts = sorted((Path(os.path.realpath(line[9:])) for line in
-                                 git(path, 'worktree', 'list', '--porcelain').stdout.splitlines()
-                                 if line.startswith('worktree ')), key=lambda c: len(c.parts), reverse=True)
+        self.checkouts = sorted((Path(os.path.realpath(c)) for c in listed), key=lambda c: len(c.parts), reverse=True)
         self.files = set(git(path, 'ls-tree', '-r', '--name-only', '-z', head).stdout.split('\0')) - {''}
         self.head = head
-        self.skills = {f.split('/')[1] for f in self.files if re.fullmatch(r'skills/[^/]+/SKILL\.md', f)}
-        self.agents = {f[7:-3] for f in self.files if re.fullmatch(r'agents/[^/]+\.md', f)}
-        self.workflows = {f[10:-3] for f in self.files if re.fullmatch(r'workflows/[^/]+\.js', f)}
+        self.skills, self.local_skills = self.catalog(r'skills/([^/]+)/SKILL\.md')
+        self.agents, self.local_agents = self.catalog(r'agents/([^/]+)\.md')
+        self.workflows, self.local_workflows = self.catalog(r'workflows/([^/]+)\.js')
         self._vocab = {}
         self._realpath = functools.lru_cache(maxsize=4096)(os.path.realpath)
+
+    def catalog(self, pattern):
+        """(names in the top-level layout, names under .claude/ only); a tracked .agents -> .claude link is one
+        file to git, so its tree is never listed twice."""
+        top = {m.group(1) for f in self.files if (m := re.fullmatch(pattern, f))}
+        return top, {m.group(1) for f in self.files if (m := re.fullmatch(rf'\.claude/{pattern}', f))} - top
+
+    def owns(self, name, top, local, ctx, script=None, cwd=None):
+        """Whether a Skill, Agent or Workflow call names this repository's own: a top-level name is installed for
+        every session; a project-local one counts only from a session in its worktrees or, given a script path,
+        where that path resolves into one, as another repository may hold the same name. A script path that no
+        longer exists (in a removed worktree) goes by the session's directory, as a call by name does."""
+        if name in top:
+            return True
+        if name not in local:
+            return False
+        if script:
+            how = (self.rel(script, cwd) or (None, None))[1]
+            if how == 'attributed' or os.path.exists(Path(cwd or '') / script):
+                return how == 'attributed'
+        return ctx['cwd_class'] in ('repo', 'repo-inferred')
 
     def rel(self, path, cwd=None, remote=False):
         """(repo-relative path, 'attributed'|'unattributed') for a path naming a repository file, else None. A path
@@ -127,8 +154,9 @@ class Repo:
         real = self.real(cwd)
         if any(real.is_relative_to(c) for c in self.checkouts):
             return 'repo'
-        if any(part == self.name or part.startswith(f'{self.name}-') for part in Path(cwd).parts):
-            return 'repo-inferred'      # a removed worktree named after the repository
+        if any(part == self.name or part.startswith(f'{self.name}-') for part in Path(cwd).parts) \
+                and not os.path.exists(cwd):
+            return 'repo-inferred'      # a removed worktree named after the repository; one that exists is another's
         return 'other'
 
 
@@ -572,14 +600,19 @@ def tool(name, inp, call_id, tally, ctx, cwd):
             tally.pending[call_id] = keys
     elif name == 'Skill':
         s = str(inp.get('skill', ''))
-        tally.skills[s if s in repo.skills else 'other'] += 1
+        tally.skills[s if repo.owns(s, repo.skills, repo.local_skills, ctx) else 'other'] += 1
     elif name in ('Agent', 'Task'):
         a = str(inp.get('subagent_type') or 'general-purpose')
-        tally.agents[a if a in repo.agents or a in BUILTIN_AGENTS else 'other'] += 1
+        own = a in BUILTIN_AGENTS or repo.owns(a, repo.agents, repo.local_agents, ctx)
+        tally.agents[a if own else 'other'] += 1
     elif name == 'Workflow':
-        w = str(inp.get('name') or Path(str(inp.get('scriptPath') or '')).stem)
-        w = re.sub(r'-wf_[\w-]+$', '', w)
-        tally.workflows[w if w in repo.workflows else 'other'] += 1
+        script = str(inp.get('scriptPath') or '')
+        stem = Path(script).stem
+        w = re.sub(r'-wf_[\w-]+$', '', str(inp.get('name') or stem))
+        if re.search(r'-wf_[\w-]+$', stem):
+            script = ''         # the harness's copy of a script names no checkout
+        own = repo.owns(w, repo.workflows, repo.local_workflows, ctx, script, cwd)
+        tally.workflows[w if own else 'other'] += 1
     elif name in ('Read', 'Edit', 'Write') and isinstance(inp.get('file_path'), str):
         hit = repo.rel(inp['file_path'], cwd)
         if hit and name == 'Read':
@@ -711,7 +744,14 @@ def report(tally, roots, stats, window):
     scripts = {k: dict(v, sessions=len(v['sessions']), days=len(v['days']), cwd=dict(v['cwd']), caller=dict(v['caller']),
                        subcommands=dict(v['subcommands']), flags=dict(v['flags']))
                for k, v in sorted(tally.scripts.items())}
-    return {'repo': str(tally.repo.top), 'window': [w.isoformat() for w in window], 'roots': roots,
+
+    def own(counts, builtin=()):
+        return sum(v for k, v in counts.items() if k != 'other' and k not in builtin)
+    totals = {'toolCalls': stats['tool_calls'], 'scriptInvocations': sum(s['invoke'] for s in scripts.values()),
+              'unattributedInvocations': sum(tally.unattributed.values()), 'skillLoads': own(tally.skills),
+              'agentLaunches': own(tally.agents, BUILTIN_AGENTS), 'workflowRuns': own(tally.workflows),
+              'docReads': sum(tally.docs.values())}
+    return {'repo': str(tally.repo.top), 'window': [w.isoformat() for w in window], 'roots': roots, 'totals': totals,
             'tool_calls': stats['tool_calls'], 'unparsed_records': stats['unparsed_records'],
             'unknown': dict(tally.unknown), 'scripts': scripts, 'unattributed': dict(tally.unattributed),
             'skills': dict(tally.skills), 'agents': dict(tally.agents), 'workflows': dict(tally.workflows),
@@ -723,6 +763,7 @@ def render(agg):
     lines += [f"root {r['kind']} {r['path']}: {r['status']}, {r.get('files', 0)} files" for r in agg['roots']]
     lines.append(f"tool calls {agg['tool_calls']}, unparsed records {agg['unparsed_records']}, "
                  f"unknown {agg['unknown'] or 0}")
+    lines.append(f"totals {agg['totals']}")
     lines.append('== scripts: invoke ok error result? sessions days | cwd | caller | reads')
     for k, s in sorted(agg['scripts'].items(), key=lambda kv: -kv[1]['invoke']):
         if not s['invoke']:
