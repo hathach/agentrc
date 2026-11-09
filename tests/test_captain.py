@@ -1696,7 +1696,7 @@ class WatchCase(LedgerCase):
     def setUp(self):
         super().setUp()
         self.owner = 'live'
-        patcher = mock.patch.object(captain, 'owner_state', lambda watch: self.owner)
+        patcher = mock.patch.object(captain, 'captain_state', lambda c: self.owner)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -1814,7 +1814,7 @@ class WatchJoinTest(WatchCase):
         self.arm('all')
         code, out = self.pending_as('t2')
         [m] = self.member('t2')
-        self.assertIn(f'STATUS WATCH {m["msg"]} from the agent session in terminal t1', out)
+        self.assertIn(f'STATUS WATCH {m["msg"]}, standing until the human cancels it', out)
         self.assertIn(f'report --for {m["msg"]} --file -', out)
         self.assertNotIn('captain', out.lower().replace(captain.INSTALLED.lower(), ''))   # names no role
         self.pending_as('t2')
@@ -1824,25 +1824,23 @@ class WatchJoinTest(WatchCase):
         self.arm('all')
         self.assertEqual(self.pending_as('t1')[1], 'none: the open watch does not cover this session')
 
-    def test_no_watch_or_an_uncertain_captain_joins_nobody(self):
+    def test_no_watch_joins_nobody(self):
         self.assertEqual(self.pending_as('t2')[1], 'none: no watch is open')
-        self.arm('all')
-        self.owner = 'unknown'
-        self.assertIn('cannot confirm', self.pending_as('t2')[1])
-        self.assertEqual(self.count('watch-end'), 0)
-        self.assertTrue(captain.marked(), 'an unknown captain keeps its watch')
 
-    def test_a_replaced_or_ended_captain_ends_the_watch(self):
-        for why, act in (('replaced', self.replace_captain), ('ended', lambda: setattr(self, 'owner', 'ended'))):
+    def test_a_watch_stands_when_its_captain_is_replaced_or_ends(self):
+        for why, act in (('replaced', self.replace_captain), ('ended', lambda: setattr(self, 'owner', 'ended')),
+                         ('unknown', lambda: setattr(self, 'owner', 'unknown'))):
             with self.subTest(why):
                 (self.state / captain.LEDGER).unlink(missing_ok=True)
                 self.enroll_captain()
                 self.owner = 'live'
                 self.arm('all')
                 act()
-                self.assertEqual(self.pending_as('t2')[1], 'none: no watch is open')
-                self.assertEqual(self.count('watch-end'), 1)
-                self.assertFalse(captain.marked())
+                self.assertIn('STATUS WATCH', self.pending_as('t2')[1])
+                [m] = self.member('t2')
+                self.report_as('t2', m['msg'])   # recorded with no live captain
+                self.assertEqual((self.count('watch-end'), self.count('report')), (0, 1))
+                self.assertTrue(captain.marked())
                 captain.write_json(captain.ENROLLED, {**captain.identity(CAPTAIN), 'generation': 'g'})
                 with mock.patch('builtins.print'):
                     captain.enroll(True)
@@ -1982,6 +1980,16 @@ class NewReportsTest(WatchCase):
         self.arm('all')
         self.assertEqual([r['needs'] for r in captain.new_reports()], ['merge it'])
 
+    def test_a_new_captain_tables_what_the_last_left_and_nothing_twice_after(self):
+        self.arm('all')
+        m = self.joined_as('t2')
+        self.report_as('t2', m, {**GOOD, 'needs': 'first'})
+        self.assertEqual([r['needs'] for r in captain.new_reports()], ['first'])
+        self.report_as('t2', m, {**GOOD, 'needs': 'second'})
+        captain.write_json(captain.ENROLLED, {**captain.identity(pinned('t4')), 'generation': 'g2'})
+        self.assertEqual([r['needs'] for r in captain.new_reports()], ['second'])
+        self.assertEqual(captain.new_reports(), [])
+
 
 class WatchUnchangedTest(WatchCase):
     """A member's transcript: a task, the watch brief a hook gave it, then the task end it reported."""
@@ -1994,7 +2002,7 @@ class WatchUnchangedTest(WatchCase):
         self.m = self.joined_as('t2')
         self.log({'type': 'user', 'promptSource': 'typed', 'origin': {'kind': 'human'},
                   'message': {'content': 'fix it'}},
-                 {'type': 'attachment', 'content': captain.watch_brief(self.m, 't1')})
+                 {'type': 'attachment', 'content': captain.watch_brief(self.m)})
         self.ref = self.reported()
 
     def log(self, *entries, raw=b''):
@@ -2125,13 +2133,13 @@ class WatchHookTest(WatchCase):
                 self.assertEqual((done.returncode, done.stdout), (0, ''))
 
 
-class OwnerStateTest(unittest.TestCase):
-    WATCH = {'captain': {**captain.identity(CAPTAIN), 'generation': 'g'}}
+class CaptainStateTest(unittest.TestCase):
+    CAPTAIN = {**captain.identity(CAPTAIN), 'generation': 'g'}
 
     def state(self, start=20, session='s-t1', error=None):
         with mock.patch.object(captain.hc, 'proc_start', side_effect=error, return_value=start), \
              mock.patch.object(captain, 'registered', return_value=session):
-            return captain.owner_state(self.WATCH)
+            return captain.captain_state(self.CAPTAIN)
 
     def test_from_proc_and_the_registry(self):
         self.assertEqual(self.state(), 'live')
@@ -2206,8 +2214,9 @@ class WatchCollectTest(WatchCase):
         self.assertEqual(captain.stored(captain.COLLECTED, recs), 2)
         captain.write_json(captain.COLLECTED, {'generation': generation, 'at': len(recs) + 1})   # past the end
         self.assertIsNone(captain.stored(captain.COLLECTED, recs))
+        captain.write_json(captain.COLLECTED, {'generation': generation, 'at': 2})
         captain.write_json(captain.ENROLLED, {**captain.enrolled(), 'generation': 'next'})
-        self.assertIsNone(captain.stored(captain.COLLECTED, recs))
+        self.assertEqual(captain.stored(captain.COLLECTED, recs), 2, 'a new captain resumes the last one\'s cursor')
         (self.state / captain.COLLECTED).write_text('{', encoding='utf-8')
         self.assertIsNone(captain.stored(captain.COLLECTED, recs))
         with captain.locked():
@@ -2215,8 +2224,8 @@ class WatchCollectTest(WatchCase):
         self.assertEqual(captain.stored(captain.COLLECTED, recs), 1)
         captain.write_json(captain.COLLECTED, {'generation': generation, 'at': 2})
         with captain.locked():
-            captain.store(captain.COLLECTED, 1, 'next')   # an earlier enrollment's further cursor does not hold it
-        self.assertEqual(captain.stored(captain.COLLECTED, recs), 1)
+            captain.store(captain.COLLECTED, 1, 'next')   # an earlier captain's further cursor holds it too
+        self.assertEqual(captain.stored(captain.COLLECTED, recs), 2)
 
     def test_a_request_sent_during_a_watch_is_followed_by_its_collect(self):
         self.arm('all')
@@ -2242,6 +2251,19 @@ class WatchCollectTest(WatchCase):
         self.assertEqual(self.collect(msg)[1], [f'reported {msg} · ready', 'done'])
         self.arm('all')
         new = [r['msg'] for r in captain.records() if r['type'] == 'watch'][-1]
+        self.assertEqual(self.collect()[1], [f'reported {m}:{n} · ready', f'cancelled {w}', f'pending: {new}'])
+
+    def test_an_unseen_report_survives_a_cancel_a_new_watch_and_a_new_captain(self):
+        self.arm('t2')
+        w = self.watch_id()
+        m = self.joined_as('t2')
+        self.collect()
+        self.report_as('t2', m)
+        n = len(captain.records()) - 1
+        captain.cancel(w, self.ident)
+        self.arm('all')
+        new = [r['msg'] for r in captain.records() if r['type'] == 'watch'][-1]
+        captain.write_json(captain.ENROLLED, {**captain.identity(pinned('t4')), 'generation': 'g2'})
         self.assertEqual(self.collect()[1], [f'reported {m}:{n} · ready', f'cancelled {w}', f'pending: {new}'])
 
     def test_a_new_watch_keeps_a_request_the_last_watch_followed(self):
@@ -2305,22 +2327,24 @@ class WatchCollectTest(WatchCase):
         self.assertLess(time.monotonic() - began, 3, 'waited for the lock past the deadline')
         self.assertEqual(lines[-1], f'pending: {m} {self.watch_id()}')
 
-    def test_collect_ends_a_watch_whose_captain_is_gone(self):
-        self.arm('all')
-        self.owner = 'ended'
-        code, lines = self.collect()
-        self.assertEqual(code, 0)
-        self.assertTrue(lines[0].startswith('watch ended w-'), lines)
-        self.assertFalse(captain.marked())
-
-    def test_a_member_s_collect_ends_when_its_captain_goes_while_it_waits(self):
+    def test_a_captain_s_end_leaves_its_watch_open_for_the_next(self):
         self.arm('all')
         m = self.joined_as('t2')
-        ends = mock.patch.object(captain.time, 'sleep', side_effect=lambda s: setattr(self, 'owner', 'ended'))
-        with ends:   # the captain goes while collect waits
-            code, lines = self.collect(m, wait_ms=1000)
-        self.assertEqual((code, lines[-1]), (0, 'done'))
-        self.assertEqual(self.count('watch-end'), 1)
+        self.collect()
+        self.owner = 'ended'
+        self.report_as('t2', m)   # while no captain runs
+        n = len(captain.records()) - 1
+        self.replace_captain()
+        code, lines = self.collect()
+        self.assertEqual(lines, [f'reported {m}:{n} · ready', f'pending: {m} {self.watch_id()}'])
+        self.assertEqual(self.count('watch-end'), 0)
+
+    def test_a_legacy_watch_end_stays_closed(self):
+        self.arm('all')
+        w = self.watch_id()
+        captain.append({'type': 'watch-end', 'msg': w, 'why': 'its captain session ended'})
+        self.assertEqual(self.pending_as('t2')[1], 'none: no watch is open')
+        self.assertEqual(self.collect()[1][-1], 'done')
 
 
 if __name__ == '__main__':

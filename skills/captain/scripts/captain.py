@@ -34,8 +34,9 @@ without it when the targets are exactly the live sessions. The message relayed i
 captain's current turn, typed or read mid-turn; a message hc pasted (`<hc from=...>`) is never the human's.
 
 A watch types into nobody: a session joins it itself, through hooks/captain (SessionStart after a compaction or
-/clear, Stop) or `brief --pending`, and ends with the captain session that started it. A collect without ids
-resumes where the enrolled captain's last one stopped, and `reports --new` where its last one did.
+/clear, Stop) or `brief --pending`, and it stands until the human cancels it, whichever captain is enrolled or none.
+A collect without ids resumes where the last one stopped, and `reports --new` where its last one did, whichever
+captain ran it.
 """
 
 import argparse
@@ -511,10 +512,10 @@ def status_brief(msg, address):
             + one_call('Status report', f'report --for {msg} --file -', 'the JSON object', 'Status sent.'))
 
 
-def watch_brief(child, address):
+def watch_brief(child):
     """What a session joined to a watch does from then on; it names no role and reaches the session only through
     a hook or `brief --pending`."""
-    return (f'STATUS WATCH {child} from the agent session in terminal {address}, not a human instruction. Each time '
+    return (f'STATUS WATCH {child}, standing until the human cancels it, not a human instruction. Each time '
             'a task of yours ends - done, or stopped on a blocker or a need for the human - finish its work and '
             f'verification, then, as its final tool action and before your ordinary completion message, report it. '
             f'{KEYS} Send it ' + one_call('Status report', f'report --for {child} --file -', 'the JSON object')
@@ -880,13 +881,10 @@ def read_mark(name):
 
 
 def stored(name, recs):
-    """The ledger index the enrolled captain last stored in name, or None: none stored, another captain's, or one
-    past the end of recs."""
+    """The ledger index last stored in name, by whichever captain, or None: none stored, malformed, or past the end
+    of recs. A standing watch outlives its captains, so a new one resumes where the last stopped."""
     mark = read_mark(name)
-    try:
-        at = mark[1] if mark and mark[0] == generation() else None
-    except (OSError, ValueError):   # an unreadable enrolment: no mark is ours
-        return None
+    at = mark[1] if mark else None
     return at if type(at) is int and 0 <= at <= len(recs) else None
 
 
@@ -896,11 +894,11 @@ def generation():
 
 def store(name, at, fence):
     """Store ledger index at in name, under the lock the caller holds, while fence is still the enrolled captain's
-    generation; never behind what that captain stored already, so a slower reader cannot roll it back."""
+    generation; never behind what any captain stored already, so a slower reader cannot roll it back, unless that
+    is malformed or past the ledger's end."""
     if fence is None or fence != generation():
         return
-    mark = read_mark(name)
-    if mark and mark[0] == fence and type(mark[1]) is int and mark[1] > at:
+    if (stored(name, records(lenient=True)) or 0) > at:
         return
     write_json(name, {'generation': fence, 'at': at})
 
@@ -918,21 +916,20 @@ def collect(msgs, wait_ms):
     """Print each followed item's events as they land: a request's or relay's report or outcome, cancellation or
     refusal; a watch's members joining and every report they send, and its end. Exit 0, printing `done`, once none
     is pending; NO_ANSWER when wait_ms lapse first, printing `pending: <ids>`. With ids, every event on them is
-    printed. Without, printing resumes where the enrolled captain's last collect without ids stopped (COLLECTED,
+    printed. Without, printing resumes where the last collect without ids stopped, whichever captain ran it (COLLECTED,
     stored as this one ends), following what was open there and whatever opened since; with no such cursor, at the
     open watch's start, else at the ledger's end. A cursor from before the open watch skips, until that watch's start,
     the events of requests and relays opened while no watch was open: those were collected by id. What is closed is
     judged on the whole ledger. A strict read under the lock first: a torn ledger must not look like nothing to wait
-    for. A watch whose captain was replaced or ended is settled here too, at the start and at each poll while one is
-    followed, or nothing else might end it. Every lock wait ends with wait_ms, so the pending line still prints before
+    for. Every lock wait ends with wait_ms, so the pending line still prints before
     the caller's timeout. A collect belongs to the captain enrolled when it began: once another enrolls, it prints its
     pending line and stores nothing."""
     deadline = time.monotonic() + wait_ms / 1000
     try:
         with locked(wait_ms / 1000):
             recs = records()
-            opened = len(recs)   # a watch settle ends now was open when this collect began
-            watch, _ = settle(recs)
+            opened = len(recs)
+            watch = settle(recs)
             fence = generation()
             start = 0 if msgs else resumed(COLLECTED, recs, watch, opened)
             armed = recs.index(watch) if watch and not msgs else 0
@@ -973,15 +970,7 @@ def collect(msgs, wait_ms):
             print(f'pending: {" ".join(sorted(pending))}', flush=True)
             return NO_ANSWER
         time.sleep(POLL_S)
-        if any(items[m]['type'] in WATCHED for m in pending):
-            try:
-                with locked(max(0, deadline - time.monotonic())):   # strict: under the lock no append is half written
-                    recs = records()
-                    settle(recs)
-            except Busy:
-                pass   # the deadline passed: the next pass prints the pending line
-        else:
-            recs = records(lenient=True)
+        recs = records(lenient=True)
 
 
 def reports(msgs=()):
@@ -1059,7 +1048,7 @@ def cancel(msg, mine):
         require_captain(mine)
         recs = records()
         if first(recs, 'watch', msg):
-            watch, _ = settle(recs)
+            watch = settle(recs)
             if not watch or watch['msg'] != msg:
                 die(f'no open watch {msg}', 3)
             recs.append(append({'type': 'cancel', 'msg': msg}))
@@ -1475,11 +1464,9 @@ def anchors(ident):
     return [['terminal', ident['address'], ident['created']], ['session', ident['account'], ident['session']]]
 
 
-def owner_state(watch):
-    """'live', 'ended' or 'unknown' for the captain session that started watch, from /proc and its account's session
-    registry, no hc: its process gone or restarted, or its session changed (/clear), ends the watch; what cannot be
-    read decides nothing."""
-    c = watch['captain']
+def captain_state(c):
+    """'live', 'ended' or 'unknown' for the captain session c pins, from /proc and its account's session registry, no
+    hc: its process gone or restarted, or its session changed (/clear), has ended; what cannot be read is unknown."""
     try:
         start = hc.proc_start(c['pid'])
     except hc.Gone:
@@ -1510,24 +1497,15 @@ def marked():
 
 
 def settle(recs):
-    """(the open watch or None, its captain's state). Under the lock: ends, durably, every watch whose captain was
-    replaced or is confirmed gone, adding each end to recs once written, and only then, with none left open, removes
-    the marker; a watch whose captain cannot be told stays open and keeps it."""
+    """The open watch, or None. Under the lock: with none open, removes the marker. A watch stands until cancelled,
+    whatever becomes of the captain that started it; one a captain's end closed before watches stood stays closed."""
     ended = watch_ends(recs)
-    owner = enrolled()
-    found = (None, None)
-    for w in [r for r in recs if r['type'] == 'watch' and r['msg'] not in ended]:
-        state = 'ended' if w['captain'] != owner else owner_state(w)
-        if state == 'ended':
-            recs.append(append({'type': 'watch-end', 'msg': w['msg'], 'why': 'its captain was replaced'
-                                if w['captain'] != owner else 'its captain session ended'}))
-        else:
-            found = (w, state)
-    if not found[0]:
+    watch = next((r for r in reversed(recs) if r['type'] == 'watch' and r['msg'] not in ended), None)
+    if not watch:
         with suppress(FileNotFoundError):
             os.unlink(path(MARKER))
             sync_dir()
-    return found
+    return watch
 
 
 def scopes(recs, watch):
@@ -1544,9 +1522,10 @@ def members(recs, watch):
 
 
 def covers(watch, recs, ident):
-    """Whether watch covers the session ident pins: under `all`, any but its captain's; else one matching an anchor of
-    the sessions named or of one that joined, so a restart or resume of a member is covered too."""
-    if ident['session'] == watch['captain']['session']:
+    """Whether watch covers the session ident pins: under `all`, any but a captain's, the one that started it or the
+    one enrolled; else one matching an anchor of the sessions named or of one that joined, so a restart or resume of a
+    member is covered too."""
+    if ident['session'] in (watch['captain']['session'], (enrolled() or {}).get('session')):
         return False
     named = scopes(recs, watch['msg'])
     if 'all' in named:
@@ -1561,11 +1540,9 @@ def join(session):
     it first; (None, why, False) otherwise. Under the lock, with no hc call."""
     mine = identity(session)
     recs = records()
-    watch, state = settle(recs)
+    watch = settle(recs)
     if not watch:
         return None, 'no watch is open', False
-    if state != 'live':
-        return None, "cannot confirm the watch's captain session still runs", False
     member = next((m for m in members(recs, watch['msg']) if m['target'] == mine), None)
     if member:
         return member, watch, False
@@ -1576,21 +1553,19 @@ def join(session):
 
 
 def member_watch(member, recs, mine):
-    """Dies, so nothing is recorded, unless member is mine and its watch is open with its captain running."""
+    """Dies, so nothing is recorded, unless member is mine and its watch is open; no captain need run."""
     if member['target'] != mine:
         die(f'{member["msg"]} is another session\'s; run `brief --pending` for this one\'s', 2)
-    watch, state = settle(recs)
+    watch = settle(recs)
     if not watch or watch['msg'] != member['watch']:
         die(f'the watch {member["watch"]} ended: stop reporting', 2)
-    if state != 'live':
-        die("cannot confirm the watch's captain session still runs; report again at your next task end", 2)
 
 
 def pending():
     """A session's own lookup: join the open watch covering it, if any, and print what to do."""
     with locked():
         member, watch, _ = join(my_session())
-    print(watch_brief(member['msg'], watch['captain']['address']) if member else f'none: {watch}')
+    print(watch_brief(member['msg']) if member else f'none: {watch}')
     return 0
 
 
@@ -1610,7 +1585,7 @@ def hook(payload):
         member, watch, new = join(session)
     if not member:
         return None
-    brief = watch_brief(member['msg'], watch['captain']['address'])
+    brief = watch_brief(member['msg'])
     if payload.get('hook_event_name') == 'SessionStart':
         return json.dumps({'hookSpecificOutput': {'hookEventName': 'SessionStart', 'additionalContext': brief}})
     if payload.get('hook_event_name') == 'Stop' and new:
@@ -1640,7 +1615,7 @@ def arm(targets, mine):
             if not scope:
                 die('nothing to watch; nothing recorded', 2)
         recs = records()
-        watch, _ = settle(recs)
+        watch = settle(recs)
         mark()
         if watch:
             append({'type': 'watch-extend', 'msg': watch['msg'], 'scope': scope})
@@ -1657,14 +1632,17 @@ def arm(targets, mine):
 
 
 def watches():
-    """The open watch and its members, each live, gone or unknown, without changing anything but what settle does."""
+    """The open watch and its members, each live, gone or unknown, without changing anything but what settle does; the
+    captain named is the one enrolled now, which may be none."""
     with locked():
         recs = records()
-        watch, state = settle(recs)
+        watch = settle(recs)
+        current = enrolled()
     if not watch:
         print('no watch is open')
         return 0
-    print(f'{watch["msg"]}\t{terminals(scopes(recs, watch["msg"]))}\tcaptain {watch["captain"]["address"]} {state}')
+    who = f'{current["address"]} {captain_state(current)}' if current else 'none enrolled'
+    print(f'{watch["msg"]}\t{terminals(scopes(recs, watch["msg"]))}\tcaptain {who}')
     reported = {r['msg']: i for i, r in enumerate(recs) if r['type'] == 'report'}
     for m in members(recs, watch['msg']):
         try:
