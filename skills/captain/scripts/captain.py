@@ -22,7 +22,7 @@ does not recognize is reported, never assumed safe.
                                                  relay it as the human's verdict on a decision
   captain.py verdict --item <id> --revision <N> --verdict <verdict> [--entry <id>]
                                                  record it as that verdict, sending nothing
-  captain.py relay --retry <action>              send a held relay once its session is idle
+  captain.py relay --retry <action>              send a held relay once its session is idle or done, its input empty
   captain.py brief --for <msg> | --pending       a target reads what a status request asks, or joins a watch
   captain.py report --for <msg> --file <json|->  a target answers a status request
   captain.py accept --action <action>            a target takes a relay and reads its words
@@ -1250,9 +1250,9 @@ def unclose(item, i, by):
         item['state'], item['closure'], item['updated'] = 'open', None, i
 
 
-def apply_report(found, i, source, payload):
+def apply_report(found, i, source, payload, needs_of):
     """Fold one report's decision operations into found. The owner is the reporting session's account and session,
-    never a payload field."""
+    never a payload field. needs_of holds each session's needs item as its last report named it."""
     def did(key):
         return item_id('d', *session_of(source['target']), key)
 
@@ -1276,10 +1276,23 @@ def apply_report(found, i, source, payload):
         if item and item['revision'] == r['revision']:
             item['resolved'] = r['revision']
             close(item, i, 'resolved')
-    if payload['needs'] and 'decisions' not in payload:
-        iid = item_id('n', *session_of(source['target']), payload['needs'])
-        if iid not in found:
-            found[iid] = new_item(iid, i, source, None, {'kind': 'blocked', 'ask': payload['needs']}, legacy=True)
+    needs(found, i, source, payload, needs_of)
+
+
+def needs(found, i, source, payload, needs_of):
+    """A report's bare needs, with no decisions, as an item: the session's current needs, superseding the item its
+    last report named. Text superseded before reopens; text the human cancelled stays closed."""
+    session = session_of(source['target'])
+    named = item_id('n', *session, payload['needs']) if payload['needs'] and 'decisions' not in payload else None
+    current = needs_of.get(session)
+    if current and current != named:
+        close(found[current], i, 'superseded')   # a no-op on one already closed, a cancelled one included
+    item = found.get(named)
+    if named and not item:
+        found[named] = new_item(named, i, source, None, {'kind': 'blocked', 'ask': payload['needs']}, legacy=True)
+    elif item and (item['closure'] or {}).get('why') == 'superseded':
+        revise(item, i, reopen=True)
+    needs_of[session] = named
 
 
 def decisions(recs):
@@ -1288,7 +1301,7 @@ def decisions(recs):
     watch carried it. Every report, a repeated event's too, says where its session runs now: its items follow it,
     relay targets never."""
     sources = asked(recs)
-    found, seen, reports, latest, bound, accepted = {}, set(), {}, {}, {}, set()
+    found, seen, reports, latest, bound, accepted, needs_of = {}, set(), {}, {}, {}, set(), {}
     for i, r in enumerate(recs):
         if r['type'] == 'report' and r['msg'] in sources:
             source, payload = sources[r['msg']], r['report']
@@ -1299,7 +1312,7 @@ def decisions(recs):
                 if ident in seen:
                     continue
                 seen.add(ident)
-            apply_report(found, i, source, payload)
+            apply_report(found, i, source, payload, needs_of)
         elif r['type'] == 'evidence':
             apply_evidence(found, reports, i, r)
         elif r['type'] in ('relay', 'verdict') and r.get('item') in found:
@@ -1319,7 +1332,10 @@ def decisions(recs):
         elif r['type'] == 'observed' and r['msg'] in found and found[r['msg']]['revision'] == r['revision']:
             found[r['msg']]['observations'][r['source']] = {'ok': r['ok'], 'value': r['value'], 'at': i}
         elif r['type'] == 'cancel' and r['msg'] in found:
-            close(found[r['msg']], i, 'cancelled')
+            item = found[r['msg']]
+            if (item['closure'] or {}).get('why') == 'superseded':   # cancelled while still open, before supersession
+                item['state'] = 'open'
+            close(item, i, 'cancelled')
     for item in found.values():
         now = latest.get(session_of(item['owner']))
         if now:
@@ -1902,7 +1918,8 @@ def relay(targets, entry, mine, decided=None):
             if busy:
                 append(item('relay', action, captain, target, **fields))
                 append({'type': 'held', 'msg': action, 'why': busy})
-                print(f'{address}: {action} held, {busy}; `relay --retry {action}` sends it once it is idle',
+                print(f'{address}: {action} held, {busy}; `relay --retry {action}` sends it once it is idle or done '
+                      'with an empty input line',
                       flush=True)
                 continue
             print(deliver('relay', action, captain, target, relay_prompt(action), **fields), flush=True)
@@ -1927,7 +1944,7 @@ def bind(decided, seen, captain, uid):
             print(f'{iid}: {v["msg"]} recorded already')
             raise SystemExit(0)
     if linked['legacy']:
-        die(f'{iid} is a report\'s needs, not a decision: only `cancel` closes it', 2)
+        die(f'{iid} is a report\'s needs, not a decision: it takes no verdict', 2)
     linked, why = rebound(iid, revision, seen)
     if linked['state'] != 'open':
         die(f'decision {iid} is closed', 2)

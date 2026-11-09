@@ -373,6 +373,12 @@ class LedgerCase(unittest.TestCase):
         finally:
             self.me = 't1'
 
+    def queued(self, *flags):
+        """What `queue --json` prints, flags passed through."""
+        with mock.patch('builtins.print') as out:
+            captain.queue('all' in flags, True, self.ident if 'refresh' in flags else None)
+        return json.loads(out.call_args_list[0].args[0])
+
     def report_as(self, address, msg, payload=GOOD):
         f = self.state / 'r.json'
         f.write_text(json.dumps(payload), encoding='utf-8')
@@ -2292,8 +2298,6 @@ class DecisionTest(DecisionCase):
         [item] = self.items()
         self.assertEqual((item['legacy'], item['content'], item['key']),
                          (True, {'kind': 'blocked', 'ask': 'approve the merge'}, None))
-        self.report_as('t2', self.m, GOOD)
-        self.assertEqual(self.items()[0]['state'], 'open', 'an empty need closes nothing')
 
     def test_cancel_closes_an_open_decision_once(self):
         self.send(decision('merge'))
@@ -2302,6 +2306,107 @@ class DecisionTest(DecisionCase):
         self.assertEqual(self.item()['closure']['why'], 'cancelled')
         with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
             captain.cancel(iid, self.ident)
+
+
+class LegacyNeedsTest(DecisionCase):
+    """A report's bare needs are its session's current need, superseded by the session's next report."""
+
+    def need(self, text, address='t2', member=None, event=None):
+        """t2, or address as member, reports needs with no decisions."""
+        self.report_as(address, member or self.m, {**GOOD, 'needs': text, **({'event_id': event} if event else {})})
+
+    def needs(self):
+        """{needs text: (state, closure reason, revision)} of the legacy items."""
+        return {i['content']['ask']: (i['state'], (i['closure'] or {}).get('why'), i['revision'])
+                for i in self.items() if i['legacy']}
+
+    def cancel(self, text):
+        iid = next(i['id'] for i in self.items() if i['legacy'] and i['content']['ask'] == text)
+        with mock.patch('builtins.print'):
+            captain.cancel(iid, self.ident)
+
+    def test_the_next_report_supersedes_with_other_needs_none_or_decisions(self):
+        self.need('merge #12?')
+        self.need('rebase first?')
+        self.assertEqual(self.needs(), {'merge #12?': ('closed', 'superseded', 1), 'rebase first?': ('open', None, 1)})
+        self.need('')
+        self.assertEqual(self.needs()['rebase first?'], ('closed', 'superseded', 1))
+        self.need('ci red?')
+        self.send()
+        self.assertEqual(self.needs()['ci red?'], ('closed', 'superseded', 1), 'decisions, empty ones too')
+
+    def test_needs_with_decisions_open_no_item_and_keyed_decisions_are_untouched(self):
+        self.send(decision('merge'), needs='see decisions')
+        self.need('ci red?')
+        self.need('')
+        self.assertEqual(self.needs(), {'ci red?': ('closed', 'superseded', 1)})
+        self.assertEqual(self.item()['state'], 'open')
+
+    def test_the_same_needs_again_change_nothing_and_superseded_text_reopens(self):
+        self.need('merge #12?')
+        self.need('merge #12?')
+        self.assertEqual(self.needs(), {'merge #12?': ('open', None, 1)})
+        opened = next(i['opened'] for i in self.items())
+        self.need('')
+        self.need('merge #12?')
+        self.assertEqual(self.needs(), {'merge #12?': ('open', None, 2)})
+        self.assertEqual(next(i['opened'] for i in self.items()), opened)
+
+    def test_text_the_human_cancelled_stays_closed(self):
+        self.need('merge #12?')
+        self.cancel('merge #12?')
+        self.need('merge #12?')
+        self.need('other')
+        self.need('merge #12?')
+        self.assertEqual(self.needs()['merge #12?'], ('closed', 'cancelled', 1))
+
+    def test_each_session_supersedes_only_its_own_and_a_silent_one_keeps_it(self):
+        self.terminals['t3'] = pinned('t3')
+        t3 = self.joined_as('t3')
+        self.need('merge #12?')
+        self.need('review #13?', address='t3', member=t3)
+        self.need('')
+        self.assertEqual(self.needs(), {'merge #12?': ('closed', 'superseded', 1), 'review #13?': ('open', None, 1)})
+
+    def test_a_request_answer_and_a_watch_report_both_count(self):
+        self.need('merge #12?')
+        msg = self.msg_of(self.ask())
+        self.report_as('t2', msg, {**GOOD, 'needs': 'rebase first?'})
+        self.assertEqual(self.needs(), {'merge #12?': ('closed', 'superseded', 1), 'rebase first?': ('open', None, 1)})
+
+    def test_an_old_event_sent_again_supersedes_nothing_even_from_where_its_session_moved(self):
+        self.need('merge #12?', event='e1')
+        self.need('rebase first?', event='e2')
+        self.need('merge #12?', event='e1')
+        self.terminals['t3'] = {**pinned('t3'), 'session': 's-t2'}   # the same session resumed in t3
+        del self.terminals['t2']
+        self.need('merge #12?', address='t3', member=self.joined_as('t3'), event='e1')
+        self.assertEqual(self.needs(), {'merge #12?': ('closed', 'superseded', 1), 'rebase first?': ('open', None, 1)})
+        self.assertEqual(next(i for i in self.items() if i['state'] == 'open')['owner']['address'], 't3')
+
+    def test_a_cancel_written_before_needs_were_superseded_stays(self):
+        self.need('merge #12?')
+        self.need('rebase first?')
+        iid = next(i['id'] for i in self.items() if i['content']['ask'] == 'merge #12?')
+        with captain.locked():
+            captain.append({'type': 'cancel', 'msg': iid})   # as an older captain could, the item open then
+        self.need('merge #12?')
+        self.assertEqual(self.needs()['merge #12?'], ('closed', 'cancelled', 1))
+
+    def test_a_long_running_ledger_lists_each_session_s_latest_need(self):
+        members = {}
+        for address in ('t3', 't4', 't5', 't6'):
+            self.terminals[address] = pinned(address)
+            members[address] = self.joined_as(address)
+        for address, text in (('t3', 'a'), ('t4', 'c'), ('t3', 'a'), ('t5', 'd'), ('t6', 'e'), ('t3', 'b'),
+                              ('t4', ''), ('t6', 'f')):
+            self.need(text, address=address, member=members[address])
+        self.cancel('f')
+        self.need('e', address='t6', member=members['t6'])
+        self.need('f', address='t6', member=members['t6'])
+        self.assertEqual(sorted(i['ask'] for i in self.queued()['items']), ['b', 'd'],
+                         't4 needs nothing, t6 was cancelled')
+        self.assertEqual(sorted(i['ask'] for i in self.queued('all')['items']), ['a', 'b', 'c', 'd', 'e', 'f'])
 
 
 class FreshnessTest(DecisionCase):
@@ -2476,7 +2581,7 @@ class VerdictTest(VerdictCase):
         self.report_as('t2', member, {**GOOD, 'needs': 'merge #12?'})
         [legacy] = self.items()
         self.say('merge it')
-        self.assertIn('only `cancel`', self.refused(captain.verdict, (legacy, 1, 'decision'), None, self.ident))
+        self.assertIn('takes no verdict', self.refused(captain.verdict, (legacy, 1, 'decision'), None, self.ident))
 
     def test_a_verdict_needs_its_captain_still_running(self):
         self.report(decision('merge', kind='blocked'))
@@ -2934,27 +3039,21 @@ class WatchCollectTest(WatchCase):
 class QueueTest(VerdictCase):
     """The decisions waiting on the human, read from the ledger alone."""
 
-    def queue(self, *flags):
-        """What `queue --json` prints, flags passed through."""
-        with mock.patch('builtins.print') as out:
-            captain.queue('all' in flags, True, self.ident if 'refresh' in flags else None)
-        return json.loads(out.call_args_list[0].args[0])
-
     def test_blocked_then_review_then_idea_each_in_opening_order(self):
         self.report(decision('later', kind='idea'), decision('ci', kind='blocked'),
                     decision('merge', reviewed_sha=self.A), decision('fix', kind='blocked'))
-        self.assertEqual([i['key'] for i in self.queue()['items']], ['ci', 'fix', 'merge', 'later'])
+        self.assertEqual([i['key'] for i in self.queued()['items']], ['ci', 'fix', 'merge', 'later'])
 
     def test_a_closed_decision_shows_only_while_its_relayed_verdict_has_not_gone_through(self):
         self.report(decision('merge', kind='blocked'), decision('ci', kind='blocked'))
         with mock.patch('builtins.print'):
             captain.cancel(self.item('ci')['id'], self.ident)
         action = self.action_of(self.decide())
-        self.assertEqual(self.queue()['items'], [], 'delivered, and the cancelled one is history')
-        self.assertEqual({i['key'] for i in self.queue('all')['items']}, {'merge', 'ci'})
+        self.assertEqual(self.queued()['items'], [], 'delivered, and the cancelled one is history')
+        self.assertEqual({i['key'] for i in self.queued('all')['items']}, {'merge', 'ci'})
         self.as_target(captain.accept, action)
         self.as_target(captain.outcome, action, 'needs-clarification', 'which branch?')
-        [shown] = self.queue()['items']
+        [shown] = self.queued()['items']
         self.assertEqual((shown['key'], shown['state'], shown['verdicts'][0]['status']),
                          ('merge', 'closed', 'needs-clarification'), 'accepted, so it may have been acted on')
 
@@ -2992,18 +3091,18 @@ class QueueTest(VerdictCase):
         second = self.action_of(self.decide(revision=2, words='squash first'))
         self.as_target(captain.accept, second)
         self.as_target(captain.outcome, second, 'completed', 'done')
-        self.assertEqual(self.queue()['items'], [])
+        self.assertEqual(self.queued()['items'], [])
 
     def test_closing_a_decision_updates_it(self):
         self.report(decision('merge', kind='blocked'))
         with mock.patch('builtins.print'):
             captain.cancel(self.item()['id'], self.ident)
-        [row] = self.queue('all')['items']
+        [row] = self.queued('all')['items']
         self.assertEqual(row['updated_at'], row['closure']['at'])
 
     def test_the_json_contract(self):
         self.report(decision('merge', reviewed_sha=self.A, worktree='/w', grant_needed='merge'))
-        out = self.queue('refresh')
+        out = self.queued('refresh')
         self.assertEqual(set(out), {'version', 'ledger_position', 'items', 'coverage', 'metrics'})
         self.assertEqual((out['version'], out['ledger_position']), (1, len(captain.records())))
         [item] = out['items']
@@ -3023,14 +3122,14 @@ class QueueTest(VerdictCase):
         self.report(decision('merge', reviewed_sha=self.A))
         before = captain.records()
         with mock.patch.object(captain, 'lookup', side_effect=AssertionError('looked up')):
-            self.queue()
+            self.queued()
         self.assertEqual(captain.records(), before)
 
     def test_what_a_decision_lacks_is_named(self):
         self.report(decision('merge'))
         member = next(r['msg'] for r in captain.records() if r['type'] == 'joined')
         self.report_as('t2', member, {**GOOD, 'needs': 'ci is red'})
-        self.assertEqual([i['missing'] for i in self.queue()['items']], [['recommendation'], ['reviewed_sha']])
+        self.assertEqual([i['missing'] for i in self.queued()['items']], [['recommendation'], ['reviewed_sha']])
 
     def test_the_text_view_names_each_decision_and_the_coverage(self):
         self.report(decision('merge', kind='blocked'))
