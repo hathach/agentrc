@@ -110,7 +110,7 @@ TERMINAL_NAME = re.compile(r'[a-z0-9_-]{1,32}')   # hc's rule for a terminal nam
 START_WAIT_S = 20
 # hc run refusals that start nothing; any other failure may have started a terminal
 NOT_STARTED = ('name_taken', 'invalid_params', 'spawn_failed', 'not_found', 'invalid_template')
-VERIFIED = ('verified', 'pending', 'failed')
+VERIFIED = ('verified', 'pending', 'failed', 'unchecked')
 INSTALLED = (os.environ.get('AGENTRC_CAPTAIN_SCRIPT')
              or os.path.expanduser('~/.claude/skills/captain/scripts/captain.py'))
 IDENTITY = ('address', 'created', 'kind', 'cwd', 'session', 'pid', 'started', 'account')
@@ -2083,12 +2083,13 @@ def terminal_name(root, account, name):
 def verify(address, root, account):
     """(verification, why, identity or None) of the session started at address, after one bounded hc wait for it to
     come up: verified once pinned under account in root, pending while it is not yet a Claude Code session or not
-    yet pinned, failed when it is gone, finished or another account's or directory's."""
+    yet pinned, failed when it is gone, finished or another account's or directory's, unchecked when hc could not
+    be asked."""
     hc.run('wait', '--json', '--timeout', str(START_WAIT_S), '--', address, timeout=START_WAIT_S + HC_TIMEOUT_S)
     try:
         t = get(address)
     except hc.Error as e:
-        return 'pending', f'hc get failed: {e}', None
+        return 'unchecked', str(e), None
     if t is None:
         return 'failed', 'its terminal is gone', None
     if t.get('state') != 'live':
@@ -2133,7 +2134,7 @@ def start(arg, account, name, space, tab, entry, mine):
                                  *labels, '--', *argv, timeout=HC_TIMEOUT_S)
     address = body.get('address') if rc == 0 and isinstance(body, dict) else None
     if not hc.is_local(address):
-        failed = rc not in (0, None) and kind in NOT_STARTED
+        failed = rc != 0 and kind in NOT_STARTED
         with locked():
             append({'type': 'start-failed' if failed else 'start-uncertain', 'msg': msg, 'why': why})
         die(f'{msg}: hc refused, nothing started: {kind}: {why}' if failed else
@@ -2147,8 +2148,9 @@ def start(arg, account, name, space, tab, entry, mine):
           f'{f", tab {tab_id}" if tab_id else ", a new tab"}')
     print({'verified': f'verified: {session and session["session"]}, pid {session and session["pid"]}',
            'pending': f'verification pending ({why}): `list` shows it once it is up',
-           'failed': f'VERIFICATION FAILED: {why}; the human closes {address}'}[verification])
-    return 0 if verification != 'failed' else 1
+           'failed': f'VERIFICATION FAILED: {why}; the human closes {address}',
+           'unchecked': f'VERIFICATION UNCHECKED: {why}; `list` shows whether it is up'}[verification])
+    return {'failed': 1, 'unchecked': 3}.get(verification, 0)
 
 
 def metric(found):

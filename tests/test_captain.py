@@ -3158,6 +3158,7 @@ class StartTest(RelayCase):
                        {'id': 'spB', 'name': 'other', 'folder': '/elsewhere', 'machine': None, 'tabs': []}]
         self.hc_calls = []
         self.run_answer = ran(0, {'address': 't9', 'created_ms': 99})
+        self.wait_answer = ran(0, {'ended': True, 'reason': 'status'})
         self.gets = {'t9': self.terminal()}
         self.pinned_account = 'main'
         for target, attr, value in [
@@ -3177,7 +3178,9 @@ class StartTest(RelayCase):
 
     def _hc(self, *args, timeout):
         self.hc_calls.append(args)
-        return self.run_answer if args[0] == 'run' else ran(0, {'ended': True, 'reason': 'status'})
+        with captain.locked(wait_s=0):   # Busy if start still held the ledger lock
+            pass
+        return self.run_answer if args[0] == 'run' else self.wait_answer
 
     def _pin(self, session):
         session.update(pid=77, started=5, account=self.pinned_account, session='s-new')
@@ -3309,6 +3312,9 @@ class StartTest(RelayCase):
         code, err = self.start_refusal()
         self.assertEqual((code, self.types()[-1]), (1, 'start-failed'))
         self.assertIn('nothing started', err)
+        self.say('start proj once hc runs')
+        self.run_answer = ran(None, None, 'spawn_failed', 'hc run did not start: no hc')   # lib/hc.py's own tuple
+        self.assertEqual((self.start_refusal(entry=f'u-{self.entries}')[0], self.types()[-1]), (1, 'start-failed'))
         for answer in (ran(None, None, 'timeout', 'late'), ran(0, {'started': True}), ran(1, None, None, 'x')):
             with self.subTest(answer):
                 self.say('start proj again')
@@ -3339,3 +3345,28 @@ class StartTest(RelayCase):
         with mock.patch.object(captain, 'pin', lambda s: s.update(account='main', pid=None) or s):
             self.start()
         self.assertEqual(captain.records()[-1]['verification'], 'pending')
+
+    def test_hc_failing_to_answer_after_the_start_leaves_it_unchecked(self):
+        self.say('start proj')
+        def get(address):
+            if address == 't9':
+                raise captain.hc.Error('hc get t9 failed: socket closed')
+        with mock.patch.object(captain, 'get', get):
+            code, out = self.start()
+        started = captain.records()[-1]
+        self.assertEqual((code, started['address'], started['verification']), (3, 't9', 'unchecked'))
+        self.assertIn('UNCHECKED', out)
+
+    def test_a_wait_that_times_out_or_fails_still_inspects_once(self):
+        for answer in (ran(0, {'ended': False, 'reason': 'timeout'}), ran(None, None, 'timeout', 'late')):
+            with self.subTest(answer):
+                self.say('start proj')
+                self.wait_answer = answer
+                self.assertEqual(self.start(entry=f'u-{self.entries}')[0], 0)
+                self.assertEqual(captain.records()[-1]['verification'], 'verified')
+
+    def test_a_failed_intent_write_starts_nothing(self):
+        self.say('start proj')
+        with mock.patch.object(captain, 'append', side_effect=OSError('disk full')), self.assertRaises(OSError):
+            captain.start(self.root, 'main', None, None, None, None, self.ident)
+        self.assertEqual((self.launched(), self.types()), ([], []))
