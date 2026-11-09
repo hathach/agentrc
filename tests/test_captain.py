@@ -2442,6 +2442,34 @@ class VerdictTest(RelayCase):
         self.assertIn('already has a correction', self.refused(
             captain.verdict, (self.item()['id'], 1, 'no-correction'), None, self.ident))
 
+    def test_a_replay_records_nothing_and_another_revision_from_that_message_refuses(self):
+        self.report(decision('merge', reviewed_sha=self.A))
+        self.say('ship it')
+        with mock.patch('builtins.print'):
+            captain.verdict((self.item()['id'], 1, 'no-correction'), None, self.ident)
+        self.report(reopen=['merge'])
+        before = captain.records()
+        with mock.patch('builtins.print'), self.assertRaises(SystemExit) as done:
+            captain.verdict((self.item()['id'], 1, 'no-correction'), None, self.ident)
+        self.assertEqual((done.exception.code, captain.records()), (0, before))
+        self.assertIn('on revision 1', self.refused(
+            captain.verdict, (self.item()['id'], 2, 'no-correction'), None, self.ident))
+
+    def test_a_report_s_bare_needs_take_no_verdict(self):
+        self.report()
+        member = next(r['msg'] for r in captain.records() if r['type'] == 'joined')
+        self.report_as('t2', member, {**GOOD, 'needs': 'merge #12?'})
+        [legacy] = self.items()
+        self.say('merge it')
+        self.assertIn('only `cancel`', self.refused(captain.verdict, (legacy, 1, 'decision'), None, self.ident))
+
+    def test_a_verdict_needs_its_captain_still_running(self):
+        self.report(decision('merge', kind='blocked'))
+        self.say('merge it')
+        with mock.patch.object(captain, 'live', return_value=False):
+            self.assertIn('no longer runs', self.refused(
+                captain.verdict, (self.item()['id'], 1, 'decision'), None, self.ident))
+
     def test_a_held_verdict_whose_decision_was_revised_is_undelivered(self):
         self.report(decision('merge', kind='blocked'))
         self.terminals['t2'] = {**pinned('t2'), 'status': 'working'}

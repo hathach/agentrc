@@ -1844,23 +1844,26 @@ def owns(owner, target):
 
 def bind(decided, seen, captain, uid):
     """(the fields binding a verdict to its decision, the decision's owner), after recording what was just observed
-    of it; dies when the
-    decision is not open at that revision, its evidence is stale or unconfirmed, or this captain already gave a
-    verdict on it from the same message (repeating the same one prints its receipt and exits)."""
+    of it. The same verdict from the same message again prints its receipt and exits, recording nothing; dies on
+    another verdict or revision from that message, a report's bare needs, a decision not open at that revision, and
+    evidence stale or unconfirmed."""
     iid, revision, verdict = decided
-    if seen:
-        record_observed(iid, *seen)
-    linked = decisions(records()).get(iid)
+    recs = records()
+    linked = decisions(recs).get(iid)
     if not linked:
         die(f'no decision {iid}', 3)
     me_ = (captain['account'], captain['session'])
     for v in linked['verdicts']:
-        rec = first(records(), v['via'], v['msg'])
+        rec = first(recs, v['via'], v['msg'])
         if (rec['captain']['account'], rec['captain']['session']) == me_ and rec['entry'] == uid:
-            if rec['verdict'] != verdict:
-                die(f'{iid} already has a {rec["verdict"]} verdict from this message', 2)
+            if (rec['verdict'], rec['revision']) != (verdict, revision):
+                die(f'{iid} already has a {rec["verdict"]} verdict on revision {rec["revision"]} from this message', 2)
             print(f'{iid}: {v["msg"]} recorded already')
             raise SystemExit(0)
+    if linked['legacy']:
+        die(f'{iid} is a report\'s needs, not a decision: only `cancel` closes it', 2)
+    if seen:
+        linked = record_observed(iid, *seen) or decisions(records())[iid]
     if linked['state'] != 'open':
         die(f'decision {iid} is closed', 2)
     why = obsolete(linked, revision)
@@ -1876,6 +1879,8 @@ def verdict(decided, entry, mine):
     never to words a caller supplies."""
     with observing(decided[0]) as seen, locked():
         captain = require_captain(mine)
+        if not live(mine):
+            die('this captain session no longer runs in its terminal', 2)
         uid, words = bound(captain, entry)
         binding, _ = bind(decided, seen, captain, uid)
         msg = new_id('v', records())
