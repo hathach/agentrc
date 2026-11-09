@@ -1332,7 +1332,10 @@ def decisions(recs):
         elif r['type'] == 'observed' and r['msg'] in found and found[r['msg']]['revision'] == r['revision']:
             found[r['msg']]['observations'][r['source']] = {'ok': r['ok'], 'value': r['value'], 'at': i}
         elif r['type'] == 'cancel' and r['msg'] in found:
-            close(found[r['msg']], i, 'cancelled')
+            item = found[r['msg']]
+            if (item['closure'] or {}).get('why') == 'superseded':   # cancelled while still open, before supersession
+                item['state'] = 'open'
+            close(item, i, 'cancelled')
     for item in found.values():
         now = latest.get(session_of(item['owner']))
         if now:
