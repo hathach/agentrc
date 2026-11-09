@@ -7,9 +7,11 @@ import ntpath
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import textwrap
+import time
 import unittest
 from pathlib import Path, PurePosixPath
 from unittest import mock
@@ -981,6 +983,17 @@ class Finish(unittest.TestCase):
         with mock.patch.object(audit, 'branch_tip', retargeted):
             self.refused('pr: o/r#7 moved from base branch main to dev while finish read it: run it again')
 
+    def test_a_second_pr_read_that_fails_gives_only_its_failure(self):
+        tip = audit.branch_tip
+
+        def lost(*args):
+            got = tip(*args)
+            del self.hub.pulls[('o/r', 7)]
+            return got
+        with mock.patch.object(audit, 'branch_tip', lost):
+            err = self.refused('pr: o/r#7 cannot be read')
+        self.assertNotIn('moved from base branch', err)
+
     def test_github_reads_never_prompt_and_give_up(self):
         real, seen = subprocess.run, []
 
@@ -994,8 +1007,8 @@ class Finish(unittest.TestCase):
             self.assertEqual(self.finish(review(self.base, self.head))[0], 0)
             (self.repo.path / audit.RECORD).unlink()
             (self.repo.path / 'stray.txt').write_text('x')
-            err = self.refused(f'git ls-remote --exit-code {self.hub.root.as_posix()}/o/r.git refs/heads/main: no '
-                               f'answer in {audit.TIMEOUT} s')
+            err = self.refused(f'git ls-remote --exit-code {self.hub.root.as_posix()}/o/r.git refs/heads/main: not '
+                               f'finished in {audit.TIMEOUT} s')
         self.assertIn('1 uncommitted paths', err)
         self.assertEqual(seen, [('0', audit.TIMEOUT)] * 2)
 
@@ -1045,6 +1058,13 @@ class Finish(unittest.TestCase):
                 mock.patch.object(audit.secrets, 'token_hex', return_value='deadbeef'):
             self.refused(f'{audit.RECORD} was not written')
         self.assertEqual(other.read_text(), 'another finish')
+
+    def test_a_write_that_fails_leaves_no_file(self):
+        path = tmpdir(self) / 'new.tmp'
+        with self.assertRaises(UnicodeEncodeError):
+            audit.create(path, '\ud800')       # a lone surrogate: no UTF-8 for it
+        self.assertFalse(path.exists())
+        audit.create(path, 'x')
 
     def test_a_record_that_cannot_be_written_is_refused(self):
         (self.repo.path / audit.RECORD).mkdir(parents=True)     # an empty directory: git status shows nothing
@@ -1239,6 +1259,9 @@ class Finish(unittest.TestCase):
         self.refused("decisions[0].by: ['d2'] is no other", decisions=[
             {'id': 'd1', 'text': 't', 'status': 'superseded', 'by': ['d2']},
             {'id': 'd2', 'text': 't', 'status': 'new'}])
+        for bad, reason in (({}, 'decisions[0]: missing id'), ({'id': ['d1']}, "decisions[0].id: not an id: ['d1']")):
+            self.refused(reason, decisions=[{**bad, 'text': 't', 'status': 'superseded', 'by': 'd2'},
+                                            {'id': 'd2', 'text': 't', 'status': 'new'}])
 
     def test_the_coverage_ledger_must_match_every_changed_path(self):
         r = self.repo
@@ -1566,10 +1589,43 @@ class Usage(unittest.TestCase):
 class GitHubRead(unittest.TestCase):
     def test_gh_never_prompts_and_gives_up(self):
         with mock.patch.object(audit.subprocess, 'run', side_effect=subprocess.TimeoutExpired('gh', 1)) as spy, \
-                self.assertRaisesRegex(audit.Refused, f'gh api x: no answer in {audit.TIMEOUT} s'):
+                self.assertRaisesRegex(audit.Refused, f'gh api x: not finished in {audit.TIMEOUT} s'):
             audit.gh(['api', 'x'])
         self.assertEqual((spy.call_args.kwargs['env']['GH_PROMPT_DISABLED'], spy.call_args.kwargs['timeout']),
                          ('1', audit.TIMEOUT))
+
+    def test_git_reads_have_no_askpass_or_terminal_and_a_fetch_runs_while_it_receives(self):
+        calls = []
+
+        def spy(argv, **kw):
+            calls.append((argv, kw))
+            return subprocess.CompletedProcess(argv, 0)
+        with mock.patch.object(audit.subprocess, 'run', spy):
+            audit.git('r', 'ls-remote', 'u', network=True)
+            audit.fetch('r', 'o/r', 'refs/pull/7/head')
+        self.assertEqual([kw['timeout'] for _, kw in calls], [audit.TIMEOUT, audit.FETCH_TIMEOUT])
+        for argv, kw in calls:
+            self.assertEqual(argv[3:7], ['-c', 'http.lowSpeedLimit=1', '-c', f'http.lowSpeedTime={audit.TIMEOUT}'])
+            self.assertEqual((kw['env']['GIT_ASKPASS'], kw['env']['SSH_ASKPASS_REQUIRE'], kw['stdin'],
+                              kw['start_new_session']), ('', 'never', subprocess.DEVNULL, True))
+
+    def test_a_timed_out_read_does_not_wait_for_a_helper_still_holding_its_output(self):
+        pid = tmpdir(self) / 'helper.pid'
+        # git-remote-https's way: a child inheriting the output, alive after its parent is killed
+        code = ('import subprocess, sys, time; '
+                'h = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], stdout=sys.stdout, '
+                f'stderr=sys.stderr); open({str(pid)!r}, "w").write(str(h.pid)); print("out", flush=True); '
+                'time.sleep(60)')
+
+        def stop():
+            with contextlib.suppress(OSError, ValueError):
+                os.kill(int(pid.read_text()), signal.SIGTERM)
+        self.addCleanup(stop)
+        began = time.monotonic()
+        with self.assertRaisesRegex(audit.Refused, 'helper: not finished in 3 s'):
+            audit.github_read([sys.executable, '-c', code], 'helper', 3)
+        self.assertLess(time.monotonic() - began, 30)
+        self.assertTrue(pid.exists(), 'the helper started before the timeout')
 
 
 class ShellAbs(unittest.TestCase):

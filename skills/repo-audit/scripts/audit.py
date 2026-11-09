@@ -49,8 +49,9 @@ R holds the record start read (this audit's own record commit, or another audit'
 refuses a `.claude` or record path that is a symbolic link or an ignored record path, then writes the record through
 a new file renamed over it and prints how to commit it. Exit 0 done, 2 refused (with every reason on stderr).
 Shallow or grafted history, or a replace ref, is refused before any command; so is a run dir of another audit.py
-version. A GitHub read (gh, git fetch or ls-remote) never prompts for credentials and refuses after TIMEOUT seconds
-without an answer.
+version. A GitHub read (gh, git fetch or ls-remote) never prompts for credentials (on native Windows an ssh url
+rewrite may still ask on the console until the time bound) and refuses after TIMEOUT seconds; a fetch still receiving
+data runs on until FETCH_TIMEOUT, an https one receiving under a byte a second for TIMEOUT seconds fails.
 
 FILE is one JSON object; a field the schema does not name is refused at any depth:
   range       "<base>..<R>" in full SHAs: the run's range, so a review written before R moved refuses
@@ -88,6 +89,7 @@ import re
 import secrets
 import subprocess
 import sys
+import tempfile
 import time
 from collections import Counter, defaultdict
 from pathlib import Path, PurePosixPath
@@ -98,8 +100,11 @@ RECORD = '.claude/audit.json'
 SCHEMA = 1
 VALIDATION = 'repo-audit-validation: 1'
 COMMENT_LIMIT = 65536            # GitHub's comment body maximum, in characters
-TIMEOUT = 300                    # seconds a GitHub read may take
-NO_PROMPT = {'GIT_TERMINAL_PROMPT': '0', 'GCM_INTERACTIVE': 'never', 'GH_PROMPT_DISABLED': '1'}
+TIMEOUT = 300                    # seconds a GitHub read may take, or a fetch may receive nothing
+FETCH_TIMEOUT = 3600             # seconds a fetch still receiving data may take
+# an empty GIT_ASKPASS also overrides core.askPass and SSH_ASKPASS; ssh, without a terminal, then has no way to ask
+NO_PROMPT = {'GIT_TERMINAL_PROMPT': '0', 'GIT_ASKPASS': '', 'SSH_ASKPASS_REQUIRE': 'never', 'GCM_INTERACTIVE': 'never',
+             'GH_PROMPT_DISABLED': '1'}
 GITHUB = 'https://github.com/'
 STAGES = ('coverage', 'phase1', 'claims', 'coreview')
 STAGE_FIELDS = {'completed': ('ref',), 'inapplicable': ('reason',)}
@@ -149,24 +154,36 @@ class HttpError(Refused):
 
 
 def git(repo, *args, check=True, network=False):
-    env, timeout = ({**os.environ, **NO_PROMPT}, TIMEOUT) if network else (None, None)
-    try:
+    if network:
+        r = github_read(['git', '-C', str(repo), '-c', 'http.lowSpeedLimit=1', '-c', f'http.lowSpeedTime={TIMEOUT}',
+                         *args], f'git {" ".join(args)}', FETCH_TIMEOUT if args[0] == 'fetch' else TIMEOUT)
+    else:
         r = subprocess.run(['git', '-C', str(repo), *args], capture_output=True, text=True, encoding='utf-8',
-                           errors='replace', env=env, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        raise Refused(f'git {" ".join(args)}: no answer in {TIMEOUT} s') from None
+                           errors='replace')
     if check and r.returncode:
         raise Refused(f'git {" ".join(args)}: {r.stderr.strip()}')
     return r
 
 
 def gh(args):
-    try:
-        r = subprocess.run(['gh', *args], capture_output=True, encoding='utf-8', errors='replace',
-                           env={**os.environ, **NO_PROMPT}, timeout=TIMEOUT)
-    except subprocess.TimeoutExpired:
-        raise Refused(f'gh {" ".join(args)}: no answer in {TIMEOUT} s') from None
+    r = github_read(['gh', *args], f'gh {" ".join(args)}')
     return r.returncode, r.stdout, r.stderr
+
+
+def github_read(argv, label, timeout=TIMEOUT):
+    """argv run with no prompt, no stdin and, off Windows, no controlling terminal, refused after timeout seconds. Its
+    output goes through files: on Windows a timed-out run waits for every holder of its pipes, as a git-remote-https
+    left behind."""
+    with tempfile.TemporaryFile('w+', encoding='utf-8', errors='replace') as out, \
+            tempfile.TemporaryFile('w+', encoding='utf-8', errors='replace') as err:
+        try:
+            r = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=out, stderr=err, env={**os.environ, **NO_PROMPT},
+                               timeout=timeout, start_new_session=True)
+        except subprocess.TimeoutExpired:
+            raise Refused(f'{label}: not finished in {timeout} s') from None
+        out.seek(0)
+        err.seek(0)
+        return subprocess.CompletedProcess(argv, r.returncode, out.read(), err.read())
 
 
 def api(path, paginate=False):
@@ -419,10 +436,16 @@ def per_kind(growth, name):
 
 
 def create(path, text, mode=0o666, newline=None):
-    """Write text to a new file, mode masked by the umask; FileExistsError when path exists."""
+    """Write text to a new file, mode masked by the umask; FileExistsError when path exists, and no file left when
+    the write fails."""
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_BINARY', 0)    # newlines translated once, by Python
-    with os.fdopen(os.open(path, flags, mode), 'w', encoding='utf-8', newline=newline) as f:
-        f.write(text)
+    fd = os.open(path, flags, mode)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8', newline=newline) as f:
+            f.write(text)
+    except BaseException:
+        Path(path).unlink(missing_ok=True)
+        raise
 
 
 def aware(text):
@@ -581,7 +604,7 @@ def check_review(s, r, rng=None, carried=None):
             s.bad(w, 'superseded needs by, and only superseded takes it')
         elif superseded and (not isinstance(it['by'], str) or it['by'] not in ids or it['by'] == it.get('id')):
             s.bad(f'{w}.by', f'{it["by"]!r} is no other item\'s id')
-        elif superseded and supersession_cycle(it['id'], by):
+        elif superseded and isinstance(it.get('id'), str) and supersession_cycle(it['id'], by):
             s.bad(f'{w}.by', f'{it["id"]} is superseded in a cycle: its chain must end in an item that is not '
                              'superseded, or every item of it drops out of later audits')
         if carried is None or not isinstance(it.get('id'), str):
@@ -1216,7 +1239,7 @@ def finish(args):
             # a retarget or push while the tip was read would record a branch the PR no longer targets
             again, now = pr_problems(review['pr'], reviewed)
             problems += again
-            if now != branch:
+            if now and now != branch:      # no branch read: again says why
                 problems.append(f'pr: {review["pr"]["repo"]}#{review["pr"]["number"]} moved from base branch {branch} '
                                 f'to {now} while finish read it: run it again')
             if not is_ancestor(repo, pr_base, reviewed):
