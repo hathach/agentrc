@@ -45,6 +45,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import time
@@ -80,6 +81,9 @@ CHIEF_RUNS = os.path.expanduser('~/.cache/chief-runs')   # where chief_run.py's 
 RUN_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,99}')
 PROGRESS_LINE = re.compile(r'(\d+) \d\d:\d\d:\d\d (.*)')
 ATTENTION = 'chief: attention'
+READER = str(Path(__file__).resolve().with_name('captain_read.py'))   # its hardened, read-only git and gh lookups
+LOOKUP_TIMEOUT_S = 30
+SOURCES = ('pr', 'worktree', 'report')
 INSTALLED = (os.environ.get('AGENTRC_CAPTAIN_SCRIPT')
              or os.path.expanduser('~/.claude/skills/captain/scripts/captain.py'))
 IDENTITY = ('address', 'created', 'kind', 'cwd', 'session', 'pid', 'started', 'account')
@@ -101,7 +105,7 @@ STATES = ('ready', 'in-progress', 'blocked', 'needs-human', 'done', 'idle')
 # withdraw and withdraw-requested have no writer since `withdraw` was removed: kept so an older ledger still reads
 RECORDS = ('request', 'report', 'cancel', 'delivered', 'undelivered', 'uncertain',
            'relay', 'held', 'sending', 'accepted', 'outcome', 'withdraw', 'withdraw-requested', 'refused',
-           'watch', 'watch-extend', 'joined', 'watch-end', 'evidence')
+           'watch', 'watch-extend', 'joined', 'watch-end', 'evidence', 'observed')
 ITEMS = ('request', 'relay')
 WATCHED = ('watch', 'joined')
 FOLLOWED = ITEMS + WATCHED   # what collect can follow
@@ -319,6 +323,9 @@ def well_formed(rec):
         return text(rec.get('watch')) and isinstance(rec.get('handle'), str) and pinned_identity(rec.get('target'))
     if rec['type'] in ('watch-end', 'held'):
         return isinstance(rec.get('why'), str)
+    if rec['type'] == 'observed':
+        return (type(rec.get('revision')) is int and rec.get('source') in SOURCES and type(rec.get('ok')) is bool
+                and (rec.get('value') is None or text(rec.get('value'))))
     if rec['type'] == 'evidence':
         return (text(rec.get('run')) and rec.get('source') in ('attention', 'report') and text(rec.get('digest'))
                 and (rec['source'] == 'report' or type(rec.get('seq')) is int and text(rec.get('text'))))
@@ -1176,12 +1183,13 @@ def item_id(prefix, *parts):
 def new_item(iid, i, source, key, content, legacy=False):
     return {'id': iid, 'key': key, 'owner': source['target'], 'handle': source['handle'], 'content': content,
             'change_id': content.get('change_id') or content.get('pr'), 'revision': 1, 'state': 'open',
-            'closure': None, 'opened': i, 'updated': i, 'legacy': legacy}
+            'closure': None, 'opened': i, 'updated': i, 'legacy': legacy, 'observations': {}}
 
 
 def revise(item, i, content=None, reopen=False):
     item['revision'] += 1
     item['updated'] = i
+    item['observations'] = {}   # what was observed is of the revision before
     if content is not None:
         item['content'] = content
     if reopen:
@@ -1250,6 +1258,8 @@ def decisions(recs):
             apply_report(found, i, source, payload)
         elif r['type'] == 'evidence':
             apply_evidence(found, reports, i, r)
+        elif r['type'] == 'observed' and r['msg'] in found and found[r['msg']]['revision'] == r['revision']:
+            found[r['msg']]['observations'][r['source']] = {'ok': r['ok'], 'value': r['value'], 'at': i}
         elif r['type'] == 'cancel' and r['msg'] in found:
             close(found[r['msg']], i, 'cancelled')
     return found
@@ -1344,6 +1354,98 @@ def ingest(run_id, mine):
             append(rec)
     print(f'{run_id}: {len(new)} attention line(s) recorded' + (', report.md changed' if changed else ''))
     return 0
+
+
+def sources(item):
+    """What item's evidence is checked against: a chief run's report.md; a session's PR head and worktree HEAD when it
+    named a reviewed SHA and them; None when it named no reviewed SHA."""
+    if 'run' in item['owner']:
+        return ['report']
+    content = item['content']
+    if 'reviewed_sha' not in content:
+        return None
+    return [s for s in ('pr', 'worktree') if s in content]
+
+
+def matches(item, source, value):
+    if source == 'report':
+        return value == item['report']
+    return value is not None and value.startswith(item['content']['reviewed_sha'])
+
+
+def freshness(item):
+    """'stale' on any known mismatch; 'current' when every source was observed to match this revision; else
+    'unknown', which a review with no reviewed SHA, or one with no source to check it against, also is; other kinds
+    with none are 'not-applicable'."""
+    named = sources(item)
+    if named is None:
+        return 'unknown' if item['content']['kind'] == 'review' else 'not-applicable'
+    seen = [(s, item['observations'].get(s)) for s in named]
+    if any(o and o['ok'] and not matches(item, s, o['value']) for s, o in seen):
+        return 'stale'
+    return 'current' if seen and all(o and o['ok'] for _, o in seen) else 'unknown'
+
+
+def lookup(*args):
+    """What captain_read.py prints for args, stripped, or None when it refuses or fails."""
+    try:
+        done = subprocess.run([sys.executable, READER, *args], capture_output=True, text=True,
+                              timeout=LOOKUP_TIMEOUT_S)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return done.stdout.strip() if done.returncode == 0 else None
+
+
+def observe(item):
+    """Each of item's sources as it is now: {source, ok, value}, a failed lookup ok false. No lock is held."""
+    found = []
+    for source in sources(item) or []:
+        if source == 'report':
+            try:
+                value, ok = report_digest(item['owner']['run']), True   # None: no report.md yet
+            except (OSError, SystemExit):   # unreadable, or a link run_file() refuses
+                value, ok = None, False
+        elif source == 'pr':
+            repo, number = item['content']['pr'].split('#')
+            try:
+                value = json.loads(lookup('gh', 'pr', 'view', number, '-R', repo, '--json', 'headRefOid') or '{}'
+                                   ).get('headRefOid')
+            except (ValueError, AttributeError):
+                value = None
+            ok = isinstance(value, str) and bool(SHA.fullmatch(value))
+        else:
+            value = lookup('git', '-C', item['content']['worktree'], 'rev-parse', '--verify', 'HEAD')
+            ok = bool(value and SHA.fullmatch(value))
+        found.append({'source': source, 'ok': ok, 'value': value if ok else None})
+    return found
+
+
+def record_observed(iid, revision, seen):
+    """Under the lock: append what observe() saw of iid, unless the item moved past revision meanwhile."""
+    item = decisions(records()).get(iid)
+    if not item or item['revision'] != revision:
+        return None
+    for o in seen:
+        append({'type': 'observed', 'msg': iid, 'revision': revision, **o})
+    return decisions(records())[iid]
+
+
+def refreshing(item):
+    """Whether queue --refresh checks item: an open one with sources to check."""
+    return item['state'] == 'open' and bool(sources(item))
+
+
+def refresh(mine):
+    """Observe every item refreshing() names, outside the lock, then record it for the revision it was taken of."""
+    with locked():
+        require_captain(mine)
+        wanted = [i for i in decisions(records()).values() if refreshing(i)]
+    seen = [(i['id'], i['revision'], observe(i)) for i in wanted]
+    with locked():
+        require_captain(mine)
+        for iid, revision, found in seen:
+            record_observed(iid, revision, found)
+    return len(seen)
 
 
 def cancel(msg, mine):

@@ -2143,8 +2143,8 @@ class WatchHookTest(WatchCase):
                 self.assertEqual((done.returncode, done.stdout), (0, ''))
 
 
-class DecisionTest(WatchCase):
-    """Decision items folded from reports: each session's own keys, revised, resolved, reopened or cancelled."""
+class DecisionCase(WatchCase):
+    """t2 joined to a watch, reporting decisions."""
 
     def setUp(self):
         super().setUp()
@@ -2180,6 +2180,10 @@ class DecisionTest(WatchCase):
 
     def item(self, key='merge'):
         return next(i for i in self.items() if i['key'] == key)
+
+
+class DecisionTest(DecisionCase):
+    """Decision items folded from reports: each session's own keys, revised, resolved, reopened or cancelled."""
 
     def test_each_decision_is_an_item_of_its_session(self):
         self.send(decision('merge'), decision('ci', kind='blocked'))
@@ -2289,6 +2293,54 @@ class DecisionTest(WatchCase):
             captain.cancel(iid, self.ident)
 
 
+class FreshnessTest(DecisionCase):
+    """An item's evidence observed against its PR head, worktree HEAD or chief report, per revision."""
+
+    A, B = 'a' * 40, 'b' * 40
+
+    def heads(self, pr=None, worktree=None):
+        """captain_read.py as observed: the PR head and worktree HEAD it prints, None for a failed lookup."""
+        def lookup(*args):
+            if args[0] == 'gh':
+                return None if pr is None else json.dumps({'headRefOid': pr})
+            return worktree
+        return mock.patch.object(captain, 'lookup', side_effect=lookup)
+
+    def refresh(self, **heads):
+        with self.heads(**heads):
+            captain.refresh(self.ident)
+        return captain.freshness(self.item())
+
+    def test_a_pr_head_matching_the_reviewed_sha_is_current_else_stale_or_unknown(self):
+        self.send(decision('merge', reviewed_sha=self.A[:7]))
+        self.assertEqual(captain.freshness(self.item()), 'unknown')
+        self.assertEqual(self.refresh(pr=self.A), 'current')
+        self.assertEqual(self.refresh(pr=self.B), 'stale')
+        self.assertEqual(self.refresh(pr=None), 'unknown', 'a failed lookup after a match is no match')
+        self.assertEqual({r['type'] for r in captain.records()} - {'watch', 'joined', 'report'}, {'observed'})
+
+    def test_every_source_must_match(self):
+        self.send(decision('merge', reviewed_sha=self.A, worktree='/w'))
+        self.assertEqual(self.refresh(pr=self.B, worktree=self.A), 'stale')
+        self.assertEqual(self.refresh(pr=self.A, worktree=None), 'unknown')
+        self.assertEqual(self.refresh(pr=self.A, worktree=self.A), 'current')
+
+    def test_without_a_reviewed_sha_or_a_source(self):
+        self.send(decision('merge'), decision('ci', kind='blocked'), decision('note', reviewed_sha=self.A, pr=None))
+        kinds = {i['key']: captain.freshness(i) for i in self.items()}
+        self.assertEqual(kinds, {'merge': 'unknown', 'ci': 'not-applicable', 'note': 'unknown'})
+
+    def test_a_new_revision_is_unobserved_and_an_older_observation_is_dropped(self):
+        self.send(decision('merge', reviewed_sha=self.A))
+        self.refresh(pr=self.A)
+        self.send(decision('merge', reviewed_sha=self.A), refresh=['merge'])
+        self.assertEqual((self.item()['revision'], captain.freshness(self.item())), (2, 'unknown'))
+        with captain.locked():
+            self.assertIsNone(captain.record_observed(self.item()['id'], 1, [{'source': 'pr', 'ok': True,
+                                                                              'value': self.A}]))
+        self.assertEqual(captain.freshness(self.item()), 'unknown')
+
+
 class ChiefFeedTest(LedgerCase):
     """A headless chief run's attention lines become decision items; its report.md is their evidence."""
 
@@ -2375,6 +2427,21 @@ class ChiefFeedTest(LedgerCase):
         [item] = self.items()
         self.assertEqual((item['revision'], item['state']), (2, 'closed'))
 
+    def test_a_report_changed_since_the_ingest_is_stale_until_ingested(self):
+        self.log('1 10:00:00 chief: attention · decide')
+        (self.run / 'report.md').write_text('A', encoding='utf-8')
+        self.ingest()
+
+        def fresh():
+            captain.refresh(self.ident)
+            return captain.freshness(self.items()[0])
+        self.assertEqual(fresh(), 'current')
+        (self.run / 'report.md').write_text('B', encoding='utf-8')
+        self.assertEqual(fresh(), 'stale')
+        self.ingest()
+        self.assertEqual((self.items()[0]['revision'], captain.freshness(self.items()[0])), (2, 'unknown'))
+        self.assertEqual(fresh(), 'current')
+
     def test_only_a_run_directory_under_the_runs_root(self):
         (self.runs / 'out').symlink_to(self.state)
         for run in ('../x', 'missing', 'out', '.hidden'):
@@ -2384,7 +2451,9 @@ class ChiefFeedTest(LedgerCase):
 
 
 def decision(key, kind='review', **extra):
-    return {'key': key, 'kind': kind, 'ask': f'{key}?', 'recommendation': 'yes', 'pr': 'o/r#12', **extra}
+    """A decision as a session reports it; a field given as None is left out."""
+    d = {'key': key, 'kind': kind, 'ask': f'{key}?', 'recommendation': 'yes', 'pr': 'o/r#12', **extra}
+    return {k: v for k, v in d.items() if v is not None}
 
 
 class CaptainStateTest(unittest.TestCase):
