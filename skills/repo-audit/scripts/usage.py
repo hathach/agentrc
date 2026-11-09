@@ -14,8 +14,9 @@ symlinks included) into one of its worktrees; a path that names a repository fil
 
 stdout holds aggregates only: repository file names, the argparse vocabulary of each script (subcommands and long
 flags; other arguments become an unrecognised count), and the repository's own skill, agent and workflow names
-(others are `other`). FILE (create-only, mode 0600) adds per-key locators, transcript path:line and tool-call id,
-never command text. Exit 0 complete, 1 partial (a root missing or unreadable), 2 refused.
+(others are `other`; a project-local one, under .claude/, only from a session in one of its worktrees or, for a
+workflow, a script path that resolves into one). FILE (create-only, mode 0600) adds per-key locators, transcript
+path:line and tool-call id, never command text. Exit 0 complete, 1 partial (a root missing or unreadable), 2 refused.
 """
 import argparse
 import functools
@@ -78,16 +79,29 @@ class Repo:
                                  if line.startswith('worktree ')), key=lambda c: len(c.parts), reverse=True)
         self.files = set(git(path, 'ls-tree', '-r', '--name-only', '-z', head).stdout.split('\0')) - {''}
         self.head = head
-        self.skills = self.catalog(r'skills/([^/]+)/SKILL\.md')
-        self.agents = self.catalog(r'agents/([^/]+)\.md')
-        self.workflows = self.catalog(r'workflows/([^/]+)\.js')
+        self.skills, self.local_skills = self.catalog(r'skills/([^/]+)/SKILL\.md')
+        self.agents, self.local_agents = self.catalog(r'agents/([^/]+)\.md')
+        self.workflows, self.local_workflows = self.catalog(r'workflows/([^/]+)\.js')
         self._vocab = {}
         self._realpath = functools.lru_cache(maxsize=4096)(os.path.realpath)
 
     def catalog(self, pattern):
-        """Names in the top-level layout and under .claude/, each once; a tracked .agents -> .claude link is one
+        """(names in the top-level layout, names under .claude/ only); a tracked .agents -> .claude link is one
         file to git, so its tree is never listed twice."""
-        return {m.group(1) for f in self.files if (m := re.fullmatch(rf'(?:\.claude/)?{pattern}', f))}
+        top = {m.group(1) for f in self.files if (m := re.fullmatch(pattern, f))}
+        return top, {m.group(1) for f in self.files if (m := re.fullmatch(rf'\.claude/{pattern}', f))} - top
+
+    def owns(self, name, top, local, ctx, script=None, cwd=None):
+        """Whether a Skill, Agent or Workflow call names this repository's own: a top-level name is installed for
+        every session; a project-local one counts only from a session in its worktrees or, given a script path,
+        where that path resolves into one, as another repository may hold the same name."""
+        if name in top:
+            return True
+        if name not in local:
+            return False
+        if script:
+            return (self.rel(script, cwd) or (None, None))[1] == 'attributed'
+        return ctx['cwd_class'] in ('repo', 'repo-inferred')
 
     def rel(self, path, cwd=None, remote=False):
         """(repo-relative path, 'attributed'|'unattributed') for a path naming a repository file, else None. A path
@@ -577,14 +591,19 @@ def tool(name, inp, call_id, tally, ctx, cwd):
             tally.pending[call_id] = keys
     elif name == 'Skill':
         s = str(inp.get('skill', ''))
-        tally.skills[s if s in repo.skills else 'other'] += 1
+        tally.skills[s if repo.owns(s, repo.skills, repo.local_skills, ctx) else 'other'] += 1
     elif name in ('Agent', 'Task'):
         a = str(inp.get('subagent_type') or 'general-purpose')
-        tally.agents[a if a in repo.agents or a in BUILTIN_AGENTS else 'other'] += 1
+        own = a in BUILTIN_AGENTS or repo.owns(a, repo.agents, repo.local_agents, ctx)
+        tally.agents[a if own else 'other'] += 1
     elif name == 'Workflow':
-        w = str(inp.get('name') or Path(str(inp.get('scriptPath') or '')).stem)
-        w = re.sub(r'-wf_[\w-]+$', '', w)
-        tally.workflows[w if w in repo.workflows else 'other'] += 1
+        script = str(inp.get('scriptPath') or '')
+        stem = Path(script).stem
+        w = re.sub(r'-wf_[\w-]+$', '', str(inp.get('name') or stem))
+        if re.search(r'-wf_[\w-]+$', stem):
+            script = ''         # the harness's copy of a script names no checkout
+        own = repo.owns(w, repo.workflows, repo.local_workflows, ctx, script, cwd)
+        tally.workflows[w if own else 'other'] += 1
     elif name in ('Read', 'Edit', 'Write') and isinstance(inp.get('file_path'), str):
         hit = repo.rel(inp['file_path'], cwd)
         if hit and name == 'Read':

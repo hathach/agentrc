@@ -1365,15 +1365,41 @@ class Usage(unittest.TestCase):
         self.run_dir = tmpdir(self) / 'run2'
         start(self.repo.path, self.run_dir, '--base', head, head=head)
         alias = self.repo.path / '.agents' / 'skills' / 'build' / 'SKILL.md'
+        cwd = self.repo.path.as_posix()
         claude(self.root / 'p' / 's1.jsonl', [
-            use('a', 'Skill', {'skill': 'build'}), use('b', 'Skill', {'skill': 'tool'}),
-            use('c', 'Agent', {'subagent_type': 'runner'}), use('d', 'Workflow', {'scriptPath': '/x/ship-wf_1.js'}),
+            use('a', 'Skill', {'skill': 'build'}, cwd=cwd), use('b', 'Skill', {'skill': 'tool'}, cwd=cwd),
+            use('c', 'Agent', {'subagent_type': 'runner'}, cwd=cwd),
+            use('d', 'Workflow', {'scriptPath': '/x/ship-wf_1.js'}, cwd=cwd),
             use('e', 'Read', {'file_path': str(alias)})])
         self.usage()
         agg = json.loads(self.out.read_text())
         self.assertEqual((agg['skills'], agg['agents'], agg['workflows']),
                          ({'build': 1, 'tool': 1}, {'runner': 1}, {'ship': 1}))
         self.assertEqual(agg['docs_read'], {'.claude/skills/build/SKILL.md': 1})
+
+    def test_a_project_local_name_counts_only_from_the_repository(self):
+        local = {'.claude/skills/build/SKILL.md': 'x\n', '.claude/agents/runner.md': 'x\n',
+                 '.claude/workflows/ship.js': 'x\n'}
+        head = self.repo.commit(local)
+        self.run_dir = tmpdir(self) / 'run2'
+        start(self.repo.path, self.run_dir, '--base', head, head=head)
+        foreign = Repo(self)
+        foreign.commit(local)
+        here, there = self.repo.path.as_posix(), foreign.path.as_posix()
+
+        def calls(cwd, script):
+            return [use(f'{cwd}s', 'Skill', {'skill': 'build'}, cwd=cwd),
+                    use(f'{cwd}a', 'Agent', {'subagent_type': 'runner'}, cwd=cwd),
+                    use(f'{cwd}w', 'Workflow', {'scriptPath': f'{script}/.claude/workflows/ship.js'}, cwd=cwd),
+                    use(f'{cwd}c', 'Workflow', {'scriptPath': '/x/ship-wf_1.js'}, cwd=cwd),
+                    use(f'{cwd}t', 'Skill', {'skill': 'tool'}, cwd=cwd)]      # a top-level name: installed everywhere
+        mine = use('r', 'Workflow', {'scriptPath': f'{here}/.claude/workflows/ship.js'}, cwd=there)
+        claude(self.root / 'p' / 's1.jsonl', calls(there, there) + calls(None, there) + calls(here, there) + [mine])
+        self.usage()
+        agg = json.loads(self.out.read_text())
+        # from the repository: its build, runner and the copied ship; ship by path counts where the path resolves
+        self.assertEqual((agg['skills'], agg['agents'], agg['workflows']),
+                         ({'build': 1, 'tool': 3, 'other': 2}, {'runner': 1, 'other': 2}, {'ship': 2, 'other': 5}))
 
     def test_codex_exec_and_function_calls(self):
         root = tmpdir(self)
