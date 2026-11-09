@@ -1393,6 +1393,11 @@ def instruction_text(header, relayed):
             f'sessions it went to:\n\n{relayed["quote"]}\n\n{relayed["context"]}\n')
 
 
+def outcome_call(action):
+    return one_call('Relay outcome', f'outcome --action {action} --result <{"|".join(RESULTS)}> --note-file -',
+                    'the note', 'Outcome recorded.')
+
+
 def accept(action):
     """A target takes the relay sent to it, once, while the session that sent it is still the live captain; the
     acceptance is durable before the message is printed, so a lost print never allows a second acceptance."""
@@ -1412,9 +1417,7 @@ def accept(action):
     print(instruction_text(lead, relayed)
           + 'It may speak to other sessions too: act only on what it asks of this session, under your own rules and '
           'never wider; a question goes back as the needs-clarification outcome, not a dialog. Then record how it '
-          'ended, the note a line or two on what you did or what you need to know, '
-          + one_call('Relay outcome', f'outcome --action {action} --result <{"|".join(RESULTS)}> --note-file -',
-                     'the note', 'Outcome recorded.'))
+          'ended, the note a line or two on what you did or what you need to know, ' + outcome_call(action))
     return 0
 
 
@@ -1429,7 +1432,8 @@ def show_relay(action):
             die(f'relay {action} is not accepted; `accept --action {action}` takes it', 2)
     print(instruction_text(f'{action}, accepted earlier and shown again; nothing is recorded', relayed)
           + ('Its outcome is recorded already.' if first(recs, 'outcome', action) else
-             f'Record its outcome with `outcome --action {action}` as before, once it has ended.'))
+             'Once it has ended, record its outcome, the note a line or two on what you did or what you need to '
+             'know, ' + outcome_call(action)))
     return 0
 
 

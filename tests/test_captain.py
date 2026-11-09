@@ -1531,7 +1531,8 @@ class AcceptTest(RelayCase):
         self.assertEqual(code, 0)
         self.assertIn('shown again; nothing is recorded', shown)
         self.assertIn('\n\nmerge o/r#12\n', shown)
-        self.assertIn(f'outcome --action {self.action}', shown)
+        self.assertIn(f'python3 {captain.INSTALLED} outcome --action {self.action} '
+                      '--result <completed|failed|rejected|needs-clarification> --note-file -', shown)
         self.as_target(captain.outcome, self.action, 'completed', 'merged')
         self.assertIn('outcome is recorded already', self.as_target(captain.show_relay, self.action)[1])
         self.assertEqual(captain.records()[:len(before)], before)
