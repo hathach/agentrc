@@ -48,6 +48,7 @@ check "JLinkExe" test -x /usr/bin/JLinkExe  # dpkg can list jlink with its files
 check "lm4flash" sh -c 'command -v lm4flash'
 check "dfu-util" dfu-util -V
 check "uhubctl" uhubctl -v
+check "iperf" iperf -v
 check "arm-none-eabi-nm" arm-none-eabi-nm --version
 check "python3 on PATH is the installed hil-venv" python3 -c 'import json, os, sys
 d = json.load(open("/var/lib/hil-farm/hil-venv.json"))["dir"]
