@@ -48,9 +48,12 @@ PUBLISH = {'create': {'--repo': REPO, '--allow-repo': REPO, '--title-file': None
            'comment': {'--repo': REPO, '--allow-repo': REPO, '--issue': None, '--body-file': None}}
 ISSUE = re.compile(r'[1-9][0-9]{0,11}')
 SUBCOMMANDS = ('list', 'enroll', 'ask', 'watch', 'watches', 'collect', 'reports', 'cancel', 'relay',
-               'queue', 'ingest', 'verdict')
+               'queue', 'ingest', 'verdict', 'start')
 TOKEN = re.compile(r'[A-Za-z0-9][A-Za-z0-9:._=-]*|--[a-z][a-z-]*')
 SHELL = re.compile(r'[^A-Za-z0-9 :._=/~,-]')   # any quoting, expansion, redirection, separator or newline
+CHECKOUT = re.compile(r'(?:/|~/)[A-Za-z0-9/._-]*')   # start's one path operand: never ~user
+START_OPTIONS = ('--name', '--space', '--tab', '--entry')
+ACCOUNTS = ('main', 'ada')
 
 
 def markdown_in(path, root):
@@ -80,6 +83,26 @@ def publication(args):
     return None
 
 
+def start_args(args):
+    """Why args are not one start: a checkout path, an optional account, each option at most once with a value."""
+    operands, seen, i = [], set(), 0
+    while i < len(args):
+        if args[i].startswith('-'):
+            value = args[i + 1] if i + 1 < len(args) else ''
+            if args[i] not in START_OPTIONS or args[i] in seen or value.startswith('-') or not TOKEN.fullmatch(value):
+                return f'start takes {", ".join(START_OPTIONS)}, each at most once with a value'
+            seen.add(args[i])
+            i += 2
+        else:
+            operands.append(args[i])
+            i += 1
+    if not operands or not CHECKOUT.fullmatch(operands[0]) or '..' in operands[0].split('/'):
+        return 'start takes the checkout as an absolute or ~/ path, with no .. in it'
+    if len(operands) > 2 or operands[1:] and operands[1] not in ACCOUNTS:
+        return f'start takes one checkout and at most an account, {" or ".join(ACCOUNTS)}'
+    return None
+
+
 def command(cmd, monitor=False):
     """Why a Bash or Monitor command is not a plain captain.py call, or None."""
     if not isinstance(cmd, str) or SHELL.search(cmd):
@@ -94,6 +117,8 @@ def command(cmd, monitor=False):
                 '`python3 ~/.claude/skills/captain/scripts/<script>`')
     if words[2] not in SUBCOMMANDS:
         return f'captain.py {words[2]} is not a captain subcommand ({", ".join(SUBCOMMANDS)})'
+    if words[2] == 'start':
+        return 'Monitor never starts a session' if monitor else start_args(words[3:])
     bad = [w for w in words[3:] if not TOKEN.fullmatch(w)]
     if bad:
         return f'unexpected argument {bad[0]!r}'
