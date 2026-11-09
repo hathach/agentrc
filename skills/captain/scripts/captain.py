@@ -1357,12 +1357,12 @@ def retry(action, mine):
             die(f'no held relay {action}', 3)
         if action not in open_items(recs) or any(r['msg'] == action and r['type'] in DELIVERY.values() for r in recs):
             die(f'relay {action} is no longer held', 2)
+        if held['captain'] != captain:
+            die(f'relay {action} was held by an earlier captain', 2)
         if first(recs, 'sending', action):   # typed or not, unrecorded: never type it twice
             append({'type': 'uncertain', 'msg': action, 'error': 'an earlier retry stopped while sending it'})
             print(f'{held["target"]["address"]}: {action} uncertain, an earlier retry stopped while sending it')
             return 0
-        if held['captain'] != captain:
-            die(f'relay {action} was held by an earlier captain', 2)
         address = held['target']['address']
         target = find(address)
         if not target or identity(target) != held['target']:

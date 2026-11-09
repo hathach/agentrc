@@ -1126,6 +1126,20 @@ class RelayTest(RelayCase):
         self.assertEqual(len(self.typed), 1)
         self.assertIn(action, captain.open_items(captain.records()))   # it may have landed: still acceptable
 
+    def test_an_interrupted_retry_is_settled_only_by_its_captain(self):
+        self.terminals['t2'] = {**pinned('t2'), 'status': 'working'}
+        self.say('merge o/r#12')
+        action = self.relay()[0].split()[1]
+        self.terminals['t2'] = {**pinned('t2'), 'status': 'idle'}
+        with mock.patch.object(captain, 'submit', mock.Mock(side_effect=OSError('killed'))), \
+                self.assertRaises(OSError):
+            self.retry(action)
+        before = captain.records()
+        captain.write_json(captain.ENROLLED, {**captain.enrolled(), 'generation': 'new'})
+        with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
+            self.retry(action)
+        self.assertEqual(captain.records(), before)
+
     def test_a_queued_message_without_an_id_refuses(self):
         self.record(type='user', origin={'kind': 'task-notification'},
                     message={'role': 'user', 'content': '<task-notification>'})
