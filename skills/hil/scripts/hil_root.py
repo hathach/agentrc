@@ -3,13 +3,19 @@
 only, and it imports nothing beside it.
 
 A rig may grant its CI user sudo on an installed copy of this file (INSTALLED), so it takes
-no path, command or environment from its caller: each verb checks its arguments against the
-one sysfs file, device or program it touches. Recovery's usb_recover is a separate grant.
+no path, command or environment from its caller (only SUDO_UID, which sudo sets itself): each verb
+checks its arguments against the one sysfs file, device or program it touches. Recovery's
+usb_recover is a separate grant.
 
   hil_root.py pattern 0|1                usbtest's pattern parameter
   hil_root.py modprobe                   modprobe usbtest
   hil_root.py dmesg                      the kernel log lines naming usbtest
   hil_root.py reset-tt BUSPORT           Reset_TT on the multi-TT hub port BUSPORT names
+  hil_root.py netns BUSPORT PID          move the USB network interface of BUSPORT's device, a
+                                         board (NETNS_VIDS), into PID's network namespace, one
+                                         owned by a user namespace a user other than root created,
+                                         the one SUDO_UID names when set; prints its ifindex, the
+                                         same in that namespace, and its name as checked
 
 Exit 2 refuses a request; otherwise the operation's own status, its error on stderr.
 Callers build the argv with `argv()`.
@@ -20,6 +26,7 @@ from __future__ import annotations
 import fcntl
 import os
 import re
+import socket
 import stat
 import struct
 import subprocess
@@ -29,6 +36,7 @@ from pathlib import Path
 FILES = ()                                  # it loads and launches nothing by path
 INSTALLED = '/usr/local/sbin/hil_root'      # a rig's root-owned copy, the CI user's sudo grant
 SYS_USB = Path('/sys/bus/usb/devices')
+PROC = Path('/proc')
 PATTERN_PARAM = Path('/sys/module/usbtest/parameters/pattern')
 DEV_USB = '/dev/bus/usb'
 DMESG, MODPROBE = '/usr/bin/dmesg', '/usr/sbin/modprobe'
@@ -39,6 +47,21 @@ _BUSPORT = re.compile(r'[1-9][0-9]*-[1-9][0-9]*(\.[1-9][0-9]*)*\Z')
 _CTRLTRANSFER = struct.Struct('@BBHHHIP')                   # struct usbdevfs_ctrltransfer
 USBDEVFS_CONTROL = 0xC0005500 | _CTRLTRANSFER.size << 16   # _IOWR('U', 0, ...)
 RESET_TT = 9
+
+# A board's USB network function, never a host NIC: a board's vendor id and one of these class
+# drivers. The id is the boundary because the caller cannot change a host NIC's (a host cdc_ether
+# or cdc_ncm adapter, a tethered phone), and a board claiming one moves only itself. A MAC is not:
+# hosts clone or randomize locally administered ones. 0xcafe: the TinyUSB examples' test VID.
+NETNS_VIDS = ('cafe',)
+NET_DRIVERS = ('cdc_ether', 'cdc_ncm', 'cdc_eem', 'rndis_host')
+NS_GET_USERNS = 0xb701                  # _IO(0xb7, 0x1), v6.12 include/uapi/linux/nsfs.h
+NS_GET_OWNER_UID = 0xb704               # _IO(0xb7, 0x4): a user namespace's creator uid (uid_t)
+RTM_NEWLINK, NLMSG_ERROR = 16, 2                # v6.12 include/uapi/linux/rtnetlink.h, netlink.h
+IFLA_NET_NS_FD = 28                             # v6.12 include/uapi/linux/if_link.h
+IFLA_NEW_IFINDEX = 49                           # if_link.h; a move honours it since v5.13
+NLM_F_REQUEST_ACK = 0x1 | 0x4
+_NLMSGHDR = struct.Struct('=IHHII')                         # len, type, flags, seq, pid
+_IFINFOMSG = struct.Struct('=BxHiII')                       # family, type, index, flags, change
 
 
 class Refused(Exception):
@@ -143,7 +166,97 @@ def reset_tt(busport):
         os.close(fd)
 
 
-VERBS = {'pattern': pattern, 'modprobe': modprobe, 'dmesg': dmesg, 'reset-tt': reset_tt}
+def usb_netdev(busport):
+    """(ifindex, name) of the one network interface BUSPORT's device has, refused unless the device
+    is a board (NETNS_VIDS) and a USB network class driver (NET_DRIVERS) drives it. The ifindex is
+    read before the checks and again after: a device re-enumerated meanwhile gets a new one, so the
+    one returned is the one checked. The name is not checked again: a rename (udev's) may change it."""
+    if not _BUSPORT.match(busport):
+        raise Refused(f'busport {busport!r}: expected BUS-PORT[.PORT...]')
+    try:
+        found = list((SYS_USB / busport).glob(f'{busport}:*/net/*'))
+        if len(found) != 1:
+            raise Refused(f'{busport}: expected one network interface, found {sorted(p.name for p in found)}')
+        net = found[0]
+        ifindex = int(_read(net / 'ifindex'))
+        vid = _read(SYS_USB / busport / 'idVendor')
+        if vid not in NETNS_VIDS:
+            raise Refused(f'{busport}: vendor id {vid} is not a board\'s ({", ".join(NETNS_VIDS)})')
+        driver = os.path.basename(os.readlink(net.parent.parent / 'driver'))
+        if driver not in NET_DRIVERS:
+            raise Refused(f'{busport}: {net.name} is driven by {driver}, not a USB network function')
+        if int(_read(net / 'ifindex')) != ifindex:
+            raise Refused(f'{busport}: {net.name} changed while it was checked')
+        return ifindex, net.name
+    except (OSError, ValueError) as e:
+        raise Refused(f'{busport}: {getattr(e, "strerror", None) or e}')
+
+
+def sandbox_netns(pid):
+    """An fd on PID's network namespace, refused unless a user namespace other than the initial
+    one owns it and a user other than root created that one -- the one SUDO_UID names when set:
+    an unprivileged process's sandbox, never the host's or a root container's. Held open, so a PID
+    reused after this check cannot redirect the move."""
+    if not pid.isdecimal() or int(pid) < 1:
+        raise Refused(f'pid {pid!r}: expected a process id')
+    if int(pid) == 1:
+        raise Refused('pid 1 is the host\'s init')
+    try:
+        fd = os.open(PROC / pid / 'ns' / 'net', os.O_RDONLY)
+    except OSError as e:
+        raise Refused(f'pid {pid}: {e.strerror or e}')
+    try:
+        owner = fcntl.ioctl(fd, NS_GET_USERNS)
+        try:
+            st, init = os.fstat(owner), os.stat(PROC / '1' / 'ns' / 'user')
+            uid, = struct.unpack('=I', fcntl.ioctl(owner, NS_GET_OWNER_UID, bytes(4)))
+        finally:
+            os.close(owner)
+        if (st.st_dev, st.st_ino) == (init.st_dev, init.st_ino):
+            raise Refused(f'pid {pid}: its network namespace is not owned by an unprivileged user namespace')
+        if uid == 0:
+            raise Refused(f'pid {pid}: its user namespace was created by root')
+        caller = os.environ.get('SUDO_UID')
+        if caller is not None and str(uid) != caller:
+            raise Refused(f'pid {pid}: its user namespace was created by uid {uid}, not SUDO_UID {caller}')
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def move_link(ifindex, nsfd):
+    """RTM_NEWLINK moving ifindex into the namespace nsfd names, by index: a device that
+    re-enumerated since has a new one, so a stale index fails rather than moving its successor.
+    It keeps that index there or the move fails (EBUSY): unasked, the kernel renumbers on a clash."""
+    attr = struct.pack('=HHI', 8, IFLA_NET_NS_FD, nsfd) + struct.pack('=HHi', 8, IFLA_NEW_IFINDEX, ifindex)
+    body = _IFINFOMSG.pack(socket.AF_UNSPEC, 0, ifindex, 0, 0) + attr
+    msg = _NLMSGHDR.pack(_NLMSGHDR.size + len(body), RTM_NEWLINK, NLM_F_REQUEST_ACK, 1, 0) + body
+    with socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, socket.NETLINK_ROUTE) as s:
+        s.settimeout(5)
+        s.send(msg)
+        reply = s.recv(4096)
+    if len(reply) < _NLMSGHDR.size + 4:
+        raise OSError(f'short netlink reply ({len(reply)} bytes)')
+    _, kind, _, seq, _ = _NLMSGHDR.unpack_from(reply)
+    if kind != NLMSG_ERROR or seq != 1:
+        raise OSError(f'unexpected netlink reply type {kind} seq {seq}')
+    err, = struct.unpack_from('=i', reply, _NLMSGHDR.size)
+    if err:
+        raise OSError(-err, os.strerror(-err))
+
+
+def netns(busport, pid):
+    ifindex, name = usb_netdev(busport)
+    fd = sandbox_netns(pid)
+    try:
+        move_link(ifindex, fd)
+    finally:
+        os.close(fd)
+    print(ifindex, name)
+
+
+VERBS = {'pattern': pattern, 'modprobe': modprobe, 'dmesg': dmesg, 'reset-tt': reset_tt, 'netns': netns}
 
 
 def main(args) -> int:
