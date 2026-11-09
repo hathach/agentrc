@@ -2351,10 +2351,10 @@ class FreshnessTest(DecisionCase):
         self.refresh(pr=self.A)
         self.send(decision('merge', reviewed_sha=self.A), refresh=['merge'])
         self.assertEqual((self.item()['revision'], captain.freshness(self.item())), (2, 'unknown'))
+        before = captain.records()
         with captain.locked():
-            self.assertIsNone(captain.record_observed(self.item()['id'], 1, [{'source': 'pr', 'ok': True,
-                                                                              'value': self.A}]))
-        self.assertEqual(captain.freshness(self.item()), 'unknown')
+            captain.record_observed([(self.item()['id'], 1, [{'source': 'pr', 'ok': True, 'value': self.A}])])
+        self.assertEqual(captain.records(), before)
 
 
 class VerdictCase(RelayCase):
@@ -2871,7 +2871,7 @@ class QueueTest(VerdictCase):
     def queue(self, *flags):
         """What `queue --json` prints, flags passed through."""
         with mock.patch('builtins.print') as out:
-            captain.queue('all' in flags, True, 'refresh' in flags, self.ident)
+            captain.queue('all' in flags, True, self.ident if 'refresh' in flags else None)
         return json.loads(out.call_args_list[0].args[0])
 
     def test_blocked_then_review_then_idea_each_in_opening_order(self):
@@ -2883,14 +2883,41 @@ class QueueTest(VerdictCase):
         self.report(decision('merge', kind='blocked'), decision('ci', kind='blocked'))
         with mock.patch('builtins.print'):
             captain.cancel(self.item('ci')['id'], self.ident)
-        self.decide()
+        action = self.action_of(self.decide())
         self.assertEqual(self.queue()['items'], [], 'delivered, and the cancelled one is history')
         self.assertEqual({i['key'] for i in self.queue('all')['items']}, {'merge', 'ci'})
-        action = next(r['msg'] for r in captain.records() if r['type'] == 'relay')
-        self.as_target(captain.outcome, action, 'rejected', 'not mine')
+        self.as_target(captain.accept, action)
+        self.as_target(captain.outcome, action, 'needs-clarification', 'which branch?')
         [shown] = self.queue()['items']
         self.assertEqual((shown['key'], shown['state'], shown['verdicts'][0]['status']),
-                         ('merge', 'closed', 'rejected'))
+                         ('merge', 'closed', 'needs-clarification'), 'accepted, so it may have been acted on')
+
+    def test_a_relayed_verdict_never_acted_on_reopens_its_decision(self):
+        for end in ('rejected', 'needs-clarification', 'cancel'):
+            with self.subTest(end):
+                key = f'k-{end}'
+                self.report(decision(key, kind='blocked'))
+                action = self.action_of(self.decide(key=key, words=f'{key}: no'))
+                with mock.patch('builtins.print'):
+                    if end == 'cancel':
+                        captain.cancel(action, self.ident)
+                    else:
+                        self.as_target(captain.outcome, action, end, 'not now')
+                self.assertEqual((self.item(key)['state'], self.item(key)['revision']), ('open', 1))
+                with mock.patch('builtins.print') as out, self.assertRaises(SystemExit):
+                    captain.relay(captain.resolve(['t2']), None, self.ident, (self.item(key)['id'], 1, 'correction'))
+                self.assertIn('recorded already', out.call_args_list[0].args[0], 'the same message is never sent again')
+
+    def test_a_resolved_decision_stays_closed_when_its_held_verdict_is_cancelled(self):
+        self.report(decision('merge', kind='blocked'))
+        self.terminals['t2'] = {**pinned('t2'), 'status': 'working'}
+        action = self.action_of(self.decide())
+        self.terminals['t2'] = pinned('t2')
+        self.report(resolved=[{'key': 'merge', 'revision': 1}])
+        with mock.patch('builtins.print'):
+            captain.cancel(action, self.ident)
+        self.assertEqual(self.item()['state'], 'closed')
+
 
     def test_only_the_latest_verdict_keeps_a_closed_decision_listed(self):
         self.report(decision('merge', kind='blocked'))
@@ -2942,7 +2969,7 @@ class QueueTest(VerdictCase):
     def test_the_text_view_names_each_decision_and_the_coverage(self):
         self.report(decision('merge', kind='blocked'))
         with mock.patch('builtins.print') as out:
-            captain.queue(False, False, False, None)
+            captain.queue(False, False)
         lines = [c.args[0] for c in out.call_args_list]
         self.assertEqual(lines[0], 'blocked')
         self.assertIn(self.item()['id'], lines[1])

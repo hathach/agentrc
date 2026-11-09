@@ -171,8 +171,11 @@ pins each target's session once, so one replaced in its terminal while the relay
   with no call on its quality; never infer one from words that do not decide that decision. Both refuse a closed or
   revised decision, evidence observed stale, and a review not confirmed current: run `queue --refresh` and show the
   human what changed. A held relayed verdict is checked again at `--retry`, and closes undelivered once obsolete; its
-  target's `accept` refuses one obsolete by then. `queue --json`'s `metrics` count correction verdicts over the
-  changes rated.
+  target's `accept` refuses one obsolete by then. A relayed verdict its target never accepted - undelivered, refused,
+  cancelled, rejected or needing clarification - reopens the decision at that revision unless it was resolved
+  meanwhile; the same message is never relayed again, so a new verdict takes the human's new words. One accepted stays
+  decided, its outcome listed until another verdict follows. `queue --json`'s `metrics` count correction verdicts over
+  the changes rated.
 - **File** a follow-up issue as `agents/captain.md` says, from a title and a body drafted under
   `~/.cache/agentrc/captain/drafts/`:
 
