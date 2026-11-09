@@ -21,12 +21,9 @@ plain file name, and renamed only with a migration of the locks and records nami
 resolve(entry) is a roster entry with its board's `flasher` (its `uid` the probe serial) and
 `flasher_recover` filled in, and its registered `dev_attached` at the top level, a new dict. An entry
 with `probe` that also carries a flasher is refused as a duplicate; one without `probe` (a bench board,
-or a rig one project owns) keeps its own, unless its probe is a registered board's. Until every project
-reads `dev_attached` from here, a registered board's roster may still carry its own copy (tinyusb
-`tests.dev_attached`, Arduino `arduino.dev_attached`). A nested copy stays in the resolved entry for the
-consumers that still read it, and a top-level one is replaced by the registry's; either way each is
-compared with the registry's (vid_pid in either `vvvv:pppp` or `vvvv_pppp` spelling, a "0" serial as
-none) and named in a warning on stderr, never refused. resolve_roster(roster) resolves `boards` and `boards-skip`.
+or a rig one project owns) keeps its own, unless its probe is a registered board's. Where the registry
+has a board's `dev_attached`, a copy its roster still carries (skills/hil/SKILL.md, Board registry) is
+compared with it and warned about on stderr, never refused. resolve_roster(roster) resolves `boards` and `boards-skip`.
 Both raise ValueError naming every problem. lock_name(entry, own) is an entry's board lock.
 
   hil_boards.py roster FILE         the resolved roster as JSON (exit 1 refused, 2 usage)
@@ -50,7 +47,8 @@ PHYSICAL = ('flasher', 'flasher_recover')
 LOCK_NAME_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]*\Z')   # also within hil_lock's own grammar
 FLASHER_NAMES = ('jlink', 'stlink', 'openocd', 'lm4flash', 'esptool', 'pyocd', 'openocd_esp')
 _FLASHER_KEYS = {'name', 'uid', 'args', 'vid_pid', 'verify', 'note'}
-_ENTRY_KEYS = {'name', *PHYSICAL, 'dev_attached'}
+REGISTERED = (*PHYSICAL, 'dev_attached')   # what a registered board's resolved entry takes from here
+_ENTRY_KEYS = {'name', *REGISTERED}
 _DEV_KEYS = {'vid_pid', 'serial', 'is_cdc', 'is_msc', 'block_size', 'block_count', 'msc_inquiry', 'note'}
 DEV_VID_PID_RE = re.compile(r'[0-9a-f]{4}:[0-9a-f]{4}\Z')
 
@@ -104,7 +102,7 @@ def flasher_problem(flasher, *, has_uid=True) -> str:
 
 
 def _identity(device, legacy=False) -> tuple:
-    """(vid_pid, serial or None) of a device; a legacy roster copy's "0" serial is none (tinyusb's rendering)."""
+    """(vid_pid, serial or None) of a device; in a roster's copy, either vid_pid spelling and a "0" serial."""
     serial = device.get('serial')
     if legacy:
         return device['vid_pid'].lower().replace('_', ':'), None if serial == '0' else serial
@@ -134,9 +132,9 @@ def dev_attached_problem(devices) -> str:
         for key in ('msc_inquiry', 'note'):
             if key in d and not (isinstance(d[key], str) and d[key].strip()):
                 return f'[{i}] {key} must be a non-empty string, got {d[key]!r}'
-        if _identity(d) in seen:
+        if (ident := _identity(d)) in seen:
             return f'[{i}] {d["vid_pid"]} {d.get("serial")!r} is listed twice'
-        seen.add(_identity(d))
+        seen.add(ident)
     return ''
 
 
@@ -200,19 +198,18 @@ def _registered(entry, path) -> tuple:
     return (reg, '') if reg else (None, f'{entry.get("name")}: probe {probe!r} is not in agentrc\'s board registry')
 
 
-def _local_copies(obj, where=''):
-    """[(path, value)] of every `dev_attached` key in a roster entry, not descending into one found."""
+LEGACY_COPIES = (('dev_attached',), ('tests', 'dev_attached'), ('arduino', 'dev_attached'))
+
+
+def _local_copies(entry):
+    """[(path, value)] of the `dev_attached` copies a roster entry carries (LEGACY_COPIES)."""
     found = []
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            here = f'{where}.{k}' if where else k
-            if k == 'dev_attached':
-                found.append((here, v))
-            else:
-                found += _local_copies(v, here)
-    elif isinstance(obj, list):
-        for i, v in enumerate(obj):
-            found += _local_copies(v, f'{where}[{i}]')
+    for path in LEGACY_COPIES:
+        obj = entry
+        for key in path:
+            obj = obj.get(key) if isinstance(obj, dict) else None
+        if obj is not None:
+            found.append(('.'.join(path), obj))
     return found
 
 
@@ -231,13 +228,12 @@ def _copy_problem(local, registered) -> str:
             return sorted(f'{v} {s!r}' if s is not None else f'{v} (no serial)' for v, s in i)
         return f'devices {show(ids)}, the registry\'s {show(by_id)}'
     for i, d in zip(ids, local):
-        differ = sorted(k for k in d if k not in ('vid_pid', 'serial') and by_id[i].get(k, _ABSENT) != d[k])
+        differ = sorted(k for k in d if k not in ('vid_pid', 'serial') and (k not in by_id[i] or by_id[i][k] != d[k]))
         if differ:
             return f'{i[0]} {i[1]!r}: {", ".join(differ)} differ'
     return ''
 
 
-_ABSENT = object()
 _warned: set = set()
 
 
@@ -268,7 +264,7 @@ def _resolve(entry, path) -> tuple:
                 if (path, note) not in _warned:
                     _warned.add((path, note))
                     print(f'hil_boards: {note}; drop it from the roster', file=sys.stderr)
-        out = copy.deepcopy({**entry, **{k: reg[k] for k in (*PHYSICAL, 'dev_attached') if k in reg}})
+        out = copy.deepcopy({**entry, **{k: reg[k] for k in REGISTERED if k in reg}})
         out['flasher']['uid'] = probe
         return out, ''
     if 'flasher' not in entry:

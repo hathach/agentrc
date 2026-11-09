@@ -284,7 +284,7 @@ class Rosters(Fixture):
         self.assertEqual(r['locks'], ['mimxrt1064_evk', 'raspberry_pi_pico2', 'stm32f303disco', 'stm32h743eval'])
         self.assertEqual(r['identities']['e6633861a3978538'], {'raspberry_pi_pico2'})
         self.assertEqual(r['identities']['000725299165'], {'mimxrt1064_evk'})   # tinyuf2 flasher.uid
-        self.assertEqual(r['identities']['820000000000000045b46338'], {'raspberry_pi_pico2'})   # dev_attached serial
+        self.assertNotIn('820000000000000045b46338', r['identities'])   # dev_attached: the DUT's own host port
         self.assertEqual(r['identities']['uart-1064'], {'mimxrt1064_evk'})
 
     def test_a_probe_shared_by_two_entries_maps_to_both_locks(self):
@@ -332,9 +332,8 @@ class Rosters(Fixture):
         b.write_text(json.dumps({'boards': [{'name': 'b', 'uid': 'FW-B', 'probe': probe}]}))
         got = hr.load_rosters([(str(a), 'name'), (str(b), 'name')])
         lock = {entry['name']}
-        attached = {hr.identity(d['serial']): lock for d in entry.get('dev_attached', []) if 'serial' in d}
         self.assertEqual(got, {'locks': [entry['name']],
-                               'identities': {'fw-a': lock, 'fw-b': lock, probe.lower(): lock, **attached}})
+                               'identities': {'fw-a': lock, 'fw-b': lock, probe.lower(): lock}})
 
     def test_a_registered_board_locks_as_its_registry_name(self):
         probe, entry = next(iter(hr.hil_boards.registry().items()))
@@ -347,15 +346,13 @@ class Rosters(Fixture):
         with self.assertRaisesRegex(hr.Refused, f"lock 'other' is not its registered board's, {entry['name']}"):
             hr.load_rosters([(str(roster), 'proj.lock')])
 
-    def test_a_registered_boards_attached_devices_are_its_identities(self):
+    def test_attached_devices_are_no_identities_registry_or_roster_copy(self):
         probe, entry = next((p, e) for p, e in hr.hil_boards.registry().items() if 'dev_attached' in e)
         roster = Path(self.td.name) / 'r.json'
-        roster.write_text(json.dumps({'boards': [{'name': 'x', 'uid': 'DUT-UID', 'probe': probe}]}))
+        roster.write_text(json.dumps({'boards': [{'name': 'x', 'uid': 'DUT-UID', 'probe': probe, 'tests': {
+            'dev_attached': [{'vid_pid': '1a86_7523', 'serial': '0'}]}}]}))
         ids = hr.load_rosters([(str(roster), 'name')])['identities']
-        for d in entry['dev_attached']:
-            if 'serial' in d:
-                self.assertIn(entry['name'], ids[hr.identity(d['serial'])], d)
-        self.assertNotIn('0', ids)
+        self.assertEqual(set(ids), {'dut-uid', probe.lower()})
 
     def test_a_roster_carrying_a_registered_boards_flasher_refuses(self):
         probe, entry = next(iter(hr.hil_boards.registry().items()))
@@ -443,6 +440,12 @@ class Check(Fixture):
     def test_the_target_busport_must_exist(self):
         rc, out = main('check', '3-1.9', *self.rosters())
         self.assertEqual((rc, 'no device at 3-1.9' in out), (1, True), out)
+
+    def test_an_attached_devices_serial_covers_no_host_node(self):
+        self.dev('3-1.4', serial='820000000000000045B46338')   # the pico2 roster's dev_attached serial
+        rc, out = main('check', '3-1.1', *self.rosters())
+        self.assertEqual(rc, 1)
+        self.assertIn('3-1.4: serial 820000000000000045B46338 matches no roster identity', out)
 
     def test_an_unknown_sibling_refuses_naming_it(self):
         self.dev('3-1.4', serial='stranger')

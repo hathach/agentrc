@@ -11,9 +11,10 @@ on the hub). An entry with `probe` locks as its registered board's name (hil_boa
 any other entry's lock is the dotted SELECTOR field, falling back to `name` only when the entry
 lacks it (tinyuf2: `tinyuf2.lock`; tinyusb: the default, `name`). A registered entry whose
 SELECTOR field names another lock is refused. Identities are every `uid`, `uart_uid` and
-`serial` string in an entry, compared in the form udev's usb_id gives a serial (whitespace
-runs and unsafe characters as `_`), case-insensitively; two roster identities that become one
-that way are refused. The contract's Hosts/rosters is the roster list: the check refuses what
+`serial` string in an entry outside its `dev_attached` lists (devices on the board's own USB host
+port, which this host never sees, some with serials as weak as "0"), compared in the form udev's
+usb_id gives a serial (whitespace runs and unsafe characters as `_`), case-insensitively; two
+roster identities that become one that way are refused. The contract's Hosts/rosters is the roster list: the check refuses what
 the rosters do not explain, it never infers an inventory.
 
 check (read-only, exit 0 covered / 1 refused / 2 usage): walks the device directories under
@@ -145,7 +146,7 @@ def _identities(obj, out):
         for k, v in obj.items():
             if k in IDENTITY_KEYS and isinstance(v, str) and v.strip():
                 out.add(v.strip().lower())
-            else:
+            elif k != 'dev_attached':
                 _identities(v, out)
     elif isinstance(obj, list):
         for v in obj:
