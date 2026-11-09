@@ -2234,6 +2234,17 @@ class DecisionTest(DecisionCase):
         self.send(decision('merge'), event='e', address='t3', member=msg)
         self.assertEqual((self.item()['owner']['address'], self.item()['revision']), ('t3', 1))
 
+    def test_a_resumed_session_retrying_an_old_event_through_the_watch_moves_its_items(self):
+        first = self.send(decision('merge'), event='e')
+        self.terminals['t3'] = {**pinned('t3'), 'session': 's-t2'}   # the same session resumed in t3
+        del self.terminals['t2']
+        member = self.joined_as('t3')
+        self.assertNotEqual(self.send(decision('merge'), event='e', address='t3', member=member), first)
+        self.assertEqual((self.item()['owner']['address'], self.item()['revision']), ('t3', 1))
+        self.assertEqual(captain.queue_row(self.item(), {})['relay_target'], 't3')
+        self.assertEqual(self.send(decision('merge'), event='e', address='t3', member=member), first)
+        self.assertEqual(self.count('report'), 2, 'a retry from where it runs now is not recorded again')
+
     def test_a_changed_decision_is_a_revision_an_unchanged_one_is_not(self):
         self.send(decision('merge'))
         self.send(decision('merge'))

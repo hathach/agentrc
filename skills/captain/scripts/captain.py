@@ -913,6 +913,15 @@ def earlier_event(recs, source, payload):
     return None
 
 
+def reported_from(recs, source):
+    """The target source's session last reported from, through any request or watch, or None: its items' owner."""
+    sources = asked(recs)
+    me = session_of(source['target'])
+    return next((sources[r['msg']]['target'] for r in reversed(recs)
+                 if r['type'] == 'report' and r['msg'] in sources and session_of(sources[r['msg']]['target']) == me),
+                None)
+
+
 def unknown_keys(recs, source, payload):
     """The keys payload reopens, refreshes or resolves that are no decision of this session's, nor in payload."""
     named = {*payload.get('reopen', []), *payload.get('refresh', []), *(r['key'] for r in payload.get('resolved', []))}
@@ -925,7 +934,8 @@ def unknown_keys(recs, source, payload):
 
 def report(msg, file):
     """A target answers msg: only the session it was sent to, as pinned then, only while it is open, only once. A
-    report repeating an event_id this session sent is the same report again, recorded once."""
+    report repeating an event_id this session sent is the same report again, its operations applied once; through a
+    watch it is recorded again only from where the session moved since, so its items follow it."""
     try:
         payload = json.loads(read_text(file))
     except ValueError as e:
@@ -944,7 +954,7 @@ def report(msg, file):
         if member:   # a watch's member reports each task end: every report is kept, none closes it
             member_watch(member, recs, mine)
             again = earlier_event(recs, member, payload)
-            if again is not None:
+            if again is not None and reported_from(recs, member) == member['target']:
                 print(f'recorded {again}')
                 return 0
             append({'type': 'report', 'msg': msg, 'report': payload})
