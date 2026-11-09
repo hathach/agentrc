@@ -517,9 +517,7 @@ def by_status(s, v, where, table, fields=()):
     return True
 
 
-def supersession_cycle(start, items):
-    by = {it['id']: it['by'] for _, it in items
-          if it.get('status') == 'superseded' and isinstance(it.get('id'), str) and isinstance(it.get('by'), str)}
+def supersession_cycle(start, by):
     seen, i = set(), start
     while i in by and i not in seen:
         seen.add(i)
@@ -575,13 +573,15 @@ def check_review(s, r, rng=None, carried=None):
             items.append((w, it))
     ids = [it['id'] for _, it in items if isinstance(it.get('id'), str)]
     unique(s, 'decisions/open', ids)
+    by = {it['id']: it['by'] for _, it in items
+          if it.get('status') == 'superseded' and isinstance(it.get('id'), str) and isinstance(it.get('by'), str)}
     for w, it in items:
         superseded = it.get('status') == 'superseded'
         if superseded != ('by' in it):
             s.bad(w, 'superseded needs by, and only superseded takes it')
         elif superseded and (not isinstance(it['by'], str) or it['by'] not in ids or it['by'] == it.get('id')):
             s.bad(f'{w}.by', f'{it["by"]!r} is no other item\'s id')
-        elif superseded and supersession_cycle(it['id'], items):
+        elif superseded and supersession_cycle(it['id'], by):
             s.bad(f'{w}.by', f'{it["id"]} is superseded in a cycle: its chain must end in an item that is not '
                              'superseded, or every item of it drops out of later audits')
         if carried is None or not isinstance(it.get('id'), str):
