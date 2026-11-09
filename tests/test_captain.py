@@ -2495,6 +2495,7 @@ class VerdictTest(VerdictCase):
         self.assertIn('undelivered', line)
         self.assertIn('revised', line)
         self.assertEqual([t for t in self.typed if 'RELAYED' in t[1]], [])
+        self.assertEqual((self.item()['state'], self.item()['revision']), ('open', 2))
 
     def test_a_delivered_review_verdict_is_not_accepted_once_the_head_moves(self):
         self.report(decision('merge', reviewed_sha=self.A))
@@ -2930,10 +2931,6 @@ class WatchCollectTest(WatchCase):
         self.assertEqual(self.collect()[1][-1], 'done')
 
 
-if __name__ == '__main__':
-    unittest.main()
-
-
 class QueueTest(VerdictCase):
     """The decisions waiting on the human, read from the ledger alone."""
 
@@ -3043,3 +3040,7 @@ class QueueTest(VerdictCase):
         self.assertEqual(lines[0], 'blocked')
         self.assertIn(self.item()['id'], lines[1])
         self.assertIn(captain.UNCOVERED, lines[-1])
+
+
+if __name__ == '__main__':
+    unittest.main()

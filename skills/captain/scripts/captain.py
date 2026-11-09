@@ -1243,10 +1243,10 @@ def close(item, i, why, by=None):
 
 
 def unclose(item, i, by):
-    """Reopen item when by, a relayed verdict, closed it at the revision it still has and nothing resolved that
-    revision since: its target never acted on the verdict."""
-    closure = item['closure']
-    if closure and closure['by'] == by and closure['revision'] == item['revision'] != item['resolved']:
+    """Reopen item, at its latest revision, when by, a relayed verdict, closed it and its session resolved neither
+    that revision nor a later one since: its target never acted on the verdict."""
+    closure, resolved = item['closure'], item['resolved']
+    if closure and closure['by'] == by and (resolved is None or resolved < closure['revision']):
         item['state'], item['closure'], item['updated'] = 'open', None, i
 
 
