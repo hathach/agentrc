@@ -27,9 +27,9 @@ see does, refuses), each reason after it. Exit 0 complete, 1 otherwise, 2 refuse
 report checks the record at E as check does, without the validation comment, and that FILE's {"end", "items":
 [{"id", "result", "ref"}]} names E, the commit its results were taken on, and exactly the record's covered items;
 it prints the comment body: the audit report rendered from the record and git, each record string on one line
-after a fixed prefix, then the validation block. It refuses a body over GitHub's comment limit, or one whose
-validation block does not read back as printed, and posts nothing:
-`gh pr comment <pr.number> --repo <pr.repo> -F <body>` does. Exit 0 printed, 2 refused.
+after a fixed prefix, then the validation block. A body over GitHub's comment limit keeps the block and cuts the
+report above it at a line, saying so. It refuses when the block alone does not fit, or does not read back as
+printed, and posts nothing: `gh pr comment <pr.number> --repo <pr.repo> -F <body>` does. Exit 0 printed, 2 refused.
 
 start takes the base from a complete record (its end E, kind `audit`) or from --base with its kind (`bootstrap` for
 a first audit, refused when head holds a record; `override` to replace one); anything else refuses, offering the
@@ -43,12 +43,14 @@ transcript window usage.py reads (ISO 8601; default the base commit's committer 
 finish checks, in the run's repository at --repo (default the checkout start ran in), the lead's review FILE against
 the record schema, the run's range and carried items and the privacy rules, and that the review's PR is open on its
 repository with head R, and records as the PR base M the tip of its base branch, read from that repository, which
-must descend from the run's base and be in R; then, after those reads, that the checkout is clean at --head R, R
-descends from the run's base and start head, and R holds the record start read (this audit's own record commit, or
-another audit's record merged since, refuses). It refuses a `.claude` or record path that is a symbolic link or an
-ignored record path, then writes the record through a new file renamed over it and prints how to commit it. Exit 0
-done, 2 refused (with every reason on stderr). Shallow or grafted history, or a replace ref, is refused before any
-command; so is a run dir of another audit.py version.
+must descend from the run's base and be in R (the PR read again after it must still have head R on that branch);
+then, after those reads, that the checkout is clean at --head R, R descends from the run's base and start head, and
+R holds the record start read (this audit's own record commit, or another audit's record merged since, refuses). It
+refuses a `.claude` or record path that is a symbolic link or an ignored record path, then writes the record through
+a new file renamed over it and prints how to commit it. Exit 0 done, 2 refused (with every reason on stderr).
+Shallow or grafted history, or a replace ref, is refused before any command; so is a run dir of another audit.py
+version. A GitHub read (gh, git fetch or ls-remote) never prompts for credentials and refuses after TIMEOUT seconds
+without an answer.
 
 FILE is one JSON object; a field the schema does not name is refused at any depth:
   range       "<base>..<R>" in full SHAs: the run's range, so a review written before R moved refuses
@@ -69,11 +71,12 @@ FILE is one JSON object; a field the schema does not name is refused at any dept
               words)}]}, with at least one software and one hardware item; required-pending refuses. The script
               checks presence and provenance only; whether the list is complete for the range is the record
               co-review's call.
-The record holds these fields but range (base and reviewedHead carry it), and prBase M. An item's status is new,
-carried, resolved or superseded (+ by, another item's id). Each id carried.json lists must appear carried, resolved
-or superseded; only those may be carried. Strings that look private refuse: home or /tmp paths, .jsonl, session URLs
-and ids, toolu_ ids, ChatGPT conversation links, bare UUIDs outside a CircleCI URL, and shell command shapes ($(,
-2>&1, /dev/null, sudo, a `$ ` prompt, a pipe into a filter, a $VAR/ path).
+The record holds these fields but range, and schema, identity (the root commits), base, baseKind, prBase M,
+reviewedHead R and completed (finish's local time, ISO 8601). An item's status is new, carried, resolved or superseded
+(+ by, another item's id; a chain of them ends in an item that is not superseded). Each id carried.json lists must
+appear carried, resolved or superseded; only those may be carried. Strings that look private refuse: home or /tmp
+paths, .jsonl, session URLs and ids, toolu_ ids, ChatGPT conversation links, bare UUIDs outside a CircleCI URL, and
+shell command shapes ($(, 2>&1, /dev/null, sudo, a `$ ` prompt, a pipe into a filter, a $VAR/ path).
 """
 import argparse
 import codecs
@@ -95,6 +98,8 @@ RECORD = '.claude/audit.json'
 SCHEMA = 1
 VALIDATION = 'repo-audit-validation: 1'
 COMMENT_LIMIT = 65536            # GitHub's comment body maximum, in characters
+TIMEOUT = 300                    # seconds a GitHub read may take
+NO_PROMPT = {'GIT_TERMINAL_PROMPT': '0', 'GCM_INTERACTIVE': 'never', 'GH_PROMPT_DISABLED': '1'}
 GITHUB = 'https://github.com/'
 STAGES = ('coverage', 'phase1', 'claims', 'coreview')
 STAGE_FIELDS = {'completed': ('ref',), 'inapplicable': ('reason',)}
@@ -121,7 +126,8 @@ PRIVATE = re.compile(r'/home/|/Users/|~/|/tmp/|C:\\Users|\.jsonl|claude\.ai/code
                      r'|(?-i:\bsession_01[0-9A-Za-z]{8})|toolu_|chatgpt\.com/(?:c|codex|share)/|' + UUID +
                      r'|\$\(|\d>&\d|/dev/null|(?-i:(?:^|\s)sudo\s)|(?:^|\n)\s*\$ '
                      r'|(?-i:\|\s*(?:grep|sed|awk|head|tail|xargs|tee|jq)\b|\$\{?[A-Za-z_]\w*\}?/)', re.I)
-CI_URL = re.compile(r'https://app\.circleci\.com/\S*', re.I)      # its workflow and job ids are UUIDs
+# its workflow and job ids are UUIDs; punctuation ends it, so a UUID glued on after it is still checked
+CI_URL = re.compile(r'https://app\.circleci\.com/[^\s,;()\[\]<>"\']*', re.I)
 CI_ID = re.compile(UUID, re.I)
 FENCE = re.compile(r'^```[^\n]*\n(.*?)^```[ \t]*$', re.M | re.S)
 LIVE = {'new', 'carried'}
@@ -142,16 +148,24 @@ class HttpError(Refused):
         self.status = status
 
 
-def git(repo, *args, check=True):
-    r = subprocess.run(['git', '-C', str(repo), *args], capture_output=True, text=True, encoding='utf-8',
-                       errors='replace')
+def git(repo, *args, check=True, network=False):
+    env, timeout = ({**os.environ, **NO_PROMPT}, TIMEOUT) if network else (None, None)
+    try:
+        r = subprocess.run(['git', '-C', str(repo), *args], capture_output=True, text=True, encoding='utf-8',
+                           errors='replace', env=env, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise Refused(f'git {" ".join(args)}: no answer in {TIMEOUT} s') from None
     if check and r.returncode:
         raise Refused(f'git {" ".join(args)}: {r.stderr.strip()}')
     return r
 
 
 def gh(args):
-    r = subprocess.run(['gh', *args], capture_output=True, encoding='utf-8', errors='replace')
+    try:
+        r = subprocess.run(['gh', *args], capture_output=True, encoding='utf-8', errors='replace',
+                           env={**os.environ, **NO_PROMPT}, timeout=TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise Refused(f'gh {" ".join(args)}: no answer in {TIMEOUT} s') from None
     return r.returncode, r.stdout, r.stderr
 
 
@@ -177,7 +191,7 @@ def api(path, paginate=False):
 def fetch(repo, slug, ref, check=True):
     """Fetch ref from slug on GitHub into the object store only: no tracking ref, no FETCH_HEAD."""
     return git(repo, 'fetch', '-q', '--no-tags', '--no-recurse-submodules', '--no-write-fetch-head',
-               f'{GITHUB}{slug}.git', ref, check=check)
+               f'{GITHUB}{slug}.git', ref, check=check, network=True)
 
 
 def commit(repo, ref):
@@ -503,6 +517,16 @@ def by_status(s, v, where, table, fields=()):
     return True
 
 
+def supersession_cycle(start, items):
+    by = {it['id']: it['by'] for _, it in items
+          if it.get('status') == 'superseded' and isinstance(it.get('id'), str) and isinstance(it.get('by'), str)}
+    seen, i = set(), start
+    while i in by and i not in seen:
+        seen.add(i)
+        i = by[i]
+    return i in seen
+
+
 def check_review(s, r, rng=None, carried=None):
     """The lead's review fields, each checked when present (the caller reports a missing one). rng is the run's
     exact base..R; carried the previous record's live item ids (None: not checked)."""
@@ -557,6 +581,9 @@ def check_review(s, r, rng=None, carried=None):
             s.bad(w, 'superseded needs by, and only superseded takes it')
         elif superseded and (not isinstance(it['by'], str) or it['by'] not in ids or it['by'] == it.get('id')):
             s.bad(f'{w}.by', f'{it["by"]!r} is no other item\'s id')
+        elif superseded and supersession_cycle(it['id'], items):
+            s.bad(f'{w}.by', f'{it["id"]} is superseded in a cycle: its chain must end in an item that is not '
+                             'superseded, or every item of it drops out of later audits')
         if carried is None or not isinstance(it.get('id'), str):
             continue
         if it['id'] in carried and it.get('status') not in SETTLED:
@@ -792,7 +819,7 @@ def end_problems(repo, rec, end):
         fetched = fetch(repo, pr['repo'], ref, check=False)
         # exit 2: no such ref, whatever language the fetch's message came in
         if fetched.returncode and git(repo, 'ls-remote', '--exit-code', f'{GITHUB}{pr["repo"]}.git', ref,
-                                      check=False).returncode == 2:
+                                      check=False, network=True).returncode == 2:
             return problems + [f'{pr["repo"]} has no {ref}']
         if fetched.returncode:
             raise Refused(f'git fetch {ref}: {fetched.stderr.strip()}')
@@ -893,13 +920,20 @@ def report(args):
     problems = s.problems + [f'{w}: looks private ({m!r})' for w, m in private(results)]
     if problems:
         raise Refused('\n'.join(problems))
-    body = render(repo, rec, end, results['items']) + \
-        f'\n```text\n{VALIDATION}\n{json.dumps({"end": end, "items": results["items"]}, indent=1)}\n```\n'
+    text = render(repo, rec, end, results['items'])
+    block = f'\n```text\n{VALIDATION}\n{json.dumps({"end": end, "items": results["items"]}, indent=1)}\n```\n'
+    if len(text) + len(block) > COMMENT_LIMIT:
+        # the record is fixed once merged: only the report can give way, never the block check reads
+        note = f'\n*The report is cut here to fit GitHub\'s comment limit; the record at `{end[:12]}` holds the ' \
+            'rest.*\n'
+        room = COMMENT_LIMIT - len(block) - len(note)
+        if room < 0:
+            raise Refused(f'the validation block is {len(block)} characters, over GitHub\'s {COMMENT_LIMIT} with the '
+                          'report\'s note: shorten the results\' refs')
+        text = text[:text.rfind('\n', 0, room) + 1] + note
+    body = text + block
     if report_blocks(body) != [{'end': end, 'items': results['items']}]:
         raise Refused('the rendered report hides or adds a validation block: a record string escaped its line')
-    if len(body) > COMMENT_LIMIT:
-        raise Refused(f'the comment is {len(body)} characters, over GitHub\'s {COMMENT_LIMIT}: shorten the record\'s '
-                      'texts')
     print(body, end='')
     return 0
 
@@ -923,6 +957,12 @@ def change_rows(inv):
             f"{len(inv['binary_changed'])} binary files changed"]
 
 
+def pin_lines(inv):
+    return ['', 'Submodule pins changed (a dependency delta, not audited here):',
+            *(f'- `{one_line(p)}` {(o or "-")[:12]} -> {(n or "-")[:12]}' for p, o, n in inv['gitlinks'])] \
+        if inv['gitlinks'] else []
+
+
 def item_line(i):
     by = f' by `{i["by"]}`' if i.get('by') else ''
     ref = f' ({one_line(i["ref"])})' if i.get('ref') else ''
@@ -935,20 +975,18 @@ def render(repo, rec, end, items):
     failed = [i['id'] for i in items if i['result'] != 'pass']
     status = f'**validation FAILED on `{end[:12]}`: {", ".join(failed)}**' if failed else \
         f'validation on `{end[:12]}`: all {len(items)} covered checks pass'
-    growth = inventory(repo, base, m)
+    growth, own = inventory(repo, base, m), inventory(repo, m, r)
     out = [f'## Repository audit {rec["pr"]["repo"]}#{rec["pr"]["number"]}', '',
            f'- {status}',
            f'- reviewed `{base[:12]}..{r[:12]}` (base: {rec["baseKind"]}), merged as `{end[:12]}`, record prepared '
            f'{rec["completed"]}',
            f'- **Outcome:** {one_line(rec["outcome"])}', '',
-           f'### This audit\'s changes `{m[:12]}..{r[:12]}`', '', *change_rows(inventory(repo, m, r)), '',
-           f'### Growth since the base `{base[:12]}..{m[:12]}`', '', *change_rows(growth)]
-    if growth['gitlinks']:
-        out += ['', 'Submodule pins changed (a dependency delta, not audited here):',
-                *(f'- `{one_line(p)}` {(o or "-")[:12]} -> {(n or "-")[:12]}' for p, o, n in growth['gitlinks'])]
-    out += ['', '### Decisions', '', *map(item_line, rec['decisions']), '',
-            '### Deferred work', '', *map(item_line, sorted(rec['open'], key=lambda o: o['status'] not in LIVE)), '',
-            f'### Validation on `{end[:12]}`', '']
+           f'### This audit\'s changes `{m[:12]}..{r[:12]}`', '', *change_rows(own), *pin_lines(own), '',
+           f'### Growth since the base `{base[:12]}..{m[:12]}`', '', *change_rows(growth), *pin_lines(growth),
+           '', '### Decisions', '', *([*map(item_line, rec['decisions'])] or ['none']), '',
+           '### Deferred work', '',
+           *([*map(item_line, sorted(rec['open'], key=lambda o: o['status'] not in LIVE))] or ['none']), '',
+           f'### Validation on `{end[:12]}`', '']
     results = {i['id']: i for i in items}
     for e in rec['validation']['expected']:
         head = f'- `{e["id"]}` {e["kind"]}: {one_line(e["check"])} ({one_line(e["source"])}): '
@@ -967,8 +1005,9 @@ def render(repo, rec, end, items):
                             else 'none'),
             *(f'  - pending: {one_line(c["claim"])} ({one_line(c["document"])} {one_line(c["revision"])} '
               f'{one_line(c["section"])})' for c in rec['claims'] if c['status'] == 'pending'),
-            '- usage: ' + (f'{totals} over {usage["hosts"]} hosts, {usage["window"]["since"]} .. '
-                           f'{usage["window"]["until"]}; zero recorded use is not proof of no use'
+            '- usage: ' + (f'{totals} over {usage["hosts"]} host{"s" * (usage["hosts"] != 1)}, '
+                           f'{one_line(usage["window"]["since"])} .. {one_line(usage["window"]["until"])}; zero '
+                           'recorded use is not proof of no use'
                            if usage['hosts'] else 'not measured')]
     return '\n'.join(out) + '\n'
 
@@ -1096,7 +1135,7 @@ def pr_problems(pr, head):
 def branch_tip(repo, slug, branch):
     """The commit slug's branch names on GitHub now, fetched here when absent; never a tracking ref or FETCH_HEAD."""
     ref = f'refs/heads/{branch}'
-    listed = git(repo, 'ls-remote', '--exit-code', f'{GITHUB}{slug}.git', ref, check=False)
+    listed = git(repo, 'ls-remote', '--exit-code', f'{GITHUB}{slug}.git', ref, check=False, network=True)
     tips = [line.split('\t')[0] for line in listed.stdout.splitlines() if line.endswith(f'\t{ref}')]
     if listed.returncode or len(tips) != 1 or not SHA.fullmatch(tips[0]):
         raise Refused(f'{slug} {ref} cannot be read: {listed.stderr.strip() or listed.stdout.strip()[:200]}')
@@ -1169,7 +1208,17 @@ def finish(args):
         pr, branch = pr_problems(review['pr'], reviewed)
         problems += uncovered(repo, run['base'], reviewed, review['coverage']) + pr
         if not pr:
-            pr_base = branch_tip(repo, review['pr']['repo'], branch)
+            try:
+                pr_base = branch_tip(repo, review['pr']['repo'], branch)
+            except Refused as e:
+                problems.append(str(e))
+        if pr_base:
+            # a retarget or push while the tip was read would record a branch the PR no longer targets
+            again, now = pr_problems(review['pr'], reviewed)
+            problems += again
+            if now != branch:
+                problems.append(f'pr: {review["pr"]["repo"]}#{review["pr"]["number"]} moved from base branch {branch} '
+                                f'to {now} while finish read it: run it again')
             if not is_ancestor(repo, pr_base, reviewed):
                 problems.append(f'the base branch {branch} at {pr_base[:12]} is not in --head {reviewed[:12]}: bring '
                                 'R up to date with it')
@@ -1187,15 +1236,15 @@ def finish(args):
     new = repo / '.claude' / f'.audit.json.{secrets.token_hex(4)}.tmp'
     try:
         (repo / '.claude').mkdir(exist_ok=True)
+        create(new, json.dumps(record, indent=2, ensure_ascii=False) + '\n', newline='\n')
         try:
-            create(new, json.dumps(record, indent=2, ensure_ascii=False) + '\n', newline='\n')
             os.replace(new, repo / RECORD)       # a link raced in at RECORD is replaced, never written through
         finally:
             new.unlink(missing_ok=True)
     except OSError as e:
         raise Refused(f'{RECORD} was not written: {e}') from None
     print(f'wrote {RECORD}; read it, then commit it alone as the PR\'s last commit:')
-    print(f'  git add -- {RECORD} && git commit --only -- {RECORD}')
+    print(f'  git add -- {RECORD} && git commit --only -m "Record the audit" -- {RECORD}')
     print('nothing may follow it: the PR merges with that commit as its head, its parent the reviewed head')
     return 0
 
@@ -1224,6 +1273,9 @@ def main(argv=None):
     r.add_argument('--head', required=True)
     r.add_argument('--results', required=True)
     args = p.parse_args(argv)
+    if hasattr(sys.stdout, 'reconfigure'):
+        # the record is UTF-8 whatever the console code page; no \r\n added past the comment limit on Windows
+        sys.stdout.reconfigure(encoding='utf-8', newline='\n')
     try:
         return {'check': check, 'start': start, 'finish': finish, 'report': report}[args.cmd](args)
     except (Refused, FileExistsError, FileNotFoundError) as e:

@@ -451,6 +451,8 @@ class Record(unittest.TestCase):
             r.git('commit', '-q', '-m', 'Audit (#7)')
         elif merge == 'ff':
             r.git('merge', '-q', '--ff-only', 'audit')
+        elif merge == 'rebase':         # GitHub rewrites each commit onto the base branch
+            r.git('cherry-pick', '-x', f'{self.base}..audit')
         else:
             r.git('merge', '-q', '--no-ff', '-m', 'Merge pull request #7', 'audit')
         self.end = r.git('rev-parse', 'HEAD')
@@ -496,6 +498,13 @@ class Record(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn('carried item d1 is missing', err)
         self.assertIn('carried item o1 is missing', err)
+
+    def test_a_rebase_merged_record_is_complete(self):
+        self.audit(merge='rebase')
+        self.assertEqual(self.repo.git('rev-list', '--parents', '-n1', self.end).split()[1:],
+                         [self.repo.git('rev-parse', 'HEAD^')])
+        self.assertNotIn(self.end, (self.pr_head, self.reviewed))
+        self.assertStatus('complete')
 
     def test_a_pr_head_absent_here_is_fetched_from_the_recorded_repository(self):
         self.audit()
@@ -753,9 +762,6 @@ class Record(unittest.TestCase):
         self.assertStatus('complete')
 
     def test_the_report_names_the_audit_s_own_changes_apart_from_the_range_s_growth(self):
-        self.repo.git('checkout', '-q', '-b', 'side')
-        side = self.repo.commit({'side.txt': 's\n'})
-        self.repo.git('checkout', '-q', 'main')
         grown = self.repo.commit({'tests/test_g.py': 'def test_g():\n  pass\n', 'src/g.c': 'int g;\n'})
         self.audit(merge='ff', decisions=[{'id': 'd1', 'text': 'cut the\n```text\nshim', 'status': 'new',
                                            'ref': 'o/r#5'}],
@@ -780,7 +786,19 @@ class Record(unittest.TestCase):
         self.assertEqual(len(audit.report_blocks(out)), 1)
         self.hub.comment('o/r', 7, 'alice', out)
         self.assertStatus('complete')
-        self.assertNotIn(side, out)
+
+    def test_the_audit_s_own_pin_changes_empty_lists_and_one_host(self):
+        (self.repo.path / 'dep').mkdir()        # staged before audit() branches: the audit's own commit pins it
+        self.repo.git('update-index', '--add', '--cacheinfo', f'160000,{self.base},dep')
+        self.audit(decisions=[], open=[], usage={'totals': {'toolCalls': 4}, 'hosts': 1,
+                                                 'window': {'since': '2026-01-01\n00:00:00+00:00', 'until': UNTIL}})
+        self.hub.comments[('o/r', 7)].clear()
+        code, out, err = self.report([{'id': 'suite', 'result': 'pass', 'ref': 'CI run 9'}])
+        self.assertEqual(code, 0, err)
+        own = out.split("### This audit's changes")[1].split('### Growth')[0]
+        self.assertIn(f'- `dep` - -> {self.base[:12]}', own)
+        self.assertIn('### Decisions\n\nnone\n\n### Deferred work\n\nnone\n', out)
+        self.assertIn(f'- usage: toolCalls 4 over 1 host, 2026-01-01 00:00:00+00:00 .. {UNTIL};', out)
 
     @unittest.skipIf(os.name == 'nt', 'Windows forbids a newline in a file name')
     def test_a_git_path_cannot_open_a_fence(self):
@@ -813,17 +831,43 @@ class Record(unittest.TestCase):
         self.hub.comment('o/r', 7, 'alice', out)
         self.assertStatus('provisional', 'suite is fail')
 
-    def test_an_oversized_report_refuses(self):
+    def test_an_oversized_report_is_cut_above_its_block(self):
         self.audit(outcome='word ' * 14000)
+        self.hub.comments[('o/r', 7)].clear()
         item = {'id': 'suite', 'result': 'pass', 'ref': 'CI run 9'}
-        code, _, err = self.report([item])
-        self.assertEqual(code, 2)
-        self.assertIn("over GitHub's 65536", err)
+        code, out, err = self.report([item])
+        self.assertEqual(code, 0, err)
+        self.assertLessEqual(len(out), audit.COMMENT_LIMIT)
+        self.assertNotIn('**Outcome:**', out)       # cut at a line, never inside one
+        self.assertIn(f"*The report is cut here to fit GitHub's comment limit; the record at `{self.end[:12]}`", out)
+        self.assertEqual(audit.report_blocks(out), [{'end': self.end, 'items': [item]}])
+        self.hub.comment('o/r', 7, 'alice', out)
+        self.assertStatus('complete')
         with mock.patch.object(audit, 'COMMENT_LIMIT', 10 ** 6):
-            size = len(self.report([item])[1])
-        for limit, want in ((size, 0), (size - 1, 2)):     # the limit counts every character printed
+            whole = self.report([item])[1]
+        for limit, cut in ((len(whole), False), (len(whole) - 1, True)):     # the limit counts every character
             with self.subTest(limit=limit), mock.patch.object(audit, 'COMMENT_LIMIT', limit):
-                self.assertEqual(self.report([item])[0], want)
+                code, out, _ = self.report([item])
+                self.assertEqual((code, 'The report is cut here' in out), (0, cut))
+                self.assertLessEqual(len(out), limit)
+        with mock.patch.object(audit, 'COMMENT_LIMIT', 100):
+            code, _, err = self.report([item])
+        self.assertEqual(code, 2)
+        self.assertIn("shorten the results' refs", err)
+
+    def test_the_report_prints_utf_8_with_lf_whatever_the_console(self):
+        self.audit(outcome='kept tud_x \u2192 tud_y')
+        file = tmpdir(self) / 'results.json'
+        file.write_text(json.dumps({'end': self.end, 'items': [{'id': 'suite', 'result': 'pass', 'ref': 'CI'}]}))
+        raw = io.BytesIO()
+        console = io.TextIOWrapper(raw, encoding='cp1252', newline='\r\n')     # a Windows console redirected
+        with self.hub.patch(), mock.patch.dict(os.environ, git_env(), clear=True), mock.patch.object(sys, 'stdout',
+                                                                                                    console):
+            code = audit.main(['report', '--repo', str(self.repo.path), '--head', self.end, '--results', str(file)])
+            sys.stdout.flush()
+        self.assertEqual(code, 0)
+        self.assertIn('kept tud_x \u2192 tud_y', raw.getvalue().decode('utf-8'))
+        self.assertNotIn(b'\r\n', raw.getvalue())
 
     def test_a_pr_base_out_of_order_reads_invalid(self):
         self.repo.git('checkout', '-q', '-b', 'side')
@@ -891,7 +935,7 @@ class Finish(unittest.TestCase):
     def test_finish_writes_the_record_from_the_run_and_the_review(self):
         code, out, err = self.finish(review(self.base, self.head))
         self.assertEqual(code, 0, err)
-        self.assertIn(f'git add -- {audit.RECORD} && git commit --only -- {audit.RECORD}', out)
+        self.assertIn(f'git add -- {audit.RECORD} && git commit --only -m "Record the audit" -- {audit.RECORD}', out)
         rec = json.loads((self.repo.path / audit.RECORD).read_text())
         self.assertEqual({k: rec[k] for k in ('schema', 'identity', 'base', 'baseKind', 'prBase', 'reviewedHead')},
                          {'schema': 1, 'identity': [self.root], 'base': self.base, 'baseKind': 'bootstrap',
@@ -923,7 +967,37 @@ class Finish(unittest.TestCase):
         self.hub.branch(self.repo, self.root)
         self.refused(f'the base branch main at {self.root[:12]} does not descend from the run\'s base')
         self.hub.pulls[('o/r', 7)] = dict(open_pr(self.head), base={'repo': {'full_name': 'o/r'}, 'ref': 'gone'})
-        self.refused('o/r refs/heads/gone cannot be read')
+        (self.repo.path / 'stray.txt').write_text('x')
+        err = self.refused('o/r refs/heads/gone cannot be read')
+        self.assertIn('1 uncommitted paths (first: stray.txt)', err)        # every reason, not the first
+
+    def test_a_pr_retargeted_while_its_base_branch_is_read_refuses(self):
+        tip = audit.branch_tip
+
+        def retargeted(*args):
+            got = tip(*args)
+            self.hub.pulls[('o/r', 7)]['base']['ref'] = 'dev'
+            return got
+        with mock.patch.object(audit, 'branch_tip', retargeted):
+            self.refused('pr: o/r#7 moved from base branch main to dev while finish read it: run it again')
+
+    def test_github_reads_never_prompt_and_give_up(self):
+        real, seen = subprocess.run, []
+
+        def spy(argv, **kw):
+            if 'ls-remote' in argv:
+                seen.append((kw['env'].get('GIT_TERMINAL_PROMPT'), kw['timeout']))
+                if len(seen) > 1:
+                    raise subprocess.TimeoutExpired(argv, kw['timeout'])
+            return real(argv, **kw)
+        with mock.patch.object(audit.subprocess, 'run', spy):
+            self.assertEqual(self.finish(review(self.base, self.head))[0], 0)
+            (self.repo.path / audit.RECORD).unlink()
+            (self.repo.path / 'stray.txt').write_text('x')
+            err = self.refused(f'git ls-remote --exit-code {self.hub.root.as_posix()}/o/r.git refs/heads/main: no '
+                               f'answer in {audit.TIMEOUT} s')
+        self.assertIn('1 uncommitted paths', err)
+        self.assertEqual(seen, [('0', audit.TIMEOUT)] * 2)
 
     def test_a_record_that_landed_at_r_since_start_is_not_overwritten(self):
         other = json.dumps({'decisions': 'another audit merged this'}) + '\n'
@@ -938,9 +1012,12 @@ class Finish(unittest.TestCase):
         read, elsewhere = audit.pr_problems, tmpdir(self)
 
         def moved(change):
+            changes = [change]
+
             def pr_problems(*args):
                 problems = read(*args)
-                change()        # another agent, while the GitHub read took its seconds
+                while changes:
+                    changes.pop()()     # another agent, while the GitHub read took its seconds
                 return problems
             return mock.patch.object(audit, 'pr_problems', pr_problems)
         with moved(lambda: self.repo.commit({'b.txt': 'b\n'})):
@@ -955,6 +1032,19 @@ class Finish(unittest.TestCase):
         (self.repo.path / '.claude' / '.audit.json.deadbeef.tmp').write_text('{')
         err = self.refused('.claude/.audit.json.deadbeef.tmp: left by an interrupted finish; delete it')
         self.assertNotIn('uncommitted paths', err)
+
+    def test_a_temp_name_taken_meanwhile_is_left_alone(self):
+        check, other = audit.checkout_problems, self.repo.path / '.claude' / '.audit.json.deadbeef.tmp'
+
+        def taken(*args):
+            problems = check(*args)
+            other.parent.mkdir()
+            other.write_text('another finish')
+            return problems
+        with mock.patch.object(audit, 'checkout_problems', taken), \
+                mock.patch.object(audit.secrets, 'token_hex', return_value='deadbeef'):
+            self.refused(f'{audit.RECORD} was not written')
+        self.assertEqual(other.read_text(), 'another finish')
 
     def test_a_record_that_cannot_be_written_is_refused(self):
         (self.repo.path / audit.RECORD).mkdir(parents=True)     # an empty directory: git status shows nothing
@@ -1065,6 +1155,11 @@ class Finish(unittest.TestCase):
                      open=[{'id': 'o9', 'text': 'x', 'status': 'resolved'}])
         self.refused('carried item d1 must be carried, resolved or superseded',
                      open=[{'id': 'o9', 'text': 'x', 'status': 'resolved'}])
+        err = self.refused('decisions[0].by: d1 is superseded in a cycle', decisions=[
+            {'id': 'd1', 'text': 'keep', 'status': 'superseded', 'by': 'd2'},
+            {'id': 'd2', 'text': 'keep, simpler', 'status': 'superseded', 'by': 'o9'}],
+            open=[{'id': 'o9', 'text': 'x', 'status': 'superseded', 'by': 'd1'}])
+        self.assertIn('open[0].by: o9 is superseded in a cycle', err)
         code, _, err = self.finish(review(self.base, self.head, decisions=[
             {'id': 'd1', 'text': 'keep', 'status': 'superseded', 'by': 'd2'},
             {'id': 'd2', 'text': 'keep, simpler', 'status': 'new'}],
@@ -1104,7 +1199,9 @@ class Finish(unittest.TestCase):
         for where in ('outcome', 'policy[0].question', 'policy[0].answer', 'claims[0].claim', 'coverage[0].batch'):
             self.assertIn(f'{where}: looks private', err)
         shell = ['cd x && python3 "$RUN/a.py"', 'n=$(ls)', 'make 2>&1', 'x >/dev/null', 'run sudo make',
-                 '$ make all', 'log | grep x', 'cp a ${OUT}/b', 'https://app.circleci.com/x,/home/me/a.jsonl']
+                 '$ make all', 'log | grep x', 'cp a ${OUT}/b', 'https://app.circleci.com/x,/home/me/a.jsonl',
+                 'https://app.circleci.com/pipelines/x,123e4567-e89b-12d3-a456-426614174000',
+                 '(https://app.circleci.com/x)(123e4567-e89b-12d3-a456-426614174000)']
         self.assertEqual([bool(audit.private(c)) for c in shell], [True] * len(shell))
         usb = ['OTGSC_B_SESSION_VALID stays', 'session_id', 'USBC_INTUSB_SESSION_REQ', 'tud_session_end()',
                'https://app.circleci.com/pipelines/github/o/r/1/workflows/123e4567-e89b-12d3-a456-426614174000/jobs/2',
@@ -1459,6 +1556,15 @@ class Usage(unittest.TestCase):
             code, out, _ = self.usage()
             self.assertEqual(code, 1)
             self.assertIn('partly unreadable', out)
+
+
+class GitHubRead(unittest.TestCase):
+    def test_gh_never_prompts_and_gives_up(self):
+        with mock.patch.object(audit.subprocess, 'run', side_effect=subprocess.TimeoutExpired('gh', 1)) as spy, \
+                self.assertRaisesRegex(audit.Refused, f'gh api x: no answer in {audit.TIMEOUT} s'):
+            audit.gh(['api', 'x'])
+        self.assertEqual((spy.call_args.kwargs['env']['GH_PROMPT_DISABLED'], spy.call_args.kwargs['timeout']),
+                         ('1', audit.TIMEOUT))
 
 
 class ShellAbs(unittest.TestCase):
