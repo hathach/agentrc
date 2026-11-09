@@ -1,21 +1,32 @@
 #!/usr/bin/env python3
 """The farm's board registry (`skills/hil/boards.json`): how each shared-farm board is flashed, keyed by
 the serial of the debug probe it is wired to. Each board has one probe, so its `flasher` and
-`flasher_recover` are farm facts, not a project's. A project roster names the board by
-`probe` and keeps its own `uid`, the serial its firmware reports, which differs per firmware.
-Stdlib only.
+`flasher_recover` are farm facts, not a project's; so is `dev_attached`, the devices wired to its USB
+host port. A project roster names the board by `probe` and keeps its own `uid`, the serial its
+firmware reports, which differs per firmware, and its tests. Stdlib only.
 
   {"boards": {"<probe serial>": {"name": <lock name>,
                                  "flasher": {name, args, vid_pid, verify, note},
-                                 "flasher_recover": {name, args, vid_pid, verify, note}}}}
+                                 "flasher_recover": {name, args, vid_pid, verify, note},
+                                 "dev_attached": [{vid_pid "vvvv:pppp", serial, is_cdc, is_msc,
+                                                   block_size, block_count, msc_inquiry, note}]}}}
+
+A device's `serial` is its iSerialNumber string as the host reads it, kept exactly ("\u0409" for a
+drive answering with its language ID). A device with no usable serial recorded omits it: tinyusb's host
+examples print "0" both for iSerialNumber 0 and for a failed read, so "0" is no device fact.
 
 `name` is the board's lock name on every host, whatever a roster calls the board: unique, a
 plain file name, and renamed only with a migration of the locks and records naming it.
 
 resolve(entry) is a roster entry with its board's `flasher` (its `uid` the probe serial) and
-`flasher_recover` filled in, a new dict. An entry with `probe` that also carries either is
-refused as a duplicate; one without `probe` (a bench board, or a rig one project owns) keeps its own, unless
-its probe is a registered board's. resolve_roster(roster) resolves `boards` and `boards-skip`.
+`flasher_recover` filled in, and its registered `dev_attached` at the top level, a new dict. An entry
+with `probe` that also carries a flasher is refused as a duplicate; one without `probe` (a bench board,
+or a rig one project owns) keeps its own, unless its probe is a registered board's. Until every project
+reads `dev_attached` from here, a registered board's roster may still carry its own copy (tinyusb
+`tests.dev_attached`, Arduino `arduino.dev_attached`). A nested copy stays in the resolved entry for the
+consumers that still read it, and a top-level one is replaced by the registry's; either way each is
+compared with the registry's (vid_pid in either `vvvv:pppp` or `vvvv_pppp` spelling, a "0" serial as
+none) and named in a warning on stderr, never refused. resolve_roster(roster) resolves `boards` and `boards-skip`.
 Both raise ValueError naming every problem. lock_name(entry, own) is an entry's board lock.
 
   hil_boards.py roster FILE         the resolved roster as JSON (exit 1 refused, 2 usage)
@@ -39,7 +50,9 @@ PHYSICAL = ('flasher', 'flasher_recover')
 LOCK_NAME_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]*\Z')   # also within hil_lock's own grammar
 FLASHER_NAMES = ('jlink', 'stlink', 'openocd', 'lm4flash', 'esptool', 'pyocd', 'openocd_esp')
 _FLASHER_KEYS = {'name', 'uid', 'args', 'vid_pid', 'verify', 'note'}
-_ENTRY_KEYS = {'name', *PHYSICAL}
+_ENTRY_KEYS = {'name', *PHYSICAL, 'dev_attached'}
+_DEV_KEYS = {'vid_pid', 'serial', 'is_cdc', 'is_msc', 'block_size', 'block_count', 'msc_inquiry', 'note'}
+DEV_VID_PID_RE = re.compile(r'[0-9a-f]{4}:[0-9a-f]{4}\Z')
 
 
 def _hil_load():
@@ -90,6 +103,43 @@ def flasher_problem(flasher, *, has_uid=True) -> str:
     return ''
 
 
+def _identity(device, legacy=False) -> tuple:
+    """(vid_pid, serial or None) of a device; a legacy roster copy's "0" serial is none (tinyusb's rendering)."""
+    serial = device.get('serial')
+    if legacy:
+        return device['vid_pid'].lower().replace('_', ':'), None if serial == '0' else serial
+    return device['vid_pid'], serial
+
+
+def dev_attached_problem(devices) -> str:
+    """Why `devices` is not a well-formed registry `dev_attached` list, or ''."""
+    if not (isinstance(devices, list) and devices):
+        return f'not a non-empty list: {devices!r}'
+    seen = set()
+    for i, d in enumerate(devices):
+        if not isinstance(d, dict):
+            return f'[{i}] not an object: {d!r}'
+        if set(d) - _DEV_KEYS:
+            return f'[{i}] unknown key(s) {", ".join(sorted(set(d) - _DEV_KEYS))}'
+        if not (isinstance(d.get('vid_pid'), str) and DEV_VID_PID_RE.match(d['vid_pid'])):
+            return f'[{i}] vid_pid must be lowercase "vvvv:pppp", got {d.get("vid_pid")!r}'
+        if 'serial' in d and not (isinstance(d['serial'], str) and d['serial'].strip()):
+            return f'[{i}] serial must be a non-empty string or absent, got {d["serial"]!r}'
+        for key in ('is_cdc', 'is_msc'):
+            if key in d and not isinstance(d[key], bool):
+                return f'[{i}] {key} must be true or false, got {d[key]!r}'
+        for key in ('block_size', 'block_count'):
+            if key in d and not (type(d[key]) is int and d[key] > 0):
+                return f'[{i}] {key} must be a positive integer, got {d[key]!r}'
+        for key in ('msc_inquiry', 'note'):
+            if key in d and not (isinstance(d[key], str) and d[key].strip()):
+                return f'[{i}] {key} must be a non-empty string, got {d[key]!r}'
+        if _identity(d) in seen:
+            return f'[{i}] {d["vid_pid"]} {d.get("serial")!r} is listed twice'
+        seen.add(_identity(d))
+    return ''
+
+
 def _check(boards: dict, path) -> list:
     problems, probes, locks = [], [], {}
     for probe, e in boards.items():
@@ -116,6 +166,8 @@ def _check(boards: dict, path) -> list:
         for key in PHYSICAL:
             if key in e and (why := flasher_problem(e[key], has_uid=False)):
                 problems.append(f'{probe}: {key}: {why}')
+        if 'dev_attached' in e and (why := dev_attached_problem(e['dev_attached'])):
+            problems.append(f'{probe}: dev_attached: {why}')
     return [f'{path}: {p}' for p in problems]
 
 
@@ -148,6 +200,47 @@ def _registered(entry, path) -> tuple:
     return (reg, '') if reg else (None, f'{entry.get("name")}: probe {probe!r} is not in agentrc\'s board registry')
 
 
+def _local_copies(obj, where=''):
+    """[(path, value)] of every `dev_attached` key in a roster entry, not descending into one found."""
+    found = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            here = f'{where}.{k}' if where else k
+            if k == 'dev_attached':
+                found.append((here, v))
+            else:
+                found += _local_copies(v, here)
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            found += _local_copies(v, f'{where}[{i}]')
+    return found
+
+
+def _copy_problem(local, registered) -> str:
+    """How a roster's own `dev_attached` differs from the registry's, or ''."""
+    if not isinstance(local, list) or not all(isinstance(d, dict) for d in local):
+        return 'not a list of objects'
+    if not all(isinstance(d.get('vid_pid'), str) and isinstance(d.get('serial', ''), str) for d in local):
+        return 'a device without a vid_pid string, or with a serial that is not one'
+    by_id = {_identity(d): d for d in registered}
+    ids = [_identity(d, legacy=True) for d in local]
+    if len(set(ids)) != len(ids):
+        return 'a device is listed twice'
+    if set(ids) != set(by_id):
+        def show(i):
+            return sorted(f'{v} {s!r}' if s is not None else f'{v} (no serial)' for v, s in i)
+        return f'devices {show(ids)}, the registry\'s {show(by_id)}'
+    for i, d in zip(ids, local):
+        differ = sorted(k for k in d if k not in ('vid_pid', 'serial') and by_id[i].get(k, _ABSENT) != d[k])
+        if differ:
+            return f'{i[0]} {i[1]!r}: {", ".join(differ)} differ'
+    return ''
+
+
+_ABSENT = object()
+_warned: set = set()
+
+
 def _resolve(entry, path) -> tuple:
     name = entry.get('name') if isinstance(entry, dict) else None
     label = name or '<unnamed>'
@@ -165,7 +258,17 @@ def _resolve(entry, path) -> tuple:
         if inline:
             return None, (f'{label}: {" and ".join(inline)} of probe {probe} come from agentrc\'s board registry '
                           f'({reg["name"]}); drop them from the roster')
-        out = copy.deepcopy({**entry, **{k: reg[k] for k in PHYSICAL if k in reg}})
+        if 'dev_attached' in reg:
+            for where, local in _local_copies(entry):
+                why = _copy_problem(local, reg['dev_attached'])
+                kept = ('the registry\'s replaces it' if where == 'dev_attached'
+                        else 'consumers reading it still get the roster\'s')
+                note = (f'{label}: {where} differs from agentrc\'s board registry ({reg["name"]}): {why}; {kept}'
+                        if why else f'{label}: {where} duplicates agentrc\'s board registry ({reg["name"]})')
+                if (path, note) not in _warned:
+                    _warned.add((path, note))
+                    print(f'hil_boards: {note}; drop it from the roster', file=sys.stderr)
+        out = copy.deepcopy({**entry, **{k: reg[k] for k in (*PHYSICAL, 'dev_attached') if k in reg}})
         out['flasher']['uid'] = probe
         return out, ''
     if 'flasher' not in entry:

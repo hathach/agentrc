@@ -235,7 +235,10 @@ for every project in `boards.json` beside this page and keyed by that probe's se
 its `flasher` (without `uid`: the key is it) and optional `flasher_recover` (the
 shapes below) and a `name`, the board's lock name on every host (Board locks): unique,
 a plain file name, and renamed only with a migration of the locks and records that
-name it. A project roster names the board by `"probe": "<serial>"`, matched exactly,
+name it. The devices wired to its USB host port are farm facts too: `dev_attached`, each
+with its `vid_pid` (`vvvv:pppp`), its `serial` as the host reads it (omitted when none was
+read), and what a test may use (`is_cdc`, `is_msc` with `block_size`, `block_count` and
+`msc_inquiry`). A project roster names the board by `"probe": "<serial>"`, matched exactly,
 and keeps its own `uid` (the serial its firmware reports, which differs per firmware),
 name, tests and project fields, never the registry's.
 
@@ -247,8 +250,12 @@ or a rig one project owns) keeps a flasher of its own. A reader that needs only 
 that needs a lock name takes `lock_name(entry, own)`, `own` being the project's lock
 field. `hil_boards.py lock FILE BOARD` prints the registry name, or a bench board's
 roster name, never a project lock field: a contract with one takes it through its
-Reservation. A board joins the farm, or its wiring changes, by an agentrc commit to
-`boards.json`, then the project's agentrc pin.
+Reservation. A board joins the farm, or its wiring changes (a replaced thumb drive
+included), by an agentrc commit to `boards.json`, then the project's agentrc pin. The
+resolved entry carries the registry's `dev_attached` at its top level; a roster that still
+keeps its own copy (tinyusb's `tests.dev_attached`, Arduino's `arduino.dev_attached`) keeps
+it for the consumers that read it, with a warning on stderr naming whether it matches,
+until each project reads the registry's.
 
 ## Flashers
 

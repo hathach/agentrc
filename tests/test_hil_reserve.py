@@ -332,7 +332,9 @@ class Rosters(Fixture):
         b.write_text(json.dumps({'boards': [{'name': 'b', 'uid': 'FW-B', 'probe': probe}]}))
         got = hr.load_rosters([(str(a), 'name'), (str(b), 'name')])
         lock = {entry['name']}
-        self.assertEqual(got, {'locks': [entry['name']], 'identities': {'fw-a': lock, 'fw-b': lock, probe.lower(): lock}})
+        attached = {hr.identity(d['serial']): lock for d in entry.get('dev_attached', []) if 'serial' in d}
+        self.assertEqual(got, {'locks': [entry['name']],
+                               'identities': {'fw-a': lock, 'fw-b': lock, probe.lower(): lock, **attached}})
 
     def test_a_registered_board_locks_as_its_registry_name(self):
         probe, entry = next(iter(hr.hil_boards.registry().items()))
@@ -344,6 +346,16 @@ class Rosters(Fixture):
         roster.write_text(json.dumps({'boards': [{'name': 'n', 'uid': 'X', 'probe': probe, 'proj': {'lock': 'other'}}]}))
         with self.assertRaisesRegex(hr.Refused, f"lock 'other' is not its registered board's, {entry['name']}"):
             hr.load_rosters([(str(roster), 'proj.lock')])
+
+    def test_a_registered_boards_attached_devices_are_its_identities(self):
+        probe, entry = next((p, e) for p, e in hr.hil_boards.registry().items() if 'dev_attached' in e)
+        roster = Path(self.td.name) / 'r.json'
+        roster.write_text(json.dumps({'boards': [{'name': 'x', 'uid': 'DUT-UID', 'probe': probe}]}))
+        ids = hr.load_rosters([(str(roster), 'name')])['identities']
+        for d in entry['dev_attached']:
+            if 'serial' in d:
+                self.assertIn(entry['name'], ids[hr.identity(d['serial'])], d)
+        self.assertNotIn('0', ids)
 
     def test_a_roster_carrying_a_registered_boards_flasher_refuses(self):
         probe, entry = next(iter(hr.hil_boards.registry().items()))

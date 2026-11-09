@@ -1,8 +1,11 @@
 """skills/hil/scripts/hil_boards.py: the farm's board registry gives each roster entry its
 board's flasher by probe serial. The shipped registry validates, a probe matches exactly, and
 a registered board's own flasher, an unknown probe, an entry with neither, or a bench board
-claiming a registered probe are refused."""
+claiming a registered probe are refused. Its `dev_attached` reaches the resolved entry's top
+level; a roster's own copy is compared and warned about, never refused, during the migration."""
+import contextlib
 import importlib.util
+import io
 import json
 import subprocess
 import sys
@@ -42,6 +45,7 @@ class Base(unittest.TestCase):
 class Shipped(Base):
     def test_it_validates(self):
         self.assertGreater(len(hb.registry()), 30)
+        self.assertGreaterEqual(sum('dev_attached' in e for e in hb.registry().values()), 11)
 
 
 class Resolve(Base):
@@ -115,6 +119,80 @@ class Resolve(Base):
                                           {'name': 'y', 'uid': 'Y', 'probe': 'E661', 'flasher': OPENOCD}]}, self.path)
         self.assertIn("x: probe 'X1' is not in", str(cm.exception))
         self.assertIn('y: flasher of probe E661', str(cm.exception))
+
+
+UDISK = {'vid_pid': 'abcd:1234', 'serial': '\u0409', 'is_msc': True, 'block_size': 512, 'block_count': 1966080,
+         'msc_inquiry': 'General  UDisk            5.00'}
+CH340 = {'vid_pid': '1a86:7523', 'note': 'no serial read'}
+
+
+class DevAttached(Base):
+    def setUp(self):
+        hb._warned.clear()
+        self.path = self.registry({'boards': {**REG['boards'], 'E663': {'name': 'pico2', 'flasher': OPENOCD,
+                                                                        'dev_attached': [UDISK, CH340]}}})
+
+    def resolve(self, entry):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            out = hb.resolve(entry, self.path)
+        return out, err.getvalue()
+
+    def test_the_registry_copy_is_at_the_top_level_in_a_new_dict(self):
+        out, err = self.resolve({'name': 'p', 'uid': 'P', 'probe': 'E663', 'tests': {'host': True}})
+        self.assertEqual((out['dev_attached'], out['tests'], err), ([UDISK, CH340], {'host': True}, ''))
+        out['dev_attached'][0]['serial'] = 'x'
+        self.assertEqual(hb.registry(self.path)['E663']['dev_attached'][0], UDISK)
+        self.assertNotIn('dev_attached', self.resolve({'name': 'k', 'uid': 'K', 'probe': '000621000000'})[0])
+
+    def test_an_equal_legacy_copy_stays_nested_with_a_warning(self):
+        tinyusb = [{**UDISK, 'vid_pid': 'ABCD_1234'}, {'vid_pid': '1a86_7523', 'serial': '0'}]
+        arduino = [{'vid_pid': 'abcd:1234', 'serial': '\u0409'}, {'vid_pid': '1a86:7523', 'serial': '0'}]
+        entry = {'name': 'p', 'uid': 'P', 'probe': 'E663', 'tests': {'dev_attached': tinyusb},
+                 'arduino': {'dev_attached': arduino}}
+        out, err = self.resolve(entry)
+        self.assertEqual((out['tests']['dev_attached'], out['arduino']['dev_attached']), (tinyusb, arduino))
+        self.assertEqual(out['dev_attached'], [UDISK, CH340])
+        self.assertIn('p: tests.dev_attached duplicates agentrc', err)
+        self.assertIn('p: arduino.dev_attached duplicates agentrc', err)
+        self.assertEqual(self.resolve(entry)[1], '')   # once per message
+
+    def test_a_differing_or_malformed_legacy_copy_warns_and_is_kept(self):
+        for local, why in (([{'vid_pid': '0951:1603', 'serial': 'K'}], "0951:1603 'K'"),
+                           ([{'vid_pid': 'abcd:1234', 'serial': '\u0409'}], '1a86:7523 \\(no serial\\)'),
+                           ([{**UDISK, 'block_count': 1}, CH340], 'block_count differ'),
+                           ([UDISK, UDISK, CH340], 'listed twice'),
+                           ([{'serial': 'x'}], 'without a vid_pid'),
+                           ('nope', 'not a list of objects')):
+            with self.subTest(local):
+                hb._warned.clear()
+                out, err = self.resolve({'name': 'p', 'uid': 'P', 'probe': 'E663', 'arduino': {'dev_attached': local}})
+                self.assertEqual((out['arduino']['dev_attached'], out['dev_attached']), (local, [UDISK, CH340]))
+                self.assertRegex(err, f'p: arduino.dev_attached differs from .*{why}.*still get the roster')
+
+    def test_a_top_level_copy_is_replaced_by_the_registrys(self):
+        out, err = self.resolve({'name': 'p', 'uid': 'P', 'probe': 'E663', 'dev_attached': [UDISK]})
+        self.assertEqual(out['dev_attached'], [UDISK, CH340])
+        self.assertIn("the registry's replaces it", err)
+
+    def test_without_a_registry_copy_and_on_a_bench_board_the_rosters_stands(self):
+        legacy = {'tests': {'dev_attached': [{'vid_pid': '0951_1603', 'serial': 'K'}]}}
+        out, err = self.resolve({'name': 'k', 'uid': 'K', 'probe': '000621000000', **legacy})
+        self.assertEqual((out['tests'], 'dev_attached' in out, err), (legacy['tests'], False, ''))
+        bench = {'name': 'b', 'uid': 'C', 'flasher': {'name': 'stlink', 'uid': '0673'}, 'dev_attached': ['any']}
+        self.assertEqual(self.resolve(bench), (bench, ''))
+
+    def test_malformed_registry_inventories_are_refused(self):
+        for devices, why in (([], 'non-empty list'), ({'a': 1}, 'non-empty list'), (['x'], 'not an object'),
+                             ([{**UDISK, 'x': 1}], 'unknown key'), ([{**UDISK, 'vid_pid': 'ABCD:1234'}], 'lowercase'),
+                             ([{**UDISK, 'vid_pid': 'abcd_1234'}], 'lowercase'), ([{'serial': 'x'}], 'vid_pid'),
+                             ([{**UDISK, 'serial': ''}], 'serial'), ([{**UDISK, 'serial': None}], 'serial'),
+                             ([{**UDISK, 'is_msc': 1}], 'is_msc'), ([{**UDISK, 'block_count': True}], 'block_count'),
+                             ([{**UDISK, 'block_size': 0}], 'block_size'), ([{**UDISK, 'note': ' '}], 'note'),
+                             ([UDISK, UDISK], 'listed twice'), ([CH340, CH340], 'listed twice')):
+            with self.subTest(devices), self.assertRaisesRegex(ValueError, f'A: dev_attached: .*{why}'):
+                hb.registry(self.registry({'boards': {'A': {'name': 'a', 'flasher': {'name': 'jlink'},
+                                                            'dev_attached': devices}}}))
 
 
 class LockName(Base):
