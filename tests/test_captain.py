@@ -1824,6 +1824,16 @@ class WatchJoinTest(WatchCase):
         self.arm('all')
         self.assertEqual(self.pending_as('t1')[1], 'none: the open watch does not cover this session')
 
+    def test_a_member_that_becomes_the_captain_stops_reporting(self):
+        self.arm('all')
+        m = self.joined_as('t2')
+        self.report_as('t2', m)
+        captain.write_json(captain.ENROLLED, {**captain.identity(pinned('t2')), 'generation': 'g2'})
+        self.assertEqual(self.pending_as('t2')[1], 'none: the open watch does not cover this session')
+        with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
+            self.report_as('t2', m)
+        self.assertEqual(self.count('report'), 1)
+
     def test_no_watch_joins_nobody(self):
         self.assertEqual(self.pending_as('t2')[1], 'none: no watch is open')
 
@@ -2338,6 +2348,16 @@ class WatchCollectTest(WatchCase):
         code, lines = self.collect()
         self.assertEqual(lines, [f'reported {m}:{n} · ready', f'pending: {m} {self.watch_id()}'])
         self.assertEqual(self.count('watch-end'), 0)
+
+    def test_a_malformed_cursor_generation_is_no_cursor(self):
+        self.arm('all')
+        m = self.joined_as('t2')
+        self.report_as('t2', m)
+        n = len(captain.records()) - 1
+        for generation in (None, '', [], {}):
+            with self.subTest(generation=generation):
+                captain.write_json(captain.COLLECTED, {'generation': generation, 'at': n + 1})
+                self.assertIsNone(captain.stored(captain.COLLECTED, captain.records()))
 
     def test_a_legacy_watch_end_stays_closed(self):
         self.arm('all')

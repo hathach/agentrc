@@ -875,7 +875,7 @@ def read_mark(name):
     try:
         with open(path(name), encoding='utf-8') as f:
             mark = json.load(f)
-        return mark['generation'], mark['at']
+        return (mark['generation'], mark['at']) if text(mark['generation']) else None
     except (OSError, ValueError, KeyError, TypeError):
         return None
 
@@ -1543,11 +1543,11 @@ def join(session):
     watch = settle(recs)
     if not watch:
         return None, 'no watch is open', False
+    if not covers(watch, recs, mine):   # a member that became the captain is no longer covered
+        return None, 'the open watch does not cover this session', False
     member = next((m for m in members(recs, watch['msg']) if m['target'] == mine), None)
     if member:
         return member, watch, False
-    if not covers(watch, recs, mine):
-        return None, 'the open watch does not cover this session', False
     return append({'type': 'joined', 'msg': new_id('j', recs), 'watch': watch['msg'], 'target': mine,
                    'handle': session['handle']}), watch, True
 
@@ -1559,6 +1559,8 @@ def member_watch(member, recs, mine):
     watch = settle(recs)
     if not watch or watch['msg'] != member['watch']:
         die(f'the watch {member["watch"]} ended: stop reporting', 2)
+    if not covers(watch, recs, mine):
+        die(f'the watch {member["watch"]} no longer covers this session, now a captain: stop reporting', 2)
 
 
 def pending():
