@@ -100,7 +100,7 @@ its kind is refused until `reset`. Lane names are `[a-z0-9-]`, up to 40.
 |---|---|
 | `review` | `gpt-6-astra` at `high` |
 | `expert` | `gpt-6-astra` at `xhigh` |
-| `default` | the host preset: `astra` (`gpt-6-astra` at `high`) or `sol` (`gpt-6.1-sol` at `high`, also when unset) |
+| `default` | the host preset: `astra` (`gpt-6-astra` at `high`, also when unset) or `sol` (`gpt-6.1-sol` at `high`) |
 
 `cowork.py default <preset>` saves the preset in
 `$XDG_CONFIG_HOME/agentrc/cowork-default` (`~/.config/...` when unset), for

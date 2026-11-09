@@ -329,10 +329,10 @@ class CoworkTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertTrue(request.startswith('codex-'))
         self.assertEqual(reply, 'codex reply\nFiles touched: none\n')
-        self.assertEqual((self.box() / 'session').read_text(), 'thread-42\ngpt-6.1-sol\nhigh\ndefault\n')
+        self.assertEqual((self.box() / 'session').read_text(), 'thread-42\ngpt-6-astra\nhigh\ndefault\n')
         self.send('--task', 'another')
         first, second = self.calls()
-        self.assertEqual(first['argv'][:6], ['exec', '-m', 'gpt-6.1-sol', '-c', 'model_reasoning_effort=high', '--json'])
+        self.assertEqual(first['argv'][:6], ['exec', '-m', 'gpt-6-astra', '-c', 'model_reasoning_effort=high', '--json'])
         self.assertEqual(second['argv'][:3], ['exec', 'resume', 'thread-42'])
         self.assertIn('-o', second['argv'])
 
@@ -471,9 +471,9 @@ class CoworkTest(unittest.TestCase):
     def test_a_new_lane_starts_at_its_sides_default_whatever_drives_it(self):
         self.send('--task', 'from claude')
         argv = self.calls()[0]['argv']
-        self.assertEqual(argv[argv.index('-m') + 1], 'gpt-6.1-sol')
+        self.assertEqual(argv[argv.index('-m') + 1], 'gpt-6-astra')
         self.assertEqual(argv[argv.index('-c') + 1], 'model_reasoning_effort=high')
-        self.assertIn('answered by gpt-6.1-sol at high effort', self.calls()[0]['stdin'])
+        self.assertIn('answered by gpt-6-astra at high effort', self.calls()[0]['stdin'])
         code, _, _, err = self.send('--effort', 'max', '--task', 'max')
         self.assertEqual(code, 2)
         self.assertIn('--model/--effort are for Claude lanes', err)
@@ -496,7 +496,7 @@ class CoworkTest(unittest.TestCase):
         self.assertEqual(self.send('--task', 'one')[0], 0)
         self.assertEqual(cowork.session_of(self.box()), 'thread-42')
         cowork.update_side(self.box(), effort='low')
-        self.assertEqual(cowork.lane_fields(self.box()), {'session': 'thread-42', 'model': 'gpt-6.1-sol', 'effort': 'low',
+        self.assertEqual(cowork.lane_fields(self.box()), {'session': 'thread-42', 'model': 'gpt-6-astra', 'effort': 'low',
                                                           'tier': 'default'}, 'a field-wise update')
         self.send('--task', 'two')
         self.assertEqual(self.calls()[-1]['argv'][:3], ['exec', 'resume', 'thread-42'])
@@ -516,11 +516,11 @@ class CoworkTest(unittest.TestCase):
 
     def test_a_flipped_default_reaches_a_default_lane_on_its_next_send(self):
         self.send('--task', 'a')
-        self.assertEqual(self.run_cli('default', 'astra')[0], 0)
+        self.assertEqual(self.run_cli('default', 'sol')[0], 0)
         _, out, _ = self.run_cli('status', '--all')
-        self.assertIn('codex/main: session thread-42, gpt-6.1-sol at high effort, tier default', out)
+        self.assertIn('codex/main: session thread-42, gpt-6-astra at high effort, tier default', out)
         self.send('--task', 'b')
-        self.assertEqual(self.pair(self.calls()[1]), ('gpt-6-astra', 'high'))
+        self.assertEqual(self.pair(self.calls()[1]), ('gpt-6.1-sol', 'high'))
         self.assertEqual(self.calls()[1]['argv'][:3], ['exec', 'resume', 'thread-42'], 'the session carries over')
 
     def test_review_and_expert_tiers_stay_put_and_omission_keeps_the_saved_tier(self):
@@ -534,15 +534,15 @@ class CoworkTest(unittest.TestCase):
 
     def test_a_pinned_codex_lane_is_refused_until_a_tier_is_named(self):
         self.box().mkdir(parents=True)
-        (self.box() / 'session').write_text('thread-42\ngpt-6-astra\nhigh\n')
+        (self.box() / 'session').write_text('thread-42\ngpt-6.1-sol\nhigh\n')
         _, out, _ = self.run_cli('status', '--all')
-        self.assertIn('codex/main: session thread-42, gpt-6-astra at high effort, pinned', out)
+        self.assertIn('codex/main: session thread-42, gpt-6.1-sol at high effort, pinned', out)
         code, _, _, err = self.send('--task', 'a')
         self.assertEqual(code, cowork.BUSY)
-        self.assertIn('codex/main is pinned to gpt-6-astra at high effort; name its tier with --tier default|review|expert', err)
+        self.assertIn('codex/main is pinned to gpt-6.1-sol at high effort; name its tier with --tier default|review|expert', err)
         self.assertEqual(self.calls(), [])
         self.send('--tier', 'default', '--task', 'b')
-        self.assertEqual([self.pair(c) for c in self.calls()], [('gpt-6.1-sol', 'high')])
+        self.assertEqual([self.pair(c) for c in self.calls()], [('gpt-6-astra', 'high')])
         self.assertEqual(self.calls()[0]['argv'][:3], ['exec', 'resume', 'thread-42'], 'the session carries over')
 
     def test_a_tier_with_a_pin_or_on_a_claude_lane_is_refused(self):
@@ -556,10 +556,10 @@ class CoworkTest(unittest.TestCase):
 
     def test_default_shows_and_sets_the_preset_and_a_bad_file_is_refused(self):
         code, out, _ = self.run_cli('default')
-        self.assertEqual((code, out), (0, 'codex default: sol, gpt-6.1-sol at high effort (built in)\n'))
+        self.assertEqual((code, out), (0, 'codex default: astra, gpt-6-astra at high effort (built in)\n'))
         path = Path(os.environ['XDG_CONFIG_HOME']) / 'agentrc' / 'cowork-default'
-        code, out, _ = self.run_cli('default', 'astra')
-        self.assertEqual((code, out, path.read_text()), (0, f'codex default: astra, gpt-6-astra at high effort ({path})\n', 'astra\n'))
+        code, out, _ = self.run_cli('default', 'sol')
+        self.assertEqual((code, out, path.read_text()), (0, f'codex default: sol, gpt-6.1-sol at high effort ({path})\n', 'sol\n'))
         self.assertEqual(self.run_cli('default', 'bogus')[0], 2)
         path.write_text('fast\n')
         code, _, _, err = self.send('--task', 'q')
@@ -1821,7 +1821,7 @@ class CoworkTest(unittest.TestCase):
         undelivered = self.reaped('--task', 'x')
         self.settled(undelivered)
         _, out, _ = self.run_cli('status')
-        self.assertEqual(out, f'codex/main: session thread-42, gpt-6.1-sol at high effort, tier default\n'
+        self.assertEqual(out, f'codex/main: session thread-42, gpt-6-astra at high effort, tier default\n'
                               f'  {undelivered}  replied\n2 idle lanes, listed by status --all\n')
         _, out, _ = self.run_cli('status', '--all')
         self.assertIn('codex/review-a: session thread-42', out)
@@ -1889,7 +1889,7 @@ class CoworkTest(unittest.TestCase):
                       'of the host checkout; commit there.', prompt)
         self.assertEqual(self.head(tree), base)
         code, out, _ = self.run_cli('status', '--all')
-        self.assertIn(f'codex/impl: session thread-42, gpt-6.1-sol at high effort, tier default, in {tree}', out)
+        self.assertIn(f'codex/impl: session thread-42, gpt-6-astra at high effort, tier default, in {tree}', out)
         self.assertNotIn('codex/main', out)
         self.send('--lane', 'impl', '--worktree', '--task', 'y')
         self.assertEqual(self.calls()[1]['argv'][:3], ['exec', 'resume', 'thread-42'])
@@ -1903,7 +1903,7 @@ class CoworkTest(unittest.TestCase):
         self.assertIn('Scope: do not edit anything', self.calls()[0]['stdin'])
         self.assertFalse((self.root / '.worktrees').exists())
         code, out, _ = self.run_cli('status', '--all')
-        self.assertIn('codex/review: session thread-42, gpt-6.1-sol at high effort, tier default, read-only', out)
+        self.assertIn('codex/review: session thread-42, gpt-6-astra at high effort, tier default, read-only', out)
         self.codex_does("open('edited.txt', 'w').write('!')")
         code, _, _, err = self.send('--lane', 'review', '--task', 'y')  # no --no-edit: the lane implies it
         self.assertEqual(code, cowork.MALFORMED)
@@ -1928,7 +1928,7 @@ class CoworkTest(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertEqual(self.calls()[-1]['cwd'], str(self.root))
         self.assertIn('Scope: do not edit anything', self.calls()[-1]['stdin'])
-        self.assertIn('codex/plan: session thread-42, gpt-6.1-sol at high effort, tier default, read-only', self.run_cli('status', '--all')[1])
+        self.assertIn('codex/plan: session thread-42, gpt-6-astra at high effort, tier default, read-only', self.run_cli('status', '--all')[1])
         self.assertFalse((self.root / '.worktrees').exists())
         box = self.box(lane='old')  # a worktree lane from before the default changed: no marker, a base
         box.mkdir(parents=True)
@@ -1959,7 +1959,7 @@ class CoworkTest(unittest.TestCase):
         self.assertIn('codex/impl has a session but no record of its kind', err)
         self.assertEqual(len(self.calls()), ran)
         self.assertFalse((self.box(lane='impl') / 'read-only').exists())
-        self.assertIn('codex/impl: session thread-42, gpt-6.1-sol at high effort, tier default, kind unknown',
+        self.assertIn('codex/impl: session thread-42, gpt-6-astra at high effort, tier default, kind unknown',
                       self.run_cli('status', '--all')[1])
         (self.root / '.worktrees' / 'cowork-codex-impl' / 'scratch.txt').write_text('left behind')
         code, _, err = self.run_cli('reset', 'codex', 'impl')
