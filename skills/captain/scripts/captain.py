@@ -2001,8 +2001,11 @@ def checkout_root(arg):
         die(f'{arg}: no such directory; nothing started', 2)
     if not os.path.isdir(root):
         die(f'{arg}: not a directory; nothing started', 2)
-    found = captain_read.plain(['git', *captain_read.HARDEN, '-C', root], captain_read.environment('git'),
-                               'rev-parse', '--path-format=absolute', '--show-toplevel')
+    try:
+        found = captain_read.plain(['git', *captain_read.HARDEN, '-C', root], captain_read.environment('git'),
+                                   'rev-parse', '--path-format=absolute', '--show-toplevel')
+    except (subprocess.SubprocessError, OSError) as e:
+        die(f'{arg}: git could not be asked ({e}); nothing started', 2)
     top = os.fsdecode(found.stdout).strip()
     if found.returncode or not top:
         die(f'{arg}: not a git checkout with a work tree; nothing started', 2)
@@ -2110,6 +2113,7 @@ def start(arg, account, name, space, tab, entry, mine):
     """Start an interactive Claude Code session in the checkout arg names, in a new hc terminal shown in a Herdr
     space, on the human's message this turn: each check refuses before anything runs, the intent is recorded before
     hc runs, and one message starts a checkout under an account once. Captain never closes what it started."""
+    tab = tab or None   # well_formed() refuses an empty tab, which would leave the ledger unreadable
     root = checkout_root(arg)
     argv = launcher(account)
     space_id = placement(root, space, tab, herdr_spaces())

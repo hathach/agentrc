@@ -3250,6 +3250,25 @@ class StartTest(RelayCase):
                 self.assertIn(why, err)
         self.assertEqual((self.launched(), self.types()), ([], []))
 
+    def test_git_that_hangs_or_is_missing_starts_nothing(self):
+        self.say('start proj')
+        for error in (subprocess.TimeoutExpired(['git'], 1), FileNotFoundError('git')):
+            with self.subTest(error), mock.patch.object(captain.captain_read, 'plain', side_effect=error):
+                code, err = self.start_refusal()
+                self.assertEqual(code, 2)
+                self.assertIn('git could not be asked', err)
+                self.assertIn('nothing started', err)
+        self.assertEqual((self.launched(), self.types()), ([], []))
+
+    def test_an_empty_tab_is_a_new_tab_and_leaves_the_ledger_readable(self):
+        self.say('start proj')
+        code, out = self.start(tab='')
+        self.assertEqual(code, 0)
+        self.assertNotIn('herdr.tab', ' '.join(self.launched()[0]))
+        self.assertEqual(self.types(), ['start', 'started'])
+        self.assertIsNone(captain.records()[0]['tab'])
+        self.assertIn('a new tab', out)
+
     def test_every_refusal_before_hc_runs_records_nothing(self):
         self.say('start proj')
         self.spaces.append({'id': 'spC', 'name': 'other', 'folder': '/x', 'machine': None, 'tabs': []})
