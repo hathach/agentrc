@@ -1,6 +1,6 @@
 ---
 name: captain
-description: Collect status from the human's other Claude Code sessions in hc terminals and relay the human's own words to one of them. Used by the `captain` agent; a target session uses `brief` and `report` to answer a status request, and `accept` and `outcome` for a relay.
+description: Collect status from the human's other Claude Code sessions in hc terminals relay the human's own words to one of them, and start one on a checkout when the human asks. Used by the `captain` agent; a target session uses `brief` and `report` to answer a status request, and `accept` and `outcome` for a relay.
 ---
 
 # Captain
@@ -30,6 +30,7 @@ python3 ~/.claude/skills/captain/scripts/captain.py relay <target>... --dry-run 
 python3 ~/.claude/skills/captain/scripts/captain.py relay --retry <action>          # send a held relay unchanged
 python3 ~/.claude/skills/captain/scripts/captain.py relay <target> --item <item> --revision <N> --verdict correction|no-correction|decision [--entry <id>]
 python3 ~/.claude/skills/captain/scripts/captain.py verdict --item <item> --revision <N> --verdict correction|no-correction|decision [--entry <id>]
+python3 ~/.claude/skills/captain/scripts/captain.py start <checkout> [main|ada] [--space <space>] [--tab <tab>] [--name <name>] [--entry <id>]
 ```
 
 The captain's read-only lookups, each refused unless its subcommand, flags and operands are on the script's
@@ -106,6 +107,21 @@ pins each target's session once, so one replaced in its terminal while the relay
   target runs `accept` to read the message from the ledger and acts on it under its own rules, then records an outcome:
   `completed`, `failed`, `rejected` or `needs-clarification`, with a note. A message the human writes after the send's
   check is not seen; the target acts only on what `accept` printed.
+- **Start** a Claude Code session only when the human's message this turn asks for one, once per checkout and
+  account it names; never on a session's report, a relay reply, a chief attention line or your own idea. `start` runs
+  an interactive `claude`, or `claude-ada` for `ada` (main unless they say ada; never inferred from the repo), in a
+  new hc terminal with no parent and no first task:
+  - The checkout is an absolute or `~/` path to a git checkout's or worktree's top level, anywhere.
+  - It opens as a new tab in a Herdr space: the one whose folder is that checkout, or the one `--space` names by id
+    or exact name. `--tab` puts it in an existing tab instead. A space that matches none or several refuses with the
+    candidates: ask the human which, and name one with a space in its name by id.
+  - Its terminal name is `<checkout>-<account>` unless `--name` gives another; a live terminal holding it refuses.
+  - The intent is recorded before hc runs, so a message never starts the same checkout under the same account twice,
+    a crash or retry included.
+  - The receipt says `verified` once the session is pinned under that account in that checkout; `pending` while it is
+    still coming up, which `list` resolves; `VERIFICATION FAILED` or `UNCHECKED` naming the terminal. Report it as
+    given: a wrong or failed session is the human's to close. Exit 3 without a terminal address means a session may
+    have started: `list` before anything else, never start again.
 - **Closing** a terminal, space or session is the human's: you may report a session done, but never close one, type
   `/exit`, kill a process or terminal, or ask a target to close itself. `cancel` closes a ledger item only: it
   neither reaches a session nor withdraws an instruction one accepted. That takes a new relay of the human's words,

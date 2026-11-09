@@ -142,7 +142,9 @@ class VerdictTest(unittest.TestCase):
         sample = {'<msg>...': 'm-1', '<msg>': 'm-1', '<ms>': '1740000', 'MS': '1740000',
                   '<id>': 'f0a4846d-6b04-428a-8e4d-a4fc931e6cff', '<action>': 'a-1',
                   '<target>...': 't2', '<run>': 'pr-12', '<item>': 'd-0123456789abcdef', '<N>': '2',
-                  'correction|no-correction|decision': 'correction', '<target>': 't2'}
+                  'correction|no-correction|decision': 'correction', '<target>': 't2',
+                  '<checkout>': '~/code/tinyusb', 'main|ada': 'ada', '<space>': 'sp8a64d095', '<tab>': 'tbd7e2c6',
+                  '<name>': 'tinyusb-2'}
         found = re.findall(r'(python3 ~/\.claude/skills/captain/scripts/captain\.py [^`#\n]*)', text)
         self.assertGreaterEqual(len(found), 10)
         for cmd in found:
