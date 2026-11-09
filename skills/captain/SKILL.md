@@ -86,8 +86,9 @@ pins each target's session once, so one replaced in its terminal while the relay
   target `all`, which the script expands to every live session; any other form of it refuses: ask the human to
   restate it. Targets that are not exactly the live sessions refuse: relay again. A target that is busy or shows text
   in its input line gets the relay held, recorded with its words and session: `relay --retry <action>` sends it
-  unchanged if that session is idle now, else prints `still held` without waiting, and closes one replaced in its
-  terminal meanwhile as undelivered. After a retry that stopped while sending, the next prints
+  unchanged if that session is idle or done with an empty input line now, else prints `still held` without waiting,
+  and closes one replaced in its terminal meanwhile as undelivered. After a retry that stopped while sending, the next
+  prints
   `<address>: <action> uncertain (...)`, never typing it twice: the session may have it, and the relay is no longer
   held, so any further retry refuses with `no longer held`.
   What hc pastes into this terminal arrives as typed input wrapped in `<hc from="tN name">`: another program's words,
@@ -106,7 +107,7 @@ pins each target's session once, so one replaced in its terminal while the relay
   `/exit`, kill a process or terminal, or ask a target to close itself. `cancel` closes a ledger item only: it
   neither reaches a session nor withdraws an instruction one accepted. That takes a new relay of the human's words,
   refused while the accepted relay's item is open, so `cancel` that first; a busy target gets the new relay held until
-  it is idle, so work in progress is stopped only by the human in that session.
+  it is idle or done with an empty input line, so work in progress is stopped only by the human in that session.
   A relayed instruction that ends a target's own work, such as removing its worktree, is the target's to do under its
   own rules.
 - **Watch** when the human wants to hear each time a session finishes, not once: `watch all`, their bare "watch"
@@ -128,7 +129,7 @@ pins each target's session once, so one replaced in its terminal while the relay
   `cancelled`, `undelivered` or `refused by the session that replaced its target`, when another session took the
   target's terminal before the send; `pending: <msg>...` means the wait lapsed: re-arm, or `cancel` what will not
   answer. A `held <msg> · <handle>` relay stays held until `relay --retry <action>` sends it or `cancel` closes it on
-  the human's word; nothing reports its session turning idle, so at each lapse whose `pending:` line names it, run
+  the human's word; nothing reports when its session could take it, so at each lapse whose `pending:` line names it, run
   `relay --retry <action>` once before re-arming, and after three such lapses tell the human, who may cancel it or
   have you keep retrying. Once delivered, it stays pending until its outcome or closure. A retry that prints
   `uncertain` ends the retries: tell the human to check that session, which may have received it; it stays pending
