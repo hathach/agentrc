@@ -1696,7 +1696,7 @@ class WatchCase(LedgerCase):
     def setUp(self):
         super().setUp()
         self.owner = 'live'
-        patcher = mock.patch.object(captain, 'owner_state', lambda watch: self.owner)
+        patcher = mock.patch.object(captain, 'captain_state', lambda c: self.owner)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -1814,7 +1814,7 @@ class WatchJoinTest(WatchCase):
         self.arm('all')
         code, out = self.pending_as('t2')
         [m] = self.member('t2')
-        self.assertIn(f'STATUS WATCH {m["msg"]} from the agent session in terminal t1', out)
+        self.assertIn(f'STATUS WATCH {m["msg"]}, standing until the human cancels it', out)
         self.assertIn(f'report --for {m["msg"]} --file -', out)
         self.assertNotIn('captain', out.lower().replace(captain.INSTALLED.lower(), ''))   # names no role
         self.pending_as('t2')
@@ -1824,25 +1824,33 @@ class WatchJoinTest(WatchCase):
         self.arm('all')
         self.assertEqual(self.pending_as('t1')[1], 'none: the open watch does not cover this session')
 
-    def test_no_watch_or_an_uncertain_captain_joins_nobody(self):
-        self.assertEqual(self.pending_as('t2')[1], 'none: no watch is open')
+    def test_a_member_that_becomes_the_captain_stops_reporting(self):
         self.arm('all')
-        self.owner = 'unknown'
-        self.assertIn('cannot confirm', self.pending_as('t2')[1])
-        self.assertEqual(self.count('watch-end'), 0)
-        self.assertTrue(captain.marked(), 'an unknown captain keeps its watch')
+        m = self.joined_as('t2')
+        self.report_as('t2', m)
+        captain.write_json(captain.ENROLLED, {**captain.identity(pinned('t2')), 'generation': 'g2'})
+        self.assertEqual(self.pending_as('t2')[1], 'none: the open watch does not cover this session')
+        with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
+            self.report_as('t2', m)
+        self.assertEqual(self.count('report'), 1)
 
-    def test_a_replaced_or_ended_captain_ends_the_watch(self):
-        for why, act in (('replaced', self.replace_captain), ('ended', lambda: setattr(self, 'owner', 'ended'))):
+    def test_no_watch_joins_nobody(self):
+        self.assertEqual(self.pending_as('t2')[1], 'none: no watch is open')
+
+    def test_a_watch_stands_when_its_captain_is_replaced_or_ends(self):
+        for why, act in (('replaced', self.replace_captain), ('ended', lambda: setattr(self, 'owner', 'ended')),
+                         ('unknown', lambda: setattr(self, 'owner', 'unknown'))):
             with self.subTest(why):
                 (self.state / captain.LEDGER).unlink(missing_ok=True)
                 self.enroll_captain()
                 self.owner = 'live'
                 self.arm('all')
                 act()
-                self.assertEqual(self.pending_as('t2')[1], 'none: no watch is open')
-                self.assertEqual(self.count('watch-end'), 1)
-                self.assertFalse(captain.marked())
+                self.assertIn('STATUS WATCH', self.pending_as('t2')[1])
+                [m] = self.member('t2')
+                self.report_as('t2', m['msg'])   # recorded with no live captain
+                self.assertEqual((self.count('watch-end'), self.count('report')), (0, 1))
+                self.assertTrue(captain.marked())
                 captain.write_json(captain.ENROLLED, {**captain.identity(CAPTAIN), 'generation': 'g'})
                 with mock.patch('builtins.print'):
                     captain.enroll(True)
@@ -1982,6 +1990,16 @@ class NewReportsTest(WatchCase):
         self.arm('all')
         self.assertEqual([r['needs'] for r in captain.new_reports()], ['merge it'])
 
+    def test_a_new_captain_tables_what_the_last_left_and_nothing_twice_after(self):
+        self.arm('all')
+        m = self.joined_as('t2')
+        self.report_as('t2', m, {**GOOD, 'needs': 'first'})
+        self.assertEqual([r['needs'] for r in captain.new_reports()], ['first'])
+        self.report_as('t2', m, {**GOOD, 'needs': 'second'})
+        captain.write_json(captain.ENROLLED, {**captain.identity(pinned('t4')), 'generation': 'g2'})
+        self.assertEqual([r['needs'] for r in captain.new_reports()], ['second'])
+        self.assertEqual(captain.new_reports(), [])
+
 
 class WatchUnchangedTest(WatchCase):
     """A member's transcript: a task, the watch brief a hook gave it, then the task end it reported."""
@@ -1994,7 +2012,7 @@ class WatchUnchangedTest(WatchCase):
         self.m = self.joined_as('t2')
         self.log({'type': 'user', 'promptSource': 'typed', 'origin': {'kind': 'human'},
                   'message': {'content': 'fix it'}},
-                 {'type': 'attachment', 'content': captain.watch_brief(self.m, 't1')})
+                 {'type': 'attachment', 'content': captain.watch_brief(self.m)})
         self.ref = self.reported()
 
     def log(self, *entries, raw=b''):
@@ -2125,13 +2143,577 @@ class WatchHookTest(WatchCase):
                 self.assertEqual((done.returncode, done.stdout), (0, ''))
 
 
-class OwnerStateTest(unittest.TestCase):
-    WATCH = {'captain': {**captain.identity(CAPTAIN), 'generation': 'g'}}
+class DecisionCase(WatchCase):
+    """t2 joined to a watch, reporting decisions."""
+
+    def setUp(self):
+        super().setUp()
+        self.arm('all')
+        self.m = self.joined_as('t2')
+        self.events = 0
+
+    def payload(self, decisions, event, ops):
+        if event is None:
+            self.events += 1
+            event = f'e{self.events}'
+        return {**GOOD, 'event_id': event, 'decisions': list(decisions), **ops}
+
+    def send(self, *decisions, address='t2', member=None, event=None, **ops):
+        """What the report printed."""
+        f = self.state / 'r.json'
+        f.write_text(json.dumps(self.payload(decisions, event, ops)), encoding='utf-8')
+        return self.as_target(captain.report, member or self.m, str(f), address=address)[1]
+
+    def refused(self, *decisions, event=None, payload=None, **ops):
+        """Why t2's report is rejected, nothing recorded."""
+        f = self.state / 'r.json'
+        f.write_text(json.dumps(payload or self.payload(decisions, event, ops)), encoding='utf-8')
+        self.me = 't2'
+        before = captain.records()
+        with self.assertRaises(SystemExit), mock.patch('builtins.print') as out:
+            captain.report(self.m, str(f))
+        self.assertEqual(captain.records(), before)
+        return '\n'.join(c.args[0] for c in out.call_args_list if c.kwargs.get('file') is sys.stderr)
+
+    def items(self):
+        return list(captain.decisions(captain.records()).values())
+
+    def item(self, key='merge'):
+        return next(i for i in self.items() if i['key'] == key)
+
+
+class DecisionTest(DecisionCase):
+    """Decision items folded from reports: each session's own keys, revised, resolved, reopened or cancelled."""
+
+    def test_each_decision_is_an_item_of_its_session(self):
+        self.send(decision('merge'), decision('ci', kind='blocked'))
+        self.assertEqual([(i['key'], i['revision'], i['state']) for i in self.items()],
+                         [('merge', 1, 'open'), ('ci', 1, 'open')])
+        self.assertEqual(self.item()['owner']['session'], 's-t2')
+        self.assertEqual(self.item()['change_id'], 'o/r#12')
+
+    def test_the_same_key_in_two_sessions_is_two_items(self):
+        self.terminals['t3'] = pinned('t3')
+        self.send(decision('merge'))
+        self.send(decision('merge'), address='t3', member=self.joined_as('t3'))
+        self.assertEqual(len({i['id'] for i in self.items()}), 2)
+
+    def test_a_retried_event_is_recorded_once_and_a_reused_one_refuses(self):
+        self.send(decision('merge'), event='e')
+        self.send(decision('merge'), event='e')
+        self.assertEqual(self.count('report'), 1)
+        self.assertIn('different report', self.refused(decision('merge', ask='other'), event='e'))
+
+    def test_an_event_sent_through_a_request_too_answers_it_and_applies_once(self):
+        self.send(decision('merge'), event='e')
+        n = len(captain.records()) - 1
+        msg = self.msg_of(self.ask())
+        self.send(decision('merge'), event='e', member=msg)
+        self.assertEqual(self.count('report'), 2, 'the request is answered')
+        self.assertEqual(self.item()['revision'], 1)
+        self.assertEqual(self.send(decision('merge'), event='e'), f'recorded {self.m}:{n}')
+
+    def test_a_retry_through_the_watch_names_the_report_first_recorded(self):
+        msg = self.msg_of(self.ask())
+        self.send(decision('merge'), event='e', member=msg)
+        n = len(captain.records()) - 1
+        self.assertEqual(self.send(decision('merge'), event='e'), f'recorded {msg}:{n}')
+
+    def test_a_resumed_session_s_report_moves_all_its_items(self):
+        self.send(decision('merge'), decision('ci'))
+        self.report_as('t2', self.m, {**GOOD, 'needs': 'approve'})
+        self.terminals['t3'] = {**pinned('t3'), 'session': 's-t2'}   # the same session resumed in t3
+        self.send(refresh=['merge'], address='t3', member=self.joined_as('t3'))
+        self.assertEqual({i['owner']['address'] for i in self.items()}, {'t3'})
+        self.assertEqual([i['revision'] for i in self.items()], [2, 1, 1])
+
+    def test_a_resumed_session_answering_with_an_old_event_moves_its_items(self):
+        self.send(decision('merge'), event='e')
+        self.terminals['t3'] = {**pinned('t3'), 'session': 's-t2'}
+        msg = self.msg_of(self.ask('t3'))
+        self.send(decision('merge'), event='e', address='t3', member=msg)
+        self.assertEqual((self.item()['owner']['address'], self.item()['revision']), ('t3', 1))
+
+    def test_a_resumed_session_retrying_an_old_event_through_the_watch_moves_its_items(self):
+        first = self.send(decision('merge'), event='e')
+        self.terminals['t3'] = {**pinned('t3'), 'session': 's-t2'}   # the same session resumed in t3
+        del self.terminals['t2']
+        member = self.joined_as('t3')
+        self.assertNotEqual(self.send(decision('merge'), event='e', address='t3', member=member), first)
+        self.assertEqual((self.item()['owner']['address'], self.item()['revision']), ('t3', 1))
+        self.assertEqual(captain.queue_row(self.item(), {})['relay_target'], 't3')
+        self.assertEqual(self.send(decision('merge'), event='e', address='t3', member=member), first)
+        self.assertEqual(self.count('report'), 2, 'a retry from where it runs now is not recorded again')
+
+    def test_a_changed_decision_is_a_revision_an_unchanged_one_is_not(self):
+        self.send(decision('merge'))
+        self.send(decision('merge'))
+        self.assertEqual(self.item()['revision'], 1)
+        self.send(decision('merge', reviewed_sha='abc1234'))
+        self.assertEqual(self.item()['revision'], 2)
+        self.send(decision('merge', reviewed_sha='abc1234'), refresh=['merge'])
+        self.assertEqual(self.item()['revision'], 3)
+
+    def test_resolving_an_older_revision_leaves_the_newer_open(self):
+        self.send(decision('merge'))
+        self.send(decision('merge', ask='merge now?'))
+        self.send(resolved=[{'key': 'merge', 'revision': 1}])
+        self.assertEqual((self.item()['revision'], self.item()['state']), (2, 'open'))
+        self.send(resolved=[{'key': 'merge', 'revision': 2}])
+        self.assertEqual(self.item()['state'], 'closed')
+
+    def test_a_closed_decision_listed_again_stays_closed_until_reopened(self):
+        self.send(decision('merge'))
+        captain.cancel(self.item()['id'], self.ident)
+        self.send(decision('merge'))
+        self.send(decision('merge', reviewed_sha='abc1234'))   # a revision, still closed
+        self.assertEqual((self.item()['revision'], self.item()['state']), (2, 'closed'))
+        self.send(decision('merge', reviewed_sha='abc1234'), reopen=['merge'], event='r')
+        self.assertEqual((self.item()['revision'], self.item()['state']), (3, 'open'))
+        self.send(decision('merge', reviewed_sha='abc1234'), reopen=['merge'], event='r')   # a retry: nothing new
+        self.assertEqual(self.item()['revision'], 3)
+
+    def test_operations_need_an_event_and_must_not_contradict(self):
+        self.send(decision('merge'))
+        self.assertIn('"event_id" is required', self.refused(payload={**GOOD, 'reopen': ['merge']}))
+        self.assertIn('reopened and refreshed, or resolved and changed',
+                      self.refused(reopen=['merge'], resolved=[{'key': 'merge', 'revision': 1}]))
+        self.assertIn('no decision ci', self.refused(refresh=['ci']))
+
+    def test_a_malformed_decision_names_its_field(self):
+        for bad, why in ((decision('Merge'), '"key"'), (decision('m', kind='todo'), '"kind"'),
+                         (decision('m', pr='12'), '"pr"'), ({**decision('m'), 'owner': 'x'}, 'exactly')):
+            with self.subTest(why):
+                self.assertIn(why, self.refused(bad))
+
+    def test_a_legacy_need_is_a_blocked_item_once(self):
+        for _ in range(2):
+            self.report_as('t2', self.m, {**GOOD, 'needs': 'approve the merge'})
+        [item] = self.items()
+        self.assertEqual((item['legacy'], item['content'], item['key']),
+                         (True, {'kind': 'blocked', 'ask': 'approve the merge'}, None))
+        self.report_as('t2', self.m, GOOD)
+        self.assertEqual(self.items()[0]['state'], 'open', 'an empty need closes nothing')
+
+    def test_cancel_closes_an_open_decision_once(self):
+        self.send(decision('merge'))
+        iid = self.item()['id']
+        captain.cancel(iid, self.ident)
+        self.assertEqual(self.item()['closure']['why'], 'cancelled')
+        with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
+            captain.cancel(iid, self.ident)
+
+
+class FreshnessTest(DecisionCase):
+    """An item's evidence observed against its PR head, worktree HEAD or chief report, per revision."""
+
+    A, B = 'a' * 40, 'b' * 40
+
+    def heads(self, pr=None, worktree=None):
+        """captain_read.py as observed: the PR head and worktree HEAD it prints, None for a failed lookup."""
+        def lookup(*args):
+            if args[0] == 'gh':
+                return None if pr is None else json.dumps({'headRefOid': pr})
+            return worktree
+        return mock.patch.object(captain, 'lookup', side_effect=lookup)
+
+    def refresh(self, **heads):
+        with self.heads(**heads):
+            captain.refresh(self.ident)
+        return captain.freshness(self.item())
+
+    def test_a_pr_head_matching_the_reviewed_sha_is_current_else_stale_or_unknown(self):
+        self.send(decision('merge', reviewed_sha=self.A[:7]))
+        self.assertEqual(captain.freshness(self.item()), 'unknown')
+        self.assertEqual(self.refresh(pr=self.A), 'current')
+        self.assertEqual(self.refresh(pr=self.B), 'stale')
+        self.assertEqual(self.refresh(pr=None), 'unknown', 'a failed lookup after a match is no match')
+        self.assertEqual({r['type'] for r in captain.records()} - {'watch', 'joined', 'report'}, {'observed'})
+
+    def test_lookups_run_under_the_observation_lock_with_the_ledger_free(self):
+        self.send(decision('merge', reviewed_sha=self.A))
+        held = []
+
+        def lookup(*args):
+            with captain.locked(0):   # the ledger is free
+                pass
+            with self.assertRaises(captain.Busy), captain.locked(0, name=captain.OBSERVING):
+                pass
+            held.append(args[0])
+            return json.dumps({'headRefOid': self.A})
+        with mock.patch.object(captain, 'lookup', side_effect=lookup):
+            captain.refresh(self.ident)
+        self.assertEqual(held, ['gh'])
+        self.assertEqual(self.refresh(pr=self.B), 'stale', 'the later observation is the one kept')
+
+    def test_every_source_must_match(self):
+        self.send(decision('merge', reviewed_sha=self.A, worktree='/w'))
+        self.assertEqual(self.refresh(pr=self.B, worktree=self.A), 'stale')
+        self.assertEqual(self.refresh(pr=self.A, worktree=None), 'unknown')
+        self.assertEqual(self.refresh(pr=self.A, worktree=self.A), 'current')
+
+    def test_without_a_reviewed_sha_or_a_source(self):
+        self.send(decision('merge'), decision('ci', kind='blocked'), decision('note', reviewed_sha=self.A, pr=None))
+        kinds = {i['key']: captain.freshness(i) for i in self.items()}
+        self.assertEqual(kinds, {'merge': 'unknown', 'ci': 'not-applicable', 'note': 'unknown'})
+
+    def test_a_new_revision_is_unobserved_and_an_older_observation_is_dropped(self):
+        self.send(decision('merge', reviewed_sha=self.A))
+        self.refresh(pr=self.A)
+        self.send(decision('merge', reviewed_sha=self.A), refresh=['merge'])
+        self.assertEqual((self.item()['revision'], captain.freshness(self.item())), (2, 'unknown'))
+        before = captain.records()
+        with captain.locked():
+            captain.record_observed([(self.item()['id'], 1, [{'source': 'pr', 'ok': True, 'value': self.A}])])
+        self.assertEqual(captain.records(), before)
+
+
+class VerdictCase(RelayCase):
+    """Sessions reporting decisions to the captain's watch, t2's PR head at self.head."""
+
+    A, B = 'a' * 40, 'b' * 40
+
+    def setUp(self):
+        super().setUp()
+        self.events = 0
+        self.head = self.A
+        patcher = mock.patch.object(captain, 'lookup', lambda *args: json.dumps({'headRefOid': self.head})
+                                    if args[0] == 'gh' else None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def report(self, *decisions, address='t2', **ops):
+        """address reports decisions at a task end, as a member of the captain's watch."""
+        if not self.watching():
+            self.as_target(captain.arm, ['all'], self.ident, address='t1')
+        self.as_target(captain.pending, address=address)
+        member = next(r['msg'] for r in captain.records() if r['type'] == 'joined'
+                      and r['target']['address'] == address)
+        self.events += 1
+        payload = {**GOOD, 'event_id': f'e{self.events}', 'decisions': list(decisions), **ops}
+        self.report_as(address, member, payload)
+
+    def watching(self):
+        return any(r['type'] == 'watch' for r in captain.records())
+
+    def items(self):
+        return captain.decisions(captain.records())
+
+    def item(self, key='merge'):
+        return next(i for i in self.items().values() if i['key'] == key)
+
+    def decide(self, *targets, key='merge', revision=1, verdict='correction', words='no: squash first'):
+        """Relay the human's words as a verdict on key: what it printed."""
+        self.say(words)
+        with mock.patch('builtins.print') as out:
+            captain.relay(captain.resolve(list(targets or ['t2'])), None, self.ident,
+                          (self.item(key)['id'], revision, verdict))
+        return [c.args[0] for c in out.call_args_list]
+
+    def refused(self, fn, *args):
+        before = captain.records()
+        with self.assertRaises(SystemExit), mock.patch('builtins.print') as out:
+            fn(*args)
+        self.assertEqual([r for r in captain.records() if r['type'] != 'observed'],
+                         [r for r in before if r['type'] != 'observed'])
+        return '\n'.join(str(c.args[0]) for c in out.call_args_list)
+
+
+class VerdictTest(VerdictCase):
+    """The human's verdict on a decision, relayed to the session that owns it or recorded alone."""
+
+    def test_a_relayed_verdict_binds_its_decision_and_closes_it(self):
+        self.report(decision('merge', kind='blocked'))
+        line = self.decide()[0]
+        self.assertTrue(line.endswith('delivered'), line)
+        relayed = next(r for r in captain.records() if r['type'] == 'relay')
+        self.assertEqual((relayed['item'], relayed['revision'], relayed['verdict'], relayed['change_id']),
+                         (self.item()['id'], 1, 'correction', 'o/r#12'))
+        self.assertEqual((self.item()['state'], self.item()['closure']['why']), ('closed', 'decided'))
+
+    def test_only_its_owner_at_its_latest_open_revision(self):
+        self.report(decision('merge', kind='blocked'))
+        self.assertIn('not this session', self.decide('t3')[0])
+        self.assertEqual([t for t in self.typed if 'RELAYED' in t[1]], [])
+        self.say('no')
+        self.assertIn('revised to 1', self.refused(
+            captain.relay, captain.resolve(['t2']), None, self.ident, (self.item()['id'], 2, 'correction')))
+
+    def test_a_review_whose_head_moved_refuses_without_a_manual_refresh(self):
+        self.report(decision('merge', reviewed_sha=self.A))
+        captain.refresh(self.ident)
+        self.head = self.B
+        self.say('go')
+        self.assertIn('evidence changed', self.refused(
+            captain.relay, captain.resolve(['t2']), None, self.ident, (self.item()['id'], 1, 'no-correction')))
+
+    def test_the_same_message_again_is_its_receipt_another_verdict_refuses(self):
+        self.report(decision('merge', kind='blocked'))
+        self.decide(words='no')
+        with mock.patch('builtins.print') as out, self.assertRaises(SystemExit) as done:
+            captain.verdict((self.item()['id'], 1, 'correction'), None, self.ident)
+        self.assertEqual(done.exception.code, 0)
+        self.assertIn('recorded already', out.call_args_list[0].args[0])
+        self.assertIn('already has a correction', self.refused(
+            captain.verdict, (self.item()['id'], 1, 'no-correction'), None, self.ident))
+
+    def test_a_replay_records_nothing_and_another_revision_from_that_message_refuses(self):
+        self.report(decision('merge', reviewed_sha=self.A))
+        self.say('ship it')
+        with mock.patch('builtins.print'):
+            captain.verdict((self.item()['id'], 1, 'no-correction'), None, self.ident)
+        self.report(reopen=['merge'])
+        before = captain.records()
+        with mock.patch('builtins.print'), self.assertRaises(SystemExit) as done:
+            captain.verdict((self.item()['id'], 1, 'no-correction'), None, self.ident)
+        self.assertEqual((done.exception.code, captain.records()), (0, before))
+        self.assertIn('on revision 1', self.refused(
+            captain.verdict, (self.item()['id'], 2, 'no-correction'), None, self.ident))
+
+    def test_a_report_s_bare_needs_take_no_verdict(self):
+        self.report()
+        member = next(r['msg'] for r in captain.records() if r['type'] == 'joined')
+        self.report_as('t2', member, {**GOOD, 'needs': 'merge #12?'})
+        [legacy] = self.items()
+        self.say('merge it')
+        self.assertIn('only `cancel`', self.refused(captain.verdict, (legacy, 1, 'decision'), None, self.ident))
+
+    def test_a_verdict_needs_its_captain_still_running(self):
+        self.report(decision('merge', kind='blocked'))
+        self.say('merge it')
+        with mock.patch.object(captain, 'live', return_value=False):
+            self.assertIn('no longer runs', self.refused(
+                captain.verdict, (self.item()['id'], 1, 'decision'), None, self.ident))
+
+    def test_a_held_verdict_whose_decision_was_revised_is_undelivered(self):
+        self.report(decision('merge', kind='blocked'))
+        self.terminals['t2'] = {**pinned('t2'), 'status': 'working'}
+        action = self.action_of(self.decide())
+        self.terminals['t2'] = pinned('t2')
+        self.report(decision('merge', kind='blocked', ask='merge now?'))
+        line = self.retry(action)[0]
+        self.assertIn('undelivered', line)
+        self.assertIn('revised', line)
+        self.assertEqual([t for t in self.typed if 'RELAYED' in t[1]], [])
+        self.assertEqual((self.item()['state'], self.item()['revision']), ('open', 2))
+
+    def test_a_delivered_review_verdict_is_not_accepted_once_the_head_moves(self):
+        self.report(decision('merge', reviewed_sha=self.A))
+        action = self.action_of(self.decide(verdict='no-correction'))
+        self.head = self.B
+        with self.assertRaises(SystemExit):
+            self.as_target(captain.accept, action)
+        self.assertFalse(captain.first(captain.records(), 'accepted', action))
+
+    def test_a_chief_decision_is_decided_on_its_latest_report_only(self):
+        runs = self.state / 'chief-runs'
+        (runs / 'pr-12').mkdir(parents=True)
+        (runs / 'pr-12' / 'progress.log').write_text('1 10:00:00 chief: attention · keep D1?\n', encoding='utf-8')
+        (runs / 'pr-12' / 'report.md').write_text('A', encoding='utf-8')
+        with mock.patch.object(captain, 'CHIEF_RUNS', str(runs)), mock.patch('builtins.print'):
+            captain.ingest('pr-12', self.ident)
+            iid = next(iter(self.items()))
+            (runs / 'pr-12' / 'report.md').write_text('B', encoding='utf-8')
+            self.say('keep it')
+            self.assertIn('evidence changed', self.refused(captain.verdict, (iid, 1, 'decision'), None, self.ident))
+            captain.ingest('pr-12', self.ident)
+            self.assertIn('revised to 2', self.refused(captain.verdict, (iid, 1, 'decision'), None, self.ident))
+            captain.verdict((iid, 2, 'decision'), None, self.ident)
+        self.assertEqual(self.items()[iid]['closure']['why'], 'decided')
+
+    def test_the_metric_counts_correction_verdicts_over_rated_changes(self):
+        self.report(decision('merge', kind='blocked'), decision('docs', kind='blocked'),
+                    decision('other', kind='blocked', pr='o/r#13'), decision('plan', kind='idea', pr=None))
+        for key, verdict in (('merge', 'correction'), ('docs', 'correction'), ('other', 'no-correction'),
+                             ('plan', 'correction')):
+            self.say(f'{key}: decided')
+            with mock.patch('builtins.print'):
+                captain.verdict((self.item(key)['id'], 1, verdict), None, self.ident)
+        self.assertEqual(captain.metric(self.items()), {
+            'correction_verdicts': 2, 'changes_with_verdicts': 2, 'ratio': 1.0, 'decision_verdicts': 0,
+            'unattributed_verdicts': 1})
+
+    def test_a_revision_s_change_id_counts_for_later_verdicts_only(self):
+        self.report(decision('plan', kind='idea', pr=None))
+        self.say('plan: no')
+        with mock.patch('builtins.print'):
+            captain.verdict((self.item('plan')['id'], 1, 'correction'), None, self.ident)
+        self.report(decision('plan', kind='idea', pr='o/r#13'), reopen=['plan'])
+        self.assertEqual(self.item('plan')['change_id'], 'o/r#13')
+        self.say('plan: yes')
+        with mock.patch('builtins.print'):
+            captain.verdict((self.item('plan')['id'], 2, 'no-correction'), None, self.ident)
+        self.assertEqual([v['change_id'] for v in self.item('plan')['verdicts']], [None, 'o/r#13'])
+        self.assertEqual(captain.metric(self.items()), {
+            'correction_verdicts': 0, 'changes_with_verdicts': 1, 'ratio': 0.0, 'decision_verdicts': 0,
+            'unattributed_verdicts': 1})
+
+    def test_accept_names_the_decision_its_verdict_settles(self):
+        self.report(decision('merge', kind='blocked'), decision('docs', kind='blocked'))
+        iid = self.item('docs')['id']
+        action = self.action_of(self.decide(key='docs', words='yes'))
+        code, shown = self.as_target(captain.accept, action)
+        self.assertEqual(code, 0)
+        line = next(s for s in shown.splitlines() if iid in s)
+        self.assertIn('not the human\'s words', line)
+        for named in ('"docs"', 'revision 1', 'correction', 'blocked', 'docs?'):
+            self.assertIn(named, line)
+        self.assertNotIn('merge', line)
+        self.report(decision('merge', kind='blocked'), decision('docs', kind='blocked', ask='later?'))
+        self.assertIn(line, self.as_target(captain.show_relay, action)[1], 'the decision as it was decided')
+
+    def test_accept_of_a_relay_bound_to_no_decision_names_none(self):
+        self.say('merge o/r#12')
+        with mock.patch('builtins.print') as out:
+            captain.relay(captain.resolve(['t2']), None, self.ident)
+        action = self.action_of([c.args[0] for c in out.call_args_list])
+        shown = self.as_target(captain.accept, action)[1]
+        self.assertNotIn('decision', shown)
+
+    def test_a_held_verdict_on_a_revision_its_session_resolved_is_undelivered(self):
+        self.report(decision('merge', kind='blocked'))
+        self.terminals['t2'] = {**pinned('t2'), 'status': 'working'}
+        action = self.action_of(self.decide())
+        self.terminals['t2'] = pinned('t2')
+        self.report(resolved=[{'key': 'merge', 'revision': 1}])
+        line = self.retry(action)[0]
+        self.assertIn('undelivered', line)
+        self.assertIn('resolved', line)
+        self.assertEqual([t for t in self.typed if 'RELAYED' in t[1]], [])
+        self.assertEqual(self.item()['state'], 'closed')
+
+    def test_a_delivered_verdict_is_not_accepted_once_its_session_resolved_the_revision(self):
+        self.report(decision('merge', kind='blocked'))
+        action = self.action_of(self.decide())
+        self.report(resolved=[{'key': 'merge', 'revision': 1}])
+        with self.assertRaises(SystemExit):
+            self.as_target(captain.accept, action)
+        self.assertFalse(captain.first(captain.records(), 'accepted', action))
+        self.assertEqual(self.item()['state'], 'closed')
+
+
+class ChiefFeedTest(LedgerCase):
+    """A headless chief run's attention lines become decision items; its report.md is their evidence."""
+
+    def setUp(self):
+        super().setUp()
+        self.runs = self.state / 'chief-runs'
+        self.run = self.runs / 'pr-12'
+        self.run.mkdir(parents=True)
+        patcher = mock.patch.object(captain, 'CHIEF_RUNS', str(self.runs))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def log(self, *lines, tail=''):
+        with open(self.run / 'progress.log', 'a', encoding='utf-8') as f:
+            f.write(''.join(f'{line}\n' for line in lines) + tail)
+
+    def ingest(self, run='pr-12'):
+        with mock.patch('builtins.print') as out:
+            captain.ingest(run, self.ident)
+        return out.call_args_list[0].args[0]
+
+    def items(self):
+        return list(captain.decisions(captain.records()).values())
+
+    def test_attention_lines_become_items_once(self):
+        self.log('1 10:00:00 launcher: started pid 1', '2 10:01:00 chief: attention · decide D1',
+                 '3 10:02:00 chief: cycle · ok')
+        self.assertEqual(self.ingest(), 'pr-12: 1 attention line(s) recorded')
+        self.assertEqual(self.ingest(), 'pr-12: 0 attention line(s) recorded')
+        [item] = self.items()
+        self.assertEqual((item['content']['ask'], item['handle'], item['revision']),
+                         ('chief: attention · decide D1', 'chief pr-12', 1))
+        self.assertEqual(item['owner'], {'run': str(self.run.resolve())})
+
+    def test_a_line_being_written_waits_and_a_shorter_log_removes_nothing(self):
+        self.log('1 10:00:00 chief: attention · one', tail='2 10:01:00 chief: attention · tw')
+        self.ingest()
+        self.assertEqual(len(self.items()), 1)
+        (self.run / 'progress.log').write_text('', encoding='utf-8')
+        self.ingest()
+        self.assertEqual(len(self.items()), 1)
+
+    def test_a_changed_line_refuses_the_whole_ingest(self):
+        self.log('1 10:00:00 chief: attention · one')
+        self.ingest()
+        (self.run / 'progress.log').write_text('1 10:00:00 chief: attention · other\n'
+                                               '2 10:01:00 chief: attention · two\n', encoding='utf-8')
+        before = captain.records()
+        with self.assertRaises(SystemExit), mock.patch('builtins.print'):
+            captain.ingest('pr-12', self.ident)
+        self.assertEqual(captain.records(), before)
+
+    def test_a_seq_given_twice_or_rewritten_as_another_line_refuses(self):
+        self.log('1 10:00:00 chief: attention · one', '1 10:00:00 chief: attention · two')
+        with self.assertRaises(SystemExit), mock.patch('builtins.print'):
+            captain.ingest('pr-12', self.ident)
+        (self.run / 'progress.log').write_text('1 10:00:00 chief: attention · one\n', encoding='utf-8')
+        self.ingest()
+        (self.run / 'progress.log').write_text('1 10:00:00 chief: done\n2 10:01:00 chief: attention · two\n',
+                                               encoding='utf-8')
+        before = captain.records()
+        with self.assertRaises(SystemExit), mock.patch('builtins.print'):
+            captain.ingest('pr-12', self.ident)
+        self.assertEqual(captain.records(), before)
+
+    def test_a_feed_file_linked_out_of_the_run_refuses(self):
+        outside = self.state / 'elsewhere.log'
+        outside.write_text('1 10:00:00 chief: attention · planted\n', encoding='utf-8')
+        (self.run / 'progress.log').symlink_to(outside)
+        with self.assertRaises(SystemExit), mock.patch('builtins.print'):
+            captain.ingest('pr-12', self.ident)
+        self.assertEqual(captain.records(), [])
+
+    def test_a_new_report_is_a_revision_never_a_reopening(self):
+        self.log('1 10:00:00 chief: attention · decide')
+        (self.run / 'report.md').write_text('verdict: needs-user', encoding='utf-8')
+        self.assertEqual(self.ingest(), 'pr-12: 1 attention line(s) recorded, report.md changed')
+        [item] = self.items()
+        self.assertEqual(item['revision'], 1, 'recorded with the report it came with')
+        captain.cancel(item['id'], self.ident)
+        (self.run / 'report.md').write_text('verdict: passed', encoding='utf-8')
+        self.ingest()
+        self.ingest()
+        [item] = self.items()
+        self.assertEqual((item['revision'], item['state']), (2, 'closed'))
+
+    def test_a_report_changed_since_the_ingest_is_stale_until_ingested(self):
+        self.log('1 10:00:00 chief: attention · decide')
+        (self.run / 'report.md').write_text('A', encoding='utf-8')
+        self.ingest()
+
+        def fresh():
+            captain.refresh(self.ident)
+            return captain.freshness(self.items()[0])
+        self.assertEqual(fresh(), 'current')
+        (self.run / 'report.md').write_text('B', encoding='utf-8')
+        self.assertEqual(fresh(), 'stale')
+        self.ingest()
+        self.assertEqual((self.items()[0]['revision'], captain.freshness(self.items()[0])), (2, 'unknown'))
+        self.assertEqual(fresh(), 'current')
+
+    def test_only_a_run_directory_under_the_runs_root(self):
+        (self.runs / 'out').symlink_to(self.state)
+        for run in ('../x', 'missing', 'out', '.hidden'):
+            with self.subTest(run), self.assertRaises(SystemExit), mock.patch('builtins.print'):
+                captain.ingest(run, self.ident)
+        self.assertEqual(captain.records(), [])
+
+
+def decision(key, kind='review', **extra):
+    """A decision as a session reports it; a field given as None is left out."""
+    d = {'key': key, 'kind': kind, 'ask': f'{key}?', 'recommendation': 'yes', 'pr': 'o/r#12', **extra}
+    return {k: v for k, v in d.items() if v is not None}
+
+
+class CaptainStateTest(unittest.TestCase):
+    CAPTAIN = {**captain.identity(CAPTAIN), 'generation': 'g'}
 
     def state(self, start=20, session='s-t1', error=None):
         with mock.patch.object(captain.hc, 'proc_start', side_effect=error, return_value=start), \
              mock.patch.object(captain, 'registered', return_value=session):
-            return captain.owner_state(self.WATCH)
+            return captain.captain_state(self.CAPTAIN)
 
     def test_from_proc_and_the_registry(self):
         self.assertEqual(self.state(), 'live')
@@ -2206,8 +2788,9 @@ class WatchCollectTest(WatchCase):
         self.assertEqual(captain.stored(captain.COLLECTED, recs), 2)
         captain.write_json(captain.COLLECTED, {'generation': generation, 'at': len(recs) + 1})   # past the end
         self.assertIsNone(captain.stored(captain.COLLECTED, recs))
+        captain.write_json(captain.COLLECTED, {'generation': generation, 'at': 2})
         captain.write_json(captain.ENROLLED, {**captain.enrolled(), 'generation': 'next'})
-        self.assertIsNone(captain.stored(captain.COLLECTED, recs))
+        self.assertEqual(captain.stored(captain.COLLECTED, recs), 2, 'a new captain resumes the last one\'s cursor')
         (self.state / captain.COLLECTED).write_text('{', encoding='utf-8')
         self.assertIsNone(captain.stored(captain.COLLECTED, recs))
         with captain.locked():
@@ -2215,8 +2798,8 @@ class WatchCollectTest(WatchCase):
         self.assertEqual(captain.stored(captain.COLLECTED, recs), 1)
         captain.write_json(captain.COLLECTED, {'generation': generation, 'at': 2})
         with captain.locked():
-            captain.store(captain.COLLECTED, 1, 'next')   # an earlier enrollment's further cursor does not hold it
-        self.assertEqual(captain.stored(captain.COLLECTED, recs), 1)
+            captain.store(captain.COLLECTED, 1, 'next')   # an earlier captain's further cursor holds it too
+        self.assertEqual(captain.stored(captain.COLLECTED, recs), 2)
 
     def test_a_request_sent_during_a_watch_is_followed_by_its_collect(self):
         self.arm('all')
@@ -2242,6 +2825,19 @@ class WatchCollectTest(WatchCase):
         self.assertEqual(self.collect(msg)[1], [f'reported {msg} · ready', 'done'])
         self.arm('all')
         new = [r['msg'] for r in captain.records() if r['type'] == 'watch'][-1]
+        self.assertEqual(self.collect()[1], [f'reported {m}:{n} · ready', f'cancelled {w}', f'pending: {new}'])
+
+    def test_an_unseen_report_survives_a_cancel_a_new_watch_and_a_new_captain(self):
+        self.arm('t2')
+        w = self.watch_id()
+        m = self.joined_as('t2')
+        self.collect()
+        self.report_as('t2', m)
+        n = len(captain.records()) - 1
+        captain.cancel(w, self.ident)
+        self.arm('all')
+        new = [r['msg'] for r in captain.records() if r['type'] == 'watch'][-1]
+        captain.write_json(captain.ENROLLED, {**captain.identity(pinned('t4')), 'generation': 'g2'})
         self.assertEqual(self.collect()[1], [f'reported {m}:{n} · ready', f'cancelled {w}', f'pending: {new}'])
 
     def test_a_new_watch_keeps_a_request_the_last_watch_followed(self):
@@ -2305,22 +2901,145 @@ class WatchCollectTest(WatchCase):
         self.assertLess(time.monotonic() - began, 3, 'waited for the lock past the deadline')
         self.assertEqual(lines[-1], f'pending: {m} {self.watch_id()}')
 
-    def test_collect_ends_a_watch_whose_captain_is_gone(self):
-        self.arm('all')
-        self.owner = 'ended'
-        code, lines = self.collect()
-        self.assertEqual(code, 0)
-        self.assertTrue(lines[0].startswith('watch ended w-'), lines)
-        self.assertFalse(captain.marked())
-
-    def test_a_member_s_collect_ends_when_its_captain_goes_while_it_waits(self):
+    def test_a_captain_s_end_leaves_its_watch_open_for_the_next(self):
         self.arm('all')
         m = self.joined_as('t2')
-        ends = mock.patch.object(captain.time, 'sleep', side_effect=lambda s: setattr(self, 'owner', 'ended'))
-        with ends:   # the captain goes while collect waits
-            code, lines = self.collect(m, wait_ms=1000)
-        self.assertEqual((code, lines[-1]), (0, 'done'))
-        self.assertEqual(self.count('watch-end'), 1)
+        self.collect()
+        self.owner = 'ended'
+        self.report_as('t2', m)   # while no captain runs
+        n = len(captain.records()) - 1
+        self.replace_captain()
+        code, lines = self.collect()
+        self.assertEqual(lines, [f'reported {m}:{n} · ready', f'pending: {m} {self.watch_id()}'])
+        self.assertEqual(self.count('watch-end'), 0)
+
+    def test_a_malformed_cursor_generation_is_no_cursor(self):
+        self.arm('all')
+        m = self.joined_as('t2')
+        self.report_as('t2', m)
+        n = len(captain.records()) - 1
+        for generation in (None, '', [], {}):
+            with self.subTest(generation=generation):
+                captain.write_json(captain.COLLECTED, {'generation': generation, 'at': n + 1})
+                self.assertIsNone(captain.stored(captain.COLLECTED, captain.records()))
+
+    def test_a_legacy_watch_end_stays_closed(self):
+        self.arm('all')
+        w = self.watch_id()
+        captain.append({'type': 'watch-end', 'msg': w, 'why': 'its captain session ended'})
+        self.assertEqual(self.pending_as('t2')[1], 'none: no watch is open')
+        self.assertEqual(self.collect()[1][-1], 'done')
+
+
+class QueueTest(VerdictCase):
+    """The decisions waiting on the human, read from the ledger alone."""
+
+    def queue(self, *flags):
+        """What `queue --json` prints, flags passed through."""
+        with mock.patch('builtins.print') as out:
+            captain.queue('all' in flags, True, self.ident if 'refresh' in flags else None)
+        return json.loads(out.call_args_list[0].args[0])
+
+    def test_blocked_then_review_then_idea_each_in_opening_order(self):
+        self.report(decision('later', kind='idea'), decision('ci', kind='blocked'),
+                    decision('merge', reviewed_sha=self.A), decision('fix', kind='blocked'))
+        self.assertEqual([i['key'] for i in self.queue()['items']], ['ci', 'fix', 'merge', 'later'])
+
+    def test_a_closed_decision_shows_only_while_its_relayed_verdict_has_not_gone_through(self):
+        self.report(decision('merge', kind='blocked'), decision('ci', kind='blocked'))
+        with mock.patch('builtins.print'):
+            captain.cancel(self.item('ci')['id'], self.ident)
+        action = self.action_of(self.decide())
+        self.assertEqual(self.queue()['items'], [], 'delivered, and the cancelled one is history')
+        self.assertEqual({i['key'] for i in self.queue('all')['items']}, {'merge', 'ci'})
+        self.as_target(captain.accept, action)
+        self.as_target(captain.outcome, action, 'needs-clarification', 'which branch?')
+        [shown] = self.queue()['items']
+        self.assertEqual((shown['key'], shown['state'], shown['verdicts'][0]['status']),
+                         ('merge', 'closed', 'needs-clarification'), 'accepted, so it may have been acted on')
+
+    def test_a_relayed_verdict_never_acted_on_reopens_its_decision(self):
+        for end in ('rejected', 'needs-clarification', 'cancel'):
+            with self.subTest(end):
+                key = f'k-{end}'
+                self.report(decision(key, kind='blocked'))
+                action = self.action_of(self.decide(key=key, words=f'{key}: no'))
+                with mock.patch('builtins.print'):
+                    if end == 'cancel':
+                        captain.cancel(action, self.ident)
+                    else:
+                        self.as_target(captain.outcome, action, end, 'not now')
+                self.assertEqual((self.item(key)['state'], self.item(key)['revision']), ('open', 1))
+                with mock.patch('builtins.print') as out, self.assertRaises(SystemExit):
+                    captain.relay(captain.resolve(['t2']), None, self.ident, (self.item(key)['id'], 1, 'correction'))
+                self.assertIn('recorded already', out.call_args_list[0].args[0], 'the same message is never sent again')
+
+    def test_a_resolved_decision_stays_closed_when_its_held_verdict_is_cancelled(self):
+        self.report(decision('merge', kind='blocked'))
+        self.terminals['t2'] = {**pinned('t2'), 'status': 'working'}
+        action = self.action_of(self.decide())
+        self.terminals['t2'] = pinned('t2')
+        self.report(resolved=[{'key': 'merge', 'revision': 1}])
+        with mock.patch('builtins.print'):
+            captain.cancel(action, self.ident)
+        self.assertEqual(self.item()['state'], 'closed')
+
+
+    def test_only_the_latest_verdict_keeps_a_closed_decision_listed(self):
+        self.report(decision('merge', kind='blocked'))
+        self.as_target(captain.outcome, self.action_of(self.decide(words='no')), 'rejected', 'not mine')
+        self.report(reopen=['merge'])
+        second = self.action_of(self.decide(revision=2, words='squash first'))
+        self.as_target(captain.accept, second)
+        self.as_target(captain.outcome, second, 'completed', 'done')
+        self.assertEqual(self.queue()['items'], [])
+
+    def test_closing_a_decision_updates_it(self):
+        self.report(decision('merge', kind='blocked'))
+        with mock.patch('builtins.print'):
+            captain.cancel(self.item()['id'], self.ident)
+        [row] = self.queue('all')['items']
+        self.assertEqual(row['updated_at'], row['closure']['at'])
+
+    def test_the_json_contract(self):
+        self.report(decision('merge', reviewed_sha=self.A, worktree='/w', grant_needed='merge'))
+        out = self.queue('refresh')
+        self.assertEqual(set(out), {'version', 'ledger_position', 'items', 'coverage', 'metrics'})
+        self.assertEqual((out['version'], out['ledger_position']), (1, len(captain.records())))
+        [item] = out['items']
+        self.assertEqual(set(item), {
+            'id', 'key', 'change_id', 'kind', 'owner', 'handle', 'relay_target', 'repo', 'pr', 'worktree',
+            'reviewed_sha', 'observations', 'ask', 'recommendation', 'grant_needed', 'evidence_refs', 'revision',
+            'state', 'freshness', 'missing', 'opened_at', 'updated_at', 'closure', 'verdicts'})
+        self.assertEqual((item['relay_target'], item['repo'], item['freshness'], item['missing']),
+                         ('t2', 'o/r', 'unknown', []), 'the worktree lookup failed')
+        self.assertEqual(sorted((o['source'], o['ok']) for o in item['observations']),
+                         [('pr', True), ('worktree', False)])
+        self.assertEqual(set(out['coverage']), {'watch', 'scope', 'members', 'chief_runs', 'not_covered'})
+        self.assertEqual([m['state'] for m in out['coverage']['members']], ['live'])
+        self.assertEqual(out['metrics']['ratio'], None)
+
+    def test_a_plain_queue_looks_nothing_up_and_records_nothing(self):
+        self.report(decision('merge', reviewed_sha=self.A))
+        before = captain.records()
+        with mock.patch.object(captain, 'lookup', side_effect=AssertionError('looked up')):
+            self.queue()
+        self.assertEqual(captain.records(), before)
+
+    def test_what_a_decision_lacks_is_named(self):
+        self.report(decision('merge'))
+        member = next(r['msg'] for r in captain.records() if r['type'] == 'joined')
+        self.report_as('t2', member, {**GOOD, 'needs': 'ci is red'})
+        self.assertEqual([i['missing'] for i in self.queue()['items']], [['recommendation'], ['reviewed_sha']])
+
+    def test_the_text_view_names_each_decision_and_the_coverage(self):
+        self.report(decision('merge', kind='blocked'))
+        with mock.patch('builtins.print') as out:
+            captain.queue(False, False)
+        lines = [c.args[0] for c in out.call_args_list]
+        self.assertEqual(lines[0], 'blocked')
+        self.assertIn(self.item()['id'], lines[1])
+        self.assertIn(captain.UNCOVERED, lines[-1])
 
 
 if __name__ == '__main__':

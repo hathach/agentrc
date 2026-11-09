@@ -13,9 +13,15 @@ does not recognize is reported, never assumed safe.
   captain.py collect [<msg>...] [--wait MS]      print each report as it lands
   captain.py reports [<msg>[:<N>]...]            the latest report from each target, or those requests' reports
   captain.py reports --new                       every watch report since the last --new
-  captain.py cancel <msg>                        close a request, relay or watch no answer will close
+  captain.py cancel <msg>                        close a request, relay, watch or decision no answer will close
+  captain.py queue [--json] [--all] [--refresh]  the decisions waiting on the human, sending nothing
+  captain.py ingest --chief <run>                record a headless chief run's attention lines as decisions
   captain.py relay <target>... [--entry <id>] [--dry-run]
                                                  relay the human's message this turn acts on
+  captain.py relay <target> --item <id> --revision <N> --verdict <verdict> [--entry <id>]
+                                                 relay it as the human's verdict on a decision
+  captain.py verdict --item <id> --revision <N> --verdict <verdict> [--entry <id>]
+                                                 record it as that verdict, sending nothing
   captain.py relay --retry <action>              send a held relay once its session is idle
   captain.py brief --for <msg> | --pending       a target reads what a status request asks, or joins a watch
   captain.py report --for <msg> --file <json|->  a target answers a status request
@@ -34,19 +40,24 @@ without it when the targets are exactly the live sessions. The message relayed i
 captain's current turn, typed or read mid-turn; a message hc pasted (`<hc from=...>`) is never the human's.
 
 A watch types into nobody: a session joins it itself, through hooks/captain (SessionStart after a compaction or
-/clear, Stop) or `brief --pending`, and ends with the captain session that started it. A collect without ids
-resumes where the enrolled captain's last one stopped, and `reports --new` where its last one did.
+/clear, Stop) or `brief --pending`, and it stands until the human cancels it, whichever captain is enrolled or none.
+A collect without ids resumes where the last one stopped, and `reports --new` where its last one did, whichever
+captain ran it.
 """
 
 import argparse
 import glob
+import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, suppress
 from pathlib import Path
 
@@ -74,17 +85,42 @@ LEDGER, ENROLLED = 'ledger-hc.jsonl', 'enrolled-hc.json'   # ledger.jsonl and en
 # where the enrolled captain's last collect without ids, and its last `reports --new`, stopped reading
 COLLECTED, TABLED = 'collected-hc.json', 'tabled-hc.json'
 TABLING = 'tabled.lock'   # serializes `reports --new` without holding the ledger lock while it prints
+# serializes each observation with its record, so one taken earlier never lands after one taken later; taken before
+# the ledger lock, never while holding it, and gh and git run under it with the ledger free
+OBSERVING = 'observing.lock'
+CHIEF_RUNS = os.path.expanduser('~/.cache/chief-runs')   # where chief_run.py's --out directories live
+RUN_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,99}')
+PROGRESS_LINE = re.compile(r'(\d+) \d\d:\d\d:\d\d (.*)')
+ATTENTION = 'chief: attention'
+# its hardened, read-only git and gh lookups; it stops its own tool's process group after its TIMEOUT
+READER = str(Path(__file__).resolve().with_name('captain_read.py'))
+SOURCES = ('pr', 'worktree', 'report')
+VERDICTS = ('correction', 'no-correction', 'decision')
+UNSETTLED = ('pending', 'held', 'sending', 'undelivered', 'uncertain', 'refused', 'failed', 'rejected',
+             'needs-clarification')   # a relayed verdict in one of these keeps its closed decision in the queue
+UNCOVERED = 'Codex terminals and remote sessions are not covered'
 INSTALLED = (os.environ.get('AGENTRC_CAPTAIN_SCRIPT')
              or os.path.expanduser('~/.claude/skills/captain/scripts/captain.py'))
 IDENTITY = ('address', 'created', 'kind', 'cwd', 'session', 'pid', 'started', 'account')
 ASKABLE = ('idle', 'done')
 REPORT = {'task': str, 'prs': list, 'state': str, 'evidence': str, 'chief': str, 'needs': str, 'next': str}
-OPTIONAL = {'issues': list}   # a report without it names no issue
+# a report without issues names no issue; the rest are decision operations, needing an event_id
+OPTIONAL = {'issues': list, 'event_id': str, 'decisions': list, 'reopen': list, 'refresh': list, 'resolved': list}
+OPS = ('decisions', 'reopen', 'refresh', 'resolved')
+KINDS = ('blocked', 'review', 'idea')
+DECISION = {'key': str, 'kind': str, 'ask': str, 'recommendation': str}
+DECISION_OPTIONAL = {'change_id': str, 'pr': str, 'worktree': str, 'reviewed_sha': str, 'grant_needed': str,
+                     'evidence_refs': list}
+DECISIONS_MAX = 20
+KEY = re.compile(r'[a-z0-9][a-z0-9-]{0,39}')
+EVENT_ID = re.compile(r'[A-Za-z0-9._:-]{1,64}')
+SHA = re.compile(r'[0-9a-f]{7,40}')
+PR_REF = re.compile(r'[\w.-]+/[\w.-]+#\d+')
 STATES = ('ready', 'in-progress', 'blocked', 'needs-human', 'done', 'idle')
 # withdraw and withdraw-requested have no writer since `withdraw` was removed: kept so an older ledger still reads
 RECORDS = ('request', 'report', 'cancel', 'delivered', 'undelivered', 'uncertain',
            'relay', 'held', 'sending', 'accepted', 'outcome', 'withdraw', 'withdraw-requested', 'refused',
-           'watch', 'watch-extend', 'joined', 'watch-end')
+           'watch', 'watch-extend', 'joined', 'watch-end', 'evidence', 'observed', 'verdict')
 ITEMS = ('request', 'relay')
 WATCHED = ('watch', 'joined')
 FOLLOWED = ITEMS + WATCHED   # what collect can follow
@@ -288,6 +324,11 @@ def well_formed(rec):
         return validate(rec.get('report')) is None
     if rec['type'] == 'outcome':
         return rec.get('result') in RESULTS and isinstance(rec.get('note'), str)
+    if ('item' in rec or rec['type'] == 'verdict') and not well_bound(rec):
+        return False
+    if rec['type'] == 'verdict':
+        captain = rec.get('captain')
+        return text(rec.get('entry')) and text(rec.get('quote')) and pinned_identity(captain)
     if rec['type'] in ITEMS:
         captain = rec.get('captain')
         relayed = rec['type'] != 'relay' or all(text(rec.get(k)) for k in ('entry', 'quote', 'context'))
@@ -302,7 +343,19 @@ def well_formed(rec):
         return text(rec.get('watch')) and isinstance(rec.get('handle'), str) and pinned_identity(rec.get('target'))
     if rec['type'] in ('watch-end', 'held'):
         return isinstance(rec.get('why'), str)
+    if rec['type'] == 'observed':
+        return (type(rec.get('revision')) is int and rec.get('source') in SOURCES and type(rec.get('ok')) is bool
+                and (rec.get('value') is None or text(rec.get('value'))))
+    if rec['type'] == 'evidence':
+        return (text(rec.get('run')) and rec.get('source') in ('attention', 'report') and text(rec.get('digest'))
+                and (rec['source'] == 'report' or type(rec.get('seq')) is int and text(rec.get('text'))))
     return True
+
+
+def well_bound(rec):
+    """A verdict's binding to the decision it settles."""
+    return (text(rec.get('item')) and type(rec.get('revision')) is int and rec.get('verdict') in VERDICTS
+            and (rec.get('change_id') is None or text(rec.get('change_id'))))
 
 
 def well_scoped(scope):
@@ -502,7 +555,13 @@ def one_call(label, command, placeholder, done=None):
 KEYS = ('Send one JSON object with exactly these keys: "task" (one line), "prs" (list of "owner/repo#N"), "issues" '
         '(list of "owner/repo#N" issues the task is for), "state" (one of ' + ', '.join(STATES) + '), "evidence" '
         '(last verification you ran, or ""), "chief" (headless chief or workflow running for you, or ""), "needs" '
-        '(the decision or action the human must take, or ""), "next" (your next step).')
+        '(the decision or action the human must take, or ""), "next" (your next step). For each decision the human '
+        'must make, also send "event_id" (new for each report, reused only to retry the same one) and "decisions": '
+        'a list of {"key" (your stable id for it, a-z 0-9 -), "kind" (blocked, review or idea), "ask", '
+        '"recommendation", and optionally "change_id", "pr" ("owner/repo#N"), "worktree", "reviewed_sha", '
+        '"grant_needed", "evidence_refs" (list)}. A decision stays open until you send "resolved": [{"key", '
+        '"revision"}] or the human decides it; "reopen": [key] reopens one decided, "refresh": [key] says you '
+        'reviewed its evidence again.')
 
 
 def status_brief(msg, address):
@@ -511,10 +570,10 @@ def status_brief(msg, address):
             + one_call('Status report', f'report --for {msg} --file -', 'the JSON object', 'Status sent.'))
 
 
-def watch_brief(child, address):
+def watch_brief(child):
     """What a session joined to a watch does from then on; it names no role and reaches the session only through
     a hook or `brief --pending`."""
-    return (f'STATUS WATCH {child} from the agent session in terminal {address}, not a human instruction. Each time '
+    return (f'STATUS WATCH {child}, standing until the human cancels it, not a human instruction. Each time '
             'a task of yours ends - done, or stopped on a blocker or a need for the human - finish its work and '
             f'verification, then, as its final tool action and before your ordinary completion message, report it. '
             f'{KEYS} Send it ' + one_call('Status report', f'report --for {child} --file -', 'the JSON object')
@@ -695,17 +754,83 @@ def record_delivery(msg, address, outcome, err=None):
     return f'{address}: {msg} {outcome}' + (f' ({err})' if err else '')
 
 
-def validate(report):
-    if not isinstance(report, dict) or not set(REPORT) <= set(report) <= set(REPORT) | set(OPTIONAL):
-        return f'keys must be exactly {", ".join(REPORT)}, and optionally {", ".join(OPTIONAL)}'
-    for key, kind in {**REPORT, **OPTIONAL}.items():
-        if key in report and not isinstance(report[key], kind):
+def shaped(obj, required, optional):
+    """Why obj is not a dict of exactly the required keys and any of the optional ones, each of its type, or None."""
+    if not isinstance(obj, dict) or not required.keys() <= obj.keys() <= required.keys() | optional.keys():
+        return f'keys must be exactly {", ".join(required)}, and optionally {", ".join(optional)}'
+    for key, value in obj.items():
+        kind = required.get(key) or optional[key]
+        if not isinstance(value, kind):
             return f'"{key}" must be a {kind.__name__}'
+    return None
+
+
+def validate(report):
+    why = shaped(report, REPORT, OPTIONAL)
+    if why:
+        return why
     for key in ('prs', 'issues'):
-        if not all(isinstance(p, str) and re.fullmatch(r'[\w.-]+/[\w.-]+#\d+', p) for p in report.get(key, [])):
+        if not all(isinstance(p, str) and PR_REF.fullmatch(p) for p in report.get(key, [])):
             return f'"{key}" must hold "owner/repo#N" strings'
     if report['state'] not in STATES:
         return f'"state" must be one of {", ".join(STATES)}'
+    return validate_ops(report)
+
+
+def validate_ops(report):
+    """Why the decision operations of report are malformed or contradict each other, or None."""
+    if 'event_id' in report and not EVENT_ID.fullmatch(report['event_id']):
+        return '"event_id" must be 1-64 of A-Z a-z 0-9 . _ : -'
+    if not report.keys() & set(OPS):
+        return None
+    if any(report.get(op) for op in OPS) and 'event_id' not in report:
+        return '"event_id" is required with decisions, reopen, refresh or resolved'
+    decided = report.get('decisions', [])
+    if len(decided) > DECISIONS_MAX:
+        return f'"decisions" holds at most {DECISIONS_MAX}'
+    for d in decided:
+        why = validate_decision(d)
+        if why:
+            return f'a decision {why}'
+    keys = [d['key'] for d in decided]
+    for op in ('reopen', 'refresh'):
+        named = report.get(op, [])
+        if not all(isinstance(k, str) and KEY.fullmatch(k) for k in named) or len(set(named)) != len(named):
+            return f'"{op}" must hold distinct decision keys'
+    resolved = report.get('resolved', [])
+    if not all(isinstance(r, dict) and set(r) == {'key', 'revision'} and isinstance(r['key'], str)
+               and KEY.fullmatch(r['key']) and type(r['revision']) is int and r['revision'] > 0 for r in resolved):
+        return '"resolved" must hold {"key", "revision"} objects'
+    closing = [r['key'] for r in resolved]
+    for name, group in (('decisions', keys), ('resolved', closing)):
+        if len(set(group)) != len(group):
+            return f'"{name}" names a key twice'
+    reopen, refresh = set(report.get('reopen', [])), set(report.get('refresh', []))
+    if reopen & refresh or set(closing) & (reopen | refresh | set(keys)):
+        return 'one key is reopened and refreshed, or resolved and changed, in the same report'
+    return None
+
+
+def validate_decision(d):
+    why = shaped(d, DECISION, DECISION_OPTIONAL)
+    if why:
+        return why
+    if not KEY.fullmatch(d['key']):
+        return '"key" must be 1-40 of a-z 0-9 -, starting with a letter or digit'
+    if d['kind'] not in KINDS:
+        return f'"kind" must be one of {", ".join(KINDS)}'
+    if not d['ask'].strip():
+        return '"ask" must say what the human decides'
+    if 'pr' in d and not PR_REF.fullmatch(d['pr']):
+        return '"pr" must be "owner/repo#N"'
+    if 'reviewed_sha' in d and not SHA.fullmatch(d['reviewed_sha']):
+        return '"reviewed_sha" must be a lowercase hex SHA'
+    if 'worktree' in d and not os.path.isabs(d['worktree']):
+        return '"worktree" must be an absolute path'
+    if 'change_id' in d and not d['change_id'].strip():
+        return '"change_id" must not be empty'
+    if not all(text(e) for e in d.get('evidence_refs', [])):
+        return '"evidence_refs" must hold non-empty strings'
     return None
 
 
@@ -766,8 +891,51 @@ def brief(msg):
     return 0
 
 
+def session_of(ident):
+    """Whose an identity is: its (account, session), or ('run', path) for a chief run, which has neither."""
+    return ('run', ident['run']) if 'run' in ident else (ident.get('account'), ident.get('session'))
+
+
+def earlier_event(recs, source, payload):
+    """The ref, `<msg>:<index>`, of the report this session sent before under payload's event_id, through any request
+    or watch, or None; dies when that report differs, so a reused id never applies other operations."""
+    event = payload.get('event_id')
+    if not event:
+        return None
+    sources = asked(recs)
+    me = session_of(source['target'])
+    for i, r in enumerate(recs):
+        owner = sources.get(r['msg']) if r['type'] == 'report' else None
+        if owner and r['report'].get('event_id') == event and session_of(owner['target']) == me:
+            if r['report'] != payload:
+                die(f'event_id {event} was sent before with a different report', 2)
+            return f'{r["msg"]}:{i}'
+    return None
+
+
+def reported_from(recs, source):
+    """The target source's session last reported from, through any request or watch, or None: its items' owner."""
+    sources = asked(recs)
+    me = session_of(source['target'])
+    return next((sources[r['msg']]['target'] for r in reversed(recs)
+                 if r['type'] == 'report' and r['msg'] in sources and session_of(sources[r['msg']]['target']) == me),
+                None)
+
+
+def unknown_keys(recs, source, payload):
+    """The keys payload reopens, refreshes or resolves that are no decision of this session's, nor in payload."""
+    named = {*payload.get('reopen', []), *payload.get('refresh', []), *(r['key'] for r in payload.get('resolved', []))}
+    named -= {d['key'] for d in payload.get('decisions', [])}
+    if not named:
+        return []
+    owner = session_of(source['target'])
+    return sorted(named - {item['key'] for item in decisions(recs).values() if session_of(item['owner']) == owner})
+
+
 def report(msg, file):
-    """A target answers msg: only the session it was sent to, as pinned then, only while it is open, only once."""
+    """A target answers msg: only the session it was sent to, as pinned then, only while it is open, only once. A
+    report repeating an event_id this session sent is the same report again, its operations applied once; through a
+    watch it is recorded again only from where the session moved since, so its items follow it."""
     try:
         payload = json.loads(read_text(file))
     except ValueError as e:
@@ -779,12 +947,22 @@ def report(msg, file):
         mine = me()   # under the lock: a restart while waiting for it must not pass
         recs = records()
         member = first(recs, 'joined', msg)
+        source = member or first(recs, 'request', msg)
+        unknown = unknown_keys(recs, source, payload) if source else []
+        if unknown:
+            die(f'report rejected: no decision {", ".join(unknown)} of this session to reopen, refresh or resolve', 4)
         if member:   # a watch's member reports each task end: every report is kept, none closes it
             member_watch(member, recs, mine)
+            again = earlier_event(recs, member, payload)
+            if again is not None and reported_from(recs, member) == member['target']:
+                print(f'recorded {again}')
+                return 0
             append({'type': 'report', 'msg': msg, 'report': payload})
             print(f'recorded {msg}:{len(recs)}')   # every report is kept, so a blind retry would duplicate one
             return 0
         requested(msg, recs, mine)
+        # dies on a reused event_id; an identical one still answers this request, its operations applied once
+        earlier_event(recs, source, payload)
         earlier = first(recs, 'report', msg)
         if earlier:
             if earlier['report'] == payload:
@@ -869,23 +1047,15 @@ def watch_event(i, rec, items):
     return None
 
 
-def read_mark(name):
-    """(generation, at) as stored in name, or None: missing or malformed. Each caller reads afresh."""
+def stored(name, recs):
+    """The ledger index last stored in name, by whichever captain, or None: none stored, malformed, or past the end
+    of recs. A standing watch outlives its captains, so a new one resumes where the last stopped. Each caller reads
+    afresh."""
     try:
         with open(path(name), encoding='utf-8') as f:
             mark = json.load(f)
-        return mark['generation'], mark['at']
+        at = mark['at'] if text(mark['generation']) else None
     except (OSError, ValueError, KeyError, TypeError):
-        return None
-
-
-def stored(name, recs):
-    """The ledger index the enrolled captain last stored in name, or None: none stored, another captain's, or one
-    past the end of recs."""
-    mark = read_mark(name)
-    try:
-        at = mark[1] if mark and mark[0] == generation() else None
-    except (OSError, ValueError):   # an unreadable enrolment: no mark is ours
         return None
     return at if type(at) is int and 0 <= at <= len(recs) else None
 
@@ -896,11 +1066,11 @@ def generation():
 
 def store(name, at, fence):
     """Store ledger index at in name, under the lock the caller holds, while fence is still the enrolled captain's
-    generation; never behind what that captain stored already, so a slower reader cannot roll it back."""
+    generation; never behind what any captain stored already, so a slower reader cannot roll it back, unless that
+    is malformed or past the ledger's end."""
     if fence is None or fence != generation():
         return
-    mark = read_mark(name)
-    if mark and mark[0] == fence and type(mark[1]) is int and mark[1] > at:
+    if (stored(name, records(lenient=True)) or 0) > at:
         return
     write_json(name, {'generation': fence, 'at': at})
 
@@ -918,21 +1088,20 @@ def collect(msgs, wait_ms):
     """Print each followed item's events as they land: a request's or relay's report or outcome, cancellation or
     refusal; a watch's members joining and every report they send, and its end. Exit 0, printing `done`, once none
     is pending; NO_ANSWER when wait_ms lapse first, printing `pending: <ids>`. With ids, every event on them is
-    printed. Without, printing resumes where the enrolled captain's last collect without ids stopped (COLLECTED,
+    printed. Without, printing resumes where the last collect without ids stopped, whichever captain ran it (COLLECTED,
     stored as this one ends), following what was open there and whatever opened since; with no such cursor, at the
     open watch's start, else at the ledger's end. A cursor from before the open watch skips, until that watch's start,
     the events of requests and relays opened while no watch was open: those were collected by id. What is closed is
     judged on the whole ledger. A strict read under the lock first: a torn ledger must not look like nothing to wait
-    for. A watch whose captain was replaced or ended is settled here too, at the start and at each poll while one is
-    followed, or nothing else might end it. Every lock wait ends with wait_ms, so the pending line still prints before
+    for. Every lock wait ends with wait_ms, so the pending line still prints before
     the caller's timeout. A collect belongs to the captain enrolled when it began: once another enrolls, it prints its
     pending line and stores nothing."""
     deadline = time.monotonic() + wait_ms / 1000
     try:
         with locked(wait_ms / 1000):
             recs = records()
-            opened = len(recs)   # a watch settle ends now was open when this collect began
-            watch, _ = settle(recs)
+            opened = len(recs)
+            watch = settle(recs)
             fence = generation()
             start = 0 if msgs else resumed(COLLECTED, recs, watch, opened)
             armed = recs.index(watch) if watch and not msgs else 0
@@ -973,15 +1142,7 @@ def collect(msgs, wait_ms):
             print(f'pending: {" ".join(sorted(pending))}', flush=True)
             return NO_ANSWER
         time.sleep(POLL_S)
-        if any(items[m]['type'] in WATCHED for m in pending):
-            try:
-                with locked(max(0, deadline - time.monotonic())):   # strict: under the lock no append is half written
-                    recs = records()
-                    settle(recs)
-            except Busy:
-                pass   # the deadline passed: the next pass prints the pending line
-        else:
-            recs = records(lenient=True)
+        recs = records(lenient=True)
 
 
 def reports(msgs=()):
@@ -1012,8 +1173,7 @@ def new_reports(emit=lambda rows: None):
         with locked():
             recs = records()
             fence = generation()
-            ends = watch_ends(recs)
-            watch = next((r for r in reversed(recs) if r['type'] == 'watch' and r['msg'] not in ends), None)
+            watch = open_watch(recs)
             requests, start = asked(recs), resumed(TABLED, recs, watch, len(recs))
         rows = [{**row(requests[r['msg']], r), 'msg': f'{r["msg"]}:{i}'} for i, r in enumerate(recs[start:], start)
                 if r['type'] == 'report' and requests[r['msg']]['type'] == 'joined']
@@ -1054,19 +1214,378 @@ def unanswered(msg, requests, recs):
     return {'handle': requests[msg]['handle'], 'msg': msg, 'missing': EVENTS[end['type']]}
 
 
+def item_id(prefix, *parts):
+    return f'{prefix}-' + hashlib.sha256('\0'.join(parts).encode()).hexdigest()[:16]
+
+
+def new_item(iid, i, source, key, content, legacy=False):
+    return {'id': iid, 'key': key, 'owner': source['target'], 'handle': source['handle'], 'content': content,
+            'change_id': content.get('change_id') or content.get('pr'), 'revision': 1, 'state': 'open',
+            'closure': None, 'opened': i, 'updated': i, 'legacy': legacy, 'observations': {}, 'verdicts': [],
+            'resolved': None}
+
+
+def revise(item, i, content=None, reopen=False):
+    item['revision'] += 1
+    item['updated'] = i
+    item['observations'] = {}   # what was observed is of the revision before
+    if content is not None:
+        item['content'] = content
+        item['change_id'] = content.get('change_id') or content.get('pr')
+    if reopen:
+        item['state'], item['closure'] = 'open', None
+
+
+def close(item, i, why, by=None):
+    if item['state'] == 'open':
+        item['state'], item['closure'] = 'closed', {'why': why, 'at': i, 'revision': item['revision'], 'by': by}
+        item['updated'] = i
+
+
+def unclose(item, i, by):
+    """Reopen item, at its latest revision, when by, a relayed verdict, closed it and its session resolved neither
+    that revision nor a later one since: its target never acted on the verdict."""
+    closure, resolved = item['closure'], item['resolved']
+    if closure and closure['by'] == by and (resolved is None or resolved < closure['revision']):
+        item['state'], item['closure'], item['updated'] = 'open', None, i
+
+
+def apply_report(found, i, source, payload):
+    """Fold one report's decision operations into found. The owner is the reporting session's account and session,
+    never a payload field."""
+    def did(key):
+        return item_id('d', *session_of(source['target']), key)
+
+    ids = {}
+    for d in payload.get('decisions', []):
+        iid = ids[d['key']] = did(d['key'])
+        item = found.get(iid)
+        if not item:
+            found[iid] = new_item(iid, i, source, d['key'], d)
+            continue
+        reopen = d['key'] in payload.get('reopen', [])
+        if d != item['content'] or reopen or d['key'] in payload.get('refresh', []):
+            revise(item, i, d, reopen)
+    for op in ('reopen', 'refresh'):
+        for key in payload.get(op, []):
+            item = found.get(did(key))
+            if item and key not in ids:
+                revise(item, i, reopen=op == 'reopen')
+    for r in payload.get('resolved', []):
+        item = found.get(did(r['key']))
+        if item and item['revision'] == r['revision']:
+            item['resolved'] = r['revision']
+            close(item, i, 'resolved')
+    if payload['needs'] and 'decisions' not in payload:
+        iid = item_id('n', *session_of(source['target']), payload['needs'])
+        if iid not in found:
+            found[iid] = new_item(iid, i, source, None, {'kind': 'blocked', 'ask': payload['needs']}, legacy=True)
+
+
+def decisions(recs):
+    """Every decision item the ledger holds, by id in opening order: what sessions reported, as revised, resolved,
+    reopened or cancelled since. An event_id a session sent before is not applied again, whichever request or
+    watch carried it. Every report, a repeated event's too, says where its session runs now: its items follow it,
+    relay targets never."""
+    sources = asked(recs)
+    found, seen, reports, latest, bound, accepted = {}, set(), {}, {}, {}, set()
+    for i, r in enumerate(recs):
+        if r['type'] == 'report' and r['msg'] in sources:
+            source, payload = sources[r['msg']], r['report']
+            latest[session_of(source['target'])] = source
+            event = payload.get('event_id')
+            if event:
+                ident = (*session_of(source['target']), event)
+                if ident in seen:
+                    continue
+                seen.add(ident)
+            apply_report(found, i, source, payload)
+        elif r['type'] == 'evidence':
+            apply_evidence(found, reports, i, r)
+        elif r['type'] in ('relay', 'verdict') and r.get('item') in found:
+            linked = found[r['item']]
+            linked['verdicts'].append({'msg': r['msg'], 'via': r['type'], 'verdict': r['verdict'],
+                                       'revision': r['revision'], 'change_id': r.get('change_id'), 'at': i})
+            if linked['revision'] == r['revision']:
+                close(linked, i, 'decided', r['msg'])
+            if r['type'] == 'relay':
+                bound[r['msg']] = linked
+        elif r['type'] == 'accepted':
+            accepted.add(r['msg'])
+        elif r.get('msg') in bound and r['msg'] not in accepted and (
+                r['type'] in ('undelivered', 'refused', 'cancel')
+                or r['type'] == 'outcome' and r['result'] in ('rejected', 'needs-clarification')):
+            unclose(bound[r['msg']], i, r['msg'])
+        elif r['type'] == 'observed' and r['msg'] in found and found[r['msg']]['revision'] == r['revision']:
+            found[r['msg']]['observations'][r['source']] = {'ok': r['ok'], 'value': r['value'], 'at': i}
+        elif r['type'] == 'cancel' and r['msg'] in found:
+            close(found[r['msg']], i, 'cancelled')
+    for item in found.values():
+        now = latest.get(session_of(item['owner']))
+        if now:
+            item['owner'], item['handle'] = now['target'], now['handle']
+    return found
+
+
+def apply_evidence(found, reports, i, rec):
+    """A chief's attention line opens an item with no relay target, its run as owner, bound to the run's report.md as
+    last recorded; a later report.md digest is a revision of each of that run's items, open or closed, never reopening
+    one. reports holds each run's latest digest."""
+    run = rec['run']
+    if rec['source'] == 'report':
+        reports[run] = rec['digest']
+        for item in found.values():
+            if item['owner'].get('run') == run and item['report'] != rec['digest']:
+                revise(item, i)
+                item['report'] = rec['digest']
+    elif rec['msg'] not in found:
+        source = {'target': {'run': run}, 'handle': f'chief {os.path.basename(run)}'}
+        content = {'kind': 'blocked', 'ask': rec['text'], 'evidence_refs': [f'{run}/progress.log:{rec["seq"]}']}
+        found[rec['msg']] = {**new_item(rec['msg'], i, source, None, content), 'report': reports.get(run)}
+
+
+def run_dir(run_id):
+    """The chief run directory run_id names under CHIEF_RUNS, resolved; dies for anything else."""
+    if not RUN_ID.fullmatch(run_id):
+        die(f'{run_id}: a chief run is named by its directory under {CHIEF_RUNS}', 2)
+    root = os.path.realpath(CHIEF_RUNS)
+    run = os.path.realpath(os.path.join(root, run_id))
+    if os.path.dirname(run) != root or not os.path.isdir(run):
+        die(f'no chief run {run_id} in {CHIEF_RUNS}', 3)
+    return run
+
+
+def run_file(run, name):
+    """The bytes of name in run, or None when it is missing; never through a symlink, which could leave CHIEF_RUNS."""
+    try:
+        fd = os.open(os.path.join(run, name), os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        die(f'{name} in {run} cannot be read safely: {e}', 2)
+    with os.fdopen(fd, 'rb') as f:
+        return f.read()
+
+
+def progress_lines(run):
+    """(seq, text) of each complete progress.log line; a last line still being written waits for the next ingest."""
+    data = run_file(run, 'progress.log') or b''
+    found = []
+    for line in data.split(b'\n')[:-1]:
+        m = PROGRESS_LINE.fullmatch(line.decode('utf-8', 'replace'))
+        if m:
+            found.append((int(m.group(1)), m.group(2)))
+    return found
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def report_digest(run):
+    data = run_file(run, 'report.md')
+    return None if data is None else digest(data)
+
+
+def ingest(run_id, mine):
+    """Record a headless chief run's attention lines as decision items and its report.md as their evidence; nothing
+    is sent anywhere and no repository, grant or session changes. Each line once by (run, seq); a seq that comes back
+    with other text refuses the whole ingest, recording nothing; a shorter progress.log removes nothing."""
+    run = run_dir(run_id)
+    with locked():   # the files are read under it too, so a slower ingest never records an older snapshot
+        require_captain(mine)
+        report = report_digest(run)
+        recs = records()
+        known = {r['seq']: r['text'] for r in recs
+                 if r['type'] == 'evidence' and r['run'] == run and r['source'] == 'attention'}
+        lines = {}
+        for seq, line in progress_lines(run):   # every line, so one rewritten as another kind is caught too
+            if lines.setdefault(seq, line) != line or known.get(seq, line) != line:
+                die(f'{run_id}: progress.log line {seq} differs from what was read or ingested; nothing recorded', 2)
+        new = []
+        for seq, line in lines.items():
+            if line.startswith(ATTENTION) and seq not in known:
+                new.append({'type': 'evidence', 'msg': item_id('c', run, str(seq)), 'run': run, 'source': 'attention',
+                            'seq': seq, 'text': line, 'digest': digest(line.encode())})
+        last = next((r['digest'] for r in reversed(recs) if r['type'] == 'evidence' and r['run'] == run
+                     and r['source'] == 'report'), None)
+        changed = report is not None and report != last
+        if changed:   # first, so the lines recorded with it are bound to it
+            append({'type': 'evidence', 'msg': item_id('r', run), 'run': run, 'source': 'report', 'digest': report})
+        for rec in new:
+            append(rec)
+    print(f'{run_id}: {len(new)} attention line(s) recorded' + (', report.md changed' if changed else ''))
+    return 0
+
+
+def sources(item):
+    """What item's evidence is checked against: a chief run's report.md; a session's PR head and worktree HEAD when it
+    named a reviewed SHA and them; None when it named no reviewed SHA."""
+    if 'run' in item['owner']:
+        return ['report']
+    content = item['content']
+    if 'reviewed_sha' not in content:
+        return None
+    return [s for s in ('pr', 'worktree') if s in content]
+
+
+def matches(item, source, value):
+    if source == 'report':
+        return value == item['report']
+    return value is not None and value.startswith(item['content']['reviewed_sha'])
+
+
+def freshness(item):
+    """'stale' on any known mismatch; 'current' when every source was observed to match this revision; else
+    'unknown', which a review with no reviewed SHA, or one with no source to check it against, also is; other kinds
+    with none are 'not-applicable'."""
+    named = sources(item)
+    if named is None:
+        return 'unknown' if item['content']['kind'] == 'review' else 'not-applicable'
+    seen = [(s, item['observations'].get(s)) for s in named]
+    if any(o and o['ok'] and not matches(item, s, o['value']) for s, o in seen):
+        return 'stale'
+    return 'current' if seen and all(o and o['ok'] for _, o in seen) else 'unknown'
+
+
+def lookup(*args):
+    """What captain_read.py prints for args, stripped, or None when it refuses or fails. No timeout here: killing
+    the reader would orphan the tool it runs, which its own timer stops."""
+    try:
+        done = subprocess.run([sys.executable, READER, *args], capture_output=True, text=True)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return done.stdout.strip() if done.returncode == 0 else None
+
+
+def observe(item, look=None):
+    """Each of item's sources as it is now: {source, ok, value}, a failed lookup ok false, through look (lookup's
+    arguments and result). No lock is held."""
+    look = look or lookup
+    found = []
+    for source in sources(item) or []:
+        if source == 'report':
+            try:
+                value, ok = report_digest(item['owner']['run']), True   # None: no report.md yet
+            except (OSError, SystemExit):   # unreadable, or a link run_file() refuses
+                value, ok = None, False
+        elif source == 'pr':
+            repo, number = item['content']['pr'].split('#')
+            try:
+                value = json.loads(look('gh', 'pr', 'view', number, '-R', repo, '--json', 'headRefOid') or '{}'
+                                   ).get('headRefOid')
+            except (ValueError, AttributeError):
+                value = None
+            ok = isinstance(value, str) and bool(SHA.fullmatch(value))
+        else:
+            value = look('git', '-C', item['content']['worktree'], 'rev-parse', '--verify', 'HEAD')
+            ok = bool(value and SHA.fullmatch(value))
+        found.append({'source': source, 'ok': ok, 'value': value if ok else None})
+    return found
+
+
+def observe_all(items):
+    """[(id, revision, observe(item))] for items, each distinct lookup run once, a few at a time."""
+    futures, guard = {}, threading.Lock()
+    with ThreadPoolExecutor(4) as lookups, ThreadPoolExecutor(4) as observers:
+        def look(*args):
+            with guard:
+                if args not in futures:
+                    futures[args] = lookups.submit(lookup, *args)
+            return futures[args].result()
+        return [(i['id'], i['revision'], seen) for i, seen in zip(items, observers.map(lambda i: observe(i, look),
+                                                                                          items))]
+
+
+def record_observed(observations):
+    """Under the ledger lock, and OBSERVING since each observation began: append what observe() saw of each item
+    (id, revision, seen), unless it moved past that revision meanwhile."""
+    found = decisions(records())
+    for iid, revision, seen in observations:
+        if iid in found and found[iid]['revision'] == revision:
+            for o in seen:
+                append({'type': 'observed', 'msg': iid, 'revision': revision, **o})
+
+
+def rebound(iid, revision, seen):
+    """(decision iid as it is now, why a verdict bound to revision of it is obsolete, or None), after recording seen,
+    what observing() saw of it, when there was any. Under the ledger lock and OBSERVING."""
+    if seen:
+        record_observed([seen])
+    linked = decisions(records()).get(iid)
+    return linked, obsolete(linked, revision)
+
+
+def obsolete(linked, revision):
+    """Why a verdict bound to revision of linked must not be made, sent or acted on now, or None: the decision
+    revised since, that revision resolved by its session, its evidence known stale, or a review whose evidence is not
+    confirmed current."""
+    if linked is None:
+        return 'its decision is gone'
+    if linked['revision'] != revision:
+        return f'its decision was revised to {linked["revision"]} since revision {revision} was decided'
+    if linked['resolved'] == revision:
+        return 'its session resolved that revision'
+    state = freshness(linked)
+    if state == 'stale':
+        return 'its evidence changed since it was reviewed'
+    if linked['content']['kind'] == 'review' and state != 'current':
+        return 'its review evidence could not be confirmed current'
+    return None
+
+
+@contextmanager
+def observing(iid):
+    """OBSERVING held while it yields (iid, revision, what observe() sees of it now), record_observed's entry for it,
+    looked up with the ledger lock free; None for no such item. For no iid, no lock and None."""
+    if not iid:
+        yield None
+        return
+    with locked(name=OBSERVING):
+        linked = decisions(records(lenient=True)).get(iid)
+        yield (iid, linked['revision'], observe(linked)) if linked else None
+
+
+def observing_relay(action):
+    """observing() the decision relay action is bound to, if any: taken before the ledger lock, so read without it."""
+    relayed = first(records(lenient=True), 'relay', action)
+    return observing(relayed and relayed.get('item'))
+
+
+def refresh(mine):
+    """Observe each item with sources to check that is open, or whose relayed verdict is not yet accepted, outside the
+    ledger lock, then record it for the revision it was taken of; all under OBSERVING."""
+    with locked(name=OBSERVING):
+        with locked():
+            require_captain(mine)
+            recs = records()
+            waiting = open_items(recs).keys() - {r['msg'] for r in recs if r['type'] == 'accepted'}
+            wanted = [i for i in decisions(recs).values() if sources(i) and (
+                i['state'] == 'open' or any(v['via'] == 'relay' and v['msg'] in waiting for v in i['verdicts']))]
+        seen = observe_all(wanted)
+        with locked():
+            require_captain(mine)
+            record_observed(seen)
+    return len(seen)
+
+
 def cancel(msg, mine):
     with locked():
         require_captain(mine)
         recs = records()
         if first(recs, 'watch', msg):
-            watch, _ = settle(recs)
+            watch = settle(recs)
             if not watch or watch['msg'] != msg:
                 die(f'no open watch {msg}', 3)
             recs.append(append({'type': 'cancel', 'msg': msg}))
             settle(recs)   # removes the marker
             return 0
-        if msg not in open_items(recs):
-            die(f'no open request, relay or watch {msg}', 3)
+        item = decisions(recs).get(msg)
+        if item:
+            if item['state'] != 'open':
+                die(f'decision {msg} is closed', 3)
+        elif msg not in open_items(recs):
+            die(f'no open request, relay, watch or decision {msg}', 3)
         append({'type': 'cancel', 'msg': msg})
     return 0
 
@@ -1329,6 +1848,16 @@ def context(target, recs):
             f'{" ".join(r["prs"]) or r["task"]}.')
 
 
+def settles(linked, binding):
+    """The ledger line naming the decision a relayed verdict settles, as it stood when bound; '' for no decision."""
+    if not linked:
+        return ''
+    content = linked['content']
+    return (f'\nLedger record, not the human\'s words: this message is the human\'s {binding["verdict"]} verdict on '
+            f'the {content["kind"]} decision "{linked["key"]}" ({binding["item"]}) at revision {binding["revision"]}, '
+            f'which asked: {one_line(content["ask"])}')
+
+
 def relay_prompt(action):
     """One line naming no role and holding no quote: the target acts only on what `accept` prints from the
     ledger."""
@@ -1336,15 +1865,20 @@ def relay_prompt(action):
             f'Run: python3 {INSTALLED} accept --action {action}')
 
 
-def relay(targets, entry, mine):
+def relay(targets, entry, mine, decided=None):
     """Relay the human's message this turn acts on (bound()) to each target, recorded before it is typed; targets as
     resolve() gave them. The transcript is read once for every target, so a message the human sends after that is not
     seen, and each session is pinned once, so one replaced in its terminal meanwhile is refused. A target busy or with
-    text in its input line gets the relay held, recorded for `retry` to send unchanged."""
+    text in its input line gets the relay held, recorded for `retry` to send unchanged. decided, (item, revision,
+    verdict), makes it the human's verdict on that decision: one target, the session that owns it, and the binding
+    written into the relay record itself."""
     addresses = list(targets)
-    with locked():
+    if decided and len(addresses) != 1:
+        die('a relay with --item goes to exactly one session, the one that owns the decision', 2)
+    with observing(decided and decided[0]) as seen, locked():
         captain = require_captain(mine)
         uid, words = bound(captain, entry)
+        binding, linked = bind(decided, seen, captain, uid) if decided else ({}, None)
         pinned = {address: find(address) for address in addresses}
         quote = relay_text(words, addresses)
         for address in addresses:
@@ -1358,7 +1892,12 @@ def relay(targets, entry, mine):
             if why:
                 print(f'{address}: refused, {why}', flush=True)
                 continue
-            action, fields = new_id('a', recs), {'entry': uid, 'quote': quote, 'context': context(target, recs)}
+            if linked and session_of(linked['owner']) != session_of(target):
+                print(f'{address}: refused, the decision {binding["item"]} is not this session\'s', flush=True)
+                continue
+            action = new_id('a', recs)
+            fields = {'entry': uid, 'quote': quote, 'context': context(target, recs) + settles(linked, binding),
+                      **binding}
             busy = refusal(target)
             if busy:
                 append(item('relay', action, captain, target, **fields))
@@ -1370,9 +1909,68 @@ def relay(targets, entry, mine):
     return 0
 
 
+def bind(decided, seen, captain, uid):
+    """(the fields binding a verdict to its decision, the decision as it is now), after recording what was just observed
+    of it. The same verdict from the same message again prints its receipt and exits, recording nothing; dies on
+    another verdict or revision from that message, a report's bare needs, a decision not open at that revision, and
+    evidence stale or unconfirmed."""
+    iid, revision, verdict = decided
+    recs = records()
+    linked = decisions(recs).get(iid)
+    if not linked:
+        die(f'no decision {iid}', 3)
+    for v in linked['verdicts']:
+        rec = first(recs, v['via'], v['msg'])
+        if session_of(rec['captain']) == session_of(captain) and rec['entry'] == uid:
+            if (rec['verdict'], rec['revision']) != (verdict, revision):
+                die(f'{iid} already has a {rec["verdict"]} verdict on revision {rec["revision"]} from this message', 2)
+            print(f'{iid}: {v["msg"]} recorded already')
+            raise SystemExit(0)
+    if linked['legacy']:
+        die(f'{iid} is a report\'s needs, not a decision: only `cancel` closes it', 2)
+    linked, why = rebound(iid, revision, seen)
+    if linked['state'] != 'open':
+        die(f'decision {iid} is closed', 2)
+    if why:
+        die(f'decision {iid}: {why}; nothing recorded', 2)
+    sha = {'reviewed_sha': linked['content']['reviewed_sha']} if 'reviewed_sha' in linked['content'] else {}
+    binding = {'item': iid, 'revision': revision, 'verdict': verdict, 'change_id': linked['change_id'], **sha}
+    return binding, linked
+
+
+def verdict(decided, entry, mine):
+    """Record the human's verdict on a decision without sending anything: bound to the human's message this turn,
+    never to words a caller supplies."""
+    with observing(decided[0]) as seen, locked():
+        captain = require_captain(mine)
+        if not live(mine):
+            die('this captain session no longer runs in its terminal', 2)
+        uid, words = bound(captain, entry)
+        binding, _ = bind(decided, seen, captain, uid)
+        msg = new_id('v', records())
+        append({'type': 'verdict', 'msg': msg, 'captain': captain, 'entry': uid, 'quote': words, **binding})
+    print(f'{binding["item"]}: {msg} recorded, {binding["verdict"]}')
+    return 0
+
+
+def metric(found):
+    """Distinct correction verdicts over the distinct changes with a correction or no-correction verdict, each change
+    the one its decision named when the verdict was made; decision verdicts and those bound to no change id are
+    counted apart, in neither."""
+    rated = [(v['change_id'], v['verdict']) for i in found.values() for v in i['verdicts']]
+    attributed = [(c, v) for c, v in rated if c]
+    corrections = sum(v == 'correction' for _, v in attributed)
+    changes = {c for c, v in attributed if v != 'decision'}
+    return {'correction_verdicts': corrections, 'changes_with_verdicts': len(changes),
+            'ratio': corrections / len(changes) if changes else None,
+            'decision_verdicts': sum(v == 'decision' for _, v in attributed),
+            'unattributed_verdicts': len(rated) - len(attributed)}
+
+
 def retry(action, mine):
-    """Send a held relay as it was recorded: the same words to the same session, never re-read or re-pinned."""
-    with locked():
+    """Send a held relay as it was recorded: the same words to the same session, never re-read or re-pinned; one
+    bound to a decision first observes its evidence again and closes undelivered once that binding is obsolete."""
+    with observing_relay(action) as seen, locked():
         captain = require_captain(mine)
         recs = records()
         relayed = first(recs, 'relay', action)
@@ -1387,9 +1985,12 @@ def retry(action, mine):
             line = record_delivery(action, address, 'uncertain', 'an earlier retry stopped while sending it')
         else:
             target = find(address)
+            stale = 'item' in relayed and rebound(relayed['item'], relayed['revision'], seen)[1]
             if not target or identity(target) != relayed['target']:
                 line = record_delivery(action, address, 'undelivered',
                                        'its session was replaced while the relay was held')
+            elif stale:
+                line = record_delivery(action, address, 'undelivered', stale)
             elif busy := refusal(target):
                 line = f'{address}: {action} still held, {busy}'
             else:
@@ -1412,8 +2013,9 @@ def outcome_call(action):
 
 def accept(action):
     """A target takes the relay sent to it, once, while the session that sent it is still the live captain; the
-    acceptance is durable before the message is printed, so a lost print never allows a second acceptance."""
-    with locked():
+    acceptance is durable before the message is printed, so a lost print never allows a second acceptance. One bound
+    to a decision is refused while that binding is obsolete, its evidence observed again first."""
+    with observing_relay(action) as seen, locked():
         mine = me()
         recs = records()
         relayed = addressed('relay', action, recs, mine)
@@ -1424,6 +2026,11 @@ def accept(action):
             die(f'relay {action} was accepted already; `show --action {action}` prints it again', 2)
         if action not in open_items(recs):
             die(f'relay {action} is closed', 2)
+        if 'item' in relayed:
+            _, why = rebound(relayed['item'], relayed['revision'], seen)
+            if why:
+                die(f'relay {action} decided {relayed["item"]}, but {why}: record it with `outcome --action '
+                    f'{action} --result needs-clarification` and act on nothing', 2)
         append({'type': 'accepted', 'msg': action})
     lead = f'{action} from the agent session in terminal {relayed["captain"]["address"]}, accepted'
     print(instruction_text(lead, relayed)
@@ -1475,11 +2082,9 @@ def anchors(ident):
     return [['terminal', ident['address'], ident['created']], ['session', ident['account'], ident['session']]]
 
 
-def owner_state(watch):
-    """'live', 'ended' or 'unknown' for the captain session that started watch, from /proc and its account's session
-    registry, no hc: its process gone or restarted, or its session changed (/clear), ends the watch; what cannot be
-    read decides nothing."""
-    c = watch['captain']
+def captain_state(c):
+    """'live', 'ended' or 'unknown' for the captain session c pins, from /proc and its account's session registry, no
+    hc: its process gone or restarted, or its session changed (/clear), has ended; what cannot be read is unknown."""
     try:
         start = hc.proc_start(c['pid'])
     except hc.Gone:
@@ -1509,25 +2114,21 @@ def marked():
     return True
 
 
-def settle(recs):
-    """(the open watch or None, its captain's state). Under the lock: ends, durably, every watch whose captain was
-    replaced or is confirmed gone, adding each end to recs once written, and only then, with none left open, removes
-    the marker; a watch whose captain cannot be told stays open and keeps it."""
+def open_watch(recs):
+    """The open watch, or None. A watch stands until cancelled, whatever becomes of the captain that started it; one a
+    captain's end closed before watches stood stays closed."""
     ended = watch_ends(recs)
-    owner = enrolled()
-    found = (None, None)
-    for w in [r for r in recs if r['type'] == 'watch' and r['msg'] not in ended]:
-        state = 'ended' if w['captain'] != owner else owner_state(w)
-        if state == 'ended':
-            recs.append(append({'type': 'watch-end', 'msg': w['msg'], 'why': 'its captain was replaced'
-                                if w['captain'] != owner else 'its captain session ended'}))
-        else:
-            found = (w, state)
-    if not found[0]:
+    return next((r for r in reversed(recs) if r['type'] == 'watch' and r['msg'] not in ended), None)
+
+
+def settle(recs):
+    """open_watch(recs). Under the lock: with none open, removes the marker."""
+    watch = open_watch(recs)
+    if not watch:
         with suppress(FileNotFoundError):
             os.unlink(path(MARKER))
             sync_dir()
-    return found
+    return watch
 
 
 def scopes(recs, watch):
@@ -1544,9 +2145,10 @@ def members(recs, watch):
 
 
 def covers(watch, recs, ident):
-    """Whether watch covers the session ident pins: under `all`, any but its captain's; else one matching an anchor of
-    the sessions named or of one that joined, so a restart or resume of a member is covered too."""
-    if ident['session'] == watch['captain']['session']:
+    """Whether watch covers the session ident pins: under `all`, any but a captain's, the one that started it or the
+    one enrolled; else one matching an anchor of the sessions named or of one that joined, so a restart or resume of a
+    member is covered too."""
+    if ident['session'] in (watch['captain']['session'], (enrolled() or {}).get('session')):
         return False
     named = scopes(recs, watch['msg'])
     if 'all' in named:
@@ -1561,36 +2163,34 @@ def join(session):
     it first; (None, why, False) otherwise. Under the lock, with no hc call."""
     mine = identity(session)
     recs = records()
-    watch, state = settle(recs)
+    watch = settle(recs)
     if not watch:
         return None, 'no watch is open', False
-    if state != 'live':
-        return None, "cannot confirm the watch's captain session still runs", False
+    if not covers(watch, recs, mine):   # a member that became the captain is no longer covered
+        return None, 'the open watch does not cover this session', False
     member = next((m for m in members(recs, watch['msg']) if m['target'] == mine), None)
     if member:
         return member, watch, False
-    if not covers(watch, recs, mine):
-        return None, 'the open watch does not cover this session', False
     return append({'type': 'joined', 'msg': new_id('j', recs), 'watch': watch['msg'], 'target': mine,
                    'handle': session['handle']}), watch, True
 
 
 def member_watch(member, recs, mine):
-    """Dies, so nothing is recorded, unless member is mine and its watch is open with its captain running."""
+    """Dies, so nothing is recorded, unless member is mine and its watch is open; no captain need run."""
     if member['target'] != mine:
         die(f'{member["msg"]} is another session\'s; run `brief --pending` for this one\'s', 2)
-    watch, state = settle(recs)
+    watch = settle(recs)
     if not watch or watch['msg'] != member['watch']:
         die(f'the watch {member["watch"]} ended: stop reporting', 2)
-    if state != 'live':
-        die("cannot confirm the watch's captain session still runs; report again at your next task end", 2)
+    if not covers(watch, recs, mine):
+        die(f'the watch {member["watch"]} no longer covers this session, now a captain: stop reporting', 2)
 
 
 def pending():
     """A session's own lookup: join the open watch covering it, if any, and print what to do."""
     with locked():
         member, watch, _ = join(my_session())
-    print(watch_brief(member['msg'], watch['captain']['address']) if member else f'none: {watch}')
+    print(watch_brief(member['msg']) if member else f'none: {watch}')
     return 0
 
 
@@ -1610,7 +2210,7 @@ def hook(payload):
         member, watch, new = join(session)
     if not member:
         return None
-    brief = watch_brief(member['msg'], watch['captain']['address'])
+    brief = watch_brief(member['msg'])
     if payload.get('hook_event_name') == 'SessionStart':
         return json.dumps({'hookSpecificOutput': {'hookEventName': 'SessionStart', 'additionalContext': brief}})
     if payload.get('hook_event_name') == 'Stop' and new:
@@ -1640,7 +2240,7 @@ def arm(targets, mine):
             if not scope:
                 die('nothing to watch; nothing recorded', 2)
         recs = records()
-        watch, _ = settle(recs)
+        watch = settle(recs)
         mark()
         if watch:
             append({'type': 'watch-extend', 'msg': watch['msg'], 'scope': scope})
@@ -1657,24 +2257,126 @@ def arm(targets, mine):
 
 
 def watches():
-    """The open watch and its members, each live, gone or unknown, without changing anything but what settle does."""
+    """The open watch and its members, each live, gone or unknown, without changing anything but what settle does; the
+    captain named is the one enrolled now, which may be none."""
     with locked():
         recs = records()
-        watch, state = settle(recs)
+        watch = settle(recs)
+        current = enrolled()
     if not watch:
         print('no watch is open')
         return 0
-    print(f'{watch["msg"]}\t{terminals(scopes(recs, watch["msg"]))}\tcaptain {watch["captain"]["address"]} {state}')
+    who = f'{current["address"]} {captain_state(current)}' if current else 'none enrolled'
+    print(f'{watch["msg"]}\t{terminals(scopes(recs, watch["msg"]))}\tcaptain {who}')
     reported = {r['msg']: i for i, r in enumerate(recs) if r['type'] == 'report'}
     for m in members(recs, watch['msg']):
-        try:
-            now = find(m['target']['address'])
-            seen = ('unknown' if now and unpinned(now) else 'live' if now and identity(now) == m['target']
-                    else 'gone')
-        except hc.Error:
-            seen = 'unknown'
         last = f'{m["msg"]}:{reported[m["msg"]]}' if m['msg'] in reported else 'no report'
-        print(f'  {m["msg"]}\t{m["handle"]}\t{seen}\t{last}')
+        print(f'  {m["msg"]}\t{m["handle"]}\t{member_state(m)}\t{last}')
+    return 0
+
+
+def member_state(member):
+    """live, gone or unknown: whether the session that joined still runs in its terminal, as far as hc can tell."""
+    try:
+        now = find(member['target']['address'])
+    except hc.Error:
+        return 'unknown'
+    return 'unknown' if now and unpinned(now) else 'live' if now and identity(now) == member['target'] else 'gone'
+
+
+def relay_states(recs):
+    """Each relay's status: pending until something happens to it, then what last did, an outcome by its result."""
+    states = {}
+    for r in recs:
+        if r['type'] == 'relay':
+            states[r['msg']] = 'pending'
+        elif r.get('msg') in states and r['type'] not in ITEMS:
+            states[r['msg']] = r['result'] if r['type'] == 'outcome' else 'cancelled' if r['type'] == 'cancel' \
+                else r['type']
+    return states
+
+
+def missing(item):
+    """What a decision lacks for the human to settle it from the queue alone."""
+    content = item['content']
+    gaps = [] if 'recommendation' in content else ['recommendation']
+    if content['kind'] == 'review' and 'run' not in item['owner']:
+        if 'reviewed_sha' not in content:
+            gaps.append('reviewed_sha')
+        elif not sources(item):
+            gaps.append('pr or worktree')
+    return gaps
+
+
+def queue_row(item, states):
+    content, owner = item['content'], item['owner']
+    pr = content.get('pr')
+    return {'id': item['id'], 'key': item['key'], 'change_id': item['change_id'], 'kind': content['kind'],
+            'owner': owner, 'handle': item['handle'], 'relay_target': owner.get('address'),
+            'repo': pr.split('#')[0] if pr else None, 'pr': pr, 'worktree': content.get('worktree'),
+            'reviewed_sha': content.get('reviewed_sha'),
+            'observations': [{'source': s, 'revision': item['revision'], 'ok': o['ok'], 'value': o['value'],
+                              'ledger_position': o['at']} for s, o in item['observations'].items()],
+            'ask': content['ask'], 'recommendation': content.get('recommendation'),
+            'grant_needed': content.get('grant_needed'), 'evidence_refs': content.get('evidence_refs', []),
+            'revision': item['revision'], 'state': item['state'], 'freshness': freshness(item),
+            'missing': missing(item), 'opened_at': item['opened'], 'updated_at': item['updated'],
+            'closure': item['closure'],
+            'verdicts': [{**v, 'status': states[v['msg']]} if v['via'] == 'relay' else v for v in item['verdicts']]}
+
+
+def coverage(recs, watch):
+    """Where decisions come from: the open watch's members as hc sees them, the chief runs ingested, and what no
+    feed reaches."""
+    runs = sorted({r['run'] for r in recs if r['type'] == 'evidence'})
+    members_ = [{'msg': m['msg'], 'handle': m['handle'], 'state': member_state(m)}
+                for m in (members(recs, watch['msg']) if watch else [])]
+    return {'watch': watch and watch['msg'], 'scope': watch and terminals(scopes(recs, watch['msg'])),
+            'members': members_, 'chief_runs': runs, 'not_covered': UNCOVERED}
+
+
+def queue(show_all, as_json, mine=None):
+    """The decisions waiting on the human, blocked first, then reviews, then ideas, each in the order it opened;
+    with show_all, closed ones too, else only those whose latest verdict is a relay that has not gone through. Reads
+    the ledger and hc only; given mine, the captain, observes evidence first, as `refresh` does. Sends nothing."""
+    if mine:
+        refresh(mine)
+    with locked():
+        recs = records()
+        watch = settle(recs)
+    states = relay_states(recs)
+    found = decisions(recs)
+    rows = [queue_row(i, states) for i in sorted(found.values(), key=lambda i: (KINDS.index(i['content']['kind']),
+                                                                               i['opened'], i['id']))]
+    if not show_all:
+        rows = [r for r in rows
+                if r['state'] == 'open' or r['verdicts'] and r['verdicts'][-1].get('status') in UNSETTLED]
+    covered = coverage(recs, watch)
+    if as_json:
+        print(json.dumps({'version': 1, 'ledger_position': len(recs), 'items': rows, 'coverage': covered,
+                          'metrics': metric(found)}, indent=2, ensure_ascii=False))
+        return 0
+    for kind in KINDS:
+        listed = [r for r in rows if r['kind'] == kind]
+        if listed:
+            print(kind)
+        for r in listed:
+            state = r['state'] if r['state'] == 'open' else f'closed {r["closure"]["why"]}'
+            gaps = f'\tmissing {", ".join(r["missing"])}' if r['missing'] else ''
+            print(f'  {r["id"]} r{r["revision"]}\t{state}\t{r["freshness"]}\t{r["handle"]}\t{one_line(r["ask"])}'
+                  f'\t-> {one_line(r["recommendation"] or "-")}{gaps}')
+            for v in r['verdicts']:
+                print(f'    {v["verdict"]} r{v["revision"]} {v["msg"]}' + (f' {v["status"]}' if 'status' in v else ''))
+    if not rows:
+        print('no decision waits on you')
+    live = [m['state'] for m in covered['members']]
+    watched = (f'watch {covered["watch"]} {covered["scope"]}: '
+               + ', '.join(f'{live.count(s)} {s}' for s in ('live', 'gone', 'unknown') if s in live)
+               if watch else 'no watch')
+    print(f'coverage: {watched}; chief runs: {" ".join(covered["chief_runs"]) or "none"}; {UNCOVERED}')
+    m = metric(found)
+    if m['changes_with_verdicts']:
+        print(f'corrections: {m["correction_verdicts"]} over {m["changes_with_verdicts"]} changes')
     return 0
 
 
@@ -1707,6 +2409,24 @@ def show_rows(rows, as_json):
     sys.stdout.flush()   # a failed write raises here, before --new stores its cursor
 
 
+def decide(parser, required=False):
+    """The options binding a relay or verdict to the decision it settles."""
+    parser.add_argument('--item', required=required, metavar='ID', help='the decision, as `queue` shows it')
+    parser.add_argument('--revision', required=required, type=int, metavar='N', help='its revision `queue` showed')
+    parser.add_argument('--verdict', required=required, choices=VERDICTS,
+                        help='correction or no-correction of its recommendation, or a decision with no quality call')
+
+
+def decided(a):
+    """(item, revision, verdict) from a relay's options, None without --item; dies on a partial set."""
+    given = (a.item, a.revision, a.verdict)
+    if all(v is None for v in given):
+        return None
+    if any(v is None for v in given):
+        die('--item, --revision and --verdict go together', 2)
+    return given
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest='cmd', required=True)
@@ -1720,19 +2440,29 @@ def main():
     c = sub.add_parser('collect', help='print each report as it lands')
     c.add_argument('msgs', nargs='*')
     c.add_argument('--wait', type=int, default=60000, metavar='MS')
-    wt = sub.add_parser('watch', help='have sessions report each task end until this captain session ends')
+    wt = sub.add_parser('watch', help='have sessions report each task end until the human cancels it')
     wt.add_argument('targets', nargs='+')
     sub.add_parser('watches', help='the open watch and its members')
     rp = sub.add_parser('reports', help="the latest report from each target, or the named requests' reports")
     rp.add_argument('msgs', nargs='*')
     rp.add_argument('--json', action='store_true')
     rp.add_argument('--new', action='store_true', help='every watch report since the last --new')
-    sub.add_parser('cancel', help='close a request, relay or watch no answer will close').add_argument('msg')
+    sub.add_parser('cancel', help='close a request, relay, watch or decision no answer will close').add_argument('msg')
+    qu = sub.add_parser('queue', help='the decisions waiting on the human, sending nothing')
+    qu.add_argument('--json', action='store_true')
+    qu.add_argument('--all', action='store_true', help='closed decisions too')
+    qu.add_argument('--refresh', action='store_true', help='observe each PR head, worktree and chief report first')
+    sub.add_parser('ingest', help="record a headless chief run's attention lines as decisions").add_argument(
+        '--chief', required=True, metavar='RUN', help=f'its directory name under {CHIEF_RUNS}')
     rl = sub.add_parser('relay', help="relay the human's message this turn acts on")
     rl.add_argument('addresses', nargs='*')
     rl.add_argument('--entry', metavar='ID', help="which of this turn's messages, when the human wrote several")
     rl.add_argument('--dry-run', action='store_true', help='show what would go where, sending nothing')
     rl.add_argument('--retry', metavar='ACTION', help='send a held relay unchanged')
+    decide(rl)
+    vd = sub.add_parser('verdict', help="record the human's verdict on a decision, sending nothing")
+    vd.add_argument('--entry', metavar='ID', help="which of this turn's messages, when the human wrote several")
+    decide(vd, required=True)
     ac = sub.add_parser('accept', help='take a relay and print its message (run by the target)')
     ac.add_argument('--action', required=True)
     sh = sub.add_parser('show', help='print a relay this session accepted again, recording nothing (run by the target)')
@@ -1779,6 +2509,8 @@ def main():
             return collect(a.msgs, a.wait)
         if a.cmd == 'watches':
             return watches()
+        if a.cmd == 'queue' and not a.refresh:
+            return queue(a.all, a.json)
         if a.cmd == 'reports':
             if a.new and a.msgs:
                 die('reports --new takes no ids', 2)
@@ -1793,18 +2525,27 @@ def main():
             for address in resolve(a.addresses):
                 print(ask(address, mine, a.force), flush=True)
             return 0
+        if a.cmd == 'ingest':
+            return ingest(a.chief, mine)
+        if a.cmd == 'queue':
+            return queue(a.all, a.json, mine)
         if a.cmd == 'cancel':
             return cancel(a.msg, mine)
         if a.cmd == 'watch':   # all stays all, sessions to come included: resolve() would list today's
             return arm(['all'] if a.targets == ['all'] else list(resolve(a.targets)), mine)
         if a.cmd == 'relay':
+            linked = decided(a)
             if a.retry:
-                if a.addresses or a.entry or a.dry_run:
+                if a.addresses or a.entry or a.dry_run or linked:
                     die('relay --retry takes only the held action', 2)
                 return retry(a.retry, mine)
             if not a.addresses:
                 die('relay names its targets', 2)
-            return (preview if a.dry_run else relay)(resolve(a.addresses), a.entry, mine)
+            if a.dry_run:
+                return preview(resolve(a.addresses), a.entry, mine)
+            return relay(resolve(a.addresses), a.entry, mine, linked)
+        if a.cmd == 'verdict':
+            return verdict(decided(a), a.entry, mine)
     except Corrupt as e:
         die(f'ledger corrupt, nothing decided until it is reconciled by hand: {e}', 4)
     except hc.Error as e:
