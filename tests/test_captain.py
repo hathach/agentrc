@@ -2143,6 +2143,130 @@ class WatchHookTest(WatchCase):
                 self.assertEqual((done.returncode, done.stdout), (0, ''))
 
 
+class DecisionTest(WatchCase):
+    """Decision items folded from reports: each session's own keys, revised, resolved, reopened or cancelled."""
+
+    def setUp(self):
+        super().setUp()
+        self.arm('all')
+        self.m = self.joined_as('t2')
+        self.events = 0
+
+    def payload(self, decisions, event, ops):
+        if event is None:
+            self.events += 1
+            event = f'e{self.events}'
+        return {**GOOD, 'event_id': event, 'decisions': list(decisions), **ops}
+
+    def send(self, *decisions, address='t2', member=None, event=None, **ops):
+        return self.report_as(address, member or self.m, self.payload(decisions, event, ops))
+
+    def refused(self, *decisions, event=None, payload=None, **ops):
+        """Why t2's report is rejected, nothing recorded."""
+        f = self.state / 'r.json'
+        f.write_text(json.dumps(payload or self.payload(decisions, event, ops)), encoding='utf-8')
+        self.me = 't2'
+        before = captain.records()
+        with self.assertRaises(SystemExit), mock.patch('builtins.print') as out:
+            captain.report(self.m, str(f))
+        self.assertEqual(captain.records(), before)
+        return '\n'.join(c.args[0] for c in out.call_args_list if c.kwargs.get('file') is sys.stderr)
+
+    def items(self):
+        return list(captain.decisions(captain.records()).values())
+
+    def item(self, key='merge'):
+        return next(i for i in self.items() if i['key'] == key)
+
+    def test_each_decision_is_an_item_of_its_session(self):
+        self.send(decision('merge'), decision('ci', kind='blocked'))
+        self.assertEqual([(i['key'], i['revision'], i['state']) for i in self.items()],
+                         [('merge', 1, 'open'), ('ci', 1, 'open')])
+        self.assertEqual(self.item()['owner']['session'], 's-t2')
+        self.assertEqual(self.item()['change_id'], 'o/r#12')
+
+    def test_the_same_key_in_two_sessions_is_two_items(self):
+        self.terminals['t3'] = pinned('t3')
+        self.send(decision('merge'))
+        self.send(decision('merge'), address='t3', member=self.joined_as('t3'))
+        self.assertEqual(len({i['id'] for i in self.items()}), 2)
+
+    def test_a_retried_event_is_recorded_once_and_a_reused_one_refuses(self):
+        self.send(decision('merge'), event='e')
+        self.send(decision('merge'), event='e')
+        self.assertEqual(self.count('report'), 1)
+        self.assertIn('different report', self.refused(decision('merge', ask='other'), event='e'))
+
+    def test_an_event_sent_through_a_request_too_applies_once(self):
+        self.send(decision('merge'), reopen=[], event='e')
+        msg = self.msg_of(self.ask())
+        self.send(decision('merge'), reopen=[], event='e', member=msg)
+        self.assertEqual(self.count('report'), 2)
+        self.assertEqual(self.item()['revision'], 1)
+
+    def test_a_changed_decision_is_a_revision_an_unchanged_one_is_not(self):
+        self.send(decision('merge'))
+        self.send(decision('merge'))
+        self.assertEqual(self.item()['revision'], 1)
+        self.send(decision('merge', reviewed_sha='abc1234'))
+        self.assertEqual(self.item()['revision'], 2)
+        self.send(decision('merge', reviewed_sha='abc1234'), refresh=['merge'])
+        self.assertEqual(self.item()['revision'], 3)
+
+    def test_resolving_an_older_revision_leaves_the_newer_open(self):
+        self.send(decision('merge'))
+        self.send(decision('merge', ask='merge now?'))
+        self.send(resolved=[{'key': 'merge', 'revision': 1}])
+        self.assertEqual((self.item()['revision'], self.item()['state']), (2, 'open'))
+        self.send(resolved=[{'key': 'merge', 'revision': 2}])
+        self.assertEqual(self.item()['state'], 'closed')
+
+    def test_a_closed_decision_listed_again_stays_closed_until_reopened(self):
+        self.send(decision('merge'))
+        captain.cancel(self.item()['id'], self.ident)
+        self.send(decision('merge'))
+        self.send(decision('merge', reviewed_sha='abc1234'))   # a revision, still closed
+        self.assertEqual((self.item()['revision'], self.item()['state']), (2, 'closed'))
+        self.send(decision('merge', reviewed_sha='abc1234'), reopen=['merge'], event='r')
+        self.assertEqual((self.item()['revision'], self.item()['state']), (3, 'open'))
+        self.send(decision('merge', reviewed_sha='abc1234'), reopen=['merge'], event='r')   # a retry: nothing new
+        self.assertEqual(self.item()['revision'], 3)
+
+    def test_operations_need_an_event_and_must_not_contradict(self):
+        self.send(decision('merge'))
+        self.assertIn('"event_id" is required', self.refused(payload={**GOOD, 'reopen': ['merge']}))
+        self.assertIn('reopened and refreshed, or resolved and changed',
+                      self.refused(reopen=['merge'], resolved=[{'key': 'merge', 'revision': 1}]))
+        self.assertIn('no decision ci', self.refused(refresh=['ci']))
+
+    def test_a_malformed_decision_names_its_field(self):
+        for bad, why in ((decision('Merge'), '"key"'), (decision('m', kind='todo'), '"kind"'),
+                         (decision('m', pr='12'), '"pr"'), ({**decision('m'), 'owner': 'x'}, 'exactly')):
+            with self.subTest(why):
+                self.assertIn(why, self.refused(bad))
+
+    def test_a_legacy_need_is_a_blocked_item_once(self):
+        for _ in range(2):
+            self.report_as('t2', self.m, {**GOOD, 'needs': 'approve the merge'})
+        [item] = self.items()
+        self.assertEqual((item['legacy'], item['content'], item['key']),
+                         (True, {'kind': 'blocked', 'ask': 'approve the merge'}, None))
+        self.report_as('t2', self.m, GOOD)
+        self.assertEqual(self.items()[0]['state'], 'open', 'an empty need closes nothing')
+
+    def test_cancel_closes_an_open_decision_once(self):
+        self.send(decision('merge'))
+        iid = self.item()['id']
+        captain.cancel(iid, self.ident)
+        self.assertEqual(self.item()['closure']['why'], 'cancelled')
+        with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
+            captain.cancel(iid, self.ident)
+
+
+def decision(key, kind='review', **extra):
+    return {'key': key, 'kind': kind, 'ask': f'{key}?', 'recommendation': 'yes', 'pr': 'o/r#12', **extra}
+
+
 class CaptainStateTest(unittest.TestCase):
     CAPTAIN = {**captain.identity(CAPTAIN), 'generation': 'g'}
 

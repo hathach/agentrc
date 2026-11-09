@@ -41,6 +41,7 @@ captain ran it.
 
 import argparse
 import glob
+import hashlib
 import json
 import os
 import re
@@ -80,7 +81,18 @@ INSTALLED = (os.environ.get('AGENTRC_CAPTAIN_SCRIPT')
 IDENTITY = ('address', 'created', 'kind', 'cwd', 'session', 'pid', 'started', 'account')
 ASKABLE = ('idle', 'done')
 REPORT = {'task': str, 'prs': list, 'state': str, 'evidence': str, 'chief': str, 'needs': str, 'next': str}
-OPTIONAL = {'issues': list}   # a report without it names no issue
+# a report without issues names no issue; the rest are decision operations, needing an event_id
+OPTIONAL = {'issues': list, 'event_id': str, 'decisions': list, 'reopen': list, 'refresh': list, 'resolved': list}
+OPS = ('decisions', 'reopen', 'refresh', 'resolved')
+KINDS = ('blocked', 'review', 'idea')
+DECISION = {'key': str, 'kind': str, 'ask': str, 'recommendation': str}
+DECISION_OPTIONAL = {'change_id': str, 'pr': str, 'worktree': str, 'reviewed_sha': str, 'grant_needed': str,
+                     'evidence_refs': list}
+DECISIONS_MAX = 20
+KEY = re.compile(r'[a-z0-9][a-z0-9-]{0,39}')
+EVENT_ID = re.compile(r'[A-Za-z0-9._:-]{1,64}')
+SHA = re.compile(r'[0-9a-f]{7,40}')
+PR_REF = re.compile(r'[\w.-]+/[\w.-]+#\d+')
 STATES = ('ready', 'in-progress', 'blocked', 'needs-human', 'done', 'idle')
 # withdraw and withdraw-requested have no writer since `withdraw` was removed: kept so an older ledger still reads
 RECORDS = ('request', 'report', 'cancel', 'delivered', 'undelivered', 'uncertain',
@@ -503,7 +515,13 @@ def one_call(label, command, placeholder, done=None):
 KEYS = ('Send one JSON object with exactly these keys: "task" (one line), "prs" (list of "owner/repo#N"), "issues" '
         '(list of "owner/repo#N" issues the task is for), "state" (one of ' + ', '.join(STATES) + '), "evidence" '
         '(last verification you ran, or ""), "chief" (headless chief or workflow running for you, or ""), "needs" '
-        '(the decision or action the human must take, or ""), "next" (your next step).')
+        '(the decision or action the human must take, or ""), "next" (your next step). For each decision the human '
+        'must make, also send "event_id" (new for each report, reused only to retry the same one) and "decisions": '
+        'a list of {"key" (your stable id for it, a-z 0-9 -), "kind" (blocked, review or idea), "ask", '
+        '"recommendation", and optionally "change_id", "pr" ("owner/repo#N"), "worktree", "reviewed_sha", '
+        '"grant_needed", "evidence_refs" (list)}. A decision stays open until you send "resolved": [{"key", '
+        '"revision"}] or the human decides it; "reopen": [key] reopens one decided, "refresh": [key] says you '
+        'reviewed its evidence again.')
 
 
 def status_brief(msg, address):
@@ -703,10 +721,67 @@ def validate(report):
         if key in report and not isinstance(report[key], kind):
             return f'"{key}" must be a {kind.__name__}'
     for key in ('prs', 'issues'):
-        if not all(isinstance(p, str) and re.fullmatch(r'[\w.-]+/[\w.-]+#\d+', p) for p in report.get(key, [])):
+        if not all(isinstance(p, str) and PR_REF.fullmatch(p) for p in report.get(key, [])):
             return f'"{key}" must hold "owner/repo#N" strings'
     if report['state'] not in STATES:
         return f'"state" must be one of {", ".join(STATES)}'
+    return validate_ops(report)
+
+
+def validate_ops(report):
+    """Why the decision operations of report are malformed or contradict each other, or None."""
+    if 'event_id' in report and not EVENT_ID.fullmatch(report['event_id']):
+        return '"event_id" must be 1-64 of A-Z a-z 0-9 . _ : -'
+    if any(report.get(op) for op in OPS) and 'event_id' not in report:
+        return '"event_id" is required with decisions, reopen, refresh or resolved'
+    decided = report.get('decisions', [])
+    if len(decided) > DECISIONS_MAX:
+        return f'"decisions" holds at most {DECISIONS_MAX}'
+    for d in decided:
+        why = validate_decision(d)
+        if why:
+            return f'a decision {why}'
+    keys = [d['key'] for d in decided]
+    for op in ('reopen', 'refresh'):
+        named = report.get(op, [])
+        if not all(isinstance(k, str) and KEY.fullmatch(k) for k in named) or len(set(named)) != len(named):
+            return f'"{op}" must hold distinct decision keys'
+    resolved = report.get('resolved', [])
+    if not all(isinstance(r, dict) and set(r) == {'key', 'revision'} and isinstance(r['key'], str)
+               and KEY.fullmatch(r['key']) and type(r['revision']) is int and r['revision'] > 0 for r in resolved):
+        return '"resolved" must hold {"key", "revision"} objects'
+    closing = [r['key'] for r in resolved]
+    for name, group in (('decisions', keys), ('resolved', closing)):
+        if len(set(group)) != len(group):
+            return f'"{name}" names a key twice'
+    reopen, refresh = set(report.get('reopen', [])), set(report.get('refresh', []))
+    if reopen & refresh or set(closing) & (reopen | refresh | set(keys)):
+        return 'one key is reopened and refreshed, or resolved and changed, in the same report'
+    return None
+
+
+def validate_decision(d):
+    if not isinstance(d, dict) or not set(DECISION) <= set(d) <= set(DECISION) | set(DECISION_OPTIONAL):
+        return (f'must have exactly {", ".join(DECISION)}, and optionally {", ".join(DECISION_OPTIONAL)}')
+    for key, kind in {**DECISION, **DECISION_OPTIONAL}.items():
+        if key in d and not isinstance(d[key], kind):
+            return f'"{key}" must be a {kind.__name__}'
+    if not KEY.fullmatch(d['key']):
+        return '"key" must be 1-40 of a-z 0-9 -, starting with a letter or digit'
+    if d['kind'] not in KINDS:
+        return f'"kind" must be one of {", ".join(KINDS)}'
+    if not d['ask'].strip():
+        return '"ask" must say what the human decides'
+    if 'pr' in d and not PR_REF.fullmatch(d['pr']):
+        return '"pr" must be "owner/repo#N"'
+    if 'reviewed_sha' in d and not SHA.fullmatch(d['reviewed_sha']):
+        return '"reviewed_sha" must be a lowercase hex SHA'
+    if 'worktree' in d and not os.path.isabs(d['worktree']):
+        return '"worktree" must be an absolute path'
+    if 'change_id' in d and not d['change_id'].strip():
+        return '"change_id" must not be empty'
+    if not all(text(e) for e in d.get('evidence_refs', [])):
+        return '"evidence_refs" must hold non-empty strings'
     return None
 
 
@@ -767,8 +842,42 @@ def brief(msg):
     return 0
 
 
+def event_owner(recs):
+    """{msg: the request or member record whose session a report on msg comes from}."""
+    return {r['msg']: r for r in recs if r['type'] in ('request', 'joined')}
+
+
+def earlier_event(recs, source, payload):
+    """The index of the report this session sent before under payload's event_id, or None; dies when that report
+    differs, so a reused id never applies other operations."""
+    event = payload.get('event_id')
+    if not event:
+        return None
+    sources = event_owner(recs)
+    me = (source['target']['account'], source['target']['session'])
+    for i, r in enumerate(recs):
+        owner = sources.get(r['msg']) if r['type'] == 'report' else None
+        if owner and r['report'].get('event_id') == event \
+                and (owner['target']['account'], owner['target']['session']) == me:
+            if r['report'] != payload:
+                die(f'event_id {event} was sent before with a different report', 2)
+            return i
+    return None
+
+
+def unknown_keys(recs, source, payload):
+    """The keys payload reopens, refreshes or resolves that are no decision of this session's, nor in payload."""
+    owner = source['target']
+    known = {item['key'] for item in decisions(recs).values() if item['owner'] is not None
+             and (item['owner']['account'], item['owner']['session']) == (owner['account'], owner['session'])}
+    known |= {d['key'] for d in payload.get('decisions', [])}
+    named = [*payload.get('reopen', []), *payload.get('refresh', []), *(r['key'] for r in payload.get('resolved', []))]
+    return sorted(set(named) - known)
+
+
 def report(msg, file):
-    """A target answers msg: only the session it was sent to, as pinned then, only while it is open, only once."""
+    """A target answers msg: only the session it was sent to, as pinned then, only while it is open, only once. A
+    report repeating an event_id this session sent is the same report again, recorded once."""
     try:
         payload = json.loads(read_text(file))
     except ValueError as e:
@@ -780,12 +889,21 @@ def report(msg, file):
         mine = me()   # under the lock: a restart while waiting for it must not pass
         recs = records()
         member = first(recs, 'joined', msg)
+        source = member or first(recs, 'request', msg)
+        unknown = unknown_keys(recs, source, payload) if source else []
+        if unknown:
+            die(f'report rejected: no decision {", ".join(unknown)} of this session to reopen, refresh or resolve', 4)
         if member:   # a watch's member reports each task end: every report is kept, none closes it
             member_watch(member, recs, mine)
+            again = earlier_event(recs, member, payload)
+            if again is not None:
+                print(f'recorded {msg}:{again}')
+                return 0
             append({'type': 'report', 'msg': msg, 'report': payload})
             print(f'recorded {msg}:{len(recs)}')   # every report is kept, so a blind retry would duplicate one
             return 0
         requested(msg, recs, mine)
+        earlier_event(recs, source, payload)   # dies on a reused event_id; an identical one is deduplicated later
         earlier = first(recs, 'report', msg)
         if earlier:
             if earlier['report'] == payload:
@@ -1043,6 +1161,81 @@ def unanswered(msg, requests, recs):
     return {'handle': requests[msg]['handle'], 'msg': msg, 'missing': EVENTS[end['type']]}
 
 
+def item_id(prefix, *parts):
+    return f'{prefix}-' + hashlib.sha256('\0'.join(parts).encode()).hexdigest()[:16]
+
+
+def new_item(iid, i, source, key, content, legacy=False):
+    return {'id': iid, 'key': key, 'owner': source['target'], 'handle': source['handle'], 'content': content,
+            'change_id': content.get('change_id') or content.get('pr'), 'revision': 1, 'state': 'open',
+            'closure': None, 'opened': i, 'updated': i, 'legacy': legacy}
+
+
+def revise(item, i, content=None, reopen=False):
+    item['revision'] += 1
+    item['updated'] = i
+    if content is not None:
+        item['content'] = content
+    if reopen:
+        item['state'], item['closure'] = 'open', None
+
+
+def close(item, i, why):
+    if item['state'] == 'open':
+        item['state'], item['closure'] = 'closed', {'why': why, 'at': i, 'revision': item['revision']}
+
+
+def apply_report(found, i, source, payload):
+    """Fold one report's decision operations into found. The owner is the reporting session's account and session,
+    never a payload field; its handle and pinned target follow the latest report."""
+    owner = source['target']
+    ids = {}
+    for d in payload.get('decisions', []):
+        iid = ids[d['key']] = item_id('d', owner['account'], owner['session'], d['key'])
+        item = found.get(iid)
+        if not item:
+            found[iid] = new_item(iid, i, source, d['key'], d)
+            continue
+        item['owner'], item['handle'] = owner, source['handle']
+        reopen = d['key'] in payload.get('reopen', [])
+        if d != item['content'] or reopen or d['key'] in payload.get('refresh', []):
+            revise(item, i, d, reopen)
+    for op in ('reopen', 'refresh'):
+        for key in payload.get(op, []):
+            item = found.get(item_id('d', owner['account'], owner['session'], key))
+            if item and key not in ids:
+                revise(item, i, reopen=op == 'reopen')
+    for r in payload.get('resolved', []):
+        item = found.get(item_id('d', owner['account'], owner['session'], r['key']))
+        if item and item['revision'] == r['revision']:
+            close(item, i, 'resolved')
+    if payload['needs'] and 'decisions' not in payload:
+        iid = item_id('n', owner['account'], owner['session'], payload['needs'])
+        if iid not in found:
+            found[iid] = new_item(iid, i, source, None, {'kind': 'blocked', 'ask': payload['needs']}, legacy=True)
+
+
+def decisions(recs):
+    """Every decision item the ledger holds, by id in opening order: what sessions reported, as revised, resolved,
+    reopened or cancelled since. An event_id a session sent before is not applied again, whichever request or
+    watch carried it."""
+    sources = event_owner(recs)
+    found, seen = {}, set()
+    for i, r in enumerate(recs):
+        if r['type'] == 'report' and r['msg'] in sources:
+            source, payload = sources[r['msg']], r['report']
+            event = payload.get('event_id')
+            if event:
+                ident = (source['target']['account'], source['target']['session'], event)
+                if ident in seen:
+                    continue
+                seen.add(ident)
+            apply_report(found, i, source, payload)
+        elif r['type'] == 'cancel' and r['msg'] in found:
+            close(found[r['msg']], i, 'cancelled')
+    return found
+
+
 def cancel(msg, mine):
     with locked():
         require_captain(mine)
@@ -1054,8 +1247,12 @@ def cancel(msg, mine):
             recs.append(append({'type': 'cancel', 'msg': msg}))
             settle(recs)   # removes the marker
             return 0
-        if msg not in open_items(recs):
-            die(f'no open request, relay or watch {msg}', 3)
+        item = decisions(recs).get(msg)
+        if item:
+            if item['state'] != 'open':
+                die(f'decision {msg} is closed', 3)
+        elif msg not in open_items(recs):
+            die(f'no open request, relay, watch or decision {msg}', 3)
         append({'type': 'cancel', 'msg': msg})
     return 0
 
