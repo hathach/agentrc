@@ -23,6 +23,8 @@ does not recognize is reported, never assumed safe.
   captain.py verdict --item <id> --revision <N> --verdict <verdict> [--entry <id>]
                                                  record it as that verdict, sending nothing
   captain.py relay --retry <action>              send a held relay once its session is idle or done, its input empty
+  captain.py start <checkout> [main|ada] [--name <n>] [--space <id|name>] [--tab <id>] [--entry <id>]
+                                                 start a Claude Code session there on the human's message
   captain.py brief --for <msg> | --pending       a target reads what a status request asks, or joins a watch
   captain.py report --for <msg> --file <json|->  a target answers a status request
   captain.py accept --action <action>            a target takes a relay and reads its words
@@ -51,6 +53,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -68,6 +71,7 @@ except ImportError:   # Windows: /proc is Linux-only, so the captain is too
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))   # the agentrc checkout this runs from
 import hc  # noqa: E402
+import captain_read  # noqa: E402
 
 CONFIG_DIRS = {'main': None, 'ada': os.path.expanduser('~/.claude-ada')}   # main is CLAUDE_CONFIG_DIR unset
 DEFAULT_CONFIG = '~/.claude'   # where main, CLAUDE_CONFIG_DIR unset, keeps its transcripts
@@ -99,6 +103,14 @@ VERDICTS = ('correction', 'no-correction', 'decision')
 UNSETTLED = ('pending', 'held', 'sending', 'undelivered', 'uncertain', 'refused', 'failed', 'rejected',
              'needs-clarification')   # a relayed verdict in one of these keeps its closed decision in the queue
 UNCOVERED = 'Codex terminals and remote sessions are not covered'
+# what `start` runs for each account: main with CLAUDE_CONFIG_DIR unset in the program itself, since hc gives it the
+# core's environment; ada through its wrapper, whose argv[0] Herdr's my-agents mod draws the account icon from
+LAUNCHERS = {'main': ('env', 'claude'), 'ada': ('claude-ada',)}
+TERMINAL_NAME = re.compile(r'[a-z0-9_-]{1,32}')   # hc's rule for a terminal name
+START_WAIT_S = 20
+# hc run refusals that start nothing; any other failure may have started a terminal
+NOT_STARTED = ('name_taken', 'invalid_params', 'spawn_failed', 'not_found', 'invalid_template')
+VERIFIED = ('verified', 'pending', 'failed')
 INSTALLED = (os.environ.get('AGENTRC_CAPTAIN_SCRIPT')
              or os.path.expanduser('~/.claude/skills/captain/scripts/captain.py'))
 IDENTITY = ('address', 'created', 'kind', 'cwd', 'session', 'pid', 'started', 'account')
@@ -120,7 +132,8 @@ STATES = ('ready', 'in-progress', 'blocked', 'needs-human', 'done', 'idle')
 # withdraw and withdraw-requested have no writer since `withdraw` was removed: kept so an older ledger still reads
 RECORDS = ('request', 'report', 'cancel', 'delivered', 'undelivered', 'uncertain',
            'relay', 'held', 'sending', 'accepted', 'outcome', 'withdraw', 'withdraw-requested', 'refused',
-           'watch', 'watch-extend', 'joined', 'watch-end', 'evidence', 'observed', 'verdict')
+           'watch', 'watch-extend', 'joined', 'watch-end', 'evidence', 'observed', 'verdict',
+           'start', 'started', 'start-failed', 'start-uncertain')
 ITEMS = ('request', 'relay')
 WATCHED = ('watch', 'joined')
 FOLLOWED = ITEMS + WATCHED   # what collect can follow
@@ -342,6 +355,15 @@ def well_formed(rec):
     if rec['type'] == 'joined':
         return text(rec.get('watch')) and isinstance(rec.get('handle'), str) and pinned_identity(rec.get('target'))
     if rec['type'] in ('watch-end', 'held'):
+        return isinstance(rec.get('why'), str)
+    if rec['type'] == 'start':
+        return (all(text(rec.get(k)) for k in ('entry', 'quote', 'dir', 'name', 'space'))
+                and os.path.isabs(rec['dir']) and rec.get('account') in LAUNCHERS
+                and (rec.get('tab') is None or text(rec.get('tab'))) and pinned_identity(rec.get('captain')))
+    if rec['type'] == 'started':
+        return (text(rec.get('address')) and rec.get('verification') in VERIFIED and isinstance(rec.get('why'), str)
+                and (rec.get('session') is None or pinned_identity(rec.get('session'))))
+    if rec['type'] in ('start-failed', 'start-uncertain'):
         return isinstance(rec.get('why'), str)
     if rec['type'] == 'observed':
         return (type(rec.get('revision')) is int and rec.get('source') in SOURCES and type(rec.get('ok')) is bool
@@ -1970,6 +1992,165 @@ def verdict(decided, entry, mine):
     return 0
 
 
+def checkout_root(arg):
+    """The canonical top level of the git checkout or worktree arg names: an absolute or ~/ path, since nothing
+    anchors a relative one, to an existing directory that is its work tree's top level. Dies otherwise."""
+    if not (arg.startswith('/') or arg.startswith('~/')):
+        die(f'{arg}: name the checkout by an absolute or ~/ path; nothing started', 2)
+    try:
+        root = os.path.realpath(os.path.expanduser(arg), strict=True)
+    except OSError:
+        die(f'{arg}: no such directory; nothing started', 2)
+    if not os.path.isdir(root):
+        die(f'{arg}: not a directory; nothing started', 2)
+    found = subprocess.run(['git', *captain_read.HARDEN, '-C', root, 'rev-parse', '--path-format=absolute',
+                            '--show-toplevel'], capture_output=True, stdin=subprocess.DEVNULL,
+                           env=captain_read.environment('git'), timeout=captain_read.TIMEOUT)
+    top = os.fsdecode(found.stdout).strip()
+    if found.returncode or not top:
+        die(f'{arg}: not a git checkout with a work tree; nothing started', 2)
+    if os.path.realpath(top) != root:
+        die(f'{arg}: inside the checkout {top}, not its top level; nothing started', 2)
+    return root
+
+
+def launcher(account):
+    """The argv that starts Claude Code under account, each program as PATH finds it now; dies when one is missing,
+    rather than run another."""
+    if account not in LAUNCHERS:
+        die(f'{account}: not an account ({", ".join(LAUNCHERS)}); nothing started', 2)
+    found = {p: shutil.which(p) for p in LAUNCHERS[account]}
+    missing = [p for p, f in found.items() if not f]
+    if missing:
+        die(f'{missing[0]} is not on PATH, so {account} cannot be started; nothing started', 2)
+    return [found['env'], '-u', 'CLAUDE_CONFIG_DIR', found['claude']] if account == 'main' else [found['claude-ada']]
+
+
+def herdr_spaces():
+    """The spaces `herdr-app ls` shows, each with its tabs; dies when the app does not answer."""
+    exe = shutil.which('herdr-app')
+    if not exe:
+        die('herdr-app is not on PATH, so no space can be named for the session; nothing started', 2)
+    try:
+        out = subprocess.run([exe, 'ls'], capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                             timeout=HC_TIMEOUT_S)
+        spaces = json.loads(out.stdout).get('spaces') if out.returncode == 0 else None
+    except (subprocess.TimeoutExpired, OSError, ValueError, AttributeError):
+        spaces = None
+    if not isinstance(spaces, list) or not all(isinstance(sp, dict) for sp in spaces):
+        die('herdr-app ls gave no list of spaces (is the Herdr window open?); nothing started', 2)
+    return spaces
+
+
+def placement(root, space, tab, spaces):
+    """(space id, tab id or None) for the session: the space named by exact id, else by its one exact name, else the
+    one local space whose folder is root; a tab must be one of that space's. No tab makes Herdr open a new one."""
+    def named(sp):
+        return f'{sp.get("name")!r} ({sp.get("id")})'
+    if space:
+        hits = [sp for sp in spaces if sp.get('id') == space] or [sp for sp in spaces if sp.get('name') == space]
+        what = f'space {space}'
+    else:
+        hits = [sp for sp in spaces if not sp.get('machine') and isinstance(sp.get('folder'), str)
+                and os.path.realpath(sp['folder']) == root]
+        what = f'a space whose folder is {root}'
+    if len(hits) != 1:
+        listed = '; '.join(map(named, hits)) or 'none'
+        die(f'{what} matches {listed}: name it with --space <id>; nothing started', 2)
+    chosen = hits[0]
+    if chosen.get('machine'):
+        die(f'space {named(chosen)} is on {chosen["machine"]}: only local sessions start; nothing started', 2)
+    if not text(chosen.get('id')):
+        die(f'space {named(chosen)} has no id; nothing started', 2)
+    if tab and tab not in [t.get('id') for t in chosen.get('tabs') or [] if isinstance(t, dict)]:
+        die(f'tab {tab} is not in space {named(chosen)}; nothing started', 2)
+    return chosen['id'], tab
+
+
+def terminal_name(root, account, name):
+    """The hc name for the session, <checkout>-<account> by default, never reshaped to fit; dies when it breaks hc's
+    rule or a live terminal holds it."""
+    name = name or f'{os.path.basename(root)}-{account}'
+    if not TERMINAL_NAME.fullmatch(name):
+        die(f'{name}: hc names are 1-32 of a-z 0-9 - _; give one with --name; nothing started', 2)
+    holder = get(name)
+    if holder and holder.get('state') == 'live':
+        die(f'{name}: the live terminal {holder.get("address")} has that name; give another with --name; '
+            'nothing started', 2)
+    return name
+
+
+def verify(address, root, account):
+    """(verification, why, identity or None) of the session started at address, after one bounded hc wait for it to
+    come up: verified once pinned under account in root, pending while it is not yet a Claude Code session or not
+    yet pinned, failed when it is gone, finished or another account's or directory's."""
+    hc.run('wait', '--json', '--timeout', str(START_WAIT_S), '--', address, timeout=START_WAIT_S + HC_TIMEOUT_S)
+    try:
+        t = get(address)
+    except hc.Error as e:
+        return 'pending', f'hc get failed: {e}', None
+    if t is None:
+        return 'failed', 'its terminal is gone', None
+    if t.get('state') != 'live':
+        return 'failed', f'its terminal is {t.get("state")}', None
+    session = described(t)
+    if not session:
+        return 'pending', 'not yet a Claude Code session', None
+    pin(session)
+    if session['account'] and session['account'] != account:
+        return 'failed', f'it runs under {session["account"]}, not {account}', None
+    if session['cwd'] and session['cwd'] != root:
+        return 'failed', f'it runs in {session["cwd"]}, not {root}', None
+    missing = unpinned(session)
+    if missing:
+        return 'pending', f'unpinned: {", ".join(missing)}', None
+    return 'verified', '', identity(session)
+
+
+def start(arg, account, name, space, tab, entry, mine):
+    """Start an interactive Claude Code session in the checkout arg names, in a new hc terminal shown in a Herdr
+    space, on the human's message this turn: each check refuses before anything runs, the intent is recorded before
+    hc runs, and one message starts a checkout under an account once. Captain never closes what it started."""
+    root = checkout_root(arg)
+    argv = launcher(account)
+    space_id, tab_id = placement(root, space, tab, herdr_spaces())
+    name = terminal_name(root, account, name)
+    with locked():
+        captain = require_captain(mine)
+        if not live(mine):
+            die('this captain session no longer runs in its terminal', 2)
+        uid, words = bound(captain, entry)
+        recs = records()
+        prior = next((r for r in recs if r['type'] == 'start' and identity(r['captain']) == identity(captain)
+                      and (r['entry'], r['dir'], r['account']) == (uid, root, account)), None)
+        if prior:
+            die(f'{prior["msg"]}: this message already started {root} under {account}; nothing started again', 2)
+        msg = new_id('s', recs)
+        append({'type': 'start', 'msg': msg, 'captain': captain, 'entry': uid, 'quote': words, 'dir': root,
+                'account': account, 'name': name, 'space': space_id, 'tab': tab_id})
+    labels = ['--label', f'herdr.space={space_id}', *(['--label', f'herdr.tab={tab_id}'] if tab_id else [])]
+    rc, body, kind, why = hc.run('run', '--json', '--bg', '--keep', '--no-parent', '--name', name, '--cwd', root,
+                                 *labels, '--', *argv, timeout=HC_TIMEOUT_S)
+    address = body.get('address') if rc == 0 and isinstance(body, dict) else None
+    if not hc.is_local(address):
+        failed = rc not in (0, None) and kind in NOT_STARTED
+        with locked():
+            append({'type': 'start-failed' if failed else 'start-uncertain', 'msg': msg, 'why': why})
+        die(f'{msg}: hc refused, nothing started: {kind}: {why}' if failed else
+            f'{msg}: hc gave no terminal address, so a session may have started: {why}; '
+            f'check `list` before starting again', 1 if failed else 3)
+    verification, why, session = verify(address, root, account)
+    with locked():
+        append({'type': 'started', 'msg': msg, 'address': address, 'created': body.get('created_ms'),
+                'verification': verification, 'why': why, 'session': session})
+    print(f'{msg}: started {name} ({address}) in {root} under {account}, space {space_id}'
+          f'{f", tab {tab_id}" if tab_id else ", a new tab"}')
+    print({'verified': f'verified: {session and session["session"]}, pid {session and session["pid"]}',
+           'pending': f'verification pending ({why}): `list` shows it once it is up',
+           'failed': f'VERIFICATION FAILED: {why}; the human closes {address}'}[verification])
+    return 0 if verification != 'failed' else 1
+
+
 def metric(found):
     """Distinct correction verdicts over the distinct changes with a correction or no-correction verdict, each change
     the one its decision named when the verdict was made; decision verdicts and those bound to no change id are
@@ -2477,6 +2658,13 @@ def main():
     rl.add_argument('--dry-run', action='store_true', help='show what would go where, sending nothing')
     rl.add_argument('--retry', metavar='ACTION', help='send a held relay unchanged')
     decide(rl)
+    st = sub.add_parser('start', help="start a Claude Code session in a checkout, on the human's message")
+    st.add_argument('checkout', help='an absolute or ~/ path to a checkout or worktree top level')
+    st.add_argument('account', nargs='?', default='main', help=f'{" or ".join(LAUNCHERS)} (default main)')
+    st.add_argument('--name', help='its hc terminal name (default <checkout>-<account>)')
+    st.add_argument('--space', help='the Herdr space, by id or exact name (default the one whose folder it is)')
+    st.add_argument('--tab', help="a tab id in that space (default a new tab)")
+    st.add_argument('--entry', metavar='ID', help="which of this turn's messages, when the human wrote several")
     vd = sub.add_parser('verdict', help="record the human's verdict on a decision, sending nothing")
     vd.add_argument('--entry', metavar='ID', help="which of this turn's messages, when the human wrote several")
     decide(vd, required=True)
@@ -2563,6 +2751,8 @@ def main():
             return relay(resolve(a.addresses), a.entry, mine, linked)
         if a.cmd == 'verdict':
             return verdict(decided(a), a.entry, mine)
+        if a.cmd == 'start':
+            return start(a.checkout, a.account, a.name, a.space, a.tab, a.entry, mine)
     except Corrupt as e:
         die(f'ledger corrupt, nothing decided until it is reconciled by hand: {e}', 4)
     except hc.Error as e:
