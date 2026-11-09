@@ -15,7 +15,7 @@ env = { HIL_OPENOCD_ESP = "/usr/local/bin/openocd-esp32", PYTHONNOUSERSITE = "1"
 packages = [
   "openssh-server", "sudo", "qemu-guest-agent", "ca-certificates", "curl", "git", "rsync", "python3", "python3-venv",
   "python3-hid", "python3-setuptools", "libhidapi-hidraw0", "libusb-1.0-0", "usbutils", "pciutils", "uhubctl",
-  "dfu-util", "lm4flash", "mtools", "libmtp-runtime", "mtp-tools", "alsa-utils", "gdb-multiarch",
+  "dfu-util", "lm4flash", "mtools", "libmtp-runtime", "mtp-tools", "alsa-utils", "iperf", "gdb-multiarch",
   "binutils-arm-none-eabi", "tshark", "nftables", "jq", "zstd", "unzip", "xz-utils", "tmux", "strace", "lsof",
 ]
 # they set the host's update and time policy: a shared host leaves them to its owner
@@ -40,8 +40,8 @@ check = ["/usr/local/bin/openocd", "--version"]
 kind = "git"
 recipe = "copy"
 repo = "https://github.com/hathach/agentrc.git"
-commit = "12d14432d35231935e9764a72c1bd19dde02c78b"
-version = "12d1443"
+commit = "8ca6765306574574e28b5e3f84b39aeda84772de"
+version = "8ca6765"
 files = ["skills/usb-kernel-recover/scripts/usb_recover.sh", "skills/usb-kernel-recover/scripts/root_port_cycle.py",
          "skills/hil/scripts/hil_root.py"]
 

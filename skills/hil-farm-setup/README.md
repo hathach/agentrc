@@ -211,12 +211,12 @@ Trusted runs only: state written by one job survives into the next. The runner r
 rewrites its migration files there). The workflow wipes only its own workspace, so the rest of `_work`, including
 `hil-report` for re-run attempts, persists, as does `~ghrunner` apart from `.cache`.
 
-Network HIL tests (`device/net_lwip_*`, disabled in tinyusb's `hil_util.device_tests`) need `iperf` and reach the
-board through `hil_root netns`, not a firewall exception: a test running unprivileged in its own user and network
-namespace has the board's USB network interface moved into that namespace, where the host's `hil_farm` table does not
-apply. Before they are re-enabled the host must allow unprivileged user namespaces, and the installed `hil_root` must
-carry `netns`: `farm.toml`'s `agentrc` tool updated to a commit that has it (Updating a tool, above). The
-runner users stay refused 192.168.0.0/16 and the other private ranges in the host's namespace.
+Network HIL tests (`device/net_lwip_*`, disabled in tinyusb's `hil_util.device_tests`) run `iperf`, which
+`setup.sh install` installs (`update` installs no packages: on a host in service, `sudo apt-get install iperf`), and
+reach the board through `hil_root netns`, not a firewall exception: a test running unprivileged in its own user and
+network namespace has the board's USB network interface moved into that namespace, where the host's `hil_farm` table
+does not apply. Before they are re-enabled the host must allow unprivileged user namespaces. The runner users stay
+refused 192.168.0.0/16 and the other private ranges in the host's namespace.
 
 ## Proof
 
