@@ -229,9 +229,8 @@ def canonical(cwd):
 
 def described(t):
     """The session fields `hc get` shows for a live local Claude Code terminal, or None for any other. Its cwd and
-    pid are its foreground process's: the terminal's own are the shell's it may have started from. said is the
-    session's own status line on one line, blocked_on what a blocked one waits for (permission, question or auth),
-    both its words, never checked."""
+    pid are its foreground process's: the terminal's own are the shell's it may have started from. said is its status
+    line on one line, blocked_on a blocked one's kind."""
     status = (t or {}).get('status') or {}
     if not t or t.get('state') != 'live' or status.get('app') != CLAUDE_APP or not hc.is_local(t.get('address')):
         return None
