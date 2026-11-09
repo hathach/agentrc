@@ -2521,6 +2521,64 @@ class VerdictTest(VerdictCase):
             'correction_verdicts': 2, 'changes_with_verdicts': 2, 'ratio': 1.0, 'decision_verdicts': 0,
             'unattributed_verdicts': 1})
 
+    def test_a_revision_s_change_id_counts_for_later_verdicts_only(self):
+        self.report(decision('plan', kind='idea', pr=None))
+        self.say('plan: no')
+        with mock.patch('builtins.print'):
+            captain.verdict((self.item('plan')['id'], 1, 'correction'), None, self.ident)
+        self.report(decision('plan', kind='idea', pr='o/r#13'), reopen=['plan'])
+        self.assertEqual(self.item('plan')['change_id'], 'o/r#13')
+        self.say('plan: yes')
+        with mock.patch('builtins.print'):
+            captain.verdict((self.item('plan')['id'], 2, 'no-correction'), None, self.ident)
+        self.assertEqual([v['change_id'] for v in self.item('plan')['verdicts']], [None, 'o/r#13'])
+        self.assertEqual(captain.metric(self.items()), {
+            'correction_verdicts': 0, 'changes_with_verdicts': 1, 'ratio': 0.0, 'decision_verdicts': 0,
+            'unattributed_verdicts': 1})
+
+    def test_accept_names_the_decision_its_verdict_settles(self):
+        self.report(decision('merge', kind='blocked'), decision('docs', kind='blocked'))
+        iid = self.item('docs')['id']
+        action = self.action_of(self.decide(key='docs', words='yes'))
+        code, shown = self.as_target(captain.accept, action)
+        self.assertEqual(code, 0)
+        line = next(s for s in shown.splitlines() if iid in s)
+        self.assertIn('not the human\'s words', line)
+        for named in ('"docs"', 'revision 1', 'correction', 'blocked', 'docs?'):
+            self.assertIn(named, line)
+        self.assertNotIn('merge', line)
+        self.report(decision('merge', kind='blocked'), decision('docs', kind='blocked', ask='later?'))
+        self.assertIn(line, self.as_target(captain.show_relay, action)[1], 'the decision as it was decided')
+
+    def test_accept_of_a_relay_bound_to_no_decision_names_none(self):
+        self.say('merge o/r#12')
+        with mock.patch('builtins.print') as out:
+            captain.relay(captain.resolve(['t2']), None, self.ident)
+        action = self.action_of([c.args[0] for c in out.call_args_list])
+        shown = self.as_target(captain.accept, action)[1]
+        self.assertNotIn('decision', shown)
+
+    def test_a_held_verdict_on_a_revision_its_session_resolved_is_undelivered(self):
+        self.report(decision('merge', kind='blocked'))
+        self.terminals['t2'] = {**pinned('t2'), 'status': 'working'}
+        action = self.action_of(self.decide())
+        self.terminals['t2'] = pinned('t2')
+        self.report(resolved=[{'key': 'merge', 'revision': 1}])
+        line = self.retry(action)[0]
+        self.assertIn('undelivered', line)
+        self.assertIn('resolved', line)
+        self.assertEqual([t for t in self.typed if 'RELAYED' in t[1]], [])
+        self.assertEqual(self.item()['state'], 'closed')
+
+    def test_a_delivered_verdict_is_not_accepted_once_its_session_resolved_the_revision(self):
+        self.report(decision('merge', kind='blocked'))
+        action = self.action_of(self.decide())
+        self.report(resolved=[{'key': 'merge', 'revision': 1}])
+        with self.assertRaises(SystemExit):
+            self.as_target(captain.accept, action)
+        self.assertFalse(captain.first(captain.records(), 'accepted', action))
+        self.assertEqual(self.item()['state'], 'closed')
+
 
 class ChiefFeedTest(LedgerCase):
     """A headless chief run's attention lines become decision items; its report.md is their evidence."""

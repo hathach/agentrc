@@ -1221,6 +1221,7 @@ def revise(item, i, content=None, reopen=False):
     item['observations'] = {}   # what was observed is of the revision before
     if content is not None:
         item['content'] = content
+        item['change_id'] = content.get('change_id') or content.get('pr')
     if reopen:
         item['state'], item['closure'] = 'open', None
 
@@ -1294,7 +1295,7 @@ def decisions(recs):
         elif r['type'] in ('relay', 'verdict') and r.get('item') in found:
             linked = found[r['item']]
             linked['verdicts'].append({'msg': r['msg'], 'via': r['type'], 'verdict': r['verdict'],
-                                       'revision': r['revision'], 'at': i})
+                                       'revision': r['revision'], 'change_id': r.get('change_id'), 'at': i})
             if linked['revision'] == r['revision']:
                 close(linked, i, 'decided', r['msg'])
             if r['type'] == 'relay':
@@ -1507,11 +1508,14 @@ def rebound(iid, revision, seen):
 
 def obsolete(linked, revision):
     """Why a verdict bound to revision of linked must not be made, sent or acted on now, or None: the decision
-    revised since, its evidence known stale, or a review whose evidence is not confirmed current."""
+    revised since, that revision resolved by its session, its evidence known stale, or a review whose evidence is not
+    confirmed current."""
     if linked is None:
         return 'its decision is gone'
     if linked['revision'] != revision:
         return f'its decision was revised to {linked["revision"]} since revision {revision} was decided'
+    if linked['resolved'] == revision:
+        return 'its session resolved that revision'
     state = freshness(linked)
     if state == 'stale':
         return 'its evidence changed since it was reviewed'
@@ -1834,6 +1838,16 @@ def context(target, recs):
             f'{" ".join(r["prs"]) or r["task"]}.')
 
 
+def settles(linked, binding):
+    """The ledger line naming the decision a relayed verdict settles, as it stood when bound; '' for no decision."""
+    if not linked:
+        return ''
+    content = linked['content']
+    return (f'\nLedger record, not the human\'s words: this message is the human\'s {binding["verdict"]} verdict on '
+            f'the {content["kind"]} decision "{linked["key"]}" ({binding["item"]}) at revision {binding["revision"]}, '
+            f'which asked: {one_line(content["ask"])}')
+
+
 def relay_prompt(action):
     """One line naming no role and holding no quote: the target acts only on what `accept` prints from the
     ledger."""
@@ -1854,7 +1868,7 @@ def relay(targets, entry, mine, decided=None):
     with observing(decided and decided[0]) as seen, locked():
         captain = require_captain(mine)
         uid, words = bound(captain, entry)
-        binding, owner = bind(decided, seen, captain, uid) if decided else ({}, None)
+        binding, linked = bind(decided, seen, captain, uid) if decided else ({}, None)
         pinned = {address: find(address) for address in addresses}
         quote = relay_text(words, addresses)
         for address in addresses:
@@ -1868,11 +1882,12 @@ def relay(targets, entry, mine, decided=None):
             if why:
                 print(f'{address}: refused, {why}', flush=True)
                 continue
-            if owner and session_of(owner) != session_of(target):
+            if linked and session_of(linked['owner']) != session_of(target):
                 print(f'{address}: refused, the decision {binding["item"]} is not this session\'s', flush=True)
                 continue
             action = new_id('a', recs)
-            fields = {'entry': uid, 'quote': quote, 'context': context(target, recs), **binding}
+            fields = {'entry': uid, 'quote': quote, 'context': context(target, recs) + settles(linked, binding),
+                      **binding}
             busy = refusal(target)
             if busy:
                 append(item('relay', action, captain, target, **fields))
@@ -1885,7 +1900,7 @@ def relay(targets, entry, mine, decided=None):
 
 
 def bind(decided, seen, captain, uid):
-    """(the fields binding a verdict to its decision, the decision's owner), after recording what was just observed
+    """(the fields binding a verdict to its decision, the decision as it is now), after recording what was just observed
     of it. The same verdict from the same message again prints its receipt and exits, recording nothing; dies on
     another verdict or revision from that message, a report's bare needs, a decision not open at that revision, and
     evidence stale or unconfirmed."""
@@ -1910,7 +1925,7 @@ def bind(decided, seen, captain, uid):
         die(f'decision {iid}: {why}; nothing recorded', 2)
     sha = {'reviewed_sha': linked['content']['reviewed_sha']} if 'reviewed_sha' in linked['content'] else {}
     binding = {'item': iid, 'revision': revision, 'verdict': verdict, 'change_id': linked['change_id'], **sha}
-    return binding, linked['owner']
+    return binding, linked
 
 
 def verdict(decided, entry, mine):
@@ -1929,9 +1944,10 @@ def verdict(decided, entry, mine):
 
 
 def metric(found):
-    """Distinct correction verdicts over the distinct changes with a correction or no-correction verdict; decision
-    verdicts and those on a decision with no change id are counted apart, in neither."""
-    rated = [(i['change_id'], v['verdict']) for i in found.values() for v in i['verdicts']]
+    """Distinct correction verdicts over the distinct changes with a correction or no-correction verdict, each change
+    the one its decision named when the verdict was made; decision verdicts and those bound to no change id are
+    counted apart, in neither."""
+    rated = [(v['change_id'], v['verdict']) for i in found.values() for v in i['verdicts']]
     attributed = [(c, v) for c, v in rated if c]
     corrections = sum(v == 'correction' for _, v in attributed)
     changes = {c for c, v in attributed if v != 'decision'}
