@@ -1,7 +1,8 @@
 """skills/hil/scripts/hil_root.py is the one root entry the HIL scripts use: which copy and sudo
-argv() picks, and each verb's refusals and its one write, ioctl or program, against a temp sysfs
-tree with the device node and the programs stubbed. That a rig's sudo grant covers only the
-installed copy is the rig's own check."""
+argv() picks, and each verb's refusals and the writes, ioctls, programs and netlink request it
+issues, against a temp sysfs and /proc tree with the device node, the nsfs ioctls, the fds and the
+netlink socket stubbed. That a rig's sudo grant covers only the installed copy is the rig's own
+check."""
 import os
 import unittest
 
@@ -239,21 +240,35 @@ class Netns(Sysfs):
         self.owner = self.root / 'sandbox-userns'
         self.owner.write_text('')
         self.netdev('1-2')
-        self.moved, self.closed = [], []
+        self.moved, self.events, self.fds = [], [], {}     # events: opens, ioctls, closes and moves in order
         real_open, real_close = os.open, os.close
 
+        def open_(path, flags, *mode):
+            fd = real_open(path, flags, *mode)
+            self.fds[fd] = Path(path)
+            self.events.append(('open', Path(path), fd))
+            return fd
+
         def ioctl(fd, req, *arg):
-            if req == 0xb704:                   # NS_GET_OWNER_UID
-                self.assertEqual(arg, (bytes(4),))
+            self.events.append(('ioctl', fd, req))
+            if req == 0xb704:                   # NS_GET_OWNER_UID, on the owner user namespace
+                self.assertEqual((self.fds.get(fd), arg), (self.owner, (bytes(4),)))
                 return struct.pack('=I', self.owner_uid)
-            self.assertEqual(req, 0xb701)
-            return real_open(self.owner, os.O_RDONLY)
+            self.assertEqual((req, self.fds.get(fd)), (0xb701, self.proc / '4321' / 'ns' / 'net'))
+            owner = real_open(self.owner, os.O_RDONLY)
+            self.fds[owner] = self.owner
+            return owner
 
         def close(fd):
-            self.closed.append(fd)
+            self.events.append(('close', fd))
+            self.fds.pop(fd, None)
             real_close(fd)
-        for target, name, value in ((hr, 'PROC', self.proc), (hr.fcntl, 'ioctl', ioctl), (hr.os, 'close', close),
-                                    (hr, 'move_link', lambda idx, fd: self.moved.append((idx, fd)))):
+
+        def move(idx, fd):
+            self.moved.append((idx, fd))
+            self.events.append(('move', idx, fd))
+        for target, name, value in ((hr, 'PROC', self.proc), (hr.fcntl, 'ioctl', ioctl), (hr.os, 'open', open_),
+                                    (hr.os, 'close', close), (hr, 'move_link', move)):
             p = mock.patch.object(target, name, value)
             p.start()
             self.addCleanup(p.stop)
@@ -261,8 +276,7 @@ class Netns(Sysfs):
         p.start()
         self.addCleanup(p.stop)
 
-    def netdev(self, busport, name='usb7', driver='cdc_ncm', mac='02:02:84:6a:96:00', ifindex=7, intf='1.0',
-               vid='cafe'):
+    def netdev(self, busport, name='usb7', driver='cdc_ncm', ifindex=7, intf='1.0', vid='cafe'):
         d = self.usb / busport
         if not d.exists():
             self.dev(busport, vid=vid)
@@ -272,7 +286,6 @@ class Netns(Sysfs):
         drivers.mkdir(parents=True, exist_ok=True)
         if not (i / 'driver').is_symlink():
             (i / 'driver').symlink_to(drivers)
-        (i / 'net' / name / 'address').write_text(f'{mac}\n')
         (i / 'net' / name / 'ifindex').write_text(f'{ifindex}\n')
 
     def refused(self, *args):
@@ -283,9 +296,12 @@ class Netns(Sysfs):
     def test_the_boards_interface_moves_by_index_into_the_sandbox(self):
         rc, out, err = self.main('netns', '1-2', '4321')
         self.assertEqual((rc, out, err), (0, '7 usb7\n', ''))
-        (idx, fd), = self.moved
-        self.assertEqual(idx, 7)
-        self.assertIn(fd, self.closed)          # the namespace fd is released after the move
+        # the fd checked is the one moved into, open until the move and closed after it
+        (_, net, fd), = (e for e in self.events if e[0] == 'open')
+        owner = self.events[2][1]               # the user namespace fd NS_GET_USERNS returned
+        self.assertEqual(net, self.proc / '4321' / 'ns' / 'net')
+        self.assertEqual(self.events, [('open', net, fd), ('ioctl', fd, 0xb701), ('ioctl', owner, 0xb704),
+                                       ('close', owner), ('move', 7, fd), ('close', fd)])
 
     def test_a_host_or_root_owned_namespace_refuses(self):
         self.owner = self.proc / '1' / 'ns' / 'user'
@@ -301,7 +317,7 @@ class Netns(Sysfs):
 
     def test_a_user_namespace_another_user_created_refuses(self):
         self.owner_uid = 1001
-        self.assertIn('created by uid 1001, not the sudo caller 1000', self.refused('1-2', '4321'))
+        self.assertIn('created by uid 1001, not SUDO_UID 1000', self.refused('1-2', '4321'))
 
     def test_without_sudo_any_unprivileged_creator_is_accepted(self):
         self.owner_uid = 1001
@@ -310,22 +326,24 @@ class Netns(Sysfs):
             self.assertEqual(self.main('netns', '1-2', '4321')[:2], (0, '7 usb7\n'))
 
     def test_a_missing_process_and_malformed_pids_refuse(self):
-        for pid in ('999', '1', '0', '-5', '4321 ', '../1', ''):
+        for pid in ('999', '0', '-5', '4321 ', '../1', ''):
             with self.subTest(pid=pid):
                 self.refused('1-2', pid)
+
+    def test_pid_1_refuses_as_the_hosts_init(self):
+        self.assertIn("pid 1 is the host's init", self.refused('1-2', '1'))
 
     def test_malformed_busports_refuse(self):
         for busport in ('1-0', '../1-2', '1-2/x', '1-2 ', 'usb7'):
             with self.subTest(busport=busport):
                 self.refused(busport, '4321')
 
-    def test_a_host_nic_refuses(self):
+    def test_a_board_on_a_driver_that_is_not_a_usb_network_function_refuses(self):
         self.netdev('1-3', name='enx1', driver='r8152')
         self.assertIn('driven by r8152', self.refused('1-3', '4321'))
 
-    def test_a_cdc_nic_that_is_not_a_board_refuses_whatever_its_mac(self):
-        # a host USB Ethernet adapter or tethered phone on a CDC driver, with a cloned or
-        # randomized locally administered MAC: its vendor id is the boundary, not its MAC
+    def test_a_cdc_nic_that_is_not_a_board_refuses(self):
+        # a host USB Ethernet adapter or tethered phone on a CDC driver: refused by its vendor id
         for busport, driver, vid in (('1-4', 'cdc_ether', '0bda'), ('1-5.1', 'cdc_ncm', '18d1'),
                                      ('1-6', 'rndis_host', '04e8')):
             with self.subTest(busport=busport):
@@ -358,7 +376,7 @@ class Netns(Sysfs):
 class MoveLink(unittest.TestCase):
     """move_link's one RTM_NEWLINK request and its ack, against a stubbed netlink socket."""
 
-    def run_move(self, err):
+    def run_move(self, err=0, reply=None):
         sent = []
 
         class Sock:
@@ -378,22 +396,35 @@ class MoveLink(unittest.TestCase):
                 sent.append((self.args, msg))
 
             def recv(self, n):
+                if reply is not None:
+                    return reply
                 return struct.pack('=IHHII', 36, 2, 0, 1, 0) + struct.pack('=i', err) + sent[0][1][:16]
         with mock.patch.object(hr.socket, 'socket', Sock):
             hr.move_link(7, 42)
         return sent
 
     def test_the_request_names_the_index_and_the_namespace_fd(self):
-        (args, msg), = self.run_move(0)
-        self.assertEqual(args[0], hr.socket.AF_NETLINK)
+        (args, msg), = self.run_move()
+        self.assertEqual(args, (hr.socket.AF_NETLINK, hr.socket.SOCK_RAW, hr.socket.NETLINK_ROUTE))
         self.assertEqual(struct.unpack_from('=IHHII', msg), (len(msg), 16, 0x5, 1, 0))
         self.assertEqual(struct.unpack_from('=BxHiII', msg, 16), (0, 0, 7, 0, 0))
         self.assertEqual(struct.unpack_from('=HHI', msg, 32), (8, 28, 42))
+        # IFLA_NEW_IFINDEX: the same index in the namespace, or the kernel refuses the move
+        self.assertEqual((struct.unpack_from('=HHi', msg, 40), len(msg)), ((8, 49, 7), 48))
 
     def test_a_kernel_error_raises_its_errno(self):
         with self.assertRaises(OSError) as cm:
             self.run_move(-19)
         self.assertEqual(cm.exception.errno, 19)
+
+    def test_a_reply_that_is_not_the_ack_or_is_short_raises(self):
+        for reply, why in ((struct.pack('=IHHII', 36, 3, 0, 1, 0) + bytes(20), 'type 3 seq 1'),     # NLMSG_DONE
+                           (struct.pack('=IHHII', 36, 2, 0, 2, 0) + bytes(20), 'type 2 seq 2'),
+                           (struct.pack('=IHHII', 36, 2, 0, 1, 0) + bytes(2), 'short netlink reply (18 bytes)'),
+                           (b'', 'short netlink reply (0 bytes)')):
+            with self.subTest(why=why), self.assertRaises(OSError) as cm:
+                self.run_move(reply=reply)
+            self.assertIn(why, str(cm.exception))
 
 
 class Standalone(unittest.TestCase):

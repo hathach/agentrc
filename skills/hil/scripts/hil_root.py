@@ -3,7 +3,7 @@
 only, and it imports nothing beside it.
 
 A rig may grant its CI user sudo on an installed copy of this file (INSTALLED), so it takes
-no path, command or environment from its caller (only the SUDO_UID sudo itself sets): each verb
+no path, command or environment from its caller (only SUDO_UID, which sudo sets itself): each verb
 checks its arguments against the one sysfs file, device or program it touches. Recovery's
 usb_recover is a separate grant.
 
@@ -13,8 +13,9 @@ usb_recover is a separate grant.
   hil_root.py reset-tt BUSPORT           Reset_TT on the multi-TT hub port BUSPORT names
   hil_root.py netns BUSPORT PID          move the USB network interface of BUSPORT's device, a
                                          board (NETNS_VIDS), into PID's network namespace, one
-                                         a user namespace the sudo caller (never root) created
-                                         owns; prints its ifindex and name
+                                         owned by a user namespace a user other than root created,
+                                         the one SUDO_UID names when set; prints its ifindex, the
+                                         same in that namespace, and its name as checked
 
 Exit 2 refuses a request; otherwise the operation's own status, its error on stderr.
 Callers build the argv with `argv()`.
@@ -55,7 +56,9 @@ NETNS_VIDS = ('cafe',)
 NET_DRIVERS = ('cdc_ether', 'cdc_ncm', 'cdc_eem', 'rndis_host')
 NS_GET_USERNS = 0xb701                  # _IO(0xb7, 0x1), v6.12 include/uapi/linux/nsfs.h
 NS_GET_OWNER_UID = 0xb704               # _IO(0xb7, 0x4): a user namespace's creator uid (uid_t)
-RTM_NEWLINK, NLMSG_ERROR, IFLA_NET_NS_FD = 16, 2, 28       # v6.12 include/uapi/linux/rtnetlink.h
+RTM_NEWLINK, NLMSG_ERROR = 16, 2                # v6.12 include/uapi/linux/rtnetlink.h, netlink.h
+IFLA_NET_NS_FD = 28                             # v6.12 include/uapi/linux/if_link.h
+IFLA_NEW_IFINDEX = 49                           # if_link.h; a move honours it since v5.13
 NLM_F_REQUEST_ACK = 0x1 | 0x4
 _NLMSGHDR = struct.Struct('=IHHII')                         # len, type, flags, seq, pid
 _IFINFOMSG = struct.Struct('=BxHiII')                       # family, type, index, flags, change
@@ -167,7 +170,7 @@ def usb_netdev(busport):
     """(ifindex, name) of the one network interface BUSPORT's device has, refused unless the device
     is a board (NETNS_VIDS) and a USB network class driver (NET_DRIVERS) drives it. The ifindex is
     read before the checks and again after: a device re-enumerated meanwhile gets a new one, so the
-    one returned is the one checked."""
+    one returned is the one checked. The name is not checked again: a rename (udev's) may change it."""
     if not _BUSPORT.match(busport):
         raise Refused(f'busport {busport!r}: expected BUS-PORT[.PORT...]')
     try:
@@ -191,11 +194,13 @@ def usb_netdev(busport):
 
 def sandbox_netns(pid):
     """An fd on PID's network namespace, refused unless a user namespace other than the initial
-    one owns it and a user other than root created that one -- the sudo caller (SUDO_UID, which
-    sudo sets) when there is one: an unprivileged process's sandbox, never the host's or a root
-    container's. Held open, so a PID reused after this check cannot redirect the move."""
-    if not pid.isdecimal() or int(pid) < 2:
+    one owns it and a user other than root created that one -- the one SUDO_UID names when set:
+    an unprivileged process's sandbox, never the host's or a root container's. Held open, so a PID
+    reused after this check cannot redirect the move."""
+    if not pid.isdecimal() or int(pid) < 1:
         raise Refused(f'pid {pid!r}: expected a process id')
+    if int(pid) == 1:
+        raise Refused('pid 1 is the host\'s init')
     try:
         fd = os.open(PROC / pid / 'ns' / 'net', os.O_RDONLY)
     except OSError as e:
@@ -213,7 +218,7 @@ def sandbox_netns(pid):
             raise Refused(f'pid {pid}: its user namespace was created by root')
         caller = os.environ.get('SUDO_UID')
         if caller is not None and str(uid) != caller:
-            raise Refused(f'pid {pid}: its user namespace was created by uid {uid}, not the sudo caller {caller}')
+            raise Refused(f'pid {pid}: its user namespace was created by uid {uid}, not SUDO_UID {caller}')
     except BaseException:
         os.close(fd)
         raise
@@ -222,17 +227,20 @@ def sandbox_netns(pid):
 
 def move_link(ifindex, nsfd):
     """RTM_NEWLINK moving ifindex into the namespace nsfd names, by index: a device that
-    re-enumerated since has a new one, so a stale index fails rather than moving its successor."""
-    attr = struct.pack('=HHI', 8, IFLA_NET_NS_FD, nsfd)
+    re-enumerated since has a new one, so a stale index fails rather than moving its successor.
+    It keeps that index there or the move fails (EBUSY): unasked, the kernel renumbers on a clash."""
+    attr = struct.pack('=HHI', 8, IFLA_NET_NS_FD, nsfd) + struct.pack('=HHi', 8, IFLA_NEW_IFINDEX, ifindex)
     body = _IFINFOMSG.pack(socket.AF_UNSPEC, 0, ifindex, 0, 0) + attr
     msg = _NLMSGHDR.pack(_NLMSGHDR.size + len(body), RTM_NEWLINK, NLM_F_REQUEST_ACK, 1, 0) + body
     with socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, socket.NETLINK_ROUTE) as s:
         s.settimeout(5)
         s.send(msg)
         reply = s.recv(4096)
+    if len(reply) < _NLMSGHDR.size + 4:
+        raise OSError(f'short netlink reply ({len(reply)} bytes)')
     _, kind, _, seq, _ = _NLMSGHDR.unpack_from(reply)
     if kind != NLMSG_ERROR or seq != 1:
-        raise OSError(f'unexpected netlink reply type {kind}')
+        raise OSError(f'unexpected netlink reply type {kind} seq {seq}')
     err, = struct.unpack_from('=i', reply, _NLMSGHDR.size)
     if err:
         raise OSError(-err, os.strerror(-err))
