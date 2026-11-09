@@ -20,13 +20,16 @@ import shlex
 import shutil
 import signal
 import sys
+import time
 import types
 from pathlib import Path
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import guard_survivors, load_arduino_engine, load_arduino_fixture, tmpdir  # noqa: E402
+from helpers import (claimant, guard_survivors, kill_quietly, killed_claimant, load_arduino_engine,  # noqa: E402
+                     load_arduino_fixture, proc_stat, tmpdir, wait_done)
 
 H = load_arduino_engine('skills/arduino/scripts/arduino_hil.py')
+REAL = H.A   # agentrc's own modules, before a test stubs them
 fake = load_arduino_fixture()
 
 
@@ -55,6 +58,8 @@ class FakeLock:
     def __init__(self):
         self.taken, self.released, self.ended, self.logged, self.restored = [], [], [], [], []
         self.records, self.pending, self.failures, self.end_errors = {}, {}, {}, {}
+        self.claims, self.running, self.settled = {}, set(), []   # claims: {board: [session]}, each its fake state
+        self.judged = []
         lock = self
 
         class PendingSessions:
@@ -66,7 +71,36 @@ class FakeLock:
                 if left:
                     raise FakeLock.PendingRefused(f'{left} not ended')
                 lock.pending.pop(self.key, None)
+
+            def claim(self, entry):   # the real record is hil_lock's, tested there
+                listed = lock.claims.setdefault(self.key[0], [])
+                others = list(listed)
+                listed.append(entry)
+                return others
+
+            def remove(self, entry):
+                listed = lock.claims.get(self.key[0], [])
+                listed[:] = [s for s in listed if s['receipt'] != entry['receipt']]
+                return listed
         self.PendingSessions = PendingSessions
+
+    def claim_entry(self, ops, cmd):
+        return {'receipt': {'ops': str(ops), 'pid': os.getpid(), 'start': '1'}, 'cmd': cmd}
+
+    def claim_alive(self, session):
+        return session.get('state') == 'alive'
+
+    def invocation_state(self, session, keep=()):
+        self.judged.append((session['receipt'], set(keep)))
+        return session.get('state', 'ended'), session.get('receipts', [])
+
+    logged_tokens = staticmethod(REAL.lock.logged_tokens)   # pure: hil_lock's own
+    receipt_token = staticmethod(REAL.lock.receipt_token)
+    open_runs = staticmethod(REAL.lock.open_runs)
+
+    def settle(self, receipts, wait, busy=None):   # a receipt whose token is in `running` stays pending
+        self.settled.append(list(receipts))
+        return ['pending' if self.receipt_token(r) in self.running else 'unknown' for r in receipts], []
 
     def take_board_lock(self, board, reason, protected=False, **extra):
         self.taken.append((board, reason, protected, extra))
@@ -81,8 +115,11 @@ class FakeLock:
         self.ended.append((list(handles), detail, list(receipts)))
         return {b: e for b, e in self.end_errors.items() if b in handles}
 
-    def log_cleanup_failure(self, board, reason, *, detail, receipts=(), **extra):
+    def log_cleanup_failure(self, board, reason, *, detail, task=None, receipts=(), **extra):
         self.logged.append((board, detail, list(receipts)))
+        if task is not None:
+            self.failures.setdefault(board, []).append({'id': f'f{len(self.logged)}', 'task': task,
+                                                        'receipts': list(receipts)})
         return {'event': 'failed', 'id': 'f2'}
 
     def open_cleanup_failures(self, board):
@@ -133,7 +170,8 @@ def fake_serial():
 
 
 def fake_tracker_init(self, run_dir):
-    self.__dict__.update(receipts=['r1'], pending=[], unclean='', log=Path(run_dir) / 'hil.log')
+    self.__dict__.update(receipts=['r1'], pending=[], unclean='', log=Path(run_dir) / 'hil.log',
+                         state_dir=str(Path(run_dir) / 'tracked'))
 
 
 class Base(unittest.TestCase):
@@ -150,6 +188,7 @@ class Base(unittest.TestCase):
                                     usb=mock.Mock(), esp=mock.Mock(), root=self.agentrc['root'])
         self.A.usb.BUSPORT_RE = re.compile(r'^[0-9]+-[0-9]+(\.[0-9]+)*$')   # agentrc usb_observe's
         self.A.esp.return_value = mock.Mock(USB_LOCATION_MAX=15, USJ_VID_PID=('303a', '1001'))   # hil_openocd_esp's
+        self.A.process.recheck_dir.return_value = ('done', [])
         for target, name, value in ((H, 'P', self.HP), (H.B, 'P', self.BP), (H, 'A', self.A)):
             self.patch(target, name, value)
         H.esptool_exe.cache_clear()
@@ -719,9 +758,31 @@ class Console(Base):
 
 
 class Detach(Base):
+    def device(self, busport, ino, serial=None):
+        """A device dir; serial None: no `serial` file, as for an enumeration without iSerialNumber."""
+        d = self.dir / f'dev{ino}'
+        d.mkdir()
+        if serial is not None:
+            (d / 'serial').write_text(serial + '\n')
+        return {'busport': busport, 'ino': ino, 'dir': str(d)}
+
+    def wait(self, board, vid_pid, polls, serials):
+        """detach over the usb_devices lists in `polls`, each serial read from `serials` (None: inconclusive)."""
+        self.A.flash.run_openocd_commands.return_value = mock.Mock(returncode=0, stdout=b'', stderr=b'')
+        self.A.usb.usb_devices.side_effect = polls
+        self.A.usb.read_sysfs = lambda path: serials.get(Path(path).parent.name)
+        self.A.usb.enumeration_id = lambda d: int(Path(d).name[3:])
+        now = [0.0]
+
+        def tick():
+            now[0] += 1
+            return now[0]
+        with mock.patch.object(H.time, 'sleep'), mock.patch.object(H.time, 'monotonic', tick):
+            return H.detach('rig_ocd', board, vid_pid, mock.Mock())
+
     def test_detach_only_where_the_flasher_targets_an_rp_chip(self):
         self.A.flash.run_openocd_commands.return_value = mock.Mock(returncode=0, stdout='', stderr='')
-        self.A.usb.usb_scan.return_value = []
+        self.A.usb.usb_devices.return_value = []
         board = self.board('rig_ocd')
         self.assertEqual(H.detach('rig_ocd', board, '239a:cafe', mock.Mock()), 'detached')
         self.assertEqual(self.A.flash.run_openocd_commands.call_args[0][1], ['mww 0x5011304c 0x00010000'])
@@ -736,12 +797,46 @@ class Detach(Base):
         self.A.flash.run_openocd_commands.assert_not_called()
 
     def test_detach_without_a_record_waits_for_the_serial(self):
+        dut, hub, other = self.device('21-1.3', 1, 'OUID'), self.device('21-1', 2), self.device('21-1.4', 3, 'X')
+        serials = {'dev1': 'ouid', 'dev3': 'X'}   # serial compared case aside
+        self.assertEqual(self.wait(self.board('rig_ocd'), None, [[hub, dut, other], [hub, other]], serials),
+                         'detached')
+        self.assertEqual(self.A.usb.usb_devices.call_args, mock.call())   # any VID: no record names one
+        self.A.usb.usb_scan.assert_not_called()
+
+    def test_an_inconclusive_serial_read_is_no_detach(self):
+        dut = self.device('21-1.3', 1, 'OUID')
+        polls = [[dut]] * 10
+        self.assertEqual(self.wait(self.board('rig_ocd'), '239a:cafe', polls, {}),
+                         f'still enumerated {H.DETACH_WAIT}s after the detach')
+        self.assertEqual(self.A.usb.usb_devices.call_args[1], {'vid_pid': ('239a', 'cafe')})
+        self.A.usb.usb_devices.side_effect = None
+        self.A.usb.enumeration_id = lambda d: 99   # read across a re-enumeration
+        self.A.usb.read_sysfs = lambda path: 'X'
+        self.A.usb.usb_devices.return_value = [dut]
+        self.assertFalse(H.dut_absent('239a:cafe', self.board('rig_ocd')))
+
+    def test_a_missing_serial_holds_a_scoped_wait(self):
         board = self.board('rig_ocd')
-        self.A.flash.run_openocd_commands.return_value = mock.Mock(returncode=0, stdout=b'', stderr=b'')
-        self.A.usb.usb_scan.side_effect = [[{'busport': '21-1.3'}], []]
-        with mock.patch.object(H.time, 'sleep'):
-            self.assertEqual(H.detach('rig_ocd', board, None, mock.Mock()), 'detached')
-        self.assertEqual(self.A.usb.usb_scan.call_args[1], {'serial': 'OUID'})
+        dut = self.device('21-1.3', 1)   # its serial string not cached, or its enumeration still being added
+        self.assertEqual(self.wait(board, '239a:cafe', [[dut]] * 10, {}),
+                         f'still enumerated {H.DETACH_WAIT}s after the detach')
+        self.assertEqual(self.wait({**board, 'usb_port': '21-1.3'}, None, [[dut]] * 10, {}),
+                         f'still enumerated {H.DETACH_WAIT}s after the detach')
+
+    def test_usb_port_scopes_the_wait(self):
+        board = {**self.board('rig_ocd'), 'usb_port': '21-1.3'}
+        dut, peer = self.device('21-1.3', 1, 'OUID'), self.device('21-1.4', 2, 'OUID')
+        self.assertEqual(self.wait(board, '239a:cafe', [[dut, peer], [peer]], {'dev1': 'OUID'}), 'detached')
+        self.assertEqual(self.wait(board, '239a:cafe', [[dut, peer]] * 10, {'dev2': 'OUID'}),
+                         f'still enumerated {H.DETACH_WAIT}s after the detach')   # dut's read inconclusive
+
+    def test_no_serial_board_waits_for_its_port_to_empty(self):
+        board = {**self.board('rig_ocd'), 'usb_port': '21-1.3', 'no_serial': True}
+        dut, peer = self.device('21-1.3', 1), self.device('21-1.4', 2)
+        self.assertEqual(self.wait(board, None, [[dut, peer], [peer]], {}), 'detached')
+        self.assertEqual(self.wait(board, None, [[dut, peer]] * 10, {}),
+                         f'still enumerated {H.DETACH_WAIT}s after the detach')
 
     def test_a_failed_detach_is_evidence(self):
         self.A.flash.run_openocd_commands.return_value = mock.Mock(returncode=0, stdout='Error: x', stderr='')
@@ -805,6 +900,11 @@ class Flash(Base):
         self.assertEqual((t.receipts, t.pending), ([{'pid': 1}], [{'receipt': {'pid': 1}}]))
         t._note('unknown', None, ['openocd'])
         self.assertIn('unrecheckable', t.pending[-1]['receipt'])
+
+    def test_tracker_runs_in_the_run_dirs_tracked_state_dir(self):
+        self.A.process.state_dir.return_value = '/trusted/tracked'
+        self.assertEqual(H.Tracker(self.dir / 'run').state_dir, '/trusted/tracked')
+        self.A.process.state_dir.assert_called_once_with(str(self.dir / 'run'), 'tracked')
 
 
 class BaseImage(Base):
@@ -1090,6 +1190,142 @@ class Battery(Base):
         self.assertNotIn('previousPending', row)
         self.assertEqual(self.lock.pending, {})
 
+    def other(self, state, receipts=()):
+        """Another invocation's claim on rig_jlink, judged `state` with `receipts` by the fake invocation_state."""
+        listed = self.lock.claims.setdefault('rig_jlink', [])
+        s = {'receipt': {'ops': '/other/ops', 'pid': 99 + len(listed), 'start': '5'}, 'cmd': 'hil_test.py',
+             'state': state, 'receipts': list(receipts)}
+        listed.append(s)
+        return s
+
+    def test_a_clean_run_claims_first_and_removes_its_claim_before_the_release(self):
+        at_release = []
+        self.lock.release_board_lock = lambda fh: at_release.append(list(self.lock.claims['rig_jlink']))
+        seen = []
+
+        def step(*a):
+            seen.append([s['receipt']['pid'] for s in self.lock.claims['rig_jlink']])
+            return {'test': 'echo', 'pass': True, 'detail': 'ok'}
+        row = self.run_board(step=step)
+        self.assertEqual((H.verdict(row), seen, at_release), ('pass', [[os.getpid()]], [[]]))
+        self.assertEqual(self.A.process.recheck_dir.call_args[0][0], str(self.dir / 'run/rig_jlink/tracked'))
+        self.assertNotIn('claimNote', row)
+
+    def test_another_live_invocation_refuses_before_admission_and_before_any_judgement(self):
+        dead = self.other('unresolved', [{'token': 't1'}])
+        other = self.other('alive')
+        row = self.run_board(admit=mock.Mock(side_effect=AssertionError('admitted')))
+        self.assertEqual((row['locked'], H.verdict(row), len(self.lock.released)), (True, 'not-run', 1))
+        self.assertIn('board in use: another invocation on rig_jlink is running', row['detail'])
+        self.assertEqual((self.lock.claims['rig_jlink'], self.lock.logged, self.lock.settled), ([dead, other], [], []))
+        self.assertEqual(self.lock.judged, [])   # judging tidies: a live claimant may log what it would tidy
+
+    def test_the_kept_tokens_are_read_after_the_gate(self):
+        self.other('ended')
+        self.lock.failures['rig_jlink'] = [{'id': 'f0', 'receipts': [{'token': 't1'}]}]
+        take = self.lock.take_board_lock
+
+        def taken(*a, **k):   # a claimant alive at the take logs t2 before it ends
+            fh = take(*a, **k)
+            self.lock.failures['rig_jlink'].append({'id': 'f9', 'receipts': [{'token': 't2'}]})
+            return fh
+        self.lock.take_board_lock = taken
+        resolved = []
+        self.lock.resolve_restored = lambda board, failures, **ev: resolved.append([f['id'] for f in failures]) or []
+        row = self.run_board()
+        self.assertEqual(self.lock.judged[0][1], {'t1', 't2'})
+        self.assertEqual((row['previousCleanupFailure']['id'], row['openCleanupFailures']), ('f9', 2))
+        self.assertEqual(resolved, [['f0', 'f9']])   # each once
+
+    def test_an_earlier_invocations_unproven_children_are_logged_then_settled(self):
+        other = self.other('unresolved', [{'token': 't1'}])
+        ended = self.other('ended')
+        row = self.run_board()
+        self.assertEqual((H.verdict(row), row['ran']), ('pass', True))
+        self.assertEqual(self.lock.logged, [('rig_jlink', 'an earlier invocation ended with children not proven '
+                                                          'ended', [{'token': 't1'}])])
+        self.assertEqual(row['previousCleanupFailure']['task'], other['receipt'])
+        self.assertEqual((self.lock.settled, self.lock.claims['rig_jlink']), ([[{'token': 't1'}]], []))
+        self.assertNotIn(ended, self.lock.claims['rig_jlink'])
+
+    def test_children_still_running_after_the_settle_give_the_board_up_and_keep_their_claim(self):
+        other = self.other('unresolved', [{'token': 't1'}, {'token': 'u1'}])
+        gone = self.other('unresolved', [{'token': 'u2'}])
+        self.lock.running = {'t1'}
+        row = self.run_board(admit=mock.Mock(side_effect=AssertionError('admitted')))
+        self.assertEqual((row['locked'], H.verdict(row), len(self.lock.released), self.lock.ended),
+                         (True, 'not-run', 1, []))
+        self.assertIn(f'still run after {H.CLAIM_SETTLE}s', row['detail'])
+        self.assertIn('t1', row['detail'])
+        self.assertNotIn('u1', row['detail'])
+        self.assertEqual(row['previousCleanupFailure']['task'], gone['receipt'])
+        self.assertEqual(self.lock.claims['rig_jlink'], [other])   # judged again by the next attempt
+        logged = len(self.lock.logged)
+        row = self.run_board(admit=mock.Mock(side_effect=AssertionError('admitted')))
+        self.assertTrue(row['locked'])
+        self.assertEqual(len(self.lock.logged), logged)   # not logged again
+        self.lock.running = set()
+        self.assertEqual(H.verdict(self.run_board()), 'pass')
+        self.assertEqual(self.lock.claims['rig_jlink'], [])
+
+    def test_an_unknown_receipt_never_holds_the_board(self):
+        self.other('unresolved', [{'unrecheckable': 'no .json file', 'token': 'x', 'files': []}])
+        row = self.run_board()
+        self.assertEqual((H.verdict(row), len(self.lock.logged), self.lock.claims['rig_jlink']), ('pass', 1, []))
+
+    def test_receipts_already_logged_are_settled_not_logged_again(self):
+        self.lock.failures['rig_jlink'] = [{'id': 'f0', 'receipts': [{'token': 't1'}]}]
+        self.other('unresolved', [{'token': 't1'}])
+        row = self.run_board()
+        self.assertEqual((H.verdict(row), self.lock.logged, self.lock.settled), ('pass', [], [[{'token': 't1'}]]))
+        self.assertEqual(self.lock.claims['rig_jlink'], [])
+
+    def test_failures_and_receipts_with_malformed_ids_are_kept_never_hashed(self):
+        odd = [{'id': [], 'receipts': []}, {'id': {'x': 1}, 'receipts': [{'token': ['t']}]}, {'receipts': []}]
+        self.lock.failures['rig_jlink'] = [dict(f) for f in odd]
+        take = self.lock.take_board_lock
+
+        def taken(*a, **k):   # the log read after the gate names them again, and one more
+            fh = take(*a, **k)
+            self.lock.failures['rig_jlink'] += [dict(f) for f in odd] + [{'id': [1], 'receipts': []}]
+            return fh
+        self.lock.take_board_lock = taken
+        self.other('unresolved', [{'token': ['t']}, {'token': {'x': 1}}, {'token': 't2'}])
+        resolved = []
+        self.lock.resolve_restored = lambda board, failures, **ev: resolved.append(failures) or []
+        row = self.run_board()
+        self.assertEqual((H.verdict(row), row['ran']), ('pass', True))
+        self.assertEqual(self.lock.logged[0][2], [{'token': ['t']}, {'token': {'x': 1}}, {'token': 't2'}])
+        self.assertEqual([f.get('id') for f in resolved[0]], [[], {'x': 1}, None, [1], 'f1'])
+
+    def test_an_earlier_claim_whose_log_failed_stays_for_the_next_attempt(self):
+        other = self.other('unresolved', [{'token': 't1'}])
+        self.lock.log_cleanup_failure = mock.Mock(side_effect=OSError('disk full'))
+        row = self.run_board()
+        self.assertEqual(H.verdict(row), 'pass')
+        self.assertIn('cleanup log not written: disk full', row['claimNote'])
+        self.assertEqual(self.lock.claims['rig_jlink'], [other])
+
+    def test_an_unclean_end_keeps_its_claim_for_the_next_attempt(self):
+        def step(*a):
+            a[-1].pending.append({'receipt': {'token': 'p1'}})
+            raise H.Unclean('openocd: cleanup pending')
+        self.A.process.recheck_dir.return_value = ('pending', [{'token': 'p1'}])
+        row = self.run_board(step=step)
+        self.assertEqual((H.verdict(row), row['claimNote']), ('blocker', 'claim kept: its operations recheck pending'))
+        self.assertEqual(self.A.process.recheck_dir.call_args[0][1], {'p1'})   # its logged receipt's files stay
+        self.assertEqual([s['receipt']['pid'] for s in self.lock.claims['rig_jlink']], [os.getpid()])
+        self.assertEqual(len(self.lock.ended), 1)
+
+    def test_a_claim_record_that_cannot_name_the_run_refuses_it(self):
+        class Unwritable(self.lock.PendingSessions):
+            def claim(self, entry):
+                raise PermissionError('another user\'s record')
+        self.lock.PendingSessions = Unwritable
+        row = self.run_board(admit=mock.Mock(side_effect=AssertionError('admitted')))
+        self.assertEqual((H.verdict(row), row['locked'], len(self.lock.released)), ('not-run', False, 1))
+        self.assertIn("claim record could not name this invocation: PermissionError", row['detail'])
+
     def test_interrupt_keeps_the_row_and_ends_the_lock(self):
         def step(*a):
             raise KeyboardInterrupt
@@ -1214,6 +1450,52 @@ class Manual(Base):
             self.assertEqual(H.manual(args), 4)
         self.assertEqual(json.loads(out.getvalue())['survivors'], [{'receipt': {'pid': 5}}])
         self.assertEqual([r for _, _, r in self.lock.logged], [[{'pid': 5}]])
+
+    def test_a_session_command_beside_a_live_invocation_is_refused(self):
+        other = {'receipt': {'ops': '/other/ops', 'pid': 99, 'start': '5'}, 'cmd': 'hil_test.py', 'state': 'alive'}
+        self.lock.claims['rig_jlink'] = [other]
+        self.lock.records['rig_jlink'] = {'reason': 'mine', 'pid': 1}
+        code, out = self.main(['exec', '-b', 'rig_jlink', '--under-hold', 'mine', str(self.roster), '--', 'true'])
+        self.assertEqual(code, 2)
+        self.assertIn('another invocation on rig_jlink is running', out['error'])
+        self.assertEqual((self.lock.claims['rig_jlink'], self.A.process.run_tracked.called), ([other], False))
+        args = self.held(cmd='restore', release=False, report=None, build_record='r.json')
+        with self.assertRaisesRegex(H.Refused, 'is running'):   # a refused restore is logged as ever
+            H.manual(args)
+        self.assertEqual([d for _, d, _ in self.lock.logged], ['restore refused or raised: InUse: another invocation '
+                                                               f'on rig_jlink is running: {[other["receipt"]]}'])
+
+    def test_a_refused_session_command_reports_and_keeps_the_failures_its_claim_found(self):
+        other = {'receipt': {'ops': '/o', 'pid': 99, 'start': '5'}, 'cmd': 'hil_test.py', 'state': 'alive'}
+        self.lock.claims['rig_jlink'] = [other]
+        self.lock.failures['rig_jlink'] = [{'id': 'f1', 'receipts': []}]
+        self.lock.records['rig_jlink'] = {'reason': 'mine', 'pid': 1}
+        code, out = self.main(['exec', '-b', 'rig_jlink', '--under-hold', 'mine', str(self.roster), '--', 'true'])
+        self.assertEqual((code, out['previousCleanupFailure']['id']), (2, 'f1'))
+        result = json.loads(next((self.root / 'build/hil-manual').glob('rig_jlink-exec-*/result.json')).read_text())
+        self.assertEqual((result['pass'], result['previousCleanupFailure']['id']), (False, 'f1'))
+        self.assertIn('is running', result['error'])
+        args = self.held(cmd='restore', release=True, report=None, build_record='r.json')
+        with mock.patch.object(H, 'release_hold', return_value={'exit': 0, 'output': ''}), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(H.manual(args), H.RESTORE_FAILED)
+        out = json.loads(out.getvalue())
+        self.assertEqual(out['previousCleanupFailure']['id'], 'f1')
+        self.assertIn('is running', out['error'])
+
+    def test_a_clean_session_command_removes_its_claim(self):
+        args = self.held(cmd='exec', argv=['true'], timeout=5)
+        self.A.process.run_tracked.return_value = mock.Mock(returncode=0, stdout='', stderr='', cleanup='done',
+                                                            receipt=None)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(H.manual(args), 0)
+        self.assertEqual(self.lock.claims['rig_jlink'], [])
+        self.A.process.run_tracked.return_value.cleanup, self.A.process.recheck_dir.return_value = 'pending', \
+            ('pending', [{'token': 'p'}])
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(H.manual(args), 4)
+        self.assertEqual(json.loads(out.getvalue())['claimNote'], 'claim kept: its operations recheck pending')
+        self.assertEqual(len(self.lock.claims['rig_jlink']), 1)
 
     def test_one_session_command_at_a_time(self):
         args = self.held(cmd='exec', argv=['true'], timeout=5)
@@ -1619,6 +1901,16 @@ class Commission(Base):
         with self.assertRaisesRegex(H.Refused, 'not proven ended'):
             H.op_restore(restore, None, self.dir / 'run', None, None)
 
+    def test_a_live_invocation_refuses_commissioning_before_hardware(self):
+        other = {'receipt': {'ops': '/o', 'pid': 99, 'start': '5'}, 'cmd': 'hil_test.py', 'state': 'alive'}
+        self.lock.claims['rig_jlink'] = [other]
+        flash = mock.Mock(side_effect=AssertionError('flashed'))
+        self.lock.failures['rig_jlink'] = [{'id': 'f1', 'receipts': []}]
+        with self.assertRaisesRegex(H.Refused, 'is running') as refused:
+            self.commission('rig_jlink', {'vidPid': '1234:5678'}, flash=flash)
+        self.assertEqual((len(self.lock.released), self.lock.ended, self.lock.claims['rig_jlink']), (1, [], [other]))
+        self.assertEqual(H.refusal_report(refused.exception)['previousCleanupFailure']['id'], 'f1')   # main's output
+
     def test_an_unusable_run_dir_refuses_before_the_lock(self):
         with mock.patch.object(H, 'Tracker', side_effect=PermissionError('chmod')), \
                 self.assertRaisesRegex(H.Refused, 'run dir .*chmod'):
@@ -1639,6 +1931,143 @@ class Commission(Base):
                             reset=mock.Mock(return_value=''), scan=lambda *a: [{'serial': 'JUID', 'ino': ino[0]}])
         self.assertEqual((len(self.lock.released), self.lock.ended), (1, []))
         self.assertFalse(list(self.root.glob('build/hil-manual/commission-rig_jlink-*/result.json')))
+
+
+class ClaimsOnTheRealLock(Base):
+    """The claim against agentrc's real hil_lock and hil_process: a real earlier invocation, SIGKILLed while the child
+    its run_tracked command left still runs under its supervisor, or still alive (agentrc#467)."""
+
+    def setUp(self):
+        super().setUp()
+        self.locks = self.dir / 'locks'
+        self.patch(REAL.lock, 'BOARD_LOCK_DIR', str(self.locks))
+        self.patch(self.A, 'lock', REAL.lock)
+        self.patch(self.A, 'process', REAL.process)
+
+    def run_board(self, admit=AssertionError('admitted')):
+        with mock.patch.object(H, 'probe_present', return_value=''), mock.patch.object(H, 'admit', side_effect=admit):
+            return H.run_board('rig_jlink', self.board('rig_jlink'), ['echo'], self.dir / 'rec.json', self.roster,
+                               self.dir / 'run', None)
+
+    def claims(self):
+        return REAL.lock.PendingSessions('rig_jlink', H.CLAIM_KIND).read()
+
+    def assert_released(self):
+        fh = REAL.lock.take_board_lock('rig_jlink', 'selftest')
+        REAL.lock.release_board_lock(fh)
+
+    @staticmethod
+    def meanwhile(action):
+        """PendingSessions.claim patched so that `action(record)` runs right after this process's own claim, as
+        another claimant would between that claim and the judgement."""
+        real = REAL.lock.PendingSessions.claim
+
+        def claim(record, entry):
+            others = real(record, entry)
+            if entry['receipt']['pid'] == os.getpid():
+                action(record)
+            return others
+        return mock.patch.object(REAL.lock.PendingSessions, 'claim', claim)
+
+    def logs_dead(self, dead, child, logged, then=lambda: None):
+        """A claimant's judgement of `dead`: its receipts logged, its claim removed, then `then()` and its child
+        ended."""
+        def action(record):
+            receipts = REAL.lock.invocation_state(dead)[1]
+            logged.append(REAL.lock.log_cleanup_failure('rig_jlink', 'live', detail='x', task=dead['receipt'],
+                                                        receipts=receipts))
+            record.remove(dead)
+            then()
+            kill_quietly(child, signal.SIGKILL)
+            wait_done(REAL.process.recheck, receipts[0])
+        return action
+
+    def test_a_dead_invocations_live_child_holds_the_board_until_it_ends(self):
+        dead, child = killed_claimant(self, self.locks, 'rig_jlink', H.CLAIM_KIND, self.dir / 'dead')
+        self.patch(H, 'CLAIM_SETTLE', 0.5)
+        row = self.run_board()
+        self.assertEqual((row['locked'], H.verdict(row), row['cleanup']['state']), (True, 'not-run', 'untouched'))
+        self.assertIn('still run after 0.5s', row['detail'])
+        failure = row['previousCleanupFailure']
+        self.assertEqual((failure['task'], len(failure['receipts'])), (dead['receipt'], 1))
+        self.assertEqual(REAL.process.recheck(failure['receipts'][0]), 'pending')
+        self.assertEqual(self.claims(), [dead])   # kept: the next attempt judges it again
+        self.assert_released()
+        row = self.run_board()   # the child still runs: refused again, nothing logged again
+        self.assertEqual((row['locked'], row['previousCleanupFailure']['id']), (True, failure['id']))
+        self.assertEqual((len(REAL.lock.open_cleanup_failures('rig_jlink')), self.claims()), (1, [dead]))
+        kill_quietly(child, signal.SIGKILL)
+        wait_done(REAL.process.recheck, failure['receipts'][0])
+        row = self.run_board(admit=H.Refused('stop here'))
+        self.assertEqual((row['locked'], row['detail'], self.claims()), (False, 'refused: stop here', []))
+        self.assertEqual(len(os.listdir(dead['receipt']['ops'])), 3)   # kept for the logged failure's resolve
+        self.assertEqual(REAL.lock.resolve_restored('rig_jlink', [failure], evidence='restored'), [])
+
+    def test_an_unknown_receipt_is_logged_and_never_holds_the_board(self):
+        dead, out = claimant(self, self.locks, 'rig_jlink', H.CLAIM_KIND, self.dir / 'dead')
+        dead.kill()
+        dead.wait()
+        ops = Path(out['entry']['receipt']['ops'])
+        (ops / 'hil_op_feed.log').write_text('')   # no lock or record: never rechecks done
+        started = time.monotonic()
+        row = self.run_board(admit=H.Refused('stop here'))
+        self.assertLess(time.monotonic() - started, 5)   # nothing pending: no wait
+        self.assertEqual((row['locked'], row['detail'], self.claims()), (False, 'refused: stop here', []))
+        self.assertEqual(row['previousCleanupFailure']['receipts'][0]['unrecheckable'], 'no .lock or .json file')
+
+    def test_a_refusal_for_a_live_claimant_never_tidies_a_receipt_it_logged(self):
+        dead, child = killed_claimant(self, self.locks, 'rig_jlink', H.CLAIM_KIND, self.dir / 'dead')
+        claimant(self, self.locks, 'rig_jlink', H.CLAIM_KIND, self.dir / 'live')
+        logged = []
+        with self.meanwhile(self.logs_dead(dead, child, logged)):
+            row = self.run_board()
+        self.assertIn('is running', row['detail'])
+        self.assertEqual(REAL.process.recheck(logged[0]['receipts'][0]), 'done')
+        self.assertEqual(REAL.lock.resolve_restored('rig_jlink', logged, evidence='restored'), [])
+
+    def test_a_failure_another_claimant_logged_after_the_take_is_reported_and_resolved(self):
+        dead, child = killed_claimant(self, self.locks, 'rig_jlink', H.CLAIM_KIND, self.dir / 'dead')
+        live, _ = claimant(self, self.locks, 'rig_jlink', H.CLAIM_KIND, self.dir / 'live')
+        logged, resolved, resolve_restored = [], [], REAL.lock.resolve_restored
+
+        def exits():
+            live.stdin.close()
+            live.wait()
+
+        def resolve(board, failures, **evidence):
+            resolved.append([f['id'] for f in failures])
+            return resolve_restored(board, failures, **evidence)
+        with self.meanwhile(self.logs_dead(dead, child, logged, then=exits)), \
+                mock.patch.object(REAL.lock, 'resolve_restored', resolve), \
+                mock.patch.object(H, 'probe_present', return_value=''), \
+                mock.patch.object(H, 'admit', return_value=({'source': {'head': 'abc'}, 'fqbn': 'f', 'platform': {},
+                                                             'sketches': {}}, {'echo': {'sha256': {}, 'fqbn': 'f'}})), \
+                mock.patch.object(H, 'step', return_value={'test': 'echo', 'pass': True, 'detail': 'ok'}), \
+                mock.patch.object(H, 'restore', return_value={'pass': True, 'state': 'echo restored',
+                                                              'evidence': 'ok'}):
+            row = H.run_board('rig_jlink', self.board('rig_jlink'), ['echo'], self.dir / 'rec.json', self.roster,
+                              self.dir / 'run', None)
+        self.assertEqual((H.verdict(row), row['previousCleanupFailure']['id']), ('pass', logged[0]['id']))
+        self.assertEqual(resolved, [[logged[0]['id']]])
+        self.assertEqual(REAL.lock.open_cleanup_failures('rig_jlink'), [])   # its receipt kept, so resolved
+
+    def test_an_exited_unreaped_claimant_is_not_alive(self):
+        zombie, _ = claimant(self, self.locks, 'rig_jlink', H.CLAIM_KIND, self.dir / 'zombie')
+        zombie.kill()
+        deadline = time.monotonic() + 10
+        while proc_stat(zombie.pid)[1] != 'Z':
+            self.assertLess(time.monotonic(), deadline, 'not a zombie once SIGKILLed')
+            time.sleep(0.05)
+        row = self.run_board(admit=H.Refused('stop here'))
+        self.assertEqual((row['locked'], row['detail'], self.claims()), (False, 'refused: stop here', []))
+
+    def test_a_live_invocation_refuses_the_run_and_keeps_its_claim(self):
+        live, out = claimant(self, self.locks, 'rig_jlink', H.CLAIM_KIND, self.dir / 'live')
+        row = self.run_board()
+        self.assertEqual((row['locked'], H.verdict(row)), (True, 'not-run'))
+        self.assertIn('is running', row['detail'])
+        self.assertEqual(self.claims(), [out['entry']])
+        self.assert_released()
 
 
 class Report(Base):

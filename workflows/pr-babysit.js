@@ -901,7 +901,7 @@ const tailsRefreshed = new Set()
 // Saved entries are of the state's expectedHead; one saved before the head was left out names it too.
 if (restored) for (const e of restored.ciCache.entries) ciVerdicts.set(e.link, { ...e, head: restored.expectedHead })
 const ciChecks = { judged: 0, partial: 0, reused: 0, unchanged: 0 }
-const CARRIED = ['cycle', 'head', 'lane', 'adoption', 'reviewPushFailed', 'ciPushFailed', 'ciWaited', 'ciCollectFailed']
+const CARRIED = ['cycle', 'head', 'lane', 'adoption', 'reviewPushFailed', 'ciPushFailed', 'ciWaited', 'ciCollectFailed', 'reconciled']
 // commentId -> { how, digest, sonar?, sonarOf? }: the answer and the body digest it addressed; an edit owes again. sonar: a code-scanning answer until its
 // SonarCloud issue settles; sonarOf: the { how, digest } of our earlier answer it belongs to, when the caller's reply settled the comment since.
 const answeredWith = new Map(restored ? restored.answeredWith : [])
@@ -3315,6 +3315,30 @@ if (restored && restored.pin && JSON.stringify(currentPin) !== JSON.stringify(re
   log(`preflight: this is not the PR the state belongs to — ${JSON.stringify(currentPin)} vs ${JSON.stringify(restored.pin)}`)
   return finish(stop(lastCycle, 'state-mismatch', { pin: currentPin, expected: restored.pin }))
 }
+if (pinned.badPushUrl) {
+  const expected = `github.com/${pinned.prRepo.trim().toLowerCase()}`
+  log(`preflight: ${pinned.remote} pushes to ${pinned.badPushUrl}, not PR #${args.pr}'s head repository ${expected} (only github.com over https or ssh)`)
+  return finish(stop(lastCycle, 'wrong-remote', { remoteUrl: pinned.badPushUrl, expected }))
+}
+// #443: a candidate whose push was refused or went unread may have landed after all. Only the live PR head being its exact
+// commit proves that, never ancestry or a rebasedHead; its failure stays in the state as the evidence.
+let reconciled = null
+const candidate = restored && restored.pin && restored.pending
+const source = candidate && history.length ? history[history.length - 1][candidate.lane === 'adopt' ? 'adoption' : `${candidate.lane}PushFailed`] : null
+if (source && candidate.sha && candidate.sha === pinned.prHead.trim() && (candidate.lane === 'adopt' ? source.to : source.sha) === candidate.sha &&
+  ['publication-unknown', 'push-failed', 'adopt-push-unknown', 'adopt-push-failed'].includes(candidate.stage)) {
+  const { lane, stage, sha, parent } = candidate
+  const failure = lane === 'adopt' ? { publication: source.publication, detail: source.detail } : source
+  reconciled = { lane, stage, sha, parent, failure }
+  const last = { ...history[history.length - 1], reconciled }
+  if (lane === 'adopt') last.adoption = { ...source, publication: 'already-published', detail: `PR #${args.pr} heads ${sha.slice(0, 7)}, read back by a later preflight` }
+  else delete last[`${lane}PushFailed`]
+  history[history.length - 1] = last
+  expectedHead = sha
+  restored = { ...restored, expectedHead, pending: pendingOf() }
+  log(`preflight: the ${lane} candidate ${sha.slice(0, 7)} on ${parent.slice(0, 7)}, recorded ${stage}, is published: PR #${args.pr} heads it; ` +
+    'continuing from it, its debt, answers and decisions kept')
+}
 if (rebasedHead !== null) {
   const why = pinned.head.trim() !== rebasedHead ? `HEAD is ${pinned.head.slice(0, 7)}, not the rebasedHead ${rebasedHead.slice(0, 7)}`
     : restored.pending ? `the state holds an unpublished candidate (${restored.pending.stage}); resolve it first` : null
@@ -3323,21 +3347,19 @@ if (rebasedHead !== null) {
     return finish(stop(lastCycle, 'rebase-refused', { detail: why }))
   }
 }
-if (adoptHead === null && rebasedHead === null && restored && restored.pin && pinned.head.trim() !== restored.expectedHead) {
+// Retrying a reconciled repair's adoption has nothing left to adopt; a reconciled adoption is retried from its own parent below.
+const adopting = adoptHead !== null && !(reconciled && reconciled.lane !== 'adopt' && reconciled.sha === adoptHead)
+if (adoptHead !== null && !adopting) log(`preflight: ${adoptHead.slice(0, 7)} is the ${reconciled.lane} repair reconciled above: nothing left to adopt`)
+if (!adopting && rebasedHead === null && restored && restored.pin && pinned.head.trim() !== restored.expectedHead) {
   log(`preflight: HEAD is ${pinned.head.slice(0, 7)}, but the previous launch left ${restored.expectedHead.slice(0, 7)}`)
   return finish(stop(lastCycle, 'stale-head', { head: pinned.head.trim(), expected: restored.expectedHead }))
-}
-if (pinned.badPushUrl) {
-  const expected = `github.com/${pinned.prRepo.trim().toLowerCase()}`
-  log(`preflight: ${pinned.remote} pushes to ${pinned.badPushUrl}, not PR #${args.pr}'s head repository ${expected} (only github.com over https or ssh)`)
-  return finish(stop(lastCycle, 'wrong-remote', { remoteUrl: pinned.badPushUrl, expected }))
 }
 // Adoption replaces the head checks: checkout at adoptHead, PR at the state's head or a chain commit, the chain audited commit by commit.
 // Without a pinned state (a first launch, or one that stopped before its pin) the chain starts at the live PR head (#260).
 let adoption = null
-if (adoptHead !== null) {
+if (adopting) {
   const prHead = pinned.prHead.trim()
-  const X = restored && restored.pin ? restored.expectedHead : prHead
+  const X = reconciled && reconciled.sha === adoptHead ? reconciled.parent : restored && restored.pin ? restored.expectedHead : prHead
   const base = pinned.prBase.trim()
   const tip = pinned.prBaseTip.trim()
   if (pinned.head.trim() !== adoptHead) {
@@ -3409,7 +3431,9 @@ if (adoptHead !== null) {
   }
   adoption = { from: X, to: adoptHead, commits: shas, paths: [...new Set(paths.map(canon))], published: prHead === adoptHead }
 }
-const rebased = rebasedHead !== null ? { from: restored.expectedHead, to: rebasedHead } : null
+const repinned = rebasedHead !== null && !(reconciled && rebasedHead === reconciled.sha)
+if (rebasedHead !== null && !repinned) log(`preflight: rebasedHead ${rebasedHead.slice(0, 7)} is the candidate reconciled above: nothing to re-pin`)
+const rebased = repinned ? { from: restored.expectedHead, to: rebasedHead } : null
 if (rebased) log(`preflight: re-pinned ${rebased.from.slice(0, 7)} -> ${rebased.to.slice(0, 7)}, the PR history the caller rewrote, unaudited; cycles, answers, decisions, holds and deferrals kept`)
 // A rewrite renamed our repair commits: a pending fix note keeps its body but can no longer be posted on a judgment naming one.
 if (rebased) for (const d of debt.values()) if (d.attempt) delete d.attempt.repair

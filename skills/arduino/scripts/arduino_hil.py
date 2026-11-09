@@ -18,7 +18,9 @@ run(profile, argv), loading this file from the pinned agentrc (its `agentrc_pin.
 The usage, exits and report are the library's HIL SKILL.md; the shared rules are agentrc's `hil` and `arduino`
 skills. Locks and the board's cleanup log are agentrc's `hil_lock.py`, the same for every library, so two libraries
 on one physical board exclude each other; a lock ends with its run or session command, a failed cleanup logged
-(agentrc#464). PENDING_KIND names the pending-session record an older engine kept: reported, never a refusal.
+(agentrc#464). Each invocation claims the board before its first tool (agentrc#467, CLAIM_KIND), so a lock alone is
+no permission to touch the probe. PENDING_KIND names the pending-session record an older engine kept: reported, never a
+refusal.
 """
 
 import argparse
@@ -80,6 +82,8 @@ STEP_MAX = VERIFY_TIMEOUT + DETACH_WAIT + FLASH_TIMEOUT + VERIFY_TIMEOUT + ENUM_
 CLEANUP_RESERVE = STEP_MAX   # the restore is one more such step
 BASE_MAX = 2 * VERIFY_TIMEOUT   # a base image's check and rewrite before a flash (ensure_base), added per step
 PENDING_KIND = 'arduino-hil'   # an older engine's pending-session record, every Arduino library's
+CLAIM_KIND = 'arduino-hil-claim'   # the invocations claiming a board (agentrc#467), every Arduino library's
+CLAIM_SETTLE = 30   # s an earlier invocation's still-running children get to end before an attempt gives the board up
 
 
 def _hil_load():
@@ -128,6 +132,20 @@ class Refused(Exception):
 
 class NotHeld(Refused):
     """The board's holder record is readable and is no live hold under the caller's reason: exit NOT_HELD."""
+
+
+class InUse(Refused):
+    """Another invocation on the board is alive, or an earlier one's children still run: not run. `found` is the
+    board's open failures, those it logged included."""
+
+    def __init__(self, msg, found):
+        super().__init__(msg)
+        self.found = found
+
+
+def refusal_report(e):
+    """The report keys a refusal carries: an InUse's open failures, the ones its claim logged included."""
+    return A.lock.failure_report(e.found) if isinstance(e, InUse) else {}
 
 
 class Unclean(Exception):
@@ -339,18 +357,13 @@ class Tracker:
     """Every hardware child runs through agentrc's run_tracked; one not proven ended stops the board."""
 
     def __init__(self, run_dir):
-        # run_tracked trusts a state dir only when neither it nor its parent is writable by others
-        self.state_dir = Path(run_dir) / 'tracked'
-        self.state_dir.mkdir(parents=True, exist_ok=True)
-        os.chmod(run_dir, 0o700)
-        os.chmod(self.state_dir, 0o700)
-        A.process.trusted_dir(str(self.state_dir))
+        self.state_dir = A.process.state_dir(str(run_dir), 'tracked')
         self.receipts, self.pending, self.unclean, self.log = [], [], '', Path(run_dir) / 'hil.log'
 
     def run(self, argv, timeout, **kw):
         self.check()
         try:
-            r = A.process.run_tracked(argv, timeout=timeout, settle=SETTLE, state_dir=str(self.state_dir), **kw)
+            r = A.process.run_tracked(argv, timeout=timeout, settle=SETTLE, state_dir=self.state_dir, **kw)
         except BaseException as e:
             self._note(getattr(e, 'cleanup', 'unknown'), getattr(e, 'receipt', None), argv)
             raise
@@ -497,7 +510,7 @@ def detach(name, board, vid_pid, tracker):
         return f'detach session failed (exit {op.returncode})'
     deadline = time.monotonic() + DETACH_WAIT
     while time.monotonic() < deadline:
-        if not (dut_devices(vid_pid, board) if vid_pid else A.usb.usb_scan(serial=board['uid'])):
+        if dut_absent(vid_pid, board):
             return 'detached'
         time.sleep(0.2)
     return f'still enumerated {DETACH_WAIT}s after the detach'
@@ -562,6 +575,25 @@ def dut_devices(vid_pid, board):
         return [d for d in devices(vid_pid) if d['busport'] == board['usb_port'] and no_serial(d)]
     found = scan(vid_pid, board['uid'])
     return [d for d in found if d['busport'] == board['usb_port']] if 'usb_port' in board else found
+
+
+def dut_absent(vid_pid, board):
+    """Whether the DUT is off the bus, any VID when vid_pid is None. A serial-keyed DUT is absent once no candidate
+    (with this VID:PID, at its `usb_port` when the roster sets one) carries its serial or one whose read was
+    inconclusive (missing, timed out, unreadable, or across a re-enumeration): that device could be it, as in
+    usb_absent. Only a host-wide scan, no VID:PID and no `usb_port`, passes over devices with no `serial` in their
+    enumeration: counting those would wait on every serial-less hub."""
+    if board.get('no_serial'):
+        return not (dut_devices(vid_pid, board) if vid_pid else
+                    [d for d in A.usb.usb_devices() if d['busport'] == board['usb_port']])
+    uid, port = board['uid'].lower(), board.get('usb_port')
+    for d in devices(vid_pid) if vid_pid else A.usb.usb_devices():
+        if (port and d['busport'] != port) or (not (vid_pid or port) and no_serial(d)):
+            continue
+        sn = A.usb.read_sysfs(str(Path(d['dir']) / 'serial'))
+        if sn is None or A.usb.enumeration_id(d['dir']) != d['ino'] or sn.lower() == uid:
+            return False
+    return True
 
 
 def dut_name(board):
@@ -715,12 +747,97 @@ def note_restored(name, failures, evidence):
         return f'restorations not logged: {e}'
 
 
-def log_failure(name, detail, pending):
-    """A cleanup this session command (no flock of its own) could not prove; '' or why it was not logged."""
+def log_failure(name, detail, pending, task=None):
+    """A cleanup this session command (no flock of its own), or an earlier invocation (`task`, its claim), could not
+    prove; '' or why it was not logged."""
     try:
-        A.lock.log_cleanup_failure(name, 'hil_test.py', detail=detail, receipts=[p['receipt'] for p in pending])
+        A.lock.log_cleanup_failure(name, 'hil_test.py', detail=detail, task=task,
+                                   receipts=[p['receipt'] for p in pending])
     except Exception as e:
         return f'cleanup log not written: {e}'
+    return ''
+
+
+def with_logged(found, fresh):
+    """`found` (a take's or a session's open failures) plus each of `fresh`, the log read now, it lacks: by id, or
+    whole for one whose id is not a string (the log keeps those open, and they may be unhashable)."""
+    ids = {f['id'] for f in found if isinstance(f.get('id'), str)}
+    return found + [f for f in fresh if (f['id'] not in ids if isinstance(f.get('id'), str) else f not in found)]
+
+
+def add_claim_note(d, why):
+    """Append `why`, when there is one, to `d`'s claimNote."""
+    if why:
+        d['claimNote'] = '; '.join(filter(None, (d.get('claimNote'), why)))
+
+
+def claim(name, tracker, found):
+    """Name this invocation in the board's claim record before its first tool, under the board's lock or the caller's
+    hold, and judge the earlier claims there (agentrc `hil` skill, Board locks). Returns (entry, `found` with what the
+    log holds now, '' or what was not logged or removed); Refused when the record cannot name this invocation, InUse
+    while another invocation is alive or a child of an earlier one still runs after CLAIM_SETTLE, this claim removed
+    and that earlier one kept."""
+    record = A.lock.PendingSessions(name, CLAIM_KIND)
+    try:
+        entry = A.lock.claim_entry(tracker.state_dir, 'hil_test.py')
+        others = record.claim(entry)
+    except (OSError, ValueError, A.lock.PendingRefused) as e:
+        raise Refused(f"the board's claim record could not name this invocation: {type(e).__name__}: {e}")
+    notes, earlier, logged = [], [], False
+    try:
+        if alive := [s['receipt'] for s in others if A.lock.claim_alive(s)]:
+            raise InUse(f'another invocation on {name} is running: {alive}', found)
+        # read after the gate: a claimant alive at the take may have logged a receipt since, to report and keep
+        found = with_logged(found, A.lock.open_cleanup_failures(name))
+        keep = A.lock.logged_tokens(found)
+        for s in others:
+            state, receipts = A.lock.invocation_state(s, keep)
+            if state == 'alive':   # not after the gate, but a live claim is never removed
+                continue
+            why = ''
+            if new := [r for r in receipts if A.lock.receipt_token(r) not in keep]:
+                why = log_failure(name, 'an earlier invocation ended with children not proven ended',
+                                  [{'receipt': r} for r in new], task=s['receipt'])
+                logged = logged or not why
+                if why:
+                    notes.append(why)
+            earlier.append((s, receipts, bool(why)))
+        if logged:
+            found = with_logged(found, A.lock.open_cleanup_failures(name))
+        states = iter(A.lock.settle([r for _, receipts, _ in earlier for r in receipts], CLAIM_SETTLE)[0])
+        running = []
+        for s, receipts, unlogged in earlier:
+            # only a proven-live child holds the board; its claim stays for the next attempt to judge again
+            if pending := [r for r in receipts if next(states) == 'pending']:
+                running += pending
+            elif not unlogged:   # one whose log failed stays, for the next attempt to log
+                try:
+                    record.remove(s)
+                except (OSError, A.lock.PendingRefused) as e:
+                    notes.append(f'earlier claim not removed: {e}')
+        if running:
+            raise InUse(f'children of an earlier invocation on {name} still run after {CLAIM_SETTLE}s: '
+                        f'{A.lock.open_runs(running, ["pending"] * len(running))}', found)
+    except InUse:
+        with contextlib.suppress(OSError, A.lock.PendingRefused):
+            record.remove(entry)
+        raise
+    return entry, found, '; '.join(notes)
+
+
+def unclaim(name, entry, tracker):
+    """Remove this invocation's claim once recheck_dir of its operations answers done, the files of those it logged
+    kept for resolve_restored; before its lock goes, so the next taker does not find it alive. '' or why it stays."""
+    if entry is None:
+        return ''
+    try:
+        keep = {t for p in tracker.pending if (t := A.lock.receipt_token(p['receipt']))}
+        verdict, _ = A.process.recheck_dir(tracker.state_dir, keep)
+        if verdict != 'done':
+            return f'claim kept: its operations recheck {verdict}'
+        A.lock.PendingSessions(name, CLAIM_KIND).remove(entry)
+    except Exception as e:   # the lock is released after this whatever it found
+        return f'claim not removed: {type(e).__name__}: {e}'
     return ''
 
 
@@ -769,11 +886,21 @@ def run_board(name, board, tests, record_path, roster_path, run_root, manifest):
     except A.lock.LockUnavailable as e:
         row.update(detail=f'board lock unavailable: {e}')
         return row
-    started, unclean, found = time.monotonic(), '', fh.cleanup_failures
+    started, unclean, found, entry = time.monotonic(), '', fh.cleanup_failures, None
     row.update(A.lock.failure_report(found))
     try:
         if why := legacy_pending(name):
             row['previousPending'] = why
+        try:
+            entry, found, why = claim(name, tracker, found)
+        except InUse as e:
+            row.update(locked=True, detail=f'board in use: {e}', **A.lock.failure_report(e.found))
+            return row
+        except Refused as e:
+            row['detail'] = f'refused: {e}'
+            return row
+        row.update(A.lock.failure_report(found))
+        add_claim_note(row, why)
         try:
             rec, images = admit(record_path, name, roster_path, run_dir, manifest=manifest)
         except Refused as e:
@@ -809,6 +936,7 @@ def run_board(name, board, tests, record_path, roster_path, run_root, manifest):
         row['cleanup']['receipts'] = list(tracker.receipts)
         if tracker.pending:   # unrecheckable ones included: the board's cleanup log keeps them
             row['cleanup']['pending'] = list(tracker.pending)
+        add_claim_note(row, unclaim(name, entry, tracker))
         end_run(fh, name, row, tracker, found)
     return row
 
@@ -1011,14 +1139,16 @@ def _session_op(args, run_dir):
     result.json. A restore records its outcome in the board's cleanup log: one that failed, was refused or raised as a
     failure, a passing one as the restoration of the failure seen before it ran."""
     found = A.lock.open_cleanup_failures(args.board)
-    tracker, extra, interrupt = None, {}, None
+    tracker, extra, interrupt, entry = None, {}, None, None
     try:
         roster, manifest = _session_inputs(args)
         run_dir.mkdir(parents=True, exist_ok=True)
         tracker = Tracker(run_dir)
-        extra = A.lock.failure_report(found)
         if why := legacy_pending(args.board):
             extra['previousPending'] = why
+        entry, found, why = claim(args.board, tracker, found)
+        extra.update(A.lock.failure_report(found))
+        add_claim_note(extra, why)
         row = OPS[args.cmd](args, roster[args.board], run_dir, tracker, manifest)
         out, code = {'pass': row['pass'], 'board': args.board, **row, 'survivors': [], 'log': str(tracker.log),
                      **extra}, 0 if row['pass'] else 1
@@ -1027,9 +1157,14 @@ def _session_op(args, run_dir):
         if not pending and not isinstance(e, Unclean):
             why = args.cmd == 'restore' and log_failure(
                 args.board, f'restore refused or raised: {type(e).__name__}: {e}', [])
+            if isinstance(e, InUse):   # its claim may have logged an earlier invocation's failure: kept with it
+                with contextlib.suppress(OSError):
+                    (run_dir / 'result.json').write_text(json.dumps(
+                        {'pass': False, 'board': args.board, 'error': '; '.join(filter(None, (str(e), why))),
+                         **extra, **refusal_report(e)}) + '\n')
             if why and isinstance(e, Refused):
-                raise Refused(f'{e}; {why}') from e
-            if why:
+                e.args = (f'{e}; {why}',)   # its type and report kept
+            elif why:
                 e.add_note(why)
             raise
         error = f'a child outlived its operation: {type(e).__name__}: {e}'
@@ -1043,6 +1178,9 @@ def _session_op(args, run_dir):
                    log_failure(args.board, f'restore failed: {row.get("evidence")}', tracker.pending))
             if why:
                 out['cleanupLog'] = why
+    finally:
+        claim_note = unclaim(args.board, entry, tracker)
+    add_claim_note(out, claim_note)
     (run_dir / 'result.json').write_text(json.dumps(out) + '\n')
     return out, code, interrupt
 
@@ -1059,6 +1197,7 @@ def _restore_and_release(args):
         except Exception as e:
             out['error'] = '; '.join([str(e) if isinstance(e, Refused) else f'{type(e).__name__}: {e}',
                                       *getattr(e, '__notes__', ())])
+            out.update(refusal_report(e))
         except BaseException as e:
             out['error'], interrupted = f'{type(e).__name__}: {e}', e
         finally:
@@ -1345,11 +1484,17 @@ def cmd_commission(args):
         fh = A.lock.take_board_lock(args.board, 'hil_test.py commission', protected=True, locks=[args.board])
     except (A.lock.BoardLocked, A.lock.RecoveryBlocked, A.lock.LockUnavailable) as e:
         raise Refused(f'{args.board}: {e}')
-    out, touched = {'board': args.board, 'rosterUid': board['uid']}, False
+    out, touched, entry = {'board': args.board, 'rosterUid': board['uid']}, False, None
+
+    def unclaimed():
+        add_claim_note(out, unclaim(args.board, entry, tracker))
     try:
         out.update(A.lock.failure_report(fh.cleanup_failures))
         if why := legacy_pending(args.board):
             out['previousPending'] = why
+        entry, found, why = claim(args.board, tracker, fh.cleanup_failures)
+        out.update(A.lock.failure_report(found))
+        add_claim_note(out, why)
         _, images = admit(Path(args.record_dir) / f'{args.board}.build.json', args.board, args.roster, run_dir)
         image = images[restore_sketch(args.board)]
         observed = []
@@ -1393,9 +1538,11 @@ def cmd_commission(args):
         if not ok:
             raise RuntimeError(f'{restore_sketch(args.board)} left running fails {test}: {out["cleanup"]}')
     except Refused:
+        unclaimed()
         A.lock.release_board_lock(fh)
         raise
     except BaseException as e:   # after hardware access: the board's state is unknown, its failure logged
+        unclaimed()
         if not touched:
             A.lock.release_board_lock(fh)
             raise
@@ -1409,6 +1556,7 @@ def cmd_commission(args):
         emit(out)
         return 4
     else:   # outside the handlers: an interrupt during the release must not end the board as failed
+        unclaimed()
         A.lock.release_board_lock(fh)
     emit(out)
     return 0 if out.get('matchesRoster') else 1
@@ -1507,5 +1655,5 @@ def main(argv=None):
             return cmd_release(args)
         return cmd_report(args)
     except Refused as e:
-        emit({'pass': False, 'error': str(e)})
+        emit({'pass': False, 'error': str(e), **refusal_report(e)})
         return NOT_HELD if isinstance(e, NotHeld) else 2

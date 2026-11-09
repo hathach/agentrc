@@ -34,9 +34,16 @@ Contract:
   write unless sticky: run_tracked (PermissionError, before anything starts) and recheck
   (unknown) check those two only (`trusted_dir`), since a replaced lock or record would forge
   `done`. Higher ancestors are not checked; the caller must keep them trusted and unchanged
-  for as long as a receipt names the directory. Files of a `done` run are removed only once
+  for as long as a receipt names the directory; `state_dir` creates one in the caller's run dir
+  whatever the umask. Files of a `done` run are removed only once
   the verdict is on the result or exception; the others stay for recheck and are the
-  caller's to remove (`tidy`, once a recheck answers `done`). A missing file reads as unknown.
+  caller's to remove (`tidy`, once a recheck answers `done`). A missing file reads as unknown,
+  unless the lock is held: a supervisor still starting, pending. A supervisor whose hello
+  cannot reach its caller runs nothing: its record says `done` and it exits.
+  `recheck_dir` rechecks and tidies every operation in a state dir from its files alone; one of
+  another uid, whose files it may not trust, is pending while /proc shows a supervisor of an
+  operation there (its command line) or may hide one (hidepid, an unreadable command line),
+  else unknown.
 """
 
 from __future__ import annotations
@@ -44,6 +51,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import ctypes
+import errno
 import fcntl
 import json
 import math
@@ -384,6 +392,7 @@ PR_SET_CHILD_SUBREAPER = 36
 WAIT_ALL = 0x40000000       # __WALL (uapi linux/wait.h): a clone child is a child too
 SETTLE_POLL = 0.05
 SURVEY_BOUND = 1.0          # the supervisor's best-effort survivor listing, names only
+PROC_SCAN_BOUND = 5.0       # another uid's supervisors listed from /proc: past it, nothing is proven
 # On top of timeout + reap_grace + settle: the supervisor's interpreter start, survey and report.
 SUPERVISOR_MARGIN = 5.0
 
@@ -411,13 +420,15 @@ def _rebuilt(err: dict) -> Exception:
     return RuntimeError(f"{err.get('type')}: {err.get('message')}")
 
 
-def _send(fd: int, msg: dict) -> None:
+def _send(fd: int, msg: dict) -> bool:
+    """Whether `msg` reached the pipe; False once the caller is gone, the record still saying how this ends."""
     data = (json.dumps(msg) + '\n').encode()
     try:
         while data:
             data = data[os.write(fd, data):]
     except OSError:
-        pass        # the caller is gone; the record still says how this ends
+        return False
+    return True
 
 
 def _write_record(path: str, rec: dict) -> None:
@@ -439,6 +450,51 @@ def trusted_dir(path: str) -> str:
     if parent.st_uid not in (os.geteuid(), 0) or parent.st_mode & 0o022 and not parent.st_mode & stat.S_ISVTX:
         raise PermissionError(f'{real}: another user can replace it through its parent')
     return real
+
+
+def _own_dir(path: str, mode: int) -> None:
+    """`path`, absolute and normalized, created if missing, then set to `mode` whatever the umask; refused
+    (PermissionError), and never chmodded, unless its last component is a real directory of ours. A missing ancestor
+    is made the same way at 0o755; an existing one is the caller's to trust, as in trusted_dir."""
+    head, tail = os.path.split(path)
+    if not tail:
+        raise PermissionError(f'{path}: want a directory below /')
+    if not os.path.lexists(head):
+        _own_dir(head, 0o755)
+    parent = os.open(head, os.O_PATH | os.O_DIRECTORY)
+    try:
+        with contextlib.suppress(FileExistsError):
+            os.mkdir(tail, mode, dir_fd=parent)
+        try:
+            # O_PATH needs no read permission on the directory itself (an umask of 0777, a mode of 0300)
+            fd = os.open(tail, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+        except OSError as e:
+            if e.errno in (errno.ELOOP, errno.ENOTDIR):
+                raise PermissionError(f'{path}: want a directory, not a link or a file') from e
+            raise
+    finally:
+        os.close(parent)
+    try:
+        if os.fstat(fd).st_uid != os.geteuid():
+            raise PermissionError(f'{path}: want a directory of uid {os.geteuid()}')
+        os.chmod(f'/proc/self/fd/{fd}', mode)    # fchmod refuses an O_PATH descriptor; this names its inode
+    finally:
+        os.close(fd)
+
+
+def state_dir(parent: str, name: str = 'ops') -> str:
+    """A run_tracked state dir: `parent` (the caller's run dir) and `parent/name` created as needed and set to 0o755
+    and 0o700 whatever the umask, then returned through trusted_dir. An existing one of them is secured only when it
+    is a real directory of ours; a link or another user's is refused (PermissionError) and left as it is, however
+    `parent` is spelled (a trailing slash, `.` or `..` are resolved lexically first). Missing ancestors of `parent`
+    are created 0o755."""
+    if not isinstance(name, str) or name in ('', '.', '..') or '/' in name or '\0' in name:
+        raise ValueError(f'state dir name {name!r}: want a single path component')
+    parent = os.path.abspath(os.fspath(parent))
+    _own_dir(parent, 0o755)
+    path = os.path.join(parent, name)
+    _own_dir(path, 0o700)
+    return trusted_dir(path)
 
 
 def _become_subreaper() -> None:
@@ -477,13 +533,20 @@ def _survey(root: int) -> dict:
     return {'processes': sorted(found, key=lambda p: p['pid']), 'unreadable': sorted(unreadable)}
 
 
-def _bounded_survey(root: int) -> dict | None:
-    # a /proc read can block (stat takes exec_update_lock), so the listing never holds up the report
+def _bounded(fn, bound: float, last: list | None = None):
+    # a /proc read can block (stat takes exec_update_lock, cmdline the mm's lock): fn() or None past `bound` s;
+    # `last` keeps the thread, so a caller can start no other while one is still blocked
     out = []
-    t = threading.Thread(target=lambda: out.append(_survey(root)), daemon=True)
+    t = threading.Thread(target=lambda: out.append(fn()), daemon=True)
+    if last is not None:
+        last[:] = [t]
     t.start()
-    t.join(SURVEY_BOUND)
+    t.join(bound)
     return out[0] if out else None
+
+
+def _bounded_survey(root: int) -> dict | None:
+    return _bounded(lambda: _survey(root), SURVEY_BOUND)
 
 
 def _supervise(job: dict) -> int:
@@ -518,7 +581,10 @@ def _supervise(job: dict) -> int:
     except Exception as e:
         _send(fd, {'result': _error(e), 'cleanup': 'done'})     # nothing started
         return 1
-    _send(fd, {'hello': {'pid': record['pid'], 'start': record['start'], 'lock': record['lock']}})
+    if not _send(fd, {'hello': {'pid': record['pid'], 'start': record['start'], 'lock': record['lock']}}):
+        # the caller died before its hello and may have been judged by its files alone: the board may be another's
+        _write_record(job['record'], {**record, 'cleanup': 'done'})
+        return 1
     track = {}
     try:
         phase['now'] = 'run'
@@ -621,11 +687,17 @@ def tidy(receipt) -> None:
 def recheck(receipt: dict) -> str:
     """'done', 'pending' or 'unknown' for a run_tracked receipt, from its supervisor's own
     state: its lock, the file it created, is held while it lives, and its record, a file of
-    ours, says `done` only once nothing is left. Anything unverifiable is unknown."""
+    ours, says `done` only once nothing is left. Anything unverifiable is unknown, a receipt
+    without a token or paths included (recheck_dir's `unrecheckable` entries). An entry recheck_dir
+    made for a state dir of another uid is rechecked from /proc alone, or as a dir of ours by its owner
+    (_foreign_state)."""
+    if isinstance(receipt, dict) and 'foreign' in receipt:
+        return _foreign_state(receipt)
     try:
+        token = receipt['token']
         trusted_dir(os.path.dirname(receipt['lock']))
         fd = os.open(receipt['lock'], os.O_RDONLY | os.O_NOFOLLOW)
-    except OSError:
+    except (OSError, KeyError, TypeError):
         return 'unknown'
     try:
         st = os.fstat(fd)
@@ -643,11 +715,222 @@ def recheck(receipt: dict) -> str:
         except (OSError, ValueError):
             return 'unknown'
         ours = stat.S_ISREG(rst.st_mode) and rst.st_uid == os.geteuid() and not rst.st_mode & 0o022
-        done = ours and isinstance(rec, dict) and rec.get('token') == receipt['token'] \
+        done = ours and isinstance(rec, dict) and rec.get('token') == token \
             and rec.get('lock') == lock_id and rec.get('cleanup') == 'done'
         return 'done' if done else 'unknown'
     finally:
         os.close(fd)
+
+
+_OP_PREFIX, _OP_FILES = 'hil_op_', ('lock', 'json', 'log')
+
+
+def _receipt(base: str, token: str, supervisor) -> dict:
+    """The receipt of the operation whose files are `base`.{lock,json,log}."""
+    return {'token': token, 'supervisor': supervisor, 'lock': f'{base}.lock', 'record': f'{base}.json',
+            'log': f'{base}.log', 'survivors': None}
+
+
+def _held_lock(path: str) -> list | None:
+    """[dev, ino] of the lock at `path` while a process holds it, else None."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        st = os.fstat(fd)
+        return [st.st_dev, st.st_ino]
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+    return None
+
+
+def _dir_receipt(state_dir: str, token: str, found: set) -> dict:
+    """The receipt of `token`'s files, the supervisor's identity from its record, or from its held lock
+    alone while a file is missing (a supervisor still starting, which recheck answers pending); else a
+    diagnostic entry: `token`, `unrecheckable` (why) and the `files` there, which recheck answers unknown."""
+    base = os.path.join(state_dir, f'{_OP_PREFIX}{token}')
+    paths = {ext: f'{base}.{ext}' for ext in _OP_FILES}
+
+    def unrecheckable(why: str) -> dict:
+        return {'token': token, 'unrecheckable': why, 'files': [paths[ext] for ext in _OP_FILES if ext in found]}
+    if missing := [ext for ext in _OP_FILES if ext not in found]:
+        if 'lock' in found and (held := _held_lock(paths['lock'])):
+            return _receipt(base, token, {'pid': None, 'start': None, 'lock': held})
+        return unrecheckable(f'no {" or ".join(f".{ext}" for ext in missing)} file')
+    try:
+        with os.fdopen(os.open(paths['json'], os.O_RDONLY | os.O_NOFOLLOW)) as f:
+            rec = json.load(f)
+    except (OSError, ValueError) as e:
+        return unrecheckable(f'record unreadable: {e}')
+    if not isinstance(rec, dict) or rec.get('token') != token:
+        return unrecheckable('record of another operation')
+    lock = rec.get('lock')
+    if not (isinstance(lock, list) and len(lock) == 2 and all(type(v) is int for v in lock)):
+        return unrecheckable('record names no lock')
+    return _receipt(base, token, {'pid': rec.get('pid'), 'start': rec.get('start'), 'lock': lock})
+
+
+def _proc_exemptions() -> tuple[bool, set] | None:
+    """(CAP_SYS_PTRACE effective, our fsgid and supplementary gids) from /proc/self/status; None when unreadable, or
+    outside the init user namespace: a hidepid mount's ptrace check and gid= are against init's caps and gids."""
+    try:
+        if os.readlink('/proc/self/ns/user') != f'user:[{0xEFFFFFFD}]':       # PROC_USER_INIT_INO
+            return None
+        with open('/proc/self/status', errors='replace') as f:
+            status = dict(line.split(':', 1) for line in f if ':' in line)
+        return (int(status['CapEff'], 16) >> 19 & 1 == 1,                       # CAP_SYS_PTRACE
+                {int(status['Gid'].split()[3]), *map(int, status['Groups'].split())})
+    except (OSError, KeyError, ValueError, IndexError):
+        return None
+
+
+def _proc_hides_others() -> bool:
+    """Whether /proc may hide another uid's processes from us: mounted hidepid other than 0 (proc(5)), unless we have
+    CAP_SYS_PTRACE or, for hidepid 1 or 2, are in its gid= group, 0 when absent (fs/proc/base.c has_pid_permissions);
+    or its mount unreadable, or our status for a mount that needs it (_proc_exemptions)."""
+    try:
+        with open('/proc/self/mountinfo', errors='replace') as f:
+            lines = [line.split() for line in f]
+    except OSError:
+        return True
+    procs = [f for f in lines if len(f) > 4 and f[4] == '/proc' and '-' in f and f[f.index('-') + 1:][:1] == ['proc']]
+    if not procs:
+        return True
+    opts = ','.join(procs[-1][5:]).split(',')          # the mount's options and its super options
+    hidepid = [o[len('hidepid='):] for o in opts if o.startswith('hidepid=')]
+    if not hidepid or hidepid[-1] in ('0', 'off'):
+        return False
+    exempt = _proc_exemptions()
+    if exempt is None:
+        return True
+    ptrace, gids = exempt
+    if ptrace:
+        return False
+    if hidepid[-1] not in ('1', 'noaccess', '2', 'invisible'):
+        return True                 # ptraceable, or a mode we do not know: gid= exempts no one
+    gid = ([o[len('gid='):] for o in opts if o.startswith('gid=')] or ['0'])[-1]
+    return not (gid.isdigit() and int(gid) in gids)
+
+
+def _supervisors_in(state_dir: str) -> list | None:
+    """[pid] of the first process /proc shows running a supervisor (this file's `--supervise JOB`, as run_tracked
+    starts it) of an operation in `state_dir`, from command lines alone, else []; None when /proc may not show every
+    process to us."""
+    if _proc_hides_others():
+        return None
+    dirs = {os.path.abspath(state_dir), os.path.realpath(state_dir)}
+    try:
+        names = os.listdir('/proc')
+    except OSError:
+        return None
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            with open(f'/proc/{name}/cmdline', 'rb') as f:
+                argv = f.read().split(b'\0')
+        except (FileNotFoundError, ProcessLookupError):
+            continue                    # gone
+        except OSError:
+            return None
+        if b'--supervise' not in argv:
+            continue
+        try:
+            lock = json.loads(argv[argv.index(b'--supervise') + 1])['lock']
+        except (IndexError, ValueError, TypeError, KeyError):
+            continue
+        if isinstance(lock, str) and os.path.dirname(lock) in dirs:
+            return [int(name)]          # one is proof enough: read no command line that may block after it
+    return []
+
+
+_proc_scan: list = []       # _foreign_state's last scan thread
+
+
+class _KeepAll:
+    """recheck_dir's `keep` holding every token: a recheck that tidies nothing."""
+
+    def __contains__(self, _token) -> bool:
+        return True
+
+
+def _foreign_state(entry: dict) -> str:
+    """For the entry's state dir's owner, once trusted_dir passes, recheck_dir's verdict, tidying nothing: the files
+    of other receipts logged against it stay. For any other uid, 'pending' while /proc shows a supervisor of an
+    operation there, or cannot show every process within PROC_SCAN_BOUND, or an earlier scan is still blocked (one
+    such thread, not one per poll); 'unknown' once it shows none: the dir's records, of another uid, prove no `done`.
+    A supervisor lives until it has reaped every descendant, so /proc shows it for as long as its lock is held."""
+    d = entry.get('foreign')
+    try:
+        trusted_dir(d)
+    except (OSError, TypeError, ValueError):
+        pass
+    else:
+        return recheck_dir(d, _KeepAll())[0]
+    if not isinstance(d, str) or any(t.is_alive() for t in _proc_scan):
+        return 'pending'
+    return 'unknown' if _bounded(lambda: _supervisors_in(d), PROC_SCAN_BOUND, _proc_scan) == [] else 'pending'
+
+
+def _foreign_entry(state_dir: str) -> dict | None:
+    """recheck_dir's entry for a state dir of another uid, or one beyond a directory we cannot search: its files
+    are not ours to trust, so it is rechecked from /proc (_foreign_state), `uid` its owner when known. None for
+    any other."""
+    try:
+        st = os.stat(state_dir)
+    except PermissionError:
+        uid = None
+    except (OSError, TypeError, ValueError):
+        return None
+    else:
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid == os.geteuid():
+            return None
+        uid = st.st_uid
+    path = os.path.abspath(state_dir)
+    return {'token': f'foreign:{path}', 'foreign': path, 'uid': uid}
+
+
+def recheck_dir(state_dir: str, keep=()) -> tuple:
+    """(verdict, open entries) for every run_tracked operation with a file in `state_dir`, from
+    those files alone. Each is rebuilt as a receipt whose supervisor identity is its record's,
+    and rechecked; one whose lock, record or log is missing, or whose record is unreadable or
+    names no lock of its own, is unknown, except that a missing file with the lock held is pending,
+    its receipt naming that lock alone. A `done` one is tidied unless its token is in `keep`.
+    verdict: 'done' when every one is done (none found included), 'pending' when the open ones
+    all are, else 'unknown'. Open entries: receipts recheck and tidy accept, or diagnostics with
+    `unrecheckable` (why) and the `files` left, which recheck answers unknown. A state_dir of another
+    uid, or one we cannot reach, is (its recheck, [{'token', 'foreign': its path, 'uid'}]): 'pending'
+    while /proc shows a supervisor of an operation there or cannot show every process, else
+    'unknown', and nothing in it is read or tidied; any other untrusted or unreadable state_dir is
+    ('unknown', [{'unrecheckable': why}])."""
+    try:
+        real = trusted_dir(state_dir)
+        names = os.listdir(real)
+    except OSError as e:
+        if (entry := _foreign_entry(state_dir)) is not None:
+            return recheck(entry), [entry]
+        return 'unknown', [{'unrecheckable': f'{state_dir}: {e}'}]
+    found = {}
+    for name in names:
+        stem, _, ext = name.partition('.')
+        if stem.startswith(_OP_PREFIX) and stem != _OP_PREFIX and ext in _OP_FILES:
+            found.setdefault(stem[len(_OP_PREFIX):], set()).add(ext)
+    verdicts, entries = set(), []
+    for token in sorted(found):
+        entry = _dir_receipt(real, token, found[token])
+        verdict = 'unknown' if 'unrecheckable' in entry else recheck(entry)
+        if verdict == 'done':
+            if token not in keep:
+                tidy(entry)
+            continue
+        verdicts.add(verdict)
+        entries.append(entry)
+    return ('done' if not verdicts else 'pending' if verdicts == {'pending'} else 'unknown'), entries
 
 
 def run_tracked(cmd: str | list, cwd: str | None = None, *, timeout: float, settle: float, state_dir: str,
@@ -662,12 +945,12 @@ def run_tracked(cmd: str | list, cwd: str | None = None, *, timeout: float, sett
         # the job crosses to the supervisor as JSON: path-like arguments as run_cmd's Popen takes them
         argv = cmd if isinstance(cmd, str) else [os.fspath(a) for a in cmd]
         cwd = None if cwd is None else os.fspath(cwd)
-        base = os.path.join(trusted_dir(state_dir), f'hil_op_{secrets.token_hex(8)}')
+        token = secrets.token_hex(8)
+        base = os.path.join(trusted_dir(state_dir), f'{_OP_PREFIX}{token}')
         log = open(f'{base}.log', 'xb')
     except BaseException as e:
         raise _attach(e, 'done', None)
-    receipt = {'token': os.path.basename(base)[len('hil_op_'):], 'supervisor': None, 'lock': f'{base}.lock',
-               'record': f'{base}.json', 'log': f'{base}.log', 'survivors': None}
+    receipt = _receipt(base, token, None)
     rfd, wfd = os.pipe()
     reports = _Reports(rfd)
     job = {'cmd': argv, 'cwd': cwd, 'env': env, 'timeout': timeout, 'settle': settle, 'reap_grace': reap_grace,
@@ -683,6 +966,7 @@ def run_tracked(cmd: str | list, cwd: str | None = None, *, timeout: float, sett
         os.close(wfd)
         log.close()
         _attach(e, 'done', None)        # no supervisor, so no operation either
+        tidy(receipt)
         hold.release()
         raise
     os.close(wfd)

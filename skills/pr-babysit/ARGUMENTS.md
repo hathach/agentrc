@@ -136,7 +136,14 @@ A key not listed here throws before anything runs.
   `launch_result.py`'s `stateRef` names a copy it keeps outside the Workflow
   task directory, so a host reset does not take the state with it. Nothing
   prunes those copies: one is needed only while a caller may continue from its
-  `stateRef`, so a finished PR's can be deleted by hand.
+  `stateRef`, so a finished PR's can be deleted by hand. A candidate the state
+  holds unpublished (a repair or an adoption whose push failed or went
+  unread) that the live PR head now is exactly was published after all:
+  preflight records it so, its failure kept as the evidence in the state's
+  `last.reconciled`, and continues from it, debt, answers and decisions kept.
+  Ancestry or a `rebasedHead` proves nothing: any other unpublished candidate
+  still stops a resume `stale-head`, an adoption `adopt-pending` and a re-pin
+  `rebase-refused`.
 - `adoptHead`: full SHA of audited commits on top of the state's
   `expectedHead` (a caller's repair, or a push made outside the workflow):
   the chain is audited, published under `autoPush`, and the run continues
@@ -149,6 +156,9 @@ A key not listed here throws before anything runs.
   live tip in the checkout (fetch the base branch), or the audit stops with
   `fetch it`. A PR that conflicts with its base
   stops `pr-conflicting`; the merge that resolves it rejoins by `adoptHead`.
+  An `adoptHead` naming a repair reconciled as published has nothing left to
+  adopt; a reconciled adoption retried is audited from its own base and read
+  `already-published`.
 - `adoptProtected`: exact repository-relative paths matching `protected` that a
   base merge in the `adoptHead` chain may change, such as a conflict resolved
   in a protected roster; only with `adoptHead`, per launch. A path an
@@ -165,7 +175,8 @@ A key not listed here throws before anything runs.
   `protected`.
 - `rebasedHead`: full SHA of the PR head after a history rewrite (rebase,
   force-push) the user authorized: with the checkout at it and no unpublished
-  candidate, the state is re-pinned to it unaudited, keeping cycles used,
+  candidate (one it names is reconciled as published, leaving nothing to
+  re-pin), the state is re-pinned to it unaudited, keeping cycles used,
   answers, decisions, holds and deferrals; passed only on the user's word,
   never with `adoptHead`; per launch. Each fix note of ours whose cited commit
   the new head no longer holds, or whose commit no state recorded, comes back

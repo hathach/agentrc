@@ -249,19 +249,38 @@ def usb_scan(vid_pid=None, serial=None, vid=None, timeout=SYSFS_READ_GRACE) -> l
       stalling every caller (see read_sysfs).
 
     A device whose serial is missing or unreadable, or that re-enumerated while it was read,
-    is not returned; the next scan sees the new enumeration.
+    is not returned; the next scan sees the new enumeration. An absence check needs
+    usb_absent, which counts such a device as possibly present.
     """
-    out = []
+    return [{**dev, 'serial': sn} for dev, sn in _with_serials(vid_pid, vid, timeout)
+            if sn is not None and (serial is None or sn.lower() == serial.lower())]
+
+
+def usb_absent(vid_pid=None, serial=None, vid=None, timeout=SYSFS_READ_GRACE) -> bool:
+    """Whether no device matching the filters is enumerated, `serial` compared case aside.
+
+    False while any device matching vid_pid/vid has a serial that is missing, unreadable or
+    timed out, or re-enumerated while it was read: that device could be the one sought, so it
+    cannot establish absence. True only when every match's serial was read and differs, or
+    nothing matches. Stops at the first device that rules absence out; without `serial`, any
+    match does, and no serial is read.
+    """
+    if serial is None:
+        return not usb_devices(vid_pid, vid)
+    for _, sn in _with_serials(vid_pid, vid, timeout):
+        if sn is None or serial is None or sn.lower() == serial.lower():
+            return False
+    return True
+
+
+def _with_serials(vid_pid, vid, timeout):
+    """usb_devices' entries paired with each one's bounded `serial` read, None when it is
+    inconclusive: missing, unreadable, timed out, or read across a re-enumeration."""
     for dev in usb_devices(vid_pid, vid):
         sn = read_sysfs(os.path.join(dev['dir'], 'serial'), timeout)
-        if sn is None:
-            continue          # serial missing or unreadable (wedged, stranded, OSError)
-        if enumeration_id(dev['dir']) != dev['ino']:
-            continue          # re-enumerated across the read: this serial is not the entry's device
-        if serial is not None and sn.lower() != serial.lower():
-            continue
-        out.append({**dev, 'serial': sn})
-    return out
+        if sn is not None and enumeration_id(dev['dir']) != dev['ino']:
+            sn = None         # re-enumerated across the read: this serial is not the entry's device
+        yield dev, sn
 
 
 def jlink_serial_match(uid: str, serial: str) -> str | None:

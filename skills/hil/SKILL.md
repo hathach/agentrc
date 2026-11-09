@@ -98,10 +98,49 @@ nothing in it through a link.
   than the mark carries none and is taken like any other: the farm-wide rule
   holds once every project on the host pins a helper with it.
 - `hil_lock.PendingSessions(<lock>, <kind>)` (`<lock>.<kind>-pending.json` in
-  the lock dir) is the pending-session record of a consumer that still keeps
-  one; its class docstring has the mechanics. agentrc's Arduino engine
-  rechecks the sessions an older engine left there, reports those not proven
-  ended and clears the record once every one is, never refusing on it.
+  the lock dir) is a consumer's per-board record; its class docstring has the
+  mechanics. agentrc's Arduino engine rechecks the sessions an older engine
+  left in its `arduino-hil` record, reports those not proven ended and clears
+  the record once every one is, never refusing on it.
+- Taking the lock is no permission to touch the probe: an invocation claims
+  the board write-ahead in its consumer's record, so one killed at any point
+  is still named. Under the flock it took, or under the caller's hold:
+  1. `claim(claim_entry(<ops dir>, <cmd>))` before its first tool lists
+     `{ops, pid, start}`, its run_tracked state dir resolved, and returns the
+     others; of two racing claims the later lists the earlier. Each claim is
+     a file its claimant owns, so on a dir shared by OS users every user
+     claims; `remove` of another user's claim there, which the sticky bit
+     keeps from being unlinked, retires it with a mark file the remover owns.
+  2. Any other `claim_alive` (its pid runs with its start and a thread
+     that has not exited, or runs with its start unreadable) refuses this
+     attempt before anything is judged: two commands under one hold. Only
+     then, `invocation_state(<other>, keep=logged_tokens(<open failures read
+     now>))` judges each, tidying what it proves done: a live claimant may
+     have logged a receipt since the take. An `ended` one (gone, its ops dir
+     `recheck_dir` done) is removed. An `unresolved` one (gone, an operation
+     not proven ended) has its receipts not yet logged appended with
+     `log_cleanup_failure(..., task=<its claim>, receipts=...)`, never
+     `end_failed` on a hold it does not own; the open failures are read once
+     more and reported (`failure_report`). An ops dir of another OS user is
+     not this uid's to trust: its one entry is `pending` while `/proc` shows a
+     supervisor of an operation there or may hide one (hidepid, an unreadable
+     command line), else `unknown`; a refusal on it names who can clear it
+     (that uid or root rerunning, or removing the claim once none runs). That
+     uid rechecks such an entry, a logged one in `resolve_restored` included,
+     as `recheck_dir` of its own dir, tidying nothing: `done` once every
+     operation there is.
+  3. `settle(<unresolved receipts>, <wait>, busy=<its own probe-use check>)`
+     rechecks until none is `pending`; only a `pending` receipt, a child
+     proven still running, or what `busy` names holds the board. An
+     unresolved claim with a receipt still pending stays, so the next attempt
+     judges it again without logging it again, and this attempt removes its
+     own claim, ends and releases a lock it took. One with none pending
+     (done or `unknown`, which is logged and never waited on) is removed,
+     unless its log append failed: then it stays for the next attempt to log.
+  4. At its end, once `recheck_dir` of its ops dir answers `done` (keeping
+     the files of receipts it logged, which `resolve_restored` rechecks), it
+     `remove`s exactly its own claim before its lock goes; an unclean end
+     keeps it, for the next attempt to judge.
 - A rig-wide operation, one that can reset or renumber a board you do not
   hold (a hub's power, a root-port cycle, a controller rebind), holds every
   board on the host first, across every project's roster there; a contract's
@@ -137,8 +176,12 @@ helper and any cleanup state.
 - A runner that watches the bus (is the board enumerated, which process holds
   its usbfs node) loads this skill's `scripts/usb_observe.py` the way it loads
   the lock helper, one module instance per process; it observes only. Its
-  `jlink_serial_match` and `jlink_serial_candidates` decide whether a J-Link's
-  zero-padded serial is a roster uid.
+  `usb_scan` finds a present device and leaves out one whose `serial` read is
+  inconclusive (missing, unreadable, timed out, or across a re-enumeration);
+  an absence check uses `usb_absent(vid_pid, serial)`, which is false while
+  any VID:PID match is inconclusive. Its `jlink_serial_match` and
+  `jlink_serial_candidates` decide whether a J-Link's zero-padded serial is a
+  roster uid.
 
 ## Farm check
 
@@ -349,7 +392,7 @@ recovery stay the contract's.
 | `hil_boards.py` | each board's flasher from the board registry by probe serial (Board registry above) |
 | `hil_load.py` | the one path loader: one module per file per process, a second path under one name refused |
 | `agentrc_source.py` | the identity of the agentrc a harness loads: its closure, commit and digests, the staged copy and its manifest, drift, the record comparison |
-| `hil_process.py` | `run_cmd`, a bounded command; `run_tracked` and `recheck`, a command whose end is proven |
+| `hil_process.py` | `run_cmd`, a bounded command; `run_tracked` and `recheck`, a command whose end is proven; `state_dir`, a directory it trusts; `recheck_dir`, every operation in one |
 | `hil_farm_check.py` | the farm check engine a project's launcher drives with its profile (Farm check above) |
 | `hil_report_notice.py` | the unavailable notice and the report writer lock, loadable when the core is not (`write_unavailable`) |
 | `hil_openocd_esp_receipt.py` | an `openocd_esp` session's state from its receipt, loadable without the provider (`session_state`) |
@@ -391,6 +434,24 @@ recovery stay the contract's.
   other user can write, in a parent of its uid or root's that no other user
   can write unless sticky. Only those two are checked: the caller keeps every
   higher ancestor trusted and unchanged while any receipt names the directory.
+  `state_dir(run_dir, name='ops')` makes one whatever the umask: the run dir
+  0755 and `run_dir/name` 0700, each created or, when it is already a real
+  directory of the caller's, chmodded; a link or another user's directory is
+  refused (`PermissionError`) and left as it is.
+- `recheck_dir(state_dir, keep=())` owns run_tracked's file layout: it
+  rebuilds a receipt for each operation with a file in the state dir, the
+  supervisor's identity from its record, rechecks it, and tidies a `done` one
+  unless its token is in `keep`. It returns `(verdict, open)`: `done` when every
+  operation is (none included), `pending` when every open one is, else
+  `unknown`. `open` lists receipts `recheck` and `tidy` take, or, for one whose
+  lock, record or log is missing or whose record is unreadable or names no lock
+  of its own, a diagnostic `{token, unrecheckable, files}` that `recheck`
+  answers `unknown` and a human removes; an untrusted or unreadable state dir
+  is `('unknown', [{unrecheckable}])`. A file missing while the lock is held
+  is a supervisor still starting: a receipt naming that lock alone, `pending`.
+  A supervisor whose hello cannot reach its caller runs nothing and records
+  `done`: a caller killed mid-start, its files read `unknown`, leaves no tool
+  to start on a board handed on.
 - A report is published through `hil_report_core`: the JSON is authoritative
   and the Markdown a view `prepare_pair` regenerates from it. An attempt that
   cannot publish recovers through `recover_publish` (a Markdown repair, or a

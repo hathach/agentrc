@@ -9,6 +9,8 @@ if os.name == 'nt':
     raise unittest.SkipTest('hil_process needs POSIX sessions and process groups')
 
 import ast
+import errno
+import fcntl
 import importlib.util
 import inspect
 import io
@@ -26,7 +28,7 @@ from contextlib import contextmanager, redirect_stdout, suppress
 from pathlib import Path
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import CUT_NAME, cut_comm_stat, guard_survivors, proc_open  # noqa: E402
+from helpers import CUT_NAME, cut_comm_stat, guard_survivors, proc_open, umask  # noqa: E402
 
 SCRIPTS = Path(__file__).resolve().parents[1] / 'skills' / 'hil' / 'scripts'
 
@@ -640,6 +642,385 @@ class InterruptAcrossTheFork(unittest.TestCase):
         self.assertEqual((r.returncode, r.stdout), (0, 'ok'))
         self.assertEqual((ra.returncode, ra.stdout), (0, b'ok'))
 
+
+def mode(path):
+    return os.lstat(path).st_mode & 0o7777
+
+
+class StateDir(unittest.TestCase):
+    """state_dir: a run dir and its state dir run_tracked trusts, whatever the umask; a link or
+    another user's directory is refused and left as it is."""
+
+    def setUp(self):
+        self.top = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.top)
+
+    def test_the_consumers_run_dir_made_first_under_umask_002(self):
+        run = Path(self.top, 'run')
+        with umask(0o002):
+            run.mkdir()
+            self.assertEqual(mode(run), 0o775)
+            (run / 'plain').mkdir(0o700)
+            with self.assertRaises(PermissionError):    # what run_tracked refuses without state_dir
+                hp.trusted_dir(str(run / 'plain'))
+            got = hp.state_dir(run, 'tracked')
+        self.assertEqual((got, mode(run), mode(got)), (str(run / 'tracked'), 0o755, 0o700))
+
+    def test_existing_dirs_of_ours_are_secured(self):
+        run = os.path.join(self.top, 'run')
+        os.makedirs(os.path.join(run, 'ops'))
+        os.chmod(run, 0o777)
+        os.chmod(os.path.join(run, 'ops'), 0o777)
+        Path(run, 'ops', 'kept').write_text('x')
+        got = hp.state_dir(run)
+        self.assertEqual((mode(run), mode(got), os.listdir(got)), (0o755, 0o700, ['kept']))
+
+    def test_a_link_is_refused_and_left_as_it_is(self):
+        real = os.path.join(self.top, 'real')
+        os.mkdir(real)
+        os.chmod(real, 0o777)
+        os.symlink(real, os.path.join(self.top, 'run'))
+        with self.assertRaisesRegex(PermissionError, 'link'):
+            hp.state_dir(os.path.join(self.top, 'run'))
+        self.assertEqual((mode(real), os.listdir(real)), (0o777, []))
+        run = os.path.join(self.top, 'run2')
+        os.mkdir(run)
+        os.symlink(real, os.path.join(run, 'ops'))
+        with self.assertRaisesRegex(PermissionError, 'link'):
+            hp.state_dir(run)
+        self.assertEqual(mode(real), 0o777)
+        os.symlink(os.path.join(self.top, 'gone'), os.path.join(self.top, 'dangling'))
+        with self.assertRaisesRegex(PermissionError, 'link'):
+            hp.state_dir(os.path.join(self.top, 'dangling'))
+        self.assertFalse(os.path.lexists(os.path.join(self.top, 'gone')))
+
+    def test_a_link_is_refused_however_it_is_spelled(self):
+        real = os.path.join(self.top, 'real')
+        os.mkdir(real, 0o700)
+        os.symlink(real, os.path.join(self.top, 'link'))
+        run = os.path.join(self.top, 'run')
+        os.mkdir(run)
+        os.symlink(real, os.path.join(run, 'ops'))
+        for spelling in ('link/', 'link//', 'link/.', 'run/../link/', 'run/ops/', 'run/ops/.'):
+            with self.subTest(spelling=spelling), self.assertRaisesRegex(PermissionError, 'link'):
+                hp.state_dir(os.path.join(self.top, spelling))
+            self.assertEqual((mode(real), os.listdir(real)), (0o700, []))
+
+    def test_any_umask_and_an_unreadable_dir_of_ours(self):
+        with umask(0o777):
+            got = hp.state_dir(os.path.join(self.top, 'run'))
+        self.assertEqual((mode(os.path.dirname(got)), mode(got)), (0o755, 0o700))
+        run = os.path.join(self.top, 'run2')
+        os.makedirs(os.path.join(run, 'ops'))
+        os.chmod(os.path.join(run, 'ops'), 0o300)
+        os.chmod(run, 0o300)
+        got = hp.state_dir(run)
+        self.assertEqual((mode(run), mode(got)), (0o755, 0o700))
+
+    def test_missing_ancestors_are_usable_whatever_the_umask(self):
+        for missing in (('a',), ('b', 'c')):
+            run = os.path.join(self.top, *missing, 'run')
+            with self.subTest(missing=missing), umask(0o777):
+                got = hp.state_dir(run)
+            made = [os.path.join(self.top, *missing[:i + 1]) for i in range(len(missing))]
+            self.assertEqual([mode(p) for p in (*made, run, got)], [0o755] * (len(made) + 1) + [0o700])
+
+    def test_a_refused_ancestor_leaves_nothing_behind(self):
+        Path(self.top, 'file').write_text('')
+        os.symlink(os.path.join(self.top, 'gone'), os.path.join(self.top, 'dangling'))
+        for top in ('file', 'dangling'):
+            with self.subTest(top=top), umask(0o777), self.assertRaises(OSError):
+                hp.state_dir(os.path.join(self.top, top, 'x', 'run'))
+        self.assertEqual(sorted(os.listdir(self.top)), ['dangling', 'file'])
+
+    def test_a_file_is_refused(self):
+        Path(self.top, 'run').write_text('')
+        with self.assertRaisesRegex(PermissionError, 'file'):
+            hp.state_dir(os.path.join(self.top, 'run'))
+
+    def test_another_users_dir_is_refused_and_never_chmodded(self):
+        run = os.path.join(self.top, 'run')
+        os.mkdir(run)
+        os.chmod(run, 0o775)
+        with mock.patch.object(hp.os, 'geteuid', return_value=os.geteuid() + 1), \
+                self.assertRaisesRegex(PermissionError, 'uid'):
+            hp.state_dir(run)
+        self.assertEqual((mode(run), os.listdir(run)), (0o775, []))
+        os.chmod(run, 0o755)
+        os.mkdir(os.path.join(run, 'ops'))
+        os.chmod(os.path.join(run, 'ops'), 0o770)
+        real_fstat = os.fstat
+
+        def foreign_ops(fd):
+            st = real_fstat(fd)
+            if st.st_ino != os.stat(os.path.join(run, 'ops')).st_ino:
+                return st
+            return mock.Mock(st_uid=st.st_uid + 1)
+        with mock.patch.object(hp.os, 'fstat', foreign_ops), self.assertRaisesRegex(PermissionError, 'uid'):
+            hp.state_dir(run)
+        self.assertEqual(mode(os.path.join(run, 'ops')), 0o770)
+
+    def test_a_name_must_be_one_path_component(self):
+        run = os.path.join(self.top, 'run')
+        for name in ('', '.', '..', 'a/b', '/abs', 'a\0b', None, b'ops'):
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, 'single path component'):
+                hp.state_dir(run, name)
+        self.assertFalse(os.path.exists(run), 'a refused name created nothing')
+
+
+class RecheckDir(unittest.TestCase):
+    """recheck_dir over hil_op_<token>.{lock,json,log} files laid out by hand: a live supervisor's
+    lock is a flock this process holds; the real supervisor's cases are RunTracked's."""
+
+    def setUp(self):
+        top = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, top)
+        self.d = os.path.join(top, 'state')
+        os.mkdir(self.d, 0o700)
+
+    def op(self, token, cleanup='done', record=None, files=('lock', 'json', 'log')):
+        """The receipt recheck_dir rebuilds for `token`'s files, the record `{token, pid, start,
+        lock, cleanup}` unless `record` replaces its text."""
+        base = os.path.join(self.d, f'hil_op_{token}')
+        lock_id = None
+        if 'lock' in files:
+            os.close(os.open(f'{base}.lock', os.O_CREAT | os.O_WRONLY, 0o600))
+            st = os.stat(f'{base}.lock')
+            lock_id = [st.st_dev, st.st_ino]
+        if 'json' in files:
+            with open(os.open(f'{base}.json', os.O_CREAT | os.O_WRONLY, 0o600), 'w') as f:
+                f.write(record if record is not None else
+                        json.dumps({'token': token, 'pid': 7, 'start': 8, 'lock': lock_id, 'cleanup': cleanup}))
+        if 'log' in files:
+            Path(f'{base}.log').write_text('')
+        return {'token': token, 'supervisor': {'pid': 7, 'start': 8, 'lock': lock_id}, 'lock': f'{base}.lock',
+                'record': f'{base}.json', 'log': f'{base}.log', 'survivors': None}
+
+    def hold(self, receipt):
+        fd = os.open(receipt['lock'], os.O_RDONLY)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+
+    def test_none_found_is_done_and_other_files_are_not_operations(self):
+        for name in ('notes.txt', 'hil_op_.log', 'hil_op_a.json.tmp', 'hil_op_b.txt'):
+            Path(self.d, name).write_text('')
+        self.assertEqual(hp.recheck_dir(self.d), ('done', []))
+        self.assertEqual(len(os.listdir(self.d)), 4)
+
+    def test_done_is_tidied_unless_kept_and_pending_stays_open(self):
+        self.op('a')
+        kept = self.op('b')
+        live = self.op('c', cleanup='pending')
+        self.hold(live)
+        self.assertEqual(hp.recheck_dir(self.d, keep=('b',)), ('pending', [live]))
+        self.assertEqual(sorted(os.listdir(self.d)),
+                         sorted(os.path.basename(p) for r in (kept, live) for p in (r['lock'], r['record'], r['log'])))
+        self.assertEqual(hp.recheck(kept), 'done')
+
+    def test_an_incomplete_file_set_is_unknown_and_kept(self):
+        for token, files in (('l', ('log',)), ('k', ('lock', 'log')), ('r', ('lock', 'json')), ('j', ('json',))):
+            self.op(token, files=files)
+        verdict, entries = hp.recheck_dir(self.d)
+        self.assertEqual(verdict, 'unknown')
+        self.assertEqual([(e['token'], e['unrecheckable'], [os.path.basename(p) for p in e['files']]) for e in entries],
+                         [('j', 'no .lock or .log file', ['hil_op_j.json']),
+                          ('k', 'no .json file', ['hil_op_k.lock', 'hil_op_k.log']),
+                          ('l', 'no .lock or .json file', ['hil_op_l.log']),
+                          ('r', 'no .log file', ['hil_op_r.lock', 'hil_op_r.json'])])
+        self.assertEqual([hp.recheck(e) for e in entries], ['unknown'] * 4)
+        self.assertEqual(len(os.listdir(self.d)), 6)
+
+    def test_a_held_lock_without_its_record_is_pending_until_the_record_says_done(self):
+        """A supervisor still starting: its lock held, its record not written yet."""
+        receipt = self.op('k', files=('lock', 'log'))
+        lock_id = receipt['supervisor']['lock']
+        starting = {**receipt, 'supervisor': {'pid': None, 'start': None, 'lock': lock_id}}
+        fd = os.open(receipt['lock'], os.O_RDONLY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            self.assertEqual(hp.recheck_dir(self.d), ('pending', [starting]))
+            self.assertEqual(hp.recheck(starting), 'pending')
+            self.op('k', files=('json',), record=json.dumps({'token': 'k', 'pid': 7, 'start': 8, 'lock': lock_id,
+                                                              'cleanup': 'done'}))
+        finally:
+            os.close(fd)
+        self.assertEqual(hp.recheck(starting), 'done')
+
+    def test_a_forged_or_malformed_record_is_unknown(self):
+        other = self.op('o')
+        cases = {'json': ('not json', 'record unreadable'), 'list': ('[1]', 'record of another operation'),
+                 'tok': (json.dumps({'token': 'x', 'lock': [1, 2], 'cleanup': 'done'}), 'record of another operation'),
+                 'nolock': (json.dumps({'token': 'nolock', 'cleanup': 'done'}), 'record names no lock')}
+        for token, (text, _) in cases.items():
+            self.op(token, record=text)
+        # done, but naming another operation's lock, or written where another user could write it
+        wrong = self.op('wrong', record=json.dumps({'token': 'wrong', 'lock': other['supervisor']['lock'],
+                                                    'cleanup': 'done'}))
+        loose = self.op('loose')
+        os.chmod(loose['record'], 0o620)
+        os.symlink(other['record'], os.path.join(self.d, 'hil_op_link.json'))
+        self.op('link', files=('lock', 'log'))
+        verdict, entries = hp.recheck_dir(self.d, keep=('o',))
+        self.assertEqual(verdict, 'unknown')
+        by_token = {e['token']: e for e in entries}
+        self.assertEqual(sorted(by_token), sorted([*cases, 'wrong', 'loose', 'link']))
+        for token, (_, why) in cases.items():
+            self.assertTrue(by_token[token]['unrecheckable'].startswith(why), by_token[token])
+        self.assertTrue(by_token['link']['unrecheckable'].startswith('record unreadable'))
+        self.assertEqual(by_token['wrong']['supervisor']['lock'], other['supervisor']['lock'])
+        self.assertEqual(by_token['loose'], loose)
+
+    def test_a_replaced_lock_is_unknown(self):
+        receipt = self.op('a')
+        old = os.open(receipt['lock'], os.O_RDONLY)    # its inode stays taken, so the new lock's differs
+        self.addCleanup(os.close, old)
+        os.unlink(receipt['lock'])
+        os.close(os.open(receipt['lock'], os.O_CREAT | os.O_WRONLY, 0o600))
+        self.assertEqual(hp.recheck_dir(self.d), ('unknown', [receipt]))
+        self.assertEqual(len(os.listdir(self.d)), 3)
+
+    def test_pending_and_unknown_together_are_unknown(self):
+        self.hold(self.op('a', cleanup='pending'))
+        self.op('b', files=('log',))
+        self.assertEqual([e['token'] for e in hp.recheck_dir(self.d)[1]], ['a', 'b'])
+        self.assertEqual(hp.recheck_dir(self.d)[0], 'unknown')
+
+    def test_its_owner_rechecks_a_foreign_entry_of_this_dir_as_its_own_and_tidies_nothing(self):
+        """A dead claimant's foreign entry, logged as a cleanup failure, is cleared by the dir's owner once done."""
+        entry = {'token': f'foreign:{self.d}', 'foreign': self.d, 'uid': os.geteuid() + 1}
+        with mock.patch.object(hp, '_bounded', side_effect=AssertionError('its owner reads no /proc')):
+            self.assertEqual(hp.recheck(entry), 'done')                # none found
+            self.op('a')
+            self.assertEqual(hp.recheck(entry), 'done')
+            self.hold(self.op('b', cleanup='pending'))
+            self.assertEqual(hp.recheck(entry), 'pending')
+            self.op('c', files=('log',))
+            self.assertEqual(hp.recheck(entry), 'unknown')
+        self.assertEqual(len(os.listdir(self.d)), 7)                    # a's files kept for other receipts
+
+    def test_an_untrusted_or_missing_state_dir_is_unknown(self):
+        self.op('a')
+        os.chmod(self.d, 0o770)
+        verdict, entries = hp.recheck_dir(self.d)
+        self.assertEqual((verdict, len(entries), hp.recheck(entries[0])), ('unknown', 1, 'unknown'))
+        self.assertIn(self.d, entries[0]['unrecheckable'])
+        self.assertEqual(len(os.listdir(self.d)), 3)
+        self.assertEqual(hp.recheck_dir(os.path.join(self.d, 'gone'))[0], 'unknown')
+
+
+
+class ForeignStateDir(unittest.TestCase):
+    """A state dir of another uid, rechecked from /proc alone; the real supervisor's case is RunTracked's."""
+
+    MOUNT = '25 30 0:23 / /proc rw,nosuid,nodev {} - proc proc {}\n'
+
+    def hides(self, mounts, exempt=(False, {1000})):
+        with mock.patch.object(hp, '_proc_exemptions', return_value=exempt), \
+                mock.patch('builtins.open', mock.mock_open(read_data=mounts)):
+            return hp._proc_hides_others()
+
+    def test_proc_hides_others_when_mounted_hidepid_or_unreadable(self):
+        for opts, hidden in (('rw', False), ('rw,hidepid=0', False), ('rw,hidepid=off', False),
+                             ('rw,hidepid=1', True), ('rw,hidepid=2', True), ('rw,hidepid=invisible', True),
+                             ('rw,hidepid=ptraceable,gid=4', True)):
+            with self.subTest(opts=opts):
+                self.assertEqual(self.hides(self.MOUNT.format('shared:12', opts)), hidden)
+        shadowed = self.MOUNT.format('shared:12', 'rw') + self.MOUNT.format('master:1', 'rw,hidepid=2')
+        self.assertTrue(self.hides(shadowed))                   # the later mount is the one /proc names
+        self.assertTrue(self.hides('26 30 0:24 / /sys rw - sysfs sysfs rw\n'))      # no /proc mount found
+        with mock.patch('builtins.open', side_effect=PermissionError(errno.EACCES, 'denied')):
+            self.assertTrue(hp._proc_hides_others())
+
+    def test_hidepid_exempts_cap_sys_ptrace_and_its_gid_group_only(self):
+        """agentrc#484 Y1/J2: root was exempt without CAP_SYS_PTRACE, and a member of the mount's gid= was not."""
+        for opts, exempt, hidden in (
+                ('rw,hidepid=2,gid=4', (False, {0}), True),             # root without CAP_SYS_PTRACE, not in gid 4
+                ('rw,hidepid=2,gid=4', (True, {1000}), False),
+                ('rw,hidepid=ptraceable', (True, {1000}), False),
+                ('rw,hidepid=2,gid=4', (False, {4, 1000}), False),
+                ('rw,hidepid=noaccess,gid=4', (False, {4}), False),
+                ('rw,hidepid=invisible', (False, {0}), False),          # no gid=: group 0
+                ('rw,hidepid=ptraceable,gid=4', (False, {4}), True),    # ptraceable ignores gid=
+                ('rw,hidepid=2', None, True),                           # status unreadable, or another user ns
+                ('rw', None, False)):
+            with self.subTest(opts=opts, exempt=exempt):
+                self.assertEqual(self.hides(self.MOUNT.format('shared:12', opts), exempt), hidden)
+
+    def test_proc_exemptions_read_cap_sys_ptrace_and_gids_in_the_init_user_ns_only(self):
+        status = 'Name:\tx\nGid:\t0\t0\t0\t7\nGroups:\t4 20 \nCapEff:\t{}\n'
+        init = 'user:[4026531837]'
+
+        def exemptions(data, ns=init):
+            with mock.patch.object(hp.os, 'readlink', return_value=ns), \
+                    mock.patch('builtins.open', mock.mock_open(read_data=data)):
+                return hp._proc_exemptions()
+        self.assertEqual(exemptions(status.format('0000000000080000')), (True, {7, 4, 20}))
+        self.assertEqual(exemptions(status.format('00000000a80425fb')), (False, {7, 4, 20}))   # no bit 19
+        self.assertIsNone(exemptions(status.format('000001ffffffffff'), 'user:[4026532001]'))
+        self.assertIsNone(exemptions('Name:\tx\n'))
+        with mock.patch.object(hp.os, 'readlink', return_value=init), \
+                mock.patch('builtins.open', side_effect=PermissionError(errno.EACCES, 'denied')):
+            self.assertIsNone(hp._proc_exemptions())
+
+    def test_supervisors_in_stops_at_the_first_supervisor_found(self):
+        d = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d)
+        argv = {'7': [b'sleep', b'9'], '8': [b'python', b'--supervise', json.dumps({'lock': f'{d}/a.lock'}).encode()]}
+        opened = []
+
+        def proc_open(path, mode='r', *a, **k):
+            opened.append(path)
+            return io.BytesIO(b'\0'.join(argv[path.split('/')[2]]))
+        with mock.patch.object(hp, '_proc_hides_others', return_value=False), \
+                mock.patch.object(hp.os, 'listdir', return_value=['self', '7', '8', '9']), \
+                mock.patch('builtins.open', side_effect=proc_open):
+            self.assertEqual(hp._supervisors_in(d), [8])
+        self.assertEqual(opened, ['/proc/7/cmdline', '/proc/8/cmdline'])       # 9 never read
+
+    def test_a_dir_of_another_uid_is_one_entry_rechecked_from_proc_and_never_read(self):
+        top = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, top)
+        d = os.path.join(top, 'state')
+        os.mkdir(d, 0o700)
+        Path(d, 'hil_op_a.log').write_text('')
+        entry = {'token': f'foreign:{d}', 'foreign': d, 'uid': os.geteuid()}
+        with mock.patch.object(hp.os, 'geteuid', return_value=os.geteuid() + 1), \
+                mock.patch.object(hp, '_proc_hides_others', return_value=False):
+            self.assertEqual(hp.recheck_dir(d), ('unknown', [entry]))     # no supervisor of it in /proc
+            with mock.patch.object(hp, '_proc_hides_others', return_value=True):
+                self.assertEqual(hp.recheck_dir(d), ('pending', [entry]))
+            with mock.patch('builtins.open', side_effect=PermissionError(errno.EACCES, 'denied')):
+                self.assertEqual(hp.recheck(entry), 'pending')         # a command line it cannot read
+            release, scans = threading.Event(), []
+            self.addCleanup(release.set)
+
+            def blocked(_):
+                scans.append(1)
+                release.wait(10)
+                return []
+            with mock.patch.object(hp, 'PROC_SCAN_BOUND', 0.01), mock.patch.object(hp, '_supervisors_in', blocked):
+                self.assertEqual(hp.recheck(entry), 'pending')         # not listed within its bound
+                self.assertEqual(hp.recheck(entry), 'pending')         # nor while that scan is still blocked
+                self.assertEqual(len(scans), 1)                         # and no second scan thread started
+                release.set()
+                hp._proc_scan[0].join(5)
+                self.assertEqual(hp.recheck(entry), 'unknown')
+            self.assertEqual(hp.recheck({'token': 'foreign:1', 'foreign': 1}), 'pending')
+        self.assertEqual(os.listdir(d), ['hil_op_a.log'])
+
+    def test_a_dir_beyond_a_directory_we_cannot_search_is_foreign(self):
+        d = '/nonexistent/beyond/state'
+        real_stat = os.stat
+
+        def stat(path, *a, **k):
+            if path == d:
+                raise PermissionError(errno.EACCES, 'Permission denied', path)
+            return real_stat(path, *a, **k)
+        with mock.patch.object(hp, 'trusted_dir', side_effect=PermissionError(errno.EACCES, 'denied')), \
+                mock.patch.object(hp.os, 'stat', stat), mock.patch.object(hp, '_proc_hides_others', return_value=True):
+            self.assertEqual(hp.recheck_dir(d), ('pending', [{'token': f'foreign:{d}', 'foreign': d, 'uid': None}]))
+
+
 # The prelude of every run_tracked case: hil_process loaded by file path as `hp`, the case's
 # state dir as `S`, scratch dir `D`, and report(), whose JSON line the test reads back.
 TRACKED_CHILD = """
@@ -1032,6 +1413,19 @@ class RunTracked(unittest.TestCase):
                                       'sticky parent': ['done', []]})
         self.assertEqual(res['ran'], ['ran-sticky'])
 
+    def test_a_state_dir_made_under_umask_002_is_trusted(self):
+        """The consumer's sequence on a runner whose umask is 002: its run dir first, then state_dir."""
+        res = self.child("""
+            os.umask(0o002)
+            run = os.path.join(D, 'runs', 'board')
+            os.makedirs(run)
+            s = hp.state_dir(run, 'tracked')
+            r = hp.run_tracked('printf ok', timeout=20, settle=1, state_dir=s)
+            report(a=[r.returncode, r.stdout, r.cleanup], modes=[os.stat(p).st_mode & 0o777 for p in (run, s)],
+                   files=os.listdir(s))
+        """)
+        self.assertEqual((res['a'], res['modes'], res['files']), ([0, 'ok', 'done'], [0o755, 0o700], []))
+
     def test_a_replaced_lock_or_record_is_never_done(self):
         """What a user who could write the state dir would do: an unlocked lock and a matching
         `done` record put in place while the survivor lives."""
@@ -1137,8 +1531,9 @@ class RunTracked(unittest.TestCase):
         """)
 
     def test_an_interrupt_right_after_the_files_go_still_says_done(self):
-        for name, nth, cmd, alarm in (('normal completion', 0, 'true', None),
-                                      ('interrupted completion', 1, 'sleep 30', 0.5)):
+        # the first tidy(receipt) is the spawn failure's
+        for name, nth, cmd, alarm in (('normal completion', 1, 'true', None),
+                                      ('interrupted completion', 2, 'sleep 30', 0.5)):
             with self.subTest(name):
                 res = self._interrupt_after('tidy(receipt)', nth, cmd, alarm)
                 self.assertEqual(res['fired'], 1)
@@ -1169,6 +1564,53 @@ class RunTracked(unittest.TestCase):
                 report(cleanup=e.cleanup, has_receipt=e.receipt is not None, after=settled(e.receipt))
         """)
         self.assertEqual((res['cleanup'], res['has_receipt'], res['after']), ('unknown', True, 'done'))
+
+    def test_recheck_dir_follows_a_live_supervisor_until_it_ends(self):
+        res = self.child("""
+            empty = hp.recheck_dir(S)
+            r = hp.run_tracked('sleep 30 </dev/null >/dev/null 2>&1 & echo $!', timeout=20, settle=0.3, state_dir=S)
+            pid = int(r.stdout)
+            hp.run_tracked('true', timeout=20, settle=1, state_dir=S)
+            live = hp.recheck_dir(S)
+            again = hp.recheck(live[1][0])
+            kill(pid)
+            settled(r.receipt)
+            kept = hp.recheck_dir(S, keep=(r.receipt['token'],))
+            files = sorted(os.listdir(S))
+            report(empty=empty, receipt=r.receipt, live=live, again=again, kept=kept, files=files,
+                   done=hp.recheck_dir(S), left=os.listdir(S), leftovers=[pid])
+        """)
+        receipt = res['receipt']
+        self.assertEqual(res['empty'], ['done', []])
+        self.assertEqual(res['live'], ['pending', [{**receipt, 'survivors': None}]])
+        self.assertEqual(res['again'], 'pending')
+        self.assertEqual(res['kept'], ['done', []])
+        self.assertEqual(res['files'], sorted(os.path.basename(receipt[k]) for k in ('lock', 'record', 'log')))
+        self.assertEqual((res['done'], res['left']), (['done', []], []))
+
+    def test_recheck_dir_of_another_uid_follows_its_supervisor_in_proc_until_it_ends(self):
+        res = self.child("""
+            r = hp.run_tracked('sleep 30 </dev/null >/dev/null 2>&1 & echo $!', timeout=20, settle=0.3, state_dir=S)
+            pid = int(r.stdout)
+            uid, os.geteuid = os.geteuid(), lambda: uid + 1      # S as another uid sees it
+            hidden = hp._proc_hides_others()
+            live = hp.recheck_dir(S)
+            kill(pid)
+            deadline = time.monotonic() + 10
+            while hp.recheck_dir(S)[0] == 'pending' and time.monotonic() < deadline:
+                time.sleep(0.05)
+            ended, files = hp.recheck_dir(S), sorted(os.listdir(S))
+            os.geteuid = lambda: uid
+            report(uid=uid, path=os.path.abspath(S), receipt=r.receipt, hidden=hidden, live=live, ended=ended,
+                   files=files, done=hp.recheck_dir(S), leftovers=[pid])
+        """)
+        if res['hidden']:
+            self.skipTest('/proc hides other users\' processes here')
+        entry = {'token': f'foreign:{res["path"]}', 'foreign': res['path'], 'uid': res['uid']}
+        self.assertEqual(res['live'], ['pending', [entry]])
+        self.assertEqual(res['ended'], ['unknown', [entry]])      # none left, but its records are not ours to read
+        self.assertEqual(res['files'], sorted(os.path.basename(res['receipt'][k]) for k in ('lock', 'record', 'log')))
+        self.assertEqual(res['done'], ['done', []])
 
     def test_a_spawn_error_started_nothing(self):
         res = self.child("""
@@ -1262,6 +1704,16 @@ class RunTracked(unittest.TestCase):
             hp.tidy({'lock': None, 'log': receipt['log']})     # no record path, an unusable lock path
             self.assertEqual(os.listdir(d), [])
 
+    def test_a_supervisor_that_never_starts_leaves_no_file(self):
+        with tempfile.TemporaryDirectory() as top:
+            d = os.path.join(top, 'state')
+            os.mkdir(d, 0o700)
+            eagain = OSError(errno.EAGAIN, 'Resource temporarily unavailable')
+            with mock.patch.object(hp.subprocess, 'Popen', side_effect=eagain), self.assertRaises(OSError) as cm:
+                hp.run_tracked(['true'], timeout=T, settle=1, state_dir=d)
+            self.assertEqual((cm.exception.errno, cm.exception.cleanup, cm.exception.receipt, os.listdir(d)),
+                             (errno.EAGAIN, 'done', None, []))
+
     def test_the_survey_lists_unreadable_entries_apart(self):
         p = subprocess.Popen(['sleep', '30'])
         self.addCleanup(p.wait)
@@ -1302,6 +1754,22 @@ class RunTracked(unittest.TestCase):
         """)
         self.assertEqual(res['rc'], 0)
         self.assertEqual(res['hello'], [res['start']])
+
+    def test_a_supervisor_whose_caller_is_gone_before_its_hello_runs_nothing(self):
+        """Its files may already have been judged unknown and the board handed on: the command never starts."""
+        res = self.child("""
+            rfd, wfd = os.pipe()
+            os.close(rfd)
+            ran = os.path.join(D, 'ran')
+            job = {'cmd': ['touch', ran], 'cwd': None, 'timeout': 20, 'settle': 5, 'reap_grace': 2, 'binary': False,
+                   'split_stderr': False, 'report_fd': wfd, 'token': 't', 'lock': os.path.join(S, 'l'),
+                   'record': os.path.join(S, 'r')}
+            rc = hp._supervise(job)
+            with open(job['record']) as f:
+                rec = json.load(f)
+            report(rc=rc, ran=os.path.exists(ran), record=rec['cleanup'])
+        """)
+        self.assertEqual((res['rc'], res['ran'], res['record']), (1, False, 'done'))
 
     def test_the_supervisor_entry_refuses_other_usage(self):
         r = subprocess.run([sys.executable, '-I', str(SCRIPTS / 'hil_process.py')], capture_output=True, text=True,
