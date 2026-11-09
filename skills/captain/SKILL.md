@@ -108,7 +108,8 @@ pins each target's session once, so one replaced in its terminal while the relay
   `completed`, `failed`, `rejected` or `needs-clarification`, with a note. A message the human writes after the send's
   check is not seen; the target acts only on what `accept` printed.
 - **Start** a Claude Code session only when the human's message this turn asks for one, once per checkout and
-  account it names; never on a session's report, a relay reply, a chief attention line or your own idea. `start` runs
+  account it names; never on a session's report, a relay reply, a chief attention line or your own idea. The script
+  binds the start to a message of theirs this turn, but cannot tell whether it asks for one: that is yours. `start` runs
   an interactive `claude`, or `claude-ada` for `ada` (main unless they say ada; never inferred from the repo), in a
   new hc terminal with no parent and no first task:
   - The checkout is an absolute or `~/` path to a git checkout's or worktree's top level, anywhere.
@@ -120,8 +121,9 @@ pins each target's session once, so one replaced in its terminal while the relay
     a crash or retry included.
   - The receipt says `verified` once the session is pinned under that account in that checkout; `pending` while it is
     still coming up, which `list` resolves; `VERIFICATION FAILED` or `UNCHECKED` naming the terminal. Report it as
-    given: a wrong or failed session is the human's to close. Exit 3 without a terminal address means a session may
-    have started: `list` before anything else, never start again.
+    given: a wrong or failed session is the human's to close. A refusal that says a session may have started means
+    hc gave no address: `list` before anything else, and never start that checkout under that account again for
+    that message.
 - **Closing** a terminal, space or session is the human's: you may report a session done, but never close one, type
   `/exit`, kill a process or terminal, or ask a target to close itself. `cancel` closes a ledger item only: it
   neither reaches a session nor withdraws an instruction one accepted. That takes a new relay of the human's words,
