@@ -879,12 +879,12 @@ class GateTest(unittest.TestCase):
         # The challenger runs without memories, plugins or the skills index; AGENTS.md is not switched off.
         self.assertEqual(cmd[cmd.index('--disable'):cmd.index('--output-schema')],
                          ['--disable', 'memories', '--disable', 'plugins', '-c', 'skills.include_instructions=false'])
-        (self.root / '.git' / 'simplify-gate').write_text('# repo override\nmodel = spark\neffort=low\n')
+        (self.root / '.git' / 'simplify-gate').write_text('# repo override\nmodel = spark\neffort=high\n')
         self.write('a.txt', 'a3\n')
         self.review()
         cmd = self.s.calls[1]
         self.assertEqual(cmd[cmd.index('-m') + 1], 'spark')
-        self.assertIn('model_reasoning_effort="low"', cmd)
+        self.assertIn('model_reasoning_effort="high"', cmd)
 
     def test_a_bad_marker_is_reported_not_defaulted(self):
         (self.root / '.git' / 'simplify-gate').write_text('effort=extreme\n')

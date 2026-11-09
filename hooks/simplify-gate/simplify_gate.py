@@ -53,8 +53,8 @@ except ImportError:  # Windows
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'lib'))
 import windows  # noqa: E402
 
-MODEL = 'gpt-6.1-sol'  # codex exec -m
-EFFORT = 'medium'  # model_reasoning_effort
+MODEL = 'gpt-6-astra'  # codex exec -m
+EFFORT = 'low'  # model_reasoning_effort
 ROUNDS = 2  # YAGNI rounds per user turn
 CHALLENGE = 'Codex YAGNI challenge'
 FED_BACK = re.compile(re.escape(CHALLENGE) + r' \(round \d')
