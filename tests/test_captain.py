@@ -108,6 +108,29 @@ class SessionsTest(unittest.TestCase):
         self.assertEqual([(s['address'], s['status_ms']) for s in found],
                          [('t2', 9), ('t22', 9), ('t1', 5), ('t3', 0)])
 
+    def test_its_own_status_line_on_one_line_and_what_a_blocked_one_waits_for(self):
+        found = self.sessions({
+            't2': terminal('t2', status={'app': 'claude-code', 'state': 'done', 'msg': '#12 passed;\n  merge?'}),
+            't3': terminal('t3', status={'app': 'claude-code', 'state': 'blocked', 'kind': 'question',
+                                         'msg': 'A or B?'}),
+            't4': terminal('t4', status={'app': 'claude-code', 'state': 'working', 'kind': 'question'})}, me='')
+        self.assertEqual([(s['address'], s['said'], s['blocked_on']) for s in found],
+                         [('t2', '#12 passed; merge?', None), ('t3', 'A or B?', 'question'), ('t4', '', None)])
+
+    def test_list_ends_each_row_with_what_the_session_said(self):
+        found = self.sessions({
+            't2': terminal('t2', status={'app': 'claude-code', 'state': 'blocked', 'kind': 'permission',
+                                         'msg': 'Edit x?'}),
+            't3': terminal('t3')}, me='')
+        with mock.patch.object(captain, 'everyone', return_value=[{**s, 'account': 'main'} for s in found]), \
+                mock.patch.object(captain, 'unpinned', return_value=[]), \
+                mock.patch('sys.argv', ['captain.py', 'list']), \
+                mock.patch('builtins.print') as out:
+            captain.main()
+        rows = [c.args[0].split('\t') for c in out.call_args_list]
+        self.assertEqual([(r[2].split(',')[0], r[4:]) for r in rows],
+                         [('blocked (permission)', ['"Edit x?"']), ('idle', [])])
+
     def test_missing_or_relative_cwd_stays_unknown(self):
         for cwd in (None, '', 'rel/dir'):
             with self.subTest(cwd=cwd):

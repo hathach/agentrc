@@ -229,7 +229,9 @@ def canonical(cwd):
 
 def described(t):
     """The session fields `hc get` shows for a live local Claude Code terminal, or None for any other. Its cwd and
-    pid are its foreground process's: the terminal's own are the shell's it may have started from."""
+    pid are its foreground process's: the terminal's own are the shell's it may have started from. said is the
+    session's own status line on one line, blocked_on what a blocked one waits for (permission, question or auth),
+    both its words, never checked."""
     status = (t or {}).get('status') or {}
     if not t or t.get('state') != 'live' or status.get('app') != CLAUDE_APP or not hc.is_local(t.get('address')):
         return None
@@ -246,6 +248,8 @@ def described(t):
         'foreground': fg.get('pid'),
         'status': status.get('state') or 'unknown',
         'status_ms': t.get('status_ms') or 0,
+        'said': one_line(status.get('msg') or ''),
+        'blocked_on': status.get('kind') if status.get('state') == 'blocked' else None,
     }
 
 
@@ -2491,7 +2495,9 @@ def main():
                 missing = unpinned(s)
                 note = f'  (unpinned: {", ".join(missing)})' if missing else ''
                 at = time.strftime('%H:%M', time.localtime(s['status_ms'] / 1000)) if s['status_ms'] else '?'
-                print(f'{s["handle"]}\t{s["kind"]}/{who}\t{s["status"]}, reported {at}\t{s["cwd"] or "?"}{note}')
+                state = s['status'] + (f' ({s["blocked_on"]})' if s['blocked_on'] else '')
+                said = f'\t"{s["said"]}"' if s['said'] else ''
+                print(f'{s["handle"]}\t{s["kind"]}/{who}\t{state}, reported {at}\t{s["cwd"] or "?"}{note}{said}')
             return 0
         if a.cmd == 'enroll':
             return enroll(a.replace)
