@@ -1451,6 +1451,11 @@ class Usage(unittest.TestCase):
         self.assertEqual(agg['workflows'], {'flow': 1})
         self.assertEqual(agg['docs_read'], {'skills/tool/SKILL.md': 1})
         self.assertNotIn('private-thing', out)
+        self.assertEqual(agg['totals'], {'toolCalls': 8, 'scriptInvocations': 2, 'unattributedInvocations': 0,
+                                         'skillLoads': 1, 'agentLaunches': 1, 'workflowRuns': 1, 'docReads': 1})
+        self.assertIn(f"totals {agg['totals']}", out)
+        self.assertEqual(audit.check_review(audit.Shape(), {'usage': {
+            'totals': agg['totals'], 'hosts': 1, 'window': {'since': SINCE, 'until': UNTIL}}}).problems, [])
 
     def test_the_claude_layout_is_catalogued_once_through_its_agents_alias(self):
         self.repo.commit({'.claude/skills/build/SKILL.md': 'x\n', '.claude/skills/tool/SKILL.md': 'x\n',

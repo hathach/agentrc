@@ -22,17 +22,19 @@ Everything below that says "the build contract" or "the HIL contract" means thos
 1. `python3 "$A/audit.py" start --repo . --head origin/<default branch>` takes the base from the last audit's
    record, `.claude/audit.json`, when it is complete, writes the private run dir (path printed; `$RUN` below) and
    prints the growth. When it refuses, or for a first audit, the owner picks the base: `--base <sha> --base-kind
-   bootstrap` for a first audit, `override` to replace a record. A submodule pin change in the growth is a
-   dependency delta to review, not an audit of the dependency. Run it, and `check`, with push access to the record's
-   repository: without it only a user-owned repository's owner counts as a validation report's writer, so an
-   organisation's record reads provisional.
+   bootstrap` for a first audit, `override` to replace a record. A repository whose last audit ended in an `audit/*`
+   tag, from before the record, bootstraps from its newest one: `--base <tag> --base-kind bootstrap`. A submodule pin
+   change in the growth is a dependency delta to review, not an audit of the dependency. Run it, and `check`, with
+   push access to the record's repository: without it only a user-owned repository's owner counts as a validation
+   report's writer, so an organisation's record reads provisional.
 2. Usage, where transcripts exist: `python3 "$A/usage.py" --run $RUN --claude-root ~/.claude/projects
    [--claude-root <other config>/projects] --codex-root ~/.codex/sessions --out $RUN/usage.json`. It measures
    maintainer tooling on this host only, never deployed firmware or external API use; zero is a lead, never proof.
    Consumer repositories reach engines through their own wrappers and CI, which no transcript shows: search their
    contracts and workflows before calling anything unused. Run it on each host whose sessions matter, each from its
    own `start` on the same head with the first run's window and base (`--since`/`--until` from its `run.json`, and
-   `--base <its base> --base-kind <its kind>` unless that kind is `audit`), and record totals with the host count.
+   `--base <its base> --base-kind <its kind>` unless that kind is `audit`), and record the `totals` of each host's
+   `usage.json`, each summed across the hosts, with the host count.
    With no transcripts anywhere, record `"hosts": 0, "totals": {}` and the run's window: unmeasured, never zero use.
 3. Python per-test coverage, only for a pytest suite (agentrc's `tests`, tinyusb's `test/hil/test`), beside, never
    instead of, the build contract's run: serial and in-process (pytest-xdist workers and subprocesses measure

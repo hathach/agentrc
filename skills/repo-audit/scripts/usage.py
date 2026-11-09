@@ -15,8 +15,11 @@ symlinks included) into one of its worktrees; a path that names a repository fil
 stdout holds aggregates only: repository file names, the argparse vocabulary of each script (subcommands and long
 flags; other arguments become an unrecognised count), and the repository's own skill, agent and workflow names
 (others are `other`; a project-local one, under .claude/, only from a session in one of its worktrees or, for a
-workflow, a script path that resolves into one). FILE (create-only, mode 0600) adds per-key locators, transcript
-path:line and tool-call id, never command text. Exit 0 complete, 1 partial (a root missing or unreadable), 2 refused.
+workflow, a script path that resolves into one). Its `totals` carry the camelCase names a record's usage.totals
+takes: toolCalls (every call read), scriptInvocations, unattributedInvocations, skillLoads, agentLaunches and
+workflowRuns (the repository's own, built-in agents excluded) and docReads; the record sums each across hosts. FILE
+(create-only, mode 0600) adds per-key locators, transcript path:line and tool-call id, never command text. Exit 0
+complete, 1 partial (a root missing or unreadable), 2 refused.
 """
 import argparse
 import functools
@@ -735,7 +738,14 @@ def report(tally, roots, stats, window):
     scripts = {k: dict(v, sessions=len(v['sessions']), days=len(v['days']), cwd=dict(v['cwd']), caller=dict(v['caller']),
                        subcommands=dict(v['subcommands']), flags=dict(v['flags']))
                for k, v in sorted(tally.scripts.items())}
-    return {'repo': str(tally.repo.top), 'window': [w.isoformat() for w in window], 'roots': roots,
+
+    def own(counts):
+        return sum(v for k, v in counts.items() if k != 'other' and k not in BUILTIN_AGENTS)
+    totals = {'toolCalls': stats['tool_calls'], 'scriptInvocations': sum(s['invoke'] for s in scripts.values()),
+              'unattributedInvocations': sum(tally.unattributed.values()), 'skillLoads': own(tally.skills),
+              'agentLaunches': own(tally.agents), 'workflowRuns': own(tally.workflows),
+              'docReads': sum(tally.docs.values())}
+    return {'repo': str(tally.repo.top), 'window': [w.isoformat() for w in window], 'roots': roots, 'totals': totals,
             'tool_calls': stats['tool_calls'], 'unparsed_records': stats['unparsed_records'],
             'unknown': dict(tally.unknown), 'scripts': scripts, 'unattributed': dict(tally.unattributed),
             'skills': dict(tally.skills), 'agents': dict(tally.agents), 'workflows': dict(tally.workflows),
@@ -747,6 +757,7 @@ def render(agg):
     lines += [f"root {r['kind']} {r['path']}: {r['status']}, {r.get('files', 0)} files" for r in agg['roots']]
     lines.append(f"tool calls {agg['tool_calls']}, unparsed records {agg['unparsed_records']}, "
                  f"unknown {agg['unknown'] or 0}")
+    lines.append(f"totals {agg['totals']}")
     lines.append('== scripts: invoke ok error result? sessions days | cwd | caller | reads')
     for k, s in sorted(agg['scripts'].items(), key=lambda kv: -kv[1]['invoke']):
         if not s['invoke']:
