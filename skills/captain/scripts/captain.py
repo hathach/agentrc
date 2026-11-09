@@ -14,23 +14,24 @@ does not recognize is reported, never assumed safe.
   captain.py reports [<msg>[:<N>]...]            the latest report from each target, or those requests' reports
   captain.py reports --new                       every watch report since the last --new
   captain.py cancel <msg>                        close a request, relay or watch no answer will close
-  captain.py relay <target>... [--entry <uuid> --digest <hex>]
-                                                 show, then relay, the human's newest message
+  captain.py relay <target>... [--entry <id>] [--dry-run]
+                                                 relay the human's message this turn acts on
+  captain.py relay --retry <action>              send a held relay once its session is idle
   captain.py brief --for <msg> | --pending       a target reads what a status request asks, or joins a watch
   captain.py report --for <msg> --file <json|->  a target answers a status request
   captain.py accept --action <action>            a target takes a relay and reads its words
+  captain.py show --action <action>              a target reads a relay it accepted again, recording nothing
   captain.py outcome --action <action> --result <result> [--note-file <file|->]
                                                  a target says how a relay ended
 
 A target is a terminal address (t7) or space:<herdr space id or name>, which must match exactly one session; `all`,
-alone, is every live session. A relay with --entry names addresses only.
+alone, is every live session.
 
 A message that opens `tell <name>... [to]`, each name an address, space id or name, or space:<id or name>, is relayed
 without that opening when the names are exactly the relay's targets, and refused when they are not or cannot be told
 apart from the instruction. One addressed to every session (`tell all|everyone|every session to|:`) is relayed
-without it when the targets are exactly the live sessions, at the preview and at the send; the preview's digest
-covers the text, the target terminals and the session pinned in each. A message hc pasted (`<hc from=...>`) is
-never the human's.
+without it when the targets are exactly the live sessions. The message relayed is one the human wrote in the
+captain's current turn, typed or read mid-turn; a message hc pasted (`<hc from=...>`) is never the human's.
 
 A watch types into nobody: a session joins it itself, through hooks/captain (SessionStart after a compaction or
 /clear, Stop) or `brief --pending`, and ends with the captain session that started it. A collect without ids
@@ -39,7 +40,6 @@ resumes where the enrolled captain's last one stopped, and `reports --new` where
 
 import argparse
 import glob
-import hashlib
 import json
 import os
 import re
@@ -83,7 +83,7 @@ OPTIONAL = {'issues': list}   # a report without it names no issue
 STATES = ('ready', 'in-progress', 'blocked', 'needs-human', 'done', 'idle')
 # withdraw and withdraw-requested have no writer since `withdraw` was removed: kept so an older ledger still reads
 RECORDS = ('request', 'report', 'cancel', 'delivered', 'undelivered', 'uncertain',
-           'relay', 'accepted', 'outcome', 'withdraw', 'withdraw-requested', 'refused',
+           'relay', 'held', 'accepted', 'outcome', 'withdraw', 'withdraw-requested', 'refused',
            'watch', 'watch-extend', 'joined', 'watch-end')
 ITEMS = ('request', 'relay')
 WATCHED = ('watch', 'joined')
@@ -300,7 +300,7 @@ def well_formed(rec):
         return well_scoped(rec.get('scope'))
     if rec['type'] == 'joined':
         return text(rec.get('watch')) and isinstance(rec.get('handle'), str) and pinned_identity(rec.get('target'))
-    if rec['type'] == 'watch-end':
+    if rec['type'] in ('watch-end', 'held'):
         return isinstance(rec.get('why'), str)
     return True
 
@@ -663,11 +663,16 @@ def ask(address, mine, force=False):
         return deliver('request', msg, captain, target, status_prompt(msg))
 
 
+def item(kind, msg, captain, target, **fields):
+    """The ledger record of a request or relay to target."""
+    return {'type': kind, 'msg': msg, 'captain': captain, 'target': identity(target), 'handle': target['handle'],
+            **fields}
+
+
 def deliver(kind, msg, captain, target, prompt, **fields):
     """Record the item, then type its prompt and record how that went: a crash between leaves the item open, never
     typed unrecorded."""
-    append({'type': kind, 'msg': msg, 'captain': captain, 'target': identity(target), 'handle': target['handle'],
-            **fields})
+    append(item(kind, msg, captain, target, **fields))
     address = target['address']
     outcome, err = submit(address, prompt, target['status'], captain['address'])
     append({'type': outcome, 'msg': msg, 'error': err} if err else {'type': outcome, 'msg': msg})
@@ -780,7 +785,7 @@ def one_line(text):
     return ' '.join(text.split())
 
 
-EVENTS = {'cancel': 'cancelled', 'undelivered': 'undelivered', 'accepted': 'accepted',
+EVENTS = {'cancel': 'cancelled', 'undelivered': 'undelivered', 'accepted': 'accepted', 'held': 'held',
           'refused': 'refused by the session that replaced its target'}
 
 
@@ -1068,33 +1073,70 @@ def unwrapped(words):
 
 def human_input(entry):
     """Whether a transcript entry is a message typed or queued at the terminal, not hook, skill or task text; one
-    hc pasted is typed too, so human_inputs() tells it apart."""
+    hc pasted is typed too, so turn_inputs() tells it apart."""
     origin = entry.get('origin') if isinstance(entry, dict) else None
     return (isinstance(origin, dict) and origin.get('kind') == 'human' and entry.get('type') == 'user'
             and entry.get('promptSource') in ('typed', 'queued') and not entry.get('isMeta')
             and not entry.get('isSidechain'))
 
 
-def human_inputs(file):
-    """(inputs, torn): the human's messages in a transcript, in order, each (uuid, text or None when not plain
-    text); torn when a line is not whole JSON, which may hide a newer message. One that opens with an hc tag is
-    another program's, hc's paste or made to look like one, and is left out."""
+def queued_input(entry):
+    """The attachment a message the human typed while this session worked becomes once the model reads it, or None:
+    it is never a `user` entry. Its enqueue record alone is not one: the model has not seen that message yet."""
+    attachment = entry.get('attachment') if isinstance(entry, dict) and entry.get('type') == 'attachment' else None
+    if (isinstance(attachment, dict) and attachment.get('type') == 'queued_command'
+            and (attachment.get('origin') or {}).get('kind') == 'human'
+            and not entry.get('isMeta') and not entry.get('isSidechain')):
+        return attachment
+    return None
+
+
+TURN_ENDS = ('turn_duration', 'compact_boundary')
+
+
+def turn_inputs(file):
+    """(inputs, why): the human's messages in the transcript's current turn as the model read them, in order, each
+    (id, text or None when not plain text); why is set when that turn may hold a message not readable yet. A turn
+    starts at new_turn() and ends at a completion or compaction record. One opening with an hc tag is another
+    program's, hc's paste or made to look like one, and is left out."""
     with open(file, 'rb') as f:
         lines = f.read().split(b'\n')
-    torn = bool(lines[-1])
-    inputs = []
+    if lines[-1]:
+        return [], 'the transcript ends in a partly written line that may hold a newer message; retry'
+    inputs, read, absorbed = [], {}, set()
     for line in lines[:-1]:
         try:
             entry = json.loads(line)
         except ValueError:
-            torn = True
+            return [], 'a transcript line is not whole JSON, so a message of the human\'s may be hidden in it'
+        if not isinstance(entry, dict):
             continue
-        if not human_input(entry):
+        if (new_turn(entry) and not entry.get('isSidechain')
+                or entry.get('type') == 'system' and entry.get('subtype') in TURN_ENDS):
+            inputs, read, absorbed = [], {}, set()
+        queued = queued_input(entry)
+        if entry.get('type') == 'queue-operation' and entry.get('operation') == 'remove' \
+                and entry.get('reason') == 'absorbed_mid_turn':
+            absorbed.add(entry.get('commandUuid'))
             continue
-        words = plain_text(content(entry))
+        if queued:
+            uid, words = queued.get('source_uuid') or entry.get('uuid'), plain_text(queued.get('prompt'))
+            if uid in read:
+                if read[uid] != words:
+                    return [], f'the queued message {uid} is recorded twice with different words'
+                continue
+            read[uid] = words
+        elif human_input(entry):
+            uid, words = entry.get('uuid'), plain_text(content(entry))
+        else:
+            continue
         if not (words and HC_TAG.match(words.lstrip())):
-            inputs.append((entry.get('uuid'), words))
-    return inputs, torn
+            inputs.append((uid, words))
+    unread = absorbed - set(read)
+    if unread:
+        ids = ', '.join(sorted(map(str, unread)))
+        return [], f'a message the human typed meanwhile ({ids}) is not readable yet; retry'
+    return inputs, None
 
 
 def transcript(captain):
@@ -1107,23 +1149,29 @@ def transcript(captain):
     return found[0]
 
 
-def newest(captain, sending):
-    """The human's newest message in the captain's transcript, as (entry, text). A torn transcript may hide a newer
-    one: sending refuses it, a preview only warns."""
-    inputs, torn = human_inputs(transcript(captain))
-    if torn and sending:
-        die('the transcript ends in a partly written line that may hold a newer message; retry', 2)
+def bound(captain, entry=None):
+    """(id, text): the human's message this turn of the captain acts on, the only one it read this turn, or with entry
+    the one of them it names. A turn no message of the human's started (a notification, a compaction) has none."""
+    inputs, why = turn_inputs(transcript(captain))
+    if why:
+        die(why, 2)
     if not inputs:
-        die('no message from the human in this session yet', 3)
-    entry, words = inputs[-1]
+        die('no message from the human in this turn: relay only what the human asked in it', 3)
+    if entry:
+        inputs = [i for i in inputs if i[0] == entry]
+        if not inputs:
+            die(f'{entry} is not a message from the human in this turn', 2)
+    elif len(inputs) > 1:
+        listed = '\n'.join(f'  {uid}  {one_line(words or "(not plain text)")[:60]}' for uid, words in inputs)
+        die(f'the human wrote more than one message this turn; relay again with --entry <id> naming the one to '
+            f'relay:\n{listed}', 2)
+    uid, words = inputs[0]
     if words is None:
-        die(f"the human's newest message ({entry}) is not plain text, so it cannot be relayed verbatim", 2)
+        die(f"the human's message {uid} is not plain text, so it cannot be relayed verbatim", 2)
     if HC_TAG.search(words):   # hc pastes into a half-typed draft: what follows the tag is not the human's
-        die(f"the human's newest message ({entry}) holds an hc tag, so it may carry another program's words; "
+        die(f"the human's message {uid} holds an hc tag, so it may carry another program's words; "
             'ask the human to restate it', 2)
-    if torn:
-        print('the transcript ends in a partly written line: relaying refuses until it is whole')
-    return entry, words
+    return uid, words
 
 
 def named(token, live):
@@ -1206,42 +1254,29 @@ def broadcast(words, first, addresses, live):
     return text, None
 
 
-def pins(found):
-    """{address: the identity of the session found in it, None for none}."""
-    return {address: identity(s) if s else None for address, s in found.items()}
-
-
-def digest(text, pinned):
-    """The preview's digest of what goes to which session, pinned as pins() gives it: target order or a status change
-    does not change it, a session opened, closed or replaced in a target terminal does."""
-    return hashlib.sha256(json.dumps([text, sorted(pinned.items())]).encode('utf-8')).hexdigest()[:16]
-
-
 def relay_text(words, addresses):
     """The text a relay to addresses sends; dies, so nothing is sent, when instruction() refuses it."""
     if not TELL.match(words):   # unaddressed: sent as written, no session listing needed
         return words
     text, why = instruction(words, addresses, everyone())
     if isinstance(why, Stale):
-        die(f'{why}: run list, then preview again with every address it shows', 2)
+        die(f'{why}: run list, then relay again to every address it shows', 2)
     if why:
         die(f"the human's message cannot be relayed as written: {why}; ask the human to restate it", 2)
     return text
 
 
-def preview(targets, mine):
-    """The human's newest message as it would be sent and who would get it, targets as resolve() gave them; sends
+def preview(targets, entry, mine):
+    """The human's message this relay would send and who would get it, targets as resolve() gave them; sends
     nothing."""
     with locked():
         captain = require_captain(mine)
-    entry, words = newest(captain, sending=False)
-    found = {address: find(address) for address in targets}
+    uid, words = bound(captain, entry)
     for address, arg in targets.items():
-        target = found[address]
+        target = find(address)
         print(f'to {arg}: {target["handle"]} ({target["status"]})' if target
               else f'to {arg}: no Claude Code terminal there')
-    text = relay_text(words, list(targets))
-    print(f'entry {entry} digest {digest(text, pins(found))}\n{text}')
+    print(f'entry {uid}\n{relay_text(words, list(targets))}')
     return 0
 
 
@@ -1272,38 +1307,70 @@ def relay_prompt(action):
             f'Run: python3 {INSTALLED} accept --action {action}')
 
 
-def relay(addresses, entry, sent, mine):
-    """Relay the human's newest message, which must still be entry and still read as the preview's digest sent, to
-    each address, recorded before it is typed. The transcript is read once for every target: a message the human sends
-    after that is not seen."""
-    if any(p.startswith(SPACE) or p == 'all' for p in addresses):
-        die('a relay names the addresses the preview printed, never a space or all', 2)
-    if not sent:
-        die('a relay names the digest the preview printed (--digest)', 2)
+def relay(targets, entry, mine):
+    """Relay the human's message this turn acts on (bound()) to each target, recorded before it is typed; targets as
+    resolve() gave them. The transcript is read once for every target, so a message the human sends after that is not
+    seen, and each session is pinned once, so one replaced in its terminal meanwhile is refused. A target busy or with
+    text in its input line gets the relay held, recorded for `retry` to send unchanged."""
+    addresses = list(targets)
     with locked():
         captain = require_captain(mine)
-        latest, words = newest(captain, sending=True)
-        if latest != entry:
-            die(f"{entry} is not the human's newest message; preview again", 2)
-        pinned = pins({address: find(address) for address in addresses})
+        uid, words = bound(captain, entry)
+        pinned = {address: find(address) for address in addresses}
         quote = relay_text(words, addresses)
-        if sent != digest(quote, pinned):
-            die('the text, terminals or sessions this relay would send to are not the ones the preview showed; '
-                'preview again', 2)
         for address in addresses:
             recs = records()
-            if any(r['type'] == 'relay' and r['entry'] == entry and r['target']['address'] == address for r in recs):
+            if any(r['type'] == 'relay' and r['entry'] == uid and r['target']['address'] == address for r in recs):
                 print(f'{address}: refused, this message was relayed to it already', flush=True)
                 continue
-            target, why = sendable(address, recs, mine)
-            if not why and identity(target) != pinned[address]:   # replaced while earlier targets were typed into
-                why = 'its session is not the one the preview showed; preview again'
+            if any(r['target']['address'] == address for r in open_items(recs).values()):
+                print(f'{address}: refused, a request or relay to it is still open (collect it, or cancel it)',
+                      flush=True)
+                continue
+            target = find(address)
+            why = unreachable(target, mine)
+            if not why and identity(target) != identity(pinned[address]):
+                why = 'its session changed during this relay; relay again'
             if why:
                 print(f'{address}: refused, {why}', flush=True)
                 continue
-            action = new_id('a', recs)
-            print(deliver('relay', action, captain, target, relay_prompt(action),
-                          entry=entry, quote=quote, context=context(target, recs)), flush=True)
+            action, fields = new_id('a', recs), {'entry': uid, 'quote': quote, 'context': context(target, recs)}
+            busy = refusal(target)
+            if busy:
+                append(item('relay', action, captain, target, **fields))
+                append({'type': 'held', 'msg': action, 'why': busy})
+                print(f'{address}: {action} held, {busy}; `relay --retry {action}` sends it once it is idle',
+                      flush=True)
+                continue
+            print(deliver('relay', action, captain, target, relay_prompt(action), **fields), flush=True)
+    return 0
+
+
+def retry(action, mine):
+    """Send a held relay as it was recorded: the same words to the same session, never re-read or re-pinned."""
+    with locked():
+        captain = require_captain(mine)
+        recs = records()
+        held = first(recs, 'relay', action)
+        if not held or not first(recs, 'held', action):
+            die(f'no held relay {action}', 3)
+        if action not in open_items(recs) or any(r['msg'] == action and r['type'] in DELIVERY.values() for r in recs):
+            die(f'relay {action} is no longer held', 2)
+        if held['captain'] != captain:
+            die(f'relay {action} was held by an earlier captain', 2)
+        address = held['target']['address']
+        target = find(address)
+        if not target or identity(target) != held['target']:
+            append({'type': 'undelivered', 'msg': action, 'error': 'its session was replaced while the relay was held'})
+            print(f'{address}: {action} undelivered, its session was replaced while held')
+            return 0
+        busy = refusal(target)
+        if busy:
+            print(f'{address}: {action} still held, {busy}')
+            return 0
+        outcome, err = submit(address, relay_prompt(action), target['status'], captain['address'])
+        append({'type': outcome, 'msg': action, 'error': err} if err else {'type': outcome, 'msg': action})
+    print(f'{address}: {action} {outcome}' + (f' ({err})' if err else ''))
     return 0
 
 
@@ -1313,23 +1380,39 @@ def accept(action):
     with locked():
         mine = me()
         recs = records()
-        item = addressed('relay', action, recs, mine)
+        relayed = addressed('relay', action, recs, mine)
         current = enrolled()
-        if current != item['captain'] or not live(identity(current)):
+        if current != relayed['captain'] or not live(identity(current)):
             die(f'relay {action} came from an agent session that is no longer enrolled or no longer runs', 2)
         if first(recs, 'accepted', action):
-            die(f'relay {action} was accepted already', 2)
+            die(f'relay {action} was accepted already; `show --action {action}` prints it again', 2)
         if action not in open_items(recs):
             die(f'relay {action} is closed', 2)
         append({'type': 'accepted', 'msg': action})
-    print(f'RELAYED HUMAN INSTRUCTION {action} from the agent session in terminal {item["captain"]["address"]}, '
+    print(f'RELAYED HUMAN INSTRUCTION {action} from the agent session in terminal {relayed["captain"]["address"]}, '
           'accepted. The human\'s message, verbatim after any opening that named the sessions it went to:\n\n'
-          f'{item["quote"]}\n\n{item["context"]}\n'
+          f'{relayed["quote"]}\n\n{relayed["context"]}\n'
           'It may speak to other sessions too: act only on what it asks of this session, under your own rules and '
           'never wider; a question goes back as the needs-clarification outcome, not a dialog. Then record how it '
           'ended, the note a line or two on what you did or what you need to know, '
           + one_call('Relay outcome', f'outcome --action {action} --result <{"|".join(RESULTS)}> --note-file -',
                      'the note', 'Outcome recorded.'))
+    return 0
+
+
+def show_relay(action):
+    """The relay this session accepted, printed again with nothing recorded, for a session that lost it to a
+    compaction: it neither accepts again nor renews or widens anything."""
+    with locked():
+        recs = records()
+        relayed = addressed('relay', action, recs, me())
+        if not first(recs, 'accepted', action):
+            die(f'relay {action} is not accepted; `accept --action {action}` takes it', 2)
+    print(f'RELAYED HUMAN INSTRUCTION {action}, accepted earlier and shown again; nothing is recorded. The human\'s '
+          f'message, verbatim after any opening that named the sessions it went to:\n\n{relayed["quote"]}\n\n'
+          f'{relayed["context"]}\n'
+          + ('Its outcome is recorded already.' if first(recs, 'outcome', action) else
+             f'Record its outcome with `outcome --action {action}` as before, once it has ended.'))
     return 0
 
 
@@ -1612,12 +1695,15 @@ def main():
     rp.add_argument('--json', action='store_true')
     rp.add_argument('--new', action='store_true', help='every watch report since the last --new')
     sub.add_parser('cancel', help='close a request, relay or watch no answer will close').add_argument('msg')
-    rl = sub.add_parser('relay', help="show the human's newest message; with --entry and --digest, relay it")
-    rl.add_argument('addresses', nargs='+')
-    rl.add_argument('--entry', metavar='UUID')
-    rl.add_argument('--digest', metavar='HEX', help='the digest the preview printed')
+    rl = sub.add_parser('relay', help="relay the human's message this turn acts on")
+    rl.add_argument('addresses', nargs='*')
+    rl.add_argument('--entry', metavar='ID', help="which of this turn's messages, when the human wrote several")
+    rl.add_argument('--dry-run', action='store_true', help='show what would go where, sending nothing')
+    rl.add_argument('--retry', metavar='ACTION', help='send a held relay unchanged')
     ac = sub.add_parser('accept', help='take a relay and print its message (run by the target)')
     ac.add_argument('--action', required=True)
+    sh = sub.add_parser('show', help='print a relay this session accepted again, recording nothing (run by the target)')
+    sh.add_argument('--action', required=True)
     o = sub.add_parser('outcome', help='say how a relay ended (run by the target)')
     o.add_argument('--action', required=True)
     o.add_argument('--result', required=True, choices=RESULTS)
@@ -1652,6 +1738,8 @@ def main():
             return report(a.msg, a.file)
         if a.cmd == 'accept':
             return accept(a.action)
+        if a.cmd == 'show':
+            return show_relay(a.action)
         if a.cmd == 'outcome':
             return outcome(a.action, a.result, read_text(a.note_file) if a.note_file else '')
         if a.cmd == 'collect':
@@ -1677,7 +1765,13 @@ def main():
         if a.cmd == 'watch':   # all stays all, sessions to come included: resolve() would list today's
             return arm(['all'] if a.targets == ['all'] else list(resolve(a.targets)), mine)
         if a.cmd == 'relay':
-            return relay(a.addresses, a.entry, a.digest, mine) if a.entry else preview(resolve(a.addresses), mine)
+            if a.retry:
+                if a.addresses or a.entry or a.dry_run:
+                    die('relay --retry takes only the held action', 2)
+                return retry(a.retry, mine)
+            if not a.addresses:
+                die('relay names its targets', 2)
+            return (preview if a.dry_run else relay)(resolve(a.addresses), a.entry, mine)
     except Corrupt as e:
         die(f'ledger corrupt, nothing decided until it is reconciled by hand: {e}', 4)
     except hc.Error as e:
