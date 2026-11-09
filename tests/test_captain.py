@@ -2892,6 +2892,22 @@ class QueueTest(VerdictCase):
         self.assertEqual((shown['key'], shown['state'], shown['verdicts'][0]['status']),
                          ('merge', 'closed', 'rejected'))
 
+    def test_only_the_latest_verdict_keeps_a_closed_decision_listed(self):
+        self.report(decision('merge', kind='blocked'))
+        self.as_target(captain.outcome, self.action_of(self.decide(words='no')), 'rejected', 'not mine')
+        self.report(reopen=['merge'])
+        second = self.action_of(self.decide(revision=2, words='squash first'))
+        self.as_target(captain.accept, second)
+        self.as_target(captain.outcome, second, 'completed', 'done')
+        self.assertEqual(self.queue()['items'], [])
+
+    def test_closing_a_decision_updates_it(self):
+        self.report(decision('merge', kind='blocked'))
+        with mock.patch('builtins.print'):
+            captain.cancel(self.item()['id'], self.ident)
+        [row] = self.queue('all')['items']
+        self.assertEqual(row['updated_at'], row['closure']['at'])
+
     def test_the_json_contract(self):
         self.report(decision('merge', reviewed_sha=self.A, worktree='/w', grant_needed='merge'))
         out = self.queue('refresh')

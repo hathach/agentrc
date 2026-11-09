@@ -155,9 +155,9 @@ pins each target's session once, so one replaced in its terminal while the relay
   keeps for it, with a kind - `blocked`, `review` or `idea` - an ask and a recommendation, and `reopen`, `refresh` or
   `resolved` for ones it sent before, all under an `event_id`. A report answers its request or watch turn whatever
   its `event_id`; its decision operations apply once per session and event, so a retry changes nothing. A report with
-  `needs` and no `decisions` opens a `blocked` decision quoting the needs. `ingest --chief <run>`, the run's directory
-  name under `~/.cache/chief-runs/`, records a headless chief's `chief: attention` lines as decisions and its
-  `report.md` as their evidence. Ingesting and listing dispatch nothing.
+  `needs` and no `decisions` opens a `blocked` item quoting the needs, which takes no verdict: only `cancel` closes it.
+  `ingest --chief <run>`, the run's directory name under `~/.cache/chief-runs/`, records a headless chief's
+  `chief: attention` lines as decisions and its `report.md` as their evidence. Ingesting and listing dispatch nothing.
   `queue` lists the open decisions, blocked first, then reviews and ideas, each with its revision and freshness:
   `current` when the PR head and worktree HEAD it names were last observed at its `reviewed_sha`, `stale` on a
   mismatch or a chief report changed since, `unknown` when unobserved, when a lookup failed, or for a review naming no

@@ -1223,6 +1223,7 @@ def revise(item, i, content=None, reopen=False):
 def close(item, i, why):
     if item['state'] == 'open':
         item['state'], item['closure'] = 'closed', {'why': why, 'at': i, 'revision': item['revision']}
+        item['updated'] = i
 
 
 def apply_report(found, i, source, payload):
@@ -2284,8 +2285,8 @@ def coverage(recs, watch):
 
 def queue(show_all, as_json, refreshed, mine):
     """The decisions waiting on the human, blocked first, then reviews, then ideas, each in the order it opened;
-    with show_all, closed ones too, else only those whose relayed verdict has not gone through. Reads the ledger and
-    hc only; refreshed observes evidence first, as `refresh` does. Sends nothing."""
+    with show_all, closed ones too, else only those whose latest verdict is a relay that has not gone through. Reads
+    the ledger and hc only; refreshed observes evidence first, as `refresh` does. Sends nothing."""
     if refreshed:
         refresh(mine)
     with locked():
@@ -2296,7 +2297,8 @@ def queue(show_all, as_json, refreshed, mine):
     rows = [queue_row(i, states) for i in sorted(found.values(), key=lambda i: (KINDS.index(i['content']['kind']),
                                                                                i['opened'], i['id']))]
     if not show_all:
-        rows = [r for r in rows if r['state'] == 'open' or any(v.get('status') in UNSETTLED for v in r['verdicts'])]
+        rows = [r for r in rows
+                if r['state'] == 'open' or r['verdicts'] and r['verdicts'][-1].get('status') in UNSETTLED]
     covered = coverage(recs, watch)
     if as_json:
         print(json.dumps({'version': 1, 'ledger_position': len(recs), 'items': rows, 'coverage': covered,
@@ -2386,7 +2388,7 @@ def main():
     c = sub.add_parser('collect', help='print each report as it lands')
     c.add_argument('msgs', nargs='*')
     c.add_argument('--wait', type=int, default=60000, metavar='MS')
-    wt = sub.add_parser('watch', help='have sessions report each task end until this captain session ends')
+    wt = sub.add_parser('watch', help='have sessions report each task end until the human cancels it')
     wt.add_argument('targets', nargs='+')
     sub.add_parser('watches', help='the open watch and its members')
     rp = sub.add_parser('reports', help="the latest report from each target, or the named requests' reports")
