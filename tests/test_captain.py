@@ -2289,6 +2289,79 @@ class DecisionTest(WatchCase):
             captain.cancel(iid, self.ident)
 
 
+class ChiefFeedTest(LedgerCase):
+    """A headless chief run's attention lines become decision items; its report.md is their evidence."""
+
+    def setUp(self):
+        super().setUp()
+        self.runs = self.state / 'chief-runs'
+        self.run = self.runs / 'pr-12'
+        self.run.mkdir(parents=True)
+        patcher = mock.patch.object(captain, 'CHIEF_RUNS', str(self.runs))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def log(self, *lines, tail=''):
+        with open(self.run / 'progress.log', 'a', encoding='utf-8') as f:
+            f.write(''.join(f'{line}\n' for line in lines) + tail)
+
+    def ingest(self, run='pr-12'):
+        with mock.patch('builtins.print') as out:
+            captain.ingest(run, self.ident)
+        return out.call_args_list[0].args[0]
+
+    def items(self):
+        return list(captain.decisions(captain.records()).values())
+
+    def test_attention_lines_become_items_once(self):
+        self.log('1 10:00:00 launcher: started pid 1', '2 10:01:00 chief: attention · decide D1',
+                 '3 10:02:00 chief: cycle · ok')
+        self.assertEqual(self.ingest(), 'pr-12: 1 attention line(s) recorded')
+        self.assertEqual(self.ingest(), 'pr-12: 0 attention line(s) recorded')
+        [item] = self.items()
+        self.assertEqual((item['content']['ask'], item['handle'], item['revision']),
+                         ('chief: attention · decide D1', 'chief pr-12', 1))
+        self.assertEqual(item['owner'], {'run': str(self.run.resolve())})
+
+    def test_a_line_being_written_waits_and_a_shorter_log_removes_nothing(self):
+        self.log('1 10:00:00 chief: attention · one', tail='2 10:01:00 chief: attention · tw')
+        self.ingest()
+        self.assertEqual(len(self.items()), 1)
+        (self.run / 'progress.log').write_text('', encoding='utf-8')
+        self.ingest()
+        self.assertEqual(len(self.items()), 1)
+
+    def test_a_changed_line_refuses_the_whole_ingest(self):
+        self.log('1 10:00:00 chief: attention · one')
+        self.ingest()
+        (self.run / 'progress.log').write_text('1 10:00:00 chief: attention · other\n'
+                                               '2 10:01:00 chief: attention · two\n', encoding='utf-8')
+        before = captain.records()
+        with self.assertRaises(SystemExit), mock.patch('builtins.print'):
+            captain.ingest('pr-12', self.ident)
+        self.assertEqual(captain.records(), before)
+
+    def test_a_new_report_is_a_revision_never_a_reopening(self):
+        self.log('1 10:00:00 chief: attention · decide')
+        (self.run / 'report.md').write_text('verdict: needs-user', encoding='utf-8')
+        self.assertEqual(self.ingest(), 'pr-12: 1 attention line(s) recorded, report.md changed')
+        [item] = self.items()
+        self.assertEqual(item['revision'], 1, 'recorded with the report it came with')
+        captain.cancel(item['id'], self.ident)
+        (self.run / 'report.md').write_text('verdict: passed', encoding='utf-8')
+        self.ingest()
+        self.ingest()
+        [item] = self.items()
+        self.assertEqual((item['revision'], item['state']), (2, 'closed'))
+
+    def test_only_a_run_directory_under_the_runs_root(self):
+        (self.runs / 'out').symlink_to(self.state)
+        for run in ('../x', 'missing', 'out', '.hidden'):
+            with self.subTest(run), self.assertRaises(SystemExit), mock.patch('builtins.print'):
+                captain.ingest(run, self.ident)
+        self.assertEqual(captain.records(), [])
+
+
 def decision(key, kind='review', **extra):
     return {'key': key, 'kind': kind, 'ask': f'{key}?', 'recommendation': 'yes', 'pr': 'o/r#12', **extra}
 

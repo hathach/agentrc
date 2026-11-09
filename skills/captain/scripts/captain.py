@@ -76,6 +76,10 @@ LEDGER, ENROLLED = 'ledger-hc.jsonl', 'enrolled-hc.json'   # ledger.jsonl and en
 # where the enrolled captain's last collect without ids, and its last `reports --new`, stopped reading
 COLLECTED, TABLED = 'collected-hc.json', 'tabled-hc.json'
 TABLING = 'tabled.lock'   # serializes `reports --new` without holding the ledger lock while it prints
+CHIEF_RUNS = os.path.expanduser('~/.cache/chief-runs')   # where chief_run.py's --out directories live
+RUN_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,99}')
+PROGRESS_LINE = re.compile(r'(\d+) \d\d:\d\d:\d\d (.*)')
+ATTENTION = 'chief: attention'
 INSTALLED = (os.environ.get('AGENTRC_CAPTAIN_SCRIPT')
              or os.path.expanduser('~/.claude/skills/captain/scripts/captain.py'))
 IDENTITY = ('address', 'created', 'kind', 'cwd', 'session', 'pid', 'started', 'account')
@@ -97,7 +101,7 @@ STATES = ('ready', 'in-progress', 'blocked', 'needs-human', 'done', 'idle')
 # withdraw and withdraw-requested have no writer since `withdraw` was removed: kept so an older ledger still reads
 RECORDS = ('request', 'report', 'cancel', 'delivered', 'undelivered', 'uncertain',
            'relay', 'held', 'sending', 'accepted', 'outcome', 'withdraw', 'withdraw-requested', 'refused',
-           'watch', 'watch-extend', 'joined', 'watch-end')
+           'watch', 'watch-extend', 'joined', 'watch-end', 'evidence')
 ITEMS = ('request', 'relay')
 WATCHED = ('watch', 'joined')
 FOLLOWED = ITEMS + WATCHED   # what collect can follow
@@ -315,6 +319,9 @@ def well_formed(rec):
         return text(rec.get('watch')) and isinstance(rec.get('handle'), str) and pinned_identity(rec.get('target'))
     if rec['type'] in ('watch-end', 'held'):
         return isinstance(rec.get('why'), str)
+    if rec['type'] == 'evidence':
+        return (text(rec.get('run')) and rec.get('source') in ('attention', 'report') and text(rec.get('digest'))
+                and (rec['source'] == 'report' or type(rec.get('seq')) is int and text(rec.get('text'))))
     return True
 
 
@@ -868,8 +875,8 @@ def earlier_event(recs, source, payload):
 def unknown_keys(recs, source, payload):
     """The keys payload reopens, refreshes or resolves that are no decision of this session's, nor in payload."""
     owner = source['target']
-    known = {item['key'] for item in decisions(recs).values() if item['owner'] is not None
-             and (item['owner']['account'], item['owner']['session']) == (owner['account'], owner['session'])}
+    known = {item['key'] for item in decisions(recs).values()
+             if (item['owner'].get('account'), item['owner'].get('session')) == (owner['account'], owner['session'])}
     known |= {d['key'] for d in payload.get('decisions', [])}
     named = [*payload.get('reopen', []), *payload.get('refresh', []), *(r['key'] for r in payload.get('resolved', []))]
     return sorted(set(named) - known)
@@ -1229,7 +1236,7 @@ def decisions(recs):
     reopened or cancelled since. An event_id a session sent before is not applied again, whichever request or
     watch carried it."""
     sources = event_owner(recs)
-    found, seen = {}, set()
+    found, seen, reports = {}, set(), {}
     for i, r in enumerate(recs):
         if r['type'] == 'report' and r['msg'] in sources:
             source, payload = sources[r['msg']], r['report']
@@ -1241,9 +1248,97 @@ def decisions(recs):
                     continue
                 seen.add(ident)
             apply_report(found, i, source, payload)
+        elif r['type'] == 'evidence':
+            apply_evidence(found, reports, i, r)
         elif r['type'] == 'cancel' and r['msg'] in found:
             close(found[r['msg']], i, 'cancelled')
     return found
+
+
+def apply_evidence(found, reports, i, rec):
+    """A chief's attention line opens an item with no relay target, its run as owner, bound to the run's report.md as
+    last recorded; a later report.md digest is a revision of each of that run's items, open or closed, never reopening
+    one. reports holds each run's latest digest."""
+    run = rec['run']
+    if rec['source'] == 'report':
+        reports[run] = rec['digest']
+        for item in found.values():
+            if item['owner'].get('run') == run and item['report'] != rec['digest']:
+                revise(item, i)
+                item['report'] = rec['digest']
+    elif rec['msg'] not in found:
+        source = {'target': {'run': run}, 'handle': f'chief {os.path.basename(run)}'}
+        content = {'kind': 'blocked', 'ask': rec['text'], 'evidence_refs': [f'{run}/progress.log:{rec["seq"]}']}
+        found[rec['msg']] = {**new_item(rec['msg'], i, source, None, content), 'report': reports.get(run)}
+
+
+def run_dir(run_id):
+    """The chief run directory run_id names under CHIEF_RUNS, resolved; dies for anything else."""
+    if not RUN_ID.fullmatch(run_id):
+        die(f'{run_id}: a chief run is named by its directory under {CHIEF_RUNS}', 2)
+    root = os.path.realpath(CHIEF_RUNS)
+    run = os.path.realpath(os.path.join(root, run_id))
+    if os.path.dirname(run) != root or not os.path.isdir(run):
+        die(f'no chief run {run_id} in {CHIEF_RUNS}', 3)
+    return run
+
+
+def progress_lines(run):
+    """(seq, text) of each complete progress.log line; a last line still being written waits for the next ingest."""
+    try:
+        with open(os.path.join(run, 'progress.log'), 'rb') as f:
+            data = f.read()
+    except FileNotFoundError:
+        return []
+    found = []
+    for line in data.split(b'\n')[:-1]:
+        m = PROGRESS_LINE.fullmatch(line.decode('utf-8', 'replace'))
+        if m:
+            found.append((int(m.group(1)), m.group(2)))
+    return found
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def report_digest(run):
+    try:
+        with open(os.path.join(run, 'report.md'), 'rb') as f:
+            return digest(f.read())
+    except FileNotFoundError:
+        return None
+
+
+def ingest(run_id, mine):
+    """Record a headless chief run's attention lines as decision items and its report.md as their evidence; nothing
+    is sent anywhere and no repository, grant or session changes. Each line once by (run, seq); a seq that comes back
+    with other text refuses the whole ingest, recording nothing; a shorter progress.log removes nothing."""
+    run = run_dir(run_id)
+    lines = [(seq, t) for seq, t in progress_lines(run) if t.startswith(ATTENTION)]
+    report = report_digest(run)
+    with locked():
+        require_captain(mine)
+        recs = records()
+        known = {r['seq']: r for r in recs
+                 if r['type'] == 'evidence' and r['run'] == run and r['source'] == 'attention'}
+        new = []
+        for seq, line in lines:
+            earlier = known.get(seq)
+            if earlier and earlier['digest'] != digest(line.encode()):
+                die(f'{run_id}: progress.log line {seq} changed since it was ingested; nothing recorded', 2)
+            if not earlier:
+                new.append({'type': 'evidence', 'msg': item_id('c', run, str(seq)), 'run': run, 'source': 'attention',
+                            'seq': seq, 'text': line, 'digest': digest(line.encode())})
+        last = next((r['digest'] for r in reversed(recs) if r['type'] == 'evidence' and r['run'] == run
+                     and r['source'] == 'report'), None)
+        changed = report is not None and report != last
+        if changed:   # first, so the lines recorded with it are bound to it
+            append({'type': 'evidence', 'msg': item_id('r', run), 'run': run, 'source': 'report', 'digest': report})
+        for rec in new:
+            append(rec)
+    print(f'{run_id}: {len(new)} attention line(s) recorded' + (', report.md changed' if changed else ''))
+    return 0
 
 
 def cancel(msg, mine):
@@ -1914,7 +2009,9 @@ def main():
     rp.add_argument('msgs', nargs='*')
     rp.add_argument('--json', action='store_true')
     rp.add_argument('--new', action='store_true', help='every watch report since the last --new')
-    sub.add_parser('cancel', help='close a request, relay or watch no answer will close').add_argument('msg')
+    sub.add_parser('cancel', help='close a request, relay, watch or decision no answer will close').add_argument('msg')
+    sub.add_parser('ingest', help="record a headless chief run's attention lines as decisions").add_argument(
+        '--chief', required=True, metavar='RUN', help=f'its directory name under {CHIEF_RUNS}')
     rl = sub.add_parser('relay', help="relay the human's message this turn acts on")
     rl.add_argument('addresses', nargs='*')
     rl.add_argument('--entry', metavar='ID', help="which of this turn's messages, when the human wrote several")
@@ -1980,6 +2077,8 @@ def main():
             for address in resolve(a.addresses):
                 print(ask(address, mine, a.force), flush=True)
             return 0
+        if a.cmd == 'ingest':
+            return ingest(a.chief, mine)
         if a.cmd == 'cancel':
             return cancel(a.msg, mine)
         if a.cmd == 'watch':   # all stays all, sessions to come included: resolve() would list today's
