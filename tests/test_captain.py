@@ -1109,6 +1109,41 @@ class RelayTest(RelayCase):
         self.assertEqual(self.typed, [])
         self.assertNotIn(action, captain.open_items(captain.records()))
 
+    def test_a_retry_interrupted_while_sending_is_never_typed_again(self):
+        self.terminals['t2'] = {**pinned('t2'), 'status': 'working'}
+        self.say('merge o/r#12')
+        action = self.relay()[0].split()[1]
+        self.terminals['t2'] = {**pinned('t2'), 'status': 'idle'}
+
+        def typed_then_crash(address, text, status, caller):
+            self._submit(address, text, status, caller)
+            raise OSError('killed')
+        with mock.patch.object(captain, 'submit', typed_then_crash), self.assertRaises(OSError):
+            self.retry(action)
+        self.assertIn('uncertain', self.retry(action)[0])
+        with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
+            self.retry(action)
+        self.assertEqual(len(self.typed), 1)
+        self.assertIn(action, captain.open_items(captain.records()))   # it may have landed: still acceptable
+
+    def test_a_queued_message_without_an_id_refuses(self):
+        self.record(type='user', origin={'kind': 'task-notification'},
+                    message={'role': 'user', 'content': '<task-notification>'})
+        self.record(type='queue-operation', operation='remove', reason='absorbed_mid_turn', commandUuid=None)
+        self.record(type='attachment', attachment={'type': 'queued_command', 'prompt': 'merge 318',
+                                                   'origin': {'kind': 'human'}})
+        self.assertIn('has no id', self.refusal())
+        self.assertEqual((self.typed, captain.records()), ([], []))
+
+    def test_a_line_that_is_not_a_record_refuses(self):
+        for line in ('null', '"text"', '[]'):
+            with self.subTest(line):
+                self.say('merge o/r#12')
+                with open(self.transcript, 'a', encoding='utf-8') as f:
+                    f.write(line + '\n')
+                self.assertIn('not a record', self.refusal())
+        self.assertEqual(self.typed, [])
+
     def test_retry_takes_only_a_held_relay_of_this_captain(self):
         self.say('merge o/r#12')
         sent = self.action_of(self.relay())
@@ -1121,6 +1156,21 @@ class RelayTest(RelayCase):
         with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
             self.retry(held)
         self.assertEqual(len(self.typed), 1)
+
+    def test_a_session_opened_in_an_empty_target_during_the_relay_is_refused(self):
+        self.say('merge o/r#12')
+        del self.terminals['t3']
+        real = captain.find
+
+        def opened_after_pinning(address):
+            found = real(address)
+            if address == 't2' and not found:
+                self.terminals['t2'] = pinned('t2')
+            return found
+        del self.terminals['t2']
+        with mock.patch.object(captain, 'find', opened_after_pinning):
+            self.assertIn('changed during this relay', self.relay()[0])
+        self.assertEqual((self.typed, captain.records()), ([], []))
 
     def test_an_unreachable_target_is_refused_not_held(self):
         self.say('merge o/r#12')

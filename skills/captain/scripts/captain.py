@@ -83,7 +83,7 @@ OPTIONAL = {'issues': list}   # a report without it names no issue
 STATES = ('ready', 'in-progress', 'blocked', 'needs-human', 'done', 'idle')
 # withdraw and withdraw-requested have no writer since `withdraw` was removed: kept so an older ledger still reads
 RECORDS = ('request', 'report', 'cancel', 'delivered', 'undelivered', 'uncertain',
-           'relay', 'held', 'accepted', 'outcome', 'withdraw', 'withdraw-requested', 'refused',
+           'relay', 'held', 'sending', 'accepted', 'outcome', 'withdraw', 'withdraw-requested', 'refused',
            'watch', 'watch-extend', 'joined', 'watch-end')
 ITEMS = ('request', 'relay')
 WATCHED = ('watch', 'joined')
@@ -1110,7 +1110,7 @@ def turn_inputs(file):
         except ValueError:
             return [], 'a transcript line is not whole JSON, so a message of the human\'s may be hidden in it'
         if not isinstance(entry, dict):
-            continue
+            return [], 'a transcript line is not a record, so where a turn starts cannot be told'
         if (new_turn(entry) and not entry.get('isSidechain')
                 or entry.get('type') == 'system' and entry.get('subtype') in TURN_ENDS):
             inputs, read, absorbed = [], {}, set()
@@ -1166,6 +1166,8 @@ def bound(captain, entry=None):
         die(f'the human wrote more than one message this turn; relay again with --entry <id> naming the one to '
             f'relay:\n{listed}', 2)
     uid, words = inputs[0]
+    if not text(uid):
+        die("the human's message has no id in the transcript, so it cannot be recorded", 2)
     if words is None:
         die(f"the human's message {uid} is not plain text, so it cannot be relayed verbatim", 2)
     if HC_TAG.search(words):   # hc pastes into a half-typed draft: what follows the tag is not the human's
@@ -1186,8 +1188,7 @@ def named(token, live):
 
 def instruction(words, addresses, live):
     """(text, None): what a relay to addresses sends, words without an opening `tell <name>... [to]` whose names are
-    exactly addresses; (None, why) when that opening names anyone else or cannot be split from the instruction. Preview
-    and send both call this, and the send checks the preview's digest of it."""
+    exactly addresses; (None, why) when that opening names anyone else or cannot be split from the instruction."""
     tell = TELL.match(words)
     if not tell:
         return words, None
@@ -1231,7 +1232,7 @@ def instruction(words, addresses, live):
 
 
 class Stale(str):
-    """A refusal a new preview cures: the sessions changed, not the human's words."""
+    """A refusal a new relay cures: the sessions changed, not the human's words."""
 
 
 def broadcast(words, first, addresses, live):
@@ -1329,7 +1330,7 @@ def relay(targets, entry, mine):
                 continue
             target = find(address)
             why = unreachable(target, mine)
-            if not why and identity(target) != identity(pinned[address]):
+            if not why and (not pinned[address] or identity(target) != identity(pinned[address])):
                 why = 'its session changed during this relay; relay again'
             if why:
                 print(f'{address}: refused, {why}', flush=True)
@@ -1356,6 +1357,10 @@ def retry(action, mine):
             die(f'no held relay {action}', 3)
         if action not in open_items(recs) or any(r['msg'] == action and r['type'] in DELIVERY.values() for r in recs):
             die(f'relay {action} is no longer held', 2)
+        if first(recs, 'sending', action):   # typed or not, unrecorded: never type it twice
+            append({'type': 'uncertain', 'msg': action, 'error': 'an earlier retry stopped while sending it'})
+            print(f'{held["target"]["address"]}: {action} uncertain, an earlier retry stopped while sending it')
+            return 0
         if held['captain'] != captain:
             die(f'relay {action} was held by an earlier captain', 2)
         address = held['target']['address']
@@ -1368,6 +1373,7 @@ def retry(action, mine):
         if busy:
             print(f'{address}: {action} still held, {busy}')
             return 0
+        append({'type': 'sending', 'msg': action})
         outcome, err = submit(address, relay_prompt(action), target['status'], captain['address'])
         append({'type': outcome, 'msg': action, 'error': err} if err else {'type': outcome, 'msg': action})
     print(f'{address}: {action} {outcome}' + (f' ({err})' if err else ''))
