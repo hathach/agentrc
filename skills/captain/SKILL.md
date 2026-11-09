@@ -22,10 +22,14 @@ python3 ~/.claude/skills/captain/scripts/captain.py watches                     
 python3 ~/.claude/skills/captain/scripts/captain.py collect [<msg>...] [--wait MS]  # each answer as it lands
 python3 ~/.claude/skills/captain/scripts/captain.py reports [--json] [<msg>...]     # latest per session, or by request
 python3 ~/.claude/skills/captain/scripts/captain.py reports --json --new            # watch reports since the last --new
-python3 ~/.claude/skills/captain/scripts/captain.py cancel <msg>                    # close a request, relay or watch
+python3 ~/.claude/skills/captain/scripts/captain.py cancel <msg>                    # close a request, relay, watch or decision
+python3 ~/.claude/skills/captain/scripts/captain.py queue [--json] [--all] [--refresh]  # the decisions waiting on the human
+python3 ~/.claude/skills/captain/scripts/captain.py ingest --chief <run>            # a headless chief run's attention lines
 python3 ~/.claude/skills/captain/scripts/captain.py relay <target>... [--entry <id>]  # relay this turn's message
 python3 ~/.claude/skills/captain/scripts/captain.py relay <target>... --dry-run     # what it would send, sending nothing
 python3 ~/.claude/skills/captain/scripts/captain.py relay --retry <action>          # send a held relay unchanged
+python3 ~/.claude/skills/captain/scripts/captain.py relay <target> --item <item> --revision <N> --verdict correction|no-correction|decision [--entry <id>]
+python3 ~/.claude/skills/captain/scripts/captain.py verdict --item <item> --revision <N> --verdict correction|no-correction|decision [--entry <id>]
 ```
 
 The captain's read-only lookups, each refused unless its subcommand, flags and operands are on the script's
@@ -115,8 +119,9 @@ pins each target's session once, so one replaced in its terminal while the relay
   `hooks/captain` at its next Stop or after a compaction or `/clear`, and from then on reports at the end of each task,
   a blocker or a need for the human included. `all` covers every other session, new ones and restarts too; named
   targets cover those sessions, a restart in their terminal and a resume of one elsewhere, and a new terminal only
-  under `all`. A later `watch` widens the one open watch. It ends when this session ends, exits, is cleared or
-  replaced as captain, or on `cancel <watch>` on the human's word; no one session stops alone. A session joins only
+  under `all`. A later `watch` widens the one open watch. It stands until `cancel <watch>` on the human's word,
+  whichever captain runs: a captain that exits, is cleared or is replaced leaves it open, and the next one enrolled
+  collects what members reported meanwhile. No one session stops alone. A session joins only
   once its turn ends, so one that has not worked since says nothing. A watch holds no request slot: asks and relays
   to a watched session go as usual. `watches` lists it and its members, each live, gone or unknown; a restarted
   session is a new member. A member with no report may be working still or may have lost its brief, which nothing
@@ -146,6 +151,28 @@ pins each target's session once, so one replaced in its terminal while the relay
   since the last such call, so a later report never hides an earlier need. If the output is abbreviated, run
   `reports --json` again with fewer ids, down to one, a watch report as `<member>:<N>`; a row still cut says so, its
   needs never pieced together.
+- **Decisions** are what sessions hand the human. A report may carry `decisions`, each under a `key` its session
+  keeps for it, with a kind - `blocked`, `review` or `idea` - an ask and a recommendation, and `reopen`, `refresh` or
+  `resolved` for ones it sent before, all under an `event_id`. A report answers its request or watch turn whatever
+  its `event_id`; its decision operations apply once per session and event, so a retry changes nothing. A report with
+  `needs` and no `decisions` opens a `blocked` decision quoting the needs. `ingest --chief <run>`, the run's directory
+  name under `~/.cache/chief-runs/`, records a headless chief's `chief: attention` lines as decisions and its
+  `report.md` as their evidence. Ingesting and listing dispatch nothing.
+  `queue` lists the open decisions, blocked first, then reviews and ideas, each with its revision and freshness:
+  `current` when the PR head and worktree HEAD it names were last observed at its `reviewed_sha`, `stale` on a
+  mismatch or a chief report changed since, `unknown` when unobserved, when a lookup failed, or for a review naming no
+  `reviewed_sha`. Plain `queue` looks nothing up; `queue --refresh` observes first through `captain_read.py`. `--all`
+  adds closed ones, `--json` is the full record. A decision closes when its session resolves that revision, on a
+  verdict, or on `cancel <id>` on the human's word, never because a session stopped mentioning it.
+- **Verdicts** are the human's, on a decision at the revision `queue` showed them. Relay their words with
+  `relay <target> --item <item> --revision <N> --verdict ...` to the one session that owns it; for a chief's decision,
+  or one the human settles with you alone, `verdict` records the words with the same options, sending nothing.
+  `correction` when they overrule its recommendation, `no-correction` when they take it, `decision` when they choose
+  with no call on its quality; never infer one from words that do not decide that decision. Both refuse a closed or
+  revised decision, evidence observed stale, and a review not confirmed current: run `queue --refresh` and show the
+  human what changed. A held relayed verdict is checked again at `--retry`, and closes undelivered once obsolete; its
+  target's `accept` refuses one obsolete by then. `queue --json`'s `metrics` count correction verdicts over the
+  changes rated.
 - **File** a follow-up issue as `agents/captain.md` says, from a title and a body drafted under
   `~/.cache/agentrc/captain/drafts/`:
 
@@ -174,3 +201,7 @@ it again, recording nothing and renewing nothing.
 A watch's brief, `STATUS WATCH <member> ...`, reaches you through `hooks/captain`; do what it says. If a compaction
 leaves it out of view, `brief --pending` joins the open watch covering this session or prints its brief again;
 `none` means there is nothing to report to.
+
+A report may hand the human decisions, as the brief's keys say: keep each `key` for the same decision, send `resolved`
+once it no longer needs them, and a new `event_id` for each report that changes them. A relay bound to a decision is
+refused at `accept` once its evidence changed: record `needs-clarification` as the refusal says, and act on nothing.

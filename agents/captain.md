@@ -23,7 +23,11 @@ Ask only when the human asks for status, for one session or for all; never on a 
 
 ## Watch
 
-When the human wants to hear each time a session finishes - "watch", "watch all", "tell t7 to report whenever it's done", "let me know each time the session on PR 318 finishes" - arm a watch as the skill says: a bare "watch" is `watch all`, named sessions are `watch <target>...`. A message that also gives a session work, such as "fix X and report when done", is a relay, never a watch: its outcome comes back when X ends. Report each watch report as it lands, rows in the Status table's columns, sessions that need the human first when several land together. Cancel a watch only on the human's word; it ends with this session anyway, so say so when the human closes or clears it.
+When the human wants to hear each time a session finishes - "watch", "watch all", "tell t7 to report whenever it's done", "let me know each time the session on PR 318 finishes" - arm a watch as the skill says: a bare "watch" is `watch all`, named sessions are `watch <target>...`. A message that also gives a session work, such as "fix X and report when done", is a relay, never a watch: its outcome comes back when X ends. Report each watch report as it lands, rows in the Status table's columns, sessions that need the human first when several land together. Cancel a watch only on the human's word; it stands across captain sessions, so a watch outlives this one when the human closes or clears it: say so.
+
+## Decisions
+
+When the human asks what waits on them, run `queue`, and `queue --refresh` before they decide a review: report each decision with its id, revision, freshness, ask and recommendation, blocked first, and say what `coverage` leaves out. A chief run's attention lines reach the queue only through `ingest --chief` on the human's word. When the human's message decides one decision you showed, relay it as a verdict to its owner as the skill says, or record it with `verdict` for a chief's or one they settle with you; the kind of verdict is what their words say, and a refusal goes back to them unchanged.
 
 ## Check
 

@@ -2357,8 +2357,8 @@ class FreshnessTest(DecisionCase):
         self.assertEqual(captain.freshness(self.item()), 'unknown')
 
 
-class VerdictTest(RelayCase):
-    """The human's verdict on a decision, relayed to the session that owns it or recorded alone."""
+class VerdictCase(RelayCase):
+    """Sessions reporting decisions to the captain's watch, t2's PR head at self.head."""
 
     A, B = 'a' * 40, 'b' * 40
 
@@ -2406,6 +2406,10 @@ class VerdictTest(RelayCase):
         self.assertEqual([r for r in captain.records() if r['type'] != 'observed'],
                          [r for r in before if r['type'] != 'observed'])
         return '\n'.join(str(c.args[0]) for c in out.call_args_list)
+
+
+class VerdictTest(VerdictCase):
+    """The human's verdict on a decision, relayed to the session that owns it or recorded alone."""
 
     def test_a_relayed_verdict_binds_its_decision_and_closes_it(self):
         self.report(decision('merge', kind='blocked'))
@@ -2859,3 +2863,71 @@ class WatchCollectTest(WatchCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class QueueTest(VerdictCase):
+    """The decisions waiting on the human, read from the ledger alone."""
+
+    def queue(self, *flags):
+        """What `queue --json` prints, flags passed through."""
+        with mock.patch('builtins.print') as out:
+            captain.queue('all' in flags, True, 'refresh' in flags, self.ident)
+        return json.loads(out.call_args_list[0].args[0])
+
+    def test_blocked_then_review_then_idea_each_in_opening_order(self):
+        self.report(decision('later', kind='idea'), decision('ci', kind='blocked'),
+                    decision('merge', reviewed_sha=self.A), decision('fix', kind='blocked'))
+        self.assertEqual([i['key'] for i in self.queue()['items']], ['ci', 'fix', 'merge', 'later'])
+
+    def test_a_closed_decision_shows_only_while_its_relayed_verdict_has_not_gone_through(self):
+        self.report(decision('merge', kind='blocked'), decision('ci', kind='blocked'))
+        with mock.patch('builtins.print'):
+            captain.cancel(self.item('ci')['id'], self.ident)
+        self.decide()
+        self.assertEqual(self.queue()['items'], [], 'delivered, and the cancelled one is history')
+        self.assertEqual({i['key'] for i in self.queue('all')['items']}, {'merge', 'ci'})
+        action = next(r['msg'] for r in captain.records() if r['type'] == 'relay')
+        self.as_target(captain.outcome, action, 'rejected', 'not mine')
+        [shown] = self.queue()['items']
+        self.assertEqual((shown['key'], shown['state'], shown['verdicts'][0]['status']),
+                         ('merge', 'closed', 'rejected'))
+
+    def test_the_json_contract(self):
+        self.report(decision('merge', reviewed_sha=self.A, worktree='/w', grant_needed='merge'))
+        out = self.queue('refresh')
+        self.assertEqual(set(out), {'version', 'ledger_position', 'items', 'coverage', 'metrics'})
+        self.assertEqual((out['version'], out['ledger_position']), (1, len(captain.records())))
+        [item] = out['items']
+        self.assertEqual(set(item), {
+            'id', 'key', 'change_id', 'kind', 'owner', 'handle', 'relay_target', 'repo', 'pr', 'worktree',
+            'reviewed_sha', 'observations', 'ask', 'recommendation', 'grant_needed', 'evidence_refs', 'revision',
+            'state', 'freshness', 'missing', 'opened_at', 'updated_at', 'closure', 'verdicts'})
+        self.assertEqual((item['relay_target'], item['repo'], item['freshness'], item['missing']),
+                         ('t2', 'o/r', 'unknown', []), 'the worktree lookup failed')
+        self.assertEqual(sorted((o['source'], o['ok']) for o in item['observations']),
+                         [('pr', True), ('worktree', False)])
+        self.assertEqual(set(out['coverage']), {'watch', 'scope', 'members', 'chief_runs', 'not_covered'})
+        self.assertEqual([m['state'] for m in out['coverage']['members']], ['live'])
+        self.assertEqual(out['metrics']['ratio'], None)
+
+    def test_a_plain_queue_looks_nothing_up_and_records_nothing(self):
+        self.report(decision('merge', reviewed_sha=self.A))
+        before = captain.records()
+        with mock.patch.object(captain, 'lookup', side_effect=AssertionError('looked up')):
+            self.queue()
+        self.assertEqual(captain.records(), before)
+
+    def test_what_a_decision_lacks_is_named(self):
+        self.report(decision('merge'))
+        member = next(r['msg'] for r in captain.records() if r['type'] == 'joined')
+        self.report_as('t2', member, {**GOOD, 'needs': 'ci is red'})
+        self.assertEqual([i['missing'] for i in self.queue()['items']], [['recommendation'], ['reviewed_sha']])
+
+    def test_the_text_view_names_each_decision_and_the_coverage(self):
+        self.report(decision('merge', kind='blocked'))
+        with mock.patch('builtins.print') as out:
+            captain.queue(False, False, False, None)
+        lines = [c.args[0] for c in out.call_args_list]
+        self.assertEqual(lines[0], 'blocked')
+        self.assertIn(self.item()['id'], lines[1])
+        self.assertIn(captain.UNCOVERED, lines[-1])

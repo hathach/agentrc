@@ -13,9 +13,15 @@ does not recognize is reported, never assumed safe.
   captain.py collect [<msg>...] [--wait MS]      print each report as it lands
   captain.py reports [<msg>[:<N>]...]            the latest report from each target, or those requests' reports
   captain.py reports --new                       every watch report since the last --new
-  captain.py cancel <msg>                        close a request, relay or watch no answer will close
+  captain.py cancel <msg>                        close a request, relay, watch or decision no answer will close
+  captain.py queue [--json] [--all] [--refresh]  the decisions waiting on the human, sending nothing
+  captain.py ingest --chief <run>                record a headless chief run's attention lines as decisions
   captain.py relay <target>... [--entry <id>] [--dry-run]
                                                  relay the human's message this turn acts on
+  captain.py relay <target> --item <id> --revision <N> --verdict <verdict> [--entry <id>]
+                                                 relay it as the human's verdict on a decision
+  captain.py verdict --item <id> --revision <N> --verdict <verdict> [--entry <id>]
+                                                 record it as that verdict, sending nothing
   captain.py relay --retry <action>              send a held relay once its session is idle
   captain.py brief --for <msg> | --pending       a target reads what a status request asks, or joins a watch
   captain.py report --for <msg> --file <json|->  a target answers a status request
@@ -88,6 +94,9 @@ ATTENTION = 'chief: attention'
 READER = str(Path(__file__).resolve().with_name('captain_read.py'))
 SOURCES = ('pr', 'worktree', 'report')
 VERDICTS = ('correction', 'no-correction', 'decision')
+UNSETTLED = ('pending', 'held', 'sending', 'undelivered', 'uncertain', 'refused', 'failed', 'rejected',
+             'needs-clarification')   # a relayed verdict in one of these keeps its closed decision in the queue
+UNCOVERED = 'Codex terminals and remote sessions are not covered'
 INSTALLED = (os.environ.get('AGENTRC_CAPTAIN_SCRIPT')
              or os.path.expanduser('~/.claude/skills/captain/scripts/captain.py'))
 IDENTITY = ('address', 'created', 'kind', 'cwd', 'session', 'pid', 'started', 'account')
@@ -2208,14 +2217,112 @@ def watches():
     print(f'{watch["msg"]}\t{terminals(scopes(recs, watch["msg"]))}\tcaptain {who}')
     reported = {r['msg']: i for i, r in enumerate(recs) if r['type'] == 'report'}
     for m in members(recs, watch['msg']):
-        try:
-            now = find(m['target']['address'])
-            seen = ('unknown' if now and unpinned(now) else 'live' if now and identity(now) == m['target']
-                    else 'gone')
-        except hc.Error:
-            seen = 'unknown'
         last = f'{m["msg"]}:{reported[m["msg"]]}' if m['msg'] in reported else 'no report'
-        print(f'  {m["msg"]}\t{m["handle"]}\t{seen}\t{last}')
+        print(f'  {m["msg"]}\t{m["handle"]}\t{member_state(m)}\t{last}')
+    return 0
+
+
+def member_state(member):
+    """live, gone or unknown: whether the session that joined still runs in its terminal, as far as hc can tell."""
+    try:
+        now = find(member['target']['address'])
+    except hc.Error:
+        return 'unknown'
+    return 'unknown' if now and unpinned(now) else 'live' if now and identity(now) == member['target'] else 'gone'
+
+
+def relay_states(recs):
+    """Each relay's status: pending until something happens to it, then what last did, an outcome by its result."""
+    states = {}
+    for r in recs:
+        if r['type'] == 'relay':
+            states[r['msg']] = 'pending'
+        elif r.get('msg') in states and r['type'] not in ITEMS:
+            states[r['msg']] = r['result'] if r['type'] == 'outcome' else 'cancelled' if r['type'] == 'cancel' \
+                else r['type']
+    return states
+
+
+def missing(item):
+    """What a decision lacks for the human to settle it from the queue alone."""
+    content = item['content']
+    gaps = [] if 'recommendation' in content else ['recommendation']
+    if content['kind'] == 'review' and 'run' not in item['owner']:
+        if 'reviewed_sha' not in content:
+            gaps.append('reviewed_sha')
+        elif not sources(item):
+            gaps.append('pr or worktree')
+    return gaps
+
+
+def queue_row(item, states):
+    content, owner = item['content'], item['owner']
+    pr = content.get('pr')
+    return {'id': item['id'], 'key': item['key'], 'change_id': item['change_id'], 'kind': content['kind'],
+            'owner': owner, 'handle': item['handle'], 'relay_target': owner.get('address'),
+            'repo': pr.split('#')[0] if pr else None, 'pr': pr, 'worktree': content.get('worktree'),
+            'reviewed_sha': content.get('reviewed_sha'),
+            'observations': [{'source': s, 'revision': item['revision'], 'ok': o['ok'], 'value': o['value'],
+                              'ledger_position': o['at']} for s, o in item['observations'].items()],
+            'ask': content['ask'], 'recommendation': content.get('recommendation'),
+            'grant_needed': content.get('grant_needed'), 'evidence_refs': content.get('evidence_refs', []),
+            'revision': item['revision'], 'state': item['state'], 'freshness': freshness(item),
+            'missing': missing(item), 'opened_at': item['opened'], 'updated_at': item['updated'],
+            'closure': item['closure'],
+            'verdicts': [{**v, 'status': states[v['msg']]} if v['via'] == 'relay' else v for v in item['verdicts']]}
+
+
+def coverage(recs, watch):
+    """Where decisions come from: the open watch's members as hc sees them, the chief runs ingested, and what no
+    feed reaches."""
+    runs = sorted({r['run'] for r in recs if r['type'] == 'evidence'})
+    members_ = [{'msg': m['msg'], 'handle': m['handle'], 'state': member_state(m)}
+                for m in (members(recs, watch['msg']) if watch else [])]
+    return {'watch': watch and watch['msg'], 'scope': watch and terminals(scopes(recs, watch['msg'])),
+            'members': members_, 'chief_runs': runs, 'not_covered': UNCOVERED}
+
+
+def queue(show_all, as_json, refreshed, mine):
+    """The decisions waiting on the human, blocked first, then reviews, then ideas, each in the order it opened;
+    with show_all, closed ones too, else only those whose relayed verdict has not gone through. Reads the ledger and
+    hc only; refreshed observes evidence first, as `refresh` does. Sends nothing."""
+    if refreshed:
+        refresh(mine)
+    with locked():
+        recs = records()
+        watch = settle(recs)
+    states = relay_states(recs)
+    found = decisions(recs)
+    rows = [queue_row(i, states) for i in sorted(found.values(), key=lambda i: (KINDS.index(i['content']['kind']),
+                                                                               i['opened'], i['id']))]
+    if not show_all:
+        rows = [r for r in rows if r['state'] == 'open' or any(v.get('status') in UNSETTLED for v in r['verdicts'])]
+    covered = coverage(recs, watch)
+    if as_json:
+        print(json.dumps({'version': 1, 'ledger_position': len(recs), 'items': rows, 'coverage': covered,
+                          'metrics': metric(found)}, indent=2, ensure_ascii=False))
+        return 0
+    for kind in KINDS:
+        listed = [r for r in rows if r['kind'] == kind]
+        if listed:
+            print(kind)
+        for r in listed:
+            state = r['state'] if r['state'] == 'open' else f'closed {r["closure"]["why"]}'
+            gaps = f'\tmissing {", ".join(r["missing"])}' if r['missing'] else ''
+            print(f'  {r["id"]} r{r["revision"]}\t{state}\t{r["freshness"]}\t{r["handle"]}\t{one_line(r["ask"])}'
+                  f'\t-> {one_line(r["recommendation"] or "-")}{gaps}')
+            for v in r['verdicts']:
+                print(f'    {v["verdict"]} r{v["revision"]} {v["msg"]}' + (f' {v["status"]}' if 'status' in v else ''))
+    if not rows:
+        print('no decision waits on you')
+    live = [m['state'] for m in covered['members']]
+    watched = (f'watch {covered["watch"]} {covered["scope"]}: '
+               + ', '.join(f'{live.count(s)} {s}' for s in ('live', 'gone', 'unknown') if s in live)
+               if watch else 'no watch')
+    print(f'coverage: {watched}; chief runs: {" ".join(covered["chief_runs"]) or "none"}; {UNCOVERED}')
+    m = metric(found)
+    if m['changes_with_verdicts']:
+        print(f'corrections: {m["correction_verdicts"]} over {m["changes_with_verdicts"]} changes')
     return 0
 
 
@@ -2287,6 +2394,10 @@ def main():
     rp.add_argument('--json', action='store_true')
     rp.add_argument('--new', action='store_true', help='every watch report since the last --new')
     sub.add_parser('cancel', help='close a request, relay, watch or decision no answer will close').add_argument('msg')
+    qu = sub.add_parser('queue', help='the decisions waiting on the human, sending nothing')
+    qu.add_argument('--json', action='store_true')
+    qu.add_argument('--all', action='store_true', help='closed decisions too')
+    qu.add_argument('--refresh', action='store_true', help='observe each PR head, worktree and chief report first')
     sub.add_parser('ingest', help="record a headless chief run's attention lines as decisions").add_argument(
         '--chief', required=True, metavar='RUN', help=f'its directory name under {CHIEF_RUNS}')
     rl = sub.add_parser('relay', help="relay the human's message this turn acts on")
@@ -2344,6 +2455,8 @@ def main():
             return collect(a.msgs, a.wait)
         if a.cmd == 'watches':
             return watches()
+        if a.cmd == 'queue' and not a.refresh:
+            return queue(a.all, a.json, False, None)
         if a.cmd == 'reports':
             if a.new and a.msgs:
                 die('reports --new takes no ids', 2)
@@ -2360,6 +2473,8 @@ def main():
             return 0
         if a.cmd == 'ingest':
             return ingest(a.chief, mine)
+        if a.cmd == 'queue':
+            return queue(a.all, a.json, True, mine)
         if a.cmd == 'cancel':
             return cancel(a.msg, mine)
         if a.cmd == 'watch':   # all stays all, sessions to come included: resolve() would list today's
