@@ -758,9 +758,31 @@ class Console(Base):
 
 
 class Detach(Base):
+    def device(self, busport, ino, serial=None):
+        """A device dir; serial None: no `serial` file, as for an enumeration without iSerialNumber."""
+        d = self.dir / f'dev{ino}'
+        d.mkdir()
+        if serial is not None:
+            (d / 'serial').write_text(serial + '\n')
+        return {'busport': busport, 'ino': ino, 'dir': str(d)}
+
+    def wait(self, board, vid_pid, polls, serials):
+        """detach over the usb_devices lists in `polls`, each serial read from `serials` (None: inconclusive)."""
+        self.A.flash.run_openocd_commands.return_value = mock.Mock(returncode=0, stdout=b'', stderr=b'')
+        self.A.usb.usb_devices.side_effect = polls
+        self.A.usb.read_sysfs = lambda path: serials.get(Path(path).parent.name)
+        self.A.usb.enumeration_id = lambda d: int(Path(d).name[3:])
+        now = [0.0]
+
+        def tick():
+            now[0] += 1
+            return now[0]
+        with mock.patch.object(H.time, 'sleep'), mock.patch.object(H.time, 'monotonic', tick):
+            return H.detach('rig_ocd', board, vid_pid, mock.Mock())
+
     def test_detach_only_where_the_flasher_targets_an_rp_chip(self):
         self.A.flash.run_openocd_commands.return_value = mock.Mock(returncode=0, stdout='', stderr='')
-        self.A.usb.usb_scan.return_value = []
+        self.A.usb.usb_devices.return_value = []
         board = self.board('rig_ocd')
         self.assertEqual(H.detach('rig_ocd', board, '239a:cafe', mock.Mock()), 'detached')
         self.assertEqual(self.A.flash.run_openocd_commands.call_args[0][1], ['mww 0x5011304c 0x00010000'])
@@ -775,12 +797,46 @@ class Detach(Base):
         self.A.flash.run_openocd_commands.assert_not_called()
 
     def test_detach_without_a_record_waits_for_the_serial(self):
+        dut, hub, other = self.device('21-1.3', 1, 'OUID'), self.device('21-1', 2), self.device('21-1.4', 3, 'X')
+        serials = {'dev1': 'ouid', 'dev3': 'X'}   # serial compared case aside
+        self.assertEqual(self.wait(self.board('rig_ocd'), None, [[hub, dut, other], [hub, other]], serials),
+                         'detached')
+        self.assertEqual(self.A.usb.usb_devices.call_args, mock.call())   # any VID: no record names one
+        self.A.usb.usb_scan.assert_not_called()
+
+    def test_an_inconclusive_serial_read_is_no_detach(self):
+        dut = self.device('21-1.3', 1, 'OUID')
+        polls = [[dut]] * 10
+        self.assertEqual(self.wait(self.board('rig_ocd'), '239a:cafe', polls, {}),
+                         f'still enumerated {H.DETACH_WAIT}s after the detach')
+        self.assertEqual(self.A.usb.usb_devices.call_args[1], {'vid_pid': ('239a', 'cafe')})
+        self.A.usb.usb_devices.side_effect = None
+        self.A.usb.enumeration_id = lambda d: 99   # read across a re-enumeration
+        self.A.usb.read_sysfs = lambda path: 'X'
+        self.A.usb.usb_devices.return_value = [dut]
+        self.assertFalse(H.dut_absent('239a:cafe', self.board('rig_ocd')))
+
+    def test_a_missing_serial_holds_a_scoped_wait(self):
         board = self.board('rig_ocd')
-        self.A.flash.run_openocd_commands.return_value = mock.Mock(returncode=0, stdout=b'', stderr=b'')
-        self.A.usb.usb_scan.side_effect = [[{'busport': '21-1.3'}], []]
-        with mock.patch.object(H.time, 'sleep'):
-            self.assertEqual(H.detach('rig_ocd', board, None, mock.Mock()), 'detached')
-        self.assertEqual(self.A.usb.usb_scan.call_args[1], {'serial': 'OUID'})
+        dut = self.device('21-1.3', 1)   # its serial string not cached, or its enumeration still being added
+        self.assertEqual(self.wait(board, '239a:cafe', [[dut]] * 10, {}),
+                         f'still enumerated {H.DETACH_WAIT}s after the detach')
+        self.assertEqual(self.wait({**board, 'usb_port': '21-1.3'}, None, [[dut]] * 10, {}),
+                         f'still enumerated {H.DETACH_WAIT}s after the detach')
+
+    def test_usb_port_scopes_the_wait(self):
+        board = {**self.board('rig_ocd'), 'usb_port': '21-1.3'}
+        dut, peer = self.device('21-1.3', 1, 'OUID'), self.device('21-1.4', 2, 'OUID')
+        self.assertEqual(self.wait(board, '239a:cafe', [[dut, peer], [peer]], {'dev1': 'OUID'}), 'detached')
+        self.assertEqual(self.wait(board, '239a:cafe', [[dut, peer]] * 10, {'dev2': 'OUID'}),
+                         f'still enumerated {H.DETACH_WAIT}s after the detach')   # dut's read inconclusive
+
+    def test_no_serial_board_waits_for_its_port_to_empty(self):
+        board = {**self.board('rig_ocd'), 'usb_port': '21-1.3', 'no_serial': True}
+        dut, peer = self.device('21-1.3', 1), self.device('21-1.4', 2)
+        self.assertEqual(self.wait(board, None, [[dut, peer], [peer]], {}), 'detached')
+        self.assertEqual(self.wait(board, None, [[dut, peer]] * 10, {}),
+                         f'still enumerated {H.DETACH_WAIT}s after the detach')
 
     def test_a_failed_detach_is_evidence(self):
         self.A.flash.run_openocd_commands.return_value = mock.Mock(returncode=0, stdout='Error: x', stderr='')

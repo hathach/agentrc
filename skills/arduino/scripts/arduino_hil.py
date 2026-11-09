@@ -510,7 +510,7 @@ def detach(name, board, vid_pid, tracker):
         return f'detach session failed (exit {op.returncode})'
     deadline = time.monotonic() + DETACH_WAIT
     while time.monotonic() < deadline:
-        if not (dut_devices(vid_pid, board) if vid_pid else A.usb.usb_scan(serial=board['uid'])):
+        if dut_absent(vid_pid, board):
             return 'detached'
         time.sleep(0.2)
     return f'still enumerated {DETACH_WAIT}s after the detach'
@@ -575,6 +575,25 @@ def dut_devices(vid_pid, board):
         return [d for d in devices(vid_pid) if d['busport'] == board['usb_port'] and no_serial(d)]
     found = scan(vid_pid, board['uid'])
     return [d for d in found if d['busport'] == board['usb_port']] if 'usb_port' in board else found
+
+
+def dut_absent(vid_pid, board):
+    """Whether the DUT is off the bus, any VID when vid_pid is None. A serial-keyed DUT is absent once no candidate
+    (with this VID:PID, at its `usb_port` when the roster sets one) carries its serial or one whose read was
+    inconclusive (missing, timed out, unreadable, or across a re-enumeration): that device could be it, as in
+    usb_absent. Only a host-wide scan, no VID:PID and no `usb_port`, passes over devices with no `serial` in their
+    enumeration: counting those would wait on every serial-less hub."""
+    if board.get('no_serial'):
+        return not (dut_devices(vid_pid, board) if vid_pid else
+                    [d for d in A.usb.usb_devices() if d['busport'] == board['usb_port']])
+    uid, port = board['uid'].lower(), board.get('usb_port')
+    for d in devices(vid_pid) if vid_pid else A.usb.usb_devices():
+        if (port and d['busport'] != port) or (not (vid_pid or port) and no_serial(d)):
+            continue
+        sn = A.usb.read_sysfs(str(Path(d['dir']) / 'serial'))
+        if sn is None or A.usb.enumeration_id(d['dir']) != d['ino'] or sn.lower() == uid:
+            return False
+    return True
 
 
 def dut_name(board):
