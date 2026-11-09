@@ -885,6 +885,19 @@ class RecheckDir(unittest.TestCase):
         self.assertEqual([e['token'] for e in hp.recheck_dir(self.d)[1]], ['a', 'b'])
         self.assertEqual(hp.recheck_dir(self.d)[0], 'unknown')
 
+    def test_its_owner_rechecks_a_foreign_entry_of_this_dir_as_its_own_and_tidies_nothing(self):
+        """A dead claimant's foreign entry, logged as a cleanup failure, is cleared by the dir's owner once done."""
+        entry = {'token': f'foreign:{self.d}', 'foreign': self.d, 'uid': os.geteuid() + 1}
+        with mock.patch.object(hp, '_bounded', side_effect=AssertionError('its owner reads no /proc')):
+            self.assertEqual(hp.recheck(entry), 'done')                # none found
+            self.op('a')
+            self.assertEqual(hp.recheck(entry), 'done')
+            self.hold(self.op('b', cleanup='pending'))
+            self.assertEqual(hp.recheck(entry), 'pending')
+            self.op('c', files=('log',))
+            self.assertEqual(hp.recheck(entry), 'unknown')
+        self.assertEqual(len(os.listdir(self.d)), 7)                    # a's files kept for other receipts
+
     def test_an_untrusted_or_missing_state_dir_is_unknown(self):
         self.op('a')
         os.chmod(self.d, 0o770)

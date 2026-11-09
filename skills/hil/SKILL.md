@@ -125,7 +125,10 @@ nothing in it through a link.
      not this uid's to trust: its one entry is `pending` while `/proc` shows a
      supervisor of an operation there or may hide one (hidepid, an unreadable
      command line), else `unknown`; a refusal on it names who can clear it
-     (that uid or root rerunning, or removing the claim once none runs).
+     (that uid or root rerunning, or removing the claim once none runs). That
+     uid rechecks such an entry, a logged one in `resolve_restored` included,
+     as `recheck_dir` of its own dir, tidying nothing: `done` once every
+     operation there is.
   3. `settle(<unresolved receipts>, <wait>, busy=<its own probe-use check>)`
      rechecks until none is `pending`; only a `pending` receipt, a child
      proven still running, or what `busy` names holds the board. An

@@ -689,7 +689,8 @@ def recheck(receipt: dict) -> str:
     state: its lock, the file it created, is held while it lives, and its record, a file of
     ours, says `done` only once nothing is left. Anything unverifiable is unknown, a receipt
     without a token or paths included (recheck_dir's `unrecheckable` entries). An entry recheck_dir
-    made for a state dir of another uid is rechecked from /proc alone (_foreign_state)."""
+    made for a state dir of another uid is rechecked from /proc alone, or as a dir of ours by its owner
+    (_foreign_state)."""
     if isinstance(receipt, dict) and 'foreign' in receipt:
         return _foreign_state(receipt)
     try:
@@ -851,12 +852,26 @@ def _supervisors_in(state_dir: str) -> list | None:
 _proc_scan: list = []       # _foreign_state's last scan thread
 
 
+class _KeepAll:
+    """recheck_dir's `keep` holding every token: a recheck that tidies nothing."""
+
+    def __contains__(self, _token) -> bool:
+        return True
+
+
 def _foreign_state(entry: dict) -> str:
-    """'pending' while /proc shows a supervisor of an operation in the entry's state dir, or cannot show every
-    process within PROC_SCAN_BOUND, or an earlier scan is still blocked (one such thread, not one per poll); 'unknown'
-    once it shows none: the dir's records, of another uid, prove no `done`. A supervisor lives until it has reaped
-    every descendant, so /proc shows it for as long as its lock is held."""
+    """For the entry's state dir's owner, once trusted_dir passes, recheck_dir's verdict, tidying nothing: the files
+    of other receipts logged against it stay. For any other uid, 'pending' while /proc shows a supervisor of an
+    operation there, or cannot show every process within PROC_SCAN_BOUND, or an earlier scan is still blocked (one
+    such thread, not one per poll); 'unknown' once it shows none: the dir's records, of another uid, prove no `done`.
+    A supervisor lives until it has reaped every descendant, so /proc shows it for as long as its lock is held."""
     d = entry.get('foreign')
+    try:
+        trusted_dir(d)
+    except (OSError, TypeError, ValueError):
+        pass
+    else:
+        return recheck_dir(d, _KeepAll())[0]
     if not isinstance(d, str) or any(t.is_alive() for t in _proc_scan):
         return 'pending'
     return 'unknown' if _bounded(lambda: _supervisors_in(d), PROC_SCAN_BOUND, _proc_scan) == [] else 'pending'

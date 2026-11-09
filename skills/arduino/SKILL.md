@@ -91,9 +91,8 @@ retries, recovery) apply unchanged; these scripts load its `hil_*` scripts throu
   still running (`pending`) gets 30 s to end, else the attempt is refused the same way, its lock released, and every
   later attempt is refused until that child ends; an `unknown` one never holds the board. Another OS user's earlier
   invocation, whose files this one may not read, counts as running while `/proc` shows one of its supervisors or may
-  hide one, and the refusal names who can clear it. A clean end removes its
-  claim before the release; one that left a child unproven keeps it. `claimNote` reports a claim not removed or a
-  failure not logged.
+  hide one, and the refusal names who can clear it. A clean end removes its claim before the release; one that left a
+  child unproven keeps it. `claimNote` reports a claim not removed or a failure not logged.
 
 ## Code format
 
