@@ -170,6 +170,14 @@ class DevAttached(Base):
                 self.assertEqual((out['arduino']['dev_attached'], out['dev_attached']), (local, [UDISK, CH340]))
                 self.assertRegex(err, f'p: arduino.dev_attached differs from .*{why}.*still get the roster')
 
+    def test_a_null_legacy_copy_warns_at_every_path(self):
+        for where, entry in (('dev_attached', {'dev_attached': None}),
+                             ('tests.dev_attached', {'tests': {'dev_attached': None}}),
+                             ('arduino.dev_attached', {'arduino': {'dev_attached': None}})):
+            with self.subTest(where):
+                err = self.resolve({'name': 'p', 'uid': 'P', 'probe': 'E663', **entry})[1]
+                self.assertIn(f'p: {where} differs from agentrc\'s board registry (pico2): not a list of objects', err)
+
     def test_a_top_level_copy_is_replaced_by_the_registrys(self):
         out, err = self.resolve({'name': 'p', 'uid': 'P', 'probe': 'E663', 'dev_attached': [UDISK]})
         self.assertEqual(out['dev_attached'], [UDISK, CH340])

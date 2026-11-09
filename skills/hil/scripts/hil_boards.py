@@ -207,8 +207,10 @@ def _local_copies(entry):
     for path in LEGACY_COPIES:
         obj = entry
         for key in path:
-            obj = obj.get(key) if isinstance(obj, dict) else None
-        if obj is not None:
+            if not isinstance(obj, dict) or key not in obj:
+                break
+            obj = obj[key]
+        else:
             found.append(('.'.join(path), obj))
     return found
 
