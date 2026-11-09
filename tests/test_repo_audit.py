@@ -1526,6 +1526,45 @@ class Usage(unittest.TestCase):
         self.assertEqual((agg['skills'], agg['agents'], agg['workflows']),
                          ({'build': 1, 'tool': 3, 'other': 2}, {'runner': 1, 'other': 2}, {'ship': 2, 'other': 5}))
 
+    def test_a_removed_worktree_goes_by_the_main_checkout_s_name_and_an_existing_directory_never(self):
+        head = self.repo.commit({'.claude/skills/build/SKILL.md': 'x\n', '.claude/agents/runner.md': 'x\n',
+                                 '.claude/workflows/ship.js': 'x\n'})
+        task = tmpdir(self) / 'audit-x'         # the audit's own worktree, named apart from the repository
+        self.repo.git('worktree', 'add', '-q', '--detach', str(task), head)
+        self.run_dir = tmpdir(self) / 'run2'
+        start(task, self.run_dir, '--base', head, head=head)
+        name = self.repo.path.name
+        gone = (tmpdir(self) / 'worktrees' / name / 'fix-2').as_posix()
+        foreign = tmpdir(self) / f'{name}-other'
+        (foreign / '.claude' / 'workflows').mkdir(parents=True)
+        (foreign / '.claude' / 'workflows' / 'ship.js').write_text('x\n')
+        there = foreign.as_posix()
+
+        def calls(cwd, script):
+            return [use(f'{cwd}s', 'Skill', {'skill': 'build'}, cwd=cwd),
+                    use(f'{cwd}a', 'Agent', {'subagent_type': 'runner'}, cwd=cwd),
+                    use(f'{cwd}n', 'Workflow', {'name': 'ship'}, cwd=cwd),
+                    use(f'{cwd}w', 'Workflow', {'scriptPath': f'{script}/.claude/workflows/ship.js'}, cwd=cwd)]
+        claude(self.root / 'p' / 's1.jsonl', calls(gone, gone) + calls(there, gone) +
+               [use('f', 'Workflow', {'scriptPath': f'{there}/.claude/workflows/ship.js'}, cwd=gone)])
+        self.usage()
+        agg = json.loads(self.out.read_text())
+        # from the removed worktree, by name or by its vanished script; from a directory that exists, never
+        self.assertEqual((agg['skills'], agg['agents'], agg['workflows']),
+                         ({'build': 1, 'other': 1}, {'runner': 1, 'other': 1}, {'ship': 2, 'other': 3}))
+
+    def test_only_agent_launches_leave_out_built_in_names(self):
+        head = self.repo.commit({'skills/fork/SKILL.md': 'x\n', 'workflows/web-fetch.js': 'x\n'})
+        self.run_dir = tmpdir(self) / 'run2'
+        start(self.repo.path, self.run_dir, '--base', head, head=head)
+        cwd = self.repo.path.as_posix()
+        claude(self.root / 'p' / 's1.jsonl', [
+            use('a', 'Skill', {'skill': 'fork'}, cwd=cwd), use('b', 'Workflow', {'name': 'web-fetch'}, cwd=cwd),
+            use('c', 'Agent', {'subagent_type': 'fork'}, cwd=cwd)])
+        self.usage()
+        totals = json.loads(self.out.read_text())['totals']
+        self.assertEqual((totals['skillLoads'], totals['workflowRuns'], totals['agentLaunches']), (1, 1, 0))
+
     def test_codex_exec_and_function_calls(self):
         root = tmpdir(self)
         rec = lambda payload: {'type': 'response_item', 'timestamp': '2026-01-10T00:00:00Z', 'payload': payload}  # noqa: E731
