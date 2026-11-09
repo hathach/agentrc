@@ -1012,6 +1012,24 @@ class RelayTest(RelayCase):
         self.assertIn('not readable yet', self.refusal())
         self.assertEqual(self.typed, [])
 
+    def test_a_task_notification_read_mid_turn_does_not_block(self):
+        """Claude Code 2.1.319 records an absorbed task notification like a queued message, with a non-human origin."""
+        self.say('merge o/r#12')
+        self.record(type='queue-operation', operation='remove', reason='absorbed_mid_turn', commandUuid='n-1',
+                    content='<task-notification>done</task-notification>')
+        self.record(type='attachment', uuid='att-n', isSidechain=False, attachment={
+            'type': 'queued_command', 'prompt': '<task-notification>done</task-notification>', 'source_uuid': 'n-1',
+            'commandMode': 'task-notification', 'origin': {'kind': 'task-notification', 'producer': 'session-task'}})
+        self.relay()
+        self.assertEqual(captain.records()[0]['quote'], 'merge o/r#12')
+
+    def test_an_absorbed_command_with_no_attachment_yet_refuses(self):
+        self.say('merge o/r#12')
+        self.record(type='queue-operation', operation='remove', reason='absorbed_mid_turn', commandUuid='n-1',
+                    content='<task-notification>done</task-notification>')
+        self.assertIn('not readable yet', self.refusal())
+        self.assertEqual(self.typed, [])
+
     def test_a_queued_message_recorded_twice_differently_refuses(self):
         self.say('rebase')
         self.queue('merge 318', uid='q-x')

@@ -1107,6 +1107,16 @@ def queued_input(entry):
     return None
 
 
+def queued_other(entry):
+    """The id of a queued command the model read that is not the human's (a task notification, a Monitor event), or
+    None: its absorption hides no message of the human's."""
+    attachment = entry.get('attachment') if entry.get('type') == 'attachment' else None
+    if not (isinstance(attachment, dict) and attachment.get('type') == 'queued_command') or entry.get('isSidechain'):
+        return None
+    kind = (attachment.get('origin') or {}).get('kind')
+    return attachment.get('source_uuid') if kind and kind != 'human' else None
+
+
 TURN_ENDS = ('turn_duration', 'compact_boundary')
 
 
@@ -1119,7 +1129,7 @@ def turn_inputs(file):
         lines = f.read().split(b'\n')
     if lines[-1]:
         return [], 'the transcript ends in a partly written line that may hold a newer message; retry'
-    inputs, read, absorbed = [], {}, set()
+    inputs, read, absorbed, other = [], {}, set(), set()
     for line in lines[:-1]:
         try:
             entry = json.loads(line)
@@ -1129,7 +1139,7 @@ def turn_inputs(file):
             return [], 'a transcript line is not a record, so where a turn starts cannot be told'
         if (new_turn(entry) and not entry.get('isSidechain')
                 or entry.get('type') == 'system' and entry.get('subtype') in TURN_ENDS):
-            inputs, read, absorbed = [], {}, set()
+            inputs, read, absorbed, other = [], {}, set(), set()
         queued = queued_input(entry)
         if entry.get('type') == 'queue-operation' and entry.get('operation') == 'remove' \
                 and entry.get('reason') == 'absorbed_mid_turn':
@@ -1145,10 +1155,12 @@ def turn_inputs(file):
         elif human_input(entry):
             uid, words = entry.get('uuid'), plain_text(content(entry))
         else:
+            if uid := queued_other(entry):
+                other.add(uid)
             continue
         if not (words and HC_TAG.match(words.lstrip())):
             inputs.append((uid, words))
-    unread = absorbed - set(read)
+    unread = absorbed - set(read) - other
     if unread:
         ids = ', '.join(sorted(map(str, unread)))
         return [], f'a message the human typed meanwhile ({ids}) is not readable yet; retry'
