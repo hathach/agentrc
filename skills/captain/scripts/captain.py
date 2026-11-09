@@ -77,6 +77,9 @@ LEDGER, ENROLLED = 'ledger-hc.jsonl', 'enrolled-hc.json'   # ledger.jsonl and en
 # where the enrolled captain's last collect without ids, and its last `reports --new`, stopped reading
 COLLECTED, TABLED = 'collected-hc.json', 'tabled-hc.json'
 TABLING = 'tabled.lock'   # serializes `reports --new` without holding the ledger lock while it prints
+# serializes each observation with its record, so one taken earlier never lands after one taken later; taken before
+# the ledger lock, never while holding it, and gh and git run under it with the ledger free
+OBSERVING = 'observing.lock'
 CHIEF_RUNS = os.path.expanduser('~/.cache/chief-runs')   # where chief_run.py's --out directories live
 RUN_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,99}')
 PROGRESS_LINE = re.compile(r'(\d+) \d\d:\d\d:\d\d (.*)')
@@ -1420,13 +1423,11 @@ def observe(item):
     return found
 
 
-def record_observed(iid, revision, seen, base):
-    """Under the lock: append what observe() saw of iid, starting when the ledger held base records, unless the item
-    moved past revision or another observation of it was recorded since, which is as new or newer."""
-    recs = records()
-    item = decisions(recs).get(iid)
-    if not item or item['revision'] != revision or any(r['type'] == 'observed' and r['msg'] == iid
-                                                       for r in recs[base:]):
+def record_observed(iid, revision, seen):
+    """Under the ledger lock, and OBSERVING since the observation began: append what observe() saw of iid, unless
+    the item moved past revision meanwhile."""
+    item = decisions(records()).get(iid)
+    if not item or item['revision'] != revision:
         return None
     for o in seen:
         append({'type': 'observed', 'msg': iid, 'revision': revision, **o})
@@ -1439,16 +1440,17 @@ def refreshing(item):
 
 
 def refresh(mine):
-    """Observe every item refreshing() names, outside the lock, then record it for the revision it was taken of."""
-    with locked():
-        require_captain(mine)
-        recs = records()
-        wanted = [i for i in decisions(recs).values() if refreshing(i)]
-    seen = [(i['id'], i['revision'], observe(i), len(recs)) for i in wanted]
-    with locked():
-        require_captain(mine)
-        for observation in seen:
-            record_observed(*observation)
+    """Observe every item refreshing() names, outside the ledger lock, then record it for the revision it was taken
+    of; all under OBSERVING."""
+    with locked(name=OBSERVING):
+        with locked():
+            require_captain(mine)
+            wanted = [i for i in decisions(records()).values() if refreshing(i)]
+        seen = [(i['id'], i['revision'], observe(i)) for i in wanted]
+        with locked():
+            require_captain(mine)
+            for observation in seen:
+                record_observed(*observation)
     return len(seen)
 
 

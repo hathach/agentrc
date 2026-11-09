@@ -2319,13 +2319,21 @@ class FreshnessTest(DecisionCase):
         self.assertEqual(self.refresh(pr=None), 'unknown', 'a failed lookup after a match is no match')
         self.assertEqual({r['type'] for r in captain.records()} - {'watch', 'joined', 'report'}, {'observed'})
 
-    def test_an_observation_taken_before_a_newer_one_is_not_recorded(self):
+    def test_lookups_run_under_the_observation_lock_with_the_ledger_free(self):
         self.send(decision('merge', reviewed_sha=self.A))
-        base = len(captain.records())
-        self.refresh(pr=self.B)   # a later refresh lands first
-        with captain.locked():
-            captain.record_observed(self.item()['id'], 1, [{'source': 'pr', 'ok': True, 'value': self.A}], base)
-        self.assertEqual(captain.freshness(self.item()), 'stale')
+        held = []
+
+        def lookup(*args):
+            with captain.locked(0):   # the ledger is free
+                pass
+            with self.assertRaises(captain.Busy), captain.locked(0, name=captain.OBSERVING):
+                pass
+            held.append(args[0])
+            return json.dumps({'headRefOid': self.A})
+        with mock.patch.object(captain, 'lookup', side_effect=lookup):
+            captain.refresh(self.ident)
+        self.assertEqual(held, ['gh'])
+        self.assertEqual(self.refresh(pr=self.B), 'stale', 'the later observation is the one kept')
 
     def test_every_source_must_match(self):
         self.send(decision('merge', reviewed_sha=self.A, worktree='/w'))
@@ -2345,7 +2353,7 @@ class FreshnessTest(DecisionCase):
         self.assertEqual((self.item()['revision'], captain.freshness(self.item())), (2, 'unknown'))
         with captain.locked():
             self.assertIsNone(captain.record_observed(self.item()['id'], 1, [{'source': 'pr', 'ok': True,
-                                                                              'value': self.A}], 0))
+                                                                              'value': self.A}]))
         self.assertEqual(captain.freshness(self.item()), 'unknown')
 
 
