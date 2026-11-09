@@ -122,8 +122,8 @@ pins each target's session once, so one replaced in its terminal while the relay
   `reported <msg> · <state>`, with `· needs you` when the report names a need, `accepted`, `held`, an outcome,
   `cancelled`, `undelivered` or `refused by the session that replaced its target`, when another session took the
   target's terminal before the send; `pending: <msg>...` means the wait lapsed: re-arm, or `cancel` what will not
-  answer. A `held <msg> · <handle>` relay stays pending until `relay --retry <action>` sends it once that session is
-  idle, or `cancel` closes it on the human's word.
+  answer. A `held <msg> · <handle>` relay stays held until `relay --retry <action>` sends it once that session is
+  idle, or `cancel` closes it on the human's word; once delivered, it stays pending until its outcome or closure.
   While a watch is open, that Monitor runs `collect --wait <ms>` with no ids instead, re-armed at each lapse until a
   `watch ended <watch>` or `cancelled <watch>` line names the watch: each run resumes where the last one stopped,
   prints `watching <member>` as a session joins and `reported <member>:<N>` for each report, and follows every
