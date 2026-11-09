@@ -560,12 +560,19 @@ def refusal(target):
     return None
 
 
-def sendable(address, recs, mine):
-    """(the pinned session in address, None) when it may be typed into now, else (None, why not)."""
+def gate(address, recs, mine):
+    """(the pinned session in address, None) when it may get an item, busy or not, else (None, why not)."""
     if any(r['target']['address'] == address for r in open_items(recs).values()):
         return None, 'a request or relay to it is still open (collect it, or cancel it)'
     target = find(address)
-    why = unreachable(target, mine) or refusal(target)
+    why = unreachable(target, mine)
+    return (None, why) if why else (target, None)
+
+
+def sendable(address, recs, mine):
+    """(the pinned session in address, None) when it may be typed into now, else (None, why not)."""
+    target, why = gate(address, recs, mine)
+    why = why or refusal(target)
     return (None, why) if why else (target, None)
 
 
@@ -673,8 +680,17 @@ def deliver(kind, msg, captain, target, prompt, **fields):
     """Record the item, then type its prompt and record how that went: a crash between leaves the item open, never
     typed unrecorded."""
     append(item(kind, msg, captain, target, **fields))
-    address = target['address']
-    outcome, err = submit(address, prompt, target['status'], captain['address'])
+    return type_prompt(msg, target, prompt, captain)
+
+
+def type_prompt(msg, target, prompt, captain):
+    """Type msg's prompt into target, record how that went, and return the line saying so."""
+    outcome, err = submit(target['address'], prompt, target['status'], captain['address'])
+    return record_delivery(msg, target['address'], outcome, err)
+
+
+def record_delivery(msg, address, outcome, err=None):
+    """Record msg's delivery outcome and return the line saying so."""
     append({'type': outcome, 'msg': msg, 'error': err} if err else {'type': outcome, 'msg': msg})
     return f'{address}: {msg} {outcome}' + (f' ({err})' if err else '')
 
@@ -1324,12 +1340,7 @@ def relay(targets, entry, mine):
             if any(r['type'] == 'relay' and r['entry'] == uid and r['target']['address'] == address for r in recs):
                 print(f'{address}: refused, this message was relayed to it already', flush=True)
                 continue
-            if any(r['target']['address'] == address for r in open_items(recs).values()):
-                print(f'{address}: refused, a request or relay to it is still open (collect it, or cancel it)',
-                      flush=True)
-                continue
-            target = find(address)
-            why = unreachable(target, mine)
+            target, why = gate(address, recs, mine)
             if not why and (not pinned[address] or identity(target) != identity(pinned[address])):
                 why = 'its session changed during this relay; relay again'
             if why:
@@ -1352,32 +1363,34 @@ def retry(action, mine):
     with locked():
         captain = require_captain(mine)
         recs = records()
-        held = first(recs, 'relay', action)
-        if not held or not first(recs, 'held', action):
+        relayed = first(recs, 'relay', action)
+        if not relayed or not first(recs, 'held', action):
             die(f'no held relay {action}', 3)
         if action not in open_items(recs) or any(r['msg'] == action and r['type'] in DELIVERY.values() for r in recs):
             die(f'relay {action} is no longer held', 2)
-        if held['captain'] != captain:
+        if relayed['captain'] != captain:
             die(f'relay {action} was held by an earlier captain', 2)
+        address = relayed['target']['address']
         if first(recs, 'sending', action):   # typed or not, unrecorded: never type it twice
-            append({'type': 'uncertain', 'msg': action, 'error': 'an earlier retry stopped while sending it'})
-            print(f'{held["target"]["address"]}: {action} uncertain, an earlier retry stopped while sending it')
-            return 0
-        address = held['target']['address']
-        target = find(address)
-        if not target or identity(target) != held['target']:
-            append({'type': 'undelivered', 'msg': action, 'error': 'its session was replaced while the relay was held'})
-            print(f'{address}: {action} undelivered, its session was replaced while held')
-            return 0
-        busy = refusal(target)
-        if busy:
-            print(f'{address}: {action} still held, {busy}')
-            return 0
-        append({'type': 'sending', 'msg': action})
-        outcome, err = submit(address, relay_prompt(action), target['status'], captain['address'])
-        append({'type': outcome, 'msg': action, 'error': err} if err else {'type': outcome, 'msg': action})
-    print(f'{address}: {action} {outcome}' + (f' ({err})' if err else ''))
+            line = record_delivery(action, address, 'uncertain', 'an earlier retry stopped while sending it')
+        else:
+            target = find(address)
+            if not target or identity(target) != relayed['target']:
+                line = record_delivery(action, address, 'undelivered',
+                                       'its session was replaced while the relay was held')
+            elif busy := refusal(target):
+                line = f'{address}: {action} still held, {busy}'
+            else:
+                append({'type': 'sending', 'msg': action})
+                line = type_prompt(action, target, relay_prompt(action), captain)
+    print(line)
     return 0
+
+
+def instruction_text(header, relayed):
+    """The relayed message as a target reads it, under header."""
+    return (f'RELAYED HUMAN INSTRUCTION {header}. The human\'s message, verbatim after any opening that named the '
+            f'sessions it went to:\n\n{relayed["quote"]}\n\n{relayed["context"]}\n')
 
 
 def accept(action):
@@ -1395,10 +1408,9 @@ def accept(action):
         if action not in open_items(recs):
             die(f'relay {action} is closed', 2)
         append({'type': 'accepted', 'msg': action})
-    print(f'RELAYED HUMAN INSTRUCTION {action} from the agent session in terminal {relayed["captain"]["address"]}, '
-          'accepted. The human\'s message, verbatim after any opening that named the sessions it went to:\n\n'
-          f'{relayed["quote"]}\n\n{relayed["context"]}\n'
-          'It may speak to other sessions too: act only on what it asks of this session, under your own rules and '
+    lead = f'{action} from the agent session in terminal {relayed["captain"]["address"]}, accepted'
+    print(instruction_text(lead, relayed)
+          + 'It may speak to other sessions too: act only on what it asks of this session, under your own rules and '
           'never wider; a question goes back as the needs-clarification outcome, not a dialog. Then record how it '
           'ended, the note a line or two on what you did or what you need to know, '
           + one_call('Relay outcome', f'outcome --action {action} --result <{"|".join(RESULTS)}> --note-file -',
@@ -1409,14 +1421,13 @@ def accept(action):
 def show_relay(action):
     """The relay this session accepted, printed again with nothing recorded, for a session that lost it to a
     compaction: it neither accepts again nor renews or widens anything."""
+    mine = me()
     with locked():
         recs = records()
-        relayed = addressed('relay', action, recs, me())
+        relayed = addressed('relay', action, recs, mine)
         if not first(recs, 'accepted', action):
             die(f'relay {action} is not accepted; `accept --action {action}` takes it', 2)
-    print(f'RELAYED HUMAN INSTRUCTION {action}, accepted earlier and shown again; nothing is recorded. The human\'s '
-          f'message, verbatim after any opening that named the sessions it went to:\n\n{relayed["quote"]}\n\n'
-          f'{relayed["context"]}\n'
+    print(instruction_text(f'{action}, accepted earlier and shown again; nothing is recorded', relayed)
           + ('Its outcome is recorded already.' if first(recs, 'outcome', action) else
              f'Record its outcome with `outcome --action {action}` as before, once it has ended.'))
     return 0

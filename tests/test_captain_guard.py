@@ -123,7 +123,7 @@ class VerdictTest(unittest.TestCase):
     def test_the_skill_s_documented_commands_pass(self):
         """The captain runs what SKILL.md shows; a recipe the guard denies would strand it."""
         text = (Path(__file__).resolve().parents[1] / 'skills' / 'captain' / 'SKILL.md').read_text(encoding='utf-8')
-        sample = {'<terminal>...': 't2', '<msg>...': 'm-1', '<msg>': 'm-1', '<ms>': '1740000', 'MS': '1740000',
+        sample = {'<msg>...': 'm-1', '<msg>': 'm-1', '<ms>': '1740000', 'MS': '1740000',
                   '<id>': 'f0a4846d-6b04-428a-8e4d-a4fc931e6cff', '<action>': 'a-1',
                   '<target>...': 't2'}
         found = re.findall(r'(python3 ~/\.claude/skills/captain/scripts/captain\.py [^`#\n]*)', text)

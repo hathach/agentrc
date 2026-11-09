@@ -892,16 +892,12 @@ class RelayCase(LedgerCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         self.entries = 0
-        self.words = {}
 
     def say(self, content, **extra):
         self.entries += 1
         uid = f'u-{self.entries}'
-        self.words[uid] = captain.plain_text(content)
-        entry = {'type': 'user', 'uuid': uid, 'origin': {'kind': 'human'}, 'promptSource': 'typed',
-                 'message': {'role': 'user', 'content': content}, **extra}
-        with open(self.transcript, 'a', encoding='utf-8') as f:
-            f.write(json.dumps(entry) + '\n')
+        self.record(type='user', uuid=uid, origin={'kind': 'human'}, promptSource='typed',
+                    message={'role': 'user', 'content': content}, **extra)
         return uid
 
     def queue(self, content, uid=None, absorbed=True):
@@ -909,21 +905,19 @@ class RelayCase(LedgerCase):
         the queue's removal, then a queued_command attachment, never a `user` entry."""
         self.entries += 1
         uid = uid or f'q-{self.entries}'
-        self.words[uid] = captain.plain_text(content)
-        with open(self.transcript, 'a', encoding='utf-8') as f:
-            f.write(json.dumps({'type': 'queue-operation', 'operation': 'remove', 'reason': 'absorbed_mid_turn',
-                                'commandUuid': uid, 'content': content}) + '\n')
-            if absorbed:
-                f.write(json.dumps({'type': 'attachment', 'uuid': f'att-{self.entries}', 'attachment': {
-                    'type': 'queued_command', 'prompt': content, 'source_uuid': uid,
-                    'origin': {'kind': 'human'}, 'humanTurn': True}}) + '\n')
+        self.record(type='queue-operation', operation='remove', reason='absorbed_mid_turn', commandUuid=uid,
+                    content=content)
+        if absorbed:
+            self.record(type='attachment', uuid=f'att-{self.entries}', attachment={
+                'type': 'queued_command', 'prompt': content, 'source_uuid': uid, 'origin': {'kind': 'human'},
+                'humanTurn': True})
         return uid
 
     def record(self, **entry):
         with open(self.transcript, 'a', encoding='utf-8') as f:
             f.write(json.dumps(entry) + '\n')
 
-    def relay(self, entry=None, *addresses):
+    def relay(self, *addresses, entry=None):
         """Relay this turn's message, or entry among them, to addresses."""
         with mock.patch('builtins.print') as out:
             captain.relay(captain.resolve(list(addresses or ['t2'])), entry, self.ident)
@@ -964,7 +958,7 @@ class RelayTest(RelayCase):
         self.assertEqual((self.typed, captain.records()), ([], []))
 
     def test_relays_the_entry_from_the_ledger_not_the_prompt(self):
-        lines = self.relay(None, 't2') if self.say([{'type': 'text', 'text': 'merge o/r#12'}]) else []
+        lines = self.relay('t2') if self.say([{'type': 'text', 'text': 'merge o/r#12'}]) else []
         action = self.action_of(lines)
         self.assertTrue(lines[0].endswith('delivered'))
         rec = captain.records()[0]
@@ -979,7 +973,7 @@ class RelayTest(RelayCase):
         stale = self.say('merge o/r#12')
         self.say('wait, do not merge')
         with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
-            self.relay(stale)
+            self.relay(entry=stale)
         self.relay()
         self.assertEqual(captain.records()[0]['quote'], 'wait, do not merge')
 
@@ -1007,8 +1001,8 @@ class RelayTest(RelayCase):
         self.assertIn(f'{first}  rebase o/r#12', listed)
         self.assertIn(f'{second}  and merge o/r#12', listed)
         self.assertEqual(self.typed, [])
-        self.relay(second, 't2')
-        self.relay(first, 't3')
+        self.relay('t2', entry=second)
+        self.relay('t3', entry=first)
         self.assertEqual([(r['entry'], r['quote']) for r in captain.records() if r['type'] == 'relay'],
                          [(second, 'and merge o/r#12'), (first, 'rebase o/r#12')])
 
@@ -1023,16 +1017,16 @@ class RelayTest(RelayCase):
         self.queue('merge 318', uid='q-x')
         self.queue('merge 319', uid='q-x')
         with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
-            self.relay('q-x')
+            self.relay(entry='q-x')
         self.assertEqual(self.typed, [])
 
     def test_an_entry_from_outside_this_turn_refuses(self):
         old = self.say('merge o/r#12')
         self.say('rebase')
         with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
-            self.relay(old)
+            self.relay(entry=old)
         with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
-            self.relay('u-99')
+            self.relay(entry='u-99')
         self.assertEqual(self.typed, [])
 
     def test_a_message_that_is_not_text_refuses(self):
@@ -1072,7 +1066,7 @@ class RelayTest(RelayCase):
         action = self.action_of(self.relay())
         self.as_target(captain.outcome, action, 'rejected', 'not mine')
         self.assertIn('already', self.relay()[0])
-        self.assertTrue(self.relay(None, 't3')[0].endswith('delivered'))
+        self.assertTrue(self.relay('t3')[0].endswith('delivered'))
         self.assertEqual(len(self.typed), 2)
 
     def test_one_open_item_per_target(self):
@@ -1087,7 +1081,7 @@ class RelayTest(RelayCase):
         self.say('merge o/r#12')
         line = self.relay()[0]
         self.assertIn('held, it is working', line)
-        action = line.split()[1]
+        action = self.action_of([line])
         self.assertEqual(self.typed, [])
         self.assertIn(action, captain.open_items(captain.records()))
         self.say('something else entirely')   # a later turn: the retry never re-reads the transcript
@@ -1103,7 +1097,7 @@ class RelayTest(RelayCase):
     def test_a_held_relay_whose_session_was_replaced_is_not_sent(self):
         self.terminals['t2'] = {**pinned('t2'), 'status': 'working'}
         self.say('merge o/r#12')
-        action = self.relay()[0].split()[1]
+        action = self.action_of(self.relay())
         self.terminals['t2'] = {**pinned('t2'), 'started': 99, 'session': 's-new'}
         self.assertIn('undelivered', self.retry(action)[0])
         self.assertEqual(self.typed, [])
@@ -1112,7 +1106,7 @@ class RelayTest(RelayCase):
     def test_a_retry_interrupted_while_sending_is_never_typed_again(self):
         self.terminals['t2'] = {**pinned('t2'), 'status': 'working'}
         self.say('merge o/r#12')
-        action = self.relay()[0].split()[1]
+        action = self.action_of(self.relay())
         self.terminals['t2'] = {**pinned('t2'), 'status': 'idle'}
 
         def typed_then_crash(address, text, status, caller):
@@ -1129,7 +1123,7 @@ class RelayTest(RelayCase):
     def test_an_interrupted_retry_is_settled_only_by_its_captain(self):
         self.terminals['t2'] = {**pinned('t2'), 'status': 'working'}
         self.say('merge o/r#12')
-        action = self.relay()[0].split()[1]
+        action = self.action_of(self.relay())
         self.terminals['t2'] = {**pinned('t2'), 'status': 'idle'}
         with mock.patch.object(captain, 'submit', mock.Mock(side_effect=OSError('killed'))), \
                 self.assertRaises(OSError):
@@ -1152,6 +1146,7 @@ class RelayTest(RelayCase):
     def test_a_line_that_is_not_a_record_refuses(self):
         for line in ('null', '"text"', '[]'):
             with self.subTest(line):
+                self.transcript.write_text('')
                 self.say('merge o/r#12')
                 with open(self.transcript, 'a', encoding='utf-8') as f:
                     f.write(line + '\n')
@@ -1165,7 +1160,7 @@ class RelayTest(RelayCase):
             with self.subTest(action), self.assertRaises(SystemExit), mock.patch('sys.stderr'):
                 self.retry(action)
         self.terminals['t3'] = {**pinned('t3'), 'status': 'working'}
-        held = self.relay(None, 't3')[0].split()[1]
+        held = self.action_of(self.relay('t3'))
         captain.write_json(captain.ENROLLED, {**captain.enrolled(), 'generation': 'new'})
         with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
             self.retry(held)
@@ -1188,7 +1183,7 @@ class RelayTest(RelayCase):
 
     def test_an_unreachable_target_is_refused_not_held(self):
         self.say('merge o/r#12')
-        self.assertIn('refused', self.relay(None, 't99')[0])
+        self.assertIn('refused', self.relay('t99')[0])
         self.assertEqual(captain.records(), [])
 
     def test_concurrent_relays_of_one_message_send_once(self):
@@ -1223,7 +1218,7 @@ class RelayTest(RelayCase):
             self.say('stop')   # lands after the check: not seen by this send
             return found
         with mock.patch.object(captain, 'turn_inputs', read_then_human_writes):
-            lines = self.relay(None, 't2', 't3')
+            lines = self.relay('t2', 't3')
         self.assertEqual(len(reads), 1)
         self.assertTrue(all(line.endswith('delivered') for line in lines))
         self.assertEqual({r['quote'] for r in captain.records() if r['type'] == 'relay'}, {'merge o/r#12'})
@@ -1249,7 +1244,7 @@ class RelayTest(RelayCase):
         self.assertEqual(self.as_target(captain.accept, uncertain)[0], 0)   # it may have landed
         self.submit_result = ('undelivered', 't2 is done, not idle')
         self.say('merge')
-        blocked = self.action_of(self.relay(None, 't3'))
+        blocked = self.action_of(self.relay('t3'))
         self.assertNotIn(blocked, captain.open_items(captain.records()))
         with self.assertRaises(SystemExit):
             self.as_target(captain.accept, blocked, address='t3')
@@ -1298,7 +1293,7 @@ class AddressingTest(AddressedCase):
 
     def test_the_addressing_is_stripped_and_the_dry_run_is_what_is_sent(self):
         self.assertEqual(self.shown('tell code to merge 318', 't2'), 'merge 318')
-        self.assertTrue(self.relay(None, 't2')[0].endswith('delivered'))
+        self.assertTrue(self.relay('t2')[0].endswith('delivered'))
         self.assertEqual(captain.records()[0]['quote'], 'merge 318')
 
     def test_every_way_of_naming_the_targets(self):
@@ -1360,7 +1355,7 @@ class BroadcastTest(AddressedCase):
         self.assertEqual(self.shown('tell all to continue', 'all'), 'continue')
         self.assertEqual(self.preview('all').split('\n')[:2],
                          ['to all: sp · name · t2 (idle)', 'to all: sp · name · t3 (idle)'])
-        lines = self.relay(None, 'all')
+        lines = self.relay('all')
         self.assertTrue(all(line.endswith('delivered') for line in lines), lines)
         self.assertEqual(sorted(address for address, _ in self.typed), list(self.EVERY))
         self.assertEqual([r['quote'] for r in captain.records() if r['type'] == 'relay'], ['continue'] * 2)
@@ -1430,7 +1425,7 @@ class BroadcastTest(AddressedCase):
             self.terminals['t3'] = {**self.terminals['t3'], 'pid': 11, 'started': 21, 'session': 's-new'}
             return self._submit(address, text, status, caller)
         with mock.patch.object(captain, 'submit', replace_w3):
-            lines = self.relay(None, *self.EVERY)
+            lines = self.relay(*self.EVERY)
         self.assertTrue(lines[0].endswith('delivered'))
         self.assertIn('changed during this relay', lines[1])
         self.assertEqual([address for address, _ in self.typed], ['t2'])
@@ -1438,11 +1433,11 @@ class BroadcastTest(AddressedCase):
     def test_a_working_session_holds_its_relay_and_the_others_go(self):
         self.terminals['t3'] = {**self.terminals['t3'], 'status': 'working'}
         self.say('tell all to continue')
-        first, held = self.relay(None, *self.EVERY)
+        first, held = self.relay(*self.EVERY)
         self.assertTrue(first.endswith('delivered'))
         self.assertIn('held, it is working', held)
         self.terminals['t3'] = {**self.terminals['t3'], 'status': 'idle'}
-        self.assertTrue(self.retry(held.split()[1])[0].endswith('delivered'))
+        self.assertTrue(self.retry(self.action_of([held]))[0].endswith('delivered'))
         self.assertEqual([address for address, _ in self.typed], ['t2', 't3'])
         self.assertEqual([r['quote'] for r in captain.records() if r['type'] == 'relay'], ['continue'] * 2)
 
@@ -1469,14 +1464,14 @@ class InjectionTest(AddressedCase):
                 with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
                     self.relay()
                 with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
-                    self.relay(injected)
+                    self.relay(entry=injected)
         self.assertEqual((self.typed, captain.records()), ([], []))
 
     def test_an_injected_message_read_mid_turn_is_skipped(self):
         human = self.say('tell code to rebase')
         for words in self.INJECTED:
             self.queue(words)
-        self.assertTrue(self.relay(None, 't2')[0].endswith('delivered'))
+        self.assertTrue(self.relay('t2')[0].endswith('delivered'))
         self.assertEqual((captain.records()[0]['entry'], captain.records()[0]['quote']), (human, 'rebase'))
 
     def test_a_tag_inside_the_human_s_message_refuses(self):
@@ -1518,7 +1513,7 @@ class SpaceTargetTest(RelayCase):
     def test_a_space_target_shows_and_gets_its_terminal(self):
         self.say('merge o/r#12')
         self.assertIn('to space:other: sp · name · t3 (idle)', self.preview('space:other'))
-        self.assertTrue(self.relay(None, 'space:other')[0].startswith('t3: '))
+        self.assertTrue(self.relay('space:other')[0].startswith('t3: '))
         self.assertEqual([r['target']['address'] for r in captain.records() if r['type'] == 'relay'], ['t3'])
 
 
