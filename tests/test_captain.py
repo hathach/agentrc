@@ -2341,6 +2341,27 @@ class ChiefFeedTest(LedgerCase):
             captain.ingest('pr-12', self.ident)
         self.assertEqual(captain.records(), before)
 
+    def test_a_seq_given_twice_or_rewritten_as_another_line_refuses(self):
+        self.log('1 10:00:00 chief: attention · one', '1 10:00:00 chief: attention · two')
+        with self.assertRaises(SystemExit), mock.patch('builtins.print'):
+            captain.ingest('pr-12', self.ident)
+        (self.run / 'progress.log').write_text('1 10:00:00 chief: attention · one\n', encoding='utf-8')
+        self.ingest()
+        (self.run / 'progress.log').write_text('1 10:00:00 chief: done\n2 10:01:00 chief: attention · two\n',
+                                               encoding='utf-8')
+        before = captain.records()
+        with self.assertRaises(SystemExit), mock.patch('builtins.print'):
+            captain.ingest('pr-12', self.ident)
+        self.assertEqual(captain.records(), before)
+
+    def test_a_feed_file_linked_out_of_the_run_refuses(self):
+        outside = self.state / 'elsewhere.log'
+        outside.write_text('1 10:00:00 chief: attention · planted\n', encoding='utf-8')
+        (self.run / 'progress.log').symlink_to(outside)
+        with self.assertRaises(SystemExit), mock.patch('builtins.print'):
+            captain.ingest('pr-12', self.ident)
+        self.assertEqual(captain.records(), [])
+
     def test_a_new_report_is_a_revision_never_a_reopening(self):
         self.log('1 10:00:00 chief: attention · decide')
         (self.run / 'report.md').write_text('verdict: needs-user', encoding='utf-8')

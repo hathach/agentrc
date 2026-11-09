@@ -1283,13 +1283,21 @@ def run_dir(run_id):
     return run
 
 
+def run_file(run, name):
+    """The bytes of name in run, or None when it is missing; never through a symlink, which could leave CHIEF_RUNS."""
+    try:
+        fd = os.open(os.path.join(run, name), os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        die(f'{name} in {run} cannot be read safely: {e}', 2)
+    with os.fdopen(fd, 'rb') as f:
+        return f.read()
+
+
 def progress_lines(run):
     """(seq, text) of each complete progress.log line; a last line still being written waits for the next ingest."""
-    try:
-        with open(os.path.join(run, 'progress.log'), 'rb') as f:
-            data = f.read()
-    except FileNotFoundError:
-        return []
+    data = run_file(run, 'progress.log') or b''
     found = []
     for line in data.split(b'\n')[:-1]:
         m = PROGRESS_LINE.fullmatch(line.decode('utf-8', 'replace'))
@@ -1303,11 +1311,8 @@ def digest(data):
 
 
 def report_digest(run):
-    try:
-        with open(os.path.join(run, 'report.md'), 'rb') as f:
-            return digest(f.read())
-    except FileNotFoundError:
-        return None
+    data = run_file(run, 'report.md')
+    return None if data is None else digest(data)
 
 
 def ingest(run_id, mine):
@@ -1315,19 +1320,19 @@ def ingest(run_id, mine):
     is sent anywhere and no repository, grant or session changes. Each line once by (run, seq); a seq that comes back
     with other text refuses the whole ingest, recording nothing; a shorter progress.log removes nothing."""
     run = run_dir(run_id)
-    lines = [(seq, t) for seq, t in progress_lines(run) if t.startswith(ATTENTION)]
-    report = report_digest(run)
-    with locked():
+    with locked():   # the files are read under it too, so a slower ingest never records an older snapshot
         require_captain(mine)
+        report = report_digest(run)
         recs = records()
-        known = {r['seq']: r for r in recs
+        known = {r['seq']: r['text'] for r in recs
                  if r['type'] == 'evidence' and r['run'] == run and r['source'] == 'attention'}
+        lines = {}
+        for seq, line in progress_lines(run):   # every line, so one rewritten as another kind is caught too
+            if lines.setdefault(seq, line) != line or known.get(seq, line) != line:
+                die(f'{run_id}: progress.log line {seq} differs from what was read or ingested; nothing recorded', 2)
         new = []
-        for seq, line in lines:
-            earlier = known.get(seq)
-            if earlier and earlier['digest'] != digest(line.encode()):
-                die(f'{run_id}: progress.log line {seq} changed since it was ingested; nothing recorded', 2)
-            if not earlier:
+        for seq, line in lines.items():
+            if line.startswith(ATTENTION) and seq not in known:
                 new.append({'type': 'evidence', 'msg': item_id('c', run, str(seq)), 'run': run, 'source': 'attention',
                             'seq': seq, 'text': line, 'digest': digest(line.encode())})
         last = next((r['digest'] for r in reversed(recs) if r['type'] == 'evidence' and r['run'] == run
