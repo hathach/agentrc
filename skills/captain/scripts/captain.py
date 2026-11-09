@@ -81,8 +81,8 @@ CHIEF_RUNS = os.path.expanduser('~/.cache/chief-runs')   # where chief_run.py's 
 RUN_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,99}')
 PROGRESS_LINE = re.compile(r'(\d+) \d\d:\d\d:\d\d (.*)')
 ATTENTION = 'chief: attention'
-READER = str(Path(__file__).resolve().with_name('captain_read.py'))   # its hardened, read-only git and gh lookups
-LOOKUP_TIMEOUT_S = 30
+# its hardened, read-only git and gh lookups; it stops its own tool's process group after its TIMEOUT
+READER = str(Path(__file__).resolve().with_name('captain_read.py'))
 SOURCES = ('pr', 'worktree', 'report')
 INSTALLED = (os.environ.get('AGENTRC_CAPTAIN_SCRIPT')
              or os.path.expanduser('~/.claude/skills/captain/scripts/captain.py'))
@@ -1387,10 +1387,10 @@ def freshness(item):
 
 
 def lookup(*args):
-    """What captain_read.py prints for args, stripped, or None when it refuses or fails."""
+    """What captain_read.py prints for args, stripped, or None when it refuses or fails. No timeout here: killing
+    the reader would orphan the tool it runs, which its own timer stops."""
     try:
-        done = subprocess.run([sys.executable, READER, *args], capture_output=True, text=True,
-                              timeout=LOOKUP_TIMEOUT_S)
+        done = subprocess.run([sys.executable, READER, *args], capture_output=True, text=True)
     except (OSError, subprocess.SubprocessError):
         return None
     return done.stdout.strip() if done.returncode == 0 else None
@@ -1420,10 +1420,13 @@ def observe(item):
     return found
 
 
-def record_observed(iid, revision, seen):
-    """Under the lock: append what observe() saw of iid, unless the item moved past revision meanwhile."""
-    item = decisions(records()).get(iid)
-    if not item or item['revision'] != revision:
+def record_observed(iid, revision, seen, base):
+    """Under the lock: append what observe() saw of iid, starting when the ledger held base records, unless the item
+    moved past revision or another observation of it was recorded since, which is as new or newer."""
+    recs = records()
+    item = decisions(recs).get(iid)
+    if not item or item['revision'] != revision or any(r['type'] == 'observed' and r['msg'] == iid
+                                                       for r in recs[base:]):
         return None
     for o in seen:
         append({'type': 'observed', 'msg': iid, 'revision': revision, **o})
@@ -1439,12 +1442,13 @@ def refresh(mine):
     """Observe every item refreshing() names, outside the lock, then record it for the revision it was taken of."""
     with locked():
         require_captain(mine)
-        wanted = [i for i in decisions(records()).values() if refreshing(i)]
-    seen = [(i['id'], i['revision'], observe(i)) for i in wanted]
+        recs = records()
+        wanted = [i for i in decisions(recs).values() if refreshing(i)]
+    seen = [(i['id'], i['revision'], observe(i), len(recs)) for i in wanted]
     with locked():
         require_captain(mine)
-        for iid, revision, found in seen:
-            record_observed(iid, revision, found)
+        for observation in seen:
+            record_observed(*observation)
     return len(seen)
 
 
