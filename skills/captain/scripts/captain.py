@@ -87,6 +87,7 @@ ATTENTION = 'chief: attention'
 # its hardened, read-only git and gh lookups; it stops its own tool's process group after its TIMEOUT
 READER = str(Path(__file__).resolve().with_name('captain_read.py'))
 SOURCES = ('pr', 'worktree', 'report')
+VERDICTS = ('correction', 'no-correction', 'decision')
 INSTALLED = (os.environ.get('AGENTRC_CAPTAIN_SCRIPT')
              or os.path.expanduser('~/.claude/skills/captain/scripts/captain.py'))
 IDENTITY = ('address', 'created', 'kind', 'cwd', 'session', 'pid', 'started', 'account')
@@ -108,7 +109,7 @@ STATES = ('ready', 'in-progress', 'blocked', 'needs-human', 'done', 'idle')
 # withdraw and withdraw-requested have no writer since `withdraw` was removed: kept so an older ledger still reads
 RECORDS = ('request', 'report', 'cancel', 'delivered', 'undelivered', 'uncertain',
            'relay', 'held', 'sending', 'accepted', 'outcome', 'withdraw', 'withdraw-requested', 'refused',
-           'watch', 'watch-extend', 'joined', 'watch-end', 'evidence', 'observed')
+           'watch', 'watch-extend', 'joined', 'watch-end', 'evidence', 'observed', 'verdict')
 ITEMS = ('request', 'relay')
 WATCHED = ('watch', 'joined')
 FOLLOWED = ITEMS + WATCHED   # what collect can follow
@@ -312,6 +313,11 @@ def well_formed(rec):
         return validate(rec.get('report')) is None
     if rec['type'] == 'outcome':
         return rec.get('result') in RESULTS and isinstance(rec.get('note'), str)
+    if ('item' in rec or rec['type'] == 'verdict') and not well_bound(rec):
+        return False
+    if rec['type'] == 'verdict':
+        captain = rec.get('captain')
+        return text(rec.get('entry')) and text(rec.get('quote')) and pinned_identity(captain)
     if rec['type'] in ITEMS:
         captain = rec.get('captain')
         relayed = rec['type'] != 'relay' or all(text(rec.get(k)) for k in ('entry', 'quote', 'context'))
@@ -333,6 +339,12 @@ def well_formed(rec):
         return (text(rec.get('run')) and rec.get('source') in ('attention', 'report') and text(rec.get('digest'))
                 and (rec['source'] == 'report' or type(rec.get('seq')) is int and text(rec.get('text'))))
     return True
+
+
+def well_bound(rec):
+    """A verdict's binding to the decision it settles."""
+    return (text(rec.get('item')) and type(rec.get('revision')) is int and rec.get('verdict') in VERDICTS
+            and (rec.get('change_id') is None or text(rec.get('change_id'))))
 
 
 def well_scoped(scope):
@@ -1186,7 +1198,7 @@ def item_id(prefix, *parts):
 def new_item(iid, i, source, key, content, legacy=False):
     return {'id': iid, 'key': key, 'owner': source['target'], 'handle': source['handle'], 'content': content,
             'change_id': content.get('change_id') or content.get('pr'), 'revision': 1, 'state': 'open',
-            'closure': None, 'opened': i, 'updated': i, 'legacy': legacy, 'observations': {}}
+            'closure': None, 'opened': i, 'updated': i, 'legacy': legacy, 'observations': {}, 'verdicts': []}
 
 
 def revise(item, i, content=None, reopen=False):
@@ -1261,6 +1273,12 @@ def decisions(recs):
             apply_report(found, i, source, payload)
         elif r['type'] == 'evidence':
             apply_evidence(found, reports, i, r)
+        elif r['type'] in ('relay', 'verdict') and r.get('item') in found:
+            linked = found[r['item']]
+            linked['verdicts'].append({'msg': r['msg'], 'via': r['type'], 'verdict': r['verdict'],
+                                       'revision': r['revision'], 'at': i})
+            if linked['revision'] == r['revision']:
+                close(linked, i, 'decided')
         elif r['type'] == 'observed' and r['msg'] in found and found[r['msg']]['revision'] == r['revision']:
             found[r['msg']]['observations'][r['source']] = {'ok': r['ok'], 'value': r['value'], 'at': i}
         elif r['type'] == 'cancel' and r['msg'] in found:
@@ -1434,9 +1452,45 @@ def record_observed(iid, revision, seen):
     return decisions(records())[iid]
 
 
-def refreshing(item):
-    """Whether queue --refresh checks item: an open one with sources to check."""
-    return item['state'] == 'open' and bool(sources(item))
+def refreshing(item, recs):
+    """Whether queue --refresh checks item: an open one, or one whose relayed verdict is still undelivered or
+    unaccepted, with sources to check."""
+    waiting = open_items(recs)
+    return bool(sources(item)) and (item['state'] == 'open' or any(
+        v['via'] == 'relay' and v['msg'] in waiting and not first(recs, 'accepted', v['msg'])
+        for v in item['verdicts']))
+
+
+def obsolete(linked, revision):
+    """Why a verdict bound to revision of linked must not be made, sent or acted on now, or None: the decision
+    revised since, its evidence known stale, or a review whose evidence is not confirmed current."""
+    if linked is None:
+        return 'its decision is gone'
+    if linked['revision'] != revision:
+        return f'its decision was revised to {linked["revision"]} since revision {revision} was decided'
+    state = freshness(linked)
+    if state == 'stale':
+        return 'its evidence changed since it was reviewed'
+    if linked['content']['kind'] == 'review' and state != 'current':
+        return 'its review evidence could not be confirmed current'
+    return None
+
+
+def observed(iid):
+    """(revision, what observe() sees of iid now), record_observed's arguments after iid, or None for no such item.
+    The caller holds OBSERVING, not the ledger lock."""
+    linked = decisions(records(lenient=True)).get(iid)
+    return (linked['revision'], observe(linked)) if linked else None
+
+
+@contextmanager
+def observing(iid):
+    """OBSERVING held while it yields observed(iid); for no iid, no lock and None."""
+    if not iid:
+        yield None
+        return
+    with locked(name=OBSERVING):
+        yield observed(iid)
 
 
 def refresh(mine):
@@ -1445,7 +1499,8 @@ def refresh(mine):
     with locked(name=OBSERVING):
         with locked():
             require_captain(mine)
-            wanted = [i for i in decisions(records()).values() if refreshing(i)]
+            recs = records()
+            wanted = [i for i in decisions(recs).values() if refreshing(i, recs)]
         seen = [(i['id'], i['revision'], observe(i)) for i in wanted]
         with locked():
             require_captain(mine)
@@ -1740,15 +1795,20 @@ def relay_prompt(action):
             f'Run: python3 {INSTALLED} accept --action {action}')
 
 
-def relay(targets, entry, mine):
+def relay(targets, entry, mine, decided=None):
     """Relay the human's message this turn acts on (bound()) to each target, recorded before it is typed; targets as
     resolve() gave them. The transcript is read once for every target, so a message the human sends after that is not
     seen, and each session is pinned once, so one replaced in its terminal meanwhile is refused. A target busy or with
-    text in its input line gets the relay held, recorded for `retry` to send unchanged."""
+    text in its input line gets the relay held, recorded for `retry` to send unchanged. decided, (item, revision,
+    verdict), makes it the human's verdict on that decision: one target, the session that owns it, and the binding
+    written into the relay record itself."""
     addresses = list(targets)
-    with locked():
+    if decided and len(addresses) != 1:
+        die('a relay with --item goes to exactly one session, the one that owns the decision', 2)
+    with observing(decided and decided[0]) as seen, locked():
         captain = require_captain(mine)
         uid, words = bound(captain, entry)
+        binding, owner = bind(decided, seen, captain, uid) if decided else ({}, None)
         pinned = {address: find(address) for address in addresses}
         quote = relay_text(words, addresses)
         for address in addresses:
@@ -1762,7 +1822,11 @@ def relay(targets, entry, mine):
             if why:
                 print(f'{address}: refused, {why}', flush=True)
                 continue
-            action, fields = new_id('a', recs), {'entry': uid, 'quote': quote, 'context': context(target, recs)}
+            if owner and not owns(owner, target):
+                print(f'{address}: refused, the decision {binding["item"]} is not this session\'s', flush=True)
+                continue
+            action = new_id('a', recs)
+            fields = {'entry': uid, 'quote': quote, 'context': context(target, recs), **binding}
             busy = refusal(target)
             if busy:
                 append(item('relay', action, captain, target, **fields))
@@ -1774,9 +1838,70 @@ def relay(targets, entry, mine):
     return 0
 
 
+def owns(owner, target):
+    return (owner.get('account'), owner.get('session')) == (target['account'], target['session'])
+
+
+def bind(decided, seen, captain, uid):
+    """(the fields binding a verdict to its decision, the decision's owner), after recording what was just observed
+    of it; dies when the
+    decision is not open at that revision, its evidence is stale or unconfirmed, or this captain already gave a
+    verdict on it from the same message (repeating the same one prints its receipt and exits)."""
+    iid, revision, verdict = decided
+    if seen:
+        record_observed(iid, *seen)
+    linked = decisions(records()).get(iid)
+    if not linked:
+        die(f'no decision {iid}', 3)
+    me_ = (captain['account'], captain['session'])
+    for v in linked['verdicts']:
+        rec = first(records(), v['via'], v['msg'])
+        if (rec['captain']['account'], rec['captain']['session']) == me_ and rec['entry'] == uid:
+            if rec['verdict'] != verdict:
+                die(f'{iid} already has a {rec["verdict"]} verdict from this message', 2)
+            print(f'{iid}: {v["msg"]} recorded already')
+            raise SystemExit(0)
+    if linked['state'] != 'open':
+        die(f'decision {iid} is closed', 2)
+    why = obsolete(linked, revision)
+    if why:
+        die(f'decision {iid}: {why}; nothing recorded', 2)
+    sha = {'reviewed_sha': linked['content']['reviewed_sha']} if 'reviewed_sha' in linked['content'] else {}
+    binding = {'item': iid, 'revision': revision, 'verdict': verdict, 'change_id': linked['change_id'], **sha}
+    return binding, linked['owner']
+
+
+def verdict(decided, entry, mine):
+    """Record the human's verdict on a decision without sending anything: bound to the human's message this turn,
+    never to words a caller supplies."""
+    with observing(decided[0]) as seen, locked():
+        captain = require_captain(mine)
+        uid, words = bound(captain, entry)
+        binding, _ = bind(decided, seen, captain, uid)
+        msg = new_id('v', records())
+        append({'type': 'verdict', 'msg': msg, 'captain': captain, 'entry': uid, 'quote': words, **binding})
+    print(f'{binding["item"]}: {msg} recorded, {binding["verdict"]}')
+    return 0
+
+
+def metric(found):
+    """Distinct correction verdicts over the distinct changes with a correction or no-correction verdict; decision
+    verdicts and those on a decision with no change id are counted apart, in neither."""
+    rated = [(i['change_id'], v['verdict']) for i in found.values() for v in i['verdicts']]
+    attributed = [(c, v) for c, v in rated if c]
+    corrections = sum(v == 'correction' for _, v in attributed)
+    changes = {c for c, v in attributed if v != 'decision'}
+    return {'correction_verdicts': corrections, 'changes_with_verdicts': len(changes),
+            'ratio': corrections / len(changes) if changes else None,
+            'decision_verdicts': sum(v == 'decision' for _, v in attributed),
+            'unattributed_verdicts': len(rated) - len(attributed)}
+
+
 def retry(action, mine):
-    """Send a held relay as it was recorded: the same words to the same session, never re-read or re-pinned."""
-    with locked():
+    """Send a held relay as it was recorded: the same words to the same session, never re-read or re-pinned; one
+    bound to a decision first observes its evidence again and closes undelivered once that binding is obsolete."""
+    linked = first(records(lenient=True), 'relay', action)
+    with observing(linked and linked.get('item')) as seen, locked():
         captain = require_captain(mine)
         recs = records()
         relayed = first(recs, 'relay', action)
@@ -1791,9 +1916,16 @@ def retry(action, mine):
             line = record_delivery(action, address, 'uncertain', 'an earlier retry stopped while sending it')
         else:
             target = find(address)
+            stale = None
+            if 'item' in relayed:
+                if seen:
+                    record_observed(relayed['item'], *seen)
+                stale = obsolete(decisions(records()).get(relayed['item']), relayed['revision'])
             if not target or identity(target) != relayed['target']:
                 line = record_delivery(action, address, 'undelivered',
                                        'its session was replaced while the relay was held')
+            elif stale:
+                line = record_delivery(action, address, 'undelivered', stale)
             elif busy := refusal(target):
                 line = f'{address}: {action} still held, {busy}'
             else:
@@ -1816,8 +1948,10 @@ def outcome_call(action):
 
 def accept(action):
     """A target takes the relay sent to it, once, while the session that sent it is still the live captain; the
-    acceptance is durable before the message is printed, so a lost print never allows a second acceptance."""
-    with locked():
+    acceptance is durable before the message is printed, so a lost print never allows a second acceptance. One bound
+    to a decision is refused while that binding is obsolete, its evidence observed again first."""
+    linked = first(records(lenient=True), 'relay', action)
+    with observing(linked and linked.get('item')) as seen, locked():
         mine = me()
         recs = records()
         relayed = addressed('relay', action, recs, mine)
@@ -1828,6 +1962,13 @@ def accept(action):
             die(f'relay {action} was accepted already; `show --action {action}` prints it again', 2)
         if action not in open_items(recs):
             die(f'relay {action} is closed', 2)
+        if 'item' in relayed:
+            if seen:
+                record_observed(relayed['item'], *seen)
+            why = obsolete(decisions(records()).get(relayed['item']), relayed['revision'])
+            if why:
+                die(f'relay {action} decided {relayed["item"]}, but {why}: record it with `outcome --action '
+                    f'{action} --result needs-clarification` and act on nothing', 2)
         append({'type': 'accepted', 'msg': action})
     lead = f'{action} from the agent session in terminal {relayed["captain"]["address"]}, accepted'
     print(instruction_text(lead, relayed)
@@ -2102,6 +2243,24 @@ def show_rows(rows, as_json):
     sys.stdout.flush()   # a failed write raises here, before --new stores its cursor
 
 
+def decide(parser, required=False):
+    """The options binding a relay or verdict to the decision it settles."""
+    parser.add_argument('--item', required=required, metavar='ID', help='the decision, as `queue` shows it')
+    parser.add_argument('--revision', required=required, type=int, metavar='N', help='its revision `queue` showed')
+    parser.add_argument('--verdict', required=required, choices=VERDICTS,
+                        help='correction or no-correction of its recommendation, or a decision with no quality call')
+
+
+def decided(a):
+    """(item, revision, verdict) from a relay's options, None without --item; dies on a partial set."""
+    given = (a.item, a.revision, a.verdict)
+    if all(v is None for v in given):
+        return None
+    if any(v is None for v in given):
+        die('--item, --revision and --verdict go together', 2)
+    return given
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest='cmd', required=True)
@@ -2130,6 +2289,10 @@ def main():
     rl.add_argument('--entry', metavar='ID', help="which of this turn's messages, when the human wrote several")
     rl.add_argument('--dry-run', action='store_true', help='show what would go where, sending nothing')
     rl.add_argument('--retry', metavar='ACTION', help='send a held relay unchanged')
+    decide(rl)
+    vd = sub.add_parser('verdict', help="record the human's verdict on a decision, sending nothing")
+    vd.add_argument('--entry', metavar='ID', help="which of this turn's messages, when the human wrote several")
+    decide(vd, required=True)
     ac = sub.add_parser('accept', help='take a relay and print its message (run by the target)')
     ac.add_argument('--action', required=True)
     sh = sub.add_parser('show', help='print a relay this session accepted again, recording nothing (run by the target)')
@@ -2197,13 +2360,18 @@ def main():
         if a.cmd == 'watch':   # all stays all, sessions to come included: resolve() would list today's
             return arm(['all'] if a.targets == ['all'] else list(resolve(a.targets)), mine)
         if a.cmd == 'relay':
+            linked = decided(a)
             if a.retry:
-                if a.addresses or a.entry or a.dry_run:
+                if a.addresses or a.entry or a.dry_run or linked:
                     die('relay --retry takes only the held action', 2)
                 return retry(a.retry, mine)
             if not a.addresses:
                 die('relay names its targets', 2)
-            return (preview if a.dry_run else relay)(resolve(a.addresses), a.entry, mine)
+            if a.dry_run:
+                return preview(resolve(a.addresses), a.entry, mine)
+            return relay(resolve(a.addresses), a.entry, mine, linked)
+        if a.cmd == 'verdict':
+            return verdict(decided(a), a.entry, mine)
     except Corrupt as e:
         die(f'ledger corrupt, nothing decided until it is reconciled by hand: {e}', 4)
     except hc.Error as e:
