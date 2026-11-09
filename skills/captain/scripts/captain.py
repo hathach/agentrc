@@ -1188,11 +1188,8 @@ def close(item, i, why):
 
 def apply_report(found, i, source, payload):
     """Fold one report's decision operations into found. The owner is the reporting session's account and session,
-    never a payload field; its handle and pinned target follow the latest report."""
+    never a payload field."""
     owner = source['target']
-    for item in found.values():   # an authenticated report refreshes where its session runs, never relay targets
-        if (item['owner'].get('account'), item['owner'].get('session')) == (owner['account'], owner['session']):
-            item['owner'], item['handle'] = owner, source['handle']
     ids = {}
     for d in payload.get('decisions', []):
         iid = ids[d['key']] = item_id('d', owner['account'], owner['session'], d['key'])
@@ -1218,6 +1215,15 @@ def apply_report(found, i, source, payload):
             found[iid] = new_item(iid, i, source, None, {'kind': 'blocked', 'ask': payload['needs']}, legacy=True)
 
 
+def moved(found, source):
+    """Every report, a repeated event's too, says where its session runs now: its items follow it, relay targets
+    never."""
+    owner = source['target']
+    for item in found.values():
+        if (item['owner'].get('account'), item['owner'].get('session')) == (owner['account'], owner['session']):
+            item['owner'], item['handle'] = owner, source['handle']
+
+
 def decisions(recs):
     """Every decision item the ledger holds, by id in opening order: what sessions reported, as revised, resolved,
     reopened or cancelled since. An event_id a session sent before is not applied again, whichever request or
@@ -1227,6 +1233,7 @@ def decisions(recs):
     for i, r in enumerate(recs):
         if r['type'] == 'report' and r['msg'] in sources:
             source, payload = sources[r['msg']], r['report']
+            moved(found, source)
             event = payload.get('event_id')
             if event:
                 ident = (source['target']['account'], source['target']['session'], event)

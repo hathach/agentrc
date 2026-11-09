@@ -2223,6 +2223,13 @@ class DecisionTest(WatchCase):
         self.assertEqual({i['owner']['address'] for i in self.items()}, {'t3'})
         self.assertEqual([i['revision'] for i in self.items()], [2, 1, 1])
 
+    def test_a_resumed_session_answering_with_an_old_event_moves_its_items(self):
+        self.send(decision('merge'), event='e')
+        self.terminals['t3'] = {**pinned('t3'), 'session': 's-t2'}
+        msg = self.msg_of(self.ask('t3'))
+        self.send(decision('merge'), event='e', address='t3', member=msg)
+        self.assertEqual((self.item()['owner']['address'], self.item()['revision']), ('t3', 1))
+
     def test_a_changed_decision_is_a_revision_an_unchanged_one_is_not(self):
         self.send(decision('merge'))
         self.send(decision('merge'))
