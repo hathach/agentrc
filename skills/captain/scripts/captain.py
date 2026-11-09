@@ -106,10 +106,8 @@ UNCOVERED = 'Codex terminals and remote sessions are not covered'
 # what `start` runs for each account: main with CLAUDE_CONFIG_DIR unset in the program itself, since hc gives it the
 # core's environment; ada through its wrapper, whose argv[0] Herdr's my-agents mod draws the account icon from
 LAUNCHERS = {'main': ('env', 'claude'), 'ada': ('claude-ada',)}
-TERMINAL_NAME = re.compile(r'[a-z0-9_-]{1,32}')   # hc's rule for a terminal name
+TERMINAL_NAME = re.compile(r'[a-z0-9][a-z0-9._-]{0,31}')   # hc's rule for a name, which also refuses an address
 START_WAIT_S = 20
-# hc run refusals that start nothing; any other failure may have started a terminal
-NOT_STARTED = ('name_taken', 'invalid_params', 'spawn_failed', 'not_found', 'invalid_template')
 VERIFIED = ('verified', 'pending', 'failed', 'unchecked')
 INSTALLED = (os.environ.get('AGENTRC_CAPTAIN_SCRIPT')
              or os.path.expanduser('~/.claude/skills/captain/scripts/captain.py'))
@@ -2003,9 +2001,8 @@ def checkout_root(arg):
         die(f'{arg}: no such directory; nothing started', 2)
     if not os.path.isdir(root):
         die(f'{arg}: not a directory; nothing started', 2)
-    found = subprocess.run(['git', *captain_read.HARDEN, '-C', root, 'rev-parse', '--path-format=absolute',
-                            '--show-toplevel'], capture_output=True, stdin=subprocess.DEVNULL,
-                           env=captain_read.environment('git'), timeout=captain_read.TIMEOUT)
+    found = captain_read.plain(['git', *captain_read.HARDEN, '-C', root], captain_read.environment('git'),
+                               'rev-parse', '--path-format=absolute', '--show-toplevel')
     top = os.fsdecode(found.stdout).strip()
     if found.returncode or not top:
         die(f'{arg}: not a git checkout with a work tree; nothing started', 2)
@@ -2043,8 +2040,8 @@ def herdr_spaces():
 
 
 def placement(root, space, tab, spaces):
-    """(space id, tab id or None) for the session: the space named by exact id, else by its one exact name, else the
-    one local space whose folder is root; a tab must be one of that space's. No tab makes Herdr open a new one."""
+    """The id of the space for the session: the one named by exact id, else by its one exact name, else the one local
+    space whose folder is root; a tab must be one of that space's."""
     def named(sp):
         return f'{sp.get("name")!r} ({sp.get("id")})'
     if space:
@@ -2052,7 +2049,7 @@ def placement(root, space, tab, spaces):
         what = f'space {space}'
     else:
         hits = [sp for sp in spaces if not sp.get('machine') and isinstance(sp.get('folder'), str)
-                and os.path.realpath(sp['folder']) == root]
+                and canonical(sp['folder']) == root]
         what = f'a space whose folder is {root}'
     if len(hits) != 1:
         listed = '; '.join(map(named, hits)) or 'none'
@@ -2064,15 +2061,16 @@ def placement(root, space, tab, spaces):
         die(f'space {named(chosen)} has no id; nothing started', 2)
     if tab and tab not in [t.get('id') for t in chosen.get('tabs') or [] if isinstance(t, dict)]:
         die(f'tab {tab} is not in space {named(chosen)}; nothing started', 2)
-    return chosen['id'], tab
+    return chosen['id']
 
 
 def terminal_name(root, account, name):
     """The hc name for the session, <checkout>-<account> by default, never reshaped to fit; dies when it breaks hc's
     rule or a live terminal holds it."""
     name = name or f'{os.path.basename(root)}-{account}'
-    if not TERMINAL_NAME.fullmatch(name):
-        die(f'{name}: hc names are 1-32 of a-z 0-9 - _; give one with --name; nothing started', 2)
+    if not TERMINAL_NAME.fullmatch(name) or ADDRESS.fullmatch(name):
+        die(f'{name}: hc names are 1-32 of a-z 0-9 - _ . from a letter or digit, never an address such as t7; '
+            'give one with --name; nothing started', 2)
     holder = get(name)
     if holder and holder.get('state') == 'live':
         die(f'{name}: the live terminal {holder.get("address")} has that name; give another with --name; '
@@ -2114,7 +2112,7 @@ def start(arg, account, name, space, tab, entry, mine):
     hc runs, and one message starts a checkout under an account once. Captain never closes what it started."""
     root = checkout_root(arg)
     argv = launcher(account)
-    space_id, tab_id = placement(root, space, tab, herdr_spaces())
+    space_id = placement(root, space, tab, herdr_spaces())
     name = terminal_name(root, account, name)
     with locked():
         captain = require_captain(mine)
@@ -2128,24 +2126,25 @@ def start(arg, account, name, space, tab, entry, mine):
             die(f'{prior["msg"]}: this message already started {root} under {account}; nothing started again', 2)
         msg = new_id('s', recs)
         append({'type': 'start', 'msg': msg, 'captain': captain, 'entry': uid, 'quote': words, 'dir': root,
-                'account': account, 'name': name, 'space': space_id, 'tab': tab_id})
-    labels = ['--label', f'herdr.space={space_id}', *(['--label', f'herdr.tab={tab_id}'] if tab_id else [])]
-    rc, body, kind, why = hc.run('run', '--json', '--bg', '--keep', '--no-parent', '--name', name, '--cwd', root,
-                                 *labels, '--', *argv, timeout=HC_TIMEOUT_S)
-    address = body.get('address') if rc == 0 and isinstance(body, dict) else None
-    if not hc.is_local(address):
-        failed = rc != 0 and kind in NOT_STARTED
+                'account': account, 'name': name, 'space': space_id, 'tab': tab})
+    labels = ['--label', f'herdr.space={space_id}', *(['--label', f'herdr.tab={tab}'] if tab else [])]
+    outcome, body = hc.launch('--bg', '--keep', '--no-parent', '--name', name, '--cwd', root, *labels, '--', *argv,
+                              timeout=HC_TIMEOUT_S)
+    if outcome != hc.STARTED or not hc.is_local(body['address']):
+        failed = outcome == hc.NOT_STARTED_OUTCOME
+        why = body if isinstance(body, str) else f'a terminal elsewhere: {body["address"]}'
         with locked():
             append({'type': 'start-failed' if failed else 'start-uncertain', 'msg': msg, 'why': why})
-        die(f'{msg}: hc refused, nothing started: {kind}: {why}' if failed else
-            f'{msg}: hc gave no terminal address, so a session may have started: {why}; '
+        die(f'{msg}: hc refused, nothing started: {why}' if failed else
+            f'{msg}: hc gave no local terminal address, so a session may have started: {why}; '
             f'check `list` before starting again', 1 if failed else 3)
+    address = body['address']
     verification, why, session = verify(address, root, account)
     with locked():
         append({'type': 'started', 'msg': msg, 'address': address, 'created': body.get('created_ms'),
                 'verification': verification, 'why': why, 'session': session})
     print(f'{msg}: started {name} ({address}) in {root} under {account}, space {space_id}'
-          f'{f", tab {tab_id}" if tab_id else ", a new tab"}')
+          f'{f", tab {tab}" if tab else ", a new tab"}')
     print({'verified': f'verified: {session and session["session"]}, pid {session and session["pid"]}',
            'pending': f'verification pending ({why}): `list` shows it once it is up',
            'failed': f'VERIFICATION FAILED: {why}; the human closes {address}',

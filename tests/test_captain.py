@@ -3141,9 +3141,6 @@ class QueueTest(VerdictCase):
         self.assertIn(captain.UNCOVERED, lines[-1])
 
 
-if __name__ == '__main__':
-    unittest.main()
-
 
 class StartTest(RelayCase):
     """`start` against a real git checkout, with hc, herdr-app, PATH and pinning replaced."""
@@ -3173,8 +3170,8 @@ class StartTest(RelayCase):
             self.addCleanup(patcher.stop)
 
     def terminal(self, app='claude-code', state='live', cwd=None):
-        return {'address': 't9', 'state': state, 'created_ms': 99, 'labels': {},
-                'status': {'app': app, 'state': 'idle'}, 'foreground': {'cwd': cwd or self.root, 'pid': 77}}
+        return terminal('t9', app, state=state, created_ms=99,
+                        foreground={'argv': ['claude'], 'cwd': cwd or self.root, 'name': 'claude', 'pid': 77})
 
     def _hc(self, *args, timeout):
         self.hc_calls.append(args)
@@ -3263,6 +3260,7 @@ class StartTest(RelayCase):
                           ({'space': 'other'}, 'matches'), ({'space': 'nope'}, 'matches none'),
                           ({'space': 'remote'}, 'only local sessions'), ({'tab': 'tbX'}, 'not in space'),
                           ({'name': 'Proj'}, 'hc names are'), ({'name': 'x' * 33}, 'hc names are'),
+                          ({'name': '-p'}, 'hc names are'), ({'name': 't5'}, 'hc names are'),
                           ({'name': 'taken'}, 'the live terminal t5')]:
             with self.subTest(opts):
                 code, err = self.start_refusal(**opts)
@@ -3270,11 +3268,15 @@ class StartTest(RelayCase):
                 self.assertIn(why, err)
         self.assertEqual((self.launched(), self.types()), ([], []))
         self.assertEqual(self.start(name='done')[0], 0)   # a finished terminal holds no name
+        self.say('start proj as a dotted name')
+        self.assertEqual(self.start(name='proj.v2', entry=f'u-{self.entries}')[0], 0)
 
     def test_no_space_holds_the_checkout_or_a_program_is_missing(self):
         self.say('start proj')
-        self.spaces[0]['folder'] = '/elsewhere'
-        self.assertIn('a space whose folder is', self.start_refusal()[1])
+        for folder in ('/elsewhere', '.', '', None, 123, os.path.relpath(self.root)):   # relative to our cwd: never it
+            with self.subTest(folder=folder):
+                self.spaces[0]['folder'] = folder
+                self.assertIn('a space whose folder is', self.start_refusal()[1])
         self.spaces[0]['folder'] = self.root
         with mock.patch.object(captain.shutil, 'which', lambda p: None if p == 'claude-ada' else f'/bin/{p}'):
             self.assertIn('claude-ada is not on PATH', self.start_refusal(account='ada')[1])
@@ -3370,3 +3372,12 @@ class StartTest(RelayCase):
         with mock.patch.object(captain, 'append', side_effect=OSError('disk full')), self.assertRaises(OSError):
             captain.start(self.root, 'main', None, None, None, None, self.ident)
         self.assertEqual((self.launched(), self.types()), ([], []))
+
+    def test_every_account_list_names_the_same_accounts(self):
+        import captain_guard
+        self.assertEqual(set(captain.LAUNCHERS), set(captain.CONFIG_DIRS))
+        self.assertEqual(set(captain_guard.ACCOUNTS), set(captain.CONFIG_DIRS))
+
+
+if __name__ == '__main__':
+    unittest.main()

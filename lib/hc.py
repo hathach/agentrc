@@ -20,6 +20,9 @@ NOT_FOUND = 3   # hc's exit code for an unknown terminal
 # and a success that does not say the program started working, may have typed: uncertain.
 NOT_TYPED = ('blocked', 'status_mismatch', 'not_found', 'finished', 'spawn_failed')
 SENT, NOT_TYPED_OUTCOME, UNCERTAIN = 'sent', 'not-typed', 'uncertain'
+# hc run refusals that start nothing; any other failure, a timeout included, may have started a terminal
+NOT_STARTED = ('name_taken', 'invalid_params', 'spawn_failed', 'not_found', 'invalid_template')
+STARTED, NOT_STARTED_OUTCOME = 'started', 'not-started'
 
 
 class Error(Exception):
@@ -120,6 +123,17 @@ def send(address, text, *, timeout, only_if=None, caller=None):
             return SENT, body
         return UNCERTAIN, f'hc send answered {body!r}, not started: true'
     return (NOT_TYPED_OUTCOME if kind in NOT_TYPED else UNCERTAIN), f'{kind or "unknown"}: {msg}'
+
+
+def launch(*args, timeout):
+    """`hc run --json args`: (STARTED, its record) when hc answers exit 0 with a JSON object naming the terminal's
+    address, (NOT_STARTED_OUTCOME, detail) for a refusal that starts nothing, (UNCERTAIN, detail) otherwise."""
+    rc, body, kind, msg = run('run', '--json', *args, timeout=timeout)
+    if rc == 0 and isinstance(body, dict) and isinstance(body.get('address'), str) and body['address']:
+        return STARTED, body
+    if rc != 0 and kind in NOT_STARTED:
+        return NOT_STARTED_OUTCOME, f'{kind}: {msg}'
+    return UNCERTAIN, f'{kind or "unknown"}: {msg}' if rc != 0 else f'hc run answered {body!r}, no address'
 
 
 def is_local(address):

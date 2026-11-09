@@ -1,6 +1,6 @@
 ---
 name: captain
-description: Collect status from the human's other Claude Code sessions in hc terminals relay the human's own words to one of them, and start one on a checkout when the human asks. Used by the `captain` agent; a target session uses `brief` and `report` to answer a status request, and `accept` and `outcome` for a relay.
+description: Collect status from the human's other Claude Code sessions in hc terminals, relay the human's own words to one of them, and start one on a checkout when the human asks. Used by the `captain` agent; a target session uses `brief` and `report` to answer a status request, and `accept` and `outcome` for a relay.
 ---
 
 # Captain
