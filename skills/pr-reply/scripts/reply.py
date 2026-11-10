@@ -35,8 +35,12 @@ stdout ends with one JSON line {"receipts": [{"commentId", "kind", "replyId",
 being pr-babysit's check on a relayed copy (fnv1a over the canonical JSON, nulls left out): kind is
 "review", "issue" or "review-body", "none" when all three were searched and the
 id is on none of them (the caller owes it nothing), null when a lookup failed
-before that was known; sent says a POST was issued (a lost response leaves sent true and replyId null: the
-reply may exist), posted that GitHub answered it, verified is true on a
+before that was known; sent says a POST was issued, posted that GitHub answered it; a POST answered
+with an error or not at all is followed by a fresh read of our replies to the
+comment, and our reply with the identical body found there is taken as its
+own (sent true, posted false, replyId set) and verified and resolved as any
+other, never posted again; none found, or a rate limit, leaves replyId null and
+the error (the reply may still exist), verified is true on a
 matching read-back, false on a mismatch and null when the read-back could not
 be fetched. `reply.py --digest TEXT` prints TEXT's digest for a manifest
 written by hand. Exit 0 when every reply is verified and, for a review
@@ -240,6 +244,16 @@ class Poster:
         elif not blocking and kind != 'review':
             blocking = [c for c in ours if is_fix_note(c['body']) == is_fix_note(body)]
         return (blocking[0]['id'], blocking[0]['body']) if blocking else None
+
+    def landed(self, kind, target, body):
+        """The id of our reply to target with exactly body, from fresh listings, None when there is none: what a POST
+        answered with an error, or not at all, may have left (#431)."""
+        if kind == 'review':
+            self._review = None
+        else:
+            self._issue = None
+        found = [c['id'] for c in self.ours(kind, target) if reads_as_sent(c['body'], body)]
+        return max(found) if found else None
 
     def post(self, kind, target, body):
         if kind == 'review':
@@ -467,8 +481,19 @@ def handle(poster, item):
             reply_id = found[0]
         else:
             rc['sent'] = True
-            reply_id = poster.post(kind, original, body)
-            rc['posted'] = True
+            try:
+                reply_id = poster.post(kind, original, body)
+                rc['posted'] = True
+            except ApiError as e:
+                # Never posted again: only a reply the POST left, found by a fresh look, settles it.
+                if RATE_LIMITED.search(str(e)):
+                    raise
+                try:
+                    reply_id = poster.landed(kind, original, body)
+                except ApiError as again:
+                    raise ApiError(f'{e}; looking for the reply after it failed: {again}')
+                if reply_id is None:
+                    raise
         rc['replyId'] = reply_id
         rc['verified'], rc['error'] = poster.verify(kind, original, reply_id, body)
         if rc['verified'] and kind == 'review':
