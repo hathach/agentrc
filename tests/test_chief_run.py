@@ -108,7 +108,11 @@ class ChiefRun(unittest.TestCase):
         self.env = {**{k: v for k, v in os.environ.items() if k != 'CLAUDE_CONFIG_DIR'},
                     'PATH': f'{self.bin}{os.pathsep}{os.environ["PATH"]}', 'FAKE_DIR': str(self.fake),
                     'CLAUDECODE': '1', 'HERDR_PANE_ID': 'p1', 'HERDR_ENV': '1', 'HOME': str(self.root),
-                    'USERPROFILE': str(self.root)}   # Path.home() on Windows
+                    'USERPROFILE': str(self.root),   # Path.home() on Windows
+                    'AGENTRC_CHIEF_RUNS': str(self.root / 'runs.jsonl')}   # never the developer's run ledger
+        ledger = mock.patch.dict(os.environ, {'AGENTRC_CHIEF_RUNS': self.env['AGENTRC_CHIEF_RUNS']})
+        ledger.start()
+        self.addCleanup(ledger.stop)
         self.assertEqual(Path(shutil.which('claude', path=self.env['PATH'])).parent, self.bin, 'the fake comes before any real claude')
 
     def stream(self, *events):
@@ -502,7 +506,7 @@ class ChiefRun(unittest.TestCase):
         blocker.write_text('')
         with mock.patch.object(chief_run.run_cost, 'report', lambda session, full_path: (full_path.write_text('| t |'), 'B', '1.00')), \
                 mock.patch.object(chief_run.run_cost, 'session_dir', lambda session_id: self.root):
-            self.assertRegex(chief_run.cost(blocker, 's-1', blocker / 'report.md'), r'^cost none \((NotADirectoryError|FileNotFoundError): ')
+            self.assertRegex(chief_run.cost(blocker, 's-1', blocker / 'report.md')[0], r'^cost none \((NotADirectoryError|FileNotFoundError): ')
 
     def test_the_session_cost_is_read_from_claude_config_dir_alone(self):
         cfg = self.root / 'cfg'
@@ -816,8 +820,129 @@ class ChiefRun(unittest.TestCase):
         self.assertEqual(r.returncode, 2, r.stderr)
         self.assertRegex(self.texts()[-1], r'^launcher: exit 2 \(a chief already runs in .*run\.lock\) · report none$')
         self.assertFalse((self.fake / 'argv.json').exists(), 'no second claude started')
+        refused = [x for x in self.ledger() if x.get('out') == str(self.out.resolve())]
+        self.assertEqual(len(refused), 1)
+        self.assertEqual([(x['type'], x.get('exit')) for x in self.ledger() if x['run'] == refused[0]['run']], [('start', None), ('end', 2)])
         (self.fake / 'go').touch()
         self.assertEqual(proc.wait(timeout=10), 0, 'the first run went on')
+
+    def ledger(self):
+        path = Path(self.env['AGENTRC_CHIEF_RUNS'])
+        return [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines()] if path.exists() else []
+
+    def module(self):
+        spec = importlib.util.spec_from_file_location('chief_run', SCRIPT)
+        chief_run = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(chief_run)
+        return chief_run
+
+    def test_a_run_is_accounted_in_run_json_and_the_ledger_under_its_task(self):
+        """#490: a start and an end under one run id, the caller's task key, and the exit line's cost as data."""
+        self.transcript(self.root / '.claude')
+        self.stream(init(), result())
+        self.assertEqual(self.run_it('--task', 'hathach/agentrc#490:accounting').returncode, 0)
+        start, end = self.ledger()
+        self.assertRegex(start['run'], r'^[0-9a-f]{32}$')
+        self.assertEqual(start | {'at': None}, {'v': 1, 'type': 'start', 'run': start['run'], 'task': 'hathach/agentrc#490:accounting',
+                                                'out': str(self.out.resolve()), 'worktree': str(self.worktree.resolve()), 'at': None})
+        self.assertEqual({k: end[k] for k in ('type', 'run', 'exit', 'reason', 'session', 'cost')},
+                         {'type': 'end', 'run': start['run'], 'exit': 0, 'reason': 'result ok', 'session': 's-1',
+                          'cost': {'status': 'known', 'usd': '0.20', 'reason': None}})
+        self.assertGreaterEqual(end['wall'], 0)
+        rec = json.loads((self.out / 'run.json').read_text(encoding='utf-8'))
+        self.assertEqual((rec['run'], rec['task'], rec['exit'], rec['cost'], rec['startedAt'], rec['endedAt']),
+                         (start['run'], start['task'], 0, end['cost'], start['at'], end['at']))
+
+    def test_a_keyless_run_is_recorded_with_its_cost_unknown_and_why(self):
+        self.stream(init(), result())
+        self.assertEqual(self.run_it().returncode, 0)
+        start, end = self.ledger()
+        self.assertIsNone(start['task'])
+        self.assertEqual(end['cost']['status'], 'unknown')
+        self.assertTrue(end['cost']['reason'].startswith('run_cost: 0 transcripts named s-1.jsonl'), end['cost'])
+
+    def test_a_task_key_that_is_not_one_is_refused_before_anything_starts(self):
+        for bad in ('', '-x', 'a b', 'x' * 161, 'a\nb'):
+            with self.subTest(bad):
+                r = self.run_it(f'--task={bad}')
+                self.assertEqual(r.returncode, 2, r.stderr)
+                self.assertIn('is not a task key', r.stderr)
+                self.assertFalse(self.out.exists())
+        self.assertEqual(self.ledger(), [])
+
+    def test_a_relaunch_into_a_reused_out_path_is_a_new_run(self):
+        self.stream(init(), result())
+        for _ in range(2):
+            self.assertEqual(self.run_it('--task', 'k').returncode, 0)
+            shutil.rmtree(self.out)
+        runs = [r['run'] for r in self.ledger()]
+        self.assertEqual(len(runs), 4)
+        self.assertEqual((runs[0] == runs[1], runs[2] == runs[3], runs[0] == runs[2]), (True, True, False))
+
+    def test_every_way_a_run_ends_writes_one_end(self):
+        empty = self.root / 'empty'
+        empty.mkdir()
+        self.assertEqual(self.run_it(PATH=str(empty)).returncode, 127)
+        self.assertEqual([(r['type'], r.get('exit'), r.get('cost')) for r in self.ledger()],
+                         [('start', None, None), ('end', 127, {'status': 'unknown', 'usd': None, 'reason': 'claude did not start'})])
+        shutil.rmtree(self.out)
+        failing = (f'import sys; sys.path.insert(0, {str(SCRIPT.parent)!r}); import chief_run\n'
+                   'def launch(a, task):\n    raise RuntimeError("boom")\n'
+                   'chief_run.launch = launch\nsys.exit(chief_run.main(sys.argv[1:]))')
+        r = subprocess.run([sys.executable, '-c', failing, *self.argv()[2:]], env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual([(x['type'], x.get('exit'), x.get('reason')) for x in self.ledger()[2:]],
+                         [('start', None, None), ('end', 1, 'launcher failed: RuntimeError: boom')], 'a foreground launcher that fails')
+        shutil.rmtree(self.out)
+        r = self.detach(subprocess.run([sys.executable, '-c', failing, *self.argv(detached=True)[2:]], env=self.env, capture_output=True, text=True, timeout=30))
+        self.wait_until('the detached end', lambda: len(self.ledger()) == 6)
+        self.assertEqual((self.ledger()[5]['exit'], self.ledger()[5]['reason']), (1, 'launcher failed: RuntimeError: boom'))
+
+    @unittest.skipIf(os.name == 'nt', 'SIGTERM and SIGKILL')
+    def test_a_handled_sigterm_ends_the_run_and_a_sigkill_leaves_it_unfinished(self):
+        self.stream(init(), text('m1', 'chief: stage · live'), '#gate never\n', result())
+        proc = self.start()
+        self.wait_until('the status line', lambda: self.logged('chief: stage · live'))
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(timeout=10)
+        self.assertEqual([(r['type'], r.get('exit')) for r in self.ledger()], [('start', None), ('end', 128 + int(signal.SIGTERM))])
+        shutil.rmtree(self.out)
+        proc = self.start()
+        self.wait_until('the status line', lambda: self.logged('chief: stage · live'))
+        os.kill(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=10)
+        os.kill(int((self.fake / 'pid').read_text()), signal.SIGKILL)
+        self.assertEqual([r['type'] for r in self.ledger()[2:]], ['start'], 'no end is made up')
+        self.assertNotIn('endedAt', json.loads((self.out / 'run.json').read_text(encoding='utf-8')))
+
+    def test_a_ledger_it_cannot_write_is_a_warning_and_the_run_is_unchanged(self):
+        self.stream(init(), result())
+        r = self.run_it(AGENTRC_CHIEF_RUNS=str(self.task / 'runs.jsonl'))   # under a file: never writable
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('chief_run: warning: run ledger start not written', r.stderr, 'no progress log yet at the start')
+        self.assertTrue(any(t.startswith('launcher: warning: run ledger end not written') for t in self.texts()), self.texts())
+        self.assertTrue(self.texts()[-1].startswith('launcher: exit 0 (result ok)'), self.texts())
+        self.assertEqual(json.loads((self.out / 'run.json').read_text(encoding='utf-8'))['exit'], 0, 'run.json is written on its own')
+
+    def test_run_json_it_cannot_write_leaves_the_ledger_written_and_one_end(self):
+        chief_run = self.module()
+        a = mock.Mock(out=self.root / 'missing', worktree=self.worktree, task='k')
+        with mock.patch('sys.stderr', new_callable=io.StringIO) as err:
+            acct = chief_run.Accounting(a)
+            acct.finish(0, 'result ok', 's-1', chief_run.spent('1.25 (partial)'))
+            acct.finish(1, 'again')
+        self.assertIn('run.json not written', err.getvalue())
+        self.assertEqual([(r['type'], r.get('exit'), r.get('cost')) for r in self.ledger()],
+                         [('start', None, None), ('end', 0, {'status': 'partial', 'usd': '1.25', 'reason': 'some agents have no price'})])
+
+    def test_the_cost_total_reads_as_known_partial_or_unknown(self):
+        spent = self.module().spent
+        self.assertEqual(spent('0.00'), {'status': 'known', 'usd': '0.00', 'reason': None}, 'an explicit zero is known')
+        self.assertEqual(spent('12.34 (partial)')['status'], 'partial')
+        self.assertEqual(spent('-'), {'status': 'unknown', 'usd': None, 'reason': 'no cost record; see cost.md'})
+        for odd in ('1.2', 'NaN', '-1.00', '1e3', ''):
+            with self.subTest(odd):
+                self.assertEqual(spent(odd)['status'], 'unknown')
 
     def installed(self, kind, name, content, root=None, scope=None):
         """An agentrc entry linked into the user scope as install.py links it."""

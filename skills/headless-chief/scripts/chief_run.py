@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run a headless chief and keep a numbered log of its `chief:` status lines.
 
-    chief_run.py --out DIR --worktree PATH --task-file FILE [--permission-mode MODE] [--foreground]
+    chief_run.py --out DIR --worktree PATH --task-file FILE [--task KEY] [--permission-mode MODE] [--foreground]
 
 DIR must not exist. It receives stream.jsonl (every stdout line, raw), progress.log
 (`<seq> <HH:MM:SS> <line>`: the launcher's own lines, chief's status lines and notes),
@@ -10,6 +10,12 @@ chief's own tasks), session (the session id), stderr.log and, when
 the session's cost can be tabled, cost.md (run_cost.py's full output; its brief form,
 the Launches and Usage tables, goes into report.md before chief's first `## ` section).
 The exit line ends with that total, or `cost none (<why>)`.
+
+Each launcher execution is accounted for (#490): run.json in DIR and a start and an end record in run_ledger.py's
+ledger, which outlives DIR. They carry a fresh run id, KEY (the caller's task, the same on every relaunch; null when
+not given), the worktree, the start and, at the end, the exit code, reason, session, wall seconds and the cost:
+known, partial or unknown, with its dollars and reason. Both are best-effort and written apart: a failure is a
+warning, never a stopped or re-coded run.
 
 While the credit guard holds one of the run's hooks waiting for a plan limit to reset, progress.log says so.
 
@@ -34,10 +40,14 @@ import tempfile
 import threading
 import time
 import traceback
+import uuid
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import run_cost  # noqa: E402
+import run_ledger  # noqa: E402
 from shadows import on_path, refusal  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
 import lead_session  # noqa: E402
@@ -49,6 +59,7 @@ credit_guard = importlib.util.module_from_spec(spec)   # its waiting hooks' reco
 spec.loader.exec_module(credit_guard)
 
 MARKER = 'chief: '
+TASK_KEY = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:/#-]{0,159}')
 RELAUNCH = [sys.executable, *sys.orig_argv[1:], '--_detached']   # this command again, as the launcher
 HELD = []   # the run.lock this launcher holds until it exits
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0   # a detached launcher's console children
@@ -75,6 +86,56 @@ class Progress:
             self.seq += 1
             self.f.write(f'{self.seq} {time.strftime("%H:%M:%S")} {text}\n')
             self.f.flush()
+
+
+def now():
+    return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def unknown(why):
+    return {'status': 'unknown', 'usd': None, 'reason': why}
+
+
+class Accounting:
+    """One launcher execution's run.json and ledger records, each written best-effort and on its own; finished once."""
+
+    def __init__(self, a):
+        self.out, self.progress, self.done, self.t0 = a.out, None, False, time.monotonic()
+        self.rec = {'v': 1, 'run': uuid.uuid4().hex, 'task': a.task, 'out': str(a.out.resolve()),
+                    'worktree': str(a.worktree.resolve()), 'startedAt': now()}
+        self.write('start', {k: self.rec[k] for k in ('run', 'task', 'out', 'worktree')} | {'at': self.rec['startedAt']})
+
+    def warn(self, text):
+        try:
+            if self.progress is None:
+                raise OSError('no progress log yet')
+            self.progress.line(f'launcher: warning: {text}')
+        except Exception:   # noqa: BLE001 - a warning must not stop the run either
+            try:
+                print(f'chief_run: warning: {text}', file=sys.stderr, flush=True)
+            except Exception:   # noqa: BLE001
+                pass
+
+    def write(self, kind, fields):
+        try:
+            tmp = self.out / f'.run.json.{os.getpid()}'
+            tmp.write_text(json.dumps(self.rec, indent=2) + '\n', encoding='utf-8', newline='\n')
+            os.replace(tmp, self.out / 'run.json')
+        except Exception as e:   # noqa: BLE001 - accounting must never stop or re-code the run
+            self.warn(f'run.json not written: {type(e).__name__}: {e}')
+        try:
+            run_ledger.append({'v': 1, 'type': kind, **fields})
+        except Exception as e:   # noqa: BLE001
+            self.warn(f'run ledger {kind} not written ({run_ledger.path()}): {type(e).__name__}: {e}')
+
+    def finish(self, code, reason, session=None, spent=None):
+        if self.done:
+            return
+        self.done = True
+        end = {'at': now(), 'exit': code, 'reason': reason, 'session': session or None,
+               'wall': round(time.monotonic() - self.t0, 1), 'cost': spent or unknown('no cost was read')}
+        self.rec.update(endedAt=end['at'], **{k: end[k] for k in ('exit', 'reason', 'session', 'wall', 'cost')})
+        self.write('end', {'run': self.rec['run']} | end)
 
 
 def watch_guard(progress, tag, stop, every=GUARD_WATCH):
@@ -293,19 +354,32 @@ def with_brief(text, brief):
     return '\n'.join(lines[:at]).rstrip('\n') + f'\n\n{brief}\n' + ('\n' + '\n'.join(lines[at:]) + '\n' if at < len(lines) else '')
 
 
+def spent(total):
+    """run_cost.report()'s total cell as accounting: `1.31` known, `1.31 (partial)` partial, anything else unknown."""
+    amount, partial = (total[:-len(' (partial)')], True) if total.endswith(' (partial)') else (total, False)
+    try:
+        usd = Decimal(amount) if re.fullmatch(r'\d+\.\d{2}', amount) else None
+    except InvalidOperation:
+        usd = None
+    if usd is None:
+        return unknown('no cost record; see cost.md' if total == '-' else f'unreadable total {total!r}')
+    return {'status': 'partial' if partial else 'known', 'usd': str(usd),
+            'reason': 'some agents have no price' if partial else None}
+
+
 def cost(out, sid, report):
-    """The exit line's cost field; writes cost.md and puts its brief form into the report."""
+    """(the exit line's cost field, the cost as accounting); writes cost.md and puts its brief form into the report."""
     if not sid:
-        return 'cost none (no session id)'
+        return 'cost none (no session id)', unknown('no session id')
     try:
         brief, _, total = run_cost.report(run_cost.session_dir(session_id=sid), out / 'cost.md')
         if report.exists():
             report.write_text(with_brief(report.read_text(encoding='utf-8'), brief), encoding='utf-8', newline='\n')
     except run_cost.Failed as e:
-        return f'cost none (run_cost: {e})'
+        return f'cost none (run_cost: {e})', unknown(f'run_cost: {e}')
     except Exception as e:   # noqa: BLE001 - chief has finished; a cost it cannot table must not lose the exit line
-        return f'cost none ({type(e).__name__}: {e})'
-    return 'cost none (no cost record; see cost.md)' if total == '-' else f'cost ${total}'
+        return f'cost none ({type(e).__name__}: {e})', unknown(f'{type(e).__name__}: {e}')
+    return ('cost none (no cost record; see cost.md)' if total == '-' else f'cost ${total}'), spent(total)
 
 
 def main(argv=None):
@@ -313,12 +387,15 @@ def main(argv=None):
     p.add_argument('--out', required=True, type=Path)
     p.add_argument('--worktree', required=True, type=Path)
     p.add_argument('--task-file', required=True, type=Path)
+    p.add_argument('--task')
     p.add_argument('--permission-mode')
     p.add_argument('--foreground', action='store_true')
     p.add_argument('--_detached', action='store_true', help=argparse.SUPPRESS)   # the launcher, run again
     a = p.parse_args(argv)
     if a._detached:
         detached(a, lambda: detached_launch(a))
+    if a.task is not None and not TASK_KEY.fullmatch(a.task):
+        fail(f'--task {a.task!r} is not a task key ({TASK_KEY.pattern}); a relaunch passes the same key')
     if a.out.exists():
         fail(f'{a.out} exists; each run needs a new directory')
     if not a.worktree.is_dir():
@@ -338,7 +415,12 @@ def main(argv=None):
             fail(f'{a.task_file} cannot be read: {e}')
         a.out.mkdir(parents=True)
         if a.foreground:
-            return launch(a, task)
+            a.accounting = Accounting(a)
+            try:
+                return launch(a, task)
+            except BaseException as e:
+                a.accounting.finish(1, f'launcher failed: {type(e).__name__}: {e}')
+                raise
     finally:
         release()
     # this process's own command line runs again as the launcher, with a fresh session's environment (herdr-core
@@ -372,6 +454,8 @@ def detached(a, run):
         code = run()
     except BaseException as e:   # noqa: BLE001 - nobody watches this process; the exit line must still come
         traceback.print_exc()
+        if accounting := getattr(a, 'accounting', None):
+            accounting.finish(1, f'launcher failed: {type(e).__name__}: {e}')
         Progress(a.out / 'progress.log').line(f'launcher: exit 1 (launcher failed: {type(e).__name__}: {e}) · report none')
     finally:
         sys.stderr.flush()
@@ -383,15 +467,16 @@ def detached(a, run):
 def detached_launch(a):
     """The launcher run again, the task on its stdin; it checks again what its caller checked, and on Windows takes
     the run lock its caller only checked."""
+    if not a.out.is_dir() or (a.out / 'progress.log').exists() or (a.out / 'run.json').exists():
+        print(f'chief_run: --_detached is the launcher chief_run starts, in the new --out it made; {a.out} is not one',
+              file=sys.stderr)
+        return 2
+    a.accounting = Accounting(a)
     task = sys.stdin.buffer
     if not task.seekable():   # Windows' pipe: copied, so claude gets a file
         task = tempfile.TemporaryFile()
         task.write(sys.stdin.buffer.read())
         task.seek(0)
-    if not a.out.is_dir() or (a.out / 'progress.log').exists():
-        print(f'chief_run: --_detached is the launcher chief_run starts, in the new --out it made; {a.out} is not one',
-              file=sys.stderr)
-        return 2
     if os.name == 'nt':   # the inherited log handle has no append mode: it would write over claude's stderr
         opened = os.open(a.out / 'stderr.log', os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
         os.dup2(opened, 1)
@@ -399,6 +484,7 @@ def detached_launch(a):
         os.dup2(1, 2)
     why = None if a.worktree.is_dir() else f'{a.worktree} is not a directory'
     if why := why or refusal(a.worktree, 'relaunch with a new --out') or lock_held(a.worktree, keep=True, wait=5):
+        a.accounting.finish(2, why)
         Progress(a.out / 'progress.log').line(f'launcher: exit 2 ({why}) · report none')
         return 2
     return launch(a, task)
@@ -412,6 +498,7 @@ def launch(a, task):
         cmd += ['--permission-mode', a.permission_mode]
 
     progress = Progress(a.out / 'progress.log')
+    a.accounting.progress = progress
     seen, result, warned, sid, tasks = set(), None, set(), '', Tasks()
 
     def warn(key, text):
@@ -430,6 +517,7 @@ def launch(a, task):
                                      env={**child_env(), 'CREDIT_GUARD_TAG': tag}, creationflags=NO_WINDOW)
         except OSError as e:
             err.write(f'chief_run: could not start claude: {e}\n'.encode())
+            a.accounting.finish(127, f'could not start claude: {e}', spent=unknown('claude did not start'))
             progress.line(f'launcher: exit 127 (could not start claude: {e}) · report none')
             return 127
         unwatch = threading.Event()
@@ -495,7 +583,9 @@ def launch(a, task):
         body = f'**{reason}**\n\n{body}'   # the report alone must not read as chief's last word
     if body.strip():
         report.write_text(body.rstrip('\n') + '\n', encoding='utf-8', newline='\n')   # Markdown: keep its indentation
-    progress.line(f'launcher: exit {code} ({reason}) · report {report if body.strip() else "none"} · {cost(a.out, sid, report)}')
+    field, spend = cost(a.out, sid, report)
+    a.accounting.finish(code, reason, sid, spend)
+    progress.line(f'launcher: exit {code} ({reason}) · report {report if body.strip() else "none"} · {field}')
     return code
 
 
