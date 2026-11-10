@@ -509,12 +509,13 @@ def default_state_dir() -> str:
 
 
 def _state_dir(path: str) -> str:
+    parent, name = os.path.split(os.path.abspath(path))
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        try:
+        if not os.path.lexists(parent):
+            # missing ancestors made 0o755 whatever the umask; an existing parent, often shared, is left as it is
+            return hil_process.state_dir(parent, name)
+        with contextlib.suppress(FileExistsError):
             os.mkdir(path, 0o700)
-        except FileExistsError:
-            pass
         # the receipts it holds decide `done`, so another user must not be able to replace them
         return hil_process.trusted_dir(path)
     except OSError as e:
