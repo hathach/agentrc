@@ -101,6 +101,7 @@ from launch_result import ENDED, STALLED, load_output  # noqa: E402
 from harvest import digest as body_digest, gh_json  # noqa: E402  the digest threads.py records
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
 import gh_repo  # noqa: E402
+from gh_reads import as_gh_reads  # noqa: E402
 import windows  # noqa: E402
 
 VERSION = 2
@@ -191,6 +192,16 @@ def store(path, led):
 
 def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()[:16]
+
+
+def read_digest(body):
+    """digest() of a reply we sent as gh reads it back: what its live copy matches; `digest` stays its identity."""
+    return digest(as_gh_reads(body))
+
+
+def live_digest(body):
+    """harvest.py's digest of text we sent as gh reads it back: what a snapshot of its live copy records."""
+    return body_digest(as_gh_reads(body))
 
 
 # An uncertain review may not be on the PR at all: it is reconciled before anything builds on it.
@@ -478,7 +489,7 @@ def note_hold(fix, bodies):
     if fix['state'] != 'published' or fix['resolve'] in SETTLED:
         return None
     body = bodies.get(fix['replyId'])
-    return 'our repair note was deleted' if body is None else 'our repair note was edited' if digest(body) != fix['digest'] else None
+    return 'our repair note was deleted' if body is None else 'our repair note was edited' if digest(body) != read_digest(fix['body']) else None
 
 
 def submitted_last(led, head):
@@ -540,9 +551,10 @@ def published_at(led, f):
         draft, got = r.get('draft') or {}, (r.get('receipts') or {}).get('review') or {}
         for c, cid in zip(draft.get('comments', []), got.get('commentIds') or []):
             if c.get('findingId') == f['id'] and cid is not None and cid == f.get('commentId'):
-                return 'review', cid, body_digest(f.get('published') or c['body'])
+                # `published` was read through gh already, and gh's rewrite is not idempotent: only our text is mapped.
+                return 'review', cid, body_digest(f['published']) if f.get('published') else live_digest(c['body'])
         if f.get('commentId') is None and any(c.get('findingId') == f['id'] for c in draft.get('moved', [])):
-            return ('review-body', got['reviewId'], body_digest(body_of(r))) if got.get('reviewId') else None
+            return ('review-body', got['reviewId'], live_digest(body_of(r))) if got.get('reviewId') else None
     return None
 
 

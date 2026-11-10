@@ -13,7 +13,8 @@ which the body must match before anything is posted. Each commentId names one
 of three things on the PR: a review comment (an inline thread), an issue comment,
 or a review whose body carries the finding (a bot's summary, or a point GitHub
 would not anchor inline). A review reply goes to the thread's first comment, where
-GitHub files every reply, and is read back: it must match the body, sit in that
+GitHub files every reply, and is read back: it must match the body as gh reads it
+(lib/gh_reads.py), sit in that
 thread after the comment it answers, and carry our login and the PR, before the
 thread is resolved; the other two
 have no thread: the reply is an issue comment whose body is the original's URL
@@ -110,6 +111,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import comment_digest  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
 import gh_repo  # noqa: E402
+from gh_reads import reads_as_sent  # noqa: E402
 from seal import RATE_LIMITED, emit, fnv1a, sealed  # noqa: E402
 
 THREADS_QUERY = ('query($o:String!,$r:String!,$p:Int!,$c:String){repository(owner:$o,name:$r){'
@@ -232,7 +234,7 @@ class Poster:
         """The (id, body) of our identical reply, else of the reply of ours this one must not be posted over:
         any other, or with second_answer only a quoting one giving the same kind of answer; None when there is none."""
         ours = self.ours(kind, target)
-        blocking = [c for c in ours if c['body'] == body]
+        blocking = [c for c in ours if reads_as_sent(c['body'], body)]
         if not blocking and not second_answer:
             blocking = ours
         elif not blocking and kind != 'review':
@@ -276,7 +278,7 @@ class Poster:
             c = self.read_reply(kind, reply_id)
         except ApiError as e:
             return None, f'read-back unavailable: {e}'
-        bad = ([] if c.get('body') == body else ['body']) + self.misplaced(kind, target, c)
+        bad = ([] if reads_as_sent(c.get('body'), body) else ['body']) + self.misplaced(kind, target, c)
         return (True, None) if not bad else (False, f'read-back mismatch on {", ".join(bad)}')
 
     def resolve(self, target):
@@ -385,7 +387,7 @@ def read_again(poster, item, rc, done=None):
     text = None if why else reply_text(kind, original, c.get('body', ''))
     if not why and original_digest(original) != item['originalDigest']:
         why = f'comment {item["commentId"]} was edited since the inspection'
-    if not why and fnv1a(text) != item['bodyDigest'] and text != done:
+    if not why and fnv1a(text) != item['bodyDigest'] and not reads_as_sent(text, done):
         why = f'reply {item["replyId"]} was edited since the inspection'
     return original, text, why
 
@@ -431,7 +433,7 @@ def edit(poster, item):
         kind = rc['kind']
         body = reply_body(kind, original, item['body'])
         # A rerun after a lost receipt finds its own edit there and does not make another.
-        if text != item['body']:
+        if not reads_as_sent(text, item['body']):
             rc['sent'] = True
             poster.edit(kind, item['replyId'], body)
             rc['posted'] = True
@@ -457,7 +459,7 @@ def handle(poster, item):
             return rc
         body = reply_body(kind, original, item['body'])
         found = poster.existing(kind, original, body, item.get('secondAnswer', False))
-        if found and found[1] != body:
+        if found and not reads_as_sent(found[1], body):
             rc['replyId'] = found[0]
             rc['error'] = f'reply {found[0]} of ours is already on this comment in other words; the caller reconciles it'
             return rc

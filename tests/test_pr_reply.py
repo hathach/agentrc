@@ -43,6 +43,7 @@ class FakeGitHub:
         self.next_id = 900
         self.mutations = []
         self.calls = []
+        self.reads = lambda out: out  # a response's JSON text as gh returns it
 
     def review_comment(self, cid, body='bot says', login='bot', thread=None, parent=None):
         self.review[cid] = {'id': cid, 'body': body, 'user': {'login': login}, 'in_reply_to_id': parent,
@@ -69,7 +70,7 @@ class FakeGitHub:
         method, path = args[2], args[3]
         body = json.loads(stdin) if stdin else None
         try:
-            return 0, json.dumps(self.rest(method, path, body, '--paginate' in args)), ''
+            return 0, self.reads(json.dumps(self.rest(method, path, body, '--paginate' in args))), ''
         except KeyError:
             return 1, '', f'gh: Not Found (HTTP 404)\n{path}'
 
@@ -988,6 +989,53 @@ class ReconcileTest(ReplyCase):
 DATA = Path(__file__).resolve().parent / 'data' / 'comment_digest'
 RABBIT = reply.comment_digest.CODERABBIT
 FOOTER = reply.comment_digest.FOOTER
+
+
+class GhReadsTest(ReplyCase):
+    """Our reply as gh reads it back: gh's sanitizer rewrites a cited `\\u001b` to `\\^[` (#461)."""
+    BODY = 'Not so: the line escapes ESC as `\\u001b`.'
+    reads = staticmethod(lambda out: out.replace(r'\\u001b', r'\\^['))  # as gh 2.103.3 rewrote #461's body
+
+    def setUp(self):
+        super().setUp()
+        self.gh.reads = self.reads
+        self.gh.review_comment(10)
+        self.gh.issue_comment(20)
+
+    def posts(self):
+        return [m for m in self.gh.mutations if m[0].startswith('post')]
+
+    def test_a_reply_citing_a_json_escape_is_verified_as_it_reads_back(self):
+        rc, receipts = self.run_script([{'commentId': 10, 'body': self.BODY}, {'commentId': 20, 'body': self.BODY}])
+        self.assertEqual(rc, 0, receipts)
+        self.assertEqual([(r['replyId'], r['verified'], r['error']) for r in receipts], [(901, True, None), (902, True, None)])
+        self.assertTrue(self.gh.threads['T10']['resolved'])
+
+    def test_our_reply_citing_it_already_there_is_reused_and_never_posted_again(self):
+        self.gh.review_comment(55, self.BODY, ME, thread='T10', parent=10)
+        self.gh.issue_comment(56, reply.issue_body(self.gh.issue[20], self.BODY), ME)
+        for second in (False, True):
+            with self.subTest(secondAnswer=second):
+                rc, receipts = self.run_script([{'commentId': 10, 'body': self.BODY, 'secondAnswer': second},
+                                                {'commentId': 20, 'body': self.BODY, 'secondAnswer': second}])
+                self.assertEqual(rc, 0, receipts)
+                self.assertEqual([(r['replyId'], r['sent'], r['verified']) for r in receipts], [(55, False, True), (56, False, True)])
+                self.assertEqual(self.posts(), [])
+
+    def edit_to(self, now):
+        """An edit of our reply 55, inspected as 'deliberately', to BODY, the reply reading `now` when it runs."""
+        self.gh.review_comment(55, now, ME, thread='T10', parent=10)
+        return self.edit({'commentId': 10, 'replyId': 55, 'body': self.BODY, 'bodyDigest': reply.fnv1a('deliberately'),
+                          'originalDigest': reply.comment_digest.sha12('bot says')})
+
+    def test_an_edit_citing_it_is_verified_as_it_reads_back(self):
+        rc, receipts = self.edit_to('deliberately')
+        self.assertEqual((rc, receipts[0]['posted'], receipts[0]['verified'], receipts[0]['error']), (0, True, True, None))
+
+    def test_an_edit_citing_it_already_on_the_reply_is_not_made_again(self):
+        rc, receipts = self.edit_to(self.BODY)
+        self.assertEqual((rc, receipts[0]['sent'], receipts[0]['verified'], receipts[0]['error']), (0, False, True, None))
+        self.assertEqual([m for m in self.gh.mutations if m[0] == 'edit'], [])
 
 
 class EncodingTest(ReplyCase):
