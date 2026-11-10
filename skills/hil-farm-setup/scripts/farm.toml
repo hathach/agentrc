@@ -30,8 +30,8 @@ build = [
 kind = "git"
 recipe = "openocd"
 repo = "https://github.com/hathach/openocd.git"  # branch tinyusb
-commit = "0ce7431256315de66ab9e05c1846999b40e41b03"
-version = "0.12.0+dev-g0ce7431"
+commit = "4c9931aa8b03124420ab6d7352522730116a3b36"
+version = "0.12.0+dev-g4c9931a"
 configure = ["--enable-jlink", "--enable-cmsis-dap", "--enable-stlink", "--enable-wlinke", "--disable-werror"]
 links = { "/usr/local/bin/openocd" = "bin/openocd" }
 check = ["/usr/local/bin/openocd", "--version"]

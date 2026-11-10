@@ -309,7 +309,7 @@ class TestSetup(unittest.TestCase):
         proposed = self.addition()
         before = self.host.read_bytes()
         installed = {p: p.read_bytes() for p in (self.tmp / 'installed').iterdir()}
-        for f, old, new in (('farm.toml', 'version = "0.12.0+dev-g0ce7431"', 'version = "0.12.0+dev-gnewer"'),
+        for f, old, new in (('farm.toml', 'version = "0.12.0+dev-g4c9931a"', 'version = "0.12.0+dev-gnewer"'),
                             ('pyocd.lock', 'pyocd==0.45.1', 'pyocd==0.45.2')):
             with self.subTest(file=f):
                 moved = self.dir / f
