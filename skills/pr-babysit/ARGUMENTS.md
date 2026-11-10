@@ -100,6 +100,9 @@ A key not listed here throws before anything runs.
   green at the CI wait's next slice boundary after the review lane's pass
   (normally within 3 minutes, a later slice up to 9), not after the whole
   wait; that pass is a grace period for checks that register late, not proof.
+  An Actions run on the head that is unfinished with no pending job registered
+  (one a concurrency group holds, a re-run not yet started) counts as a
+  pending check, so it is waited on.
 - `ciNotes`: what the caller established about this PR's CI, handed to the
   judge verbatim; it never revises a placed verdict stored on the head, while
   a stored unclassified failure is judged again once the notes change.
