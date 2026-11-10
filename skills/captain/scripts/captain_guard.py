@@ -95,7 +95,8 @@ def start_args(args):
         elif args[i].startswith('-'):
             value = args[i + 1] if i + 1 < len(args) else ''
             if args[i] not in START_OPTIONS or args[i] in seen or value.startswith('-') or not TOKEN.fullmatch(value):
-                return f'start takes {", ".join(START_OPTIONS)}, each at most once with a value'
+                return (f'start takes {", ".join(START_OPTIONS)}, each at most once with a value, and '
+                        f'{", ".join(START_FLAGS)} at most once')
             seen.add(args[i])
             i += 2
         else:

@@ -1381,7 +1381,8 @@ class AddressingTest(AddressedCase):
             with self.subTest(words):
                 self.assertEqual(self.shown(words, *addresses), want)
         for words, why in (('docs merge 318', 'not a target'), ('t98 merge 318', "'t98' names no live session"),
-                           ('space:missing merge', "'space:missing' names no live session"), ('code', 'nothing follows')):
+                           ('space:missing merge', "'space:missing' names no live session"),
+                           ('code', 'nothing follows')):
             with self.subTest(words):
                 self.assertIn(why, self.refused(words, 't2'))
 
@@ -2556,10 +2557,10 @@ class VerdictCase(RelayCase):
                           (self.item(key)['id'], revision, verdict))
         return [c.args[0] for c in out.call_args_list]
 
-    def refused(self, fn, *args):
+    def refused(self, fn, *args, **kwargs):
         before = captain.records()
         with self.assertRaises(SystemExit), mock.patch('builtins.print') as out:
-            fn(*args)
+            fn(*args, **kwargs)
         self.assertEqual([r for r in captain.records() if r['type'] != 'observed'],
                          [r for r in before if r['type'] != 'observed'])
         return '\n'.join(str(c.args[0]) for c in out.call_args_list)
@@ -2583,7 +2584,7 @@ class VerdictTest(VerdictCase):
         held = self.action_of(self.decide())
         self.say('no: rebase first')
         out = self.refused(captain.relay, captain.resolve(['t2']), None, self.ident,
-                           (self.item()['id'], 1, 'correction'), True)
+                           (self.item()['id'], 1, 'correction'), force=True)
         self.assertIn(f'is closed (decided by {held})', out)
 
     def test_only_its_owner_at_its_latest_open_revision(self):

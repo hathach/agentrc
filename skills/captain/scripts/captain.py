@@ -40,8 +40,9 @@ alone, is every live session.
 A message that opens `tell <name>... [to]`, or the names alone, each an address, space id or name, or space:<id or
 name>, is relayed without that opening when the names are exactly the relay's targets, and refused when they are not
 or cannot be told apart from the instruction. One addressed to every session (`tell all|everyone|every session
-to|:`) is relayed without it when the targets are exactly the live sessions. The message relayed is one the human wrote in the
-captain's current turn, typed or read mid-turn; a message hc pasted (`<hc from=...>`) is never the human's.
+to|:`) is relayed without it when the targets are exactly the live sessions. The message relayed is one the human
+wrote in the captain's current turn, typed or read mid-turn; a message hc pasted (`<hc from=...>`) is never the
+human's.
 
 A watch types into nobody: a session joins it itself, through hooks/captain (SessionStart after a compaction or
 /clear, Stop) or `brief --pending`, and it stands until the human cancels it, whichever captain is enrolled or none.
@@ -1778,6 +1779,12 @@ def named(token, live):
             if token in (s.get(k) and s[k].casefold() for k in ('address', 'space_id', 'space'))}
 
 
+def recipient(token, live):
+    """Whether token is read as a recipient: an address or space: target even when it names no one, or a name of a
+    live session."""
+    return bool(token.startswith(SPACE) or ADDRESS.fullmatch(token) or named(token, live))
+
+
 def instruction(words, addresses, live):
     """(text, None): what a relay to addresses sends, words without an opening `[tell] <name>... [to]` whose names
     are exactly addresses; (None, why) when that opening names anyone else or cannot be split from the instruction.
@@ -1792,8 +1799,7 @@ def instruction(words, addresses, live):
     else:
         pos = len(words) - len(words.lstrip())
         lead = NAME.match(words, pos)
-        if not lead or EVERY_WORD.fullmatch(lead.group()) or not (
-                lead.group().startswith(SPACE) or ADDRESS.fullmatch(lead.group()) or named(lead.group(), live)):
+        if not lead or EVERY_WORD.fullmatch(lead.group()) or not recipient(lead.group(), live):
             return words, None
     found = set()
     while True:
@@ -1813,10 +1819,7 @@ def instruction(words, addresses, live):
         pos = name.end()
         join = JOIN.match(words, pos)
         following = join and NAME.match(words, join.end())
-        # an address or space: is a recipient even when it names no one, never the instruction's first word
-        if not (following and (':' in following.group() or ADDRESS.fullmatch(following.group())
-                               or EVERY_WORD.fullmatch(following.group())
-                               or named(following.group(), live))):
+        if not (following and (EVERY_WORD.fullmatch(following.group()) or recipient(following.group(), live))):
             joiner = join and join.group().strip(' \t\r\n,')
             if joiner:
                 return None, f'{joiner!r} after {name.group()!r} may join another name or start the instruction'
@@ -1939,8 +1942,8 @@ def relay(targets, entry, mine, decided=None, force=False, pinned=None):
             if any(r['type'] == 'relay' and r['entry'] == uid and r['target']['address'] == address for r in recs):
                 print(f'{address}: refused, this message was relayed to it already', flush=True)
                 continue
-            stale = open_to(address, recs)
-            target, why = (None, OPEN) if stale and not force else reach(address, mine)
+            target, why = reach(address, mine) if force else gate(address, recs, mine)
+            stale = open_to(address, recs) if force else []
             if not why and (not pinned[address] or identity(target) != identity(pinned[address])):
                 why = 'its session changed during this relay; relay again'
             if why:
