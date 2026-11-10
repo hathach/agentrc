@@ -43,7 +43,8 @@ has carry: one record per entry, {commentId, eligible, reason}, plus the comment
 commentAliases (when it has some) and source when eligible. An entry is eligible only when its comment is in this
 harvest with that digest (or an alias of it), the checkout's HEAD is the head, and git shows its paths unchanged, committed
 or not, since judgedSha; unbounded paths only on judgedSha the head, with a clean tree. Paths are literal pathspecs.
-Any git failure, missing commit or path outside the repository makes it ineligible, never eligible.
+Any git failure, missing commit or path outside the repository makes it ineligible, never eligible. An eligible
+comment's body is left out like the two below, bodyOmitted "carried": the caller restores its findings.
 
 --probe prints only headSha, observedAt, headEventAt, headEventEvidence, bots and fingerprint, sealed (facts.sealed): what a workflow waiting out
 CodeRabbit's rate limit compares with its last full harvest (#359).
@@ -53,7 +54,6 @@ import base64
 import functools
 import hashlib
 import json
-import os
 import re
 import sys
 import time
@@ -67,7 +67,7 @@ except ImportError:
     yaml = None
 
 sys.path.insert(0, str(Path(__file__).parent))
-from facts import FULL_SHA, Parser, RateLimited, Unusable, attempt, bind_repo, checkout_top, report, run  # noqa: E402
+from facts import FULL_SHA, Parser, RateLimited, Unusable, attempt, bind_repo, checkout_top, report, run, status  # noqa: E402
 
 PROBE = ('headSha', 'observedAt', 'headEventAt', 'headEventEvidence', 'bots', 'fingerprint')
 # reply.py checks a comment against the same digest, so both skills share one definition.
@@ -587,11 +587,6 @@ def carry_entries(text):
     return entries
 
 
-def git_reading(*argv):
-    """(status, stdout, stderr) of git with every pathspec literal."""
-    return attempt('git', *argv, env={**os.environ, 'GIT_LITERAL_PATHSPECS': '1'})
-
-
 def unchanged_since(judged, paths, head):
     """None when the checkout holds what was judged at `judged` for these paths, else why not."""
     if not paths and judged != head:
@@ -599,31 +594,32 @@ def unchanged_since(judged, paths, head):
     bad = [x for x in paths or [] if not x or x.startswith('/') or '\\' in x or '..' in x.split('/')]
     if bad:
         return f'not repository-relative: {bad}'
-    spec = ['--', *paths] if paths else []
-    # NUL-separated: a name of only whitespace is still a change.
-    code, out, err = git_reading('status', '--porcelain=v1', '-z', '--untracked-files=all', *spec)
-    if code != 0:
-        return f'git status failed: {err.strip()}'
-    if out:
-        return f'uncommitted changes: {sorted(re.sub(r"^.. ", "", x) for x in out.split(chr(0)) if x)}'
+    try:
+        dirty = status(*(paths or []))
+    except Unusable as e:
+        return f'git status failed: {e}'
+    if dirty:
+        return f'uncommitted changes: {sorted(re.sub(r"^.. ", "", x) for x in dirty)}'
     if judged == head:
         return None
-    code, out, err = git_reading('diff', '--name-only', '-z', '--no-renames', '--no-ext-diff', judged, head, *spec)
+    # NUL-separated: a name of only whitespace is still a change.
+    code, out, err = attempt('git', '--literal-pathspecs', 'diff', '--name-only', '-z', '--no-renames', '--no-ext-diff', judged, head, '--', *(paths or []))
     if code != 0:
         return f'git cannot compare {judged[:8]} with the head: {err.strip()}'
     return f'changed since {judged[:8]}: {sorted(x for x in out.split(chr(0)) if x)}' if out else None
 
 
 def carried(entries, harvested, head):
-    """One record per --carry entry: whether its comment keeps its settled findings."""
+    """One record per --carry entry: whether its comment keeps its settled findings. An eligible comment's body is
+    omitted from `harvested` (bodyOmitted "carried"): the caller restores its findings, so nobody reads it."""
     if not entries:
         return []
     by_id = {c['commentId']: c for c in harvested}
-    code, out, _ = git_reading('rev-parse', 'HEAD')
-    at = out.strip() if code == 0 else None
     try:
         checkout_top()  # paths are the repository's, which git reads relative to the working directory
-        away = None
+        code, out, _ = attempt('git', 'rev-parse', 'HEAD')
+        at = out.strip() if code == 0 else None
+        away = None if at == head else f'the checkout is at {at or "an unreadable HEAD"}, not the head'
     except Unusable as e:
         away = str(e)
     got = []
@@ -632,10 +628,14 @@ def carried(entries, harvested, head):
         why = (away if away
                else 'not in this harvest' if c is None
                else 'its body changed' if e['digest'] not in (c['digest'], *c.get('aliases', ()))
-               else f'the checkout is at {at or "an unreadable HEAD"}, not the head' if at != head
                else unchanged_since(e['judgedSha'], e['paths'], head))
-        fresh = {'commentDigest': c['digest'], **({'commentAliases': c['aliases']} if c.get('aliases') else {}), 'source': c['source']} if why is None else {}
-        got.append({'commentId': e['commentId'], 'eligible': why is None, 'reason': why or f"unchanged since {e['judgedSha'][:8]}", **fresh})
+        if why is None:
+            if c['body'] is not None:
+                c.update(body=None, bodyOmitted='carried', bodyLength=len(c['body']))
+            got.append({'commentId': e['commentId'], 'eligible': True, 'reason': f"unchanged since {e['judgedSha'][:8]}",
+                        'commentDigest': c['digest'], **({'commentAliases': c['aliases']} if c.get('aliases') else {}), 'source': c['source']})
+        else:
+            got.append({'commentId': e['commentId'], 'eligible': False, 'reason': why})
     return got
 
 

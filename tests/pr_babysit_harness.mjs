@@ -4983,6 +4983,14 @@ test('a challenger overturning a posted dismissal is shown the earlier verdict',
   assert.deepEqual(result.corrections.map(c => c.now), ['the challenger: the ISR path skips the check'], 'the reversal the overturn made is reported')
 })
 
+// harvest.py --carry's list as the validator prompt passes it, [] when it passes none.
+const carryOf = (prompt) => { const m = String(prompt).match(/--carry '((?:[^']|'\\'')*)'/); return m ? JSON.parse(m[1].replaceAll("'\\''", "'")) : [] }
+// What harvest.py answers for those candidates: each eligible unless the case says otherwise.
+const carrying = (prompt, over = () => ({})) => carryOf(prompt).map(c => ({
+  commentId: c.commentId, eligible: true, reason: 'unchanged', commentDigest: c.digest, source: 'coderabbit', ...over(c),
+}))
+const dismissed = (over = {}) => ({ findings: [invalidFinding({ reason: 'the caller checks it', dependsOn: ['src/caller.c'], ...over })], replies: [{ commentId: 1, body: 'not so' }], bots: 'reviewed' })
+
 test('a dismissal answered at its body, with its recorded verdict and nothing owed or held, is not challenged again (#393)', async () => {
   const again = { findings: [invalidFinding({ reason: 'still checked by the caller' })], replies: [{ commentId: 1, body: 'not so' }], bots: 'reviewed' }
   const settled = await refutedThen(again)
@@ -5016,15 +5024,8 @@ test('a fix landing after its fix note posted is not challenged; a hold on its c
   assert.deepEqual(held.result.state.holds.map(([id]) => id), ['1#1'])
   const after = await run({ reviews: { findings: [invalidFinding({ line: 2 })], replies: [], bots: 'reviewed' }, args: { maxCycles: 5, state: held.result.state } })
   assert.ok(after.labels.some(l => l.startsWith('challenge#')), after.labels.join(' '))
+  assert.deepEqual(carryOf(after.calls.find(c => c.label.startsWith('reviews#')).prompt), [], 'nor is the held comment carried')
 })
-
-// harvest.py --carry's list as the validator prompt passes it, [] when it passes none.
-const carryOf = (prompt) => { const m = String(prompt).match(/--carry '((?:[^']|'\\'')*)'/); return m ? JSON.parse(m[1].replaceAll("'\\''", "'")) : [] }
-// What harvest.py answers for those candidates: each eligible unless the case says otherwise.
-const carrying = (prompt, over = () => ({})) => carryOf(prompt).map(c => ({
-  commentId: c.commentId, eligible: true, reason: 'unchanged', commentDigest: c.digest, source: 'coderabbit', ...over(c),
-}))
-const dismissed = (over = {}) => ({ findings: [invalidFinding({ reason: 'the caller checks it', dependsOn: ['src/caller.c'], ...over })], replies: [{ commentId: 1, body: 'not so' }], bots: 'reviewed' })
 
 test('a settled comment harvest.py finds unchanged is carried: not judged, challenged or answered again (#393)', async () => {
   const first = await run({ reviews: dismissed(), args: { maxCycles: 5, yieldAfterCycle: true } })
@@ -5069,18 +5070,28 @@ test('a comment carried across our repair push keeps the head its verdict was ju
   assert.notEqual(decided.get('2#2').reviewedSha, HEAD, 'judged again after it')
 })
 
+test('a quota wait that reuses a report with a carried comment restores it once and keeps its judgment (#393)', async () => {
+  const first = await run({ reviews: dismissed(), args: { maxCycles: 5, yieldAfterCycle: true } })
+  const [[, d]] = first.result.state.decisions
+  let n = 0
+  const { result, labels, logs } = await run({
+    args: { coderabbitTrigger: true, maxCycles: 5, state: first.result.state }, napClock: true,
+    // Fixed records: the stub harvests once per cycle, and a probe (no --carry) may ask first.
+    reviewsPerCycle: () => ({ ...quiet([++n < 3 ? limitedCr(at(20)) : bot('coderabbit')]),
+      carry: [{ commentId: 1, eligible: true, reason: 'unchanged', commentDigest: 'd1', source: 'coderabbit' }] }),
+  })
+  assert.equal(result.pass, true, `${result.reason} ${result.detail}`)
+  assert.ok(labels.some(l => l.startsWith('reviews:probe#')), labels.join(' '))
+  assert.ok(logs.some(l => /probe — CodeRabbit still rate-limited and nothing new on the head/.test(l)), logs.join('\n'))
+  assert.equal(labels.some(l => /^(challenge|replies)#/.test(l)), false, labels.join(' '))
+  assert.deepEqual(result.state.decisions.map(([id, x]) => [id, x.reviewedSha, x.paths]), [['1#1', d.reviewedSha, d.paths]])
+})
+
 test('only a comment whose every finding is an answered dismissal, nothing owed or held, is a carry candidate (#393)', async () => {
   // A valid finding owes a fix: not a candidate.
   let prompts = []
   await run({ reviewsPerCycle: (p) => { prompts.push(p); return oneValid }, args: { maxCycles: 2 } })
   assert.deepEqual(prompts.map(carryOf), [[], []])
-  // A held finding on the comment: not a candidate.
-  const first = await run({ reviews: dismissed(), args: { maxCycles: 5, yieldAfterCycle: true } })
-  const held = await run({ reviews: { findings: [finding(), invalidFinding({ line: 2 })], replies: [], bots: 'reviewed' }, args: { maxCycles: 5, yieldAfterCycle: true, state: first.result.state } })
-  assert.deepEqual(held.result.state.holds.map(([id]) => id), ['1#1'])
-  prompts = []
-  await run({ reviewsPerCycle: (p) => { prompts.push(p); return { findings: [invalidFinding({ line: 2 })], replies: [], bots: 'reviewed' } }, args: { maxCycles: 5, state: held.result.state } })
-  assert.deepEqual(carryOf(prompts[0]), [])
   // A dismissal with no bounded paths is a candidate with paths null: harvest.py carries it only on the head it was judged on.
   const unbounded = await run({ reviews: dismissed({ dependsOn: [] }), args: { maxCycles: 5, yieldAfterCycle: true } })
   prompts = []

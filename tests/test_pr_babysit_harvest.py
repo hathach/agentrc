@@ -879,7 +879,7 @@ class Carry(unittest.TestCase):
         return self.git('rev-parse', 'HEAD')
 
     def comment(self, id_=1, body='fix this', **over):
-        return {'commentId': id_, 'source': 'coderabbit', 'digest': harvest.digest(body), **over}
+        return {'commentId': id_, 'source': 'coderabbit', 'body': body, 'digest': harvest.digest(body), **over}
 
     def entry(self, paths, id_=1, body='fix this', judged=None):
         return {'commentId': id_, 'digest': harvest.digest(body), 'judgedSha': judged or self.judged, 'paths': paths}
@@ -895,6 +895,19 @@ class Carry(unittest.TestCase):
         got = self.one(['a.c', 'x/c.h'], [self.comment(aliases=['old'])])
         self.assertEqual(got, {'commentId': 1, 'eligible': True, 'reason': f'unchanged since {self.judged[:8]}',
                                'commentDigest': harvest.digest('fix this'), 'commentAliases': ['old'], 'source': 'coderabbit'})
+
+    def test_only_an_eligible_comment_loses_its_body_its_identity_kept(self):
+        self.write({'a.c': 'a2\n'})
+        self.commit('a.c changed')
+        walk = self.comment(id_=3, body=None, bodyOmitted='coderabbit-walkthrough', bodyLength=9)
+        comments = [self.comment(), self.comment(id_=2), walk]
+        entries = [self.entry(['b.c']), self.entry(['a.c'], id_=2), {**self.entry(['b.c'], id_=3), 'digest': walk['digest']}]
+        got = harvest.carried(entries, comments, self.git('rev-parse', 'HEAD'))
+        self.assertEqual([c['eligible'] for c in got], [True, False, True])
+        self.assertEqual({k: comments[0][k] for k in ('body', 'bodyOmitted', 'bodyLength', 'digest')},
+                         {'body': None, 'bodyOmitted': 'carried', 'bodyLength': len('fix this'), 'digest': harvest.digest('fix this')})
+        self.assertEqual(comments[1]['body'], 'fix this', 'an ineligible comment is judged, so its body stays')
+        self.assertEqual((walk['bodyOmitted'], walk['bodyLength']), ('coderabbit-walkthrough', 9), 'an omission already made stays as it was')
 
     def test_a_changed_deleted_or_renamed_dependency_is_judged_again(self):
         for change in ({'a.c': 'a2\n'}, None, 'rename'):
