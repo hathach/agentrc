@@ -27,10 +27,11 @@ User-wide rules are in `instructions/user.md`; edit them there, and keep
   `reviewers`. The merge also needs the owner's own words accepting it
   without Greptile (`merge.py --waive greptile`); this note waives nothing.
   A run first launched with `greptileTrigger`, as every run on the earlier
-  args was, keeps requiring Greptile and stops `greptile-unreviewed`, and its
-  state refuses the args above; the waiver cannot help it, since `merge.py`
-  needs a passing `both` launch. Only a fresh run without `stateRef` gets
-  past it, and its merge still needs the waiver.
+  args was, keeps requiring Greptile: it stops `greptile-unreviewed` when
+  Greptile stays silent or its request fails, but passes with Greptile in
+  `unreviewed` once Greptile posts its pause notice, and the waiver can then
+  accept that launch. Its state refuses the args above, so only a fresh run
+  without `stateRef` uses them, and that run's merge still needs the waiver.
   Greptile auto-reviews on `open` events (`.greptile/config.json`); request
   another review with `@greptileai`, which `greptileTrigger` posts once per
   pushed head Greptile has not reviewed.
