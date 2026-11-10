@@ -852,8 +852,9 @@ class Carry(unittest.TestCase):
     """#393: --carry says which settled comments keep their findings, from git in a real checkout."""
 
     def setUp(self):
-        self.repo = Path(tempfile.mkdtemp(prefix='harvest-carry-'))
-        self.addCleanup(subprocess.run, ['rm', '-rf', str(self.repo)])
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.repo = Path(tmp.name).resolve()
         env = mock.patch.dict(os.environ, git_env(), clear=True)
         env.start()
         self.addCleanup(env.stop)
@@ -908,16 +909,28 @@ class Carry(unittest.TestCase):
                 self.commit('change')
                 got = self.one(['a.c'])
                 self.assertFalse(got['eligible'])
-                self.assertEqual(got['reason'], f'changed since {self.judged[:8]}: a.c')
+                self.assertEqual(got['reason'], f"changed since {self.judged[:8]}: ['a.c']")
                 self.assertNotIn('commentDigest', got)
 
     def test_uncommitted_or_untracked_content_on_a_path_is_judged_again(self):
         self.write({'a.c': 'dirty\n'})
-        self.assertEqual(self.one(['a.c'])['reason'], 'uncommitted changes: a.c')
+        self.assertEqual(self.one(['a.c'])['reason'], "uncommitted changes: ['a.c']")
         self.git('checkout', '--', 'a.c')
         self.write({'x/new.h': 'n\n'})
-        self.assertEqual(self.one(['x/new.h'])['reason'], 'uncommitted changes: x/new.h')
+        self.assertEqual(self.one(['x/new.h'])['reason'], "uncommitted changes: ['x/new.h']")
         self.assertTrue(self.one(['a.c'])['eligible'], 'dirt elsewhere does not touch these paths')
+
+    def test_a_name_of_only_whitespace_is_still_a_change(self):
+        self.write({' ': 'x\n'})
+        self.assertEqual(self.one([' '])['reason'], "uncommitted changes: [' ']")
+        self.commit('blank name')
+        self.assertEqual(self.one([' '])['reason'], f"changed since {self.judged[:8]}: [' ']")
+
+    def test_run_below_the_top_level_carries_nothing(self):
+        os.chdir(self.repo / 'x')
+        got = self.one(['a.c'])
+        self.assertFalse(got['eligible'])
+        self.assertTrue(got['reason'].startswith('run from the checkout top level'), got['reason'])
 
     def test_paths_are_literal_never_pathspec_magic(self):
         self.write({'a.c': 'a2\n'})
@@ -937,7 +950,7 @@ class Carry(unittest.TestCase):
         self.assertTrue(self.one(None)['eligible'])
         self.assertTrue(self.one([])['eligible'])
         self.write({'b.c': 'dirty\n'})
-        self.assertEqual(self.one(None)['reason'], 'uncommitted changes: b.c')
+        self.assertEqual(self.one(None)['reason'], "uncommitted changes: ['b.c']")
         self.commit('next')
         self.assertEqual(self.one(None)['reason'], 'its verdicts name no bounded dependencies, and were judged on another head')
 

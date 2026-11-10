@@ -67,7 +67,7 @@ except ImportError:
     yaml = None
 
 sys.path.insert(0, str(Path(__file__).parent))
-from facts import FULL_SHA, Parser, RateLimited, Unusable, attempt, bind_repo, report, run  # noqa: E402
+from facts import FULL_SHA, Parser, RateLimited, Unusable, attempt, bind_repo, checkout_top, report, run  # noqa: E402
 
 PROBE = ('headSha', 'observedAt', 'headEventAt', 'headEventEvidence', 'bots', 'fingerprint')
 # reply.py checks a comment against the same digest, so both skills share one definition.
@@ -600,17 +600,18 @@ def unchanged_since(judged, paths, head):
     if bad:
         return f'not repository-relative: {bad}'
     spec = ['--', *paths] if paths else []
-    code, out, err = git_reading('status', '--porcelain=v1', '--untracked-files=all', *spec)
+    # NUL-separated: a name of only whitespace is still a change.
+    code, out, err = git_reading('status', '--porcelain=v1', '-z', '--untracked-files=all', *spec)
     if code != 0:
         return f'git status failed: {err.strip()}'
-    if out.strip():
-        return f'uncommitted changes: {" ".join(sorted(line[3:] for line in out.splitlines()))}'
+    if out:
+        return f'uncommitted changes: {sorted(re.sub(r"^.. ", "", x) for x in out.split(chr(0)) if x)}'
     if judged == head:
         return None
-    code, out, err = git_reading('diff', '--name-only', '--no-renames', '--no-ext-diff', judged, head, *spec)
+    code, out, err = git_reading('diff', '--name-only', '-z', '--no-renames', '--no-ext-diff', judged, head, *spec)
     if code != 0:
         return f'git cannot compare {judged[:8]} with the head: {err.strip()}'
-    return f'changed since {judged[:8]}: {" ".join(out.split())}' if out.strip() else None
+    return f'changed since {judged[:8]}: {sorted(x for x in out.split(chr(0)) if x)}' if out else None
 
 
 def carried(entries, harvested, head):
@@ -620,10 +621,16 @@ def carried(entries, harvested, head):
     by_id = {c['commentId']: c for c in harvested}
     code, out, _ = git_reading('rev-parse', 'HEAD')
     at = out.strip() if code == 0 else None
+    try:
+        checkout_top()  # paths are the repository's, which git reads relative to the working directory
+        away = None
+    except Unusable as e:
+        away = str(e)
     got = []
     for e in entries:
         c = by_id.get(e['commentId'])
-        why = ('not in this harvest' if c is None
+        why = (away if away
+               else 'not in this harvest' if c is None
                else 'its body changed' if e['digest'] not in (c['digest'], *c.get('aliases', ()))
                else f'the checkout is at {at or "an unreadable HEAD"}, not the head' if at != head
                else unchanged_since(e['judgedSha'], e['paths'], head))
