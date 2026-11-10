@@ -597,28 +597,75 @@ def tool_version():
     return _cli_json('version').get('VersionString')
 
 
-def foreign_headers(build_dir, cores=()):
-    """Headers a build's .d files took from another copy of this library (a core's bundled one, another checkout),
-    or in a core from another copy of the core, each with its counterpart path here, whether the bytes match and
-    whether it lies in one of the build's `cores`."""
-    found, roots, seen = {}, {}, set()
+def foreign_headers(deps, cores=()):
+    """Headers a build took (`deps`, its dep_paths) from another copy of this library (a core's bundled one, another
+    checkout), or in a core from another copy of the core, each with its counterpart path here, whether the bytes
+    match and whether it lies in one of the build's `cores`."""
+    found, roots = {}, {}
+    for token in deps:
+        p = Path(os.path.realpath(token)) if core_mode() else Path(token)   # the sketchbook links to ROOT
+        if P.ROOT in p.parents:
+            continue
+        root = library_root(p, roots)
+        if root:
+            counterpart = P.ROOT / p.relative_to(root)
+            digest, exists = sha256(p), counterpart.exists()
+            found[token] = {'path': token, 'counterpart': rel(counterpart) if exists else
+                            p.relative_to(root).as_posix(), 'sha256': digest,
+                            'matches': exists and digest == sha256(counterpart), 'core': within(p, cores)}
+    return sorted(found.values(), key=lambda h: h['path'])
+
+
+def dep_paths(build_dir):
+    """The absolute paths a build's .d files name, each once, in no particular order."""
+    seen = set()
     for dfile in Path(build_dir).rglob('*.d'):
         text = dfile.read_text(errors='replace').replace('\\\n', ' ')
         for token in (t.replace('\\ ', ' ') for t in re.split(r'(?<!\\)\s+', text) if t):
-            if token.endswith(':') or not token.startswith('/') or token in seen:
-                continue
-            seen.add(token)
-            p = Path(os.path.realpath(token)) if core_mode() else Path(token)   # the sketchbook links to ROOT
-            if P.ROOT in p.parents:
-                continue
-            root = library_root(p, roots)
-            if root:
-                counterpart = P.ROOT / p.relative_to(root)
-                digest, exists = sha256(p), counterpart.exists()
-                found[token] = {'path': token, 'counterpart': rel(counterpart) if exists else
-                                p.relative_to(root).as_posix(), 'sha256': digest,
-                                'matches': exists and digest == sha256(counterpart), 'core': within(p, cores)}
-    return sorted(found.values(), key=lambda h: h['path'])
+            if not token.endswith(':') and token.startswith('/'):
+                seen.add(token)
+    return list(seen)
+
+
+def core_tinyusb(deps):
+    """[{root, version, ref, headers}] per copy of the TinyUSB an ESP32 core bundles (esp32-arduino-lib-builder's
+    include/arduino_tinyusb) that a build's `deps` (its dep_paths) name: its tusb_option.h TUSB_VERSION, the
+    lib-builder's versions.txt `tinyusb:` line, each None when unreadable, and the headers taken from it.
+    Informational only."""
+    copies = {}
+    for token in deps:
+        parts = Path(token).parts
+        if 'arduino_tinyusb' in parts:
+            root = Path(*parts[:parts.index('arduino_tinyusb') + 1])
+            copies.setdefault(root, []).append(token)
+    return [{'root': str(root), 'version': _tusb_version(root / 'tinyusb/src/tusb_option.h'),
+             'ref': _versions_txt(root.parent.parent / 'versions.txt', 'tinyusb'), 'headers': sorted(headers)}
+            for root, headers in sorted(copies.items())]
+
+
+def _read_text(path):
+    """The file's text, None when it cannot be read."""
+    try:
+        return Path(path).read_text(errors='replace')
+    except OSError:
+        return None
+
+
+def _tusb_version(option_h):
+    text = _read_text(option_h)
+    if text is None:
+        return None
+    parts = [re.search(rf'^\s*#\s*define\s+TUSB_VERSION_{k}\s+(\d+)\b', text, re.M)
+             for k in ('MAJOR', 'MINOR', 'REVISION')]
+    return '.'.join(m.group(1) for m in parts) if all(parts) else None
+
+
+def _versions_txt(path, name):
+    text = _read_text(path)
+    if text is None:
+        return None
+    m = re.search(rf'^{re.escape(name)}:\s*(.+?)\s*$', text, re.M)
+    return m.group(1) if m else None
 
 
 def library_root(path, cache):
@@ -739,13 +786,15 @@ def compile_sketch(board, example, build_dir, properties, prepared, config=None)
             row.update(status='failed', firstError=f'{boot_app0} missing: the ESP core layout changed')
             return row
         shutil.copy2(boot_app0, build_dir / boot_app0.name)
-    headers = foreign_headers(build_dir, cores)
+    deps = dep_paths(build_dir)
+    headers = foreign_headers(deps, cores)
     if core_mode() and headers:   # the isolated environment reaches no other copy: one leaking in fails the sketch
         row.update(status='failed', foreignHeaders=headers,
                    firstError=f'compiled against another copy of the core: {[h["path"] for h in headers][:3]}')
         return row
     row.update(status='ok', fqbn=fqbn_, platform=platform, buildPlatform=build_platform, shadows=shadows,
                vidPid=P.vid_pid(build_dir, board, None), foreignHeaders=headers,
+               coreTinyUSB=core_tinyusb(deps),
                libraries=[{'name': lib.get('name'), 'version': lib.get('version'), 'dir': lib.get('install_dir')}
                           for lib in used_libs],
                artifacts=sorted(rel(f) for f in build_dir.glob('*.ino.*') if f.suffix in ('.elf', '.hex', '.bin',

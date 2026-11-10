@@ -412,12 +412,42 @@ class Provenance(Lib):
         (build / 'main.cpp.d').write_text(f'main.cpp.o: \\\n {same} \\\n {other} {unrelated} {notours} {gone} '
                                           f'{self.root / "src/fake.h"} ' +
                                           str(spaced / 'src/fake.h').replace(' ', '\\ ') + '\n')
-        got = [(h['counterpart'], h['matches']) for h in ab.foreign_headers(build)]
+        got = [(h['counterpart'], h['matches']) for h in ab.foreign_headers(ab.dep_paths(build))]
         self.assertEqual(sorted(got), [('src/fake.h', False), ('src/fake.h', True), ('src/only_there.h', False),
                                        ('src/ports/fa/port.cpp', False)])
-        core = {Path(h['path']): h['core'] for h in ab.foreign_headers(build, [None, str(d / 'core')])}
+        core = {Path(h['path']): h['core'] for h in ab.foreign_headers(ab.dep_paths(build), [None, str(d / 'core')])}
         self.assertEqual(core, {same: True, other: True, gone: True, spaced / 'src/fake.h': False})
-        self.assertFalse(any(h['core'] for h in ab.foreign_headers(build)))
+        self.assertFalse(any(h['core'] for h in ab.foreign_headers(ab.dep_paths(build))))
+
+    def test_core_tinyusb_names_the_esp_cores_bundled_copy_its_version_and_headers(self):
+        d = self.tmp / 'esp32s3 libs/3.3.12'
+        tusb = d / 'include/arduino_tinyusb'
+        (tusb / 'tinyusb/src/device').mkdir(parents=True)
+        (tusb / 'include').mkdir()
+        (tusb / 'tinyusb/src/tusb_option.h').write_text('#define TUSB_VERSION_MAJOR     0\n'
+                                                         '#define TUSB_VERSION_MINOR     21\n'
+                                                         '#define TUSB_VERSION_REVISION  0\n')
+        (tusb / 'tinyusb/src/device/usbd.h').write_text('')
+        (tusb / 'include/tusb_config.h').write_text('')
+        (d / 'versions.txt').write_text('esp-idf: v5.5.5 b774170ff46\ntinyusb: master 88c7f0b81\n')
+        other = self.tmp / 'old/include/arduino_tinyusb'   # a second copy: no tusb_option.h, no versions.txt
+        (other / 'include').mkdir(parents=True)
+        (other / 'include/tusb_config.h').write_text('')
+        build = self.tmp / 'b'
+        (build / 'sketch').mkdir(parents=True)
+        esc = lambda p: str(p).replace(' ', '\\ ')
+        (build / 'sketch/a.cpp.d').write_text(f'a.cpp.o: \\\n {esc(tusb / "tinyusb/src/tusb_option.h")} \\\n '
+                                              f'{esc(tusb / "include/tusb_config.h")} {self.root / "src/fake.h"}\n')
+        (build / 'b.cpp.d').write_text(f'b.cpp.o: {esc(tusb / "tinyusb/src/device/usbd.h")} '
+                                       f'{esc(tusb / "include/tusb_config.h")} {other / "include/tusb_config.h"}\n')
+        self.assertEqual(ab.core_tinyusb(ab.dep_paths(build)), [
+            {'root': str(tusb), 'version': '0.21.0', 'ref': 'master 88c7f0b81',
+             'headers': sorted(str(tusb / h) for h in ('include/tusb_config.h', 'tinyusb/src/device/usbd.h',
+                                                       'tinyusb/src/tusb_option.h'))},
+            {'root': str(other), 'version': None, 'ref': None, 'headers': [str(other / 'include/tusb_config.h')]}])
+        (tusb / 'tinyusb/src/tusb_option.h').write_text('#define TUSB_VERSION_MAJOR 0\n')   # incomplete
+        self.assertIsNone(ab.core_tinyusb(ab.dep_paths(build))[0]['version'])
+        self.assertEqual(ab.core_tinyusb(ab.dep_paths(self.tmp / 'nothing')), [])
 
     def fake_compile(self, used=None, success=True, err='', platform='/x'):
         used = [{'name': fake.NAME, 'install_dir': str(self.root)}] if used is None else used
@@ -443,8 +473,22 @@ class Provenance(Lib):
     def test_ok_build_row(self):
         row = self.compile(self.fake_compile())
         self.assertEqual((row['status'], row['vidPid'], row['foreignHeaders']), ('ok', '1234:5678', []))
+        self.assertEqual(row['coreTinyUSB'], [])
         self.assertEqual(row['libraries'], [{'name': fake.NAME, 'version': None, 'dir': str(self.root)}])
         self.assertIn('--library', (self.root / row['log']).read_text())
+
+    def test_both_header_reports_come_from_one_read_of_the_dep_files(self):
+        tusb = self.tmp / 'core/include/arduino_tinyusb'
+
+        def run(*_, **__):
+            (self.root / 'b/a.cpp.d').write_text(f'a.cpp.o: {tusb / "include/tusb_config.h"}\n')
+            return self.fake_compile()
+        with mock.patch.object(ab.subprocess, 'run', side_effect=run), \
+                mock.patch.object(ab, 'dep_paths', wraps=ab.dep_paths) as deps:
+            row = ab.compile_sketch('rig_jlink', 'examples/Basic/echo', self.root / 'b', [], {})
+        self.assertEqual(deps.call_count, 1)
+        self.assertEqual((row['foreignHeaders'], row['coreTinyUSB']), ([], [
+            {'root': str(tusb), 'version': None, 'ref': None, 'headers': [str(tusb / 'include/tusb_config.h')]}]))
 
     def test_missing_core_is_an_error_with_remedy(self):
         row = self.compile(self.fake_compile(success=False, err='Error resolving FQBN: platform x'), board='dev_a')
@@ -1171,7 +1215,7 @@ class Core(Lib):
         build = self.tmp / 'b'
         build.mkdir()
         (build / 'main.cpp.d').write_text(f'main.cpp.o: {other}/cores/fake/main.cpp {link}/cores/fake/main.cpp\n')
-        self.assertEqual([(h['counterpart'], h['matches']) for h in ab.foreign_headers(build)],
+        self.assertEqual([(h['counterpart'], h['matches']) for h in ab.foreign_headers(ab.dep_paths(build))],
                          [('cores/fake/main.cpp', False)])
 
     def test_submodules_bind_at_their_gitlinks_clean(self):

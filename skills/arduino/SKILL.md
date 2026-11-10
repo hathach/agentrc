@@ -69,6 +69,9 @@ retries, recovery) apply unchanged; these scripts load its `hil_*` scripts throu
   files differ from the ones running: rebuild it. Each process freezes the agentrc closure's digests
   when it loads it and refuses to write, admit or stage a record once those files have changed under it; a manual
   session refuses records built with other agentrc files than the ones it opened with.
+- **Core TinyUSB** (informational): each build row's `coreTinyUSB` lists, per copy of the TinyUSB an ESP32 core
+  bundles (`include/arduino_tinyusb`), the headers the build's `.d` files took from it, its `tusb_option.h` version
+  and the lib-builder's `versions.txt` `tinyusb:` ref (null when unreadable). Nothing admits or refuses on it.
 - **DUT identity**: the roster `uid` is the DUT's USB serial; `usb_port` additionally pins its bus port. `no_serial`
   (with `usb_port`) is for firmware that reports no serial (ESP32 under Arduino): the serial-less device at that port.
   `hil_test.py commission` finds and confirms either under the restoration sketch.
