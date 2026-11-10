@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Mechanics of the captain: find the Claude Code sessions in this host's hc terminals, pin each one's identity, and
-tell whether its input line is empty before anything is typed into it.
+tell whether its screen shows Claude Code's input line before anything is typed into it.
 
 Judgment stays in SKILL.md. Every check refuses rather than guesses: an identity it cannot pin or a screen it
 does not recognize is reported, never assumed safe.
@@ -22,7 +22,7 @@ does not recognize is reported, never assumed safe.
                                                  relay it as the human's verdict on a decision
   captain.py verdict --item <id> --revision <N> --verdict <verdict> [--entry <id>]
                                                  record it as that verdict, sending nothing
-  captain.py relay --retry <action>              send a held relay once its session is idle or done, its input empty
+  captain.py relay --retry <action>              send a held relay once its session is idle or done, its input line shown
   captain.py start <checkout> [main|ada] [--name <n>] [--space <id|name>] [--tab <id>] [--entry <id>]
                                                  start a Claude Code session there on the human's message
   captain.py brief --for <msg> | --pending       a target reads what a status request asks, or joins a watch
@@ -175,19 +175,15 @@ def footer_only(lines):
             and bool(CLAUDE_HINTS.search(shown[-1])))
 
 
-def input_state(screen):
-    """'empty', 'text' or 'unknown' for the input line on an `hc read` screen; only 'empty' is safe to type into,
-    since a paste appends to whatever a human has half typed. hc read is plain text, so Claude Code's dim suggestion
-    cannot be told from a draft: any text counts. Claude Code draws its input between the last two full-width rules,
-    the first line led by ❯."""
+def shows_input(screen):
+    """Whether an `hc read` screen ends in Claude Code's input line, not a dialog or anything else. Text already in
+    the line does not matter: a paste appends to it. Claude Code draws its input between the last two full-width
+    rules, the first line led by ❯."""
     lines = [line.rstrip(BLANK) for line in screen.splitlines()]
     rules = [i for i, line in enumerate(lines) if RULE.match(line)]
     if len(rules) < 2 or rules[-1] - rules[-2] < 2 or not footer_only(lines[rules[-1] + 1:]):
-        return 'unknown'
-    head, *rest = (line.lstrip(BLANK) for line in lines[rules[-2] + 1:rules[-1]])
-    if not head.startswith('❯'):
-        return 'unknown'
-    return 'text' if head[1:].strip(BLANK) or any(rest) else 'empty'
+        return False
+    return lines[rules[-2] + 1].lstrip(BLANK).startswith('❯')
 
 
 def read_screen(address):
@@ -634,11 +630,8 @@ def refusal(target):
     """Why target must not be typed into now, or None: re-read right before every submit."""
     if target['status'] not in ASKABLE:
         return f'it is {target["status"]}'
-    state = input_state(read_screen(target['address']))
-    if state != 'empty':
-        return ('its input line shows text, a draft or a suggestion hc read cannot tell apart; '
-                'promptSuggestionEnabled: false in its Claude Code settings turns suggestions off' if state == 'text'
-                else 'its screen is not a recognized input line')
+    if not shows_input(read_screen(target['address'])):
+        return 'its screen is not a recognized input line'
     return None
 
 
@@ -1907,8 +1900,8 @@ def relay_prompt(action):
 def relay(targets, entry, mine, decided=None):
     """Relay the human's message this turn acts on (bound()) to each target, recorded before it is typed; targets as
     resolve() gave them. The transcript is read once for every target, so a message the human sends after that is not
-    seen, and each session is pinned once, so one replaced in its terminal meanwhile is refused. A target busy or with
-    text in its input line gets the relay held, recorded for `retry` to send unchanged. decided, (item, revision,
+    seen, and each session is pinned once, so one replaced in its terminal meanwhile is refused. A target busy or not
+    showing its input line gets the relay held, recorded for `retry` to send unchanged. decided, (item, revision,
     verdict), makes it the human's verdict on that decision: one target, the session that owns it, and the binding
     written into the relay record itself."""
     addresses = list(targets)
@@ -1942,7 +1935,7 @@ def relay(targets, entry, mine, decided=None):
                 append(item('relay', action, captain, target, **fields))
                 append({'type': 'held', 'msg': action, 'why': busy})
                 print(f'{address}: {action} held, {busy}; `relay --retry {action}` sends it once it is idle or done '
-                      'with an empty input line',
+                      'with its input line shown',
                       flush=True)
                 continue
             print(deliver('relay', action, captain, target, relay_prompt(action), **fields), flush=True)
