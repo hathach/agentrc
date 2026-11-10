@@ -541,6 +541,14 @@ async function run(opts = {}) {
       if (typeof opts.verify === 'function') return opts.verify(label)
       return structuredClone(opts.verify ?? { addresses: true, reason: 'verified' })
     }
+    if (label.startsWith('reserved#')) {
+      assert.equal(options.agentType, 'finding-verifier')
+      // opts.inReserved(findingId): whether its fix changes a caller-reserved area, false by default; null a verifier that cannot tell.
+      // opts.reservedVerdicts(ids) the whole list.
+      const ids = JSON.parse(String(prompt).match(/\nFindings: (\[.*\])$/s)[1]).map(x => x.findingId)
+      return conforms(options.schema, { verdicts: opts.reservedVerdicts ? opts.reservedVerdicts(ids)
+        : ids.map(findingId => ({ findingId, reserved: opts.inReserved ? opts.inReserved(findingId) : false, reason: 'stub reading' })) }, label)
+    }
     if (label.startsWith('topic#')) {
       assert.equal(options.agentType, 'finding-verifier')
       // opts.topic(pairId) is whether the topic's issue covers the finding, '<findingId>@<topic>', false by default; opts.topicVerdicts(ids) the whole list.
@@ -4801,6 +4809,71 @@ test('an out-of-scope topic holds a finding its issue covers before the first ha
   const deferred = await run({ reviews: oneValid, args: { autoPush: true, deferrals: [topic, deferral()], state: held.result.state, maxCycles: 3 } })
   assert.equal(deferred.labels.some(l => l.startsWith('topic#')), false)
   assert.equal(deferred.result.pass, true, JSON.stringify(deferred.result.reason))
+})
+
+test('a valid finding whose fix changes a caller-reserved area is held with its proposed fix, never fixed; anything short of a clear no holds (#497)', async () => {
+  // agentrc#496: two pushed repairs changed verdict binding and reopen semantics the caller had reserved for the human.
+  const RESERVED = [{ area: 'verdict binding and closure/reopen semantics', paths: ['src/a.c'], symbols: ['unclose'] }]
+  const two = { findings: [finding({ fixHint: 'make unclose() reopen too' }), finding({ commentId: 2, file: 'src/b.c' })], replies: [], bots: 'reviewed' }
+  const mixed = await run({ reviews: two, args: { autoPush: true, maxCycles: 1, reserved: RESERVED }, inReserved: (id) => id === '1#1' })
+  const prompt = mixed.calls.find(c => c.label === 'reserved#1').prompt
+  assert.ok(prompt.includes(JSON.stringify(RESERVED)) && prompt.includes('"proposedFix":"make unclose() reopen too"'), prompt)
+  const fixes = mixed.calls.filter(c => c.label.startsWith('fix:'))
+  assert.ok(fixes.length > 0 && fixes.every(c => c.prompt.includes('src/b.c:1') && !c.prompt.includes('src/a.c:1')), 'only the finding outside the area is fixed')
+  assert.ok(!fixes.some(c => c.prompt.includes('make unclose() reopen too')), 'the held one reaches no writer')
+  const row = mixed.result.rollup.rows.find(r => r.findingId === '1#1')
+  assert.deepEqual([row.state, row.hold, row.proposedFix], ['held', 'in a caller-reserved area: stub reading', 'make unclose() reopen too'])
+  const alone = { findings: [two.findings[0]], replies: [], bots: 'reviewed' }
+  const held = await run({ reviews: alone, args: { autoPush: true, maxCycles: 3, reserved: RESERVED }, inReserved: () => true })
+  assert.equal(held.labels.some(l => /^(fix:|push#|resolve#)/.test(l)), false)
+  assert.equal(held.result.reason, 'held-awaiting-caller')
+  assert.deepEqual(held.result.held, [{ findingId: '1#1', commentId: 1, reason: 'in a caller-reserved area: stub reading', proposedFix: 'make unclose() reopen too' }])
+  assert.deepEqual(held.result.state.reserved, RESERVED)
+  // The state keeps the areas: a resume that names none still holds the finding.
+  // Only the caller lifts it: a resume over the same areas keeps the hold unjudged, whatever a verifier would say now.
+  const resumed = await run({ reviews: alone, args: { autoPush: true, maxCycles: 4, state: held.result.state }, inReserved: () => false })
+  assert.equal(resumed.labels.some(l => /^(reserved#|fix:|commit#|push#|resolve#)/.test(l)), false, resumed.labels.join(', '))
+  assert.deepEqual(resumed.result.held, held.result.held)
+  // Another hold meanwhile (an unsettled dismissal) does not end the reservation: valid again, it is still held (Codex re-review).
+  const dismissed = { findings: [invalidFinding({ fixHint: alone.findings[0].fixHint })], replies: [], bots: 'reviewed' }
+  const other = await run({ reviews: dismissed, args: { autoPush: true, maxCycles: 4, state: held.result.state },
+    challenge: { verdicts: [{ id: 0, verdict: 'unknown', reason: 'cannot tell' }] } })
+  assert.match(other.result.state.holds[0][1].reason, /^the challenger could not settle it/)
+  const again = await run({ reviews: alone, args: { autoPush: true, maxCycles: 5, state: other.result.state }, inReserved: () => false })
+  assert.equal(again.labels.some(l => /^(reserved#|fix:|commit#|push#|resolve#)/.test(l)), false, again.labels.join(', '))
+  assert.deepEqual(again.result.held, held.result.held)
+  // A refused deferral keeps the reservation: the next launch over the same areas still holds the finding (Codex round 3).
+  const refused = await run({ reviews: alone, args: { autoPush: true, maxCycles: 4, state: held.result.state, deferrals: [deferral({ commentDigest: 'stale' })] }, inReserved: () => false })
+  assert.equal(refused.result.reason, 'deferral-refused')
+  const after = await run({ reviews: alone, args: { autoPush: true, maxCycles: 5, state: refused.result.state }, inReserved: () => false })
+  assert.equal(after.labels.some(l => /^(reserved#|fix:|commit#|push#|resolve#)/.test(l)), false, after.labels.join(', '))
+  assert.deepEqual(after.result.held, held.result.held)
+  // Changed areas end the reservations at once, a launch that stops before judging included; the same areas keep them.
+  for (const [areas, kept] of [[[{ area: 'the queue --json v1 contract' }], undefined], [undefined, [['1#1', held.result.held[0].reason]]]]) {
+    const ended = await run({ reviews: alone, args: { autoPush: true, maxCycles: 4, state: held.result.state, ...(areas ? { reserved: areas } : {}) },
+      preflight: { prState: 'MERGED' } })
+    assert.equal(ended.result.reason, 'pr-merged')
+    assert.deepEqual(ended.result.state.reservations, kept, JSON.stringify(areas))
+  }
+  // Narrowed areas are judged again, and a deferral releases the finding from them.
+  const narrowed = await run({ reviews: alone, args: { autoPush: true, maxCycles: 4, state: held.result.state, reserved: [{ area: 'the queue --json v1 contract' }] }, inReserved: () => false })
+  assert.ok(narrowed.labels.includes('reserved#2') && narrowed.labels.some(l => l.startsWith('fix:')), narrowed.labels.join(', '))
+  const deferred = await run({ reviews: alone, args: { autoPush: true, maxCycles: 4, state: held.result.state, deferrals: [deferral()] }, inReserved: () => true })
+  assert.equal(deferred.labels.some(l => /^(reserved#|fix:)/.test(l)), false)
+  assert.deepEqual(deferred.result.state.holds, [])
+  // An unsure or dead verifier holds too, as does a list naming one finding twice and another not at all.
+  const twice = (ids) => [ids[0], ids[0]].map(findingId => ({ findingId, reserved: false, reason: 'twice' }))
+  for (const over of [{ inReserved: () => null }, { throwOn: 'reserved#' }, { reservedVerdicts: twice, reviews: two }]) {
+    const { labels, result } = await run({ reviews: oneValid, args: { autoPush: true, maxCycles: 1, reserved: RESERVED }, ...over })
+    assert.equal(labels.some(l => l.startsWith('fix:')), false, JSON.stringify(over))
+    assert.equal(result.state.holds.length, (over.reviews || oneValid).findings.length)
+    assert.ok(result.state.holds.every(([, h]) => /^not judged outside the caller-reserved areas/.test(h.reason)))
+  }
+  // Without areas nothing is asked, and a malformed one refuses the launch.
+  assert.equal((await run({ reviews: oneValid })).labels.some(l => l.startsWith('reserved#')), false)
+  for (const bad of [[{ area: '' }], [{ area: 'x', paths: ['../a'] }], [{ area: 'x', why: 'y' }], [{ area: 'x' }, { area: 'x' }], 'x']) {
+    await assert.rejects(run({ args: { reserved: bad } }), /reserved must be/, JSON.stringify(bad))
+  }
 })
 
 test('a green PR whose owed findings are all held for the caller stops at once; a hold another cycle may lift re-arms', async () => {

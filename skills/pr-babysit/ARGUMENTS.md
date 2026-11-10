@@ -89,6 +89,15 @@ A key not listed here throws before anything runs.
   never committed or published; an adopted chain may carry one only in commits
   the PR already has, in a merge from the base that takes either parent's
   version of it, or as `adoptProtected` or `adoptReviewedProtected` permits.
+- `reserved`: `[{ area, paths?, symbols? }]`, design areas the caller keeps
+  for its own decision, one entry per `area` (what it covers, in words), with
+  any plain repo-relative `paths` and `symbols` in them that help place it. A
+  finding-verifier judges each valid finding's fix against them before any
+  writer runs: one whose fix would change an area, or that it cannot judge
+  outside them, is held for the caller like a caller hold, never fixed or
+  published, and its row and the `held-awaiting-caller` stop carry its
+  `proposedFix`. The caller lifts a hold by deferring the finding or narrowing
+  the areas. Kept in the state: a launch that names none keeps the last given.
 - `generated`: regex over repo-relative paths a fixer's build regenerates; a
   plain modification to one is admitted into the commit on the caller's word
   that the repository hooks validate it.
