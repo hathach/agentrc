@@ -2195,6 +2195,11 @@ def start(arg, account, name, space, tab, entry, mine, task=False):
             print(f'{msg}: first task not relayed, it was refused before anything was recorded; a task for '
                   f'{address} needs a new message of theirs')
             return 1
+        except hc.Error as e:
+            # only relay()'s reads before it records raise this (hc get, hc read); hc send returns its outcome
+            print(f'{msg}: first task not relayed, {e}; nothing was recorded for it: once `list` still shows '
+                  f'{session["session"]} there, `relay {address} --entry {uid}` sends it')
+            return 1
         return first_task(msg, address, uid, session, why)
     elif task:
         print(f'{msg}: first task not relayed, the session is not verified' + (

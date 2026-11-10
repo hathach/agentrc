@@ -3344,6 +3344,17 @@ class StartTest(RelayCase):
         self.assertIn('first task not relayed, it was refused before anything was recorded', out)
         self.assertNotIn('--entry', out)
 
+    def test_a_task_whose_screen_read_fails_exits_1_and_names_its_relay(self):
+        self.say('start proj and fix the lint errors')
+        self.terminals['t9'] = {**pinned('t9'), 'created': 99, 'cwd': self.root, 'session': 's-new', 'pid': 77,
+                                'started': 5}
+        with mock.patch.object(captain, 'read_screen', side_effect=captain.hc.Error('hc read t9 failed: gone')):
+            code, out = self.start(task=True)
+        self.assertEqual(code, 1)
+        self.assertNotIn('relay', self.types())
+        self.assertIn('first task not relayed, hc read t9 failed: gone; nothing was recorded for it', out)
+        self.assertIn('`relay t9 --entry u-1`', out)
+
     def test_a_failed_start_offers_no_relay(self):
         self.say('start proj and fix the lint errors')
         self.pinned_account = 'ada'
