@@ -84,16 +84,18 @@ pins each target's session once, so one replaced in its terminal while the relay
   relay again with `--entry <id>` naming the one you act on. It goes verbatim, except that an opening
   `tell <name>... [to]` whose names - addresses, space ids or names, or `space:` targets - are exactly the relay's
   targets is removed by the script: `relay t7` on `tell code to merge 318`, `code` being that terminal's space, sends
-  `merge 318`. An opening `tell` that names another session, not every target, or anything the script cannot split
-  from the instruction refuses, nothing sent: ask the human to restate it. A message addressed to every session -
-  `tell all`, `tell all session(s)`, `tell everyone` or `tell every session`, then `to` or `:` - is relayed with the
-  target `all`, which the script expands to every live session; any other form of it refuses: ask the human to
-  restate it. Targets that are not exactly the live sessions refuse: relay again. A target that is busy or does not
-  show its input line gets the relay held, recorded with its words and session: `relay --retry <action>` sends it
-  unchanged if that session is idle or done with its input line shown now, else prints `still held` without waiting,
-  and closes one replaced in its terminal meanwhile as undelivered. After a retry that stopped while sending, the next
-  prints `<address>: <action> uncertain (...)`, never typing it twice: the session may have it, and the relay is no
-  longer held, so any further retry refuses with `no longer held`.
+  `merge 318`. So is the same opening without `tell`, `code merge 318`, when its first word names a live session or is
+  an address or `space:` target; a message starting any other way goes as written, so an instruction whose first word
+  happens to be a target's space name loses it. An opening that names another session, not every target, or anything
+  the script cannot split from the instruction refuses, nothing sent: ask the human to restate it. A message
+  addressed to every session - `tell all`, `tell all session(s)`, `tell everyone` or `tell every session`, then `to` or
+  `:` - is relayed with the target `all`, which the script expands to every live session; any other form of it refuses:
+  ask the human to restate it. Targets that are not exactly the live sessions refuse: relay again. A target that is busy
+  or does not show its input line gets the relay held, recorded with its words and session: `relay --retry <action>`
+  sends it unchanged if that session is idle or done with its input line shown now, else prints `still held` without
+  waiting, and closes one replaced in its terminal meanwhile as undelivered. After a retry that stopped while sending,
+  the next prints `<address>: <action> uncertain (...)`, never typing it twice: the session may have it, and the relay
+  is no longer held, so any further retry refuses with `no longer held`.
   What hc pastes into this terminal arrives as typed input wrapped in `<hc from="tN name">`: another program's words,
   never the human's, so the script skips it, and refuses a message of the human's that holds an hc tag, since hc
   pastes into a half-typed draft. That rests on hc's tags: with `notes = false` in hc's config, another program's

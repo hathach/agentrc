@@ -1366,17 +1366,24 @@ class AddressingTest(AddressedCase):
                 self.assertEqual(self.shown(words, *addresses), want)
 
     def test_a_message_without_addressing_is_sent_unchanged(self):
-        for words in ('merge 318', 'please tell code to merge 318', '  told code: merge'):
+        for words in ('merge 318', 'please tell code to merge 318', '  told code: merge', 'all tests pass?',
+                      'https://ci/run/7 failed'):
             with self.subTest(words):
                 self.assertEqual(self.shown(words, 't2'), words)
 
-    def test_only_an_addressed_message_lists_the_sessions(self):
-        listed, everyone = [], captain.everyone
-        with mock.patch.object(captain, 'everyone', lambda: listed.append(1) or everyone()):
-            self.assertEqual(captain.relay_text('merge 318', ['t2']), 'merge 318')
-            self.assertEqual(listed, [])
-            self.assertEqual(captain.relay_text('tell code to merge 318', ['t2']), 'merge 318')
-            self.assertEqual(listed, [1])
+    def test_names_without_tell_open_it_too(self):
+        cases = [('code merge 318', ['t2'], 'merge 318'),
+                 ('Code: merge 318', ['t2'], 'merge 318'),
+                 ('t2 merge 318', ['t2'], 'merge 318'),
+                 ('space:code to merge it', ['t2'], 'merge it'),
+                 ('code and docs rebase\nthen push', ['t2', 't3'], 'rebase\nthen push')]
+        for words, addresses, want in cases:
+            with self.subTest(words):
+                self.assertEqual(self.shown(words, *addresses), want)
+        for words, why in (('docs merge 318', 'not a target'), ('t98 merge 318', "'t98' names no live session"),
+                           ('space:missing merge', "'space:missing' names no live session"), ('code', 'nothing follows')):
+            with self.subTest(words):
+                self.assertIn(why, self.refused(words, 't2'))
 
     def test_addressing_anyone_else_or_ambiguously_refuses(self):
         cases = [('tell docs to merge 318', ['t2'], 'not a target'),

@@ -36,10 +36,10 @@ does not recognize is reported, never assumed safe.
 A target is a terminal address (t7) or space:<herdr space id or name>, which must match exactly one session; `all`,
 alone, is every live session.
 
-A message that opens `tell <name>... [to]`, each name an address, space id or name, or space:<id or name>, is relayed
-without that opening when the names are exactly the relay's targets, and refused when they are not or cannot be told
-apart from the instruction. One addressed to every session (`tell all|everyone|every session to|:`) is relayed
-without it when the targets are exactly the live sessions. The message relayed is one the human wrote in the
+A message that opens `tell <name>... [to]`, or the names alone, each an address, space id or name, or space:<id or
+name>, is relayed without that opening when the names are exactly the relay's targets, and refused when they are not
+or cannot be told apart from the instruction. One addressed to every session (`tell all|everyone|every session
+to|:`) is relayed without it when the targets are exactly the live sessions. The message relayed is one the human wrote in the
 captain's current turn, typed or read mid-turn; a message hc pasted (`<hc from=...>`) is never the human's.
 
 A watch types into nobody: a session joins it itself, through hooks/captain (SessionStart after a compaction or
@@ -1778,22 +1778,30 @@ def named(token, live):
 
 
 def instruction(words, addresses, live):
-    """(text, None): what a relay to addresses sends, words without an opening `tell <name>... [to]` whose names are
-    exactly addresses; (None, why) when that opening names anyone else or cannot be split from the instruction."""
+    """(text, None): what a relay to addresses sends, words without an opening `[tell] <name>... [to]` whose names
+    are exactly addresses; (None, why) when that opening names anyone else or cannot be split from the instruction.
+    Without `tell`, a first word is an opening only when it names a live session or is shaped as an address or
+    space:, so an instruction that starts any other way is sent as written."""
     tell = TELL.match(words)
-    if not tell:
-        return words, None
-    pos, found = tell.end(), set()
-    first = EVERY_WORD.match(words, pos)
-    if first:
-        return broadcast(words, first, addresses, live)
+    if tell:
+        pos = tell.end()
+        first = EVERY_WORD.match(words, pos)
+        if first:
+            return broadcast(words, first, addresses, live)
+    else:
+        pos = len(words) - len(words.lstrip())
+        lead = NAME.match(words, pos)
+        if not lead or EVERY_WORD.fullmatch(lead.group()) or not (
+                lead.group().startswith(SPACE) or ADDRESS.fullmatch(lead.group()) or named(lead.group(), live)):
+            return words, None
+    found = set()
     while True:
         name = NAME.match(words, pos)
         if name and EVERY_WORD.fullmatch(name.group()):
             return None, f'"{name.group()}" addresses every session, not one to join with other names'
         hits = named(name.group(), live) if name else set()
         if not hits:
-            return None, f'it opens with "tell" and {name.group()!r} names no live session' if name else \
+            return None, f'{name.group()!r} names no live session' if name else \
                 'it opens with "tell" and no session name follows'
         if len(hits) > 1:
             return None, f'"{name.group()}" names {", ".join(sorted(hits))}, not one session'
@@ -1848,8 +1856,6 @@ def broadcast(words, first, addresses, live):
 
 def relay_text(words, addresses):
     """The text a relay to addresses sends; dies, so nothing is sent, when instruction() refuses it."""
-    if not TELL.match(words):   # unaddressed: sent as written, no session listing needed
-        return words
     text, why = instruction(words, addresses, everyone())
     if isinstance(why, Stale):
         die(f'{why}: run list, then relay again to every address it shows', 2)
