@@ -26,7 +26,8 @@ Everything below that says "the build contract" or "the HIL contract" means thos
    tag, from before the record, bootstraps from its newest one: `--base <tag> --base-kind bootstrap`. A submodule pin
    change in the growth is a dependency delta to review, not an audit of the dependency. Run it, and `check`, with
    push access to the record's repository: without it only a user-owned repository's owner counts as a validation
-   report's writer, so an organisation's record reads provisional.
+   report's writer, so an organisation's record reads provisional. Its GitHub reads never prompt: git reads of a
+   private repository need a credential helper (`gh auth setup-git`), as a `GIT_ASKPASS` program is not used.
 2. Usage, where transcripts exist: `python3 "$A/usage.py" --run $RUN --claude-root ~/.claude/projects
    [--claude-root <other config>/projects] --codex-root ~/.codex/sessions --out $RUN/usage.json`. It measures
    maintainer tooling on this host only, never deployed firmware or external API use; zero is a lead, never proof.
