@@ -920,6 +920,7 @@ class Carry(unittest.TestCase):
         self.assertEqual(self.one(['x/new.h'])['reason'], "uncommitted changes: ['x/new.h']")
         self.assertTrue(self.one(['a.c'])['eligible'], 'dirt elsewhere does not touch these paths')
 
+    @unittest.skipIf(sys.platform == 'win32', 'Windows has no file named by a space alone')
     def test_a_name_of_only_whitespace_is_still_a_change(self):
         self.write({' ': 'x\n'})
         self.assertEqual(self.one([' '])['reason'], "uncommitted changes: [' ']")
