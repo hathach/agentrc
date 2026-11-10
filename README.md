@@ -180,7 +180,7 @@ Agent collaboration and PRs:
 | [`pr-babysit`](skills/pr-babysit/SKILL.md) | the fact collectors the pr-babysit workflow runs before it commits a fix | `preflight.py --pr N`, `hooks.py <path>...` |
 | [`pr-review`](skills/pr-review/SKILL.md) | review someone else's PR in one request, such as `/pr-review N auto-post boards: <ids>`: pin it, run the pr-review workflow on the boards named (none by default), leave a pending review for you to submit (or submit it under auto-post); re-review after a push | `prepare.py --pr N` |
 | [`ci-rerun`](skills/ci-rerun/SKILL.md) | read a failed CircleCI job's or Read the Docs build's log, rerun it once after an infra failure | `circleci.py log <job>`, `rerun <job>...`, `rtd.py log <url>` |
-| [`headless-chief`](skills/headless-chief/SKILL.md) | launch a headless `chief` and follow its status lines while it runs, its report when it exits | `chief_run.py --out <dir> --worktree <wt> --task-file <task>` |
+| [`headless-chief`](skills/headless-chief/SKILL.md) | launch a headless `chief` and follow its status lines while it runs, its report when it exits | `chief_run.py --out <dir> --worktree <wt> --task-file <task> --task <key>` |
 | [`repo-audit`](skills/repo-audit/SKILL.md) | audit any repository since its last audit: range, growth, usage, test and firmware evidence, whole-range review, then the record `.claude/audit.json` | `audit.py start --repo . --head origin/main` |
 | [`worktree-remove`](skills/worktree-remove/SKILL.md) | remove a worktree when its task is done, run from outside it: check it, gate on pending follow-ups and PR state, close the hc terminals working in it when run from one, then git removes it and `scripts/worktree_children.py` its clean `<name>--*` siblings and its branches whose commits are on their remote or a PR head | `worktree_remove.py [PATH] --dry-run [--pending <item>]`, `--proceed <token>` |
 
@@ -342,8 +342,9 @@ the review scope: the whole PR, or takeover-only (earlier PR commits are context
 the takeover HEAD is the task base) for a task limited to the repairs it
 commissions; an offer to launch names that choice when the human has not, and an
 unspecified review scope defaults to the whole PR; ask only when the PR,
-repository or worktree is ambiguous. A relaunch for the same PR task copies
-the grant verbatim from the earlier launch task, without asking again, until
+repository or worktree is ambiguous. A relaunch for the same PR task passes
+the same `--task` and copies the grant verbatim from the earlier launch task,
+without asking again, until
 the task is done, the PR changes, or the human narrows or withdraws it; a
 later restriction rides along verbatim. A merge is granted only by the
 human's own words asking to merge that PR, under chief's merge exception: the

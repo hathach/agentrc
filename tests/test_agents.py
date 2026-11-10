@@ -219,7 +219,7 @@ class AgentFiles(unittest.TestCase):
         self.assertIn('a fix note and a resolve on each of our threads its pushed repair fixed (`post.py --fixed`)', rules)
         self.assertIn('Neither grants a merge, an approval, a dismissal or a force-push.', rules)
         readme = ' '.join((AGENTS.parent / 'README.md').read_text().split())
-        self.assertIn('A relaunch for the same PR task copies the grant verbatim from the earlier launch task, without asking again, '
+        self.assertIn('A relaunch for the same PR task passes the same `--task` and copies the grant verbatim from the earlier launch task, without asking again, '
                       'until the task is done, the PR changes, or the human narrows or withdraws it', readme)
 
     def test_follow_up_issues_ride_a_push_grant_within_bounds(self):
