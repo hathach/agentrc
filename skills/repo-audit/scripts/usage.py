@@ -8,8 +8,9 @@ DIR is audit.py start's run directory (repository, since, until). At least one r
 filtered by their own timestamps, each tool call is counted once (Claude repeats calls in api-request records;
 those are skipped), and a command is parsed, not grepped: only a script in command position counts as an
 invocation, after sudo/env/timeout/interpreter prefixes, literal `VAR=path` assignments, `cd` and `ssh` are
-resolved; heredoc bodies and `-c` code are skipped. A path counts for the repository when it resolves (installed
-symlinks included) into one of its worktrees; a path that names a repository file but does not resolve there
+resolved; heredoc bodies, `-c` code and `command -v` are skipped, and a prefix option that changes what runs or where
+(abbreviated long options included) leaves the command unknown. A path counts for the repository when it resolves
+(installed symlinks included) into one of its worktrees; a path that names a repository file but does not resolve there
 (a removed worktree, another host) is reported as unattributed; a same-name file elsewhere never counts.
 
 stdout holds aggregates only: repository file names, the argparse vocabulary of each script (subcommands and long
@@ -41,9 +42,25 @@ OPERAND = {'exec': 'a', 'sudo': 'CDghpRrTtUu', 'env': 'aCSu', 'timeout': 'ks', '
 LONG_OPERAND = {'--argv0', '--chdir', '--close-from', '--group', '--host', '--prompt', '--chroot', '--role', '--type',
                 '--command-timeout', '--other-user', '--user', '--unset', '--split-string', '--kill-after',
                 '--signal', '--adjustment', '--input', '--output', '--error'}
-# a prefix's options that change what runs or where (a split command line, another directory, root or host)
-REDIRECTING = {'env': 'CS', 'sudo': 'DRh'}
-LONG_REDIRECTING = {'env': {'--chdir', '--split-string'}, 'sudo': {'--chdir', '--chroot', '--host'}}
+# every long option of a getopt_long prefix, which takes any unambiguous abbreviation of one; the shell's exec,
+# command and time take none
+LONG_OPTIONS = {
+    'env': {'--argv0', '--ignore-environment', '--null', '--unset', '--chdir', '--split-string', '--block-signal',
+            '--default-signal', '--ignore-signal', '--list-signal-handling', '--debug', '--help', '--version'},
+    'sudo': {'--askpass', '--background', '--bell', '--close-from', '--chdir', '--preserve-env', '--edit', '--group',
+             '--set-home', '--help', '--host', '--login', '--remove-timestamp', '--reset-timestamp', '--list',
+             '--non-interactive', '--preserve-groups', '--prompt', '--chroot', '--role', '--stdin', '--shell',
+             '--type', '--command-timeout', '--other-user', '--user', '--version', '--validate'},
+    'timeout': {'--foreground', '--kill-after', '--preserve-status', '--signal', '--verbose', '--help', '--version'},
+    'nice': {'--adjustment', '--help', '--version'},
+    'stdbuf': {'--input', '--output', '--error', '--help', '--version'},
+    'setsid': {'--ctty', '--fork', '--wait', '--help', '--version'},
+    'nohup': {'--help', '--version'},
+}
+# a prefix's options that change what runs or where (a split command line, another directory, root, host or a
+# login shell in the target's home)
+REDIRECTING = {'env': 'CS', 'sudo': 'DRhi'}
+LONG_REDIRECTING = {'env': {'--chdir', '--split-string'}, 'sudo': {'--chdir', '--chroot', '--host', '--login'}}
 READERS = {'cat', 'sed', 'head', 'tail', 'less', 'grep', 'rg', 'wc', 'vim', 'vi', 'nano', 'diff', 'ls', 'awk',
            'chmod', 'cp', 'mv', 'rm', 'git', 'stat', 'file', 'readlink', 'realpath', 'test', '['}
 OPERATORS = {';', '&', '|', '&&', '||', '(', ')', ';;', '|&'}
@@ -382,11 +399,20 @@ def segments(command):
     return [(b, w, ops[i:]) for b, w, i in segs]
 
 
+def long_option(prefix, opt):
+    """The long option of prefix that opt names, exactly or as an unambiguous abbreviation; None when it names none
+    or several, which getopt_long refuses."""
+    name = opt.split('=', 1)[0]
+    known = LONG_OPTIONS.get(prefix, set())
+    hits = [name] if name in known else [k for k in known if k.startswith(name)]
+    return hits[0] if len(hits) == 1 else None
+
+
 def takes_operand(prefix, opt):
     """Whether prefix's option word opt leaves its operand to the next word: a short cluster ending in an option
     that takes one, or a long option that takes one written without =."""
     if opt.startswith('--'):
-        return opt in LONG_OPERAND and prefix in OPERAND
+        return '=' not in opt and long_option(prefix, opt) in LONG_OPERAND and prefix in OPERAND
     if not opt.startswith('-'):   # a duration or niceness
         return False
     letters = opt[1:]
@@ -394,12 +420,27 @@ def takes_operand(prefix, opt):
     return first == len(letters) - 1
 
 
-def redirects(prefix, opt):
-    """Whether prefix's option word opt is one of REDIRECTING, alone, last in a cluster or with its operand joined."""
+def option_effect(prefix, opt):
+    """What prefix's option word opt does to the command after it: 'redirect' (what runs, or where, is not what the
+    words say, or an option the prefix refuses), 'shell' (a shell runs it, whose startup files may cd), 'lookup'
+    (only looked up, never run) or None. A short cluster's letters count up to the first that takes an operand."""
+    if opt == '--' or not opt.startswith('-'):
+        return None
     if opt.startswith('--'):
-        return opt.split('=', 1)[0] in LONG_REDIRECTING.get(prefix, ())
-    first = next((c for c in opt[1:] if c in OPERAND.get(prefix, '')), None) if opt.startswith('-') else None
-    return first is not None and first in REDIRECTING.get(prefix, '')
+        name = long_option(prefix, opt)
+        if name is None or name in LONG_REDIRECTING.get(prefix, ()):
+            return 'redirect'
+        return 'shell' if (prefix, name) == ('sudo', '--shell') else None
+    if prefix == 'time':        # the keyword takes only -p; GNU time's -f/-o operand the keyword would run
+        return None if opt == '-p' else 'redirect'
+    cluster = opt[1:]
+    first = next((i for i, c in enumerate(cluster) if c in OPERAND.get(prefix, '')), None)
+    cluster = cluster if first is None else cluster[:first + 1]
+    if any(c in REDIRECTING.get(prefix, '') for c in cluster):
+        return 'redirect'
+    if prefix == 'sudo' and 's' in cluster:
+        return 'shell'
+    return 'lookup' if prefix == 'command' and set(cluster) & set('vV') else None
 
 
 def may_run_script(seg):
@@ -463,15 +504,20 @@ def parse(command, tally, ctx, cwd, env, remote=False):
                 elif '=' in t and background:
                     env.pop(t.split('=', 1)[0], None)
             continue
-        whole, redirected = seg, False
+        whole, effects = seg, set()
         while seg and (seg[0] in PREFIXES or re.fullmatch(r'\w+=.*', seg[0])):
             prefix, seg = seg[0], seg[1:]
             while seg and (seg[0].startswith('-') or re.fullmatch(r'\d+[smh]?', seg[0])):
-                redirected |= redirects(prefix, seg[0])
+                effects.add(option_effect(prefix, seg[0]))
+                if seg[0] == '--':
+                    seg = seg[1:]
+                    break
                 seg = seg[1 + takes_operand(prefix, seg[0]):]
-        if redirected:      # never followed: what runs, or where, is not what the words say
+        if 'redirect' in effects:      # never followed: what runs, or where, is not what the words say
             if may_run_script(whole):
                 tally.unknown['unparsed_prefix'] += 1
+            continue
+        if 'lookup' in effects:
             continue
         if not seg:
             continue
@@ -523,6 +569,9 @@ def parse(command, tally, ctx, cwd, env, remote=False):
             tally.unknown['unresolved_variable'] += 1
             continue
         if '/' not in path and not path.endswith(('.py', '.sh', '.mjs')):
+            continue
+        if 'shell' in effects and not shell_abs(path):
+            tally.unknown['unparsed_prefix'] += 1
             continue
         if not shell_abs(path) and cwd is None and not remote:
             tally.unknown['unknown_cwd'] += 1       # a relative script after a cd whose effect is unknown

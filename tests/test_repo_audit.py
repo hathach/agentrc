@@ -1415,16 +1415,32 @@ class Usage(unittest.TestCase):
                     f'env --chdir=/ python3 {rel} send', f'sudo -D / python3 {rel} send',
                     f'sudo -ED/ python3 {rel} send', f'sudo --chdir=/ python3 {rel} send',
                     f'sudo -R /mnt python3 {s} send', f'sudo --chroot /mnt python3 {s} send',
-                    f'sudo -h host python3 {s} send', f'sudo --host=host python3 {s} send']
+                    f'sudo -h host python3 {s} send', f'sudo --host=host python3 {s} send',
+                    # GNU getopt_long's abbreviations, and an ambiguous one it refuses
+                    f'env --chd=/ python3 {rel} send', f'env --c / python3 {rel} send',
+                    f"env --spl={split} {s} send", f'sudo --chd / python3 {rel} send',
+                    f'sudo --chr=/mnt python3 {s} send', f'sudo --ho=host python3 {s} send',
+                    f'sudo --ch / python3 {rel} send', f'env --nosuch python3 {s} send',
+                    # a login shell starts in the target's home; a shell with a relative path; GNU time's operand
+                    f'sudo -i python3 {rel} send', f'sudo -Ei python3 {s} send', f'sudo --login python3 {rel} send',
+                    f'sudo --log python3 {rel} send', f'sudo -s python3 {rel} send', f'sudo --sh ./{rel} send',
+                    f'time -f %e python3 {s} send', f'time -o {s} python3 -c 1', f'sudo time --output=x {s} send']
         records = [r for i, c in enumerate(commands) for r in (use(f'x{i}', 'Bash', {'command': c}, cwd=repo),
                                                                result(f'x{i}'))]
         claude(self.root / 'p' / 's1.jsonl', records + [
             use('a', 'Bash', {'command': f'sudo -Eu root env -u X python3 {rel} send'}, cwd=repo), result('a'),
+            # abbreviations that change nothing, -s with an absolute path, the keyword's -p, a lookup
+            use('b', 'Bash', {'command': f'sudo --us root env --un=X timeout --sig KILL 5 {s} send'}), result('b'),
+            use('c', 'Bash', {'command': f'sudo -s python3 {s} send'}), result('c'),
+            use('d', 'Bash', {'command': f'time -p python3 {s} send'}), result('d'),
+            use('e', 'Bash', {'command': f'command -v {s}'}), result('e'),
+            use('f', 'Bash', {'command': f'command -pv python3 {s}'}), result('f'),
+            use('g', 'Bash', {'command': f'sudo -- python3 {s} send'}), result('g'),
         ])
         self.usage()
         agg = json.loads(self.out.read_text())
         t = agg['scripts']['skills/tool/scripts/tool.py']
-        self.assertEqual((t['invoke'], t['ok'], t['subcommands']), (1, 1, {'send': 1}))
+        self.assertEqual((t['invoke'], t['ok'], t['subcommands']), (5, 5, {'send': 5}))
         self.assertEqual(agg['unknown'], {'unparsed_prefix': len(commands)})
 
     def test_installed_links_attribute_and_foreign_paths_do_not(self):
