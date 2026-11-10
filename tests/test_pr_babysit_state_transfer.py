@@ -75,6 +75,23 @@ class StateTransferTest(unittest.TestCase):
         code, out = self.run_script(self.file)
         self.assertEqual((code, out), (0, {'digest': 'cd1574aa', 'state': STATE}))
 
+    def test_a_pinned_checkout_dir_is_read_against_this_worktree_and_sealed_apart_from_the_state(self):
+        repo = self.dir / 'repo'
+        subprocess.run(['git', 'init', '-q', str(repo)], check=True, env=git_env())
+        (repo / 'sub').mkdir()
+        other = self.dir / 'other'
+        subprocess.run(['git', 'init', '-q', str(other)], check=True, env=git_env())
+        for pinned, cwd, same in ((str(repo), repo / 'sub', True), (str(other), repo, False), (str(self.dir / 'gone'), repo, False),
+                                  (str(repo), self.dir, False)):
+            state = {**STATE, 'config': {'checkoutDir': pinned}}
+            done = subprocess.run([sys.executable, str(SCRIPT), self.saved({'result': {'state': state}}, 'pinned.output')], cwd=cwd,
+                                  capture_output=True, text=True, encoding='utf-8', env=git_env())
+            line = json.loads(done.stdout.splitlines()[-1])
+            self.assertEqual((line['state'], line['checkout']), (state, transfer.sealed({'dir': pinned, 'same': same})), (pinned, cwd))
+        for config in ({'checkoutDir': '.'}, {}, None):
+            _, line = self.run_script(self.saved({'result': {'state': {**STATE, 'config': config}}}, 'here.output'))
+            self.assertNotIn('checkout', line, config)
+
     @unittest.skipUnless(shutil.which('node'), 'needs Node.js')
     def test_the_emitted_module_loads_as_the_line_with_its_own_path_and_stdout_only_names_it(self):
         at = self.dir / 'state.1.js'

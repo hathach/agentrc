@@ -34,12 +34,13 @@ if (pythonArg !== null && (typeof pythonArg !== 'string' || !pythonArg.trim() ||
   throw new Error('python must be the interpreter every script runs under, a path or command name on one line')
 }
 let PY = pythonArg === null ? 'python3' : shq(pythonArg)
-const checkoutDir = args.checkoutDir || '.'
+let checkoutDir = args.checkoutDir || '.'
 if (typeof checkoutDir !== 'string') {
   throw new Error('checkoutDir must be a path string')
 }
-const IN_CHECKOUT = checkoutDir === '.' ? 'The working tree IS the PR checkout. '
-  : `The PR branch checkout is at ${checkoutDir} - run every git/build/file command there, not in the session directory. `
+const inCheckout = (dir) => dir === '.' ? 'The working tree IS the PR checkout. '
+  : `The PR branch checkout is at ${dir} - run every git/build/file command there, not in the session directory. `
+let IN_CHECKOUT = inCheckout(checkoutDir)
 if (args.maxCycles != null && (!Number.isInteger(args.maxCycles) || args.maxCycles < 1)) {
   throw new Error('maxCycles must be an integer >= 1')
 }
@@ -310,6 +311,9 @@ const STATE_SCRIPT = `${AGENTRC}/skills/pr-babysit/scripts/state_transfer.py`
 // state_transfer.py's MAX, over its own measure: compact JSON with every non-ASCII UTF-16 unit escaped as \uXXXX.
 const STATE_MAX = 64 * 1024
 const stateBytes = (st) => { const s = JSON.stringify(st); return s.length + 5 * (s.match(/[^\x00-\x7e]/g) || []).length }
+// A stateRef load's reading of whether the session directory is the state's checkoutDir: state_transfer.py's sealed
+// checkout, null when its line has none; undefined for an inline state.
+let loadedCheckout
 if (args.stateRef != null) {
   const ref = args.stateRef
   // The path goes into a shell command, single-quoted; a Windows one (C:\...) in its C:/... spelling. A leading // is
@@ -329,8 +333,10 @@ if (args.stateRef != null) {
   if (!got.line) got = await load('state:load.retry')
   const { line, why } = got
   const st = stateOf(got)
-  if (st) args.state = st
-  else {
+  if (st) {
+    args.state = st
+    loadedCheckout = line.checkout ?? null
+  } else {
     const detail = !line ? why : line.error ? `state_transfer.py: ${line.error}` : 'the loaded state does not match stateRef.digest'
     log(`state: ${detail}; the output file is untouched`)
     return { pass: false, status: 'blocked', reason: 'state-transfer-failed', detail, stateRef: ref }
@@ -375,6 +381,23 @@ if (args.state !== undefined && args.state !== null) {
         Object.values(st.reviewClock.unknown).every(u => u && typeof u.reading === 'string' && Number.isFinite(Date.parse(u.since)))))))
   if (!shaped) throw new Error(`state is not a pr-babysit state of version ${STATE_VERSION}`)
   if (st.digest !== sealOf(st)) throw new Error('state digest mismatch: the state was changed after the launch that returned it')
+  // A resume that names no checkout continues in the one the state pins, when that is the session's own worktree (#517).
+  const pinnedDir = st.config.checkoutDir
+  if (args.checkoutDir == null && typeof pinnedDir === 'string' && pinnedDir !== '.') {
+    // A stateRef load read it beside the state; an inline state asks a relay. Unread or unsealed reads as another one.
+    const c = loadedCheckout
+    const same = c !== undefined ? (c && sealMatches(c) && c.dir === pinnedDir ? { exit: c.same === true ? 0 : 1 } : null)
+      : await agent(
+        'Editing nothing, run exactly ' +
+        `\`t=$(git rev-parse --show-toplevel) && [ -n "$t" ] && [ "$t" = "$(git -C ${shq(pinnedDir)} rev-parse --show-toplevel)" ]\` and answer its exit status as exit.`,
+        { label: 'state:checkout', phase: 'Triage', agentType: 'relay', model: 'haiku', effort: 'low', schema: RAN },
+      ).catch(e => { log(`state:checkout errored — ${e && e.message}`); return null })
+    if (same && same.exit === 0) {
+      checkoutDir = config.checkoutDir = pinnedDir
+      IN_CHECKOUT = inCheckout(checkoutDir)
+      log(`state: checkoutDir ${pinnedDir}, the state's, is this session's worktree`)
+    } else log(`state: the session directory is not the state's checkoutDir ${pinnedDir}${same ? '' : c !== undefined ? ' (no sealed reading of it)' : ' (the check died)'}: pass checkoutDir`)
+  }
   if (JSON.stringify(st.config) !== JSON.stringify(config)) {
     const differ = [...new Set([...Object.keys(st.config), ...Object.keys(config)])]
       .filter(k => JSON.stringify(st.config[k]) !== JSON.stringify(config[k]))

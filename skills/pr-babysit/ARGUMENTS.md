@@ -78,7 +78,9 @@ A key not listed here throws before anything runs.
   than one search page holds it reads unknown. Needs `autoPush` and `greptile` in
   `reviewers`; the switch itself is never restored from a state.
 - `checkoutDir`: the PR checkout, default the session directory. Dirty `.idea/`
-  paths are ignored; any other pre-existing edit refuses the start.
+  paths are ignored; any other pre-existing edit refuses the start. A resume
+  that leaves it out continues in the state's `checkoutDir` when that is the
+  session directory's worktree; one that names another refuses.
 - `protected`: regex over repo-relative paths kept out of every fix scope (a
   review fix needing one is withheld, a CI fix's guess at one dropped) and
   never committed or published; an adopted chain may carry one only in commits

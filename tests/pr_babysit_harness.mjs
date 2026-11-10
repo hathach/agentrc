@@ -308,6 +308,8 @@ async function run(opts = {}) {
       return push
     }
     if (label === 'stop:ci') return conforms(options.schema, { exit: 0 }, label)
+    // Whether the session directory is the state's pinned checkoutDir: opts.sameCheckout the exit (0 by default), null a dead relay.
+    if (label === 'state:checkout') return opts.sameCheckout === null ? null : { exit: opts.sameCheckout ?? 0 }
     if (label.startsWith('prstate#')) {
       // preflight.py --state before a publication the CI lane is not watching: OPEN unless opts.prState (a value, or a function of the label) says otherwise.
       const state = typeof opts.prState === 'function' ? opts.prState(label) : opts.prState === undefined ? 'OPEN' : opts.prState
@@ -8130,6 +8132,47 @@ test('a facts.py without emit-dir stops at preflight naming both agentrc roots, 
   const plain = await run({ reviews: oneValid, dirAnswer: () => ({ dir: '', error: 'no git dir' }) })
   assert.equal(plain.result.detail, 'no directory for the line (facts.py emit-dir failed)')
   assert.equal(plain.journal.some(j => j.label === 'emit:roots'), false)
+})
+
+test('a resume that names no checkoutDir inherits the state\'s when it is the session\'s worktree; an explicit other one refuses (#517)', async () => {
+  const WT = '/home/u/code/tinyusb/.worktrees/fix-hil-net'
+  const first = await run({ args: { ...YIELD, checkoutDir: WT } })
+  const state = first.result.state
+  const saved = structuredClone(state) // a resume mutates the state it is handed
+  assert.equal(state.config.checkoutDir, WT)
+  const resumed = await run({ args: { ...YIELD, state } })
+  assert.equal(resumed.result.state.cyclesUsed, 2, resumed.result.reason)
+  assert.equal(resumed.result.state.config.checkoutDir, WT)
+  assert.match(resumed.journal.find(j => j.label === 'state:checkout').prompt, /git -C '\/home\/u\/code\/tinyusb\/\.worktrees\/fix-hil-net' rev-parse --show-toplevel/)
+  assert.ok(resumed.calls.find(c => c.label === 'preflight').prompt.startsWith(`The PR branch checkout is at ${WT} `))
+  for (const [over, why] of [
+    [{ sameCheckout: 1 }, /checkoutDir: "\/home\/u\/code\/tinyusb\/\.worktrees\/fix-hil-net" vs "\."/],
+    [{ sameCheckout: null }, /checkoutDir: "\/home\/u\/code\/tinyusb\/\.worktrees\/fix-hil-net" vs "\."/],
+    [{ args: { ...YIELD, state, checkoutDir: '/elsewhere' } }, /checkoutDir: "\/home\/u\/code\/tinyusb\/\.worktrees\/fix-hil-net" vs "\/elsewhere"/],
+    [{ args: { ...YIELD, state, checkoutDir: '.' } }, /checkoutDir: "\/home\/u\/code\/tinyusb\/\.worktrees\/fix-hil-net" vs "\."/],
+    [{ args: { ...YIELD, state: { ...state, cyclesUsed: 0 } } }, /state digest mismatch/],
+    [{ args: { ...YIELD, state, repo: 'other/repo' } }, /repo other\/repo is not the state's hathach\/tinyusb/],
+  ]) {
+    const trace = []
+    await assert.rejects(run({ args: { ...YIELD, state }, trace, ...over }), why)
+    assert.equal(trace.some(c => c.label === 'preflight'), false)
+  }
+  // By stateRef, state_transfer.py's sealed reading stands in for that relay; one that is not a sealed yes for this
+  // checkoutDir refuses as a no does.
+  const stateRef = { outputFile: '/tmp/tasks/w1.output', digest: first.result.stateDigest }
+  const reading = (same, dir = WT) => sealLine({ dir, same })
+  const byRef = (checkout) => run({ args: { ...YIELD, stateRef }, load: structuredClone(saved),
+    garble: onLoad(({ checkout: _, ...line }) => checkout === undefined ? line : { ...line, checkout }) })
+  const loaded = await byRef(reading(true))
+  assert.deepEqual([loaded.result.state.cyclesUsed, loaded.result.state.config.checkoutDir], [2, WT], loaded.result.reason)
+  assert.equal(loaded.journal.some(j => j.label === 'state:checkout'), false)
+  for (const checkout of [reading(false), { ...reading(false), same: true }, reading(true, '/elsewhere'), undefined]) {
+    await assert.rejects(byRef(checkout), /checkoutDir: "\/home\/u\/code\/tinyusb\/\.worktrees\/fix-hil-net" vs "\."/, JSON.stringify(checkout))
+  }
+  // A fresh launch and a state of the session directory ask nothing.
+  assert.equal(first.journal.some(j => j.label === 'state:checkout'), false)
+  const here = await run({ args: { ...YIELD, state: (await run({ args: YIELD })).result.state } })
+  assert.equal(here.journal.some(j => j.label === 'state:checkout'), false)
 })
 
 test('a resumed launch reloads the lines its relays wrote; a file there before a live run is reloaded only when it names itself', async () => {
