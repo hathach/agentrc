@@ -31,6 +31,7 @@ import argparse
 import errno
 import importlib.util
 import json
+import math
 import os
 import re
 import signal
@@ -355,9 +356,11 @@ def with_brief(text, brief):
 
 
 def spent(usd, partial):
-    """run_cost.total() as accounting: known, partial (a lower bound) or, with no dollar priced, unknown."""
+    """run_cost.total() as accounting: known, partial (a lower bound) or, with no usable dollar amount, unknown."""
     if usd is None:
         return unknown('no cost record; see cost.md')
+    if not math.isfinite(usd) or usd < 0:   # transcript cost records are taken as written
+        return unknown(f'unusable total {usd!r}')
     return {'status': 'partial' if partial else 'known', 'usd': f'{usd:.2f}',
             'reason': 'some agents have no price' if partial else None}
 
@@ -463,7 +466,12 @@ def detached(a, run):
         code = run()
     except BaseException as e:   # noqa: BLE001 - nobody watches this process; the exit line must still come
         traceback.print_exc()
-        exit_line(a, Progress(a.out / 'progress.log'), 1, f'launcher failed: {type(e).__name__}: {e}')
+        why = f'launcher failed: {type(e).__name__}: {e}'
+        try:
+            exit_line(a, Progress(a.out / 'progress.log'), 1, why)
+        finally:   # an exit line it cannot write must not lose the end too
+            if accounting := getattr(a, 'accounting', None):
+                accounting.finish(1, why)
     finally:
         sys.stderr.flush()
         if HELD:

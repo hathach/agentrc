@@ -934,6 +934,12 @@ class ChiefRun(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertEqual([(x['type'], x.get('exit'), x.get('reason')) for x in self.ledger()],
                          [('start', None, None), ('end', 1, 'launcher failed: OSError: disk full')])
+        Path(self.env['AGENTRC_CHIEF_RUNS']).unlink()
+        shutil.rmtree(self.out)
+        r = self.detach(subprocess.run([sys.executable, '-c', failing, *self.argv(detached=True)[2:]], env=self.env, capture_output=True, text=True, timeout=30))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.wait_until('the end record', lambda: len(self.ledger()) == 2)
+        self.assertEqual([(x['type'], x.get('exit')) for x in self.ledger()], [('start', None), ('end', 1)], 'detached too')
 
     def test_a_ledger_path_it_cannot_resolve_is_a_warning_not_a_failed_launch(self):
         chief_run = self.module()
@@ -964,6 +970,9 @@ class ChiefRun(unittest.TestCase):
         self.assertEqual(field(spent(1.3, False)), 'cost $1.30')
         self.assertEqual(field(spent(12.34, True)), 'cost $12.34 (partial)')
         self.assertEqual(field(spent(None, True)), 'cost none (no cost record; see cost.md)')
+        for odd in (float('nan'), float('inf'), -1.0):
+            with self.subTest(odd):
+                self.assertEqual(spent(odd, False)['status'], 'unknown')
 
     def installed(self, kind, name, content, root=None, scope=None):
         """An agentrc entry linked into the user scope as install.py links it."""

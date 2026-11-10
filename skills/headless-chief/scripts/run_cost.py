@@ -479,7 +479,7 @@ def usage(rows):
 
 
 def report(session, full_path=None):
-    """(the brief form, or None without full_path, the full output, its total cell) of a session directory; with
+    """(the brief form, or None without full_path, the full output, its total()) of a session directory; with
     full_path, the full output is written there and the brief points to it."""
     transcript = session.with_suffix('.jsonl')
     if not transcript.exists():
