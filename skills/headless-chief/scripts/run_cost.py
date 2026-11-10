@@ -228,12 +228,16 @@ def priced(rows, state):
     return rows
 
 
+def total(rows):
+    """(the sum of rows' dollars, None when none has any; whether one has none)."""
+    known = [r['cost'] for r in rows if r['cost'] is not None]
+    return (sum(known) if known else None), len(known) != len(rows)
+
+
 def total_cell(rows):
     """The sum of rows' dollars, `(partial)` when one has none, or '-'."""
-    known = [r['cost'] for r in rows if r['cost'] is not None]
-    if not known:
-        return '-'
-    return f'{sum(known):.2f}' + ('' if len(known) == len(rows) else ' (partial)')
+    usd, partial = total(rows)
+    return '-' if usd is None else f'{usd:.2f}' + (' (partial)' if partial else '')
 
 
 def table(rows):
@@ -488,15 +492,15 @@ def report(session, full_path=None):
         notes.append('No cost-state record in the transcript: every $ is its tokens at RATES.')
     full = table(rows) + '\n\n' + breakout(rows, session) + '\n\n' + timeline(session, walls) + '\n\n' + '\n'.join(notes)
     if full_path is None:
-        return None, full, total_cell(rows)
+        return None, full, total(rows)
     full_path.write_text(full + '\n', encoding='utf-8', newline='\n')
     brief = (f'## Launches\n\n{launches(session, rows, walls)}\n\n## Usage by stage and agent\n\n{usage(rows)}\n\n'
              + ''.join(n + '\n' for n in notes[1:]) + f'Per launch × stage × model and the time breakdown: {full_path}')
-    return brief, full, total_cell(rows)
+    return brief, full, total(rows)
 
 
 def summary(session):
-    """(the full Markdown output, its total cell) of a session directory."""
+    """(the full Markdown output, its total()) of a session directory."""
     return report(session)[1:]
 
 

@@ -22,6 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import run_ledger  # noqa: E402
+from run_cost import cell, minutes  # noqa: E402
 
 RUN_ID = re.compile(r'[0-9a-f]{32}')
 USD = re.compile(r'\d+\.\d{2}')
@@ -127,14 +128,14 @@ def spent(t):
 def text(report, each):
     rows = ['| task | launches | wall | $ |', '|---|---:|---:|---|']
     for t in report['tasks']:
-        rows.append(f'| {t["task"]} | {t["launches"]} | {t["wall"] / 60:.1f} m | {spent(t)} |')
+        rows.append(f'| {cell(t["task"])} | {t["launches"]} | {minutes(t["wall"])} m | {spent(t)} |')
         if each:
             for x in t['runs']:
                 cost = x['cost']
-                what = ('unfinished' if cost is None else f'unknown ({cost["reason"]})' if cost['usd'] is None
+                what = ('unfinished' if cost is None else f'unknown ({cell(cost["reason"])})' if cost['usd'] is None
                         else f'${cost["usd"]}' + (' (partial)' if cost['status'] == 'partial' else ''))
-                wall = '-' if x['wall'] is None else f'{x["wall"] / 60:.1f} m'
-                rows.append(f'| ↳ {x["startedAt"]} exit {x["exit"]} | {x["out"]} | {wall} | {what} |')
+                wall = '-' if x['wall'] is None else f'{minutes(x["wall"])} m'
+                rows.append(f'| ↳ {cell(x["startedAt"])} exit {x["exit"]} | {cell(x["out"])} | {wall} | {what} |')
     lines = rows if report['tasks'] else ['No launch recorded' + (' for that task.' if each else '.')]
     if not report['complete']:
         lines.append('\nIncomplete: the ledger holds lines that cannot be attributed, so a total may miss a launch.')

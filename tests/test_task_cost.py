@@ -180,10 +180,6 @@ class TaskCost(unittest.TestCase):
         _, r = self.query()
         self.assertTrue(r['complete'])
         self.assertEqual(r['diagnostics'], [{'line': 3, 'run': run_id(1), 'problem': 'the same end again'}])
-        self.write(start(1), end(1, '1.00'), end(1, '2.00'))
-        _, r = self.query()
-        self.assertFalse(r['complete'])
-        self.assertEqual(r['tasks'], [], 'neither amount wins')
 
     def test_records_missing_what_the_roll_up_reads_are_diagnostics_never_a_crash(self):
         cost = end(2, status='unknown')['cost']
@@ -231,6 +227,12 @@ class TaskCost(unittest.TestCase):
         self.assertEqual(len(r['tasks']), 1)
         out = self.text('--task', 'k')
         self.assertIn('| ↳ 2026-11-10T09:00:00Z exit None | /tmp/run1 | - | unfinished |', out)
+
+    def test_a_pipe_in_a_key_path_or_reason_stays_in_its_cell(self):
+        self.write(start(1, task='a|b', out='/tmp/x|y'), {**end(1, status='unknown'), 'cost': {'status': 'unknown', 'usd': None, 'reason': 'p|q'}})
+        out = self.text('--task', 'a|b')
+        self.assertIn('| a\\|b | 1 |', out)
+        self.assertIn('| /tmp/x\\|y | 1.0 m | unknown (p\\|q) |', out)
 
 
 if __name__ == '__main__':

@@ -32,12 +32,11 @@ def path():
 
 
 @contextmanager
-def locked(ledger, wait=None):
-    """Hold `<ledger>.lock` for the block, or raise Busy after `wait` seconds (LOCK_WAIT)."""
-    wait = LOCK_WAIT if wait is None else wait
+def locked(ledger):
+    """Hold `<ledger>.lock` for the block, or raise Busy after LOCK_WAIT seconds."""
     ledger.parent.mkdir(parents=True, exist_ok=True)
     with open(ledger.with_name(ledger.name + '.lock'), 'ab') as f:
-        deadline = time.monotonic() + wait
+        deadline = time.monotonic() + LOCK_WAIT
         if os.name == 'nt':
             os.lseek(f.fileno(), 1 << 30, os.SEEK_SET)   # msvcrt locks are mandatory: lock a byte past any content
         while True:
@@ -49,7 +48,7 @@ def locked(ledger, wait=None):
                 break
             except OSError as e:
                 if e.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLOCK) or time.monotonic() >= deadline:
-                    raise Busy(f'{ledger}.lock not taken in {wait:g} s: {e}') from e
+                    raise Busy(f'{ledger}.lock not taken in {LOCK_WAIT:g} s: {e}') from e
                 time.sleep(0.05)
         try:
             yield

@@ -42,7 +42,6 @@ import time
 import traceback
 import uuid
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -107,20 +106,20 @@ class Accounting:
 
     def warn(self, text):
         try:
-            if self.progress is None:
-                raise OSError('no progress log yet')
-            self.progress.line(f'launcher: warning: {text}')
+            if self.progress is not None:
+                return self.progress.line(f'launcher: warning: {text}')
         except Exception:   # noqa: BLE001 - a warning must not stop the run either
-            try:
-                print(f'chief_run: warning: {text}', file=sys.stderr, flush=True)
-            except Exception:   # noqa: BLE001
-                pass
+            pass
+        try:
+            print(f'chief_run: warning: {text}', file=sys.stderr, flush=True)
+        except Exception:   # noqa: BLE001
+            pass
 
     def write(self, kind, fields):
         try:
             tmp = self.out / f'.run.json.{os.getpid()}'
             tmp.write_text(json.dumps(self.rec, indent=2) + '\n', encoding='utf-8', newline='\n')
-            os.replace(tmp, self.out / 'run.json')
+            windows.replace(tmp, self.out / 'run.json')
         except Exception as e:   # noqa: BLE001 - accounting must never stop or re-code the run
             self.warn(f'run.json not written: {type(e).__name__}: {e}')
         try:
@@ -355,32 +354,41 @@ def with_brief(text, brief):
     return '\n'.join(lines[:at]).rstrip('\n') + f'\n\n{brief}\n' + ('\n' + '\n'.join(lines[at:]) + '\n' if at < len(lines) else '')
 
 
-def spent(total):
-    """run_cost.report()'s total cell as accounting: `1.31` known, `1.31 (partial)` partial, anything else unknown."""
-    amount, partial = (total[:-len(' (partial)')], True) if total.endswith(' (partial)') else (total, False)
-    try:
-        usd = Decimal(amount) if re.fullmatch(r'\d+\.\d{2}', amount) else None
-    except InvalidOperation:
-        usd = None
+def spent(usd, partial):
+    """run_cost.total() as accounting: known, partial (a lower bound) or, with no dollar priced, unknown."""
     if usd is None:
-        return unknown('no cost record; see cost.md' if total == '-' else f'unreadable total {total!r}')
-    return {'status': 'partial' if partial else 'known', 'usd': str(usd),
+        return unknown('no cost record; see cost.md')
+    return {'status': 'partial' if partial else 'known', 'usd': f'{usd:.2f}',
             'reason': 'some agents have no price' if partial else None}
 
 
 def cost(out, sid, report):
-    """(the exit line's cost field, the cost as accounting); writes cost.md and puts its brief form into the report."""
+    """The run's cost as accounting; writes cost.md and puts its brief form into the report."""
     if not sid:
-        return 'cost none (no session id)', unknown('no session id')
+        return unknown('no session id')
     try:
         brief, _, total = run_cost.report(run_cost.session_dir(session_id=sid), out / 'cost.md')
         if report.exists():
             report.write_text(with_brief(report.read_text(encoding='utf-8'), brief), encoding='utf-8', newline='\n')
     except run_cost.Failed as e:
-        return f'cost none (run_cost: {e})', unknown(f'run_cost: {e}')
+        return unknown(f'run_cost: {e}')
     except Exception as e:   # noqa: BLE001 - chief has finished; a cost it cannot table must not lose the exit line
-        return f'cost none ({type(e).__name__}: {e})', unknown(f'{type(e).__name__}: {e}')
-    return ('cost none (no cost record; see cost.md)' if total == '-' else f'cost ${total}'), spent(total)
+        return unknown(f'{type(e).__name__}: {e}')
+    return spent(*total)
+
+
+def cost_field(c):
+    """The exit line's cost field."""
+    if c['usd'] is None:
+        return f'cost none ({c["reason"]})'
+    return f'cost ${c["usd"]}' + (' (partial)' if c['status'] == 'partial' else '')
+
+
+def exit_line(a, progress, code, reason, tail='report none', session=None, spend=None):
+    """The run's last progress line, then its accounting end, so no warning lands after the exit line."""
+    progress.line(f'launcher: exit {code} ({reason}) · {tail}')
+    if accounting := getattr(a, 'accounting', None):
+        accounting.finish(code, reason, session, spend)
 
 
 def main(argv=None):
@@ -455,9 +463,7 @@ def detached(a, run):
         code = run()
     except BaseException as e:   # noqa: BLE001 - nobody watches this process; the exit line must still come
         traceback.print_exc()
-        if accounting := getattr(a, 'accounting', None):
-            accounting.finish(1, f'launcher failed: {type(e).__name__}: {e}')
-        Progress(a.out / 'progress.log').line(f'launcher: exit 1 (launcher failed: {type(e).__name__}: {e}) · report none')
+        exit_line(a, Progress(a.out / 'progress.log'), 1, f'launcher failed: {type(e).__name__}: {e}')
     finally:
         sys.stderr.flush()
         if HELD:
@@ -485,8 +491,7 @@ def detached_launch(a):
         os.dup2(1, 2)
     why = None if a.worktree.is_dir() else f'{a.worktree} is not a directory'
     if why := why or refusal(a.worktree, 'relaunch with a new --out') or lock_held(a.worktree, keep=True, wait=5):
-        Progress(a.out / 'progress.log').line(f'launcher: exit 2 ({why}) · report none')
-        a.accounting.finish(2, why)
+        exit_line(a, Progress(a.out / 'progress.log'), 2, why)
         return 2
     return launch(a, task)
 
@@ -518,8 +523,7 @@ def launch(a, task):
                                      env={**child_env(), 'CREDIT_GUARD_TAG': tag}, creationflags=NO_WINDOW)
         except OSError as e:
             err.write(f'chief_run: could not start claude: {e}\n'.encode())
-            progress.line(f'launcher: exit 127 (could not start claude: {e}) · report none')
-            a.accounting.finish(127, f'could not start claude: {e}', spent=unknown('claude did not start'))
+            exit_line(a, progress, 127, f'could not start claude: {e}', spend=unknown('claude did not start'))
             return 127
         unwatch = threading.Event()
         watcher = threading.Thread(target=watch_guard, args=(progress, tag, unwatch), daemon=True)
@@ -584,9 +588,8 @@ def launch(a, task):
         body = f'**{reason}**\n\n{body}'   # the report alone must not read as chief's last word
     if body.strip():
         report.write_text(body.rstrip('\n') + '\n', encoding='utf-8', newline='\n')   # Markdown: keep its indentation
-    field, spend = cost(a.out, sid, report)
-    progress.line(f'launcher: exit {code} ({reason}) · report {report if body.strip() else "none"} · {field}')
-    a.accounting.finish(code, reason, sid, spend)
+    spend = cost(a.out, sid, report)
+    exit_line(a, progress, code, reason, f'report {report if body.strip() else "none"} · {cost_field(spend)}', sid, spend)
     return code
 
 

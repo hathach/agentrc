@@ -506,7 +506,7 @@ class ChiefRun(unittest.TestCase):
         blocker.write_text('')
         with mock.patch.object(chief_run.run_cost, 'report', lambda session, full_path: (full_path.write_text('| t |'), 'B', '1.00')), \
                 mock.patch.object(chief_run.run_cost, 'session_dir', lambda session_id: self.root):
-            self.assertRegex(chief_run.cost(blocker, 's-1', blocker / 'report.md')[0], r'^cost none \((NotADirectoryError|FileNotFoundError): ')
+            self.assertRegex(chief_run.cost_field(chief_run.cost(blocker, 's-1', blocker / 'report.md')), r'^cost none \((NotADirectoryError|FileNotFoundError): ')
 
     def test_the_session_cost_is_read_from_claude_config_dir_alone(self):
         cfg = self.root / 'cfg'
@@ -950,20 +950,20 @@ class ChiefRun(unittest.TestCase):
         a = mock.Mock(out=self.root / 'missing', worktree=self.worktree, task='k')
         with mock.patch('sys.stderr', new_callable=io.StringIO) as err:
             acct = chief_run.Accounting(a)
-            acct.finish(0, 'result ok', 's-1', chief_run.spent('1.25 (partial)'))
+            acct.finish(0, 'result ok', 's-1', chief_run.spent(1.25, True))
             acct.finish(1, 'again')
         self.assertIn('run.json not written', err.getvalue())
         self.assertEqual([(r['type'], r.get('exit'), r.get('cost')) for r in self.ledger()],
                          [('start', None, None), ('end', 0, {'status': 'partial', 'usd': '1.25', 'reason': 'some agents have no price'})])
 
     def test_the_cost_total_reads_as_known_partial_or_unknown(self):
-        spent = self.module().spent
-        self.assertEqual(spent('0.00'), {'status': 'known', 'usd': '0.00', 'reason': None}, 'an explicit zero is known')
-        self.assertEqual(spent('12.34 (partial)')['status'], 'partial')
-        self.assertEqual(spent('-'), {'status': 'unknown', 'usd': None, 'reason': 'no cost record; see cost.md'})
-        for odd in ('1.2', 'NaN', '-1.00', '1e3', ''):
-            with self.subTest(odd):
-                self.assertEqual(spent(odd)['status'], 'unknown')
+        chief_run = self.module()
+        spent, field = chief_run.spent, chief_run.cost_field
+        self.assertEqual(spent(0.0, False), {'status': 'known', 'usd': '0.00', 'reason': None}, 'an explicit zero is known')
+        self.assertEqual(spent(None, True), {'status': 'unknown', 'usd': None, 'reason': 'no cost record; see cost.md'})
+        self.assertEqual(field(spent(1.3, False)), 'cost $1.30')
+        self.assertEqual(field(spent(12.34, True)), 'cost $12.34 (partial)')
+        self.assertEqual(field(spent(None, True)), 'cost none (no cost record; see cost.md)')
 
     def installed(self, kind, name, content, root=None, scope=None):
         """An agentrc entry linked into the user scope as install.py links it."""
