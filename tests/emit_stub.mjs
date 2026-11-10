@@ -18,21 +18,24 @@ const asciiJson = (v) => JSON.stringify(v).replace(/[\u007f-\uffff]/g, c => `\\u
 // The module lib/seal.py's emit writes to `file`, byte for byte.
 export const moduleOf = (file, line) => `export const meta = { name: 'emit', description: 'a script line' }\nreturn ${asciiJson({ emit: file, line })}\n`
 
-// facts.py emit-dir's directory for one run: `given` (an earlier run's, kept), else a new one made on first use, which
-// cleanup() removes unless `keep`.
+// facts.py emit-dir's directory for one run: `given` (an earlier run's, kept), else a new one made on first use under
+// `root`, the directory mkdtemp made, which cleanup() removes unless `keep` (`always`: a run that throws keeps nothing).
 export function emitDirs (prefix, given, keep) {
+  let root = null
   let made = null
   return {
     dir () {
       if (given) return given
       if (!made) {
-        made = `${mkdtempSync(join(tmpdir(), prefix)).replace(/\\/g, '/')}/agentrc-emit/r1`
+        root = mkdtempSync(join(tmpdir(), prefix)).replace(/\\/g, '/')
+        made = `${root}/agentrc-emit/r1`
         mkdirSync(made, { recursive: true })
       }
       return made
     },
     get made () { return made },
-    cleanup () { if (made && !keep) rmSync(made.split('/agentrc-emit/')[0], { recursive: true, force: true }) },
+    get root () { return root },
+    cleanup (always = false) { if (root && (always || !keep)) rmSync(root, { recursive: true, force: true }) },
   }
 }
 

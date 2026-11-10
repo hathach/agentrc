@@ -1835,6 +1835,13 @@ class GitHubRead(unittest.TestCase):
                          "takes credentials from a credential helper only, never an askpass: gh auth setup-git sets "
                          "one)")
 
+    def test_a_branch_tip_refusal_names_the_credential_helper(self):
+        err = "fatal: could not read Username for 'https://github.com': terminal prompts disabled\n"
+        with mock.patch.object(audit, 'github_read', return_value=subprocess.CompletedProcess([], 128, '', err)), \
+                self.assertRaisesRegex(audit.Refused, r'^o/r refs/heads/main cannot be read: fatal: .*terminal '
+                                                      r'prompts disabled \(.*gh auth setup-git sets one\)$'):
+            audit.branch_tip('r', 'o/r', 'main')
+
 
 class ShellAbs(unittest.TestCase):
     def test_a_root_relative_path_is_absolute_under_windows_path_rules_too(self):

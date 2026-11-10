@@ -216,8 +216,10 @@ async function run(opts = {}) {
   const journal = [] // every agent call and its answer, which opts.resume replays
   let live = 0 // how far this run still follows opts.resume
   const loads = [] // each scriptPath workflow() loaded
-  // facts.py emit-dir's directory: opts.emitDir, else a new one this run removes unless opts.keepEmit.
+  // facts.py emit-dir's directory: opts.emitDir, else a new one this run removes unless opts.keepEmit and it returns;
+  // the caller removes a kept one by the emitRoot it returns.
   const emit = emitDirs('pr-babysit-emit-', opts.emitDir, opts.keepEmit)
+  let returned = false
   let dirCalls = 0 // facts.py emit-dir runs; opts.dirAnswer(n) answers the nth instead (undefined: the directory)
 
   // One harvest per cycle, whichever of the validator and the probe (#359) asks for it first.
@@ -711,10 +713,11 @@ async function run(opts = {}) {
         assert.match(value.replace(/^'(.*)'$/, '$1'), /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/, `${label}: coderabbit_trigger.py's ISO contract`)
       }
     }
-    return { result, logs, labels: calls.map(c => c.label), calls, napPoints, napMs, journal, loads, emitDir: emit.made }
+    returned = true
+    return { result, logs, labels: calls.map(c => c.label), calls, napPoints, napMs, journal, loads, emitDir: emit.made, emitRoot: emit.root }
   } finally {
     globalThis.setTimeout = realTimeout
-    emit.cleanup()
+    emit.cleanup(!returned)
   }
 }
 
@@ -1427,10 +1430,13 @@ const corrupted = (b64, json) => [Buffer.from(json.slice(0, -1)).toString('base6
 
 test('hostile text in a reply body reaches reply.py byte for byte; a corrupted stage runs no script (#510)', async () => {
   const tmp = mkdtempSync(join(tmpdir(), 'pr-babysit-exec-'))
+  let emitRoot = null
   try {
-    const { calls, emitDir } = await run({
+    const ran = await run({
       keepEmit: true, args: { ...YIELD, python: hostPython() }, reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: HOSTILE }], bots: 'reviewed' },
     })
+    emitRoot = ran.emitRoot
+    const { calls } = ran
     // reply.py stands in as a copy of its --manifest beside its receipt; the stage is the real facts.py's.
     const stub = join(tmp, 'skills', 'pr-reply', 'scripts')
     mkdirSync(stub, { recursive: true })
@@ -1452,15 +1458,20 @@ test('hostile text in a reply body reaches reply.py byte for byte; a corrupted s
       assert.notEqual(runCommand(cmd.replace(b64, bad), tmp, join(tmp, 'bad.js')).status, 0)
       assert.equal(existsSync(`${out}.got`), false, 'reply.py never ran')
     }
-    rmSync(emitDir.split('/agentrc-emit/')[0], { recursive: true, force: true })
-  } finally { rmSync(tmp, { recursive: true, force: true }) }
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+    if (emitRoot) rmSync(emitRoot, { recursive: true, force: true })
+  }
 })
 
 test('a CI verdict reaches collect.py remember with no shell quoting, byte for byte; a malformed one is refused before it (#505)', async () => {
   const tmp = mkdtempSync(join(tmpdir(), 'pr-babysit-exec-'))
   const ROOT = fileURLToPath(new URL('..', import.meta.url))
+  let emitRoot = null
   try {
-    const { calls, emitDir } = await run({ keepEmit: true, args: { ...YIELD, python: hostPython() }, reviews: WAITING, ci: redWith({ ...RIG, firstError: HOSTILE }).ci })
+    const ran = await run({ keepEmit: true, args: { ...YIELD, python: hostPython() }, reviews: WAITING, ci: redWith({ ...RIG, firstError: HOSTILE }).ci })
+    emitRoot = ran.emitRoot
+    const { calls } = ran
     const remember = calls.find(c => c.label === 'ci:collect#1.w')
     const verdicts = stagedOf(remember.prompt)
     assert.equal(verdicts[0].failures[0].firstError, HOSTILE)
@@ -1482,8 +1493,10 @@ test('a CI verdict reaches collect.py remember with no shell quoting, byte for b
       assert.equal(existsSync(join(empty, 'ci-collect')), false, 'remember never ran')
       assert.equal(existsSync(join(tmp, 'bad.js')), false, 'no line')
     }
-    rmSync(emitDir.split('/agentrc-emit/')[0], { recursive: true, force: true })
-  } finally { rmSync(tmp, { recursive: true, force: true }) }
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+    if (emitRoot) rmSync(emitRoot, { recursive: true, force: true })
+  }
 })
 
 test('every script input is written by the command that runs the script, at a path the workflow names (#510)', async () => {
@@ -1506,6 +1519,9 @@ test('an unresolved build contract, or a build that did not run, blocks the batc
     [{ candidate: null }, /the build did not count: no sealed receipt \(the relay died or its line failed its seal\)/],
     [{ garble: (l, a) => l.startsWith('build#') ? { ...a, exit: 1 - a.exit } : a }, /the build did not count: no sealed receipt/],
     [{ candidate: { error: 'usage: ...' } }, /the build did not count: usage/],
+    // build.py's own error line names no state or revision.
+    [{ garble: (l, a) => l.startsWith('build#') ? { error: 'the build was stopped timedOut, and process(es) [1] still run' } : a },
+      /the build did not count: the build was stopped timedOut, and process\(es\) \[1\] still run/],
     [{ candidate: { exit: 2 } }, /the build failed \(exit 2\)/],
   ]) {
     const { result, labels, logs } = await run({ reviews: oneValid, ...over })
@@ -3752,7 +3768,7 @@ test('a relay a resume meets again never runs its command twice: its line is rel
       assert.deepEqual([reloaded, unknown], how === 'after its line' ? [true, false] : [false, true], how)
       assert.deepEqual(resumed.labels.filter(l => l.startsWith('build#')), [], how)
       assert.equal(!!resumed.result.history[0].reviewPush?.pass, true, `${how}: an unknown attempt's build is waited on again`)
-    } finally { rmSync(first.emitDir.split('/agentrc-emit/')[0], { recursive: true, force: true }) }
+    } finally { rmSync(first.emitRoot, { recursive: true, force: true }) }
   }
 })
 
@@ -3779,7 +3795,7 @@ test("a reply relay a resume meets again posts nothing: its line, or the receipt
         assert.ok(answered, how)
         assert.equal(resumed.logs.includes("replies#1: recovered from reply.py's saved receipt"), how !== 'after its line', resumed.logs.join('\n'))
       }
-    } finally { rmSync(first.emitDir.split('/agentrc-emit/')[0], { recursive: true, force: true }) }
+    } finally { rmSync(first.emitRoot, { recursive: true, force: true }) }
   }
 })
 
@@ -8303,7 +8319,7 @@ test('a resumed launch reloads the lines its relays wrote; a file there before a
     assert.ok(foreign.logs.includes(`preflight: an earlier attempt of this call claimed ${pre} and left no line of it — its outcome is unknown`), foreign.logs.join('\n'))
     assert.equal(foreign.labels[0], 'preflight.retry', 'the refused call ran nothing')
     assert.equal(foreign.result.pass, true)
-  } finally { rmSync(first.emitDir.split('/agentrc-emit/')[0], { recursive: true, force: true }) }
+  } finally { rmSync(first.emitRoot, { recursive: true, force: true }) }
 })
 
 test('stateRef is refused when malformed or given with state', async () => {

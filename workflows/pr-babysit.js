@@ -691,7 +691,7 @@ const BUILD_RUN = withSeal({
   type: 'object', additionalProperties: false,
   required: ['state', 'revision'],
   properties: {
-    state: { enum: ['running', 'done', 'timedOut', 'abandoned'] }, elapsed: { type: 'integer' },
+    state: { type: 'string', enum: ['running', 'done', 'timedOut', 'abandoned'] }, elapsed: { type: 'integer' },
     revision: { type: 'string' }, snapshot: { type: 'string' }, snapshotAfter: { type: 'string' },
     command: { type: 'string' }, setup: { type: 'string' }, requires: { type: 'array', items: { type: 'string' } },
     stage: { type: 'string' },

@@ -1227,8 +1227,11 @@ def branch_tip(repo, slug, branch):
     listed = git(repo, 'ls-remote', '--exit-code', f'{GITHUB}{slug}.git', ref, check=False, network=True)
     tips = [line.split('\t')[0] for line in listed.stdout.splitlines() if line.endswith(f'\t{ref}')]
     if listed.returncode or len(tips) != 1 or not SHA.fullmatch(tips[0]):
-        why = listed.stdout.strip()[:200] if listed.returncode in (0, 2) else failure(listed.returncode, listed.stderr)
-        raise Refused(f'{slug} {ref} cannot be read: {listed.stderr.strip() or why}')
+        if listed.returncode in (0, 2):
+            why = listed.stderr.strip() or listed.stdout.strip()[:200]
+        else:
+            why = failure(listed.returncode, listed.stderr)
+        raise Refused(f'{slug} {ref} cannot be read: {why}')
     if not has_commit(repo, tips[0]):
         fetch(repo, slug, ref)
         if not has_commit(repo, tips[0]):
