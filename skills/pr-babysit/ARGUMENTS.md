@@ -163,7 +163,8 @@ A key not listed here throws before anything runs.
   branch's live tip or the base GitHub recorded holds its second parent. That
   record is stale until the head is pushed, so a merge newer than it needs the
   live tip in the checkout (fetch the base branch), or the audit stops with
-  `fetch it`. A PR that conflicts with its base
+  `fetch it`. An empty commit is a link only when the PR head already has
+  it, such as one pushed to resync the head. A PR that conflicts with its base
   stops `pr-conflicting`; the merge that resolves it rejoins by `adoptHead`.
   An `adoptHead` naming a repair reconciled as published has nothing left to
   adopt; a reconciled adoption retried is audited from its own base and read

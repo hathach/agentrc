@@ -236,6 +236,28 @@ class CommitsTest(unittest.TestCase):
         self.write('t.c', 't\n')
         self.assertIn(f'sits on {one[:7]}, not {side[:7]}', self.chain_refusal(side, self.commit('two', 't.c')))
 
+    def test_an_empty_link_the_pr_head_already_has_is_adopted_and_no_other(self):
+        # #429: Adafruit_TinyUSB_Arduino#602, an empty commit pushed to resync the PR head after a GitHub outage.
+        self.write('b.c', 'b\n')
+        one = self.commit('one', 'b.c')
+        self.git('commit', '-q', '--allow-empty', '-m', 'Resync the PR head after GitHub\'s outage (empty)')
+        empty = self.git('rev-parse', 'HEAD').strip()
+        out = self.chain_of(empty, empty, self.base)
+        self.assertEqual((out['refusal'], out['unpublished'], out['changes']), ('', [], []), 'the published empty head')
+        self.write('c.c', 'c\n')
+        two = self.commit('two', 'c.c')
+        out = self.chain_of(two, empty, self.base)
+        self.assertEqual((out['refusal'], out['unpublished']), ('', ['c.c']), 'a published empty link under an unpublished one')
+        self.assertIn(f'{empty[:7]} touches no path', self.chain_of(two, one, self.base)['refusal'], 'not yet published')
+        self.git('commit', '-q', '--allow-empty', '-m', 'nothing')
+        later = self.git('rev-parse', 'HEAD').strip()
+        self.assertIn(f'{later[:7]} touches no path', self.chain_of(later, empty, self.base)['refusal'], 'an empty link after the published head')
+        self.git('checkout', '-q', '--detach', one)
+        self.git('commit', '-q', '--allow-empty', '-m', 'Resync\n\nCo-Authored-By: Claude <noreply@anthropic.com>')
+        credited = self.git('rev-parse', 'HEAD').strip()
+        self.assertIn('carries attribution', self.chain_of(credited, credited, self.base)['refusal'], 'published, but credited')
+        self.assertIn('touches no path', self.refusal('head', '--parent', one, 'b.c'), 'a commit at the head is never empty')
+
     def base_merge(self, base_files=None, pr_files=None, resolve=None, message='Merge the base', start=None):
         """A PR commit and base's own commit beside it on start, and the PR merging base, after resolve() edits the tree: (one, tip, merge)."""
         self.git('checkout', '-q', '-b', 'main', start or self.base)

@@ -28,8 +28,9 @@ Per commit: sha, parents (every parent), paths (`git diff-tree --no-renames
 entry differs from both parents, so what the base alone changed is not its)
 and message (`%B`).
 A link of a chain, or the head commit, is refused when it is a root, does not
-sit on the commit before it, touches no path, or has a message line crediting
-an agent, model, tool or session or linking a session (facts.attribution_in).
+sit on the commit before it, touches no path (unless the link is at or before P,
+which the PR already has), or has a message line crediting an agent, model, tool
+or session or linking a session (facts.attribution_in).
 A chain link may be a merge of a commit B or T holds, a merge from the base
 branch, which may touch no path; any other merge, and a merge at the head, is
 refused.
@@ -105,7 +106,9 @@ def on_base(sha, bases):
     return False
 
 
-def link_refusal(c, parent, bases=None):
+def link_refusal(c, parent, bases=None, published=False):
+    """Why link c on parent cannot be adopted, '' when it can; `published`: the PR's head already holds it, so an empty
+    single-parent link there is the PR's own history, as an empty commit pushed to resync it is (#429)."""
     sha = c['sha'][:7]
     merge = bases is not None and len(c['parents']) == 2
     if len(c['parents']) != 1 and not merge:
@@ -114,7 +117,7 @@ def link_refusal(c, parent, bases=None):
         return f"{sha} sits on {c['parents'][0][:7]}, not {parent[:7]}"
     if merge and not on_base(c['parents'][1], bases):
         return f"{sha} merges {c['parents'][1][:7]}, which is not on the PR's base {' or '.join(b[:7] for b in bases)}"
-    if not c['paths'] and not merge:
+    if not c['paths'] and not merge and not published:
         return f'{sha} touches no path'
     said = attribution_in(c['message'])
     return f'commit message carries attribution: {said}' if said else ''
@@ -153,17 +156,18 @@ def chain(start, end, published, base, tip):
     return {'from': start, 'to': end, 'published': published, 'base': base, 'tip': tip, 'commits': shas, 'paths': touched(found),
             'unpublished': unpublished, 'mergeOnly': [p for p in unpublished if p not in ordinary],
             'changes': [{'sha': c['sha'], 'paths': c['paths']} for c in found[after:]],
-            'refusal': chain_refusal(start, end, bases, found)}
+            'refusal': chain_refusal(start, end, bases, found, after)}
 
 
-def chain_refusal(start, end, bases, found):
+def chain_refusal(start, end, bases, found, published=0):
+    """Why FROM..TO cannot be adopted, '' when it can; its first `published` links are the PR head's."""
     if not found:
         return f'no commits in {start[:7]}..{end[:7]}'
     if found[-1]['sha'] != end:
         return f"the chain ends at {found[-1]['sha'][:7]}, not {end[:7]}"
     before = start
-    for c in found:
-        refusal = link_refusal(c, before, bases)
+    for i, c in enumerate(found):
+        refusal = link_refusal(c, before, bases, i < published)
         if refusal:
             return refusal
         before = c['sha']
