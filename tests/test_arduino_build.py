@@ -696,7 +696,7 @@ class RecordCase(Lib):
         super().setUp()
         self.roster = fake.roster(self.root / 'test/hil/ci.json')
         self.patch(ab, 'tool_version', lambda: '1.5.1')
-        self.patch(ab, 'platform_git', lambda d: None)
+        self.patch(ab, 'platform_git', lambda d, content=False: None)
 
     def flasher(self, flasher):
         fake.roster(self.roster, rig_jlink={'flasher': flasher})
@@ -722,6 +722,131 @@ class RecordCase(Lib):
             return ab.make_record(args, board, [row], ident, '', self.roster, prepared or {})
 
 
+class CoreContent(unittest.TestCase):
+    """platform_git(content=True): a core checkout's bytes beyond its HEAD, by real git."""
+
+    def setUp(self):
+        self.tmp = tmpdir(self)
+        self.env = git_env(GIT_CONFIG_COUNT='1', GIT_CONFIG_KEY_0='protocol.file.allow', GIT_CONFIG_VALUE_0='always')
+        environ = mock.patch.dict(os.environ, self.env, clear=True)
+        environ.start()
+        self.addCleanup(environ.stop)
+        self.core = self.tmp / 'core'
+        self.core.mkdir()
+        for f, text in (('platform.txt', 'name=X\n'), ('cores/x/main.cpp', 'int main() {}\n'),
+                        ('.gitignore', 'out/\n')):
+            (self.core / f).parent.mkdir(parents=True, exist_ok=True)
+            (self.core / f).write_text(text)
+        self.git(self.core, 'init', '-q', '-b', 'main')
+        self.git(self.core, 'add', '-A')
+        self.git(self.core, 'commit', '-qm', 'core')
+
+    def git(self, where, *a):
+        subprocess.run(['git', '-C', str(where), *a], check=True, capture_output=True, env=self.env)
+
+    def content(self):
+        return ab.platform_git(str(self.core), content=True)
+
+    def add_submodule(self):
+        up = self.tmp / 'lib_upstream'
+        up.mkdir()
+        (up / 'lib.h').write_text('// lib\n')
+        self.git(up, 'init', '-q', '-b', 'main')
+        self.git(up, 'add', '-A')
+        self.git(up, 'commit', '-qm', 'lib')
+        self.git(self.core, 'submodule', '-q', 'add', str(up), 'libraries/Lib')
+        self.git(self.core, 'commit', '-qm', 'sub')
+
+    def test_a_clean_core_is_stable_and_without_content_the_entry_is_unchanged(self):
+        first = self.content()
+        self.assertEqual((first['dirty'], first['content']), (False, self.content()['content']))
+        (self.core / 'out').mkdir()
+        (self.core / 'out/x.o').write_text('ignored')   # ignored files are not bound
+        self.assertEqual(self.content(), first)
+        self.assertEqual(set(ab.platform_git(str(self.core))), {'commit', 'dirty'})
+
+    def test_tracked_untracked_and_deleted_bytes_each_change_the_content(self):
+        clean = self.content()['content']
+        seen = {clean}
+        main = self.core / 'cores/x/main.cpp'
+        main.write_text('int main() { return 1; }\n')
+        one = self.content()
+        self.assertTrue(one['dirty'])
+        main.write_text('int main() { return 2; }\n')   # same commit, same dirty flag, other bytes
+        two = self.content()
+        self.assertEqual((two['commit'], two['dirty']), (one['commit'], one['dirty']))
+        seen |= {one['content'], two['content']}
+        main.write_text('int main() {}\n')
+        self.assertEqual(self.content()['content'], clean)
+        extra = self.core / 'cores/x/extra.c'
+        extra.write_text('a')
+        untracked = self.content()
+        self.assertFalse(untracked['dirty'])   # `dirty` keeps its meaning: tracked files only
+        extra.write_text('b')
+        seen |= {untracked['content'], self.content()['content']}
+        extra.unlink()
+        (self.core / 'platform.txt').unlink()
+        seen.add(self.content()['content'])
+        self.assertEqual(len(seen), 6)
+
+    def test_a_submodules_own_changes_change_the_content(self):
+        self.add_submodule()
+        clean = self.content()['content']
+        (self.core / 'libraries/Lib/lib.h').write_text('// changed\n')
+        changed = self.content()['content']
+        (self.core / 'libraries/Lib/lib.h').write_text('// lib\n')
+        (self.core / 'libraries/Lib/new.h').write_text('')
+        self.assertEqual(len({clean, changed, self.content()['content']}), 3)
+
+    def test_an_unparsed_submodule_status_line_is_refused_not_skipped(self):
+        status = mock.Mock(returncode=0, stdout=b' 3e5369cd libs/ok\nwarning: odd\n')
+        with mock.patch.object(ab, '_git_at', return_value=status), \
+                self.assertRaisesRegex(RuntimeError, "unparsed line 'warning: odd'"):
+            ab.content_digest(self.core)
+
+    def test_untracked_bytes_holding_separators_do_not_collide_with_two_files(self):
+        (self.core / 'a').write_bytes(b'x\0b\0y')
+        one = self.content()['content']
+        (self.core / 'a').write_bytes(b'x')
+        (self.core / 'b').write_bytes(b'y')
+        self.assertNotEqual(one, self.content()['content'])
+
+    def test_git_presentation_settings_do_not_enter_the_content(self):
+        self.add_submodule()
+        (self.core / 'cores/x/main.cpp').write_text('int main() { return 1; }\n')
+        (self.core / 'cores/x/ü.c').write_text('')
+        (self.core / 'platform.txt').write_text('name=Y\n')
+        first = self.content()['content']
+        order = self.tmp / 'order'
+        order.write_text('platform.txt\n')
+        for key, value in (('diff.noprefix', 'true'), ('diff.mnemonicPrefix', 'true'), ('core.quotePath', 'false'),
+                           ('diff.context', '9'), ('diff.algorithm', 'histogram'), ('diff.orderFile', str(order))):
+            self.git(self.core, 'config', key, value)
+        self.git(self.core / 'libraries/Lib', 'tag', 'v1')   # submodule status names it: `(v1)`
+        self.assertEqual(self.content()['content'], first)
+
+    def test_non_git_cores_and_unreadable_inputs_are_explicit(self):
+        plain = self.tmp / 'plain'
+        plain.mkdir()
+        self.assertIsNone(ab.platform_git(str(plain), content=True))
+        nested = self.core / 'cores/vendored'
+        nested.mkdir()
+        self.git(nested, 'init', '-q')
+        (nested / 'f').write_text('')
+        got = self.content()
+        self.assertIsNone(got['content'])
+        self.assertIn('an untracked repository', got['contentError'])
+        shutil.rmtree(nested)
+        (self.core / 'cores/x/locked.c').write_text('')
+        (self.core / 'cores/x/locked.c').chmod(0)
+        self.addCleanup((self.core / 'cores/x/locked.c').chmod, 0o644)
+        if os.access(self.core / 'cores/x/locked.c', os.R_OK):
+            self.skipTest('running as root: an unreadable file is readable')
+        got = self.content()
+        self.assertIsNone(got['content'])
+        self.assertIn('locked.c', got['contentError'])
+
+
 class Record(RecordCase):
     def test_jlink_board_records_the_hex_and_schema_2_identity(self):
         dep = {'name': 'Dep A', 'version': '1', 'dir': '/l/A', 'location': 'user', 'sha256': 'f' * 64}
@@ -739,6 +864,13 @@ class Record(RecordCase):
         self.assertEqual(rec['agentrc'], {'commit': 'a' * 40, 'files': {
             f: ab.sha256(self.agentrc['root'] / f) for f in self.agentrc['files']}})
         self.assertEqual(rec['agentrcSource'], {'source': 'installed', 'dirty': False})   # provenance, not compared
+
+    def test_record_binds_its_cores_content(self):
+        self.patch(ab, 'platform_git', lambda d, content=False: {'commit': 'c', 'dirty': True,
+                                                                 **({'content': 'f' * 64} if content else {})})
+        rec, err = self.record(self.samd_row())
+        self.assertIsNone(err)
+        self.assertEqual(rec['platform']['git'], {'commit': 'c', 'dirty': True, 'content': 'f' * 64})
 
     def test_record_takes_each_sketchs_fqbn(self):
         rec, err = self.record(self.samd_row())

@@ -58,8 +58,10 @@ retries, recovery) apply unchanged; these scripts load its `hil_*` scripts throu
   prepared user copy shadowing a library the build's own core bundles (hashed before any compile and recorded with
   `shadows`); any other fails the sketch.
 - **The HIL build record** (schema 2) binds a run to its firmware: HEAD and a clean tree, the FQBN, the core (`{id,
-  version, install_dir}`, and `{commit, dirty}` when it is a git checkout: a dirty core's exact bytes are not
-  identified), the resolved dependencies, the roster's sha256, the library's contract files and the agentrc engines'
+  version, install_dir}`, and `{commit, dirty, content}` when it is a git checkout: `content` a sha256 over its tracked
+  diff, untracked files not ignored and submodules, or null with `contentError` when one is unreadable; a core that is
+  no git checkout is identified by id and version only, and no harness compares the core with the rig's), the
+  resolved dependencies, the roster's sha256, the library's contract files and the agentrc engines'
   closure by sha256 with its commit (provenance: the digests decide), and per sketch its images, load spans, VID:PID,
   foreign headers and used libraries. Without `--experimental`, a foreign header that differs from the checkout
   refuses the record unless it is the build's own core's copy: a core's bundled copy lags the library between core

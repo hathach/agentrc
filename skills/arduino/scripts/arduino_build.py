@@ -127,10 +127,14 @@ def _git_local_vars():
     return frozenset(names)
 
 
+def _git_env():
+    """os.environ without the GIT_* that would aim git away from the repository it names."""
+    return {k: v for k, v in os.environ.items() if k not in _git_local_vars()}
+
+
 def git(*args, check=True):
     """git in the checkout, deaf to the GIT_* that would aim it elsewhere (a hook's GIT_DIR, GIT_INDEX_FILE...)."""
-    env = {k: v for k, v in os.environ.items() if k not in _git_local_vars()}
-    p = subprocess.run(['git', '-C', str(P.ROOT), *args], capture_output=True, text=True, env=env)
+    p = subprocess.run(['git', '-C', str(P.ROOT), *args], capture_output=True, text=True, env=_git_env())
     if check and p.returncode:
         fail(f'git {" ".join(args)}: {p.stderr.strip()}')
     return p.stdout
@@ -1042,16 +1046,25 @@ def source_identity():
     return ident, diff
 
 
+def _submodule_status(line):
+    """(state, commit, path) of one `git submodule status` line, None when it is not one."""
+    m = re.match(r'^([ +\-U])([0-9a-f]+) (.+)$', line)
+    if not m:
+        return None
+    state, commit, path = m.groups()
+    if state in ' +':   # git appends ` (<describe>)` to these only; the path itself may hold spaces
+        path = re.sub(r' \([^ ]*\)$', '', path)
+    return state, commit, path
+
+
 def submodules():
     """[{path, commit, state}] of the checkout's submodules, recursive: state is git's status prefix, ' ' at the
     gitlink, '-' not initialised, '+' at another commit, 'U' conflicted. A core bundles libraries this way."""
     out = []
     for line in git('submodule', 'status', '--recursive').splitlines():
-        m = re.match(r'^([ +\-U])([0-9a-f]+) (.+)$', line)
-        if m:
-            state, commit, path = m.groups()
-            if state in ' +':   # git appends ` (<describe>)` to these only; the path itself may hold spaces
-                path = re.sub(r' \([^ ]*\)$', '', path)
+        parsed = _submodule_status(line)
+        if parsed:
+            state, commit, path = parsed
             dirty = False
             if state != '-':   # =dirty: nested worktrees are their own entries; a gitlink staged here still shows
                 dirty = bool(git('-C', path, 'status', '--porcelain', '--untracked-files=all',
@@ -1069,13 +1082,76 @@ def submodule_problems(ident):
                                                    if s['state'] == ' ' and s['dirty']]
 
 
-def platform_git(install_dir):
-    p = subprocess.run(['git', '-C', install_dir, 'rev-parse', 'HEAD'], capture_output=True, text=True)
+def _git_at(where, *args):
+    return subprocess.run(['git', '-C', str(where), *args], capture_output=True, env=_git_env())
+
+
+def platform_git(install_dir, content=False):
+    """{commit, dirty} of the git checkout at install_dir, None when it is not one. With `content`, also `content`:
+    a sha256 over what its bytes add to that commit (content_digest), or None with `contentError` naming the input
+    it could not read."""
+    p = _git_at(install_dir, 'rev-parse', 'HEAD')
     if p.returncode:
         return None
-    dirty = subprocess.run(['git', '-C', install_dir, 'status', '--porcelain', '--untracked-files=no'],
-                           capture_output=True, text=True).stdout.strip()
-    return {'commit': p.stdout.strip(), 'dirty': bool(dirty)}
+    dirty = _git_at(install_dir, 'status', '--porcelain', '--untracked-files=no').stdout.strip()
+    out = {'commit': p.stdout.decode().strip(), 'dirty': bool(dirty)}
+    if content:
+        try:
+            out['content'] = content_digest(install_dir)
+        except (OSError, RuntimeError) as e:
+            out.update(content=None, contentError=str(e))
+    return out
+
+
+def content_digest(top):
+    """sha256 over a git checkout's bytes beyond its HEAD, from structured inputs only (no diff text, so no git
+    presentation setting enters it): each submodule's state, commit and path (`git submodule status --recursive`),
+    then for the checkout and each initialised submodule every tracked path that differs from its own HEAD (status,
+    mode, current bytes; a link by its target) and every untracked file not ignored, each field length-framed.
+    Ignored files are not bound. RuntimeError or OSError when an input cannot be read."""
+    def run(where, *args):
+        p = _git_at(where, *args)
+        if p.returncode:
+            raise RuntimeError(f'git -C {where} {" ".join(args)}: {p.stderr.decode(errors="replace").strip()}')
+        return p.stdout
+
+    h = hashlib.sha256()
+
+    def frame(*fields):
+        for f in fields:
+            h.update(len(f).to_bytes(8, 'big') + f)
+
+    def entry(f):
+        if f.is_symlink():
+            return b'link', os.fsencode(os.readlink(f))
+        if f.is_dir():
+            raise RuntimeError(f'{f}: an untracked repository, its bytes unbound')
+        return b'file', f.read_bytes()
+
+    top = Path(top)
+    repos = ['.']
+    for line in os.fsdecode(run(top, 'submodule', 'status', '--recursive')).splitlines():
+        parsed = _submodule_status(line)
+        if not parsed:
+            raise RuntimeError(f'git -C {top} submodule status: unparsed line {line!r}')
+        state, commit, path = parsed
+        frame(b'submodule', state.encode(), commit.encode(), os.fsencode(path))
+        if state != '-':   # not initialised: no worktree
+            repos.append(path)
+    for repo in repos:
+        where = top / repo
+        frame(b'repo', os.fsencode(repo))
+        raw = run(where, 'diff', 'HEAD', '--raw', '-z', '--no-renames', '--no-ext-diff', '--ignore-submodules=all')
+        fields = raw.split(b'\0')
+        # ":<old mode> <new mode> <old> <new> <status>", path; by path, as diff.orderFile reorders them
+        for meta, name in sorted(zip(fields[0::2], fields[1::2]), key=lambda e: e[1]):
+            _, mode, _, _, status = meta.split()
+            frame(b'tracked', name, status, mode, *((b'deleted', b'') if status == b'D' else
+                                                     entry(where / os.fsdecode(name))))
+        for name in sorted(n for n in run(where, 'ls-files', '--others', '--exclude-standard', '-z').split(b'\0')
+                           if n):
+            frame(b'untracked', name, *entry(where / os.fsdecode(name)))
+    return h.hexdigest()
 
 
 def contract_identity():
@@ -1170,7 +1246,7 @@ def make_record(args, board, rows, before, diff, roster_path, prepared):
         'fqbn': P.BOARDS[board]['fqbn'], 'experimental': bool(args.experimental),
         'source': {k: before[k] for k in ('head', 'dirty', 'diffSha256', 'submodules') if k in before},
         'buildProperties': args.build_property, 'arduinoCli': tool_version(),
-        'platform': {**platform, 'git': platform_git(platform['install_dir'])},
+        'platform': {**platform, 'git': platform_git(platform['install_dir'], content=True)},
         'dependencies': list(prepared.values()),
         'roster': {'path': rel(roster_path), 'sha256': sha256(roster_path)},
         **identity, 'agentrcSource': {'source': P.AGENTRC['source'], 'dirty': P.AGENTRC['dirty']},
