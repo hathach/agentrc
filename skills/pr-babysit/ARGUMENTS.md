@@ -38,7 +38,9 @@ A key not listed here throws before anything runs.
   skipped that way, then waits for the review up to the silent-bot cap. Once
   per head too, it comments `@coderabbitai review` instead when that tick
   failed (a summary with no box to tick, a failed edit), unless the box reads
-  ticked or such a comment follows the head event. A rate limit leaves no box:
+  ticked or such a comment follows the head event, and when CodeRabbit's
+  review of the head failed (such as a `Review failed` check run), unless such a
+  comment follows the head event. A rate limit leaves no box:
   several PRs share the repository's hourly quota, so the launch waits the
   limit out with no ceiling and never stops for it, commenting
   `@coderabbitai review` once per reset window, a minute past the later of the

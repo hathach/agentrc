@@ -2071,12 +2071,15 @@ const settleSonar = async (cycle, entry, ended) => {
 const MANUAL_SKIP = /^review skipped: manual review required/i
 const manualSkip = (cr) => cr.state === 'settled' && cr.kind === 'skipped' && MANUAL_SKIP.test(cr.reason)
 const limited = (cr) => cr.state === 'settled' && cr.kind === 'limited'
-// Manual skips get one tick and one fallback per head; a rate limit gets a request each reset window.
+const reviewFailed = (cr) => cr.state === 'settled' && cr.kind === 'failed'
+// Manual skips get one tick and one fallback per head, a failed review one request per head (#499); a rate limit gets a
+// request each reset window.
 const coderabbitAskable = (cr, clock) => {
   if (manualSkip(cr)) {
     if (clock.triggeredAt === undefined) return 'tick'
     return !clock.request && clock.triggeredAt === null ? 'request' : null
   }
+  if (reviewFailed(cr)) return clock.request ? null : 'request'
   return limited(cr) ? 'request' : null
 }
 const requestTried = (clock) => clock.request.tried ?? clock.request.at
@@ -2106,11 +2109,11 @@ const triggerCodeRabbit = async (cycle, r, bots, ended) => {
     reviewClock.triggeredAt = outcome === 'failed' ? null : Number.isFinite(Date.parse(t.at)) ? t.at : r.observedAt
   }
   if (limited(cr)) return requestCodeRabbit(cycle, r, cr, ended)
-  if (manual) await requestCodeRabbit(cycle, r, cr, ended)
-  // Waits like a queued bot, its cap counted from the latest ask; working and reviewed go by settleBots alone. Any skip after
-  // the ask is waited on too: the skip asked about may read otherwise once its box is ticked.
+  if (manual || reviewFailed(cr)) await requestCodeRabbit(cycle, r, cr, ended)
+  // Waits like a queued bot, its cap counted from the latest ask; working and reviewed go by settleBots alone. Any skip or
+  // failed review after the ask is waited on too: the one asked about reads so until CodeRabbit starts again.
   const asks = [reviewClock.triggeredAt, reviewClock.request && reviewClock.request.at].filter(t => typeof t === 'string')
-  if (!asks.length || !(cr.state === 'settled' && cr.kind === 'skipped' || cr.state === 'queued' || cr.state === 'absent')) return
+  if (!asks.length || !(cr.state === 'settled' && ['skipped', 'failed'].includes(cr.kind) || cr.state === 'queued' || cr.state === 'absent')) return
   waitAfter(cr, asks.reduce((a, b) => Date.parse(a) >= Date.parse(b) ? a : b), r.observedAt)
 }
 // One trigger script's run through a relay: its line, and the outcome, `failed` for a line it cannot read.
@@ -2185,7 +2188,7 @@ const requestCodeRabbit = async (cycle, r, cr, ended) => {
     return retryLater(cr, Math.min(deadline, cap > observed ? cap : Infinity) - observed)
   }
   if (await ended('crrequest')) return
-  const why = limited(cr) ? 'after its rate limit' : 'that it skipped for a manual review'
+  const why = limited(cr) ? 'after its rate limit' : reviewFailed(cr) ? 'again, its review of the head failed' : 'that it skipped for a manual review'
   const { t, outcome } = await relayTrigger(cycle, 'crrequest', CRTRIGGER_SCRIPT, `Ask CodeRabbit to review PR #${args.pr} ${why}`,
     ` --request${quota ? ` --not-before ${shq(isoSeconds(deadline))}` : ''}`, ['requested', 'already', 'notDue', 'notLimited', 'failed'])
   // A failure before the POST gets one retry (#276); a possibly posted attempt waits for the next window.

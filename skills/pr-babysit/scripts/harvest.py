@@ -86,6 +86,7 @@ CR_RESUME = '`@coderabbitai resume` resumes it'
 CR_RATE = '<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->'
 CR_WALKTHROUGH = '<!-- This is an auto-generated comment: summarize by coderabbit.ai -->'
 CR_RATE_STATUS = 'review rate limited'
+CR_REVIEW_FAILED = 'review failed'
 # A repository CodeRabbit reviews only on request: a box in its summary comment, ticked once asked, or these words beside it (#324).
 CR_TRIGGER_BOX = re.compile(r'^(?P<pre>(?:> )?- \[)(?P<mark>[ xX])(?P<post>\][^\n]*Trigger (?:a manual )?review[^\n]*)$', re.M)
 CR_MANUAL_ONLY = 'does not receive automatic reviews'
@@ -282,6 +283,9 @@ def coderabbit_run(run_, ev, head, stickies):
     if rate_run(run_):
         return record('coderabbit', 'settled', f"check run: {(run_.get('output') or {}).get('title')}", ev, head, 'limited')
     title = ((run_.get('output') or {}).get('title') or '').strip()
+    if run_['status'] == 'completed' and run_.get('conclusion') == 'neutral' and title.lower().startswith(CR_REVIEW_FAILED):
+        # An error on CodeRabbit's side (#499): its review of the head failed, which a request may ask again.
+        return record('coderabbit', 'settled', f'check run: {title}', ev, head, 'failed')
     if run_['status'] == 'completed' and run_.get('conclusion') == 'skipped':
         lowered = title.lower()
         if lowered.startswith('review skipped'):

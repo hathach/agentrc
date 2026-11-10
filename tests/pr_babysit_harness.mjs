@@ -7762,6 +7762,30 @@ test('a failed tick spends no comment: one `@coderabbitai review` asks for the s
   assert.equal(d.result.state.reviewClock.request.at, at(0), "the script's own check finds the standing comment, and it is waited on")
 })
 
+test('a failed CodeRabbit review gets one `@coderabbitai review` per head, waited on to the cap, never an unreadable wait (#499)', async () => {
+  const failedCr = () => bot('coderabbit', { state: 'settled', kind: 'failed', sha: 'head', evidence: ['check run completed/neutral'], reason: 'check run: Review failed' })
+  let n = 0
+  const { result, logs, labels, calls } = await run({
+    args: { coderabbitTrigger: true, maxCycles: 3 }, reviewsPerCycle: () => quiet([++n === 1 ? failedCr() : bot('coderabbit')]),
+  })
+  assert.equal(result.pass, true, result.reason)
+  assert.deepEqual([triggers(labels), requests(labels)], [[], ['crrequest#1']])
+  const call = calls.find(c => c.label === 'crrequest#1')
+  assert.ok(call.prompt.includes(`--head ${HEAD} --request\``), call.prompt)
+  assert.ok(call.prompt.includes('again, its review of the head failed'), call.prompt)
+  assert.ok(logs.includes('cycle 1: crrequest#1: requested (comment 99)'), logs.join('\n'))
+  assert.equal(headLine(logs)[0], 'cycle 1 summary — CI green, reviews: coderabbit review triggered (check run: Review failed, 10m to cap)')
+  // Still failed at the cap after its one request: stopped unreviewed, never asked twice and never read as unreadable.
+  const capped = await run({ args: { coderabbitTrigger: true, maxCycles: 4 }, minutesPerCycle: 5, reviews: quiet([failedCr()]) })
+  assert.equal(capped.result.reason, 'coderabbit-unreviewed')
+  assert.deepEqual([triggers(capped.labels), requests(capped.labels)], [[], ['crrequest#1']])
+  assert.deepEqual(capped.result.coderabbitAsk, { relaunchAsks: null, asked: [{ ask: 'request', at: at(0), requests: 1 }] })
+  // Without the switch nothing is asked, and a failed review settles at once.
+  const plain = await run({ args: { maxCycles: 2 }, reviews: quiet([failedCr()]) })
+  assert.equal(plain.result.pass, true, plain.result.reason)
+  assert.deepEqual(requests(plain.labels), [])
+})
+
 test('a cycle that asked a bot to review and then met a GitHub rate limit stays charged', async () => {
   const { result, labels } = await run({
     args: { coderabbitTrigger: true, maxCycles: 4 }, reviews: quiet([skippedCr()]),

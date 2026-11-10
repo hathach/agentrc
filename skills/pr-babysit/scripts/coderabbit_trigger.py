@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tick CodeRabbit's "Trigger review" box on PR N when it skipped HEAD for a manual review,
-or, with --request, ask it to review once its rate limit on HEAD has reset, or when no tick asked for a skipped HEAD.
+or, with --request, ask it to review once its rate limit on HEAD has reset, when no tick asked for a skipped HEAD, or
+when its review of HEAD failed.
 
   coderabbit_trigger.py --pr N --head SHA [--request [--not-before ISO]] [--repo OWNER/NAME]
 
@@ -23,13 +24,14 @@ Run from the PR checkout; PR N is --repo's, else the checkout's one repository
 With --request, CodeRabbit is read as harvest.py reads it, and a rate-limit
 notice leaves no box to tick (CodeRabbit's docs: comment `@coderabbitai review`
 after the reset); nor does a manual-review skip whose summary lost its box, or
-whose tick failed (#274). The outcome:
+whose tick failed (#274), nor a review of HEAD that failed (#499). The outcome:
 
-  requested   it is limited on HEAD and its reset plus a minute has passed, or
-              it skipped HEAD for a manual review and no box is ticked; the
-              comment was posted and read back
-  already     such a comment was posted at or after the reset, or, on a skip,
-              at or after the head event (harvest.py's), or the box is ticked
+  requested   it is limited on HEAD and its reset plus a minute has passed, it
+              skipped HEAD for a manual review and no box is ticked, or its
+              review of HEAD failed; the comment was posted and read back
+  already     such a comment was posted at or after the reset, or, on a skip or
+              a failed review, at or after the head event (harvest.py's), or on
+              a skip the box is ticked
   notDue      the reset plus a minute is still ahead (retryAt), or no reset
               time can be read (retryAt null) and no --not-before stands in:
               nothing posted
@@ -39,11 +41,11 @@ after its last request, or after it first saw a limit with no reset time),
 moves the reset later, never earlier: a request is posted only once both have
 passed, and only one posted at or after both counts as already.
   notLimited  the PR is not open, SHA is not its head (both read again just
-              before posting), or CodeRabbit is neither rate-limited on it nor
-              skipped it for a manual review
+              before posting), or CodeRabbit is neither rate-limited on it,
+              skipped it for a manual review, nor failed its review
   failed      a read before the post, the post or its read-back failed, or on
-              a skip a standing comment cannot be placed against an unknown
-              head event time
+              a skip or a failed review a standing comment cannot be placed
+              against an unknown head event time
 
 and the line adds retryAt, the reset it read, null when it read none. A failed
 line adds phase: `read` when it failed before the POST, so nothing was posted;
@@ -166,6 +168,8 @@ def unasked(repo, pr, head, not_before=None):
     cr = seen['bots'][0]
     if seen['headSha'] == head and (cr['state'], cr['kind']) == ('settled', 'skipped') and cr['reason'].lower().startswith(SKIP):
         return unasked_skip(pr, head, seen['headEventAt'])
+    if seen['headSha'] == head and (cr['state'], cr['kind']) == ('settled', 'failed'):
+        return unasked_skip(pr, head, seen['headEventAt'], box=False)
     if seen['headSha'] != head or (cr['state'], cr['kind']) != ('settled', 'limited'):
         return {'outcome': 'notLimited', 'detail': f"{state_of(cr)} on {seen['headSha'][:9]}: {cr['reason']}"}, None
     reset = {'retryAt': cr['retryAt']}
@@ -187,11 +191,12 @@ def unasked(repo, pr, head, not_before=None):
     return None, reset
 
 
-def unasked_skip(pr, head, event_at):
-    """unasked's answer on a manual-review skip: an ask stands when the box is ticked or a request follows the head event."""
+def unasked_skip(pr, head, event_at, box=True):
+    """unasked's answer on a manual-review skip: an ask stands when the box is ticked or a request follows the head event;
+    on a failed review (box False) only the request counts, as a ticked box may be what started the review that failed."""
     comments = pages(f'repos/{{owner}}/{{repo}}/issues/{pr}/comments')
     reset = {'retryAt': None}
-    ticked = [c for c in comments if by_coderabbit(c) and any(m['mark'] != ' ' for m in BOX.finditer(c.get('body') or ''))]
+    ticked = [c for c in comments if box and by_coderabbit(c) and any(m['mark'] != ' ' for m in BOX.finditer(c.get('body') or ''))]
     if ticked:
         c = ticked[0]
         return on_comment('already', c, detail=f"comment {c['id']} has its Trigger review box ticked", at=c['updated_at'], **reset), None

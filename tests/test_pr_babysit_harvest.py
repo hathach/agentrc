@@ -134,6 +134,19 @@ class SettleRules(unittest.TestCase):
         r = harvest.coderabbit(HEAD, [manual], [run_], [comment(bot, 'summary\n> - [ ] 🔍 Trigger review', id_=5)], EVENT)
         self.assertEqual(r['state'], 'unknown', 'a manual-review status at the no-files run\'s second')
 
+    def test_a_review_failed_coderabbit_check_run_reads_a_failed_review_of_the_head(self):
+        # #499: adafruit/Adafruit_TinyUSB_Arduino#615's head 553c7327, CodeRabbit's check run completed neutral.
+        summary = 'Result: Error - Hypothesis review incomplete: 0/1 batches completed'
+        run_ = {'id': 14, 'name': 'CodeRabbit', 'status': 'completed', 'conclusion': 'neutral', 'started_at': '2026-11-09T17:20:00Z',
+                'completed_at': '2026-11-09T17:28:29Z', 'output': {'title': 'Review failed', 'summary': summary}}
+        r = harvest.coderabbit(HEAD, [], [run_], [], EVENT)
+        self.assertEqual((r['state'], r['kind'], r['sha'], r['reason']), ('settled', 'failed', HEAD, 'check run: Review failed'))
+        for what, over in (('another neutral title', {'output': {'title': 'Review completed with notes'}}),
+                           ('no title', {'output': {'title': None}}),
+                           ('a failed title on a skipped run', {'conclusion': 'skipped'})):
+            with self.subTest(what):
+                self.assertEqual(harvest.coderabbit(HEAD, [], [{**run_, **over}], [], EVENT)['state'], 'unknown')
+
     def test_a_review_paused_coderabbit_check_run_reads_paused_with_its_resume_command(self):
         # #381: adafruit/Adafruit_TinyUSB_Arduino#595's head; the run completed 38s after the pause comment's last edit.
         run_ = {'id': 13, 'name': 'CodeRabbit', 'status': 'completed', 'conclusion': 'skipped', 'started_at': '2026-11-01T20:21:40Z',
