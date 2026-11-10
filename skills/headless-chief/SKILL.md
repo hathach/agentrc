@@ -13,12 +13,14 @@ first lines to `progress.log`, so the caller tails a file.
 ```bash
 R="${AGENTRC_DIR:-$HOME/.claude}/skills/headless-chief/scripts/chief_run.py"
 python3 "$R" --out <new dir> --worktree <task worktree> --task-file <task.md> \
-  --permission-mode bypassPermissions
+  --task <key> --permission-mode bypassPermissions
 ```
 
 1. **Before launching**: take the target from the assignment, formed as the
    Report rule in `agents/chief.md` forms it (`owner/repo#N` and the task),
-   asking only when it is ambiguous, and name `--out` after it. A task that publishes to a PR carries
+   asking only when it is ambiguous, and name `--out` after it. `--task` is that target as a key
+   (`hathach/agentrc#490:accounting`, `owner/repo#N:babysit`), the same on every relaunch of the task, so
+   its launches add up. A task that publishes to a PR carries
    its grant verbatim and its `Merge grant:` line, per the README's headless
    recipe.
 2. **Launch** in the foreground: it checks the arguments, starts the
@@ -81,8 +83,19 @@ python3 "$R" --out <new dir> --worktree <task worktree> --task-file <task.md> \
 Leave the worktree to chief until it exits; remaining in-scope work goes into
 its task. A signal to the launcher is passed
 on to chief (not on Windows, step 2); the launcher still writes the exit
-line. A relaunch needs a new `--out`; its grant follows the README's
+line. A relaunch needs a new `--out` and the same `--task`; its grant follows the README's
 headless recipe.
+
+Each launch is accounted for in `run.json` in `--out` and in the run ledger, which outlives it
+(`scripts/run_ledger.py` names its path). Both are best-effort and measure only: a lost write leaves a launch
+uncounted and a warning is attempted, so nothing here can enforce a budget yet (#490). What a task has spent:
+
+```bash
+python3 "${AGENTRC_DIR:-$HOME/.claude}/skills/headless-chief/scripts/task_cost.py" [--task <key>] [--json]
+```
+
+A total is a plain sum only when every launch finished with a known cost and the ledger read whole; otherwise it
+says what is known and what is missing.
 
 The rest of the directory is for autopsy: `stream.jsonl` (every event,
 raw), `stderr.log`, and `session`, whose id names the transcript:
