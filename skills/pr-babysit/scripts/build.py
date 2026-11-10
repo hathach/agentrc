@@ -31,7 +31,8 @@ shell calls are bounded waits it out in several: DIR names it, the first call
 starts it in a process of its own and every call, the first included, waits up
 to S seconds for it. A call that sees it finish prints its line with `state`
 `done`, or `timedOut` when it ran past T seconds and was killed (exit is then
-the killed shell's status); one that does not prints {state: running,
+the stopped shell's status, which on Windows, whose tree kill may end the
+shell's children before it, can be 0); one that does not prints {state: running,
 revision, elapsed, seal}, and the next call with the same arguments and DIR
 waits again. A build no call has waited on for A seconds (900) is killed, so a
 caller that stops asking leaves nothing running. A stopped build takes every

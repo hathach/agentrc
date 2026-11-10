@@ -39,6 +39,7 @@ class BuildTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
+        self.addCleanup(self.runners_exited)
         self.repo = Path(tmp.name) / 'repo'
         self.repo.mkdir()
         self.env = git_env()
@@ -47,6 +48,19 @@ class BuildTest(unittest.TestCase):
         self.git('add', '-A')
         self.git('commit', '-qm', 'base')
         self.base = self.git('rev-parse', 'HEAD').strip()
+
+    def runners_exited(self, seconds=30):
+        """Wait for each job runner to exit: it writes its receipt before it exits, and on Windows the runner.log it
+        holds open keeps the temp dir from being removed."""
+        end = time.monotonic() + seconds
+        for log in self.repo.parent.glob('job*/runner.log'):
+            while True:
+                try:
+                    log.unlink()
+                    break
+                except PermissionError:
+                    self.assertLess(time.monotonic(), end, f'a runner still holds {log}')
+                    time.sleep(0.2)
 
     def git(self, *argv):
         return subprocess.run(['git', *argv], cwd=self.repo, env=self.env, check=True,
@@ -270,7 +284,8 @@ class BuildTest(unittest.TestCase):
         code, out = self.job(command, 30, timeout=4)
         self.addCleanup(lambda: os.path.exists(out.get('log', '')) and os.remove(out['log']))
         self.assertEqual((code, out['state'], out['stage']), (0, 'timedOut', 'build'), out)
-        self.assertNotEqual(out['exit'], 0)
+        if os.name != 'nt':  # Windows' taskkill /T may end the shell's children first, and `wait` then returns 0
+            self.assertNotEqual(out['exit'], 0)
         for pid in pids:
             self.gone(pid)
 
