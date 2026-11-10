@@ -257,6 +257,54 @@ class LockName(Base):
         self.assertEqual(hb.lock_name({'name': 'bench'}, 'shared', self.path), 'shared')
 
 
+class Board(Base):
+    def setUp(self):
+        self.path = self.registry(REG)
+        self.bench = {'name': 'bench', 'uid': 'B', 'flasher': {'name': 'jlink', 'uid': '1'}}
+        self.parked = {'name': 'k', 'uid': 'K', 'probe': '000621000000'}
+
+    def roster(self, doc, encoding='utf-8'):
+        path = tmpdir(self) / 'r.json'
+        path.write_text(doc if isinstance(doc, str) else json.dumps(doc), encoding=encoding)
+        return str(path)
+
+    def test_a_named_entry_resolves_bench_or_registered(self):
+        r = self.roster({'boards': [self.bench, {'name': 'm', 'uid': 'M', 'probe': 'E661'}]})
+        self.assertEqual(hb.board(r, 'bench', parked=False, path=self.path), self.bench)
+        self.assertEqual(hb.board(r, 'm', parked=False, path=self.path)['flasher'], {**OPENOCD, 'uid': 'E661'})
+
+    def test_a_parked_board_needs_parked(self):
+        r = self.roster({'boards': [self.bench], 'boards-skip': [self.parked]})
+        with self.assertRaisesRegex(ValueError, r'k is parked \(boards-skip\)'):
+            hb.board(r, 'k', parked=False, path=self.path)
+        self.assertEqual(hb.board(r, 'k', parked=True, path=self.path)['flasher']['uid'], '000621000000')
+        with self.assertRaises(TypeError):
+            hb.board(r, 'k', path=self.path)
+
+    def test_a_missing_or_duplicate_name_is_refused(self):
+        for doc, n in (({'boards': [self.bench]}, 0),
+                       ({'boards': [self.bench, self.bench]}, 2),
+                       ({'boards': [self.bench], 'boards-skip': [self.bench]}, 2)):
+            for parked in (False, True):
+                with self.subTest(doc=doc, parked=parked), self.assertRaisesRegex(ValueError, f"{n} entries named"):
+                    hb.board(self.roster(doc), 'bench' if n else 'absent', parked=parked, path=self.path)
+
+    def test_a_bom_is_read(self):
+        r = self.roster({'boards': [self.bench]}, encoding='utf-8-sig')
+        self.assertEqual(hb.board(r, 'bench', parked=False, path=self.path), self.bench)
+
+    def test_a_malformed_roster_or_entry_is_refused(self):
+        for doc, why in (('{', 'Expecting'), ([], 'a roster is'), ({'boards': {}}, 'a roster is'),
+                         ({'boards': [], 'boards-skip': 1}, 'a roster is'),
+                         ({'boards': [self.bench, 'x']}, "boards: not an object: 'x'"),
+                         ({'boards': [{'name': 'bench', 'uid': 'B'}]}, 'names neither'),
+                         ({'boards': [{**self.parked, 'name': 'bench', 'uid': ''}]}, 'no uid')):
+            with self.subTest(doc), self.assertRaisesRegex(ValueError, why):
+                hb.board(self.roster(doc), 'bench', parked=True, path=self.path)
+        with self.assertRaises(OSError):
+            hb.board(str(tmpdir(self) / 'absent.json'), 'bench', parked=True, path=self.path)
+
+
 class Registry(Base):
     def refused(self, doc, why):
         with self.assertRaisesRegex(ValueError, why):
@@ -304,7 +352,7 @@ class Cli(Base):
         with tempfile.TemporaryDirectory() as td:
             roster = Path(td) / 'r.json'
             probe = next(iter(hb.registry()))
-            roster.write_text(json.dumps({'boards': [{'name': 'x', 'uid': 'X', 'probe': probe}]}))
+            roster.write_text(json.dumps({'boards': [{'name': 'x', 'uid': 'X', 'probe': probe}]}), encoding='utf-8-sig')
             r = self.run_cli('roster', str(roster))
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertEqual(json.loads(r.stdout)['boards'][0]['flasher'],
@@ -327,6 +375,14 @@ class Cli(Base):
             r = self.run_cli('lock', str(roster), 'absent')
             self.assertEqual((r.returncode, r.stdout), (1, ''))
             self.assertIn("0 entries named 'absent'", r.stderr)
+            roster.write_text(json.dumps({'boards': [{'name': 'bad', 'uid': 'B'}, 7]}))
+            r = self.run_cli('lock', str(roster), 'bad')
+            self.assertEqual((r.returncode, r.stdout), (1, ''))
+            self.assertIn('boards: not an object: 7', r.stderr)
+            roster.write_text(json.dumps({'boards': [{'name': 'bad', 'uid': 'B'}]}))
+            r = self.run_cli('lock', str(roster), 'bad')
+            self.assertEqual((r.returncode, r.stdout), (1, ''))
+            self.assertIn('names neither a registered probe nor a flasher', r.stderr)
         self.assertEqual(self.run_cli('lock', 'x').returncode, 2)
 
 

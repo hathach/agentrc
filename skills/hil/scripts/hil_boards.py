@@ -25,13 +25,16 @@ or a rig one project owns) keeps its own, unless its probe is a registered board
 has a board's `dev_attached`, a copy its roster still carries (skills/hil/SKILL.md, Board registry) is
 compared with it and warned about on stderr, never refused; resolve(entry, roster=FILE) names the roster
 file in that warning. resolve_roster(roster) resolves `boards` and `boards-skip`.
-Both raise ValueError naming every problem. lock_name(entry, own) is an entry's board lock.
+Both raise ValueError naming every problem. board(file, name, parked=) is the resolved entry a roster file
+names `name`, refusing a name no entry or several carry and, unless `parked`, one in `boards-skip`.
+lock_name(entry, own) is an entry's board lock.
 A flasher is hil_flash.py's (SKILL.md, Flashers) or tinyusb's `wch_uart_loader` (`args` "" or absent); an
 `openocd` one may carry `args_program`, the openocd commands tinyusb runs after program or reset.
 
   hil_boards.py roster FILE         the resolved roster as JSON (exit 1 refused, 2 usage)
-  hil_boards.py lock FILE BOARD     the board lock of FILE's entry named BOARD, boards-skip included
-                                    (lock_name without `own`: a project lock field is not read)
+  hil_boards.py lock FILE BOARD     the board lock of board(FILE, BOARD, parked=True), resolved, so a
+                                    malformed entry is refused (lock_name without `own`: a project lock
+                                    field is not read)
 """
 
 from __future__ import annotations
@@ -329,22 +332,45 @@ def resolve_roster(roster, path=REGISTRY) -> dict:
     return out
 
 
+def load_roster(roster_file):
+    """A roster file's JSON, a UTF-8 BOM allowed, unchecked; OSError when unreadable, ValueError when not JSON."""
+    with open(roster_file, encoding='utf-8-sig') as f:
+        return json.load(f)
+
+
+def board(roster_file, name, *, parked: bool, path=REGISTRY) -> dict:
+    """The resolved entry of `roster_file` named `name`, a new dict; ValueError for a malformed roster, a name no
+    entry or several carry, or a parked one (in `boards-skip`) unless `parked`. OSError when the file is unreadable."""
+    roster = load_roster(roster_file)
+    if not isinstance(roster, dict) or not isinstance(roster.get('boards'), list) \
+            or not isinstance(roster.get('boards-skip', []), list):
+        raise ValueError('a roster is {"boards": [...], "boards-skip": [...]}')
+    found = []
+    for key in ('boards', 'boards-skip'):
+        for e in roster.get(key, []):
+            if not isinstance(e, dict):
+                raise ValueError(f'{key}: not an object: {e!r}')
+            if e.get('name') == name:
+                found.append((key, e))
+    if len(found) != 1:
+        raise ValueError(f'{len(found)} entries named {name!r}')
+    key, entry = found[0]
+    if key == 'boards-skip' and not parked:
+        raise ValueError(f'{name} is parked (boards-skip)')
+    return resolve(entry, path, roster=roster_file)
+
+
 def main(argv=None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if not (argv[:1] == ['roster'] and len(argv) == 2 or argv[:1] == ['lock'] and len(argv) == 3):
         print(__doc__.rsplit('\n\n', 1)[-1].rstrip(), file=sys.stderr)
         return 2
     try:
-        with open(argv[1], encoding='utf-8-sig') as f:
-            roster = json.load(f)
-        if argv[0] == 'roster':
-            print(json.dumps(resolve_roster(roster), indent=2))
+        if argv[0] == 'lock':
+            print(lock_name(board(argv[1], argv[2], parked=True)))
             return 0
-        found = [e for key in ('boards', 'boards-skip') for e in roster.get(key, []) if e.get('name') == argv[2]]
-        if len(found) != 1:
-            raise ValueError(f'{len(found)} entries named {argv[2]!r}')
-        print(lock_name(found[0]))
-    except (OSError, ValueError, AttributeError) as e:
+        print(json.dumps(resolve_roster(load_roster(argv[1])), indent=2))
+    except (OSError, ValueError) as e:
         print(f'hil_boards: {argv[1]}: {e}', file=sys.stderr)
         return 1
     return 0
