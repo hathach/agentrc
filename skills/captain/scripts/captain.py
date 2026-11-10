@@ -2699,7 +2699,7 @@ def main():
                 at = time.strftime('%H:%M', time.localtime(s['status_ms'] / 1000)) if s['status_ms'] else '?'
                 state = s['status'] + (f' ({s["blocked_on"]})' if s['blocked_on'] else '')
                 said = f'\t"{s["said"]}"' if s['said'] else ''
-                print(f'{s["handle"]}\t{s["kind"]}/{who}\t{state}, reported {at}\t{s["cwd"] or "?"}{note}{said}')
+                print(f'{s["handle"]}\t{s["kind"]}/{who}\t{state}\t{at}\t{s["cwd"] or "?"}{note}{said}')
             return 0
         if a.cmd == 'enroll':
             return enroll(a.replace)

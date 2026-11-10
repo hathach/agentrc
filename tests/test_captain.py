@@ -119,8 +119,8 @@ class SessionsTest(unittest.TestCase):
                 mock.patch('builtins.print') as out:
             captain.main()
         rows = [c.args[0].split('\t') for c in out.call_args_list]   # its cwd column differs on Windows
-        self.assertEqual([(r[2], r[4:]) for r in rows],
-                         [('blocked (permission), reported ?', ['"Edit x?"']), ('idle, reported ?', [])])
+        self.assertEqual([(r[2], r[3], r[5:]) for r in rows],
+                         [('blocked (permission)', '?', ['"Edit x?"']), ('idle', '?', [])])
 
     def test_missing_or_relative_cwd_stays_unknown(self):
         for cwd in (None, '', 'rel/dir'):

@@ -10,9 +10,9 @@ telling whether it shows its input line, and a locked ledger under `~/.cache/age
 and answer. This page is the judgment. Linux only (`/proc`). Claude Code sessions only: a session is pinned through
 the session registry Claude Code keeps under its account's config dir, which Codex has none of, so `list` leaves
 Codex terminals out, and remote (`machine/tN`) ones too. `list` orders sessions by hc's `status_ms`, when each last
-reported its status, latest first: an order, not how long one has been idle. A row ends with the session's own status
-line, quoted, and a blocked one's state names what it waits for: `blocked (permission)`, `(question)` or `(auth)`, as
-of `reported`, unchecked.
+reported its status, latest first: an order, not how long one has been idle. A row gives the state and, in the next
+column, that report's time; it ends with the session's own status line, quoted, and a blocked one's state names what it
+waits for: `blocked (permission)`, `(question)` or `(auth)`, as of that time, unchecked.
 
 ```bash
 python3 ~/.claude/skills/captain/scripts/captain.py list [--json]                   # every other Claude Code session, latest change first
