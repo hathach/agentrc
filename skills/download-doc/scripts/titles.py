@@ -145,7 +145,7 @@ def title(doc):
                (re.sub(r'^ES[_-]', '', w[0]) + (' ' + rest if rest else ''))
 
     head = trim(head)
-    if word and not DOCLINE.search(head):
+    if word and not DOCLINE.search(head) and word.lower() not in head.lower():
         head = f"{head} — {word}" if head else word
 
     head = _drop_redundant_grade(_dedupe_words(head))

@@ -111,7 +111,7 @@ def fetch(doc, mod, tmp: Path) -> tuple:
 
 
 # The shared tag vocabulary: the kinds the adapters normalize to, plus those only `add` files.
-KINDS = sorted(doclib.TECHNICAL_TYPES | {"technical-note", "data-brief", "schematic"})
+KINDS = sorted(doclib.TECHNICAL_TYPES | {"technical-note", "data-brief", "schematic", "specification"})
 
 
 def library_conflict(doc, idx: dict, legacy: dict) -> str | None:
