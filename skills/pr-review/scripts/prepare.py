@@ -23,8 +23,12 @@ sibling another run of this PR has locked is refused before anything is checked
 out, naming that run's token. It
 first settles the pending reviews of ours on the ledger (post.py
 --sync): what the human submitted or deleted on GitHub is recorded, and one still
-pending, or a post never confirmed, refuses the run. It reads the ledger to choose the mode: `same` when the head was
-reviewed already, `incremental` when the last reviewed head is an ancestor and
+pending, or a post never confirmed, refuses the run. Then it brings the last review's standing
+findings to the PR as it reads now (post.py's reconcile, reported as `reconciled`): an inline comment of
+ours edited since stands with its text published, which the recheck judges, and a deleted one drops its
+finding; a listing it cannot read refuses. Review bodies are not reconciled: a finding moved into one keeps its
+recorded text, and post.py --auto holds it once that body reads otherwise. It reads the ledger to choose the mode:
+`same` when the head was reviewed already, `incremental` when the last reviewed head is an ancestor and
 the merge base is unchanged (scope: last head..head), else `full` (scope:
 merge base..head); --full forces full. The scope's changed directories become
 at most MAX_GROUPS review groups, merging to shallower directories when they
@@ -78,7 +82,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ledger import (ONLINE, facts_path, last, ledger_path, load, locked, publications, refuse_unsettled, repo_of, store,  # noqa: E402
                     submitted_last)
-from post import sync  # noqa: E402
+from post import reconcile, sync  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'pr-babysit' / 'scripts'))
 from facts import FULL_SHA, HOST, Parser, Unusable, attempt, checkout_repo, checkout_top, git, github_repo, report, run  # noqa: E402
@@ -479,6 +483,9 @@ def prepare(a):
             auto = ' --auto' if online[-1].get('publish') == 'auto' else ''
             raise Unusable(f"a review POST for {online[-1]['head']} may have landed unseen: reconcile it first with "
                            f"post.py --pr {a.pr} --expected-head {online[-1]['head']}{auto}, which only looks for it by its marker")
+        reconciled = reconcile(repo, a.pr, led)
+        if reconciled:
+            store(path, led)
         conflicts = []
         if a.recheck_from:
             mode, scope_base, conflicts = recheck_of(led, a.pr, a.recheck_from, head, merge_base)
@@ -518,7 +525,7 @@ def prepare(a):
         'lock': lock,
         'changed': len(pr_paths), 'scoped': len(scope), 'groups': groups, 'overCap': over,
         'tooling': [p for p in pr_paths if TOOLING.search(p)], 'ci': ci,
-        'ledger': path.as_posix(), 'facts': facts.as_posix(), 'synced': synced, 'changedFile': changed_file and changed_file.as_posix(),
+        'ledger': path.as_posix(), 'facts': facts.as_posix(), 'synced': synced, 'reconciled': reconciled, 'changedFile': changed_file and changed_file.as_posix(),
         **({'repair': repair} if a.auto_fix else {}),
     }
 

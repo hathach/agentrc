@@ -61,6 +61,7 @@ class FakeGitHub:
         self.posts = []
         self.post_fails = False
         self.list_fails = False
+        self.comments_fail = False
         self.readback_state = None
         self.readback_body = None
         self.next_id = 500
@@ -213,6 +214,8 @@ class FakeGitHub:
                     return 1, '', 'HTTP 502'
                 return 0, json.dumps(page(self.reviews.values()))
             if path == f'repos/{REPO}/pulls/{PR}/comments':
+                if self.comments_fail:
+                    return 1, '', 'gh: Bad Gateway (HTTP 502)'
                 return 0, json.dumps(page(self.inline))
             if path == f'repos/{REPO}/issues/{PR}/comments':
                 return 0, json.dumps(page(self.issue))
@@ -2292,6 +2295,99 @@ class Threads(Case):
         got = {c['id']: c for c in json.loads(f.read_text())['comments']}
         self.assertEqual((got[11]['line'], got[11]['bot'], got[11]['threadId'], got[11]['outdated']), (9, True, 'T2', True))
         self.assertEqual(got[11]['digest'], harvest.digest('bug'))
+
+
+class Reconcile(PostCase):
+    """A posted review's inline comments edited or deleted since are reconciled before a recheck, and an auto post whose
+    recheck judged text the PR no longer shows goes to the human (#383)."""
+
+    def posted(self):
+        """Our auto review on the head: pr7-f1 inline on line 21, pr7-f2 inline on line 20, pr7-f3 in the body."""
+        one = self.result_for(self.p)['findings'][0]
+        findings = [one, {**one, 'line': 20, 'why': 'a is shadowed'}, {**one, 'line': 1, 'why': 'far away'}]
+        draft = {'event': 'COMMENT', 'body': 'Summary.', 'replies': [],
+                 'comments': [{'path': 'src/core/a.c', 'line': 21, 'body': 'b is never initialised', 'finding': 0},
+                              {'path': 'src/core/a.c', 'line': 20, 'body': 'a is shadowed', 'finding': 1},
+                              {'path': 'src/core/a.c', 'line': 1, 'body': 'far away', 'finding': 2}]}
+        self.save(self.result_for(self.p, findings=findings, draft=draft))
+        self.assertEqual(self.post('--auto')['status'], 'posted')
+        return {f['id']: f.get('commentId') for f in self.review()['findings']}
+
+    def comment(self, cid):
+        return next(c for c in self.gh.inline if c['id'] == cid)
+
+    def recheck(self, reason='again'):
+        """A second auto review of the head carrying every standing finding, as a recheck saves it."""
+        carried = [{'id': i, 'status': 'open'} for i in ('pr7-f1', 'pr7-f2', 'pr7-f3')
+                   if any(f['id'] == i and f['status'] == 'open' for f in self.review()['findings'])]
+        self.save(self.result_for(self.p, findings=carried, draft={'event': 'COMMENT', 'body': f'Still open: {reason}.', 'comments': [], 'replies': []}),
+                  reason=reason)
+
+    def test_prepare_records_an_edit_as_published_and_a_deletion_as_dropped_keeping_ids_and_disputes(self):
+        ids = self.posted()
+        led = json.loads(Path(self.p['ledger']).read_text())
+        led['reviews'][-1]['findings'][1]['disputes'] = [{'key': 'k', 'judgedHead': self.head, 'state': 'upheld'}]
+        Path(self.p['ledger']).write_text(json.dumps(led))
+        self.comment(ids['pr7-f1'])['body'] = 'b is never initialised, softened'
+        self.gh.inline = [c for c in self.gh.inline if c['id'] != ids['pr7-f2']]
+        rid = self.review()['receipts']['review']['reviewId']
+        self.gh.reviews[rid]['body'] = 'Edited summary.'
+        got = self.prepare()
+        self.assertEqual(got['reconciled'], [{'findingId': 'pr7-f1', 'commentId': ids['pr7-f1'], 'change': 'edited'},
+                                             {'findingId': 'pr7-f2', 'commentId': ids['pr7-f2'], 'change': 'deleted'}])
+        f1, f2, f3 = self.review()['findings']
+        self.assertEqual((f1['id'], f1['status'], f1['commentId'], f1['published']),
+                         ('pr7-f1', 'open', ids['pr7-f1'], 'b is never initialised, softened'))
+        self.assertEqual((f2['id'], f2['status'], f2['disputes']), ('pr7-f2', 'dropped', [{'key': 'k', 'judgedHead': self.head, 'state': 'upheld'}]))
+        self.assertEqual((f3['status'], f3.get('published')), ('open', None), 'a body line is left for the auto-post hold')
+        self.assertEqual(self.review()['draft']['comments'][0]['body'], 'b is never initialised', 'the draft keeps what we posted')
+        self.assertEqual(self.prepare()['reconciled'], [], 'once recorded, nothing changes again')
+
+    def test_an_unreadable_listing_never_reads_as_a_deletion(self):
+        self.posted()
+        before = Path(self.p['ledger']).read_text()
+        self.gh.comments_fail = True
+        with self.assertRaisesRegex(facts.Unusable, 'HTTP 502'):
+            self.prepare()
+        self.assertEqual(Path(self.p['ledger']).read_text(), before)
+
+    def test_an_auto_post_whose_recheck_judged_text_edited_or_deleted_since_goes_to_the_human(self):
+        ids = self.posted()
+        self.recheck()
+        self.comment(ids['pr7-f1'])['body'] = 'edited after the recheck'
+        got = self.post('--auto')
+        self.assertEqual(got['status'], 'drafted')
+        self.assertIn('pr7-f1 edited', got['handedOver'])
+        self.assertEqual(len(self.gh.submits), 1, 'only the first review was submitted')
+
+    def test_an_auto_post_recovered_after_a_push_reads_no_snapshot_for_stale_text(self):
+        self.posted()
+        self.recheck()
+        self.crash_at('POST')
+        with self.assertRaises(KeyboardInterrupt):
+            self.post('--auto')
+        old = self.head
+        self.commit('src/core/a.c', 'int z;\n', 'z')
+        self.push_pr()
+        with mock.patch.object(post, 'snapshot', side_effect=AssertionError('a snapshot while recovering')):
+            got = self.call(post, ['--pr', str(PR), '--repo', REPO, '--expected-head', old, '--auto'])
+        self.assertEqual((got['status'], got['review']['recovered'], got['handedOver']), ('drafted', True, 'the PR head moved before the submit'))
+
+    def test_an_auto_post_after_a_reconciled_edit_is_submitted_and_a_body_edit_holds_it(self):
+        ids = self.posted()
+        first = self.review()['receipts']['review']['reviewId']
+        self.comment(ids['pr7-f1'])['body'] = 'b is never initialised, softened'
+        self.assertEqual(len(self.prepare()['reconciled']), 1)
+        self.recheck()
+        self.assertEqual(self.post('--auto')['status'], 'posted', 'the recheck judged the text the PR shows')
+        self.gh.reviews[self.review()['receipts']['review']['reviewId']]['body'] = 'Still open, edited.'
+        self.recheck('a third')
+        self.assertEqual(self.post('--auto')['status'], 'posted', 'an edit of a body that states no finding holds nothing')
+        self.gh.reviews[first]['body'] = self.gh.reviews[first]['body'].replace('far away', 'far')
+        self.recheck('a fourth')
+        got = self.post('--auto')
+        self.assertEqual(got['status'], 'drafted')
+        self.assertIn('pr7-f3 edited', got['handedOver'])
 
 
 class Ownership(PostCase):

@@ -38,7 +38,9 @@ checkout's top level, with `--full` when the request says `full` and
 records what the human did with our pending reviews on GitHub, and refuses
 while one is still pending or a post was never confirmed: stop and report what
 it names for the human to finish, delete or reconcile; auto-post never submits
-an older pending review. It makes
+an older pending review. Then it records what was edited or deleted since of
+the last posted review's inline comments (`reconciled`, post.py's
+`reconcile()` has the rule), so its recheck judges the text the PR shows. It makes
 `.worktrees/pr-review-<N>`, or the sibling `<checkout>--pr-review-<N>` when
 the checkout is a linked worktree, on branch `pr-review-<N>` at
 the PR head (an existing tree at either place is reused) and picks
@@ -132,7 +134,9 @@ Auto-post, when the request names it: the review is submitted as `COMMENT` or
 `REQUEST_CHANGES`, never `APPROVE`, with fix notes and resolves on our own
 threads whose fix a recheck verified. It is the same pending review, submitted
 by `post.py` once its head and fix notes check out and no text is held (a body
-line whose first line no check verified); otherwise it is
+line whose first line no check verified, or a standing finding whose text on
+the PR no longer reads as the ledger holds it: edited or deleted since the
+prepare, in a review body edited since, or never placed); otherwise it is
 handed to the human as a pending review (`handedOver`, exit 1), its fix notes
 staged unless the head moved or an earlier run left it pending. Answers to
 pushback (a concession or a rebuttal) are never submitted: they go into a
@@ -251,7 +255,8 @@ pending review holds its thread answers beside the replies they answer
 `firstLineUnchecked` for them to check before submitting. They edit, delete or add, pick the
 event and submit, or delete the whole review. The next `prepare.py` records
 the outcome: a deleted comment drops its finding; an edited one stands, and
-its next recheck reads the text published; a concession withdraws its finding
+its next recheck reads the text published, as it does for an inline comment
+edited or deleted after the review was submitted; a concession withdraws its finding
 only when submitted as drafted; the threads of published concessions and fix
 notes are resolved unless the head moved or someone replied since, in which
 case the next review rechecks them first (`post.py`'s docstring has the

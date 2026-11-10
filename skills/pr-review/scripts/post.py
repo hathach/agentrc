@@ -24,7 +24,9 @@ A body line whose first line no check verified (firstLineUnchecked) is named for
 
 --auto takes the same path, refusing APPROVE: the pending review with its fix notes (never its answers), then, while the
 head is still the draft's and every note reads back, a submit with the draft's event (its intent stored first, never
-sent twice) and the same settling as a human's submit. Held text, a moved head, an unconfirmed note, a pending review an
+sent twice) and the same settling as a human's submit. Held text (that body line, or a standing finding of the last
+review on the PR whose text no longer reads as the ledger holds it, ledger.py's stale: edited or deleted since the
+prepare reconciled it, or never placed, so the recheck judged other text), a moved head, an unconfirmed note, a pending review an
 earlier run left (only the human sees it, so it may have changed) or a submit whose outcome cannot be read hands the
 pending review to the human instead (handedOver, exit 1), who finishes it like any draft; a later post.py run then
 publishes its answers. Thread answers are never submitted: the review's are put in an answer publication on it
@@ -46,6 +48,8 @@ left for --auto to recover by its marker). Submitted: posted, with the event the
   resolved, deferred or observed (already resolved): one left sent (its answer unconfirmed), or resolved and
   reopened since, is never resolved again by itself, nor one whose repair note was deleted or edited before its
   resolve, whatever older answer of ours the thread holds.
+A posted review is never settled again; prepare.py runs reconcile() after --sync, so the next recheck judges the last
+posted review's inline comments as the PR shows them (reconcile() has the rule).
 
 --fixed FILE, once an auto-fix repair is pushed and the PR head is SHA: FILE is {"reviewedHead": the last review's
 head, which must be submitted, "findings": [{id, claimDigest, verdict: "verified", checkedSha: SHA, note, evidence}]},
@@ -77,8 +81,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ledger import (DRAFTS, ONLINE, OPEN, SETTLED, UNSETTLED, add_answers, answer_root, answered_ids, answers_of, claim,  # noqa: E402
-                    holder, note_hold, open_answers, owner_of, publications, pushback, reached, receipted, repair_hold, repairs, submitted_last,
-                    thread_roots, digest as ledger_digest, ledger_path, load, locked, repo_of, store)
+                    holder, last, note_hold, open_answers, owner_of, publications, published_at, pushback, reached, receipted,
+                    repair_hold, repairs, stale, submitted_last, thread_roots, digest as ledger_digest, ledger_path, load, locked,
+                    repo_of, store)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'pr-babysit' / 'scripts'))
 from facts import FULL_SHA, Parser, Unusable, attempt  # noqa: E402
@@ -477,6 +482,41 @@ def sync(repo, pr, led, persist):
 EARLIER = 'an earlier run left it pending, open to changes since'
 
 
+def reconcile(repo, pr, led):
+    """Bring the last review's standing findings to the PR as it reads now, before a recheck judges them: an inline
+    comment of ours edited since our receipts placed it stands with the text published, a deleted one drops its
+    finding. The whole listing is read first, so one that cannot be read refuses rather than reading as a deletion.
+    Review bodies are not reconciled: a finding moved into one keeps its recorded text, and holder() holds it from --auto
+    once that body reads otherwise; one no receipt places stays as it is, always held."""
+    rev = last(led)
+    placed = [(f, at) for f in (rev or {}).get('findings', []) if f['status'] in OPEN
+              for at in [published_at(led, f)] if at and at[0] == 'review']
+    if not placed:
+        return []
+    live = {c['id']: c for c in pages(f'repos/{repo}/pulls/{pr}/comments')}
+    out = []
+    for f, (_, cid, want) in placed:
+        c = live.get(cid)
+        if c is None:
+            f['status'] = 'dropped'
+        elif digest(c.get('body')) != want:
+            f['published'] = c.get('body')
+        else:
+            continue
+        out.append({'findingId': f['id'], 'commentId': cid, 'change': 'deleted' if c is None else 'edited'})
+    return out
+
+
+def stale_text(repo, pr, led, login):
+    """Why an auto post must go to the human because standing findings its recheck judged no longer read on the PR as
+    the ledger holds them (ledger.py's stale), or ''."""
+    rev = last(led)
+    if not rev or not any(f['status'] in OPEN for f in rev.get('findings', [])):
+        return ''
+    held = stale(led, snapshot(repo, pr, login, receipted(led)))
+    return held and f"standing findings whose text the PR no longer shows as judged ({', '.join(f'{i} {w}' for i, w in held)})"
+
+
 def review_state(repo, pr, rid):
     """(exit code, state or None when unread, stderr) of one of our reviews on GitHub."""
     code, text, err = attempt('gh', 'api', f"repos/{repo}/pulls/{pr}/reviews/{rid}")
@@ -784,6 +824,8 @@ def collect(argv):
         login = gh_json('api', 'user')['login']
         if not a.auto:
             return {**publish_draft(repo, a.pr, led, review, login, recovering, persist), 'firstLineUnchecked': unchecked}
+        if not recovering:  # recovery hands the review to the human whatever its text
+            hold = '; '.join(x for x in (hold, stale_text(repo, a.pr, led, login)) if x)
         out = {**publish_auto(repo, a.pr, led, review, event, login, recovering, persist, hold), 'firstLineUnchecked': unchecked}
         answers = [p for p in review.get('answerPublications', []) if p.get('auto') and p['status'] in DRAFTS]
         if answers and review['status'] == 'posted' and not recovering:

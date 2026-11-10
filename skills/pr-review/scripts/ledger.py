@@ -52,8 +52,8 @@ why: `disputed`, `unmapped` (no receipt places its text), `grouped` (unmapped an
 because its group's printed text states its defect, and that text still stands: a claim of that review whose comment
 the snapshot still lists, or the group's `lead` finding, not muted and itself in `fix`), `deleted`, `edited` (the
 inline comment, or the body of the review it was moved into, reads otherwise) or `replied`. `autoPost` is false when
-any is held `unmapped`, `deleted` or `edited`: a recheck would judge text the ledger no longer holds, so its review
-goes to the human as a pending one. A `grouped` one has no text of its own on the PR to diverge, so it does not; a
+any is held `unmapped`, `deleted` or `edited` (STALE): a recheck would judge text the ledger no longer holds, so its
+review goes to the human as a pending one; post.py --auto holds every auto post by the same rule (stale()). A `grouped` one has no text of its own on the PR to diverge, so it does not; a
 muted one whose group's text the human deleted, edited, dropped or contested, or one in a review saved before `muted`
 existed, is held `unmapped`, and one in a review saved before `lead` existed is grouped only through a listed claim.
 
@@ -585,12 +585,13 @@ def holder(led, snapshot):
     return hold
 
 
-def fixable(led, snapshot, head):
-    online = [x for x, _ in publications(led) if x['status'] in ONLINE]
-    if online:
-        raise Unusable(f"a {online[-1]['status']} publication for {online[-1]['head']} is not settled, so the last review on the PR "
-                       'is unknown: reconcile it first')
-    rev = submitted_last(led, head)
+# A standing finding held for these has no text on the PR that the ledger holds: a recheck would judge other text.
+STALE = ('unmapped', 'deleted', 'edited')
+
+
+def standing_holds(led, rev, snapshot):
+    """[(finding, why it is held, or None)] for rev's standing findings as the snapshot shows the PR: holder()'s, and
+    `grouped` for an unmapped muted one whose group's printed text still stands."""
     hold = holder(led, snapshot)
     standing = [(f, hold(f)) for f in rev.get('findings', []) if f['status'] in OPEN]
     # The defects whose group's printed text still stands: a claim whose comment is on the PR, or the lead's own text
@@ -600,17 +601,31 @@ def fixable(led, snapshot, head):
     stated = ({c.get('defect') for c in rev.get('claims') or [] if c.get('commentId') in on_pr}
               | {f.get('defect') for f, why in standing
                  if f.get('lead') and not f.get('muted') and why is None}) - {None}
+    return [(f, 'grouped' if why == 'unmapped' and f.get('muted') and f.get('defect') in stated else why)
+            for f, why in standing]
+
+
+def stale(led, snapshot):
+    """(finding id, why) for each standing finding of the last review on the PR held for STALE text."""
+    rev = last(led)
+    return [(f['id'], why) for f, why in standing_holds(led, rev, snapshot) if why in STALE] if rev else []
+
+
+def fixable(led, snapshot, head):
+    online = [x for x, _ in publications(led) if x['status'] in ONLINE]
+    if online:
+        raise Unusable(f"a {online[-1]['status']} publication for {online[-1]['head']} is not settled, so the last review on the PR "
+                       'is unknown: reconcile it first')
+    rev = submitted_last(led, head)
     fix, held = [], []
-    for f, why in standing:
-        if why == 'unmapped' and f.get('muted') and f.get('defect') in stated:
-            why = 'grouped'
+    for f, why in standing_holds(led, rev, snapshot):
         if why:
             held.append({'findingId': f['id'], 'commentId': f.get('commentId'), 'why': why})
         else:
             # The text the PR shows, as the human edited it, and the digest a repair's fix check names.
             fix.append({**open_row(f, {}), 'claimDigest': digest(claim(f))})
     return {'fix': sorted(fix, key=by_severity), 'held': held,
-            'autoPost': not any(h['why'] in ('unmapped', 'deleted', 'edited') for h in held)}
+            'autoPost': not any(h['why'] in STALE for h in held)}
 
 
 def add_answers(review, head, answers, auto=False, output=None):
