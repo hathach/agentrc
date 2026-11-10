@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test as nodeTest } from 'node:test'
@@ -48,8 +48,11 @@ const bare = (v) => Array.isArray(v) ? v.map(bare)
 const sealLine = (facts) => ({ ...facts, seal: fnv1a(canonical(bare(facts))) })
 // [reviewers, auto-runners] as the validator prompt's harvest command names them.
 const harvestFlags = (prompt) => ['--reviewers', '--auto-run'].map(f => new RegExp(`${f} ([^\\s\`]+)`).exec(String(prompt))?.[1].split(',') ?? [])
-// The JSON a prompt ends with after `key: `, or its trailing list on a line of its own.
-const payloadOf = (prompt, key) => JSON.parse(String(prompt).match(new RegExp(`${key}: (\\{.*\\})$`))[1])
+// The JSON a relay command stages for its script (staged()), decoded as its Python stage decodes it.
+const stagedOf = (prompt) => JSON.parse(Buffer.from(String(prompt).match(/printf '%s' '([A-Za-z0-9+/=]*)' \| /)[1], 'base64').toString('utf8'))
+// The staged JSON's text, '' for a prompt that stages none.
+const stagedText = (prompt) => /printf '%s' '/.test(String(prompt)) ? JSON.stringify(stagedOf(prompt)) : ''
+// A prompt's trailing list on a line of its own.
 const trailingList = (prompt) => JSON.parse(String(prompt).slice(String(prompt).indexOf('\n[') + 1))
 // The workflow's failure identity.
 const failureKey = (f) => JSON.stringify([f.workflow, f.job, f.cell, f.signature])
@@ -66,7 +69,7 @@ const COLLECT_CONTRACT = Number(body.match(/^const COLLECT_CONTRACT = (\d+)$/m)[
 // The values a relay prompt passes a script, each shell-quoted as --flag='value'.
 const flagValues = (prompt, flag) => [...String(prompt).matchAll(new RegExp(`--${flag}='((?:[^']|'\\\\'')*)'`, 'g'))].map(m => m[1].replaceAll("'\\''", "'"))
 const askedOf = (prompt) => JSON.parse(String(prompt).match(/each needing exactly one entry in your reply: (\[.*\])\./)[1])
-const manifestOf = (calls, label) => payloadOf(calls.find(c => c.label === label).prompt, 'Manifest').replies
+const manifestOf = (calls, label) => stagedOf(calls.find(c => c.label === label).prompt).replies
 // The nth commit a run makes. Each is distinct, as a real commit is, because the
 // audit rejects one whose SHA equals its parent.
 const shaFor = (n) => (SHA.slice(0, 38) + String(n).padStart(2, '0')).toLowerCase()
@@ -338,7 +341,7 @@ async function run(opts = {}) {
         if (opts.recall) answer = opts.recall(answer, text)
       } else if (/ remember /.test(text)) {
         // A patch replaces the stored failures of its keys; the stub refuses no patch.
-        for (const v of trailingList(text)) {
+        for (const v of stagedOf(text)) {
           const old = store.get(key(v.link))
           store.set(key(v.link), v.patch ? { ...old, failures: old.failures.map(f => v.patch.find(p => failureKey(p) === failureKey(f)) ?? f) } : v)
         }
@@ -432,7 +435,7 @@ async function run(opts = {}) {
       // lost (lost), the agent invented an id (strayDoneIds), the id is on
       // none of the PR's id spaces (noTarget), it names a review body
       // (reviewBody) or the receipts are reshaped (receipts).
-      const entries = JSON.parse(String(prompt).match(/Manifest: (\{.*\})$/)[1]).replies
+      const entries = stagedOf(prompt).replies
       // reply.py's error line before anything is posted (replyError), as the relay is told to return it.
       const scriptError = opts.replyError && opts.replyError(label)
       if (scriptError) return conforms(options.schema, { ...(typeof scriptError === 'string' ? { error: scriptError } : scriptError), receipts: [] }, label)
@@ -544,7 +547,7 @@ async function run(opts = {}) {
       if (opts.reuse === null) return null
       const scriptError = opts.replyError && opts.replyError(label)
       if (scriptError) return conforms(options.schema, { error: scriptError, receipts: [] }, label)
-      const { reuses } = payloadOf(prompt, 'Reuses')
+      const { reuses } = stagedOf(prompt)
       return conforms(options.schema, { receipts: printed(reuses.map(u => ({
         commentId: u.commentId, kind: 'review', replyId: u.replyId, digest: u.bodyDigest,
         sent: false, posted: false, verified: true, resolved: true, error: null,
@@ -556,7 +559,7 @@ async function run(opts = {}) {
       // launch marked found resolved by a rerun; a --receipt path its first run saved replays that run's line.
       const path = String(prompt).match(/--receipt '([^']+)'/)?.[1]
       if (path && receiptFiles.has(path)) return receiptFiles.get(path)
-      const items = payloadOf(prompt, 'Manifest').items
+      const items = stagedOf(prompt).items
       const answer = typeof opts.sonar === 'function' ? opts.sonar(items, label)
         : { results: items.map(x => ({ commentId: x.commentId, issue: `K${x.commentId}`,
           ...sonarMarked.has(x.commentId) ? { outcome: 'resolved', detail: 'RESOLVED FALSE-POSITIVE' } : { outcome: 'marked', detail: 'false positive' } })) }
@@ -687,6 +690,7 @@ async function run(opts = {}) {
       }, workflow, null,
       ...ABSENT.map(() => undefined))
     // Outside the stub: the workflow catches relay exceptions, including a failed assertion inside one.
+    for (const { label, prompt } of journal) assert.doesNotMatch(prompt, /<AGENTRC_|<that file>/, `${label}: no placeholder reaches an agent (#510)`)
     for (const { label, prompt } of calls.filter(c => c.label.startsWith('crrequest#'))) {
       for (const [, value] of prompt.matchAll(/ --not-before ([^\s`]+)/g)) {
         assert.match(value.replace(/^'(.*)'$/, '$1'), /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/, `${label}: coderabbit_trigger.py's ISO contract`)
@@ -1366,10 +1370,64 @@ test('the committer gets the claims without their hints, and the message on stdi
   const commit = calls.find(c => c.label === 'commit#1-review').prompt
   assert.doesNotMatch(commit, /hint:|rewrite it all/)
   assert.match(commit, /The fixes: \["src\/a\.c:\d+ /)
-  assert.match(commit, /commits\.py commit --receipt '\/tmp\/pr-babysit-receipts-x\/commit#1-review\.json' --request 'commit#1-review' 'src\/a\.c' < '<that file>'; rm -f '<that file>'`/)
-  const quoted = calls.filter(c => c.prompt.includes("'<that file>'"))
-  assert.ok(quoted.some(c => c.label.startsWith('reply')) || quoted.length > 1, 'more than the commit quotes its file')
-  for (const c of quoted) assert.match(c.prompt, /a new temporary file[^:]*, a name without quotes/, c.label)
+  // The message file is one the workflow names, outside .git, and the commit runs only after its write (#510).
+  const [, file] = commit.match(/with your file tool to exactly (\/tmp\/pr-babysit-receipts-x\/commit_1-review\.1\.[0-9a-f]{8}\.in), outside the checkout/)
+  assert.ok(commit.includes(`Only once that write has returned, run exactly \`AGENTRC_EMIT=`), commit)
+  assert.ok(commit.includes(`commits.py commit --receipt '/tmp/pr-babysit-receipts-x/commit#1-review.json' --request 'commit#1-review' 'src/a.c' < '${file}'\``), commit)
+  assert.doesNotMatch(commit, /temporary file|mktemp|rm -f/)
+})
+
+// A relay command as Bash runs it: `cmd` from its prompt, its AGENTRC_EMIT moved to `emit`; the scripts under `root`.
+const runCommand = (cmd, root, emit, env = {}) => spawnSync('bash', ['-c', cmd.replace(/AGENTRC_EMIT='[^']+' /, `AGENTRC_EMIT='${emit}' `)],
+  { encoding: 'utf8', env: { ...process.env, AGENTRC_DIR: root, ...env } })
+const commandOf = (prompt) => String(prompt).match(/run exactly `([^`]*)` and answer/)[1]
+
+const HOSTILE = `it's "quoted", \\ back\; \`tick\` $(touch /tmp/pwned) '\\'' \r\nline\r\n naïve ✓ 😀   EOF`
+// A stage that does not decode to the JSON sent: cut short, other JSON, not base64.
+const corrupted = (b64, json) => [Buffer.from(json.slice(0, -1)).toString('base64'), Buffer.from('[]').toString('base64'), `${b64.slice(0, 10)}!${b64.slice(11)}`]
+
+test('hostile text in a reply body reaches reply.py byte for byte; a corrupted stage runs no script (#510)', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'pr-babysit-exec-'))
+  try {
+    const { calls, emitDir } = await run({
+      keepEmit: true, args: YIELD, reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: HOSTILE }], bots: 'reviewed' },
+    })
+    // reply.py stands in as a copy of its --manifest beside its receipt; the stage is the real facts.py's.
+    const stub = join(tmp, 'skills', 'pr-reply', 'scripts')
+    mkdirSync(stub, { recursive: true })
+    writeFileSync(join(stub, 'reply.py'), 'import shutil, sys\nshutil.copy(sys.argv[sys.argv.index("--manifest") + 1], sys.argv[-1] + ".got")\n')
+    cpSync(fileURLToPath(new URL('../lib', import.meta.url)), join(tmp, 'lib'), { recursive: true })
+    cpSync(fileURLToPath(new URL('../skills/pr-babysit/scripts/facts.py', import.meta.url)), join(tmp, 'skills', 'pr-babysit', 'scripts', 'facts.py'))
+    const reply = calls.find(c => c.label === 'replies#1')
+    const sent = stagedOf(reply.prompt)
+    assert.equal(sent.replies[0].body, HOSTILE)
+    const out = join(tmp, 'receipt')
+    const cmd = commandOf(reply.prompt).replace(/--receipt '[^']+'/, `--receipt '${out}'`)
+    const got = runCommand(cmd, tmp, join(tmp, 'r.js'))
+    assert.equal(got.status, 0, got.stderr)
+    assert.equal(readFileSync(`${out}.got`, 'utf8'), JSON.stringify(sent), 'the manifest is the JSON the workflow sent, byte for byte')
+    assert.equal(existsSync('/tmp/pwned'), false)
+    const b64 = cmd.match(/printf '%s' '([^']*)'/)[1]
+    for (const bad of corrupted(b64, JSON.stringify(sent))) {
+      rmSync(`${out}.got`, { force: true })
+      assert.notEqual(runCommand(cmd.replace(b64, bad), tmp, join(tmp, 'bad.js')).status, 0)
+      assert.equal(existsSync(`${out}.got`), false, 'reply.py never ran')
+    }
+    rmSync(emitDir.split('/agentrc-emit/')[0], { recursive: true, force: true })
+  } finally { rmSync(tmp, { recursive: true, force: true }) }
+})
+
+test('every script input is written by the command that runs the script, at a path the workflow names (#510)', async () => {
+  const { calls } = await run({ reviews: { findings: [finding(), invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'not so' }], bots: 'reviewed' }, args: { autoPush: true } })
+  const inputs = calls.filter(c => /printf '%s' /.test(c.prompt))
+  assert.deepEqual(inputs.map(c => c.label).sort(), ['replies#1', 'resolve#1'])
+  for (const c of inputs) {
+    // One command: the stage, then the script under `&&`, both naming the one input file beside the line.
+    const [, cmd] = c.prompt.match(/run exactly `([^`]*)`/)
+    const [, stage, emit, rest] = cmd.match(/^(printf .*) && AGENTRC_EMIT='([^']+)\.js' (.*)$/)
+    assert.ok(stage.includes(` '${emit}.in' `) && rest.includes(` --manifest '${emit}.in' `), cmd)
+    assert.doesNotMatch(c.prompt, /temporary file|mktemp|Manifest:/, c.label)
+  }
 })
 
 test('an unresolved build contract, or a build that did not run, blocks the batch as unverifiable, a failed build as unverified', async () => {
@@ -2251,7 +2309,7 @@ test('the same head in a later cycle is not judged again, and an unclassified ve
   const store = new Map()
   const first = await run({ store, args: YIELD, reviews: WAITING, ci: redWith(RIG, UNPLACED).ci })
   assert.equal(first.result.reason, 'ci-red-unclassified')
-  assert.deepEqual(trailingList(first.calls.find(c => c.label === 'ci:collect#1.w').prompt).map(v => v.link), ['https://github.com/o/r/actions/runs/1/job/1', 'https://github.com/o/r/actions/runs/1/job/2'])
+  assert.deepEqual(stagedOf(first.calls.find(c => c.label === 'ci:collect#1.w').prompt).map(v => v.link), ['https://github.com/o/r/actions/runs/1/job/1', 'https://github.com/o/r/actions/runs/1/job/2'])
   const { calls } = await run({ store, base: 'b2', args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci: redWith(RIG, UNPLACED).ci })
   const second = calls.find(c => c.label === 'ci:collect#2.f').prompt
   assert.doesNotMatch(second, /job\/1'/, 'the rig-side verdict is reused')
@@ -2267,7 +2325,7 @@ test('a stored check with an unclassified failure is judged again for that failu
   const store = new Map()
   const first = await run({ store, args: YIELD, reviews: WAITING, ci: redWith(RIG).ci, judge: judgeWith(MIXED) })
   assert.equal(first.result.reason, 'ci-red-unclassified')
-  assert.equal(trailingList(first.calls.find(c => c.label === 'ci:collect#1.w').prompt)[0].failures.length, 3, 'a mixed check is stored')
+  assert.equal(stagedOf(first.calls.find(c => c.label === 'ci:collect#1.w').prompt)[0].failures.length, 3, 'a mixed check is stored')
   const placed = { ...MIXED[1], verdict: 'rig-side', firstError: 'placed by the notes' }
   const again = await run({ store, args: { ...YIELD, state: first.result.state, ciNotes: 'pico b is the probe' }, reviews: WAITING, ci: redWith(RIG).ci, judge: judgeWith([placed]) })
   const [asked] = askedOf(judgePrompt(again.calls, 2))
@@ -2276,7 +2334,7 @@ test('a stored check with an unclassified failure is judged again for that failu
   const report = again.result.history.at(-1).ci.realFailures
   assert.deepEqual(report.map(f => [f.cell, f.verdict, f.firstError]), [['pico a', 'rig-side', 'pico a failed'], ['pico b', 'rig-side', 'placed by the notes'], ['pico c', 'rig-side', 'pico c failed']])
   assert.notEqual(again.result.reason, 'ci-red-unclassified')
-  assert.deepEqual(trailingList(again.calls.find(c => c.label === 'ci:collect#2.w').prompt), [{ link: 'https://github.com/o/r/actions/runs/1/job/1', bucket: 'fail', patch: [placed] }], 'stored as a patch of what changed')
+  assert.deepEqual(stagedOf(again.calls.find(c => c.label === 'ci:collect#2.w').prompt), [{ link: 'https://github.com/o/r/actions/runs/1/job/1', bucket: 'fail', patch: [placed] }], 'stored as a patch of what changed')
   const settled = await run({ store, args: { ...YIELD, state: again.result.state }, reviews: WAITING, ci: redWith(RIG).ci })
   assert.equal(settled.labels.includes('ci:judge#3'), false, 'then reused whole')
 })
@@ -3687,7 +3745,7 @@ test('an upheld refutation still replies and resolves', async () => {
   })
   const posted = calls.find(c => c.label.startsWith('replies#'))
   assert.ok(posted, 'expected the refutation to be posted')
-  assert.match(posted.prompt, /"commentId":1/)
+  assert.match(stagedText(posted.prompt), /"commentId":1/)
 })
 
 test('sibling refutations on one comment are merged into its single reply', async () => {
@@ -3705,8 +3763,8 @@ test('sibling refutations on one comment are merged into its single reply', asyn
   })
   const posted = calls.filter(c => c.label.startsWith('replies#'))
   assert.equal(posted.length, 1, 'one posting agent, one reply per thread')
-  assert.match(posted[0].prompt, /the first point misreads the guard/)
-  assert.match(posted[0].prompt, /the second point is about dead code/)
+  assert.match(stagedText(posted[0].prompt), /the first point misreads the guard/)
+  assert.match(stagedText(posted[0].prompt), /the second point is about dead code/)
   assert.equal(result.pass, true, `both dismissals must be settled (got ${result.reason})`)
 })
 
@@ -3722,7 +3780,7 @@ test('an overturned finding is fixed, replied to, and carries the challenger rea
   // every finding on the comment was overturned, so the fix note is NOT withheld
   const resolve = calls.find(c => c.label.startsWith('resolve#'))
   assert.ok(resolve, 'expected the fix note to be posted')
-  assert.match(resolve.prompt, /"commentId":1/)
+  assert.match(stagedText(resolve.prompt), /"commentId":1/)
 })
 
 test('an overturned finding with no hint carries the evidence alone', async () => {
@@ -3808,8 +3866,8 @@ test('two valid findings on one comment share one fix note', async () => {
   })
   const resolve = calls.filter(c => c.label.startsWith('resolve#'))
   assert.equal(resolve.length, 1)
-  assert.equal([...resolve[0].prompt.matchAll(/"commentId":1\b/g)].length, 1, 'one note for the thread')
-  assert.match(resolve[0].prompt, /Fixed in [0-9a-f]{40}\.\\n\\n- src\/a\.c:1\\n- src\/a\.c:9"/, 'both findings named in the one note')
+  assert.equal([...stagedText(resolve[0].prompt).matchAll(/"commentId":1\b/g)].length, 1, 'one note for the thread')
+  assert.match(stagedText(resolve[0].prompt), /Fixed in [0-9a-f]{40}\.\\n\\n- src\/a\.c:1\\n- src\/a\.c:9"/, 'both findings named in the one note')
   assert.doesNotMatch(resolve[0].prompt, /leak/)
   assert.equal(result.pass, true, `the comment must be settled (got ${result.reason})`)
 })
@@ -3949,7 +4007,7 @@ for (const [name, { harvests, verdicts, maxCycles, ...over }, outcome] of [
     if ('notReason' in outcome) assert.notEqual(result.reason, outcome.notReason)
     if ('outstanding' in outcome) assert.deepEqual(result.outstanding, outcome.outstanding)
     if (outcome.log) assert.ok(logs.some(l => l.includes(outcome.log)), logs.join('\n'))
-    const posted = calls.find(c => c.label.startsWith('replies#'))?.prompt ?? ''
+    const posted = stagedText(calls.find(c => c.label.startsWith('replies#'))?.prompt)
     for (const [id, n] of Object.entries(outcome.posted ?? {})) assert.equal(posted.split(`"commentId":${id}`).length - 1, n, `comment ${id} in ${posted}`)
   })
 }
@@ -3980,7 +4038,7 @@ const reanswered = async () => {
 test('the caller\'s reply settles a handed-off comment once reply.py reads both back at the head it was judged on', async () => {
   const { edited, at, state, settlement } = await reanswered()
   const { result, calls, logs } = await run({ reviews: edited, preflight: at, args: { ...YIELD, state, replySettlements: [settlement] } })
-  assert.deepEqual(payloadOf(calls.find(c => c.label === 'reuse#3').prompt, 'Reuses').reuses,
+  assert.deepEqual(stagedOf(calls.find(c => c.label === 'reuse#3').prompt).reuses,
     [{ commentId: 1, replyId: 777, bodyDigest: 'abcd1234', originalDigest: 'edited' }])
   assert.deepEqual(result.settlements, [{ commentId: 1, outcome: 'settled', replyId: 777 }])
   assert.deepEqual(result.rollup.rows.map(r => [r.commentDigest, r.reply]), [['edited', { how: 'caller', replyId: 777, settled: true }]],
@@ -4310,7 +4368,7 @@ test('a reply that reads back as the offered body is the caller\'s to settle on,
   const settlement = { commentId: 2, commentDigest: 'd2', replyId: 502, bodyDigest: fnv1a('not so'), headSha: first.result.state.expectedHead }
   const { result, labels, calls } = await resumeAt(first.result.state, { ...wrong, args: { autoPush: true, maxCycles: 3, replySettlements: [settlement] } })
   assert.deepEqual(labels.filter(l => /^(replies|inspect|edit|reuse)#/.test(l)), ['reuse#2'])
-  assert.deepEqual(payloadOf(calls.find(c => c.label === 'reuse#2').prompt, 'Reuses').reuses,
+  assert.deepEqual(stagedOf(calls.find(c => c.label === 'reuse#2').prompt).reuses,
     [{ commentId: 2, replyId: 502, bodyDigest: fnv1a('not so'), originalDigest: 'd2' }])
   assert.equal(result.pass, true, result.reason)
 })
@@ -4635,7 +4693,7 @@ test('a settlement or a by-hand answer recorded before CodeRabbit rewrote its co
   // Each launch gets its own copy: a launch re-pins the state it restored in place.
   const settled = await run({ reviews: now, preflight: at, args: { ...YIELD, state: structuredClone(state), replySettlements: [{ ...settlement }] } })
   assert.deepEqual(settled.result.settlements, [{ commentId: 1, outcome: 'settled', replyId: 777 }])
-  assert.equal(payloadOf(settled.calls.find(c => c.label === 'reuse#3').prompt, 'Reuses').reuses[0].originalDigest, 'canon')
+  assert.equal(stagedOf(settled.calls.find(c => c.label === 'reuse#3').prompt).reuses[0].originalDigest, 'canon')
   assert.deepEqual(settled.result.state.answeredWith.find(([id]) => id === 1), [1, { how: 'byHand', digest: 'canon' }])
   // Settled on the digest of the day, then rewritten: still the caller's answer.
   const byHand = await run({ reviews: edited, preflight: at, args: { ...YIELD, state, replySettlements: [settlement] } })
@@ -8075,7 +8133,7 @@ test('markSonar marks the SonarCloud issue of a refuted code-scanning comment wi
   const { calls, result } = await run({ reviews: scanRefuted, args: { autoPush: true, markSonar: true, maxCycles: 1 } })
   const labels = calls.map(c => c.label)
   assert.ok(labels.indexOf('sonar#1') > labels.findIndex(l => l.startsWith('replies#')), labels.join(', '))
-  const [item] = payloadOf(calls.find(c => c.label === 'sonar#1').prompt, 'Manifest').items
+  const [item] = stagedOf(calls.find(c => c.label === 'sonar#1').prompt).items
   assert.deepEqual(item, { commentId: 3, commentDigest: 'd3', how: 'refutation', note: 'Not injectable: a list argv.', digest: fnv1a('Not injectable: a list argv.') })
   assert.match(calls.find(c => c.label === 'sonar#1').prompt, new RegExp(`--pr 3888 --repo 'hathach/tinyusb' --head ${HEAD} --manifest`))
   assert.deepEqual(result.history[0].sonar, [{ commentId: 3, issue: 'K3', outcome: 'marked', detail: 'false positive' }])
@@ -8106,8 +8164,8 @@ test('the note is the body that was posted, and an edited comment is marked with
     reviews: { ...scanRefuted, replies: [{ commentId: 3, body: 'second wording' }] },
     args: { ...YIELD, markSonar: true, state },
   })
-  assert.match(calls.find(c => c.label.startsWith('replies#')).prompt, /first wording/)
-  assert.equal(payloadOf(calls.find(c => c.label.startsWith('sonar#')).prompt, 'Manifest').items[0].note, 'first wording')
+  assert.match(stagedText(calls.find(c => c.label.startsWith('replies#')).prompt), /first wording/)
+  assert.equal(stagedOf(calls.find(c => c.label.startsWith('sonar#')).prompt).items[0].note, 'first wording')
   assert.deepEqual(sonarOf(result.state), [])
   // Owed before an edit, then the reviewer edits the comment: nothing is marked with the old answer.
   const owed = (await run({ reviews: scanRefuted, args: { ...YIELD } })).result.state
@@ -8125,7 +8183,7 @@ test('a later launch with markSonar marks what an earlier one left owed', async 
   const again = await run({ args: { ...YIELD, markSonar: true, state: first.result.state } })
   const sonar = again.calls.find(c => c.label.startsWith('sonar#'))
   assert.ok(sonar, again.calls.map(c => c.label).join(', '))
-  assert.equal(payloadOf(sonar.prompt, 'Manifest').items[0].commentId, 3)
+  assert.equal(stagedOf(sonar.prompt).items[0].commentId, 3)
   assert.deepEqual(sonarOf(again.result.state), [])
 })
 
@@ -8220,7 +8278,7 @@ test('a fixed code-scanning finding still flagged is marked once CI settles, and
   })
   const sonar = calls.filter(c => c.label.startsWith('sonar#'))
   assert.deepEqual(sonar.map(c => c.label), ['sonar#2'], calls.map(c => c.label).join(', '))
-  const [item] = payloadOf(sonar[0].prompt, 'Manifest').items
+  const [item] = stagedOf(sonar[0].prompt).items
   assert.equal(item.how, 'fixNote')
   assert.match(item.note, /^Fixed in [0-9a-f]{40}\./)
   assert.match(sonar[0].prompt, new RegExp(`--head ${shaFor(1)} `))

@@ -155,9 +155,6 @@ const STATE_VERSION = 4
 const canonical = (v) => Array.isArray(v) ? `[${v.map(canonical).join(',')}]`
   : v && typeof v === 'object' ? `{${Object.keys(v).sort().map(k => `${JSON.stringify(k)}:${canonical(v[k])}`).join(',')}}`
   : JSON.stringify(v)
-// JSON a relay writes to a file for a script: a literal backslash as \u005c, so no `\;` reaches the Bash tool,
-// which rewrites it (#417). Every backslash JSON.stringify emits starts an escape, so its `\\` pairs are exactly them.
-const inbound = (v) => JSON.stringify(v).replace(/\\\\/g, '\\u005c')
 const sealOf = ({ digest, ...st }) => fnv1a(canonical(JSON.parse(JSON.stringify(st))))
 // facts.py's seal: fnv1a over the canonical JSON without null members.
 const bare = (v) => Array.isArray(v) ? v.map(bare)
@@ -205,12 +202,41 @@ const reviewedChange = (sha, f) => adoptReviewedProtected.some(e => e.sha === sh
 // an edited command never meets an older file.
 const FACTS_SCRIPT = `${AGENTRC}/skills/pr-babysit/scripts/facts.py`
 const EMIT = '<AGENTRC_EMIT>' // where a relay command takes its file
+// Where a relay command reads its input: a file beside its line, which the command itself writes first (staged) or the
+// prompt names for a file tool, so no step waits on a path a relay chose (#510).
+const INPUT = '<AGENTRC_INPUT>'
 const EMIT_REFUSED = 3 // lib/seal.py's
 const RAN = { type: 'object', additionalProperties: false, required: ['exit'], properties: { exit: { type: 'integer' }, error: { type: 'string' } } }
 const RETURN_EXIT = 'and answer only its exit status as exit, AGENTRC_EMIT kept exactly as written: the script writes its JSON line to that file, ' +
   'where the workflow reads it, and prints only a note. Only on a nonzero exit, also give what went wrong as error, in its own words.'
-// A relay prompt's command, `script` a Python script with its arguments, run under the file emitted() names it.
-const runExactly = (script, extra = '') => `run exactly \`${EMIT}${PY} ${script}\` ${RETURN_EXIT}${extra}`
+// A relay prompt's command, `script` a Python script with its arguments, run under the file emitted() names it; `stage`
+// the staged() text that writes its input first, in the same command.
+const runExactly = (script, extra = '', stage = '') => `run exactly \`${stage}${EMIT}${PY} ${script}\` ${RETURN_EXIT}${extra}`
+// UTF-8 bytes as base64, by hand: the sandbox has no TextEncoder, Buffer or btoa.
+const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+const base64 = (text) => {
+  const bytes = []
+  for (const ch of text) {
+    const c = ch.codePointAt(0)
+    if (c < 0x80) bytes.push(c)
+    else if (c < 0x800) bytes.push(0xc0 | c >> 6, 0x80 | c & 63)
+    else if (c < 0x10000) bytes.push(0xe0 | c >> 12, 0x80 | c >> 6 & 63, 0x80 | c & 63)
+    else bytes.push(0xf0 | c >> 18, 0x80 | c >> 12 & 63, 0x80 | c >> 6 & 63, 0x80 | c & 63)
+  }
+  let out = ''
+  for (let i = 0; i < bytes.length; i += 3) {
+    const n = bytes[i] << 16 | (bytes[i + 1] ?? 0) << 8 | (bytes[i + 2] ?? 0)
+    out += B64[n >> 18 & 63] + B64[n >> 12 & 63] + (i + 1 < bytes.length ? B64[n >> 6 & 63] : '=') + (i + 2 < bytes.length ? B64[n & 63] : '=')
+  }
+  return out
+}
+// A script's JSON input as its command writes it to INPUT before the script runs: base64 on stdin, so no shell quoting
+// meets the text and no backslash reaches the Bash tool (#417, #505); facts.py stage refuses one that is not this JSON
+// (its fnv1a) and writes the bytes, all before `&&` lets the script start.
+const staged = (v) => {
+  const text = JSON.stringify(v)
+  return `printf '%s' '${base64(text)}' | ${PY} ${FACTS_SCRIPT} stage '${INPUT}' ${fnv1a(text)} && `
+}
 const EMIT_DIR = { type: 'object', additionalProperties: false, required: ['dir'], properties: { dir: { type: 'string' }, error: { type: 'string' } } }
 let emitDir = null
 // The one path a relay copies: a mis-copy names no directory a run wrote into (mkdtemp's name, never-overwritten files).
@@ -230,15 +256,19 @@ const emitDirOf = () => emitDir ??= agent(
 })
 const emitCount = new Map()
 // One relay's run: { line } as its script wrote it, else { why }, dead when the relay died and left no line.
-const emitted = async (prompt, { label, ...opts }) => {
+const emitted = async (prompt, { label, inputDir, ...opts }) => {
   if (!prompt.includes(EMIT)) throw new Error(`${label}: its command names no ${EMIT}`)
   const dir = await emitDirOf()
   if (!dir) return { why: 'no directory for the line (facts.py emit-dir failed)' }
   const name = label.replace(/[^A-Za-z0-9._-]/g, '_')
   const n = (emitCount.get(name) || 0) + 1
   emitCount.set(name, n)
-  const file = `${dir}/${name}.${n}.${fnv1a(prompt)}.js`
-  const ran = await agent(prompt.replace(EMIT, `AGENTRC_EMIT=${shq(file)} `), { label, ...opts, schema: RAN })
+  const stem = `${name}.${n}.${fnv1a(prompt)}`
+  const file = `${dir}/${stem}.js`
+  // The input path sits in the command's single quotes as it is.
+  const input = `${inputDir ?? dir}/${stem}.in`
+  if (/['\x00-\x1f]/.test(input)) return { why: `the input file ${JSON.stringify(input)} holds a quote or control character` }
+  const ran = await agent(prompt.replace(EMIT, `AGENTRC_EMIT=${shq(file)} `).split(INPUT).join(input), { label, ...opts, schema: RAN })
     .catch(e => { log(`${label} errored — ${e && e.message}`); return null })
   // A relay that died after its script wrote still leaves the line. A file there before the run (exit 3: the script
   // ran nothing) is this call's own from an attempt a resume cut short: its line when it names this file, else that
@@ -846,9 +876,9 @@ const settles = (r) => r.verified === true && r.replyId !== null &&
 // the first run's saved receipt instead, so a reply that run posted is not reported as found there (#53).
 const runReplyScript = (label, mode, task, rules, payload) => {
   const run = (as, what, only = '') => relayRun(
-    `${IN_CHECKOUT}${what}: write exactly this JSON to a new temporary file, a name without quotes, and ` +
-    runExactly(`${REPLY_SCRIPT} --pr ${args.pr} --repo ${shq(repo)} --${mode} '<that file>' --receipt ${shq(`${pinned.receipts.trim()}/${label}.json`)}${only}`,
-      ` ${rules}${payload}`),
+    `${IN_CHECKOUT}${what}: ` +
+    runExactly(`${REPLY_SCRIPT} --pr ${args.pr} --repo ${shq(repo)} --${mode} '${INPUT}' --receipt ${shq(`${pinned.receipts.trim()}/${label}.json`)}${only}`,
+      ` ${rules}`, staged(payload)),
     { label: as, phase: 'Push', model: 'haiku', schema: RECEIPTS },
   )
   // A run that brought no line of reply.py's back (a resume meeting its empty claim, a dead relay, a line off its seal,
@@ -1782,16 +1812,17 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
   const commitLabel = `commit#${cycle}-${what}`
   const receiptFile = shq(`${pinned.receipts.trim()}/${commitLabel}.json`)
   const made = await relayRun(
-    `${IN_CHECKOUT}On branch ${pinned.branch}, write a commit message with your file tool to a new temporary file outside the checkout, a name without quotes: an imperative subject summarizing the cycle-${cycle} ${what} fixes for PR #${args.pr}, ` +
+    `${IN_CHECKOUT}On branch ${pinned.branch}, write a commit message with your file tool to exactly ${INPUT}, outside the checkout, replacing any file there: an imperative subject summarizing the cycle-${cycle} ${what} fixes for PR #${args.pr}, ` +
     'in the style `git log -5 --format=%s` shows, and a body only for a why the diff cannot show; ' +
     'no trailer or line crediting an agent, model, tool or session — no Co-Authored-By, Claude-Session, Generated-with or the like: the repository\'s human is the sole author. ' +
     `The fixes: ${JSON.stringify(brief.claims)}; read \`git --literal-pathspecs diff -- ${scope.map(shq).join(' ')}\` for what changed. ` +
     // A file, not a here-document: no delimiter can collide with the message.
     // An installed pre-commit hook runs again on the commit: the hooks excused above stay excused there, the others run.
-    'Then ' + runExactly(`${COMMITS_SCRIPT} commit ${skipIds.length ? `--skip-hooks ${shq(skipIds.join(','))} ` : ''}--receipt ${receiptFile} --request ${shq(commitLabel)} ${scope.map(shq).join(' ')} < '<that file>'; rm -f '<that file>'`,
+    'Only once that write has returned, ' + runExactly(`${COMMITS_SCRIPT} commit ${skipIds.length ? `--skip-hooks ${shq(skipIds.join(','))} ` : ''}--receipt ${receiptFile} --request ${shq(commitLabel)} ${scope.map(shq).join(' ')} < '${INPUT}'`,
       ' Run it in the foreground with a Bash timeout of 600000 ms, the tool\'s maximum: an installed pre-commit hook runs again on the commit. ' +
       'Do not push. Change nothing else, and never add a file a hook touched and retry.'),
-    { label: commitLabel, phase: 'Push', model: 'haiku', effort: 'low', schema: COMMIT, fileTool: true },
+    // A file tool may not write under .git, where the emit directory is.
+    { label: commitLabel, phase: 'Push', model: 'haiku', effort: 'low', schema: COMMIT, fileTool: true, inputDir: pinned.receipts.trim() },
   )
   // A lost or error copy is recovered from the script's own receipt, never by a second commit; with none, the HEAD read-back settles it, else committed stays null.
   let lost = made ? made.error : 'commit agent died'
@@ -1997,8 +2028,8 @@ const publishReplies = async (label, drafts, how, cycle, digestOf) => {
   if (replies.length === 0) return null
   if (pendingReview) return { pass: false, detail: `not sent: pending review ${pendingReview.review} of ${pendingReview.login}`, receipts: [], replied: [] }
   const out = await runReplyScript(label, 'manifest', `Publish these replies on PR #${args.pr}`,
-    'Do not post, edit or delete anything yourself and do not change a body; the script posts once, reads back and resolves. ',
-    `Manifest: ${inbound({ replies })}`)
+    'Do not post, edit or delete anything yourself and do not change a body; the script posts once, reads back and resolves.',
+    { replies })
   const expected = new Map(replies.map(r => [r.commentId, r.digest]))
   // An error line skips the seal check, so receipts beside it prove nothing.
   const receipts = out && !out.error ? out.receipts.filter(r => expected.has(r.commentId)) : []
@@ -2055,9 +2086,9 @@ const settleSonar = async (cycle, entry, ended) => {
   // One receipt per request and cycle: the CI lane after the review lane's line was lost, or a resumed relay, replays the run that marked (#55).
   const receipt = `${pinned.receipts.trim()}/sonar-${cycle}-${fnv1a(JSON.stringify({ head: expectedHead, items }))}.json`
   const r = await relayRun(
-    `${IN_CHECKOUT}Mark SonarCloud issues on PR #${args.pr}: write exactly this JSON to a new temporary file, a name without quotes, and ` +
-    runExactly(`${SONAR_SCRIPT} --pr ${args.pr} --repo ${shq(repo)} --head ${expectedHead} --manifest '<that file>' --receipt ${shq(receipt)}`,
-      ` Change nothing on SonarCloud or GitHub yourself. Manifest: ${inbound({ items })}`),
+    `${IN_CHECKOUT}Mark SonarCloud issues on PR #${args.pr}: ` +
+    runExactly(`${SONAR_SCRIPT} --pr ${args.pr} --repo ${shq(repo)} --head ${expectedHead} --manifest '${INPUT}' --receipt ${shq(receipt)}`,
+      ' Change nothing on SonarCloud or GitHub yourself.', staged({ items })),
     { label, phase: 'Push', model: 'haiku', effort: 'low', schema: SONAR })
   if (!r) { log(`${label}: no answer — the issues stay owed`); return 0 }
   if (r.error) { sonarDown = r.error; log(`${label}: ${r.error} — the issues stay owed, nothing more is asked this launch`); return 0 }
@@ -2262,8 +2293,8 @@ const settleCaller = async (cycle, digestOf, held, ended) => {
   settlementsTried = true
   if (!ready.length || await ended('reuse')) return []
   const out = await runReplyScript(`reuse#${cycle}`, 'reuse', `Settle these comments on PR #${args.pr} on the replies already there`,
-    'The script posts nothing; do not post, edit or delete anything yourself. ',
-    `Reuses: ${inbound({ reuses: ready.map(s => ({ commentId: s.commentId, replyId: s.replyId, bodyDigest: s.bodyDigest, originalDigest: s.commentDigest })) })}`)
+    'The script posts nothing; do not post, edit or delete anything yourself.',
+    { reuses: ready.map(s => ({ commentId: s.commentId, replyId: s.replyId, bodyDigest: s.bodyDigest, originalDigest: s.commentDigest })) })
   const settled = []
   for (const s of ready) {
     const mine = (out && !out.error ? out.receipts : []).filter(r => r.commentId === s.commentId)
@@ -2292,9 +2323,9 @@ const ciLaneRun = async (cycle, lanes, entry) => {
   const collect = (label, command, schema, payload) => {
     const head = queried = expectedHead
     const prompt = (command) =>
-      `${IN_CHECKOUT}Editing and committing nothing, ${payload ? 'write exactly the JSON below to a new temporary file, a name without quotes, and ' : ''}` +
-      runExactly(`${COLLECT_SCRIPT} ${command} --repo ${shq(repo)} --pr ${args.pr} --head ${head}${payload ? " < '<that file>'" : ''}`,
-        ' Run it in the foreground with a Bash timeout of 600000 ms, the tool\'s maximum.' + (payload ? `\n${inbound(payload)}` : ''))
+      `${IN_CHECKOUT}Editing and committing nothing, ` +
+      runExactly(`${COLLECT_SCRIPT} ${command} --repo ${shq(repo)} --pr ${args.pr} --head ${head}${payload ? ` < '${INPUT}'` : ''}`,
+        ' Run it in the foreground with a Bash timeout of 600000 ms, the tool\'s maximum.', payload ? staged(payload) : '')
     const opts = { label, phase: 'Triage', model: 'haiku', effort: 'low', schema, contract: COLLECT_CONTRACT }
     // A skew stops the cycle (runLanes); to every reader here its line is an error.
     const skewed = (got) => {

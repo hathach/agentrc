@@ -1,4 +1,5 @@
 """Tests for pr-babysit's state_transfer.py, and the AGENTRC_EMIT file every facts.py report writes (lib/seal.py's emit)."""
+import base64
 import importlib.util
 import json
 import os
@@ -203,6 +204,32 @@ class EmitDirTest(unittest.TestCase):
         subprocess.run(['git', '-C', str(self.repo), 'worktree', 'add', '-q', str(linked)], check=True, env=git_env())
         self.assertEqual(Path(self.emit_dir(linked)[1]['dir']).parent.resolve(), (self.repo / '.git' / 'agentrc-emit').resolve())
 
+
+
+class StageTest(unittest.TestCase):
+    """facts.py stage: a relay command's script input, written only when it is the JSON the workflow sent."""
+
+    def stage(self, data, digest):
+        out = Path(tempfile.mkdtemp()) / 'x.in'
+        self.addCleanup(shutil.rmtree, out.parent)
+        done = subprocess.run([sys.executable, str(FACTS), 'stage', str(out), digest], input=data, capture_output=True)
+        return done.returncode, json.loads(done.stdout.decode().splitlines()[-1]), out
+
+    def test_the_bytes_sent_are_written_and_anything_else_refused(self):
+        text = json.dumps({'body': "it's \\ naïve ✓ 😀\r\n"}, ensure_ascii=False)
+        sent = base64.b64encode(text.encode())
+        code, line, out = self.stage(sent, fnv1a(text))
+        self.assertEqual((code, line, out.read_bytes()), (0, {'staged': str(out)}, text.encode()))
+        for data, digest, why in [
+            (sent, fnv1a(text + ' '), 'not the JSON sent'),
+            (sent + b'\n', fnv1a(text), 'not base64'),
+            (base64.b64encode(b'\xff[]'), fnv1a(text), 'not base64 of UTF-8 JSON'),
+            (base64.b64encode(b'{'), fnv1a('{'), 'not base64 of UTF-8 JSON'),
+        ]:
+            code, line, out = self.stage(data, digest)
+            self.assertEqual(code, 2, why)
+            self.assertIn(why, line['error'])
+            self.assertFalse(out.exists(), why)
 
 if __name__ == '__main__':
     unittest.main()
