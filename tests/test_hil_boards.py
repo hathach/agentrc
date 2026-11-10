@@ -106,6 +106,30 @@ class Resolve(Base):
             with self.subTest(entry), self.assertRaisesRegex(ValueError, why):
                 hb.resolve(entry, self.path)
 
+    def test_the_wch_dev_pc_flashers_resolve_as_tinyusb_rosters_spell_them(self):
+        hydra = {'name': 'hydrausb3_v1', 'flasher': {
+            'name': 'openocd', 'uid': 'D3008F0657DB', 'args': '-f target/wch-riscv.cfg', 'verify': False,
+            'args_program': '-c "halt" -c "reg dcsr 0x40000003" -c "resume" -c "riscv dmi_write 0x10 0"'}}
+        nano = {'name': 'nanoch32h417', 'flasher': {'name': 'wch_uart_loader', 'uid': 'E8E68F066EEE', 'args': ''}}
+        bare = {'name': 'nano2', 'flasher': {'name': 'wch_uart_loader', 'uid': 'E8E68F066EEF'}}
+        for entry in (hydra, nano, bare):
+            entry['uid'] = 'U'
+            self.assertEqual(hb.resolve(entry, self.path), entry)
+
+    def test_the_wch_flasher_forms_go_no_wider(self):
+        for flasher, why in (({'name': 'openocd', 'uid': '1', 'args_program': ''}, 'args_program must be a non-empty'),
+                             ({'name': 'openocd', 'uid': '1', 'args_program': ' '}, 'args_program must be a non-empty'),
+                             ({'name': 'openocd', 'uid': '1', 'args_program': ['-c', 'halt']}, 'args_program must'),
+                             ({'name': 'jlink', 'uid': '1', 'args_program': '-c halt'}, "args_program is openocd's"),
+                             ({'name': 'openocd_esp', 'uid': '1', 'args_program': '-c x'}, "args_program is openocd's"),
+                             ({'name': 'wch_uart_loader', 'uid': '1', 'args': '--baud 1'}, 'args must be ""'),
+                             ({'name': 'wch_uart_loader', 'args': ''}, 'no uid'),
+                             ({'name': 'openocd', 'uid': '1', 'args': ''}, 'args must be a non-empty'),
+                             ({'name': 'wch_uart_loader', 'uid': '1', 'args_prog': 'x'}, 'unknown key'),
+                             ({'name': 'wch_link', 'uid': '1'}, 'is none of')):
+            with self.subTest(flasher), self.assertRaisesRegex(ValueError, why):
+                hb.resolve({'name': 'b', 'uid': 'C', 'flasher': flasher}, self.path)
+
     def test_a_roster_resolves_both_lists_and_names_every_problem(self):
         roster = {'boards': [{'name': 'a', 'uid': 'A', 'probe': '000621000000'}],
                   'boards-skip': [{'name': 'b', 'uid': 'B', 'probe': 'E661'}],

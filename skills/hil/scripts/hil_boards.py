@@ -26,6 +26,8 @@ has a board's `dev_attached`, a copy its roster still carries (skills/hil/SKILL.
 compared with it and warned about on stderr, never refused; resolve(entry, roster=FILE) names the roster
 file in that warning. resolve_roster(roster) resolves `boards` and `boards-skip`.
 Both raise ValueError naming every problem. lock_name(entry, own) is an entry's board lock.
+A flasher is hil_flash.py's (SKILL.md, Flashers) or tinyusb's `wch_uart_loader` (`args` "" or absent); an
+`openocd` one may carry `args_program`, the openocd commands tinyusb runs after program or reset.
 
   hil_boards.py roster FILE         the resolved roster as JSON (exit 1 refused, 2 usage)
   hil_boards.py lock FILE BOARD     the board lock of FILE's entry named BOARD, boards-skip included
@@ -46,8 +48,8 @@ REGISTRY = os.path.join(HERE, '..', 'boards.json')
 FILES = ('skills/hil/scripts/hil_load.py', 'skills/hil/scripts/usb_observe.py', 'skills/hil/boards.json')
 PHYSICAL = ('flasher', 'flasher_recover')
 LOCK_NAME_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]*\Z')   # also within hil_lock's own grammar
-FLASHER_NAMES = ('jlink', 'stlink', 'openocd', 'lm4flash', 'esptool', 'pyocd', 'openocd_esp')
-_FLASHER_KEYS = {'name', 'uid', 'args', 'vid_pid', 'verify', 'note'}
+FLASHER_NAMES = ('jlink', 'stlink', 'openocd', 'lm4flash', 'esptool', 'pyocd', 'openocd_esp', 'wch_uart_loader')
+_FLASHER_KEYS = {'name', 'uid', 'args', 'args_program', 'vid_pid', 'verify', 'note'}
 REGISTERED = (*PHYSICAL, 'dev_attached')   # what a registered board's resolved entry takes from here
 _ENTRY_KEYS = {'name', *REGISTERED}
 _DEV_KEYS = {'vid_pid', 'serial', 'is_cdc', 'is_msc', 'block_size', 'block_count', 'msc_inquiry', 'note'}
@@ -90,8 +92,14 @@ def flasher_problem(flasher, *, has_uid=True) -> str:
         return f'unknown key(s) {", ".join(sorted(extra))}'
     if flasher.get('name') not in FLASHER_NAMES:
         return f'name {flasher.get("name")!r} is none of {", ".join(FLASHER_NAMES)}'
-    for key in ('uid', 'args', 'vid_pid', 'note'):
-        if key in flasher and not (isinstance(flasher[key], str) and flasher[key].strip()):
+    if 'args_program' in flasher and flasher['name'] != 'openocd':
+        return f'args_program is openocd\'s, not {flasher["name"]}\'s'
+    loader = flasher['name'] == 'wch_uart_loader'
+    if loader and flasher.get('args', '') != '':
+        return f'args must be "" for wch_uart_loader, got {flasher["args"]!r}'
+    for key in ('uid', 'args', 'args_program', 'vid_pid', 'note'):
+        if key in flasher and not (isinstance(flasher[key], str) and flasher[key].strip()) \
+                and not (loader and key == 'args'):
             return f'{key} must be a non-empty string, got {flasher[key]!r}'
     if has_uid and 'uid' not in flasher:
         return 'no uid (the probe serial)'
