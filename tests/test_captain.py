@@ -3269,7 +3269,8 @@ class StartTest(RelayCase):
 
     def test_a_task_is_that_message_relayed_to_the_verified_session(self):
         self.say('start proj and fix the lint errors')
-        self.terminals['t9'] = pinned('t9')   # the new session, as list finds it once it is up
+        self.terminals['t9'] = {**pinned('t9'), 'created': 99, 'cwd': self.root, 'session': 's-new', 'pid': 77,
+                                'started': 5}   # the session verify() pinned, as list finds it
         code, out = self.start(task=True)
         self.assertEqual(code, 0)
         self.assertEqual(self.types()[:2], ['start', 'started'])
@@ -3279,9 +3280,23 @@ class StartTest(RelayCase):
         self.assertIn(f'accept --action {relayed["msg"]}', self.typed[-1][1])
         self.assertTrue(out.splitlines()[-1].endswith('delivered'), out)
 
+    def test_a_task_never_goes_to_a_session_other_than_the_one_verified(self):
+        self.say('start proj and fix the lint errors')
+        self.terminals['t9'] = pinned('t9')   # replaced after verify() pinned s-new
+        out = self.start(task=True)[1]
+        self.assertNotIn('relay', self.types())
+        self.assertIn('t9: refused, its session changed', out)
+
+    def test_a_failed_start_offers_no_relay(self):
+        self.say('start proj and fix the lint errors')
+        self.pinned_account = 'ada'
+        out = self.start(task=True)[1]
+        self.assertIn('first task not relayed, the session is not verified', out)
+        self.assertNotIn('--entry', out)
+
     def test_a_task_waits_for_a_session_not_yet_verified(self):
         self.say('start proj and fix the lint errors')
-        self.gets = {}
+        self.gets = {'t9': self.terminal(app=None)}   # still coming up: no Claude Code session yet
         code, out = self.start(task=True)
         self.assertNotIn('relay', self.types())
         self.assertIn('first task not relayed', out)

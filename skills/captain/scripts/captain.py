@@ -1916,14 +1916,15 @@ def relay_prompt(action):
             f'Run: python3 {INSTALLED} accept --action {action}')
 
 
-def relay(targets, entry, mine, decided=None, force=False):
+def relay(targets, entry, mine, decided=None, force=False, pinned=None):
     """Relay the human's message this turn acts on (bound()) to each target, recorded before it is typed; targets as
     resolve() gave them. The transcript is read once for every target, so a message the human sends after that is not
     seen, and each session is pinned once, so one replaced in its terminal meanwhile is refused. A target busy or not
     showing its input line gets the relay held, recorded for `retry` to send unchanged. decided, (item, revision,
     verdict), makes it the human's verdict on that decision: one target, the session that owns it, and the binding
     written into the relay record itself. force cancels a request or relay still open to a target, once every other
-    check passed, as `cancel` would on the human's word."""
+    check passed, as `cancel` would on the human's word. pinned, {address: identity}, is the session each target
+    must still be, as start() verified it, in place of the one found now."""
     addresses = list(targets)
     if decided and len(addresses) != 1:
         die('a relay with --item goes to exactly one session, the one that owns the decision', 2)
@@ -1931,7 +1932,7 @@ def relay(targets, entry, mine, decided=None, force=False):
         captain = require_captain(mine)
         uid, words = bound(captain, entry)
         binding, linked = bind(decided, seen, captain, uid) if decided else ({}, None)
-        pinned = {address: find(address) for address in addresses}
+        pinned = pinned or {address: find(address) for address in addresses}
         quote = relay_text(words, addresses)
         for address in addresses:
             recs = records()
@@ -2177,10 +2178,11 @@ def start(arg, account, name, space, tab, entry, mine, task=False):
            'failed': f'VERIFICATION FAILED: {why}; the human closes {address}',
            'unchecked': f'VERIFICATION UNCHECKED: {why}; `list` shows whether it is up'}[verification])
     if task and verification == 'verified':
-        relay({address: address}, uid, mine)
+        relay({address: address}, uid, mine, pinned={address: session})
     elif task:
-        print(f'{msg}: first task not relayed, the session is not verified; once `list` shows it, '
-              f'`relay {address} --entry {uid}` sends it')
+        print(f'{msg}: first task not relayed, the session is not verified' + (
+            '' if verification == 'failed' else f'; once `list` shows it running in {root} under {account}, '
+            f'`relay {address} --entry {uid}` sends it'))
     return {'failed': 1, 'unchecked': 3}.get(verification, 0)
 
 

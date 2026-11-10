@@ -127,8 +127,9 @@ pins each target's session once, so one replaced in its terminal while the relay
     that message.
   - `--task`, when their message also gives the new session work ("start ~/code/tinyusb and fix issue 12"), relays
     that same message to it once `verified`, as a relay of their words with its own receipt; the session reads the
-    whole message, the start included. Not verified, nothing is relayed: the receipt names the `relay --entry` that
-    sends it once `list` shows the session.
+    whole message, the start included, and only the session `start` verified gets it. Not verified, nothing is
+    relayed: when pending or unchecked, the receipt names the `relay --entry` that sends it once `list` shows that
+    session in that checkout under that account; when failed, none.
 - **Closing** a terminal, space or session is the human's: you may report a session done, but never close one, type
   `/exit`, kill a process or terminal, or ask a target to close itself. `cancel` closes a ledger item only: it
   neither reaches a session nor withdraws an instruction one accepted. That takes a new relay of the human's words,
