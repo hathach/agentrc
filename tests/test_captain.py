@@ -3298,7 +3298,7 @@ class StartTest(RelayCase):
     def test_a_task_waits_for_a_session_not_yet_verified(self):
         self.say('start proj and fix the lint errors')
         self.gets = {'t9': self.terminal(app=None)}   # still coming up: no Claude Code session yet
-        code, out = self.start(task=True)
+        out = self.start(task=True)[1]
         self.assertNotIn('relay', self.types())
         self.assertIn('first task not relayed', out)
         self.assertIn('`relay t9 --entry u-1`', out)
