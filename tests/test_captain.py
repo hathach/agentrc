@@ -2577,10 +2577,7 @@ class VerdictTest(VerdictCase):
         self.say('no: rebase first')
         out = self.refused(captain.relay, captain.resolve(['t2']), None, self.ident,
                            (self.item()['id'], 1, 'correction'), True)
-        self.assertIn(f'the verdict relay {held} on it is still open', out)
-        self.as_target(captain.accept, held)
-        self.assertIn('--force does not replace a verdict', self.refused(
-            captain.relay, captain.resolve(['t2']), None, self.ident, (self.item()['id'], 1, 'correction'), True))
+        self.assertIn(f'is closed (decided by {held})', out)
 
     def test_only_its_owner_at_its_latest_open_revision(self):
         self.report(decision('merge', kind='blocked'))

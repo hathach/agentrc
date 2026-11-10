@@ -641,14 +641,19 @@ def open_to(address, recs):
     return [m for m, r in open_items(recs).items() if r['target']['address'] == address]
 
 
-def gate(address, recs, mine, force=False):
-    """(the pinned session in address, None) when it may get an item, busy or not, else (None, why not); force
-    passes an item still open to it, for the caller to cancel."""
-    if not force and open_to(address, recs):
-        return None, 'a request or relay to it is still open (collect it, cancel it, or relay with --force)'
+OPEN = 'a request or relay to it is still open (collect it, cancel it, or relay with --force)'
+
+
+def reach(address, mine):
+    """(the pinned session in address, None), else (None, why not)."""
     target = find(address)
     why = unreachable(target, mine)
     return (None, why) if why else (target, None)
+
+
+def gate(address, recs, mine):
+    """(the pinned session in address, None) when it may get an item, busy or not, else (None, why not)."""
+    return (None, OPEN) if open_to(address, recs) else reach(address, mine)
 
 
 def sendable(address, recs, mine):
@@ -1911,17 +1916,13 @@ def relay(targets, entry, mine, decided=None, force=False):
     showing its input line gets the relay held, recorded for `retry` to send unchanged. decided, (item, revision,
     verdict), makes it the human's verdict on that decision: one target, the session that owns it, and the binding
     written into the relay record itself. force cancels a request or relay still open to a target, once every other
-    check passed, as `cancel` would on the human's word; never an open verdict relay on decided's decision, which
-    closes it, so bind() would refuse first."""
+    check passed, as `cancel` would on the human's word."""
     addresses = list(targets)
     if decided and len(addresses) != 1:
         die('a relay with --item goes to exactly one session, the one that owns the decision', 2)
     with observing(decided and decided[0]) as seen, locked():
         captain = require_captain(mine)
         uid, words = bound(captain, entry)
-        if decided and force and (same := [m for m, r in open_items(records()).items() if r.get('item') == decided[0]]):
-            die(f'{decided[0]}: the verdict relay {", ".join(same)} on it is still open and closes it; --force does not '
-                'replace a verdict: cancel it on the human\'s word only while its session has not accepted it', 2)
         binding, linked = bind(decided, seen, captain, uid) if decided else ({}, None)
         pinned = {address: find(address) for address in addresses}
         quote = relay_text(words, addresses)
@@ -1930,7 +1931,8 @@ def relay(targets, entry, mine, decided=None, force=False):
             if any(r['type'] == 'relay' and r['entry'] == uid and r['target']['address'] == address for r in recs):
                 print(f'{address}: refused, this message was relayed to it already', flush=True)
                 continue
-            target, why = gate(address, recs, mine, force)
+            stale = open_to(address, recs)
+            target, why = (None, OPEN) if stale and not force else reach(address, mine)
             if not why and (not pinned[address] or identity(target) != identity(pinned[address])):
                 why = 'its session changed during this relay; relay again'
             if why:
@@ -1939,9 +1941,9 @@ def relay(targets, entry, mine, decided=None, force=False):
             if linked and session_of(linked['owner']) != session_of(target):
                 print(f'{address}: refused, the decision {binding["item"]} is not this session\'s', flush=True)
                 continue
-            for stale in open_to(address, recs):
-                append({'type': 'cancel', 'msg': stale})
-                print(f'{address}: cancelled {stale}', flush=True)
+            for msg in stale:
+                append({'type': 'cancel', 'msg': msg})
+                print(f'{address}: cancelled {msg}', flush=True)
             action = new_id('a', recs)
             fields = {'entry': uid, 'quote': quote, 'context': context(target, recs) + settles(linked, binding),
                       **binding}
@@ -1978,7 +1980,8 @@ def bind(decided, seen, captain, uid):
         die(f'{iid} is a report\'s needs, not a decision: it takes no verdict', 2)
     linked, why = rebound(iid, revision, seen)
     if linked['state'] != 'open':
-        die(f'decision {iid} is closed', 2)
+        closure = linked['closure']
+        die(f'decision {iid} is closed ({closure["why"]}' + (f' by {closure["by"]})' if closure['by'] else ')'), 2)
     if why:
         die(f'decision {iid}: {why}; nothing recorded', 2)
     sha = {'reviewed_sha': linked['content']['reviewed_sha']} if 'reviewed_sha' in linked['content'] else {}
