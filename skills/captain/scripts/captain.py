@@ -22,7 +22,7 @@ does not recognize is reported, never assumed safe.
                                                  relay it as the human's verdict on a decision
   captain.py verdict --item <id> --revision <N> --verdict <verdict> [--entry <id>]
                                                  record it as that verdict, sending nothing
-  captain.py relay --retry <action>              send a held relay once its session is idle or done, its input empty
+  captain.py relay --retry <action>              send a held relay once its session is idle or done, its input line shown
   captain.py start <checkout> [main|ada] [--name <n>] [--space <id|name>] [--tab <id>] [--entry <id>]
                                                  start a Claude Code session there on the human's message
   captain.py brief --for <msg> | --pending       a target reads what a status request asks, or joins a watch
