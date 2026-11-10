@@ -67,8 +67,9 @@ commit will, so a fail_fast stop cannot hide a hook the change breaks: what
 fails there joins failed and is rerun on HEAD in turn, the hooks running again
 while every new failure is excused, and a failed run that names no hook adds the
 failure `(pre-commit)`.
-pre-commit runs with core.abbrev pinned at the length HEAD abbreviates to
-when the first run starts (#377), possibly a digit over git's default, which
+pre-commit runs without the GIT_*_PATHSPECS variables, as commits.py's commit
+runs the hooks (#415), and with core.abbrev pinned at the length HEAD
+abbreviates to when the first run starts (#377), possibly a digit over git's default, which
 the hooks' own git commands inherit. git still lengthens an abbreviation a
 hook's new object makes ambiguous, so rarely a hook that changed nothing is in
 modifiedBy.
@@ -96,7 +97,7 @@ import zipfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from commits import bounded as copyable, with_skip  # noqa: E402
+from commits import bounded as copyable, hook_env, with_skip  # noqa: E402
 from facts import Unusable, checkout_top, git, report, status  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
 import windows  # noqa: E402
@@ -385,7 +386,8 @@ def bounded(argv, deadline, start, what, cwd=None, env=None, name=None):
 def pre_commit(paths, deadline, start, what, hook=None, cwd=None, skip=()):
     """(exit code, hook_runner.py's records) of one pre-commit run, skip added to the SKIP it inherits; the records
     None when pre-commit's interpreter is unknown and it ran as is. With hook, only that hook alone runs."""
-    env = pinned_abbrev(other_repo_env() if cwd else os.environ, abbrev_length())
+    # The environment commits.py's commit gives the hooks (hook_env), so what passes here passes there (#415).
+    env = pinned_abbrev(hook_env(other_repo_env() if cwd else os.environ), abbrev_length())
     if skip:
         env = with_skip(env, skip)
     argv = ['run', '--color', 'never', *([hook] if hook else []), '--files', *paths]

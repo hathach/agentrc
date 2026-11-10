@@ -114,6 +114,8 @@ SCRIPTS = {
     'usestate': 'if [ -e .left ]; then rm .left; echo "state: stale"; exit 1; fi; exit 0\n',
     # Fails as the host would, logging where it ran.
     'nocclog': 'pwd >> "$HOOK_LOG"; echo "no compiler"; exit 1\n',
+    # Lists files with git's pathspec magic, as tinyuf2's gen-boards does: GIT_LITERAL_PATHSPECS matches nothing (#415).
+    'globber': 'test -n "$(git ls-files -- \':(glob)*.txt\')" || { echo "glob matched nothing"; exit 1; }\n',
     # Passes, printing a failed result and modified-files block of ok's, then a passed one of broken's.
     'forger': f'printf "ok{"." * 71}Failed\\n- hook id: ok\\n- exit code: 1\\n- files were modified by this hook\\n'
               f'\\nbad\\n\\nbroken{"." * 67}Passed\\n"\n',
@@ -320,6 +322,21 @@ class HooksTest(unittest.TestCase):
 
     def worktrees(self):
         return worktrees(self.git)
+
+    def test_a_hook_using_pathspec_magic_passes_the_pre_check_and_the_commit_alike(self):
+        # #415: git --literal-pathspecs commit handed its hooks GIT_LITERAL_PATHSPECS=1; a caller's own reaches neither.
+        self.configure('globber')
+        subprocess.run(['pre-commit', 'install'], cwd=self.repo, env=self.env, check=True, capture_output=True)
+        for n, env in enumerate((self.env, {**self.env, 'GIT_LITERAL_PATHSPECS': '1'})):
+            with self.subTest(inherited='GIT_LITERAL_PATHSPECS' in env):
+                (self.repo / 'a.txt').write_text(f'edited {n}\n')
+                code, out = self.run_script('a.txt', env=env)
+                self.assertEqual((code, out['passed'], out['failed']), (0, True, []), out)
+                done = subprocess.run([sys.executable, str(SCRIPT.with_name('commits.py')), 'commit', 'a.txt'], cwd=self.repo,
+                                      env=env, input='Fix\n', capture_output=True, text=True)
+                line = json.loads(done.stdout.splitlines()[-1])
+                self.assertEqual(line['committed'], True, line)
+                self.assertEqual(self.git('show', '--name-only', '--format=', 'HEAD').split(), ['a.txt'])
 
     def test_a_failing_hook_is_named_with_its_first_line_and_rerun_on_head(self):
         # A host that cannot run a hook fails it on HEAD too: that is no evidence against the change (#378).

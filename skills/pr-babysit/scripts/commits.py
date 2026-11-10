@@ -10,7 +10,8 @@
   commits.py cited HEAD SHA...  whether a rewritten PR head still holds each commit our fix notes cite
 
 `commit` stages PATH and runs `git commit --only`, so nothing staged beside
-it is taken; it prints {committed, detail}: committed false, with git's last
+it is taken, each PATH as `:(literal)PATH` and the hooks' environment without
+PATHSPEC_ENV, as hooks.py runs them; it prints {committed, detail}: committed false, with git's last
 lines, when git made no commit (a hook that fails or modifies a file stops it),
 or before staging anything when the message is blank. --skip-hooks adds the
 comma-separated pre-commit hook ids IDS to the SKIP the commit's hooks see: the
@@ -70,6 +71,9 @@ sys.path.insert(0, str(Path(__file__).parent))
 from facts import FULL_SHA, Unusable, attempt, attribution_in, git, report, run, sealed, status  # noqa: E402
 
 DETAIL_MAX = 500
+# What a git command exports to the hooks it runs and that changes how their own git commands read pathspecs: git
+# --literal-pathspecs sets the first, and a hook running `git ls-files ':(glob)...'` then matches nothing (#415).
+PATHSPEC_ENV = ('GIT_LITERAL_PATHSPECS', 'GIT_GLOB_PATHSPECS', 'GIT_NOGLOB_PATHSPECS', 'GIT_ICASE_PATHSPECS')
 ESCAPE = re.compile(r'\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|.)')
 
 
@@ -188,8 +192,13 @@ def with_skip(env, ids):
     return {**env, 'SKIP': ','.join([*filter(None, env.get('SKIP', '').split(',')), *ids])}
 
 
+def hook_env(env):
+    """env without PATHSPEC_ENV: the repository's hooks get pathspecs as a human's commit gives them."""
+    return {k: v for k, v in env.items() if k not in PATHSPEC_ENV}
+
+
 def outcome(paths, skip=()):
-    env = skip_env(skip)  # before anything is staged
+    env = hook_env(skip_env(skip) or os.environ)  # before anything is staged
     try:
         # -sig: a leading BOM would hide an attribution first line from attribution_in
         message = sys.stdin.buffer.read().decode('utf-8-sig')
@@ -197,10 +206,11 @@ def outcome(paths, skip=()):
         raise Unusable('the message on stdin is not UTF-8')
     if not message.strip():
         return {'committed': False, 'detail': 'the commit message is blank'}
-    # --literal-pathspecs: a file named like pathspec magic, such as `:(top)*`, is that file only.
+    # Literal: a file named like pathspec magic, such as `:(top)*`, is that file only. The commit takes each path's own
+    # :(literal) magic, never --literal-pathspecs, which git would hand its hooks as GIT_LITERAL_PATHSPECS.
     before = git('rev-parse', 'HEAD').strip()
     git('--literal-pathspecs', 'add', '--', *paths)
-    code, out, err = attempt('git', '--literal-pathspecs', 'commit', '--only', '-F', '-', '--', *paths, input=message,
+    code, out, err = attempt('git', 'commit', '--only', '-F', '-', '--', *(f':(literal){p}' for p in paths), input=message,
                              env=env)
     said = (out + err).strip().splitlines()
     tail = ' / '.join(said[-5:])

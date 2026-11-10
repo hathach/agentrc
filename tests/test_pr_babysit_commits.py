@@ -511,6 +511,25 @@ class CommitsTest(unittest.TestCase):
         code, seen = self.run_script('head', '--parent', self.base, ':(top)*')
         self.assertEqual((code, seen['refusal'], len(seen['entries'])), (0, '', 1), 'the audit reads back the same one file')
 
+    @unittest.skipIf(os.name == 'nt', 'NTFS forbids : and * in a file name')
+    def test_the_commits_hooks_read_pathspec_magic_while_its_paths_stay_literal(self):
+        # #415: a hook listing files with git's own magic matched nothing under the committer's GIT_LITERAL_PATHSPECS.
+        self.hook('env | grep -q "^GIT_[A-Z]*_PATHSPECS=" && { echo "pathspec variable leaked" >&2; exit 1; }\n'
+                  'test -n "$(git ls-files -- \':(glob)*.c\')" || { echo "glob matched nothing" >&2; exit 1; }')
+        self.write(':(glob)*.c', 'odd\n')
+        self.write('a.c', 'changed\n')
+        self.write('b.c', 'staged\n')
+        self.git('add', 'b.c')
+        for env in (ENV, {**ENV, 'GIT_LITERAL_PATHSPECS': '1'}):
+            with self.subTest(inherited=env is not ENV):
+                self.write(':(glob)*.c', f'odd {len(env)}\n')
+                code, out = self.run_script('commit', ':(glob)*.c', stdin='Fix\n', env=env)
+                self.assertEqual((code, out['committed']), (0, True), out)
+                self.assertEqual(self.git('show', '--name-only', '--format=', 'HEAD').split('\n')[:-1], [':(glob)*.c'],
+                                 'that one file, never what its name would match')
+                self.assertEqual(self.git('diff', '--cached', '--name-only').split(), ['b.c'], 'what was staged beside it stays staged')
+                self.assertIn(' M a.c', self.git('status', '--porcelain'))
+
     def test_a_hook_that_moves_head_and_fails_is_no_clean_refusal(self):
         self.hook('git commit -q --allow-empty -m nested --no-verify\nexit 1')
         self.write('a.c', 'changed\n')
