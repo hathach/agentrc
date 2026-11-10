@@ -15,6 +15,7 @@ read or its lock is not taken in time.
 """
 import argparse
 import json
+import math
 import re
 import sys
 from decimal import Decimal
@@ -29,7 +30,7 @@ COST_STATES = ('known', 'partial', 'unknown')
 
 
 def shaped(rec):
-    """Why a ledger record is not one this reads, else None."""
+    """Why a ledger record is not one this reads, else None: every field the roll-up uses present and well typed."""
     if not isinstance(rec, dict) or rec.get('v') != 1:
         return 'not a version 1 record'
     if rec.get('type') not in ('start', 'end') or not isinstance(rec.get('run'), str) or not RUN_ID.fullmatch(rec['run']):
@@ -37,23 +38,29 @@ def shaped(rec):
     if not isinstance(rec.get('at'), str):
         return 'no time'
     if rec['type'] == 'start':
-        if not (rec.get('task') is None or isinstance(rec.get('task'), str)) or not all(isinstance(rec.get(k), str) for k in ('out', 'worktree')):
+        if 'task' not in rec or not (rec['task'] is None or isinstance(rec['task'], str)) or \
+                not all(isinstance(rec.get(k), str) for k in ('out', 'worktree')):
             return 'a start without task, out or worktree'
         return None
+    wall = rec.get('wall')
+    if type(rec.get('exit')) is not int or not isinstance(rec.get('reason'), str) or 'session' not in rec or \
+            type(wall) not in (int, float) or not math.isfinite(wall) or wall < 0:
+        return 'an end without exit, reason, session or a finite wall'
     cost = rec.get('cost')
-    if type(rec.get('exit')) is not int or not isinstance(rec.get('reason'), str) or \
-            not isinstance(rec.get('wall'), (int, float)) or isinstance(rec.get('wall'), bool) or rec['wall'] < 0:
-        return 'an end without exit, reason or wall'
-    if not isinstance(cost, dict) or cost.get('status') not in COST_STATES or \
-            (cost['status'] == 'unknown') != (cost.get('usd') is None) or \
-            (cost.get('usd') is not None and not (isinstance(cost['usd'], str) and USD.fullmatch(cost['usd']))):
+    if not isinstance(cost, dict) or set(cost) != {'status', 'usd', 'reason'} or cost['status'] not in COST_STATES:
         return 'an end whose cost is not known, partial or unknown'
+    usd, why = cost['usd'], cost['reason']
+    priced = isinstance(usd, str) and USD.fullmatch(usd)
+    if not ((cost['status'] == 'known' and priced and (why is None or isinstance(why, str))) or
+            (cost['status'] == 'partial' and priced and isinstance(why, str)) or
+            (cost['status'] == 'unknown' and usd is None and isinstance(why, str))):
+        return f'an end whose {cost["status"]} cost has no amount or reason it needs'
     return None
 
 
 def fold(lines):
     """({run: {'start', 'end'}}, diagnostics, complete) from the ledger's byte lines."""
-    runs, diagnostics, complete = {}, [], True
+    runs, diagnostics, complete, disputed = {}, [], True, set()
     for n, raw in enumerate(lines, 1):
         try:
             rec = json.loads(raw.decode('utf-8'))
@@ -70,14 +77,15 @@ def fold(lines):
             runs[rec['run']][rec['type']] = rec
         elif had == rec:
             diagnostics.append({'line': n, 'run': rec['run'], 'problem': f'the same {rec["type"]} again'})
-        else:
+        else:   # neither is established: the run counts for nothing
             diagnostics.append({'line': n, 'run': rec['run'], 'problem': f'a second, different {rec["type"]}'})
             complete = False
+            disputed.add(rec['run'])
     for run, got in runs.items():
         if 'start' not in got:
             diagnostics.append({'run': run, 'problem': 'an end with no start'})
             complete = False
-    return {r: got for r, got in runs.items() if 'start' in got}, diagnostics, complete
+    return {r: got for r, got in runs.items() if 'start' in got and r not in disputed}, diagnostics, complete
 
 
 def tasks_of(runs, complete):

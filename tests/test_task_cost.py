@@ -183,7 +183,36 @@ class TaskCost(unittest.TestCase):
         self.write(start(1), end(1, '1.00'), end(1, '2.00'))
         _, r = self.query()
         self.assertFalse(r['complete'])
-        self.assertIsNone(r['tasks'][0]['totalUsd'])
+        self.assertEqual(r['tasks'], [], 'neither amount wins')
+
+    def test_records_missing_what_the_roll_up_reads_are_diagnostics_never_a_crash(self):
+        cost = end(2, status='unknown')['cost']
+        for name, bad in (('start without task', {k: v for k, v in start(2).items() if k != 'task'}),
+                          ('cost without usd', {**end(1), 'cost': {k: v for k, v in cost.items() if k != 'usd'}}),
+                          ('cost without reason', {**end(1), 'cost': {k: v for k, v in cost.items() if k != 'reason'}}),
+                          ('unknown with no reason', {**end(1), 'cost': {**cost, 'reason': None}}),
+                          ('partial with no reason', {**end(1), 'cost': {'status': 'partial', 'usd': '1.00', 'reason': None}}),
+                          ('end without session', {k: v for k, v in end(1).items() if k != 'session'}),
+                          ('NaN wall', {**end(1), 'wall': float('nan')}),
+                          ('infinite wall', {**end(1), 'wall': float('inf')})):
+            with self.subTest(name):
+                self.write(start(1), bad, start(3), end(3, '2.00'))
+                code, r = self.query()
+                self.assertEqual(code, 0)
+                self.assertFalse(r['complete'])
+                self.assertTrue(all(t['totalUsd'] is None for t in r['tasks']))
+                self.assertIn('Incomplete', self.text('--task', 'k'))
+
+    def test_a_disputed_run_counts_for_nothing_whatever_its_records_order(self):
+        for name, records in (('ends 9 then 1', (start(1), end(1, '9.00'), end(1, '1.00'))),
+                              ('ends 1 then 9', (start(1), end(1, '1.00'), end(1, '9.00'))),
+                              ('starts of two tasks', (start(1), start(1, task='j'), end(1, '9.00'))),
+                              ('a later copy restores nothing', (start(1), end(1, '9.00'), end(1, '1.00'), end(1, '9.00')))):
+            with self.subTest(name):
+                self.write(*records, start(2), end(2, '2.00'))
+                _, r = self.query()
+                self.assertFalse(r['complete'])
+                self.assertEqual([(t['task'], t['launches'], t['knownUsd'], t['totalUsd']) for t in r['tasks']], [('k', 1, '2.00', None)])
 
     def test_a_missing_ledger_is_empty_and_an_unreadable_one_an_error(self):
         code, r = self.query()
