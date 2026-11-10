@@ -8,7 +8,7 @@ export const meta = {
 const AGENTRC = '"${AGENTRC_DIR:-$HOME/.claude}"'  // shell text, quoted so a path with spaces stays one word: the agentrc checkout a project install names in AGENTRC_DIR, else the user install
 // args: { pr, repo: 'owner/name', head, mergeBase, scopeBase (full SHAs: prepare.py's
 //          pins; scopeBase is mergeBase on a full review, the last reviewed head on an
-//          incremental one, or on a recheck after a base merge prepare's synthetic base), mode: 'full' | 'incremental' | 'discussion' (the last for prepare.py's
+//          incremental one, or after a base merge prepare's synthetic base), mode: 'full' | 'incremental' | 'discussion' (the last for prepare.py's
 //          `same`: the head was reviewed and only pushback on our threads is judged), groups: string[] (prepare.py's),
 //          factsDir (prepare.py's facts file's directory, where threads.py writes),
 //          hil: { choice: 'none' } | { choice: 'boards', boards: [{ board, verdict: 'pass' | 'fail' | 'not-run',
@@ -170,13 +170,15 @@ if (prior.repo !== repo || prior.pr !== pr || prior.head !== head) {
   return blocked('ledger-failed', `the ledger view is for ${prior.repo}#${prior.pr} at ${prior.head}, not ${repo}#${pr} at ${head}`)
 }
 // A copy missing members must not read as nothing standing: an incremental or discussion run continues the review prepare pinned.
+// After a base merge an incremental scope starts at prepare's synthetic base, not at the last reviewed head it pinned.
+const lastHead = (check.pins || {}).priorHead ?? scopeBase
 // A row without its published text or repair record would restate the draft, or never raise a failed repair again;
 // heldThreads is printed whenever a review is on the ledger.
 const rowOk = (f) => f && typeof f.id === 'string' && (f.published === null || typeof f.published === 'string') &&
   (f.repair === null || (f.repair && SHA.test(f.repair.head) && typeof f.repair.state === 'string' && typeof f.repair.resolved === 'boolean'))
 if (!Number.isInteger(prior.reviews) || prior.reviews < 0 || !Array.isArray(prior.open) || !Array.isArray(prior.disputes) || !prior.open.every(rowOk) ||
   (prior.reviews > 0 && !Array.isArray(prior.heldThreads)) ||
-  ((args.mode !== 'full' || recheckFrom) && (prior.reviews < 1 || (prior.last || {}).head !== (discussion ? head : recheckFrom || scopeBase)))) {
+  ((args.mode !== 'full' || recheckFrom) && (prior.reviews < 1 || (prior.last || {}).head !== (discussion ? head : recheckFrom || lastHead)))) {
   const shape = Object.fromEntries(Object.entries(prior).map(([k, v]) => [k, Array.isArray(v) ? `${v.length} rows` : v]))
   return blocked('ledger-failed', `ledger answered ${JSON.stringify(shape)}`)
 }

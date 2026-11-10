@@ -474,6 +474,24 @@ test('a ledger answer missing its members, or not of the review prepare pinned, 
   assert.equal((await run(BASE, { ledgerAsIs: { reviews: 0, last: null, open: [], disputes: [] } })).result.status, 'reviewed', 'an empty ledger prints no heldThreads')
 })
 
+test('an incremental review scoped from a base merge\'s synthetic base continues the review of the head prepare pinned as prior (#450)', async () => {
+  const S = 'd'.repeat(40)
+  const inc = { ...BASE, mode: 'incremental', scopeBase: S }
+  const standing = { id: 'pr7-f1', status: 'open', file: 'src/core/a.c', line: 10, severity: 'high', commentId: 901 }
+  const ledger = { reviews: 1, last: { head: OLD }, open: [standing] }
+  const still = { state: 'open', reason: 'still' }
+  const withPrior = (priorHead) => ({ ...pinned(inc), pins: { ...pinned(inc).pins, priorHead } })
+  const good = await run(inc, { check: withPrior(OLD), ledger, recheck: still })
+  assert.equal(good.result.status, 'reviewed')
+  assert.deepEqual([good.result.scopeBase, good.result.mergeBase], [S, MB], 'saved with the new merge base, so the next review compares as today')
+  assert.deepEqual(good.audits.map(a => a.diff), [{ base: S, head: H }])
+  for (const check of [pinned(inc), withPrior(MB)]) {
+    const { result, labels } = await run(inc, { check, ledger, recheck: still })
+    assert.deepEqual([result.status, result.reason], ['blocked', 'ledger-failed'], JSON.stringify(check.pins))
+    assert.ok(!labels.some(l => l.startsWith('recheck:')))
+  }
+})
+
 test('a ledger answer past 64 KiB crosses whole through one emitted file, every text exact, in every mode', async () => {
   const inc = { ...BASE, mode: 'incremental', scopeBase: OLD }
   // As ledger.py's view writes a carried row: without its impact and severityReason.

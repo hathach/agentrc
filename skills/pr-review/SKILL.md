@@ -45,8 +45,11 @@ the last posted review's inline comments (`reconciled`, post.py's
 the checkout is a linked worktree, on branch `pr-review-<N>` at
 the PR head (an existing tree at either place is reused) and picks
 the mode: `full` on a first review or after a force-push or rebase,
-`incremental` when the last reviewed head is an ancestor and the merge base is
-unchanged, `same` when this head was reviewed already. On `same`, launch in
+`incremental` when the last reviewed head is an ancestor (after a base merge,
+scoped from a synthetic merge of that head and the new merge base, so what the
+merge brought in is left out and a content conflict's resolution is in; any
+other conflict kind refuses, and `full` reviews the whole PR), `same` when this
+head was reviewed already. On `same`, launch in
 `discussion` mode, which only judges new replies on our threads and returns
 `nothing-new` when there are none; `full` reviews the head again instead, saved
 with the request's words as `--reason`. Under `auto-fix`, prepare's
