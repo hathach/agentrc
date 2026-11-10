@@ -158,6 +158,9 @@ pages in order join into the entry. A link it has none for, or whose entry has a
 failure or a list of starts too large for a line, is left out of both. The caller checks what comes
 back against its own digests.
 
+Every gh read answered HTTP 502, 503 or 504 is made again after 2 and then 5 seconds, the --stop-file checked before
+each attempt, before it fails; nothing it writes is ever repeated.
+
 Under AGENTRC_EMIT the line goes to the file it names instead of stdout, claimed before anything runs
 (exit 3 at once, nothing done, when that file is there): lib/seal.py's emit, which a workflow reads instead
 of a model's copy.
@@ -233,16 +236,29 @@ class Failed(Exception):
         self.limit = limit
 
 
+# #424: a 502, 503 or 504 that the same read answered a moment later lost whole pr-babysit cycles; a read meets one again
+# after each of these waits, never a write, whose request may have landed.
+TRANSIENT = re.compile(r'\bHTTP 50[234]\b')
+RETRY_WAITS = (2, 5)
+WRITES = ('-X', '--method', '-f', '-F', '--field', '--raw-field', '--input')
+
+
 def gh(*args, raw=False):
-    if STOP_FILE and os.path.exists(STOP_FILE):
-        raise Failed(f'stopped before the next GitHub call: {STOP_FILE} exists')
-    try:
-        done = subprocess.run(['gh', *args], capture_output=True)
-    except OSError as e:
-        raise Failed(f'gh: {e}')
-    if done.returncode != 0:
+    read = args[0] != 'api' or not any(a in WRITES for a in args)
+    for wait in (*RETRY_WAITS, None):
+        if STOP_FILE and os.path.exists(STOP_FILE):
+            raise Failed(f'stopped before the next GitHub call: {STOP_FILE} exists')
+        try:
+            done = subprocess.run(['gh', *args], capture_output=True)
+        except OSError as e:
+            raise Failed(f'gh: {e}')
+        if done.returncode == 0:
+            break
         err = done.stderr.decode(errors='replace').strip()
-        raise Failed(f'gh {args[0]} {args[1]}: {err or f"exit {done.returncode}"}', rate_limit(err))
+        limit = rate_limit(err)
+        if wait is None or not read or limit or not TRANSIENT.search(err):
+            raise Failed(f'gh {args[0]} {args[1]}: {err or f"exit {done.returncode}"}', limit)
+        time.sleep(wait)
     # A job log is whatever the job printed; anything parsed stays strict.
     if raw:
         return done.stdout.decode(errors='replace')

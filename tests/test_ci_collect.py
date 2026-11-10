@@ -115,6 +115,59 @@ class PageSizeTest(unittest.TestCase):
             self.assertEqual(len(calls), 1)
 
 
+class TransientRetryTest(unittest.TestCase):
+    """#424: a read meets a 502, 503 or 504 again after a short wait, a bounded number of times; nothing else is retried."""
+
+    def gh(self, answers, *args, stop=None):
+        calls, waits = [], []
+
+        def run(argv, **kw):
+            calls.append(argv)
+            code, err = answers.pop(0) if len(answers) > 1 else answers[0]
+            return mock.Mock(returncode=code, stdout=b'{"ok": 1}' if code == 0 else b'', stderr=err.encode())
+
+        def sleep(s):
+            waits.append(s)
+            if stop and len(waits) == stop[1]:
+                Path(stop[0]).touch()
+        with mock.patch.object(collect.subprocess, 'run', run), mock.patch.object(collect.time, 'sleep', sleep), \
+                mock.patch.object(collect, 'STOP_FILE', stop[0] if stop else None):
+            try:
+                return collect.gh(*(args or ('pr', 'checks', '5', '--repo', 'o/r'))), calls, waits
+            except collect.Failed as e:
+                return e, calls, waits
+
+    def test_a_transient_server_error_is_read_again_after_a_wait(self):
+        for err in ('HTTP 504: 504 Gateway Timeout (https://api.github.com/graphql)',
+                    'HTTP 503: No server is currently available to service your request', 'gh: Server Error (HTTP 502)'):
+            with self.subTest(err):
+                got, calls, waits = self.gh([(1, err), (0, '')])
+                self.assertEqual((got, len(calls), waits), ({'ok': 1}, 2, [2]))
+
+    def test_it_gives_up_after_its_waits_with_the_last_error(self):
+        got, calls, waits = self.gh([(1, 'HTTP 502')])
+        self.assertIsInstance(got, collect.Failed)
+        self.assertIn('HTTP 502', str(got))
+        self.assertEqual((len(calls), waits), (3, list(collect.RETRY_WAITS)))
+
+    def test_other_failures_and_writes_are_not_retried(self):
+        for what, err, args in (('a 500', 'HTTP 500', ()), ('a 404', 'gh: Not Found (HTTP 404)', ()),
+                                ('a rate limit', 'HTTP 403: API rate limit exceeded for user ID 1.', ()),
+                                ('a POST', 'HTTP 502', ('api', '-X', 'POST', 'repos/o/r/actions/runs/7/rerun')),
+                                ('a field', 'HTTP 502', ('api', 'repos/o/r/issues/5/comments', '-f', 'body=x'))):
+            with self.subTest(what):
+                got, calls, waits = self.gh([(1, err), (0, '')], *args)
+                self.assertIsInstance(got, collect.Failed)
+                self.assertEqual((len([c for c in calls if c[1:3] != ['api', 'rate_limit']]), waits), (1, []))
+
+    def test_a_stop_file_between_attempts_ends_it_before_the_next_call(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            got, calls, waits = self.gh([(1, 'HTTP 502')], stop=(str(Path(tmp) / 'stop'), 1))
+        self.assertIsInstance(got, collect.Failed)
+        self.assertIn('stopped before the next GitHub call', str(got))
+        self.assertEqual((len(calls), waits), (1, [2]))
+
+
 class InventoryTest(unittest.TestCase):
     def setUp(self):
         self.heads = []      # headRefOid per `gh pr view`, last one repeats
@@ -818,7 +871,7 @@ class FailuresTest(unittest.TestCase):
                 return limited
             return ok(self.logs[job]) if path.endswith('/logs') else ok(self.jobs[job])
         for obj, name, fake in ((collect.subprocess, 'run', run), (collect.tempfile, 'gettempdir', lambda: self.tmp.name),
-                                (collect.rtd, 'token', lambda: 'k'),
+                                (collect.time, 'sleep', lambda s: None), (collect.rtd, 'token', lambda: 'k'),
                                 (collect.rtd, 'reason', lambda url, key: (9, {'error': ''}, [('error', 'Error while checking out', 'x')],
                                                                           [(128, 'git checkout --force abc', 'fetching\nfatal: reference is not a tree: abc')]))):
             patcher = mock.patch.object(obj, name, fake)
