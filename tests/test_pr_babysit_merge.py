@@ -266,7 +266,7 @@ class MergeTest(unittest.TestCase):
                 self.assertBlocked(self.run_it(launch_output(result=result), '--merge'), pattern)
 
     def test_exceptions_and_obligations_in_the_state_block(self):
-        cases = {'acceptedFailures': ['k'], 'deferrals': [['1#1', {}]], 'holds': [['1#1', {}]], 'debt': [[1, {}]], 'reanswer': [1],
+        cases = {'deferrals': [['1#1', {}]], 'holds': [['1#1', {}]], 'debt': [[1, {}]], 'reanswer': [1],
                  'pending': {'sha': OTHER, 'stage': 'push-failed'}}
         for key, value in cases.items():
             with self.subTest(key):
@@ -412,6 +412,66 @@ class MergeTest(unittest.TestCase):
                 self.world.__init__()
                 self.world.inventory.update(over)
                 self.assertBlocked(self.run_it(None, '--merge'), pattern)
+
+    def test_a_merge_goes_with_the_failures_the_user_accepted_and_nothing_else(self):
+        # #435: an accepted rig-side failure leaves CI red and the merge state UNSTABLE.
+        check = {'name': 'build (CH32V20x_EVT)', 'workflow': 'Build', 'bucket': 'fail', 'link': 'https://github.com/o/r/actions/runs/1/job/2',
+                 'attempt': '2', 'aliases': []}
+
+        key = '61a7ca4931576955'
+
+        def failure(**over):
+            return {'check': check['name'], 'workflow': 'Build', 'job': 'build', 'cell': None, 'signature': 'FAILED to install WCH:ch32v',
+                    'complete': True, 'verdict': 'rig-side', 'state': 'accepted', 'key': key, 'link': check['link'], **over}
+
+        def accepted(keys=(key,), entries=None, failures=None):
+            observation = launch_output()['result']['observation']
+            ci = {'status': 'red', 'headSha': HEAD, 'realFailures': [failure()] if failures is None else failures}
+            return launch_output({'acceptedFailures': list(keys), 'ciCache': {'reruns': [], 'entries': [{'link': check['link'], 'bucket': 'fail', 'digest': 'd'}]
+                                                                              if entries is None else entries}},
+                                 {'observation': {**observation, 'ci': ci}})
+
+        def world(views=None, **inventory):
+            self.world.__init__()
+            self.world.views = views or [live(mergeStateStatus='UNSTABLE')]
+            self.world.inventory.update({'status': 'red', 'checks': [check], **inventory})
+
+        world()
+        got = self.run_it(accepted())
+        self.assertEqual((got['outcome'], got['blockers']), ('ready', []), got)
+        self.assertEqual(got['accepted'], [{'check': check['name'], 'link': check['link'], 'keys': [key]}], 'the acceptance is recorded')
+        world([live(mergeStateStatus='UNSTABLE'), live(mergeStateStatus='UNSTABLE'), live(state='MERGED', mergeCommit={'oid': OTHER})])
+        got = self.run_it(accepted(), '--merge')
+        self.assertEqual((got['outcome'], got['admin'], self.world.merges[0][-1]), ('merged', False, ''), got)
+        rerun = {**check, 'link': 'https://github.com/o/r/actions/runs/1/job/3', 'attempt': '3'}
+        cases = {
+            'a launch accepting nothing': (accepted(keys=()), {}, 'ci: status red'),
+            'another key accepted': (accepted(keys=('0' * 16,)), {}, 'ci: status red'),
+            'a failure keyed on another execution': (accepted(failures=[failure(link=rerun['link'])]), {}, 'ci: status red'),
+            'an output from before the link': (accepted(failures=[{k: v for k, v in failure().items() if k != 'link'}]), {}, 'ci: status red'),
+            'a failure with no key': (accepted(failures=[{k: v for k, v in failure().items() if k != 'key'}]), {}, 'ci: status red'),
+            'a failure not accepted': (accepted(failures=[failure(), failure(signature='second', state='rigSide', key='1' * 16)]), {}, 'ci: status red'),
+            'an incomplete failure list': (accepted(failures=[failure(complete=False)]), {}, 'ci: status red'),
+            'an execution the launch never judged': (accepted(entries=[]), {}, 'ci: status red'),
+            'a re-run': (accepted(), {'checks': [rerun]}, 'ci: status red'),
+            'cancelled since': (accepted(), {'checks': [{**check, 'bucket': 'cancel'}]}, 'ci: status red'),
+            'an unknown attempt': (accepted(entries=[{'link': check['link'], 'bucket': 'fail'}]), {'checks': [{**check, 'attempt': None}]}, 'ci: status red'),
+            'a new failure': (accepted(), {'checks': [check, {**rerun, 'name': 'lint'}]}, 'failed: build .*, lint'),
+            'something pending': (accepted(), {'pending': 1, 'status': 'running'}, '1 pending'),
+            'another head': (accepted(), {'head': OTHER}, f'head {OTHER}'),
+            'a required check': (accepted(), {'requiredChecks': [{'context': check['name'], 'app': -1, 'state': 'completed/failure', 'bucket': 'fail'}]},
+                                 f"required check '{re.escape(check['name'])}' on the head: completed/failure"),
+        }
+        for name, (output, inventory, pattern) in cases.items():
+            with self.subTest(name):
+                world(**inventory)
+                got = self.run_it(output, '--merge')
+                self.assertBlocked(got, pattern)
+                self.assertBlocked(got, 'merge state UNSTABLE')
+        world([live()], status='green', checks=[])
+        self.assertEqual(self.run_it(accepted())['outcome'], 'ready', 'an accepted failure since passed blocks nothing')
+        world(status='green', checks=[])
+        self.assertBlocked(self.run_it(accepted()), 'merge state UNSTABLE')  # nothing accepted explains it
 
     def test_an_ambiguous_merge_is_read_back(self):
         cases = {

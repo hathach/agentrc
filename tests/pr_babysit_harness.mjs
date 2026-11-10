@@ -3112,6 +3112,7 @@ test('a run red only from accepted failures passes, listing them, and is never c
   assert.equal(result.pass, true, JSON.stringify(result.reason))
   assert.deepEqual(result.acceptedFailures, [{ check: 'pvs / analyze', workflow: 'static', job: 'pvs', cell: null, signature: 'license expires in 12 days', key: PVS_KEY, verdict: 'rig-side', reason: 'PVS license renewal pending', scope: 'until the license is renewed' }])
   assert.equal(result.observation.ci.realFailures[0].key, PVS_KEY, 'the observed report carries the key a caller accepts it by')
+  assert.equal(result.observation.ci.realFailures[0].link, failedChecks(redWith(PVS).ci)[0].link, 'and the execution merge.py matches it on')
   assert.match(summaries(logs)[0], /^cycle 1 summary — CI red, accepted failures only/)
   assert.match(rowsOf(summaries(logs)[0])[0][3], /^accepted, not fixed: PVS license renewal pending/)
   assert.equal(rowsOf(summaries(logs)[0])[0][2], 'rig-side', 'the watcher\'s classification is kept')

@@ -46,7 +46,9 @@ python3 "$S/merge.py" --pr-url <url> --base <branch> --checkout DIR --output <sa
 ```
 
 `merge.py --merge` is chief-only, under `agents/chief.md`'s merge exception, and `--waive` only on the owner's word that
-the merge goes without that bot; a bot left out of `autoRun` alone is never waived, and waiving both is refused.
+the merge goes without that bot; a bot left out of `autoRun` alone is never waived, and waiving both is refused. A red
+CI goes with the merge only when the launch's `acceptedFailures` explain every failed check, as the very executions it
+judged, and none is a required check; the receipt's `accepted` records them.
 
 After an agentrc update, launch the workflow from the installed file (Workflow
 `scriptPath: "${AGENTRC_DIR:-$HOME/.claude}/workflows/pr-babysit.js"`, expanded

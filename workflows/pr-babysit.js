@@ -78,8 +78,9 @@ const keyOf = (c, f) => {
   for (const ch of JSON.stringify([c.workflow, c.name, f.signature])) h = ((h ^ BigInt(ch.codePointAt(0))) * 0x100000001b3n) & 0xffffffffffffffffn
   return h.toString(16).padStart(16, '0')
 }
-// recollect, on an incomplete CircleCI failure only: whether a relaunch collects its log again (#482).
-const keyed = (c, failures, recollect) => failures.map(f => ({ ...f, key: keyOf(c, f),
+// link, the collector's execution the key was made on, which merge.py matches it by (#435); recollect, on an incomplete
+// CircleCI failure only: whether a relaunch collects its log again (#482).
+const keyed = (c, failures, recollect) => failures.map(f => ({ ...f, key: keyOf(c, f), link: c.link,
   ...(recollect !== undefined && !f.complete && (c.attempt || '').startsWith('circleci:') ? { recollect } : {}) }))
 const acceptedShaped = (a) => a && typeof a === 'object' && Object.keys(a).length === 3 && typeof a.key === 'string' && /^[0-9a-f]{16}$/.test(a.key) &&
   ['reason', 'scope'].every(k => typeof a[k] === 'string' && a[k].trim().length > 0)
