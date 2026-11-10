@@ -6,8 +6,8 @@ description: Collect status from the human's other Claude Code sessions in hc te
 # Captain
 
 `scripts/captain.py` owns the mechanics: finding sessions in this host's hc terminals, pinning each one's identity,
-telling whether its screen shows its input line, and a locked ledger under `~/.cache/agentrc/captain/` that holds
-every request and answer. This page is the judgment. Linux only (`/proc`). Claude Code sessions only: a session is pinned through
+telling whether it shows its input line, and a locked ledger under `~/.cache/agentrc/captain/` that holds every request
+and answer. This page is the judgment. Linux only (`/proc`). Claude Code sessions only: a session is pinned through
 the session registry Claude Code keeps under its account's config dir, which Codex has none of, so `list` leaves
 Codex terminals out, and remote (`machine/tN`) ones too. `list` orders sessions by hc's `status_ms`, when each last
 reported its status, latest first: an order, not how long one has been idle. A row ends with the session's own status
