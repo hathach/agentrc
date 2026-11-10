@@ -465,11 +465,11 @@ def detached(a, run):
     try:
         code = run()
     except BaseException as e:   # noqa: BLE001 - nobody watches this process; the exit line must still come
-        traceback.print_exc()
         why = f'launcher failed: {type(e).__name__}: {e}'
         try:
+            traceback.print_exc()
             exit_line(a, Progress(a.out / 'progress.log'), 1, why)
-        finally:   # an exit line it cannot write must not lose the end too
+        finally:   # a traceback or exit line it cannot write must not lose the end too
             if accounting := getattr(a, 'accounting', None):
                 accounting.finish(1, why)
     finally:

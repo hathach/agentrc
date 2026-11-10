@@ -940,6 +940,15 @@ class ChiefRun(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.wait_until('the end record', lambda: len(self.ledger()) == 2)
         self.assertEqual([(x['type'], x.get('exit')) for x in self.ledger()], [('start', None), ('end', 1)], 'detached too')
+        Path(self.env['AGENTRC_CHIEF_RUNS']).unlink()
+        shutil.rmtree(self.out)
+        mute = failing.replace('chief_run.Progress.line = broken\n', 'chief_run.Progress.line = broken\n'
+                               'def gone(*_):\n    raise OSError("stderr full")\nchief_run.traceback.print_exc = gone\n')
+        self.assertIn('gone', mute)
+        r = self.detach(subprocess.run([sys.executable, '-c', mute, *self.argv(detached=True)[2:]], env=self.env, capture_output=True, text=True, timeout=30))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.wait_until('the end record', lambda: len(self.ledger()) == 2)
+        self.assertEqual([(x['type'], x.get('exit')) for x in self.ledger()], [('start', None), ('end', 1)], 'nor a lost traceback')
 
     def test_a_ledger_path_it_cannot_resolve_is_a_warning_not_a_failed_launch(self):
         chief_run = self.module()
