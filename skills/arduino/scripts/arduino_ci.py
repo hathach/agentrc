@@ -17,8 +17,10 @@ with its HIL profile (arduino_hil.py's names; HIL, the checkout-relative hil_tes
       [--prune-days N] ROSTER
       (rig) one board at a time: DIR/B admitted (provenance and manifest name this run, B and SHA; every file pinned
       by the manifest, no link, no stray file; its roster this checkout's) and moved to OUT/B/tree, then
-      `hil_test.py run --staged` there, each attempt in OUT/B/run-<n>. A locked board is admitted again every
-      LOCK_POLL s up to --lock-wait; a fail is retried once (the `hil` Caller rules: a passing retry is flaky).
+      `hil_test.py run --staged` there, each attempt in OUT/B/run-<n>. A locked board is admitted again up to
+      --lock-wait once its flock reads free in /proc/locks (an observation; the battery's own take decides), or
+      every LOCK_POLL s while it cannot be watched; a fail is retried once (the `hil` Caller rules: a passing retry
+      is flaky).
       Every attempt starts only before the --deadline (seconds from start; a started battery always finishes its
       restore); a board it stops is not-run "deadline", a fail it denies a retry stays failed. Writes
       OUT/summary.json, recording --attempt (admission ignores the tree's), also the last stdout line. Before the
@@ -55,7 +57,7 @@ FILES = ('skills/arduino/scripts/arduino_remote.py', 'skills/arduino/scripts/ard
 PROVENANCE = 'provenance.json'
 SUMMARY = 'summary.json'
 SUMMARY_KIND = 'arduino-hil-ci'
-LOCK_POLL = 30   # seconds between admissions of a locked board
+LOCK_POLL = 30   # seconds between admissions of a locked board whose flock cannot be watched (lock_observed)
 LOCK_WAIT = 600
 DEADLINE = 3600
 PRUNE_DAYS = 30
@@ -282,9 +284,16 @@ def attempt_entry(run_dir, code, row, seconds):
             'firmware': row.get('firmware'), **{k: row[k] for k in EARLIER if row.get(k)}}
 
 
+def lock_observed(board):
+    """Whether the board's flock is held (True), free (False) or cannot be read (None): hil_lock.flock_observed, which
+    reads /proc/locks and takes nothing. The battery's own take stays the authority."""
+    return H.A.lock.flock_observed(board)
+
+
 def run_board(board, tree, out, roster, clock, lock_wait, stop):
-    """The board's attempts and result. Locked: admitted again every LOCK_POLL s within lock_wait; a fail: one
-    retry, the fail standing until a retry runs. No attempt starts past the deadline, the lock wait or a signal."""
+    """The board's attempts and result. Locked: admitted again within lock_wait once its flock, seen held, reads
+    free, or every LOCK_POLL s while it cannot be read or read free as the battery found it locked; a fail: one retry,
+    the fail standing until a retry runs. No attempt starts past the deadline, the lock wait or a signal."""
     res = new_result(board)
     lock_since, waited, failed = None, 0.0, None   # lock_since: awaiting admission; failed: the fail awaiting a retry
 
@@ -316,10 +325,21 @@ def run_board(board, tree, out, roster, clock, lock_wait, stop):
             log(f'{board}: {a["previousPending"]}'[:300])
         if a.get('locked'):
             lock_since = t if lock_since is None else lock_since
-            nap = min(LOCK_POLL, lock_wait - waited - (time.monotonic() - lock_since), clock.left())
+            nap = min(lock_wait - waited - (time.monotonic() - lock_since), clock.left())
+            # free right after the battery found it locked (a lost race, or a holder /proc/locks does not show) or
+            # unreadable: the observation is blind, so the battery retries every LOCK_POLL s
+            watching, slept = lock_observed(board) is True, 0.0
             while nap > 0 and not stop['signal']:
+                if watching:
+                    seen = lock_observed(board)
+                    if seen is False:
+                        break
+                    watching = seen is True
+                if not watching and slept >= LOCK_POLL:
+                    break
                 time.sleep(min(1.0, nap))
                 nap -= 1.0
+                slept += 1.0
             continue
         if lock_since is not None:   # admitted: the wait ends where this attempt started
             waited += t - lock_since

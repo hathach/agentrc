@@ -253,6 +253,35 @@ class FlockIsTheOnlyAuthority(LockDir):
         self.patch(hil_lock.fcntl, 'flock', mock.Mock(side_effect=AssertionError('is_locked flocked')))
         self.assertTrue(hil_lock.is_locked(BOARD))
 
+    def test_flock_observed_reads_the_flock_not_the_record_and_never_flocks(self):
+        """agentrc#470: /proc/locks, matched on the lock file's dev and inode, read across uids, takes nothing."""
+        if not os.access(hil_lock.PROC_LOCKS, os.R_OK):
+            self.skipTest(f'{hil_lock.PROC_LOCKS} is not readable here')
+        self.assertIsNone(hil_lock.flock_observed(BOARD))          # no lock file yet
+        p = self.holder(self.record(reason='live'))
+        with mock.patch.object(hil_lock.fcntl, 'flock', mock.Mock(side_effect=AssertionError('flocked'))):
+            self.assertIs(hil_lock.flock_observed(BOARD), True)
+        p.stdin.close()
+        p.wait()
+        Path(hil_lock.lock_path(BOARD)).write_text(json.dumps({'pid': os.getpid(), 'reason': 'record left'}))
+        self.assertTrue(hil_lock.is_locked(BOARD))
+        self.assertIs(hil_lock.flock_observed(BOARD), False)      # a live pid's record without its flock
+        st = os.stat(hil_lock.lock_path(BOARD))
+        dev = f'{os.major(st.st_dev):02x}:{os.minor(st.st_dev):02x}'
+        fake = Path(self.dir, 'proc-locks')
+        for text, seen in ((f'1: POSIX  ADVISORY  WRITE 7 {dev}:{st.st_ino} 0 EOF\n', False),
+                           (f'1: FLOCK  ADVISORY  WRITE 7 {dev}:{st.st_ino + 1} 0 EOF\n', False),
+                           (f'1: FLOCK  ADVISORY  WRITE 7 {dev}:{st.st_ino} 0 EOF\n'
+                            f'1: -> FLOCK  ADVISORY  WRITE 8 {dev}:{st.st_ino} 0 EOF\n', True),
+                           (f'2: -> FLOCK  ADVISORY  WRITE 8 {dev}:{st.st_ino} 0 EOF\n', False),   # only waiting
+                           ('', False)):
+            with self.subTest(text=text):
+                fake.write_text(text)
+                self.patch(hil_lock, 'PROC_LOCKS', str(fake))
+                self.assertIs(hil_lock.flock_observed(BOARD), seen)
+        self.patch(hil_lock, 'PROC_LOCKS', str(Path(self.dir, 'missing')))
+        self.assertIsNone(hil_lock.flock_observed(BOARD))
+
     def test_a_live_pid_record_without_the_flock_does_not_refuse_an_acquire(self):
         Path(hil_lock.lock_path(BOARD)).write_text(json.dumps({'pid': os.getppid(), 'reason': 'stale'}))
         self.assertIsNotNone(self.acquire())

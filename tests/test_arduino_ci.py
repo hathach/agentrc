@@ -196,9 +196,11 @@ class Loop(unittest.TestCase):
     def setUp(self):
         self.out = tmpdir(self)
         self.sleeps = []
-        p = mock.patch.object(C.time, 'sleep', lambda s: self.sleeps.append(s))
-        p.start()
-        self.addCleanup(p.stop)
+        for target, name, value in ((C.time, 'sleep', lambda s: self.sleeps.append(s)),
+                                    (C, 'lock_observed', lambda b: None)):   # the scripted rows decide; no host read
+            p = mock.patch.object(target, name, value)
+            p.start()
+            self.addCleanup(p.stop)
 
     def run_board(self, rows, deadline=3600, lock_wait=600, stop=None, clock_left=None, each=None):
         rows = list(rows)
@@ -317,6 +319,121 @@ class Loop(unittest.TestCase):
     def test_a_signal_starts_no_attempt(self):
         res, calls = self.run_board([row('pass')], stop={'signal': True})
         self.assertEqual((res['verdict'], calls), ('not-run', []))
+
+    def test_a_flock_unreadable_or_free_as_the_battery_found_it_locked_is_retried_every_lock_poll(self):
+        for seen in (None, False):    # a lost race, or a holder /proc/locks does not show: never a hot loop
+            with self.subTest(seen=seen), mock.patch.object(C, 'lock_observed', lambda b: seen):
+                self.sleeps.clear()
+                res, calls = self.run_board([row('not-run', locked=True), row('not-run', locked=True), row('pass')])
+                self.assertEqual((res['verdict'], len(calls), sum(self.sleeps)), ('pass', 3, 2 * C.LOCK_POLL))
+
+
+class LockObserved(unittest.TestCase):
+    """agentrc#470: run_board launches no battery while a real holder (hil_lock in a temp dir) holds the board's
+    flock, as /proc/locks shows it, and one as soon as the flock is gone, its record or not; every LOCK_POLL s when
+    /proc/locks cannot be read. The lock wait, the deadline and a signal still bound the wait, and the battery's own
+    take stays the authority."""
+
+    # holds the board until stdin closes; a `drop` line first closes its flock leaving its record (a failed clear)
+    HOLDER = ('import importlib.util, sys\n'
+              'spec = importlib.util.spec_from_file_location("agentrc_hil_lock", sys.argv[1])\n'
+              'm = importlib.util.module_from_spec(spec)\n'
+              'spec.loader.exec_module(m)\n'
+              'm.BOARD_LOCK_DIR = sys.argv[2]\n'
+              'fh = m.take_board_lock(sys.argv[3], "selftest holder")\n'
+              'print("ready", flush=True)\n'
+              'if sys.stdin.readline().strip() == "drop":\n'
+              '    fh.close()\n'
+              '    print("dropped", flush=True)\n'
+              '    sys.stdin.read()\n'
+              'else:\n'
+              '    m.release_board_lock(fh)\n')
+
+    def setUp(self):
+        self.lock = C.H.A.lock
+        if not os.access(self.lock.PROC_LOCKS, os.R_OK):
+            self.skipTest(f'{self.lock.PROC_LOCKS} is not readable here')
+        p = mock.patch.object(self.lock, 'BOARD_LOCK_DIR', str(tmpdir(self)))
+        p.start()
+        self.addCleanup(p.stop)
+        self.out, self.now, self.sleeps, self.holder = tmpdir(self), [1000.0], 0, None
+
+    def hold(self):
+        self.holder = subprocess.Popen([sys.executable, '-c', self.HOLDER, self.lock.__file__, self.lock.BOARD_LOCK_DIR,
+                                        BOARD], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        self.addCleanup(self.holder.wait)
+        self.addCleanup(self.holder.stdout.close)
+        self.addCleanup(lambda: self.holder.stdin.closed or self.holder.stdin.close())
+        self.assertEqual(self.holder.stdout.readline().strip(), 'ready')
+
+    def release(self):
+        self.holder.stdin.close()
+        self.holder.wait()          # no timeout: Popen.wait would poll the patched clock
+
+    def run_board(self, lock_wait=600, deadline=3600, at_sleep=None, stop=None):
+        """run_board with a battery that takes the real lock as the real one would: locked while the holder holds it.
+        Each sleep advances the clock its length and runs at_sleep(n); returns (result, held at each launch)."""
+        launches, self.sleeps = [], 0
+
+        def battery(tree, board, run_dir, roster):
+            try:
+                fh = self.lock.take_board_lock(board, 'hil_test.py', protected=True, locks=[board])
+            except self.lock.BoardLocked as e:
+                launches.append(True)
+                return 1, row('not-run', locked=True) | {'detail': f'board locked: {e}'}
+            launches.append(False)
+            self.lock.release_board_lock(fh)
+            return 0, row('pass')
+
+        def sleep(s):
+            self.now[0] += s
+            self.sleeps += 1
+            if at_sleep:
+                at_sleep(self.sleeps)
+        with mock.patch.object(C, 'battery', battery), mock.patch.object(C.time, 'sleep', sleep), \
+                mock.patch.object(C.time, 'monotonic', lambda: self.now[0]):
+            res = C.run_board(BOARD, Path('tree'), self.out, ROSTER, C.Clock(deadline), lock_wait,
+                              stop or {'signal': False})
+        return res, launches
+
+    def drop(self):
+        self.holder.stdin.write('drop\n')
+        self.holder.stdin.flush()
+        self.assertEqual(self.holder.stdout.readline().strip(), 'dropped')
+        self.assertTrue(self.lock.is_locked(BOARD))     # its record still names it, alive
+
+    def test_no_launch_while_held_and_one_once_released(self):
+        self.hold()
+        res, launches = self.run_board(at_sleep=lambda n: n == 3 * C.LOCK_POLL and self.release())
+        self.assertEqual((res['verdict'], launches, res['waitedS']), ('pass', [True, False], 3 * C.LOCK_POLL))
+
+    def test_a_live_former_holder_whose_record_stays_is_retaken_once_its_flock_is_gone(self):
+        """Its record left by a failed clear still names it, alive: the flock, not the record, ends the wait."""
+        self.hold()
+        res, launches = self.run_board(lock_wait=60, at_sleep=lambda n: n == 1 and self.drop())
+        self.assertEqual((res['verdict'], launches, res['waitedS']), ('pass', [True, False], 1))
+
+    def test_an_unreadable_proc_locks_falls_back_to_a_launch_every_lock_poll(self):
+        self.hold()
+        with mock.patch.object(self.lock, 'PROC_LOCKS', str(self.out / 'no-proc-locks')):
+            res, launches = self.run_board(lock_wait=100)
+        self.assertEqual((res['verdict'], launches, self.sleeps), ('not-run', [True] * 4, 100))
+        self.release()
+
+    def test_a_held_lock_still_ends_at_the_lock_wait_the_deadline_or_a_signal(self):
+        self.hold()
+        res, launches = self.run_board(lock_wait=100)
+        self.assertEqual((res['verdict'], launches, self.sleeps), ('not-run', [True], 100))
+        self.assertIn('lock wait', res['detail'])
+        res, launches = self.run_board(deadline=50)
+        self.assertEqual((res['verdict'], launches), ('not-run', [True]))
+        self.assertIn('deadline', res['detail'])
+        stop = {'signal': False}
+        res, launches = self.run_board(stop=stop, at_sleep=lambda n: n == 5 and stop.update(signal=True))
+        self.assertEqual((res['verdict'], launches), ('not-run', [True]))
+        self.assertIn('aborted by a signal', res['detail'])
+        self.assertTrue(self.lock.flock_observed(BOARD))   # the observation took nothing
+        self.release()
 
 
 class Prune(unittest.TestCase):

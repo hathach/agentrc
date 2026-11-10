@@ -1466,6 +1466,26 @@ def settle(receipts, wait, busy=None) -> tuple:
 
 
 # --- operator CLI (hold/release/status) ------------------------------------
+PROC_LOCKS = '/proc/locks'
+
+
+def flock_observed(board: str):
+    """Whether a flock is held on the board's lock file, read from /proc/locks without taking it: True or False, None
+    when it cannot be read (no lock file, no /proc/locks). Lines per fs/locks.c lock_get_status (v6.12): `<id>: FLOCK
+    ADVISORY WRITE <pid> <major hex>:<minor hex>:<inode> 0 EOF`, a blocked request's id followed by `->`. A holder in
+    another pid namespace, or a dev number the file system reports otherwise to stat, reads free: only an
+    observation, the flock itself decides."""
+    try:
+        _check_name(board)
+        st = os.stat(lock_path(board), follow_symlinks=False)
+        with open(PROC_LOCKS) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return None
+    want = f'{os.major(st.st_dev):02x}:{os.minor(st.st_dev):02x}:{st.st_ino}'
+    return any(len(t) > 5 and t[1] == 'FLOCK' and t[5] == want for t in (line.split() for line in lines))
+
+
 def is_locked(board: str) -> bool:
     """True if the recorded holder process is still alive.
 
