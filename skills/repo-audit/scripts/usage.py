@@ -18,7 +18,8 @@ flags; other arguments become an unrecognised count), and the repository's own s
 (others are `other`; a project-local one, under .claude/, only from a session in one of its worktrees or in a
 removed one, a directory that no longer exists with a path part that is the main checkout's name or starts with
 `<name>-`, or, for a workflow, from a script path that resolves into a worktree, a script path that no longer exists
-going by the session's directory). Its `totals` carry the camelCase names a record's usage.totals takes: toolCalls
+but may have been the repository's going by the session's directory; an absorbed submodule's checkout counts as its
+main worktree). Its `totals` carry the camelCase names a record's usage.totals takes: toolCalls
 (every call read), scriptInvocations, unattributedInvocations, skillLoads, agentLaunches and workflowRuns (the
 repository's own, agentLaunches without built-in agents) and docReads; the record sums each across hosts. FILE
 (create-only, mode 0600) adds per-key locators, transcript path:line and tool-call id, never command text. Exit 0
@@ -94,7 +95,7 @@ class Repo:
 
     def __init__(self, path, head):
         self.top = Path(git(path, 'rev-parse', '--show-toplevel').stdout.strip())
-        listed = [line[9:] for line in git(path, 'worktree', 'list', '--porcelain').stdout.splitlines()
+        listed = [self.checkout(line[9:]) for line in git(path, 'worktree', 'list', '--porcelain').stdout.splitlines()
                   if line.startswith('worktree ')]
         self.name = Path(listed[0]).name        # the main worktree's, listed first: the audit runs in a task worktree
         # deepest first: a worktree nested in the main checkout must match before it
@@ -107,6 +108,16 @@ class Repo:
         self._vocab = {}
         self._realpath = functools.lru_cache(maxsize=4096)(os.path.realpath)
 
+    @staticmethod
+    def checkout(entry):
+        """A listed worktree's directory: an absorbed submodule's main worktree is listed as its git dir, whose
+        core.worktree names the checkout."""
+        if os.path.isdir(entry) and not os.path.exists(os.path.join(entry, '.git')):
+            r = git(entry, 'rev-parse', '--show-toplevel', check=False)
+            if not r.returncode and r.stdout.strip():
+                return r.stdout.strip()
+        return entry
+
     def catalog(self, pattern):
         """(names in the top-level layout, names under .claude/ only); a tracked .agents -> .claude link is one
         file to git, so its tree is never listed twice."""
@@ -117,15 +128,19 @@ class Repo:
         """Whether a Skill, Agent or Workflow call names this repository's own: a top-level name is installed for
         every session; a project-local one counts only from a session in its worktrees or, given a script path,
         where that path resolves into one, as another repository may hold the same name. A script path that no
-        longer exists (in a removed worktree) goes by the session's directory, as a call by name does."""
+        longer exists goes by the session's directory, as a call by name does, only when it may have been this
+        repository's: it names a repository file, or lies in a worktree or a removed one."""
         if name in top:
             return True
         if name not in local:
             return False
         if script:
             how = (self.rel(script, cwd) or (None, None))[1]
-            if how == 'attributed' or os.path.exists(Path(cwd or '') / script):
+            path = Path(cwd or '') / script
+            if how == 'attributed' or os.path.exists(path):
                 return how == 'attributed'
+            if how is None and self.cwd_class(path) == 'other':
+                return False
         return ctx['cwd_class'] in ('repo', 'repo-inferred')
 
     def rel(self, path, cwd=None, remote=False):

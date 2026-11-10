@@ -1569,6 +1569,42 @@ class Usage(unittest.TestCase):
         self.assertEqual((agg['skills'], agg['agents'], agg['workflows']),
                          ({'build': 1, 'other': 1}, {'runner': 1, 'other': 1}, {'ship': 2, 'other': 3}))
 
+    def test_an_absorbed_submodule_s_checkout_is_its_main_worktree(self):
+        head = self.repo.commit({'.claude/skills/build/SKILL.md': 'x\n', '.claude/agents/runner.md': 'x\n',
+                                 '.claude/workflows/ship.js': 'x\n'})
+        outer = Repo(self)
+        outer.git('-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', self.repo.path.as_posix(), 'dep')
+        dep = outer.path / 'dep'           # git lists its main worktree as outer/.git/modules/dep
+        task = tmpdir(self) / 'audit-x'
+        subprocess.run(['git', '-C', str(dep), 'worktree', 'add', '-q', '--detach', str(task), head], check=True,
+                       capture_output=True, env=git_env())
+        self.run_dir = tmpdir(self) / 'run2'
+        start(task, self.run_dir, '--base', head, head=head)
+        cwd = dep.as_posix()
+        claude(self.root / 'p' / 's1.jsonl', [
+            use('s', 'Skill', {'skill': 'build'}, cwd=cwd), use('a', 'Agent', {'subagent_type': 'runner'}, cwd=cwd),
+            use('w', 'Workflow', {'name': 'ship'}, cwd=cwd),
+            use('b', 'Bash', {'command': 'python3 skills/tool/scripts/tool.py send'}, cwd=cwd)])
+        self.usage()
+        agg = json.loads(self.out.read_text())
+        self.assertEqual((agg['skills'], agg['agents'], agg['workflows']),
+                         ({'build': 1}, {'runner': 1}, {'ship': 1}))
+        self.assertEqual(agg['scripts']['skills/tool/scripts/tool.py']['cwd'], {'repo': 1})
+
+    def test_a_vanished_workflow_script_goes_by_the_session_only_where_it_may_have_been_the_repository_s(self):
+        head = self.repo.commit({'.claude/workflows/ship.js': 'x\n'})
+        self.run_dir = tmpdir(self) / 'run2'
+        start(self.repo.path, self.run_dir, '--base', head, head=head)
+        here, gone = self.repo.path.as_posix(), tmpdir(self).as_posix()
+        name = self.repo.path.name
+        claude(self.root / 'p' / 's1.jsonl', [
+            use('a', 'Workflow', {'scriptPath': f'{gone}/scratch-gone/ship.js'}, cwd=here),     # another stem's
+            use('b', 'Workflow', {'scriptPath': f'{here}/scratch/ship.js'}, cwd=here),         # in the worktree
+            use('c', 'Workflow', {'scriptPath': f'{gone}/{name}-fix/tmp/ship.js'}, cwd=here),  # a removed one
+            use('d', 'Workflow', {'scriptPath': f'{gone}/x/.claude/workflows/ship.js'}, cwd=here)])  # its file
+        self.usage()
+        self.assertEqual(json.loads(self.out.read_text())['workflows'], {'ship': 3, 'other': 1})
+
     def test_only_agent_launches_leave_out_built_in_names(self):
         head = self.repo.commit({'skills/fork/SKILL.md': 'x\n', 'workflows/web-fetch.js': 'x\n'})
         self.run_dir = tmpdir(self) / 'run2'
