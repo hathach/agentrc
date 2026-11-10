@@ -39,7 +39,8 @@ unedited, so a later review states it again only once that line is gone;
 --view prints instead the pr-review workflow's view of that answer, bound to the repository, PR and head it was
 read for (repo, pr, head): it leaves out what the workflow never reads, the ledger path, the unpublished answers and
 each open row's impact and severityReason, which save keeps from the ledger when a result does not regrade the
-finding. The workflow runs it under AGENTRC_EMIT and loads the line from that file (lib/seal.py's emit), so no
+finding, and adds ownComments, the comment ids our receipts hold, which the workflow never takes for another
+reviewer's claim. The workflow runs it under AGENTRC_EMIT and loads the line from that file (lib/seal.py's emit), so no
 model copies it.
 
 --fixable, with a fresh threads.py snapshot, prints what an auto-fix repair may take from the review posted on
@@ -217,6 +218,19 @@ def publications(led):
         yield r, r
         for a in r.get('answerPublications', []):
             yield a, r
+
+
+def receipted(led):
+    """(review ids, comment ids) our receipts hold: each publication's review, its inline comments and the replies staged
+    into it, and each repair note. They stay ours whatever the human edits since, a review body's marker included."""
+    reviews, comments = set(), set()
+    for p, _ in publications(led):
+        rec = p.get('receipts') or {}
+        reviews.add((rec.get('review') or {}).get('reviewId'))
+        comments |= set((rec.get('review') or {}).get('commentIds') or [])
+        comments |= {e.get('replyId') for e in rec.get('staged') or []}
+    comments |= {x.get('replyId') for r in led['reviews'] for x in r.get('repairs', [])}
+    return reviews - {None}, comments - {None}
 
 
 def owner_of(led, pub):
@@ -715,10 +729,10 @@ UNREAD = ('ledger', 'answers')
 UNREAD_ROW = ('impact', 'severityReason')
 
 
-def workflow_view(answer, repo, pr, head):
+def workflow_view(answer, repo, pr, head, own=()):
     view = {k: v for k, v in answer.items() if k not in UNREAD}
     view['open'] = [{k: v for k, v in f.items() if k not in UNREAD_ROW} for f in answer['open']]
-    return {'repo': repo, 'pr': pr, 'head': head, **view}
+    return {'repo': repo, 'pr': pr, 'head': head, **view, 'ownComments': sorted(own)}
 
 
 def read_snapshot(path, repo, pr):
@@ -974,7 +988,7 @@ def next_of(a, repo):
         return [sys.executable, (HERE / script).as_posix(), *args, '--pr', str(a.pr), '--repo', repo]
     return next_step(led, facts, {'head': pr['headRefOid'], 'state': pr.get('state')}, a.publish, cmd, review,
                      manifest and {**manifest, 'path': a.manifest}, reading,
-                     lambda h: fixable(led, snapshot(repo, a.pr), h), a.token)
+                     lambda h: fixable(led, snapshot(repo, a.pr, owned=receipted(led)), h), a.token)
 
 
 def collect(argv):
@@ -1022,7 +1036,7 @@ def collect(argv):
             return {'ledger': path.as_posix(), 'fixable': fixable(led, snapshot, a.head)}
         out = {'ledger': path.as_posix(), **show(led, a.finding, a.draft, snapshot, a.pending)}
         out = {**out, 'disputes': disputes(led, snapshot, a.head)} if a.head else out
-        return workflow_view(out, repo, a.pr, a.head) if a.view else out
+        return workflow_view(out, repo, a.pr, a.head, receipted(led)[1]) if a.view else out
     result = (load_output(a.output) or {}).get('result')
     if not isinstance(result, dict):
         raise Unusable(f'--output {a.output} holds no Workflow result')

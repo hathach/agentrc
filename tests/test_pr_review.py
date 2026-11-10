@@ -82,7 +82,7 @@ class FakeGitHub:
     def publish(self, rid):
         """A submitted review's comments turn public: each root opens a thread, each reply joins its root's."""
         for c in self.review_comments[rid]:
-            self.inline.append({**c, 'user': {'login': ME}, 'created_at': self.tick()})
+            self.inline.append({**c, 'user': {'login': ME}, 'pull_request_review_id': rid, 'created_at': self.tick()})
             root = c.get('in_reply_to_id')
             if root is None:
                 self.threads.append({'id': f"T{c['id']}", 'isResolved': False, 'isOutdated': False,
@@ -971,7 +971,8 @@ class Ledger(Case):
         snap = self.tmp / 'threads.json'
         snap.write_text(json.dumps({'repo': REPO, 'pr': PR, 'comments': [], 'threads': []}))
         view = self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--threads', str(snap), '--head', self.p['head'], '--view'])
-        self.assertEqual(view, {'repo': REPO, 'pr': PR, 'head': self.p['head'], 'reviews': 0, 'last': None, 'open': [], 'disputes': []})
+        self.assertEqual(view, {'repo': REPO, 'pr': PR, 'head': self.p['head'], 'reviews': 0, 'last': None, 'open': [], 'disputes': [],
+                                'ownComments': []})
 
     def test_save_refuses_a_word_off_the_scale_before_anything_is_stored(self):
         for word in ('major', 'severe', None):
@@ -1927,7 +1928,10 @@ class Pushback(PostCase):
         plain = self.call(ledger, show)
         want = {k: v for k, v in plain.items() if k not in ('ledger', 'answers')}
         want['open'] = [{k: v for k, v in f.items() if k not in ('impact', 'severityReason')} for f in plain['open']]
-        self.assertEqual(view, {'repo': REPO, 'pr': PR, 'head': self.head, **want}, 'the plain answer less what the workflow never reads')
+        own = sorted(ledger.receipted(json.loads(Path(self.p['ledger']).read_text()))[1])
+        self.assertEqual(own, [5010])
+        self.assertEqual(view, {'repo': REPO, 'pr': PR, 'head': self.head, **want, 'ownComments': own},
+                         'the plain answer less what the workflow never reads, with the comments our receipts hold')
         self.assertEqual((len(view['open']), len(view['disputes'])), (1, 1))
         for bad in (['show', '--pr', str(PR), '--repo', REPO, '--threads', str(snap)],
                     [*show, '--fixable']):
@@ -2288,6 +2292,39 @@ class Threads(Case):
         got = {c['id']: c for c in json.loads(f.read_text())['comments']}
         self.assertEqual((got[11]['line'], got[11]['bot'], got[11]['threadId'], got[11]['outdated']), (9, True, 'T2', True))
         self.assertEqual(got[11]['digest'], harvest.digest('bug'))
+
+
+class Ownership(PostCase):
+    """threads.py takes the comments our ledger receipted for ours, whatever the human made of the review body (#433)."""
+
+    def ours(self):
+        f = self.tmp / 'threads.json'
+        self.call(threads, ['--pr', str(PR), '--repo', REPO, '--out', str(f)])
+        return {(c['kind'], c['id']): c['ours'] for c in json.loads(f.read_text())['comments']}
+
+    def test_a_blanked_review_body_keeps_its_receipted_comments_ours_and_an_unrelated_one_of_ours_stays_external(self):
+        self.save(self.result_for(self.p))
+        rid = self.post('--auto')['review']['reviewId']
+        root = self.review()['findings'][0]['commentId']
+        led = json.loads(Path(self.p['ledger']).read_text())
+        led['reviews'][-1]['repairs'] = [{'findingId': 'pr7-f1', 'commentId': root, 'replyId': 990}]
+        Path(self.p['ledger']).write_text(json.dumps(led))
+        # A fix note lands in a marker-less review of its own, as post.py --fixed's reply does; 991 is ours by
+        # author only, in a review of no run of ours.
+        self.gh.reviews[77] = {'id': 77, 'body': '', 'state': 'COMMENTED', 'user': {'login': ME}}
+        self.gh.reviews[78] = {'id': 78, 'body': 'my own aside', 'state': 'COMMENTED', 'user': {'login': ME}}
+        self.gh.inline += [{'id': 990, 'in_reply_to_id': root, 'body': 'Fixed in abc: x', 'user': {'login': ME},
+                            'pull_request_review_id': 77, 'created_at': self.gh.tick()},
+                           {'id': 991, 'in_reply_to_id': root, 'body': 'also see b.c', 'user': {'login': ME},
+                            'pull_request_review_id': 78, 'created_at': self.gh.tick()}]
+        want = {('review', root): True, ('review', 990): True, ('review', 991): False, ('review-body', 78): False}
+        got = self.ours()
+        self.assertEqual(({k: got[k] for k in want}, got[('review-body', rid)]), (want, True))
+        self.gh.reviews[rid]['body'] = ''
+        got = self.ours()
+        self.assertEqual(({k: got[k] for k in want}, ('review-body', rid) in got), (want, False), 'a blanked body keeps what was receipted')
+        next(c for c in self.gh.inline if c['id'] == 990)['user'] = {'login': 'contrib'}
+        self.assertFalse(self.ours()[('review', 990)], 'a receipted id is ours only while we wrote it')
 
 
 class ResolveDue(unittest.TestCase):

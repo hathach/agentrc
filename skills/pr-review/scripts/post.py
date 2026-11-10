@@ -77,7 +77,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ledger import (DRAFTS, ONLINE, OPEN, SETTLED, UNSETTLED, add_answers, answer_root, answered_ids, answers_of, claim,  # noqa: E402
-                    holder, note_hold, open_answers, owner_of, publications, pushback, reached, repair_hold, repairs, submitted_last,
+                    holder, note_hold, open_answers, owner_of, publications, pushback, reached, receipted, repair_hold, repairs, submitted_last,
                     thread_roots, digest as ledger_digest, ledger_path, load, locked, repo_of, store)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'pr-babysit' / 'scripts'))
@@ -610,7 +610,7 @@ def unfit(repo, pr, led, f, want, head, login):
     """(snapshot, why f's thread may not take a note or a resolve now, or None), read afresh: the root and claim as
     the fix check judged them (`want`, its claim digest), no pushback since our last answer, the PR open on the repaired
     head."""
-    snap = snapshot(repo, pr, login)
+    snap = snapshot(repo, pr, login, receipted(led))
     t = thread_roots(snap).get(f.get('commentId'))
     at, shut = head_if_open(repo, pr)
     return snap, (shut or holder(led, snap)(f) or

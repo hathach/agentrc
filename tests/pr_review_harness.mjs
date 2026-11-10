@@ -592,6 +592,18 @@ test('a grouping that names an item twice, nothing, one member or two files is d
   assert.ok(!alone.labels.includes('group'), 'nothing shares a file: no grouping asked')
 })
 
+test('a claim on a comment our ledger receipted is never judged as another reviewer\'s, whatever its review body reads (#433)', async () => {
+  const claims = { claims: [{ commentId: 901, threadId: 'T1', author: 'reviewer', bot: false, path: 'src/core/a.c', line: 10, url: 'https://x/c901', claim: 'overrun' },
+    { commentId: 55, threadId: 'T2', author: 'coderabbitai[bot]', bot: true, path: 'src/core/a.c', line: 12, url: 'https://x/c55', claim: 'leak' }] }
+  const { result, labels, logs } = await run(BASE, { ledger: { reviews: 1, last: { head: OLD }, open: [], ownComments: [901] }, claims, judge: () => confirmedAs('low') })
+  assert.deepEqual(result.claims.map(c => c.commentId), [55])
+  assert.deepEqual(labels.filter(l => l.startsWith('judge:')), ['judge:0'])
+  assert.ok(!result.draft.body.includes('c901') && result.draft.body.includes('c55'))
+  assert.ok(logs.some(l => l === '1 claim(s) dropped: our own comments'))
+  const without = await run(BASE, { ledger: { reviews: 1, last: { head: OLD }, open: [] }, claims, judge: () => confirmedAs('low') })
+  assert.deepEqual(without.result.claims.map(c => c.commentId), [901, 55], 'a view without the member drops nothing')
+})
+
 test('a claims-only group needs a path, and a claim that covered a finding counts with it only while it is confirmed again', async () => {
   const claims = { claims: [{ commentId: 55, author: 'a[bot]', bot: true, path: null, line: null, claim: 'x' },
     { commentId: 56, author: 'b[bot]', bot: true, path: null, line: null, claim: 'x too' }] }

@@ -10,9 +10,11 @@ thread order (a thread past 100 comments is refused, not cut); comments has one 
 comment (`issue`): id, author, bot, body verbatim, digest (sha256, 12 hex, as
 pr-babysit's harvest.py computes it), path, line, commitId, inReplyTo,
 reviewId, threadId, resolved and outdated (the last two null outside a
-thread), url, createdAt. A comment is `ours` when it belongs to a review by the
-authenticated user whose body carries pr-review's marker: quoting the marker
-makes nobody else's comment ours.
+thread), url, createdAt. A comment is `ours` when the authenticated user wrote
+it and it belongs to a review whose body carries pr-review's marker, or the
+PR's ledger receipted it or its review: a body the human edited or blanked, or
+a marker-less review a fix note landed in, keeps them ours, while quoting the
+marker makes nobody else's comment ours.
 
 stdout ends with one JSON line: the file, its sha256, and counts; the bodies
 stay in the file. {"error": ...}, exit 2, when an endpoint cannot be read.
@@ -24,7 +26,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from ledger import repo_of  # noqa: E402
+from ledger import ledger_path, load, receipted, repo_of  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'pr-babysit' / 'scripts'))
 from facts import Parser, Unusable, report  # noqa: E402
@@ -64,22 +66,24 @@ def record(kind, c, **extra):
             'createdAt': c.get('created_at') or c.get('submitted_at'), 'ours': False, **extra}
 
 
-def snapshot(repo, pr, login=None):
-    """The PR's comments and threads, as collect writes them; `login` saves reading who we are again."""
+def snapshot(repo, pr, login=None, owned=((), ())):
+    """The PR's comments and threads, as collect writes them; `login` saves reading who we are again, `owned` is
+    ledger.receipted()'s (review ids, comment ids) of this PR's ledger."""
     reviews = pages(f'repos/{repo}/pulls/{pr}/reviews')
     inline = pages(f'repos/{repo}/pulls/{pr}/comments')
     issue = pages(f'repos/{repo}/issues/{pr}/comments')
     ordered = threads(repo, pr)
     where = {i: (t['threadId'], t['resolved'], t['outdated']) for t in ordered for i in t['commentIds']}
     login = login or gh_json('api', 'user')['login']
-    ours = {r['id'] for r in reviews if MARKER in (r.get('body') or '') and (r.get('user') or {}).get('login') == login}
+    mine = lambda c: (c.get('user') or {}).get('login') == login  # noqa: E731
+    ours = {r['id'] for r in reviews if mine(r) and (MARKER in (r.get('body') or '') or r['id'] in owned[0])}
     out = [record('review-body', r, ours=r['id'] in ours) for r in reviews if (r.get('body') or '').strip()]
     for c in inline:
         tid, resolved, outdated = where.get(c['id'], (None, None, None))
         out.append(record('review', c, path=c.get('path'), line=c.get('line') or c.get('original_line'),
                           inReplyTo=c.get('in_reply_to_id'), reviewId=c.get('pull_request_review_id'),
                           threadId=tid, resolved=resolved, outdated=outdated,
-                          ours=c.get('pull_request_review_id') in ours))
+                          ours=c.get('pull_request_review_id') in ours or mine(c) and c['id'] in owned[1]))
     out += [record('issue', c) for c in issue]
     return {'repo': repo, 'pr': pr, 'viewer': login, 'comments': out, 'threads': ordered}
 
@@ -90,7 +94,8 @@ def collect(argv):
     p.add_argument('--out', required=True)
     p.add_argument('--repo')
     a = p.parse_args(argv)
-    snap = snapshot(repo_of(a.repo), a.pr)
+    repo = repo_of(a.repo)
+    snap = snapshot(repo, a.pr, owned=receipted(load(ledger_path(repo, a.pr), repo, a.pr)))
     text = json.dumps(snap, indent=1) + '\n'
     Path(a.out).write_text(text, encoding='utf-8')
     kinds = {}

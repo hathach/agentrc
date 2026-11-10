@@ -181,6 +181,8 @@ if (!Number.isInteger(prior.reviews) || prior.reviews < 0 || !Array.isArray(prio
   return blocked('ledger-failed', `ledger answered ${JSON.stringify(shape)}`)
 }
 const disputeOf = Object.fromEntries(prior.disputes.map(d => [d.findingId, d]))
+// A comment our ledger receipted is never another reviewer's claim, whatever its review body reads now.
+const ownComments = new Set(Array.isArray(prior.ownComments) ? prior.ownComments : [])
 // A discussion run judges only the findings someone answered; any other run rechecks every standing one.
 const carried = prior.open.filter(f => !discussion || disputeOf[f.id])
 if (discussion && !carried.length) return { status: 'nothing-new', reason: 'no unanswered reply on our threads', pr, head }
@@ -235,7 +237,12 @@ const [audit, rechecked, claims] = await parallel([
     `${IN}Read ${threadsFile} (every comment on PR #${pr}). List the review claims still open that are not ours: each point raised in an unresolved, not outdated thread, and each finding in a bot's review body or summary comment (split multi-point comments; split a bot's comments into findings as the bot rules in ${AGENTRC}/agents/pr-review-validator.md do (expand that path in the shell before reading it; Read does not), a CodeRabbit nitpick or a Greptile summary item included). ` +
     'Skip comments with ours=true, replies that only acknowledge, questions with no claim about the code, and threads marked resolved. One record per claim, its claim in one sentence, with the url the file gives its comment. ' + DATA,
     { label: 'claims', phase: 'Review', model: 'sonnet', effort: 'medium', schema: CLAIMS },
-  )).then(cs => cs && parallel(withClaimIds(cs.claims).map((c, i) => () => judge(c, i))).then(judged => ({ claims: cs.claims, judged }))),
+  )).then(cs => {
+    if (!cs) return cs
+    const theirs = cs.claims.filter(c => !ownComments.has(c.commentId))
+    if (theirs.length < cs.claims.length) log(`${cs.claims.length - theirs.length} claim(s) dropped: our own comments`)
+    return parallel(withClaimIds(theirs).map((c, i) => () => judge(c, i))).then(judged => ({ claims: theirs, judged }))
+  }),
 ])
 if (!audit) return blocked('audit-failed', 'code-audit returned nothing')
 if (!claims) return blocked('claims-failed', 'the claims reader died')
