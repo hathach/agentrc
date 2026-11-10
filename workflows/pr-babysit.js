@@ -78,7 +78,9 @@ const keyOf = (c, f) => {
   for (const ch of JSON.stringify([c.workflow, c.name, f.signature])) h = ((h ^ BigInt(ch.codePointAt(0))) * 0x100000001b3n) & 0xffffffffffffffffn
   return h.toString(16).padStart(16, '0')
 }
-const keyed = (c, failures) => failures.map(f => ({ ...f, key: keyOf(c, f) }))
+// recollect, on an incomplete CircleCI failure only: whether a relaunch collects its log again (#482).
+const keyed = (c, failures, recollect) => failures.map(f => ({ ...f, key: keyOf(c, f),
+  ...(recollect !== undefined && !f.complete && (c.attempt || '').startsWith('circleci:') ? { recollect } : {}) }))
 const acceptedShaped = (a) => a && typeof a === 'object' && Object.keys(a).length === 3 && typeof a.key === 'string' && /^[0-9a-f]{16}$/.test(a.key) &&
   ['reason', 'scope'].every(k => typeof a[k] === 'string' && a[k].trim().length > 0)
 if (!Array.isArray(acceptedArg) || !acceptedArg.every(acceptedShaped) || new Set(acceptedArg.map(a => a.key)).size !== acceptedArg.length) {
@@ -290,7 +292,8 @@ const ciCacheShaped = (c) => c && typeof c === 'object' &&
   Array.isArray(c.reruns) && c.reruns.every(r => r && ['head', 'link', 'workflow', 'check'].every(k => typeof r[k] === 'string') && typeof r.sure === 'boolean' &&
     (r.at === undefined || Number.isFinite(Date.parse(r.at)))) &&
   Array.isArray(c.entries) && c.entries.every(e => e && ['link', 'bucket', 'digest'].every(k => typeof e[k] === 'string') &&
-    (e.head === undefined || typeof e.head === 'string') && (e.placedWith === undefined || typeof e.placedWith === 'string'))
+    (e.head === undefined || typeof e.head === 'string') && (e.placedWith === undefined || typeof e.placedWith === 'string') &&
+    (e.refreshed === undefined || e.refreshed === true))
 const config = { pr: args.pr, reviewers, autoRun, checkoutDir, ciWait, protected: protectedRe ? protectedRe.source : null, generated: generatedRe ? generatedRe.source : null }
 let restored = null
 if (args.state !== undefined && args.state !== null) {
@@ -910,8 +913,6 @@ const noteRerun = (r) => {
   else if (r.sure) ciReruns[i] = r
 }
 const ciVerdicts = new Map()
-// Checks this launch judged, or sent back to be judged, from what the collector reads now (#319).
-const tailsRefreshed = new Set()
 // Saved entries are of the state's expectedHead; one saved before the head was left out names it too.
 if (restored) for (const e of restored.ciCache.entries) ciVerdicts.set(e.link, { ...e, head: restored.expectedHead })
 const ciChecks = { judged: 0, partial: 0, reused: 0, unchanged: 0 }
@@ -998,7 +999,8 @@ const stateOut = () => {
     ...(reanswer.size ? { reanswer: [...reanswer] } : {}),
     ciCache: {
       reruns: ciReruns.filter(r => r.head === expectedHead),
-      entries: [...ciVerdicts.values()].filter(e => e.head === expectedHead).map(({ link, bucket, digest, placedWith }) => ({ link, bucket, digest, ...(placedWith ? { placedWith } : {}) })),
+      entries: [...ciVerdicts.values()].filter(e => e.head === expectedHead).map(({ link, bucket, digest, placedWith, refreshed }) =>
+        ({ link, bucket, digest, ...(placedWith ? { placedWith } : {}), ...(refreshed ? { refreshed } : {}) })),
     },
     debt: [...debt].map(([id, d]) => [id, { dismissals: [...d.dismissals], notes: [...d.notes], ...(d.edited ? { edited: d.edited } : {}), ...(d.digest !== undefined ? { digest: d.digest } : {}), ...(d.repair ? { repair: d.repair } : {}), ...(d.attempt ? { attempt: d.attempt } : {}), ...(d.rejudge ? { rejudge: d.rejudge } : {}) }]),
     last: history.length ? Object.fromEntries(CARRIED.filter(k => k in history[history.length - 1]).map(k => [k, history[history.length - 1][k]])) : null,
@@ -2436,11 +2438,12 @@ const ciLaneRun = async (cycle, lanes, entry) => {
     }
   }
   await parallel(groupsOf(unread, RECALL_PER_CALL).map((batch, k) => () => recallBatch(batch, k)))
-  // A CircleCI verdict judged incomplete may predate the whole-log collector (#319): collected and judged again once per
-  // launch, so a resumed launch reads the whole log; still incomplete after that, it stands as judged.
-  const tails = failing.filter(c => reusable(c) && c.attempt.startsWith('circleci:') && !tailsRefreshed.has(c.link) &&
-    ciVerdicts.get(c.link).failures.some(f => !f.complete))
-  for (const c of tails) { tailsRefreshed.add(c.link); ciVerdicts.delete(c.link) }
+  // A CircleCI verdict judged incomplete may predate the whole-log collector (#319): one with no `refreshed` mark is
+  // collected and judged again once, so a resumed launch reads the whole log; still incomplete after that, it stands as
+  // judged (#482).
+  const tails = failing.filter(c => reusable(c) && c.attempt.startsWith('circleci:') &&
+    !ciVerdicts.get(c.link).refreshed && ciVerdicts.get(c.link).failures.some(f => !f.complete))
+  for (const c of tails) ciVerdicts.delete(c.link)
   if (tails.length) log(`cycle ${cycle}: CI verdicts judged on an incomplete log collected and judged again for ${tails.map(c => c.name).join(', ')}`)
   // A stored check is judged again only for its unclassified failures, when its stored list is complete and distinct.
   const storedOf = (c) => ciVerdicts.get(c.link).failures
@@ -2470,7 +2473,7 @@ const ciLaneRun = async (cycle, lanes, entry) => {
     ...(settling.length && inv.status !== 'running' ? { settling: true } : {}),
     ...(overdue.length ? { unregistered: overdue.map(c => `${c.workflow} / ${c.name}`) } : {}),
     ...(failedRequired.length ? { requiredFailed: failedRequired.map(({ context, app }) => ({ context, app })) } : {}),
-    realFailures: cached.flatMap(c => keyed(c, JSON.parse(JSON.stringify(ciVerdicts.get(c.link).failures)))),
+    realFailures: cached.flatMap(c => keyed(c, JSON.parse(JSON.stringify(ciVerdicts.get(c.link).failures)), !ciVerdicts.get(c.link).refreshed)),
   }
   if (cached.length) log(`cycle ${cycle}: CI verdicts reused for ${cached.length} check(s) already judged on this head`)
   if (judging.length === 0 && gated.length === 0) return report
@@ -2567,8 +2570,7 @@ const ciLaneRun = async (cycle, lanes, entry) => {
   for (const v of fresh) {
     const base = ev.bases.find(b => b.link === v.link)?.base ?? null
     const placedWith = v.failures.some(f => f.verdict === 'unclassified') ? { placedWith: placedKey(base) } : {}
-    ciVerdicts.set(v.link, { head: inv.head, digest: verdictDigest(v), ...v, ...placedWith })
-    tailsRefreshed.add(v.link)
+    ciVerdicts.set(v.link, { head: inv.head, digest: verdictDigest(v), ...v, ...placedWith, refreshed: true })
   }
   // After a push these verdicts are never recalled; a lost one fails its digest and is judged again.
   if (fresh.length && !lanes.reviewPublishing) {
@@ -2578,7 +2580,7 @@ const ciLaneRun = async (cycle, lanes, entry) => {
   }
   if (unsettled.length) return null
   report.infraRerun = judged.infraRerun
-  report.realFailures.push(...judging.flatMap(c => keyed(c, failuresOf.get(c.link))))
+  report.realFailures.push(...judging.flatMap(c => keyed(c, failuresOf.get(c.link), false)))
   return report
 }
 

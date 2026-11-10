@@ -572,7 +572,8 @@ class LaunchResultTest(unittest.TestCase):
                     'listed again unchanged, report it'])
 
     def test_incomplete_ci_evidence_is_relaunched_for_only_on_a_circleci_check(self):
-        # #319: a relaunch collects a stored CircleCI verdict's whole log once; an Actions verdict is reused as judged.
+        # #319: an output from before the recollect mark: a relaunch collects a stored CircleCI verdict's whole log once;
+        # an Actions verdict is reused as judged.
         data = output()
         data['result']['observation']['ci']['realFailures'] = [
             {**failure('build', complete=False), 'check': 'ci/circleci: build'},
@@ -581,6 +582,17 @@ class LaunchResultTest(unittest.TestCase):
             'CI evidence incomplete for ci/circleci: build / build: a relaunch with the same stateRef collects its whole log '
             'once and judges it again; listed again, report it',
             'CI evidence incomplete for build / arm / arm: a relaunch reads no more of its log: report it'])
+
+    def test_incomplete_circleci_evidence_is_relaunched_for_only_when_the_workflow_marks_it_so(self):
+        # #482: a verdict judged on the capped whole log, or already refreshed once, is reported; an unmarked one gets one refresh.
+        data = output()
+        data['result']['observation']['ci']['realFailures'] = [
+            {**failure('fresh', complete=False), 'check': 'ci/circleci: build', 'recollect': False},
+            {**failure('stored', complete=False), 'check': 'ci/circleci: test', 'recollect': True}]
+        self.assertEqual(self.run_it(data)[1]['blockers'], [
+            'CI evidence incomplete for ci/circleci: build / fresh: a relaunch reads no more of its log: report it',
+            'CI evidence incomplete for ci/circleci: test / stored: a relaunch with the same stateRef collects its whole log '
+            'once and judges it again; listed again, report it'])
 
     def test_a_handed_off_comment_and_a_settlement_that_did_not_settle_are_blockers(self):
         data = output()

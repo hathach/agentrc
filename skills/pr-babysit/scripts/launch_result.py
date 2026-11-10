@@ -136,9 +136,18 @@ STALLED = {
 # What settles a blocker that names no stop reason of its own.
 REVALIDATED = ('duplicate-finding-ids', 'review-report-unusable')
 REVALIDATE = 'a `reviews` or `both` relaunch with the same stateRef runs the validator again; listed again unchanged, report it'
-CIRCLECI = 'ci/circleci: '  # CircleCI's status context, the only check whose stored verdict a relaunch collects again (#319)
+# A relaunch collects a stored CircleCI verdict again only when the workflow marks it `recollect` (#482); an output from
+# before that mark names it by CircleCI's status context alone (#319).
+CIRCLECI = 'ci/circleci: '
 RECOLLECT = 'a relaunch with the same stateRef collects its whole log once and judges it again; listed again, report it'
 UNRECOLLECTED = 'a relaunch reads no more of its log: report it'
+
+
+def recollected(failure):
+    """Whether a relaunch collects this incomplete failure's log again."""
+    if 'recollect' in failure:
+        return failure['recollect'] is True
+    return str(failure.get('check')).startswith(CIRCLECI)
 
 
 ASKS = {'tick': 'a Trigger review tick', 'request': 'an `@coderabbitai review` comment'}
@@ -453,7 +462,7 @@ def summarize(output, output_path, state_ref=None, tree=None, keys=False):
         for f in (ci or {}).get('realFailures') or []:
             if f.get('complete') is not True:
                 blockers.append(f'CI evidence incomplete for {f.get("check")} / {f.get("cell")}: '
-                                + (RECOLLECT if str(f.get('check')).startswith(CIRCLECI) else UNRECOLLECTED))
+                                + (RECOLLECT if recollected(f) else UNRECOLLECTED))
         # reviewedHead is where the last cycle began; a push it made moves the state past it.
         heads = {k: v for k, v in (('result', result.get('head')), ('state', (result.get('state') or {}).get('expectedHead')),
                                    ('checkout', tree and tree['head'])) if v}
