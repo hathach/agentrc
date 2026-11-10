@@ -71,7 +71,11 @@ A key not listed here throws before anything runs.
   failed, uncertain or ambiguous request, or no review within the cap, stops
   `greptile-unreviewed`, never a pass. A rate-limited Greptile (its pause
   notice; the limit is monthly) is not waited for: the pass lists it in
-  `unreviewed`. Needs `autoPush` and `greptile` in
+  `unreviewed`. Greptile posts that notice on one PR only, so an absent
+  Greptile is read against the newest one on the PRs it last reviewed, until
+  a newer Greptile review on any PR updated since or the date the notice says
+  reviews resume, and is asked nothing while it stands; with more such PRs
+  than one search page holds it reads unknown. Needs `autoPush` and `greptile` in
   `reviewers`; the switch itself is never restored from a state.
 - `checkoutDir`: the PR checkout, default the session directory. Dirty `.idea/`
   paths are ignored; any other pre-existing edit refuses the start.

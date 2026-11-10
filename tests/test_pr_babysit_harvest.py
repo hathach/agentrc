@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -523,6 +524,153 @@ class FailClosed(unittest.TestCase):
             self.assertEqual(harvest.head_event('o/r', 7, view, HEAD)[0], '2026-09-25T09:00:00Z', 'GitHub leaves a reopen\'s commit_id null')
 
 
+SEARCH = ('api', '-X', 'GET', 'search/issues', '-f', 'q=repo:o/r is:pr reviewed-by:app/greptile-apps', '-f', 'sort=updated', '-f', 'order=desc',
+          '-f', 'per_page=10')
+# hathach/agentrc#498's review 5830338135, the one pause notice the repository got (#515).
+PAUSE_498 = ('Greptile has paused reviews on this repository \u2014 it used its 100 free open-source review credits for this billing period. '
+             'Reviews resume automatically on December 1. To continue before then, an organization admin can keep reviews running.')
+
+
+class RepositoryPause(unittest.TestCase):
+    """#515: Greptile posts its pause on one PR; an absent Greptile on another reads it from the repository."""
+    ABSENT = harvest.record('greptile', 'absent', 'no check run and no applicable refusal on the head')
+    NOW = datetime.fromisoformat('2026-11-10T09:00:00+00:00')
+
+    def read(self, by_pr, issue=(), own=(), now=NOW, fail=None, incomplete=False, first=None, since=None, since_total=None, event_at=None):
+        """repo_paused on PR 503 with each other PR's reviews in by_pr and the repository's issue comments: `first` the
+        PRs the newest-ten search finds (503 and by_pr's by default), `since` those the search of PRs updated since the
+        notice finds (by_pr's), of since_total in all (all of them)."""
+        calls = []
+        first = [503, *by_pr] if first is None else first
+        since = list(by_pr) if since is None else since
+
+        def gh_json(*argv):
+            calls.append(argv[-1])
+            if fail and fail in ' '.join(argv):
+                raise fail_with
+            if argv[1:] == SEARCH[1:]:
+                return {'total_count': 99, 'incomplete_results': incomplete, 'items': [{'number': n} for n in first]}
+            if argv[:4] == SEARCH[:4] and argv[5].startswith(SEARCH[5] + ' updated:>=') and argv[6:-1] == SEARCH[6:-1] and argv[-1] == 'per_page=100':
+                calls[-1] = argv[5]
+                return {'total_count': len(since) if since_total is None else since_total, 'incomplete_results': incomplete,
+                        'items': [{'number': n} for n in since]}
+            if argv[-1] == 'repos/o/r/issues/comments?sort=created&direction=desc&per_page=100':
+                return list(issue)
+            raise AssertionError(argv)
+
+        def pages(path, key=None):
+            calls.append(path)
+            if fail and fail in path:
+                raise fail_with
+            return by_pr[int(path.split('/')[-2])]
+        fail_with = harvest.Unusable('gh: HTTP 502') if fail else None
+        with mock.patch.object(harvest, 'gh_json', gh_json), mock.patch.object(harvest, 'pages', pages):
+            return harvest.repo_paused('o/r', 503, list(own), dict(self.ABSENT), event_at, now), calls
+
+    def test_a_pause_on_another_pr_settles_greptile_limited_until_its_resume_date(self):
+        notice = greptile_review(OLD, at='2026-11-09T18:01:03Z', id_=5830338135, body=PAUSE_498)
+        r, calls = self.read({498: [notice], 500: []})
+        self.assertEqual((r['state'], r['kind'], r['sha'], r['retryAt']), ('settled', 'limited', None, '2026-12-01T00:00:00Z'))
+        self.assertEqual(r['evidence'], ['review 5830338135 on PR #498'])
+        self.assertIn('at 2026-11-09T18:01:03Z, until 2026-12-01T00:00:00Z (as it states)', r['reason'])
+        self.assertIn('no newer Greptile review on the 2 PR(s) it reviewed updated since', r['reason'])
+        self.assertIn('q=repo:o/r is:pr reviewed-by:app/greptile-apps updated:>=2026-11-09T18:01:03Z', calls)
+        self.assertNotIn('repos/o/r/pulls/503/reviews', calls, "the PR's own reviews are not read twice")
+
+    def test_a_newer_review_is_looked_for_on_this_pr_and_every_pr_updated_since_the_notice(self):
+        # Coordinator review of #515: this PR and a PR with a newer review both outside the newest ten.
+        notice = greptile_review(OLD, at='2026-11-09T18:01:03Z', id_=1, body=PAUSE_498)
+        own = [greptile_review(HEAD, at='2026-11-09T19:00:00Z', id_=3)]
+        r, _ = self.read({498: [notice]}, own=own, first=[498])
+        self.assertEqual(r['state'], 'absent', "this PR's own newer review ends it")
+        self.assertIn('ended by review 3 on PR #503', r['reason'])
+        later = greptile_review(OLD, at='2026-11-09T19:00:00Z', id_=2)
+        r, _ = self.read({498: [notice], 600: [later]}, first=[498])
+        self.assertEqual(r['state'], 'absent', 'a PR past the newest ten, updated since the notice')
+        r, _ = self.read({498: [notice]}, since_total=harvest.PAUSE_SINCE + 1)
+        self.assertEqual(r['state'], 'unknown', 'more PRs updated since than one page holds')
+        self.assertIn('no newer review can be ruled out', r['reason'])
+        r, calls = self.read({498: [notice]}, since_total=harvest.PAUSE_SINCE + 1, now=datetime.fromisoformat('2026-12-01T00:00:00+00:00'))
+        self.assertEqual(r['state'], 'absent', 'a notice past its resume date needs no newer review ruled out')
+        self.assertIn('ended 2026-12-01T00:00:00Z', r['reason'])
+        self.assertFalse([c for c in calls if 'updated:>=' in c], 'nor the search for one')
+
+    def test_a_newer_greptile_review_or_the_resume_date_ends_it(self):
+        notice = greptile_review(OLD, at='2026-11-09T18:01:03Z', id_=1, body=PAUSE_498)
+        later = greptile_review(OLD, at='2026-11-09T19:00:00Z', id_=2)
+        r, _ = self.read({498: [notice], 500: [later]})
+        self.assertEqual(r['state'], 'absent')
+        self.assertIn('ended by review 2 on PR #500 at 2026-11-09T19:00:00Z', r['reason'])
+        r, _ = self.read({498: [notice]}, own=[greptile_review(HEAD, at='2026-11-09T19:00:00Z', id_=3)])
+        self.assertEqual(r['state'], 'absent', "a review on this PR's older head ends it too")
+        r, _ = self.read({498: [notice]}, now=datetime.fromisoformat('2026-12-01T00:00:00+00:00'))
+        self.assertEqual(r['state'], 'absent')
+        self.assertIn('ended 2026-12-01T00:00:00Z', r['reason'])
+        earlier = greptile_review(OLD, at='2026-11-09T17:00:00Z', id_=4)
+        self.assertEqual(self.read({498: [notice], 500: [earlier]})[0]['state'], 'settled', 'a review before the notice ends nothing')
+
+    def test_the_first_newer_review_ends_the_search_but_not_the_choice_of_notice(self):
+        old = greptile_review(OLD, at='2026-11-08T00:00:00Z', id_=1, body=PAUSE_498)
+        ended_old = greptile_review(OLD, at='2026-11-08T12:00:00Z', id_=2)
+        notice = greptile_review(OLD, at='2026-11-09T18:01:03Z', id_=3, body=PAUSE_498)
+        r, calls = self.read({497: [old, ended_old], 498: [notice]}, since=[497, 498])
+        self.assertEqual((r['state'], r['evidence']), ('settled', ['review 3 on PR #498']), 'the newest notice is chosen from every PR read')
+        later = greptile_review(OLD, at='2026-11-09T19:00:00Z', id_=4)
+        r, calls = self.read({498: [notice], 500: [later], 600: []}, since=[500, 600, 498], first=[498])
+        self.assertIn('ended by review 4 on PR #500', r['reason'])
+        self.assertNotIn('repos/o/r/pulls/600/reviews', calls, 'no PR is read past the first newer review')
+
+    def test_a_head_event_inside_the_trigger_grace_reads_no_repository(self):
+        notice = greptile_review(OLD, at='2026-11-09T18:01:03Z', id_=1, body=PAUSE_498)
+        r, calls = self.read({498: [notice]}, event_at='2026-11-10T08:58:01Z')
+        self.assertEqual((r['state'], calls), ('absent', []))
+        self.assertIn('read from 2 minutes after the head event at 2026-11-10T08:58:01Z', r['reason'])
+        self.assertEqual(self.read({498: [notice]}, event_at='2026-11-10T08:58:00Z')[0]['state'], 'settled', 'read once the grace is out')
+        self.assertEqual(self.read({498: [notice]}, event_at=None)[0]['state'], 'settled', 'an undated head event postpones nothing')
+
+    def test_the_grace_is_the_workflows_greptile_trigger_grace(self):
+        # Longer than the workflow's, an @greptileai could be posted before the notices are read.
+        js = (Path(__file__).resolve().parents[1] / 'workflows' / 'pr-babysit.js').read_text(encoding='utf-8')
+        minutes = int(re.search(r'^const GREPTILE_GRACE_MIN = (\d+)$', js, re.M)[1])
+        self.assertEqual(harvest.PAUSE_GRACE, timedelta(minutes=minutes))
+
+    def test_a_notice_naming_no_resume_date_stands_one_billing_period(self):
+        undated = greptile_review(OLD, at='2026-11-01T00:00:00Z', id_=1, body=harvest.GREPTILE_PAUSED + '.')
+        r, _ = self.read({498: [undated]})
+        self.assertEqual((r['state'], r['retryAt']), ('settled', None))
+        self.assertIn('until 2026-12-02T00:00:00Z (a billing period, as it names no resume date)', r['reason'])
+        old = dict(undated, submitted_at='2026-09-01T00:00:00Z')
+        self.assertEqual(self.read({498: [old]})[0]['state'], 'absent', 'a historic pause is not carried forever')
+
+    def test_only_greptiles_own_account_pauses_it(self):
+        for login in ('hathach', 'greptile-fan', 'greptile-apps'):
+            with self.subTest(login):
+                prose = greptile_review(OLD, at='2026-11-09T18:01:03Z', id_=1, body=PAUSE_498) | {'user': user(login)}
+                comment_ = comment(login, PAUSE_498, at='2026-11-09T18:01:03Z', id_=9)
+                r, _ = self.read({498: [prose]}, issue=[comment_])
+                self.assertEqual(r['state'], 'absent', login)
+                self.assertIn('no Greptile pause notice on this PR, among', r['reason'])
+
+    def test_a_notice_in_an_issue_comment_counts(self):
+        notice = comment(harvest.GREPTILE_BOT, PAUSE_498, at='2026-11-09T18:01:03Z', id_=9) | {'html_url': 'https://github.com/o/r/pull/498#c9'}
+        r, _ = self.read({498: []}, issue=[notice])
+        self.assertEqual((r['state'], r['kind'], r['evidence']), ('settled', 'limited', ['comment 9 on https://github.com/o/r/pull/498#c9']))
+
+    def test_an_unreadable_repository_is_unknown_never_absent(self):
+        notice = greptile_review(OLD, at='2026-11-09T18:01:03Z', id_=1, body=PAUSE_498)
+        for where in ('search/issues', 'updated:>=', 'pulls/498/reviews', 'issues/comments'):
+            with self.subTest(where):
+                r, _ = self.read({498: [notice]}, fail=where)
+                self.assertEqual(r['state'], 'unknown')
+                self.assertIn("the repository's Greptile pause notices did not read (gh: HTTP 502)", r['reason'])
+        r, _ = self.read({498: []}, incomplete=True)
+        self.assertEqual(r['state'], 'unknown', 'a search that may have missed the notice proves no absence')
+        self.assertIn('incomplete results', r['reason'])
+        with mock.patch.object(harvest, 'gh_json', side_effect=harvest.RateLimited('limited', {'resetAt': 'x'})):
+            with self.assertRaises(harvest.RateLimited):
+                harvest.repo_paused('o/r', 503, [], dict(self.ABSENT), None, self.NOW)
+
+
 class FakeGh:
     """A gh answering from a {joined argv: [answers...]} map; each call pops the first answer that remains."""
 
@@ -858,6 +1006,24 @@ class EndToEnd(unittest.TestCase):
         code, got = self.harvest(answers, '--pr', '7', '--reviewers', 'greptile')
         self.assertEqual((code, [(b['state'], b['kind']) for b in got['bots']]), (0, [('settled', 'limited')]), got)
         self.assertEqual([c['commentId'] for c in got['comments']], [51], 'the reviews are read once')
+
+    def test_an_absent_auto_run_greptile_reads_the_repositorys_pause(self):
+        argv = ['--pr', '7', '--reviewers', 'coderabbit,greptile', '--auto-run', 'coderabbit,greptile']
+        answers = self.answers([HEAD])
+        answers[' '.join(SEARCH)] = [{'total_count': 2, 'incomplete_results': False, 'items': [{'number': 7}, {'number': 498}]}]
+        answers['api --paginate --slurp repos/o/r/pulls/498/reviews?per_page=100'] = [[[
+            greptile_review(OLD, at='2099-01-01T00:00:00Z', id_=5830338135, body=harvest.GREPTILE_PAUSED + '. Reviews resume automatically on December 1.')]]]
+        answers['api repos/o/r/issues/comments?sort=created&direction=desc&per_page=100'] = [[]]
+        since = [*SEARCH[:5], f'{SEARCH[5]} updated:>=2099-01-01T00:00:00Z', *SEARCH[6:-1], 'per_page=100']
+        answers[' '.join(since)] = [{'total_count': 1, 'incomplete_results': False, 'items': [{'number': 498}]}]
+        code, got = self.harvest(answers, *argv)
+        self.assertEqual(code, 0, got)
+        g = got['bots'][1]
+        self.assertEqual((g['state'], g['kind'], g['evidence']), ('settled', 'limited', ['review 5830338135 on PR #498']), g)
+        answers = self.answers([HEAD])
+        answers[f'api --paginate --slurp repos/o/r/commits/{HEAD}/check-runs?per_page=100'] = [[{'check_runs': [greptile_run('in_progress')]}]]
+        code, got = self.harvest(answers, *argv)
+        self.assertEqual((code, got['bots'][1]['state']), (0, 'working'), 'a Greptile at work on the head reads no repository')
 
     def test_usage(self):
         for argv in (['--pr', '7', '--reviewers', 'coderabbit', '--auto-run', 'greptile'], ['--pr', '7', '--reviewers', 'bard'], ['--pr', '7'],
