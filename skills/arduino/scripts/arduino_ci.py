@@ -212,9 +212,9 @@ def admit_tree(src, board, head, run_id, roster):
     if src.is_symlink() or not src.is_dir():
         raise Refused(f'no packed tree at {src}')
     entries = list(src.rglob('*'))
-    links = [p for p in entries if p.is_symlink()]
-    if links:
-        raise Refused(f'{src} holds links: {[str(p.relative_to(src)) for p in links[:5]]}')
+    # read, not pinned: refuse_unsafe_paths below covers only what the manifest names
+    if links := [name for name in (PROVENANCE, R.MANIFEST) if (src / name).is_symlink()]:
+        raise Refused(f'{src}: {", ".join(links)} is a link')
     prov, manifest = read_json(src / PROVENANCE), read_json(src / R.MANIFEST)
     if not isinstance(prov, dict) or not isinstance(manifest, dict) or not isinstance(manifest.get('files'), dict):
         raise Refused(f'{src}: provenance or manifest is no JSON object')
@@ -227,10 +227,12 @@ def admit_tree(src, board, head, run_id, roster):
     pinned = manifest['files']
     if roster not in pinned:
         raise Refused(f'{src}: its manifest pins no {roster}')
-    bad = [r for r in pinned if not isinstance(r, str) or r.startswith('/') or '..' in Path(r).parts]
-    if bad:
-        raise Refused(f'{src}: manifest paths outside the tree: {bad[:5]}')
-    files = {p.relative_to(src).as_posix() for p in entries if p.is_file()}
+    try:
+        R.H.refuse_unsafe_paths(src, pinned)
+    except R.H.Refused as e:
+        raise Refused(f'{src}: {e}') from None
+    # a link the manifest does not pin is as unpinned as a file
+    files = {p.relative_to(src).as_posix() for p in entries if p.is_file() or p.is_symlink()}
     stray = sorted(files - set(pinned) - {R.MANIFEST, PROVENANCE})
     missing = sorted(set(pinned) - files)
     changed = sorted(r for r in set(pinned) & files if R.core.digest(src / r) != pinned[r])

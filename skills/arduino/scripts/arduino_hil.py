@@ -41,7 +41,7 @@ import socket
 import subprocess
 import sys
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOCK_SCRIPT = 'skills/hil/scripts/hil_lock.py'
@@ -223,9 +223,34 @@ def selection(roster, boards, tests):
     return picked
 
 
+def refuse_unsafe_paths(root, files):
+    """Refused unless every entry of a manifest's `files` names a digest at a plain path inside `root` reached through
+    no link, the file itself included: an absolute or drive path, `..` or a link would hash, or run, a file the
+    manifest does not pin. CI admission (arduino_ci) asks the same of a packed tree."""
+    if not isinstance(files, dict):
+        raise Refused(f'the manifest\'s files are no JSON object: {type(files).__name__}')
+    outside, links = [], []
+    for rel, digest in files.items():
+        if (not isinstance(rel, str) or not isinstance(digest, str) or not rel or PureWindowsPath(rel).anchor
+                or '..' in PurePosixPath(rel).parts or '..' in PureWindowsPath(rel).parts):
+            outside.append(rel)
+            continue
+        p = Path(root)
+        for part in PurePosixPath(rel).parts:
+            p = p / part
+            if p.is_symlink():
+                links.append(rel)
+                break
+    if outside:
+        raise Refused(f'manifest paths outside the tree or malformed: {outside[:5]}')
+    if links:
+        raise Refused(f'manifest paths through links: {links[:5]}')
+
+
 def verify_staged(manifest_path):
     """A rig tree staged by hil_remote.py: every staged file must hash as the manifest written on the dev PC says."""
     m = json.loads(Path(manifest_path).read_text())
+    refuse_unsafe_paths(P.ROOT, m.get('files') if isinstance(m, dict) else None)
     bad = [rel for rel, digest in m['files'].items()
            if not (P.ROOT / rel).is_file() or B.sha256(P.ROOT / rel) != digest]
     if bad:

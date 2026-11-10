@@ -139,6 +139,38 @@ class Admit(Checkout):
         (self.tree / R.MANIFEST).write_text(json.dumps(m))
         self.assertRefused('outside the tree')
 
+    def test_admission_refuses_through_the_staged_check(self):
+        """agentrc#472: admit_tree asks arduino_hil's refuse_unsafe_paths, the check verify_staged makes."""
+        m = json.loads((self.tree / R.MANIFEST).read_text())
+        for rel in ('/etc/passwd', 'C:/x', '..\\escape'):
+            with self.subTest(rel=rel):
+                (self.tree / R.MANIFEST).write_text(json.dumps({**m, 'files': {**m['files'], rel: '0' * 64}}))
+                self.assertRefused('outside the tree')
+        (self.tree / R.MANIFEST).write_text(json.dumps(m))
+        elf = f'build/hil/{BOARD}/echo/echo.ino.elf'
+        real = self.tmp / 'real'
+        shutil.move(self.tree / f'build/hil/{BOARD}', real)
+        (self.tree / f'build/hil/{BOARD}').symlink_to(real, target_is_directory=True)
+        self.assertRefused(f"manifest paths through links: ['{elf}']")
+        (self.tree / f'build/hil/{BOARD}').unlink()
+        shutil.move(real, self.tree / f'build/hil/{BOARD}')
+        self.assertIsNone(self.admit())
+        (self.tree / 'stray-link').symlink_to(self.tree / ROSTER)
+        self.assertRefused("unpinned ['stray-link']")
+
+    def test_admission_refuses_metadata_through_a_link(self):
+        """manifest.json and provenance.json are read, not pinned: a link to a copy outside the tree is refused."""
+        for name in (R.MANIFEST, C.PROVENANCE):
+            with self.subTest(name=name):
+                meta = self.tree / name
+                outside = self.tmp / f'outside-{name}'
+                shutil.move(meta, outside)
+                meta.symlink_to(outside)
+                self.assertRefused(f'{name} is a link')
+                meta.unlink()
+                shutil.move(outside, meta)
+                self.assertIsNone(self.admit())
+
     def test_refuses_a_tree_whose_manifest_pins_no_roster(self):
         m = json.loads((self.tree / R.MANIFEST).read_text())
         del m['files'][ROSTER]

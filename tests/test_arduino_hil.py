@@ -430,6 +430,33 @@ class Admission(Base):
         m.write_text(json.dumps({'head': 'abc', 'files': {'src/fake.h': sha((self.root / 'src/fake.h').read_bytes())}}))
         self.assertEqual(H.verify_staged(m)['head'], 'abc')
 
+    def test_staged_paths_outside_the_tree_or_through_links_are_refused_before_hashing(self):
+        """agentrc#472: the check every staged run (hil_remote's, CI's) goes through, not only CI admission."""
+        m = self.dir / 'manifest.json'
+        good = {'src/fake.h': sha((self.root / 'src/fake.h').read_bytes())}
+        outside = self.dir / 'outside'
+        outside.mkdir()
+        (outside / 'fake.h').write_bytes((self.root / 'src/fake.h').read_bytes())
+        (self.root / 'parent-link').symlink_to(outside, target_is_directory=True)
+        (self.root / 'file-link.h').symlink_to(self.root / 'src/fake.h')
+        digest = good['src/fake.h']
+        cases = {'/etc/passwd': 'outside', '../escape': 'outside', 'src/../../escape': 'outside',
+                 'C:/x': 'outside', 'C:x': 'outside', '\\\\host\\share\\x': 'outside', '..\\escape': 'outside',
+                 '': 'outside', 'parent-link/fake.h': 'through links', 'file-link.h': 'through links'}
+        hashed = mock.Mock(side_effect=AssertionError('hashed before the path check'))
+        for rel, why in cases.items():
+            with self.subTest(rel=rel), mock.patch.object(H.B, 'sha256', hashed):
+                m.write_text(json.dumps({'head': 'abc', 'files': {**good, rel: digest}}))
+                with self.assertRaisesRegex(H.Refused, why):
+                    H.verify_staged(m)
+        for files in ([], {'src/fake.h': 7}, None):
+            with self.subTest(files=files):
+                m.write_text(json.dumps({'head': 'abc', 'files': files}))
+                with self.assertRaisesRegex(H.Refused, 'malformed|no JSON object'):
+                    H.verify_staged(m)
+        m.write_text(json.dumps({'head': 'abc', 'files': good}))
+        self.assertEqual(H.verify_staged(m)['files'], good)
+
     def test_record_problems_without_a_head_skip_the_head_check(self):
         rec = json.loads(self.record(source={'head': 'old'}).read_text())
         self.assertEqual(H.record_problems(rec, 'rig_jlink', None, False, 'HEAD'), [])
