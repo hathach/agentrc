@@ -32,7 +32,7 @@ python3 ~/.claude/skills/captain/scripts/captain.py relay <target>... --dry-run 
 python3 ~/.claude/skills/captain/scripts/captain.py relay --retry <action>          # send a held relay unchanged
 python3 ~/.claude/skills/captain/scripts/captain.py relay <target> --item <item> --revision <N> --verdict correction|no-correction|decision [--entry <id>]
 python3 ~/.claude/skills/captain/scripts/captain.py verdict --item <item> --revision <N> --verdict correction|no-correction|decision [--entry <id>]
-python3 ~/.claude/skills/captain/scripts/captain.py start <checkout> [main|ada] [--space <space>] [--tab <tab>] [--name <name>] [--entry <id>]
+python3 ~/.claude/skills/captain/scripts/captain.py start <checkout> [main|ada] [--space <space>] [--tab <tab>] [--name <name>] [--entry <id>] [--task]
 ```
 
 The captain's read-only lookups, each refused unless its subcommand, flags and operands are on the script's
@@ -112,7 +112,7 @@ pins each target's session once, so one replaced in its terminal while the relay
   account it names; never on a session's report, a relay reply, a chief attention line or your own idea. The script
   binds the start to a message of theirs this turn, but cannot tell whether it asks for one: that is yours. `start` runs
   an interactive `claude`, or `claude-ada` for `ada` (main unless they say ada; never inferred from the repo), in a
-  new hc terminal with no parent and no first task:
+  new hc terminal with no parent and no first task unless `--task`:
   - The checkout is an absolute or `~/` path to a git checkout's or worktree's top level, anywhere.
   - It opens as a new tab in a Herdr space: the one whose folder is that checkout, or the one `--space` names by id
     or exact name. `--tab` puts it in an existing tab instead. A space that matches none or several refuses with the
@@ -125,6 +125,10 @@ pins each target's session once, so one replaced in its terminal while the relay
     given: a wrong or failed session is the human's to close. A refusal that says a session may have started means
     hc gave no address: `list` before anything else, and never start that checkout under that account again for
     that message.
+  - `--task`, when their message also gives the new session work ("start ~/code/tinyusb and fix issue 12"), relays
+    that same message to it once `verified`, as a relay of their words with its own receipt; the session reads the
+    whole message, the start included. Not verified, nothing is relayed: the receipt names the `relay --entry` that
+    sends it once `list` shows the session.
 - **Closing** a terminal, space or session is the human's: you may report a session done, but never close one, type
   `/exit`, kill a process or terminal, or ask a target to close itself. `cancel` closes a ledger item only: it
   neither reaches a session nor withdraws an instruction one accepted. That takes a new relay of the human's words,

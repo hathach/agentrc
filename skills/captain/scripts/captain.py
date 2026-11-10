@@ -24,8 +24,9 @@ does not recognize is reported, never assumed safe.
   captain.py verdict --item <id> --revision <N> --verdict <verdict> [--entry <id>]
                                                  record it as that verdict, sending nothing
   captain.py relay --retry <action>              send a held relay once its session is idle or done, its input line shown
-  captain.py start <checkout> [main|ada] [--name <n>] [--space <id|name>] [--tab <id>] [--entry <id>]
-                                                 start a Claude Code session there on the human's message
+  captain.py start <checkout> [main|ada] [--name <n>] [--space <id|name>] [--tab <id>] [--entry <id>] [--task]
+                                                 start a Claude Code session there on the human's message;
+                                                 --task relays that message to it as its first task
   captain.py brief --for <msg> | --pending       a target reads what a status request asks, or joins a watch
   captain.py report --for <msg> --file <json|->  a target answers a status request
   captain.py accept --action <action>            a target takes a relay and reads its words
@@ -2129,10 +2130,12 @@ def verify(address, root, account):
     return 'verified', '', identity(session)
 
 
-def start(arg, account, name, space, tab, entry, mine):
+def start(arg, account, name, space, tab, entry, mine, task=False):
     """Start an interactive Claude Code session in the checkout arg names, in a new hc terminal shown in a Herdr
     space, on the human's message this turn: each check refuses before anything runs, the intent is recorded before
-    hc runs, and one message starts a checkout under an account once. Captain never closes what it started."""
+    hc runs, and one message starts a checkout under an account once. Captain never closes what it started. task
+    relays that same message to the session as its first task once it is verified, through relay() and its
+    receipt."""
     tab = tab or None   # well_formed() refuses an empty tab, which would leave the ledger unreadable
     root = checkout_root(arg)
     argv = launcher(account)
@@ -2173,6 +2176,11 @@ def start(arg, account, name, space, tab, entry, mine):
            'pending': f'verification pending ({why}): `list` shows it once it is up',
            'failed': f'VERIFICATION FAILED: {why}; the human closes {address}',
            'unchecked': f'VERIFICATION UNCHECKED: {why}; `list` shows whether it is up'}[verification])
+    if task and verification == 'verified':
+        relay({address: address}, uid, mine)
+    elif task:
+        print(f'{msg}: first task not relayed, the session is not verified; once `list` shows it, '
+              f'`relay {address} --entry {uid}` sends it')
     return {'failed': 1, 'unchecked': 3}.get(verification, 0)
 
 
@@ -2691,6 +2699,7 @@ def main():
     st.add_argument('--space', help='the Herdr space, by id or exact name (default the one whose folder it is)')
     st.add_argument('--tab', help="a tab id in that space (default a new tab)")
     st.add_argument('--entry', metavar='ID', help="which of this turn's messages, when the human wrote several")
+    st.add_argument('--task', action='store_true', help='relay that same message to the new session as its first task')
     vd = sub.add_parser('verdict', help="record the human's verdict on a decision, sending nothing")
     vd.add_argument('--entry', metavar='ID', help="which of this turn's messages, when the human wrote several")
     decide(vd, required=True)
@@ -2780,7 +2789,7 @@ def main():
         if a.cmd == 'verdict':
             return verdict(decided(a), a.entry, mine)
         if a.cmd == 'start':
-            return start(a.checkout, a.account, a.name, a.space, a.tab, a.entry, mine)
+            return start(a.checkout, a.account, a.name, a.space, a.tab, a.entry, mine, a.task)
     except Corrupt as e:
         die(f'ledger corrupt, nothing decided until it is reconciled by hand: {e}', 4)
     except hc.Error as e:

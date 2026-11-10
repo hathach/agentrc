@@ -3233,9 +3233,9 @@ class StartTest(RelayCase):
         session.update(pid=77, started=5, account=self.pinned_account, session='s-new')
         return session
 
-    def start(self, arg=None, account='main', name=None, space=None, tab=None, entry=None):
+    def start(self, arg=None, account='main', name=None, space=None, tab=None, entry=None, task=False):
         with mock.patch('builtins.print') as out:
-            code = captain.start(arg or self.root, account, name, space, tab, entry, self.ident)
+            code = captain.start(arg or self.root, account, name, space, tab, entry, self.ident, task)
         return code, '\n'.join(str(c.args[0]) for c in out.call_args_list)
 
     def start_refusal(self, arg=None, account='main', **opts):
@@ -3266,6 +3266,26 @@ class StartTest(RelayCase):
                          ('t9', 'verified', 's-new'))
         self.assertIn('a new tab', out)
         self.assertIn('verified', out)
+
+    def test_a_task_is_that_message_relayed_to_the_verified_session(self):
+        self.say('start proj and fix the lint errors')
+        self.terminals['t9'] = pinned('t9')   # the new session, as list finds it once it is up
+        code, out = self.start(task=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.types()[:2], ['start', 'started'])
+        relayed = next(r for r in captain.records() if r['type'] == 'relay')
+        self.assertEqual((relayed['target']['address'], relayed['entry'], relayed['quote']),
+                         ('t9', 'u-1', 'start proj and fix the lint errors'))
+        self.assertIn(f'accept --action {relayed["msg"]}', self.typed[-1][1])
+        self.assertTrue(out.splitlines()[-1].endswith('delivered'), out)
+
+    def test_a_task_waits_for_a_session_not_yet_verified(self):
+        self.say('start proj and fix the lint errors')
+        self.gets = {}
+        code, out = self.start(task=True)
+        self.assertNotIn('relay', self.types())
+        self.assertIn('first task not relayed', out)
+        self.assertIn('`relay t9 --entry u-1`', out)
 
     def test_ada_runs_its_wrapper(self):
         self.say('start proj on ada')

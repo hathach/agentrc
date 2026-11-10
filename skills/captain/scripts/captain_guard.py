@@ -53,6 +53,7 @@ TOKEN = re.compile(r'[A-Za-z0-9][A-Za-z0-9:._=-]*|--[a-z][a-z-]*')
 SHELL = re.compile(r'[^A-Za-z0-9 :._=/~,-]')   # any quoting, expansion, redirection, separator or newline
 CHECKOUT = re.compile(r'(?:/|~/)[A-Za-z0-9/._-]*')   # start's one path operand: never ~user
 START_OPTIONS = ('--name', '--space', '--tab', '--entry')
+START_FLAGS = ('--task',)
 ACCOUNTS = ('main', 'ada')
 
 
@@ -84,10 +85,14 @@ def publication(args):
 
 
 def start_args(args):
-    """Why args are not one start: a checkout path, an optional account, each option at most once with a value."""
+    """Why args are not one start: a checkout path, an optional account, each option at most once with a value, each
+    flag at most once."""
     operands, seen, i = [], set(), 0
     while i < len(args):
-        if args[i].startswith('-'):
+        if args[i] in START_FLAGS and args[i] not in seen:
+            seen.add(args[i])
+            i += 1
+        elif args[i].startswith('-'):
             value = args[i + 1] if i + 1 < len(args) else ''
             if args[i] not in START_OPTIONS or args[i] in seen or value.startswith('-') or not TOKEN.fullmatch(value):
                 return f'start takes {", ".join(START_OPTIONS)}, each at most once with a value'
