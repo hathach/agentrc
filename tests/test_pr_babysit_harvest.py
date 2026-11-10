@@ -470,6 +470,12 @@ class FailClosed(unittest.TestCase):
             ([v(harvest.COPILOT_QUOTA[0])], ('settled', 'limited', HEAD)),
             ([v('Copilot was unable to review this pull request because the user who requested the review has insufficient remaining quota.')],
              ('settled', 'limited', HEAD)),
+            ([v('Copilot was unable to review this pull request because the user who requested the review has insufficient remaining quota. '
+                'Try requesting a review at a lower effort level.')], ('settled', 'limited', HEAD)),
+            ([v(harvest.COPILOT_QUOTA[0] + '\n\n' + harvest.COPILOT_QUOTA_HINT)], ('settled', 'limited', HEAD)),
+            ([v(harvest.COPILOT_QUOTA[1] + ' Try requesting a review at a lower effort level. Or upgrade.')], ('unknown', None, None)),
+            ([v(harvest.COPILOT_QUOTA[1] + ' Try something else.')], ('unknown', None, None)),
+            ([v(harvest.COPILOT_QUOTA_HINT)], ('unknown', None, None)),
             ([v('Copilot was unable to review this pull request because the user who requested the review has no seat.')], ('unknown', None, None)),
             ([v(excluded)], ('settled', 'skipped', HEAD)),
             ([v(overview)], ('reviewed', None, HEAD)),
