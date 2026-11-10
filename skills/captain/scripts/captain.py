@@ -175,15 +175,15 @@ def footer_only(lines):
             and bool(CLAUDE_HINTS.search(shown[-1])))
 
 
-def input_state(screen):
-    """'input' when an `hc read` screen ends in Claude Code's input line, else 'unknown', such as a dialog. Text
-    already in the line does not matter: a paste appends to it. Claude Code draws its input between the last two
-    full-width rules, the first line led by ❯."""
+def shows_input(screen):
+    """Whether an `hc read` screen ends in Claude Code's input line, not a dialog or anything else. Text already in
+    the line does not matter: a paste appends to it. Claude Code draws its input between the last two full-width
+    rules, the first line led by ❯."""
     lines = [line.rstrip(BLANK) for line in screen.splitlines()]
     rules = [i for i, line in enumerate(lines) if RULE.match(line)]
     if len(rules) < 2 or rules[-1] - rules[-2] < 2 or not footer_only(lines[rules[-1] + 1:]):
-        return 'unknown'
-    return 'input' if lines[rules[-2] + 1].lstrip(BLANK).startswith('❯') else 'unknown'
+        return False
+    return lines[rules[-2] + 1].lstrip(BLANK).startswith('❯')
 
 
 def read_screen(address):
@@ -630,7 +630,7 @@ def refusal(target):
     """Why target must not be typed into now, or None: re-read right before every submit."""
     if target['status'] not in ASKABLE:
         return f'it is {target["status"]}'
-    if input_state(read_screen(target['address'])) != 'input':
+    if not shows_input(read_screen(target['address'])):
         return 'its screen is not a recognized input line'
     return None
 

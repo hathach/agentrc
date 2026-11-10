@@ -6,8 +6,8 @@ description: Collect status from the human's other Claude Code sessions in hc te
 # Captain
 
 `scripts/captain.py` owns the mechanics: finding sessions in this host's hc terminals, pinning each one's identity,
-telling whether its screen shows its input line, and a locked ledger under `~/.cache/agentrc/captain/` that holds every request
-and answer. This page is the judgment. Linux only (`/proc`). Claude Code sessions only: a session is pinned through
+telling whether its screen shows its input line, and a locked ledger under `~/.cache/agentrc/captain/` that holds
+every request and answer. This page is the judgment. Linux only (`/proc`). Claude Code sessions only: a session is pinned through
 the session registry Claude Code keeps under its account's config dir, which Codex has none of, so `list` leaves
 Codex terminals out, and remote (`machine/tN`) ones too. `list` orders sessions by hc's `status_ms`, when each last
 reported its status, latest first: an order, not how long one has been idle. A row ends with the session's own status
@@ -73,10 +73,10 @@ pins each target's session once, so one replaced in its terminal while the relay
   as one, such as a dialog, refuses, checked right before each send. hc pastes the request into the input line,
   appended to any text already there, a human's draft included. An idle target is sent only while hc still sees it
   idle; hc has no such check for done, so one that starts a turn in between gets the request as its next input. One
-  request per session is open at a time. A session
-  whose own transcript starts no turn after the request its last report answered - no prompt, task notification or
-  compaction - is not asked: `ask` prints `not asked` with that report's id, which answers for it. `--force` asks
-  anyway, only when the human wants a session asked again whatever it last said.
+  request per session is open at a time. A session whose own transcript starts no turn after the request its last
+  report answered - no prompt, task notification or compaction - is not asked: `ask` prints `not asked` with that
+  report's id, which answers for it. `--force` asks anyway, only when the human wants a session asked again whatever
+  it last said.
 - **Relay** carries the human's message this turn of yours acts on, read by the script from this session's own
   transcript: you never pass the words. That is the message that started the turn, or one the human typed while you
   worked, which reaches you inside a tool result; a turn a notification or a compaction started has none, and the

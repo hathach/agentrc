@@ -34,43 +34,34 @@ def boxed(*lines):
 class InputStateTest(unittest.TestCase):
     """The input line is recognized whatever text it holds: a paste appends to it."""
 
-    def test_empty(self):
-        self.assertEqual(captain.input_state(EMPTY), 'input')
-        self.assertEqual(captain.input_state(boxed('❯\xa0')), 'input')
-
-    def test_a_draft_or_a_suggestion_is_still_the_input_line(self):
-        for line in ('❯ my draft text', '❯\xa0Try "how does <filepath> work?"', '❯ apply to both', '❯ ⠓⠑⠇⠇⠕'):
-            with self.subTest(line):
-                self.assertEqual(captain.input_state(boxed(line)), 'input')
-
-    def test_claude_labelled_top_rule(self):
-        text = f'{RULE} alo68 ─\n❯ \n{RULE}\n  status\n  ⏵⏵ bypass permissions on'
-        self.assertEqual(captain.input_state(text), 'input')
-
-    def test_claude_multiline_draft(self):
-        self.assertEqual(captain.input_state(boxed('❯ ', '  second line')), 'input')
+    def test_an_input_line_empty_or_not(self):
+        labelled = f'{RULE} alo68 ─\n❯ \n{RULE}\n  status\n  ⏵⏵ bypass permissions on'
+        for screen in (EMPTY, boxed('❯\xa0'), labelled, boxed('❯ my draft text'), boxed('❯ ', '  second line'),
+                       boxed('❯\xa0Try "how does <filepath> work?"'), boxed('❯ ⠓⠑⠇⠇⠕')):
+            with self.subTest(screen):
+                self.assertTrue(captain.shows_input(screen))
 
     def test_claude_without_input_box_is_unknown(self):
         for text in ['Do you want to proceed?\n❯ 1. Yes\n  2. No', f'{RULE}\n{RULE}', f'{RULE}\n  menu\n{RULE}']:
             with self.subTest(text):
-                self.assertEqual(captain.input_state(text), 'unknown')
+                self.assertFalse(captain.shows_input(text))
 
     def test_trust_prompt_is_unknown(self):
         text = (f'{RULE}\n Accessing workspace:\n /w\n Quick safety check: Is this a project you trust?\n'
                 ' ❯ No, exit\n   Yes, I trust this folder\n Enter to confirm · Esc to cancel\n')
-        self.assertEqual(captain.input_state(text), 'unknown')
+        self.assertFalse(captain.shows_input(text))
 
     def test_dialog_below_the_input_is_unknown(self):
-        self.assertEqual(captain.input_state(EMPTY + '\nPermission required\n❯ 1. Yes\n  2. No'), 'unknown')
+        self.assertFalse(captain.shows_input(EMPTY + '\nPermission required\n❯ 1. Yes\n  2. No'))
 
     def test_dialog_rows_above_the_hint_are_unknown(self):
         lines = EMPTY.rstrip('\n').split('\n')
         lines[-1:-1] = ['  Permission required', '  Press Enter to approve or Esc to cancel']
-        self.assertEqual(captain.input_state('\n'.join(lines)), 'unknown')
+        self.assertFalse(captain.shows_input('\n'.join(lines)))
 
     def test_indented_dialog_below_the_input_is_unknown(self):
         text = EMPTY + '\n  Permission required\n  Press Enter to approve or Esc to cancel'
-        self.assertEqual(captain.input_state(text), 'unknown')
+        self.assertFalse(captain.shows_input(text))
 
 
 def terminal(address, app='claude-code', **extra):
