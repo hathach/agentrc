@@ -82,7 +82,8 @@ retries, recovery) apply unchanged; these scripts load its `hil_*` scripts throu
   `release` or `session close`; a session command that leaves a child unproven, or a restore that fails, logs the
   failure under it. A passing restore marks restored each open failure whose children and retained
   sessions are proven ended. `restore --release` releases the hold whatever the restore did: exit 0 restored, 6
-  restore failed (released), 5 not released; `session close` counts 6 closed. An older engine's pending record
+  restore failed (released), 5 not released; `session close` counts 6 closed, and on a closed session prints its
+  recorded exits without the rig (exit 0). An older engine's pending record
   (kind `arduino-hil`) is reported (`previousPending`), never a refusal.
 - **Claims** (agentrc#467): a run, commission or session command claims its board (kind `arduino-hil-claim`, the
   `hil` skill's Board locks) after its lock or hold check and before its first tool. Another live invocation on the

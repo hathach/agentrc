@@ -350,6 +350,26 @@ class Session(Checkout):
         rc, closed = self.main('session', 'close', 's1')
         self.assertEqual((rc, closed['closed']), (R.H.RELEASE_FAILED, False))
 
+    def test_a_closed_session_closes_again_from_its_record_without_the_rig(self):
+        """agentrc#406: the rig would answer NOT_HELD about a hold the session took, restored and released."""
+        for opened, key, first in ((True, 'restore', 0), (True, 'restore', R.H.RESTORE_FAILED),
+                                   (False, 'release', R.H.NOT_HELD), (False, 'release', 0)):
+            with self.subTest(held=opened, first=first):
+                self.rig_exit = {} if opened else {'lock': 1}
+                self.main('session', 'open', '--run-id', 's1', '-b', BOARD)
+                self.rig_exit[key] = 255            # an incomplete first close stays retryable
+                self.assertEqual(self.main('session', 'close', 's1')[1]['closed'], False)
+                self.rig_exit[key] = first
+                rc, closed = self.main('session', 'close', 's1')
+                self.assertEqual(closed['closed'], True)
+                calls = len(self.calls)
+                rc, again = self.main('session', 'close', 's1')
+                self.assertEqual(len(self.calls), calls)
+                exits = {'restoreExit': first if opened else None, 'releaseExit': None if opened else first}
+                self.assertEqual((rc, again['closed'], again['restoreExit'], again['releaseExit']),
+                                 (0, True, exits['restoreExit'], exits['releaseExit']))
+                self.assertIn('nothing was sent to the rig', again['note'])
+
     def test_exec_adds_the_session_options_and_keeps_argv_after_the_roster(self):
         out = self.open()
         self.assertEqual(R.main(['session', 'exec', 's1', 'exec', '--timeout', '9', '--', 'ls', '-l']), 0)
