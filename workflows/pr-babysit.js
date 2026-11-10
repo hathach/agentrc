@@ -511,9 +511,11 @@ const REVIEWS = {
       type: 'array',
       items: {
         type: 'object', additionalProperties: false,
-        required: ['source', 'findingId', 'commentDigest', 'commentId', 'file', 'line', 'claim', 'verdict', 'reason', 'fixHint', 'fixFiles', 'related', 'changeReason', 'fixedBy'],
+        required: ['source', 'findingId', 'commentDigest', 'commentId', 'file', 'line', 'claim', 'verdict', 'reason', 'fixHint', 'fixFiles', 'related', 'changeReason', 'fixedBy', 'dependsOn'],
         properties: {
           related: { type: ['string', 'null'] }, changeReason: { type: ['string', 'null'] }, fixedBy: { type: ['string', 'null'] },
+          // The paths a dismissal rests on, [] when unbounded: what harvest.py --carry checks before it is carried (#393).
+          dependsOn: { type: 'array', items: { type: 'string' } },
           source: { type: 'string' }, findingId: { type: 'string' },
           commentDigest: { type: 'string' }, commentAliases: { type: 'array', items: { type: 'string' } }, commentId: { type: 'integer' },
           file: { type: 'string' }, line: { type: 'integer' }, claim: { type: 'string' },
@@ -528,6 +530,18 @@ const REVIEWS = {
         type: 'object', additionalProperties: false,
         required: ['commentId', 'body'],
         properties: { commentId: { type: 'integer' }, body: { type: 'string' } },
+      },
+    },
+    // harvest.py's carry records, unchanged: the comments it found unchanged since their findings settled (#393).
+    carry: {
+      type: 'array',
+      items: {
+        type: 'object', additionalProperties: false,
+        required: ['commentId', 'eligible', 'reason'],
+        properties: {
+          commentId: { type: 'integer' }, eligible: { type: 'boolean' }, reason: { type: 'string' },
+          commentDigest: { type: 'string' }, commentAliases: { type: 'array', items: { type: 'string' } }, source: { type: 'string' },
+        },
       },
     },
     // harvest.py's error, verbatim, when it failed twice for any other reason (#205); its last stderr line when it printed no JSON line (#240).
@@ -921,6 +935,11 @@ const decisions = new Map(restored ? restored.decisions : [])
 const holds = new Map(restored ? restored.holds : [])
 const heldComments = () => new Set([...holds.values()].map(h => h.commentId))
 const outstanding = () => [...new Set([...debt.keys(), ...heldComments()])]
+// Our answer stands on this body, and the comment owes nothing and holds nothing (#393).
+const answerStands = (commentId, digest) => {
+  const a = answeredWith.get(commentId)
+  return !!a && a.digest === digest && !reanswer.has(commentId) && !outstanding().includes(commentId)
+}
 const corrections = []
 // findingId -> a caller's deferral once its issue was read to cover it; holds while the comment body stands.
 const deferrals = new Map(restored ? restored.deferrals : [])
@@ -2581,6 +2600,52 @@ const runCycle = async (cycle, entry) => {
   return verdict
 }
 
+// #393: comments whose findings all settled as dismissals, answered at that body with nothing owed or held, judged on one
+// head; harvest.py --carry checks each against git, and the validator judges only the rest. paths null: unbounded.
+const carryCandidates = () => {
+  const byComment = new Map()
+  for (const d of decisions.values()) byComment.set(d.commentId, [...(byComment.get(d.commentId) || []), d])
+  const out = []
+  for (const [commentId, ds] of byComment) {
+    const a = answeredWith.get(commentId)
+    if (!answerStands(commentId, a && a.digest) || a.how === 'byHand') continue
+    const shas = new Set(ds.map(d => d.reviewedSha))
+    if (shas.size !== 1 || !ds.every(d => d.digest === a.digest && d.verdict !== 'valid' && !d.rejection)) continue
+    const bounded = ds.every(d => Array.isArray(d.paths) && d.paths.length > 0)
+    out.push({ commentId, digest: a.digest, judgedSha: [...shas][0], paths: bounded ? [...new Set(ds.flatMap(d => d.paths))].sort() : null })
+  }
+  return out
+}
+// A carried comment's findings, rebuilt from their decisions under the comment's current digest; why the report is unusable, else null.
+const restoreCarried = (cycle, r, candidates) => {
+  const carry = r.carry
+  delete r.carry
+  // No records: nothing is carried, and every comment stands judged as reported.
+  if (carry === undefined) return null
+  const listed = new Set(candidates.map(c => c.commentId))
+  const ids = carry.map(c => c.commentId)
+  if (ids.length !== listed.size || new Set(ids).size !== ids.length || !ids.every(id => listed.has(id))) {
+    return `its carry records name ${JSON.stringify(ids)}, not the comments harvest.py was given ${JSON.stringify([...listed])}`
+  }
+  const kept = carry.filter(c => c.eligible)
+  for (const c of kept) {
+    if (typeof c.commentDigest !== 'string' || typeof c.source !== 'string') return `carried comment ${c.commentId} has no current digest or source`
+    if (r.findings.some(f => f.commentId === c.commentId) || r.replies.some(x => x.commentId === c.commentId)) return `comment ${c.commentId} is both carried and judged`
+  }
+  for (const c of kept) {
+    for (const [findingId, d] of decisions) {
+      if (d.commentId !== c.commentId) continue
+      r.findings.push({
+        source: c.source, findingId, commentDigest: c.commentDigest, ...(c.commentAliases ? { commentAliases: c.commentAliases } : {}),
+        commentId: c.commentId, file: d.file, line: d.line, claim: d.claim, verdict: d.verdict, reason: d.reason, fixHint: '', fixFiles: [],
+        related: null, changeReason: null, fixedBy: null, carried: true,
+      })
+    }
+  }
+  if (kept.length) log(`cycle ${cycle}: ${kept.length} comment(s) unchanged since their findings settled — carried, not judged again`)
+  return null
+}
+
 // #359: after a cycle that only waited out CodeRabbit's rate limit, a probe of harvest.py stands in for the validator
 // while CodeRabbit stays limited and the review evidence (harvest.py's fingerprint) is unchanged on the same head: the
 // validator would read the same comments. Its last report, as it returned it, goes on with the probe's bots and time.
@@ -2616,14 +2681,16 @@ const runLanes = async (cycle, entry, lanes) => {
     }
 
     const owedLastCycle = outstanding().map(commentId => ({ commentId, findingIds: owedIds(commentId) }))
+    const candidates = carryCandidates()
     const reviewPrompt =
       `Validate the bot review findings on PR #${args.pr} per your procedure. ${IN_CHECKOUT}` +
-      `Harvest with exactly \`${PY} ${HARVEST_SCRIPT} --pr ${args.pr} --repo ${shq(repo)} --reviewers ${reviewers.join(',')}${waitedOn.length ? ` --auto-run ${waitedOn.join(',')}` : ''}\`. ` +
+      `Harvest with exactly \`${PY} ${HARVEST_SCRIPT} --pr ${args.pr} --repo ${shq(repo)} --reviewers ${reviewers.join(',')}${waitedOn.length ? ` --auto-run ${waitedOn.join(',')}` : ''}` +
+      `${candidates.length ? ` --carry ${shq(JSON.stringify(candidates))}` : ''}\`. ` +
       (owedLastCycle.length > 0
         ? 'These comments still owe an answer from an earlier cycle; report every finding on each as its body stands now, ' +
           `those listed by findingId among them, so they can be reconciled: ${JSON.stringify(owedLastCycle)}. ` : '') +
       (decisions.size > 0
-        ? `Earlier verdicts on this PR (set related and changeReason against them per your procedure): ${JSON.stringify([...decisions].map(([findingId, d]) => ({ findingId, ...d })))}. ` : '') +
+        ? `Earlier verdicts on this PR (set related and changeReason against them per your procedure): ${JSON.stringify([...decisions].map(([findingId, { paths, ...d }]) => ({ findingId, ...d })))}. ` : '') +
       (unpostedNotes().length > 0
         ? 'Our fix notes on these comments are not yet posted; for a stale finding on one, set fixedBy to its sha when that commit\'s change is what fixed the finding: ' +
           `${JSON.stringify(unpostedNotes().map(([commentId, d]) => ({ commentId, sha: d.attempt.repair.sha })))}. ` : '')
@@ -2634,7 +2701,7 @@ const runLanes = async (cycle, entry, lanes) => {
       : probed || await agent(reviewPrompt, {
         label: `reviews#${cycle}`, phase: 'Triage', agentType: 'pr-review-validator', schema: REVIEWS,
       }).catch(quiet(`cycle ${cycle}: review validator`))
-    lastRead = r && r !== nobody && !r.rateLimit && !r.harvestError ? { head: expectedHead, json: JSON.stringify(r) } : null
+    lastRead = null
     if (lanes.prState) return prEnded(cycle, lanes.prState)
     if (!r) {
       entry.error = 'pr-review-validator died'
@@ -2654,12 +2721,14 @@ const runLanes = async (cycle, entry, lanes) => {
     entry.reviews = r
     // A harvest not about this head, or missing an auto-run bot, settles nothing.
     if (r !== nobody) {
-      const why = reviewsWhy(r)
+      // A probed report is one stored below, its carried findings restored and its carry records gone.
+      const why = reviewsWhy(r) || restoreCarried(cycle, r, candidates)
       if (why) {
         log(`cycle ${cycle}: validator report unusable — ${why}`)
         entry.error = `validator report unusable: ${why}`
         return stop(cycle, 'review-report-unusable', { detail: why })
       }
+      lastRead = { head: expectedHead, json: JSON.stringify(r) }
     }
     if (r !== nobody) reviewedCycles.set(cycle, r.findings)
     entry.bots = r === nobody
@@ -2722,8 +2791,15 @@ const runLanes = async (cycle, entry, lanes) => {
       log(`cycle ${cycle}: ${f.findingId} held — ${f.hold}`)
     }
 
+    // A dismissal already answered at this body, its verdict the recorded one (or a fix noted landing), with nothing owed
+    // or held on its comment, posts nothing and reverses nothing: it needs no second opinion (#393).
+    const settledAnswer = (f) => {
+      const p = prior.get(f)
+      return !!p && answerStands(f.commentId, f.commentDigest) &&
+        (p.verdict === f.verdict || (p.verdict === 'valid' && f.verdict === 'stale' && answeredWith.get(f.commentId).how === 'fixNote'))
+    }
     // A dismissal about to be posted closes the thread, and a reversal is about to be fixed: both get a second opinion.
-    const challenged = r.findings.filter(f => f.verdict !== 'valid' || reversal(f))
+    const challenged = r.findings.filter(f => reversal(f) || (f.verdict !== 'valid' && !settledAnswer(f)))
     if (challenged.length > 0) {
       if (lanes.prState) return prEnded(cycle, lanes.prState)
       const submitted = challenged.map((f, id) => {
@@ -2827,8 +2903,11 @@ const runLanes = async (cycle, entry, lanes) => {
       if (holds.delete(f.findingId)) log(`cycle ${cycle}: ${f.findingId} reconciled`)
       // A writer's rejection stands while the comment does: a second one on the same body stops the run.
       const prior = decisions.get(f.findingId)
+      // A carried verdict keeps the head and paths it was judged on; a fresh dismissal's paths include its cited file.
+      const judged = f.carried ? { reviewedSha: prior.reviewedSha, ...(prior.paths ? { paths: prior.paths } : {}) }
+        : { reviewedSha: r.headSha, ...(f.verdict !== 'valid' && f.dependsOn && f.dependsOn.length ? { paths: [...new Set([...(f.file ? [f.file] : []), ...f.dependsOn])] } : {}) }
       decisions.set(f.findingId, {
-        commentId: f.commentId, digest: f.commentDigest, reviewedSha: r.headSha, file: f.file, line: f.line,
+        commentId: f.commentId, digest: f.commentDigest, ...judged, file: f.file, line: f.line,
         claim: cut(f.claim), verdict: f.verdict, reason: cut(f.challengeReason || f.reason),
         ...(prior && prior.rejection && prior.digest === f.commentDigest ? { rejection: prior.rejection } : {}),
       })
