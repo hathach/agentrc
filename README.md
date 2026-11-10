@@ -249,23 +249,46 @@ of `simplify_gate.py`. Session state lives under
 
 `hooks/credit-guard` keeps a session on an account with extra usage enabled
 from spending credits. At session start it asks `/api/oauth/usage` once
-whether credits are enabled; if not, it stays off for that session. Otherwise
-it blocks the prompt, or denies the next tool call and ends the session, once
-any plan limit reaches 100%. Usage is re-read on a window that shrinks with
+whether credits are enabled; if not, it stays off for that session. Otherwise,
+once any plan limit reaches 100%, the prompt or tool call waits in the hook
+until the limits reset, then goes through, so an interactive session and a
+headless chief both carry on where they paused; a subagent or Workflow agent
+waits at its own next tool call. Usage is re-read on a window that shrinks with
 headroom and burn rate (`HEADROOM` in `credit_guard.py`, tuned from
-`credit-guard/readings.log`); a read that fails, or a payload it cannot
-parse, keeps the last reading, and blocks only when there is none. It cannot
-stop a model call already running, a subagent's next turn, or a hook that
-Claude Code kills on timeout, and it does not know the session's model.
+`credit-guard/readings.log`); a read that fails, or a payload it cannot parse,
+keeps the last reading, and blocks only when there is none.
+
+A wait sleeps until the latest reset of the full limits, then re-reads usage,
+backing off while a limit stays full; only a successful, still-trusted reading
+below 100% ends it. It is bounded by the hook's registered timeout, passed to
+the script as `--timeout N` because a running session keeps the hooks it
+started with: up to eight days (`MAX_WAIT`), less a margin, since Claude Code
+lets a hook that times out or is killed through. A reset beyond that, a usage
+read refused with HTTP 401 or 403 (a login that expires during a long wait
+included; nothing in the hook renews it) or a hook registered without
+`--timeout` stops the session as before: the prompt is blocked, or the tool
+denied and the session ended.
+
+While waiting, the interactive UI shows the hook running, `credit_guard.py
+status` lists the waiting hooks and their next quota check, and the session
+gets a message when the wait ends; a headless chief's launcher looks every
+30 s and logs `launcher: credit-guard waiting` when it finds one of the run's
+hooks waiting and `wait over` when a later look finds none, so a short wait,
+or one the run ends inside, can go unlogged. Esc cancels the waiting turn without running its
+tool; never kill a waiting hook's process, which lets its call through. The
+guard cannot stop a model call already running or a subagent's next turn, and
+it does not know the session's model.
 
 `install.py` does not register it. Register it per config dir that needs it
-(`~/.claude-ada` here); the recipe refuses a dir that already has it:
+(`~/.claude-ada` here); the recipe replaces an earlier registration, and
+sessions started before it keep theirs:
 
 ```sh
-d=~/.claude-ada; ! grep -q credit_guard.py $d/settings.json && mkdir -p $d/hooks &&
-ln -sfn ~/code/agentrc/hooks/credit-guard $d/hooks/credit-guard &&
+d=~/.claude-ada; mkdir -p $d/hooks && ln -sfn ~/code/agentrc/hooks/credit-guard $d/hooks/credit-guard &&
 jq --arg c "$d/hooks/credit-guard/credit_guard.py" --slurpfile h ~/code/agentrc/hooks/credit-guard/hooks.json \
-  '.hooks = reduce ($h[0] | to_entries[]) as $e (.hooks // {}; .[$e.key] += [$e.value[] | .hooks |= map(.command = $c)])' \
+  '.hooks = reduce ($h[0] | to_entries[]) as $e (.hooks // {} | with_entries(.value |= map(if .hooks then
+      .hooks |= map(select((.command // "") | contains("credit_guard.py") | not)) | select(.hooks != []) else . end));
+    .[$e.key] += [$e.value[] | .hooks |= map(.command = "\($c) --timeout \(.timeout)")])' \
   $d/settings.json > $d/settings.json.new && chmod --reference=$d/settings.json $d/settings.json.new &&
 mv $d/settings.json.new $d/settings.json
 ```

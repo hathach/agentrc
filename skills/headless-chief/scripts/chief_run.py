@@ -11,6 +11,8 @@ the session's cost can be tabled, cost.md (run_cost.py's full output; its brief 
 the Launches and Usage tables, goes into report.md before chief's first `## ` section).
 The exit line ends with that total, or `cost none (<why>)`.
 
+While the credit guard holds one of the run's hooks waiting for a plan limit to reset, progress.log says so.
+
 A status line is the first line of one of chief's own messages (agents/chief.md);
 a note is a progress note, joined onto one line, that chief's model returns as a `thinking`
 block. It returns at once and leaves the launcher in its own session, so no caller's
@@ -21,6 +23,7 @@ and usage are in SKILL.md.
 """
 import argparse
 import errno
+import importlib.util
 import json
 import os
 import re
@@ -28,6 +31,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -39,10 +43,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
 import lead_session  # noqa: E402
 import windows  # noqa: E402
 
+GUARD = Path(__file__).resolve().parents[3] / 'hooks' / 'credit-guard' / 'credit_guard.py'
+spec = importlib.util.spec_from_file_location('credit_guard', GUARD)
+credit_guard = importlib.util.module_from_spec(spec)   # its waiting hooks' records, read the way it reads them
+spec.loader.exec_module(credit_guard)
+
 MARKER = 'chief: '
 RELAUNCH = [sys.executable, *sys.orig_argv[1:], '--_detached']   # this command again, as the launcher
 HELD = []   # the run.lock this launcher holds until it exits
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0   # a detached launcher's console children
+GUARD_WATCH = 30   # seconds between looks at the credit guard's waiting hooks
 
 if os.name == 'nt':
     import msvcrt
@@ -58,11 +68,29 @@ class Progress:
         self.f = path.open('a+', encoding='utf-8', newline='\n')
         self.f.seek(0)
         self.seq = sum(1 for _ in self.f)   # a line appended after a failed launch keeps the count
+        self.lock = threading.Lock()   # the guard watcher writes too
 
     def line(self, text):
-        self.seq += 1
-        self.f.write(f'{self.seq} {time.strftime("%H:%M:%S")} {text}\n')
-        self.f.flush()
+        with self.lock:
+            self.seq += 1
+            self.f.write(f'{self.seq} {time.strftime("%H:%M:%S")} {text}\n')
+            self.f.flush()
+
+
+def watch_guard(progress, tag, stop, every=GUARD_WATCH):
+    """Log when the run's hooks (CREDIT_GUARD_TAG tag) start and stop waiting on the credit guard, until stop is
+    set: a wait can begin before claude names its session."""
+    since = None
+    while not stop.wait(every):
+        waits = credit_guard.waiters(tag)
+        if waits and since is None:
+            since = min(w['since'] for w in waits)
+            names = sorted({n for w in waits for n in w.get('limits') or []})
+            progress.line(f'launcher: credit-guard waiting ({", ".join(names)}), next quota check '
+                          f'{credit_guard.local_time(min(w["next_check"] for w in waits))}')
+        elif not waits and since is not None:
+            progress.line(f'launcher: credit-guard wait over after {credit_guard.duration(time.time() - since)}')
+            since = None
 
 
 def running_chiefs(worktree):
@@ -146,6 +174,7 @@ def child_env():
     # a fresh top-level session: inheriting the caller's, chief would run as nested in, pass for, or message as the lead
     env = lead_session.child_env()
     env['CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS'] = '0'   # else -p kills units still running 10 min after chief's turn ends
+    env.pop('CREDIT_GUARD_TAG', None)   # launch() sets this run's own
     return env
 
 
@@ -396,13 +425,17 @@ def launch(a, task):
             if claude is None:
                 raise FileNotFoundError('claude is not on PATH')
             # a console of its own with no window, in the foreground too: claude's tools open none
-            child = subprocess.Popen(cmd, cwd=a.worktree, stdin=task, stdout=subprocess.PIPE, stderr=err, env=child_env(),
-                                     creationflags=NO_WINDOW)
+            tag = str(a.out.resolve())
+            child = subprocess.Popen(cmd, cwd=a.worktree, stdin=task, stdout=subprocess.PIPE, stderr=err,
+                                     env={**child_env(), 'CREDIT_GUARD_TAG': tag}, creationflags=NO_WINDOW)
         except OSError as e:
             err.write(f'chief_run: could not start claude: {e}\n'.encode())
             progress.line(f'launcher: exit 127 (could not start claude: {e}) · report none')
             return 127
+        unwatch = threading.Event()
+        watcher = threading.Thread(target=watch_guard, args=(progress, tag, unwatch), daemon=True)
         try:
+            watcher.start()
             # Windows has no SIGHUP and can send claude no signal but termination
             for sig in filter(None, (getattr(signal, n, None) for n in ('SIGTERM', 'SIGINT', 'SIGHUP', 'SIGBREAK'))):
                 signal.signal(sig, lambda signum, _frame: stop(child) if os.name == 'nt' else child.send_signal(signum))
@@ -449,6 +482,10 @@ def launch(a, task):
                 child.kill()
                 child.wait()
             raise
+        finally:   # no watcher line after the exit line
+            unwatch.set()
+            if watcher.ident is not None:
+                watcher.join()
     body = str(result.get('result') or '') if result is not None else ''
     if result is not None and result.get('num_turns') == 0:
         body = ''   # a hook refused the prompt: not chief's report
