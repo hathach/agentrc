@@ -340,17 +340,29 @@ def hil_tests():
     return {t for t in P.CONTRACT_TESTS if t != 'build'}
 
 
+def reached_families(effect, detail):
+    """The firmware families a change of this effect reaches: a HIL sketch (or an example one) those of the rig
+    boards that build and run it, a fixture those of its boards. A harness or roster change (`hil`) reaches none:
+    it changes no firmware, and `hil.full` already runs it on every roster board."""
+    if effect == 'family':
+        return {detail}
+    if effect == 'shared':
+        return set(P.REPRESENTATIVES)
+    if effect == 'boards':
+        return {P.BOARDS[b]['family'] for b in detail}
+    if effect == 'fixture':
+        return {b['family'] for b in P.BOARDS.values() if b.get('fixture') == detail}
+    if effect in ('hil_sketch', 'example'):
+        return {P.BOARDS[b]['family'] for b in P.BOARDS
+                if 'span' in P.BOARDS[b] and detail in hil_sketches(b) and eligible(b, detail)}
+    return set()
+
+
 def uncovered_by_roster(paths, roster):
     """Firmware families a change reaches that no roster board on this host runs."""
     reached = set()
     for path in paths:
-        effect, detail, _ = classify(path)
-        if effect == 'family':
-            reached.add(detail)
-        elif effect == 'shared':
-            reached.update(P.REPRESENTATIVES)
-        elif effect == 'boards':
-            reached.update(P.BOARDS[b]['family'] for b in detail)
+        reached |= reached_families(*classify(path)[:2])
     covered = {P.BOARDS[b]['family'] for b in roster}
     return [{'family': f, 'reason': 'no roster board of this family on this host'} for f in sorted(reached - covered)]
 

@@ -244,7 +244,23 @@ class Selection(Lib):
         sel = ab.select([f'{probe}/probe.ino'], roster=['rig_ocd', 'rig_host'])
         self.assertEqual(sel['builds'], {b: [probe] for b in ('rig_esp', 'rig_jlink', 'rig_ocd')})
         self.assertEqual(sel['tests'], ['hil'])   # hil_remote is not a test of this profile
-        self.assertEqual(sel['hil'], {'boards': ['rig_host', 'rig_ocd'], 'full': True, 'uncovered': []})
+        self.assertEqual(sel['hil'], {'boards': ['rig_host', 'rig_ocd'], 'full': True, 'uncovered': [
+            {'family': 'fb', 'reason': 'no roster board of this family on this host'}]})   # rig_jlink and rig_esp
+
+    def test_a_hil_sketch_or_fixture_reaches_the_families_of_the_rig_boards_it_builds_on(self):
+        for path in ('test/hil/sketches/probe/probe.ino', 'examples/HID/inout/inout.ino', 'test/hil/fixture.cpp'):
+            with self.subTest(path=path):
+                self.assertEqual([u['family'] for u in ab.uncovered_by_roster([path], ['rig_ocd'])], ['fb'])
+                self.assertEqual(ab.uncovered_by_roster([path], ['rig_ocd', 'rig_jlink']), [])
+        # a fixture reaches only its own boards' family, an example no rig board runs reaches none
+        self.assertEqual(ab.uncovered_by_roster(['test/hil/fixture.cpp'], ['rig_esp']), [])
+        self.assertEqual(ab.uncovered_by_roster(['examples/Only/bonly/bonly.ino'], ['rig_ocd']), [])
+
+    def test_a_harness_or_roster_change_reaches_no_family(self):
+        for path in ('test/hil/ci.json', '.claude/skills/hil-contract/scripts/hil_test.py',
+                     '.claude/test/test_hil.py', '.claude/skills/build/scripts/check_build.py'):
+            with self.subTest(path=path):
+                self.assertEqual(ab.uncovered_by_roster([path], ['rig_ocd']), [])
 
     def test_fixture_change_builds_and_selects_its_boards(self):
         sel = ab.select(['test/hil/fixture.cpp'], roster=['rig_ocd', 'rig_esp'])
@@ -1053,6 +1069,13 @@ class Core(Lib):
         self.assertEqual(sel['uncovered'], [])
         self.assertEqual(ab.uncovered_by_roster(['platform.txt'], ['rig_m4']),
                          [{'family': 'c21', 'reason': 'no roster board of this family on this host'}])
+
+    def test_a_hil_sketch_change_names_the_family_of_a_rig_board_the_roster_lacks(self):
+        self.P.BOARDS['rig_m0'] = {'fqbn': 'fake:core:m0', 'family': 'c21', 'filters': 'm0', 'span': (0x2000, 0x40000)}
+        sel = ab.select(['test/hil/core_cdc/core_cdc.ino'], roster=['rig_m4'])
+        self.assertEqual(sorted(sel['builds']), ['rig_m0', 'rig_m4'])
+        self.assertEqual(sel['hil'], {'boards': ['rig_m4'], 'full': True, 'uncovered': [
+            {'family': 'c21', 'reason': 'no roster board of this family on this host'}]})
 
     def test_a_sketch_no_representative_builds_is_uncovered(self):
         self.P.classify_source = lambda path: ('sketches', ['libraries/Wire/examples/skipped'], 'w')
