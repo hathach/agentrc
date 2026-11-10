@@ -3293,9 +3293,24 @@ class StartTest(RelayCase):
     def test_a_task_never_goes_to_a_session_other_than_the_one_verified(self):
         self.say('start proj and fix the lint errors')
         self.terminals['t9'] = pinned('t9')   # replaced after verify() pinned s-new
-        out = self.start(task=True)[1]
+        code, out = self.start(task=True)
+        self.assertEqual(code, 1)
         self.assertNotIn('relay', self.types())
         self.assertIn('t9: refused, its session changed', out)
+        self.assertIn('first task not relayed, t9 may no longer be the session verified', out)
+        self.assertNotIn('--entry', out)
+
+    def test_a_task_refused_by_an_item_open_to_the_verified_session_names_its_relay(self):
+        self.say('start proj and fix the lint errors')
+        self.terminals['t9'] = {**pinned('t9'), 'created': 99, 'cwd': self.root, 'session': 's-new', 'pid': 77,
+                                'started': 5}
+        self.ask('t9')
+        code, out = self.start(task=True)
+        self.assertEqual(code, 1)
+        self.assertNotIn('relay', self.types())
+        self.assertIn('t9: refused, a request or relay to it is still open', out)
+        self.assertIn('first task not relayed, a request or relay to t9 is still open', out)
+        self.assertIn('`relay t9 --entry u-1`', out)
 
     def test_a_failed_start_offers_no_relay(self):
         self.say('start proj and fix the lint errors')

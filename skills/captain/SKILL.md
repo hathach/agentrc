@@ -129,8 +129,11 @@ pins each target's session once, so one replaced in its terminal while the relay
     that same message to it once `verified`, as a relay of their words with its own receipt; the session reads the
     whole message, the start included, and only the session `start` verified gets it. Not verified, nothing is
     relayed: when pending or unchecked, the receipt names the `relay --entry` that sends it once `list` shows that
-    session in that checkout under that account; when failed, none. A message that also asks you something gets no
-    `--task`, as with a relay: start without it, answer, and ask the human for the task alone.
+    session in that checkout under that account; when failed, none. A held relay keeps its `relay --retry` line. A
+    refused one exits 1 with `first task not relayed`: it names `relay --entry` only when an item still open to that
+    session refused it; when that terminal may no longer hold the session verified, the human checks or closes it and
+    a task for it needs a new message of theirs. A message that also asks you something gets no `--task`, as with a
+    relay: start without it, answer, and ask the human for the task alone.
 - **Closing** a terminal, space or session is the human's: you may report a session done, but never close one, type
   `/exit`, kill a process or terminal, or ask a target to close itself. `cancel` closes a ledger item only: it
   neither reaches a session nor withdraws an instruction one accepted. That takes a new relay of the human's words,

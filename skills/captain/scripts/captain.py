@@ -2182,11 +2182,27 @@ def start(arg, account, name, space, tab, entry, mine, task=False):
            'unchecked': f'VERIFICATION UNCHECKED: {why}; `list` shows whether it is up'}[verification])
     if task and verification == 'verified':
         relay({address: address}, uid, mine, pinned={address: session})
+        return first_task(msg, address, uid, session)
     elif task:
         print(f'{msg}: first task not relayed, the session is not verified' + (
             '' if verification == 'failed' else f'; once `list` shows it running in {root} under {account}, '
             f'`relay {address} --entry {uid}` sends it'))
     return {'failed': 1, 'unchecked': 3}.get(verification, 0)
+
+
+def first_task(msg, address, uid, session):
+    """0 once relay() recorded the start's message to address, delivered or held as its receipt says; else 1, naming
+    why: `--entry` is offered only when an item still open to that session refused it, never when it may be another."""
+    recs = records()
+    if any(r['type'] == 'relay' and r['entry'] == uid and r['target']['address'] == address for r in recs):
+        return 0
+    if open_to(address, recs):
+        print(f'{msg}: first task not relayed, a request or relay to {address} is still open; once it is collected or '
+              f'cancelled and `list` still shows {session["session"]} there, `relay {address} --entry {uid}` sends it')
+    else:
+        print(f'{msg}: first task not relayed, {address} may no longer be the session verified; the human checks or '
+              'closes it, and a task for it needs a new message of theirs')
+    return 1
 
 
 def metric(found):
