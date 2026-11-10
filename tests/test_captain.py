@@ -941,10 +941,10 @@ class RelayCase(LedgerCase):
         with open(self.transcript, 'a', encoding='utf-8') as f:
             f.write(json.dumps(entry) + '\n')
 
-    def relay(self, *addresses, entry=None):
+    def relay(self, *addresses, entry=None, force=False):
         """Relay this turn's message, or entry among them, to addresses."""
         with mock.patch('builtins.print') as out:
-            captain.relay(captain.resolve(list(addresses or ['t2'])), entry, self.ident)
+            captain.relay(captain.resolve(list(addresses or ['t2'])), entry, self.ident, force=force)
         return [c.args[0] for c in out.call_args_list]
 
     def preview(self, *targets, entry=None):
@@ -1117,6 +1117,22 @@ class RelayTest(RelayCase):
         self.say('and push')
         self.assertIn('still open', self.relay()[0])
         self.assertEqual(len(self.typed), 1)
+
+    def test_force_cancels_what_is_still_open_to_the_target_and_relays(self):
+        first = self.relayed()
+        self.say('and push')
+        lines = self.relay(force=True)
+        self.assertEqual(lines[0], f't2: cancelled {first}')
+        self.assertTrue(lines[1].endswith('delivered'))
+        self.assertEqual(len(self.typed), 2)
+        self.assertEqual(list(captain.open_items(captain.records())), [self.action_of(lines[1:])])
+
+    def test_force_cancels_nothing_when_the_relay_is_refused(self):
+        first = self.relayed()
+        self.terminals['t2'] = {**pinned('t2'), 'pid': None}
+        self.say('and push')
+        self.assertIn('refused', self.relay(force=True)[0])
+        self.assertIn(first, captain.open_items(captain.records()))
 
     def test_a_busy_target_holds_the_relay_and_retry_sends_it_unchanged(self):
         self.terminals['t2'] = {**pinned('t2'), 'status': 'working'}

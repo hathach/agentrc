@@ -16,8 +16,9 @@ does not recognize is reported, never assumed safe.
   captain.py cancel <msg>                        close a request, relay, watch or decision no answer will close
   captain.py queue [--json] [--all] [--refresh]  the decisions waiting on the human, sending nothing
   captain.py ingest --chief <run>                record a headless chief run's attention lines as decisions
-  captain.py relay <target>... [--entry <id>] [--dry-run]
-                                                 relay the human's message this turn acts on
+  captain.py relay <target>... [--entry <id>] [--dry-run] [--force]
+                                                 relay the human's message this turn acts on; --force first
+                                                 cancels a request or relay still open to a target
   captain.py relay <target> --item <id> --revision <N> --verdict <verdict> [--entry <id>]
                                                  relay it as the human's verdict on a decision
   captain.py verdict --item <id> --revision <N> --verdict <verdict> [--entry <id>]
@@ -635,10 +636,16 @@ def refusal(target):
     return None
 
 
-def gate(address, recs, mine):
-    """(the pinned session in address, None) when it may get an item, busy or not, else (None, why not)."""
-    if any(r['target']['address'] == address for r in open_items(recs).values()):
-        return None, 'a request or relay to it is still open (collect it, or cancel it)'
+def open_to(address, recs):
+    """The ids of the requests and relays still open to address."""
+    return [m for m, r in open_items(recs).items() if r['target']['address'] == address]
+
+
+def gate(address, recs, mine, force=False):
+    """(the pinned session in address, None) when it may get an item, busy or not, else (None, why not); force
+    passes an item still open to it, for the caller to cancel."""
+    if not force and open_to(address, recs):
+        return None, 'a request or relay to it is still open (collect it, cancel it, or relay with --force)'
     target = find(address)
     why = unreachable(target, mine)
     return (None, why) if why else (target, None)
@@ -1897,13 +1904,14 @@ def relay_prompt(action):
             f'Run: python3 {INSTALLED} accept --action {action}')
 
 
-def relay(targets, entry, mine, decided=None):
+def relay(targets, entry, mine, decided=None, force=False):
     """Relay the human's message this turn acts on (bound()) to each target, recorded before it is typed; targets as
     resolve() gave them. The transcript is read once for every target, so a message the human sends after that is not
     seen, and each session is pinned once, so one replaced in its terminal meanwhile is refused. A target busy or not
     showing its input line gets the relay held, recorded for `retry` to send unchanged. decided, (item, revision,
     verdict), makes it the human's verdict on that decision: one target, the session that owns it, and the binding
-    written into the relay record itself."""
+    written into the relay record itself. force cancels a request or relay still open to a target, once every other
+    check passed, as `cancel` would on the human's word."""
     addresses = list(targets)
     if decided and len(addresses) != 1:
         die('a relay with --item goes to exactly one session, the one that owns the decision', 2)
@@ -1918,7 +1926,7 @@ def relay(targets, entry, mine, decided=None):
             if any(r['type'] == 'relay' and r['entry'] == uid and r['target']['address'] == address for r in recs):
                 print(f'{address}: refused, this message was relayed to it already', flush=True)
                 continue
-            target, why = gate(address, recs, mine)
+            target, why = gate(address, recs, mine, force)
             if not why and (not pinned[address] or identity(target) != identity(pinned[address])):
                 why = 'its session changed during this relay; relay again'
             if why:
@@ -1927,6 +1935,9 @@ def relay(targets, entry, mine, decided=None):
             if linked and session_of(linked['owner']) != session_of(target):
                 print(f'{address}: refused, the decision {binding["item"]} is not this session\'s', flush=True)
                 continue
+            for stale in open_to(address, recs):
+                append({'type': 'cancel', 'msg': stale})
+                print(f'{address}: cancelled {stale}', flush=True)
             action = new_id('a', recs)
             fields = {'entry': uid, 'quote': quote, 'context': context(target, recs) + settles(linked, binding),
                       **binding}
@@ -2658,6 +2669,7 @@ def main():
     rl.add_argument('--entry', metavar='ID', help="which of this turn's messages, when the human wrote several")
     rl.add_argument('--dry-run', action='store_true', help='show what would go where, sending nothing')
     rl.add_argument('--retry', metavar='ACTION', help='send a held relay unchanged')
+    rl.add_argument('--force', action='store_true', help='cancel a request or relay still open to a target first')
     decide(rl)
     st = sub.add_parser('start', help="start a Claude Code session in a checkout, on the human's message")
     st.add_argument('checkout', help='an absolute or ~/ path to a checkout or worktree top level')
@@ -2744,14 +2756,14 @@ def main():
         if a.cmd == 'relay':
             linked = decided(a)
             if a.retry:
-                if a.addresses or a.entry or a.dry_run or linked:
+                if a.addresses or a.entry or a.dry_run or a.force or linked:
                     die('relay --retry takes only the held action', 2)
                 return retry(a.retry, mine)
             if not a.addresses:
                 die('relay names its targets', 2)
             if a.dry_run:
                 return preview(resolve(a.addresses), a.entry, mine)
-            return relay(resolve(a.addresses), a.entry, mine, linked)
+            return relay(resolve(a.addresses), a.entry, mine, linked, a.force)
         if a.cmd == 'verdict':
             return verdict(decided(a), a.entry, mine)
         if a.cmd == 'start':

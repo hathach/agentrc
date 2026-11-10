@@ -27,7 +27,7 @@ python3 ~/.claude/skills/captain/scripts/captain.py reports --json --new        
 python3 ~/.claude/skills/captain/scripts/captain.py cancel <msg>                    # close a request, relay, watch or decision
 python3 ~/.claude/skills/captain/scripts/captain.py queue [--json] [--all] [--refresh]  # the decisions waiting on the human
 python3 ~/.claude/skills/captain/scripts/captain.py ingest --chief <run>            # a headless chief run's attention lines
-python3 ~/.claude/skills/captain/scripts/captain.py relay <target>... [--entry <id>]  # relay this turn's message
+python3 ~/.claude/skills/captain/scripts/captain.py relay <target>... [--entry <id>] [--force]  # relay this turn's message
 python3 ~/.claude/skills/captain/scripts/captain.py relay <target>... --dry-run     # what it would send, sending nothing
 python3 ~/.claude/skills/captain/scripts/captain.py relay --retry <action>          # send a held relay unchanged
 python3 ~/.claude/skills/captain/scripts/captain.py relay <target> --item <item> --revision <N> --verdict correction|no-correction|decision [--entry <id>]
@@ -126,7 +126,8 @@ pins each target's session once, so one replaced in its terminal while the relay
 - **Closing** a terminal, space or session is the human's: you may report a session done, but never close one, type
   `/exit`, kill a process or terminal, or ask a target to close itself. `cancel` closes a ledger item only: it
   neither reaches a session nor withdraws an instruction one accepted. That takes a new relay of the human's words,
-  refused while the accepted relay's item is open, so `cancel` that first; a busy target gets the new relay held until
+  refused while the accepted relay's item is open, so `cancel` that first, or relay with `--force` on the human's
+  word, which cancels what is still open to each target once every other check passed; a busy target gets the new relay held until
   it is idle or done with its input line shown, so work in progress is stopped only by the human in that session.
   A relayed instruction that ends a target's own work, such as removing its worktree, is the target's to do under its
   own rules.
