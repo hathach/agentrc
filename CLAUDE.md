@@ -19,7 +19,9 @@ User-wide rules are in `instructions/user.md`; edit them there, and keep
   configuration, backward compatibility, tests and docs kept in step, the
   repository's own conventions`.
 - `pr-babysit` args for this repo:
-  `{"pr": <num>, "reviewers": ["coderabbit", "copilot", "greptile"], "autoRun": ["coderabbit"], "coderabbitTrigger": true, "greptileTrigger": true}`;
+  `{"pr": <num>, "reviewers": ["coderabbit", "copilot"], "autoRun": ["coderabbit"], "coderabbitTrigger": true}`;
+  Greptile is left out until 2026-12-01 (review credits used up); then add
+  `"greptile"` back to `reviewers` and `"greptileTrigger": true`.
   Greptile auto-reviews on `open` events (`.greptile/config.json`); request
   another review with `@greptileai`, which `greptileTrigger` posts once per
   pushed head Greptile has not reviewed.
