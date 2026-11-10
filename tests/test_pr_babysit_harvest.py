@@ -4,6 +4,8 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -14,7 +16,7 @@ from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'pr-babysit' / 'scripts' / 'harvest.py'
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import guard_survivors, run_gh_as  # noqa: E402
+from helpers import git_env, guard_survivors, run_gh_as  # noqa: E402
 spec = importlib.util.spec_from_file_location('pr_babysit_harvest', SCRIPT)
 harvest = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(harvest)
@@ -638,6 +640,12 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(got['comments'][0]['body'], 'fix this')
         self.assertRegex(got['fingerprint'], r'^coderabbit,copilot\|coderabbit\|[0-9a-f]{32}$')
         self.assertEqual(self.harvest(self.answers([HEAD]))[1]['fingerprint'], got['fingerprint'], 'a second read of the same evidence')
+        self.assertEqual(got['carry'], [], 'no --carry, nothing carried')
+        entry = {'commentId': 40, 'digest': harvest.digest('fix this'), 'judgedSha': HEAD, 'paths': ['a.c']}
+        code, carried = self.harvest(self.answers([HEAD]), '--pr', '7', '--reviewers', 'coderabbit,copilot', '--auto-run', 'coderabbit',
+                                     '--carry', json.dumps([entry]))
+        self.assertEqual((code, [(c['commentId'], c['eligible']) for c in carried['carry']]), (0, [(40, False)]),
+                         'this checkout is not at the fixture head')
 
     def test_a_probe_is_the_same_reading_without_comments(self):
         """#359: a quota wait compares a probe's fingerprint and bots with its last full harvest."""
@@ -838,6 +846,116 @@ class EndToEnd(unittest.TestCase):
                      ['--pr', '7', '--reviewers', 'copilot', '--auto-run', 'copilot'], ['--pr', '7', '--reviewers', 'codex']):
             code, got = self.harvest({}, *argv)
             self.assertEqual(code, 2, argv)
+
+
+class Carry(unittest.TestCase):
+    """#393: --carry says which settled comments keep their findings, from git in a real checkout."""
+
+    def setUp(self):
+        self.repo = Path(tempfile.mkdtemp(prefix='harvest-carry-'))
+        self.addCleanup(subprocess.run, ['rm', '-rf', str(self.repo)])
+        env = mock.patch.dict(os.environ, git_env(), clear=True)
+        env.start()
+        self.addCleanup(env.stop)
+        cwd = os.getcwd()
+        os.chdir(self.repo)
+        self.addCleanup(os.chdir, cwd)
+        self.git('init', '-q')
+        self.write({'a.c': 'a\n', 'b.c': 'b\n', 'x/c.h': 'c\n'})
+        self.judged = self.commit('judged')
+
+    def git(self, *argv):
+        return subprocess.run(['git', *argv], check=True, capture_output=True, text=True).stdout.strip()
+
+    def write(self, files):
+        for name, text in files.items():
+            (self.repo / name).parent.mkdir(parents=True, exist_ok=True)
+            (self.repo / name).write_text(text)
+
+    def commit(self, message):
+        self.git('add', '-A')
+        self.git('commit', '-q', '--allow-empty', '-m', message)
+        return self.git('rev-parse', 'HEAD')
+
+    def comment(self, id_=1, body='fix this', **over):
+        return {'commentId': id_, 'source': 'coderabbit', 'digest': harvest.digest(body), **over}
+
+    def entry(self, paths, id_=1, body='fix this', judged=None):
+        return {'commentId': id_, 'digest': harvest.digest(body), 'judgedSha': judged or self.judged, 'paths': paths}
+
+    def one(self, paths, comments=None, judged=None, head=None):
+        head = head or self.git('rev-parse', 'HEAD')
+        [got] = harvest.carried([self.entry(paths, judged=judged)], comments or [self.comment()], head)
+        return got
+
+    def test_a_comment_whose_paths_did_not_change_is_carried_with_its_current_identity(self):
+        self.write({'b.c': 'b2\n'})
+        self.commit('elsewhere')
+        got = self.one(['a.c', 'x/c.h'], [self.comment(aliases=['old'])])
+        self.assertEqual(got, {'commentId': 1, 'eligible': True, 'reason': f'unchanged since {self.judged[:8]}',
+                               'commentDigest': harvest.digest('fix this'), 'commentAliases': ['old'], 'source': 'coderabbit'})
+
+    def test_a_changed_deleted_or_renamed_dependency_is_judged_again(self):
+        for change in ({'a.c': 'a2\n'}, None, 'rename'):
+            with self.subTest(change):
+                self.git('reset', '-q', '--hard', self.judged)
+                if change == 'rename':
+                    self.git('mv', 'a.c', 'z.c')
+                elif change is None:
+                    self.git('rm', '-q', 'a.c')
+                else:
+                    self.write(change)
+                self.commit('change')
+                got = self.one(['a.c'])
+                self.assertFalse(got['eligible'])
+                self.assertEqual(got['reason'], f'changed since {self.judged[:8]}: a.c')
+                self.assertNotIn('commentDigest', got)
+
+    def test_uncommitted_or_untracked_content_on_a_path_is_judged_again(self):
+        self.write({'a.c': 'dirty\n'})
+        self.assertEqual(self.one(['a.c'])['reason'], 'uncommitted changes: a.c')
+        self.git('checkout', '--', 'a.c')
+        self.write({'x/new.h': 'n\n'})
+        self.assertEqual(self.one(['x/new.h'])['reason'], 'uncommitted changes: x/new.h')
+        self.assertTrue(self.one(['a.c'])['eligible'], 'dirt elsewhere does not touch these paths')
+
+    def test_paths_are_literal_never_pathspec_magic(self):
+        self.write({'a.c': 'a2\n'})
+        self.commit('a.c changed')
+        self.assertTrue(self.one(['*.c'])['eligible'], 'a glob would have matched a.c')
+        self.assertFalse(self.one([':(glob)*.c', 'a.c'])['eligible'])
+
+    def test_a_missing_commit_or_a_path_outside_the_repository_is_never_carried(self):
+        self.commit('later')
+        got = self.one(['a.c'], judged='f' * 40)
+        self.assertRegex(got['reason'], r'^git cannot compare ffffffff with the head: ')
+        for bad in ('/etc/passwd', '../a.c', 'x/../../a.c', '', 'a\\b'):
+            with self.subTest(bad):
+                self.assertEqual(self.one([bad])['reason'], f'not repository-relative: {[bad]}')
+
+    def test_unbounded_paths_carry_only_on_the_judged_head_with_a_clean_tree(self):
+        self.assertTrue(self.one(None)['eligible'])
+        self.assertTrue(self.one([])['eligible'])
+        self.write({'b.c': 'dirty\n'})
+        self.assertEqual(self.one(None)['reason'], 'uncommitted changes: b.c')
+        self.commit('next')
+        self.assertEqual(self.one(None)['reason'], 'its verdicts name no bounded dependencies, and were judged on another head')
+
+    def test_an_edited_or_missing_comment_or_a_checkout_off_the_head_is_judged_again(self):
+        self.assertEqual(self.one(['a.c'], [self.comment(body='edited')])['reason'], 'its body changed')
+        self.assertTrue(self.one(['a.c'], [self.comment(body='edited', aliases=[harvest.digest('fix this')])])['eligible'])
+        self.assertEqual(self.one(['a.c'], [self.comment(id_=2)])['reason'], 'not in this harvest')
+        self.assertEqual(self.one(['a.c'], head='e' * 40)['reason'], f'the checkout is at {self.judged}, not the head')
+
+    def test_a_malformed_carry_list_is_unusable(self):
+        good = self.entry(['a.c'])
+        for text in ('nope', '{}', json.dumps([{**good, 'extra': 1}]), json.dumps([{**good, 'judgedSha': 'abc'}]),
+                     json.dumps([{**good, 'commentId': True}]), json.dumps([{**good, 'paths': 'a.c'}]), json.dumps([good, good])):
+            with self.subTest(text), self.assertRaises(harvest.Unusable):
+                harvest.carry_entries(text)
+        self.assertEqual(harvest.carry_entries(json.dumps([good])), [good])
+        with self.assertRaises(harvest.Unusable):
+            harvest.collect(['--pr', '7', '--reviewers', 'coderabbit', '--probe', '--carry', '[]'])
 
 
 if __name__ == '__main__':

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Where each requested review bot stands on a PR's head, and every comment its reviewers left.
 
-  harvest.py --pr N --reviewers copilot,coderabbit,greptile,code-scanning --auto-run coderabbit,greptile [--repo OWNER/REPO] [--probe]
+  harvest.py --pr N --reviewers copilot,coderabbit,greptile,code-scanning --auto-run coderabbit,greptile [--repo OWNER/REPO] [--probe | --carry JSON]
 
 --auto-run names the bots settled from their artifacts, only coderabbit and greptile. Copilot is read
 from its newest submitted review on the head; any other reviewer is `harvested`, its state not read.
@@ -37,6 +37,14 @@ with its walkthrough marker (CR_WALKTHROUGH), the auto-generated summary,
 and its url shows it (`gh api repos/<repo>/issues/comments/<commentId>` for the walkthrough). Exit 2 with {"error": ...} when gh cannot answer the PR, the
 head, or a comment endpoint, plus facts.py's rateLimit when GitHub refused gh for a rate limit.
 
+--carry takes a JSON list of {commentId, digest, judgedSha, paths}: comments whose findings were all settled at
+judgedSha, paths the repository-relative files their verdicts rest on (null or [] when unbounded). The full output then
+has carry: one record per entry, {commentId, eligible, reason}, plus the comment's current commentDigest,
+commentAliases (when it has some) and source when eligible. An entry is eligible only when its comment is in this
+harvest with that digest (or an alias of it), the checkout's HEAD is the head, and git shows its paths unchanged, committed
+or not, since judgedSha; unbounded paths only on judgedSha the head, with a clean tree. Paths are literal pathspecs.
+Any git failure, missing commit or path outside the repository makes it ineligible, never eligible.
+
 --probe prints only headSha, observedAt, headEventAt, headEventEvidence, bots and fingerprint, sealed (facts.sealed): what a workflow waiting out
 CodeRabbit's rate limit compares with its last full harvest (#359).
 """
@@ -45,6 +53,7 @@ import base64
 import functools
 import hashlib
 import json
+import os
 import re
 import sys
 import time
@@ -58,7 +67,7 @@ except ImportError:
     yaml = None
 
 sys.path.insert(0, str(Path(__file__).parent))
-from facts import FULL_SHA, Parser, RateLimited, Unusable, bind_repo, report, run  # noqa: E402
+from facts import FULL_SHA, Parser, RateLimited, Unusable, attempt, bind_repo, report, run  # noqa: E402
 
 PROBE = ('headSha', 'observedAt', 'headEventAt', 'headEventEvidence', 'bots', 'fingerprint')
 # reply.py checks a comment against the same digest, so both skills share one definition.
@@ -558,6 +567,71 @@ def observe(repo, n, reviewers, auto):
             'fingerprint': fingerprint(reviewers, auto, harvested, reviews, statuses, checks)}
 
 
+CARRY_KEYS = {'commentId', 'digest', 'judgedSha', 'paths'}
+
+
+def carry_entries(text):
+    """--carry's list, or Unusable: the workflow built it, so a malformed one is no entry to judge."""
+    try:
+        entries = json.loads(text)
+    except ValueError as e:
+        raise Unusable(f'--carry is not JSON: {e}')
+    shaped = isinstance(entries, list) and all(
+        isinstance(e, dict) and set(e) == CARRY_KEYS and type(e['commentId']) is int and isinstance(e['digest'], str) and
+        isinstance(e['judgedSha'], str) and FULL_SHA.match(e['judgedSha']) and
+        (e['paths'] is None or isinstance(e['paths'], list) and all(isinstance(x, str) for x in e['paths'])) for e in entries)
+    if not shaped:
+        raise Unusable('--carry must be a JSON list of {commentId, digest, judgedSha (full SHA), paths (list of strings or null)}')
+    if len({e['commentId'] for e in entries}) != len(entries):
+        raise Unusable('--carry names a comment twice')
+    return entries
+
+
+def git_reading(*argv):
+    """(status, stdout, stderr) of git with every pathspec literal."""
+    return attempt('git', *argv, env={**os.environ, 'GIT_LITERAL_PATHSPECS': '1'})
+
+
+def unchanged_since(judged, paths, head):
+    """None when the checkout holds what was judged at `judged` for these paths, else why not."""
+    if not paths and judged != head:
+        return 'its verdicts name no bounded dependencies, and were judged on another head'
+    bad = [x for x in paths or [] if not x or x.startswith('/') or '\\' in x or '..' in x.split('/')]
+    if bad:
+        return f'not repository-relative: {bad}'
+    spec = ['--', *paths] if paths else []
+    code, out, err = git_reading('status', '--porcelain=v1', '--untracked-files=all', *spec)
+    if code != 0:
+        return f'git status failed: {err.strip()}'
+    if out.strip():
+        return f'uncommitted changes: {" ".join(sorted(line[3:] for line in out.splitlines()))}'
+    if judged == head:
+        return None
+    code, out, err = git_reading('diff', '--name-only', '--no-renames', '--no-ext-diff', judged, head, *spec)
+    if code != 0:
+        return f'git cannot compare {judged[:8]} with the head: {err.strip()}'
+    return f'changed since {judged[:8]}: {" ".join(out.split())}' if out.strip() else None
+
+
+def carried(entries, harvested, head):
+    """One record per --carry entry: whether its comment keeps its settled findings."""
+    if not entries:
+        return []
+    by_id = {c['commentId']: c for c in harvested}
+    code, out, _ = git_reading('rev-parse', 'HEAD')
+    at = out.strip() if code == 0 else None
+    got = []
+    for e in entries:
+        c = by_id.get(e['commentId'])
+        why = ('not in this harvest' if c is None
+               else 'its body changed' if e['digest'] not in (c['digest'], *c.get('aliases', ()))
+               else f'the checkout is at {at or "an unreadable HEAD"}, not the head' if at != head
+               else unchanged_since(e['judgedSha'], e['paths'], head))
+        fresh = {'commentDigest': c['digest'], **({'commentAliases': c['aliases']} if c.get('aliases') else {}), 'source': c['source']} if why is None else {}
+        got.append({'commentId': e['commentId'], 'eligible': why is None, 'reason': why or f"unchanged since {e['judgedSha'][:8]}", **fresh})
+    return got
+
+
 def collect(argv):
     p = Parser(prog='harvest.py', add_help=False)
     p.add_argument('--pr', type=int, required=True)
@@ -565,7 +639,11 @@ def collect(argv):
     p.add_argument('--auto-run', default='')
     p.add_argument('--repo')
     p.add_argument('--probe', action='store_true')
+    p.add_argument('--carry')
     a = p.parse_args(argv)
+    if a.probe and a.carry is not None:
+        raise Unusable('--probe reads no comments, so it takes no --carry')
+    entries = carry_entries(a.carry) if a.carry is not None else []
     reviewers = [r for r in a.reviewers.split(',') if r]
     auto = [r for r in a.auto_run.split(',') if r]
     unknown = [r for r in reviewers if r not in KNOWN] + [r for r in auto if r not in SETTLED]
@@ -577,7 +655,7 @@ def collect(argv):
             seen = observe(repo, a.pr, reviewers, auto)
             again = gh_json('pr', 'view', str(a.pr), '-R', repo, '--json', 'headRefOid')['headRefOid']
             if again == seen['headSha']:
-                return {k: seen[k] for k in PROBE} if a.probe else seen
+                return {k: seen[k] for k in PROBE} if a.probe else {**seen, 'carry': carried(entries, seen['comments'], seen['headSha'])}
     except (KeyError, TypeError, AttributeError, IndexError, ValueError) as e:
         raise Unusable(f'gh answered in a shape harvest.py does not read ({e!r})')
     raise Unusable(f'the head moved during two reads in a row (now {again}); harvest again once it settles')
