@@ -920,9 +920,30 @@ class ChiefRun(unittest.TestCase):
         r = self.run_it(AGENTRC_CHIEF_RUNS=str(self.task / 'runs.jsonl'))   # under a file: never writable
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn('chief_run: warning: run ledger start not written', r.stderr, 'no progress log yet at the start')
-        self.assertTrue(any(t.startswith('launcher: warning: run ledger end not written') for t in self.texts()), self.texts())
+        self.assertIn('chief_run: warning: run ledger end not written', r.stderr, 'nothing follows the exit line')
         self.assertTrue(self.texts()[-1].startswith('launcher: exit 0 (result ok)'), self.texts())
         self.assertEqual(json.loads((self.out / 'run.json').read_text(encoding='utf-8'))['exit'], 0, 'run.json is written on its own')
+
+    def test_an_exit_line_it_cannot_write_is_accounted_as_the_launcher_failing(self):
+        self.stream(init(), result())
+        failing = (f'import sys; sys.path.insert(0, {str(SCRIPT.parent)!r}); import chief_run\n'
+                   'line = chief_run.Progress.line\n'
+                   'def broken(self, text):\n    if text.startswith("launcher: exit"): raise OSError("disk full")\n    line(self, text)\n'
+                   'chief_run.Progress.line = broken\nsys.exit(chief_run.main(sys.argv[1:]))')
+        r = subprocess.run([sys.executable, '-c', failing, *self.argv()[2:]], env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual([(x['type'], x.get('exit'), x.get('reason')) for x in self.ledger()],
+                         [('start', None, None), ('end', 1, 'launcher failed: OSError: disk full')])
+
+    def test_a_ledger_path_it_cannot_resolve_is_a_warning_not_a_failed_launch(self):
+        chief_run = self.module()
+        a = mock.Mock(out=self.out, worktree=self.worktree, task=None)
+        self.out.mkdir()
+        with mock.patch.object(chief_run.run_ledger, 'path', side_effect=RuntimeError('Could not determine home directory.')), \
+                mock.patch('sys.stderr', new_callable=io.StringIO) as err:
+            chief_run.Accounting(a).finish(0, 'result ok')
+        self.assertEqual(err.getvalue().count('run ledger'), 2, err.getvalue())
+        self.assertEqual(json.loads((self.out / 'run.json').read_text(encoding='utf-8'))['exit'], 0)
 
     def test_run_json_it_cannot_write_leaves_the_ledger_written_and_one_end(self):
         chief_run = self.module()

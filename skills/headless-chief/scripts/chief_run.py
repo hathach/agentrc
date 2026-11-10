@@ -126,12 +126,13 @@ class Accounting:
         try:
             run_ledger.append({'v': 1, 'type': kind, **fields})
         except Exception as e:   # noqa: BLE001
-            self.warn(f'run ledger {kind} not written ({run_ledger.path()}): {type(e).__name__}: {e}')
+            self.warn(f'run ledger {kind} not written: {type(e).__name__}: {e}')
 
     def finish(self, code, reason, session=None, spent=None):
+        """Called once the exit line was written: its warnings go to stderr.log, never after the exit line."""
         if self.done:
             return
-        self.done = True
+        self.done, self.progress = True, None
         end = {'at': now(), 'exit': code, 'reason': reason, 'session': session or None,
                'wall': round(time.monotonic() - self.t0, 1), 'cost': spent or unknown('no cost was read')}
         self.rec.update(endedAt=end['at'], **{k: end[k] for k in ('exit', 'reason', 'session', 'wall', 'cost')})
@@ -484,8 +485,8 @@ def detached_launch(a):
         os.dup2(1, 2)
     why = None if a.worktree.is_dir() else f'{a.worktree} is not a directory'
     if why := why or refusal(a.worktree, 'relaunch with a new --out') or lock_held(a.worktree, keep=True, wait=5):
-        a.accounting.finish(2, why)
         Progress(a.out / 'progress.log').line(f'launcher: exit 2 ({why}) · report none')
+        a.accounting.finish(2, why)
         return 2
     return launch(a, task)
 
@@ -517,8 +518,8 @@ def launch(a, task):
                                      env={**child_env(), 'CREDIT_GUARD_TAG': tag}, creationflags=NO_WINDOW)
         except OSError as e:
             err.write(f'chief_run: could not start claude: {e}\n'.encode())
-            a.accounting.finish(127, f'could not start claude: {e}', spent=unknown('claude did not start'))
             progress.line(f'launcher: exit 127 (could not start claude: {e}) · report none')
+            a.accounting.finish(127, f'could not start claude: {e}', spent=unknown('claude did not start'))
             return 127
         unwatch = threading.Event()
         watcher = threading.Thread(target=watch_guard, args=(progress, tag, unwatch), daemon=True)
@@ -584,8 +585,8 @@ def launch(a, task):
     if body.strip():
         report.write_text(body.rstrip('\n') + '\n', encoding='utf-8', newline='\n')   # Markdown: keep its indentation
     field, spend = cost(a.out, sid, report)
-    a.accounting.finish(code, reason, sid, spend)
     progress.line(f'launcher: exit {code} ({reason}) · report {report if body.strip() else "none"} · {field}')
+    a.accounting.finish(code, reason, sid, spend)
     return code
 
 

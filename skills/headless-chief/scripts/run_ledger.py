@@ -74,9 +74,10 @@ def append(record, ledger=None):
 
 
 def read(ledger=None):
-    """The ledger's lines, read under its lock; [] when there is none yet. Busy or OSError when it cannot be read."""
+    """The ledger's lines as bytes, split on newline alone (a JSON string may hold U+2028) and read under its lock;
+    [] when there is none yet. Busy or OSError when it cannot be read. Decoding each is the reader's."""
     ledger = ledger or path()
-    if not ledger.exists():
-        return []
     with locked(ledger):
-        return ledger.read_bytes().decode('utf-8', 'replace').splitlines()
+        if not ledger.exists():
+            return []
+        return [line for line in ledger.read_bytes().split(b'\n') if line]
