@@ -3290,6 +3290,27 @@ class StartTest(RelayCase):
         self.assertIn(f'accept --action {relayed["msg"]}', self.typed[-1][1])
         self.assertTrue(out.splitlines()[-1].endswith('delivered'), out)
 
+    def test_a_task_for_a_busy_session_is_held(self):
+        self.say('start proj and fix the lint errors')
+        self.terminals['t9'] = {**pinned('t9'), 'created': 99, 'cwd': self.root, 'session': 's-new', 'pid': 77,
+                                'started': 5, 'status': 'working'}
+        code, out = self.start(task=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.types()[-1], 'held')
+        self.assertIn('`relay --retry ', out)
+        self.assertNotIn('first task not relayed', out)
+
+    def test_a_task_hc_did_not_type_exits_1_and_needs_a_new_message(self):
+        self.say('start proj and fix the lint errors')
+        self.terminals['t9'] = {**pinned('t9'), 'created': 99, 'cwd': self.root, 'session': 's-new', 'pid': 77,
+                                'started': 5}
+        self.submit_result = ('undelivered', 't9 is working, not idle')
+        code, out = self.start(task=True)
+        self.assertEqual(code, 1)
+        self.assertEqual(self.types()[-1], 'undelivered')
+        self.assertIn('first task not relayed, it was not delivered to t9 and that relay is closed', out)
+        self.assertNotIn('--entry', out)
+
     def test_a_task_never_goes_to_a_session_other_than_the_one_verified(self):
         self.say('start proj and fix the lint errors')
         self.terminals['t9'] = pinned('t9')   # replaced after verify() pinned s-new

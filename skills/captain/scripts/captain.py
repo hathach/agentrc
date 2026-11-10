@@ -756,7 +756,7 @@ def ask(address, mine, force=False):
             at = time.strftime('%H:%M', time.localtime(last['at']))
             return f'{address}: not asked, nothing new since its report {ref} at {at}'
         msg = new_id('m', recs)
-        return deliver('request', msg, captain, target, status_prompt(msg))
+        return deliver('request', msg, captain, target, status_prompt(msg))[1]
 
 
 def item(kind, msg, captain, target, **fields):
@@ -766,16 +766,16 @@ def item(kind, msg, captain, target, **fields):
 
 
 def deliver(kind, msg, captain, target, prompt, **fields):
-    """Record the item, then type its prompt and record how that went: a crash between leaves the item open, never
-    typed unrecorded."""
+    """Record the item, then type its prompt and record how that went, as type_prompt() returns it: a crash between
+    leaves the item open, never typed unrecorded."""
     append(item(kind, msg, captain, target, **fields))
     return type_prompt(msg, target, prompt, captain)
 
 
 def type_prompt(msg, target, prompt, captain):
-    """Type msg's prompt into target, record how that went, and return the line saying so."""
+    """Type msg's prompt into target, record how that went, and return (that outcome, the line saying so)."""
     outcome, err = submit(target['address'], prompt, target['status'], captain['address'])
-    return record_delivery(msg, target['address'], outcome, err)
+    return outcome, record_delivery(msg, target['address'], outcome, err)
 
 
 def record_delivery(msg, address, outcome, err=None):
@@ -1927,7 +1927,8 @@ def relay(targets, entry, mine, decided=None, force=False, pinned=None):
     verdict), makes it the human's verdict on that decision: one target, the session that owns it, and the binding
     written into the relay record itself. force cancels a request or relay still open to a target, once every other
     check passed, as `cancel` would on the human's word. pinned, {address: identity}, is the session each target
-    must still be, as start() verified it, in place of the one found now."""
+    must still be, as start() verified it, in place of the one found now. Returns {address: None when the message is
+    recorded to it, already or now, held, delivered or uncertain; else why not: its refusal, or 'undelivered'}."""
     addresses = list(targets)
     if decided and len(addresses) != 1:
         die('a relay with --item goes to exactly one session, the one that owns the decision', 2)
@@ -1937,8 +1938,10 @@ def relay(targets, entry, mine, decided=None, force=False, pinned=None):
         binding, linked = bind(decided, seen, captain, uid) if decided else ({}, None)
         pinned = pinned or {address: find(address) for address in addresses}
         quote = relay_text(words, addresses)
+        results = {}
         for address in addresses:
             recs = records()
+            results[address] = None
             if any(r['type'] == 'relay' and r['entry'] == uid and r['target']['address'] == address for r in recs):
                 print(f'{address}: refused, this message was relayed to it already', flush=True)
                 continue
@@ -1946,11 +1949,11 @@ def relay(targets, entry, mine, decided=None, force=False, pinned=None):
             stale = open_to(address, recs) if force else []
             if not why and (not pinned[address] or identity(target) != identity(pinned[address])):
                 why = 'its session changed during this relay; relay again'
+            if not why and linked and session_of(linked['owner']) != session_of(target):
+                why = f'the decision {binding["item"]} is not this session\'s'
             if why:
                 print(f'{address}: refused, {why}', flush=True)
-                continue
-            if linked and session_of(linked['owner']) != session_of(target):
-                print(f'{address}: refused, the decision {binding["item"]} is not this session\'s', flush=True)
+                results[address] = why
                 continue
             busy = refusal(target)   # reads the screen, which can fail: before any cancel
             for msg in stale:
@@ -1966,8 +1969,10 @@ def relay(targets, entry, mine, decided=None, force=False, pinned=None):
                       'with its input line shown',
                       flush=True)
                 continue
-            print(deliver('relay', action, captain, target, relay_prompt(action), **fields), flush=True)
-    return 0
+            outcome, line = deliver('relay', action, captain, target, relay_prompt(action), **fields)
+            print(line, flush=True)
+            results[address] = 'undelivered' if outcome == 'undelivered' else None
+    return results
 
 
 def bind(decided, seen, captain, uid):
@@ -2181,8 +2186,8 @@ def start(arg, account, name, space, tab, entry, mine, task=False):
            'failed': f'VERIFICATION FAILED: {why}; the human closes {address}',
            'unchecked': f'VERIFICATION UNCHECKED: {why}; `list` shows whether it is up'}[verification])
     if task and verification == 'verified':
-        relay({address: address}, uid, mine, pinned={address: session})
-        return first_task(msg, address, uid, session)
+        why = relay({address: address}, uid, mine, pinned={address: session})[address]
+        return first_task(msg, address, uid, session, why)
     elif task:
         print(f'{msg}: first task not relayed, the session is not verified' + (
             '' if verification == 'failed' else f'; once `list` shows it running in {root} under {account}, '
@@ -2190,15 +2195,17 @@ def start(arg, account, name, space, tab, entry, mine, task=False):
     return {'failed': 1, 'unchecked': 3}.get(verification, 0)
 
 
-def first_task(msg, address, uid, session):
-    """0 once relay() recorded the start's message to address, delivered or held as its receipt says; else 1, naming
-    why: `--entry` is offered only when an item still open to that session refused it, never when it may be another."""
-    recs = records()
-    if any(r['type'] == 'relay' and r['entry'] == uid and r['target']['address'] == address for r in recs):
+def first_task(msg, address, uid, session, why):
+    """0 when relay() recorded the start's message to address, why None, as its receipt says; else 1, naming why:
+    `--entry` is offered only when an item still open to that session refused it, never when it may be another."""
+    if not why:
         return 0
-    if open_to(address, recs):
+    if why == OPEN:
         print(f'{msg}: first task not relayed, a request or relay to {address} is still open; once it is collected or '
               f'cancelled and `list` still shows {session["session"]} there, `relay {address} --entry {uid}` sends it')
+    elif why == 'undelivered':
+        print(f'{msg}: first task not relayed, it was not delivered to {address} and that relay is closed; a task for '
+              'it needs a new message of theirs')
     else:
         print(f'{msg}: first task not relayed, {address} may no longer be the session verified; the human checks or '
               'closes it, and a task for it needs a new message of theirs')
@@ -2247,7 +2254,7 @@ def retry(action, mine):
                 line = f'{address}: {action} still held, {busy}'
             else:
                 append({'type': 'sending', 'msg': action})
-                line = type_prompt(action, target, relay_prompt(action), captain)
+                line = type_prompt(action, target, relay_prompt(action), captain)[1]
     print(line)
     return 0
 
@@ -2806,7 +2813,8 @@ def main():
                 die('relay names its targets', 2)
             if a.dry_run:
                 return preview(resolve(a.addresses), a.entry, mine)
-            return relay(resolve(a.addresses), a.entry, mine, linked, a.force)
+            relay(resolve(a.addresses), a.entry, mine, linked, a.force)
+            return 0
         if a.cmd == 'verdict':
             return verdict(decided(a), a.entry, mine)
         if a.cmd == 'start':
