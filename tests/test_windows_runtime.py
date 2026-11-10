@@ -1,4 +1,5 @@
-"""Tests for lib/windows.py: the PATH-only program lookup, Git Bash, the bounded tree kill, the retry and the replace.
+"""Tests for lib/windows.py: the PATH-only program lookup, Git Bash, the bounded tree kill, liveness, the retry and
+the replace.
 The Windows branches run here with os.name and the system calls stood in for; the real ones run on Windows CI."""
 import os
 import subprocess
@@ -98,6 +99,49 @@ class VolumeMountTest(unittest.TestCase):
     def test_elsewhere_nothing_mounts_one(self):
         with mock.patch.object(windows.os, 'name', 'posix'):
             self.assertIsNone(windows.volume_mount('\\\\?\\Volume{1}\\'))
+
+
+class AliveTest(unittest.TestCase):
+    """windows.alive with kernel32 stood in for: only Windows naming the process gone reads as gone."""
+    def alive(self, opened, last_error=0, wait=0x102):
+        import ctypes
+        kernel32 = mock.Mock()
+        kernel32.OpenProcess.return_value = 0x44 if opened else None
+        kernel32.WaitForSingleObject.return_value = wait
+        with mock.patch.object(ctypes, 'WinDLL', return_value=kernel32, create=True) as dll, \
+                mock.patch.object(ctypes, 'get_last_error', return_value=last_error, create=True):
+            result = windows.alive(1234)
+        dll.assert_called_once_with('kernel32', use_last_error=True)
+        self.assertEqual(kernel32.OpenProcess.call_args.args, (0x00100000, False, 1234))
+        self.assertEqual(len(kernel32.OpenProcess.argtypes), 3)
+        self.assertIsNotNone(kernel32.WaitForSingleObject.restype)
+        if opened:
+            kernel32.CloseHandle.assert_called_once_with(0x44)
+        return result
+
+    def test_a_running_process_is_alive(self):
+        self.assertTrue(self.alive(True, wait=0x102))   # WAIT_TIMEOUT
+
+    def test_an_exited_process_is_gone(self):
+        self.assertFalse(self.alive(True, wait=0))   # WAIT_OBJECT_0
+
+    def test_no_such_process_is_gone(self):
+        self.assertFalse(self.alive(False, last_error=87))   # ERROR_INVALID_PARAMETER
+
+    def test_what_windows_cannot_tell_stays_alive(self):
+        self.assertTrue(self.alive(False, last_error=5))   # ERROR_ACCESS_DENIED: it exists
+        self.assertTrue(self.alive(False, last_error=8))   # ERROR_NOT_ENOUGH_MEMORY
+        self.assertTrue(self.alive(True, wait=0xFFFFFFFF))   # WAIT_FAILED
+
+    @unittest.skipUnless(NT, 'native Windows processes')
+    def test_windows_tells_a_running_process_from_an_exited_one(self):
+        proc = subprocess.Popen(SLEEP)
+        self.addCleanup(proc.wait)
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        self.assertTrue(windows.alive(proc.pid))
+        proc.kill()
+        proc.wait()
+        self.assertFalse(windows.alive(proc.pid))
 
 
 class KillTreeTest(unittest.TestCase):

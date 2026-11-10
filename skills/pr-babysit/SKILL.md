@@ -37,7 +37,7 @@ python3 "$S/push.py" --remote origin --branch <b> --sha <sha> --push-url <url> [
 python3 "$S/sonar.py" --pr N [--repo R] --head <sha> --manifest <file> [--receipt <path>]  # mark answered code-scanning comments' SonarCloud issues false positive; a saved --receipt replays
 python3 "$S/coderabbit_trigger.py" --pr N [--repo R] --head <sha> [--request]  # tick CodeRabbit's Trigger review box when it skipped the head for a manual review; --request comments `@coderabbitai review` once its rate limit has reset, on such a skip no tick asked for, or when its review of the head failed
 python3 "$S/greptile_trigger.py" --pr N [--repo R] --head <sha>  # comment `@greptileai` once per head, recorded under the git common dir
-python3 "$S/build.py" --path 'src/a.c' --command 'make -C <BUILD>' [--setup L] [--require T]  # build the checkout as it stands
+python3 "$S/build.py" --path 'src/a.c' --command 'make -C <BUILD>' [--setup L] [--require T] [--job DIR --wait-seconds S --timeout-seconds T]  # build the checkout as it stands; --job detached, waited on S seconds a call
 python3 "$S/scope_check.py" --path 'src/a.c' --path 'test/test_a.c'  # which paths a fix writer may edit or create
 python3 "$S/state_transfer.py" <saved output>  # a stateRef's state whole with its digest
 python3 "$S/facts.py" emit-dir                 # a new directory for one launch's AGENTRC_EMIT files; ones unwritten for 14 days go

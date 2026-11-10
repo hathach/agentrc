@@ -666,10 +666,13 @@ const BUILD_PLAN = {
     contract: { type: 'array', items: { type: 'string' } }, reason: { type: 'string' }, error: { type: ['string', 'null'] },
   },
 }
+// build.py --job's line: a finished build's receipt, or { state: running, revision, elapsed } while it still runs.
+const BUILD_DONE = ['snapshot', 'snapshotAfter', 'command', 'setup', 'requires', 'stage', 'buildDir', 'exit', 'log', 'retained']
 const BUILD_RUN = withSeal({
   type: 'object', additionalProperties: false,
-  required: ['revision', 'snapshot', 'snapshotAfter', 'command', 'setup', 'requires', 'stage', 'buildDir', 'exit', 'log', 'retained'],
+  required: ['state', 'revision'],
   properties: {
+    state: { enum: ['running', 'done', 'timedOut', 'abandoned'] }, elapsed: { type: 'integer' },
     revision: { type: 'string' }, snapshot: { type: 'string' }, snapshotAfter: { type: 'string' },
     command: { type: 'string' }, setup: { type: 'string' }, requires: { type: 'array', items: { type: 'string' } },
     stage: { type: 'string' },
@@ -1313,7 +1316,8 @@ const unverifiedStop = (cycles, lane, verdict) => {
   log(`cycle ${cycles}: ${lane}-lane fixes left uncommitted for the caller's review — not pushing unverified changes` +
     (fixes.length ? '' : '; every writer died, so inspect the checkout for any edit they made'))
   const also = withheld.length ? { withheld } : {}
-  return unverifiable ? stop(cycles, 'build-unverifiable', { detail: unverifiable, ...also }) : stop(cycles, 'fix-verification-failed', also)
+  return unverifiable ? stop(cycles, 'build-unverifiable', { detail: unverifiable, ...(unverifiable.startsWith(BUILD_TIMED_OUT) ? { timedOut: true } : {}), ...also })
+    : stop(cycles, 'fix-verification-failed', also)
 }
 // dryRun: the debt was never postable.
 const unresolvedVerdict = (cycles, outstanding, dryRun = false) =>
@@ -1437,6 +1441,11 @@ const contractTouched = (plan, paths) => plan.contract.some(f => paths.has(canon
 const callerPlan = buildCmd && { command: buildCmd, setup: null, requires: [], contract: [], reason: "the caller's build", error: null }
 // The batch is built once, as it settled: a writer's own build ran before later writers' edits. A failure blocks.
 const BUILD_FAILED = 'the build failed'
+const BUILD_TIMED_OUT = 'the build timed out'
+// Each wait stays under the relay's 600000 ms Bash limit; the build itself is stopped past BUILD_LIMIT_MIN.
+const BUILD_POLL_S = 540
+const BUILD_LIMIT_MIN = 180
+const BUILD_POLLS = Math.ceil(BUILD_LIMIT_MIN * 60 / BUILD_POLL_S) + 2
 const buildCheck = async (tag, owned) => {
   let plan = callerPlan
   if (!plan) {
@@ -1460,14 +1469,27 @@ const buildCheck = async (tag, owned) => {
   }
   if (plan.command === null) { log(`build#${tag}: no build applies — ${plan.reason}`); return null }
   // --flag=value throughout: a value such as -DBOARD=x must not read as a flag.
-  const r = await relayRun(
-    `${IN_CHECKOUT}From the checkout's top level, editing nothing, ` +
-    runExactly(`${BUILD_SCRIPT}${owned.map(f => ` --path=${shq(f)}`).join('')} --command=${shq(plan.command)}` +
-      `${plan.setup ? ` --setup=${shq(plan.setup)}` : ''}${plan.requires.map(t => ` --require=${shq(t)}`).join('')}`,
-      ' Run it in the foreground with a Bash timeout of 600000 ms, the tool\'s maximum.'),
-    { label: `build#${tag}`, phase: 'Fix', model: 'haiku', effort: 'low', schema: BUILD_RUN },
-  )
+  const cmd = `${BUILD_SCRIPT}${owned.map(f => ` --path=${shq(f)}`).join('')} --command=${shq(plan.command)}` +
+    `${plan.setup ? ` --setup=${shq(plan.setup)}` : ''}${plan.requires.map(t => ` --require=${shq(t)}`).join('')}`
+  // The build runs detached in a job of this batch and head, so a contract longer than one shell call is waited out
+  // over several bounded ones (#375); each call attaches to the same job, a retried or resumed one included.
+  const job = `${pinned.receipts.trim()}/build-${tag}-${fnv1a(`${expectedHead} ${cmd}`)}`
+  const prompt = `${IN_CHECKOUT}From the checkout's top level, editing nothing, ` +
+    runExactly(`${cmd} --job=${shq(job)} --wait-seconds=${BUILD_POLL_S} --timeout-seconds=${BUILD_LIMIT_MIN * 60}`,
+      ' Run it in the foreground with a Bash timeout of 600000 ms, the tool\'s maximum: it returns within ten minutes, ' +
+      'the build left running for the next call when unfinished.')
+  let r = null
+  for (let n = 0; n < BUILD_POLLS; n++) {
+    r = await relayOnce(prompt, { label: `build#${tag}`, phase: 'Fix', model: 'haiku', effort: 'low', schema: BUILD_RUN })
+    if (!r || r.error || r.state !== 'running') break
+    log(`build#${tag}: still running after ${Math.round(r.elapsed / 60)} min — waiting again`)
+  }
+  if (r && !r.error && r.state === 'timedOut') return `${BUILD_TIMED_OUT} after ${BUILD_LIMIT_MIN} min and was stopped; log ${r.log}`
+  const lacking = r && !r.error && r.state !== 'running' ? BUILD_DONE.filter(k => !(k in r)) : []
   const why = !r ? 'no sealed receipt (the relay died or its line failed its seal)' : r.error ? r.error
+    : r.state === 'running' ? `still running after ${BUILD_POLLS} waits`
+    : r.state !== 'done' ? `the build was ${r.state}`
+    : lacking.length ? `the receipt has no ${lacking.join(', ')}`
     : r.revision !== expectedHead ? `the receipt is for ${String(r.revision).slice(0, 7)}, not ${expectedHead.slice(0, 7)}`
     : r.command !== plan.command.replaceAll('<BUILD>', r.buildDir) ? 'the receipt is for another command'
     : !['setup', 'prerequisite', 'build'].includes(r.stage) ? `the receipt names no step it stopped in (${JSON.stringify(r.stage)})`

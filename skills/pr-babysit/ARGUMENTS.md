@@ -95,7 +95,10 @@ A key not listed here throws before anything runs.
   board family's included, a missing one stopping `build-unverifiable` rather
   than failing the batch; per launch. Only a tool the resolver names is checked
   before the build: one only a build wrapper invokes and the contract never
-  names still fails the build as unverified.
+  names still fails the build as unverified. The build runs detached and is
+  waited on over calls of at most nine minutes each, up to 180 minutes; one
+  past that is stopped, process tree included, and stops `build-unverifiable`
+  with `timedOut: true`, apart from a build that failed.
 - `ciWait`: minutes to wait on pending checks, default 30. CodeRabbit's own
   check is left out when coderabbit is in `autoRun` and the review lane runs:
   the review lane waits on it. A head with no other check registered settles

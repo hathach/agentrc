@@ -208,6 +208,7 @@ async function run(opts = {}) {
   let validatorCalls = 0
   let observed = null // the last validator observedAt, a trigger's default finishing time
   let brokenWriter = false // a writer reported a failed build since the last candidate build
+  let buildWaits = 0 // build.py --job calls answered so far
   const receiptFiles = opts.receiptFiles ?? new Map() // reply.py or sonar.py --receipt path -> the line its first run saved there
   const sonarMarked = new Set() // comments whose SonarCloud issue a sonar.py run marked
   const replied = opts.replied ?? new Set() // comments a reply.py run posted to, which a rerun finds there (rerunReuses)
@@ -597,14 +598,16 @@ async function run(opts = {}) {
       return conforms(options.schema, { command: 'make -C <BUILD> all', setup: null, requires: [], contract: ['AGENTS.md'], reason: 'stub contract', error: null, ...plan }, label)
     }
     if (label.startsWith('build#')) {
-      // build.py's receipt: the build fails when a writer's did; opts.candidate reshapes it, null is a dead agent.
+      // build.py --job's line: running for the first opts.buildRunning waits, then the receipt: the build fails when a
+      // writer's did; opts.candidate reshapes it, null is a dead agent.
+      if (buildWaits++ < (opts.buildRunning ?? 0)) return { state: 'running', revision: head, elapsed: 540 * buildWaits }
       const over = opts.candidate
       const exit = brokenWriter ? 1 : 0
       brokenWriter = false
       if (over === null) return null
       const asked = (flag) => flagValues(prompt, flag)
       return conforms(options.schema, bare({
-        revision: head, snapshot: 'snap', snapshotAfter: 'snap',
+        state: 'done', revision: head, snapshot: 'snap', snapshotAfter: 'snap',
         command: asked('command')[0].replaceAll('<BUILD>', '/tmp/b'), setup: asked('setup')[0] ?? '', requires: asked('require'), stage: 'build',
         buildDir: '/tmp/b', exit,
         log: '/tmp/candidate.log', retained: [],
@@ -1315,20 +1318,42 @@ test('a batch whose build fails is not published', async () => {
   assert.equal(labels.some(l => l.startsWith('push#')), false, 'the publisher is not dispatched')
   assert.ok(labels.includes('check:src/a.c'), 'the issue check runs whatever the writer\'s own build said')
   assert.deepEqual(labels.filter(l => /^build[:#]/.test(l)), ['build:resolve#1-review', 'build#1-review'])
-  assert.match(calls.find(c => c.label === 'build#1-review').prompt, /build\.py --path='src\/a\.c' --command='make -C <BUILD> all'`/)
+  assert.match(calls.find(c => c.label === 'build#1-review').prompt, /build\.py --path='src\/a\.c' --command='make -C <BUILD> all' --job=/)
   assert.match(rowsOf(summaries(logs)[0])[0][3], /unverified: the build failed \(exit 1\); log \/tmp\/cand/)
   assert.equal(labels.some(l => l.startsWith('compat#')), false, 'no compatibility check on a broken batch')
+})
+
+test('a build longer than one relay call is waited out over bounded calls to one job; a timeout is told from a failure (#375)', async () => {
+  const long = await run({ reviews: oneValid, buildRunning: 3 })
+  const polls = long.calls.filter(c => c.label === 'build#1-review')
+  assert.equal(polls.length, 4)
+  assert.equal(new Set(polls.map(c => c.prompt.replace(emitOf(c.prompt), ''))).size, 1, 'every call names the one job')
+  assert.match(polls[0].prompt, / --job='\/tmp\/pr-babysit-receipts-x\/build-1-review-[0-9a-f]{8}' --wait-seconds=540 --timeout-seconds=10800`/)
+  assert.match(polls[0].prompt, /Bash timeout of 600000 ms/)
+  assert.deepEqual(long.logs.filter(l => l.startsWith('build#1-review: still running')).length, 3)
+  assert.equal(long.result.history[0].reviewPush.pass, true)
+  const timedOut = await run({ reviews: oneValid, candidate: { state: 'timedOut', exit: -15 } })
+  assert.deepEqual([timedOut.result.reason, timedOut.result.timedOut], ['build-unverifiable', true])
+  assert.match(timedOut.result.detail, /the build timed out after 180 min and was stopped; log \/tmp\/candidate\.log/)
+  const failed = await run({ reviews: oneValid, candidate: { exit: 2 } })
+  assert.deepEqual([failed.result.reason, failed.result.timedOut], ['fix-verification-failed', undefined])
+  const forever = await run({ reviews: oneValid, buildRunning: 1000 })
+  assert.equal(forever.calls.filter(c => c.label === 'build#1-review').length, 22)
+  assert.deepEqual([forever.result.reason, forever.result.timedOut], ['build-unverifiable', undefined])
+  assert.match(forever.result.detail, /the build did not count: still running after 22 waits/)
+  const abandoned = await run({ reviews: oneValid, candidate: { state: 'abandoned' } })
+  assert.match(abandoned.result.detail, /the build did not count: the build was abandoned/)
 })
 
 test('the batch build is resolved from the contract when the caller named none, and is the caller\'s otherwise', async () => {
   const resolved = await run({ reviews: twoValid })
   const resolve = resolved.calls.find(c => c.label === 'build:resolve#1-review')
   assert.match(resolve.prompt, /for a change to src\/a\.c, src\/b\.c\./)
-  assert.match(resolved.calls.find(c => c.label === 'build#1-review').prompt, /build\.py --path='src\/a\.c' --path='src\/b\.c' --command='make -C <BUILD> all'`/)
+  assert.match(resolved.calls.find(c => c.label === 'build#1-review').prompt, /build\.py --path='src\/a\.c' --path='src\/b\.c' --command='make -C <BUILD> all' --job=/)
   assert.equal(resolved.result.history[0].reviewPush.pass, true)
   const given = await run({ reviews: oneValid, args: { build: "make BOARD='x y' <BUILD>" } })
   assert.equal(given.labels.some(l => l.startsWith('build:resolve#')), false)
-  assert.match(given.calls.find(c => c.label === 'build#1-review').prompt, /--command='make BOARD='\\''x y'\\'' <BUILD>'`/)
+  assert.match(given.calls.find(c => c.label === 'build#1-review').prompt, /--command='make BOARD='\\''x y'\\'' <BUILD>' --job=/)
   assert.equal(given.result.history[0].reviewPush.pass, true, 'the receipt echoes the quoted command back')
 })
 
@@ -1497,7 +1522,7 @@ test('a build receipt counts only as the run that was asked for', async () => {
 test('a contract setup and its tools go to build.py, and a shell that stopped before the build is the environment', async () => {
   const buildPlan = { command: 'idf.py -B <BUILD> build', setup: '. "$IDF_PATH/export.sh"', requires: ['idf.py'] }
   const ok = await run({ reviews: oneValid, buildPlan })
-  assert.match(ok.calls.find(c => c.label === 'build#1-review').prompt, /--command='idf\.py -B <BUILD> build' --setup='\. "\$IDF_PATH\/export\.sh"' --require='idf\.py'`/)
+  assert.match(ok.calls.find(c => c.label === 'build#1-review').prompt, /--command='idf\.py -B <BUILD> build' --setup='\. "\$IDF_PATH\/export\.sh"' --require='idf\.py' --job=/)
   assert.equal(ok.result.history[0].reviewPush.pass, true)
   for (const [candidate, why] of [
     [{ stage: 'prerequisite', exit: 127 }, /the build environment is not set up: its prerequisite step stopped the shell \(exit 127\)/],
@@ -1524,7 +1549,7 @@ test('the resolver is asked for every built family\'s setup and wrapper tools, a
   const resolve = calls.find(c => c.label === 'build:resolve#1-review').prompt
   assert.match(resolve, /several targets or board families, a wrapper script's included, setup and requires hold every one's/)
   assert.match(resolve, /each tool its build invokes, through the wrapper too \(such as idf\.py\)/)
-  assert.match(calls.find(c => c.label === 'build#1-review').prompt, /--setup='\. "\$IDF_PATH\/export\.sh"' --require='python3' --require='riscv-none-elf-gcc' --require='idf\.py'`/)
+  assert.match(calls.find(c => c.label === 'build#1-review').prompt, /--setup='\. "\$IDF_PATH\/export\.sh"' --require='python3' --require='riscv-none-elf-gcc' --require='idf\.py' --job=/)
   assert.equal(result.reason, 'build-unverifiable', 'not fix-verification-failed')
   assert.match(result.detail, /its prerequisite step stopped the shell \(exit 127\)/)
 })
@@ -3710,12 +3735,13 @@ test('a relay a resume meets again never runs its command twice: its line is rel
     try {
       const prefix = first.journal.slice(0, first.journal.findIndex(j => j.label === 'build#1-review'))
       const resumed = await run({ reviews: oneValid, resume: prefix })
-      // The stub is the command: it ran once in all, in the first launch.
-      assert.deepEqual([first.labels, resumed.labels].map(ls => ls.filter(l => l.startsWith('build#')).length), [1, 0], how)
+      // The stub is the command: it ran once in all, in the first launch; a build's retry attaches to its job (#375).
+      assert.deepEqual([first.labels, resumed.labels].map(ls => ls.filter(l => l === 'build#1-review').length), [1, 0], how)
       const reloaded = resumed.logs.includes('build#1-review: the line an earlier attempt of this call wrote, reloaded')
       const unknown = resumed.logs.some(l => l.startsWith('build#1-review: an earlier attempt of this call claimed ') && l.endsWith('its outcome is unknown'))
       assert.deepEqual([reloaded, unknown], how === 'after its line' ? [true, false] : [false, true], how)
-      assert.equal(!!resumed.result.history[0].reviewPush?.pass, how === 'after its line', `${how}: an unknown build publishes nothing`)
+      assert.deepEqual(resumed.labels.filter(l => l.startsWith('build#')), [], how)
+      assert.equal(!!resumed.result.history[0].reviewPush?.pass, true, `${how}: an unknown attempt's build is waited on again`)
     } finally { rmSync(first.emitDir.split('/agentrc-emit/')[0], { recursive: true, force: true }) }
   }
 })

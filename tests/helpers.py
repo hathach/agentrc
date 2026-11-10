@@ -26,6 +26,9 @@ GIT_LOCATION = ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 
 for _name in GIT_LOCATION:
     os.environ.pop(_name, None)
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lib'))
+import windows  # noqa: E402
+
 
 def make_stub(bin_dir, name, source):
     """An executable `name` in bin_dir running the Python `source`, its path: a shebang script, or on Windows,
@@ -59,15 +62,7 @@ def pid_alive(pid):
         except ProcessLookupError:
             return False
         return not exited(pid)    # an orphan left to the survivor guard's subreaper stays a zombie
-    kernel32 = ctypes.WinDLL('kernel32')    # os.kill(pid, 0) would terminate it on Windows
-    kernel32.OpenProcess.restype = ctypes.c_void_p
-    handle = kernel32.OpenProcess(0x00100000, False, pid)   # SYNCHRONIZE
-    if not handle:
-        return False
-    try:
-        return kernel32.WaitForSingleObject(ctypes.c_void_p(handle), 0) == 0x102   # WAIT_TIMEOUT: still running
-    finally:
-        kernel32.CloseHandle(ctypes.c_void_p(handle))
+    return windows.alive(pid)
 
 
 def run_gh_as(stub):

@@ -1,6 +1,6 @@
 """Windows runtime helpers the skills, hooks and statusline share: a program lookup that never takes the working
-directory, Git Bash found that way, a bounded process-tree kill, a file step, os.replace among them, retried
-while another process holds the file open, and the drive that mounts a volume.
+directory, Git Bash found that way, a bounded process-tree kill, process liveness, a file step, os.replace among them,
+retried while another process holds the file open, and the drive that mounts a volume.
 
 A script reaches it through its resolved path, as chief_guard.py reaches shadows.py:
 `sys.path.insert(0, str(Path(__file__).resolve().parents[N] / 'lib'))`, then `import windows`.
@@ -66,6 +66,28 @@ def kill_tree(proc, timeout, total=False):
         return proc.wait(max(0, end - time.monotonic()) if total else timeout)
     except subprocess.TimeoutExpired:
         return None
+
+
+def alive(pid):
+    """Whether Windows still runs pid: False only when Windows names it gone, OpenProcess finding no such process or
+    the process signalled as exited; True when it runs and when Windows cannot say (access denied, a failed wait), so
+    a caller waiting for pid to go keeps waiting. os.kill(pid, 0) would terminate it here."""
+    import ctypes
+    from ctypes import wintypes
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = kernel32.OpenProcess(0x00100000, False, pid)   # SYNCHRONIZE
+    if not handle:
+        return ctypes.get_last_error() != 87   # ERROR_INVALID_PARAMETER: no process has pid
+    try:
+        return kernel32.WaitForSingleObject(handle, 0) != 0   # WAIT_OBJECT_0: it exited
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 def retry(step, tries=50):
