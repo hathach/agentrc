@@ -22,6 +22,10 @@ User-wide rules are in `instructions/user.md`; edit them there, and keep
   `{"pr": <num>, "reviewers": ["coderabbit", "copilot"], "autoRun": ["coderabbit"], "coderabbitTrigger": true}`;
   Greptile is left out until 2026-12-01 (review credits used up); then add
   `"greptile"` back to `reviewers` and `"greptileTrigger": true`.
+  Until then a merge launch here leaves out the `greptileTrigger` chief's
+  merge exception sets, which pr-babysit rejects without greptile in
+  `reviewers`, and the merge also needs the owner's own words accepting it
+  without Greptile (`merge.py --waive greptile`); this note waives nothing.
   Greptile auto-reviews on `open` events (`.greptile/config.json`); request
   another review with `@greptileai`, which `greptileTrigger` posts once per
   pushed head Greptile has not reviewed.
