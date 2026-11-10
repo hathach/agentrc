@@ -160,6 +160,30 @@ class SendTest(StubbedHc):
             self.assertEqual(hc.send('t7', 'x', timeout=5)[0], hc.NOT_TYPED_OUTCOME)
 
 
+class LaunchTest(StubbedHc):
+    def test_outcomes(self):
+        for scenario, outcome in (
+                ({'out': {'address': 't9', 'state': 'live'}}, hc.STARTED),
+                ({'out': {'state': 'live'}}, hc.UNCERTAIN),          # no address to follow
+                ({'out': {'address': ''}}, hc.UNCERTAIN),
+                ({'out': 'garbled'}, hc.UNCERTAIN),
+                ({'rc': 4, 'err': err('name_taken')}, hc.NOT_STARTED_OUTCOME),
+                ({'rc': 2, 'err': err('invalid_params')}, hc.NOT_STARTED_OUTCOME),
+                ({'rc': 1, 'err': err('spawn_failed')}, hc.NOT_STARTED_OUTCOME),
+                ({'rc': 1, 'err': err('unavailable')}, hc.UNCERTAIN),
+                ({'rc': 1}, hc.UNCERTAIN),
+                ({'sleep': 10}, hc.UNCERTAIN)):
+            with self.subTest(scenario):
+                self.answer(**scenario)
+                self.assertEqual(hc.launch('--bg', '--', 'claude', timeout=0.5 if 'sleep' in scenario else 5)[0],
+                                 outcome)
+        self.assertEqual(self.argv()[0], ['run', '--json', '--bg', '--', 'claude'])
+
+    def test_hc_that_cannot_start_starts_nothing(self):
+        with mock.patch.dict('os.environ', {'PATH': str(self.dir)}):
+            self.assertEqual(hc.launch('--bg', timeout=5)[0], hc.NOT_STARTED_OUTCOME)
+
+
 class ReadTest(StubbedHc):
     def test_returns_the_text_as_is(self):
         self.answer(out='❯ \x1b[2mnot json\n')

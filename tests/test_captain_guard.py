@@ -120,13 +120,31 @@ class VerdictTest(unittest.TestCase):
             with self.subTest(cmd):
                 self.assertIsNotNone(self.verdict('Bash', command=cmd))
 
+    def test_start_takes_one_absolute_or_home_path_an_account_and_its_options(self):
+        for cmd in [f'{RUN} start ~/code/tinyusb', f'{RUN} start /home/u/.herdr/worktrees/agentrc/captain ada',
+                    f'{RUN} start ~/code/tinyusb main --name tinyusb-2 --space sp8a64d095 --tab tbd7e2c6',
+                    f'{RUN} start ~/x --space Adafruit_TinyUSB_Arduino --entry f0a4846d-6b04-428a-8e4d-a4fc931e6cff']:
+            with self.subTest(cmd):
+                self.assertIsNone(self.verdict('Bash', command=cmd))
+        for cmd in [f'{RUN} start', f'{RUN} start tinyusb', f'{RUN} start ./tinyusb', f'{RUN} start ~alice/code',
+                    f'{RUN} start ~/code/../.ssh', f'{RUN} start /a/.. ada', f'{RUN} start ~/a ~/b',
+                    f'{RUN} start ~/a work', f'{RUN} start ~/a ada main', f'{RUN} start ~/a --name x --name y',
+                    f'{RUN} start ~/a --name', f'{RUN} start ~/a --name --tab', f'{RUN} start ~/a --name=x',
+                    f'{RUN} start ~/a --cwd /etc', f'{RUN} start ~/a --space a/b', f'{RUN} ask ~/code',
+                    f'{RUN} relay /home/u t2', f'{RUN} start "~/a b"', f'{RUN} start ~/a; hc kill t2']:
+            with self.subTest(cmd):
+                self.assertIsNotNone(self.verdict('Bash', command=cmd))
+        self.assertIsNotNone(self.verdict('Monitor', command=f'{RUN} start ~/code/tinyusb', timeout_ms=1000))
+
     def test_the_skill_s_documented_commands_pass(self):
         """The captain runs what SKILL.md shows; a recipe the guard denies would strand it."""
         text = (Path(__file__).resolve().parents[1] / 'skills' / 'captain' / 'SKILL.md').read_text(encoding='utf-8')
         sample = {'<msg>...': 'm-1', '<msg>': 'm-1', '<ms>': '1740000', 'MS': '1740000',
                   '<id>': 'f0a4846d-6b04-428a-8e4d-a4fc931e6cff', '<action>': 'a-1',
                   '<target>...': 't2', '<run>': 'pr-12', '<item>': 'd-0123456789abcdef', '<N>': '2',
-                  'correction|no-correction|decision': 'correction', '<target>': 't2'}
+                  'correction|no-correction|decision': 'correction', '<target>': 't2',
+                  '<checkout>': '~/code/tinyusb', 'main|ada': 'ada', '<space>': 'sp8a64d095', '<tab>': 'tbd7e2c6',
+                  '<name>': 'tinyusb-2'}
         found = re.findall(r'(python3 ~/\.claude/skills/captain/scripts/captain\.py [^`#\n]*)', text)
         self.assertGreaterEqual(len(found), 10)
         for cmd in found:

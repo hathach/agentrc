@@ -3164,5 +3164,262 @@ class QueueTest(VerdictCase):
         self.assertIn(captain.UNCOVERED, lines[-1])
 
 
+
+class StartTest(RelayCase):
+    """`start` against a real git checkout, with hc, herdr-app, PATH and pinning replaced."""
+
+    def setUp(self):
+        super().setUp()
+        repo = self.state / 'anywhere' / 'proj'
+        repo.mkdir(parents=True)
+        subprocess.run(['git', 'init', '-q', str(repo)], check=True)
+        self.root = os.path.realpath(repo)
+        self.spaces = [{'id': 'spA', 'name': 'proj', 'folder': self.root, 'machine': None, 'tabs': [{'id': 'tbA'}]},
+                       {'id': 'spB', 'name': 'other', 'folder': '/elsewhere', 'machine': None, 'tabs': []}]
+        self.hc_calls = []
+        self.run_answer = ran(0, {'address': 't9', 'created_ms': 99})
+        self.wait_answer = ran(0, {'ended': True, 'reason': 'status'})
+        self.gets = {'t9': self.terminal()}
+        self.pinned_account = 'main'
+        for target, attr, value in [
+            (captain.hc, 'run', self._hc),
+            (captain, 'get', lambda address: self.gets.get(address)),
+            (captain, 'herdr_spaces', lambda: self.spaces),
+            (captain, 'pin', self._pin),
+            (captain.shutil, 'which', lambda p: f'/bin/{p}'),
+        ]:
+            patcher = mock.patch.object(target, attr, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def terminal(self, app='claude-code', state='live', cwd=None):
+        return terminal('t9', app, state=state, created_ms=99,
+                        foreground={'argv': ['claude'], 'cwd': cwd or self.root, 'name': 'claude', 'pid': 77})
+
+    def _hc(self, *args, timeout):
+        self.hc_calls.append(args)
+        with captain.locked(wait_s=0):   # Busy if start still held the ledger lock
+            pass
+        return self.run_answer if args[0] == 'run' else self.wait_answer
+
+    def _pin(self, session):
+        session.update(pid=77, started=5, account=self.pinned_account, session='s-new')
+        return session
+
+    def start(self, arg=None, account='main', name=None, space=None, tab=None, entry=None):
+        with mock.patch('builtins.print') as out:
+            code = captain.start(arg or self.root, account, name, space, tab, entry, self.ident)
+        return code, '\n'.join(str(c.args[0]) for c in out.call_args_list)
+
+    def start_refusal(self, arg=None, account='main', **opts):
+        """(exit code, stderr) of a start that stops."""
+        with self.assertRaises(SystemExit) as stop, mock.patch('builtins.print') as out:
+            captain.start(arg or self.root, account, opts.get('name'), opts.get('space'), opts.get('tab'),
+                          opts.get('entry'), self.ident)
+        return stop.exception.code, '\n'.join(c.args[0] for c in out.call_args_list if c.kwargs.get('file'))
+
+    def launched(self):
+        return [c for c in self.hc_calls if c[0] == 'run']
+
+    def types(self):
+        return [r['type'] for r in captain.records()]
+
+    def test_main_runs_claude_with_its_config_dir_unset_in_a_new_tab_of_the_checkout_s_space(self):
+        self.say('start proj')
+        code, out = self.start()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.launched(), [('run', '--json', '--bg', '--keep', '--no-parent', '--name', 'proj-main',
+                                            '--cwd', self.root, '--label', 'herdr.space=spA', '--',
+                                            '/bin/env', '-u', 'CLAUDE_CONFIG_DIR', '/bin/claude')])
+        self.assertEqual(self.types(), ['start', 'started'])
+        start, started = captain.records()
+        self.assertEqual((start['entry'], start['quote'], start['dir'], start['account']),
+                         ('u-1', 'start proj', self.root, 'main'))
+        self.assertEqual((started['address'], started['verification'], started['session']['session']),
+                         ('t9', 'verified', 's-new'))
+        self.assertIn('a new tab', out)
+        self.assertIn('verified', out)
+
+    def test_ada_runs_its_wrapper(self):
+        self.say('start proj on ada')
+        self.pinned_account = 'ada'
+        self.assertEqual(self.start(account='ada')[0], 0)
+        run = self.launched()[0]
+        self.assertEqual(run[run.index('--') + 1:], ('/bin/claude-ada',))
+        self.assertEqual(run[run.index('--name') + 1], 'proj-ada')
+
+    def test_a_space_by_exact_id_or_name_and_a_tab_of_it(self):
+        self.say('start proj')
+        self.assertEqual(self.start(space='other', name='p1')[0], 0)
+        self.assertIn('herdr.space=spB', self.launched()[-1])
+        self.say('start proj there')
+        self.assertEqual(self.start(space='spA', tab='tbA', name='p2', entry='u-2')[0], 0)
+        run = self.launched()[-1]
+        self.assertEqual(run[run.index('--label'):run.index('--')],
+                         ('--label', 'herdr.space=spA', '--label', 'herdr.tab=tbA'))
+
+    def test_anywhere_is_a_checkout_but_only_its_top_level(self):
+        self.say('start it')
+        sub = Path(self.root) / 'src'
+        sub.mkdir()
+        plain = self.state / 'plain'
+        plain.mkdir()
+        for arg, why in [('proj', 'absolute or ~/'), ('./proj', 'absolute or ~/'), ('~alice/proj', 'absolute or ~/'),
+                         (str(self.state / 'missing'), 'no such directory'), (str(sub), 'not its top level'),
+                         (str(plain), 'not a git checkout')]:
+            with self.subTest(arg):
+                code, err = self.start_refusal(arg)
+                self.assertEqual(code, 2)
+                self.assertIn(why, err)
+        self.assertEqual((self.launched(), self.types()), ([], []))
+
+    def test_git_that_hangs_or_is_missing_starts_nothing(self):
+        self.say('start proj')
+        for error in (subprocess.TimeoutExpired(['git'], 1), FileNotFoundError('git')):
+            with self.subTest(error), mock.patch.object(captain.captain_read, 'plain', side_effect=error):
+                code, err = self.start_refusal()
+                self.assertEqual(code, 2)
+                self.assertIn('git could not be asked', err)
+                self.assertIn('nothing started', err)
+        self.assertEqual((self.launched(), self.types()), ([], []))
+
+    def test_an_empty_tab_is_a_new_tab_and_leaves_the_ledger_readable(self):
+        self.say('start proj')
+        code, out = self.start(tab='')
+        self.assertEqual(code, 0)
+        self.assertNotIn('herdr.tab', ' '.join(self.launched()[0]))
+        self.assertEqual(self.types(), ['start', 'started'])
+        self.assertIsNone(captain.records()[0]['tab'])
+        self.assertIn('a new tab', out)
+
+    def test_every_refusal_before_hc_runs_records_nothing(self):
+        self.say('start proj')
+        self.spaces.append({'id': 'spC', 'name': 'other', 'folder': '/x', 'machine': None, 'tabs': []})
+        self.spaces.append({'id': 'spR', 'name': 'remote', 'folder': self.root, 'machine': 'ci', 'tabs': []})
+        self.gets['taken'] = {'address': 't5', 'state': 'live'}
+        self.gets['done'] = {'address': 't6', 'state': 'finished'}
+        for opts, why in [({'account': 'work'}, 'not an account'),
+                          ({'space': 'other'}, 'matches'), ({'space': 'nope'}, 'matches none'),
+                          ({'space': 'remote'}, 'only local sessions'), ({'tab': 'tbX'}, 'not in space'),
+                          ({'name': 'Proj'}, 'hc names are'), ({'name': 'x' * 33}, 'hc names are'),
+                          ({'name': '-p'}, 'hc names are'), ({'name': 't5'}, 'hc names are'),
+                          ({'name': 'taken'}, 'the live terminal t5')]:
+            with self.subTest(opts):
+                code, err = self.start_refusal(**opts)
+                self.assertEqual(code, 2)
+                self.assertIn(why, err)
+        self.assertEqual((self.launched(), self.types()), ([], []))
+        self.assertEqual(self.start(name='done')[0], 0)   # a finished terminal holds no name
+        self.say('start proj as a dotted name')
+        self.assertEqual(self.start(name='proj.v2', entry=f'u-{self.entries}')[0], 0)
+
+    def test_no_space_holds_the_checkout_or_a_program_is_missing(self):
+        self.say('start proj')
+        for folder in ('/elsewhere', '.', '', None, 123, os.path.relpath(self.root)):   # relative to our cwd: never it
+            with self.subTest(folder=folder):
+                self.spaces[0]['folder'] = folder
+                self.assertIn('a space whose folder is', self.start_refusal()[1])
+        self.spaces[0]['folder'] = self.root
+        with mock.patch.object(captain.shutil, 'which', lambda p: None if p == 'claude-ada' else f'/bin/{p}'):
+            self.assertIn('claude-ada is not on PATH', self.start_refusal(account='ada')[1])
+        self.assertEqual(self.launched(), [])
+
+    def test_only_on_a_message_from_the_human_this_turn(self):
+        code, err = self.start_refusal()
+        self.assertEqual(code, 3)
+        self.assertIn('no message from the human', err)
+        self.say('start proj')
+        self.queue('and tinyusb')
+        self.assertIn('more than one message', self.start_refusal()[1])
+        self.assertEqual((self.launched(), self.types()), ([], []))
+
+    def test_one_message_starts_a_checkout_under_an_account_once(self):
+        self.say('start proj on main and on ada')
+        self.assertEqual(self.start(name='a')[0], 0)
+        code, err = self.start_refusal(name='b', space='other')
+        self.assertEqual(code, 2)
+        self.assertIn('already started', err)
+        self.pinned_account = 'ada'
+        self.assertEqual(self.start(account='ada')[0], 0)
+        self.assertEqual(len(self.launched()), 2)
+
+    def test_an_interrupted_start_is_never_retried(self):
+        self.say('start proj')
+        captain.append({'type': 'start', 'msg': 's-1', 'captain': captain.enrolled(), 'entry': 'u-1', 'quote': 'x',
+                        'dir': self.root, 'account': 'main', 'name': 'proj-main', 'space': 'spA', 'tab': None})
+        self.assertIn('s-1: this message already started', self.start_refusal()[1])
+        self.assertEqual(self.launched(), [])
+
+    def test_hc_refusing_records_a_failure_and_no_answer_an_uncertain_start(self):
+        self.say('start proj')
+        self.run_answer = ran(4, None, 'name_taken', 'proj-main is taken')
+        code, err = self.start_refusal()
+        self.assertEqual((code, self.types()[-1]), (1, 'start-failed'))
+        self.assertIn('nothing started', err)
+        self.say('start proj once hc runs')
+        self.run_answer = ran(None, None, 'spawn_failed', 'hc run did not start: no hc')   # lib/hc.py's own tuple
+        self.assertEqual((self.start_refusal(entry=f'u-{self.entries}')[0], self.types()[-1]), (1, 'start-failed'))
+        for answer in (ran(None, None, 'timeout', 'late'), ran(0, {'started': True}), ran(1, None, None, 'x')):
+            with self.subTest(answer):
+                self.say('start proj again')
+                self.run_answer = answer
+                code, err = self.start_refusal(entry=f'u-{self.entries}')
+                self.assertEqual((code, self.types()[-1]), (3, 'start-uncertain'))
+                self.assertIn('may have started', err)
+
+    def test_a_session_not_up_yet_is_pending_and_a_wrong_or_lost_one_failed(self):
+        cases = [(self.terminal(app=None), 'main', 'pending', 'not yet a Claude Code session'),
+                 (self.terminal(), 'ada', 'failed', 'runs under ada'),
+                 (self.terminal(cwd='/other'), 'main', 'failed', 'runs in /other'),
+                 (self.terminal(state='finished'), 'main', 'failed', 'finished'),
+                 (None, 'main', 'failed', 'gone')]
+        for record, account, verification, why in cases:
+            with self.subTest(verification=verification, why=why):
+                self.say('start proj')
+                self.gets['t9'], self.pinned_account = record, account
+                code, out = self.start(entry=f'u-{self.entries}')
+                started = captain.records()[-1]
+                self.assertEqual((started['verification'], started['session']), (verification, None))
+                self.assertIn(why, started['why'])
+                self.assertEqual(code, 1 if verification == 'failed' else 0)
+                self.assertIn('the human closes t9' if verification == 'failed' else 'pending', out)
+
+    def test_an_unpinned_session_is_pending(self):
+        self.say('start proj')
+        with mock.patch.object(captain, 'pin', lambda s: s.update(account='main', pid=None) or s):
+            self.start()
+        self.assertEqual(captain.records()[-1]['verification'], 'pending')
+
+    def test_hc_failing_to_answer_after_the_start_leaves_it_unchecked(self):
+        self.say('start proj')
+        def get(address):
+            if address == 't9':
+                raise captain.hc.Error('hc get t9 failed: socket closed')
+        with mock.patch.object(captain, 'get', get):
+            code, out = self.start()
+        started = captain.records()[-1]
+        self.assertEqual((code, started['address'], started['verification']), (3, 't9', 'unchecked'))
+        self.assertIn('UNCHECKED', out)
+
+    def test_a_wait_that_times_out_or_fails_still_inspects_once(self):
+        for answer in (ran(0, {'ended': False, 'reason': 'timeout'}), ran(None, None, 'timeout', 'late')):
+            with self.subTest(answer):
+                self.say('start proj')
+                self.wait_answer = answer
+                self.assertEqual(self.start(entry=f'u-{self.entries}')[0], 0)
+                self.assertEqual(captain.records()[-1]['verification'], 'verified')
+
+    def test_a_failed_intent_write_starts_nothing(self):
+        self.say('start proj')
+        with mock.patch.object(captain, 'append', side_effect=OSError('disk full')), self.assertRaises(OSError):
+            captain.start(self.root, 'main', None, None, None, None, self.ident)
+        self.assertEqual((self.launched(), self.types()), ([], []))
+
+    def test_every_account_list_names_the_same_accounts(self):
+        import captain_guard
+        self.assertEqual(set(captain.LAUNCHERS), set(captain.CONFIG_DIRS))
+        self.assertEqual(set(captain_guard.ACCOUNTS), set(captain.CONFIG_DIRS))
+
+
 if __name__ == '__main__':
     unittest.main()
