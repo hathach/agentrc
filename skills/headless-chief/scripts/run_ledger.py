@@ -32,8 +32,9 @@ def path():
 
 
 @contextmanager
-def locked(ledger, wait=LOCK_WAIT):
-    """Hold `<ledger>.lock` for the block, or raise Busy after `wait` seconds."""
+def locked(ledger, wait=None):
+    """Hold `<ledger>.lock` for the block, or raise Busy after `wait` seconds (LOCK_WAIT)."""
+    wait = LOCK_WAIT if wait is None else wait
     ledger.parent.mkdir(parents=True, exist_ok=True)
     with open(ledger.with_name(ledger.name + '.lock'), 'ab') as f:
         deadline = time.monotonic() + wait
