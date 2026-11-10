@@ -617,12 +617,28 @@ class LaunchResultTest(unittest.TestCase):
 
     def test_an_unmarked_sonarcloud_issue_is_a_blocker_even_on_a_green_launch(self):
         data = output(result={'pass': True, 'status': 'complete', 'sonarUnmarked': [
-            {'commentId': 3, 'how': 'refutation', 'last': {'commentId': 3, 'issue': 'K3', 'outcome': 'failed', 'detail': 'HTTP 403'}},
+            {'commentId': 3, 'how': 'refutation', 'last': {'commentId': 3, 'issue': 'K3', 'outcome': 'failed', 'detail': 'HTTP 503'}},
             {'commentId': 4, 'how': 'fixNote', 'last': None}]})
         _, s = self.run_it(data)
-        self.assertIn('SonarCloud issue of comment 3 not marked false positive: failed: HTTP 403', s['blockers'])
-        self.assertIn('SonarCloud issue of comment 4 not marked false positive: not asked', s['blockers'])
+        self.assertIn('SonarCloud issue of comment 3 not marked false positive: failed: HTTP 503; a later `both` launch with markSonar asks again',
+                      s['blockers'])
+        self.assertIn('SonarCloud issue of comment 4 not marked false positive: not asked; a later `both` launch with markSonar asks again',
+                      s['blockers'])
         self.assertEqual(len(s['result']['sonarUnmarked']), 2)
+
+    def test_a_sonarcloud_refusal_is_reported_and_a_transient_failure_relaunched_for(self):
+        # #481: routed on sonar.py's outcome, never on its detail: an older output's `failed` refusal is asked once more.
+        lasts = {'refused': {'outcome': 'refused', 'detail': '/api/issues/search: HTTP 403 Forbidden: '},
+                 'failed': {'outcome': 'failed', 'detail': '/api/issues/search: HTTP 403 Forbidden: '},
+                 'waiting': {'outcome': 'waiting', 'detail': 'SonarCloud analysed nothing'},
+                 'down': {'outcome': 'not asked', 'detail': 'SONAR_TOKEN is not set'}, 'unasked': None}
+        data = output(result={'pass': True, 'status': 'complete', 'sonarUnmarked': [
+            {'commentId': i, 'how': 'refutation', 'last': last} for i, last in enumerate(lasts.values())]})
+        _, s = self.run_it(data)
+        routes = [b.rsplit('; ', 1)[1] for b in s['blockers'] if b.startswith('SonarCloud issue of comment')]
+        self.assertEqual(dict(zip(lasts, routes)), {'refused': launch_result.SONAR_PERMANENT, 'failed': launch_result.SONAR_RETRY,
+                                                    'waiting': launch_result.SONAR_RETRY, 'down': launch_result.SONAR_DOWN,
+                                                    'unasked': launch_result.SONAR_RETRY})
 
     def test_the_checkout_is_compared_with_the_state(self):
         _, s = self.run_it(output(), '--checkout', self.repo())

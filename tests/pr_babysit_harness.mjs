@@ -8137,19 +8137,21 @@ test('a refuted comment from another reviewer owes SonarCloud nothing', async ()
   assert.deepEqual(sonarOf(result.state), [])
 })
 
-test('a waiting or failed issue stays owed and is listed unmarked, and a relay error stops asking for the launch', async () => {
+test('a waiting, refused or failed issue stays owed and is listed unmarked, and a relay error stops asking for the launch', async () => {
   const two = { findings: [invalidFinding({ source: 'code-scanning', commentId: 3 }), invalidFinding({ source: 'code-scanning', commentId: 4 })],
     replies: [{ commentId: 3, body: 'a' }, { commentId: 4, body: 'b' }], bots: 'reviewed' }
-  const partial = await run({
-    reviews: two, args: { autoPush: true, markSonar: true, maxCycles: 1 },
-    sonar: () => ({ results: [{ commentId: 3, issue: 'K3', outcome: 'failed', detail: 'HTTP 403' }, { commentId: 4, issue: 'K4', outcome: 'waiting', detail: 'not analysed' }] }),
-  })
-  assert.equal(partial.result.pass, true, 'the PR is green')
-  assert.deepEqual(sonarOf(partial.result.state), [[3, 'a'], [4, 'b']])
-  assert.deepEqual(partial.result.sonarUnmarked, [
-    { commentId: 3, how: 'refutation', last: { commentId: 3, issue: 'K3', outcome: 'failed', detail: 'HTTP 403' } },
-    { commentId: 4, how: 'refutation', last: { commentId: 4, issue: 'K4', outcome: 'waiting', detail: 'not analysed' } }])
-  assert.ok(partial.logs.some(l => /sonar#1: comment 3, issue K3: failed \(HTTP 403\)/.test(l)), partial.logs.join('\n'))
+  for (const [outcome, detail] of [['refused', 'HTTP 403'], ['failed', 'HTTP 503']]) {
+    const partial = await run({
+      reviews: two, args: { autoPush: true, markSonar: true, maxCycles: 1 },
+      sonar: () => ({ results: [{ commentId: 3, issue: 'K3', outcome, detail }, { commentId: 4, issue: 'K4', outcome: 'waiting', detail: 'not analysed' }] }),
+    })
+    assert.equal(partial.result.pass, true, 'the PR is green')
+    assert.deepEqual(sonarOf(partial.result.state), [[3, 'a'], [4, 'b']], outcome)
+    assert.deepEqual(partial.result.sonarUnmarked, [
+      { commentId: 3, how: 'refutation', last: { commentId: 3, issue: 'K3', outcome, detail } },
+      { commentId: 4, how: 'refutation', last: { commentId: 4, issue: 'K4', outcome: 'waiting', detail: 'not analysed' } }])
+    assert.ok(partial.logs.some(l => l.includes(`sonar#1: comment 3, issue K3: ${outcome} (${detail})`)), partial.logs.join('\n'))
+  }
   const dead = await run({ reviews: two, args: { autoPush: true, markSonar: true, maxCycles: 1 }, sonar: () => null })
   assert.deepEqual(sonarOf(dead.result.state).map(([id]) => id), [3, 4])
   let cycle = 0

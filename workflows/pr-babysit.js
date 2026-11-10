@@ -629,7 +629,7 @@ const SONAR = withSeal({
       type: 'array',
       items: { type: 'object', additionalProperties: false, required: ['commentId', 'issue', 'outcome', 'detail'],
         properties: { commentId: { type: 'integer' }, issue: { type: ['string', 'null'] },
-          outcome: { type: 'string', enum: ['skipped', 'resolved', 'waiting', 'marked', 'failed'] }, detail: { type: 'string' } } },
+          outcome: { type: 'string', enum: ['skipped', 'resolved', 'waiting', 'marked', 'refused', 'failed'] }, detail: { type: 'string' } } },
     },
   },
 })
@@ -2063,7 +2063,7 @@ const settleSonar = async (cycle, entry, ended) => {
   entry.sonar = r.results.filter(x => items.some(i => i.commentId === x.commentId))
   for (const x of entry.sonar) {
     sonarLast.set(x.commentId, x)
-    if (!['waiting', 'failed'].includes(x.outcome)) { delete answeredWith.get(x.commentId).sonar; delete answeredWith.get(x.commentId).sonarOf }
+    if (!['waiting', 'refused', 'failed'].includes(x.outcome)) { delete answeredWith.get(x.commentId).sonar; delete answeredWith.get(x.commentId).sonarOf }
     if (x.outcome !== 'skipped') log(`${label}: comment ${x.commentId}, issue ${x.issue}: ${x.outcome} (${x.detail})`)
   }
   return entry.sonar.filter(x => x.outcome === 'marked').length

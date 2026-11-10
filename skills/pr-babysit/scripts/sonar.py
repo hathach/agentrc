@@ -19,7 +19,12 @@ $SONAR_TOKEN, which goes to https://sonarcloud.io only. Each item's outcome:
             cleared the issue is not known yet
   marked    the issue was open: note added as its comment, unless an identical
             one is there, then transitioned to false positive and read back so
-  failed    a request failed or the read-back disagrees; detail says which
+  refused   SonarCloud refused a request (HTTP 400, 401, 403 or 404), the token
+            has no falsepositive transition for the issue, or SonarCloud has no
+            such issue: a later run cannot change it; detail says which
+  failed    any other request failure (another HTTP status, the network, the
+            GitHub read) or a read-back that disagrees: a later run may pass;
+            detail says which
 
 stdout ends with one JSON line {results: [{commentId, issue, outcome, detail}],
 seal} (seal: facts.sealed). Exit 2 with {"error": ...} when the arguments or
@@ -53,10 +58,16 @@ BOT = 'github-advanced-security[bot]'
 KEY = re.compile(r'<!--SONAR_ISSUE_KEY:([A-Za-z0-9_-]+)-->')
 LINK = re.compile(r'https://sonarcloud\.io/project/issues\?[^"\s<>]+')
 OPEN = ('OPEN', 'CONFIRMED', 'REOPENED')
+# SonarCloud refusing the request itself (#481); a 408, 409, 429 or 5xx may pass on a later run.
+REFUSED = (400, 401, 403, 404)
 
 
 class Failed(Exception):
-    pass
+    """refused: the outcome is `refused`, which a later run cannot change, not `failed`."""
+
+    def __init__(self, message, refused=False):
+        super().__init__(message)
+        self.refused = refused
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -77,7 +88,7 @@ def sonar(token, path, data=None):
         with OPENER.open(req, timeout=30) as r:
             text = r.read().decode()
     except urllib.error.HTTPError as e:
-        raise Failed(f'{path.split("?")[0]}: HTTP {e.code} {e.msg}: {e.read().decode(errors="replace")[:200]}')
+        raise Failed(f'{path.split("?")[0]}: HTTP {e.code} {e.msg}: {e.read().decode(errors="replace")[:200]}', e.code in REFUSED)
     except (urllib.error.URLError, OSError) as e:
         raise Failed(f'{path.split("?")[0]}: {e}')
     try:
@@ -116,7 +127,7 @@ def read_issue(token, project, key, pr):
                                 'additionalFields': 'comments,transitions'})
     found = [i for i in sonar(token, f'/api/issues/search?{q}').get('issues', []) if i.get('key') == key]
     if len(found) != 1:
-        raise Failed(f'SonarCloud has no issue {key} on PR #{pr} of {project}')
+        raise Failed(f'SonarCloud has no issue {key} on PR #{pr} of {project}', refused=True)
     return found[0]
 
 
@@ -140,7 +151,7 @@ def settle(token, item, pr, head, heads):
         if heads[project] != head:
             return key, 'waiting', f"SonarCloud analysed {(heads[project] or 'nothing')[:12]}, not {head[:12]}"
     if 'falsepositive' not in (issue.get('transitions') or []):
-        return key, 'failed', f"no falsepositive transition for this token: {issue.get('transitions')}"
+        return key, 'refused', f"no falsepositive transition for this token: {issue.get('transitions')}"
     if not any(c.get('markdown') == item['note'] for c in issue.get('comments') or []):
         sonar(token, '/api/issues/add_comment', {'issue': key, 'text': item['note']})
     sonar(token, '/api/issues/do_transition', {'issue': key, 'transition': 'falsepositive'})
@@ -220,7 +231,7 @@ def mark(argv):
         try:
             key, outcome, detail = settle(token, item, a.pr, a.head, heads)
         except Failed as e:
-            key, outcome, detail = None, 'failed', str(e)
+            key, outcome, detail = None, 'refused' if e.refused else 'failed', str(e)
         results.append({'commentId': item['commentId'], 'issue': key, 'outcome': outcome, 'detail': detail})
     if a.receipt:
         save(a.receipt, request, results)

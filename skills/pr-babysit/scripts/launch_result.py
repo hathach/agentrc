@@ -150,6 +150,19 @@ def recollected(failure):
     return str(failure.get('check')).startswith(CIRCLECI)
 
 
+# What a relaunch can change of an unmarked SonarCloud issue (#481): nothing for sonar.py's `refused`, nor for a
+# sonar.py that did not run (`not asked` with its error); any other outcome a later launch asks about again.
+SONAR_PERMANENT = 'SonarCloud refused it, which a relaunch cannot change: report it'
+SONAR_DOWN = 'sonar.py did not run, which a relaunch alone does not change: report it'
+SONAR_RETRY = 'a later `both` launch with markSonar asks again'
+
+
+def sonar_route(last):
+    if last.get('outcome') == 'refused':
+        return SONAR_PERMANENT
+    return SONAR_DOWN if last.get('outcome') == 'not asked' and last.get('detail') else SONAR_RETRY
+
+
 ASKS = {'tick': 'a Trigger review tick', 'request': 'an `@coderabbitai review` comment'}
 
 
@@ -458,7 +471,7 @@ def summarize(output, output_path, state_ref=None, tree=None, keys=False):
         for u in result.get('sonarUnmarked') or []:
             last = u.get('last') or {}
             blockers.append(f"SonarCloud issue of comment {u.get('commentId')} not marked false positive: "
-                            f"{last.get('outcome', 'not asked')}{': ' + cut(last['detail']) if last.get('detail') else ''}")
+                            f"{last.get('outcome', 'not asked')}{': ' + cut(last['detail']) if last.get('detail') else ''}; {sonar_route(last)}")
         for f in (ci or {}).get('realFailures') or []:
             if f.get('complete') is not True:
                 blockers.append(f'CI evidence incomplete for {f.get("check")} / {f.get("cell")}: '
