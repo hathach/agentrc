@@ -38,8 +38,8 @@ def setUpModule():
 class BuildTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        self.addCleanup(self.runners_exited)
+        # up to 30 s: on Windows a job runner holds its runner.log open until it exits, after writing its receipt
+        self.addCleanup(build.windows.retry, tmp.cleanup, tries=1500)
         self.repo = Path(tmp.name) / 'repo'
         self.repo.mkdir()
         self.env = git_env()
@@ -48,19 +48,6 @@ class BuildTest(unittest.TestCase):
         self.git('add', '-A')
         self.git('commit', '-qm', 'base')
         self.base = self.git('rev-parse', 'HEAD').strip()
-
-    def runners_exited(self, seconds=30):
-        """Wait for each job runner to exit: it writes its receipt before it exits, and on Windows the runner.log it
-        holds open keeps the temp dir from being removed."""
-        end = time.monotonic() + seconds
-        for log in self.repo.parent.glob('job*/runner.log'):
-            while True:
-                try:
-                    log.unlink()
-                    break
-                except PermissionError:
-                    self.assertLess(time.monotonic(), end, f'a runner still holds {log}')
-                    time.sleep(0.2)
 
     def git(self, *argv):
         return subprocess.run(['git', *argv], cwd=self.repo, env=self.env, check=True,
