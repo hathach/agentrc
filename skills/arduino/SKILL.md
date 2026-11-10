@@ -123,6 +123,9 @@ changes from a library:
   whose sketchbook links `hardware/<vendor>/<arch>` to the checkout and holds only the prepared dependencies, the
   user's data dir (toolchains) unchanged. A build whose platform resolves anywhere but the checkout fails, so neither
   an installed copy of the core nor a `~/Arduino/hardware` link to another checkout is ever tested by mistake.
+  Each compile appends `-ffile-prefix-map=<that dir>=.arduino-cli` to the FQBN's resolved
+  `compiler.{c,cpp,S}.extra_flags` (the platform's and `--build-property` values kept), so an image embedding
+  `__FILE__` names no PID and two builds of one commit match; the core's compilers must be GCC 8 or later.
 - **Libraries the core bundles** are its own: a user copy of one is never prepared and fails a build that used it
   (library mode admits such a shadow). Dependencies are the profile's `EXTRA_DEPENDENCIES` and their `depends=`.
 - **Sketches** are every `*.ino` dir under `SKETCH_ROOTS` (the bundled libraries, `extras/` included, as a core's

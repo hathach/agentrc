@@ -89,7 +89,7 @@ def cli_compile(used, platform_id, version, install_dir, build_install_dir, succ
     """arduino-cli compile --json's result as compile_sketch parses it."""
     out = {'success': success, 'compiler_err': err, 'builder_result': {
         'used_libraries': used, 'board_platform': {'id': platform_id, 'version': version, 'install_dir': install_dir},
-        'build_platform': {'id': platform_id, 'install_dir': build_install_dir}}}
+        'build_platform': {'id': platform_id, 'install_dir': build_install_dir}, 'build_properties': []}}
     return mock.Mock(returncode=0 if success else 1, stdout=json.dumps(out), stderr='')
 
 
@@ -471,7 +471,9 @@ class Provenance(Lib):
         self.assertEqual((row['status'], row['remedy']), ('error', 'install arduino-cli on PATH'))
 
     def test_ok_build_row(self):
-        row = self.compile(self.fake_compile())
+        with mock.patch.object(ab.subprocess, 'run', return_value=self.fake_compile()) as run:
+            row = ab.compile_sketch('rig_jlink', 'examples/Basic/echo', self.root / 'b', [], {})
+        self.assertEqual(run.call_count, 1)   # a library's build maps no prefix: it has no per-process dir
         self.assertEqual((row['status'], row['vidPid'], row['foreignHeaders']), ('ok', '1234:5678', []))
         self.assertEqual(row['coreTinyUSB'], [])
         self.assertEqual(row['libraries'], [{'name': fake.NAME, 'version': None, 'dir': str(self.root)}])
@@ -1284,6 +1286,39 @@ class Core(Lib):
         self.assertEqual(cmd[cmd.index('--config-file') + 1], str(self.tmp / 'cli.yaml'))
         self.assertEqual((cmd[cmd.index('--fqbn') + 1], row['fqbn']), ('fake:core:m4:usb=tusb',) * 2)
         self.assertEqual(row['platform']['install_dir'], str(self.root))
+
+    def test_compile_maps_the_isolated_dir_out_of_file_keeping_every_extra_flag(self):
+        listed = {'success': True, 'builder_result': {'build_properties': [
+            'compiler.c.extra_flags=-DPLATFORM', 'compiler.cpp.extra_flags=-DUSER {build.x}', 'build.extra_flags=-DB']}}
+        calls = []
+
+        def run(cmd, **kw):
+            calls.append(cmd)
+            return mock.Mock(returncode=0, stdout=json.dumps(listed), stderr='') if '--show-properties=unexpanded' \
+                in cmd else self.fake_compile()
+        config = self.tmp / 'iso dir/arduino-cli.yaml'
+        user = ['compiler.cpp.extra_flags=-DUSER {build.x}', 'build.foo=1']
+        with mock.patch.object(ab.subprocess, 'run', side_effect=run):
+            row = ab.compile_sketch('rig_m4', 'test/hil/core_cdc', self.root / 'b', user, {}, config)
+        self.assertEqual(row['status'], 'ok', row.get('firstError'))
+        show, compile_ = calls
+        self.assertEqual(show[show.index('--config-file') + 1], str(config))
+        self.assertEqual([show[i + 1] for i, a in enumerate(show) if a == '--build-property'], user)
+        flag = f'"-ffile-prefix-map={self.tmp / "iso dir"}=.arduino-cli"'
+        self.assertEqual([compile_[i + 1] for i, a in enumerate(compile_) if a == '--build-property'],
+                         ['build.foo=1', f'compiler.c.extra_flags=-DPLATFORM {flag}',
+                          f'compiler.cpp.extra_flags=-DUSER {{build.x}} {flag}', f'compiler.S.extra_flags={flag}'])
+        with mock.patch.object(ab.subprocess, 'run', side_effect=run):   # resolved once per FQBN and properties
+            ab.compile_sketch('rig_m4', 'test/hil/core_cdc', self.root / 'b', user, {}, config)
+        self.assertEqual(len(calls), 3)
+
+    def test_unresolvable_properties_are_an_error_before_compiling(self):
+        failed = mock.Mock(returncode=1, stdout='', stderr='Error resolving FQBN\nplatform not installed\n')
+        with mock.patch.object(ab.subprocess, 'run', return_value=failed) as run:
+            row = ab.compile_sketch('rig_m4', 'test/hil/core_cdc', self.root / 'b', [], {}, self.tmp / 'x/cli.yaml')
+        self.assertEqual((row['status'], row['firstError']),
+                         ('error', 'arduino-cli --show-properties: platform not installed'))
+        self.assertEqual(run.call_count, 1)
 
     def test_platform_through_a_link_to_the_checkout_is_this_checkout(self):
         link = self.tmp / 'sketchbook/hardware/fake/core'

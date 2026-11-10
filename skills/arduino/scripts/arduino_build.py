@@ -724,15 +724,52 @@ def cli_env(at, prepared):
     return path
 
 
+PREFIX_MAP_KEYS = ('compiler.c.extra_flags', 'compiler.cpp.extra_flags', 'compiler.S.extra_flags')
+_resolved = {}
+
+
+def prefix_mapped(fqbn_, sketch, config, properties):
+    """`properties` with -ffile-prefix-map (GCC 8 or later) appended to the FQBN's resolved per-language extra flags
+    (PREFIX_MAP_KEYS, as arduino-cli resolves them with `properties`, none lost), mapping the isolated environment's
+    per-process dir (config's) to `.arduino-cli`: a __FILE__ the image embeds (SPI.cpp's assert) and the debug paths
+    then name no PID. A platform whose recipes leave those keys out gets no mapping. RuntimeError when arduino-cli
+    cannot resolve them."""
+    key = (fqbn_, str(config), tuple(properties))
+    if key not in _resolved:
+        cmd = ['arduino-cli', 'compile', '--fqbn', fqbn_, '--config-file', str(config), '--show-properties=unexpanded',
+               '--format', 'json', *[a for prop in properties for a in ('--build-property', prop)], str(sketch)]
+        listed = None
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if not p.returncode:
+                listed = json.loads(p.stdout).get('builder_result', {}).get('build_properties')
+        except (OSError, subprocess.TimeoutExpired, ValueError) as e:
+            raise RuntimeError(f'arduino-cli --show-properties: {e}')
+        if not isinstance(listed, list):
+            why = (p.stderr.strip().splitlines() or ['no properties listed'])[-1]
+            raise RuntimeError(f'arduino-cli --show-properties: {why}')
+        _resolved[key] = dict(prop.partition('=')[::2] for prop in listed)
+    flag = f'"-ffile-prefix-map={Path(config).parent}=.arduino-cli"'
+    return [prop for prop in properties if prop.partition('=')[0] not in PREFIX_MAP_KEYS] + \
+        [f'{k}=' + ' '.join(v for v in (_resolved[key].get(k, ''), flag) if v) for k in PREFIX_MAP_KEYS]
+
+
 def compile_sketch(board, example, build_dir, properties, prepared, config=None):
     shutil.rmtree(build_dir, ignore_errors=True)
     build_dir.mkdir(parents=True)
     fqbn_ = fqbn(board, example)
+    sketch = sketch_source(board, example, build_dir)
+    if config:
+        try:
+            properties = prefix_mapped(fqbn_, sketch, config, properties)
+        except RuntimeError as e:
+            return {'board': board, 'example': example, 'status': 'error', 'buildDir': rel(build_dir),
+                    'firstError': str(e)}
     cmd = ['arduino-cli', 'compile', '--clean', '--format', 'json', '--warnings', 'all', '--fqbn', fqbn_,
            *(['--config-file', str(config)] if config else ['--library', str(P.ROOT)]), '--build-path', str(build_dir)]
     for prop in properties:
         cmd += ['--build-property', prop]
-    cmd.append(str(sketch_source(board, example, build_dir)))
+    cmd.append(str(sketch))
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=COMPILE_TIMEOUT)
     except OSError as e:
