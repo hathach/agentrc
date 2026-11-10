@@ -321,26 +321,28 @@ const groupPrompt = (
   'An item belongs to a group only if its whole substance is that defect: a finding or claim that also raises another problem stays out. Items about different variants belong together only when the path and the fix are the same.\n' +
   `Findings: ${JSON.stringify(pool.map((f, i) => ({ finding: i, file: f.file, line: f.line, dimension: f.dimension, why: whyOf(f) })).filter(f => asked.has(f.file)))}\n` +
   `Claims: ${JSON.stringify(confirmedClaims.filter(c => asked.has(c.path)).map(c => ({ claim: c.claimId, path: c.path, line: c.line, text: c.claim })))}`)
-// An item named twice, an index or id that names nothing, a group of one, one across files or on a file not asked
-// about is a grouping to distrust whole.
+// An item named twice, or an index or id that names nothing, is a grouping to distrust whole. A group of one, one across
+// files or on a file not asked about is dropped alone: its items stay ungrouped, the answer's other groups stand (#448).
 const oneFile = (g) => { const at = new Set([...g.findings.map(i => pool[i].file), ...g.claims.map(id => claimOf[id].path)]); return at.size === 1 && asked.has([...at][0]) }
-const groupingOk = (x) => {
+const wellFormed = (x) => {
   if (!x || !Array.isArray(x.groups) || !x.groups.every(g => g && Array.isArray(g.findings) && Array.isArray(g.claims))) return false
   const members = x.groups.flatMap(g => [...g.findings.map(i => `f${i}`), ...g.claims.map(id => `c${id}`)])
   return new Set(members).size === members.length &&
-    x.groups.every(g => g.findings.length + g.claims.length > 1 && g.findings.every(i => Number.isInteger(i) && pool[i]) &&
-      g.claims.every(id => Object.hasOwn(claimOf, id)) && oneFile(g))
+    x.groups.every(g => g.findings.every(i => Number.isInteger(i) && pool[i]) && g.claims.every(id => Object.hasOwn(claimOf, id)))
 }
+const groupOk = (g) => g.findings.length + g.claims.length > 1 && oneFile(g)
 const askGroups = (label, prompt) => agent(prompt, { label, phase: 'Judge', model: 'sonnet', effort: 'medium', schema: GROUPS }).catch(quiet(label))
 let grouped = asked.size ? await askGroups('group', groupPrompt) : { groups: [] }
 // One unusable answer (#150) gets one more judgment, on a fresh label, before its findings stay ungrouped.
-if (!groupingOk(grouped)) {
+if (!wellFormed(grouped)) {
   grouped = await askGroups('group:retry', `${groupPrompt}\nAn earlier answer was not usable: each item at most once, only ` +
     'the finding indexes and claim ids listed, at least two members a group, and every member of a group on one file.')
 }
-const groupsOk = groupingOk(grouped)
-if (!groupsOk) unjudged.push({ kind: 'group' })
-const groups = groupsOk ? grouped.groups : []
+const usable = wellFormed(grouped)
+const groups = usable ? grouped.groups.filter(groupOk) : []
+const offRule = usable ? grouped.groups.filter(g => !groupOk(g)) : []
+if (offRule.length) log(`${offRule.length} group(s) dropped, their items left ungrouped: ${JSON.stringify(offRule)}`)
+if (!usable || offRule.length) unjudged.push({ kind: 'group' })
 // A lead thread claim graded below our lead finding: the body names our stronger grade.
 const ourGrade = new Map()
 const leadOf = new Map()
