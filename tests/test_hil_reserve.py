@@ -347,7 +347,7 @@ class Rosters(Fixture):
             hr.load_rosters([(str(roster), 'proj.lock')])
 
     def test_attached_devices_are_no_identities_registry_or_roster_copy(self):
-        probe, entry = next((p, e) for p, e in hr.hil_boards.registry().items() if 'dev_attached' in e)
+        probe = next(p for p, e in hr.hil_boards.registry().items() if 'dev_attached' in e)
         roster = Path(self.td.name) / 'r.json'
         roster.write_text(json.dumps({'boards': [{'name': 'x', 'uid': 'DUT-UID', 'probe': probe, 'tests': {
             'dev_attached': [{'vid_pid': '1a86_7523', 'serial': '0'}]}}]}))

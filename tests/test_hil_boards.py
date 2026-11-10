@@ -195,6 +195,7 @@ class DevAttached(Base):
                              ([{**UDISK, 'x': 1}], 'unknown key'), ([{**UDISK, 'vid_pid': 'ABCD:1234'}], 'lowercase'),
                              ([{**UDISK, 'vid_pid': 'abcd_1234'}], 'lowercase'), ([{'serial': 'x'}], 'vid_pid'),
                              ([{**UDISK, 'serial': ''}], 'serial'), ([{**UDISK, 'serial': None}], 'serial'),
+                             ([{**UDISK, 'serial': '0'}], 'serial'),
                              ([{**UDISK, 'is_msc': 1}], 'is_msc'), ([{**UDISK, 'block_count': True}], 'block_count'),
                              ([{**UDISK, 'block_size': 0}], 'block_size'), ([{**UDISK, 'note': ' '}], 'note'),
                              ([UDISK, UDISK], 'listed twice'), ([CH340, CH340], 'listed twice')):

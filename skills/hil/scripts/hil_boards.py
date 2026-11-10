@@ -121,8 +121,8 @@ def dev_attached_problem(devices) -> str:
             return f'[{i}] unknown key(s) {", ".join(sorted(set(d) - _DEV_KEYS))}'
         if not (isinstance(d.get('vid_pid'), str) and DEV_VID_PID_RE.match(d['vid_pid'])):
             return f'[{i}] vid_pid must be lowercase "vvvv:pppp", got {d.get("vid_pid")!r}'
-        if 'serial' in d and not (isinstance(d['serial'], str) and d['serial'].strip()):
-            return f'[{i}] serial must be a non-empty string or absent, got {d["serial"]!r}'
+        if 'serial' in d and not (isinstance(d['serial'], str) and d['serial'].strip() and d['serial'] != '0'):
+            return f'[{i}] serial must be a non-empty string other than "0", or absent, got {d["serial"]!r}'
         for key in ('is_cdc', 'is_msc'):
             if key in d and not isinstance(d[key], bool):
                 return f'[{i}] {key} must be true or false, got {d[key]!r}'
