@@ -239,6 +239,22 @@ const staged = (v) => {
 }
 const EMIT_DIR = { type: 'object', additionalProperties: false, required: ['dir'], properties: { dir: { type: 'string' }, error: { type: 'string' } } }
 let emitDir = null
+// Why the last emit-dir call named no directory: what every relay waiting on it answers.
+let emitWhy = null
+let skewNote = null
+// The scripts' checkout and the saved workflow's, each `<root> <short HEAD>`: a named launch loads the saved workflow,
+// which AGENTRC_DIR does not choose, while every script runs from AGENTRC_DIR (#480). The sandbox names no file of its own.
+const ROOTS = { type: 'object', additionalProperties: false, required: ['scripts', 'saved'], properties: { scripts: { type: 'string' }, saved: { type: 'string' } } }
+const ROOTS_CMD = 'for f in ' + `${AGENTRC}/skills/pr-babysit/scripts/facts.py "\${CLAUDE_CONFIG_DIR:-$HOME/.claude}/workflows/pr-babysit.js"; ` +
+  'do d=$([ -e "$f" ] && cd -P "$(dirname "$(readlink -f "$f")")" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null); ' +
+  'echo "${d:-unresolved} ${d:+$(git -C "$d" rev-parse --short HEAD 2>/dev/null)}"; done'
+const skewOf = async (error) => {
+  const r = await agent(`Editing nothing, run exactly \`${ROOTS_CMD}\` and return its first line as scripts and its second as saved, character for character.`,
+    { label: 'emit:roots', phase: 'Triage', agentType: 'relay', model: 'haiku', effort: 'low', schema: ROOTS }).catch(() => null)
+  const roots = r ? `the scripts are ${r.scripts} (AGENTRC_DIR, else ~/.claude), and the saved workflow a named launch loads is ${r.saved}` : 'neither root could be read'
+  return `facts.py emit-dir answered ${JSON.stringify(error)}: the scripts are another agentrc revision than this workflow; ${roots}. ` +
+    'AGENTRC_DIR does not choose the saved workflow: relaunch with Workflow scriptPath "${AGENTRC_DIR:-$HOME/.claude}/workflows/pr-babysit.js", expanded in the shell first'
+}
 // The one path a relay copies: a mis-copy names no directory a run wrote into (mkdtemp's name, never-overwritten files).
 // A trust boundary: nothing here proves the directory fresh or this launch's; an existing one handed back would replay
 // its files, whose self-naming and seals give consistency, not freshness.
@@ -249,6 +265,8 @@ const emitDirOf = () => emitDir ??= agent(
 ).then(r => {
   if (r && /^(?:[A-Za-z]:)?\/(?!\/)[^'\n]*\/agentrc-emit\/[A-Za-z0-9_]+$/.test(r.dir)) return r.dir
   log(`emit:dir: no directory for the scripts' lines — ${r ? r.error || JSON.stringify(r.dir) : 'the relay died'}`)
+  // A facts.py without emit-dir answers its usage: a script copy older than this workflow.
+  emitWhy = r && /usage: facts\.py/.test(r.error || '') ? skewNote ??= skewOf(r.error) : null
   return null
 }, e => { log(`emit:dir errored — ${e && e.message}`); return null }).then(dir => {
   if (!dir) emitDir = null // only a directory is kept: the next relay, a .retry included, asks again
@@ -259,7 +277,7 @@ const emitCount = new Map()
 const emitted = async (prompt, { label, inputDir, ...opts }) => {
   if (!prompt.includes(EMIT)) throw new Error(`${label}: its command names no ${EMIT}`)
   const dir = await emitDirOf()
-  if (!dir) return { why: 'no directory for the line (facts.py emit-dir failed)' }
+  if (!dir) return { why: (await emitWhy) ?? 'no directory for the line (facts.py emit-dir failed)' }
   const name = label.replace(/[^A-Za-z0-9._-]/g, '_')
   const n = (emitCount.get(name) || 0) + 1
   emitCount.set(name, n)

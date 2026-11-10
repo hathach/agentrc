@@ -263,6 +263,8 @@ async function run(opts = {}) {
       if (answer instanceof Error) throw answer
       return answer === undefined ? { dir: emit.dir() } : answer
     }
+    // The two agentrc roots, read only when emit-dir answered a usage: opts.roots, null a dead relay.
+    if (label === 'emit:roots') return opts.roots === undefined ? { scripts: '/home/u/code/agentrc 341ae67', saved: '/home/u/candidate 455d554' } : opts.roots
     calls.push({
       label, prompt: String(prompt), agentType: options.agentType,
       phase: options.phase, schema: options.schema, model: options.model,
@@ -8111,6 +8113,23 @@ test('a preflight that got no emit directory is asked again on its retry, which 
     assert.ok(got.logs.includes('preflight: relay recovered on the retry'), got.logs.join('\n'))
     assert.equal(got.result.cycles, 1, got.result.reason)
   }
+})
+
+test('a facts.py without emit-dir stops at preflight naming both agentrc roots, not a usage error (#480)', async () => {
+  const usage = { dir: '', error: 'usage: facts.py repo' }
+  const got = await run({ reviews: oneValid, dirAnswer: () => usage })
+  assert.deepEqual([got.result.reason, got.labels], ['preflight-failed', []], 'no relay runs without a directory')
+  assert.match(got.result.detail, /^facts\.py emit-dir answered "usage: facts\.py repo": the scripts are another agentrc revision than this workflow; the scripts are \/home\/u\/code\/agentrc 341ae67 \(AGENTRC_DIR, else ~\/\.claude\), and the saved workflow a named launch loads is \/home\/u\/candidate 455d554\. AGENTRC_DIR does not choose the saved workflow: relaunch with Workflow scriptPath "\$\{AGENTRC_DIR:-\$HOME\/\.claude\}\/workflows\/pr-babysit\.js"/)
+  assert.equal(got.journal.filter(j => j.label === 'emit:roots').length, 1, 'the roots are read once')
+  const roots = got.journal.find(j => j.label === 'emit:roots').prompt
+  assert.ok(roots.includes('"${AGENTRC_DIR:-$HOME/.claude}"/skills/pr-babysit/scripts/facts.py "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/workflows/pr-babysit.js"'), roots)
+  // A state load meets the same skew; another emit-dir failure keeps its plain detail.
+  const { state, stateRef } = await savedForLoad()
+  const load = await run({ args: { yieldAfterCycle: true, maxCycles: 3, stateRef }, load: state, dirAnswer: () => usage, roots: null })
+  assert.deepEqual([load.result.reason, load.result.detail.split(';')[1]], ['state-transfer-failed', ' neither root could be read. AGENTRC_DIR does not choose the saved workflow: relaunch with Workflow scriptPath "${AGENTRC_DIR:-$HOME/.claude}/workflows/pr-babysit.js", expanded in the shell first'])
+  const plain = await run({ reviews: oneValid, dirAnswer: () => ({ dir: '', error: 'no git dir' }) })
+  assert.equal(plain.result.detail, 'no directory for the line (facts.py emit-dir failed)')
+  assert.equal(plain.journal.some(j => j.label === 'emit:roots'), false)
 })
 
 test('a resumed launch reloads the lines its relays wrote; a file there before a live run is reloaded only when it names itself', async () => {

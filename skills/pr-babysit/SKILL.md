@@ -50,13 +50,15 @@ the merge goes without that bot; a bot left out of `autoRun` alone is never waiv
 CI goes with the merge only when the launch's `acceptedFailures` explain every failed check, as the very executions it
 judged, and none is a required check; the receipt's `accepted` records them.
 
-After an agentrc update, launch the workflow from the installed file (Workflow
+Launch the workflow from the root its scripts run from (Workflow
 `scriptPath: "${AGENTRC_DIR:-$HOME/.claude}/workflows/pr-babysit.js"`, expanded
-in the shell first), not by its name in a session started before the update:
-that session may hold an older copy of the script while the skills' scripts are
-already new. A copy whose collector output it cannot read stops
-`collector-skew` (collect.py's `contract`), one calling a script the install
-lacks `stale-workflow`.
+in the shell first), not by its name: a named launch loads the user scope's
+saved `workflows/pr-babysit.js`, which `AGENTRC_DIR` does not change, and a
+session started before an agentrc update may hold an older copy of the script
+while the skills' scripts are already new. A copy whose collector output it
+cannot read stops `collector-skew` (collect.py's `contract`), one calling a
+script the install lacks `stale-workflow`, and one whose `facts.py` lacks
+`emit-dir` stops `preflight-failed` naming both checkouts and their HEADs.
 
 `launch_result.py` is the caller's, not the workflow's: it condenses a finished
 launch, lists the `blockers` to settle before continuing, and shows as `pinned`
