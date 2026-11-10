@@ -6,7 +6,7 @@ description: Collect status from the human's other Claude Code sessions in hc te
 # Captain
 
 `scripts/captain.py` owns the mechanics: finding sessions in this host's hc terminals, pinning each one's identity,
-telling whether its input line is empty, and a locked ledger under `~/.cache/agentrc/captain/` that holds every request
+telling whether its screen shows its input line, and a locked ledger under `~/.cache/agentrc/captain/` that holds every request
 and answer. This page is the judgment. Linux only (`/proc`). Claude Code sessions only: a session is pinned through
 the session registry Claude Code keeps under its account's config dir, which Codex has none of, so `list` leaves
 Codex terminals out, and remote (`machine/tN`) ones too. `list` orders sessions by hc's `status_ms`, when each last
@@ -68,15 +68,12 @@ pins each target's session once, so one replaced in its terminal while the relay
 
 - **Enroll** once per session. Another captain that still runs is kept; `--replace` only on the human's word.
   Requests from a replaced captain can no longer be answered.
-- **Ask** sends a status request only to a session that is idle or done, has an empty input line and can be pinned
-  (terminal, foreground process and start time, cwd, registered session and account). hc pastes the request into the
-  terminal, appending to anything a human half typed, so the empty-line check runs right before each send; a human who
-  starts typing there at that instant can still have text merged. `hc read` is plain text, so Claude Code's dim
-  suggestion, such as `Try "..."` or a predicted next prompt, cannot be told from a draft: any text in the input line
-  refuses, and a session showing one is reported as refused. `promptSuggestionEnabled: false` in the target's Claude
-  Code settings, such as `claude --settings '{"promptSuggestionEnabled":false}'`, turns suggestions off, the startup
-  `Try "..."` included. An idle target is sent only while hc still sees it idle; hc has no such check for done, so one
-  that starts a turn in between gets the request as its next input. One request per session is open at a time. A session
+- **Ask** sends a status request only to a session that is idle or done, shows its input line and can be pinned
+  (terminal, foreground process and start time, cwd, registered session and account); a screen it does not recognize
+  as one, such as a dialog, refuses, checked right before each send. hc pastes the request into the input line,
+  appended to any text already there, a human's draft included. An idle target is sent only while hc still sees it
+  idle; hc has no such check for done, so one that starts a turn in between gets the request as its next input. One
+  request per session is open at a time. A session
   whose own transcript starts no turn after the request its last report answered - no prompt, task notification or
   compaction - is not asked: `ask` prints `not asked` with that report's id, which answers for it. `--force` asks
   anyway, only when the human wants a session asked again whatever it last said.
@@ -91,9 +88,9 @@ pins each target's session once, so one replaced in its terminal while the relay
   from the instruction refuses, nothing sent: ask the human to restate it. A message addressed to every session -
   `tell all`, `tell all session(s)`, `tell everyone` or `tell every session`, then `to` or `:` - is relayed with the
   target `all`, which the script expands to every live session; any other form of it refuses: ask the human to
-  restate it. Targets that are not exactly the live sessions refuse: relay again. A target that is busy or shows text
-  in its input line gets the relay held, recorded with its words and session: `relay --retry <action>` sends it
-  unchanged if that session is idle or done with an empty input line now, else prints `still held` without waiting,
+  restate it. Targets that are not exactly the live sessions refuse: relay again. A target that is busy or does not
+  show its input line gets the relay held, recorded with its words and session: `relay --retry <action>` sends it
+  unchanged if that session is idle or done with its input line shown now, else prints `still held` without waiting,
   and closes one replaced in its terminal meanwhile as undelivered. After a retry that stopped while sending, the next
   prints `<address>: <action> uncertain (...)`, never typing it twice: the session may have it, and the relay is no
   longer held, so any further retry refuses with `no longer held`.
@@ -130,7 +127,7 @@ pins each target's session once, so one replaced in its terminal while the relay
   `/exit`, kill a process or terminal, or ask a target to close itself. `cancel` closes a ledger item only: it
   neither reaches a session nor withdraws an instruction one accepted. That takes a new relay of the human's words,
   refused while the accepted relay's item is open, so `cancel` that first; a busy target gets the new relay held until
-  it is idle or done with an empty input line, so work in progress is stopped only by the human in that session.
+  it is idle or done with its input line shown, so work in progress is stopped only by the human in that session.
   A relayed instruction that ends a target's own work, such as removing its worktree, is the target's to do under its
   own rules.
 - **Watch** when the human wants to hear each time a session finishes, not once: `watch all`, their bare "watch"

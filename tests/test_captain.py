@@ -32,23 +32,23 @@ def boxed(*lines):
 
 
 class InputStateTest(unittest.TestCase):
-    """hc read is plain text: any text in the input box, a human's draft or Claude Code's suggestion, counts."""
+    """The input line is recognized whatever text it holds: a paste appends to it."""
 
     def test_empty(self):
-        self.assertEqual(captain.input_state(EMPTY), 'empty')
-        self.assertEqual(captain.input_state(boxed('❯\xa0')), 'empty')
+        self.assertEqual(captain.input_state(EMPTY), 'input')
+        self.assertEqual(captain.input_state(boxed('❯\xa0')), 'input')
 
-    def test_a_draft_or_a_suggestion_is_text(self):
+    def test_a_draft_or_a_suggestion_is_still_the_input_line(self):
         for line in ('❯ my draft text', '❯\xa0Try "how does <filepath> work?"', '❯ apply to both', '❯ ⠓⠑⠇⠇⠕'):
             with self.subTest(line):
-                self.assertEqual(captain.input_state(boxed(line)), 'text')
+                self.assertEqual(captain.input_state(boxed(line)), 'input')
 
     def test_claude_labelled_top_rule(self):
         text = f'{RULE} alo68 ─\n❯ \n{RULE}\n  status\n  ⏵⏵ bypass permissions on'
-        self.assertEqual(captain.input_state(text), 'empty')
+        self.assertEqual(captain.input_state(text), 'input')
 
     def test_claude_multiline_draft(self):
-        self.assertEqual(captain.input_state(boxed('❯ ', '  second line')), 'text')
+        self.assertEqual(captain.input_state(boxed('❯ ', '  second line')), 'input')
 
     def test_claude_without_input_box_is_unknown(self):
         for text in ['Do you want to proceed?\n❯ 1. Yes\n  2. No', f'{RULE}\n{RULE}', f'{RULE}\n  menu\n{RULE}']:
@@ -513,7 +513,6 @@ class AskTest(LedgerCase):
     def test_refusals_type_nothing(self):
         cases = {
             'working': ({'status': 'working'}, None),
-            'shows text': ({}, boxed('❯ my draft text')),
             'not a recognized': ({}, 'plain shell $'),
             'not pinned': ({'pid': None}, None),
         }
@@ -527,6 +526,11 @@ class AskTest(LedgerCase):
         self.assertIn('no Claude Code terminal at that address', self.ask('t99'))
         self.assertIn('this session', self.ask('t1'))
         self.assertEqual(self.typed, [])
+
+    def test_a_draft_in_the_input_line_is_no_refusal(self):
+        self.screens['t2'] = boxed('❯ my draft text')
+        self.ask()
+        self.assertEqual(len(self.typed), 1)
 
     def test_blocked_submission_closes_the_request(self):
         self.submit_result = ('undelivered', 't2 is done, not idle')
