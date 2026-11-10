@@ -1417,6 +1417,36 @@ test('hostile text in a reply body reaches reply.py byte for byte; a corrupted s
   } finally { rmSync(tmp, { recursive: true, force: true }) }
 })
 
+test('a CI verdict reaches collect.py remember with no shell quoting, byte for byte; a malformed one is refused before it (#505)', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'pr-babysit-exec-'))
+  const ROOT = fileURLToPath(new URL('..', import.meta.url))
+  try {
+    const { calls, emitDir } = await run({ keepEmit: true, args: YIELD, reviews: WAITING, ci: redWith({ ...RIG, firstError: HOSTILE }).ci })
+    const remember = calls.find(c => c.label === 'ci:collect#1.w')
+    const verdicts = stagedOf(remember.prompt)
+    assert.equal(verdicts[0].failures[0].firstError, HOSTILE)
+    // The real collect.py, its store under TMPDIR; the input file goes where the workflow named it.
+    const store = join(tmp, 'store')
+    mkdirSync(store)
+    const cmd = commandOf(remember.prompt)
+    const kept = runCommand(cmd, ROOT, join(tmp, 'w.js'), { TMPDIR: store })
+    assert.equal(kept.status, 0, kept.stderr)
+    const head = remember.prompt.match(/--head ([0-9a-f]{40})/)[1]
+    const saved = JSON.parse(readFileSync(join(store, 'ci-collect', 'hathach_tinyusb', '3888', head, 'verdicts.json'), 'utf8'))
+    assert.deepEqual(Object.values(saved), verdicts, 'collect.py remember stores the verdicts as judged')
+    assert.equal(existsSync('/tmp/pwned'), false)
+    const b64 = cmd.match(/printf '%s' '([^']*)'/)[1]
+    for (const bad of corrupted(b64, JSON.stringify(verdicts))) {
+      const empty = join(tmp, `empty-${fnv1a(bad)}`)
+      mkdirSync(empty)
+      assert.notEqual(runCommand(cmd.replace(b64, bad), ROOT, join(tmp, 'bad.js'), { TMPDIR: empty }).status, 0)
+      assert.equal(existsSync(join(empty, 'ci-collect')), false, 'remember never ran')
+      assert.equal(existsSync(join(tmp, 'bad.js')), false, 'no line')
+    }
+    rmSync(emitDir.split('/agentrc-emit/')[0], { recursive: true, force: true })
+  } finally { rmSync(tmp, { recursive: true, force: true }) }
+})
+
 test('every script input is written by the command that runs the script, at a path the workflow names (#510)', async () => {
   const { calls } = await run({ reviews: { findings: [finding(), invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'not so' }], bots: 'reviewed' }, args: { autoPush: true } })
   const inputs = calls.filter(c => /printf '%s' /.test(c.prompt))
