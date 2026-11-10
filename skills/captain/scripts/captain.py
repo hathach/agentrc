@@ -1920,8 +1920,8 @@ def relay(targets, entry, mine, decided=None, force=False):
         captain = require_captain(mine)
         uid, words = bound(captain, entry)
         if decided and force and (same := [m for m, r in open_items(records()).items() if r.get('item') == decided[0]]):
-            die(f'{decided[0]}: the verdict relay {", ".join(same)} on it is still open and closes it; --force cannot '
-                'replace it: cancel it first on the human\'s word, then relay again', 2)
+            die(f'{decided[0]}: the verdict relay {", ".join(same)} on it is still open and closes it; --force does not '
+                'replace a verdict: cancel it on the human\'s word only while its session has not accepted it', 2)
         binding, linked = bind(decided, seen, captain, uid) if decided else ({}, None)
         pinned = {address: find(address) for address in addresses}
         quote = relay_text(words, addresses)
