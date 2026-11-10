@@ -201,6 +201,64 @@ class ChiefRun(unittest.TestCase):
         self.assertFalse(lead.keys() & env.keys(), 'none of the lead session\'s identity reaches chief')
         self.assertEqual(env['CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS'], '0')
 
+    def test_chief_runs_with_this_runs_credit_guard_tag(self):
+        self.stream(init(), result())
+        self.assertEqual(self.run_it(CREDIT_GUARD_TAG='the lead run').returncode, 0)
+        env = json.loads((self.fake / 'env.json').read_text())
+        self.assertEqual(env['CREDIT_GUARD_TAG'], str(self.out.resolve()))
+
+    @unittest.skipIf(os.name == 'nt', 'no SIGTERM: the stop goes by kill_tree')
+    def test_a_watcher_that_cannot_start_still_stops_chief(self):
+        spec = importlib.util.spec_from_file_location('chief_run', SCRIPT)
+        chief_run = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(chief_run)
+        self.stream(init(), '#gate never\n', result())
+        self.out.mkdir()
+        args = mock.Mock(out=self.out, worktree=self.worktree, permission_mode=None)
+        children, popen = [], subprocess.Popen
+        def started(*a, **kw):
+            children.append(popen(*a, **kw))
+            return children[-1]
+        with mock.patch.dict(os.environ, self.env), mock.patch.object(chief_run.subprocess, 'Popen', started), \
+                mock.patch.object(chief_run.threading.Thread, 'start', side_effect=RuntimeError('no thread')), \
+                self.assertRaises(RuntimeError), self.task.open('rb') as task:
+            chief_run.launch(args, task)
+        self.assertIsNotNone(children[0].poll(), 'chief was stopped and reaped')
+
+    def guard_wait(self, name, tag, seen, **more):
+        d = self.root / 'config' / 'credit-guard' / 'waits'
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f'{name}.json').write_text(json.dumps({'tag': tag, 'seen': seen, 'since': seen - 3720,
+                                                    'next_check': seen + 60, 'limits': ['session'], **more}))
+        return d / f'{name}.json'
+
+    def test_the_guard_watcher_logs_when_the_runs_hooks_wait_and_stop_waiting(self):
+        spec = importlib.util.spec_from_file_location('chief_run', SCRIPT)
+        chief_run = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(chief_run)
+        tag, now = str(self.out), time.time()
+        self.out.mkdir()
+        progress = chief_run.Progress(self.out / 'progress.log')
+        with mock.patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': str(self.root / 'config')}):
+            self.guard_wait('1', 'another run', now)
+            self.guard_wait('2', tag, now - 3 * chief_run.credit_guard.SLICE)  # a hook that died
+            first = self.guard_wait('3', tag, now, limits=['weekly_all'])
+            second = self.guard_wait('4', tag, now, limits=['session', 'weekly_all'], next_check=now + 30)
+            unwatch = chief_run.threading.Event()
+            watcher = chief_run.threading.Thread(target=chief_run.watch_guard, args=(progress, tag, unwatch, 0.01))
+            watcher.start()
+            self.wait_until('the wait line', lambda: self.logged('credit-guard waiting'))
+            first.unlink()
+            time.sleep(0.05)
+            second.unlink()
+            self.wait_until('the wait-over line', lambda: self.logged('credit-guard wait over'))
+            unwatch.set()
+            watcher.join(timeout=5)
+        self.assertEqual(self.texts(), [
+            f'launcher: credit-guard waiting (session, weekly_all), next quota check '
+            f'{chief_run.credit_guard.local_time(now + 30)}',
+            'launcher: credit-guard wait over after 1h02m'])
+
     def test_chief_gets_the_shared_lead_session_filter_and_keeps_configuration(self):
         # A chief launched from a Codex session or a coworker relay's command too.
         self.stream(init(), result())

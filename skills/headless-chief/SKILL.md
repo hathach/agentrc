@@ -43,7 +43,10 @@ python3 "$R" --out <new dir> --worktree <task worktree> --task-file <task.md> \
    description, on every arm, the target, such as `chief hathach/tinyusb#3988
    babysit`. Each line is
    `<seq> <HH:MM:SS> <text>`: `launcher:` lines (started, session, a parse
-   warning, exit), chief's `chief: <event> · ...` lines, and `note:` lines,
+   warning, `credit-guard waiting` and `wait over` when a 30 s look finds
+   the README's credit guard holding the run's hooks for a plan limit to
+   reset and later finds none, exit),
+   chief's `chief: <event> · ...` lines, and `note:` lines,
    a progress note, joined onto one line, that the model returned as a `thinking` block
    instead of text; a note can carry an event whose status line never came. An `attention`
    line is chief asking for something; relay it. Every line you relay,
