@@ -42,7 +42,7 @@ python3 "$S/scope_check.py" --path 'src/a.c' --path 'test/test_a.c'  # which pat
 python3 "$S/state_transfer.py" <saved output>  # a stateRef's state whole with its digest
 python3 "$S/facts.py" emit-dir                 # a new directory for one launch's AGENTRC_EMIT files; ones unwritten for 14 days go
 python3 "$S/launch_result.py" --output <saved output> [--state-ref F:D] [--checkout DIR] [--keys]  # the caller's reading of a launch; --keys: settled failures' keys too
-python3 "$S/merge.py" --pr-url <url> --base <branch> --checkout DIR --output <saved output> --state-digest D [--waive BOT] [--merge]  # chief's merge gate; inspects without --merge; --waive drops a bot from the required reviews on the owner's word, recorded as `waived`
+python3 "$S/merge.py" --pr-url <url> --base <branch> --checkout DIR --output <saved output> --state-digest D [--waive BOT] [--merge]  # chief's merge gate; inspects without --merge; --waive drops a bot from the required reviews, and a last launch's stop on that bot alone, on the owner's word, recorded as `waived`
 ```
 
 `merge.py --merge` is chief-only, under `agents/chief.md`'s merge exception, and `--waive` only on the owner's word that

@@ -335,6 +335,66 @@ class MergeTest(unittest.TestCase):
         with self.assertRaises(merge.Unusable):
             self.run_it(output(), '--waive', 'copilot')
 
+    def test_a_waiver_lifts_the_launch_s_own_stop_for_that_bot_only(self):
+        # #432: the last launch stopped coderabbit-unreviewed; the owner said to merge without CodeRabbit.
+        def stopped(bot_name='coderabbit', bots=None, state=None, **over):
+            result = {'status': 'blocked', 'pass': False, 'reason': f'{bot_name}-unreviewed', 'head': HEAD,
+                      'bots': bots or [bot(bot_name, 'settled', None, 'limited')],
+                      'coderabbitAsk': {'relaunchAsks': None, 'asked': [{'ask': 'tick', 'at': '2026-11-01T00:00:00Z'}]}, **over}
+            return launch_output(state, result)
+        self.world.fresh['bots'][0] = bot('coderabbit', 'settled', None, 'limited')
+        got = self.run_it(stopped(), '--waive', 'coderabbit')
+        self.assertEqual((got['outcome'], got['blockers'], got['waived']), ('ready', [], ['coderabbit']), got)
+        self.world.views = [live(), live(), live(state='MERGED', mergeCommit={'oid': OTHER})]
+        self.assertEqual(self.run_it(stopped(), '--waive', 'coderabbit', '--merge')['outcome'], 'merged')
+        self.world.__init__()
+        self.world.fresh['bots'][2] = bot('greptile', 'settled', None, 'limited')
+        self.assertEqual(self.run_it(stopped('greptile'), '--waive', 'greptile')['outcome'], 'ready')
+        def judged(fid, comment, verdict, digest=None, how='refutation', was=None):
+            f = {'findingId': fid, 'commentId': comment, 'commentDigest': f'd{comment}', 'verdict': verdict}
+            decision = [fid, {'commentId': comment, 'digest': digest or f['commentDigest'], 'verdict': was or verdict}]
+            return f, decision, [comment, {'how': how, 'digest': f['commentDigest']}]
+
+        def harvested(*rows, decisions=None, answers=None):
+            obs = launch_output()['result']['observation']
+            return {'observation': {**obs, 'reviews': {**obs['reviews'], 'findings': [r[0] for r in rows]}},
+                    'state': {'decisions': [r[1] for r in rows] if decisions is None else decisions,
+                              'answeredWith': [r[2] for r in rows] if answers is None else answers}}
+        fine = harvested(judged('2#1', 2, 'invalid'), judged('3#1', 3, 'stale'), judged('4#1', 4, 'stale', how='fixNote', was='valid'))
+        got = self.run_it(stopped('greptile', **fine), '--waive', 'greptile')
+        self.assertEqual((got['outcome'], got['blockers']), ('ready', []), 'every dismissal decided and answered as it stands')
+        observation = launch_output()['result']['observation']
+        cases = {
+            'no waiver': ((), stopped(), 'stopped coderabbit-unreviewed'),
+            'the other bot waived': (('greptile',), stopped(), 'stopped coderabbit-unreviewed'),
+            'a second bot it names unwaived': (('coderabbit',), stopped(bots=[bot('coderabbit', 'absent', None), bot('greptile', 'absent', None)]),
+                                               'stopped coderabbit-unreviewed'),
+            'another stop': (('coderabbit',), stopped(reason='ci-red-rig-side'), 'stopped ci-red-rig-side'),
+            'paused, not blocked': (('coderabbit',), stopped(status='paused'), 'status paused'),
+            'a reviews lane': (('coderabbit',), stopped(observation={**observation, 'lane': 'reviews'}), 'lane reviews'),
+            'an extra blocker': (('coderabbit',), stopped(handoffs=[{'commentId': 5, 'why': 'edited after we answered it'}]), "comment 5 is the caller's"),
+            'a spent budget': (('coderabbit',), stopped(state={'cyclesUsed': 8}), 'cycle budget spent'),
+            'a finding still valid': (('coderabbit',), stopped(**harvested(judged('1#1', 1, 'valid', how='fixNote'))), r'finding\(s\) 1#1 of its last harvest'),
+            'a finding with no decision': (('coderabbit',), stopped(**harvested(judged('1#1', 1, 'invalid'), decisions=[])), r'finding\(s\) 1#1 of'),
+            'a decision on another body': (('coderabbit',), stopped(**harvested(judged('1#1', 1, 'invalid', digest='old'))), r'finding\(s\) 1#1 of'),
+            'a decision with another verdict': (('coderabbit',), stopped(**harvested(judged('1#1', 1, 'invalid', was='stale'))), r'finding\(s\) 1#1 of'),
+            'valid to stale without a fix note': (('coderabbit',), stopped(**harvested(judged('1#1', 1, 'stale', was='valid'))), r'finding\(s\) 1#1 of'),
+            'an answer on another body': (('coderabbit',), stopped(**harvested(judged('1#1', 1, 'invalid'), answers=[[1, {'how': 'refutation', 'digest': 'old'}]])),
+                                          r'finding\(s\) 1#1 of'),
+            'no answer': (('coderabbit',), stopped(**harvested(judged('1#1', 1, 'invalid'), judged('2#1', 2, 'invalid'), answers=[])),
+                          r'finding\(s\) 1#1, 2#1 of its last harvest not settled'),
+        }
+        for name, (waive, output, pattern) in cases.items():
+            with self.subTest(name):
+                self.world.__init__()
+                self.world.fresh['bots'][0] = bot('coderabbit', 'settled', None, 'limited')
+                self.assertBlocked(self.run_it(output, *(a for w in waive for a in ('--waive', w)), '--merge'), pattern)
+        self.world.__init__()
+        self.assertBlocked(self.run_it(stopped(state={'debt': [[1, {}]]}), '--waive', 'coderabbit'), 'still owed a reply')
+        self.world.fresh['bots'][0] = bot('coderabbit', 'settled', None, 'limited')
+        self.world.inventory.update(status='red', checks=[{'name': 'build'}])
+        self.assertBlocked(self.run_it(stopped(), '--waive', 'coderabbit'), '^ci: status red')
+
     def test_review_evidence_changed_since_the_launch(self):
         self.world.fresh['fingerprint'] = FP[:-1] + '1'
         self.assertBlocked(self.run_it(None, '--merge'), '^fingerprint: .*relaunch a `both` launch')

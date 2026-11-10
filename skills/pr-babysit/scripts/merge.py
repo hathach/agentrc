@@ -5,9 +5,11 @@
 
 chief's, under its merge exception (agents/chief.md): URL and BRANCH are the PR and base branch the grant names,
 FILE the last launch's saved Workflow output and D its stateDigest. Every condition is read again here: the launch
-(complete, a `both` lane, pass, no blocker launch_result.py reads, no accepted failure, deferral, hold, reply debt
-or pending publication, its state matching D and its own digest, pinned to that PR), one head everywhere (the
-checkout's, the state's, the reviewed one, the reviews', CI's and the PR's), a fresh harvest (harvest.py with the
+(complete, a `both` lane, pass, or a `both` launch blocked only on the `<bot>-unreviewed` stop of bots --waive names,
+every finding of its last harvest settled in its state; no blocker launch_result.py reads, no accepted failure,
+deferral, hold, reply debt or pending publication, its state matching D and its own digest, pinned to that PR),
+one head everywhere (the checkout's, the state's, the reviewed one, the reviews', CI's and the PR's), a fresh
+harvest (harvest.py with the
 launch's reviewers, from its fingerprint: the same fingerprint, CodeRabbit and Greptile both `reviewed` on the head
 and in its auto-run list, but for a bot --waive names: the owner's word that the merge goes without it, which a bot
 merely left out of auto-run never is; waiving both refuses, a merge needs one bot's review of the head),
@@ -66,22 +68,57 @@ def state_digest(state):
     return fnv1a(canonical({k: v for k, v in state.items() if k != 'digest'}, nulls=True))
 
 
-def launch(output, path, digest, tree, url):
+def waived_stop(result, obs, waived):
+    """The bot whose `<bot>-unreviewed` stop the owner waived, else None: a `both` launch blocked on that stop alone, every
+    bot it names unreviewed waived."""
+    named = [b.get('bot') for b in result.get('bots') or [] if isinstance(b, dict)]
+    bot = next((b for b in waived if result.get('reason') == f'{b}-unreviewed'), None)
+    if bot in named and set(named) <= set(waived) and (result.get('status'), result.get('pass'), obs.get('lane')) == ('blocked', False, 'both'):
+        return bot
+    return None
+
+
+def settled(finding, state):
+    """Whether the state records the finding settled: held, deferred, or, as the workflow's settledAnswer reads it, a
+    dismissal whose own recorded decision on this comment body has its verdict (or valid, its fix noted landing as
+    stale) and whose answer stands on that body."""
+    pairs = lambda key: {e[0]: e[1] for e in state.get(key) or [] if isinstance(e, list) and len(e) == 2}
+    fid, body = finding.get('findingId'), finding.get('commentDigest')
+    if fid in pairs('holds') or fid in pairs('deferrals'):
+        return True
+    decision, answer = pairs('decisions').get(fid), pairs('answeredWith').get(finding.get('commentId'))
+    if not (isinstance(decision, dict) and isinstance(answer, dict)) or body is None:
+        return False
+    verdict, was = finding.get('verdict'), decision.get('verdict')
+    return (verdict in ('invalid', 'stale') and decision.get('commentId') == finding.get('commentId') and decision.get('digest') == body
+            and answer.get('digest') == body and (was == verdict or (was, verdict, answer.get('how')) == ('valid', 'stale', 'fixNote')))
+
+
+def launch(output, path, digest, tree, url, waived=()):
     """(blockers, facts) of the launch's saved output: the state, the observation and the heads it names."""
     if output is None:
         raise Unusable(f'--output {path} is empty: the launch threw before returning')
-    reading = launch_result.summarize(output, path, None, tree)
-    blockers = [f'launch: {b}' for b in reading['blockers']]
     result = output.get('result')
     if not isinstance(result, dict) or not isinstance(result.get('state'), dict):
         raise Unusable(f'--output {path} holds no result with a state')
     state, obs = result['state'], result.get('observation') or {}
     reviews = obs.get('reviews') or {}
+    waiver = waived_stop(result, obs, waived)
+    # The waived stop's own blockers go with its reason; summarize() reads everything else as it stands.
+    reading = launch_result.summarize({**output, 'result': {k: v for k, v in result.items() if k != 'reason'}} if waiver else output,
+                                      path, None, tree)
+    blockers = [f'launch: {b}' for b in reading['blockers']]
     if result.get('stateDigest') != digest or state.get('digest') != digest:
         blockers.append(f'launch: its state is {state.get("digest")!r} (stateDigest {result.get("stateDigest")!r}), not --state-digest {digest}')
     elif state_digest(state) != digest:
         blockers.append('launch: its state does not match its own digest')
-    if (result.get('status'), result.get('pass'), obs.get('lane')) != ('complete', True, 'both'):
+    if waiver:
+        # A stop that cut its cycle short (Greptile's request failing) left that harvest's findings unsettled, in no debt.
+        unsettled = [f.get('findingId') for f in reviews.get('findings') or [] if not settled(f, state)]
+        if unsettled:
+            blockers.append(f"launch: stopped {result['reason']} with finding(s) {', '.join(map(str, unsettled))} of its last harvest "
+                            "not settled in its state: the waiver covers the bot's review only")
+    elif (result.get('status'), result.get('pass'), obs.get('lane')) != ('complete', True, 'both'):
         stopped = f" (stopped {result['reason']})" if result.get('reason') else ''
         blockers.append(f"launch: status {result.get('status')}, pass {result.get('pass')}, lane {obs.get('lane')}{stopped}: "
                         'a merge needs a complete `both` launch that passed')
@@ -261,7 +298,7 @@ def collect(argv):
         raise Unusable(f'--pr-url must be https://github.com/OWNER/REPO/pull/N, not {a.pr_url!r}')
     repo, n = url
     path = Path(a.output).resolve().as_posix()
-    blockers, facts = launch(launch_result.load_output(a.output), path, a.state_digest, launch_result.checkout(a.checkout), url)
+    blockers, facts = launch(launch_result.load_output(a.output), path, a.state_digest, launch_result.checkout(a.checkout), url, waived)
     head = facts['head']
     pr = settled_view(repo, n)
     if pr['state'] == 'MERGED':

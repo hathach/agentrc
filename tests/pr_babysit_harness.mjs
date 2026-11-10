@@ -8743,3 +8743,50 @@ test('the requirement latches for the run: a head adopted without the switch is 
   const asked = await run({ args: { ...YG, greptileTrigger: true, state: pushed.result.state }, preflight: { head: ADOPT, prHead: ADOPT }, clockOffset: 7, reviews: silentG() })
   assert.deepEqual(gAsks(asked.labels), ['greptile#4'])
 })
+
+// #432: merge.py's --waive greptile lifts a greptile-unreviewed stop only when the state settles every finding of its last harvest.
+const waivedLaunch = (result) => {
+  const st = result.state
+  const done = spawnSync('python3', ['-X', 'utf8', '-c', 'import json,sys; sys.path.insert(0, sys.argv[1]); import merge; out = json.loads(sys.stdin.read()); st = out["result"]["state"]; '
+    + 'print(json.dumps(merge.launch(out, "w.output", st["digest"], {"branch": st["pin"]["prBranch"], "head": st["expectedHead"], "dirty": []}, merge.pr_identity(st["pin"]["prUrl"]), ["greptile"])[0]))',
+  join(STATE_TRANSFER, '..')], { input: JSON.stringify({ agentCount: 1, totalTokens: 1, logs: [], result }), encoding: 'utf8' })
+  assert.equal(done.status, 0, done.stderr)
+  return JSON.parse(done.stdout)
+}
+
+test("merge.py's waiver refuses a greptile-unreviewed stop that cut short the settling of another bot's finding", async () => {
+  const fingerprint = `coderabbit,greptile|coderabbit,greptile|${'0123456789abcdef'.repeat(2)}`
+  const failed = { outcome: 'failed', detail: 'the head event time is unknown' }
+  let n = 0
+  const cut = await run({
+    args: { ...GT, maxCycles: 5 }, minutesPerCycle: 3, gTrigger: failed,
+    reviewsPerCycle: () => ({ ...silentG(), fingerprint, ...(++n > 1 ? { findings: [invalidFinding({ commentId: 4 })], replies: [{ commentId: 4, body: 'not a bug: x' }] } : {}) }),
+  })
+  assert.equal(cut.result.reason, 'greptile-unreviewed')
+  assert.deepEqual([cut.result.state.debt, cut.result.state.answeredWith], [[], []], 'stopped before the finding was answered or owed')
+  assert.deepEqual(waivedLaunch(cut.result), ["launch: stopped greptile-unreviewed with finding(s) 4#1 of its last harvest not settled in its state: the waiver covers the bot's review only"])
+  n = 0
+  const quietCut = await run({ args: { ...GT, maxCycles: 5 }, minutesPerCycle: 3, gTrigger: failed, reviewsPerCycle: () => ({ ...silentG(), fingerprint }) })
+  assert.equal(quietCut.result.reason, 'greptile-unreviewed')
+  assert.deepEqual(waivedLaunch(quietCut.result), [], 'nothing harvested, nothing to settle')
+  // A second finding on a comment already answered, harvested in the cycle the request failed in, was never challenged or decided.
+  n = 0
+  const both = [invalidFinding({ commentId: 1 }), invalidFinding({ commentId: 1, line: 2 })]
+  const sameComment = await run({
+    args: { ...GT, autoPush: true, maxCycles: 5 }, minutesPerCycle: 3, gTrigger: failed,
+    reviewsPerCycle: () => ({ ...silentG(), fingerprint, findings: ++n > 1 ? both : both.slice(0, 1), replies: [{ commentId: 1, body: 'not a bug: x' }] }),
+  })
+  assert.equal(sameComment.result.reason, 'greptile-unreviewed')
+  assert.deepEqual(sameComment.result.state.decisions.map(([id]) => id), ['1#1'])
+  assert.deepEqual(sameComment.result.state.answeredWith.map(([id, a]) => [id, a.digest]), [[1, 'd1']])
+  assert.deepEqual(sameComment.labels.filter(l => l.startsWith('challenge')), ['challenge#1'])
+  assert.deepEqual(waivedLaunch(sameComment.result), ["launch: stopped greptile-unreviewed with finding(s) 1#2 of its last harvest not settled in its state: the waiver covers the bot's review only"])
+  // The stop after a settled cycle: the refutation posted, recorded in answeredWith, so the waiver lifts it.
+  const settled = await run({
+    args: { ...GT, autoPush: true, maxCycles: 8 }, minutesPerCycle: 2,
+    reviews: { ...silentG(), fingerprint, findings: [invalidFinding({ commentId: 4 })], replies: [{ commentId: 4, body: 'not a bug: x' }] },
+  })
+  assert.equal(settled.result.reason, 'greptile-unreviewed')
+  assert.deepEqual(settled.result.state.answeredWith.map(([id, a]) => [id, a.digest]), [[4, 'd4']])
+  assert.deepEqual(waivedLaunch(settled.result), [])
+})
