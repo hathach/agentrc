@@ -1134,6 +1134,15 @@ class RelayTest(RelayCase):
         self.assertIn('refused', self.relay(force=True)[0])
         self.assertIn(first, captain.open_items(captain.records()))
 
+    def test_force_cancels_nothing_when_the_screen_read_fails(self):
+        first = self.relayed()
+        self.say('stop and inspect')
+        with mock.patch.object(captain, 'read_screen', side_effect=captain.hc.Error('socket closed')):
+            self.assertRaises(captain.hc.Error, self.relay, force=True)
+        recs = captain.records()
+        self.assertIn(first, captain.open_items(recs))
+        self.assertFalse(any(r['type'] == 'cancel' for r in recs))
+
     def test_a_busy_target_holds_the_relay_and_retry_sends_it_unchanged(self):
         self.terminals['t2'] = {**pinned('t2'), 'status': 'working'}
         self.say('merge o/r#12')

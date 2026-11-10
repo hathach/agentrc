@@ -1952,13 +1952,13 @@ def relay(targets, entry, mine, decided=None, force=False, pinned=None):
             if linked and session_of(linked['owner']) != session_of(target):
                 print(f'{address}: refused, the decision {binding["item"]} is not this session\'s', flush=True)
                 continue
+            busy = refusal(target)   # reads the screen, which can fail: before any cancel
             for msg in stale:
                 append({'type': 'cancel', 'msg': msg})
                 print(f'{address}: cancelled {msg}', flush=True)
             action = new_id('a', recs)
             fields = {'entry': uid, 'quote': quote, 'context': context(target, recs) + settles(linked, binding),
                       **binding}
-            busy = refusal(target)
             if busy:
                 append(item('relay', action, captain, target, **fields))
                 append({'type': 'held', 'msg': action, 'why': busy})
