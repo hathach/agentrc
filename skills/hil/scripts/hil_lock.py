@@ -852,6 +852,12 @@ def _receipt_text(r) -> str:
         owner = f'uid {r["uid"]}' if isinstance(r.get('uid'), int) else 'its owner'
         return (f'operations in {r["foreign"]!r:.200} (uid {os.geteuid()} cannot recheck them: rerun as {owner} or '
                 f'root, or have either remove that claim\'s file in {BOARD_LOCK_DIR} once none runs)')
+    if isinstance(r, dict) and 'unrecheckable' in r:     # a run without a receipt: its command or why
+        what = r['unrecheckable']
+        what = ' '.join(map(str, what)) if isinstance(what, list) else str(what)
+        alive = f', surviving pids {r["survivors"]!r:.80}' if r.get('survivors') else ''
+        token = f' {r["token"]!r:.40}' if 'token' in r else ''
+        return f'unrecheckable run{token} ({what:.200}{alive})'
     sup = r.get('supervisor') if isinstance(r, dict) else None
     pid = sup.get('pid') if isinstance(sup, dict) else None
     return f'receipt {r.get("token")} (supervisor pid {pid})' if isinstance(r, dict) else f'receipt {r!r:.80}'

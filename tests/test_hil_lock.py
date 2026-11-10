@@ -1763,6 +1763,24 @@ class CleanupLog(LockDir):
         self.assertTrue(all('journal cannot be read' in n for n in notes[10:13]), notes[10:13])
         self.assertIn('malformed', notes[13])
 
+    def test_an_unrecheckable_marker_stays_open_naming_its_command_and_survivors(self):
+        """A run without a receipt (hil_reserve's survivor, the farm check's lost supervisor, recheck_dir's
+        diagnostic) is named by what it recorded, never as `receipt None (supervisor pid None)` (agentrc#475)."""
+        markers = [{'unrecheckable': ['sudo', '-n', 'recover', 'reset', '3-1.1'], 'survivors': [4242, 4243]},
+                   {'unrecheckable': ['JLinkExe'], 'at': 1.0},
+                   {'token': 'tok', 'unrecheckable': 'no .json file', 'files': []},
+                   {'unrecheckable': {'odd': 1}}]
+        hil_lock.log_cleanup_failure(BOARD, 'hil_reserve', detail='survivors', receipts=markers)
+        [note] = hil_lock.resolve_restored(BOARD, hil_lock.open_cleanup_failures(BOARD), evidence='restored')
+        self.assertNotIn('receipt None', note)
+        for text in ("unrecheckable run (sudo -n recover reset 3-1.1, surviving pids [4242, 4243]) unknown",
+                     'unrecheckable run (JLinkExe) unknown', "unrecheckable run 'tok' (no .json file) unknown",
+                     "unrecheckable run ({'odd': 1}) unknown"):
+            self.assertIn(text, note)
+        self.assertEqual(len(hil_lock.open_cleanup_failures(BOARD)), 1)
+        self.assertEqual(hil_lock.open_runs([{'token': 't', 'supervisor': {'pid': 7}}, 'path'], ['pending', 'gone']),
+                         ['receipt t (supervisor pid 7) pending', "receipt 'path' gone"])
+
     def test_a_session_command_logs_a_failure_without_the_flock(self):
         self.acquire()   # a detached hold: the command logging runs under it, not as its holder
         event = hil_lock.log_cleanup_failure(BOARD, 'hil_test.py', detail='restore failed', receipts=[{'pid': 5}])
