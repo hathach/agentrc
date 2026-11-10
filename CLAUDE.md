@@ -19,7 +19,17 @@ User-wide rules are in `instructions/user.md`; edit them there, and keep
   configuration, backward compatibility, tests and docs kept in step, the
   repository's own conventions`.
 - `pr-babysit` args for this repo:
-  `{"pr": <num>, "reviewers": ["coderabbit", "copilot", "greptile"], "autoRun": ["coderabbit"], "coderabbitTrigger": true, "greptileTrigger": true}`;
+  `{"pr": <num>, "reviewers": ["coderabbit", "copilot"], "autoRun": ["coderabbit"], "coderabbitTrigger": true}`;
+  Greptile is left out until 2026-12-01 (review credits used up); then add
+  `"greptile"` back to `reviewers` and `"greptileTrigger": true`.
+  Until then a merge launch here omits `greptileTrigger`, which chief's
+  merge exception sets but pr-babysit rejects without greptile in
+  `reviewers`. The merge also needs the owner's own words accepting it
+  without Greptile (`merge.py --waive greptile`); this note waives nothing.
+  Runs started on the earlier args keep requiring Greptile, as the
+  `greptileTrigger` entry in `skills/pr-babysit/ARGUMENTS.md` describes;
+  their state refuses the args above, so only a fresh run without `stateRef`
+  uses them, and its merge still needs the waiver.
   Greptile auto-reviews on `open` events (`.greptile/config.json`); request
   another review with `@greptileai`, which `greptileTrigger` posts once per
   pushed head Greptile has not reviewed.
