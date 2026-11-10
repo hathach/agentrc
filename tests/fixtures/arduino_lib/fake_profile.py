@@ -26,6 +26,7 @@ BOARDS = {
     'rig_esp': {'fqbn': 'esp:esp32:s3', 'family': 'fb', 'filters': 'dev_b', 'span': (0, 0x400000), 'chip': 'esp32s3',
                 'fixture': 'test/hil/fixture.cpp'},
 }
+REMOTE_ROSTER = 'test/hil/ci.json'
 REPRESENTATIVES = {'fa': ['rig_ocd', 'host_ci'], 'fb': ['rig_jlink', 'dev_b']}
 HIL_SKETCHES = {'device': ('examples/Basic/echo', 'examples/HID/inout', 'test/hil/sketches/probe'),
                 'host': ('examples/Host/info',)}
@@ -97,7 +98,7 @@ def hil_profile(build, **over):
         TEST_FUNCS={'echo': lambda *a: (True, 'echoed'), 'inout': lambda *a: (True, 'echoed'),
                     'probe': lambda *a: (True, 'probed')},
         REPORT_SCHEMA='fake-usb-hil', step_host=lambda *a: {'test': a[3], 'pass': True, 'detail': 'host'},
-        REMOTE_BASE='~/hil-remote/fake-usb', REMOTE_ROSTER='test/hil/ci.json', HIL='hil/hil_test.py')
+        REMOTE_BASE='~/hil-remote/fake-usb', REMOTE_ROSTER=REMOTE_ROSTER, HIL='hil/hil_test.py')
     vars(p).update(over)
     return p
 
@@ -114,6 +115,37 @@ def roster(path, **entries):
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     Path(path).write_text(json.dumps(data))
     return Path(path)
+
+
+def clean_checkout(tmp, git, ignore):
+    """The fake library at tmp/lib as a clean git checkout with its roster at REMOTE_ROSTER and `ignore` as its
+    .gitignore, and a stand-in agentrc at tmp/agentrc, for test_arduino_ci and test_arduino_remote: a namespace of
+    root, head, agentrc, BP (build profile) and HP (HIL profile). `git(root, *args)` runs git without GIT_* env."""
+    root = library(tmp / 'lib')
+    roster(root / REMOTE_ROSTER)
+    (root / '.gitignore').write_text(ignore)
+    git(root, 'init', '-q')
+    git(root, 'add', '-A')
+    git(root, 'commit', '-qm', 'init')
+    identity = agentrc(tmp / 'agentrc')
+    bp = build_profile(root, identity)
+    return types.SimpleNamespace(root=root, head=git(root, 'rev-parse', 'HEAD'), agentrc=identity, BP=bp,
+                                 HP=hil_profile(bp))
+
+
+def hil_record(root, head, identity, board, at=None, **over):
+    """A clean build record of `board` at `head`, one echo image, written as build/hil/<at, default board>.build.json
+    with `over` applied; `identity` is the engine's contract_identity(). Returns its path."""
+    elf = root / f'build/hil/{board}/echo/echo.ino.elf'
+    elf.parent.mkdir(parents=True, exist_ok=True)
+    elf.write_bytes(b'elf')
+    rec = {'kind': 'arduino-hil-build', 'version': 2, 'library': NAME, 'board': board, 'experimental': False,
+           'source': {'head': head}, **identity,
+           'sketches': {'echo': {'sha256': {elf.relative_to(root).as_posix(): hashlib.sha256(b'elf').hexdigest()}}},
+           **over}
+    path = root / f'build/hil/{at or board}.build.json'
+    path.write_text(json.dumps(rec))
+    return path
 
 
 CORE_NAME = 'Fake Core Boards'

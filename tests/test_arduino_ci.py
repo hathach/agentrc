@@ -44,16 +44,7 @@ class Checkout(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tmpdir(self)
-        self.root = fake.library(self.tmp / 'lib')
-        fake.roster(self.root / ROSTER)
-        (self.root / '.gitignore').write_text('/build/\n')
-        git(self.root, 'init', '-q')
-        git(self.root, 'add', '-A')
-        git(self.root, 'commit', '-qm', 'init')
-        self.head = git(self.root, 'rev-parse', 'HEAD')
-        self.agentrc = fake.agentrc(self.tmp / 'agentrc')
-        self.BP = fake.build_profile(self.root, self.agentrc)
-        self.HP = fake.hil_profile(self.BP)
+        vars(self).update(vars(fake.clean_checkout(self.tmp, git, '/build/\n')))
         stack = contextlib.ExitStack()
         self.addCleanup(stack.close)
         for target, name, value in ((C, 'P', self.HP), (R, 'P', self.HP), (R.H, 'P', self.HP), (R.B, 'P', self.BP)):
@@ -61,16 +52,7 @@ class Checkout(unittest.TestCase):
         self.record_path = self.record()
 
     def record(self, board=BOARD):
-        elf = self.root / f'build/hil/{board}/echo/echo.ino.elf'
-        elf.parent.mkdir(parents=True, exist_ok=True)
-        elf.write_bytes(b'elf')
-        rec = {'kind': 'arduino-hil-build', 'version': 2, 'library': fake.NAME, 'board': board, 'experimental': False,
-               'source': {'head': self.head}, **R.B.contract_identity(),
-               'sketches': {'echo': {'sha256': {elf.relative_to(self.root).as_posix(): hashlib.sha256(b'elf')
-                                                .hexdigest()}}}}
-        path = self.root / f'build/hil/{board}.build.json'
-        path.write_text(json.dumps(rec))
-        return path
+        return fake.hil_record(self.root, self.head, R.B.contract_identity(), board)
 
     def main(self, *argv):
         with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
