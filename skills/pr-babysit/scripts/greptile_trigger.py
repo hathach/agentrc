@@ -29,13 +29,18 @@ claim without a receipt only looks for the comment that claim made. The outcome:
              or read back: nothing is posted for SHA from this checkout again
              while the record stands; detail names it
 
+A failed line adds phase: `read` when a GitHub read failed before this run
+claimed the head, so nothing was posted and a rerun may ask; the outcomes
+above add none. Such a read answered HTTP 502, 503 or 504 is read once more
+after a short pause first; a rate limit, or any other failure, is not.
+
 detail names the comment ("comment N") on requested and already; at is that
 comment's time on those, else the UTC time the script finished. commentId is the
 comment's id on requested and already, and on an uncertain one that was posted
 and did not read back. stdout ends with one JSON line {outcome, detail, at,
 commentId?, seal} (seal: facts.sealed). Exit 2 with
-{"error": ...} when the arguments are wrong or GitHub's answer cannot be read, the workflow
-file of a run that might date the head included (harvest.workflow_file), with nothing posted.
+{"error": ...} when the arguments are wrong, or GitHub's answer cannot be read after
+the claim, the comment that claim made possibly posted.
 A rerun after a lost line reports `already`.
 Deduplication is this checkout's: with no receipt recorded here, a later
 head event on the same SHA (a reopen after a request made elsewhere or by
@@ -45,18 +50,21 @@ reliably, so a duplicate is preferred to a missed review.
 
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from coderabbit_trigger import pull_at  # noqa: E402
-from facts import FULL_SHA, Parser, Unusable, attempt, bind_repo, git, locked, report, utc  # noqa: E402
+from coderabbit_trigger import Failed, pull_at  # noqa: E402
+from facts import FULL_SHA, Parser, RateLimited, Unusable, attempt, bind_repo, git, locked, report, utc  # noqa: E402
 from harvest import gh_json, head_event, newest, pages, stamp  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
 import windows  # noqa: E402
 
 REQUEST = '@greptileai'
+TRANSIENT = re.compile(r'\bHTTP 50[234]\b')  # a gateway's answer, not GitHub's verdict on the request
+RETRY_S = 2  # seconds before a transient read is made again
 
 
 def record_dir():
@@ -113,7 +121,27 @@ def found(path, record, outcome, pr, why):
 
 
 def request(pr, head):
-    pull, why = pull_at(pr, head)
+    # Only before_claim raises Failed: a failure once the head is claimed stays an error line or an outcome.
+    try:
+        return claimed(pr, head)
+    except Failed as e:
+        return {'outcome': 'failed', 'detail': str(e), 'phase': e.phase}
+
+
+def before_claim(step, *args, again=True):
+    """step(*args), a GitHub read made before this run claims the head, so its failure posted nothing; one answered
+    by a gateway is made once more when again."""
+    try:
+        return step(*args)
+    except Unusable as e:
+        if not again or isinstance(e, RateLimited) or not TRANSIENT.search(str(e)):
+            raise Failed(str(e), 'read') from None
+    time.sleep(RETRY_S)
+    return before_claim(step, *args, again=False)
+
+
+def claimed(pr, head):
+    pull, why = before_claim(pull_at, pr, head)
     if why:
         return {'outcome': 'notOpen', 'detail': why}
     repo = pull['base']['repo']['full_name']
@@ -125,10 +153,11 @@ def request(pr, head):
             return {'outcome': 'already', 'detail': f"comment {r['id']}", 'commentId': r['id'], 'at': r['at']}
         if record:
             return found(path, record, 'already', pr, f"an attempt claimed this head at {record['claimedAt']} and its comment is not on the PR")
-        standing = asks(pr)
+        standing = before_claim(asks, pr)
         view = {'headRefName': pull['head']['ref'], 'headRepository': {'nameWithOwner': pull['head']['repo']['full_name']}}
         # Only a standing request needs the head's time; a workflow file that would date it and cannot be read is an error line.
-        event_at, evidence = head_event(repo, pr, view, head) if standing else (None, '')
+        # head_event reads the workflow that would date the head again itself
+        event_at, evidence = before_claim(head_event, repo, pr, view, head, again=False) if standing else (None, '')
         if standing and event_at is None:
             return {'outcome': 'failed', 'detail': f"the head event time is unknown ({evidence}), so comment {standing[-1]['id']} "
                                                    'cannot be placed before or after it: nothing posted'}
@@ -142,7 +171,7 @@ def request(pr, head):
             return {'outcome': 'ambiguous', 'detail': f"comment {tied[0]['id']} was made at {event_at}, the head event's own second ({evidence}): "
                                                       'nothing posted'}
         # The reads above take a while: a PR closed or pushed meanwhile is not asked about.
-        why = pull_at(pr, head)[1]
+        why = before_claim(pull_at, pr, head)[1]
         if why:
             return {'outcome': 'notOpen', 'detail': why}
         mine = claim(path, [c['id'] for c in standing])

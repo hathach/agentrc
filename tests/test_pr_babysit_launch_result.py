@@ -302,6 +302,19 @@ class LaunchResultTest(unittest.TestCase):
         rc, s = self.run_it(output(result={'pass': True, 'status': 'complete', 'state': {'expectedHead': NEXT, 'cyclesUsed': 5, 'maxCycles': 5}}))
         self.assertEqual(s['blockers'], [], 'a launch that passed on its last cycle needs no relaunch')
 
+    def test_a_greptile_request_that_posted_nothing_names_the_retry_a_relaunch_makes(self):
+        # #425: a pre-claim 502 on the last cycle keeps the head's one retry for the next launch.
+        base = {'pass': False, 'status': 'blocked', 'reason': 'greptile-unreviewed', 'state': {'expectedHead': NEXT, 'cyclesUsed': 5, 'maxCycles': 5}}
+        rc, s = self.run_it(output(result={**base, 'greptileRetry': True}))
+        self.assertIn("cycle budget spent: 5 of 5; a relaunch needs a larger maxCycles, the user's decision", s['blockers'])
+        said = [b for b in s['blockers'] if b.startswith('Greptile has not reviewed the head')]
+        self.assertEqual(len(said), 1, s['blockers'])
+        self.assertIn('posted nothing', said[0])
+        self.assertIn('a relaunch asks Greptile once more', said[0])
+        self.assertNotIn('relaunch once Greptile reviewed the head', said[0])
+        rc, s = self.run_it(output(result=base))
+        self.assertTrue(any('relaunch once Greptile reviewed the head' in b for b in s['blockers']), 'a final request keeps its blocker')
+
     def test_a_state_too_large_to_load_is_a_blocker(self):
         rc, s = self.run_it(output(result={'pass': True, 'status': 'complete', 'stateTooLarge': 70000,
                                            'state': {'expectedHead': NEXT, 'cyclesUsed': 1, 'maxCycles': 5}}))

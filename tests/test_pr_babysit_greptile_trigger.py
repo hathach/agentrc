@@ -195,7 +195,7 @@ class Trigger(unittest.TestCase):
         self.assertFalse((self.dir / f'o-r-7-{HEAD}.json').exists(), 'nothing claimed')
         self.assertEqual(self.run_with(Rig(runs=()))[1]['outcome'], 'requested')
 
-    def test_an_unreadable_workflow_that_would_date_the_head_is_an_error_line_not_an_unknown_time(self):
+    def test_an_unreadable_workflow_that_would_date_the_head_is_a_read_failure_not_an_unknown_time(self):
         # #242: a pull_request run dates the head, and its workflow file does not read twice.
         reads = []
 
@@ -213,14 +213,78 @@ class Trigger(unittest.TestCase):
         rig = unreadable(Rig(comments=[standing], runs=(dict(RUN, event='pull_request'),)))
         with mock.patch.object(harvest, 'WORKFLOW_RETRY_S', 0):
             code, out = self.run_with(rig)
-        self.assertEqual(code, 2)
-        self.assertIn('workflow .github/workflows/ci.yml at aaaaaaaaa could not be read (gh api: HTTP 503)', out['error'])
+        self.assertEqual((code, out['outcome'], out['phase']), (0, 'failed', 'read'))
+        self.assertIn('workflow .github/workflows/ci.yml at aaaaaaaaa could not be read (gh api: HTTP 503)', out['detail'])
         self.assertEqual(len(reads), 2, 'read again once')
         self.assertEqual(rig.posts, [])
         self.assertFalse((self.dir / f'o-r-7-{HEAD}.json').exists(), 'nothing claimed')
         fresh = unreadable(Rig(runs=(dict(RUN, event='pull_request'),)))
         self.assertEqual(self.run_with(fresh)[1]['outcome'], 'requested', 'with no request standing the head time is not needed')
         self.assertEqual(len(reads), 2, 'nor read')
+
+    def failing(self, rig, path, error, times=None):
+        """rig with each GET of path failing with error, the first times of them only when times is given; the reads made."""
+        answer, reads = rig.run, []
+
+        def run(*argv, ok=(0,)):
+            if path in argv[-1]:
+                reads.append(argv[-1])
+                if times is None or len(reads) <= times:
+                    raise error
+            return answer(*argv, ok=ok)
+        rig.run = run
+        return reads
+
+    def test_a_read_that_fails_before_the_claim_is_a_failed_read_and_a_rerun_asks_once(self):
+        # #425: a 502 on the PR read left the head's one request spent with nothing posted.
+        for path in ('/pulls/7', '/comments?'):
+            with self.subTest(path):
+                self.dir = Path(tempfile.mkdtemp())
+                self.addCleanup(shutil.rmtree, self.dir)
+                rig = Rig()
+                answer = rig.run
+                self.failing(rig, path, facts.Unusable('gh: HTTP 502'))
+                with mock.patch.object(trigger, 'RETRY_S', 0):
+                    code, out = self.run_with(rig)
+                self.assertEqual((code, out['outcome'], out['phase'], out['detail']), (0, 'failed', 'read', 'gh: HTTP 502'))
+                self.assertEqual(rig.posts, [])
+                self.assertFalse((self.dir / f'o-r-7-{HEAD}.json').exists(), 'nothing claimed')
+                rig.run = answer
+                self.assertEqual(self.run_with(rig)[1]['outcome'], 'requested')
+                self.assertEqual(len(rig.posts), 1)
+
+    def test_a_gateway_failure_before_the_claim_is_read_once_more_and_nothing_else_is(self):
+        rig = Rig()
+        reads = self.failing(rig, '/pulls/7', facts.Unusable('gh: Bad Gateway (HTTP 502)'), times=1)
+        with mock.patch.object(trigger.time, 'sleep') as slept:
+            code, out = self.run_with(rig)
+        self.assertEqual((code, out['outcome'], len(rig.posts)), (0, 'requested', 1))
+        self.assertEqual(slept.call_args_list.count(mock.call(trigger.RETRY_S)), 1, 'after one pause')
+        self.assertEqual(len(reads), 3, 'the failed PR read made again, then the one just before the claim')
+        for error in (facts.Unusable('gh: Bad Gateway (HTTP 502)'), facts.Unusable('gh: Requires authentication (HTTP 401)'),
+                      facts.RateLimited('gh: HTTP 503: secondary rate limit', {'secondary': True})):
+            with self.subTest(str(error)):
+                self.dir = Path(tempfile.mkdtemp())
+                self.addCleanup(shutil.rmtree, self.dir)
+                rig = Rig()
+                reads = self.failing(rig, '/pulls/7', error)
+                with mock.patch.object(trigger.time, 'sleep'):
+                    code, out = self.run_with(rig)
+                self.assertEqual((code, out['outcome'], out['phase'], rig.posts), (0, 'failed', 'read', []))
+                self.assertEqual(len(reads), 2 if 'HTTP 502' in str(error) and type(error) is facts.Unusable else 1,
+                                 'a gateway failure is read twice at most, any other once')
+
+    def test_a_read_that_fails_after_the_claim_is_an_error_line_and_a_rerun_never_posts(self):
+        rig = Rig(post_code=1, lost=True)
+        answer = rig.run
+        rig.run = lambda *argv, ok=(0,): (_ for _ in ()).throw(facts.Unusable('gh: HTTP 502')) \
+            if '/comments?' in argv[-1] and rig.posts else answer(*argv, ok=ok)
+        code, out = self.run_with(rig)
+        self.assertEqual(code, 2)
+        self.assertNotIn('phase', out)
+        rig.run = answer
+        self.assertEqual(self.run_with(rig)[1]['outcome'], 'uncertain', 'the claim stands: looked for, never posted again')
+        self.assertEqual(len(rig.posts), 1)
 
     def test_nothing_is_posted_unless_the_pr_is_open_at_the_head(self):
         for what, rig in (('closed', Rig(state='closed')), ('another head', Rig(head='b' * 40))):

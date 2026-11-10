@@ -370,6 +370,8 @@ if (args.state !== undefined && args.state !== null) {
       Number.isFinite(Date.parse(st.reviewClock.since)) && (st.reviewClock.eventAt === null || Number.isFinite(Date.parse(st.reviewClock.eventAt))) &&
       (st.reviewClock.triggeredAt == null || Number.isFinite(Date.parse(st.reviewClock.triggeredAt))) &&
       (st.reviewClock.greptileAt == null || Number.isFinite(Date.parse(st.reviewClock.greptileAt))) &&
+      (st.reviewClock.greptileRetried === undefined || st.reviewClock.greptileRetried === true) &&
+      (st.reviewClock.greptileRetries === undefined || (Number.isInteger(st.reviewClock.greptileRetries) && st.reviewClock.greptileRetries >= 0)) &&
       (st.reviewClock.limitSeen === undefined || Number.isFinite(Date.parse(st.reviewClock.limitSeen))) &&
       (st.reviewClock.requests === undefined || (Number.isInteger(st.reviewClock.requests) && st.reviewClock.requests >= 0)) &&
       (st.reviewClock.request === undefined || (st.reviewClock.request &&
@@ -1027,8 +1029,14 @@ let pin = restored ? restored.pin : null
 // When the wait for a silent bot began, per head; kept across launches so a resume does not restart the cap.
 // triggeredAt: absent until this head's one CodeRabbit trigger, then when the script finished, or null when it failed.
 // greptileAt the same for its one `@greptileai` request. limitSeen dates the first limit, request the last attempt, requests
-// counts attempts on this head. requestUnposted holds the one pre-POST retry allowance until that attempt is recorded.
+// counts attempts on this head. requestUnposted holds the one pre-POST retry allowance until that attempt is recorded;
+// greptileRetried marks this head's one Greptile request retried after a read failed before its claim.
 let reviewClock = restored ? restored.reviewClock : null
+// An earlier shape counted that retry (greptileRetries).
+if (reviewClock && reviewClock.greptileRetries !== undefined) {
+  const { greptileRetries, ...rest } = reviewClock
+  reviewClock = greptileRetries > 0 ? { ...rest, greptileRetried: true } : rest
+}
 // Latched by the first launch with greptileTrigger: from then on every head of this run needs Greptile's review, whatever
 // later launches pass; only posting the request stays with the switch.
 const greptileRequired = greptileTrigger || (!!restored && restored.greptileRequired === true)
@@ -2313,6 +2321,8 @@ const requestCodeRabbit = async (cycle, r, cr, ended) => {
 // A Greptile that reviews only on PR open never sees a pushed head unasked: under greptileTrigger, one `@greptileai` per
 // head once it stayed absent through a grace, then the silent-bot cap counted from the request.
 const GREPTILE_GRACE_MIN = 2
+// How requestGreptile ends a pre-claim failure with no cycle left: the retry is a relaunch's.
+const GREPTILE_RETRY_LEFT = 'failed before posting, its retry left to a relaunch'
 // Returns how Greptile's request ended when that leaves the head unreviewed.
 const requestGreptile = async (cycle, r, bots, lanes, ended) => {
   const g = bots.bots.find(b => b.bot === 'greptile')
@@ -2325,8 +2335,14 @@ const requestGreptile = async (cycle, r, bots, lanes, ended) => {
       ['requested', 'already', 'notOpen', 'failed', 'uncertain', 'ambiguous'])
     // Merged or closed ends the launch; open at another head stops: the head this run must have reviewed is not the PR's.
     if (outcome === 'notOpen') return await ended('greptile') ? null : outcome
+    // A read that failed before the script claimed the head posted nothing: asked once more on this head, the next cycle
+    // or, past the budget, a relaunch's; the script's claim still guards that attempt (#425).
+    if (outcome === 'failed' && t && t.phase === 'read' && !reviewClock.greptileRetried) {
+      reviewClock.greptileRetried = true
+      return budgetLeft() ? null : GREPTILE_RETRY_LEFT
+    }
     const asked = ['requested', 'already'].includes(outcome) && Number.isFinite(Date.parse(t.at))
-    // Once per head, whatever the outcome: a failed, uncertain or ambiguous request is never repeated into a second comment.
+    // Otherwise once per head, whatever the outcome: a failed, uncertain or ambiguous request is never repeated into a second comment.
     reviewClock.greptileAt = asked ? t.at : null
     if (!asked) return outcome
   }
@@ -2839,7 +2855,8 @@ const runLanes = async (cycle, entry, lanes) => {
     if (lanes.prState) return prEnded(cycle, lanes.prState)
     if (unasked) {
       log(`cycle ${cycle}: Greptile must review ${expectedHead.slice(0, 7)}, and its request ended ${unasked} — stopping, the head unreviewed`)
-      return stop(cycle, 'greptile-unreviewed', { head: expectedHead, bots: entry.bots.bots.filter(b => b.bot === 'greptile').map(botOut) })
+      return stop(cycle, 'greptile-unreviewed', { head: expectedHead, bots: entry.bots.bots.filter(b => b.bot === 'greptile').map(botOut),
+        ...(unasked === GREPTILE_RETRY_LEFT ? { greptileRetry: true } : {}) })
     }
     const reviewsSettled = !!entry.bots && entry.bots.bots.every(b => b.done)
     const pendingBots = entry.bots ? entry.bots.bots.filter(b => !b.done) : []

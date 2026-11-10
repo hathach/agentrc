@@ -8801,6 +8801,40 @@ test('a failed, uncertain or lost request stops greptile-unreviewed at once and 
   assert.equal(moved.result.state.reviewClock.greptileAt, undefined, 'nothing was asked')
 })
 
+test('a request whose read failed before its claim is asked once more on the head, across a resume too; never a third time (#425)', async () => {
+  const unread = { outcome: 'failed', detail: 'gh api repos/{owner}/{repo}/pulls/379: gh: HTTP 502', phase: 'read' }
+  const once = await run({ args: { ...GT, maxCycles: 6 }, minutesPerCycle: 3, gTrigger: (l) => l === 'greptile#2' ? unread : { outcome: 'requested', detail: 'comment 7', commentId: 7 }, reviews: silentG() })
+  assert.deepEqual(gAsks(once.labels), ['greptile#2', 'greptile#3'])
+  assert.equal(once.result.state.reviewClock.greptileRetried, true)
+  assert.equal(once.result.state.reviewClock.greptileAt, at(6))
+  const twice = await run({ args: { ...GT, maxCycles: 6 }, minutesPerCycle: 3, gTrigger: unread, reviews: silentG() })
+  assert.deepEqual([twice.result.reason, gAsks(twice.labels)], ['greptile-unreviewed', ['greptile#2', 'greptile#3']])
+  assert.equal(twice.result.state.reviewClock.greptileAt, null, 'the retry spent, the head is not asked again')
+  // Out of budget, the retry is the relaunch's: the allowance is spent in the state, the head left unasked.
+  const YG = { ...GT, maxCycles: 6 }
+  const a = await run({ args: { ...YG, maxCycles: 2 }, minutesPerCycle: 3, gTrigger: unread, reviews: silentG() })
+  assert.deepEqual([a.result.reason, a.result.greptileRetry, gAsks(a.labels)], ['greptile-unreviewed', true, ['greptile#2']])
+  assert.deepEqual([a.result.state.reviewClock.greptileRetried, a.result.state.reviewClock.greptileAt], [true, undefined])
+  const spent = structuredClone(a.result.state) // a resume mutates the state it is handed
+  assert.equal(twice.result.greptileRetry, undefined, 'a spent retry leaves the relaunch nothing to ask')
+  const b = await run({ args: { ...YG, maxCycles: 3, state: a.result.state }, minutesPerCycle: 3, clockOffset: 6, gTrigger: unread, reviews: silentG() })
+  assert.deepEqual([b.result.reason, gAsks(b.labels)], ['greptile-unreviewed', ['greptile#3']])
+  assert.equal(b.result.state.reviewClock.greptileAt, null)
+  // A possibly posted attempt is final at once.
+  const posted = await run({ args: { ...GT, maxCycles: 6 }, minutesPerCycle: 3, gTrigger: { outcome: 'failed', detail: 'post', phase: 'post' }, reviews: silentG() })
+  assert.deepEqual(gAsks(posted.labels), ['greptile#2'])
+  // A state that counted the retry loads: one spent is still spent, none spent leaves it.
+  const { greptileRetried, ...clock } = spent.reviewClock
+  for (const [count, asks] of [[1, ['greptile#3']], [0, ['greptile#3', 'greptile#4']]]) {
+    const counted = seal({ ...structuredClone(spent), reviewClock: { ...clock, greptileRetries: count } })
+    const c = await run({ args: { ...YG, maxCycles: 4, state: counted }, minutesPerCycle: 3, clockOffset: 6, gTrigger: unread, reviews: silentG() })
+    assert.deepEqual([c.result.reason, gAsks(c.labels), c.result.state.reviewClock.greptileRetries], ['greptile-unreviewed', asks, undefined], String(count))
+  }
+  for (const bad of [{ greptileRetried: false }, { greptileRetries: -1 }]) {
+    await assert.rejects(run({ args: { ...YG, state: seal({ ...spent, reviewClock: { ...clock, ...bad } }) } }), /not a pr-babysit state/)
+  }
+})
+
 test('the obligation outlives the switch: a resume without greptileTrigger still waits and blocks, asking nothing', async () => {
   const YG = { ...G, maxCycles: 6, yieldAfterCycle: true }
   // Recorded during the grace, before the first yield.

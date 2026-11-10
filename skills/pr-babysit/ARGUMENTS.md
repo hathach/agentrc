@@ -68,8 +68,11 @@ A key not listed here throws before anything runs.
   reviewed or is scoring is never asked about. The first launch with the switch
   latches the run: its state requires Greptile's review of every later head,
   so a launch without the switch keeps waiting on Greptile, asking nothing. A
-  failed, uncertain or ambiguous request, or no review within the cap, stops
-  `greptile-unreviewed`, never a pass. A rate-limited Greptile (its pause
+  request whose read failed before it claimed the head, so posted nothing, is
+  asked once more on that head, by the next cycle or, with none left, a
+  relaunch from the state (that stop carries `greptileRetry: true`); any other
+  failed, uncertain or ambiguous request, or no review within the
+  cap, stops `greptile-unreviewed`, never a pass. A rate-limited Greptile (its pause
   notice; the limit is monthly) is not waited for: the pass lists it in
   `unreviewed`. Greptile posts that notice on one PR only, so an absent
   Greptile is read against the newest one on the PRs it last reviewed, until

@@ -87,6 +87,10 @@ REFUSED = {
 USER_ASKS = ('the user comments `@coderabbitai review` on the PR or accepts the head '
              'unreviewed, and a relaunch helps only once CodeRabbit reviewed the head, or on a new head')
 CR_UNREVIEWED = 'CodeRabbit has not reviewed the head, and a coderabbitTrigger launch made its review required for every head of this run'
+# A request whose read failed before its claim posted nothing, and the state keeps the head's one retry (#425).
+GREPTILE_RETRY = ('Greptile has not reviewed the head: its request failed on a read before posting, so it posted nothing, and no '
+                  'cycle was left to retry it; a relaunch asks Greptile once more on this head from the returned state, once any other '
+                  "blocker allows one; shipping the head unreviewed is the user's decision")
 ENDED = {'pr-merged': 'the PR is merged; nothing to continue', 'pr-closed': 'the PR is closed; nothing to continue'}
 # Stops another launch on the same state repeats: what must change first (chief's rule against relaunching on an unchanged blocker).
 STALLED = {
@@ -431,7 +435,9 @@ def summarize(output, output_path, state_ref=None, tree=None, keys=False):
         if ask and result.get('reason') == 'coderabbit-unreviewed':
             blockers.append(coderabbit_blocker(ask))
         else:
-            if result.get('reason') in STALLED:
+            if result.get('reason') == 'greptile-unreviewed' and result.get('greptileRetry') is True:
+                blockers.append(GREPTILE_RETRY)
+            elif result.get('reason') in STALLED:
                 blockers.append(STALLED[result['reason']])
             if ask:
                 notes.append(f'CodeRabbit has not reviewed the head; {relaunch_ask(ask)}')
