@@ -194,7 +194,8 @@ class TaskCost(unittest.TestCase):
                           ('partial with no reason', {**end(1), 'cost': {'status': 'partial', 'usd': '1.00', 'reason': None}}),
                           ('end without session', {k: v for k, v in end(1).items() if k != 'session'}),
                           ('NaN wall', {**end(1), 'wall': float('nan')}),
-                          ('infinite wall', {**end(1), 'wall': float('inf')})):
+                          ('infinite wall', {**end(1), 'wall': float('inf')}),
+                          ('huge wall', {**end(1), 'wall': 10 ** 400})):
             with self.subTest(name):
                 self.write(start(1), bad, start(3), end(3, '2.00'))
                 code, r = self.query()

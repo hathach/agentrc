@@ -15,7 +15,6 @@ read or its lock is not taken in time.
 """
 import argparse
 import json
-import math
 import re
 import sys
 from decimal import Decimal
@@ -27,6 +26,7 @@ import run_ledger  # noqa: E402
 RUN_ID = re.compile(r'[0-9a-f]{32}')
 USD = re.compile(r'\d+\.\d{2}')
 COST_STATES = ('known', 'partial', 'unknown')
+MAX_WALL = 10 ** 9   # seconds: more than any launch runs
 
 
 def shaped(rec):
@@ -44,7 +44,7 @@ def shaped(rec):
         return None
     wall = rec.get('wall')
     if type(rec.get('exit')) is not int or not isinstance(rec.get('reason'), str) or 'session' not in rec or \
-            type(wall) not in (int, float) or not math.isfinite(wall) or wall < 0:
+            type(wall) not in (int, float) or not 0 <= wall <= MAX_WALL:   # NaN and huge ints fail the range
         return 'an end without exit, reason, session or a finite wall'
     cost = rec.get('cost')
     if not isinstance(cost, dict) or set(cost) != {'status', 'usd', 'reason'} or cost['status'] not in COST_STATES:
