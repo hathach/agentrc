@@ -120,11 +120,13 @@ class BuildTest(unittest.TestCase):
         (self.repo / 'secret.c').write_text('x')
         os.chmod(self.repo / 'secret.c', 0)
         self.addCleanup(os.chmod, self.repo / 'secret.c', 0o644)
-        before = set(Path(tempfile.gettempdir()).glob('pr-babysit-build-*'))
+        own = self.repo.parent / 'tmp'     # parallel tests make build dirs in the shared temp dir
+        own.mkdir()
+        self.env['TMPDIR'] = str(own)
         code, out = self.run_script('--path=.', '--command', 'true')
         self.assertEqual(code, 2)
         self.assertIn('Permission denied', out['error'])
-        self.assertEqual(set(Path(tempfile.gettempdir()).glob('pr-babysit-build-*')), before, 'the build dir is gone')
+        self.assertEqual(list(own.glob('pr-babysit-build-*')), [], 'the build dir is gone')
 
     def toolchain(self):
         """An export script that puts a fake idf.py on PATH, as ESP-IDF's does."""
