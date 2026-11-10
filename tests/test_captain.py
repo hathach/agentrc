@@ -3333,6 +3333,17 @@ class StartTest(RelayCase):
         self.assertIn('first task not relayed, a request or relay to t9 is still open', out)
         self.assertIn('`relay t9 --entry u-1`', out)
 
+    def test_a_task_whose_opening_names_another_session_exits_1_and_needs_a_new_message(self):
+        self.say('sp2 fix the lint errors')   # t2's space: a relay to t9 cannot send it as written
+        self.terminals['t9'] = {**pinned('t9'), 'created': 99, 'cwd': self.root, 'session': 's-new', 'pid': 77,
+                                'started': 5}
+        code, out = self.start(task=True)
+        self.assertEqual(code, 1)
+        self.assertNotIn('relay', self.types())
+        self.assertIn("the human's message cannot be relayed as written", out)
+        self.assertIn('first task not relayed, it was refused before anything was recorded', out)
+        self.assertNotIn('--entry', out)
+
     def test_a_failed_start_offers_no_relay(self):
         self.say('start proj and fix the lint errors')
         self.pinned_account = 'ada'

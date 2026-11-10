@@ -2186,7 +2186,15 @@ def start(arg, account, name, space, tab, entry, mine, task=False):
            'failed': f'VERIFICATION FAILED: {why}; the human closes {address}',
            'unchecked': f'VERIFICATION UNCHECKED: {why}; `list` shows whether it is up'}[verification])
     if task and verification == 'verified':
-        why = relay({address: address}, uid, mine, pinned={address: session})[address]
+        try:
+            why = relay({address: address}, uid, mine, pinned={address: session})[address]
+        except SystemExit as stop:
+            if not stop.code:
+                raise
+            # relay() dies only before its loop records anything; die() has already said why
+            print(f'{msg}: first task not relayed, it was refused before anything was recorded; a task for '
+                  f'{address} needs a new message of theirs')
+            return 1
         return first_task(msg, address, uid, session, why)
     elif task:
         print(f'{msg}: first task not relayed, the session is not verified' + (
