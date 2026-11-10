@@ -1418,6 +1418,8 @@ test('the committer gets the claims without their hints, and the message on stdi
 const runCommand = (cmd, root, emit, env = {}) => spawnSync('bash', ['-c', cmd.replace(/AGENTRC_EMIT='[^']+' /, `AGENTRC_EMIT='${emit}' `)],
   { encoding: 'utf8', env: { ...process.env, AGENTRC_DIR: root, ...env } })
 const commandOf = (prompt) => String(prompt).match(/run exactly `([^`]*)` and answer/)[1]
+// The interpreter the commands run under: PIN's /usr/bin/python3 does not exist on Windows; forward slashes for bash.
+const hostPython = () => spawnSync('python3', ['-c', 'import sys; print(sys.executable)'], { encoding: 'utf8' }).stdout.trim().replaceAll('\\', '/')
 
 const HOSTILE = `it's "quoted", \\ back\; \`tick\` $(touch /tmp/pwned) '\\'' \r\nline\r\n naïve ✓ 😀   EOF`
 // A stage that does not decode to the JSON sent: cut short, other JSON, not base64.
@@ -1427,7 +1429,7 @@ test('hostile text in a reply body reaches reply.py byte for byte; a corrupted s
   const tmp = mkdtempSync(join(tmpdir(), 'pr-babysit-exec-'))
   try {
     const { calls, emitDir } = await run({
-      keepEmit: true, args: YIELD, reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: HOSTILE }], bots: 'reviewed' },
+      keepEmit: true, args: { ...YIELD, python: hostPython() }, reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: HOSTILE }], bots: 'reviewed' },
     })
     // reply.py stands in as a copy of its --manifest beside its receipt; the stage is the real facts.py's.
     const stub = join(tmp, 'skills', 'pr-reply', 'scripts')
@@ -1458,7 +1460,7 @@ test('a CI verdict reaches collect.py remember with no shell quoting, byte for b
   const tmp = mkdtempSync(join(tmpdir(), 'pr-babysit-exec-'))
   const ROOT = fileURLToPath(new URL('..', import.meta.url))
   try {
-    const { calls, emitDir } = await run({ keepEmit: true, args: YIELD, reviews: WAITING, ci: redWith({ ...RIG, firstError: HOSTILE }).ci })
+    const { calls, emitDir } = await run({ keepEmit: true, args: { ...YIELD, python: hostPython() }, reviews: WAITING, ci: redWith({ ...RIG, firstError: HOSTILE }).ci })
     const remember = calls.find(c => c.label === 'ci:collect#1.w')
     const verdicts = stagedOf(remember.prompt)
     assert.equal(verdicts[0].failures[0].firstError, HOSTILE)
