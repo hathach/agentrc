@@ -940,6 +940,8 @@ class ChiefRun(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.wait_until('the end record', lambda: len(self.ledger()) == 2)
         self.assertEqual([(x['type'], x.get('exit')) for x in self.ledger()], [('start', None), ('end', 1)], 'detached too')
+        pid = int(r.stdout.split('launcher pid ')[1].split(',')[0])
+        self.wait_until('the launcher to exit', lambda: not pid_alive(pid))   # Windows will not remove its open logs
         Path(self.env['AGENTRC_CHIEF_RUNS']).unlink()
         shutil.rmtree(self.out)
         mute = failing.replace('chief_run.Progress.line = broken\n', 'chief_run.Progress.line = broken\n'
