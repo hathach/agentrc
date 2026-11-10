@@ -1263,9 +1263,15 @@ def op_restore(args, board, run_dir, tracker, manifest):
 
 
 def release_hold(name):
-    """End the caller's hold once its board is restored; under the session lock, so no command slips in between."""
-    r = subprocess.run([sys.executable, str(A.root / LOCK_SCRIPT), 'release', name],
-                       capture_output=True, text=True, timeout=30)
+    """End the caller's hold once its board is restored; under the session lock, so no command slips in between.
+    The helper runs in its own session and a SIGINT/SIGTERM to the caller waits for it (bounded by its timeout): a
+    signal to the caller's group (a tty Ctrl-C, `timeout`) would kill it before it signalled the holder."""
+    hold = A.process.InterruptHold()
+    try:
+        r = subprocess.run([sys.executable, str(A.root / LOCK_SCRIPT), 'release', name],
+                           capture_output=True, text=True, timeout=30, start_new_session=True)
+    finally:
+        hold.release()
     return {'exit': r.returncode, 'output': (r.stdout + r.stderr).strip()[-1000:]}
 
 

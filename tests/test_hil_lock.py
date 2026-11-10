@@ -981,6 +981,119 @@ class LeftCleanup(LockDir):
         self.assertEqual((f['pid'], f['detail']), (pid, 'restore failed'))
         self.assertNotIn('noteError', f)
 
+    def test_a_restore_cut_short_never_reads_as_our_new_record(self):
+        """Log append, our record's last write and then the restore's write k all fail, each write
+        cut after its first byte (agentrc#477): the old record or an unreadable one, never ours."""
+        real = hil_lock._pwrite_all
+        for k in (1, 2, 3):                # the restore's sentinel, body and first byte
+            with self.subTest(restore_write=k):
+                pid = self.dead_record(cleanupOwed=True, detail='restore failed')
+                old = self.lock_bytes()
+                calls = []
+
+                def faulty(fd, data, offset):
+                    calls.append(data)
+                    if len(calls) == 3:    # _write_record's final first byte
+                        raise OSError(28, 'No space left on device')
+                    if len(calls) == 3 + k:
+                        os.pwrite(fd, data[:1], offset)
+                        raise OSError(28, 'No space left on device')
+                    real(fd, data, offset)
+                with mock.patch.object(hil_lock, '_log_append', mock.Mock(side_effect=OSError(28, 'full'))), \
+                        mock.patch.object(hil_lock, '_pwrite_all', faulty), \
+                        self.assertRaises(hil_lock.LockUnavailable) as cm:
+                    self.acquire()
+                self.assertIn('leftover record not restored', str(cm.exception))
+                state, rec = hil_lock.record_state(BOARD)
+                self.assertTrue(state == 'unreadable' or self.lock_bytes() == old, (state, rec))
+                f = taken_failure(self.acquire())
+                self.assertEqual(f['how'], 'found-left')
+                self.assertTrue(f['pid'] == pid or 'unreadable' in f['task'], f)
+                os.unlink(hil_lock.lock_path(BOARD))
+
+    def interrupted_take(self, **patches):
+        """A take interrupted by KeyboardInterrupt under `patches`, its exception kept as an
+        interactive caller keeps it; returns that exception."""
+        with ExitStack() as stack:
+            for name, value in patches.items():
+                stack.enter_context(mock.patch.object(hil_lock, name, value))
+            try:
+                hil_lock.take_board_lock(BOARD, 'selftest')
+            except KeyboardInterrupt as e:
+                return e                # with its traceback: assertRaises would clear its frames
+        self.fail('not interrupted')
+
+    def test_an_interrupt_between_flock_and_return_drops_the_flock(self):
+        """A caller that keeps the exception, and so the frame, never keeps the flock (agentrc#477);
+        the record is left as found, cleared once its leftover is logged, or put back."""
+        real_pwrite = hil_lock._pwrite_all
+
+        def interrupt(*a, **k):
+            raise KeyboardInterrupt
+
+        def at_body(fd, data, offset):    # our record's second write, once
+            if offset == 1 and not interrupted:
+                interrupted.append(1)
+                raise KeyboardInterrupt
+            real_pwrite(fd, data, offset)
+        full = mock.Mock(side_effect=OSError(28, 'full'))
+        for name, patches, left in (
+                ('logging the leftover', {'_log_append': interrupt}, 'old'),
+                ('writing our record, leftover logged', {'_pwrite_all': at_body}, 'empty'),
+                ('writing our record, leftover not logged', {'_pwrite_all': at_body, '_log_append': full}, 'old'),
+                ('reading the open failures', {'open_cleanup_failures': interrupt}, 'empty')):
+            with self.subTest(name):
+                interrupted = []
+                pid = self.dead_record(cleanupOwed=True, detail='restore failed')
+                old = self.lock_bytes()
+                kept = self.interrupted_take(**patches)
+                self.assertIsNotNone(kept.__traceback__)
+                self.assertTrue(self.flock_is_free())
+                self.assertEqual(self.lock_bytes(), old if left == 'old' else b'')
+                if left == 'old':
+                    self.assertEqual(taken_failure(self.acquire())['pid'], pid)
+                os.unlink(hil_lock.lock_path(BOARD))
+
+    def test_a_sigint_in_the_log_mutex_wait_drops_the_flock(self):
+        """A real SIGINT while the take waits for the cleanup log's mutex, in a process that keeps
+        the KeyboardInterrupt: the flock is free while it still runs, the leftover still there."""
+        pid = self.dead_record(cleanupOwed=True, detail='restore failed')
+        old = self.lock_bytes()
+        hil_lock._log_append(BOARD, {'event': 'probe'})      # creates the mutex file
+        mutex = open(os.path.join(self.dir, BOARD + hil_lock.CLEANUP_LOG + '.mutex'), 'r+')
+        self.addCleanup(mutex.close)
+        fcntl.flock(mutex, fcntl.LOCK_EX)
+        child = subprocess.Popen([sys.executable, '-c', r'''
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location('agentrc_hil_lock', sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+m.BOARD_LOCK_DIR = sys.argv[2]
+m.LOG_WAIT = 30
+print('taking', flush=True)
+try:
+    m.take_board_lock(sys.argv[3], 'selftest')
+except KeyboardInterrupt as e:
+    kept = e
+    print('interrupted', flush=True)
+sys.stdin.read()
+''', str(SCRIPT), self.dir, BOARD], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        self.addCleanup(child.wait)
+        self.addCleanup(child.stdin.close)
+        self.addCleanup(child.stdout.close)
+        self.assertEqual(child.stdout.readline().strip(), 'taking')
+        deadline = time.monotonic() + 10
+        while self.flock_is_free():       # it holds the board's flock while it waits for the mutex
+            self.assertLess(time.monotonic(), deadline)
+            _sleep(0.02)
+        child.send_signal(signal.SIGINT)
+        self.assertEqual(child.stdout.readline().strip(), 'interrupted')
+        self.assertIsNone(child.poll())
+        self.assertTrue(self.flock_is_free())
+        self.assertEqual(self.lock_bytes(), old)
+        mutex.close()
+        self.assertEqual(taken_failure(self.acquire())['pid'], pid)
+
     def test_a_dead_cleanup_holders_record_under_a_live_taker_is_contention(self):
         """A taker logging a dead holder's record holds the flock with that record still in place."""
         dead = subprocess.Popen([sys.executable, '-c', ''])

@@ -19,6 +19,7 @@ import re
 import shlex
 import shutil
 import signal
+import subprocess
 import sys
 import time
 import types
@@ -26,7 +27,7 @@ from pathlib import Path
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from helpers import (claimant, guard_survivors, kill_quietly, killed_claimant, load_arduino_engine,  # noqa: E402
-                     load_arduino_fixture, proc_stat, tmpdir, wait_done)
+                     load_arduino_fixture, pid_alive, proc_stat, tmpdir, wait_done)
 
 H = load_arduino_engine('skills/arduino/scripts/arduino_hil.py')
 REAL = H.A   # agentrc's own modules, before a test stubs them
@@ -1782,6 +1783,60 @@ class Manual(Base):
         args.board = 'rig_host'
         with self.assertRaisesRegex(H.Refused, 'host board'):
             H.op_check(args, self.board('rig_host'), self.dir, mock.Mock(), None)
+
+
+class ReleaseHelper(unittest.TestCase):
+    """release_hold's `hil_lock.py release` survives a signal to its caller's process group (agentrc#477): a tty
+    Ctrl-C, or `timeout` without --foreground, would kill it before it signalled the holder."""
+
+    HELPER = ('import os, pathlib, sys, time\n'
+              'd = pathlib.Path(__file__).parent\n'
+              '(d / "started").write_text(str(os.getpid()))\n'
+              'time.sleep(1)\n'
+              '(d / "released").write_text(" ".join(sys.argv[1:]))\n')
+    CALLER = ('import json, signal, sys\n'
+              'from pathlib import Path\n'
+              'sys.path.insert(0, sys.argv[2])\n'
+              'from helpers import load_arduino_engine\n'
+              'H = load_arduino_engine("skills/arduino/scripts/arduino_hil.py")\n'
+              'H.A.root = Path(sys.argv[1])\n'
+              'signal.signal(signal.SIGINT, signal.default_int_handler)\n'
+              'try:\n'
+              '    H.release_hold("rig_jlink")\n'
+              'except KeyboardInterrupt:\n'
+              '    print("interrupted", (Path(sys.argv[1]) / H.LOCK_SCRIPT).with_name("released").exists(), flush=True)\n')
+
+    def released_through(self, sig):
+        """Signal the caller's whole group once the helper started; (caller's output, its exit, helper's argv)."""
+        root = tmpdir(self)
+        script = root / H.LOCK_SCRIPT
+        script.parent.mkdir(parents=True)
+        script.write_text(self.HELPER)
+        caller = subprocess.Popen([sys.executable, '-c', self.CALLER, str(root), str(Path(__file__).resolve().parent)],
+                                  stdout=subprocess.PIPE, text=True, start_new_session=True)
+        self.addCleanup(caller.stdout.close)
+        self.addCleanup(kill_quietly, caller.pid, signal.SIGKILL)
+        started, deadline = script.with_name('started'), time.monotonic() + 30
+        while not started.exists() or not started.read_text():
+            self.assertIsNone(caller.poll(), 'the caller exited before its helper started')
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.02)
+        os.killpg(caller.pid, sig)
+        out = caller.stdout.read()
+        code = caller.wait(timeout=30)
+        helper, deadline = int(started.read_text()), time.monotonic() + 10
+        while pid_alive(helper):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.02)
+        released = script.with_name('released')
+        return out, code, released.read_text() if released.exists() else None
+
+    def test_a_group_sigint_waits_for_the_release_then_interrupts(self):
+        self.assertEqual(self.released_through(signal.SIGINT), ('interrupted True\n', 0, 'release rig_jlink'))
+
+    def test_a_group_sigterm_ends_the_caller_but_not_the_release(self):
+        out, code, released = self.released_through(signal.SIGTERM)
+        self.assertEqual((code, released), (-signal.SIGTERM, 'release rig_jlink'))
 
 
 class Commission(Base):

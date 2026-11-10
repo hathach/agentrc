@@ -264,7 +264,11 @@ def _write_record(fh, first: bytes, reason: str, extra: dict) -> None:
     as for REWRITING."""
     data = json.dumps({'pid': os.getpid(), 'reason': reason,
                        'since': time.strftime('%Y-%m-%dT%H:%M:%S%z'), **extra}).encode()
-    fd = fh.fileno()
+    _overwrite(fh.fileno(), first, data)
+
+
+def _overwrite(fd, first: bytes, data: bytes) -> None:
+    """The file's bytes made `data` behind the non-JSON byte `first`, data's own first byte last."""
     _pwrite_all(fd, first, 0)
     _pwrite_all(fd, data[1:], 1)
     os.ftruncate(fd, len(data))
@@ -282,12 +286,11 @@ def clear_record(fh) -> bool:
 
 
 def _restore_record(fh, data: bytes) -> bool:
-    """Put back the record `data` a failed rewrite may have cut short; first byte first, so an
-    interrupted restore reads as unreadable (logged), never as ACQUIRING. False when it failed."""
+    """Put back the record `data` a failed rewrite may have cut short, behind REWRITING: an
+    interrupted restore reads as unreadable (logged), never as a valid splice of the new record.
+    One whose first write fails leaves what the rewrite left. False when it failed."""
     try:
-        fd = fh.fileno()
-        _pwrite_all(fd, data, 0)
-        os.ftruncate(fd, len(data))
+        _overwrite(fh.fileno(), REWRITING, data)
     except OSError:
         return False
     return True
@@ -469,31 +472,48 @@ def take_board_lock(board: str, reason: str, *, protected=False, **extra):
         raise _held_refusal(board) from None
     except OSError as e:
         raise _unavailable(e) from e
+    found, note_error = b'', None      # note_error stays None until the leftover's log attempt returned
     try:
-        found = _handle_record(fh)
-        left = _leftover(board, fh, data=found)
-    except OSError as e:
-        fh.close()
-        raise LockUnavailable(f'board lock unavailable: holder record: {e}') from e
-    note_error = _log_leftover(board, left)
-    # announce ourselves so the other side's conflict message is truthful
+        try:
+            found = _handle_record(fh)
+            left = _leftover(board, fh, data=found)
+        except OSError as e:
+            raise LockUnavailable(f'board lock unavailable: holder record: {e}') from e
+        note_error = _log_leftover(board, left)
+        # announce ourselves so the other side's conflict message is truthful
+        try:
+            _write_record(fh, ACQUIRING, reason, extra)
+        except OSError as e:
+            why = _abandon(fh, found, note_error)
+            fh = None
+            raise LockUnavailable(f'board lock unavailable: holder record: {e}{why}') from e
+        fh.cleanup_failures = open_cleanup_failures(board) + ([dict(left, noteError=note_error)] if note_error else [])
+    except BaseException:
+        # an interrupt included: a caller keeping the exception must not keep the flock (agentrc#477)
+        if fh is not None:
+            _abandon(fh, found, note_error)
+        raise
+    return fh
+
+
+def _abandon(fh, found, note_error) -> str:
+    """Undo a take that will not return, then drop its flock: before the leftover's log attempt
+    returned (`note_error` None) the record is left as found, for the next taker to log; once it is
+    logged ours is cleared; else the leftover record `found` is put back, its only evidence when no
+    journal holds it. Returns why the leftover was not logged, or ''."""
+    why = ''
     try:
-        _write_record(fh, ACQUIRING, reason, extra)
-    except OSError as e:
-        why = f'board lock unavailable: holder record: {e}'
-        if not note_error:
+        if note_error == '':
             clear_record(fh)
-        elif _restore_record(fh, found):     # the leftover's only evidence when no journal holds it
-            why += f'; leftover kept for the next taker, {note_error}'
-        else:
-            why += f'; leftover record not restored, {note_error}'
+        elif note_error:
+            ok = _restore_record(fh, found)
+            why = f'; leftover {"kept for the next taker" if ok else "record not restored"}, {note_error}'
+    finally:
         try:
             fh.close()   # even a failing close lets the fd (and flock) go
         except OSError:
             pass
-        raise LockUnavailable(why) from e
-    fh.cleanup_failures = open_cleanup_failures(board) + ([dict(left, noteError=note_error)] if note_error else [])
-    return fh
+    return why
 
 
 def _log_leftover(board, left) -> str:
