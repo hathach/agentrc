@@ -150,6 +150,22 @@ class Run(Checkout):
         with self.assertRaisesRegex(SystemExit, 'built with other agentrc files'):
             R.record_files(path, self.head, BOARD)
 
+    def test_named_builds_of_one_source_stage_and_pin_each_image(self):
+        path = self.record()
+        rec = json.loads(path.read_text())
+        named = self.root / f'build/hil/{BOARD}/echo_b/echo.ino.elf'
+        named.parent.mkdir(parents=True)
+        named.write_bytes(b'elf b')
+        rel = named.relative_to(self.root).as_posix()
+        rec['sketches']['echo_b'] = {'source': 'examples/Basic/echo',
+                                     'sha256': {rel: hashlib.sha256(b'elf b').hexdigest()}}
+        path.write_text(json.dumps(rec))
+        self.assertEqual(R.record_files(path, self.head, BOARD)[1][-1], rel)
+        R.snapshot_records(self.root / 'stage', [R.record_files(path, self.head, BOARD)])
+        named.write_bytes(b'elf c')
+        with self.assertRaisesRegex(SystemExit, 'echo_b/echo.ino.elf changed since the build record'):
+            R.snapshot_records(self.root / 'stage2', [R.record_files(path, self.head, BOARD)])
+
     def test_a_base_images_files_are_staged_and_pinned_with_the_record(self):
         base = self.root / 'base.hex'
         base.write_text(':00000001FF\n')

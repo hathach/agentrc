@@ -254,6 +254,20 @@ class Binding(Base):
                 H.bind(fake.hil_profile(self.BP, **kw))
             self.assertIsNone(H.P)
 
+    def test_a_named_build_can_be_the_restoration_sketch(self):
+        self.patch(H, 'P', None)
+        self.patch(self.BP, 'HIL_SKETCHES', {**self.BP.HIL_SKETCHES, 'device': (
+            {'echo_b': ('examples/Basic/echo', 'usb=b')}, *self.BP.HIL_SKETCHES['device'])})
+        with self.assertRaisesRegex(RuntimeError, "runs 'echo', not the first HIL sketch 'echo_b'"):
+            H.bind(fake.hil_profile(self.BP))
+        H.bind(fake.hil_profile(self.BP, TESTS={**fake.hil_profile(self.BP).TESTS, 'echo': 'echo_b'}))
+        self.assertEqual(H.restore_sketch('rig_ocd'), 'echo_b')
+        seen = []
+        with mock.patch.object(H, 'step', lambda name, board, image, test, *a: seen.append((image, test)) or
+                               {'pass': True, 'detail': 'ok'}):
+            H.restore('rig_ocd', {}, {'echo': 'echo image', 'echo_b': 'echo_b image'}, self.dir, None)
+        self.assertEqual(seen, [('echo_b image', 'echo')])
+
     def test_budget_reserve_covers_the_restore(self):
         self.assertGreaterEqual(H.CLEANUP_RESERVE, H.FLASH_TIMEOUT + H.VERIFY_TIMEOUT + H.ENUM_TIMEOUT +
                                 H.TEST_TIMEOUT)
@@ -337,6 +351,20 @@ class Admission(Base):
         self.assertTrue(images['echo']['elf'].startswith(str(self.dir / 'run')))
         self.assertEqual((images['echo']['vidPid'], images['echo']['hex']), ('1234:5678', None))
         self.assertEqual(images['echo']['fqbn'], json.loads(self.record().read_text())['fqbn'])   # no per-sketch one
+
+    def test_two_named_builds_of_one_source_are_admitted_by_name(self):
+        rec = self.record()
+        data = json.loads(rec.read_text())
+        rel = 'build/hil/rig_jlink/echo_b/echo.ino.elf'
+        (self.root / rel).parent.mkdir(parents=True)
+        (self.root / rel).write_bytes(b'elf b')
+        data['sketches']['echo_b'] = {**data['sketches']['echo'], 'example': 'echo_b', 'source': 'examples/Basic/echo',
+                                      'fqbn': 'f:usb=b', 'elf': rel, 'sha256': {rel: sha(b'elf b')}}
+        rec.write_text(json.dumps(data))
+        _, images = self.admit(rec)
+        self.assertEqual({k: (Path(v['elf']).read_bytes(), Path(v['elf']).parent.name, v['fqbn'])
+                          for k, v in images.items()},
+                         {'echo': (b'elf', 'echo', 'f'), 'echo_b': (b'elf b', 'echo_b', 'f:usb=b')})
 
     def test_admission_sees_the_build_sides_worktree_status(self):
         # a core's dirty submodule hidden by an ignore setting: the build side reports it, admission refuses on it

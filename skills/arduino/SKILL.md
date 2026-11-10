@@ -136,7 +136,11 @@ changes from a library:
   `boards.txt` or `platform.txt` change on CI's matrix) and `sketches` (the named sketches on every representative,
   e.g. a bundled library's source).
 - **One rig board, several menus**: the profile's `fqbn(board, example)` gives a HIL sketch its own FQBN (a USB stack
-  menu); the record keeps each sketch's FQBN and the report names them (`firmware.fqbns`).
+  menu); the record keeps each sketch's FQBN and the report names them (`firmware.fqbns`). A named build (feature
+  `named`) builds one sketch dir under several names: a `HIL_SKETCHES` entry `{name: (sketch dir, 'k=v,...')}` sets
+  those menu options on the board's FQBN, and the name keys its build dir, `fqbn()`, its record sketch (which also
+  names its `source`) and the test that runs it; a change to the dir builds every name it has. `bind()` refuses a name
+  that is no plain file name, an id listed twice in a role and one defined two ways across roles.
 - **Identity**: a record also binds the submodules (`git submodule status --recursive`) and refuses one that is not
   initialised, not at its gitlink or dirty (each one's own worktree, at any depth, whatever its `ignore` setting),
   `--experimental` included: a record's patch carries no submodule bytes. A record also refuses any untracked file.
@@ -184,5 +188,5 @@ user. The library's workflow and report comment are its own.
    HIL contracts.
 
 A core follows the same steps with its core-mode profile; its `agentrc_pin.py` copy also refuses engines without
-core mode (`'core'` missing from `arduino_build.PROFILE_FEATURES`), and one whose rig board has a base image without
-`'base'`, since `PROFILE_API` stays 1 for it.
+core mode (`'core'` missing from `arduino_build.PROFILE_FEATURES`), one whose rig board has a base image without
+`'base'`, and one whose `HIL_SKETCHES` names a build without `'named'`, since `PROFILE_API` stays 1 for them.

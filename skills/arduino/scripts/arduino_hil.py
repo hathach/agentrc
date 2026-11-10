@@ -7,7 +7,7 @@ run(profile, argv), loading this file from the pinned agentrc (its `agentrc_pin.
 
   ROOT                  the library checkout (Path)
   BUILD                 the library's build profile (its check_build module; agentrc arduino_build.py)
-  TESTS                 {test: the sketch name (its dir's basename) it runs}
+  TESTS                 {test: the sketch name (its dir's basename, a named build's name) it runs}
   ROLE_TESTS            {role: (tests a board of that role may run)}
   RESTORE_TEST          {role: the test that checks the role's restoration sketch (the first HIL sketch)}
   TEST_FUNCS            {device test: fn(dev, nonce, deadline, tracker, run_dir, board) -> (ok, detail)}
@@ -114,7 +114,8 @@ def bind(profile):
         raise RuntimeError(f'arduino_hil is bound to another profile ({P.ROOT}), not {profile.ROOT}\'s')
     problems = [f'RESTORE_TEST {r!r} runs {profile.TESTS.get(t)!r}, not the first HIL sketch {first!r}'
                 for r in profile.ROLE_TESTS for t in [profile.RESTORE_TEST.get(r)]
-                for first in [Path(profile.BUILD.HIL_SKETCHES[r][0]).name] if profile.TESTS.get(t) != first]
+                for first in [Path(B.sketch_id(profile.BUILD.HIL_SKETCHES[r][0])).name]
+                if profile.TESTS.get(t) != first]
     if set(profile.TESTS) != {t for tests in profile.ROLE_TESTS.values() for t in tests}:
         problems.append('TESTS and the union of ROLE_TESTS name different tests')
     if set(profile.TEST_FUNCS) != set(profile.ROLE_TESTS.get('device', ())):

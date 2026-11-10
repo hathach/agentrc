@@ -1550,5 +1550,119 @@ class Core(Lib):
                                                                         'libs/in conflict'])
 
 
+
+class NamedBuilds(Lib):
+    """Feature 'named': one HIL sketch dir built under two names with different menus."""
+
+    def setUp(self):
+        super().setUp()
+        self.root = fake.core(self.tmp / 'core')
+        self.P = fake.core_profile(self.root, self.agentrc, HIL_SKETCHES={'device': (
+            'test/hil/core_cdc', {'core_cdc_tusb2': ('test/hil/core_cdc', 'usb=tusb,debug=on')})})
+        self.patch(ab, 'P', self.P)
+
+    def test_feature_advertised_and_existing_profiles_unchanged(self):
+        self.assertIn('named', ab.PROFILE_FEATURES)
+        self.assertEqual(ab.PROFILE_API, 1)
+        self.patch(ab, 'P', fake.core_profile(self.root, self.agentrc))
+        self.assertEqual(ab.hil_sketches('rig_m4'), fake.CORE_HIL_SKETCHES['device'])
+        self.assertEqual(ab.named_builds(), {})
+        self.assertEqual(ab.fqbn('rig_m4', 'test/hil/core_cdc_tusb'), 'fake:core:m4:usb=tusb')
+
+    def test_bind_refuses_a_malformed_entry(self):
+        self.patch(ab, 'P', None)
+        for entry in ({'a/b': ('test/hil/core_cdc', '')}, {'x': 'test/hil/core_cdc'}, {'x': ('s', 'nomenu')},
+                      {'x': ('s', ''), 'y': ('s', '')}, ('x', 's'), {'.': ('s', '')}, {'..': ('s', '')},
+                      {'.sketch': ('s', '')}, {'a\\b': ('s', '')}, {'': ('s', '')}):
+            with self.subTest(entry=entry), self.assertRaisesRegex(RuntimeError, 'HIL_SKETCHES: entries neither'):
+                ab.bind(fake.core_profile(self.root, self.agentrc, HIL_SKETCHES={'device': ('test/hil/core_cdc',
+                                                                                            entry)}))
+            self.assertIsNone(ab.P)
+        self.assertIs(ab.bind(self.P), ab)
+
+    def test_bind_refuses_a_build_id_twice_in_a_role_or_defined_two_ways(self):
+        self.patch(ab, 'P', None)
+        cdc, tusb = 'test/hil/core_cdc', 'test/hil/core_cdc_tusb'
+        for table, why in (
+                ({'device': (cdc, cdc)}, f"'device' lists {cdc} twice"),
+                ({'device': (cdc, {'n': (cdc, '')}, {'n': (tusb, '')})}, "'device' lists n twice"),
+                ({'device': (cdc, {'cdc': (cdc, 'usb=arduino')}), 'host': ({'cdc': (tusb, 'usb=tusb')},)},
+                 'cdc is defined two ways'),
+                ({'device': (cdc, {'core_x': (cdc, '')}), 'host': ('core_x',)}, 'core_x is defined two ways')):
+            with self.subTest(table=table), self.assertRaisesRegex(RuntimeError, why):
+                ab.bind(fake.core_profile(self.root, self.agentrc, HIL_SKETCHES=table))
+            self.assertIsNone(ab.P)
+        same = {'device': (cdc, {'n': (cdc, 'usb=tusb')}), 'host': ({'n': (cdc, 'usb=tusb')},)}
+        self.assertIs(ab.bind(fake.core_profile(self.root, self.agentrc, HIL_SKETCHES=same)), ab)
+
+    def test_names_key_the_build_dir_the_fqbn_and_the_source(self):
+        self.assertEqual(ab.hil_sketches('rig_m4'), ('test/hil/core_cdc', 'core_cdc_tusb2'))
+        self.assertEqual([ab.source_of(e) for e in ab.hil_sketches('rig_m4')], ['test/hil/core_cdc'] * 2)
+        self.assertEqual([ab.build_key(e) for e in ab.hil_sketches('rig_m4')], ['core_cdc', 'core_cdc_tusb2'])
+        self.assertEqual(ab.fqbn('rig_m4', 'test/hil/core_cdc'), 'fake:core:m4:usb=arduino')
+        self.assertEqual(ab.fqbn('rig_m4', 'core_cdc_tusb2'), 'fake:core:m4:usb=tusb,debug=on')
+        self.assertTrue(ab.eligible('rig_m4', 'core_cdc_tusb2'))
+        self.assertFalse(ab.eligible('m4', 'core_cdc_tusb2'))   # a rig board's HIL build only
+        self.assertEqual(ab.with_options('v:a:b', 'x=1'), 'v:a:b:x=1')
+
+    def test_a_change_to_the_source_builds_every_name(self):
+        sel = ab.select(['test/hil/core_cdc/core_cdc.ino'], roster=['rig_m4'])
+        self.assertEqual(sel['builds'], {'rig_m4': ['core_cdc_tusb2', 'test/hil/core_cdc']})
+        self.assertEqual(sel['hil']['boards'], ['rig_m4'])
+        self.patch(self.P, 'HIL_SKETCHES', {'device': ({'only_named': ('test/hil/core_cdc_tusb', '')},)})
+        self.assertEqual(ab.classify('test/hil/core_cdc_tusb/x.h')[:2], ('hil_sketch', 'test/hil/core_cdc_tusb'))
+        self.assertEqual(ab.select(['test/hil/core_cdc_tusb/x.h'])['builds'], {'rig_m4': ['only_named']})
+
+    def test_a_name_clashing_with_a_sketch_basename_is_refused(self):
+        self.patch(self.P, 'HIL_SKETCHES', {'device': ('test/hil/core_cdc', {'core_cdc': ('test/hil/core_cdc', '')})})
+        self.assertEqual(ab.basename_clashes({'rig_m4': list(ab.hil_sketches('rig_m4'))}),
+                         ['rig_m4: test/hil/core_cdc and core_cdc'])
+
+    def test_both_names_compile_the_one_source_into_their_own_dirs(self):
+        calls = []
+
+        def run(cmd, **kw):
+            calls.append(cmd)
+            return cli_compile([], 'fake:core', '1.0.0', str(self.root), str(self.root))
+        with mock.patch.object(ab.subprocess, 'run', side_effect=run):
+            rows = ab.build_all(2, {'rig_m4': list(ab.hil_sketches('rig_m4'))}, self.root / 'build/hil', [], {},
+                                self.tmp / 'cli/arduino-cli.yaml')
+        self.assertEqual([(r['example'], r['status'], r['fqbn'], r['buildDir']) for r in rows],
+                         [('core_cdc_tusb2', 'ok', 'fake:core:m4:usb=tusb,debug=on', 'build/hil/rig_m4/core_cdc_tusb2'),
+                          ('test/hil/core_cdc', 'ok', 'fake:core:m4:usb=arduino', 'build/hil/rig_m4/core_cdc')])
+        compiles = [c for c in calls if '--build-path' in c]
+        self.assertEqual({c[-1] for c in compiles}, {str(self.root / 'test/hil/core_cdc')})
+        self.P.BOARDS['rig_m4']['fixture'] = 'cores/fake/main.cpp'   # a fixture board copies the source per name
+        src = ab.sketch_source('rig_m4', 'core_cdc_tusb2', self.root / 'build/hil/rig_m4/core_cdc_tusb2')
+        self.assertEqual((src.name, src.parent.name), ('core_cdc', 'core_cdc_tusb2'))
+        self.assertTrue((src / 'core_cdc.ino').is_file() and (src / 'main.cpp').is_file())
+
+    def test_the_record_keys_each_build_by_its_name_with_its_source(self):
+        roster = self.root / 'test/hil/ci.json'
+        roster.write_text(json.dumps({'boards': [{'name': 'rig_m4', 'uid': 'U', 'flasher': {
+            'name': 'jlink', 'uid': '1', 'args': '-device X'}, 'arduino': {'tests': ['cdc']}}]}))
+        rows = []
+        for e in ab.hil_sketches('rig_m4'):
+            b = self.root / 'build/hil/rig_m4' / ab.build_key(e)
+            b.mkdir(parents=True)
+            (b / 'core_cdc.ino.elf').write_bytes(elf32([(1, 0x4000, 0x20)]))
+            (b / 'core_cdc.ino.hex').write_text(ihex(0x4000, bytes(0x20)))
+            rows.append({'example': e, 'buildDir': ab.rel(b), 'fqbn': ab.fqbn('rig_m4', e), 'foreignHeaders': [],
+                         'platform': {'id': 'fake:core', 'version': '1.0.0', 'install_dir': str(self.root)}})
+        args = mock.Mock(experimental=False, build_property=[], record=str(self.root / 'build/r.json'))
+        ident = {'head': 'abc', 'dirty': False, 'diffSha256': 'd', 'status': ''}
+        with mock.patch.object(ab, 'source_identity', return_value=(ident, '')), \
+                mock.patch.object(ab, 'tool_version', return_value='1.5.1'), \
+                mock.patch.object(ab, 'platform_git', return_value=None):
+            rec, err = ab.make_record(args, 'rig_m4', rows, ident, '', roster, {})
+        self.assertIsNone(err)
+        self.assertEqual(list(rec['sketches']), ['core_cdc', 'core_cdc_tusb2'])
+        named = rec['sketches']['core_cdc_tusb2']
+        self.assertEqual((named['example'], named['source'], named['fqbn'], named['elf']),
+                         ('core_cdc_tusb2', 'test/hil/core_cdc', 'fake:core:m4:usb=tusb,debug=on',
+                          'build/hil/rig_m4/core_cdc_tusb2/core_cdc.ino.elf'))
+        self.assertNotIn('source', rec['sketches']['core_cdc'])
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -13,7 +13,10 @@ point, loading this file from the pinned agentrc (its `agentrc_pin.py`). One pro
                         rig board must hold under its sketches, `base_exclude` the address ranges [lo, hi) of them
                         never checked or written (SKILL.md, Base image)
   REPRESENTATIVES       {family: [boards]} a change to that family's code builds
-  HIL_SKETCHES          {role: (sketch dirs, the first the restoration image)}
+  HIL_SKETCHES          {role: (sketches, the first the restoration image)}: each a sketch dir, or (feature
+                        'named') {name: (sketch dir, menu options)}, a build of that dir under its own name, FQBN
+                        options (`k=v,...`) overriding the board's: the name keys its build dir, record sketch and
+                        fqbn(), and a change to the dir builds every name it has
   SMOKE_BOARDS          boards whose restoration sketch a build-contract change builds (one per image kind)
   CONTRACT_TESTS        {name: test script}; a change to `.claude/test/test_<name>.py` runs it, a HIL change
                         every one but `build`
@@ -39,7 +42,7 @@ A core's profile (an Arduino platform checkout, e.g. adafruit:samd) adds these, 
 
 PROFILE_API is the profile interface the three engines implement; a library's bootstrap refuses any other unloaded.
 PROFILE_FEATURES names the additive capabilities a bootstrap may require of these engines ('core': core mode,
-'base': a rig board's base image).
+'base': a rig board's base image, 'named': named HIL builds).
 
 The JSON contract (stdout's last line, exits 0 pass, 1 failed, 2 usage or a missing prerequisite, 3 uncovered) is
 the library's build SKILL.md.
@@ -66,7 +69,7 @@ FILES = ('skills/hil/boards.json', 'skills/hil/scripts/hil_boards.py', 'skills/h
 SELF = 'skills/arduino/scripts/arduino_build.py'
 SCHEMA = 2
 PROFILE_API = 1   # bump on a change a library profile must follow, arduino_hil's and arduino_remote's included
-PROFILE_FEATURES = ('core', 'base')
+PROFILE_FEATURES = ('core', 'base', 'named')
 COMPILE_TIMEOUT = 900
 BUILD_SCRIPTS = '.claude/skills/build/scripts/'
 HIL_CONTROL = ('.claude/skills/hil-contract/scripts/', 'test/hil/')
@@ -94,20 +97,77 @@ hil_boards = hil_load.load_file('skills/hil/scripts/hil_boards.py')
 
 
 def bind(profile):
-    """Bind the library profile this process builds for; a second, different one is refused."""
+    """Bind the library profile this process builds for; a second, different one is refused, as is a HIL_SKETCHES
+    table hil_sketch_problems() faults."""
     global P
     if P is not None and P is not profile:
         raise RuntimeError(f'arduino_build is bound to another profile ({P.ROOT}), not {profile.ROOT}\'s')
+    problems = hil_sketch_problems(profile.HIL_SKETCHES)
+    if problems:
+        raise RuntimeError(f'{profile.ROOT}: HIL_SKETCHES: {"; ".join(problems)}')
     P = profile
     return sys.modules[__name__]
+
+
+NAMED_ID = re.compile(r'[A-Za-z0-9_][A-Za-z0-9_.+-]*')   # one build dir under <root>/<board>/, never . or .. or hidden
+
+
+def _entry_ok(e):
+    if isinstance(e, str):
+        return True
+    if not (isinstance(e, dict) and len(e) == 1):
+        return False
+    (name, value), = e.items()
+    return (isinstance(name, str) and bool(NAMED_ID.fullmatch(name)) and isinstance(value, tuple) and len(value) == 2
+            and all(isinstance(x, str) for x in value) and all('=' in o for o in value[1].split(',') if o))
+
+
+def hil_sketch_problems(table):
+    """What makes a HIL_SKETCHES table ambiguous: an entry neither a sketch dir nor {name: (sketch dir, menu
+    options)} with a plain file name, a build id listed twice in one role, or one id defined two ways across roles
+    (two named builds, or a name and a sketch dir)."""
+    bad = [repr(e) for entries in table.values() for e in entries if not _entry_ok(e)]
+    if bad:
+        return [f'entries neither a sketch dir nor {{name: (sketch dir, menu options)}}: {", ".join(bad)}']
+    problems, defined = [], {}
+    for role_, entries in table.items():
+        ids = [sketch_id(e) for e in entries]
+        problems += [f'{role_!r} lists {i} twice' for i in dict.fromkeys(ids) if ids.count(i) > 1]
+        for e in entries:
+            i = sketch_id(e)
+            how = e if isinstance(e, str) else e[i]
+            if defined.setdefault(i, how) != how:
+                problems.append(f'{i} is defined two ways: {defined[i]!r} and {how!r}')
+    return list(dict.fromkeys(problems))
 
 
 def role(board):
     return P.BOARDS[board].get('role', 'device')
 
 
+def sketch_id(entry):
+    """A HIL_SKETCHES entry's build id: its sketch dir, or a named build's name."""
+    return entry if isinstance(entry, str) else next(iter(entry))
+
+
 def hil_sketches(board):
-    return P.HIL_SKETCHES[role(board)]
+    """The build ids of the HIL sketches the board's role runs, the restoration one first."""
+    return tuple(sketch_id(e) for e in P.HIL_SKETCHES[role(board)])
+
+
+def named_builds():
+    """{name: (sketch dir, menu options)} of the profile's named HIL builds."""
+    return {n: v for entries in P.HIL_SKETCHES.values() for e in entries if isinstance(e, dict) for n, v in e.items()}
+
+
+def source_of(example):
+    """The sketch dir a build id compiles: a named build's, else the id itself."""
+    return named_builds().get(example, (example,))[0]
+
+
+def with_named(source):
+    """`source` and every named build of it: what a change to that sketch dir builds."""
+    return [source, *(n for n, (src, _) in named_builds().items() if src == source)]
 
 
 def fixtures():
@@ -209,7 +269,17 @@ def eligible(board, example):
 
 def fqbn(board, example):
     hook = getattr(P, 'fqbn', None)
-    return hook(board, example) if hook else P.BOARDS[board]['fqbn']
+    base = hook(board, example) if hook else P.BOARDS[board]['fqbn']
+    options = named_builds().get(example, (None, ''))[1]
+    return with_options(base, options) if options else base
+
+
+def with_options(fqbn_, options):
+    """`fqbn_` with the menu options `k=v,...` set, each replacing the same menu's value or appended."""
+    parts = fqbn_.split(':')
+    menus = dict(o.split('=', 1) for o in ':'.join(parts[3:]).split(',') if o)
+    menus.update(o.split('=', 1) for o in options.split(',') if o)
+    return ':'.join(parts[:3]) + ':' + ','.join(f'{k}={v}' for k, v in menus.items())
 
 
 # ---- selection
@@ -227,7 +297,8 @@ def unbuildable_examples():
 def hil_sketch_of(path):
     """The HIL sketch dir outside examples/ holding `path`, or None."""
     for sketches in P.HIL_SKETCHES.values():
-        for s in sketches:
+        for e in sketches:
+            s = source_of(sketch_id(e))
             if not is_example(s) and path.startswith(s + '/'):
                 return s
     return None
@@ -306,10 +377,11 @@ def select(paths, roster=None, only_examples=None):
         elif effect == 'example':
             if not buildable(detail):
                 uncovered.append({'path': path, 'reason': 'sketch eligible on no board this contract builds'})
+            named = with_named(detail)
             for b in P.BOARDS:
-                add(b, [detail])
+                add(b, named)
             if roster:
-                hil_picked.update(b for b in roster if detail in hil_sketches(b))
+                hil_picked.update(b for b in roster if set(named) & set(hil_sketches(b)))
         elif effect == 'tests':
             tests.add(detail)
             if detail == 'build':
@@ -322,8 +394,9 @@ def select(paths, roster=None, only_examples=None):
             if roster:
                 hil_picked.update(b for b in roster if b in boards)
         elif effect == 'hil_sketch':
+            named = with_named(detail)
             for b in P.BOARDS:
-                add(b, [detail])
+                add(b, named)
             tests.update(hil_tests())
             hil_full = True
         elif effect == 'hil':
@@ -357,8 +430,9 @@ def reached_families(effect, detail):
     if effect == 'fixture':
         return {b['family'] for b in P.BOARDS.values() if b.get('fixture') == detail}
     if effect in ('hil_sketch', 'example'):
-        return {P.BOARDS[b]['family'] for b in P.BOARDS
-                if 'span' in P.BOARDS[b] and detail in hil_sketches(b) and eligible(b, detail)}
+        named = with_named(detail)
+        return {P.BOARDS[b]['family'] for b in P.BOARDS for s in named
+                if 'span' in P.BOARDS[b] and s in hil_sketches(b) and eligible(b, s)}
     return set()
 
 
@@ -694,12 +768,12 @@ def library_root(path, cache):
 def sketch_source(board, example, build_dir):
     """The sketch dir to compile: the example, or for a board with a `fixture` a copy of it beside the build dir with
     the fixture added (examples stay untouched), one per build key and named as the sketch, as arduino-cli needs."""
-    fixture = P.BOARDS[board].get('fixture')
+    fixture, source = P.BOARDS[board].get('fixture'), source_of(example)
     if not fixture:
-        return P.ROOT / example
-    copy = build_dir.parent / '.sketch' / build_dir.name / Path(example).name
+        return P.ROOT / source
+    copy = build_dir.parent / '.sketch' / build_dir.name / Path(source).name
     shutil.rmtree(copy, ignore_errors=True)
-    shutil.copytree(P.ROOT / example, copy)
+    shutil.copytree(P.ROOT / source, copy)
     shutil.copy2(P.ROOT / fixture, copy / Path(fixture).name)
     return copy
 
@@ -1270,6 +1344,7 @@ def make_record(args, board, rows, before, diff, roster_path, prepared):
             'elf': rel(elf),
             'hex': rel(hexfile) if hexfile else None, 'image': image, 'loadSpans': [[s, e] for s, e in spans],
             'vidPid': vid_pid, 'foreignHeaders': row['foreignHeaders'], 'libraries': row.get('libraries', []),
+            **({'source': source_of(row['example'])} if row['example'] in named_builds() else {}),
             'sha256': {rel(f): sha256(f) for f in files},
             **({'segments': [[o, n] for o, n in segments]} if segments else {}), **(extra or {}),
         }
