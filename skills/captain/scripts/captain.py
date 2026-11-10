@@ -1911,13 +1911,17 @@ def relay(targets, entry, mine, decided=None, force=False):
     showing its input line gets the relay held, recorded for `retry` to send unchanged. decided, (item, revision,
     verdict), makes it the human's verdict on that decision: one target, the session that owns it, and the binding
     written into the relay record itself. force cancels a request or relay still open to a target, once every other
-    check passed, as `cancel` would on the human's word."""
+    check passed, as `cancel` would on the human's word; never an open verdict relay on decided's decision, which
+    closes it, so bind() would refuse first."""
     addresses = list(targets)
     if decided and len(addresses) != 1:
         die('a relay with --item goes to exactly one session, the one that owns the decision', 2)
     with observing(decided and decided[0]) as seen, locked():
         captain = require_captain(mine)
         uid, words = bound(captain, entry)
+        if decided and force and (same := [m for m, r in open_items(records()).items() if r.get('item') == decided[0]]):
+            die(f'{decided[0]}: the verdict relay {", ".join(same)} on it is still open and closes it; --force cannot '
+                'replace it: cancel it first on the human\'s word, then relay again', 2)
         binding, linked = bind(decided, seen, captain, uid) if decided else ({}, None)
         pinned = {address: find(address) for address in addresses}
         quote = relay_text(words, addresses)

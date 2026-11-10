@@ -2570,6 +2570,15 @@ class VerdictTest(VerdictCase):
                          (self.item()['id'], 1, 'correction', 'o/r#12'))
         self.assertEqual((self.item()['state'], self.item()['closure']['why']), ('closed', 'decided'))
 
+    def test_force_refuses_to_replace_an_open_verdict_on_the_same_decision(self):
+        self.report(decision('merge', kind='blocked'))
+        self.terminals['t2'] = {**pinned('t2'), 'status': 'working'}
+        held = self.action_of(self.decide())
+        self.say('no: rebase first')
+        out = self.refused(captain.relay, captain.resolve(['t2']), None, self.ident,
+                           (self.item()['id'], 1, 'correction'), True)
+        self.assertIn(f'the verdict relay {held} on it is still open', out)
+
     def test_only_its_owner_at_its_latest_open_revision(self):
         self.report(decision('merge', kind='blocked'))
         self.assertIn('not this session', self.decide('t3')[0])
