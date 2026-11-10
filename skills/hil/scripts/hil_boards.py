@@ -23,7 +23,8 @@ resolve(entry) is a roster entry with its board's `flasher` (its `uid` the probe
 with `probe` that also carries a flasher is refused as a duplicate; one without `probe` (a bench board,
 or a rig one project owns) keeps its own, unless its probe is a registered board's. Where the registry
 has a board's `dev_attached`, a copy its roster still carries (skills/hil/SKILL.md, Board registry) is
-compared with it and warned about on stderr, never refused. resolve_roster(roster) resolves `boards` and `boards-skip`.
+compared with it and warned about on stderr, never refused; resolve(entry, roster=FILE) names the roster
+file in that warning. resolve_roster(roster) resolves `boards` and `boards-skip`.
 Both raise ValueError naming every problem. lock_name(entry, own) is an entry's board lock.
 
   hil_boards.py roster FILE         the resolved roster as JSON (exit 1 refused, 2 usage)
@@ -239,7 +240,7 @@ def _copy_problem(local, registered) -> str:
 _warned: set = set()
 
 
-def _resolve(entry, path) -> tuple:
+def _resolve(entry, path, roster=None) -> tuple:
     name = entry.get('name') if isinstance(entry, dict) else None
     label = name or '<unnamed>'
     if not isinstance(entry, dict):
@@ -263,6 +264,8 @@ def _resolve(entry, path) -> tuple:
                         else 'consumers reading it still get the roster\'s')
                 note = (f'{label}: {where} differs from agentrc\'s board registry ({reg["name"]}): {why}; {kept}'
                         if why else f'{label}: {where} duplicates agentrc\'s board registry ({reg["name"]})')
+                if roster is not None:
+                    note = f'roster {roster}: {note}'
                 if (path, note) not in _warned:
                     _warned.add((path, note))
                     print(f'hil_boards: {note}; drop it from the roster', file=sys.stderr)
@@ -294,8 +297,8 @@ def lock_name(entry, own=None, path=REGISTRY) -> str:
     return entry['name'] if own is None else own
 
 
-def resolve(entry, path=REGISTRY) -> dict:
-    out, why = _resolve(entry, path)
+def resolve(entry, path=REGISTRY, *, roster=None) -> dict:
+    out, why = _resolve(entry, path, roster)
     if why:
         raise ValueError(why)
     return out

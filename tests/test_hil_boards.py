@@ -157,6 +157,15 @@ class DevAttached(Base):
         self.assertIn('p: arduino.dev_attached duplicates agentrc', err)
         self.assertEqual(self.resolve(entry)[1], '')   # once per message
 
+    def test_each_rosters_copy_warns_naming_its_file(self):
+        entry = {'name': 'p', 'uid': 'P', 'probe': 'E663', 'tests': {'dev_attached': [UDISK, CH340]}}
+        for roster in ('a.json', 'b.json'):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                hb.resolve(entry, self.path, roster=roster)
+            self.assertEqual(err.getvalue(), f'hil_boards: roster {roster}: p: tests.dev_attached duplicates '
+                                             "agentrc's board registry (pico2); drop it from the roster\n")
+
     def test_a_differing_or_malformed_legacy_copy_warns_and_is_kept(self):
         for local, why in (([{'vid_pid': '0951:1603', 'serial': 'K'}], "0951:1603 'K'"),
                            ([{'vid_pid': 'abcd:1234', 'serial': '\u0409'}], '1a86:7523 \\(no serial\\)'),

@@ -178,7 +178,7 @@ def load_rosters(specs):
                 lock = hil_boards.lock_name(e, None if own is _ABSENT else own)
                 if not LOCK_NAME_RE.match(lock):
                     raise Refused(f'roster {path}: {e["name"]}: lock name {lock!r} is not a plain file name')
-                e = hil_boards.resolve(e)
+                e = hil_boards.resolve(e, roster=path)
             except ValueError as err:
                 raise Refused(f'roster {path}: {err}')
             locks.add(lock)

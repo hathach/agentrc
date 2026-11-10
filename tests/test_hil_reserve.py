@@ -354,6 +354,20 @@ class Rosters(Fixture):
         ids = hr.load_rosters([(str(roster), 'name')])['identities']
         self.assertEqual(set(ids), {'dut-uid', probe.lower()})
 
+    def test_each_rosters_legacy_copy_warns_naming_its_file(self):
+        probe, entry = next((p, e) for p, e in hr.hil_boards.registry().items() if 'dev_attached' in e)
+        a, b = Path(self.td.name) / 'a.json', Path(self.td.name) / 'b.json'
+        for roster in (a, b):
+            roster.write_text(json.dumps({'boards': [{'name': 'x', 'uid': 'DUT-UID', 'probe': probe,
+                                                      'tests': {'dev_attached': entry['dev_attached']}}]}))
+        hr.hil_boards._warned.clear()
+        err = io.StringIO()
+        with redirect_stderr(err):
+            hr.load_rosters([(str(a), 'name'), (str(b), 'name')])
+        self.assertEqual(err.getvalue().splitlines(), [f'hil_boards: roster {r}: x: tests.dev_attached duplicates '
+                                                       f"agentrc's board registry ({entry['name']}); drop it from the roster"
+                                                       for r in (a, b)])
+
     def test_a_roster_carrying_a_registered_boards_flasher_refuses(self):
         probe, entry = next(iter(hr.hil_boards.registry().items()))
         bad = Path(self.td.name) / 'bad.json'
