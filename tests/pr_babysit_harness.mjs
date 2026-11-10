@@ -4975,11 +4975,47 @@ test('a valid finding now dismissed goes to the challenger with the earlier verd
 })
 
 test('a challenger overturning a posted dismissal is shown the earlier verdict', async () => {
-  const again = { findings: [invalidFinding({ reason: 'the caller checks it' })], replies: [{ commentId: 1, body: 'not so' }], bots: 'reviewed' }
+  // Another dismissal verdict than the posted one is challenged; the same one is not (#393).
+  const again = { findings: [invalidFinding({ verdict: 'stale', reason: 'the caller checks it' })], replies: [{ commentId: 1, body: 'not so' }], bots: 'reviewed' }
   const { calls, labels, result } = await refutedThen(again, { challenge: { verdicts: [{ id: 0, verdict: 'valid', reason: 'the ISR path skips the check' }] } })
   assert.match(calls.find(c => c.label.startsWith('challenge#')).prompt, /"earlier":\{"verdict":"invalid","reason":"the caller checks it"/)
   assert.ok(labels.includes('fix:src/a.c'), 'an overturn with evidence, against the earlier verdict it saw, is acted on')
   assert.deepEqual(result.corrections.map(c => c.now), ['the challenger: the ISR path skips the check'], 'the reversal the overturn made is reported')
+})
+
+test('a dismissal answered at its body, with its recorded verdict and nothing owed or held, is not challenged again (#393)', async () => {
+  const again = { findings: [invalidFinding({ reason: 'still checked by the caller' })], replies: [{ commentId: 1, body: 'not so' }], bots: 'reviewed' }
+  const settled = await refutedThen(again)
+  assert.equal(settled.labels.some(l => l.startsWith('challenge#')), false, settled.labels.join(' '))
+  assert.equal(settled.labels.some(l => l.startsWith('replies#')), false)
+  assert.equal(settled.result.pass, true)
+  // An edited body, or a new finding beside it, is still challenged.
+  const edited = await refutedThen({ ...again, findings: [invalidFinding({ commentDigest: 'd1-edited' })] })
+  assert.ok(edited.labels.some(l => l.startsWith('challenge#')))
+  const sibling = await refutedThen({ ...again, findings: [...again.findings, invalidFinding({ line: 2 })] })
+  assert.deepEqual(JSON.parse(sibling.calls.find(c => c.label.startsWith('challenge#')).prompt.match(/Findings: (\[.*\])\.$/s)[1]).map(x => x.claim + x.line), ['bad2'])
+  // So is a reversal of the posted dismissal.
+  const flipped = await refutedThen({ findings: [finding({ changeReason: 'new evidence' })], replies: [], bots: 'reviewed' })
+  assert.ok(flipped.labels.some(l => l.startsWith('challenge#')))
+})
+
+test('a fix landing after its fix note posted is not challenged; a hold on its comment brings the challenge back (#393)', async () => {
+  let cycle = 0
+  const landed = await run({
+    args: { autoPush: true, maxCycles: 2 },
+    reviewsPerCycle: () => ++cycle === 1 ? oneValid : { findings: [finding({ verdict: 'stale' })], replies: [], bots: 'reviewed' },
+  })
+  assert.ok(landed.labels.includes('resolve#1'), 'the fix note posted in cycle 1')
+  assert.equal(landed.labels.some(l => l === 'challenge#2'), false, landed.labels.join(' '))
+  // A sibling held on the same answered comment, omitted from the harvest, keeps its siblings challenged.
+  const first = await run({
+    reviews: { findings: [invalidFinding({ reason: 'the caller checks it' })], replies: [{ commentId: 1, body: 'not so' }], bots: 'reviewed' },
+    args: { maxCycles: 5, yieldAfterCycle: true },
+  })
+  const held = await run({ reviews: { findings: [finding(), invalidFinding({ line: 2 })], replies: [], bots: 'reviewed' }, args: { maxCycles: 5, yieldAfterCycle: true, state: first.result.state } })
+  assert.deepEqual(held.result.state.holds.map(([id]) => id), ['1#1'])
+  const after = await run({ reviews: { findings: [invalidFinding({ line: 2 })], replies: [], bots: 'reviewed' }, args: { maxCycles: 5, state: held.result.state } })
+  assert.ok(after.labels.some(l => l.startsWith('challenge#')), after.labels.join(' '))
 })
 
 test('a challenger verdict with no evidence, or a verdict list with a stray id, settles nothing', async () => {

@@ -2722,8 +2722,17 @@ const runLanes = async (cycle, entry, lanes) => {
       log(`cycle ${cycle}: ${f.findingId} held — ${f.hold}`)
     }
 
+    // A dismissal already answered at this body, its verdict the recorded one (or a fix noted landing), with nothing owed
+    // or held on its comment, posts nothing and reverses nothing: it needs no second opinion (#393).
+    const settledAnswer = (f) => {
+      const a = answeredWith.get(f.commentId)
+      const p = prior.get(f)
+      return !!a && !!p && a.digest === f.commentDigest && !reanswer.has(f.commentId) && !debt.has(f.commentId) &&
+        ![...holds.values()].some(h => h.commentId === f.commentId) &&
+        (p.verdict === f.verdict || (p.verdict === 'valid' && f.verdict === 'stale' && a.how === 'fixNote'))
+    }
     // A dismissal about to be posted closes the thread, and a reversal is about to be fixed: both get a second opinion.
-    const challenged = r.findings.filter(f => f.verdict !== 'valid' || reversal(f))
+    const challenged = r.findings.filter(f => reversal(f) || (f.verdict !== 'valid' && !settledAnswer(f)))
     if (challenged.length > 0) {
       if (lanes.prState) return prEnded(cycle, lanes.prState)
       const submitted = challenged.map((f, id) => {
