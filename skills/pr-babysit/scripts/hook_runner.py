@@ -10,9 +10,9 @@ file, gets one JSON line per record, each flushed:
   {record: start, version, supported}, then, for a supported version only:
   {record: hooks, hooks: [{id, alias, stages}]}: every hook the config and
     manifests resolve to, at any stage, in config order;
-  {record: roster, failFast, hooks: [{id, alias, failFast}]}: the hooks the run
-    selected, in run order, after the config and manifests are resolved;
-    failFast, the config's or --fail-fast;
+  {record: roster, failFast, hooks: [{id, alias, failFast, passFilenames}]}: the
+    hooks the run selected, in run order, after the config and manifests are
+    resolved; failFast, the config's or --fail-fast;
   {record: hook, index, id, executed, retcode, modified, failed, output} per
     _run_single_hook() call, index its roster position;
   {record: end, code} once main() returns.
@@ -69,7 +69,8 @@ def observe(write, only):
         roster[:] = hooks
         refused = only is not None and [h.id for h in hooks] != [only]
         write(record='roster', failFast=bool(config['fail_fast'] or getattr(args, 'fail_fast', False)),
-              hooks=[{'id': h.id, 'alias': h.alias, 'failFast': bool(h.fail_fast)} for h in hooks],
+              hooks=[{'id': h.id, 'alias': h.alias, 'failFast': bool(h.fail_fast), 'passFilenames': bool(h.pass_filenames)}
+                     for h in hooks],
               **({'refused': True} if refused else {}))
         return 1 if refused else run_hooks(config, hooks, skips, args)
 

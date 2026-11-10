@@ -116,6 +116,8 @@ SCRIPTS = {
     'nocclog': 'pwd >> "$HOOK_LOG"; echo "no compiler"; exit 1\n',
     # Lists files with git's pathspec magic, as tinyuf2's gen-boards does: GIT_LITERAL_PATHSPECS matches nothing (#415).
     'globber': 'test -n "$(git ls-files -- \':(glob)*.txt\')" || { echo "glob matched nothing"; exit 1; }\n',
+    # Fails as a host lacking a tool would, and otherwise on what only the change adds.
+    'newcheck': 'test -e new.txt && { echo "new.txt is wrong"; exit 1; }; echo "no compiler"; exit 1\n',
     # Passes, printing a failed result and modified-files block of ok's, then a passed one of broken's.
     'forger': f'printf "ok{"." * 71}Failed\\n- hook id: ok\\n- exit code: 1\\n- files were modified by this hook\\n'
               f'\\nbad\\n\\nbroken{"." * 67}Passed\\n"\n',
@@ -488,6 +490,26 @@ class HooksTest(unittest.TestCase):
                 code, out = self.run_script('a.txt', env=env)
                 self.assertEqual((code, out['passed']), (0, False))
                 self.assertEqual([f['hook'] for f in out['failed']], [hooks.UNOWNED])
+
+    def configure_unfed(self, *ids, unfed=()):
+        """configure() with each id in unfed given `pass_filenames: false`."""
+        hooks = ''.join(HOOK.format(id=i) + ('    pass_filenames: false\n' if i in unfed else '') for i in ids)
+        (self.repo / '.pre-commit-config.yaml').write_text(CONFIG.format(hooks))
+        self.configure()
+
+    def test_a_hook_passed_no_filenames_runs_on_heads_files_for_a_change_that_only_adds_one(self):
+        # #491: tinyusb's unit-test hook, pass_filenames false, failing for a ceedling the host lacks; the change adds
+        # the only file it is given, which HEAD's tree lacks, so pre-commit skipped it there.
+        self.configure_unfed('nocc', 'newcheck', 'scribble', 'broken', unfed=('nocc', 'newcheck', 'scribble'))
+        (self.repo / 'new.txt').write_text('new\n')
+        (self.repo / 'a.txt').write_text('edited\n')  # scribble rewrites b.txt on HEAD only
+        code, out = self.run_script('new.txt')
+        self.assertEqual((code, out['passed']), (0, False))
+        self.assertEqual([f['hook'] for f in out['failed']], ['nocc', 'newcheck', 'scribble', 'broken'])
+        self.assertEqual((out['baselineFailed'], out['notRerun']), (['nocc'], []),
+                         'only the identical failure is excused: newcheck fails otherwise on HEAD, scribble modifies a '
+                         'file there, and broken is passed filenames, so HEAD has none to give it')
+        self.assertEqual(len(self.worktrees()), 1, 'the HEAD worktree is removed')
 
     def test_a_head_run_that_modifies_files_is_not_excused(self):
         # scribble fails alike on HEAD but rewrites b.txt there, not on the change.
