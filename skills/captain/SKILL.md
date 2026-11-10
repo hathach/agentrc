@@ -127,10 +127,9 @@ pins each target's session once, so one replaced in its terminal while the relay
   `/exit`, kill a process or terminal, or ask a target to close itself. `cancel` closes a ledger item only: it
   neither reaches a session nor withdraws an instruction one accepted. That takes a new relay of the human's words,
   refused while the accepted relay's item is open, so `cancel` that first, or relay with `--force` on the human's
-  word, which cancels what is still open to each target once every other check passed, but never an open verdict
-  relay on the same decision, which closed it: cancelling one its session has not accepted reopens it; a busy target
-  gets the new relay held until it is idle or done with its input line shown, so work in progress is stopped only by
-  the human in that session.
+  word, which cancels what is still open to each target once every other check passed; a verdict with `--item` still
+  needs its decision open, which `--force` does not reopen; a busy target gets the new relay held until it is idle
+  or done with its input line shown, so work in progress is stopped only by the human in that session.
   A relayed instruction that ends a target's own work, such as removing its worktree, is the target's to do under its
   own rules.
 - **Watch** when the human wants to hear each time a session finishes, not once: `watch all`, their bare "watch"
