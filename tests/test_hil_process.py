@@ -1115,6 +1115,13 @@ class Bounded(unittest.TestCase):
         self.assertEqual(hp._bounded(blocked, T, last), 'walked')
         self.assertIsNot(last[0], first)
 
+    def test_a_worker_that_never_started_does_not_gate_the_next_call(self):
+        last = []
+        with mock.patch.object(threading.Thread, 'start', side_effect=RuntimeError("can't start new thread")), \
+                self.assertRaises(RuntimeError):
+            hp._bounded(list, T, last)
+        self.assertEqual(hp._bounded(list, T, last), [])
+
 
 @unittest.skipUnless(os.path.isdir('/proc'), 'reads processes from /proc')
 class RunTracked(unittest.TestCase):

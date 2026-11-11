@@ -554,12 +554,20 @@ def _bounded(fn, bound: float, last: list | None = None, *, reraise: bool = Fals
             finished.set()
     t = threading.Thread(target=run, daemon=True)
     t.finished = finished
-    with _bounded_start:
-        if last is not None:
-            if any(not x.finished.is_set() for x in last):
-                return None
-            last[:] = [t]
-        t.start()
+    hold = InterruptHold()      # an interrupt between recording t and its start would gate `last` forever
+    try:
+        with _bounded_start:
+            if last is not None:
+                if any(not x.finished.is_set() for x in last):
+                    return None
+                last[:] = [t]
+            try:
+                t.start()
+            except Exception:
+                finished.set()      # it never started: nothing for `last` to wait for
+                raise
+    finally:
+        hold.release()
     finished.wait(bound)
     if not out:
         return None
