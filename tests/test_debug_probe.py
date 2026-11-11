@@ -347,11 +347,10 @@ class ProbeTest(unittest.TestCase):
         self.chip('CH582', 0x82, 0x16, 'USER_CFG', 0x4FFF0FD5)
         code, out, err = self.main('config', '--chip', 'CH582', '--set', 'CFG_RESET_EN=1')
         self.assertEqual(code, 0, err)
-        self.assertEqual(self.calls('wchisp')[:2], [['config', '--help'], ['-u', 'info']])
-        self.assertEqual(self.set_word_calls(), [['-u', 'config', 'set-word', '--register', 'USER_CFG', '--expect-uid',
-                                                  '11-22-33-44-55-66-77-88', '--expect', '4FFF0FD5',
-                                                  '--value', '4FFF0FDD']])
-        self.assertEqual(len(self.calls('wchisp')), 3)
+        self.assertEqual(self.calls('wchisp'), [['config', '--help'], ['-u', 'info'],
+                                                ['-u', 'config', 'set-word', '--register', 'USER_CFG', '--expect-uid',
+                                                 '11-22-33-44-55-66-77-88', '--expect', '4FFF0FD5',
+                                                 '--value', '4FFF0FDD']])
         self.assertIn('0x4FFF0FD5 -> 0x4FFF0FDD', out)
 
     def test_ch582_show_decodes_without_writing(self):
