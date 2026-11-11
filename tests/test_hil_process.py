@@ -999,14 +999,15 @@ class ForeignStateDir(unittest.TestCase):
                 entered.set()
                 release.wait(10)
                 return []
-            with mock.patch.object(hp, 'PROC_SCAN_BOUND', 0.01), mock.patch.object(hp, '_supervisors_in', blocked):
-                self.assertEqual(hp.recheck(entry), 'pending')         # not listed within its bound
-                self.assertTrue(entered.wait(5))                        # the worker may start after the bound
-                self.assertEqual(hp.recheck(entry), 'pending')         # nor while that scan is still blocked
-                self.assertEqual(len(scans), 1)                         # and no second scan thread started
+            with mock.patch.object(hp, '_supervisors_in', blocked):
+                with mock.patch.object(hp, 'PROC_SCAN_BOUND', 0.01):
+                    self.assertEqual(hp.recheck(entry), 'pending')     # not listed within its bound
+                    self.assertTrue(entered.wait(5))                    # the worker may start after the bound
+                    self.assertEqual(hp.recheck(entry), 'pending')     # nor while that scan is still blocked
+                    self.assertEqual(len(scans), 1)                     # and no second scan thread started
                 release.set()
                 hp._proc_scan[0].join(5)
-                self.assertEqual(hp.recheck(entry), 'unknown')
+                self.assertEqual(hp.recheck(entry), 'unknown')         # the normal bound: a slow start is not 'pending'
             self.assertEqual(hp.recheck({'token': 'foreign:1', 'foreign': 1}), 'pending')
         self.assertEqual(os.listdir(d), ['hil_op_a.log'])
 
