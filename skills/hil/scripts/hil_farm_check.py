@@ -7,28 +7,33 @@ flashed and the board's USB is not checked: whatever image it ran runs again. No
 wedged probe or board is reported. Farm health only, never firmware-validation evidence.
 
 Row statuses: ok (the reset succeeded); failed (no probe, an ambiguous probe, a reset that
-failed or raised, or the board's own error); unsupported (the probe has no reset-only mode:
-unverified, not ok); locked (a live holder: skipped, never waited on, no bypass); blocked (the
-board's state is unknown). `coverage`: reset-not-attempted, reset-attempted, unsupported,
-skipped-locked, blocked-before (an older helper's live cleanup holder, refused before the
-reset) or blocked-after (this check's cleanup is unresolved: the board released, its failure
-logged; `check_status` keeps the check's own status). A row whose take found a failed cleanup
-an earlier task left carries it as `previousCleanupFailure`.
+failed or raised, an inconclusive busy check, or the board's own error); unsupported (the probe
+has no reset-only mode: unverified, not ok); locked (a live holder, or users the busy check
+named: skipped, never waited on, no bypass); blocked (the board's state is unknown).
+`coverage`: reset-not-attempted, reset-attempted, unsupported, skipped-locked, blocked-before
+(an older helper's live cleanup holder, refused before the reset) or blocked-after (this
+check's cleanup is unresolved: the board released, its failure logged; `check_status` keeps
+the check's own status). A row whose take found a failed cleanup
+an earlier task left carries it as `previousCleanupFailure`, refused or not.
 
 Exit: 0 no failed row (unsupported and locked rows are unverified, not failures); 1 any failed
 row, an aborted run, or a report that could not be persisted; 2 refused before any board
 (usage, unknown host, profile, state dir, report dir); 4 any blocked row, over 1. Read the
 document for detail, never $? alone.
 
-Reservation: a board is taken with hil_lock.take_board_lock(lock, 'farm_check',
-protected=True) and released when the check of that board ends, whatever its outcome
-(agentrc#464). ctx.run refuses a new command while an earlier one is not proven ended
-(hil_process.run_tracked's `done`, or a recheck of its receipt). A board whose processes are
-not all proven ended, or whose record cannot be cleared, ends through hil_lock.end_failed: its
-open receipts and retained sessions go to the board's cleanup log, which the next task reports,
-and the row is blocked. A check killed outright leaves its record, which the next task logs as
-a failed cleanup, and prints no report. SIGINT stops the check after the current board's
-cleanup; the report then says `termination: aborted`.
+Reservation: each board is one hil_lock.board_task(lock, 'farm_check', busy=profile.busy),
+ended when the check of that board ends, whatever its outcome (agentrc#464): the profile's busy
+check runs under the lock before the reset, and a board it finds in use, or cannot judge, is
+released with nothing touched and no failure logged. ctx.run refuses a new command while an
+earlier one is not proven ended (hil_process.run_tracked's `done`, or a recheck of its
+receipt). Every process proven ended ends the task clean(), whether the reset succeeded or
+not: a reset restores nothing. Otherwise it ends failed(): the open receipts and retained
+sessions go to the board's cleanup log, which the next task reports, and the row is blocked;
+so is one whose lock did not end as its verdict said (BoardTask.ended_cleanly). A check killed
+outright leaves its record, which the next task logs as a failed cleanup, and prints no
+report. SIGINT stops the check after the current board's cleanup; the report then says
+`termination: aborted`. An interrupt that lands as the task's __exit__ is entered, before it
+runs, gets one more __exit__ (BoardTask's limit).
 
 Profile (a module; `__file__` names it in the report, with its digest):
   roster(host, config, args) -> {'path', 'boards': [dict], 'named_only': [dict]}: this host's
@@ -39,6 +44,11 @@ Profile (a module; `__file__` names it in the report, with its digest):
   probe_name(board) -> str: the board's flasher, shown beside the probe mark.
   probe_candidates(board) -> [busport]: every probe matching the board under the project's
       constraints, best tier only; more than one is reported as ambiguous, never picked.
+  busy(board) -> list: the live users of the board's probe or devices, empty when it sees none,
+      raising when it cannot tell (hil_flash.probe_users for the probe; the project's own check
+      for anything else). It runs under the board's lock before the reset (board_task's
+      `busy`); what it covers is the project's to document. A profile without it is refused,
+      never read as idle.
   reset(ctx, board) -> hil_flash Operation, or None when the probe has no reset-only mode and
       nothing was started. It runs inside the reservation and takes no lock; every process it
       starts goes through `ctx.run` (hil_flash's `run=`: hil_process.run_tracked with the
@@ -101,7 +111,7 @@ RECHECK_WAIT = 5.0    # s an operation not yet proven ended gets before the boar
 STATUSES = ('ok', 'failed', 'unsupported', 'locked', 'blocked')
 MARKS = {'ok': '✅ ok', 'failed': '❌ failed', 'unsupported': '➖ unsupported', 'locked': '🔒 locked',
          'blocked': '⛔ blocked'}
-REQUIRED = ('roster', 'lock_name', 'probe_name', 'probe_candidates', 'reset')
+REQUIRED = ('roster', 'lock_name', 'probe_name', 'probe_candidates', 'busy', 'reset')
 
 _t0 = time.monotonic()
 
@@ -186,7 +196,7 @@ class Context:
 
     def retain(self, detail: str, receipts) -> None:
         """A session the profile's provider left running outside `run` (an openocd_esp server):
-        pending, so nothing more starts on the board, and the board ends through end_failed,
+        pending, so nothing more starts on the board, and its task ends failed(),
         its receipts in the row and the board's cleanup log. `receipts` (JSON values) are the
         provider's own, never rechecked here. No receipts, no entry; the same detail and
         receipts are entered once."""
@@ -263,32 +273,71 @@ def check_board(profile, board: dict, args, state_dir) -> dict:
     row = new_row(board['name'])
     if not _probe(profile, board, row):
         return row
-    lock = profile.lock_name(board)
-    try:
-        fh = hil_lock.take_board_lock(lock, REASON, protected=True)
-    except hil_lock.RecoveryBlocked as e:
-        return _not_taken(row, 'blocked', str(e))
-    except hil_lock.BoardLocked as e:
-        return _not_taken(row, 'locked', str(e))
-    except hil_lock.LockUnavailable as e:
-        return _not_taken(row, 'failed', str(e))
-    if fh.cleanup_failures:
-        row.update(hil_lock.failure_report(fh.cleanup_failures))
-        row['note'].append(f'an earlier task\'s cleanup failed: {hil_lock.failure_text(fh.cleanup_failures[-1])}'[:300])
     ctx = Context(args, state_dir)
+    task = hil_lock.board_task(profile.lock_name(board), REASON, busy=lambda: profile.busy(board))
+    entered = False
     try:
-        try:
-            _reset(profile, ctx, board, row)
-        finally:
-            _end_reservation(fh, lock, ctx, row)
-    except KeyboardInterrupt:
+        with task:
+            entered = True
+            _previous_failure(row, task.cleanup_failures)
+            try:
+                _reset(profile, ctx, board, row)
+            finally:
+                # inline, as BoardTask.__exit__: a helper's entry is itself a point where a signal handler runs. The
+                # verdict comes from the ledger before the task unwinds: one interrupted before _verdict's hold is in
+                # (row['cleanup'] still None) is collected again, that interrupt raised once it is given
+                interrupted = None
+                while row['cleanup'] is None:
+                    try:
+                        _verdict(task, ctx, row)
+                    except KeyboardInterrupt as e:
+                        if row['cleanup'] is not None:     # given: the hold replayed it
+                            raise
+                        interrupted = interrupted or e
+                if interrupted is not None:
+                    raise interrupted
+    except hil_lock.BoardBusy as e:
+        return _refused(row, task, 'locked', f'probe in use: {", ".join(map(_user_text, e.users))}'[:300])
+    except hil_lock.RecoveryBlocked as e:
+        return _refused(row, task, 'blocked', str(e))
+    except hil_lock.BoardLocked as e:
+        return _refused(row, task, 'locked', str(e))
+    except hil_lock.LockUnavailable as e:
+        return _refused(row, task, 'failed', str(e))
+    except KeyboardInterrupt as e:
         row['interrupted'] = True
-    # an interrupt that came before finalization could defer it: finalize from the same ledger
-    while row['cleanup'] is None:
-        try:
-            _end_reservation(fh, lock, ctx, row)
-        except KeyboardInterrupt:
-            row['interrupted'] = True
+        if not task.ended:     # it landed as __exit__ was entered: that __exit__ never ran
+            try:
+                task.__exit__(type(e), e, e.__traceback__)
+            except KeyboardInterrupt:
+                pass
+        if not entered and task.failure_logged is None:
+            return _refused(row, task, 'failed', 'interrupted')
+    except Exception as e:
+        if not entered:        # the busy check raised: inconclusive, nothing touched
+            return _refused(row, task, 'failed', f'busy check inconclusive: {e!r}'[:300])
+        row['note'].append(f'internal error: {e!r}'[:120])
+    _end_row(row, task, ctx)
+    return row
+
+
+def _user_text(user) -> str:
+    return f'pid {user["pid"]} ({user.get("cmd", "")})' if isinstance(user, dict) and 'pid' in user else str(user)
+
+
+def _previous_failure(row: dict, failures: list) -> None:
+    if failures and 'previousCleanupFailure' not in row:
+        row.update(hil_lock.failure_report(failures))
+        row['note'].append(f'an earlier task\'s cleanup failed: {hil_lock.failure_text(failures[-1])}'[:300])
+
+
+def _refused(row: dict, task, status: str, why: str) -> dict:
+    """A board its task refused before the reset; blocked when the refusal's lock did not end cleanly."""
+    _previous_failure(row, task.cleanup_failures)
+    _not_taken(row, status, why)
+    if not task.ended_cleanly:
+        row['check_status'], row['status'] = row['status'], 'blocked'
+        row['note'].append(task.describe()[:300])
     return row
 
 
@@ -332,21 +381,27 @@ def _reset(profile, ctx: Context, board: dict, row: dict) -> None:
         row['note'].append(f'reset: {e!r}'[:120])
 
 
-def _end_reservation(fh, lock: str, ctx: Context, row: dict) -> None:
-    """Release the board, logging a cleanup it could not prove; never raises. An interrupt is
-    deferred until the board is released, its waits all bounded, and then only marks the row."""
+def _verdict(task, ctx: Context, row: dict) -> None:
+    """The task's cleanup verdict from the ledger, an interrupt deferred until it is given:
+    clean() once every run is proven ended, else failed() with the open receipts and retained
+    sessions."""
     hold = hil_process.InterruptHold()
     try:
-        _finalize(fh, lock, ctx, row)
-    except Exception as e:
-        if row['cleanup'] is None:        # failed before the ledger was copied: it, unrechecked
-            row['cleanup'] = _cleanup_from([e for e in ctx.ledger if e['cleanup'] != 'done'], 'unresolved')
-        _end_unresolved(row, fh, lock, f'finalization failed: {e!r}'[:200])
-    finally:
         try:
-            hold.release()
-        except KeyboardInterrupt:
-            row['interrupted'] = True
+            open_ops, why = ctx.open_runs(), ''
+        except Exception as err:   # unrechecked: every run not yet proven ended stays open
+            open_ops, why = [e for e in ctx.ledger if e['cleanup'] != 'done'], f'recheck failed: {err!r}'[:200]
+        if not open_ops and not why:
+            row['cleanup'] = _new_cleanup('released')
+            task.clean()
+            return
+        cleanup = row['cleanup'] = _cleanup_from(open_ops, 'unresolved')
+        if why:
+            cleanup['evidence'].append(why)
+        task.failed(detail=f'farm check cleanup unresolved: {"; ".join(cleanup["evidence"])}'[:500],
+                    receipts=cleanup['receipts'], retained=cleanup.get('retained', []))
+    finally:
+        hold.release()
 
 
 def _new_cleanup(result: str) -> dict:
@@ -365,46 +420,31 @@ def _cleanup_from(open_ops: list, result: str) -> dict:
     return cleanup
 
 
-def _end_unresolved(row: dict, fh, lock: str, why: str) -> None:
-    """End the board's reservation through end_failed, unless it was released: the row is
-    blocked, the board released, the failure logged."""
-    cleanup = row['cleanup'] = row['cleanup'] or _new_cleanup('interrupted')
-    if cleanup['released']:
+def _end_row(row: dict, task, ctx: Context) -> None:
+    """The row once its board task ended: released or not, and blocked when its cleanup is
+    unresolved or its lock did not end as its verdict said."""
+    if row['cleanup'] is None:     # cut short before its verdict: the task ended failed
+        row['cleanup'] = _cleanup_from([e for e in ctx.ledger if e['cleanup'] != 'done'], 'interrupted')
+    cleanup = row['cleanup']
+    cleanup['released'] = task.released
+    if task.errors:
+        cleanup['logErrors'] = list(task.errors)
+    if cleanup['result'] == 'released' and not task.ended_cleanly:
+        cleanup['result'] = 'release-failed'
+    if cleanup['result'] == 'released':
         return
-    if why:
-        cleanup['evidence'].append(why)
+    if not task.ended_cleanly:
+        cleanup['evidence'].append(task.describe())
     if row['status'] != 'blocked':
         row['check_status'], row['status'] = row['status'], 'blocked'
-    detail = (f'farm check cleanup unresolved: {cleanup["result"]}; ' + '; '.join(cleanup['evidence']))[:500]
-    try:
-        errors = hil_lock.end_failed({lock: fh}, REASON, detail=detail, receipts=cleanup['receipts'],
-                                     retained=cleanup.get('retained', []))
-    except KeyboardInterrupt:     # end_failed released the board first
-        row['interrupted'], errors = True, {}
-    cleanup['released'] = True
-    if errors:
-        cleanup['logErrors'] = errors.get(lock, [])
-    row['note'].append('released with its cleanup unresolved; logged in the board\'s cleanup log' +
-                       (f' (not logged: {"; ".join(cleanup["logErrors"])})' if errors else ''))
+    if task.failure_logged:
+        row['note'].append("released with its cleanup unresolved; logged in the board's cleanup log")
+    else:
+        row['note'].append(f'cleanup unresolved: {task.describe()}'[:300])
     if cleanup.get('retained'):
         row['note'].append('end every session in cleanup.retained with its provider (openocd_esp: '
                            '`hil_openocd_esp.py end --receipt`)')
-    say(f'{row["name"]:26} BLOCKED: cleanup {cleanup["result"]}, released')
-
-
-def _finalize(fh, lock: str, ctx: Context, row: dict) -> None:
-    ctx._recheck()
-    open_ops = [e for e in ctx.ledger if e['cleanup'] != 'done']
-    cleanup = row['cleanup'] = _cleanup_from(open_ops, 'unresolved' if open_ops else 'release-failed')
-    if not open_ops:
-        # proven clear through our own descriptor, while the flock is still ours
-        if hil_lock.clear_record(fh) and os.fstat(fh.fileno()).st_size == 0:
-            cleanup['result'], cleanup['released'] = 'released', True
-            with contextlib.suppress(OSError):
-                fh.close()
-            return
-        cleanup['evidence'].append('the record could not be cleared')
-    _end_unresolved(row, fh, lock, '')
+    say(f'{row["name"]:26} BLOCKED: cleanup {cleanup["result"]}, {"released" if task.released else "NOT released"}')
 
 
 # --- the farm -------------------------------------------------------------------------------
@@ -555,8 +595,8 @@ def parser_for(profile) -> argparse.ArgumentParser:
     return p
 
 
-LOCK_FUNCTIONS = ('take_board_lock', 'clear_record', 'end_failed', 'failure_report', 'failure_text')
-LOCK_EXCEPTIONS = ('BoardLocked', 'RecoveryBlocked', 'LockUnavailable')
+LOCK_FUNCTIONS = ('board_task', 'failure_report', 'failure_text')
+LOCK_EXCEPTIONS = ('BoardBusy', 'BoardLocked', 'RecoveryBlocked', 'LockUnavailable')
 
 
 def _lock_api_problem(module):

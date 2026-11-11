@@ -90,15 +90,20 @@ retries, recovery) apply unchanged; these scripts load its `hil_*` scripts throu
   restore failed (released), 5 not released; `session close` counts 6 closed, and on a closed session prints its
   recorded exits without the rig (exit 0). An older engine's pending record
   (kind `arduino-hil`) is reported (`previousPending`), never a refusal.
-- **Claims** (agentrc#467): a run, commission or session command claims its board (kind `arduino-hil-claim`, the
-  `hil` skill's Board locks) after its lock or hold check and before its first tool. Another live invocation on the
-  board refuses it (a run's row `locked`, a session command's exit 2). An earlier invocation that died with children
-  not proven ended is logged in the board's cleanup log once and reported (`previousCleanupFailure`); a child of it
-  still running (`pending`) gets 30 s to end, else the attempt is refused the same way, its lock released, and every
-  later attempt is refused until that child ends; an `unknown` one never holds the board. Another OS user's earlier
-  invocation, whose files this one may not read, counts as running while `/proc` shows one of its supervisors or may
-  hide one, and the refusal names who can clear it. A clean end removes its claim before the release; one that left a
-  child unproven keeps it. `claimNote` reports a claim not removed or a failure not logged.
+- **Busy check**: a run or commission is one `hil_lock.board_task` whose busy check, under its lock and before any tool,
+  is agentrc `hil_flash.probe_users` on the board's probe; its docstring has what it covers (the probe's serial on a
+  command line, holders of its usbfs node or esptool tty) and misses (GDB clients, DUT-side tools, anything started
+  after the check). A probe in use refuses with nothing touched: a run's row `locked`, naming the users in `probeUsers`,
+  and a commission's exit 2, neither logging a failure; a check that cannot tell refuses the same way (a run's row not
+  run, `refused: probe check`). A session command refused either way exits 2 with nothing touched, though a refused
+  `restore` is logged in the board's cleanup log as any refused restore is, and `restore --release` still releases the
+  hold and exits 6, or 5 when the release fails. A run's or commission's refusal whose lock did not end cleanly is a
+  blocker (exit 4) instead. Session commands under one hold run one at a time, from any tree or OS user, through the
+  hold's session mutex (`hil_lock.session_mutex`), taken before the hold is checked, and run the same busy check
+  themselves. A run's cleanup verdict is failed (logged, a blocker) unless its cleanup passed, then restored when a test
+  ran and its restore passed (open failures whose evidence is resolved marked restored), else clean; a commission that
+  passes is a restoration. `cleanup.lock` (a commission's `lock`) names a lock that did not end as its verdict said: a
+  blocker.
 
 ## Code format
 
