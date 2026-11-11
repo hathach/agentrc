@@ -203,14 +203,10 @@ pins each target's session once, so one replaced in its terminal while the relay
   mentioning it. The watch brief tells each session its own open decisions with their revisions, and to resolve one
   the human answered in its terminal.
 - **Pruning** closes decisions the human settled elsewhere. Plain `prune` lists the open ones the evidence shows
-  obsolete: `pr-done` when the PR it names is merged or closed, `owner-gone` when its session runs in no local
-  terminal (one resumed elsewhere, or now the captain, keeps its items). A failed lookup, a non-local owner or an
-  unpinned session that could be the owner is no reason, and a chief run's item has only its PR's; staleness, age or
-  a `done` report never make one obsolete. `prune <id>:<rev>...` previews the named ones, any open decision. Show
-  the human the preview; on their word, `prune <id>:<rev>... --apply` cancels exactly those at those revisions, all
-  or none: one revised, closed or missing since refuses the batch with nothing written, and one already cancelled at
-  its revision is a retry's no-op. A pruned decision is cancelled, history kept: reported again it stays closed until
-  its session reopens it.
+  obsolete, `pr-done` (its PR merged or closed) or `owner-gone` (its session runs in no local terminal); what cannot
+  be told is never listed, and staleness, age or a `done` report never count. `prune <id>:<rev>...` previews any
+  open ones the human names. Show the preview; only on their word run `prune <id>:<rev>... --apply`, which cancels
+  exactly those, all or none, and keeps the history.
 - **Verdicts** are the human's, on a decision at the revision `queue` showed them. Relay their words with
   `relay <target> --item <item> --revision <N> --verdict ...` to the one session that owns it; for a chief's decision,
   or one the human settles with you alone, `verdict` records the words with the same options, sending nothing.

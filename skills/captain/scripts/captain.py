@@ -359,8 +359,6 @@ def well_formed(rec):
         return text(rec.get('watch')) and isinstance(rec.get('handle'), str) and pinned_identity(rec.get('target'))
     if rec['type'] in ('watch-end', 'held'):
         return isinstance(rec.get('why'), str)
-    if rec['type'] == 'cancel':
-        return 'revision' not in rec or type(rec['revision']) is int and rec['revision'] > 0
     if rec['type'] == 'start':
         return (all(text(rec.get(k)) for k in ('entry', 'quote', 'dir', 'name', 'space'))
                 and os.path.isabs(rec['dir']) and rec.get('account') in LAUNCHERS
@@ -485,9 +483,9 @@ def find(address):
     return pin(s) if s and s['address'] == address else None
 
 
-def everyone():
-    """Every Claude Code session but this one, pinned where it can be."""
-    return [pin(s) for s in sessions()]
+def everyone(me=None):
+    """Every Claude Code session but me (this one by default, '' for none), pinned where it can be."""
+    return [pin(s) for s in sessions(me=me)]
 
 
 def in_space(space, session):
@@ -1372,8 +1370,6 @@ def decisions(recs):
             found[r['msg']]['observations'][r['source']] = {'ok': r['ok'], 'value': r['value'], 'at': i}
         elif r['type'] == 'cancel' and r['msg'] in found:
             item = found[r['msg']]
-            if r.get('revision', item['revision']) != item['revision']:
-                continue   # a prune of a revision since replaced
             if (item['closure'] or {}).get('why') == 'superseded':   # cancelled while still open, before supersession
                 item['state'] = 'open'
             close(item, i, 'cancelled')
@@ -1515,6 +1511,17 @@ def lookup(*args):
     return done.stdout.strip() if done.returncode == 0 else None
 
 
+def pr_view(pr, fields, look=None):
+    """The fields of pr, `owner/repo#N`, as gh reports them, through look (lookup's arguments and result), or None
+    when they cannot be read."""
+    repo, number = pr.split('#')
+    try:
+        got = json.loads((look or lookup)('gh', 'pr', 'view', number, '-R', repo, '--json', fields) or 'null')
+    except ValueError:
+        return None
+    return got if isinstance(got, dict) else None
+
+
 def observe(item, look=None):
     """Each of item's sources as it is now: {source, ok, value}, a failed lookup ok false, through look (lookup's
     arguments and result). No lock is held."""
@@ -1527,12 +1534,7 @@ def observe(item, look=None):
             except (OSError, SystemExit):   # unreadable, or a link run_file() refuses
                 value, ok = None, False
         elif source == 'pr':
-            repo, number = item['content']['pr'].split('#')
-            try:
-                value = json.loads(look('gh', 'pr', 'view', number, '-R', repo, '--json', 'headRefOid') or '{}'
-                                   ).get('headRefOid')
-            except (ValueError, AttributeError):
-                value = None
+            value = (pr_view(item['content']['pr'], 'headRefOid', look) or {}).get('headRefOid')
             ok = isinstance(value, str) and bool(SHA.fullmatch(value))
         else:
             value = look('git', '-C', item['content']['worktree'], 'rev-parse', '--verify', 'HEAD')
@@ -1647,31 +1649,17 @@ def cancel(msg, mine):
     return 0
 
 
-def everywhere():
-    """Every local Claude Code session, this one included, pinned where it can be."""
-    return [pin(s) for s in sessions(me='')]
-
-
 def gone(owner, live):
-    """Whether owner's session runs in none of live, the local sessions; None when that cannot be told: a non-local
-    owner, or an unpinned session that could be it."""
-    if not hc.is_local(owner['address']):
-        return None
-    if any((s['account'], s['session']) == session_of(owner) for s in live):
-        return False
-    if any(s['session'] in (None, owner['session']) and s['account'] in (None, owner['account']) for s in live):
-        return None
-    return True
+    """Whether owner's session, on a local terminal, runs in none of live, the local sessions, an unpinned one that
+    could be it included."""
+    return hc.is_local(owner['address']) and not any(
+        s['session'] in (None, owner['session']) and s['account'] in (None, owner['account']) for s in live)
 
 
-def pr_state(pr, look):
+def pr_state(pr):
     """pr's state as gh reports it (OPEN, MERGED, CLOSED), or None when it cannot be read."""
-    repo, number = pr.split('#')
-    try:
-        got = json.loads(look('gh', 'pr', 'view', number, '-R', repo, '--json', 'number,state') or 'null')
-    except ValueError:
-        return None
-    return got.get('state') if isinstance(got, dict) and got.get('number') == int(number) else None
+    got = pr_view(pr, 'number,state')
+    return got.get('state') if got and got.get('number') == int(pr.split('#')[1]) else None
 
 
 def prunable(items):
@@ -1680,13 +1668,12 @@ def prunable(items):
     chief run's item, owned by no session, has only its PR's. No lock is held."""
     prs = sorted({i['content']['pr'] for i in items if i['content'].get('pr')})
     with ThreadPoolExecutor(4) as pool:
-        states = dict(zip(prs, pool.map(lambda pr: pr_state(pr, lookup), prs)))
-    live = None
-    if any('address' in i['owner'] for i in items):
-        try:
-            live = everywhere()
-        except hc.Error:
-            pass   # every owner stays unknown
+        listing = pool.submit(everyone, '') if any('address' in i['owner'] for i in items) else None
+        states = dict(zip(prs, pool.map(pr_state, prs)))
+    try:
+        live = listing.result() if listing else []
+    except hc.Error:
+        live = None   # every owner stays unknown
     found = {}
     for i in items:
         reasons = ['pr-done'] if states.get(i['content'].get('pr')) in ('MERGED', 'CLOSED') else []
@@ -1704,50 +1691,21 @@ def where(item):
     return f'closed ({item["closure"]["why"]}) at revision {item["closure"]["revision"]}'
 
 
-def prune(selection, apply, as_json, mine):
-    """Without apply, preview the open decisions the evidence shows obsolete, or the ones selection names as
-    (id, revision), sending and recording nothing. With apply, cancel exactly the selected ones, all or none: one
-    missing, revised or closed since refuses the batch, unless it was cancelled at that revision already, a retry.
-    The human's word gates apply; nothing here can check it."""
-    ids = [iid for iid, _ in selection]
-    if apply and not ids:
-        die('prune --apply names each decision as <id>:<rev>', 2)
-    if len(set(ids)) != len(ids):
-        die('prune names each decision once', 2)
+def prune(selection, as_json, mine):
+    """Preview the open decisions the evidence shows obsolete, or the ones selection names, sending and recording
+    nothing."""
     with locked():
         require_captain(mine)
         found = decisions(records())
-        if apply:
-            todo, done, wrong = [], [], []
-            for iid, rev in selection:
-                item = found.get(iid)
-                closure = item and item['closure'] or {}
-                if item and item['state'] == 'open' and item['revision'] == rev:
-                    todo.append((iid, rev))
-                elif closure.get('why') == 'cancelled' and closure['revision'] == rev:
-                    done.append(iid)
-                else:
-                    wrong.append(f'{iid}:{rev} is ' + (where(item) if item else 'no decision'))
-            if wrong:
-                die('nothing cancelled: ' + '; '.join(wrong), 3)
-            for iid, rev in todo:
-                append({'type': 'cancel', 'msg': iid, 'revision': rev})
-    if apply:
-        for iid, _ in todo:
-            print(f'cancelled {iid}')
-        for iid in done:
-            print(f'{iid}: cancelled already')
-        return 0
-    if ids:
-        missing = [iid for iid in ids if iid not in found]
-        if missing:
-            die(f'no decision {", ".join(missing)}', 3)
-        rows = [found[iid] for iid in ids]
+    missing = [iid for iid, _ in selection if iid not in found]
+    if missing:
+        die(f'no decision {", ".join(missing)}', 3)
+    if selection:
+        rows = [found[iid] for iid, _ in selection]
+        reasons = prunable([i for i in rows if i['state'] == 'open'])
     else:
-        rows = [i for i in found.values() if i['state'] == 'open']
-    reasons = prunable([i for i in rows if i['state'] == 'open'])
-    if not ids:
-        rows = [i for i in rows if i['id'] in reasons]
+        reasons = prunable([i for i in found.values() if i['state'] == 'open'])
+        rows = [found[iid] for iid in reasons]
     listed = [{'id': i['id'], 'revision': i['revision'], 'state': i['state'], 'reasons': reasons.get(i['id'], []),
                'handle': i['handle'], 'ask': i['content']['ask']} for i in rows]
     line = [f'{r["id"]}:{r["revision"]}' for r in listed if r['state'] == 'open']
@@ -1758,7 +1716,37 @@ def prune(selection, apply, as_json, mine):
         why = ', '.join(r['reasons']) or ('-' if r['state'] == 'open' else 'closed')
         print(f'{r["id"]}:{r["revision"]}\t{why}\t{r["handle"]}\t{one_line(r["ask"])}')
     print(f'apply: python3 {INSTALLED} prune {" ".join(line)} --apply' if line
-          else 'no decision looks obsolete' if not ids else 'nothing open to cancel')
+          else 'nothing open to cancel' if selection else 'no decision looks obsolete')
+    return 0
+
+
+def prune_apply(selection, mine):
+    """Cancel exactly the selected decisions at their revisions, all or none: one missing, revised or closed since
+    refuses the batch, unless it was cancelled at that revision already, a retry. The human's word gates this;
+    nothing here can check it."""
+    if not selection:
+        die('prune --apply names each decision as <id>:<rev>', 2)
+    with locked():
+        require_captain(mine)
+        found = decisions(records())
+        todo, done, wrong = [], [], []
+        for iid, rev in selection:
+            item = found.get(iid)
+            closure = item and item['closure'] or {}
+            if item and item['state'] == 'open' and item['revision'] == rev:
+                todo.append(iid)
+            elif closure.get('why') == 'cancelled' and closure['revision'] == rev:
+                done.append(iid)
+            else:
+                wrong.append(f'{iid}:{rev} is ' + (where(item) if item else 'no decision'))
+        if wrong:
+            die('nothing cancelled: ' + '; '.join(wrong), 3)
+        for iid in todo:
+            append({'type': 'cancel', 'msg': iid})
+    for iid in todo:
+        print(f'cancelled {iid}')
+    for iid in done:
+        print(f'{iid}: cancelled already')
     return 0
 
 
@@ -2589,14 +2577,14 @@ def pending():
     session = my_session()
     with locked():
         member, watch, _ = join(session)
-        keys = open_keys(records(), session) if member else ()
+        keys = open_keys(session) if member else ()
     print(watch_brief(member['msg'], keys) if member else f'none: {watch}')
     return 0
 
 
-def open_keys(recs, session):
-    """(key, revision) of each open keyed decision session owns, in opening order."""
-    return [(i['key'], i['revision']) for i in decisions(recs).values()
+def open_keys(session):
+    """(key, revision) of each open keyed decision session owns, in opening order. Under the ledger lock."""
+    return [(i['key'], i['revision']) for i in decisions(records()).values()
             if i['key'] and i['state'] == 'open' and session_of(i['owner']) == session_of(session)]
 
 
@@ -2615,11 +2603,11 @@ def hook(payload):
     briefing = payload.get('hook_event_name') == 'SessionStart'
     with locked(HOOK_LOCK_S):
         member, watch, new = join(session)
-        keys = open_keys(records(), session) if member and (briefing or new) else ()
+        keys = open_keys(session) if member and (briefing or new) else ()
     if not member:
         return None
     brief = watch_brief(member['msg'], keys)
-    if payload.get('hook_event_name') == 'SessionStart':
+    if briefing:
         return json.dumps({'hookSpecificOutput': {'hookEventName': 'SessionStart', 'additionalContext': brief}})
     if payload.get('hook_event_name') == 'Stop' and new:
         return json.dumps({'decision': 'block', 'reason': brief + '\n\nIf this turn ended a task, report it now; '
@@ -2841,6 +2829,9 @@ def selected(items):
     bad = [t for t, m in zip(items, found) if not m]
     if bad:
         die(f'prune takes <id>:<rev>, not {bad[0]}', 2)
+    ids = [m.group(1) for m in found]
+    if len(set(ids)) != len(ids):
+        die('prune names each decision once', 2)
     return [(m.group(1), int(m.group(2))) for m in found]
 
 
@@ -2964,7 +2955,7 @@ def main():
         if a.cmd == 'cancel':
             return cancel(a.msg, mine)
         if a.cmd == 'prune':
-            return prune(selected(a.items), a.apply, a.json, mine)
+            return prune_apply(selected(a.items), mine) if a.apply else prune(selected(a.items), a.json, mine)
         if a.cmd == 'watch':   # all stays all, sessions to come included: resolve() would list today's
             return arm(['all'] if a.targets == ['all'] else list(resolve(a.targets)), mine)
         if a.cmd == 'relay':

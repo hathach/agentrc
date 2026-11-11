@@ -3208,25 +3208,24 @@ class PruneTest(VerdictCase):
     def setUp(self):
         super().setUp()
         self.pr_states = {'o/r#12': 'OPEN'}
-        for attr, value in (('lookup', self.look), ('everywhere', lambda: [dict(t) for t in self.terminals.values()])):
+        for attr, value in (('lookup', self.look), ('everyone', lambda me: [dict(t) for t in self.terminals.values()])):
             patcher = mock.patch.object(captain, attr, value)
             patcher.start()
             self.addCleanup(patcher.stop)
 
     def look(self, *args):
-        if args[:3] == ('gh', 'pr', 'view') and args[-1] == 'number,state':
-            state = self.pr_states.get(f'{args[5]}#{args[3]}')
-            return json.dumps({'number': int(args[3]), 'state': state}) if state else None
-        return json.dumps({'headRefOid': self.head}) if args[0] == 'gh' else None
+        self.assertEqual((args[:3], args[-1]), (('gh', 'pr', 'view'), 'number,state'))
+        state = self.pr_states.get(f'{args[5]}#{args[3]}')
+        return json.dumps({'number': int(args[3]), 'state': state}) if state else None
 
     def preview(self, *selection):
         with mock.patch('builtins.print') as out:
-            captain.prune(captain.selected(list(selection)), False, True, self.ident)
+            captain.prune(captain.selected(list(selection)), True, self.ident)
         return json.loads(out.call_args_list[0].args[0])
 
     def apply(self, *selection):
         with mock.patch('builtins.print') as out:
-            captain.prune(captain.selected(list(selection)), True, False, self.ident)
+            captain.prune_apply(captain.selected(list(selection)), self.ident)
         return [c.args[0] for c in out.call_args_list]
 
     def test_a_merged_or_closed_pr_and_a_gone_session_are_candidates_and_preview_records_nothing(self):
@@ -3254,7 +3253,7 @@ class PruneTest(VerdictCase):
                 self.assertEqual(self.preview()['items'], [])
                 for address in terminals:
                     del self.terminals[address]
-        with mock.patch.object(captain, 'everywhere', side_effect=captain.hc.Error('hc down')):
+        with mock.patch.object(captain, 'everyone', side_effect=captain.hc.Error('hc down')):
             self.assertEqual(self.preview()['items'], [])
         with mock.patch.object(captain.hc, 'is_local', return_value=False):
             self.assertEqual(self.preview()['items'], [])
@@ -3267,7 +3266,6 @@ class PruneTest(VerdictCase):
             with self.subTest(address):
                 self.terminals[address] = {**pinned(address), 'session': 's-t2'}
                 self.assertEqual(self.preview()['items'], [])
-        self.terminals['t1'] = CAPTAIN
 
     def test_apply_cancels_exactly_the_named_revisions(self):
         self.report(decision('merge'), decision('ci', kind='blocked'))
@@ -3275,7 +3273,7 @@ class PruneTest(VerdictCase):
         self.assertEqual(self.apply(f'{merge}:1'), [f'cancelled {merge}'])
         self.assertEqual((self.item()['state'], self.item()['closure']['why']), ('closed', 'cancelled'))
         self.assertEqual(self.item('ci')['state'], 'open')
-        self.assertEqual([r['revision'] for r in captain.records() if r['type'] == 'cancel'], [1])
+        self.assertEqual(self.count('cancel'), 1)
 
     def test_a_selection_revised_closed_or_unknown_refuses_the_whole_batch(self):
         self.report(decision('merge'), decision('ci', kind='blocked'), decision('fix', kind='blocked'))
@@ -3286,7 +3284,7 @@ class PruneTest(VerdictCase):
                                ([f'{ci}:1', f'{fix}:1'], f'{fix}:1 is closed (resolved) at revision 1'),
                                ([f'{ci}:1', 'd-0000000000000000:1'], 'is no decision')):
             with self.subTest(why):
-                self.assertIn(why, self.refused(captain.prune, captain.selected(selection), True, False, self.ident))
+                self.assertIn(why, self.refused(captain.prune_apply, captain.selected(selection), self.ident))
         self.assertEqual(self.item('ci')['state'], 'open')
 
     def test_a_named_preview_shows_each_as_it_is_and_offers_only_the_open(self):
@@ -3308,18 +3306,16 @@ class PruneTest(VerdictCase):
     def test_malformed_selections_refuse(self):
         self.report(decision('merge'))
         iid = self.item()['id']
-        for args, why in (([], 'names each decision'), ([(iid, 1), (iid, 1)], 'each decision once')):
-            with self.subTest(why):
-                self.assertIn(why, self.refused(captain.prune, args, True, False, self.ident))
-        for token in (iid, f'{iid}:0', f'{iid}:r1', 'merge:1'):
-            with self.subTest(token), self.assertRaises(SystemExit), mock.patch('sys.stderr'):
-                captain.selected([token])
+        self.assertIn('names each decision', self.refused(captain.prune_apply, [], self.ident))
+        for tokens in ([iid], [f'{iid}:0'], [f'{iid}:r1'], ['merge:1'], [f'{iid}:1', f'{iid}:2']):
+            with self.subTest(tokens), self.assertRaises(SystemExit), mock.patch('sys.stderr'):
+                captain.selected(tokens)
 
     def test_only_the_enrolled_captain_prunes(self):
         self.report(decision('merge'))
         self.replace_captain()
         self.assertIn('not the enrolled captain',
-                      self.refused(captain.prune, [(self.item()['id'], 1)], True, False, self.ident))
+                      self.refused(captain.prune_apply, [(self.item()['id'], 1)], self.ident))
 
     def test_a_pruned_decision_stays_closed_when_reported_again(self):
         self.report(decision('merge'))
@@ -3332,18 +3328,6 @@ class PruneTest(VerdictCase):
         self.assertEqual([i['state'] for i in self.items().values()], ['closed', 'closed'])
         self.report(decision('merge', ask='merge now?'), reopen=['merge'])
         self.assertEqual(self.item()['state'], 'open')
-
-    def test_a_cancel_bound_to_a_replaced_revision_closes_nothing(self):
-        self.report(decision('merge'))
-        self.report(decision('merge', ask='merge now?'))
-        with captain.locked():
-            captain.append({'type': 'cancel', 'msg': self.item()['id'], 'revision': 1})
-        self.assertEqual((self.item()['state'], self.item()['revision']), ('open', 2))
-
-    def test_a_cancel_s_revision_is_a_positive_integer(self):
-        for revision, ok in ((1, True), (0, False), (True, False), ('1', False)):
-            with self.subTest(revision):
-                self.assertEqual(captain.well_formed({'type': 'cancel', 'msg': 'd-1', 'revision': revision}), ok)
 
     def test_the_brief_lists_the_session_s_own_open_decisions_with_their_revisions(self):
         self.terminals['t3'] = pinned('t3')
