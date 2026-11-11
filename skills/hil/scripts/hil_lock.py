@@ -9,6 +9,7 @@ import errno
 import fcntl
 import hashlib
 import importlib.util
+import itertools
 import json
 import math
 import os
@@ -247,6 +248,16 @@ def _write_all(fd, data) -> None:
         data = data[n:]
 
 
+RECORD_OWN = ('pid', 'since')   # what every record write stamps itself
+
+
+def _own_fields(extra, *marks) -> None:
+    """ValueError when `extra` names a field the write stamps itself (RECORD_OWN, `marks`): it
+    would replace the holder's pid or start, or fake or cancel a mark."""
+    if clash := sorted(set(RECORD_OWN + marks) & set(extra)):
+        raise ValueError(f'record fields {clash} are reserved: the lock writes them itself')
+
+
 def write_record(fh, reason: str, **extra) -> None:
     """Holder record; the flock itself is already held. Raises OSError on a write failure: a
     hold whose record is missing is invisible to status/release, so every caller refuses it.
@@ -455,8 +466,10 @@ def take_board_lock(board: str, reason: str, *, protected=False, **extra):
     `protected` marks the record `cleanupOwed`: a task that restores the board, so `release`
     never signals it and a record it leaves is logged as a failed cleanup. It also declares
     the task's group on that first record: `locks`, the names of every board the task takes
-    (unique, this one among them; default this board alone). A malformed group raises
+    (unique, this one among them; default this board alone). A malformed group, or an `extra`
+    field the take writes itself (RECORD_OWN, and `cleanupOwed` when protected), raises
     ValueError before anything is touched."""
+    _own_fields(extra, *((CLEANUP_OWED,) if protected else ()))
     if protected:
         try:
             _check_name(board)
@@ -616,6 +629,18 @@ def open_cleanup_failures(board) -> list:
             and not (isinstance(e.get('id'), str) and e['id'] in restored)]
 
 
+def _guarded(step, what, note, interrupted, default=None):
+    """step(), or `default` once note('<what>: <error>') took its failure; an interrupt it raised
+    is kept in `interrupted` for the caller to raise once its cleanup is done."""
+    try:
+        return step()
+    except BaseException as e:
+        if not isinstance(e, Exception):
+            interrupted.append(e)
+        note(f'{what}: {e!r:.200}')
+        return default
+
+
 def end_failed(handles, reason, *, detail, receipts=(), retained=(), **extra) -> dict:
     """End a task whose cleanup did not end proven: on every board of `handles` ({board: handle}),
     append a `failed` event (the holder record, `detail`, the run_tracked `receipts` and the
@@ -625,14 +650,10 @@ def end_failed(handles, reason, *, detail, receipts=(), retained=(), **extra) ->
 
     def guard(boards, what, step, default=None):
         """step(), its failure noted on `boards`; an interrupt is kept until every board is released."""
-        try:
-            return step()
-        except BaseException as e:
-            if not isinstance(e, Exception):
-                interrupted.append(e)
+        def note(text):
             for b in boards:
-                errors.setdefault(b, []).append(f'{what}: {e!r:.200}')
-            return default
+                errors.setdefault(b, []).append(text)
+        return _guarded(step, what, note, interrupted, default)
     # a signal between the guarded steps waits until every board is released (None: the guards alone)
     hold = guard((), 'interrupt hold', lambda: _process().InterruptHold())
     receipts = guard(handles, 'cleanup log not written: receipts', lambda: list(receipts), [])
@@ -732,6 +753,246 @@ def acquire_board_lock(board_name, reason=CI_REASON, **kw):
     if os.environ.get('HIL_NO_BOARD_LOCK') == '1':
         return None  # user-authorized bypass — see the HIL contract
     return take_board_lock(board_name, reason, **kw)
+
+
+# --- board task -----------------------------------------------------------------------------
+TASK_POLL = 0.25    # s between takes while a board task waits out contention
+
+
+class BoardBusy(BoardLocked):
+    """The task's busy check named live users of the board's probe or devices: its lock, taken
+    for the check, is released again without a failure event. `users` are what the check named,
+    `cleanup_failures` the take's open failures, for the caller's report."""
+
+    def __init__(self, board, users, cleanup_failures):
+        super().__init__(f'board busy: {board} in use by {", ".join(map(str, users)):.500}')
+        self.board, self.users, self.cleanup_failures = board, users, cleanup_failures
+
+
+def _exc_text(exc) -> str:
+    return f'{type(exc).__name__}: {exc}' if str(exc) else type(exc).__name__
+
+
+class BoardTask:
+    """One task's lifecycle on one board, as a context manager that takes nothing until entered:
+    a protected take (`record_fields` added to the record; the take's own fields and marks, and
+    `protected`, `locks` and `role`, refused), waiting out ordinary contention for at most `wait`
+    s (a RecoveryBlocked or LockUnavailable refuses at once), then `busy()`, the consumer's
+    observational check that returns the live users of its probe or devices as a list, tuple or
+    set, empty when idle, and raises when inconclusive, under the lock and before the body. A
+    name refuses with BoardBusy, a raising check with its exception and any other result with
+    TypeError, after the lock is released with no failure event. Each take attempt runs under an
+    InterruptHold until its handle and failures are kept, so an interrupt there ends as that
+    refusal.
+
+    The body ends on its verdict, given once as its last hardware action: clean() clears the
+    record and releases (a record that cannot be cleared ends through end_failed),
+    restored(evidence=...) runs resolve_restored on the take's failures while still holding,
+    then releases, and failed(...), no verdict, or a body that raised before its verdict end
+    through end_failed, the exception named in the detail. A second verdict raises and ends the
+    task as failed. Finalization runs under an InterruptHold: a SIGINT or SIGTERM whose handler is
+    a Python callable is replayed once the task's state is complete and then takes precedence
+    over the body's exception, kept as its __context__; other finalization errors go to `errors`
+    and never replace it. A handle that cannot be closed is kept, and a later __exit__ retries
+    its close. With `allow_bypass`, HIL_NO_BOARD_LOCK=1 takes no flock (acquire_board_lock): the
+    busy check still runs, a failed cleanup is logged with log_cleanup_failure and a restoration
+    resolves nothing; without it the variable is ignored.
+
+    Limit: a signal CPython delivers as __exit__ is entered unwinds before it runs, leaving the
+    flock held while the process lives and the protected record for the next take to log
+    found-left. A worker that catches that interrupt and goes on calls the task's __exit__ again
+    (a task without a verdict then ends as failed) or ends before it continues.
+
+    `cleanup_failures` (the take's open failures, kept even when admission is refused), `errors`,
+    `restore_notes` (resolve_restored's), `bypassed` and `released` (an owned handle was closed)
+    stay readable after the task ends, for the caller's report."""
+
+    def __init__(self, board, reason=CI_REASON, *, busy, wait=0, allow_bypass=False, **record_fields):
+        if not callable(busy):
+            raise TypeError(f'busy must be callable, not {busy!r:.80}')
+        if isinstance(wait, bool) or not isinstance(wait, (int, float)) or not math.isfinite(wait) or wait < 0:
+            raise ValueError(f'wait must be a finite number of seconds >= 0, not {wait!r:.80}')
+        _own_fields(record_fields, CLEANUP_OWED, 'protected', 'locks', 'role')
+        self.board, self.reason = board, reason
+        self._busy, self._wait, self._allow_bypass, self._fields = busy, wait, allow_bypass, record_fields
+        self.cleanup_failures, self.errors, self.restore_notes = [], [], []
+        self.bypassed = self.released = False
+        self._fh = self._verdict = None
+        self._given = []                 # every verdict call, in order
+        # new, entering, active; then ending (its verdict's steps), closing (its handle) and done
+        self._state = 'new'
+
+    def __enter__(self):
+        if self._state != 'new':
+            raise RuntimeError(f'board task {self.board} is entered once')
+        self._state = 'entering'
+        refusal = None
+        try:
+            self._take()
+            if self._fh is None:
+                self.bypassed = True
+                self.cleanup_failures = open_cleanup_failures(self.board)
+            users = self._busy()
+            if not isinstance(users, (list, tuple, set, frozenset)):
+                raise TypeError(f'busy() returned {users!r:.80}, not a list, tuple or set of users')
+            if users:
+                refusal = BoardBusy(self.board, list(users), self.cleanup_failures)
+        except BaseException as e:
+            refusal = e
+        if refusal is None:
+            self._state = 'active'
+            return self
+        # inline, as in __exit__: entering a helper is itself a point where a signal handler runs
+        pending = None
+        while True:
+            try:
+                self._finish(None, refused=True)
+                break
+            except BaseException as e:
+                if self._state != 'entering':
+                    raise
+                pending = pending or e
+        raise pending or refusal
+
+    def _take(self):
+        take = acquire_board_lock if self._allow_bypass else take_board_lock
+        deadline = time.monotonic() + self._wait
+        while True:
+            hold = self._interrupt_hold()      # per attempt, never over the sleep: Ctrl-C ends a wait
+            try:
+                try:
+                    self._fh = take(self.board, self.reason, protected=True, **self._fields)
+                    if self._fh is not None:
+                        self.cleanup_failures = list(self._fh.cleanup_failures)
+                    return
+                finally:
+                    if hold is not None:
+                        hold.release()
+            except RecoveryBlocked:
+                raise
+            except BoardLocked:
+                pause = deadline - time.monotonic()
+                if pause <= 0:
+                    raise
+                time.sleep(min(TASK_POLL, pause))
+                if time.monotonic() > deadline:
+                    raise
+
+    def _interrupt_hold(self):
+        try:
+            return _process().InterruptHold()
+        except Exception as e:
+            if (why := f'interrupt hold: {e!r:.200}') not in self.errors:     # once, not per take attempt
+                self.errors.append(why)
+            return None
+
+    def clean(self) -> None:
+        self._decide(('clean',))
+
+    def restored(self, *, evidence) -> None:
+        self._decide(('restored', evidence))
+
+    def failed(self, *, detail, receipts=(), retained=()) -> None:
+        self._decide(('failed', detail, receipts, retained))
+
+    def _decide(self, verdict) -> None:
+        if self._state != 'active':
+            raise RuntimeError(f'board task {self.board}: a verdict belongs inside its with block')
+        self._given.append(verdict)
+        if self._verdict is None:
+            self._verdict = verdict      # one store: an interrupt leaves it given or not
+            return
+        failed = [v for v in self._given if v[0] == 'failed']
+        detail = 'cleanup verdict misuse: ' + ' then '.join(v[0] for v in self._given)
+        detail += ''.join(f'; {v[1]}' for v in failed)
+        # lazy: finalization consumes each collection once, under its own guard, however often this merges
+        self._verdict = ('failed', detail, itertools.chain.from_iterable(v[2] for v in failed),
+                         itertools.chain.from_iterable(v[3] for v in failed))
+        raise RuntimeError(f'board task {self.board}: verdict {verdict[0]} after {self._given[0][0]}; '
+                           f'it ends as a failed cleanup')
+
+    def __exit__(self, exc_type, exc, traceback) -> bool:
+        # an interrupt before _finish's hold went in did nothing yet: finish again, then raise it
+        pending = None
+        while True:
+            try:
+                self._finish(exc)
+                break
+            except BaseException as e:
+                if self._state != 'active':
+                    raise
+                pending = pending or e
+        if pending is not None:
+            raise pending
+        return False
+
+    def _verdict_at_end(self, exc):
+        verdict = self._verdict
+        if verdict is None:
+            return ('failed', 'the task ended without a cleanup verdict'
+                    + (f': {_exc_text(exc)}' if exc is not None else ''), (), ())
+        if verdict[0] == 'failed' and exc is not None:
+            return ('failed', f'{verdict[1]}; then {_exc_text(exc)}', *verdict[2:])
+        return verdict
+
+    def _finish(self, exc, refused=False) -> None:
+        if self._state == 'done':
+            return
+        hold = self._interrupt_hold()
+        interrupted = []
+
+        def guard(what, step, default=None):
+            return _guarded(step, what, self.errors.append, interrupted, default)
+        try:
+            if self._state in ('entering', 'active'):
+                self._state = 'ending'
+                self._end_on(guard, refused, exc)
+                self._state = 'closing'
+        finally:
+            # whatever cut the steps short (no hold to defer it), an owned handle is closed here
+            try:
+                fh = self._fh
+                if fh is not None and not fh.closed:
+                    guard('close', fh.close)
+                self.released = fh is not None and fh.closed
+                if fh is None or fh.closed:   # a handle still open is kept for a later __exit__ to close
+                    self._fh = None
+                    self._state = 'done'
+            finally:
+                if hold is not None:
+                    hold.release()
+        if interrupted:
+            raise interrupted[0]
+
+    def _end_on(self, guard, refused, exc) -> None:
+        verdict = ('refused',) if refused else guard('verdict', lambda: self._verdict_at_end(exc),
+                                                     ('failed', 'the task ended without a cleanup verdict', (), ()))
+        kind, fh = verdict[0], self._fh
+        if fh is None:
+            if self.bypassed and kind == 'failed':
+                guard('cleanup log not written', lambda: log_cleanup_failure(
+                    self.board, self.reason, detail=verdict[1], receipts=verdict[2], retained=verdict[3]))
+            elif self.bypassed and kind == 'restored' and self.cleanup_failures:
+                self.restore_notes.append('nothing resolved: the board lock was bypassed (HIL_NO_BOARD_LOCK=1)')
+        elif kind == 'failed':
+            self._end_failed(guard, *verdict[1:])
+        else:
+            if kind == 'restored':
+                self.restore_notes.extend(guard('restoration', lambda: resolve_restored(
+                    self.board, self.cleanup_failures, evidence=verdict[1]), []))
+            cleared = guard('record not cleared', lambda: clear_record(fh))
+            if cleared is False:
+                self.errors.append('record not cleared')
+            if not cleared and kind != 'refused':     # a refusal touched nothing: the next take logs the record
+                self._end_failed(guard, f'record not cleared after a {kind} verdict', (), ())
+
+    def _end_failed(self, guard, detail, receipts, retained) -> None:
+        errors = guard('end_failed', lambda: end_failed({self.board: self._fh}, self.reason, detail=detail,
+                                                        receipts=receipts, retained=retained), {})
+        self.errors.extend(errors.get(self.board, []))
+
+
+board_task = BoardTask
 
 
 # --- holder identity ------------------------------------------------------------------------
