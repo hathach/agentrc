@@ -1078,28 +1078,42 @@ def session_mutex(lock):
     LockUnavailable when the dir or file cannot be used. It is no board lock: lock_names and
     `release --all` never list it."""
     _check_name(lock)
+    fds = []      # the dir's, then the mutex's
     try:
-        dfd = _open_dir(create=True)
-    except OSError as e:
-        raise _unavailable(e) from e
-    try:     # the dir fd is closed last, so no close stands between the mutex fd's open and its own cleanup
         try:
-            fd = _open_file(dfd, lock + SESSION_MUTEX, os.O_RDWR, create=True)
+            fds.append(_open_dir(create=True))
+            fds.append(_open_file(fds[0], lock + SESSION_MUTEX, os.O_RDWR, create=True))
         except OSError as e:
             raise _unavailable(e) from e
         try:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                raise SessionBusy(f'session busy: another command under the hold of {lock} is running '
-                                  f'({lock}{SESSION_MUTEX} held)') from None
-            except OSError as e:
-                raise _unavailable(e) from e
-            yield
-        finally:
-            os.close(fd)
+            fcntl.flock(fds[1], fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SessionBusy(f'session busy: another command under the hold of {lock} is running '
+                              f'({lock}{SESSION_MUTEX} held)') from None
+        except OSError as e:
+            raise _unavailable(e) from e
+        yield
     finally:
-        os.close(dfd)
+        # closed under an InterruptHold, inline (a call's entry is an interrupt check): a caller catching the
+        # interrupt keeps no flock. One before the hold went in closed nothing yet: close again, then raise it
+        pending = None
+        while fds:
+            try:
+                try:
+                    hold = _process().InterruptHold()
+                except Exception:
+                    hold = None       # the pops alone
+                try:
+                    while fds:
+                        os.close(fds.pop())       # popped first: an fd is closed at most once
+                finally:
+                    if hold is not None:
+                        hold.release()
+            except BaseException as e:      # an interrupt wins over a close's OSError
+                if pending is None or isinstance(pending, Exception) and not isinstance(e, Exception):
+                    pending = e
+        if pending is not None:
+            raise pending
 
 
 # --- holder identity ------------------------------------------------------------------------

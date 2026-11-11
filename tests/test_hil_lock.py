@@ -2820,6 +2820,37 @@ class SessionMutex(LockDir):
         p = self.other()
         self.assertEqual(p.stdout.readline().strip(), 'ready')
 
+    def test_an_interrupt_in_its_cleanup_still_frees_the_mutex(self):
+        """A caller that catches the interrupt runs its next command under the hold, not SessionBusy."""
+        self.addCleanup(signal.signal, signal.SIGINT, signal.signal(signal.SIGINT, signal.default_int_handler))
+        with hil_lock.session_mutex(BOARD):
+            pass
+        fds = len(os.listdir('/proc/self/fd'))
+        real_close, real_process = os.close, hil_lock._process
+
+        def close(fd):                          # an interrupt just before the mutex fd closes
+            if not stat.S_ISDIR(os.fstat(fd).st_mode):
+                signal.raise_signal(signal.SIGINT)
+            real_close(fd)
+        with self.assertRaises(KeyboardInterrupt):
+            with mock.patch.object(hil_lock.os, 'close', close), hil_lock.session_mutex(BOARD):
+                pass
+        self.assertEqual(len(os.listdir('/proc/self/fd')), fds)
+        with hil_lock.session_mutex(BOARD):
+            pass
+        interrupts = [KeyboardInterrupt()]
+
+        def process():                          # an interrupt before the hold goes in
+            if interrupts:
+                raise interrupts.pop()
+            return real_process()
+        with self.assertRaises(KeyboardInterrupt):
+            with mock.patch.object(hil_lock, '_process', process), hil_lock.session_mutex(BOARD):
+                pass
+        self.assertEqual(len(os.listdir('/proc/self/fd')), fds)
+        with hil_lock.session_mutex(BOARD):
+            pass
+
     def test_never_a_board_lock(self):
         with hil_lock.session_mutex(BOARD):
             self.assertEqual(hil_lock.lock_names(), [])
