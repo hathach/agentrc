@@ -347,9 +347,11 @@ class ProbeTest(unittest.TestCase):
         self.chip('CH582', 0x82, 0x16, 'USER_CFG', 0x4FFF0FD5)
         code, out, err = self.main('config', '--chip', 'CH582', '--set', 'CFG_RESET_EN=1')
         self.assertEqual(code, 0, err)
+        self.assertEqual(self.calls('wchisp')[:2], [['config', '--help'], ['-u', 'info']])
         self.assertEqual(self.set_word_calls(), [['-u', 'config', 'set-word', '--register', 'USER_CFG', '--expect-uid',
                                                   '11-22-33-44-55-66-77-88', '--expect', '4FFF0FD5',
                                                   '--value', '4FFF0FDD']])
+        self.assertEqual(len(self.calls('wchisp')), 3)
         self.assertIn('0x4FFF0FD5 -> 0x4FFF0FDD', out)
 
     def test_ch582_show_decodes_without_writing(self):
@@ -392,6 +394,34 @@ class ProbeTest(unittest.TestCase):
         self.save()
         code, _, err = self.main('config', '--chip', 'CH582', '--show')
         self.assertEqual((code, 'no config set-word' in err), (1, True), err)
+
+    def test_config_refuses_a_second_isp_device_appearing_before_info(self):
+        self.chip('CH582', 0x82, 0x16, 'USER_CFG', 0x4FFF0FD5)
+        real_run = probe.run
+
+        def run(argv, timeout=120):
+            if argv[1:] == ['-u', 'info']:   # wchisp may open this one instead
+                self.device('5-2.4', '4348', '55e0')
+            return real_run(argv, timeout)
+        with mock.patch.object(probe, 'run', run):
+            code, out, err = self.main('config', '--chip', 'CH582', '--set', 'CFG_RESET_EN=1')
+        self.assertEqual(code, 1)
+        self.assertIn('ISP devices after wchisp info: 5-2.4, 5-2.6, not only the one at 5-2.6', err)
+        self.assertNotIn('UID', out)
+        self.assertEqual(self.set_word_calls(), [])
+
+    def test_config_refuses_a_second_isp_device_appearing_before_set_word(self):
+        self.chip('CH582', 0x82, 0x16, 'USER_CFG', 0x4FFF0FD5)
+        real_apply = probe.apply_fields
+
+        def apply_then_plug(*a):
+            self.device('5-2.7', '1a86', '55e0')
+            return real_apply(*a)
+        with mock.patch.object(probe, 'apply_fields', apply_then_plug):
+            code, _, err = self.main('config', '--chip', 'CH582', '--set', 'CFG_RESET_EN=1')
+        self.assertEqual(code, 1)
+        self.assertIn('ISP devices before set-word: 5-2.6, 5-2.7, not only the one at 5-2.6', err)
+        self.assertEqual(self.calls('wchisp'), [['config', '--help'], ['-u', 'info']])
 
     def test_config_waits_for_no_device_then_fails(self):
         code, _, err = self.main('config', '--chip', 'CH582', '--show', '--wait', '0')

@@ -13,8 +13,8 @@ built per SKILL.md) enforce the same selection. A probe's firmware version comes
 attaches to the target. fw-update refuses an image whose sha256 tools.toml does not list for that model, a
 downgrade without --allow-downgrade, the same version without --reinstall, and fails unless the same serial comes
 back at the same port on the image's version. config needs exactly one WCH ISP device (4348:55e0 or 1a86:55e0) on
-the bus; it changes only the fields CHIPS allows, refuses a word whose fixed bits are off, and hands wchisp the UID
-and current value so the write aborts if either changed."""
+the bus, the same one after `wchisp info` and before the write; it changes only the fields CHIPS allows, refuses a
+word whose fixed bits are off, and hands wchisp the UID and current value so the write aborts if either changed."""
 import argparse
 import hashlib
 import json
@@ -217,12 +217,20 @@ def wait_one_isp_device(wait):
         if len(isp) > 1:
             raise Refused(f'{len(isp)} ISP devices on the bus ({", ".join(d["port"] for d in isp)}); leave one')
         if isp and node_ready(isp[0]):
-            return
+            return isp[0]['port']
         if time.monotonic() >= deadline:
             if isp:
                 raise Refused(f'ISP device at {isp[0]["port"]} but its usbfs node is not accessible after {wait} s')
             raise Refused(f'no WCH ISP device appeared within {wait} s; enter the bootloader per chips/wch.md')
         time.sleep(0.2)
+
+
+def require_only_isp_device(port, when):
+    """wchisp opens the first ISP device libusb lists, not a port: one appearing since the guard could be the one
+    it read or writes."""
+    isp = [d['port'] for d in usb_devices() if d['mode'] == 'isp']
+    if isp != [port]:
+        raise Refused(f'ISP devices {when}: {", ".join(isp) or "none"}, not only the one at {port}; leave one')
 
 
 def chip_word(spec, chip):
@@ -279,8 +287,9 @@ def cmd_config(args):
     _, out = run(['wchisp', 'config', '--help'], timeout=10)
     if 'set-word' not in out:
         raise Refused('wchisp is not the patched build (no config set-word); build it per SKILL.md')
-    wait_one_isp_device(args.wait)
+    port = wait_one_isp_device(args.wait)
     uid, word = chip_word(spec, args.chip)
+    require_only_isp_device(port, 'after wchisp info')
     check_word(spec, word, 'current')
     print(f'{args.chip} UID {uid} {spec["register"]} 0x{word:08X} {decode(spec, word)}')
     if args.show:
@@ -289,6 +298,7 @@ def cmd_config(args):
     if new == word:
         print('nothing to change')
         return 0
+    require_only_isp_device(port, 'before set-word')
     code, out = run(['wchisp', '-u', 'config', 'set-word', '--register', spec['register'], '--expect-uid', uid,
                      '--expect', f'{word:08X}', '--value', f'{new:08X}'], timeout=30)
     print(out.rstrip())

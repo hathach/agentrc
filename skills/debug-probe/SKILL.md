@@ -51,7 +51,8 @@ $S config --chip CH582 --set CFG_RESET_EN=1 --wait 60
   YAML's reset word is byte-swapped, see `chips/wch.md`).
 - **One ISP device on the bus for `config`.** wchisp picks a device by index
   and a probe in IAP mode shares `4348:55e0` with a chip's bootloader, so
-  `config` refuses while more than one is present. Unplug the other.
+  `config` refuses while more than one is present, re-checking after `info`
+  and before the write. Unplug the other.
 - **Something else may hold the bootloader.** A running virt-manager with USB
   redirection claims `4348:55e0` the moment it enumerates (`Can't claim`,
   timeouts); `usb-kernel-recover`'s triage finds the holder.
