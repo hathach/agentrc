@@ -110,8 +110,12 @@ nothing in it through a link.
   board, and an inconclusive check refuses rather than reporting the devices
   idle. It is a snapshot: it misses a child that opens the hardware later and
   does not serialize two commands under one hold, so commands sharing a
-  manual hold are serialized by their consumer. Each consumer documents what
-  its check covers. A task that takes its own lock does it through
+  manual hold serialize through `hil_lock.session_mutex(<lock>)`, taken
+  before the hold is validated. The shared probe check is
+  `hil_flash.probe_users`, whose docstring has its coverage: a recognized
+  selector naming another probe excludes that process by its intended probe,
+  with no guarantee against discovery opens of other candidates. Each consumer
+  documents what its check covers. A task taking its own lock does it through
   `hil_lock.board_task(<lock>, busy=<check>)`, which runs the check under the
   lock before the body and ends the lock on the body's cleanup verdict; its
   docstring has the verdicts and their limits. A command under a hold it did not

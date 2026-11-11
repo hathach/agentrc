@@ -1924,7 +1924,7 @@ class CleanupLog(LockDir):
         fhs = {b: hil_lock.take_board_lock(b, 'selftest run', protected=True, locks=boards) for b in boards}
         prev = signal.signal(signal.SIGINT, signal.default_int_handler)
         self.addCleanup(signal.signal, signal.SIGINT, prev)
-        lines, first = inspect.getsourcelines(hil_lock.end_failed)
+        lines, first = inspect.getsourcelines(hil_lock._end_failed_each)
         # the first board's failure is logged, its record not yet cleared: no patched callable reaches here
         gap = first + next(i for i, line in enumerate(lines) if "'record not cleared'" in line)
         fired = []
@@ -1936,7 +1936,7 @@ class CleanupLog(LockDir):
             return local
 
         def tracer(frame, event, arg):
-            return local if frame.f_code is hil_lock.end_failed.__code__ else None
+            return local if frame.f_code is hil_lock._end_failed_each.__code__ else None
         prev_trace = sys.gettrace()
         sys.settrace(tracer)
         try:
@@ -2334,6 +2334,75 @@ class BoardTasks(LockDir):
         self.assertEqual(latest_failure(hil_lock, BOARD)['detail'], 'record not cleared after a clean verdict')
         self.assertEqual(taken_failure(self.acquire())['how'], 'found-left')    # the record it could not clear
 
+    def test_outcome_attributes_say_how_the_lock_ended(self):
+        """taken, failure_logged and ended_cleanly: what a caller decides on instead of `errors`."""
+        def outcome(task):
+            return task.taken, task.failure_logged, task.ended_cleanly
+        no_log = {'_log_append': mock.Mock(side_effect=OSError(28, 'No space left on device'))}
+        no_hold = {'InterruptHold': mock.Mock(side_effect=OSError(24, 'Too many open files'))}
+        cases = (('clean', {}, {}, ('clean', {}), (True, None, True)),
+                 ('restored, a restoration error being advisory', {}, {}, ('restored', {'evidence': object()}),
+                  (True, None, True)),
+                 ('no interrupt hold, advisory', {}, no_hold, ('clean', {}), (True, None, True)),
+                 ('failed, logged', {}, {}, ('failed', {'detail': 'd'}), (True, True, True)),
+                 ('failed, log not written', no_log, {}, ('failed', {'detail': 'd'}), (True, False, False)),
+                 ('clean, record not cleared', {'clear_record': lambda fh: False}, {}, ('clean', {}),
+                  (True, True, False)),
+                 ('no verdict, a body that raised', {}, {}, None, (True, True, True)))
+        for what, patches, process, verdict, want in cases:
+            with self.subTest(what), ExitStack() as stack:
+                for name, value in patches.items():
+                    stack.enter_context(mock.patch.object(hil_lock, name, value))
+                for name, value in process.items():
+                    stack.enter_context(mock.patch.object(hil_lock._process(), name, value))
+                task = self.task()
+                self.assertEqual(outcome(task), (False, None, False))
+                with suppress(ValueError), task:
+                    if verdict is None:
+                        raise ValueError('boom')
+                    getattr(task, verdict[0])(**verdict[1])
+                self.assertEqual(outcome(task), want)
+
+        busy = self.task(busy=lambda: ['JLinkExe pid 7'])
+        with self.assertRaises(hil_lock.BoardBusy), busy:
+            pass
+        self.assertEqual(outcome(busy), (True, None, True))
+
+        kept = []
+        real_clear = hil_lock.clear_record
+
+        def clear(fh):
+            kept.append(fh)
+            fh.close = mock.Mock(side_effect=OSError(5, 'Input/output error'))
+            return real_clear(fh)
+        task = self.task()
+        with mock.patch.object(hil_lock, 'clear_record', clear), task:
+            task.clean()
+        self.assertEqual(outcome(task), (True, None, False))       # its handle is kept, not closed
+        del kept[0].close
+        task.__exit__(None, None, None)
+        self.assertEqual(outcome(task), (True, None, True))
+
+        os.environ['HIL_NO_BOARD_LOCK'] = '1'
+        for patches, want in (({}, (False, True, True)), (no_log, (False, False, False))):
+            with self.subTest(bypass=bool(patches)), ExitStack() as stack:
+                for name, value in patches.items():
+                    stack.enter_context(mock.patch.object(hil_lock, name, value))
+                with self.task(allow_bypass=True) as task:
+                    task.failed(detail='d')
+                self.assertEqual(outcome(task), want)
+        with self.task(allow_bypass=True) as task:
+            task.clean()
+        self.assertEqual(outcome(task), (False, None, True))
+        del os.environ['HIL_NO_BOARD_LOCK']
+
+        p = self.holder(self.record(reason='hil_test.py'))
+        refused = self.task()
+        with self.assertRaises(hil_lock.BoardLocked), refused:
+            pass
+        self.assertEqual(outcome(refused), (False, None, True))
+        self.assertIsNone(p.poll())
+
     def test_the_bypass_is_opt_in_and_never_touches_another_holders_record(self):
         os.environ['HIL_NO_BOARD_LOCK'] = '1'
         with self.task() as task:
@@ -2485,8 +2554,8 @@ class BoardTasks(LockDir):
         self.patch(hil_lock._process(), 'InterruptHold', mock.Mock(side_effect=OSError(24, 'Too many open files')))
         hold_error = "interrupt hold: OSError(24, 'Too many open files')"
         for n, (owner, name, errors) in enumerate(((hil_lock.BoardTask, '_end_on', [hold_error]),
-                                                   (hil_lock, 'end_failed', [hold_error,
-                                                                             'end_failed: KeyboardInterrupt()']))):
+                                                   (hil_lock, '_end_failed_each',
+                                                    [hold_error, 'end_failed: KeyboardInterrupt()']))):
             with self.subTest(name), self.raising(name, signal.SIGINT, owner=owner):
                 task = self.task()
                 with self.assertRaises(KeyboardInterrupt):
@@ -2519,6 +2588,35 @@ class BoardTasks(LockDir):
         self.assertEqual(len(task.errors), 1)
         task.__exit__(None, None, None)                  # done: never finalized twice
         self.assertEqual((failed_events(hil_lock, BOARD), len(task.errors)), ([], 1))
+
+    def test_ended_only_once_finalization_leaves_no_owned_handle(self):
+        task = self.task()
+        self.assertFalse(task.ended)
+        with task:
+            self.assertFalse(task.ended)
+            task.clean()
+        self.assertTrue(task.ended)
+
+        real_clear, kept = hil_lock.clear_record, []
+
+        def clear(fh):
+            kept.append(fh)
+            fh.close = mock.Mock(side_effect=OSError(5, 'Input/output error'))
+            return real_clear(fh)
+        task = self.task()
+        with mock.patch.object(hil_lock, 'clear_record', clear):
+            with task:
+                task.clean()
+        self.assertFalse(task.ended)                    # its handle is kept for a later __exit__
+        del kept[0].close
+        task.__exit__(None, None, None)
+        self.assertTrue(task.ended)
+
+        refused = self.task(busy=lambda: [42])
+        with self.assertRaises(hil_lock.BoardBusy):
+            with refused:
+                pass
+        self.assertTrue(refused.ended)
 
     def test_real_signals_around_the_verdict_and_while_logging(self):
         """Repeated SIGINT and SIGTERM while the failure is logged are deferred, then replayed over
@@ -2633,6 +2731,114 @@ for name, f in (('read', lambda: m.PendingSessions(lock, 'selftest').read()),
 print(json.dumps(out))
 '''
 
+
+# Takes <lock>.session.mutex as session_mutex would from another process; prints 'ready' and
+# holds until stdin closes, or prints 'busy'.
+SESSION_HOLDER = r'''
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location('agentrc_hil_lock', sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+m.BOARD_LOCK_DIR = sys.argv[2]
+try:
+    with m.session_mutex(sys.argv[3]):
+        print('ready', flush=True)
+        sys.stdin.read()
+except m.SessionBusy as e:
+    print('busy', e, flush=True)
+'''
+
+
+class SessionMutex(LockDir):
+    """session_mutex: one command at a time under a manual hold, across processes and trees, on a
+    file that is never a board lock and never removed."""
+
+    def other(self):
+        p = subprocess.Popen([sys.executable, '-c', SESSION_HOLDER, str(SCRIPT), self.dir, BOARD],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        self.addCleanup(p.wait, 30)
+        self.addCleanup(p.stdout.close)
+        self.addCleanup(p.stdin.close)
+        return p
+
+    def test_a_second_take_is_refused_at_once(self):
+        path = os.path.join(self.dir, BOARD + '.session.mutex')
+        with hil_lock.session_mutex(BOARD):
+            ino = os.stat(path).st_ino
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o666)
+            started = time.monotonic()
+            with self.assertRaisesRegex(hil_lock.SessionBusy, re.escape(BOARD)):
+                with hil_lock.session_mutex(BOARD):
+                    self.fail('taken twice')
+            self.assertLess(time.monotonic() - started, 1)
+            self.assertTrue(self.other().stdout.readline().startswith('busy'))
+        p = self.other()
+        self.assertEqual(p.stdout.readline().strip(), 'ready')
+        with self.assertRaises(hil_lock.SessionBusy):
+            with hil_lock.session_mutex(BOARD):
+                pass
+        p.stdin.close()
+        p.wait(30)
+        with hil_lock.session_mutex(BOARD):
+            pass
+        self.assertEqual(os.stat(path).st_ino, ino)        # kept: every taker locks one inode
+
+    def test_released_on_exit_and_on_an_exception(self):
+        with hil_lock.session_mutex(BOARD):
+            pass
+        with self.assertRaises(ValueError):
+            with hil_lock.session_mutex(BOARD):
+                raise ValueError('boom')
+        with hil_lock.session_mutex(BOARD):
+            pass
+        self.assertTrue(os.path.exists(os.path.join(self.dir, BOARD + '.session.mutex')))
+
+    def test_an_interrupted_take_closes_its_fds_and_leaves_the_mutex_free(self):
+        self.addCleanup(signal.signal, signal.SIGINT, signal.signal(signal.SIGINT, signal.default_int_handler))
+        real = fcntl.flock
+
+        def flock(fd, op):
+            signal.raise_signal(signal.SIGINT)
+            return real(fd, op)
+        with hil_lock.session_mutex(BOARD):     # the dir and the file exist: only this take's fds are counted
+            pass
+        fds = len(os.listdir('/proc/self/fd'))
+        with mock.patch.object(hil_lock.fcntl, 'flock', flock), self.assertRaises(KeyboardInterrupt):
+            with hil_lock.session_mutex(BOARD):
+                self.fail('the body ran')
+        self.assertEqual(len(os.listdir('/proc/self/fd')), fds)
+        real_close = os.close
+
+        def close(fd):                          # an interrupt as the lock dir's fd closes
+            is_dir = stat.S_ISDIR(os.fstat(fd).st_mode)
+            real_close(fd)
+            if is_dir:
+                signal.raise_signal(signal.SIGINT)
+        with self.assertRaises(KeyboardInterrupt):
+            with mock.patch.object(hil_lock.os, 'close', close), hil_lock.session_mutex(BOARD):
+                pass
+        self.assertEqual(len(os.listdir('/proc/self/fd')), fds)
+        p = self.other()
+        self.assertEqual(p.stdout.readline().strip(), 'ready')
+
+    def test_never_a_board_lock(self):
+        with hil_lock.session_mutex(BOARD):
+            self.assertEqual(hil_lock.lock_names(), [])
+            with mock.patch.object(sys, 'argv', ['hil_lock.py', 'release', '--all']), quiet() as (_, err), \
+                    self.assertRaises(SystemExit) as done:
+                hil_lock.main()
+            self.assertEqual(done.exception.code, 2)
+            self.assertIn('no boards given', err.getvalue())
+        self.assertEqual(os.listdir(self.dir), [BOARD + '.session.mutex'])
+
+    def test_an_unsafe_file_or_name_is_refused(self):
+        os.symlink('/dev/null', os.path.join(self.dir, BOARD + '.session.mutex'))
+        with self.assertRaises(hil_lock.LockUnavailable):
+            with hil_lock.session_mutex(BOARD):
+                pass
+        with self.assertRaises(OSError):
+            with hil_lock.session_mutex('../x'):
+                pass
 
 class Pending(LockDir):
     """PendingSessions: a board's pending-session record beside its lock, read, extended and
