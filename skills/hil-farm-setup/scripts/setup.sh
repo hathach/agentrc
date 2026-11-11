@@ -279,6 +279,8 @@ install_rules() {
   printf 'usbmon\nusbtest\n' > /etc/modules-load.d/tinyusb.conf
   modprobe -a usbmon usbtest  # now, not only from the next boot
   install -m 0644 "$B"/udev/*.rules /etc/udev/rules.d/
+  # retired: only UDISKS_IGNORE lines, and the farm has no automounter (tinyuf2 commissioning.md)
+  rm -f /etc/udev/rules.d/99-tinyuf2-hil.rules
   udevadm control --reload-rules
   apply_rules
 }
