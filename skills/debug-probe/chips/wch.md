@@ -28,11 +28,10 @@ pin is PB22 by default (wchisp's YAML, `DOWNLOAD_CFG`).
 
 **Observed**:
 
-- 2026-11-11, htpc, bench CH582M UID D4-43-62-7B-54-50-8A-0F: USER_CFG
-  `0x450F3FDD` (RESET_EN, DEBUG_EN, ROM_READ all 1; bits [27:8] `0x50F3F`, as
-  WCH's tools write them, not the datasheet's FFF0Fh). `config --set
-  CFG_RESET_EN=0` then `=1` wrote and read back `0x450F3FD5` and `0x450F3FDD`,
-  other config bytes unchanged.
+- Bits [27:8] read `0x50F3F` as WCH's tools write them, not the datasheet's
+  FFF0Fh: keep the chip's own reserved bits, never the datasheet default.
+  `config` toggling `CFG_RESET_EN` read back with only bit 3 changed
+  (2026-11-11, a CH582M).
 - 2-wire debug needs DEBUG_EN *and* ROM_READ: with ROM_READ=0 the attach still
   fails `0x55` (2026-07, an earlier CH582 board; written as user byte `0xDD`
   with isp55e0).
@@ -62,11 +61,16 @@ Supported by `config`: CH32X035C8T6 (chip ID 81), word `RDPR_USER`, field
   of the whole 256-byte area first (RM §20.5.2, p249): an interrupted erase
   leaves RDPR erased, i.e. protected. That path is not implemented.
 
-**Observed** (2026-11-11, ci.lan, probe A8D88F062D95, unrostered): ChipID
-`0x03510611`, read-protected (`Flash protected: true`, then `DMI Status Failed`;
-the ESIG UID read all FF). `wlink unprotect` (0.1.2) exited 0, and the chip still
-reported protected before a power cycle, as RM §20.5.4 (p250: erase, write RDPR
-0xA5, which mass-erases, then a power-on reset) says.
+**Read protection** (RM §20.5.4, p250): removing it erases the user word,
+writes RDPR 0xA5, which mass-erases the flash, and takes effect at the next
+power-on reset; download mode is not needed. A protected C8T6 (ChipID
+`0x03510611`) attaches but reports `Flash protected: true`, then `DMI Status
+Failed`, its ESIG UID all FF. `wlink unprotect` (0.1.2) exits 0 even when its
+own read-back prints `Read protected: true`: read that line, not the exit
+status. Observed 2026-11-11: with the probe at v39 the read-back stayed
+protected, also after a board power cycle during which the probe stayed
+enumerated; at v43 the re-attach after the write was refused (`0x55`). Whether a
+full power cycle then clears it is unverified.
 
 **Unverified**: all of it on hardware: the ISP write, whether the bootloader
 keeps nUSER as written, PA21 resetting the chip. wchisp notes that CH32X03x
@@ -90,14 +94,14 @@ disabled. Otherwise, the debug function cannot be used normally."
 
 **Observed**:
 
-- 2026-07: attach failed `0x55` until DEBUG_EN was set; `wchisp config reset`
-  restored `0x8FFFF2E5` (DEBUG_EN=1, CODE_READ_EN=1, BOOT_EN kept).
-- 2026-11-11, htpc, HydraUSB3 UID BA-FE-BA-E4-C2-84-36-68: NV_INFO read
-  `0x8FFFF245` (DEBUG_EN and CODE_READ_EN 0); `config --set
-  DEBUG_EN=1,CODE_READ_EN=1` wrote and read back `0x8FFFF2E5`, the other config
-  words unchanged. A wlink-rs 0.1.3 attach failed `0x55` while the Flash Mode
-  jumper (J3) stayed fitted; with it removed, `wlink status --chip CH56X`
-  attached (ChipID `0x69000000`) and `wlink reset` printed `Reset Quit`.
+- Attach fails `0x55` while DEBUG_EN is 0 (2026-07). Enable debug with
+  `config --set DEBUG_EN=1,CODE_READ_EN=1`, RESET_EN left off: on a HydraUSB3
+  it took NV_INFO `0x8FFFF245` to `0x8FFFF2E5`, other config words unchanged
+  (2026-11-11).
+- Attach with the Flash Mode jumper (J3) removed: with it fitted a wlink-rs
+  0.1.3 attach failed `0x55`; with it removed, `wlink status --chip CH56X`
+  attached (ChipID `0x69000000`) and `wlink reset` printed `Reset Quit`
+  (2026-11-11).
 
 The chip must be powered for SDI. HydraUSB3 notes warn that 2-wire debug can
 brick a CH569. What an active debug module did to it afterwards is in

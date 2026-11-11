@@ -12,11 +12,11 @@ p2 and p17).
 - **Version.** `probe.py probes --version`, from `wlink-iap -V`: the probe's
   answer to `81 0d 01 01`, no target attach. WCH counts `vNN = major*10 +
   minor` (2.22 is v42). wlink-rs prints the same probe as `v2.22(v42)` in 0.1.2
-  and `v3.6(v42)` in 0.1.3: trust the `(vNN)`. On 2026-11-11 the USB
-  descriptor's `bcdDevice`, readable from sysfs without opening the probe,
-  matched `-V` on every probe read: `0223` on four WCH-LinkEs at v43, `0219` on
-  two at v39, `0212` on two WCH-Link-CH549 at v32. Other models and versions
-  are unverified, and the model is not in it.
+  and `v3.6(v42)` in 0.1.3: trust the `(vNN)`. The USB descriptor's
+  `bcdDevice`, readable from sysfs without opening the probe, matched `-V` in
+  RV mode on every WCH-LinkE (v39, v43) and WCH-Link-CH549 (v32) read on
+  2026-11-11 (`0223` is 2.23, v43); other versions are unverified, and the model
+  is not in it.
 - **Tool.** Patched wlink-iap only. wchisp cannot: the probe's IAP mode speaks
   the WCH-Link `0x81` protocol, not WCHISP's, so wchisp 0.2.3 and 0.3.0 fail
   with "response command type mismatch" or a timeout (2026-07-08). wlink-rs has
@@ -36,24 +36,26 @@ p2 and p17).
 - **Recovery.** The IAP button held at power-up is only for a probe whose
   firmware no longer answers USB. A probe left in IAP mode (button pressed,
   update interrupted) enumerates as `4348:55e0`: `probe.py fw-recover --port
-  <port> --model WCH-LinkE-CH32V305 --image <image>`. The stock tool's bare
-  `-q` (quit IAP) did not reboot an idle stuck probe (2026-07-08).
+  <port> --model WCH-LinkE-CH32V305 --image <image>`. Its IAP mode showed
+  `bcdDevice` 1.00 and no strings, where the chip bootloaders seen here showed
+  their own versions (24.00, 27.00); do not send it wchisp commands to find
+  out, it does not answer them. If the erase gets no reply (`Fail to erase`,
+  `LIBUSB_ERROR_TIMEOUT`), replug the probe and run it again: two attempts
+  failed that way after a `wchisp info` to the IAP device, the first after a
+  replug succeeded (2026-11-11). The stock tool's bare `-q` (quit IAP) did not
+  reboot an idle stuck probe (2026-07-08).
+- **Right after a flash** the probe's usbfs node can still refuse an open
+  (`LIBUSB_ERROR_ACCESS`; a read a minute later worked, consistent with udev
+  setting its permissions after sysfs showed the device; ci.lan, 2026-11-11).
+  `probe.py` waits for an openable node after a flash (`--timeout`) and before
+  `config`'s wchisp (only while `--wait` lasts; its default 0 checks once), and
+  `fw-recover` refuses a node it cannot open. wlink-iap's own open of the IAP
+  device after `81 0f` relies on a fixed 3.5 s settle with no permission retry.
+- **WCH-Link (CH549)**, the farm's `BC…` serials, takes another image and
+  update path; `fw-update` does not cover it.
 
-Observed: 2026-07-08, five farm probes updated v38 → v39 with the earlier
-patched wlink-iap (serial selection only). 2026-11-11, htpc: `fw-update` took
-`57468F06DC03` (port 5-2.5) from v39 to v43 (WCH-LinkUtility 3.2), then
-`A96C8F062E29` from v39 and `E9B38F066FBB` from v42 (image source unrecorded) to
-v43; on ci.lan, from a staged copy under each board's lock, `A76D8F062C2A` and
-`A8D88F062D95` from v39 to v43. There the version read right after the flash
-failed `LIBUSB_ERROR_ACCESS` and one a minute later read v43, consistent with
-udev setting the node's permissions after sysfs showed the device. `probe.py`
-waits for an openable node after a flash (`--timeout`) and before `config`'s
-wchisp (only while `--wait` lasts; its default 0 checks once), and `fw-recover`
-refuses a node it cannot open. wlink-iap's own open of the IAP
-device after `81 0f` still relies on its fixed 3.5 s settle, which held in all
-five updates that day; it has no permission retry. The farm's `BC4954081051` and `BC5DA47360D0` are
-WCH-Link-CH549 (v32), another image and update path `fw-update` does not cover.
-Unverified: `fw-recover` on hardware.
+Validated on hardware 2026-11-11: `fw-update` and `fw-recover` on WCH-LinkE,
+to v43.
 
 ## wlink-rs (`wlink`)
 
