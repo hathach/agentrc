@@ -121,8 +121,11 @@ file). Option word read `0x40BF5AA5`. An attach's effect on its clocks is in
 **Observed** (2026-07-13..16): USB-HS firmware takes the SWD pins (why, and
 the `DBGMCU_Config()` hang: `target-debug`'s `families.md`). Getting them back:
 unplug the USB 3.0 Type-A cable, then `wlink -d N erase --method power-off
---chip CH32H41X` (works while SB7 powers the board from the probe). wchisp has
-no CH32H support.
+--chip CH32H41X` (works while SB7 powers the board from the probe). Take N from
+the `wlink -d` that `probe.py probes` prints for this probe's serial, run just
+before the erase with nothing plugged or unplugged in between, or erase with
+only this probe connected: wlink-rs 0.1.3 selects by index only. wchisp has no
+CH32H support.
 
 ## CH32V10x / CH32V20x / CH32V30x
 

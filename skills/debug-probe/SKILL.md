@@ -1,6 +1,6 @@
 ---
 name: debug-probe
-description: "Use to update or recover a debug probe's own firmware, switch its mode or power output, or change a target chip's user config / option bytes (debug enable, RST pin, read protection) - WCH-LinkE probes and WCH chips (CH582, CH32X035, CH569, CH32V4x7, CH32H417) today. Also to read which firmware a probe runs without touching its target, and when a WCH-Link attach is refused (0x55) or a chip needs a power-off erase to get its debug pins back."
+description: "Use to update or recover a debug probe's own firmware, switch its mode or power output, or change a target chip's user config / option bytes (debug enable, RST pin, read protection) - WCH-LinkE probes, and config writes on WCH CH582, CH32X035 and CH569 today; CH32V4x7 and CH32H417 have attach and recovery notes only. Also to read which firmware a probe runs without touching its target, and when a WCH-Link attach is refused (0x55) or a chip needs a power-off erase to get its debug pins back."
 ---
 
 # debug-probe — maintain probes and chip config words
