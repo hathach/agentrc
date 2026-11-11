@@ -19,6 +19,7 @@ Pi).
 | `usb-sniffer`             | what crossed the wire (PIDs, handshakes, resets) | the hardware tap cabled in; role-agnostic |
 | SystemView (`sysview.md`) | where CPU time goes: task/ISR schedule, per-context load, switch and ready→run timing, or what ran right before a crash/hang | firmware built with SystemView's recorder; a J-Link/J-Trace for live recording, an OpenOCD probe for RTT streaming, either for a post-mortem dump |
 | `usb-kernel-debug`        | what a Linux host exchanged (usbmon URBs) and why its kernel acted (dynamic debug) | Linux on either end: PC host or gadget peer |
+| `debug-probe`             | why a probe cannot attach (WCH `0x55`: debug disabled in the chip's config, pins taken), the probe's own firmware, a chip's config word | the probe; the chip's ISP bootloader for config writes |
 
 **Espressif targets** (ESP32-S2/S3/P4/S31 and the C series): read `espressif.md` first; it names the tools, the JTAG
 route per chip and the console.

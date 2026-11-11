@@ -1,0 +1,17 @@
+# The probe firmware images probe.py fw-update / fw-recover accept: app-only (never *-APP-IAP.bin, which carries
+# the 8 KB IAP loader); v = major*10 + minor, as `wlink-iap -V` prints it.
+[[firmware]]
+model = "WCH-LinkE-CH32V305"
+v = 39
+file = "FIRMWARE_CH32V305.bin"
+sha256 = "82b9e53c651f49825c2c82c3e23c7b7daf4d5f2a198da9171e1ad8e8d4dba72f"
+source = "https://github.com/21km43/WCH-Link_Firmware"
+revision = "17298a8cffcb501a3575c522fd1ae60c6a38130a"
+
+[[firmware]]
+model = "WCH-LinkE-CH32V305"
+v = 43
+file = "FIRMWARE_CH32V305.bin"
+sha256 = "acff78ad06feea305f341081c7ba166f9b4e90028dcfda0b11dde58624201e3b"
+source = "https://file.wch.cn/download/file?id=418"   # WCH-LinkUtility.ZIP 3.2, uploaded 2026-11-07, Firmware_Link/
+revision = "d637847f06a9512cf2ed78c90bb1e33639cbba4fb14f2116cad4c47de1a579b5"   # sha256 of that zip
