@@ -71,6 +71,12 @@ CLEANUP = {'reason': 'selftest cleanup', 'role': 'cleanup-holder', 'board': 'x',
            'detail': 'park failed', 'survivors': []}
 
 
+def patched(stack, owner, mapping):
+    """Enter mock.patch.object(owner, name, value) on `stack` for each of mapping's items."""
+    for name, value in mapping.items():
+        stack.enter_context(mock.patch.object(owner, name, value))
+
+
 @contextmanager
 def quiet():
     """Swallow a command's stdout and stderr; yields their buffers."""
@@ -1057,8 +1063,7 @@ class LeftCleanup(LockDir):
         """A take interrupted by KeyboardInterrupt under `patches`, its exception kept as an
         interactive caller keeps it; returns that exception."""
         with ExitStack() as stack:
-            for name, value in patches.items():
-                stack.enter_context(mock.patch.object(hil_lock, name, value))
+            patched(stack, hil_lock, patches)
             try:
                 hil_lock.take_board_lock(BOARD, 'selftest')
             except KeyboardInterrupt as e:
@@ -2322,8 +2327,7 @@ class BoardTasks(LockDir):
         for what, patches, (verdict, kw), errors, left in cases:
             with self.subTest(what):
                 with ExitStack() as stack:
-                    for name, value in patches.items():
-                        stack.enter_context(mock.patch.object(hil_lock, name, value))
+                    patched(stack, hil_lock, patches)
                     task = self.task()
                     with task:
                         getattr(task, verdict)(**kw)
@@ -2335,72 +2339,63 @@ class BoardTasks(LockDir):
         self.assertEqual(taken_failure(self.acquire())['how'], 'found-left')    # the record it could not clear
 
     def test_outcome_attributes_say_how_the_lock_ended(self):
-        """taken, failure_logged and ended_cleanly: what a caller decides on instead of `errors`."""
+        """ended, taken, failure_logged and ended_cleanly: what a caller decides on instead of
+        `errors`; describe() says it in one line."""
         def outcome(task):
-            return task.taken, task.failure_logged, task.ended_cleanly
+            return task.ended, task.taken, task.failure_logged, task.ended_cleanly
+        log = os.path.join(self.dir, BOARD + '.cleanup.jsonl')
         no_log = {'_log_append': mock.Mock(side_effect=OSError(28, 'No space left on device'))}
         no_hold = {'InterruptHold': mock.Mock(side_effect=OSError(24, 'Too many open files'))}
-        cases = (('clean', {}, {}, ('clean', {}), (True, None, True)),
-                 ('restored, a restoration error being advisory', {}, {}, ('restored', {'evidence': object()}),
-                  (True, None, True)),
-                 ('no interrupt hold, advisory', {}, no_hold, ('clean', {}), (True, None, True)),
-                 ('failed, logged', {}, {}, ('failed', {'detail': 'd'}), (True, True, True)),
-                 ('failed, log not written', no_log, {}, ('failed', {'detail': 'd'}), (True, False, False)),
+        cases = (('clean', {}, {}, ('clean', {}), (True, True, None, True), f'{BOARD}: lock released'),
+                 ('no interrupt hold, advisory', {}, no_hold, ('clean', {}), (True, True, None, True), None),
+                 ('failed, logged', {}, {}, ('failed', {'detail': 'd'}), (True, True, True, True),
+                  f'{BOARD}: lock released, failure logged in {log}'),
+                 ('restored, its restoration error advisory', {}, {}, ('restored', {'evidence': object()}),
+                  (True, True, None, True), f'{BOARD}: lock released, errors: restoration: TypeError'),
+                 ('failed, log not written', no_log, {}, ('failed', {'detail': 'd'}), (True, True, False, False),
+                  f'{BOARD}: lock released, failure NOT logged in {log}, errors: cleanup log not written: OSError'),
                  ('clean, record not cleared', {'clear_record': lambda fh: False}, {}, ('clean', {}),
-                  (True, True, False)),
-                 ('no verdict, a body that raised', {}, {}, None, (True, True, True)))
-        for what, patches, process, verdict, want in cases:
+                  (True, True, True, False), None),
+                 ('no verdict, a body that raised', {}, {}, None, (True, True, True, True), None))
+        for what, patches, process, verdict, want, line in cases:
             with self.subTest(what), ExitStack() as stack:
-                for name, value in patches.items():
-                    stack.enter_context(mock.patch.object(hil_lock, name, value))
-                for name, value in process.items():
-                    stack.enter_context(mock.patch.object(hil_lock._process(), name, value))
+                patched(stack, hil_lock, patches)
+                patched(stack, hil_lock._process(), process)
                 task = self.task()
-                self.assertEqual(outcome(task), (False, None, False))
+                self.assertEqual(outcome(task), (False, False, None, False))
                 with suppress(ValueError), task:
+                    self.assertEqual(outcome(task), (False, True, None, False))
                     if verdict is None:
                         raise ValueError('boom')
                     getattr(task, verdict[0])(**verdict[1])
                 self.assertEqual(outcome(task), want)
+                if line is not None:
+                    self.assertEqual(task.describe().split('(')[0], line)
 
         busy = self.task(busy=lambda: ['JLinkExe pid 7'])
         with self.assertRaises(hil_lock.BoardBusy), busy:
             pass
-        self.assertEqual(outcome(busy), (True, None, True))
-
-        kept = []
-        real_clear = hil_lock.clear_record
-
-        def clear(fh):
-            kept.append(fh)
-            fh.close = mock.Mock(side_effect=OSError(5, 'Input/output error'))
-            return real_clear(fh)
-        task = self.task()
-        with mock.patch.object(hil_lock, 'clear_record', clear), task:
-            task.clean()
-        self.assertEqual(outcome(task), (True, None, False))       # its handle is kept, not closed
-        del kept[0].close
-        task.__exit__(None, None, None)
-        self.assertEqual(outcome(task), (True, None, True))
+        self.assertEqual(outcome(busy), (True, True, None, True))
 
         os.environ['HIL_NO_BOARD_LOCK'] = '1'
-        for patches, want in (({}, (False, True, True)), (no_log, (False, False, False))):
+        for patches, want in (({}, (True, False, True, True)), (no_log, (True, False, False, False))):
             with self.subTest(bypass=bool(patches)), ExitStack() as stack:
-                for name, value in patches.items():
-                    stack.enter_context(mock.patch.object(hil_lock, name, value))
+                patched(stack, hil_lock, patches)
                 with self.task(allow_bypass=True) as task:
                     task.failed(detail='d')
                 self.assertEqual(outcome(task), want)
+                self.assertTrue(task.describe().startswith(f'{BOARD}: lock bypassed (HIL_NO_BOARD_LOCK=1), failure '))
         with self.task(allow_bypass=True) as task:
             task.clean()
-        self.assertEqual(outcome(task), (False, None, True))
+        self.assertEqual(outcome(task), (True, False, None, True))
         del os.environ['HIL_NO_BOARD_LOCK']
 
         p = self.holder(self.record(reason='hil_test.py'))
         refused = self.task()
         with self.assertRaises(hil_lock.BoardLocked), refused:
             pass
-        self.assertEqual(outcome(refused), (False, None, True))
+        self.assertEqual(outcome(refused), (True, False, None, True))
+        self.assertEqual(refused.describe(), f'{BOARD}: lock not taken')
         self.assertIsNone(p.poll())
 
     def test_the_bypass_is_opt_in_and_never_touches_another_holders_record(self):
@@ -2579,44 +2574,17 @@ class BoardTasks(LockDir):
         with task:
             task.clean()
         self.assertEqual((task.released, task.errors), (False, ["close: OSError(5, 'Input/output error')"]))
+        self.assertEqual((task.ended, task.ended_cleanly), (False, False))
+        self.assertTrue(task.describe().startswith(f'{BOARD}: lock NOT released, errors: close: OSError'))
         self.assertFalse(self.flock_is_free())
         with self.assertRaisesRegex(RuntimeError, 'inside its with block'):
             task.failed(detail='late')
         del kept[0].close
         task.__exit__(None, None, None)
         self.assert_released(task)
-        self.assertEqual(len(task.errors), 1)
+        self.assertEqual((task.ended, task.ended_cleanly, len(task.errors)), (True, True, 1))
         task.__exit__(None, None, None)                  # done: never finalized twice
         self.assertEqual((failed_events(hil_lock, BOARD), len(task.errors)), ([], 1))
-
-    def test_ended_only_once_finalization_leaves_no_owned_handle(self):
-        task = self.task()
-        self.assertFalse(task.ended)
-        with task:
-            self.assertFalse(task.ended)
-            task.clean()
-        self.assertTrue(task.ended)
-
-        real_clear, kept = hil_lock.clear_record, []
-
-        def clear(fh):
-            kept.append(fh)
-            fh.close = mock.Mock(side_effect=OSError(5, 'Input/output error'))
-            return real_clear(fh)
-        task = self.task()
-        with mock.patch.object(hil_lock, 'clear_record', clear):
-            with task:
-                task.clean()
-        self.assertFalse(task.ended)                    # its handle is kept for a later __exit__
-        del kept[0].close
-        task.__exit__(None, None, None)
-        self.assertTrue(task.ended)
-
-        refused = self.task(busy=lambda: [42])
-        with self.assertRaises(hil_lock.BoardBusy):
-            with refused:
-                pass
-        self.assertTrue(refused.ended)
 
     def test_real_signals_around_the_verdict_and_while_logging(self):
         """Repeated SIGINT and SIGTERM while the failure is logged are deferred, then replayed over
@@ -2783,15 +2751,12 @@ class SessionMutex(LockDir):
             pass
         self.assertEqual(os.stat(path).st_ino, ino)        # kept: every taker locks one inode
 
-    def test_released_on_exit_and_on_an_exception(self):
-        with hil_lock.session_mutex(BOARD):
-            pass
+    def test_released_on_an_exception(self):
         with self.assertRaises(ValueError):
             with hil_lock.session_mutex(BOARD):
                 raise ValueError('boom')
         with hil_lock.session_mutex(BOARD):
             pass
-        self.assertTrue(os.path.exists(os.path.join(self.dir, BOARD + '.session.mutex')))
 
     def test_an_interrupted_take_closes_its_fds_and_leaves_the_mutex_free(self):
         self.addCleanup(signal.signal, signal.SIGINT, signal.signal(signal.SIGINT, signal.default_int_handler))
@@ -2839,6 +2804,7 @@ class SessionMutex(LockDir):
         with self.assertRaises(OSError):
             with hil_lock.session_mutex('../x'):
                 pass
+
 
 class Pending(LockDir):
     """PendingSessions: a board's pending-session record beside its lock, read, extended and

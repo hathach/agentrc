@@ -114,8 +114,10 @@ nothing in it through a link.
   before the hold is validated. The shared probe check is
   `hil_flash.probe_users`, whose docstring has its coverage: a recognized
   selector naming another probe excludes that process by its intended probe,
-  with no guarantee against discovery opens of other candidates. Each consumer
-  documents what its check covers. A task taking its own lock does it through
+  with no guarantee against discovery opens of other candidates, and any
+  STM32_Programmer_CLI counts as using an `stlink` flasher's probe. Each
+  consumer documents what its check covers. A task taking its own lock does
+  it through
   `hil_lock.board_task(<lock>, busy=<check>)`, which runs the check under the
   lock before the body and ends the lock on the body's cleanup verdict; its
   docstring has the verdicts and their limits. A command under a hold it did not

@@ -1246,7 +1246,7 @@ class ProbeUsers(unittest.TestCase):
     def setUp(self):
         self.proc = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.node = os.path.realpath(self.proc / 'node')      # stands in for /dev/bus/usb/BBB/DDD
-        self.enterContext(mock.patch.object(hf, 'PROC', str(self.proc)))
+        self.enterContext(mock.patch.object(hf.usb_observe, 'PROC_ROOT', str(self.proc)))
         self.enterContext(mock.patch.object(hf.hil_process, '_proc_hides_others', lambda: False))
         self.enterContext(mock.patch.object(hf, '_probe_nodes', lambda uid, filters: {self.node}))
         self.pid = 100
@@ -1256,7 +1256,7 @@ class ProbeUsers(unittest.TestCase):
         d = self.proc / str(pid)
         d.mkdir()
         (d / 'cmdline').write_bytes(b''.join(a.encode() + b'\0' for a in argv))
-        (d / 'stat').write_text(f'{pid} (x) S {ppid} {pid} {pid} 0')
+        (d / 'stat').write_text(f'{pid} (x) S {ppid} {pid} {pid} ' + ' '.join(['0'] * 20))
         (d / 'fd').mkdir()
         for i, target in enumerate(fds):
             os.symlink(target, d / 'fd' / str(i))
@@ -1348,10 +1348,10 @@ class ProbeUsers(unittest.TestCase):
         self.entry([], readable=False)                  # a kernel thread
         self.assertEqual(self.users(), [])
 
-    def test_stlink_any_refuses_every_stm32_programmer(self):
+    def test_any_stm32_programmer_uses_an_stlink_flashers_probe(self):
         cli = self.entry(['STM32_Programmer_CLI', '-script', 'x.prg'])
-        self.assertEqual(self.users({'name': 'stlink', 'uid': 'ABC'}), [])
-        self.assertEqual(self.users({'name': 'stlink', 'uid': 'ABC'}, stlink_any=True), [cli])
+        self.assertEqual(self.users({'name': 'stlink', 'uid': 'ABC'}), [cli])
+        self.assertEqual(self.users({'name': 'openocd', 'uid': 'ABC'}), [])
 
     def test_a_process_that_ends_during_the_walk_is_ignored(self):
         (self.proc / '7').mkdir()                                       # no cmdline: gone
@@ -1402,7 +1402,7 @@ class ProbeUsers(unittest.TestCase):
                 self.users()
             for _ in range(3):
                 started = time.monotonic()
-                with self.assertRaisesRegex(hf.ProbeCheckInconclusive, 'still running'):
+                with self.assertRaisesRegex(hf.ProbeCheckInconclusive, 'earlier one is still blocked'):
                     self.users()
                 self.assertLess(time.monotonic() - started, 0.1)
             self.assertEqual(threading.active_count(), before + 1)
@@ -1410,15 +1410,17 @@ class ProbeUsers(unittest.TestCase):
             hf._scan[0].join(30)
             self.assertEqual(self.users(), [])
 
+
 class ProbeNodes(unittest.TestCase):
     """The usbfs node a probe is held through, found by its serial under the flasher's USB IDs."""
 
     def test_usb_filters(self):
-        cases = (({'name': 'jlink'}, [('1366', None)]),
-                 ({'name': 'openocd', 'vid_pid': '0x2E8A 0x000c 0x0d28 0x0204'}, [('2e8a', '000c'), ('0d28', '0204')]),
-                 ({'name': 'openocd', 'args': '-f interface/stlink.cfg'}, [('0483', None)]),
-                 ({'name': 'openocd', 'args': '-f interface/cmsis-dap.cfg'}, [None]),
-                 ({'name': 'pyocd'}, [None]))
+        cases = (({'name': 'jlink'}, [{'vid': '1366'}]),
+                 ({'name': 'openocd', 'vid_pid': '0x2E8A 0x000c 0x0d28 0x0204'},
+                  [{'vid_pid': ('2e8a', '000c')}, {'vid_pid': ('0d28', '0204')}]),
+                 ({'name': 'openocd', 'args': '-f interface/stlink.cfg'}, [{'vid': '0483'}]),
+                 ({'name': 'openocd', 'args': '-f interface/cmsis-dap.cfg'}, [{}]),
+                 ({'name': 'pyocd'}, [{}]))
         for flasher, want in cases:
             with self.subTest(flasher=flasher):
                 self.assertEqual(hf._usb_filters(flasher), want)
@@ -1437,11 +1439,11 @@ class ProbeNodes(unittest.TestCase):
         self.enterContext(mock.patch.object(hf.usb_observe, 'udev_serial', lambda bus, dev: None))
         self.enterContext(mock.patch.object(hf.usb_observe, 'read_sysfs', lambda p, *a: sysfs.get(p)))
         self.enterContext(mock.patch.object(hf.usb_observe, 'enumeration_id', lambda d: 1))
-        self.assertEqual(hf._probe_nodes('681295394', [('1366', None)]), {'/dev/bus/usb/001/002'})
+        self.assertEqual(hf._probe_nodes('681295394', [{'vid': '1366'}]), {'/dev/bus/usb/001/002'})
         with self.assertRaisesRegex(hf.ProbeCheckInconclusive, r'serial of 1-3 is unreadable'):
-            hf._probe_nodes('424242', [('1366', None)])
+            hf._probe_nodes('424242', [{'vid': '1366'}])
         del devs[2]
-        self.assertEqual(hf._probe_nodes('424242', [('1366', None)]), set())   # absent; 1-2 has no serial
+        self.assertEqual(hf._probe_nodes('424242', [{'vid': '1366'}]), set())   # absent; 1-2 has no serial
 
 
 class ProbeUsersLive(unittest.TestCase):

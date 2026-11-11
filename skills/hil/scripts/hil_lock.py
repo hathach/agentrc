@@ -667,7 +667,7 @@ def _end_failed_each(handles, reason, detail, receipts, retained, extra, ended) 
     for b, fh in handles.items():
         ended[b] = {'logged': False, 'cleared': False}
         ended[b]['logged'] = guard([b], 'cleanup log not written', lambda: _log_ended(
-            b, fh, reason, detail, receipts, retained, extra) or True, False)
+            b, fh, reason, detail, receipts, retained, extra)) is not None
         cleared = guard([b], 'record not cleared', lambda: clear_record(fh))
         if cleared is False:
             errors.setdefault(b, []).append('record not cleared')
@@ -680,12 +680,12 @@ def _end_failed_each(handles, reason, detail, receipts, retained, extra, ended) 
     return errors
 
 
-def _log_ended(board, fh, reason, detail, receipts, retained, extra) -> None:
+def _log_ended(board, fh, reason, detail, receipts, retained, extra) -> dict:
     try:
         state, rec = _parse(_handle_record(fh))
     except OSError:
         state, rec = 'unreadable', None
-    log_cleanup_failure(board, reason, detail=detail, task=rec if state == 'record' else None, receipts=receipts,
+    return log_cleanup_failure(board, reason, detail=detail, task=rec if state == 'record' else None, receipts=receipts,
                         retained=retained, **extra)
 
 
@@ -824,10 +824,13 @@ class BoardTask:
       appended (end_failed, or log_cleanup_failure under the bypass).
     * `ended_cleanly`: `ended`, with the lock ended as its verdict said: an owned handle closed,
       its record cleared (clear_record, or end_failed's clear for a failed verdict) and, for a
-      failed verdict, its failure logged. A clean or restored verdict whose record was not
-      cleared ends through end_failed and never cleanly; a refusal before the take ends cleanly.
-      Advisory notes do not change it: an interrupt hold that could not be installed, a
-      restoration's notes (restore_notes) or errors, a deferred interrupt replayed afterwards."""
+      failed verdict, its failure logged (under the bypass too). `not ended_cleanly` alone is the
+      lock's own failure for the caller's exit status; the verdict's failure stays the caller's.
+      A clean or restored verdict whose record was not cleared ends through end_failed and never
+      cleanly; a refusal before the take ends cleanly. Advisory notes do not change it: an
+      interrupt hold that could not be installed, a restoration's notes (restore_notes) or
+      errors, a deferred interrupt replayed afterwards.
+    describe() puts these and `errors` in one line for the caller's report."""
 
     def __init__(self, board, reason=CI_REASON, *, busy, wait=0, allow_bypass=False, **record_fields):
         if not callable(busy):
@@ -919,7 +922,24 @@ class BoardTask:
 
     @property
     def ended_cleanly(self) -> bool:
-        return self.ended and self._as_verdict and (self.released or not self.taken)
+        return self.ended and self._as_verdict
+
+    def describe(self) -> str:
+        """One line on how the lock ended: released or not (or bypassed), the failure logged or not
+        with the cleanup log's path when one was due, and `errors`."""
+        if self.bypassed:
+            lock = 'lock bypassed (HIL_NO_BOARD_LOCK=1)'
+        elif not self.taken:
+            lock = 'lock not taken'
+        else:
+            lock = 'lock released' if self.released else 'lock NOT released'
+        parts = [f'{self.board}: {lock}']
+        if self.failure_logged is not None:
+            log = os.path.join(BOARD_LOCK_DIR, self.board + CLEANUP_LOG)
+            parts.append(f'failure {"logged" if self.failure_logged else "NOT logged"} in {log}')
+        if self.errors:
+            parts.append('errors: ' + '; '.join(self.errors))
+        return ', '.join(parts)
 
     def clean(self) -> None:
         self._decide(('clean',))
