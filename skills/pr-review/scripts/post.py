@@ -24,7 +24,9 @@ A body line whose first line no check verified (firstLineUnchecked) is named for
 
 --auto takes the same path, refusing APPROVE: the pending review with its fix notes (never its answers), then, while the
 head is still the draft's and every note reads back, a submit with the draft's event (its intent stored first, never
-sent twice) and the same settling as a human's submit. Held text, a moved head, an unconfirmed note, a pending review an
+sent twice) and the same settling as a human's submit. Held text (that body line, or a standing finding of the last
+review on the PR whose text no longer reads as the ledger holds it, ledger.py's stale: edited or deleted since the
+prepare reconciled it, or never placed, so the recheck judged other text), a moved head, an unconfirmed note, a pending review an
 earlier run left (only the human sees it, so it may have changed) or a submit whose outcome cannot be read hands the
 pending review to the human instead (handedOver, exit 1), who finishes it like any draft; a later post.py run then
 publishes its answers. Thread answers are never submitted: the review's are put in an answer publication on it
@@ -46,6 +48,8 @@ left for --auto to recover by its marker). Submitted: posted, with the event the
   resolved, deferred or observed (already resolved): one left sent (its answer unconfirmed), or resolved and
   reopened since, is never resolved again by itself, nor one whose repair note was deleted or edited before its
   resolve, whatever older answer of ours the thread holds.
+A posted review is never settled again; prepare.py runs reconcile() after --sync, so the next recheck judges the last
+posted review's inline comments as the PR shows them (reconcile() has the rule).
 
 --fixed FILE, once an auto-fix repair is pushed and the PR head is SHA: FILE is {"reviewedHead": the last review's
 head, which must be submitted, "findings": [{id, claimDigest, verdict: "verified", checkedSha: SHA, note, evidence}]},
@@ -62,7 +66,9 @@ A body-moved finding has no thread to note. A later review's draft never repeats
 records that pr-babysit launch (its stateRef digest) in the review's fixedLaunches, so ledger.py next asks once a launch.
 
 A write is stored as sent before it is sent, so a run that dies in it only looks for it afterwards (a review by
-its marker, a reply by its thread and body digest), never sends it twice.
+its marker, a reply by its thread and body digest), never sends it twice. A review's body and inline comments are
+compared with what GitHub returns as gh reads them (lib/gh_reads.py): gh rewrites control escapes in every
+response, so a comment citing `\\u001b` reads back `\\^[`.
 A POST GitHub itself refused (its rate limit or Validation Failed, on a 403, 422 or
 429) whose marker does not read back right after created nothing: the review stays pending and unsent, reported
 failed, and a later run may POST it again; one that does read back is recovered. Any other error stays sent. stdout ends with
@@ -77,8 +83,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ledger import (DRAFTS, ONLINE, OPEN, SETTLED, UNSETTLED, add_answers, answer_root, answered_ids, answers_of, claim,  # noqa: E402
-                    holder, note_hold, open_answers, owner_of, publications, pushback, reached, repair_hold, repairs, submitted_last,
-                    thread_roots, digest as ledger_digest, ledger_path, load, locked, repo_of, store)
+                    holder, last, live_digest, note_hold, read_digest, open_answers, owner_of, publications, published_at, pushback, reached, receipted,
+                    repair_hold, repairs, stale, submitted_last, thread_roots, digest as ledger_digest, ledger_path, load, locked,
+                    repo_of, store)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'pr-babysit' / 'scripts'))
 from facts import FULL_SHA, Parser, Unusable, attempt  # noqa: E402
@@ -123,11 +130,11 @@ def read_back(repo, pr, rid, review):
         comments = [c for c in review_comments(repo, pr, rid).values() if not c.get('in_reply_to_id')]
     except (Unusable, ValueError):
         return None, 'read-back failed', None
-    if got.get('state') != 'PENDING' or digest(got.get('body')) != digest(body_of(review)):
+    if got.get('state') != 'PENDING' or digest(got.get('body')) != live_digest(body_of(review)):
         return False, f"read back state {got.get('state')}, body digest {digest(got.get('body'))}", None
     # GitHub gives a pending review's comments no line until it is submitted.
     key = lambda c: (c.get('path'), digest(c.get('body')))  # noqa: E731
-    want = [key(c) for c in review['draft']['comments']]
+    want = [(c['path'], live_digest(c['body'])) for c in review['draft']['comments']]
     if sorted(want) != sorted(key(c) for c in comments):
         return False, f'inline comments differ: {len(comments)} read back, {len(want)} drafted', None
     by_key = {}
@@ -251,15 +258,28 @@ def replies_of(led, review, answers=True):
                    'resolve': d['answer']['resolve'], 'dispute': d} for f, d in (answers_of(led, review) if answers else [])]
 
 
-def refresh(e, comments, final):
-    """Settle a staged reply against its review's comments as they stand; `final` once the review is submitted."""
+def sent_digest(led, review, e):
+    """read_digest() of the body a staged reply was sent with, found by its identity digest; that digest itself when the
+    ledger no longer holds the body."""
+    if e['kind'] == 'fixnote':
+        bodies = [r['body'] for r in review['draft'].get('replies', [])]
+    else:
+        bodies = [d['answer']['body'] for f in owner_of(led, review)['findings'] if f['id'] == e['findingId']
+                  for d in f.get('disputes', []) if d.get('answer')]
+    body = next((b for b in bodies if ledger_digest(b) == e['digest']), None)
+    return e['digest'] if body is None else read_digest(body)
+
+
+def refresh(e, comments, final, want):
+    """Settle a staged reply against its review's comments as they stand, its live copy matched by `want`
+    (sent_digest()); `final` once the review is submitted."""
     if e['state'] not in ('sent', 'staged', 'uncertain'):
         return
     c = comments.get(e.get('replyId'))
     if c is None and e['state'] != 'staged':
         # Only our staging adds replies to our own pending review: identical ones are the answer, duplicated.
         hits = [x for x in comments.values()
-                if x.get('in_reply_to_id') == e['commentId'] and ledger_digest(x.get('body') or '') == e['digest']]
+                if x.get('in_reply_to_id') == e['commentId'] and ledger_digest(x.get('body') or '') == want]
         c = min(hits, key=lambda x: x['id']) if hits else None
     if c is None:
         # A staged reply gone from the review was deleted by the human; one never confirmed is not re-added.
@@ -268,7 +288,7 @@ def refresh(e, comments, final):
     e.update(replyId=c['id'], error=None)
     if not final:
         e['state'] = 'staged'
-    elif ledger_digest(c.get('body') or '') == e['digest']:
+    elif ledger_digest(c.get('body') or '') == want:
         e['state'] = 'published'
     else:
         e.update(state='edited', published=c.get('body'))
@@ -282,7 +302,7 @@ def stage(repo, pr, led, review, login, persist, answers=True):
     if staged:
         comments = review_comments(repo, pr, rid)
         for e in staged:
-            refresh(e, comments, final=False)
+            refresh(e, comments, False, sent_digest(led, review, e))
     new = [r for r in todo if not any((e['kind'], e['findingId']) == (r['kind'], r['findingId']) for e in staged)]
     added = []
     if new:
@@ -313,7 +333,7 @@ def stage(repo, pr, led, review, login, persist, answers=True):
     if any(e['state'] == 'staged' for e in added):
         comments = review_comments(repo, pr, rid)
         for e in added:
-            if e['state'] == 'staged' and ledger_digest((comments.get(e['replyId']) or {}).get('body') or '') != e['digest']:
+            if e['state'] == 'staged' and ledger_digest((comments.get(e['replyId']) or {}).get('body') or '') != sent_digest(led, review, e):
                 e.update(state='uncertain', error='not read back on the pending review')
     return staged
 
@@ -382,7 +402,7 @@ def match_roots(drafted, roots):
     for p in {place(c) for c in drafted}:
         ks = [k for k, c in enumerate(drafted) if place(c) == p]
         live = [r for r in roots if place(r) == p]
-        if len(ks) == 1 and len(live) == 1 and digest(live[0].get('body')) == digest(drafted[ks[0]]['body']):
+        if len(ks) == 1 and len(live) == 1 and digest(live[0].get('body')) == live_digest(drafted[ks[0]]['body']):
             ids[ks[0]] = live[0]['id']
         elif live:
             unsure |= set(ks)
@@ -408,7 +428,7 @@ def submitted(repo, pr, led, review, state, login, persist):
         else:
             f['commentId'] = cid
             # A finding raised again keeps the claim the PR shows: its new comment restates the human's edit.
-            if digest(live.get('body')) != digest(c['body']) or f.get('published'):
+            if digest(live.get('body')) != live_digest(c['body']) or f.get('published'):
                 f['published'] = live.get('body')
         ids.append(live and cid)
     inline = {c['findingId'] for c in review['draft']['comments']}
@@ -420,7 +440,7 @@ def submitted(repo, pr, led, review, state, login, persist):
     review['status'] = 'posted'
     want = []
     for e in rec.get('staged', []):
-        refresh(e, comments, final=True)
+        refresh(e, comments, True, sent_digest(led, review, e))
         f = by_id.get(e['findingId'])
         if e['kind'] == 'answer' and f:
             a = next((d['answer'] for d in reversed(f.get('disputes', [])) if (d.get('answer') or {}).get('digest') == e['digest']), None)
@@ -475,6 +495,41 @@ def sync(repo, pr, led, persist):
 
 
 EARLIER = 'an earlier run left it pending, open to changes since'
+
+
+def reconcile(repo, pr, led):
+    """Bring the last review's standing findings to the PR as it reads now, before a recheck judges them: an inline
+    comment of ours edited since our receipts placed it stands with the text published, a deleted one drops its
+    finding. The whole listing is read first, so one that cannot be read refuses rather than reading as a deletion.
+    Review bodies are not reconciled: a finding moved into one keeps its recorded text, and holder() holds it from --auto
+    once that body reads otherwise; one no receipt places stays as it is, always held."""
+    rev = last(led)
+    placed = [(f, at) for f in (rev or {}).get('findings', []) if f['status'] in OPEN
+              for at in [published_at(led, f)] if at and at[0] == 'review']
+    if not placed:
+        return []
+    live = {c['id']: c for c in pages(f'repos/{repo}/pulls/{pr}/comments')}
+    out = []
+    for f, (_, cid, want) in placed:
+        c = live.get(cid)
+        if c is None:
+            f['status'] = 'dropped'
+        elif digest(c.get('body')) != want:
+            f['published'] = c.get('body')
+        else:
+            continue
+        out.append({'findingId': f['id'], 'commentId': cid, 'change': 'deleted' if c is None else 'edited'})
+    return out
+
+
+def stale_text(repo, pr, led, login):
+    """Why an auto post must go to the human because standing findings its recheck judged no longer read on the PR as
+    the ledger holds them (ledger.py's stale), or ''."""
+    rev = last(led)
+    if not rev or not any(f['status'] in OPEN for f in rev.get('findings', [])):
+        return ''
+    held = stale(led, snapshot(repo, pr, login, receipted(led)))
+    return held and f"standing findings whose text the PR no longer shows as judged ({', '.join(f'{i} {w}' for i, w in held)})"
 
 
 def review_state(repo, pr, rid):
@@ -602,7 +657,7 @@ def note_reply(snap, x):
     replies = [c for c in snap['comments'] if c['kind'] == 'review' and c['inReplyTo'] == x['commentId']]
     if x['replyId']:
         return next((c for c in replies if c['id'] == x['replyId']), None)
-    hits = [c for c in replies if c['id'] not in x['before'] and c['author'] == snap['viewer'] and ledger_digest(c['body']) == x['digest']]
+    hits = [c for c in replies if c['id'] not in x['before'] and c['author'] == snap['viewer'] and ledger_digest(c['body']) == read_digest(x['body'])]
     return hits[0] if len(hits) == 1 else None
 
 
@@ -610,7 +665,7 @@ def unfit(repo, pr, led, f, want, head, login):
     """(snapshot, why f's thread may not take a note or a resolve now, or None), read afresh: the root and claim as
     the fix check judged them (`want`, its claim digest), no pushback since our last answer, the PR open on the repaired
     head."""
-    snap = snapshot(repo, pr, login)
+    snap = snapshot(repo, pr, login, receipted(led))
     t = thread_roots(snap).get(f.get('commentId'))
     at, shut = head_if_open(repo, pr)
     return snap, (shut or holder(led, snap)(f) or
@@ -640,7 +695,7 @@ def settle_note(repo, pr, led, f, x, row, head, login, persist):
     snap, why = unfit(repo, pr, led, f, x['claimDigest'], head, login)
     c = note_reply(snap, x)
     if x['state'] in ('sent', 'uncertain'):
-        if c and ledger_digest(c['body']) == x['digest']:
+        if c and ledger_digest(c['body']) == read_digest(x['body']):
             x.update(state='published', replyId=c['id'], error=None)
         else:
             x.update(state='uncertain', error=x['error'] if x['error'] != 'sent; not confirmed' else 'not read back on the thread')
@@ -784,6 +839,8 @@ def collect(argv):
         login = gh_json('api', 'user')['login']
         if not a.auto:
             return {**publish_draft(repo, a.pr, led, review, login, recovering, persist), 'firstLineUnchecked': unchecked}
+        if not recovering:  # recovery hands the review to the human whatever its text
+            hold = '; '.join(x for x in (hold, stale_text(repo, a.pr, led, login)) if x)
         out = {**publish_auto(repo, a.pr, led, review, event, login, recovering, persist, hold), 'firstLineUnchecked': unchecked}
         answers = [p for p in review.get('answerPublications', []) if p.get('auto') and p['status'] in DRAFTS]
         if answers and review['status'] == 'posted' and not recovering:

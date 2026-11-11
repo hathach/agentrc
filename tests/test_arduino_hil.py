@@ -19,6 +19,7 @@ import re
 import shlex
 import shutil
 import signal
+import subprocess
 import sys
 import time
 import types
@@ -26,7 +27,7 @@ from pathlib import Path
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from helpers import (claimant, guard_survivors, kill_quietly, killed_claimant, load_arduino_engine,  # noqa: E402
-                     load_arduino_fixture, proc_stat, tmpdir, wait_done)
+                     load_arduino_fixture, pid_alive, proc_stat, tmpdir, wait_done)
 
 H = load_arduino_engine('skills/arduino/scripts/arduino_hil.py')
 REAL = H.A   # agentrc's own modules, before a test stubs them
@@ -253,6 +254,20 @@ class Binding(Base):
                 H.bind(fake.hil_profile(self.BP, **kw))
             self.assertIsNone(H.P)
 
+    def test_a_named_build_can_be_the_restoration_sketch(self):
+        self.patch(H, 'P', None)
+        self.patch(self.BP, 'HIL_SKETCHES', {**self.BP.HIL_SKETCHES, 'device': (
+            {'echo_b': ('examples/Basic/echo', 'usb=b')}, *self.BP.HIL_SKETCHES['device'])})
+        with self.assertRaisesRegex(RuntimeError, "runs 'echo', not the first HIL sketch 'echo_b'"):
+            H.bind(fake.hil_profile(self.BP))
+        H.bind(fake.hil_profile(self.BP, TESTS={**fake.hil_profile(self.BP).TESTS, 'echo': 'echo_b'}))
+        self.assertEqual(H.restore_sketch('rig_ocd'), 'echo_b')
+        seen = []
+        with mock.patch.object(H, 'step', lambda name, board, image, test, *a: seen.append((image, test)) or
+                               {'pass': True, 'detail': 'ok'}):
+            H.restore('rig_ocd', {}, {'echo': 'echo image', 'echo_b': 'echo_b image'}, self.dir, None)
+        self.assertEqual(seen, [('echo_b image', 'echo')])
+
     def test_budget_reserve_covers_the_restore(self):
         self.assertGreaterEqual(H.CLEANUP_RESERVE, H.FLASH_TIMEOUT + H.VERIFY_TIMEOUT + H.ENUM_TIMEOUT +
                                 H.TEST_TIMEOUT)
@@ -336,6 +351,20 @@ class Admission(Base):
         self.assertTrue(images['echo']['elf'].startswith(str(self.dir / 'run')))
         self.assertEqual((images['echo']['vidPid'], images['echo']['hex']), ('1234:5678', None))
         self.assertEqual(images['echo']['fqbn'], json.loads(self.record().read_text())['fqbn'])   # no per-sketch one
+
+    def test_two_named_builds_of_one_source_are_admitted_by_name(self):
+        rec = self.record()
+        data = json.loads(rec.read_text())
+        rel = 'build/hil/rig_jlink/echo_b/echo.ino.elf'
+        (self.root / rel).parent.mkdir(parents=True)
+        (self.root / rel).write_bytes(b'elf b')
+        data['sketches']['echo_b'] = {**data['sketches']['echo'], 'example': 'echo_b', 'source': 'examples/Basic/echo',
+                                      'fqbn': 'f:usb=b', 'elf': rel, 'sha256': {rel: sha(b'elf b')}}
+        rec.write_text(json.dumps(data))
+        _, images = self.admit(rec)
+        self.assertEqual({k: (Path(v['elf']).read_bytes(), Path(v['elf']).parent.name, v['fqbn'])
+                          for k, v in images.items()},
+                         {'echo': (b'elf', 'echo', 'f'), 'echo_b': (b'elf b', 'echo_b', 'f:usb=b')})
 
     def test_admission_sees_the_build_sides_worktree_status(self):
         # a core's dirty submodule hidden by an ignore setting: the build side reports it, admission refuses on it
@@ -428,6 +457,33 @@ class Admission(Base):
             H.verify_staged(m)
         m.write_text(json.dumps({'head': 'abc', 'files': {'src/fake.h': sha((self.root / 'src/fake.h').read_bytes())}}))
         self.assertEqual(H.verify_staged(m)['head'], 'abc')
+
+    def test_staged_paths_outside_the_tree_or_through_links_are_refused_before_hashing(self):
+        """agentrc#472: the check every staged run (hil_remote's, CI's) goes through, not only CI admission."""
+        m = self.dir / 'manifest.json'
+        good = {'src/fake.h': sha((self.root / 'src/fake.h').read_bytes())}
+        outside = self.dir / 'outside'
+        outside.mkdir()
+        (outside / 'fake.h').write_bytes((self.root / 'src/fake.h').read_bytes())
+        (self.root / 'parent-link').symlink_to(outside, target_is_directory=True)
+        (self.root / 'file-link.h').symlink_to(self.root / 'src/fake.h')
+        digest = good['src/fake.h']
+        cases = {'/etc/passwd': 'outside', '../escape': 'outside', 'src/../../escape': 'outside',
+                 'C:/x': 'outside', 'C:x': 'outside', '\\\\host\\share\\x': 'outside', '..\\escape': 'outside',
+                 '': 'outside', 'parent-link/fake.h': 'through links', 'file-link.h': 'through links'}
+        hashed = mock.Mock(side_effect=AssertionError('hashed before the path check'))
+        for rel, why in cases.items():
+            with self.subTest(rel=rel), mock.patch.object(H.B, 'sha256', hashed):
+                m.write_text(json.dumps({'head': 'abc', 'files': {**good, rel: digest}}))
+                with self.assertRaisesRegex(H.Refused, why):
+                    H.verify_staged(m)
+        for files in ([], {'src/fake.h': 7}, None):
+            with self.subTest(files=files):
+                m.write_text(json.dumps({'head': 'abc', 'files': files}))
+                with self.assertRaisesRegex(H.Refused, 'malformed|no JSON object'):
+                    H.verify_staged(m)
+        m.write_text(json.dumps({'head': 'abc', 'files': good}))
+        self.assertEqual(H.verify_staged(m)['files'], good)
 
     def test_record_problems_without_a_head_skip_the_head_check(self):
         rec = json.loads(self.record(source={'head': 'old'}).read_text())
@@ -1782,6 +1838,60 @@ class Manual(Base):
         args.board = 'rig_host'
         with self.assertRaisesRegex(H.Refused, 'host board'):
             H.op_check(args, self.board('rig_host'), self.dir, mock.Mock(), None)
+
+
+class ReleaseHelper(unittest.TestCase):
+    """release_hold's `hil_lock.py release` survives a signal to its caller's process group (agentrc#477): a tty
+    Ctrl-C, or `timeout` without --foreground, would kill it before it signalled the holder."""
+
+    HELPER = ('import os, pathlib, sys, time\n'
+              'd = pathlib.Path(__file__).parent\n'
+              '(d / "started").write_text(str(os.getpid()))\n'
+              'time.sleep(1)\n'
+              '(d / "released").write_text(" ".join(sys.argv[1:]))\n')
+    CALLER = ('import json, signal, sys\n'
+              'from pathlib import Path\n'
+              'sys.path.insert(0, sys.argv[2])\n'
+              'from helpers import load_arduino_engine\n'
+              'H = load_arduino_engine("skills/arduino/scripts/arduino_hil.py")\n'
+              'H.A.root = Path(sys.argv[1])\n'
+              'signal.signal(signal.SIGINT, signal.default_int_handler)\n'
+              'try:\n'
+              '    H.release_hold("rig_jlink")\n'
+              'except KeyboardInterrupt:\n'
+              '    print("interrupted", (Path(sys.argv[1]) / H.LOCK_SCRIPT).with_name("released").exists(), flush=True)\n')
+
+    def released_through(self, sig):
+        """Signal the caller's whole group once the helper started; (caller's output, its exit, helper's argv)."""
+        root = tmpdir(self)
+        script = root / H.LOCK_SCRIPT
+        script.parent.mkdir(parents=True)
+        script.write_text(self.HELPER)
+        caller = subprocess.Popen([sys.executable, '-c', self.CALLER, str(root), str(Path(__file__).resolve().parent)],
+                                  stdout=subprocess.PIPE, text=True, start_new_session=True)
+        self.addCleanup(caller.stdout.close)
+        self.addCleanup(kill_quietly, caller.pid, signal.SIGKILL)
+        started, deadline = script.with_name('started'), time.monotonic() + 30
+        while not started.exists() or not started.read_text():
+            self.assertIsNone(caller.poll(), 'the caller exited before its helper started')
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.02)
+        os.killpg(caller.pid, sig)
+        out = caller.stdout.read()
+        code = caller.wait(timeout=30)
+        helper, deadline = int(started.read_text()), time.monotonic() + 10
+        while pid_alive(helper):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.02)
+        released = script.with_name('released')
+        return out, code, released.read_text() if released.exists() else None
+
+    def test_a_group_sigint_waits_for_the_release_then_interrupts(self):
+        self.assertEqual(self.released_through(signal.SIGINT), ('interrupted True\n', 0, 'release rig_jlink'))
+
+    def test_a_group_sigterm_ends_the_caller_but_not_the_release(self):
+        out, code, released = self.released_through(signal.SIGTERM)
+        self.assertEqual((code, released), (-signal.SIGTERM, 'release rig_jlink'))
 
 
 class Commission(Base):

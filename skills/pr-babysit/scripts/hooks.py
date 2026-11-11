@@ -36,8 +36,9 @@ why, modifiedBy nothing from it, and it gets no retry.
 failed and baselineFailed explain a failure: failed, {hook, error} for each hook
 the first pass's last run failed, error the first line with a word in its
 output; and baselineFailed, the ids among those that, rerun alone in a detached
-worktree of HEAD on the same PATHs, fail there with the output they printed in
-that run (comparable: its lines in any order, the tree's path read as the
+worktree of HEAD on the same PATHs (on all of HEAD's files instead for a hook
+HEAD's config passes no filenames that none of PATH selected there), fail there
+with the output they printed in that run (comparable: its lines in any order, the tree's path read as the
 checkout's, and each number standing alone, such as a duration, line number,
 count, pid or address, each time, worker number and temporary name masked), so
 they are no evidence against the change (#378). The change's side is the
@@ -67,8 +68,9 @@ commit will, so a fail_fast stop cannot hide a hook the change breaks: what
 fails there joins failed and is rerun on HEAD in turn, the hooks running again
 while every new failure is excused, and a failed run that names no hook adds the
 failure `(pre-commit)`.
-pre-commit runs with core.abbrev pinned at the length HEAD abbreviates to
-when the first run starts (#377), possibly a digit over git's default, which
+pre-commit runs without the GIT_*_PATHSPECS variables, as commits.py's commit
+runs the hooks (#415), and with core.abbrev pinned at the length HEAD
+abbreviates to when the first run starts (#377), possibly a digit over git's default, which
 the hooks' own git commands inherit. git still lengthens an abbreviation a
 hook's new object makes ambiguous, so rarely a hook that changed nothing is in
 modifiedBy.
@@ -96,7 +98,7 @@ import zipfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from commits import bounded as copyable, with_skip  # noqa: E402
+from commits import bounded as copyable, hook_env, with_skip  # noqa: E402
 from facts import Unusable, checkout_top, git, report, status  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
 import windows  # noqa: E402
@@ -384,11 +386,14 @@ def bounded(argv, deadline, start, what, cwd=None, env=None, name=None):
 
 def pre_commit(paths, deadline, start, what, hook=None, cwd=None, skip=()):
     """(exit code, hook_runner.py's records) of one pre-commit run, skip added to the SKIP it inherits; the records
-    None when pre-commit's interpreter is unknown and it ran as is. With hook, only that hook alone runs."""
-    env = pinned_abbrev(other_repo_env() if cwd else os.environ, abbrev_length())
+    None when pre-commit's interpreter is unknown and it ran as is. With hook, only that hook alone runs; paths None
+    runs on all files."""
+    # The environment commits.py's commit gives the hooks (hook_env), so what passes here passes there (#415).
+    env = pinned_abbrev(hook_env(other_repo_env() if cwd else os.environ), abbrev_length())
     if skip:
         env = with_skip(env, skip)
-    argv = ['run', '--color', 'never', *([hook] if hook else []), '--files', *paths]
+    files = ['--files', *paths] if paths is not None else ['--all-files']
+    argv = ['run', '--color', 'never', *([hook] if hook else []), *files]
     found = pre_commit_python()
     if not found:
         # The pre-commit judged, by path: Windows' CreateProcess looks a bare name up in its own order (its own
@@ -610,8 +615,12 @@ def baseline(expected, paths, deadline, start):
                 # What an earlier rerun rewrote or left behind could fail the next one: each gets HEAD as is.
                 git_within(deadline, start, *no_hooks, 'reset', '--quiet', '--hard', 'HEAD', cwd=tree)
                 git_within(deadline, start, 'clean', '-qffdx', cwd=tree)
-            if fails_alike(hook, outputs, *pre_commit(paths, deadline, start, f'HEAD {hook}', hook=hook, cwd=tree),
-                           tree):
+            ran = pre_commit(paths, deadline, start, f'HEAD {hook}', hook=hook, cwd=tree)
+            if unfed(hook, *ran):
+                # Its output does not depend on the files passed, and paths only the change adds select none in
+                # HEAD's tree (#491): it runs on every file there instead.
+                ran = pre_commit(None, deadline, start, f'HEAD {hook} all files', hook=hook, cwd=tree)
+            if fails_alike(hook, outputs, *ran, tree):
                 failing.append(hook)
             judged += 1
     except Unusable as e:
@@ -621,6 +630,16 @@ def baseline(expected, paths, deadline, start):
     finally:
         forget(tmp, deadline, start)
     return failing, {}
+
+
+def unfed(hook, code, records):
+    """Whether HEAD's run of hook alone skipped it for want of files while HEAD's config passes it no filenames."""
+    try:
+        roster, ran = attributed(records, code)
+    except Unattributed:
+        return False
+    return ([h['id'] for h in roster['hooks']] == [hook] and roster['hooks'][0].get('passFilenames') is False
+            and len(ran) == 1 and not ran[0]['executed'] and not ran[0]['failed'])
 
 
 def fails_alike(hook, outputs, code, records, tree):

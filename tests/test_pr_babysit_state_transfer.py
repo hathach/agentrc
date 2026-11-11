@@ -1,4 +1,5 @@
 """Tests for pr-babysit's state_transfer.py, and the AGENTRC_EMIT file every facts.py report writes (lib/seal.py's emit)."""
+import base64
 import importlib.util
 import json
 import os
@@ -73,6 +74,23 @@ class StateTransferTest(unittest.TestCase):
     def test_the_line_is_the_state_whole(self):
         code, out = self.run_script(self.file)
         self.assertEqual((code, out), (0, {'digest': 'cd1574aa', 'state': STATE}))
+
+    def test_a_pinned_checkout_dir_is_read_against_this_worktree_and_sealed_apart_from_the_state(self):
+        repo = self.dir / 'repo'
+        subprocess.run(['git', 'init', '-q', str(repo)], check=True, env=git_env())
+        (repo / 'sub').mkdir()
+        other = self.dir / 'other'
+        subprocess.run(['git', 'init', '-q', str(other)], check=True, env=git_env())
+        for pinned, cwd, same in ((str(repo), repo / 'sub', True), (str(other), repo, False), (str(self.dir / 'gone'), repo, False),
+                                  (str(repo), self.dir, False)):
+            state = {**STATE, 'config': {'checkoutDir': pinned}}
+            done = subprocess.run([sys.executable, str(SCRIPT), self.saved({'result': {'state': state}}, 'pinned.output')], cwd=cwd,
+                                  capture_output=True, text=True, encoding='utf-8', env=git_env())
+            line = json.loads(done.stdout.splitlines()[-1])
+            self.assertEqual((line['state'], line['checkout']), (state, transfer.sealed({'dir': pinned, 'same': same})), (pinned, cwd))
+        for config in ({'checkoutDir': '.'}, {}, None):
+            _, line = self.run_script(self.saved({'result': {'state': {**STATE, 'config': config}}}, 'here.output'))
+            self.assertNotIn('checkout', line, config)
 
     @unittest.skipUnless(shutil.which('node'), 'needs Node.js')
     def test_the_emitted_module_loads_as_the_line_with_its_own_path_and_stdout_only_names_it(self):
@@ -203,6 +221,32 @@ class EmitDirTest(unittest.TestCase):
         subprocess.run(['git', '-C', str(self.repo), 'worktree', 'add', '-q', str(linked)], check=True, env=git_env())
         self.assertEqual(Path(self.emit_dir(linked)[1]['dir']).parent.resolve(), (self.repo / '.git' / 'agentrc-emit').resolve())
 
+
+
+class StageTest(unittest.TestCase):
+    """facts.py stage: a relay command's script input, written only when it is the JSON the workflow sent."""
+
+    def stage(self, data, digest):
+        out = Path(tempfile.mkdtemp()) / 'x.in'
+        self.addCleanup(shutil.rmtree, out.parent)
+        done = subprocess.run([sys.executable, str(FACTS), 'stage', str(out), digest], input=data, capture_output=True)
+        return done.returncode, json.loads(done.stdout.decode().splitlines()[-1]), out
+
+    def test_the_bytes_sent_are_written_and_anything_else_refused(self):
+        text = json.dumps({'body': "it's \\ naïve ✓ 😀\r\n"}, ensure_ascii=False)
+        sent = base64.b64encode(text.encode())
+        code, line, out = self.stage(sent, fnv1a(text))
+        self.assertEqual((code, line, out.read_bytes()), (0, {'staged': str(out)}, text.encode()))
+        for data, digest, why in [
+            (sent, fnv1a(text + ' '), 'not the JSON sent'),
+            (sent + b'\n', fnv1a(text), 'not base64'),
+            (base64.b64encode(b'\xff[]'), fnv1a(text), 'not base64 of UTF-8 JSON'),
+            (base64.b64encode(b'{'), fnv1a('{'), 'not base64 of UTF-8 JSON'),
+        ]:
+            code, line, out = self.stage(data, digest)
+            self.assertEqual(code, 2, why)
+            self.assertIn(why, line['error'])
+            self.assertFalse(out.exists(), why)
 
 if __name__ == '__main__':
     unittest.main()

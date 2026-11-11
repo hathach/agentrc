@@ -39,7 +39,8 @@ unedited, so a later review states it again only once that line is gone;
 --view prints instead the pr-review workflow's view of that answer, bound to the repository, PR and head it was
 read for (repo, pr, head): it leaves out what the workflow never reads, the ledger path, the unpublished answers and
 each open row's impact and severityReason, which save keeps from the ledger when a result does not regrade the
-finding. The workflow runs it under AGENTRC_EMIT and loads the line from that file (lib/seal.py's emit), so no
+finding, and adds ownComments, the comment ids our receipts hold, which the workflow never takes for another
+reviewer's claim. The workflow runs it under AGENTRC_EMIT and loads the line from that file (lib/seal.py's emit), so no
 model copies it.
 
 --fixable, with a fresh threads.py snapshot, prints what an auto-fix repair may take from the review posted on
@@ -51,8 +52,8 @@ why: `disputed`, `unmapped` (no receipt places its text), `grouped` (unmapped an
 because its group's printed text states its defect, and that text still stands: a claim of that review whose comment
 the snapshot still lists, or the group's `lead` finding, not muted and itself in `fix`), `deleted`, `edited` (the
 inline comment, or the body of the review it was moved into, reads otherwise) or `replied`. `autoPost` is false when
-any is held `unmapped`, `deleted` or `edited`: a recheck would judge text the ledger no longer holds, so its review
-goes to the human as a pending one. A `grouped` one has no text of its own on the PR to diverge, so it does not; a
+any is held `unmapped`, `deleted` or `edited` (STALE): a recheck would judge text the ledger no longer holds, so its
+review goes to the human as a pending one; post.py --auto holds every auto post by the same rule (stale()). A `grouped` one has no text of its own on the PR to diverge, so it does not; a
 muted one whose group's text the human deleted, edited, dropped or contested, or one in a review saved before `muted`
 existed, is held `unmapped`, and one in a review saved before `lead` existed is grouped only through a listed claim.
 
@@ -100,6 +101,7 @@ from launch_result import ENDED, STALLED, load_output  # noqa: E402
 from harvest import digest as body_digest, gh_json  # noqa: E402  the digest threads.py records
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
 import gh_repo  # noqa: E402
+from gh_reads import as_gh_reads  # noqa: E402
 import windows  # noqa: E402
 
 VERSION = 2
@@ -192,6 +194,16 @@ def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()[:16]
 
 
+def read_digest(body):
+    """digest() of a reply we sent as gh reads it back: what its live copy matches; `digest` stays its identity."""
+    return digest(as_gh_reads(body))
+
+
+def live_digest(body):
+    """harvest.py's digest of text we sent as gh reads it back: what a snapshot of its live copy records."""
+    return body_digest(as_gh_reads(body))
+
+
 # An uncertain review may not be on the PR at all: it is reconciled before anything builds on it.
 REACHED = ('posted',)
 UNSETTLED = ('pending', 'drafted', 'uncertain')
@@ -217,6 +229,19 @@ def publications(led):
         yield r, r
         for a in r.get('answerPublications', []):
             yield a, r
+
+
+def receipted(led):
+    """(review ids, comment ids) our receipts hold: each publication's review, its inline comments and the replies staged
+    into it, and each repair note. They stay ours whatever the human edits since, a review body's marker included."""
+    reviews, comments = set(), set()
+    for p, _ in publications(led):
+        rec = p.get('receipts') or {}
+        reviews.add((rec.get('review') or {}).get('reviewId'))
+        comments |= set((rec.get('review') or {}).get('commentIds') or [])
+        comments |= {e.get('replyId') for e in rec.get('staged') or []}
+    comments |= {x.get('replyId') for r in led['reviews'] for x in r.get('repairs', [])}
+    return reviews - {None}, comments - {None}
 
 
 def owner_of(led, pub):
@@ -464,7 +489,7 @@ def note_hold(fix, bodies):
     if fix['state'] != 'published' or fix['resolve'] in SETTLED:
         return None
     body = bodies.get(fix['replyId'])
-    return 'our repair note was deleted' if body is None else 'our repair note was edited' if digest(body) != fix['digest'] else None
+    return 'our repair note was deleted' if body is None else 'our repair note was edited' if digest(body) != read_digest(fix['body']) else None
 
 
 def submitted_last(led, head):
@@ -526,9 +551,10 @@ def published_at(led, f):
         draft, got = r.get('draft') or {}, (r.get('receipts') or {}).get('review') or {}
         for c, cid in zip(draft.get('comments', []), got.get('commentIds') or []):
             if c.get('findingId') == f['id'] and cid is not None and cid == f.get('commentId'):
-                return 'review', cid, body_digest(f.get('published') or c['body'])
+                # `published` was read through gh already, and gh's rewrite is not idempotent: only our text is mapped.
+                return 'review', cid, body_digest(f['published']) if f.get('published') else live_digest(c['body'])
         if f.get('commentId') is None and any(c.get('findingId') == f['id'] for c in draft.get('moved', [])):
-            return ('review-body', got['reviewId'], body_digest(body_of(r))) if got.get('reviewId') else None
+            return ('review-body', got['reviewId'], live_digest(body_of(r))) if got.get('reviewId') else None
     return None
 
 
@@ -571,12 +597,13 @@ def holder(led, snapshot):
     return hold
 
 
-def fixable(led, snapshot, head):
-    online = [x for x, _ in publications(led) if x['status'] in ONLINE]
-    if online:
-        raise Unusable(f"a {online[-1]['status']} publication for {online[-1]['head']} is not settled, so the last review on the PR "
-                       'is unknown: reconcile it first')
-    rev = submitted_last(led, head)
+# A standing finding held for these has no text on the PR that the ledger holds: a recheck would judge other text.
+STALE = ('unmapped', 'deleted', 'edited')
+
+
+def standing_holds(led, rev, snapshot):
+    """[(finding, why it is held, or None)] for rev's standing findings as the snapshot shows the PR: holder()'s, and
+    `grouped` for an unmapped muted one whose group's printed text still stands."""
     hold = holder(led, snapshot)
     standing = [(f, hold(f)) for f in rev.get('findings', []) if f['status'] in OPEN]
     # The defects whose group's printed text still stands: a claim whose comment is on the PR, or the lead's own text
@@ -586,17 +613,31 @@ def fixable(led, snapshot, head):
     stated = ({c.get('defect') for c in rev.get('claims') or [] if c.get('commentId') in on_pr}
               | {f.get('defect') for f, why in standing
                  if f.get('lead') and not f.get('muted') and why is None}) - {None}
+    return [(f, 'grouped' if why == 'unmapped' and f.get('muted') and f.get('defect') in stated else why)
+            for f, why in standing]
+
+
+def stale(led, snapshot):
+    """(finding id, why) for each standing finding of the last review on the PR held for STALE text."""
+    rev = last(led)
+    return [(f['id'], why) for f, why in standing_holds(led, rev, snapshot) if why in STALE] if rev else []
+
+
+def fixable(led, snapshot, head):
+    online = [x for x, _ in publications(led) if x['status'] in ONLINE]
+    if online:
+        raise Unusable(f"a {online[-1]['status']} publication for {online[-1]['head']} is not settled, so the last review on the PR "
+                       'is unknown: reconcile it first')
+    rev = submitted_last(led, head)
     fix, held = [], []
-    for f, why in standing:
-        if why == 'unmapped' and f.get('muted') and f.get('defect') in stated:
-            why = 'grouped'
+    for f, why in standing_holds(led, rev, snapshot):
         if why:
             held.append({'findingId': f['id'], 'commentId': f.get('commentId'), 'why': why})
         else:
             # The text the PR shows, as the human edited it, and the digest a repair's fix check names.
             fix.append({**open_row(f, {}), 'claimDigest': digest(claim(f))})
     return {'fix': sorted(fix, key=by_severity), 'held': held,
-            'autoPost': not any(h['why'] in ('unmapped', 'deleted', 'edited') for h in held)}
+            'autoPost': not any(h['why'] in STALE for h in held)}
 
 
 def add_answers(review, head, answers, auto=False, output=None):
@@ -715,10 +756,10 @@ UNREAD = ('ledger', 'answers')
 UNREAD_ROW = ('impact', 'severityReason')
 
 
-def workflow_view(answer, repo, pr, head):
+def workflow_view(answer, repo, pr, head, own=()):
     view = {k: v for k, v in answer.items() if k not in UNREAD}
     view['open'] = [{k: v for k, v in f.items() if k not in UNREAD_ROW} for f in answer['open']]
-    return {'repo': repo, 'pr': pr, 'head': head, **view}
+    return {'repo': repo, 'pr': pr, 'head': head, **view, 'ownComments': sorted(own)}
 
 
 def read_snapshot(path, repo, pr):
@@ -974,7 +1015,7 @@ def next_of(a, repo):
         return [sys.executable, (HERE / script).as_posix(), *args, '--pr', str(a.pr), '--repo', repo]
     return next_step(led, facts, {'head': pr['headRefOid'], 'state': pr.get('state')}, a.publish, cmd, review,
                      manifest and {**manifest, 'path': a.manifest}, reading,
-                     lambda h: fixable(led, snapshot(repo, a.pr), h), a.token)
+                     lambda h: fixable(led, snapshot(repo, a.pr, owned=receipted(led)), h), a.token)
 
 
 def collect(argv):
@@ -1022,7 +1063,7 @@ def collect(argv):
             return {'ledger': path.as_posix(), 'fixable': fixable(led, snapshot, a.head)}
         out = {'ledger': path.as_posix(), **show(led, a.finding, a.draft, snapshot, a.pending)}
         out = {**out, 'disputes': disputes(led, snapshot, a.head)} if a.head else out
-        return workflow_view(out, repo, a.pr, a.head) if a.view else out
+        return workflow_view(out, repo, a.pr, a.head, receipted(led)[1]) if a.view else out
     result = (load_output(a.output) or {}).get('result')
     if not isinstance(result, dict):
         raise Unusable(f'--output {a.output} holds no Workflow result')

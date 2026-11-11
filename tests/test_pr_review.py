@@ -26,6 +26,8 @@ import post  # noqa: E402
 import prepare  # noqa: E402
 import result  # noqa: E402
 import threads  # noqa: E402
+sys.path.insert(0, str(ROOT / 'lib'))
+import gh_reads as lib_gh_reads  # noqa: E402  gh_reads() below is the tests' own oracle
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from helpers import git_env, guard_survivors, make_stub, remotes_checkout, tmpdir  # noqa: E402
 
@@ -47,6 +49,16 @@ def setUpModule():
     guard_survivors(__name__)
 
 
+# gh 2.103.3's rewrite of a response's JSON text, as seen: the body text `\u001b` (#461) reads back `\^[`, and `\u001c`
+# reads back `\^\`, so gh turns a sent `\u001cu001b` into `\^\u001b`.
+GH_REWRITES = {'b': r'\\^[', 'c': r'\\^\\'}
+
+
+def gh_reads(text):
+    """A gh response as gh returns it: one pass, as gh streams it, so what a rewrite writes is not rewritten again."""
+    return re.sub(r'\\\\u001([bc])', lambda m: GH_REWRITES[m.group(1)], text)
+
+
 class FakeGitHub:
     def __init__(self):
         self.head = None
@@ -61,6 +73,7 @@ class FakeGitHub:
         self.posts = []
         self.post_fails = False
         self.list_fails = False
+        self.comments_fail = False
         self.readback_state = None
         self.readback_body = None
         self.next_id = 500
@@ -82,7 +95,7 @@ class FakeGitHub:
     def publish(self, rid):
         """A submitted review's comments turn public: each root opens a thread, each reply joins its root's."""
         for c in self.review_comments[rid]:
-            self.inline.append({**c, 'user': {'login': ME}, 'created_at': self.tick()})
+            self.inline.append({**c, 'user': {'login': ME}, 'pull_request_review_id': rid, 'created_at': self.tick()})
             root = c.get('in_reply_to_id')
             if root is None:
                 self.threads.append({'id': f"T{c['id']}", 'isResolved': False, 'isOutdated': False,
@@ -213,6 +226,8 @@ class FakeGitHub:
                     return 1, '', 'HTTP 502'
                 return 0, json.dumps(page(self.reviews.values()))
             if path == f'repos/{REPO}/pulls/{PR}/comments':
+                if self.comments_fail:
+                    return 1, '', 'gh: Bad Gateway (HTTP 502)'
                 return 0, json.dumps(page(self.inline))
             if path == f'repos/{REPO}/issues/{PR}/comments':
                 return 0, json.dumps(page(self.issue))
@@ -266,11 +281,11 @@ class Case(unittest.TestCase):
         code, out, *err = self.gh.gh(list(argv[1:]))
         if code not in ok:
             raise facts.Unusable(f"{' '.join(argv)}: {err[0] if err else ''}")
-        return code, out
+        return code, gh_reads(out)
 
     def fake_attempt(self, *argv, input=None):
         code, out, *err = self.gh.gh(list(argv[1:]), stdin=input)
-        return code, out, err[0] if err else ''
+        return code, gh_reads(out), err[0] if err else ''
 
     def call(self, module, argv):
         patches = [mock.patch.object(m, 'run', self.fake_run) for m in (facts, harvest, prepare)]
@@ -588,13 +603,14 @@ class Prepare(Case):
         p = self.prepare()
         os.chdir(p['worktree'])
         ok = self.call(prepare, ['--check', '--pr', str(PR), '--repo', REPO, '--expected-head', head])
-        want = {'mergeBase': p['mergeBase'], 'scopeBase': p['scopeBase'], 'mode': 'full', 'groups': p['groups'], 'recheckFrom': None}
+        want = {'mergeBase': p['mergeBase'], 'scopeBase': p['scopeBase'], 'mode': 'full', 'groups': p['groups'], 'recheckFrom': None,
+                'priorHead': None}
         self.assertEqual(ok['pins'], want)
         pinned = json.loads(Path(p['facts']).read_text())
-        del pinned['recheckFrom']
+        del pinned['recheckFrom'], pinned['priorHead']
         Path(p['facts']).write_text(json.dumps(pinned))
         self.assertEqual(self.call(prepare, ['--check', '--pr', str(PR), '--repo', REPO, '--expected-head', head])['pins'], want,
-                         "a prepare from before --recheck-from pinned no recheck")
+                         "a prepare from before --recheck-from or priorHead pinned neither")
         self.assertEqual(ok['top'], Path(os.path.realpath(p['worktree'])).as_posix())
         self.assertEqual((ok['repo'], ok['pr']), (REPO, PR))
         with self.assertRaisesRegex(facts.Unusable, 'a full SHA'):
@@ -647,8 +663,8 @@ class Prepare(Case):
         self.assertEqual(prepare.groups_of(nested, 6), (['agents', 'skills/cowork'], False))
 
 
-class Recheck(Case):
-    """prepare --recheck-from R: the auto-fix recheck scans only what the repair changed, a base merge's imports left out."""
+class MergeCase(Case):
+    """A posted review of a PR whose base the contributor may merge since."""
 
     LINES = [f'int v{i};\n' for i in range(20)]
 
@@ -685,11 +701,15 @@ class Recheck(Case):
         return subprocess.run(['git', 'merge', '--quiet', '--no-edit', *strategy, 'origin/main'], cwd=self.work,
                               capture_output=True, text=True, env=git_env()).returncode
 
-    def recheck(self):
-        return self.prepare('--recheck-from', self.reviewed)
-
     def scan(self, p):
         return sh(self.clone, 'git', 'diff', p['scopeBase'], p['head'])
+
+
+class Recheck(MergeCase):
+    """prepare --recheck-from R: the auto-fix recheck scans only what the repair changed, a base merge's imports left out."""
+
+    def recheck(self):
+        return self.prepare('--recheck-from', self.reviewed)
 
     def test_a_repair_without_a_base_merge_is_incremental_from_the_reviewed_head(self):
         self.commit('src/fix/f.c', 'int f;\n', 'repair')
@@ -732,9 +752,10 @@ class Recheck(Case):
             pins = self.call(prepare, ['--check', '--pr', str(PR), '--repo', REPO, '--expected-head', head])['pins']
         finally:
             os.chdir(self.clone)
-        self.assertEqual((pins['recheckFrom'], pins['scopeBase']), (self.reviewed, p['scopeBase']))
+        self.assertEqual((pins['recheckFrom'], pins['scopeBase'], pins['priorHead']), (self.reviewed, p['scopeBase'], self.reviewed))
         q = self.prepare()
-        self.assertEqual((q['mode'], q['recheckFrom']), ('full', None), 'an ordinary prepare after a base merge is unchanged')
+        self.assertEqual((q['mode'], q['recheckFrom'], q['scopeBase']), ('incremental', None, p['scopeBase']),
+                         'an ordinary prepare after a base merge takes the same scope')
 
     def test_two_base_merges_leave_both_imports_out(self):
         self.commit('src/fix/f.c', 'int f;\n', 'repair')
@@ -816,6 +837,68 @@ class Recheck(Case):
                 self.prepare('--recheck-from', self.reviewed, *extra)
         with self.assertRaisesRegex(facts.Unusable, 'full SHA'):
             self.prepare('--recheck-from', self.reviewed[:12])
+
+
+class BaseMerge(MergeCase):
+    """An ordinary re-review after the contributor merged the base: scoped from the same synthetic base as a recheck,
+    so only what the contributor changed is reviewed again (#450)."""
+
+    def review(self):
+        return self.prepare()
+
+    def test_a_clean_base_merge_scopes_the_contributors_changes_only(self):
+        self.commit('src/fix/f.c', 'int f;\n', 'contributor')
+        self.on_main('src/usb/m.c', 'int main_only;\n', 'main: new file')
+        self.on_main('src/core/a.c', self.text(l15='int main_far;\n'), 'main: same file, far from the PR')
+        self.assertEqual(self.merge_main(), 0)
+        head = self.push_pr()
+        p = self.review()
+        self.assertEqual((p['mode'], p['priorHead'], p['recheckFrom'], p['conflicts']), ('incremental', self.reviewed, None, []))
+        self.assertNotIn(p['scopeBase'], (self.reviewed, p['mergeBase']))
+        self.assertNotEqual(p['mergeBase'], self.base)
+        self.assertEqual(sh(self.clone, 'git', 'diff', '--name-only', p['scopeBase'], head).split(), ['src/fix/f.c'])
+        self.assertEqual(p['groups'], ['src/fix'])
+        facts_ = json.loads(Path(p['facts']).read_text())
+        self.assertEqual((facts_['scopeBase'], facts_['priorHead']), (p['scopeBase'], self.reviewed))
+        # Saved from that scope, the review keeps the new merge base: the next push compares as before.
+        self.save(self.result_for(p))
+        self.mark_posted(p)
+        self.commit('src/fix/g.c', 'int g;\n', 'contributor again')
+        nxt = self.push_pr()
+        q = self.review()
+        self.assertEqual((q['mode'], q['scopeBase'], q['priorHead'], q['mergeBase']), ('incremental', head, head, p['mergeBase']))
+        self.assertEqual(sh(self.clone, 'git', 'diff', '--name-only', q['scopeBase'], nxt).split(), ['src/fix/g.c'])
+
+    def test_a_content_conflict_resolution_is_in_scope(self):
+        self.on_main('src/core/a.c', self.text(l5='int main5;\n', l15='int main_far;\n'), 'main: the same line')
+        self.assertNotEqual(self.merge_main(), 0)
+        (self.work / 'src/core/a.c').write_text(self.text(l5='int resolved;\n', l15='int main_far;\n'))
+        sh(self.work, 'git', 'commit', '--quiet', '-am', 'merge main, resolved')
+        self.push_pr()
+        p = self.review()
+        self.assertEqual((p['mode'], p['conflicts'], p['groups']), ('incremental', ['src/core/a.c'], ['src/core']))
+        diff = self.scan(p)
+        self.assertIn('+int resolved;', diff)
+        self.assertNotIn('main_far', diff)
+
+    def test_another_conflict_kind_is_refused_and_full_reviews_the_whole_pr(self):
+        self.on_main('src/core/a.c', None, 'main: delete a.c')
+        self.assertNotEqual(self.merge_main(), 0)
+        sh(self.work, 'git', 'add', 'src/core/a.c')
+        sh(self.work, 'git', 'commit', '--quiet', '-m', 'merge main, kept a.c')
+        self.push_pr()
+        with self.assertRaisesRegex(facts.Unusable, r'CONFLICT \(modify/delete\).*src/core/a\.c.*takes --full'):
+            self.review()
+        p = self.prepare('--full')
+        self.assertEqual((p['mode'], p['scopeBase']), ('full', p['mergeBase']))
+
+    def test_rewritten_history_after_a_base_merge_is_full(self):
+        self.on_main('src/usb/m.c', 'int main_only;\n', 'main')
+        sh(self.work, 'git', 'fetch', '--quiet', 'origin')
+        sh(self.work, 'git', 'rebase', '--quiet', 'origin/main')
+        self.push_pr(force=True)
+        p = self.review()
+        self.assertEqual((p['mode'], p['scopeBase'], p['priorHead']), ('full', p['mergeBase'], self.reviewed))
 
 
 class AutoFix(Case):
@@ -971,7 +1054,8 @@ class Ledger(Case):
         snap = self.tmp / 'threads.json'
         snap.write_text(json.dumps({'repo': REPO, 'pr': PR, 'comments': [], 'threads': []}))
         view = self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--threads', str(snap), '--head', self.p['head'], '--view'])
-        self.assertEqual(view, {'repo': REPO, 'pr': PR, 'head': self.p['head'], 'reviews': 0, 'last': None, 'open': [], 'disputes': []})
+        self.assertEqual(view, {'repo': REPO, 'pr': PR, 'head': self.p['head'], 'reviews': 0, 'last': None, 'open': [], 'disputes': [],
+                                'ownComments': []})
 
     def test_save_refuses_a_word_off_the_scale_before_anything_is_stored(self):
         for word in ('major', 'severe', None):
@@ -1401,6 +1485,24 @@ class Post(PostCase):
             self.post()
         self.assertEqual(self.gh.posts, [])
 
+    def test_a_comment_citing_a_json_escape_reads_back_verified_and_unedited(self):
+        r"""gh returns the text `\u001b` as `\^[` (#461): the read-back compares what we sent as gh reads it."""
+        body = '**low**: The JSON line escapes ESC as `\\u001b`, so only a relay that decodes the field and copies it is at risk.'
+        draft = {'event': 'COMMENT', 'body': 'Cites `\\u001b` too.', 'replies': [],
+                 'comments': [{'path': 'src/core/a.c', 'line': 21, 'body': body, 'finding': 0}]}
+        self.save(self.result_for(self.p, draft=draft))
+        got = self.post('--auto')
+        self.assertEqual((got['status'], got['review']['verified'], got['review']['error']), ('posted', True, None))
+        self.assertEqual(self.gh.posts[0]['comments'][0]['body'], body, 'sent as drafted')
+        self.assertIn('Cites `\\u001b` too.', self.gh.posts[0]['body'])
+        f = self.review()['findings'][0]
+        self.assertEqual((f['commentId'], f.get('published')), (got['review']['commentIds'][0], None), 'not taken for an edit')
+        snap = self.tmp / 'threads.json'
+        self.call(threads, ['--pr', str(PR), '--repo', REPO, '--out', str(snap)])
+        self.assertIn('`\\^[`', json.loads(snap.read_text())['comments'][-1]['body'], 'gh reads it rewritten')
+        fx = self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--fixable', '--threads', str(snap), '--head', self.head])['fixable']
+        self.assertEqual((fx['held'], fx['autoPost']), ([], True), 'its text still stands as posted')
+
     def test_long_text_is_auto_posted_whole(self):
         draft = self.result_for(self.p)['draft']
         long = ' '.join(['w'] * 200) + '\n- ' + 'x' * 700
@@ -1482,14 +1584,14 @@ class Draft(PostCase):
     def due(self):
         return {o['id']: o['resolveDue'] for o in self.show()['open'] if o['resolveDue']}
 
-    def fixed(self):
+    def fixed(self, note='Fixed in abc.'):
         """Our review posted on the head, then a second review of it that finds pr7-f1 fixed, with a fix note."""
         self.save(self.result_for(self.p))
         self.post('--auto')
         root = self.review()['findings'][0]['commentId']
         self.save(self.result_for(self.p, findings=[{'id': 'pr7-f1', 'status': 'fixed'}],
                                   draft={'event': 'COMMENT', 'body': 'Fixed.', 'comments': [],
-                                         'replies': [{'commentId': root, 'body': 'Fixed in abc.', 'findingId': 'pr7-f1'}]}), reason='fixed')
+                                         'replies': [{'commentId': root, 'body': note, 'findingId': 'pr7-f1'}]}), reason='fixed')
         return root
 
     def test_a_pending_review_without_an_event_is_created_once(self):
@@ -1810,6 +1912,23 @@ class Draft(PostCase):
         self.assertEqual(self.post()['status'], 'drafted', 'found by its thread and body digest')
         self.assertEqual(len(self.adds()), 1)
 
+    def test_a_fix_note_citing_a_json_escape_is_matched_as_gh_reads_it_also_when_found_again(self):
+        """#461 for replies: a staged note reads back with gh's rewrite, through a lost answer and the human's submit."""
+        self.fixed(note='Fixed in abc: `\\u001b` is escaped now.')
+        self.gh.reply_fails = 'lost'
+        self.assertEqual(self.post()['staged'][0]['state'], 'uncertain')
+        self.gh.reply_fails = None
+        self.assertEqual(self.post()['status'], 'drafted', 'found by its thread and its body as gh reads it')
+        self.assertEqual(len(self.adds()), 1)
+        self.gh.submit(self.rid())
+        self.call(post, ['--pr', str(PR), '--repo', REPO, '--sync'])
+        self.assertEqual(self.review()['receipts']['staged'][0]['state'], 'published', 'not taken for an edit')
+
+    def test_an_auto_post_with_a_fix_note_citing_a_json_escape_is_submitted(self):
+        self.fixed(note='Fixed in abc: `\\u001b` is escaped now.')
+        got = self.post('--auto')
+        self.assertEqual((got['status'], [e['state'] for e in got['staged']]), ('posted', ['published']))
+
     def test_a_duplicated_lost_reply_is_the_answer_published(self):
         self.fixed()
         self.gh.reply_fails = 'lost'
@@ -1927,7 +2046,10 @@ class Pushback(PostCase):
         plain = self.call(ledger, show)
         want = {k: v for k, v in plain.items() if k not in ('ledger', 'answers')}
         want['open'] = [{k: v for k, v in f.items() if k not in ('impact', 'severityReason')} for f in plain['open']]
-        self.assertEqual(view, {'repo': REPO, 'pr': PR, 'head': self.head, **want}, 'the plain answer less what the workflow never reads')
+        own = sorted(ledger.receipted(json.loads(Path(self.p['ledger']).read_text()))[1])
+        self.assertEqual(own, [5010])
+        self.assertEqual(view, {'repo': REPO, 'pr': PR, 'head': self.head, **want, 'ownComments': own},
+                         'the plain answer less what the workflow never reads, with the comments our receipts hold')
         self.assertEqual((len(view['open']), len(view['disputes'])), (1, 1))
         for bad in (['show', '--pr', str(PR), '--repo', REPO, '--threads', str(snap)],
                     [*show, '--fixable']):
@@ -2288,6 +2410,170 @@ class Threads(Case):
         got = {c['id']: c for c in json.loads(f.read_text())['comments']}
         self.assertEqual((got[11]['line'], got[11]['bot'], got[11]['threadId'], got[11]['outdated']), (9, True, 'T2', True))
         self.assertEqual(got[11]['digest'], harvest.digest('bug'))
+
+
+class Reconcile(PostCase):
+    """A posted review's inline comments edited or deleted since are reconciled before a recheck, and an auto post whose
+    recheck judged text the PR no longer shows goes to the human (#383)."""
+
+    def posted(self):
+        """Our auto review on the head: pr7-f1 inline on line 21, pr7-f2 inline on line 20, pr7-f3 in the body."""
+        one = self.result_for(self.p)['findings'][0]
+        findings = [one, {**one, 'line': 20, 'why': 'a is shadowed'}, {**one, 'line': 1, 'why': 'far away'}]
+        draft = {'event': 'COMMENT', 'body': 'Summary.', 'replies': [],
+                 'comments': [{'path': 'src/core/a.c', 'line': 21, 'body': 'b is never initialised', 'finding': 0},
+                              {'path': 'src/core/a.c', 'line': 20, 'body': 'a is shadowed', 'finding': 1},
+                              {'path': 'src/core/a.c', 'line': 1, 'body': 'far away', 'finding': 2}]}
+        self.save(self.result_for(self.p, findings=findings, draft=draft))
+        self.assertEqual(self.post('--auto')['status'], 'posted')
+        return {f['id']: f.get('commentId') for f in self.review()['findings']}
+
+    def comment(self, cid):
+        return next(c for c in self.gh.inline if c['id'] == cid)
+
+    def recheck(self, reason='again'):
+        """A second auto review of the head carrying every standing finding, as a recheck saves it."""
+        carried = [{'id': i, 'status': 'open'} for i in ('pr7-f1', 'pr7-f2', 'pr7-f3')
+                   if any(f['id'] == i and f['status'] == 'open' for f in self.review()['findings'])]
+        self.save(self.result_for(self.p, findings=carried, draft={'event': 'COMMENT', 'body': f'Still open: {reason}.', 'comments': [], 'replies': []}),
+                  reason=reason)
+
+    def test_prepare_records_an_edit_as_published_and_a_deletion_as_dropped_keeping_ids_and_disputes(self):
+        ids = self.posted()
+        led = json.loads(Path(self.p['ledger']).read_text())
+        led['reviews'][-1]['findings'][1]['disputes'] = [{'key': 'k', 'judgedHead': self.head, 'state': 'upheld'}]
+        Path(self.p['ledger']).write_text(json.dumps(led))
+        self.comment(ids['pr7-f1'])['body'] = 'b is never initialised, softened'
+        self.gh.inline = [c for c in self.gh.inline if c['id'] != ids['pr7-f2']]
+        rid = self.review()['receipts']['review']['reviewId']
+        self.gh.reviews[rid]['body'] = 'Edited summary.'
+        got = self.prepare()
+        self.assertEqual(got['reconciled'], [{'findingId': 'pr7-f1', 'commentId': ids['pr7-f1'], 'change': 'edited'},
+                                             {'findingId': 'pr7-f2', 'commentId': ids['pr7-f2'], 'change': 'deleted'}])
+        f1, f2, f3 = self.review()['findings']
+        self.assertEqual((f1['id'], f1['status'], f1['commentId'], f1['published']),
+                         ('pr7-f1', 'open', ids['pr7-f1'], 'b is never initialised, softened'))
+        self.assertEqual((f2['id'], f2['status'], f2['disputes']), ('pr7-f2', 'dropped', [{'key': 'k', 'judgedHead': self.head, 'state': 'upheld'}]))
+        self.assertEqual((f3['status'], f3.get('published')), ('open', None), 'a body line is left for the auto-post hold')
+        self.assertEqual(self.review()['draft']['comments'][0]['body'], 'b is never initialised', 'the draft keeps what we posted')
+        self.assertEqual(self.prepare()['reconciled'], [], 'once recorded, nothing changes again')
+
+    def test_an_edit_gh_rewrites_into_a_new_escape_is_recorded_once(self):
+        """gh's rewrite is not idempotent: `\\u001cu001b` reads back `\\^\\u001b`, which read again would be `\\^\\^[`."""
+        ids = self.posted()
+        self.comment(ids['pr7-f1'])['body'] = 'edited: \\u001cu001b'
+        self.assertEqual([r['change'] for r in self.prepare()['reconciled']], ['edited'])
+        self.assertEqual(self.review()['findings'][0]['published'], 'edited: \\^\\u001b')
+        self.assertEqual(self.prepare()['reconciled'], [], 'the text recorded as read is the text read')
+        self.recheck()
+        self.assertEqual(self.post('--auto')['status'], 'posted')
+
+    def test_an_unreadable_listing_never_reads_as_a_deletion(self):
+        self.posted()
+        before = Path(self.p['ledger']).read_text()
+        self.gh.comments_fail = True
+        with self.assertRaisesRegex(facts.Unusable, 'HTTP 502'):
+            self.prepare()
+        self.assertEqual(Path(self.p['ledger']).read_text(), before)
+
+    def test_an_auto_post_whose_recheck_judged_text_edited_or_deleted_since_goes_to_the_human(self):
+        ids = self.posted()
+        self.recheck()
+        self.comment(ids['pr7-f1'])['body'] = 'edited after the recheck'
+        got = self.post('--auto')
+        self.assertEqual(got['status'], 'drafted')
+        self.assertIn('pr7-f1 edited', got['handedOver'])
+        self.assertEqual(len(self.gh.submits), 1, 'only the first review was submitted')
+
+    def test_an_auto_post_recovered_after_a_push_reads_no_snapshot_for_stale_text(self):
+        self.posted()
+        self.recheck()
+        self.crash_at('POST')
+        with self.assertRaises(KeyboardInterrupt):
+            self.post('--auto')
+        old = self.head
+        self.commit('src/core/a.c', 'int z;\n', 'z')
+        self.push_pr()
+        with mock.patch.object(post, 'snapshot', side_effect=AssertionError('a snapshot while recovering')):
+            got = self.call(post, ['--pr', str(PR), '--repo', REPO, '--expected-head', old, '--auto'])
+        self.assertEqual((got['status'], got['review']['recovered'], got['handedOver']), ('drafted', True, 'the PR head moved before the submit'))
+
+    def test_an_auto_post_after_a_reconciled_edit_is_submitted_and_a_body_edit_holds_it(self):
+        ids = self.posted()
+        first = self.review()['receipts']['review']['reviewId']
+        self.comment(ids['pr7-f1'])['body'] = 'b is never initialised, softened'
+        self.assertEqual(len(self.prepare()['reconciled']), 1)
+        self.recheck()
+        self.assertEqual(self.post('--auto')['status'], 'posted', 'the recheck judged the text the PR shows')
+        self.gh.reviews[self.review()['receipts']['review']['reviewId']]['body'] = 'Still open, edited.'
+        self.recheck('a third')
+        self.assertEqual(self.post('--auto')['status'], 'posted', 'an edit of a body that states no finding holds nothing')
+        self.gh.reviews[first]['body'] = self.gh.reviews[first]['body'].replace('far away', 'far')
+        self.recheck('a fourth')
+        got = self.post('--auto')
+        self.assertEqual(got['status'], 'drafted')
+        self.assertIn('pr7-f3 edited', got['handedOver'])
+
+
+class Ownership(PostCase):
+    """threads.py takes the comments our ledger receipted for ours, whatever the human made of the review body (#433)."""
+
+    def ours(self):
+        f = self.tmp / 'threads.json'
+        self.call(threads, ['--pr', str(PR), '--repo', REPO, '--out', str(f)])
+        return {(c['kind'], c['id']): c['ours'] for c in json.loads(f.read_text())['comments']}
+
+    def test_a_blanked_review_body_keeps_its_receipted_comments_ours_and_an_unrelated_one_of_ours_stays_external(self):
+        self.save(self.result_for(self.p))
+        rid = self.post('--auto')['review']['reviewId']
+        root = self.review()['findings'][0]['commentId']
+        led = json.loads(Path(self.p['ledger']).read_text())
+        led['reviews'][-1]['repairs'] = [{'findingId': 'pr7-f1', 'commentId': root, 'replyId': 990}]
+        Path(self.p['ledger']).write_text(json.dumps(led))
+        # A fix note lands in a marker-less review of its own, as post.py --fixed's reply does; 991 is ours by
+        # author only, in a review of no run of ours.
+        self.gh.reviews[77] = {'id': 77, 'body': '', 'state': 'COMMENTED', 'user': {'login': ME}}
+        self.gh.reviews[78] = {'id': 78, 'body': 'my own aside', 'state': 'COMMENTED', 'user': {'login': ME}}
+        self.gh.inline += [{'id': 990, 'in_reply_to_id': root, 'body': 'Fixed in abc: x', 'user': {'login': ME},
+                            'pull_request_review_id': 77, 'created_at': self.gh.tick()},
+                           {'id': 991, 'in_reply_to_id': root, 'body': 'also see b.c', 'user': {'login': ME},
+                            'pull_request_review_id': 78, 'created_at': self.gh.tick()}]
+        want = {('review', root): True, ('review', 990): True, ('review', 991): False, ('review-body', 78): False}
+        got = self.ours()
+        self.assertEqual(({k: got[k] for k in want}, got[('review-body', rid)]), (want, True))
+        self.gh.reviews[rid]['body'] = ''
+        got = self.ours()
+        self.assertEqual(({k: got[k] for k in want}, ('review-body', rid) in got), (want, False), 'a blanked body keeps what was receipted')
+        next(c for c in self.gh.inline if c['id'] == 990)['user'] = {'login': 'contrib'}
+        self.assertFalse(self.ours()[('review', 990)], 'a receipted id is ours only while we wrote it')
+
+
+class GhReads(unittest.TestCase):
+    """lib/gh_reads.py's as_gh_reads over the exact bytes of hathach/agentrc#461's body: as GitHub serves it (curl)
+    and as gh 2.103.3 printed it."""
+    GITHUB = rb'"- The JSON line escapes ESC as `\\u001b`, so only a relay that decodes the field and copies it is at risk."'
+    GH = rb'"- The JSON line escapes ESC as `\\^[`, so only a relay that decodes the field and copies it is at risk."'
+
+    def test_the_text_gh_returns_for_what_github_stores(self):
+        self.assertEqual(lib_gh_reads.as_gh_reads(json.loads(self.GITHUB)), json.loads(self.GH))
+        self.assertEqual(lib_gh_reads.as_gh_reads(json.loads(self.GH)), json.loads(self.GH), 'read text reads the same again')
+
+    def test_each_control_escape_and_character_as_the_sanitizer_writes_it_and_neighbours_stay_apart(self):
+        for sent, read in (('\\u001b', '\\^['), ('\\u001B', '\\^['), ('\x1b', '^['), ('\\\x1b', '\\^['),
+                           ('\\\\u001b', '\\\\^['), ('\\u001a', '\\^Z'), ('\\u001c', '\\^\\'), ('\x9b\x9c', '^[^\\'),
+                           ('\\U001b', '\\U001b'), ('\\u0009', '\\u0009'), ('\\u007f', '\\u007f'), ('\t\n\r\x0b\x7f', '\t\n\r\x0b\x7f'),
+                           ('plain text', 'plain text')):
+            with self.subTest(sent=sent):
+                self.assertEqual(lib_gh_reads.as_gh_reads(sent), read)
+        self.assertNotEqual(lib_gh_reads.as_gh_reads('\\u001b'), lib_gh_reads.as_gh_reads('\x1b'))
+        self.assertNotEqual(lib_gh_reads.as_gh_reads('`\\u001b`'), lib_gh_reads.as_gh_reads('`\\u001a`'))
+
+    def test_read_text_is_compared_with_ours_mapped_once(self):
+        sent, read = json.loads(self.GITHUB), json.loads(self.GH)
+        self.assertTrue(lib_gh_reads.reads_as_sent(read, sent))
+        self.assertFalse(lib_gh_reads.reads_as_sent(sent, sent), 'the text as sent is not what gh reads')
+        self.assertFalse(lib_gh_reads.reads_as_sent(read, read.replace('^[', '^Z')))
+        self.assertFalse(lib_gh_reads.reads_as_sent(None, ''))
 
 
 class ResolveDue(unittest.TestCase):
@@ -2835,6 +3121,15 @@ class Repair(PostCase):
         note = ' '.join(['word'] * 70)
         self.assertEqual(self.fixed(self.row(note=note))['status'], 'repaired')
         self.assertEqual(self.gh.notes, [(self.root, f'Fixed in {self.fixed_head[:12]}: {note}')])
+
+    def test_a_note_citing_a_json_escape_is_read_back_and_found_again_as_gh_reads_it(self):
+        """#461 for --fixed notes: the read-back, a lost answer's recovery and the edit check all take gh's rewrite."""
+        self.gh.note_fails = 'lost'
+        out = self.fixed(self.row(note='`\\u001b` is escaped now.'))
+        self.assertEqual((out['status'], out['repairs'][0]['state'], out['repairs'][0]['resolve']), ('repaired', 'published', 'resolved'))
+        self.assertEqual(len(self.gh.notes), 1)
+        self.thread()['isResolved'] = False
+        self.assertNotIn('our repair note was edited', json.dumps(self.show()), 'the note still reads as sent')
 
     def test_a_verified_repair_gets_one_note_and_its_resolve_and_no_review(self):
         posts, submits = len(self.gh.posts), len(self.gh.submits)

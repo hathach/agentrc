@@ -474,6 +474,24 @@ test('a ledger answer missing its members, or not of the review prepare pinned, 
   assert.equal((await run(BASE, { ledgerAsIs: { reviews: 0, last: null, open: [], disputes: [] } })).result.status, 'reviewed', 'an empty ledger prints no heldThreads')
 })
 
+test('an incremental review scoped from a base merge\'s synthetic base continues the review of the head prepare pinned as prior (#450)', async () => {
+  const S = 'd'.repeat(40)
+  const inc = { ...BASE, mode: 'incremental', scopeBase: S }
+  const standing = { id: 'pr7-f1', status: 'open', file: 'src/core/a.c', line: 10, severity: 'high', commentId: 901 }
+  const ledger = { reviews: 1, last: { head: OLD }, open: [standing] }
+  const still = { state: 'open', reason: 'still' }
+  const withPrior = (priorHead) => ({ ...pinned(inc), pins: { ...pinned(inc).pins, priorHead } })
+  const good = await run(inc, { check: withPrior(OLD), ledger, recheck: still })
+  assert.equal(good.result.status, 'reviewed')
+  assert.deepEqual([good.result.scopeBase, good.result.mergeBase], [S, MB], 'saved with the new merge base, so the next review compares as today')
+  assert.deepEqual(good.audits.map(a => a.diff), [{ base: S, head: H }])
+  for (const check of [pinned(inc), withPrior(MB)]) {
+    const { result, labels } = await run(inc, { check, ledger, recheck: still })
+    assert.deepEqual([result.status, result.reason], ['blocked', 'ledger-failed'], JSON.stringify(check.pins))
+    assert.ok(!labels.some(l => l.startsWith('recheck:')))
+  }
+})
+
 test('a ledger answer past 64 KiB crosses whole through one emitted file, every text exact, in every mode', async () => {
   const inc = { ...BASE, mode: 'incremental', scopeBase: OLD }
   // As ledger.py's view writes a carried row: without its impact and severityReason.
@@ -575,13 +593,23 @@ test('an invalid or dead grouping is judged again once, told why, before its fin
   assert.deepEqual(both.logs.filter(l => / errored — /.test(l)), ['group errored — group exploded', 'group:retry errored — group exploded'])
 })
 
-test('a grouping that names an item twice, nothing, one member or two files is distrusted whole; a dead one is unjudged', async () => {
+test('a grouping that names an item twice or nothing is distrusted whole; a group of one or across files is dropped alone; a dead one is unjudged', async () => {
   const two = audited(finding('a'), finding('b'), { ...finding('c'), file: 'src/core/b.c' })
   for (const groups of [[{ findings: [0, 1], claims: [] }, { findings: [1, 0], claims: [] }], [{ findings: [0, 5], claims: [] }],
-    [{ findings: [0], claims: [] }], [{ findings: [0, 1], claims: ['9#1'] }], [{ findings: [0, 2], claims: [] }]]) {
-    const { result } = await run(BASE, { audit: two, group: { groups } })
+    [{ findings: [0, 1], claims: ['9#1'] }]]) {
+    const { result, labels } = await run(BASE, { audit: two, group: { groups } })
     assert.equal(result.draft.comments.length, 3, JSON.stringify(groups))
     assert.deepEqual(result.coverage.unjudged, [{ kind: 'group' }])
+    assert.ok(labels.includes('group:retry'), 'a malformed answer is judged again')
+  }
+  const three = audited(finding('a'), finding('b'), { ...finding('c'), file: 'src/core/b.c' }, finding('d', 'high', 30))
+  for (const off of [{ findings: [3], claims: [] }, { findings: [3, 2], claims: [] }]) {
+    const { result, labels, logs } = await run(BASE, { audit: three, group: { groups: [{ findings: [0, 1], claims: [] }, off] } })
+    assert.deepEqual(result.draft.comments.map(c => c.finding), [0, 2, 3], `the pair stays one comment beside ${JSON.stringify(off)}`)
+    assert.deepEqual(result.findings.map(f => f.defect), [0, 0, undefined, undefined])
+    assert.deepEqual(result.coverage.unjudged, [{ kind: 'group' }], 'the group dropped is unjudged')
+    assert.ok(!labels.includes('group:retry'), 'a well-formed answer is not asked again')
+    assert.ok(logs.includes(`1 group(s) dropped, their items left ungrouped: ${JSON.stringify([off])}`))
   }
   const dead = await run(BASE, { audit: two, group: null })
   assert.deepEqual([dead.result.draft.comments.length, dead.result.verdict.event], [3, 'REQUEST_CHANGES'])
@@ -590,6 +618,51 @@ test('a grouping that names an item twice, nothing, one member or two files is d
   assert.deepEqual([odd.labels.includes('group'), odd.result.coverage.unjudged], [true, [{ kind: 'group' }]], 'a file or claim id named like an Object property')
   const alone = await run(BASE, { audit: audited(finding('a'), { ...finding('b'), file: 'src/core/b.c' }) })
   assert.ok(!alone.labels.includes('group'), 'nothing shares a file: no grouping asked')
+})
+
+// hathach/tinyusb#4415 review 5781551105: the grouping judge's answer, verbatim, grouped five of the six duplicate
+// classes; its one group across two files voided the whole answer, so all 29 findings were posted.
+test('one group across files no longer voids the rest: the #4415 duplicates post once each, distinct neighbours apart (#448)', async () => {
+  const RST = 'docs/reference/class/video.rst', DEV = 'src/class/video/video_device.c', HDR = 'src/class/video/video_device.h'
+  const YML = 'test/unit-test/project.yml', TC = 'test/unit-test/test/device/video/test_video_device.c', TH = 'test/unit-test/test/support/video_device_test.h'
+  const at = [[RST, 106, 'medium'], [RST, 107, 'medium'], [RST, 107, 'low'], [RST, 106, 'low'], [RST, 106, 'low'], [RST, 105, 'nit'],
+    [RST, 107, 'low'], [RST, 107, 'low'], [DEV, 132, 'nit'], [DEV, 132, 'nit'], [RST, 106, 'low'], [DEV, 132, 'nit'], [DEV, 1375, 'nit'],
+    [HDR, 58, 'nit'], [HDR, 64, 'low'], [YML, 193, 'nit'], [TC, 257, 'low'], [TC, 275, 'low'], [TC, 276, 'low'], [TC, 295, 'nit'],
+    [TH, 281, 'low'], [TC, 275, 'low'], [TC, 276, 'low'], [TH, 711, 'nit'], [TH, 272, 'nit'], [YML, 201, 'nit'], [TC, 225, 'nit'],
+    [TC, 275, 'low'], [TH, 268, 'nit']]
+  const audit = audited(...at.map(([file, line, severity], i) => ({ ...finding(`finding ${i}`, severity, line), file })))
+  const answer = { groups: [{ findings: [0, 3, 4, 7], claims: [] }, { findings: [1, 6, 10], claims: [] }, { findings: [8, 9, 11], claims: [] },
+    { findings: [17, 21, 27], claims: [] }, { findings: [18, 22], claims: [] }, { findings: [14, 16], claims: [] }] }
+  const { result, labels, calls } = await run(BASE, { audit, group: answer })
+  assert.ok(!labels.includes('group:retry'))
+  const posted = result.draft.comments.map(c => c.finding)
+  // Resync advice (rst:105-107), streaming() false while the driver owns the frame, the mutex comment, the hanging test,
+  // the missed halt and COMMIT paths: each the strongest member's one comment.
+  for (const [lead, ...rest] of [[0, 3, 4, 7], [1, 6, 10], [8, 9, 11], [17, 21, 27], [18, 22]]) {
+    assert.deepEqual([lead, ...rest].filter(i => posted.includes(i)), [lead], `one comment for ${lead}'s defect`)
+    assert.equal(result.findings[lead].lead, true)
+    assert.ok(rest.every(i => result.findings[i].muted && result.findings[i].defect === result.findings[lead].defect))
+  }
+  const brief = JSON.parse(/Findings: (\[.*\])$/s.exec(calls.find(c => c.label === 'write').prompt)[1])
+  assert.deepEqual(brief.filter(b => ['finding 0', 'finding 1'].includes(b.why)).map(b => [b.severity, b.evidence]),
+    [['medium', 'holds: finding 0'], ['medium', 'holds: finding 1']], 'each lead keeps its grade and verification')
+  // The header-and-test pair spans two files, which no group may: both stay, as do the neighbours that are other defects.
+  for (const i of [14, 16, 2, 5, 13, 19, 20, 12, 15, 23, 24, 25, 26, 28]) assert.ok(posted.includes(i), `finding ${i} posted`)
+  assert.equal(posted.length, 19)
+  assert.deepEqual(result.coverage.unjudged, [{ kind: 'group' }])
+  assert.ok(result.verdict.reasons.includes('8 open finding(s) above nit'), JSON.stringify(result.verdict.reasons))
+})
+
+test('a claim on a comment our ledger receipted is never judged as another reviewer\'s, whatever its review body reads (#433)', async () => {
+  const claims = { claims: [{ commentId: 901, threadId: 'T1', author: 'reviewer', bot: false, path: 'src/core/a.c', line: 10, url: 'https://x/c901', claim: 'overrun' },
+    { commentId: 55, threadId: 'T2', author: 'coderabbitai[bot]', bot: true, path: 'src/core/a.c', line: 12, url: 'https://x/c55', claim: 'leak' }] }
+  const { result, labels, logs } = await run(BASE, { ledger: { reviews: 1, last: { head: OLD }, open: [], ownComments: [901] }, claims, judge: () => confirmedAs('low') })
+  assert.deepEqual(result.claims.map(c => c.commentId), [55])
+  assert.deepEqual(labels.filter(l => l.startsWith('judge:')), ['judge:0'])
+  assert.ok(!result.draft.body.includes('c901') && result.draft.body.includes('c55'))
+  assert.ok(logs.some(l => l === '1 claim(s) dropped: our own comments'))
+  const without = await run(BASE, { ledger: { reviews: 1, last: { head: OLD }, open: [] }, claims, judge: () => confirmedAs('low') })
+  assert.deepEqual(without.result.claims.map(c => c.commentId), [901, 55], 'a view without the member drops nothing')
 })
 
 test('a claims-only group needs a path, and a claim that covered a finding counts with it only while it is confirmed again', async () => {

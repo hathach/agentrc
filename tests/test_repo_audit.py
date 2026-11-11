@@ -10,13 +10,14 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 import unittest
 from pathlib import Path, PurePosixPath
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import git_env, guard_survivors, tmpdir  # noqa: E402
+from helpers import git_env, guard_survivors, proc_stat, tmpdir  # noqa: E402
 
 SCRIPTS = Path(__file__).resolve().parents[1] / 'skills' / 'repo-audit' / 'scripts'
 
@@ -995,15 +996,15 @@ class Finish(unittest.TestCase):
         self.assertNotIn('moved from base branch', err)
 
     def test_github_reads_never_prompt_and_give_up(self):
-        real, seen = subprocess.run, []
+        real, seen = audit.bounded, []
 
-        def spy(argv, **kw):
+        def spy(argv, out, err, env, timeout, idle=None):
             if 'ls-remote' in argv:
-                seen.append((kw['env'].get('GIT_TERMINAL_PROMPT'), kw['timeout']))
+                seen.append((env.get('GIT_TERMINAL_PROMPT'), timeout))
                 if len(seen) > 1:
-                    raise subprocess.TimeoutExpired(argv, kw['timeout'])
-            return real(argv, **kw)
-        with mock.patch.object(audit.subprocess, 'run', spy):
+                    raise subprocess.TimeoutExpired(argv, timeout)
+            return real(argv, out, err, env, timeout, idle)
+        with mock.patch.object(audit, 'bounded', spy):
             self.assertEqual(self.finish(review(self.base, self.head))[0], 0)
             (self.repo.path / audit.RECORD).unlink()
             (self.repo.path / 'stray.txt').write_text('x')
@@ -1415,16 +1416,32 @@ class Usage(unittest.TestCase):
                     f'env --chdir=/ python3 {rel} send', f'sudo -D / python3 {rel} send',
                     f'sudo -ED/ python3 {rel} send', f'sudo --chdir=/ python3 {rel} send',
                     f'sudo -R /mnt python3 {s} send', f'sudo --chroot /mnt python3 {s} send',
-                    f'sudo -h host python3 {s} send', f'sudo --host=host python3 {s} send']
+                    f'sudo -h host python3 {s} send', f'sudo --host=host python3 {s} send',
+                    # GNU getopt_long's abbreviations, and an ambiguous one it refuses
+                    f'env --chd=/ python3 {rel} send', f'env --c / python3 {rel} send',
+                    f"env --spl={split} {s} send", f'sudo --chd / python3 {rel} send',
+                    f'sudo --chr=/mnt python3 {s} send', f'sudo --ho=host python3 {s} send',
+                    f'sudo --ch / python3 {rel} send', f'env --nosuch python3 {s} send',
+                    # a login shell starts in the target's home; a shell with a relative path; GNU time's operand
+                    f'sudo -i python3 {rel} send', f'sudo -Ei python3 {s} send', f'sudo --login python3 {rel} send',
+                    f'sudo --log python3 {rel} send', f'sudo -s python3 {rel} send', f'sudo --sh ./{rel} send',
+                    f'time -f %e python3 {s} send', f'time -o {s} python3 -c 1', f'sudo time --output=x {s} send']
         records = [r for i, c in enumerate(commands) for r in (use(f'x{i}', 'Bash', {'command': c}, cwd=repo),
                                                                result(f'x{i}'))]
         claude(self.root / 'p' / 's1.jsonl', records + [
             use('a', 'Bash', {'command': f'sudo -Eu root env -u X python3 {rel} send'}, cwd=repo), result('a'),
+            # abbreviations that change nothing, -s with an absolute path, the keyword's -p, a lookup
+            use('b', 'Bash', {'command': f'sudo --us root env --un=X timeout --sig KILL 5 {s} send'}), result('b'),
+            use('c', 'Bash', {'command': f'sudo -s python3 {s} send'}), result('c'),
+            use('d', 'Bash', {'command': f'time -p python3 {s} send'}), result('d'),
+            use('e', 'Bash', {'command': f'command -v {s}'}), result('e'),
+            use('f', 'Bash', {'command': f'command -pv python3 {s}'}), result('f'),
+            use('g', 'Bash', {'command': f'sudo -- python3 {s} send'}), result('g'),
         ])
         self.usage()
         agg = json.loads(self.out.read_text())
         t = agg['scripts']['skills/tool/scripts/tool.py']
-        self.assertEqual((t['invoke'], t['ok'], t['subcommands']), (1, 1, {'send': 1}))
+        self.assertEqual((t['invoke'], t['ok'], t['subcommands']), (5, 5, {'send': 5}))
         self.assertEqual(agg['unknown'], {'unparsed_prefix': len(commands)})
 
     def test_installed_links_attribute_and_foreign_paths_do_not(self):
@@ -1553,6 +1570,42 @@ class Usage(unittest.TestCase):
         self.assertEqual((agg['skills'], agg['agents'], agg['workflows']),
                          ({'build': 1, 'other': 1}, {'runner': 1, 'other': 1}, {'ship': 2, 'other': 3}))
 
+    def test_an_absorbed_submodule_s_checkout_is_its_main_worktree(self):
+        head = self.repo.commit({'.claude/skills/build/SKILL.md': 'x\n', '.claude/agents/runner.md': 'x\n',
+                                 '.claude/workflows/ship.js': 'x\n'})
+        outer = Repo(self)
+        outer.git('-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', self.repo.path.as_posix(), 'dep')
+        dep = outer.path / 'dep'           # git lists its main worktree as outer/.git/modules/dep
+        task = tmpdir(self) / 'audit-x'
+        subprocess.run(['git', '-C', str(dep), 'worktree', 'add', '-q', '--detach', str(task), head], check=True,
+                       capture_output=True, env=git_env())
+        self.run_dir = tmpdir(self) / 'run2'
+        start(task, self.run_dir, '--base', head, head=head)
+        cwd = dep.as_posix()
+        claude(self.root / 'p' / 's1.jsonl', [
+            use('s', 'Skill', {'skill': 'build'}, cwd=cwd), use('a', 'Agent', {'subagent_type': 'runner'}, cwd=cwd),
+            use('w', 'Workflow', {'name': 'ship'}, cwd=cwd),
+            use('b', 'Bash', {'command': 'python3 skills/tool/scripts/tool.py send'}, cwd=cwd)])
+        self.usage()
+        agg = json.loads(self.out.read_text())
+        self.assertEqual((agg['skills'], agg['agents'], agg['workflows']),
+                         ({'build': 1}, {'runner': 1}, {'ship': 1}))
+        self.assertEqual(agg['scripts']['skills/tool/scripts/tool.py']['cwd'], {'repo': 1})
+
+    def test_a_vanished_workflow_script_goes_by_the_session_only_where_it_may_have_been_the_repository_s(self):
+        head = self.repo.commit({'.claude/workflows/ship.js': 'x\n'})
+        self.run_dir = tmpdir(self) / 'run2'
+        start(self.repo.path, self.run_dir, '--base', head, head=head)
+        here, gone = self.repo.path.as_posix(), tmpdir(self).as_posix()
+        name = self.repo.path.name
+        claude(self.root / 'p' / 's1.jsonl', [
+            use('a', 'Workflow', {'scriptPath': f'{gone}/scratch-gone/ship.js'}, cwd=here),     # another stem's
+            use('b', 'Workflow', {'scriptPath': f'{here}/scratch/ship.js'}, cwd=here),         # in the worktree
+            use('c', 'Workflow', {'scriptPath': f'{gone}/{name}-fix/tmp/ship.js'}, cwd=here),  # a removed one
+            use('d', 'Workflow', {'scriptPath': f'{gone}/x/.claude/workflows/ship.js'}, cwd=here)])  # its file
+        self.usage()
+        self.assertEqual(json.loads(self.out.read_text())['workflows'], {'ship': 3, 'other': 1})
+
     def test_only_agent_launches_leave_out_built_in_names(self):
         head = self.repo.commit({'skills/fork/SKILL.md': 'x\n', 'workflows/web-fetch.js': 'x\n'})
         self.run_dir = tmpdir(self) / 'run2'
@@ -1625,36 +1678,68 @@ class Usage(unittest.TestCase):
             self.assertIn('partly unreadable', out)
 
 
+HELPER = ('import subprocess, sys, time; '
+          'h = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], stdout=sys.stdout, '
+          'stderr=sys.stderr); open({pid!r}, "w").write(str(h.pid)); print("out", flush=True); time.sleep(60)')
+
+
+def ended(pid, wait=10):
+    """Whether pid has exited within wait seconds; a zombie left to the survivor guard's subreaper has."""
+    deadline = time.monotonic() + wait
+    while (st := proc_stat(pid)) and st[1] != 'Z' and time.monotonic() < deadline:
+        time.sleep(0.05)
+    return not st or st[1] == 'Z'
+
+
 class GitHubRead(unittest.TestCase):
     def test_gh_never_prompts_and_gives_up(self):
-        with mock.patch.object(audit.subprocess, 'run', side_effect=subprocess.TimeoutExpired('gh', 1)) as spy, \
+        with mock.patch.object(audit, 'bounded', side_effect=subprocess.TimeoutExpired('gh', 1)) as spy, \
                 self.assertRaisesRegex(audit.Refused, f'gh api x: not finished in {audit.TIMEOUT} s'):
             audit.gh(['api', 'x'])
-        self.assertEqual((spy.call_args.kwargs['env']['GH_PROMPT_DISABLED'], spy.call_args.kwargs['timeout']),
-                         ('1', audit.TIMEOUT))
+        self.assertEqual((spy.call_args.args[3]['GH_PROMPT_DISABLED'], spy.call_args.args[4]), ('1', audit.TIMEOUT))
 
-    def test_git_reads_have_no_askpass_or_terminal_and_a_fetch_runs_while_it_receives(self):
+    def test_git_reads_have_no_askpass_and_a_fetch_runs_while_it_reports_progress(self):
         calls = []
 
-        def spy(argv, **kw):
-            calls.append((argv, kw))
-            return subprocess.CompletedProcess(argv, 0)
-        with mock.patch.object(audit.subprocess, 'run', spy):
+        def spy(argv, out, err, env, timeout, idle=None):
+            calls.append((argv, env, timeout, idle))
+            return 0
+        with mock.patch.object(audit, 'bounded', spy):
             audit.git('r', 'ls-remote', 'u', network=True)
             audit.fetch('r', 'o/r', 'refs/pull/7/head')
-        self.assertEqual([kw['timeout'] for _, kw in calls], [audit.TIMEOUT, audit.FETCH_TIMEOUT])
-        for argv, kw in calls:
+        self.assertEqual([c[2:] for c in calls], [(audit.TIMEOUT, None), (audit.FETCH_TIMEOUT, audit.TIMEOUT)])
+        self.assertIn('--progress', calls[1][0])
+        for argv, env, _, _ in calls:
             self.assertEqual(argv[3:7], ['-c', 'http.lowSpeedLimit=1', '-c', f'http.lowSpeedTime={audit.TIMEOUT}'])
-            self.assertEqual((kw['env']['GIT_ASKPASS'], kw['env']['SSH_ASKPASS_REQUIRE'], kw['stdin'],
-                              kw['start_new_session']), ('', 'never', subprocess.DEVNULL, True))
+            # an empty SSH_ASKPASS also stops an OpenSSH before 8.4, which ignores SSH_ASKPASS_REQUIRE
+            self.assertEqual((env['GIT_ASKPASS'], env['SSH_ASKPASS'], env['SSH_ASKPASS_REQUIRE']), ('', '', 'never'))
+
+    def test_a_read_runs_on_while_it_writes_and_is_refused_once_it_stops(self):
+        talk = 'import sys, time\nfor _ in range(9):\n    print(".", file=sys.stderr, flush=True); time.sleep(0.4)'
+        self.assertEqual(audit.github_read([sys.executable, '-c', talk], 'talk', 60, idle=3).returncode, 0)
+        stall = 'import sys, time; print(".", file=sys.stderr, flush=True); time.sleep(60)'
+        began = time.monotonic()
+        with self.assertRaisesRegex(audit.Refused, 'stall: nothing received for 2 s'):
+            audit.github_read([sys.executable, '-c', stall], 'stall', 60, idle=2)
+        self.assertLess(time.monotonic() - began, 30)
+        with self.assertRaisesRegex(audit.Refused, 'talk: not finished in 2 s'):
+            audit.github_read([sys.executable, '-c', talk], 'talk', 2, idle=3)
+
+    @unittest.skipIf(os.name == 'nt', 'not run on native Windows')
+    def test_a_fetch_over_a_silent_ssh_is_refused_after_timeout_not_fetch_timeout(self):
+        repo = Repo(self)
+        ssh = tmpdir(self) / 'ssh.py'
+        ssh.write_text('import time; time.sleep(60)\n')
+        env = git_env(GIT_SSH_COMMAND=f'"{sys.executable}" "{ssh}"', GIT_CONFIG_COUNT='1',
+                      GIT_CONFIG_KEY_0='url.ssh://git@example.invalid/.insteadOf', GIT_CONFIG_VALUE_0=audit.GITHUB)
+        began = time.monotonic()
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(audit, 'TIMEOUT', 2), \
+                self.assertRaisesRegex(audit.Refused, 'git fetch .*: nothing received for 2 s'):
+            audit.fetch(repo.path, 'o/r', 'refs/heads/main')
+        self.assertLess(time.monotonic() - began, 30)
 
     def test_a_timed_out_read_does_not_wait_for_a_helper_still_holding_its_output(self):
         pid = tmpdir(self) / 'helper.pid'
-        # git-remote-https's way: a child inheriting the output, alive after its parent is killed
-        code = ('import subprocess, sys, time; '
-                'h = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], stdout=sys.stdout, '
-                f'stderr=sys.stderr); open({str(pid)!r}, "w").write(str(h.pid)); print("out", flush=True); '
-                'time.sleep(60)')
 
         def stop():
             with contextlib.suppress(OSError, ValueError):
@@ -1662,9 +1747,100 @@ class GitHubRead(unittest.TestCase):
         self.addCleanup(stop)
         began = time.monotonic()
         with self.assertRaisesRegex(audit.Refused, 'helper: not finished in 3 s'):
-            audit.github_read([sys.executable, '-c', code], 'helper', 3)
+            audit.github_read([sys.executable, '-c', HELPER.format(pid=str(pid))], 'helper', 3)
         self.assertLess(time.monotonic() - began, 30)
         self.assertTrue(pid.exists(), 'the helper started before the timeout')
+        if os.path.isdir('/proc/self'):         # /proc to see the helper end
+            self.assertTrue(ended(int(pid.read_text())), 'the helper ended with the read')
+
+    def test_a_refused_read_on_windows_ends_its_tree_and_waits_no_longer_than_the_kill(self):
+        killed = []
+
+        def kill_tree(proc, timeout):
+            killed.append((proc, timeout))
+            self.addCleanup(proc.wait)
+            self.addCleanup(proc.kill)
+            return None                         # as when taskkill and proc.kill left it running
+        with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err, \
+                mock.patch.object(audit.os, 'name', 'nt'), mock.patch.object(audit.windows, 'kill_tree', kill_tree):
+            began = time.monotonic()
+            with self.assertRaises(subprocess.TimeoutExpired):
+                audit.bounded([sys.executable, '-c', 'import time; time.sleep(60)'], out, err, dict(os.environ), 2)
+        self.assertLess(time.monotonic() - began, 30)
+        self.assertEqual([t for _, t in killed], [10])
+        self.assertIsNone(killed[0][0].poll(), 'bounded did not wait on past kill_tree')
+
+    @unittest.skipUnless(os.path.isdir('/proc/self'), 'a process group, and /proc to see the helper end')
+    def test_an_interrupted_read_ends_its_helpers(self):
+        pid = tmpdir(self) / 'helper.pid'
+        driver = textwrap.dedent(f'''\
+            import importlib.util, sys
+            spec = importlib.util.spec_from_file_location('audit', {str(SCRIPTS / 'audit.py')!r})
+            audit = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(audit)
+            try:
+                audit.github_read([sys.executable, '-c', {HELPER.format(pid=str(pid))!r}], 'helper', 60)
+            except KeyboardInterrupt:
+                print('interrupted')
+            ''')
+        caller = subprocess.Popen([sys.executable, '-c', driver], stdout=subprocess.PIPE, text=True,
+                                  start_new_session=True)
+        self.addCleanup(caller.wait)
+        self.addCleanup(caller.kill)
+        deadline = time.monotonic() + 30
+        while not (pid.exists() and pid.read_text()) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        os.killpg(caller.pid, signal.SIGINT)     # Ctrl-C reaches the caller's process group, not the read's session
+        self.assertEqual(caller.communicate(timeout=30)[0].strip(), 'interrupted')
+        self.assertTrue(ended(int(pid.read_text())), 'the helper ended with the read')
+
+    @unittest.skipUnless(os.path.isdir('/proc/self'), 'a process group, and /proc to see the read end')
+    def test_an_interrupt_right_after_the_spawn_ends_the_read(self):
+        spawned = []
+        real = subprocess.Popen
+
+        def popen(*a, **k):
+            spawned.append(real(*a, **k))
+            return spawned[-1]
+        d = tmpdir(self)
+        with open(d / 'out', 'w+') as out, open(d / 'err', 'w+') as err, \
+                mock.patch.object(audit.subprocess, 'Popen', popen), \
+                mock.patch.object(audit.time, 'monotonic', side_effect=KeyboardInterrupt), \
+                self.assertRaises(KeyboardInterrupt):
+            audit.bounded([sys.executable, '-c', 'import time; time.sleep(60)'], out, err, None, 60)
+        self.assertIsNotNone(spawned[0].poll(), 'the read ended with the interrupt')
+
+    def test_a_read_without_output_files_or_a_message_says_why(self):
+        with mock.patch.object(audit.tempfile, 'TemporaryFile', side_effect=OSError(28, 'No space left on device')), \
+                self.assertRaisesRegex(audit.Refused, 'gh api x: no output file under .*: No space left on device'):
+            audit.gh(['api', 'x'])
+        silent = subprocess.CompletedProcess([], 128, '', '')
+        with mock.patch.object(audit, 'github_read', return_value=silent), \
+                self.assertRaisesRegex(audit.Refused, r'git ls-remote u: exit 128 with no message \(its output files '
+                                                      r'are under .*: is that full\?\)'):
+            audit.git('r', 'ls-remote', 'u', network=True)
+        with mock.patch.object(audit, 'gh', return_value=(1, '', '')), \
+                self.assertRaisesRegex(audit.HttpError, 'gh api x: exit 1 with no message'):
+            audit.api('x')
+
+    def test_a_fetch_refusal_names_the_credential_helper_and_drops_its_progress(self):
+        err = ('remote: Enumerating objects: 5, done.\nremote: Counting objects:  20% (1/5)\r'
+               'Receiving objects: 100% (5/5), done.\n'
+               "fatal: could not read Username for 'https://github.com': terminal prompts disabled\n")
+        with mock.patch.object(audit, 'github_read', return_value=subprocess.CompletedProcess([], 128, '', err)), \
+                self.assertRaises(audit.Refused) as refused:
+            audit.fetch('r', 'o/r', 'refs/pull/7/head')
+        self.assertEqual(str(refused.exception).split(': ', 1)[1],
+                         "fatal: could not read Username for 'https://github.com': terminal prompts disabled (git "
+                         "takes credentials from a credential helper only, never an askpass: gh auth setup-git sets "
+                         "one)")
+
+    def test_a_branch_tip_refusal_names_the_credential_helper(self):
+        err = "fatal: could not read Username for 'https://github.com': terminal prompts disabled\n"
+        with mock.patch.object(audit, 'github_read', return_value=subprocess.CompletedProcess([], 128, '', err)), \
+                self.assertRaisesRegex(audit.Refused, r'^o/r refs/heads/main cannot be read: fatal: .*terminal '
+                                                      r'prompts disabled \(.*gh auth setup-git sets one\)$'):
+            audit.branch_tip('r', 'o/r', 'main')
 
 
 class ShellAbs(unittest.TestCase):

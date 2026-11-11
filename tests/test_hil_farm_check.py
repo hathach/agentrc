@@ -25,7 +25,7 @@ import types
 from pathlib import Path
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import guard_survivors, latest_failure  # noqa: E402
+from helpers import guard_survivors, latest_failure, tmpdir, umask  # noqa: E402
 
 SCRIPTS = Path(__file__).resolve().parents[1] / 'skills' / 'hil' / 'scripts'
 
@@ -554,6 +554,42 @@ class Document(unittest.TestCase):
         self.assertIn('⛔ blocked', lines[4])
         self.assertIn('➖ unsupported', lines[5])
         self.assertTrue(lines[-1].startswith('farm check: 0 ok · 0 failed · 1 unsupported · 1 locked · 1 blocked'))
+
+
+class StateDir(unittest.TestCase):
+    """_state_dir: the receipts' dir, private, in a parent nobody else can write."""
+
+    def setUp(self):
+        self.d = tmpdir(self)
+
+    def mode(self, path):
+        return os.stat(path).st_mode & 0o777
+
+    def test_missing_ancestors_are_made_0755_under_umask_002(self):
+        self.enterContext(umask(0o002))
+        path = self.d / 'xdg' / 'state' / 'hil-farm-check'
+        self.assertEqual(eng._state_dir(str(path)), str(path))
+        self.assertEqual([self.mode(p) for p in (path.parent.parent, path.parent, path)], [0o755, 0o755, 0o700])
+
+    def test_an_existing_parent_is_left_as_it_is(self):
+        self.enterContext(umask(0o002))
+        (self.d / 'state').mkdir(0o700)
+        path = self.d / 'state' / 'hil-farm-check'
+        self.assertEqual(eng._state_dir(str(path)), str(path))
+        self.assertEqual((self.mode(path.parent), self.mode(path)), (0o700, 0o700))
+
+    def test_unsafe_existing_dirs_are_refused(self):
+        parent = self.d / 'state'
+        parent.mkdir()
+        os.chmod(parent, 0o775)
+        with self.assertRaisesRegex(eng.Refused, 'through its parent'):
+            eng._state_dir(str(parent / 'hil-farm-check'))
+        self.assertEqual(self.mode(parent), 0o775)
+        os.chmod(parent, 0o755)
+        (parent / 'open').mkdir()
+        os.chmod(parent / 'open', 0o770)
+        with self.assertRaisesRegex(eng.Refused, 'nobody else can write'):
+            eng._state_dir(str(parent / 'open'))
 
 
 class Main(unittest.TestCase):

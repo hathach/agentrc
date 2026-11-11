@@ -41,17 +41,7 @@ class Checkout(unittest.TestCase):
     """The fake library as a clean git checkout with its roster and one clean build record at HEAD."""
 
     def setUp(self):
-        tmp = tmpdir(self)
-        self.root = fake.library(tmp / 'lib')
-        fake.roster(self.root / ROSTER)
-        (self.root / '.gitignore').write_text('/build/\n/.hil-remote/\n')
-        git(self.root, 'init', '-q')
-        git(self.root, 'add', '-A')
-        git(self.root, 'commit', '-qm', 'init')
-        self.head = git(self.root, 'rev-parse', 'HEAD')
-        self.agentrc = fake.agentrc(tmp / 'agentrc')
-        self.BP = fake.build_profile(self.root, self.agentrc)
-        self.HP = fake.hil_profile(self.BP)
+        vars(self).update(vars(fake.clean_checkout(tmpdir(self), git, '/build/\n/.hil-remote/\n')))
         stack = contextlib.ExitStack()
         self.addCleanup(stack.close)
         for target, name, value in ((R, 'P', self.HP), (R.H, 'P', self.HP), (R.B, 'P', self.BP)):
@@ -81,17 +71,7 @@ class Checkout(unittest.TestCase):
         return self.rig_exit.get(argv[3], 0)
 
     def record(self, board=BOARD, **over):
-        elf = self.root / f'build/hil/{board}/echo/echo.ino.elf'
-        elf.parent.mkdir(parents=True, exist_ok=True)
-        elf.write_bytes(b'elf')
-        rec = {'kind': 'arduino-hil-build', 'version': 2, 'library': fake.NAME, 'board': board, 'experimental': False,
-               'source': {'head': self.head}, **R.B.contract_identity(),
-               'sketches': {'echo': {'sha256': {elf.relative_to(self.root).as_posix(): hashlib.sha256(b'elf')
-                                                .hexdigest()}}}}
-        rec.update(over)
-        path = self.root / f'build/hil/{BOARD}.build.json'
-        path.write_text(json.dumps(rec))
-        return path
+        return fake.hil_record(self.root, self.head, R.B.contract_identity(), board, at=BOARD, **over)
 
     def main(self, *argv):
         with contextlib.redirect_stdout(io.StringIO()) as out:
@@ -169,6 +149,22 @@ class Run(Checkout):
         (self.agentrc['root'] / fake.SELF).write_text('# a newer engine\n')
         with self.assertRaisesRegex(SystemExit, 'built with other agentrc files'):
             R.record_files(path, self.head, BOARD)
+
+    def test_named_builds_of_one_source_stage_and_pin_each_image(self):
+        path = self.record()
+        rec = json.loads(path.read_text())
+        named = self.root / f'build/hil/{BOARD}/echo_b/echo.ino.elf'
+        named.parent.mkdir(parents=True)
+        named.write_bytes(b'elf b')
+        rel = named.relative_to(self.root).as_posix()
+        rec['sketches']['echo_b'] = {'source': 'examples/Basic/echo',
+                                     'sha256': {rel: hashlib.sha256(b'elf b').hexdigest()}}
+        path.write_text(json.dumps(rec))
+        self.assertEqual(R.record_files(path, self.head, BOARD)[1][-1], rel)
+        R.snapshot_records(self.root / 'stage', [R.record_files(path, self.head, BOARD)])
+        named.write_bytes(b'elf c')
+        with self.assertRaisesRegex(SystemExit, 'echo_b/echo.ino.elf changed since the build record'):
+            R.snapshot_records(self.root / 'stage2', [R.record_files(path, self.head, BOARD)])
 
     def test_a_base_images_files_are_staged_and_pinned_with_the_record(self):
         base = self.root / 'base.hex'
@@ -349,6 +345,26 @@ class Session(Checkout):
         self.open()
         rc, closed = self.main('session', 'close', 's1')
         self.assertEqual((rc, closed['closed']), (R.H.RELEASE_FAILED, False))
+
+    def test_a_closed_session_closes_again_from_its_record_without_the_rig(self):
+        """agentrc#406: the rig would answer NOT_HELD about a hold the session took, restored and released."""
+        for opened, key, first in ((True, 'restore', 0), (True, 'restore', R.H.RESTORE_FAILED),
+                                   (False, 'release', R.H.NOT_HELD), (False, 'release', 0)):
+            with self.subTest(held=opened, first=first):
+                self.rig_exit = {} if opened else {'lock': 1}
+                self.main('session', 'open', '--run-id', 's1', '-b', BOARD)
+                self.rig_exit[key] = 255            # an incomplete first close stays retryable
+                self.assertEqual(self.main('session', 'close', 's1')[1]['closed'], False)
+                self.rig_exit[key] = first
+                rc, closed = self.main('session', 'close', 's1')
+                self.assertEqual(closed['closed'], True)
+                calls = len(self.calls)
+                rc, again = self.main('session', 'close', 's1')
+                self.assertEqual(len(self.calls), calls)
+                exits = {'restoreExit': first if opened else None, 'releaseExit': None if opened else first}
+                self.assertEqual((rc, again['closed'], again['restoreExit'], again['releaseExit']),
+                                 (0, True, exits['restoreExit'], exits['releaseExit']))
+                self.assertIn('nothing was sent to the rig', again['note'])
 
     def test_exec_adds_the_session_options_and_keeps_argv_after_the_roster(self):
         out = self.open()

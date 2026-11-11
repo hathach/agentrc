@@ -8,7 +8,7 @@ export const meta = {
 const AGENTRC = '"${AGENTRC_DIR:-$HOME/.claude}"'  // shell text, quoted so a path with spaces stays one word: the agentrc checkout a project install names in AGENTRC_DIR, else the user install
 // args: { pr, repo: 'owner/name', head, mergeBase, scopeBase (full SHAs: prepare.py's
 //          pins; scopeBase is mergeBase on a full review, the last reviewed head on an
-//          incremental one, or on a recheck after a base merge prepare's synthetic base), mode: 'full' | 'incremental' | 'discussion' (the last for prepare.py's
+//          incremental one, or after a base merge prepare's synthetic base), mode: 'full' | 'incremental' | 'discussion' (the last for prepare.py's
 //          `same`: the head was reviewed and only pushback on our threads is judged), groups: string[] (prepare.py's),
 //          factsDir (prepare.py's facts file's directory, where threads.py writes),
 //          hil: { choice: 'none' } | { choice: 'boards', boards: [{ board, verdict: 'pass' | 'fail' | 'not-run',
@@ -170,17 +170,21 @@ if (prior.repo !== repo || prior.pr !== pr || prior.head !== head) {
   return blocked('ledger-failed', `the ledger view is for ${prior.repo}#${prior.pr} at ${prior.head}, not ${repo}#${pr} at ${head}`)
 }
 // A copy missing members must not read as nothing standing: an incremental or discussion run continues the review prepare pinned.
+// After a base merge an incremental scope starts at prepare's synthetic base, not at the last reviewed head it pinned.
+const lastHead = (check.pins || {}).priorHead ?? scopeBase
 // A row without its published text or repair record would restate the draft, or never raise a failed repair again;
 // heldThreads is printed whenever a review is on the ledger.
 const rowOk = (f) => f && typeof f.id === 'string' && (f.published === null || typeof f.published === 'string') &&
   (f.repair === null || (f.repair && SHA.test(f.repair.head) && typeof f.repair.state === 'string' && typeof f.repair.resolved === 'boolean'))
 if (!Number.isInteger(prior.reviews) || prior.reviews < 0 || !Array.isArray(prior.open) || !Array.isArray(prior.disputes) || !prior.open.every(rowOk) ||
   (prior.reviews > 0 && !Array.isArray(prior.heldThreads)) ||
-  ((args.mode !== 'full' || recheckFrom) && (prior.reviews < 1 || (prior.last || {}).head !== (discussion ? head : recheckFrom || scopeBase)))) {
+  ((args.mode !== 'full' || recheckFrom) && (prior.reviews < 1 || (prior.last || {}).head !== (discussion ? head : recheckFrom || lastHead)))) {
   const shape = Object.fromEntries(Object.entries(prior).map(([k, v]) => [k, Array.isArray(v) ? `${v.length} rows` : v]))
   return blocked('ledger-failed', `ledger answered ${JSON.stringify(shape)}`)
 }
 const disputeOf = Object.fromEntries(prior.disputes.map(d => [d.findingId, d]))
+// A comment our ledger receipted is never another reviewer's claim, whatever its review body reads now.
+const ownComments = new Set(Array.isArray(prior.ownComments) ? prior.ownComments : [])
 // A discussion run judges only the findings someone answered; any other run rechecks every standing one.
 const carried = prior.open.filter(f => !discussion || disputeOf[f.id])
 if (discussion && !carried.length) return { status: 'nothing-new', reason: 'no unanswered reply on our threads', pr, head }
@@ -235,7 +239,12 @@ const [audit, rechecked, claims] = await parallel([
     `${IN}Read ${threadsFile} (every comment on PR #${pr}). List the review claims still open that are not ours: each point raised in an unresolved, not outdated thread, and each finding in a bot's review body or summary comment (split multi-point comments; split a bot's comments into findings as the bot rules in ${AGENTRC}/agents/pr-review-validator.md do (expand that path in the shell before reading it; Read does not), a CodeRabbit nitpick or a Greptile summary item included). ` +
     'Skip comments with ours=true, replies that only acknowledge, questions with no claim about the code, and threads marked resolved. One record per claim, its claim in one sentence, with the url the file gives its comment. ' + DATA,
     { label: 'claims', phase: 'Review', model: 'sonnet', effort: 'medium', schema: CLAIMS },
-  )).then(cs => cs && parallel(withClaimIds(cs.claims).map((c, i) => () => judge(c, i))).then(judged => ({ claims: cs.claims, judged }))),
+  )).then(cs => {
+    if (!cs) return cs
+    const theirs = cs.claims.filter(c => !ownComments.has(c.commentId))
+    if (theirs.length < cs.claims.length) log(`${cs.claims.length - theirs.length} claim(s) dropped: our own comments`)
+    return parallel(withClaimIds(theirs).map((c, i) => () => judge(c, i))).then(judged => ({ claims: theirs, judged }))
+  }),
 ])
 if (!audit) return blocked('audit-failed', 'code-audit returned nothing')
 if (!claims) return blocked('claims-failed', 'the claims reader died')
@@ -312,26 +321,28 @@ const groupPrompt = (
   'An item belongs to a group only if its whole substance is that defect: a finding or claim that also raises another problem stays out. Items about different variants belong together only when the path and the fix are the same.\n' +
   `Findings: ${JSON.stringify(pool.map((f, i) => ({ finding: i, file: f.file, line: f.line, dimension: f.dimension, why: whyOf(f) })).filter(f => asked.has(f.file)))}\n` +
   `Claims: ${JSON.stringify(confirmedClaims.filter(c => asked.has(c.path)).map(c => ({ claim: c.claimId, path: c.path, line: c.line, text: c.claim })))}`)
-// An item named twice, an index or id that names nothing, a group of one, one across files or on a file not asked
-// about is a grouping to distrust whole.
+// An item named twice, or an index or id that names nothing, is a grouping to distrust whole. A group of one, one across
+// files or on a file not asked about is dropped alone: its items stay ungrouped, the answer's other groups stand (#448).
 const oneFile = (g) => { const at = new Set([...g.findings.map(i => pool[i].file), ...g.claims.map(id => claimOf[id].path)]); return at.size === 1 && asked.has([...at][0]) }
-const groupingOk = (x) => {
+const wellFormed = (x) => {
   if (!x || !Array.isArray(x.groups) || !x.groups.every(g => g && Array.isArray(g.findings) && Array.isArray(g.claims))) return false
   const members = x.groups.flatMap(g => [...g.findings.map(i => `f${i}`), ...g.claims.map(id => `c${id}`)])
   return new Set(members).size === members.length &&
-    x.groups.every(g => g.findings.length + g.claims.length > 1 && g.findings.every(i => Number.isInteger(i) && pool[i]) &&
-      g.claims.every(id => Object.hasOwn(claimOf, id)) && oneFile(g))
+    x.groups.every(g => g.findings.every(i => Number.isInteger(i) && pool[i]) && g.claims.every(id => Object.hasOwn(claimOf, id)))
 }
+const groupOk = (g) => g.findings.length + g.claims.length > 1 && oneFile(g)
 const askGroups = (label, prompt) => agent(prompt, { label, phase: 'Judge', model: 'sonnet', effort: 'medium', schema: GROUPS }).catch(quiet(label))
 let grouped = asked.size ? await askGroups('group', groupPrompt) : { groups: [] }
 // One unusable answer (#150) gets one more judgment, on a fresh label, before its findings stay ungrouped.
-if (!groupingOk(grouped)) {
+if (!wellFormed(grouped)) {
   grouped = await askGroups('group:retry', `${groupPrompt}\nAn earlier answer was not usable: each item at most once, only ` +
     'the finding indexes and claim ids listed, at least two members a group, and every member of a group on one file.')
 }
-const groupsOk = groupingOk(grouped)
-if (!groupsOk) unjudged.push({ kind: 'group' })
-const groups = groupsOk ? grouped.groups : []
+const usable = wellFormed(grouped)
+const groups = usable ? grouped.groups.filter(groupOk) : []
+const offRule = usable ? grouped.groups.filter(g => !groupOk(g)) : []
+if (offRule.length) log(`${offRule.length} group(s) dropped, their items left ungrouped: ${JSON.stringify(offRule)}`)
+if (!usable || offRule.length) unjudged.push({ kind: 'group' })
 // A lead thread claim graded below our lead finding: the body names our stronger grade.
 const ourGrade = new Map()
 const leadOf = new Map()

@@ -302,6 +302,19 @@ class LaunchResultTest(unittest.TestCase):
         rc, s = self.run_it(output(result={'pass': True, 'status': 'complete', 'state': {'expectedHead': NEXT, 'cyclesUsed': 5, 'maxCycles': 5}}))
         self.assertEqual(s['blockers'], [], 'a launch that passed on its last cycle needs no relaunch')
 
+    def test_a_greptile_request_that_posted_nothing_names_the_retry_a_relaunch_makes(self):
+        # #425: a pre-claim 502 on the last cycle keeps the head's one retry for the next launch.
+        base = {'pass': False, 'status': 'blocked', 'reason': 'greptile-unreviewed', 'state': {'expectedHead': NEXT, 'cyclesUsed': 5, 'maxCycles': 5}}
+        rc, s = self.run_it(output(result={**base, 'greptileRetry': True}))
+        self.assertIn("cycle budget spent: 5 of 5; a relaunch needs a larger maxCycles, the user's decision", s['blockers'])
+        said = [b for b in s['blockers'] if b.startswith('Greptile has not reviewed the head')]
+        self.assertEqual(len(said), 1, s['blockers'])
+        self.assertIn('posted nothing', said[0])
+        self.assertIn('a relaunch asks Greptile once more', said[0])
+        self.assertNotIn('relaunch once Greptile reviewed the head', said[0])
+        rc, s = self.run_it(output(result=base))
+        self.assertTrue(any('relaunch once Greptile reviewed the head' in b for b in s['blockers']), 'a final request keeps its blocker')
+
     def test_a_state_too_large_to_load_is_a_blocker(self):
         rc, s = self.run_it(output(result={'pass': True, 'status': 'complete', 'stateTooLarge': 70000,
                                            'state': {'expectedHead': NEXT, 'cyclesUsed': 1, 'maxCycles': 5}}))
@@ -572,7 +585,8 @@ class LaunchResultTest(unittest.TestCase):
                     'listed again unchanged, report it'])
 
     def test_incomplete_ci_evidence_is_relaunched_for_only_on_a_circleci_check(self):
-        # #319: a relaunch collects a stored CircleCI verdict's whole log once; an Actions verdict is reused as judged.
+        # #319: an output from before the recollect mark: a relaunch collects a stored CircleCI verdict's whole log once;
+        # an Actions verdict is reused as judged.
         data = output()
         data['result']['observation']['ci']['realFailures'] = [
             {**failure('build', complete=False), 'check': 'ci/circleci: build'},
@@ -581,6 +595,17 @@ class LaunchResultTest(unittest.TestCase):
             'CI evidence incomplete for ci/circleci: build / build: a relaunch with the same stateRef collects its whole log '
             'once and judges it again; listed again, report it',
             'CI evidence incomplete for build / arm / arm: a relaunch reads no more of its log: report it'])
+
+    def test_incomplete_circleci_evidence_is_relaunched_for_only_when_the_workflow_marks_it_so(self):
+        # #482: a verdict judged on the capped whole log, or already refreshed once, is reported; an unmarked one gets one refresh.
+        data = output()
+        data['result']['observation']['ci']['realFailures'] = [
+            {**failure('fresh', complete=False), 'check': 'ci/circleci: build', 'recollect': False},
+            {**failure('stored', complete=False), 'check': 'ci/circleci: test', 'recollect': True}]
+        self.assertEqual(self.run_it(data)[1]['blockers'], [
+            'CI evidence incomplete for ci/circleci: build / fresh: a relaunch reads no more of its log: report it',
+            'CI evidence incomplete for ci/circleci: test / stored: a relaunch with the same stateRef collects its whole log '
+            'once and judges it again; listed again, report it'])
 
     def test_a_handed_off_comment_and_a_settlement_that_did_not_settle_are_blockers(self):
         data = output()
@@ -605,12 +630,28 @@ class LaunchResultTest(unittest.TestCase):
 
     def test_an_unmarked_sonarcloud_issue_is_a_blocker_even_on_a_green_launch(self):
         data = output(result={'pass': True, 'status': 'complete', 'sonarUnmarked': [
-            {'commentId': 3, 'how': 'refutation', 'last': {'commentId': 3, 'issue': 'K3', 'outcome': 'failed', 'detail': 'HTTP 403'}},
+            {'commentId': 3, 'how': 'refutation', 'last': {'commentId': 3, 'issue': 'K3', 'outcome': 'failed', 'detail': 'HTTP 503'}},
             {'commentId': 4, 'how': 'fixNote', 'last': None}]})
         _, s = self.run_it(data)
-        self.assertIn('SonarCloud issue of comment 3 not marked false positive: failed: HTTP 403', s['blockers'])
-        self.assertIn('SonarCloud issue of comment 4 not marked false positive: not asked', s['blockers'])
+        self.assertIn('SonarCloud issue of comment 3 not marked false positive: failed: HTTP 503; a later `both` launch with markSonar asks again',
+                      s['blockers'])
+        self.assertIn('SonarCloud issue of comment 4 not marked false positive: not asked; a later `both` launch with markSonar asks again',
+                      s['blockers'])
         self.assertEqual(len(s['result']['sonarUnmarked']), 2)
+
+    def test_a_sonarcloud_refusal_is_reported_and_a_transient_failure_relaunched_for(self):
+        # #481: routed on sonar.py's outcome, never on its detail: an older output's `failed` refusal is asked once more.
+        lasts = {'refused': {'outcome': 'refused', 'detail': '/api/issues/search: HTTP 403 Forbidden: '},
+                 'failed': {'outcome': 'failed', 'detail': '/api/issues/search: HTTP 403 Forbidden: '},
+                 'waiting': {'outcome': 'waiting', 'detail': 'SonarCloud analysed nothing'},
+                 'down': {'outcome': 'not asked', 'detail': 'SONAR_TOKEN is not set'}, 'unasked': None}
+        data = output(result={'pass': True, 'status': 'complete', 'sonarUnmarked': [
+            {'commentId': i, 'how': 'refutation', 'last': last} for i, last in enumerate(lasts.values())]})
+        _, s = self.run_it(data)
+        routes = [b.rsplit('; ', 1)[1] for b in s['blockers'] if b.startswith('SonarCloud issue of comment')]
+        self.assertEqual(dict(zip(lasts, routes)), {'refused': launch_result.SONAR_PERMANENT, 'failed': launch_result.SONAR_RETRY,
+                                                    'waiting': launch_result.SONAR_RETRY, 'down': launch_result.SONAR_DOWN,
+                                                    'unasked': launch_result.SONAR_RETRY})
 
     def test_the_checkout_is_compared_with_the_state(self):
         _, s = self.run_it(output(), '--checkout', self.repo())

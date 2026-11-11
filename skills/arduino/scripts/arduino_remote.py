@@ -339,7 +339,7 @@ def close_unheld(run_id, s):
     out = {'runId': run_id, 'board': s['board'], 'closed': rc in (0, H.NOT_HELD), 'restoreExit': None,
            'releaseExit': rc}
     if out['closed']:
-        core.write_json(session_path(run_id), {**s, 'closed': True})
+        core.write_json(session_path(run_id), {**s, 'closed': True, 'releaseExit': rc})
     out['note'] = ("released the hold the rig took under this session's reason; nothing was restored" if rc == 0 else
                    'held no hold: nothing was held, released or restored' if rc == H.NOT_HELD else
                    'not closed: the release did not complete (its JSON above, or no answer from the rig); rerun '
@@ -350,6 +350,13 @@ def close_unheld(run_id, s):
 
 def cmd_session_close(a):
     s = session_record(a.run_id)
+    if s.get('closed'):
+        # the rig would answer NOT_HELD about a hold this session did take, restore and release
+        print(json.dumps({'runId': a.run_id, 'board': s['board'], 'closed': True,
+                          'restoreExit': s.get('restoreExit'), 'releaseExit': s.get('releaseExit'),
+                          'note': 'already closed by an earlier session close, with these exits (null: not '
+                                  'recorded); nothing was sent to the rig'}))
+        return 0
     if not s.get('held'):
         return close_unheld(a.run_id, s)
     tree = core.load_attempt(P.ROOT, runs(), a.run_id)
@@ -357,7 +364,7 @@ def cmd_session_close(a):
                                                '--release'], []))
     # only these codes confirm the hold is gone; any other, an ssh failure included, may leave it standing
     closed = rc in (0, H.RESTORE_FAILED, H.NOT_HELD)
-    core.write_json(session_path(a.run_id), {**s, 'held': not closed, 'closed': closed})
+    core.write_json(session_path(a.run_id), {**s, 'held': not closed, 'closed': closed, 'restoreExit': rc})
     out = {'runId': a.run_id, 'board': s['board'], 'closed': closed, 'restoreExit': rc}
     if rc == H.NOT_HELD:
         out['note'] = ("the rig holds the board under this session's reason no more (an earlier restore released it, "

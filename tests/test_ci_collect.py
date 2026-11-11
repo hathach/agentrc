@@ -115,6 +115,59 @@ class PageSizeTest(unittest.TestCase):
             self.assertEqual(len(calls), 1)
 
 
+class TransientRetryTest(unittest.TestCase):
+    """#424: a read meets a 502, 503 or 504 again after a short wait, a bounded number of times; nothing else is retried."""
+
+    def gh(self, answers, *args, stop=None):
+        calls, waits = [], []
+
+        def run(argv, **kw):
+            calls.append(argv)
+            code, err = answers.pop(0) if len(answers) > 1 else answers[0]
+            return mock.Mock(returncode=code, stdout=b'{"ok": 1}' if code == 0 else b'', stderr=err.encode())
+
+        def sleep(s):
+            waits.append(s)
+            if stop and len(waits) == stop[1]:
+                Path(stop[0]).touch()
+        with mock.patch.object(collect.subprocess, 'run', run), mock.patch.object(collect.time, 'sleep', sleep), \
+                mock.patch.object(collect, 'STOP_FILE', stop[0] if stop else None):
+            try:
+                return collect.gh(*(args or ('pr', 'checks', '5', '--repo', 'o/r'))), calls, waits
+            except collect.Failed as e:
+                return e, calls, waits
+
+    def test_a_transient_server_error_is_read_again_after_a_wait(self):
+        for err in ('HTTP 504: 504 Gateway Timeout (https://api.github.com/graphql)',
+                    'HTTP 503: No server is currently available to service your request', 'gh: Server Error (HTTP 502)'):
+            with self.subTest(err):
+                got, calls, waits = self.gh([(1, err), (0, '')])
+                self.assertEqual((got, len(calls), waits), ({'ok': 1}, 2, [2]))
+
+    def test_it_gives_up_after_its_waits_with_the_last_error(self):
+        got, calls, waits = self.gh([(1, 'HTTP 502')])
+        self.assertIsInstance(got, collect.Failed)
+        self.assertIn('HTTP 502', str(got))
+        self.assertEqual((len(calls), waits), (3, list(collect.RETRY_WAITS)))
+
+    def test_other_failures_and_writes_are_not_retried(self):
+        for what, err, args in (('a 500', 'HTTP 500', ()), ('a 404', 'gh: Not Found (HTTP 404)', ()),
+                                ('a rate limit', 'HTTP 403: API rate limit exceeded for user ID 1.', ()),
+                                ('a POST', 'HTTP 502', ('api', '-X', 'POST', 'repos/o/r/actions/runs/7/rerun')),
+                                ('a field', 'HTTP 502', ('api', 'repos/o/r/issues/5/comments', '-f', 'body=x'))):
+            with self.subTest(what):
+                got, calls, waits = self.gh([(1, err), (0, '')], *args)
+                self.assertIsInstance(got, collect.Failed)
+                self.assertEqual((len([c for c in calls if c[1:3] != ['api', 'rate_limit']]), waits), (1, []))
+
+    def test_a_stop_file_between_attempts_ends_it_before_the_next_call(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            got, calls, waits = self.gh([(1, 'HTTP 502')], stop=(str(Path(tmp) / 'stop'), 1))
+        self.assertIsInstance(got, collect.Failed)
+        self.assertIn('stopped before the next GitHub call', str(got))
+        self.assertEqual((len(calls), waits), (1, [2]))
+
+
 class InventoryTest(unittest.TestCase):
     def setUp(self):
         self.heads = []      # headRefOid per `gh pr view`, last one repeats
@@ -129,11 +182,17 @@ class InventoryTest(unittest.TestCase):
         self.rules = []
         self.runs = []      # check runs per read, last one repeats
         self.commit_statuses = []
+        self.head_runs = []   # the head's workflow runs; an Exception fails the read
 
         def run(argv, **kw):
             self.calls.append(argv[1:3])
             path = argv[4] if argv[1:3] == ['api', '--paginate'] else argv[2] if argv[1] == 'api' else ''
             ok = lambda out: mock.Mock(returncode=0, stdout=json.dumps(out).encode())
+            if path.startswith(f'repos/o/r/actions/runs?head_sha={HEAD}&'):
+                self.calls.append(['head-runs'])
+                if isinstance(self.head_runs, Exception):
+                    return mock.Mock(returncode=1, stdout=b'', stderr=str(self.head_runs).encode())
+                return ok([{'total_count': len(self.head_runs), 'workflow_runs': self.head_runs}])
             if path == 'repos/o/r/branches/master':
                 return ok({'name': 'master', 'protection': self.protection})
             if path.startswith('repos/o/r/rules/branches/master?'):
@@ -251,6 +310,76 @@ class InventoryTest(unittest.TestCase):
         self.assertEqual((r['status'], r['pending']), ('running', 2))
         self.assertEqual([c['name'] for c in r['checks']], ['c3', 'hil', 'docs'], 'other workflows and providers still listed')
         self.assertEqual(sorted(c[2] for c in self.calls if c[:2] == ['circleci', 'workflow']), ['wf-a', 'wf-b'], 'one status read per workflow')
+
+    @staticmethod
+    def head_run(id_, status, head=HEAD, name='HIL'):
+        return {'id': id_, 'name': name, 'path': '.github/workflows/hil.yml', 'head_sha': head, 'status': status,
+                'html_url': f'https://github.com/o/r/actions/runs/{id_}'}
+
+    def test_a_head_run_with_no_job_registered_keeps_it_running(self):
+        # #444: Adafruit_TinyUSB_Arduino#610's HIL run 41978191340, held by its concurrency group behind the previous head's.
+        self.heads = [HEAD]
+        self.listings = [[self.check('build', 'pass', JOB.format(1))]]
+        self.head_runs = [self.head_run(41978191340, 'pending')]
+        rc, r = self.main()
+        self.assertEqual((rc, r['status'], r['pending'], r['registered']), (0, 'running', 1, 2))
+        self.assertNotEqual(r['waiting'], '')
+        for status in ('queued', 'waiting', 'requested', 'in_progress'):
+            with self.subTest(status):
+                self.head_runs = [self.head_run(41978191340, status)]
+                self.assertEqual(self.main()[1]['status'], 'running')
+
+    def test_a_held_run_is_named_in_the_wait_and_a_listed_settled_or_foreign_one_changes_nothing(self):
+        self.heads = [HEAD]
+        self.listings = [[self.check('build', 'pass', JOB.format(1))]]
+        self.head_runs = [self.head_run(41978191340, 'pending')]
+        held = self.main()[1]['waiting']
+        self.head_runs = [self.head_run(41978191341, 'pending')]
+        self.assertNotEqual(self.main()[1]['waiting'], held, 'another held run is another wait')
+        for what, runs in (('completed', [self.head_run(8, 'completed') | {'conclusion': 'skipped'}]),
+                           ('another head', [self.head_run(9, 'pending', head=OTHER)])):
+            with self.subTest(what):
+                self.head_runs = runs
+                rc, r = self.main()
+                self.assertEqual((rc, r['status'], r['pending'], r['registered']), (0, 'green', 0, 1))
+        self.listings = [[self.check('build', 'pending', JOB.format(1))]]
+        self.head_runs = [self.head_run(7, 'in_progress')]
+        rc, r = self.main()
+        self.assertEqual((r['status'], r['pending'], r['registered']), ('running', 1, 1), 'its pending job stands for it, once')
+
+    def test_a_queued_rerun_whose_earlier_attempt_passed_keeps_it_running(self):
+        # Codex review of #444: run 7's second attempt queued while the listing still shows attempt 1's passing job.
+        self.heads = [HEAD]
+        self.listings = [[self.check('build', 'pass', JOB.format(1))]]
+        for status in ('queued', 'pending'):
+            with self.subTest(status):
+                self.head_runs = [self.head_run(7, status) | {'run_attempt': 2}]
+                rc, r = self.main()
+                self.assertEqual((rc, r['status'], r['pending'], r['registered']), (0, 'running', 1, 2))
+
+    def test_head_runs_are_read_only_while_no_counted_check_is_pending(self):
+        self.heads = [HEAD]
+        self.head_runs = [self.head_run(41978191340, 'pending')]
+        self.listings = [[self.check('build', 'pending', 'https://github.com/o/r/actions/runs/8/job/1')]]
+        rc, r = self.main()
+        self.assertEqual((rc, r['status'], r['pending'], ['head-runs'] in self.calls), (0, 'running', 1, False))
+        self.calls.clear()
+        self.listings = [[self.check('build', 'pass', JOB.format(1)), self.check('CodeRabbit', 'pending', '')]]
+        rc, r = self.main('--ignore-check', 'CodeRabbit')
+        self.assertEqual((r['status'], r['pending'], ['head-runs'] in self.calls), ('running', 1, True), 'an ignored pending check stands for no run')
+        self.calls.clear()
+        self.statuses = {'wf-1': ['running']}
+        self.listings = [[self.check('cci', 'fail', CIRCLE.format(1))]]
+        rc, r = self.main()
+        self.assertEqual((r['status'], r['pending'], ['head-runs'] in self.calls), ('running', 1, False), 'a held CircleCI job is pending')
+
+    def test_unreadable_head_runs_are_an_error(self):
+        self.heads = [HEAD]
+        self.listings = [[self.check('build', 'pass', JOB.format(1))]]
+        self.head_runs = Exception('gh: Not Found (HTTP 404)')
+        rc, r = self.main()
+        self.assertEqual(rc, 1)
+        self.assertIn('HTTP 404', r['error'])
 
     def test_waits_for_the_workflow_reading_its_status_every_poll(self):
         self.heads = [HEAD]
@@ -785,6 +914,8 @@ class FailuresTest(unittest.TestCase):
                 return ok({'name': 'master', 'protection': {'enabled': False}})
             if argv[1:3] == ['api', '--paginate'] and argv[4].startswith('repos/o/r/rules/branches/master?'):
                 return ok([[]])
+            if argv[1:3] == ['api', '--paginate'] and argv[4].startswith(f'repos/o/r/actions/runs?head_sha={HEAD}&'):
+                return ok([{'total_count': 0, 'workflow_runs': []}])
             if argv[1:3] == ['api', '--paginate'] and '/attempts/' in argv[4]:
                 n = int(argv[4].split('/attempts/')[1].split('/')[0])
                 jobs = self.attempts.get(n, [])
@@ -818,7 +949,7 @@ class FailuresTest(unittest.TestCase):
                 return limited
             return ok(self.logs[job]) if path.endswith('/logs') else ok(self.jobs[job])
         for obj, name, fake in ((collect.subprocess, 'run', run), (collect.tempfile, 'gettempdir', lambda: self.tmp.name),
-                                (collect.rtd, 'token', lambda: 'k'),
+                                (collect.time, 'sleep', lambda s: None), (collect.rtd, 'token', lambda: 'k'),
                                 (collect.rtd, 'reason', lambda url, key: (9, {'error': ''}, [('error', 'Error while checking out', 'x')],
                                                                           [(128, 'git checkout --force abc', 'fetching\nfatal: reference is not a tree: abc')]))):
             patcher = mock.patch.object(obj, name, fake)

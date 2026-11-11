@@ -7,7 +7,9 @@ rate_limit` (which spends no quota) shows exhausted, null when it shows none, an
 secondary when none is exhausted or gh names a secondary limit."""
 
 import argparse
+import base64
 import errno
+import json
 import os
 import re
 import shutil
@@ -187,15 +189,35 @@ def emit_dir():
     return {'dir': Path(tempfile.mkdtemp(prefix='', dir=parent)).as_posix()}
 
 
+def stage(file, digest):
+    """Write to file the JSON stdin carries as base64, once it decodes to UTF-8 JSON whose fnv1a is digest: the bytes
+    as sent, so no shell quoting meets the text."""
+    try:
+        data = base64.b64decode(sys.stdin.buffer.read(), validate=True)
+        text = data.decode('utf-8')
+        json.loads(text)
+    except ValueError as e:  # binascii.Error, UnicodeDecodeError and JSONDecodeError among them
+        raise Unusable(f'staged input is not base64 of UTF-8 JSON: {e}') from None
+    if fnv1a(text) != digest:
+        raise Unusable('staged input is not the JSON sent')
+    try:
+        Path(file).write_bytes(data)
+    except OSError as e:
+        raise Unusable(f'staged input not written: {e}') from None
+    return {'staged': file}
+
+
 def collect(argv):
     if argv == ['repo']:
         return {'repo': checkout_repo()}
     if argv == ['emit-dir']:
         return emit_dir()
-    raise Unusable('usage: facts.py repo | emit-dir')
+    if argv[:1] == ['stage'] and len(argv) == 3:
+        return stage(*argv[1:])
+    raise Unusable('usage: facts.py repo | emit-dir | stage FILE DIGEST')
 
 
 # `repo`: the checkout's one repository, for a prompt that must name it (fix-issue's triage); `emit-dir`: a workflow's
-# AGENTRC_EMIT directory.
+# AGENTRC_EMIT directory; `stage`: a relay command's script input, written before the script runs.
 if __name__ == '__main__':
     sys.exit(report(collect, sys.argv[1:]))

@@ -89,7 +89,7 @@ def cli_compile(used, platform_id, version, install_dir, build_install_dir, succ
     """arduino-cli compile --json's result as compile_sketch parses it."""
     out = {'success': success, 'compiler_err': err, 'builder_result': {
         'used_libraries': used, 'board_platform': {'id': platform_id, 'version': version, 'install_dir': install_dir},
-        'build_platform': {'id': platform_id, 'install_dir': build_install_dir}}}
+        'build_platform': {'id': platform_id, 'install_dir': build_install_dir}, 'build_properties': []}}
     return mock.Mock(returncode=0 if success else 1, stdout=json.dumps(out), stderr='')
 
 
@@ -244,7 +244,23 @@ class Selection(Lib):
         sel = ab.select([f'{probe}/probe.ino'], roster=['rig_ocd', 'rig_host'])
         self.assertEqual(sel['builds'], {b: [probe] for b in ('rig_esp', 'rig_jlink', 'rig_ocd')})
         self.assertEqual(sel['tests'], ['hil'])   # hil_remote is not a test of this profile
-        self.assertEqual(sel['hil'], {'boards': ['rig_host', 'rig_ocd'], 'full': True, 'uncovered': []})
+        self.assertEqual(sel['hil'], {'boards': ['rig_host', 'rig_ocd'], 'full': True, 'uncovered': [
+            {'family': 'fb', 'reason': 'no roster board of this family on this host'}]})   # rig_jlink and rig_esp
+
+    def test_a_hil_sketch_or_fixture_reaches_the_families_of_the_rig_boards_it_builds_on(self):
+        for path in ('test/hil/sketches/probe/probe.ino', 'examples/HID/inout/inout.ino', 'test/hil/fixture.cpp'):
+            with self.subTest(path=path):
+                self.assertEqual([u['family'] for u in ab.uncovered_by_roster([path], ['rig_ocd'])], ['fb'])
+                self.assertEqual(ab.uncovered_by_roster([path], ['rig_ocd', 'rig_jlink']), [])
+        # a fixture reaches only its own boards' family, an example no rig board runs reaches none
+        self.assertEqual(ab.uncovered_by_roster(['test/hil/fixture.cpp'], ['rig_esp']), [])
+        self.assertEqual(ab.uncovered_by_roster(['examples/Only/bonly/bonly.ino'], ['rig_ocd']), [])
+
+    def test_a_harness_or_roster_change_reaches_no_family(self):
+        for path in ('test/hil/ci.json', '.claude/skills/hil-contract/scripts/hil_test.py',
+                     '.claude/test/test_hil.py', '.claude/skills/build/scripts/check_build.py'):
+            with self.subTest(path=path):
+                self.assertEqual(ab.uncovered_by_roster([path], ['rig_ocd']), [])
 
     def test_fixture_change_builds_and_selects_its_boards(self):
         sel = ab.select(['test/hil/fixture.cpp'], roster=['rig_ocd', 'rig_esp'])
@@ -396,12 +412,42 @@ class Provenance(Lib):
         (build / 'main.cpp.d').write_text(f'main.cpp.o: \\\n {same} \\\n {other} {unrelated} {notours} {gone} '
                                           f'{self.root / "src/fake.h"} ' +
                                           str(spaced / 'src/fake.h').replace(' ', '\\ ') + '\n')
-        got = [(h['counterpart'], h['matches']) for h in ab.foreign_headers(build)]
+        got = [(h['counterpart'], h['matches']) for h in ab.foreign_headers(ab.dep_paths(build))]
         self.assertEqual(sorted(got), [('src/fake.h', False), ('src/fake.h', True), ('src/only_there.h', False),
                                        ('src/ports/fa/port.cpp', False)])
-        core = {Path(h['path']): h['core'] for h in ab.foreign_headers(build, [None, str(d / 'core')])}
+        core = {Path(h['path']): h['core'] for h in ab.foreign_headers(ab.dep_paths(build), [None, str(d / 'core')])}
         self.assertEqual(core, {same: True, other: True, gone: True, spaced / 'src/fake.h': False})
-        self.assertFalse(any(h['core'] for h in ab.foreign_headers(build)))
+        self.assertFalse(any(h['core'] for h in ab.foreign_headers(ab.dep_paths(build))))
+
+    def test_core_tinyusb_names_the_esp_cores_bundled_copy_its_version_and_headers(self):
+        d = self.tmp / 'esp32s3 libs/3.3.12'
+        tusb = d / 'include/arduino_tinyusb'
+        (tusb / 'tinyusb/src/device').mkdir(parents=True)
+        (tusb / 'include').mkdir()
+        (tusb / 'tinyusb/src/tusb_option.h').write_text('#define TUSB_VERSION_MAJOR     0\n'
+                                                         '#define TUSB_VERSION_MINOR     21\n'
+                                                         '#define TUSB_VERSION_REVISION  0\n')
+        (tusb / 'tinyusb/src/device/usbd.h').write_text('')
+        (tusb / 'include/tusb_config.h').write_text('')
+        (d / 'versions.txt').write_text('esp-idf: v5.5.5 b774170ff46\ntinyusb: master 88c7f0b81\n')
+        other = self.tmp / 'old/include/arduino_tinyusb'   # a second copy: no tusb_option.h, no versions.txt
+        (other / 'include').mkdir(parents=True)
+        (other / 'include/tusb_config.h').write_text('')
+        build = self.tmp / 'b'
+        (build / 'sketch').mkdir(parents=True)
+        esc = lambda p: str(p).replace(' ', '\\ ')
+        (build / 'sketch/a.cpp.d').write_text(f'a.cpp.o: \\\n {esc(tusb / "tinyusb/src/tusb_option.h")} \\\n '
+                                              f'{esc(tusb / "include/tusb_config.h")} {self.root / "src/fake.h"}\n')
+        (build / 'b.cpp.d').write_text(f'b.cpp.o: {esc(tusb / "tinyusb/src/device/usbd.h")} '
+                                       f'{esc(tusb / "include/tusb_config.h")} {other / "include/tusb_config.h"}\n')
+        self.assertEqual(ab.core_tinyusb(ab.dep_paths(build)), [
+            {'root': str(tusb), 'version': '0.21.0', 'ref': 'master 88c7f0b81',
+             'headers': sorted(str(tusb / h) for h in ('include/tusb_config.h', 'tinyusb/src/device/usbd.h',
+                                                       'tinyusb/src/tusb_option.h'))},
+            {'root': str(other), 'version': None, 'ref': None, 'headers': [str(other / 'include/tusb_config.h')]}])
+        (tusb / 'tinyusb/src/tusb_option.h').write_text('#define TUSB_VERSION_MAJOR 0\n')   # incomplete
+        self.assertIsNone(ab.core_tinyusb(ab.dep_paths(build))[0]['version'])
+        self.assertEqual(ab.core_tinyusb(ab.dep_paths(self.tmp / 'nothing')), [])
 
     def fake_compile(self, used=None, success=True, err='', platform='/x'):
         used = [{'name': fake.NAME, 'install_dir': str(self.root)}] if used is None else used
@@ -425,10 +471,26 @@ class Provenance(Lib):
         self.assertEqual((row['status'], row['remedy']), ('error', 'install arduino-cli on PATH'))
 
     def test_ok_build_row(self):
-        row = self.compile(self.fake_compile())
+        with mock.patch.object(ab.subprocess, 'run', return_value=self.fake_compile()) as run:
+            row = ab.compile_sketch('rig_jlink', 'examples/Basic/echo', self.root / 'b', [], {})
+        self.assertEqual(run.call_count, 1)   # a library's build maps no prefix: it has no per-process dir
         self.assertEqual((row['status'], row['vidPid'], row['foreignHeaders']), ('ok', '1234:5678', []))
+        self.assertEqual(row['coreTinyUSB'], [])
         self.assertEqual(row['libraries'], [{'name': fake.NAME, 'version': None, 'dir': str(self.root)}])
         self.assertIn('--library', (self.root / row['log']).read_text())
+
+    def test_both_header_reports_come_from_one_read_of_the_dep_files(self):
+        tusb = self.tmp / 'core/include/arduino_tinyusb'
+
+        def run(*_, **__):
+            (self.root / 'b/a.cpp.d').write_text(f'a.cpp.o: {tusb / "include/tusb_config.h"}\n')
+            return self.fake_compile()
+        with mock.patch.object(ab.subprocess, 'run', side_effect=run), \
+                mock.patch.object(ab, 'dep_paths', wraps=ab.dep_paths) as deps:
+            row = ab.compile_sketch('rig_jlink', 'examples/Basic/echo', self.root / 'b', [], {})
+        self.assertEqual(deps.call_count, 1)
+        self.assertEqual((row['foreignHeaders'], row['coreTinyUSB']), ([], [
+            {'root': str(tusb), 'version': None, 'ref': None, 'headers': [str(tusb / 'include/tusb_config.h')]}]))
 
     def test_missing_core_is_an_error_with_remedy(self):
         row = self.compile(self.fake_compile(success=False, err='Error resolving FQBN: platform x'), board='dev_a')
@@ -636,7 +698,7 @@ class RecordCase(Lib):
         super().setUp()
         self.roster = fake.roster(self.root / 'test/hil/ci.json')
         self.patch(ab, 'tool_version', lambda: '1.5.1')
-        self.patch(ab, 'platform_git', lambda d: None)
+        self.patch(ab, 'platform_git', lambda d, content=False: None)
 
     def flasher(self, flasher):
         fake.roster(self.roster, rig_jlink={'flasher': flasher})
@@ -662,6 +724,131 @@ class RecordCase(Lib):
             return ab.make_record(args, board, [row], ident, '', self.roster, prepared or {})
 
 
+class CoreContent(unittest.TestCase):
+    """platform_git(content=True): a core checkout's bytes beyond its HEAD, by real git."""
+
+    def setUp(self):
+        self.tmp = tmpdir(self)
+        self.env = git_env(GIT_CONFIG_COUNT='1', GIT_CONFIG_KEY_0='protocol.file.allow', GIT_CONFIG_VALUE_0='always')
+        environ = mock.patch.dict(os.environ, self.env, clear=True)
+        environ.start()
+        self.addCleanup(environ.stop)
+        self.core = self.tmp / 'core'
+        self.core.mkdir()
+        for f, text in (('platform.txt', 'name=X\n'), ('cores/x/main.cpp', 'int main() {}\n'),
+                        ('.gitignore', 'out/\n')):
+            (self.core / f).parent.mkdir(parents=True, exist_ok=True)
+            (self.core / f).write_text(text)
+        self.git(self.core, 'init', '-q', '-b', 'main')
+        self.git(self.core, 'add', '-A')
+        self.git(self.core, 'commit', '-qm', 'core')
+
+    def git(self, where, *a):
+        subprocess.run(['git', '-C', str(where), *a], check=True, capture_output=True, env=self.env)
+
+    def content(self):
+        return ab.platform_git(str(self.core), content=True)
+
+    def add_submodule(self):
+        up = self.tmp / 'lib_upstream'
+        up.mkdir()
+        (up / 'lib.h').write_text('// lib\n')
+        self.git(up, 'init', '-q', '-b', 'main')
+        self.git(up, 'add', '-A')
+        self.git(up, 'commit', '-qm', 'lib')
+        self.git(self.core, 'submodule', '-q', 'add', str(up), 'libraries/Lib')
+        self.git(self.core, 'commit', '-qm', 'sub')
+
+    def test_a_clean_core_is_stable_and_without_content_the_entry_is_unchanged(self):
+        first = self.content()
+        self.assertEqual((first['dirty'], first['content']), (False, self.content()['content']))
+        (self.core / 'out').mkdir()
+        (self.core / 'out/x.o').write_text('ignored')   # ignored files are not bound
+        self.assertEqual(self.content(), first)
+        self.assertEqual(set(ab.platform_git(str(self.core))), {'commit', 'dirty'})
+
+    def test_tracked_untracked_and_deleted_bytes_each_change_the_content(self):
+        clean = self.content()['content']
+        seen = {clean}
+        main = self.core / 'cores/x/main.cpp'
+        main.write_text('int main() { return 1; }\n')
+        one = self.content()
+        self.assertTrue(one['dirty'])
+        main.write_text('int main() { return 2; }\n')   # same commit, same dirty flag, other bytes
+        two = self.content()
+        self.assertEqual((two['commit'], two['dirty']), (one['commit'], one['dirty']))
+        seen |= {one['content'], two['content']}
+        main.write_text('int main() {}\n')
+        self.assertEqual(self.content()['content'], clean)
+        extra = self.core / 'cores/x/extra.c'
+        extra.write_text('a')
+        untracked = self.content()
+        self.assertFalse(untracked['dirty'])   # `dirty` keeps its meaning: tracked files only
+        extra.write_text('b')
+        seen |= {untracked['content'], self.content()['content']}
+        extra.unlink()
+        (self.core / 'platform.txt').unlink()
+        seen.add(self.content()['content'])
+        self.assertEqual(len(seen), 6)
+
+    def test_a_submodules_own_changes_change_the_content(self):
+        self.add_submodule()
+        clean = self.content()['content']
+        (self.core / 'libraries/Lib/lib.h').write_text('// changed\n')
+        changed = self.content()['content']
+        (self.core / 'libraries/Lib/lib.h').write_text('// lib\n')
+        (self.core / 'libraries/Lib/new.h').write_text('')
+        self.assertEqual(len({clean, changed, self.content()['content']}), 3)
+
+    def test_an_unparsed_submodule_status_line_is_refused_not_skipped(self):
+        status = mock.Mock(returncode=0, stdout=b' 3e5369cd libs/ok\nwarning: odd\n')
+        with mock.patch.object(ab, '_git_at', return_value=status), \
+                self.assertRaisesRegex(RuntimeError, "unparsed line 'warning: odd'"):
+            ab.content_digest(self.core)
+
+    def test_untracked_bytes_holding_separators_do_not_collide_with_two_files(self):
+        (self.core / 'a').write_bytes(b'x\0b\0y')
+        one = self.content()['content']
+        (self.core / 'a').write_bytes(b'x')
+        (self.core / 'b').write_bytes(b'y')
+        self.assertNotEqual(one, self.content()['content'])
+
+    def test_git_presentation_settings_do_not_enter_the_content(self):
+        self.add_submodule()
+        (self.core / 'cores/x/main.cpp').write_text('int main() { return 1; }\n')
+        (self.core / 'cores/x/ü.c').write_text('')
+        (self.core / 'platform.txt').write_text('name=Y\n')
+        first = self.content()['content']
+        order = self.tmp / 'order'
+        order.write_text('platform.txt\n')
+        for key, value in (('diff.noprefix', 'true'), ('diff.mnemonicPrefix', 'true'), ('core.quotePath', 'false'),
+                           ('diff.context', '9'), ('diff.algorithm', 'histogram'), ('diff.orderFile', str(order))):
+            self.git(self.core, 'config', key, value)
+        self.git(self.core / 'libraries/Lib', 'tag', 'v1')   # submodule status names it: `(v1)`
+        self.assertEqual(self.content()['content'], first)
+
+    def test_non_git_cores_and_unreadable_inputs_are_explicit(self):
+        plain = self.tmp / 'plain'
+        plain.mkdir()
+        self.assertIsNone(ab.platform_git(str(plain), content=True))
+        nested = self.core / 'cores/vendored'
+        nested.mkdir()
+        self.git(nested, 'init', '-q')
+        (nested / 'f').write_text('')
+        got = self.content()
+        self.assertIsNone(got['content'])
+        self.assertIn('an untracked repository', got['contentError'])
+        shutil.rmtree(nested)
+        (self.core / 'cores/x/locked.c').write_text('')
+        (self.core / 'cores/x/locked.c').chmod(0)
+        self.addCleanup((self.core / 'cores/x/locked.c').chmod, 0o644)
+        if os.access(self.core / 'cores/x/locked.c', os.R_OK):
+            self.skipTest('running as root: an unreadable file is readable')
+        got = self.content()
+        self.assertIsNone(got['content'])
+        self.assertIn('locked.c', got['contentError'])
+
+
 class Record(RecordCase):
     def test_jlink_board_records_the_hex_and_schema_2_identity(self):
         dep = {'name': 'Dep A', 'version': '1', 'dir': '/l/A', 'location': 'user', 'sha256': 'f' * 64}
@@ -679,6 +866,13 @@ class Record(RecordCase):
         self.assertEqual(rec['agentrc'], {'commit': 'a' * 40, 'files': {
             f: ab.sha256(self.agentrc['root'] / f) for f in self.agentrc['files']}})
         self.assertEqual(rec['agentrcSource'], {'source': 'installed', 'dirty': False})   # provenance, not compared
+
+    def test_record_binds_its_cores_content(self):
+        self.patch(ab, 'platform_git', lambda d, content=False: {'commit': 'c', 'dirty': True,
+                                                                 **({'content': 'f' * 64} if content else {})})
+        rec, err = self.record(self.samd_row())
+        self.assertIsNone(err)
+        self.assertEqual(rec['platform']['git'], {'commit': 'c', 'dirty': True, 'content': 'f' * 64})
 
     def test_record_takes_each_sketchs_fqbn(self):
         rec, err = self.record(self.samd_row())
@@ -1054,6 +1248,13 @@ class Core(Lib):
         self.assertEqual(ab.uncovered_by_roster(['platform.txt'], ['rig_m4']),
                          [{'family': 'c21', 'reason': 'no roster board of this family on this host'}])
 
+    def test_a_hil_sketch_change_names_the_family_of_a_rig_board_the_roster_lacks(self):
+        self.P.BOARDS['rig_m0'] = {'fqbn': 'fake:core:m0', 'family': 'c21', 'filters': 'm0', 'span': (0x2000, 0x40000)}
+        sel = ab.select(['test/hil/core_cdc/core_cdc.ino'], roster=['rig_m4'])
+        self.assertEqual(sorted(sel['builds']), ['rig_m0', 'rig_m4'])
+        self.assertEqual(sel['hil'], {'boards': ['rig_m4'], 'full': True, 'uncovered': [
+            {'family': 'c21', 'reason': 'no roster board of this family on this host'}]})
+
     def test_a_sketch_no_representative_builds_is_uncovered(self):
         self.P.classify_source = lambda path: ('sketches', ['libraries/Wire/examples/skipped'], 'w')
         self.assertEqual(ab.select(['libraries/Wire/Wire.cpp'])['uncovered'],
@@ -1085,6 +1286,39 @@ class Core(Lib):
         self.assertEqual(cmd[cmd.index('--config-file') + 1], str(self.tmp / 'cli.yaml'))
         self.assertEqual((cmd[cmd.index('--fqbn') + 1], row['fqbn']), ('fake:core:m4:usb=tusb',) * 2)
         self.assertEqual(row['platform']['install_dir'], str(self.root))
+
+    def test_compile_maps_the_isolated_dir_out_of_file_keeping_every_extra_flag(self):
+        listed = {'success': True, 'builder_result': {'build_properties': [
+            'compiler.c.extra_flags=-DPLATFORM', 'compiler.cpp.extra_flags=-DUSER {build.x}', 'build.extra_flags=-DB']}}
+        calls = []
+
+        def run(cmd, **kw):
+            calls.append(cmd)
+            return mock.Mock(returncode=0, stdout=json.dumps(listed), stderr='') if '--show-properties=unexpanded' \
+                in cmd else self.fake_compile()
+        config = self.tmp / 'iso dir/arduino-cli.yaml'
+        user = ['compiler.cpp.extra_flags=-DUSER {build.x}', 'build.foo=1']
+        with mock.patch.object(ab.subprocess, 'run', side_effect=run):
+            row = ab.compile_sketch('rig_m4', 'test/hil/core_cdc', self.root / 'b', user, {}, config)
+        self.assertEqual(row['status'], 'ok', row.get('firstError'))
+        show, compile_ = calls
+        self.assertEqual(show[show.index('--config-file') + 1], str(config))
+        self.assertEqual([show[i + 1] for i, a in enumerate(show) if a == '--build-property'], user)
+        flag = f'"-ffile-prefix-map={self.tmp / "iso dir"}=.arduino-cli"'
+        self.assertEqual([compile_[i + 1] for i, a in enumerate(compile_) if a == '--build-property'],
+                         ['build.foo=1', f'compiler.c.extra_flags=-DPLATFORM {flag}',
+                          f'compiler.cpp.extra_flags=-DUSER {{build.x}} {flag}', f'compiler.S.extra_flags={flag}'])
+        with mock.patch.object(ab.subprocess, 'run', side_effect=run):   # resolved once per FQBN and properties
+            ab.compile_sketch('rig_m4', 'test/hil/core_cdc', self.root / 'b', user, {}, config)
+        self.assertEqual(len(calls), 3)
+
+    def test_unresolvable_properties_are_an_error_before_compiling(self):
+        failed = mock.Mock(returncode=1, stdout='', stderr='Error resolving FQBN\nplatform not installed\n')
+        with mock.patch.object(ab.subprocess, 'run', return_value=failed) as run:
+            row = ab.compile_sketch('rig_m4', 'test/hil/core_cdc', self.root / 'b', [], {}, self.tmp / 'x/cli.yaml')
+        self.assertEqual((row['status'], row['firstError']),
+                         ('error', 'arduino-cli --show-properties: platform not installed'))
+        self.assertEqual(run.call_count, 1)
 
     def test_platform_through_a_link_to_the_checkout_is_this_checkout(self):
         link = self.tmp / 'sketchbook/hardware/fake/core'
@@ -1148,7 +1382,7 @@ class Core(Lib):
         build = self.tmp / 'b'
         build.mkdir()
         (build / 'main.cpp.d').write_text(f'main.cpp.o: {other}/cores/fake/main.cpp {link}/cores/fake/main.cpp\n')
-        self.assertEqual([(h['counterpart'], h['matches']) for h in ab.foreign_headers(build)],
+        self.assertEqual([(h['counterpart'], h['matches']) for h in ab.foreign_headers(ab.dep_paths(build))],
                          [('cores/fake/main.cpp', False)])
 
     def test_submodules_bind_at_their_gitlinks_clean(self):
@@ -1314,6 +1548,120 @@ class Core(Lib):
                              ['libs/my lib', 'libs/odd (x)', 'libs/new (y)', 'libs/in conflict'])
         self.assertEqual([c.args[1] for c in git.call_args_list[1:]], ['libs/my lib', 'libs/odd (x)',
                                                                         'libs/in conflict'])
+
+
+
+class NamedBuilds(Lib):
+    """Feature 'named': one HIL sketch dir built under two names with different menus."""
+
+    def setUp(self):
+        super().setUp()
+        self.root = fake.core(self.tmp / 'core')
+        self.P = fake.core_profile(self.root, self.agentrc, HIL_SKETCHES={'device': (
+            'test/hil/core_cdc', {'core_cdc_tusb2': ('test/hil/core_cdc', 'usb=tusb,debug=on')})})
+        self.patch(ab, 'P', self.P)
+
+    def test_feature_advertised_and_existing_profiles_unchanged(self):
+        self.assertIn('named', ab.PROFILE_FEATURES)
+        self.assertEqual(ab.PROFILE_API, 1)
+        self.patch(ab, 'P', fake.core_profile(self.root, self.agentrc))
+        self.assertEqual(ab.hil_sketches('rig_m4'), fake.CORE_HIL_SKETCHES['device'])
+        self.assertEqual(ab.named_builds(), {})
+        self.assertEqual(ab.fqbn('rig_m4', 'test/hil/core_cdc_tusb'), 'fake:core:m4:usb=tusb')
+
+    def test_bind_refuses_a_malformed_entry(self):
+        self.patch(ab, 'P', None)
+        for entry in ({'a/b': ('test/hil/core_cdc', '')}, {'x': 'test/hil/core_cdc'}, {'x': ('s', 'nomenu')},
+                      {'x': ('s', ''), 'y': ('s', '')}, ('x', 's'), {'.': ('s', '')}, {'..': ('s', '')},
+                      {'.sketch': ('s', '')}, {'a\\b': ('s', '')}, {'': ('s', '')}):
+            with self.subTest(entry=entry), self.assertRaisesRegex(RuntimeError, 'HIL_SKETCHES: entries neither'):
+                ab.bind(fake.core_profile(self.root, self.agentrc, HIL_SKETCHES={'device': ('test/hil/core_cdc',
+                                                                                            entry)}))
+            self.assertIsNone(ab.P)
+        self.assertIs(ab.bind(self.P), ab)
+
+    def test_bind_refuses_a_build_id_twice_in_a_role_or_defined_two_ways(self):
+        self.patch(ab, 'P', None)
+        cdc, tusb = 'test/hil/core_cdc', 'test/hil/core_cdc_tusb'
+        for table, why in (
+                ({'device': (cdc, cdc)}, f"'device' lists {cdc} twice"),
+                ({'device': (cdc, {'n': (cdc, '')}, {'n': (tusb, '')})}, "'device' lists n twice"),
+                ({'device': (cdc, {'cdc': (cdc, 'usb=arduino')}), 'host': ({'cdc': (tusb, 'usb=tusb')},)},
+                 'cdc is defined two ways'),
+                ({'device': (cdc, {'core_x': (cdc, '')}), 'host': ('core_x',)}, 'core_x is defined two ways')):
+            with self.subTest(table=table), self.assertRaisesRegex(RuntimeError, why):
+                ab.bind(fake.core_profile(self.root, self.agentrc, HIL_SKETCHES=table))
+            self.assertIsNone(ab.P)
+        same = {'device': (cdc, {'n': (cdc, 'usb=tusb')}), 'host': ({'n': (cdc, 'usb=tusb')},)}
+        self.assertIs(ab.bind(fake.core_profile(self.root, self.agentrc, HIL_SKETCHES=same)), ab)
+
+    def test_names_key_the_build_dir_the_fqbn_and_the_source(self):
+        self.assertEqual(ab.hil_sketches('rig_m4'), ('test/hil/core_cdc', 'core_cdc_tusb2'))
+        self.assertEqual([ab.source_of(e) for e in ab.hil_sketches('rig_m4')], ['test/hil/core_cdc'] * 2)
+        self.assertEqual([ab.build_key(e) for e in ab.hil_sketches('rig_m4')], ['core_cdc', 'core_cdc_tusb2'])
+        self.assertEqual(ab.fqbn('rig_m4', 'test/hil/core_cdc'), 'fake:core:m4:usb=arduino')
+        self.assertEqual(ab.fqbn('rig_m4', 'core_cdc_tusb2'), 'fake:core:m4:usb=tusb,debug=on')
+        self.assertTrue(ab.eligible('rig_m4', 'core_cdc_tusb2'))
+        self.assertFalse(ab.eligible('m4', 'core_cdc_tusb2'))   # a rig board's HIL build only
+        self.assertEqual(ab.with_options('v:a:b', 'x=1'), 'v:a:b:x=1')
+
+    def test_a_change_to_the_source_builds_every_name(self):
+        sel = ab.select(['test/hil/core_cdc/core_cdc.ino'], roster=['rig_m4'])
+        self.assertEqual(sel['builds'], {'rig_m4': ['core_cdc_tusb2', 'test/hil/core_cdc']})
+        self.assertEqual(sel['hil']['boards'], ['rig_m4'])
+        self.patch(self.P, 'HIL_SKETCHES', {'device': ({'only_named': ('test/hil/core_cdc_tusb', '')},)})
+        self.assertEqual(ab.classify('test/hil/core_cdc_tusb/x.h')[:2], ('hil_sketch', 'test/hil/core_cdc_tusb'))
+        self.assertEqual(ab.select(['test/hil/core_cdc_tusb/x.h'])['builds'], {'rig_m4': ['only_named']})
+
+    def test_a_name_clashing_with_a_sketch_basename_is_refused(self):
+        self.patch(self.P, 'HIL_SKETCHES', {'device': ('test/hil/core_cdc', {'core_cdc': ('test/hil/core_cdc', '')})})
+        self.assertEqual(ab.basename_clashes({'rig_m4': list(ab.hil_sketches('rig_m4'))}),
+                         ['rig_m4: test/hil/core_cdc and core_cdc'])
+
+    def test_both_names_compile_the_one_source_into_their_own_dirs(self):
+        calls = []
+
+        def run(cmd, **kw):
+            calls.append(cmd)
+            return cli_compile([], 'fake:core', '1.0.0', str(self.root), str(self.root))
+        with mock.patch.object(ab.subprocess, 'run', side_effect=run):
+            rows = ab.build_all(2, {'rig_m4': list(ab.hil_sketches('rig_m4'))}, self.root / 'build/hil', [], {},
+                                self.tmp / 'cli/arduino-cli.yaml')
+        self.assertEqual([(r['example'], r['status'], r['fqbn'], r['buildDir']) for r in rows],
+                         [('core_cdc_tusb2', 'ok', 'fake:core:m4:usb=tusb,debug=on', 'build/hil/rig_m4/core_cdc_tusb2'),
+                          ('test/hil/core_cdc', 'ok', 'fake:core:m4:usb=arduino', 'build/hil/rig_m4/core_cdc')])
+        compiles = [c for c in calls if '--build-path' in c]
+        self.assertEqual({c[-1] for c in compiles}, {str(self.root / 'test/hil/core_cdc')})
+        self.P.BOARDS['rig_m4']['fixture'] = 'cores/fake/main.cpp'   # a fixture board copies the source per name
+        src = ab.sketch_source('rig_m4', 'core_cdc_tusb2', self.root / 'build/hil/rig_m4/core_cdc_tusb2')
+        self.assertEqual((src.name, src.parent.name), ('core_cdc', 'core_cdc_tusb2'))
+        self.assertTrue((src / 'core_cdc.ino').is_file() and (src / 'main.cpp').is_file())
+
+    def test_the_record_keys_each_build_by_its_name_with_its_source(self):
+        roster = self.root / 'test/hil/ci.json'
+        roster.write_text(json.dumps({'boards': [{'name': 'rig_m4', 'uid': 'U', 'flasher': {
+            'name': 'jlink', 'uid': '1', 'args': '-device X'}, 'arduino': {'tests': ['cdc']}}]}))
+        rows = []
+        for e in ab.hil_sketches('rig_m4'):
+            b = self.root / 'build/hil/rig_m4' / ab.build_key(e)
+            b.mkdir(parents=True)
+            (b / 'core_cdc.ino.elf').write_bytes(elf32([(1, 0x4000, 0x20)]))
+            (b / 'core_cdc.ino.hex').write_text(ihex(0x4000, bytes(0x20)))
+            rows.append({'example': e, 'buildDir': ab.rel(b), 'fqbn': ab.fqbn('rig_m4', e), 'foreignHeaders': [],
+                         'platform': {'id': 'fake:core', 'version': '1.0.0', 'install_dir': str(self.root)}})
+        args = mock.Mock(experimental=False, build_property=[], record=str(self.root / 'build/r.json'))
+        ident = {'head': 'abc', 'dirty': False, 'diffSha256': 'd', 'status': ''}
+        with mock.patch.object(ab, 'source_identity', return_value=(ident, '')), \
+                mock.patch.object(ab, 'tool_version', return_value='1.5.1'), \
+                mock.patch.object(ab, 'platform_git', return_value=None):
+            rec, err = ab.make_record(args, 'rig_m4', rows, ident, '', roster, {})
+        self.assertIsNone(err)
+        self.assertEqual(list(rec['sketches']), ['core_cdc', 'core_cdc_tusb2'])
+        named = rec['sketches']['core_cdc_tusb2']
+        self.assertEqual((named['example'], named['source'], named['fqbn'], named['elf']),
+                         ('core_cdc_tusb2', 'test/hil/core_cdc', 'fake:core:m4:usb=tusb,debug=on',
+                          'build/hil/rig_m4/core_cdc_tusb2/core_cdc.ino.elf'))
+        self.assertNotIn('source', rec['sketches']['core_cdc'])
 
 
 if __name__ == '__main__':

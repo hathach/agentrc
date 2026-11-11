@@ -305,6 +305,24 @@ class Request(unittest.TestCase):
         self.assertEqual(self.run_with(rig := RequestRig(cr=other))[1]['outcome'], 'notLimited', 'another skip is not asked about')
         self.assertEqual(rig.posts, [])
 
+    def test_a_failed_review_of_the_head_is_asked_once_by_comment(self):
+        # #499: a CodeRabbit check run completed neutral, titled Review failed.
+        failed = dict(LIMITED, kind='failed', reason='check run: Review failed', retryAt=None)
+        ticked = {'id': 5, 'user': {'login': BOT}, 'body': BOX.replace('[ ]', '[x]'), 'updated_at': '2026-10-13T10:00:00Z'}
+        older = {'id': 50, 'body': '@coderabbitai review', 'created_at': '2026-10-13T08:00:00Z'}
+        for what, comments in (('nothing asked', []), ('a box ticked before the review failed', [ticked]), ("an older head's request", [older])):
+            with self.subTest(what):
+                code, out = self.run_with(rig := RequestRig(cr=failed, comments=comments))
+                self.assertEqual((code, out['outcome'], out['commentId'], out['retryAt']), (0, 'requested', 99, None))
+                self.assertEqual(len(rig.posts), 1)
+        mine = dict(older, id=51, created_at='2026-10-13T09:30:00Z')
+        code, out = self.run_with(rig := RequestRig(cr=failed, comments=[mine]))
+        self.assertEqual((out['outcome'], out['commentId']), ('already', 51), 'never a second ask on the head')
+        self.assertEqual(rig.posts, [])
+        code, out = self.run_with(rig := RequestRig(cr=failed, comments=[mine], event_at=None))
+        self.assertEqual((out['outcome'], out['phase']), ('failed', 'read'), 'a request it cannot place')
+        self.assertEqual(rig.posts, [])
+
     def test_a_failed_or_unconfirmed_post_is_failed_with_its_limit(self):
         for what, rig in (('post failed', RequestRig(post_code=1)), ('read back differs', RequestRig(readback='something else'))):
             with self.subTest(what):

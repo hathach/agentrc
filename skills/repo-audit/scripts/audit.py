@@ -50,8 +50,10 @@ refuses a `.claude` or record path that is a symbolic link or an ignored record 
 a new file renamed over it and prints how to commit it. Exit 0 done, 2 refused (with every reason on stderr).
 Shallow or grafted history, or a replace ref, is refused before any command; so is a run dir of another audit.py
 version. A GitHub read (gh, git fetch or ls-remote) never prompts for credentials (on native Windows an ssh url
-rewrite may still ask on the console until the time bound) and refuses after TIMEOUT seconds; a fetch still receiving
-data runs on until FETCH_TIMEOUT, an https one receiving under a byte a second for TIMEOUT seconds fails.
+rewrite may still ask on the console until the time bound), so git takes them from a credential helper only (gh auth
+setup-git sets one), never from a GIT_ASKPASS or core.askPass program; it refuses after TIMEOUT seconds, and ends
+the helpers it started (git-remote-https, ssh) with it then and on an interrupt. A fetch reporting
+progress runs on until FETCH_TIMEOUT; one that reports none for TIMEOUT seconds, on any transport, is refused.
 
 FILE is one JSON object; a field the schema does not name is refused at any depth:
   range       "<base>..<R>" in full SHAs: the run's range, so a review written before R moved refuses
@@ -87,6 +89,7 @@ import json
 import os
 import re
 import secrets
+import signal
 import subprocess
 import sys
 import tempfile
@@ -95,6 +98,7 @@ from collections import Counter, defaultdict
 from pathlib import Path, PurePosixPath
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
 from gh_repo import REPO  # noqa: E402
+import windows  # noqa: E402
 
 RECORD = '.claude/audit.json'
 SCHEMA = 1
@@ -102,9 +106,12 @@ VALIDATION = 'repo-audit-validation: 1'
 COMMENT_LIMIT = 65536            # GitHub's comment body maximum, in characters
 TIMEOUT = 300                    # seconds a GitHub read may take, or a fetch may receive nothing
 FETCH_TIMEOUT = 3600             # seconds a fetch still receiving data may take
-# an empty GIT_ASKPASS also overrides core.askPass and SSH_ASKPASS; ssh, without a terminal, then has no way to ask
-NO_PROMPT = {'GIT_TERMINAL_PROMPT': '0', 'GIT_ASKPASS': '', 'SSH_ASKPASS_REQUIRE': 'never', 'GCM_INTERACTIVE': 'never',
-             'GH_PROMPT_DISABLED': '1'}
+# an empty GIT_ASKPASS overrides core.askPass and SSH_ASKPASS for git; ssh reads SSH_ASKPASS itself, and before
+# OpenSSH 8.4 ignores SSH_ASKPASS_REQUIRE: an empty one fails its exec, so with DISPLAY set it opens no dialog either
+NO_PROMPT = {'GIT_TERMINAL_PROMPT': '0', 'GIT_ASKPASS': '', 'SSH_ASKPASS': '', 'SSH_ASKPASS_REQUIRE': 'never',
+             'GCM_INTERACTIVE': 'never', 'GH_PROMPT_DISABLED': '1'}
+# a fetch's --progress lines, local and remote: they show it receiving, but explain no failure
+PROGRESS = re.compile(r'(?:remote: )?(?:[A-Z][a-z]+(?: [a-z]+)*: +\d|Total \d)')
 GITHUB = 'https://github.com/'
 STAGES = ('coverage', 'phase1', 'claims', 'coreview')
 STAGE_FIELDS = {'completed': ('ref',), 'inapplicable': ('reason',)}
@@ -155,14 +162,29 @@ class HttpError(Refused):
 
 def git(repo, *args, check=True, network=False):
     if network:
+        fetching = args[0] == 'fetch'
         r = github_read(['git', '-C', str(repo), '-c', 'http.lowSpeedLimit=1', '-c', f'http.lowSpeedTime={TIMEOUT}',
-                         *args], f'git {" ".join(args)}', FETCH_TIMEOUT if args[0] == 'fetch' else TIMEOUT)
+                         *args], f'git {" ".join(args)}', FETCH_TIMEOUT if fetching else TIMEOUT,
+                        TIMEOUT if fetching else None)
+        if fetching:
+            r.stderr = ''.join(line for line in r.stderr.splitlines(keepends=True) if not PROGRESS.match(line))
     else:
         r = subprocess.run(['git', '-C', str(repo), *args], capture_output=True, text=True, encoding='utf-8',
                            errors='replace')
     if check and r.returncode:
-        raise Refused(f'git {" ".join(args)}: {r.stderr.strip()}')
+        raise Refused(f'git {" ".join(args)}: {failure(r.returncode, r.stderr) if network else r.stderr.strip()}')
     return r
+
+
+def failure(code, stderr):
+    """Why a GitHub read failed: its message, naming the way to credentials when it could not prompt for them, or
+    its exit status when it wrote none, as when TMPDIR, which holds its output files, filled meanwhile."""
+    why = stderr.strip()
+    if not why:
+        return f'exit {code} with no message (its output files are under {tempfile.gettempdir()}: is that full?)'
+    if 'terminal prompts disabled' in why:
+        why += ' (git takes credentials from a credential helper only, never an askpass: gh auth setup-git sets one)'
+    return why
 
 
 def gh(args):
@@ -170,20 +192,64 @@ def gh(args):
     return r.returncode, r.stdout, r.stderr
 
 
-def github_read(argv, label, timeout=TIMEOUT):
-    """argv run with no prompt, no stdin and, off Windows, no controlling terminal, refused after timeout seconds. Its
-    output goes through files: on Windows a timed-out run waits for every holder of its pipes, as a git-remote-https
-    left behind."""
-    with tempfile.TemporaryFile('w+', encoding='utf-8', errors='replace') as out, \
-            tempfile.TemporaryFile('w+', encoding='utf-8', errors='replace') as err:
+def github_read(argv, label, timeout=TIMEOUT, idle=None):
+    """argv run with no prompt, no stdin and, off Windows, no controlling terminal, refused after timeout seconds or
+    once it has written nothing for idle seconds. Its output goes through files: on Windows a timed-out run waits for
+    every holder of its pipes, as a git-remote-https left behind."""
+    with output_file(label) as out, output_file(label) as err:
         try:
-            r = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=out, stderr=err, env={**os.environ, **NO_PROMPT},
-                               timeout=timeout, start_new_session=True)
+            code = bounded(argv, out, err, {**os.environ, **NO_PROMPT}, timeout, idle)
+        except Idle:
+            raise Refused(f'{label}: nothing received for {idle} s') from None
         except subprocess.TimeoutExpired:
             raise Refused(f'{label}: not finished in {timeout} s') from None
         out.seek(0)
         err.seek(0)
-        return subprocess.CompletedProcess(argv, r.returncode, out.read(), err.read())
+        return subprocess.CompletedProcess(argv, code, out.read(), err.read())
+
+
+def output_file(label):
+    try:
+        return tempfile.TemporaryFile('w+', encoding='utf-8', errors='replace')
+    except OSError as e:
+        raise Refused(f'{label}: no output file under {tempfile.gettempdir()}: {e.strerror or e}') from None
+
+
+class Idle(subprocess.TimeoutExpired):
+    pass
+
+
+def bounded(argv, out, err, env, timeout, idle=None):
+    """argv's exit status; TimeoutExpired after timeout seconds, Idle once out and err have not grown for idle
+    seconds. Then or on an interrupt its whole tree is killed, off Windows as its own session's process group:
+    killing only argv would leave the helpers it started running."""
+    p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=out, stderr=err, env=env, start_new_session=True)
+    try:
+        began = last = time.monotonic()
+        size = 0
+        while True:
+            now = time.monotonic()
+            if now - began >= timeout:
+                raise subprocess.TimeoutExpired(argv, timeout)
+            if idle and now - last >= idle:
+                raise Idle(argv, idle)
+            try:
+                return p.wait(min(0.5, began + timeout - now))
+            except subprocess.TimeoutExpired:
+                pass
+            grown = os.fstat(out.fileno()).st_size + os.fstat(err.fileno()).st_size
+            if grown != size:
+                size, last = grown, time.monotonic()
+    except BaseException:
+        if os.name == 'nt':
+            windows.kill_tree(p, 10)
+        else:
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            p.wait()
+        raise
 
 
 def api(path, paginate=False):
@@ -193,7 +259,7 @@ def api(path, paginate=False):
     rc, out, err = gh(['api', *(['--paginate', '--slurp'] if paginate else []), path])
     if rc:
         status = re.search(r'\(HTTP (\d{3})\)', err)
-        raise HttpError(f'gh api {path}: {err.strip() or out.strip()}', status and int(status[1]))
+        raise HttpError(f'gh api {path}: {failure(rc, err or out)}', status and int(status[1]))
     try:
         data = json.loads(out)
     except ValueError:
@@ -207,7 +273,7 @@ def api(path, paginate=False):
 
 def fetch(repo, slug, ref, check=True):
     """Fetch ref from slug on GitHub into the object store only: no tracking ref, no FETCH_HEAD."""
-    return git(repo, 'fetch', '-q', '--no-tags', '--no-recurse-submodules', '--no-write-fetch-head',
+    return git(repo, 'fetch', '-q', '--progress', '--no-tags', '--no-recurse-submodules', '--no-write-fetch-head',
                f'{GITHUB}{slug}.git', ref, check=check, network=True)
 
 
@@ -845,7 +911,7 @@ def end_problems(repo, rec, end):
                                       check=False, network=True).returncode == 2:
             return problems + [f'{pr["repo"]} has no {ref}']
         if fetched.returncode:
-            raise Refused(f'git fetch {ref}: {fetched.stderr.strip()}')
+            raise Refused(f'git fetch {ref}: {failure(fetched.returncode, fetched.stderr)}')
         if not has_commit(repo, p):
             return problems + [f'{ref} of {pr["repo"]} did not bring the head the API names, {p}']
     parents = git(repo, 'rev-list', '--parents', '-n1', p).stdout.split()[1:]
@@ -1161,7 +1227,11 @@ def branch_tip(repo, slug, branch):
     listed = git(repo, 'ls-remote', '--exit-code', f'{GITHUB}{slug}.git', ref, check=False, network=True)
     tips = [line.split('\t')[0] for line in listed.stdout.splitlines() if line.endswith(f'\t{ref}')]
     if listed.returncode or len(tips) != 1 or not SHA.fullmatch(tips[0]):
-        raise Refused(f'{slug} {ref} cannot be read: {listed.stderr.strip() or listed.stdout.strip()[:200]}')
+        if listed.returncode in (0, 2):
+            why = listed.stderr.strip() or listed.stdout.strip()[:200]
+        else:
+            why = failure(listed.returncode, listed.stderr)
+        raise Refused(f'{slug} {ref} cannot be read: {why}')
     if not has_commit(repo, tips[0]):
         fetch(repo, slug, ref)
         if not has_commit(repo, tips[0]):

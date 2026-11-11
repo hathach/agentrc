@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test as nodeTest } from 'node:test'
@@ -48,8 +48,11 @@ const bare = (v) => Array.isArray(v) ? v.map(bare)
 const sealLine = (facts) => ({ ...facts, seal: fnv1a(canonical(bare(facts))) })
 // [reviewers, auto-runners] as the validator prompt's harvest command names them.
 const harvestFlags = (prompt) => ['--reviewers', '--auto-run'].map(f => new RegExp(`${f} ([^\\s\`]+)`).exec(String(prompt))?.[1].split(',') ?? [])
-// The JSON a prompt ends with after `key: `, or its trailing list on a line of its own.
-const payloadOf = (prompt, key) => JSON.parse(String(prompt).match(new RegExp(`${key}: (\\{.*\\})$`))[1])
+// The JSON a relay command stages for its script (staged()), decoded as its Python stage decodes it.
+const stagedOf = (prompt) => JSON.parse(Buffer.from(String(prompt).match(/printf '%s' '([A-Za-z0-9+/=]*)' \| /)[1], 'base64').toString('utf8'))
+// The staged JSON's text, '' for a prompt that stages none.
+const stagedText = (prompt) => /printf '%s' '/.test(String(prompt)) ? JSON.stringify(stagedOf(prompt)) : ''
+// A prompt's trailing list on a line of its own.
 const trailingList = (prompt) => JSON.parse(String(prompt).slice(String(prompt).indexOf('\n[') + 1))
 // The workflow's failure identity.
 const failureKey = (f) => JSON.stringify([f.workflow, f.job, f.cell, f.signature])
@@ -66,7 +69,7 @@ const COLLECT_CONTRACT = Number(body.match(/^const COLLECT_CONTRACT = (\d+)$/m)[
 // The values a relay prompt passes a script, each shell-quoted as --flag='value'.
 const flagValues = (prompt, flag) => [...String(prompt).matchAll(new RegExp(`--${flag}='((?:[^']|'\\\\'')*)'`, 'g'))].map(m => m[1].replaceAll("'\\''", "'"))
 const askedOf = (prompt) => JSON.parse(String(prompt).match(/each needing exactly one entry in your reply: (\[.*\])\./)[1])
-const manifestOf = (calls, label) => payloadOf(calls.find(c => c.label === label).prompt, 'Manifest').replies
+const manifestOf = (calls, label) => stagedOf(calls.find(c => c.label === label).prompt).replies
 // The nth commit a run makes. Each is distinct, as a real commit is, because the
 // audit rejects one whose SHA equals its parent.
 const shaFor = (n) => (SHA.slice(0, 38) + String(n).padStart(2, '0')).toLowerCase()
@@ -205,6 +208,7 @@ async function run(opts = {}) {
   let validatorCalls = 0
   let observed = null // the last validator observedAt, a trigger's default finishing time
   let brokenWriter = false // a writer reported a failed build since the last candidate build
+  let buildWaits = 0 // build.py --job calls answered so far
   const receiptFiles = opts.receiptFiles ?? new Map() // reply.py or sonar.py --receipt path -> the line its first run saved there
   const sonarMarked = new Set() // comments whose SonarCloud issue a sonar.py run marked
   const replied = opts.replied ?? new Set() // comments a reply.py run posted to, which a rerun finds there (rerunReuses)
@@ -212,8 +216,10 @@ async function run(opts = {}) {
   const journal = [] // every agent call and its answer, which opts.resume replays
   let live = 0 // how far this run still follows opts.resume
   const loads = [] // each scriptPath workflow() loaded
-  // facts.py emit-dir's directory: opts.emitDir, else a new one this run removes unless opts.keepEmit.
+  // facts.py emit-dir's directory: opts.emitDir, else a new one this run removes unless opts.keepEmit and it returns;
+  // the caller removes a kept one by the emitRoot it returns.
   const emit = emitDirs('pr-babysit-emit-', opts.emitDir, opts.keepEmit)
+  let returned = false
   let dirCalls = 0 // facts.py emit-dir runs; opts.dirAnswer(n) answers the nth instead (undefined: the directory)
 
   // One harvest per cycle, whichever of the validator and the probe (#359) asks for it first.
@@ -260,6 +266,8 @@ async function run(opts = {}) {
       if (answer instanceof Error) throw answer
       return answer === undefined ? { dir: emit.dir() } : answer
     }
+    // The two agentrc roots, read only when emit-dir answered a usage: opts.roots, null a dead relay.
+    if (label === 'emit:roots') return opts.roots === undefined ? { scripts: '/home/u/code/agentrc 341ae67', saved: '/home/u/candidate 455d554' } : opts.roots
     calls.push({
       label, prompt: String(prompt), agentType: options.agentType,
       phase: options.phase, schema: options.schema, model: options.model,
@@ -303,6 +311,8 @@ async function run(opts = {}) {
       return push
     }
     if (label === 'stop:ci') return conforms(options.schema, { exit: 0 }, label)
+    // Whether the session directory is the state's pinned checkoutDir: opts.sameCheckout the exit (0 by default), null a dead relay.
+    if (label === 'state:checkout') return opts.sameCheckout === null ? null : { exit: opts.sameCheckout ?? 0 }
     if (label.startsWith('prstate#')) {
       // preflight.py --state before a publication the CI lane is not watching: OPEN unless opts.prState (a value, or a function of the label) says otherwise.
       const state = typeof opts.prState === 'function' ? opts.prState(label) : opts.prState === undefined ? 'OPEN' : opts.prState
@@ -338,7 +348,7 @@ async function run(opts = {}) {
         if (opts.recall) answer = opts.recall(answer, text)
       } else if (/ remember /.test(text)) {
         // A patch replaces the stored failures of its keys; the stub refuses no patch.
-        for (const v of trailingList(text)) {
+        for (const v of stagedOf(text)) {
           const old = store.get(key(v.link))
           store.set(key(v.link), v.patch ? { ...old, failures: old.failures.map(f => v.patch.find(p => failureKey(p) === failureKey(f)) ?? f) } : v)
         }
@@ -432,7 +442,7 @@ async function run(opts = {}) {
       // lost (lost), the agent invented an id (strayDoneIds), the id is on
       // none of the PR's id spaces (noTarget), it names a review body
       // (reviewBody) or the receipts are reshaped (receipts).
-      const entries = JSON.parse(String(prompt).match(/Manifest: (\{.*\})$/)[1]).replies
+      const entries = stagedOf(prompt).replies
       // reply.py's error line before anything is posted (replyError), as the relay is told to return it.
       const scriptError = opts.replyError && opts.replyError(label)
       if (scriptError) return conforms(options.schema, { ...(typeof scriptError === 'string' ? { error: scriptError } : scriptError), receipts: [] }, label)
@@ -533,6 +543,14 @@ async function run(opts = {}) {
       if (typeof opts.verify === 'function') return opts.verify(label)
       return structuredClone(opts.verify ?? { addresses: true, reason: 'verified' })
     }
+    if (label.startsWith('reserved#')) {
+      assert.equal(options.agentType, 'finding-verifier')
+      // opts.inReserved(findingId): whether its fix changes a caller-reserved area, false by default; null a verifier that cannot tell.
+      // opts.reservedVerdicts(ids) the whole list.
+      const ids = JSON.parse(String(prompt).match(/\nFindings: (\[.*\])$/s)[1]).map(x => x.findingId)
+      return conforms(options.schema, { verdicts: opts.reservedVerdicts ? opts.reservedVerdicts(ids)
+        : ids.map(findingId => ({ findingId, reserved: opts.inReserved ? opts.inReserved(findingId) : false, reason: 'stub reading' })) }, label)
+    }
     if (label.startsWith('topic#')) {
       assert.equal(options.agentType, 'finding-verifier')
       // opts.topic(pairId) is whether the topic's issue covers the finding, '<findingId>@<topic>', false by default; opts.topicVerdicts(ids) the whole list.
@@ -544,7 +562,7 @@ async function run(opts = {}) {
       if (opts.reuse === null) return null
       const scriptError = opts.replyError && opts.replyError(label)
       if (scriptError) return conforms(options.schema, { error: scriptError, receipts: [] }, label)
-      const { reuses } = payloadOf(prompt, 'Reuses')
+      const { reuses } = stagedOf(prompt)
       return conforms(options.schema, { receipts: printed(reuses.map(u => ({
         commentId: u.commentId, kind: 'review', replyId: u.replyId, digest: u.bodyDigest,
         sent: false, posted: false, verified: true, resolved: true, error: null,
@@ -556,7 +574,7 @@ async function run(opts = {}) {
       // launch marked found resolved by a rerun; a --receipt path its first run saved replays that run's line.
       const path = String(prompt).match(/--receipt '([^']+)'/)?.[1]
       if (path && receiptFiles.has(path)) return receiptFiles.get(path)
-      const items = payloadOf(prompt, 'Manifest').items
+      const items = stagedOf(prompt).items
       const answer = typeof opts.sonar === 'function' ? opts.sonar(items, label)
         : { results: items.map(x => ({ commentId: x.commentId, issue: `K${x.commentId}`,
           ...sonarMarked.has(x.commentId) ? { outcome: 'resolved', detail: 'RESOLVED FALSE-POSITIVE' } : { outcome: 'marked', detail: 'false positive' } })) }
@@ -590,14 +608,16 @@ async function run(opts = {}) {
       return conforms(options.schema, { command: 'make -C <BUILD> all', setup: null, requires: [], contract: ['AGENTS.md'], reason: 'stub contract', error: null, ...plan }, label)
     }
     if (label.startsWith('build#')) {
-      // build.py's receipt: the build fails when a writer's did; opts.candidate reshapes it, null is a dead agent.
+      // build.py --job's line: running for the first opts.buildRunning waits, then the receipt: the build fails when a
+      // writer's did; opts.candidate reshapes it, null is a dead agent.
+      if (buildWaits++ < (opts.buildRunning ?? 0)) return { state: 'running', revision: head, elapsed: 540 * buildWaits }
       const over = opts.candidate
       const exit = brokenWriter ? 1 : 0
       brokenWriter = false
       if (over === null) return null
       const asked = (flag) => flagValues(prompt, flag)
       return conforms(options.schema, bare({
-        revision: head, snapshot: 'snap', snapshotAfter: 'snap',
+        state: 'done', revision: head, snapshot: 'snap', snapshotAfter: 'snap',
         command: asked('command')[0].replaceAll('<BUILD>', '/tmp/b'), setup: asked('setup')[0] ?? '', requires: asked('require'), stage: 'build',
         buildDir: '/tmp/b', exit,
         log: '/tmp/candidate.log', retained: [],
@@ -687,15 +707,17 @@ async function run(opts = {}) {
       }, workflow, null,
       ...ABSENT.map(() => undefined))
     // Outside the stub: the workflow catches relay exceptions, including a failed assertion inside one.
+    for (const { label, prompt } of journal) assert.doesNotMatch(prompt, /<AGENTRC_|<that file>/, `${label}: no placeholder reaches an agent (#510)`)
     for (const { label, prompt } of calls.filter(c => c.label.startsWith('crrequest#'))) {
       for (const [, value] of prompt.matchAll(/ --not-before ([^\s`]+)/g)) {
         assert.match(value.replace(/^'(.*)'$/, '$1'), /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/, `${label}: coderabbit_trigger.py's ISO contract`)
       }
     }
-    return { result, logs, labels: calls.map(c => c.label), calls, napPoints, napMs, journal, loads, emitDir: emit.made }
+    returned = true
+    return { result, logs, labels: calls.map(c => c.label), calls, napPoints, napMs, journal, loads, emitDir: emit.made, emitRoot: emit.root }
   } finally {
     globalThis.setTimeout = realTimeout
-    emit.cleanup()
+    emit.cleanup(!returned)
   }
 }
 
@@ -1307,20 +1329,42 @@ test('a batch whose build fails is not published', async () => {
   assert.equal(labels.some(l => l.startsWith('push#')), false, 'the publisher is not dispatched')
   assert.ok(labels.includes('check:src/a.c'), 'the issue check runs whatever the writer\'s own build said')
   assert.deepEqual(labels.filter(l => /^build[:#]/.test(l)), ['build:resolve#1-review', 'build#1-review'])
-  assert.match(calls.find(c => c.label === 'build#1-review').prompt, /build\.py --path='src\/a\.c' --command='make -C <BUILD> all'`/)
+  assert.match(calls.find(c => c.label === 'build#1-review').prompt, /build\.py --path='src\/a\.c' --command='make -C <BUILD> all' --job=/)
   assert.match(rowsOf(summaries(logs)[0])[0][3], /unverified: the build failed \(exit 1\); log \/tmp\/cand/)
   assert.equal(labels.some(l => l.startsWith('compat#')), false, 'no compatibility check on a broken batch')
+})
+
+test('a build longer than one relay call is waited out over bounded calls to one job; a timeout is told from a failure (#375)', async () => {
+  const long = await run({ reviews: oneValid, buildRunning: 3 })
+  const polls = long.calls.filter(c => c.label === 'build#1-review')
+  assert.equal(polls.length, 4)
+  assert.equal(new Set(polls.map(c => c.prompt.replace(emitOf(c.prompt), ''))).size, 1, 'every call names the one job')
+  assert.match(polls[0].prompt, / --job='\/tmp\/pr-babysit-receipts-x\/build-1-review-[0-9a-f]{8}' --wait-seconds=540 --timeout-seconds=10800`/)
+  assert.match(polls[0].prompt, /Bash timeout of 600000 ms/)
+  assert.deepEqual(long.logs.filter(l => l.startsWith('build#1-review: still running')).length, 3)
+  assert.equal(long.result.history[0].reviewPush.pass, true)
+  const timedOut = await run({ reviews: oneValid, candidate: { state: 'timedOut', exit: -15 } })
+  assert.deepEqual([timedOut.result.reason, timedOut.result.timedOut], ['build-unverifiable', true])
+  assert.match(timedOut.result.detail, /the build timed out after 180 min and was stopped; log \/tmp\/candidate\.log/)
+  const failed = await run({ reviews: oneValid, candidate: { exit: 2 } })
+  assert.deepEqual([failed.result.reason, failed.result.timedOut], ['fix-verification-failed', undefined])
+  const forever = await run({ reviews: oneValid, buildRunning: 1000 })
+  assert.equal(forever.calls.filter(c => c.label === 'build#1-review').length, 22)
+  assert.deepEqual([forever.result.reason, forever.result.timedOut], ['build-unverifiable', undefined])
+  assert.match(forever.result.detail, /the build did not count: still running after 22 waits/)
+  const abandoned = await run({ reviews: oneValid, candidate: { state: 'abandoned' } })
+  assert.match(abandoned.result.detail, /the build did not count: the build was abandoned/)
 })
 
 test('the batch build is resolved from the contract when the caller named none, and is the caller\'s otherwise', async () => {
   const resolved = await run({ reviews: twoValid })
   const resolve = resolved.calls.find(c => c.label === 'build:resolve#1-review')
   assert.match(resolve.prompt, /for a change to src\/a\.c, src\/b\.c\./)
-  assert.match(resolved.calls.find(c => c.label === 'build#1-review').prompt, /build\.py --path='src\/a\.c' --path='src\/b\.c' --command='make -C <BUILD> all'`/)
+  assert.match(resolved.calls.find(c => c.label === 'build#1-review').prompt, /build\.py --path='src\/a\.c' --path='src\/b\.c' --command='make -C <BUILD> all' --job=/)
   assert.equal(resolved.result.history[0].reviewPush.pass, true)
   const given = await run({ reviews: oneValid, args: { build: "make BOARD='x y' <BUILD>" } })
   assert.equal(given.labels.some(l => l.startsWith('build:resolve#')), false)
-  assert.match(given.calls.find(c => c.label === 'build#1-review').prompt, /--command='make BOARD='\\''x y'\\'' <BUILD>'`/)
+  assert.match(given.calls.find(c => c.label === 'build#1-review').prompt, /--command='make BOARD='\\''x y'\\'' <BUILD>' --job=/)
   assert.equal(given.result.history[0].reviewPush.pass, true, 'the receipt echoes the quoted command back')
 })
 
@@ -1366,10 +1410,106 @@ test('the committer gets the claims without their hints, and the message on stdi
   const commit = calls.find(c => c.label === 'commit#1-review').prompt
   assert.doesNotMatch(commit, /hint:|rewrite it all/)
   assert.match(commit, /The fixes: \["src\/a\.c:\d+ /)
-  assert.match(commit, /commits\.py commit --receipt '\/tmp\/pr-babysit-receipts-x\/commit#1-review\.json' --request 'commit#1-review' 'src\/a\.c' < '<that file>'; rm -f '<that file>'`/)
-  const quoted = calls.filter(c => c.prompt.includes("'<that file>'"))
-  assert.ok(quoted.some(c => c.label.startsWith('reply')) || quoted.length > 1, 'more than the commit quotes its file')
-  for (const c of quoted) assert.match(c.prompt, /a new temporary file[^:]*, a name without quotes/, c.label)
+  // The message file is one the workflow names, outside .git, and the commit runs only after its write (#510).
+  const [, file] = commit.match(/with your file tool to exactly (\/tmp\/pr-babysit-receipts-x\/commit_1-review\.1\.[0-9a-f]{8}\.in), outside the checkout/)
+  assert.ok(commit.includes(`Only once that write has returned, run exactly \`AGENTRC_EMIT=`), commit)
+  assert.ok(commit.includes(`commits.py commit --receipt '/tmp/pr-babysit-receipts-x/commit#1-review.json' --request 'commit#1-review' 'src/a.c' < '${file}'\``), commit)
+  assert.doesNotMatch(commit, /temporary file|mktemp|rm -f/)
+})
+
+// A relay command as Bash runs it: `cmd` from its prompt, its AGENTRC_EMIT moved to `emit`; the scripts under `root`.
+const runCommand = (cmd, root, emit, env = {}) => spawnSync('bash', ['-c', cmd.replace(/AGENTRC_EMIT='[^']+' /, `AGENTRC_EMIT='${emit}' `)],
+  { encoding: 'utf8', env: { ...process.env, AGENTRC_DIR: root, ...env } })
+const commandOf = (prompt) => String(prompt).match(/run exactly `([^`]*)` and answer/)[1]
+// The interpreter the commands run under: PIN's /usr/bin/python3 does not exist on Windows; forward slashes for bash.
+const hostPython = () => spawnSync('python3', ['-c', 'import sys; print(sys.executable)'], { encoding: 'utf8' }).stdout.trim().replaceAll('\\', '/')
+
+const HOSTILE = `it's "quoted", \\ back\; \`tick\` $(touch /tmp/pwned) '\\'' \r\nline\r\n naïve ✓ 😀   EOF`
+// A stage that does not decode to the JSON sent: cut short, other JSON, not base64.
+const corrupted = (b64, json) => [Buffer.from(json.slice(0, -1)).toString('base64'), Buffer.from('[]').toString('base64'), `${b64.slice(0, 10)}!${b64.slice(11)}`]
+
+test('hostile text in a reply body reaches reply.py byte for byte; a corrupted stage runs no script (#510)', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'pr-babysit-exec-'))
+  let emitRoot = null
+  try {
+    const ran = await run({
+      keepEmit: true, args: { ...YIELD, python: hostPython() }, reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: HOSTILE }], bots: 'reviewed' },
+    })
+    emitRoot = ran.emitRoot
+    const { calls } = ran
+    // reply.py stands in as a copy of its --manifest beside its receipt; the stage is the real facts.py's.
+    const stub = join(tmp, 'skills', 'pr-reply', 'scripts')
+    mkdirSync(stub, { recursive: true })
+    writeFileSync(join(stub, 'reply.py'), 'import shutil, sys\nshutil.copy(sys.argv[sys.argv.index("--manifest") + 1], sys.argv[-1] + ".got")\n')
+    cpSync(fileURLToPath(new URL('../lib', import.meta.url)), join(tmp, 'lib'), { recursive: true })
+    cpSync(fileURLToPath(new URL('../skills/pr-babysit/scripts/facts.py', import.meta.url)), join(tmp, 'skills', 'pr-babysit', 'scripts', 'facts.py'))
+    const reply = calls.find(c => c.label === 'replies#1')
+    const sent = stagedOf(reply.prompt)
+    assert.equal(sent.replies[0].body, HOSTILE)
+    const out = join(tmp, 'receipt')
+    const cmd = commandOf(reply.prompt).replace(/--receipt '[^']+'/, `--receipt '${out}'`)
+    const got = runCommand(cmd, tmp, join(tmp, 'r.js'))
+    assert.equal(got.status, 0, got.stderr)
+    assert.equal(readFileSync(`${out}.got`, 'utf8'), JSON.stringify(sent), 'the manifest is the JSON the workflow sent, byte for byte')
+    assert.equal(existsSync('/tmp/pwned'), false)
+    const b64 = cmd.match(/printf '%s' '([^']*)'/)[1]
+    for (const bad of corrupted(b64, JSON.stringify(sent))) {
+      rmSync(`${out}.got`, { force: true })
+      assert.notEqual(runCommand(cmd.replace(b64, bad), tmp, join(tmp, 'bad.js')).status, 0)
+      assert.equal(existsSync(`${out}.got`), false, 'reply.py never ran')
+    }
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+    if (emitRoot) rmSync(emitRoot, { recursive: true, force: true })
+  }
+})
+
+test('a CI verdict reaches collect.py remember with no shell quoting, byte for byte; a malformed one is refused before it (#505)', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'pr-babysit-exec-'))
+  const ROOT = fileURLToPath(new URL('..', import.meta.url))
+  let emitRoot = null
+  try {
+    const ran = await run({ keepEmit: true, args: { ...YIELD, python: hostPython() }, reviews: WAITING, ci: redWith({ ...RIG, firstError: HOSTILE }).ci })
+    emitRoot = ran.emitRoot
+    const { calls } = ran
+    const remember = calls.find(c => c.label === 'ci:collect#1.w')
+    const verdicts = stagedOf(remember.prompt)
+    assert.equal(verdicts[0].failures[0].firstError, HOSTILE)
+    // The real collect.py, its store under TMPDIR; the input file goes where the workflow named it.
+    const store = join(tmp, 'store')
+    mkdirSync(store)
+    const cmd = commandOf(remember.prompt)
+    const kept = runCommand(cmd, ROOT, join(tmp, 'w.js'), { TMPDIR: store })
+    assert.equal(kept.status, 0, kept.stderr)
+    const head = remember.prompt.match(/--head ([0-9a-f]{40})/)[1]
+    const saved = JSON.parse(readFileSync(join(store, 'ci-collect', 'hathach_tinyusb', '3888', head, 'verdicts.json'), 'utf8'))
+    assert.deepEqual(Object.values(saved), verdicts, 'collect.py remember stores the verdicts as judged')
+    assert.equal(existsSync('/tmp/pwned'), false)
+    const b64 = cmd.match(/printf '%s' '([^']*)'/)[1]
+    for (const bad of corrupted(b64, JSON.stringify(verdicts))) {
+      const empty = join(tmp, `empty-${fnv1a(bad)}`)
+      mkdirSync(empty)
+      assert.notEqual(runCommand(cmd.replace(b64, bad), ROOT, join(tmp, 'bad.js'), { TMPDIR: empty }).status, 0)
+      assert.equal(existsSync(join(empty, 'ci-collect')), false, 'remember never ran')
+      assert.equal(existsSync(join(tmp, 'bad.js')), false, 'no line')
+    }
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+    if (emitRoot) rmSync(emitRoot, { recursive: true, force: true })
+  }
+})
+
+test('every script input is written by the command that runs the script, at a path the workflow names (#510)', async () => {
+  const { calls } = await run({ reviews: { findings: [finding(), invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'not so' }], bots: 'reviewed' }, args: { autoPush: true } })
+  const inputs = calls.filter(c => /printf '%s' /.test(c.prompt))
+  assert.deepEqual(inputs.map(c => c.label).sort(), ['replies#1', 'resolve#1'])
+  for (const c of inputs) {
+    // One command: the stage, then the script under `&&`, both naming the one input file beside the line.
+    const [, cmd] = c.prompt.match(/run exactly `([^`]*)`/)
+    const [, stage, emit, rest] = cmd.match(/^(printf .*) && AGENTRC_EMIT='([^']+)\.js' (.*)$/)
+    assert.ok(stage.includes(` '${emit}.in' `) && rest.includes(` --manifest '${emit}.in' `), cmd)
+    assert.doesNotMatch(c.prompt, /temporary file|mktemp|Manifest:/, c.label)
+  }
 })
 
 test('an unresolved build contract, or a build that did not run, blocks the batch as unverifiable, a failed build as unverified', async () => {
@@ -1379,6 +1519,9 @@ test('an unresolved build contract, or a build that did not run, blocks the batc
     [{ candidate: null }, /the build did not count: no sealed receipt \(the relay died or its line failed its seal\)/],
     [{ garble: (l, a) => l.startsWith('build#') ? { ...a, exit: 1 - a.exit } : a }, /the build did not count: no sealed receipt/],
     [{ candidate: { error: 'usage: ...' } }, /the build did not count: usage/],
+    // build.py's own error line names no state or revision.
+    [{ garble: (l, a) => l.startsWith('build#') ? { error: 'the build was stopped timedOut, and process(es) [1] still run' } : a },
+      /the build did not count: the build was stopped timedOut, and process\(es\) \[1\] still run/],
     [{ candidate: { exit: 2 } }, /the build failed \(exit 2\)/],
   ]) {
     const { result, labels, logs } = await run({ reviews: oneValid, ...over })
@@ -1405,7 +1548,7 @@ test('a build receipt counts only as the run that was asked for', async () => {
 test('a contract setup and its tools go to build.py, and a shell that stopped before the build is the environment', async () => {
   const buildPlan = { command: 'idf.py -B <BUILD> build', setup: '. "$IDF_PATH/export.sh"', requires: ['idf.py'] }
   const ok = await run({ reviews: oneValid, buildPlan })
-  assert.match(ok.calls.find(c => c.label === 'build#1-review').prompt, /--command='idf\.py -B <BUILD> build' --setup='\. "\$IDF_PATH\/export\.sh"' --require='idf\.py'`/)
+  assert.match(ok.calls.find(c => c.label === 'build#1-review').prompt, /--command='idf\.py -B <BUILD> build' --setup='\. "\$IDF_PATH\/export\.sh"' --require='idf\.py' --job=/)
   assert.equal(ok.result.history[0].reviewPush.pass, true)
   for (const [candidate, why] of [
     [{ stage: 'prerequisite', exit: 127 }, /the build environment is not set up: its prerequisite step stopped the shell \(exit 127\)/],
@@ -1432,7 +1575,7 @@ test('the resolver is asked for every built family\'s setup and wrapper tools, a
   const resolve = calls.find(c => c.label === 'build:resolve#1-review').prompt
   assert.match(resolve, /several targets or board families, a wrapper script's included, setup and requires hold every one's/)
   assert.match(resolve, /each tool its build invokes, through the wrapper too \(such as idf\.py\)/)
-  assert.match(calls.find(c => c.label === 'build#1-review').prompt, /--setup='\. "\$IDF_PATH\/export\.sh"' --require='python3' --require='riscv-none-elf-gcc' --require='idf\.py'`/)
+  assert.match(calls.find(c => c.label === 'build#1-review').prompt, /--setup='\. "\$IDF_PATH\/export\.sh"' --require='python3' --require='riscv-none-elf-gcc' --require='idf\.py' --job=/)
   assert.equal(result.reason, 'build-unverifiable', 'not fix-verification-failed')
   assert.match(result.detail, /its prerequisite step stopped the shell \(exit 127\)/)
 })
@@ -2220,7 +2363,7 @@ test('a same-head relaunch recalls the judged verdicts from the store: no judge'
   const store = new Map()
   const first = await run({ store, args: YIELD, reviews: WAITING, ci: redWith(RIG).ci })
   assert.deepEqual(ciLabels(first.labels), ['ci:collect#1.1', 'ci:collect#1.f', 'ci:judge#1', 'ci:collect#1.w'])
-  assert.deepEqual(Object.keys(first.result.state.ciCache.entries[0]).sort(), ['bucket', 'digest', 'link'], 'the state keeps digests only, of its expectedHead')
+  assert.deepEqual(Object.keys(first.result.state.ciCache.entries[0]).sort(), ['bucket', 'digest', 'link', 'refreshed'], 'the state keeps digests only, of its expectedHead')
   const again = await run({ store, args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci: redWith(RIG).ci })
   assert.deepEqual(ciLabels(again.labels), ['ci:collect#2.1', 'ci:collect#2.r1'])
   assert.match(again.calls.find(c => c.label === 'ci:collect#2.r1').prompt, / recall --check 'https:\/\/github\.com\/o\/r\/actions\/runs\/1\/job\/1' --repo /)
@@ -2251,7 +2394,7 @@ test('the same head in a later cycle is not judged again, and an unclassified ve
   const store = new Map()
   const first = await run({ store, args: YIELD, reviews: WAITING, ci: redWith(RIG, UNPLACED).ci })
   assert.equal(first.result.reason, 'ci-red-unclassified')
-  assert.deepEqual(trailingList(first.calls.find(c => c.label === 'ci:collect#1.w').prompt).map(v => v.link), ['https://github.com/o/r/actions/runs/1/job/1', 'https://github.com/o/r/actions/runs/1/job/2'])
+  assert.deepEqual(stagedOf(first.calls.find(c => c.label === 'ci:collect#1.w').prompt).map(v => v.link), ['https://github.com/o/r/actions/runs/1/job/1', 'https://github.com/o/r/actions/runs/1/job/2'])
   const { calls } = await run({ store, base: 'b2', args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci: redWith(RIG, UNPLACED).ci })
   const second = calls.find(c => c.label === 'ci:collect#2.f').prompt
   assert.doesNotMatch(second, /job\/1'/, 'the rig-side verdict is reused')
@@ -2267,7 +2410,7 @@ test('a stored check with an unclassified failure is judged again for that failu
   const store = new Map()
   const first = await run({ store, args: YIELD, reviews: WAITING, ci: redWith(RIG).ci, judge: judgeWith(MIXED) })
   assert.equal(first.result.reason, 'ci-red-unclassified')
-  assert.equal(trailingList(first.calls.find(c => c.label === 'ci:collect#1.w').prompt)[0].failures.length, 3, 'a mixed check is stored')
+  assert.equal(stagedOf(first.calls.find(c => c.label === 'ci:collect#1.w').prompt)[0].failures.length, 3, 'a mixed check is stored')
   const placed = { ...MIXED[1], verdict: 'rig-side', firstError: 'placed by the notes' }
   const again = await run({ store, args: { ...YIELD, state: first.result.state, ciNotes: 'pico b is the probe' }, reviews: WAITING, ci: redWith(RIG).ci, judge: judgeWith([placed]) })
   const [asked] = askedOf(judgePrompt(again.calls, 2))
@@ -2276,7 +2419,7 @@ test('a stored check with an unclassified failure is judged again for that failu
   const report = again.result.history.at(-1).ci.realFailures
   assert.deepEqual(report.map(f => [f.cell, f.verdict, f.firstError]), [['pico a', 'rig-side', 'pico a failed'], ['pico b', 'rig-side', 'placed by the notes'], ['pico c', 'rig-side', 'pico c failed']])
   assert.notEqual(again.result.reason, 'ci-red-unclassified')
-  assert.deepEqual(trailingList(again.calls.find(c => c.label === 'ci:collect#2.w').prompt), [{ link: 'https://github.com/o/r/actions/runs/1/job/1', bucket: 'fail', patch: [placed] }], 'stored as a patch of what changed')
+  assert.deepEqual(stagedOf(again.calls.find(c => c.label === 'ci:collect#2.w').prompt), [{ link: 'https://github.com/o/r/actions/runs/1/job/1', bucket: 'fail', patch: [placed] }], 'stored as a patch of what changed')
   const settled = await run({ store, args: { ...YIELD, state: again.result.state }, reviews: WAITING, ci: redWith(RIG).ci })
   assert.equal(settled.labels.includes('ci:judge#3'), false, 'then reused whole')
 })
@@ -2719,7 +2862,7 @@ test('a collector of another output contract stops collector-skew at once; a lin
   assert.ok(altered.logs.some(l => l === 'cycle 1: CI inventory failed — the collector died'), altered.logs.join('\n'))
 })
 
-test('a resumed launch collects and judges once more a stored CircleCI verdict judged incomplete (#319)', async () => {
+test('a resumed launch collects and judges once more a stored CircleCI verdict judged incomplete before the whole-log collector (#319, #482)', async () => {
   const RAM = { check: 'ci/circleci: build', link: 'https://circleci.com/gh/hathach/tinyusb/508184', signature: "ld: region `RAM' overflowed by 744 bytes",
     firstError: "ld: region `RAM' overflowed by 744 bytes", files: [], verdict: 'rig-side' }
   const accepted = { key: keyOf(RAM), reason: 'master overflows RAM on this board', scope: 'until master fixes it' }
@@ -2728,12 +2871,21 @@ test('a resumed launch collects and judges once more a stored CircleCI verdict j
   const args = { ...YIELD, acceptedFailures: [accepted] }
   const first = await run({ store, args, reviews: WAITING, ci: redWith(RAM).ci, judge: tail })
   assert.ok(first.logs.some(l => /not accepted — the watcher did not list every failure of its job/.test(l)), first.logs.join('\n'))
-  const again = await run({ store, args: { ...args, state: first.result.state }, reviews: WAITING, ci: redWith(RAM).ci })
+  assert.deepEqual(first.result.history.at(-1).ci.realFailures.map(f => f.recollect), [false], 'judged on the log collected now: a relaunch reads no more')
+  assert.equal(first.result.state.ciCache.entries[0].refreshed, true)
+  // Judged on the whole log already, it is reused by a relaunch, never collected again.
+  const marked = await run({ store, args: { ...args, state: first.result.state }, reviews: WAITING, ci: redWith(RAM).ci })
+  assert.deepEqual(ciLabels(marked.labels).slice(0, 2), ['ci:collect#2.1', 'ci:collect#2.r1'])
+  assert.equal(marked.labels.some(l => l.startsWith('ci:judge#')), false, marked.labels.join('\n'))
+  assert.deepEqual(marked.result.history.at(-1).ci.realFailures.map(f => f.recollect), [false])
+  // A state from before the mark gets one refresh.
+  const legacy = seal({ ...first.result.state, ciCache: { ...first.result.state.ciCache, entries: first.result.state.ciCache.entries.map(({ refreshed, ...e }) => e) } })
+  const again = await run({ store, args: { ...args, state: legacy }, reviews: WAITING, ci: redWith(RAM).ci })
   assert.deepEqual(ciLabels(again.labels).slice(0, 4), ['ci:collect#2.1', 'ci:collect#2.r1', 'ci:collect#2.f', 'ci:judge#2'])
   assert.ok(again.logs.some(l => l.endsWith('collected and judged again for ci/circleci: build')), again.logs.join('\n'))
   assert.equal(again.logs.some(l => /not accepted/.test(l)), false, 'the whole log made the listing complete, so the acceptance applies')
   // Still incomplete after its refresh, it stands as judged: one more judge per launch, never one per cycle.
-  const still = await run({ store, args: { ...args, state: first.result.state, maxCycles: 4, yieldAfterCycle: undefined, yieldOnChange: true }, reviews: WAITING, ci: redWith(RAM).ci, judge: tail })
+  const still = await run({ store, args: { ...args, state: legacy, maxCycles: 4, yieldAfterCycle: undefined, yieldOnChange: true }, reviews: WAITING, ci: redWith(RAM).ci, judge: tail })
   assert.equal(still.labels.filter(l => l.startsWith('ci:judge#')).length, 1, still.labels.join('\n'))
   assert.ok(still.logs.some(l => /not accepted — the watcher did not list every failure of its job/.test(l)))
   // An Actions job's log was always whole: its stored verdict is reused as before.
@@ -3103,6 +3255,7 @@ test('a run red only from accepted failures passes, listing them, and is never c
   assert.equal(result.pass, true, JSON.stringify(result.reason))
   assert.deepEqual(result.acceptedFailures, [{ check: 'pvs / analyze', workflow: 'static', job: 'pvs', cell: null, signature: 'license expires in 12 days', key: PVS_KEY, verdict: 'rig-side', reason: 'PVS license renewal pending', scope: 'until the license is renewed' }])
   assert.equal(result.observation.ci.realFailures[0].key, PVS_KEY, 'the observed report carries the key a caller accepts it by')
+  assert.equal(result.observation.ci.realFailures[0].link, failedChecks(redWith(PVS).ci)[0].link, 'and the execution merge.py matches it on')
   assert.match(summaries(logs)[0], /^cycle 1 summary — CI red, accepted failures only/)
   assert.match(rowsOf(summaries(logs)[0])[0][3], /^accepted, not fixed: PVS license renewal pending/)
   assert.equal(rowsOf(summaries(logs)[0])[0][2], 'rig-side', 'the watcher\'s classification is kept')
@@ -3608,13 +3761,14 @@ test('a relay a resume meets again never runs its command twice: its line is rel
     try {
       const prefix = first.journal.slice(0, first.journal.findIndex(j => j.label === 'build#1-review'))
       const resumed = await run({ reviews: oneValid, resume: prefix })
-      // The stub is the command: it ran once in all, in the first launch.
-      assert.deepEqual([first.labels, resumed.labels].map(ls => ls.filter(l => l.startsWith('build#')).length), [1, 0], how)
+      // The stub is the command: it ran once in all, in the first launch; a build's retry attaches to its job (#375).
+      assert.deepEqual([first.labels, resumed.labels].map(ls => ls.filter(l => l === 'build#1-review').length), [1, 0], how)
       const reloaded = resumed.logs.includes('build#1-review: the line an earlier attempt of this call wrote, reloaded')
       const unknown = resumed.logs.some(l => l.startsWith('build#1-review: an earlier attempt of this call claimed ') && l.endsWith('its outcome is unknown'))
       assert.deepEqual([reloaded, unknown], how === 'after its line' ? [true, false] : [false, true], how)
-      assert.equal(!!resumed.result.history[0].reviewPush?.pass, how === 'after its line', `${how}: an unknown build publishes nothing`)
-    } finally { rmSync(first.emitDir.split('/agentrc-emit/')[0], { recursive: true, force: true }) }
+      assert.deepEqual(resumed.labels.filter(l => l.startsWith('build#')), [], how)
+      assert.equal(!!resumed.result.history[0].reviewPush?.pass, true, `${how}: an unknown attempt's build is waited on again`)
+    } finally { rmSync(first.emitRoot, { recursive: true, force: true }) }
   }
 })
 
@@ -3641,7 +3795,7 @@ test("a reply relay a resume meets again posts nothing: its line, or the receipt
         assert.ok(answered, how)
         assert.equal(resumed.logs.includes("replies#1: recovered from reply.py's saved receipt"), how !== 'after its line', resumed.logs.join('\n'))
       }
-    } finally { rmSync(first.emitDir.split('/agentrc-emit/')[0], { recursive: true, force: true }) }
+    } finally { rmSync(first.emitRoot, { recursive: true, force: true }) }
   }
 })
 
@@ -3677,7 +3831,7 @@ test('an upheld refutation still replies and resolves', async () => {
   })
   const posted = calls.find(c => c.label.startsWith('replies#'))
   assert.ok(posted, 'expected the refutation to be posted')
-  assert.match(posted.prompt, /"commentId":1/)
+  assert.match(stagedText(posted.prompt), /"commentId":1/)
 })
 
 test('sibling refutations on one comment are merged into its single reply', async () => {
@@ -3695,8 +3849,8 @@ test('sibling refutations on one comment are merged into its single reply', asyn
   })
   const posted = calls.filter(c => c.label.startsWith('replies#'))
   assert.equal(posted.length, 1, 'one posting agent, one reply per thread')
-  assert.match(posted[0].prompt, /the first point misreads the guard/)
-  assert.match(posted[0].prompt, /the second point is about dead code/)
+  assert.match(stagedText(posted[0].prompt), /the first point misreads the guard/)
+  assert.match(stagedText(posted[0].prompt), /the second point is about dead code/)
   assert.equal(result.pass, true, `both dismissals must be settled (got ${result.reason})`)
 })
 
@@ -3712,7 +3866,7 @@ test('an overturned finding is fixed, replied to, and carries the challenger rea
   // every finding on the comment was overturned, so the fix note is NOT withheld
   const resolve = calls.find(c => c.label.startsWith('resolve#'))
   assert.ok(resolve, 'expected the fix note to be posted')
-  assert.match(resolve.prompt, /"commentId":1/)
+  assert.match(stagedText(resolve.prompt), /"commentId":1/)
 })
 
 test('an overturned finding with no hint carries the evidence alone', async () => {
@@ -3798,8 +3952,8 @@ test('two valid findings on one comment share one fix note', async () => {
   })
   const resolve = calls.filter(c => c.label.startsWith('resolve#'))
   assert.equal(resolve.length, 1)
-  assert.equal([...resolve[0].prompt.matchAll(/"commentId":1\b/g)].length, 1, 'one note for the thread')
-  assert.match(resolve[0].prompt, /Fixed in [0-9a-f]{40}\.\\n\\n- src\/a\.c:1\\n- src\/a\.c:9"/, 'both findings named in the one note')
+  assert.equal([...stagedText(resolve[0].prompt).matchAll(/"commentId":1\b/g)].length, 1, 'one note for the thread')
+  assert.match(stagedText(resolve[0].prompt), /Fixed in [0-9a-f]{40}\.\\n\\n- src\/a\.c:1\\n- src\/a\.c:9"/, 'both findings named in the one note')
   assert.doesNotMatch(resolve[0].prompt, /leak/)
   assert.equal(result.pass, true, `the comment must be settled (got ${result.reason})`)
 })
@@ -3939,7 +4093,7 @@ for (const [name, { harvests, verdicts, maxCycles, ...over }, outcome] of [
     if ('notReason' in outcome) assert.notEqual(result.reason, outcome.notReason)
     if ('outstanding' in outcome) assert.deepEqual(result.outstanding, outcome.outstanding)
     if (outcome.log) assert.ok(logs.some(l => l.includes(outcome.log)), logs.join('\n'))
-    const posted = calls.find(c => c.label.startsWith('replies#'))?.prompt ?? ''
+    const posted = stagedText(calls.find(c => c.label.startsWith('replies#'))?.prompt)
     for (const [id, n] of Object.entries(outcome.posted ?? {})) assert.equal(posted.split(`"commentId":${id}`).length - 1, n, `comment ${id} in ${posted}`)
   })
 }
@@ -3970,7 +4124,7 @@ const reanswered = async () => {
 test('the caller\'s reply settles a handed-off comment once reply.py reads both back at the head it was judged on', async () => {
   const { edited, at, state, settlement } = await reanswered()
   const { result, calls, logs } = await run({ reviews: edited, preflight: at, args: { ...YIELD, state, replySettlements: [settlement] } })
-  assert.deepEqual(payloadOf(calls.find(c => c.label === 'reuse#3').prompt, 'Reuses').reuses,
+  assert.deepEqual(stagedOf(calls.find(c => c.label === 'reuse#3').prompt).reuses,
     [{ commentId: 1, replyId: 777, bodyDigest: 'abcd1234', originalDigest: 'edited' }])
   assert.deepEqual(result.settlements, [{ commentId: 1, outcome: 'settled', replyId: 777 }])
   assert.deepEqual(result.rollup.rows.map(r => [r.commentDigest, r.reply]), [['edited', { how: 'caller', replyId: 777, settled: true }]],
@@ -4300,7 +4454,7 @@ test('a reply that reads back as the offered body is the caller\'s to settle on,
   const settlement = { commentId: 2, commentDigest: 'd2', replyId: 502, bodyDigest: fnv1a('not so'), headSha: first.result.state.expectedHead }
   const { result, labels, calls } = await resumeAt(first.result.state, { ...wrong, args: { autoPush: true, maxCycles: 3, replySettlements: [settlement] } })
   assert.deepEqual(labels.filter(l => /^(replies|inspect|edit|reuse)#/.test(l)), ['reuse#2'])
-  assert.deepEqual(payloadOf(calls.find(c => c.label === 'reuse#2').prompt, 'Reuses').reuses,
+  assert.deepEqual(stagedOf(calls.find(c => c.label === 'reuse#2').prompt).reuses,
     [{ commentId: 2, replyId: 502, bodyDigest: fnv1a('not so'), originalDigest: 'd2' }])
   assert.equal(result.pass, true, result.reason)
 })
@@ -4625,7 +4779,7 @@ test('a settlement or a by-hand answer recorded before CodeRabbit rewrote its co
   // Each launch gets its own copy: a launch re-pins the state it restored in place.
   const settled = await run({ reviews: now, preflight: at, args: { ...YIELD, state: structuredClone(state), replySettlements: [{ ...settlement }] } })
   assert.deepEqual(settled.result.settlements, [{ commentId: 1, outcome: 'settled', replyId: 777 }])
-  assert.equal(payloadOf(settled.calls.find(c => c.label === 'reuse#3').prompt, 'Reuses').reuses[0].originalDigest, 'canon')
+  assert.equal(stagedOf(settled.calls.find(c => c.label === 'reuse#3').prompt).reuses[0].originalDigest, 'canon')
   assert.deepEqual(settled.result.state.answeredWith.find(([id]) => id === 1), [1, { how: 'byHand', digest: 'canon' }])
   // Settled on the digest of the day, then rewritten: still the caller's answer.
   const byHand = await run({ reviews: edited, preflight: at, args: { ...YIELD, state, replySettlements: [settlement] } })
@@ -4673,6 +4827,71 @@ test('an out-of-scope topic holds a finding its issue covers before the first ha
   const deferred = await run({ reviews: oneValid, args: { autoPush: true, deferrals: [topic, deferral()], state: held.result.state, maxCycles: 3 } })
   assert.equal(deferred.labels.some(l => l.startsWith('topic#')), false)
   assert.equal(deferred.result.pass, true, JSON.stringify(deferred.result.reason))
+})
+
+test('a valid finding whose fix changes a caller-reserved area is held with its proposed fix, never fixed; anything short of a clear no holds (#497)', async () => {
+  // agentrc#496: two pushed repairs changed verdict binding and reopen semantics the caller had reserved for the human.
+  const RESERVED = [{ area: 'verdict binding and closure/reopen semantics', paths: ['src/a.c'], symbols: ['unclose'] }]
+  const two = { findings: [finding({ fixHint: 'make unclose() reopen too' }), finding({ commentId: 2, file: 'src/b.c' })], replies: [], bots: 'reviewed' }
+  const mixed = await run({ reviews: two, args: { autoPush: true, maxCycles: 1, reserved: RESERVED }, inReserved: (id) => id === '1#1' })
+  const prompt = mixed.calls.find(c => c.label === 'reserved#1').prompt
+  assert.ok(prompt.includes(JSON.stringify(RESERVED)) && prompt.includes('"proposedFix":"make unclose() reopen too"'), prompt)
+  const fixes = mixed.calls.filter(c => c.label.startsWith('fix:'))
+  assert.ok(fixes.length > 0 && fixes.every(c => c.prompt.includes('src/b.c:1') && !c.prompt.includes('src/a.c:1')), 'only the finding outside the area is fixed')
+  assert.ok(!fixes.some(c => c.prompt.includes('make unclose() reopen too')), 'the held one reaches no writer')
+  const row = mixed.result.rollup.rows.find(r => r.findingId === '1#1')
+  assert.deepEqual([row.state, row.hold, row.proposedFix], ['held', 'in a caller-reserved area: stub reading', 'make unclose() reopen too'])
+  const alone = { findings: [two.findings[0]], replies: [], bots: 'reviewed' }
+  const held = await run({ reviews: alone, args: { autoPush: true, maxCycles: 3, reserved: RESERVED }, inReserved: () => true })
+  assert.equal(held.labels.some(l => /^(fix:|push#|resolve#)/.test(l)), false)
+  assert.equal(held.result.reason, 'held-awaiting-caller')
+  assert.deepEqual(held.result.held, [{ findingId: '1#1', commentId: 1, reason: 'in a caller-reserved area: stub reading', proposedFix: 'make unclose() reopen too' }])
+  assert.deepEqual(held.result.state.reserved, RESERVED)
+  // The state keeps the areas: a resume that names none still holds the finding.
+  // Only the caller lifts it: a resume over the same areas keeps the hold unjudged, whatever a verifier would say now.
+  const resumed = await run({ reviews: alone, args: { autoPush: true, maxCycles: 4, state: held.result.state }, inReserved: () => false })
+  assert.equal(resumed.labels.some(l => /^(reserved#|fix:|commit#|push#|resolve#)/.test(l)), false, resumed.labels.join(', '))
+  assert.deepEqual(resumed.result.held, held.result.held)
+  // Another hold meanwhile (an unsettled dismissal) does not end the reservation: valid again, it is still held (Codex re-review).
+  const dismissed = { findings: [invalidFinding({ fixHint: alone.findings[0].fixHint })], replies: [], bots: 'reviewed' }
+  const other = await run({ reviews: dismissed, args: { autoPush: true, maxCycles: 4, state: held.result.state },
+    challenge: { verdicts: [{ id: 0, verdict: 'unknown', reason: 'cannot tell' }] } })
+  assert.match(other.result.state.holds[0][1].reason, /^the challenger could not settle it/)
+  const again = await run({ reviews: alone, args: { autoPush: true, maxCycles: 5, state: other.result.state }, inReserved: () => false })
+  assert.equal(again.labels.some(l => /^(reserved#|fix:|commit#|push#|resolve#)/.test(l)), false, again.labels.join(', '))
+  assert.deepEqual(again.result.held, held.result.held)
+  // A refused deferral keeps the reservation: the next launch over the same areas still holds the finding (Codex round 3).
+  const refused = await run({ reviews: alone, args: { autoPush: true, maxCycles: 4, state: held.result.state, deferrals: [deferral({ commentDigest: 'stale' })] }, inReserved: () => false })
+  assert.equal(refused.result.reason, 'deferral-refused')
+  const after = await run({ reviews: alone, args: { autoPush: true, maxCycles: 5, state: refused.result.state }, inReserved: () => false })
+  assert.equal(after.labels.some(l => /^(reserved#|fix:|commit#|push#|resolve#)/.test(l)), false, after.labels.join(', '))
+  assert.deepEqual(after.result.held, held.result.held)
+  // Changed areas end the reservations at once, a launch that stops before judging included; the same areas keep them.
+  for (const [areas, kept] of [[[{ area: 'the queue --json v1 contract' }], undefined], [undefined, [['1#1', held.result.held[0].reason]]]]) {
+    const ended = await run({ reviews: alone, args: { autoPush: true, maxCycles: 4, state: held.result.state, ...(areas ? { reserved: areas } : {}) },
+      preflight: { prState: 'MERGED' } })
+    assert.equal(ended.result.reason, 'pr-merged')
+    assert.deepEqual(ended.result.state.reservations, kept, JSON.stringify(areas))
+  }
+  // Narrowed areas are judged again, and a deferral releases the finding from them.
+  const narrowed = await run({ reviews: alone, args: { autoPush: true, maxCycles: 4, state: held.result.state, reserved: [{ area: 'the queue --json v1 contract' }] }, inReserved: () => false })
+  assert.ok(narrowed.labels.includes('reserved#2') && narrowed.labels.some(l => l.startsWith('fix:')), narrowed.labels.join(', '))
+  const deferred = await run({ reviews: alone, args: { autoPush: true, maxCycles: 4, state: held.result.state, deferrals: [deferral()] }, inReserved: () => true })
+  assert.equal(deferred.labels.some(l => /^(reserved#|fix:)/.test(l)), false)
+  assert.deepEqual(deferred.result.state.holds, [])
+  // An unsure or dead verifier holds too, as does a list naming one finding twice and another not at all.
+  const twice = (ids) => [ids[0], ids[0]].map(findingId => ({ findingId, reserved: false, reason: 'twice' }))
+  for (const over of [{ inReserved: () => null }, { throwOn: 'reserved#' }, { reservedVerdicts: twice, reviews: two }]) {
+    const { labels, result } = await run({ reviews: oneValid, args: { autoPush: true, maxCycles: 1, reserved: RESERVED }, ...over })
+    assert.equal(labels.some(l => l.startsWith('fix:')), false, JSON.stringify(over))
+    assert.equal(result.state.holds.length, (over.reviews || oneValid).findings.length)
+    assert.ok(result.state.holds.every(([, h]) => /^not judged outside the caller-reserved areas/.test(h.reason)))
+  }
+  // Without areas nothing is asked, and a malformed one refuses the launch.
+  assert.equal((await run({ reviews: oneValid })).labels.some(l => l.startsWith('reserved#')), false)
+  for (const bad of [[{ area: '' }], [{ area: 'x', paths: ['../a'] }], [{ area: 'x', why: 'y' }], [{ area: 'x' }, { area: 'x' }], 'x']) {
+    await assert.rejects(run({ args: { reserved: bad } }), /reserved must be/, JSON.stringify(bad))
+  }
 })
 
 test('a green PR whose owed findings are all held for the caller stops at once; a hold another cycle may lift re-arms', async () => {
@@ -7762,6 +7981,30 @@ test('a failed tick spends no comment: one `@coderabbitai review` asks for the s
   assert.equal(d.result.state.reviewClock.request.at, at(0), "the script's own check finds the standing comment, and it is waited on")
 })
 
+test('a failed CodeRabbit review gets one `@coderabbitai review` per head, waited on to the cap, never an unreadable wait (#499)', async () => {
+  const failedCr = () => bot('coderabbit', { state: 'settled', kind: 'failed', sha: 'head', evidence: ['check run completed/neutral'], reason: 'check run: Review failed' })
+  let n = 0
+  const { result, logs, labels, calls } = await run({
+    args: { coderabbitTrigger: true, maxCycles: 3 }, reviewsPerCycle: () => quiet([++n === 1 ? failedCr() : bot('coderabbit')]),
+  })
+  assert.equal(result.pass, true, result.reason)
+  assert.deepEqual([triggers(labels), requests(labels)], [[], ['crrequest#1']])
+  const call = calls.find(c => c.label === 'crrequest#1')
+  assert.ok(call.prompt.includes(`--head ${HEAD} --request\``), call.prompt)
+  assert.ok(call.prompt.includes('again, its review of the head failed'), call.prompt)
+  assert.ok(logs.includes('cycle 1: crrequest#1: requested (comment 99)'), logs.join('\n'))
+  assert.equal(headLine(logs)[0], 'cycle 1 summary — CI green, reviews: coderabbit review triggered (check run: Review failed, 10m to cap)')
+  // Still failed at the cap after its one request: stopped unreviewed, never asked twice and never read as unreadable.
+  const capped = await run({ args: { coderabbitTrigger: true, maxCycles: 4 }, minutesPerCycle: 5, reviews: quiet([failedCr()]) })
+  assert.equal(capped.result.reason, 'coderabbit-unreviewed')
+  assert.deepEqual([triggers(capped.labels), requests(capped.labels)], [[], ['crrequest#1']])
+  assert.deepEqual(capped.result.coderabbitAsk, { relaunchAsks: null, asked: [{ ask: 'request', at: at(0), requests: 1 }] })
+  // Without the switch nothing is asked, and a failed review settles at once.
+  const plain = await run({ args: { maxCycles: 2 }, reviews: quiet([failedCr()]) })
+  assert.equal(plain.result.pass, true, plain.result.reason)
+  assert.deepEqual(requests(plain.labels), [])
+})
+
 test('a cycle that asked a bot to review and then met a GitHub rate limit stays charged', async () => {
   const { result, labels } = await run({
     args: { coderabbitTrigger: true, maxCycles: 4 }, reviews: quiet([skippedCr()]),
@@ -7991,6 +8234,64 @@ test('a preflight that got no emit directory is asked again on its retry, which 
   }
 })
 
+test('a facts.py without emit-dir stops at preflight naming both agentrc roots, not a usage error (#480)', async () => {
+  const usage = { dir: '', error: 'usage: facts.py repo' }
+  const got = await run({ reviews: oneValid, dirAnswer: () => usage })
+  assert.deepEqual([got.result.reason, got.labels], ['preflight-failed', []], 'no relay runs without a directory')
+  assert.match(got.result.detail, /^facts\.py emit-dir answered "usage: facts\.py repo": the scripts are another agentrc revision than this workflow; the scripts are \/home\/u\/code\/agentrc 341ae67 \(AGENTRC_DIR, else ~\/\.claude\), and the saved workflow a named launch loads is \/home\/u\/candidate 455d554\. AGENTRC_DIR does not choose the saved workflow: relaunch with Workflow scriptPath "\$\{AGENTRC_DIR:-\$HOME\/\.claude\}\/workflows\/pr-babysit\.js"/)
+  assert.equal(got.journal.filter(j => j.label === 'emit:roots').length, 1, 'the roots are read once')
+  const roots = got.journal.find(j => j.label === 'emit:roots').prompt
+  assert.ok(roots.includes('"${AGENTRC_DIR:-$HOME/.claude}"/skills/pr-babysit/scripts/facts.py "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/workflows/pr-babysit.js"'), roots)
+  // A state load meets the same skew; another emit-dir failure keeps its plain detail.
+  const { state, stateRef } = await savedForLoad()
+  const load = await run({ args: { yieldAfterCycle: true, maxCycles: 3, stateRef }, load: state, dirAnswer: () => usage, roots: null })
+  assert.deepEqual([load.result.reason, load.result.detail.split(';')[1]], ['state-transfer-failed', ' neither root could be read. AGENTRC_DIR does not choose the saved workflow: relaunch with Workflow scriptPath "${AGENTRC_DIR:-$HOME/.claude}/workflows/pr-babysit.js", expanded in the shell first'])
+  const plain = await run({ reviews: oneValid, dirAnswer: () => ({ dir: '', error: 'no git dir' }) })
+  assert.equal(plain.result.detail, 'no directory for the line (facts.py emit-dir failed)')
+  assert.equal(plain.journal.some(j => j.label === 'emit:roots'), false)
+})
+
+test('a resume that names no checkoutDir inherits the state\'s when it is the session\'s worktree; an explicit other one refuses (#517)', async () => {
+  const WT = '/home/u/code/tinyusb/.worktrees/fix-hil-net'
+  const first = await run({ args: { ...YIELD, checkoutDir: WT } })
+  const state = first.result.state
+  const saved = structuredClone(state) // a resume mutates the state it is handed
+  assert.equal(state.config.checkoutDir, WT)
+  const resumed = await run({ args: { ...YIELD, state } })
+  assert.equal(resumed.result.state.cyclesUsed, 2, resumed.result.reason)
+  assert.equal(resumed.result.state.config.checkoutDir, WT)
+  assert.match(resumed.journal.find(j => j.label === 'state:checkout').prompt, /git -C '\/home\/u\/code\/tinyusb\/\.worktrees\/fix-hil-net' rev-parse --show-toplevel/)
+  assert.ok(resumed.calls.find(c => c.label === 'preflight').prompt.startsWith(`The PR branch checkout is at ${WT} `))
+  for (const [over, why] of [
+    [{ sameCheckout: 1 }, /checkoutDir: "\/home\/u\/code\/tinyusb\/\.worktrees\/fix-hil-net" vs "\."/],
+    [{ sameCheckout: null }, /checkoutDir: "\/home\/u\/code\/tinyusb\/\.worktrees\/fix-hil-net" vs "\."/],
+    [{ args: { ...YIELD, state, checkoutDir: '/elsewhere' } }, /checkoutDir: "\/home\/u\/code\/tinyusb\/\.worktrees\/fix-hil-net" vs "\/elsewhere"/],
+    [{ args: { ...YIELD, state, checkoutDir: '.' } }, /checkoutDir: "\/home\/u\/code\/tinyusb\/\.worktrees\/fix-hil-net" vs "\."/],
+    [{ args: { ...YIELD, state: { ...state, cyclesUsed: 0 } } }, /state digest mismatch/],
+    [{ args: { ...YIELD, state, repo: 'other/repo' } }, /repo other\/repo is not the state's hathach\/tinyusb/],
+  ]) {
+    const trace = []
+    await assert.rejects(run({ args: { ...YIELD, state }, trace, ...over }), why)
+    assert.equal(trace.some(c => c.label === 'preflight'), false)
+  }
+  // By stateRef, state_transfer.py's sealed reading stands in for that relay; one that is not a sealed yes for this
+  // checkoutDir refuses as a no does.
+  const stateRef = { outputFile: '/tmp/tasks/w1.output', digest: first.result.stateDigest }
+  const reading = (same, dir = WT) => sealLine({ dir, same })
+  const byRef = (checkout) => run({ args: { ...YIELD, stateRef }, load: structuredClone(saved),
+    garble: onLoad(({ checkout: _, ...line }) => checkout === undefined ? line : { ...line, checkout }) })
+  const loaded = await byRef(reading(true))
+  assert.deepEqual([loaded.result.state.cyclesUsed, loaded.result.state.config.checkoutDir], [2, WT], loaded.result.reason)
+  assert.equal(loaded.journal.some(j => j.label === 'state:checkout'), false)
+  for (const checkout of [reading(false), { ...reading(false), same: true }, reading(true, '/elsewhere'), undefined]) {
+    await assert.rejects(byRef(checkout), /checkoutDir: "\/home\/u\/code\/tinyusb\/\.worktrees\/fix-hil-net" vs "\."/, JSON.stringify(checkout))
+  }
+  // A fresh launch and a state of the session directory ask nothing.
+  assert.equal(first.journal.some(j => j.label === 'state:checkout'), false)
+  const here = await run({ args: { ...YIELD, state: (await run({ args: YIELD })).result.state } })
+  assert.equal(here.journal.some(j => j.label === 'state:checkout'), false)
+})
+
 test('a resumed launch reloads the lines its relays wrote; a file there before a live run is reloaded only when it names itself', async () => {
   const reviews = { findings: [invalidFinding({ commentId: 2 })], replies: [{ commentId: 2, body: 'not so' }], bots: 'reviewed' }
   const args = { yieldAfterCycle: true, maxCycles: 3 }
@@ -8018,7 +8319,7 @@ test('a resumed launch reloads the lines its relays wrote; a file there before a
     assert.ok(foreign.logs.includes(`preflight: an earlier attempt of this call claimed ${pre} and left no line of it — its outcome is unknown`), foreign.logs.join('\n'))
     assert.equal(foreign.labels[0], 'preflight.retry', 'the refused call ran nothing')
     assert.equal(foreign.result.pass, true)
-  } finally { rmSync(first.emitDir.split('/agentrc-emit/')[0], { recursive: true, force: true }) }
+  } finally { rmSync(first.emitRoot, { recursive: true, force: true }) }
 })
 
 test('stateRef is refused when malformed or given with state', async () => {
@@ -8041,7 +8342,7 @@ test('markSonar marks the SonarCloud issue of a refuted code-scanning comment wi
   const { calls, result } = await run({ reviews: scanRefuted, args: { autoPush: true, markSonar: true, maxCycles: 1 } })
   const labels = calls.map(c => c.label)
   assert.ok(labels.indexOf('sonar#1') > labels.findIndex(l => l.startsWith('replies#')), labels.join(', '))
-  const [item] = payloadOf(calls.find(c => c.label === 'sonar#1').prompt, 'Manifest').items
+  const [item] = stagedOf(calls.find(c => c.label === 'sonar#1').prompt).items
   assert.deepEqual(item, { commentId: 3, commentDigest: 'd3', how: 'refutation', note: 'Not injectable: a list argv.', digest: fnv1a('Not injectable: a list argv.') })
   assert.match(calls.find(c => c.label === 'sonar#1').prompt, new RegExp(`--pr 3888 --repo 'hathach/tinyusb' --head ${HEAD} --manifest`))
   assert.deepEqual(result.history[0].sonar, [{ commentId: 3, issue: 'K3', outcome: 'marked', detail: 'false positive' }])
@@ -8072,8 +8373,8 @@ test('the note is the body that was posted, and an edited comment is marked with
     reviews: { ...scanRefuted, replies: [{ commentId: 3, body: 'second wording' }] },
     args: { ...YIELD, markSonar: true, state },
   })
-  assert.match(calls.find(c => c.label.startsWith('replies#')).prompt, /first wording/)
-  assert.equal(payloadOf(calls.find(c => c.label.startsWith('sonar#')).prompt, 'Manifest').items[0].note, 'first wording')
+  assert.match(stagedText(calls.find(c => c.label.startsWith('replies#')).prompt), /first wording/)
+  assert.equal(stagedOf(calls.find(c => c.label.startsWith('sonar#')).prompt).items[0].note, 'first wording')
   assert.deepEqual(sonarOf(result.state), [])
   // Owed before an edit, then the reviewer edits the comment: nothing is marked with the old answer.
   const owed = (await run({ reviews: scanRefuted, args: { ...YIELD } })).result.state
@@ -8091,7 +8392,7 @@ test('a later launch with markSonar marks what an earlier one left owed', async 
   const again = await run({ args: { ...YIELD, markSonar: true, state: first.result.state } })
   const sonar = again.calls.find(c => c.label.startsWith('sonar#'))
   assert.ok(sonar, again.calls.map(c => c.label).join(', '))
-  assert.equal(payloadOf(sonar.prompt, 'Manifest').items[0].commentId, 3)
+  assert.equal(stagedOf(sonar.prompt).items[0].commentId, 3)
   assert.deepEqual(sonarOf(again.result.state), [])
 })
 
@@ -8104,19 +8405,21 @@ test('a refuted comment from another reviewer owes SonarCloud nothing', async ()
   assert.deepEqual(sonarOf(result.state), [])
 })
 
-test('a waiting or failed issue stays owed and is listed unmarked, and a relay error stops asking for the launch', async () => {
+test('a waiting, refused or failed issue stays owed and is listed unmarked, and a relay error stops asking for the launch', async () => {
   const two = { findings: [invalidFinding({ source: 'code-scanning', commentId: 3 }), invalidFinding({ source: 'code-scanning', commentId: 4 })],
     replies: [{ commentId: 3, body: 'a' }, { commentId: 4, body: 'b' }], bots: 'reviewed' }
-  const partial = await run({
-    reviews: two, args: { autoPush: true, markSonar: true, maxCycles: 1 },
-    sonar: () => ({ results: [{ commentId: 3, issue: 'K3', outcome: 'failed', detail: 'HTTP 403' }, { commentId: 4, issue: 'K4', outcome: 'waiting', detail: 'not analysed' }] }),
-  })
-  assert.equal(partial.result.pass, true, 'the PR is green')
-  assert.deepEqual(sonarOf(partial.result.state), [[3, 'a'], [4, 'b']])
-  assert.deepEqual(partial.result.sonarUnmarked, [
-    { commentId: 3, how: 'refutation', last: { commentId: 3, issue: 'K3', outcome: 'failed', detail: 'HTTP 403' } },
-    { commentId: 4, how: 'refutation', last: { commentId: 4, issue: 'K4', outcome: 'waiting', detail: 'not analysed' } }])
-  assert.ok(partial.logs.some(l => /sonar#1: comment 3, issue K3: failed \(HTTP 403\)/.test(l)), partial.logs.join('\n'))
+  for (const [outcome, detail] of [['refused', 'HTTP 403'], ['failed', 'HTTP 503']]) {
+    const partial = await run({
+      reviews: two, args: { autoPush: true, markSonar: true, maxCycles: 1 },
+      sonar: () => ({ results: [{ commentId: 3, issue: 'K3', outcome, detail }, { commentId: 4, issue: 'K4', outcome: 'waiting', detail: 'not analysed' }] }),
+    })
+    assert.equal(partial.result.pass, true, 'the PR is green')
+    assert.deepEqual(sonarOf(partial.result.state), [[3, 'a'], [4, 'b']], outcome)
+    assert.deepEqual(partial.result.sonarUnmarked, [
+      { commentId: 3, how: 'refutation', last: { commentId: 3, issue: 'K3', outcome, detail } },
+      { commentId: 4, how: 'refutation', last: { commentId: 4, issue: 'K4', outcome: 'waiting', detail: 'not analysed' } }])
+    assert.ok(partial.logs.some(l => l.includes(`sonar#1: comment 3, issue K3: ${outcome} (${detail})`)), partial.logs.join('\n'))
+  }
   const dead = await run({ reviews: two, args: { autoPush: true, markSonar: true, maxCycles: 1 }, sonar: () => null })
   assert.deepEqual(sonarOf(dead.result.state).map(([id]) => id), [3, 4])
   let cycle = 0
@@ -8184,7 +8487,7 @@ test('a fixed code-scanning finding still flagged is marked once CI settles, and
   })
   const sonar = calls.filter(c => c.label.startsWith('sonar#'))
   assert.deepEqual(sonar.map(c => c.label), ['sonar#2'], calls.map(c => c.label).join(', '))
-  const [item] = payloadOf(sonar[0].prompt, 'Manifest').items
+  const [item] = stagedOf(sonar[0].prompt).items
   assert.equal(item.how, 'fixNote')
   assert.match(item.note, /^Fixed in [0-9a-f]{40}\./)
   assert.match(sonar[0].prompt, new RegExp(`--head ${shaFor(1)} `))
@@ -8589,6 +8892,40 @@ test('a failed, uncertain or lost request stops greptile-unreviewed at once and 
   assert.equal(moved.result.state.reviewClock.greptileAt, undefined, 'nothing was asked')
 })
 
+test('a request whose read failed before its claim is asked once more on the head, across a resume too; never a third time (#425)', async () => {
+  const unread = { outcome: 'failed', detail: 'gh api repos/{owner}/{repo}/pulls/379: gh: HTTP 502', phase: 'read' }
+  const once = await run({ args: { ...GT, maxCycles: 6 }, minutesPerCycle: 3, gTrigger: (l) => l === 'greptile#2' ? unread : { outcome: 'requested', detail: 'comment 7', commentId: 7 }, reviews: silentG() })
+  assert.deepEqual(gAsks(once.labels), ['greptile#2', 'greptile#3'])
+  assert.equal(once.result.state.reviewClock.greptileRetried, true)
+  assert.equal(once.result.state.reviewClock.greptileAt, at(6))
+  const twice = await run({ args: { ...GT, maxCycles: 6 }, minutesPerCycle: 3, gTrigger: unread, reviews: silentG() })
+  assert.deepEqual([twice.result.reason, gAsks(twice.labels)], ['greptile-unreviewed', ['greptile#2', 'greptile#3']])
+  assert.equal(twice.result.state.reviewClock.greptileAt, null, 'the retry spent, the head is not asked again')
+  // Out of budget, the retry is the relaunch's: the allowance is spent in the state, the head left unasked.
+  const YG = { ...GT, maxCycles: 6 }
+  const a = await run({ args: { ...YG, maxCycles: 2 }, minutesPerCycle: 3, gTrigger: unread, reviews: silentG() })
+  assert.deepEqual([a.result.reason, a.result.greptileRetry, gAsks(a.labels)], ['greptile-unreviewed', true, ['greptile#2']])
+  assert.deepEqual([a.result.state.reviewClock.greptileRetried, a.result.state.reviewClock.greptileAt], [true, undefined])
+  const spent = structuredClone(a.result.state) // a resume mutates the state it is handed
+  assert.equal(twice.result.greptileRetry, undefined, 'a spent retry leaves the relaunch nothing to ask')
+  const b = await run({ args: { ...YG, maxCycles: 3, state: a.result.state }, minutesPerCycle: 3, clockOffset: 6, gTrigger: unread, reviews: silentG() })
+  assert.deepEqual([b.result.reason, gAsks(b.labels)], ['greptile-unreviewed', ['greptile#3']])
+  assert.equal(b.result.state.reviewClock.greptileAt, null)
+  // A possibly posted attempt is final at once.
+  const posted = await run({ args: { ...GT, maxCycles: 6 }, minutesPerCycle: 3, gTrigger: { outcome: 'failed', detail: 'post', phase: 'post' }, reviews: silentG() })
+  assert.deepEqual(gAsks(posted.labels), ['greptile#2'])
+  // A state that counted the retry loads: one spent is still spent, none spent leaves it.
+  const { greptileRetried, ...clock } = spent.reviewClock
+  for (const [count, asks] of [[1, ['greptile#3']], [0, ['greptile#3', 'greptile#4']]]) {
+    const counted = seal({ ...structuredClone(spent), reviewClock: { ...clock, greptileRetries: count } })
+    const c = await run({ args: { ...YG, maxCycles: 4, state: counted }, minutesPerCycle: 3, clockOffset: 6, gTrigger: unread, reviews: silentG() })
+    assert.deepEqual([c.result.reason, gAsks(c.labels), c.result.state.reviewClock.greptileRetries], ['greptile-unreviewed', asks, undefined], String(count))
+  }
+  for (const bad of [{ greptileRetried: false }, { greptileRetries: -1 }]) {
+    await assert.rejects(run({ args: { ...YG, state: seal({ ...spent, reviewClock: { ...clock, ...bad } }) } }), /not a pr-babysit state/)
+  }
+})
+
 test('the obligation outlives the switch: a resume without greptileTrigger still waits and blocks, asking nothing', async () => {
   const YG = { ...G, maxCycles: 6, yieldAfterCycle: true }
   // Recorded during the grace, before the first yield.
@@ -8707,4 +9044,51 @@ test('the requirement latches for the run: a head adopted without the switch is 
   assert.deepEqual(pushed.result.state.reviewClock, { sha: ADOPT, eventAt: null, since: at(5) })
   const asked = await run({ args: { ...YG, greptileTrigger: true, state: pushed.result.state }, preflight: { head: ADOPT, prHead: ADOPT }, clockOffset: 7, reviews: silentG() })
   assert.deepEqual(gAsks(asked.labels), ['greptile#4'])
+})
+
+// #432: merge.py's --waive greptile lifts a greptile-unreviewed stop only when the state settles every finding of its last harvest.
+const waivedLaunch = (result) => {
+  const st = result.state
+  const done = spawnSync('python3', ['-X', 'utf8', '-c', 'import json,sys; sys.path.insert(0, sys.argv[1]); import merge; out = json.loads(sys.stdin.read()); st = out["result"]["state"]; '
+    + 'print(json.dumps(merge.launch(out, "w.output", st["digest"], {"branch": st["pin"]["prBranch"], "head": st["expectedHead"], "dirty": []}, merge.pr_identity(st["pin"]["prUrl"]), ["greptile"])[0]))',
+  join(STATE_TRANSFER, '..')], { input: JSON.stringify({ agentCount: 1, totalTokens: 1, logs: [], result }), encoding: 'utf8' })
+  assert.equal(done.status, 0, done.stderr)
+  return JSON.parse(done.stdout)
+}
+
+test("merge.py's waiver refuses a greptile-unreviewed stop that cut short the settling of another bot's finding", async () => {
+  const fingerprint = `coderabbit,greptile|coderabbit,greptile|${'0123456789abcdef'.repeat(2)}`
+  const failed = { outcome: 'failed', detail: 'the head event time is unknown' }
+  let n = 0
+  const cut = await run({
+    args: { ...GT, maxCycles: 5 }, minutesPerCycle: 3, gTrigger: failed,
+    reviewsPerCycle: () => ({ ...silentG(), fingerprint, ...(++n > 1 ? { findings: [invalidFinding({ commentId: 4 })], replies: [{ commentId: 4, body: 'not a bug: x' }] } : {}) }),
+  })
+  assert.equal(cut.result.reason, 'greptile-unreviewed')
+  assert.deepEqual([cut.result.state.debt, cut.result.state.answeredWith], [[], []], 'stopped before the finding was answered or owed')
+  assert.deepEqual(waivedLaunch(cut.result), ["launch: stopped greptile-unreviewed with finding(s) 4#1 of its last harvest not settled in its state: the waiver covers the bot's review only"])
+  n = 0
+  const quietCut = await run({ args: { ...GT, maxCycles: 5 }, minutesPerCycle: 3, gTrigger: failed, reviewsPerCycle: () => ({ ...silentG(), fingerprint }) })
+  assert.equal(quietCut.result.reason, 'greptile-unreviewed')
+  assert.deepEqual(waivedLaunch(quietCut.result), [], 'nothing harvested, nothing to settle')
+  // A second finding on a comment already answered, harvested in the cycle the request failed in, was never challenged or decided.
+  n = 0
+  const both = [invalidFinding({ commentId: 1 }), invalidFinding({ commentId: 1, line: 2 })]
+  const sameComment = await run({
+    args: { ...GT, autoPush: true, maxCycles: 5 }, minutesPerCycle: 3, gTrigger: failed,
+    reviewsPerCycle: () => ({ ...silentG(), fingerprint, findings: ++n > 1 ? both : both.slice(0, 1), replies: [{ commentId: 1, body: 'not a bug: x' }] }),
+  })
+  assert.equal(sameComment.result.reason, 'greptile-unreviewed')
+  assert.deepEqual(sameComment.result.state.decisions.map(([id]) => id), ['1#1'])
+  assert.deepEqual(sameComment.result.state.answeredWith.map(([id, a]) => [id, a.digest]), [[1, 'd1']])
+  assert.deepEqual(sameComment.labels.filter(l => l.startsWith('challenge')), ['challenge#1'])
+  assert.deepEqual(waivedLaunch(sameComment.result), ["launch: stopped greptile-unreviewed with finding(s) 1#2 of its last harvest not settled in its state: the waiver covers the bot's review only"])
+  // The stop after a settled cycle: the refutation posted, recorded in answeredWith, so the waiver lifts it.
+  const settled = await run({
+    args: { ...GT, autoPush: true, maxCycles: 8 }, minutesPerCycle: 2,
+    reviews: { ...silentG(), fingerprint, findings: [invalidFinding({ commentId: 4 })], replies: [{ commentId: 4, body: 'not a bug: x' }] },
+  })
+  assert.equal(settled.result.reason, 'greptile-unreviewed')
+  assert.deepEqual(settled.result.state.answeredWith.map(([id, a]) => [id, a.digest]), [[4, 'd4']])
+  assert.deepEqual(waivedLaunch(settled.result), [])
 })

@@ -35,26 +35,30 @@ python3 "$S/commits.py" head --parent <sha> 'src/a.c'  # audit the commit at HEA
 python3 "$S/commits.py" chain <from> <to> --published <pr-head> --base <base-head> --tip <base-tip>  # audit from..to for adoption, full SHAs; preflight's prBase and prBaseTip
 python3 "$S/push.py" --remote origin --branch <b> --sha <sha> --push-url <url> [--open-pr N] [--pr N] [--repo R]
 python3 "$S/sonar.py" --pr N [--repo R] --head <sha> --manifest <file> [--receipt <path>]  # mark answered code-scanning comments' SonarCloud issues false positive; a saved --receipt replays
-python3 "$S/coderabbit_trigger.py" --pr N [--repo R] --head <sha> [--request]  # tick CodeRabbit's Trigger review box when it skipped the head for a manual review; --request comments `@coderabbitai review` once its rate limit has reset, or on such a skip no tick asked for
+python3 "$S/coderabbit_trigger.py" --pr N [--repo R] --head <sha> [--request]  # tick CodeRabbit's Trigger review box when it skipped the head for a manual review; --request comments `@coderabbitai review` once its rate limit has reset, on such a skip no tick asked for, or when its review of the head failed
 python3 "$S/greptile_trigger.py" --pr N [--repo R] --head <sha>  # comment `@greptileai` once per head, recorded under the git common dir
-python3 "$S/build.py" --path 'src/a.c' --command 'make -C <BUILD>' [--setup L] [--require T]  # build the checkout as it stands
+python3 "$S/build.py" --path 'src/a.c' --command 'make -C <BUILD>' [--setup L] [--require T] [--job DIR --wait-seconds S --timeout-seconds T]  # build the checkout as it stands; --job detached, waited on S seconds a call
 python3 "$S/scope_check.py" --path 'src/a.c' --path 'test/test_a.c'  # which paths a fix writer may edit or create
 python3 "$S/state_transfer.py" <saved output>  # a stateRef's state whole with its digest
 python3 "$S/facts.py" emit-dir                 # a new directory for one launch's AGENTRC_EMIT files; ones unwritten for 14 days go
 python3 "$S/launch_result.py" --output <saved output> [--state-ref F:D] [--checkout DIR] [--keys]  # the caller's reading of a launch; --keys: settled failures' keys too
-python3 "$S/merge.py" --pr-url <url> --base <branch> --checkout DIR --output <saved output> --state-digest D [--waive BOT] [--merge]  # chief's merge gate; inspects without --merge; --waive drops a bot from the required reviews on the owner's word, recorded as `waived`
+python3 "$S/merge.py" --pr-url <url> --base <branch> --checkout DIR --output <saved output> --state-digest D [--waive BOT] [--merge]  # chief's merge gate; inspects without --merge; --waive drops a bot from the required reviews, and a last launch's stop on that bot alone, on the owner's word, recorded as `waived`
 ```
 
 `merge.py --merge` is chief-only, under `agents/chief.md`'s merge exception, and `--waive` only on the owner's word that
-the merge goes without that bot; a bot left out of `autoRun` alone is never waived, and waiving both is refused.
+the merge goes without that bot; a bot left out of `autoRun` alone is never waived, and waiving both is refused. A red
+CI goes with the merge only when the launch's `acceptedFailures` explain every failed check, as the very executions it
+judged, and none is a required check; the receipt's `accepted` records them.
 
-After an agentrc update, launch the workflow from the installed file (Workflow
+Launch the workflow from the root its scripts run from (Workflow
 `scriptPath: "${AGENTRC_DIR:-$HOME/.claude}/workflows/pr-babysit.js"`, expanded
-in the shell first), not by its name in a session started before the update:
-that session may hold an older copy of the script while the skills' scripts are
-already new. A copy whose collector output it cannot read stops
-`collector-skew` (collect.py's `contract`), one calling a script the install
-lacks `stale-workflow`.
+in the shell first), not by its name: a named launch loads the user scope's
+saved `workflows/pr-babysit.js`, which `AGENTRC_DIR` does not change, and a
+session started before an agentrc update may hold an older copy of the script
+while the skills' scripts are already new. A copy whose collector output it
+cannot read stops `collector-skew` (collect.py's `contract`), one calling a
+script the install lacks `stale-workflow`, and one whose `facts.py` lacks
+`emit-dir` stops `preflight-failed` naming both checkouts and their HEADs.
 
 `launch_result.py` is the caller's, not the workflow's: it condenses a finished
 launch, lists the `blockers` to settle before continuing, and shows as `pinned`

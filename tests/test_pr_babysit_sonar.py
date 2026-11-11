@@ -169,8 +169,23 @@ class SonarTest(unittest.TestCase):
         self.assertEqual(got[1]['outcome'], 'failed')
         self.assertIn('HTTP 404', got[1]['detail'])
         self.assertEqual(got[2]['outcome'], 'marked')
-        self.assertEqual((got[3]['outcome'], got[3]['issue']), ('failed', 'K3'))
+        self.assertEqual((got[3]['outcome'], got[3]['issue']), ('refused', 'K3'), 'no falsepositive transition for this token')
         self.assertEqual(fake.issues['K3']['status'], 'OPEN')
+
+    def test_only_sonarclouds_refusal_or_a_missing_issue_is_refused(self):
+        # #481: a 400, 401, 403 or 404 is SonarCloud refusing the request; a 408, 409, 429, 5xx or the network may pass later.
+        self.comments[1] = scanning('K1')
+        for code in (400, 401, 403, 404, 408, 409, 429, 500, 502, 503, None):
+            with self.subTest(code):
+                def answers(req, timeout):
+                    if code is None:
+                        raise sonar.urllib.error.URLError('timed out')
+                    raise sonar.urllib.error.HTTPError(req.full_url, code, 'Reason', {}, io.BytesIO(b'{"errors":[]}'))
+                with mock.patch.object(sonar.OPENER, 'open', answers):
+                    _, line = self.run_mark(sonar.sonar, [(1, 'refutation', 'n')])
+                self.assertEqual(line['results'][0]['outcome'], 'refused' if code in (400, 401, 403, 404) else 'failed', line)
+        _, line = self.run_mark(FakeSonar({}), [(1, 'refutation', 'n')])
+        self.assertEqual((line['results'][0]['outcome'], line['results'][0]['detail']), ('refused', 'SonarCloud has no issue K1 on PR #7 of o_r'))
 
     def test_a_read_back_that_is_not_false_positive_fails(self):
         self.comments[1] = scanning('K1')

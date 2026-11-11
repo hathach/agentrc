@@ -58,8 +58,10 @@ retries, recovery) apply unchanged; these scripts load its `hil_*` scripts throu
   prepared user copy shadowing a library the build's own core bundles (hashed before any compile and recorded with
   `shadows`); any other fails the sketch.
 - **The HIL build record** (schema 2) binds a run to its firmware: HEAD and a clean tree, the FQBN, the core (`{id,
-  version, install_dir}`, and `{commit, dirty}` when it is a git checkout: a dirty core's exact bytes are not
-  identified), the resolved dependencies, the roster's sha256, the library's contract files and the agentrc engines'
+  version, install_dir}`, and `{commit, dirty, content}` when it is a git checkout: `content` a sha256 over its tracked
+  diff, untracked files not ignored and submodules, or null with `contentError` when one is unreadable; a core that is
+  no git checkout is identified by id and version only, and no harness compares the core with the rig's), the
+  resolved dependencies, the roster's sha256, the library's contract files and the agentrc engines'
   closure by sha256 with its commit (provenance: the digests decide), and per sketch its images, load spans, VID:PID,
   foreign headers and used libraries. Without `--experimental`, a foreign header that differs from the checkout
   refuses the record unless it is the build's own core's copy: a core's bundled copy lags the library between core
@@ -69,6 +71,9 @@ retries, recovery) apply unchanged; these scripts load its `hil_*` scripts throu
   files differ from the ones running: rebuild it. Each process freezes the agentrc closure's digests
   when it loads it and refuses to write, admit or stage a record once those files have changed under it; a manual
   session refuses records built with other agentrc files than the ones it opened with.
+- **Core TinyUSB** (informational): each build row's `coreTinyUSB` lists, per copy of the TinyUSB an ESP32 core
+  bundles (`include/arduino_tinyusb`), the headers the build's `.d` files took from it, its `tusb_option.h` version
+  and the lib-builder's `versions.txt` `tinyusb:` ref (null when unreadable). Nothing admits or refuses on it.
 - **DUT identity**: the roster `uid` is the DUT's USB serial; `usb_port` additionally pins its bus port. `no_serial`
   (with `usb_port`) is for firmware that reports no serial (ESP32 under Arduino): the serial-less device at that port.
   `hil_test.py commission` finds and confirms either under the restoration sketch.
@@ -82,7 +87,8 @@ retries, recovery) apply unchanged; these scripts load its `hil_*` scripts throu
   `release` or `session close`; a session command that leaves a child unproven, or a restore that fails, logs the
   failure under it. A passing restore marks restored each open failure whose children and retained
   sessions are proven ended. `restore --release` releases the hold whatever the restore did: exit 0 restored, 6
-  restore failed (released), 5 not released; `session close` counts 6 closed. An older engine's pending record
+  restore failed (released), 5 not released; `session close` counts 6 closed, and on a closed session prints its
+  recorded exits without the rig (exit 0). An older engine's pending record
   (kind `arduino-hil`) is reported (`previousPending`), never a refusal.
 - **Claims** (agentrc#467): a run, commission or session command claims its board (kind `arduino-hil-claim`, the
   `hil` skill's Board locks) after its lock or hold check and before its first tool. Another live invocation on the
@@ -117,6 +123,9 @@ changes from a library:
   whose sketchbook links `hardware/<vendor>/<arch>` to the checkout and holds only the prepared dependencies, the
   user's data dir (toolchains) unchanged. A build whose platform resolves anywhere but the checkout fails, so neither
   an installed copy of the core nor a `~/Arduino/hardware` link to another checkout is ever tested by mistake.
+  Each compile appends `-ffile-prefix-map=<that dir>=.arduino-cli` to the FQBN's resolved
+  `compiler.{c,cpp,S}.extra_flags` (the platform's and `--build-property` values kept), so an image embedding
+  `__FILE__` names no PID and two builds of one commit match; the core's compilers must be GCC 8 or later.
 - **Libraries the core bundles** are its own: a user copy of one is never prepared and fails a build that used it
   (library mode admits such a shadow). Dependencies are the profile's `EXTRA_DEPENDENCIES` and their `depends=`.
 - **Sketches** are every `*.ino` dir under `SKETCH_ROOTS` (the bundled libraries, `extras/` included, as a core's
@@ -127,7 +136,11 @@ changes from a library:
   `boards.txt` or `platform.txt` change on CI's matrix) and `sketches` (the named sketches on every representative,
   e.g. a bundled library's source).
 - **One rig board, several menus**: the profile's `fqbn(board, example)` gives a HIL sketch its own FQBN (a USB stack
-  menu); the record keeps each sketch's FQBN and the report names them (`firmware.fqbns`).
+  menu); the record keeps each sketch's FQBN and the report names them (`firmware.fqbns`). A named build (feature
+  `named`) builds one sketch dir under several names: a `HIL_SKETCHES` entry `{name: (sketch dir, 'k=v,...')}` sets
+  those menu options on the board's FQBN, and the name keys its build dir, `fqbn()`, its record sketch (which also
+  names its `source`) and the test that runs it; a change to the dir builds every name it has. `bind()` refuses a name
+  that is no plain file name, an id listed twice in a role and one defined two ways across roles.
 - **Identity**: a record also binds the submodules (`git submodule status --recursive`) and refuses one that is not
   initialised, not at its gitlink or dirty (each one's own worktree, at any depth, whatever its `ignore` setting),
   `--experimental` included: a record's patch carries no submodule bytes. A record also refuses any untracked file.
@@ -175,5 +188,5 @@ user. The library's workflow and report comment are its own.
    HIL contracts.
 
 A core follows the same steps with its core-mode profile; its `agentrc_pin.py` copy also refuses engines without
-core mode (`'core'` missing from `arduino_build.PROFILE_FEATURES`), and one whose rig board has a base image without
-`'base'`, since `PROFILE_API` stays 1 for it.
+core mode (`'core'` missing from `arduino_build.PROFILE_FEATURES`), one whose rig board has a base image without
+`'base'`, and one whose `HIL_SKETCHES` names a build without `'named'`, since `PROFILE_API` stays 1 for them.

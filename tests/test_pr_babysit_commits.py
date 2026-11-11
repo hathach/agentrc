@@ -236,6 +236,28 @@ class CommitsTest(unittest.TestCase):
         self.write('t.c', 't\n')
         self.assertIn(f'sits on {one[:7]}, not {side[:7]}', self.chain_refusal(side, self.commit('two', 't.c')))
 
+    def test_an_empty_link_the_pr_head_already_has_is_adopted_and_no_other(self):
+        # #429: Adafruit_TinyUSB_Arduino#602, an empty commit pushed to resync the PR head after a GitHub outage.
+        self.write('b.c', 'b\n')
+        one = self.commit('one', 'b.c')
+        self.git('commit', '-q', '--allow-empty', '-m', 'Resync the PR head after GitHub\'s outage (empty)')
+        empty = self.git('rev-parse', 'HEAD').strip()
+        out = self.chain_of(empty, empty, self.base)
+        self.assertEqual((out['refusal'], out['unpublished'], out['changes']), ('', [], []), 'the published empty head')
+        self.write('c.c', 'c\n')
+        two = self.commit('two', 'c.c')
+        out = self.chain_of(two, empty, self.base)
+        self.assertEqual((out['refusal'], out['unpublished']), ('', ['c.c']), 'a published empty link under an unpublished one')
+        self.assertIn(f'{empty[:7]} touches no path', self.chain_of(two, one, self.base)['refusal'], 'not yet published')
+        self.git('commit', '-q', '--allow-empty', '-m', 'nothing')
+        later = self.git('rev-parse', 'HEAD').strip()
+        self.assertIn(f'{later[:7]} touches no path', self.chain_of(later, empty, self.base)['refusal'], 'an empty link after the published head')
+        self.git('checkout', '-q', '--detach', one)
+        self.git('commit', '-q', '--allow-empty', '-m', 'Resync\n\nCo-Authored-By: Claude <noreply@anthropic.com>')
+        credited = self.git('rev-parse', 'HEAD').strip()
+        self.assertIn('carries attribution', self.chain_of(credited, credited, self.base)['refusal'], 'published, but credited')
+        self.assertIn('touches no path', self.refusal('head', '--parent', one, 'b.c'), 'a commit at the head is never empty')
+
     def base_merge(self, base_files=None, pr_files=None, resolve=None, message='Merge the base', start=None):
         """A PR commit and base's own commit beside it on start, and the PR merging base, after resolve() edits the tree: (one, tip, merge)."""
         self.git('checkout', '-q', '-b', 'main', start or self.base)
@@ -510,6 +532,25 @@ class CommitsTest(unittest.TestCase):
         self.assertIn(' M a.c', self.git('status', '--porcelain'))
         code, seen = self.run_script('head', '--parent', self.base, ':(top)*')
         self.assertEqual((code, seen['refusal'], len(seen['entries'])), (0, '', 1), 'the audit reads back the same one file')
+
+    @unittest.skipIf(os.name == 'nt', 'NTFS forbids : and * in a file name')
+    def test_the_commits_hooks_read_pathspec_magic_while_its_paths_stay_literal(self):
+        # #415: a hook listing files with git's own magic matched nothing under the committer's GIT_LITERAL_PATHSPECS.
+        self.hook('env | grep -q "^GIT_[A-Z]*_PATHSPECS=" && { echo "pathspec variable leaked" >&2; exit 1; }\n'
+                  'test -n "$(git ls-files -- \':(glob)*.c\')" || { echo "glob matched nothing" >&2; exit 1; }')
+        self.write(':(glob)*.c', 'odd\n')
+        self.write('a.c', 'changed\n')
+        self.write('b.c', 'staged\n')
+        self.git('add', 'b.c')
+        for env in (ENV, {**ENV, 'GIT_LITERAL_PATHSPECS': '1'}):
+            with self.subTest(inherited=env is not ENV):
+                self.write(':(glob)*.c', f'odd {len(env)}\n')
+                code, out = self.run_script('commit', ':(glob)*.c', stdin='Fix\n', env=env)
+                self.assertEqual((code, out['committed']), (0, True), out)
+                self.assertEqual(self.git('show', '--name-only', '--format=', 'HEAD').split('\n')[:-1], [':(glob)*.c'],
+                                 'that one file, never what its name would match')
+                self.assertEqual(self.git('diff', '--cached', '--name-only').split(), ['b.c'], 'what was staged beside it stays staged')
+                self.assertIn(' M a.c', self.git('status', '--porcelain'))
 
     def test_a_hook_that_moves_head_and_fails_is_no_clean_refusal(self):
         self.hook('git commit -q --allow-empty -m nested --no-verify\nexit 1')

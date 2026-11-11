@@ -38,7 +38,9 @@ A key not listed here throws before anything runs.
   skipped that way, then waits for the review up to the silent-bot cap. Once
   per head too, it comments `@coderabbitai review` instead when that tick
   failed (a summary with no box to tick, a failed edit), unless the box reads
-  ticked or such a comment follows the head event. A rate limit leaves no box:
+  ticked or such a comment follows the head event, and when CodeRabbit's
+  review of the head failed (such as a `Review failed` check run), unless such a
+  comment follows the head event. A rate limit leaves no box:
   several PRs share the repository's hourly quota, so the launch waits the
   limit out with no ceiling and never stops for it, commenting
   `@coderabbitai review` once per reset window, a minute past the later of the
@@ -66,18 +68,36 @@ A key not listed here throws before anything runs.
   reviewed or is scoring is never asked about. The first launch with the switch
   latches the run: its state requires Greptile's review of every later head,
   so a launch without the switch keeps waiting on Greptile, asking nothing. A
-  failed, uncertain or ambiguous request, or no review within the cap, stops
-  `greptile-unreviewed`, never a pass. A rate-limited Greptile (its pause
+  request whose read failed before it claimed the head, so posted nothing, is
+  asked once more on that head, by the next cycle or, with none left, a
+  relaunch from the state (that stop carries `greptileRetry: true`); any other
+  failed, uncertain or ambiguous request, or no review within the
+  cap, stops `greptile-unreviewed`, never a pass. A rate-limited Greptile (its pause
   notice; the limit is monthly) is not waited for: the pass lists it in
-  `unreviewed`. Needs `autoPush` and `greptile` in
+  `unreviewed`. Greptile posts that notice on one PR only, so an absent
+  Greptile is read against the newest one on the PRs it last reviewed, until
+  a newer Greptile review on any PR updated since or the date the notice says
+  reviews resume, and is asked nothing while it stands; with more such PRs
+  than one search page holds it reads unknown. Needs `autoPush` and `greptile` in
   `reviewers`; the switch itself is never restored from a state.
 - `checkoutDir`: the PR checkout, default the session directory. Dirty `.idea/`
-  paths are ignored; any other pre-existing edit refuses the start.
+  paths are ignored; any other pre-existing edit refuses the start. A resume
+  that leaves it out continues in the state's `checkoutDir` when that is the
+  session directory's worktree; one that names another refuses.
 - `protected`: regex over repo-relative paths kept out of every fix scope (a
   review fix needing one is withheld, a CI fix's guess at one dropped) and
   never committed or published; an adopted chain may carry one only in commits
   the PR already has, in a merge from the base that takes either parent's
   version of it, or as `adoptProtected` or `adoptReviewedProtected` permits.
+- `reserved`: `[{ area, paths?, symbols? }]`, design areas the caller keeps
+  for its own decision, one entry per `area` (what it covers, in words), with
+  any plain repo-relative `paths` and `symbols` in them that help place it. A
+  finding-verifier judges each valid finding's fix against them before any
+  writer runs: one whose fix would change an area, or that it cannot judge
+  outside them, is held for the caller like a caller hold, never fixed or
+  published, and its row and the `held-awaiting-caller` stop carry its
+  `proposedFix`. The caller lifts a hold by deferring the finding or narrowing
+  the areas. Kept in the state: a launch that names none keeps the last given.
 - `generated`: regex over repo-relative paths a fixer's build regenerates; a
   plain modification to one is admitted into the commit on the caller's word
   that the repository hooks validate it.
@@ -87,13 +107,19 @@ A key not listed here throws before anything runs.
   board family's included, a missing one stopping `build-unverifiable` rather
   than failing the batch; per launch. Only a tool the resolver names is checked
   before the build: one only a build wrapper invokes and the contract never
-  names still fails the build as unverified.
+  names still fails the build as unverified. The build runs detached and is
+  waited on over calls of at most nine minutes each, up to 180 minutes; one
+  past that is stopped, process tree included, and stops `build-unverifiable`
+  with `timedOut: true`, apart from a build that failed.
 - `ciWait`: minutes to wait on pending checks, default 30. CodeRabbit's own
   check is left out when coderabbit is in `autoRun` and the review lane runs:
   the review lane waits on it. A head with no other check registered settles
   green at the CI wait's next slice boundary after the review lane's pass
   (normally within 3 minutes, a later slice up to 9), not after the whole
   wait; that pass is a grace period for checks that register late, not proof.
+  An Actions run on the head that is unfinished with no pending job registered
+  (one a concurrency group holds, a re-run not yet started) counts as a
+  pending check, so it is waited on.
 - `ciNotes`: what the caller established about this PR's CI, handed to the
   judge verbatim; it never revises a placed verdict stored on the head, while
   a stored unclassified failure is judged again once the notes change.
@@ -154,7 +180,8 @@ A key not listed here throws before anything runs.
   branch's live tip or the base GitHub recorded holds its second parent. That
   record is stale until the head is pushed, so a merge newer than it needs the
   live tip in the checkout (fetch the base branch), or the audit stops with
-  `fetch it`. A PR that conflicts with its base
+  `fetch it`. An empty commit is a link only when the PR head already has
+  it, such as one pushed to resync the head. A PR that conflicts with its base
   stops `pr-conflicting`; the merge that resolves it rejoins by `adoptHead`.
   An `adoptHead` naming a repair reconciled as published has nothing left to
   adopt; a reconciled adoption retried is audited from its own base and read

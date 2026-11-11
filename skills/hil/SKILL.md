@@ -244,7 +244,8 @@ name, tests and project fields, never the registry's.
 
 `scripts/hil_boards.py` is the one reader, and its docstring states what it refuses:
 every consumer that needs a board's flasher resolves the roster entry through it
-(`resolve`, `resolve_roster`, or `hil_boards.py roster FILE`); the resolved
+(`resolve`, `resolve_roster`, `board` for one entry by name with an explicit parked-board
+policy, or `hil_boards.py roster FILE`); the resolved
 `flasher.uid` is the probe serial, and a board without `probe` (a bench board on a dev PC,
 or a rig one project owns) keeps a flasher of its own. A reader that needs only names reads the roster raw; one
 that needs a lock name takes `lock_name(entry, own)`, `own` being the project's lock

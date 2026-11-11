@@ -266,7 +266,7 @@ class MergeTest(unittest.TestCase):
                 self.assertBlocked(self.run_it(launch_output(result=result), '--merge'), pattern)
 
     def test_exceptions_and_obligations_in_the_state_block(self):
-        cases = {'acceptedFailures': ['k'], 'deferrals': [['1#1', {}]], 'holds': [['1#1', {}]], 'debt': [[1, {}]], 'reanswer': [1],
+        cases = {'deferrals': [['1#1', {}]], 'holds': [['1#1', {}]], 'debt': [[1, {}]], 'reanswer': [1],
                  'pending': {'sha': OTHER, 'stage': 'push-failed'}}
         for key, value in cases.items():
             with self.subTest(key):
@@ -335,6 +335,66 @@ class MergeTest(unittest.TestCase):
         with self.assertRaises(merge.Unusable):
             self.run_it(output(), '--waive', 'copilot')
 
+    def test_a_waiver_lifts_the_launch_s_own_stop_for_that_bot_only(self):
+        # #432: the last launch stopped coderabbit-unreviewed; the owner said to merge without CodeRabbit.
+        def stopped(bot_name='coderabbit', bots=None, state=None, **over):
+            result = {'status': 'blocked', 'pass': False, 'reason': f'{bot_name}-unreviewed', 'head': HEAD,
+                      'bots': bots or [bot(bot_name, 'settled', None, 'limited')],
+                      'coderabbitAsk': {'relaunchAsks': None, 'asked': [{'ask': 'tick', 'at': '2026-11-01T00:00:00Z'}]}, **over}
+            return launch_output(state, result)
+        self.world.fresh['bots'][0] = bot('coderabbit', 'settled', None, 'limited')
+        got = self.run_it(stopped(), '--waive', 'coderabbit')
+        self.assertEqual((got['outcome'], got['blockers'], got['waived']), ('ready', [], ['coderabbit']), got)
+        self.world.views = [live(), live(), live(state='MERGED', mergeCommit={'oid': OTHER})]
+        self.assertEqual(self.run_it(stopped(), '--waive', 'coderabbit', '--merge')['outcome'], 'merged')
+        self.world.__init__()
+        self.world.fresh['bots'][2] = bot('greptile', 'settled', None, 'limited')
+        self.assertEqual(self.run_it(stopped('greptile'), '--waive', 'greptile')['outcome'], 'ready')
+        def judged(fid, comment, verdict, digest=None, how='refutation', was=None):
+            f = {'findingId': fid, 'commentId': comment, 'commentDigest': f'd{comment}', 'verdict': verdict}
+            decision = [fid, {'commentId': comment, 'digest': digest or f['commentDigest'], 'verdict': was or verdict}]
+            return f, decision, [comment, {'how': how, 'digest': f['commentDigest']}]
+
+        def harvested(*rows, decisions=None, answers=None):
+            obs = launch_output()['result']['observation']
+            return {'observation': {**obs, 'reviews': {**obs['reviews'], 'findings': [r[0] for r in rows]}},
+                    'state': {'decisions': [r[1] for r in rows] if decisions is None else decisions,
+                              'answeredWith': [r[2] for r in rows] if answers is None else answers}}
+        fine = harvested(judged('2#1', 2, 'invalid'), judged('3#1', 3, 'stale'), judged('4#1', 4, 'stale', how='fixNote', was='valid'))
+        got = self.run_it(stopped('greptile', **fine), '--waive', 'greptile')
+        self.assertEqual((got['outcome'], got['blockers']), ('ready', []), 'every dismissal decided and answered as it stands')
+        observation = launch_output()['result']['observation']
+        cases = {
+            'no waiver': ((), stopped(), 'stopped coderabbit-unreviewed'),
+            'the other bot waived': (('greptile',), stopped(), 'stopped coderabbit-unreviewed'),
+            'a second bot it names unwaived': (('coderabbit',), stopped(bots=[bot('coderabbit', 'absent', None), bot('greptile', 'absent', None)]),
+                                               'stopped coderabbit-unreviewed'),
+            'another stop': (('coderabbit',), stopped(reason='ci-red-rig-side'), 'stopped ci-red-rig-side'),
+            'paused, not blocked': (('coderabbit',), stopped(status='paused'), 'status paused'),
+            'a reviews lane': (('coderabbit',), stopped(observation={**observation, 'lane': 'reviews'}), 'lane reviews'),
+            'an extra blocker': (('coderabbit',), stopped(handoffs=[{'commentId': 5, 'why': 'edited after we answered it'}]), "comment 5 is the caller's"),
+            'a spent budget': (('coderabbit',), stopped(state={'cyclesUsed': 8}), 'cycle budget spent'),
+            'a finding still valid': (('coderabbit',), stopped(**harvested(judged('1#1', 1, 'valid', how='fixNote'))), r'finding\(s\) 1#1 of its last harvest'),
+            'a finding with no decision': (('coderabbit',), stopped(**harvested(judged('1#1', 1, 'invalid'), decisions=[])), r'finding\(s\) 1#1 of'),
+            'a decision on another body': (('coderabbit',), stopped(**harvested(judged('1#1', 1, 'invalid', digest='old'))), r'finding\(s\) 1#1 of'),
+            'a decision with another verdict': (('coderabbit',), stopped(**harvested(judged('1#1', 1, 'invalid', was='stale'))), r'finding\(s\) 1#1 of'),
+            'valid to stale without a fix note': (('coderabbit',), stopped(**harvested(judged('1#1', 1, 'stale', was='valid'))), r'finding\(s\) 1#1 of'),
+            'an answer on another body': (('coderabbit',), stopped(**harvested(judged('1#1', 1, 'invalid'), answers=[[1, {'how': 'refutation', 'digest': 'old'}]])),
+                                          r'finding\(s\) 1#1 of'),
+            'no answer': (('coderabbit',), stopped(**harvested(judged('1#1', 1, 'invalid'), judged('2#1', 2, 'invalid'), answers=[])),
+                          r'finding\(s\) 1#1, 2#1 of its last harvest not settled'),
+        }
+        for name, (waive, output, pattern) in cases.items():
+            with self.subTest(name):
+                self.world.__init__()
+                self.world.fresh['bots'][0] = bot('coderabbit', 'settled', None, 'limited')
+                self.assertBlocked(self.run_it(output, *(a for w in waive for a in ('--waive', w)), '--merge'), pattern)
+        self.world.__init__()
+        self.assertBlocked(self.run_it(stopped(state={'debt': [[1, {}]]}), '--waive', 'coderabbit'), 'still owed a reply')
+        self.world.fresh['bots'][0] = bot('coderabbit', 'settled', None, 'limited')
+        self.world.inventory.update(status='red', checks=[{'name': 'build'}])
+        self.assertBlocked(self.run_it(stopped(), '--waive', 'coderabbit'), '^ci: status red')
+
     def test_review_evidence_changed_since_the_launch(self):
         self.world.fresh['fingerprint'] = FP[:-1] + '1'
         self.assertBlocked(self.run_it(None, '--merge'), '^fingerprint: .*relaunch a `both` launch')
@@ -352,6 +412,66 @@ class MergeTest(unittest.TestCase):
                 self.world.__init__()
                 self.world.inventory.update(over)
                 self.assertBlocked(self.run_it(None, '--merge'), pattern)
+
+    def test_a_merge_goes_with_the_failures_the_user_accepted_and_nothing_else(self):
+        # #435: an accepted rig-side failure leaves CI red and the merge state UNSTABLE.
+        check = {'name': 'build (CH32V20x_EVT)', 'workflow': 'Build', 'bucket': 'fail', 'link': 'https://github.com/o/r/actions/runs/1/job/2',
+                 'attempt': '2', 'aliases': []}
+
+        key = '61a7ca4931576955'
+
+        def failure(**over):
+            return {'check': check['name'], 'workflow': 'Build', 'job': 'build', 'cell': None, 'signature': 'FAILED to install WCH:ch32v',
+                    'complete': True, 'verdict': 'rig-side', 'state': 'accepted', 'key': key, 'link': check['link'], **over}
+
+        def accepted(keys=(key,), entries=None, failures=None):
+            observation = launch_output()['result']['observation']
+            ci = {'status': 'red', 'headSha': HEAD, 'realFailures': [failure()] if failures is None else failures}
+            return launch_output({'acceptedFailures': list(keys), 'ciCache': {'reruns': [], 'entries': [{'link': check['link'], 'bucket': 'fail', 'digest': 'd'}]
+                                                                              if entries is None else entries}},
+                                 {'observation': {**observation, 'ci': ci}})
+
+        def world(views=None, **inventory):
+            self.world.__init__()
+            self.world.views = views or [live(mergeStateStatus='UNSTABLE')]
+            self.world.inventory.update({'status': 'red', 'checks': [check], **inventory})
+
+        world()
+        got = self.run_it(accepted())
+        self.assertEqual((got['outcome'], got['blockers']), ('ready', []), got)
+        self.assertEqual(got['accepted'], [{'check': check['name'], 'link': check['link'], 'keys': [key]}], 'the acceptance is recorded')
+        world([live(mergeStateStatus='UNSTABLE'), live(mergeStateStatus='UNSTABLE'), live(state='MERGED', mergeCommit={'oid': OTHER})])
+        got = self.run_it(accepted(), '--merge')
+        self.assertEqual((got['outcome'], got['admin'], self.world.merges[0][-1]), ('merged', False, ''), got)
+        rerun = {**check, 'link': 'https://github.com/o/r/actions/runs/1/job/3', 'attempt': '3'}
+        cases = {
+            'a launch accepting nothing': (accepted(keys=()), {}, 'ci: status red'),
+            'another key accepted': (accepted(keys=('0' * 16,)), {}, 'ci: status red'),
+            'a failure keyed on another execution': (accepted(failures=[failure(link=rerun['link'])]), {}, 'ci: status red'),
+            'an output from before the link': (accepted(failures=[{k: v for k, v in failure().items() if k != 'link'}]), {}, 'ci: status red'),
+            'a failure with no key': (accepted(failures=[{k: v for k, v in failure().items() if k != 'key'}]), {}, 'ci: status red'),
+            'a failure not accepted': (accepted(failures=[failure(), failure(signature='second', state='rigSide', key='1' * 16)]), {}, 'ci: status red'),
+            'an incomplete failure list': (accepted(failures=[failure(complete=False)]), {}, 'ci: status red'),
+            'an execution the launch never judged': (accepted(entries=[]), {}, 'ci: status red'),
+            'a re-run': (accepted(), {'checks': [rerun]}, 'ci: status red'),
+            'cancelled since': (accepted(), {'checks': [{**check, 'bucket': 'cancel'}]}, 'ci: status red'),
+            'an unknown attempt': (accepted(entries=[{'link': check['link'], 'bucket': 'fail'}]), {'checks': [{**check, 'attempt': None}]}, 'ci: status red'),
+            'a new failure': (accepted(), {'checks': [check, {**rerun, 'name': 'lint'}]}, 'failed: build .*, lint'),
+            'something pending': (accepted(), {'pending': 1, 'status': 'running'}, '1 pending'),
+            'another head': (accepted(), {'head': OTHER}, f'head {OTHER}'),
+            'a required check': (accepted(), {'requiredChecks': [{'context': check['name'], 'app': -1, 'state': 'completed/failure', 'bucket': 'fail'}]},
+                                 f"required check '{re.escape(check['name'])}' on the head: completed/failure"),
+        }
+        for name, (output, inventory, pattern) in cases.items():
+            with self.subTest(name):
+                world(**inventory)
+                got = self.run_it(output, '--merge')
+                self.assertBlocked(got, pattern)
+                self.assertBlocked(got, 'merge state UNSTABLE')
+        world([live()], status='green', checks=[])
+        self.assertEqual(self.run_it(accepted())['outcome'], 'ready', 'an accepted failure since passed blocks nothing')
+        world(status='green', checks=[])
+        self.assertBlocked(self.run_it(accepted()), 'merge state UNSTABLE')  # nothing accepted explains it
 
     def test_an_ambiguous_merge_is_read_back(self):
         cases = {

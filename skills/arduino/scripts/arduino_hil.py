@@ -7,7 +7,7 @@ run(profile, argv), loading this file from the pinned agentrc (its `agentrc_pin.
 
   ROOT                  the library checkout (Path)
   BUILD                 the library's build profile (its check_build module; agentrc arduino_build.py)
-  TESTS                 {test: the sketch name (its dir's basename) it runs}
+  TESTS                 {test: the sketch name (its dir's basename, a named build's name) it runs}
   ROLE_TESTS            {role: (tests a board of that role may run)}
   RESTORE_TEST          {role: the test that checks the role's restoration sketch (the first HIL sketch)}
   TEST_FUNCS            {device test: fn(dev, nonce, deadline, tracker, run_dir, board) -> (ok, detail)}
@@ -41,7 +41,7 @@ import socket
 import subprocess
 import sys
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOCK_SCRIPT = 'skills/hil/scripts/hil_lock.py'
@@ -114,7 +114,8 @@ def bind(profile):
         raise RuntimeError(f'arduino_hil is bound to another profile ({P.ROOT}), not {profile.ROOT}\'s')
     problems = [f'RESTORE_TEST {r!r} runs {profile.TESTS.get(t)!r}, not the first HIL sketch {first!r}'
                 for r in profile.ROLE_TESTS for t in [profile.RESTORE_TEST.get(r)]
-                for first in [Path(profile.BUILD.HIL_SKETCHES[r][0]).name] if profile.TESTS.get(t) != first]
+                for first in [Path(B.sketch_id(profile.BUILD.HIL_SKETCHES[r][0])).name]
+                if profile.TESTS.get(t) != first]
     if set(profile.TESTS) != {t for tests in profile.ROLE_TESTS.values() for t in tests}:
         problems.append('TESTS and the union of ROLE_TESTS name different tests')
     if set(profile.TEST_FUNCS) != set(profile.ROLE_TESTS.get('device', ())):
@@ -223,9 +224,34 @@ def selection(roster, boards, tests):
     return picked
 
 
+def refuse_unsafe_paths(root, files):
+    """Refused unless every entry of a manifest's `files` names a digest at a plain path inside `root` reached through
+    no link, the file itself included: an absolute or drive path, `..` or a link would hash, or run, a file the
+    manifest does not pin. CI admission (arduino_ci) asks the same of a packed tree."""
+    if not isinstance(files, dict):
+        raise Refused(f'the manifest\'s files are no JSON object: {type(files).__name__}')
+    outside, links = [], []
+    for rel, digest in files.items():
+        if (not isinstance(rel, str) or not isinstance(digest, str) or not rel or PureWindowsPath(rel).anchor
+                or '..' in PurePosixPath(rel).parts or '..' in PureWindowsPath(rel).parts):
+            outside.append(rel)
+            continue
+        p = Path(root)
+        for part in PurePosixPath(rel).parts:
+            p = p / part
+            if p.is_symlink():
+                links.append(rel)
+                break
+    if outside:
+        raise Refused(f'manifest paths outside the tree or malformed: {outside[:5]}')
+    if links:
+        raise Refused(f'manifest paths through links: {links[:5]}')
+
+
 def verify_staged(manifest_path):
     """A rig tree staged by hil_remote.py: every staged file must hash as the manifest written on the dev PC says."""
     m = json.loads(Path(manifest_path).read_text())
+    refuse_unsafe_paths(P.ROOT, m.get('files') if isinstance(m, dict) else None)
     bad = [rel for rel, digest in m['files'].items()
            if not (P.ROOT / rel).is_file() or B.sha256(P.ROOT / rel) != digest]
     if bad:
@@ -1263,9 +1289,15 @@ def op_restore(args, board, run_dir, tracker, manifest):
 
 
 def release_hold(name):
-    """End the caller's hold once its board is restored; under the session lock, so no command slips in between."""
-    r = subprocess.run([sys.executable, str(A.root / LOCK_SCRIPT), 'release', name],
-                       capture_output=True, text=True, timeout=30)
+    """End the caller's hold once its board is restored; under the session lock, so no command slips in between.
+    The helper runs in its own session and a SIGINT/SIGTERM to the caller waits for it (bounded by its timeout): a
+    signal to the caller's group (a tty Ctrl-C, `timeout`) would kill it before it signalled the holder."""
+    hold = A.process.InterruptHold()
+    try:
+        r = subprocess.run([sys.executable, str(A.root / LOCK_SCRIPT), 'release', name],
+                           capture_output=True, text=True, timeout=30, start_new_session=True)
+    finally:
+        hold.release()
     return {'exit': r.returncode, 'output': (r.stdout + r.stderr).strip()[-1000:]}
 
 

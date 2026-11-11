@@ -31,7 +31,12 @@ GitHub's, read last;
 `pending` counts the pending checks, `registered` every check. `waiting`, '' unless
 running, fingerprints the pending checks (name, link, attempt) and mergeable: two
 reads with the same one saw nothing move. `observedAt` is the UTC time of the
-print, `YYYY-MM-DDTHH:MM:SSZ`, the caller's clock. A failed or cancelled CircleCI job whose
+print, `YYYY-MM-DDTHH:MM:SSZ`, the caller's clock. An Actions run on the head that is unfinished
+(queued, pending, waiting, requested, in progress) with no pending job in the listing, such as one a concurrency group
+holds or a re-run whose earlier attempt's finished jobs are still listed,
+is one more pending check, named "<workflow> (run <id>, <status>, no pending job registered)" with the run's link, so it
+counts in `pending`, `registered` and `waiting`; such runs are read only while no other check is pending (the status is
+running either way), so until then those three may leave them out. A failed or cancelled CircleCI job whose
 workflow has not finished (running, failing, on_hold, queued: CircleCI refuses
 to re-run it yet) counts as pending, read from CircleCI's public job and
 workflow API on every poll; a status it cannot read is an error. This also
@@ -158,6 +163,9 @@ pages in order join into the entry. A link it has none for, or whose entry has a
 failure or a list of starts too large for a line, is left out of both. The caller checks what comes
 back against its own digests.
 
+Every gh read answered HTTP 502, 503 or 504 is made again after 2 and then 5 seconds, the --stop-file checked before
+each attempt, before it fails; nothing it writes is ever repeated.
+
 Under AGENTRC_EMIT the line goes to the file it names instead of stdout, claimed before anything runs
 (exit 3 at once, nothing done, when that file is there): lib/seal.py's emit, which a workflow reads instead
 of a model's copy.
@@ -187,10 +195,10 @@ import windows  # noqa: E402
 from seal import emit, fnv1a, rate_limit, sealed, utc  # noqa: E402
 
 POLL = 30
-ACTIONS_JOB = re.compile(r'^https://github\.com/[^/]+/[^/]+/actions/runs/\d+/job/(\d+)')
+ACTIONS_JOB = re.compile(r'^https://github\.com/[^/]+/[^/]+/actions/runs/(?P<run>\d+)/job/(?P<job>\d+)')
 ATTEMPT = (
     ('actions', ACTIONS_JOB),
-    ('circleci', re.compile(r'^https://circleci\.com/gh/[^/]+/[^/]+/(\d+)$')),
+    ('circleci', re.compile(r'^https://circleci\.com/gh/[^/]+/[^/]+/(?P<job>\d+)$')),
 )
 
 
@@ -233,16 +241,29 @@ class Failed(Exception):
         self.limit = limit
 
 
+# #424: a 502, 503 or 504 that the same read answered a moment later lost whole pr-babysit cycles; a read meets one again
+# after each of these waits, never a write, whose request may have landed.
+TRANSIENT = re.compile(r'\bHTTP 50[234]\b')
+RETRY_WAITS = (2, 5)
+WRITES = ('-X', '--method', '-f', '-F', '--field', '--raw-field', '--input')
+
+
 def gh(*args, raw=False):
-    if STOP_FILE and os.path.exists(STOP_FILE):
-        raise Failed(f'stopped before the next GitHub call: {STOP_FILE} exists')
-    try:
-        done = subprocess.run(['gh', *args], capture_output=True)
-    except OSError as e:
-        raise Failed(f'gh: {e}')
-    if done.returncode != 0:
+    read = args[0] != 'api' or not any(a in WRITES for a in args)
+    for wait in (*RETRY_WAITS, None):
+        if STOP_FILE and os.path.exists(STOP_FILE):
+            raise Failed(f'stopped before the next GitHub call: {STOP_FILE} exists')
+        try:
+            done = subprocess.run(['gh', *args], capture_output=True)
+        except OSError as e:
+            raise Failed(f'gh: {e}')
+        if done.returncode == 0:
+            break
         err = done.stderr.decode(errors='replace').strip()
-        raise Failed(f'gh {args[0]} {args[1]}: {err or f"exit {done.returncode}"}', rate_limit(err))
+        limit = rate_limit(err)
+        if wait is None or not read or limit or not TRANSIENT.search(err):
+            raise Failed(f'gh {args[0]} {args[1]}: {err or f"exit {done.returncode}"}', limit)
+        time.sleep(wait)
     # A job log is whatever the job printed; anything parsed stays strict.
     if raw:
         return done.stdout.decode(errors='replace')
@@ -278,7 +299,7 @@ def attempt(link):
     for kind, pattern in ATTEMPT:
         m = pattern.match(link or '')
         if m:
-            return f'{kind}:{m.group(1)}'
+            return f'{kind}:{m.group("job")}'
     m = rtd.BUILD.match(link or '')
     return f'readthedocs:{m.group(3)}' if m else None
 
@@ -345,7 +366,7 @@ def origin(repo, record, cache):
 
 def with_job(link, job):
     m = ACTIONS_JOB.match(link)
-    return link[:m.start(1)] + str(job) + link[m.end(1):]
+    return link[:m.start('job')] + str(job) + link[m.end('job'):]
 
 
 def resolved(repo, head, check, cache):
@@ -396,10 +417,21 @@ def unfinished_held(repo, checks, workflows):
     return [{**c, 'bucket': 'pending'} if c['link'] in held else c for c in checks]
 
 
+def held_runs(repo, head, everything):
+    """The head's unfinished workflow runs no pending check in the listing stands for, each as one pending check
+    (#444): a run a concurrency group holds, or a re-run not yet started, registers no check run of its own, and the
+    listing may still show the finished jobs of its earlier attempt."""
+    seen = {m.group('run') for c in everything if c.get('bucket') == 'pending' and (m := ACTIONS_JOB.match(c.get('link') or ''))}
+    return [{'name': f"{r.get('name') or r['path']} (run {r['id']}, {r['status']}, no pending job registered)", 'workflow': r.get('name') or '',
+             'bucket': 'pending', 'link': r.get('html_url') or ''}
+            for r in listed(f'repos/{repo}/actions/runs?head_sha={head}', 'workflow_runs')
+            if r.get('head_sha') == head and r.get('status') in RUN_PENDING and str(r['id']) not in seen]
+
+
 def run_of(link):
     """An Actions job link without its job: the run every copy of that job is listed in."""
     m = ACTIONS_JOB.match(link or '')
-    return link[:m.start(1)] if m else link
+    return link[:m.start('job')] if m else link
 
 
 def listed(path, key=None):
@@ -488,7 +520,8 @@ def judged(repo, head, required):
 
 def inventory(repo, pr, head, wait, ignore=(), brief=False, links=None, required=True):
     """brief: the caller is shown no failing check while running, by the last mergeable read; links: the only checks
-    it asks about, by link; required False skips the required checks (failures and bases, which judge none)."""
+    it asks about, by link; required False skips the required checks and the held runs (failures and bases, which judge
+    none)."""
     view = before = pull(repo, pr)
     if before['state'] != 'OPEN':
         return ended(before)
@@ -510,6 +543,8 @@ def inventory(repo, pr, head, wait, ignore=(), brief=False, links=None, required
         everything = listing(repo, pr)
         ignored = sorted({c['name'] for c in everything if c['name'] in ignore})
         checks = unfinished_held(repo, [c for c in everything if c['name'] not in ignore], workflows)
+        if required and not any(c['bucket'] == 'pending' for c in checks):
+            checks += held_runs(repo, head, everything)
         counts = summary(checks, view.get('mergeable'))[1]
         reqs = judge(view, counts)
         status = summary(checks, view.get('mergeable'), reqs)[0]

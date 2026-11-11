@@ -12,7 +12,8 @@ head that moved restarts the read once on the new head, and one that moves
 again is an error. The settle rules are this file's, and its tests', and read
 known artifact formats only: an artifact on the head whose shape it does not know,
 evidence it cannot order, or a read that failed makes that bot `unknown`,
-never `absent`.
+never `absent`. An auto-run Greptile with nothing on the PR is read against
+the repository's newest Greptile pause notice too, from PAUSE_GRACE after a dated head event (repo_paused, #515).
 
 stdout ends with one JSON line: headSha, observedAt, headEventAt (null when no
 run or timeline event dates the head, when the workflow file of a run that might date it could not be read twice, or
@@ -86,6 +87,7 @@ CR_RESUME = '`@coderabbitai resume` resumes it'
 CR_RATE = '<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->'
 CR_WALKTHROUGH = '<!-- This is an auto-generated comment: summarize by coderabbit.ai -->'
 CR_RATE_STATUS = 'review rate limited'
+CR_REVIEW_FAILED = 'review failed'
 # A repository CodeRabbit reviews only on request: a box in its summary comment, ticked once asked, or these words beside it (#324).
 CR_TRIGGER_BOX = re.compile(r'^(?P<pre>(?:> )?- \[)(?P<mark>[ xX])(?P<post>\][^\n]*Trigger (?:a manual )?review[^\n]*)$', re.M)
 CR_MANUAL_ONLY = 'does not receive automatic reviews'
@@ -94,13 +96,28 @@ CR_COUNTDOWN = re.compile(r'Next included review available in ([^.*\n]+)\.')
 COUNTDOWN_TERM = re.compile(r'(\d+) (hour|minute|second)s?')
 # CodeRabbit's included reviews come back within the hour: the reset a notice without a countdown is given.
 ESTIMATED_RESET = timedelta(hours=1)
-# The quota notice's known wordings (#308); any other "unable to review" body stays unknown.
+# The quota notice's known wordings (#308), each alone or followed by the effort hint (#453); any other "unable to
+# review" body stays unknown.
 COPILOT_QUOTA = ('Copilot was unable to review this pull request because the user who requested the review has reached their quota limit.',
                  'Copilot was unable to review this pull request because the user who requested the review has insufficient remaining quota.')
+COPILOT_QUOTA_HINT = 'Try requesting a review at a lower effort level.'
 COPILOT_NO_FILES = "Copilot wasn't able to review any files in this pull request."
 COPILOT_OVERVIEW = ('<!-- ccr-overview', '## Pull request overview')
 REVIEW_SUBMITTED = ('COMMENTED', 'APPROVED', 'CHANGES_REQUESTED')
 GREPTILE_PAUSED = 'Greptile has paused reviews on this repository'
+# Greptile posts its pause once, on one PR (#515): an absent Greptile looks for it among the most recently updated PRs
+# Greptile reviewed, and only Greptile's own account (a login no person can hold) counts.
+GREPTILE_BOT = f'{greptile_check.APP}[bot]'
+PAUSE_PRS = 10
+# The most PRs updated since a notice whose reviews are read to rule out a newer review: one search page.
+PAUSE_SINCE = 100
+# How long after its head event an absent Greptile is left unread for a pause: pr-babysit's GREPTILE_GRACE_MIN, so the
+# notices are read before the workflow may post an @greptileai.
+PAUSE_GRACE = timedelta(minutes=2)
+MONTHS = ('January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December')
+PAUSE_RESUME = re.compile(rf"Reviews resume automatically on ({'|'.join(MONTHS)}) (\d{{1,2}})\b")
+# A notice that names no resume date stands at most one billing period.
+PAUSE_UNDATED = timedelta(days=31)
 GREPTILE_ERROR = 'Greptile encountered an error while reviewing this PR'
 GREPTILE_STATUS = '<!-- greptile-status -->'
 # How long a below-threshold confidence result may stand before its review on the head counts as not observed: pr-babysit's REVIEW_CAP_MIN.
@@ -280,6 +297,9 @@ def coderabbit_run(run_, ev, head, stickies):
     if rate_run(run_):
         return record('coderabbit', 'settled', f"check run: {(run_.get('output') or {}).get('title')}", ev, head, 'limited')
     title = ((run_.get('output') or {}).get('title') or '').strip()
+    if run_['status'] == 'completed' and run_.get('conclusion') == 'neutral' and title.lower().startswith(CR_REVIEW_FAILED):
+        # An error on CodeRabbit's side (#499): its review of the head failed, which a request may ask again.
+        return record('coderabbit', 'settled', f'check run: {title}', ev, head, 'failed')
     if run_['status'] == 'completed' and run_.get('conclusion') == 'skipped':
         lowered = title.lower()
         if lowered.startswith('review skipped'):
@@ -366,6 +386,86 @@ def greptile(head, checks, issue, reviews, event_at, now=None):
     return record('greptile', 'unknown', f"check run {r['status']}/{r.get('conclusion')} with a summary this does not read", ev)
 
 
+def repo_paused(repo, n, reviews, absent, event_at, now):
+    """An absent Greptile settled limited by its newest pause notice on PR n, the PAUSE_PRS most recently updated PRs it
+    reviewed or the repository's newest issue comments, until a newer Greptile review or the notice's resume date
+    (PAUSE_UNDATED after it when it names none); `absent` itself when no notice stands or within PAUSE_GRACE of a dated
+    head event; unknown when that evidence does not read whole. A newer review is looked for on PR n and every PR
+    Greptile reviewed updated since the notice, all of them on one search page or the pause is not asserted, until the
+    first one found. `reviews` are PR n's, already read."""
+    read = {n: reviews}
+
+    def greptile_reviews(number):
+        if number not in read:
+            read[number] = pages(f'repos/{repo}/pulls/{number}/reviews')
+        return [{'at': v['submitted_at'], 'body': v.get('body') or '', 'source': f"review {v['id']} on PR #{number}"}
+                for v in read[number] if (v.get('user') or {}).get('login') == GREPTILE_BOT and v.get('state') in REVIEW_SUBMITTED
+                and stamp(v.get('submitted_at'))]
+
+    try:
+        event = stamp(event_at)
+        if event is not None and now - event < PAUSE_GRACE:
+            return {**absent, 'reason': f"{absent['reason']}; the repository's Greptile pause notices are read from "
+                                        f"{int(PAUSE_GRACE.total_seconds() // 60)} minutes after the head event at {event_at}"}
+        prs = {n, *reviewed_prs(repo, '', PAUSE_PRS)[0]}
+        notices = [x for number in sorted(prs) for x in greptile_reviews(number) if GREPTILE_PAUSED in x['body']]
+        for c in gh_json('api', f'repos/{repo}/issues/comments?sort=created&direction=desc&per_page=100'):
+            if (c.get('user') or {}).get('login') == GREPTILE_BOT and GREPTILE_PAUSED in (c.get('body') or '') and stamp(c.get('created_at')):
+                notices.append({'at': c['created_at'], 'body': c['body'], 'source': f"comment {c['id']} on {c.get('html_url') or 'the repository'}"})
+        notice = max(notices, key=lambda x: stamp(x['at']), default=None)
+        if notice is None:
+            return {**absent, 'reason': f"{absent['reason']}; no Greptile pause notice on this PR, among the {PAUSE_PRS} most recently "
+                                        'updated PRs Greptile reviewed or in the newest issue comments'}
+        at = stamp(notice['at'])
+        resume = resume_at(notice['body'], at)
+        until = resume or at + PAUSE_UNDATED
+        if now >= until:
+            return {**absent, 'reason': f"{absent['reason']}; its pause in {notice['source']} at {notice['at']} ended {until:%Y-%m-%dT%H:%M:%SZ}"}
+        # Only a notice still in force needs every newer review ruled out; a PR given one after it was updated after it too.
+        since, whole = reviewed_prs(repo, f" updated:>={notice['at']}", PAUSE_SINCE)
+        if not whole:
+            raise Unusable(f"more than {PAUSE_SINCE} PRs Greptile reviewed were updated since {notice['at']}, so no newer review can be ruled out")
+        for number in dict.fromkeys([n, *since]):
+            later = next((x for x in greptile_reviews(number) if GREPTILE_PAUSED not in x['body'] and stamp(x['at']) > at), None)
+            if later:
+                return {**absent, 'reason': f"{absent['reason']}; its pause in {notice['source']} at {notice['at']} ended by {later['source']} at {later['at']}"}
+    except RateLimited:
+        raise
+    except (Unusable, KeyError, TypeError, AttributeError, ValueError) as e:
+        return record('greptile', 'unknown', f"{absent['reason']}; the repository's Greptile pause notices did not read ({e})")
+    stated = 'as it states' if resume else 'a billing period, as it names no resume date'
+    return record('greptile', 'settled', f"Greptile paused reviews on this repository at {notice['at']}, until {until:%Y-%m-%dT%H:%M:%SZ} ({stated}); "
+                  f'no newer Greptile review on the {len(since)} PR(s) it reviewed updated since', [notice['source']], None, 'limited',
+                  f'{resume:%Y-%m-%dT%H:%M:%SZ}' if resume else None)
+
+
+def reviewed_prs(repo, qualifier, size):
+    """(the numbers of the PRs Greptile reviewed matching qualifier, most recently updated first, one search page of
+    size, whether that page holds them all); an incomplete search is Unusable."""
+    found = gh_json('api', '-X', 'GET', 'search/issues', '-f', f'q=repo:{repo} is:pr reviewed-by:app/{greptile_check.APP}{qualifier}',
+                    '-f', 'sort=updated', '-f', 'order=desc', '-f', f'per_page={size}')
+    if found['incomplete_results'] is not False:
+        raise Unusable('GitHub search returned incomplete results')
+    numbers = [p['number'] for p in found['items']]
+    return numbers, found['total_count'] == len(numbers)
+
+
+def resume_at(body, at):
+    """The first moment, UTC, of the day a pause notice posted at `at` says reviews resume, None when it names none."""
+    m = PAUSE_RESUME.search(body)
+    if not m:
+        return None
+    month = MONTHS.index(m[1]) + 1
+    for year in (at.year, at.year + 1):
+        try:
+            day = datetime(year, month, int(m[2]), tzinfo=timezone.utc)
+        except ValueError:
+            return None
+        if day > at:
+            return day
+    return None
+
+
 def head_reviews(reviews, bot, head):
     """A bot's submitted reviews on the head."""
     return [v for v in reviews or [] if bot in (v['user']['login'] or '').lower() and v.get('commit_id') == head and v.get('state') in REVIEW_SUBMITTED]
@@ -401,7 +501,7 @@ def greptile_paused(head, reviews, harvested):
 def copilot_reading(body):
     """(state, kind, reason) for a Copilot review body."""
     body = (body or '').strip()
-    if body in COPILOT_QUOTA:
+    if any(body.startswith(q) and body[len(q):].strip() in ('', COPILOT_QUOTA_HINT) for q in COPILOT_QUOTA):
         return 'settled', 'limited', 'the requesting user reached the Copilot quota'
     if body.startswith(COPILOT_NO_FILES):
         return 'settled', 'skipped', 'no file in the PR is one Copilot reviews'
@@ -554,7 +654,8 @@ def observe(repo, n, reviewers, auto):
         if bot == 'coderabbit' and bot in auto:
             bots.append(coderabbit(head, statuses, checks, issue, event_at))
         elif bot == 'greptile' and bot in auto:
-            bots.append(greptile(head, checks, issue, reviews, event_at, now))
+            g = greptile(head, checks, issue, reviews, event_at, now)
+            bots.append(repo_paused(repo, n, reviews, g, event_at, now) if g['state'] == 'absent' else g)
         elif bot == 'copilot':
             bots.append(copilot(head, reviews))
         elif bot == 'greptile' and (paused := greptile_paused(head, reviews, harvested)):

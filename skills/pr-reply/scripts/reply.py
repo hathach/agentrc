@@ -13,7 +13,8 @@ which the body must match before anything is posted. Each commentId names one
 of three things on the PR: a review comment (an inline thread), an issue comment,
 or a review whose body carries the finding (a bot's summary, or a point GitHub
 would not anchor inline). A review reply goes to the thread's first comment, where
-GitHub files every reply, and is read back: it must match the body, sit in that
+GitHub files every reply, and is read back: it must match the body as gh reads it
+(lib/gh_reads.py), sit in that
 thread after the comment it answers, and carry our login and the PR, before the
 thread is resolved; the other two
 have no thread: the reply is an issue comment whose body is the original's URL
@@ -34,8 +35,12 @@ stdout ends with one JSON line {"receipts": [{"commentId", "kind", "replyId",
 being pr-babysit's check on a relayed copy (fnv1a over the canonical JSON, nulls left out): kind is
 "review", "issue" or "review-body", "none" when all three were searched and the
 id is on none of them (the caller owes it nothing), null when a lookup failed
-before that was known; sent says a POST was issued (a lost response leaves sent true and replyId null: the
-reply may exist), posted that GitHub answered it, verified is true on a
+before that was known; sent says a POST was issued, posted that GitHub answered it; a POST answered
+with an error or not at all is followed by a fresh read of our replies to the
+comment, and our reply with the identical body found there is taken as its
+own (sent true, posted false, replyId set) and verified and resolved as any
+other, never posted again; none found, or a rate limit, leaves replyId null and
+the error (the reply may still exist), verified is true on a
 matching read-back, false on a mismatch and null when the read-back could not
 be fetched. `reply.py --digest TEXT` prints TEXT's digest for a manifest
 written by hand. Exit 0 when every reply is verified and, for a review
@@ -110,6 +115,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import comment_digest  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
 import gh_repo  # noqa: E402
+from gh_reads import reads_as_sent  # noqa: E402
 from seal import RATE_LIMITED, emit, fnv1a, sealed  # noqa: E402
 
 THREADS_QUERY = ('query($o:String!,$r:String!,$p:Int!,$c:String){repository(owner:$o,name:$r){'
@@ -232,12 +238,22 @@ class Poster:
         """The (id, body) of our identical reply, else of the reply of ours this one must not be posted over:
         any other, or with second_answer only a quoting one giving the same kind of answer; None when there is none."""
         ours = self.ours(kind, target)
-        blocking = [c for c in ours if c['body'] == body]
+        blocking = [c for c in ours if reads_as_sent(c['body'], body)]
         if not blocking and not second_answer:
             blocking = ours
         elif not blocking and kind != 'review':
             blocking = [c for c in ours if is_fix_note(c['body']) == is_fix_note(body)]
         return (blocking[0]['id'], blocking[0]['body']) if blocking else None
+
+    def landed(self, kind, target, body):
+        """The id of our reply to target with exactly body, from fresh listings, None when there is none: what a POST
+        answered with an error, or not at all, may have left (#431)."""
+        if kind == 'review':
+            self._review = None
+        else:
+            self._issue = None
+        found = [c['id'] for c in self.ours(kind, target) if reads_as_sent(c['body'], body)]
+        return max(found) if found else None
 
     def post(self, kind, target, body):
         if kind == 'review':
@@ -276,7 +292,7 @@ class Poster:
             c = self.read_reply(kind, reply_id)
         except ApiError as e:
             return None, f'read-back unavailable: {e}'
-        bad = ([] if c.get('body') == body else ['body']) + self.misplaced(kind, target, c)
+        bad = ([] if reads_as_sent(c.get('body'), body) else ['body']) + self.misplaced(kind, target, c)
         return (True, None) if not bad else (False, f'read-back mismatch on {", ".join(bad)}')
 
     def resolve(self, target):
@@ -385,7 +401,7 @@ def read_again(poster, item, rc, done=None):
     text = None if why else reply_text(kind, original, c.get('body', ''))
     if not why and original_digest(original) != item['originalDigest']:
         why = f'comment {item["commentId"]} was edited since the inspection'
-    if not why and fnv1a(text) != item['bodyDigest'] and text != done:
+    if not why and fnv1a(text) != item['bodyDigest'] and not reads_as_sent(text, done):
         why = f'reply {item["replyId"]} was edited since the inspection'
     return original, text, why
 
@@ -431,7 +447,7 @@ def edit(poster, item):
         kind = rc['kind']
         body = reply_body(kind, original, item['body'])
         # A rerun after a lost receipt finds its own edit there and does not make another.
-        if text != item['body']:
+        if not reads_as_sent(text, item['body']):
             rc['sent'] = True
             poster.edit(kind, item['replyId'], body)
             rc['posted'] = True
@@ -457,7 +473,7 @@ def handle(poster, item):
             return rc
         body = reply_body(kind, original, item['body'])
         found = poster.existing(kind, original, body, item.get('secondAnswer', False))
-        if found and found[1] != body:
+        if found and not reads_as_sent(found[1], body):
             rc['replyId'] = found[0]
             rc['error'] = f'reply {found[0]} of ours is already on this comment in other words; the caller reconciles it'
             return rc
@@ -465,8 +481,19 @@ def handle(poster, item):
             reply_id = found[0]
         else:
             rc['sent'] = True
-            reply_id = poster.post(kind, original, body)
-            rc['posted'] = True
+            try:
+                reply_id = poster.post(kind, original, body)
+                rc['posted'] = True
+            except ApiError as e:
+                # Never posted again: only a reply the POST left, found by a fresh look, settles it.
+                if RATE_LIMITED.search(str(e)):
+                    raise
+                try:
+                    reply_id = poster.landed(kind, original, body)
+                except ApiError as again:
+                    raise ApiError(f'{e}; looking for the reply after it failed: {again}')
+                if reply_id is None:
+                    raise
         rc['replyId'] = reply_id
         rc['verified'], rc['error'] = poster.verify(kind, original, reply_id, body)
         if rc['verified'] and kind == 'review':

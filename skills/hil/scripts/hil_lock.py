@@ -264,7 +264,11 @@ def _write_record(fh, first: bytes, reason: str, extra: dict) -> None:
     as for REWRITING."""
     data = json.dumps({'pid': os.getpid(), 'reason': reason,
                        'since': time.strftime('%Y-%m-%dT%H:%M:%S%z'), **extra}).encode()
-    fd = fh.fileno()
+    _overwrite(fh.fileno(), first, data)
+
+
+def _overwrite(fd, first: bytes, data: bytes) -> None:
+    """The file's bytes made `data` behind the non-JSON byte `first`, data's own first byte last."""
     _pwrite_all(fd, first, 0)
     _pwrite_all(fd, data[1:], 1)
     os.ftruncate(fd, len(data))
@@ -282,12 +286,11 @@ def clear_record(fh) -> bool:
 
 
 def _restore_record(fh, data: bytes) -> bool:
-    """Put back the record `data` a failed rewrite may have cut short; first byte first, so an
-    interrupted restore reads as unreadable (logged), never as ACQUIRING. False when it failed."""
+    """Put back the record `data` a failed rewrite may have cut short, behind REWRITING: an
+    interrupted restore reads as unreadable (logged), never as a valid splice of the new record.
+    One whose first write fails leaves what the rewrite left. False when it failed."""
     try:
-        fd = fh.fileno()
-        _pwrite_all(fd, data, 0)
-        os.ftruncate(fd, len(data))
+        _overwrite(fh.fileno(), REWRITING, data)
     except OSError:
         return False
     return True
@@ -469,31 +472,48 @@ def take_board_lock(board: str, reason: str, *, protected=False, **extra):
         raise _held_refusal(board) from None
     except OSError as e:
         raise _unavailable(e) from e
+    found, note_error = b'', None      # note_error stays None until the leftover's log attempt returned
     try:
-        found = _handle_record(fh)
-        left = _leftover(board, fh, data=found)
-    except OSError as e:
-        fh.close()
-        raise LockUnavailable(f'board lock unavailable: holder record: {e}') from e
-    note_error = _log_leftover(board, left)
-    # announce ourselves so the other side's conflict message is truthful
+        try:
+            found = _handle_record(fh)
+            left = _leftover(board, fh, data=found)
+        except OSError as e:
+            raise LockUnavailable(f'board lock unavailable: holder record: {e}') from e
+        note_error = _log_leftover(board, left)
+        # announce ourselves so the other side's conflict message is truthful
+        try:
+            _write_record(fh, ACQUIRING, reason, extra)
+        except OSError as e:
+            why = _abandon(fh, found, note_error)
+            fh = None
+            raise LockUnavailable(f'board lock unavailable: holder record: {e}{why}') from e
+        fh.cleanup_failures = open_cleanup_failures(board) + ([dict(left, noteError=note_error)] if note_error else [])
+    except BaseException:
+        # an interrupt included: a caller keeping the exception must not keep the flock (agentrc#477)
+        if fh is not None:
+            _abandon(fh, found, note_error)
+        raise
+    return fh
+
+
+def _abandon(fh, found, note_error) -> str:
+    """Undo a take that will not return, then drop its flock: before the leftover's log attempt
+    returned (`note_error` None) the record is left as found, for the next taker to log; once it is
+    logged ours is cleared; else the leftover record `found` is put back, its only evidence when no
+    journal holds it. Returns why the leftover was not logged, or ''."""
+    why = ''
     try:
-        _write_record(fh, ACQUIRING, reason, extra)
-    except OSError as e:
-        why = f'board lock unavailable: holder record: {e}'
-        if not note_error:
+        if note_error == '':
             clear_record(fh)
-        elif _restore_record(fh, found):     # the leftover's only evidence when no journal holds it
-            why += f'; leftover kept for the next taker, {note_error}'
-        else:
-            why += f'; leftover record not restored, {note_error}'
+        elif note_error:
+            ok = _restore_record(fh, found)
+            why = f'; leftover {"kept for the next taker" if ok else "record not restored"}, {note_error}'
+    finally:
         try:
             fh.close()   # even a failing close lets the fd (and flock) go
         except OSError:
             pass
-        raise LockUnavailable(why) from e
-    fh.cleanup_failures = open_cleanup_failures(board) + ([dict(left, noteError=note_error)] if note_error else [])
-    return fh
+    return why
 
 
 def _log_leftover(board, left) -> str:
@@ -832,6 +852,12 @@ def _receipt_text(r) -> str:
         owner = f'uid {r["uid"]}' if isinstance(r.get('uid'), int) else 'its owner'
         return (f'operations in {r["foreign"]!r:.200} (uid {os.geteuid()} cannot recheck them: rerun as {owner} or '
                 f'root, or have either remove that claim\'s file in {BOARD_LOCK_DIR} once none runs)')
+    if isinstance(r, dict) and 'unrecheckable' in r:     # a run without a receipt: its command or why
+        what = r['unrecheckable']
+        what = ' '.join(map(str, what)) if isinstance(what, list) else str(what)
+        alive = f', surviving pids {r["survivors"]!r:.80}' if r.get('survivors') else ''
+        token = f' {r["token"]!r:.40}' if 'token' in r else ''
+        return f'unrecheckable run{token} ({what:.200}{alive})'
     sup = r.get('supervisor') if isinstance(r, dict) else None
     pid = sup.get('pid') if isinstance(sup, dict) else None
     return f'receipt {r.get("token")} (supervisor pid {pid})' if isinstance(r, dict) else f'receipt {r!r:.80}'
@@ -1440,6 +1466,26 @@ def settle(receipts, wait, busy=None) -> tuple:
 
 
 # --- operator CLI (hold/release/status) ------------------------------------
+PROC_LOCKS = '/proc/locks'
+
+
+def flock_observed(board: str):
+    """Whether a flock is held on the board's lock file, read from /proc/locks without taking it: True or False, None
+    when it cannot be read (no lock file, no /proc/locks). Lines per fs/locks.c lock_get_status (v6.12): `<id>: FLOCK
+    ADVISORY WRITE <pid> <major hex>:<minor hex>:<inode> 0 EOF`, a blocked request's id followed by `->`. A holder in
+    another pid namespace, or a dev number the file system reports otherwise to stat, reads free: only an
+    observation, the flock itself decides."""
+    try:
+        _check_name(board)
+        st = os.stat(lock_path(board), follow_symlinks=False)
+        with open(PROC_LOCKS) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return None
+    want = f'{os.major(st.st_dev):02x}:{os.minor(st.st_dev):02x}:{st.st_ino}'
+    return any(len(t) > 5 and t[1] == 'FLOCK' and t[5] == want for t in (line.split() for line in lines))
+
+
 def is_locked(board: str) -> bool:
     """True if the recorded holder process is still alive.
 

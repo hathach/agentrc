@@ -43,6 +43,7 @@ class FakeGitHub:
         self.next_id = 900
         self.mutations = []
         self.calls = []
+        self.reads = lambda out: out  # a response's JSON text as gh returns it
 
     def review_comment(self, cid, body='bot says', login='bot', thread=None, parent=None):
         self.review[cid] = {'id': cid, 'body': body, 'user': {'login': login}, 'in_reply_to_id': parent,
@@ -69,7 +70,7 @@ class FakeGitHub:
         method, path = args[2], args[3]
         body = json.loads(stdin) if stdin else None
         try:
-            return 0, json.dumps(self.rest(method, path, body, '--paginate' in args)), ''
+            return 0, self.reads(json.dumps(self.rest(method, path, body, '--paginate' in args))), ''
         except KeyError:
             return 1, '', f'gh: Not Found (HTTP 404)\n{path}'
 
@@ -545,21 +546,74 @@ class ReplyTest(ReplyCase):
         rc, receipts = self.run_script([{'commentId': 10, 'body': 'hello'}], raw=True)
         self.assertEqual(rc, 2, 'an entry without a digest is refused')
 
-    def test_lost_response_reports_sent_without_a_reply_id(self):
-        self.gh.review_comment(10)
+    def failing_post(self, landed=lambda body: body, login=ME, lookup_down=False):
+        """POSTs that fail as a 5xx or a lost answer does while GitHub may store the reply: landed(body) the body it
+        stores, None for none, by login; lookup_down fails every listing after the POST."""
         real = self.gh.rest
+        posted = []
 
-        def lost(method, path, body, paginate):
-            r = real(method, path, body, paginate)
+        def rest(method, path, body, paginate):
             if method == 'POST':
-                raise KeyError('connection reset')  # GitHub stored it, the answer never came
-            return r
-        self.gh.rest = lost
-        rc, receipts = self.run_script([{'commentId': 10, 'body': 'ok'}])
-        r = receipts[0]
-        self.assertEqual((rc, r['sent'], r['posted'], r['replyId'], r['verified']), (1, True, False, None, False))
-        self.assertEqual(len(self.gh.review), 2, 'the reply exists on GitHub')
-        # a failure before any POST says so
+                posted.append(path)
+                stored = landed(body['body'])
+                if stored is not None:
+                    r = real(method, path, {'body': stored}, paginate)
+                    (self.gh.review if '/replies' in path else self.gh.issue)[r['id']]['user'] = {'login': login}
+                raise KeyError(path)
+            if posted and lookup_down and method == 'GET' and paginate:
+                raise KeyError(path)
+            return real(method, path, body, paginate)
+        self.gh.rest = rest
+        return posted
+
+    def test_a_post_answered_with_a_server_error_adopts_the_reply_it_left_and_resolves(self):
+        # #431: Adafruit_SPIFlash#196, a refutation answered 502 that landed as comment 4466463338.
+        self.gh.review_comment(10)
+        self.gh.issue_comment(20)
+        posted = self.failing_post()
+        rc, receipts = self.run_script([{'commentId': 10, 'body': 'ok'}, {'commentId': 20, 'body': 'fine'}])
+        self.assertEqual(rc, 0, receipts)
+        self.assertEqual([(r['sent'], r['posted'], r['verified'], r['resolved'], r['error']) for r in receipts],
+                         [(True, False, True, True, None), (True, False, True, None, None)])
+        self.assertEqual([r['replyId'] for r in receipts], [901, 902])
+        self.assertEqual(len(posted), 2, 'never posted again')
+        self.assertTrue(self.gh.threads['T10']['resolved'])
+
+    def test_a_failed_post_lists_again_only_the_comments_its_reply_is_among(self):
+        self.gh.review_comment(10)
+        self.gh.issue_comment(20)
+        self.failing_post()
+        rc, receipts = self.run_script([{'commentId': 10, 'body': 'ok'}, {'commentId': 20, 'body': 'fine'}])
+        self.assertEqual(rc, 0, receipts)
+        listings = [a[3].split('?')[0] for a in self.gh.calls if a[:3] == ['api', '-X', 'GET'] and '--paginate' in a]
+        self.assertEqual({p: listings.count(p) for p in (f'repos/{REPO}/pulls/{PR}/comments', f'repos/{REPO}/issues/{PR}/comments')},
+                         {f'repos/{REPO}/pulls/{PR}/comments': 2, f'repos/{REPO}/issues/{PR}/comments': 2}, 'once, then once after its own POST')
+
+    def test_a_failed_post_citing_a_json_escape_adopts_the_reply_as_it_reads_back(self):
+        self.gh.reads = GhReadsTest.reads
+        self.gh.review_comment(10)
+        posted = self.failing_post()
+        rc, receipts = self.run_script([{'commentId': 10, 'body': GhReadsTest.BODY}])
+        self.assertEqual((rc, receipts[0]['replyId'], receipts[0]['verified'], len(posted)), (0, 901, True, 1), receipts)
+
+    def test_a_failed_post_that_left_no_identical_reply_of_ours_stays_unsettled(self):
+        for what, over in (('absent', {'landed': lambda body: None}),
+                           ('another body', {'landed': lambda body: body + ' (edited)'}),
+                           ('another author', {'login': 'someone'}),
+                           ('the look fails', {'lookup_down': True})):
+            with self.subTest(what):
+                self.setUp()
+                self.gh.review_comment(10)
+                posted = self.failing_post(**over)
+                rc, receipts = self.run_script([{'commentId': 10, 'body': 'ok'}])
+                r = receipts[0]
+                self.assertEqual((rc, r['sent'], r['posted'], r['replyId'], r['verified']), (1, True, False, None, False))
+                self.assertEqual(len(posted), 1, 'never posted again')
+                self.assertFalse(self.gh.threads['T10']['resolved'])
+                if what == 'the look fails':
+                    self.assertIn('looking for the reply after it failed', r['error'])
+
+    def test_a_failure_before_any_post_says_so(self):
         rc, receipts = self.run_script([{'commentId': 99, 'body': 'x'}])
         self.assertEqual((receipts[0]['sent'], receipts[0]['replyId']), (False, None))
 
@@ -988,6 +1042,53 @@ class ReconcileTest(ReplyCase):
 DATA = Path(__file__).resolve().parent / 'data' / 'comment_digest'
 RABBIT = reply.comment_digest.CODERABBIT
 FOOTER = reply.comment_digest.FOOTER
+
+
+class GhReadsTest(ReplyCase):
+    """Our reply as gh reads it back: gh's sanitizer rewrites a cited `\\u001b` to `\\^[` (#461)."""
+    BODY = 'Not so: the line escapes ESC as `\\u001b`.'
+    reads = staticmethod(lambda out: out.replace(r'\\u001b', r'\\^['))  # as gh 2.103.3 rewrote #461's body
+
+    def setUp(self):
+        super().setUp()
+        self.gh.reads = self.reads
+        self.gh.review_comment(10)
+        self.gh.issue_comment(20)
+
+    def posts(self):
+        return [m for m in self.gh.mutations if m[0].startswith('post')]
+
+    def test_a_reply_citing_a_json_escape_is_verified_as_it_reads_back(self):
+        rc, receipts = self.run_script([{'commentId': 10, 'body': self.BODY}, {'commentId': 20, 'body': self.BODY}])
+        self.assertEqual(rc, 0, receipts)
+        self.assertEqual([(r['replyId'], r['verified'], r['error']) for r in receipts], [(901, True, None), (902, True, None)])
+        self.assertTrue(self.gh.threads['T10']['resolved'])
+
+    def test_our_reply_citing_it_already_there_is_reused_and_never_posted_again(self):
+        self.gh.review_comment(55, self.BODY, ME, thread='T10', parent=10)
+        self.gh.issue_comment(56, reply.issue_body(self.gh.issue[20], self.BODY), ME)
+        for second in (False, True):
+            with self.subTest(secondAnswer=second):
+                rc, receipts = self.run_script([{'commentId': 10, 'body': self.BODY, 'secondAnswer': second},
+                                                {'commentId': 20, 'body': self.BODY, 'secondAnswer': second}])
+                self.assertEqual(rc, 0, receipts)
+                self.assertEqual([(r['replyId'], r['sent'], r['verified']) for r in receipts], [(55, False, True), (56, False, True)])
+                self.assertEqual(self.posts(), [])
+
+    def edit_to(self, now):
+        """An edit of our reply 55, inspected as 'deliberately', to BODY, the reply reading `now` when it runs."""
+        self.gh.review_comment(55, now, ME, thread='T10', parent=10)
+        return self.edit({'commentId': 10, 'replyId': 55, 'body': self.BODY, 'bodyDigest': reply.fnv1a('deliberately'),
+                          'originalDigest': reply.comment_digest.sha12('bot says')})
+
+    def test_an_edit_citing_it_is_verified_as_it_reads_back(self):
+        rc, receipts = self.edit_to('deliberately')
+        self.assertEqual((rc, receipts[0]['posted'], receipts[0]['verified'], receipts[0]['error']), (0, True, True, None))
+
+    def test_an_edit_citing_it_already_on_the_reply_is_not_made_again(self):
+        rc, receipts = self.edit_to(self.BODY)
+        self.assertEqual((rc, receipts[0]['sent'], receipts[0]['verified'], receipts[0]['error']), (0, False, True, None))
+        self.assertEqual([m for m in self.gh.mutations if m[0] == 'edit'], [])
 
 
 class EncodingTest(ReplyCase):

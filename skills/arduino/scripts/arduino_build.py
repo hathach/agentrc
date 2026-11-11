@@ -13,7 +13,10 @@ point, loading this file from the pinned agentrc (its `agentrc_pin.py`). One pro
                         rig board must hold under its sketches, `base_exclude` the address ranges [lo, hi) of them
                         never checked or written (SKILL.md, Base image)
   REPRESENTATIVES       {family: [boards]} a change to that family's code builds
-  HIL_SKETCHES          {role: (sketch dirs, the first the restoration image)}
+  HIL_SKETCHES          {role: (sketches, the first the restoration image)}: each a sketch dir, or (feature
+                        'named') {name: (sketch dir, menu options)}, a build of that dir under its own name, FQBN
+                        options (`k=v,...`) overriding the board's: the name keys its build dir, record sketch and
+                        fqbn(), and a change to the dir builds every name it has
   SMOKE_BOARDS          boards whose restoration sketch a build-contract change builds (one per image kind)
   CONTRACT_TESTS        {name: test script}; a change to `.claude/test/test_<name>.py` runs it, a HIL change
                         every one but `build`
@@ -39,7 +42,7 @@ A core's profile (an Arduino platform checkout, e.g. adafruit:samd) adds these, 
 
 PROFILE_API is the profile interface the three engines implement; a library's bootstrap refuses any other unloaded.
 PROFILE_FEATURES names the additive capabilities a bootstrap may require of these engines ('core': core mode,
-'base': a rig board's base image).
+'base': a rig board's base image, 'named': named HIL builds).
 
 The JSON contract (stdout's last line, exits 0 pass, 1 failed, 2 usage or a missing prerequisite, 3 uncovered) is
 the library's build SKILL.md.
@@ -66,7 +69,7 @@ FILES = ('skills/hil/boards.json', 'skills/hil/scripts/hil_boards.py', 'skills/h
 SELF = 'skills/arduino/scripts/arduino_build.py'
 SCHEMA = 2
 PROFILE_API = 1   # bump on a change a library profile must follow, arduino_hil's and arduino_remote's included
-PROFILE_FEATURES = ('core', 'base')
+PROFILE_FEATURES = ('core', 'base', 'named')
 COMPILE_TIMEOUT = 900
 BUILD_SCRIPTS = '.claude/skills/build/scripts/'
 HIL_CONTROL = ('.claude/skills/hil-contract/scripts/', 'test/hil/')
@@ -94,20 +97,77 @@ hil_boards = hil_load.load_file('skills/hil/scripts/hil_boards.py')
 
 
 def bind(profile):
-    """Bind the library profile this process builds for; a second, different one is refused."""
+    """Bind the library profile this process builds for; a second, different one is refused, as is a HIL_SKETCHES
+    table hil_sketch_problems() faults."""
     global P
     if P is not None and P is not profile:
         raise RuntimeError(f'arduino_build is bound to another profile ({P.ROOT}), not {profile.ROOT}\'s')
+    problems = hil_sketch_problems(profile.HIL_SKETCHES)
+    if problems:
+        raise RuntimeError(f'{profile.ROOT}: HIL_SKETCHES: {"; ".join(problems)}')
     P = profile
     return sys.modules[__name__]
+
+
+NAMED_ID = re.compile(r'[A-Za-z0-9_][A-Za-z0-9_.+-]*')   # one build dir under <root>/<board>/, never . or .. or hidden
+
+
+def _entry_ok(e):
+    if isinstance(e, str):
+        return True
+    if not (isinstance(e, dict) and len(e) == 1):
+        return False
+    (name, value), = e.items()
+    return (isinstance(name, str) and bool(NAMED_ID.fullmatch(name)) and isinstance(value, tuple) and len(value) == 2
+            and all(isinstance(x, str) for x in value) and all('=' in o for o in value[1].split(',') if o))
+
+
+def hil_sketch_problems(table):
+    """What makes a HIL_SKETCHES table ambiguous: an entry neither a sketch dir nor {name: (sketch dir, menu
+    options)} with a plain file name, a build id listed twice in one role, or one id defined two ways across roles
+    (two named builds, or a name and a sketch dir)."""
+    bad = [repr(e) for entries in table.values() for e in entries if not _entry_ok(e)]
+    if bad:
+        return [f'entries neither a sketch dir nor {{name: (sketch dir, menu options)}}: {", ".join(bad)}']
+    problems, defined = [], {}
+    for role_, entries in table.items():
+        ids = [sketch_id(e) for e in entries]
+        problems += [f'{role_!r} lists {i} twice' for i in dict.fromkeys(ids) if ids.count(i) > 1]
+        for e in entries:
+            i = sketch_id(e)
+            how = e if isinstance(e, str) else e[i]
+            if defined.setdefault(i, how) != how:
+                problems.append(f'{i} is defined two ways: {defined[i]!r} and {how!r}')
+    return list(dict.fromkeys(problems))
 
 
 def role(board):
     return P.BOARDS[board].get('role', 'device')
 
 
+def sketch_id(entry):
+    """A HIL_SKETCHES entry's build id: its sketch dir, or a named build's name."""
+    return entry if isinstance(entry, str) else next(iter(entry))
+
+
 def hil_sketches(board):
-    return P.HIL_SKETCHES[role(board)]
+    """The build ids of the HIL sketches the board's role runs, the restoration one first."""
+    return tuple(sketch_id(e) for e in P.HIL_SKETCHES[role(board)])
+
+
+def named_builds():
+    """{name: (sketch dir, menu options)} of the profile's named HIL builds."""
+    return {n: v for entries in P.HIL_SKETCHES.values() for e in entries if isinstance(e, dict) for n, v in e.items()}
+
+
+def source_of(example):
+    """The sketch dir a build id compiles: a named build's, else the id itself."""
+    return named_builds().get(example, (example,))[0]
+
+
+def with_named(source):
+    """`source` and every named build of it: what a change to that sketch dir builds."""
+    return [source, *(n for n, (src, _) in named_builds().items() if src == source)]
 
 
 def fixtures():
@@ -127,10 +187,14 @@ def _git_local_vars():
     return frozenset(names)
 
 
+def _git_env():
+    """os.environ without the GIT_* that would aim git away from the repository it names."""
+    return {k: v for k, v in os.environ.items() if k not in _git_local_vars()}
+
+
 def git(*args, check=True):
     """git in the checkout, deaf to the GIT_* that would aim it elsewhere (a hook's GIT_DIR, GIT_INDEX_FILE...)."""
-    env = {k: v for k, v in os.environ.items() if k not in _git_local_vars()}
-    p = subprocess.run(['git', '-C', str(P.ROOT), *args], capture_output=True, text=True, env=env)
+    p = subprocess.run(['git', '-C', str(P.ROOT), *args], capture_output=True, text=True, env=_git_env())
     if check and p.returncode:
         fail(f'git {" ".join(args)}: {p.stderr.strip()}')
     return p.stdout
@@ -205,7 +269,17 @@ def eligible(board, example):
 
 def fqbn(board, example):
     hook = getattr(P, 'fqbn', None)
-    return hook(board, example) if hook else P.BOARDS[board]['fqbn']
+    base = hook(board, example) if hook else P.BOARDS[board]['fqbn']
+    options = named_builds().get(example, (None, ''))[1]
+    return with_options(base, options) if options else base
+
+
+def with_options(fqbn_, options):
+    """`fqbn_` with the menu options `k=v,...` set, each replacing the same menu's value or appended."""
+    parts = fqbn_.split(':')
+    menus = dict(o.split('=', 1) for o in ':'.join(parts[3:]).split(',') if o)
+    menus.update(o.split('=', 1) for o in options.split(',') if o)
+    return ':'.join(parts[:3]) + ':' + ','.join(f'{k}={v}' for k, v in menus.items())
 
 
 # ---- selection
@@ -223,7 +297,8 @@ def unbuildable_examples():
 def hil_sketch_of(path):
     """The HIL sketch dir outside examples/ holding `path`, or None."""
     for sketches in P.HIL_SKETCHES.values():
-        for s in sketches:
+        for e in sketches:
+            s = source_of(sketch_id(e))
             if not is_example(s) and path.startswith(s + '/'):
                 return s
     return None
@@ -302,10 +377,11 @@ def select(paths, roster=None, only_examples=None):
         elif effect == 'example':
             if not buildable(detail):
                 uncovered.append({'path': path, 'reason': 'sketch eligible on no board this contract builds'})
+            named = with_named(detail)
             for b in P.BOARDS:
-                add(b, [detail])
+                add(b, named)
             if roster:
-                hil_picked.update(b for b in roster if detail in hil_sketches(b))
+                hil_picked.update(b for b in roster if set(named) & set(hil_sketches(b)))
         elif effect == 'tests':
             tests.add(detail)
             if detail == 'build':
@@ -318,8 +394,9 @@ def select(paths, roster=None, only_examples=None):
             if roster:
                 hil_picked.update(b for b in roster if b in boards)
         elif effect == 'hil_sketch':
+            named = with_named(detail)
             for b in P.BOARDS:
-                add(b, [detail])
+                add(b, named)
             tests.update(hil_tests())
             hil_full = True
         elif effect == 'hil':
@@ -340,17 +417,30 @@ def hil_tests():
     return {t for t in P.CONTRACT_TESTS if t != 'build'}
 
 
+def reached_families(effect, detail):
+    """The firmware families a change of this effect reaches: a HIL sketch (or an example one) those of the rig
+    boards that build and run it, a fixture those of its boards. A harness or roster change (`hil`) reaches none:
+    it changes no firmware, and `hil.full` already runs it on every roster board."""
+    if effect == 'family':
+        return {detail}
+    if effect == 'shared':
+        return set(P.REPRESENTATIVES)
+    if effect == 'boards':
+        return {P.BOARDS[b]['family'] for b in detail}
+    if effect == 'fixture':
+        return {b['family'] for b in P.BOARDS.values() if b.get('fixture') == detail}
+    if effect in ('hil_sketch', 'example'):
+        named = with_named(detail)
+        return {P.BOARDS[b]['family'] for b in P.BOARDS for s in named
+                if 'span' in P.BOARDS[b] and s in hil_sketches(b) and eligible(b, s)}
+    return set()
+
+
 def uncovered_by_roster(paths, roster):
     """Firmware families a change reaches that no roster board on this host runs."""
     reached = set()
     for path in paths:
-        effect, detail, _ = classify(path)
-        if effect == 'family':
-            reached.add(detail)
-        elif effect == 'shared':
-            reached.update(P.REPRESENTATIVES)
-        elif effect == 'boards':
-            reached.update(P.BOARDS[b]['family'] for b in detail)
+        reached |= reached_families(*classify(path)[:2])
     covered = {P.BOARDS[b]['family'] for b in roster}
     return [{'family': f, 'reason': 'no roster board of this family on this host'} for f in sorted(reached - covered)]
 
@@ -585,28 +675,75 @@ def tool_version():
     return _cli_json('version').get('VersionString')
 
 
-def foreign_headers(build_dir, cores=()):
-    """Headers a build's .d files took from another copy of this library (a core's bundled one, another checkout),
-    or in a core from another copy of the core, each with its counterpart path here, whether the bytes match and
-    whether it lies in one of the build's `cores`."""
-    found, roots, seen = {}, {}, set()
+def foreign_headers(deps, cores=()):
+    """Headers a build took (`deps`, its dep_paths) from another copy of this library (a core's bundled one, another
+    checkout), or in a core from another copy of the core, each with its counterpart path here, whether the bytes
+    match and whether it lies in one of the build's `cores`."""
+    found, roots = {}, {}
+    for token in deps:
+        p = Path(os.path.realpath(token)) if core_mode() else Path(token)   # the sketchbook links to ROOT
+        if P.ROOT in p.parents:
+            continue
+        root = library_root(p, roots)
+        if root:
+            counterpart = P.ROOT / p.relative_to(root)
+            digest, exists = sha256(p), counterpart.exists()
+            found[token] = {'path': token, 'counterpart': rel(counterpart) if exists else
+                            p.relative_to(root).as_posix(), 'sha256': digest,
+                            'matches': exists and digest == sha256(counterpart), 'core': within(p, cores)}
+    return sorted(found.values(), key=lambda h: h['path'])
+
+
+def dep_paths(build_dir):
+    """The absolute paths a build's .d files name, each once, in no particular order."""
+    seen = set()
     for dfile in Path(build_dir).rglob('*.d'):
         text = dfile.read_text(errors='replace').replace('\\\n', ' ')
         for token in (t.replace('\\ ', ' ') for t in re.split(r'(?<!\\)\s+', text) if t):
-            if token.endswith(':') or not token.startswith('/') or token in seen:
-                continue
-            seen.add(token)
-            p = Path(os.path.realpath(token)) if core_mode() else Path(token)   # the sketchbook links to ROOT
-            if P.ROOT in p.parents:
-                continue
-            root = library_root(p, roots)
-            if root:
-                counterpart = P.ROOT / p.relative_to(root)
-                digest, exists = sha256(p), counterpart.exists()
-                found[token] = {'path': token, 'counterpart': rel(counterpart) if exists else
-                                p.relative_to(root).as_posix(), 'sha256': digest,
-                                'matches': exists and digest == sha256(counterpart), 'core': within(p, cores)}
-    return sorted(found.values(), key=lambda h: h['path'])
+            if not token.endswith(':') and token.startswith('/'):
+                seen.add(token)
+    return list(seen)
+
+
+def core_tinyusb(deps):
+    """[{root, version, ref, headers}] per copy of the TinyUSB an ESP32 core bundles (esp32-arduino-lib-builder's
+    include/arduino_tinyusb) that a build's `deps` (its dep_paths) name: its tusb_option.h TUSB_VERSION, the
+    lib-builder's versions.txt `tinyusb:` line, each None when unreadable, and the headers taken from it.
+    Informational only."""
+    copies = {}
+    for token in deps:
+        parts = Path(token).parts
+        if 'arduino_tinyusb' in parts:
+            root = Path(*parts[:parts.index('arduino_tinyusb') + 1])
+            copies.setdefault(root, []).append(token)
+    return [{'root': str(root), 'version': _tusb_version(root / 'tinyusb/src/tusb_option.h'),
+             'ref': _versions_txt(root.parent.parent / 'versions.txt', 'tinyusb'), 'headers': sorted(headers)}
+            for root, headers in sorted(copies.items())]
+
+
+def _read_text(path):
+    """The file's text, None when it cannot be read."""
+    try:
+        return Path(path).read_text(errors='replace')
+    except OSError:
+        return None
+
+
+def _tusb_version(option_h):
+    text = _read_text(option_h)
+    if text is None:
+        return None
+    parts = [re.search(rf'^\s*#\s*define\s+TUSB_VERSION_{k}\s+(\d+)\b', text, re.M)
+             for k in ('MAJOR', 'MINOR', 'REVISION')]
+    return '.'.join(m.group(1) for m in parts) if all(parts) else None
+
+
+def _versions_txt(path, name):
+    text = _read_text(path)
+    if text is None:
+        return None
+    m = re.search(rf'^{re.escape(name)}:\s*(.+?)\s*$', text, re.M)
+    return m.group(1) if m else None
 
 
 def library_root(path, cache):
@@ -631,12 +768,12 @@ def library_root(path, cache):
 def sketch_source(board, example, build_dir):
     """The sketch dir to compile: the example, or for a board with a `fixture` a copy of it beside the build dir with
     the fixture added (examples stay untouched), one per build key and named as the sketch, as arduino-cli needs."""
-    fixture = P.BOARDS[board].get('fixture')
+    fixture, source = P.BOARDS[board].get('fixture'), source_of(example)
     if not fixture:
-        return P.ROOT / example
-    copy = build_dir.parent / '.sketch' / build_dir.name / Path(example).name
+        return P.ROOT / source
+    copy = build_dir.parent / '.sketch' / build_dir.name / Path(source).name
     shutil.rmtree(copy, ignore_errors=True)
-    shutil.copytree(P.ROOT / example, copy)
+    shutil.copytree(P.ROOT / source, copy)
     shutil.copy2(P.ROOT / fixture, copy / Path(fixture).name)
     return copy
 
@@ -661,15 +798,52 @@ def cli_env(at, prepared):
     return path
 
 
+PREFIX_MAP_KEYS = ('compiler.c.extra_flags', 'compiler.cpp.extra_flags', 'compiler.S.extra_flags')
+_resolved = {}
+
+
+def prefix_mapped(fqbn_, sketch, config, properties):
+    """`properties` with -ffile-prefix-map (GCC 8 or later) appended to the FQBN's resolved per-language extra flags
+    (PREFIX_MAP_KEYS, as arduino-cli resolves them with `properties`, none lost), mapping the isolated environment's
+    per-process dir (config's) to `.arduino-cli`: a __FILE__ the image embeds (SPI.cpp's assert) and the debug paths
+    then name no PID. A platform whose recipes leave those keys out gets no mapping. RuntimeError when arduino-cli
+    cannot resolve them."""
+    key = (fqbn_, str(config), tuple(properties))
+    if key not in _resolved:
+        cmd = ['arduino-cli', 'compile', '--fqbn', fqbn_, '--config-file', str(config), '--show-properties=unexpanded',
+               '--format', 'json', *[a for prop in properties for a in ('--build-property', prop)], str(sketch)]
+        listed = None
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if not p.returncode:
+                listed = json.loads(p.stdout).get('builder_result', {}).get('build_properties')
+        except (OSError, subprocess.TimeoutExpired, ValueError) as e:
+            raise RuntimeError(f'arduino-cli --show-properties: {e}')
+        if not isinstance(listed, list):
+            why = (p.stderr.strip().splitlines() or ['no properties listed'])[-1]
+            raise RuntimeError(f'arduino-cli --show-properties: {why}')
+        _resolved[key] = dict(prop.partition('=')[::2] for prop in listed)
+    flag = f'"-ffile-prefix-map={Path(config).parent}=.arduino-cli"'
+    return [prop for prop in properties if prop.partition('=')[0] not in PREFIX_MAP_KEYS] + \
+        [f'{k}=' + ' '.join(v for v in (_resolved[key].get(k, ''), flag) if v) for k in PREFIX_MAP_KEYS]
+
+
 def compile_sketch(board, example, build_dir, properties, prepared, config=None):
     shutil.rmtree(build_dir, ignore_errors=True)
     build_dir.mkdir(parents=True)
     fqbn_ = fqbn(board, example)
+    sketch = sketch_source(board, example, build_dir)
+    if config:
+        try:
+            properties = prefix_mapped(fqbn_, sketch, config, properties)
+        except RuntimeError as e:
+            return {'board': board, 'example': example, 'status': 'error', 'buildDir': rel(build_dir),
+                    'firstError': str(e)}
     cmd = ['arduino-cli', 'compile', '--clean', '--format', 'json', '--warnings', 'all', '--fqbn', fqbn_,
            *(['--config-file', str(config)] if config else ['--library', str(P.ROOT)]), '--build-path', str(build_dir)]
     for prop in properties:
         cmd += ['--build-property', prop]
-    cmd.append(str(sketch_source(board, example, build_dir)))
+    cmd.append(str(sketch))
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=COMPILE_TIMEOUT)
     except OSError as e:
@@ -727,13 +901,15 @@ def compile_sketch(board, example, build_dir, properties, prepared, config=None)
             row.update(status='failed', firstError=f'{boot_app0} missing: the ESP core layout changed')
             return row
         shutil.copy2(boot_app0, build_dir / boot_app0.name)
-    headers = foreign_headers(build_dir, cores)
+    deps = dep_paths(build_dir)
+    headers = foreign_headers(deps, cores)
     if core_mode() and headers:   # the isolated environment reaches no other copy: one leaking in fails the sketch
         row.update(status='failed', foreignHeaders=headers,
                    firstError=f'compiled against another copy of the core: {[h["path"] for h in headers][:3]}')
         return row
     row.update(status='ok', fqbn=fqbn_, platform=platform, buildPlatform=build_platform, shadows=shadows,
                vidPid=P.vid_pid(build_dir, board, None), foreignHeaders=headers,
+               coreTinyUSB=core_tinyusb(deps),
                libraries=[{'name': lib.get('name'), 'version': lib.get('version'), 'dir': lib.get('install_dir')}
                           for lib in used_libs],
                artifacts=sorted(rel(f) for f in build_dir.glob('*.ino.*') if f.suffix in ('.elf', '.hex', '.bin',
@@ -981,16 +1157,25 @@ def source_identity():
     return ident, diff
 
 
+def _submodule_status(line):
+    """(state, commit, path) of one `git submodule status` line, None when it is not one."""
+    m = re.match(r'^([ +\-U])([0-9a-f]+) (.+)$', line)
+    if not m:
+        return None
+    state, commit, path = m.groups()
+    if state in ' +':   # git appends ` (<describe>)` to these only; the path itself may hold spaces
+        path = re.sub(r' \([^ ]*\)$', '', path)
+    return state, commit, path
+
+
 def submodules():
     """[{path, commit, state}] of the checkout's submodules, recursive: state is git's status prefix, ' ' at the
     gitlink, '-' not initialised, '+' at another commit, 'U' conflicted. A core bundles libraries this way."""
     out = []
     for line in git('submodule', 'status', '--recursive').splitlines():
-        m = re.match(r'^([ +\-U])([0-9a-f]+) (.+)$', line)
-        if m:
-            state, commit, path = m.groups()
-            if state in ' +':   # git appends ` (<describe>)` to these only; the path itself may hold spaces
-                path = re.sub(r' \([^ ]*\)$', '', path)
+        parsed = _submodule_status(line)
+        if parsed:
+            state, commit, path = parsed
             dirty = False
             if state != '-':   # =dirty: nested worktrees are their own entries; a gitlink staged here still shows
                 dirty = bool(git('-C', path, 'status', '--porcelain', '--untracked-files=all',
@@ -1008,13 +1193,76 @@ def submodule_problems(ident):
                                                    if s['state'] == ' ' and s['dirty']]
 
 
-def platform_git(install_dir):
-    p = subprocess.run(['git', '-C', install_dir, 'rev-parse', 'HEAD'], capture_output=True, text=True)
+def _git_at(where, *args):
+    return subprocess.run(['git', '-C', str(where), *args], capture_output=True, env=_git_env())
+
+
+def platform_git(install_dir, content=False):
+    """{commit, dirty} of the git checkout at install_dir, None when it is not one. With `content`, also `content`:
+    a sha256 over what its bytes add to that commit (content_digest), or None with `contentError` naming the input
+    it could not read."""
+    p = _git_at(install_dir, 'rev-parse', 'HEAD')
     if p.returncode:
         return None
-    dirty = subprocess.run(['git', '-C', install_dir, 'status', '--porcelain', '--untracked-files=no'],
-                           capture_output=True, text=True).stdout.strip()
-    return {'commit': p.stdout.strip(), 'dirty': bool(dirty)}
+    dirty = _git_at(install_dir, 'status', '--porcelain', '--untracked-files=no').stdout.strip()
+    out = {'commit': p.stdout.decode().strip(), 'dirty': bool(dirty)}
+    if content:
+        try:
+            out['content'] = content_digest(install_dir)
+        except (OSError, RuntimeError) as e:
+            out.update(content=None, contentError=str(e))
+    return out
+
+
+def content_digest(top):
+    """sha256 over a git checkout's bytes beyond its HEAD, from structured inputs only (no diff text, so no git
+    presentation setting enters it): each submodule's state, commit and path (`git submodule status --recursive`),
+    then for the checkout and each initialised submodule every tracked path that differs from its own HEAD (status,
+    mode, current bytes; a link by its target) and every untracked file not ignored, each field length-framed.
+    Ignored files are not bound. RuntimeError or OSError when an input cannot be read."""
+    def run(where, *args):
+        p = _git_at(where, *args)
+        if p.returncode:
+            raise RuntimeError(f'git -C {where} {" ".join(args)}: {p.stderr.decode(errors="replace").strip()}')
+        return p.stdout
+
+    h = hashlib.sha256()
+
+    def frame(*fields):
+        for f in fields:
+            h.update(len(f).to_bytes(8, 'big') + f)
+
+    def entry(f):
+        if f.is_symlink():
+            return b'link', os.fsencode(os.readlink(f))
+        if f.is_dir():
+            raise RuntimeError(f'{f}: an untracked repository, its bytes unbound')
+        return b'file', f.read_bytes()
+
+    top = Path(top)
+    repos = ['.']
+    for line in os.fsdecode(run(top, 'submodule', 'status', '--recursive')).splitlines():
+        parsed = _submodule_status(line)
+        if not parsed:
+            raise RuntimeError(f'git -C {top} submodule status: unparsed line {line!r}')
+        state, commit, path = parsed
+        frame(b'submodule', state.encode(), commit.encode(), os.fsencode(path))
+        if state != '-':   # not initialised: no worktree
+            repos.append(path)
+    for repo in repos:
+        where = top / repo
+        frame(b'repo', os.fsencode(repo))
+        raw = run(where, 'diff', 'HEAD', '--raw', '-z', '--no-renames', '--no-ext-diff', '--ignore-submodules=all')
+        fields = raw.split(b'\0')
+        # ":<old mode> <new mode> <old> <new> <status>", path; by path, as diff.orderFile reorders them
+        for meta, name in sorted(zip(fields[0::2], fields[1::2]), key=lambda e: e[1]):
+            _, mode, _, _, status = meta.split()
+            frame(b'tracked', name, status, mode, *((b'deleted', b'') if status == b'D' else
+                                                     entry(where / os.fsdecode(name))))
+        for name in sorted(n for n in run(where, 'ls-files', '--others', '--exclude-standard', '-z').split(b'\0')
+                           if n):
+            frame(b'untracked', name, *entry(where / os.fsdecode(name)))
+    return h.hexdigest()
 
 
 def contract_identity():
@@ -1096,6 +1344,7 @@ def make_record(args, board, rows, before, diff, roster_path, prepared):
             'elf': rel(elf),
             'hex': rel(hexfile) if hexfile else None, 'image': image, 'loadSpans': [[s, e] for s, e in spans],
             'vidPid': vid_pid, 'foreignHeaders': row['foreignHeaders'], 'libraries': row.get('libraries', []),
+            **({'source': source_of(row['example'])} if row['example'] in named_builds() else {}),
             'sha256': {rel(f): sha256(f) for f in files},
             **({'segments': [[o, n] for o, n in segments]} if segments else {}), **(extra or {}),
         }
@@ -1109,7 +1358,7 @@ def make_record(args, board, rows, before, diff, roster_path, prepared):
         'fqbn': P.BOARDS[board]['fqbn'], 'experimental': bool(args.experimental),
         'source': {k: before[k] for k in ('head', 'dirty', 'diffSha256', 'submodules') if k in before},
         'buildProperties': args.build_property, 'arduinoCli': tool_version(),
-        'platform': {**platform, 'git': platform_git(platform['install_dir'])},
+        'platform': {**platform, 'git': platform_git(platform['install_dir'], content=True)},
         'dependencies': list(prepared.values()),
         'roster': {'path': rel(roster_path), 'sha256': sha256(roster_path)},
         **identity, 'agentrcSource': {'source': P.AGENTRC['source'], 'dirty': P.AGENTRC['dirty']},
