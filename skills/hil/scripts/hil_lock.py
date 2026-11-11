@@ -652,7 +652,7 @@ def end_failed(handles, reason, *, detail, receipts=(), retained=(), **extra) ->
 def _end_failed_each(handles, reason, detail, receipts, retained, extra, ended) -> dict:
     """end_failed, setting ended[board] to {'logged', 'cleared', 'evidence'}: whether its failed event
     was appended, its record cleared and `receipts` and `retained` collected (an event is logged
-    without the one that failed)."""
+    with what one that failed yielded and an unrecheckable marker in its receipts)."""
     errors, interrupted = {}, []
 
     def guard(boards, what, step, default=None):
@@ -663,10 +663,18 @@ def _end_failed_each(handles, reason, detail, receipts, retained, extra, ended) 
         return _guarded(step, what, note, interrupted, default)
     # a signal between the guarded steps waits until every board is released (None: the guards alone)
     hold = guard((), 'interrupt hold', lambda: _process().InterruptHold())
-    receipts = guard(handles, 'cleanup log not written: receipts', lambda: list(receipts))
-    retained = guard(handles, 'cleanup log not written: retained', lambda: list(retained))
-    evidence = receipts is not None and retained is not None
-    receipts, retained = receipts or [], retained or []
+
+    def collect(items, got):
+        for item in items:
+            got.append(item)      # kept as yielded: an iterable that raises later loses none of them
+        return True
+    given = {'receipts': receipts, 'retained': retained}
+    receipts, retained = [], []
+    lost = [k for k, got in (('receipts', receipts), ('retained', retained))
+            if guard(handles, f'cleanup log not written: {k}', lambda k=k, got=got: collect(given[k], got)) is None]
+    # an operation in the lost part may still run: the marker keeps the logged failure open (resolve_restored)
+    receipts += [{'unrecheckable': f'its {k} were not all collected'} for k in lost]
+    evidence = not lost
     for b, fh in handles.items():
         ended[b] = {'logged': False, 'cleared': False, 'evidence': evidence}
         ended[b]['logged'] = guard([b], 'cleanup log not written', lambda: _log_ended(

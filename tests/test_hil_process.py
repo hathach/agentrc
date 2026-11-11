@@ -1101,14 +1101,16 @@ THREAD_LEADER = ('import ctypes, os, sys, threading, time\n'
 class Bounded(unittest.TestCase):
     def test_a_worker_still_running_gates_the_next_call_whatever_is_alive_says(self):
         """CPython 3.12's Thread.join, interrupted while waiting, marks a still-running thread stopped."""
-        release, calls, last = threading.Event(), [], []
+        release, entered, calls, last = threading.Event(), threading.Event(), [], []
         self.addCleanup(release.set)
 
         def blocked():
             calls.append(1)
+            entered.set()
             release.wait(T)
             return 'walked'
         self.assertIsNone(hp._bounded(blocked, 0.01, last))
+        self.assertTrue(entered.wait(T))
         with mock.patch.object(threading.Thread, 'is_alive', return_value=False):
             self.assertIsNone(hp._bounded(blocked, 0.01, last))
         self.assertEqual(len(calls), 1)

@@ -2419,6 +2419,7 @@ class BoardTasks(LockDir):
         self.assertIsNone(p.poll())
 
     def test_a_failure_logged_without_its_evidence_never_ends_cleanly(self):
+        """What the evidence yielded before it raised is logged, with a marker no restore resolves."""
         def lost():
             yield {'token': 'r'}
             raise OSError(5, 'Input/output error')
@@ -2429,8 +2430,13 @@ class BoardTasks(LockDir):
                 self.assertEqual((task.ended, task.failure_logged, task.ended_cleanly), (True, True, False))
                 self.assert_released(task, events=n)
                 f = latest_failure(hil_lock, BOARD)
-                self.assertEqual((f['detail'], f[key]), ('d', []))
+                self.assertEqual((f['detail'], f[key][0]), ('d', {'token': 'r'}))
+                self.assertEqual(f['receipts'][-1], {'unrecheckable': f'its {key} were not all collected'})
                 self.assertEqual([e.split(':')[1].strip() for e in task.errors], [key])
+                [note] = hil_lock.resolve_restored(BOARD, [f], evidence='restored')
+                self.assertIn(f'{f["id"]} stays open', note)
+                self.assertIn(f'unrecheckable run (its {key} were not all collected)', note)
+                self.assertIn(f['id'], [e['id'] for e in hil_lock.open_cleanup_failures(BOARD)])
 
     def test_the_bypass_is_opt_in_and_never_touches_another_holders_record(self):
         os.environ['HIL_NO_BOARD_LOCK'] = '1'
