@@ -819,6 +819,25 @@ class TestSetup(unittest.TestCase):
                 self.assertNotIn('after', r.stdout)
                 self.assertIn('udev did not apply the rules to the attached devices', r.stderr)
 
+    def test_install_rules_retires_the_tinyuf2_exclusion_file_and_keeps_the_rest(self):
+        rules, modules = self.tmp / 'rules.d', self.tmp / 'modules-load.d'
+        rules.mkdir()
+        modules.mkdir()
+        shutil.copytree(FARM / 'udev', self.dir / 'udev')
+        setup = self.dir / 'setup.sh'
+        setup.write_text(setup.read_text().replace('/etc/udev/rules.d', str(rules))
+                         .replace('/etc/modules-load.d', str(modules)))
+        for name in ('modprobe', 'udevadm', 'timeout'):
+            self.stub(name, ':')
+        (rules / '99-tinyuf2-hil.rules').write_text('retired\n')
+        (rules / '99-tinyuf2-hil-local.rules').write_text('an owner rule\n')
+        want = sorted(['99-tinyuf2-hil-local.rules', *(f.name for f in (FARM / 'udev').glob('*.rules'))])
+        self.assertNotIn('99-tinyuf2-hil.rules', want)
+        for attempt in (1, 2):   # an update re-runs it
+            with self.subTest(attempt=attempt):
+                self.sourced('install_rules')
+                self.assertEqual(sorted(f.name for f in rules.iterdir()), want)
+
     def test_root_creates_what_the_runners_can_read_whatever_umask_sudo_passed(self):
         self.addCleanup(os.umask, os.umask(0o077))
         self.assertEqual(self.sourced('umask'), '0022\n')
