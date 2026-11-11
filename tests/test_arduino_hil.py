@@ -1476,6 +1476,10 @@ class Manual(Base):
                 self.assertIn(why, out['error'])
                 self.assertFalse(self.A.process.run_tracked.called)
                 self.assertEqual((self.lock.logged, self.lock.taken, self.lock.sessions), ([], [], []))
+                self.assertEqual(self.refusal_recorded('exec'), {'pass': False, 'board': 'rig_jlink',
+                                                                 'error': out['error'],
+                                                                 'previousCleanupFailure': {'id': 'f1',
+                                                                                            'receipts': []}})
         args = self.held(cmd='restore', release=False, report=None, build_record='r.json')
         with self.assertRaisesRegex(H.Refused, 'probe check'):   # a refused restore is logged as ever
             H.manual(args)
@@ -1499,16 +1503,27 @@ class Manual(Base):
             H.manual(args)
         self.assertEqual((seen, self.lock.sessions), ([['rig_jlink']], []))
 
+    def refusal_recorded(self, cmd):
+        """The result.json a refused session command left in its run dir, removed so the next one is its own."""
+        results = list((self.root / 'build/hil-manual').glob(f'rig_jlink-{cmd}-*/result.json'))
+        self.assertEqual(len(results), 1, results)
+        out = json.loads(results[0].read_text())
+        results[0].unlink()
+        return out
+
     def test_one_session_command_at_a_time(self):
         args = self.held(cmd='exec', argv=['true'], timeout=5)
         with H.one_session_command('rig_jlink'):
-            with self.assertRaisesRegex(H.Refused, 'still running: session busy'):
+            with self.assertRaisesRegex(H.Refused, 'still running: session busy') as refused:
                 H.manual(args)
+        self.assertEqual(self.refusal_recorded('exec'), {'pass': False, 'board': 'rig_jlink',
+                                                         'error': str(refused.exception)})
         with H.one_session_command('rig_jlink'):
             pass
         self.lock.session_mutex = mock.Mock(side_effect=FakeLock.LockUnavailable('lock dir unusable'))
         with self.assertRaisesRegex(H.Refused, 'session mutex of rig_jlink is unavailable: lock dir unusable'):
             H.manual(args)
+        self.assertIn('lock dir unusable', self.refusal_recorded('exec')['error'])
 
     def test_bundle_holds_the_record_and_its_images(self):
         rec = self.record()

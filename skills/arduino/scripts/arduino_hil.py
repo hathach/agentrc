@@ -132,6 +132,10 @@ class NotHeld(Refused):
     """The board's holder record is readable and is no live hold under the caller's reason: exit NOT_HELD."""
 
 
+class NotAdmitted(Refused):
+    """one_session_command refused: another command under the hold runs, or its session mutex is unusable."""
+
+
 class Unclean(Exception):
     """A child's end is not proven: nothing more may touch the board."""
 
@@ -1067,16 +1071,27 @@ def one_session_command(name):
     try:
         stack.enter_context(A.lock.session_mutex(name))
     except A.lock.SessionBusy as e:
-        raise Refused(f'another session command on {name} is still running: {e}')
+        raise NotAdmitted(f'another session command on {name} is still running: {e}')
     except A.lock.LockUnavailable as e:
-        raise Refused(f'the session mutex of {name} is unavailable: {e}')
+        raise NotAdmitted(f'the session mutex of {name} is unavailable: {e}')
     with stack:
         yield
 
 
 def manual(args):
-    with one_session_command(args.board):
-        return _manual(args)
+    try:
+        with one_session_command(args.board):
+            return _manual(args)
+    except NotAdmitted as e:
+        record_refusal(session_run_dir(args), {'pass': False, 'board': args.board, 'error': str(e)})
+        raise
+
+
+def record_refusal(run_dir, out):
+    """A refused session command's result.json, which outlives a dropped ssh session as every command's does."""
+    with contextlib.suppress(OSError):
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / 'result.json').write_text(json.dumps(out) + '\n')
 
 
 def _manual(args):
@@ -1127,6 +1142,8 @@ def _session_op(args, run_dir):
                 e.args = (f'{e}; {why}',)   # its type kept
             elif why:
                 e.add_note(why)
+            if isinstance(e, Refused):
+                record_refusal(run_dir, {'pass': False, 'board': args.board, 'error': str(e), **extra})
             raise
         error = f'a child outlived its operation: {type(e).__name__}: {e}'
         out, code = {'pass': False, 'board': args.board, 'error': error, 'survivors': pending,
