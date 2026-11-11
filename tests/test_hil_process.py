@@ -991,15 +991,17 @@ class ForeignStateDir(unittest.TestCase):
                 self.assertEqual(hp.recheck_dir(d), ('pending', [entry]))
             with mock.patch('builtins.open', side_effect=PermissionError(errno.EACCES, 'denied')):
                 self.assertEqual(hp.recheck(entry), 'pending')         # a command line it cannot read
-            release, scans = threading.Event(), []
+            release, entered, scans = threading.Event(), threading.Event(), []
             self.addCleanup(release.set)
 
             def blocked(_):
                 scans.append(1)
+                entered.set()
                 release.wait(10)
                 return []
             with mock.patch.object(hp, 'PROC_SCAN_BOUND', 0.01), mock.patch.object(hp, '_supervisors_in', blocked):
                 self.assertEqual(hp.recheck(entry), 'pending')         # not listed within its bound
+                self.assertTrue(entered.wait(5))                        # the worker may start after the bound
                 self.assertEqual(hp.recheck(entry), 'pending')         # nor while that scan is still blocked
                 self.assertEqual(len(scans), 1)                         # and no second scan thread started
                 release.set()

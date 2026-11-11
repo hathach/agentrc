@@ -906,7 +906,7 @@ def _foreign_state(entry: dict) -> str:
         pass
     else:
         return recheck_dir(d, _KeepAll())[0]
-    if not isinstance(d, str) or any(t.is_alive() for t in _proc_scan):
+    if not isinstance(d, str):
         return 'pending'
     return 'unknown' if _bounded(lambda: _supervisors_in(d), PROC_SCAN_BOUND, _proc_scan) == [] else 'pending'
 
