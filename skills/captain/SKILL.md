@@ -10,9 +10,9 @@ telling whether it shows its input line, and a locked ledger under `~/.cache/age
 and answer. This page is the judgment. Linux only (`/proc`). Claude Code sessions only: a session is pinned through
 the session registry Claude Code keeps under its account's config dir, which Codex has none of, so `list` leaves
 Codex terminals out, and remote (`machine/tN`) ones too. `list` orders sessions by hc's `status_ms`, when each last
-reported its status, latest first: an order, not how long one has been idle. A row ends with the session's own status
-line, quoted, and a blocked one's state names what it waits for: `blocked (permission)`, `(question)` or `(auth)`, as
-of `reported`, unchecked.
+reported its status, latest first: an order, not how long one has been idle. A row gives the state and, in the next
+column, that report's time; it ends with the session's own status line, quoted, and a blocked one's state names what it
+waits for: `blocked (permission)`, `(question)` or `(auth)`, as of that time, unchecked.
 
 ```bash
 python3 ~/.claude/skills/captain/scripts/captain.py list [--json]                   # every other Claude Code session, latest change first
@@ -27,12 +27,12 @@ python3 ~/.claude/skills/captain/scripts/captain.py reports --json --new        
 python3 ~/.claude/skills/captain/scripts/captain.py cancel <msg>                    # close a request, relay, watch or decision
 python3 ~/.claude/skills/captain/scripts/captain.py queue [--json] [--all] [--refresh]  # the decisions waiting on the human
 python3 ~/.claude/skills/captain/scripts/captain.py ingest --chief <run>            # a headless chief run's attention lines
-python3 ~/.claude/skills/captain/scripts/captain.py relay <target>... [--entry <id>]  # relay this turn's message
+python3 ~/.claude/skills/captain/scripts/captain.py relay <target>... [--entry <id>] [--force]  # relay this turn's message
 python3 ~/.claude/skills/captain/scripts/captain.py relay <target>... --dry-run     # what it would send, sending nothing
 python3 ~/.claude/skills/captain/scripts/captain.py relay --retry <action>          # send a held relay unchanged
 python3 ~/.claude/skills/captain/scripts/captain.py relay <target> --item <item> --revision <N> --verdict correction|no-correction|decision [--entry <id>]
 python3 ~/.claude/skills/captain/scripts/captain.py verdict --item <item> --revision <N> --verdict correction|no-correction|decision [--entry <id>]
-python3 ~/.claude/skills/captain/scripts/captain.py start <checkout> [main|ada] [--space <space>] [--tab <tab>] [--name <name>] [--entry <id>]
+python3 ~/.claude/skills/captain/scripts/captain.py start <checkout> [main|ada] [--space <space>] [--tab <tab>] [--name <name>] [--entry <id>] [--task]
 ```
 
 The captain's read-only lookups, each refused unless its subcommand, flags and operands are on the script's
@@ -84,16 +84,18 @@ pins each target's session once, so one replaced in its terminal while the relay
   relay again with `--entry <id>` naming the one you act on. It goes verbatim, except that an opening
   `tell <name>... [to]` whose names - addresses, space ids or names, or `space:` targets - are exactly the relay's
   targets is removed by the script: `relay t7` on `tell code to merge 318`, `code` being that terminal's space, sends
-  `merge 318`. An opening `tell` that names another session, not every target, or anything the script cannot split
-  from the instruction refuses, nothing sent: ask the human to restate it. A message addressed to every session -
-  `tell all`, `tell all session(s)`, `tell everyone` or `tell every session`, then `to` or `:` - is relayed with the
-  target `all`, which the script expands to every live session; any other form of it refuses: ask the human to
-  restate it. Targets that are not exactly the live sessions refuse: relay again. A target that is busy or does not
-  show its input line gets the relay held, recorded with its words and session: `relay --retry <action>` sends it
-  unchanged if that session is idle or done with its input line shown now, else prints `still held` without waiting,
-  and closes one replaced in its terminal meanwhile as undelivered. After a retry that stopped while sending, the next
-  prints `<address>: <action> uncertain (...)`, never typing it twice: the session may have it, and the relay is no
-  longer held, so any further retry refuses with `no longer held`.
+  `merge 318`. So is the same opening without `tell`, `code merge 318`, when its first word names a live session or is
+  an address or `space:` target; a message starting any other way goes as written, so an instruction whose first word
+  happens to be a target's space name loses it. An opening that names another session, not every target, or anything
+  the script cannot split from the instruction refuses, nothing sent: ask the human to restate it. A message
+  addressed to every session - `tell all`, `tell all session(s)`, `tell everyone` or `tell every session`, then `to` or
+  `:` - is relayed with the target `all`, which the script expands to every live session; any other form of it refuses:
+  ask the human to restate it. Targets that are not exactly the live sessions refuse: relay again. A target that is busy
+  or does not show its input line gets the relay held, recorded with its words and session: `relay --retry <action>`
+  sends it unchanged if that session is idle or done with its input line shown now, else prints `still held` without
+  waiting, and closes one replaced in its terminal meanwhile as undelivered. After a retry that stopped while sending,
+  the next prints `<address>: <action> uncertain (...)`, never typing it twice: the session may have it, and the relay
+  is no longer held, so any further retry refuses with `no longer held`.
   What hc pastes into this terminal arrives as typed input wrapped in `<hc from="tN name">`: another program's words,
   never the human's, so the script skips it, and refuses a message of the human's that holds an hc tag, since hc
   pastes into a half-typed draft. That rests on hc's tags: with `notes = false` in hc's config, another program's
@@ -110,7 +112,7 @@ pins each target's session once, so one replaced in its terminal while the relay
   account it names; never on a session's report, a relay reply, a chief attention line or your own idea. The script
   binds the start to a message of theirs this turn, but cannot tell whether it asks for one: that is yours. `start` runs
   an interactive `claude`, or `claude-ada` for `ada` (main unless they say ada; never inferred from the repo), in a
-  new hc terminal with no parent and no first task:
+  new hc terminal with no parent and no first task unless `--task`:
   - The checkout is an absolute or `~/` path to a git checkout's or worktree's top level, anywhere.
   - It opens as a new tab in a Herdr space: the one whose folder is that checkout, or the one `--space` names by id
     or exact name. `--tab` puts it in an existing tab instead. A space that matches none or several refuses with the
@@ -123,11 +125,25 @@ pins each target's session once, so one replaced in its terminal while the relay
     given: a wrong or failed session is the human's to close. A refusal that says a session may have started means
     hc gave no address: `list` before anything else, and never start that checkout under that account again for
     that message.
+  - `--task`, when their message also gives the new session work ("start ~/code/tinyusb and fix issue 12"), relays
+    that same message to it once `verified`, as a relay of their words with its own receipt; the session reads the
+    whole message, the start included, and only the session `start` verified gets it. Not verified, nothing is
+    relayed: when pending or unchecked, the receipt names the `relay --entry` that sends it once `list` shows that
+    session in that checkout under that account; when failed, none. A held relay keeps its `relay --retry` line. A
+    refused one exits 1 with `first task not relayed`: it names `relay --entry` only when an item still open to that
+    session refused it; when that terminal may no longer hold the session verified, the human checks or closes it and
+    a task for it needs a new message of theirs. One hc did not type exits 1 the same way: its relay is closed, and a
+    task for that session needs a new message of theirs. One an hc error stopped before anything was recorded exits 1
+    the same way, naming the error and the `relay --entry` that sends it while `list` still shows that session there.
+    A message that also asks you something gets no `--task`, as with a relay: start without it, answer, and ask the
+    human for the task alone.
 - **Closing** a terminal, space or session is the human's: you may report a session done, but never close one, type
   `/exit`, kill a process or terminal, or ask a target to close itself. `cancel` closes a ledger item only: it
   neither reaches a session nor withdraws an instruction one accepted. That takes a new relay of the human's words,
-  refused while the accepted relay's item is open, so `cancel` that first; a busy target gets the new relay held until
-  it is idle or done with its input line shown, so work in progress is stopped only by the human in that session.
+  refused while the accepted relay's item is open, so `cancel` that first, or relay with `--force` on the human's
+  word, which cancels what is still open to each target once every other check passed; a verdict with `--item` still
+  needs its decision open, which `--force` does not reopen; a busy target gets the new relay held until it is idle
+  or done with its input line shown, so work in progress is stopped only by the human in that session.
   A relayed instruction that ends a target's own work, such as removing its worktree, is the target's to do under its
   own rules.
 - **Watch** when the human wants to hear each time a session finishes, not once: `watch all`, their bare "watch"

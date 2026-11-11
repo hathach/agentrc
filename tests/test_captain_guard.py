@@ -123,7 +123,8 @@ class VerdictTest(unittest.TestCase):
     def test_start_takes_one_absolute_or_home_path_an_account_and_its_options(self):
         for cmd in [f'{RUN} start ~/code/tinyusb', f'{RUN} start /home/u/.herdr/worktrees/agentrc/captain ada',
                     f'{RUN} start ~/code/tinyusb main --name tinyusb-2 --space sp8a64d095 --tab tbd7e2c6',
-                    f'{RUN} start ~/x --space Adafruit_TinyUSB_Arduino --entry f0a4846d-6b04-428a-8e4d-a4fc931e6cff']:
+                    f'{RUN} start ~/x --space Adafruit_TinyUSB_Arduino --entry f0a4846d-6b04-428a-8e4d-a4fc931e6cff',
+                    f'{RUN} start ~/code/tinyusb --task', f'{RUN} start ~/code/tinyusb ada --task --name t-2']:
             with self.subTest(cmd):
                 self.assertIsNone(self.verdict('Bash', command=cmd))
         for cmd in [f'{RUN} start', f'{RUN} start tinyusb', f'{RUN} start ./tinyusb', f'{RUN} start ~alice/code',
@@ -131,7 +132,8 @@ class VerdictTest(unittest.TestCase):
                     f'{RUN} start ~/a work', f'{RUN} start ~/a ada main', f'{RUN} start ~/a --name x --name y',
                     f'{RUN} start ~/a --name', f'{RUN} start ~/a --name --tab', f'{RUN} start ~/a --name=x',
                     f'{RUN} start ~/a --cwd /etc', f'{RUN} start ~/a --space a/b', f'{RUN} ask ~/code',
-                    f'{RUN} relay /home/u t2', f'{RUN} start "~/a b"', f'{RUN} start ~/a; hc kill t2']:
+                    f'{RUN} relay /home/u t2', f'{RUN} start "~/a b"', f'{RUN} start ~/a; hc kill t2',
+                    f'{RUN} start ~/a --task --task', f'{RUN} start ~/a --task x y']:
             with self.subTest(cmd):
                 self.assertIsNotNone(self.verdict('Bash', command=cmd))
         self.assertIsNotNone(self.verdict('Monitor', command=f'{RUN} start ~/code/tinyusb', timeout_ms=1000))

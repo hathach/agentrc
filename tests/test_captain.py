@@ -119,8 +119,8 @@ class SessionsTest(unittest.TestCase):
                 mock.patch('builtins.print') as out:
             captain.main()
         rows = [c.args[0].split('\t') for c in out.call_args_list]   # its cwd column differs on Windows
-        self.assertEqual([(r[2], r[4:]) for r in rows],
-                         [('blocked (permission), reported ?', ['"Edit x?"']), ('idle, reported ?', [])])
+        self.assertEqual([(r[2], r[3], r[5:]) for r in rows],
+                         [('blocked (permission)', '?', ['"Edit x?"']), ('idle', '?', [])])
 
     def test_missing_or_relative_cwd_stays_unknown(self):
         for cwd in (None, '', 'rel/dir'):
@@ -941,10 +941,10 @@ class RelayCase(LedgerCase):
         with open(self.transcript, 'a', encoding='utf-8') as f:
             f.write(json.dumps(entry) + '\n')
 
-    def relay(self, *addresses, entry=None):
+    def relay(self, *addresses, entry=None, force=False):
         """Relay this turn's message, or entry among them, to addresses."""
         with mock.patch('builtins.print') as out:
-            captain.relay(captain.resolve(list(addresses or ['t2'])), entry, self.ident)
+            captain.relay(captain.resolve(list(addresses or ['t2'])), entry, self.ident, force=force)
         return [c.args[0] for c in out.call_args_list]
 
     def preview(self, *targets, entry=None):
@@ -1117,6 +1117,31 @@ class RelayTest(RelayCase):
         self.say('and push')
         self.assertIn('still open', self.relay()[0])
         self.assertEqual(len(self.typed), 1)
+
+    def test_force_cancels_what_is_still_open_to_the_target_and_relays(self):
+        first = self.relayed()
+        self.say('and push')
+        lines = self.relay(force=True)
+        self.assertEqual(lines[0], f't2: cancelled {first}')
+        self.assertTrue(lines[1].endswith('delivered'))
+        self.assertEqual(len(self.typed), 2)
+        self.assertEqual(list(captain.open_items(captain.records())), [self.action_of(lines[1:])])
+
+    def test_force_cancels_nothing_when_the_relay_is_refused(self):
+        first = self.relayed()
+        self.terminals['t2'] = {**pinned('t2'), 'pid': None}
+        self.say('and push')
+        self.assertIn('refused', self.relay(force=True)[0])
+        self.assertIn(first, captain.open_items(captain.records()))
+
+    def test_force_cancels_nothing_when_the_screen_read_fails(self):
+        first = self.relayed()
+        self.say('stop and inspect')
+        with mock.patch.object(captain, 'read_screen', side_effect=captain.hc.Error('socket closed')):
+            self.assertRaises(captain.hc.Error, self.relay, force=True)
+        recs = captain.records()
+        self.assertIn(first, captain.open_items(recs))
+        self.assertFalse(any(r['type'] == 'cancel' for r in recs))
 
     def test_a_busy_target_holds_the_relay_and_retry_sends_it_unchanged(self):
         self.terminals['t2'] = {**pinned('t2'), 'status': 'working'}
@@ -1350,17 +1375,25 @@ class AddressingTest(AddressedCase):
                 self.assertEqual(self.shown(words, *addresses), want)
 
     def test_a_message_without_addressing_is_sent_unchanged(self):
-        for words in ('merge 318', 'please tell code to merge 318', '  told code: merge'):
+        for words in ('merge 318', 'please tell code to merge 318', '  told code: merge', 'all tests pass?',
+                      'https://ci/run/7 failed'):
             with self.subTest(words):
                 self.assertEqual(self.shown(words, 't2'), words)
 
-    def test_only_an_addressed_message_lists_the_sessions(self):
-        listed, everyone = [], captain.everyone
-        with mock.patch.object(captain, 'everyone', lambda: listed.append(1) or everyone()):
-            self.assertEqual(captain.relay_text('merge 318', ['t2']), 'merge 318')
-            self.assertEqual(listed, [])
-            self.assertEqual(captain.relay_text('tell code to merge 318', ['t2']), 'merge 318')
-            self.assertEqual(listed, [1])
+    def test_names_without_tell_open_it_too(self):
+        cases = [('code merge 318', ['t2'], 'merge 318'),
+                 ('Code: merge 318', ['t2'], 'merge 318'),
+                 ('t2 merge 318', ['t2'], 'merge 318'),
+                 ('space:code to merge it', ['t2'], 'merge it'),
+                 ('code and docs rebase\nthen push', ['t2', 't3'], 'rebase\nthen push')]
+        for words, addresses, want in cases:
+            with self.subTest(words):
+                self.assertEqual(self.shown(words, *addresses), want)
+        for words, why in (('docs merge 318', 'not a target'), ('t98 merge 318', "'t98' names no live session"),
+                           ('space:missing merge', "'space:missing' names no live session"),
+                           ('code', 'nothing follows')):
+            with self.subTest(words):
+                self.assertIn(why, self.refused(words, 't2'))
 
     def test_addressing_anyone_else_or_ambiguously_refuses(self):
         cases = [('tell docs to merge 318', ['t2'], 'not a target'),
@@ -2533,10 +2566,10 @@ class VerdictCase(RelayCase):
                           (self.item(key)['id'], revision, verdict))
         return [c.args[0] for c in out.call_args_list]
 
-    def refused(self, fn, *args):
+    def refused(self, fn, *args, **kwargs):
         before = captain.records()
         with self.assertRaises(SystemExit), mock.patch('builtins.print') as out:
-            fn(*args)
+            fn(*args, **kwargs)
         self.assertEqual([r for r in captain.records() if r['type'] != 'observed'],
                          [r for r in before if r['type'] != 'observed'])
         return '\n'.join(str(c.args[0]) for c in out.call_args_list)
@@ -2553,6 +2586,15 @@ class VerdictTest(VerdictCase):
         self.assertEqual((relayed['item'], relayed['revision'], relayed['verdict'], relayed['change_id']),
                          (self.item()['id'], 1, 'correction', 'o/r#12'))
         self.assertEqual((self.item()['state'], self.item()['closure']['why']), ('closed', 'decided'))
+
+    def test_force_refuses_to_replace_an_open_verdict_on_the_same_decision(self):
+        self.report(decision('merge', kind='blocked'))
+        self.terminals['t2'] = {**pinned('t2'), 'status': 'working'}
+        held = self.action_of(self.decide())
+        self.say('no: rebase first')
+        out = self.refused(captain.relay, captain.resolve(['t2']), None, self.ident,
+                           (self.item()['id'], 1, 'correction'), force=True)
+        self.assertIn(f'is closed (decided by {held})', out)
 
     def test_only_its_owner_at_its_latest_open_revision(self):
         self.report(decision('merge', kind='blocked'))
@@ -3201,9 +3243,9 @@ class StartTest(RelayCase):
         session.update(pid=77, started=5, account=self.pinned_account, session='s-new')
         return session
 
-    def start(self, arg=None, account='main', name=None, space=None, tab=None, entry=None):
+    def start(self, arg=None, account='main', name=None, space=None, tab=None, entry=None, task=False):
         with mock.patch('builtins.print') as out:
-            code = captain.start(arg or self.root, account, name, space, tab, entry, self.ident)
+            code = captain.start(arg or self.root, account, name, space, tab, entry, self.ident, task)
         return code, '\n'.join(str(c.args[0]) for c in out.call_args_list)
 
     def start_refusal(self, arg=None, account='main', **opts):
@@ -3234,6 +3276,99 @@ class StartTest(RelayCase):
                          ('t9', 'verified', 's-new'))
         self.assertIn('a new tab', out)
         self.assertIn('verified', out)
+
+    def test_a_task_is_that_message_relayed_to_the_verified_session(self):
+        self.say('start proj and fix the lint errors')
+        self.terminals['t9'] = {**pinned('t9'), 'created': 99, 'cwd': self.root, 'session': 's-new', 'pid': 77,
+                                'started': 5}   # the session verify() pinned, as list finds it
+        code, out = self.start(task=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.types()[:2], ['start', 'started'])
+        relayed = next(r for r in captain.records() if r['type'] == 'relay')
+        self.assertEqual((relayed['target']['address'], relayed['entry'], relayed['quote']),
+                         ('t9', 'u-1', 'start proj and fix the lint errors'))
+        self.assertIn(f'accept --action {relayed["msg"]}', self.typed[-1][1])
+        self.assertTrue(out.splitlines()[-1].endswith('delivered'), out)
+
+    def test_a_task_for_a_busy_session_is_held(self):
+        self.say('start proj and fix the lint errors')
+        self.terminals['t9'] = {**pinned('t9'), 'created': 99, 'cwd': self.root, 'session': 's-new', 'pid': 77,
+                                'started': 5, 'status': 'working'}
+        code, out = self.start(task=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.types()[-1], 'held')
+        self.assertIn('`relay --retry ', out)
+        self.assertNotIn('first task not relayed', out)
+
+    def test_a_task_hc_did_not_type_exits_1_and_needs_a_new_message(self):
+        self.say('start proj and fix the lint errors')
+        self.terminals['t9'] = {**pinned('t9'), 'created': 99, 'cwd': self.root, 'session': 's-new', 'pid': 77,
+                                'started': 5}
+        self.submit_result = ('undelivered', 't9 is working, not idle')
+        code, out = self.start(task=True)
+        self.assertEqual(code, 1)
+        self.assertEqual(self.types()[-1], 'undelivered')
+        self.assertIn('first task not relayed, it was not delivered to t9 and that relay is closed', out)
+        self.assertNotIn('--entry', out)
+
+    def test_a_task_never_goes_to_a_session_other_than_the_one_verified(self):
+        self.say('start proj and fix the lint errors')
+        self.terminals['t9'] = pinned('t9')   # replaced after verify() pinned s-new
+        code, out = self.start(task=True)
+        self.assertEqual(code, 1)
+        self.assertNotIn('relay', self.types())
+        self.assertIn('t9: refused, its session changed', out)
+        self.assertIn('first task not relayed, t9 may no longer be the session verified', out)
+        self.assertNotIn('--entry', out)
+
+    def test_a_task_refused_by_an_item_open_to_the_verified_session_names_its_relay(self):
+        self.say('start proj and fix the lint errors')
+        self.terminals['t9'] = {**pinned('t9'), 'created': 99, 'cwd': self.root, 'session': 's-new', 'pid': 77,
+                                'started': 5}
+        self.ask('t9')
+        code, out = self.start(task=True)
+        self.assertEqual(code, 1)
+        self.assertNotIn('relay', self.types())
+        self.assertIn('t9: refused, a request or relay to it is still open', out)
+        self.assertIn('first task not relayed, a request or relay to t9 is still open', out)
+        self.assertIn('`relay t9 --entry u-1`', out)
+
+    def test_a_task_whose_opening_names_another_session_exits_1_and_needs_a_new_message(self):
+        self.say('sp2 fix the lint errors')   # t2's space: a relay to t9 cannot send it as written
+        self.terminals['t9'] = {**pinned('t9'), 'created': 99, 'cwd': self.root, 'session': 's-new', 'pid': 77,
+                                'started': 5}
+        code, out = self.start(task=True)
+        self.assertEqual(code, 1)
+        self.assertNotIn('relay', self.types())
+        self.assertIn("the human's message cannot be relayed as written", out)
+        self.assertIn('first task not relayed, it was refused before anything was recorded', out)
+        self.assertNotIn('--entry', out)
+
+    def test_a_task_whose_screen_read_fails_exits_1_and_names_its_relay(self):
+        self.say('start proj and fix the lint errors')
+        self.terminals['t9'] = {**pinned('t9'), 'created': 99, 'cwd': self.root, 'session': 's-new', 'pid': 77,
+                                'started': 5}
+        with mock.patch.object(captain, 'read_screen', side_effect=captain.hc.Error('hc read t9 failed: gone')):
+            code, out = self.start(task=True)
+        self.assertEqual(code, 1)
+        self.assertNotIn('relay', self.types())
+        self.assertIn('first task not relayed, hc read t9 failed: gone; nothing was recorded for it', out)
+        self.assertIn('`relay t9 --entry u-1`', out)
+
+    def test_a_failed_start_offers_no_relay(self):
+        self.say('start proj and fix the lint errors')
+        self.pinned_account = 'ada'
+        out = self.start(task=True)[1]
+        self.assertIn('first task not relayed, the session is not verified', out)
+        self.assertNotIn('--entry', out)
+
+    def test_a_task_waits_for_a_session_not_yet_verified(self):
+        self.say('start proj and fix the lint errors')
+        self.gets = {'t9': self.terminal(app=None)}   # still coming up: no Claude Code session yet
+        out = self.start(task=True)[1]
+        self.assertNotIn('relay', self.types())
+        self.assertIn('first task not relayed', out)
+        self.assertIn('`relay t9 --entry u-1`', out)
 
     def test_ada_runs_its_wrapper(self):
         self.say('start proj on ada')

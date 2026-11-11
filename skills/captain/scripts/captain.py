@@ -16,15 +16,17 @@ does not recognize is reported, never assumed safe.
   captain.py cancel <msg>                        close a request, relay, watch or decision no answer will close
   captain.py queue [--json] [--all] [--refresh]  the decisions waiting on the human, sending nothing
   captain.py ingest --chief <run>                record a headless chief run's attention lines as decisions
-  captain.py relay <target>... [--entry <id>] [--dry-run]
-                                                 relay the human's message this turn acts on
+  captain.py relay <target>... [--entry <id>] [--dry-run] [--force]
+                                                 relay the human's message this turn acts on; --force first
+                                                 cancels a request or relay still open to a target
   captain.py relay <target> --item <id> --revision <N> --verdict <verdict> [--entry <id>]
                                                  relay it as the human's verdict on a decision
   captain.py verdict --item <id> --revision <N> --verdict <verdict> [--entry <id>]
                                                  record it as that verdict, sending nothing
   captain.py relay --retry <action>              send a held relay once its session is idle or done, its input line shown
-  captain.py start <checkout> [main|ada] [--name <n>] [--space <id|name>] [--tab <id>] [--entry <id>]
-                                                 start a Claude Code session there on the human's message
+  captain.py start <checkout> [main|ada] [--name <n>] [--space <id|name>] [--tab <id>] [--entry <id>] [--task]
+                                                 start a Claude Code session there on the human's message;
+                                                 --task relays that message to it as its first task
   captain.py brief --for <msg> | --pending       a target reads what a status request asks, or joins a watch
   captain.py report --for <msg> --file <json|->  a target answers a status request
   captain.py accept --action <action>            a target takes a relay and reads its words
@@ -35,11 +37,12 @@ does not recognize is reported, never assumed safe.
 A target is a terminal address (t7) or space:<herdr space id or name>, which must match exactly one session; `all`,
 alone, is every live session.
 
-A message that opens `tell <name>... [to]`, each name an address, space id or name, or space:<id or name>, is relayed
-without that opening when the names are exactly the relay's targets, and refused when they are not or cannot be told
-apart from the instruction. One addressed to every session (`tell all|everyone|every session to|:`) is relayed
-without it when the targets are exactly the live sessions. The message relayed is one the human wrote in the
-captain's current turn, typed or read mid-turn; a message hc pasted (`<hc from=...>`) is never the human's.
+A message that opens `tell <name>... [to]`, or the names alone, each an address, space id or name, or space:<id or
+name>, is relayed without that opening when the names are exactly the relay's targets, and refused when they are not
+or cannot be told apart from the instruction. One addressed to every session (`tell all|everyone|every session
+to|:`) is relayed without it when the targets are exactly the live sessions. The message relayed is one the human
+wrote in the captain's current turn, typed or read mid-turn; a message hc pasted (`<hc from=...>`) is never the
+human's.
 
 A watch types into nobody: a session joins it itself, through hooks/captain (SessionStart after a compaction or
 /clear, Stop) or `brief --pending`, and it stands until the human cancels it, whichever captain is enrolled or none.
@@ -635,13 +638,24 @@ def refusal(target):
     return None
 
 
-def gate(address, recs, mine):
-    """(the pinned session in address, None) when it may get an item, busy or not, else (None, why not)."""
-    if any(r['target']['address'] == address for r in open_items(recs).values()):
-        return None, 'a request or relay to it is still open (collect it, or cancel it)'
+def open_to(address, recs):
+    """The ids of the requests and relays still open to address."""
+    return [m for m, r in open_items(recs).items() if r['target']['address'] == address]
+
+
+OPEN = 'a request or relay to it is still open (collect it, cancel it, or relay with --force)'
+
+
+def reach(address, mine):
+    """(the pinned session in address, None), else (None, why not)."""
     target = find(address)
     why = unreachable(target, mine)
     return (None, why) if why else (target, None)
+
+
+def gate(address, recs, mine):
+    """(the pinned session in address, None) when it may get an item, busy or not, else (None, why not)."""
+    return (None, OPEN) if open_to(address, recs) else reach(address, mine)
 
 
 def sendable(address, recs, mine):
@@ -742,7 +756,7 @@ def ask(address, mine, force=False):
             at = time.strftime('%H:%M', time.localtime(last['at']))
             return f'{address}: not asked, nothing new since its report {ref} at {at}'
         msg = new_id('m', recs)
-        return deliver('request', msg, captain, target, status_prompt(msg))
+        return deliver('request', msg, captain, target, status_prompt(msg))[1]
 
 
 def item(kind, msg, captain, target, **fields):
@@ -752,16 +766,16 @@ def item(kind, msg, captain, target, **fields):
 
 
 def deliver(kind, msg, captain, target, prompt, **fields):
-    """Record the item, then type its prompt and record how that went: a crash between leaves the item open, never
-    typed unrecorded."""
+    """Record the item, then type its prompt and record how that went, as type_prompt() returns it: a crash between
+    leaves the item open, never typed unrecorded."""
     append(item(kind, msg, captain, target, **fields))
     return type_prompt(msg, target, prompt, captain)
 
 
 def type_prompt(msg, target, prompt, captain):
-    """Type msg's prompt into target, record how that went, and return the line saying so."""
+    """Type msg's prompt into target, record how that went, and return (that outcome, the line saying so)."""
     outcome, err = submit(target['address'], prompt, target['status'], captain['address'])
-    return record_delivery(msg, target['address'], outcome, err)
+    return outcome, record_delivery(msg, target['address'], outcome, err)
 
 
 def record_delivery(msg, address, outcome, err=None):
@@ -1765,23 +1779,36 @@ def named(token, live):
             if token in (s.get(k) and s[k].casefold() for k in ('address', 'space_id', 'space'))}
 
 
+def recipient(token, live):
+    """Whether token is read as a recipient: an address or space: target even when it names no one, or a name of a
+    live session."""
+    return bool(token.startswith(SPACE) or ADDRESS.fullmatch(token) or named(token, live))
+
+
 def instruction(words, addresses, live):
-    """(text, None): what a relay to addresses sends, words without an opening `tell <name>... [to]` whose names are
-    exactly addresses; (None, why) when that opening names anyone else or cannot be split from the instruction."""
+    """(text, None): what a relay to addresses sends, words without an opening `[tell] <name>... [to]` whose names
+    are exactly addresses; (None, why) when that opening names anyone else or cannot be split from the instruction.
+    Without `tell`, a first word is an opening only when it names a live session or is shaped as an address or
+    space:, so an instruction that starts any other way is sent as written."""
     tell = TELL.match(words)
-    if not tell:
-        return words, None
-    pos, found = tell.end(), set()
-    first = EVERY_WORD.match(words, pos)
-    if first:
-        return broadcast(words, first, addresses, live)
+    if tell:
+        pos = tell.end()
+        first = EVERY_WORD.match(words, pos)
+        if first:
+            return broadcast(words, first, addresses, live)
+    else:
+        pos = len(words) - len(words.lstrip())
+        lead = NAME.match(words, pos)
+        if not lead or EVERY_WORD.fullmatch(lead.group()) or not recipient(lead.group(), live):
+            return words, None
+    found = set()
     while True:
         name = NAME.match(words, pos)
         if name and EVERY_WORD.fullmatch(name.group()):
             return None, f'"{name.group()}" addresses every session, not one to join with other names'
         hits = named(name.group(), live) if name else set()
         if not hits:
-            return None, f'it opens with "tell" and {name.group()!r} names no live session' if name else \
+            return None, f'{name.group()!r} names no live session' if name else \
                 'it opens with "tell" and no session name follows'
         if len(hits) > 1:
             return None, f'"{name.group()}" names {", ".join(sorted(hits))}, not one session'
@@ -1792,10 +1819,7 @@ def instruction(words, addresses, live):
         pos = name.end()
         join = JOIN.match(words, pos)
         following = join and NAME.match(words, join.end())
-        # an address or space: is a recipient even when it names no one, never the instruction's first word
-        if not (following and (':' in following.group() or ADDRESS.fullmatch(following.group())
-                               or EVERY_WORD.fullmatch(following.group())
-                               or named(following.group(), live))):
+        if not (following and (EVERY_WORD.fullmatch(following.group()) or recipient(following.group(), live))):
             joiner = join and join.group().strip(' \t\r\n,')
             if joiner:
                 return None, f'{joiner!r} after {name.group()!r} may join another name or start the instruction'
@@ -1836,8 +1860,6 @@ def broadcast(words, first, addresses, live):
 
 def relay_text(words, addresses):
     """The text a relay to addresses sends; dies, so nothing is sent, when instruction() refuses it."""
-    if not TELL.match(words):   # unaddressed: sent as written, no session listing needed
-        return words
     text, why = instruction(words, addresses, everyone())
     if isinstance(why, Stale):
         die(f'{why}: run list, then relay again to every address it shows', 2)
@@ -1897,13 +1919,16 @@ def relay_prompt(action):
             f'Run: python3 {INSTALLED} accept --action {action}')
 
 
-def relay(targets, entry, mine, decided=None):
+def relay(targets, entry, mine, decided=None, force=False, pinned=None):
     """Relay the human's message this turn acts on (bound()) to each target, recorded before it is typed; targets as
     resolve() gave them. The transcript is read once for every target, so a message the human sends after that is not
     seen, and each session is pinned once, so one replaced in its terminal meanwhile is refused. A target busy or not
     showing its input line gets the relay held, recorded for `retry` to send unchanged. decided, (item, revision,
     verdict), makes it the human's verdict on that decision: one target, the session that owns it, and the binding
-    written into the relay record itself."""
+    written into the relay record itself. force cancels a request or relay still open to a target, once every other
+    check passed, as `cancel` would on the human's word. pinned, {address: identity}, is the session each target
+    must still be, as start() verified it, in place of the one found now. Returns {address: None when the message is
+    recorded to it, already or now, held, delivered or uncertain; else why not: its refusal, or 'undelivered'}."""
     addresses = list(targets)
     if decided and len(addresses) != 1:
         die('a relay with --item goes to exactly one session, the one that owns the decision', 2)
@@ -1911,26 +1936,32 @@ def relay(targets, entry, mine, decided=None):
         captain = require_captain(mine)
         uid, words = bound(captain, entry)
         binding, linked = bind(decided, seen, captain, uid) if decided else ({}, None)
-        pinned = {address: find(address) for address in addresses}
+        pinned = pinned or {address: find(address) for address in addresses}
         quote = relay_text(words, addresses)
+        results = {}
         for address in addresses:
             recs = records()
+            results[address] = None
             if any(r['type'] == 'relay' and r['entry'] == uid and r['target']['address'] == address for r in recs):
                 print(f'{address}: refused, this message was relayed to it already', flush=True)
                 continue
-            target, why = gate(address, recs, mine)
+            target, why = reach(address, mine) if force else gate(address, recs, mine)
+            stale = open_to(address, recs) if force else []
             if not why and (not pinned[address] or identity(target) != identity(pinned[address])):
                 why = 'its session changed during this relay; relay again'
+            if not why and linked and session_of(linked['owner']) != session_of(target):
+                why = f'the decision {binding["item"]} is not this session\'s'
             if why:
                 print(f'{address}: refused, {why}', flush=True)
+                results[address] = why
                 continue
-            if linked and session_of(linked['owner']) != session_of(target):
-                print(f'{address}: refused, the decision {binding["item"]} is not this session\'s', flush=True)
-                continue
+            busy = refusal(target)   # reads the screen, which can fail: before any cancel
+            for msg in stale:
+                append({'type': 'cancel', 'msg': msg})
+                print(f'{address}: cancelled {msg}', flush=True)
             action = new_id('a', recs)
             fields = {'entry': uid, 'quote': quote, 'context': context(target, recs) + settles(linked, binding),
                       **binding}
-            busy = refusal(target)
             if busy:
                 append(item('relay', action, captain, target, **fields))
                 append({'type': 'held', 'msg': action, 'why': busy})
@@ -1938,8 +1969,10 @@ def relay(targets, entry, mine, decided=None):
                       'with its input line shown',
                       flush=True)
                 continue
-            print(deliver('relay', action, captain, target, relay_prompt(action), **fields), flush=True)
-    return 0
+            outcome, line = deliver('relay', action, captain, target, relay_prompt(action), **fields)
+            print(line, flush=True)
+            results[address] = 'undelivered' if outcome == 'undelivered' else None
+    return results
 
 
 def bind(decided, seen, captain, uid):
@@ -1963,7 +1996,8 @@ def bind(decided, seen, captain, uid):
         die(f'{iid} is a report\'s needs, not a decision: it takes no verdict', 2)
     linked, why = rebound(iid, revision, seen)
     if linked['state'] != 'open':
-        die(f'decision {iid} is closed', 2)
+        closure = linked['closure']
+        die(f'decision {iid} is closed ({closure["why"]}' + (f' by {closure["by"]})' if closure['by'] else ')'), 2)
     if why:
         die(f'decision {iid}: {why}; nothing recorded', 2)
     sha = {'reviewed_sha': linked['content']['reviewed_sha']} if 'reviewed_sha' in linked['content'] else {}
@@ -2105,10 +2139,12 @@ def verify(address, root, account):
     return 'verified', '', identity(session)
 
 
-def start(arg, account, name, space, tab, entry, mine):
+def start(arg, account, name, space, tab, entry, mine, task=False):
     """Start an interactive Claude Code session in the checkout arg names, in a new hc terminal shown in a Herdr
     space, on the human's message this turn: each check refuses before anything runs, the intent is recorded before
-    hc runs, and one message starts a checkout under an account once. Captain never closes what it started."""
+    hc runs, and one message starts a checkout under an account once. Captain never closes what it started. task
+    relays that same message to the session as its first task once it is verified, through relay() and its
+    receipt."""
     tab = tab or None   # well_formed() refuses an empty tab, which would leave the ledger unreadable
     root = checkout_root(arg)
     argv = launcher(account)
@@ -2149,7 +2185,44 @@ def start(arg, account, name, space, tab, entry, mine):
            'pending': f'verification pending ({why}): `list` shows it once it is up',
            'failed': f'VERIFICATION FAILED: {why}; the human closes {address}',
            'unchecked': f'VERIFICATION UNCHECKED: {why}; `list` shows whether it is up'}[verification])
+    if task and verification == 'verified':
+        try:
+            why = relay({address: address}, uid, mine, pinned={address: session})[address]
+        except SystemExit as stop:
+            if not stop.code:
+                raise
+            # relay() dies only before its loop records anything; die() has already said why
+            print(f'{msg}: first task not relayed, it was refused before anything was recorded; a task for '
+                  f'{address} needs a new message of theirs')
+            return 1
+        except hc.Error as e:
+            # only relay()'s reads before it records raise this (hc get, hc read); hc send returns its outcome
+            print(f'{msg}: first task not relayed, {e}; nothing was recorded for it: once `list` still shows '
+                  f'{session["session"]} there, `relay {address} --entry {uid}` sends it')
+            return 1
+        return first_task(msg, address, uid, session, why)
+    elif task:
+        print(f'{msg}: first task not relayed, the session is not verified' + (
+            '' if verification == 'failed' else f'; once `list` shows it running in {root} under {account}, '
+            f'`relay {address} --entry {uid}` sends it'))
     return {'failed': 1, 'unchecked': 3}.get(verification, 0)
+
+
+def first_task(msg, address, uid, session, why):
+    """0 when relay() recorded the start's message to address, why None, as its receipt says; else 1, naming why:
+    `--entry` is offered only when an item still open to that session refused it, never when it may be another."""
+    if not why:
+        return 0
+    if why == OPEN:
+        print(f'{msg}: first task not relayed, a request or relay to {address} is still open; once it is collected or '
+              f'cancelled and `list` still shows {session["session"]} there, `relay {address} --entry {uid}` sends it')
+    elif why == 'undelivered':
+        print(f'{msg}: first task not relayed, it was not delivered to {address} and that relay is closed; a task for '
+              'it needs a new message of theirs')
+    else:
+        print(f'{msg}: first task not relayed, {address} may no longer be the session verified; the human checks or '
+              'closes it, and a task for it needs a new message of theirs')
+    return 1
 
 
 def metric(found):
@@ -2194,7 +2267,7 @@ def retry(action, mine):
                 line = f'{address}: {action} still held, {busy}'
             else:
                 append({'type': 'sending', 'msg': action})
-                line = type_prompt(action, target, relay_prompt(action), captain)
+                line = type_prompt(action, target, relay_prompt(action), captain)[1]
     print(line)
     return 0
 
@@ -2658,6 +2731,7 @@ def main():
     rl.add_argument('--entry', metavar='ID', help="which of this turn's messages, when the human wrote several")
     rl.add_argument('--dry-run', action='store_true', help='show what would go where, sending nothing')
     rl.add_argument('--retry', metavar='ACTION', help='send a held relay unchanged')
+    rl.add_argument('--force', action='store_true', help='cancel a request or relay still open to a target first')
     decide(rl)
     st = sub.add_parser('start', help="start a Claude Code session in a checkout, on the human's message")
     st.add_argument('checkout', help='an absolute or ~/ path to a checkout or worktree top level')
@@ -2666,6 +2740,7 @@ def main():
     st.add_argument('--space', help='the Herdr space, by id or exact name (default the one whose folder it is)')
     st.add_argument('--tab', help="a tab id in that space (default a new tab)")
     st.add_argument('--entry', metavar='ID', help="which of this turn's messages, when the human wrote several")
+    st.add_argument('--task', action='store_true', help='relay that same message to the new session as its first task')
     vd = sub.add_parser('verdict', help="record the human's verdict on a decision, sending nothing")
     vd.add_argument('--entry', metavar='ID', help="which of this turn's messages, when the human wrote several")
     decide(vd, required=True)
@@ -2699,7 +2774,7 @@ def main():
                 at = time.strftime('%H:%M', time.localtime(s['status_ms'] / 1000)) if s['status_ms'] else '?'
                 state = s['status'] + (f' ({s["blocked_on"]})' if s['blocked_on'] else '')
                 said = f'\t"{s["said"]}"' if s['said'] else ''
-                print(f'{s["handle"]}\t{s["kind"]}/{who}\t{state}, reported {at}\t{s["cwd"] or "?"}{note}{said}')
+                print(f'{s["handle"]}\t{s["kind"]}/{who}\t{state}\t{at}\t{s["cwd"] or "?"}{note}{said}')
             return 0
         if a.cmd == 'enroll':
             return enroll(a.replace)
@@ -2744,18 +2819,19 @@ def main():
         if a.cmd == 'relay':
             linked = decided(a)
             if a.retry:
-                if a.addresses or a.entry or a.dry_run or linked:
+                if a.addresses or a.entry or a.dry_run or a.force or linked:
                     die('relay --retry takes only the held action', 2)
                 return retry(a.retry, mine)
             if not a.addresses:
                 die('relay names its targets', 2)
             if a.dry_run:
                 return preview(resolve(a.addresses), a.entry, mine)
-            return relay(resolve(a.addresses), a.entry, mine, linked)
+            relay(resolve(a.addresses), a.entry, mine, linked, a.force)
+            return 0
         if a.cmd == 'verdict':
             return verdict(decided(a), a.entry, mine)
         if a.cmd == 'start':
-            return start(a.checkout, a.account, a.name, a.space, a.tab, a.entry, mine)
+            return start(a.checkout, a.account, a.name, a.space, a.tab, a.entry, mine, a.task)
     except Corrupt as e:
         die(f'ledger corrupt, nothing decided until it is reconciled by hand: {e}', 4)
     except hc.Error as e:
