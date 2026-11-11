@@ -1,0 +1,200 @@
+diff --git a/devices/0x29-CH32V4x7.yaml b/devices/0x29-CH32V4x7.yaml
+new file mode 100644
+index 0000000..423c17a
+--- /dev/null
++++ b/devices/0x29-CH32V4x7.yaml
+@@ -0,0 +1,69 @@
++---
++name: CH32V4x7 Series
++mcu_type: 0x19
++device_type: 0x29
++support_net: false
++support_usb: true
++support_serial: true
++description: CH32V407/V467 (QingKe V5F) Dual USB HS and Ethernet Series
++config_registers:
++  # CH32V407RM Rev 1.3, 32.6 User Option Bytes, Table 32-4
++  - offset: 0x00
++    name: RDPR_USER
++    description: RDPR, nRDPR, USER, nUSER
++    # USER = 0xBF keeps RAM_CODE_MOD = 0 (512KB zero-wait code + 200KB RAM)
++    reset: 0x40BF5AA5
++    fields:
++      - bit_range: [7, 0]
++        name: RDPR
++        description: Read Protection. 0xA5 for unprotected, otherwise read-protected(ignoring WRP)
++        explanation:
++          0xa5: Unprotected
++          _: Protected
++      - bit_range: [16, 16]
++        name: IWDG_SW
++        description: Independent watchdog (IWDG) hardware enable
++        explanation:
++          1: IWDG enabled by the software, and disabled by hardware
++          0: IWDG enabled by the hardware (decided along with the LSI clock)
++      - bit_range: [17, 17]
++        name: STOP_RST
++        description: System reset control under the stop mode
++        explanation:
++          1: Disable
++          0: Enable
++      - bit_range: [18, 18]
++        name: STANDBY_RST
++        description: System reset control under the standby mode, STANDY_RST
++        explanation:
++          1: Disable, entering standby-mode without RST
++          0: Enable
++      - bit_range: [22, 22]
++        name: RAM_CODE_MOD
++        description: SRAM Code Mode
++        explanation:
++          1: CODE-576KB + RAM-136KB
++          0: CODE-512KB + RAM-200KB
++  - offset: 0x04
++    name: DATA
++    description: Customizable 2 byte data, DATA0, nDATA0, DATA1, nDATA1
++    reset: 0xFF00FF00
++    type: u32
++    fields:
++      - bit_range: [7, 0]
++        name: DATA0
++      - bit_range: [23, 16]
++        name: DATA1
++  - offset: 0x08
++    name: WRP
++    # Each bit represents 4K bytes to store the write protection status
++    description: Flash memory write protection status
++    type: u32
++    reset: 0xFFFFFFFF
++    explanation:
++      0xFFFFFFFF: Unprotected
++      _: Some 4K sections are protected
++variants:
++  - name: CH32V407WEU6
++    chip_id: 0x71
++    flash_size: 992K
+diff --git a/src/device.rs b/src/device.rs
+index 5212459..e255b74 100644
+--- a/src/device.rs
++++ b/src/device.rs
+@@ -164,6 +164,7 @@ impl ChipDB {
+             serde_yaml::from_str(include_str!("../devices/0x24-CH643.yaml"))?,
+             serde_yaml::from_str(include_str!("../devices/0x25-CH32L103.yaml"))?,
+             serde_yaml::from_str(include_str!("../devices/0x26-CH32V317.yaml"))?,
++            serde_yaml::from_str(include_str!("../devices/0x29-CH32V4x7.yaml"))?,
+         ];
+         for family in &families {
+             family.validate()?;
+diff --git a/src/flashing.rs b/src/flashing.rs
+index 7ffb775..12b5b29 100644
+--- a/src/flashing.rs
++++ b/src/flashing.rs
+@@ -343,6 +343,66 @@ impl<'a> Flashing<'a> {
+         Ok(())
+     }
+ 
++    /// Replace one config word on a chip whose layout this was checked against, after confirming the
++    /// chip UID and the word's current value; the rest of the RDPR/USER/DATA/WPR block is written back as read.
++    pub fn set_config_word(&mut self, name: &str, expect_uid: &str, expect: u32, value: u32) -> Result<()> {
++        // (device_type, chip_id, register): CH582 USER_CFG, CH32X035C8T6 RDPR_USER, CH569 NV_INFO
++        const SUPPORTED: &[(u8, u8, &str)] =
++            &[(0x16, 0x82, "USER_CFG"), (0x23, 81, "RDPR_USER"), (0x10, 0x69, "NV_INFO")];
++        anyhow::ensure!(
++            SUPPORTED.contains(&(self.chip.device_type, self.chip.chip_id, name)),
++            "set-word {} is not supported on {}",
++            name,
++            self.chip.name
++        );
++        let uid = self.chip_uid().iter().map(|x| format!("{:02X}", x)).collect::<String>();
++        let want_uid = expect_uid.replace('-', "").to_uppercase();
++        anyhow::ensure!(uid == want_uid, "chip UID {} is not the expected {}", uid, want_uid);
++        let offset = self
++            .chip
++            .config_registers
++            .iter()
++            .find(|r| r.name == name)
++            .ok_or_else(|| anyhow::anyhow!("{} has no {} register", self.chip.name, name))?
++            .offset;
++
++        // CH32X03x refuses a masked read, so read everything, as dump_config does; its first 12 bytes
++        // are the block the 0x07 mask writes
++        let mut raw = self.read_config_block()?;
++        let current = raw.pread_with::<u32>(offset, LE)?;
++        anyhow::ensure!(
++            current == expect,
++            "{} is 0x{:08X}, not the expected 0x{:08X}",
++            name,
++            current,
++            expect
++        );
++
++        raw.pwrite_with(value, offset, LE)?;
++        log::info!("Writing config registers: {}", hex::encode(&raw));
++        let write_conf = Command::write_config(CFG_MASK_RDPR_USER_DATA_WPR, raw.clone());
++        let resp = self.transport.transfer(write_conf)?;
++        anyhow::ensure!(resp.is_ok(), "write_config failed");
++
++        let back = self.read_config_block()?;
++        anyhow::ensure!(
++            back == raw,
++            "readback {} differs from written {}",
++            hex::encode(&back),
++            hex::encode(&raw)
++        );
++        log::info!("{} 0x{:08X} -> 0x{:08X}", name, current, value);
++        Ok(())
++    }
++
++    fn read_config_block(&mut self) -> Result<Vec<u8>> {
++        let resp = self.transport.transfer(Command::read_config(CFG_MASK_ALL))?;
++        anyhow::ensure!(resp.is_ok(), "read_config failed");
++        let payload = resp.payload();
++        anyhow::ensure!(payload.len() >= 14, "config reply is {} bytes", payload.len());
++        Ok(payload[2..14].to_vec())
++    }
++
+     pub fn disable_debug(&mut self) -> Result<()> {
+         let read_conf = Command::read_config(CFG_MASK_RDPR_USER_DATA_WPR);
+         let resp = self.transport.transfer(read_conf)?;
+diff --git a/src/main.rs b/src/main.rs
+index 43452d2..23fdb07 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -107,6 +107,21 @@ enum ConfigCommands {
+     },
+     /// Unprotect code flash
+     Unprotect {},
++    /// Replace one config word after checking the chip UID and its current value (CH582 USER_CFG, CH32X035C8T6 RDPR_USER, CH569 NV_INFO)
++    SetWord {
++        /// Register name as `config info` prints it
++        #[arg(long)]
++        register: String,
++        /// Chip UID as `info` prints it
++        #[arg(long)]
++        expect_uid: String,
++        /// Current value, hex
++        #[arg(long)]
++        expect: String,
++        /// New value, hex
++        #[arg(long)]
++        value: String,
++    },
+ }
+ 
+ #[derive(Subcommand)]
+@@ -365,6 +380,15 @@ fn main() -> Result<()> {
+                 Some(ConfigCommands::Unprotect {}) => {
+                     flashing.unprotect(true)?;
+                 }
++                Some(ConfigCommands::SetWord {
++                    register,
++                    expect_uid,
++                    expect,
++                    value,
++                }) => {
++                    let hex = |s: &str| u32::from_str_radix(s.trim_start_matches("0x"), 16);
++                    flashing.set_config_word(register, expect_uid, hex(expect)?, hex(value)?)?;
++                }
+             }
+         }
+     }

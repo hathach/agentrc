@@ -1,0 +1,701 @@
+diff --git a/src/main.c b/src/main.c
+index 06f9e01..9cc7968 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -14,13 +14,6 @@
+ #include "arg.h"
+ char *argv0;
+ 
+-// ret 0 if file exists
+-int file_not_exists(const char *filename)
+-{
+-    struct stat buffer;
+-    return stat(filename, &buffer);
+-}
+-
+ // load file with filename to buffer and set filesize.
+ int load_firmware(char *filename, char **buffer, long *filesize) {
+   FILE    *infile;
+@@ -30,13 +23,11 @@ int load_firmware(char *filename, char **buffer, long *filesize) {
+   if(infile == NULL)
+       return 1;
+ 
+-  /* Get the number of bytes */
+-  fseek(infile, 0L, SEEK_END);
+-  *filesize = ftell(infile);
+-
+-  /* reset the file position indicator to
+-  the beginning of the file */
+-  fseek(infile, 0L, SEEK_SET);
++  if (fseek(infile, 0L, SEEK_END) != 0 || (*filesize = ftell(infile)) <= 0 ||
++      fseek(infile, 0L, SEEK_SET) != 0) {
++    fclose(infile);
++    return 1;
++  }
+ 
+   *buffer = (char*)calloc(*filesize, sizeof(char));
+ 
+@@ -44,9 +35,9 @@ int load_firmware(char *filename, char **buffer, long *filesize) {
+       return 1;
+ 
+   /* copy all the text into the buffer */
+-  fread(*buffer, sizeof(char), *filesize, infile);
++  size_t got = fread(*buffer, sizeof(char), *filesize, infile);
+   fclose(infile);
+-  return 0; 
++  return got != (size_t)*filesize;
+ }
+ 
+ // value for last param 'cmd':
+@@ -98,7 +89,7 @@ int flash_firmware(struct libusb_device_handle * iap_handle,
+     ret = pReadData(iap_handle, 2, rxbuf, &len);
+     if(ret != 0 || rxbuf[0]!= 0x00 || rxbuf[1] != 0x00) {
+       fprintf(stderr, "Reply error\n");
+-      return ret;
++      return 1;
+     }
+ 
+     offset = offset + copy_size;
+@@ -110,8 +101,9 @@ int flash_firmware(struct libusb_device_handle * iap_handle,
+ // sucess ret 0, fail ret 1
+ int open_device(const uint16_t vids[],
+     const uint16_t pids[],
++    int check_serial,
+     struct libusb_device_handle **handle) {
+-  if (jtag_libusb_open(vids, pids, handle) != 0)
++  if (jtag_libusb_open(vids, pids, check_serial, handle) != 0)
+   {
+     fprintf(stderr, "Fail to open usb device.\n");
+ 		return 1;
+@@ -127,7 +119,9 @@ int open_device(const uint16_t vids[],
+ 
+   int ret = libusb_claim_interface(*handle, 0);
+   if(ret != LIBUSB_SUCCESS) {
+-    fprintf(stderr, "Claim interface failed: %s", libusb_error_name(ret));
++    fprintf(stderr, "Claim interface failed: %s\n", libusb_error_name(ret));
++    jtag_libusb_close(*handle);
++    *handle = NULL;
+ 		return 1;
+   }
+   return 0;
+@@ -151,12 +145,7 @@ int switch_to_iap_mode(struct libusb_device_handle *wlink_handle,
+ 		return 1;
+   }
+ 
+-  usleep(1000);
+-
+-  if(device_exists(0x4348, 0x55e0))
+-    return 0;
+-
+-  return 1;
++  return 0;
+ }
+ 
+ int erase_app_flash(struct libusb_device_handle *iap_handle) {
+@@ -214,6 +203,7 @@ int quit_iap_mode(struct libusb_device_handle *iap_handle) {
+ // downgrade the firmware. 
+ int get_wchlink_info(struct libusb_device_handle *wlink_handle,
+     int endp_out, int endp_in) {
++  const char *model;
+   unsigned char txbuf[6];
+   unsigned char rxbuf[20];
+   unsigned int len = 5;
+@@ -236,32 +226,28 @@ int get_wchlink_info(struct libusb_device_handle *wlink_handle,
+   if(ret != 0)
+     return 1;
+ 
+-  printf("Found device : ");
+-
+   switch (rxbuf[5]) {
+-    case 1: 
+-      printf("WCH-Link(ch549)");
++    case 1:
++      model = "WCH-Link-CH549";
+       break;
+     case 2:
+     case 0x12:
+-      printf("WCH-LinkE(ch32v305)");
++      model = "WCH-LinkE-CH32V305";
+       break;
+     case 3:
+-      printf("WCH-LinkS(ch32v203)");
++      model = "WCH-LinkS-CH32V203";
+       break;
+     case 5:
+     case 0x85:
+-      printf("WCH-LinkB(ch32v208)");
++      model = "WCH-LinkB-CH32V208";
+       break;
+     default:
+-      printf("Unknown adapter\n");
++      fprintf(stderr, "Unknown adapter type 0x%02x\n", rxbuf[5]);
+       return 1;
+   }
+- 
+-  // display version
+-  // Version in wchlink.wcfg is "rxbuf[3]*10 + rxbuf[4]"
+-  // But in wch-openocd, it's "rxbuf[3].rxbuf[4]"
+-  printf(" with firmware v%d.%d\n", rxbuf[3], rxbuf[4]);
++
++  // WCH-LinkUtility's vNN is major*10 + minor (v2.22 = v42)
++  printf("model=%s version=%d.%d v=%d\n", model, rxbuf[3], rxbuf[4], rxbuf[3] * 10 + rxbuf[4]);
+ 
+   return 0;
+ }
+@@ -271,242 +257,181 @@ void usage()
+ {
+     printf("A tool to flash WCH-Link/E firmware.\n");
+     printf("By cjacker <cjacker@gmail.com>\n\n");
+-    printf("Usage:\n\n");
+-    printf("wlink-iap -f <firmware file>\n");
+-    printf("  Flash firmware.\n");
+-    printf("  Firmwares can be extracted from WCH-LinkUtility.\n");
+-    printf("  FIRMWARE_CH32V305.bin:  WCH-LinkE(ch32v305)\n");
+-    printf("  FIRMWARE_CH549.bin:     WCH-Link(ch549) RV\n");
+-    printf("  FIRMWARE_DAP_CH549.bin: WCH-Link(ch549) DAP\n");
+-    printf("  FIRMWARE_CH32V208.bin:  WCH-LinkB(ch32v208)\n");
+-    printf("  FIRMWARE_CH32V203.bin:  WCH-LinkS(ch32v203)\n\n");
+-    printf("wlink-iap -i\n");
++    printf("Every operation names the probe's USB port as sysfs does (-p 5-2.4);\n");
++    printf("-s <serial> also requires that serial on the RV/DAP-mode probe.\n\n");
++    printf("wlink-iap -p <port> [-s <serial>] -V\n");
++    printf("  Print model and firmware version, nothing else.\n\n");
++    printf("wlink-iap -p <port> [-s <serial>] -f <firmware file>\n");
++    printf("  Flash firmware (app-only image, e.g. FIRMWARE_CH32V305.bin).\n\n");
++    printf("wlink-iap -p <port> -r -f <firmware file>\n");
++    printf("  Flash a probe already in IAP mode (4348:55e0) at that port.\n\n");
++    printf("wlink-iap -p <port> [-s <serial>] -i\n");
+     printf("  Enter IAP mode.\n\n");
+-    printf("wlink-iap -q\n");
+-    printf("  Quit IAP mode.\n\n");
+-    exit(0);
++    printf("wlink-iap -p <port> -q\n");
++    printf("  Quit IAP mode.\n");
++    exit(2);
+ }
+ 
+-int main(int argc, char **argv)
++int do_iap_flash(char *buffer, long filesize)
+ {
+-  // no args, display usage and exit
+-  if(argc == 1) {
+-    usage();
+-    exit(0);
++  const uint16_t iap_vids[] = {0x4348, 0};
++  const uint16_t iap_pids[] = {0x55e0, 0};
++  struct libusb_device_handle *iap_handle = NULL;
++  int ret = 1;
++
++  printf("Flashing %ld bytes in IAP mode at %s.\n", filesize, g_target_port);
++  printf("######################################\n");
++  printf("DO NOT UNPLUG WCH-Link/E until done!!!\n");
++  printf("######################################\n");
++
++  if(open_device(iap_vids, iap_pids, 0, &iap_handle) != 0) {
++    fprintf(stderr, "Fail to open IAP device.\n");
++    goto end;
+   }
+-  
+-  char *firmware_file = NULL;
++  if(erase_app_flash(iap_handle) != 0) {
++    fprintf(stderr, "Fail to erase.\n");
++    goto end;
++  }
++  if(flash_firmware(iap_handle, buffer, filesize, 0x80) != 0) {
++    fprintf(stderr, "Fail to download firmware.\n");
++    goto end;
++  }
++  if(flash_firmware(iap_handle, buffer, filesize, 0x82) != 0) {
++    fprintf(stderr, "Fail to verify firmware.\n");
++    goto end;
++  }
++  if(quit_iap_mode(iap_handle) != 0) {
++    fprintf(stderr, "Fail to quit IAP mode.\n");
++    goto end;
++  }
++  printf("Done!\n");
++  ret = 0;
+ 
+-  // flag to switch to IAP only.
+-  int into_iap = 0;
+-  // flag to quit IAP only.
+-  int quit_iap = 0;
++end:
++  if(iap_handle)
++    jtag_libusb_close(iap_handle);
++  return ret;
++}
++
++// The probe re-enumerates as 4348:55e0 on the same port; ch549 is slow to get there.
++int wait_iap_at_port(int seconds)
++{
++  for (int i = 0; i < seconds * 10; i++) {
++    if (device_at_port(0x4348, 0x55e0) == 0)
++      return 0;
++    usleep(100 * 1000);
++  }
++  return 1;
++}
++
++int main(int argc, char **argv)
++{
++  char *firmware_file = NULL;
++  int into_iap = 0, quit_iap = 0, version_only = 0, recover = 0;
+ 
+   ARGBEGIN {
+   case 'f':
+-    if(into_iap == 1 || quit_iap == 1) {
+-      fprintf(stderr, "Don't use '-f' with '-i' or '-q'\n");
+-      exit(1);
+-    }
+     firmware_file = EARGF(usage());
+     break;
+   case 'i':
+-    if(firmware_file || quit_iap == 1) {
+-      fprintf(stderr, "Don't use '-i' with '-q' or '-f'\n");
+-      exit(1);
+-    }
+     into_iap = 1;
+     break;
+   case 'q':
+-    if(firmware_file || into_iap == 1) {
+-      fprintf(stderr, "Don't use '-q' with '-i' or '-f'\n");
+-      exit(1);
+-    }
+     quit_iap = 1;
+     break;
+-  case 'h':
+-    usage();
+-    exit(0);
++  case 'V':
++    version_only = 1;
++    break;
++  case 'r':
++    recover = 1;
++    break;
++  case 's':
++    g_target_serial = EARGF(usage());
++    break;
++  case 'p':
++    g_target_port = EARGF(usage());
++    break;
+   default:
+     usage();
+   }
+   ARGEND;
+ 
+-  // Check device existance
+-  if(device_exists(0x1a86, 0x8010) != 0 &&
+-		  device_exists(0x1a86, 0x8012) != 0 &&
+-		  device_exists(0x4348, 0x55e0) != 0) {
+-    fprintf(stderr, "WCH-Link/E device not found\n");
+-    exit(1);
++  // exactly one operation; -r only with -f; an IAP-mode device has no serial to check
++  if (!g_target_port || into_iap + quit_iap + version_only + (firmware_file != NULL) != 1 ||
++      (recover && !firmware_file) || ((recover || quit_iap) && g_target_serial))
++    usage();
++
++  long filesize = 0;
++  char *buffer = NULL;
++  if (firmware_file && load_firmware(firmware_file, &buffer, &filesize) != 0) {
++    fprintf(stderr, "Fail to load firmware file \"%s\".\n", firmware_file);
++    return 1;
+   }
+ 
+-  // If found 0x4348, 0x55e0, it maybe a wchlink already in IAP mode,
+-  // And maybe some other devices we don't know.
+-  // Let user try to quit IAP mode first.
+-  if(device_exists(0x4348, 0x55e0) == 0 && quit_iap != 1) {
+-    printf("Maybe WCH-Link/E already in IAP mode, but I'm not sure.\n");
+-    printf("Please try to quit IAP mode first by:\n\n");
+-    printf("wlink-iap -q\n");
+-    exit(0);
++  const uint16_t iap_vids[] = {0x4348, 0};
++  const uint16_t iap_pids[] = {0x55e0, 0};
++
++  if (recover) {
++    int ret = do_iap_flash(buffer, filesize);
++    free(buffer);
++    return ret;
+   }
+ 
+-  // only check file existance here.
+-  // check it early to better handle into_iap == 1,
+-  // avoid load firmware before switch to IAP mode.
+-  if(quit_iap == 0 && into_iap == 0 && 
+-      file_not_exists(firmware_file)) {
+-    fprintf(stderr,"Firmware \"%s\" not found!\n", firmware_file);
+-    exit(1);
++  if (quit_iap) {
++    struct libusb_device_handle *iap_handle = NULL;
++    if (open_device(iap_vids, iap_pids, 0, &iap_handle) != 0)
++      return 1;
++    int ret = quit_iap_mode(iap_handle);
++    jtag_libusb_close(iap_handle);
++    printf(ret ? "Failed\n" : "Done\n");
++    return ret;
+   }
+ 
+-  //0x1a86:0x8010 RV mode
+-  //0x1a86:0x8012 DAP mode
++  //0x1a86:0x8010 RV mode, 0x1a86:0x8012 DAP mode
+   const uint16_t wlink_vids[] = {0x1a86, 0x1a86, 0};
+   const uint16_t wlink_pids[] = {0x8010, 0x8012, 0};
+   struct libusb_device_handle *wlink_handle = NULL;
+ 
++  if (open_device(wlink_vids, wlink_pids, 1, &wlink_handle) != 0) {
++    free(buffer);
++    return 1;
++  }
+ 
+-  //4348:55e0 WinChipHead
+-  const uint16_t iap_vids[] = {0x4348, 0};
+-  const uint16_t iap_pids[] = {0x55e0, 0};
+-  struct libusb_device_handle *iap_handle = NULL;
+-
+-  // setup endp_out/in for RV mode.
+-  int endp_out = 1;
+-  int endp_in = 1;
+- 
+-  // setup endp_out/in for DAP mode.
+-  if(device_exists(0x1a86, 0x8012) == 0) {
++  struct libusb_device_descriptor desc;
++  libusb_get_device_descriptor(libusb_get_device(wlink_handle), &desc);
++  int endp_out = 1, endp_in = 1;
++  if (desc.idProduct == 0x8012) {
+     endp_out = 2;
+     endp_in = 3;
+-  } 
+-  
+-  // with '-q', quit IAP mode directly.
+-  if(quit_iap == 1) {
+-    //open IAP device.
+-    if(open_device(iap_vids, iap_pids, &iap_handle) != 0) {
+-      if(iap_handle)
+-        jtag_libusb_close(iap_handle);
+-        exit(1);
+-    }
+-
+-    //send quit command.
+-    printf("Quit IAP mode \n");
+-    if(quit_iap_mode(iap_handle) != 0) 
+-      printf("Failed\n");
+-    else
+-      printf("Done\n");
+-
+-    //clean up.
+-    if(iap_handle)
+-        jtag_libusb_close(iap_handle);
+-
+-		exit(0);
+-  } 
+-
+-
+-  int ret;
+-  // open wlink device.
+-  ret = open_device(wlink_vids, wlink_pids, &wlink_handle);
+-
+-  if(ret != 0) {
+-    fprintf(stderr, "Faile to open device.\n");
+-    if(wlink_handle)
+-      jtag_libusb_close(wlink_handle);
+-    exit(1);
+-  } 
+-  
+-
+-  // STEP 1: Read adatper type and firmware version
+-  ret = get_wchlink_info(wlink_handle, endp_out, endp_in);
+-  if(ret != 0) {
+-    fprintf(stderr, "Fail to get device info.\n");
+-    if(wlink_handle)
+-      jtag_libusb_close(wlink_handle);
+-    exit(1);
+-  }
+-  
+-  // STEP 2: switch to IAP mode: 0x01010f81 len 4
+-  printf("Switch to IAP mode.\n");
+-  ret = switch_to_iap_mode(wlink_handle, endp_out);
+-  if(ret != 0) {
+-    fprintf(stderr,"Fail to switch to IAP mode.\n");
+-    exit(1);
+-  }
+- 
+-  // if 'wlink-iap -i'
+-  if(into_iap == 1) {
+-    printf("Done!\n");
+-    exit(0);
+-  } 
+- 
+-  // The reason I put it after switch_to_iap_mode is:
+-  // If 'into_iap' only, the filename will be null.
+-  //
+-  // STEP 3: load firmware to buffer and get filesize.
+-  long filesize = 0;
+-  char *buffer = NULL; 
+-
+-  ret = load_firmware(firmware_file, &buffer, &filesize);
+-  if(ret != 0) {
+-    fprintf(stderr, "Fail to load firmware file.\n");
+-    exit(1);
+   }
+ 
+-  // READY, go
+-  printf("Start flash the firmware...\n");
+-  printf("######################################\n");
+-  printf("DO NOT UNPLUG WCH-Link/E until done!!!\n");
+-  printf("######################################\n");
+-
+-  // win32 Sleep(1) == linux usleep(1000);
+-  // win32 Sleep(0xdac);
+-  // ch549 need to wait for a long time to enter IAP mode.
+-  usleep(3500*1000);
+-
+-  // STEP 4: open IAP device
+-  ret = open_device(iap_vids, iap_pids, &iap_handle);
+-
+-  if(ret != 0) {
+-    fprintf(stderr, "Fail to open IAP device.\n");
+-    goto end;
+-  }
+-
+-  // STEP 5: erase the app flash area.
+-  ret = erase_app_flash(iap_handle);
+-  if(ret != 0) {
+-    fprintf(stderr, "Fail to erase.\n");
+-    goto end;
++  if (get_wchlink_info(wlink_handle, endp_out, endp_in) != 0) {
++    fprintf(stderr, "Fail to get device info.\n");
++    jtag_libusb_close(wlink_handle);
++    free(buffer);
++    return 1;
+   }
+-  
+-  // STEP 6: first loop, download the firmware.
+-  ret = flash_firmware(iap_handle, buffer, filesize, 0x80);
+-  if(ret != 0) {
+-		fprintf(stderr,"Fail to download firmware.\n");
+-    goto end;
++  if (version_only) {
++    jtag_libusb_close(wlink_handle);
++    return 0;
+   }
+ 
+-  // STEP 7: second loop, verify the firmware
+-  ret = flash_firmware(iap_handle, buffer, filesize, 0x82);
+-  if(ret != 0) {
+-		fprintf(stderr,"Fail to verify firmware.\n");
+-    goto end;
++  printf("Switch to IAP mode.\n");
++  int ret = switch_to_iap_mode(wlink_handle, endp_out);
++  jtag_libusb_close(wlink_handle);
++  if (ret != 0 || wait_iap_at_port(10) != 0) {
++    fprintf(stderr, "Fail to switch to IAP mode at %s.\n", g_target_port);
++    free(buffer);
++    return 1;
+   }
+-  
+-  // STEP 8: After program, quit IAP mode 
+-  ret = quit_iap_mode(iap_handle);
+-  if(ret != 0) {
+-		fprintf(stderr,"Fail to quit IAP mode.\n");
+-    goto end;
++  if (into_iap) {
++    printf("Done!\n");
++    return 0;
+   }
+-  
+-  printf("Done!\n");
+ 
+-end: 
+-  if(buffer)
+-    free(buffer);
+-  if(iap_handle) 
+-    jtag_libusb_close(iap_handle);
++  // ch549 needs time after enumerating before it accepts IAP commands
++  usleep(3500 * 1000);
++  ret = do_iap_flash(buffer, filesize);
++  free(buffer);
++  return ret;
+ }
+-
+-
+diff --git a/src/usb.c b/src/usb.c
+index 1853f8b..51b549c 100644
+--- a/src/usb.c
++++ b/src/usb.c
+@@ -5,6 +5,7 @@
+ 
+ #include <sys/types.h>
+ #include <string.h>
++#include <strings.h>
+ #include <libusb.h>
+ #include "usb.h"
+ 
+@@ -48,6 +49,10 @@ int pWriteData(libusb_device_handle *handle, int endpoint, unsigned char *buf, u
+   int ret, pr;
+   length = (unsigned int *)length;
+   ret = jtag_libusb_bulk_write(handle, endpoint, buf, *length, 3000, &pr);
++  if (ret == 0 && pr != (int)*length) {
++    fprintf(stderr, "short transfer: %d of %u bytes\n", pr, *length);
++    return 1;
++  }
+   return ret;
+ }
+ 
+@@ -56,6 +61,10 @@ int pReadData(libusb_device_handle *handle, int endpoint, unsigned char *buf, un
+   int ret, pr;
+   length = (unsigned int *)length;
+   ret = jtag_libusb_bulk_read(handle, endpoint|0x80, buf, *length, 3000, &pr);
++  if (ret == 0 && pr != (int)*length) {
++    fprintf(stderr, "short transfer: %d of %u bytes\n", pr, *length);
++    return 1;
++  }
+   return ret;
+ }
+ 
+@@ -75,39 +84,35 @@ static bool jtag_libusb_match_ids(struct libusb_device_descriptor *dev_desc,
+ }
+ 
+ 
+-int device_exists(uint16_t vid, uint16_t pid)
++/* Selection for every open: the USB port path ("BUS-P.P.P", as sysfs names it) is
++   required; the serial, when set, must match a device that has one. */
++const char *g_target_port = NULL;
++const char *g_target_serial = NULL;
++
++static int port_path(struct libusb_device *dev, char *buf, size_t size)
+ {
+-  struct libusb_context *context; /**< Libusb context **/
+-  struct libusb_device **devs; /**< The usb device list **/
+-  if (libusb_init(&context) < 0)
++  uint8_t ports[8];
++  int n = libusb_get_port_numbers(dev, ports, sizeof(ports));
++  if (n <= 0)
+     return 1;
+-  int count = libusb_get_device_list(context, &devs);
+-
+-  struct libusb_device_descriptor desc;
+-
+-  for (int i = 0; i < count; i++) {
+-    if (libusb_get_device_descriptor(devs[i], &desc) != 0)
+-      continue;
+-    if(desc.idVendor == vid && desc.idProduct == pid) {
+-      //found
+-      return 0;
+-    } 
+-  }
+-  if (count >= 0)
+-    libusb_free_device_list(devs, 1);
+-
+-  if (context)
+-    libusb_exit(context);
+-  return 1;
++  int len = snprintf(buf, size, "%d-%d", libusb_get_bus_number(dev), ports[0]);
++  for (int i = 1; i < n && len < (int)size; i++)
++    len += snprintf(buf + len, size - len, ".%d", ports[i]);
++  return len >= (int)size;
+ }
+ 
+-int jtag_libusb_open(const uint16_t vids[], const uint16_t pids[],
++int jtag_libusb_open(const uint16_t vids[], const uint16_t pids[], int check_serial,
+ 		     struct libusb_device_handle **out)
+ {
+   int cnt, idx, err_code;
+   int retval = 1;
+   struct libusb_device_handle *libusb_handle = NULL;
++  char path[64];
+ 
++  if (!g_target_port) {
++    fprintf(stderr, "No USB port selected (-p)\n");
++    return 1;
++  }
+   if (libusb_init(&jtag_libusb_context) < 0)
+     return 1;
+   cnt = libusb_get_device_list(jtag_libusb_context, &devs);
+@@ -122,15 +127,29 @@ int jtag_libusb_open(const uint16_t vids[], const uint16_t pids[],
+     if (!jtag_libusb_match_ids(&dev_desc, vids, pids))
+       continue;
+ 
++    if (port_path(devs[idx], path, sizeof(path)) != 0 || strcmp(path, g_target_port) != 0)
++      continue;
++
+     err_code = libusb_open(devs[idx], &libusb_handle);
+ 
+     if (err_code) {
+-      fprintf(stderr,"libusb_open() failed with %s",
++      fprintf(stderr, "libusb_open() failed with %s\n",
+ 	      libusb_error_name(err_code));
+-      continue;
++      break;
++    }
++
++    if (check_serial && g_target_serial) {
++      unsigned char sn[128];
++      int r = dev_desc.iSerialNumber ? libusb_get_string_descriptor_ascii(libusb_handle,
++              dev_desc.iSerialNumber, sn, sizeof(sn)) : -1;
++      if (r < 0 || strcasecmp((char *)sn, g_target_serial) != 0) {
++        fprintf(stderr, "Device at %s has serial %s, not %s\n", g_target_port,
++                r < 0 ? "(none)" : (char *)sn, g_target_serial);
++        libusb_close(libusb_handle);
++        break;
++      }
+     }
+-   
+-    /* Success. */
++
+     *out = libusb_handle;
+     retval = 0;
+     break;
+@@ -145,6 +164,31 @@ int jtag_libusb_open(const uint16_t vids[], const uint16_t pids[],
+   return retval;
+ }
+ 
++/* 0 once a device with vid:pid sits at the selected port. */
++int device_at_port(uint16_t vid, uint16_t pid)
++{
++  struct libusb_context *context;
++  struct libusb_device **list;
++  struct libusb_device_descriptor desc;
++  char path[64];
++  int found = 1;
++
++  if (!g_target_port || libusb_init(&context) < 0)
++    return 1;
++  int count = libusb_get_device_list(context, &list);
++  for (int i = 0; i < count && found; i++) {
++    if (libusb_get_device_descriptor(list[i], &desc) != 0)
++      continue;
++    if (desc.idVendor == vid && desc.idProduct == pid &&
++        port_path(list[i], path, sizeof(path)) == 0 && strcmp(path, g_target_port) == 0)
++      found = 0;
++  }
++  if (count >= 0)
++    libusb_free_device_list(list, 1);
++  libusb_exit(context);
++  return found;
++}
++
+ 
+ int jtag_libusb_set_configuration(struct libusb_device_handle *devh,
+ 				  int configuration)                                          {
+diff --git a/src/usb.h b/src/usb.h
+index d760c8a..31386b0 100644
+--- a/src/usb.h
++++ b/src/usb.h
+@@ -1,9 +1,13 @@
+ #ifndef USB_H
+ #define USB_H
+-int device_exists(uint16_t vid, uint16_t pid);
++extern const char *g_target_port;
++extern const char *g_target_serial;
+ 
+-int jtag_libusb_open(const uint16_t vids[], 
+-    const uint16_t pids[], 
++int device_at_port(uint16_t vid, uint16_t pid);
++
++int jtag_libusb_open(const uint16_t vids[],
++    const uint16_t pids[],
++    int check_serial,
+     struct libusb_device_handle **out);
+ 
+ int jtag_libusb_set_configuration(struct libusb_device_handle *devh,

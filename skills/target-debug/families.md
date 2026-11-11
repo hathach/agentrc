@@ -107,3 +107,16 @@ family.
   `hathach/openocd` tinyusb branch).
 - That OpenOCD's init halts the hart, so a tool reading the state after `init` sees `halted` on a running ch32v30x:
   `sysview_dump.py`'s `core.before` reads `halted` there (2026-10-22 ch32v307v_r1_1v0).
+- After SDI contact the debug module can stay active until power-on: on a CH569 (2026-07-15, OpenOCD
+  `program ... reset exit`) `dmcontrol.dmactive=1` and `dcsr.ebreakm=1` survived resets, so every `ebreak` (a
+  release build's assert) halted the core with nobody attached, and register x9 was corrupted under USB-HS
+  traffic. Other parts and wlink-rs are unverified. Power-cycle before trusting a device, or quiesce it as
+  tinyusb's HIL flasher does: `openocd ... -c init -c halt -c "reg dcsr 0x40000003" -c resume
+  -c "riscv dmi_write 0x10 0" -c exit`.
+- An OpenOCD attach to a running ch32v407_evt_r0 (hathach/openocd `4c9931a`, its `wlink_init` sending
+  `81 0d 01 02`, WCH-LinkE firmware 2.22) cleared HSEON and USBHS_PLLON: the enumerated device dropped off USB
+  about 3 s later until a reset (2026-11-11). Other tools and probe firmware: unverified.
+- CH32H417's SWD pins are PB8/PB9, the USB-HS D+/D- pair (MuseLab nanoCH32H417 and WCH's own eval board), so
+  USB-HS firmware takes them away and a host bus reset looks like an SDI reset; `DBGMCU_Config()` called without
+  a debugger attached hung the core and the probe session (2026-07-13..16). Getting the pins back is
+  `debug-probe`'s power-off erase (`chips/wch.md`).
