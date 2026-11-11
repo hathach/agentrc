@@ -97,7 +97,8 @@ class VerdictTest(unittest.TestCase):
                     f'{RUN} relay --retry a-0a1b',
                     f'{RUN} watch all', f'{RUN} watch t2 space:code', f'{RUN} watches',
                     f'{RUN} collect --wait 1740000', f'{RUN} reports --json j-0a1b:12 m-0a1b',
-                    f'{RUN} reports --json --new', f'{RUN} cancel w-0a1b',
+                    f'{RUN} reports --json --new', f'{RUN} cancel w-0a1b', f'{RUN} prune --json',
+                    f'{RUN} prune d-0123456789abcdef:2 n-0123456789abcdef:1 --apply',
                     f'python3 {home_script} list']:
             with self.subTest(cmd):
                 self.assertIsNone(self.verdict('Bash', command=cmd))
@@ -141,7 +142,8 @@ class VerdictTest(unittest.TestCase):
     def test_the_skill_s_documented_commands_pass(self):
         """The captain runs what SKILL.md shows; a recipe the guard denies would strand it."""
         text = (Path(__file__).resolve().parents[1] / 'skills' / 'captain' / 'SKILL.md').read_text(encoding='utf-8')
-        sample = {'<msg>...': 'm-1', '<msg>': 'm-1', '<ms>': '1740000', 'MS': '1740000',
+        sample = {'<id>:<rev>...': 'd-0123456789abcdef:2', '<msg>...': 'm-1', '<msg>': 'm-1', '<ms>': '1740000',
+                  'MS': '1740000',
                   '<id>': 'f0a4846d-6b04-428a-8e4d-a4fc931e6cff', '<action>': 'a-1',
                   '<target>...': 't2', '<run>': 'pr-12', '<item>': 'd-0123456789abcdef', '<N>': '2',
                   'correction|no-correction|decision': 'correction', '<target>': 't2',

@@ -26,6 +26,8 @@ python3 ~/.claude/skills/captain/scripts/captain.py reports [--json] [<msg>...] 
 python3 ~/.claude/skills/captain/scripts/captain.py reports --json --new            # watch reports since the last --new
 python3 ~/.claude/skills/captain/scripts/captain.py cancel <msg>                    # close a request, relay, watch or decision
 python3 ~/.claude/skills/captain/scripts/captain.py queue [--json] [--all] [--refresh]  # the decisions waiting on the human
+python3 ~/.claude/skills/captain/scripts/captain.py prune [<id>:<rev>...] [--json]  # obsolete decisions, recording nothing
+python3 ~/.claude/skills/captain/scripts/captain.py prune <id>:<rev>... --apply     # cancel exactly those decisions
 python3 ~/.claude/skills/captain/scripts/captain.py ingest --chief <run>            # a headless chief run's attention lines
 python3 ~/.claude/skills/captain/scripts/captain.py relay <target>... [--entry <id>] [--force]  # relay this turn's message
 python3 ~/.claude/skills/captain/scripts/captain.py relay <target>... --dry-run     # what it would send, sending nothing
@@ -198,7 +200,17 @@ pins each target's session once, so one replaced in its terminal while the relay
   `reviewed_sha`. Plain `queue` looks nothing up; `queue --refresh` observes first through `captain_read.py`. `--all`
   adds closed ones, `--json` is the full record. A decision closes when its session resolves that revision, on a
   verdict, or on `cancel <id>` on the human's word; a keyed decision never closes because a session stopped
-  mentioning it.
+  mentioning it. The watch brief tells each session its own open decisions with their revisions, and to resolve one
+  the human answered in its terminal.
+- **Pruning** closes decisions the human settled elsewhere. Plain `prune` lists the open ones the evidence shows
+  obsolete: `pr-done` when the PR it names is merged or closed, `owner-gone` when its session runs in no local
+  terminal (one resumed elsewhere, or now the captain, keeps its items). A failed lookup, a non-local owner or an
+  unpinned session that could be the owner is no reason, and a chief run's item has only its PR's; staleness, age or
+  a `done` report never make one obsolete. `prune <id>:<rev>...` previews the named ones, any open decision. Show
+  the human the preview; on their word, `prune <id>:<rev>... --apply` cancels exactly those at those revisions, all
+  or none: one revised, closed or missing since refuses the batch with nothing written, and one already cancelled at
+  its revision is a retry's no-op. A pruned decision is cancelled, history kept: reported again it stays closed until
+  its session reopens it.
 - **Verdicts** are the human's, on a decision at the revision `queue` showed them. Relay their words with
   `relay <target> --item <item> --revision <N> --verdict ...` to the one session that owns it; for a chief's decision,
   or one the human settles with you alone, `verdict` records the words with the same options, sending nothing.

@@ -27,7 +27,7 @@ When the human wants to hear each time a session finishes - "watch", "watch all"
 
 ## Decisions
 
-When the human asks what waits on them, run `queue`, and `queue --refresh` before they decide a review: report each decision with its id, revision, freshness, ask and recommendation, blocked first, and say what `coverage` leaves out. A chief run's attention lines reach the queue only through `ingest --chief` on the human's word. When the human's message decides one decision you showed, relay it as a verdict to its owner as the skill says, or record it with `verdict` for a chief's or one they settle with you; the kind of verdict is what their words say, and a refusal goes back to them unchanged.
+When the human asks what waits on them, run `queue`, and `queue --refresh` before they decide a review: report each decision with its id, revision, freshness, ask and recommendation, blocked first, and say what `coverage` leaves out. A chief run's attention lines reach the queue only through `ingest --chief` on the human's word. When the human asks to clear what they settled elsewhere, show `prune`'s preview, or the one for the ids they name, and run `prune <id>:<rev>... --apply` only on their word for those items. When the human's message decides one decision you showed, relay it as a verdict to its owner as the skill says, or record it with `verdict` for a chief's or one they settle with you; the kind of verdict is what their words say, and a refusal goes back to them unchanged.
 
 ## Check
 

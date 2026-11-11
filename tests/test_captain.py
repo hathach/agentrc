@@ -3202,6 +3202,162 @@ class QueueTest(VerdictCase):
 
 
 
+class PruneTest(VerdictCase):
+    """`prune` previews the open decisions the evidence shows obsolete and cancels exactly the named ones."""
+
+    def setUp(self):
+        super().setUp()
+        self.pr_states = {'o/r#12': 'OPEN'}
+        for attr, value in (('lookup', self.look), ('everywhere', lambda: [dict(t) for t in self.terminals.values()])):
+            patcher = mock.patch.object(captain, attr, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def look(self, *args):
+        if args[:3] == ('gh', 'pr', 'view') and args[-1] == 'number,state':
+            state = self.pr_states.get(f'{args[5]}#{args[3]}')
+            return json.dumps({'number': int(args[3]), 'state': state}) if state else None
+        return json.dumps({'headRefOid': self.head}) if args[0] == 'gh' else None
+
+    def preview(self, *selection):
+        with mock.patch('builtins.print') as out:
+            captain.prune(captain.selected(list(selection)), False, True, self.ident)
+        return json.loads(out.call_args_list[0].args[0])
+
+    def apply(self, *selection):
+        with mock.patch('builtins.print') as out:
+            captain.prune(captain.selected(list(selection)), True, False, self.ident)
+        return [c.args[0] for c in out.call_args_list]
+
+    def test_a_merged_or_closed_pr_and_a_gone_session_are_candidates_and_preview_records_nothing(self):
+        self.terminals['t3'] = pinned('t3')
+        self.report(decision('merge'), decision('ci', kind='blocked', pr='o/r#13'))
+        self.report(decision('fix', kind='blocked', pr=None), address='t3')
+        self.report(decision('lint', kind='blocked', pr=None))
+        self.pr_states.update({'o/r#12': 'MERGED', 'o/r#13': 'CLOSED'})
+        del self.terminals['t3']
+        before = captain.records()
+        out = self.preview()
+        self.assertEqual(captain.records(), before)
+        self.assertEqual({i['ask']: i['reasons'] for i in out['items']},
+                         {'merge?': ['pr-done'], 'ci?': ['pr-done'], 'fix?': ['owner-gone']})
+        self.assertEqual(out['apply'], [f'{i["id"]}:1' for i in out['items']])
+
+    def test_what_cannot_be_told_is_no_candidate(self):
+        self.report(decision('merge'))
+        self.pr_states = {}   # the PR lookup fails
+        del self.terminals['t2']
+        for why, terminals in (('unpinned', {'t5': {**pinned('t5'), 'session': None}}),
+                               ('unpinned account', {'t5': {**pinned('t5'), 'session': 's-t2', 'account': None}})):
+            with self.subTest(why):
+                self.terminals.update(terminals)
+                self.assertEqual(self.preview()['items'], [])
+                for address in terminals:
+                    del self.terminals[address]
+        with mock.patch.object(captain, 'everywhere', side_effect=captain.hc.Error('hc down')):
+            self.assertEqual(self.preview()['items'], [])
+        with mock.patch.object(captain.hc, 'is_local', return_value=False):
+            self.assertEqual(self.preview()['items'], [])
+        self.assertEqual(self.preview()['items'][0]['reasons'], ['owner-gone'], 'told apart at last')
+
+    def test_a_session_resumed_elsewhere_or_now_the_captain_keeps_its_items(self):
+        self.report(decision('merge', pr=None))
+        del self.terminals['t2']
+        for address in ('t3', 't1'):
+            with self.subTest(address):
+                self.terminals[address] = {**pinned(address), 'session': 's-t2'}
+                self.assertEqual(self.preview()['items'], [])
+        self.terminals['t1'] = CAPTAIN
+
+    def test_apply_cancels_exactly_the_named_revisions(self):
+        self.report(decision('merge'), decision('ci', kind='blocked'))
+        merge = self.item()['id']
+        self.assertEqual(self.apply(f'{merge}:1'), [f'cancelled {merge}'])
+        self.assertEqual((self.item()['state'], self.item()['closure']['why']), ('closed', 'cancelled'))
+        self.assertEqual(self.item('ci')['state'], 'open')
+        self.assertEqual([r['revision'] for r in captain.records() if r['type'] == 'cancel'], [1])
+
+    def test_a_selection_revised_closed_or_unknown_refuses_the_whole_batch(self):
+        self.report(decision('merge'), decision('ci', kind='blocked'), decision('fix', kind='blocked'))
+        self.report(decision('merge', ask='merge now?'))
+        self.report(resolved=[{'key': 'fix', 'revision': 1}])
+        ci, merge, fix = (self.item(k)['id'] for k in ('ci', 'merge', 'fix'))
+        for selection, why in (([f'{ci}:1', f'{merge}:1'], f'{merge}:1 is open at revision 2'),
+                               ([f'{ci}:1', f'{fix}:1'], f'{fix}:1 is closed (resolved) at revision 1'),
+                               ([f'{ci}:1', 'd-0000000000000000:1'], 'is no decision')):
+            with self.subTest(why):
+                self.assertIn(why, self.refused(captain.prune, captain.selected(selection), True, False, self.ident))
+        self.assertEqual(self.item('ci')['state'], 'open')
+
+    def test_a_named_preview_shows_each_as_it_is_and_offers_only_the_open(self):
+        self.report(decision('merge'), decision('ci', kind='blocked'))
+        merge, ci = self.item()['id'], self.item('ci')['id']
+        self.apply(f'{ci}:1')
+        out = self.preview(f'{merge}:1', f'{ci}:1')
+        self.assertEqual([(i['id'], i['state'], i['reasons']) for i in out['items']],
+                         [(merge, 'open', []), (ci, 'closed', [])])
+        self.assertEqual(out['apply'], [f'{merge}:1'])
+
+    def test_a_retried_batch_cancels_only_what_is_left(self):
+        self.report(decision('merge'), decision('ci', kind='blocked'))
+        merge, ci = self.item()['id'], self.item('ci')['id']
+        self.apply(f'{merge}:1')
+        self.assertEqual(self.apply(f'{merge}:1', f'{ci}:1'), [f'cancelled {ci}', f'{merge}: cancelled already'])
+        self.assertEqual(self.count('cancel'), 2)
+
+    def test_malformed_selections_refuse(self):
+        self.report(decision('merge'))
+        iid = self.item()['id']
+        for args, why in (([], 'names each decision'), ([(iid, 1), (iid, 1)], 'each decision once')):
+            with self.subTest(why):
+                self.assertIn(why, self.refused(captain.prune, args, True, False, self.ident))
+        for token in (iid, f'{iid}:0', f'{iid}:r1', 'merge:1'):
+            with self.subTest(token), self.assertRaises(SystemExit), mock.patch('sys.stderr'):
+                captain.selected([token])
+
+    def test_only_the_enrolled_captain_prunes(self):
+        self.report(decision('merge'))
+        self.replace_captain()
+        self.assertIn('not the enrolled captain',
+                      self.refused(captain.prune, [(self.item()['id'], 1)], True, False, self.ident))
+
+    def test_a_pruned_decision_stays_closed_when_reported_again(self):
+        self.report(decision('merge'))
+        member = next(r['msg'] for r in captain.records() if r['type'] == 'joined')
+        self.report_as('t2', member, {**GOOD, 'needs': 'approve?'})
+        need = next(i for i in self.items().values() if i['legacy'])
+        self.apply(f'{self.item()["id"]}:1', f'{need["id"]}:1')
+        self.report(decision('merge', ask='merge now?'))
+        self.report_as('t2', member, {**GOOD, 'needs': 'approve?'})
+        self.assertEqual([i['state'] for i in self.items().values()], ['closed', 'closed'])
+        self.report(decision('merge', ask='merge now?'), reopen=['merge'])
+        self.assertEqual(self.item()['state'], 'open')
+
+    def test_a_cancel_bound_to_a_replaced_revision_closes_nothing(self):
+        self.report(decision('merge'))
+        self.report(decision('merge', ask='merge now?'))
+        with captain.locked():
+            captain.append({'type': 'cancel', 'msg': self.item()['id'], 'revision': 1})
+        self.assertEqual((self.item()['state'], self.item()['revision']), ('open', 2))
+
+    def test_a_cancel_s_revision_is_a_positive_integer(self):
+        for revision, ok in ((1, True), (0, False), (True, False), ('1', False)):
+            with self.subTest(revision):
+                self.assertEqual(captain.well_formed({'type': 'cancel', 'msg': 'd-1', 'revision': revision}), ok)
+
+    def test_the_brief_lists_the_session_s_own_open_decisions_with_their_revisions(self):
+        self.terminals['t3'] = pinned('t3')
+        self.report(decision('merge'), decision('ci', kind='blocked'))
+        self.report(decision('merge', ask='merge now?'), resolved=[{'key': 'ci', 'revision': 1}])
+        self.report(decision('fix', kind='blocked'), address='t3')
+        out = self.as_target(captain.pending)[1]
+        self.assertIn('Your open decisions, each with the revision to resolve: merge 2.', out)
+        hooked = self.as_target(captain.hook, {'hook_event_name': 'SessionStart', 'session_id': 's-t3'},
+                                address='t3')[0]
+        self.assertIn('Your open decisions, each with the revision to resolve: fix 1.', hooked)
+        self.assertIn('ends a task even when no further work follows', out)
+
+
 class StartTest(RelayCase):
     """`start` against a real git checkout, with hc, herdr-app, PATH and pinning replaced."""
 
