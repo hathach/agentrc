@@ -9,7 +9,9 @@ import json
 import os
 import sys
 import tempfile
+import time
 import tomllib
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -111,7 +113,9 @@ class ProbeTest(unittest.TestCase):
         for patch in (mock.patch.object(probe.usb_observe, 'SYS_USB_DEVICES', str(self.sysfs)),
                       mock.patch.object(probe, 'DEV_USB', str(self.dev_usb)),
                       mock.patch.object(probe, 'TOOLS', self.tmp / 'tools.toml'),
-                      mock.patch.object(probe.time, 'sleep', lambda s: None),
+                      # a private clock: patching the shared time module also stubs subprocess's exit-wait sleep
+                      mock.patch.object(probe, 'time', types.SimpleNamespace(monotonic=time.monotonic,
+                                                                             sleep=lambda s: None)),
                       mock.patch.dict(os.environ, {'PATH': str(self.bin)})):
             patch.start()
             self.addCleanup(patch.stop)
