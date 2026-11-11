@@ -538,9 +538,10 @@ _bounded_start = threading.Lock()
 
 def _bounded(fn, bound: float, last: list | None = None, *, reraise: bool = False):
     # a /proc read can block (stat takes exec_update_lock, cmdline the mm's lock): fn() or None past `bound` s;
-    # `last` keeps the thread: while it is still alive no other starts and None is returned at once. fn's
-    # exception is raised here with `reraise`, else it ends the thread (threading.excepthook) as None
-    out = []
+    # `last` keeps the thread: until its fn has returned no other starts and None is returned at once. fn's
+    # exception is raised here with `reraise`, else it ends the thread (threading.excepthook) as None.
+    # The thread's own `finished` event, not is_alive(): CPython 3.12's Thread.join, interrupted, marks it stopped
+    out, finished = [], threading.Event()
 
     def run():
         try:
@@ -549,14 +550,17 @@ def _bounded(fn, bound: float, last: list | None = None, *, reraise: bool = Fals
             out.append((False, e))
             if not reraise:
                 raise
+        finally:
+            finished.set()
     t = threading.Thread(target=run, daemon=True)
+    t.finished = finished
     with _bounded_start:
         if last is not None:
-            if any(x.is_alive() for x in last):
+            if any(not x.finished.is_set() for x in last):
                 return None
             last[:] = [t]
         t.start()
-    t.join(bound)
+    finished.wait(bound)
     if not out:
         return None
     ok, value = out[0]

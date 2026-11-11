@@ -2214,6 +2214,26 @@ class BoardTasks(LockDir):
         busy.assert_called_once_with()
         self.assertEqual(failed_events(hil_lock, BOARD), [])
 
+    def test_a_wait_shorter_than_the_poll_still_takes_once_more_at_its_end(self):
+        self.patch(hil_lock, 'TASK_POLL', 5.0)
+        p = self.holder(self.record(reason='hil_test.py'))
+        real, calls = hil_lock.take_board_lock, []
+
+        def take(*a, **k):
+            calls.append(1)
+            try:
+                return real(*a, **k)
+            except hil_lock.BoardLocked:
+                p.stdin.close()
+                p.wait()
+                raise
+        self.patch(hil_lock, 'take_board_lock', take)
+        start = time.monotonic()
+        with self.task(wait=0.1) as task:
+            task.clean()
+        self.assertEqual(len(calls), 2)
+        self.assertLess(time.monotonic() - start, 2)
+
     def test_recovery_infrastructure_and_busy_refusals_are_never_retried(self):
         take = mock.Mock(wraps=hil_lock.take_board_lock)
         self.patch(hil_lock, 'take_board_lock', take)
@@ -2397,6 +2417,20 @@ class BoardTasks(LockDir):
         self.assertEqual(outcome(refused), (True, False, None, True))
         self.assertEqual(refused.describe(), f'{BOARD}: lock not taken')
         self.assertIsNone(p.poll())
+
+    def test_a_failure_logged_without_its_evidence_never_ends_cleanly(self):
+        def lost():
+            yield {'token': 'r'}
+            raise OSError(5, 'Input/output error')
+        for n, key in enumerate(('receipts', 'retained'), 1):
+            with self.subTest(key):
+                with self.task() as task:
+                    task.failed(detail='d', **{key: lost()})
+                self.assertEqual((task.ended, task.failure_logged, task.ended_cleanly), (True, True, False))
+                self.assert_released(task, events=n)
+                f = latest_failure(hil_lock, BOARD)
+                self.assertEqual((f['detail'], f[key]), ('d', []))
+                self.assertEqual([e.split(':')[1].strip() for e in task.errors], [key])
 
     def test_the_bypass_is_opt_in_and_never_touches_another_holders_record(self):
         os.environ['HIL_NO_BOARD_LOCK'] = '1'

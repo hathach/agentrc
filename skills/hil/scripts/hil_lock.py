@@ -650,8 +650,9 @@ def end_failed(handles, reason, *, detail, receipts=(), retained=(), **extra) ->
 
 
 def _end_failed_each(handles, reason, detail, receipts, retained, extra, ended) -> dict:
-    """end_failed, setting ended[board] to {'logged', 'cleared'}: whether its failed event was
-    appended and its record cleared."""
+    """end_failed, setting ended[board] to {'logged', 'cleared', 'evidence'}: whether its failed event
+    was appended, its record cleared and `receipts` and `retained` collected (an event is logged
+    without the one that failed)."""
     errors, interrupted = {}, []
 
     def guard(boards, what, step, default=None):
@@ -662,10 +663,12 @@ def _end_failed_each(handles, reason, detail, receipts, retained, extra, ended) 
         return _guarded(step, what, note, interrupted, default)
     # a signal between the guarded steps waits until every board is released (None: the guards alone)
     hold = guard((), 'interrupt hold', lambda: _process().InterruptHold())
-    receipts = guard(handles, 'cleanup log not written: receipts', lambda: list(receipts), [])
-    retained = guard(handles, 'cleanup log not written: retained', lambda: list(retained), [])
+    receipts = guard(handles, 'cleanup log not written: receipts', lambda: list(receipts))
+    retained = guard(handles, 'cleanup log not written: retained', lambda: list(retained))
+    evidence = receipts is not None and retained is not None
+    receipts, retained = receipts or [], retained or []
     for b, fh in handles.items():
-        ended[b] = {'logged': False, 'cleared': False}
+        ended[b] = {'logged': False, 'cleared': False, 'evidence': evidence}
         ended[b]['logged'] = guard([b], 'cleanup log not written', lambda: _log_ended(
             b, fh, reason, detail, receipts, retained, extra)) is not None
         cleared = guard([b], 'record not cleared', lambda: clear_record(fh))
@@ -824,7 +827,8 @@ class BoardTask:
       appended (end_failed, or log_cleanup_failure under the bypass).
     * `ended_cleanly`: `ended`, with the lock ended as its verdict said: an owned handle closed,
       its record cleared (clear_record, or end_failed's clear for a failed verdict) and, for a
-      failed verdict, its failure logged (under the bypass too). `not ended_cleanly` alone is the
+      failed verdict, its failure logged with its receipts and retained sessions (under the bypass
+      too: there one that cannot be collected leaves it unlogged). `not ended_cleanly` alone is the
       lock's own failure for the caller's exit status; the verdict's failure stays the caller's.
       A clean or restored verdict whose record was not cleared ends through end_failed and never
       cleanly; a refusal before the take ends cleanly. Advisory notes do not change it: an
@@ -902,9 +906,7 @@ class BoardTask:
                 pause = deadline - time.monotonic()
                 if pause <= 0:
                     raise
-                time.sleep(min(TASK_POLL, pause))
-                if time.monotonic() > deadline:
-                    raise
+                time.sleep(min(TASK_POLL, pause))     # then one more take, even past the deadline
 
     def _interrupt_hold(self):
         try:
@@ -1046,14 +1048,14 @@ class BoardTask:
             self._as_verdict = cleared is True
 
     def _end_failed(self, guard, detail, receipts, retained) -> bool:
-        """end_failed on the task's handle; whether it logged the failure and cleared the record."""
+        """end_failed on the task's handle; whether it logged the failure with its evidence and cleared the record."""
         ended = {}
         errors = guard('end_failed', lambda: _end_failed_each({self.board: self._fh}, self.reason, detail, receipts,
                                                               retained, {}, ended), {})
         self.errors.extend(errors.get(self.board, []))
         outcome = ended.get(self.board, {})
         self.failure_logged = outcome.get('logged', False)
-        return self.failure_logged and outcome.get('cleared', False)
+        return self.failure_logged and outcome.get('cleared', False) and outcome.get('evidence', False)
 
 
 board_task = BoardTask

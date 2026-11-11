@@ -1095,6 +1095,27 @@ THREAD_LEADER = ('import ctypes, os, sys, threading, time\n'
                  'ctypes.CDLL(None).pthread_exit(None)\n')
 
 
+class Bounded(unittest.TestCase):
+    def test_a_worker_still_running_gates_the_next_call_whatever_is_alive_says(self):
+        """CPython 3.12's Thread.join, interrupted while waiting, marks a still-running thread stopped."""
+        release, calls, last = threading.Event(), [], []
+        self.addCleanup(release.set)
+
+        def blocked():
+            calls.append(1)
+            release.wait(T)
+            return 'walked'
+        self.assertIsNone(hp._bounded(blocked, 0.01, last))
+        with mock.patch.object(threading.Thread, 'is_alive', return_value=False):
+            self.assertIsNone(hp._bounded(blocked, 0.01, last))
+        self.assertEqual(len(calls), 1)
+        first = last[0]
+        release.set()
+        first.join(T)
+        self.assertEqual(hp._bounded(blocked, T, last), 'walked')
+        self.assertIsNot(last[0], first)
+
+
 @unittest.skipUnless(os.path.isdir('/proc'), 'reads processes from /proc')
 class RunTracked(unittest.TestCase):
     """run_tracked's completion evidence from its operation-owned supervisor, with real
