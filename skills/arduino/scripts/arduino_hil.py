@@ -1114,7 +1114,24 @@ def _session_inputs(args):
 
 
 def session_run_dir(args):
-    return P.ROOT / 'build' / 'hil-manual' / f'{args.board}-{args.cmd}-{time.strftime("%Y%m%d-%H%M%S")}'
+    """This invocation's own run dir, created exclusively: <board>-<cmd>-<time>, suffixed -2, -3, ... when another
+    invocation has that one, so no command's report or logs replace another's. When it cannot be created, the path
+    is returned anyway, for the command's own handling of a dir it cannot make."""
+    parent = P.ROOT / 'build' / 'hil-manual'
+    stem, n = f'{args.board}-{args.cmd}-{time.strftime("%Y%m%d-%H%M%S")}', 1
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return parent / stem
+    while True:
+        d = parent / (stem if n == 1 else f'{stem}-{n}')
+        try:
+            d.mkdir()
+            return d
+        except FileExistsError:
+            n += 1
+        except OSError:
+            return d
 
 
 def _session_op(args, run_dir):

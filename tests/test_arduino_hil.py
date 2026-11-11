@@ -1525,6 +1525,34 @@ class Manual(Base):
             H.manual(args)
         self.assertIn('lock dir unusable', self.refusal_recorded('exec')['error'])
 
+    def test_invocations_in_one_second_never_share_a_run_dir(self):
+        """A command refused while another holds the session mutex, after that one wrote its result, and a command
+        run after it, all within one second: each result.json is its own invocation's."""
+        args = self.held(cmd='exec', argv=['true'], timeout=5)
+        self.A.process.run_tracked.return_value = mock.Mock(returncode=0, stdout='', stderr='', cleanup='done',
+                                                            receipt=None)
+        real, refused = self.lock.session_mutex, []
+
+        @contextlib.contextmanager
+        def held_on(lock):
+            with real(lock):
+                yield
+                if not refused:   # its result written, its mutex still held
+                    with self.assertRaises(H.NotAdmitted) as e:
+                        H.manual(args)
+                    refused.append(str(e.exception))
+        self.lock.session_mutex = held_on
+        with mock.patch.object(H.time, 'strftime', return_value='20261112-120000'), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(H.manual(args), 0)
+            self.assertEqual(H.manual(args), 0)
+        results = {p.parent.name: json.loads(p.read_text())
+                   for p in (self.root / 'build/hil-manual').glob('rig_jlink-exec-*/result.json')}
+        self.assertEqual(sorted(results), ['rig_jlink-exec-20261112-120000', 'rig_jlink-exec-20261112-120000-2',
+                                           'rig_jlink-exec-20261112-120000-3'])
+        self.assertEqual([(r['pass'], r.get('error')) for _, r in sorted(results.items())],
+                         [(True, None), (False, refused[0]), (True, None)])
+
     def test_bundle_holds_the_record_and_its_images(self):
         rec = self.record()
         bundle = self.root / 'bundles/1'
