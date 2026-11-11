@@ -201,7 +201,8 @@ pins each target's session once, so one replaced in its terminal while the relay
   adds closed ones, `--json` is the full record. A decision closes when its session resolves that revision, on a
   verdict, or on `cancel <id>` on the human's word; a keyed decision never closes because a session stopped
   mentioning it. The watch brief tells each session its own open decisions with their revisions, and to resolve one
-  the human answered in its terminal.
+  the human answered in its terminal; each of its watch reports prints them again as they stand after it, so a
+  `resolved` naming an older revision, which leaves the newer open, shows.
 - **Pruning** closes decisions the human settled elsewhere. Plain `prune` lists the open ones the evidence shows
   obsolete, `pr-done` (its PR merged or closed) or `owner-gone` (its session runs in no local terminal); what cannot
   be told is never listed, and staleness, age or a `done` report never count. `prune <id>:<rev>...` previews any

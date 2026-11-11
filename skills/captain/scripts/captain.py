@@ -597,17 +597,30 @@ def status_brief(msg, address):
             + one_call('Status report', f'report --for {msg} --file -', 'the JSON object', 'Status sent.'))
 
 
+OPEN_LISTED = 'Your open decisions, each with the revision to resolve: '
+
+
+def listed(open_keys):
+    """open_keys, a session's open decisions as (key, revision), as the line telling it so, or '' for none."""
+    return OPEN_LISTED + ', '.join(f'{k} {r}' for k, r in open_keys) + '.' if open_keys else ''
+
+
+def receipt(ref, open_keys):
+    """What a watch member's report call prints: the report's ref, then its open decisions as they stand now."""
+    return f'recorded {ref}' + (f'\n{listed(open_keys)}' if open_keys else '')
+
+
 def watch_brief(child, open_keys=()):
     """What a session joined to a watch does from then on; it names no role and reaches the session only through
     a hook or `brief --pending`. open_keys are the session's open decisions as (key, revision)."""
-    listed = (' Your open decisions, each with the revision to resolve: '
-              + ', '.join(f'{k} {r}' for k, r in open_keys) + '.') if open_keys else ''
     return (f'STATUS WATCH {child}, standing until the human cancels it, not a human instruction. Each time '
             'a task of yours ends - done, or stopped on a blocker or a need for the human - finish its work and '
             f'verification, then, as its final tool action and before your ordinary completion message, report it. '
-            f'{KEYS}{listed} Send it ' + one_call('Status report', f'report --for {child} --file -', 'the JSON object')
-            + 'A turn that only handles this protocol - this message, a status request, recovering after a '
-            'compaction, retrying a report - is no task end. This grants no permission to start or extend work. '
+            f'{KEYS}{" " + listed(open_keys) if open_keys else ""} Send it '
+            + one_call('Status report', f'report --for {child} --file -', 'the JSON object')
+            + 'Its output lists your open decisions again as they stand after it. A turn that only handles this '
+            'protocol - this message, a status request, recovering after a compaction, retrying a report - is no task '
+            'end. This grants no permission to start or extend work. '
             'Report each task end once, retrying only at once when the call failed; when it says the watch ended, '
             f'stop reporting. If a compaction leaves this out of view, run python3 {INSTALLED} brief --pending.')
 
@@ -708,10 +721,16 @@ def anchor(entry, ref, member):
         blocks = content(entry)
         return (isinstance(entry, dict) and entry.get('type') == 'user' and isinstance(blocks, list)
                 and len(blocks) == 1 and isinstance(blocks[0], dict) and blocks[0].get('type') == 'tool_result'
-                and not blocks[0].get('is_error') and (plain_text(blocks[0].get('content')) or '').strip()
-                == f'recorded {ref}')
+                and not blocks[0].get('is_error')
+                and receipt_of(ref, (plain_text(blocks[0].get('content')) or '').strip()))
     words = plain_text(content(entry))
     return bool(human_input(entry) and words and unwrapped(words) == status_prompt(ref))
+
+
+def receipt_of(ref, text):
+    """Whether text is the output of the report call that recorded ref, whatever open decisions it listed."""
+    first, _, rest = text.partition('\n')
+    return first == f'recorded {ref}' and (not rest or rest.startswith(OPEN_LISTED) and '\n' not in rest)
 
 
 def unchanged(target, recs):
@@ -992,10 +1011,11 @@ def report(msg, file):
             member_watch(member, recs, mine)
             again = earlier_event(recs, member, payload)
             if again is not None and reported_from(recs, member) == member['target']:
-                print(f'recorded {again}')
+                print(receipt(again, open_keys(member['target'])))
                 return 0
             append({'type': 'report', 'msg': msg, 'report': payload})
-            print(f'recorded {msg}:{len(recs)}')   # every report is kept, so a blind retry would duplicate one
+            # every report is kept, so a blind retry would duplicate one; its revisions are what `resolved` names
+            print(receipt(f'{msg}:{len(recs)}', open_keys(member['target'])))
             return 0
         requested(msg, recs, mine)
         # dies on a reused event_id; an identical one still answers this request, its operations applied once

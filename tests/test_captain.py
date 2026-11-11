@@ -2101,6 +2101,10 @@ class WatchUnchangedTest(WatchCase):
         [row] = captain.reports([self.ref])
         self.assertEqual((row['msg'], row['task']), (self.ref, GOOD['task']))
 
+    def test_a_receipt_listing_open_decisions_names_its_report(self):
+        self.ref = self.reported(extra='\n' + captain.listed([('merge', 2)]))
+        self.assertIn(f'not asked, nothing new since its report {self.ref} at', self.asked())
+
     def test_a_later_turn_is_asked(self):
         self.log({'type': 'user', 'promptSource': 'typed', 'origin': {'kind': 'human'},
                   'message': {'content': 'and now this'}})
@@ -2110,6 +2114,7 @@ class WatchUnchangedTest(WatchCase):
         cases = {'torn line': lambda: self.log(raw=b'{"type": "user", "mess'),
                  'later report not logged': lambda: self.report_as('t2', self.m),
                  'other output': lambda: self.reported(extra=' and more'),
+                 'more after the listing': lambda: self.reported(extra='\n' + captain.listed([('merge', 1)]) + '\nx'),
                  'only quoted': lambda: self.transcript.write_bytes(json.dumps(
                      {'type': 'user', 'isCompactSummary': True, 'message': {
                          'content': f'earlier: recorded {self.ref}'}}).encode() + b'\n')}
@@ -2268,13 +2273,13 @@ class DecisionTest(DecisionCase):
         self.send(decision('merge'), event='e', member=msg)
         self.assertEqual(self.count('report'), 2, 'the request is answered')
         self.assertEqual(self.item()['revision'], 1)
-        self.assertEqual(self.send(decision('merge'), event='e'), f'recorded {self.m}:{n}')
+        self.assertEqual(self.send(decision('merge'), event='e'), f'recorded {self.m}:{n}\n{OPEN}merge 1.')
 
     def test_a_retry_through_the_watch_names_the_report_first_recorded(self):
         msg = self.msg_of(self.ask())
         self.send(decision('merge'), event='e', member=msg)
         n = len(captain.records()) - 1
-        self.assertEqual(self.send(decision('merge'), event='e'), f'recorded {msg}:{n}')
+        self.assertEqual(self.send(decision('merge'), event='e'), f'recorded {msg}:{n}\n{OPEN}merge 1.')
 
     def test_a_resumed_session_s_report_moves_all_its_items(self):
         self.send(decision('merge'), decision('ci'))
@@ -2318,6 +2323,18 @@ class DecisionTest(DecisionCase):
         self.assertEqual((self.item()['revision'], self.item()['state']), (2, 'open'))
         self.send(resolved=[{'key': 'merge', 'revision': 2}])
         self.assertEqual(self.item()['state'], 'closed')
+
+    def test_each_member_report_lists_its_open_decisions_at_their_current_revisions(self):
+        n = len(captain.records())
+        self.assertEqual(self.send(decision('merge'), decision('ci', kind='blocked')),
+                         f'recorded {self.m}:{n}\n{OPEN}merge 1, ci 1.')
+        listed = self.send(decision('merge', ask='merge now?'))
+        self.assertTrue(listed.endswith('merge 2, ci 1.'), listed)
+        self.assertTrue(self.send(resolved=[{'key': 'merge', 'revision': 1}]).endswith('merge 2, ci 1.'),
+                        'a stale resolve leaves it listed open')
+        self.assertTrue(self.send(resolved=[{'key': 'merge', 'revision': 2}]).endswith(': ci 1.'))
+        n = len(captain.records())
+        self.assertEqual(self.send(resolved=[{'key': 'ci', 'revision': 1}]), f'recorded {self.m}:{n}')
 
     def test_a_closed_decision_listed_again_stays_closed_until_reopened(self):
         self.send(decision('merge'))
@@ -2864,6 +2881,9 @@ class ChiefFeedTest(LedgerCase):
             with self.subTest(run), self.assertRaises(SystemExit), mock.patch('builtins.print'):
                 captain.ingest(run, self.ident)
         self.assertEqual(captain.records(), [])
+
+
+OPEN = 'Your open decisions, each with the revision to resolve: '
 
 
 def decision(key, kind='review', **extra):
