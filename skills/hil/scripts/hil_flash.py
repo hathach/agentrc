@@ -547,8 +547,10 @@ def sysresetreq_openocd(flasher: dict, *, timeout, run=None, workdir=None) -> Op
                                 run=run, workdir=workdir)
 
 
-# openocd interface cfgs whose discovery filters by VID/PID before opening; see convoy_safe
-CONVOY_SAFE_CFGS = ('interface/jlink.cfg', 'interface/stlink.cfg', 'interface/ti-icdi.cfg')
+# openocd interface cfgs whose discovery filters by VID/PID before opening (see convoy_safe), with
+# the USB vendor of the probe each drives (probe_users)
+OPENOCD_CFG_VIDS = {'interface/jlink.cfg': '1366', 'interface/stlink.cfg': '0483', 'interface/ti-icdi.cfg': '1cbe'}
+CONVOY_SAFE_CFGS = tuple(OPENOCD_CFG_VIDS)
 
 
 # OpenOCD's messages for "the target's debug port did not answer". The probe is fine when
@@ -841,6 +843,307 @@ def esptool_port(uid: str) -> str:
     if not is_chr:
         raise RuntimeError(f'bridge serial {uid}: {links[0]} -> {tty} is not a character device')
     return tty
+
+
+# -------------------------------------------------------------
+# Who uses a probe
+# -------------------------------------------------------------
+PROBE_SCAN_BOUND = 20.0     # s for probe_users' /proc walk: a cmdline read takes the target's mm lock and can block
+# The programs that open a debug probe, by effective program (_program): what a process whose fds
+# cannot be read is judged by.
+PROBE_TOOLS = re.compile(r'(JLink|openocd|esptool|pyocd|run_pyocd)\S*|STM32_Programmer_CLI|probe-rs|picotool|'
+                         r'lm4flash|st-flash|dfu-util')
+# USB vendors a flasher's probe is looked up under when its entry pins none (vid_pid)
+PROBE_VIDS = {'jlink': '1366', 'stlink': '0483', 'lm4flash': '1cbe'}
+_PYTHON = re.compile(r'python[0-9.]*')
+_scan: list = []            # the last /proc walk's thread: while it is blocked no other starts
+
+
+class ProbeCheckInconclusive(RuntimeError):
+    """probe_users could not observe enough to say who uses the probe: never read as idle."""
+
+
+def _python_program(argv: list) -> list | None:
+    """The argv a Python interpreter's argv hands its module (`-m`) or script, the program's
+    basename first; None for `-c`, stdin or no program. The interpreter's own options (`-X`,
+    `-W` and their values) are not the program's."""
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a == '--':
+            return [os.path.basename(argv[i + 1]), *argv[i + 2:]] if i + 1 < len(argv) else None
+        if not a.startswith('-') or a == '-':
+            return None if a == '-' else [os.path.basename(a), *argv[i + 1:]]
+        if a.startswith('--'):
+            i += 2 if a == '--check-hash-based-pycs' else 1
+            continue
+        for k, ch in enumerate(a[1:], 2):
+            if ch in 'mcXW':            # each takes a value, the rest of the word or the next one
+                inline = a[k:]
+                value = inline or (argv[i + 1] if i + 1 < len(argv) else '')
+                if ch == 'm':
+                    return [value, *argv[i + (1 if inline else 2):]] if value else None
+                if ch == 'c':
+                    return None
+                i += 0 if inline else 1
+                break
+        i += 1
+    return None
+
+
+def _program(argv: list) -> list:
+    """argv as its effective program sees it, the program's basename first: argv[0]'s, or for a
+    Python interpreter the module or script it runs (a console script started through its shebang
+    shows as one) with only that program's arguments."""
+    name = os.path.basename(argv[0]) if argv else ''
+    return (_python_program(argv) or [name, *argv[1:]]) if _PYTHON.fullmatch(name) else [name, *argv[1:]]
+
+
+def _names_serial(uid: str, token: str) -> bool:
+    """Whether one command-line token names the probe serial `uid`: case aside, an all-digit one
+    as a number (J-Link's zero padding), also after a `scheme:` prefix (pyocd's `cmsisdap:<uid>`)."""
+    token = token.strip('\'"{}[];')
+    return bool(usb_observe.jlink_serial_match(uid, token)) or (
+        ':' in token and bool(usb_observe.jlink_serial_match(uid, token.split(':', 1)[1])))
+
+
+def _tokens(argv: list):
+    for word in argv:
+        yield from (t for t in re.split(r'[\s=,]+', word) if t)
+
+
+def _option_values(argv: list, flags: tuple, *, fold=False, joined=False) -> list:
+    """The values argv gives `flags` (case aside with `fold`; also a long flag's `--flag=value`
+    with `joined`), read left to right so an option's value is never read as an option."""
+    out, i = [], 1
+    while i < len(argv):
+        a = argv[i].lower() if fold else argv[i]
+        if a in flags and i + 1 < len(argv):
+            out.append(argv[i + 1])
+            i += 2
+            continue
+        if joined and (f := next((f for f in flags if f.startswith('--') and a.startswith(f + '=')), None)):
+            out.append(argv[i][len(f) + 1:])
+        i += 1
+    return out
+
+
+# an openocd -c argument that is one serial selection and nothing else
+_OPENOCD_SERIAL = re.compile(r'\s*(?:adapter\s+serial|hla_serial|cmsis_dap_serial)\s+'
+                             r'(?:"([A-Za-z0-9_.:+-]+)"|\{([A-Za-z0-9_.:+-]+)\}|([A-Za-z0-9_.:+-]+))\s*;?\s*')
+
+
+def _selections(program: str, argv: list) -> tuple:
+    """(serials, ports) a probe tool's argv selects its probe by through a mechanism whose scope
+    is exact, each read only where the tool reads it: J-Link -USB <sn>, -SelectEmuBySN <sn> and
+    -select USB=<sn>; an openocd -c that is only `adapter serial`, `hla_serial` or
+    `cmsis_dap_serial` <sn>; esptool --port/-p; lm4flash -s; st-flash --serial. Empty for every
+    other tool and selection, and for any other syntax (pyocd and STM32_Programmer_CLI discovery
+    open candidate probes before their serial filter)."""
+    serials, ports = [], []
+    if program.startswith('JLink'):
+        serials += _option_values(argv, ('-usb', '-selectemubysn'), fold=True)
+        serials += [v[4:] for v in _option_values(argv, ('-select',), fold=True)
+                    if v[:4].upper() == 'USB=' and v[4:]]
+    elif program.startswith('openocd'):
+        serials += [v for c in _option_values(argv, ('-c', '--command'), joined=True)
+                    if (m := _OPENOCD_SERIAL.fullmatch(c)) for v in m.groups() if v]
+    elif program.startswith('esptool'):
+        ports += _option_values(argv, ('--port', '-p'), joined=True)
+    elif program == 'lm4flash':
+        serials += _option_values(argv, ('-s',))
+    elif program == 'st-flash':
+        serials += _option_values(argv, ('--serial',), joined=True)
+    return serials, ports
+
+
+def _usb_filters(flasher: dict) -> list:
+    """The usb_observe.usb_devices keyword filters the flasher's probe is looked up under, one
+    per vid_pid pair or vendor; [{}] for every device."""
+    name = flasher.get('name')
+    if name in ('openocd', 'pyocd') and valid_vid_pid(flasher.get('vid_pid')):
+        w = [x.lower().removeprefix('0x') for x in flasher['vid_pid'].split()]
+        return [{'vid_pid': pair} for pair in zip(w[::2], w[1::2])]
+    if name in PROBE_VIDS:
+        return [{'vid': PROBE_VIDS[name]}]
+    if name == 'openocd':
+        for cfg, vid in OPENOCD_CFG_VIDS.items():
+            if cfg in (flasher.get('args') or ''):
+                return [{'vid': vid}]
+    return [{}]
+
+
+def _probe_nodes(uid: str, filters: list) -> set:
+    """The usbfs nodes of the enumerated devices under `filters` whose serial is `uid` (exact or
+    J-Link padded), read from udev's record, else the bounded `serial` read; empty when none is
+    enumerated. Inconclusive when none matched while a device's serial could not be read."""
+    found, unknown = set(), []
+    for f in filters:
+        for dev in usb_observe.usb_devices(**f):
+            bus, num, attr = dev['busnum'], dev['devnum'], os.path.join(dev['dir'], 'serial')
+            if bus is None or num is None:
+                unknown.append(dev['busport'])
+                continue
+            sn = usb_observe.udev_serial(bus, num)
+            if sn is None:
+                if not os.path.lexists(attr):
+                    continue            # no serial string: not a probe a roster names by one
+                sn = usb_observe.read_sysfs(attr)
+            if sn is None or usb_observe.enumeration_id(dev['dir']) != dev['ino']:
+                unknown.append(dev['busport'])
+            elif usb_observe.jlink_serial_match(uid, sn):
+                found.add(f'/dev/bus/usb/{bus:03d}/{num:03d}')
+    if not found and unknown:
+        raise ProbeCheckInconclusive(f'probe {uid}: not found, and the serial of {", ".join(unknown)} is unreadable')
+    return found
+
+
+def _probe_devices(flasher: dict) -> set:
+    """The device nodes whose holders use the flasher's probe: esptool's tty (esptool_port) and,
+    for a USB-Serial/JTAG or openocd_esp, the USJ's usbfs node; else the probe's usbfs node."""
+    name, uid = flasher.get('name'), _uid(flasher)
+    try:
+        if name in ('esptool', 'openocd_esp'):
+            devs = {esptool_port(uid)}
+            if name == 'openocd_esp' or USJ_SERIAL.fullmatch(uid):
+                devs.add(hil_load.load_file('skills/hil/scripts/hil_openocd_esp.py').usj_node(uid))
+            return devs
+    except (RuntimeError, OSError, ImportError) as e:
+        raise ProbeCheckInconclusive(f'probe {uid}: {e}') from e
+    if name in ('jlink', 'stlink', 'openocd', 'lm4flash', 'pyocd'):
+        return _probe_nodes(uid, _usb_filters(flasher))
+    raise ValueError(f'probe_users: no probe lookup for flasher {name!r}')
+
+
+def _ancestors() -> set:
+    """Our pid and our ancestors' while /proc shows the chain; a link that cannot be read ends it
+    early, which only exempts less."""
+    chain, pid = set(), os.getpid()
+    while pid > 0 and pid not in chain:
+        chain.add(pid)
+        st = usb_observe._proc_stat(pid)
+        if st is None or not st[3].isdigit():
+            break
+        pid = int(st[3])
+    return chain
+
+
+def _fds(pid: int):
+    """The targets of a process's fds; None when they cannot be read (another uid's).
+    FileNotFoundError or ProcessLookupError once the process ended; inconclusive on any other
+    error."""
+    proc = usb_observe.PROC_ROOT
+    try:
+        fds = os.listdir(f'{proc}/{pid}/fd')
+    except PermissionError:
+        return None
+    except (FileNotFoundError, ProcessLookupError):
+        raise
+    except OSError as e:
+        raise ProbeCheckInconclusive(f'pid {pid}: cannot list its fds: {e}') from e
+    targets = []
+    for fd in fds:
+        try:
+            targets.append(os.readlink(f'{proc}/{pid}/fd/{fd}'))
+        except PermissionError:
+            return None                 # listed but not ptrace-readable: a non-dumpable process of our uid
+        except FileNotFoundError:
+            pass                        # that fd closed; the process's others still count
+        except ProcessLookupError:
+            raise
+        except OSError as e:
+            raise ProbeCheckInconclusive(f'pid {pid}: cannot read fd {fd}: {e}') from e
+    return targets
+
+
+def _walk(flasher: dict, devices: set) -> list:
+    uid, proc, stlink = _uid(flasher), usb_observe.PROC_ROOT, flasher.get('name') == 'stlink'
+    exempt = _ancestors()
+    try:
+        pids = sorted(int(p) for p in os.listdir(proc) if p.isdigit())
+    except OSError as e:
+        raise ProbeCheckInconclusive(f'cannot list {proc}: {e}') from e
+    users = []
+    for pid in pids:
+        try:
+            with open(f'{proc}/{pid}/cmdline', 'rb') as f:
+                raw = f.read()
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except OSError as e:
+            raise ProbeCheckInconclusive(f'pid {pid}: cannot read its command line: {e}') from e
+        argv = [os.fsdecode(w) for w in raw.split(b'\0')]
+        if argv and argv[-1] == '':
+            argv.pop()
+        prog_argv = _program(argv)
+        program = prog_argv[0]
+        user = pid not in exempt and (any(_names_serial(uid, t) for t in _tokens(argv)) or
+                                      stlink and program == 'STM32_Programmer_CLI')
+        if not user:
+            try:
+                fds = _fds(pid)
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            if fds is not None:
+                user = any(t in devices for t in fds)
+            elif PROBE_TOOLS.fullmatch(program):
+                serials, ports = _selections(program, prog_argv)
+                if not (serials or ports):
+                    raise ProbeCheckInconclusive(
+                        f'pid {pid} ({program}): its fds are unreadable and its command line selects no probe '
+                        f'exactly, so it may hold {uid}')
+                # a serial naming ours matched as a token above; an exempt process is never a user here
+                user = pid not in exempt and any(os.path.realpath(p) in devices for p in ports)
+        if user:
+            users.append({'pid': pid, 'cmd': shlex.join(argv)})
+    return users
+
+
+def probe_users(flasher: dict) -> list:
+    """The processes that /proc shows using the flasher's probe, [{'pid', 'cmd'}] by pid, empty
+    when it shows none. A limited observation, never proof that no process uses the probe.
+
+    One walk of usb_observe.PROC_ROOT, after the probe's devices are resolved (_probe_devices: esptool's tty by
+    esptool_port and a USB-Serial/JTAG's usbfs node, or the probe's usbfs node by its serial
+    under the flasher's vid_pid or vendor). A process is a user when
+    * its command line, of any uid, names the probe serial as a token (words split at whitespace,
+      `=` and `,`, quotes and braces stripped; case aside, an all-digit serial as a number for
+      J-Link's zero padding, also after a `scheme:` prefix), or, for an `stlink` flasher, it runs
+      STM32_Programmer_CLI at all (a `-script` names the probe in its file, and whether one runs
+      depends on the other tools on the host, not on the caller); our own process and its
+      ancestors are exempt from this match only;
+    * its fds, where we may read them (our uid, or CAP_SYS_PTRACE), hold one of those devices;
+      our process and ancestors included.
+    A process whose fds we cannot read and whose effective program (argv[0]'s basename, or a
+    Python interpreter's `-m` module or script) is a probe tool (PROBE_TOOLS) counts as not ours
+    only when its command line selects a different probe through an exact-scope selection
+    (_selections); otherwise the check is inconclusive. Any other process with unreadable fds is
+    skipped: a non-tool of another uid holding the probe without naming it is not seen.
+
+    A recognized selector naming another probe lets the check exclude that process when its fds
+    are unreadable. This identifies its intended probe, not every device it currently has open:
+    OpenOCD discovery opens other candidates before comparing serials, and those opens, including
+    ones prolonged by a stopped or stalled process, can be missed. The check gives no exclusion
+    guarantee against discovery activity. A pyOCD process is never excluded this way, a
+    deliberately more conservative policy.
+
+    Not covered: an STM32_Programmer_CLI script on an ST-LINK whose flasher is not `stlink`, a
+    GDB client attached to a server, DUT-side tools (testusb, mcopy, nrfutil) and anything not
+    running at the moment of the walk. ProbeCheckInconclusive (a RuntimeError) when /proc may
+    hide another uid's processes (hidepid), the walk is bounded out (PROBE_SCAN_BOUND) or an
+    earlier one is still blocked, a visible process's command line or fds fail to read for a
+    reason other than it ending, the devices cannot be resolved, or a probe tool is unaccounted
+    for as above; ValueError for a flasher with no uid or no lookup.
+    PROBE_SCAN_BOUND covers the walk only: resolving the devices before it may spend the sysfs
+    grace (usb_observe.read_sysfs) on each unreadable serial not yet memoised as stranded."""
+    devices = {os.path.realpath(d) for d in _probe_devices(flasher)}
+    if hil_process._proc_hides_others():
+        raise ProbeCheckInconclusive(f'{usb_observe.PROC_ROOT} may hide other users\' processes (hidepid)')
+    users = hil_process._bounded(lambda: _walk(flasher, devices), PROBE_SCAN_BOUND, _scan, reraise=True)
+    if users is None:
+        raise ProbeCheckInconclusive(f'the {usb_observe.PROC_ROOT} walk did not finish in {PROBE_SCAN_BOUND} s, or an '
+                                     'earlier one is still blocked')
+    return users
 
 
 def flash_lm4flash(flasher: dict, firmware: str, *, timeout, run=None) -> Operation:

@@ -359,6 +359,11 @@ def latest_failure(lock_module, board):
     return failures[-1] if failures else None
 
 
+def failed_events(lock_module, board):
+    """Every `failed` event in `board`'s cleanup log, oldest first."""
+    return [e for e in lock_module.cleanup_events(board) if e['event'] == 'failed']
+
+
 def taken_failure(fh):
     """The latest open failed cleanup a take found (its handle's cleanup_failures), else None."""
     return fh.cleanup_failures[-1] if fh.cleanup_failures else None

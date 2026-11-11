@@ -991,20 +991,23 @@ class ForeignStateDir(unittest.TestCase):
                 self.assertEqual(hp.recheck_dir(d), ('pending', [entry]))
             with mock.patch('builtins.open', side_effect=PermissionError(errno.EACCES, 'denied')):
                 self.assertEqual(hp.recheck(entry), 'pending')         # a command line it cannot read
-            release, scans = threading.Event(), []
+            release, entered, scans = threading.Event(), threading.Event(), []
             self.addCleanup(release.set)
 
             def blocked(_):
                 scans.append(1)
+                entered.set()
                 release.wait(10)
                 return []
-            with mock.patch.object(hp, 'PROC_SCAN_BOUND', 0.01), mock.patch.object(hp, '_supervisors_in', blocked):
-                self.assertEqual(hp.recheck(entry), 'pending')         # not listed within its bound
-                self.assertEqual(hp.recheck(entry), 'pending')         # nor while that scan is still blocked
-                self.assertEqual(len(scans), 1)                         # and no second scan thread started
+            with mock.patch.object(hp, '_supervisors_in', blocked):
+                with mock.patch.object(hp, 'PROC_SCAN_BOUND', 0.01):
+                    self.assertEqual(hp.recheck(entry), 'pending')     # not listed within its bound
+                    self.assertTrue(entered.wait(5))                    # the worker may start after the bound
+                    self.assertEqual(hp.recheck(entry), 'pending')     # nor while that scan is still blocked
+                    self.assertEqual(len(scans), 1)                     # and no second scan thread started
                 release.set()
                 hp._proc_scan[0].join(5)
-                self.assertEqual(hp.recheck(entry), 'unknown')
+                self.assertEqual(hp.recheck(entry), 'unknown')         # the normal bound: a slow start is not 'pending'
             self.assertEqual(hp.recheck({'token': 'foreign:1', 'foreign': 1}), 'pending')
         self.assertEqual(os.listdir(d), ['hil_op_a.log'])
 
@@ -1093,6 +1096,36 @@ THREAD_LEADER = ('import ctypes, os, sys, threading, time\n'
                  'threading.Thread(target=time.sleep, args=(30,)).start()\n'
                  'open(sys.argv[1], "w").write(f"{os.getpid()}\\n")\n'
                  'ctypes.CDLL(None).pthread_exit(None)\n')
+
+
+class Bounded(unittest.TestCase):
+    def test_a_worker_still_running_gates_the_next_call_whatever_is_alive_says(self):
+        """CPython 3.12's Thread.join, interrupted while waiting, marks a still-running thread stopped."""
+        release, entered, calls, last = threading.Event(), threading.Event(), [], []
+        self.addCleanup(release.set)
+
+        def blocked():
+            calls.append(1)
+            entered.set()
+            release.wait(T)
+            return 'walked'
+        self.assertIsNone(hp._bounded(blocked, 0.01, last))
+        self.assertTrue(entered.wait(T))
+        with mock.patch.object(threading.Thread, 'is_alive', return_value=False):
+            self.assertIsNone(hp._bounded(blocked, 0.01, last))
+        self.assertEqual(len(calls), 1)
+        first = last[0]
+        release.set()
+        first.join(T)
+        self.assertEqual(hp._bounded(blocked, T, last), 'walked')
+        self.assertIsNot(last[0], first)
+
+    def test_a_worker_that_never_started_does_not_gate_the_next_call(self):
+        last = []
+        with mock.patch.object(threading.Thread, 'start', side_effect=RuntimeError("can't start new thread")), \
+                self.assertRaises(RuntimeError):
+            hp._bounded(list, T, last)
+        self.assertEqual(hp._bounded(list, T, last), [])
 
 
 @unittest.skipUnless(os.path.isdir('/proc'), 'reads processes from /proc')

@@ -23,11 +23,14 @@ import importlib.util
 import io
 import json
 import re
+import secrets
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import types
 from pathlib import Path
 from unittest import mock
@@ -1206,6 +1209,273 @@ class EsptoolPort(unittest.TestCase):
             self.link('usb-x_ab1-if00-port0')
             self.assertEqual(hf.esptool_port('ab1'), '/dev/null')
         self.assertEqual(seen, ['30:ED:A0:E0:C9:02'])
+
+
+# The middle process of ProbeUsersLive: names the serial on its own command line, holds a pty
+# slave open or not, and runs CHECK_CHILD under it.
+CHAIN_PARENT = r'''
+import json, os, subprocess, sys
+flash, serial, hold, child = sys.argv[1:5]
+master, slave = os.openpty()
+tty = os.ttyname(slave)
+if hold == '0':
+    os.close(slave)
+r = subprocess.run([sys.executable, '-c', child, flash, tty, serial], capture_output=True, text=True, timeout=60)
+print(json.dumps({'pid': os.getpid(), 'rc': r.returncode, 'out': r.stdout, 'err': r.stderr}))
+'''
+# probe_users of an esptool probe whose tty is `tty`, run as a child that names the serial too
+CHECK_CHILD = r'''
+import importlib.util, json, re, sys
+flash, tty, serial = sys.argv[1:4]
+spec = importlib.util.spec_from_file_location('agentrc_hil_flash', flash)
+hf = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(hf)
+hf.PROBE_TOOLS = re.compile(r'(?!)')        # another uid's probe tools on this host are not this test's
+hf.esptool_port = lambda uid: tty
+hf.hil_process._proc_hides_others = lambda: False
+print(json.dumps(hf.probe_users({'name': 'esptool', 'uid': serial})))
+'''
+
+
+class ProbeUsers(unittest.TestCase):
+    """probe_users over a fake /proc: command-line tokens of any process, fd holders where fds
+    are readable, probe tools with unreadable fds judged by their exact-scope selection."""
+
+    UID = '681295394'
+
+    def setUp(self):
+        self.proc = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.node = os.path.realpath(self.proc / 'node')      # stands in for /dev/bus/usb/BBB/DDD
+        self.enterContext(mock.patch.object(hf.usb_observe, 'PROC_ROOT', str(self.proc)))
+        self.enterContext(mock.patch.object(hf.hil_process, '_proc_hides_others', lambda: False))
+        self.enterContext(mock.patch.object(hf, '_probe_nodes', lambda uid, filters: {self.node}))
+        self.pid = 100
+
+    def entry(self, argv, fds=(), readable=True, pid=None, ppid=1):
+        pid = pid or self.next_pid()
+        d = self.proc / str(pid)
+        d.mkdir()
+        (d / 'cmdline').write_bytes(b''.join(a.encode() + b'\0' for a in argv))
+        (d / 'stat').write_text(f'{pid} (x) S {ppid} {pid} {pid} ' + ' '.join(['0'] * 20))
+        (d / 'fd').mkdir()
+        for i, target in enumerate(fds):
+            os.symlink(target, d / 'fd' / str(i))
+        if not readable:
+            self.unreadable(d / 'fd')
+        return pid
+
+    def next_pid(self):
+        self.pid += 1
+        return self.pid
+
+    def unreadable(self, path):
+        if os.geteuid() == 0:
+            self.skipTest('root reads any /proc entry')
+        mode = path.stat().st_mode
+        path.chmod(0)
+        self.addCleanup(lambda: path.exists() and path.chmod(mode))
+
+    def users(self, flasher=None, **kw):
+        return [u['pid'] for u in hf.probe_users(flasher or {'name': 'jlink', 'uid': self.UID}, **kw)]
+
+    def test_a_command_line_token_names_the_serial_whatever_the_uid(self):
+        named = [self.entry(argv, readable=False) for argv in (
+            ['JLinkExe', '-USB', '000681295394', '-CommandFile', 'x'],             # J-Link zero padding
+            ['sh', '-c', 'JLinkGDBServerCLExe -select USB=681295394 -port 2331'],   # inside a word, after '='
+            ['openocd', '-c', 'adapter serial 681295394'],
+            ['/v/bin/python3', '/x/run_pyocd.py', 'flash', '-u', 'cmsisdap:681295394'],
+            ['tool', '--sn=a,681295394,b'])]
+        for argv in (['x', '6812953941'], ['x', 'a681295394'], ['x', '/tmp/681295394.hex'], ['x', '000000000']):
+            self.entry(argv)
+        users = hf.probe_users({'name': 'jlink', 'uid': self.UID})
+        self.assertEqual([u['pid'] for u in users], named)
+        self.assertEqual(users[0]['cmd'], 'JLinkExe -USB 000681295394 -CommandFile x')
+
+    def test_a_holder_of_the_probe_node_or_tty_is_a_user(self):
+        pty = self.proc / 'pts'
+        pty.write_text('')
+        holder = self.entry(['some-tool'], fds=['/dev/null', self.node])
+        self.entry(['other'], fds=['/dev/null', str(self.proc / 'elsewhere')])
+        self.assertEqual(self.users(), [holder])
+        with mock.patch.object(hf, 'esptool_port', lambda uid: str(pty)):
+            tty_holder = self.entry(['miniterm'], fds=[str(pty)])
+            self.assertEqual(self.users({'name': 'esptool', 'uid': 'ab12'}), [tty_holder])
+
+    def test_ancestors_are_exempt_from_the_token_match_only(self):
+        parent = self.next_pid()
+        self.entry(['harness', '--probe', self.UID], pid=os.getpid(), ppid=parent)
+        self.entry(['runner', '--probe', self.UID], pid=parent)
+        self.assertEqual(self.users(), [])
+        (self.proc / str(parent) / 'fd' / '9').symlink_to(self.node)
+        self.assertEqual(self.users(), [parent])
+
+    def test_a_probe_tool_with_unreadable_fds_and_no_exact_selection_is_inconclusive(self):
+        for argv in (['/opt/SEGGER/JLinkExe', '-CommandFile', 'x.jlink'],
+                     ['openocd', '-f', 'interface/cmsis-dap.cfg', '-f', 'target/rp2040.cfg'],
+                     ['STM32_Programmer_CLI', '-script', 'x.prg'],
+                     ['/usr/bin/python3', '-m', 'esptool', 'chip_id'],                 # auto-detected port
+                     ['/v/bin/python3', '/v/bin/pyocd', 'flash', 'fw.hex'],            # pyocd auto-discovery
+                     # A1'': run_pyocd's VID/PID filter is not exact scope: discovery opens the candidates
+                     ['/v/bin/python3', '-I', '/x/run_pyocd.py', '--project-dir', 'd', '0x0d28', '0x0204', 'flash',
+                      '-W', '-u', 'cmsisdap:OTHER'],
+                     ['probe-rs', 'run'], ['picotool', 'load', 'x.uf2'], ['dfu-util', '-D', 'x.bin'],
+                     # a selector's syntax anywhere but where the tool reads it selects nothing
+                     ['JLinkExe', '-CommandFile', 'USB=999'], ['JLinkGDBServerCLExe', '-select', 'IP=10.0.0.1'],
+                     ['openocd', '-c', 'echo adapter serial OTHER'], ['openocd', '-c', 'adapter serial OTHER; init'],
+                     ['openocd', '-c=adapter serial OTHER'], ['openocd', '-f', 'adapter serial OTHER'],
+                     ['/usr/bin/python3', '-m', 'esptool', 'write_flash', '--port-file', '-p'],
+                     # the interpreter's own -X takes -p as its value: esptool gets no port
+                     ['/usr/bin/python3', '-X', '-p', '-m', 'esptool', 'chip_id']):
+            with self.subTest(argv=argv):
+                pid = self.entry(argv, readable=False)
+                with self.assertRaisesRegex(hf.ProbeCheckInconclusive, rf'pid {pid} \('):
+                    self.users()
+                (self.proc / str(pid) / 'fd').chmod(0o755)
+                shutil.rmtree(self.proc / str(pid))
+
+    def test_a_probe_tool_selecting_another_probe_exactly_is_not_ours(self):
+        for argv in (['JLinkExe', '-usb', '999', '-CommandFile', 'x'],
+                     ['JLinkGDBServerCLExe', '-select', 'USB=999'], ['JLinkGDBServerCLExe', '-Select', 'usb=999'],
+                     ['openocd', '-c', 'hla_serial {OTHER}'], ['openocd', '--command=cmsis_dap_serial "OTHER";'],
+                     ['JLinkExe', '-SelectEmuBySN', '999'],
+                     ['openocd-esp32', '-c', 'adapter usb location 1-2', '-c', 'adapter serial OTHER'],
+                     ['/usr/bin/python3', '-m', 'esptool', '-p', '/dev/ttyUSB9', 'chip_id'],
+                     ['/v/bin/python3', '/v/bin/esptool', '--port=/dev/ttyUSB9', 'chip_id'],
+                     ['lm4flash', '-s', 'OTHER', 'x.bin'], ['st-flash', '--serial', 'OTHER', 'write', 'x.bin']):
+            self.entry(argv, readable=False)
+        self.entry(['bash'], readable=False)            # not a probe tool: a documented blind spot
+        self.entry(['sshd: user'], readable=False)
+        self.entry([], readable=False)                  # a kernel thread
+        self.assertEqual(self.users(), [])
+
+    def test_any_stm32_programmer_uses_an_stlink_flashers_probe(self):
+        cli = self.entry(['STM32_Programmer_CLI', '-script', 'x.prg'])
+        self.assertEqual(self.users({'name': 'stlink', 'uid': 'ABC'}), [cli])
+        self.assertEqual(self.users({'name': 'openocd', 'uid': 'ABC'}), [])
+
+    def test_a_process_that_ends_during_the_walk_is_ignored(self):
+        (self.proc / '7').mkdir()                                       # no cmdline: gone
+        gone_fds = self.entry(['x'])
+        shutil.rmtree(self.proc / str(gone_fds) / 'fd')                 # its fd dir gone after its cmdline
+        closing = self.entry(['x'], fds=[self.node, '/dev/null'])
+        real = os.readlink
+
+        def readlink(path):
+            if path == f'{self.proc}/{closing}/fd/0':
+                raise FileNotFoundError(2, 'No such file or directory', path)   # closed after the listing
+            return real(path)
+        with mock.patch.object(hf.os, 'readlink', readlink):
+            self.assertEqual(self.users(), [])
+
+    def test_what_cannot_be_observed_is_inconclusive(self):
+        with mock.patch.object(hf.hil_process, '_proc_hides_others', lambda: True), \
+                self.assertRaisesRegex(hf.ProbeCheckInconclusive, 'hidepid'):
+            self.users()
+        pid = self.entry(['x'])
+        self.unreadable(self.proc / str(pid) / 'cmdline')
+        with self.assertRaisesRegex(hf.ProbeCheckInconclusive, f'pid {pid}: cannot read its command line'):
+            self.users()
+
+    def test_device_lookup_failures_are_inconclusive(self):
+        def port(uid):
+            raise RuntimeError(f'bridge serial {uid}: want one link, found [a, b]')
+        with mock.patch.object(hf, 'esptool_port', port), \
+                self.assertRaisesRegex(hf.ProbeCheckInconclusive, 'found \\[a, b\\]'):
+            self.users({'name': 'esptool', 'uid': 'ab12'})
+        with self.assertRaisesRegex(ValueError, 'no probe lookup'):
+            self.users({'name': 'wch_uart_loader', 'uid': 'ab12'})
+
+    def test_a_walk_that_blocks_is_inconclusive_and_never_stacks_another(self):
+        release = threading.Event()
+        before = threading.active_count()
+
+        def blocked(*a):
+            release.wait(30)
+            return []
+
+        def cleanup():
+            release.set()
+            hf._scan[0].join(30)
+        self.addCleanup(cleanup)
+        with mock.patch.object(hf, 'PROBE_SCAN_BOUND', 0.1), mock.patch.object(hf, '_walk', blocked):
+            with self.assertRaisesRegex(hf.ProbeCheckInconclusive, 'did not finish'):
+                self.users()
+            for _ in range(3):
+                started = time.monotonic()
+                with self.assertRaisesRegex(hf.ProbeCheckInconclusive, 'earlier one is still blocked'):
+                    self.users()
+                self.assertLess(time.monotonic() - started, 0.1)
+            self.assertEqual(threading.active_count(), before + 1)
+            release.set()
+            hf._scan[0].join(30)
+            self.assertEqual(self.users(), [])
+
+
+class ProbeNodes(unittest.TestCase):
+    """The usbfs node a probe is held through, found by its serial under the flasher's USB IDs."""
+
+    def test_usb_filters(self):
+        cases = (({'name': 'jlink'}, [{'vid': '1366'}]),
+                 ({'name': 'openocd', 'vid_pid': '0x2E8A 0x000c 0x0d28 0x0204'},
+                  [{'vid_pid': ('2e8a', '000c')}, {'vid_pid': ('0d28', '0204')}]),
+                 ({'name': 'openocd', 'args': '-f interface/stlink.cfg'}, [{'vid': '0483'}]),
+                 ({'name': 'openocd', 'args': '-f interface/cmsis-dap.cfg'}, [{}]),
+                 ({'name': 'pyocd'}, [{}]))
+        for flasher, want in cases:
+            with self.subTest(flasher=flasher):
+                self.assertEqual(hf._usb_filters(flasher), want)
+
+    def test_found_by_serial_padded_or_inconclusive(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        devs = []
+        for busport, sn in (('1-1', '000681295394'), ('1-2', None), ('1-3', 'unreadable')):
+            d = root / busport
+            d.mkdir()
+            if sn is not None:
+                (d / 'serial').write_text(sn)
+            devs.append({'busport': busport, 'dir': str(d), 'ino': 1, 'busnum': 1, 'devnum': len(devs) + 2})
+        sysfs = {str(root / '1-1' / 'serial'): '000681295394'}
+        self.enterContext(mock.patch.object(hf.usb_observe, 'usb_devices', lambda **kw: devs))
+        self.enterContext(mock.patch.object(hf.usb_observe, 'udev_serial', lambda bus, dev: None))
+        self.enterContext(mock.patch.object(hf.usb_observe, 'read_sysfs', lambda p, *a: sysfs.get(p)))
+        self.enterContext(mock.patch.object(hf.usb_observe, 'enumeration_id', lambda d: 1))
+        self.assertEqual(hf._probe_nodes('681295394', [{'vid': '1366'}]), {'/dev/bus/usb/001/002'})
+        with self.assertRaisesRegex(hf.ProbeCheckInconclusive, r'serial of 1-3 is unreadable'):
+            hf._probe_nodes('424242', [{'vid': '1366'}])
+        del devs[2]
+        self.assertEqual(hf._probe_nodes('424242', [{'vid': '1366'}]), set())   # absent; 1-2 has no serial
+
+
+class ProbeUsersLive(unittest.TestCase):
+    """probe_users over the real /proc, with real processes."""
+
+    def setUp(self):
+        self.serial = str(secrets.randbelow(10 ** 9) + 10 ** 9)
+        self.enterContext(mock.patch.object(hf, 'PROBE_TOOLS', re.compile(r'(?!)')))
+        self.enterContext(mock.patch.object(hf.hil_process, '_proc_hides_others', lambda: False))
+        self.enterContext(mock.patch.object(hf, '_probe_nodes', lambda uid, filters: set()))
+
+    def test_a_child_naming_the_serial_zero_padded_is_listed(self):
+        p = subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.read()', '-USB', '000' + self.serial],
+                             stdin=subprocess.PIPE)
+        self.addCleanup(p.wait, 10)
+        self.addCleanup(p.stdin.close)
+        users = hf.probe_users({'name': 'jlink', 'uid': self.serial})
+        self.assertIn(p.pid, [u['pid'] for u in users])
+        p.stdin.close()
+        p.wait(10)
+        self.assertNotIn(p.pid, [u['pid'] for u in hf.probe_users({'name': 'jlink', 'uid': self.serial})])
+
+    def test_an_ancestor_is_listed_for_holding_the_tty_never_for_naming_the_serial(self):
+        for hold in (False, True):
+            with self.subTest(hold=hold):
+                r = subprocess.run([sys.executable, '-c', CHAIN_PARENT, str(SCRIPTS / 'hil_flash.py'), self.serial,
+                                    str(int(hold)), CHECK_CHILD], capture_output=True, text=True, timeout=90)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                out = json.loads(r.stdout)
+                self.assertEqual(out['rc'], 0, out['err'])
+                pids = [u['pid'] for u in json.loads(out['out'])]
+                self.assertEqual(pids, [out['pid']] if hold else [])
 
 
 class ResetProblem(unittest.TestCase):

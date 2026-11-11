@@ -533,16 +533,50 @@ def _survey(root: int) -> dict:
     return {'processes': sorted(found, key=lambda p: p['pid']), 'unreadable': sorted(unreadable)}
 
 
-def _bounded(fn, bound: float, last: list | None = None):
+_bounded_start = threading.Lock()
+
+
+def _bounded(fn, bound: float, last: list | None = None, *, reraise: bool = False):
     # a /proc read can block (stat takes exec_update_lock, cmdline the mm's lock): fn() or None past `bound` s;
-    # `last` keeps the thread, so a caller can start no other while one is still blocked
-    out = []
-    t = threading.Thread(target=lambda: out.append(fn()), daemon=True)
-    if last is not None:
-        last[:] = [t]
-    t.start()
-    t.join(bound)
-    return out[0] if out else None
+    # `last` keeps the thread: until its fn has returned no other starts and None is returned at once. fn's
+    # exception is raised here with `reraise`, else it ends the thread (threading.excepthook) as None.
+    # The thread's own `finished` event, not is_alive(): CPython 3.12's Thread.join, interrupted, marks it stopped
+    out, finished = [], threading.Event()
+
+    def run():
+        try:
+            out.append((True, fn()))
+        except BaseException as e:
+            out.append((False, e))
+            if not reraise:
+                raise
+        finally:
+            finished.set()
+    t = threading.Thread(target=run, daemon=True)
+    t.finished = finished
+    hold = InterruptHold()      # an interrupt between recording t and its start would gate `last` forever
+    try:
+        with _bounded_start:
+            if last is not None:
+                if any(not x.finished.is_set() for x in last):
+                    return None
+                last[:] = [t]
+            try:
+                t.start()
+            except Exception:
+                finished.set()      # it never started: nothing for `last` to wait for
+                raise
+    finally:
+        hold.release()
+    finished.wait(bound)
+    if not out:
+        return None
+    ok, value = out[0]
+    if ok:
+        return value
+    if reraise:
+        raise value
+    return None
 
 
 def _bounded_survey(root: int) -> dict | None:
@@ -872,7 +906,7 @@ def _foreign_state(entry: dict) -> str:
         pass
     else:
         return recheck_dir(d, _KeepAll())[0]
-    if not isinstance(d, str) or any(t.is_alive() for t in _proc_scan):
+    if not isinstance(d, str):
         return 'pending'
     return 'unknown' if _bounded(lambda: _supervisors_in(d), PROC_SCAN_BOUND, _proc_scan) == [] else 'pending'
 

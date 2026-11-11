@@ -61,7 +61,8 @@ nothing in it through a link.
   follows a failed cleanup. A detached manual hold (`hil_lock.py hold`, a
   project's manual session) is the exception: it lasts until its holder
   releases it, and a failed cleanup under it is logged all the same. The
-  flock is the only refusal. A free flock is
+  flock is the only refusal to take the lock; admission to the hardware is
+  the busy check's (below). A free flock is
   always taken; what a task that ended without its cleanup left there (a
   record marked `cleanupOwed`, an unreadable record, an older helper's
   takeover journal) is first appended to the board's cleanup log as a failed
@@ -102,9 +103,37 @@ nothing in it through a link.
   mechanics. agentrc's Arduino engine rechecks the sessions an older engine
   left in its `arduino-hil` record, reports those not proven ended and clears
   the record once every one is, never refusing on it.
-- Taking the lock is no permission to touch the probe: an invocation claims
-  the board write-ahead in its consumer's record, so one killed at any point
-  is still named. Under the flock it took, or under the caller's hold:
+- Taking the lock is no permission to touch the probe. Every consumer, before
+  its first hardware operation, reports the open failures found at take and
+  checks for live processes using its probe or the board's devices: a busy
+  check refuses access and names the users, never kills them or recovers the
+  board, and an inconclusive check refuses rather than reporting the devices
+  idle. It is a snapshot: it misses a child that opens the hardware later and
+  does not serialize two commands under one hold, so commands sharing a
+  manual hold serialize through `hil_lock.session_mutex(<lock>)`, taken
+  before the hold is validated. The shared probe check is
+  `hil_flash.probe_users`, whose docstring has its coverage: a recognized
+  selector naming another probe excludes that process by its intended probe,
+  with no guarantee against discovery opens of other candidates, and any
+  STM32_Programmer_CLI counts as using an `stlink` flasher's probe. Each
+  consumer documents what its check covers. A task taking its own lock does
+  it through
+  `hil_lock.board_task(<lock>, busy=<check>)`, which runs the check under the
+  lock before the body and ends the lock on the body's cleanup verdict; its
+  docstring has the verdicts and their limits. A command under a hold it did not
+  take stays outside it: it never releases that hold and logs a failed
+  cleanup with `log_cleanup_failure`.
+- The minimum, lock, cleanup log and busy check, does not detect a leftover
+  child of a killed task that touches neither the probe nor the board's
+  devices. CI's job-end cleanup is best effort, never proof that such a child
+  ended; an earlier `.started` without a matching `.done` in a CI state dir
+  can refuse a rerun, but only on paths consulting that same dir.
+- Write-ahead claims are deprecated, never a prerequisite for taking or
+  using a board: every consumer moves to `board_task`, and the claim
+  primitives go once none uses them. Until it adopts `board_task`, agentrc's
+  Arduino engine still claims as follows. An invocation that claims records the board write-ahead in its
+  consumer's record, so one killed at any point is still named. Under the
+  flock it took, or under the caller's hold:
   1. `claim(claim_entry(<ops dir>, <cmd>))` before its first tool lists
      `{ops, pid, start}`, its run_tracked state dir resolved, and returns the
      others; of two racing claims the later lists the earlier. Each claim is
