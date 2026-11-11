@@ -160,6 +160,10 @@
       "name": "ch32v307v_r1_1v0",
       "flasher": {"name": "openocd", "vid_pid": "0x1a86 0x8010", "args": "-f target/wch-riscv.cfg"}
     },
+    "E9B38F066FBB": {
+      "name": "ch32v407_r0",
+      "flasher": {"name": "openocd", "vid_pid": "0x1a86 0x8010", "args": "-f target/wch-riscv.cfg"}
+    },
     "57468F06DC03": {
       "name": "ch582m_evt",
       "flasher": {"name": "openocd", "vid_pid": "0x1a86 0x8010", "args": "-f target/wch-riscv.cfg", "verify": false}
