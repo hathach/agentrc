@@ -35,9 +35,10 @@
       "flasher": {"name": "jlink", "args": "-device nrf52840_xxaa"},
       "flasher_recover": {"name": "openocd", "args": "-f interface/jlink.cfg -c \"transport select swd\" -c \"adapter speed 4000\" -f target/nrf52.cfg"}
     },
-    "E6614C311B597D32": {
+    "000063728732": {
       "name": "max32666fthr",
-      "flasher": {"name": "openocd", "vid_pid": "0x2e8a 0x000c", "args": "-f interface/cmsis-dap.cfg -f target/max32665.cfg", "verify": true}
+      "flasher": {"name": "jlink", "args": "-device MAX32665"},
+      "flasher_recover": {"name": "openocd", "args": "-f interface/jlink.cfg -c \"transport select swd\" -c \"adapter speed 4000\" -f target/max32665.cfg"}
     },
     "000063728691": {
       "name": "metro_m4_express",
@@ -157,6 +158,10 @@
     },
     "BC5DA47360D0": {
       "name": "ch32v307v_r1_1v0",
+      "flasher": {"name": "openocd", "vid_pid": "0x1a86 0x8010", "args": "-f target/wch-riscv.cfg"}
+    },
+    "E9B38F066FBB": {
+      "name": "ch32v407_r0",
       "flasher": {"name": "openocd", "vid_pid": "0x1a86 0x8010", "args": "-f target/wch-riscv.cfg"}
     },
     "57468F06DC03": {
