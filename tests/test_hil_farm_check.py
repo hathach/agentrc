@@ -26,7 +26,7 @@ import types
 from pathlib import Path
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import guard_survivors, latest_failure, tmpdir, umask  # noqa: E402
+from helpers import guard_survivors, interrupt_first_exit, latest_failure, tmpdir, umask  # noqa: E402
 
 SCRIPTS = Path(__file__).resolve().parents[1] / 'skills' / 'hil' / 'scripts'
 
@@ -356,7 +356,7 @@ class Engine(unittest.TestCase):
         doc = self.doc(row)
         self.assertEqual((row['status'], self.ran, row['cleanup'], doc['rows'][0]['coverage'], eng.exit_status(doc)),
                          ('locked', [], None, 'skipped-locked', 0))
-        self.assertEqual(row['note'][-1], 'probe in use: pid 42 (openocd -c adapter serial P)')
+        self.assertEqual(row['note'][-1], 'board busy: b in use by pid 42 (openocd -c adapter serial P)')
         self.assertEqual(row['previousCleanupFailure']['how'], 'found-left', 'its take found it: still reported')
         self.assertEqual([e['how'] for e in lk.cleanup_events('b')], ['found-left'], 'the refusal logged nothing')
         self.take()
@@ -484,17 +484,24 @@ class Engine(unittest.TestCase):
         self.assertEqual(latest_failure(lk, 'b')['detail'][:30], 'farm check cleanup unresolved:')
         self.take()
 
-    def interrupt_at_exit(self):
-        """The board task's first __exit__ interrupted as it is entered, before it runs (BoardTask's limit)."""
-        real, calls = lk.BoardTask.__exit__, []
+    def pending_reset(self, retained=None):
+        """A reset whose run stays pending, and a session its provider retained when `retained` names one."""
+        self.outcomes[RESET] = (0, 'pending', '')
+        self.rechecks[RESET] = 'pending'
+        self.p.reset = StubProfile.reset.__get__(self.p)
+        if retained:
+            self.retain_after_reset(retained)
 
-        def exit_(task, *a):
-            calls.append(task.ended)
-            if len(calls) == 1:
-                raise KeyboardInterrupt
-            return real(task, *a)
-        patch(self, lk.BoardTask, '__exit__', exit_)
-        return calls
+    def assert_pending_logged(self, row, retained=None):
+        """The interrupted row is blocked and released, and its logged failure keeps the pending reset's receipt and
+        any retained session open."""
+        receipt = {'token': RESET, 'lock': '/nonexistent'}
+        self.assertEqual((row['status'], row['interrupted'], row['cleanup']['receipts'], row['cleanup']['released']),
+                         ('blocked', True, [receipt], True))
+        f = latest_failure(lk, 'b')
+        self.assertEqual((f['receipts'], f.get('retained')), ([receipt], retained or []))
+        self.assertRegex(lk.resolve_restored('b', [f], evidence='a later restore')[0], f'{f["id"]} stays open')
+        self.take()
 
     def test_a_reset_that_exits_the_process_still_finalizes(self):
         def reset(ctx, board):
@@ -506,7 +513,7 @@ class Engine(unittest.TestCase):
         self.take()
 
     def test_an_interrupt_at_the_tasks_exit_exits_it_again_with_its_verdict(self):
-        calls = self.interrupt_at_exit()
+        calls = interrupt_first_exit(self, lk.BoardTask)
         row = self.check()
         self.assertEqual(calls, [False, False], 'exited once more, as it had not ended')
         self.assertEqual((row['status'], row['interrupted'], row['cleanup']['result'], row['cleanup']['released']),
@@ -535,18 +542,9 @@ class Engine(unittest.TestCase):
         self.take()
 
     def test_an_interrupt_before_the_verdict_keeps_a_pending_resets_receipt_and_retained_session(self):
-        self.outcomes[RESET] = (0, 'pending', '')
-        self.rechecks[RESET] = 'pending'
-        self.retain_after_reset(['/s/r1.json'])
+        self.pending_reset(retained=['/s/r1.json'])
         self.interrupt_before_the_verdict()
-        row = self.check()
-        receipt = {'token': RESET, 'lock': '/nonexistent'}
-        self.assertEqual((row['status'], row['interrupted'], row['cleanup']['receipts'], row['cleanup']['released']),
-                         ('blocked', True, [receipt], True))
-        f = latest_failure(lk, 'b')
-        self.assertEqual((f['receipts'], f['retained']), ([receipt], ['/s/r1.json']))
-        self.assertRegex(lk.resolve_restored('b', [f], evidence='a later restore')[0], f'{f["id"]} stays open')
-        self.take()
+        self.assert_pending_logged(self.check(), retained=['/s/r1.json'])
 
     def signal_at(self, where):
         """A real SIGINT delivered once, where the body's finally first calls _verdict (`call-site`, the line in
@@ -578,21 +576,12 @@ class Engine(unittest.TestCase):
     def test_a_signal_as_the_verdict_is_first_collected_still_logs_the_ledgers_evidence(self):
         for where in ('call-site', 'entry'):
             with self.subTest(where=where):
-                self.outcomes[RESET] = (0, 'pending', '')
-                self.rechecks[RESET] = 'pending'
-                self.p.reset = StubProfile.reset.__get__(self.p)
-                self.retain_after_reset(['/s/r1.json'])
+                self.pending_reset(retained=['/s/r1.json'])
                 fired = self.signal_at(where)
                 row = self.check()
                 sys.settrace(None)
-                receipt = {'token': RESET, 'lock': '/nonexistent'}
                 self.assertEqual(fired, [where])
-                self.assertEqual((row['status'], row['interrupted'], row['cleanup']['receipts'],
-                                  row['cleanup']['released']), ('blocked', True, [receipt], True))
-                f = latest_failure(lk, 'b')
-                self.assertEqual((f['receipts'], f['retained']), ([receipt], ['/s/r1.json']))
-                self.assertRegex(lk.resolve_restored('b', [f], evidence='a later restore')[0], f'{f["id"]} stays open')
-                self.take()
+                self.assert_pending_logged(row, retained=['/s/r1.json'])
 
     def test_a_recheck_that_raises_keeps_the_receipts_and_retained_sessions(self):
         self.outcomes[RESET] = (0, 'pending', 'ok')
@@ -608,15 +597,9 @@ class Engine(unittest.TestCase):
         self.take()
 
     def test_an_interrupt_at_the_tasks_exit_keeps_a_pending_resets_receipt(self):
-        self.outcomes[RESET] = (0, 'pending', '')
-        self.rechecks[RESET] = 'pending'
-        self.interrupt_at_exit()
-        row = self.check()
-        receipt = {'token': RESET, 'lock': '/nonexistent'}
-        self.assertEqual((row['status'], row['interrupted'], row['cleanup']['receipts'], row['cleanup']['released']),
-                         ('blocked', True, [receipt], True))
-        self.assertEqual(latest_failure(lk, 'b')['receipts'], [receipt])
-        self.take()
+        self.pending_reset()
+        interrupt_first_exit(self, lk.BoardTask)
+        self.assert_pending_logged(self.check())
 
     def test_a_record_that_cannot_be_cleared_is_released_and_logged(self):
         real = lk.take_board_lock

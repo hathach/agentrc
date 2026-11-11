@@ -368,6 +368,22 @@ def taken_failure(fh):
     return fh.cleanup_failures[-1] if fh.cleanup_failures else None
 
 
+def interrupt_first_exit(case, task_class):
+    """task_class.__exit__ patched for the test so that its first call raises KeyboardInterrupt before it runs, as a
+    signal landing as it is entered does (hil_lock.BoardTask's limit); returns the `ended` each call found."""
+    real, calls = task_class.__exit__, []
+
+    def exit_(task, *exc):
+        calls.append(task.ended)
+        if len(calls) == 1:
+            raise KeyboardInterrupt
+        return real(task, *exc)
+    p = mock.patch.object(task_class, '__exit__', exit_)
+    p.start()
+    case.addCleanup(p.stop)
+    return calls
+
+
 def kill_quietly(pid, sig=signal.SIGTERM):
     with contextlib.suppress(ProcessLookupError):
         os.kill(pid, sig)

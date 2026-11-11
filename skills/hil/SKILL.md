@@ -128,7 +128,6 @@ nothing in it through a link.
   devices. CI's job-end cleanup is best effort, never proof that such a child
   ended; an earlier `.started` without a matching `.done` in a CI state dir
   can refuse a rerun, but only on paths consulting that same dir.
-- Write-ahead claims were removed; every task on one board uses `board_task`.
 - A rig-wide operation, one that can reset or renumber a board you do not
   hold (a hub's power, a root-port cycle, a controller rebind), holds every
   board on the host first, across every project's roster there; a contract's

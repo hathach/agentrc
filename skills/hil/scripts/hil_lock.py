@@ -780,13 +780,20 @@ def acquire_board_lock(board_name, reason=CI_REASON, **kw):
 TASK_POLL = 0.25    # s between takes while a board task waits out contention
 
 
+def users_text(users) -> str:
+    """What a busy check named, on one line: `pid N (cmd)` for hil_flash.probe_users' entries,
+    str() of any other."""
+    return ', '.join(f'pid {u["pid"]} ({u.get("cmd", "")})' if isinstance(u, dict) and 'pid' in u else str(u)
+                     for u in users)
+
+
 class BoardBusy(BoardLocked):
     """The task's busy check named live users of the board's probe or devices: its lock, taken
     for the check, is released again without a failure event. `users` are what the check named,
     `cleanup_failures` the take's open failures, for the caller's report."""
 
     def __init__(self, board, users, cleanup_failures):
-        super().__init__(f'board busy: {board} in use by {", ".join(map(str, users)):.500}')
+        super().__init__(f'board busy: {board} in use by {users_text(users):.500}')
         self.board, self.users, self.cleanup_failures = board, users, cleanup_failures
 
 

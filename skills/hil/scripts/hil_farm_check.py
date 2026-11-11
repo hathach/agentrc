@@ -297,7 +297,7 @@ def check_board(profile, board: dict, args, state_dir) -> dict:
                 if interrupted is not None:
                     raise interrupted
     except hil_lock.BoardBusy as e:
-        return _refused(row, task, 'locked', f'probe in use: {", ".join(map(_user_text, e.users))}'[:300])
+        return _refused(row, task, 'locked', str(e))
     except hil_lock.RecoveryBlocked as e:
         return _refused(row, task, 'blocked', str(e))
     except hil_lock.BoardLocked as e:
@@ -319,10 +319,6 @@ def check_board(profile, board: dict, args, state_dir) -> dict:
         row['note'].append(f'internal error: {e!r}'[:120])
     _end_row(row, task, ctx)
     return row
-
-
-def _user_text(user) -> str:
-    return f'pid {user["pid"]} ({user.get("cmd", "")})' if isinstance(user, dict) and 'pid' in user else str(user)
 
 
 def _previous_failure(row: dict, failures: list) -> None:

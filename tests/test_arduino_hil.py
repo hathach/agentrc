@@ -13,6 +13,7 @@ if os.name == 'nt':
 import argparse
 import contextlib
 import hashlib
+import inspect
 import io
 import json
 import re
@@ -26,8 +27,8 @@ import types
 from pathlib import Path
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import (guard_survivors, kill_quietly, load_arduino_engine, load_arduino_fixture, pid_alive,  # noqa: E402
-                     tmpdir)
+from helpers import (guard_survivors, interrupt_first_exit, kill_quietly, load_arduino_engine,  # noqa: E402
+                     load_arduino_fixture, pid_alive, tmpdir)
 
 H = load_arduino_engine('skills/arduino/scripts/arduino_hil.py')
 REAL = H.A   # agentrc's own modules, before a test stubs them
@@ -50,8 +51,8 @@ class FakeTask:
     def __init__(self, lock, board, reason, busy, fields):
         self.lock, self.board, self.reason, self.busy, self.fields = lock, board, reason, busy, fields
         self.cleanup_failures, self.errors, self.restore_notes = [], [], []
-        self.taken = self.released = self.ended = self.ended_cleanly = False
-        self.failure_logged, self.verdict, self.fh = None, None, None
+        self.released = self.ended = self.ended_cleanly = False
+        self.verdict = self.fh = None
 
     def __enter__(self):
         try:
@@ -59,7 +60,7 @@ class FakeTask:
         except BaseException:   # nothing taken: a clean end
             self.ended = self.ended_cleanly = True
             raise
-        self.taken, self.cleanup_failures = True, list(self.fh.cleanup_failures)
+        self.cleanup_failures = list(self.fh.cleanup_failures)
         try:
             users = self.busy()
             if users:
@@ -96,7 +97,6 @@ class FakeTask:
             errors = self.lock.end_failed({self.board: self.fh}, self.reason, detail=v[1], receipts=v[2]).get(
                 self.board, [])
             self.errors.extend(errors)
-            self.failure_logged = not errors
             self.end(lambda: None, not errors)
         else:
             if v[0] == 'restored':
@@ -117,7 +117,7 @@ class FakeLock:
 
     class BoardBusy(BoardLocked):
         def __init__(self, board, users, cleanup_failures):
-            super().__init__(f'board busy: {board} in use by {users}')
+            super().__init__(f'board busy: {board} in use by {REAL.lock.users_text(users)}')
             self.users, self.cleanup_failures = users, cleanup_failures
 
     class LockUnavailable(Exception):
@@ -132,7 +132,7 @@ class FakeLock:
     def __init__(self):
         self.taken, self.released, self.ended, self.logged, self.restored = [], [], [], [], []
         self.records, self.pending, self.failures, self.end_errors = {}, {}, {}, {}
-        self.verdicts, self.tasks, self.sessions = [], [], []   # sessions: the boards whose session mutex is held
+        self.verdicts, self.sessions = [], []   # sessions: the boards whose session mutex is held
         self.uncleared = False   # a task's record is not cleared: it does not end cleanly
         lock = self
 
@@ -147,9 +147,10 @@ class FakeLock:
                 lock.pending.pop(self.key, None)
         self.PendingSessions = PendingSessions
 
-    def board_task(self, board, reason='hil_test.py', *, busy, wait=0, **fields):
-        self.tasks.append(FakeTask(self, board, reason, busy, fields))
-        return self.tasks[-1]
+    users_text = staticmethod(REAL.lock.users_text)
+
+    def board_task(self, board, reason='hil_test.py', *, busy, **fields):
+        return FakeTask(self, board, reason, busy, fields)
 
     @contextlib.contextmanager
     def session_mutex(self, lock):
@@ -1327,25 +1328,6 @@ class Battery(Base):
             self.run_board()
         self.assertEqual(self.lock.verdicts, ['clean'])
 
-    def test_a_busy_probe_refuses_the_run_before_anything_and_logs_nothing(self):
-        users = [{'pid': 7, 'cmd': 'JLinkExe -USB 123'}]
-        self.A.flash.probe_users.return_value = users
-        self.lock.failures['rig_jlink'] = [{'id': 'f1', 'receipts': []}]
-        row = self.run_board(admit=mock.Mock(side_effect=AssertionError('admitted')))
-        self.assertEqual((row['locked'], H.verdict(row), row['probeUsers'], row['cleanup']['state']),
-                         (True, 'not-run', users, 'untouched'))
-        self.assertEqual(row['detail'], 'probe in use: pid 7 (JLinkExe -USB 123)')
-        self.assertEqual(row['previousCleanupFailure']['id'], 'f1')
-        self.assertEqual((self.lock.verdicts, len(self.lock.released), self.lock.ended), (['refused'], 1, []))
-        self.A.flash.probe_users.assert_called_once_with(self.board('rig_jlink')['flasher'])
-
-    def test_an_inconclusive_probe_check_refuses_the_run(self):
-        self.A.flash.probe_users.side_effect = RuntimeError('pid 9: cannot read its command line')
-        row = self.run_board(admit=mock.Mock(side_effect=AssertionError('admitted')))
-        self.assertEqual((row['locked'], H.verdict(row)), (False, 'not-run'))
-        self.assertEqual(row['detail'], 'refused: probe check: pid 9: cannot read its command line')
-        self.assertEqual((self.lock.verdicts, self.lock.ended), (['refused'], []))
-
     def test_a_lock_that_did_not_end_as_its_verdict_said_is_a_blocker(self):
         def unlogged(handles, reason, **kw):
             return {'rig_jlink': ['cleanup log not written: disk full']}
@@ -1360,19 +1342,6 @@ class Battery(Base):
         row = self.run_board(step=step)
         self.assertTrue(row['interrupted'])
         self.assertEqual((row['cleanup']['released'], len(self.lock.ended)), (True, 1))
-
-    def test_an_interrupt_as_the_tasks_exit_is_entered_exits_it_again_and_keeps_the_row(self):
-        real, calls = FakeTask.__exit__, []
-
-        def exit_(task, *exc):
-            calls.append(task.ended)
-            if len(calls) == 1:
-                raise KeyboardInterrupt   # before that __exit__ ran (BoardTask's limit)
-            return real(task, *exc)
-        with mock.patch.object(FakeTask, '__exit__', exit_):
-            row = self.run_board()
-        self.assertEqual((calls, row['interrupted'], self.lock.verdicts, row['cleanup']['released']),
-                         ([False, False], True, ['restored'], True))
 
     def test_absent_probe_is_not_run_before_the_lock(self):
         row = self.run_board(probe='probe 1 is not on this host\'s bus')
@@ -1495,14 +1464,16 @@ class Manual(Base):
     def test_a_busy_probe_refuses_a_session_command_before_its_tool(self):
         self.lock.records['rig_jlink'] = {'reason': 'mine', 'pid': 1}
         self.lock.failures['rig_jlink'] = [{'id': 'f1', 'receipts': []}]
-        for outcome, why in (({'return_value': [{'pid': 7, 'cmd': 'openocd'}]}, 'probe in use: pid 7 (openocd)'),
-                             ({'side_effect': RuntimeError('/proc hides other users')}, 'probe check: RuntimeError')):
+        for outcome, why in (({'return_value': [{'pid': 7, 'cmd': 'openocd'}]},
+                              'board busy: rig_jlink in use by pid 7 (openocd)'),
+                             ({'side_effect': RuntimeError('/proc hides other users')},
+                              'rig_jlink: probe check: RuntimeError')):
             with self.subTest(why=why):
                 self.A.flash.probe_users.configure_mock(**outcome)
                 code, out = self.main(['exec', '-b', 'rig_jlink', '--under-hold', 'mine', str(self.roster), '--',
                                        'true'])
                 self.assertEqual(code, 2)
-                self.assertIn(f'rig_jlink: {why}', out['error'])
+                self.assertIn(why, out['error'])
                 self.assertFalse(self.A.process.run_tracked.called)
                 self.assertEqual((self.lock.logged, self.lock.taken, self.lock.sessions), ([], [], []))
         args = self.held(cmd='restore', release=False, report=None, build_record='r.json')
@@ -1992,11 +1963,12 @@ class Commission(Base):
 
     def test_a_busy_or_unjudged_probe_refuses_commissioning_before_hardware(self):
         flash = mock.Mock(side_effect=AssertionError('flashed'))
-        for outcome, why in (({'return_value': [{'pid': 7, 'cmd': 'JLinkExe'}]}, 'probe in use: pid 7 (JLinkExe)'),
-                             ({'side_effect': RuntimeError('fds unreadable')}, 'probe check: RuntimeError')):
+        for outcome, why in (({'return_value': [{'pid': 7, 'cmd': 'JLinkExe'}]},
+                              'board busy: rig_jlink in use by pid 7 (JLinkExe)'),
+                             ({'side_effect': RuntimeError('fds unreadable')}, 'rig_jlink: probe check: RuntimeError')):
             with self.subTest(why=why):
                 self.A.flash.probe_users.configure_mock(**outcome)
-                with self.assertRaisesRegex(H.Refused, f'rig_jlink: {re.escape(why)}'):
+                with self.assertRaisesRegex(H.Refused, re.escape(why)):
                     self.commission('rig_jlink', {'vidPid': '1234:5678'}, flash=flash)
         self.assertEqual((self.lock.verdicts, len(self.lock.released), self.lock.ended), (['refused'] * 2, 2, []))
 
@@ -2016,7 +1988,7 @@ class Commission(Base):
                     side_effect=RuntimeError('fds unreadable') if name == 'inconclusive' else None)
                 code, out, _ = self.commission('rig_jlink', {'vidPid': '1234:5678'}, flash=flash, **patches)
                 self.assertEqual((code, out['lock']), (4, 'rig_jlink: fake lock'))
-                self.assertIn({'busy': 'probe in use', 'inconclusive': 'probe check', 'stale record': 'stale'}[name],
+                self.assertIn({'busy': 'board busy', 'inconclusive': 'probe check', 'stale record': 'stale'}[name],
                               out['error'])
                 results = sorted(self.root.glob('build/hil-manual/commission-rig_jlink-*/result.json'))
                 self.assertEqual(json.loads(results[-1].read_text()), out)
@@ -2056,12 +2028,13 @@ class BoardTaskOnTheRealLock(Base):
         self.patch(self.A, 'lock', REAL.lock)
         self.patch(self.A, 'process', REAL.process)
 
-    def run_board(self, restore=None, admit=None):
+    def run_board(self, restore=None, admit=None, step=None):
         rec = ({'source': {'head': 'abc'}, 'fqbn': 'f', 'platform': {}, 'sketches': {}},
                {'echo': {'sha256': {}, 'fqbn': 'f'}})
         with mock.patch.object(H, 'probe_present', return_value=''), \
                 mock.patch.object(H, 'admit', admit or mock.Mock(return_value=rec)), \
-                mock.patch.object(H, 'step', return_value={'test': 'echo', 'pass': True, 'detail': 'ok'}), \
+                mock.patch.object(H, 'step', step or mock.Mock(return_value={'test': 'echo', 'pass': True,
+                                                                            'detail': 'ok'})), \
                 mock.patch.object(H, 'restore', restore or mock.Mock(return_value={'pass': True,
                                                                                     'state': 'echo restored',
                                                                                     'evidence': 'ok'})):
@@ -2075,10 +2048,15 @@ class BoardTaskOnTheRealLock(Base):
     def test_a_busy_probe_refuses_with_nothing_logged_and_the_board_released(self):
         users = [{'pid': 7, 'cmd': 'JLinkExe -USB 123'}]
         self.A.flash.probe_users.return_value = users
+        earlier = REAL.lock.log_cleanup_failure('rig_jlink', 'earlier', detail='restore failed')
         row = self.run_board(admit=mock.Mock(side_effect=AssertionError('admitted')))
         self.assertEqual((row['locked'], H.verdict(row), row['probeUsers'], row['cleanup']['released']),
                          (True, 'not-run', users, True))    # its lock, taken for the check, released again
-        self.assertEqual(REAL.lock.cleanup_events('rig_jlink'), [])
+        self.assertEqual((row['detail'], row['cleanup']['state']),
+                         ('board busy: rig_jlink in use by pid 7 (JLinkExe -USB 123)', 'untouched'))
+        self.assertEqual(row['previousCleanupFailure']['id'], earlier['id'])
+        self.assertEqual([e['id'] for e in REAL.lock.cleanup_events('rig_jlink')], [earlier['id']])
+        self.A.flash.probe_users.assert_called_once_with(self.board('rig_jlink')['flasher'])
         self.assert_released()
 
     def test_an_inconclusive_probe_check_refuses_with_nothing_logged(self):
@@ -2118,20 +2096,89 @@ class BoardTaskOnTheRealLock(Base):
             code = H.cmd_commission(args)
         out = json.loads(out.getvalue().splitlines()[-1])
         self.assertEqual(code, 4)
-        self.assertIn('probe in use: pid 7 (JLinkExe -USB 123)', out['error'])
+        self.assertEqual(out['error'], 'board busy: rig_jlink in use by pid 7 (JLinkExe -USB 123)')
         self.assertIn('rig_jlink: lock released', out['lock'])
         self.assertIn('record not cleared', out['lock'])
 
-    def test_an_interrupt_as_the_tasks_exit_is_entered_exits_it_again(self):
-        real, calls = REAL.lock.BoardTask.__exit__, []
+    def test_a_signal_as_the_verdict_is_first_collected_still_logs_the_pending_receipt(self):
+        """A real SIGINT at battery's verdict, before its interrupt hold is in place: the verdict still carries the
+        child not proven ended."""
+        fired = self.signal_before_the_verdict(H.battery)
 
-        def exit_(task, *exc):
-            calls.append(task.ended)
-            if len(calls) == 1:
-                raise KeyboardInterrupt
-            return real(task, *exc)
-        with mock.patch.object(REAL.lock.BoardTask, '__exit__', exit_):
-            row = self.run_board()
+        def step(*a):
+            a[-1].pending.append({'receipt': {'unrecheckable': ['JLinkExe'], 'at': 1.0}})
+            raise H.Unclean('JLinkExe: cleanup unknown')
+        row = self.run_board(step=step)
+        sys.settrace(None)
+        self.assertEqual((fired, row['interrupted'], H.verdict(row), row['cleanup']['released']),
+                         ([1], True, 'blocker', True))
+        failure = REAL.lock.open_cleanup_failures('rig_jlink')[-1]
+        self.assertEqual((failure['detail'], failure['receipts']),
+                         ('JLinkExe: cleanup unknown; then KeyboardInterrupt', [{'unrecheckable': ['JLinkExe'],
+                                                                                'at': 1.0}]))
+        self.assertEqual(row['cleanup']['pending'], [{'receipt': failure['receipts'][0]}])
+        self.assert_released()
+
+    def signal_before_the_verdict(self, fn):
+        """A real SIGINT, once, at fn's `hold = A.process.InterruptHold()` line: before the hold its verdict is given
+        under is in place. Returns what fired; the tracer goes at cleanup."""
+        prev = signal.signal(signal.SIGINT, signal.default_int_handler)
+        self.addCleanup(signal.signal, signal.SIGINT, prev)
+        lines, first = inspect.getsourcelines(fn)
+        site = first + next(i for i, line in enumerate(lines) if 'hold = A.process.InterruptHold()' in line)
+        fired = []
+
+        def local(frame, event, arg):
+            if not fired and event == 'line' and frame.f_lineno == site:
+                fired.append(1)
+                signal.raise_signal(signal.SIGINT)
+            return local
+        prev_trace = sys.gettrace()
+        sys.settrace(lambda frame, event, arg: local if frame.f_code is fn.__code__ else None)
+        self.addCleanup(sys.settrace, prev_trace)
+        return fired
+
+    def commission(self, detach):
+        """cmd_commission on rig_jlink, its DUT re-enumerating at each flash and reset; the interrupt propagates."""
+        ino = [0]
+
+        def bump(*a):
+            ino[0] += 1
+            return ''
+        args = argparse.Namespace(board='rig_jlink', roster=str(self.roster), record_dir=str(self.dir))
+        with mock.patch.object(H, 'admit', return_value=({}, {'echo': {'vidPid': '1234:5678'}})), \
+                mock.patch.object(H, 'detach', detach), mock.patch.object(H, 'flash', bump), \
+                mock.patch.object(H, 'reset', bump), mock.patch.object(H.time, 'sleep'), \
+                mock.patch.object(H, 'scan', lambda *a: [{'serial': 'JUID', 'ino': ino[0]}]), \
+                contextlib.redirect_stdout(io.StringIO()), self.assertRaises(KeyboardInterrupt):
+            H.cmd_commission(args)
+        sys.settrace(None)
+
+    def test_a_signal_before_a_failed_commissions_verdict_still_logs_its_pending_child(self):
+        def detach(*a):
+            a[-1]._note('unknown', None, ['JLinkExe'])
+            a[-1].check()
+        fired = self.signal_before_the_verdict(H.commission)
+        self.commission(detach)
+        failure = REAL.lock.open_cleanup_failures('rig_jlink')[-1]
+        self.assertEqual((fired, failure['detail'][:39], [r['unrecheckable'] for r in failure['receipts']]),
+                         ([1], 'Unclean: JLinkExe: cleanup unknown; the', [['JLinkExe']]))
+        self.assertRegex(REAL.lock.resolve_restored('rig_jlink', [failure], evidence='restored')[0], 'stays open')
+        self.assert_released()
+
+    def test_a_signal_before_a_passing_commissions_verdict_still_restores(self):
+        earlier = REAL.lock.log_cleanup_failure('rig_jlink', 'earlier', detail='restore failed')
+        fired = self.signal_before_the_verdict(H.commission)
+        self.commission(mock.Mock())
+        self.assertEqual(fired, [1])
+        self.assertEqual([e['id'] for e in REAL.lock.cleanup_events('rig_jlink') if e['event'] == 'failed'],
+                         [earlier['id']], 'no failure logged for it')
+        self.assertEqual(REAL.lock.open_cleanup_failures('rig_jlink'), [])
+        self.assert_released()
+
+    def test_an_interrupt_as_the_tasks_exit_is_entered_exits_it_again(self):
+        calls = interrupt_first_exit(self, REAL.lock.BoardTask)
+        row = self.run_board()
         self.assertEqual((calls, row['interrupted'], row['cleanup']['released'], H.verdict(row)),
                          ([False, False], True, True, 'pass'))
         self.assertEqual(REAL.lock.cleanup_events('rig_jlink'), [], 'its restored verdict stood')
