@@ -1003,6 +1003,20 @@ class AddOne(unittest.TestCase):
                                             '--title', 't', '--url', self.URL])
             self.assertEqual(doc.language, language, doc_id)
 
+    def test_a_specification_is_filed_as_one(self):
+        ap = sync.doc_parser('sync.py add', '')
+        ap.add_argument('--revision')
+        _, doc, _ = sync.parse_doc(ap, ['--vendor', 'usbif', '--author', 'USB Implementers Forum',
+                                        '--id', 'UAC1-Formats', '--id-not-printed',
+                                        '--type', 'specification', '--revision', '1.0',
+                                        '--title', 'USB Device Class Definition for Audio Data Formats',
+                                        '--url', self.URL])
+        self.assertEqual(doc.tags(), ['specification', 'usbif'])
+        self.assertEqual(doc.calibre_title(), 'USB Device Class Definition for Audio Data Formats '
+                                              '— Specification (UAC1-Formats) Rev 1.0')
+        doc.title = 'Universal Serial Bus Specification'
+        self.assertEqual(doc.calibre_title(), 'Universal Serial Bus Specification (UAC1-Formats) Rev 1.0')
+
 
 def setattr_all(saved):
     vendor_ti.http_get, vendor_ti.last_modified, vendor_ti._parts_from_bsp = saved

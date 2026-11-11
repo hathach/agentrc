@@ -367,7 +367,7 @@ TECHNICAL_TYPES = {"datasheet", "errata", "reference-manual", "user-manual",
 VENDOR_TYPE = {"errata": "Errata Sheet", "datasheet": "Datasheet",
                "reference-manual": "Reference Manual", "user-manual": "User Manual",
                "programming-manual": "Programming Manual",
-               "application-note": "Application Note"}
+               "application-note": "Application Note", "specification": "Specification"}
 
 
 @dataclass
