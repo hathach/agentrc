@@ -23,13 +23,14 @@ spec = importlib.util.spec_from_file_location('probe_under_test', SKILL / 'scrip
 probe = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(probe)
 
-# Each stub logs its argv to log.jsonl and answers from state.json, which a test edits between calls.
+# Each stub logs its argv to log.jsonl and answers from state.json, which a test edits between calls. setUp prepends
+# NAME and HERE: on Windows the stub is a launcher whose __file__ and argv[0] name the .exe, not bin/ and the tool.
 STUB = '''
 import json, sys
 from pathlib import Path
-here = Path(__file__).resolve().parent
+here = Path(HERE)
 with open(here / 'log.jsonl', 'a') as f:
-    f.write(json.dumps([Path(sys.argv[0]).name, *sys.argv[1:]]) + '\\n')
+    f.write(json.dumps([NAME, *sys.argv[1:]]) + '\\n')
 state = json.loads((here / 'state.json').read_text())
 args = sys.argv[1:]
 '''
@@ -98,7 +99,7 @@ class ProbeTest(unittest.TestCase):
         self.bin = self.tmp / 'bin'
         self.bin.mkdir()
         for name, source in (('wlink-iap', WLINK_IAP), ('wlink', WLINK), ('wchisp', WCHISP)):
-            make_stub(self.bin, name, source)
+            make_stub(self.bin, name, f'NAME, HERE = {name!r}, {str(self.bin)!r}\n{source}')
         self.sysfs = self.tmp / 'sysfs'
         self.sysfs.mkdir()
         self.dev_usb = self.tmp / 'dev-bus-usb'
