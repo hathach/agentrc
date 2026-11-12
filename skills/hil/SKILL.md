@@ -118,9 +118,12 @@ nothing in it through a link.
   STM32_Programmer_CLI counts as using an `stlink` flasher's probe. Each
   consumer documents what its check covers. A task taking its own lock does
   it through
-  `hil_lock.board_task(<lock>, busy=<check>)`, which runs the check under the
-  lock before the body and ends the lock on the body's cleanup verdict; its
-  docstring has the verdicts and their limits. A command under a hold it did not
+  `hil_lock.board_task(<lock>, busy=<check>, verdict=<collector>)`, which
+  runs the check under the lock before the body and ends the lock on the
+  cleanup verdict, given by the body or, at the end, by the collector from
+  the consumer's ledger under the task's own interrupt hold. A worker whose
+  `__exit__` an interrupt cut short calls `finish(e)`, and its report takes
+  `report()`; the docstring has the verdicts and their limits. A command under a hold it did not
   take stays outside it: it never releases that hold and logs a failed
   cleanup with `log_cleanup_failure`.
 - The minimum, lock, cleanup log and busy check, does not detect a leftover

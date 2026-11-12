@@ -2034,7 +2034,7 @@ try:
 except KeyboardInterrupt:
     print('interrupted', task._state, flush=True)
 if sys.stdin.readline().strip() == 'exit':
-    task.__exit__(None, None, None)
+    task.finish()
     print('ended', task._state, task.released, flush=True)
 sys.stdin.read()
 '''
@@ -2716,6 +2716,260 @@ class BoardTasks(LockDir):
         self.assertEqual(hil_lock.open_cleanup_failures(BOARD), [])
         self.assertEqual(task.restore_notes, [])
         self.assert_handlers(*handlers)
+
+    def test_the_collector_gives_the_verdict_once_under_the_hold(self):
+        handlers = self.signals()
+        hil_lock.log_cleanup_failure(BOARD, 'earlier', detail='resolvable')
+        cases = (('clean', lambda t: t.clean(), 0),
+                 ('restored', lambda t: t.restored(evidence='restored'), 0),
+                 ('failed', lambda t: t.failed(detail='restore failed', receipts=[{'token': 'r'}]), 1))
+        events = 1
+        for what, give, logged in cases:
+            with self.subTest(what):
+                calls = []
+
+                def collect(task, exc, give=give):
+                    calls.append((task, exc, signal.getsignal(signal.SIGINT) is handlers[0]))
+                    give(task)
+                task = self.task(verdict=collect)
+                with task:
+                    pass
+                events += logged
+                self.assertEqual(calls, [(task, None, False)])     # a hold's handler, not the runner's
+                self.assert_released(task, events=events)
+                self.assertTrue(task.ended_cleanly)
+        self.assertEqual(hil_lock.open_cleanup_failures(BOARD)[-1]['detail'], 'restore failed')
+        self.assert_handlers(*handlers)
+
+    def test_a_signal_in_the_collector_is_deferred_until_the_task_ended(self):
+        handlers = self.signals()
+
+        def collect(task, exc):
+            signal.raise_signal(signal.SIGINT)
+            task.failed(detail='restore failed', receipts=[{'token': 'r'}])
+        task = self.task(verdict=collect)
+        with self.assertRaises(KeyboardInterrupt):
+            with task:
+                pass
+        self.assert_released(task, events=1)
+        self.assertEqual(latest_failure(hil_lock, BOARD)['receipts'], [{'token': 'r'}])
+        self.assertTrue(task.ended_cleanly)
+        self.assert_handlers(*handlers)
+
+    def test_a_body_verdict_stands_and_a_refusal_never_collects(self):
+        collect = mock.Mock()
+        with self.task(verdict=collect) as task:
+            task.clean()
+        collect.assert_not_called()
+        self.assert_released(task)
+        with self.assertRaises(hil_lock.BoardBusy):
+            with self.task(lambda: [{'pid': 7, 'cmd': 'JLinkExe'}], verdict=collect):
+                pass
+        collect.assert_not_called()
+        with self.assertRaises(TypeError):
+            self.task(verdict='clean')
+
+    def test_the_collector_sees_the_body_exception_and_never_suppresses_it(self):
+        boom, seen = ValueError('boom'), []
+
+        def collect(task, exc):
+            seen.append(exc)
+            task.clean()
+        with self.assertRaises(ValueError) as cm:
+            with self.task(verdict=collect):
+                raise boom
+        self.assertIs(cm.exception, boom)
+        self.assertEqual(seen, [boom])
+
+    def test_a_collector_failure_ends_failed_and_never_cleanly(self):
+        def raises(task):
+            raise RuntimeError('ledger unreadable')
+
+        def failed_then_raises(task):
+            task.failed(detail='restore failed', receipts=iter([{'token': 'r'}]), retained=['/s.json'])
+            raise RuntimeError('ledger unreadable')
+
+        def clean_then_raises(task):
+            task.clean()
+            raise RuntimeError('ledger unreadable')
+
+        def restored_then_raises(task):
+            task.restored(evidence='restored')
+            raise RuntimeError('ledger unreadable')
+
+        def twice(task):
+            task.clean()
+            task.failed(detail='restore failed')
+        unfinished = {'unrecheckable': 'the verdict collector did not finish'}
+        cases = ((raises, 'the verdict collector did not finish', [unfinished], []),
+                 (failed_then_raises, 'restore failed; then the verdict collector did not finish',
+                  [{'token': 'r'}, unfinished], ['/s.json']),
+                 (clean_then_raises, 'the verdict collector did not finish after a clean verdict', [unfinished], []),
+                 (restored_then_raises, 'the verdict collector did not finish after a restored verdict',
+                  [unfinished], []),
+                 (lambda task: None, 'the verdict collector gave no verdict',
+                  [{'unrecheckable': 'the verdict collector gave no verdict'}], []),
+                 (twice, 'cleanup verdict misuse: clean then failed; restore failed; then the verdict collector '
+                  'did not finish', [unfinished], []))
+        for bypass in (False, True):
+            if bypass:
+                os.environ['HIL_NO_BOARD_LOCK'] = '1'
+                self.addCleanup(os.environ.pop, 'HIL_NO_BOARD_LOCK', None)
+            for n, (body, detail, receipts, retained) in enumerate(cases):
+                with self.subTest(body=body.__name__, bypass=bypass):
+                    task = self.task(verdict=lambda t, exc, body=body: body(t), allow_bypass=bypass)
+                    with task:
+                        pass
+                    f = latest_failure(hil_lock, BOARD)
+                    self.assertEqual((f['detail'], f['receipts'], f['retained']), (detail, receipts, retained))
+                    self.assertEqual((task.bypassed, task.ended, task.ended_cleanly, task.failure_logged),
+                                     (bypass, True, False, True))
+                    self.assertEqual(len(failed_events(hil_lock, BOARD)), n + 1 + bypass * len(cases))
+                    if body is not cases[4][0]:
+                        self.assertTrue(task.errors[-1].startswith('verdict collector: RuntimeError('))
+
+    def test_without_a_hold_an_interrupted_collector_ends_failed_then_raises(self):
+        self.signals()
+        self.patch(hil_lock._process(), 'InterruptHold', mock.Mock(side_effect=OSError(24, 'Too many open files')))
+        calls = []
+
+        def at_entry(task, exc):
+            calls.append(1)
+            signal.raise_signal(signal.SIGINT)
+
+        def after_a_verdict(task, exc):
+            calls.append(1)
+            task.failed(detail='restore failed', receipts=[{'token': 'r'}])
+            signal.raise_signal(signal.SIGINT)
+        unfinished = {'unrecheckable': 'the verdict collector did not finish'}
+        for n, (collect, receipts) in enumerate(((at_entry, [unfinished]),
+                                                 (after_a_verdict, [{'token': 'r'}, unfinished]))):
+            with self.subTest(collect.__name__):
+                task = self.task(verdict=collect)
+                with self.assertRaises(KeyboardInterrupt):
+                    with task:
+                        pass
+                self.assertEqual(len(calls), n + 1)
+                self.assert_released(task, events=n + 1)
+                self.assertEqual(latest_failure(hil_lock, BOARD)['receipts'], receipts)
+                self.assertFalse(task.ended_cleanly)
+
+    def test_a_pre_hold_interrupt_reaches_the_collector_and_stays_first(self):
+        """A SIGINT as finalization's hold is installed: the retry's collector gets it as `exc`, and a
+        SIGTERM the collector raises (deferred, then replayed) never replaces it."""
+        handlers = self.signals()
+        process = hil_lock._process()
+        real_hold, holds, seen = process.InterruptHold, [], []
+
+        def hold():
+            holds.append(1)
+            if len(holds) == 2:           # the first is the take attempt's, the second finalization's
+                signal.raise_signal(signal.SIGINT)
+            return real_hold()
+        self.patch(process, 'InterruptHold', hold)
+
+        def collect(task, exc):
+            seen.append(exc)
+            signal.raise_signal(signal.SIGTERM)
+            task.clean()
+        task = self.task(verdict=collect)
+        with self.assertRaises(KeyboardInterrupt):
+            with task:
+                pass
+        self.assertEqual([type(e) for e in seen], [KeyboardInterrupt])
+        self.assert_released(task)
+        self.assertTrue(task.ended_cleanly)
+        self.assert_handlers(*handlers)
+
+    def test_a_body_interrupt_stays_first(self):
+        handlers = self.signals()
+
+        def collect(task, exc):
+            signal.raise_signal(signal.SIGTERM)
+            task.clean()
+        stop = KeyboardInterrupt()
+        with self.assertRaises(KeyboardInterrupt) as cm:
+            with self.task(verdict=collect) as task:
+                raise stop
+        self.assertIs(cm.exception, stop)
+        self.assert_released(task)
+        self.assert_handlers(*handlers)
+
+    def test_finish_ends_once_and_drops_a_new_interrupt_under_the_callers(self):
+        task = self.task()
+        task.finish()
+        self.assertEqual((task.ended, task.taken, os.listdir(self.dir)), (True, False, []))
+        with self.assertRaisesRegex(RuntimeError, 'entered once'):
+            task.__enter__()
+        handlers = self.signals()
+        stop = KeyboardInterrupt()
+
+        def collect(task, exc):
+            self.assertIs(exc, stop)
+            signal.raise_signal(signal.SIGINT)
+        task = self.task(verdict=collect)
+        task.__enter__()
+        task.finish(stop)                     # the new SIGINT is dropped: the caller re-raises its own
+        self.assert_released(task, events=1)
+        self.assertEqual(latest_failure(hil_lock, BOARD)['detail'],
+                         'the verdict collector gave no verdict; then KeyboardInterrupt')
+        task.finish()
+        task.finish(ValueError('late'))
+        self.assertEqual(len(failed_events(hil_lock, BOARD)), 1)
+        self.assert_handlers(*handlers)
+
+    def test_finish_after_an_interrupt_left_enter_ends_it_as_a_refusal(self):
+        self.signals()
+        code = hil_lock.BoardTask.__enter__.__code__
+        line = next(n for _, _, n in code.co_lines() if n and "self._state = 'active'" in
+                    inspect.getsourcelines(hil_lock)[0][n - 1])
+
+        def tracer(frame, event, arg):
+            if frame.f_code is code:
+                if event == 'line' and frame.f_lineno == line:
+                    sys.settrace(None)
+                    frame.f_trace = None
+                    signal.raise_signal(signal.SIGINT)
+                return tracer
+            return None
+        collect = mock.Mock()
+        task = self.task(verdict=collect)
+        prev = sys.gettrace()
+        sys.settrace(tracer)
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                with task:
+                    self.fail('the body ran')
+        finally:
+            sys.settrace(prev)
+        self.assertEqual(task._state, 'entering')
+        self.assertFalse(self.flock_is_free())
+        task.finish()
+        collect.assert_not_called()
+        self.assert_released(task)
+        self.assertTrue(task.ended_cleanly)
+
+    def test_report_is_a_snapshot_of_the_outcome(self):
+        task = self.task()
+        with task:
+            task.clean()
+        report = task.report()
+        self.assertEqual(report, {'taken': True, 'released': True, 'bypassed': False, 'ended': True,
+                                  'endedCleanly': True, 'failureLogged': None, 'errors': [],
+                                  'describe': f'{BOARD}: lock released', 'restoreNotes': []})
+        report['errors'].append('x')
+        report['restoreNotes'].append('y')
+        self.assertEqual((task.errors, task.restore_notes), ([], []))
+        busy = self.task(lambda: [{'pid': 7, 'cmd': 'JLinkExe'}])
+        with self.assertRaises(hil_lock.BoardBusy):
+            with busy:
+                pass
+        self.assertEqual({k: busy.report()[k] for k in ('taken', 'released', 'ended', 'endedCleanly')},
+                         {'taken': True, 'released': True, 'ended': True, 'endedCleanly': True})
+        unused = self.task()
+        self.assertEqual({k: unused.report()[k] for k in ('taken', 'ended', 'failureLogged')},
+                         {'taken': False, 'ended': False, 'failureLogged': None})
+        self.assertFalse(unused.ended)
 
 PENDING_AS = r'''
 import importlib.util, json, os, sys

@@ -820,16 +820,27 @@ class BoardTask:
     through end_failed, the exception named in the detail. A second verdict raises and ends the
     task as failed. Finalization runs under an InterruptHold: a SIGINT or SIGTERM whose handler is
     a Python callable is replayed once the task's state is complete and then takes precedence
-    over the body's exception, kept as its __context__; other finalization errors go to `errors`
-    and never replace it. A handle that cannot be closed is kept, and a later __exit__ retries
+    over the body's exception, kept as its __context__, unless that is itself an interrupt; the
+    first interrupt wins over later ones. Other finalization errors go to `errors` and never
+    replace it. A handle that cannot be closed is kept, and a later __exit__ or finish() retries
     its close. With `allow_bypass`, HIL_NO_BOARD_LOCK=1 takes no flock (acquire_board_lock): the
     busy check still runs, a failed cleanup is logged with log_cleanup_failure and a restoration
     resolves nothing; without it the variable is ignored.
 
-    Limit: a signal CPython delivers as __exit__ is entered unwinds before it runs, leaving the
-    flock held while the process lives and the protected record for the next take to log
-    found-left. A worker that catches that interrupt and goes on calls the task's __exit__ again
-    (a task without a verdict then ends as failed) while `ended` is false, or ends before it
+    `verdict(task, exc)`, when given, is the consumer's verdict collector: called once, at the
+    end of an admitted task whose body gave no verdict, under finalization's InterruptHold and
+    before its steps, with the body's exception (else an interrupt that cut an earlier attempt
+    short) as `exc`, it gives the verdict from the consumer's own ledger through clean(),
+    restored() or failed(), and never suppresses the exception. A collector that raises (an
+    interrupt included, where no hold could be installed) or gives no verdict ends the task as
+    failed, any failed verdict it gave keeping its evidence, with an unrecheckable marker in its
+    receipts and never cleanly; its interrupt is raised after finalization. Hardware work stays in
+    the body: the collector only reads the ledger.
+
+    Limit: a signal CPython delivers as __exit__ or finish() is entered unwinds before it runs,
+    leaving the flock held while the process lives and the protected record for the next take to
+    log found-left. A worker that catches that interrupt and goes on calls finish(e) while `ended`
+    is false (a task without a verdict or collector then ends as failed), or ends before it
     continues.
 
     `cleanup_failures` (the take's open failures, kept even when admission is refused), `errors`,
@@ -849,16 +860,21 @@ class BoardTask:
       cleanly; a refusal before the take ends cleanly. Advisory notes do not change it: an
       interrupt hold that could not be installed, a restoration's notes (restore_notes) or
       errors, a deferred interrupt replayed afterwards.
-    describe() puts these and `errors` in one line for the caller's report."""
+    describe() puts these and `errors` in one line for the caller's report, and report() all of
+    them as one dict."""
 
-    def __init__(self, board, reason=CI_REASON, *, busy, wait=0, allow_bypass=False, **record_fields):
+    def __init__(self, board, reason=CI_REASON, *, busy, wait=0, allow_bypass=False, verdict=None,
+                 **record_fields):
         if not callable(busy):
             raise TypeError(f'busy must be callable, not {busy!r:.80}')
+        if verdict is not None and not callable(verdict):
+            raise TypeError(f'verdict must be callable or None, not {verdict!r:.80}')
         if isinstance(wait, bool) or not isinstance(wait, (int, float)) or not math.isfinite(wait) or wait < 0:
             raise ValueError(f'wait must be a finite number of seconds >= 0, not {wait!r:.80}')
         _own_fields(record_fields, CLEANUP_OWED, 'protected', 'locks', 'role')
         self.board, self.reason = board, reason
         self._busy, self._wait, self._allow_bypass, self._fields = busy, wait, allow_bypass, record_fields
+        self._collector, self._collected, self._collector_failed = verdict, False, False
         self.cleanup_failures, self.errors, self.restore_notes = [], [], []
         self.bypassed = self.released = self.taken = False
         self.failure_logged = None
@@ -984,19 +1000,38 @@ class BoardTask:
                            f'it ends as a failed cleanup')
 
     def __exit__(self, exc_type, exc, traceback) -> bool:
-        # an interrupt before _finish's hold went in did nothing yet: finish again, then raise it
-        pending = None
+        # an interrupt before _finish's hold went in did nothing yet: finish again. The first
+        # interrupt wins, and a body's own interrupt is first
+        start, pending = self._state, None
         while True:
             try:
-                self._finish(exc)
+                self._finish(exc if exc is not None else pending, refused=start == 'entering')
                 break
             except BaseException as e:
-                if self._state != 'active':
-                    raise
                 pending = pending or e
-        if pending is not None:
+                if self._state != start or start not in ('entering', 'active'):
+                    break
+        if pending is not None and not (isinstance(exc, BaseException) and not isinstance(exc, Exception)
+                                        and not isinstance(pending, Exception)):
             raise pending
         return False
+
+    def finish(self, exc=None) -> None:
+        """End the task now, as its __exit__ with `exc` would: what a worker calls when an
+        interrupt cut its __exit__ short, or when an interrupt left __enter__ before admission
+        returned (a refusal then). It does nothing once `ended`, and ends a task never entered
+        as untouched. It never raises `exc`; when `exc` is an interrupt, one caught while
+        finishing is dropped for the caller to re-raise its own."""
+        if self._state == 'new':
+            self._state = 'done'
+        self.__exit__(None if exc is None else type(exc), exc, None if exc is None else exc.__traceback__)
+
+    def report(self) -> dict:
+        """The outcome attributes, describe() and copies of `errors` and `restore_notes`, for a
+        caller's report; reading it changes nothing."""
+        return {'taken': self.taken, 'released': self.released, 'bypassed': self.bypassed, 'ended': self.ended,
+                'endedCleanly': self.ended_cleanly, 'failureLogged': self.failure_logged,
+                'errors': list(self.errors), 'describe': self.describe(), 'restoreNotes': list(self.restore_notes)}
 
     def _verdict_at_end(self, exc):
         verdict = self._verdict
@@ -1016,9 +1051,14 @@ class BoardTask:
         def guard(what, step, default=None):
             return _guarded(step, what, self.errors.append, interrupted, default)
         try:
+            if self._state == 'active' and not refused and self._collector is not None and not self._collected:
+                self._collected = True       # before the call: a retried _finish never reruns it
+                self._collect(guard, exc)
             if self._state in ('entering', 'active'):
                 self._state = 'ending'
                 self._end_on(guard, refused, exc)
+                if self._collector_failed:
+                    self._as_verdict = False
                 self._state = 'closing'
         finally:
             # whatever cut the steps short (no hold to defer it), an owned handle is closed here
@@ -1032,9 +1072,29 @@ class BoardTask:
                     self._state = 'done'
             finally:
                 if hold is not None:
-                    hold.release()
+                    try:
+                        hold.release()
+                    except BaseException as e:     # the replay: an interrupt already kept stays first
+                        interrupted.append(e)
         if interrupted:
             raise interrupted[0]
+
+    def _collect(self, guard, exc) -> None:
+        if self._verdict is not None:
+            return
+        done = guard('verdict collector', lambda: self._collector(self, exc) or True)
+        if done and self._verdict is not None:
+            return
+        why, given = ('gave no verdict' if done else 'did not finish'), self._verdict
+        self._collector_failed = True
+        if given is None:
+            detail, receipts, retained = f'the verdict collector {why}', (), ()
+        elif given[0] == 'failed':
+            detail, receipts, retained = f'{given[1]}; then the verdict collector {why}', given[2], given[3]
+        else:
+            detail, receipts, retained = f'the verdict collector {why} after a {given[0]} verdict', (), ()
+        self._verdict = ('failed', detail, itertools.chain(receipts, [{'unrecheckable': f'the verdict collector {why}'}]),
+                         retained)
 
     def _end_on(self, guard, refused, exc) -> None:
         verdict = ('refused',) if refused else guard('verdict', lambda: self._verdict_at_end(exc),
