@@ -109,7 +109,9 @@ STALLED = {
     'ci-red-unclassified': 'a CI failure is unplaced: investigate it and pass the evidence as ciNotes before relaunching',
     'ci-stuck': 'the same checks stayed pending through two whole CI waits on this head (`unmet` names the required checks not yet '
                 'passed: one never registered may be a renamed job or an app that no longer runs), or a re-run named in '
-                '`unregistered` never registered within ciWait: observe them once (a hung job, a missing runner) before relaunching',
+                '`unregistered` never registered within ciWait: observe them once (a hung job, a missing runner) before relaunching; '
+                'a run orphaned in queued with no job was cancelled and re-run once by the launch where the blocker on its '
+                '`ciRecovery` says so, and is never cancelled or re-run again by hand while its record shows a step sent',
     'required-check-failed': 'a check the base branch requires failed (`requiredFailed`) with no failure left to repair or re-run, '
                              'or only accepted ones, which never cover a required check: fix or re-run it, or change the '
                              "requirement; GitHub refuses the merge until it passes, and that decision is the user's",
@@ -210,6 +212,17 @@ def load_output(path):
     if not isinstance(output, dict):
         raise Unusable(f'--output {path} is not a Workflow output object')
     return output
+
+
+def ci_recovery(r):
+    """The ci-stuck blocker on ci_recover.py's attempt (#536): its outcome, and each run's evidence, step and record."""
+    runs = [f"run {x.get('runId')} attempt {x.get('attempt')} ({x.get('workflow')}): {x.get('outcome')}, {cut(x.get('reason') or '')}"
+            + (f"; evidence: {cut(', '.join(x['evidence']))}" if x.get('evidence') else '')
+            + (f"; new attempt {x['newAttempt']}" if x.get('newAttempt') else '') + (f"; record {x['record']}" if x.get('record') else '')
+            for x in r.get('runs') or [] if isinstance(x, dict)]
+    return (f"orphaned-run recovery {r.get('outcome')}: {cut(r.get('detail') or '')}" + ''.join(f'\n- {x}' for x in runs) +
+            '\nEach run attempt is cancelled and re-run at most once, by its record under the checkout\'s git common dir: a relaunch '
+            'resumes a cancel that completed since, and sends nothing a record shows sent')
 
 
 def cut(text, limit=CUT):
@@ -441,6 +454,8 @@ def summarize(output, output_path, state_ref=None, tree=None, keys=False):
                 blockers.append(STALLED[result['reason']])
             if ask:
                 notes.append(f'CodeRabbit has not reviewed the head; {relaunch_ask(ask)}')
+        if result.get('reason') == 'ci-stuck' and isinstance(result.get('ciRecovery'), dict):
+            blockers.append(ci_recovery(result['ciRecovery']))
         if result.get('reason') == 'held-awaiting-caller':
             blockers += [f"finding {h.get('findingId')} on comment {h.get('commentId')} is held for the caller, and another launch "
                          f"cannot lift it: {cut(h.get('reason') or '')}" for h in result.get('held') or []]

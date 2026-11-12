@@ -737,6 +737,22 @@ const TRIGGER = withSeal({
     retryAt: { type: ['string', 'null'] }, commentId: { type: ['integer', 'null'] }, phase: { type: ['string', 'null'] },
   },
 })
+// ci_recover.py's line: what it did with each queued or recorded run on the head (#536).
+const CI_RECOVER = withSeal({
+  type: 'object', additionalProperties: false, required: ['outcome', 'detail', 'runs', 'at'],
+  properties: {
+    error: { type: 'string' }, outcome: { type: 'string' }, detail: { type: 'string' }, at: { type: 'string' },
+    runs: {
+      type: 'array',
+      items: {
+        type: 'object', additionalProperties: false, required: ['runId', 'attempt', 'outcome', 'reason', 'evidence', 'newAttempt', 'record'],
+        properties: { runId: { type: 'integer' }, attempt: { type: 'integer' }, workflow: { type: ['string', 'null'] }, outcome: { type: 'string' },
+          reason: { type: 'string' }, evidence: { type: 'array', items: { type: 'string' } }, newAttempt: { type: ['integer', 'null'] },
+          record: { type: ['string', 'null'] } },
+      },
+    },
+  },
+})
 // commits.py cited: whether a rewritten head still holds each commit our fix notes cite (#361).
 const CITED = withSeal({
   type: 'object', additionalProperties: false, required: ['head', 'cited'],
@@ -850,8 +866,9 @@ const HARVEST_SCRIPT = `${AGENTRC}/skills/pr-babysit/scripts/harvest.py`
 const BUILD_SCRIPT = `${AGENTRC}/skills/pr-babysit/scripts/build.py`
 const SCOPE_SCRIPT = `${AGENTRC}/skills/pr-babysit/scripts/scope_check.py`
 const COLLECT_SCRIPT = `${AGENTRC}/skills/ci-rerun/scripts/collect.py`
+const CIRECOVER_SCRIPT = `${AGENTRC}/skills/pr-babysit/scripts/ci_recover.py`
 // The preflight checks each is installed: a session's cached workflow definition can outlive a script it calls (#38).
-const NEEDED = [REPLY_SCRIPT, HOOKS_SCRIPT, COMMITS_SCRIPT, PUSH_SCRIPT, SONAR_SCRIPT, CRTRIGGER_SCRIPT, GTRIGGER_SCRIPT, HARVEST_SCRIPT, BUILD_SCRIPT, SCOPE_SCRIPT, COLLECT_SCRIPT, STATE_SCRIPT, FACTS_SCRIPT]
+const NEEDED = [REPLY_SCRIPT, HOOKS_SCRIPT, COMMITS_SCRIPT, PUSH_SCRIPT, SONAR_SCRIPT, CRTRIGGER_SCRIPT, GTRIGGER_SCRIPT, HARVEST_SCRIPT, BUILD_SCRIPT, SCOPE_SCRIPT, COLLECT_SCRIPT, CIRECOVER_SCRIPT, STATE_SCRIPT, FACTS_SCRIPT]
 function shq (s) { return `'${String(s).replace(/'/g, `'\\''`)}'` }
 // The workflow's own check of a script's line against its schema: a member its schema allows null may be left out (a
 // script drops a null one) and reads null; an error line's other required members read empty.
@@ -2042,6 +2059,25 @@ const rearm = () => { waited = true; return null }
 const requiredName = (r) => r.app === -1 ? r.context : `${r.context} (app ${r.app})`
 // The cycle before this one, the state's last included: history holds this cycle's entry already.
 const before = (k) => history.length > 1 ? history[history.length - 2][k] : null
+// A run orphaned in queued with no job keeps CI pending for good (#536): where ci-stuck would stop, ci_recover.py cancels
+// and re-runs a suspected orphan, each step once per run attempt under its own durable record; asked once per head in a
+// launch. Its line, or null under a GitHub rate limit; a recovery is never a CI result.
+const ciRecoveries = new Map()
+const recoverCi = async (cycle, entry) => {
+  if (githubLimit) return null
+  const label = `cirecover#${cycle}`
+  const r = await relayOnce(
+    `${IN_CHECKOUT}Recover PR #${args.pr}'s Actions runs orphaned in queued: ` +
+    runExactly(`${CIRECOVER_SCRIPT} --pr ${args.pr} --repo ${shq(repo)} --head ${expectedHead} --wait-minutes ${ciWait}`,
+      ' Change nothing on GitHub yourself.'),
+    { label, phase: 'Triage', model: 'haiku', effort: 'low', schema: CI_RECOVER })
+  const got = !r ? { outcome: 'unknown', detail: 'no answer: the recovery may have acted; its records under the git common dir say', runs: [] }
+    : r.error ? { outcome: 'unknown', detail: r.error, runs: [] } : r
+  entry.ciRecovery = { outcome: got.outcome, detail: got.detail, runs: got.runs }
+  ciRecoveries.set(expectedHead, entry.ciRecovery)
+  log(`cycle ${cycle}: ${label}: ${got.outcome} (${got.detail})`)
+  return entry.ciRecovery
+}
 
 // A digest recorded before CodeRabbit rewrote its comment's end is one of the comment's aliases now (comment_digest.py): the same body.
 const repin = (cycle, findings) => {
@@ -3372,9 +3408,18 @@ const runLanes = async (cycle, entry, lanes) => {
     }
     const now = entry.ciWaited, prev = before('ciWaited')
     if (c.status === 'running' && now && (now.registered > 0 || now.unmet) && prev && ['head', 'registered', 'pending', 'waiting'].every(k => now[k] === prev[k])) {
+      const earlier = ciRecoveries.get(expectedHead)
+      const recovery = earlier ?? await recoverCi(cycle, entry)
+      if (!earlier && recovery?.outcome === 'recovered') {
+        // The new attempts are pending checks like any: two more whole waits on them before ci-stuck reads again.
+        delete entry.ciWaited
+        log(`cycle ${cycle}: CI on ${expectedHead.slice(0, 7)}: orphaned run(s) re-run — waiting on them`)
+        return rearm()
+      }
       const required = now.unmet ? `; required check(s) not passed: ${now.unmet.join(', ')}` : ''
       log(`cycle ${cycle}: CI on ${expectedHead.slice(0, 7)} still running with the same ${now.pending} pending check(s)${required} after two whole waits — observe them before relaunching`)
-      return stop(cycle, 'ci-stuck', { head: now.head, pending: now.pending, ...(now.unmet ? { unmet: now.unmet } : {}) })
+      return stop(cycle, 'ci-stuck', { head: now.head, pending: now.pending, ...(now.unmet ? { unmet: now.unmet } : {}),
+        ...(recovery ? { ciRecovery: recovery } : {}) })
     }
     if (c.unregistered) {
       log(`cycle ${cycle}: CI on ${expectedHead.slice(0, 7)}: the re-run of ${c.unregistered.join(', ')} has not registered within ${ciWait} minutes — observe it before relaunching`)

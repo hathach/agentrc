@@ -595,6 +595,12 @@ async function run(opts = {}) {
       const answer = typeof opts.gTrigger === 'function' ? opts.gTrigger(label) : 'gTrigger' in opts ? opts.gTrigger : { outcome: 'requested', detail: 'comment 7', commentId: 7 }
       return answer === null ? null : conforms(options.schema, { at: answer.error ? '' : observed, ...structuredClone(answer) }, label)
     }
+    if (label.startsWith('cirecover#')) {
+      // ci_recover.py's line: no queued run on the head unless opts.ciRecover(label) answers otherwise; null is a dead relay.
+      const answer = typeof opts.ciRecover === 'function' ? opts.ciRecover(label) : 'ciRecover' in opts ? opts.ciRecover
+        : { outcome: 'none', detail: 'no queued run on the head', runs: [] }
+      return answer === null ? null : conforms(options.schema, { at: answer.error ? '' : observed, runs: [], ...structuredClone(answer) }, label)
+    }
     if (label.startsWith('crrequest#')) {
       // coderabbit_trigger.py --request's line: requested unless opts.crRequest(label) answers otherwise.
       const answer = typeof opts.crRequest === 'function' ? opts.crRequest(label, observed) : 'crRequest' in opts ? opts.crRequest
@@ -2039,6 +2045,37 @@ test('CI that saw nothing move through two whole waits on one head stops ci-stuc
   const none = { ...RUNNING, pending: 0, registered: 0, waiting: 'none' }
   const shortNone = await run({ ci: none, throwOn: retried, args: { maxCycles: 1, ciWait: 1 } })
   assert.notEqual(shortNone.result.pass, true)
+})
+
+test('CI stuck through two whole waits asks ci_recover.py once per head; a recovery re-arms, never reads green (#536)', async () => {
+  const stuck = { ...RUNNING, pending: 2, waiting: 'same' }
+  const recovers = (labels) => labels.filter(l => l.startsWith('cirecover#'))
+  const run_ = { runId: 43095438193, attempt: 1, workflow: 'tests', outcome: 'recovered', reason: 'cancelled and re-run: attempt 2 is queued',
+    evidence: ['queued since 2026-11-11T20:20:25Z (91 minutes), attempt 1 with no job'], newAttempt: 2, record: '/x/o-r-43095438193-1.json' }
+  const recovered = { outcome: 'recovered', detail: 'run 43095438193 attempt 1: recovered', runs: [run_] }
+  const { result, logs, labels, calls } = await run({ ci: stuck, ciRecover: recovered, args: { maxCycles: 6 } })
+  assert.deepEqual(recovers(labels), ['cirecover#2'])
+  const call = calls.find(c => c.label === 'cirecover#2')
+  assert.ok(call.prompt.includes(`ci_recover.py --pr 3888 --repo 'hathach/tinyusb' --head ${HEAD} --wait-minutes 30\``), call.prompt)
+  assert.deepEqual([call.agentType, call.model], ['relay', 'haiku'])
+  assert.ok(logs.includes('cycle 2: cirecover#2: recovered (run 43095438193 attempt 1: recovered)'), logs.join('\n'))
+  assert.equal(result.reason, 'ci-stuck', 'still pending two whole waits after the re-run: stuck, never green')
+  assert.equal(result.cycles, 4)
+  assert.notEqual(result.pass, true)
+  assert.deepEqual(result.ciRecovery, recovered, 'the stop names the recovery made on the head')
+  for (const [answer, outcome] of [[{ outcome: 'none', detail: 'run 1 attempt 1: skipped, its attempt 1 has 2 job(s)', runs: [] }, 'none'],
+    [{ outcome: 'uncertain', detail: 'run 1 attempt 1: uncertain, the cancel has not completed the run', runs: [] }, 'uncertain'],
+    [{ outcome: 'failed', detail: 'run 1 attempt 1: failed, GitHub refused the cancel', runs: [] }, 'failed'],
+    [{ error: 'gh: HTTP 401' }, 'unknown']]) {
+    const r = await run({ ci: stuck, ciRecover: answer, args: { maxCycles: 4 } })
+    assert.deepEqual([r.result.reason, r.result.cycles, recovers(r.labels)], ['ci-stuck', 2, ['cirecover#2']], outcome)
+    assert.equal(r.result.ciRecovery.outcome, outcome)
+  }
+  const dead = await run({ ci: stuck, ciRecover: null, args: { maxCycles: 4 } })
+  assert.deepEqual(recovers(dead.labels), ['cirecover#2', 'cirecover#2.retry'], 'a lost line gets one fresh relay: the script dedupes its own steps')
+  assert.equal(dead.result.ciRecovery.outcome, 'unknown')
+  const moving = await run({ ci: RUNNING, args: { maxCycles: 3 } })
+  assert.deepEqual(recovers(moving.labels), [], 'only where ci-stuck would stop')
 })
 
 test('a required check not yet passed is waited for, never read as green, and stops ci-stuck by name', async () => {

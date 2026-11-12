@@ -315,6 +315,24 @@ class LaunchResultTest(unittest.TestCase):
         rc, s = self.run_it(output(result=base))
         self.assertTrue(any('relaunch once Greptile reviewed the head' in b for b in s['blockers']), 'a final request keeps its blocker')
 
+    def test_a_ci_stuck_stop_names_its_orphaned_run_recovery(self):
+        # #536: the blocker names the evidence, the attempt and its result.
+        run_ = {'runId': 43095438193, 'attempt': 1, 'workflow': 'tests', 'outcome': 'uncertain',
+                'reason': 'the cancel (sent) has not completed the run within 45 seconds; it is not sent again',
+                'evidence': ['queued since 2026-11-11T20:20:25Z (91 minutes), attempt 1 with no job'], 'newAttempt': None,
+                'record': '/r/.git/pr-babysit/ci-recover/o-r-43095438193-1.json'}
+        base = {'pass': False, 'status': 'blocked', 'reason': 'ci-stuck', 'head': HEAD, 'pending': 1,
+                'state': {'expectedHead': HEAD, 'cyclesUsed': 2, 'maxCycles': 5}}
+        rc, s = self.run_it(output(result={**base, 'ciRecovery': {'outcome': 'uncertain', 'detail': 'run 43095438193 attempt 1: uncertain', 'runs': [run_]}}))
+        said = [b for b in s['blockers'] if b.startswith('orphaned-run recovery uncertain')]
+        self.assertEqual(len(said), 1, s['blockers'])
+        for part in ('run 43095438193 attempt 1 (tests): uncertain', 'evidence: queued since 2026-11-11T20:20:25Z',
+                     'record /r/.git/pr-babysit/ci-recover/o-r-43095438193-1.json', 'sends nothing a record shows sent'):
+            self.assertIn(part, said[0])
+        self.assertTrue(any(b.startswith('the same checks stayed pending') for b in s['blockers']))
+        rc, s = self.run_it(output(result=base))
+        self.assertFalse(any(b.startswith('orphaned-run recovery') for b in s['blockers']), 'none asked, none named')
+
     def test_a_state_too_large_to_load_is_a_blocker(self):
         rc, s = self.run_it(output(result={'pass': True, 'status': 'complete', 'stateTooLarge': 70000,
                                            'state': {'expectedHead': NEXT, 'cyclesUsed': 1, 'maxCycles': 5}}))

@@ -121,7 +121,14 @@ A key not listed here throws before anything runs.
   wait; that pass is a grace period for checks that register late, not proof.
   An Actions run on the head that is unfinished with no pending job registered
   (one a concurrency group holds, a re-run not yet started) counts as a
-  pending check, so it is waited on.
+  pending check, so it is waited on. Where the same checks stay pending through
+  two whole waits (`ci-stuck`), the launch first runs `ci_recover.py` once per
+  head: a run still `queued` with no job past `ciWait`, after which a newer
+  run in the repository completed, and that no concurrency group can be
+  holding, is cancelled and re-run whole, each step once per run attempt
+  under a record in the git common dir. A recovery re-arms the CI wait and is
+  never green; any other outcome stops `ci-stuck` with `ciRecovery`: its
+  outcome, and each run's evidence, step and record.
 - `ciNotes`: what the caller established about this PR's CI, handed to the
   judge verbatim; it never revises a placed verdict stored on the head, while
   a stored unclassified failure is judged again once the notes change.
