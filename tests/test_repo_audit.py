@@ -1144,6 +1144,8 @@ class Finish(unittest.TestCase):
         stages = review(self.base, self.head)['stages']
         self.refused('stages: missing coreview', stages={k: v for k, v in stages.items() if k != 'coreview'})
         self.refused('stages: missing correctness', stages={k: v for k, v in stages.items() if k != 'correctness'})
+        self.refused('stages.correctness: must be completed',
+                     stages=dict(stages, correctness={'status': 'inapplicable', 'reason': 'review tool unavailable'}))
         self.refused('stages.claims: missing reason', stages=dict(stages, claims={'status': 'inapplicable'}))
         self.refused('stages.claims: unknown field range',
                      stages=dict(stages, claims=dict(stages['claims'], range=f'{self.base}..{self.head}')))

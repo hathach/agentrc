@@ -60,7 +60,8 @@ FILE is one JSON object; a field the schema does not name is refused at any dept
   pr          {repo: "owner/name" of the base repository, number}
   outcome     text
   stages      {coverage, phase1, claims, coreview, correctness, any other stage}: each {status: "completed", ref}
-              or {status: "inapplicable", reason}; check accepts a record without correctness, written before it
+              or {status: "inapplicable", reason}; finish requires correctness completed, check accepts a record
+              without it, written before it
   coverage    [{batch, paths: [glob]}], not empty; every path base..R changes (both sides of a rename, a deletion,
               a submodule pin) must match a glob: ** spans directories, * and ? stay within one
   claims      [{claim, document, revision, section, variants: [part], status: verified|refuted|pending}]
@@ -1297,6 +1298,9 @@ def finish(args):
     s = Shape()
     if s.obj(review, 'review', REVIEW_FIELDS):
         check_review(s, review, f'{run["base"]}..{reviewed}', carried, FINISH_STAGES)
+        correctness = review.get('stages', {}).get('correctness') if isinstance(review.get('stages'), dict) else None
+        if isinstance(correctness, dict) and correctness.get('status') == 'inapplicable':
+            s.bad('stages.correctness', 'must be completed: the correctness co-review runs for every batch')
     problems = s.problems + [f'{w}: looks private ({m!r})' for w, m in private(review)]
     pr_base = None
     if not s.problems:
