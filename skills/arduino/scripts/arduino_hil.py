@@ -699,7 +699,9 @@ def base_state(image):
 def step(name, board, image, test, run_dir, tracker):
     """Flash the test's sketch, wait for the DUT to enumerate anew, run the host check. A dict row."""
     if role(name) == 'host':
-        return P.step_host(name, board, image, test, run_dir, tracker)
+        row = P.step_host(name, board, image, test, run_dir, tracker)
+        tracker.check()
+        return row
     started = time.monotonic()
     vid_pid = image['vidPid']
     why, detached, dev = flash_and_enumerate(name, board, image, run_dir, tracker)
@@ -718,13 +720,15 @@ def step(name, board, image, test, run_dir, tracker):
 def run_test(test, dev, tracker, run_dir, board):
     """(ok, detail) of a device test's host check on `dev` within TEST_TIMEOUT."""
     try:
-        return P.TEST_FUNCS[test](dev, secrets.token_hex(4), time.monotonic() + TEST_TIMEOUT, tracker, run_dir,
-                                  board)
+        result = P.TEST_FUNCS[test](dev, secrets.token_hex(4), time.monotonic() + TEST_TIMEOUT, tracker, run_dir,
+                                    board)
     except Unclean:
         raise
     except Exception as e:   # a host-side failure of the check is the test's, once its children ended
         tracker.check()
         return False, f'{type(e).__name__}: {e}'
+    tracker.check()   # a check that returned past a child it ran unclean proves nothing of the board
+    return result
 
 
 def restore(name, board, images, run_dir, tracker):

@@ -1173,9 +1173,19 @@ class Step(Base):
 
     def test_a_host_board_runs_the_profiles_host_step(self):
         self.HP.step_host = mock.Mock(return_value={'test': 'info', 'pass': True})
-        board = self.board('rig_host')
-        self.assertEqual(H.step('rig_host', board, {'elf': 'x'}, 'info', self.dir, None)['pass'], True)
-        self.HP.step_host.assert_called_once_with('rig_host', board, {'elf': 'x'}, 'info', self.dir, None)
+        board, tracker = self.board('rig_host'), mock.Mock()
+        self.assertEqual(H.step('rig_host', board, {'elf': 'x'}, 'info', self.dir, tracker)['pass'], True)
+        self.HP.step_host.assert_called_once_with('rig_host', board, {'elf': 'x'}, 'info', self.dir, tracker)
+        tracker.check.side_effect = H.Unclean('openocd: cleanup unknown')   # its passing row proves nothing then
+        with self.assertRaises(H.Unclean):
+            H.step('rig_host', board, {'elf': 'x'}, 'info', self.dir, tracker)
+
+    def test_a_check_returning_past_an_unproven_child_is_unclean(self):
+        tracker = mock.Mock()
+        tracker.check.side_effect = H.Unclean('read-block: cleanup unknown')
+        self.HP.TEST_FUNCS['echo'] = lambda *a: (True, 'echoed')
+        with self.assertRaises(H.Unclean):
+            H.run_test('echo', {}, tracker, self.dir, {})
 
     def test_restore_runs_the_roles_restore_test_on_its_restoration_sketch(self):
         seen = []
@@ -1236,6 +1246,25 @@ class Battery(Base):
         self.assertEqual((self.lock.released, self.lock.pending), ([], {}))
         self.assertNotIn('logError', row['cleanup'])
         self.assertEqual(H.exit_code([row]), 4)
+
+    def test_a_passing_restore_check_past_an_unproven_child_fails_the_cleanup(self):
+        calls = []
+
+        def echo(dev, nonce, deadline, tracker, *a):   # the test step clean, the restore's leaves a child unproven
+            calls.append(dev)
+            if len(calls) == 2:
+                tracker._note('unknown', {'pid': 7}, ['probe-tool'])
+            return True, 'echoed'
+        self.HP.TEST_FUNCS['echo'] = echo
+        images = {'echo': {'sha256': {}, 'fqbn': 'vend:arch:rig_jlink', 'vidPid': '1234:5678'}}
+        with mock.patch.object(H, 'flash_and_enumerate', return_value=('', '', {'busport': '1-1', 'dir': '/x'})):
+            row = self.run_board(step=H.step, restore=H.restore,
+                                 admit=lambda *a, **k: (json.loads(self.record().read_text()), images))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual((row['tests'][0]['pass'], row['cleanup']['state'], H.verdict(row)),
+                         (True, 'pending', 'blocker'))
+        self.assertEqual((self.lock.verdicts, self.lock.ended[0][2]), (['failed'], [{'pid': 7}]))
+        self.assertEqual(row['cleanup']['pending'], [{'receipt': {'pid': 7}}])
 
     def test_unrecheckable_child_is_logged_and_the_next_run_proceeds(self):
         lost = {'receipt': {'unrecheckable': ['JLinkExe'], 'at': 1.0}}
@@ -2003,6 +2032,23 @@ class Commission(Base):
         restore = argparse.Namespace(board='rig_jlink', report=str(report))
         with self.assertRaisesRegex(H.Refused, 'not proven ended'):
             H.op_restore(restore, None, self.dir / 'run', None, None)
+
+    def test_a_passing_restore_check_past_an_unproven_child_fails_the_commission(self):
+        ino = [0]
+        self.serial_devices(ino)
+
+        def bump(*a):
+            ino[0] += 1
+            return ''
+
+        def echo(dev, nonce, deadline, tracker, *a):
+            tracker._note('unknown', {'pid': 7}, ['probe-tool'])
+            return True, 'echoed'
+        self.HP.TEST_FUNCS['echo'] = echo
+        code, result, _ = self.commission('rig_ocd', {'vidPid': '239a:cafe'}, flash=bump, reset=bump)
+        self.assertEqual((code, self.lock.verdicts, self.lock.ended[0][2]), (4, ['failed'], [{'pid': 7}]))
+        self.assertEqual(result['error'], 'Unclean: probe-tool: cleanup unknown')
+        self.assertEqual(result['results'][0]['cleanup']['pending'], [{'receipt': {'pid': 7}}])
 
     def test_a_busy_or_unjudged_probe_refuses_commissioning_before_hardware(self):
         flash = mock.Mock(side_effect=AssertionError('flashed'))
