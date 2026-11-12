@@ -1188,6 +1188,7 @@ def resumed(name, recs, watch, default):
 
 
 BUSY = 'it is working'   # refusal()'s reason for a relay held while its target works
+WAKE_LOOK_S = 3   # the most one held target's `hc get`, or storing what it said, keeps collect from the ledger
 
 
 def held_working(recs, pending, fence):
@@ -1218,38 +1219,58 @@ def wake_line(action, relayed, now):
     return head + f'now {now}: `relay --retry {action}` keeps it held until it is idle or done'
 
 
-def wake(recs, pending, fence, deadline):
-    """Print a line for each relay held while its target was working whose target has left working since, each state
-    once per relay across collects (NOTICED, stored after it printed); `hc get` bounded by deadline, a failure looked
-    at again at the next poll. Sends nothing: `relay --retry` stays the human's, with all its checks."""
-    held = held_working(recs, pending, fence)
-    if not held:
-        return
+def noticed(fence):
+    """The state each held relay's target was last said to be in, as NOTICED holds it for enrollment fence."""
     try:
         with open(path(NOTICED), encoding='utf-8') as f:
             mark = json.load(f)
-        seen = dict(mark['seen']) if mark['generation'] == fence else {}
+        seen = mark['seen'] if mark['generation'] == fence else {}
     except (OSError, ValueError, KeyError, TypeError):
         seen = {}
-    before = {a: seen[a] for a in held if a in seen}
-    seen = dict(before)
+    return dict(seen) if isinstance(seen, dict) else {}
+
+
+def wake(recs, pending, fence, deadline):
+    """Print a line for each relay held while its target was working whose target has left working since, each state
+    once per relay across collects (NOTICED). Each `hc get` gets at most WAKE_LOOK_S of what is left before deadline,
+    a failure looked at again at the next poll. The line prints before it is stored, so a crash repeats it rather than
+    losing it; the store merges into NOTICED under the ledger lock, fenced by the enrollment. Sends nothing:
+    `relay --retry` stays the human's, with all its checks."""
+    held = held_working(recs, pending, fence)
+    if not held:
+        return
+    seen, changes = noticed(fence), {}
     for action, relayed in held.items():
         left = deadline - time.monotonic()
         if left < 1:
             break
         try:
-            found = glance(relayed['target']['address'], left)
+            found = glance(relayed['target']['address'], min(WAKE_LOOK_S, left))
         except hc.Error:
             continue
         state = found['status'] if found and identity(found) == relayed['target'] else 'replaced'
         if state == 'working':
-            seen.pop(action, None)   # leaving it again is news again
+            if action in seen:
+                changes[action] = None   # leaving it again is news again
         elif seen.get(action) != state and fence == generation():
-            seen[action] = state
+            changes[action] = state
             kind = found['blocked_on'] if state == 'blocked' else None
             print(wake_line(action, relayed, state + (f' ({kind})' if kind else '')), flush=True)
-    if seen != before and fence == generation():
-        write_json(NOTICED, {'generation': fence, 'seen': seen})
+    if not changes:
+        return
+    states = relay_states(recs)
+    with suppress(Busy), locked(max(0, min(WAKE_LOOK_S, deadline - time.monotonic()))):
+        if fence != generation():
+            return
+        stored_seen = noticed(fence)
+        merged = {a: v for a, v in stored_seen.items() if states.get(a, 'held') == 'held'}   # a relay newer than recs
+        for action, state in changes.items():
+            if state:
+                merged[action] = state
+            else:
+                merged.pop(action, None)
+        if merged != stored_seen:
+            write_json(NOTICED, {'generation': fence, 'seen': merged})
 
 
 def collect(msgs, wait_ms):

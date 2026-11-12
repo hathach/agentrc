@@ -1460,12 +1460,66 @@ class HeldWakeTest(RelayCase):
     def test_hc_failure_or_no_time_left_says_nothing_and_looks_again(self):
         self.terminals['t2'] = captain.hc.Error('hc get t2 failed: timeout')
         self.assertEqual(self.woken(), [])
-        self.assertLessEqual(self.looked[-1][1], 30)
+        self.assertLessEqual(self.looked[-1][1], captain.WAKE_LOOK_S)
         self.now(status='done')
         self.looked.clear()
         self.assertEqual(self.woken(within=0.5), [])
         self.assertEqual(self.looked, [])
         self.assertEqual(len(self.woken()), 1)
+
+    def test_a_lookup_takes_a_short_budget_however_long_the_wait(self):
+        self.woken(within=600)
+        self.assertEqual(self.looked, [('t2', captain.WAKE_LOOK_S)])
+        self.looked.clear()
+        self.woken(within=1.5)
+        self.assertLessEqual(self.looked[0][1], 1.5)
+
+    def test_collections_following_different_relays_keep_each_other_s_notices(self):
+        self.terminals['t3'] = {**pinned('t3'), 'status': 'working'}
+        self.say('merge o/r#13')
+        other = self.action_of(self.relay('t3'))
+        self.now(status='done')
+        self.terminals['t3'] = {**pinned('t3'), 'status': 'done'}
+
+        def poll(action):
+            with mock.patch('builtins.print') as out:
+                captain.wake(captain.records(), {action}, captain.generation(), time.monotonic() + 30)
+            return len(out.call_args_list)
+        self.assertEqual([poll(self.action), poll(other), poll(self.action), poll(other)], [1, 1, 0, 0])
+
+    def test_a_closed_relay_s_notice_is_dropped_when_the_state_is_stored(self):
+        self.now(status='done')
+        self.woken()
+        captain.cancel(self.action, self.ident)
+        self.terminals['t3'] = {**pinned('t3'), 'status': 'working'}
+        self.say('merge o/r#13')
+        other = self.action_of(self.relay('t3'))
+        self.terminals['t3'] = {**pinned('t3'), 'status': 'done'}
+        with mock.patch('builtins.print'):
+            captain.wake(captain.records(), {other}, captain.generation(), time.monotonic() + 30)
+        self.assertEqual(json.loads((self.state / captain.NOTICED).read_text())['seen'], {other: 'done'})
+
+    def test_a_replacement_enrolled_before_the_store_is_never_overwritten(self):
+        self.now(status='done')
+        real = captain.locked
+
+        @contextmanager
+        def replaced_first(*args, **kwargs):
+            self.replace_captain()   # lands after the line printed, before the store takes the lock
+            with real(*args, **kwargs):
+                yield
+        with mock.patch.object(captain, 'locked', replaced_first):
+            self.assertEqual(len(self.woken()), 1)
+        self.assertFalse((self.state / captain.NOTICED).exists())
+
+    def test_a_held_lock_skips_the_store_within_the_budget(self):
+        self.now(status='done')
+        with mock.patch.object(captain, 'WAKE_LOOK_S', 0.2), captain.locked():
+            began = time.monotonic()
+            self.assertEqual(len(self.woken()), 1)
+            self.assertLess(time.monotonic() - began, 5)
+        self.assertFalse((self.state / captain.NOTICED).exists())
+        self.assertEqual(len(self.woken()), 1)   # unstored, it is said again rather than lost
 
     def test_only_relays_held_for_working_by_this_captain_and_still_pending(self):
         self.now(status='done')
@@ -1494,7 +1548,7 @@ class HeldWakeTest(RelayCase):
         self.assertTrue(lines[1].startswith(f'left working {self.action}'))
         self.assertEqual(lines[-2:], [f'cancelled {self.action} · sp · name · t2', 'done'])
         self.assertEqual(sum(line.startswith('left working') for line in lines), 1)
-        self.assertTrue(all(timeout <= 60 for _, timeout in self.looked))
+        self.assertTrue(all(timeout <= captain.WAKE_LOOK_S for _, timeout in self.looked))
         self.assertEqual(self.typed, [])
 
 
