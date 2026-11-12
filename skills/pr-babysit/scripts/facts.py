@@ -189,21 +189,111 @@ def emit_dir():
     return {'dir': Path(tempfile.mkdtemp(prefix='', dir=parent)).as_posix()}
 
 
-def stage(file, digest):
-    """Write to file the JSON stdin carries as base64, once it decodes to UTF-8 JSON whose fnv1a is digest: the bytes
-    as sent, so no shell quoting meets the text."""
+def staged_bytes(text, digest, where):
+    """text, base64 of UTF-8 JSON, as bytes once its fnv1a is digest."""
     try:
-        data = base64.b64decode(sys.stdin.buffer.read(), validate=True)
-        text = data.decode('utf-8')
-        json.loads(text)
+        data = base64.b64decode(text, validate=True)
+        decoded = data.decode('utf-8')
+        json.loads(decoded)
     except ValueError as e:  # binascii.Error, UnicodeDecodeError and JSONDecodeError among them
-        raise Unusable(f'staged input is not base64 of UTF-8 JSON: {e}') from None
-    if fnv1a(text) != digest:
-        raise Unusable('staged input is not the JSON sent')
+        raise Unusable(f'facts.py stage: {where} is not base64 of UTF-8 JSON: {e}') from None
+    if fnv1a(decoded) != digest:
+        raise Unusable(f'facts.py stage: {where} is not the JSON sent')
+    return data
+
+
+SESSION_ID = re.compile(r'\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z')
+PAYLOAD = 'AGENTRC-PAYLOAD'
+# The newest transcripts read, the bytes read from them in all, and the lines read for each one's first user record.
+SCAN_FILES = 400
+SCAN_BYTES = 64 << 20
+SCAN_LINES = 8
+SCAN_RETRY_S = 2  # a relay's prompt is in its transcript before its first command runs; the one wait is for a slow write
+TASK_FRAME = 'The computed task text follows:\n'
+
+
+class Bounded(Exception):
+    """The scan stopped at one of its bounds before reading every transcript."""
+
+
+def task_text(record):
+    """The computed task a workflow agent's first user record holds, each line as given: the harness indents every line
+    of it two spaces, past its frame."""
+    content = (record.get('message') or {}).get('content')
+    text = content if isinstance(content, str) else ''.join(
+        b.get('text') or '' for b in content or [] if isinstance(b, dict) and b.get('type') == 'text') if isinstance(content, list) else ''
+    if TASK_FRAME in text:
+        text = text.split(TASK_FRAME, 1)[1]
+        return '\n'.join(line[2:] if line.startswith('  ') else line for line in text.split('\n'))
+    return text
+
+
+def mtime(path):
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0
+
+
+def payloads(sid, file, digest):
+    """The payload texts this session's subagent transcripts give FILE and DIGEST in their first user record, newest
+    transcript first; Bounded when a bound stopped the scan first."""
+    root = Path(os.environ.get('CLAUDE_CONFIG_DIR') or Path.home() / '.claude')
+    found = sorted(root.glob(f'projects/*/{sid}/subagents/**/agent-*.jsonl'), key=mtime, reverse=True)
+    head = f'{PAYLOAD} {file} {digest} '
+    got, left = [], SCAN_BYTES
+    for n, path in enumerate(found):
+        if n == SCAN_FILES:
+            raise Bounded(f'{SCAN_FILES} of {len(found)} transcripts read')
+        try:
+            with open(path, encoding='utf-8', errors='replace') as f:
+                for _ in range(SCAN_LINES):
+                    line = f.readline(left + 1)
+                    left -= len(line)
+                    if left < 0:
+                        raise Bounded(f'{SCAN_BYTES} bytes read, in {n + 1} of {len(found)} transcripts')
+                    if not line:
+                        break
+                    try:
+                        record = json.loads(line)
+                    except ValueError:
+                        break  # a record still being written
+                    if isinstance(record, dict) and record.get('type') == 'user':
+                        got += [x[len(head):] for x in task_text(record).split('\n') if x.startswith(head)]
+                        break
+        except OSError:
+            continue
+    return got, len(found)
+
+
+def stage(file, digest, from_transcript=False):
+    """Write to file the JSON the workflow sent, once it decodes to UTF-8 JSON whose fnv1a is digest: the bytes as sent,
+    so no shell quoting meets the text. From stdin as base64, or, from_transcript, from the AGENTRC-PAYLOAD line naming
+    file and digest in this session's subagent transcripts: the relay's own prompt, which no model retypes (#540)."""
+    if from_transcript:
+        sid = os.environ.get('CLAUDE_CODE_SESSION_ID') or ''
+        if not SESSION_ID.match(sid):
+            raise Unusable(f'facts.py stage: CLAUDE_CODE_SESSION_ID {sid!r} names no session, so no transcript holds the payload')
+        for wait in (SCAN_RETRY_S, None):
+            try:
+                got, scanned = payloads(sid, file, digest)
+            except Bounded as e:
+                raise Unusable(f'facts.py stage: the transcript scan stopped at its bound ({e}) before finding the payload for {file}') from None
+            if got or wait is None:
+                break
+            time.sleep(wait)
+        if not got:
+            raise Unusable(f'facts.py stage: no {PAYLOAD} line for {file} {digest} in the first user record of '
+                           f"this session's {scanned} subagent transcript(s), read twice")
+        if len(set(got)) > 1:
+            raise Unusable(f'facts.py stage: {len(set(got))} different {PAYLOAD} lines name {file} {digest}: none is taken')
+        data = staged_bytes(got[0], digest, f'the payload for {file}')
+    else:
+        data = staged_bytes(sys.stdin.buffer.read(), digest, 'staged input')
     try:
         Path(file).write_bytes(data)
     except OSError as e:
-        raise Unusable(f'staged input not written: {e}') from None
+        raise Unusable(f'facts.py stage: staged input not written: {e}') from None
     return {'staged': file}
 
 
@@ -214,10 +304,13 @@ def collect(argv):
         return emit_dir()
     if argv[:1] == ['stage'] and len(argv) == 3:
         return stage(*argv[1:])
-    raise Unusable('usage: facts.py repo | emit-dir | stage FILE DIGEST')
+    if argv[:1] == ['stage'] and len(argv) == 4 and argv[3] == '--from-transcript':
+        return stage(*argv[1:3], from_transcript=True)
+    raise Unusable('usage: facts.py repo | emit-dir | stage FILE DIGEST [--from-transcript]')
 
 
 # `repo`: the checkout's one repository, for a prompt that must name it (fix-issue's triage); `emit-dir`: a workflow's
-# AGENTRC_EMIT directory; `stage`: a relay command's script input, written before the script runs.
+# AGENTRC_EMIT directory; `stage`: a relay command's script input, written before the script runs, --from-transcript
+# from the relay's own prompt (CLAUDE_CONFIG_DIR, else ~/.claude, and CLAUDE_CODE_SESSION_ID name its transcripts).
 if __name__ == '__main__':
     sys.exit(report(collect, sys.argv[1:]))

@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test as nodeTest } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { ABSENT, AsyncFunction, emitDirs, emitOf, loadModule, moduleOf } from './emit_stub.mjs'
+import { ABSENT, AsyncFunction, emitDirs, emitOf as firstEmitOf, loadModule, moduleOf } from './emit_stub.mjs'
 
 // The body runs as the runtime runs it; `meta` is exposed so its value, not its spelling, is checked.
 const body = readFileSync(new URL('../workflows/pr-babysit.js', import.meta.url), 'utf8')
@@ -48,10 +48,14 @@ const bare = (v) => Array.isArray(v) ? v.map(bare)
 const sealLine = (facts) => ({ ...facts, seal: fnv1a(canonical(bare(facts))) })
 // [reviewers, auto-runners] as the validator prompt's harvest command names them.
 const harvestFlags = (prompt) => ['--reviewers', '--auto-run'].map(f => new RegExp(`${f} ([^\\s\`]+)`).exec(String(prompt))?.[1].split(',') ?? [])
+// The file a relay command hands its script as AGENTRC_EMIT, not the one its facts.py stage writes its own line to.
+const emitOf = (prompt) => firstEmitOf(String(prompt).replace(/AGENTRC_EMIT='[^']+\.stage\.js' /, ''))
+// A relay prompt's staged() payload line: the input path, the JSON's fnv1a and its base64.
+const PAYLOAD_LINE = /^AGENTRC-PAYLOAD (.+) ([0-9a-f]{8}) ([A-Za-z0-9+/=]*)$/m
 // The JSON a relay command stages for its script (staged()), decoded as its Python stage decodes it.
-const stagedOf = (prompt) => JSON.parse(Buffer.from(String(prompt).match(/printf '%s' '([A-Za-z0-9+/=]*)' \| /)[1], 'base64').toString('utf8'))
+const stagedOf = (prompt) => JSON.parse(Buffer.from(String(prompt).match(PAYLOAD_LINE)[3], 'base64').toString('utf8'))
 // The staged JSON's text, '' for a prompt that stages none.
-const stagedText = (prompt) => /printf '%s' '/.test(String(prompt)) ? JSON.stringify(stagedOf(prompt)) : ''
+const stagedText = (prompt) => PAYLOAD_LINE.test(String(prompt)) ? JSON.stringify(stagedOf(prompt)) : ''
 // A prompt's trailing list on a line of its own.
 const trailingList = (prompt) => JSON.parse(String(prompt).slice(String(prompt).indexOf('\n[') + 1))
 // The workflow's failure identity.
@@ -685,9 +689,16 @@ async function run(opts = {}) {
         const file = emitOf(prompt)
         let answer
         try {
+          const stageFile = String(prompt).match(/AGENTRC_EMIT='([^']+\.stage\.js)' /)?.[1]
+          // opts.stageError(label): facts.py stage refused the payload, writing that error as its own line; the script never ran.
+          const refusal = stageFile && opts.stageError && opts.stageError(options.label)
           if (file === undefined) answer = await agent(prompt, options)
           else if (existsSync(file)) answer = { exit: 3 }
-          else {
+          else if (refusal) {
+            calls.push({ label: options.label, prompt: String(prompt), agentType: options.agentType, phase: options.phase, schema: options.schema, model: options.model })
+            writeFileSync(stageFile, moduleOf(stageFile, { error: refusal }))
+            answer = { exit: 2, error: 'the stage failed' }
+          } else {
             writeFileSync(file, '')
             const line = await agent(prompt, { ...options, schema: null })
             const sealed = !line || 'seal' in line || line.error ? line : sealLine(line)
@@ -1423,18 +1434,32 @@ test('the committer gets the claims without their hints, and the message on stdi
   assert.doesNotMatch(commit, /temporary file|mktemp|rm -f/)
 })
 
-// A relay command as Bash runs it: `cmd` from its prompt, its AGENTRC_EMIT moved to `emit`; the scripts under `root`.
-const runCommand = (cmd, root, emit, env = {}) => spawnSync('bash', ['-c', cmd.replace(/AGENTRC_EMIT='[^']+' /, `AGENTRC_EMIT='${emit}' `)],
-  { encoding: 'utf8', env: { ...process.env, AGENTRC_DIR: root, ...env } })
+// A relay command as Bash runs it: `cmd` from its prompt, its AGENTRC_EMIT moved to `emit` (its stage's beside it); the
+// scripts under `root`.
+const runCommand = (cmd, root, emit, env = {}) => spawnSync('bash', ['-c', cmd.replace(/AGENTRC_EMIT='[^']+\.stage\.js' /, `AGENTRC_EMIT='${emit}.stage.js' `)
+  .replace(/AGENTRC_EMIT='[^']+(?<!\.stage\.js)' /, `AGENTRC_EMIT='${emit}' `)], { encoding: 'utf8', env: { ...process.env, AGENTRC_DIR: root, ...env } })
 const commandOf = (prompt) => String(prompt).match(/run exactly `([^`]*)` and answer/)[1]
 // The interpreter the commands run under: PIN's /usr/bin/python3 does not exist on Windows; forward slashes for bash.
 const hostPython = () => spawnSync('python3', ['-c', 'import sys; print(sys.executable)'], { encoding: 'utf8' }).stdout.trim().replaceAll('\\', '/')
+// A relay's transcript as the runtime keeps it (#540): under CLAUDE_CONFIG_DIR's project directory of the session
+// CLAUDE_CODE_SESSION_ID names, its prompt the computed task of the first user record, each line indented two spaces
+// past the harness's frame; `after` the records that follow it. The env that names it.
+const SESSION = '3b3ec575-092d-4e18-a4d8-e20371216222'
+const FRAME = '[Workflow harness — computed task] The task text below was computed at runtime by a workflow script. The harness ' +
+  'indents every line of the computed text. The computed task text follows:\n'
+const transcript = (config, prompt, { name = 'agent-a1.jsonl', after = [], sid = SESSION } = {}) => {
+  const dir = join(config, 'projects', '-home-x', sid, 'subagents', 'workflows', 'wf_1')
+  mkdirSync(dir, { recursive: true })
+  const task = { type: 'user', message: { role: 'user', content: FRAME + String(prompt).split('\n').map(l => `  ${l}`).join('\n') } }
+  writeFileSync(join(dir, name), [task, ...after].map(r => JSON.stringify(r)).join('\n') + '\n')
+  return { CLAUDE_CONFIG_DIR: config, CLAUDE_CODE_SESSION_ID: SESSION }
+}
 
-const HOSTILE = `it's "quoted", \\ back\; \`tick\` $(touch /tmp/pwned) '\\'' \r\nline\r\n naïve ✓ 😀   EOF`
-// A stage that does not decode to the JSON sent: cut short, other JSON, not base64.
+const HOSTILE = `it's "quoted", \\ back\; \`tick\` $(touch /tmp/pwned) '\\'' \r\nline\r\n naïve ✓ 😀   EOF`
+// A payload that does not decode to the JSON sent: cut short, other JSON, not base64.
 const corrupted = (b64, json) => [Buffer.from(json.slice(0, -1)).toString('base64'), Buffer.from('[]').toString('base64'), `${b64.slice(0, 10)}!${b64.slice(11)}`]
 
-test('hostile text in a reply body reaches reply.py byte for byte; a corrupted stage runs no script (#510)', async () => {
+test('hostile text in a reply body reaches reply.py byte for byte from the relay transcript; a corrupted payload runs no script (#510, #540)', async () => {
   const tmp = mkdtempSync(join(tmpdir(), 'pr-babysit-exec-'))
   let emitRoot = null
   try {
@@ -1452,25 +1477,32 @@ test('hostile text in a reply body reaches reply.py byte for byte; a corrupted s
     const reply = calls.find(c => c.label === 'replies#1')
     const sent = stagedOf(reply.prompt)
     assert.equal(sent.replies[0].body, HOSTILE)
+    const cmd = commandOf(reply.prompt)
+    assert.doesNotMatch(cmd, /printf|base64|AGENTRC-PAYLOAD/, 'the command carries no payload')
     const out = join(tmp, 'receipt')
-    const cmd = commandOf(reply.prompt).replace(/--receipt '[^']+'/, `--receipt '${out}'`)
-    const got = runCommand(cmd, tmp, join(tmp, 'r.js'))
+    const local = cmd.replace(/--receipt '[^']+'/, `--receipt '${out}'`)
+    const env = transcript(join(tmp, 'config'), reply.prompt, { after: [
+      { type: 'assistant', message: { content: [{ type: 'text', text: `AGENTRC-PAYLOAD ${PAYLOAD_LINE.exec(reply.prompt)[1]} ${fnv1a(JSON.stringify(sent))} W10=` }] } }] })
+    const got = runCommand(local, tmp, join(tmp, 'r.js'), env)
     assert.equal(got.status, 0, got.stderr)
-    assert.equal(readFileSync(`${out}.got`, 'utf8'), JSON.stringify(sent), 'the manifest is the JSON the workflow sent, byte for byte')
+    assert.equal(readFileSync(`${out}.got`, 'utf8'), JSON.stringify(sent), "the manifest is the JSON the workflow sent, byte for byte, the assistant's quoted line ignored")
     assert.equal(existsSync('/tmp/pwned'), false)
-    const b64 = cmd.match(/printf '%s' '([^']*)'/)[1]
-    for (const bad of corrupted(b64, JSON.stringify(sent))) {
+    const b64 = PAYLOAD_LINE.exec(reply.prompt)[3]
+    corrupted(b64, JSON.stringify(sent)).forEach((bad, i) => {
       rmSync(`${out}.got`, { force: true })
-      assert.notEqual(runCommand(cmd.replace(b64, bad), tmp, join(tmp, 'bad.js')).status, 0)
+      const config = join(tmp, `bad-${i}`)
+      const ran = runCommand(local, tmp, join(tmp, `bad-${i}.js`), transcript(config, reply.prompt.replace(b64, bad)))
+      assert.notEqual(ran.status, 0)
       assert.equal(existsSync(`${out}.got`), false, 'reply.py never ran')
-    }
+      assert.match(readFileSync(join(tmp, `bad-${i}.js.stage.js`), 'utf8'), /facts\.py stage: the payload for .* is not/, 'the stage names itself in its own line')
+    })
   } finally {
     rmSync(tmp, { recursive: true, force: true })
     if (emitRoot) rmSync(emitRoot, { recursive: true, force: true })
   }
 })
 
-test('a CI verdict reaches collect.py remember with no shell quoting, byte for byte; a malformed one is refused before it (#505)', async () => {
+test('a CI verdict reaches collect.py remember with no shell quoting, byte for byte; a malformed one is refused before it (#505, #540)', async () => {
   const tmp = mkdtempSync(join(tmpdir(), 'pr-babysit-exec-'))
   const ROOT = fileURLToPath(new URL('..', import.meta.url))
   let emitRoot = null
@@ -1485,36 +1517,42 @@ test('a CI verdict reaches collect.py remember with no shell quoting, byte for b
     const store = join(tmp, 'store')
     mkdirSync(store)
     const cmd = commandOf(remember.prompt)
-    const kept = runCommand(cmd, ROOT, join(tmp, 'w.js'), { TMPDIR: store })
+    const kept = runCommand(cmd, ROOT, join(tmp, 'w.js'), { TMPDIR: store, ...transcript(join(tmp, 'config'), remember.prompt) })
     assert.equal(kept.status, 0, kept.stderr)
     const head = remember.prompt.match(/--head ([0-9a-f]{40})/)[1]
     const saved = JSON.parse(readFileSync(join(store, 'ci-collect', 'hathach_tinyusb', '3888', head, 'verdicts.json'), 'utf8'))
     assert.deepEqual(Object.values(saved), verdicts, 'collect.py remember stores the verdicts as judged')
     assert.equal(existsSync('/tmp/pwned'), false)
-    const b64 = cmd.match(/printf '%s' '([^']*)'/)[1]
-    for (const bad of corrupted(b64, JSON.stringify(verdicts))) {
-      const empty = join(tmp, `empty-${fnv1a(bad)}`)
+    const b64 = PAYLOAD_LINE.exec(remember.prompt)[3]
+    corrupted(b64, JSON.stringify(verdicts)).forEach((bad, i) => {
+      const empty = join(tmp, `empty-${i}`)
       mkdirSync(empty)
-      assert.notEqual(runCommand(cmd.replace(b64, bad), ROOT, join(tmp, 'bad.js'), { TMPDIR: empty }).status, 0)
+      const env = transcript(join(tmp, `bad-${i}`), remember.prompt.replace(b64, bad))
+      assert.notEqual(runCommand(cmd, ROOT, join(tmp, `bad-${i}.js`), { TMPDIR: empty, ...env }).status, 0)
       assert.equal(existsSync(join(empty, 'ci-collect')), false, 'remember never ran')
-      assert.equal(existsSync(join(tmp, 'bad.js')), false, 'no line')
-    }
+      assert.equal(existsSync(join(tmp, `bad-${i}.js`)), false, 'no line')
+    })
   } finally {
     rmSync(tmp, { recursive: true, force: true })
     if (emitRoot) rmSync(emitRoot, { recursive: true, force: true })
   }
 })
 
-test('every script input is written by the command that runs the script, at a path the workflow names (#510)', async () => {
+test('every script input is written by the command that runs the script, at a path the workflow names (#510, #540)', async () => {
   const { calls } = await run({ reviews: { findings: [finding(), invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'not so' }], bots: 'reviewed' }, args: { autoPush: true } })
-  const inputs = calls.filter(c => /printf '%s' /.test(c.prompt))
+  const inputs = calls.filter(c => PAYLOAD_LINE.test(c.prompt))
   assert.deepEqual(inputs.map(c => c.label).sort(), ['replies#1', 'resolve#1'])
   for (const c of inputs) {
-    // One command: the stage, then the script under `&&`, both naming the one input file beside the line.
+    // One command: the stage, then the script under `&&`, both naming the one input file beside the line; the payload
+    // closes the prompt, outside the command, naming that file and the JSON's fnv1a.
     const [, cmd] = c.prompt.match(/run exactly `([^`]*)`/)
-    const [, stage, emit, rest] = cmd.match(/^(printf .*) && AGENTRC_EMIT='([^']+)\.js' (.*)$/)
-    assert.ok(stage.includes(` '${emit}.in' `) && rest.includes(` --manifest '${emit}.in' `), cmd)
-    assert.doesNotMatch(c.prompt, /temporary file|mktemp|Manifest:/, c.label)
+    const [, stageEmit, digest, emit, rest] = cmd.match(/^AGENTRC_EMIT='([^']+)\.stage\.js' \S+ \S+facts\.py stage '[^']+' ([0-9a-f]{8}) --from-transcript && AGENTRC_EMIT='([^']+)\.js' (.*)$/)
+    assert.equal(stageEmit, emit)
+    assert.ok(cmd.includes(` stage '${emit}.in' `) && rest.includes(` --manifest '${emit}.in' `), cmd)
+    const [line, path, sum] = c.prompt.match(PAYLOAD_LINE)
+    assert.deepEqual([path, sum], [`${emit}.in`, digest])
+    assert.ok(c.prompt.endsWith(`\n${line}`), 'the payload line closes the prompt')
+    assert.doesNotMatch(c.prompt, /temporary file|mktemp|Manifest:|printf/, c.label)
   }
 })
 
@@ -3763,7 +3801,7 @@ test('reviews go to the validator role directly, and no lane leaves the roles', 
   // call would never be reached here, and runCycle would absorb the stub's throw
   // as 'cycle-threw' if it were. So refuse the spelling too, over the whole source:
   // the one call is the emitted line's load.
-  assert.deepEqual([...body.matchAll(/\bworkflow\s*\([^)]+\)/g)].map(m => m[0]), ['workflow({ scriptPath: file })'], 'this workflow must never nest another workflow')
+  assert.deepEqual([...body.matchAll(/\bworkflow\s*\([^)]+\)/g)].map(m => m[0]), ['workflow({ scriptPath: path })'], 'this workflow must never nest another workflow')
   assert.doesNotMatch(body, /codex-agent/, 'the review lane is a Claude role, not a codex agent')
 })
 
@@ -3847,6 +3885,31 @@ test("a reply.py killed after posting, its relay surviving, is settled by its sa
   // reply.py's own error line is its answer: no replay.
   const own = await run({ reviews, replyError: (l) => l === 'replies#1' && 'gh: HTTP 502' })
   assert.deepEqual(own.labels.filter(l => l.startsWith('replies#')), ['replies#1'])
+})
+
+test('a payload facts.py stage refused publishes nothing, is named as the stage, and is no unknown outcome to replay (#540)', async () => {
+  const reviews = { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'no' }], bots: 'reviewed' }
+  const why = 'facts.py stage: the payload for /x/replies_1.1.0a1b2c3d.in is not the JSON sent'
+  const { result, logs, labels } = await run({ reviews, stageError: (l) => l === 'replies#1' && why })
+  assert.deepEqual(labels.filter(l => l.startsWith('replies#')), ['replies#1'], 'no replay: reply.py never ran')
+  const posts = result.history[0].refutedPosts
+  assert.deepEqual([posts.pass, posts.detail, posts.receipts], [false, why, []])
+  assert.ok(logs.includes(`cycle 1: replies#1 incomplete — ${why}`), logs.join('\n'))
+  assert.equal(logs.some(l => l.includes('reply.py: facts.py stage')), false, 'never read as reply.py\'s')
+  assert.equal(result.state.answeredWith.some(([id]) => id === 2), false, 'nothing answered')
+  // The receipt is the request's, named by its label: a payload staged afresh by a .replay or .retry relay keeps it.
+  const killed = await run({ reviews, killedAfter: (l) => l === 'replies#1' })
+  const receiptOf = (label) => killed.calls.find(c => c.label === label).prompt.match(/--receipt '([^']+)'/)[1]
+  const inputOf = (label) => killed.calls.find(c => c.label === label).prompt.match(PAYLOAD_LINE)[1]
+  assert.equal(receiptOf('replies#1'), receiptOf('replies#1.replay'))
+  assert.notEqual(inputOf('replies#1'), inputOf('replies#1.replay'), 'each relay names its own input and payload line')
+  assert.equal(stagedText(killed.calls.find(c => c.label === 'replies#1.replay').prompt), stagedText(killed.calls.find(c => c.label === 'replies#1').prompt))
+  // Every staged() caller: a refusing stage is its definite failure, named as the stage's.
+  const scan = { findings: [invalidFinding({ source: 'code-scanning', commentId: 3 })], replies: [{ commentId: 3, body: 'Not injectable.' }], bots: 'reviewed' }
+  const sonar = await run({ reviews: scan, args: { autoPush: true, markSonar: true, maxCycles: 1 },
+    stageError: (l) => l === 'sonar#1' && 'facts.py stage: no AGENTRC-PAYLOAD line for /x.in 0a1b2c3d' })
+  assert.ok(sonar.logs.includes('sonar#1: facts.py stage: no AGENTRC-PAYLOAD line for /x.in 0a1b2c3d — the issues stay owed, nothing more is asked this launch'),
+    sonar.logs.join('\n'))
 })
 
 test('every dismissal is challenged before it is posted', async () => {

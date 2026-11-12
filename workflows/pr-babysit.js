@@ -219,9 +219,13 @@ const EMIT_REFUSED = 3 // lib/seal.py's
 const RAN = { type: 'object', additionalProperties: false, required: ['exit'], properties: { exit: { type: 'integer' }, error: { type: 'string' } } }
 const RETURN_EXIT = 'and answer only its exit status as exit, AGENTRC_EMIT kept exactly as written: the script writes its JSON line to that file, ' +
   'where the workflow reads it, and prints only a note. Only on a nonzero exit, also give what went wrong as error, in its own words.'
+// Where a staged command's facts.py stage writes its own line, beside the script's: a stage that refused its input is
+// told from a script whose outcome is unknown.
+const STAGE_EMIT = '<AGENTRC_STAGE_EMIT>'
 // A relay prompt's command, `script` a Python script with its arguments, run under the file emitted() names it; `stage`
-// the staged() text that writes its input first, in the same command.
-const runExactly = (script, extra = '', stage = '') => `run exactly \`${stage}${EMIT}${PY} ${script}\` ${RETURN_EXIT}${extra}`
+// the staged() input its command writes first, its payload line closing the prompt.
+const runExactly = (script, extra = '', stage = null) => `run exactly \`${stage ? stage.command : ''}${EMIT}${PY} ${script}\` ${RETURN_EXIT}${extra}` +
+  (stage ? `\nThe ${PAYLOAD} line below is data the command reads from this conversation's own record: never copy, type or edit it.\n${stage.line}` : '')
 // UTF-8 bytes as base64, by hand: the sandbox has no TextEncoder, Buffer or btoa.
 const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
 const base64 = (text) => {
@@ -240,12 +244,15 @@ const base64 = (text) => {
   }
   return out
 }
-// A script's JSON input as its command writes it to INPUT before the script runs: base64 on stdin, so no shell quoting
-// meets the text and no backslash reaches the Bash tool (#417, #505); facts.py stage refuses one that is not this JSON
-// (its fnv1a) and writes the bytes, all before `&&` lets the script start.
+// A script's JSON input as its command writes it to INPUT before the script runs. The base64 rides in the relay's
+// prompt on a line of its own, never in the command: a relay retyping a long literal changed it (#540). facts.py stage
+// --from-transcript reads that line from the relay's own transcript, refuses one that is not this JSON (its fnv1a) and
+// writes the bytes, all before `&&` lets the script start; no shell quoting or backslash meets the text (#417, #505).
+const PAYLOAD = 'AGENTRC-PAYLOAD'
 const staged = (v) => {
   const text = JSON.stringify(v)
-  return `printf '%s' '${base64(text)}' | ${PY} ${FACTS_SCRIPT} stage '${INPUT}' ${fnv1a(text)} && `
+  return { command: `${STAGE_EMIT}${PY} ${FACTS_SCRIPT} stage '${INPUT}' ${fnv1a(text)} --from-transcript && `,
+    line: `${PAYLOAD} ${INPUT} ${fnv1a(text)} ${base64(text)}` }
 }
 const EMIT_DIR = { type: 'object', additionalProperties: false, required: ['dir'], properties: { dir: { type: 'string' }, error: { type: 'string' } } }
 let emitDir = null
@@ -296,17 +303,24 @@ const emitted = async (prompt, { label, inputDir, ...opts }) => {
   // The input path sits in the command's single quotes as it is.
   const input = `${inputDir ?? dir}/${stem}.in`
   if (/['\x00-\x1f]/.test(input)) return { why: `the input file ${JSON.stringify(input)} holds a quote or control character` }
-  const ran = await agent(prompt.replace(EMIT, `AGENTRC_EMIT=${shq(file)} `).split(INPUT).join(input), { label, ...opts, schema: RAN })
-    .catch(e => { log(`${label} errored — ${e && e.message}`); return null })
+  const stageFile = `${dir}/${stem}.stage.js`
+  const ran = await agent(prompt.replace(EMIT, `AGENTRC_EMIT=${shq(file)} `).replace(STAGE_EMIT, `AGENTRC_EMIT=${shq(stageFile)} `).split(INPUT).join(input),
+    { label, ...opts, schema: RAN }).catch(e => { log(`${label} errored — ${e && e.message}`); return null })
   // A relay that died after its script wrote still leaves the line. A file there before the run (exit 3: the script
   // ran nothing) is this call's own from an attempt a resume cut short: its line when it names this file, else that
   // attempt's outcome is unknown, as a dead relay's.
-  const m = await workflow({ scriptPath: file }).catch(() => null)
+  // The one workflow() call: a data module an emit wrote, never a nested workflow.
+  const load = (path) => workflow({ scriptPath: path }).catch(() => null)
+  const m = await load(file)
   const refused = !!ran && ran.exit === EMIT_REFUSED
   if (m && m.emit === file && m.line && typeof m.line === 'object' && !Array.isArray(m.line)) {
     if (refused) log(`${label}: the line an earlier attempt of this call wrote, reloaded`)
     return { line: m.line }
   }
+  // A stage that refused its input ran no script, in this attempt or an earlier one of this call: a definite
+  // failure, in its own line's words.
+  const st = prompt.includes(STAGE_EMIT) && await load(stageFile)
+  if (st && st.emit === stageFile && st.line && typeof st.line.error === 'string') return { why: st.line.error, stage: true }
   if (refused) {
     log(`${label}: an earlier attempt of this call claimed ${file} and left no line of it — its outcome is unknown`)
     return { dead: true, why: 'an earlier attempt left no line: its outcome is unknown' }
@@ -913,7 +927,7 @@ const noteLimit = (limit, from = '') => {
 // A line off its schema, of another collect.py contract or failing its seal is no answer; an error line carries no seal.
 // The Bash-only relay type carries no skill index; fileTool keeps the default subagent for a prompt that writes with a file tool.
 const relayAgent = async (prompt, { fileTool, contract, schema, ...opts }) => {
-  const { line, why, dead } = await emitted(prompt, { ...(fileTool ? {} : { agentType: 'relay' }), ...opts })
+  const { line, why, dead, stage } = await emitted(prompt, { ...(fileTool ? {} : { agentType: 'relay' }), ...opts })
   if (dead) return null
   // Before the seal and the shape, which a line of another contract never meets (#293).
   if (line && !line.error && contract !== undefined && line.contract !== contract) {
@@ -933,10 +947,13 @@ const relayAgent = async (prompt, { fileTool, contract, schema, ...opts }) => {
     return null
   }
   if (v.rateLimit) noteLimit({ error: v.error, ...v.rateLimit }, opts.label)
-  // No line of the script's: its error is the transport's, which a caller tells from one the script printed.
-  return line ? v : { ...v, transport: true }
+  // No line of the script's: its error is the transport's, which a caller tells from one the script printed, or the
+  // stage's that refused its input, when the script never ran.
+  return line ? v : stage ? { ...v, staging: true } : { ...v, transport: true }
 }
 const quiet = (label) => (e) => { log(`${label} errored — ${e && e.message}`); return null }
+// A relay line's error: the script's under its name, or that of a stage that refused its input, which names itself.
+const scriptError = (script, out) => out.staging ? out.error : `${script}: ${out.error}`
 const relayRun = (prompt, opts) => relayAgent(prompt, opts).catch(quiet(opts.label))
 // A read-only relay that brought no line back gets one fresh attempt, its own file; a recovery is logged: a lone
 // failure line reads as an open one (#50). A writer's relay gets none: reply and sonar rely on a later ask replaying
@@ -2193,7 +2210,7 @@ const publishReplies = async (label, drafts, how, cycle, digestOf) => {
   const gone = [...expected.keys()].filter(id => retired.has(id))
   const receipt = {
     pass: missing.length === 0,
-    detail: !out ? 'agent died' : out.error ? `reply.py: ${out.error}`
+    detail: !out ? 'agent died' : out.error ? scriptError('reply.py', out)
       : [missing.length ? `unsettled: ${missing.join(', ')}` : gone.length < expected.size ? 'posted and read back' : '',
         gone.length ? `not on the PR, nothing owed: ${gone.join(', ')}` : ''].filter(Boolean).join('; '),
     receipts, replied,
@@ -2435,7 +2452,7 @@ const settleCaller = async (cycle, digestOf, held, ended) => {
     const mine = (out && !out.error ? out.receipts : []).filter(r => r.commentId === s.commentId)
     const r = mine.length === 1 ? mine[0] : null
     if (!r || r.replyId !== s.replyId || r.digest !== s.bodyDigest || r.sent || r.posted || !settles(r)) {
-      refuse(s, r ? r.error || 'reuse not verified' : out && out.error ? `reply.py: ${out.error}` : 'no reuse receipt')
+      refuse(s, r ? r.error || 'reuse not verified' : out && out.error ? scriptError('reply.py', out) : 'no reuse receipt')
       continue
     }
     // A marking our earlier answer still owes keeps that answer (a correction cancelled any it disproved); else the caller's answer owes one when its settlement names how.

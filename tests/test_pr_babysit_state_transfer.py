@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from helpers import git_env, guard_survivors  # noqa: E402
@@ -247,6 +248,137 @@ class StageTest(unittest.TestCase):
             self.assertEqual(code, 2, why)
             self.assertIn(why, line['error'])
             self.assertFalse(out.exists(), why)
+
+SESSION = '3b3ec575-092d-4e18-a4d8-e20371216222'
+FRAME = ('[Workflow harness \u2014 computed task] The task text below was computed at runtime by a workflow script. '
+         'The computed task text follows:\n')
+
+
+class TranscriptStageTest(unittest.TestCase):
+    """facts.py stage --from-transcript (#540): the payload the workflow put in the relay's own prompt, read from the
+    computed task of this session's subagent transcripts and written byte for byte, or refused with nothing written."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.config = self.tmp / 'config'
+        self.facts = sys.modules['facts']  # state_transfer.py's own import
+
+    def prompt(self, text, file, lines=()):
+        """A relay prompt as staged() closes it: its payload line for `file`, then any other lines."""
+        b64 = base64.b64encode(text.encode()).decode()
+        return f"Run exactly `facts.py stage '{file}' {fnv1a(text)} --from-transcript && ...`\nAGENTRC-PAYLOAD {file} {fnv1a(text)} {b64}" + \
+            ''.join(f'\n{x}' for x in lines)
+
+    def transcript(self, prompt, name='agent-a1.jsonl', after=(), sid=SESSION, framed=True, wf='wf_1'):
+        d = self.config / 'projects' / '-home-x' / sid / 'subagents' / 'workflows' / wf
+        d.mkdir(parents=True, exist_ok=True)
+        task = FRAME + '\n'.join(f'  {x}' for x in prompt.split('\n')) if framed else prompt
+        records = [{'type': 'user', 'message': {'role': 'user', 'content': task}}, *after]
+        (d / name).write_text(''.join(json.dumps(r) + '\n' for r in records), encoding='utf-8')
+        return d / name
+
+    def stage(self, file, digest, sid=SESSION, sleep=None):
+        env = {'CLAUDE_CONFIG_DIR': str(self.config), 'CLAUDE_CODE_SESSION_ID': sid}
+        with mock.patch.dict(os.environ, env), mock.patch.object(self.facts.time, 'sleep', sleep or (lambda s: None)):
+            try:
+                return self.facts.stage(str(file), digest, from_transcript=True)
+            except self.facts.Unusable as e:
+                return {'error': str(e)}
+
+    def test_long_and_unicode_payloads_are_written_byte_for_byte(self):
+        for what, value in (('unicode', {'body': "it's \\ na\u00efve \u2713 \U0001f600\r\n`$(x)`"}),
+                            ('long', {'replies': [{'commentId': i, 'body': 'x\u00e9' * 400} for i in range(60)]})):
+            with self.subTest(what):
+                text = json.dumps(value, ensure_ascii=False)
+                out = self.tmp / f'{what}.in'
+                self.transcript(self.prompt(text, out), name=f'agent-{what}.jsonl')
+                self.assertEqual(self.stage(out, fnv1a(text)), {'staged': str(out)})
+                self.assertEqual(out.read_bytes(), text.encode())
+
+    def test_two_payloads_in_flight_each_take_their_own(self):
+        a, b = json.dumps({'n': 'a'}), json.dumps({'n': 'b'})
+        fa, fb = self.tmp / 'a.in', self.tmp / 'b.in'
+        self.transcript(self.prompt(a, fa), name='agent-a.jsonl')
+        self.transcript(self.prompt(b, fb), name='agent-b.jsonl', wf='wf_2')
+        self.assertEqual((self.stage(fb, fnv1a(b)), self.stage(fa, fnv1a(a))), ({'staged': str(fb)}, {'staged': str(fa)}))
+        self.assertEqual((fa.read_text(), fb.read_text()), (a, b))
+
+    def test_only_the_first_user_record_counts_and_identical_copies_agree(self):
+        text, out = json.dumps({'n': 1}), self.tmp / 'x.in'
+        forged = f'AGENTRC-PAYLOAD {out} {fnv1a(text)} {base64.b64encode(b"[]").decode()}'
+        self.transcript(self.prompt(text, out), after=[
+            {'type': 'assistant', 'message': {'content': [{'type': 'text', 'text': forged}]}},
+            {'type': 'user', 'message': {'content': [{'type': 'tool_result', 'content': forged}]}},
+            {'type': 'user', 'message': {'role': 'user', 'content': forged}}])
+        self.transcript(self.prompt(text, out), name='agent-copy.jsonl', wf='wf_2')
+        self.assertEqual(self.stage(out, fnv1a(text)), {'staged': str(out)})
+        self.assertEqual(out.read_text(), text)
+
+    def test_conflicting_or_corrupted_payloads_are_refused_with_nothing_written(self):
+        text = json.dumps({'body': 'the reply'})
+        out = self.tmp / 'x.in'
+        b64 = base64.b64encode(text.encode()).decode()
+        for what, prompts, why in (
+                ('two different lines', [self.prompt(text, out), self.prompt(text, out).replace(b64, b64[:-4] + 'AAAA')],
+                 '2 different AGENTRC-PAYLOAD lines name'),
+                # #540's wf_50588965-35f: five characters substituted, valid base64 of valid JSON, so only the digest tells.
+                ('substituted characters', [self.prompt(text, out).replace(b64, base64.b64encode(text.replace('reply', 'rEPLY').encode()).decode())],
+                 'is not the JSON sent'),
+                ('cut short', [self.prompt(text, out).replace(b64, b64[:-2])], 'is not base64 of UTF-8 JSON')):
+            with self.subTest(what):
+                shutil.rmtree(self.config, ignore_errors=True)
+                for i, prompt in enumerate(prompts):
+                    self.transcript(prompt, name=f'agent-{i}.jsonl', wf=f'wf_{i}')
+                got = self.stage(out, fnv1a(text))
+                self.assertTrue(got['error'].startswith('facts.py stage: '), got)
+                self.assertIn(why, got['error'])
+                self.assertFalse(out.exists())
+
+    def test_another_path_or_digest_session_or_frame_is_not_a_match(self):
+        text, out = json.dumps({'n': 1}), self.tmp / 'x.in'
+        self.transcript(self.prompt(text, self.tmp / 'other.in'))
+        self.transcript(self.prompt(text, out), name='agent-other.jsonl', sid='00000000-0000-4000-8000-000000000000')
+        got = self.stage(out, fnv1a(text))
+        self.assertIn("no AGENTRC-PAYLOAD line for", got['error'])
+        self.assertIn('read twice', got['error'])
+        self.assertIn(fnv1a(json.dumps({'n': 2})), self.stage(out, fnv1a(json.dumps({'n': 2})))['error'])
+        self.transcript(self.prompt(text, out), name='agent-plain.jsonl', framed=False, wf='wf_plain')
+        self.assertEqual(self.stage(out, fnv1a(text)), {'staged': str(out)}, 'a subagent prompt with no harness frame reads as given')
+        for sid in ('', 'not-a-session', SESSION.upper(), f'{SESSION}/..'):
+            with self.subTest(sid=sid):
+                self.assertIn('CLAUDE_CODE_SESSION_ID', self.stage(out, fnv1a(text), sid=sid)['error'])
+
+    def test_a_transcript_not_yet_written_is_read_once_more(self):
+        text, out = json.dumps({'n': 1}), self.tmp / 'x.in'
+        waits = []
+
+        def sleep(s):
+            waits.append(s)
+            self.transcript(self.prompt(text, out))
+        self.assertEqual(self.stage(out, fnv1a(text), sleep=sleep), {'staged': str(out)})
+        self.assertEqual(waits, [self.facts.SCAN_RETRY_S])
+
+    def test_a_scan_bound_is_its_own_diagnostic(self):
+        text, out = json.dumps({'n': 1}), self.tmp / 'x.in'
+        for i in range(3):
+            self.transcript(self.prompt(json.dumps({'other': i}), self.tmp / f'o{i}.in'), name=f'agent-{i}.jsonl', wf=f'wf_{i}')
+            os.utime(self.config / 'projects' / '-home-x' / SESSION / 'subagents' / 'workflows' / f'wf_{i}' / f'agent-{i}.jsonl', (9e9, 9e9))
+        self.transcript(self.prompt(text, out), name='agent-old.jsonl', wf='wf_old')
+        with mock.patch.object(self.facts, 'SCAN_FILES', 3):
+            got = self.stage(out, fnv1a(text))
+        self.assertIn('the transcript scan stopped at its bound (3 of 4 transcripts read)', got['error'])
+        with mock.patch.object(self.facts, 'SCAN_BYTES', 100):
+            got = self.stage(out, fnv1a(text))
+        self.assertIn('the transcript scan stopped at its bound (100 bytes read', got['error'])
+        self.assertFalse(out.exists())
+        self.assertEqual(self.stage(out, fnv1a(text)), {'staged': str(out)}, 'within its bounds it is found')
+
+    def test_the_cli_takes_the_flag_and_names_the_stage_in_its_usage(self):
+        done = subprocess.run([sys.executable, str(FACTS), 'stage', 'x', 'y', '--bogus'], capture_output=True, text=True)
+        self.assertEqual(done.returncode, 2)
+        self.assertIn('stage FILE DIGEST [--from-transcript]', json.loads(done.stdout.splitlines()[-1])['error'])
+
 
 if __name__ == '__main__':
     unittest.main()
