@@ -1847,6 +1847,9 @@ class Manual(Base):
         self.lock.records['rig_jlink'] = {'reason': 'someone else', 'pid': 1}
         with self.assertRaisesRegex(H.NotHeld, 'not held'):
             H.held_by('rig_jlink', 'mine')
+        self.lock.records['rig_jlink'] = {'reason': 'mine', 'pid': 1, 'cleanupOwed': True}
+        with self.assertRaisesRegex(H.NotHeld, 'not held'):     # a protected task's record kept for the next take
+            H.held_by('rig_jlink', 'mine')
         self.lock.records['rig_jlink'] = {'reason': 'mine', 'pid': 1}
         H.held_by('rig_jlink', 'mine')
         with mock.patch.object(self.lock, 'is_locked', return_value=False):   # a second read, unreadable
