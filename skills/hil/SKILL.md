@@ -60,7 +60,9 @@ nothing in it through a link.
   outcome: no hold outlives its task for recovery, and no manual unlock step
   follows a failed cleanup. A detached manual hold (`hil_lock.py hold`, a
   project's manual session) is the exception: it lasts until its holder
-  releases it, and a failed cleanup under it is logged all the same. The
+  releases it, and a failed cleanup under it is logged all the same. Its
+  holder, like a remote attempt's supervisor, starts without the hc terminal's
+  `HC_SCOPE`, so that terminal's cleanup does not end it. The
   flock is the only refusal to take the lock; admission to the hardware is
   the busy check's (below). A free flock is
   always taken; what a task that ended without its cleanup left there (a

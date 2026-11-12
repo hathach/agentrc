@@ -60,6 +60,9 @@ DIR_MODE = 0o755
 SHARE_STEP = (f'a second OS user needs the lock dir sticky and world-writable, a one-time host step '
               f'once every project on the host runs this helper: sudo install -d -m 1777 {BOARD_LOCK_DIR}')
 RELEASE_WAIT = 3.0            # s a signalled holder gets to clear its records and exit
+# herdr-core (hc) ends every process whose starting environment carries a terminal's HC_SCOPE when it cleans up
+# after that terminal, setsid'd ones included: the hold holder, which outlives its terminal, starts without them
+DETACHED_ENV_DROP = ('HC_SCOPE',)
 _NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._+-]*\Z')
 
 
@@ -1844,7 +1847,53 @@ def cmd_hold(boards, reason):
         os.dup2(devnull, std_fd)
     if devnull > 2:
         os.close(devnull)
+    if _starts_scoped():
+        _exec_holder(boards, reason, w_fd, ack_r)
+    _holder(boards, reason, w_fd, ack_r)
 
+
+def _starts_scoped() -> bool:
+    """Whether os.environ or the environment this process started with (/proc/self/environ: what a fork keeps
+    whatever os.environ drops, and what hc reads) names one of DETACHED_ENV_DROP; true when that is unreadable."""
+    if any(k in os.environ for k in DETACHED_ENV_DROP):
+        return True
+    try:
+        with open('/proc/self/environ', 'rb') as f:
+            names = {e.partition(b'=')[0] for e in f.read().split(b'\0')}
+    except OSError:
+        return bool(DETACHED_ENV_DROP)
+    return any(os.fsencode(k) in names for k in DETACHED_ENV_DROP)
+
+
+# a fresh interpreter's holder: argv is this file, BOARD_LOCK_DIR, the reason, the two pipe fds, the boards
+_HOLDER_BOOT = (
+    'import importlib.util, sys\n'
+    "spec = importlib.util.spec_from_file_location('agentrc_hil_lock', sys.argv[1])\n"
+    'lock = importlib.util.module_from_spec(spec)\n'
+    'sys.modules[spec.name] = lock\n'
+    'spec.loader.exec_module(lock)\n'
+    'lock.BOARD_LOCK_DIR = sys.argv[2]\n'
+    'lock._holder(sys.argv[6:], sys.argv[3], int(sys.argv[4]), int(sys.argv[5]))\n')
+
+
+def _exec_holder(boards, reason, w_fd, ack_r):
+    """Become the holder in a fresh interpreter whose environment is os.environ without DETACHED_ENV_DROP, the pipes
+    passed on: only an exec sets the environment a process started with. Never returns; a failed exec is reported."""
+    env = {k: v for k, v in os.environ.items() if k not in DETACHED_ENV_DROP}
+    try:
+        for fd in (w_fd, ack_r):
+            os.set_inheritable(fd, True)
+        os.execve(sys.executable, [sys.executable, '-I', '-c', _HOLDER_BOOT, os.path.abspath(__file__),
+                                   BOARD_LOCK_DIR, reason, str(w_fd), str(ack_r), *boards], env)
+    except OSError as e:
+        with contextlib.suppress(OSError):
+            os.write(w_fd, f'0holder not started: {e}'.encode())
+    os._exit(1)
+
+
+def _holder(boards, reason, w_fd, ack_r):
+    """The hold holder: take every board, report readiness on w_fd and keep the hold once ack_r acknowledges it,
+    until SIGTERM. Never returns."""
     def report(text) -> bool:
         """False when the parent is gone or stopped waiting (EPIPE, or no ack of a readiness):
         it reports a failure."""

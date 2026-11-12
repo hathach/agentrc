@@ -145,6 +145,8 @@ class LockDir(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
         os.environ.pop('HIL_NO_BOARD_LOCK', None)
+        # a hold's holder stays this process's fork, which the patches here reach, even under an hc terminal
+        self.patch(hil_lock, 'DETACHED_ENV_DROP', ())
 
     def patch(self, obj, name, value):
         p = mock.patch.object(obj, name, value)
@@ -759,6 +761,72 @@ class DetachedHolder(LockDir):
         deadline = time.monotonic() + 10
         while any(hil_lock.read_record(b) for b in boards) and time.monotonic() < deadline:
             _sleep(0.02)
+
+    def scoped(self):
+        """An hc terminal's environment: the holder must start without its HC_SCOPE. Returns a marker variable's
+        `name=value`, which only processes started from this test carry in their starting environment."""
+        self.patch(hil_lock, 'DETACHED_ENV_DROP', ('HC_SCOPE',))
+        marker = f'HIL_SELFTEST_MARK={secrets.token_hex(8)}'
+        os.environ.update([marker.split('='), ('HC_SCOPE', 'selftest-scope')])
+        return marker
+
+    @staticmethod
+    def started_env(pid) -> list:
+        return Path(f'/proc/{pid}/environ').read_bytes().decode().split('\0')
+
+    def marked(self, marker) -> list:
+        """The live processes whose starting environment carries `marker`."""
+        pids = []
+        for d in Path('/proc').iterdir():
+            with suppress(OSError, ValueError):
+                if marker in self.started_env(int(d.name)) and pid_alive(int(d.name)):
+                    pids.append(int(d.name))
+        return pids
+
+    def test_a_holder_started_from_an_hc_terminal_starts_without_its_scope(self):
+        """#365: hc ends every process that started with a terminal's HC_SCOPE when it cleans up after that terminal;
+        os.environ cannot drop it from a fork, so the holder is exec'd without it, the rest of the environment kept."""
+        marker = self.scoped()
+        with quiet() as (out, _):
+            self.assertEqual(hil_lock.cmd_hold([BOARD, BOARD + '-2'], 'selftest hold'), 0)
+        pid = hil_lock.read_record(BOARD)['pid']
+        self.addCleanup(kill_quietly, pid)
+        self.assertIn('held: ', out.getvalue())
+        env = self.started_env(pid)
+        self.assertFalse([e for e in env if e.startswith('HC_SCOPE=')], env)
+        self.assertIn(marker, env)
+        self.assertEqual(Path(f'/proc/{pid}/cmdline').read_bytes().split(b'\0')[1:3], [b'-I', b'-c'])
+        self.assertNotEqual(os.getsid(pid), os.getsid(0))
+        self.assertEqual(sorted(os.readlink(f'/proc/{pid}/fd/{fd}') for fd in (0, 1, 2)), [os.devnull] * 3)
+        self.assertEqual(hil_lock.read_record(BOARD + '-2')['pid'], pid)
+        self.patch(hil_lock.time, 'sleep', lambda s: self.wait_cleared([BOARD, BOARD + '-2']))
+        with quiet():
+            self.assertEqual(hil_lock.cmd_release([BOARD]), 0)
+        self.assertIsNone(hil_lock.read_record(BOARD + '-2'))
+        deadline = time.monotonic() + 10
+        while not self.flock_is_free() and time.monotonic() < deadline:
+            _sleep(0.02)
+        self.assertTrue(self.flock_is_free())
+        self.assertEqual(self.marked(marker), [])
+
+    def test_an_execd_holder_that_cannot_hold_leaves_no_daemon(self):
+        rival = self.holder(self.record(reason='rival'))       # started before the marker
+        marker = self.scoped()
+        with quiet() as (_, err):
+            self.assertEqual(hil_lock.cmd_hold([BOARD + '-2', BOARD], 'selftest hold'), 1)
+        self.assertIn(f'{BOARD} locked: ', err.getvalue())
+        self.wait_cleared([BOARD + '-2'])
+        self.assertIsNone(hil_lock.read_record(BOARD + '-2'))
+        self.assertEqual(hil_lock.read_record(BOARD)['pid'], rival.pid)
+        deadline = time.monotonic() + 10
+        while self.marked(marker) and time.monotonic() < deadline:
+            _sleep(0.02)
+        self.assertEqual(self.marked(marker), [])
+        self.patch(hil_lock.sys, 'executable', str(Path(self.dir, 'no-python')))      # inherited by the fork
+        with quiet() as (_, err):
+            self.assertEqual(hil_lock.cmd_hold([BOARD + '-2'], 'selftest hold'), 1)
+        self.assertIn('ERROR: holder not started: ', err.getvalue())
+        self.assertIsNone(hil_lock.read_record(BOARD + '-2'))
 
 
 class SafeFiles(LockDir):

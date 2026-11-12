@@ -1388,6 +1388,27 @@ class Attempts(Rig):
         self.assertEqual(sorted(v for k, v in fds.items() if k > 2), [str(records / 'driver.lock')])
         self.assertEqual(os.getsid(record['childPid']), record['sid'])
 
+    def test_the_supervisor_and_its_command_start_without_a_terminals_scope(self):
+        """#365: hc ends every process that started with a terminal's HC_SCOPE when it cleans up after that terminal;
+        the launcher's exec drops it, so neither the supervisor it forks nor the command carries it."""
+        fake(self.bin / 'ssh', FAKE_SSH.replace("env = {'HOME'", "env = {'HC_SCOPE': 'rig-scope', 'HOME'"))
+        tree = self.create()
+        self.stage(tree)
+        self.setenv(FAKE_SLEEP='30')
+        record = self.launch(tree, env={'HIL_ODD': 'kept'})
+        self.assertEqual(rc_.attempt_status(tree)['state'], 'running')
+        launch = [c['argv'][-1] for c in self.calls() if c['tool'] == 'ssh' and "' launch " in c['argv'][-1]]
+        self.assertEqual([shlex.split(c)[:4] for c in launch], [['env', '-u', 'HC_SCOPE', 'python3']])
+        for pid in (record['pid'], record['childPid']):
+            env = Path(f'/proc/{pid}/environ').read_bytes().decode().split('\0')
+            self.assertFalse([e for e in env if e.startswith('HC_SCOPE=')], env)
+            self.assertIn(f'HOME={self.home}', env)
+            self.assertIn(f'FAKE_RUN={self.run_file}', env)
+        child = Path(f'/proc/{record["childPid"]}/environ').read_bytes().decode().split('\0')
+        self.assertIn('HIL_ODD=kept', child)
+        self.assertIn(str(self.base / 'a1' / rc_.RECORDS / 'driver.lock'),
+                      [os.readlink(fd) for fd in Path(f'/proc/{record["childPid"]}/fd').iterdir()])
+
     def test_a_launch_is_never_repeated_and_staging_ends_at_the_launch(self):
         tree = self.create()
         self.stage(tree)
