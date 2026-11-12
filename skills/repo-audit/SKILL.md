@@ -95,9 +95,30 @@ Everything below that says "the build contract" or "the HIL contract" means thos
 
 - It covers the whole range `base..R` (R the reviewed head), the audit's changes and everyone else's. Keep a
   coverage ledger assigning every changed path to a batch (per subsystem for a large range); no record after
-  reviewing part of it. Each batch runs the user rules' completion sequence: simplification Phase 1 with hardware
-  flags, `read-doc` claim records for every hardware-dependent finding on every affected part, the Codex co-review;
-  `code-audit` may add coverage to a batch, never replace it. One review across the batches closes it.
+  reviewing part of it. Each batch runs the user rules' completion sequence with the correctness co-review below: every
+  batch's simplification Phase 1 with hardware flags and both correctness reviews run on the frozen target before any
+  repair, all started together; the user rules' `read-doc` claim records, also for a hardware-dependent finding first
+  raised during adjudication; then one adjudication of the batch's Phase 1 and correctness findings, one read-only
+  `cowork` lane per batch, sent together. `code-audit` may add coverage to a batch, never replace it. With more than one
+  batch or any repair, one co-review across the batches closes it: combined coverage, cross-batch interactions such as
+  callers across batches, and dispositions on the final R.
+- Correctness co-review, per batch, recorded as stage `correctness` (`finish` requires it), even where a step review
+  covered the batch. Its target is `base..R` in a checkout clean at the pinned R, the pathspecs selecting exactly the
+  batch's ledger paths (`dir/` for `dir/**`). Both sides review it independently with their built-in review; cleanups it
+  reports join Phase 1's findings:
+  - Claude: `/code-review high base..R -- <pathspecs>` from a session with a shell; a Codex lead asks a read-only
+    `cowork` Claude lane to invoke the code-review skill with those arguments.
+  - Codex: `codex review -c 'sandbox_mode="read-only"' -c 'model_reasoning_effort="high"' "<prompt>"`, the prompt naming
+    `git diff base..R -- <pathspecs>` and asking for the correctness defects the selected changes introduce, with
+    callers, imports and dependencies traced anywhere in the tree at R and unrelated defects outside the selected
+    changes excluded. Selector mode (`--base`) takes no prompt, so it is no substitute.
+  Run, wait on and cancel each by its own tool (a `cowork` lane by its Send and collect). Exit 0 proves nothing: a
+  blocked, partial or interrupted review leaves its side pending. Adjudicate by the user rules' `co-review`, each side's
+  findings validated by the other, agreement covering the coverage and every disposition; an unresolved finding goes to
+  the owner, never into a clean result.
+- Repairs follow the user rules' fix-diff co-review and coverage carry-over, with no new discovery pair unless scope,
+  base or coverage changed; note in the coverage ledger the R each batch's coverage was taken on (`finish`'s `--head` is
+  the final R).
 - Findings in code the audit did not change are fixed in an authorised stage or handed off as the Follow-ups rule
   says; unconfirmed hypotheses get a disposition.
 - Validation is derived from the whole range, not from the PR's own checks: every applicable build-contract check
@@ -121,8 +142,9 @@ Everything below that says "the build contract" or "the HIL contract" means thos
    finish refuses text that looks private, shell command shapes included: reword it as prose.
 2. Nothing may push to the PR after P. If the base branch moves or a commit lands on P anyway, drop P (revert it, or
    on the owner's word reset the branch to R and force-push it), bring R up to date, review the new commits into the
-   ledger, re-run validation for the new range on the new R, rewrite the review's `range`, run finish again, then
-   read and co-review the new record before committing it.
+   ledger through the Completion review's batch sequence, correctness co-review included, re-run validation for the new
+   range on the new R, rewrite the review's `range`, run finish again, then read and co-review the new record before
+   committing it.
 3. The PR merges by squash or rebase, up to date with its base branch: an ordinary merge commit or a stale branch
    makes the record invalid.
 4. After the merge, validate the merge commit E against the record's `validation.expected`, software and hardware,
