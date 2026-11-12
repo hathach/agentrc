@@ -173,11 +173,16 @@ pins each target's session once, so one replaced in its terminal while the relay
   `cancelled`, `undelivered` or `refused by the session that replaced its target`, when another session took the
   target's terminal before the send; `pending: <msg>...` means the wait lapsed: re-arm, or `cancel` what will not
   answer. A `held <msg> · <handle>` relay stays held until `relay --retry <action>` sends it or `cancel` closes it on
-  the human's word; nothing reports when its session could take it, so at each lapse whose `pending:` line names it, run
-  `relay --retry <action>` once before re-arming, and after three such lapses tell the human, who may cancel it or
-  have you keep retrying. Once delivered, it stays pending until its outcome or closure. A retry that prints
-  `uncertain` ends the retries: tell the human to check that session, which may have received it; it stays pending
-  until its outcome or a `cancel` on the human's word.
+  the human's word. One held because its session was working is watched by `collect` itself, through `hc get` within
+  its wait: once that session leaves working, it prints `left working <action> · <handle> · now <state>: ...` once per
+  state, or `its session was replaced or ended`. Pass that line to the human and run `relay --retry <action>` on their
+  word: the line is no send check. The retry checks the session and screen again, a blocked or errored session keeps
+  the relay held, a replaced one closes it undelivered, and a draft in the input line gets it appended. For a relay
+  held for any other reason nothing reports when its session could take it, so at each lapse whose `pending:` line
+  names it, run `relay --retry <action>` once before re-arming, and after three such lapses tell the human, who may
+  cancel it or have you keep retrying. Once delivered, it stays pending until its outcome or closure. A retry that
+  prints `uncertain` ends the retries: tell the human to check that session, which may have received it; it stays
+  pending until its outcome or a `cancel` on the human's word.
   While a watch is open, that Monitor runs `collect --wait <ms>` with no ids instead, re-armed at each lapse until a
   `watch ended <watch>` or `cancelled <watch>` line names the watch: each run resumes where the last one stopped,
   prints `watching <member>` as a session joins and `reported <member>:<N>` for each report, and follows every

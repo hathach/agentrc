@@ -1375,6 +1375,129 @@ class RelayTest(RelayCase):
                     captain.records()
 
 
+class HeldWakeTest(RelayCase):
+    """A relay held while its target worked: collect says once when that target leaves working, and sends nothing."""
+
+    def setUp(self):
+        super().setUp()
+        self.terminals['t2'] = {**pinned('t2'), 'status': 'working'}
+        self.action = self.relayed()
+        self.looked = []
+        for attr, value in [('glance', self._glance), ('submit', mock.Mock(side_effect=AssertionError('sent')))]:
+            patcher = mock.patch.object(captain, attr, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _glance(self, address, timeout):
+        self.looked.append((address, timeout))
+        found = self.terminals.get(address)
+        if isinstance(found, Exception):
+            raise found
+        return dict(found) if found else None
+
+    def now(self, **change):
+        self.terminals['t2'] = {**pinned('t2'), **change}
+
+    def woken(self, within=30):
+        """The lines one poll prints."""
+        recs = captain.records()
+        with mock.patch('builtins.print') as out:
+            captain.wake(recs, {self.action}, captain.generation(), time.monotonic() + within)
+        return [c.args[0] for c in out.call_args_list]
+
+    def test_held_while_working_and_still_working_says_nothing(self):
+        self.assertEqual(self.woken(), [])
+        self.assertEqual(self.looked[0][0], 't2')
+
+    def test_each_state_it_leaves_working_for_reads_differently_and_sends_nothing(self):
+        cases = {'done': 'run `relay --retry', 'idle': 'appends to any draft',
+                 'blocked': 'now blocked (question): the human answers it there',
+                 'error': '`relay --retry ' + self.action + '` keeps it held'}
+        for status, said in cases.items():
+            with self.subTest(status):
+                self.now(status='working')
+                self.assertEqual(self.woken(), [])
+                self.now(status=status, blocked_on='question' if status == 'blocked' else None)
+                [line] = self.woken()
+                self.assertTrue(line.startswith(f'left working {self.action} · sp · name · t2 · now {status}'))
+                self.assertIn(said, line)
+                self.assertIn(f'relay --retry {self.action}', line)
+                self.assertNotIn('safe', line)
+        self.assertEqual(self.typed, [])
+        self.assertEqual(captain.relay_states(captain.records())[self.action], 'held')
+
+    def test_a_replaced_or_vanished_session_reads_as_replaced(self):
+        for why, change in {'restarted': lambda: self.now(started=99, session='s-new'),
+                            'gone': lambda: self.terminals.pop('t2')}.items():
+            with self.subTest(why):
+                (self.state / captain.NOTICED).unlink(missing_ok=True)
+                change()
+                [line] = self.woken()
+                self.assertIn('its session was replaced or ended', line)
+                self.assertIn('closes it as undelivered', line)
+
+    def test_each_transition_is_said_once_across_collects(self):
+        self.now(status='done')
+        self.assertEqual(len(self.woken()), 1)
+        self.assertEqual(self.woken(), [])   # a later poll, or a re-armed collect
+        self.now(status='idle')
+        self.assertEqual(len(self.woken()), 1)
+        self.now(status='working')
+        self.assertEqual(self.woken(), [])
+        self.now(status='done')
+        self.assertEqual(len(self.woken()), 1)   # left working again
+
+    def test_a_new_enrollment_starts_afresh_and_an_old_one_says_nothing(self):
+        self.now(status='done')
+        fence = captain.generation()
+        self.woken()
+        self.replace_captain()
+        with mock.patch('builtins.print') as out:
+            captain.wake(captain.records(), {self.action}, fence, time.monotonic() + 30)
+        self.assertEqual(out.call_args_list, [])
+        self.assertEqual(json.loads((self.state / captain.NOTICED).read_text())['generation'], fence)
+
+    def test_hc_failure_or_no_time_left_says_nothing_and_looks_again(self):
+        self.terminals['t2'] = captain.hc.Error('hc get t2 failed: timeout')
+        self.assertEqual(self.woken(), [])
+        self.assertLessEqual(self.looked[-1][1], 30)
+        self.now(status='done')
+        self.looked.clear()
+        self.assertEqual(self.woken(within=0.5), [])
+        self.assertEqual(self.looked, [])
+        self.assertEqual(len(self.woken()), 1)
+
+    def test_only_relays_held_for_working_by_this_captain_and_still_pending(self):
+        self.now(status='done')
+        recs = captain.records()
+        held = [r for r in recs if r['type'] == 'held']
+        for why, (state, pending) in {'held for its screen': ([{**held[0], 'why': 'its screen is not a recognized '
+                                                                'input line'}], {self.action}),
+                                      'not pending': (held, set())}.items():
+            with self.subTest(why):
+                changed = [r if r['type'] != 'held' else state[0] for r in recs]
+                self.assertEqual(captain.held_working(changed, pending, captain.generation()), {})
+        self.assertEqual(captain.held_working(recs, {self.action}, 'another-generation'), {})
+        captain.cancel(self.action, self.ident)
+        self.assertEqual(captain.held_working(captain.records(), {self.action}, captain.generation()), {})
+
+    def test_collect_says_it_then_follows_the_relay_on(self):
+        def done_then_cancelled(address, timeout):
+            self.looked.append((address, timeout))
+            if len(self.looked) > 1:
+                captain.append({'type': 'cancel', 'msg': self.action})
+            return {**pinned('t2'), 'status': 'done'}
+        with mock.patch.object(captain, 'glance', done_then_cancelled), mock.patch('builtins.print') as out:
+            self.assertEqual(captain.collect([self.action], 60000), 0)
+        lines = [c.args[0] for c in out.call_args_list]
+        self.assertTrue(lines[0].startswith(f'held {self.action}'))
+        self.assertTrue(lines[1].startswith(f'left working {self.action}'))
+        self.assertEqual(lines[-2:], [f'cancelled {self.action} · sp · name · t2', 'done'])
+        self.assertEqual(sum(line.startswith('left working') for line in lines), 1)
+        self.assertTrue(all(timeout <= 60 for _, timeout in self.looked))
+        self.assertEqual(self.typed, [])
+
+
 class AddressedCase(RelayCase):
     """Two live sessions besides the captain, in herdr spaces named code and docs."""
 

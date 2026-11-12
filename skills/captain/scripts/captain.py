@@ -94,6 +94,7 @@ STATE = os.environ.get('AGENTRC_CAPTAIN_DIR') or os.path.expanduser('~/.cache/ag
 LEDGER, ENROLLED = 'ledger-hc.jsonl', 'enrolled-hc.json'   # ledger.jsonl and enrolled.json pinned Herdr panes
 # where the enrolled captain's last collect without ids, and its last `reports --new`, stopped reading
 COLLECTED, TABLED = 'collected-hc.json', 'tabled-hc.json'
+NOTICED = 'noticed-hc.json'   # where each held relay's target was last seen after working, so collect says it once
 TABLING = 'tabled.lock'   # serializes `reports --new` without holding the ledger lock while it prints
 # serializes each observation with its record, so one taken earlier never lands after one taken later; taken before
 # the ledger lock, never while holding it, and gh and git run under it with the ledger free
@@ -1186,6 +1187,71 @@ def resumed(name, recs, watch, default):
     return default if at is None else at
 
 
+BUSY = 'it is working'   # refusal()'s reason for a relay held while its target works
+
+
+def held_working(recs, pending, fence):
+    """The pending relays this enrollment (fence) holds because their target was working, by action."""
+    states = relay_states(recs)
+    why = {r['msg']: r['why'] for r in recs if r['type'] == 'held'}
+    return {r['msg']: r for r in recs if r['type'] == 'relay' and r['msg'] in pending and states[r['msg']] == 'held'
+            and why.get(r['msg']) == BUSY and (r.get('captain') or {}).get('generation') == fence}
+
+
+def glance(address, timeout):
+    """find(), its hc call bounded by timeout s."""
+    s = described(hc.get(address, timeout=timeout)) if hc.is_local(address) else None
+    return pin(s) if s and s['address'] == address else None
+
+
+def wake_line(action, relayed, now):
+    """The collect line for a held relay whose target is now in state now: never that it is safe to send, since
+    `relay --retry` checks the session and screen again, and a draft in the input line gets the relay appended."""
+    head = f'left working {action} · {relayed["handle"]} · '
+    if now == 'replaced':
+        return head + f'its session was replaced or ended: `relay --retry {action}` closes it as undelivered'
+    if now in ASKABLE:
+        return (head + f'now {now}: run `relay --retry {action}`, which checks it again and appends to any draft in '
+                'its input line')
+    if now.startswith('blocked'):
+        return head + f'now {now}: the human answers it there, then `relay --retry {action}`'
+    return head + f'now {now}: `relay --retry {action}` keeps it held until it is idle or done'
+
+
+def wake(recs, pending, fence, deadline):
+    """Print a line for each relay held while its target was working whose target has left working since, each state
+    once per relay across collects (NOTICED, stored after it printed); `hc get` bounded by deadline, a failure looked
+    at again at the next poll. Sends nothing: `relay --retry` stays the human's, with all its checks."""
+    held = held_working(recs, pending, fence)
+    if not held:
+        return
+    try:
+        with open(path(NOTICED), encoding='utf-8') as f:
+            mark = json.load(f)
+        seen = dict(mark['seen']) if mark['generation'] == fence else {}
+    except (OSError, ValueError, KeyError, TypeError):
+        seen = {}
+    before = {a: seen[a] for a in held if a in seen}
+    seen = dict(before)
+    for action, relayed in held.items():
+        left = deadline - time.monotonic()
+        if left < 1:
+            break
+        try:
+            found = glance(relayed['target']['address'], left)
+        except hc.Error:
+            continue
+        state = found['status'] if found and identity(found) == relayed['target'] else 'replaced'
+        if state == 'working':
+            seen.pop(action, None)   # leaving it again is news again
+        elif seen.get(action) != state and fence == generation():
+            seen[action] = state
+            kind = found['blocked_on'] if state == 'blocked' else None
+            print(wake_line(action, relayed, state + (f' ({kind})' if kind else '')), flush=True)
+    if seen != before and fence == generation():
+        write_json(NOTICED, {'generation': fence, 'seen': seen})
+
+
 def collect(msgs, wait_ms):
     """Print each followed item's events as they land: a request's or relay's report or outcome, cancellation or
     refusal; a watch's members joining and every report they send, and its end. Exit 0, printing `done`, once none
@@ -1196,7 +1262,8 @@ def collect(msgs, wait_ms):
     the events of requests and relays opened while no watch was open: those were collected by id. What is closed is
     judged on the whole ledger. A strict read under the lock first: a torn ledger must not look like nothing to wait
     for. Every lock wait ends with wait_ms, so the pending line still prints before
-    the caller's timeout. A collect belongs to the captain enrolled when it began: once another enrolls, it prints its
+    the caller's timeout. A relay held while its target worked gets a `left working` line once that target leaves
+    working (wake()). A collect belongs to the captain enrolled when it began: once another enrolls, it prints its
     pending line and stores nothing."""
     deadline = time.monotonic() + wait_ms / 1000
     try:
@@ -1243,6 +1310,7 @@ def collect(msgs, wait_ms):
         if lapsed:
             print(f'pending: {" ".join(sorted(pending))}', flush=True)
             return NO_ANSWER
+        wake(recs, pending, fence, deadline)
         time.sleep(POLL_S)
         recs = records(lenient=True)
 
