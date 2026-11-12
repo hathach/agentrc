@@ -7981,6 +7981,26 @@ test('a failed tick spends no comment: one `@coderabbitai review` asks for the s
   assert.equal(d.result.state.reviewClock.request.at, at(0), "the script's own check finds the standing comment, and it is waited on")
 })
 
+test('a check run titled as a manual-review skip with no box gets its one `@coderabbitai review` per head (#530)', async () => {
+  // harvest.py's reading of hathach/agentrc#529's head: the check run's title alone, its summary holding no box.
+  const titled = skippedCr(`Review skipped: manual review required (check run; titled "${MANUAL}")`)
+  const noBox = { outcome: 'failed', detail: '0 CodeRabbit comments hold one Trigger review box, not 1' }
+  let n = 0
+  const { result, labels } = await run({ args: { coderabbitTrigger: true, maxCycles: 3 }, crTrigger: noBox,
+    reviewsPerCycle: () => quiet([++n === 1 ? titled : bot('coderabbit')]) })
+  assert.equal(result.pass, true, result.reason)
+  assert.deepEqual([triggers(labels), requests(labels)], [['crtrigger#1'], ['crrequest#1']])
+  const a = await run({ args: { coderabbitTrigger: true, maxCycles: 3, yieldAfterCycle: true }, crTrigger: noBox, reviews: quiet([titled]) })
+  assert.deepEqual([triggers(a.labels), requests(a.labels)], [['crtrigger#1'], ['crrequest#1']])
+  const b = await run({ args: { coderabbitTrigger: true, maxCycles: 3, state: a.result.state }, clockOffset: 12, reviews: quiet([titled]) })
+  assert.deepEqual([triggers(b.labels), requests(b.labels)], [[], []], 'never a second ask on the head')
+  assert.equal(b.result.reason, 'coderabbit-unreviewed')
+  const moved = seal({ ...a.result.state, expectedHead: shaFor(1) })
+  const c = await run({ args: { coderabbitTrigger: true, maxCycles: 3, yieldAfterCycle: true, state: moved }, clockOffset: 20, crTrigger: noBox,
+    preflight: { head: shaFor(1), prHead: shaFor(1) }, reviews: quiet([titled]) })
+  assert.deepEqual([triggers(c.labels), requests(c.labels)], [['crtrigger#2'], ['crrequest#2']], 'a new head is asked again, once')
+})
+
 test('a failed CodeRabbit review gets one `@coderabbitai review` per head, waited on to the cap, never an unreadable wait (#499)', async () => {
   const failedCr = () => bot('coderabbit', { state: 'settled', kind: 'failed', sha: 'head', evidence: ['check run completed/neutral'], reason: 'check run: Review failed' })
   let n = 0

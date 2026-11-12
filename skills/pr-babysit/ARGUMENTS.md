@@ -35,7 +35,9 @@ A key not listed here throws before anything runs.
   `CLAUDE.md` when CodeRabbit skips every push for a manual review (a
   repository below its open-source threshold). Once per head, ticks
   the "Trigger review" box of CodeRabbit's summary comment when the head was
-  skipped that way, then waits for the review up to the silent-bot cap. Once
+  skipped that way (a status or check run titled `Review skipped: manual review
+  required`, or a bare skip whose summary holds the box or says so), then waits
+  for the review up to the silent-bot cap. Once
   per head too, it comments `@coderabbitai review` instead when that tick
   failed (a summary with no box to tick, a failed edit), unless the box reads
   ticked or such a comment follows the head event, and when CodeRabbit's

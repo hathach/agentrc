@@ -303,8 +303,9 @@ def coderabbit_run(run_, ev, head, stickies):
     if run_['status'] == 'completed' and run_.get('conclusion') == 'skipped':
         lowered = title.lower()
         if lowered.startswith('review skipped'):
-            # A check run gives no skip reason: the summary comment tells a manual-review skip, read as its status says it, from any other.
-            why = manual_only(stickies)
+            # A bare "Review skipped" gives no reason: the summary comment tells a manual-review skip, read as its status says
+            # it, from any other; a title naming the manual review says it alone (#530), box or no box.
+            why = manual_only(stickies) or (f'titled "{title}"' if lowered.startswith(CR_MANUAL_SKIP) else None)
             return record('coderabbit', 'settled', f'Review skipped: manual review required (check run; {why})' if why else f'check run skipped: {title}',
                           ev, head, 'skipped')
         if lowered.startswith('no files to review'):

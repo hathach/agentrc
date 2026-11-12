@@ -121,6 +121,27 @@ class SettleRules(unittest.TestCase):
         agrees = status('success', 'Review skipped: manual review required for this OSS repository', '2026-09-25T09:00:01Z')
         self.assertEqual(harvest.coderabbit(HEAD, [agrees], [run_], manual, EVENT)['kind'], 'skipped', 'one that agrees')
 
+    def test_a_check_run_titled_manual_review_required_is_a_manual_skip_without_a_box(self):
+        # #530: hathach/agentrc#529's head 5ef6598d, whose summary held no Trigger review box and no manual-only words.
+        title = 'Review skipped: manual review required for this OSS repository'
+        run_ = {'id': 14, 'name': 'CodeRabbit', 'status': 'completed', 'conclusion': 'skipped', 'started_at': '2026-11-11T11:47:37Z',
+                'completed_at': '2026-11-11T11:47:38Z', 'output': {'title': title, 'summary': 'Result: Skipped'}}
+        summary = comment('coderabbitai[bot]', 'summary\n- [ ] <!-- {"checkboxId":"1"} --> Commit to this branch', id_=6)
+        for what, issue in (('no summary', []), ('a summary without a box', [summary])):
+            with self.subTest(what):
+                r = harvest.coderabbit(HEAD, [], [run_], issue, EVENT)
+                self.assertEqual((r['state'], r['kind'], r['sha']), ('settled', 'skipped', HEAD))
+                self.assertEqual(r['reason'], f'Review skipped: manual review required (check run; titled "{title}")')
+                self.assertTrue(r['reason'].lower().startswith(harvest.CR_MANUAL_SKIP), "the workflow's MANUAL_SKIP reads it")
+        box = comment('coderabbitai[bot]', '> - [ ] 🔍 Trigger review', id_=5)
+        self.assertIn('comment 5 holds a Trigger review box', harvest.coderabbit(HEAD, [], [run_], [box], EVENT)['reason'], 'a box is still named')
+        agrees = status('success', title, '2026-11-11T11:47:38Z')
+        self.assertEqual(harvest.coderabbit(HEAD, [agrees], [run_], [], EVENT)['kind'], 'skipped', 'a status at its second agrees')
+        for other in ('Review skipped', 'Review skipped: no files changed', 'Review skipped: manual review is paused'):
+            with self.subTest(other):
+                r = harvest.coderabbit(HEAD, [], [dict(run_, output={'title': other})], [summary], EVENT)
+                self.assertEqual(r['reason'], f'check run skipped: {other}', 'only the manual-review title says it')
+
     def test_a_no_files_to_review_coderabbit_check_run_is_a_skip_never_askable(self):
         # #372: hathach/tinyusb#4246's rebased head, check run 124595415060.
         run_ = {'id': 124595415060, 'name': 'CodeRabbit', 'status': 'completed', 'conclusion': 'skipped', 'started_at': '2026-09-25T09:00:00Z',
