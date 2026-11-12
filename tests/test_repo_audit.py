@@ -336,7 +336,7 @@ class Start(unittest.TestCase):
 def review(base, reviewed, **fields):
     """A review file finish accepts for the range base..reviewed, fields replacing its own."""
     r = {'range': f'{base}..{reviewed}', 'pr': {'repo': 'o/r', 'number': 7}, 'outcome': 'growth reviewed, one cut',
-         'stages': {name: {'status': 'completed', 'ref': 'o/r#7'} for name in audit.STAGES},
+         'stages': {name: {'status': 'completed', 'ref': 'o/r#7'} for name in audit.FINISH_STAGES},
          'coverage': [{'batch': 'all', 'paths': ['**']}],
          'claims': [{'claim': 'FIFO flush needs a wait', 'document': 'RM0090', 'revision': '19',
                      'section': '34.17.2', 'variants': ['STM32F4'], 'status': 'verified'}],
@@ -708,6 +708,8 @@ class Record(unittest.TestCase):
                               "validation.expected[0].ref: not a non-empty string")):
             with self.subTest(reason):
                 self.assertIn(reason, '\n'.join(audit.check_record(body)))
+        before = dict(rec, stages={k: v for k, v in rec['stages'].items() if k != 'correctness'})
+        self.assertEqual(audit.check_record(before), [], 'a record from before the correctness stage still checks')
         with mock.patch.dict(os.environ, git_env(), clear=True):
             for body, reason in (('{', 'is not JSON'),
                                  (json.dumps(dict(rec, identity=['0' * 40])), 'identity differs')):
@@ -1141,6 +1143,7 @@ class Finish(unittest.TestCase):
     def test_stages_and_the_range(self):
         stages = review(self.base, self.head)['stages']
         self.refused('stages: missing coreview', stages={k: v for k, v in stages.items() if k != 'coreview'})
+        self.refused('stages: missing correctness', stages={k: v for k, v in stages.items() if k != 'correctness'})
         self.refused('stages.claims: missing reason', stages=dict(stages, claims={'status': 'inapplicable'}))
         self.refused('stages.claims: unknown field range',
                      stages=dict(stages, claims=dict(stages['claims'], range=f'{self.base}..{self.head}')))

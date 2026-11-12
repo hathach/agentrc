@@ -59,8 +59,8 @@ FILE is one JSON object; a field the schema does not name is refused at any dept
   range       "<base>..<R>" in full SHAs: the run's range, so a review written before R moved refuses
   pr          {repo: "owner/name" of the base repository, number}
   outcome     text
-  stages      {coverage, phase1, claims, coreview, any other stage}: each {status: "completed", ref} or
-              {status: "inapplicable", reason}
+  stages      {coverage, phase1, claims, coreview, correctness, any other stage}: each {status: "completed", ref}
+              or {status: "inapplicable", reason}; check accepts a record without correctness, written before it
   coverage    [{batch, paths: [glob]}], not empty; every path base..R changes (both sides of a rename, a deletion,
               a submodule pin) must match a glob: ** spans directories, * and ? stay within one
   claims      [{claim, document, revision, section, variants: [part], status: verified|refuted|pending}]
@@ -114,6 +114,8 @@ NO_PROMPT = {'GIT_TERMINAL_PROMPT': '0', 'GIT_ASKPASS': '', 'SSH_ASKPASS': '', '
 PROGRESS = re.compile(r'(?:remote: )?(?:[A-Z][a-z]+(?: [a-z]+)*: +\d|Total \d)')
 GITHUB = 'https://github.com/'
 STAGES = ('coverage', 'phase1', 'claims', 'coreview')
+# finish requires the correctness co-review too; check still reads records written before it
+FINISH_STAGES = STAGES + ('correctness',)
 STAGE_FIELDS = {'completed': ('ref',), 'inapplicable': ('reason',)}
 # what each expected validation status must carry; required-pending blocks finish
 EXPECTED_FIELDS = {'covered': ('ref',), 'inapplicable': ('reason',), 'excluded': ('owner',), 'required-pending': ()}
@@ -614,7 +616,7 @@ def supersession_cycle(start, by):
     return i in seen
 
 
-def check_review(s, r, rng=None, carried=None):
+def check_review(s, r, rng=None, carried=None, stages=STAGES):
     """The lead's review fields, each checked when present (the caller reports a missing one). rng is the run's
     exact base..R; carried the previous record's live item ids (None: not checked)."""
     if 'range' in r and s.text(r['range'], 'range') and rng and r['range'] != rng:
@@ -626,7 +628,7 @@ def check_review(s, r, rng=None, carried=None):
             s.bad('pr.number', f'not a positive integer: {n!r}')
     if 'outcome' in r:
         s.text(r['outcome'], 'outcome')
-    if 'stages' in r and s.obj(r['stages'], 'stages', STAGES, r['stages'] if isinstance(r['stages'], dict) else ()):
+    if 'stages' in r and s.obj(r['stages'], 'stages', stages, r['stages'] if isinstance(r['stages'], dict) else ()):
         for name, st in r['stages'].items():
             w = f'stages.{name}'
             if not STAGE_NAME.fullmatch(name):
@@ -1294,7 +1296,7 @@ def finish(args):
     review = read_json(args.review)
     s = Shape()
     if s.obj(review, 'review', REVIEW_FIELDS):
-        check_review(s, review, f'{run["base"]}..{reviewed}', carried)
+        check_review(s, review, f'{run["base"]}..{reviewed}', carried, FINISH_STAGES)
     problems = s.problems + [f'{w}: looks private ({m!r})' for w, m in private(review)]
     pr_base = None
     if not s.problems:
