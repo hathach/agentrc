@@ -13,6 +13,7 @@ import contextlib
 import fcntl
 import hashlib
 import importlib.util
+import inspect
 import json
 import shlex
 import shutil

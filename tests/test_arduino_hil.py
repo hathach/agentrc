@@ -13,6 +13,7 @@ if os.name == 'nt':
 import argparse
 import contextlib
 import hashlib
+import inspect
 import io
 import json
 import re
