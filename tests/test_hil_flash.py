@@ -1352,6 +1352,10 @@ class ProbeUsers(unittest.TestCase):
         cli = self.entry(['STM32_Programmer_CLI', '-script', 'x.prg'])
         self.assertEqual(self.users({'name': 'stlink', 'uid': 'ABC'}), [cli])
         self.assertEqual(self.users({'name': 'openocd', 'uid': 'ABC'}), [])
+        on_stlink = {'name': 'openocd', 'uid': 'ABC', 'args': '-f interface/stlink.cfg -f target/stm32h7x.cfg'}
+        self.assertEqual(self.users(on_stlink), [cli])
+        versaloon = {'name': 'openocd', 'uid': 'ABC', 'args': '-f interface/vsllink.cfg', 'vid_pid': '0x0483 0xa038'}
+        self.assertEqual(self.users(versaloon), [])      # ST's vendor id, not an ST-LINK
 
     def test_an_stm32_programmer_on_another_stlink_is_no_user_even_holding_our_node(self):
         """agentrc#541: its discovery opens every ST-LINK before its sn= filter; the exemption accepts it."""
@@ -1361,6 +1365,8 @@ class ProbeUsers(unittest.TestCase):
             (['/opt/st/bin/STM32_Programmer_CLI', '-c', 'port=SWD', 'SN=OTHER', '-w', 'x.hex'], [], False),
             (['STM32_Programmer_CLI', '-c', 'port=swd,sn=OTHER'], [self.node], True))]
         self.assertEqual(self.users(stlink), [])
+        recovery = {'name': 'openocd', 'uid': 'ABC', 'args': '-f interface/stlink.cfg -f target/stm32h7x.cfg'}
+        self.assertEqual(self.users(recovery), [])       # a board's recovery entry on the same ST-LINK
         ours = [self.entry(argv, fds=fds) for argv, fds in (
             (['STM32_Programmer_CLI', '--connect', 'port=swd', 'sn=abc', '--rst'], []),     # ours, case aside
             (['STM32_Programmer_CLI', '-c', 'port=swd', 'sn=OTHER', 'sn=ABC'], []),           # mixed selectors

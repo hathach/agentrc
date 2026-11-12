@@ -116,9 +116,9 @@ nothing in it through a link.
   `hil_flash.probe_users`, whose docstring has its coverage: a recognized
   selector naming another probe excludes that process by its intended probe,
   with no guarantee against discovery opens of other candidates, and an
-  STM32_Programmer_CLI counts as using an `stlink` flasher's probe unless it
-  selects only other ST-LINKs by `sn=`, its discovery opens of this one
-  accepted. Each consumer documents what its check covers. A task taking its
+  STM32_Programmer_CLI counts as using an ST-LINK (an `stlink` flasher's, or
+  openocd's on `interface/stlink.cfg`) unless it selects only other ST-LINKs
+  by `sn=`, its discovery opens of this one accepted. Each consumer documents what its check covers. A task taking its
   own lock does it through
   `hil_lock.board_task(<lock>, busy=<check>, verdict=<collector>)`, which
   runs the check under the lock before the body and ends the lock on the
