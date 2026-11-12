@@ -55,6 +55,7 @@ CLEANUP_LOG = '.cleanup.jsonl'   # <board>.cleanup.jsonl: the board's failed cle
 LOG_WAIT = 5.0                # s a cleanup-log reader or writer waits for its mutex
 REWRITING = b'#'              # byte 0 of a record being rewritten: unreadable
 ACQUIRING = b'~'              # byte 0 while take_board_lock writes its first record: a free board
+UNLOGGED = b'!'               # byte 0 while end_failed writes an unlogged failure's evidence into its record
 DIR_MODE = 0o755
 SHARE_STEP = (f'a second OS user needs the lock dir sticky and world-writable, a one-time host step '
               f'once every project on the host runs this helper: sudo install -d -m 1777 {BOARD_LOCK_DIR}')
@@ -411,6 +412,8 @@ def _leftover(board, fh, data=None):
         found['task'] = rec
     elif state == 'unreadable' and not _acquiring(data):
         found['task'] = {'unreadable': data[:2000].decode(errors='backslashreplace')}
+        if data[:1] == UNLOGGED:     # an unlogged failure's evidence cut short: it stays open (resolve_restored)
+            found['task']['receipts'] = [{'unrecheckable': 'an unlogged failure whose evidence was not kept'}]
     if 'task' not in found and 'journalDigest' in found and _logged_journal(board, found['journalDigest']):
         return None
     if not found:
@@ -646,9 +649,11 @@ def end_failed(handles, reason, *, detail, receipts=(), retained=(), **extra) ->
     append a `failed` event (the holder record, `detail`, the run_tracked `receipts` and the
     `retained` sessions not proven ended, `extra`), clear the record once that event is logged
     and drop the flock, going on whatever fails. A record whose event was not logged is kept, its
-    only evidence, for the next take to log found-left; if the log is still unwritable then, that
-    take reports it only in its cleanup_failures. Returns {board: [error text]} for the boards
-    where a step failed."""
+    only evidence, for the next take to log found-left, rewritten first with the failure's `detail`,
+    `receipts` and `retained` (_keep_unlogged) so that resolve_restored rechecks them; a rewrite cut
+    short reads as an unrecheckable receipt, and only one whose first byte cannot be written leaves
+    the record without them. If the log is still unwritable at that take, it reports the failure
+    only in its cleanup_failures. Returns {board: [error text]} for the boards where a step failed."""
     return _end_failed_each(handles, reason, detail, receipts, retained, extra, {})
 
 
@@ -687,6 +692,9 @@ def _end_failed_each(handles, reason, detail, receipts, retained, extra, ended) 
             if cleared is False:
                 errors.setdefault(b, []).append('record not cleared')
             ended[b]['cleared'] = cleared is True
+        else:
+            guard([b], 'evidence not kept in the record', lambda: _keep_unlogged(
+                fh, reason, detail, receipts, retained))
         guard([b], 'close', fh.close)
     if hold is not None:
         guard((), 'deferred interrupt', hold.release)
@@ -702,6 +710,23 @@ def _log_ended(board, fh, reason, detail, receipts, retained, extra) -> dict:
         state, rec = 'unreadable', None
     return log_cleanup_failure(board, reason, detail=detail, task=rec if state == 'record' else None, receipts=receipts,
                         retained=retained, **extra)
+
+
+def _keep_unlogged(fh, reason, detail, receipts, retained) -> None:
+    """Rewrite the record of a failure end_failed could not log with its `detail`, `receipts` and
+    `retained` (a value JSON cannot hold as its repr; evidence it cannot hold at all as an
+    unrecheckable receipt), marked cleanupOwed, behind UNLOGGED. OSError when a write fails."""
+    try:
+        state, rec = _parse(_handle_record(fh))
+    except OSError:
+        state, rec = 'unreadable', None
+    fields = {**(rec if state == 'record' else {'pid': os.getpid(), 'reason': reason}), CLEANUP_OWED: True}
+    try:
+        data = json.dumps({**fields, 'detail': detail, 'receipts': receipts, 'retained': retained}, default=repr)
+    except (TypeError, ValueError) as e:
+        data = json.dumps({**fields, 'detail': f'{detail!r:.2000}',
+                           'receipts': [{'unrecheckable': f'its evidence cannot be recorded: {e!r:.200}'}]})
+    _overwrite(fh.fileno(), UNLOGGED, data.encode())
 
 
 def log_cleanup_failure(board, reason, *, detail, task=None, receipts=(), retained=(), **extra) -> dict:
@@ -746,9 +771,9 @@ def _journal_records(journal):
 def resolve_restored(board, failures, **evidence) -> list:
     """After the caller restored `board`: mark restored (cleanup_restored, with `evidence`) each of
     `failures` (its take's `cleanup_failures`, or open_cleanup_failures under its hold) whose own
-    evidence is resolved: every receipt, a legacy task record's and those its takeover journal kept
-    included, rechecks `done` as the caller, and every session they retained reads ended
-    (_release_blocker). Returns why each other one stays open or its restoration was not logged;
+    evidence is resolved: every receipt, its task record's (an older helper's, or one end_failed kept
+    unlogged) and those its takeover journal kept included, rechecks `done` as the caller, and
+    every session they retained reads ended (_release_blocker). Returns why each other one stays open or its restoration was not logged;
     a failure without an id is skipped."""
     notes = []
     for f in failures:

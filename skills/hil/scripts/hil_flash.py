@@ -1060,7 +1060,8 @@ def _fds(pid: int):
 def _other_stlink_session(prog_argv: list, uid: str) -> bool:
     """Whether an STM32_Programmer_CLI argv selects only ST-LINKs other than `uid`: a nonempty
     `sn=` among a `-c`/`--connect` option's parameters (the words up to the next option, each
-    split at `,`), no `-script` (whose file may name any probe) and no word containing `uid`."""
+    split at `,`), no `-script` (whose file may name any probe), no `-pwr`/`--power` (which selects
+    its probe by its own `index=`, probe 0 by default) and no word containing `uid`."""
     words, uid = [w.casefold() for w in prog_argv[1:]], uid.casefold()
     selected, connect = False, False
     for w in words:
@@ -1068,7 +1069,8 @@ def _other_stlink_session(prog_argv: list, uid: str) -> bool:
             connect = w in ('-c', '--connect')
         elif connect:
             selected = selected or any(f.startswith('sn=') and len(f) > 3 for f in w.split(','))
-    return (bool(uid) and selected and not any(w.lstrip('-').split('=', 1)[0] == 'script' for w in words)
+    return (bool(uid) and selected and not any(w.lstrip('-').split('=', 1)[0] in ('script', 'pwr', 'power')
+                                               for w in words)
             and not any(uid in w for w in words))
 
 
@@ -1137,11 +1139,11 @@ def probe_users(flasher: dict) -> list:
       STM32_Programmer_CLI (a `-script` names the probe in its file, and whether one runs
       depends on the other tools on the host, not on the caller); our own process and its
       ancestors are exempt from this match only. On an ST-LINK an STM32_Programmer_CLI
-      selecting only other ST-LINKs (an `sn=` selector, no `-script`, no word containing this
-      serial) is no user at all, its fds included: its discovery opens every ST-LINK before its
-      serial filter, vendor-filtered rather than serial-exclusive, and those opens of this probe
-      are accepted so sibling ST-LINK boards flash concurrently (any other tool's readable fds
-      still count);
+      selecting only other ST-LINKs (an `sn=` selector, no `-script`, no `-pwr`, no word
+      containing this serial) is no user at all, its fds included: its discovery opens every
+      ST-LINK before its serial filter, vendor-filtered rather than serial-exclusive, and those
+      opens of this probe are accepted so sibling ST-LINK boards flash concurrently (any other
+      tool's readable fds still count);
     * its fds, where we may read them (our uid, or CAP_SYS_PTRACE), hold one of those devices;
       our process and ancestors included.
     A process whose fds we cannot read and whose effective program (argv[0]'s basename, or a

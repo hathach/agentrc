@@ -1372,6 +1372,8 @@ class ProbeUsers(unittest.TestCase):
             (['STM32_Programmer_CLI', '-c', 'port=swd', 'sn=OTHER', 'sn=ABC'], []),           # mixed selectors
             (['STM32_Programmer_CLI', '-c', 'port=swd', 'sn=OTHER', '-script', 'x.prg'], []),
             (['STM32_Programmer_CLI', '-c', 'port=swd', 'sn=OTHER', '--script=x.prg'], []),
+            (['STM32_Programmer_CLI', '-c', 'port=swd', 'sn=OTHER', '-pwr', 'off', 'index=0'], []),  # its own index=
+            (['STM32_Programmer_CLI', '-c', 'port=swd', 'sn=OTHER', '--power', 'on'], []),        # probe 0
             (['STM32_Programmer_CLI', '-c', 'port=swd', 'sn=OTHER', '-w', '/fw/ABC.hex'], []),  # names ours elsewhere
             (['STM32_Programmer_CLI', '-c', 'port=swd', '-l'], []),                            # no sn= at all
             (['STM32_Programmer_CLI', '-c', 'port=swd', 'sn='], [self.node]),                  # an empty selector
@@ -1382,7 +1384,7 @@ class ProbeUsers(unittest.TestCase):
         self.assertEqual(self.users(stlink), ours)
         (self.proc / str(others[1]) / 'fd').chmod(0o755)
         shutil.rmtree(self.proc / str(others[1]))       # unreadable: inconclusive for any other flasher
-        self.assertEqual(self.users({'name': 'openocd', 'uid': 'ABC'}), [others[0], others[2], *ours[:2], *ours[6:]])
+        self.assertEqual(self.users({'name': 'openocd', 'uid': 'ABC'}), [others[0], others[2], *ours[:2], *ours[8:]])
         self.assertEqual(hf._other_stlink_session(['STM32_Programmer_CLI', '--connect', 'port=swd', 'sn=OTHER',
                                                    '--write', 'sn=x.hex'], 'ABC'), True)
 

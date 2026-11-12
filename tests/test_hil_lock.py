@@ -3022,6 +3022,47 @@ class BoardTasks(LockDir):
             nxt.clean()
         self.assertEqual((left['how'], left['task']['runDir']), ('found-left', '/r'))
         self.assertEqual(hil_lock.open_cleanup_failures(BOARD)[-1]['how'], 'found-left')
+        self.assertEqual((left['detail'], left['task']['receipts']), ('restore failed', [{'token': 'r'}]))
+        with mock.patch.object(hil_lock, '_rechecks', lambda receipts: ['pending'] * len(receipts)):
+            with self.task() as again:
+                again.restored(evidence='restored')
+        self.assertTrue(any('not proven ended' in n for n in again.restore_notes), again.restore_notes)
+        self.assertEqual([f['id'] for f in hil_lock.open_cleanup_failures(BOARD)], [left['id']])
+        with mock.patch.object(hil_lock, '_rechecks', lambda receipts: ['done'] * len(receipts)):
+            with self.task() as last:
+                last.restored(evidence='restored')
+        self.assertEqual(hil_lock.open_cleanup_failures(BOARD), [])
+
+    def test_an_unlogged_failure_whose_evidence_rewrite_is_cut_short_stays_open(self):
+        real = hil_lock._overwrite
+
+        def cut(fd, first, data):
+            if first != hil_lock.UNLOGGED:
+                return real(fd, first, data)
+            os.pwrite(fd, first, 0)
+            raise OSError(28, 'No space left')
+        task = self.task()
+        with mock.patch.object(hil_lock, '_log_append', mock.Mock(side_effect=OSError(28, 'No space left'))), \
+                mock.patch.object(hil_lock, '_overwrite', cut):
+            with task:
+                task.failed(detail='restore failed', receipts=[{'token': 'r'}])
+        self.assertTrue(any('evidence not kept in the record' in e for e in task.errors), task.errors)
+        self.assert_released(task, record='unreadable')
+        with self.task() as nxt:
+            left = nxt.cleanup_failures[-1]
+            nxt.restored(evidence='restored')
+        self.assertEqual((left['how'], left['task']['receipts'][0]['unrecheckable']),
+                         ('found-left', 'an unlogged failure whose evidence was not kept'))
+        self.assertTrue(any('not proven ended' in n for n in nxt.restore_notes), nxt.restore_notes)
+        self.assertEqual([f['id'] for f in hil_lock.open_cleanup_failures(BOARD)], [left['id']])
+
+    def test_an_unlogged_failure_whose_evidence_json_cannot_hold_keeps_an_unrecheckable_receipt(self):
+        task = self.task()
+        with mock.patch.object(hil_lock, '_log_append', mock.Mock(side_effect=OSError(28, 'No space left'))):
+            with task:
+                task.failed(detail='restore failed', receipts=[{('a', 'tuple'): 'key'}, object()])
+        self.assertEqual(hil_lock.record_state(BOARD)[1]['receipts'][0]['unrecheckable'][:33],
+                         'its evidence cannot be recorded: ')
 
     def test_report_is_a_snapshot_of_the_outcome(self):
         task = self.task()
