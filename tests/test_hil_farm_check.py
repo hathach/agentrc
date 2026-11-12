@@ -521,72 +521,43 @@ class Engine(unittest.TestCase):
         self.assertEqual(lk.cleanup_events('b'), [], 'its clean verdict stood: nothing logged')
         self.take()
 
-    def interrupt_before_the_verdict(self):
-        """An interrupt as the verdict is first collected, before its own interrupt hold is in place."""
-        real, calls = eng._verdict, []
-
-        def verdict(*a):
-            calls.append(1)
-            if len(calls) == 1:
-                raise KeyboardInterrupt
-            return real(*a)
-        patch(self, eng, '_verdict', verdict)
-        return calls
-
-    def test_an_interrupt_before_the_verdict_finalizes_from_the_same_ledger(self):
-        calls = self.interrupt_before_the_verdict()
-        row = self.check()
-        self.assertEqual(len(calls), 2)
-        self.assertEqual((row['status'], row['interrupted'], row['cleanup']['result']), ('ok', True, 'released'))
-        self.assertEqual(lk.cleanup_events('b'), [])
-        self.take()
-
-    def test_an_interrupt_before_the_verdict_keeps_a_pending_resets_receipt_and_retained_session(self):
-        self.pending_reset(retained=['/s/r1.json'])
-        self.interrupt_before_the_verdict()
-        self.assert_pending_logged(self.check(), retained=['/s/r1.json'])
-
-    def signal_at(self, where):
-        """A real SIGINT delivered once, where the body's finally first calls _verdict (`call-site`, the line in
-        check_board) or as _verdict's own frame is entered (`entry`): no patched callable stands between."""
+    def signal_at_the_verdict(self):
+        """A real SIGINT delivered once as BoardTask calls _verdict, its collector: no patched callable stands
+        between."""
         prev = signal.signal(signal.SIGINT, signal.default_int_handler)
         self.addCleanup(signal.signal, signal.SIGINT, prev)
-        lines, first = inspect.getsourcelines(eng.check_board)
-        site = first + next(i for i, line in enumerate(lines) if line.strip() == '_verdict(task, ctx, row)')
         fired = []
 
-        def local(frame, event, arg):
-            if not fired and event == 'line' and frame.f_lineno == site:
-                fired.append(where)
-                signal.raise_signal(signal.SIGINT)
-            return local
-
         def tracer(frame, event, arg):
-            if where == 'call-site':
-                return local if frame.f_code is eng.check_board.__code__ else None
-            if not fired and frame.f_code is eng._verdict.__code__:
-                fired.append(where)
+            if not fired and event == 'call' and frame.f_code is eng._verdict.__code__:
+                fired.append(1)
                 signal.raise_signal(signal.SIGINT)
-            return None
         prev_trace = sys.gettrace()
         sys.settrace(tracer)
         self.addCleanup(sys.settrace, prev_trace)
         return fired
 
-    def test_a_signal_as_the_verdict_is_first_collected_still_logs_the_ledgers_evidence(self):
-        for where in ('call-site', 'entry'):
-            with self.subTest(where=where):
-                self.pending_reset(retained=['/s/r1.json'])
-                fired = self.signal_at(where)
-                row = self.check()
-                sys.settrace(None)
-                self.assertEqual(fired, [where])
-                self.assert_pending_logged(row, retained=['/s/r1.json'])
+    def test_a_signal_as_the_verdict_is_collected_finalizes_from_the_same_ledger(self):
+        fired = self.signal_at_the_verdict()
+        row = self.check()
+        sys.settrace(None)
+        self.assertEqual(fired, [1])
+        self.assertEqual((row['status'], row['interrupted'], row['cleanup']['result']), ('ok', True, 'released'))
+        self.assertEqual(lk.cleanup_events('b'), [])
+        self.take()
+
+    def test_a_signal_as_the_verdict_is_collected_still_logs_the_ledgers_evidence(self):
+        self.pending_reset(retained=['/s/r1.json'])
+        fired = self.signal_at_the_verdict()
+        row = self.check()
+        sys.settrace(None)
+        self.assertEqual(fired, [1])
+        self.assert_pending_logged(row, retained=['/s/r1.json'])
 
     def signal_past_the_reset(self, k):
         """A real SIGINT, once, at the k-th line event of check_board's task body or _verdict, counted from the first
-        past check_board's reset: every point between the reset's end and its verdict, and after, until the task's own
-        except clauses. Returns the line it fired at."""
+        past check_board's reset or the first of _verdict, the task's collector: every point between the reset's end
+        and its verdict, and after, until the task's own except clauses. Returns the line it fired at."""
         prev = signal.signal(signal.SIGINT, signal.default_int_handler)
         self.addCleanup(signal.signal, signal.SIGINT, prev)
         lines, first = inspect.getsourcelines(eng.check_board)
@@ -596,7 +567,7 @@ class Engine(unittest.TestCase):
 
         def local(frame, event, arg):
             board = frame.f_code is codes[0]
-            if event == 'line' and not fired and (seen or board and frame.f_lineno > after) \
+            if event == 'line' and not fired and (seen or not board or frame.f_lineno > after) \
                     and not (board and frame.f_lineno >= end):
                 seen.append(frame.f_lineno)
                 if len(seen) > k:

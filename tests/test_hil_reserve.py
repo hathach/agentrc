@@ -679,8 +679,9 @@ class Run(Fixture):
         self.assertIn('not logged: mimxrt1064_evk: cleanup log not written', line)
         self.assertIn('No space left on device', line)
         self.assertEqual(p.wait(), 1)
-        self.assertEqual(self.held(), set())
-        self.assertTrue(self.flock_free('raspberry_pi_pico2'))
+        held = self.held()       # each record kept, its only evidence, for the next take to log found-left
+        self.assertTrue(held)
+        self.assertTrue(all(self.flock_free(l) for l in held))
 
     def test_a_missing_sibling_after_a_successful_command_is_a_blocker_once_the_budget_is_spent(self):
         p = self.run_run(action='drop-sibling')

@@ -779,14 +779,6 @@ def probe_busy(board):
     return A.flash.probe_users(board['flasher'])
 
 
-def finish_interrupted(task, interrupt):
-    """An interrupt that landed as the task's __exit__ was entered left that __exit__ unrun (BoardTask's limit): run it
-    once more before this process goes on; a task without a verdict then ends as failed."""
-    if not task.ended:
-        with contextlib.suppress(KeyboardInterrupt):
-            task.__exit__(type(interrupt), interrupt, interrupt.__traceback__)
-
-
 def probe_present(flasher):
     """'' when exactly one probe with the flasher's serial is on this host's bus, else why not."""
     if flasher['name'] == 'esptool':
@@ -821,12 +813,13 @@ def run_board(name, board, tests, record_path, roster_path, run_root, manifest):
     except OSError as e:
         row['detail'] = f'refused: run dir {run_dir}: {e}'
         return row
-    task = A.lock.board_task(name, 'hil_test.py', busy=lambda: probe_busy(board), runDir=str(run_dir))
+    task = A.lock.board_task(name, 'hil_test.py', busy=lambda: probe_busy(board), runDir=str(run_dir),
+                             verdict=lambda task, exc: give_verdict(task, name, row, tracker))
     entered = False
     try:
         with task:
             entered = True
-            battery(task, name, board, tests, record_path, roster_path, run_dir, manifest, tracker, row)
+            battery(name, board, tests, record_path, roster_path, run_dir, manifest, tracker, row)
     except A.lock.BoardBusy as e:
         row.update(locked=True, detail=str(e), probeUsers=e.users)
     except A.lock.RecoveryBlocked as e:
@@ -837,7 +830,7 @@ def run_board(name, board, tests, record_path, roster_path, run_root, manifest):
         row.update(detail=f'board lock unavailable: {e}')
     except KeyboardInterrupt as e:
         row['interrupted'] = True
-        finish_interrupted(task, e)
+        task.finish(e)    # an interrupt as its __exit__ was entered left it unrun (BoardTask's limit)
         if not entered:
             row['detail'] = row['detail'] or 'aborted: interrupted before the board was touched'
     except Exception as e:
@@ -847,79 +840,57 @@ def run_board(name, board, tests, record_path, roster_path, run_root, manifest):
     return row
 
 
-def battery(task, name, board, tests, record_path, roster_path, run_dir, manifest, tracker, row):
-    """The body of a run's board task: the tests, then the restore, ending on the task's cleanup verdict."""
-    given = False
-
-    def held_verdict():   # carries the tracker's evidence; an interrupt before its hold is in leaves it ungiven
-        nonlocal given
-        hold = A.process.InterruptHold()
-        try:
-            row['cleanup']['receipts'] = list(tracker.receipts)
-            if tracker.pending:   # unrecheckable ones included: the board's cleanup log keeps them
-                row['cleanup']['pending'] = list(tracker.pending)
-                if row['cleanup']['pass']:   # an interrupt landed before the body's handler could fail it
-                    row['cleanup'].update({'pass': False, 'state': 'pending', 'evidence': tracker.unclean})
-            if row['cleanup']['pass'] and row['cleanup']['state'] == 'unknown':   # the body ended inside its handler
-                row['cleanup'].update({'pass': False, 'evidence': 'cleanup state unknown: the body ended before its '
-                                                                  'handler failed the cleanup'})
-            give_verdict(task, name, row, tracker)
-            given = True
-        finally:
-            hold.release()
+def battery(name, board, tests, record_path, roster_path, run_dir, manifest, tracker, row):
+    """The body of a run's board task: the tests, then the restore, its row the ledger give_verdict reads."""
     started = time.monotonic()
     try:
+        if why := legacy_pending(name):
+            row['previousPending'] = why
         try:
-            if why := legacy_pending(name):
-                row['previousPending'] = why
-            try:
-                rec, images = admit(record_path, name, roster_path, run_dir, manifest=manifest)
-            except Refused as e:
-                row['detail'] = f'refused: {e}'
-                return
-            row['firmware'] = {'buildRecord': str(record_path), 'head': rec['source']['head'], 'fqbn': rec['fqbn'],
-                               'platform': rec['platform'], 'sketches': {k: v['sha256'] for k, v in images.items()},
-                               'fqbns': {k: v['fqbn'] for k, v in images.items()},   # a core's sketches may differ
-                               'driftedHeaders': sorted({h['counterpart'] for s in rec['sketches'].values()
-                                                         for h in s.get('foreignHeaders', []) if not h['matches']})}
-            extra = BASE_MAX if rec.get('base') else 0   # each step and the restore may check and rewrite the base
-            budget, need = BOARD_BUDGET + (len(tests) + 1) * extra, STEP_MAX + CLEANUP_RESERVE + 2 * extra
-            for test in tests:
-                if budget - (time.monotonic() - started) < need:
-                    row['tests'].append({'test': test, 'pass': False, 'detail': 'not run: board budget left too small'})
-                    continue
-                row['ran'] = True
-                row['cleanup']['state'] = 'unknown'
-                row['tests'].append(step(name, board, images[P.TESTS[test]], test, run_dir, tracker))
-            if row['ran']:
-                row['cleanup'].update(restore(name, board, images, run_dir, tracker))
-            row['pass'] = row['ran'] and all(t['pass'] for t in row['tests']) and row['cleanup']['pass']
-        except Unclean as e:
-            row['cleanup'].update({'pass': False, 'state': 'pending', 'evidence': str(e)})
-            row['detail'] = f'a child outlived its operation: {e}'
-        except BaseException as e:   # interrupted or a harness bug: the board's state is unknown
-            why = f'{type(e).__name__}: {e}'
-            row['cleanup'].update({'pass': False, 'state': 'unknown', 'evidence': why})
-            row['detail'] = f'aborted: {why}'
-            row['interrupted'] = not isinstance(e, Exception)
-        finally:
-            held_verdict()
-    except KeyboardInterrupt:
-        # one from the body's end until the verdict is given, the finally's own first line included, lands here: the
-        # verdict is given again, that interrupt raised once it is
-        while not given:
-            try:
-                held_verdict()
-            except KeyboardInterrupt:
-                if given:     # the hold replayed it
-                    raise
-        raise
+            rec, images = admit(record_path, name, roster_path, run_dir, manifest=manifest)
+        except Refused as e:
+            row['detail'] = f'refused: {e}'
+            return
+        row['firmware'] = {'buildRecord': str(record_path), 'head': rec['source']['head'], 'fqbn': rec['fqbn'],
+                           'platform': rec['platform'], 'sketches': {k: v['sha256'] for k, v in images.items()},
+                           'fqbns': {k: v['fqbn'] for k, v in images.items()},   # a core's sketches may differ
+                           'driftedHeaders': sorted({h['counterpart'] for s in rec['sketches'].values()
+                                                     for h in s.get('foreignHeaders', []) if not h['matches']})}
+        extra = BASE_MAX if rec.get('base') else 0   # each step and the restore may check and rewrite the base
+        budget, need = BOARD_BUDGET + (len(tests) + 1) * extra, STEP_MAX + CLEANUP_RESERVE + 2 * extra
+        for test in tests:
+            if budget - (time.monotonic() - started) < need:
+                row['tests'].append({'test': test, 'pass': False, 'detail': 'not run: board budget left too small'})
+                continue
+            row['ran'] = True
+            row['cleanup']['state'] = 'unknown'
+            row['tests'].append(step(name, board, images[P.TESTS[test]], test, run_dir, tracker))
+        if row['ran']:
+            row['cleanup'].update(restore(name, board, images, run_dir, tracker))
+        row['pass'] = row['ran'] and all(t['pass'] for t in row['tests']) and row['cleanup']['pass']
+    except Unclean as e:
+        row['cleanup'].update({'pass': False, 'state': 'pending', 'evidence': str(e)})
+        row['detail'] = f'a child outlived its operation: {e}'
+    except BaseException as e:   # interrupted or a harness bug: the board's state is unknown
+        why = f'{type(e).__name__}: {e}'
+        row['cleanup'].update({'pass': False, 'state': 'unknown', 'evidence': why})
+        row['detail'] = f'aborted: {why}'
+        row['interrupted'] = not isinstance(e, Exception)
 
 
 def give_verdict(task, name, row, tracker):
-    """A failed cleanup over a restoration over an untouched board (the `hil` skill's verdicts): a passing restore
-    after a test ran restores, a run that never ran a test touched nothing."""
+    """The run's board task's verdict collector, with the tracker's evidence in its row: a failed cleanup over a
+    restoration over an untouched board (the `hil` skill's verdicts): a passing restore after a test ran restores, a
+    run that never ran a test touched nothing."""
     c = row['cleanup']
+    c['receipts'] = list(tracker.receipts)
+    if tracker.pending:   # unrecheckable ones included: the board's cleanup log keeps them
+        c['pending'] = list(tracker.pending)
+        if c['pass']:   # an interrupt landed before the body's handler could fail it
+            c.update({'pass': False, 'state': 'pending', 'evidence': tracker.unclean})
+    if c['pass'] and c['state'] == 'unknown':   # the body ended inside its handler
+        c.update({'pass': False, 'evidence': 'cleanup state unknown: the body ended before its handler failed the '
+                                             'cleanup'})
     if not c['pass']:
         task.failed(detail=c['evidence'] or row['detail'], receipts=[p['receipt'] for p in tracker.pending])
     elif row['ran']:
@@ -1071,7 +1042,9 @@ def held_by(name, reason):
     state, rec = A.lock.record_state(name)
     if state == 'unreadable':   # is_locked reads the record, not the flock: the hold may still stand
         raise Refused(f'{name} has an unreadable holder record: whether {reason!r} holds it is unknown')
-    if state != 'record' or rec.get('reason') != reason or not A.lock.holder_alive(rec):
+    # a protected task's record (cleanupOwed) is never a manual hold: one ended failed keeps it for the next take
+    if (state != 'record' or rec.get('reason') != reason or rec.get(A.lock.CLEANUP_OWED)
+            or not A.lock.holder_alive(rec)):
         raise NotHeld(f'{name} is not held under reason {reason!r} by a live holder (record: {rec})')
 
 
@@ -1496,18 +1469,20 @@ def cmd_commission(args):
         tracker = Tracker(run_dir)
     except OSError as e:
         raise Refused(f'run dir {run_dir}: {e}')
-    task = A.lock.board_task(args.board, 'hil_test.py commission', busy=lambda: probe_busy(board))
-    out, failure, entered, refusal = {'board': args.board, 'rosterUid': board['uid']}, None, False, None
+    out, entered, refusal = {'board': args.board, 'rosterUid': board['uid']}, False, None
+    ledger = {'touched': False, 'done': False, 'error': None, 'failure': None}
+    task = A.lock.board_task(args.board, 'hil_test.py commission', busy=lambda: probe_busy(board),
+                             verdict=lambda task, exc: commission_verdict(task, exc, args, tracker, out, ledger))
     try:
         with task:
             entered = True
-            failure = commission(task, args, board, run_dir, tracker, out)
+            commission(args, board, run_dir, tracker, out, ledger)
     except A.lock.BoardBusy as e:
         refusal = Refused(str(e))
     except (A.lock.BoardLocked, A.lock.LockUnavailable) as e:
         refusal = Refused(f'{args.board}: {e}')
     except KeyboardInterrupt as e:
-        finish_interrupted(task, e)
+        task.finish(e)    # an interrupt as its __exit__ was entered left it unrun (BoardTask's limit)
         raise
     except Exception as e:   # a refusal of the body before any hardware access, or the busy check's
         refusal = e if entered else Refused(f'{args.board}: probe check: {type(e).__name__}: {e}')
@@ -1517,6 +1492,7 @@ def cmd_commission(args):
         # its lock did not end as its clean end said: a blocker, reported as one
         out['error'] = str(refusal) if isinstance(refusal, Refused) else f'{type(refusal).__name__}: {refusal}'
     out.update(A.lock.failure_report(task.cleanup_failures))
+    failure = ledger['failure']
     if failure is not None:
         task_fields(failure['cleanup'], task)
         out['results'] = [failure]   # result.json is a `restore --report` input
@@ -1530,10 +1506,9 @@ def cmd_commission(args):
     return 0 if out.get('matchesRoster') else 1
 
 
-def commission(task, args, board, run_dir, tracker, out):
-    """The body of a commission's board task, ending on its cleanup verdict: restored once the restoration sketch left
-    running passes its restore test, clean when it fails before touching the board (re-raised), else failed, its
-    tracker's evidence logged. Returns the failure's report row, or None."""
+def commission(args, board, run_dir, tracker, out, ledger):
+    """The body of a commission's board task, recording in `ledger` what commission_verdict decides on; a failure
+    before touching the board is re-raised."""
     by_port = bool(board.get('no_serial'))
 
     def enumerated(vid_pid):   # {identity: enumeration id}; a serial board's usb_port, when set, must hold it
@@ -1541,90 +1516,75 @@ def commission(task, args, board, run_dir, tracker, out):
             return {d['busport']: d['ino'] for d in devices(vid_pid) if no_serial(d)}
         return {d['serial']: d['ino'] for d in scan(vid_pid)
                 if 'usb_port' not in board or d['busport'] == board['usb_port']}
-    touched, done, error, failure, given = False, False, None, None, False
-
-    def held_verdict():   # carries the tracker's evidence; an interrupt before its hold is in leaves it ungiven
-        nonlocal failure, given
-        hold = A.process.InterruptHold()
-        try:
-            if done:
-                task.restored(evidence=f'{args.board}: {restore_sketch(args.board)} restored, {test} passed')
-            elif not touched:
-                task.clean()
-            else:
-                out['error'] = f'{type(error).__name__}: {error}' if error is not None else 'interrupted'
-                failure = {'board': args.board, 'cleanup': {'evidence': out['error'],
-                                                            'receipts': list(tracker.receipts)}}
-                if tracker.pending:
-                    failure['cleanup']['pending'] = list(tracker.pending)
-                task.failed(detail=out['error'], receipts=[p['receipt'] for p in tracker.pending])
-            given = True
-        finally:
-            hold.release()
     try:
-        try:
-            if why := legacy_pending(args.board):
-                out['previousPending'] = why
-            _, images = admit(Path(args.record_dir) / f'{args.board}.build.json', args.board, args.roster, run_dir)
-            image = images[restore_sketch(args.board)]
-            observed = []
-            for action in ('flash', 'reset'):
-                before = enumerated(image['vidPid'])
-                touched = True
-                if action == 'flash':
-                    detach(args.board, board, image['vidPid'], tracker)
-                    why = flash(board['flasher'], image, run_dir, tracker)
-                    out.update(base_state(image))
-                else:
-                    detach(args.board, board, image['vidPid'], tracker)
-                    why = reset(board['flasher'], tracker)
-                if why:
-                    raise RuntimeError(f'{action}: {why}')
-                time.sleep(ENUM_TIMEOUT / 4)
-                deadline, changed = time.monotonic() + ENUM_TIMEOUT, set()
-                while time.monotonic() < deadline and not changed:
-                    changed = {k for k, ino in enumerated(image['vidPid']).items() if before.get(k) != ino}
-                    time.sleep(0.5)
-                observed.append(sorted(changed))
-            out['observed'] = observed
-            found = {s for obs in observed for s in obs}
-            if not (all(len(o) == 1 for o in observed) and len(found) == 1):
-                raise RuntimeError(f'ambiguous: not exactly one device re-enumerated with one '
-                                   f'{"port" if by_port else "serial"} both times')
-            if by_port:
-                out['port'] = found.pop()
-                out['matchesRoster'] = out['port'] == board['usb_port']
-                dev = next(d for d in devices(image['vidPid']) if d['busport'] == out['port'] and no_serial(d))
+        if why := legacy_pending(args.board):
+            out['previousPending'] = why
+        _, images = admit(Path(args.record_dir) / f'{args.board}.build.json', args.board, args.roster, run_dir)
+        image = images[restore_sketch(args.board)]
+        observed = []
+        for action in ('flash', 'reset'):
+            before = enumerated(image['vidPid'])
+            ledger['touched'] = True
+            if action == 'flash':
+                detach(args.board, board, image['vidPid'], tracker)
+                why = flash(board['flasher'], image, run_dir, tracker)
+                out.update(base_state(image))
             else:
-                out['serial'] = found.pop()
-                out['matchesRoster'] = out['serial'].lower() == board['uid'].lower()
-                devs = [d for d in scan(image['vidPid'], out['serial'])
-                        if 'usb_port' not in board or d['busport'] == board['usb_port']]
-                if len(devs) != 1:
-                    raise RuntimeError(f'want one {image["vidPid"]} with serial {out["serial"]}, found {len(devs)}')
-                dev = devs[0]
-            test = P.RESTORE_TEST['device']
-            ok, out['cleanup'] = run_test(test, dev, tracker, run_dir, board)
-            if not ok:
-                raise RuntimeError(f'{restore_sketch(args.board)} left running fails {test}: {out["cleanup"]}')
-            done = True
-        except BaseException as e:   # after hardware access: the board's state is unknown, its failure logged
-            error = e
-        finally:
-            held_verdict()
-    except KeyboardInterrupt:
-        # one from the body's end until the verdict is given, the finally's own first line included, lands here: the
-        # verdict is given again, that interrupt raised once it is
-        while not given:
-            try:
-                held_verdict()
-            except KeyboardInterrupt:
-                if given:     # the hold replayed it
-                    raise
-        raise
-    if error is not None and not touched:
-        raise error
-    return failure
+                detach(args.board, board, image['vidPid'], tracker)
+                why = reset(board['flasher'], tracker)
+            if why:
+                raise RuntimeError(f'{action}: {why}')
+            time.sleep(ENUM_TIMEOUT / 4)
+            deadline, changed = time.monotonic() + ENUM_TIMEOUT, set()
+            while time.monotonic() < deadline and not changed:
+                changed = {k for k, ino in enumerated(image['vidPid']).items() if before.get(k) != ino}
+                time.sleep(0.5)
+            observed.append(sorted(changed))
+        out['observed'] = observed
+        found = {s for obs in observed for s in obs}
+        if not (all(len(o) == 1 for o in observed) and len(found) == 1):
+            raise RuntimeError(f'ambiguous: not exactly one device re-enumerated with one '
+                               f'{"port" if by_port else "serial"} both times')
+        if by_port:
+            out['port'] = found.pop()
+            out['matchesRoster'] = out['port'] == board['usb_port']
+            dev = next(d for d in devices(image['vidPid']) if d['busport'] == out['port'] and no_serial(d))
+        else:
+            out['serial'] = found.pop()
+            out['matchesRoster'] = out['serial'].lower() == board['uid'].lower()
+            devs = [d for d in scan(image['vidPid'], out['serial'])
+                    if 'usb_port' not in board or d['busport'] == board['usb_port']]
+            if len(devs) != 1:
+                raise RuntimeError(f'want one {image["vidPid"]} with serial {out["serial"]}, found {len(devs)}')
+            dev = devs[0]
+        test = P.RESTORE_TEST['device']
+        ok, out['cleanup'] = run_test(test, dev, tracker, run_dir, board)
+        if not ok:
+            raise RuntimeError(f'{restore_sketch(args.board)} left running fails {test}: {out["cleanup"]}')
+        ledger['done'] = True
+    except BaseException as e:   # after hardware access: the board's state is unknown, its failure logged
+        ledger['error'] = e
+    if ledger['error'] is not None and not ledger['touched']:
+        raise ledger['error']
+
+
+def commission_verdict(task, exc, args, tracker, out, ledger):
+    """The commission's board task's verdict collector: restored once the restoration sketch left running passed its
+    restore test, clean when it failed before touching the board, else failed, its tracker's evidence logged and its
+    report row in ledger['failure']."""
+    if ledger['done']:
+        test = P.RESTORE_TEST['device']
+        task.restored(evidence=f'{args.board}: {restore_sketch(args.board)} restored, {test} passed')
+    elif not ledger['touched']:
+        task.clean()
+    else:
+        error = ledger['error'] or exc
+        out['error'] = f'{type(error).__name__}: {error}' if error is not None else 'interrupted'
+        ledger['failure'] = {'board': args.board, 'cleanup': {'evidence': out['error'],
+                                                              'receipts': list(tracker.receipts)}}
+        if tracker.pending:
+            ledger['failure']['cleanup']['pending'] = list(tracker.pending)
+        task.failed(detail=out['error'], receipts=[p['receipt'] for p in tracker.pending])
 
 
 def cmd_lock(rest):

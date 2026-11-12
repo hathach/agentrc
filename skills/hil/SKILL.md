@@ -86,9 +86,10 @@ nothing in it through a link.
   takes (default the board alone), on the board's first record. It ends with
   `release_board_lock` after a proven cleanup, otherwise with
   `end_failed(handles, reason, detail=..., receipts=..., retained=...)`, which
-  logs the failure on every board of the group, clears each record and drops
-  each flock whatever fails and returns the errors per board; an interrupt is
-  re-raised once every handle is released. A
+  logs the failure on every board of the group, clears each record whose
+  failure it logged (one it could not log keeps its record for the next take
+  to log found-left), drops each flock whatever fails and returns the errors
+  per board; an interrupt is re-raised once every handle is released. A
   session command run under a hold it did not take logs with
   `log_cleanup_failure`. Only a task that restored the board marks failures
   restored, through `resolve_restored`: each one whose receipts recheck ended
@@ -114,13 +115,18 @@ nothing in it through a link.
   before the hold is validated. The shared probe check is
   `hil_flash.probe_users`, whose docstring has its coverage: a recognized
   selector naming another probe excludes that process by its intended probe,
-  with no guarantee against discovery opens of other candidates, and any
-  STM32_Programmer_CLI counts as using an `stlink` flasher's probe. Each
-  consumer documents what its check covers. A task taking its own lock does
-  it through
-  `hil_lock.board_task(<lock>, busy=<check>)`, which runs the check under the
-  lock before the body and ends the lock on the body's cleanup verdict; its
-  docstring has the verdicts and their limits. A command under a hold it did not
+  with no guarantee against discovery opens of other candidates, and an
+  STM32_Programmer_CLI counts as using an ST-LINK (an `stlink` flasher's, or
+  openocd's on `interface/stlink.cfg`) unless it selects only other ST-LINKs
+  by `sn=`, its discovery opens of this one accepted. Each consumer documents what its check covers. A task taking its
+  own lock does it through
+  `hil_lock.board_task(<lock>, busy=<check>, verdict=<collector>)`, which
+  runs the check under the lock before the body and ends the lock on the
+  cleanup verdict, given by the body or, at the end, by the collector from
+  the consumer's ledger under the task's own interrupt hold. A worker whose
+  `__exit__` an interrupt cut short calls `finish(e)`; `report()` gives the
+  lock's outcome for a report, and the docstring has the verdicts and their
+  limits. A command under a hold it did not
   take stays outside it: it never releases that hold and logs a failed
   cleanup with `log_cleanup_failure`.
 - The minimum, lock, cleanup log and busy check, does not detect a leftover

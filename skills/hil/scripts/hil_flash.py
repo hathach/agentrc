@@ -612,8 +612,9 @@ def convoy_safe(flasher: dict) -> bool:
     * esptool -- delivery is `-p <ttyACM>`, a named port; it never enumerates usbfs.
     * stlink (STM32_Programmer_CLI v2.23) -- its libSTLinkUSBDriver.so lists devices through
       libusb's lock-free sysfs walk (descriptors, busnum, devnum, speed, uevent) and opens
-      only ST-Link (0483) nodes. strace on ci.lan 2026-10-07; with a testusb D-state on the
-      wedged DUT's node, `--rst --go` returned 0 in 1.7 s and the holder reaped.
+      only ST-Link (0483) nodes, every one before its `sn=` filter (see probe_users). strace
+      on ci.lan 2026-10-07; with a testusb D-state on the wedged DUT's node, `--rst --go`
+      returned 0 in 1.7 s and the holder reaped.
     * openocd over interface/jlink.cfg -- libjaylink opens SEGGER devices only (below).
     * openocd over interface/stlink.cfg or interface/ti-icdi.cfg -- discovery is VID/PID
       filtered by the cfg's own `adapter usb vid_pid` (below).
@@ -939,7 +940,7 @@ def _selections(program: str, argv: list) -> tuple:
     -select USB=<sn>; an openocd -c that is only `adapter serial`, `hla_serial` or
     `cmsis_dap_serial` <sn>; esptool --port/-p; lm4flash -s; st-flash --serial. Empty for every
     other tool and selection, and for any other syntax (pyocd and STM32_Programmer_CLI discovery
-    open candidate probes before their serial filter)."""
+    open candidate probes before their serial filter; see probe_users for STM32_Programmer_CLI)."""
     serials, ports = [], []
     if program.startswith('JLink'):
         serials += _option_values(argv, ('-usb', '-selectemubysn'), fold=True)
@@ -1056,8 +1057,32 @@ def _fds(pid: int):
     return targets
 
 
+def _other_stlink_session(prog_argv: list, uid: str) -> bool:
+    """Whether an STM32_Programmer_CLI argv selects only ST-LINKs other than `uid`: a nonempty
+    `sn=` among a `-c`/`--connect` option's parameters (the words up to the next option, each
+    split at `,`), no `-script` (whose file may name any probe), no `-pwr`/`--power` (which selects
+    its probe by its own `index=`, probe 0 by default) and no word containing `uid`."""
+    words, uid = [w.casefold() for w in prog_argv[1:]], uid.casefold()
+    selected, connect = False, False
+    for w in words:
+        if w.startswith('-'):
+            connect = w in ('-c', '--connect')
+        elif connect:
+            selected = selected or any(f.startswith('sn=') and len(f) > 3 for f in w.split(','))
+    return (bool(uid) and selected and not any(w.lstrip('-').split('=', 1)[0] in ('script', 'pwr', 'power')
+                                               for w in words)
+            and not any(uid in w for w in words))
+
+
+def _on_stlink(flasher: dict) -> bool:
+    """Whether the flasher drives an ST-LINK: an `stlink` flasher, or openocd on interface/stlink.cfg (a
+    board's recovery entry drives its main probe). ST's vendor id alone is no ST-LINK (Versaloon is 0483:a038)."""
+    return flasher.get('name') == 'stlink' or (flasher.get('name') == 'openocd'
+                                                and 'interface/stlink.cfg' in (flasher.get('args') or ''))
+
+
 def _walk(flasher: dict, devices: set) -> list:
-    uid, proc, stlink = _uid(flasher), usb_observe.PROC_ROOT, flasher.get('name') == 'stlink'
+    uid, proc, stlink = _uid(flasher), usb_observe.PROC_ROOT, _on_stlink(flasher)
     exempt = _ancestors()
     try:
         pids = sorted(int(p) for p in os.listdir(proc) if p.isdigit())
@@ -1077,8 +1102,10 @@ def _walk(flasher: dict, devices: set) -> list:
             argv.pop()
         prog_argv = _program(argv)
         program = prog_argv[0]
-        user = pid not in exempt and (any(_names_serial(uid, t) for t in _tokens(argv)) or
-                                      stlink and program == 'STM32_Programmer_CLI')
+        stm32 = stlink and program == 'STM32_Programmer_CLI'
+        if stm32 and _other_stlink_session(prog_argv, uid):
+            continue        # its discovery opens our probe too: accepted, fds included (agentrc#541)
+        user = pid not in exempt and (any(_names_serial(uid, t) for t in _tokens(argv)) or stm32)
         if not user:
             try:
                 fds = _fds(pid)
@@ -1108,10 +1135,15 @@ def probe_users(flasher: dict) -> list:
     under the flasher's vid_pid or vendor). A process is a user when
     * its command line, of any uid, names the probe serial as a token (words split at whitespace,
       `=` and `,`, quotes and braces stripped; case aside, an all-digit serial as a number for
-      J-Link's zero padding, also after a `scheme:` prefix), or, for an `stlink` flasher, it runs
-      STM32_Programmer_CLI at all (a `-script` names the probe in its file, and whether one runs
+      J-Link's zero padding, also after a `scheme:` prefix), or, on an ST-LINK (_on_stlink), it runs
+      STM32_Programmer_CLI (a `-script` names the probe in its file, and whether one runs
       depends on the other tools on the host, not on the caller); our own process and its
-      ancestors are exempt from this match only;
+      ancestors are exempt from this match only. On an ST-LINK an STM32_Programmer_CLI
+      selecting only other ST-LINKs (an `sn=` selector, no `-script`, no `-pwr`, no word
+      containing this serial) is no user at all, its fds included: its discovery opens every
+      ST-LINK before its serial filter, vendor-filtered rather than serial-exclusive, and those
+      opens of this probe are accepted so sibling ST-LINK boards flash concurrently (any other
+      tool's readable fds still count);
     * its fds, where we may read them (our uid, or CAP_SYS_PTRACE), hold one of those devices;
       our process and ancestors included.
     A process whose fds we cannot read and whose effective program (argv[0]'s basename, or a
@@ -1127,7 +1159,7 @@ def probe_users(flasher: dict) -> list:
     guarantee against discovery activity. A pyOCD process is never excluded this way, a
     deliberately more conservative policy.
 
-    Not covered: an STM32_Programmer_CLI script on an ST-LINK whose flasher is not `stlink`, a
+    Not covered: an STM32_Programmer_CLI script on an ST-LINK whose flasher _on_stlink does not name, a
     GDB client attached to a server, DUT-side tools (testusb, mcopy, nrfutil) and anything not
     running at the moment of the walk. ProbeCheckInconclusive (a RuntimeError) when /proc may
     hide another uid's processes (hidepid), the walk is bounded out (PROBE_SCAN_BOUND) or an

@@ -33,7 +33,7 @@ so is one whose lock did not end as its verdict said (BoardTask.ended_cleanly). 
 outright leaves its record, which the next task logs as a failed cleanup, and prints no
 report. SIGINT stops the check after the current board's cleanup; the report then says
 `termination: aborted`. An interrupt that lands as the task's __exit__ is entered, before it
-runs, gets one more __exit__ (BoardTask's limit).
+runs, gets the task's finish() (BoardTask's limit).
 
 Profile (a module; `__file__` names it in the report, with its digest):
   roster(host, config, args) -> {'path', 'boards': [dict], 'named_only': [dict]}: this host's
@@ -274,28 +274,14 @@ def check_board(profile, board: dict, args, state_dir) -> dict:
     if not _probe(profile, board, row):
         return row
     ctx = Context(args, state_dir)
-    task = hil_lock.board_task(profile.lock_name(board), REASON, busy=lambda: profile.busy(board))
+    task = hil_lock.board_task(profile.lock_name(board), REASON, busy=lambda: profile.busy(board),
+                               verdict=lambda task, exc: _verdict(task, ctx, row))
     entered = False
     try:
         with task:
             entered = True
             _previous_failure(row, task.cleanup_failures)
-            try:
-                try:
-                    _reset(profile, ctx, board, row)
-                finally:
-                    _verdict(task, ctx, row)
-            except KeyboardInterrupt:
-                # one from the reset's end until the verdict is given (row['cleanup'] still None), the finally's own
-                # first line included, lands here: the verdict comes from the ledger again, that interrupt raised once
-                # it is
-                while row['cleanup'] is None:
-                    try:
-                        _verdict(task, ctx, row)
-                    except KeyboardInterrupt:
-                        if row['cleanup'] is not None:     # given: the hold replayed it
-                            raise
-                raise
+            _reset(profile, ctx, board, row)
     except hil_lock.BoardBusy as e:
         return _refused(row, task, 'locked', str(e))
     except hil_lock.RecoveryBlocked as e:
@@ -306,11 +292,7 @@ def check_board(profile, board: dict, args, state_dir) -> dict:
         return _refused(row, task, 'failed', str(e))
     except KeyboardInterrupt as e:
         row['interrupted'] = True
-        if not task.ended:     # it landed as __exit__ was entered: that __exit__ never ran
-            try:
-                task.__exit__(type(e), e, e.__traceback__)
-            except KeyboardInterrupt:
-                pass
+        task.finish(e)         # one that landed as __exit__ was entered left it unrun
         if not entered and task.failure_logged is None:
             return _refused(row, task, 'failed', 'interrupted')
     except Exception as e:
@@ -378,26 +360,21 @@ def _reset(profile, ctx: Context, board: dict, row: dict) -> None:
 
 
 def _verdict(task, ctx: Context, row: dict) -> None:
-    """The task's cleanup verdict from the ledger, an interrupt deferred until it is given:
-    clean() once every run is proven ended, else failed() with the open receipts and retained
-    sessions."""
-    hold = hil_process.InterruptHold()
+    """The task's verdict collector, from the ledger: clean() once every run is proven ended,
+    else failed() with the open receipts and retained sessions."""
     try:
-        try:
-            open_ops, why = ctx.open_runs(), ''
-        except Exception as err:   # unrechecked: every run not yet proven ended stays open
-            open_ops, why = [e for e in ctx.ledger if e['cleanup'] != 'done'], f'recheck failed: {err!r}'[:200]
-        if not open_ops and not why:
-            row['cleanup'] = _new_cleanup('released')
-            task.clean()
-            return
-        cleanup = row['cleanup'] = _cleanup_from(open_ops, 'unresolved')
-        if why:
-            cleanup['evidence'].append(why)
-        task.failed(detail=f'farm check cleanup unresolved: {"; ".join(cleanup["evidence"])}'[:500],
-                    receipts=cleanup['receipts'], retained=cleanup.get('retained', []))
-    finally:
-        hold.release()
+        open_ops, why = ctx.open_runs(), ''
+    except Exception as err:   # unrechecked: every run not yet proven ended stays open
+        open_ops, why = [e for e in ctx.ledger if e['cleanup'] != 'done'], f'recheck failed: {err!r}'[:200]
+    if not open_ops and not why:
+        row['cleanup'] = _new_cleanup('released')
+        task.clean()
+        return
+    cleanup = row['cleanup'] = _cleanup_from(open_ops, 'unresolved')
+    if why:
+        cleanup['evidence'].append(why)
+    task.failed(detail=f'farm check cleanup unresolved: {"; ".join(cleanup["evidence"])}'[:500],
+                receipts=cleanup['receipts'], retained=cleanup.get('retained', []))
 
 
 def _new_cleanup(result: str) -> dict:

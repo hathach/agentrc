@@ -55,6 +55,7 @@ CLEANUP_LOG = '.cleanup.jsonl'   # <board>.cleanup.jsonl: the board's failed cle
 LOG_WAIT = 5.0                # s a cleanup-log reader or writer waits for its mutex
 REWRITING = b'#'              # byte 0 of a record being rewritten: unreadable
 ACQUIRING = b'~'              # byte 0 while take_board_lock writes its first record: a free board
+UNLOGGED = b'!'               # byte 0 while end_failed writes an unlogged failure's evidence into its record
 DIR_MODE = 0o755
 SHARE_STEP = (f'a second OS user needs the lock dir sticky and world-writable, a one-time host step '
               f'once every project on the host runs this helper: sudo install -d -m 1777 {BOARD_LOCK_DIR}')
@@ -411,6 +412,8 @@ def _leftover(board, fh, data=None):
         found['task'] = rec
     elif state == 'unreadable' and not _acquiring(data):
         found['task'] = {'unreadable': data[:2000].decode(errors='backslashreplace')}
+        if data[:1] == UNLOGGED:     # an unlogged failure's evidence cut short: it stays open (resolve_restored)
+            found['task']['receipts'] = [{'unrecheckable': 'an unlogged failure whose evidence was not kept'}]
     if 'task' not in found and 'journalDigest' in found and _logged_journal(board, found['journalDigest']):
         return None
     if not found:
@@ -644,8 +647,13 @@ def _guarded(step, what, note, interrupted, default=None):
 def end_failed(handles, reason, *, detail, receipts=(), retained=(), **extra) -> dict:
     """End a task whose cleanup did not end proven: on every board of `handles` ({board: handle}),
     append a `failed` event (the holder record, `detail`, the run_tracked `receipts` and the
-    `retained` sessions not proven ended, `extra`), clear the record and drop the flock, going on
-    whatever fails. Returns {board: [error text]} for the boards where a step failed."""
+    `retained` sessions not proven ended, `extra`), clear the record once that event is logged
+    and drop the flock, going on whatever fails. A record whose event was not logged is kept, its
+    only evidence, for the next take to log found-left, rewritten first with the failure's `detail`,
+    `receipts` and `retained` (_keep_unlogged) so that resolve_restored rechecks them; a rewrite cut
+    short reads as an unrecheckable receipt, and only one whose first byte cannot be written leaves
+    the record without them. If the log is still unwritable at that take, it reports the failure
+    only in its cleanup_failures. Returns {board: [error text]} for the boards where a step failed."""
     return _end_failed_each(handles, reason, detail, receipts, retained, extra, {})
 
 
@@ -679,10 +687,14 @@ def _end_failed_each(handles, reason, detail, receipts, retained, extra, ended) 
         ended[b] = {'logged': False, 'cleared': False, 'evidence': evidence}
         ended[b]['logged'] = guard([b], 'cleanup log not written', lambda: _log_ended(
             b, fh, reason, detail, receipts, retained, extra)) is not None
-        cleared = guard([b], 'record not cleared', lambda: clear_record(fh))
-        if cleared is False:
-            errors.setdefault(b, []).append('record not cleared')
-        ended[b]['cleared'] = cleared is True
+        if ended[b]['logged']:
+            cleared = guard([b], 'record not cleared', lambda: clear_record(fh))
+            if cleared is False:
+                errors.setdefault(b, []).append('record not cleared')
+            ended[b]['cleared'] = cleared is True
+        else:
+            guard([b], 'evidence not kept in the record', lambda: _keep_unlogged(
+                fh, reason, detail, receipts, retained))
         guard([b], 'close', fh.close)
     if hold is not None:
         guard((), 'deferred interrupt', hold.release)
@@ -698,6 +710,23 @@ def _log_ended(board, fh, reason, detail, receipts, retained, extra) -> dict:
         state, rec = 'unreadable', None
     return log_cleanup_failure(board, reason, detail=detail, task=rec if state == 'record' else None, receipts=receipts,
                         retained=retained, **extra)
+
+
+def _keep_unlogged(fh, reason, detail, receipts, retained) -> None:
+    """Rewrite the record of a failure end_failed could not log with its `detail`, `receipts` and
+    `retained` (a value JSON cannot hold as its repr; evidence it cannot hold at all as an
+    unrecheckable receipt), marked cleanupOwed, behind UNLOGGED. OSError when a write fails."""
+    try:
+        state, rec = _parse(_handle_record(fh))
+    except OSError:
+        state, rec = 'unreadable', None
+    fields = {**(rec if state == 'record' else {'pid': os.getpid(), 'reason': reason}), CLEANUP_OWED: True}
+    try:
+        data = json.dumps({**fields, 'detail': detail, 'receipts': receipts, 'retained': retained}, default=repr)
+    except (TypeError, ValueError) as e:
+        data = json.dumps({**fields, 'detail': f'{detail!r:.2000}',
+                           'receipts': [{'unrecheckable': f'its evidence cannot be recorded: {e!r:.200}'}]})
+    _overwrite(fh.fileno(), UNLOGGED, data.encode())
 
 
 def log_cleanup_failure(board, reason, *, detail, task=None, receipts=(), retained=(), **extra) -> dict:
@@ -742,9 +771,9 @@ def _journal_records(journal):
 def resolve_restored(board, failures, **evidence) -> list:
     """After the caller restored `board`: mark restored (cleanup_restored, with `evidence`) each of
     `failures` (its take's `cleanup_failures`, or open_cleanup_failures under its hold) whose own
-    evidence is resolved: every receipt, a legacy task record's and those its takeover journal kept
-    included, rechecks `done` as the caller, and every session they retained reads ended
-    (_release_blocker). Returns why each other one stays open or its restoration was not logged;
+    evidence is resolved: every receipt, its task record's (an older helper's, or one end_failed kept
+    unlogged) and those its takeover journal kept included, rechecks `done` as the caller, and
+    every session they retained reads ended (_release_blocker). Returns why each other one stays open or its restoration was not logged;
     a failure without an id is skipped."""
     notes = []
     for f in failures:
@@ -820,17 +849,30 @@ class BoardTask:
     through end_failed, the exception named in the detail. A second verdict raises and ends the
     task as failed. Finalization runs under an InterruptHold: a SIGINT or SIGTERM whose handler is
     a Python callable is replayed once the task's state is complete and then takes precedence
-    over the body's exception, kept as its __context__; other finalization errors go to `errors`
-    and never replace it. A handle that cannot be closed is kept, and a later __exit__ retries
+    over the body's exception, kept as its __context__, unless that is itself an interrupt; the
+    first interrupt caught while finishing wins over later ones (a signal landing while the
+    replay's own handler runs is outside that rule). Other finalization errors go to `errors` and never
+    replace it. A handle that cannot be closed is kept, and a later __exit__ or finish() retries
     its close. With `allow_bypass`, HIL_NO_BOARD_LOCK=1 takes no flock (acquire_board_lock): the
     busy check still runs, a failed cleanup is logged with log_cleanup_failure and a restoration
     resolves nothing; without it the variable is ignored.
 
-    Limit: a signal CPython delivers as __exit__ is entered unwinds before it runs, leaving the
-    flock held while the process lives and the protected record for the next take to log
-    found-left. A worker that catches that interrupt and goes on calls the task's __exit__ again
-    (a task without a verdict then ends as failed) while `ended` is false, or ends before it
-    continues.
+    `verdict(task, exc)`, when given, is the consumer's verdict collector: called once, at the
+    end of an admitted task whose body gave no verdict, under finalization's InterruptHold and
+    before its steps, with the body's exception (else an interrupt that cut an earlier attempt
+    short) as `exc`, it gives the verdict from the consumer's own ledger through clean(),
+    restored() or failed(), and never suppresses the exception. A collector that raises (an
+    interrupt included, where no hold could be installed) or gives no verdict ends the task as
+    failed, any failed verdict it gave keeping its evidence, with an unrecheckable marker in its
+    receipts and never cleanly; its interrupt is raised after finalization. Hardware work stays in
+    the body: the collector only reads the ledger.
+
+    Limit: a signal CPython delivers as __exit__ or finish() is entered unwinds before it runs,
+    leaving the flock held while the process lives and the protected record for the next take to
+    log found-left. A worker that catches that interrupt and goes on calls finish(e) while `ended`
+    is false (a task without a verdict or collector then ends as failed), or ends before it
+    continues. One landing as __enter__ returns, after admission, leaves an admitted task whose
+    body never ran: finish() then ends it as an empty body, its collector included.
 
     `cleanup_failures` (the take's open failures, kept even when admission is refused), `errors`,
     `restore_notes` (resolve_restored's), `bypassed` and `released` (an owned handle was closed)
@@ -849,16 +891,22 @@ class BoardTask:
       cleanly; a refusal before the take ends cleanly. Advisory notes do not change it: an
       interrupt hold that could not be installed, a restoration's notes (restore_notes) or
       errors, a deferred interrupt replayed afterwards.
-    describe() puts these and `errors` in one line for the caller's report."""
+    describe() puts these and `errors` in one line for the caller's report, and report() all of
+    them as one dict."""
 
-    def __init__(self, board, reason=CI_REASON, *, busy, wait=0, allow_bypass=False, **record_fields):
+    def __init__(self, board, reason=CI_REASON, *, busy, wait=0, allow_bypass=False, verdict=None,
+                 **record_fields):
         if not callable(busy):
             raise TypeError(f'busy must be callable, not {busy!r:.80}')
+        if verdict is not None and not callable(verdict):
+            raise TypeError(f'verdict must be callable or None, not {verdict!r:.80}')
         if isinstance(wait, bool) or not isinstance(wait, (int, float)) or not math.isfinite(wait) or wait < 0:
             raise ValueError(f'wait must be a finite number of seconds >= 0, not {wait!r:.80}')
         _own_fields(record_fields, CLEANUP_OWED, 'protected', 'locks', 'role')
         self.board, self.reason = board, reason
         self._busy, self._wait, self._allow_bypass, self._fields = busy, wait, allow_bypass, record_fields
+        self._collector = verdict        # None once called: a retried _finish never reruns it
+        self._collector_why = None       # why the collector's verdict does not stand, once called
         self.cleanup_failures, self.errors, self.restore_notes = [], [], []
         self.bypassed = self.released = self.taken = False
         self.failure_logged = None
@@ -984,28 +1032,61 @@ class BoardTask:
                            f'it ends as a failed cleanup')
 
     def __exit__(self, exc_type, exc, traceback) -> bool:
-        # an interrupt before _finish's hold went in did nothing yet: finish again, then raise it
-        pending = None
+        # an interrupt before _finish's hold went in did nothing yet: finish again. The first
+        # interrupt wins, and a body's own interrupt is first
+        start, pending = self._state, None
         while True:
             try:
-                self._finish(exc)
+                self._finish(exc if exc is not None else pending, refused=start == 'entering')
                 break
             except BaseException as e:
-                if self._state != 'active':
-                    raise
                 pending = pending or e
-        if pending is not None:
+                if self._state != start or start not in ('entering', 'active'):
+                    break
+        if pending is not None and (exc is None or isinstance(exc, Exception) or isinstance(pending, Exception)):
             raise pending
         return False
 
+    def finish(self, exc=None) -> None:
+        """End the task now, as its __exit__ with `exc` would: what a worker calls when an
+        interrupt cut its __exit__ short, or when an interrupt left __enter__ before admission
+        returned (a refusal then). It does nothing once `ended`, and ends a task never entered
+        as untouched. It never raises `exc`; when `exc` is an interrupt, one caught while
+        finishing is dropped for the caller to re-raise its own."""
+        if self._state == 'new':
+            self._state = 'done'
+            return
+        self.__exit__(None if exc is None else type(exc), exc, None)
+
+    def report(self) -> dict:
+        """The outcome attributes, describe() and copies of `errors` and `restore_notes`, for a
+        caller's report; reading it changes nothing."""
+        return {'taken': self.taken, 'released': self.released, 'bypassed': self.bypassed, 'ended': self.ended,
+                'endedCleanly': self.ended_cleanly, 'failureLogged': self.failure_logged,
+                'errors': list(self.errors), 'describe': self.describe(), 'restoreNotes': list(self.restore_notes)}
+
     def _verdict_at_end(self, exc):
         verdict = self._verdict
+        if self._collector_why is not None:
+            verdict = self._collector_failure(verdict)
         if verdict is None:
             return ('failed', 'the task ended without a cleanup verdict'
                     + (f': {_exc_text(exc)}' if exc is not None else ''), (), ())
         if verdict[0] == 'failed' and exc is not None:
             return ('failed', f'{verdict[1]}; then {_exc_text(exc)}', *verdict[2:])
         return verdict
+
+    def _collector_failure(self, given):
+        """The failed verdict a collector that did not finish, or gave none, ends its task on."""
+        why = self._collector_why
+        if given is None:
+            detail, receipts, retained = f'the verdict collector {why}', (), ()
+        elif given[0] == 'failed':
+            detail, receipts, retained = f'{given[1]}; then the verdict collector {why}', given[2], given[3]
+        else:
+            detail, receipts, retained = f'the verdict collector {why} after a {given[0]} verdict', (), ()
+        return ('failed', detail, itertools.chain(receipts, [{'unrecheckable': f'the verdict collector {why}'}]),
+                retained)
 
     def _finish(self, exc, refused=False) -> None:
         if self._state == 'done':
@@ -1016,9 +1097,17 @@ class BoardTask:
         def guard(what, step, default=None):
             return _guarded(step, what, self.errors.append, interrupted, default)
         try:
+            if self._state == 'active' and not refused and self._collector is not None and self._verdict is None:
+                collector, self._collector, self._collector_why = self._collector, None, 'did not finish'
+                if guard('verdict collector', lambda: (collector(self, exc), True)[1]):
+                    self._collector_why = None if self._verdict is not None else 'gave no verdict'
+                    if self._collector_why:
+                        self.errors.append('verdict collector: gave no verdict')
             if self._state in ('entering', 'active'):
                 self._state = 'ending'
                 self._end_on(guard, refused, exc)
+                if self._collector_why is not None:
+                    self._as_verdict = False
                 self._state = 'closing'
         finally:
             # whatever cut the steps short (no hold to defer it), an owned handle is closed here
@@ -1032,7 +1121,10 @@ class BoardTask:
                     self._state = 'done'
             finally:
                 if hold is not None:
-                    hold.release()
+                    try:
+                        hold.release()
+                    except BaseException as e:     # the replay: an interrupt already kept stays first
+                        interrupted.append(e)
         if interrupted:
             raise interrupted[0]
 
