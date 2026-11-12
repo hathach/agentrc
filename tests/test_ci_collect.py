@@ -148,7 +148,7 @@ class TransientRetryTest(unittest.TestCase):
         got, calls, waits = self.gh([(1, 'HTTP 502')])
         self.assertIsInstance(got, collect.Failed)
         self.assertIn('HTTP 502', str(got))
-        self.assertEqual((len(calls), waits), (3, list(collect.RETRY_WAITS)))
+        self.assertEqual((len(calls), waits), (3, list(collect.gh_retry.WAITS)))
 
     def test_other_failures_and_writes_are_not_retried(self):
         for what, err, args in (('a 500', 'HTTP 500', ()), ('a 404', 'gh: Not Found (HTTP 404)', ()),

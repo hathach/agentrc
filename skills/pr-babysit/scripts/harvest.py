@@ -36,7 +36,8 @@ with its walkthrough marker (CR_WALKTHROUGH), the auto-generated summary,
 "coderabbit-walkthrough"; and a Copilot review body saying it could not review,
 "copilot-refusal". Their digest and aliases are still the real body's and identify them,
 and its url shows it (`gh api repos/<repo>/issues/comments/<commentId>` for the walkthrough). Exit 2 with {"error": ...} when gh cannot answer the PR, the
-head, or a comment endpoint, plus facts.py's rateLimit when GitHub refused gh for a rate limit.
+head, or a comment endpoint, plus facts.py's rateLimit when GitHub refused gh for a rate limit. A read GitHub answered
+HTTP 502, 503 or 504 is made again after lib/gh_retry.py's waits first; a write through gh_json, never.
 
 --carry takes a JSON list of {commentId, digest, judgedSha, paths}: comments whose findings were all settled at
 judgedSha, paths the repository-relative files their verdicts rest on (null or [] when unbounded). The full output then
@@ -77,6 +78,7 @@ import comment_digest  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
 import greptile as greptile_check  # noqa: E402  the confidence check's recogniser, which collect.py shares
 from check_runs import latest_run, newest, newest_reading, stamp  # noqa: E402,F401  which collect.py shares
+import gh_retry  # noqa: E402
 
 KNOWN = ('copilot', 'coderabbit', 'greptile', 'code-scanning')
 SETTLED = ('coderabbit', 'greptile')
@@ -132,7 +134,8 @@ class Unreadable(Unusable):
 
 
 def gh_json(*argv):
-    text = run('gh', *argv)[1]
+    """gh's JSON answer, a read made again on a transient server error (lib/gh_retry.py)."""
+    text = gh_retry.read(argv, lambda: run('gh', *argv), Unusable)[1]
     try:
         return json.loads(text)
     except ValueError:

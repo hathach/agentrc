@@ -293,6 +293,55 @@ class SettleRules(unittest.TestCase):
             self.assertNotIn('bodyOmitted', got)
 
 
+class TransientReads(unittest.TestCase):
+    """#523: gh_json and pages make a read again on HTTP 502, 503 or 504, as collect.py does; nothing else."""
+
+    def gh(self, answers, call):
+        calls, waits = [], []
+
+        def run(*argv, ok=(0,)):
+            calls.append(argv)
+            got = answers.pop(0) if len(answers) > 1 else answers[0]
+            if isinstance(got, Exception):
+                raise got
+            return 0, got
+        with mock.patch.object(harvest, 'run', run), mock.patch.object(harvest.gh_retry.time, 'sleep', waits.append):
+            try:
+                return call(), calls, waits
+            except harvest.Unusable as e:
+                return e, calls, waits
+
+    def test_a_transient_error_is_read_again(self):
+        got, calls, waits = self.gh([harvest.Unusable('gh pr view 7: HTTP 503'), '{"headRefOid": "x"}'],
+                                    lambda: harvest.gh_json('pr', 'view', '7', '--json', 'headRefOid'))
+        self.assertEqual((got, len(calls), waits), ({'headRefOid': 'x'}, 2, [2]))
+
+    def test_a_paginated_read_is_read_again_whole(self):
+        got, calls, waits = self.gh([harvest.Unusable('gh api: gh: Server Error (HTTP 502)'), '[[1, 2], [3]]'],
+                                    lambda: harvest.pages('repos/o/r/issues/7/comments'))
+        self.assertEqual((got, waits), ([1, 2, 3], [2]))
+        self.assertEqual(calls[0], calls[1])
+        self.assertEqual(calls[0][:4], ('gh', 'api', '--paginate', '--slurp'))
+
+    def test_exhaustion_keeps_the_error_contract(self):
+        got, calls, waits = self.gh([harvest.Unusable('gh api x: HTTP 504')], lambda: harvest.gh_json('api', 'x'))
+        self.assertEqual((type(got), str(got), len(calls), waits), (harvest.Unusable, 'gh api x: HTTP 504', 3, [2, 5]))
+
+    def test_no_retry_of_a_rate_limit_a_mutation_or_a_malformed_answer(self):
+        limited = harvest.RateLimited('gh api x: HTTP 503: secondary rate limit', {'resetAt': None})
+        mutation = ('api', 'graphql', '-f', 'query=mutation { resolveReviewThread(input: {threadId: "t"}) { thread { id } } }')
+        for what, answers, argv, want in (('a rate limit', [limited, '{}'], ('api', 'x'), limited),
+                                          ('a mutation', [harvest.Unusable('gh api graphql: HTTP 502'), '{}'], mutation, None),
+                                          ('a POST', [harvest.Unusable('gh api: HTTP 502'), '{}'], ('api', 'x', '-f', 'body=y'), None),
+                                          ('JSON it cannot read', ['<html>', '{}'], ('api', 'x'), None)):
+            with self.subTest(what):
+                got, calls, waits = self.gh(answers, lambda: harvest.gh_json(*argv))
+                self.assertIsInstance(got, harvest.Unusable)
+                if want:
+                    self.assertIs(got, want)
+                self.assertEqual((len(calls), waits), (1, []))
+
+
 class FailClosed(unittest.TestCase):
     """What a first review found failing open: each case must end unknown or with the older, provable state."""
 
@@ -960,7 +1009,8 @@ class EndToEnd(unittest.TestCase):
         self.assertIn('secondary rate limit', got['error'])
         self.assertEqual((got['rateLimit']['resetAt'], got['rateLimit']['secondary']), (None, True))
 
-    def test_a_workflow_read_that_fails_twice_leaves_the_head_undated_and_says_so(self):
+    @mock.patch('time.sleep')  # lib/gh_retry.py's waits before a failed read is made again
+    def test_a_workflow_read_that_fails_twice_leaves_the_head_undated_and_says_so(self, _sleep):
         """#242: the runs date the head, but a failed read of the workflow that would date it is not "nothing dates the head"."""
         path = f'api repos/o/r/contents/.github/workflows/build.yml?ref={HEAD}'
         answers = self.answers([HEAD])

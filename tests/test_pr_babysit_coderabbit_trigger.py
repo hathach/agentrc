@@ -355,7 +355,8 @@ class Request(unittest.TestCase):
                 self.assertNotIn('commentId', out)
                 self.assertIsInstance(out['detail'], str)
 
-    def test_a_read_that_fails_before_the_post_says_nothing_was_posted(self):
+    @mock.patch.object(harvest.gh_retry.time, 'sleep')  # lib/gh_retry.py's waits before a failed read is made again
+    def test_a_read_that_fails_before_the_post_says_nothing_was_posted(self, _sleep):
         # #276: a 503 on the pull read, which comes before the POST.
         rig = RequestRig()
 
