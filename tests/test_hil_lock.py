@@ -2825,8 +2825,8 @@ class BoardTasks(LockDir):
                     self.assertEqual((task.bypassed, task.ended, task.ended_cleanly, task.failure_logged),
                                      (bypass, True, False, True))
                     self.assertEqual(len(failed_events(hil_lock, BOARD)), n + 1 + bypass * len(cases))
-                    if body is not cases[4][0]:
-                        self.assertTrue(task.errors[-1].startswith('verdict collector: RuntimeError('))
+                    self.assertTrue(task.errors[-1] == 'verdict collector: gave no verdict' if body is cases[4][0]
+                                    else task.errors[-1].startswith('verdict collector: RuntimeError('))
 
     def test_without_a_hold_an_interrupted_collector_ends_failed_then_raises(self):
         self.signals()
@@ -2946,6 +2946,60 @@ class BoardTasks(LockDir):
         self.assertFalse(self.flock_is_free())
         task.finish()
         collect.assert_not_called()
+        self.assert_released(task)
+        self.assertTrue(task.ended_cleanly)
+
+    def test_without_a_hold_a_signal_as_the_collector_is_entered_leaves_the_record_for_the_next_take(self):
+        self.signals()
+        self.patch(hil_lock._process(), 'InterruptHold', mock.Mock(side_effect=OSError(24, 'Too many open files')))
+
+        def tracer(frame, event, arg):
+            if event == 'call' and frame.f_code is hil_lock._guarded.__code__ and \
+                    frame.f_locals.get('what') == 'verdict collector':
+                sys.settrace(None)
+                signal.raise_signal(signal.SIGINT)
+        collect = mock.Mock()
+        task = self.task(verdict=collect)
+        prev = sys.gettrace()
+        with self.assertRaises(KeyboardInterrupt):
+            with task:
+                sys.settrace(tracer)
+        sys.settrace(prev)
+        collect.assert_not_called()
+        self.assert_released(task, record='record')
+        self.assertEqual(taken_failure(self.acquire())['how'], 'found-left')
+
+    def test_a_signal_as_enter_returns_leaves_an_empty_body_for_finish(self):
+        self.signals()
+        code = hil_lock.BoardTask.__enter__.__code__
+        source = inspect.getsourcelines(hil_lock)[0]
+        line = next(n for _, _, n in code.co_lines() if n and source[n - 1].strip() == 'return self')
+
+        def tracer(frame, event, arg):
+            if frame.f_code is code:
+                if event == 'line' and frame.f_lineno == line:
+                    sys.settrace(None)
+                    frame.f_trace = None
+                    signal.raise_signal(signal.SIGINT)
+                return tracer
+            return None
+        seen = []
+
+        def collect(task, exc):
+            seen.append(exc)
+            task.clean()
+        task = self.task(verdict=collect)
+        prev = sys.gettrace()
+        sys.settrace(tracer)
+        try:
+            with self.assertRaises(KeyboardInterrupt) as cm:
+                with task:
+                    self.fail('the body ran')
+        finally:
+            sys.settrace(prev)
+        self.assertEqual(task._state, 'active')
+        task.finish(cm.exception)
+        self.assertEqual(seen, [cm.exception])
         self.assert_released(task)
         self.assertTrue(task.ended_cleanly)
 

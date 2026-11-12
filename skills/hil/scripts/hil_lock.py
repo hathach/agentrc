@@ -821,7 +821,8 @@ class BoardTask:
     task as failed. Finalization runs under an InterruptHold: a SIGINT or SIGTERM whose handler is
     a Python callable is replayed once the task's state is complete and then takes precedence
     over the body's exception, kept as its __context__, unless that is itself an interrupt; the
-    first interrupt wins over later ones. Other finalization errors go to `errors` and never
+    first interrupt caught while finishing wins over later ones (a signal landing while the
+    replay's own handler runs is outside that rule). Other finalization errors go to `errors` and never
     replace it. A handle that cannot be closed is kept, and a later __exit__ or finish() retries
     its close. With `allow_bypass`, HIL_NO_BOARD_LOCK=1 takes no flock (acquire_board_lock): the
     busy check still runs, a failed cleanup is logged with log_cleanup_failure and a restoration
@@ -841,7 +842,8 @@ class BoardTask:
     leaving the flock held while the process lives and the protected record for the next take to
     log found-left. A worker that catches that interrupt and goes on calls finish(e) while `ended`
     is false (a task without a verdict or collector then ends as failed), or ends before it
-    continues.
+    continues. One landing as __enter__ returns, after admission, leaves an admitted task whose
+    body never ran: finish() then ends it as an empty body, its collector included.
 
     `cleanup_failures` (the take's open failures, kept even when admission is refused), `errors`,
     `restore_notes` (resolve_restored's), `bypassed` and `released` (an owned handle was closed)
@@ -874,7 +876,7 @@ class BoardTask:
         _own_fields(record_fields, CLEANUP_OWED, 'protected', 'locks', 'role')
         self.board, self.reason = board, reason
         self._busy, self._wait, self._allow_bypass, self._fields = busy, wait, allow_bypass, record_fields
-        self._collector, self._collected, self._collector_failed = verdict, False, False
+        self._collector, self._collected, self._collector_done, self._collector_failed = verdict, False, False, False
         self.cleanup_failures, self.errors, self.restore_notes = [], [], []
         self.bypassed = self.released = self.taken = False
         self.failure_logged = None
@@ -1035,12 +1037,28 @@ class BoardTask:
 
     def _verdict_at_end(self, exc):
         verdict = self._verdict
+        if self._collector_failed:
+            verdict = self._collector_failure(verdict)
         if verdict is None:
             return ('failed', 'the task ended without a cleanup verdict'
                     + (f': {_exc_text(exc)}' if exc is not None else ''), (), ())
         if verdict[0] == 'failed' and exc is not None:
             return ('failed', f'{verdict[1]}; then {_exc_text(exc)}', *verdict[2:])
         return verdict
+
+    def _collector_failure(self, given):
+        """The failed verdict a collector that did not finish, or gave none, ends its task on."""
+        why = 'did not finish' if not self._collector_done else 'gave no verdict'
+        if self._collector_done:
+            self.errors.append('verdict collector: gave no verdict')
+        if given is None:
+            detail, receipts, retained = f'the verdict collector {why}', (), ()
+        elif given[0] == 'failed':
+            detail, receipts, retained = f'{given[1]}; then the verdict collector {why}', given[2], given[3]
+        else:
+            detail, receipts, retained = f'the verdict collector {why} after a {given[0]} verdict', (), ()
+        return ('failed', detail, itertools.chain(receipts, [{'unrecheckable': f'the verdict collector {why}'}]),
+                retained)
 
     def _finish(self, exc, refused=False) -> None:
         if self._state == 'done':
@@ -1051,9 +1069,11 @@ class BoardTask:
         def guard(what, step, default=None):
             return _guarded(step, what, self.errors.append, interrupted, default)
         try:
-            if self._state == 'active' and not refused and self._collector is not None and not self._collected:
+            if (self._state == 'active' and not refused and self._collector is not None and not self._collected
+                    and self._verdict is None):
                 self._collected = True       # before the call: a retried _finish never reruns it
-                self._collect(guard, exc)
+                self._collector_done = guard('verdict collector', lambda: (self._collector(self, exc), True)[1]) is True
+                self._collector_failed = not (self._collector_done and self._verdict is not None)
             if self._state in ('entering', 'active'):
                 self._state = 'ending'
                 self._end_on(guard, refused, exc)
@@ -1078,23 +1098,6 @@ class BoardTask:
                         interrupted.append(e)
         if interrupted:
             raise interrupted[0]
-
-    def _collect(self, guard, exc) -> None:
-        if self._verdict is not None:
-            return
-        done = guard('verdict collector', lambda: self._collector(self, exc) or True)
-        if done and self._verdict is not None:
-            return
-        why, given = ('gave no verdict' if done else 'did not finish'), self._verdict
-        self._collector_failed = True
-        if given is None:
-            detail, receipts, retained = f'the verdict collector {why}', (), ()
-        elif given[0] == 'failed':
-            detail, receipts, retained = f'{given[1]}; then the verdict collector {why}', given[2], given[3]
-        else:
-            detail, receipts, retained = f'the verdict collector {why} after a {given[0]} verdict', (), ()
-        self._verdict = ('failed', detail, itertools.chain(receipts, [{'unrecheckable': f'the verdict collector {why}'}]),
-                         retained)
 
     def _end_on(self, guard, refused, exc) -> None:
         verdict = ('refused',) if refused else guard('verdict', lambda: self._verdict_at_end(exc),
