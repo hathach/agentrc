@@ -1843,7 +1843,10 @@ class CleanupLog(LockDir):
         _, errors = self.failed_end()
         self.assertRegex(errors[BOARD][0], r'cleanup log not written: .*mutex held past 0.2s')
         self.assertTrue(self.flock_is_free())
-        self.assertRegex(taken_failure(self.acquire())['unavailable'], 'cleanup log unreadable: .*mutex held')
+        unavailable, left = self.acquire().cleanup_failures
+        self.assertRegex(unavailable['unavailable'], 'cleanup log unreadable: .*mutex held')
+        self.assertEqual(left['how'], 'found-left')       # the record kept, as its found-left could not be logged
+        self.assertRegex(left['noteError'], 'mutex held')
 
     def test_a_reader_waits_for_an_append_and_creates_nothing(self):
         fh = self.acquire()
@@ -1888,8 +1891,14 @@ class CleanupLog(LockDir):
         self.patch(hil_lock, 'clear_record', lambda fh: False)
         errors = hil_lock.end_failed(fhs, 'selftest run', detail='d', receipts=[object()])
         self.assertEqual(sorted(errors), boards)
+        for b in boards:       # not logged: the record is kept, never cleared
+            self.assertEqual([e.split(':')[0] for e in errors[b]], ['cleanup log not written'])
+            self.assertTrue(fhs[b].closed)
+        fhs = {b: hil_lock.take_board_lock(b, 'selftest run', protected=True, locks=boards) for b in boards}
+        self.assertEqual({b: fh.cleanup_failures[-1]['how'] for b, fh in fhs.items()}, dict.fromkeys(boards, 'found-left'))
+        errors = hil_lock.end_failed(fhs, 'selftest run', detail='d')
         for b in boards:
-            self.assertEqual([e.split(':')[0] for e in errors[b]], ['cleanup log not written', 'record not cleared'])
+            self.assertEqual(errors[b], ['record not cleared'])
             self.assertTrue(fhs[b].closed)
 
     def test_an_interrupt_anywhere_still_releases_every_board_then_propagates(self):
@@ -1920,8 +1929,11 @@ class CleanupLog(LockDir):
                 for b in boards:
                     self.assertTrue(fhs[b].closed, (where, b))
                     self.assertTrue(self.flock_is_free() if b == BOARD else True)
+                    unlogged = where == '_log_failure' and b == BOARD    # kept for the next take
                     if where != 'clear_record' or b != BOARD:
-                        self.assertEqual(hil_lock.record_state(b)[0], 'empty', (where, b))
+                        self.assertEqual(hil_lock.record_state(b)[0], 'record' if unlogged else 'empty', (where, b))
+                    if unlogged:
+                        os.unlink(hil_lock.lock_path(b))
 
     def test_a_signal_between_the_steps_still_logs_and_releases_every_board_then_propagates(self):
         boards = [BOARD, BOARD + '-2']
@@ -2334,9 +2346,9 @@ class BoardTasks(LockDir):
         real_clear = hil_lock.clear_record
         hil_lock.log_cleanup_failure(BOARD, 'earlier', detail='resolvable')
         cases = (('log write', {'_log_append': mock.Mock(side_effect=OSError(28, 'No space left on device'))},
-                  ('failed', {'detail': 'd'}), ['cleanup log not written: OSError'], 'empty'),
+                  ('failed', {'detail': 'd'}), ['cleanup log not written: OSError'], 'record'),
                  ('serialization', {}, ('failed', {'detail': 'd', 'receipts': [object()]}),
-                  ['cleanup log not written: TypeError'], 'empty'),
+                  ['cleanup log not written: TypeError'], 'record'),
                  ('restoration log', {}, ('restored', {'evidence': object()}), ['restoration: TypeError'], 'empty'),
                  ('close', {'clear_record': closes_then_fails}, ('clean', {}), ['close: OSError'], 'empty'),
                  ('record clear raising', {'clear_record': mock.Mock(side_effect=OSError(5, 'Input/output error'))},
@@ -2676,7 +2688,7 @@ class BoardTasks(LockDir):
                 raise boom
         self.assertIs(cm.exception, boom)
         self.assertEqual([e.split('(')[0] for e in task.errors], ['cleanup log not written: OSError'])
-        self.assert_released(task)
+        self.assert_released(task, record='record')
 
     def test_a_real_signal_at_exit_entry_and_between_clear_and_close(self):
         """A SIGINT before the finalization's hold is installed, then SIGINT and SIGTERM again after
@@ -3002,6 +3014,20 @@ class BoardTasks(LockDir):
         self.assertEqual(seen, [cm.exception])
         self.assert_released(task)
         self.assertTrue(task.ended_cleanly)
+
+    def test_a_failure_that_could_not_be_logged_keeps_its_record_for_the_next_take(self):
+        """agentrc#538: the record is the failure's only evidence once its event is not logged."""
+        task = self.task(runDir='/r')
+        with mock.patch.object(hil_lock, '_log_append', mock.Mock(side_effect=OSError(28, 'No space left'))):
+            with task:
+                task.failed(detail='restore failed', receipts=[{'token': 'r'}])
+        self.assertEqual((task.failure_logged, task.ended, task.ended_cleanly), (False, True, False))
+        self.assert_released(task, record='record')
+        with self.task() as nxt:
+            left = nxt.cleanup_failures[-1]
+            nxt.clean()
+        self.assertEqual((left['how'], left['task']['runDir']), ('found-left', '/r'))
+        self.assertEqual(hil_lock.open_cleanup_failures(BOARD)[-1]['how'], 'found-left')
 
     def test_report_is_a_snapshot_of_the_outcome(self):
         task = self.task()

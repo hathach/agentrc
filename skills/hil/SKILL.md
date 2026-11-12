@@ -86,9 +86,10 @@ nothing in it through a link.
   takes (default the board alone), on the board's first record. It ends with
   `release_board_lock` after a proven cleanup, otherwise with
   `end_failed(handles, reason, detail=..., receipts=..., retained=...)`, which
-  logs the failure on every board of the group, clears each record and drops
-  each flock whatever fails and returns the errors per board; an interrupt is
-  re-raised once every handle is released. A
+  logs the failure on every board of the group, clears each record whose
+  failure it logged (one it could not log keeps its record for the next take
+  to log found-left), drops each flock whatever fails and returns the errors
+  per board; an interrupt is re-raised once every handle is released. A
   session command run under a hold it did not take logs with
   `log_cleanup_failure`. Only a task that restored the board marks failures
   restored, through `resolve_restored`: each one whose receipts recheck ended

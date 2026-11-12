@@ -644,8 +644,11 @@ def _guarded(step, what, note, interrupted, default=None):
 def end_failed(handles, reason, *, detail, receipts=(), retained=(), **extra) -> dict:
     """End a task whose cleanup did not end proven: on every board of `handles` ({board: handle}),
     append a `failed` event (the holder record, `detail`, the run_tracked `receipts` and the
-    `retained` sessions not proven ended, `extra`), clear the record and drop the flock, going on
-    whatever fails. Returns {board: [error text]} for the boards where a step failed."""
+    `retained` sessions not proven ended, `extra`), clear the record once that event is logged
+    and drop the flock, going on whatever fails. A record whose event was not logged is kept, its
+    only evidence, for the next take to log found-left; if the log is still unwritable then, that
+    take reports it only in its cleanup_failures. Returns {board: [error text]} for the boards
+    where a step failed."""
     return _end_failed_each(handles, reason, detail, receipts, retained, extra, {})
 
 
@@ -679,10 +682,11 @@ def _end_failed_each(handles, reason, detail, receipts, retained, extra, ended) 
         ended[b] = {'logged': False, 'cleared': False, 'evidence': evidence}
         ended[b]['logged'] = guard([b], 'cleanup log not written', lambda: _log_ended(
             b, fh, reason, detail, receipts, retained, extra)) is not None
-        cleared = guard([b], 'record not cleared', lambda: clear_record(fh))
-        if cleared is False:
-            errors.setdefault(b, []).append('record not cleared')
-        ended[b]['cleared'] = cleared is True
+        if ended[b]['logged']:
+            cleared = guard([b], 'record not cleared', lambda: clear_record(fh))
+            if cleared is False:
+                errors.setdefault(b, []).append('record not cleared')
+            ended[b]['cleared'] = cleared is True
         guard([b], 'close', fh.close)
     if hold is not None:
         guard((), 'deferred interrupt', hold.release)
