@@ -1353,6 +1353,27 @@ class ProbeUsers(unittest.TestCase):
         self.assertEqual(self.users({'name': 'stlink', 'uid': 'ABC'}), [cli])
         self.assertEqual(self.users({'name': 'openocd', 'uid': 'ABC'}), [])
 
+    def test_an_stm32_programmer_on_another_stlink_is_no_user_even_holding_our_node(self):
+        """agentrc#541: its discovery opens every ST-LINK before its sn= filter; the exemption accepts it."""
+        stlink = {'name': 'stlink', 'uid': 'ABC'}
+        others = [self.entry(argv, fds=fds, readable=readable) for argv, fds, readable in (
+            (['STM32_Programmer_CLI', '--connect', 'port=swd', 'sn=OTHER', '--rst', '--go'], [self.node], True),
+            (['/opt/st/bin/STM32_Programmer_CLI', '-c', 'port=SWD', 'SN=OTHER', '-w', 'x.hex'], [], False),
+            (['STM32_Programmer_CLI', '-c', 'port=swd,sn=OTHER'], [self.node], True))]
+        self.assertEqual(self.users(stlink), [])
+        ours = [self.entry(argv, fds=fds) for argv, fds in (
+            (['STM32_Programmer_CLI', '--connect', 'port=swd', 'sn=abc', '--rst'], []),     # ours, case aside
+            (['STM32_Programmer_CLI', '-c', 'port=swd', 'sn=OTHER', 'sn=ABC'], []),           # mixed selectors
+            (['STM32_Programmer_CLI', '-c', 'port=swd', 'sn=OTHER', '-script', 'x.prg'], []),
+            (['STM32_Programmer_CLI', '-c', 'port=swd', 'sn=OTHER', '--script=x.prg'], []),
+            (['STM32_Programmer_CLI', '-c', 'port=swd', 'sn=OTHER', '-w', '/fw/ABC.hex'], []),  # names ours elsewhere
+            (['STM32_Programmer_CLI', '-c', 'port=swd', '-l'], []),                            # no sn= at all
+            (['STM32_Programmer_CLI', '-c', 'port=swd'], [self.node]))]
+        self.assertEqual(self.users(stlink), ours)
+        (self.proc / str(others[1]) / 'fd').chmod(0o755)
+        shutil.rmtree(self.proc / str(others[1]))       # unreadable: inconclusive for any other flasher
+        self.assertEqual(self.users({'name': 'openocd', 'uid': 'ABC'}), [others[0], others[2], *ours[:2], ours[-1]])
+
     def test_a_process_that_ends_during_the_walk_is_ignored(self):
         (self.proc / '7').mkdir()                                       # no cmdline: gone
         gone_fds = self.entry(['x'])

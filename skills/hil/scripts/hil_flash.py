@@ -612,8 +612,10 @@ def convoy_safe(flasher: dict) -> bool:
     * esptool -- delivery is `-p <ttyACM>`, a named port; it never enumerates usbfs.
     * stlink (STM32_Programmer_CLI v2.23) -- its libSTLinkUSBDriver.so lists devices through
       libusb's lock-free sysfs walk (descriptors, busnum, devnum, speed, uevent) and opens
-      only ST-Link (0483) nodes. strace on ci.lan 2026-10-07; with a testusb D-state on the
-      wedged DUT's node, `--rst --go` returned 0 in 1.7 s and the holder reaped.
+      only ST-Link (0483) nodes, every one of them before its `sn=` filter (probe_users
+      accepts those opens from a session selecting another ST-LINK). strace on ci.lan
+      2026-10-07; with a testusb D-state on the wedged DUT's node, `--rst --go` returned 0
+      in 1.7 s and the holder reaped.
     * openocd over interface/jlink.cfg -- libjaylink opens SEGGER devices only (below).
     * openocd over interface/stlink.cfg or interface/ti-icdi.cfg -- discovery is VID/PID
       filtered by the cfg's own `adapter usb vid_pid` (below).
@@ -1056,6 +1058,14 @@ def _fds(pid: int):
     return targets
 
 
+def _other_stlink_session(prog_argv: list, uid: str) -> bool:
+    """Whether an STM32_Programmer_CLI argv selects only ST-LINKs other than `uid`: an `sn=`
+    selector, no `-script` (whose file may name any probe) and no word containing `uid`."""
+    words, uid = [w.casefold() for w in prog_argv[1:]], uid.casefold()
+    return (bool(uid) and any('sn=' in w for w in words) and not any(w.lstrip('-').split('=', 1)[0] == 'script' for w in words)
+            and not any(uid in w for w in words))
+
+
 def _walk(flasher: dict, devices: set) -> list:
     uid, proc, stlink = _uid(flasher), usb_observe.PROC_ROOT, flasher.get('name') == 'stlink'
     exempt = _ancestors()
@@ -1077,6 +1087,8 @@ def _walk(flasher: dict, devices: set) -> list:
             argv.pop()
         prog_argv = _program(argv)
         program = prog_argv[0]
+        if stlink and program == 'STM32_Programmer_CLI' and _other_stlink_session(prog_argv, uid):
+            continue        # its discovery opens our probe too: accepted, fds included (agentrc#541)
         user = pid not in exempt and (any(_names_serial(uid, t) for t in _tokens(argv)) or
                                       stlink and program == 'STM32_Programmer_CLI')
         if not user:
@@ -1109,9 +1121,13 @@ def probe_users(flasher: dict) -> list:
     * its command line, of any uid, names the probe serial as a token (words split at whitespace,
       `=` and `,`, quotes and braces stripped; case aside, an all-digit serial as a number for
       J-Link's zero padding, also after a `scheme:` prefix), or, for an `stlink` flasher, it runs
-      STM32_Programmer_CLI at all (a `-script` names the probe in its file, and whether one runs
+      STM32_Programmer_CLI (a `-script` names the probe in its file, and whether one runs
       depends on the other tools on the host, not on the caller); our own process and its
-      ancestors are exempt from this match only;
+      ancestors are exempt from this match only. For an `stlink` flasher an STM32_Programmer_CLI
+      selecting only other ST-LINKs (an `sn=` selector, no `-script`, no word containing this
+      serial) is no user at all, its fds included: its discovery opens every ST-LINK before its
+      serial filter, vendor-filtered rather than serial-exclusive, and those opens of this probe
+      are accepted as OpenOCD's are below, so sibling ST-LINK boards flash concurrently;
     * its fds, where we may read them (our uid, or CAP_SYS_PTRACE), hold one of those devices;
       our process and ancestors included.
     A process whose fds we cannot read and whose effective program (argv[0]'s basename, or a
