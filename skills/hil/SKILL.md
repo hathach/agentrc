@@ -78,9 +78,18 @@ nothing in it through a link.
   `ended-failed` or `found-left`; the task's record, `detail`, the `receipts`
   of children not proven ended and the provider sessions it `retained`) and
   `restored`, naming the failure a later task restored the board after. A
-  failure stays open until a `restored` event names it, whatever failed after
-  it (`open_cleanup_failures`). `hil_lock.py status` shows the latest open one
-  and how many earlier ones are; a taker's handle carries them
+  failure stays open until a `restored` event names it, or an operator's
+  `acknowledged` one, whatever failed after it (`open_cleanup_failures`).
+  `hil_lock.py resolve <lock> <failure-id> --reason TEXT` logs that
+  acknowledgement, never evidence of a restoration, for a failure whose
+  evidence cannot be rechecked: it refuses while a receipt rechecks pending
+  (as the caller: run it as the user whose runs they are), a survivor it names
+  or a retained session still lives. `hil_lock.py compact <lock>...`, as the
+  log's owner or root, rewrites the log without its closed failures and the
+  events that closed them, every other line kept, and refuses a log with a
+  malformed line; nothing compacts it on its own. Helpers older than
+  `acknowledged` keep such a failure open. `hil_lock.py status` shows the
+  latest open one and how many earlier ones are; a taker's handle carries them
   (`cleanup_failures`) for its report before any hardware access, and its run
   reports them beside its result (`failure_report`, `failure_text`).
 - A taker that restores the board takes with `protected=True`, which marks its

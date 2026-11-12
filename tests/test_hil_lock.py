@@ -2122,6 +2122,210 @@ sys.stdin.read()
 '''
 
 
+class OperatorResolution(LockDir):
+    """`hil_lock.py resolve` and `compact` (agentrc#475): an operator's acknowledgement closes one named failure,
+    logged apart from a restoration and refused while its evidence is known live; compaction drops only closed
+    failures with what closed them, in a durable replace under the log's mutex."""
+
+    def setUp(self):
+        super().setUp()
+        self.log = Path(self.dir, BOARD + hil_lock.CLEANUP_LOG)
+        self.mutex = Path(self.dir, BOARD + hil_lock.CLEANUP_LOG + '.mutex')
+
+    def failure(self, **evidence):
+        return hil_lock.log_cleanup_failure(BOARD, 'selftest run', detail='restore failed', **evidence)['id']
+
+    def resolve(self, fid, reason='checked by hand: board flashed and tested'):
+        with quiet() as (out, err):
+            rc = hil_lock.cmd_resolve(BOARD, fid, reason)
+        return rc, out.getvalue() + err.getvalue()
+
+    def open_ids(self):
+        return [f['id'] for f in hil_lock.open_cleanup_failures(BOARD)]
+
+    def test_an_acknowledgement_closes_only_its_failure_and_is_no_restoration(self):
+        first = self.failure(receipts=[{'unrecheckable': ['JLinkExe']}])
+        second = self.failure(receipts=[{'unrecheckable': ['sudo', 'recover'], 'survivors': [999999999]}])
+        self.assertEqual(self.resolve(first), (0, f'{BOARD}: failure {first} acknowledged (closed by an operator, '
+                                                  f'not proven restored)\n'))
+        self.assertEqual(self.open_ids(), [second])
+        ack = hil_lock.cleanup_events(BOARD)[-1]
+        self.assertEqual((ack['event'], ack['failure'], ack['reason'], ack['uid']),
+                         ('acknowledged', first, 'checked by hand: board flashed and tested', os.geteuid()))
+        self.assertNotIn('restored', [e['event'] for e in hil_lock.cleanup_events(BOARD)])
+        self.assertEqual(self.resolve(second)[0], 0)
+        self.assertEqual(self.open_ids(), [])
+
+    def test_a_closed_unknown_or_unexplained_failure_is_refused(self):
+        restored, acked, fid = self.failure(), self.failure(), self.failure()
+        hil_lock.cleanup_restored(BOARD, restored)
+        self.assertEqual(self.resolve(acked)[0], 0)
+        before = self.log.read_bytes()
+        for target, reason, says in ((restored, 'x', 'already closed (restored'),
+                                     (acked, 'x', 'already closed (acknowledged'),
+                                     ('feedfacefeedface', 'x', 'no failure feedfacefeedface'),
+                                     (fid, '  ', 'a reason is required')):
+            with self.subTest(says=says):
+                rc, text = self.resolve(target, reason)
+                self.assertEqual(rc, 1)
+                self.assertIn(says, text)
+        self.assertEqual(self.log.read_bytes(), before)
+        self.assertEqual(self.open_ids(), [fid])
+
+    def test_known_live_evidence_refuses_and_unrecheckable_evidence_does_not(self):
+        me = {'pid': os.getpid(), 'start': hil_lock.proc_start(os.getpid())}
+        session = Path(self.dir, 'session.json')
+        session.write_text(json.dumps({'tool': 'hil_openocd_esp', 'pid': me['pid'], 'startTime': me['start'],
+                                       'closed': False}))
+        states = {'pending-op': 'pending'}
+        self.patch(hil_lock, '_process', lambda: types.SimpleNamespace(recheck=lambda r: states.get(r.get('token'),
+                                                                                                    'unknown')))
+        live = {'pending receipt': {'receipts': [{'token': 'pending-op'}]},
+                'live survivor': {'receipts': [{'unrecheckable': ['x'], 'survivors': [me]}]},
+                'live bare pid': {'receipts': [{'unrecheckable': ['x'], 'survivors': [me['pid']]}]},
+                'running session': {'retained': [str(session)]},
+                'journal receipt': {'task': {'role': hil_lock.CLEANUP_ROLE, 'reason': 'takeover'},
+                                    'journal': {'token': 't', 'prior': None, 'predecessor': json.dumps(
+                                        {'role': hil_lock.CLEANUP_ROLE, 'receipts': [{'token': 'pending-op'}]})}}}
+        fids = {}
+        for name, evidence in live.items():
+            with self.subTest(name=name):
+                fid = fids[name] = secrets.token_hex(8)
+                hil_lock._log_append(BOARD, {'event': 'failed', 'id': fid, **evidence})
+                rc, text = self.resolve(fid)
+                self.assertEqual(rc, 1)
+                self.assertIn('its evidence is still live', text)
+                self.assertIn(fid, self.open_ids())
+        # ended or never rechecked: the operator's to judge
+        states.clear()
+        session.write_text(json.dumps({'tool': 'hil_openocd_esp', 'pid': me['pid'], 'startTime': me['start'],
+                                       'closed': True}))
+        for evidence in ({'receipts': [{'unrecheckable': ['x'], 'survivors': [{**me, 'start': '1'}]}]},
+                         {'receipts': [{'token': 'gone'}, 'not a receipt']}, {'retained': ['/no/such.json']}):
+            fid = secrets.token_hex(8)
+            hil_lock._log_append(BOARD, {'event': 'failed', 'id': fid, **evidence})
+            self.assertEqual(self.resolve(fid)[0], 0, evidence)
+        still = [fids['live survivor'], fids['live bare pid']]     # this process, alive
+        for fid in self.open_ids():
+            self.assertEqual(self.resolve(fid)[0], 1 if fid in still else 0, fid)
+        self.assertEqual(self.open_ids(), still)
+
+    def test_a_helper_that_cannot_load_or_a_restoration_meanwhile_refuses(self):
+        fid = self.failure(receipts=[{'unrecheckable': ['x']}])
+        with mock.patch.object(hil_lock, '_process', side_effect=ImportError('no hil_process')):
+            rc, text = self.resolve(fid)
+        self.assertEqual((rc, self.open_ids()), (1, [fid]))
+        self.assertIn('its evidence cannot be rechecked', text)
+        self.assertIn('no hil_process', text)
+        real = hil_lock._live_evidence
+
+        def restored_meanwhile(*a):
+            hil_lock.cleanup_restored(BOARD, fid)
+            return real(*a)
+        self.patch(hil_lock, '_live_evidence', restored_meanwhile)
+        rc, text = self.resolve(fid)
+        self.assertEqual(rc, 1)
+        self.assertIn('already closed (restored', text)
+        self.assertEqual([e['event'] for e in hil_lock.cleanup_events(BOARD)], ['failed', 'restored'])
+
+    def lines(self):
+        return [json.loads(ln) for ln in self.log.read_text().splitlines()]
+
+    def test_compaction_drops_only_closed_failures_and_what_closed_them(self):
+        old = os.umask(0o077)
+        self.addCleanup(os.umask, old)
+        restored, acked, kept = self.failure(), self.failure(), self.failure()
+        hil_lock.cleanup_restored(BOARD, restored)
+        hil_lock.cleanup_restored(BOARD, restored)          # a duplicate restoration goes with its failure
+        self.assertEqual(self.resolve(acked)[0], 0)
+        hil_lock.cleanup_restored(BOARD, 'not-in-this-log')
+        hil_lock._log_append(BOARD, {'event': 'probe'})
+        hil_lock._log_append(BOARD, {'event': 'failed', 'id': ['odd'], 'detail': 'never closable'})
+        hil_lock._log_append(BOARD, {'event': 'restored', 'failure': ['odd']})
+        mutex = os.stat(self.mutex).st_ino
+        with quiet() as (out, _):
+            self.assertEqual(hil_lock.cmd_compact([BOARD, BOARD]), 0)
+        self.assertEqual(out.getvalue(), f'{BOARD}: 5 events of closed failures dropped, 5 kept\n')
+        self.assertEqual([(e['event'], e.get('id', e.get('failure'))) for e in self.lines()],
+                         [('failed', kept), ('restored', 'not-in-this-log'), ('probe', None), ('failed', ['odd']),
+                          ('restored', ['odd'])])
+        self.assertEqual(self.open_ids(), [kept, ['odd']])
+        self.assertEqual((os.stat(self.mutex).st_ino, stat.S_IMODE(os.stat(self.log).st_mode)), (mutex, 0o666))
+        self.assertEqual(os.stat(self.log).st_uid, os.geteuid())
+        self.assertEqual(sorted(os.listdir(self.dir)), sorted([self.log.name, self.mutex.name]))
+        ino = os.stat(self.log).st_ino
+        self.assertEqual(hil_lock.compact_cleanup_log(BOARD), {'dropped': 0, 'kept': 5})
+        self.assertEqual(os.stat(self.log).st_ino, ino, 'nothing closed: nothing rewritten')
+        self.assertEqual(hil_lock.compact_cleanup_log(BOARD + '-none'), {'dropped': 0, 'kept': 0})
+
+    def test_a_malformed_whole_line_refuses_and_a_torn_tail_goes(self):
+        fid = self.failure()
+        hil_lock.cleanup_restored(BOARD, fid)
+        kept = self.failure()
+        with open(self.log, 'ab') as f:
+            f.write(b'{"event": "failed", "id": "torn')
+        self.assertEqual(hil_lock.compact_cleanup_log(BOARD), {'dropped': 2, 'kept': 1})
+        self.assertEqual([e['id'] for e in self.lines()], [kept])
+        for bad in (b'not json\n', b'[1]\n', b'\xff\n'):
+            with self.subTest(bad=bad):
+                hil_lock.cleanup_restored(BOARD, kept)
+                with open(self.log, 'ab') as f:
+                    f.write(bad)
+                before = self.log.read_bytes()
+                with quiet() as (_, err):
+                    self.assertEqual(hil_lock.cmd_compact([BOARD]), 1)
+                self.assertIn('is not a JSON object, not compacted', err.getvalue())
+                self.assertEqual(self.log.read_bytes(), before)
+                self.log.write_bytes(before[:-len(bad)])        # as the operator would repair it
+
+    def test_an_append_during_compaction_waits_and_lands_in_the_new_log(self):
+        fid = self.failure()
+        hil_lock.cleanup_restored(BOARD, fid)
+        real, appended = os.rename, []
+
+        def rename(*a, **k):
+            t = threading.Thread(target=lambda: appended.append(self.failure()))
+            t.start()
+            t.join(0.3)
+            self.assertTrue(t.is_alive(), 'the append did not wait for the mutex')
+            real(*a, **k)
+            self.addCleanup(t.join)
+        with mock.patch.object(hil_lock.os, 'rename', rename):
+            self.assertEqual(hil_lock.compact_cleanup_log(BOARD), {'dropped': 2, 'kept': 0})
+        deadline = time.monotonic() + 10
+        while not appended and time.monotonic() < deadline:
+            _sleep(0.02)
+        self.assertEqual([e['id'] for e in self.lines()], appended)
+
+    def test_a_failed_replace_or_another_owner_leaves_the_log_as_it_was(self):
+        fid = self.failure()
+        hil_lock.cleanup_restored(BOARD, fid)
+        before, ino = self.log.read_bytes(), os.stat(self.log).st_ino
+        os.chmod(self.dir, stat.S_IMODE(os.stat(self.dir).st_mode) | stat.S_ISVTX)    # a shared dir, as the host step
+        for name, patch, error in (
+                ('rename', mock.patch.object(hil_lock.os, 'rename', side_effect=OSError(errno.EIO, 'rename failed')),
+                 OSError),
+                ('fsync', mock.patch.object(hil_lock.os, 'fsync', side_effect=OSError(errno.EIO, 'fsync failed')),
+                 OSError),
+                ('owner', mock.patch.object(hil_lock.os, 'geteuid', return_value=os.geteuid() + 1),
+                 hil_lock.LogRefused)):
+            with self.subTest(name=name):
+                with patch, self.assertRaises(error):
+                    hil_lock.compact_cleanup_log(BOARD)
+                self.assertEqual((self.log.read_bytes(), os.stat(self.log).st_ino), (before, ino))
+                self.assertEqual(sorted(os.listdir(self.dir)), sorted([self.log.name, self.mutex.name]))
+
+    def test_the_cli_takes_resolve_and_compact(self):
+        fid = self.failure()
+        for argv, rc in ((['resolve', BOARD, fid, '--reason', 'checked'], 0), (['compact', BOARD], 0),
+                         (['resolve', BOARD, fid], 2), (['compact'], 2)):
+            with self.subTest(argv=argv), mock.patch.object(sys, 'argv', ['hil_lock.py', *argv]), quiet(), \
+                    self.assertRaises(SystemExit) as done:
+                hil_lock.main()
+            self.assertEqual(done.exception.code, rc)
+        self.assertEqual(self.log.read_bytes(), b'')
+
+
 class BoardTasks(LockDir):
     """board_task: a protected take, the busy check under it before the body, and an end on the
     body's verdict that releases the board whatever fails or interrupts it."""
