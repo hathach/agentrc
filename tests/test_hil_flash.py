@@ -1371,11 +1371,14 @@ class ProbeUsers(unittest.TestCase):
             (['STM32_Programmer_CLI', '-c', 'port=swd', 'sn='], [self.node]),                  # an empty selector
             (['STM32_Programmer_CLI', '-c', 'port=swd,sn='], [self.node]),
             (['STM32_Programmer_CLI', '-c', 'port=swd', '-w', '/tmp/sn=backup.hex'], [self.node]),   # no selector
+            (['STM32_Programmer_CLI', '--connect', 'port=swd', '--write', 'sn=backup.hex'], [self.node]),
             (['STM32_Programmer_CLI', '-c', 'port=swd'], [self.node]))]
         self.assertEqual(self.users(stlink), ours)
         (self.proc / str(others[1]) / 'fd').chmod(0o755)
         shutil.rmtree(self.proc / str(others[1]))       # unreadable: inconclusive for any other flasher
         self.assertEqual(self.users({'name': 'openocd', 'uid': 'ABC'}), [others[0], others[2], *ours[:2], *ours[6:]])
+        self.assertEqual(hf._other_stlink_session(['STM32_Programmer_CLI', '--connect', 'port=swd', 'sn=OTHER',
+                                                   '--write', 'sn=x.hex'], 'ABC'), True)
 
     def test_a_process_that_ends_during_the_walk_is_ignored(self):
         (self.proc / '7').mkdir()                                       # no cmdline: gone

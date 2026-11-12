@@ -1061,10 +1061,15 @@ def _fds(pid: int):
 
 def _other_stlink_session(prog_argv: list, uid: str) -> bool:
     """Whether an STM32_Programmer_CLI argv selects only ST-LINKs other than `uid`: a nonempty
-    `sn=` field of a word (fields split at `,`, as in `port=swd,sn=X`), no `-script` (whose file
-    may name any probe) and no word containing `uid`."""
+    `sn=` among a `-c`/`--connect` option's parameters (the words up to the next option, each
+    split at `,`), no `-script` (whose file may name any probe) and no word containing `uid`."""
     words, uid = [w.casefold() for w in prog_argv[1:]], uid.casefold()
-    selected = any(f.startswith('sn=') and len(f) > 3 for w in words for f in w.split(','))
+    selected, connect = False, False
+    for w in words:
+        if w.startswith('-'):
+            connect = w in ('-c', '--connect')
+        elif connect:
+            selected = selected or any(f.startswith('sn=') and len(f) > 3 for f in w.split(','))
     return (bool(uid) and selected and not any(w.lstrip('-').split('=', 1)[0] == 'script' for w in words)
             and not any(uid in w for w in words))
 
