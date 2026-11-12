@@ -858,6 +858,8 @@ def battery(task, name, board, tests, record_path, roster_path, run_dir, manifes
             row['cleanup']['receipts'] = list(tracker.receipts)
             if tracker.pending:   # unrecheckable ones included: the board's cleanup log keeps them
                 row['cleanup']['pending'] = list(tracker.pending)
+                if row['cleanup']['pass']:   # an interrupt landed before the body's handler could fail it
+                    row['cleanup'].update({'pass': False, 'state': 'pending', 'evidence': tracker.unclean})
             give_verdict(task, name, row, tracker)
             given = True
         finally:

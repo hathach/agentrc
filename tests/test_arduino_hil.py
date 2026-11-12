@@ -2255,24 +2255,35 @@ class BoardTaskOnTheRealLock(Base):
         return fired
 
     def test_a_signal_anywhere_from_the_batterys_end_to_its_verdict_still_logs_the_pending_child(self):
-        def step(*a):
+        """From each handler's first line on, its own lines before it fails the cleanup included."""
+        def unclean(*a):
             a[-1]._note('unknown', None, ['JLinkExe'])
             a[-1].check()
-        for k in range(100):
-            with self.subTest(k=k):
-                fired = self.signal_past(H.battery, "row['detail'] = f'a child outlived its operation: {e}'", k)
-                row = self.run_board(step=step)
-                sys.settrace(None)
-                if not fired:
-                    break
-                self.assertEqual((row['interrupted'], H.verdict(row), row['cleanup']['released']),
-                                 (True, 'blocker', True))
-                failure = REAL.lock.open_cleanup_failures('rig_jlink')[-1]
-                self.assertEqual([r['unrecheckable'] for r in failure['receipts']], [['JLinkExe']])
-                self.assertRegex(REAL.lock.resolve_restored('rig_jlink', [failure], evidence='restored')[0],
-                                 'stays open')
-                self.assert_released()
-        self.assertGreater(k, 3, 'the sweep reached past the verdict')
+
+        def crash(*a):   # a child not proven ended, then a harness bug
+            a[-1]._note('unknown', None, ['JLinkExe'])
+            raise RuntimeError('harness bug')
+        for handler, step in (('except Unclean as e:', unclean),
+                              ("except BaseException as e:   # interrupted or a harness bug: the board's state is "
+                               "unknown", crash)):
+            for k in range(100):
+                with self.subTest(handler=handler, k=k):
+                    fired = self.signal_past(H.battery, handler, k)
+                    before = len(REAL.lock.open_cleanup_failures('rig_jlink'))
+                    row = self.run_board(step=step)
+                    sys.settrace(None)
+                    if not fired:
+                        break
+                    self.assertEqual((row['interrupted'], H.verdict(row), row['cleanup']['released']),
+                                     (True, 'blocker', True))
+                    logged = REAL.lock.open_cleanup_failures('rig_jlink')[before:]
+                    self.assertEqual(len(logged), 1, 'this run logged its own failure')
+                    failure = logged[0]
+                    self.assertEqual([r['unrecheckable'] for r in failure['receipts']], [['JLinkExe']])
+                    self.assertRegex(REAL.lock.resolve_restored('rig_jlink', [failure], evidence='restored')[0],
+                                     'stays open')
+                    self.assert_released()
+            self.assertGreater(k, 3, 'the sweep reached past the verdict')
 
     def test_a_signal_anywhere_from_a_commissions_end_to_its_verdict_still_logs_its_pending_child(self):
         def detach(*a):
