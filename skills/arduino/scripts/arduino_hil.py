@@ -819,7 +819,7 @@ def run_board(name, board, tests, record_path, roster_path, run_root, manifest):
     try:
         with task:
             entered = True
-            battery(task, name, board, tests, record_path, roster_path, run_dir, manifest, tracker, row)
+            battery(name, board, tests, record_path, roster_path, run_dir, manifest, tracker, row)
     except A.lock.BoardBusy as e:
         row.update(locked=True, detail=str(e), probeUsers=e.users)
     except A.lock.RecoveryBlocked as e:
@@ -840,7 +840,7 @@ def run_board(name, board, tests, record_path, roster_path, run_root, manifest):
     return row
 
 
-def battery(task, name, board, tests, record_path, roster_path, run_dir, manifest, tracker, row):
+def battery(name, board, tests, record_path, roster_path, run_dir, manifest, tracker, row):
     """The body of a run's board task: the tests, then the restore, its row the ledger give_verdict reads."""
     started = time.monotonic()
     try:
