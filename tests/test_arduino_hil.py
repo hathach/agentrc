@@ -1372,6 +1372,17 @@ class Battery(Base):
         self.assertTrue(row['interrupted'])
         self.assertEqual((row['cleanup']['released'], len(self.lock.ended)), (True, 1))
 
+    def test_an_interrupt_in_the_bodys_handler_before_it_fails_the_cleanup_is_no_restoration(self):
+        class Bug(RuntimeError):
+            def __str__(self):   # the handler formats it first: the interrupt lands before it fails the cleanup
+                raise KeyboardInterrupt
+
+        def step(*a):
+            raise Bug
+        row = self.run_board(step=step)
+        self.assertEqual((self.lock.verdicts, row['cleanup']['pass'], row['interrupted']), (['failed'], False, True))
+        self.assertEqual(len(self.lock.ended), 1)
+
     def test_absent_probe_is_not_run_before_the_lock(self):
         row = self.run_board(probe='probe 1 is not on this host\'s bus')
         self.assertEqual((H.verdict(row), self.lock.taken), ('not-run', []))
@@ -1488,6 +1499,20 @@ class Manual(Base):
         with contextlib.redirect_stdout(io.StringIO()) as out:
             self.assertEqual(H.manual(args), 4)
         self.assertEqual(json.loads(out.getvalue())['survivors'], [{'receipt': {'pid': 5}}])
+        self.assertEqual([r for _, _, r in self.lock.logged], [[{'pid': 5}]])
+
+    def test_a_console_reset_raising_past_an_unproven_child_is_unclean(self):
+        args = self.held(cmd='console', reset=True, baud=115200, seconds=1)
+        lost = OSError(5, 'supervisor lost')
+        lost.cleanup, lost.receipt = 'unknown', {'pid': 5}
+        self.A.process.run_tracked.side_effect = lost
+        self.A.flash.reset_jlink.side_effect = lambda flasher, timeout, run: run(['JLinkExe'], timeout)
+        self.serial.Serial = mock.MagicMock()
+        with mock.patch.object(H, 'console_tty', return_value='/dev/ttyX'), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(H.manual(args), 4)
+        result = json.loads(next((self.root / 'build/hil-manual').glob('rig_jlink-console-*/result.json')).read_text())
+        self.assertEqual(result['survivors'], [{'receipt': {'pid': 5}}])
         self.assertEqual([r for _, _, r in self.lock.logged], [[{'pid': 5}]])
 
     def test_a_busy_probe_refuses_a_session_command_before_its_tool(self):

@@ -860,6 +860,9 @@ def battery(task, name, board, tests, record_path, roster_path, run_dir, manifes
                 row['cleanup']['pending'] = list(tracker.pending)
                 if row['cleanup']['pass']:   # an interrupt landed before the body's handler could fail it
                     row['cleanup'].update({'pass': False, 'state': 'pending', 'evidence': tracker.unclean})
+            if row['cleanup']['pass'] and row['cleanup']['state'] == 'unknown':   # the body ended inside its handler
+                row['cleanup'].update({'pass': False, 'evidence': 'cleanup state unknown: the body ended before its '
+                                                                  'handler failed the cleanup'})
             give_verdict(task, name, row, tracker)
             given = True
         finally:
@@ -1417,6 +1420,8 @@ def op_console(args, board, run_dir, tracker, manifest):
             if not why:
                 read_console(port, time.monotonic() + args.seconds, buf, times, t0)
     except (serial.SerialException, OSError) as e:   # pyserial's line setters raise a bare OSError
+        if tracker.pending:
+            raise   # a tracked detach's or reset's own error: _session_op records its unproven child
         why = f'{tty}: {e}'   # the capture so far is kept; the hold stays with the caller
     except KeyboardInterrupt:   # SIGTERM too (main): stopping a capture keeps it
         if tracker.pending:
