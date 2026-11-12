@@ -128,48 +128,6 @@ nothing in it through a link.
   devices. CI's job-end cleanup is best effort, never proof that such a child
   ended; an earlier `.started` without a matching `.done` in a CI state dir
   can refuse a rerun, but only on paths consulting that same dir.
-- Write-ahead claims are deprecated, never a prerequisite for taking or
-  using a board: every consumer moves to `board_task`, and the claim
-  primitives go once none uses them. Until it adopts `board_task`, agentrc's
-  Arduino engine still claims as follows. An invocation that claims records the board write-ahead in its
-  consumer's record, so one killed at any point is still named. Under the
-  flock it took, or under the caller's hold:
-  1. `claim(claim_entry(<ops dir>, <cmd>))` before its first tool lists
-     `{ops, pid, start}`, its run_tracked state dir resolved, and returns the
-     others; of two racing claims the later lists the earlier. Each claim is
-     a file its claimant owns, so on a dir shared by OS users every user
-     claims; `remove` of another user's claim there, which the sticky bit
-     keeps from being unlinked, retires it with a mark file the remover owns.
-  2. Any other `claim_alive` (its pid runs with its start and a thread
-     that has not exited, or runs with its start unreadable) refuses this
-     attempt before anything is judged: two commands under one hold. Only
-     then, `invocation_state(<other>, keep=logged_tokens(<open failures read
-     now>))` judges each, tidying what it proves done: a live claimant may
-     have logged a receipt since the take. An `ended` one (gone, its ops dir
-     `recheck_dir` done) is removed. An `unresolved` one (gone, an operation
-     not proven ended) has its receipts not yet logged appended with
-     `log_cleanup_failure(..., task=<its claim>, receipts=...)`, never
-     `end_failed` on a hold it does not own; the open failures are read once
-     more and reported (`failure_report`). An ops dir of another OS user is
-     not this uid's to trust: its one entry is `pending` while `/proc` shows a
-     supervisor of an operation there or may hide one (hidepid, an unreadable
-     command line), else `unknown`; a refusal on it names who can clear it
-     (that uid or root rerunning, or removing the claim once none runs). That
-     uid rechecks such an entry, a logged one in `resolve_restored` included,
-     as `recheck_dir` of its own dir, tidying nothing: `done` once every
-     operation there is.
-  3. `settle(<unresolved receipts>, <wait>, busy=<its own probe-use check>)`
-     rechecks until none is `pending`; only a `pending` receipt, a child
-     proven still running, or what `busy` names holds the board. An
-     unresolved claim with a receipt still pending stays, so the next attempt
-     judges it again without logging it again, and this attempt removes its
-     own claim, ends and releases a lock it took. One with none pending
-     (done or `unknown`, which is logged and never waited on) is removed,
-     unless its log append failed: then it stays for the next attempt to log.
-  4. At its end, once `recheck_dir` of its ops dir answers `done` (keeping
-     the files of receipts it logged, which `resolve_restored` rechecks), it
-     `remove`s exactly its own claim before its lock goes; an unclean end
-     keeps it, for the next attempt to judge.
 - A rig-wide operation, one that can reset or renumber a board you do not
   hold (a hub's power, a root-port cycle, a controller rebind), holds every
   board on the host first, across every project's roster there; a contract's
@@ -225,16 +183,19 @@ engine (`scripts/hil_farm_check.py`) from the agentrc the project pins, with the
 project's profile. Never run an installed engine against a project whose pin is
 older, or the reverse.
 
-The check takes each free board's lock itself (`farm_check`, protected). A held
-board is reported `locked`, its probe still shown, and skipped: never waited on,
-released or bypassed. An older helper's cleanup holder is reported `blocked`
-and left to the contract's Recovery. Never kill a running check: one killed
-outright leaves its board's cleanup unproven, which the next task on it logs as
-a failed cleanup. An interrupt (SIGINT) ends it after the current board's
-cleanup. A row notes an earlier task's open failed cleanup on its board.
+The check takes each free board as a `board_task` (`farm_check`) whose busy
+check is the profile's required `busy(board)` hook; a profile without it is
+refused. A held board, or one whose check names users of its probe, is reported
+`locked`, its probe still shown, and skipped: never waited on, released or
+bypassed. A check that cannot tell is a `failed` row, the board untouched. An
+older helper's cleanup holder is reported `blocked` and left to the contract's
+Recovery. Never kill a running check: one killed outright leaves its board's
+cleanup unproven, which the next task on it logs as a failed cleanup. An
+interrupt (SIGINT) ends it after the current board's cleanup. A row notes an
+earlier task's open failed cleanup on its board.
 
 - Statuses: `ok` (the probe reset the board), `failed` (no probe, an ambiguous
-  one, or a failed reset), `unsupported` (the probe has no reset-only mode),
+  one, an inconclusive busy check or a failed reset), `unsupported` (the probe has no reset-only mode),
   `locked`, `blocked`. `ok` says the probe reached and reset the board now, not
   that its firmware, USB or anything else works.
 - A `blocked` row is a cleanup the check could not prove, a process it ran
@@ -460,12 +421,12 @@ recovery stay the contract's.
   identity `frozen()` takes once per process. Records bind `portable()`,
   the commit and closure digests, and admission refuses a record that binds
   none or another (`mismatch`); a stage copies the closure with `stage()`.
-- The farm check engine releases a board it reserved (`protected=True`)
-  either way: cleanly once every process it started there is proven ended
-  (`run_tracked`'s `done`, or a `recheck` of its receipt that answers
-  `done`), otherwise through `end_failed`, the open receipts logged in its
-  cleanup log; a run that left no receipt is logged as an `unrecheckable`
-  one, which keeps its failure open. `run_tracked` only supplies the
+- The farm check engine ends a board's `board_task` either way: `clean()` once
+  every process it started there is proven ended (`run_tracked`'s `done`, or
+  a `recheck` of its receipt that answers `done`), whatever the reset did,
+  since a reset restores nothing; otherwise `failed()`, the open receipts
+  logged in its cleanup log; a run that left no receipt is logged as an
+  `unrecheckable` one, which keeps its failure open. `run_tracked` only supplies the
   evidence; any other caller enforces its own reservation policy.
 - `run_tracked`'s `state_dir` is the caller's: a directory of its uid that no
   other user can write, in a parent of its uid or root's that no other user

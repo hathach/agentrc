@@ -5,7 +5,6 @@ import contextlib
 import ctypes
 import functools
 import io
-import json
 import os
 import select
 import signal
@@ -369,46 +368,25 @@ def taken_failure(fh):
     return fh.cleanup_failures[-1] if fh.cleanup_failures else None
 
 
-# An invocation that claims `board` in hil_lock's PendingSessions record of `kind` and starts one run_tracked `cmd` in
-# its ops dir, prints {entry, stdout} and waits on stdin; argv: hil_lock.py, lock dir, board, kind, run dir, cmd.
-CLAIMANT = r'''
-import importlib.util, json, sys
-spec = importlib.util.spec_from_file_location('agentrc_hil_lock', sys.argv[1])
-m = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(m)
-m.BOARD_LOCK_DIR, board, kind, run_dir, cmd = sys.argv[2:7]
-ops = m._process().state_dir(run_dir, 'ops')
-entry = m.claim_entry(ops, 'claimant')
-m.PendingSessions(board, kind).claim(entry)
-r = m._process().run_tracked(cmd, timeout=20, settle=0.3, state_dir=ops) if cmd else None
-print(json.dumps({'entry': entry, 'stdout': r.stdout if r else ''}), flush=True)
-sys.stdin.read()
-'''
-LOCK_SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'hil' / 'scripts' / 'hil_lock.py'
+def interrupt_first_exit(case, task_class):
+    """task_class.__exit__ patched for the test so that its first call raises KeyboardInterrupt before it runs, as a
+    signal landing as it is entered does (hil_lock.BoardTask's limit); returns the `ended` each call found."""
+    real, calls = task_class.__exit__, []
 
-
-def claimant(case, lock_dir, board, kind, run_dir, cmd=''):
-    """A live CLAIMANT process and what it printed; it exits once its stdin closes (a cleanup does)."""
-    p = subprocess.Popen([sys.executable, '-I', '-c', CLAIMANT, str(LOCK_SCRIPT), str(lock_dir), board, kind,
-                          str(run_dir), cmd], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
-    case.addCleanup(p.wait)
-    case.addCleanup(p.stdin.close)
-    case.addCleanup(p.stdout.close)
-    return p, json.loads(p.stdout.readline())
+    def exit_(task, *exc):
+        calls.append(task.ended)
+        if len(calls) == 1:
+            raise KeyboardInterrupt
+        return real(task, *exc)
+    p = mock.patch.object(task_class, '__exit__', exit_)
+    p.start()
+    case.addCleanup(p.stop)
+    return calls
 
 
 def kill_quietly(pid, sig=signal.SIGTERM):
     with contextlib.suppress(ProcessLookupError):
         os.kill(pid, sig)
-
-
-def wait_done(recheck, receipt, wait=10):
-    """Until `recheck` (hil_process's) answers done for `receipt`; AssertionError past `wait` s."""
-    deadline = time.monotonic() + wait
-    while recheck(receipt) != 'done':
-        if time.monotonic() > deadline:
-            raise AssertionError(f'{receipt.get("token")} never rechecked done')
-        time.sleep(0.1)
 
 
 @contextlib.contextmanager
@@ -418,18 +396,3 @@ def umask(mask):
         yield
     finally:
         os.umask(old)
-
-
-# a child that outlives its command: its run_tracked supervisor stays, holding its lock (`pending`); prints its pid
-LEFT_CHILD = 'sleep 30 </dev/null >/dev/null 2>&1 & echo $!'
-
-
-def killed_claimant(case, lock_dir, board, kind, run_dir, cmd=LEFT_CHILD):
-    """A CLAIMANT SIGKILLed once its `cmd` ran, so its claim names a dead invocation while the child LEFT_CHILD left
-    still runs under its supervisor: (its claim entry, the child's pid, killed by a cleanup)."""
-    p, out = claimant(case, lock_dir, board, kind, run_dir, cmd)
-    child = int(out['stdout'])
-    case.addCleanup(kill_quietly, child, signal.SIGKILL)
-    p.kill()
-    p.wait()
-    return out['entry'], child

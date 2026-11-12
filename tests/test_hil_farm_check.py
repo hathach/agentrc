@@ -13,6 +13,7 @@ import contextlib
 import fcntl
 import hashlib
 import importlib.util
+import inspect
 import json
 import shlex
 import shutil
@@ -25,7 +26,7 @@ import types
 from pathlib import Path
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import guard_survivors, latest_failure, tmpdir, umask  # noqa: E402
+from helpers import guard_survivors, interrupt_first_exit, latest_failure, tmpdir, umask  # noqa: E402
 
 SCRIPTS = Path(__file__).resolve().parents[1] / 'skills' / 'hil' / 'scripts'
 
@@ -67,6 +68,7 @@ class StubProfile:
         Path(self.__file__).write_text('# stub profile\n')
         self.boards = [dict(BOARD)]
         self.candidates = ['1-1']
+        self.users = []             # what busy() names, or an exception it raises
         self.records = []           # the board's lock record as each reset saw it
 
     def roster(self, host, config, args):
@@ -84,6 +86,12 @@ class StubProfile:
 
     def probe_candidates(self, board):
         return list(self.candidates)
+
+    def busy(self, board):
+        self.records.append(('busy', (lk.read_record(board['name']) or {}).get('reason')))
+        if isinstance(self.users, BaseException):
+            raise self.users
+        return self.users
 
     def reset(self, ctx, board):
         self.records.append(lk.read_record(board['name']))
@@ -148,7 +156,8 @@ class Engine(unittest.TestCase):
     # --- the reset ------------------------------------------------------------------------------
     def test_a_free_board_is_reset_under_the_protected_reason_and_released(self):
         row = self.check()
-        rec = self.p.records[0]
+        busy, rec = self.p.records
+        self.assertEqual(busy, ('busy', 'farm_check'), 'the busy check runs under the lock, before the reset')
         self.assertEqual((rec['reason'], rec['cleanupOwed']), ('farm_check', True))
         self.assertIn('farm_check', lk.PROTECTED_REASONS)
         self.assertEqual((row['status'], row['probe'], row['location'], self.ran), ('ok', '✅ stlink', '1-1', [RESET]))
@@ -339,6 +348,45 @@ class Engine(unittest.TestCase):
         self.assertEqual((row['status'], self.ran), ('failed', []))
         self.assertIn('unavailable', row['note'][-1])
 
+    # --- the busy check ---------------------------------------------------------------------------
+    def test_a_busy_board_is_locked_untouched_and_nothing_logged(self):
+        self.p.users = [{'pid': 42, 'cmd': 'openocd -c adapter serial P'}]
+        self.stale(detail='restore failed', protected=True)
+        row = self.check()
+        doc = self.doc(row)
+        self.assertEqual((row['status'], self.ran, row['cleanup'], doc['rows'][0]['coverage'], eng.exit_status(doc)),
+                         ('locked', [], None, 'skipped-locked', 0))
+        self.assertEqual(row['note'][-1], 'board busy: b in use by pid 42 (openocd -c adapter serial P)')
+        self.assertEqual(row['previousCleanupFailure']['how'], 'found-left', 'its take found it: still reported')
+        self.assertEqual([e['how'] for e in lk.cleanup_events('b')], ['found-left'], 'the refusal logged nothing')
+        self.take()
+
+    def test_an_inconclusive_busy_check_fails_the_row_untouched(self):
+        for users in (RuntimeError('cannot read /proc/7/fd'), 'idle'):
+            with self.subTest(users=users):
+                self.p.users = users
+                row = self.check()
+                self.assertEqual((row['status'], self.ran, row['cleanup']), ('failed', [], None))
+                self.assertIn('busy check inconclusive', row['note'][-1])
+                self.assertEqual(self.doc(row)['rows'][0]['coverage'], 'reset-not-attempted')
+        self.assertEqual(lk.cleanup_events('b'), [])
+        self.take()
+
+    def test_a_failed_reset_proven_ended_is_a_clean_verdict(self):
+        self.outcomes[RESET] = (1, 'done', 'Error: no target')
+        row = self.check()
+        self.assertEqual((row['status'], row['cleanup']['result']), ('failed', 'released'))
+        self.assertEqual(lk.cleanup_events('b'), [], 'a reset restores nothing, and nothing was left open')
+
+    def test_an_interrupted_busy_check_is_a_refusal_and_stops_the_farm(self):
+        self.p.users = KeyboardInterrupt()
+        self.p.boards = [dict(BOARD), dict(BOARD, name='c')]
+        rows, aborted = eng.check_farm(self.p, self.p.boards, self.args, state_dir=str(self.state))
+        self.assertEqual((aborted, [r['name'] for r in rows], rows[0]['status'], rows[0]['cleanup']),
+                         (True, ['b'], 'failed', None))
+        self.assertEqual((self.ran, lk.cleanup_events('b')), ([], []))
+        self.take()
+
     # --- the profile's seams on ctx -------------------------------------------------------------
     def test_a_run_is_labelled_whatever_its_argv_holds(self):
         def tracked(cmd, cwd=None, **kw):
@@ -436,16 +484,24 @@ class Engine(unittest.TestCase):
         self.assertEqual(latest_failure(lk, 'b')['detail'][:30], 'farm check cleanup unresolved:')
         self.take()
 
-    def interrupt_before_finalization(self):
-        real, calls = eng._end_reservation, []
+    def pending_reset(self, retained=None):
+        """A reset whose run stays pending, and a session its provider retained when `retained` names one."""
+        self.outcomes[RESET] = (0, 'pending', '')
+        self.rechecks[RESET] = 'pending'
+        self.p.reset = StubProfile.reset.__get__(self.p)
+        if retained:
+            self.retain_after_reset(retained)
 
-        def end(*a):
-            calls.append(1)
-            if len(calls) == 1:
-                raise KeyboardInterrupt     # before its own interrupt hold is in place
-            return real(*a)
-        patch(self, eng, '_end_reservation', end)
-        return calls
+    def assert_pending_logged(self, row, retained=None):
+        """The interrupted row is blocked and released, and its logged failure keeps the pending reset's receipt and
+        any retained session open."""
+        receipt = {'token': RESET, 'lock': '/nonexistent'}
+        self.assertEqual((row['status'], row['interrupted'], row['cleanup']['receipts'], row['cleanup']['released']),
+                         ('blocked', True, [receipt], True))
+        f = latest_failure(lk, 'b')
+        self.assertEqual((f['receipts'], f.get('retained')), ([receipt], retained or []))
+        self.assertRegex(lk.resolve_restored('b', [f], evidence='a later restore')[0], f'{f["id"]} stays open')
+        self.take()
 
     def test_a_reset_that_exits_the_process_still_finalizes(self):
         def reset(ctx, board):
@@ -456,12 +512,113 @@ class Engine(unittest.TestCase):
             self.check()
         self.take()
 
-    def test_an_interrupt_before_finalization_finalizes_from_the_same_ledger(self):
-        calls = self.interrupt_before_finalization()
+    def test_an_interrupt_at_the_tasks_exit_exits_it_again_with_its_verdict(self):
+        calls = interrupt_first_exit(self, lk.BoardTask)
+        row = self.check()
+        self.assertEqual(calls, [False, False], 'exited once more, as it had not ended')
+        self.assertEqual((row['status'], row['interrupted'], row['cleanup']['result'], row['cleanup']['released']),
+                         ('ok', True, 'released', True))
+        self.assertEqual(lk.cleanup_events('b'), [], 'its clean verdict stood: nothing logged')
+        self.take()
+
+    def interrupt_before_the_verdict(self):
+        """An interrupt as the verdict is first collected, before its own interrupt hold is in place."""
+        real, calls = eng._verdict, []
+
+        def verdict(*a):
+            calls.append(1)
+            if len(calls) == 1:
+                raise KeyboardInterrupt
+            return real(*a)
+        patch(self, eng, '_verdict', verdict)
+        return calls
+
+    def test_an_interrupt_before_the_verdict_finalizes_from_the_same_ledger(self):
+        calls = self.interrupt_before_the_verdict()
         row = self.check()
         self.assertEqual(len(calls), 2)
         self.assertEqual((row['status'], row['interrupted'], row['cleanup']['result']), ('ok', True, 'released'))
+        self.assertEqual(lk.cleanup_events('b'), [])
         self.take()
+
+    def test_an_interrupt_before_the_verdict_keeps_a_pending_resets_receipt_and_retained_session(self):
+        self.pending_reset(retained=['/s/r1.json'])
+        self.interrupt_before_the_verdict()
+        self.assert_pending_logged(self.check(), retained=['/s/r1.json'])
+
+    def signal_at(self, where):
+        """A real SIGINT delivered once, where the body's finally first calls _verdict (`call-site`, the line in
+        check_board) or as _verdict's own frame is entered (`entry`): no patched callable stands between."""
+        prev = signal.signal(signal.SIGINT, signal.default_int_handler)
+        self.addCleanup(signal.signal, signal.SIGINT, prev)
+        lines, first = inspect.getsourcelines(eng.check_board)
+        site = first + next(i for i, line in enumerate(lines) if line.strip() == '_verdict(task, ctx, row)')
+        fired = []
+
+        def local(frame, event, arg):
+            if not fired and event == 'line' and frame.f_lineno == site:
+                fired.append(where)
+                signal.raise_signal(signal.SIGINT)
+            return local
+
+        def tracer(frame, event, arg):
+            if where == 'call-site':
+                return local if frame.f_code is eng.check_board.__code__ else None
+            if not fired and frame.f_code is eng._verdict.__code__:
+                fired.append(where)
+                signal.raise_signal(signal.SIGINT)
+            return None
+        prev_trace = sys.gettrace()
+        sys.settrace(tracer)
+        self.addCleanup(sys.settrace, prev_trace)
+        return fired
+
+    def test_a_signal_as_the_verdict_is_first_collected_still_logs_the_ledgers_evidence(self):
+        for where in ('call-site', 'entry'):
+            with self.subTest(where=where):
+                self.pending_reset(retained=['/s/r1.json'])
+                fired = self.signal_at(where)
+                row = self.check()
+                sys.settrace(None)
+                self.assertEqual(fired, [where])
+                self.assert_pending_logged(row, retained=['/s/r1.json'])
+
+    def signal_past_the_reset(self, k):
+        """A real SIGINT, once, at the k-th line event of check_board's task body or _verdict, counted from the first
+        past check_board's reset: every point between the reset's end and its verdict, and after, until the task's own
+        except clauses. Returns the line it fired at."""
+        prev = signal.signal(signal.SIGINT, signal.default_int_handler)
+        self.addCleanup(signal.signal, signal.SIGINT, prev)
+        lines, first = inspect.getsourcelines(eng.check_board)
+        after = first + next(i for i, line in enumerate(lines) if line.strip() == '_reset(profile, ctx, board, row)')
+        end = first + next(i for i, line in enumerate(lines) if line.strip().startswith('except hil_lock.BoardBusy'))
+        codes, seen, fired = (eng.check_board.__code__, eng._verdict.__code__), [], []
+
+        def local(frame, event, arg):
+            board = frame.f_code is codes[0]
+            if event == 'line' and not fired and (seen or board and frame.f_lineno > after) \
+                    and not (board and frame.f_lineno >= end):
+                seen.append(frame.f_lineno)
+                if len(seen) > k:
+                    fired.append(frame.f_lineno)
+                    signal.raise_signal(signal.SIGINT)
+            return local
+        prev_trace = sys.gettrace()
+        sys.settrace(lambda frame, event, arg: local if frame.f_code in codes else None)
+        self.addCleanup(sys.settrace, prev_trace)
+        return fired
+
+    def test_a_signal_anywhere_from_the_resets_end_to_its_verdict_still_logs_the_ledgers_evidence(self):
+        for k in range(100):
+            with self.subTest(k=k):
+                self.pending_reset(retained=['/s/r1.json'])
+                fired = self.signal_past_the_reset(k)
+                row = self.check()
+                sys.settrace(None)
+                if not fired:
+                    break
+                self.assert_pending_logged(row, retained=['/s/r1.json'])
+        self.assertGreater(k, 3, 'the sweep reached past the verdict')
 
     def test_a_recheck_that_raises_keeps_the_receipts_and_retained_sessions(self):
         self.outcomes[RESET] = (0, 'pending', 'ok')
@@ -471,21 +628,15 @@ class Engine(unittest.TestCase):
         receipt = {'token': RESET, 'lock': '/nonexistent'}
         self.assertEqual((row['status'], row['cleanup']['released'], row['cleanup']['receipts'],
                           row['cleanup']['retained']), ('blocked', True, [receipt], ['/s/r1.json']))
-        self.assertIn('finalization failed', row['cleanup']['evidence'][-1])
+        self.assertIn('recheck failed', row['cleanup']['evidence'][-1])
         f = latest_failure(lk, 'b')
         self.assertEqual((f['receipts'], f['retained']), ([receipt], ['/s/r1.json']))
         self.take()
 
-    def test_an_interrupt_before_finalization_keeps_a_pending_resets_receipt(self):
-        self.outcomes[RESET] = (0, 'pending', '')
-        self.rechecks[RESET] = 'pending'
-        self.interrupt_before_finalization()
-        row = self.check()
-        receipt = {'token': RESET, 'lock': '/nonexistent'}
-        self.assertEqual((row['status'], row['interrupted'], row['cleanup']['receipts'], row['cleanup']['released']),
-                         ('blocked', True, [receipt], True))
-        self.assertEqual(latest_failure(lk, 'b')['receipts'], [receipt])
-        self.take()
+    def test_an_interrupt_at_the_tasks_exit_keeps_a_pending_resets_receipt(self):
+        self.pending_reset()
+        interrupt_first_exit(self, lk.BoardTask)
+        self.assert_pending_logged(self.check())
 
     def test_a_record_that_cannot_be_cleared_is_released_and_logged(self):
         real = lk.take_board_lock
@@ -499,8 +650,9 @@ class Engine(unittest.TestCase):
         doc = self.doc(row)
         self.assertEqual((row['status'], row['check_status'], row['cleanup']['result'], row['cleanup']['released'],
                           eng.exit_status(doc)), ('blocked', 'ok', 'release-failed', True, 4))
-        self.assertIn('the record could not be cleared', row['cleanup']['evidence'])
-        self.assertEqual(row['cleanup']['logErrors'], ['record not cleared'])
+        self.assertTrue(row['cleanup']['evidence'][-1].startswith('b: lock released, failure logged in '))
+        self.assertIn('record not cleared', row['cleanup']['logErrors'])
+        self.assertEqual(latest_failure(lk, 'b')['detail'], 'record not cleared after a clean verdict')
         patch(self, eng.hil_lock, 'take_board_lock', real)
         self.take()          # the record it left is the next task's to log
         self.assertEqual(latest_failure(lk, 'b')['how'], 'found-left')
@@ -708,6 +860,12 @@ class Main(unittest.TestCase):
         self.p.reset = None
         self.assertEqual(self.run_main(self.cfg)[0], 2)
 
+    def test_a_profile_without_a_busy_check_is_refused_never_read_as_idle(self):
+        self.p.busy = None
+        code, _, err = self.run_main(self.cfg, check=lambda *a, **kw: self.fail('checked'))
+        self.assertEqual(code, 2)
+        self.assertIn('profile lacks busy', err)
+
     def test_named_boards_include_named_only_ones(self):
         seen = []
         code, _, _ = self.run_main(self.cfg, '-b', 'parked', check=lambda p, b, *a, **kw: seen.append(b['name']) or row(b['name'], 'ok'))
@@ -749,9 +907,10 @@ class Main(unittest.TestCase):
         self.assertIn('farm_check', err)
         code, _, err = self.run_main(self.cfg, lock_module=types.SimpleNamespace(), check=lambda *a, **kw: self.fail('checked'))
         self.assertEqual(code, 2)
-        self.assertIn('take_board_lock', err)
+        self.assertIn('board_task', err)
         # present but of the wrong type: refused before the engine runs, not a crash inside it
-        for name, value in (('take_board_lock', None), ('end_failed', None), ('RecoveryBlocked', None),
+        for name, value in (('board_task', None), ('failure_report', None), ('BoardBusy', None),
+                            ('RecoveryBlocked', None),
                             ('RecoveryBlocked', int), ('PROTECTED_REASONS', None), ('PROTECTED_REASONS', 'farm_check')):
             with self.subTest(name=name, value=value):
                 bad = types.SimpleNamespace(**{a: getattr(lk, a) for a in api})
@@ -853,6 +1012,9 @@ def probe_name(board):
 
 def probe_candidates(board):
     return ['1-1']
+
+def busy(board):
+    return []
 
 def reset(ctx, board):
     return hf.reset_stlink(board['flasher'], timeout=60, run=ctx.run)
