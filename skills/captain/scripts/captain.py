@@ -727,6 +727,37 @@ def new_turn(entry):
     return entry.get('type') == 'user' and not entry.get('isMeta') and not results
 
 
+# What may follow a watch member's report call in its turn and leave the report current, as Claude Code 2.1 writes
+# transcripts; anything else, a newer kind included, counts as work done after it.
+PROSE = ('text', 'thinking', 'redacted_thinking')
+QUIET_SYSTEM = ('stop_hook_summary', 'turn_duration', 'away_summary')
+QUIET_ATTACHMENTS = ('output_style', 'hook_success', 'hook_system_message', 'silent_turn_reminder',
+                     'total_tokens_reminder', 'deferred_tools_record', 'deferred_tools_delta', 'skill_listing',
+                     'mcp_instructions_delta', 'agent_listing_delta', 'date')
+BOOKKEEPING = ('api-request', 'api-request-blob', 'api-request-shape', 'queue-operation', 'last-prompt', 'ai-title',
+               'custom-title', 'agent-name', 'agent-setting', 'mode', 'permission-mode', 'session-owner', 'atis-latch',
+               'bridge-session', 'pr-link', 'history-suppression', 'file-history-snapshot', 'file-history-delta',
+               'cost-state', 'tools-used')
+
+
+def settled(entry):
+    """Whether a transcript entry after a watch member's report call leaves that report current: completion text or
+    bookkeeping, never a tool call, input injected into the turn, a hook holding the stop, or anything unrecognized."""
+    if not isinstance(entry, dict):
+        return False
+    kind = entry.get('type')
+    if kind == 'assistant':
+        blocks = content(entry)
+        return isinstance(blocks, list) and all(isinstance(b, dict) and b.get('type') in PROSE for b in blocks)
+    if kind == 'system':   # a Stop hook that blocked lists its reason in hookErrors and the turn goes on
+        return entry.get('subtype') in QUIET_SYSTEM and not any(
+            entry.get(k) for k in ('hookErrors', 'hookAdditionalContext', 'preventedContinuation'))
+    if kind == 'attachment':
+        attached = entry.get('attachment')
+        return isinstance(attached, dict) and attached.get('type') in QUIET_ATTACHMENTS
+    return kind in BOOKKEEPING
+
+
 def anchor(entry, ref, member):
     """Whether a transcript entry is what a report's turn starts from: a watch member's own report call returning,
     its output naming the report; a request's prompt as typed."""
@@ -748,8 +779,8 @@ def receipt_of(ref, text):
 
 def unchanged(target, recs):
     """(target's last report, the id `reports` gives it by) when its transcript starts no turn after the request that
-    report answered or, for a watch member's, after the report call, so asking again would only repeat it; None, so
-    the target is asked, whenever that cannot be shown."""
+    report answered or, for a watch member's, holds only completion text and bookkeeping after the report call, so
+    asking again would only repeat it; None, so the target is asked, whenever that cannot be shown."""
     last = last_report(target, recs)
     if not last:
         return None
@@ -772,8 +803,9 @@ def unchanged(target, recs):
     try:
         entries = (json.loads(line) for line in lines)   # lazily: the first new turn ends the walk
         for entry in entries:   # a record of the API request that carried it may quote it first
-            if anchor(entry, ref, member):
-                return None if any(new_turn(e) for e in entries) else (last, ref)
+            if anchor(entry, ref, member):   # a member may keep working in the turn its report call returned in
+                current = settled if member else (lambda e: not new_turn(e))
+                return (last, ref) if all(current(e) for e in entries) else None
             if new_turn(entry):
                 return None   # a summary or tool output quoting the id is not the request
         return None

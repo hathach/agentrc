@@ -2153,6 +2153,80 @@ class WatchUnchangedTest(WatchCase):
                   'message': {'content': 'and now this'}})
         self.assertTrue(self.asked().endswith('delivered'))
 
+    def asked_after(self, *entries):
+        """Whether ask types a new request once entries follow the report call, the transcript restored after."""
+        saved = self.transcript.read_bytes()
+        self.log(*entries)
+        try:
+            return self.asked().endswith('delivered')
+        finally:
+            self.transcript.write_bytes(saved)
+
+    def test_completion_text_and_bookkeeping_after_the_report_keep_it(self):
+        quiet = [{'type': 'assistant', 'message': {'content': [{'type': 'thinking', 'thinking': 'done'},
+                                                               {'type': 'text', 'text': 'All done.'}]}},
+                 {'type': 'attachment', 'attachment': {'type': 'hook_success', 'hookEvent': 'Stop'}},
+                 {'type': 'attachment', 'attachment': {'type': 'hook_system_message', 'content': 'gate skipped'}},
+                 {'type': 'system', 'subtype': 'stop_hook_summary', 'hookErrors': [], 'hookAdditionalContext': [],
+                  'preventedContinuation': False},
+                 {'type': 'system', 'subtype': 'turn_duration'}, {'type': 'system', 'subtype': 'away_summary'},
+                 {'type': 'api-request', 'body': f'recorded {self.ref}'}, {'type': 'file-history-snapshot'},
+                 {'type': 'queue-operation'}, {'type': 'last-prompt'}, {'type': 'cost-state'}]
+        self.assertFalse(self.asked_after(*quiet))
+        self.assertEqual(self.typed, [])
+
+    def test_work_after_the_report_in_the_same_turn_is_asked(self):
+        blocked = [{'type': 'attachment', 'attachment': {'type': 'hook_blocking_error', 'hookEvent': 'Stop',
+                                                         'blockingError': {'blockingError': 'review findings'}}},
+                   {'type': 'system', 'subtype': 'stop_hook_summary', 'hookErrors': ['review findings'],
+                    'hookAdditionalContext': [], 'preventedContinuation': False},
+                   {'type': 'user', 'isMeta': True, 'message': {'content': 'Stop hook feedback:\nreview findings'}}]
+        work = [{'type': 'assistant', 'message': {'content': [{'type': 'tool_use', 'name': 'Bash'}]}},
+                {'type': 'user', 'message': {'content': [{'type': 'tool_result', 'content': 'ok'}]}},
+                {'type': 'assistant', 'message': {'content': [{'type': 'tool_use', 'name': 'Edit'}]}},
+                {'type': 'assistant', 'message': {'content': [{'type': 'text', 'text': 'Applied the findings.'}]}},
+                {'type': 'system', 'subtype': 'stop_hook_summary', 'hookErrors': []}]
+        cases = {
+            'blocked stop, then work': blocked + work,
+            'blocked stop, then only text': [blocked[1], work[3]],
+            'a further tool call': work[:1],
+            'stop hook context': [{'type': 'system', 'subtype': 'stop_hook_summary', 'hookErrors': [],
+                                   'hookAdditionalContext': ['go on']}],
+            'stop prevented': [{'type': 'system', 'subtype': 'stop_hook_summary', 'preventedContinuation': True}],
+            'input read mid-turn': [{'type': 'attachment', 'attachment': {'type': 'queued_command',
+                                                                          'prompt': 'also merge it'}}],
+            'meta input': [blocked[2]],
+            'an unknown entry': [{'type': 'something-new'}],
+            'an unknown attachment': [{'type': 'attachment', 'attachment': {'type': 'task_status'}}],
+            'an unknown system entry': [{'type': 'system', 'subtype': 'local_command'}],
+            'an assistant entry of another shape': [{'type': 'assistant', 'message': {'content': 'text'}}],
+            'not an object': [['a list']]}
+        for why, entries in cases.items():
+            with self.subTest(why):
+                self.assertTrue(self.asked_after(*entries))
+
+    def test_a_later_report_after_the_work_is_the_new_anchor(self):
+        self.log({'type': 'attachment', 'attachment': {'type': 'hook_blocking_error', 'hookEvent': 'Stop'}},
+                 {'type': 'assistant', 'message': {'content': [{'type': 'tool_use', 'name': 'Edit'}]}},
+                 {'type': 'user', 'message': {'content': [{'type': 'tool_result', 'content': 'ok'}]}})
+        self.ref = self.reported()
+        self.assertIn(f'not asked, nothing new since its report {self.ref} at', self.asked())
+
+    def test_a_status_request_s_own_turn_keeps_its_shortcut(self):
+        """Only a member's receipt is held to completion text: a request's turn runs the report call after it."""
+        self.log({'type': 'user', 'promptSource': 'typed', 'origin': {'kind': 'human'},
+                  'message': {'content': 'and now this'}})
+        line = self.ask()
+        msg = self.msg_of(line)
+        self.log({'type': 'user', 'promptSource': 'typed', 'origin': {'kind': 'human'},
+                  'message': {'content': f'<hc from="t1">{captain.status_prompt(msg)}</hc>'}},
+                 {'type': 'assistant', 'message': {'content': [{'type': 'tool_use', 'name': 'Bash'}]}},
+                 {'type': 'user', 'message': {'content': [{'type': 'tool_result', 'content': 'brief text'}]}},
+                 {'type': 'attachment', 'attachment': {'type': 'task_status'}},
+                 {'type': 'assistant', 'message': {'content': [{'type': 'text', 'text': 'Status sent.'}]}})
+        self.report_as('t2', msg)
+        self.assertIn(f'not asked, nothing new since its report {msg} at', self.ask())
+
     def test_asked_when_it_cannot_be_shown(self):
         cases = {'torn line': lambda: self.log(raw=b'{"type": "user", "mess'),
                  'later report not logged': lambda: self.report_as('t2', self.m),

@@ -80,8 +80,10 @@ pins each target's session once, so one replaced in its terminal while the relay
   idle; hc has no such check for done, so one that starts a turn in between gets the request as its next input. One
   request per session is open at a time. A session whose own transcript starts no turn after the request its last
   report answered - no prompt, task notification or compaction - is not asked: `ask` prints `not asked` with that
-  report's id, which answers for it. `--force` asks anyway, only when the human wants a session asked again whatever
-  it last said.
+  report's id, which answers for it. A watch member's last report counts only while its transcript holds nothing but
+  completion text and bookkeeping after that report call: a Stop hook that kept the turn going, a further tool call,
+  input read mid-turn or any entry the script does not know means it is asked. `--force` asks anyway, only when the
+  human wants a session asked again whatever it last said.
 - **Relay** carries the human's message this turn of yours acts on, read by the script from this session's own
   transcript: you never pass the words. That is the message that started the turn, or one the human typed while you
   worked, which reaches you inside a tool result; a turn a notification or a compaction started has none, and the
