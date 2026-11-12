@@ -82,6 +82,7 @@ CONFIG_DIRS = {'main': None, 'ada': os.path.expanduser('~/.claude-ada')}   # mai
 DEFAULT_CONFIG = '~/.claude'   # where main, CLAUDE_CONFIG_DIR unset, keeps its transcripts
 HC_TIMEOUT_S = 30
 CLAUDE_APP = 'claude-code'
+BACKGROUND = 'claude.background_tasks'
 RULE = re.compile(r'^─{20,}')  # the top rule may end in a session label: ──── alo68 ─
 BLANK = ' \xa0\t\r'
 CLAUDE_HINTS = re.compile(r'⏵⏵|\? for shortcuts|shift\+tab|esc to interrupt')
@@ -240,10 +241,21 @@ def canonical(cwd):
     return os.path.realpath(cwd) if cwd and os.path.isabs(cwd) else None
 
 
+def background(labels):
+    """The count of background tasks Claude Code puts in its terminal's claude.background_tasks label (hc 0.1.19+,
+    a decimal string): None when the label is absent or empty, '?' when it is not a count, never a guessed 0."""
+    raw = labels.get(BACKGROUND)
+    if raw is None or raw == '':
+        return None
+    if type(raw) is int and raw >= 0:
+        return raw
+    return int(raw) if isinstance(raw, str) and raw.isascii() and raw.isdigit() else '?'
+
+
 def described(t):
     """The session fields `hc get` shows for a live local Claude Code terminal, or None for any other. Its cwd and
     pid are its foreground process's: the terminal's own are the shell's it may have started from. said is its status
-    line on one line, blocked_on a blocked one's kind."""
+    line on one line, blocked_on a blocked one's kind, background_tasks what background() reads."""
     status = (t or {}).get('status') or {}
     if not t or t.get('state') != 'live' or status.get('app') != CLAUDE_APP or not hc.is_local(t.get('address')):
         return None
@@ -262,6 +274,7 @@ def described(t):
         'status_ms': t.get('status_ms') or 0,
         'said': one_line(status.get('msg') or ''),
         'blocked_on': status.get('kind') if status.get('state') == 'blocked' else None,
+        'background_tasks': background(labels),
     }
 
 
@@ -2933,6 +2946,7 @@ def main():
                 note = f'  (unpinned: {", ".join(missing)})' if missing else ''
                 at = time.strftime('%H:%M', time.localtime(s['status_ms'] / 1000)) if s['status_ms'] else '?'
                 state = s['status'] + (f' ({s["blocked_on"]})' if s['blocked_on'] else '')
+                state += f', background tasks: {s["background_tasks"]}' if s['background_tasks'] not in (None, 0) else ''
                 said = f'\t"{s["said"]}"' if s['said'] else ''
                 print(f'{s["handle"]}\t{s["kind"]}/{who}\t{state}\t{at}\t{s["cwd"] or "?"}{note}{said}')
             return 0

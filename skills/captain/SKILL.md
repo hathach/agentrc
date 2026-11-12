@@ -12,7 +12,10 @@ the session registry Claude Code keeps under its account's config dir, which Cod
 Codex terminals out, and remote (`machine/tN`) ones too. `list` orders sessions by hc's `status_ms`, when each last
 reported its status, latest first: an order, not how long one has been idle. A row gives the state and, in the next
 column, that report's time; it ends with the session's own status line, quoted, and a blocked one's state names what it
-waits for: `blocked (permission)`, `(question)` or `(auth)`, as of that time, unchecked.
+waits for: `blocked (permission)`, `(question)` or `(auth)`, as of that time, unchecked. A session running background
+tasks, such as a Monitor or a headless chief, adds Claude Code's count of them, `done, background tasks: 1`, from its
+terminal's `claude.background_tasks` label (hc 0.1.19+), or `?` when the label is not a count; `--json` gives it as
+`background_tasks`, null when the label is absent. It never holds an ask or a relay: such a session still answers.
 
 ```bash
 python3 ~/.claude/skills/captain/scripts/captain.py list [--json]                   # every other Claude Code session, latest change first

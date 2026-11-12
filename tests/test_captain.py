@@ -122,6 +122,42 @@ class SessionsTest(unittest.TestCase):
         self.assertEqual([(r[2], r[3], r[5:]) for r in rows],
                          [('blocked (permission)', '?', ['"Edit x?"']), ('idle', '?', [])])
 
+    def test_background_tasks_from_the_label_never_a_guessed_zero(self):
+        cases = [(None, None), ('', None), ('0', 0), ('2', 2), (7, 7), ('two', '?'), ('-1', '?'), ('1.5', '?'),
+                 ('²', '?'), (True, '?'), (-3, '?'), (['1'], '?')]
+        for value, want in cases:
+            with self.subTest(value=value):
+                t = terminal('t2')
+                if value is not None:
+                    t['labels'] = {**t['labels'], 'claude.background_tasks': value}
+                self.assertEqual(self.sessions({'t2': t})[0]['background_tasks'], want)
+
+    def test_list_shows_background_tasks_beside_the_status(self):
+        def labelled(address, value, **status):
+            t = terminal(address, status={'app': 'claude-code', **status})
+            if value is not None:
+                t['labels'] = {**t['labels'], 'claude.background_tasks': value}
+            return t
+        found = self.sessions({'t2': labelled('t2', '2', state='done', msg='ok'),
+                               't3': labelled('t3', 'x', state='blocked', kind='permission'),
+                               't4': labelled('t4', '0', state='idle'), 't5': labelled('t5', None, state='idle')},
+                              me='')
+        found = [{**s, 'account': 'main'} for s in found]
+        with mock.patch.object(captain, 'everyone', return_value=found), \
+                mock.patch.object(captain, 'unpinned', return_value=[]), \
+                mock.patch('sys.argv', ['captain.py', 'list']), \
+                mock.patch('builtins.print') as out:
+            captain.main()
+        rows = {r[0].rsplit(' · ', 1)[1]: r[2] for r in (c.args[0].split('\t') for c in out.call_args_list)}
+        self.assertEqual(rows, {'t2': 'done, background tasks: 2', 't3': 'blocked (permission), background tasks: ?',
+                                't4': 'idle', 't5': 'idle'})
+        with mock.patch.object(captain, 'everyone', return_value=found), \
+                mock.patch('sys.argv', ['captain.py', 'list', '--json']), \
+                mock.patch('builtins.print') as out:
+            captain.main()
+        shown = {s['address']: s['background_tasks'] for s in json.loads(out.call_args.args[0])}
+        self.assertEqual(shown, {'t2': 2, 't3': '?', 't4': 0, 't5': None})
+
     def test_missing_or_relative_cwd_stays_unknown(self):
         for cwd in (None, '', 'rel/dir'):
             with self.subTest(cwd=cwd):
@@ -517,6 +553,13 @@ class AskTest(LedgerCase):
         self.assertIn('no Claude Code terminal at that address', self.ask('t99'))
         self.assertIn('this session', self.ask('t1'))
         self.assertEqual(self.typed, [])
+
+    def test_background_tasks_never_hold_an_ask(self):
+        for n, count in enumerate((3, '?')):
+            address = f't{n + 3}'
+            self.terminals[address] = {**pinned(address), 'status': 'done', 'background_tasks': count}
+            self.assertTrue(self.ask(address).endswith('delivered'))
+        self.assertEqual([a for a, _ in self.typed], ['t3', 't4'])
 
     def test_a_draft_in_the_input_line_is_no_refusal(self):
         self.screens['t2'] = boxed('❯ my draft text')
