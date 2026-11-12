@@ -12,6 +12,8 @@ if os.name == 'nt':
 
 import ast
 import contextlib
+import dis
+import errno
 import fcntl
 import importlib.util
 import inspect
@@ -3224,6 +3226,129 @@ class SessionMutex(LockDir):
         self.assertEqual(len(os.listdir('/proc/self/fd')), fds)
         with hil_lock.session_mutex(BOARD):
             pass
+
+    def check_points(self):
+        """{code: offsets} of hil_lock's own code where CPython runs a pending signal's Python handler: just after
+        a call returns, a backward jump, a frame's resume."""
+        codes, todo = {}, [f.__code__ for f in vars(hil_lock).values() if isinstance(f, types.FunctionType)]
+        todo.append(inspect.unwrap(hil_lock.session_mutex).__code__)
+        while todo:
+            code = todo.pop()
+            if code in codes or code.co_filename != hil_lock.__file__:
+                continue
+            ins = list(dis.get_instructions(code))
+            codes[code] = {b.offset for a, b in zip(ins, ins[1:]) if a.opname.startswith('CALL')
+                           and a.opname != 'CALL_INTRINSIC_1'}
+            codes[code] |= {i.offset for i in ins if i.opname in ('JUMP_BACKWARD', 'RESUME')}
+            todo += [c for c in code.co_consts if isinstance(c, types.CodeType)]
+        return codes
+
+    def interrupt_every_take(self, sig, storm):
+        """Take and drop the mutex once per check point, `sig` raised at that one (and with `storm` at every one
+        after it): each take ends interrupted with no fd kept, the handlers back, and the mutex free here."""
+        class Terminated(BaseException):
+            pass
+
+        def term(signum, frame):
+            raise Terminated(signum)
+        self.addCleanup(signal.signal, signal.SIGINT, signal.signal(signal.SIGINT, signal.default_int_handler))
+        self.addCleanup(signal.signal, signal.SIGTERM, signal.signal(signal.SIGTERM, term))
+        mon, tool = sys.monitoring, sys.monitoring.DEBUGGER_ID
+        if mon.get_tool(tool) is not None:
+            self.skipTest('sys.monitoring debugger id in use')
+        codes = self.check_points()
+        with hil_lock.session_mutex(BOARD):     # the dir and the file exist: only a take's fds are counted
+            pass
+        fds = sorted(os.listdir('/proc/self/fd'))
+        mon.use_tool_id(tool, 'session_mutex interrupts')
+        try:
+            self.take_interrupted(codes, sig, storm, fds, term, Terminated)
+        finally:
+            mon.register_callback(tool, mon.events.INSTRUCTION, None)
+            mon.free_tool_id(tool)
+
+    def take_interrupted(self, codes, sig, storm, fds, term, Terminated):
+        mon, tool = sys.monitoring, sys.monitoring.DEBUGGER_ID
+        seen = 0
+
+        def at(code, offset):
+            nonlocal seen
+            if offset in codes.get(code, ()):
+                seen += 1
+                if seen == n + 1 or storm and seen > n:
+                    signal.raise_signal(sig)
+        mon.register_callback(tool, mon.events.INSTRUCTION, at)
+        n = 0
+        while True:
+            seen = 0
+            for code in codes:
+                mon.set_local_events(tool, code, mon.events.INSTRUCTION)
+            try:
+                with hil_lock.session_mutex(BOARD):
+                    pass
+            except (KeyboardInterrupt, Terminated):
+                interrupted = True
+            else:
+                interrupted = False
+            finally:
+                for code in codes:
+                    mon.set_local_events(tool, code, 0)
+            if seen <= n:
+                break
+            with self.subTest(sig=sig, at=n, storm=storm):
+                self.assertTrue(interrupted)
+                self.assertEqual(sorted(os.listdir('/proc/self/fd')), fds)
+                self.assertEqual((signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM)),
+                                 (signal.default_int_handler, term))
+                with hil_lock.session_mutex(BOARD):     # reacquired in this process
+                    pass
+            n += 1
+        self.assertGreater(n, 10)
+
+    def test_an_interrupt_at_any_check_point_frees_the_mutex(self):
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            self.interrupt_every_take(sig, storm=False)
+
+    def test_a_second_interrupt_in_its_cleanup_still_frees_the_mutex(self):
+        """#537: a first interrupt before the cleanup and a second on its back-edge leaked both fds."""
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            self.interrupt_every_take(sig, storm=True)
+
+    def test_a_helper_that_cannot_load_acquires_nothing(self):
+        fds = sorted(os.listdir('/proc/self/fd'))
+        for e in (ImportError('no hil_process'), OSError(errno.ENOENT, 'gone')):
+            with self.subTest(e=e), mock.patch.object(hil_lock, '_process', side_effect=e), \
+                    self.assertRaisesRegex(hil_lock.LockUnavailable, 'interrupt hold'):
+                with hil_lock.session_mutex(BOARD):
+                    self.fail('the body ran')
+            self.assertEqual(sorted(os.listdir('/proc/self/fd')), fds)
+            self.assertEqual(os.listdir(self.dir), [])
+        with hil_lock.session_mutex(BOARD):
+            pass
+
+    def test_a_failed_close_closes_each_fd_once(self):
+        self.addCleanup(signal.signal, signal.SIGINT, signal.signal(signal.SIGINT, signal.default_int_handler))
+        with hil_lock.session_mutex(BOARD):
+            pass
+        fds = sorted(os.listdir('/proc/self/fd'))
+        real_close = os.close
+        for body, raised in ((None, OSError), (ValueError('body'), OSError), (KeyboardInterrupt(), KeyboardInterrupt)):
+            closed = []
+
+            def close(fd):                      # the fd is freed, as Linux frees it whatever close returns
+                closed.append(fd)
+                real_close(fd)
+                raise OSError(errno.EIO, 'close failed')
+            with self.subTest(body=body), self.assertRaises(raised):
+                with mock.patch.object(hil_lock.os, 'close', close), hil_lock.session_mutex(BOARD):
+                    if body is not None:
+                        raise body
+            self.assertEqual(len(closed), 2)
+            self.assertEqual(len(set(closed)), 2)
+            self.assertEqual(sorted(os.listdir('/proc/self/fd')), fds)
+            self.assertIs(signal.getsignal(signal.SIGINT), signal.default_int_handler)
+            with hil_lock.session_mutex(BOARD):
+                pass
 
     def test_never_a_board_lock(self):
         with hil_lock.session_mutex(BOARD):

@@ -1182,10 +1182,19 @@ def session_mutex(lock):
     shared file there is, never replaced or unlinked, so every taker locks the same inode), held
     for the with block. A command takes it before validating the caller's hold, so two commands
     cannot both pass that check. SessionBusy, naming the lock, at once when another holds it;
-    LockUnavailable when the dir or file cannot be used. It is no board lock: lock_names and
-    `release --all` never list it."""
+    LockUnavailable when the dir or file cannot be used, or hil_process cannot be loaded. It is
+    no board lock: lock_names and `release --all` never list it.
+
+    SIGINT and SIGTERM are deferred (hil_process.InterruptHold) from before its first fd opens
+    until both are closed, the with block alone excepted, so a caller catching the interrupt
+    keeps no flock; one deferred is raised after the closes, ahead of a close's error."""
     _check_name(lock)
-    fds = []      # the dir's, then the mutex's
+    try:
+        process = _process()        # before any fd: a helper that cannot load acquires nothing
+    except Exception as e:
+        raise LockUnavailable(f'session mutex unavailable: interrupt hold: {e!r:.200}') from e
+    hold = process.InterruptHold()
+    fds, raised, failed = [], None, None      # fds: the dir's, then the mutex's
     try:
         try:
             fds.append(_open_dir(create=True))
@@ -1199,28 +1208,21 @@ def session_mutex(lock):
                               f'({lock}{SESSION_MUTEX} held)') from None
         except OSError as e:
             raise _unavailable(e) from e
+        hold.deliver()
         yield
+    except BaseException as e:      # no call in here: no interrupt check before the finally's first store
+        raised = e
+        raise
     finally:
-        # closed under an InterruptHold, inline (a call's entry is an interrupt check): a caller catching the
-        # interrupt keeps no flock. One before the hold went in closed nothing yet: close again, then raise it
-        pending = None
+        hold.deferring = True       # first: an attribute store is no interrupt check, a call's entry is
         while fds:
             try:
-                try:
-                    hold = _process().InterruptHold()
-                except Exception:
-                    hold = None       # the pops alone
-                try:
-                    while fds:
-                        os.close(fds.pop())       # popped first: an fd is closed at most once
-                finally:
-                    if hold is not None:
-                        hold.release()
-            except BaseException as e:      # an interrupt wins over a close's OSError
-                if pending is None or isinstance(pending, Exception) and not isinstance(e, Exception):
-                    pending = e
-        if pending is not None:
-            raise pending
+                os.close(fds.pop())       # once each: a failed close frees the fd number all the same
+            except Exception as e:
+                failed = failed or e
+        hold.release()
+        if failed is not None and (raised is None or isinstance(raised, Exception)):     # an interrupt wins
+            raise failed
 
 
 # --- holder identity ------------------------------------------------------------------------
