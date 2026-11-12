@@ -48,8 +48,9 @@ class FakeTask:
     """hil_lock.board_task over FakeLock's take, release, end_failed and resolve_restored, its verdict recorded in
     `lock.verdicts`; the real lifecycle is hil_lock's, tested there and in BoardTaskOnTheRealLock."""
 
-    def __init__(self, lock, board, reason, busy, fields):
+    def __init__(self, lock, board, reason, busy, fields, collector=None):
         self.lock, self.board, self.reason, self.busy, self.fields = lock, board, reason, busy, fields
+        self.collector = collector
         self.cleanup_failures, self.errors, self.restore_notes = [], [], []
         self.released = self.ended = self.ended_cleanly = False
         self.verdict = self.fh = None
@@ -90,7 +91,9 @@ class FakeTask:
         self.ended_cleanly = cleanly
         step()
 
-    def __exit__(self, *exc):
+    def __exit__(self, exc_type=None, exc=None, tb=None):
+        if self.verdict is None and self.collector is not None:
+            self.collector(self, exc)
         v = self.verdict or ('failed', 'the task ended without a cleanup verdict', [])
         self.lock.verdicts.append(v[0])
         if v[0] == 'failed':
@@ -103,6 +106,10 @@ class FakeTask:
                 self.restore_notes.extend(self.lock.resolve_restored(self.board, self.cleanup_failures, evidence=v[1]))
             self.end(lambda: self.lock.release_board_lock(self.fh), not self.lock.uncleared)
         return False
+
+    def finish(self, exc=None):
+        if not self.ended:
+            self.__exit__(type(exc), exc, None)
 
     def describe(self):
         return f'{self.board}: fake lock'
@@ -149,8 +156,8 @@ class FakeLock:
 
     users_text = staticmethod(REAL.lock.users_text)
 
-    def board_task(self, board, reason='hil_test.py', *, busy, **fields):
-        return FakeTask(self, board, reason, busy, fields)
+    def board_task(self, board, reason='hil_test.py', *, busy, verdict=None, **fields):
+        return FakeTask(self, board, reason, busy, fields, verdict)
 
     @contextlib.contextmanager
     def session_mutex(self, lock):
@@ -2222,10 +2229,10 @@ class BoardTaskOnTheRealLock(Base):
         self.assertIn('rig_jlink: lock released', out['lock'])
         self.assertIn('record not cleared', out['lock'])
 
-    def test_a_signal_as_the_verdict_is_first_collected_still_logs_the_pending_receipt(self):
-        """A real SIGINT at battery's verdict, before its interrupt hold is in place: the verdict still carries the
-        child not proven ended."""
-        fired = self.signal_before_the_verdict(H.battery)
+    def test_a_signal_as_the_verdict_is_collected_still_logs_the_pending_receipt(self):
+        """A real SIGINT as BoardTask calls give_verdict, its collector: deferred by the task's hold, the verdict still
+        carries the child not proven ended, then the interrupt propagates."""
+        fired = self.signal_at_call(H.give_verdict)
 
         def step(*a):
             a[-1].pending.append({'receipt': {'unrecheckable': ['JLinkExe'], 'at': 1.0}})
@@ -2236,34 +2243,29 @@ class BoardTaskOnTheRealLock(Base):
                          ([1], True, 'blocker', True))
         failure = REAL.lock.open_cleanup_failures('rig_jlink')[-1]
         self.assertEqual((failure['detail'], failure['receipts']),
-                         ('JLinkExe: cleanup unknown; then KeyboardInterrupt', [{'unrecheckable': ['JLinkExe'],
-                                                                                'at': 1.0}]))
+                         ('JLinkExe: cleanup unknown', [{'unrecheckable': ['JLinkExe'], 'at': 1.0}]))
         self.assertEqual(row['cleanup']['pending'], [{'receipt': failure['receipts'][0]}])
         self.assert_released()
 
-    def signal_before_the_verdict(self, fn):
-        """A real SIGINT, once, at fn's `hold = A.process.InterruptHold()` line: before the hold its verdict is given
-        under is in place. Returns what fired; the tracer goes at cleanup."""
+    def signal_at_call(self, fn):
+        """A real SIGINT, once, as fn is called. Returns what fired; the tracer goes at cleanup."""
         prev = signal.signal(signal.SIGINT, signal.default_int_handler)
         self.addCleanup(signal.signal, signal.SIGINT, prev)
-        lines, first = inspect.getsourcelines(fn)
-        site = first + next(i for i, line in enumerate(lines) if 'hold = A.process.InterruptHold()' in line)
         fired = []
 
-        def local(frame, event, arg):
-            if not fired and event == 'line' and frame.f_lineno == site:
+        def tracer(frame, event, arg):
+            if not fired and event == 'call' and frame.f_code is fn.__code__:
                 fired.append(1)
                 signal.raise_signal(signal.SIGINT)
-            return local
         prev_trace = sys.gettrace()
-        sys.settrace(lambda frame, event, arg: local if in_function(frame, fn) else None)
+        sys.settrace(tracer)
         self.addCleanup(sys.settrace, prev_trace)
         return fired
 
-    def signal_past(self, fn, text, k):
-        """A real SIGINT, once, at the k-th line event of fn or its nested functions, counted from the first of fn's
-        own past its `text` line: every point between the body's end and its verdict, and after. Returns the line it
-        fired at; the tracer goes at cleanup."""
+    def signal_past(self, fn, text, k, collector):
+        """A real SIGINT, once, at the k-th line event of fn, its nested functions or the task's `collector`, counted
+        from the first of fn's own past its `text` line or the collector's first: every point between the body's end
+        and its verdict, and after. Returns the line it fired at; the tracer goes at cleanup."""
         prev = signal.signal(signal.SIGINT, signal.default_int_handler)
         self.addCleanup(signal.signal, signal.SIGINT, prev)
         lines, first = inspect.getsourcelines(fn)
@@ -2271,14 +2273,17 @@ class BoardTaskOnTheRealLock(Base):
         seen, fired = [], []
 
         def local(frame, event, arg):
-            if event == 'line' and not fired and (seen or frame.f_code is fn.__code__ and frame.f_lineno > after):
+            ours = frame.f_code is fn.__code__
+            if event == 'line' and not fired and (seen or ours and frame.f_lineno > after
+                                                  or frame.f_code is collector.__code__):
                 seen.append(frame.f_lineno)
                 if len(seen) > k:
                     fired.append(frame.f_lineno)
                     signal.raise_signal(signal.SIGINT)
             return local
         prev_trace = sys.gettrace()
-        sys.settrace(lambda frame, event, arg: local if in_function(frame, fn) else None)
+        sys.settrace(lambda frame, event, arg: local if in_function(frame, fn) or frame.f_code is collector.__code__
+                     else None)
         self.addCleanup(sys.settrace, prev_trace)
         return fired
 
@@ -2296,7 +2301,7 @@ class BoardTaskOnTheRealLock(Base):
                                "unknown", crash)):
             for k in range(100):
                 with self.subTest(handler=handler, k=k):
-                    fired = self.signal_past(H.battery, handler, k)
+                    fired = self.signal_past(H.battery, handler, k, H.give_verdict)
                     before = len(REAL.lock.open_cleanup_failures('rig_jlink'))
                     row = self.run_board(step=step)
                     sys.settrace(None)
@@ -2319,7 +2324,7 @@ class BoardTaskOnTheRealLock(Base):
             a[-1].check()
         for k in range(100):
             with self.subTest(k=k):
-                fired = self.signal_past(H.commission, 'error = e', k)
+                fired = self.signal_past(H.commission, "ledger['error'] = e", k, H.commission_verdict)
                 self.commission(detach, interrupted=None)
                 if not fired:
                     break
@@ -2349,21 +2354,21 @@ class BoardTaskOnTheRealLock(Base):
             H.cmd_commission(args)
         sys.settrace(None)
 
-    def test_a_signal_before_a_failed_commissions_verdict_still_logs_its_pending_child(self):
+    def test_a_signal_as_a_failed_commissions_verdict_is_collected_still_logs_its_pending_child(self):
         def detach(*a):
             a[-1]._note('unknown', None, ['JLinkExe'])
             a[-1].check()
-        fired = self.signal_before_the_verdict(H.commission)
+        fired = self.signal_at_call(H.commission_verdict)
         self.commission(detach)
         failure = REAL.lock.open_cleanup_failures('rig_jlink')[-1]
-        self.assertEqual((fired, failure['detail'][:39], [r['unrecheckable'] for r in failure['receipts']]),
-                         ([1], 'Unclean: JLinkExe: cleanup unknown; the', [['JLinkExe']]))
+        self.assertEqual((fired, failure['detail'][:34], [r['unrecheckable'] for r in failure['receipts']]),
+                         ([1], 'Unclean: JLinkExe: cleanup unknown', [['JLinkExe']]))
         self.assertRegex(REAL.lock.resolve_restored('rig_jlink', [failure], evidence='restored')[0], 'stays open')
         self.assert_released()
 
-    def test_a_signal_before_a_passing_commissions_verdict_still_restores(self):
+    def test_a_signal_as_a_passing_commissions_verdict_is_collected_still_restores(self):
         earlier = REAL.lock.log_cleanup_failure('rig_jlink', 'earlier', detail='restore failed')
-        fired = self.signal_before_the_verdict(H.commission)
+        fired = self.signal_at_call(H.commission_verdict)
         self.commission(mock.Mock())
         self.assertEqual(fired, [1])
         self.assertEqual([e['id'] for e in REAL.lock.cleanup_events('rig_jlink') if e['event'] == 'failed'],
