@@ -941,7 +941,8 @@ def _selections(program: str, argv: list) -> tuple:
     -select USB=<sn>; an openocd -c that is only `adapter serial`, `hla_serial` or
     `cmsis_dap_serial` <sn>; esptool --port/-p; lm4flash -s; st-flash --serial. Empty for every
     other tool and selection, and for any other syntax (pyocd and STM32_Programmer_CLI discovery
-    open candidate probes before their serial filter)."""
+    open candidate probes before their serial filter; _walk exempts an STM32_Programmer_CLI on
+    another ST-LINK separately, accepting those opens)."""
     serials, ports = [], []
     if program.startswith('JLink'):
         serials += _option_values(argv, ('-usb', '-selectemubysn'), fold=True)
@@ -1059,10 +1060,12 @@ def _fds(pid: int):
 
 
 def _other_stlink_session(prog_argv: list, uid: str) -> bool:
-    """Whether an STM32_Programmer_CLI argv selects only ST-LINKs other than `uid`: an `sn=`
-    selector, no `-script` (whose file may name any probe) and no word containing `uid`."""
+    """Whether an STM32_Programmer_CLI argv selects only ST-LINKs other than `uid`: a nonempty
+    `sn=` field of a word (fields split at `,`, as in `port=swd,sn=X`), no `-script` (whose file
+    may name any probe) and no word containing `uid`."""
     words, uid = [w.casefold() for w in prog_argv[1:]], uid.casefold()
-    return (bool(uid) and any('sn=' in w for w in words) and not any(w.lstrip('-').split('=', 1)[0] == 'script' for w in words)
+    selected = any(f.startswith('sn=') and len(f) > 3 for w in words for f in w.split(','))
+    return (bool(uid) and selected and not any(w.lstrip('-').split('=', 1)[0] == 'script' for w in words)
             and not any(uid in w for w in words))
 
 
