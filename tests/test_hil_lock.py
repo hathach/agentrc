@@ -2930,11 +2930,11 @@ class BoardTasks(LockDir):
         self.assertEqual(len(failed_events(hil_lock, BOARD)), 1)
         self.assert_handlers(*handlers)
 
-    def test_finish_after_an_interrupt_left_enter_ends_it_as_a_refusal(self):
-        self.signals()
+    def signal_at_enter_line(self, source):
+        """A tracer raising a real SIGINT once, at the line of BoardTask.__enter__ whose source is `source`."""
         code = hil_lock.BoardTask.__enter__.__code__
-        line = next(n for _, _, n in code.co_lines() if n and "self._state = 'active'" in
-                    inspect.getsourcelines(hil_lock)[0][n - 1])
+        lines = inspect.getsourcelines(hil_lock)[0]
+        line = next(n for _, _, n in code.co_lines() if n and lines[n - 1].strip() == source)
 
         def tracer(frame, event, arg):
             if frame.f_code is code:
@@ -2944,6 +2944,11 @@ class BoardTasks(LockDir):
                     signal.raise_signal(signal.SIGINT)
                 return tracer
             return None
+        return tracer
+
+    def test_finish_after_an_interrupt_left_enter_ends_it_as_a_refusal(self):
+        self.signals()
+        tracer = self.signal_at_enter_line("self._state = 'active'")
         collect = mock.Mock()
         task = self.task(verdict=collect)
         prev = sys.gettrace()
@@ -2983,18 +2988,7 @@ class BoardTasks(LockDir):
 
     def test_a_signal_as_enter_returns_leaves_an_empty_body_for_finish(self):
         self.signals()
-        code = hil_lock.BoardTask.__enter__.__code__
-        source = inspect.getsourcelines(hil_lock)[0]
-        line = next(n for _, _, n in code.co_lines() if n and source[n - 1].strip() == 'return self')
-
-        def tracer(frame, event, arg):
-            if frame.f_code is code:
-                if event == 'line' and frame.f_lineno == line:
-                    sys.settrace(None)
-                    frame.f_trace = None
-                    signal.raise_signal(signal.SIGINT)
-                return tracer
-            return None
+        tracer = self.signal_at_enter_line('return self')
         seen = []
 
         def collect(task, exc):

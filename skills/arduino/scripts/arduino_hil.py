@@ -1043,7 +1043,7 @@ def held_by(name, reason):
     if state == 'unreadable':   # is_locked reads the record, not the flock: the hold may still stand
         raise Refused(f'{name} has an unreadable holder record: whether {reason!r} holds it is unknown')
     # a protected task's record (cleanupOwed) is never a manual hold: one ended failed keeps it for the next take
-    if (state != 'record' or rec.get('reason') != reason or rec.get('cleanupOwed')
+    if (state != 'record' or rec.get('reason') != reason or rec.get(A.lock.CLEANUP_OWED)
             or not A.lock.holder_alive(rec)):
         raise NotHeld(f'{name} is not held under reason {reason!r} by a live holder (record: {rec})')
 

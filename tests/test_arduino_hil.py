@@ -13,7 +13,6 @@ if os.name == 'nt':
 import argparse
 import contextlib
 import hashlib
-import inspect
 import io
 import json
 import re
@@ -116,6 +115,8 @@ class FakeTask:
 
 
 class FakeLock:
+    CLEANUP_OWED = REAL.lock.CLEANUP_OWED
+
     class BoardLocked(Exception):
         pass
 

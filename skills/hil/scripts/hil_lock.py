@@ -880,7 +880,8 @@ class BoardTask:
         _own_fields(record_fields, CLEANUP_OWED, 'protected', 'locks', 'role')
         self.board, self.reason = board, reason
         self._busy, self._wait, self._allow_bypass, self._fields = busy, wait, allow_bypass, record_fields
-        self._collector, self._collected, self._collector_done, self._collector_failed = verdict, False, False, False
+        self._collector = verdict        # None once called: a retried _finish never reruns it
+        self._collector_why = None       # why the collector's verdict does not stand, once called
         self.cleanup_failures, self.errors, self.restore_notes = [], [], []
         self.bypassed = self.released = self.taken = False
         self.failure_logged = None
@@ -1017,8 +1018,7 @@ class BoardTask:
                 pending = pending or e
                 if self._state != start or start not in ('entering', 'active'):
                     break
-        if pending is not None and not (isinstance(exc, BaseException) and not isinstance(exc, Exception)
-                                        and not isinstance(pending, Exception)):
+        if pending is not None and (exc is None or isinstance(exc, Exception) or isinstance(pending, Exception)):
             raise pending
         return False
 
@@ -1030,7 +1030,8 @@ class BoardTask:
         finishing is dropped for the caller to re-raise its own."""
         if self._state == 'new':
             self._state = 'done'
-        self.__exit__(None if exc is None else type(exc), exc, None if exc is None else exc.__traceback__)
+            return
+        self.__exit__(None if exc is None else type(exc), exc, None)
 
     def report(self) -> dict:
         """The outcome attributes, describe() and copies of `errors` and `restore_notes`, for a
@@ -1041,7 +1042,7 @@ class BoardTask:
 
     def _verdict_at_end(self, exc):
         verdict = self._verdict
-        if self._collector_failed:
+        if self._collector_why is not None:
             verdict = self._collector_failure(verdict)
         if verdict is None:
             return ('failed', 'the task ended without a cleanup verdict'
@@ -1052,9 +1053,7 @@ class BoardTask:
 
     def _collector_failure(self, given):
         """The failed verdict a collector that did not finish, or gave none, ends its task on."""
-        why = 'did not finish' if not self._collector_done else 'gave no verdict'
-        if self._collector_done:
-            self.errors.append('verdict collector: gave no verdict')
+        why = self._collector_why
         if given is None:
             detail, receipts, retained = f'the verdict collector {why}', (), ()
         elif given[0] == 'failed':
@@ -1073,15 +1072,16 @@ class BoardTask:
         def guard(what, step, default=None):
             return _guarded(step, what, self.errors.append, interrupted, default)
         try:
-            if (self._state == 'active' and not refused and self._collector is not None and not self._collected
-                    and self._verdict is None):
-                self._collected = True       # before the call: a retried _finish never reruns it
-                self._collector_done = guard('verdict collector', lambda: (self._collector(self, exc), True)[1]) is True
-                self._collector_failed = not (self._collector_done and self._verdict is not None)
+            if self._state == 'active' and not refused and self._collector is not None and self._verdict is None:
+                collector, self._collector, self._collector_why = self._collector, None, 'did not finish'
+                if guard('verdict collector', lambda: (collector(self, exc), True)[1]):
+                    self._collector_why = None if self._verdict is not None else 'gave no verdict'
+                    if self._collector_why:
+                        self.errors.append('verdict collector: gave no verdict')
             if self._state in ('entering', 'active'):
                 self._state = 'ending'
                 self._end_on(guard, refused, exc)
-                if self._collector_failed:
+                if self._collector_why is not None:
                     self._as_verdict = False
                 self._state = 'closing'
         finally:
