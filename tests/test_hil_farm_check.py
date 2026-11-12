@@ -583,6 +583,43 @@ class Engine(unittest.TestCase):
                 self.assertEqual(fired, [where])
                 self.assert_pending_logged(row, retained=['/s/r1.json'])
 
+    def signal_past_the_reset(self, k):
+        """A real SIGINT, once, at the k-th line event of check_board's task body or _verdict, counted from the first
+        past check_board's reset: every point between the reset's end and its verdict, and after, until the task's own
+        except clauses. Returns the line it fired at."""
+        prev = signal.signal(signal.SIGINT, signal.default_int_handler)
+        self.addCleanup(signal.signal, signal.SIGINT, prev)
+        lines, first = inspect.getsourcelines(eng.check_board)
+        after = first + next(i for i, line in enumerate(lines) if line.strip() == '_reset(profile, ctx, board, row)')
+        end = first + next(i for i, line in enumerate(lines) if line.strip().startswith('except hil_lock.BoardBusy'))
+        codes, seen, fired = (eng.check_board.__code__, eng._verdict.__code__), [], []
+
+        def local(frame, event, arg):
+            board = frame.f_code is codes[0]
+            if event == 'line' and not fired and (seen or board and frame.f_lineno > after) \
+                    and not (board and frame.f_lineno >= end):
+                seen.append(frame.f_lineno)
+                if len(seen) > k:
+                    fired.append(frame.f_lineno)
+                    signal.raise_signal(signal.SIGINT)
+            return local
+        prev_trace = sys.gettrace()
+        sys.settrace(lambda frame, event, arg: local if frame.f_code in codes else None)
+        self.addCleanup(sys.settrace, prev_trace)
+        return fired
+
+    def test_a_signal_anywhere_from_the_resets_end_to_its_verdict_still_logs_the_ledgers_evidence(self):
+        for k in range(100):
+            with self.subTest(k=k):
+                self.pending_reset(retained=['/s/r1.json'])
+                fired = self.signal_past_the_reset(k)
+                row = self.check()
+                sys.settrace(None)
+                if not fired:
+                    break
+                self.assert_pending_logged(row, retained=['/s/r1.json'])
+        self.assertGreater(k, 3, 'the sweep reached past the verdict')
+
     def test_a_recheck_that_raises_keeps_the_receipts_and_retained_sessions(self):
         self.outcomes[RESET] = (0, 'pending', 'ok')
         self.retain_after_reset(['/s/r1.json'])

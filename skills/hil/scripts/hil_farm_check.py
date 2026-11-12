@@ -281,21 +281,21 @@ def check_board(profile, board: dict, args, state_dir) -> dict:
             entered = True
             _previous_failure(row, task.cleanup_failures)
             try:
-                _reset(profile, ctx, board, row)
-            finally:
-                # inline, as BoardTask.__exit__: a helper's entry is itself a point where a signal handler runs. The
-                # verdict comes from the ledger before the task unwinds: one interrupted before _verdict's hold is in
-                # (row['cleanup'] still None) is collected again, that interrupt raised once it is given
-                interrupted = None
+                try:
+                    _reset(profile, ctx, board, row)
+                finally:
+                    _verdict(task, ctx, row)
+            except KeyboardInterrupt:
+                # one from the reset's end until the verdict is given (row['cleanup'] still None), the finally's own
+                # first line included, lands here: the verdict comes from the ledger again, that interrupt raised once
+                # it is
                 while row['cleanup'] is None:
                     try:
                         _verdict(task, ctx, row)
-                    except KeyboardInterrupt as e:
+                    except KeyboardInterrupt:
                         if row['cleanup'] is not None:     # given: the hold replayed it
                             raise
-                        interrupted = interrupted or e
-                if interrupted is not None:
-                    raise interrupted
+                raise
     except hil_lock.BoardBusy as e:
         return _refused(row, task, 'locked', str(e))
     except hil_lock.RecoveryBlocked as e:

@@ -2106,6 +2106,11 @@ class Commission(Base):
         self.assertFalse(list(self.root.glob('build/hil-manual/commission-rig_jlink-*/result.json')))
 
 
+def in_function(frame, fn) -> bool:
+    """Whether frame runs fn or a function nested in it."""
+    return frame.f_code.co_qualname.split('.<locals>.')[0] == fn.__qualname__
+
+
 class BoardTaskOnTheRealLock(Base):
     """run_board and cmd_commission on agentrc's real hil_lock.board_task and hil_process, in a temp lock dir; the busy
     check (hil_flash.probe_users) stubbed."""
@@ -2223,12 +2228,73 @@ class BoardTaskOnTheRealLock(Base):
                 signal.raise_signal(signal.SIGINT)
             return local
         prev_trace = sys.gettrace()
-        sys.settrace(lambda frame, event, arg: local if frame.f_code is fn.__code__ else None)
+        sys.settrace(lambda frame, event, arg: local if in_function(frame, fn) else None)
         self.addCleanup(sys.settrace, prev_trace)
         return fired
 
-    def commission(self, detach):
-        """cmd_commission on rig_jlink, its DUT re-enumerating at each flash and reset; the interrupt propagates."""
+    def signal_past(self, fn, text, k):
+        """A real SIGINT, once, at the k-th line event of fn or its nested functions, counted from the first of fn's
+        own past its `text` line: every point between the body's end and its verdict, and after. Returns the line it
+        fired at; the tracer goes at cleanup."""
+        prev = signal.signal(signal.SIGINT, signal.default_int_handler)
+        self.addCleanup(signal.signal, signal.SIGINT, prev)
+        lines, first = inspect.getsourcelines(fn)
+        after = first + next(i for i, line in enumerate(lines) if line.strip() == text)
+        seen, fired = [], []
+
+        def local(frame, event, arg):
+            if event == 'line' and not fired and (seen or frame.f_code is fn.__code__ and frame.f_lineno > after):
+                seen.append(frame.f_lineno)
+                if len(seen) > k:
+                    fired.append(frame.f_lineno)
+                    signal.raise_signal(signal.SIGINT)
+            return local
+        prev_trace = sys.gettrace()
+        sys.settrace(lambda frame, event, arg: local if in_function(frame, fn) else None)
+        self.addCleanup(sys.settrace, prev_trace)
+        return fired
+
+    def test_a_signal_anywhere_from_the_batterys_end_to_its_verdict_still_logs_the_pending_child(self):
+        def step(*a):
+            a[-1]._note('unknown', None, ['JLinkExe'])
+            a[-1].check()
+        for k in range(100):
+            with self.subTest(k=k):
+                fired = self.signal_past(H.battery, "row['detail'] = f'a child outlived its operation: {e}'", k)
+                row = self.run_board(step=step)
+                sys.settrace(None)
+                if not fired:
+                    break
+                self.assertEqual((row['interrupted'], H.verdict(row), row['cleanup']['released']),
+                                 (True, 'blocker', True))
+                failure = REAL.lock.open_cleanup_failures('rig_jlink')[-1]
+                self.assertEqual([r['unrecheckable'] for r in failure['receipts']], [['JLinkExe']])
+                self.assertRegex(REAL.lock.resolve_restored('rig_jlink', [failure], evidence='restored')[0],
+                                 'stays open')
+                self.assert_released()
+        self.assertGreater(k, 3, 'the sweep reached past the verdict')
+
+    def test_a_signal_anywhere_from_a_commissions_end_to_its_verdict_still_logs_its_pending_child(self):
+        def detach(*a):
+            a[-1]._note('unknown', None, ['JLinkExe'])
+            a[-1].check()
+        for k in range(100):
+            with self.subTest(k=k):
+                fired = self.signal_past(H.commission, 'error = e', k)
+                self.commission(detach, interrupted=None)
+                if not fired:
+                    break
+                failure = REAL.lock.open_cleanup_failures('rig_jlink')[-1]
+                self.assertEqual((failure['detail'][:34], [r['unrecheckable'] for r in failure['receipts']]),
+                                 ('Unclean: JLinkExe: cleanup unknown', [['JLinkExe']]))
+                self.assertRegex(REAL.lock.resolve_restored('rig_jlink', [failure], evidence='restored')[0],
+                                 'stays open')
+                self.assert_released()
+        self.assertGreater(k, 3, 'the sweep reached past the verdict')
+
+    def commission(self, detach, interrupted=True):
+        """cmd_commission on rig_jlink, its DUT re-enumerating at each flash and reset; the interrupt propagates
+        (`interrupted` None: it may, or not)."""
         ino = [0]
 
         def bump(*a):
@@ -2239,7 +2305,8 @@ class BoardTaskOnTheRealLock(Base):
                 mock.patch.object(H, 'detach', detach), mock.patch.object(H, 'flash', bump), \
                 mock.patch.object(H, 'reset', bump), mock.patch.object(H.time, 'sleep'), \
                 mock.patch.object(H, 'scan', lambda *a: [{'serial': 'JUID', 'ino': ino[0]}]), \
-                contextlib.redirect_stdout(io.StringIO()), self.assertRaises(KeyboardInterrupt):
+                contextlib.redirect_stdout(io.StringIO()), \
+                self.assertRaises(KeyboardInterrupt) if interrupted else contextlib.suppress(KeyboardInterrupt):
             H.cmd_commission(args)
         sys.settrace(None)
 
