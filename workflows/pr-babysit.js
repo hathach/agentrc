@@ -332,8 +332,15 @@ const emitted = async (prompt, { label, inputDir, ...opts }) => {
 if (args.state != null && args.stateRef != null) throw new Error('pass state or stateRef, not both')
 const STATE_SCRIPT = `${AGENTRC}/skills/pr-babysit/scripts/state_transfer.py`
 // state_transfer.py's MAX, over its own measure: compact JSON with every non-ASCII UTF-16 unit escaped as \uXXXX.
-const STATE_MAX = 64 * 1024
+const STATE_MAX = 256 * 1024
 const stateBytes = (st) => { const s = JSON.stringify(st); return s.length + 5 * (s.match(/[^\x00-\x7e]/g) || []).length }
+// A state passed inline is one a model typed into the arguments: it keeps the bound a typed copy was given (62c54ae2),
+// measured before a stateRef load fills args.state.
+const INLINE_STATE_MAX = 64 * 1024
+if (args.state != null) {
+  const size = stateBytes(typeof args.state === 'string' ? JSON.parse(args.state) : args.state)
+  if (size > INLINE_STATE_MAX) throw new Error(`state passed inline is ${size} bytes, over ${INLINE_STATE_MAX}: pass the saved output as stateRef`)
+}
 // A stateRef load's reading of whether the session directory is the state's checkoutDir: state_transfer.py's sealed
 // checkout, null when its line has none; undefined for an inline state.
 let loadedCheckout

@@ -132,6 +132,33 @@ class StateTransferTest(unittest.TestCase):
             self.assertEqual(code, 2, argv)
             self.assertIn(message, out['error'], argv)
 
+    def at_size(self, size, unit):
+        """A state whose compact ASCII JSON is exactly size bytes, padded with unit (its escaped form one size)."""
+        escaped = len(json.dumps(unit)) - 2
+        state = {'digest': 'x', 'checkoutDir': '/repo', 'pad': ''}
+        room = size - len(json.dumps(state, ensure_ascii=True, separators=(',', ':')))
+        state['pad'] = unit * (room // escaped) + 'a' * (room % escaped)
+        self.assertEqual(len(json.dumps(state, ensure_ascii=True, separators=(',', ':'))), size)
+        return state
+
+    def test_a_state_loads_up_to_256_kib_measured_escaped_and_its_module_fits_a_workflow_script(self):
+        # #539: a stateRef state stopped at 64 KiB; the runtime refuses a Workflow script file over 524288 bytes
+        # (Claude Code 2.1.322), and the emitted module is the state plus its wrapper.
+        self.assertEqual(transfer.MAX, 256 * 1024)
+        for what, unit in (('ASCII', 'a'), ('escape-heavy', '\u2192\U0001F600"\\\n\x7f')):
+            with self.subTest(what):
+                at = self.dir / f'{what}.js'
+                state = self.at_size(transfer.MAX, unit)
+                file = self.saved(json.dumps({'result': {'state': state}}, ensure_ascii=False), f'{what}.output')
+                self.assertEqual(self.run_script(file, emit=at)[0], 0)
+                self.assertEqual(load(at)['line']['state'], state)
+                self.assertLess(at.stat().st_size, 524288)
+                self.assertLess(at.stat().st_size, transfer.MAX + 1024, 'the wrapper adds a few hundred bytes')
+                over = self.saved(json.dumps({'result': {'state': self.at_size(transfer.MAX + 1, unit)}}, ensure_ascii=False), f'{what}-over.output')
+                code, out = self.run_script(over)
+                self.assertEqual(code, 2)
+                self.assertEqual(out['error'], f'state too large: {transfer.MAX + 1} bytes (max {transfer.MAX})')
+
     @unittest.skipUnless(shutil.which('node'), 'needs Node.js')
     def test_an_error_line_is_emitted_too(self):
         at = self.dir / 'state.1.js'

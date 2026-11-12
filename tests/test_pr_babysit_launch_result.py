@@ -334,9 +334,9 @@ class LaunchResultTest(unittest.TestCase):
         self.assertFalse(any(b.startswith('orphaned-run recovery') for b in s['blockers']), 'none asked, none named')
 
     def test_a_state_too_large_to_load_is_a_blocker(self):
-        rc, s = self.run_it(output(result={'pass': True, 'status': 'complete', 'stateTooLarge': 70000,
+        rc, s = self.run_it(output(result={'pass': True, 'status': 'complete', 'stateTooLarge': 270000,
                                            'state': {'expectedHead': NEXT, 'cyclesUsed': 1, 'maxCycles': 5}}))
-        self.assertEqual(s['blockers'], ['the returned state is 70000 bytes, over the 65536 a launch loads: no launch can continue '
+        self.assertEqual(s['blockers'], ['the returned state is 270000 bytes, over the 262144 a launch loads: no launch can continue '
                                          'from it; keep the output file and report it, never reset or reconstruct the state'])
 
     def test_a_launch_stopped_at_load_is_a_blocker_and_keeps_the_state_it_was_given(self):
