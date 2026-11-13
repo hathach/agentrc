@@ -397,8 +397,9 @@ recovery stay the contract's. Linux only.
   the caller's step.
 - rc 0 means the tool reported success, not that the target runs the image;
   the project's own checks decide that. rc 124 from the default runner means
-  it killed the tool's process group on the timeout and reaped it for a
-  bounded grace: a survivor is abandoned, so 124 proves neither that every
+  it stopped the tool's process group on the timeout, SIGTERM and a short
+  grace before SIGKILL (an openocd SIGKILLed on a J-Link leaks its probe
+  registration), and reaped it for a bounded grace: a survivor is abandoned, so 124 proves neither that every
   descendant died nor that the board is in a known state. An `openocd_esp`
   timeout also returns 124; its `cleanup` says whether the session still
   ended (`done`) or a command was outstanding and the server was left running

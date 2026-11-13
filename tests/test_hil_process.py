@@ -175,7 +175,7 @@ class RunCmdModes(unittest.TestCase):
 class Stuck:
     """A child that never finishes: every communicate() times out, its bound kept in `waits`."""
     pid = 999999999
-    stdout = stderr = stdin = None
+    stdout = stderr = stdin = returncode = None
     waits = None
 
     def __init__(self, *a, **k):
@@ -214,7 +214,9 @@ class ExplicitBounds(unittest.TestCase):
             with mock.patch.object(hp.subprocess, 'Popen', Stuck), redirect_stdout(io.StringIO()), \
                     mock.patch.object(Stuck, 'waits', waits), mock.patch.object(hp.os, 'killpg'):
                 r = fn()
-            self.assertEqual((r.returncode, waits), (124, [3, 0.5]))
+            # the TERM wait (half of reap_grace, here cut short: the fake child is gone) and the
+            # post-SIGKILL reap share reap_grace
+            self.assertEqual((r.returncode, waits), (124, [3, 0.25]))
 
     def test_a_refused_kill_still_reaps_and_returns_124(self):
         """An all-root group refuses killpg AND p.kill(); a raise there skipped the bounded
@@ -226,7 +228,7 @@ class ExplicitBounds(unittest.TestCase):
         with mock.patch.object(hp.subprocess, 'Popen', RootOwned), mock.patch.object(RootOwned, 'waits', waits), \
                 mock.patch.object(hp.os, 'killpg', side_effect=PermissionError(1, 'Operation not permitted')):
             r = hp.run_alongside(['x'], lambda: None, 3, reap_grace=0.5)
-            self.assertEqual((r.returncode, waits), (124, [3, 0.5]))
+            self.assertEqual((r.returncode, waits), (124, [3, 0.25]))
             with self.assertRaisesRegex(AssertionError, 'the write failed'):
                 hp.run_alongside(['x'], boom, 3, reap_grace=0.5)
 
@@ -339,12 +341,16 @@ class RunCmdCleanupShape(unittest.TestCase):
 
     def test_both_cleanup_paths_kill_the_group(self):
         killers = self._calls(self._run_cmd_ast())
-        self.assertEqual(killers.count('_kill_group'), 2,
-                         'both the timeout and the BaseException path must kill the group')
+        self.assertEqual((killers.count('_stop_group'), killers.count('_stop_interrupted')), (1, 1),
+                         'both the timeout and the BaseException path must stop the group')
         self.assertEqual(killers.count('kill') + killers.count('killpg'), 0,
                          'p.kill() reaches only the direct child')
         group = self._calls(self._ast('_kill_group'))
         self.assertEqual((group.count('killpg'), group.count('kill')), (1, 0))
+        for name in ('_stop_group', '_stop_interrupted'):
+            calls = self._calls(self._ast(name))
+            self.assertEqual(calls.count('_kill_group'), 2, f'{name}: SIGTERM, then SIGKILL, of the group')
+            self.assertEqual(calls.count('kill') + calls.count('killpg'), 0, name)
 
     def test_the_interrupt_path_reraises(self):
         base = [h for n in ast.walk(self._run_cmd_ast()) if isinstance(n, ast.Try) for h in n.handlers
@@ -363,6 +369,237 @@ def _live_in_group(pgid: int) -> list:
         if st and st[1] not in 'ZX' and st[4] == str(pgid):
             live.append(int(d))
     return live
+
+
+# A child that answers SIGTERM as openocd does (`shutdown command invoked`), or ignores it.
+COOPERATIVE = ('import signal, sys, time\n'
+               'def bye(*_):\n'
+               '    print("shutdown command invoked", flush=True)\n'
+               '    open(sys.argv[1], "w").close()\n'
+               '    sys.exit(0)\n'
+               'signal.signal(signal.SIGTERM, bye)\n'
+               'print("ready", flush=True)\n'
+               'time.sleep(30)\n')
+DEAF = 'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); print("ready", flush=True); time.sleep(30)'
+
+
+@unittest.skipUnless(os.path.isdir('/proc'), 'reads process groups from /proc')
+class TermBeforeKill(unittest.TestCase):
+    """The group gets SIGTERM and TERM_GRACE (half of reap_grace) before SIGKILL, on the timeout and
+    on an interrupt (agentrc#296): a SIGKILLed openocd never unregisters from a J-Link."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.d, True)
+        self.marker = os.path.join(self.d, 'termed')
+        self.procs = []
+        real = subprocess.Popen
+
+        def spy(*a, **k):
+            self.procs.append(real(*a, **k))
+            return self.procs[-1]
+        patch = mock.patch.object(hp.subprocess, 'Popen', spy)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def _gone(self, pgid):
+        deadline = time.monotonic() + 5
+        while _live_in_group(pgid) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(_live_in_group(pgid), [], 'a group member outlived the stop')
+
+    def _interrupt_at(self, *delays):
+        """KeyboardInterrupt from SIGALRM at each of `delays` s from now."""
+        times = list(delays)
+        start = time.monotonic()
+
+        def alarm(*_):
+            if times:
+                signal.setitimer(signal.ITIMER_REAL, max(0.001, start + times.pop(0) - time.monotonic()))
+            raise KeyboardInterrupt
+        prev = signal.signal(signal.SIGALRM, alarm)
+        self.addCleanup(signal.signal, signal.SIGALRM, prev)
+        self.addCleanup(signal.setitimer, signal.ITIMER_REAL, 0)
+        signal.setitimer(signal.ITIMER_REAL, times.pop(0))
+
+    def test_a_timeout_lets_a_cooperative_child_shut_down(self):
+        t0 = time.monotonic()
+        with redirect_stdout(io.StringIO()):
+            r = hp.run_cmd([sys.executable, '-c', COOPERATIVE, self.marker], timeout=1)
+        self.assertEqual(r.returncode, 124)
+        self.assertIn('shutdown command invoked', r.stdout)
+        self.assertTrue(os.path.exists(self.marker))
+        self.assertLess(time.monotonic() - t0, 1 + hp.TERM_GRACE, 'it waited out the whole TERM grace')
+        self._gone(self.procs[0].pid)
+
+    def test_a_timeout_kills_a_child_that_ignores_the_term_after_the_grace(self):
+        t0 = time.monotonic()
+        with redirect_stdout(io.StringIO()):
+            r = hp.run_cmd([sys.executable, '-c', DEAF], timeout=0.5, reap_grace=1)
+        took = time.monotonic() - t0
+        self.assertEqual(r.returncode, 124)
+        self.assertGreaterEqual(took, 0.5 + hp._term_wait(1) - 0.05)
+        self.assertLess(took, 0.5 + 1 + 1)
+        self._gone(self.procs[0].pid)
+
+    def test_a_member_left_after_the_leader_exits_is_killed(self):
+        cmd = '(trap "" TERM; exec sleep 30) </dev/null >/dev/null 2>&1 & exec sleep 30'
+        with redirect_stdout(io.StringIO()):
+            r = hp.run_cmd(cmd, timeout=0.5, reap_grace=1)
+        self.assertEqual(r.returncode, 124)
+        self._gone(self.procs[0].pid)       # the member is in the leader's group
+
+    def test_a_member_left_after_the_leader_exits_gets_its_grace(self):
+        """A cooperative member that keeps no pipe still gets its TERM grace once the leader is gone."""
+        pidfile = os.path.join(self.d, 'gc')
+        cmd = (f'(trap "sleep 0.5; : > {self.marker}; exit 0" TERM; sleep 30 & wait) </dev/null >/dev/null 2>&1 & '
+               f'echo $! > {pidfile}; exec sleep 30')
+        with redirect_stdout(io.StringIO()):
+            r = hp.run_cmd(cmd, timeout=0.5)
+        self.assertEqual(r.returncode, 124)
+        self.assertTrue(os.path.exists(self.marker), 'the member was SIGKILLed inside its TERM grace')
+        self._gone(self.procs[0].pid)
+
+    def test_the_leader_stays_unreaped_until_the_kill(self):
+        """Its zombie keeps the pgid ours: a group the SIGKILL targets cannot be another's."""
+        seen = []
+        real = hp._kill_group
+
+        def spy(p, sig=signal.SIGKILL):
+            seen.append((sig, p.returncode))
+            real(p, sig)
+        with mock.patch.object(hp, '_kill_group', spy), redirect_stdout(io.StringIO()):
+            hp.run_cmd([sys.executable, '-c', COOPERATIVE, self.marker], timeout=0.5)
+            self._interrupt_at(0.5)
+            with self.assertRaises(KeyboardInterrupt):
+                hp.run_cmd([sys.executable, '-c', COOPERATIVE, self.marker], timeout=30)
+        self.assertEqual(seen, [(signal.SIGTERM, None), (signal.SIGKILL, None)] * 2)
+
+    def test_an_interrupt_in_run_alongsides_timeout_stop_kills_at_once(self):
+        self._interrupt_at(0.8)
+        t0 = time.monotonic()
+        with self.assertRaises(KeyboardInterrupt):
+            hp.run_alongside([sys.executable, '-c', DEAF], lambda: None, 0.3)
+        self.assertLess(time.monotonic() - t0, 0.3 + hp.TERM_GRACE - 1, 'the interrupt restarted the TERM wait')
+        p = self.procs[0]
+        self._gone(p.pid)
+        self.assertTrue(p.stdout.closed, 'our pipe ends leaked')
+
+    def test_a_member_whose_leader_thread_exited_gets_its_grace(self):
+        """A zombie thread-group leader with a live thread is a live member (delay_group_leader)."""
+        prog = ('import ctypes, os, signal, sys, threading, time\n'
+                'signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})\n'
+                'def worker():\n'
+                '    signal.sigwait({signal.SIGTERM})\n'
+                '    time.sleep(0.5)\n'
+                '    open(sys.argv[1], "w").close()\n'
+                '    os._exit(0)\n'
+                'threading.Thread(target=worker).start()\n'
+                'ctypes.CDLL(None).pthread_exit(None)\n')
+        cmd = f'{shlex.join([sys.executable, "-c", prog, self.marker])} </dev/null >/dev/null 2>&1 & exec sleep 30'
+        with redirect_stdout(io.StringIO()):
+            r = hp.run_cmd(cmd, timeout=0.5)
+        self.assertEqual(r.returncode, 124)
+        self.assertTrue(os.path.exists(self.marker), 'the live thread was SIGKILLed inside its TERM grace')
+        self._gone(self.procs[0].pid)
+
+    def test_an_emptied_group_whose_leader_was_reaped_is_not_signalled(self):
+        """CPython's communicate() reaps a leader that exits in its SIGINT wait: its pgid is then ours
+        only while a member lives, so a group the look shows empty gets no signal; one it shows
+        live, or a look that cannot tell, gets the stop."""
+        for look, signalled in ((False, False), (True, True), (None, True)):     # None: a look past its bound
+            self._interrupt_at(0.3)
+            with mock.patch.object(hp, '_bounded', return_value=look), mock.patch.object(hp, 'TERM_GRACE', 0.2), \
+                    mock.patch.object(hp.os, 'killpg') as k, self.assertRaises(KeyboardInterrupt):
+                hp.run_cmd([sys.executable, '-c', 'import time; time.sleep(0.4)'], timeout=30)
+            p = self.procs[-1]
+            self.assertEqual(p.returncode, 0, 'the leader was not reaped by the interrupt: no case to test')
+            self.assertEqual(k.called, signalled, look)
+
+    def test_a_reaped_leaders_live_member_is_stopped(self):
+        self._interrupt_at(0.3)
+        with self.assertRaises(KeyboardInterrupt):
+            hp.run_cmd('sleep 30 </dev/null >/dev/null 2>&1 & exec sleep 0.4', timeout=30)
+        p = self.procs[-1]
+        self.assertEqual(p.returncode, 0, 'the leader was not reaped by the interrupt: no case to test')
+        self._gone(p.pid)
+
+    def _slow_scan(self, delay):
+        real = hp._group_survivors
+
+        def slow(pgid):
+            time.sleep(delay)
+            return real(pgid)
+        patch = mock.patch.object(hp, '_group_survivors', slow)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_a_look_that_missed_a_member_still_sigkills_an_unreaped_leaders_group(self):
+        """A /proc look is evidence, not proof: one that missed a member forked during it must not
+        spare the group while the unreaped leader keeps its pgid ours."""
+        with mock.patch.object(hp, '_group_survivors', return_value=False):
+            self._interrupt_at(0.5)
+            with self.assertRaises(KeyboardInterrupt):
+                hp.run_cmd('(trap "" TERM; exec sleep 30) </dev/null >/dev/null 2>&1 & exec sleep 30', timeout=30)
+        p = self.procs[0]
+        self.assertIsNone(p.returncode)
+        self._gone(p.pid)
+
+    def test_a_second_interrupt_in_the_first_look_still_kills_and_closes(self):
+        self._slow_scan(1)
+        self._interrupt_at(0.3, 0.6)
+        with self.assertRaises(KeyboardInterrupt):
+            hp.run_cmd('sleep 30 </dev/null >/dev/null 2>&1 & exec sleep 0.4', timeout=30)
+        p = self.procs[0]
+        self.assertEqual(p.returncode, 0, 'the leader was not reaped by the interrupt: no case to test')
+        self._gone(p.pid)
+        self.assertTrue(p.stdout.closed, 'our pipe ends leaked')
+
+    def test_the_looks_stay_inside_the_budget(self):
+        self._slow_scan(1)
+        p = subprocess.Popen(['sleep', '30'], start_new_session=True, stdout=subprocess.PIPE)
+        self.addCleanup(lambda: (p.kill(), p.wait()))
+        t0 = time.monotonic()
+        hp._stop_interrupted(p, 0)
+        self.assertLess(time.monotonic() - t0, 0.5)
+        p.wait(5)
+        self.assertIn(p.returncode, (-signal.SIGTERM, -signal.SIGKILL))
+        q = subprocess.Popen(['sleep', '0.1'], start_new_session=True, stdout=subprocess.PIPE)
+        q.wait()
+        t0 = time.monotonic()
+        hp._stop_interrupted(q, 0)
+        self.assertLess(time.monotonic() - t0, 0.5)
+
+    def test_a_zero_reap_grace_kills_at_once(self):
+        t0 = time.monotonic()
+        with redirect_stdout(io.StringIO()):
+            r = hp.run_cmd([sys.executable, '-c', DEAF], timeout=0.5, reap_grace=0)
+        self.assertEqual(r.returncode, 124)
+        self.assertLess(time.monotonic() - t0, 2)
+        self._gone(self.procs[0].pid)
+
+    def test_an_interrupt_lets_a_cooperative_child_shut_down(self):
+        for run in (lambda: hp.run_cmd([sys.executable, '-c', COOPERATIVE, self.marker], timeout=30),
+                    lambda: hp.run_alongside([sys.executable, '-c', COOPERATIVE, self.marker], lambda: None, 30)):
+            with suppress(FileNotFoundError):
+                os.unlink(self.marker)
+            self._interrupt_at(0.5)
+            with self.assertRaises(KeyboardInterrupt):
+                run()
+            self.assertTrue(os.path.exists(self.marker), 'the interrupt SIGKILLed before the TERM ran')
+            p = self.procs[-1]
+            self._gone(p.pid)
+            self.assertTrue(p.stdout.closed, 'our pipe ends leaked')
+
+    def test_a_second_interrupt_cuts_the_term_wait_short(self):
+        self._interrupt_at(0.3, 0.6)
+        t0 = time.monotonic()
+        with self.assertRaises(KeyboardInterrupt):
+            hp.run_cmd([sys.executable, '-c', DEAF], timeout=30)
+        self.assertLess(time.monotonic() - t0, 0.3 + hp.TERM_GRACE - 1)
+        p = self.procs[0]
+        self._gone(p.pid)
+        self.assertTrue(p.stdout.closed, 'our pipe ends leaked')
 
 
 @unittest.skipUnless(os.path.isdir('/proc'), 'reads process groups from /proc')
@@ -497,8 +734,9 @@ class InterruptAcrossTheFork(unittest.TestCase):
 
     @contextmanager
     def _never_reaped(self):
-        """A deferred interrupt is killed at once: no reap waits out the timeout first. Enter
-        it before _popen_hook, which replaces subprocess.Popen."""
+        """A deferred interrupt is stopped without a reap: none waits out the timeout first (its
+        SIGTERM wait polls the group, never communicate). Enter it before _popen_hook, which
+        replaces subprocess.Popen."""
         with mock.patch.object(subprocess.Popen, 'communicate', autospec=True,
                                side_effect=subprocess.Popen.communicate) as comm:
             yield
@@ -1331,6 +1569,25 @@ class RunTracked(unittest.TestCase):
         self.assertEqual((killed['cleanup'], killed['receipt']), ('done', None))
         self.assertLess(killed['took'], 10)
         self.assertEqual((escaped['cleanup'], escaped['before'], escaped['after']), ('pending', 'pending', 'done'))
+
+    def test_an_interrupt_and_a_timeout_let_a_cooperative_child_shut_down(self):
+        """The supervisor stops the group as run_cmd does: SIGTERM first (agentrc#296)."""
+        res = self.child(f"""
+            def alarm(*_):
+                raise KeyboardInterrupt
+            signal.signal(signal.SIGALRM, alarm)
+            prog = {COOPERATIVE!r}
+            signal.setitimer(signal.ITIMER_REAL, 1.0)
+            try:
+                hp.run_tracked([sys.executable, '-c', prog, D + '/a'], timeout=30, settle=0.5, state_dir=S)
+                a = 'not interrupted'
+            except KeyboardInterrupt as e:
+                a = [e.cleanup, os.path.exists(D + '/a')]
+            r = hp.run_tracked([sys.executable, '-c', prog, D + '/b'], timeout=1, settle=0.5, state_dir=S, quiet=True)
+            report(a=a, b=[r.returncode, r.cleanup, 'shutdown command invoked' in r.stdout, os.path.exists(D + '/b')])
+        """)
+        self.assertEqual(res['a'], ['done', True])
+        self.assertEqual(res['b'], [124, 'done', True, True])
 
     def test_an_interrupt_during_spawn_still_reaches_the_operation(self):
         res = self.child("""
