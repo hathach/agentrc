@@ -40,6 +40,7 @@ def api_flags(args):
         token = args[i]
         if token.startswith('--'):
             name, eq, value = token.partition('=')
+            eq = bool(eq)
         elif token.startswith('-') and len(token) > 1:
             # A shorthand takes its value attached, after an optional `=`, or as the next token.
             name, value = token[:2], token[2:]
@@ -50,7 +51,7 @@ def api_flags(args):
                 return None
             endpoint, i = token, i + 1
             continue
-        if name in BARE and not eq and name == token:
+        if name in BARE and name == token:
             i += 1
         elif name in VALUED:
             if not eq:
