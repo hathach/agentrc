@@ -900,7 +900,11 @@ def _live_evidence(receipts, retained) -> list:
 
 
 def _live_survivors(receipt) -> list:
+    """The pids among the receipt's `survivors` still alive: a list of pids or {pid, start} (hil_reserve's), or
+    hil_process's survey {processes: [{pid, ...}], unreadable: [pid]}, a pid it could not read counted as a survivor."""
     survivors = receipt.get('survivors') if isinstance(receipt, dict) else None
+    if isinstance(survivors, dict):
+        survivors = [*(survivors.get('processes') or []), *(survivors.get('unreadable') or [])]
     live = []
     for s in survivors if isinstance(survivors, list) else []:
         pid, start = (s.get('pid'), s.get('start')) if isinstance(s, dict) else (s, None)

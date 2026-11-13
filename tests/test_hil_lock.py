@@ -2178,12 +2178,18 @@ class OperatorResolution(LockDir):
         session = Path(self.dir, 'session.json')
         session.write_text(json.dumps({'tool': 'hil_openocd_esp', 'pid': me['pid'], 'startTime': me['start'],
                                        'closed': False}))
+        survey = hil_lock._process()._survey(os.getppid())     # what a supervisor reports: this process among them
+        self.assertIn(os.getpid(), [p['pid'] for p in survey['processes']])
         states = {'pending-op': 'pending'}
         self.patch(hil_lock, '_process', lambda: types.SimpleNamespace(recheck=lambda r: states.get(r.get('token'),
                                                                                                     'unknown')))
         live = {'pending receipt': {'receipts': [{'token': 'pending-op'}]},
                 'live survivor': {'receipts': [{'unrecheckable': ['x'], 'survivors': [me]}]},
                 'live bare pid': {'receipts': [{'unrecheckable': ['x'], 'survivors': [me['pid']]}]},
+                # run_tracked's pending receipt: survivors as its supervisor's survey reported them
+                'surveyed process': {'receipts': [{'token': 'unknown-op', 'survivors': survey}]},
+                'unreadable survey entry': {'receipts': [{'token': 'unknown-op', 'survivors': {
+                    'processes': [], 'unreadable': [me['pid']]}}]},
                 'running session': {'retained': [str(session)]},
                 'journal receipt': {'task': {'role': hil_lock.CLEANUP_ROLE, 'reason': 'takeover'},
                                     'journal': {'token': 't', 'prior': None, 'predecessor': json.dumps(
@@ -2202,11 +2208,14 @@ class OperatorResolution(LockDir):
         session.write_text(json.dumps({'tool': 'hil_openocd_esp', 'pid': me['pid'], 'startTime': me['start'],
                                        'closed': True}))
         for evidence in ({'receipts': [{'unrecheckable': ['x'], 'survivors': [{**me, 'start': '1'}]}]},
+                         {'receipts': [{'token': 'x', 'survivors': {'processes': [{'pid': 999999999}],
+                                                                    'unreadable': [999999998]}}]},
+                         {'receipts': [{'token': 'x', 'survivors': None}]},
                          {'receipts': [{'token': 'gone'}, 'not a receipt']}, {'retained': ['/no/such.json']}):
             fid = secrets.token_hex(8)
             hil_lock._log_append(BOARD, {'event': 'failed', 'id': fid, **evidence})
             self.assertEqual(self.resolve(fid)[0], 0, evidence)
-        still = [fids['live survivor'], fids['live bare pid']]     # this process, alive
+        still = [fids[k] for k in ('live survivor', 'live bare pid', 'surveyed process', 'unreadable survey entry')]
         for fid in self.open_ids():
             self.assertEqual(self.resolve(fid)[0], 1 if fid in still else 0, fid)
         self.assertEqual(self.open_ids(), still)
