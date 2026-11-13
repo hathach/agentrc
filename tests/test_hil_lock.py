@@ -2210,6 +2210,33 @@ class OperatorResolution(LockDir):
             self.assertEqual(self.resolve(fid)[0], 1 if fid in still else 0, fid)
         self.assertEqual(self.open_ids(), still)
 
+    def test_a_journal_not_read_whole_or_a_live_journal_holder_refuses(self):
+        """A takeover journal link that cannot be read drops every record before it too: refused, never resolved on
+        what remains; a holder the journal kept that still runs is live evidence."""
+        me = {'role': hil_lock.CLEANUP_ROLE, 'pid': os.getpid(), 'start': hil_lock.proc_start(os.getpid())}
+        task = {'role': hil_lock.CLEANUP_ROLE, 'reason': 'takeover'}
+        cases = {'cannot be read': {'token': 't', 'predecessor': json.dumps(me), 'prior': {}},
+                 'holder pid': {'token': 't', 'predecessor': json.dumps(me), 'prior': None}}
+        for says, journal in cases.items():
+            with self.subTest(says=says):
+                fid = secrets.token_hex(8)
+                hil_lock._log_append(BOARD, {'event': 'failed', 'id': fid, 'how': 'found-left', 'task': task,
+                                             'journal': journal})
+                rc, text = self.resolve(fid)
+                self.assertEqual(rc, 1)
+                self.assertIn(says, text)
+                self.assertIn(fid, self.open_ids())
+        fid = secrets.token_hex(8)
+        hil_lock._log_append(BOARD, {'event': 'failed', 'id': fid, 'receipts': 'r'})
+        rc, text = self.resolve(fid)
+        self.assertEqual(rc, 1)
+        self.assertIn('its evidence is malformed', text)
+        gone = {**me, 'start': '1'}       # the same pid, another start: not the holder the journal kept
+        fid = secrets.token_hex(8)
+        hil_lock._log_append(BOARD, {'event': 'failed', 'id': fid, 'how': 'found-left', 'task': task,
+                                     'journal': {'token': 't', 'predecessor': json.dumps(gone), 'prior': None}})
+        self.assertEqual(self.resolve(fid)[0], 0)
+
     def test_a_helper_that_cannot_load_or_a_restoration_meanwhile_refuses(self):
         fid = self.failure(receipts=[{'unrecheckable': ['x']}])
         with mock.patch.object(hil_lock, '_process', side_effect=ImportError('no hil_process')):
@@ -2308,7 +2335,11 @@ class OperatorResolution(LockDir):
                 ('fsync', mock.patch.object(hil_lock.os, 'fsync', side_effect=OSError(errno.EIO, 'fsync failed')),
                  OSError),
                 ('owner', mock.patch.object(hil_lock.os, 'geteuid', return_value=os.geteuid() + 1),
-                 hil_lock.LogRefused)):
+                 hil_lock.LogRefused),
+                ('group', mock.patch.multiple(hil_lock.os, getegid=mock.Mock(return_value=os.stat(self.log).st_gid + 1),
+                                              getgroups=mock.Mock(return_value=[])), hil_lock.LogRefused),
+                ('fchown', mock.patch.object(hil_lock.os, 'fchown', side_effect=PermissionError(errno.EPERM, 'no')),
+                 PermissionError)):
             with self.subTest(name=name):
                 with patch, self.assertRaises(error):
                     hil_lock.compact_cleanup_log(BOARD)

@@ -847,11 +847,12 @@ def acknowledge_failure(board, failure_id, reason) -> dict:
     """An operator's resolution of the board's open failure `failure_id` (`hil_lock.py resolve`):
     an `acknowledged` event with `reason`, which closes it as `restored` does but is never evidence
     the board was restored; automated callers use resolve_restored. LogRefused, nothing logged, for
-    a blank reason, a failure the log does not hold or one already closed, and while its evidence
-    is known still live (_live_evidence, rechecked as the caller, so run it as the user whose runs
-    they are) or hil_process, which rechecks it, cannot be loaded; evidence that cannot be
-    rechecked is the operator's to judge. OSError or TimeoutError when the log cannot be read or
-    written."""
+    a blank reason, a failure the log does not hold or one already closed, while its evidence is
+    known still live (_live_evidence, rechecked as the caller, so run it as the user whose runs
+    they are, and a holder its takeover journal kept still running), and when it cannot be read
+    whole (a takeover journal with a link that cannot be read, evidence that is not a list) or
+    hil_process, which rechecks it, cannot be loaded. A run whose receipt cannot be rechecked is
+    the operator's to judge. OSError or TimeoutError when the log cannot be read or written."""
     reason = reason.strip() if isinstance(reason, str) else ''
     if not reason:
         raise LogRefused('a reason is required')
@@ -872,9 +873,16 @@ def acknowledge_failure(board, failure_id, reason) -> dict:
         return failed
     live = []
     for f in still_open(cleanup_events(board)):
-        # an unreadable takeover journal leaves its own evidence to recheck
-        receipts, retained = _failure_evidence(f) or _failure_evidence({k: v for k, v in f.items() if k != 'journal'})
-        live += _live_evidence(*(sum((x for x in xs if isinstance(x, list)), []) for xs in (receipts, retained)))
+        found = _failure_evidence(f)
+        if found is None:
+            raise LogRefused(f'{failure_id} stays open: its takeover journal cannot be read, so neither can all of '
+                             f'its evidence')
+        receipts, retained = found
+        if not all(isinstance(x, list) for x in receipts + retained):
+            raise LogRefused(f'{failure_id} stays open: its evidence is malformed')
+        live += _live_evidence(sum(receipts, []), sum(retained, []))
+        held = _journal_records(f['journal']) if 'journal' in f else []
+        live += [f'takeover journal holder pid {pid} running' for pid in _live_survivors({'survivors': held})]
     if live:
         raise LogRefused(f'{failure_id} stays open: its evidence is still live: {"; ".join(live)}')
     return _log_append(board, {'event': 'acknowledged', 'failure': failure_id, 'reason': reason,
@@ -928,7 +936,8 @@ def compact_cleanup_log(board) -> dict:
     written and fsynced, renamed over the log and the dir fsynced, so the only copy is never
     truncated and the mutex is untouched; a failed step leaves the log as it was. Nothing is
     rewritten when nothing is closed. LogRefused, nothing changed, for a whole line that is not a
-    JSON object or a log of another owner; OSError or TimeoutError when it cannot be done.
+    JSON object, a log of another owner or, but as root, of a group the caller is not in; OSError
+    or TimeoutError when it cannot be done.
     Returns {'dropped': events dropped, 'kept': events kept}."""
     with contextlib.ExitStack() as stack:
         try:
@@ -964,14 +973,16 @@ def _compact(board, dfd, st, data) -> dict:
     euid = os.geteuid()
     if euid not in (0, st.st_uid):
         raise LogRefused(f'{name} is owned by uid {st.st_uid}: compact it as that user or root')
+    if euid and st.st_gid not in (os.getegid(), *os.getgroups()):
+        raise LogRefused(f'{name} has group {st.st_gid}, which uid {euid} cannot give its replacement: compact it '
+                         f'as root')
     keep = [line for line, e in zip(lines, events) if names(e) not in closed]
     tmp = f'.{name}.{secrets.token_hex(4)}.tmp'
     tfd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dfd)
     try:
         try:
             _write_all(tfd, b''.join(keep))
-            with contextlib.suppress(PermissionError) if euid else contextlib.nullcontext():
-                os.fchown(tfd, st.st_uid, st.st_gid)      # an owner outside the log's group keeps its own
+            os.fchown(tfd, st.st_uid, st.st_gid)
             os.fchmod(tfd, stat.S_IMODE(st.st_mode))
             os.fsync(tfd)
         finally:
