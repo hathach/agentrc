@@ -49,33 +49,22 @@ reliably, so a duplicate is preferred to a missed review.
 """
 
 import json
-import os
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from coderabbit_trigger import Failed, pull_at  # noqa: E402
-from facts import FULL_SHA, Parser, Unusable, attempt, bind_repo, git, locked, report, utc  # noqa: E402
+from facts import FULL_SHA, Parser, Unusable, attempt, bind_repo, locked, read_record, record_dir, report, utc, write_record  # noqa: E402
 from harvest import gh_json, head_event, newest, pages, stamp  # noqa: E402
-sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
-import windows  # noqa: E402
 
 REQUEST = '@greptileai'
 
 
-def record_dir():
-    common = Path(git('rev-parse', '--path-format=absolute', '--git-common-dir').strip())
-    return common / 'pr-babysit' / 'greptile'
-
-
 def read(path):
-    try:
-        record = json.loads(path.read_text(encoding='utf-8'))
-    except FileNotFoundError:
+    record = read_record(path)
+    if record is None:
         return None
-    except (OSError, ValueError) as e:
-        raise Unusable(f'attempt record {path} unreadable: {e}')
     if not isinstance(record, dict) or not isinstance(record.get('seen'), list) or not isinstance(record.get('claimedAt'), str):
         raise Unusable(f'attempt record {path} is not one this script wrote')
     return record
@@ -84,18 +73,14 @@ def read(path):
 def claim(path, seen):
     record = {'claimedAt': utc(time.time()), 'seen': seen}
     try:
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        write_record(path, record, new=True)
     except FileExistsError:
         raise Unusable(f'attempt record {path} appeared under the lock: another writer ignores it')
-    with os.fdopen(fd, 'w', encoding='utf-8') as f:
-        json.dump(record, f)
     return record
 
 
 def receipt(path, record, comment, at):
-    tmp = path.with_name(path.name + '.tmp')
-    tmp.write_text(json.dumps({**record, 'receipt': {'id': comment, 'at': at}}), encoding='utf-8')
-    windows.replace(tmp, path)  # Windows: retried while another process has the record open
+    write_record(path, {**record, 'receipt': {'id': comment, 'at': at}})
 
 
 def asks(pr):
@@ -139,7 +124,7 @@ def claimed(pr, head):
     if why:
         return {'outcome': 'notOpen', 'detail': why}
     repo = pull['base']['repo']['full_name']
-    path = record_dir() / f"{repo.replace('/', '-')}-{pr}-{head}.json"
+    path = record_dir('greptile') / f"{repo.replace('/', '-')}-{pr}-{head}.json"
     with locked(path):
         record = read(path)
         if record and record.get('receipt'):

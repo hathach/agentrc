@@ -81,7 +81,7 @@ class Trigger(unittest.TestCase):
     def run_with(self, rig):
         out = io.StringIO()
         with mock.patch.object(trigger, 'attempt', rig.attempt), mock.patch.object(harvest, 'run', rig.run), \
-                mock.patch.object(trigger, 'record_dir', lambda: self.dir), redirect_stdout(out):
+                mock.patch.object(trigger, 'record_dir', lambda kind: self.dir), redirect_stdout(out):
             code = trigger.report(trigger.collect, ['--pr', '7', '--head', HEAD, '--repo', 'o/r'], seal=True)
         return code, json.loads(out.getvalue())
 
@@ -216,12 +216,12 @@ class Trigger(unittest.TestCase):
             code, out = self.run_with(rig)
         self.assertEqual((code, out['outcome'], out['phase']), (0, 'failed', 'read'))
         self.assertIn('workflow .github/workflows/ci.yml at aaaaaaaaa could not be read (gh api: HTTP 503)', out['detail'])
-        self.assertEqual(len(reads), 2 * (1 + len(harvest.gh_retry.WAITS)), 'read twice, each made again on its 503')
+        self.assertEqual(len(reads), 1 + len(harvest.gh_retry.WAITS), 'made again on its 503 by gh_retry alone, never twice over')
         self.assertEqual(rig.posts, [])
         self.assertFalse((self.dir / f'o-r-7-{HEAD}.json').exists(), 'nothing claimed')
         fresh = unreadable(Rig(runs=(dict(RUN, event='pull_request'),)))
         self.assertEqual(self.run_with(fresh)[1]['outcome'], 'requested', 'with no request standing the head time is not needed')
-        self.assertEqual(len(reads), 2 * (1 + len(harvest.gh_retry.WAITS)), 'nor read')
+        self.assertEqual(len(reads), 1 + len(harvest.gh_retry.WAITS), 'nor read')
 
     def failing(self, rig, path, error, times=None):
         """rig with each GET of path failing with error, the first times of them only when times is given; the reads made."""
@@ -303,7 +303,7 @@ class Trigger(unittest.TestCase):
         def one():
             outs.append(trigger.collect(['--pr', '7', '--head', HEAD, '--repo', 'o/r']))
         with mock.patch.object(trigger, 'attempt', rig.attempt), mock.patch.object(harvest, 'run', rig.run), \
-                mock.patch.object(trigger, 'record_dir', lambda: self.dir):
+                mock.patch.object(trigger, 'record_dir', lambda kind: self.dir):
             threads = [threading.Thread(target=one) for _ in range(2)]
             for t in threads:
                 t.start()

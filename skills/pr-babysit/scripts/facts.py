@@ -136,13 +136,30 @@ def checkout_top():
     return top
 
 
+class Busy(Unusable):
+    """Another process held the lock past the wait asked for."""
+
+
 @contextmanager
-def locked(path):
-    """path's .lock beside it held exclusively for the block, waiting while another process holds it."""
+def locked(path, timeout=None):
+    """path's .lock beside it held exclusively for the block, waiting while another process holds it: for good, or up
+    to timeout seconds, then Busy."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path.with_suffix('.lock'), 'a') as fd:
+    lock = path.with_suffix('.lock')
+    deadline = None if timeout is None else time.monotonic() + timeout
+
+    def wait():
+        if deadline is not None and time.monotonic() >= deadline:
+            raise Busy(f'{lock} stayed held by another process for {timeout:.0f} seconds')
+        time.sleep(0.05)
+    with open(lock, 'a') as fd:
         if fcntl:
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | (0 if deadline is None else fcntl.LOCK_NB))
+                    break
+                except BlockingIOError:
+                    wait()
             yield
         else:
             # msvcrt locks are mandatory and per handle: lock a byte past the content; LK_LOCK gives up after ~10 s.
@@ -154,13 +171,63 @@ def locked(path):
                 except OSError as e:
                     if e.errno not in (errno.EACCES, errno.EDEADLOCK):
                         raise
-                    time.sleep(0.05)
+                    wait()
             try:
                 yield
             finally:
                 # Windows may release a closed handle's lock only after a delay.
                 os.lseek(fd.fileno(), 1 << 30, os.SEEK_SET)
                 msvcrt.locking(fd.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+def fsync_dir(path):
+    """path's entries on disk: a file created or renamed in it survives a host crash (POSIX; Windows has no such call)."""
+    if os.name == 'nt':
+        return
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def record_dir(kind):
+    """pr-babysit/<kind> under the checkout's git common dir, where a script keeps the records of what it sent; each
+    directory made for it durable in its parent."""
+    path = Path(git('rev-parse', '--path-format=absolute', '--git-common-dir').strip()) / 'pr-babysit' / kind
+    missing, p = [], path
+    while not p.exists():
+        missing.append(p)
+        p = p.parent
+    path.mkdir(parents=True, exist_ok=True)
+    for made in reversed(missing):
+        fsync_dir(made.parent)
+    return path
+
+
+def read_record(path):
+    """The JSON record at path, None when there is none; Unusable when it does not read. Its shape is the caller's."""
+    try:
+        return json.loads(path.read_text(encoding='utf-8'))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        raise Unusable(f'attempt record {path} unreadable: {e}')
+
+
+def write_record(path, record, new=False):
+    """record on disk, durably, before anything acts on it: a new one created exclusively (FileExistsError when one is
+    there), a later one replaced whole through path.tmp; the file fsynced, then its directory, so a step written before
+    its request never reverts after a host crash while the request landed."""
+    target = path if new else path.with_name(path.name + '.tmp')
+    fd = os.open(target, os.O_CREAT | os.O_WRONLY | (os.O_EXCL if new else os.O_TRUNC))
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        json.dump(record, f)
+        f.flush()
+        os.fsync(f.fileno())
+    if not new:
+        windows.replace(target, path)  # Windows: retried while another process has the record open
+    fsync_dir(path.parent)
 
 
 def report(collect, argv, seal=False, limits=False):

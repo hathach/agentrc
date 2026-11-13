@@ -1014,7 +1014,7 @@ class EndToEnd(unittest.TestCase):
         """#242: the runs date the head, but a failed read of the workflow that would date it is not "nothing dates the head"."""
         path = f'api repos/o/r/contents/.github/workflows/build.yml?ref={HEAD}'
         answers = self.answers([HEAD])
-        answers[path] = [{'stderr': 'HTTP 503'}, workflow('on: [push, pull_request]\n')]
+        answers[path] = [{'stderr': 'HTTP 500'}, workflow('on: [push, pull_request]\n')]
         with mock.patch.object(harvest, 'WORKFLOW_RETRY_S', 0):
             code, got = self.harvest(answers)
         self.assertEqual((code, got['headEventAt']), (0, '2026-09-25T08:00:00Z'), 'one failed read is read again')

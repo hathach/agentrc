@@ -560,12 +560,8 @@ def pr_types(repo, path, sha):
     missing too; a file that does not read raises Unreadable."""
     if yaml is None:
         return None
-    meta = workflow_file(repo, path, sha)
-    try:
-        doc = yaml.safe_load(base64.b64decode(meta['content']).decode())
-    except (KeyError, ValueError, yaml.YAMLError):
-        return None
-    on = doc.get('on', doc.get(True)) if isinstance(doc, dict) else None  # YAML 1.1 reads a bare `on` as True
+    doc = workflow_doc(repo, path, sha)
+    on = doc.get('on', doc.get(True)) if doc else None  # YAML 1.1 reads a bare `on` as True
     if isinstance(on, str):
         on = {on: None}
     elif isinstance(on, list):
@@ -581,16 +577,27 @@ def pr_types(repo, path, sha):
 
 def workflow_file(repo, path, sha):
     """The contents API's answer for a workflow revision, read twice; Unreadable after that, never taken for a workflow
-    without pull_request (#242)."""
+    without pull_request (#242). A gateway failure gh_json made again already is Unreadable at once."""
     for left in (1, 0):
         try:
             return gh_json('api', f'repos/{repo}/contents/{path}?ref={sha}')
         except RateLimited:
             raise
         except Unusable as e:
-            if not left:
+            if not left or gh_retry.TRANSIENT.search(str(e)):
                 raise Unreadable(f'workflow {path} at {sha[:9]} could not be read ({e})')
             time.sleep(WORKFLOW_RETRY_S)
+
+
+def workflow_doc(repo, path, sha):
+    """A workflow revision's YAML as a mapping, None when it does not parse into one; Unreadable when it does not read.
+    The caller checks PyYAML is there."""
+    meta = workflow_file(repo, path, sha)
+    try:
+        doc = yaml.safe_load(base64.b64decode(meta['content']).decode())
+    except (KeyError, TypeError, ValueError, yaml.YAMLError):
+        return None
+    return doc if isinstance(doc, dict) else None
 
 
 def entry(kind, c, src, body, created, updated, path=None, line=None, commit=None, reply_to=None):

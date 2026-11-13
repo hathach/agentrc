@@ -190,7 +190,7 @@ import circleci  # noqa: E402
 import rtd  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
 import greptile  # noqa: E402
-from check_runs import latest_run, newest  # noqa: E402
+from check_runs import RUN_PENDING, latest_run, newest  # noqa: E402
 import windows  # noqa: E402
 import gh_retry  # noqa: E402
 from seal import emit, fnv1a, rate_limit, sealed, utc  # noqa: E402
@@ -228,7 +228,6 @@ NO_RUN = 'no reader for this check: its link names no run'
 ANY_APP = -1  # a required check any source may provide
 # GitHub counts these as a passed required check.
 PASSED = ('success', 'neutral', 'skipped')
-RUN_PENDING = ('queued', 'in_progress', 'waiting', 'requested', 'pending')
 RUN_FAILED = ('failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure', 'stale')
 STATUS_BUCKET = {'pending': 'pending', 'success': 'pass', 'failure': 'fail', 'error': 'fail'}
 

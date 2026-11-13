@@ -2,6 +2,9 @@
 for which of several runs is the newest, so both read a head alike."""
 from datetime import datetime
 
+# An Actions workflow run's statuses before it completes: a run in one of them can still take a job or hold a group.
+RUN_PENDING = ('queued', 'in_progress', 'waiting', 'requested', 'pending')
+
 
 def stamp(t):
     return datetime.fromisoformat(t.replace('Z', '+00:00')) if t else None
