@@ -19,14 +19,18 @@ def utc(seconds):
     return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(seconds))
 
 
-def rate_limit(stderr):
-    """rateLimit for a gh failure GitHub refused for a rate limit, else None."""
+def rate_limit(stderr, timeout=None):
+    """rateLimit for a gh failure GitHub refused for a rate limit, else None; its reset is looked up within timeout
+    seconds, not at all when none are left."""
     if not RATE_LIMITED.search(stderr):
         return None
     try:
-        resources = json.loads(subprocess.run(['gh', 'api', 'rate_limit'], capture_output=True).stdout)['resources']
+        if timeout is not None and timeout <= 0:
+            raise TimeoutError
+        resources = json.loads(subprocess.run(['gh', 'api', 'rate_limit'], capture_output=True,
+                                              timeout=timeout).stdout)['resources']
         spent = [r['reset'] for r in resources.values() if r.get('remaining') == 0 and isinstance(r.get('reset'), int)]
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.TimeoutExpired):
         spent = []
     return {'observedAt': utc(time.time()), 'resetAt': utc(max(spent)) if spent else None,
             'secondary': not spent or 'secondary' in stderr.lower()}

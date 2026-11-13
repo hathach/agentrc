@@ -117,7 +117,7 @@ def run(*argv, ok=(0,)):
     if done.returncode not in ok:
         err = done.stderr.decode(errors='replace').strip()
         message = f"{' '.join(argv)}: {err}"
-        limit = rate_limit(err) if argv[0] == 'gh' else None
+        limit = rate_limit(err, timeout=time_left()) if argv[0] == 'gh' else None
         raise RateLimited(message, limit) if limit else Unusable(message)
     try:
         return done.returncode, done.stdout.decode()

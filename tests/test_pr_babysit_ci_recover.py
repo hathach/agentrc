@@ -129,11 +129,14 @@ class Recover(unittest.TestCase):
         out = io.StringIO()
         sleep = lambda s: self.clock.__setitem__(0, self.clock[0] + s)  # noqa: E731
         with mock.patch.object(harvest, 'run', gh.run), mock.patch.object(recover, 'attempt', gh.attempt), \
-                mock.patch.object(recover, 'record_dir', lambda kind: self.dir), mock.patch.object(recover, 'now', lambda: NOW), \
+                mock.patch.object(recover, 'record_dir', self.record_dir), mock.patch.object(recover, 'now', lambda: NOW), \
                 mock.patch.object(recover.time, 'sleep', sleep), mock.patch.object(recover.time, 'monotonic', lambda: self.clock[0]), \
                 redirect_stdout(out):
             code = recover.report(recover.collect, ['--pr', '533', '--head', HEAD, '--repo', 'o/r', '--wait-minutes', str(wait)], seal=True)
         return code, json.loads(out.getvalue())
+
+    def record_dir(self, kind):
+        return self.dir
 
     def records(self):
         return sorted(p.name for p in self.dir.glob('*.json'))
@@ -351,6 +354,29 @@ class Recover(unittest.TestCase):
         self.assertIn('not reached: the time budget ran out first', out['runs'][-1]['reason'])
         self.assertTrue(all(x['outcome'] == 'skipped' for x in out['runs']), out['detail'])
 
+    def test_runs_not_reached_keep_the_results_before_them(self):
+        # record_dir runs git under the budget: it is asked once, before any run, never for a run left unreached
+        gh = GitHub(runs=[a_run(), a_run(id_=5)], workflow='on: pull_request\n')
+        post, asked = gh.attempt, []
+
+        def attempt(*argv, **kw):
+            out = post(*argv, **kw)
+            if argv[-1].endswith('/rerun'):
+                self.clock[0] = recover.BUDGET + 1     # the budget runs out once the first run is re-run
+            return out
+        gh.attempt = attempt
+
+        def record_dir(kind):
+            if self.clock[0] >= recover.BUDGET:
+                raise recover.OutOfTime('git: not run, the time budget ran out')
+            asked.append(kind)
+            return self.dir
+        self.record_dir = record_dir
+        out = self.go(gh)[1]
+        self.assertEqual(asked, ['ci-recover'])
+        self.assertEqual([r['runId'] for r in out['runs']], [43095438193, 5])
+        self.assertIn('not reached', out['runs'][1]['reason'])
+
     def test_a_record_locked_past_the_budget_is_left_to_its_holder(self):
         gh = GitHub()
         with recover.locked(self.dir / 'o-r-43095438193-1.json'), mock.patch.object(recover, 'BUDGET', 1):
@@ -420,6 +446,21 @@ class TimeBudget(unittest.TestCase):
         self.assertEqual(facts.attempt(sys.executable, '-c', 'pass')[0], 124)
         facts.DEADLINE = None
         self.assertEqual(facts.run(sys.executable, '-c', 'print(1)'), (0, '1\n'), 'no budget, no bound')
+
+
+    def test_a_rate_limit_lookup_is_bounded_by_the_time_left(self):
+        import seal
+        calls = []
+
+        def run(argv, **kw):
+            calls.append(kw.get('timeout'))
+            return mock.Mock(stdout='{"resources": {"core": {"remaining": 0, "reset": 1800000000}}}')
+        with mock.patch.object(seal.subprocess, 'run', run):
+            self.assertEqual(seal.rate_limit('HTTP 403: API rate limit exceeded', timeout=0)['resetAt'], None)
+            self.assertEqual(calls, [], 'no lookup once no time is left')
+            self.assertIsNotNone(seal.rate_limit('HTTP 403: API rate limit exceeded', timeout=3.5)['resetAt'])
+            self.assertIsNotNone(seal.rate_limit('HTTP 403: API rate limit exceeded')['resetAt'])
+        self.assertEqual(calls, [3.5, None])
 
 
 @unittest.skipIf(os.name == 'nt', 'Windows has no directory fsync')

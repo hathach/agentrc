@@ -263,9 +263,13 @@ def advance(repo, path, record):
     return 'recovered', f"cancelled and re-run: attempt {r['run_attempt']} is {r['status']}"
 
 
-def one(repo, pr, head, wait, listed):
+def record_of(records, repo, listed):
+    return records / f"{repo.replace('/', '-')}-{listed['id']}-{listed['run_attempt']}.json"
+
+
+def one(repo, pr, head, wait, listed, records):
     """One run's record: left alone, or its attempt's steps taken under its lock."""
-    path = record_dir('ci-recover') / f"{repo.replace('/', '-')}-{listed['id']}-{listed['run_attempt']}.json"
+    path = record_of(records, repo, listed)
     shown = {'runId': listed['id'], 'attempt': listed['run_attempt'], 'workflow': listed.get('name') or listed.get('path'),
              'evidence': [], 'newAttempt': None, 'record': None}
     if listed.get('status') != 'queued' and not path.exists():
@@ -304,9 +308,9 @@ def under_lock(repo, pr, head, wait, listed, path, shown):
             'record': str(path)}
 
 
-def not_reached(repo, listed):
+def not_reached(repo, listed, records):
     """A run on the head left for a later run of this script, the time budget spent before it."""
-    path = record_dir('ci-recover') / f"{repo.replace('/', '-')}-{listed['id']}-{listed['run_attempt']}.json"
+    path = record_of(records, repo, listed)
     if listed.get('status') != 'queued' and not path.exists():
         return None
     return {'runId': listed['id'], 'attempt': listed['run_attempt'], 'workflow': listed.get('name') or listed.get('path'),
@@ -319,7 +323,9 @@ def recover(repo, pr, head, wait):
     if why:
         return {'outcome': 'none', 'detail': why, 'runs': []}
     listed = [r for r in pages(f'repos/{repo}/actions/runs?head_sha={head}', 'workflow_runs') if r.get('head_sha') == head]
-    runs = [x for x in (one(repo, pr, head, wait, r) if left() > 0 else not_reached(repo, r) for r in listed) if x]
+    records = record_dir('ci-recover')  # once, while there is time for its git: not_reached runs past the budget
+    runs = [x for x in (one(repo, pr, head, wait, r, records) if left() > 0 else not_reached(repo, r, records)
+                        for r in listed) if x]
     outcome = next((o for o in ORDER if any(x['outcome'] == o for x in runs)), 'none')
     detail = '; '.join(f"run {x['runId']} attempt {x['attempt']}: {x['outcome']}, {x['reason']}" for x in runs) or 'no queued run on the head'
     return {'outcome': outcome, 'detail': detail, 'runs': runs}
