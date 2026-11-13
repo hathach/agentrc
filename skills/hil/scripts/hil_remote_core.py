@@ -87,8 +87,9 @@ TREE_REPLACED = 200
 RIG_REFUSED = 64     # the rig helper refused before changing anything
 RIG_SECS = 180       # one rig helper call: the lease wait (60 s) and a slow link, not a run
 # herdr-core (hc) ends every process whose starting environment carries a terminal's HC_SCOPE when it cleans up
-# after that terminal, setsid'd ones included: a launch's supervisor, which outlives it, starts without them
-DETACHED_ENV_DROP = ('HC_SCOPE',)
+# after that terminal, setsid'd ones included: a launch's supervisor, which outlives it, starts without it (a
+# client's `SendEnv` can carry it to the rig)
+HC_SCOPE = 'HC_SCOPE'
 
 # under the Bash tool's 10-min foreground cap, so one wait is one tool call
 WAIT_SECS = 570
@@ -976,7 +977,7 @@ def _rig(host, op, *args, timeout=RIG_SECS):
     """Run the rig helper's op over ssh: (exit status, stdout, stderr); exit 255 with the reason
     when ssh did not return within timeout seconds."""
     # dropped by the launcher's own exec: the supervisor it forks starts with the launcher's environment
-    unset = ['env', *(w for k in DETACHED_ENV_DROP for w in ('-u', k))] if op == 'launch' else []
+    unset = ['env', '-u', HC_SCOPE] if op == 'launch' else []
     try:
         r = subprocess.run(ssh_argv(host, shlex.join([*unset, 'python3', '-c', RIG_PY, op, *args])),
                            stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding='utf-8',
@@ -1046,7 +1047,7 @@ def launch(tree, argv, env=None, cwd='.'):
     """Launch argv detached in the attempt (cwd tree-relative), env added and RIG_PATH ahead of
     PATH, and return its launch record. It runs in its own session on the rig, stdio on
     <attempt>/.attempt/std{out,err}.log, so neither this process nor the ssh session ending
-    signals it, nor a terminal's cleanup (DETACHED_ENV_DROP), and its supervisor publishes the
+    signals it, nor a terminal's cleanup (HC_SCOPE), and its supervisor publishes the
     launch and completion records itself. Refused once the attempt's launch was claimed; when the
     acknowledgement is lost the attempt may still have started, which attempt_status tells."""
     argv, env, cwd = _check_argv(argv), _env_args(env), _write_path(cwd, 'a run dir')

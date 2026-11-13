@@ -62,8 +62,8 @@ SHARE_STEP = (f'a second OS user needs the lock dir sticky and world-writable, a
               f'once every project on the host runs this helper: sudo install -d -m 1777 {BOARD_LOCK_DIR}')
 RELEASE_WAIT = 3.0            # s a signalled holder gets to clear its records and exit
 # herdr-core (hc) ends every process whose starting environment carries a terminal's HC_SCOPE when it cleans up
-# after that terminal, setsid'd ones included: the hold holder, which outlives its terminal, starts without them
-DETACHED_ENV_DROP = ('HC_SCOPE',)
+# after that terminal, setsid'd ones included: the hold holder, which outlives its terminal, starts without it
+HC_SCOPE = 'HC_SCOPE'
 _NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._+-]*\Z')
 
 
@@ -2070,15 +2070,14 @@ def cmd_hold(boards, reason):
 
 def _starts_scoped() -> bool:
     """Whether os.environ or the environment this process started with (/proc/self/environ: what a fork keeps
-    whatever os.environ drops, and what hc reads) names one of DETACHED_ENV_DROP; true when that is unreadable."""
-    if any(k in os.environ for k in DETACHED_ENV_DROP):
+    whatever os.environ drops, and what hc reads) names HC_SCOPE; true when that is unreadable."""
+    if HC_SCOPE in os.environ:
         return True
     try:
         with open('/proc/self/environ', 'rb') as f:
-            names = {e.partition(b'=')[0] for e in f.read().split(b'\0')}
+            return any(e.startswith(os.fsencode(HC_SCOPE) + b'=') for e in f.read().split(b'\0'))
     except OSError:
-        return bool(DETACHED_ENV_DROP)
-    return any(os.fsencode(k) in names for k in DETACHED_ENV_DROP)
+        return True
 
 
 # a fresh interpreter's holder: argv is this file, BOARD_LOCK_DIR, the reason, the two pipe fds, the boards
@@ -2093,9 +2092,9 @@ _HOLDER_BOOT = (
 
 
 def _exec_holder(boards, reason, w_fd, ack_r):
-    """Become the holder in a fresh interpreter whose environment is os.environ without DETACHED_ENV_DROP, the pipes
-    passed on: only an exec sets the environment a process started with. Never returns; a failed exec is reported."""
-    env = {k: v for k, v in os.environ.items() if k not in DETACHED_ENV_DROP}
+    """Become the holder in a fresh interpreter whose environment is os.environ without HC_SCOPE, the pipes passed
+    on: only an exec sets the environment a process started with. Never returns; a failed exec is reported."""
+    env = {k: v for k, v in os.environ.items() if k != HC_SCOPE}
     try:
         for fd in (w_fd, ack_r):
             os.set_inheritable(fd, True)

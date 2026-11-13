@@ -147,7 +147,7 @@ class LockDir(unittest.TestCase):
         self.addCleanup(env.stop)
         os.environ.pop('HIL_NO_BOARD_LOCK', None)
         # a hold's holder stays this process's fork, which the patches here reach, even under an hc terminal
-        self.patch(hil_lock, 'DETACHED_ENV_DROP', ())
+        self.patch(hil_lock, 'HC_SCOPE', 'HIL_SELFTEST_NO_SCOPE')
 
     def patch(self, obj, name, value):
         p = mock.patch.object(obj, name, value)
@@ -766,7 +766,7 @@ class DetachedHolder(LockDir):
     def scoped(self):
         """An hc terminal's environment: the holder must start without its HC_SCOPE. Returns a marker variable's
         `name=value`, which only processes started from this test carry in their starting environment."""
-        self.patch(hil_lock, 'DETACHED_ENV_DROP', ('HC_SCOPE',))
+        self.patch(hil_lock, 'HC_SCOPE', 'HC_SCOPE')
         marker = f'HIL_SELFTEST_MARK={secrets.token_hex(8)}'
         os.environ.update([marker.split('='), ('HC_SCOPE', 'selftest-scope')])
         return marker
