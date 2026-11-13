@@ -445,7 +445,7 @@ class TimeBudget(unittest.TestCase):
             facts.run(sys.executable, '-c', 'pass')
         self.assertEqual(facts.attempt(sys.executable, '-c', 'pass')[0], 124)
         facts.DEADLINE = None
-        self.assertEqual(facts.run(sys.executable, '-c', 'print(1)'), (0, '1\n'), 'no budget, no bound')
+        self.assertEqual(facts.run(sys.executable, '-c', 'print(1, end="")'), (0, '1'), 'no budget, no bound')
 
 
     def test_a_rate_limit_lookup_is_bounded_by_the_time_left(self):
