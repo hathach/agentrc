@@ -75,7 +75,7 @@ def terminal(address, app='claude-code', **extra):
 class SessionsTest(unittest.TestCase):
     def sessions(self, gets, ls=None, me='t1'):
         ls = ls or [{'address': a, 'agent': (t.get('status') or {}).get('app') or 'bash'} for a, t in gets.items()]
-        with mock.patch.object(captain, 'get', lambda address: gets.get(address)):
+        with mock.patch.object(captain, 'get', lambda address, timeout=None: gets.get(address)):
             return captain.sessions(terminals=ls, me=me)
 
     def test_excludes_self_codex_shells_and_remote_terminals(self):
@@ -158,6 +158,13 @@ class SessionsTest(unittest.TestCase):
         shown = {s['address']: s['background_tasks'] for s in json.loads(out.call_args.args[0])}
         self.assertEqual(shown, {'t2': 2, 't3': '?', 't4': 0, 't5': None})
 
+    def test_find_bounds_its_hc_call_by_the_timeout_given(self):
+        with mock.patch.object(captain.hc, 'get', return_value=terminal('t2')) as hc_get, \
+                mock.patch.object(captain, 'pin', side_effect=lambda s: s):
+            captain.find('t2')
+            captain.find('t2', timeout=2)
+        self.assertEqual([c.kwargs['timeout'] for c in hc_get.call_args_list], [captain.HC_TIMEOUT_S, 2])
+
     def test_missing_or_relative_cwd_stays_unknown(self):
         for cwd in (None, '', 'rel/dir'):
             with self.subTest(cwd=cwd):
@@ -166,7 +173,7 @@ class SessionsTest(unittest.TestCase):
                 self.assertIsNone(self.sessions({'t2': t})[0]['cwd'])
 
     def test_find_takes_an_address_never_a_name(self):
-        with mock.patch.object(captain, 'get', lambda address: terminal('t2')), \
+        with mock.patch.object(captain, 'get', lambda address, timeout=None: terminal('t2')), \
              mock.patch.object(captain, 'pin', side_effect=lambda s: s):
             self.assertEqual(captain.find('t2')['address'], 't2')
             self.assertIsNone(captain.find('review'))   # hc would resolve the name to t2
@@ -387,7 +394,8 @@ class LedgerCase(unittest.TestCase):
         for target, attr, value in [
             (captain, 'STATE', str(self.state)),
             (captain, 'POLL_S', 0),
-            (captain, 'find', lambda address: dict(self.terminals[address]) if address in self.terminals else None),
+            (captain, 'find', lambda address, timeout=None: dict(self.terminals[address]) if address in self.terminals
+             else None),
             (captain, 'read_screen', lambda address: self.screens.get(address, EMPTY)),
             (captain, 'submit', self._submit),
             (captain, 'my_session', lambda: dict(self.terminals[self.me])),
@@ -1383,12 +1391,12 @@ class HeldWakeTest(RelayCase):
         self.terminals['t2'] = {**pinned('t2'), 'status': 'working'}
         self.action = self.relayed()
         self.looked = []
-        for attr, value in [('glance', self._glance), ('submit', mock.Mock(side_effect=AssertionError('sent')))]:
+        for attr, value in [('find', self._find), ('submit', mock.Mock(side_effect=AssertionError('sent')))]:
             patcher = mock.patch.object(captain, attr, value)
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def _glance(self, address, timeout):
+    def _find(self, address, timeout=None):
         self.looked.append((address, timeout))
         found = self.terminals.get(address)
         if isinstance(found, Exception):
@@ -1536,12 +1544,12 @@ class HeldWakeTest(RelayCase):
         self.assertEqual(captain.held_working(captain.records(), {self.action}, captain.generation()), {})
 
     def test_collect_says_it_then_follows_the_relay_on(self):
-        def done_then_cancelled(address, timeout):
+        def done_then_cancelled(address, timeout=None):
             self.looked.append((address, timeout))
             if len(self.looked) > 1:
                 captain.append({'type': 'cancel', 'msg': self.action})
             return {**pinned('t2'), 'status': 'done'}
-        with mock.patch.object(captain, 'glance', done_then_cancelled), mock.patch('builtins.print') as out:
+        with mock.patch.object(captain, 'find', done_then_cancelled), mock.patch('builtins.print') as out:
             self.assertEqual(captain.collect([self.action], 60000), 0)
         lines = [c.args[0] for c in out.call_args_list]
         self.assertTrue(lines[0].startswith(f'held {self.action}'))
@@ -3674,7 +3682,7 @@ class StartTest(RelayCase):
         self.pinned_account = 'main'
         for target, attr, value in [
             (captain.hc, 'run', self._hc),
-            (captain, 'get', lambda address: self.gets.get(address)),
+            (captain, 'get', lambda address, timeout=None: self.gets.get(address)),
             (captain, 'herdr_spaces', lambda: self.spaces),
             (captain, 'pin', self._pin),
             (captain.shutil, 'which', lambda p: f'/bin/{p}'),
@@ -3976,7 +3984,7 @@ class StartTest(RelayCase):
 
     def test_hc_failing_to_answer_after_the_start_leaves_it_unchecked(self):
         self.say('start proj')
-        def get(address):
+        def get(address, timeout=None):
             if address == 't9':
                 raise captain.hc.Error('hc get t9 failed: socket closed')
         with mock.patch.object(captain, 'get', get):

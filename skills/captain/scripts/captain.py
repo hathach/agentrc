@@ -169,9 +169,9 @@ def die(msg, code=1):
     raise SystemExit(code)
 
 
-def get(address):
+def get(address, timeout=HC_TIMEOUT_S):
     """`hc get` for one terminal, None when hc knows none by that address."""
-    return hc.get(address, timeout=HC_TIMEOUT_S)
+    return hc.get(address, timeout=timeout)
 
 
 def footer_only(lines):
@@ -490,10 +490,10 @@ def identity(session):
     return {k: session.get(k) for k in IDENTITY}
 
 
-def find(address):
+def find(address, timeout=HC_TIMEOUT_S):
     """The pinned session in the local terminal at address, with its handle and status, or None: a name hc would
-    resolve is not an address."""
-    s = described(get(address)) if hc.is_local(address) else None
+    resolve is not an address. timeout bounds its hc call."""
+    s = described(get(address, timeout)) if hc.is_local(address) else None
     return pin(s) if s and s['address'] == address else None
 
 
@@ -1199,12 +1199,6 @@ def held_working(recs, pending, fence):
             and why.get(r['msg']) == BUSY and (r.get('captain') or {}).get('generation') == fence}
 
 
-def glance(address, timeout):
-    """find(), its hc call bounded by timeout s."""
-    s = described(hc.get(address, timeout=timeout)) if hc.is_local(address) else None
-    return pin(s) if s and s['address'] == address else None
-
-
 def wake_line(action, relayed, now):
     """The collect line for a held relay whose target is now in state now: never that it is safe to send, since
     `relay --retry` checks the session and screen again, and a draft in the input line gets the relay appended."""
@@ -1245,7 +1239,7 @@ def wake(recs, pending, fence, deadline):
         if left < 1:
             break
         try:
-            found = glance(relayed['target']['address'], min(WAKE_LOOK_S, left))
+            found = find(relayed['target']['address'], timeout=min(WAKE_LOOK_S, left))
         except hc.Error:
             continue
         state = found['status'] if found and identity(found) == relayed['target'] else 'replaced'
