@@ -1417,15 +1417,19 @@ def session_mutex(lock):
         hold.deferring = True       # first: an attribute store is no interrupt check, a call's entry is
         rearmed = None
         try:
-            hold.rearm()            # a handler the with block installed defers too, before an fd goes
-        except BaseException as e:
-            rearmed = e             # pending as it began: raised once the fds are closed
-        while fds:
-            try:
-                os.close(fds.pop())       # once each: a failed close frees the fd number all the same
-            except Exception as e:
-                failed = failed or e
-        hold.release()
+            while True:             # a handler the with block installed defers too, before an fd goes
+                try:
+                    hold.rearm()
+                    break
+                except BaseException as e:
+                    rearmed = rearmed or e      # the with block's handler ran first: the first is raised at the end
+        finally:                    # the fds go even when a signal lands on the loop's back-edge
+            while fds:
+                try:
+                    os.close(fds.pop())       # once each: a failed close frees the fd number all the same
+                except Exception as e:
+                    failed = failed or e
+            hold.release()
         if rearmed is not None:
             raise rearmed
         if failed is not None and (raised is None or isinstance(raised, Exception)):     # an interrupt wins

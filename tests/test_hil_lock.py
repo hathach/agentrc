@@ -18,6 +18,7 @@ import fcntl
 import importlib.util
 import inspect
 import io
+import itertools
 import json
 import math
 import re
@@ -3531,13 +3532,14 @@ class SessionMutex(LockDir):
             pass
 
     def check_points(self):
-        """{code: offsets} of hil_lock's own code where CPython runs a pending signal's Python handler: just after
-        a call returns, a backward jump, a frame's resume."""
+        """{code: offsets} of hil_lock's own code and InterruptHold.rearm where CPython runs a pending signal's
+        Python handler: just after a call returns, a backward jump, a frame's resume."""
+        process = hil_lock._process()
         codes, todo = {}, [f.__code__ for f in vars(hil_lock).values() if isinstance(f, types.FunctionType)]
-        todo.append(inspect.unwrap(hil_lock.session_mutex).__code__)
+        todo += [inspect.unwrap(hil_lock.session_mutex).__code__, process.InterruptHold.rearm.__code__]
         while todo:
             code = todo.pop()
-            if code in codes or code.co_filename != hil_lock.__file__:
+            if code in codes or code.co_filename not in (hil_lock.__file__, process.__file__):
                 continue
             ins = list(dis.get_instructions(code))
             codes[code] = {b.offset for a, b in zip(ins, ins[1:]) if a.opname.startswith('CALL')
@@ -3546,10 +3548,11 @@ class SessionMutex(LockDir):
             todo += [c for c in code.co_consts if isinstance(c, types.CodeType)]
         return codes
 
-    def interrupt_every_take(self, sig, storm, body=lambda: None):
-        """Take and drop the mutex once per check point, `sig` raised at that one (and with `storm` at every one
-        after it), body() run under it: each take ends interrupted with no fd kept, the handlers back, and the mutex
-        free here."""
+    def interrupt_every_take(self, sig, fires, body=lambda: None):
+        """Take and drop the mutex once per injection plan, body() run under it, `sig` raised at the check points
+        the plan names: fires(n) yields, per take, the 1-based indexes of the points where it is raised, ending when a
+        take reaches none of them. Each take ends interrupted with no fd kept, the handlers back, and the mutex free
+        here."""
         class Terminated(BaseException):
             pass
 
@@ -3564,26 +3567,17 @@ class SessionMutex(LockDir):
         with hil_lock.session_mutex(BOARD):     # the dir and the file exist: only a take's fds are counted
             pass
         fds = sorted(os.listdir('/proc/self/fd'))
-        mon.use_tool_id(tool, 'session_mutex interrupts')
-        try:
-            self.take_interrupted(codes, sig, storm, fds, term, Terminated, body)
-        finally:
-            mon.register_callback(tool, mon.events.INSTRUCTION, None)
-            mon.free_tool_id(tool)
-
-    def take_interrupted(self, codes, sig, storm, fds, term, Terminated, body):
-        mon, tool = sys.monitoring, sys.monitoring.DEBUGGER_ID
-        seen = 0
+        seen, plan = 0, None
 
         def at(code, offset):
             nonlocal seen
             if offset in codes.get(code, ()):
                 seen += 1
-                if seen == n + 1 or storm and seen > n:
+                if plan(seen):
                     signal.raise_signal(sig)
-        mon.register_callback(tool, mon.events.INSTRUCTION, at)
-        n = 0
-        while True:
+
+        def take():
+            nonlocal seen
             seen = 0
             for code in codes:
                 mon.set_local_events(tool, code, mon.events.INSTRUCTION)
@@ -3597,34 +3591,72 @@ class SessionMutex(LockDir):
             finally:
                 for code in codes:
                     mon.set_local_events(tool, code, 0)
-            if seen <= n:
-                break
-            with self.subTest(sig=sig, at=n, storm=storm):
-                self.assertTrue(interrupted)
-                self.assertEqual(sorted(os.listdir('/proc/self/fd')), fds)
-                self.assertEqual((signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM)),
-                                 (signal.default_int_handler, term))
-                with hil_lock.session_mutex(BOARD):     # reacquired in this process
-                    pass
-            n += 1
-        self.assertGreater(n, 10)
+            return interrupted
+        mon.use_tool_id(tool, 'session_mutex interrupts')
+        takes = 0
+        try:
+            mon.register_callback(tool, mon.events.INSTRUCTION, at)
+            for plan in fires():
+                interrupted = take()
+                plan.seen = seen
+                if seen < plan.points[-1]:      # not every point reached: nothing to check
+                    continue
+                takes += 1
+                with self.subTest(sig=sig, plan=plan.name):
+                    self.assertTrue(interrupted)
+                    self.assertEqual(sorted(os.listdir('/proc/self/fd')), fds)
+                    self.assertEqual((signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM)),
+                                     (signal.default_int_handler, term))
+                    with hil_lock.session_mutex(BOARD):     # reacquired in this process
+                        pass
+        finally:
+            mon.register_callback(tool, mon.events.INSTRUCTION, None)
+            mon.free_tool_id(tool)
+        self.assertGreater(takes, 10)
+
+    class Plan:
+        """Raise at each of `points` and, with `storm`, at every point after the first; `seen`, set once taken, is how
+        many points the take reached."""
+
+        def __init__(self, points, storm=False):
+            self.points, self.storm, self.name, self.seen = points, storm, (points, storm), 0
+
+        def __call__(self, seen):
+            return seen in self.points or self.storm and seen > self.points[0]
+
+    def plans(self, storm=False, pairs=False):
+        """Every single point (with `storm`, every point and all after it), or with `pairs` every ordered pair."""
+        def fires():
+            for n in itertools.count(1):
+                plan = self.Plan([n], storm)
+                yield plan
+                if plan.seen < n:
+                    return
+                for m in itertools.count(n + 1) if pairs else ():
+                    plan = self.Plan([n, m])
+                    yield plan
+                    if plan.seen < m:
+                        break
+        return fires
 
     def test_an_interrupt_at_any_check_point_frees_the_mutex(self):
         for sig in (signal.SIGINT, signal.SIGTERM):
-            self.interrupt_every_take(sig, storm=False)
+            self.interrupt_every_take(sig, self.plans())
 
     def test_a_second_interrupt_in_its_cleanup_still_frees_the_mutex(self):
         """#537: a first interrupt before the cleanup and a second on its back-edge leaked both fds."""
         for sig in (signal.SIGINT, signal.SIGTERM):
-            self.interrupt_every_take(sig, storm=True)
+            self.interrupt_every_take(sig, self.plans(storm=True))
 
     def test_a_handler_the_body_installed_still_defers_in_its_cleanup(self):
         """A with block that installs its own handler (signal.default_int_handler here) replaces the deferring one:
-        the cleanup installs it again before it lets go of an fd."""
+        the cleanup installs it again before it lets go of an fd, though a first interrupt cuts that short and a
+        second lands after an fd is popped (every ordered pair of check points)."""
         def body():
             signal.signal(signal.SIGINT, signal.default_int_handler)
         for sig in (signal.SIGINT, signal.SIGTERM):
-            self.interrupt_every_take(sig, storm=False, body=body)
+            self.interrupt_every_take(sig, self.plans(), body=body)
+        self.interrupt_every_take(signal.SIGINT, self.plans(pairs=True), body=body)
 
     def test_a_helper_that_cannot_load_acquires_nothing(self):
         fds = sorted(os.listdir('/proc/self/fd'))
