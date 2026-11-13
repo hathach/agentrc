@@ -2301,6 +2301,26 @@ class OperatorResolution(LockDir):
         self.assertEqual(os.stat(self.log).st_ino, ino, 'nothing closed: nothing rewritten')
         self.assertEqual(hil_lock.compact_cleanup_log(BOARD + '-none'), {'dropped': 0, 'kept': 0})
 
+    def test_the_replacement_keeps_mode_owner_and_group_and_starts_private(self):
+        old = os.umask(0)
+        self.addCleanup(os.umask, old)
+        fid = self.failure()
+        hil_lock.cleanup_restored(BOARD, fid)
+        os.chmod(self.log, 0o660)
+        before = os.stat(self.log)
+        real, seen = os.fchmod, []
+
+        def fchmod(fd, mode):
+            seen.append((stat.S_IMODE(os.fstat(fd).st_mode), mode))
+            real(fd, mode)
+        with mock.patch.object(hil_lock.os, 'fchmod', fchmod):
+            self.assertEqual(hil_lock.compact_cleanup_log(BOARD), {'dropped': 2, 'kept': 0})
+        after = os.stat(self.log)
+        self.assertEqual(seen, [(0o600, 0o660)])       # the temp file is private until it takes the log's mode
+        self.assertEqual((stat.S_IMODE(after.st_mode), after.st_uid, after.st_gid),
+                         (0o660, before.st_uid, before.st_gid))
+        self.assertNotEqual(after.st_ino, before.st_ino)
+
     def test_a_malformed_whole_line_refuses_and_a_torn_tail_goes(self):
         fid = self.failure()
         hil_lock.cleanup_restored(BOARD, fid)

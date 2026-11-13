@@ -163,16 +163,19 @@ def _read_file(board, suffix):
         return f.read()
 
 
-def _replace_file(dfd, name, data: bytes) -> None:
+def _replace_file(dfd, name, data: bytes, mode=0o644, owner=None) -> None:
     """Replace `name` in the lock dir `dfd` with `data`, atomically and durably: a crash leaves
-    the old file or the new one, and the rename itself is fsynced through the dir. 0644 whatever
-    the umask, so another OS user reads it; in a sticky dir only its owner or root replaces it.
-    A failed replace removes its temp file; one a crash leaves is hidden and never read."""
+    the old file or the new one, and the rename itself is fsynced through the dir. `mode` (0644,
+    so another OS user reads it) whatever the umask, and `owner`, (uid, gid), when given; the temp
+    file is 0600 until then. In a sticky dir only its owner or root replaces it. A failed replace
+    removes its temp file; one a crash leaves is hidden and never read."""
     tmp = f'.{name}.{os.getpid()}.{secrets.token_hex(4)}'
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644, dir_fd=dfd)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dfd)
     try:
         try:
-            os.fchmod(fd, 0o644)
+            if owner is not None:
+                os.fchown(fd, *owner)
+            os.fchmod(fd, mode)
             _pwrite_all(fd, data, 0)
             os.fsync(fd)
         finally:
@@ -974,22 +977,7 @@ def _compact(board, dfd, st, data) -> dict:
         raise LogRefused(f'{name} has group {st.st_gid}, which uid {euid} cannot give its replacement: compact it '
                          f'as root')
     keep = [line for line, e in zip(lines, events) if names(e) not in closed]
-    tmp = f'.{name}.{secrets.token_hex(4)}.tmp'
-    tfd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dfd)
-    try:
-        try:
-            _write_all(tfd, b''.join(keep))
-            os.fchown(tfd, st.st_uid, st.st_gid)
-            os.fchmod(tfd, stat.S_IMODE(st.st_mode))
-            os.fsync(tfd)
-        finally:
-            os.close(tfd)
-        os.rename(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp, dir_fd=dfd)
-        raise
-    os.fsync(dfd)
+    _replace_file(dfd, name, b''.join(keep), stat.S_IMODE(st.st_mode), (st.st_uid, st.st_gid))
     return {'dropped': len(lines) - len(keep), 'kept': len(keep)}
 
 
