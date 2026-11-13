@@ -8,6 +8,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from datetime import datetime, timezone
@@ -315,12 +316,40 @@ class Recover(unittest.TestCase):
         gh = GitHub()
         with mock.patch.object(recover, 'BUDGET', 0):
             out = self.go(gh)[1]
-        self.assertEqual((out['outcome'], gh.posts), ('none', []))
+        self.assertEqual((out['outcome'], gh.posts, self.records()), ('none', [], []))
         self.assertEqual(out['runs'][0]['outcome'], 'skipped')
+        self.assertIn('not reached: the time budget ran out first', out['runs'][0]['reason'])
+        # Spent by the last read before the cancel: the record is written, and the cancel is not.
+        answer, jobs = gh.run, []
+
+        def run(*argv, ok=(0,)):
+            got = answer(*argv, ok=ok)
+            if '/jobs?' in argv[-1]:
+                jobs.append(argv[-1])
+                if len(jobs) == 2:
+                    self.clock[0] += recover.BUDGET
+            return got
+        gh.run = run
+        out = self.go(gh)[1]
+        self.assertEqual((out['outcome'], gh.posts), ('none', []))
         self.assertIn('the time budget ran out before the cancel: nothing was sent', out['runs'][0]['reason'])
         self.assertEqual(json.loads(Path(out['runs'][0]['record']).read_text())['steps'], {})
         self.assertEqual((self.go(gh)[1]['outcome'], gh.posts), ('recovered', [(43095438193, 'cancel'), (43095438193, 'rerun')]),
                          'a later run checks it again and goes on')
+
+    def test_reads_stop_once_the_budget_is_spent_however_many_runs_are_queued(self):
+        gh = GitHub(runs=[a_run(id_=1000 + i) for i in range(100)])
+        answer = gh.run
+
+        def run(*argv, ok=(0,)):  # every GitHub read takes 10 seconds
+            self.clock[0] += 10
+            return answer(*argv, ok=ok)
+        gh.run = run
+        out = self.go(gh)[1]
+        self.assertLessEqual(len(gh.reads) * 10, recover.BUDGET + 10, f'{len(gh.reads)} reads')
+        self.assertEqual(len(out['runs']), 100)
+        self.assertIn('not reached: the time budget ran out first', out['runs'][-1]['reason'])
+        self.assertTrue(all(x['outcome'] == 'skipped' for x in out['runs']), out['detail'])
 
     def test_a_record_locked_past_the_budget_is_left_to_its_holder(self):
         gh = GitHub()
@@ -369,6 +398,28 @@ class Recover(unittest.TestCase):
                 with redirect_stdout(out):
                     self.assertEqual(recover.report(recover.collect, argv), 2)
                 self.assertIn('error', json.loads(out.getvalue()))
+
+
+class TimeBudget(unittest.TestCase):
+    """facts.DEADLINE, which ci_recover.py sets: no command starts past it, and none runs beyond it."""
+
+    def test_a_read_past_it_is_out_of_time_and_a_request_cut_short_is_unknown(self):
+        import facts
+        slow = (sys.executable, '-c', 'import time; time.sleep(30)')
+        self.addCleanup(setattr, facts, 'DEADLINE', None)
+        facts.DEADLINE = time.monotonic() + 0.5
+        with self.assertRaisesRegex(facts.OutOfTime, 'no answer within the time budget'):
+            facts.run(*slow)
+        facts.DEADLINE = time.monotonic() + 0.5
+        code, _, err = facts.attempt(*slow)
+        self.assertEqual(code, 124)
+        self.assertIn('it may have landed', err)
+        self.assertTrue(recover.answer(code, err).startswith('unknown: '), 'observed, never sent again')
+        with self.assertRaisesRegex(facts.OutOfTime, 'not run, the time budget ran out'):
+            facts.run(sys.executable, '-c', 'pass')
+        self.assertEqual(facts.attempt(sys.executable, '-c', 'pass')[0], 124)
+        facts.DEADLINE = None
+        self.assertEqual(facts.run(sys.executable, '-c', 'print(1)'), (0, '1\n'), 'no budget, no bound')
 
 
 @unittest.skipIf(os.name == 'nt', 'Windows has no directory fsync')

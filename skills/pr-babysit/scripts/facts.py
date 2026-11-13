@@ -88,12 +88,32 @@ def gh_env(argv):
     return {**os.environ, 'GH_REPO': GH_REPO} if argv[0] == 'gh' and GH_REPO else None
 
 
+# time.monotonic() past which a script with a time budget (ci_recover.py) starts no command, and before which each
+# command it runs must answer; None for every other script.
+DEADLINE = None
+
+
+class OutOfTime(Unusable):
+    """The time budget ran out before a command started, or before it answered."""
+
+
+def time_left():
+    """Seconds left before DEADLINE, None when there is none."""
+    return None if DEADLINE is None else DEADLINE - time.monotonic()
+
+
 def run(*argv, ok=(0,)):
-    """(exit status, stdout); a status outside ok, or stdout that is not UTF-8, is Unusable."""
+    """(exit status, stdout); a status outside ok, or stdout that is not UTF-8, is Unusable, and a command past
+    DEADLINE OutOfTime."""
+    left = time_left()
+    if left is not None and left <= 0:
+        raise OutOfTime(f"{' '.join(argv)}: not run, the time budget ran out")
     try:
-        done = subprocess.run(argv, capture_output=True, env=gh_env(argv))
+        done = subprocess.run(argv, capture_output=True, env=gh_env(argv), timeout=left)
     except FileNotFoundError:
         raise Unusable(f'{argv[0]} is not installed')
+    except subprocess.TimeoutExpired:
+        raise OutOfTime(f"{' '.join(argv)}: no answer within the time budget") from None
     if done.returncode not in ok:
         err = done.stderr.decode(errors='replace').strip()
         message = f"{' '.join(argv)}: {err}"
@@ -107,13 +127,20 @@ def run(*argv, ok=(0,)):
 
 
 def attempt(*argv, input=None, env=None):
-    """(exit status, stdout, stderr), replacing bad bytes: unlike run, a failure is part of the receipt."""
+    """(exit status, stdout, stderr), replacing bad bytes: unlike run, a failure is part of the receipt, one past
+    DEADLINE too (exit 124): a request cut short may have landed, and is the caller's to observe, never to send again."""
+    left = time_left()
+    if left is not None and left <= 0:
+        return 124, '', 'not started: the time budget ran out'
     try:
         # bytes in: a text-mode stdin on Windows writes each \n as \r\n
-        done = subprocess.run(argv, capture_output=True, env=env or gh_env(argv),
+        done = subprocess.run(argv, capture_output=True, env=env or gh_env(argv), timeout=left,
                               input=None if input is None else input.encode('utf-8', 'replace'))
     except FileNotFoundError:
         raise Unusable(f'{argv[0]} is not installed')
+    except subprocess.TimeoutExpired:
+        return 124, '', f'no answer within the time budget ({left:.0f} seconds): it may have landed'
+
     text = lambda b: b.decode('utf-8', 'replace').replace('\r\n', '\n').replace('\r', '\n')  # as text mode reads it
     return done.returncode, text(done.stdout), text(done.stderr)
 
