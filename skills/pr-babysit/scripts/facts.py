@@ -263,10 +263,14 @@ def emit_dir():
 
 
 def launch_began(directory):
-    """When the launch whose emit directory this is began: its LAUNCH_MARK, written once by emit_dir."""
+    """When the launch whose emit directory this is began: its LAUNCH_MARK, written once by emit_dir; None for a
+    directory an emit_dir before the mark made, which a resumed launch still names (never marked now: that would leave
+    out the transcripts written before)."""
     mark = Path(directory) / LAUNCH_MARK
     try:
         return float(mark.read_text(encoding='utf-8'))
+    except FileNotFoundError:
+        return None
     except (OSError, ValueError) as e:
         raise Unusable(f'facts.py stage: {mark} does not tell when the launch began ({e}): no transcript scan is bounded by it') from None
 
@@ -320,23 +324,31 @@ def mtime(path):
 
 
 def payloads(sid, file, digest, since):
-    """The payload texts this session's subagent transcripts written since `since` give FILE and DIGEST in their first
-    user record, newest transcript first; Bounded when there are more of them than SCAN_FILES, or the bytes bound stopped
-    the scan first. An older transcript is an earlier launch's: none holds this launch's file."""
+    """(the payload texts this session's subagent transcripts written since `since` give FILE and DIGEST in their first
+    user record, newest transcript first, how many were read); Bounded when there are more of them than SCAN_FILES, or
+    the bytes bound stopped the scan first. An older transcript is an earlier launch's: none holds this launch's file.
+    With since None (a launch with no LAUNCH_MARK) the newest are read up to either bound, which counts only when what
+    was read holds no match."""
     root = Path(os.environ.get('CLAUDE_CONFIG_DIR') or Path.home() / '.claude')
-    found = sorted((p for p in root.glob(f'projects/*/{sid}/subagents/**/agent-*.jsonl') if mtime(p) >= since - SCAN_SLACK_S),
-                   key=mtime, reverse=True)
-    if len(found) > SCAN_FILES:
+    found = sorted((p for p in root.glob(f'projects/*/{sid}/subagents/**/agent-*.jsonl')
+                    if since is None or mtime(p) >= since - SCAN_SLACK_S), key=mtime, reverse=True)
+    if since is not None and len(found) > SCAN_FILES:
         raise Bounded(f'{len(found)} transcripts written since the launch began, over {SCAN_FILES}')
     head = f'{PAYLOAD} {file} {digest} '
     got, left = [], SCAN_BYTES
     for n, path in enumerate(found):
+        if n == SCAN_FILES:  # since is None
+            if got:
+                return got, n
+            raise Bounded(f'the {SCAN_FILES} newest of {len(found)} transcripts read, the launch having no {LAUNCH_MARK}')
         try:
             with open(path, encoding='utf-8', errors='replace') as f:
                 for _ in range(SCAN_LINES):
                     line = f.readline(left + 1)
                     left -= len(line)
                     if left < 0:
+                        if since is None and got:
+                            return got, n
                         raise Bounded(f'{SCAN_BYTES} bytes read, in {n + 1} of {len(found)} transcripts')
                     if not line:
                         break
@@ -368,8 +380,9 @@ def stage(file, digest, since):
             break
         time.sleep(wait)
     if not got:
+        which = 'written since the launch began' if since is not None else f'newest (the launch has no {LAUNCH_MARK})'
         raise Unusable(f'facts.py stage: no {PAYLOAD} line for {file} {digest} in the first user record of '
-                       f"this session's {scanned} subagent transcript(s) written since the launch began, read twice")
+                       f"this session's {scanned} subagent transcript(s) {which}, read twice")
     if len(set(got)) > 1:
         raise Unusable(f'facts.py stage: {len(set(got))} different {PAYLOAD} lines name {file} {digest}: none is taken')
     data = staged_bytes(got[0], digest, file)

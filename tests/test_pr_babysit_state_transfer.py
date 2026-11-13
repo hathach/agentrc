@@ -381,6 +381,27 @@ class TranscriptStageTest(unittest.TestCase):
         self.assertFalse(out.exists())
         self.assertEqual(self.stage(out, fnv1a(text)), {'staged': str(out)}, 'within its bounds it is found')
 
+    def test_a_launch_with_no_mark_reads_the_newest_and_takes_a_match_there(self):
+        text, out = json.dumps({'n': 1}), self.tmp / 'x.in'
+        old = self.transcript(self.prompt(text, out), name='agent-old.jsonl', wf='wf_old')
+        os.utime(old, (1e9, 1e9))
+        for i in range(4):
+            other = self.transcript(self.prompt(json.dumps({'other': i}), self.tmp / f'o{i}.in'), name=f'agent-{i}.jsonl', wf=f'wf_{i}')
+            os.utime(other, (2e9 + i, 2e9 + i))
+        with mock.patch.object(self.facts, 'SCAN_FILES', 3):
+            got = self.stage(out, fnv1a(text), since=None)
+            self.assertIn('the transcript scan stopped at its bound (the 3 newest of 5 transcripts read, the launch having no .launch)',
+                          got['error'], 'a match past the bound is never reached')
+            self.assertFalse(out.exists())
+            os.utime(self.transcript(self.prompt(text, out), name='agent-new.jsonl', wf='wf_new'), (3e9, 3e9))
+            self.assertEqual(self.stage(out, fnv1a(text), since=None), {'staged': str(out)}, 'the original relay is among the newest')
+            self.assertEqual(out.read_text(), text)
+            b64 = base64.b64encode(text.encode()).decode()
+            conflict = self.transcript(self.prompt(text, out).replace(b64, b64[:-4] + 'AAAA'), name='agent-conflict.jsonl', wf='wf_conflict')
+            os.utime(conflict, (3e9 + 1, 3e9 + 1))
+            self.assertIn('2 different AGENTRC-PAYLOAD lines name', self.stage(out, fnv1a(text), since=None)['error'],
+                          'conflicting copies among those read refuse')
+
     def test_only_transcripts_written_since_the_launch_began_count_toward_the_bound(self):
         text, out = json.dumps({'n': 1}), self.tmp / 'x.in'
         began = time.time() - 60
@@ -426,6 +447,7 @@ class TranscriptStageTest(unittest.TestCase):
                           (['x', 'y', '--from-transcript', '--line', str(line), '--claimed', 'c', '--bogus'], 'unrecognized arguments: --bogus'),
                           (['x', 'y', '--from-transcript', '--line', str(line), '--claimed', 'c'], 'does not tell when the launch began')):
             with self.subTest(why):
+                (self.tmp / '.launch').write_text('not a time')
                 done = subprocess.run([sys.executable, str(FACTS), 'stage', *argv], capture_output=True, text=True,
                                       env={k: v for k, v in os.environ.items() if k != 'AGENTRC_EMIT'})
                 self.assertEqual(done.returncode, 2)
