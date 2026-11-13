@@ -5,24 +5,34 @@
 
 pr-babysit's CI lane runs it where the same checks stayed pending through two whole CI waits (ci-stuck, #536). Run from
 the PR checkout; PR N is --repo's, else the checkout's one repository (facts.bind_repo). A run on the head is a suspected
-orphan, and acted on, only when all of this reads so under its lock, the last four just before the first request: no
+orphan, and acted on, only when all of this reads so under its lock, the last four just before the cancel: no
 concurrency group can be holding it (its workflow file at SHA declares no top-level `concurrency`, or no other unfinished
-run in the repository can share the group: one of the same workflow when the group names github.workflow, on the same
-branch when it names github.ref, github.head_ref, github.sha or a PR number; a group naming github.run_id is its own);
-the repository's newest completed run was created after it was queued (Actions runs other work); PR N is open at SHA;
-the run is on the PR's head branch and repository at SHA and `queued`; its attempt has been queued at least M minutes;
-and that attempt has no job. A workflow file that does not read, or no PyYAML, leaves the run alone.
+run in the repository can share the group); the repository's newest completed run was created after it was queued
+(Actions runs other work); PR N is open at SHA; the run is on the PR's head branch and repository at SHA and `queued`; its
+attempt has been queued at least M minutes; and that attempt has no job. A workflow file that does not read, or no
+PyYAML, leaves the run alone.
+
+What a group can share is inferred only from forms whose value proves it, each `${{ }}` expression taken whole: a group
+whose expressions are all `github.run_id`, `github.workflow` or a branch's (`github.ref` alone, or ended by it after
+any of `github.head_ref`, `github.event.pull_request.number`, `github.event.number` joined by `||`) is the run's own when
+one is github.run_id, else shared at most with a run of the same workflow when one is github.workflow, and on the same
+branch when one is a branch's (a run of an event other than push, pull_request or workflow_dispatch: on any branch).
+Any other group, a literal or any other expression among them, can be shared by every unfinished run in the repository.
 
 Each run attempt acted on is recorded under the checkout's git common dir, in
 pr-babysit/ci-recover/<owner>-<repo>-<run>-<attempt>.json, under one lock held from the reads above to the last step.
 Each step, the cancel and then the re-run (`POST .../rerun`, every job: none ran, so not --failed), is written there
 before its request and its answer after, and is sent at most once per run attempt by any run of this script: a step
 whose answer was lost is observed, never sent again. The re-run is sent only once the run reads completed after the
-cancel, waited on up to CANCEL_WAIT seconds; its new attempt is looked for up to RERUN_WAIT seconds. A later run of
-this script on the same head resumes a record whose cancel completed since, sending the re-run then.
+cancel, waited on up to CANCEL_WAIT seconds, and only when its attempt concluded `cancelled` and PR N is still open at
+SHA with the run on its head; its new attempt is looked for up to RERUN_WAIT seconds. A record whose cancel was not
+written yet is checked as a new one; a later run of this script on the same head resumes a record whose cancel
+completed since, sending the re-run then.
 
-The outcome, the worst of the runs' (uncertain, failed, recovered, none in that order):
+The outcome, the worst of the runs' (uncertain, failed, withheld, completed, recovered, none in that order):
   recovered  each run acted on was cancelled and re-run, its new attempt observed
+  completed  a run's attempt completed with a conclusion other than cancelled after the cancel: it is not re-run
+  withheld   a run was cancelled, and its re-run is not sent: PR N is no longer open at SHA, or the run not on its head
   none       no queued run on the head is a suspected orphan; each run's reason says why
   uncertain  a step's answer was lost, or what it asked for was not observed in time (a cancel that has not completed
              the run, a re-run whose attempt does not show): nothing more is sent for that attempt
@@ -54,11 +64,11 @@ CANCEL_WAIT = 45  # seconds: the whole script stays inside a relay's two-minute 
 RERUN_WAIT = 30
 POLL = 5
 UNFINISHED = ('queued', 'in_progress', 'waiting', 'pending', 'requested')
-PER_BRANCH = re.compile(r'github\.(?:ref|head_ref|sha)\b|pull_request\.number|github\.event\.number')
-PER_WORKFLOW = re.compile(r'github\.workflow\b')
-PER_RUN = re.compile(r'github\.run_id\b')
+EXPRESSION = re.compile(r'\$\{\{(.*?)\}\}', re.S)
+BEFORE_REF = ('github.head_ref', 'github.event.pull_request.number', 'github.event.number')  # each empty on a push
+BRANCH_EVENTS = ('push', 'pull_request', 'workflow_dispatch')  # github.ref of a run of these names its head_branch
 REFUSED = re.compile(r'\bHTTP 4\d\d\b')
-ORDER = ('uncertain', 'failed', 'recovered')
+ORDER = ('uncertain', 'failed', 'withheld', 'completed', 'recovered')
 # A read that fails or answers in another shape: one run's, which leaves the others' outcomes standing.
 READ_FAILED = (Unusable, KeyError, TypeError, AttributeError, IndexError, ValueError)
 
@@ -131,17 +141,47 @@ def group_of(repo, r):
     return str((c.get('group') if isinstance(c, dict) else c) or '')
 
 
+def scope(group):
+    """What the group's value provably varies with: {'run'}, else a subset of {'workflow', 'branch'}; set() when an
+    expression is of anything else, or there is none (a literal group)."""
+    kinds = set()
+    for e in EXPRESSION.findall(group):
+        terms = [t.strip() for t in e.lower().split('||')]  # GitHub reads context names case-insensitively
+        if terms == ['github.run_id']:
+            kinds.add('run')
+        elif terms == ['github.workflow']:
+            kinds.add('workflow')
+        elif terms[-1] == 'github.ref' and all(t in BEFORE_REF for t in terms[:-1]):
+            kinds.add('branch')
+        else:
+            return set()
+    return {'run'} if 'run' in kinds else kinds
+
+
 def holders(repo, r, group):
-    """The unfinished runs that could share the run's concurrency group, read for what the group names."""
-    if PER_RUN.search(group):
+    """The unfinished runs that could share the run's concurrency group, read for what the group provably names."""
+    kinds = scope(group)
+    if 'run' in kinds:
         return []
     others = [x for s in UNFINISHED for x in pages(f'repos/{repo}/actions/runs?status={s}', 'workflow_runs') if x.get('id') != r['id']]
-    if PER_WORKFLOW.search(group):
-        others = [x for x in others if x.get('workflow_id') == r.get('workflow_id')]
-    if PER_BRANCH.search(group):
-        others = [x for x in others if x.get('head_branch') == r.get('head_branch') and
-                  (x.get('head_repository') or {}).get('full_name') == (r.get('head_repository') or {}).get('full_name')]
+    if 'workflow' in kinds:  # github.workflow is the workflow's name: two files can share one
+        others = [x for x in others if x.get('workflow_id') == r.get('workflow_id') or x.get('name') == r.get('name')]
+    if 'branch' in kinds and r.get('event') in BRANCH_EVENTS:
+        others = [x for x in others if x.get('event') not in BRANCH_EVENTS or x.get('head_branch') == r.get('head_branch')]
     return others
+
+
+def on_head(repo, pr, head, run_id):
+    """(None, the run as read) when PR N is open at head and the run is on its head branch and repository at head, else
+    (why not, None)."""
+    view = gh_json('pr', 'view', str(pr), '-R', repo, '--json', 'state,headRefOid,headRefName,headRepository')
+    if view['state'] != 'OPEN' or view['headRefOid'] != head:
+        return f"PR {pr} is {view['state']} at {view['headRefOid'][:9]}, not open at {head[:9]}", None
+    r = run_of(repo, run_id)
+    if r.get('head_sha') != head or r.get('head_branch') != view['headRefName'] or \
+            (r.get('head_repository') or {}).get('full_name') != view['headRepository']['nameWithOwner']:
+        return "it is not on the PR's head branch and repository at the head", None
+    return None, r
 
 
 def suspect(repo, pr, head, wait, listed):
@@ -157,13 +197,9 @@ def suspect(repo, pr, head, wait, listed):
     newest = gh_json('api', f'repos/{repo}/actions/runs?status=completed&per_page=1')['workflow_runs']
     if not newest or stamp(newest[0]['created_at']) <= queued_at(listed):
         return 'no run in the repository created since it was queued has completed', [], None
-    view = gh_json('pr', 'view', str(pr), '-R', repo, '--json', 'state,headRefOid,headRefName,headRepository')
-    if view['state'] != 'OPEN' or view['headRefOid'] != head:
-        return f"PR {pr} is {view['state']} at {view['headRefOid'][:9]}, not open at {head[:9]}", [], None
-    r = run_of(repo, listed['id'])
-    if r.get('head_sha') != head or r.get('head_branch') != view['headRefName'] or \
-            (r.get('head_repository') or {}).get('full_name') != view['headRepository']['nameWithOwner']:
-        return "it is not on the PR's head branch and repository at the head", [], None
+    why, r = on_head(repo, pr, head, listed['id'])
+    if why:
+        return why, [], None
     if r['status'] != 'queued' or r['run_attempt'] != listed['run_attempt']:
         return f"it is now {r['status']}, attempt {r['run_attempt']}", [], None
     waited = now() - queued_at(r)
@@ -216,7 +252,14 @@ def advance(repo, path, record):
     r = observe(repo, run_id, lambda r: r['status'] == 'completed' or r['run_attempt'] != n, CANCEL_WAIT)
     if r is None:
         return 'uncertain', (f"the cancel ({sent}) has not completed the run within {CANCEL_WAIT} seconds; it is not sent again, and a "
-                             'later run of this script re-runs the run once it reads completed')
+                             'later run of this script re-runs the run once it reads cancelled')
+    if r['run_attempt'] == n and 'rerun' not in record['steps']:
+        if r.get('conclusion') != 'cancelled':
+            return 'completed', (f"attempt {n} completed {r.get('conclusion')} after the cancel ({sent}), not cancelled: it is not "
+                                 're-run')
+        why, r = on_head(repo, record['pr'], record['head'], run_id)
+        if why:
+            return 'withheld', f'the run was cancelled, and its re-run is not sent: {why}'
     if r['run_attempt'] == n or 'rerun' in record['steps']:
         sent = step(repo, path, record, 'rerun', 'rerun')
         if sent.startswith('refused'):
@@ -239,17 +282,18 @@ def one(repo, pr, head, wait, listed):
     path.parent.mkdir(parents=True, exist_ok=True)
     with locked(path):
         record = read(path)
-        if record is None:
-            if listed.get('status') != 'queued':
-                return None
+        if record is None and listed.get('status') != 'queued':
+            return None
+        if record is None or 'cancel' not in record['steps']:  # a record cut short before its cancel proves nothing
             try:
                 why, evidence, r = suspect(repo, pr, head, wait, listed)
             except READ_FAILED as e:
                 why = f'a read failed ({e!r}), so nothing was sent'
             if why:
-                return {**shown, 'outcome': 'skipped', 'reason': why}
+                return {**shown, 'outcome': 'skipped', 'reason': why, 'record': record and str(path)}
+            fresh = record is None
             record = {'repo': repo, 'pr': pr, 'head': head, 'runId': r['id'], 'attempt': r['run_attempt'], 'evidence': evidence, 'steps': {}}
-            write(path, record, new=True)
+            write(path, record, new=fresh)
         try:
             outcome, why = advance(repo, path, record)
         except READ_FAILED as e:

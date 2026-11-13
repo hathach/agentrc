@@ -44,12 +44,14 @@ class GitHub:
     `cancel_after` and `rerun_after` polls of the run, or lost (`lose`) or refused (`refuse`)."""
 
     def __init__(self, runs=None, workflow=WORKFLOW, newest='2026-11-11T21:45:00Z', jobs=0, cancel_after=1, rerun_after=0,
-                 lose=(), refuse=()):
+                 lose=(), refuse=(), cancel_as='cancelled'):
         self.runs = {r['id']: r for r in (runs or [a_run()])}
         self.workflow, self.newest, self.jobs = workflow, newest, jobs
         self.cancel_after, self.rerun_after, self.lose, self.refuse = cancel_after, rerun_after, set(lose), set(refuse)
+        self.cancel_as = cancel_as  # the conclusion the run reads once completed after a cancel
         self.head, self.state, self.posts, self.reads = HEAD, 'OPEN', [], []
         self.after_list = None  # called once the runs on the head have been listed: a race
+        self.after_cancel = None  # called once a cancel was sent: a race
 
     def run(self, *argv, ok=(0,)):
         path = argv[-1]
@@ -97,7 +99,9 @@ class GitHub:
             return 1, '', 'gh: Resource not accessible by integration (HTTP 403)'
         r = self.runs[int(run_id)]
         if what == 'cancel':
-            r['_pending'] = [self.cancel_after, {'status': 'completed', 'conclusion': 'cancelled'}]
+            r['_pending'] = [self.cancel_after, {'status': 'completed', 'conclusion': self.cancel_as}]
+            if self.after_cancel:
+                self.after_cancel()
         else:
             r['_pending'] = [self.rerun_after, {'status': 'queued', 'conclusion': None, 'run_attempt': r['run_attempt'] + 1,
                                                 'run_started_at': '2026-11-11T21:53:00Z'}]
@@ -171,14 +175,25 @@ class Recover(unittest.TestCase):
                 self.assertEqual(self.records(), [], 'nothing recorded')
 
     def test_a_concurrency_group_is_read_for_what_it_names(self):
-        elsewhere = {'id': 9, 'workflow_id': 7, 'status': 'queued', 'head_branch': 'other', 'head_repository': {'full_name': 'o/r'}}
-        other_workflow = dict(elsewhere, workflow_id=8, head_branch='captain-prune')
+        elsewhere = {'id': 9, 'name': 'tests', 'workflow_id': 7, 'status': 'queued', 'head_branch': 'other', 'event': 'pull_request',
+                     'head_repository': {'full_name': 'o/r'}}
+        other_workflow = dict(elsewhere, name='lint', workflow_id=8, head_branch='captain-prune')
+        group = 'concurrency:\n  group: %s\n'.__mod__
         for what, workflow, unfinished, held in (
                 ("another branch's run, per-PR group", WORKFLOW, [elsewhere], False),
                 ("another workflow's run, per-workflow group", WORKFLOW, [other_workflow], False),
+                ('another workflow file of the same name, per-workflow group', WORKFLOW, [dict(other_workflow, name='tests')], True),
+                ("another branch's scheduled run, per-PR group", WORKFLOW, [dict(elsewhere, event='schedule')], True),
                 ('any run, a constant group', 'on: push\nconcurrency: deploy\n', [elsewhere], True),
-                ('another branch, a per-workflow group', 'concurrency:\n  group: ${{ github.workflow }}\n', [elsewhere], True),
+                ('any run, a literal that reads like an expression', 'concurrency: github.run_id\n', [other_workflow], True),
+                ('another branch, a per-workflow group', group('${{ github.workflow }}'), [elsewhere], True),
                 ('a per-run group', 'concurrency: ${{ github.run_id }}\n', [other_workflow], False),
+                ('a per-run group of the workflow', group("ci-${{ github.workflow }}-${{ github.run_id }}"), [elsewhere], False),
+                ('another branch, a ref compared', group("${{ github.ref == 'refs/heads/main' && 'production' || 'staging' }}"),
+                 [elsewhere], True),
+                ('another branch, head_ref alone (empty on a push)', group('${{ github.head_ref }}'), [elsewhere], True),
+                ('another branch, head_ref then ref', group('${{ github.head_ref || github.ref }}'), [elsewhere], False),
+                ('another workflow, a sha beside the workflow', group('${{ github.workflow }}-${{ github.sha }}'), [other_workflow], True),
                 ('no group', 'on: [push]\n', [other_workflow], False)):
             with self.subTest(what):
                 self.fresh()
@@ -203,6 +218,45 @@ class Recover(unittest.TestCase):
         gh = GitHub()
         gh.state = 'CLOSED'
         self.assertEqual((self.go(gh)[1]['outcome'], gh.posts), ('none', []))
+
+    def test_a_cancel_that_did_not_end_in_cancelled_is_never_rerun(self):
+        gh = GitHub(lose={'cancel'}, cancel_as='success')
+        out = self.go(gh)[1]
+        self.assertEqual((out['outcome'], gh.posts), ('completed', [(43095438193, 'cancel')]), 'it ran and passed: no re-run')
+        self.assertIn('completed success', out['runs'][0]['reason'])
+        out = self.go(gh)[1]
+        self.assertEqual((out['outcome'], gh.posts), ('completed', [(43095438193, 'cancel')]), 'a relaunch sends nothing either')
+
+    def test_a_pr_that_moves_during_the_cancel_withholds_the_rerun(self):
+        for what, race, why in (('a new head', lambda gh: setattr(gh, 'head', 'b' * 40), 'not open at aaaaaaaaa'),
+                                ('closed', lambda gh: setattr(gh, 'state', 'CLOSED'), 'PR 533 is CLOSED')):
+            with self.subTest(what):
+                self.fresh()
+                gh = GitHub()
+                gh.after_cancel = lambda: race(gh)
+                out = self.go(gh)[1]
+                self.assertEqual((out['outcome'], gh.posts), ('withheld', [(43095438193, 'cancel')]))
+                self.assertIn(why, out['runs'][0]['reason'])
+                record = json.loads(Path(out['runs'][0]['record']).read_text())
+                self.assertEqual(list(record['steps']), ['cancel'])
+
+    def test_a_record_cut_short_before_its_cancel_is_checked_again(self):
+        path = self.dir / 'o-r-43095438193-1.json'
+        path.write_text(json.dumps({'repo': 'o/r', 'pr': 533, 'head': HEAD, 'runId': 43095438193, 'attempt': 1, 'evidence': ['e'],
+                                    'steps': {}}))
+        gh = GitHub(runs=[a_run(status='in_progress')])
+        out = self.go(gh)[1]
+        self.assertEqual((out['outcome'], gh.posts), ('none', []), 'it started since: no cancel')
+        self.assertEqual((out['runs'][0]['outcome'], out['runs'][0]['record']), ('skipped', str(path)))
+        self.assertIn('it is now in_progress', out['runs'][0]['reason'])
+        gh = GitHub()
+        gh.unfinished = [{'id': 9, 'name': 'tests', 'workflow_id': 7, 'status': 'in_progress', 'head_branch': 'captain-prune',
+                          'event': 'pull_request'}]
+        self.assertEqual((self.go(gh)[1]['outcome'], gh.posts), ('none', []), 'its group is held now')
+        gh.unfinished = []
+        out = self.go(gh)[1]
+        self.assertEqual((out['outcome'], gh.posts), ('recovered', [(43095438193, 'cancel'), (43095438193, 'rerun')]))
+        self.assertNotEqual(json.loads(path.read_text())['evidence'], ['e'], 'the record carries what was read before its cancel')
 
     def test_a_lost_cancel_answer_is_observed_and_never_sent_again(self):
         gh = GitHub(lose={'cancel'})

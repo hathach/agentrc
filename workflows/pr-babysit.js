@@ -3434,10 +3434,10 @@ const runLanes = async (cycle, entry, lanes) => {
     if (c.status === 'running' && now && (now.registered > 0 || now.unmet) && prev && ['head', 'registered', 'pending', 'waiting'].every(k => now[k] === prev[k])) {
       const earlier = ciRecoveries.get(expectedHead)
       const recovery = earlier ?? await recoverCi(cycle, entry)
-      if (!earlier && recovery?.outcome === 'recovered') {
-        // The new attempts are pending checks like any: two more whole waits on them before ci-stuck reads again.
+      if (!earlier && ['recovered', 'completed'].includes(recovery?.outcome)) {
+        // The new attempts, or a run that completed after the cancel, move CI: two more whole waits before ci-stuck reads again.
         delete entry.ciWaited
-        log(`cycle ${cycle}: CI on ${expectedHead.slice(0, 7)}: orphaned run(s) re-run — waiting on them`)
+        log(`cycle ${cycle}: CI on ${expectedHead.slice(0, 7)}: orphaned run(s) ${recovery.outcome === 'recovered' ? 're-run' : 'completed after the cancel'} — waiting on them`)
         return rearm()
       }
       const required = now.unmet ? `; required check(s) not passed: ${now.unmet.join(', ')}` : ''

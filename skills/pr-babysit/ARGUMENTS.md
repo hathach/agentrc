@@ -126,7 +126,8 @@ A key not listed here throws before anything runs.
   head: a run still `queued` with no job past `ciWait`, after which a newer
   run in the repository completed, and that no concurrency group can be
   holding, is cancelled and re-run whole, each step once per run attempt
-  under a record in the git common dir. A recovery re-arms the CI wait and is
+  under a record in the git common dir. A recovery, or a run that completed
+  rather than cancelled (`completed`, not re-run), re-arms the CI wait and is
   never green; any other outcome stops `ci-stuck` with `ciRecovery`: its
   outcome, and each run's evidence, step and record.
 - `ciNotes`: what the caller established about this PR's CI, handed to the

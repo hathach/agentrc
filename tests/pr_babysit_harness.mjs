@@ -2118,11 +2118,17 @@ test('CI stuck through two whole waits asks ci_recover.py once per head; a recov
   for (const [answer, outcome] of [[{ outcome: 'none', detail: 'run 1 attempt 1: skipped, its attempt 1 has 2 job(s)', runs: [] }, 'none'],
     [{ outcome: 'uncertain', detail: 'run 1 attempt 1: uncertain, the cancel has not completed the run', runs: [] }, 'uncertain'],
     [{ outcome: 'failed', detail: 'run 1 attempt 1: failed, GitHub refused the cancel', runs: [] }, 'failed'],
+    [{ outcome: 'withheld', detail: 'run 1 attempt 1: withheld, PR 3888 is OPEN at bbbbbbbbb', runs: [] }, 'withheld'],
     [{ error: 'gh: HTTP 401' }, 'unknown']]) {
     const r = await run({ ci: stuck, ciRecover: answer, args: { maxCycles: 4 } })
     assert.deepEqual([r.result.reason, r.result.cycles, recovers(r.labels)], ['ci-stuck', 2, ['cirecover#2']], outcome)
     assert.equal(r.result.ciRecovery.outcome, outcome)
   }
+  const completed = { outcome: 'completed', detail: 'run 1 attempt 1: completed, attempt 1 completed success', runs: [] }
+  const settled = await run({ ci: stuck, ciRecover: completed, args: { maxCycles: 6 } })
+  assert.deepEqual([settled.result.reason, settled.result.cycles, recovers(settled.labels)], ['ci-stuck', 4, ['cirecover#2']],
+    'a run that completed rather than cancelled re-arms the wait like a recovery')
+  assert.ok(settled.logs.includes(`cycle 2: CI on ${HEAD.slice(0, 7)}: orphaned run(s) completed after the cancel — waiting on them`), settled.logs.join('\n'))
   const dead = await run({ ci: stuck, ciRecover: null, args: { maxCycles: 4 } })
   assert.deepEqual(recovers(dead.labels), ['cirecover#2', 'cirecover#2.retry'], 'a lost line gets one fresh relay: the script dedupes its own steps')
   assert.equal(dead.result.ciRecovery.outcome, 'unknown')
