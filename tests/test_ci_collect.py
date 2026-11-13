@@ -189,10 +189,13 @@ class InventoryTest(unittest.TestCase):
             path = argv[4] if argv[1:3] == ['api', '--paginate'] else argv[2] if argv[1] == 'api' else ''
             ok = lambda out: mock.Mock(returncode=0, stdout=json.dumps(out).encode())
             if path.startswith(f'repos/o/r/actions/runs?head_sha={HEAD}&'):
-                self.calls.append(['head-runs'])
+                # GitHub's own filter for runs awaiting approval: event pull_request, conclusion action_required.
+                gated = path.startswith(f'repos/o/r/actions/runs?head_sha={HEAD}&event=pull_request&status=action_required&')
+                self.calls.append(['gated-runs' if gated else 'head-runs'])
                 if isinstance(self.head_runs, Exception):
                     return mock.Mock(returncode=1, stdout=b'', stderr=str(self.head_runs).encode())
-                return ok([{'total_count': len(self.head_runs), 'workflow_runs': self.head_runs}])
+                runs = [r for r in self.head_runs if r.get('event') == 'pull_request' and r.get('conclusion') == 'action_required'] if gated else self.head_runs
+                return ok([{'total_count': len(runs), 'workflow_runs': runs}])
             if path == 'repos/o/r/branches/master':
                 return ok({'name': 'master', 'protection': self.protection})
             if path.startswith('repos/o/r/rules/branches/master?'):
@@ -259,7 +262,7 @@ class InventoryTest(unittest.TestCase):
                           self.check('lint', 'cancel', 'https://example.com/x')]]
         rc, r = self.main()
         self.assertEqual((rc, r['status'], r['pending']), (0, 'red', 0))
-        self.assertEqual(sorted(r), ['baseRef', 'checks', 'head', 'ignored', 'mergeable', 'observedAt', 'pending', 'registered', 'requiredChecks', 'status', 'waiting'], 'only what the workflow reads, and no null error')
+        self.assertEqual(sorted(r), ['awaitingApproval', 'baseRef', 'checks', 'head', 'ignored', 'mergeable', 'observedAt', 'pending', 'registered', 'requiredChecks', 'status', 'waiting'], 'only what the workflow reads, and no null error')
         self.assertEqual([(c['name'], c['bucket'], c['link']) for c in r['checks']],
                          [('hil', 'fail', JOB.format(3)), ('docs', 'fail', RTD.format(9)), ('lint', 'cancel', 'https://example.com/x')])
         self.assertEqual([c['aliases'] for c in r['checks']], [[], [], []], 'printed empty, so a relay has nothing to add (#50)')
@@ -357,7 +360,7 @@ class InventoryTest(unittest.TestCase):
                 rc, r = self.main()
                 self.assertEqual((rc, r['status'], r['pending'], r['registered']), (0, 'running', 1, 2))
 
-    def test_head_runs_are_read_only_while_no_counted_check_is_pending(self):
+    def test_held_head_runs_count_only_while_no_counted_check_is_pending(self):
         self.heads = [HEAD]
         self.head_runs = [self.head_run(41978191340, 'pending')]
         self.listings = [[self.check('build', 'pending', 'https://github.com/o/r/actions/runs/8/job/1')]]
@@ -372,6 +375,124 @@ class InventoryTest(unittest.TestCase):
         self.listings = [[self.check('cci', 'fail', CIRCLE.format(1))]]
         rc, r = self.main()
         self.assertEqual((r['status'], r['pending'], ['head-runs'] in self.calls), ('running', 1, False), 'a held CircleCI job is pending')
+
+    def gated(self, id_, name, head=HEAD, event='pull_request'):
+        return self.head_run(id_, 'completed', head=head, name=name) | {'conclusion': 'action_required', 'event': event}
+
+    def test_a_head_awaiting_approval_alone_is_its_own_status_never_green_and_named(self):
+        # #545: adafruit/Adafruit_TinyUSB_Arduino#591, Build and HIL completed/action_required, only the bots' checks listed.
+        self.heads = [HEAD]
+        bots = [self.check('CodeRabbit', 'pass', ''), self.check('Greptile Review', 'pass', '')]
+        names = ['Build (run 43344617970, completed/action_required: awaiting maintainer approval)',
+                 'HIL (run 43344617967, completed/action_required: awaiting maintainer approval)']
+        for what, listing, ignore in (('bot checks pass', bots, ()), ('no check at all', [], ()),
+                                      ('only ignored checks', bots, ('--ignore-check', 'CodeRabbit', '--ignore-check', 'Greptile Review'))):
+            with self.subTest(what):
+                self.listings = [listing]
+                self.head_runs = [self.gated(43344617967, 'HIL'), self.gated(43344617970, 'Build'), self.gated(9, 'Build', head=OTHER)]
+                self.calls.clear()
+                rc, r = self.main('--wait-seconds', '600', *ignore)
+                self.assertEqual((rc, r['status'], r['pending'], r['checks'], r['awaitingApproval']), (0, 'awaiting-approval', 2, [], names))
+                self.assertEqual(self.clock[0], 0, 'nothing a wait does moves it: printed at once')
+                self.assertEqual(r['registered'], 2 + len(listing) - len(ignore) // 2)
+                self.assertEqual(r['waiting'], '')
+                self.assertEqual(r['requiredChecks'], [], 'none required')
+                self.assertEqual((self.calls.count(['head-runs']), ['gated-runs'] in self.calls), (1, False),
+                                 'the gates come from the whole listing it reads, no request of their own')
+                self.assertEqual(self.main('--brief', *ignore)[1]['awaitingApproval'], names, 'a brief line names them too')
+        self.listings = [bots]
+        for what, run in (("another head's", self.gated(2, 'Build', head=OTHER)),
+                          # hathach/tinyusb run 43103189104: a fork contributor's review comment, held, on a head whose CI ran.
+                          ('a review comment\'s', self.gated(43103189104, 'Claude Code', event='pull_request_review_comment'))):
+            with self.subTest(what):
+                self.head_runs = [self.head_run(1, 'completed') | {'conclusion': 'success'}, run]
+                rc, r = self.main()
+                self.assertEqual((r['status'], r['pending'], r['awaitingApproval']), ('green', 0, []), f'{what} gate changes nothing')
+
+    def test_a_gate_alone_still_judges_the_required_checks(self):
+        self.heads = [HEAD]
+        self.require('Build', 'CodeRabbit')
+        gate = ['Build (run 43344617970, completed/action_required: awaiting maintainer approval)']
+        self.listings = [[self.check('CodeRabbit', 'fail', '')]]
+        self.head_runs = [self.gated(43344617970, 'Build')]
+        self.commit_statuses = [{'id': 9, 'context': 'CodeRabbit', 'state': 'failure', 'updated_at': '2026-10-01T00:00:00Z'}]
+        rc, r = self.main('--ignore-check', 'CodeRabbit')
+        self.assertEqual((rc, r['status'], r['awaitingApproval'], [(c['context'], c['bucket']) for c in r['requiredChecks']]),
+                         (0, 'red', gate, [('Build', 'missing'), ('CodeRabbit', 'fail')]), 'an ignored required check that failed is red')
+        for state in ('success', 'pending'):
+            with self.subTest(state):
+                self.commit_statuses[0]['state'] = state
+                rc, r = self.main('--ignore-check', 'CodeRabbit')
+                self.assertEqual((r['status'], r['waiting'], r['requiredChecks'][0]['bucket']), ('awaiting-approval', '', 'missing'),
+                                 'a requirement the gated run would provide, or one still pending, waits on the approval too')
+
+    def test_a_run_awaiting_approval_beside_other_work_is_read_by_its_own_filter_and_outranked(self):
+        self.heads = [HEAD]
+        self.require()
+        gate = ['Build (run 43344617970, completed/action_required: awaiting maintainer approval)']
+        self.listings = [[self.check('build', 'pending', 'https://github.com/o/r/actions/runs/8/job/1'), self.check('lint', 'fail', JOB.format(4))]]
+        self.head_runs = [self.head_run(41978191340, 'pending'), self.gated(43344617970, 'Build')]
+        rc, r = self.main()
+        self.assertEqual((rc, r['status'], r['pending'], r['registered']), (0, 'running', 2, 3), 'a pending check keeps it running')
+        self.assertEqual(r['awaitingApproval'], gate)
+        self.assertEqual((['head-runs'] in self.calls, self.calls.count(['gated-runs'])), (False, 1),
+                         'the whole listing is not read while a check is pending: the gates by GitHub\'s filter')
+        self.assertEqual([(c['name'], c['bucket']) for c in r['checks']], [('lint', 'fail')], 'listed as no failure')
+        self.listings = [[self.check('build', 'pass', JOB.format(1))]]
+        rc, r = self.main()
+        self.assertEqual((r['status'], r['pending'], r['awaitingApproval']), ('running', 2, gate), 'a held run keeps it running')
+        self.listings = [[self.check('build', 'pass', JOB.format(1)), self.check('lint', 'fail', JOB.format(4))]]
+        self.head_runs = [self.gated(43344617970, 'Build')]
+        rc, r = self.main()
+        self.assertEqual((r['status'], r['pending'], [c['name'] for c in r['checks']], r['awaitingApproval']), ('red', 1, ['lint'], gate),
+                         'a failure is handled first, the gate still named')
+        self.listings = [[self.check('build', 'pass', JOB.format(1))]]
+        for mergeable, want in (('CONFLICTING', 'conflicting'), ('UNKNOWN', 'running')):
+            with self.subTest(mergeable):
+                self.mergeable = [mergeable]
+                self.assertEqual(self.main()[1]['status'], want, 'mergeability outranks the gate')
+
+    def test_the_gates_filtered_read_falls_back_to_a_smaller_page(self):
+        self.heads = [HEAD]
+        self.listings = [[self.check('build', 'pending', JOB.format(1))]]
+        real = collect.subprocess.run
+        sizes = []
+
+        def flaky(argv, **kw):
+            if argv[1:3] == ['api', '--paginate'] and '&event=pull_request&status=action_required&' in argv[4]:
+                sizes.append(argv[4].rsplit('per_page=', 1)[1])
+                if sizes[-1] == '100':
+                    return mock.Mock(returncode=1, stdout=b'', stderr=b'gh: Server Error (HTTP 502)')
+                return mock.Mock(returncode=0, stdout=json.dumps([{'total_count': 1, 'workflow_runs': [self.gated(43344617970, 'Build')]}]).encode())
+            return real(argv, **kw)
+        with mock.patch.object(collect.gh_retry.time, 'sleep', lambda s: None), mock.patch.object(collect.subprocess, 'run', flaky):
+            rc, r = self.main()
+        self.assertEqual((rc, r['status'], len(r['awaitingApproval'])), (0, 'running', 1))
+        self.assertEqual((sizes[0], sizes[-1]), ('100', '50'), 'the whole list read again at a smaller page size')
+
+    def test_a_run_awaiting_approval_on_a_later_page_is_read(self):
+        self.heads = [HEAD]
+        self.listings = [[self.check('build', 'pass', JOB.format(1))]]
+        later = [self.head_run(i, 'completed') | {'conclusion': 'success'} for i in range(1, 101)]
+        real = collect.subprocess.run
+
+        def paged(argv, **kw):
+            if argv[1:3] == ['api', '--paginate'] and argv[4].startswith(f'repos/o/r/actions/runs?head_sha={HEAD}&'):
+                self.calls.append(['head-runs'])
+                pages = [{'total_count': 101, 'workflow_runs': later}, {'total_count': 101, 'workflow_runs': [self.gated(43344617970, 'Build')]}]
+                return mock.Mock(returncode=0, stdout=json.dumps(pages).encode())
+            return real(argv, **kw)
+        with mock.patch.object(collect.subprocess, 'run', paged):
+            rc, r = self.main()
+        self.assertEqual((rc, r['status'], r['pending'], len(r['awaitingApproval'])), (0, 'awaiting-approval', 1, 1))
+
+    def test_unreadable_head_runs_are_an_error_with_checks_pending_too(self):
+        self.heads = [HEAD]
+        self.listings = [[self.check('build', 'pending', JOB.format(1))]]
+        self.head_runs = Exception('gh: Not Found (HTTP 404)')
+        rc, r = self.main()
+        self.assertEqual((rc, 'status' in r), (1, False))
+        self.assertIn('HTTP 404', r['error'])
 
     def test_unreadable_head_runs_are_an_error(self):
         self.heads = [HEAD]
@@ -641,7 +762,7 @@ class InventoryTest(unittest.TestCase):
         self.listings = [[self.check('hil', 'pending', JOB.format(3)), self.check('lint', 'fail', JOB.format(4))]]
         rc, r = self.main('--brief')
         self.assertEqual((rc, r['status'], r['pending'], r['checks']), (0, 'running', 1, []))
-        self.assertEqual(sorted(r), ['baseRef', 'checks', 'head', 'ignored', 'mergeable', 'observedAt', 'pending', 'registered', 'requiredChecks', 'status', 'waiting'], 'the same members as a whole line')
+        self.assertEqual(sorted(r), ['awaitingApproval', 'baseRef', 'checks', 'head', 'ignored', 'mergeable', 'observedAt', 'pending', 'registered', 'requiredChecks', 'status', 'waiting'], 'the same members as a whole line')
         self.assertNotIn(['api', 'repos/o/r/actions/jobs/4'], self.calls, 'a check nobody is shown is not resolved')
         self.assertEqual(r['waiting'], self.main()[1]['waiting'], 'the pending checks it hides still fingerprint the wait')
         self.listings = [[self.check('hil', 'pass', JOB.format(3)), self.check('lint', 'fail', JOB.format(4))]]

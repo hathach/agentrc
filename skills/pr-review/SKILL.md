@@ -288,7 +288,9 @@ carries the earlier findings, replies and receipts.
   verified HIL regression request changes. A disputed finding never blocks, and the body
   names it apart from the findings the verdict rests on;
   approval needs nothing open above a nit, no finding under dispute, every
-  scan and verifier accounted for, green CI and hardware covered when the
+  scan and verifier accounted for, green CI (Actions runs awaiting a maintainer's
+  approval, lib/check_runs.py's rule that pr-babysit's CI lane shares, read pending,
+  never green: `ci.blocker` names them) and hardware covered when the
   change touches it. On a pending review the human picks the event; auto-post
   never approves.
 - Review comments carry no footer or attribution.

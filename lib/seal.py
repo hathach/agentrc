@@ -5,6 +5,7 @@ One copy for every script whose line a relay runs: pr-babysit's facts.py, ci-rer
 pr-reply's reply.py.
 """
 
+import errno
 import json
 import os
 import re
@@ -65,15 +66,19 @@ def sealed(facts):
     return {**facts, 'seal': fnv1a(canonical({k: v for k, v in facts.items() if k != 'error'}))}
 
 
-# The exit status when the file AGENTRC_EMIT names cannot be claimed: a file there is an earlier run's, and this run
-# does nothing.
+# The exit status when the file AGENTRC_EMIT names is there, an earlier run's, or may be (a refusal such as EACCES
+# does not say whether one is): this run does nothing.
 EMIT_REFUSED = 3
+# The exit status when no file can be there: its directory is missing or not a directory. No run claimed it, and this
+# one does nothing.
+EMIT_UNCLAIMABLE = 4
 
 
 def claim():
     """Claim the file AGENTRC_EMIT names before the script does anything: created empty with O_EXCL, so a rerun that
-    meets an earlier run's file, finished or cut short, exits EMIT_REFUSED at once with nothing done; popped, so no
-    child the script starts (a hook running these scripts) claims it too."""
+    meets an earlier run's file, finished or cut short, or cannot tell (EACCES, EPERM...), exits EMIT_REFUSED at once
+    with nothing done, and one whose directory is missing exits EMIT_UNCLAIMABLE; popped, so no child the script starts
+    (a hook running these scripts) claims it too."""
     path = os.environ.pop('AGENTRC_EMIT', None)
     if not path:
         return None, None
@@ -83,7 +88,7 @@ def claim():
         why = f'AGENTRC_EMIT {path}: {e.strerror}: nothing was run'
         print(why, file=sys.stderr)
         print(json.dumps({'error': why}))
-        sys.exit(EMIT_REFUSED)
+        sys.exit(EMIT_UNCLAIMABLE if e.errno in (errno.ENOENT, errno.ENOTDIR) else EMIT_REFUSED)
 
 
 EMIT_TO, emit_fd = claim()

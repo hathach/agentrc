@@ -1,0 +1,2 @@
+# Claude Code refuses a workflow script with CR bytes (#528)
+/workflows/*.js text eol=lf

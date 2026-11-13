@@ -35,7 +35,10 @@ exceed it. `tooling` lists the PR's changed paths that execute when the PR is
 built or tested (build files, scripts, CI, the HIL harness): the caller reads
 their diff before building anything. `ci` summarises the head's checks:
 `unobserved` with none, `red`, `pending` (action_required included), `green`,
-`unknown` for a state none of these covers.
+`unknown` for a state none of these covers. The head's Actions runs awaiting a maintainer's approval are read too
+(lib/check_runs.py's gated_runs, the approval gate on a fork PR): such a run registers no check, so it makes the state
+`pending` unless red, counts in `actionRequired` and is named in `blocker`; runs that cannot be read leave `unknown`
+unless red or pending, `blocker` saying why. `blocker` is absent otherwise.
 
 --auto-fix adds `repair`: whether an auto-fix run's repairs can be pushed to the PR's head branch (headRepo,
 headBranch), {state, why}: `available` with push access to the head repository, or for a cross-repository PR allowing
@@ -89,6 +92,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'pr-babysit' / 'scr
 from facts import FULL_SHA, HOST, Parser, Unusable, attempt, checkout_repo, checkout_top, git, github_repo, report, run  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
 import gh_retry  # noqa: E402
+from check_runs import gated_runs  # noqa: E402
 
 # Paths that run when a PR is built or tested; their diff is read before any build.
 TOOLING = re.compile(r'(^|/)(CMakeLists\.txt|Makefile|[^/]+\.(cmake|mk|py|sh|ps1|bat))$'
@@ -272,7 +276,15 @@ def remote_for(repo):
     raise Unusable(f'no remote of this checkout is {repo} (remotes: {", ".join(sorted(set(names))) or "none"})')
 
 
-def ci_summary(repo, pr):
+def workflow_runs(path):
+    """Every workflow run a paginated Actions runs path lists."""
+    pages = gh_json('api', '--paginate', '--slurp', f'{path}&per_page=100')[1] or []
+    if not all(isinstance(p, dict) and isinstance(p.get('workflow_runs', []), list) for p in pages):
+        raise Unusable(f'{path} read in a shape prepare.py does not')
+    return [r for p in pages for r in p.get('workflow_runs') or []]
+
+
+def ci_summary(repo, pr, head):
     # gh exits 8 while checks are pending and 1 when the PR has none.
     code, checks = gh_json('pr', 'checks', str(pr), '--repo', repo, '--json', 'name,state,workflow,link', ok=(0, 1, 8))
     checks = checks or []
@@ -280,9 +292,17 @@ def ci_summary(repo, pr):
     counts = {}
     for s in states:
         counts[s] = counts.get(s, 0) + 1
-    state = ('unobserved' if not checks else 'red' if any(s in FAILED for s in states)
-             else 'pending' if any(s in PENDING for s in states) else 'green' if all(s in PASSED for s in states) else 'unknown')
-    return {'state': state, 'counts': counts, 'actionRequired': counts.get('ACTION_REQUIRED', 0)}, checks
+    # Runs awaiting approval register no check run (#545); None when they could not be read.
+    try:
+        gated, blocker = gated_runs(repo, head, workflow_runs), None
+    except Unusable as e:
+        gated, blocker = None, f"the head's Actions runs could not be read: {e}"
+    if gated:
+        blocker = f"{len(gated)} Actions run(s) wait for maintainer approval: " + ', '.join(f"{r.get('name') or r.get('path')} (run {r.get('id')})" for r in gated)
+    state = ('red' if any(s in FAILED for s in states) else 'pending' if gated or any(s in PENDING for s in states)
+             else 'unknown' if gated is None else 'unobserved' if not checks else 'green' if all(s in PASSED for s in states) else 'unknown')
+    return {'state': state, 'counts': counts, 'actionRequired': counts.get('ACTION_REQUIRED', 0) + len(gated or []),
+            **({'blocker': blocker} if blocker else {})}, checks
 
 
 def groups_of(paths, cap):
@@ -496,7 +516,7 @@ def prepare(a):
         pr_paths = changed(merge_base, head)
         scope = pr_paths if mode != 'incremental' else changed(scope_base, head)
         groups, over = groups_of(scope, MAX_GROUPS)
-        ci, checks = ci_summary(repo, a.pr)
+        ci, checks = ci_summary(repo, a.pr, head)
         facts = facts_path(repo, a.pr, head)
         facts.parent.mkdir(parents=True, exist_ok=True)
         pins = {'head': head, 'mergeBase': merge_base, 'scopeBase': scope_base, 'mode': mode, 'groups': groups,
@@ -544,7 +564,7 @@ def check(a):
         pinned = json.loads(facts.read_text(encoding='utf-8'))
     except (OSError, ValueError):
         raise Unusable(f'no prepare facts for {local} at {facts}: run prepare first')
-    return {'ok': True, 'head': local, 'top': Path(os.path.realpath(top)).as_posix(), 'repo': repo, 'pr': a.pr, 'ci': ci_summary(repo, a.pr)[0],
+    return {'ok': True, 'head': local, 'top': Path(os.path.realpath(top)).as_posix(), 'repo': repo, 'pr': a.pr, 'ci': ci_summary(repo, a.pr, local)[0],
             # A prepare from before --recheck-from or priorHead pinned neither.
             'pins': {**{k: pinned[k] for k in ('mergeBase', 'scopeBase', 'mode', 'groups')}, 'recheckFrom': pinned.get('recheckFrom'),
                      'priorHead': pinned.get('priorHead')}}

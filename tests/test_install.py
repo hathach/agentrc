@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import guard_survivors  # noqa: E402
+from helpers import git_env, guard_survivors  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / 'install.py'
@@ -394,6 +394,27 @@ class InstallTest(unittest.TestCase):
 
 AGENTS_MD = sorted(p.name for p in (ROOT / 'agents').glob('*.md'))
 WORKFLOWS = sorted(p.name for p in (ROOT / 'workflows').glob('*.js'))
+
+
+class WorkflowLineEndings(unittest.TestCase):
+    """agentrc#528: a checkout that converts text to CRLF (core.autocrlf on Windows) still writes workflows with LF."""
+
+    def git(self, *argv, cwd):
+        subprocess.run(['git', *argv], cwd=cwd, env=git_env(), check=True, capture_output=True)
+
+    def test_a_crlf_checkout_keeps_workflows_lf_and_only_them(self):
+        with tempfile.TemporaryDirectory() as td:
+            src, dst = Path(td) / 'src', Path(td) / 'dst'
+            (src / 'workflows').mkdir(parents=True)
+            shutil.copy(ROOT / '.gitattributes', src / '.gitattributes')
+            (src / 'workflows' / 'w.js').write_bytes(b'export const meta = {}\nconst x = 1\n')
+            (src / 'notes.txt').write_bytes(b'a\nb\n')
+            self.git('init', '-q', cwd=src)
+            self.git('add', '-A', cwd=src)
+            self.git('commit', '-qm', 'x', cwd=src)
+            self.git('-c', 'core.autocrlf=true', 'clone', '-q', str(src), str(dst), cwd=td)
+            self.assertNotIn(b'\r', (dst / 'workflows' / 'w.js').read_bytes())
+            self.assertIn(b'\r\n', (dst / 'notes.txt').read_bytes(), 'the control file was not converted: no case')
 
 
 class ProjectInstallTest(unittest.TestCase):
