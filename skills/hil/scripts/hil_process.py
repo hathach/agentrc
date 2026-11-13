@@ -18,8 +18,9 @@ Contract:
   being spawned are deferred into the cleanup `try`; any interrupt SIGTERMs the group, waits
   for it at most TERM_GRACE s (half of `reap_grace`), SIGKILLs it, closes our pipe ends without
   reaping, and propagates; a second interrupt in that wait cuts it short, and one during the
-  timeout's stop kills at once. Either wait ends early once the leader exited and /proc shows
-  no other live member of its group; the leader stays unreaped until the SIGKILL
+  timeout's stop kills at once, or once that stop's SIGKILL is sent, only closes our pipe ends.
+  Either wait reads what the group writes to our pipes and ends early once the leader exited and
+  /proc shows no other live member of its group; the leader stays unreaped until the SIGKILL
   (_stop_interrupted has the one case it cannot keep the pgid: an interrupt CPython's
   communicate() reaped behind).
 - `run_alongside` adds no bound around `work()`; only its reap is bounded.
@@ -178,12 +179,31 @@ def _group_survivors(pgid: int) -> bool:
     return False
 
 
+def _drain(p: subprocess.Popen, until: float, eof: set) -> None:
+    """Read what the group writes to our pipes until `until` (monotonic): a member blocked on a full
+    pipe could not finish its TERM cleanup. It goes to the buffers a started communicate() returns
+    it from (CPython's POSIX _fileobj2output), else nowhere. A pipe at EOF joins `eof` (its fd), left
+    open for communicate() to close."""
+    bufs = getattr(p, '_fileobj2output', {})
+    pipes = {f.fileno(): f for f in (p.stdout, p.stderr) if f is not None and not f.closed and f.fileno() not in eof}
+    poller = select.poll()
+    for fd in pipes:
+        poller.register(fd, select.POLLIN)
+    while (left := until - time.monotonic()) > 0:
+        for fd, _ in poller.poll(math.ceil(left * 1000)):
+            if data := os.read(fd, 32768):
+                bufs.get(pipes[fd], []).append(data)
+            else:
+                eof.add(fd)
+                poller.unregister(fd)
+
+
 def _await_group(p: subprocess.Popen, deadline: float) -> bool:
     """Wait until `deadline` (monotonic) for the leader to exit and /proc to show no other live
-    member of its group: True once it does (best-effort: a look can miss a member forked during
-    it), False at the deadline, each /proc look bounded by what is left. The leader is never reaped here: its zombie keeps the pgid ours for a SIGKILL
-    that follows. Pipes are not drained meanwhile; the reap after that SIGKILL reads them."""
-    last = []
+    member of its group, draining our pipes meanwhile: True once it does (best-effort: a look can
+    miss a member forked during it), False at the deadline, each /proc look bounded by what is left.
+    The leader is never reaped here: its zombie keeps the pgid ours for a SIGKILL that follows."""
+    last, eof = [], set()
     while True:
         try:
             exited = p.returncode is not None or os.waitid(os.P_PID, p.pid,
@@ -196,18 +216,20 @@ def _await_group(p: subprocess.Popen, deadline: float) -> bool:
         left = deadline - time.monotonic()
         if left <= 0:
             return False
-        time.sleep(min(GROUP_POLL, left))
+        _drain(p, time.monotonic() + min(GROUP_POLL, left), eof)
 
 
-def _stop_group(p: subprocess.Popen, reap_grace: float) -> tuple:
+def _stop_group(p: subprocess.Popen, reap_grace: float, stop: dict) -> tuple:
     """The timeout's stop: SIGTERM the group, wait for it _term_wait(reap_grace), SIGKILL whatever is
     left (a member that ignored the TERM) and reap the leader for the rest of reap_grace: (out,
     err). TimeoutExpired when something outlived the SIGKILL. The timed-out communicate() reaped
-    nothing, so the pgid stays ours throughout."""
+    nothing, so the pgid stays ours until that reap. `stop` gets 'killed' once the SIGKILL is sent:
+    an interrupt after it must not signal the group again, its leader perhaps reaped by communicate()."""
     term = _term_wait(reap_grace)
     _kill_group(p, signal.SIGTERM)
     _await_group(p, time.monotonic() + term)
     _kill_group(p)
+    stop['killed'] = True
     return p.communicate(timeout=reap_grace - term)
 
 
@@ -338,6 +360,7 @@ def run_alongside(argv: list, work, timeout: int, *,
         raise
 
     reaped = stopping = False
+    stop = {}
 
     def _reap() -> subprocess.CompletedProcess:
         nonlocal reaped, stopping
@@ -348,7 +371,7 @@ def run_alongside(argv: list, work, timeout: int, *,
         except subprocess.TimeoutExpired:
             stopping = True
             try:
-                out, err = _stop_group(p, reap_grace)
+                out, err = _stop_group(p, reap_grace, stop)
             except subprocess.TimeoutExpired:
                 # Outlasted SIGKILL: uninterruptible, still holding whatever it opened.
                 # Abandoned.
@@ -373,8 +396,9 @@ def run_alongside(argv: list, work, timeout: int, *,
         # Interrupted before a reap completed: as run_cmd's interrupt path. Not keyed on
         # returncode: communicate() reaps the leader on KeyboardInterrupt, its group living on.
         # The pgid stays ours while any member lives.
-        if stopping and not reaped:     # interrupted in the timeout's stop: kill, never wait again
-            _kill_group(p)
+        if stopping and not reaped:     # interrupted in the timeout's stop: kill unless it had, never wait again
+            if 'killed' not in stop:
+                _kill_group(p)
             _close_pipes(p)
         elif not reaped:
             _stop_interrupted(p, reap_grace)
@@ -446,7 +470,7 @@ def _run(cmd, cwd, timeout, binary, split_stderr, quiet, reap_grace, verbose,
     except BaseException:
         hold.release()
         raise
-    timed_out = False
+    timed_out, stop = False, {}
     try:
         if track is not None:
             track['popen'] = p
@@ -458,7 +482,7 @@ def _run(cmd, cwd, timeout, binary, split_stderr, quiet, reap_grace, verbose,
         if track is not None:
             track['timed_out'] = True
         try:
-            out, err = _stop_group(p, reap_grace)
+            out, err = _stop_group(p, reap_grace, stop)
         except subprocess.TimeoutExpired:
             # Something in the group outlived SIGKILL: D state (truly unkillable), or
             # root-owned because sudo FORKS rather than execs, so the wrapper dies and its
@@ -468,9 +492,10 @@ def _run(cmd, cwd, timeout, binary, split_stderr, quiet, reap_grace, verbose,
             out, err = None, None
             _close_pipes(p)
         except BaseException:
-            # interrupted mid-reap, perhaps still in its TERM wait: kill, never wait again; the
-            # BaseException handler below is a sibling
-            _kill_group(p)
+            # interrupted mid-reap, perhaps still in its TERM wait: kill unless the stop had, never wait
+            # again; the BaseException handler below is a sibling
+            if 'killed' not in stop:
+                _kill_group(p)
             _close_pipes(p)
             raise
         # prefer the post-kill buffers (supersets of the exception's), falling back to ex.*

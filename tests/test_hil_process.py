@@ -381,6 +381,16 @@ COOPERATIVE = ('import signal, sys, time\n'
                'print("ready", flush=True)\n'
                'time.sleep(30)\n')
 DEAF = 'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); print("ready", flush=True); time.sleep(30)'
+# A cooperative child that writes more than a pipe holds before its cleanup ends.
+CHATTY = ('import os, signal, sys, time\n'
+          'def bye(*_):\n'
+          '    os.write(1, b"x" * (1 << 20))\n'
+          '    open(sys.argv[1], "w").close()\n'
+          '    os.write(1, b"shutdown command invoked")\n'
+          '    sys.exit(0)\n'
+          'signal.signal(signal.SIGTERM, bye)\n'
+          'print("ready", flush=True)\n'
+          'time.sleep(30)\n')
 
 
 @unittest.skipUnless(os.path.isdir('/proc'), 'reads process groups from /proc')
@@ -600,6 +610,68 @@ class TermBeforeKill(unittest.TestCase):
         p = self.procs[0]
         self._gone(p.pid)
         self.assertTrue(p.stdout.closed, 'our pipe ends leaked')
+
+    def test_an_interrupt_after_the_timeouts_kill_never_signals_the_group_again(self):
+        """CPython's communicate() can reap the leader before an interrupt in the post-kill reap
+        propagates: a later signal could reach another group given the freed pgid."""
+        seen = []
+        real_kill, popen = hp._kill_group, hp.subprocess.Popen
+
+        def spy(p, sig=signal.SIGKILL):
+            seen.append((sig, p.returncode))
+            real_kill(p, sig)
+
+        def hooked(*a, **k):
+            p = popen(*a, **k)
+            real, calls = p.communicate, []
+
+            def communicate(*args, **kwargs):
+                calls.append(1)
+                if len(calls) == 2:         # the post-kill reap
+                    p.wait()
+                    raise KeyboardInterrupt
+                return real(*args, **kwargs)
+            p.communicate = communicate
+            return p
+        argv = [sys.executable, '-c', DEAF]
+        for run in (lambda: hp.run_cmd(argv, timeout=0.3, reap_grace=0.4),
+                    lambda: hp.run_alongside(argv, lambda: None, 0.3, reap_grace=0.4)):
+            seen.clear()
+            with mock.patch.object(hp, '_kill_group', spy), mock.patch.object(hp.subprocess, 'Popen', hooked), \
+                    redirect_stdout(io.StringIO()), self.assertRaises(KeyboardInterrupt):
+                run()
+            p = self.procs[-1]
+            self.assertEqual(p.returncode, -signal.SIGKILL, 'the leader was not reaped: no case to test')
+            self.assertEqual(seen, [(signal.SIGTERM, None), (signal.SIGKILL, None)])
+            self.assertTrue(p.stdout.closed, 'our pipe ends leaked')
+
+    def test_the_term_grace_drains_our_pipes(self):
+        """A cooperative child writing more than a pipe holds while it shuts down still finishes,
+        and the timeout's result keeps every byte."""
+        for run in (lambda: hp.run_cmd([sys.executable, '-c', CHATTY, self.marker], timeout=1),
+                    lambda: hp.run_alongside([sys.executable, '-c', CHATTY, self.marker], lambda: None, 1)):
+            with suppress(FileNotFoundError):
+                os.unlink(self.marker)
+            t0 = time.monotonic()
+            with redirect_stdout(io.StringIO()):
+                r = run()
+            self.assertEqual(r.returncode, 124)
+            out = r.stdout if isinstance(r.stdout, bytes) else r.stdout.encode()
+            self.assertEqual(out, b'ready\n' + b'x' * (1 << 20) + b'shutdown command invoked')
+            self.assertTrue(os.path.exists(self.marker))
+            self.assertLess(time.monotonic() - t0, 1 + hp.TERM_GRACE, 'it waited out the whole TERM grace')
+            self._gone(self.procs[-1].pid)
+        for run in (lambda: hp.run_cmd([sys.executable, '-c', CHATTY, self.marker], timeout=30),
+                    lambda: hp.run_alongside([sys.executable, '-c', CHATTY, self.marker], lambda: None, 30)):
+            with suppress(FileNotFoundError):
+                os.unlink(self.marker)
+            self._interrupt_at(0.5)
+            with self.assertRaises(KeyboardInterrupt):
+                run()
+            self.assertTrue(os.path.exists(self.marker), 'blocked on a full pipe, it was SIGKILLed in its TERM grace')
+            p = self.procs[-1]
+            self._gone(p.pid)
+            self.assertTrue(p.stdout.closed, 'our pipe ends leaked')
 
 
 @unittest.skipUnless(os.path.isdir('/proc'), 'reads process groups from /proc')
