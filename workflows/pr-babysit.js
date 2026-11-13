@@ -344,7 +344,8 @@ const stateBytes = (st) => { const s = JSON.stringify(st); return s.length + 5 *
 // measured before a stateRef load fills args.state.
 const INLINE_STATE_MAX = 64 * 1024
 if (args.state != null) {
-  const size = stateBytes(typeof args.state === 'string' ? JSON.parse(args.state) : args.state)
+  if (typeof args.state === 'string') args.state = JSON.parse(args.state)
+  const size = stateBytes(args.state)
   if (size > INLINE_STATE_MAX) throw new Error(`state passed inline is ${size} bytes, over ${INLINE_STATE_MAX}: pass the saved output as stateRef`)
 }
 // A stateRef load's reading of whether the session directory is the state's checkoutDir: state_transfer.py's sealed
@@ -388,7 +389,7 @@ const ciCacheShaped = (c) => c && typeof c === 'object' &&
 const config = { pr: args.pr, reviewers, autoRun, checkoutDir, ciWait, protected: protectedRe ? protectedRe.source : null, generated: generatedRe ? generatedRe.source : null }
 let restored = null
 if (args.state !== undefined && args.state !== null) {
-  const st = typeof args.state === 'string' ? JSON.parse(args.state) : args.state
+  const st = args.state
   const shaped = st && st.version === STATE_VERSION && (st.pin === null || (st.pin && typeof st.pin === 'object')) &&
     Number.isInteger(st.maxCycles) && st.maxCycles >= 1 &&
     st.config && typeof st.config === 'object' && Number.isInteger(st.cyclesUsed) && st.cyclesUsed >= 0 &&
@@ -1166,8 +1167,15 @@ const stateOut = () => {
   let out = sized(entries)
   if (out.size > STATE_MAX && entries.length && sized([]).size <= STATE_MAX) {
     const bytes = out.size
-    let dropped = 0
-    while (out.size > STATE_MAX) out = sized(entries.slice(++dropped))
+    // The fewest oldest dropped that fit: the size falls as more go, and dropping all of them fits.
+    let lo = 1, hi = entries.length
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1
+      if (sized(entries.slice(mid)).size <= STATE_MAX) hi = mid
+      else lo = mid + 1
+    }
+    const dropped = lo
+    out = sized(entries.slice(dropped))
     log(`state: ${bytes} bytes, over the ${STATE_MAX} a launch loads — the ${dropped} oldest of ${entries.length} CI verdict digest(s) left out, judged again by a later launch`)
   }
   return out

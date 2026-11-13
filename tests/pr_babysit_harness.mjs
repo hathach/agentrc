@@ -2829,19 +2829,24 @@ test('another harvest error keeps today\'s path: every reviewer unknown, re-arme
 })
 
 const cacheFill = (n, from = 0) => Array.from({ length: n }, (_, i) => ({ link: job(from + i), bucket: 'fail', digest: fnv1a(String(from + i)) }))
+const STATE_REF_MAX = 262144 // state_transfer.py's MAX: what a stateRef loads
+const INLINE_STATE_MAX = 65536 // what an inline state may be
+// The largest n in [0, hi] for which fits(n) holds, fits holding up to some n and failing past it.
+const largest = (fits, hi) => {
+  let lo = 0
+  while (lo < hi) { const mid = Math.ceil((lo + hi) / 2); if (fits(mid)) lo = mid; else hi = mid - 1 }
+  return lo
+}
+// n refuted findings, each with its reply: what grows a launch's saved state.
+const refuting = (n, reason) => ({ findings: Array.from({ length: n }, (_, i) => invalidFinding({ commentId: 100 + i, reason })),
+  replies: Array.from({ length: n }, (_, i) => ({ commentId: 100 + i, body: 'not so' })), bots: 'reviewed' })
 
 test('a saved state stays loadable: the oldest CI verdict digests go first, and a state still too large is named', async () => {
-  const MAX = 262144
+  const MAX = STATE_REF_MAX
   // Loaded by stateRef (an inline state stops at 64 KiB), as large as one loads; the launch's refutations then grow it.
   const bytes = (st) => { const t = JSON.stringify(st); return t.length + 5 * (t.match(/[^\x00-\x7e]/g) || []).length }
-  const fill = (make) => {
-    let [lo, hi] = [0, 20000]
-    while (lo < hi) { const mid = Math.ceil((lo + hi) / 2); if (bytes(make(mid)) <= MAX) lo = mid; else hi = mid - 1 }
-    return make(lo)
-  }
+  const fill = (make) => make(largest(n => bytes(make(n)) <= MAX, 20000))
   const base = { cyclesUsed: 1, maxCycles: 2 }
-  const refuting = (n, reason) => ({ findings: Array.from({ length: n }, (_, i) => invalidFinding({ commentId: 100 + i, reason })),
-    replies: Array.from({ length: n }, (_, i) => ({ commentId: 100 + i, body: 'not so' })), bots: 'reviewed' })
   const spent = (state, reviews) => {
     const { state: _, ...args } = adoptionArgs(state, { adoptHead: undefined })
     return run({ args: { ...args, stateRef: { outputFile: '/tmp/tasks/w1.output', digest: state.digest } }, load: state, reviews })
@@ -2877,12 +2882,11 @@ test('a saved state stays loadable: the oldest CI verdict digests go first, and 
 
 test('an inline state keeps the 64 KiB bound a typed copy was given; a stateRef loads one to 256 KiB (#539)', async () => {
   const sized = (target) => {
-    let [lo, hi] = [0, 40000]
     const make = (n) => adoptionState({ cyclesUsed: 1, maxCycles: 2, ciCache: { reruns: [], entries: cacheFill(n) } })
-    while (lo < hi) { const mid = Math.ceil((lo + hi) / 2); if (JSON.stringify(make(mid)).length <= target) lo = mid; else hi = mid - 1 }
-    return [make(lo), make(lo + 1)]
+    const n = largest(m => JSON.stringify(make(m)).length <= target, 40000)
+    return [make(n), make(n + 1)]
   }
-  const [fits, over] = sized(65536)
+  const [fits, over] = sized(INLINE_STATE_MAX)
   const { state: _, ...args } = adoptionArgs(fits, { adoptHead: undefined })
   assert.equal((await run({ args: { ...args, state: fits }, reviews: WAITING })).result.state.cyclesUsed, 2, 'at the bound it loads')
   await assert.rejects(run({ args: { ...args, state: over } }), /state passed inline is 655\d\d bytes, over 65536: pass the saved output as stateRef/)
@@ -2897,13 +2901,10 @@ test('a relaunch from a trimmed state recalls a verdict it kept', async () => {
   const st = first.result.state
   // As many older digests as a stateRef loads; this launch's refutations then take the state over the bound.
   const pad = (n) => seal({ ...st, ciCache: { ...st.ciCache, entries: [...cacheFill(n, 1000), ...st.ciCache.entries] } })
-  let [lo, hi] = [0, 20000]
-  while (lo < hi) { const mid = Math.ceil((lo + hi) / 2); if (JSON.stringify(pad(mid)).length <= 262144) lo = mid; else hi = mid - 1 }
+  const lo = largest(n => JSON.stringify(pad(n)).length <= STATE_REF_MAX, 20000)
   const padded = pad(lo)
-  const refuting = { findings: Array.from({ length: 20 }, (_, i) => invalidFinding({ commentId: 100 + i, reason: 'x'.repeat(1000) })),
-    replies: Array.from({ length: 20 }, (_, i) => ({ commentId: 100 + i, body: 'not so' })), bots: 'reviewed' }
   const trimmed = await run({ store, args: { ...YIELD, stateRef: { outputFile: '/tmp/tasks/w1.output', digest: padded.digest } }, load: padded,
-    reviews: refuting, ci: redWith(RIG).ci })
+    reviews: refuting(20, 'x'.repeat(1000)), ci: redWith(RIG).ci })
   const kept = trimmed.result.state.ciCache.entries
   assert.ok(kept.length > 1 && kept.length < lo + 1, `${kept.length} kept`)
   assert.deepEqual(kept.at(-1), st.ciCache.entries[0])
