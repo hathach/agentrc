@@ -126,12 +126,16 @@ def run(*argv, ok=(0,)):
         raise Unusable(f"{' '.join(argv)}: output is not UTF-8")
 
 
+NOT_STARTED = (124, '', 'not started: the time budget ran out')  # attempt's receipt for a command it never started
+
+
 def attempt(*argv, input=None, env=None):
     """(exit status, stdout, stderr), replacing bad bytes: unlike run, a failure is part of the receipt, one past
-    DEADLINE too (exit 124): a request cut short may have landed, and is the caller's to observe, never to send again."""
+    DEADLINE too (exit 124): a request cut short may have landed, and is the caller's to observe, never to send again;
+    one not started at all is NOT_STARTED."""
     left = time_left()
     if left is not None and left <= 0:
-        return 124, '', 'not started: the time budget ran out'
+        return NOT_STARTED
     try:
         # bytes in: a text-mode stdin on Windows writes each \n as \r\n
         done = subprocess.run(argv, capture_output=True, env=env or gh_env(argv), timeout=left,
@@ -220,15 +224,12 @@ def fsync_dir(path):
 
 def record_dir(kind):
     """pr-babysit/<kind> under the checkout's git common dir, where a script keeps the records of what it sent; each
-    directory made for it durable in its parent."""
-    path = Path(git('rev-parse', '--path-format=absolute', '--git-common-dir').strip()) / 'pr-babysit' / kind
-    missing, p = [], path
-    while not p.exists():
-        missing.append(p)
-        p = p.parent
+    directory on it durable in its parent on every call, so one an earlier call made and did not sync is synced too."""
+    common = Path(git('rev-parse', '--path-format=absolute', '--git-common-dir').strip())
+    path = common / 'pr-babysit' / kind
     path.mkdir(parents=True, exist_ok=True)
-    for made in reversed(missing):
-        fsync_dir(made.parent)
+    for parent in (common, common / 'pr-babysit'):
+        fsync_dir(parent)
     return path
 
 

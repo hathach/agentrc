@@ -23,7 +23,8 @@ Each run attempt acted on is recorded under the checkout's git common dir, in
 pr-babysit/ci-recover/<owner>-<repo>-<run>-<attempt>.json, under one lock held from the reads above to the last step.
 Each step, the cancel and then the re-run (`POST .../rerun`, every job: none ran, so not --failed), is written there
 before its request and its answer after, and is sent at most once per run attempt by any run of this script: a step
-whose answer was lost is observed, never sent again. The re-run is sent only once the run reads completed after the
+whose answer was lost is observed, never sent again; one the budget stopped before its request started is dropped from
+the record again, for a later run to send. The re-run is sent only once the run reads completed after the
 cancel, waited on up to CANCEL_WAIT seconds, and only when its attempt concluded `cancelled` and PR N is still open at
 SHA with the run on its head; its new attempt is looked for up to RERUN_WAIT seconds. A record whose cancel was not
 written yet is checked as a new one; a later run of this script on the same head resumes a record whose cancel
@@ -55,7 +56,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from coderabbit_trigger import pull_at  # noqa: E402
 import facts  # noqa: E402
-from facts import FULL_SHA, Busy, OutOfTime, Parser, Unusable, attempt, bind_repo, locked, read_record, record_dir, report, utc, write_record  # noqa: E402
+from facts import FULL_SHA, NOT_STARTED, Busy, OutOfTime, Parser, Unusable, attempt, bind_repo, locked, read_record, record_dir, report, utc, write_record  # noqa: E402
 from harvest import gh_json, pages, stamp, workflow_doc, yaml  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
 from check_runs import RUN_PENDING  # noqa: E402
@@ -217,12 +218,18 @@ def observe(repo, run_id, done, seconds):
 
 
 def step(repo, path, record, name, endpoint):
-    """Send one step once: written before its POST, its answer after; an earlier answer when it was sent already."""
+    """Send one step once: written before its POST, its answer after; an earlier answer when it was sent already; None,
+    the step dropped from the record again, when the budget ran out before its POST started."""
     if name not in record['steps']:
         due()
         record['steps'][name] = {'at': utc(time.time())}
         write_record(path, record)
-        code, _, err = attempt('gh', 'api', '-X', 'POST', f"repos/{repo}/actions/runs/{record['runId']}/{endpoint}")
+        got = attempt('gh', 'api', '-X', 'POST', f"repos/{repo}/actions/runs/{record['runId']}/{endpoint}")
+        if got == NOT_STARTED:
+            del record['steps'][name]
+            write_record(path, record)
+            return None
+        code, _, err = got
         record['steps'][name]['answer'] = answer(code, err)
         write_record(path, record)
     return record['steps'][name].get('answer') or 'unknown: the record holds no answer (a run cut short after sending)'
@@ -231,9 +238,9 @@ def step(repo, path, record, name, endpoint):
 def advance(repo, path, record):
     """(outcome, reason): the record's next step taken, or what its last one shows."""
     run_id, n = record['runId'], record['attempt']
-    if 'cancel' not in record['steps'] and left() <= 0:
+    sent = step(repo, path, record, 'cancel', 'cancel') if 'cancel' in record['steps'] or left() > 0 else None
+    if sent is None:
         return 'skipped', 'the time budget ran out before the cancel: nothing was sent'
-    sent = step(repo, path, record, 'cancel', 'cancel')
     if sent.startswith('refused'):
         return 'failed', f'GitHub refused the cancel ({sent}); nothing more is sent for attempt {n}'
     r = observe(repo, run_id, lambda r: r['status'] == 'completed' or r['run_attempt'] != n, CANCEL_WAIT)
@@ -247,10 +254,10 @@ def advance(repo, path, record):
         why, r = on_head(repo, record['pr'], record['head'], run_id)
         if why:
             return 'withheld', f'the run was cancelled, and its re-run is not sent: {why}'
-        if left() <= 0:
-            return 'uncertain', 'the run was cancelled, and the time budget ran out before its re-run: a later run of this script sends it'
     if r['run_attempt'] == n or 'rerun' in record['steps']:
-        sent = step(repo, path, record, 'rerun', 'rerun')
+        sent = step(repo, path, record, 'rerun', 'rerun') if 'rerun' in record['steps'] or left() > 0 else None
+        if sent is None:
+            return 'uncertain', 'the run was cancelled, and the time budget ran out before its re-run: a later run of this script sends it'
         if sent.startswith('refused'):
             return 'failed', f'the run was cancelled, and GitHub refused its re-run ({sent}); nothing more is sent for attempt {n}'
         r = observe(repo, run_id, lambda r: r['run_attempt'] > n, RERUN_WAIT)

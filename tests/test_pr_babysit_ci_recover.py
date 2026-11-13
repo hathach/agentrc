@@ -340,6 +340,27 @@ class Recover(unittest.TestCase):
         self.assertEqual((self.go(gh)[1]['outcome'], gh.posts), ('recovered', [(43095438193, 'cancel'), (43095438193, 'rerun')]),
                          'a later run checks it again and goes on')
 
+    def test_a_step_the_budget_stops_before_its_request_is_sent_by_a_later_run(self):
+        import facts
+        for what, first, posts in (('cancel', ('none', []), [(43095438193, 'cancel'), (43095438193, 'rerun')]),
+                                   ('rerun', ('uncertain', [(43095438193, 'cancel')]), [(43095438193, 'cancel'), (43095438193, 'rerun')])):
+            with self.subTest(what):
+                self.fresh()
+                gh, real = GitHub(), recover.write_record
+                post = gh.attempt
+                gh.attempt = lambda *argv, **kw: facts.attempt(*argv, **kw) if facts.time_left() <= 0 else post(*argv, **kw)
+
+                def write(path, record, new=False):  # the budget runs out while the step is written, before its POST
+                    real(path, record, new)
+                    if 'answer' not in record['steps'].get(what, {'answer': None}):
+                        self.clock[0] += recover.BUDGET
+                with mock.patch.object(recover, 'write_record', write):
+                    out = self.go(gh)[1]
+                self.assertEqual((out['outcome'], gh.posts), first)
+                self.assertIn('the time budget ran out before', out['runs'][0]['reason'])
+                self.assertNotIn(what, json.loads(Path(out['runs'][0]['record']).read_text())['steps'], 'not sent: no step')
+                self.assertEqual((self.go(gh)[1]['outcome'], gh.posts), ('recovered', posts), 'a later run sends it')
+
     def test_reads_stop_once_the_budget_is_spent_however_many_runs_are_queued(self):
         gh = GitHub(runs=[a_run(id_=1000 + i) for i in range(100)])
         answer = gh.run
@@ -492,6 +513,9 @@ class DurableRecord(unittest.TestCase):
             made = self.synced(lambda: facts.record_dir('ci-recover'))
         self.assertEqual(made, [ino(common), ino(common / 'pr-babysit')], 'each new directory in its parent')
         self.assertTrue((common / 'pr-babysit' / 'ci-recover').is_dir())
+        with mock.patch.object(facts, 'git', lambda *a: f'{common}\n'):
+            again = self.synced(lambda: facts.record_dir('ci-recover'))
+        self.assertEqual(again, made, 'each directory on it again: an earlier call may have stopped before its sync')
 
 
 if __name__ == '__main__':
