@@ -317,12 +317,14 @@ const emitted = async (prompt, { label, inputDir, ...opts }) => {
     if (refused) log(`${label}: the line an earlier attempt of this call wrote, reloaded`)
     return { line: m.line }
   }
-  // A stage that refused its input ran no script, in the last attempt of this call that ran it: a definite failure,
-  // in its own line's words.
+  // A stage that refused its input ran no script, in the last attempt of this call that ran it: a definite failure, in
+  // its own line's words, unless an earlier attempt's script claimed its file (m loaded) and may have acted before dying.
   const st = prompt.includes(STAGE_LINE) && await load(stageFile)
-  if (st && st.emit === stageFile && st.line && typeof st.line.error === 'string') return { why: st.line.error, stage: true }
-  if (refused) {
-    log(`${label}: an earlier attempt of this call claimed ${file} and left no line of it — its outcome is unknown`)
+  const stageError = st && st.emit === stageFile && st.line && typeof st.line.error === 'string' ? st.line.error : null
+  if (stageError !== null && m === null) return { why: stageError, stage: true }
+  if (refused || stageError !== null) {
+    log(`${label}: ${stageError !== null ? `its stage refused its input (${stageError}), and ` : ''}an earlier attempt of this call ` +
+      `claimed ${file} and left no line of it — its outcome is unknown`)
     return { dead: true, why: 'an earlier attempt left no line: its outcome is unknown' }
   }
   return { dead: !m && !ran, why: m ? `${file} holds no line written for it` : !ran ? 'the relay died'

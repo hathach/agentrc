@@ -690,23 +690,22 @@ async function run(opts = {}) {
           const stageFile = String(prompt).match(/ stage '[^']+' [0-9a-f]{8} --from-transcript --line '([^']+)' /)?.[1]
           // opts.stageError(label): facts.py stage refused the payload, writing that error as its own line; the script never ran.
           const refusal = stageFile && opts.stageError && opts.stageError(options.label)
+          const record = () => calls.push({ label: options.label, prompt: String(prompt), agentType: options.agentType, phase: options.phase, schema: options.schema, model: options.model })
+          // The command's order: facts.py stage writes its own line, rewritten on every run, before the script claims its file.
+          if (stageFile && !refusal) writeFileSync(stageFile, moduleOf(stageFile, { staged: PAYLOAD_LINE.exec(String(prompt))[1] }))
           if (file === undefined) answer = await agent(prompt, options)
-          else if (existsSync(file)) answer = { exit: 3 }
           else if (refusal) {
-            calls.push({ label: options.label, prompt: String(prompt), agentType: options.agentType, phase: options.phase, schema: options.schema, model: options.model })
+            record()
             writeFileSync(stageFile, moduleOf(stageFile, { error: refusal }))
             answer = { exit: 2, error: 'the stage failed' }
-          } else {
-            writeFileSync(file, '')
-            // facts.py stage's own line, rewritten on every run of the command: staged, before the script runs.
-            if (stageFile) writeFileSync(stageFile, moduleOf(stageFile, { staged: PAYLOAD_LINE.exec(String(prompt))[1] }))
+          } else if (stageFile && opts.cutAfterStage && opts.cutAfterStage(options.label)) {
             // opts.cutAfterStage(label): the command was cut short once its stage had run, before its script claimed its file.
-            if (stageFile && opts.cutAfterStage && opts.cutAfterStage(options.label)) {
-              calls.push({ label: options.label, prompt: String(prompt), agentType: options.agentType, phase: options.phase, schema: options.schema, model: options.model })
-              rmSync(file)
-              entry.answer = null
-              return null
-            }
+            record()
+            entry.answer = null
+            return null
+          } else if (existsSync(file)) answer = { exit: 3 }
+          else {
+            writeFileSync(file, '')
             const line = await agent(prompt, { ...options, schema: null })
             const sealed = !line || 'seal' in line || line.error ? line : sealLine(line)
             const wrote = opts.garble ? opts.garble(options.label, sealed) : sealed
@@ -3972,6 +3971,24 @@ test('a payload facts.py stage refused publishes nothing, is named as the stage,
     stageError: (l) => l === 'sonar#1' && 'facts.py stage: no AGENTRC-PAYLOAD line for /x.in 0a1b2c3d' })
   assert.ok(sonar.logs.includes('sonar#1: facts.py stage: no AGENTRC-PAYLOAD line for /x.in 0a1b2c3d — the issues stay owed, nothing more is asked this launch'),
     sonar.logs.join('\n'))
+})
+
+test("a stage refusing on a resume after reply.py claimed its file is no definite failure: the receipt is replayed (#540)", async () => {
+  const reviews = { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'no' }], bots: 'reviewed' }
+  const world = { reviews, receiptFiles: new Map(), replied: new Set(), rerunReuses: true }
+  // reply.py posted and saved its receipt, then died before its line: its claim stays, empty.
+  const first = await run({ ...world, garble: (l, a) => l === 'replies#1' ? null : a, keepEmit: true })
+  try {
+    const prefix = first.journal.slice(0, first.journal.findIndex(j => j.label === 'replies#1'))
+    const why = 'facts.py stage: no AGENTRC-PAYLOAD line for /x.in 0a1b2c3d'
+    const resumed = await run({ ...world, resume: prefix, stageError: (l) => l === 'replies#1' && why })
+    assert.deepEqual(resumed.journal.map(j => j.label).filter(l => l.startsWith('replies#')), ['replies#1', 'replies#1.replay'], resumed.logs.join('\n'))
+    assert.ok(resumed.logs.some(l => l.startsWith('replies#1: its stage refused') && l.endsWith('its outcome is unknown')), resumed.logs.join('\n'))
+    assert.ok(resumed.logs.includes("replies#1: recovered from reply.py's saved receipt"), resumed.logs.join('\n'))
+    const posts = resumed.result.history[0].refutedPosts
+    assert.equal(posts.pass, true)
+    assert.deepEqual(posts.receipts.map(r => [r.sent, r.posted, r.verified, r.resolved]), [[true, true, true, true]], 'what the first run did')
+  } finally { rmSync(first.emitRoot, { recursive: true, force: true }) }
 })
 
 test('a command cut short after its stage ran stages again on a resume and runs its script (#540)', async () => {
