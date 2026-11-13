@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict'
-import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { dirname } from 'node:path'
 import { test } from 'node:test'
-import { ABSENT, AsyncFunction, emitDirs, emitOf, loadModule, moduleOf } from './emit_stub.mjs'
+import { ABSENT, AsyncFunction, SENTINEL, claimOf, emitDirs, emitOf, loadModule, moduleOf } from './emit_stub.mjs'
 
 const body = readFileSync(new URL('../workflows/pr-review.js', import.meta.url), 'utf8')
   .replace(/^export const meta = /m, 'const meta = globalThis.__meta = ')
@@ -21,16 +22,18 @@ const confirmedAs = (severity, over = {}) => ({ verdict: 'confirmed', reason: 'y
 const REFUTED = { verdict: 'refuted', reason: 'no', severity: null, impact: null, severityReason: null, confidence: null }
 
 // Stub agents keyed by label; `stubs.<label>` is the value, or a function of the prompt. A relay's stub is its script's
-// line, which lands in the file its command names as lib/seal.py's emit writes it, claimed before the script runs (one
-// there is exit 3, nothing run), null a relay that died before it wrote; the relay answers its exit. `opts.resume` is an earlier run's journal, answered
+// line, which lands in the file its command names as lib/seal.py's emit writes it, claimed before the script runs as
+// lib/seal.py's claim does (`opts.beforeClaim(label, file)` changing its directory first), null a relay that died before
+// it wrote; the relay answers its exit. `opts.resume` is an earlier run's journal, answered
 // in order as the runtime's resume answers the unchanged prefix; `opts.emitDir` is facts.py emit-dir's directory,
-// else a new one, removed unless `opts.keepEmit`.
+// else a new one, removed unless `opts.keepEmit`; `opts.dirAnswer(n)` answers the nth emit-dir run instead.
 async function run(args, stubs = {}, opts = {}) {
   const calls = []
   const logs = []
   const journal = []
   const loads = []
   let live = 0
+  let dirCalls = 0
   const emit = emitDirs('pr-review-emit-', opts.emitDir, opts.keepEmit)
   const pick = (label, prompt) => {
     const key = Object.keys(stubs).find(k => k === label) ?? Object.keys(stubs).find(k => label.startsWith(k + ':'))
@@ -45,7 +48,7 @@ async function run(args, stubs = {}, opts = {}) {
   }
   const stub = async (prompt, options) => {
     calls.push({ label: options.label, prompt: String(prompt), options })
-    if (options.label === 'emit:dir') return { dir: emit.dir() }
+    if (options.label === 'emit:dir') return opts.dirAnswer?.(++dirCalls) ?? emit.answer()
     // A relay's fresh attempt (`<label>:retry`) runs the same script.
     const base = options.label.replace(/:retry$/, '')
     const v = pick(options.label, prompt)
@@ -87,9 +90,7 @@ async function run(args, stubs = {}, opts = {}) {
     let answer = null
     try {
       if (file === undefined) answer = await stub(prompt, options)
-      else if (existsSync(file)) answer = { exit: 3 }
-      else {
-        writeFileSync(file, '') // the claim, before the script runs anything
+      else if ((answer = claim(options.label, file)) === undefined) {
         const line = await stub(prompt, options)
         if (line !== null) {
           writeFileSync(file, moduleOf(file, line))
@@ -98,6 +99,11 @@ async function run(args, stubs = {}, opts = {}) {
       }
     } finally { entry.answer = structuredClone(answer) }
     return answer
+  }
+  // The script's claim (emit_stub.mjs's claimOf), opts.beforeClaim(label, file) changing its directory first.
+  const claim = (label, file) => {
+    if (opts.beforeClaim) opts.beforeClaim(label, file)
+    return claimOf(file)
   }
   const audits = []
   // A data module (emit_stub.mjs's loadModule), else the one named child, code-audit.
@@ -547,19 +553,69 @@ test('a ledger line of another repository, PR or head, an error or a dead relay 
 test('a resumed review reloads the lines its relays wrote; a file there before a live run is reloaded only when it names itself', async () => {
   const first = await run(BASE, {}, { keepEmit: true })
   try {
-    assert.deepEqual(first.loads.map(f => f.split('/').at(-1).split('.')[0]), ['check', 'threads', 'ledger'])
+    assert.deepEqual(first.loads.map(f => f.split('/').at(-1).split('.')[0]), ['emit-dir', 'check', 'threads', 'ledger'])
     const resumed = await run(BASE, {}, { resume: first.journal })
     assert.deepEqual(resumed.calls, [], 'no agent ran again')
     assert.deepEqual([resumed.loads, resumed.result], [first.loads, first.result])
     const again = await run(BASE, {}, { emitDir: first.emitDir })
     assert.deepEqual(again.result, first.result)
     assert.ok(again.logs.includes('check: the line an earlier attempt of this call wrote, reloaded'), again.logs.join('\n'))
-    writeFileSync(first.loads[0], readFileSync(first.loads[1], 'utf8'))
+    writeFileSync(first.loads[1], readFileSync(first.loads[2], 'utf8'))
     // A file there that names another: the check ran nothing (exit 3) and its outcome is unknown; its fresh attempt runs.
     const foreign = await run(BASE, {}, { emitDir: first.emitDir })
-    assert.ok(foreign.logs.includes(`check: an earlier attempt of this call claimed ${first.loads[0]} and left no line of it — its outcome is unknown`), foreign.logs.join('\n'))
+    assert.ok(foreign.logs.includes(`check: an earlier attempt of this call claimed ${first.loads[1]} and left no line of it — its outcome is unknown`), foreign.logs.join('\n'))
     assert.deepEqual([foreign.labels[0], foreign.result.status], ['check:retry', 'reviewed'])
   } finally { rmSync(first.emitDir.split('/agentrc-emit/')[0], { recursive: true, force: true }) }
+})
+
+test('an emit:dir answer its directory\'s sentinel does not bind is asked again before any line goes in (#547)', async () => {
+  const other = emitDirs('pr-review-other-')
+  try {
+    const { dir, nonce } = other.answer()
+    const parent = dirname(dir)
+    const sentinel = (name, text) => { mkdirSync(`${parent}/${name}`); if (text !== null) writeFileSync(`${parent}/${name}/${SENTINEL}`, text); return `${parent}/${name}` }
+    const copyWhy = (d, none) => `the emit:dir relay answered ${JSON.stringify(d)}, which holds no ${SENTINEL} of that emit-dir run${none ? ' (none loads there)' : ''}`
+    const older = sentinel('old', null)
+    for (const [what, answer, why] of [
+      ['mis-copied', { dir: '/home/u/.claude/.git/agentrc-emit/6_6tkgev', nonce }, copyWhy('/home/u/.claude/.git/agentrc-emit/6_6tkgev', true)],
+      ['another emit-dir run\'s', { dir, nonce: '0'.repeat(16) }, copyWhy(dir)],
+      ['no nonce, its sentinel there', { dir }, copyWhy(dir)],
+      ['malformed sentinel', { dir: sentinel('bad', 'return {"dir":'), nonce }, copyWhy(`${parent}/bad`, true)],
+      ['sentinel copied from another', { dir: sentinel('r2', moduleOf(`${dir}/${SENTINEL}`, { dir, nonce })), nonce }, copyWhy(`${parent}/r2`)],
+      ['sentinel naming another', { dir: sentinel('r3', moduleOf(`${parent}/r3/${SENTINEL}`, { dir, nonce })), nonce }, copyWhy(`${parent}/r3`)],
+      ['sentinel missing its nonce', { dir: sentinel('r4', moduleOf(`${parent}/r4/${SENTINEL}`, { dir: `${parent}/r4` })), nonce }, copyWhy(`${parent}/r4`)],
+      ['empty nonces on both sides', { dir: sentinel('r5', moduleOf(`${parent}/r5/${SENTINEL}`, { dir: `${parent}/r5`, nonce: '' })), nonce: '' },
+        copyWhy(`${parent}/r5`)],
+      ['no nonce, no sentinel', { dir: older }, `the emit:dir relay answered ${JSON.stringify(older)} with no nonce, and no ${SENTINEL} loads there: ` +
+        'the scripts may be an older agentrc revision than this workflow'],
+    ]) {
+      const got = await run(BASE, {}, { dirAnswer: n => n === 1 ? answer : undefined })
+      assert.ok(got.logs.includes(`emit:dir: ${why}`), `${what}\n${got.logs.join('\n')}`)
+      assert.deepEqual(got.calls.slice(0, 3).map(c => c.label), ['emit:dir', 'emit:dir', 'check:retry'], `${what}: the retry asks again`)
+      assert.equal(got.result.status, 'reviewed', what)
+      assert.deepEqual(got.loads.filter(f => f.startsWith(`${answer.dir}/`)), [`${answer.dir}/${SENTINEL}`], `${what}: no line goes in`)
+      const stuck = await run(BASE, {}, { dirAnswer: () => answer })
+      assert.deepEqual([stuck.result.reason, stuck.result.detail, stuck.labels], ['check-failed', why, []], what)
+    }
+  } finally { other.cleanup(true) }
+})
+
+test('a script that cannot create its emit file reports that nothing ran; a refusal that cannot tell keeps its outcome unknown (#547)', async () => {
+  const gone = await run(BASE, {}, { beforeClaim: (label, file) => { if (label.startsWith('check')) rmSync(dirname(file), { recursive: true, force: true }) } })
+  assert.deepEqual([gone.result.reason, gone.labels], ['check-failed', []])
+  // A definite failure, which gets no fresh attempt.
+  assert.match(gone.result.detail, /^the script could not claim \/.+\/agentrc-emit\/r1\/check\.1\.[0-9a-f]{8}\.js: nothing was run$/)
+  assert.deepEqual(gone.journal.map(j => j.label), ['emit:dir', 'check'])
+  if (process.platform !== 'win32' && process.getuid?.() !== 0) {
+    const locked = await run(BASE, {}, { keepEmit: true, beforeClaim: (label, file) => { if (label.startsWith('check')) chmodSync(dirname(file), 0o500) } })
+    try {
+      assert.deepEqual([locked.result.reason, locked.result.detail], ['check-failed', 'the check relay died'], 'exit 3: its outcome unknown')
+      assert.ok(locked.logs.some(l => l.endsWith('its outcome is unknown')), locked.logs.join('\n'))
+    } finally {
+      chmodSync(locked.emitDir, 0o700)
+      rmSync(locked.emitDir.split('/agentrc-emit/')[0], { recursive: true, force: true })
+    }
+  }
 })
 
 test('a draft or check agent that throws takes its null path; a check relay that throws blocks', async () => {

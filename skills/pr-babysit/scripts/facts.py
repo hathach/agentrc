@@ -12,6 +12,7 @@ import errno
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -271,11 +272,15 @@ def report(collect, argv, seal=False, limits=False):
 EMIT_KEEP = 14 * 86400  # seconds an emit directory outlives its last write: a launch resumed later reloads its files
 # In each emit directory, written once at its creation: when its launch began, which bounds the transcripts a stage reads.
 LAUNCH_MARK = '.launch'
+# Also written once there, as an emitted line is (lib/seal.py's module_text): {dir, nonce} naming the directory and this
+# emit-dir run's nonce, which the workflow loads to reject a path its relay mis-copied (#547); no emitted file's name
+# (label.count.fnv1a.js) is this one.
+EMIT_SENTINEL = 'emit-dir.js'
 
 
 def emit_dir():
     """A new directory for one workflow launch's emitted lines, under the checkout's git common dir, its LAUNCH_MARK
-    written; directories there unwritten for EMIT_KEEP go."""
+    and EMIT_SENTINEL written; directories there unwritten for EMIT_KEEP go."""
     parent = Path(git('rev-parse', '--path-format=absolute', '--git-common-dir').strip()) / 'agentrc-emit'
     parent.mkdir(exist_ok=True)
     for old in parent.iterdir():
@@ -287,7 +292,10 @@ def emit_dir():
     made = Path(tempfile.mkdtemp(prefix='', dir=parent))
     with open(made / LAUNCH_MARK, 'x', encoding='utf-8') as f:
         f.write(f'{time.time()}\n')
-    return {'dir': made.as_posix()}
+    out = {'dir': made.as_posix(), 'nonce': secrets.token_hex(8)}
+    with open(made / EMIT_SENTINEL, 'x', encoding='utf-8', newline='\n') as f:
+        f.write(module_text(f"{out['dir']}/{EMIT_SENTINEL}", out))
+    return out
 
 
 def launch_began(directory):
@@ -459,8 +467,9 @@ def collect(argv):
 
 
 # `repo`: the checkout's one repository, for a prompt that must name it (fix-issue's triage); `emit-dir`: a workflow's
-# AGENTRC_EMIT directory; `stage`: a relay command's script input, written before the script runs, from the relay's
-# own prompt (CLAUDE_CONFIG_DIR, else ~/.claude, and CLAUDE_CODE_SESSION_ID name its transcripts), its line written to
-# --line PATH in the launch's emit directory, saying whether --claimed PATH (the script's emit file) existed.
+# AGENTRC_EMIT directory and the nonce its EMIT_SENTINEL holds; `stage`: a relay command's script input, written before
+# the script runs, from the relay's own prompt (CLAUDE_CONFIG_DIR, else ~/.claude, and CLAUDE_CODE_SESSION_ID name its
+# transcripts), its line written to --line PATH in the launch's emit directory, saying whether --claimed PATH (the
+# script's emit file) existed.
 if __name__ == '__main__':
     sys.exit(report(collect, sys.argv[1:]))

@@ -97,26 +97,49 @@ const quiet = (label) => (e) => { log(`${label} errored — ${e && e.message}`);
 // resume's replayed relays reload what they wrote, and a file there before a live run (exit 3) is reloaded only when
 // it names itself.
 const EMIT_REFUSED = 3 // lib/seal.py's
+const EMIT_UNCLAIMABLE = 4 // lib/seal.py's
+const EMIT_SENTINEL = 'emit-dir.js' // facts.py's
 const RAN = { type: 'object', additionalProperties: false, required: ['exit'], properties: { exit: { type: 'integer' }, error: { type: 'string' } } }
 let emitDir = null
-// The one path a relay copies: a mis-copy names no directory a run wrote into (mkdtemp's name, never-overwritten files).
-// A trust boundary: nothing here proves the directory fresh or this launch's; an existing one handed back would replay
-// its files, whose self-naming gives consistency, not freshness.
+// Why the last emit-dir call named no directory: what every relay waiting on it answers.
+let emitWhy = null
+const NO_DIR = 'no directory for the line (facts.py emit-dir failed)'
+// The one path a relay copies, kept only when the EMIT_SENTINEL there, emitted as a line is (its emit its own path),
+// names it and the nonce that emit-dir run printed, a non-empty string on both sides (pr-babysit.js's emitDirOf, #547):
+// a mis-copy is asked again before any line goes in. A trust boundary: that proves consistency, not freshness; a
+// resume's replayed relay hands back its first run's directory and nonce.
 const emitDirOf = () => emitDir ??= agent(
-  `${IN}Editing nothing, run exactly \`python3 ${AGENTRC}/skills/pr-babysit/scripts/facts.py emit-dir\` and return the dir member of its last stdout line as dir, ` +
-  'character for character. If that line is {"error": ...}, or there is none, return its error, or what went wrong, as error, with dir = \'\'.',
+  `${IN}Editing nothing, run exactly \`python3 ${AGENTRC}/skills/pr-babysit/scripts/facts.py emit-dir\` and return the dir and nonce members of its last stdout ` +
+  'line as dir and nonce, character for character. If that line is {"error": ...}, or there is none, return its error, or what went wrong, as error, with dir = \'\'.',
   { label: 'emit:dir', phase: 'Check', agentType: 'relay', model: 'haiku', effort: 'low',
-    schema: { type: 'object', additionalProperties: false, required: ['dir'], properties: { dir: { type: 'string' }, error: { type: 'string' } } } },
-).then(r => {
-  if (r && /^(?:[A-Za-z]:)?\/(?!\/)[^'\n]*\/agentrc-emit\/[A-Za-z0-9_]+$/.test(r.dir)) return r.dir
+    schema: { type: 'object', additionalProperties: false, required: ['dir'], properties: { dir: { type: 'string' }, nonce: { type: 'string' }, error: { type: 'string' } } } },
+).then(async r => {
+  emitWhy = null
+  if (r && /^(?:[A-Za-z]:)?\/(?!\/)[^'\n]*\/agentrc-emit\/[A-Za-z0-9_]+$/.test(r.dir)) {
+    const sentinel = `${r.dir}/${EMIT_SENTINEL}`
+    const s = await workflow({ scriptPath: sentinel }).catch(() => null)
+    const nonEmpty = (v) => typeof v === 'string' && v !== ''
+    const nonce = nonEmpty(r.nonce) ? r.nonce : null
+    if (s && nonce && s.emit === sentinel && s.line && s.line.dir === r.dir && nonEmpty(s.line.nonce) && s.line.nonce === nonce) return r.dir
+    // A sentinel there and no nonce answered is the relay's copy failing, as a wrong nonce is.
+    emitWhy = !s && !nonce
+      ? `the emit:dir relay answered ${JSON.stringify(r.dir)} with no nonce, and no ${EMIT_SENTINEL} loads there: the scripts may be an older agentrc revision than this workflow`
+      : `the emit:dir relay answered ${JSON.stringify(r.dir)}, which holds no ${EMIT_SENTINEL} of that emit-dir run${s ? '' : ' (none loads there)'}`
+    log(`emit:dir: ${emitWhy}`)
+    return null
+  }
   log(`emit:dir: no directory for the scripts' lines — ${r ? r.error || JSON.stringify(r.dir) : 'the relay died'}`)
   return null
-}, quiet('emit:dir'))
+}, quiet('emit:dir')).then(dir => {
+  if (!dir) emitDir = null // only a directory is kept: the next relay, a retry included, asks again
+  return dir
+})
 const emitCount = new Map()
-// A relay runs one script: its line as the script wrote it, else { error }, or null when the relay died leaving none.
+// A relay runs one script: its line as the script wrote it, else { error }, or null when the relay died leaving none;
+// unrun when no directory let its script run, which relayOnce asks again.
 const relay = async (label, phase, cmd) => {
   const dir = await emitDirOf()
-  if (!dir) return { error: 'no directory for the line (facts.py emit-dir failed)' }
+  if (!dir) return { error: emitWhy ?? NO_DIR, unrun: true }
   const name = label.replace(/[^A-Za-z0-9._-]/g, '_')
   const n = (emitCount.get(name) || 0) + 1
   emitCount.set(name, n)
@@ -124,8 +147,9 @@ const relay = async (label, phase, cmd) => {
   const ran = await agent(`${IN}Run exactly \`AGENTRC_EMIT='${file}' ${cmd}\` and answer only its exit status as exit, AGENTRC_EMIT kept exactly as written: ` +
     'the script writes its JSON line to that file, where the workflow reads it, and prints only a note. Only on a nonzero exit, also give what went wrong as error, in its own words.',
   { label, phase, agentType: 'relay', model: 'haiku', effort: 'low', schema: RAN }).catch(quiet(label))
-  // Exit 3: the script ran nothing, meeting the file an attempt a resume cut short claimed; with no line there, that
-  // attempt's outcome is unknown, as a dead relay's.
+  // On EMIT_REFUSED or EMIT_UNCLAIMABLE (lib/seal.py's claim says when) the script ran nothing: a refused file with no
+  // line of its own leaves that earlier attempt's outcome unknown, as a dead relay's; an unclaimable one is a definite
+  // failure, which relayOnce does not retry.
   const m = await workflow({ scriptPath: file }).catch(() => null)
   const refused = !!ran && ran.exit === EMIT_REFUSED
   if (m && m.emit === file && m.line && typeof m.line === 'object' && !Array.isArray(m.line)) {
@@ -136,11 +160,15 @@ const relay = async (label, phase, cmd) => {
     log(`${label}: an earlier attempt of this call claimed ${file} and left no line of it — its outcome is unknown`)
     return null
   }
+  if (!!ran && ran.exit === EMIT_UNCLAIMABLE) return { error: `the script could not claim ${file}: nothing was run` }
   return m ? { error: `${file} holds no line written for it` } : ran ? { error: `the script wrote no line (exit ${ran.exit})${ran.error ? `: ${ran.error}` : ''}` } : null
 }
 // Every relay here only reads (threads.py writes only its facts file): one that brought no line back
 // gets one fresh attempt, its own file.
-const relayOnce = async (label, phase, cmd) => (await relay(label, phase, cmd)) ?? relay(`${label}:retry`, phase, cmd)
+const relayOnce = async (label, phase, cmd) => {
+  const r = await relay(label, phase, cmd)
+  return r && !r.unrun ? r : (await relay(`${label}:retry`, phase, cmd)) ?? r
+}
 const blocked = (reason, detail) => ({ status: 'blocked', reason, detail, pr, head })
 
 phase('Check')

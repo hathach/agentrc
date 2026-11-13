@@ -216,6 +216,7 @@ const EMIT = '<AGENTRC_EMIT>' // where a relay command takes its file
 // prompt names for a file tool, so no step waits on a path a relay chose (#510).
 const INPUT = '<AGENTRC_INPUT>'
 const EMIT_REFUSED = 3 // lib/seal.py's
+const EMIT_UNCLAIMABLE = 4 // lib/seal.py's
 const RAN = { type: 'object', additionalProperties: false, required: ['exit'], properties: { exit: { type: 'integer' }, error: { type: 'string' } } }
 const RETURN_EXIT = 'and answer only its exit status as exit, AGENTRC_EMIT kept exactly as written: the script writes its JSON line to that file, ' +
   'where the workflow reads it, and prints only a note. Only on a nonzero exit, also give what went wrong as error, in its own words.'
@@ -256,36 +257,55 @@ const staged = (v) => {
   return { command: `${PY} ${FACTS_SCRIPT} stage '${INPUT}' ${fnv1a(text)} --from-transcript --line ${STAGE_LINE} --claimed ${STAGE_CLAIM} && `,
     line: `${PAYLOAD} ${INPUT} ${fnv1a(text)} ${base64(text)}` }
 }
-const EMIT_DIR = { type: 'object', additionalProperties: false, required: ['dir'], properties: { dir: { type: 'string' }, error: { type: 'string' } } }
+const EMIT_DIR = { type: 'object', additionalProperties: false, required: ['dir'], properties: { dir: { type: 'string' }, nonce: { type: 'string' }, error: { type: 'string' } } }
+const EMIT_SENTINEL = 'emit-dir.js' // facts.py's
+// The one workflow() call: a data module (an emit's line, emit-dir's sentinel), never a nested workflow.
+const loadData = (path) => workflow({ scriptPath: path }).catch(() => null)
+const nonEmpty = (v) => typeof v === 'string' && v !== ''
 let emitDir = null
 // Why the last emit-dir call named no directory: what every relay waiting on it answers.
 let emitWhy = null
-let skewNote = null
+let rootsNote = null
 // The scripts' checkout and the saved workflow's, each `<root> <short HEAD>`: a named launch loads the saved workflow,
 // which AGENTRC_DIR does not choose, while every script runs from AGENTRC_DIR (#480). The sandbox names no file of its own.
 const ROOTS = { type: 'object', additionalProperties: false, required: ['scripts', 'saved'], properties: { scripts: { type: 'string' }, saved: { type: 'string' } } }
 const ROOTS_CMD = 'for f in ' + `${AGENTRC}/skills/pr-babysit/scripts/facts.py "\${CLAUDE_CONFIG_DIR:-$HOME/.claude}/workflows/pr-babysit.js"; ` +
   'do d=$([ -e "$f" ] && cd -P "$(dirname "$(readlink -f "$f")")" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null); ' +
   'echo "${d:-unresolved} ${d:+$(git -C "$d" rev-parse --short HEAD 2>/dev/null)}"; done'
-const skewOf = async (error) => {
-  const r = await agent(`Editing nothing, run exactly \`${ROOTS_CMD}\` and return its first line as scripts and its second as saved, character for character.`,
-    { label: 'emit:roots', phase: 'Triage', agentType: 'relay', model: 'haiku', effort: 'low', schema: ROOTS }).catch(() => null)
-  const roots = r ? `the scripts are ${r.scripts} (AGENTRC_DIR, else ~/.claude), and the saved workflow a named launch loads is ${r.saved}` : 'neither root could be read'
-  return `facts.py emit-dir answered ${JSON.stringify(error)}: the scripts are another agentrc revision than this workflow; ${roots}. ` +
-    'AGENTRC_DIR does not choose the saved workflow: relaunch with Workflow scriptPath "${AGENTRC_DIR:-$HOME/.claude}/workflows/pr-babysit.js", expanded in the shell first'
-}
-// The one path a relay copies: a mis-copy names no directory a run wrote into (mkdtemp's name, never-overwritten files).
-// A trust boundary: nothing here proves the directory fresh or this launch's; an existing one handed back would replay
-// its files, whose self-naming and seals give consistency, not freshness.
+const rootsOf = () => rootsNote ??= agent(`Editing nothing, run exactly \`${ROOTS_CMD}\` and return its first line as scripts and its second as saved, character for character.`,
+  { label: 'emit:roots', phase: 'Triage', agentType: 'relay', model: 'haiku', effort: 'low', schema: ROOTS }).catch(() => null)
+  .then(r => r ? `the scripts are ${r.scripts} (AGENTRC_DIR, else ~/.claude), and the saved workflow a named launch loads is ${r.saved}` : 'neither root could be read')
+const RELAUNCH = 'AGENTRC_DIR does not choose the saved workflow: relaunch with Workflow scriptPath "${AGENTRC_DIR:-$HOME/.claude}/workflows/pr-babysit.js", expanded in the shell first'
+const skewOf = async (error) =>
+  `facts.py emit-dir answered ${JSON.stringify(error)}: the scripts are another agentrc revision than this workflow; ${await rootsOf()}. ${RELAUNCH}`
+// No nonce and no sentinel: an emit-dir older than #547's, or a relay that dropped the nonce and mis-copied the path.
+const maybeSkewOf = async (dir) => `the emit:dir relay answered ${JSON.stringify(dir)} with no nonce, and no ${EMIT_SENTINEL} loads there: ` +
+  `the scripts may be an older agentrc revision than this workflow; ${await rootsOf()}. If they differ, ${RELAUNCH}`
+// The one path a relay copies, kept only when the EMIT_SENTINEL there, emitted as a line is (its emit its own path),
+// names it and the nonce that emit-dir run printed, a non-empty string on both sides (#547): a mis-copy, a directory
+// that is not there or another emit-dir run's, is asked again before any line goes in.
+// A trust boundary: that proves consistency, not freshness; a resumed launch's replayed relay hands back the directory
+// and nonce of its first run, whose files its self-naming and seals reload.
 const emitDirOf = () => emitDir ??= agent(
-  `${IN_CHECKOUT}Editing and committing nothing, run exactly \`${PY} ${FACTS_SCRIPT} emit-dir\` and return the dir member of its last stdout line as dir, ` +
-  'character for character. If that line is {"error": ...}, or there is none, return its error, or what went wrong, as error, with dir = \'\'.',
+  `${IN_CHECKOUT}Editing and committing nothing, run exactly \`${PY} ${FACTS_SCRIPT} emit-dir\` and return the dir and nonce members of its last stdout ` +
+  'line as dir and nonce, character for character. If that line is {"error": ...}, or there is none, return its error, or what went wrong, as error, with dir = \'\'.',
   { label: 'emit:dir', phase: 'Triage', agentType: 'relay', model: 'haiku', effort: 'low', schema: EMIT_DIR },
-).then(r => {
-  if (r && /^(?:[A-Za-z]:)?\/(?!\/)[^'\n]*\/agentrc-emit\/[A-Za-z0-9_]+$/.test(r.dir)) return r.dir
+).then(async r => {
+  if (r && /^(?:[A-Za-z]:)?\/(?!\/)[^'\n]*\/agentrc-emit\/[A-Za-z0-9_]+$/.test(r.dir)) {
+    const sentinel = `${r.dir}/${EMIT_SENTINEL}`
+    const s = await loadData(sentinel)
+    const nonce = nonEmpty(r.nonce) ? r.nonce : null
+    if (s && nonce && s.emit === sentinel && s.line && s.line.dir === r.dir && nonEmpty(s.line.nonce) && s.line.nonce === nonce) return r.dir
+    // A sentinel there and no nonce answered is the relay's copy failing, as a wrong nonce is.
+    const why = !s && !nonce ? await maybeSkewOf(r.dir)
+      : `the emit:dir relay answered ${JSON.stringify(r.dir)}, which holds no ${EMIT_SENTINEL} of that emit-dir run${s ? '' : ' (none loads there)'}`
+    log(`emit:dir: ${why}`)
+    emitWhy = why
+    return null
+  }
   log(`emit:dir: no directory for the scripts' lines — ${r ? r.error || JSON.stringify(r.dir) : 'the relay died'}`)
   // A facts.py without emit-dir answers its usage: a script copy older than this workflow.
-  emitWhy = r && /usage: facts\.py/.test(r.error || '') ? skewNote ??= skewOf(r.error) : null
+  emitWhy = r && /usage: facts\.py/.test(r.error || '') ? skewOf(r.error) : null
   return null
 }, e => { log(`emit:dir errored — ${e && e.message}`); return null }).then(dir => {
   if (!dir) emitDir = null // only a directory is kept: the next relay, a .retry included, asks again
@@ -309,21 +329,24 @@ const emitted = async (prompt, { label, inputDir, ...opts }) => {
   const ran = await agent(prompt.replace(EMIT, `AGENTRC_EMIT=${shq(file)} `).replace(STAGE_LINE, shq(stageFile))
     .replace(STAGE_CLAIM, shq(file)).split(INPUT).join(input),
     { label, ...opts, schema: RAN }).catch(e => { log(`${label} errored — ${e && e.message}`); return null })
-  // A relay that died after its script wrote still leaves the line. A file there before the run (exit 3: the script
-  // ran nothing) is this call's own from an attempt a resume cut short: its line when it names this file, else that
-  // attempt's outcome is unknown, as a dead relay's.
-  // The one workflow() call: a data module an emit wrote, never a nested workflow.
-  const load = (path) => workflow({ scriptPath: path }).catch(() => null)
-  const m = await load(file)
+  // A relay that died after its script wrote still leaves the line. On EMIT_REFUSED or EMIT_UNCLAIMABLE (lib/seal.py's
+  // claim says when) the script ran nothing: a refused file is this call's own from an attempt a resume cut short, its
+  // line when it names this file, else that attempt's outcome is unknown, as a dead relay's; an unclaimable one is a
+  // definite failure, which no fresh attempt retries.
+  const m = await loadData(file)
   const refused = !!ran && ran.exit === EMIT_REFUSED
   if (m && m.emit === file && m.line && typeof m.line === 'object' && !Array.isArray(m.line)) {
     if (refused) log(`${label}: the line an earlier attempt of this call wrote, reloaded`)
     return { line: m.line }
   }
+  if (!!ran && ran.exit === EMIT_UNCLAIMABLE) {
+    log(`${label}: the script could not claim ${file}${ran.error ? ` (${ran.error})` : ''} — nothing was run`)
+    return { why: `the script could not claim ${file}: nothing was run`, unclaimable: true }
+  }
   // A stage that refused its input ran no script, in the last attempt of this call that ran it: a definite failure, in
   // its own line's words, only where its line says no earlier attempt's script claimed its file (that one may have acted
   // before dying).
-  const st = prompt.includes(STAGE_LINE) && await load(stageFile)
+  const st = prompt.includes(STAGE_LINE) && await loadData(stageFile)
   const stageError = st && st.emit === stageFile && st.line && typeof st.line.error === 'string' ? st.line.error : null
   if (stageError !== null && st.line.claimed === false) return { why: stageError, stage: true }
   if (refused || stageError !== null) {
@@ -360,14 +383,14 @@ if (args.stateRef != null) {
       !/^[0-9a-f]{8}$/.test(ref.digest || '')) {
     throw new Error('stateRef must be { outputFile: a plain absolute path ([A-Za-z0-9._ /-], no leading //), digest: the result\'s 8-hex stateDigest }')
   }
-  // state_transfer.py emits the saved state whole. Read-only: a load that brought no line back gets one fresh attempt;
-  // a line, a refusal or a digest that does not match, is that file's answer.
+  // state_transfer.py emits the saved state whole. Read-only: a load that brought no line back gets one fresh attempt,
+  // unless its script could not claim its file; a line, a refusal or a digest that does not match, is that file's answer.
   const load = (label) => emitted(`${IN_CHECKOUT}Editing nothing, ${runExactly(`${STATE_SCRIPT} '${file}'`)}`,
     { label, phase: 'Triage', agentType: 'relay', model: 'haiku', effort: 'low' })
   const stateOf = ({ line }) => line && !line.error && line.digest === ref.digest && line.state && typeof line.state === 'object' &&
     line.state.digest === ref.digest && sealOf(line.state) === ref.digest ? line.state : null
   let got = await load('state:load')
-  if (!got.line) got = await load('state:load.retry')
+  if (!got.line && !got.unclaimable) got = await load('state:load.retry')
   const { line, why } = got
   const st = stateOf(got)
   if (st) {
@@ -941,7 +964,7 @@ const noteLimit = (limit, from = '') => {
 // A line off its schema, of another collect.py contract or failing its seal is no answer; an error line carries no seal.
 // The Bash-only relay type carries no skill index; fileTool keeps the default subagent for a prompt that writes with a file tool.
 const relayAgent = async (prompt, { fileTool, contract, schema, ...opts }) => {
-  const { line, why, dead, stage } = await emitted(prompt, { ...(fileTool ? {} : { agentType: 'relay' }), ...opts })
+  const { line, why, dead, stage, unclaimable } = await emitted(prompt, { ...(fileTool ? {} : { agentType: 'relay' }), ...opts })
   if (dead) return null
   // Before the seal and the shape, which a line of another contract never meets (#293).
   if (line && !line.error && contract !== undefined && line.contract !== contract) {
@@ -963,12 +986,14 @@ const relayAgent = async (prompt, { fileTool, contract, schema, ...opts }) => {
   if (v.rateLimit) noteLimit({ error: v.error, ...v.rateLimit }, opts.label)
   // No line of the script's: its error is the transport's, which a caller tells from one the script printed, or the
   // stage's that refused its input, when the script never ran.
-  return line ? v : stage ? { ...v, staging: true } : { ...v, transport: true }
+  return line ? v : stage ? { ...v, staging: true } : { ...v, transport: true, ...(unclaimable ? { unclaimable } : {}) }
 }
 const quiet = (label) => (e) => { log(`${label} errored — ${e && e.message}`); return null }
 // A relay line's error: the script's under its name, or that of a stage that refused its input, which names itself.
 const scriptError = (script, out) => out.staging ? out.error : `${script}: ${out.error}`
 const relayRun = (prompt, opts) => relayAgent(prompt, opts).catch(quiet(opts.label))
+// Whether a relay's answer gets a fresh attempt: no line came back, and its script could have run.
+const retriable = (r) => !r || (r.transport && !r.unclaimable)
 // A read-only relay that brought no line back gets one fresh attempt, its own file; a recovery is logged: a lone
 // failure line reads as an open one (#50). A writer's relay gets none: reply and sonar rely on a later ask replaying
 // their receipt (#53, #55), a push on pushExact's read-back, a commit on its receipt.
@@ -979,7 +1004,7 @@ const relayRetry = async (prompt, opts) => {
 }
 const relayOnce = async (prompt, opts, retryPrompt = prompt) => {
   const r = await relayRun(prompt, opts)
-  return r && !r.transport ? r : (await relayRetry(retryPrompt, opts)) ?? r
+  return retriable(r) ? (await relayRetry(retryPrompt, opts)) ?? r : r
 }
 const settles = (r) => r.verified === true && r.replyId !== null &&
   (r.kind === 'issue' || r.kind === 'review-body' || (r.kind === 'review' && r.resolved === true))
@@ -2047,7 +2072,7 @@ const pushExact = async (sha, label, prToo = false) => {
   // A retry finds a push that landed; it cannot prove one did not.
   const first = await relayRun(prompt, opts)
   const lost = !first || first.transport
-  const r = lost ? (await relayRetry(prompt, opts)) ?? first : first
+  const r = retriable(first) ? (await relayRetry(prompt, opts)) ?? first : first
   if (!r) return null
   const unknown = (detail) => ({ pass: false, detail, published: 'unknown' })
   if (r.error) return unknown(r.error)
@@ -2507,7 +2532,7 @@ const ciLaneRun = async (cycle, lanes, entry) => {
     }
     return relayRun(prompt(command), opts).then(got => {
       // A retry after a rate limit would only call GitHub again.
-      if ((got && !got.transport) || githubLimit) return skewed(got)
+      if (!retriable(got) || githubLimit) return skewed(got)
       shortened = shortened || /--wait-seconds [1-9]/.test(command)
       return relayRetry(prompt(command.replace(/--wait-seconds \d+/, '--wait-seconds 0')), opts).then(r => skewed(r ?? got))
     })

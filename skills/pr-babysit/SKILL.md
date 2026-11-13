@@ -9,11 +9,13 @@ Each script prints one JSON line, the last on stdout, and the workflow decides
 on it. Under `AGENTRC_EMIT=<file>`, as the workflow's relay runs it, the script
 also writes that line to the new `<file>` as a data module the workflow loads
 with `workflow({scriptPath})`, so no model copies it (`lib/seal.py`'s `emit`);
-the file is claimed before the script does anything, so a rerun meeting one
-already there exits 3 at once, nothing done. `facts.py emit-dir` makes a
-launch's directory for those files under the git common dir; that path is the
-one value a model copies, and the files' self-naming and seals give
-consistency, not freshness. An `{"error": ...}` line
+the file is claimed before the script does anything, and a claim that fails
+exits at once, nothing done, with the status `lib/seal.py`'s `claim` gives.
+`facts.py emit-dir` makes a launch's directory for those files under the git
+common dir, with an `emit-dir.js` data module, written as an emitted line is,
+naming it and the nonce the run prints; that path and nonce are the values a
+model copies, which the workflow loads that module to check, and the files'
+self-naming and seals give consistency, not freshness. An `{"error": ...}` line
 with exit 2 means the facts could not be collected or contradict each other:
 the workflow refuses to publish, and the caller never fills in what is
 missing. Each script's docstring says what it reports.
@@ -41,7 +43,7 @@ python3 "$S/ci_recover.py" --pr N [--repo R] --head <sha> --wait-minutes M  # ca
 python3 "$S/build.py" --path 'src/a.c' --command 'make -C <BUILD>' [--setup L] [--require T] [--job DIR --wait-seconds S --timeout-seconds T]  # build the checkout as it stands; --job detached, waited on S seconds a call
 python3 "$S/scope_check.py" --path 'src/a.c' --path 'test/test_a.c'  # which paths a fix writer may edit or create
 python3 "$S/state_transfer.py" <saved output>  # a stateRef's state whole with its digest
-python3 "$S/facts.py" emit-dir                 # a new directory for one launch's AGENTRC_EMIT files; ones unwritten for 14 days go
+python3 "$S/facts.py" emit-dir                 # a new directory for one launch's AGENTRC_EMIT files, and its nonce; ones unwritten for 14 days go
 python3 "$S/launch_result.py" --output <saved output> [--state-ref F:D] [--checkout DIR] [--keys]  # the caller's reading of a launch; --keys: settled failures' keys too
 python3 "$S/merge.py" --pr-url <url> --base <branch> --checkout DIR --output <saved output> --state-digest D [--waive BOT] [--merge]  # chief's merge gate; inspects without --merge; --waive drops a bot from the required reviews, and a last launch's stop on that bot alone, on the owner's word, recorded as `waived`
 ```

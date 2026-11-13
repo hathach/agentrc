@@ -17,7 +17,7 @@ from helpers import git_env, guard_survivors  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'lib'))
-from seal import fnv1a  # noqa: E402
+from seal import EMIT_REFUSED, EMIT_UNCLAIMABLE, fnv1a  # noqa: E402
 SCRIPT = ROOT / 'skills' / 'pr-babysit' / 'scripts' / 'state_transfer.py'
 FACTS = ROOT / 'skills' / 'pr-babysit' / 'scripts' / 'facts.py'
 EMIT_STUB = ROOT / 'tests' / 'emit_stub.mjs'
@@ -71,7 +71,7 @@ class StateTransferTest(unittest.TestCase):
         if emit:
             env['AGENTRC_EMIT'] = str(emit)
         done = subprocess.run([sys.executable, str(SCRIPT), *argv], capture_output=True, text=True, encoding='utf-8', env=env)
-        return done.returncode, done.stdout if emit and done.returncode != 3 else json.loads(done.stdout.splitlines()[-1])
+        return done.returncode, done.stdout if emit and done.returncode not in (EMIT_REFUSED, EMIT_UNCLAIMABLE) else json.loads(done.stdout.splitlines()[-1])
 
     def test_the_line_is_the_state_whole(self):
         code, out = self.run_script(self.file)
@@ -173,9 +173,40 @@ class StateTransferTest(unittest.TestCase):
         self.assertEqual(code, 3)
         self.assertEqual(out, {'error': f'AGENTRC_EMIT {at}: File exists: nothing was run'})
         self.assertEqual(at.read_text(), 'return {"emit": "stale"}\n')
-        code, _ = self.run_script(self.file, emit=self.dir / 'absent' / 'state.1.js')
-        self.assertEqual(code, 3, 'no directory is made for it')
-        self.assertFalse((self.dir / 'absent').exists())
+        empty = self.dir / 'empty.1.js'
+        empty.write_bytes(b'')
+        self.assertEqual(self.run_script(self.file, emit=empty)[0], EMIT_REFUSED, 'an earlier claim left empty is still a claim')
+        self.assertEqual(empty.read_bytes(), b'')
+
+    def test_an_emit_file_that_cannot_be_made_is_no_claim_and_nothing_runs(self):
+        # #547: a missing directory, or a file where it should be, holds no earlier attempt's claim (EMIT_REFUSED).
+        absent = self.dir / 'absent' / 'state.1.js'
+        code, out = self.run_script(self.file, emit=absent)
+        self.assertEqual((code, out), (EMIT_UNCLAIMABLE, {'error': f'AGENTRC_EMIT {absent}: No such file or directory: nothing was run'}))
+        self.assertFalse((self.dir / 'absent').exists(), 'no directory is made for it')
+        (self.dir / 'plain').write_text('')
+        code, out = self.run_script(self.file, emit=self.dir / 'plain' / 'state.1.js')
+        self.assertEqual(code, EMIT_UNCLAIMABLE, 'its parent is a file')
+        self.assertTrue(out['error'].endswith(': nothing was run'), out)
+
+    @unittest.skipIf(os.name == 'nt' or (hasattr(os, 'geteuid') and os.geteuid() == 0), 'needs POSIX permissions a non-root user obeys')
+    def test_a_refusal_that_cannot_tell_whether_a_claim_is_there_is_refused_as_one(self):
+        # EACCES says nothing of an earlier claim: a directory it may not write, or one that hides a claim (mode 000).
+        locked = self.dir / 'locked'
+        locked.mkdir(mode=0o500)
+        self.addCleanup(locked.chmod, 0o700)
+        code, out = self.run_script(self.file, emit=locked / 'state.1.js')
+        self.assertEqual((code, out), (EMIT_REFUSED, {'error': f'AGENTRC_EMIT {locked / "state.1.js"}: Permission denied: nothing was run'}))
+        self.assertEqual(list(locked.iterdir()), [])
+        hidden = self.dir / 'hidden'
+        hidden.mkdir()
+        (hidden / 'state.1.js').write_bytes(b'')
+        hidden.chmod(0o000)
+        self.addCleanup(hidden.chmod, 0o700)
+        code, out = self.run_script(self.file, emit=hidden / 'state.1.js')
+        self.assertEqual((code, out), (EMIT_REFUSED, {'error': f'AGENTRC_EMIT {hidden / "state.1.js"}: Permission denied: nothing was run'}))
+        hidden.chmod(0o700)
+        self.assertEqual((hidden / 'state.1.js').read_bytes(), b'', 'the earlier claim untouched')
 
     def test_a_run_that_dies_before_its_line_leaves_its_claim_empty(self):
         at = self.dir / 'state.1.js'
@@ -218,6 +249,18 @@ class EmitDirTest(unittest.TestCase):
         done = subprocess.run([sys.executable, str(FACTS), 'emit-dir'], cwd=cwd, capture_output=True, text=True, env=git_env())
         return done.returncode, json.loads(done.stdout.splitlines()[-1])
 
+    @unittest.skipUnless(shutil.which('node'), 'needs Node.js')
+    def test_each_directory_holds_a_sentinel_naming_it_and_the_nonce_its_run_printed(self):
+        code, first = self.emit_dir(self.repo)
+        self.assertEqual((code, sorted(first)), (0, ['dir', 'nonce']))
+        self.assertRegex(first['nonce'], r'\A[0-9a-f]{16}\Z')
+        sentinel = f"{first['dir']}/emit-dir.js"
+        self.assertEqual(load(sentinel), {'emit': sentinel, 'line': first}, 'an emitted line of its own path: what the run printed')
+        second = self.emit_dir(self.repo)[1]
+        self.assertNotEqual(second['nonce'], first['nonce'], 'a nonce per run: another run\'s directory is told apart')
+        self.assertEqual(load(f"{second['dir']}/emit-dir.js"), {'emit': f"{second['dir']}/emit-dir.js", 'line': second})
+        self.assertTrue((Path(second['dir']) / 'emit-dir.js').read_bytes().isascii())
+
     def test_each_call_makes_a_new_directory_under_the_common_dir_and_drops_only_stale_ones(self):
         code, first = self.emit_dir(self.repo)
         self.assertEqual(code, 0)
@@ -243,7 +286,7 @@ class EmitDirTest(unittest.TestCase):
         made = sorted(parent.iterdir())
         self.assertEqual(len(made), 1)
         again = run()
-        self.assertEqual(again.returncode, 3)
+        self.assertEqual(again.returncode, EMIT_REFUSED)
         self.assertEqual(sorted(parent.iterdir()), made, 'the second run made no directory: the operation never ran twice')
 
     def test_a_linked_worktree_uses_the_common_dir(self):

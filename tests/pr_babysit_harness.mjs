@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { test as nodeTest } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { ABSENT, AsyncFunction, emitDirs, emitOf, loadModule, moduleOf } from './emit_stub.mjs'
+import { ABSENT, AsyncFunction, SENTINEL, claimOf, emitDirs, emitOf, loadModule, moduleOf } from './emit_stub.mjs'
 
 // The body runs as the runtime runs it; `meta` is exposed so its value, not its spelling, is checked.
 const body = readFileSync(new URL('../workflows/pr-babysit.js', import.meta.url), 'utf8')
@@ -222,7 +222,7 @@ async function run(opts = {}) {
   // the caller removes a kept one by the emitRoot it returns.
   const emit = emitDirs('pr-babysit-emit-', opts.emitDir, opts.keepEmit)
   let returned = false
-  let dirCalls = 0 // facts.py emit-dir runs; opts.dirAnswer(n) answers the nth instead (undefined: the directory)
+  let dirCalls = 0 // facts.py emit-dir runs; opts.dirAnswer(n) answers the nth instead (undefined: the directory and its nonce)
 
   // One harvest per cycle, whichever of the validator and the probe (#359) asks for it first.
   const readings = new Map()
@@ -266,7 +266,7 @@ async function run(opts = {}) {
     if (label === 'emit:dir') {
       const answer = opts.dirAnswer ? opts.dirAnswer(++dirCalls) : undefined
       if (answer instanceof Error) throw answer
-      return answer === undefined ? { dir: emit.dir() } : answer
+      return answer === undefined ? emit.answer() : answer
     }
     // The two agentrc roots, read only when emit-dir answered a usage: opts.roots, null a dead relay.
     if (label === 'emit:roots') return opts.roots === undefined ? { scripts: '/home/u/code/agentrc 341ae67', saved: '/home/u/candidate 455d554' } : opts.roots
@@ -648,6 +648,11 @@ async function run(opts = {}) {
   const pipeline = (items, first, second) =>
     settle(items.map(async item => second(await first(item), item)))
   const parallel = (thunks) => settle(thunks.map(fn => fn()))
+  // The script's claim (emit_stub.mjs's claimOf), opts.beforeClaim(label, file) changing its directory first.
+  const claim = (label, file) => {
+    if (opts.beforeClaim) opts.beforeClaim(label, file)
+    return claimOf(file)
+  }
   // pr-babysit nests nothing but a data module (emit_stub.mjs's loadModule).
   const workflow = async (ref, a) => {
     if (!ref || typeof ref.scriptPath !== 'string') throw new Error('pr-babysit nests only a data module, by scriptPath')
@@ -669,10 +674,10 @@ async function run(opts = {}) {
       // the unchanged prefix. Else a relay of a script (its command names AGENTRC_EMIT) answers through the file:
       // each stub answers as its script before facts.py seals the line (no seal on an error line), opts.garble(label,
       // line) is what the script wrote instead (null: the relay died before it wrote), and the line lands in that
-      // file as lib/seal.py's emit writes it. The script claims the file (empty) before it runs anything: one already
-      // there is exit 3 with nothing run, and a death before the line leaves the claim empty. The relay answers its
-      // exit, or null when opts.lostAnswer(label) says it died after its script wrote. The journal keeps the calls in
-      // the order they were made, as the runtime's does.
+      // file as lib/seal.py's emit writes it. The script claims the file (empty) before it runs anything, refusing as
+      // lib/seal.py's claim does, and a death before the line leaves the claim empty. The relay answers its exit, or null when
+      // opts.lostAnswer(label) says it died after its script wrote. The journal keeps the calls in the order they were
+      // made, as the runtime's does.
       async (prompt, options) => {
         const at = journal.length
         const cached = opts.resume && live === at && opts.resume[at]
@@ -706,9 +711,7 @@ async function run(opts = {}) {
             record()
             entry.answer = null
             return null
-          } else if (existsSync(file)) answer = { exit: 3 }
-          else {
-            writeFileSync(file, '')
+          } else if ((answer = claim(options.label, file)) === undefined) {
             const line = await agent(prompt, { ...options, schema: null })
             const sealed = !line || 'seal' in line || line.error ? line : sealLine(line)
             const wrote = opts.garble ? opts.garble(options.label, sealed) : sealed
@@ -8394,7 +8397,8 @@ test('stateRef loads the saved state whole from the file state_transfer.py emits
   assert.deepEqual(loaded.labels.slice(0, 2), ['state:load', 'preflight'])
   assert.match(loaded.calls[0].prompt, /run exactly `AGENTRC_EMIT='[^']+\/agentrc-emit\/r1\/state_load\.1\.[0-9a-f]{8}\.js' python3 "\$\{AGENTRC_DIR:-\$HOME\/\.claude\}"\/skills\/pr-babysit\/scripts\/state_transfer\.py '\/tmp\/tasks\/w1\.output'` /)
   assert.equal(loaded.calls[0].agentType, 'relay')
-  assert.match(loaded.loads[0], /\/state_load\.1\.[0-9a-f]{8}\.js$/, 'the state comes from the file, by workflow()')
+  assert.match(loaded.loads[0], new RegExp(`/agentrc-emit/r1/${SENTINEL}$`), 'the emit directory checked before any line goes in')
+  assert.match(loaded.loads[1], /\/state_load\.1\.[0-9a-f]{8}\.js$/, 'the state comes from the file, by workflow()')
   assert.equal(loaded.result.state.cyclesUsed, 2, 'the loaded state carries the budget')
   assert.equal(loaded.result.state.decisions[0][1].reason, REASON, 'free text arrives byte for byte')
   const windows = await loadWith(state, { ...stateRef, outputFile: 'C:\\Users\\me\\tasks\\w1.output' })
@@ -8492,6 +8496,106 @@ test('a facts.py without emit-dir stops at preflight naming both agentrc roots, 
   assert.equal(plain.journal.some(j => j.label === 'emit:roots'), false)
 })
 
+test('an emit:dir answer its directory\'s sentinel does not bind is asked again before any line goes in (#547)', async () => {
+  const other = emitDirs('pr-babysit-other-')
+  try {
+    const { dir, nonce } = other.answer()
+    const parent = dirname(dir)
+    const sentinel = (name, text) => { mkdirSync(`${parent}/${name}`); writeFileSync(`${parent}/${name}/${SENTINEL}`, text); return `${parent}/${name}` }
+    const unbound = [
+      ['mis-copied', { dir: '/home/u/.claude/.git/agentrc-emit/6_6tkgev', nonce }],
+      ['another emit-dir run\'s', { dir, nonce: '0'.repeat(16) }],
+      ['no nonce, its sentinel there', { dir }],
+      ['malformed sentinel', { dir: sentinel('bad', 'return {"dir":'), nonce }],
+      ['sentinel copied from another', { dir: sentinel('r2', moduleOf(`${dir}/${SENTINEL}`, { dir, nonce })), nonce }],
+      ['sentinel naming another', { dir: sentinel('r3', moduleOf(`${parent}/r3/${SENTINEL}`, { dir, nonce })), nonce }],
+      ['sentinel missing its nonce', { dir: sentinel('r4', moduleOf(`${parent}/r4/${SENTINEL}`, { dir: `${parent}/r4` })), nonce }],
+      ['empty nonces on both sides', { dir: sentinel('r5', moduleOf(`${parent}/r5/${SENTINEL}`, { dir: `${parent}/r5`, nonce: '' })), nonce: '' }],
+    ]
+    const { state, stateRef } = await savedForLoad()
+    for (const [what, answer] of unbound) {
+      const loaded = await run({ args: { yieldAfterCycle: true, maxCycles: 3, stateRef }, load: state, dirAnswer: n => n === 1 ? answer : undefined })
+      assert.deepEqual(loaded.journal.slice(0, 2).map(j => j.label), ['emit:dir', 'emit:dir'], what)
+      assert.deepEqual(loaded.labels.slice(0, 2), ['state:load.retry', 'preflight'], `${what}: the retry asks again and loads`)
+      assert.equal(loaded.result.state.cyclesUsed, 2, what)
+      assert.ok(loaded.logs.includes(`emit:dir: the emit:dir relay answered ${JSON.stringify(answer.dir)}, which holds no ${SENTINEL} of that emit-dir run` +
+        (what === 'mis-copied' || what === 'malformed sentinel' ? ' (none loads there)' : '')), loaded.logs.join('\n'))
+      assert.equal(loaded.journal.some(j => j.label === 'emit:roots'), false, `${what}: a copy failure, no skew asked after`)
+      assert.deepEqual(loaded.loads.filter(f => f.startsWith(`${answer.dir}/`)), [`${answer.dir}/${SENTINEL}`], `${what}: no line goes in`)
+      const fresh = await run({ reviews: oneValid, dirAnswer: n => n === 1 ? answer : undefined })
+      assert.deepEqual([fresh.labels[0], fresh.result.cycles], ['preflight.retry', 1], what)
+    }
+    // Never bound: the stop names the copy, not an unknown earlier attempt, and no relay runs.
+    const [, misCopied] = unbound[0]
+    const stuck = await run({ args: { yieldAfterCycle: true, maxCycles: 3, stateRef }, load: state, dirAnswer: () => misCopied })
+    assert.deepEqual([stuck.result.reason, stuck.result.detail, stuck.labels],
+      ['state-transfer-failed', `the emit:dir relay answered "${misCopied.dir}", which holds no ${SENTINEL} of that emit-dir run (none loads there)`, []])
+    // No nonce and no sentinel: maybe an emit-dir older than this workflow, said so with both roots, read once; still asked again.
+    const older = `${parent}/old`
+    mkdirSync(older)
+    const skew = `the emit:dir relay answered ${JSON.stringify(older)} with no nonce, and no ${SENTINEL} loads there: the scripts may be an older agentrc ` +
+      'revision than this workflow; the scripts are /home/u/code/agentrc 341ae67 (AGENTRC_DIR, else ~/.claude), and the saved workflow a named launch ' +
+      'loads is /home/u/candidate 455d554. If they differ, AGENTRC_DIR does not choose the saved workflow: relaunch with Workflow scriptPath ' +
+      '"${AGENTRC_DIR:-$HOME/.claude}/workflows/pr-babysit.js", expanded in the shell first'
+    const once = await run({ reviews: oneValid, dirAnswer: n => n === 1 ? { dir: older } : undefined })
+    assert.ok(once.logs.includes(`emit:dir: ${skew}`), once.logs.join('\n'))
+    assert.deepEqual([once.labels[0], once.result.cycles], ['preflight.retry', 1])
+    const always = await run({ args: { yieldAfterCycle: true, maxCycles: 3, stateRef }, load: state, dirAnswer: () => ({ dir: older }) })
+    assert.deepEqual([always.result.reason, always.result.detail, always.labels], ['state-transfer-failed', skew, []])
+    assert.equal(always.journal.filter(j => j.label === 'emit:roots').length, 1, 'the roots are read once')
+    // Another emit-dir run's directory with its own nonce is consistent, and taken: the sentinel gives no freshness.
+    const bound = await run({ reviews: oneValid, dirAnswer: () => ({ dir, nonce }) })
+    assert.equal(bound.loads[0], `${dir}/${SENTINEL}`)
+    assert.ok(bound.loads.slice(1).every(f => f.startsWith(`${dir}/`)), bound.loads.join('\n'))
+    assert.equal(bound.result.cycles, 1, bound.result.reason)
+  } finally { other.cleanup(true) }
+})
+
+test('a script that cannot create its emit file reports that nothing ran, never an earlier attempt\'s unknown outcome (#547)', async () => {
+  const { state, stateRef } = await savedForLoad()
+  const onStateLoad = (change) => (label, file) => { if (label.startsWith('state:load')) change(dirname(file), file) }
+  const loadUnder = (beforeClaim, more = {}) => run({ args: { yieldAfterCycle: true, maxCycles: 3, stateRef }, load: state, beforeClaim, ...more })
+  const unclaimable = /^the script could not claim \/.+\/agentrc-emit\/r1\/state_load\.1\.[0-9a-f]{8}\.js: nothing was run$/
+  for (const [what, change] of [
+    ['its directory gone', (d) => rmSync(d, { recursive: true, force: true })],
+    ['its directory a file', (d) => { rmSync(d, { recursive: true, force: true }); writeFileSync(d, '') }],
+  ]) {
+    const got = await loadUnder(onStateLoad(change))
+    assert.deepEqual([got.result.status, got.result.reason, got.result.stateRef], ['blocked', 'state-transfer-failed', stateRef], what)
+    assert.match(got.result.detail, unclaimable, what)
+    assert.deepEqual([got.journal.map(j => j.label), got.labels], [['emit:dir', 'state:load'], []],
+      `${what}: no script run, no fresh attempt, the stop`)
+    assert.ok(got.logs.some(l => /^state:load: the script could not claim .+ \(AGENTRC_EMIT .+: E[A-Z]+: nothing was run\) — nothing was run$/.test(l)), got.logs.join('\n'))
+    assert.equal(got.logs.some(l => l.includes('its outcome is unknown')), false, what)
+  }
+  // A refusal that cannot tell whether an earlier claim is there (EACCES), one hidden or none, keeps its outcome unknown.
+  if (process.platform !== 'win32' && process.getuid?.() !== 0) {
+    for (const [what, change] of [
+      ['a directory it may not write', (d) => chmodSync(d, 0o500)],
+      // The load's claim is hidden; its retry's file meets the same directory.
+      ['a claim hidden behind a mode-000 directory', (d, file) => { if (!file.includes('.retry.')) writeFileSync(file, ''); chmodSync(d, 0o000) }],
+    ]) {
+      const locked = await loadUnder(onStateLoad(change), { keepEmit: true })
+      try {
+        assert.deepEqual([locked.result.reason, locked.result.detail], ['state-transfer-failed', 'an earlier attempt left no line: its outcome is unknown'], what)
+        assert.equal(locked.logs.some(l => l.includes('could not claim')), false, what)
+      } finally {
+        chmodSync(locked.emitDir, 0o700)
+        rmSync(locked.emitRoot, { recursive: true, force: true })
+      }
+    }
+  }
+  // A claim there before the run, even left empty, is still an earlier attempt's: its outcome stays unknown.
+  const claimed = await loadUnder(onStateLoad((_, file) => writeFileSync(file, '')))
+  assert.deepEqual([claimed.result.reason, claimed.result.detail], ['state-transfer-failed', 'an earlier attempt left no line: its outcome is unknown'])
+  // A relay a transport failure retries: the unclaimable file is a definite failure, never a dead relay's silence, and
+  // gets no fresh attempt either.
+  const pre = await run({ reviews: oneValid, beforeClaim: (label, file) => { if (label === 'preflight') rmSync(file.replace(/[^/]+$/, ''), { recursive: true, force: true }) } })
+  assert.ok(pre.logs.some(l => /^preflight: the script could not claim .+ — nothing was run$/.test(l)), pre.logs.join('\n'))
+  assert.deepEqual([pre.journal.map(j => j.label), pre.result.reason], [['emit:dir', 'preflight'], 'preflight-failed'])
+  assert.match(pre.result.detail, /^the script could not claim \/.+\/agentrc-emit\/r1\/preflight\.1\.[0-9a-f]{8}\.js: nothing was run$/)
+})
+
 test('a resume that names no checkoutDir inherits the state\'s when it is the session\'s worktree; an explicit other one refuses (#517)', async () => {
   const WT = '/home/u/code/tinyusb/.worktrees/fix-hil-net'
   const first = await run({ args: { ...YIELD, checkoutDir: WT } })
@@ -8554,7 +8658,8 @@ test('a resumed launch reloads the lines its relays wrote; a file there before a
     assert.ok(again.logs.includes('preflight: the line an earlier attempt of this call wrote, reloaded'), again.logs.join('\n'))
     // A file there that names another (a copy of another call's) is no line of this call: that attempt's outcome is
     // unknown, and the read-only preflight gets its one fresh attempt.
-    const [pre, other] = first.loads
+    assert.equal(first.loads[0], `${first.emitDir}/${SENTINEL}`, 'the directory checked first')
+    const [pre, other] = first.loads.slice(1)
     writeFileSync(pre, readFileSync(other, 'utf8'))
     const foreign = await run({ reviews, emitDir: first.emitDir, args })
     assert.ok(foreign.logs.includes(`preflight: an earlier attempt of this call claimed ${pre} and left no line of it — its outcome is unknown`), foreign.logs.join('\n'))
