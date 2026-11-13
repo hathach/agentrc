@@ -265,14 +265,36 @@ def _usj(serial: str) -> tuple:
     return first[0]
 
 
-def usj_location(serial: str) -> str:
-    """The bus-port of the one USJ with `serial`, for `adapter usb location`; RuntimeError when
-    it is missing, ambiguous, unidentifiable or changes between two walks. No serial-only
-    fallback."""
-    busport = _usj(serial)[0]
+def _location(serial: str, busport: str) -> str:
     if not usb_observe.BUSPORT_RE.fullmatch(busport) or len(busport) > USB_LOCATION_MAX:
         raise RuntimeError(f'USJ serial {serial}: bus-port {busport!r} is not a location openocd can match')
     return busport
+
+
+def _usj_at(serial: str, busport: str) -> str:
+    """`busport` once the device there is 303a:1001 with `serial` within one enumeration."""
+    _location(serial, busport)
+    d = os.path.join(usb_observe.SYS_USB_DEVICES, busport)
+    ino = usb_observe.enumeration_id(d)
+    try:
+        ids = _attr(d, 'idVendor'), _attr(d, 'idProduct')
+    except OSError:
+        ids = None
+    # the device's own serial, never udev's record: that is keyed by bus and device number, not enumeration
+    sn = usb_observe.read_sysfs(os.path.join(d, 'serial')) if ids == USJ_VID_PID else None
+    if ino is None or ids != USJ_VID_PID or sn != serial or usb_observe.enumeration_id(d) != ino:
+        raise RuntimeError(f'USJ serial {serial}: no 303a:1001 with it at {busport} (found {ids}, serial {sn!r})')
+    return busport
+
+
+def usj_location(serial: str, busport: str | None = None) -> str:
+    """The bus-port of the one USJ with `serial`, for `adapter usb location`; RuntimeError when
+    it is missing, ambiguous, unidentifiable or changes between two walks. No serial-only
+    fallback. With `busport` (a roster's port) only that port is checked: the device there must
+    be 303a:1001 with `serial` within one enumeration, whatever else is on the bus."""
+    if busport is not None:
+        return _usj_at(serial, busport)
+    return _location(serial, _usj(serial)[0])
 
 
 USBFS_ROOT, DEV_ROOT = '/dev/bus/usb', '/dev'

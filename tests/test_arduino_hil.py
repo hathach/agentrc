@@ -609,25 +609,15 @@ class Identity(Base):
             self.assertIsNone(H.wait_enumerated('1:2', {}, 1))   # only the old enumeration
 
     def test_usb_serial_jtag_is_checked_at_its_roster_port(self):
-        sysfs = self.dir / 'sys'
-        usj = sysfs / '11-1.2'
-        usj.mkdir(parents=True)
-        (usj / 'idVendor').write_text('303a\n')
-        (usj / 'idProduct').write_text('1001\n')
-        self.A.usb.SYS_USB_DEVICES = str(sysfs)
-        self.A.usb.enumeration_id = lambda d: 7 if Path(d).exists() else None
-        dbg = {'uid': '60:55:F9', 'usb_port': '11-1.2'}
-        self.A.usb.read_sysfs = lambda p: '60:55:F9'
-        self.assertEqual(H.usj_at(dbg), '11-1.2')
-        for serial, port in (('84:F7:03', '11-1.2'), (None, '11-1.2'), ('60:55:F9', '11-1.3')):
-            self.A.usb.read_sysfs = lambda p, s=serial: s
-            with self.subTest(serial=serial, port=port), self.assertRaisesRegex(RuntimeError, 'no USB-Serial/JTAG'):
-                H.usj_at({**dbg, 'usb_port': port})
-        ids = iter([7, 8])   # re-enumerated during the check
-        self.A.usb.enumeration_id = lambda d: next(ids)
-        self.A.usb.read_sysfs = lambda p: '60:55:F9'
-        with self.assertRaisesRegex(RuntimeError, 'no USB-Serial/JTAG'):
-            H.usj_at(dbg)
+        """The provider's port-pinned resolver (its tests have the cases): debug.uid at debug.usb_port only."""
+        esp = mock.MagicMock()
+        esp.usj_location.return_value = '11-1.2'
+        self.A.esp = lambda: esp
+        self.assertEqual(H.usj_at({'uid': '60:55:F9', 'usb_port': '11-1.2'}), '11-1.2')
+        esp.usj_location.assert_called_once_with('60:55:F9', '11-1.2')
+        esp.usj_location.side_effect = RuntimeError('USJ serial 60:55:F9: no 303a:1001 with it at 11-1.2')
+        with self.assertRaisesRegex(RuntimeError, 'no 303a:1001 with it at 11-1.2'):
+            H.usj_at({'uid': '60:55:F9', 'usb_port': '11-1.2'})
 
     def test_probe_presence(self):
         usb = self.A.usb
@@ -696,7 +686,7 @@ class Esp(Base):
         board = self.board('rig_esp')
         with mock.patch.object(H, 'usj_at', return_value='11-1.2'):
             pipe = shlex.split(H.gdb_argv('rig_esp', board, 'fw.elf', [])[4].removeprefix('target extended-remote | '))
-        esp.usj_location.assert_not_called()   # it refuses while a serial-less DUT is on the bus
+        esp.usj_location.assert_not_called()   # only through usj_at, pinned to the roster port
         self.assertEqual(esp.admit.call_args[0][0], {'name': 'openocd_esp', 'uid': '60:55:F9',
                                                      'args': '-f board/esp32s3-builtin.cfg'})
         self.assertEqual(esp.find_openocd.call_args[0][0], 'openocd-esp32')

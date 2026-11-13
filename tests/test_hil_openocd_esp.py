@@ -431,6 +431,39 @@ class UsjLocation(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, r'cannot rule out 5-3\.1'):
             oe.usj_location(SERIAL)
 
+    def test_a_roster_port_is_checked_alone(self):
+        self.bus.add('5-3.4')
+        self.bus.add('5-3.1', None, dev=9)                    # unreadable: the bus-wide walk refuses
+        self.assertEqual(oe.usj_location(SERIAL, '5-3.4'), '5-3.4')
+        self.bus.add('5-3.2', 'AA:BB', dev=10)
+        self.bus.add('5-3.3', SERIAL, vid_pid=('239a', '00a5'), dev=11)
+        self.bus.add('5-3.5', None, dev=12, udev=False)
+        for port, why in (('5-3.2', "serial 'AA:BB'"), ('5-3.3', "found \\('239a', '00a5'\\)"), ('5-3.5', 'serial None'),
+                          ('5-3.9', 'found None'), ('5-3.1', 'serial None')):
+            with self.subTest(port=port), self.assertRaisesRegex(RuntimeError, f'no 303a:1001 with it at {port}.*{why}'):
+                oe.usj_location(SERIAL, port)
+        with self.assertRaisesRegex(RuntimeError, 'not a location openocd can match'):
+            oe.usj_location(SERIAL, '5-1.2.3.4.5.6.17')
+        with self.assertRaisesRegex(RuntimeError, 'not a location openocd can match'):
+            oe.usj_location(SERIAL, '../5-3.4')
+
+    def test_a_roster_port_takes_the_devices_serial_not_udevs_record(self):
+        """udev's record is keyed by bus and device number: one left from an earlier device proves nothing."""
+        d = self.bus.add('5-3.4', 'AA:BB:CC:DD:EE:FF')
+        (self.bus.udev / f'c189:{4 * 128 + 13}').write_text(f'E:ID_SERIAL_SHORT={SERIAL}\n')
+        with self.assertRaisesRegex(RuntimeError, "no 303a:1001 with it at 5-3.4.*serial 'AA:BB:CC:DD:EE:FF'"):
+            oe.usj_location(SERIAL, '5-3.4')
+        (d / 'serial').unlink()
+        with self.assertRaisesRegex(RuntimeError, 'no 303a:1001 with it at 5-3.4.*serial None'):
+            oe.usj_location(SERIAL, '5-3.4')
+
+    def test_a_roster_port_re_enumerating_as_it_is_checked_is_refused(self):
+        self.bus.add('5-3.4')
+        ids = iter([7, 8])
+        with mock.patch.object(oe.usb_observe, 'enumeration_id', lambda d: next(ids)), \
+                self.assertRaisesRegex(RuntimeError, 'no 303a:1001 with it at 5-3.4'):
+            oe.usj_location(SERIAL, '5-3.4')
+
     def test_a_usj_that_disappears_mid_walk_is_refused(self):
         d = self.bus.add('5-3.4')
         (d / 'devnum').unlink()
