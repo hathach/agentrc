@@ -2196,6 +2196,21 @@ test('Actions runs awaiting approval beside other work wait on it, and a failure
   assert.deepEqual([rig.result.pass, rig.result.reason], [false, 'ci-red-rig-side'], rig.logs.join('\n'))
 })
 
+test('a required check the gated run would provide waits on the approval, and a failed ignored one is red first (#545)', async () => {
+  // collect.py's inventories for a Build gate, Build and CodeRabbit required, CodeRabbit ignored.
+  const build = { context: 'Build', app: -1, state: 'not registered', bucket: 'missing' }
+  const coderabbit = { context: 'CodeRabbit', app: -1, state: 'failure', bucket: 'fail' }
+  const inconsistent = (r) => r.logs.some(l => /CI inventory is inconsistent/.test(l))
+  const gated = await run({ ci: { ...AWAITING, ignored: ['CodeRabbit'], requiredChecks: [build, { ...coderabbit, state: 'success', bucket: 'pass' }] }, args: { maxCycles: 3 } })
+  assert.equal(inconsistent(gated), false, gated.logs.join('\n'))
+  assert.deepEqual([gated.result.reason, gated.result.cycles, gated.result.awaitingApproval], ['ci-awaiting-approval', 1, GATED], gated.logs.join('\n'))
+  const red = await run({ ci: { status: 'red', pending: 2, awaitingApproval: GATED, ignored: ['CodeRabbit'], infraRerun: [], realFailures: [], requiredChecks: [build, coderabbit] }, args: { maxCycles: 3 } })
+  assert.equal(inconsistent(red), false, red.logs.join('\n'))
+  assert.deepEqual([red.result.reason, red.result.requiredFailed], ['required-check-failed', [{ context: 'CodeRabbit', app: -1 }]], red.logs.join('\n'))
+  const running = await run({ ci: { ...RUNNING, pending: 2, awaitingApproval: GATED, requiredChecks: [build] }, args: { maxCycles: 1 } })
+  assert.ok(inconsistent(running), `the gate alone is never running for a missing required check: ${running.logs.join('\n')}`)
+})
+
 test('a conflicting PR or an unknown mergeability outranks runs awaiting approval (#545)', async () => {
   const conflicting = await run({ ci: { ...AWAITING, status: 'conflicting', mergeable: 'CONFLICTING' }, args: { maxCycles: 3 } })
   assert.equal(conflicting.result.reason, 'pr-conflicting', conflicting.logs.join('\n'))

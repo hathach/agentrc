@@ -2598,10 +2598,11 @@ const ciLaneRun = async (cycle, lanes, entry) => {
   const failing = inv.checks.filter(c => c.bucket === 'fail' || c.bucket === 'cancel')
   const unmet = unmetOf(inv)
   const failedRequired = inv.requiredChecks.filter(r => r.bucket === 'fail')
-  // Runs awaiting approval are pending checks too, which only other pending work keeps running.
+  // Runs awaiting approval are pending checks too, which only other pending work keeps running; a required check not
+  // yet passed waits on them too, as the gated run may be what provides it.
   const gates = inv.awaitingApproval.length
   const shown = inv.mergeable === 'CONFLICTING' ? 'conflicting'
-    : inv.pending > gates || inv.mergeable === 'UNKNOWN' || unmet.length ? 'running' : failing.length || failedRequired.length ? 'red'
+    : inv.pending > gates || inv.mergeable === 'UNKNOWN' || (unmet.length && !gates) ? 'running' : failing.length || failedRequired.length ? 'red'
       : gates ? 'awaiting-approval' : null
   if (inv.head !== expectedHead || (shown ? inv.status !== shown : !['green', 'running'].includes(inv.status))) {
     log(`cycle ${cycle}: CI inventory is inconsistent — head ${inv.head.slice(0, 7) || 'none'} for ${expectedHead.slice(0, 7)}, ${inv.status} with ${failing.length} failing check(s); re-arming`)

@@ -396,7 +396,7 @@ class InventoryTest(unittest.TestCase):
                 self.assertEqual(self.clock[0], 0, 'nothing a wait does moves it: printed at once')
                 self.assertEqual(r['registered'], 2 + len(listing) - len(ignore) // 2)
                 self.assertEqual(r['waiting'], '')
-                self.assertEqual(r['requiredChecks'], [], 'judged only once nothing is pending')
+                self.assertEqual(r['requiredChecks'], [], 'none required')
                 self.assertEqual((self.calls.count(['head-runs']), ['gated-runs'] in self.calls), (1, False),
                                  'the gates come from the whole listing it reads, no request of their own')
                 self.assertEqual(self.main('--brief', *ignore)[1]['awaitingApproval'], names, 'a brief line names them too')
@@ -408,6 +408,23 @@ class InventoryTest(unittest.TestCase):
                 self.head_runs = [self.head_run(1, 'completed') | {'conclusion': 'success'}, run]
                 rc, r = self.main()
                 self.assertEqual((r['status'], r['pending'], r['awaitingApproval']), ('green', 0, []), f'{what} gate changes nothing')
+
+    def test_a_gate_alone_still_judges_the_required_checks(self):
+        self.heads = [HEAD]
+        self.require('Build', 'CodeRabbit')
+        gate = ['Build (run 43344617970, completed/action_required: awaiting maintainer approval)']
+        self.listings = [[self.check('CodeRabbit', 'fail', '')]]
+        self.head_runs = [self.gated(43344617970, 'Build')]
+        self.commit_statuses = [{'id': 9, 'context': 'CodeRabbit', 'state': 'failure', 'updated_at': '2026-10-01T00:00:00Z'}]
+        rc, r = self.main('--ignore-check', 'CodeRabbit')
+        self.assertEqual((rc, r['status'], r['awaitingApproval'], [(c['context'], c['bucket']) for c in r['requiredChecks']]),
+                         (0, 'red', gate, [('Build', 'missing'), ('CodeRabbit', 'fail')]), 'an ignored required check that failed is red')
+        for state in ('success', 'pending'):
+            with self.subTest(state):
+                self.commit_statuses[0]['state'] = state
+                rc, r = self.main('--ignore-check', 'CodeRabbit')
+                self.assertEqual((r['status'], r['waiting'], r['requiredChecks'][0]['bucket']), ('awaiting-approval', '', 'missing'),
+                                 'a requirement the gated run would provide, or one still pending, waits on the approval too')
 
     def test_a_run_awaiting_approval_beside_other_work_is_read_by_its_own_filter_and_outranked(self):
         self.heads = [HEAD]

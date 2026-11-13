@@ -42,7 +42,8 @@ running either way), so until then those three may leave them out. A run on the 
 that whole run listing where it is read and by GitHub's own filter for them otherwise, named
 "<workflow> (run <id>, completed/action_required: awaiting maintainer approval)", never a failure: only the approval
 starts it, and `awaitingApproval` lists those names, sorted, [] when none. With no other check pending, no unfinished
-run and nothing failed, the status is awaiting-approval, never green: nothing a wait or a re-run does moves it. A failed
+run and nothing failed, a required check included, the status is awaiting-approval, never green, nor running for a
+required check pending or missing (the gated run may provide it): nothing a wait or a re-run does moves it. A failed
 or cancelled CircleCI job whose
 workflow has not finished (running, failing, on_hold, queued: CircleCI refuses
 to re-run it yet) counts as pending, read from CircleCI's public job and
@@ -64,11 +65,12 @@ state, bucket}: `app` the GitHub App id that must provide it, -1 for any
 source (a commit status counts only there);
 `bucket` pass, pending, fail or missing (none registered, or only by another
 app: `state` says which), read from the head's check runs and statuses, an
---ignore-check NAME included: one pending or missing keeps the status running,
-one failed makes it red, and `waiting` covers them. It is [] when nothing was
-judged, which is only when the requirements cannot change the status: a
-merged, closed or conflicting PR, GitHub's mergeable UNKNOWN, or a listed
-check still pending. Where the base requires a context from any source, its
+--ignore-check NAME included: one pending or missing keeps the status running
+(awaiting-approval beside a run awaiting approval), one failed makes it red, and
+`waiting` covers them. It is [] when nothing was judged, which is only when the
+requirements cannot change the status: a merged, closed or conflicting PR,
+GitHub's mergeable UNKNOWN, or a listed check other than a run awaiting
+approval still pending. Where the base requires a context from any source, its
 newest check run and newest commit status of that name must both pass where
 both exist, as GitHub requires. A base retargeted while collecting is an
 error. `baseRef` is the PR's base branch. Exit 0 with the
@@ -387,7 +389,8 @@ def summary(checks, mergeable, required=()):
     """(status, counts of the listed checks by bucket), the required checks folded in: one pending or missing keeps it
     running, one failed makes it red unless a listed check is still pending; nothing listed is running, unless a required
     check failed. A run awaiting approval is a pending check that keeps it running only beside another one: alone, it
-    makes awaiting-approval what would be green, and red outranks it."""
+    makes awaiting-approval what would be green, or running only for a required check pending or missing (the gated run
+    may be what provides it), and red, a failed required check included, outranks it."""
     if mergeable not in ('MERGEABLE', 'CONFLICTING', 'UNKNOWN'):
         raise Failed(f'the PR\'s mergeable is {mergeable!r}')
     counts = {}
@@ -397,7 +400,8 @@ def summary(checks, mergeable, required=()):
     buckets = {r['bucket'] for r in required}
     if mergeable == 'CONFLICTING':
         return 'conflicting', counts
-    if counts.get('pending', 0) > gates or mergeable == 'UNKNOWN' or buckets & {'pending', 'missing'} or not (checks or 'fail' in buckets):
+    unmet = not gates and buckets & {'pending', 'missing'}
+    if counts.get('pending', 0) > gates or mergeable == 'UNKNOWN' or unmet or not (checks or 'fail' in buckets):
         return 'running', counts
     if counts.get('fail') or counts.get('cancel') or 'fail' in buckets:
         return 'red', counts
@@ -549,11 +553,11 @@ def inventory(repo, pr, head, wait, ignore=(), brief=False, links=None, required
     start = time.monotonic()
     workflows, definitions = {}, None
 
-    def judge(view, counts):
+    def judge(view, checks):
         """The required checks judged, read once per call and only where they can change the status: GitHub knows the PR
-        mergeable and no listed check is pending; [] otherwise."""
+        mergeable and no listed check but a run awaiting approval is pending; [] otherwise."""
         nonlocal definitions
-        if not required or view.get('mergeable') != 'MERGEABLE' or counts.get('pending'):
+        if not required or view.get('mergeable') != 'MERGEABLE' or any(c['bucket'] == 'pending' and not c.get('approval') for c in checks):
             return []
         if definitions is None:
             definitions = required_checks(repo, before['baseRefName'])
@@ -567,7 +571,7 @@ def inventory(repo, pr, head, wait, ignore=(), brief=False, links=None, required
             runs = None if any(c['bucket'] == 'pending' for c in checks) else head_runs(repo, head)
             checks += held_runs(runs or [], everything) + approval_checks(gated_runs(repo, head, workflow_runs, runs))
         counts = summary(checks, view.get('mergeable'))[1]
-        reqs = judge(view, counts)
+        reqs = judge(view, checks)
         status = summary(checks, view.get('mergeable'), reqs)[0]
         waited = int(time.monotonic() - start)
         if status != 'running' or waited + POLL > wait:
@@ -602,7 +606,7 @@ def inventory(repo, pr, head, wait, ignore=(), brief=False, links=None, required
 
     def reqs_at(view):
         if view.get('mergeable') not in judgements:
-            judgements[view.get('mergeable')] = judge(view, counts)
+            judgements[view.get('mergeable')] = judge(view, checks)
         return judgements[view.get('mergeable')]
 
     hidden = brief and status == 'running'
