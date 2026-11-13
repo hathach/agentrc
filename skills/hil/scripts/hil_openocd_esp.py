@@ -265,14 +265,36 @@ def _usj(serial: str) -> tuple:
     return first[0]
 
 
-def usj_location(serial: str) -> str:
-    """The bus-port of the one USJ with `serial`, for `adapter usb location`; RuntimeError when
-    it is missing, ambiguous, unidentifiable or changes between two walks. No serial-only
-    fallback."""
-    busport = _usj(serial)[0]
+def _location(serial: str, busport: str) -> str:
     if not usb_observe.BUSPORT_RE.fullmatch(busport) or len(busport) > USB_LOCATION_MAX:
         raise RuntimeError(f'USJ serial {serial}: bus-port {busport!r} is not a location openocd can match')
     return busport
+
+
+def _usj_at(serial: str, busport: str) -> str:
+    """`busport` once the device there is 303a:1001 with `serial` within one enumeration."""
+    _location(serial, busport)
+    d = os.path.join(usb_observe.SYS_USB_DEVICES, busport)
+    ino = usb_observe.enumeration_id(d)
+    try:
+        ids = _attr(d, 'idVendor'), _attr(d, 'idProduct')
+    except OSError:
+        ids = None
+    # the device's own serial, never udev's record: that is keyed by bus and device number, not enumeration
+    sn = usb_observe.read_sysfs(os.path.join(d, 'serial')) if ids == USJ_VID_PID else None
+    if ino is None or ids != USJ_VID_PID or sn != serial or usb_observe.enumeration_id(d) != ino:
+        raise RuntimeError(f'USJ serial {serial}: no 303a:1001 with it at {busport} (found {ids}, serial {sn!r})')
+    return busport
+
+
+def usj_location(serial: str, busport: str | None = None) -> str:
+    """The bus-port of the one USJ with `serial`, for `adapter usb location`; RuntimeError when
+    it is missing, ambiguous, unidentifiable or changes between two walks. No serial-only
+    fallback. With `busport` (a roster's port) only that port is checked: the device there must
+    be 303a:1001 with `serial` within one enumeration, whatever else is on the bus."""
+    if busport is not None:
+        return _usj_at(serial, busport)
+    return _location(serial, _usj(serial)[0])
 
 
 USBFS_ROOT, DEV_ROOT = '/dev/bus/usb', '/dev'
@@ -765,18 +787,32 @@ def security_evidence(result, *, chip: str, source: str) -> dict:
                               f'eFuse flash encryption {efuse["flashEncryption"]}, secure boot {efuse["secureBoot"]}'}
 
 
+SECURITY_SETTLE = 2.0      # s run_tracked waits for the security read's descendants once its child ended
+SECURITY_STATE = 'security-ops'
+
+
 def read_security(serial: str, *, chip: str, workdir, timeout, retains_lock=False, esptool: str = 'esptool',
                   run=None, baud: int = ESP_BAUD):
     """Read the security state of the chip behind the USJ with `serial` before an openocd_esp
     flash: one esptool_session.py child, under the interpreter of `esptool` (hil_flash
     tool_python), on usj_tty(serial), that reads GET_SECURITY_INFO and the eFuses on the ROM
-    loader, then hard-resets the chip out of it, run through `run` (hil_flash's). Refused, before
-    any board access, as `refusal(retains_lock=)` refuses and for a chip not in SECURITY_CHIPS.
-    Returns hil_flash's Operation of the child with `security`, security_evidence's dict; a
-    failed child or evidence that is unknown or contradictory raises, carrying `.operation`."""
+    loader, then hard-resets the chip out of it, run through `run` (hil_flash's), which must report
+    the child's cleanup as hil_process.run_tracked does (a plain run_cmd's `unknown` is refused), by
+    default run_tracked with SECURITY_SETTLE and its state in `workdir`'s SECURITY_STATE dir,
+    which outlives the call while a receipt names it. Refused, before any board access, as
+    `refusal(retains_lock=)` refuses and for a chip not in SECURITY_CHIPS. Returns hil_flash's
+    Operation of the child with `security`, security_evidence's dict, only once the child is
+    proven ended (cleanup `done`): an openocd session started beside a survivor would share the
+    USJ with it. Otherwise, as for a failed child or evidence that is unknown or contradictory,
+    it raises carrying `.operation`, its cleanup and receipts."""
     _admit_session(retains_lock)
     _security_chip(chip)
     tty, python = usj_tty(serial), hil_flash.tool_python(esptool)
+    if run is None:
+        state = hil_process.state_dir(_workdir(workdir), SECURITY_STATE)
+
+        def run(cmd, cwd=None, **kw):
+            return hil_process.run_tracked(cmd, cwd, settle=SECURITY_SETTLE, state_dir=state, **kw)
     with tempfile.TemporaryDirectory(prefix='hil_security_', dir=_workdir(workdir)) as td:
         ops = os.path.join(td, 'ops.json')
         with open(ops, 'w') as f:
@@ -785,6 +821,8 @@ def read_security(serial: str, *, chip: str, workdir, timeout, retains_lock=Fals
                 '--after', 'hard-reset', ops]
         op = hil_flash._once(run, argv, env=dict(hil_flash.ESPTOOL_ENV), timeout=timeout)
     try:
+        if op.cleanup != 'done':
+            raise RuntimeError(f'esptool_session on {tty}: cleanup {op.cleanup}, its child is not proven ended')
         lines = hil_process.cmd_stdout_text(op.stdout).strip().splitlines()
         try:
             out = json.loads(lines[-1]) if lines else None

@@ -431,6 +431,39 @@ class UsjLocation(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, r'cannot rule out 5-3\.1'):
             oe.usj_location(SERIAL)
 
+    def test_a_roster_port_is_checked_alone(self):
+        self.bus.add('5-3.4')
+        self.bus.add('5-3.1', None, dev=9)                    # unreadable: the bus-wide walk refuses
+        self.assertEqual(oe.usj_location(SERIAL, '5-3.4'), '5-3.4')
+        self.bus.add('5-3.2', 'AA:BB', dev=10)
+        self.bus.add('5-3.3', SERIAL, vid_pid=('239a', '00a5'), dev=11)
+        self.bus.add('5-3.5', None, dev=12, udev=False)
+        for port, why in (('5-3.2', "serial 'AA:BB'"), ('5-3.3', "found \\('239a', '00a5'\\)"), ('5-3.5', 'serial None'),
+                          ('5-3.9', 'found None'), ('5-3.1', 'serial None')):
+            with self.subTest(port=port), self.assertRaisesRegex(RuntimeError, f'no 303a:1001 with it at {port}.*{why}'):
+                oe.usj_location(SERIAL, port)
+        with self.assertRaisesRegex(RuntimeError, 'not a location openocd can match'):
+            oe.usj_location(SERIAL, '5-1.2.3.4.5.6.17')
+        with self.assertRaisesRegex(RuntimeError, 'not a location openocd can match'):
+            oe.usj_location(SERIAL, '../5-3.4')
+
+    def test_a_roster_port_takes_the_devices_serial_not_udevs_record(self):
+        """udev's record is keyed by bus and device number: one left from an earlier device proves nothing."""
+        d = self.bus.add('5-3.4', 'AA:BB:CC:DD:EE:FF')
+        (self.bus.udev / f'c189:{4 * 128 + 13}').write_text(f'E:ID_SERIAL_SHORT={SERIAL}\n')
+        with self.assertRaisesRegex(RuntimeError, "no 303a:1001 with it at 5-3.4.*serial 'AA:BB:CC:DD:EE:FF'"):
+            oe.usj_location(SERIAL, '5-3.4')
+        (d / 'serial').unlink()
+        with self.assertRaisesRegex(RuntimeError, 'no 303a:1001 with it at 5-3.4.*serial None'):
+            oe.usj_location(SERIAL, '5-3.4')
+
+    def test_a_roster_port_re_enumerating_as_it_is_checked_is_refused(self):
+        self.bus.add('5-3.4')
+        ids = iter([7, 8])
+        with mock.patch.object(oe.usb_observe, 'enumeration_id', lambda d: next(ids)), \
+                self.assertRaisesRegex(RuntimeError, 'no 303a:1001 with it at 5-3.4'):
+            oe.usj_location(SERIAL, '5-3.4')
+
     def test_a_usj_that_disappears_mid_walk_is_refused(self):
         d = self.bus.add('5-3.4')
         (d / 'devnum').unlink()
@@ -1793,12 +1826,14 @@ class ReadSecurity(unittest.TestCase):
         for var in oe.CI_JOB_ENV:
             os.environ.pop(var, None)
 
-    def read(self, stdout, rc=0, chip='esp32p4', **kw):
+    def read(self, stdout, rc=0, chip='esp32p4', cleanup='done', **kw):
         seen = []
 
         def run(argv, **k):
             seen.append((argv, k, json.loads(Path(argv[-1]).read_text())))
-            return subprocess.CompletedProcess(argv, rc, stdout, None)
+            r = subprocess.CompletedProcess(argv, rc, stdout, None)
+            r.cleanup = cleanup
+            return r
         try:
             return oe.read_security(SERIAL, chip=chip, workdir=str(self.work), timeout=30, retains_lock=True,
                                     esptool='esptool-5.3.1', run=run, **kw), seen
@@ -1828,24 +1863,68 @@ class ReadSecurity(unittest.TestCase):
                 self.read(stdout, rc=rc)
             self.assertEqual(cm.exception.operation.returncode, rc)
 
-    def test_every_malformed_result_carries_the_pending_operation(self):
+    def test_every_malformed_result_carries_its_operation(self):
         receipt = {'token': 'r1', 'lock': '/state/hil_op_r1.lock'}
 
-        def pending_run(stdout):
+        def tracked_run(stdout, cleanup):
             def run(argv, **kw):
                 r = subprocess.CompletedProcess(argv, 0, stdout, None)
-                r.cleanup, r.receipt = 'pending', receipt
+                r.cleanup, r.receipt = cleanup, receipt
                 return r
             return run
-        for out in ({'ok': True, 'results': {'unexpected': 1}}, {'ok': True, 'results': 7}, {'ok': True, 'results': []},
-                    {'ok': True}, {'ok': True, 'results': [7]}, {'ok': True, 'results': [None]},
-                    {'ok': True, 'results': [{'op': 'security'}]}, [1, 2], 'ok'):
-            with self.subTest(out=out), self.assertRaises((RuntimeError, ValueError)) as cm:
-                oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=30, retains_lock=True,
-                                 run=pending_run(json.dumps(out) + '\n'))
-            op = cm.exception.operation
-            self.assertEqual((op.cleanup, op.receipts), ('pending', (receipt,)))
+        for cleanup in ('done', 'pending'):     # done: the parse refuses; pending: the cleanup gate first
+            for out in ({'ok': True, 'results': {'unexpected': 1}}, {'ok': True, 'results': 7},
+                        {'ok': True, 'results': []}, {'ok': True}, {'ok': True, 'results': [7]},
+                        {'ok': True, 'results': [None]}, {'ok': True, 'results': [{'op': 'security'}]}, [1, 2], 'ok'):
+                with self.subTest(cleanup=cleanup, out=out), self.assertRaises((RuntimeError, ValueError)) as cm:
+                    oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=30, retains_lock=True,
+                                     run=tracked_run(json.dumps(out) + '\n', cleanup))
+                op = cm.exception.operation
+                self.assertEqual(op.cleanup, cleanup)
+                if cleanup == 'done':
+                    self.assertNotIn('not proven ended', str(cm.exception))
+                else:
+                    self.assertEqual(op.receipts, (receipt,))
         self.assertEqual(list(self.work.iterdir()), [])
+
+    def test_no_evidence_until_the_child_is_proven_ended(self):
+        """agentrc#213: a usable result line from a child not proven ended is no evidence."""
+        for cleanup in ('pending', 'unknown', None):
+            with self.subTest(cleanup=cleanup), self.assertRaisesRegex(RuntimeError, 'not proven ended') as cm:
+                self.read(self.line(sec()), cleanup=cleanup)
+            op = cm.exception.operation
+            self.assertEqual(op.cleanup, cleanup if cleanup in ('pending', 'unknown') else 'unknown')
+            self.assertFalse(hasattr(op, 'security'))
+
+    def test_by_default_the_child_runs_tracked_with_its_state_in_the_workdir(self):
+        seen = []
+
+        def tracked(cmd, cwd=None, **kw):
+            seen.append(kw)
+            r = subprocess.CompletedProcess(cmd, 0, self.line(sec()), None)
+            r.cleanup, r.receipt = 'done', None
+            return r
+        with mock.patch.object(oe.hil_process, 'run_tracked', tracked):
+            op = oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=30, retains_lock=True)
+        (kw,) = seen
+        state = self.work / oe.SECURITY_STATE
+        self.assertEqual((kw['settle'], kw['state_dir'], kw['timeout']), (oe.SECURITY_SETTLE, str(state), 30))
+        self.assertEqual(oe.hil_process.trusted_dir(str(state)), str(state))
+        self.assertEqual({k: op.security[k] for k in OFF}, OFF)
+        state.rmdir()       # for the workdir check of the other tests' read()
+
+    def test_a_tracked_child_that_raises_carries_its_receipt(self):
+        receipt = {'token': 't', 'lock': '/s/hil_op_t.lock'}
+
+        def tracked(cmd, cwd=None, **kw):
+            e = KeyboardInterrupt()
+            e.cleanup, e.receipt = 'pending', receipt
+            raise e
+        with mock.patch.object(oe.hil_process, 'run_tracked', tracked), self.assertRaises(KeyboardInterrupt) as cm:
+            oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=30, retains_lock=True)
+        op = cm.exception.operation
+        self.assertEqual((op.cleanup, op.receipts), ('pending', (receipt,)))
+        (self.work / oe.SECURITY_STATE).rmdir()
 
     def test_an_unchecked_chip_is_refused_before_any_access(self):
         with mock.patch.object(oe, 'usj_tty', side_effect=AssertionError('touched')), \

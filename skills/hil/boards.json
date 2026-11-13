@@ -33,7 +33,7 @@
     "683944004": {
       "name": "nrf52840dk",
       "flasher": {"name": "jlink", "args": "-device nrf52840_xxaa"},
-      "flasher_recover": {"name": "openocd", "args": "-f interface/jlink.cfg -c \"transport select swd\" -c \"adapter speed 4000\" -f target/nrf52.cfg"}
+      "flasher_recover": {"name": "openocd", "args": "-f interface/jlink.cfg -c \"transport select swd\" -c \"adapter speed 4000\" -f target/nrf52.cfg", "note": "reset and reflash, demonstrated on ci.lan 2026-11-13 (hathach/agentrc#534)"}
     },
     "000063728732": {
       "name": "max32666fthr",

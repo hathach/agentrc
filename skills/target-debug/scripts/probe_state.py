@@ -177,26 +177,13 @@ def hil_boards():
 
 
 def hil_flasher(path, board):
-    """The `flasher` of one board in a project's HIL config json ({"boards": [{"name", "uid", "probe"}]}):
-    its probe's in agentrc's registry, or an unregistered bench board's own
-    (hil_boards.resolve). Raises ValueError. Kept identical in rtt.py and probe_state.py (see
-    rtt.py's module docstring)."""
+    """The `flasher` of one active board in a project's HIL config json, by hil_boards.board: its probe's in
+    agentrc's registry, or an unregistered bench board's own. Raises ValueError. Kept identical in rtt.py and
+    probe_state.py (see rtt.py's module docstring)."""
     try:
-        with open(path, encoding='utf-8-sig') as f:
-            config = json.load(f)
-    except (OSError, ValueError) as e:
-        raise ValueError(f'--hil-config {path}: {e}')
-    boards = config.get('boards') if isinstance(config, dict) else None
-    if not isinstance(boards, list) or not all(isinstance(b, dict) for b in boards):
-        raise ValueError(f'--hil-config {path}: expected {{"boards": [{{...}}, ...]}}')
-    found = [b for b in boards if b.get('name') == board]
-    if len(found) != 1:
-        names = ', '.join(sorted(str(b.get('name')) for b in boards))
-        raise ValueError(f'--board {board}: {len(found)} entries of that name in {path} (it has: {names})')
-    try:
-        flasher = hil_boards().resolve(found[0])['flasher']
-    except (ImportError, ValueError) as e:
-        raise ValueError(f'--board {board} in {path}: {e}')
+        flasher = hil_boards().board(path, board, parked=False)['flasher']
+    except (ImportError, OSError, ValueError) as e:
+        raise ValueError(f'--hil-config {path} --board {board}: {e}')
     if flasher['name'] not in HIL_PROBE_ROUTES:
         raise ValueError(f"--board {board} is flashed over {flasher['name']!r}, which is no debug-probe route "
                          f"(known: {', '.join(HIL_PROBE_ROUTES)}); name the probe with explicit flags")

@@ -1290,18 +1290,8 @@ def op_exec(args, board, run_dir, tracker, manifest):
 
 def usj_at(dbg):
     """The roster's USB-Serial/JTAG bus-port (debug.usb_port), once the device there is 303a:1001 with serial debug.uid
-    within one enumeration. agentrc's usj_location walks the whole bus and refuses while any 303a:1001 has no readable
-    serial, which the S3's Arduino DUT never has."""
-    d = str(Path(A.usb.SYS_USB_DEVICES) / dbg['usb_port'])
-    ino = A.usb.enumeration_id(d)
-    try:
-        ids = tuple((Path(d) / a).read_text().strip() for a in ('idVendor', 'idProduct'))
-    except OSError:
-        ids = None
-    serial = A.usb.read_sysfs(str(Path(d) / 'serial'))
-    if ino is None or ids != A.esp().USJ_VID_PID or serial != dbg['uid'] or A.usb.enumeration_id(d) != ino:
-        raise RuntimeError(f'no USB-Serial/JTAG {dbg["uid"]} at {dbg["usb_port"]} (found {ids}, serial {serial!r})')
-    return dbg['usb_port']
+    within one enumeration (hil_openocd_esp.usj_location pinned to that port)."""
+    return A.esp().usj_location(dbg['uid'], dbg['usb_port'])
 
 
 def esp_openocd(dbg, chip):

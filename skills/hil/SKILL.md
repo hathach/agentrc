@@ -256,8 +256,7 @@ wedge recovery, so it joins only after a reset through it, and a reflash where o
 can flash the part, worked on the board's rig; its `note` records that as
 `<reset and reflash|reset only>, demonstrated on <rig> <YYYY-MM-DD> (<owner/repo>#<N>)`,
 the PR or issue holding the evidence (`<from>..<to>` where it dates its runs only as a set).
-`tests/test_hil_boards.py` refuses an entry without one, except nrf52840dk, which predates the
-rule with no recorded demonstration and stays note-less until a rig run records it (#534).
+`tests/test_hil_boards.py` refuses an entry without one.
 
 `scripts/hil_boards.py` is the one reader, and its docstring states what it refuses:
 every consumer that needs a board's flasher resolves the roster entry through it
@@ -364,11 +363,13 @@ recovery stay the contract's. Linux only.
   "source": <where it was read>}`. Without it, or with either feature not
   `off`, the flash is refused before anything starts; the provider never
   infers or defaults the chip's security state. `read_security(serial, chip=,
-  workdir=, timeout=, retains_lock=True)` reads it and hard-resets the chip;
-  `security_evidence(result, chip=, source=)` reads a `security` op of the
-  caller's own `scripts/esptool_session.py`. Unknown or contradictory
-  evidence, or a chip outside `SECURITY_CHIPS` (ESP32-P4, ESP32-S3), is
-  refused.
+  workdir=, timeout=, retains_lock=True)` reads it and hard-resets the chip,
+  its child run tracked by default (state in `workdir`) and its evidence
+  returned only once that child is proven ended (cleanup `done`), otherwise
+  raised with its receipts; `security_evidence(result, chip=, source=)`
+  reads a `security` op of the caller's own `scripts/esptool_session.py`.
+  Unknown or contradictory evidence, or a chip outside `SECURITY_CHIPS`
+  (ESP32-P4, ESP32-S3), is refused.
   Flash, reset and `read_security` run only for a caller that passes
   `retains_lock=True`, declaring it holds the board lock through each
   operation and logs a session it leaves pending, and never under a CI job (`RUNNER_TRACKING_ID` or
@@ -397,8 +398,9 @@ recovery stay the contract's. Linux only.
   the caller's step.
 - rc 0 means the tool reported success, not that the target runs the image;
   the project's own checks decide that. rc 124 from the default runner means
-  it killed the tool's process group on the timeout and reaped it for a
-  bounded grace: a survivor is abandoned, so 124 proves neither that every
+  it stopped the tool's process group on the timeout, SIGTERM and a short
+  grace before SIGKILL (an openocd SIGKILLed on a J-Link leaks its probe
+  registration), and reaped it for a bounded grace: a survivor is abandoned, so 124 proves neither that every
   descendant died nor that the board is in a known state. An `openocd_esp`
   timeout also returns 124; its `cleanup` says whether the session still
   ended (`done`) or a command was outstanding and the server was left running

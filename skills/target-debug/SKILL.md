@@ -39,7 +39,8 @@ These skills know probes, not projects. Three things come from the project, and 
 
 A HIL config json names each board, its `uid` and its `probe` (`--hil-config <file> --board <name>`); the board's
 `flasher` is that probe's in agentrc's board registry (`hil` skill, Board registry), or an unregistered bench board's
-own entry. `rtt.py` and `swo_capture.py` turn that `flasher` into their flags, and a flag given as well must agree:
+own entry, read through `hil_boards.board`, which refuses a missing, duplicated or parked (`boards-skip`) name.
+`rtt.py` and `swo_capture.py` turn that `flasher` into their flags, and a flag given as well must agree:
 
 | `flasher` field | Means | Becomes |
 | --------------- | --- | --- |
