@@ -2366,7 +2366,8 @@ its reason, logged as such and never as a restoration; it refuses while the
 failure's evidence is known still live (a receipt rechecking pending as the
 caller, a survivor or retained session alive). `compact` rewrites a board's
 log without its closed failures, every open one kept, as the log's owner or
-root.
+root; a closed one whose journalDigest matches a takeover journal still on
+disk stays, with its closing events.
 """
 TAKE_OVER_GONE = ('--take-over is gone (agentrc#464): a free board is taken by the next task, and a live older '
                   "helper's cleanup holder ends with `release --token`")
