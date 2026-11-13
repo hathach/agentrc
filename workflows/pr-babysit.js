@@ -2073,11 +2073,12 @@ const pushExact = async (sha, label, prToo = false) => {
   const opts = { label, phase: 'Push', model: 'haiku', effort: 'low', schema: PUSH }
   // A retry finds a push that landed; it cannot prove one did not.
   const first = await relayRun(prompt, opts)
-  const lost = !first || first.transport
-  const r = retriable(first) ? (await relayRetry(prompt, opts)) ?? first : first
+  const lost = retriable(first)
+  const r = lost ? (await relayRetry(prompt, opts)) ?? first : first
   if (!r) return null
   const unknown = (detail) => ({ pass: false, detail, published: 'unknown' })
-  if (r.error) return unknown(r.error)
+  // A first attempt that could not claim its file ran no push.py: a definite failure.
+  if (r.error) return r.unclaimable && !lost ? { pass: false, detail: r.error } : unknown(r.error)
   // push.py pushed nothing to a PR it did not read OPEN; the caller stops on it. A retry cannot prove the first attempt did not land.
   if (r.prState !== 'OPEN') {
     const prState = r.prState === 'MERGED' || r.prState === 'CLOSED' ? r.prState.toLowerCase() : 'unread'

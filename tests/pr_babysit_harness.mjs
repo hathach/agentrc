@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { test as nodeTest } from 'node:test'
@@ -8657,6 +8657,33 @@ test('a script that cannot create its emit file reports that nothing ran, never 
   assert.ok(pre.logs.some(l => /^preflight: the script could not claim .+ — nothing was run$/.test(l)), pre.logs.join('\n'))
   assert.deepEqual([pre.journal.map(j => j.label), pre.result.reason], [['emit:dir', 'preflight'], 'preflight-failed'])
   assert.match(pre.result.detail, /^the script could not claim \/.+\/agentrc-emit\/r1\/preflight\.1\.[0-9a-f]{8}\.js: nothing was run$/)
+})
+
+test('a push whose first attempt cannot claim its emit file failed, nothing pushed; only after a lost first attempt is it unknown (#547)', async () => {
+  // The emit dir is moved away for that one claim and back for the next script's.
+  const awayFor = (target) => (label, file) => {
+    const d = dirname(file)
+    if (label === target) renameSync(d, `${d}.away`)
+    else if (existsSync(`${d}.away`)) renameSync(`${d}.away`, d)
+  }
+  const review = await run({ reviews: oneValid, scope: ['src/a.c'], args: { autoPush: true, maxCycles: 3 }, beforeClaim: awayFor('push#1-review') })
+  assert.equal(review.result.reason, 'push-failed')
+  assert.equal(review.result.history[0].reviewPushFailed.published, undefined)
+  assert.match(review.result.history[0].reviewPushFailed.detail, /^the script could not claim .+: nothing was run$/)
+  assert.equal(review.result.state.pending.stage, 'push-failed')
+  assert.equal(review.journal.some(j => j.label === 'push#1-review.retry'), false, 'no fresh attempt')
+  const adopt = await run({ args: adoptionArgs(adoptionState()), preflight: { head: ADOPT, prHead: HEAD }, beforeClaim: awayFor('adopt:push') })
+  assert.equal(adopt.result.reason, 'adopt-push-failed')
+  assert.equal(adopt.result.history.at(-1).adoption.publication, 'failed')
+  assert.equal(adopt.result.state.pending.stage, 'adopt-push-failed')
+  // The first attempt died after its claim, so it may have pushed: the retry's unclaimable file proves nothing of it.
+  const lost = await run({
+    reviews: oneValid, scope: ['src/a.c'], args: { autoPush: true, maxCycles: 3 },
+    garble: (l, a) => l === 'push#1-review' ? null : a, beforeClaim: awayFor('push#1-review.retry'),
+  })
+  assert.ok(lost.journal.some(j => j.label === 'push#1-review.retry'), 'the retry ran')
+  assert.equal(lost.result.history[0].reviewPushFailed.published, 'unknown')
+  assert.equal(lost.result.state.pending.stage, 'publication-unknown')
 })
 
 test('a resume that names no checkoutDir inherits the state\'s when it is the session\'s worktree; an explicit other one refuses (#517)', async () => {
