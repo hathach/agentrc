@@ -1385,9 +1385,13 @@ def session_mutex(lock):
 
     SIGINT and SIGTERM are deferred (hil_process.InterruptHold) from before its first fd opens
     until both are closed, the with block alone excepted, so a caller catching the interrupt
-    keeps no flock; one deferred is raised after the closes, ahead of a close's error. A handler
-    the with block installed defers again in the cleanup (InterruptHold.rearm, which cannot defer
-    a signal already pending as it starts) and is replaced at exit by the one found at entry."""
+    keeps no flock; one deferred is raised after the closes, ahead of a close's error. The one
+    gap: a handler the with block installed and left runs until the cleanup's rearm loop puts
+    the deferring one back (InterruptHold.rearm, retried until it completes, cannot defer a
+    signal already pending as it starts). One interrupt there is raised after the closes; one
+    more on the loop's back-edge ends the loop with the fds closed undeferred, so a third after
+    an fd is popped can leave that fd, and its flock, open until the process exits. That handler
+    is replaced at exit by the one found at entry."""
     _check_name(lock)
     try:
         process = _process()        # before any fd: a helper that cannot load acquires nothing
