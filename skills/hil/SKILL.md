@@ -256,8 +256,7 @@ wedge recovery, so it joins only after a reset through it, and a reflash where o
 can flash the part, worked on the board's rig; its `note` records that as
 `<reset and reflash|reset only>, demonstrated on <rig> <YYYY-MM-DD> (<owner/repo>#<N>)`,
 the PR or issue holding the evidence (`<from>..<to>` where it dates its runs only as a set).
-`tests/test_hil_boards.py` refuses an entry without one, except nrf52840dk, which predates the
-rule with no recorded demonstration and stays note-less until a rig run records it (#534).
+`tests/test_hil_boards.py` refuses an entry without one.
 
 `scripts/hil_boards.py` is the one reader, and its docstring states what it refuses:
 every consumer that needs a board's flasher resolves the roster entry through it
