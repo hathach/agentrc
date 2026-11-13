@@ -1227,9 +1227,9 @@ def noticed(fence):
 def wake(recs, pending, fence, deadline):
     """Print a line for each relay held while its target was working whose target has left working since, each state
     once per relay across collects (NOTICED). Each `hc get` gets at most WAKE_LOOK_S of what is left before deadline,
-    a failure looked at again at the next poll. The line prints before it is stored, so a crash repeats it rather than
-    losing it; the store merges into NOTICED under the ledger lock, fenced by the enrollment. Sends nothing:
-    `relay --retry` stays the human's, with all its checks."""
+    a failure, or a session whose identity could not be pinned, looked at again at the next poll. The line prints
+    before it is stored, so a crash repeats it rather than losing it; the store merges into NOTICED under the ledger
+    lock, fenced by the enrollment. Sends nothing: `relay --retry` stays the human's, with all its checks."""
     held = held_working(recs, pending, fence)
     if not held:
         return
@@ -1241,6 +1241,8 @@ def wake(recs, pending, fence, deadline):
         try:
             found = find(relayed['target']['address'], timeout=min(WAKE_LOOK_S, left))
         except hc.Error:
+            continue
+        if found and unpinned(found):
             continue
         state = found['status'] if found and identity(found) == relayed['target'] else 'replaced'
         if state == 'working':

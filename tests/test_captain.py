@@ -1444,6 +1444,14 @@ class HeldWakeTest(RelayCase):
                 self.assertIn('its session was replaced or ended', line)
                 self.assertIn('closes it as undelivered', line)
 
+    def test_an_unpinned_session_is_unknown_and_looked_at_again(self):
+        self.now(status='done', pid=None, started=None, account=None, session=None)   # as pin() leaves it
+        self.assertEqual(self.woken(), [])
+        self.assertFalse((self.state / captain.NOTICED).exists())
+        self.now(status='done')
+        [line] = self.woken()
+        self.assertTrue(line.startswith(f'left working {self.action} · sp · name · t2 · now done'))
+
     def test_each_transition_is_said_once_across_collects(self):
         self.now(status='done')
         self.assertEqual(len(self.woken()), 1)
