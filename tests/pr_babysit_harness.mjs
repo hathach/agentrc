@@ -8618,7 +8618,7 @@ test('a script that cannot create its emit file reports that nothing ran, never 
   const { state, stateRef } = await savedForLoad()
   const onStateLoad = (change) => (label, file) => { if (label.startsWith('state:load')) change(dirname(file), file) }
   const loadUnder = (beforeClaim, more = {}) => run({ args: { yieldAfterCycle: true, maxCycles: 3, stateRef }, load: state, beforeClaim, ...more })
-  const unclaimable = /^the script could not claim \/.+\/agentrc-emit\/r1\/state_load\.1\.[0-9a-f]{8}\.js: nothing was run$/
+  const unclaimable = /^the script could not claim (?:[A-Za-z]:)?\/.+\/agentrc-emit\/r1\/state_load\.1\.[0-9a-f]{8}\.js: nothing was run$/
   for (const [what, change] of [
     ['its directory gone', (d) => rmSync(d, { recursive: true, force: true })],
     ['its directory a file', (d) => { rmSync(d, { recursive: true, force: true }); writeFileSync(d, '') }],
@@ -8656,7 +8656,7 @@ test('a script that cannot create its emit file reports that nothing ran, never 
   const pre = await run({ reviews: oneValid, beforeClaim: (label, file) => { if (label === 'preflight') rmSync(file.replace(/[^/]+$/, ''), { recursive: true, force: true }) } })
   assert.ok(pre.logs.some(l => /^preflight: the script could not claim .+ — nothing was run$/.test(l)), pre.logs.join('\n'))
   assert.deepEqual([pre.journal.map(j => j.label), pre.result.reason], [['emit:dir', 'preflight'], 'preflight-failed'])
-  assert.match(pre.result.detail, /^the script could not claim \/.+\/agentrc-emit\/r1\/preflight\.1\.[0-9a-f]{8}\.js: nothing was run$/)
+  assert.match(pre.result.detail, /^the script could not claim (?:[A-Za-z]:)?\/.+\/agentrc-emit\/r1\/preflight\.1\.[0-9a-f]{8}\.js: nothing was run$/)
 })
 
 test('a push whose first attempt cannot claim its emit file failed, nothing pushed; only after a lost first attempt is it unknown (#547)', async () => {

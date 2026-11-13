@@ -604,7 +604,7 @@ test('a script that cannot create its emit file reports that nothing ran; a refu
   const gone = await run(BASE, {}, { beforeClaim: (label, file) => { if (label.startsWith('check')) rmSync(dirname(file), { recursive: true, force: true }) } })
   assert.deepEqual([gone.result.reason, gone.labels], ['check-failed', []])
   // A definite failure, which gets no fresh attempt.
-  assert.match(gone.result.detail, /^the script could not claim \/.+\/agentrc-emit\/r1\/check\.1\.[0-9a-f]{8}\.js: nothing was run$/)
+  assert.match(gone.result.detail, /^the script could not claim (?:[A-Za-z]:)?\/.+\/agentrc-emit\/r1\/check\.1\.[0-9a-f]{8}\.js: nothing was run$/)
   assert.deepEqual(gone.journal.map(j => j.label), ['emit:dir', 'check'])
   if (process.platform !== 'win32' && process.getuid?.() !== 0) {
     const locked = await run(BASE, {}, { keepEmit: true, beforeClaim: (label, file) => { if (label.startsWith('check')) chmodSync(dirname(file), 0o500) } })
