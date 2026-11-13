@@ -2,11 +2,13 @@
 board's flasher by probe serial. The shipped registry validates, a probe matches exactly, and
 a registered board's own flasher, an unknown probe, an entry with neither, or a bench board
 claiming a registered probe are refused. Its `dev_attached` reaches the resolved entry's top
-level; a roster's own copy is compared and warned about, never refused, during the migration."""
+level; a roster's own copy is compared and warned about, never refused, during the migration.
+Every shipped `flasher_recover` records its hardware demonstration in its `note`."""
 import contextlib
 import importlib.util
 import io
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -42,10 +44,41 @@ class Base(unittest.TestCase):
         return str(path)
 
 
+DATE = r'\d{4}-\d{2}-\d{2}'
+# a span where the evidence dates its runs only as a set
+DEMONSTRATED = re.compile(rf'(reset and reflash|reset only), demonstrated on [\w.-]+ {DATE}(\.\.{DATE})? '
+                          r'\([\w.-]+/[\w.-]+#\d+\)')
+# recover entries whose demonstration no record holds yet (#534): no note at all until a rig run records one
+UNDEMONSTRATED = {'nrf52840dk'}
+
+
+def undemonstrated(boards) -> list:
+    """Names of the `flasher_recover` entries whose `note` does not record their demonstration."""
+    return [e['name'] for e in boards.values() if 'flasher_recover' in e
+            and not DEMONSTRATED.fullmatch(str(e['flasher_recover'].get('note', '')).strip())]
+
+
 class Shipped(Base):
     def test_it_validates(self):
         self.assertGreater(len(hb.registry()), 30)
         self.assertTrue(any('dev_attached' in e for e in hb.registry().values()))
+
+    def test_every_recover_entry_records_its_hardware_demonstration(self):
+        # a recovery flasher arms in-run wedge recovery, so it ships only once it worked on the board's rig
+        self.assertEqual(sorted(undemonstrated(hb.registry())), sorted(UNDEMONSTRATED))
+        for e in hb.registry().values():
+            if e['name'] in UNDEMONSTRATED:
+                self.assertNotIn('note', e['flasher_recover'], e['name'])
+
+    def test_a_missing_blank_or_unshaped_note_is_undemonstrated(self):
+        good = 'reset only, demonstrated on ci.lan 2026-10-17 (hathach/tinyusb#4240)'
+        boards = {str(i): {'name': f'b{i}', 'flasher': JLINK, 'flasher_recover': {**RECOVER, **extra}}
+                  for i, extra in enumerate(({}, {'note': ''}, {'note': '   '}, {'note': 'works'},
+                                             {'note': 'reset, demonstrated on ci.lan 2026-10-17 (#4240)'},
+                                             {'note': good}, {'note': good.replace('reset only', 'reset and reflash')},
+                                             {'note': good.replace('2026-10-17', '2026-08-17..2026-09-22')}))}
+        boards['x'] = {'name': 'jlink only', 'flasher': JLINK}
+        self.assertEqual(undemonstrated(boards), ['b0', 'b1', 'b2', 'b3', 'b4'])
 
 
 class Resolve(Base):

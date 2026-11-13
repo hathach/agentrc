@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Board-lock primitive shared by every project on a HIL host: the per-board kernel
 flocks in BOARD_LOCK_DIR and their holder records (`hil` skill, Board locks), with a
-hold/release/status CLI. A project's HIL contract wraps it for its roster and lock names.
+hold/release/status CLI and resolve/compact for the boards' cleanup logs. A project's HIL
+contract wraps it for its roster and lock names.
 """
 import argparse
 import contextlib
@@ -60,6 +61,9 @@ DIR_MODE = 0o755
 SHARE_STEP = (f'a second OS user needs the lock dir sticky and world-writable, a one-time host step '
               f'once every project on the host runs this helper: sudo install -d -m 1777 {BOARD_LOCK_DIR}')
 RELEASE_WAIT = 3.0            # s a signalled holder gets to clear its records and exit
+# herdr-core (hc) ends every process whose starting environment carries a terminal's HC_SCOPE when it cleans up
+# after that terminal, setsid'd ones included: the hold holder, which outlives its terminal, starts without it
+HC_SCOPE = 'HC_SCOPE'
 _NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._+-]*\Z')
 
 
@@ -79,6 +83,10 @@ class RecoveryBlocked(BoardLocked):
 
 class ReleaseRefused(RuntimeError):
     """A token release was refused before signalling, or its delivery or wait failed."""
+
+
+class LogRefused(RuntimeError):
+    """A cleanup-log command (resolve, compact) refused before changing the log."""
 
 
 # --- files in the shared dir ----------------------------------------------------------------
@@ -155,16 +163,19 @@ def _read_file(board, suffix):
         return f.read()
 
 
-def _replace_file(dfd, name, data: bytes) -> None:
+def _replace_file(dfd, name, data: bytes, mode=0o644, owner=None) -> None:
     """Replace `name` in the lock dir `dfd` with `data`, atomically and durably: a crash leaves
-    the old file or the new one, and the rename itself is fsynced through the dir. 0644 whatever
-    the umask, so another OS user reads it; in a sticky dir only its owner or root replaces it.
-    A failed replace removes its temp file; one a crash leaves is hidden and never read."""
+    the old file or the new one, and the rename itself is fsynced through the dir. `mode` (0644,
+    so another OS user reads it) whatever the umask, and `owner`, (uid, gid), when given; the temp
+    file is 0600 until then. In a sticky dir only its owner or root replaces it. A failed replace
+    removes its temp file; one a crash leaves is hidden and never read."""
     tmp = f'.{name}.{os.getpid()}.{secrets.token_hex(4)}'
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644, dir_fd=dfd)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dfd)
     try:
         try:
-            os.fchmod(fd, 0o644)
+            if owner is not None:
+                os.fchown(fd, *owner)
+            os.fchmod(fd, mode)
             _pwrite_all(fd, data, 0)
             os.fsync(fd)
         finally:
@@ -396,10 +407,8 @@ def _leftover(board, fh, data=None):
     `journalDigest`; one this user cannot unlink stays, logged once). `data`: the record's bytes
     when the caller already read them under this flock."""
     found = {}
-    try:
-        raw = _read_file(board, JOURNAL)
-    except OSError as e:          # its bytes unknown: logged, never unlinked
-        raw = f'cannot be read: {e}'.encode()
+    raw, kept = _read_journal(board)
+    if kept:
         found['journalKept'] = True
     if raw is not None:
         state, journal = _parse(raw)
@@ -421,6 +430,15 @@ def _leftover(board, fh, data=None):
     task = found.get('task') or {}
     return {'how': 'found-left', 'reason': task.get('reason'), 'pid': task.get('pid'),
             'detail': task.get('detail') or 'the task ended without its cleanup', **found}
+
+
+def _read_journal(board):
+    """(bytes, kept) of the board's takeover journal, (None, False) when absent; one that cannot be
+    read reads as its error's text, kept (its bytes unknown: logged, never unlinked)."""
+    try:
+        return _read_file(board, JOURNAL), False
+    except OSError as e:
+        return f'cannot be read: {e}'.encode(), True
 
 
 def _logged_journal(board, digest) -> bool:
@@ -547,10 +565,15 @@ def _log_leftover(board, left) -> str:
 
 # --- cleanup log ----------------------------------------------------------------------------
 # <board>.cleanup.jsonl beside the lock file: one JSON event per line, `failed` (a task's cleanup
-# did not end proven, or a leftover was found) or `restored` (a later task restored the board
-# after the failure it names). 0666 and never renamed or unlinked, so every runner's uid appends
-# to it in a sticky dir; reads and appends are serialised by <log>.mutex, not the board flock, and
-# a torn last line is cut before the next append.
+# did not end proven, or a leftover was found), `restored` (a later task restored the board after
+# the failure it names) or `acknowledged` (an operator's `resolve` of the failure it names, no
+# evidence of a restoration). 0666 and never unlinked, so every runner's uid appends to it in a
+# sticky dir; only `compact`, as its owner or root, replaces it whole. Reads, appends and that
+# replace are serialised by <log>.mutex, not the board flock, and a torn last line is cut before
+# the next append.
+CLOSING_EVENTS = ('restored', 'acknowledged')
+
+
 def _log_name(board) -> str:
     _check_name(board)
     return board + CLEANUP_LOG
@@ -581,14 +604,18 @@ def _log_locked(board, create=True):
         os.close(dfd)
 
 
-def _log_append(board, event: dict) -> dict:
-    """Append `event`, stamped, durably; OSError or TimeoutError when it cannot be."""
+def _log_append(board, event: dict, check=None) -> dict:
+    """Append `event`, stamped, durably; OSError or TimeoutError when it cannot be. check(events), given
+    the log's events under the same mutex hold, raises to refuse the append."""
     event = {'v': 1, **event, 'board': board, 'at': time.strftime('%Y-%m-%dT%H:%M:%S%z'), 'uid': os.geteuid()}
     line = (json.dumps(event) + '\n').encode()
     with _log_locked(board) as dfd:
         fd = _open_file(dfd, _log_name(board), os.O_RDWR | os.O_APPEND, create=True)
         try:
-            os.ftruncate(fd, _whole_lines(fd))     # an earlier append's torn line goes
+            size = _whole_lines(fd)
+            os.ftruncate(fd, size)     # an earlier append's torn line goes
+            if check is not None:
+                check(_events(_pread_all(fd, size)))
             _write_all(fd, line)
             os.fsync(fd)
         finally:
@@ -609,6 +636,10 @@ def cleanup_events(board) -> list:
             data = _read_file(board, CLEANUP_LOG) or b''
     except FileNotFoundError:
         data = b''
+    return _events(data)
+
+
+def _events(data) -> list:
     events = []
     for line in data[:data.rfind(b'\n') + 1].splitlines():
         with contextlib.suppress(ValueError):
@@ -618,18 +649,32 @@ def cleanup_events(board) -> list:
     return events
 
 
+def _pread_all(fd, size) -> bytes:
+    data = b''
+    while len(data) < size:
+        chunk = os.pread(fd, size - len(data), len(data))
+        if not chunk:
+            raise OSError(errno.EIO, f'read made no progress at offset {len(data)}')
+        data += chunk
+    return data
+
+
+def _closed_ids(events) -> set:
+    return {e['failure'] for e in events if e.get('event') in CLOSING_EVENTS and isinstance(e.get('failure'), str)}
+
+
 def open_cleanup_failures(board) -> list:
-    """The board's `failed` events no `restored` event names, oldest first: each stays open until
-    a task proves its own evidence resolved, whatever failed after it. `[{'unavailable': why}]`
-    when the log cannot be read."""
+    """The board's `failed` events no `restored` or `acknowledged` event names, oldest first: each
+    stays open until a task proves its own evidence resolved, or an operator acknowledges it,
+    whatever failed after it. `[{'unavailable': why}]` when the log cannot be read."""
     try:
         events = cleanup_events(board)
     except OSError as e:
         return [{'unavailable': f'cleanup log unreadable: {e}'}]
-    restored = {e['failure'] for e in events if e.get('event') == 'restored' and isinstance(e.get('failure'), str)}
-    # a failure whose id is not a string can never be named restored: it stays open
+    closed = _closed_ids(events)
+    # a failure whose id is not a string can never be named closed: it stays open
     return [e for e in events if e.get('event') == 'failed'
-            and not (isinstance(e.get('id'), str) and e['id'] in restored)]
+            and not (isinstance(e.get('id'), str) and e['id'] in closed)]
 
 
 def _guarded(step, what, note, interrupted, default=None):
@@ -780,12 +825,11 @@ def resolve_restored(board, failures, **evidence) -> list:
         fid = f.get('id')
         if not isinstance(fid, str):
             continue
-        task = f.get('task') if isinstance(f.get('task'), dict) else {}
-        held = _journal_records(f['journal']) if 'journal' in f else []
-        if held is None:
+        found = _failure_evidence(f)
+        if found is None:
             notes.append(f'{fid} stays open: its takeover journal cannot be read')
             continue
-        receipts, retained = ([_evidence(f, task, k)] + [r.get(k, []) for r in held] for k in ('receipts', 'retained'))
+        receipts, retained, _ = found
         if not all(isinstance(x, list) for x in receipts + retained):
             notes.append(f'{fid} stays open: its evidence is malformed')
         elif why := _release_blocker(sum(receipts, []), retained=sum(retained, [])):
@@ -796,6 +840,158 @@ def resolve_restored(board, failures, **evidence) -> list:
             except OSError as e:
                 notes.append(f'{fid} restoration not logged: {e}')
     return notes
+
+
+def _failure_evidence(f):
+    """([receipts], [retained], records) of the logged failure `f`, lists as logged: its own (or its
+    legacy task record's), then those of each of the records its takeover journal kept, read once;
+    None when that journal cannot be read."""
+    task = f.get('task') if isinstance(f.get('task'), dict) else {}
+    held = _journal_records(f['journal']) if 'journal' in f else []
+    if held is None:
+        return None
+    return (*([_evidence(f, task, k)] + [r.get(k, []) for r in held] for k in ('receipts', 'retained')), held)
+
+
+def acknowledge_failure(board, failure_id, reason) -> dict:
+    """An operator's resolution of the board's open failure `failure_id` (`hil_lock.py resolve`):
+    an `acknowledged` event with `reason`, which closes it as `restored` does but is never evidence
+    the board was restored; automated callers use resolve_restored. LogRefused, nothing logged, for
+    a blank reason, a failure the log does not hold or one already closed, while its evidence is
+    known still live (_live_evidence, rechecked as the caller, so run it as the user whose runs
+    they are, and a holder its takeover journal kept still running), and when it cannot be read
+    whole (a takeover journal with a link that cannot be read, evidence that is not a list) or
+    hil_process, which rechecks it, cannot be loaded. A run whose receipt cannot be rechecked is
+    the operator's to judge. OSError or TimeoutError when the log cannot be read or written."""
+    reason = reason.strip() if isinstance(reason, str) else ''
+    if not reason:
+        raise LogRefused('a reason is required')
+    if not isinstance(failure_id, str):
+        raise LogRefused(f'not a failure id: {failure_id!r:.80}')
+    try:
+        _process()      # a recheck without it proves nothing: refused, never read as not live
+    except Exception as e:
+        raise LogRefused(f'its evidence cannot be rechecked: {e!r:.200}') from e
+
+    def still_open(events):
+        if failure_id in _closed_ids(events):
+            how = next(e for e in events if e.get('event') in CLOSING_EVENTS and e.get('failure') == failure_id)
+            raise LogRefused(f'{failure_id} is already closed ({how["event"]} {how.get("at")})')
+        failed = [e for e in events if e.get('event') == 'failed' and e.get('id') == failure_id]
+        if not failed:
+            raise LogRefused(f'no failure {failure_id} in {_log_name(board)}')
+        return failed
+    live = []
+    for f in still_open(cleanup_events(board)):
+        found = _failure_evidence(f)
+        if found is None:
+            raise LogRefused(f'{failure_id} stays open: its takeover journal cannot be read, so neither can all of '
+                             f'its evidence')
+        receipts, retained, held = found
+        if not all(isinstance(x, list) for x in receipts + retained):
+            raise LogRefused(f'{failure_id} stays open: its evidence is malformed')
+        live += _live_evidence(sum(receipts, []), sum(retained, []))
+        live += [f'takeover journal holder pid {pid} running' for pid in _live_survivors({'survivors': held})]
+    if live:
+        raise LogRefused(f'{failure_id} stays open: its evidence is still live: {"; ".join(live)}')
+    return _log_append(board, {'event': 'acknowledged', 'failure': failure_id, 'reason': reason,
+                               'pid': os.getpid()}, check=still_open)
+
+
+def _live_evidence(receipts, retained) -> list:
+    """What of a failure's evidence is known still live, as text: a receipt rechecking pending (as
+    the caller), a survivor it names alive (with its recorded start time, when one is), a retained
+    session not closed whose process lives on with its pid and start time. Evidence that cannot be
+    rechecked is not known live."""
+    live = [f'{_receipt_text(r)} pending' for r, state in zip(receipts, _rechecks(receipts)) if state == 'pending']
+    live += [f'{_receipt_text(r)}: pids {pids} alive' for r in receipts if (pids := _live_survivors(r))]
+    return live + [f'retained session {s!r:.120} running' for s in retained if _session_running(s)]
+
+
+def _live_survivors(receipt) -> list:
+    """The pids among the receipt's `survivors` still alive: a list of pids or {pid, start} (hil_reserve's), or
+    hil_process's survey {processes: [{pid, ...}], unreadable: [pid]}, of which only `processes` were its
+    descendants: `unreadable` lists every /proc entry it could not read, its own or not."""
+    survivors = receipt.get('survivors') if isinstance(receipt, dict) else None
+    if isinstance(survivors, dict):
+        survivors = survivors.get('processes')
+    live = []
+    for s in survivors if isinstance(survivors, list) else []:
+        pid, start = (s.get('pid'), s.get('start')) if isinstance(s, dict) else (s, None)
+        if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 and (now := proc_start(pid)) is not None \
+                and (start is None or str(start) == now):
+            live.append(pid)
+    return live
+
+
+def _session_running(receipt) -> bool:
+    """Whether the retained session `receipt` (its path, or the record kept in its place) is not
+    closed and a process with its pid and start time lives (hil_openocd_esp_receipt's `running`)."""
+    rec = _read_session_receipt(receipt)[0] if isinstance(receipt, str) else receipt
+    if not isinstance(rec, dict) or rec.get('closed') is not False:
+        return False
+    pid = rec.get('pid')
+    return (isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
+            and str(rec.get('startTime')).isdigit() and proc_start(pid) == str(rec['startTime']))
+
+
+def compact_cleanup_log(board) -> dict:
+    """Rewrite the board's cleanup log without its closed failures (`hil_lock.py compact`): each
+    `failed` event a `restored` or `acknowledged` event names, and every event naming it. Every
+    other event stays as written (open failures, events of another kind, a closing event naming no
+    failure in the log, a closed failure whose takeover journal is still on disk unchanged, with what
+    closed it), and a torn last line goes as the next append would cut it. Under the
+    log's mutex, as the log's owner or root: a new file, the log's mode, owner and group kept, is
+    written and fsynced, renamed over the log and the dir fsynced, so the only copy is never
+    truncated and the mutex is untouched; a failed step leaves the log as it was. Nothing is
+    rewritten when nothing is closed. LogRefused, nothing changed, for a whole line that is not a
+    JSON object, a log of another owner or, but as root, of a group the caller is not in; OSError
+    or TimeoutError when it cannot be done.
+    Returns {'dropped': events dropped, 'kept': events kept}."""
+    with contextlib.ExitStack() as stack:
+        try:
+            dfd = stack.enter_context(_log_locked(board, create=False))
+            fd = _open_file(dfd, _log_name(board), os.O_RDONLY)
+        except FileNotFoundError:
+            return {'dropped': 0, 'kept': 0}
+        with os.fdopen(fd, 'rb') as f:
+            st, data = os.fstat(f.fileno()), f.read()
+        return _compact(board, dfd, st, data)
+
+
+def _compact(board, dfd, st, data) -> dict:
+    name = _log_name(board)
+    lines = data[:data.rfind(b'\n') + 1].splitlines(keepends=True)
+    events = []
+    for n, line in enumerate(lines, 1):
+        try:
+            event = json.loads(line)
+        except ValueError:
+            event = None
+        if not isinstance(event, dict):
+            raise LogRefused(f'{name} line {n} is not a JSON object, not compacted: {line[:80]!r}')
+        events.append(event)
+
+    def names(e):
+        """The failure id `e` names: a failed event's own, a closing event's failure."""
+        key = 'id' if e.get('event') == 'failed' else 'failure' if e.get('event') in CLOSING_EVENTS else None
+        return e[key] if key and isinstance(e.get(key), str) else None
+    closed = _closed_ids(events) & {names(e) for e in events if e.get('event') == 'failed'}
+    if closed and (raw := _read_journal(board)[0]) is not None:
+        # a journal this user could not unlink is logged once by its digest (_logged_journal): kept while it stays
+        digest = hashlib.sha256(raw).hexdigest()
+        closed -= {names(e) for e in events if e.get('event') == 'failed' and e.get('journalDigest') == digest}
+    if not closed:
+        return {'dropped': 0, 'kept': len(lines)}
+    euid = os.geteuid()
+    if euid not in (0, st.st_uid):
+        raise LogRefused(f'{name} is owned by uid {st.st_uid}: compact it as that user or root')
+    if euid and st.st_gid not in (os.getegid(), *os.getgroups()):
+        raise LogRefused(f'{name} has group {st.st_gid}, which uid {euid} cannot give its replacement: compact it '
+                         f'as root')
+    keep = [line for line, e in zip(lines, events) if names(e) not in closed]
+    _replace_file(dfd, name, b''.join(keep), stat.S_IMODE(st.st_mode), (st.st_uid, st.st_gid))
+    return {'dropped': len(lines) - len(keep), 'kept': len(keep)}
 
 
 def acquire_board_lock(board_name, reason=CI_REASON, **kw):
@@ -1182,10 +1378,25 @@ def session_mutex(lock):
     shared file there is, never replaced or unlinked, so every taker locks the same inode), held
     for the with block. A command takes it before validating the caller's hold, so two commands
     cannot both pass that check. SessionBusy, naming the lock, at once when another holds it;
-    LockUnavailable when the dir or file cannot be used. It is no board lock: lock_names and
-    `release --all` never list it."""
+    LockUnavailable when the dir or file cannot be used, or hil_process cannot be loaded. It is
+    no board lock: lock_names and `release --all` never list it.
+
+    SIGINT and SIGTERM are deferred (hil_process.InterruptHold) from before its first fd opens
+    until both are closed, the with block alone excepted, so a caller catching the interrupt
+    keeps no flock; one deferred is raised after the closes, ahead of a close's error. The one
+    gap: a handler the with block installed and left runs until the cleanup's rearm loop puts
+    the deferring one back (InterruptHold.rearm, retried until it completes, cannot defer a
+    signal already pending as it starts). One interrupt there is raised after the closes; one
+    more on the loop's back-edge ends the loop with the fds closed undeferred, so a third after
+    an fd is popped can leave that fd, and its flock, open until the process exits. That handler
+    is replaced at exit by the one found at entry."""
     _check_name(lock)
-    fds = []      # the dir's, then the mutex's
+    try:
+        process = _process()        # before any fd: a helper that cannot load acquires nothing
+    except Exception as e:
+        raise LockUnavailable(f'session mutex unavailable: interrupt hold: {e!r:.200}') from e
+    hold = process.InterruptHold()
+    fds, raised, failed = [], None, None      # fds: the dir's, then the mutex's
     try:
         try:
             fds.append(_open_dir(create=True))
@@ -1199,28 +1410,32 @@ def session_mutex(lock):
                               f'({lock}{SESSION_MUTEX} held)') from None
         except OSError as e:
             raise _unavailable(e) from e
+        hold.deliver()
         yield
+    except BaseException as e:      # no call in here: no interrupt check before the finally's first store
+        raised = e
+        raise
     finally:
-        # closed under an InterruptHold, inline (a call's entry is an interrupt check): a caller catching the
-        # interrupt keeps no flock. One before the hold went in closed nothing yet: close again, then raise it
-        pending = None
-        while fds:
-            try:
+        hold.deferring = True       # first: an attribute store is no interrupt check, a call's entry is
+        rearmed = None
+        try:
+            while True:             # a handler the with block installed defers too, before an fd goes
                 try:
-                    hold = _process().InterruptHold()
-                except Exception:
-                    hold = None       # the pops alone
+                    hold.rearm()
+                    break
+                except BaseException as e:
+                    rearmed = rearmed or e      # the with block's handler ran first: the first is raised at the end
+        finally:                    # the fds go even when a signal lands on the loop's back-edge
+            while fds:
                 try:
-                    while fds:
-                        os.close(fds.pop())       # popped first: an fd is closed at most once
-                finally:
-                    if hold is not None:
-                        hold.release()
-            except BaseException as e:      # an interrupt wins over a close's OSError
-                if pending is None or isinstance(pending, Exception) and not isinstance(e, Exception):
-                    pending = e
-        if pending is not None:
-            raise pending
+                    os.close(fds.pop())       # once each: a failed close frees the fd number all the same
+                except Exception as e:
+                    failed = failed or e
+            hold.release()
+        if rearmed is not None:
+            raise rearmed
+        if failed is not None and (raised is None or isinstance(raised, Exception)):     # an interrupt wins
+            raise failed
 
 
 # --- holder identity ------------------------------------------------------------------------
@@ -1368,6 +1583,18 @@ def _release_receipts(recs, key='receipts') -> list:
     return receipts
 
 
+def _read_session_receipt(path) -> tuple:
+    """(the JSON at `path`, '') or (None, why it cannot be read). Non-blocking: a FIFO in its place
+    must not hang a release."""
+    try:
+        with os.fdopen(os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)) as f:
+            if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+                return None, 'not a regular file'
+            return json.load(f), ''
+    except (OSError, ValueError) as e:
+        return None, f'unreadable ({e!r:.80})'
+
+
 def retained_state(receipt) -> str:
     """'ended' once the session receipt at path `receipt` (esp_session's receipt format) is
     hil_openocd_esp's, whole and closed after its reviewed end, as `hil_openocd_esp.py end` leaves
@@ -1376,14 +1603,9 @@ def retained_state(receipt) -> str:
     ended: its holder is not released by token."""
     if not isinstance(receipt, str):
         return 'not a receipt path, so never proven ended'
-    try:
-        # non-blocking: a FIFO in its place must not hang a release
-        with os.fdopen(os.open(receipt, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)) as f:
-            if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
-                return 'not a regular file'
-            rec = json.load(f)
-    except (OSError, ValueError) as e:
-        return f'unreadable ({e!r:.80})'
+    rec, why = _read_session_receipt(receipt)
+    if why:
+        return why
     if not isinstance(rec, dict) or rec.get('tool') != 'hil_openocd_esp':
         return 'not a hil_openocd_esp session receipt'
     pid = rec.get('pid')
@@ -1842,7 +2064,52 @@ def cmd_hold(boards, reason):
         os.dup2(devnull, std_fd)
     if devnull > 2:
         os.close(devnull)
+    if _starts_scoped():
+        _exec_holder(boards, reason, w_fd, ack_r)
+    _holder(boards, reason, w_fd, ack_r)
 
+
+def _starts_scoped() -> bool:
+    """Whether os.environ or the environment this process started with (/proc/self/environ: what a fork keeps
+    whatever os.environ drops, and what hc reads) names HC_SCOPE; true when that is unreadable."""
+    if HC_SCOPE in os.environ:
+        return True
+    try:
+        with open('/proc/self/environ', 'rb') as f:
+            return any(e.startswith(os.fsencode(HC_SCOPE) + b'=') for e in f.read().split(b'\0'))
+    except OSError:
+        return True
+
+
+# a fresh interpreter's holder: argv is this file, BOARD_LOCK_DIR, the reason, the two pipe fds, the boards
+_HOLDER_BOOT = (
+    'import importlib.util, sys\n'
+    "spec = importlib.util.spec_from_file_location('agentrc_hil_lock', sys.argv[1])\n"
+    'lock = importlib.util.module_from_spec(spec)\n'
+    'sys.modules[spec.name] = lock\n'
+    'spec.loader.exec_module(lock)\n'
+    'lock.BOARD_LOCK_DIR = sys.argv[2]\n'
+    'lock._holder(sys.argv[6:], sys.argv[3], int(sys.argv[4]), int(sys.argv[5]))\n')
+
+
+def _exec_holder(boards, reason, w_fd, ack_r):
+    """Become the holder in a fresh interpreter whose environment is os.environ without HC_SCOPE, the pipes passed
+    on: only an exec sets the environment a process started with. Never returns; a failed exec is reported."""
+    env = {k: v for k, v in os.environ.items() if k != HC_SCOPE}
+    try:
+        for fd in (w_fd, ack_r):
+            os.set_inheritable(fd, True)
+        os.execve(sys.executable, [sys.executable, '-I', '-c', _HOLDER_BOOT, os.path.abspath(__file__),
+                                   BOARD_LOCK_DIR, reason, str(w_fd), str(ack_r), *boards], env)
+    except OSError as e:
+        with contextlib.suppress(OSError):
+            os.write(w_fd, f'0holder not started: {e}'.encode())
+    os._exit(1)
+
+
+def _holder(boards, reason, w_fd, ack_r):
+    """The hold holder: take every board, report readiness on w_fd and keep the hold once ack_r acknowledges it,
+    until SIGTERM. Never returns."""
     def report(text) -> bool:
         """False when the parent is gone or stopped waiting (EPIPE, or no ack of a readiness):
         it reports a failure."""
@@ -2046,6 +2313,29 @@ def cmd_status():
     return 0
 
 
+def cmd_resolve(board, failure_id, reason):
+    try:
+        acknowledge_failure(board, failure_id, reason)
+    except (LogRefused, OSError) as e:
+        print(f'ERROR: {board}: {e}', file=sys.stderr)
+        return 1
+    print(f'{board}: failure {failure_id} acknowledged (closed by an operator, not proven restored)')
+    return 0
+
+
+def cmd_compact(boards):
+    rc = 0
+    for b in dict.fromkeys(boards):
+        try:
+            done = compact_cleanup_log(b)
+        except (LogRefused, OSError) as e:
+            print(f'ERROR: {b}: {e}', file=sys.stderr)
+            rc = 1
+            continue
+        print(f'{b}: {done["dropped"]} events of closed failures dropped, {done["kept"]} kept')
+    return rc
+
+
 _CLI_USAGE = """Per-board advisory locks for a HIL host, shared by every project on it.
 
 Arbitrates board access between dev sessions and project runners, which lock
@@ -2060,6 +2350,8 @@ Usage:
   hil_lock.py hold BOARD [BOARD...] --reason TEXT
   hil_lock.py release BOARD [BOARD...] | release --all | release --token TOKEN
   hil_lock.py status
+  hil_lock.py resolve BOARD FAILURE_ID --reason TEXT
+  hil_lock.py compact BOARD [BOARD...]
 
 A holder process holds ALL boards given in one `hold` call; releasing any of
 them ends that holder and releases all of its boards. `release --token` ends
@@ -2067,6 +2359,15 @@ an older helper's cleanup holder, which never frees on its own, once its
 release predicate (the run_tracked receipts it waits for, the provider
 sessions in its `retained`) holds: until then it refuses, naming what is
 still open.
+
+A logged failure stays open until a task that restored the board proves its
+evidence ended. `resolve` closes one by an operator's acknowledgement with
+its reason, logged as such and never as a restoration; it refuses while the
+failure's evidence is known still live (a receipt rechecking pending as the
+caller, a survivor or retained session alive). `compact` rewrites a board's
+log without its closed failures, every open one kept, as the log's owner or
+root; a closed one whose journalDigest matches a takeover journal still on
+disk stays, with its closing events.
 """
 TAKE_OVER_GONE = ('--take-over is gone (agentrc#464): a free board is taken by the next task, and a live older '
                   "helper's cleanup holder ends with `release --token`")
@@ -2085,6 +2386,12 @@ def main():
     p_rel.add_argument('--all', action='store_true')
     p_rel.add_argument('--token')
     sub.add_parser('status')
+    p_res = sub.add_parser('resolve')
+    p_res.add_argument('board')
+    p_res.add_argument('failure')
+    p_res.add_argument('--reason', required=True)
+    p_cmp = sub.add_parser('compact')
+    p_cmp.add_argument('boards', nargs='+')
     a = ap.parse_args()
     if a.cmd == 'hold':
         if a.take_over:
@@ -2101,6 +2408,10 @@ def main():
         if not boards:
             ap.error('no boards given (name boards or use --all)')
         sys.exit(cmd_release(boards))
+    if a.cmd == 'resolve':
+        sys.exit(cmd_resolve(a.board, a.failure, a.reason))
+    if a.cmd == 'compact':
+        sys.exit(cmd_compact(a.boards))
     sys.exit(cmd_status())
 
 

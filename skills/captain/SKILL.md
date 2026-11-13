@@ -12,7 +12,10 @@ the session registry Claude Code keeps under its account's config dir, which Cod
 Codex terminals out, and remote (`machine/tN`) ones too. `list` orders sessions by hc's `status_ms`, when each last
 reported its status, latest first: an order, not how long one has been idle. A row gives the state and, in the next
 column, that report's time; it ends with the session's own status line, quoted, and a blocked one's state names what it
-waits for: `blocked (permission)`, `(question)` or `(auth)`, as of that time, unchecked.
+waits for: `blocked (permission)`, `(question)` or `(auth)`, as of that time, unchecked. A session running background
+tasks, such as a Monitor or a headless chief, adds Claude Code's count of them, `done, background tasks: 1`, from its
+terminal's `claude.background_tasks` label (hc 0.1.19+), or `?` when the label is not a count; `--json` gives it as
+`background_tasks`, null when the label is absent. It never holds an ask or a relay: such a session still answers.
 
 ```bash
 python3 ~/.claude/skills/captain/scripts/captain.py list [--json]                   # every other Claude Code session, latest change first
@@ -77,8 +80,10 @@ pins each target's session once, so one replaced in its terminal while the relay
   idle; hc has no such check for done, so one that starts a turn in between gets the request as its next input. One
   request per session is open at a time. A session whose own transcript starts no turn after the request its last
   report answered - no prompt, task notification or compaction - is not asked: `ask` prints `not asked` with that
-  report's id, which answers for it. `--force` asks anyway, only when the human wants a session asked again whatever
-  it last said.
+  report's id, which answers for it. A watch member's last report counts only while its transcript holds nothing but
+  completion text and bookkeeping after that report call: a Stop hook that kept the turn going, a further tool call,
+  input read mid-turn or any entry the script does not know means it is asked. `--force` asks anyway, only when the
+  human wants a session asked again whatever it last said.
 - **Relay** carries the human's message this turn of yours acts on, read by the script from this session's own
   transcript: you never pass the words. That is the message that started the turn, or one the human typed while you
   worked, which reaches you inside a tool result; a turn a notification or a compaction started has none, and the
@@ -168,11 +173,16 @@ pins each target's session once, so one replaced in its terminal while the relay
   `cancelled`, `undelivered` or `refused by the session that replaced its target`, when another session took the
   target's terminal before the send; `pending: <msg>...` means the wait lapsed: re-arm, or `cancel` what will not
   answer. A `held <msg> · <handle>` relay stays held until `relay --retry <action>` sends it or `cancel` closes it on
-  the human's word; nothing reports when its session could take it, so at each lapse whose `pending:` line names it, run
-  `relay --retry <action>` once before re-arming, and after three such lapses tell the human, who may cancel it or
-  have you keep retrying. Once delivered, it stays pending until its outcome or closure. A retry that prints
-  `uncertain` ends the retries: tell the human to check that session, which may have received it; it stays pending
-  until its outcome or a `cancel` on the human's word.
+  the human's word. One held because its session was working is watched by `collect` itself, through `hc get` within
+  its wait: once that session leaves working, it prints `left working <action> · <handle> · now <state>: ...` once per
+  state, or `its session was replaced or ended`. Pass that line to the human and run `relay --retry <action>` on their
+  word: the line is no send check. The retry checks the session and screen again, a blocked or errored session keeps
+  the relay held, a replaced one closes it undelivered, and a draft in the input line gets it appended. For a relay
+  held for any other reason nothing reports when its session could take it, so at each lapse whose `pending:` line
+  names it, run `relay --retry <action>` once before re-arming, and after three such lapses tell the human, who may
+  cancel it or have you keep retrying. Once delivered, it stays pending until its outcome or closure. A retry that
+  prints `uncertain` ends the retries: tell the human to check that session, which may have received it; it stays
+  pending until its outcome or a `cancel` on the human's word.
   While a watch is open, that Monitor runs `collect --wait <ms>` with no ids instead, re-armed at each lapse until a
   `watch ended <watch>` or `cancelled <watch>` line names the watch: each run resumes where the last one stopped,
   prints `watching <member>` as a session joins and `reported <member>:<N>` for each report, and follows every

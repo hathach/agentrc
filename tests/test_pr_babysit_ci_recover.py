@@ -1,0 +1,522 @@
+"""Tests for pr-babysit's ci_recover.py: when a queued run with no job is a suspected orphan, and that its cancel and
+re-run are each sent at most once per run attempt, whatever answers or relaunches (#536)."""
+import base64
+import importlib.util
+import io
+import json
+import os
+import shutil
+import sys
+import tempfile
+import time
+import unittest
+from contextlib import redirect_stdout
+from datetime import datetime, timezone
+from pathlib import Path
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / 'skills/pr-babysit/scripts'))
+spec = importlib.util.spec_from_file_location('ci_recover', ROOT / 'skills/pr-babysit/scripts/ci_recover.py')
+recover = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(recover)
+import harvest  # noqa: E402  the script's GET helpers, which call facts.run through harvest
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors  # noqa: E402
+
+HEAD = 'a' * 40
+NOW = datetime(2026, 11, 11, 21, 52, tzinfo=timezone.utc)
+# hathach/agentrc#533's tests run 43095438193: queued at 20:20:25Z with no job, while later runs completed.
+QUEUED = '2026-11-11T20:20:25Z'
+WORKFLOW = 'on: pull_request\nconcurrency:\n  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}\n'
+
+
+def setUpModule():
+    guard_survivors(__name__)
+
+
+def a_run(id_=43095438193, **over):
+    return {'id': id_, 'name': 'tests', 'path': '.github/workflows/tests.yml', 'workflow_id': 7, 'status': 'queued', 'conclusion': None,
+            'run_attempt': 1, 'created_at': QUEUED, 'run_started_at': QUEUED, 'head_sha': HEAD, 'head_branch': 'captain-prune',
+            'head_repository': {'full_name': 'o/r'}, 'event': 'pull_request', **over}
+
+
+class GitHub:
+    """A fake gh: the PR, the runs, their jobs and workflow files as GET answers (run), each POST (attempt) applied after
+    `cancel_after` and `rerun_after` polls of the run, or lost (`lose`) or refused (`refuse`)."""
+
+    def __init__(self, runs=None, workflow=WORKFLOW, newest='2026-11-11T21:45:00Z', jobs=0, cancel_after=1, rerun_after=0,
+                 lose=(), refuse=(), cancel_as='cancelled'):
+        self.runs = {r['id']: r for r in (runs or [a_run()])}
+        self.workflow, self.newest, self.jobs = workflow, newest, jobs
+        self.cancel_after, self.rerun_after, self.lose, self.refuse = cancel_after, rerun_after, set(lose), set(refuse)
+        self.cancel_as = cancel_as  # the conclusion the run reads once completed after a cancel
+        self.head, self.state, self.posts, self.reads = HEAD, 'open', [], []
+        self.after_list = None  # called once the runs on the head have been listed: a race
+        self.after_cancel = None  # called once a cancel was sent: a race
+        self.unlisted = {}
+
+    def run(self, *argv, ok=(0,)):
+        path = argv[-1]
+        self.reads.append(path)
+        if path == 'repos/{owner}/{repo}/pulls/533':
+            return 0, json.dumps({'state': self.state, 'head': {'sha': self.head, 'ref': 'captain-prune', 'repo': {'full_name': 'o/r'}}})
+        if f'head_sha={HEAD}' in path:
+            got = json.dumps([{'workflow_runs': list(self.runs.values())}])
+            if self.after_list:
+                self.after_list()
+                self.after_list = None
+            return 0, got
+        if 'status=completed&per_page=1' in path:
+            return 0, json.dumps({'workflow_runs': [{'id': 43105843911, 'created_at': self.newest}] if self.newest else []})
+        if '/actions/runs?status=' in path:
+            assert path.endswith('&per_page=2'), path
+            status = path.split('status=')[1].split('&')[0]
+            matching = [r for r in [*self.runs.values(), *self.others()] if r['status'] == status]
+            unlisted = self.unlisted.get(status, 0)  # counted runs a page of two does not show
+            return 0, json.dumps({'total_count': len(matching) + unlisted, 'workflow_runs': matching[:2]})
+        if '/contents/' in path:
+            if self.workflow is None:
+                raise harvest.Unusable(f'gh api {path}: Not Found (HTTP 404)')
+            return 0, json.dumps({'content': base64.b64encode(self.workflow.encode()).decode()})
+        if '/jobs?' in path:
+            return 0, json.dumps({'total_count': self.jobs})
+        if '/actions/runs/' in path:
+            r = self.runs[int(path.rsplit('/', 1)[1])]
+            pending = r.pop('_pending', None)
+            if pending:
+                pending[0] -= 1
+                if pending[0] < 0:
+                    r.update(pending[1])
+                else:
+                    r['_pending'] = pending
+            return 0, json.dumps({k: v for k, v in r.items() if not k.startswith('_')})
+        raise harvest.Unusable(f'unexpected {argv}')
+
+    def others(self):
+        return getattr(self, 'unfinished', [])
+
+    def attempt(self, *argv, input=None):
+        assert argv[:4] == ('gh', 'api', '-X', 'POST'), argv
+        run_id, what = argv[4].split('/')[-2:]
+        self.posts.append((int(run_id), what))
+        if what in self.refuse:
+            return 1, '', 'gh: Resource not accessible by integration (HTTP 403)'
+        r = self.runs[int(run_id)]
+        if what == 'cancel':
+            r['_pending'] = [self.cancel_after, {'status': 'completed', 'conclusion': self.cancel_as}]
+            if self.after_cancel:
+                self.after_cancel()
+        else:
+            r['_pending'] = [self.rerun_after, {'status': 'queued', 'conclusion': None, 'run_attempt': r['run_attempt'] + 1,
+                                                'run_started_at': '2026-11-11T21:53:00Z'}]
+        if what in self.lose:
+            return 1, '', 'gh: Post "https://api.github.com/...": net/http: timeout awaiting response headers'
+        return 0, '', ''
+
+
+class Recover(unittest.TestCase):
+    def setUp(self):
+        self.fresh()
+        self.clock = [0.0]
+
+    def fresh(self):
+        """A new record directory: another checkout's, with no record of an earlier case."""
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir)
+
+    def go(self, gh, wait=30):
+        out = io.StringIO()
+        sleep = lambda s: self.clock.__setitem__(0, self.clock[0] + s)  # noqa: E731
+        with mock.patch.object(harvest, 'run', gh.run), mock.patch.object(recover, 'attempt', gh.attempt), \
+                mock.patch.object(recover, 'record_dir', self.record_dir), mock.patch.object(recover, 'now', lambda: NOW), \
+                mock.patch.object(recover.time, 'sleep', sleep), mock.patch.object(recover.time, 'monotonic', lambda: self.clock[0]), \
+                redirect_stdout(out):
+            code = recover.report(recover.collect, ['--pr', '533', '--head', HEAD, '--repo', 'o/r', '--wait-minutes', str(wait)], seal=True)
+        return code, json.loads(out.getvalue())
+
+    def record_dir(self, kind):
+        return self.dir
+
+    def records(self):
+        return sorted(p.name for p in self.dir.glob('*.json'))
+
+    def test_a_suspected_orphan_is_cancelled_and_rerun_once_its_cancel_completes(self):
+        gh = GitHub(cancel_after=2)
+        code, out = self.go(gh)
+        self.assertEqual((code, out['outcome']), (0, 'recovered'), out)
+        self.assertEqual(gh.posts, [(43095438193, 'cancel'), (43095438193, 'rerun')])
+        run = out['runs'][0]
+        self.assertEqual((run['runId'], run['attempt'], run['newAttempt'], run['outcome']), (43095438193, 1, 2, 'recovered'))
+        self.assertEqual(run['evidence'][:2], ['queued since 2026-11-11T20:20:25Z (91 minutes), attempt 1 with no job',
+                                               'run 43105843911 created 2026-11-11T21:45:00Z has completed since'])
+        self.assertIn("concurrency group '${{ github.workflow }}", run['evidence'][2])
+        record = json.loads(Path(run['record']).read_text())
+        self.assertEqual(record['steps']['cancel']['answer'], 'sent')
+        self.assertEqual((record['steps']['rerun']['answer'], record['newAttempt']), ('sent', 2))
+        self.assertEqual(self.records(), ['o-r-43095438193-1.json'])
+
+    def test_a_run_that_is_not_a_suspected_orphan_is_left_alone(self):
+        older = {'id': 9, 'workflow_id': 7, 'status': 'in_progress', 'head_branch': 'captain-prune', 'head_repository': {'full_name': 'o/r'}}
+        cases = {
+            'jobs registered': (GitHub(jobs=2), 'its attempt 1 has 2 job(s)'),
+            'recent': (GitHub(runs=[a_run(created_at='2026-11-11T21:40:00Z', run_started_at='2026-11-11T21:40:00Z')]),
+                       'queued 12 minutes, under the 30-minute CI wait'),
+            "a re-run's attempt still recent": (GitHub(runs=[a_run(run_attempt=2, run_started_at='2026-11-11T21:40:00Z')]), 'queued 12 minutes'),
+            'no newer completed run': (GitHub(newest='2026-11-11T20:00:00Z'), 'no run in the repository created since it was queued'),
+            'no completed run at all': (GitHub(newest=None), 'no run in the repository created since it was queued'),
+            'in progress': (GitHub(runs=[a_run(status='in_progress')]), None),
+            'concurrency-held on its PR': (GitHub(), "may be held by another unfinished run (run 9, in_progress)"),
+            'workflow file unreadable': (GitHub(workflow=None), 'whether a concurrency group holds it cannot be told'),
+            'not on the head branch': (GitHub(runs=[a_run(head_branch='main')]), "not on the PR's head branch"),
+        }
+        cases['concurrency-held on its PR'][0].unfinished = [older]
+        for what, (gh, why) in cases.items():
+            with self.subTest(what):
+                code, out = self.go(gh)
+                self.assertEqual((code, out['outcome'], gh.posts), (0, 'none', []))
+                if why:
+                    self.assertEqual(out['runs'][0]['outcome'], 'skipped')
+                    self.assertIn(why, out['runs'][0]['reason'])
+                else:
+                    self.assertEqual(out['runs'], [])
+                self.assertEqual(self.records(), [], 'nothing recorded')
+
+    def test_only_no_group_or_the_run_id_alone_proves_no_run_can_hold_it(self):
+        elsewhere = {'id': 9, 'name': 'lint', 'workflow_id': 8, 'status': 'queued', 'head_branch': 'other', 'event': 'pull_request',
+                     'head_repository': {'full_name': 'o/r'}}
+        group = 'concurrency:\n  group: %s\n'.__mod__
+        for what, workflow, unfinished, held in (
+                ('no group', 'on: [push]\n', [elsewhere], False),
+                ('the run id alone', 'concurrency: ${{ github.run_id }}\n', [elsewhere], False),
+                ('the run id alone, as the group', group('${{github.run_id}}'), [elsewhere], False),
+                ('a per-PR group, no other unfinished run', WORKFLOW, [], False),
+                ("a per-PR group, another workflow's run on another branch", WORKFLOW, [elsewhere], True),
+                ('a constant group', 'on: push\nconcurrency: deploy\n', [elsewhere], True),
+                ('a literal that reads like the run id', 'concurrency: github.run_id\n', [elsewhere], True),
+                ('the run id beside the workflow', group('ci-${{ github.workflow }}-${{ github.run_id }}'), [elsewhere], True),
+                ('a ref compared', group("${{ github.ref == 'refs/heads/main' && 'production' || 'staging' }}"), [elsewhere], True),
+                # workflow ci on captain-prune and workflow ci-captain on prune both read ci-captain-prune
+                ('names that concatenate alike', group('${{ github.workflow }}-${{ github.head_ref || github.ref }}'),
+                 [dict(elsewhere, name='ci-captain', head_branch='prune')], True)):
+            with self.subTest(what):
+                self.fresh()
+                gh = GitHub(workflow=workflow)
+                gh.unfinished = unfinished
+                out = self.go(gh)[1]
+                self.assertEqual(out['outcome'], 'none' if held else 'recovered', out)
+                if held:
+                    self.assertEqual((out['runs'][0]['outcome'], gh.posts), ('skipped', []))
+                    self.assertIn('may be held by another unfinished run (run 9, queued)', out['runs'][0]['reason'])
+
+    def test_a_head_that_moves_or_a_run_that_starts_before_the_cancel_is_left_alone(self):
+        gh = GitHub()
+        gh.after_list = lambda: setattr(gh, 'head', 'b' * 40)
+        out = self.go(gh)[1]
+        self.assertEqual((out['outcome'], gh.posts), ('none', []))
+        self.assertIn('not open at aaaaaaaaa', out['runs'][0]['reason'])
+        gh = GitHub()
+        gh.after_list = lambda: gh.runs[43095438193].update(status='in_progress')
+        out = self.go(gh)[1]
+        self.assertEqual((out['outcome'], gh.posts), ('none', []))
+        self.assertIn('it is now in_progress', out['runs'][0]['reason'])
+        out = self.go(GitHub(), wait=200)[1]
+        self.assertEqual(out['outcome'], 'none', 'a longer wait')
+        gh = GitHub()
+        gh.state = 'closed'
+        self.assertEqual((self.go(gh)[1]['outcome'], gh.posts), ('none', []))
+
+    def test_a_cancel_that_did_not_end_in_cancelled_is_never_rerun(self):
+        gh = GitHub(lose={'cancel'}, cancel_as='success')
+        out = self.go(gh)[1]
+        self.assertEqual((out['outcome'], gh.posts), ('completed', [(43095438193, 'cancel')]), 'it ran and passed: no re-run')
+        self.assertIn('completed success', out['runs'][0]['reason'])
+        out = self.go(gh)[1]
+        self.assertEqual((out['outcome'], gh.posts), ('completed', [(43095438193, 'cancel')]), 'a relaunch sends nothing either')
+
+    def test_a_pr_that_moves_during_the_cancel_withholds_the_rerun(self):
+        for what, race, why in (('a new head', lambda gh: setattr(gh, 'head', 'b' * 40), 'not open at aaaaaaaaa'),
+                                ('closed', lambda gh: setattr(gh, 'state', 'closed'), 'PR 533 is closed')):
+            with self.subTest(what):
+                self.fresh()
+                gh = GitHub()
+                gh.after_cancel = lambda: race(gh)
+                out = self.go(gh)[1]
+                self.assertEqual((out['outcome'], gh.posts), ('withheld', [(43095438193, 'cancel')]))
+                self.assertIn(why, out['runs'][0]['reason'])
+                record = json.loads(Path(out['runs'][0]['record']).read_text())
+                self.assertEqual(list(record['steps']), ['cancel'])
+
+    def test_a_record_cut_short_before_its_cancel_is_checked_again(self):
+        path = self.dir / 'o-r-43095438193-1.json'
+        path.write_text(json.dumps({'repo': 'o/r', 'pr': 533, 'head': HEAD, 'runId': 43095438193, 'attempt': 1, 'evidence': ['e'],
+                                    'steps': {}}))
+        gh = GitHub(runs=[a_run(status='in_progress')])
+        out = self.go(gh)[1]
+        self.assertEqual((out['outcome'], gh.posts), ('none', []), 'it started since: no cancel')
+        self.assertEqual((out['runs'][0]['outcome'], out['runs'][0]['record']), ('skipped', str(path)))
+        self.assertIn('it is now in_progress', out['runs'][0]['reason'])
+        gh = GitHub()
+        gh.unfinished = [{'id': 9, 'name': 'tests', 'workflow_id': 7, 'status': 'in_progress', 'head_branch': 'captain-prune',
+                          'event': 'pull_request'}]
+        self.assertEqual((self.go(gh)[1]['outcome'], gh.posts), ('none', []), 'its group is held now')
+        gh.unfinished = []
+        out = self.go(gh)[1]
+        self.assertEqual((out['outcome'], gh.posts), ('recovered', [(43095438193, 'cancel'), (43095438193, 'rerun')]))
+        self.assertNotEqual(json.loads(path.read_text())['evidence'], ['e'], 'the record carries what was read before its cancel')
+
+    def test_a_lost_cancel_answer_is_observed_and_never_sent_again(self):
+        gh = GitHub(lose={'cancel'})
+        out = self.go(gh)[1]
+        self.assertEqual((out['outcome'], gh.posts), ('recovered', [(43095438193, 'cancel'), (43095438193, 'rerun')]), 'it took: observed')
+        record = json.loads(Path(out['runs'][0]['record']).read_text())
+        self.assertTrue(record['steps']['cancel']['answer'].startswith('unknown: '))
+        self.fresh()
+        gh = GitHub(cancel_after=100)
+        out = self.go(gh)[1]
+        self.assertEqual((out['outcome'], gh.posts), ('uncertain', [(43095438193, 'cancel')]), 'a cancel that never completes')
+        self.assertIn('not sent again', out['runs'][0]['reason'])
+        gh.cancel_after = 0
+        gh.runs[43095438193]['_pending'] = [0, {'status': 'completed', 'conclusion': 'cancelled'}]
+        out = self.go(gh)[1]
+        self.assertEqual((out['outcome'], gh.posts), ('recovered', [(43095438193, 'cancel'), (43095438193, 'rerun')]),
+                         'a relaunch resumes the record once the cancel completed, with no second cancel')
+
+    def test_a_lost_rerun_answer_is_observed_and_never_sent_again(self):
+        gh = GitHub(lose={'rerun'})
+        out = self.go(gh)[1]
+        self.assertEqual((out['outcome'], out['runs'][0]['newAttempt']), ('recovered', 2))
+        self.fresh()
+        gh = GitHub(lose={'rerun'}, rerun_after=100)
+        out = self.go(gh)[1]
+        self.assertEqual((out['outcome'], gh.posts), ('uncertain', [(43095438193, 'cancel'), (43095438193, 'rerun')]))
+        gh.runs[43095438193].pop('_pending')
+        out = self.go(gh)[1]
+        self.assertEqual(gh.posts, [(43095438193, 'cancel'), (43095438193, 'rerun')], 'a relaunch sends nothing again')
+        self.assertEqual(out['outcome'], 'uncertain')
+
+    def test_a_refused_step_fails_and_is_never_sent_again(self):
+        for what, refuse, posts in (('cancel', {'cancel'}, [(43095438193, 'cancel')]),
+                                    ('rerun', {'rerun'}, [(43095438193, 'cancel'), (43095438193, 'rerun')])):
+            with self.subTest(what):
+                self.fresh()
+                gh = GitHub(refuse=refuse)
+                out = self.go(gh)[1]
+                self.assertEqual((out['outcome'], gh.posts), ('failed', posts))
+                self.assertIn('HTTP 403', out['runs'][0]['reason'])
+                if what == 'cancel':
+                    gh.refuse = set()
+                    self.assertEqual((self.go(gh)[1]['outcome'], gh.posts), ('failed', posts), 'a relaunch sends nothing again')
+
+    def test_an_unfinished_run_counted_but_not_on_the_page_still_holds(self):
+        gh = GitHub()
+        gh.unlisted = {'waiting': 1}
+        out = self.go(gh)[1]
+        self.assertEqual((out['outcome'], gh.posts), ('none', []))
+        self.assertIn('may be held by another unfinished run (waiting)', out['runs'][0]['reason'])
+
+    def test_the_time_budget_sends_nothing_it_leaves_no_time_for(self):
+        gh = GitHub()
+        with mock.patch.object(recover, 'BUDGET', 0):
+            out = self.go(gh)[1]
+        self.assertEqual((out['outcome'], gh.posts, self.records()), ('none', [], []))
+        self.assertEqual(out['runs'][0]['outcome'], 'skipped')
+        self.assertIn('not reached: the time budget ran out first', out['runs'][0]['reason'])
+        # Spent by the last read before the cancel: the record is written, and the cancel is not.
+        answer, jobs = gh.run, []
+
+        def run(*argv, ok=(0,)):
+            got = answer(*argv, ok=ok)
+            if '/jobs?' in argv[-1]:
+                jobs.append(argv[-1])
+                if len(jobs) == 2:
+                    self.clock[0] += recover.BUDGET
+            return got
+        gh.run = run
+        out = self.go(gh)[1]
+        self.assertEqual((out['outcome'], gh.posts), ('none', []))
+        self.assertIn('the time budget ran out before the cancel: nothing was sent', out['runs'][0]['reason'])
+        self.assertEqual(json.loads(Path(out['runs'][0]['record']).read_text())['steps'], {})
+        self.assertEqual((self.go(gh)[1]['outcome'], gh.posts), ('recovered', [(43095438193, 'cancel'), (43095438193, 'rerun')]),
+                         'a later run checks it again and goes on')
+
+    def test_a_step_the_budget_stops_before_its_request_is_sent_by_a_later_run(self):
+        import facts
+        for what, first, posts in (('cancel', ('none', []), [(43095438193, 'cancel'), (43095438193, 'rerun')]),
+                                   ('rerun', ('uncertain', [(43095438193, 'cancel')]), [(43095438193, 'cancel'), (43095438193, 'rerun')])):
+            with self.subTest(what):
+                self.fresh()
+                gh, real = GitHub(), recover.write_record
+                post = gh.attempt
+                gh.attempt = lambda *argv, **kw: facts.attempt(*argv, **kw) if facts.time_left() <= 0 else post(*argv, **kw)
+
+                def write(path, record, new=False):  # the budget runs out while the step is written, before its POST
+                    real(path, record, new)
+                    if 'answer' not in record['steps'].get(what, {'answer': None}):
+                        self.clock[0] += recover.BUDGET
+                with mock.patch.object(recover, 'write_record', write):
+                    out = self.go(gh)[1]
+                self.assertEqual((out['outcome'], gh.posts), first)
+                self.assertIn('the time budget ran out before', out['runs'][0]['reason'])
+                self.assertNotIn(what, json.loads(Path(out['runs'][0]['record']).read_text())['steps'], 'not sent: no step')
+                self.assertEqual((self.go(gh)[1]['outcome'], gh.posts), ('recovered', posts), 'a later run sends it')
+
+    def test_reads_stop_once_the_budget_is_spent_however_many_runs_are_queued(self):
+        gh = GitHub(runs=[a_run(id_=1000 + i) for i in range(100)])
+        answer = gh.run
+
+        def run(*argv, ok=(0,)):  # every GitHub read takes 10 seconds
+            self.clock[0] += 10
+            return answer(*argv, ok=ok)
+        gh.run = run
+        out = self.go(gh)[1]
+        self.assertLessEqual(len(gh.reads) * 10, recover.BUDGET + 10, f'{len(gh.reads)} reads')
+        self.assertEqual(len(out['runs']), 100)
+        self.assertIn('not reached: the time budget ran out first', out['runs'][-1]['reason'])
+        self.assertTrue(all(x['outcome'] == 'skipped' for x in out['runs']), out['detail'])
+
+    def test_runs_not_reached_keep_the_results_before_them(self):
+        # record_dir runs git under the budget: it is asked once, before any run, never for a run left unreached
+        gh = GitHub(runs=[a_run(), a_run(id_=5)], workflow='on: pull_request\n')
+        post, asked = gh.attempt, []
+
+        def attempt(*argv, **kw):
+            out = post(*argv, **kw)
+            if argv[-1].endswith('/rerun'):
+                self.clock[0] = recover.BUDGET + 1     # the budget runs out once the first run is re-run
+            return out
+        gh.attempt = attempt
+
+        def record_dir(kind):
+            if self.clock[0] >= recover.BUDGET:
+                raise recover.OutOfTime('git: not run, the time budget ran out')
+            asked.append(kind)
+            return self.dir
+        self.record_dir = record_dir
+        out = self.go(gh)[1]
+        self.assertEqual(asked, ['ci-recover'])
+        self.assertEqual([r['runId'] for r in out['runs']], [43095438193, 5])
+        self.assertIn('not reached', out['runs'][1]['reason'])
+
+    def test_a_record_locked_past_the_budget_is_left_to_its_holder(self):
+        gh = GitHub()
+        with recover.locked(self.dir / 'o-r-43095438193-1.json'), mock.patch.object(recover, 'BUDGET', 1):
+            out = self.go(gh)[1]
+        self.assertEqual((out['outcome'], gh.posts), ('uncertain', []))
+        self.assertIn('stayed held by another process', out['runs'][0]['reason'])
+
+    def test_a_relaunch_after_a_recovery_sends_nothing_again(self):
+        gh = GitHub()
+        self.assertEqual(self.go(gh)[1]['outcome'], 'recovered')
+        out = self.go(gh)[1]
+        self.assertEqual(out['outcome'], 'none', 'the new attempt is recent')
+        self.assertEqual(gh.posts, [(43095438193, 'cancel'), (43095438193, 'rerun')])
+
+    def test_a_record_cut_short_after_its_cancel_was_sent_is_observed(self):
+        gh = GitHub()
+        path = self.dir / 'o-r-43095438193-1.json'
+        path.write_text(json.dumps({'repo': 'o/r', 'pr': 533, 'head': HEAD, 'runId': 43095438193, 'attempt': 1, 'evidence': ['e'],
+                                    'steps': {'cancel': {'at': '2026-11-11T21:50:00Z'}}}))
+        out = self.go(gh)[1]
+        self.assertEqual((out['outcome'], gh.posts), ('uncertain', []))
+        self.assertIn('the record holds no answer', out['runs'][0]['reason'])
+        gh.runs[43095438193].update(status='completed', conclusion='cancelled')
+        out = self.go(gh)[1]
+        self.assertEqual((out['outcome'], gh.posts), ('recovered', [(43095438193, 'rerun')]), 'the cancel took: the re-run follows once')
+
+    def test_a_read_failing_for_one_run_leaves_the_others_standing(self):
+        # No group, so the other queued run holds none.
+        gh = GitHub(runs=[a_run(), a_run(id_=5, path='.github/workflows/gone.yml')], workflow='on: pull_request\n')
+        answer = gh.run
+
+        def run(*argv, ok=(0,)):
+            if 'gone.yml' in argv[-1]:
+                raise harvest.Unusable('gh api: HTTP 500')
+            return answer(*argv, ok=ok)
+        gh.run = run
+        out = self.go(gh)[1]
+        self.assertEqual(out['outcome'], 'recovered')
+        self.assertEqual([r['outcome'] for r in out['runs']], ['recovered', 'skipped'])
+
+    def test_usage(self):
+        for argv in (['--pr', '1', '--head', 'abc', '--wait-minutes', '30'], ['--pr', '1', '--head', HEAD, '--wait-minutes', '0']):
+            with self.subTest(argv):
+                out = io.StringIO()
+                with redirect_stdout(out):
+                    self.assertEqual(recover.report(recover.collect, argv), 2)
+                self.assertIn('error', json.loads(out.getvalue()))
+
+
+class TimeBudget(unittest.TestCase):
+    """facts.DEADLINE, which ci_recover.py sets: no command starts past it, and none runs beyond it."""
+
+    def test_a_read_past_it_is_out_of_time_and_a_request_cut_short_is_unknown(self):
+        import facts
+        slow = (sys.executable, '-c', 'import time; time.sleep(30)')
+        self.addCleanup(setattr, facts, 'DEADLINE', None)
+        facts.DEADLINE = time.monotonic() + 0.5
+        with self.assertRaisesRegex(facts.OutOfTime, 'no answer within the time budget'):
+            facts.run(*slow)
+        facts.DEADLINE = time.monotonic() + 0.5
+        code, _, err = facts.attempt(*slow)
+        self.assertEqual(code, 124)
+        self.assertIn('it may have landed', err)
+        self.assertTrue(recover.answer(code, err).startswith('unknown: '), 'observed, never sent again')
+        with self.assertRaisesRegex(facts.OutOfTime, 'not run, the time budget ran out'):
+            facts.run(sys.executable, '-c', 'pass')
+        self.assertEqual(facts.attempt(sys.executable, '-c', 'pass')[0], 124)
+        facts.DEADLINE = None
+        self.assertEqual(facts.run(sys.executable, '-c', 'print(1, end="")'), (0, '1'), 'no budget, no bound')
+
+
+    def test_a_rate_limit_lookup_is_bounded_by_the_time_left(self):
+        import seal
+        calls = []
+
+        def run(argv, **kw):
+            calls.append(kw.get('timeout'))
+            return mock.Mock(stdout='{"resources": {"core": {"remaining": 0, "reset": 1800000000}}}')
+        with mock.patch.object(seal.subprocess, 'run', run):
+            self.assertEqual(seal.rate_limit('HTTP 403: API rate limit exceeded', timeout=0)['resetAt'], None)
+            self.assertEqual(calls, [], 'no lookup once no time is left')
+            self.assertIsNotNone(seal.rate_limit('HTTP 403: API rate limit exceeded', timeout=3.5)['resetAt'])
+            self.assertIsNotNone(seal.rate_limit('HTTP 403: API rate limit exceeded')['resetAt'])
+        self.assertEqual(calls, [3.5, None])
+
+
+@unittest.skipIf(os.name == 'nt', 'Windows has no directory fsync')
+class DurableRecord(unittest.TestCase):
+    """facts.write_record and record_dir, which ci_recover.py and greptile_trigger.py keep their records with."""
+
+    def synced(self, act):
+        """The inodes os.fsync was called on while act() ran."""
+        got, real = [], os.fsync
+        with mock.patch.object(os, 'fsync', lambda fd: (got.append(os.fstat(fd).st_ino), real(fd))):
+            act()
+        return got
+
+    def test_a_record_its_rename_and_each_directory_made_for_it_reach_the_disk(self):
+        import facts
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root)
+        path = root / 'r.json'
+        ino = lambda p: p.stat().st_ino  # noqa: E731
+        self.assertEqual(self.synced(lambda: facts.write_record(path, {'n': 1}, new=True)), [ino(path), ino(root)])
+        replaced = self.synced(lambda: facts.write_record(path, {'n': 2}))
+        self.assertEqual(replaced, [ino(path), ino(root)], 'the new file, then the directory holding its rename')
+        self.assertEqual(json.loads(path.read_text()), {'n': 2})
+        with self.assertRaises(FileExistsError):
+            facts.write_record(path, {'n': 3}, new=True)
+        common = root / 'common'
+        common.mkdir()
+        with mock.patch.object(facts, 'git', lambda *a: f'{common}\n'):
+            made = self.synced(lambda: facts.record_dir('ci-recover'))
+        self.assertEqual(made, [ino(common), ino(common / 'pr-babysit')], 'each new directory in its parent')
+        self.assertTrue((common / 'pr-babysit' / 'ci-recover').is_dir())
+        with mock.patch.object(facts, 'git', lambda *a: f'{common}\n'):
+            again = self.synced(lambda: facts.record_dir('ci-recover'))
+        self.assertEqual(again, made, 'each directory on it again: an earlier call may have stopped before its sync')
+
+
+if __name__ == '__main__':
+    unittest.main()

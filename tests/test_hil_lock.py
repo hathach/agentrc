@@ -12,10 +12,13 @@ if os.name == 'nt':
 
 import ast
 import contextlib
+import dis
+import errno
 import fcntl
 import importlib.util
 import inspect
 import io
+import itertools
 import json
 import math
 import re
@@ -143,6 +146,8 @@ class LockDir(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
         os.environ.pop('HIL_NO_BOARD_LOCK', None)
+        # a hold's holder stays this process's fork, which the patches here reach, even under an hc terminal
+        self.patch(hil_lock, 'HC_SCOPE', 'HIL_SELFTEST_NO_SCOPE')
 
     def patch(self, obj, name, value):
         p = mock.patch.object(obj, name, value)
@@ -757,6 +762,72 @@ class DetachedHolder(LockDir):
         deadline = time.monotonic() + 10
         while any(hil_lock.read_record(b) for b in boards) and time.monotonic() < deadline:
             _sleep(0.02)
+
+    def scoped(self):
+        """An hc terminal's environment: the holder must start without its HC_SCOPE. Returns a marker variable's
+        `name=value`, which only processes started from this test carry in their starting environment."""
+        self.patch(hil_lock, 'HC_SCOPE', 'HC_SCOPE')
+        marker = f'HIL_SELFTEST_MARK={secrets.token_hex(8)}'
+        os.environ.update([marker.split('='), ('HC_SCOPE', 'selftest-scope')])
+        return marker
+
+    @staticmethod
+    def started_env(pid) -> list:
+        return Path(f'/proc/{pid}/environ').read_bytes().decode().split('\0')
+
+    def marked(self, marker) -> list:
+        """The live processes whose starting environment carries `marker`."""
+        pids = []
+        for d in Path('/proc').iterdir():
+            with suppress(OSError, ValueError):
+                if marker in self.started_env(int(d.name)) and pid_alive(int(d.name)):
+                    pids.append(int(d.name))
+        return pids
+
+    def test_a_holder_started_from_an_hc_terminal_starts_without_its_scope(self):
+        """#365: hc ends every process that started with a terminal's HC_SCOPE when it cleans up after that terminal;
+        os.environ cannot drop it from a fork, so the holder is exec'd without it, the rest of the environment kept."""
+        marker = self.scoped()
+        with quiet() as (out, _):
+            self.assertEqual(hil_lock.cmd_hold([BOARD, BOARD + '-2'], 'selftest hold'), 0)
+        pid = hil_lock.read_record(BOARD)['pid']
+        self.addCleanup(kill_quietly, pid)
+        self.assertIn('held: ', out.getvalue())
+        env = self.started_env(pid)
+        self.assertFalse([e for e in env if e.startswith('HC_SCOPE=')], env)
+        self.assertIn(marker, env)
+        self.assertEqual(Path(f'/proc/{pid}/cmdline').read_bytes().split(b'\0')[1:3], [b'-I', b'-c'])
+        self.assertNotEqual(os.getsid(pid), os.getsid(0))
+        self.assertEqual(sorted(os.readlink(f'/proc/{pid}/fd/{fd}') for fd in (0, 1, 2)), [os.devnull] * 3)
+        self.assertEqual(hil_lock.read_record(BOARD + '-2')['pid'], pid)
+        self.patch(hil_lock.time, 'sleep', lambda s: self.wait_cleared([BOARD, BOARD + '-2']))
+        with quiet():
+            self.assertEqual(hil_lock.cmd_release([BOARD]), 0)
+        self.assertIsNone(hil_lock.read_record(BOARD + '-2'))
+        deadline = time.monotonic() + 10
+        while not self.flock_is_free() and time.monotonic() < deadline:
+            _sleep(0.02)
+        self.assertTrue(self.flock_is_free())
+        self.assertEqual(self.marked(marker), [])
+
+    def test_an_execd_holder_that_cannot_hold_leaves_no_daemon(self):
+        rival = self.holder(self.record(reason='rival'))       # started before the marker
+        marker = self.scoped()
+        with quiet() as (_, err):
+            self.assertEqual(hil_lock.cmd_hold([BOARD + '-2', BOARD], 'selftest hold'), 1)
+        self.assertIn(f'{BOARD} locked: ', err.getvalue())
+        self.wait_cleared([BOARD + '-2'])
+        self.assertIsNone(hil_lock.read_record(BOARD + '-2'))
+        self.assertEqual(hil_lock.read_record(BOARD)['pid'], rival.pid)
+        deadline = time.monotonic() + 10
+        while self.marked(marker) and time.monotonic() < deadline:
+            _sleep(0.02)
+        self.assertEqual(self.marked(marker), [])
+        self.patch(hil_lock.sys, 'executable', str(Path(self.dir, 'no-python')))      # inherited by the fork
+        with quiet() as (_, err):
+            self.assertEqual(hil_lock.cmd_hold([BOARD + '-2'], 'selftest hold'), 1)
+        self.assertIn('ERROR: holder not started: ', err.getvalue())
+        self.assertIsNone(hil_lock.read_record(BOARD + '-2'))
 
 
 class SafeFiles(LockDir):
@@ -2052,6 +2123,297 @@ sys.stdin.read()
 '''
 
 
+class OperatorResolution(LockDir):
+    """`hil_lock.py resolve` and `compact` (agentrc#475): an operator's acknowledgement closes one named failure,
+    logged apart from a restoration and refused while its evidence is known live; compaction drops only closed
+    failures with what closed them, in a durable replace under the log's mutex."""
+
+    def setUp(self):
+        super().setUp()
+        self.log = Path(self.dir, BOARD + hil_lock.CLEANUP_LOG)
+        self.mutex = Path(self.dir, BOARD + hil_lock.CLEANUP_LOG + '.mutex')
+
+    def failure(self, **evidence):
+        return hil_lock.log_cleanup_failure(BOARD, 'selftest run', detail='restore failed', **evidence)['id']
+
+    def resolve(self, fid, reason='checked by hand: board flashed and tested'):
+        with quiet() as (out, err):
+            rc = hil_lock.cmd_resolve(BOARD, fid, reason)
+        return rc, out.getvalue() + err.getvalue()
+
+    def open_ids(self):
+        return [f['id'] for f in hil_lock.open_cleanup_failures(BOARD)]
+
+    def test_an_acknowledgement_closes_only_its_failure_and_is_no_restoration(self):
+        first = self.failure(receipts=[{'unrecheckable': ['JLinkExe']}])
+        second = self.failure(receipts=[{'unrecheckable': ['sudo', 'recover'], 'survivors': [999999999]}])
+        self.assertEqual(self.resolve(first), (0, f'{BOARD}: failure {first} acknowledged (closed by an operator, '
+                                                  f'not proven restored)\n'))
+        self.assertEqual(self.open_ids(), [second])
+        ack = hil_lock.cleanup_events(BOARD)[-1]
+        self.assertEqual((ack['event'], ack['failure'], ack['reason'], ack['uid']),
+                         ('acknowledged', first, 'checked by hand: board flashed and tested', os.geteuid()))
+        self.assertNotIn('restored', [e['event'] for e in hil_lock.cleanup_events(BOARD)])
+        self.assertEqual(self.resolve(second)[0], 0)
+        self.assertEqual(self.open_ids(), [])
+
+    def test_a_closed_unknown_or_unexplained_failure_is_refused(self):
+        restored, acked, fid = self.failure(), self.failure(), self.failure()
+        hil_lock.cleanup_restored(BOARD, restored)
+        self.assertEqual(self.resolve(acked)[0], 0)
+        before = self.log.read_bytes()
+        for target, reason, says in ((restored, 'x', 'already closed (restored'),
+                                     (acked, 'x', 'already closed (acknowledged'),
+                                     ('feedfacefeedface', 'x', 'no failure feedfacefeedface'),
+                                     (fid, '  ', 'a reason is required')):
+            with self.subTest(says=says):
+                rc, text = self.resolve(target, reason)
+                self.assertEqual(rc, 1)
+                self.assertIn(says, text)
+        self.assertEqual(self.log.read_bytes(), before)
+        self.assertEqual(self.open_ids(), [fid])
+
+    def test_known_live_evidence_refuses_and_unrecheckable_evidence_does_not(self):
+        me = {'pid': os.getpid(), 'start': hil_lock.proc_start(os.getpid())}
+        session = Path(self.dir, 'session.json')
+        session.write_text(json.dumps({'tool': 'hil_openocd_esp', 'pid': me['pid'], 'startTime': me['start'],
+                                       'closed': False}))
+        fifo = os.path.join(self.dir, 'session.fifo')
+        os.mkfifo(fifo)
+        survey = hil_lock._process()._survey(os.getppid())     # what a supervisor reports: this process among them
+        self.assertIn(os.getpid(), [p['pid'] for p in survey['processes']])
+        states = {'pending-op': 'pending'}
+        self.patch(hil_lock, '_process', lambda: types.SimpleNamespace(recheck=lambda r: states.get(r.get('token'),
+                                                                                                    'unknown')))
+        live = {'pending receipt': {'receipts': [{'token': 'pending-op'}]},
+                'live survivor': {'receipts': [{'unrecheckable': ['x'], 'survivors': [me]}]},
+                'live bare pid': {'receipts': [{'unrecheckable': ['x'], 'survivors': [me['pid']]}]},
+                # run_tracked's pending receipt: survivors as its supervisor's survey reported them
+                'surveyed process': {'receipts': [{'token': 'unknown-op', 'survivors': survey}]},
+                'running session': {'retained': [str(session)]},
+                'journal receipt': {'task': {'role': hil_lock.CLEANUP_ROLE, 'reason': 'takeover'},
+                                    'journal': {'token': 't', 'prior': None, 'predecessor': json.dumps(
+                                        {'role': hil_lock.CLEANUP_ROLE, 'receipts': [{'token': 'pending-op'}]})}}}
+        fids = {}
+        for name, evidence in live.items():
+            with self.subTest(name=name):
+                fid = fids[name] = secrets.token_hex(8)
+                hil_lock._log_append(BOARD, {'event': 'failed', 'id': fid, **evidence})
+                rc, text = self.resolve(fid)
+                self.assertEqual(rc, 1)
+                self.assertIn('its evidence is still live', text)
+                self.assertIn(fid, self.open_ids())
+        # ended or never rechecked: the operator's to judge
+        states.clear()
+        session.write_text(json.dumps({'tool': 'hil_openocd_esp', 'pid': me['pid'], 'startTime': me['start'],
+                                       'closed': True}))
+        for evidence in ({'receipts': [{'unrecheckable': ['x'], 'survivors': [{**me, 'start': '1'}]}]},
+                         {'receipts': [{'token': 'x', 'survivors': {'processes': [{'pid': 999999999}],
+                                                                    'unreadable': [999999998]}}]},
+                         # a survey's unreadable entries are any /proc entry it could not read: not its survivors
+                         {'receipts': [{'token': 'x', 'survivors': {**survey, 'processes': [],
+                                                                    'unreadable': [me['pid']]}}]},
+                         {'receipts': [{'token': 'x', 'survivors': None}]},
+                         {'receipts': [{'token': 'gone'}, 'not a receipt']}, {'retained': ['/no/such.json']},
+                         {'retained': [fifo]}):     # read without blocking, as retained_state reads it
+            fid = secrets.token_hex(8)
+            hil_lock._log_append(BOARD, {'event': 'failed', 'id': fid, **evidence})
+            self.assertEqual(self.resolve(fid)[0], 0, evidence)
+        still = [fids[k] for k in ('live survivor', 'live bare pid', 'surveyed process')]
+        for fid in self.open_ids():
+            self.assertEqual(self.resolve(fid)[0], 1 if fid in still else 0, fid)
+        self.assertEqual(self.open_ids(), still)
+
+    def test_a_journal_not_read_whole_or_a_live_journal_holder_refuses(self):
+        """A takeover journal link that cannot be read drops every record before it too: refused, never resolved on
+        what remains; a holder the journal kept that still runs is live evidence."""
+        me = {'role': hil_lock.CLEANUP_ROLE, 'pid': os.getpid(), 'start': hil_lock.proc_start(os.getpid())}
+        task = {'role': hil_lock.CLEANUP_ROLE, 'reason': 'takeover'}
+        cases = {'cannot be read': {'token': 't', 'predecessor': json.dumps(me), 'prior': {}},
+                 'holder pid': {'token': 't', 'predecessor': json.dumps(me), 'prior': None}}
+        for says, journal in cases.items():
+            with self.subTest(says=says):
+                fid = secrets.token_hex(8)
+                hil_lock._log_append(BOARD, {'event': 'failed', 'id': fid, 'how': 'found-left', 'task': task,
+                                             'journal': journal})
+                rc, text = self.resolve(fid)
+                self.assertEqual(rc, 1)
+                self.assertIn(says, text)
+                self.assertIn(fid, self.open_ids())
+        fid = secrets.token_hex(8)
+        hil_lock._log_append(BOARD, {'event': 'failed', 'id': fid, 'receipts': 'r'})
+        rc, text = self.resolve(fid)
+        self.assertEqual(rc, 1)
+        self.assertIn('its evidence is malformed', text)
+        real, reads = hil_lock._journal_records, []
+        self.patch(hil_lock, '_journal_records', lambda j: reads.append(j) or real(j))
+        gone = {**me, 'start': '1'}       # the same pid, another start: not the holder the journal kept
+        fid = secrets.token_hex(8)
+        hil_lock._log_append(BOARD, {'event': 'failed', 'id': fid, 'how': 'found-left', 'task': task,
+                                     'journal': {'token': 't', 'predecessor': json.dumps(gone), 'prior': None}})
+        self.assertEqual(self.resolve(fid)[0], 0)
+        self.assertEqual(len(reads), 1, 'one snapshot of the journal decides')
+
+    def test_a_helper_that_cannot_load_or_a_restoration_meanwhile_refuses(self):
+        fid = self.failure(receipts=[{'unrecheckable': ['x']}])
+        with mock.patch.object(hil_lock, '_process', side_effect=ImportError('no hil_process')):
+            rc, text = self.resolve(fid)
+        self.assertEqual((rc, self.open_ids()), (1, [fid]))
+        self.assertIn('its evidence cannot be rechecked', text)
+        self.assertIn('no hil_process', text)
+        real = hil_lock._live_evidence
+
+        def restored_meanwhile(*a):
+            hil_lock.cleanup_restored(BOARD, fid)
+            return real(*a)
+        self.patch(hil_lock, '_live_evidence', restored_meanwhile)
+        rc, text = self.resolve(fid)
+        self.assertEqual(rc, 1)
+        self.assertIn('already closed (restored', text)
+        self.assertEqual([e['event'] for e in hil_lock.cleanup_events(BOARD)], ['failed', 'restored'])
+
+    def lines(self):
+        return [json.loads(ln) for ln in self.log.read_text().splitlines()]
+
+    def test_compaction_drops_only_closed_failures_and_what_closed_them(self):
+        old = os.umask(0o077)
+        self.addCleanup(os.umask, old)
+        restored, acked, kept = self.failure(), self.failure(), self.failure()
+        hil_lock.cleanup_restored(BOARD, restored)
+        hil_lock.cleanup_restored(BOARD, restored)          # a duplicate restoration goes with its failure
+        self.assertEqual(self.resolve(acked)[0], 0)
+        hil_lock.cleanup_restored(BOARD, 'not-in-this-log')
+        hil_lock._log_append(BOARD, {'event': 'probe'})
+        hil_lock._log_append(BOARD, {'event': 'failed', 'id': ['odd'], 'detail': 'never closable'})
+        hil_lock._log_append(BOARD, {'event': 'restored', 'failure': ['odd']})
+        mutex = os.stat(self.mutex).st_ino
+        with quiet() as (out, _):
+            self.assertEqual(hil_lock.cmd_compact([BOARD, BOARD]), 0)
+        self.assertEqual(out.getvalue(), f'{BOARD}: 5 events of closed failures dropped, 5 kept\n')
+        self.assertEqual([(e['event'], e.get('id', e.get('failure'))) for e in self.lines()],
+                         [('failed', kept), ('restored', 'not-in-this-log'), ('probe', None), ('failed', ['odd']),
+                          ('restored', ['odd'])])
+        self.assertEqual(self.open_ids(), [kept, ['odd']])
+        self.assertEqual((os.stat(self.mutex).st_ino, stat.S_IMODE(os.stat(self.log).st_mode)), (mutex, 0o666))
+        self.assertEqual(os.stat(self.log).st_uid, os.geteuid())
+        self.assertEqual(sorted(os.listdir(self.dir)), sorted([self.log.name, self.mutex.name]))
+        ino = os.stat(self.log).st_ino
+        self.assertEqual(hil_lock.compact_cleanup_log(BOARD), {'dropped': 0, 'kept': 5})
+        self.assertEqual(os.stat(self.log).st_ino, ino, 'nothing closed: nothing rewritten')
+        self.assertEqual(hil_lock.compact_cleanup_log(BOARD + '-none'), {'dropped': 0, 'kept': 0})
+
+    def test_a_closed_failure_stays_while_its_journal_cannot_be_unlinked(self):
+        journal = Path(self.dir, BOARD + hil_lock.JOURNAL)
+        journal.write_text(json.dumps({'token': 't', 'predecessor': '', 'prior': None}))
+        # another user's journal in a sticky dir: logged, never unlinked
+        with mock.patch.object(hil_lock.os, 'unlink', side_effect=PermissionError(1, 'Operation not permitted')):
+            fh = self.acquire()
+            fid = taken_failure(fh)['id']
+            hil_lock.release_board_lock(fh)
+            self.assertEqual(self.resolve(fid)[0], 0)
+            self.assertEqual(hil_lock.compact_cleanup_log(BOARD), {'dropped': 0, 'kept': 2})
+            fh = self.acquire()
+            self.assertIsNone(taken_failure(fh), 'the journal was logged once')
+            hil_lock.release_board_lock(fh)
+        self.assertEqual([e['event'] for e in self.lines()], ['failed', 'acknowledged'])
+        journal.unlink()
+        self.assertEqual(hil_lock.compact_cleanup_log(BOARD), {'dropped': 2, 'kept': 0})
+
+    def test_the_replacement_keeps_mode_owner_and_group_and_starts_private(self):
+        old = os.umask(0)
+        self.addCleanup(os.umask, old)
+        fid = self.failure()
+        hil_lock.cleanup_restored(BOARD, fid)
+        os.chmod(self.log, 0o660)
+        before = os.stat(self.log)
+        real, seen = os.fchmod, []
+
+        def fchmod(fd, mode):
+            seen.append((stat.S_IMODE(os.fstat(fd).st_mode), mode))
+            real(fd, mode)
+        with mock.patch.object(hil_lock.os, 'fchmod', fchmod):
+            self.assertEqual(hil_lock.compact_cleanup_log(BOARD), {'dropped': 2, 'kept': 0})
+        after = os.stat(self.log)
+        self.assertEqual(seen, [(0o600, 0o660)])       # the temp file is private until it takes the log's mode
+        self.assertEqual((stat.S_IMODE(after.st_mode), after.st_uid, after.st_gid),
+                         (0o660, before.st_uid, before.st_gid))
+        self.assertNotEqual(after.st_ino, before.st_ino)
+
+    def test_a_malformed_whole_line_refuses_and_a_torn_tail_goes(self):
+        fid = self.failure()
+        hil_lock.cleanup_restored(BOARD, fid)
+        kept = self.failure()
+        with open(self.log, 'ab') as f:
+            f.write(b'{"event": "failed", "id": "torn')
+        self.assertEqual(hil_lock.compact_cleanup_log(BOARD), {'dropped': 2, 'kept': 1})
+        self.assertEqual([e['id'] for e in self.lines()], [kept])
+        for bad in (b'not json\n', b'[1]\n', b'\xff\n'):
+            with self.subTest(bad=bad):
+                hil_lock.cleanup_restored(BOARD, kept)
+                with open(self.log, 'ab') as f:
+                    f.write(bad)
+                before = self.log.read_bytes()
+                with quiet() as (_, err):
+                    self.assertEqual(hil_lock.cmd_compact([BOARD]), 1)
+                self.assertIn('is not a JSON object, not compacted', err.getvalue())
+                self.assertEqual(self.log.read_bytes(), before)
+                self.log.write_bytes(before[:-len(bad)])        # as the operator would repair it
+
+    def test_an_append_during_compaction_waits_and_lands_in_the_new_log(self):
+        fid = self.failure()
+        hil_lock.cleanup_restored(BOARD, fid)
+        real, appended = os.rename, []
+
+        def rename(*a, **k):
+            t = threading.Thread(target=lambda: appended.append(self.failure()))
+            t.start()
+            t.join(0.3)
+            self.assertTrue(t.is_alive(), 'the append did not wait for the mutex')
+            real(*a, **k)
+            self.addCleanup(t.join)
+        with mock.patch.object(hil_lock.os, 'rename', rename):
+            self.assertEqual(hil_lock.compact_cleanup_log(BOARD), {'dropped': 2, 'kept': 0})
+        deadline = time.monotonic() + 10
+        while not appended and time.monotonic() < deadline:
+            _sleep(0.02)
+        self.assertEqual([e['id'] for e in self.lines()], appended)
+
+    def test_a_failed_replace_or_another_owner_leaves_the_log_as_it_was(self):
+        fid = self.failure()
+        hil_lock.cleanup_restored(BOARD, fid)
+        before, ino = self.log.read_bytes(), os.stat(self.log).st_ino
+        os.chmod(self.dir, stat.S_IMODE(os.stat(self.dir).st_mode) | stat.S_ISVTX)    # a shared dir, as the host step
+        for name, patch, error in (
+                ('rename', mock.patch.object(hil_lock.os, 'rename', side_effect=OSError(errno.EIO, 'rename failed')),
+                 OSError),
+                ('fsync', mock.patch.object(hil_lock.os, 'fsync', side_effect=OSError(errno.EIO, 'fsync failed')),
+                 OSError),
+                ('owner', mock.patch.object(hil_lock.os, 'geteuid', return_value=os.geteuid() + 1),
+                 hil_lock.LogRefused),
+                # root may give any group: checked only for another user
+                *([('group', mock.patch.multiple(hil_lock.os,
+                                                 getegid=mock.Mock(return_value=os.stat(self.log).st_gid + 1),
+                                                 getgroups=mock.Mock(return_value=[])), hil_lock.LogRefused)]
+                  if os.geteuid() else []),
+                ('fchown', mock.patch.object(hil_lock.os, 'fchown', side_effect=PermissionError(errno.EPERM, 'no')),
+                 PermissionError)):
+            with self.subTest(name=name):
+                with patch, self.assertRaises(error):
+                    hil_lock.compact_cleanup_log(BOARD)
+                self.assertEqual((self.log.read_bytes(), os.stat(self.log).st_ino), (before, ino))
+                self.assertEqual(sorted(os.listdir(self.dir)), sorted([self.log.name, self.mutex.name]))
+
+    def test_the_cli_takes_resolve_and_compact(self):
+        fid = self.failure()
+        for argv, rc in ((['resolve', BOARD, fid, '--reason', 'checked'], 0), (['compact', BOARD], 0),
+                         (['resolve', BOARD, fid], 2), (['compact'], 2)):
+            with self.subTest(argv=argv), mock.patch.object(sys, 'argv', ['hil_lock.py', *argv]), quiet(), \
+                    self.assertRaises(SystemExit) as done:
+                hil_lock.main()
+            self.assertEqual(done.exception.code, rc)
+        self.assertEqual(self.log.read_bytes(), b'')
+
+
 class BoardTasks(LockDir):
     """board_task: a protected take, the busy check under it before the body, and an end on the
     body's verdict that releases the board whatever fails or interrupts it."""
@@ -3224,6 +3586,169 @@ class SessionMutex(LockDir):
         self.assertEqual(len(os.listdir('/proc/self/fd')), fds)
         with hil_lock.session_mutex(BOARD):
             pass
+
+    def check_points(self):
+        """{code: offsets} of hil_lock's own code and InterruptHold.rearm where CPython runs a pending signal's
+        Python handler: just after a call returns, a backward jump, a frame's resume."""
+        process = hil_lock._process()
+        codes, todo = {}, [f.__code__ for f in vars(hil_lock).values() if isinstance(f, types.FunctionType)]
+        todo += [inspect.unwrap(hil_lock.session_mutex).__code__, process.InterruptHold.rearm.__code__]
+        while todo:
+            code = todo.pop()
+            if code in codes or code.co_filename not in (hil_lock.__file__, process.__file__):
+                continue
+            ins = list(dis.get_instructions(code))
+            codes[code] = {b.offset for a, b in zip(ins, ins[1:]) if a.opname.startswith('CALL')
+                           and a.opname != 'CALL_INTRINSIC_1'}
+            codes[code] |= {i.offset for i in ins if i.opname in ('JUMP_BACKWARD', 'RESUME')}
+            todo += [c for c in code.co_consts if isinstance(c, types.CodeType)]
+        return codes
+
+    def interrupt_every_take(self, sig, fires, body=lambda: None):
+        """Take and drop the mutex once per injection plan, body() run under it, `sig` raised at the check points
+        the plan names: fires(n) yields, per take, the 1-based indexes of the points where it is raised, ending when a
+        take reaches none of them. Each take ends interrupted with no fd kept, the handlers back, and the mutex free
+        here."""
+        class Terminated(BaseException):
+            pass
+
+        def term(signum, frame):
+            raise Terminated(signum)
+        self.addCleanup(signal.signal, signal.SIGINT, signal.signal(signal.SIGINT, signal.default_int_handler))
+        self.addCleanup(signal.signal, signal.SIGTERM, signal.signal(signal.SIGTERM, term))
+        mon, tool = sys.monitoring, sys.monitoring.DEBUGGER_ID
+        if mon.get_tool(tool) is not None:
+            self.skipTest('sys.monitoring debugger id in use')
+        codes = self.check_points()
+        with hil_lock.session_mutex(BOARD):     # the dir and the file exist: only a take's fds are counted
+            pass
+        fds = sorted(os.listdir('/proc/self/fd'))
+        seen, plan = 0, None
+
+        def at(code, offset):
+            nonlocal seen
+            if offset in codes.get(code, ()):
+                seen += 1
+                if plan(seen):
+                    signal.raise_signal(sig)
+
+        def take():
+            nonlocal seen
+            seen = 0
+            for code in codes:
+                mon.set_local_events(tool, code, mon.events.INSTRUCTION)
+            try:
+                with hil_lock.session_mutex(BOARD):
+                    body()
+            except (KeyboardInterrupt, Terminated):
+                interrupted = True
+            else:
+                interrupted = False
+            finally:
+                for code in codes:
+                    mon.set_local_events(tool, code, 0)
+            return interrupted
+        mon.use_tool_id(tool, 'session_mutex interrupts')
+        takes = 0
+        try:
+            mon.register_callback(tool, mon.events.INSTRUCTION, at)
+            for plan in fires():
+                interrupted = take()
+                plan.seen = seen
+                if seen < plan.points[-1]:      # not every point reached: nothing to check
+                    continue
+                takes += 1
+                with self.subTest(sig=sig, plan=plan.name):
+                    self.assertTrue(interrupted)
+                    self.assertEqual(sorted(os.listdir('/proc/self/fd')), fds)
+                    self.assertEqual((signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM)),
+                                     (signal.default_int_handler, term))
+                    with hil_lock.session_mutex(BOARD):     # reacquired in this process
+                        pass
+        finally:
+            mon.register_callback(tool, mon.events.INSTRUCTION, None)
+            mon.free_tool_id(tool)
+        self.assertGreater(takes, 10)
+
+    class Plan:
+        """Raise at each of `points` and, with `storm`, at every point after the first; `seen`, set once taken, is how
+        many points the take reached."""
+
+        def __init__(self, points, storm=False):
+            self.points, self.storm, self.name, self.seen = points, storm, (points, storm), 0
+
+        def __call__(self, seen):
+            return seen in self.points or self.storm and seen > self.points[0]
+
+    def plans(self, storm=False, pairs=False):
+        """Every single point (with `storm`, every point and all after it), or with `pairs` every ordered pair."""
+        def fires():
+            for n in itertools.count(1):
+                plan = self.Plan([n], storm)
+                yield plan
+                if plan.seen < n:
+                    return
+                for m in itertools.count(n + 1) if pairs else ():
+                    plan = self.Plan([n, m])
+                    yield plan
+                    if plan.seen < m:
+                        break
+        return fires
+
+    def test_an_interrupt_at_any_check_point_frees_the_mutex(self):
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            self.interrupt_every_take(sig, self.plans())
+
+    def test_a_second_interrupt_in_its_cleanup_still_frees_the_mutex(self):
+        """#537: a first interrupt before the cleanup and a second on its back-edge leaked both fds."""
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            self.interrupt_every_take(sig, self.plans(storm=True))
+
+    def test_a_handler_the_body_installed_still_defers_in_its_cleanup(self):
+        """A with block that installs its own handler (signal.default_int_handler here) replaces the deferring one:
+        the cleanup installs it again before it lets go of an fd, though a first interrupt cuts that short and a
+        second lands after an fd is popped (every ordered pair of check points)."""
+        def body():
+            signal.signal(signal.SIGINT, signal.default_int_handler)
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            self.interrupt_every_take(sig, self.plans(), body=body)
+        self.interrupt_every_take(signal.SIGINT, self.plans(pairs=True), body=body)
+
+    def test_a_helper_that_cannot_load_acquires_nothing(self):
+        fds = sorted(os.listdir('/proc/self/fd'))
+        for e in (ImportError('no hil_process'), OSError(errno.ENOENT, 'gone')):
+            with self.subTest(e=e), mock.patch.object(hil_lock, '_process', side_effect=e), \
+                    self.assertRaisesRegex(hil_lock.LockUnavailable, 'interrupt hold'):
+                with hil_lock.session_mutex(BOARD):
+                    self.fail('the body ran')
+            self.assertEqual(sorted(os.listdir('/proc/self/fd')), fds)
+            self.assertEqual(os.listdir(self.dir), [])
+        with hil_lock.session_mutex(BOARD):
+            pass
+
+    def test_a_failed_close_closes_each_fd_once(self):
+        self.addCleanup(signal.signal, signal.SIGINT, signal.signal(signal.SIGINT, signal.default_int_handler))
+        with hil_lock.session_mutex(BOARD):
+            pass
+        fds = sorted(os.listdir('/proc/self/fd'))
+        real_close = os.close
+        for body, raised in ((None, OSError), (ValueError('body'), OSError), (KeyboardInterrupt(), KeyboardInterrupt)):
+            closed = []
+
+            def close(fd):                      # the fd is freed, as Linux frees it whatever close returns
+                closed.append(fd)
+                real_close(fd)
+                raise OSError(errno.EIO, 'close failed')
+            with self.subTest(body=body), self.assertRaises(raised):
+                with mock.patch.object(hil_lock.os, 'close', close), hil_lock.session_mutex(BOARD):
+                    if body is not None:
+                        raise body
+            self.assertEqual(len(closed), 2)
+            self.assertEqual(len(set(closed)), 2)
+            self.assertEqual(sorted(os.listdir('/proc/self/fd')), fds)
+            self.assertIs(signal.getsignal(signal.SIGINT), signal.default_int_handler)
+            with hil_lock.session_mutex(BOARD):
+                pass
 
     def test_never_a_board_lock(self):
         with hil_lock.session_mutex(BOARD):

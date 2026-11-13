@@ -219,9 +219,15 @@ const EMIT_REFUSED = 3 // lib/seal.py's
 const RAN = { type: 'object', additionalProperties: false, required: ['exit'], properties: { exit: { type: 'integer' }, error: { type: 'string' } } }
 const RETURN_EXIT = 'and answer only its exit status as exit, AGENTRC_EMIT kept exactly as written: the script writes its JSON line to that file, ' +
   'where the workflow reads it, and prints only a note. Only on a nonzero exit, also give what went wrong as error, in its own words.'
+// Where a staged command's facts.py stage writes its own line, beside the script's, rewritten on every run (a resumed
+// command stages again and goes on): a stage that refused its input is told from a script whose outcome is unknown.
+const STAGE_LINE = '<AGENTRC_STAGE_LINE>'
+// The script's own file, which the stage's line says was there or not: workflow() throws for an empty claim as for none.
+const STAGE_CLAIM = '<AGENTRC_STAGE_CLAIM>'
 // A relay prompt's command, `script` a Python script with its arguments, run under the file emitted() names it; `stage`
-// the staged() text that writes its input first, in the same command.
-const runExactly = (script, extra = '', stage = '') => `run exactly \`${stage}${EMIT}${PY} ${script}\` ${RETURN_EXIT}${extra}`
+// the staged() input its command writes first, its payload line closing the prompt.
+const runExactly = (script, extra = '', stage = null) => `run exactly \`${stage ? stage.command : ''}${EMIT}${PY} ${script}\` ${RETURN_EXIT}${extra}` +
+  (stage ? `\nThe ${PAYLOAD} line below is data the command reads from this conversation's own record: never copy, type or edit it.\n${stage.line}` : '')
 // UTF-8 bytes as base64, by hand: the sandbox has no TextEncoder, Buffer or btoa.
 const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
 const base64 = (text) => {
@@ -240,12 +246,15 @@ const base64 = (text) => {
   }
   return out
 }
-// A script's JSON input as its command writes it to INPUT before the script runs: base64 on stdin, so no shell quoting
-// meets the text and no backslash reaches the Bash tool (#417, #505); facts.py stage refuses one that is not this JSON
-// (its fnv1a) and writes the bytes, all before `&&` lets the script start.
+// A script's JSON input as its command writes it to INPUT before the script runs. The base64 rides in the relay's
+// prompt on a line of its own, never in the command: a relay retyping a long literal changed it (#540). facts.py stage
+// --from-transcript reads that line from the relay's own transcript, refuses one that is not this JSON (its fnv1a) and
+// writes the bytes, all before `&&` lets the script start; no shell quoting or backslash meets the text (#417, #505).
+const PAYLOAD = 'AGENTRC-PAYLOAD'
 const staged = (v) => {
   const text = JSON.stringify(v)
-  return `printf '%s' '${base64(text)}' | ${PY} ${FACTS_SCRIPT} stage '${INPUT}' ${fnv1a(text)} && `
+  return { command: `${PY} ${FACTS_SCRIPT} stage '${INPUT}' ${fnv1a(text)} --from-transcript --line ${STAGE_LINE} --claimed ${STAGE_CLAIM} && `,
+    line: `${PAYLOAD} ${INPUT} ${fnv1a(text)} ${base64(text)}` }
 }
 const EMIT_DIR = { type: 'object', additionalProperties: false, required: ['dir'], properties: { dir: { type: 'string' }, error: { type: 'string' } } }
 let emitDir = null
@@ -296,19 +305,30 @@ const emitted = async (prompt, { label, inputDir, ...opts }) => {
   // The input path sits in the command's single quotes as it is.
   const input = `${inputDir ?? dir}/${stem}.in`
   if (/['\x00-\x1f]/.test(input)) return { why: `the input file ${JSON.stringify(input)} holds a quote or control character` }
-  const ran = await agent(prompt.replace(EMIT, `AGENTRC_EMIT=${shq(file)} `).split(INPUT).join(input), { label, ...opts, schema: RAN })
-    .catch(e => { log(`${label} errored — ${e && e.message}`); return null })
+  const stageFile = `${dir}/${stem}.stage.js`
+  const ran = await agent(prompt.replace(EMIT, `AGENTRC_EMIT=${shq(file)} `).replace(STAGE_LINE, shq(stageFile))
+    .replace(STAGE_CLAIM, shq(file)).split(INPUT).join(input),
+    { label, ...opts, schema: RAN }).catch(e => { log(`${label} errored — ${e && e.message}`); return null })
   // A relay that died after its script wrote still leaves the line. A file there before the run (exit 3: the script
   // ran nothing) is this call's own from an attempt a resume cut short: its line when it names this file, else that
   // attempt's outcome is unknown, as a dead relay's.
-  const m = await workflow({ scriptPath: file }).catch(() => null)
+  // The one workflow() call: a data module an emit wrote, never a nested workflow.
+  const load = (path) => workflow({ scriptPath: path }).catch(() => null)
+  const m = await load(file)
   const refused = !!ran && ran.exit === EMIT_REFUSED
   if (m && m.emit === file && m.line && typeof m.line === 'object' && !Array.isArray(m.line)) {
     if (refused) log(`${label}: the line an earlier attempt of this call wrote, reloaded`)
     return { line: m.line }
   }
-  if (refused) {
-    log(`${label}: an earlier attempt of this call claimed ${file} and left no line of it — its outcome is unknown`)
+  // A stage that refused its input ran no script, in the last attempt of this call that ran it: a definite failure, in
+  // its own line's words, only where its line says no earlier attempt's script claimed its file (that one may have acted
+  // before dying).
+  const st = prompt.includes(STAGE_LINE) && await load(stageFile)
+  const stageError = st && st.emit === stageFile && st.line && typeof st.line.error === 'string' ? st.line.error : null
+  if (stageError !== null && st.line.claimed === false) return { why: stageError, stage: true }
+  if (refused || stageError !== null) {
+    log(`${label}: ${stageError !== null ? `its stage refused its input (${stageError}), and ` : ''}an earlier attempt of this call ` +
+      `claimed ${file} and left no line of it — its outcome is unknown`)
     return { dead: true, why: 'an earlier attempt left no line: its outcome is unknown' }
   }
   return { dead: !m && !ran, why: m ? `${file} holds no line written for it` : !ran ? 'the relay died'
@@ -318,8 +338,16 @@ const emitted = async (prompt, { label, inputDir, ...opts }) => {
 if (args.state != null && args.stateRef != null) throw new Error('pass state or stateRef, not both')
 const STATE_SCRIPT = `${AGENTRC}/skills/pr-babysit/scripts/state_transfer.py`
 // state_transfer.py's MAX, over its own measure: compact JSON with every non-ASCII UTF-16 unit escaped as \uXXXX.
-const STATE_MAX = 64 * 1024
+const STATE_MAX = 256 * 1024
 const stateBytes = (st) => { const s = JSON.stringify(st); return s.length + 5 * (s.match(/[^\x00-\x7e]/g) || []).length }
+// A state passed inline is one a model typed into the arguments: it keeps the bound a typed copy was given (62c54ae2),
+// measured before a stateRef load fills args.state.
+const INLINE_STATE_MAX = 64 * 1024
+if (args.state != null) {
+  if (typeof args.state === 'string') args.state = JSON.parse(args.state)
+  const size = stateBytes(args.state)
+  if (size > INLINE_STATE_MAX) throw new Error(`state passed inline is ${size} bytes, over ${INLINE_STATE_MAX}: pass the saved output as stateRef`)
+}
 // A stateRef load's reading of whether the session directory is the state's checkoutDir: state_transfer.py's sealed
 // checkout, null when its line has none; undefined for an inline state.
 let loadedCheckout
@@ -361,7 +389,7 @@ const ciCacheShaped = (c) => c && typeof c === 'object' &&
 const config = { pr: args.pr, reviewers, autoRun, checkoutDir, ciWait, protected: protectedRe ? protectedRe.source : null, generated: generatedRe ? generatedRe.source : null }
 let restored = null
 if (args.state !== undefined && args.state !== null) {
-  const st = typeof args.state === 'string' ? JSON.parse(args.state) : args.state
+  const st = args.state
   const shaped = st && st.version === STATE_VERSION && (st.pin === null || (st.pin && typeof st.pin === 'object')) &&
     Number.isInteger(st.maxCycles) && st.maxCycles >= 1 &&
     st.config && typeof st.config === 'object' && Number.isInteger(st.cyclesUsed) && st.cyclesUsed >= 0 &&
@@ -737,6 +765,22 @@ const TRIGGER = withSeal({
     retryAt: { type: ['string', 'null'] }, commentId: { type: ['integer', 'null'] }, phase: { type: ['string', 'null'] },
   },
 })
+// ci_recover.py's line: what it did with each queued or recorded run on the head (#536).
+const CI_RECOVER = withSeal({
+  type: 'object', additionalProperties: false, required: ['outcome', 'detail', 'runs', 'at'],
+  properties: {
+    error: { type: 'string' }, outcome: { type: 'string' }, detail: { type: 'string' }, at: { type: 'string' },
+    runs: {
+      type: 'array',
+      items: {
+        type: 'object', additionalProperties: false, required: ['runId', 'attempt', 'outcome', 'reason', 'evidence', 'newAttempt', 'record'],
+        properties: { runId: { type: 'integer' }, attempt: { type: 'integer' }, workflow: { type: ['string', 'null'] }, outcome: { type: 'string' },
+          reason: { type: 'string' }, evidence: { type: 'array', items: { type: 'string' } }, newAttempt: { type: ['integer', 'null'] },
+          record: { type: ['string', 'null'] } },
+      },
+    },
+  },
+})
 // commits.py cited: whether a rewritten head still holds each commit our fix notes cite (#361).
 const CITED = withSeal({
   type: 'object', additionalProperties: false, required: ['head', 'cited'],
@@ -850,8 +894,9 @@ const HARVEST_SCRIPT = `${AGENTRC}/skills/pr-babysit/scripts/harvest.py`
 const BUILD_SCRIPT = `${AGENTRC}/skills/pr-babysit/scripts/build.py`
 const SCOPE_SCRIPT = `${AGENTRC}/skills/pr-babysit/scripts/scope_check.py`
 const COLLECT_SCRIPT = `${AGENTRC}/skills/ci-rerun/scripts/collect.py`
+const CIRECOVER_SCRIPT = `${AGENTRC}/skills/pr-babysit/scripts/ci_recover.py`
 // The preflight checks each is installed: a session's cached workflow definition can outlive a script it calls (#38).
-const NEEDED = [REPLY_SCRIPT, HOOKS_SCRIPT, COMMITS_SCRIPT, PUSH_SCRIPT, SONAR_SCRIPT, CRTRIGGER_SCRIPT, GTRIGGER_SCRIPT, HARVEST_SCRIPT, BUILD_SCRIPT, SCOPE_SCRIPT, COLLECT_SCRIPT, STATE_SCRIPT, FACTS_SCRIPT]
+const NEEDED = [REPLY_SCRIPT, HOOKS_SCRIPT, COMMITS_SCRIPT, PUSH_SCRIPT, SONAR_SCRIPT, CRTRIGGER_SCRIPT, GTRIGGER_SCRIPT, HARVEST_SCRIPT, BUILD_SCRIPT, SCOPE_SCRIPT, COLLECT_SCRIPT, CIRECOVER_SCRIPT, STATE_SCRIPT, FACTS_SCRIPT]
 function shq (s) { return `'${String(s).replace(/'/g, `'\\''`)}'` }
 // The workflow's own check of a script's line against its schema: a member its schema allows null may be left out (a
 // script drops a null one) and reads null; an error line's other required members read empty.
@@ -896,7 +941,7 @@ const noteLimit = (limit, from = '') => {
 // A line off its schema, of another collect.py contract or failing its seal is no answer; an error line carries no seal.
 // The Bash-only relay type carries no skill index; fileTool keeps the default subagent for a prompt that writes with a file tool.
 const relayAgent = async (prompt, { fileTool, contract, schema, ...opts }) => {
-  const { line, why, dead } = await emitted(prompt, { ...(fileTool ? {} : { agentType: 'relay' }), ...opts })
+  const { line, why, dead, stage } = await emitted(prompt, { ...(fileTool ? {} : { agentType: 'relay' }), ...opts })
   if (dead) return null
   // Before the seal and the shape, which a line of another contract never meets (#293).
   if (line && !line.error && contract !== undefined && line.contract !== contract) {
@@ -916,10 +961,13 @@ const relayAgent = async (prompt, { fileTool, contract, schema, ...opts }) => {
     return null
   }
   if (v.rateLimit) noteLimit({ error: v.error, ...v.rateLimit }, opts.label)
-  // No line of the script's: its error is the transport's, which a caller tells from one the script printed.
-  return line ? v : { ...v, transport: true }
+  // No line of the script's: its error is the transport's, which a caller tells from one the script printed, or the
+  // stage's that refused its input, when the script never ran.
+  return line ? v : stage ? { ...v, staging: true } : { ...v, transport: true }
 }
 const quiet = (label) => (e) => { log(`${label} errored — ${e && e.message}`); return null }
+// A relay line's error: the script's under its name, or that of a stage that refused its input, which names itself.
+const scriptError = (script, out) => out.staging ? out.error : `${script}: ${out.error}`
 const relayRun = (prompt, opts) => relayAgent(prompt, opts).catch(quiet(opts.label))
 // A read-only relay that brought no line back gets one fresh attempt, its own file; a recovery is logged: a lone
 // failure line reads as an open one (#50). A writer's relay gets none: reply and sonar rely on a later ask replaying
@@ -1119,8 +1167,15 @@ const stateOut = () => {
   let out = sized(entries)
   if (out.size > STATE_MAX && entries.length && sized([]).size <= STATE_MAX) {
     const bytes = out.size
-    let dropped = 0
-    while (out.size > STATE_MAX) out = sized(entries.slice(++dropped))
+    // The fewest oldest dropped that fit: the size falls as more go, and dropping all of them fits.
+    let lo = 1, hi = entries.length
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1
+      if (sized(entries.slice(mid)).size <= STATE_MAX) hi = mid
+      else lo = mid + 1
+    }
+    const dropped = lo
+    out = sized(entries.slice(dropped))
     log(`state: ${bytes} bytes, over the ${STATE_MAX} a launch loads — the ${dropped} oldest of ${entries.length} CI verdict digest(s) left out, judged again by a later launch`)
   }
   return out
@@ -2042,6 +2097,25 @@ const rearm = () => { waited = true; return null }
 const requiredName = (r) => r.app === -1 ? r.context : `${r.context} (app ${r.app})`
 // The cycle before this one, the state's last included: history holds this cycle's entry already.
 const before = (k) => history.length > 1 ? history[history.length - 2][k] : null
+// A run orphaned in queued with no job keeps CI pending for good (#536): where ci-stuck would stop, ci_recover.py cancels
+// and re-runs a suspected orphan, each step once per run attempt under its own durable record; asked once per head in a
+// launch. Its line, or null under a GitHub rate limit; a recovery is never a CI result.
+const ciRecoveries = new Map()
+const recoverCi = async (cycle, entry) => {
+  if (githubLimit) return null
+  const label = `cirecover#${cycle}`
+  const r = await relayOnce(
+    `${IN_CHECKOUT}Recover PR #${args.pr}'s Actions runs orphaned in queued: ` +
+    runExactly(`${CIRECOVER_SCRIPT} --pr ${args.pr} --repo ${shq(repo)} --head ${expectedHead} --wait-minutes ${ciWait}`,
+      ' Run it in the foreground with a Bash timeout of 600000 ms, the tool\'s maximum: it keeps within it. Change nothing on GitHub yourself.'),
+    { label, phase: 'Triage', model: 'haiku', effort: 'low', schema: CI_RECOVER })
+  const got = !r ? { outcome: 'unknown', detail: 'no answer: the recovery may have acted; its records under the git common dir say', runs: [] }
+    : r.error ? { outcome: 'unknown', detail: r.error, runs: [] } : r
+  entry.ciRecovery = { outcome: got.outcome, detail: got.detail, runs: got.runs }
+  ciRecoveries.set(expectedHead, entry.ciRecovery)
+  log(`cycle ${cycle}: ${label}: ${got.outcome} (${got.detail})`)
+  return entry.ciRecovery
+}
 
 // A digest recorded before CodeRabbit rewrote its comment's end is one of the comment's aliases now (comment_digest.py): the same body.
 const repin = (cycle, findings) => {
@@ -2157,7 +2231,7 @@ const publishReplies = async (label, drafts, how, cycle, digestOf) => {
   const gone = [...expected.keys()].filter(id => retired.has(id))
   const receipt = {
     pass: missing.length === 0,
-    detail: !out ? 'agent died' : out.error ? `reply.py: ${out.error}`
+    detail: !out ? 'agent died' : out.error ? scriptError('reply.py', out)
       : [missing.length ? `unsettled: ${missing.join(', ')}` : gone.length < expected.size ? 'posted and read back' : '',
         gone.length ? `not on the PR, nothing owed: ${gone.join(', ')}` : ''].filter(Boolean).join('; '),
     receipts, replied,
@@ -2399,7 +2473,7 @@ const settleCaller = async (cycle, digestOf, held, ended) => {
     const mine = (out && !out.error ? out.receipts : []).filter(r => r.commentId === s.commentId)
     const r = mine.length === 1 ? mine[0] : null
     if (!r || r.replyId !== s.replyId || r.digest !== s.bodyDigest || r.sent || r.posted || !settles(r)) {
-      refuse(s, r ? r.error || 'reuse not verified' : out && out.error ? `reply.py: ${out.error}` : 'no reuse receipt')
+      refuse(s, r ? r.error || 'reuse not verified' : out && out.error ? scriptError('reply.py', out) : 'no reuse receipt')
       continue
     }
     // A marking our earlier answer still owes keeps that answer (a correction cancelled any it disproved); else the caller's answer owes one when its settlement names how.
@@ -3372,9 +3446,18 @@ const runLanes = async (cycle, entry, lanes) => {
     }
     const now = entry.ciWaited, prev = before('ciWaited')
     if (c.status === 'running' && now && (now.registered > 0 || now.unmet) && prev && ['head', 'registered', 'pending', 'waiting'].every(k => now[k] === prev[k])) {
+      const earlier = ciRecoveries.get(expectedHead)
+      const recovery = earlier ?? await recoverCi(cycle, entry)
+      if (!earlier && ['recovered', 'completed'].includes(recovery?.outcome)) {
+        // The new attempts, or a run that completed after the cancel, move CI: two more whole waits before ci-stuck reads again.
+        delete entry.ciWaited
+        log(`cycle ${cycle}: CI on ${expectedHead.slice(0, 7)}: orphaned run(s) ${recovery.outcome === 'recovered' ? 're-run' : 'completed after the cancel'} — waiting on them`)
+        return rearm()
+      }
       const required = now.unmet ? `; required check(s) not passed: ${now.unmet.join(', ')}` : ''
       log(`cycle ${cycle}: CI on ${expectedHead.slice(0, 7)} still running with the same ${now.pending} pending check(s)${required} after two whole waits — observe them before relaunching`)
-      return stop(cycle, 'ci-stuck', { head: now.head, pending: now.pending, ...(now.unmet ? { unmet: now.unmet } : {}) })
+      return stop(cycle, 'ci-stuck', { head: now.head, pending: now.pending, ...(now.unmet ? { unmet: now.unmet } : {}),
+        ...(recovery ? { ciRecovery: recovery } : {}) })
     }
     if (c.unregistered) {
       log(`cycle ${cycle}: CI on ${expectedHead.slice(0, 7)}: the re-run of ${c.unregistered.join(', ')} has not registered within ${ciWait} minutes — observe it before relaunching`)

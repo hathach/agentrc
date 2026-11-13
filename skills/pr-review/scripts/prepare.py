@@ -87,6 +87,8 @@ from post import reconcile, sync  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'pr-babysit' / 'scripts'))
 from facts import FULL_SHA, HOST, Parser, Unusable, attempt, checkout_repo, checkout_top, git, github_repo, report, run  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
+import gh_retry  # noqa: E402
 
 # Paths that run when a PR is built or tested; their diff is read before any build.
 TOOLING = re.compile(r'(^|/)(CMakeLists\.txt|Makefile|[^/]+\.(cmake|mk|py|sh|ps1|bat))$'
@@ -100,7 +102,8 @@ MAX_GROUPS = 6
 
 
 def gh_json(*argv, ok=(0,)):
-    code, out = run('gh', *argv, ok=ok)
+    # A read failing HTTP 502, 503 or 504 is made again (lib/gh_retry.py); an exit in ok is an answer, never retried.
+    code, out = gh_retry.read(argv, lambda: run('gh', *argv, ok=ok), Unusable)
     try:
         return code, json.loads(out) if out.strip() else None
     except ValueError:

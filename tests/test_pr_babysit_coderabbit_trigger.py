@@ -24,6 +24,8 @@ SKIP = {'context': 'CodeRabbit', 'state': 'success', 'updated_at': '2026-10-12T1
 # #324: hathach/agentrc#323's head, which CodeRabbit skipped through a check run and no status.
 SKIP_RUN = {'id': 12, 'name': 'CodeRabbit', 'status': 'completed', 'conclusion': 'skipped', 'started_at': '2026-10-12T11:41:09Z',
             'completed_at': '2026-10-12T11:41:10Z', 'output': {'title': 'Review skipped', 'summary': 'Result: Skipped - Review skipped'}}
+# #530: hathach/agentrc#529's head, skipped by a check run whose title alone says manual review.
+TITLED_RUN = dict(SKIP_RUN, output={'title': SKIP['description'], 'summary': 'Result: Skipped'})
 NO_AUTO = 'This repository does not receive automatic reviews because it has fewer than 10 stars.'
 
 
@@ -111,6 +113,13 @@ class Trigger(unittest.TestCase):
                 self.assertEqual(out['outcome'], 'notSkipped', out)
                 self.assertEqual(rig.patches, [])
         self.assertIn('check run skipped: Review skipped', self.run_with(cases['another skip'])[1]['detail'])
+
+    def test_a_check_run_titled_manual_review_required_with_no_box_fails_its_tick(self):
+        # #530: no box to tick, so the tick fails and the workflow falls back to its one request.
+        rig = Rig(statuses=(), checks=(TITLED_RUN,), comments=[{'id': 5, 'user': {'login': BOT}, 'body': 'summary'}])
+        out = self.run_with(rig)[1]
+        self.assertEqual((out['outcome'], out['detail']), ('failed', '0 CodeRabbit comments hold one Trigger review box, not 1'))
+        self.assertEqual(rig.patches, [])
 
     def test_failures(self):
         other = {'id': 6, 'user': {'login': 'someone'}, 'body': BOX}
@@ -305,6 +314,21 @@ class Request(unittest.TestCase):
         self.assertEqual(self.run_with(rig := RequestRig(cr=other))[1]['outcome'], 'notLimited', 'another skip is not asked about')
         self.assertEqual(rig.posts, [])
 
+    def test_a_check_run_titled_manual_review_required_is_asked_once_by_comment(self):
+        # #530: the recheck reads the head as harvest.py does, so a title-only skip with no box is asked about.
+        summary = {'id': 6, 'user': {'login': BOT}, 'body': 'summary, no box', 'updated_at': NOW}
+        skip = harvest.coderabbit(HEAD, [], [TITLED_RUN], [summary], '2026-10-12T11:00:00Z')
+        code, out = self.run_with(rig := RequestRig(cr=skip, comments=[summary]))
+        self.assertEqual((code, out['outcome'], out['commentId']), (0, 'requested', 99))
+        self.assertEqual(len(rig.posts), 1)
+        mine = {'id': 51, 'body': '@coderabbitai review', 'created_at': '2026-10-13T09:30:00Z'}
+        code, out = self.run_with(rig := RequestRig(cr=skip, comments=[summary, mine]))
+        self.assertEqual((out['outcome'], out['commentId']), ('already', 51), 'never a second ask on the head')
+        self.assertEqual(rig.posts, [])
+        code, out = self.run_with(rig := RequestRig(cr=skip, comments=[summary, mine], head='b' * 40))
+        self.assertEqual(out['outcome'], 'notLimited', 'a changed head is not asked about here')
+        self.assertEqual(rig.posts, [])
+
     def test_a_failed_review_of_the_head_is_asked_once_by_comment(self):
         # #499: a CodeRabbit check run completed neutral, titled Review failed.
         failed = dict(LIMITED, kind='failed', reason='check run: Review failed', retryAt=None)
@@ -331,7 +355,8 @@ class Request(unittest.TestCase):
                 self.assertNotIn('commentId', out)
                 self.assertIsInstance(out['detail'], str)
 
-    def test_a_read_that_fails_before_the_post_says_nothing_was_posted(self):
+    @mock.patch.object(harvest.gh_retry.time, 'sleep')  # lib/gh_retry.py's waits before a failed read is made again
+    def test_a_read_that_fails_before_the_post_says_nothing_was_posted(self, _sleep):
         # #276: a 503 on the pull read, which comes before the POST.
         rig = RequestRig()
 

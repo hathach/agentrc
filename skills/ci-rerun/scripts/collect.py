@@ -163,8 +163,8 @@ pages in order join into the entry. A link it has none for, or whose entry has a
 failure or a list of starts too large for a line, is left out of both. The caller checks what comes
 back against its own digests.
 
-Every gh read answered HTTP 502, 503 or 504 is made again after 2 and then 5 seconds, the --stop-file checked before
-each attempt, before it fails; nothing it writes is ever repeated.
+Every gh read answered HTTP 502, 503 or 504 is made again after 2 and then 5 seconds (lib/gh_retry.py), the --stop-file
+checked before each attempt, before it fails; nothing it writes is ever repeated.
 
 Under AGENTRC_EMIT the line goes to the file it names instead of stdout, claimed before anything runs
 (exit 3 at once, nothing done, when that file is there): lib/seal.py's emit, which a workflow reads instead
@@ -190,8 +190,9 @@ import circleci  # noqa: E402
 import rtd  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
 import greptile  # noqa: E402
-from check_runs import latest_run, newest  # noqa: E402
+from check_runs import RUN_PENDING, latest_run, newest  # noqa: E402
 import windows  # noqa: E402
+import gh_retry  # noqa: E402
 from seal import emit, fnv1a, rate_limit, sealed, utc  # noqa: E402
 
 POLL = 30
@@ -227,7 +228,6 @@ NO_RUN = 'no reader for this check: its link names no run'
 ANY_APP = -1  # a required check any source may provide
 # GitHub counts these as a passed required check.
 PASSED = ('success', 'neutral', 'skipped')
-RUN_PENDING = ('queued', 'in_progress', 'waiting', 'requested', 'pending')
 RUN_FAILED = ('failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure', 'stale')
 STATUS_BUCKET = {'pending': 'pending', 'success': 'pass', 'failure': 'fail', 'error': 'fail'}
 
@@ -241,29 +241,23 @@ class Failed(Exception):
         self.limit = limit
 
 
-# #424: a 502, 503 or 504 that the same read answered a moment later lost whole pr-babysit cycles; a read meets one again
-# after each of these waits, never a write, whose request may have landed.
-TRANSIENT = re.compile(r'\bHTTP 50[234]\b')
-RETRY_WAITS = (2, 5)
-WRITES = ('-X', '--method', '-f', '-F', '--field', '--raw-field', '--input')
+def stopped():
+    if STOP_FILE and os.path.exists(STOP_FILE):
+        raise Failed(f'stopped before the next GitHub call: {STOP_FILE} exists')
 
 
 def gh(*args, raw=False):
-    read = args[0] != 'api' or not any(a in WRITES for a in args)
-    for wait in (*RETRY_WAITS, None):
-        if STOP_FILE and os.path.exists(STOP_FILE):
-            raise Failed(f'stopped before the next GitHub call: {STOP_FILE} exists')
+    def once():
         try:
             done = subprocess.run(['gh', *args], capture_output=True)
         except OSError as e:
             raise Failed(f'gh: {e}')
-        if done.returncode == 0:
-            break
-        err = done.stderr.decode(errors='replace').strip()
-        limit = rate_limit(err)
-        if wait is None or not read or limit or not TRANSIENT.search(err):
-            raise Failed(f'gh {args[0]} {args[1]}: {err or f"exit {done.returncode}"}', limit)
-        time.sleep(wait)
+        if done.returncode:
+            err = done.stderr.decode(errors='replace').strip()
+            raise Failed(f'gh {args[0]} {args[1]}: {err or f"exit {done.returncode}"}', rate_limit(err))
+        return done
+    # #424: a 502, 503 or 504 the same read answered a moment later lost whole pr-babysit cycles.
+    done = gh_retry.read(args, once, Failed, stop=stopped)
     # A job log is whatever the job printed; anything parsed stays strict.
     if raw:
         return done.stdout.decode(errors='replace')

@@ -7,9 +7,9 @@ when its review of HEAD failed.
 
 A repository below CodeRabbit's open-source threshold gets, on each push, a
 CodeRabbit status "Review skipped: manual review required ...", or a skipped check
-run while its summary comment holds an unticked "Trigger review" box or says the
-repository gets no automatic reviews, read as harvest.py reads them; ticking the
-box starts the review.
+run titled so, or one whose summary comment holds an unticked "Trigger review" box
+or says the repository gets no automatic reviews, read as harvest.py reads them;
+ticking the box starts the review.
 Run from the PR checkout; PR N is --repo's, else the checkout's one repository
 (facts.bind_repo). The outcome:
 

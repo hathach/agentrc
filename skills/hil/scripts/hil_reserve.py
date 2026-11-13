@@ -46,8 +46,9 @@ Any other outcome is a blocker that ends with this run (agentrc#464): the BLOCKE
 the problems, hil_lock.end_failed logs them in every board's cleanup log, which the next task
 on each board reports, and every lock is released. A survivor is named, not waited for; it
 reparents to init once this process exits, and nothing can recheck it, so its logged failure
-stays open. A reservation killed outright leaves its records, which the next task on each
-board logs. Exit 0 released, 1 blocker or refused, 2 usage.
+stays open until an operator acknowledges it (`hil_lock.py resolve`). A reservation killed
+outright leaves its records, which the next task on each board logs. Exit 0 released, 1
+blocker or refused, 2 usage.
 
 Signals: SIGINT/SIGTERM/SIGHUP before the command release the untouched reservation and
 exit 130; during the command SIGINT/SIGTERM are forwarded to its process group, while SIGHUP

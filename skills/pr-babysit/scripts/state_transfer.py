@@ -5,7 +5,10 @@
 
 FILE is a saved Workflow output holding {"result": {"state": ...}}: the line is
 {digest, state, checkout?}, digest the state's own. The state must carry its digest and stay
-within MAX bytes as compact ASCII JSON, the measure pr-babysit's STATE_MAX takes.
+within MAX bytes as compact ASCII JSON, the measure pr-babysit's STATE_MAX takes. MAX keeps the
+emitted data module, the state and a few hundred bytes around it, within the runtime's limit on a
+Workflow script file (524288 bytes in Claude Code 2.1.322) with room to spare; it bounds what a
+launch loads, not how far a state may grow (#539).
 checkout, when the state pins a checkoutDir other than '.', is {dir, same, seal}
 (seal: facts.sealed): same whether git names this directory's worktree top level
 and dir's as one, false when either cannot be read.
@@ -24,7 +27,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from facts import Parser, Unusable, attempt, report, sealed  # noqa: E402
 
-MAX = 64 * 1024
+MAX = 256 * 1024
 
 
 def read(path):

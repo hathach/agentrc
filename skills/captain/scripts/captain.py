@@ -82,6 +82,7 @@ CONFIG_DIRS = {'main': None, 'ada': os.path.expanduser('~/.claude-ada')}   # mai
 DEFAULT_CONFIG = '~/.claude'   # where main, CLAUDE_CONFIG_DIR unset, keeps its transcripts
 HC_TIMEOUT_S = 30
 CLAUDE_APP = 'claude-code'
+BACKGROUND = 'claude.background_tasks'
 RULE = re.compile(r'^─{20,}')  # the top rule may end in a session label: ──── alo68 ─
 BLANK = ' \xa0\t\r'
 CLAUDE_HINTS = re.compile(r'⏵⏵|\? for shortcuts|shift\+tab|esc to interrupt')
@@ -93,6 +94,7 @@ STATE = os.environ.get('AGENTRC_CAPTAIN_DIR') or os.path.expanduser('~/.cache/ag
 LEDGER, ENROLLED = 'ledger-hc.jsonl', 'enrolled-hc.json'   # ledger.jsonl and enrolled.json pinned Herdr panes
 # where the enrolled captain's last collect without ids, and its last `reports --new`, stopped reading
 COLLECTED, TABLED = 'collected-hc.json', 'tabled-hc.json'
+NOTICED = 'noticed-hc.json'   # where each held relay's target was last seen after working, so collect says it once
 TABLING = 'tabled.lock'   # serializes `reports --new` without holding the ledger lock while it prints
 # serializes each observation with its record, so one taken earlier never lands after one taken later; taken before
 # the ledger lock, never while holding it, and gh and git run under it with the ledger free
@@ -167,9 +169,9 @@ def die(msg, code=1):
     raise SystemExit(code)
 
 
-def get(address):
+def get(address, timeout=HC_TIMEOUT_S):
     """`hc get` for one terminal, None when hc knows none by that address."""
-    return hc.get(address, timeout=HC_TIMEOUT_S)
+    return hc.get(address, timeout=timeout)
 
 
 def footer_only(lines):
@@ -240,10 +242,21 @@ def canonical(cwd):
     return os.path.realpath(cwd) if cwd and os.path.isabs(cwd) else None
 
 
+def background(labels):
+    """The count of background tasks Claude Code puts in its terminal's claude.background_tasks label (hc 0.1.19+,
+    a decimal string): None when the label is absent or empty, '?' when it is not a count, never a guessed 0."""
+    raw = labels.get(BACKGROUND)
+    if raw is None or raw == '':
+        return None
+    if type(raw) is int and raw >= 0:
+        return raw
+    return int(raw) if isinstance(raw, str) and raw.isascii() and raw.isdigit() else '?'
+
+
 def described(t):
     """The session fields `hc get` shows for a live local Claude Code terminal, or None for any other. Its cwd and
     pid are its foreground process's: the terminal's own are the shell's it may have started from. said is its status
-    line on one line, blocked_on a blocked one's kind."""
+    line on one line, blocked_on a blocked one's kind, background_tasks what background() reads."""
     status = (t or {}).get('status') or {}
     if not t or t.get('state') != 'live' or status.get('app') != CLAUDE_APP or not hc.is_local(t.get('address')):
         return None
@@ -262,6 +275,7 @@ def described(t):
         'status_ms': t.get('status_ms') or 0,
         'said': one_line(status.get('msg') or ''),
         'blocked_on': status.get('kind') if status.get('state') == 'blocked' else None,
+        'background_tasks': background(labels),
     }
 
 
@@ -293,6 +307,11 @@ def pin(session):
 def unpinned(session):
     """The identity fields a pinned session lacks; a session missing any is never typed into."""
     return [k for k in ('cwd', 'created', 'pid', 'started', 'session', 'account') if not session.get(k)]
+
+
+def contradicts(session, ident):
+    """Whether an identity field both session and ident hold differs: proof of another session, pinned or not."""
+    return any(session.get(k) and ident.get(k) and session[k] != ident[k] for k in IDENTITY)
 
 
 class Corrupt(Exception):
@@ -476,10 +495,10 @@ def identity(session):
     return {k: session.get(k) for k in IDENTITY}
 
 
-def find(address):
+def find(address, timeout=HC_TIMEOUT_S):
     """The pinned session in the local terminal at address, with its handle and status, or None: a name hc would
-    resolve is not an address."""
-    s = described(get(address)) if hc.is_local(address) else None
+    resolve is not an address. timeout bounds its hc call."""
+    s = described(get(address, timeout)) if hc.is_local(address) else None
     return pin(s) if s and s['address'] == address else None
 
 
@@ -714,6 +733,37 @@ def new_turn(entry):
     return entry.get('type') == 'user' and not entry.get('isMeta') and not results
 
 
+# What may follow a watch member's report call in its turn and leave the report current, as Claude Code 2.1 writes
+# transcripts; anything else, a newer kind included, counts as work done after it.
+PROSE = ('text', 'thinking', 'redacted_thinking')
+QUIET_SYSTEM = ('stop_hook_summary', 'turn_duration', 'away_summary')
+QUIET_ATTACHMENTS = ('output_style', 'hook_success', 'hook_system_message', 'silent_turn_reminder',
+                     'total_tokens_reminder', 'deferred_tools_record', 'deferred_tools_delta', 'skill_listing',
+                     'mcp_instructions_delta', 'agent_listing_delta', 'date')
+BOOKKEEPING = ('api-request', 'api-request-blob', 'api-request-shape', 'queue-operation', 'last-prompt', 'ai-title',
+               'custom-title', 'agent-name', 'agent-setting', 'mode', 'permission-mode', 'session-owner', 'atis-latch',
+               'bridge-session', 'pr-link', 'history-suppression', 'file-history-snapshot', 'file-history-delta',
+               'cost-state', 'tools-used')
+
+
+def settled(entry):
+    """Whether a transcript entry after a watch member's report call leaves that report current: completion text or
+    bookkeeping, never a tool call, input injected into the turn, a hook holding the stop, or anything unrecognized."""
+    if not isinstance(entry, dict):
+        return False
+    kind = entry.get('type')
+    if kind == 'assistant':
+        blocks = content(entry)
+        return isinstance(blocks, list) and all(isinstance(b, dict) and b.get('type') in PROSE for b in blocks)
+    if kind == 'system':   # a Stop hook that blocked lists its reason in hookErrors and the turn goes on
+        return entry.get('subtype') in QUIET_SYSTEM and not any(
+            entry.get(k) for k in ('hookErrors', 'hookAdditionalContext', 'preventedContinuation'))
+    if kind == 'attachment':
+        attached = entry.get('attachment')
+        return isinstance(attached, dict) and attached.get('type') in QUIET_ATTACHMENTS
+    return kind in BOOKKEEPING
+
+
 def anchor(entry, ref, member):
     """Whether a transcript entry is what a report's turn starts from: a watch member's own report call returning,
     its output naming the report; a request's prompt as typed."""
@@ -735,8 +785,8 @@ def receipt_of(ref, text):
 
 def unchanged(target, recs):
     """(target's last report, the id `reports` gives it by) when its transcript starts no turn after the request that
-    report answered or, for a watch member's, after the report call, so asking again would only repeat it; None, so
-    the target is asked, whenever that cannot be shown."""
+    report answered or, for a watch member's, holds only completion text and bookkeeping after the report call, so
+    asking again would only repeat it; None, so the target is asked, whenever that cannot be shown."""
     last = last_report(target, recs)
     if not last:
         return None
@@ -759,8 +809,9 @@ def unchanged(target, recs):
     try:
         entries = (json.loads(line) for line in lines)   # lazily: the first new turn ends the walk
         for entry in entries:   # a record of the API request that carried it may quote it first
-            if anchor(entry, ref, member):
-                return None if any(new_turn(e) for e in entries) else (last, ref)
+            if anchor(entry, ref, member):   # a member may keep working in the turn its report call returned in
+                current = settled if member else (lambda e: not new_turn(e))
+                return (last, ref) if all(current(e) for e in entries) else None
             if new_turn(entry):
                 return None   # a summary or tool output quoting the id is not the request
         return None
@@ -1141,6 +1192,89 @@ def resumed(name, recs, watch, default):
     return default if at is None else at
 
 
+BUSY = 'it is working'   # refusal()'s reason for a relay held while its target works
+WAKE_LOOK_S = 3   # the most one held target's `hc get`, or storing what it said, keeps collect from the ledger
+
+
+def held_working(recs, pending, fence):
+    """The pending relays this enrollment (fence) holds because their target was working, by action."""
+    states = relay_states(recs)
+    why = {r['msg']: r['why'] for r in recs if r['type'] == 'held'}
+    return {r['msg']: r for r in recs if r['type'] == 'relay' and r['msg'] in pending and states[r['msg']] == 'held'
+            and why.get(r['msg']) == BUSY and (r.get('captain') or {}).get('generation') == fence}
+
+
+def wake_line(action, relayed, now):
+    """The collect line for a held relay whose target is now in state now: never that it is safe to send, since
+    `relay --retry` checks the session and screen again, and a draft in the input line gets the relay appended."""
+    head = f'left working {action} · {relayed["handle"]} · '
+    if now == 'replaced':
+        return head + f'its session was replaced or ended: `relay --retry {action}` closes it as undelivered'
+    if now in ASKABLE:
+        return (head + f'now {now}: run `relay --retry {action}`, which checks it again and appends to any draft in '
+                'its input line')
+    if now.startswith('blocked'):
+        return head + f'now {now}: the human answers it there, then `relay --retry {action}`'
+    return head + f'now {now}: `relay --retry {action}` keeps it held until it is idle or done'
+
+
+def noticed(fence):
+    """The state each held relay's target was last said to be in, as NOTICED holds it for enrollment fence."""
+    try:
+        with open(path(NOTICED), encoding='utf-8') as f:
+            mark = json.load(f)
+        seen = mark['seen'] if mark['generation'] == fence else {}
+    except (OSError, ValueError, KeyError, TypeError):
+        seen = {}
+    return dict(seen) if isinstance(seen, dict) else {}
+
+
+def wake(recs, pending, fence, deadline):
+    """Print a line for each relay held while its target was working whose target has left working since, each state
+    once per relay across collects (NOTICED). Each `hc get` gets at most WAKE_LOOK_S of what is left before deadline,
+    a failure, or a session whose identity could not be pinned but agrees in every field read, looked at again at the
+    next poll. The line prints before it is stored, so a crash repeats it rather than losing it; the store merges into
+    NOTICED under the ledger lock, fenced by the enrollment. Sends nothing: `relay --retry` stays the human's, with all
+    its checks."""
+    held = held_working(recs, pending, fence)
+    if not held:
+        return
+    seen, changes = noticed(fence), {}
+    for action, relayed in held.items():
+        left = deadline - time.monotonic()
+        if left < 1:
+            break
+        try:
+            found = find(relayed['target']['address'], timeout=min(WAKE_LOOK_S, left))
+        except hc.Error:
+            continue
+        if found and unpinned(found) and not contradicts(found, relayed['target']):
+            continue
+        state = found['status'] if found and identity(found) == relayed['target'] else 'replaced'
+        if state == 'working':
+            if action in seen:
+                changes[action] = None   # leaving it again is news again
+        elif seen.get(action) != state and fence == generation():
+            changes[action] = state
+            kind = found['blocked_on'] if state == 'blocked' else None
+            print(wake_line(action, relayed, state + (f' ({kind})' if kind else '')), flush=True)
+    if not changes:
+        return
+    states = relay_states(recs)
+    with suppress(Busy), locked(max(0, min(WAKE_LOOK_S, deadline - time.monotonic()))):
+        if fence != generation():
+            return
+        stored_seen = noticed(fence)
+        merged = {a: v for a, v in stored_seen.items() if states.get(a, 'held') == 'held'}   # a relay newer than recs
+        for action, state in changes.items():
+            if state:
+                merged[action] = state
+            else:
+                merged.pop(action, None)
+        if merged != stored_seen:
+            write_json(NOTICED, {'generation': fence, 'seen': merged})
+
+
 def collect(msgs, wait_ms):
     """Print each followed item's events as they land: a request's or relay's report or outcome, cancellation or
     refusal; a watch's members joining and every report they send, and its end. Exit 0, printing `done`, once none
@@ -1151,7 +1285,8 @@ def collect(msgs, wait_ms):
     the events of requests and relays opened while no watch was open: those were collected by id. What is closed is
     judged on the whole ledger. A strict read under the lock first: a torn ledger must not look like nothing to wait
     for. Every lock wait ends with wait_ms, so the pending line still prints before
-    the caller's timeout. A collect belongs to the captain enrolled when it began: once another enrolls, it prints its
+    the caller's timeout. A relay held while its target worked gets a `left working` line once that target leaves
+    working (wake()). A collect belongs to the captain enrolled when it began: once another enrolls, it prints its
     pending line and stores nothing."""
     deadline = time.monotonic() + wait_ms / 1000
     try:
@@ -1198,6 +1333,7 @@ def collect(msgs, wait_ms):
         if lapsed:
             print(f'pending: {" ".join(sorted(pending))}', flush=True)
             return NO_ANSWER
+        wake(recs, pending, fence, deadline)
         time.sleep(POLL_S)
         recs = records(lenient=True)
 
@@ -2933,6 +3069,7 @@ def main():
                 note = f'  (unpinned: {", ".join(missing)})' if missing else ''
                 at = time.strftime('%H:%M', time.localtime(s['status_ms'] / 1000)) if s['status_ms'] else '?'
                 state = s['status'] + (f' ({s["blocked_on"]})' if s['blocked_on'] else '')
+                state += f', background tasks: {s["background_tasks"]}' if s['background_tasks'] not in (None, 0) else ''
                 said = f'\t"{s["said"]}"' if s['said'] else ''
                 print(f'{s["handle"]}\t{s["kind"]}/{who}\t{state}\t{at}\t{s["cwd"] or "?"}{note}{said}')
             return 0

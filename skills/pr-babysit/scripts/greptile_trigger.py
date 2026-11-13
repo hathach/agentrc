@@ -31,8 +31,8 @@ claim without a receipt only looks for the comment that claim made. The outcome:
 
 A failed line adds phase: `read` when a GitHub read failed before this run
 claimed the head, so nothing was posted and a rerun may ask; the outcomes
-above add none. Such a read answered HTTP 502, 503 or 504 is read once more
-after a short pause first; a rate limit, or any other failure, is not.
+above add none. Such a read answered HTTP 502, 503 or 504 is made again after
+lib/gh_retry.py's waits first; a rate limit, or any other failure, is not.
 
 detail names the comment ("comment N") on requested and already; at is that
 comment's time on those, else the UTC time the script finished. commentId is the
@@ -49,36 +49,22 @@ reliably, so a duplicate is preferred to a missed review.
 """
 
 import json
-import os
-import re
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from coderabbit_trigger import Failed, pull_at  # noqa: E402
-from facts import FULL_SHA, Parser, RateLimited, Unusable, attempt, bind_repo, git, locked, report, utc  # noqa: E402
+from facts import FULL_SHA, Parser, Unusable, attempt, bind_repo, locked, read_record, record_dir, report, utc, write_record  # noqa: E402
 from harvest import gh_json, head_event, newest, pages, stamp  # noqa: E402
-sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
-import windows  # noqa: E402
 
 REQUEST = '@greptileai'
-TRANSIENT = re.compile(r'\bHTTP 50[234]\b')  # a gateway's answer, not GitHub's verdict on the request
-RETRY_S = 2  # seconds before a transient read is made again
-
-
-def record_dir():
-    common = Path(git('rev-parse', '--path-format=absolute', '--git-common-dir').strip())
-    return common / 'pr-babysit' / 'greptile'
 
 
 def read(path):
-    try:
-        record = json.loads(path.read_text(encoding='utf-8'))
-    except FileNotFoundError:
+    record = read_record(path)
+    if record is None:
         return None
-    except (OSError, ValueError) as e:
-        raise Unusable(f'attempt record {path} unreadable: {e}')
     if not isinstance(record, dict) or not isinstance(record.get('seen'), list) or not isinstance(record.get('claimedAt'), str):
         raise Unusable(f'attempt record {path} is not one this script wrote')
     return record
@@ -87,18 +73,14 @@ def read(path):
 def claim(path, seen):
     record = {'claimedAt': utc(time.time()), 'seen': seen}
     try:
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        write_record(path, record, new=True)
     except FileExistsError:
         raise Unusable(f'attempt record {path} appeared under the lock: another writer ignores it')
-    with os.fdopen(fd, 'w', encoding='utf-8') as f:
-        json.dump(record, f)
     return record
 
 
 def receipt(path, record, comment, at):
-    tmp = path.with_name(path.name + '.tmp')
-    tmp.write_text(json.dumps({**record, 'receipt': {'id': comment, 'at': at}}), encoding='utf-8')
-    windows.replace(tmp, path)  # Windows: retried while another process has the record open
+    write_record(path, {**record, 'receipt': {'id': comment, 'at': at}})
 
 
 def asks(pr):
@@ -128,16 +110,13 @@ def request(pr, head):
         return {'outcome': 'failed', 'detail': str(e), 'phase': e.phase}
 
 
-def before_claim(step, *args, again=True):
-    """step(*args), a GitHub read made before this run claims the head, so its failure posted nothing; one answered
-    by a gateway is made once more when again."""
+def before_claim(step, *args):
+    """step(*args), a GitHub read made before this run claims the head, so its failure posted nothing; harvest.py's
+    gh_json has made a read a gateway failed again already."""
     try:
         return step(*args)
     except Unusable as e:
-        if not again or isinstance(e, RateLimited) or not TRANSIENT.search(str(e)):
-            raise Failed(str(e), 'read') from None
-    time.sleep(RETRY_S)
-    return before_claim(step, *args, again=False)
+        raise Failed(str(e), 'read') from None
 
 
 def claimed(pr, head):
@@ -145,7 +124,7 @@ def claimed(pr, head):
     if why:
         return {'outcome': 'notOpen', 'detail': why}
     repo = pull['base']['repo']['full_name']
-    path = record_dir() / f"{repo.replace('/', '-')}-{pr}-{head}.json"
+    path = record_dir('greptile') / f"{repo.replace('/', '-')}-{pr}-{head}.json"
     with locked(path):
         record = read(path)
         if record and record.get('receipt'):
@@ -156,8 +135,7 @@ def claimed(pr, head):
         standing = before_claim(asks, pr)
         view = {'headRefName': pull['head']['ref'], 'headRepository': {'nameWithOwner': pull['head']['repo']['full_name']}}
         # Only a standing request needs the head's time; a workflow file that would date it and cannot be read is an error line.
-        # head_event reads the workflow that would date the head again itself
-        event_at, evidence = before_claim(head_event, repo, pr, view, head, again=False) if standing else (None, '')
+        event_at, evidence = before_claim(head_event, repo, pr, view, head) if standing else (None, '')
         if standing and event_at is None:
             return {'outcome': 'failed', 'detail': f"the head event time is unknown ({evidence}), so comment {standing[-1]['id']} "
                                                    'cannot be placed before or after it: nothing posted'}

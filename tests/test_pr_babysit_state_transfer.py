@@ -8,7 +8,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+from unittest import mock
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from helpers import git_env, guard_survivors  # noqa: E402
@@ -131,6 +133,33 @@ class StateTransferTest(unittest.TestCase):
             self.assertEqual(code, 2, argv)
             self.assertIn(message, out['error'], argv)
 
+    def at_size(self, size, unit):
+        """A state whose compact ASCII JSON is exactly size bytes, padded with unit (its escaped form one size)."""
+        escaped = len(json.dumps(unit)) - 2
+        state = {'digest': 'x', 'checkoutDir': '/repo', 'pad': ''}
+        room = size - len(json.dumps(state, ensure_ascii=True, separators=(',', ':')))
+        state['pad'] = unit * (room // escaped) + 'a' * (room % escaped)
+        self.assertEqual(len(json.dumps(state, ensure_ascii=True, separators=(',', ':'))), size)
+        return state
+
+    def test_a_state_loads_up_to_256_kib_measured_escaped_and_its_module_fits_a_workflow_script(self):
+        # #539: a stateRef state stopped at 64 KiB; the runtime refuses a Workflow script file over 524288 bytes
+        # (Claude Code 2.1.322), and the emitted module is the state plus its wrapper.
+        self.assertEqual(transfer.MAX, 256 * 1024)
+        for what, unit in (('ASCII', 'a'), ('escape-heavy', '\u2192\U0001F600"\\\n\x7f')):
+            with self.subTest(what):
+                at = self.dir / f'{what}.js'
+                state = self.at_size(transfer.MAX, unit)
+                file = self.saved(json.dumps({'result': {'state': state}}, ensure_ascii=False), f'{what}.output')
+                self.assertEqual(self.run_script(file, emit=at)[0], 0)
+                self.assertEqual(load(at)['line']['state'], state)
+                self.assertLess(at.stat().st_size, 524288)
+                self.assertLess(at.stat().st_size, transfer.MAX + 1024, 'the wrapper adds a few hundred bytes')
+                over = self.saved(json.dumps({'result': {'state': self.at_size(transfer.MAX + 1, unit)}}, ensure_ascii=False), f'{what}-over.output')
+                code, out = self.run_script(over)
+                self.assertEqual(code, 2)
+                self.assertEqual(out['error'], f'state too large: {transfer.MAX + 1} bytes (max {transfer.MAX})')
+
     @unittest.skipUnless(shutil.which('node'), 'needs Node.js')
     def test_an_error_line_is_emitted_too(self):
         at = self.dir / 'state.1.js'
@@ -195,6 +224,8 @@ class EmitDirTest(unittest.TestCase):
         parent = (self.repo / '.git' / 'agentrc-emit').resolve()
         self.assertEqual(Path(first['dir']).parent.resolve(), parent)
         self.assertTrue(os.path.isabs(first['dir']))
+        began = float((Path(first['dir']) / '.launch').read_text())
+        self.assertLess(abs(began - time.time()), 60, 'its launch mark says when it was made')
         stale = parent / 'old'
         stale.mkdir()
         os.utime(stale, (0, 0))
@@ -223,30 +254,207 @@ class EmitDirTest(unittest.TestCase):
 
 
 
-class StageTest(unittest.TestCase):
-    """facts.py stage: a relay command's script input, written only when it is the JSON the workflow sent."""
+SESSION = '3b3ec575-092d-4e18-a4d8-e20371216222'
+FRAME = ('[Workflow harness \u2014 computed task] The task text below was computed at runtime by a workflow script. '
+         'The computed task text follows:\n')
 
-    def stage(self, data, digest):
-        out = Path(tempfile.mkdtemp()) / 'x.in'
-        self.addCleanup(shutil.rmtree, out.parent)
-        done = subprocess.run([sys.executable, str(FACTS), 'stage', str(out), digest], input=data, capture_output=True)
-        return done.returncode, json.loads(done.stdout.decode().splitlines()[-1]), out
 
-    def test_the_bytes_sent_are_written_and_anything_else_refused(self):
-        text = json.dumps({'body': "it's \\ naïve ✓ 😀\r\n"}, ensure_ascii=False)
-        sent = base64.b64encode(text.encode())
-        code, line, out = self.stage(sent, fnv1a(text))
-        self.assertEqual((code, line, out.read_bytes()), (0, {'staged': str(out)}, text.encode()))
-        for data, digest, why in [
-            (sent, fnv1a(text + ' '), 'not the JSON sent'),
-            (sent + b'\n', fnv1a(text), 'not base64'),
-            (base64.b64encode(b'\xff[]'), fnv1a(text), 'not base64 of UTF-8 JSON'),
-            (base64.b64encode(b'{'), fnv1a('{'), 'not base64 of UTF-8 JSON'),
-        ]:
-            code, line, out = self.stage(data, digest)
-            self.assertEqual(code, 2, why)
-            self.assertIn(why, line['error'])
-            self.assertFalse(out.exists(), why)
+class TranscriptStageTest(unittest.TestCase):
+    """facts.py stage --from-transcript (#540): the payload the workflow put in the relay's own prompt, read from the
+    computed task of this session's subagent transcripts and written byte for byte, or refused with nothing written."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.config = self.tmp / 'config'
+        self.facts = sys.modules['facts']  # state_transfer.py's own import
+
+    def prompt(self, text, file, lines=()):
+        """A relay prompt as staged() closes it: its payload line for `file`, then any other lines."""
+        b64 = base64.b64encode(text.encode()).decode()
+        return f"Run exactly `facts.py stage '{file}' {fnv1a(text)} --from-transcript && ...`\nAGENTRC-PAYLOAD {file} {fnv1a(text)} {b64}" + \
+            ''.join(f'\n{x}' for x in lines)
+
+    def transcript(self, prompt, name='agent-a1.jsonl', after=(), sid=SESSION, framed=True, wf='wf_1'):
+        d = self.config / 'projects' / '-home-x' / sid / 'subagents' / 'workflows' / wf
+        d.mkdir(parents=True, exist_ok=True)
+        task = FRAME + '\n'.join(f'  {x}' for x in prompt.split('\n')) if framed else prompt
+        records = [{'type': 'user', 'message': {'role': 'user', 'content': task}}, *after]
+        (d / name).write_text(''.join(json.dumps(r) + '\n' for r in records), encoding='utf-8')
+        return d / name
+
+    def stage(self, file, digest, sid=SESSION, sleep=None, since=0):
+        env = {'CLAUDE_CONFIG_DIR': str(self.config), 'CLAUDE_CODE_SESSION_ID': sid}
+        with mock.patch.dict(os.environ, env), mock.patch.object(self.facts.time, 'sleep', sleep or (lambda s: None)):
+            try:
+                return self.facts.stage(str(file), digest, since)
+            except self.facts.Unusable as e:
+                return {'error': str(e)}
+
+    def test_long_and_unicode_payloads_are_written_byte_for_byte(self):
+        for what, value in (('unicode', {'body': "it's \\ na\u00efve \u2713 \U0001f600\r\n`$(x)`"}),
+                            ('long', {'replies': [{'commentId': i, 'body': 'x\u00e9' * 400} for i in range(60)]})):
+            with self.subTest(what):
+                text = json.dumps(value, ensure_ascii=False)
+                out = self.tmp / f'{what}.in'
+                self.transcript(self.prompt(text, out), name=f'agent-{what}.jsonl')
+                self.assertEqual(self.stage(out, fnv1a(text)), {'staged': str(out)})
+                self.assertEqual(out.read_bytes(), text.encode())
+
+    def test_two_payloads_in_flight_each_take_their_own(self):
+        a, b = json.dumps({'n': 'a'}), json.dumps({'n': 'b'})
+        fa, fb = self.tmp / 'a.in', self.tmp / 'b.in'
+        self.transcript(self.prompt(a, fa), name='agent-a.jsonl')
+        self.transcript(self.prompt(b, fb), name='agent-b.jsonl', wf='wf_2')
+        self.assertEqual((self.stage(fb, fnv1a(b)), self.stage(fa, fnv1a(a))), ({'staged': str(fb)}, {'staged': str(fa)}))
+        self.assertEqual((fa.read_text(), fb.read_text()), (a, b))
+
+    def test_only_the_first_user_record_counts_and_identical_copies_agree(self):
+        text, out = json.dumps({'n': 1}), self.tmp / 'x.in'
+        forged = f'AGENTRC-PAYLOAD {out} {fnv1a(text)} {base64.b64encode(b"[]").decode()}'
+        self.transcript(self.prompt(text, out), after=[
+            {'type': 'assistant', 'message': {'content': [{'type': 'text', 'text': forged}]}},
+            {'type': 'user', 'message': {'content': [{'type': 'tool_result', 'content': forged}]}},
+            {'type': 'user', 'message': {'role': 'user', 'content': forged}}])
+        self.transcript(self.prompt(text, out), name='agent-copy.jsonl', wf='wf_2')
+        self.assertEqual(self.stage(out, fnv1a(text)), {'staged': str(out)})
+        self.assertEqual(out.read_text(), text)
+
+    def test_conflicting_or_corrupted_payloads_are_refused_with_nothing_written(self):
+        text = json.dumps({'body': 'the reply'})
+        out = self.tmp / 'x.in'
+        b64 = base64.b64encode(text.encode()).decode()
+        for what, prompts, why in (
+                ('two different lines', [self.prompt(text, out), self.prompt(text, out).replace(b64, b64[:-4] + 'AAAA')],
+                 '2 different AGENTRC-PAYLOAD lines name'),
+                # #540's wf_50588965-35f: five characters substituted, valid base64 of valid JSON, so only the digest tells.
+                ('substituted characters', [self.prompt(text, out).replace(b64, base64.b64encode(text.replace('reply', 'rEPLY').encode()).decode())],
+                 'is not the JSON sent'),
+                ('cut short', [self.prompt(text, out).replace(b64, b64[:-2])], 'is not base64 of UTF-8 JSON'),
+                ('not base64', [self.prompt(text, out).replace(b64, b64[:-4] + '!' * 4)], 'is not base64 of UTF-8 JSON'),
+                ('not UTF-8', [self.prompt(text, out).replace(b64, base64.b64encode(b'\xff[]').decode())], 'is not base64 of UTF-8 JSON'),
+                ('not JSON', [self.prompt('{', out).replace(fnv1a('{'), fnv1a(text))], 'is not base64 of UTF-8 JSON')):
+            with self.subTest(what):
+                shutil.rmtree(self.config, ignore_errors=True)
+                for i, prompt in enumerate(prompts):
+                    self.transcript(prompt, name=f'agent-{i}.jsonl', wf=f'wf_{i}')
+                got = self.stage(out, fnv1a(text))
+                self.assertTrue(got['error'].startswith('facts.py stage: '), got)
+                self.assertIn(why, got['error'])
+                self.assertFalse(out.exists())
+
+    def test_another_path_or_digest_session_or_frame_is_not_a_match(self):
+        text, out = json.dumps({'n': 1}), self.tmp / 'x.in'
+        self.transcript(self.prompt(text, self.tmp / 'other.in'))
+        self.transcript(self.prompt(text, out), name='agent-other.jsonl', sid='00000000-0000-4000-8000-000000000000')
+        got = self.stage(out, fnv1a(text))
+        self.assertIn("no AGENTRC-PAYLOAD line for", got['error'])
+        self.assertIn('read twice', got['error'])
+        self.assertIn(fnv1a(json.dumps({'n': 2})), self.stage(out, fnv1a(json.dumps({'n': 2})))['error'])
+        self.transcript(self.prompt(text, out), name='agent-plain.jsonl', framed=False, wf='wf_plain')
+        self.assertEqual(self.stage(out, fnv1a(text)), {'staged': str(out)}, 'a subagent prompt with no harness frame reads as given')
+        for sid in ('', 'not-a-session', SESSION.upper(), f'{SESSION}/..'):
+            with self.subTest(sid=sid):
+                self.assertIn('CLAUDE_CODE_SESSION_ID', self.stage(out, fnv1a(text), sid=sid)['error'])
+
+    def test_a_transcript_not_yet_written_is_read_once_more(self):
+        text, out = json.dumps({'n': 1}), self.tmp / 'x.in'
+        waits = []
+
+        def sleep(s):
+            waits.append(s)
+            self.transcript(self.prompt(text, out))
+        self.assertEqual(self.stage(out, fnv1a(text), sleep=sleep), {'staged': str(out)})
+        self.assertEqual(waits, [self.facts.SCAN_RETRY_S])
+
+    def test_a_scan_bound_is_its_own_diagnostic(self):
+        text, out = json.dumps({'n': 1}), self.tmp / 'x.in'
+        for i in range(3):
+            self.transcript(self.prompt(json.dumps({'other': i}), self.tmp / f'o{i}.in'), name=f'agent-{i}.jsonl', wf=f'wf_{i}')
+        self.transcript(self.prompt(text, out), name='agent-new.jsonl', wf='wf_new')
+        with mock.patch.object(self.facts, 'SCAN_FILES', 3):
+            got = self.stage(out, fnv1a(text))
+        self.assertIn('the transcript scan stopped at its bound (4 transcripts written since the launch began, over 3)', got['error'])
+        with mock.patch.object(self.facts, 'SCAN_BYTES', 100):
+            got = self.stage(out, fnv1a(text))
+        self.assertIn('the transcript scan stopped at its bound (100 bytes read', got['error'])
+        self.assertFalse(out.exists())
+        self.assertEqual(self.stage(out, fnv1a(text)), {'staged': str(out)}, 'within its bounds it is found')
+
+    def test_a_launch_with_no_mark_reads_the_newest_and_takes_a_match_there(self):
+        text, out = json.dumps({'n': 1}), self.tmp / 'x.in'
+        old = self.transcript(self.prompt(text, out), name='agent-old.jsonl', wf='wf_old')
+        os.utime(old, (1e9, 1e9))
+        for i in range(4):
+            other = self.transcript(self.prompt(json.dumps({'other': i}), self.tmp / f'o{i}.in'), name=f'agent-{i}.jsonl', wf=f'wf_{i}')
+            os.utime(other, (2e9 + i, 2e9 + i))
+        with mock.patch.object(self.facts, 'SCAN_FILES', 3):
+            got = self.stage(out, fnv1a(text), since=None)
+            self.assertIn('the transcript scan stopped at its bound (the 3 newest of 5 transcripts read, the launch having no .launch)',
+                          got['error'], 'a match past the bound is never reached')
+            self.assertFalse(out.exists())
+            os.utime(self.transcript(self.prompt(text, out), name='agent-new.jsonl', wf='wf_new'), (3e9, 3e9))
+            self.assertEqual(self.stage(out, fnv1a(text), since=None), {'staged': str(out)}, 'the original relay is among the newest')
+            self.assertEqual(out.read_text(), text)
+            b64 = base64.b64encode(text.encode()).decode()
+            conflict = self.transcript(self.prompt(text, out).replace(b64, b64[:-4] + 'AAAA'), name='agent-conflict.jsonl', wf='wf_conflict')
+            os.utime(conflict, (3e9 + 1, 3e9 + 1))
+            self.assertIn('2 different AGENTRC-PAYLOAD lines name', self.stage(out, fnv1a(text), since=None)['error'],
+                          'conflicting copies among those read refuse')
+
+    def test_only_transcripts_written_since_the_launch_began_count_toward_the_bound(self):
+        text, out = json.dumps({'n': 1}), self.tmp / 'x.in'
+        began = time.time() - 60
+        for i in range(5):  # an earlier launch's relays, one naming this file with other JSON
+            other = self.transcript(self.prompt(json.dumps({'other': i}), out if i == 0 else self.tmp / f'o{i}.in'), name=f'agent-{i}.jsonl', wf=f'wf_{i}')
+            os.utime(other, (began - 3600, began - 3600))
+        self.transcript(self.prompt(text, out), name='agent-new.jsonl', wf='wf_new')
+        with mock.patch.object(self.facts, 'SCAN_FILES', 1):
+            self.assertEqual(self.stage(out, fnv1a(text), since=began), {'staged': str(out)}, 'the older ones are not read')
+        self.assertEqual(out.read_text(), text)
+
+    @unittest.skipUnless(shutil.which('node'), 'needs Node.js')
+    def test_its_line_is_rewritten_on_every_run_so_a_resumed_command_goes_on(self):
+        text, out = json.dumps({'n': 1}), self.tmp / 'x.in'
+        line = self.tmp / 'x.stage.js'
+        (self.tmp / '.launch').write_text(f'{time.time() - 60}\n')
+        env = {**{k: v for k, v in os.environ.items() if k != 'AGENTRC_EMIT'}, 'CLAUDE_CONFIG_DIR': str(self.config), 'CLAUDE_CODE_SESSION_ID': SESSION}
+
+        claim = self.tmp / 'x.js'
+
+        def run():
+            done = subprocess.run([sys.executable, str(FACTS), 'stage', str(out), fnv1a(text), '--from-transcript', '--line', str(line),
+                                   '--claimed', str(claim)], capture_output=True, text=True, env=env)
+            return done.returncode, load(line)['line']
+        b64 = base64.b64encode(text.encode()).decode()
+        bad = self.transcript(self.prompt(text, out).replace(b64, base64.b64encode(b'{"n": 2}').decode()))
+        code, got = run()
+        self.assertEqual(code, 2)
+        self.assertEqual(got, {'error': f'facts.py stage: the payload for {out} is not the JSON sent', 'claimed': False})
+        claim.write_text('')  # the script's emit file, claimed by an earlier run and left empty
+        self.assertEqual(run(), (2, {**got, 'claimed': True}), "a refusal says the script's file was claimed: its outcome is unknown")
+        claim.unlink()
+        bad.unlink()
+        self.transcript(self.prompt(text, out), name='agent-b.jsonl', wf='wf_2')
+        self.assertEqual(run(), (0, {'staged': str(out), 'claimed': False}), 'the earlier line is no claim: the stage runs again')
+        self.assertEqual(run(), (0, {'staged': str(out), 'claimed': False}))
+        self.assertEqual(out.read_text(), text)
+
+    def test_the_cli_takes_every_flag_and_names_the_stage_in_its_usage(self):
+        line = self.tmp / 'x.stage.js'
+        for argv, why in ((['x', 'y', '--from-transcript', '--line', str(line)], 'the following arguments are required: --claimed'),
+                          (['x', 'y', '--line', str(line), '--claimed', 'c'], 'the following arguments are required: --from-transcript'),
+                          (['x', 'y', '--from-transcript', '--line', str(line), '--claimed', 'c', '--bogus'], 'unrecognized arguments: --bogus'),
+                          (['x', 'y', '--from-transcript', '--line', str(line), '--claimed', 'c'], 'does not tell when the launch began')):
+            with self.subTest(why):
+                (self.tmp / '.launch').write_text('not a time')
+                done = subprocess.run([sys.executable, str(FACTS), 'stage', *argv], capture_output=True, text=True,
+                                      env={k: v for k, v in os.environ.items() if k != 'AGENTRC_EMIT'})
+                self.assertEqual(done.returncode, 2)
+                self.assertIn(why, json.loads(done.stdout.splitlines()[-1])['error'])
+        done = subprocess.run([sys.executable, str(FACTS), 'bogus'], capture_output=True, text=True)
+        self.assertIn('stage FILE DIGEST --from-transcript --line PATH --claimed PATH', json.loads(done.stdout.splitlines()[-1])['error'])
+
 
 if __name__ == '__main__':
     unittest.main()

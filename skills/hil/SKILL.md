@@ -60,7 +60,9 @@ nothing in it through a link.
   outcome: no hold outlives its task for recovery, and no manual unlock step
   follows a failed cleanup. A detached manual hold (`hil_lock.py hold`, a
   project's manual session) is the exception: it lasts until its holder
-  releases it, and a failed cleanup under it is logged all the same. The
+  releases it, and a failed cleanup under it is logged all the same. Its
+  holder, like a remote attempt's supervisor, starts without the hc terminal's
+  `HC_SCOPE`, so that terminal's cleanup does not end it. The
   flock is the only refusal to take the lock; admission to the hardware is
   the busy check's (below). A free flock is
   always taken; what a task that ended without its cleanup left there (a
@@ -76,11 +78,24 @@ nothing in it through a link.
   `ended-failed` or `found-left`; the task's record, `detail`, the `receipts`
   of children not proven ended and the provider sessions it `retained`) and
   `restored`, naming the failure a later task restored the board after. A
-  failure stays open until a `restored` event names it, whatever failed after
-  it (`open_cleanup_failures`). `hil_lock.py status` shows the latest open one
-  and how many earlier ones are; a taker's handle carries them
-  (`cleanup_failures`) for its report before any hardware access, and its run
-  reports them beside its result (`failure_report`, `failure_text`).
+  failure stays open until a `restored` event names it, or an operator's
+  `acknowledged` one, whatever failed after it (`open_cleanup_failures`).
+  `hil_lock.py resolve <lock> <failure-id> --reason TEXT` logs that
+  acknowledgement, never evidence of a restoration, for a failure whose
+  evidence cannot be rechecked: it refuses while a receipt rechecks pending
+  (as the caller: run it as the user whose runs they are), a survivor it names,
+  a retained session or a holder its takeover journal kept still lives, and
+  while that journal cannot be read whole. `hil_lock.py compact <lock>...`, as
+  root or the log's owner in its group, rewrites it without its closed
+  failures and the events that closed them, every other line kept: a closed
+  failure whose `journalDigest` matches a takeover journal still on disk stays,
+  with its closing events, so the next take still finds that journal logged. It
+  refuses a log with a malformed line; nothing compacts it on its own.
+  Helpers older than `acknowledged` keep such a failure open. `hil_lock.py
+  status` shows the latest open one and how many earlier ones are; a taker's
+  handle carries them (`cleanup_failures`) for its report before any hardware
+  access, and its run reports them beside its result (`failure_report`,
+  `failure_text`).
 - A taker that restores the board takes with `protected=True`, which marks its
   record `cleanupOwed` and declares its whole group, `locks=` every board it
   takes (default the board alone), on the board's first record. It ends with
@@ -236,7 +251,13 @@ with its `vid_pid` (`vvvv:pppp`), its `serial` as the host reads it (omitted whe
 read), and what a test may use (`is_cdc`, `is_msc` with `block_size`, `block_count` and
 `msc_inquiry`). A project roster names the board by `"probe": "<serial>"`, matched exactly,
 and keeps its own `uid` (the serial its firmware reports, which differs per firmware),
-name, tests and project fields, never the registry's.
+name, tests and project fields, never the registry's. A `flasher_recover` arms in-run
+wedge recovery, so it joins only after a reset through it, and a reflash where openocd
+can flash the part, worked on the board's rig; its `note` records that as
+`<reset and reflash|reset only>, demonstrated on <rig> <YYYY-MM-DD> (<owner/repo>#<N>)`,
+the PR or issue holding the evidence (`<from>..<to>` where it dates its runs only as a set).
+`tests/test_hil_boards.py` refuses an entry without one, except nrf52840dk, which predates the
+rule with no recorded demonstration and stays note-less until a rig run records it (#534).
 
 `scripts/hil_boards.py` is the one reader, and its docstring states what it refuses:
 every consumer that needs a board's flasher resolves the roster entry through it

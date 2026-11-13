@@ -75,7 +75,7 @@ def terminal(address, app='claude-code', **extra):
 class SessionsTest(unittest.TestCase):
     def sessions(self, gets, ls=None, me='t1'):
         ls = ls or [{'address': a, 'agent': (t.get('status') or {}).get('app') or 'bash'} for a, t in gets.items()]
-        with mock.patch.object(captain, 'get', lambda address: gets.get(address)):
+        with mock.patch.object(captain, 'get', lambda address, timeout=None: gets.get(address)):
             return captain.sessions(terminals=ls, me=me)
 
     def test_excludes_self_codex_shells_and_remote_terminals(self):
@@ -122,6 +122,49 @@ class SessionsTest(unittest.TestCase):
         self.assertEqual([(r[2], r[3], r[5:]) for r in rows],
                          [('blocked (permission)', '?', ['"Edit x?"']), ('idle', '?', [])])
 
+    def test_background_tasks_from_the_label_never_a_guessed_zero(self):
+        cases = [(None, None), ('', None), ('0', 0), ('2', 2), (7, 7), ('two', '?'), ('-1', '?'), ('1.5', '?'),
+                 ('²', '?'), (True, '?'), (-3, '?'), (['1'], '?')]
+        for value, want in cases:
+            with self.subTest(value=value):
+                t = terminal('t2')
+                if value is not None:
+                    t['labels'] = {**t['labels'], 'claude.background_tasks': value}
+                self.assertEqual(self.sessions({'t2': t})[0]['background_tasks'], want)
+
+    def test_list_shows_background_tasks_beside_the_status(self):
+        def labelled(address, value, **status):
+            t = terminal(address, status={'app': 'claude-code', **status})
+            if value is not None:
+                t['labels'] = {**t['labels'], 'claude.background_tasks': value}
+            return t
+        found = self.sessions({'t2': labelled('t2', '2', state='done', msg='ok'),
+                               't3': labelled('t3', 'x', state='blocked', kind='permission'),
+                               't4': labelled('t4', '0', state='idle'), 't5': labelled('t5', None, state='idle')},
+                              me='')
+        found = [{**s, 'account': 'main'} for s in found]
+        with mock.patch.object(captain, 'everyone', return_value=found), \
+                mock.patch.object(captain, 'unpinned', return_value=[]), \
+                mock.patch('sys.argv', ['captain.py', 'list']), \
+                mock.patch('builtins.print') as out:
+            captain.main()
+        rows = {r[0].rsplit(' · ', 1)[1]: r[2] for r in (c.args[0].split('\t') for c in out.call_args_list)}
+        self.assertEqual(rows, {'t2': 'done, background tasks: 2', 't3': 'blocked (permission), background tasks: ?',
+                                't4': 'idle', 't5': 'idle'})
+        with mock.patch.object(captain, 'everyone', return_value=found), \
+                mock.patch('sys.argv', ['captain.py', 'list', '--json']), \
+                mock.patch('builtins.print') as out:
+            captain.main()
+        shown = {s['address']: s['background_tasks'] for s in json.loads(out.call_args.args[0])}
+        self.assertEqual(shown, {'t2': 2, 't3': '?', 't4': 0, 't5': None})
+
+    def test_find_bounds_its_hc_call_by_the_timeout_given(self):
+        with mock.patch.object(captain.hc, 'get', return_value=terminal('t2')) as hc_get, \
+                mock.patch.object(captain, 'pin', side_effect=lambda s: s):
+            captain.find('t2')
+            captain.find('t2', timeout=2)
+        self.assertEqual([c.kwargs['timeout'] for c in hc_get.call_args_list], [captain.HC_TIMEOUT_S, 2])
+
     def test_missing_or_relative_cwd_stays_unknown(self):
         for cwd in (None, '', 'rel/dir'):
             with self.subTest(cwd=cwd):
@@ -130,7 +173,7 @@ class SessionsTest(unittest.TestCase):
                 self.assertIsNone(self.sessions({'t2': t})[0]['cwd'])
 
     def test_find_takes_an_address_never_a_name(self):
-        with mock.patch.object(captain, 'get', lambda address: terminal('t2')), \
+        with mock.patch.object(captain, 'get', lambda address, timeout=None: terminal('t2')), \
              mock.patch.object(captain, 'pin', side_effect=lambda s: s):
             self.assertEqual(captain.find('t2')['address'], 't2')
             self.assertIsNone(captain.find('review'))   # hc would resolve the name to t2
@@ -351,7 +394,8 @@ class LedgerCase(unittest.TestCase):
         for target, attr, value in [
             (captain, 'STATE', str(self.state)),
             (captain, 'POLL_S', 0),
-            (captain, 'find', lambda address: dict(self.terminals[address]) if address in self.terminals else None),
+            (captain, 'find', lambda address, timeout=None: dict(self.terminals[address]) if address in self.terminals
+             else None),
             (captain, 'read_screen', lambda address: self.screens.get(address, EMPTY)),
             (captain, 'submit', self._submit),
             (captain, 'my_session', lambda: dict(self.terminals[self.me])),
@@ -517,6 +561,13 @@ class AskTest(LedgerCase):
         self.assertIn('no Claude Code terminal at that address', self.ask('t99'))
         self.assertIn('this session', self.ask('t1'))
         self.assertEqual(self.typed, [])
+
+    def test_background_tasks_never_hold_an_ask(self):
+        for n, count in enumerate((3, '?')):
+            address = f't{n + 3}'
+            self.terminals[address] = {**pinned(address), 'status': 'done', 'background_tasks': count}
+            self.assertTrue(self.ask(address).endswith('delivered'))
+        self.assertEqual([a for a, _ in self.typed], ['t3', 't4'])
 
     def test_a_draft_in_the_input_line_is_no_refusal(self):
         self.screens['t2'] = boxed('❯ my draft text')
@@ -1332,6 +1383,196 @@ class RelayTest(RelayCase):
                     captain.records()
 
 
+class HeldWakeTest(RelayCase):
+    """A relay held while its target worked: collect says once when that target leaves working, and sends nothing."""
+
+    def setUp(self):
+        super().setUp()
+        self.terminals['t2'] = {**pinned('t2'), 'status': 'working'}
+        self.action = self.relayed()
+        self.looked = []
+        for attr, value in [('find', self._find), ('submit', mock.Mock(side_effect=AssertionError('sent')))]:
+            patcher = mock.patch.object(captain, attr, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _find(self, address, timeout=None):
+        self.looked.append((address, timeout))
+        found = self.terminals.get(address)
+        if isinstance(found, Exception):
+            raise found
+        return dict(found) if found else None
+
+    def now(self, **change):
+        self.terminals['t2'] = {**pinned('t2'), **change}
+
+    def woken(self, within=30):
+        """The lines one poll prints."""
+        recs = captain.records()
+        with mock.patch('builtins.print') as out:
+            captain.wake(recs, {self.action}, captain.generation(), time.monotonic() + within)
+        return [c.args[0] for c in out.call_args_list]
+
+    def test_held_while_working_and_still_working_says_nothing(self):
+        self.assertEqual(self.woken(), [])
+        self.assertEqual(self.looked[0][0], 't2')
+
+    def test_each_state_it_leaves_working_for_reads_differently_and_sends_nothing(self):
+        cases = {'done': 'run `relay --retry', 'idle': 'appends to any draft',
+                 'blocked': 'now blocked (question): the human answers it there',
+                 'error': '`relay --retry ' + self.action + '` keeps it held'}
+        for status, said in cases.items():
+            with self.subTest(status):
+                self.now(status='working')
+                self.assertEqual(self.woken(), [])
+                self.now(status=status, blocked_on='question' if status == 'blocked' else None)
+                [line] = self.woken()
+                self.assertTrue(line.startswith(f'left working {self.action} · sp · name · t2 · now {status}'))
+                self.assertIn(said, line)
+                self.assertIn(f'relay --retry {self.action}', line)
+                self.assertNotIn('safe', line)
+        self.assertEqual(self.typed, [])
+        self.assertEqual(captain.relay_states(captain.records())[self.action], 'held')
+
+    def test_a_replaced_or_vanished_session_reads_as_replaced(self):
+        for why, change in {'restarted': lambda: self.now(started=99, session='s-new'),
+                            'gone': lambda: self.terminals.pop('t2')}.items():
+            with self.subTest(why):
+                (self.state / captain.NOTICED).unlink(missing_ok=True)
+                change()
+                [line] = self.woken()
+                self.assertIn('its session was replaced or ended', line)
+                self.assertIn('closes it as undelivered', line)
+
+    def test_an_unpinned_session_is_unknown_and_looked_at_again(self):
+        self.now(status='done', pid=None, started=None, account=None, session=None)   # as pin() leaves it
+        self.assertEqual(self.woken(), [])
+        self.assertFalse((self.state / captain.NOTICED).exists())
+        self.now(status='done')
+        [line] = self.woken()
+        self.assertTrue(line.startswith(f'left working {self.action} · sp · name · t2 · now done'))
+
+    def test_an_unpinned_session_whose_read_fields_differ_reads_as_replaced(self):
+        self.now(status='done', pid=999, started=99, account='config:other', session=None)   # session unreadable
+        [line] = self.woken()
+        self.assertIn('its session was replaced or ended', line)
+
+    def test_each_transition_is_said_once_across_collects(self):
+        self.now(status='done')
+        self.assertEqual(len(self.woken()), 1)
+        self.assertEqual(self.woken(), [])   # a later poll, or a re-armed collect
+        self.now(status='idle')
+        self.assertEqual(len(self.woken()), 1)
+        self.now(status='working')
+        self.assertEqual(self.woken(), [])
+        self.now(status='done')
+        self.assertEqual(len(self.woken()), 1)   # left working again
+
+    def test_a_new_enrollment_starts_afresh_and_an_old_one_says_nothing(self):
+        self.now(status='done')
+        fence = captain.generation()
+        self.woken()
+        self.replace_captain()
+        with mock.patch('builtins.print') as out:
+            captain.wake(captain.records(), {self.action}, fence, time.monotonic() + 30)
+        self.assertEqual(out.call_args_list, [])
+        self.assertEqual(json.loads((self.state / captain.NOTICED).read_text())['generation'], fence)
+
+    def test_hc_failure_or_no_time_left_says_nothing_and_looks_again(self):
+        self.terminals['t2'] = captain.hc.Error('hc get t2 failed: timeout')
+        self.assertEqual(self.woken(), [])
+        self.assertLessEqual(self.looked[-1][1], captain.WAKE_LOOK_S)
+        self.now(status='done')
+        self.looked.clear()
+        self.assertEqual(self.woken(within=0.5), [])
+        self.assertEqual(self.looked, [])
+        self.assertEqual(len(self.woken()), 1)
+
+    def test_a_lookup_takes_a_short_budget_however_long_the_wait(self):
+        self.woken(within=600)
+        self.assertEqual(self.looked, [('t2', captain.WAKE_LOOK_S)])
+        self.looked.clear()
+        self.woken(within=1.5)
+        self.assertLessEqual(self.looked[0][1], 1.5)
+
+    def test_collections_following_different_relays_keep_each_other_s_notices(self):
+        self.terminals['t3'] = {**pinned('t3'), 'status': 'working'}
+        self.say('merge o/r#13')
+        other = self.action_of(self.relay('t3'))
+        self.now(status='done')
+        self.terminals['t3'] = {**pinned('t3'), 'status': 'done'}
+
+        def poll(action):
+            with mock.patch('builtins.print') as out:
+                captain.wake(captain.records(), {action}, captain.generation(), time.monotonic() + 30)
+            return len(out.call_args_list)
+        self.assertEqual([poll(self.action), poll(other), poll(self.action), poll(other)], [1, 1, 0, 0])
+
+    def test_a_closed_relay_s_notice_is_dropped_when_the_state_is_stored(self):
+        self.now(status='done')
+        self.woken()
+        captain.cancel(self.action, self.ident)
+        self.terminals['t3'] = {**pinned('t3'), 'status': 'working'}
+        self.say('merge o/r#13')
+        other = self.action_of(self.relay('t3'))
+        self.terminals['t3'] = {**pinned('t3'), 'status': 'done'}
+        with mock.patch('builtins.print'):
+            captain.wake(captain.records(), {other}, captain.generation(), time.monotonic() + 30)
+        self.assertEqual(json.loads((self.state / captain.NOTICED).read_text())['seen'], {other: 'done'})
+
+    def test_a_replacement_enrolled_before_the_store_is_never_overwritten(self):
+        self.now(status='done')
+        real = captain.locked
+
+        @contextmanager
+        def replaced_first(*args, **kwargs):
+            self.replace_captain()   # lands after the line printed, before the store takes the lock
+            with real(*args, **kwargs):
+                yield
+        with mock.patch.object(captain, 'locked', replaced_first):
+            self.assertEqual(len(self.woken()), 1)
+        self.assertFalse((self.state / captain.NOTICED).exists())
+
+    def test_a_held_lock_skips_the_store_within_the_budget(self):
+        self.now(status='done')
+        with mock.patch.object(captain, 'WAKE_LOOK_S', 0.2), captain.locked():
+            began = time.monotonic()
+            self.assertEqual(len(self.woken()), 1)
+            self.assertLess(time.monotonic() - began, 5)
+        self.assertFalse((self.state / captain.NOTICED).exists())
+        self.assertEqual(len(self.woken()), 1)   # unstored, it is said again rather than lost
+
+    def test_only_relays_held_for_working_by_this_captain_and_still_pending(self):
+        self.now(status='done')
+        recs = captain.records()
+        held = [r for r in recs if r['type'] == 'held']
+        for why, (state, pending) in {'held for its screen': ([{**held[0], 'why': 'its screen is not a recognized '
+                                                                'input line'}], {self.action}),
+                                      'not pending': (held, set())}.items():
+            with self.subTest(why):
+                changed = [r if r['type'] != 'held' else state[0] for r in recs]
+                self.assertEqual(captain.held_working(changed, pending, captain.generation()), {})
+        self.assertEqual(captain.held_working(recs, {self.action}, 'another-generation'), {})
+        captain.cancel(self.action, self.ident)
+        self.assertEqual(captain.held_working(captain.records(), {self.action}, captain.generation()), {})
+
+    def test_collect_says_it_then_follows_the_relay_on(self):
+        def done_then_cancelled(address, timeout=None):
+            self.looked.append((address, timeout))
+            if len(self.looked) > 1:
+                captain.append({'type': 'cancel', 'msg': self.action})
+            return {**pinned('t2'), 'status': 'done'}
+        with mock.patch.object(captain, 'find', done_then_cancelled), mock.patch('builtins.print') as out:
+            self.assertEqual(captain.collect([self.action], 60000), 0)
+        lines = [c.args[0] for c in out.call_args_list]
+        self.assertTrue(lines[0].startswith(f'held {self.action}'))
+        self.assertTrue(lines[1].startswith(f'left working {self.action}'))
+        self.assertEqual(lines[-2:], [f'cancelled {self.action} · sp · name · t2', 'done'])
+        self.assertEqual(sum(line.startswith('left working') for line in lines), 1)
+        self.assertTrue(all(timeout <= captain.WAKE_LOOK_S for _, timeout in self.looked))
+        self.assertEqual(self.typed, [])
+
+
 class AddressedCase(RelayCase):
     """Two live sessions besides the captain, in herdr spaces named code and docs."""
 
@@ -2109,6 +2350,80 @@ class WatchUnchangedTest(WatchCase):
         self.log({'type': 'user', 'promptSource': 'typed', 'origin': {'kind': 'human'},
                   'message': {'content': 'and now this'}})
         self.assertTrue(self.asked().endswith('delivered'))
+
+    def asked_after(self, *entries):
+        """Whether ask types a new request once entries follow the report call, the transcript restored after."""
+        saved = self.transcript.read_bytes()
+        self.log(*entries)
+        try:
+            return self.asked().endswith('delivered')
+        finally:
+            self.transcript.write_bytes(saved)
+
+    def test_completion_text_and_bookkeeping_after_the_report_keep_it(self):
+        quiet = [{'type': 'assistant', 'message': {'content': [{'type': 'thinking', 'thinking': 'done'},
+                                                               {'type': 'text', 'text': 'All done.'}]}},
+                 {'type': 'attachment', 'attachment': {'type': 'hook_success', 'hookEvent': 'Stop'}},
+                 {'type': 'attachment', 'attachment': {'type': 'hook_system_message', 'content': 'gate skipped'}},
+                 {'type': 'system', 'subtype': 'stop_hook_summary', 'hookErrors': [], 'hookAdditionalContext': [],
+                  'preventedContinuation': False},
+                 {'type': 'system', 'subtype': 'turn_duration'}, {'type': 'system', 'subtype': 'away_summary'},
+                 {'type': 'api-request', 'body': f'recorded {self.ref}'}, {'type': 'file-history-snapshot'},
+                 {'type': 'queue-operation'}, {'type': 'last-prompt'}, {'type': 'cost-state'}]
+        self.assertFalse(self.asked_after(*quiet))
+        self.assertEqual(self.typed, [])
+
+    def test_work_after_the_report_in_the_same_turn_is_asked(self):
+        blocked = [{'type': 'attachment', 'attachment': {'type': 'hook_blocking_error', 'hookEvent': 'Stop',
+                                                         'blockingError': {'blockingError': 'review findings'}}},
+                   {'type': 'system', 'subtype': 'stop_hook_summary', 'hookErrors': ['review findings'],
+                    'hookAdditionalContext': [], 'preventedContinuation': False},
+                   {'type': 'user', 'isMeta': True, 'message': {'content': 'Stop hook feedback:\nreview findings'}}]
+        work = [{'type': 'assistant', 'message': {'content': [{'type': 'tool_use', 'name': 'Bash'}]}},
+                {'type': 'user', 'message': {'content': [{'type': 'tool_result', 'content': 'ok'}]}},
+                {'type': 'assistant', 'message': {'content': [{'type': 'tool_use', 'name': 'Edit'}]}},
+                {'type': 'assistant', 'message': {'content': [{'type': 'text', 'text': 'Applied the findings.'}]}},
+                {'type': 'system', 'subtype': 'stop_hook_summary', 'hookErrors': []}]
+        cases = {
+            'blocked stop, then work': blocked + work,
+            'blocked stop, then only text': [blocked[1], work[3]],
+            'a further tool call': work[:1],
+            'stop hook context': [{'type': 'system', 'subtype': 'stop_hook_summary', 'hookErrors': [],
+                                   'hookAdditionalContext': ['go on']}],
+            'stop prevented': [{'type': 'system', 'subtype': 'stop_hook_summary', 'preventedContinuation': True}],
+            'input read mid-turn': [{'type': 'attachment', 'attachment': {'type': 'queued_command',
+                                                                          'prompt': 'also merge it'}}],
+            'meta input': [blocked[2]],
+            'an unknown entry': [{'type': 'something-new'}],
+            'an unknown attachment': [{'type': 'attachment', 'attachment': {'type': 'task_status'}}],
+            'an unknown system entry': [{'type': 'system', 'subtype': 'local_command'}],
+            'an assistant entry of another shape': [{'type': 'assistant', 'message': {'content': 'text'}}],
+            'not an object': [['a list']]}
+        for why, entries in cases.items():
+            with self.subTest(why):
+                self.assertTrue(self.asked_after(*entries))
+
+    def test_a_later_report_after_the_work_is_the_new_anchor(self):
+        self.log({'type': 'attachment', 'attachment': {'type': 'hook_blocking_error', 'hookEvent': 'Stop'}},
+                 {'type': 'assistant', 'message': {'content': [{'type': 'tool_use', 'name': 'Edit'}]}},
+                 {'type': 'user', 'message': {'content': [{'type': 'tool_result', 'content': 'ok'}]}})
+        self.ref = self.reported()
+        self.assertIn(f'not asked, nothing new since its report {self.ref} at', self.asked())
+
+    def test_a_status_request_s_own_turn_keeps_its_shortcut(self):
+        """Only a member's receipt is held to completion text: a request's turn runs the report call after it."""
+        self.log({'type': 'user', 'promptSource': 'typed', 'origin': {'kind': 'human'},
+                  'message': {'content': 'and now this'}})
+        line = self.ask()
+        msg = self.msg_of(line)
+        self.log({'type': 'user', 'promptSource': 'typed', 'origin': {'kind': 'human'},
+                  'message': {'content': f'<hc from="t1">{captain.status_prompt(msg)}</hc>'}},
+                 {'type': 'assistant', 'message': {'content': [{'type': 'tool_use', 'name': 'Bash'}]}},
+                 {'type': 'user', 'message': {'content': [{'type': 'tool_result', 'content': 'brief text'}]}},
+                 {'type': 'attachment', 'attachment': {'type': 'task_status'}},
+                 {'type': 'assistant', 'message': {'content': [{'type': 'text', 'text': 'Status sent.'}]}})
+        self.report_as('t2', msg)
+        self.assertIn(f'not asked, nothing new since its report {msg} at', self.ask())
 
     def test_asked_when_it_cannot_be_shown(self):
         cases = {'torn line': lambda: self.log(raw=b'{"type": "user", "mess'),
@@ -3380,7 +3695,7 @@ class StartTest(RelayCase):
         self.pinned_account = 'main'
         for target, attr, value in [
             (captain.hc, 'run', self._hc),
-            (captain, 'get', lambda address: self.gets.get(address)),
+            (captain, 'get', lambda address, timeout=None: self.gets.get(address)),
             (captain, 'herdr_spaces', lambda: self.spaces),
             (captain, 'pin', self._pin),
             (captain.shutil, 'which', lambda p: f'/bin/{p}'),
@@ -3682,7 +3997,7 @@ class StartTest(RelayCase):
 
     def test_hc_failing_to_answer_after_the_start_leaves_it_unchecked(self):
         self.say('start proj')
-        def get(address):
+        def get(address, timeout=None):
             if address == 't9':
                 raise captain.hc.Error('hc get t9 failed: socket closed')
         with mock.patch.object(captain, 'get', get):

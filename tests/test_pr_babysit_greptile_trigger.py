@@ -81,7 +81,7 @@ class Trigger(unittest.TestCase):
     def run_with(self, rig):
         out = io.StringIO()
         with mock.patch.object(trigger, 'attempt', rig.attempt), mock.patch.object(harvest, 'run', rig.run), \
-                mock.patch.object(trigger, 'record_dir', lambda: self.dir), redirect_stdout(out):
+                mock.patch.object(trigger, 'record_dir', lambda kind: self.dir), redirect_stdout(out):
             code = trigger.report(trigger.collect, ['--pr', '7', '--head', HEAD, '--repo', 'o/r'], seal=True)
         return code, json.loads(out.getvalue())
 
@@ -133,7 +133,8 @@ class Trigger(unittest.TestCase):
         self.assertEqual(self.run_with(rig)[1]['outcome'], 'already', 'the comment shows up later')
         self.assertEqual(self.record()['receipt']['id'], 120)
 
-    def test_a_lost_read_back_is_uncertain_then_reconciled(self):
+    @mock.patch.object(harvest.gh_retry.time, 'sleep')  # lib/gh_retry.py's waits before the 502 read is made again
+    def test_a_lost_read_back_is_uncertain_then_reconciled(self, _sleep):
         rig = Rig(readback=lambda path: (_ for _ in ()).throw(trigger.Unusable(f'gh api {path}: HTTP 502')))
         code, out = self.run_with(rig)
         self.assertEqual((code, out['outcome'], out['commentId']), (0, 'uncertain', 101))
@@ -211,16 +212,16 @@ class Trigger(unittest.TestCase):
             return rig
         standing = {'id': 50, 'body': '@greptileai', 'created_at': '2026-10-21T09:00:00Z'}
         rig = unreadable(Rig(comments=[standing], runs=(dict(RUN, event='pull_request'),)))
-        with mock.patch.object(harvest, 'WORKFLOW_RETRY_S', 0):
+        with mock.patch.object(harvest, 'WORKFLOW_RETRY_S', 0), mock.patch.object(harvest.gh_retry.time, 'sleep'):
             code, out = self.run_with(rig)
         self.assertEqual((code, out['outcome'], out['phase']), (0, 'failed', 'read'))
         self.assertIn('workflow .github/workflows/ci.yml at aaaaaaaaa could not be read (gh api: HTTP 503)', out['detail'])
-        self.assertEqual(len(reads), 2, 'read again once')
+        self.assertEqual(len(reads), 1 + len(harvest.gh_retry.WAITS), 'made again on its 503 by gh_retry alone, never twice over')
         self.assertEqual(rig.posts, [])
         self.assertFalse((self.dir / f'o-r-7-{HEAD}.json').exists(), 'nothing claimed')
         fresh = unreadable(Rig(runs=(dict(RUN, event='pull_request'),)))
         self.assertEqual(self.run_with(fresh)[1]['outcome'], 'requested', 'with no request standing the head time is not needed')
-        self.assertEqual(len(reads), 2, 'nor read')
+        self.assertEqual(len(reads), 1 + len(harvest.gh_retry.WAITS), 'nor read')
 
     def failing(self, rig, path, error, times=None):
         """rig with each GET of path failing with error, the first times of them only when times is given; the reads made."""
@@ -244,7 +245,7 @@ class Trigger(unittest.TestCase):
                 rig = Rig()
                 answer = rig.run
                 self.failing(rig, path, facts.Unusable('gh: HTTP 502'))
-                with mock.patch.object(trigger, 'RETRY_S', 0):
+                with mock.patch.object(harvest.gh_retry.time, 'sleep'):
                     code, out = self.run_with(rig)
                 self.assertEqual((code, out['outcome'], out['phase'], out['detail']), (0, 'failed', 'read', 'gh: HTTP 502'))
                 self.assertEqual(rig.posts, [])
@@ -259,7 +260,7 @@ class Trigger(unittest.TestCase):
         with mock.patch.object(trigger.time, 'sleep') as slept:
             code, out = self.run_with(rig)
         self.assertEqual((code, out['outcome'], len(rig.posts)), (0, 'requested', 1))
-        self.assertEqual(slept.call_args_list.count(mock.call(trigger.RETRY_S)), 1, 'after one pause')
+        self.assertEqual(slept.call_args_list.count(mock.call(harvest.gh_retry.WAITS[0])), 1, 'after one pause')
         self.assertEqual(len(reads), 3, 'the failed PR read made again, then the one just before the claim')
         for error in (facts.Unusable('gh: Bad Gateway (HTTP 502)'), facts.Unusable('gh: Requires authentication (HTTP 401)'),
                       facts.RateLimited('gh: HTTP 503: secondary rate limit', {'secondary': True})):
@@ -271,10 +272,11 @@ class Trigger(unittest.TestCase):
                 with mock.patch.object(trigger.time, 'sleep'):
                     code, out = self.run_with(rig)
                 self.assertEqual((code, out['outcome'], out['phase'], rig.posts), (0, 'failed', 'read', []))
-                self.assertEqual(len(reads), 2 if 'HTTP 502' in str(error) and type(error) is facts.Unusable else 1,
-                                 'a gateway failure is read twice at most, any other once')
+                self.assertEqual(len(reads), 1 + len(harvest.gh_retry.WAITS) if 'HTTP 502' in str(error) and type(error) is facts.Unusable else 1,
+                                 "a gateway failure is made again after lib/gh_retry.py's waits, any other read once")
 
-    def test_a_read_that_fails_after_the_claim_is_an_error_line_and_a_rerun_never_posts(self):
+    @mock.patch.object(harvest.gh_retry.time, 'sleep')  # lib/gh_retry.py's waits before the 502 read is made again
+    def test_a_read_that_fails_after_the_claim_is_an_error_line_and_a_rerun_never_posts(self, _sleep):
         rig = Rig(post_code=1, lost=True)
         answer = rig.run
         rig.run = lambda *argv, ok=(0,): (_ for _ in ()).throw(facts.Unusable('gh: HTTP 502')) \
@@ -301,7 +303,7 @@ class Trigger(unittest.TestCase):
         def one():
             outs.append(trigger.collect(['--pr', '7', '--head', HEAD, '--repo', 'o/r']))
         with mock.patch.object(trigger, 'attempt', rig.attempt), mock.patch.object(harvest, 'run', rig.run), \
-                mock.patch.object(trigger, 'record_dir', lambda: self.dir):
+                mock.patch.object(trigger, 'record_dir', lambda kind: self.dir):
             threads = [threading.Thread(target=one) for _ in range(2)]
             for t in threads:
                 t.start()

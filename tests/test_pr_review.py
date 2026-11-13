@@ -1340,7 +1340,8 @@ class Post(PostCase):
         self.gh.post_fails = False
         self.assertEqual((self.post()['status'], len(self.gh.posts), len(self.gh.reviews)), ('drafted', 3, 1))
 
-    def test_a_refusal_whose_marker_cannot_be_read_back_stays_sent(self):
+    @mock.patch.object(harvest.gh_retry.time, 'sleep')  # lib/gh_retry.py's waits before a failed read is made again
+    def test_a_refusal_whose_marker_cannot_be_read_back_stays_sent(self, _sleep):
         self.save(self.result_for(self.p))
         self.gh.post_fails, self.gh.list_fails = 'refused', True
         with self.assertRaisesRegex(facts.Unusable, 'HTTP 502'):
@@ -2468,7 +2469,8 @@ class Reconcile(PostCase):
         self.recheck()
         self.assertEqual(self.post('--auto')['status'], 'posted')
 
-    def test_an_unreadable_listing_never_reads_as_a_deletion(self):
+    @mock.patch.object(harvest.gh_retry.time, 'sleep')  # lib/gh_retry.py's waits before a failed read is made again
+    def test_an_unreadable_listing_never_reads_as_a_deletion(self, _sleep):
         self.posted()
         before = Path(self.p['ledger']).read_text()
         self.gh.comments_fail = True
@@ -2574,6 +2576,41 @@ class GhReads(unittest.TestCase):
         self.assertFalse(lib_gh_reads.reads_as_sent(sent, sent), 'the text as sent is not what gh reads')
         self.assertFalse(lib_gh_reads.reads_as_sent(read, read.replace('^[', '^Z')))
         self.assertFalse(lib_gh_reads.reads_as_sent(None, ''))
+
+
+class TransientReads(unittest.TestCase):
+    """#523: prepare.py's gh_json makes a read again on HTTP 502, 503 or 504; an exit it accepts is an answer."""
+
+    def gh(self, answers, *argv, ok=(0,)):
+        calls, waits = [], []
+
+        def run(*a, ok=(0,)):
+            calls.append(a)
+            got = answers.pop(0) if len(answers) > 1 else answers[0]
+            if isinstance(got, Exception):
+                raise got
+            return got
+        with mock.patch.object(prepare, 'run', run), mock.patch.object(prepare.gh_retry.time, 'sleep', waits.append):
+            try:
+                return prepare.gh_json(*argv, ok=ok), calls, waits
+            except facts.Unusable as e:
+                return e, calls, waits
+
+    def test_a_transient_error_is_read_again_and_exhaustion_raises_the_last(self):
+        argv = ('api', f'repos/{REPO}', '--jq', '.permissions')
+        self.assertEqual(self.gh([facts.Unusable('gh api: HTTP 503'), (0, '{"push": true}')], *argv), ((0, {'push': True}), [mock.ANY] * 2, [2]))
+        got, calls, waits = self.gh([facts.Unusable('gh api: HTTP 502')], *argv)
+        self.assertEqual((str(got), len(calls), waits), ('gh api: HTTP 502', 3, [2, 5]))
+
+    def test_an_accepted_exit_a_malformed_answer_and_a_rate_limit_are_read_once(self):
+        checks = ('pr', 'checks', str(PR), '--repo', REPO, '--json', 'name,state,workflow,link')
+        self.assertEqual(self.gh([(8, '[]'), (0, '[{}]')], *checks, ok=(0, 1, 8)), ((8, []), [mock.ANY], []), 'gh exits 8 while checks are pending')
+        for what, answers in (('not JSON', [(0, '<html>'), (0, '{}')]),
+                              ('a rate limit', [facts.RateLimited('gh api: HTTP 503 rate limit', {'resetAt': None}), (0, '{}')])):
+            with self.subTest(what):
+                got, calls, waits = self.gh(answers, 'api', 'user')
+                self.assertIsInstance(got, facts.Unusable)
+                self.assertEqual((len(calls), waits), (1, []))
 
 
 class ResolveDue(unittest.TestCase):

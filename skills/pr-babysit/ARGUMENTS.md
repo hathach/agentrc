@@ -35,7 +35,9 @@ A key not listed here throws before anything runs.
   `CLAUDE.md` when CodeRabbit skips every push for a manual review (a
   repository below its open-source threshold). Once per head, ticks
   the "Trigger review" box of CodeRabbit's summary comment when the head was
-  skipped that way, then waits for the review up to the silent-bot cap. Once
+  skipped that way (a status or check run titled `Review skipped: manual review
+  required`, or a bare skip whose summary holds the box or says so), then waits
+  for the review up to the silent-bot cap. Once
   per head too, it comments `@coderabbitai review` instead when that tick
   failed (a summary with no box to tick, a failed edit), unless the box reads
   ticked or such a comment follows the head event, and when CodeRabbit's
@@ -119,7 +121,15 @@ A key not listed here throws before anything runs.
   wait; that pass is a grace period for checks that register late, not proof.
   An Actions run on the head that is unfinished with no pending job registered
   (one a concurrency group holds, a re-run not yet started) counts as a
-  pending check, so it is waited on.
+  pending check, so it is waited on. Where the same checks stay pending through
+  two whole waits (`ci-stuck`), the launch first runs `ci_recover.py` once per
+  head: a run still `queued` with no job past `ciWait`, after which a newer
+  run in the repository completed, and that no concurrency group can be
+  holding, is cancelled and re-run whole, each step once per run attempt
+  under a record in the git common dir. A recovery, or a run that completed
+  rather than cancelled (`completed`, not re-run), re-arms the CI wait and is
+  never green; any other outcome stops `ci-stuck` with `ciRecovery`: its
+  outcome, and each run's evidence, step and record.
 - `ciNotes`: what the caller established about this PR's CI, handed to the
   judge verbatim; it never revises a placed verdict stored on the head, while
   a stored unclassified failure is judged again once the notes change.
@@ -158,7 +168,10 @@ A key not listed here throws before anything runs.
   needs `yieldAfterCycle` and never declares the PR done.
 - `state` or `stateRef: { outputFile, digest }`: a previous launch's state, or
   the saved output holding it and its `stateDigest`, loaded whole from the file
-  `state_transfer.py` emits and checked against that digest.
+  `state_transfer.py` emits and checked against that digest. A `stateRef`
+  loads a state of up to 256 KiB (compact ASCII JSON), an inline `state` one
+  of up to 64 KiB; a launch whose returned state is larger says so
+  (`stateTooLarge`), and nothing trims its decisions or debt.
   `launch_result.py`'s `stateRef` names a copy it keeps outside the Workflow
   task directory, so a host reset does not take the state with it. Nothing
   prunes those copies: one is needed only while a caller may continue from its

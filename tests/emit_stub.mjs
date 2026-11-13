@@ -40,9 +40,12 @@ export function emitDirs (prefix, given, keep) {
 }
 
 // workflow({scriptPath}) as the runtime runs it: the file's body, its return value the result; an unreadable file
-// throws, and a data module nests nothing.
+// throws, as does one with no `export const meta` (an emit file claimed and left empty: Claude Code 2.1.322), and a
+// data module nests nothing.
 export function loadModule (path, a, { pipeline = null, parallel = null, log = () => {} } = {}) {
-  const text = readFileSync(path, 'utf8').replace(/^export const meta = /m, 'const meta = ')
+  const raw = readFileSync(path, 'utf8')
+  if (!/^export const meta = /m.test(raw)) throw new Error(`${path}: \`export const meta = { name, description, ... }\` required`)
+  const text = raw.replace(/^export const meta = /m, 'const meta = ')
   const nested = () => { throw new Error('a child workflow nests nothing') }
   return new AsyncFunction('args', 'agent', 'pipeline', 'parallel', 'phase', 'log', 'workflow', 'budget', ...ABSENT, text)(
     a, nested, pipeline, parallel, () => {}, log, nested, null, ...ABSENT.map(() => undefined))

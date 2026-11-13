@@ -121,6 +121,27 @@ class SettleRules(unittest.TestCase):
         agrees = status('success', 'Review skipped: manual review required for this OSS repository', '2026-09-25T09:00:01Z')
         self.assertEqual(harvest.coderabbit(HEAD, [agrees], [run_], manual, EVENT)['kind'], 'skipped', 'one that agrees')
 
+    def test_a_check_run_titled_manual_review_required_is_a_manual_skip_without_a_box(self):
+        # #530: hathach/agentrc#529's head 5ef6598d, whose summary held no Trigger review box and no manual-only words.
+        title = 'Review skipped: manual review required for this OSS repository'
+        run_ = {'id': 14, 'name': 'CodeRabbit', 'status': 'completed', 'conclusion': 'skipped', 'started_at': '2026-11-11T11:47:37Z',
+                'completed_at': '2026-11-11T11:47:38Z', 'output': {'title': title, 'summary': 'Result: Skipped'}}
+        summary = comment('coderabbitai[bot]', 'summary\n- [ ] <!-- {"checkboxId":"1"} --> Commit to this branch', id_=6)
+        for what, issue in (('no summary', []), ('a summary without a box', [summary])):
+            with self.subTest(what):
+                r = harvest.coderabbit(HEAD, [], [run_], issue, EVENT)
+                self.assertEqual((r['state'], r['kind'], r['sha']), ('settled', 'skipped', HEAD))
+                self.assertEqual(r['reason'], f'Review skipped: manual review required (check run; titled "{title}")')
+                self.assertTrue(r['reason'].lower().startswith(harvest.CR_MANUAL_SKIP), "the workflow's MANUAL_SKIP reads it")
+        box = comment('coderabbitai[bot]', '> - [ ] 🔍 Trigger review', id_=5)
+        self.assertIn('comment 5 holds a Trigger review box', harvest.coderabbit(HEAD, [], [run_], [box], EVENT)['reason'], 'a box is still named')
+        agrees = status('success', title, '2026-11-11T11:47:38Z')
+        self.assertEqual(harvest.coderabbit(HEAD, [agrees], [run_], [], EVENT)['kind'], 'skipped', 'a status at its second agrees')
+        for other in ('Review skipped', 'Review skipped: no files changed', 'Review skipped: manual review is paused'):
+            with self.subTest(other):
+                r = harvest.coderabbit(HEAD, [], [dict(run_, output={'title': other})], [summary], EVENT)
+                self.assertEqual(r['reason'], f'check run skipped: {other}', 'only the manual-review title says it')
+
     def test_a_no_files_to_review_coderabbit_check_run_is_a_skip_never_askable(self):
         # #372: hathach/tinyusb#4246's rebased head, check run 124595415060.
         run_ = {'id': 124595415060, 'name': 'CodeRabbit', 'status': 'completed', 'conclusion': 'skipped', 'started_at': '2026-09-25T09:00:00Z',
@@ -270,6 +291,55 @@ class SettleRules(unittest.TestCase):
             got = harvest.entry(kind, {'id': 6, 'user': {'login': login}, 'html_url': 'u/6'}, src, body, 't', 't')
             self.assertEqual(got['body'], body, (kind, src))
             self.assertNotIn('bodyOmitted', got)
+
+
+class TransientReads(unittest.TestCase):
+    """#523: gh_json and pages make a read again on HTTP 502, 503 or 504, as collect.py does; nothing else."""
+
+    def gh(self, answers, call):
+        calls, waits = [], []
+
+        def run(*argv, ok=(0,)):
+            calls.append(argv)
+            got = answers.pop(0) if len(answers) > 1 else answers[0]
+            if isinstance(got, Exception):
+                raise got
+            return 0, got
+        with mock.patch.object(harvest, 'run', run), mock.patch.object(harvest.gh_retry.time, 'sleep', waits.append):
+            try:
+                return call(), calls, waits
+            except harvest.Unusable as e:
+                return e, calls, waits
+
+    def test_a_transient_error_is_read_again(self):
+        got, calls, waits = self.gh([harvest.Unusable('gh pr view 7: HTTP 503'), '{"headRefOid": "x"}'],
+                                    lambda: harvest.gh_json('pr', 'view', '7', '--json', 'headRefOid'))
+        self.assertEqual((got, len(calls), waits), ({'headRefOid': 'x'}, 2, [2]))
+
+    def test_a_paginated_read_is_read_again_whole(self):
+        got, calls, waits = self.gh([harvest.Unusable('gh api: gh: Server Error (HTTP 502)'), '[[1, 2], [3]]'],
+                                    lambda: harvest.pages('repos/o/r/issues/7/comments'))
+        self.assertEqual((got, waits), ([1, 2, 3], [2]))
+        self.assertEqual(calls[0], calls[1])
+        self.assertEqual(calls[0][:4], ('gh', 'api', '--paginate', '--slurp'))
+
+    def test_exhaustion_keeps_the_error_contract(self):
+        got, calls, waits = self.gh([harvest.Unusable('gh api x: HTTP 504')], lambda: harvest.gh_json('api', 'x'))
+        self.assertEqual((type(got), str(got), len(calls), waits), (harvest.Unusable, 'gh api x: HTTP 504', 3, [2, 5]))
+
+    def test_no_retry_of_a_rate_limit_a_mutation_or_a_malformed_answer(self):
+        limited = harvest.RateLimited('gh api x: HTTP 503: secondary rate limit', {'resetAt': None})
+        mutation = ('api', 'graphql', '-f', 'query=mutation { resolveReviewThread(input: {threadId: "t"}) { thread { id } } }')
+        for what, answers, argv, want in (('a rate limit', [limited, '{}'], ('api', 'x'), limited),
+                                          ('a mutation', [harvest.Unusable('gh api graphql: HTTP 502'), '{}'], mutation, None),
+                                          ('a POST', [harvest.Unusable('gh api: HTTP 502'), '{}'], ('api', 'x', '-f', 'body=y'), None),
+                                          ('JSON it cannot read', ['<html>', '{}'], ('api', 'x'), None)):
+            with self.subTest(what):
+                got, calls, waits = self.gh(answers, lambda: harvest.gh_json(*argv))
+                self.assertIsInstance(got, harvest.Unusable)
+                if want:
+                    self.assertIs(got, want)
+                self.assertEqual((len(calls), waits), (1, []))
 
 
 class FailClosed(unittest.TestCase):
@@ -939,11 +1009,12 @@ class EndToEnd(unittest.TestCase):
         self.assertIn('secondary rate limit', got['error'])
         self.assertEqual((got['rateLimit']['resetAt'], got['rateLimit']['secondary']), (None, True))
 
-    def test_a_workflow_read_that_fails_twice_leaves_the_head_undated_and_says_so(self):
+    @mock.patch('time.sleep')  # lib/gh_retry.py's waits before a failed read is made again
+    def test_a_workflow_read_that_fails_twice_leaves_the_head_undated_and_says_so(self, _sleep):
         """#242: the runs date the head, but a failed read of the workflow that would date it is not "nothing dates the head"."""
         path = f'api repos/o/r/contents/.github/workflows/build.yml?ref={HEAD}'
         answers = self.answers([HEAD])
-        answers[path] = [{'stderr': 'HTTP 503'}, workflow('on: [push, pull_request]\n')]
+        answers[path] = [{'stderr': 'HTTP 500'}, workflow('on: [push, pull_request]\n')]
         with mock.patch.object(harvest, 'WORKFLOW_RETRY_S', 0):
             code, got = self.harvest(answers)
         self.assertEqual((code, got['headEventAt']), (0, '2026-09-25T08:00:00Z'), 'one failed read is read again')
