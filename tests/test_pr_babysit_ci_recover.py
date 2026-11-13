@@ -4,6 +4,7 @@ import base64
 import importlib.util
 import io
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -49,16 +50,16 @@ class GitHub:
         self.workflow, self.newest, self.jobs = workflow, newest, jobs
         self.cancel_after, self.rerun_after, self.lose, self.refuse = cancel_after, rerun_after, set(lose), set(refuse)
         self.cancel_as = cancel_as  # the conclusion the run reads once completed after a cancel
-        self.head, self.state, self.posts, self.reads = HEAD, 'OPEN', [], []
+        self.head, self.state, self.posts, self.reads = HEAD, 'open', [], []
         self.after_list = None  # called once the runs on the head have been listed: a race
         self.after_cancel = None  # called once a cancel was sent: a race
+        self.unlisted = {}
 
     def run(self, *argv, ok=(0,)):
         path = argv[-1]
         self.reads.append(path)
-        if argv[1:3] == ('pr', 'view'):
-            return 0, json.dumps({'state': self.state, 'headRefOid': self.head, 'headRefName': 'captain-prune',
-                                  'headRepository': {'nameWithOwner': 'o/r'}})
+        if path == 'repos/{owner}/{repo}/pulls/533':
+            return 0, json.dumps({'state': self.state, 'head': {'sha': self.head, 'ref': 'captain-prune', 'repo': {'full_name': 'o/r'}}})
         if f'head_sha={HEAD}' in path:
             got = json.dumps([{'workflow_runs': list(self.runs.values())}])
             if self.after_list:
@@ -68,8 +69,11 @@ class GitHub:
         if 'status=completed&per_page=1' in path:
             return 0, json.dumps({'workflow_runs': [{'id': 43105843911, 'created_at': self.newest}] if self.newest else []})
         if '/actions/runs?status=' in path:
+            assert path.endswith('&per_page=2'), path
             status = path.split('status=')[1].split('&')[0]
-            return 0, json.dumps([{'workflow_runs': [r for r in self.others() if r['status'] == status]}])
+            matching = [r for r in [*self.runs.values(), *self.others()] if r['status'] == status]
+            unlisted = self.unlisted.get(status, 0)  # counted runs a page of two does not show
+            return 0, json.dumps({'total_count': len(matching) + unlisted, 'workflow_runs': matching[:2]})
         if '/contents/' in path:
             if self.workflow is None:
                 raise harvest.Unusable(f'gh api {path}: Not Found (HTTP 404)')
@@ -124,7 +128,7 @@ class Recover(unittest.TestCase):
         out = io.StringIO()
         sleep = lambda s: self.clock.__setitem__(0, self.clock[0] + s)  # noqa: E731
         with mock.patch.object(harvest, 'run', gh.run), mock.patch.object(recover, 'attempt', gh.attempt), \
-                mock.patch.object(recover, 'record_dir', lambda: self.dir), mock.patch.object(recover, 'now', lambda: NOW), \
+                mock.patch.object(recover, 'record_dir', lambda kind: self.dir), mock.patch.object(recover, 'now', lambda: NOW), \
                 mock.patch.object(recover.time, 'sleep', sleep), mock.patch.object(recover.time, 'monotonic', lambda: self.clock[0]), \
                 redirect_stdout(out):
             code = recover.report(recover.collect, ['--pr', '533', '--head', HEAD, '--repo', 'o/r', '--wait-minutes', str(wait)], seal=True)
@@ -158,7 +162,7 @@ class Recover(unittest.TestCase):
             'no newer completed run': (GitHub(newest='2026-11-11T20:00:00Z'), 'no run in the repository created since it was queued'),
             'no completed run at all': (GitHub(newest=None), 'no run in the repository created since it was queued'),
             'in progress': (GitHub(runs=[a_run(status='in_progress')]), None),
-            'concurrency-held on its PR': (GitHub(), "may be held by run 9 (in_progress)"),
+            'concurrency-held on its PR': (GitHub(), "may be held by another unfinished run (run 9, in_progress)"),
             'workflow file unreadable': (GitHub(workflow=None), 'whether a concurrency group holds it cannot be told'),
             'not on the head branch': (GitHub(runs=[a_run(head_branch='main')]), "not on the PR's head branch"),
         }
@@ -199,7 +203,7 @@ class Recover(unittest.TestCase):
                 self.assertEqual(out['outcome'], 'none' if held else 'recovered', out)
                 if held:
                     self.assertEqual((out['runs'][0]['outcome'], gh.posts), ('skipped', []))
-                    self.assertIn('may be held by run 9 (queued)', out['runs'][0]['reason'])
+                    self.assertIn('may be held by another unfinished run (run 9, queued)', out['runs'][0]['reason'])
 
     def test_a_head_that_moves_or_a_run_that_starts_before_the_cancel_is_left_alone(self):
         gh = GitHub()
@@ -215,7 +219,7 @@ class Recover(unittest.TestCase):
         out = self.go(GitHub(), wait=200)[1]
         self.assertEqual(out['outcome'], 'none', 'a longer wait')
         gh = GitHub()
-        gh.state = 'CLOSED'
+        gh.state = 'closed'
         self.assertEqual((self.go(gh)[1]['outcome'], gh.posts), ('none', []))
 
     def test_a_cancel_that_did_not_end_in_cancelled_is_never_rerun(self):
@@ -228,7 +232,7 @@ class Recover(unittest.TestCase):
 
     def test_a_pr_that_moves_during_the_cancel_withholds_the_rerun(self):
         for what, race, why in (('a new head', lambda gh: setattr(gh, 'head', 'b' * 40), 'not open at aaaaaaaaa'),
-                                ('closed', lambda gh: setattr(gh, 'state', 'CLOSED'), 'PR 533 is CLOSED')):
+                                ('closed', lambda gh: setattr(gh, 'state', 'closed'), 'PR 533 is closed')):
             with self.subTest(what):
                 self.fresh()
                 gh = GitHub()
@@ -300,6 +304,31 @@ class Recover(unittest.TestCase):
                     gh.refuse = set()
                     self.assertEqual((self.go(gh)[1]['outcome'], gh.posts), ('failed', posts), 'a relaunch sends nothing again')
 
+    def test_an_unfinished_run_counted_but_not_on_the_page_still_holds(self):
+        gh = GitHub()
+        gh.unlisted = {'waiting': 1}
+        out = self.go(gh)[1]
+        self.assertEqual((out['outcome'], gh.posts), ('none', []))
+        self.assertIn('may be held by another unfinished run (waiting)', out['runs'][0]['reason'])
+
+    def test_the_time_budget_sends_nothing_it_leaves_no_time_for(self):
+        gh = GitHub()
+        with mock.patch.object(recover, 'BUDGET', 0):
+            out = self.go(gh)[1]
+        self.assertEqual((out['outcome'], gh.posts), ('none', []))
+        self.assertEqual(out['runs'][0]['outcome'], 'skipped')
+        self.assertIn('the time budget ran out before the cancel: nothing was sent', out['runs'][0]['reason'])
+        self.assertEqual(json.loads(Path(out['runs'][0]['record']).read_text())['steps'], {})
+        self.assertEqual((self.go(gh)[1]['outcome'], gh.posts), ('recovered', [(43095438193, 'cancel'), (43095438193, 'rerun')]),
+                         'a later run checks it again and goes on')
+
+    def test_a_record_locked_past_the_budget_is_left_to_its_holder(self):
+        gh = GitHub()
+        with recover.locked(self.dir / 'o-r-43095438193-1.json'), mock.patch.object(recover, 'BUDGET', 1):
+            out = self.go(gh)[1]
+        self.assertEqual((out['outcome'], gh.posts), ('uncertain', []))
+        self.assertIn('stayed held by another process', out['runs'][0]['reason'])
+
     def test_a_relaunch_after_a_recovery_sends_nothing_again(self):
         gh = GitHub()
         self.assertEqual(self.go(gh)[1]['outcome'], 'recovered')
@@ -320,7 +349,8 @@ class Recover(unittest.TestCase):
         self.assertEqual((out['outcome'], gh.posts), ('recovered', [(43095438193, 'rerun')]), 'the cancel took: the re-run follows once')
 
     def test_a_read_failing_for_one_run_leaves_the_others_standing(self):
-        gh = GitHub(runs=[a_run(), a_run(id_=5, path='.github/workflows/gone.yml')])
+        # No group, so the other queued run holds none.
+        gh = GitHub(runs=[a_run(), a_run(id_=5, path='.github/workflows/gone.yml')], workflow='on: pull_request\n')
         answer = gh.run
 
         def run(*argv, ok=(0,)):
@@ -339,6 +369,37 @@ class Recover(unittest.TestCase):
                 with redirect_stdout(out):
                     self.assertEqual(recover.report(recover.collect, argv), 2)
                 self.assertIn('error', json.loads(out.getvalue()))
+
+
+@unittest.skipIf(os.name == 'nt', 'Windows has no directory fsync')
+class DurableRecord(unittest.TestCase):
+    """facts.write_record and record_dir, which ci_recover.py and greptile_trigger.py keep their records with."""
+
+    def synced(self, act):
+        """The inodes os.fsync was called on while act() ran."""
+        got, real = [], os.fsync
+        with mock.patch.object(os, 'fsync', lambda fd: (got.append(os.fstat(fd).st_ino), real(fd))):
+            act()
+        return got
+
+    def test_a_record_its_rename_and_each_directory_made_for_it_reach_the_disk(self):
+        import facts
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root)
+        path = root / 'r.json'
+        ino = lambda p: p.stat().st_ino  # noqa: E731
+        self.assertEqual(self.synced(lambda: facts.write_record(path, {'n': 1}, new=True)), [ino(path), ino(root)])
+        replaced = self.synced(lambda: facts.write_record(path, {'n': 2}))
+        self.assertEqual(replaced, [ino(path), ino(root)], 'the new file, then the directory holding its rename')
+        self.assertEqual(json.loads(path.read_text()), {'n': 2})
+        with self.assertRaises(FileExistsError):
+            facts.write_record(path, {'n': 3}, new=True)
+        common = root / 'common'
+        common.mkdir()
+        with mock.patch.object(facts, 'git', lambda *a: f'{common}\n'):
+            made = self.synced(lambda: facts.record_dir('ci-recover'))
+        self.assertEqual(made, [ino(common), ino(common / 'pr-babysit')], 'each new directory in its parent')
+        self.assertTrue((common / 'pr-babysit' / 'ci-recover').is_dir())
 
 
 if __name__ == '__main__':

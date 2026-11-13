@@ -2107,7 +2107,7 @@ const recoverCi = async (cycle, entry) => {
   const r = await relayOnce(
     `${IN_CHECKOUT}Recover PR #${args.pr}'s Actions runs orphaned in queued: ` +
     runExactly(`${CIRECOVER_SCRIPT} --pr ${args.pr} --repo ${shq(repo)} --head ${expectedHead} --wait-minutes ${ciWait}`,
-      ' Change nothing on GitHub yourself.'),
+      ' Run it in the foreground with a Bash timeout of 600000 ms, the tool\'s maximum: it keeps within it. Change nothing on GitHub yourself.'),
     { label, phase: 'Triage', model: 'haiku', effort: 'low', schema: CI_RECOVER })
   const got = !r ? { outcome: 'unknown', detail: 'no answer: the recovery may have acted; its records under the git common dir say', runs: [] }
     : r.error ? { outcome: 'unknown', detail: r.error, runs: [] } : r

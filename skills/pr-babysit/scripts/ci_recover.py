@@ -4,13 +4,16 @@
   ci_recover.py --pr N --head SHA --wait-minutes M [--repo OWNER/NAME]
 
 pr-babysit's CI lane runs it where the same checks stayed pending through two whole CI waits (ci-stuck, #536). Run from
-the PR checkout; PR N is --repo's, else the checkout's one repository (facts.bind_repo). A run on the head is a suspected
-orphan, and acted on, only when all of this reads so under its lock, the last four just before the cancel: no
-concurrency group can be holding it (its workflow file at SHA declares no top-level `concurrency`, its group is exactly
-`${{ github.run_id }}`, or no other unfinished run is in the repository at all); the repository's newest completed run
-was created after it was queued (Actions runs other work); PR N is open at SHA; the run is on the PR's head branch and
-repository at SHA and `queued`; its attempt has been queued at least M minutes; and that attempt has no job. A workflow
-file that does not read, or no PyYAML, leaves the run alone.
+the PR checkout; PR N is --repo's, else the checkout's one repository (facts.bind_repo). Its relay runs it with the
+600000 ms Bash timeout; the whole script, lock waits and GitHub calls included, keeps within BUDGET seconds of that, and
+a step the budget leaves no time for is not sent. A run on the head is a suspected orphan, and acted on, only when all
+of this reads so under its lock, the cheapest first, and the PR, the run, its group's holders and its jobs read afresh
+just before the cancel: no concurrency group can be holding it (its workflow file at SHA declares no top-level
+`concurrency`, its group is exactly `${{ github.run_id }}`, or no other unfinished run is in the repository at all, read
+a status at a time on a page of two); the repository's newest completed run was created after it was queued (Actions
+runs other work); PR N is open at SHA; the run is on the PR's head branch and repository at SHA and `queued`; its
+attempt has been queued at least M minutes; and that attempt has no job. A workflow file that does not read, or no
+PyYAML, leaves the run alone.
 
 Any other group can be shared by any other unfinished run: groups compare case-insensitively, concatenated values can
 collide, and another workflow's group can be any expression of its own, none of which this script reads.
@@ -23,7 +26,7 @@ whose answer was lost is observed, never sent again. The re-run is sent only onc
 cancel, waited on up to CANCEL_WAIT seconds, and only when its attempt concluded `cancelled` and PR N is still open at
 SHA with the run on its head; its new attempt is looked for up to RERUN_WAIT seconds. A record whose cancel was not
 written yet is checked as a new one; a later run of this script on the same head resumes a record whose cancel
-completed since, sending the re-run then.
+completed since, sending the re-run then. Each write is durable (facts.write_record) before its request goes.
 
 The outcome, the worst of the runs' (uncertain, failed, withheld, completed, recovered, none in that order):
   recovered  each run acted on was cancelled and re-run, its new attempt observed
@@ -31,7 +34,8 @@ The outcome, the worst of the runs' (uncertain, failed, withheld, completed, rec
   withheld   a run was cancelled, and its re-run is not sent: PR N is no longer open at SHA, or the run not on its head
   none       no queued run on the head is a suspected orphan; each run's reason says why
   uncertain  a step's answer was lost, or what it asked for was not observed in time (a cancel that has not completed
-             the run, a re-run whose attempt does not show): nothing more is sent for that attempt
+             the run, a re-run whose attempt does not show), or the budget ran out first, a record's lock held past it
+             included: nothing more is sent for that attempt by this run
   failed     GitHub refused a step (HTTP 4xx): nothing more is sent for that attempt
 
 A recovery is no CI result: the caller waits on the new attempt like any pending check. stdout ends with one JSON line
@@ -41,9 +45,6 @@ left alone, else its step's outcome; evidence what made it a suspected orphan; r
 with {"error": ...} when the arguments are wrong or a read before anything was sent fails.
 """
 
-import base64
-import json
-import os
 import re
 import sys
 import time
@@ -51,15 +52,16 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from facts import FULL_SHA, Parser, Unusable, attempt, bind_repo, git, locked, report, utc  # noqa: E402
-from harvest import gh_json, pages, stamp, yaml  # noqa: E402
+from coderabbit_trigger import pull_at  # noqa: E402
+from facts import FULL_SHA, Busy, Parser, Unusable, attempt, bind_repo, locked, read_record, record_dir, report, utc, write_record  # noqa: E402
+from harvest import gh_json, pages, stamp, workflow_doc, yaml  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
-import windows  # noqa: E402
+from check_runs import RUN_PENDING  # noqa: E402
 
-CANCEL_WAIT = 45  # seconds: the whole script stays inside a relay's two-minute command
+BUDGET = 420  # seconds of the relay's 600 s Bash timeout the script may spend, leaving room for one GitHub call past it
+CANCEL_WAIT = 45
 RERUN_WAIT = 30
 POLL = 5
-UNFINISHED = ('queued', 'in_progress', 'waiting', 'pending', 'requested')
 PER_RUN = re.compile(r'\$\{\{\s*github\.run_id\s*\}\}')  # as the whole group: no other run can share it
 REFUSED = re.compile(r'\bHTTP 4\d\d\b')
 ORDER = ('uncertain', 'failed', 'withheld', 'completed', 'recovered')
@@ -67,33 +69,21 @@ ORDER = ('uncertain', 'failed', 'withheld', 'completed', 'recovered')
 READ_FAILED = (Unusable, KeyError, TypeError, AttributeError, IndexError, ValueError)
 
 
-def record_dir():
-    common = Path(git('rev-parse', '--path-format=absolute', '--git-common-dir').strip())
-    return common / 'pr-babysit' / 'ci-recover'
+END = None  # time.monotonic() when BUDGET runs out, set by collect
+
+
+def left():
+    """Seconds of BUDGET left."""
+    return END - time.monotonic()
 
 
 def read(path):
-    try:
-        record = json.loads(path.read_text(encoding='utf-8'))
-    except FileNotFoundError:
+    record = read_record(path)
+    if record is None:
         return None
-    except (OSError, ValueError) as e:
-        raise Unusable(f'attempt record {path} unreadable: {e}')
     if not isinstance(record, dict) or not isinstance(record.get('steps'), dict) or not isinstance(record.get('attempt'), int):
         raise Unusable(f'attempt record {path} is not one this script wrote')
     return record
-
-
-def write(path, record, new=False):
-    """The record on disk before anything acts on it: a new one created exclusively, a later one replaced whole."""
-    target = path if new else path.with_name(path.name + '.tmp')
-    fd = os.open(target, os.O_CREAT | os.O_WRONLY | (os.O_EXCL if new else os.O_TRUNC))
-    with os.fdopen(fd, 'w', encoding='utf-8') as f:
-        json.dump(record, f)
-        f.flush()
-        os.fsync(f.fileno())
-    if not new:
-        windows.replace(target, path)  # Windows: retried while another process has the record open
 
 
 def now():
@@ -101,7 +91,7 @@ def now():
 
 
 def iso(t):
-    return t.strftime('%Y-%m-%dT%H:%M:%SZ')
+    return utc(t.timestamp())
 
 
 def queued_at(r):
@@ -122,49 +112,55 @@ def group_of(repo, r):
     workflow file cannot be read for one."""
     if yaml is None:
         raise Unusable('PyYAML is not installed')
-    meta = gh_json('api', f"repos/{repo}/contents/{r['path']}?ref={r['head_sha']}")
-    try:
-        doc = yaml.safe_load(base64.b64decode(meta['content']).decode())
-    except (KeyError, ValueError, yaml.YAMLError) as e:
-        raise Unusable(f"{r['path']} at {r['head_sha'][:9]} does not parse: {e}")
-    if not isinstance(doc, dict):
-        raise Unusable(f"{r['path']} at {r['head_sha'][:9]} is no workflow")
+    doc = workflow_doc(repo, r['path'], r['head_sha'])
+    if doc is None:
+        raise Unusable(f"{r['path']} at {r['head_sha'][:9]} does not parse into a workflow")
     c = doc.get('concurrency')
     if c is None:
         return ''
     return str((c.get('group') if isinstance(c, dict) else c) or '')
 
 
-def holders(repo, r, group):
-    """The unfinished runs that could share the run's concurrency group: none for its own run id, else every other one."""
+def holder(repo, r, group):
+    """Why another unfinished run could share the run's concurrency group, None when none can: never for its own run
+    id, else when any other run in the repository is unfinished, read a status at a time on a page of two."""
     if PER_RUN.fullmatch(group):
-        return []
-    return [x for s in UNFINISHED for x in pages(f'repos/{repo}/actions/runs?status={s}', 'workflow_runs') if x.get('id') != r['id']]
+        return None
+    for status in RUN_PENDING:
+        page = gh_json('api', f'repos/{repo}/actions/runs?status={status}&per_page=2')
+        others = [x for x in page['workflow_runs'] if x.get('id') != r['id']]
+        if others or page['total_count'] > len(page['workflow_runs']):
+            return (f"its workflow's concurrency group {group!r} may be held by another unfinished run"
+                    + (f" (run {others[0]['id']}, {status})" if others else f' ({status})'))
+    return None
 
 
 def on_head(repo, pr, head, run_id):
     """(None, the run as read) when PR N is open at head and the run is on its head branch and repository at head, else
     (why not, None)."""
-    view = gh_json('pr', 'view', str(pr), '-R', repo, '--json', 'state,headRefOid,headRefName,headRepository')
-    if view['state'] != 'OPEN' or view['headRefOid'] != head:
-        return f"PR {pr} is {view['state']} at {view['headRefOid'][:9]}, not open at {head[:9]}", None
+    pull, why = pull_at(pr, head)
+    if why:
+        return why, None
     r = run_of(repo, run_id)
-    if r.get('head_sha') != head or r.get('head_branch') != view['headRefName'] or \
-            (r.get('head_repository') or {}).get('full_name') != view['headRepository']['nameWithOwner']:
+    if r.get('head_sha') != head or r.get('head_branch') != pull['head']['ref'] or \
+            (r.get('head_repository') or {}).get('full_name') != (pull['head']['repo'] or {}).get('full_name'):
         return "it is not on the PR's head branch and repository at the head", None
     return None, r
 
 
 def suspect(repo, pr, head, wait, listed):
     """(None, the evidence, the run as read last) when the run is a suspected orphan, else (why not, [], None); the
-    reads that change fastest come last, just before the caller acts."""
+    reads that cost least come first, and those that change fastest last, freshly just before the caller acts."""
+    waited = now() - queued_at(listed)
+    if waited < timedelta(minutes=wait):
+        return f'its attempt has been queued {int(waited.total_seconds() // 60)} minutes, under the {wait}-minute CI wait', [], None
+    jobs = jobs_of(repo, listed)
+    if jobs:
+        return f"its attempt {listed['run_attempt']} has {jobs} job(s)", [], None
     try:
         group = group_of(repo, listed)
     except Unusable as e:
         return f'whether a concurrency group holds it cannot be told ({e})', [], None
-    held = holders(repo, listed, group) if group else []
-    if held:
-        return f"its workflow's concurrency group {group!r} may be held by run {held[0]['id']} ({held[0].get('status')})", [], None
     newest = gh_json('api', f'repos/{repo}/actions/runs?status=completed&per_page=1')['workflow_runs']
     if not newest or stamp(newest[0]['created_at']) <= queued_at(listed):
         return 'no run in the repository created since it was queued has completed', [], None
@@ -176,6 +172,9 @@ def suspect(repo, pr, head, wait, listed):
     waited = now() - queued_at(r)
     if waited < timedelta(minutes=wait):
         return f'its attempt has been queued {int(waited.total_seconds() // 60)} minutes, under the {wait}-minute CI wait', [], None
+    held = holder(repo, r, group) if group else None
+    if held:
+        return held, [], None
     jobs = jobs_of(repo, r)
     if jobs:
         return f"its attempt {r['run_attempt']} has {jobs} job(s)", [], None
@@ -193,7 +192,7 @@ def answer(code, err):
 
 def observe(repo, run_id, done, seconds):
     """The run once done(run) holds, polled every POLL seconds for up to seconds; None when it never did."""
-    deadline = time.monotonic() + seconds
+    deadline = time.monotonic() + min(seconds, max(left(), 0))
     while True:
         r = run_of(repo, run_id)
         if done(r):
@@ -207,16 +206,18 @@ def step(repo, path, record, name, endpoint):
     """Send one step once: written before its POST, its answer after; an earlier answer when it was sent already."""
     if name not in record['steps']:
         record['steps'][name] = {'at': utc(time.time())}
-        write(path, record)
+        write_record(path, record)
         code, _, err = attempt('gh', 'api', '-X', 'POST', f"repos/{repo}/actions/runs/{record['runId']}/{endpoint}")
         record['steps'][name]['answer'] = answer(code, err)
-        write(path, record)
+        write_record(path, record)
     return record['steps'][name].get('answer') or 'unknown: the record holds no answer (a run cut short after sending)'
 
 
 def advance(repo, path, record):
     """(outcome, reason): the record's next step taken, or what its last one shows."""
     run_id, n = record['runId'], record['attempt']
+    if 'cancel' not in record['steps'] and left() <= 0:
+        return 'skipped', 'the time budget ran out before the cancel: nothing was sent'
     sent = step(repo, path, record, 'cancel', 'cancel')
     if sent.startswith('refused'):
         return 'failed', f'GitHub refused the cancel ({sent}); nothing more is sent for attempt {n}'
@@ -231,6 +232,8 @@ def advance(repo, path, record):
         why, r = on_head(repo, record['pr'], record['head'], run_id)
         if why:
             return 'withheld', f'the run was cancelled, and its re-run is not sent: {why}'
+        if left() <= 0:
+            return 'uncertain', 'the run was cancelled, and the time budget ran out before its re-run: a later run of this script sends it'
     if r['run_attempt'] == n or 'rerun' in record['steps']:
         sent = step(repo, path, record, 'rerun', 'rerun')
         if sent.startswith('refused'):
@@ -239,7 +242,7 @@ def advance(repo, path, record):
         if r is None:
             return 'uncertain', f'the run was cancelled and its re-run ({sent}) shows no new attempt within {RERUN_WAIT} seconds; it is not sent again'
     record['newAttempt'] = r['run_attempt']
-    write(path, record)
+    write_record(path, record)
     if 'rerun' not in record['steps']:
         return 'recovered', f"cancelled, and attempt {r['run_attempt']} ({r['status']}) was started by someone else: no re-run was sent"
     return 'recovered', f"cancelled and re-run: attempt {r['run_attempt']} is {r['status']}"
@@ -247,36 +250,45 @@ def advance(repo, path, record):
 
 def one(repo, pr, head, wait, listed):
     """One run's record: left alone, or its attempt's steps taken under its lock."""
-    path = record_dir() / f"{repo.replace('/', '-')}-{listed['id']}-{listed['run_attempt']}.json"
+    path = record_dir('ci-recover') / f"{repo.replace('/', '-')}-{listed['id']}-{listed['run_attempt']}.json"
     shown = {'runId': listed['id'], 'attempt': listed['run_attempt'], 'workflow': listed.get('name') or listed.get('path'),
              'evidence': [], 'newAttempt': None, 'record': None}
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with locked(path):
-        record = read(path)
-        if record is None and listed.get('status') != 'queued':
-            return None
-        if record is None or 'cancel' not in record['steps']:  # a record cut short before its cancel proves nothing
-            try:
-                why, evidence, r = suspect(repo, pr, head, wait, listed)
-            except READ_FAILED as e:
-                why = f'a read failed ({e!r}), so nothing was sent'
-            if why:
-                return {**shown, 'outcome': 'skipped', 'reason': why, 'record': record and str(path)}
-            fresh = record is None
-            record = {'repo': repo, 'pr': pr, 'head': head, 'runId': r['id'], 'attempt': r['run_attempt'], 'evidence': evidence, 'steps': {}}
-            write(path, record, new=fresh)
+    if listed.get('status') != 'queued' and not path.exists():
+        return None
+    try:
+        with locked(path, timeout=max(left(), 0)):
+            return under_lock(repo, pr, head, wait, listed, path, shown)
+    except Busy as e:
+        return {**shown, 'outcome': 'uncertain', 'reason': f'{e}, past the time budget: nothing was sent by this run', 'record': str(path)}
+
+
+def under_lock(repo, pr, head, wait, listed, path, shown):
+    """one()'s work under the record's lock."""
+    record = read(path)
+    if record is None and listed.get('status') != 'queued':
+        return None
+    if record is None or 'cancel' not in record['steps']:  # a record cut short before its cancel proves nothing
         try:
-            outcome, why = advance(repo, path, record)
+            why, evidence, r = suspect(repo, pr, head, wait, listed)
         except READ_FAILED as e:
-            outcome, why = 'uncertain', f'a read after the record was written failed ({e!r}); nothing is sent again for this attempt'
+            why = f'a read failed ({e!r}), so nothing was sent'
+        if why:
+            return {**shown, 'outcome': 'skipped', 'reason': why, 'record': record and str(path)}
+        fresh = record is None
+        record = {'repo': repo, 'pr': pr, 'head': head, 'runId': r['id'], 'attempt': r['run_attempt'], 'evidence': evidence, 'steps': {}}
+        write_record(path, record, new=fresh)
+    try:
+        outcome, why = advance(repo, path, record)
+    except READ_FAILED as e:
+        outcome, why = 'uncertain', f'a read after the record was written failed ({e!r}); nothing is sent again for this attempt'
     return {**shown, 'outcome': outcome, 'reason': why, 'evidence': record['evidence'], 'newAttempt': record.get('newAttempt'),
             'record': str(path)}
 
 
 def recover(repo, pr, head, wait):
-    view = gh_json('pr', 'view', str(pr), '-R', repo, '--json', 'state,headRefOid')
-    if view['state'] != 'OPEN' or view['headRefOid'] != head:
-        return {'outcome': 'none', 'detail': f"PR {pr} is {view['state']} at {view['headRefOid'][:9]}, not open at {head[:9]}", 'runs': []}
+    why = pull_at(pr, head)[1]
+    if why:
+        return {'outcome': 'none', 'detail': why, 'runs': []}
     listed = [r for r in pages(f'repos/{repo}/actions/runs?head_sha={head}', 'workflow_runs') if r.get('head_sha') == head]
     runs = [x for x in (one(repo, pr, head, wait, r) for r in listed) if x]
     outcome = next((o for o in ORDER if any(x['outcome'] == o for x in runs)), 'none')
@@ -295,6 +307,8 @@ def collect(argv):
         raise Unusable(f'not a full SHA: {a.head!r}')
     if a.wait_minutes < 1:
         raise Unusable(f'--wait-minutes must be at least 1: {a.wait_minutes}')
+    global END
+    END = time.monotonic() + BUDGET
     repo = bind_repo(a.repo)
     try:
         out = recover(repo, a.pr, a.head, a.wait_minutes)

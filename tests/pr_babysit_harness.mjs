@@ -2121,6 +2121,7 @@ test('CI stuck through two whole waits asks ci_recover.py once per head; a recov
   const call = calls.find(c => c.label === 'cirecover#2')
   assert.ok(call.prompt.includes(`ci_recover.py --pr 3888 --repo 'hathach/tinyusb' --head ${HEAD} --wait-minutes 30\``), call.prompt)
   assert.deepEqual([call.agentType, call.model], ['relay', 'haiku'])
+  assert.ok(call.prompt.includes('with a Bash timeout of 600000 ms'), 'the script keeps within the tool\'s maximum, not its default')
   assert.ok(logs.includes('cycle 2: cirecover#2: recovered (run 43095438193 attempt 1: recovered)'), logs.join('\n'))
   assert.equal(result.reason, 'ci-stuck', 'still pending two whole waits after the re-run: stuck, never green')
   assert.equal(result.cycles, 4)
