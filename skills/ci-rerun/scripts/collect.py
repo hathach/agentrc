@@ -570,9 +570,8 @@ def inventory(repo, pr, head, wait, ignore=(), brief=False, links=None, required
             # The whole run listing only while nothing else is pending; the gates from it then, else by their own filter.
             runs = None if any(c['bucket'] == 'pending' for c in checks) else head_runs(repo, head)
             checks += held_runs(runs or [], everything) + approval_checks(gated_runs(repo, head, workflow_runs, runs))
-        counts = summary(checks, view.get('mergeable'))[1]
         reqs = judge(view, checks)
-        status = summary(checks, view.get('mergeable'), reqs)[0]
+        status, counts = summary(checks, view.get('mergeable'), reqs)
         waited = int(time.monotonic() - start)
         if status != 'running' or waited + POLL > wait:
             break
