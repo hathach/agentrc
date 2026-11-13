@@ -2244,11 +2244,14 @@ class OperatorResolution(LockDir):
         rc, text = self.resolve(fid)
         self.assertEqual(rc, 1)
         self.assertIn('its evidence is malformed', text)
+        real, reads = hil_lock._journal_records, []
+        self.patch(hil_lock, '_journal_records', lambda j: reads.append(j) or real(j))
         gone = {**me, 'start': '1'}       # the same pid, another start: not the holder the journal kept
         fid = secrets.token_hex(8)
         hil_lock._log_append(BOARD, {'event': 'failed', 'id': fid, 'how': 'found-left', 'task': task,
                                      'journal': {'token': 't', 'predecessor': json.dumps(gone), 'prior': None}})
         self.assertEqual(self.resolve(fid)[0], 0)
+        self.assertEqual(len(reads), 1, 'one snapshot of the journal decides')
 
     def test_a_helper_that_cannot_load_or_a_restoration_meanwhile_refuses(self):
         fid = self.failure(receipts=[{'unrecheckable': ['x']}])

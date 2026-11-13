@@ -819,7 +819,7 @@ def resolve_restored(board, failures, **evidence) -> list:
         if found is None:
             notes.append(f'{fid} stays open: its takeover journal cannot be read')
             continue
-        receipts, retained = found
+        receipts, retained, _ = found
         if not all(isinstance(x, list) for x in receipts + retained):
             notes.append(f'{fid} stays open: its evidence is malformed')
         elif why := _release_blocker(sum(receipts, []), retained=sum(retained, [])):
@@ -833,14 +833,14 @@ def resolve_restored(board, failures, **evidence) -> list:
 
 
 def _failure_evidence(f):
-    """([receipts], [retained]) of the logged failure `f`, lists as logged: its own (or its legacy
-    task record's), then those of each record its takeover journal kept; None when that journal
-    cannot be read."""
+    """([receipts], [retained], records) of the logged failure `f`, lists as logged: its own (or its
+    legacy task record's), then those of each of the records its takeover journal kept, read once;
+    None when that journal cannot be read."""
     task = f.get('task') if isinstance(f.get('task'), dict) else {}
     held = _journal_records(f['journal']) if 'journal' in f else []
     if held is None:
         return None
-    return tuple([_evidence(f, task, k)] + [r.get(k, []) for r in held] for k in ('receipts', 'retained'))
+    return (*([_evidence(f, task, k)] + [r.get(k, []) for r in held] for k in ('receipts', 'retained')), held)
 
 
 def acknowledge_failure(board, failure_id, reason) -> dict:
@@ -877,11 +877,10 @@ def acknowledge_failure(board, failure_id, reason) -> dict:
         if found is None:
             raise LogRefused(f'{failure_id} stays open: its takeover journal cannot be read, so neither can all of '
                              f'its evidence')
-        receipts, retained = found
+        receipts, retained, held = found
         if not all(isinstance(x, list) for x in receipts + retained):
             raise LogRefused(f'{failure_id} stays open: its evidence is malformed')
         live += _live_evidence(sum(receipts, []), sum(retained, []))
-        held = _journal_records(f['journal']) if 'journal' in f else []
         live += [f'takeover journal holder pid {pid} running' for pid in _live_survivors({'survivors': held})]
     if live:
         raise LogRefused(f'{failure_id} stays open: its evidence is still live: {"; ".join(live)}')
