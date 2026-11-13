@@ -3515,9 +3515,10 @@ class SessionMutex(LockDir):
             todo += [c for c in code.co_consts if isinstance(c, types.CodeType)]
         return codes
 
-    def interrupt_every_take(self, sig, storm):
+    def interrupt_every_take(self, sig, storm, body=lambda: None):
         """Take and drop the mutex once per check point, `sig` raised at that one (and with `storm` at every one
-        after it): each take ends interrupted with no fd kept, the handlers back, and the mutex free here."""
+        after it), body() run under it: each take ends interrupted with no fd kept, the handlers back, and the mutex
+        free here."""
         class Terminated(BaseException):
             pass
 
@@ -3534,12 +3535,12 @@ class SessionMutex(LockDir):
         fds = sorted(os.listdir('/proc/self/fd'))
         mon.use_tool_id(tool, 'session_mutex interrupts')
         try:
-            self.take_interrupted(codes, sig, storm, fds, term, Terminated)
+            self.take_interrupted(codes, sig, storm, fds, term, Terminated, body)
         finally:
             mon.register_callback(tool, mon.events.INSTRUCTION, None)
             mon.free_tool_id(tool)
 
-    def take_interrupted(self, codes, sig, storm, fds, term, Terminated):
+    def take_interrupted(self, codes, sig, storm, fds, term, Terminated, body):
         mon, tool = sys.monitoring, sys.monitoring.DEBUGGER_ID
         seen = 0
 
@@ -3557,7 +3558,7 @@ class SessionMutex(LockDir):
                 mon.set_local_events(tool, code, mon.events.INSTRUCTION)
             try:
                 with hil_lock.session_mutex(BOARD):
-                    pass
+                    body()
             except (KeyboardInterrupt, Terminated):
                 interrupted = True
             else:
@@ -3585,6 +3586,14 @@ class SessionMutex(LockDir):
         """#537: a first interrupt before the cleanup and a second on its back-edge leaked both fds."""
         for sig in (signal.SIGINT, signal.SIGTERM):
             self.interrupt_every_take(sig, storm=True)
+
+    def test_a_handler_the_body_installed_still_defers_in_its_cleanup(self):
+        """A with block that installs its own handler (signal.default_int_handler here) replaces the deferring one:
+        the cleanup installs it again before it lets go of an fd."""
+        def body():
+            signal.signal(signal.SIGINT, signal.default_int_handler)
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            self.interrupt_every_take(sig, storm=False, body=body)
 
     def test_a_helper_that_cannot_load_acquires_nothing(self):
         fds = sorted(os.listdir('/proc/self/fd'))

@@ -189,6 +189,15 @@ class InterruptHold:
         for sig in dict.fromkeys(pending):
             signal.raise_signal(sig)
 
+    def rearm(self) -> None:
+        """Defer again, the deferring handler put back where one installed since replaced it
+        (release() restores the handlers found at construction). signal.signal runs a pending
+        signal's handler before it swaps, so one already pending as this starts is not deferred."""
+        self.deferring = True
+        for sig in self._held:
+            if signal.getsignal(sig) != self._defer:
+                signal.signal(sig, self._defer)
+
     def release(self) -> None:
         self._released = True
         for sig, old in self._held.items():

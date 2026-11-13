@@ -1374,7 +1374,9 @@ def session_mutex(lock):
 
     SIGINT and SIGTERM are deferred (hil_process.InterruptHold) from before its first fd opens
     until both are closed, the with block alone excepted, so a caller catching the interrupt
-    keeps no flock; one deferred is raised after the closes, ahead of a close's error."""
+    keeps no flock; one deferred is raised after the closes, ahead of a close's error. A handler
+    the with block installed defers again in the cleanup (InterruptHold.rearm, which cannot defer
+    a signal already pending as it starts) and is replaced at exit by the one found at entry."""
     _check_name(lock)
     try:
         process = _process()        # before any fd: a helper that cannot load acquires nothing
@@ -1402,12 +1404,19 @@ def session_mutex(lock):
         raise
     finally:
         hold.deferring = True       # first: an attribute store is no interrupt check, a call's entry is
+        rearmed = None
+        try:
+            hold.rearm()            # a handler the with block installed defers too, before an fd goes
+        except BaseException as e:
+            rearmed = e             # pending as it began: raised once the fds are closed
         while fds:
             try:
                 os.close(fds.pop())       # once each: a failed close frees the fd number all the same
             except Exception as e:
                 failed = failed or e
         hold.release()
+        if rearmed is not None:
+            raise rearmed
         if failed is not None and (raised is None or isinstance(raised, Exception)):     # an interrupt wins
             raise failed
 
