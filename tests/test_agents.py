@@ -109,6 +109,13 @@ class AgentFiles(unittest.TestCase):
         self.assertEqual(sorted(cleanup['flashVerify']), ['command', 'result'], 'a hash alone does not verify a flash')
         self.assertEqual(sorted(cleanup['runState']), ['command', 'result'], 'a verified flash alone does not restore the run state')
 
+    def test_a_relay_runs_its_command_before_answering_anything(self):
+        """agentrc#527: a weaker relay filled the schema from priors without running the command. Prompt hardening
+        only: this checks the rule is stated, not that a model follows it."""
+        text = (AGENTS / 'relay.md').read_text()
+        self.assertIn('Your first tool call is that command itself', text)
+        self.assertIn('fabricated', text)
+
     def test_restoration_flashes_a_pinned_artifact_and_verifies_against_it(self):
         body = ' '.join((SKILLS / 'target-debug' / 'SKILL.md').read_text().split())
         self.assertIn('save the restoration artifact apart from later build outputs and pin it', body)
