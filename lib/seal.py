@@ -85,6 +85,12 @@ def claim():
 EMIT_TO, emit_fd = claim()
 
 
+def module_text(path, line):
+    """The data module a workflow loads with workflow({scriptPath}) for line written to path: compact ASCII JSON."""
+    return ("export const meta = { name: 'emit', description: 'a script line' }\n"
+            f"return {json.dumps({'emit': path, 'line': line}, separators=(',', ':'))}\n")
+
+
 def emit(line, code):
     """Print line as the last stdout line and return code; under AGENTRC_EMIT write it instead to the file claimed at
     import, as a data module a workflow loads with workflow({scriptPath}) (`return {"emit": <that path>, "line":
@@ -96,7 +102,6 @@ def emit(line, code):
         return code
     fd, emit_fd = emit_fd, None
     with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as f:
-        f.write("export const meta = { name: 'emit', description: 'a script line' }\n"
-                f"return {json.dumps({'emit': EMIT_TO, 'line': line}, separators=(',', ':'))}\n")
+        f.write(module_text(EMIT_TO, line))
     print(f'the line is in {EMIT_TO}')
     return code

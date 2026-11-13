@@ -327,9 +327,8 @@ const emitted = async (prompt, { label, inputDir, ...opts }) => {
   const stageError = st && st.emit === stageFile && st.line && typeof st.line.error === 'string' ? st.line.error : null
   if (stageError !== null && st.line.claimed === false) return { why: stageError, stage: true }
   if (refused || stageError !== null) {
-    const claim = stageError === null || st.line.claimed === true ? `an earlier attempt of this call claimed ${file} and left no line of it`
-      : `its line does not say whether an earlier attempt of this call claimed ${file}`
-    log(`${label}: ${stageError !== null ? `its stage refused its input (${stageError}), and ` : ''}${claim} — its outcome is unknown`)
+    log(`${label}: ${stageError !== null ? `its stage refused its input (${stageError}), and ` : ''}an earlier attempt of this call ` +
+      `claimed ${file} and left no line of it — its outcome is unknown`)
     return { dead: true, why: 'an earlier attempt left no line: its outcome is unknown' }
   }
   return { dead: !m && !ran, why: m ? `${file} holds no line written for it` : !ran ? 'the relay died'

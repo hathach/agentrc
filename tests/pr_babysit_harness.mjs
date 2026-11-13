@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { test as nodeTest } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { ABSENT, AsyncFunction, emitDirs, emitOf, loadModule, moduleOf } from './emit_stub.mjs'
@@ -1443,9 +1443,14 @@ test('the committer gets the claims without their hints, and the message on stdi
   assert.doesNotMatch(commit, /temporary file|mktemp|rm -f/)
 })
 
-// A relay command as Bash runs it: `cmd` from its prompt, its AGENTRC_EMIT moved to `emit` (its stage's beside it); the
+// A relay command as Bash runs it: `cmd` from its prompt, its AGENTRC_EMIT moved to `emit` (its stage's beside it, in
+// a directory standing for the launch's, with facts.py emit-dir's mark made before any relay's transcript); the
 // scripts under `root`.
-const runCommand = (cmd, root, emit, env = {}) => spawnSync('bash', ['-c', cmd.replace(/ --line '[^']+' /, ` --line '${emit}.stage.js' `)
+const launchMarked = (emit) => {
+  const mark = join(dirname(emit), '.launch')
+  if (!existsSync(mark)) writeFileSync(mark, `${Date.now() / 1000 - 60}\n`)
+}
+const runCommand = (cmd, root, emit, env = {}) => launchMarked(emit) ?? spawnSync('bash', ['-c', cmd.replace(/ --line '[^']+' /, ` --line '${emit}.stage.js' `)
   .replace(/ --claimed '[^']+' /, ` --claimed '${emit}' `).replace(/AGENTRC_EMIT='[^']+' /, `AGENTRC_EMIT='${emit}' `)], { encoding: 'utf8', env: { ...process.env, AGENTRC_DIR: root, ...env } })
 const commandOf = (prompt) => String(prompt).match(/run exactly `([^`]*)` and answer/)[1]
 // The interpreter the commands run under: PIN's /usr/bin/python3 does not exist on Windows; forward slashes for bash.

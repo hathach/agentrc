@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -223,6 +224,8 @@ class EmitDirTest(unittest.TestCase):
         parent = (self.repo / '.git' / 'agentrc-emit').resolve()
         self.assertEqual(Path(first['dir']).parent.resolve(), parent)
         self.assertTrue(os.path.isabs(first['dir']))
+        began = float((Path(first['dir']) / '.launch').read_text())
+        self.assertLess(abs(began - time.time()), 60, 'its launch mark says when it was made')
         stale = parent / 'old'
         stale.mkdir()
         os.utime(stale, (0, 0))
@@ -250,31 +253,6 @@ class EmitDirTest(unittest.TestCase):
         self.assertEqual(Path(self.emit_dir(linked)[1]['dir']).parent.resolve(), (self.repo / '.git' / 'agentrc-emit').resolve())
 
 
-
-class StageTest(unittest.TestCase):
-    """facts.py stage: a relay command's script input, written only when it is the JSON the workflow sent."""
-
-    def stage(self, data, digest):
-        out = Path(tempfile.mkdtemp()) / 'x.in'
-        self.addCleanup(shutil.rmtree, out.parent)
-        done = subprocess.run([sys.executable, str(FACTS), 'stage', str(out), digest], input=data, capture_output=True)
-        return done.returncode, json.loads(done.stdout.decode().splitlines()[-1]), out
-
-    def test_the_bytes_sent_are_written_and_anything_else_refused(self):
-        text = json.dumps({'body': "it's \\ naïve ✓ 😀\r\n"}, ensure_ascii=False)
-        sent = base64.b64encode(text.encode())
-        code, line, out = self.stage(sent, fnv1a(text))
-        self.assertEqual((code, line, out.read_bytes()), (0, {'staged': str(out)}, text.encode()))
-        for data, digest, why in [
-            (sent, fnv1a(text + ' '), 'not the JSON sent'),
-            (sent + b'\n', fnv1a(text), 'not base64'),
-            (base64.b64encode(b'\xff[]'), fnv1a(text), 'not base64 of UTF-8 JSON'),
-            (base64.b64encode(b'{'), fnv1a('{'), 'not base64 of UTF-8 JSON'),
-        ]:
-            code, line, out = self.stage(data, digest)
-            self.assertEqual(code, 2, why)
-            self.assertIn(why, line['error'])
-            self.assertFalse(out.exists(), why)
 
 SESSION = '3b3ec575-092d-4e18-a4d8-e20371216222'
 FRAME = ('[Workflow harness \u2014 computed task] The task text below was computed at runtime by a workflow script. '
@@ -305,11 +283,11 @@ class TranscriptStageTest(unittest.TestCase):
         (d / name).write_text(''.join(json.dumps(r) + '\n' for r in records), encoding='utf-8')
         return d / name
 
-    def stage(self, file, digest, sid=SESSION, sleep=None):
+    def stage(self, file, digest, sid=SESSION, sleep=None, since=0):
         env = {'CLAUDE_CONFIG_DIR': str(self.config), 'CLAUDE_CODE_SESSION_ID': sid}
         with mock.patch.dict(os.environ, env), mock.patch.object(self.facts.time, 'sleep', sleep or (lambda s: None)):
             try:
-                return self.facts.stage(str(file), digest, from_transcript=True)
+                return self.facts.stage(str(file), digest, since)
             except self.facts.Unusable as e:
                 return {'error': str(e)}
 
@@ -352,7 +330,10 @@ class TranscriptStageTest(unittest.TestCase):
                 # #540's wf_50588965-35f: five characters substituted, valid base64 of valid JSON, so only the digest tells.
                 ('substituted characters', [self.prompt(text, out).replace(b64, base64.b64encode(text.replace('reply', 'rEPLY').encode()).decode())],
                  'is not the JSON sent'),
-                ('cut short', [self.prompt(text, out).replace(b64, b64[:-2])], 'is not base64 of UTF-8 JSON')):
+                ('cut short', [self.prompt(text, out).replace(b64, b64[:-2])], 'is not base64 of UTF-8 JSON'),
+                ('not base64', [self.prompt(text, out).replace(b64, b64[:-4] + '!' * 4)], 'is not base64 of UTF-8 JSON'),
+                ('not UTF-8', [self.prompt(text, out).replace(b64, base64.b64encode(b'\xff[]').decode())], 'is not base64 of UTF-8 JSON'),
+                ('not JSON', [self.prompt('{', out).replace(fnv1a('{'), fnv1a(text))], 'is not base64 of UTF-8 JSON')):
             with self.subTest(what):
                 shutil.rmtree(self.config, ignore_errors=True)
                 for i, prompt in enumerate(prompts):
@@ -390,21 +371,32 @@ class TranscriptStageTest(unittest.TestCase):
         text, out = json.dumps({'n': 1}), self.tmp / 'x.in'
         for i in range(3):
             self.transcript(self.prompt(json.dumps({'other': i}), self.tmp / f'o{i}.in'), name=f'agent-{i}.jsonl', wf=f'wf_{i}')
-            os.utime(self.config / 'projects' / '-home-x' / SESSION / 'subagents' / 'workflows' / f'wf_{i}' / f'agent-{i}.jsonl', (9e9, 9e9))
-        self.transcript(self.prompt(text, out), name='agent-old.jsonl', wf='wf_old')
+        self.transcript(self.prompt(text, out), name='agent-new.jsonl', wf='wf_new')
         with mock.patch.object(self.facts, 'SCAN_FILES', 3):
             got = self.stage(out, fnv1a(text))
-        self.assertIn('the transcript scan stopped at its bound (3 of 4 transcripts read)', got['error'])
+        self.assertIn('the transcript scan stopped at its bound (4 transcripts written since the launch began, over 3)', got['error'])
         with mock.patch.object(self.facts, 'SCAN_BYTES', 100):
             got = self.stage(out, fnv1a(text))
         self.assertIn('the transcript scan stopped at its bound (100 bytes read', got['error'])
         self.assertFalse(out.exists())
         self.assertEqual(self.stage(out, fnv1a(text)), {'staged': str(out)}, 'within its bounds it is found')
 
+    def test_only_transcripts_written_since_the_launch_began_count_toward_the_bound(self):
+        text, out = json.dumps({'n': 1}), self.tmp / 'x.in'
+        began = time.time() - 60
+        for i in range(5):  # an earlier launch's relays, one naming this file with other JSON
+            other = self.transcript(self.prompt(json.dumps({'other': i}), out if i == 0 else self.tmp / f'o{i}.in'), name=f'agent-{i}.jsonl', wf=f'wf_{i}')
+            os.utime(other, (began - 3600, began - 3600))
+        self.transcript(self.prompt(text, out), name='agent-new.jsonl', wf='wf_new')
+        with mock.patch.object(self.facts, 'SCAN_FILES', 1):
+            self.assertEqual(self.stage(out, fnv1a(text), since=began), {'staged': str(out)}, 'the older ones are not read')
+        self.assertEqual(out.read_text(), text)
+
     @unittest.skipUnless(shutil.which('node'), 'needs Node.js')
     def test_its_line_is_rewritten_on_every_run_so_a_resumed_command_goes_on(self):
         text, out = json.dumps({'n': 1}), self.tmp / 'x.in'
         line = self.tmp / 'x.stage.js'
+        (self.tmp / '.launch').write_text(f'{time.time() - 60}\n')
         env = {**{k: v for k, v in os.environ.items() if k != 'AGENTRC_EMIT'}, 'CLAUDE_CONFIG_DIR': str(self.config), 'CLAUDE_CODE_SESSION_ID': SESSION}
 
         claim = self.tmp / 'x.js'
@@ -427,10 +419,19 @@ class TranscriptStageTest(unittest.TestCase):
         self.assertEqual(run(), (0, {'staged': str(out), 'claimed': False}))
         self.assertEqual(out.read_text(), text)
 
-    def test_the_cli_takes_the_flag_and_names_the_stage_in_its_usage(self):
-        done = subprocess.run([sys.executable, str(FACTS), 'stage', 'x', 'y', '--bogus'], capture_output=True, text=True)
-        self.assertEqual(done.returncode, 2)
-        self.assertIn('stage FILE DIGEST [--from-transcript [--line PATH [--claimed PATH]]]', json.loads(done.stdout.splitlines()[-1])['error'])
+    def test_the_cli_takes_every_flag_and_names_the_stage_in_its_usage(self):
+        line = self.tmp / 'x.stage.js'
+        for argv, why in ((['x', 'y', '--from-transcript', '--line', str(line)], 'the following arguments are required: --claimed'),
+                          (['x', 'y', '--line', str(line), '--claimed', 'c'], 'the following arguments are required: --from-transcript'),
+                          (['x', 'y', '--from-transcript', '--line', str(line), '--claimed', 'c', '--bogus'], 'unrecognized arguments: --bogus'),
+                          (['x', 'y', '--from-transcript', '--line', str(line), '--claimed', 'c'], 'does not tell when the launch began')):
+            with self.subTest(why):
+                done = subprocess.run([sys.executable, str(FACTS), 'stage', *argv], capture_output=True, text=True,
+                                      env={k: v for k, v in os.environ.items() if k != 'AGENTRC_EMIT'})
+                self.assertEqual(done.returncode, 2)
+                self.assertIn(why, json.loads(done.stdout.splitlines()[-1])['error'])
+        done = subprocess.run([sys.executable, str(FACTS), 'bogus'], capture_output=True, text=True)
+        self.assertIn('stage FILE DIGEST --from-transcript --line PATH --claimed PATH', json.loads(done.stdout.splitlines()[-1])['error'])
 
 
 if __name__ == '__main__':

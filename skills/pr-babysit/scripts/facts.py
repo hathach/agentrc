@@ -27,7 +27,7 @@ except ImportError:  # Windows
     import msvcrt
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
-from seal import canonical, emit, fnv1a, rate_limit, sealed, utc  # noqa: E402,F401  re-exported for the scripts
+from seal import canonical, emit, fnv1a, module_text, rate_limit, sealed, utc  # noqa: E402,F401  re-exported for the scripts
 import gh_repo  # noqa: E402
 import windows  # noqa: E402
 from gh_repo import HOST, REPO, github_repo  # noqa: E402,F401  re-exported for the scripts
@@ -174,11 +174,13 @@ def report(collect, argv, seal=False, limits=False):
 
 
 EMIT_KEEP = 14 * 86400  # seconds an emit directory outlives its last write: a launch resumed later reloads its files
+# In each emit directory, written once at its creation: when its launch began, which bounds the transcripts a stage reads.
+LAUNCH_MARK = '.launch'
 
 
 def emit_dir():
-    """A new directory for one workflow launch's emitted lines, under the checkout's git common dir; directories there
-    unwritten for EMIT_KEEP go."""
+    """A new directory for one workflow launch's emitted lines, under the checkout's git common dir, its LAUNCH_MARK
+    written; directories there unwritten for EMIT_KEEP go."""
     parent = Path(git('rev-parse', '--path-format=absolute', '--git-common-dir').strip()) / 'agentrc-emit'
     parent.mkdir(exist_ok=True)
     for old in parent.iterdir():
@@ -187,26 +189,40 @@ def emit_dir():
                 shutil.rmtree(old)
         except OSError:
             pass
-    return {'dir': Path(tempfile.mkdtemp(prefix='', dir=parent)).as_posix()}
+    made = Path(tempfile.mkdtemp(prefix='', dir=parent))
+    with open(made / LAUNCH_MARK, 'x', encoding='utf-8') as f:
+        f.write(f'{time.time()}\n')
+    return {'dir': made.as_posix()}
 
 
-def staged_bytes(text, digest, where):
+def launch_began(directory):
+    """When the launch whose emit directory this is began: its LAUNCH_MARK, written once by emit_dir."""
+    mark = Path(directory) / LAUNCH_MARK
+    try:
+        return float(mark.read_text(encoding='utf-8'))
+    except (OSError, ValueError) as e:
+        raise Unusable(f'facts.py stage: {mark} does not tell when the launch began ({e}): no transcript scan is bounded by it') from None
+
+
+def staged_bytes(text, digest, file):
     """text, base64 of UTF-8 JSON, as bytes once its fnv1a is digest."""
     try:
         data = base64.b64decode(text, validate=True)
         decoded = data.decode('utf-8')
         json.loads(decoded)
     except ValueError as e:  # binascii.Error, UnicodeDecodeError and JSONDecodeError among them
-        raise Unusable(f'facts.py stage: {where} is not base64 of UTF-8 JSON: {e}') from None
+        raise Unusable(f'facts.py stage: the payload for {file} is not base64 of UTF-8 JSON: {e}') from None
     if fnv1a(decoded) != digest:
-        raise Unusable(f'facts.py stage: {where} is not the JSON sent')
+        raise Unusable(f'facts.py stage: the payload for {file} is not the JSON sent')
     return data
 
 
 SESSION_ID = re.compile(r'\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z')
 PAYLOAD = 'AGENTRC-PAYLOAD'
-# The newest transcripts read, the bytes read from them in all, and the lines read for each one's first user record.
+# The transcripts written since the launch began that are read, the bytes read from them in all, and the lines read
+# for each one's first user record.
 SCAN_FILES = 400
+SCAN_SLACK_S = 2  # a filesystem's coarsest mtime step: a transcript the launch wrote is never older than its mark by more
 SCAN_BYTES = 64 << 20
 SCAN_LINES = 8
 SCAN_RETRY_S = 2  # a relay's prompt is in its transcript before its first command runs; the one wait is for a slow write
@@ -236,16 +252,18 @@ def mtime(path):
         return 0
 
 
-def payloads(sid, file, digest):
-    """The payload texts this session's subagent transcripts give FILE and DIGEST in their first user record, newest
-    transcript first; Bounded when a bound stopped the scan first."""
+def payloads(sid, file, digest, since):
+    """The payload texts this session's subagent transcripts written since `since` give FILE and DIGEST in their first
+    user record, newest transcript first; Bounded when there are more of them than SCAN_FILES, or the bytes bound stopped
+    the scan first. An older transcript is an earlier launch's: none holds this launch's file."""
     root = Path(os.environ.get('CLAUDE_CONFIG_DIR') or Path.home() / '.claude')
-    found = sorted(root.glob(f'projects/*/{sid}/subagents/**/agent-*.jsonl'), key=mtime, reverse=True)
+    found = sorted((p for p in root.glob(f'projects/*/{sid}/subagents/**/agent-*.jsonl') if mtime(p) >= since - SCAN_SLACK_S),
+                   key=mtime, reverse=True)
+    if len(found) > SCAN_FILES:
+        raise Bounded(f'{len(found)} transcripts written since the launch began, over {SCAN_FILES}')
     head = f'{PAYLOAD} {file} {digest} '
     got, left = [], SCAN_BYTES
     for n, path in enumerate(found):
-        if n == SCAN_FILES:
-            raise Bounded(f'{SCAN_FILES} of {len(found)} transcripts read')
         try:
             with open(path, encoding='utf-8', errors='replace') as f:
                 for _ in range(SCAN_LINES):
@@ -267,30 +285,27 @@ def payloads(sid, file, digest):
     return got, len(found)
 
 
-def stage(file, digest, from_transcript=False):
+def stage(file, digest, since):
     """Write to file the JSON the workflow sent, once it decodes to UTF-8 JSON whose fnv1a is digest: the bytes as sent,
-    so no shell quoting meets the text. From stdin as base64, or, from_transcript, from the AGENTRC-PAYLOAD line naming
-    file and digest in this session's subagent transcripts: the relay's own prompt, which no model retypes (#540)."""
-    if from_transcript:
-        sid = os.environ.get('CLAUDE_CODE_SESSION_ID') or ''
-        if not SESSION_ID.match(sid):
-            raise Unusable(f'facts.py stage: CLAUDE_CODE_SESSION_ID {sid!r} names no session, so no transcript holds the payload')
-        for wait in (SCAN_RETRY_S, None):
-            try:
-                got, scanned = payloads(sid, file, digest)
-            except Bounded as e:
-                raise Unusable(f'facts.py stage: the transcript scan stopped at its bound ({e}) before finding the payload for {file}') from None
-            if got or wait is None:
-                break
-            time.sleep(wait)
-        if not got:
-            raise Unusable(f'facts.py stage: no {PAYLOAD} line for {file} {digest} in the first user record of '
-                           f"this session's {scanned} subagent transcript(s), read twice")
-        if len(set(got)) > 1:
-            raise Unusable(f'facts.py stage: {len(set(got))} different {PAYLOAD} lines name {file} {digest}: none is taken')
-        data = staged_bytes(got[0], digest, f'the payload for {file}')
-    else:
-        data = staged_bytes(sys.stdin.buffer.read(), digest, 'staged input')
+    so no shell quoting meets the text, from the AGENTRC-PAYLOAD line naming file and digest in this session's subagent
+    transcripts written since the launch began (`since`): the relay's own prompt, which no model retypes (#540)."""
+    sid = os.environ.get('CLAUDE_CODE_SESSION_ID') or ''
+    if not SESSION_ID.match(sid):
+        raise Unusable(f'facts.py stage: CLAUDE_CODE_SESSION_ID {sid!r} names no session, so no transcript holds the payload')
+    for wait in (SCAN_RETRY_S, None):
+        try:
+            got, scanned = payloads(sid, file, digest, since)
+        except Bounded as e:
+            raise Unusable(f'facts.py stage: the transcript scan stopped at its bound ({e}) before finding the payload for {file}') from None
+        if got or wait is None:
+            break
+        time.sleep(wait)
+    if not got:
+        raise Unusable(f'facts.py stage: no {PAYLOAD} line for {file} {digest} in the first user record of '
+                       f"this session's {scanned} subagent transcript(s) written since the launch began, read twice")
+    if len(set(got)) > 1:
+        raise Unusable(f'facts.py stage: {len(set(got))} different {PAYLOAD} lines name {file} {digest}: none is taken')
+    data = staged_bytes(got[0], digest, file)
     try:
         Path(file).write_bytes(data)
     except OSError as e:
@@ -302,12 +317,9 @@ def stage_line(path, line):
     """The stage's own line at path, as lib/seal.py's emit writes a script's, so the workflow tells a refused stage from
     a script whose outcome is unknown. Replaced whole on every run, never claimed once as an AGENTRC_EMIT file is: a
     resumed command stages again and goes on to its script."""
-    if path is None:
-        return
     tmp = Path(f'{path}.tmp')
     try:
-        tmp.write_text("export const meta = { name: 'emit', description: 'a script line' }\n"
-                       f"return {json.dumps({'emit': path, 'line': line}, separators=(',', ':'))}\n", encoding='utf-8', newline='\n')
+        tmp.write_text(module_text(path, line), encoding='utf-8', newline='\n')
         windows.replace(tmp, path)
     except OSError as e:
         raise Unusable(f'facts.py stage: its line not written to {path}: {e}') from None
@@ -318,26 +330,29 @@ def collect(argv):
         return {'repo': checkout_repo()}
     if argv == ['emit-dir']:
         return emit_dir()
-    if argv[:1] == ['stage'] and len(argv) == 3:
-        return stage(*argv[1:])
-    if argv[:1] == ['stage'] and argv[3:4] == ['--from-transcript'] and len(argv) in (4, 6, 8) and \
-            argv[4:5] in ([], ['--line']) and argv[6:7] in ([], ['--claimed']):
-        to = argv[5] if len(argv) >= 6 else None
+    if argv[:1] == ['stage']:
+        p = Parser(prog='facts.py stage')
+        p.add_argument('file')
+        p.add_argument('digest')
+        p.add_argument('--from-transcript', action='store_true', required=True)
+        p.add_argument('--line', required=True)
+        p.add_argument('--claimed', required=True)
+        a = p.parse_args(argv[1:])
         # Whether an earlier run of the command claimed its script's AGENTRC_EMIT file: that script may have acted.
-        claimed = {'claimed': Path(argv[7]).exists()} if len(argv) == 8 else {}
+        claimed = Path(a.claimed).exists()
         try:
-            out = stage(*argv[1:3], from_transcript=True)
+            out = stage(a.file, a.digest, launch_began(Path(a.line).parent))
         except Unusable as e:
-            stage_line(to, {'error': str(e), **claimed})
+            stage_line(a.line, {'error': str(e), 'claimed': claimed})
             raise
-        stage_line(to, {**out, **claimed})
+        stage_line(a.line, {**out, 'claimed': claimed})
         return out
-    raise Unusable('usage: facts.py repo | emit-dir | stage FILE DIGEST [--from-transcript [--line PATH [--claimed PATH]]]')
+    raise Unusable('usage: facts.py repo | emit-dir | stage FILE DIGEST --from-transcript --line PATH --claimed PATH')
 
 
 # `repo`: the checkout's one repository, for a prompt that must name it (fix-issue's triage); `emit-dir`: a workflow's
-# AGENTRC_EMIT directory; `stage`: a relay command's script input, written before the script runs, --from-transcript
-# from the relay's own prompt (CLAUDE_CONFIG_DIR, else ~/.claude, and CLAUDE_CODE_SESSION_ID name its transcripts), its
-# line also written to --line PATH, saying with --claimed whether that path (the script's emit file) existed.
+# AGENTRC_EMIT directory; `stage`: a relay command's script input, written before the script runs, from the relay's
+# own prompt (CLAUDE_CONFIG_DIR, else ~/.claude, and CLAUDE_CODE_SESSION_ID name its transcripts), its line written to
+# --line PATH in the launch's emit directory, saying whether --claimed PATH (the script's emit file) existed.
 if __name__ == '__main__':
     sys.exit(report(collect, sys.argv[1:]))
