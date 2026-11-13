@@ -29,6 +29,7 @@ except ImportError:  # Windows
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
 from seal import canonical, emit, fnv1a, rate_limit, sealed, utc  # noqa: E402,F401  re-exported for the scripts
 import gh_repo  # noqa: E402
+import windows  # noqa: E402
 from gh_repo import HOST, REPO, github_repo  # noqa: E402,F401  re-exported for the scripts
 
 FULL_SHA = re.compile(r'\A[0-9a-f]{40}\Z')  # \Z: $ would let a trailing newline through
@@ -297,6 +298,21 @@ def stage(file, digest, from_transcript=False):
     return {'staged': file}
 
 
+def stage_line(path, line):
+    """The stage's own line at path, as lib/seal.py's emit writes a script's, so the workflow tells a refused stage from
+    a script whose outcome is unknown. Replaced whole on every run, never claimed once as an AGENTRC_EMIT file is: a
+    resumed command stages again and goes on to its script."""
+    if path is None:
+        return
+    tmp = Path(f'{path}.tmp')
+    try:
+        tmp.write_text("export const meta = { name: 'emit', description: 'a script line' }\n"
+                       f"return {json.dumps({'emit': path, 'line': line}, separators=(',', ':'))}\n", encoding='utf-8', newline='\n')
+        windows.replace(tmp, path)
+    except OSError as e:
+        raise Unusable(f'facts.py stage: its line not written to {path}: {e}') from None
+
+
 def collect(argv):
     if argv == ['repo']:
         return {'repo': checkout_repo()}
@@ -304,13 +320,21 @@ def collect(argv):
         return emit_dir()
     if argv[:1] == ['stage'] and len(argv) == 3:
         return stage(*argv[1:])
-    if argv[:1] == ['stage'] and len(argv) == 4 and argv[3] == '--from-transcript':
-        return stage(*argv[1:3], from_transcript=True)
-    raise Unusable('usage: facts.py repo | emit-dir | stage FILE DIGEST [--from-transcript]')
+    if argv[:1] == ['stage'] and argv[3:4] == ['--from-transcript'] and len(argv) in (4, 6) and argv[4:5] in ([], ['--line']):
+        to = argv[5] if len(argv) == 6 else None
+        try:
+            out = stage(*argv[1:3], from_transcript=True)
+        except Unusable as e:
+            stage_line(to, {'error': str(e)})
+            raise
+        stage_line(to, out)
+        return out
+    raise Unusable('usage: facts.py repo | emit-dir | stage FILE DIGEST [--from-transcript [--line PATH]]')
 
 
 # `repo`: the checkout's one repository, for a prompt that must name it (fix-issue's triage); `emit-dir`: a workflow's
 # AGENTRC_EMIT directory; `stage`: a relay command's script input, written before the script runs, --from-transcript
-# from the relay's own prompt (CLAUDE_CONFIG_DIR, else ~/.claude, and CLAUDE_CODE_SESSION_ID name its transcripts).
+# from the relay's own prompt (CLAUDE_CONFIG_DIR, else ~/.claude, and CLAUDE_CODE_SESSION_ID name its transcripts), its
+# line also written to --line PATH.
 if __name__ == '__main__':
     sys.exit(report(collect, sys.argv[1:]))

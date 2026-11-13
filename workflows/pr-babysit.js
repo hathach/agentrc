@@ -219,9 +219,9 @@ const EMIT_REFUSED = 3 // lib/seal.py's
 const RAN = { type: 'object', additionalProperties: false, required: ['exit'], properties: { exit: { type: 'integer' }, error: { type: 'string' } } }
 const RETURN_EXIT = 'and answer only its exit status as exit, AGENTRC_EMIT kept exactly as written: the script writes its JSON line to that file, ' +
   'where the workflow reads it, and prints only a note. Only on a nonzero exit, also give what went wrong as error, in its own words.'
-// Where a staged command's facts.py stage writes its own line, beside the script's: a stage that refused its input is
-// told from a script whose outcome is unknown.
-const STAGE_EMIT = '<AGENTRC_STAGE_EMIT>'
+// Where a staged command's facts.py stage writes its own line, beside the script's, rewritten on every run (a resumed
+// command stages again and goes on): a stage that refused its input is told from a script whose outcome is unknown.
+const STAGE_LINE = '<AGENTRC_STAGE_LINE>'
 // A relay prompt's command, `script` a Python script with its arguments, run under the file emitted() names it; `stage`
 // the staged() input its command writes first, its payload line closing the prompt.
 const runExactly = (script, extra = '', stage = null) => `run exactly \`${stage ? stage.command : ''}${EMIT}${PY} ${script}\` ${RETURN_EXIT}${extra}` +
@@ -251,7 +251,7 @@ const base64 = (text) => {
 const PAYLOAD = 'AGENTRC-PAYLOAD'
 const staged = (v) => {
   const text = JSON.stringify(v)
-  return { command: `${STAGE_EMIT}${PY} ${FACTS_SCRIPT} stage '${INPUT}' ${fnv1a(text)} --from-transcript && `,
+  return { command: `${PY} ${FACTS_SCRIPT} stage '${INPUT}' ${fnv1a(text)} --from-transcript --line ${STAGE_LINE} && `,
     line: `${PAYLOAD} ${INPUT} ${fnv1a(text)} ${base64(text)}` }
 }
 const EMIT_DIR = { type: 'object', additionalProperties: false, required: ['dir'], properties: { dir: { type: 'string' }, error: { type: 'string' } } }
@@ -304,7 +304,7 @@ const emitted = async (prompt, { label, inputDir, ...opts }) => {
   const input = `${inputDir ?? dir}/${stem}.in`
   if (/['\x00-\x1f]/.test(input)) return { why: `the input file ${JSON.stringify(input)} holds a quote or control character` }
   const stageFile = `${dir}/${stem}.stage.js`
-  const ran = await agent(prompt.replace(EMIT, `AGENTRC_EMIT=${shq(file)} `).replace(STAGE_EMIT, `AGENTRC_EMIT=${shq(stageFile)} `).split(INPUT).join(input),
+  const ran = await agent(prompt.replace(EMIT, `AGENTRC_EMIT=${shq(file)} `).replace(STAGE_LINE, shq(stageFile)).split(INPUT).join(input),
     { label, ...opts, schema: RAN }).catch(e => { log(`${label} errored — ${e && e.message}`); return null })
   // A relay that died after its script wrote still leaves the line. A file there before the run (exit 3: the script
   // ran nothing) is this call's own from an attempt a resume cut short: its line when it names this file, else that
@@ -317,9 +317,9 @@ const emitted = async (prompt, { label, inputDir, ...opts }) => {
     if (refused) log(`${label}: the line an earlier attempt of this call wrote, reloaded`)
     return { line: m.line }
   }
-  // A stage that refused its input ran no script, in this attempt or an earlier one of this call: a definite
-  // failure, in its own line's words.
-  const st = prompt.includes(STAGE_EMIT) && await load(stageFile)
+  // A stage that refused its input ran no script, in the last attempt of this call that ran it: a definite failure,
+  // in its own line's words.
+  const st = prompt.includes(STAGE_LINE) && await load(stageFile)
   if (st && st.emit === stageFile && st.line && typeof st.line.error === 'string') return { why: st.line.error, stage: true }
   if (refused) {
     log(`${label}: an earlier attempt of this call claimed ${file} and left no line of it — its outcome is unknown`)

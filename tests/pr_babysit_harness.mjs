@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test as nodeTest } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { ABSENT, AsyncFunction, emitDirs, emitOf as firstEmitOf, loadModule, moduleOf } from './emit_stub.mjs'
+import { ABSENT, AsyncFunction, emitDirs, emitOf, loadModule, moduleOf } from './emit_stub.mjs'
 
 // The body runs as the runtime runs it; `meta` is exposed so its value, not its spelling, is checked.
 const body = readFileSync(new URL('../workflows/pr-babysit.js', import.meta.url), 'utf8')
@@ -48,8 +48,6 @@ const bare = (v) => Array.isArray(v) ? v.map(bare)
 const sealLine = (facts) => ({ ...facts, seal: fnv1a(canonical(bare(facts))) })
 // [reviewers, auto-runners] as the validator prompt's harvest command names them.
 const harvestFlags = (prompt) => ['--reviewers', '--auto-run'].map(f => new RegExp(`${f} ([^\\s\`]+)`).exec(String(prompt))?.[1].split(',') ?? [])
-// The file a relay command hands its script as AGENTRC_EMIT, not the one its facts.py stage writes its own line to.
-const emitOf = (prompt) => firstEmitOf(String(prompt).replace(/AGENTRC_EMIT='[^']+\.stage\.js' /, ''))
 // A relay prompt's staged() payload line: the input path, the JSON's fnv1a and its base64.
 const PAYLOAD_LINE = /^AGENTRC-PAYLOAD (.+) ([0-9a-f]{8}) ([A-Za-z0-9+/=]*)$/m
 // The JSON a relay command stages for its script (staged()), decoded as its Python stage decodes it.
@@ -689,7 +687,7 @@ async function run(opts = {}) {
         const file = emitOf(prompt)
         let answer
         try {
-          const stageFile = String(prompt).match(/AGENTRC_EMIT='([^']+\.stage\.js)' /)?.[1]
+          const stageFile = String(prompt).match(/ stage '[^']+' [0-9a-f]{8} --from-transcript --line '([^']+)' /)?.[1]
           // opts.stageError(label): facts.py stage refused the payload, writing that error as its own line; the script never ran.
           const refusal = stageFile && opts.stageError && opts.stageError(options.label)
           if (file === undefined) answer = await agent(prompt, options)
@@ -700,6 +698,15 @@ async function run(opts = {}) {
             answer = { exit: 2, error: 'the stage failed' }
           } else {
             writeFileSync(file, '')
+            // facts.py stage's own line, rewritten on every run of the command: staged, before the script runs.
+            if (stageFile) writeFileSync(stageFile, moduleOf(stageFile, { staged: PAYLOAD_LINE.exec(String(prompt))[1] }))
+            // opts.cutAfterStage(label): the command was cut short once its stage had run, before its script claimed its file.
+            if (stageFile && opts.cutAfterStage && opts.cutAfterStage(options.label)) {
+              calls.push({ label: options.label, prompt: String(prompt), agentType: options.agentType, phase: options.phase, schema: options.schema, model: options.model })
+              rmSync(file)
+              entry.answer = null
+              return null
+            }
             const line = await agent(prompt, { ...options, schema: null })
             const sealed = !line || 'seal' in line || line.error ? line : sealLine(line)
             const wrote = opts.garble ? opts.garble(options.label, sealed) : sealed
@@ -1436,8 +1443,8 @@ test('the committer gets the claims without their hints, and the message on stdi
 
 // A relay command as Bash runs it: `cmd` from its prompt, its AGENTRC_EMIT moved to `emit` (its stage's beside it); the
 // scripts under `root`.
-const runCommand = (cmd, root, emit, env = {}) => spawnSync('bash', ['-c', cmd.replace(/AGENTRC_EMIT='[^']+\.stage\.js' /, `AGENTRC_EMIT='${emit}.stage.js' `)
-  .replace(/AGENTRC_EMIT='[^']+(?<!\.stage\.js)' /, `AGENTRC_EMIT='${emit}' `)], { encoding: 'utf8', env: { ...process.env, AGENTRC_DIR: root, ...env } })
+const runCommand = (cmd, root, emit, env = {}) => spawnSync('bash', ['-c', cmd.replace(/ --line '[^']+' /, ` --line '${emit}.stage.js' `)
+  .replace(/AGENTRC_EMIT='[^']+' /, `AGENTRC_EMIT='${emit}' `)], { encoding: 'utf8', env: { ...process.env, AGENTRC_DIR: root, ...env } })
 const commandOf = (prompt) => String(prompt).match(/run exactly `([^`]*)` and answer/)[1]
 // The interpreter the commands run under: PIN's /usr/bin/python3 does not exist on Windows; forward slashes for bash.
 const hostPython = () => spawnSync('python3', ['-c', 'import sys; print(sys.executable)'], { encoding: 'utf8' }).stdout.trim().replaceAll('\\', '/')
@@ -1486,6 +1493,13 @@ test('hostile text in a reply body reaches reply.py byte for byte from the relay
     const got = runCommand(local, tmp, join(tmp, 'r.js'), env)
     assert.equal(got.status, 0, got.stderr)
     assert.equal(readFileSync(`${out}.got`, 'utf8'), JSON.stringify(sent), "the manifest is the JSON the workflow sent, byte for byte, the assistant's quoted line ignored")
+    assert.match(readFileSync(join(tmp, 'r.js.stage.js'), 'utf8'), /"line":\{"staged":/)
+    // Cut short after its stage, before reply.py claimed its file: the same command run again stages again and goes on.
+    rmSync(join(tmp, 'r.js'), { force: true })
+    rmSync(`${out}.got`)
+    const again = runCommand(local, tmp, join(tmp, 'r.js'), env)
+    assert.equal(again.status, 0, again.stderr)
+    assert.equal(readFileSync(`${out}.got`, 'utf8'), JSON.stringify(sent))
     assert.equal(existsSync('/tmp/pwned'), false)
     const b64 = PAYLOAD_LINE.exec(reply.prompt)[3]
     corrupted(b64, JSON.stringify(sent)).forEach((bad, i) => {
@@ -1546,8 +1560,8 @@ test('every script input is written by the command that runs the script, at a pa
     // One command: the stage, then the script under `&&`, both naming the one input file beside the line; the payload
     // closes the prompt, outside the command, naming that file and the JSON's fnv1a.
     const [, cmd] = c.prompt.match(/run exactly `([^`]*)`/)
-    const [, stageEmit, digest, emit, rest] = cmd.match(/^AGENTRC_EMIT='([^']+)\.stage\.js' \S+ \S+facts\.py stage '[^']+' ([0-9a-f]{8}) --from-transcript && AGENTRC_EMIT='([^']+)\.js' (.*)$/)
-    assert.equal(stageEmit, emit)
+    const [, digest, stageLine, emit, rest] = cmd.match(/^\S+ \S+facts\.py stage '[^']+' ([0-9a-f]{8}) --from-transcript --line '([^']+)\.stage\.js' && AGENTRC_EMIT='([^']+)\.js' (.*)$/)
+    assert.equal(stageLine, emit)
     assert.ok(cmd.includes(` stage '${emit}.in' `) && rest.includes(` --manifest '${emit}.in' `), cmd)
     const [line, path, sum] = c.prompt.match(PAYLOAD_LINE)
     assert.deepEqual([path, sum], [`${emit}.in`, digest])
@@ -3952,6 +3966,22 @@ test('a payload facts.py stage refused publishes nothing, is named as the stage,
     stageError: (l) => l === 'sonar#1' && 'facts.py stage: no AGENTRC-PAYLOAD line for /x.in 0a1b2c3d' })
   assert.ok(sonar.logs.includes('sonar#1: facts.py stage: no AGENTRC-PAYLOAD line for /x.in 0a1b2c3d — the issues stay owed, nothing more is asked this launch'),
     sonar.logs.join('\n'))
+})
+
+test('a command cut short after its stage ran stages again on a resume and runs its script (#540)', async () => {
+  const reviews = { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'no' }], bots: 'reviewed' }
+  const world = { reviews, receiptFiles: new Map(), replied: new Set(), rerunReuses: true }
+  const first = await run({ ...world, cutAfterStage: (l) => l === 'replies#1', keepEmit: true })
+  try {
+    assert.equal(first.result.history[0].refutedPosts.pass, false, 'cut before reply.py ran: nothing posted')
+    const prefix = first.journal.slice(0, first.journal.findIndex(j => j.label === 'replies#1'))
+    const resumed = await run({ ...world, resume: prefix })
+    const call = resumed.calls.find(c => c.label === 'replies#1')
+    assert.ok(call, resumed.labels.join(', '))
+    assert.equal(call.prompt, first.calls.find(c => c.label === 'replies#1').prompt, 'the same command, its stage line already there')
+    assert.equal(resumed.result.history[0].refutedPosts.pass, true, 'its stage ran again and reply.py posted')
+    assert.equal(resumed.logs.some(l => l.includes('its outcome is unknown')), false, resumed.logs.join('\n'))
+  } finally { rmSync(first.emitRoot, { recursive: true, force: true }) }
 })
 
 test('every dismissal is challenged before it is posted', async () => {
