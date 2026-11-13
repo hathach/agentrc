@@ -1452,6 +1452,11 @@ class HeldWakeTest(RelayCase):
         [line] = self.woken()
         self.assertTrue(line.startswith(f'left working {self.action} · sp · name · t2 · now done'))
 
+    def test_an_unpinned_session_whose_read_fields_differ_reads_as_replaced(self):
+        self.now(status='done', pid=999, started=99, account='config:other', session=None)   # session unreadable
+        [line] = self.woken()
+        self.assertIn('its session was replaced or ended', line)
+
     def test_each_transition_is_said_once_across_collects(self):
         self.now(status='done')
         self.assertEqual(len(self.woken()), 1)

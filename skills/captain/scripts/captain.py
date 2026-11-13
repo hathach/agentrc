@@ -309,6 +309,11 @@ def unpinned(session):
     return [k for k in ('cwd', 'created', 'pid', 'started', 'session', 'account') if not session.get(k)]
 
 
+def contradicts(session, ident):
+    """Whether an identity field both session and ident hold differs: proof of another session, pinned or not."""
+    return any(session.get(k) and ident.get(k) and session[k] != ident[k] for k in IDENTITY)
+
+
 class Corrupt(Exception):
     """A ledger line that is not a whole JSON record: what it held cannot be known, so nothing may be decided."""
 
@@ -1227,9 +1232,10 @@ def noticed(fence):
 def wake(recs, pending, fence, deadline):
     """Print a line for each relay held while its target was working whose target has left working since, each state
     once per relay across collects (NOTICED). Each `hc get` gets at most WAKE_LOOK_S of what is left before deadline,
-    a failure, or a session whose identity could not be pinned, looked at again at the next poll. The line prints
-    before it is stored, so a crash repeats it rather than losing it; the store merges into NOTICED under the ledger
-    lock, fenced by the enrollment. Sends nothing: `relay --retry` stays the human's, with all its checks."""
+    a failure, or a session whose identity could not be pinned but agrees in every field read, looked at again at the
+    next poll. The line prints before it is stored, so a crash repeats it rather than losing it; the store merges into
+    NOTICED under the ledger lock, fenced by the enrollment. Sends nothing: `relay --retry` stays the human's, with all
+    its checks."""
     held = held_working(recs, pending, fence)
     if not held:
         return
@@ -1242,7 +1248,7 @@ def wake(recs, pending, fence, deadline):
             found = find(relayed['target']['address'], timeout=min(WAKE_LOOK_S, left))
         except hc.Error:
             continue
-        if found and unpinned(found):
+        if found and unpinned(found) and not contradicts(found, relayed['target']):
             continue
         state = found['status'] if found and identity(found) == relayed['target'] else 'replaced'
         if state == 'working':
