@@ -363,11 +363,13 @@ recovery stay the contract's. Linux only.
   "source": <where it was read>}`. Without it, or with either feature not
   `off`, the flash is refused before anything starts; the provider never
   infers or defaults the chip's security state. `read_security(serial, chip=,
-  workdir=, timeout=, retains_lock=True)` reads it and hard-resets the chip;
-  `security_evidence(result, chip=, source=)` reads a `security` op of the
-  caller's own `scripts/esptool_session.py`. Unknown or contradictory
-  evidence, or a chip outside `SECURITY_CHIPS` (ESP32-P4, ESP32-S3), is
-  refused.
+  workdir=, timeout=, retains_lock=True)` reads it and hard-resets the chip,
+  its child run tracked by default (state in `workdir`) and its evidence
+  returned only once that child is proven ended (cleanup `done`), otherwise
+  raised with its receipts; `security_evidence(result, chip=, source=)`
+  reads a `security` op of the caller's own `scripts/esptool_session.py`.
+  Unknown or contradictory evidence, or a chip outside `SECURITY_CHIPS`
+  (ESP32-P4, ESP32-S3), is refused.
   Flash, reset and `read_security` run only for a caller that passes
   `retains_lock=True`, declaring it holds the board lock through each
   operation and logs a session it leaves pending, and never under a CI job (`RUNNER_TRACKING_ID` or
