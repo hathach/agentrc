@@ -687,16 +687,19 @@ async function run(opts = {}) {
         const file = emitOf(prompt)
         let answer
         try {
-          const stageFile = String(prompt).match(/ stage '[^']+' [0-9a-f]{8} --from-transcript --line '([^']+)' /)?.[1]
+          const [, stageFile, claimFile] = String(prompt).match(/ stage '[^']+' [0-9a-f]{8} --from-transcript --line '([^']+)' --claimed '([^']+)' /) ?? []
+          if (stageFile) assert.equal(claimFile, file, 'the stage asks after the script\'s own file')
+          // facts.py stage --claimed: whether an earlier attempt's script claimed its file, as the stage found it.
+          const claimed = stageFile ? existsSync(file) : undefined
           // opts.stageError(label): facts.py stage refused the payload, writing that error as its own line; the script never ran.
           const refusal = stageFile && opts.stageError && opts.stageError(options.label)
           const record = () => calls.push({ label: options.label, prompt: String(prompt), agentType: options.agentType, phase: options.phase, schema: options.schema, model: options.model })
           // The command's order: facts.py stage writes its own line, rewritten on every run, before the script claims its file.
-          if (stageFile && !refusal) writeFileSync(stageFile, moduleOf(stageFile, { staged: PAYLOAD_LINE.exec(String(prompt))[1] }))
+          if (stageFile && !refusal) writeFileSync(stageFile, moduleOf(stageFile, { staged: PAYLOAD_LINE.exec(String(prompt))[1], claimed }))
           if (file === undefined) answer = await agent(prompt, options)
           else if (refusal) {
             record()
-            writeFileSync(stageFile, moduleOf(stageFile, { error: refusal }))
+            writeFileSync(stageFile, moduleOf(stageFile, { error: refusal, claimed }))
             answer = { exit: 2, error: 'the stage failed' }
           } else if (stageFile && opts.cutAfterStage && opts.cutAfterStage(options.label)) {
             // opts.cutAfterStage(label): the command was cut short once its stage had run, before its script claimed its file.
@@ -1443,7 +1446,7 @@ test('the committer gets the claims without their hints, and the message on stdi
 // A relay command as Bash runs it: `cmd` from its prompt, its AGENTRC_EMIT moved to `emit` (its stage's beside it); the
 // scripts under `root`.
 const runCommand = (cmd, root, emit, env = {}) => spawnSync('bash', ['-c', cmd.replace(/ --line '[^']+' /, ` --line '${emit}.stage.js' `)
-  .replace(/AGENTRC_EMIT='[^']+' /, `AGENTRC_EMIT='${emit}' `)], { encoding: 'utf8', env: { ...process.env, AGENTRC_DIR: root, ...env } })
+  .replace(/ --claimed '[^']+' /, ` --claimed '${emit}' `).replace(/AGENTRC_EMIT='[^']+' /, `AGENTRC_EMIT='${emit}' `)], { encoding: 'utf8', env: { ...process.env, AGENTRC_DIR: root, ...env } })
 const commandOf = (prompt) => String(prompt).match(/run exactly `([^`]*)` and answer/)[1]
 // The interpreter the commands run under: PIN's /usr/bin/python3 does not exist on Windows; forward slashes for bash.
 const hostPython = () => spawnSync('python3', ['-c', 'import sys; print(sys.executable)'], { encoding: 'utf8' }).stdout.trim().replaceAll('\\', '/')
@@ -1492,7 +1495,7 @@ test('hostile text in a reply body reaches reply.py byte for byte from the relay
     const got = runCommand(local, tmp, join(tmp, 'r.js'), env)
     assert.equal(got.status, 0, got.stderr)
     assert.equal(readFileSync(`${out}.got`, 'utf8'), JSON.stringify(sent), "the manifest is the JSON the workflow sent, byte for byte, the assistant's quoted line ignored")
-    assert.match(readFileSync(join(tmp, 'r.js.stage.js'), 'utf8'), /"line":\{"staged":/)
+    assert.match(readFileSync(join(tmp, 'r.js.stage.js'), 'utf8'), /"line":\{"staged":"[^"]+","claimed":false\}/)
     // Cut short after its stage, before reply.py claimed its file: the same command run again stages again and goes on.
     rmSync(join(tmp, 'r.js'), { force: true })
     rmSync(`${out}.got`)
@@ -1504,10 +1507,14 @@ test('hostile text in a reply body reaches reply.py byte for byte from the relay
     corrupted(b64, JSON.stringify(sent)).forEach((bad, i) => {
       rmSync(`${out}.got`, { force: true })
       const config = join(tmp, `bad-${i}`)
+      // The first as a resume meets it: an earlier attempt's script claimed its file and left it empty.
+      if (i === 0) writeFileSync(join(tmp, `bad-${i}.js`), '')
       const ran = runCommand(local, tmp, join(tmp, `bad-${i}.js`), transcript(config, reply.prompt.replace(b64, bad)))
       assert.notEqual(ran.status, 0)
       assert.equal(existsSync(`${out}.got`), false, 'reply.py never ran')
-      assert.match(readFileSync(join(tmp, `bad-${i}.js.stage.js`), 'utf8'), /facts\.py stage: the payload for .* is not/, 'the stage names itself in its own line')
+      const line = readFileSync(join(tmp, `bad-${i}.js.stage.js`), 'utf8')
+      assert.match(line, /facts\.py stage: the payload for .* is not/, 'the stage names itself in its own line')
+      assert.match(line, i === 0 ? /,"claimed":true\}/ : /,"claimed":false\}/, 'it says whether the script\'s file was claimed')
     })
   } finally {
     rmSync(tmp, { recursive: true, force: true })
@@ -1559,8 +1566,8 @@ test('every script input is written by the command that runs the script, at a pa
     // One command: the stage, then the script under `&&`, both naming the one input file beside the line; the payload
     // closes the prompt, outside the command, naming that file and the JSON's fnv1a.
     const [, cmd] = c.prompt.match(/run exactly `([^`]*)`/)
-    const [, digest, stageLine, emit, rest] = cmd.match(/^\S+ \S+facts\.py stage '[^']+' ([0-9a-f]{8}) --from-transcript --line '([^']+)\.stage\.js' && AGENTRC_EMIT='([^']+)\.js' (.*)$/)
-    assert.equal(stageLine, emit)
+    const [, digest, stageLine, claim, emit, rest] = cmd.match(/^\S+ \S+facts\.py stage '[^']+' ([0-9a-f]{8}) --from-transcript --line '([^']+)\.stage\.js' --claimed '([^']+)\.js' && AGENTRC_EMIT='([^']+)\.js' (.*)$/)
+    assert.deepEqual([stageLine, claim], [emit, emit])
     assert.ok(cmd.includes(` stage '${emit}.in' `) && rest.includes(` --manifest '${emit}.in' `), cmd)
     const [line, path, sum] = c.prompt.match(PAYLOAD_LINE)
     assert.deepEqual([path, sum], [`${emit}.in`, digest])
@@ -3973,22 +3980,34 @@ test('a payload facts.py stage refused publishes nothing, is named as the stage,
     sonar.logs.join('\n'))
 })
 
-test("a stage refusing on a resume after reply.py claimed its file is no definite failure: the receipt is replayed (#540)", async () => {
+test("a stage refusing on a resume is definite only where its line says no earlier attempt claimed the script's file (#540)", async () => {
   const reviews = { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'no' }], bots: 'reviewed' }
-  const world = { reviews, receiptFiles: new Map(), replied: new Set(), rerunReuses: true }
-  // reply.py posted and saved its receipt, then died before its line: its claim stays, empty.
-  const first = await run({ ...world, garble: (l, a) => l === 'replies#1' ? null : a, keepEmit: true })
-  try {
-    const prefix = first.journal.slice(0, first.journal.findIndex(j => j.label === 'replies#1'))
-    const why = 'facts.py stage: no AGENTRC-PAYLOAD line for /x.in 0a1b2c3d'
-    const resumed = await run({ ...world, resume: prefix, stageError: (l) => l === 'replies#1' && why })
-    assert.deepEqual(resumed.journal.map(j => j.label).filter(l => l.startsWith('replies#')), ['replies#1', 'replies#1.replay'], resumed.logs.join('\n'))
-    assert.ok(resumed.logs.some(l => l.startsWith('replies#1: its stage refused') && l.endsWith('its outcome is unknown')), resumed.logs.join('\n'))
-    assert.ok(resumed.logs.includes("replies#1: recovered from reply.py's saved receipt"), resumed.logs.join('\n'))
-    const posts = resumed.result.history[0].refutedPosts
-    assert.equal(posts.pass, true)
-    assert.deepEqual(posts.receipts.map(r => [r.sent, r.posted, r.verified, r.resolved]), [[true, true, true, true]], 'what the first run did')
-  } finally { rmSync(first.emitRoot, { recursive: true, force: true }) }
+  const why = 'facts.py stage: no AGENTRC-PAYLOAD line for /x.in 0a1b2c3d'
+  // reply.py posted and saved its receipt, then died before its line: its claim stays, empty, and the receipt is replayed.
+  // Cut short after its stage, before reply.py claimed its file: nothing ran, so the refusal is the outcome.
+  for (const [how, cut, claimed] of [['reply.py claimed, died', { garble: (l, a) => l === 'replies#1' ? null : a }, true],
+    ['cut before the claim', { cutAfterStage: (l) => l === 'replies#1' }, false]]) {
+    const world = { reviews, receiptFiles: new Map(), replied: new Set(), rerunReuses: true }
+    const first = await run({ ...world, ...cut, keepEmit: true })
+    try {
+      const prefix = first.journal.slice(0, first.journal.findIndex(j => j.label === 'replies#1'))
+      const resumed = await run({ ...world, resume: prefix, stageError: (l) => l === 'replies#1' && why })
+      const ran = resumed.journal.map(j => j.label).filter(l => l.startsWith('replies#'))
+      const posts = resumed.result.history[0].refutedPosts
+      if (claimed) {
+        assert.deepEqual(ran, ['replies#1', 'replies#1.replay'], `${how}: ${resumed.logs.join('\n')}`)
+        assert.ok(resumed.logs.some(l => l.startsWith(`replies#1: its stage refused its input (${why}), and an earlier attempt of this call claimed `) &&
+          l.endsWith('its outcome is unknown')), resumed.logs.join('\n'))
+        assert.ok(resumed.logs.includes("replies#1: recovered from reply.py's saved receipt"), resumed.logs.join('\n'))
+        assert.equal(posts.pass, true, how)
+        assert.deepEqual(posts.receipts.map(r => [r.sent, r.posted, r.verified, r.resolved]), [[true, true, true, true]], 'what the first run did')
+      } else {
+        assert.deepEqual(ran, ['replies#1'], `${how}: no replay, reply.py never ran`)
+        assert.deepEqual([posts.pass, posts.detail, posts.receipts], [false, why, []], how)
+        assert.equal(resumed.logs.some(l => l.includes('its outcome is unknown')), false, resumed.logs.join('\n'))
+      }
+    } finally { rmSync(first.emitRoot, { recursive: true, force: true }) }
+  }
 })
 
 test('a command cut short after its stage ran stages again on a resume and runs its script (#540)', async () => {

@@ -320,21 +320,24 @@ def collect(argv):
         return emit_dir()
     if argv[:1] == ['stage'] and len(argv) == 3:
         return stage(*argv[1:])
-    if argv[:1] == ['stage'] and argv[3:4] == ['--from-transcript'] and len(argv) in (4, 6) and argv[4:5] in ([], ['--line']):
-        to = argv[5] if len(argv) == 6 else None
+    if argv[:1] == ['stage'] and argv[3:4] == ['--from-transcript'] and len(argv) in (4, 6, 8) and \
+            argv[4:5] in ([], ['--line']) and argv[6:7] in ([], ['--claimed']):
+        to = argv[5] if len(argv) >= 6 else None
+        # Whether an earlier run of the command claimed its script's AGENTRC_EMIT file: that script may have acted.
+        claimed = {'claimed': Path(argv[7]).exists()} if len(argv) == 8 else {}
         try:
             out = stage(*argv[1:3], from_transcript=True)
         except Unusable as e:
-            stage_line(to, {'error': str(e)})
+            stage_line(to, {'error': str(e), **claimed})
             raise
-        stage_line(to, out)
+        stage_line(to, {**out, **claimed})
         return out
-    raise Unusable('usage: facts.py repo | emit-dir | stage FILE DIGEST [--from-transcript [--line PATH]]')
+    raise Unusable('usage: facts.py repo | emit-dir | stage FILE DIGEST [--from-transcript [--line PATH [--claimed PATH]]]')
 
 
 # `repo`: the checkout's one repository, for a prompt that must name it (fix-issue's triage); `emit-dir`: a workflow's
 # AGENTRC_EMIT directory; `stage`: a relay command's script input, written before the script runs, --from-transcript
 # from the relay's own prompt (CLAUDE_CONFIG_DIR, else ~/.claude, and CLAUDE_CODE_SESSION_ID name its transcripts), its
-# line also written to --line PATH.
+# line also written to --line PATH, saying with --claimed whether that path (the script's emit file) existed.
 if __name__ == '__main__':
     sys.exit(report(collect, sys.argv[1:]))

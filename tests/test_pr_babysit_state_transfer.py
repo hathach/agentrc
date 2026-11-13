@@ -407,25 +407,30 @@ class TranscriptStageTest(unittest.TestCase):
         line = self.tmp / 'x.stage.js'
         env = {**{k: v for k, v in os.environ.items() if k != 'AGENTRC_EMIT'}, 'CLAUDE_CONFIG_DIR': str(self.config), 'CLAUDE_CODE_SESSION_ID': SESSION}
 
+        claim = self.tmp / 'x.js'
+
         def run():
-            done = subprocess.run([sys.executable, str(FACTS), 'stage', str(out), fnv1a(text), '--from-transcript', '--line', str(line)],
-                                  capture_output=True, text=True, env=env)
+            done = subprocess.run([sys.executable, str(FACTS), 'stage', str(out), fnv1a(text), '--from-transcript', '--line', str(line),
+                                   '--claimed', str(claim)], capture_output=True, text=True, env=env)
             return done.returncode, load(line)['line']
         b64 = base64.b64encode(text.encode()).decode()
         bad = self.transcript(self.prompt(text, out).replace(b64, base64.b64encode(b'{"n": 2}').decode()))
         code, got = run()
         self.assertEqual(code, 2)
-        self.assertEqual(got['error'], f'facts.py stage: the payload for {out} is not the JSON sent')
+        self.assertEqual(got, {'error': f'facts.py stage: the payload for {out} is not the JSON sent', 'claimed': False})
+        claim.write_text('')  # the script's emit file, claimed by an earlier run and left empty
+        self.assertEqual(run(), (2, {**got, 'claimed': True}), "a refusal says the script's file was claimed: its outcome is unknown")
+        claim.unlink()
         bad.unlink()
         self.transcript(self.prompt(text, out), name='agent-b.jsonl', wf='wf_2')
-        self.assertEqual(run(), (0, {'staged': str(out)}), 'the earlier line is no claim: the stage runs again')
-        self.assertEqual(run(), (0, {'staged': str(out)}))
+        self.assertEqual(run(), (0, {'staged': str(out), 'claimed': False}), 'the earlier line is no claim: the stage runs again')
+        self.assertEqual(run(), (0, {'staged': str(out), 'claimed': False}))
         self.assertEqual(out.read_text(), text)
 
     def test_the_cli_takes_the_flag_and_names_the_stage_in_its_usage(self):
         done = subprocess.run([sys.executable, str(FACTS), 'stage', 'x', 'y', '--bogus'], capture_output=True, text=True)
         self.assertEqual(done.returncode, 2)
-        self.assertIn('stage FILE DIGEST [--from-transcript [--line PATH]]', json.loads(done.stdout.splitlines()[-1])['error'])
+        self.assertIn('stage FILE DIGEST [--from-transcript [--line PATH [--claimed PATH]]]', json.loads(done.stdout.splitlines()[-1])['error'])
 
 
 if __name__ == '__main__':

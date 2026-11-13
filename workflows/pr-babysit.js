@@ -222,6 +222,8 @@ const RETURN_EXIT = 'and answer only its exit status as exit, AGENTRC_EMIT kept 
 // Where a staged command's facts.py stage writes its own line, beside the script's, rewritten on every run (a resumed
 // command stages again and goes on): a stage that refused its input is told from a script whose outcome is unknown.
 const STAGE_LINE = '<AGENTRC_STAGE_LINE>'
+// The script's own file, which the stage's line says was there or not: workflow() throws for an empty claim as for none.
+const STAGE_CLAIM = '<AGENTRC_STAGE_CLAIM>'
 // A relay prompt's command, `script` a Python script with its arguments, run under the file emitted() names it; `stage`
 // the staged() input its command writes first, its payload line closing the prompt.
 const runExactly = (script, extra = '', stage = null) => `run exactly \`${stage ? stage.command : ''}${EMIT}${PY} ${script}\` ${RETURN_EXIT}${extra}` +
@@ -251,7 +253,7 @@ const base64 = (text) => {
 const PAYLOAD = 'AGENTRC-PAYLOAD'
 const staged = (v) => {
   const text = JSON.stringify(v)
-  return { command: `${PY} ${FACTS_SCRIPT} stage '${INPUT}' ${fnv1a(text)} --from-transcript --line ${STAGE_LINE} && `,
+  return { command: `${PY} ${FACTS_SCRIPT} stage '${INPUT}' ${fnv1a(text)} --from-transcript --line ${STAGE_LINE} --claimed ${STAGE_CLAIM} && `,
     line: `${PAYLOAD} ${INPUT} ${fnv1a(text)} ${base64(text)}` }
 }
 const EMIT_DIR = { type: 'object', additionalProperties: false, required: ['dir'], properties: { dir: { type: 'string' }, error: { type: 'string' } } }
@@ -304,7 +306,8 @@ const emitted = async (prompt, { label, inputDir, ...opts }) => {
   const input = `${inputDir ?? dir}/${stem}.in`
   if (/['\x00-\x1f]/.test(input)) return { why: `the input file ${JSON.stringify(input)} holds a quote or control character` }
   const stageFile = `${dir}/${stem}.stage.js`
-  const ran = await agent(prompt.replace(EMIT, `AGENTRC_EMIT=${shq(file)} `).replace(STAGE_LINE, shq(stageFile)).split(INPUT).join(input),
+  const ran = await agent(prompt.replace(EMIT, `AGENTRC_EMIT=${shq(file)} `).replace(STAGE_LINE, shq(stageFile))
+    .replace(STAGE_CLAIM, shq(file)).split(INPUT).join(input),
     { label, ...opts, schema: RAN }).catch(e => { log(`${label} errored — ${e && e.message}`); return null })
   // A relay that died after its script wrote still leaves the line. A file there before the run (exit 3: the script
   // ran nothing) is this call's own from an attempt a resume cut short: its line when it names this file, else that
@@ -318,13 +321,15 @@ const emitted = async (prompt, { label, inputDir, ...opts }) => {
     return { line: m.line }
   }
   // A stage that refused its input ran no script, in the last attempt of this call that ran it: a definite failure, in
-  // its own line's words, unless an earlier attempt's script claimed its file (m loaded) and may have acted before dying.
+  // its own line's words, only where its line says no earlier attempt's script claimed its file (that one may have acted
+  // before dying).
   const st = prompt.includes(STAGE_LINE) && await load(stageFile)
   const stageError = st && st.emit === stageFile && st.line && typeof st.line.error === 'string' ? st.line.error : null
-  if (stageError !== null && m === null) return { why: stageError, stage: true }
+  if (stageError !== null && st.line.claimed === false) return { why: stageError, stage: true }
   if (refused || stageError !== null) {
-    log(`${label}: ${stageError !== null ? `its stage refused its input (${stageError}), and ` : ''}an earlier attempt of this call ` +
-      `claimed ${file} and left no line of it — its outcome is unknown`)
+    const claim = stageError === null || st.line.claimed === true ? `an earlier attempt of this call claimed ${file} and left no line of it`
+      : `its line does not say whether an earlier attempt of this call claimed ${file}`
+    log(`${label}: ${stageError !== null ? `its stage refused its input (${stageError}), and ` : ''}${claim} — its outcome is unknown`)
     return { dead: true, why: 'an earlier attempt left no line: its outcome is unknown' }
   }
   return { dead: !m && !ran, why: m ? `${file} holds no line written for it` : !ran ? 'the relay died'
