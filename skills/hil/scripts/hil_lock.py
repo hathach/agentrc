@@ -917,13 +917,7 @@ def _live_survivors(receipt) -> list:
 def _session_running(receipt) -> bool:
     """Whether the retained session `receipt` (its path, or the record kept in its place) is not
     closed and a process with its pid and start time lives (hil_openocd_esp_receipt's `running`)."""
-    rec = receipt
-    if isinstance(receipt, str):
-        try:
-            with os.fdopen(os.open(receipt, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)) as f:
-                rec = json.load(f) if stat.S_ISREG(os.fstat(f.fileno()).st_mode) else None
-        except (OSError, ValueError):
-            return False
+    rec = _read_session_receipt(receipt)[0] if isinstance(receipt, str) else receipt
     if not isinstance(rec, dict) or rec.get('closed') is not False:
         return False
     pid = rec.get('pid')
@@ -1589,6 +1583,18 @@ def _release_receipts(recs, key='receipts') -> list:
     return receipts
 
 
+def _read_session_receipt(path) -> tuple:
+    """(the JSON at `path`, '') or (None, why it cannot be read). Non-blocking: a FIFO in its place
+    must not hang a release."""
+    try:
+        with os.fdopen(os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)) as f:
+            if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+                return None, 'not a regular file'
+            return json.load(f), ''
+    except (OSError, ValueError) as e:
+        return None, f'unreadable ({e!r:.80})'
+
+
 def retained_state(receipt) -> str:
     """'ended' once the session receipt at path `receipt` (esp_session's receipt format) is
     hil_openocd_esp's, whole and closed after its reviewed end, as `hil_openocd_esp.py end` leaves
@@ -1597,14 +1603,9 @@ def retained_state(receipt) -> str:
     ended: its holder is not released by token."""
     if not isinstance(receipt, str):
         return 'not a receipt path, so never proven ended'
-    try:
-        # non-blocking: a FIFO in its place must not hang a release
-        with os.fdopen(os.open(receipt, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)) as f:
-            if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
-                return 'not a regular file'
-            rec = json.load(f)
-    except (OSError, ValueError) as e:
-        return f'unreadable ({e!r:.80})'
+    rec, why = _read_session_receipt(receipt)
+    if why:
+        return why
     if not isinstance(rec, dict) or rec.get('tool') != 'hil_openocd_esp':
         return 'not a hil_openocd_esp session receipt'
     pid = rec.get('pid')

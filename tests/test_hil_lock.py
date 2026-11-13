@@ -2178,6 +2178,8 @@ class OperatorResolution(LockDir):
         session = Path(self.dir, 'session.json')
         session.write_text(json.dumps({'tool': 'hil_openocd_esp', 'pid': me['pid'], 'startTime': me['start'],
                                        'closed': False}))
+        fifo = os.path.join(self.dir, 'session.fifo')
+        os.mkfifo(fifo)
         survey = hil_lock._process()._survey(os.getppid())     # what a supervisor reports: this process among them
         self.assertIn(os.getpid(), [p['pid'] for p in survey['processes']])
         states = {'pending-op': 'pending'}
@@ -2211,7 +2213,8 @@ class OperatorResolution(LockDir):
                          {'receipts': [{'token': 'x', 'survivors': {'processes': [{'pid': 999999999}],
                                                                     'unreadable': [999999998]}}]},
                          {'receipts': [{'token': 'x', 'survivors': None}]},
-                         {'receipts': [{'token': 'gone'}, 'not a receipt']}, {'retained': ['/no/such.json']}):
+                         {'receipts': [{'token': 'gone'}, 'not a receipt']}, {'retained': ['/no/such.json']},
+                         {'retained': [fifo]}):     # read without blocking, as retained_state reads it
             fid = secrets.token_hex(8)
             hil_lock._log_append(BOARD, {'event': 'failed', 'id': fid, **evidence})
             self.assertEqual(self.resolve(fid)[0], 0, evidence)
