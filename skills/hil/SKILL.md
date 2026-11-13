@@ -87,7 +87,9 @@ nothing in it through a link.
   a retained session or a holder its takeover journal kept still lives, and
   while that journal cannot be read whole. `hil_lock.py compact <lock>...`, as
   root or the log's owner in its group, rewrites it without its closed
-  failures and the events that closed them, every other line kept, and
+  failures and the events that closed them, every other line kept: a closed
+  failure whose `journalDigest` matches a takeover journal still on disk stays,
+  with its closing events, so the next take still finds that journal logged. It
   refuses a log with a malformed line; nothing compacts it on its own.
   Helpers older than `acknowledged` keep such a failure open. `hil_lock.py
   status` shows the latest open one and how many earlier ones are; a taker's

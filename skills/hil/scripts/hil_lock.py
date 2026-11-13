@@ -407,10 +407,8 @@ def _leftover(board, fh, data=None):
     `journalDigest`; one this user cannot unlink stays, logged once). `data`: the record's bytes
     when the caller already read them under this flock."""
     found = {}
-    try:
-        raw = _read_file(board, JOURNAL)
-    except OSError as e:          # its bytes unknown: logged, never unlinked
-        raw = f'cannot be read: {e}'.encode()
+    raw, kept = _read_journal(board)
+    if kept:
         found['journalKept'] = True
     if raw is not None:
         state, journal = _parse(raw)
@@ -432,6 +430,15 @@ def _leftover(board, fh, data=None):
     task = found.get('task') or {}
     return {'how': 'found-left', 'reason': task.get('reason'), 'pid': task.get('pid'),
             'detail': task.get('detail') or 'the task ended without its cleanup', **found}
+
+
+def _read_journal(board):
+    """(bytes, kept) of the board's takeover journal, (None, False) when absent; one that cannot be
+    read reads as its error's text, kept (its bytes unknown: logged, never unlinked)."""
+    try:
+        return _read_file(board, JOURNAL), False
+    except OSError as e:
+        return f'cannot be read: {e}'.encode(), True
 
 
 def _logged_journal(board, digest) -> bool:
@@ -932,7 +939,8 @@ def compact_cleanup_log(board) -> dict:
     """Rewrite the board's cleanup log without its closed failures (`hil_lock.py compact`): each
     `failed` event a `restored` or `acknowledged` event names, and every event naming it. Every
     other event stays as written (open failures, events of another kind, a closing event naming no
-    failure in the log), and a torn last line goes as the next append would cut it. Under the
+    failure in the log, a closed failure whose takeover journal is still on disk unchanged, with what
+    closed it), and a torn last line goes as the next append would cut it. Under the
     log's mutex, as the log's owner or root: a new file, the log's mode, owner and group kept, is
     written and fsynced, renamed over the log and the dir fsynced, so the only copy is never
     truncated and the mutex is untouched; a failed step leaves the log as it was. Nothing is
@@ -969,6 +977,10 @@ def _compact(board, dfd, st, data) -> dict:
         key = 'id' if e.get('event') == 'failed' else 'failure' if e.get('event') in CLOSING_EVENTS else None
         return e[key] if key and isinstance(e.get(key), str) else None
     closed = _closed_ids(events) & {names(e) for e in events if e.get('event') == 'failed'}
+    if closed and (raw := _read_journal(board)[0]) is not None:
+        # a journal this user could not unlink is logged once by its digest (_logged_journal): kept while it stays
+        digest = hashlib.sha256(raw).hexdigest()
+        closed -= {names(e) for e in events if e.get('event') == 'failed' and e.get('journalDigest') == digest}
     if not closed:
         return {'dropped': 0, 'kept': len(lines)}
     euid = os.geteuid()

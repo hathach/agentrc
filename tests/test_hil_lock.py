@@ -2302,6 +2302,23 @@ class OperatorResolution(LockDir):
         self.assertEqual(os.stat(self.log).st_ino, ino, 'nothing closed: nothing rewritten')
         self.assertEqual(hil_lock.compact_cleanup_log(BOARD + '-none'), {'dropped': 0, 'kept': 0})
 
+    def test_a_closed_failure_stays_while_its_journal_cannot_be_unlinked(self):
+        journal = Path(self.dir, BOARD + hil_lock.JOURNAL)
+        journal.write_text(json.dumps({'token': 't', 'predecessor': '', 'prior': None}))
+        # another user's journal in a sticky dir: logged, never unlinked
+        with mock.patch.object(hil_lock.os, 'unlink', side_effect=PermissionError(1, 'Operation not permitted')):
+            fh = self.acquire()
+            fid = taken_failure(fh)['id']
+            hil_lock.release_board_lock(fh)
+            self.assertEqual(self.resolve(fid)[0], 0)
+            self.assertEqual(hil_lock.compact_cleanup_log(BOARD), {'dropped': 0, 'kept': 2})
+            fh = self.acquire()
+            self.assertIsNone(taken_failure(fh), 'the journal was logged once')
+            hil_lock.release_board_lock(fh)
+        self.assertEqual([e['event'] for e in self.lines()], ['failed', 'acknowledged'])
+        journal.unlink()
+        self.assertEqual(hil_lock.compact_cleanup_log(BOARD), {'dropped': 2, 'kept': 0})
+
     def test_the_replacement_keeps_mode_owner_and_group_and_starts_private(self):
         old = os.umask(0)
         self.addCleanup(os.umask, old)
@@ -2373,8 +2390,11 @@ class OperatorResolution(LockDir):
                  OSError),
                 ('owner', mock.patch.object(hil_lock.os, 'geteuid', return_value=os.geteuid() + 1),
                  hil_lock.LogRefused),
-                ('group', mock.patch.multiple(hil_lock.os, getegid=mock.Mock(return_value=os.stat(self.log).st_gid + 1),
-                                              getgroups=mock.Mock(return_value=[])), hil_lock.LogRefused),
+                # root may give any group: checked only for another user
+                *([('group', mock.patch.multiple(hil_lock.os,
+                                                 getegid=mock.Mock(return_value=os.stat(self.log).st_gid + 1),
+                                                 getgroups=mock.Mock(return_value=[])), hil_lock.LogRefused)]
+                  if os.geteuid() else []),
                 ('fchown', mock.patch.object(hil_lock.os, 'fchown', side_effect=PermissionError(errno.EPERM, 'no')),
                  PermissionError)):
             with self.subTest(name=name):
