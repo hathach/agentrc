@@ -456,6 +456,10 @@ def summarize(output, output_path, state_ref=None, tree=None, keys=False):
                 notes.append(f'CodeRabbit has not reviewed the head; {relaunch_ask(ask)}')
         if result.get('reason') == 'ci-stuck' and isinstance(result.get('ciRecovery'), dict):
             blockers.append(ci_recovery(result['ciRecovery']))
+        if result.get('reason') == 'ci-awaiting-approval':
+            runs = result.get('awaitingApproval') if isinstance(result.get('awaitingApproval'), list) else []
+            blockers.append(f"the head's Actions runs {cut(', '.join(map(str, runs))) or '(unnamed)'} wait for a maintainer to approve "
+                            "them on GitHub (#545): no failure, and nothing here approves or re-runs them; relaunch once they are approved")
         if result.get('reason') == 'held-awaiting-caller':
             blockers += [f"finding {h.get('findingId')} on comment {h.get('commentId')} is held for the caller, and another launch "
                          f"cannot lift it: {cut(h.get('reason') or '')}" for h in result.get('held') or []]

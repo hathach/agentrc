@@ -9,7 +9,7 @@
 
 inventory: waits up to S seconds (default 0) while the status is running, then
 prints one JSON object {head, baseRef, status, mergeable, pending, registered, ignored, waiting, checks, requiredChecks,
-observedAt}, plus `error` when set
+awaitingApproval, observedAt}, plus `error` when set
 (a relaying agent can drop a trailing null, so no line carries a null error), and
 `rateLimit` {observedAt, resetAt, secondary} beside an error from a gh call GitHub
 refused for a rate limit, as pr-babysit's facts.py reports it; every
@@ -26,7 +26,8 @@ listing nothing, its head whatever the PR's last one was), else
 conflicting (GitHub's `mergeable` is CONFLICTING: the pull_request workflows
 may not have run, so no check result stands for the PR), else running (a check
 pending, no checks registered yet, or mergeable UNKNOWN), else red (a check
-failed or was cancelled) or green, with the base branch's required checks folded in (below); `mergeable` is
+failed or was cancelled), else awaiting-approval (the only checks pending are Actions runs awaiting approval, below),
+else green, with the base branch's required checks folded in (below); `mergeable` is
 GitHub's, read last;
 `pending` counts the pending checks, `registered` every check. `waiting`, '' unless
 running, fingerprints the pending checks (name, link, attempt) and mergeable: two
@@ -36,7 +37,13 @@ print, `YYYY-MM-DDTHH:MM:SSZ`, the caller's clock. An Actions run on the head th
 holds or a re-run whose earlier attempt's finished jobs are still listed,
 is one more pending check, named "<workflow> (run <id>, <status>, no pending job registered)" with the run's link, so it
 counts in `pending`, `registered` and `waiting`; such runs are read only while no other check is pending (the status is
-running either way), so until then those three may leave them out. A failed or cancelled CircleCI job whose
+running either way), so until then those three may leave them out. A run on the head awaiting a maintainer's approval
+(lib/check_runs.py's awaiting_approval: it registers no check run) is one more pending check on every poll, read from
+that whole run listing where it is read and by GitHub's own filter for them otherwise, named
+"<workflow> (run <id>, completed/action_required: awaiting maintainer approval)", never a failure: only the approval
+starts it, and `awaitingApproval` lists those names, sorted, [] when none. With no other check pending, no unfinished
+run and nothing failed, the status is awaiting-approval, never green: nothing a wait or a re-run does moves it. A failed
+or cancelled CircleCI job whose
 workflow has not finished (running, failing, on_hold, queued: CircleCI refuses
 to re-run it yet) counts as pending, read from CircleCI's public job and
 workflow API on every poll; a status it cannot read is an error. This also
@@ -190,7 +197,7 @@ import circleci  # noqa: E402
 import rtd  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
 import greptile  # noqa: E402
-from check_runs import RUN_PENDING, latest_run, newest  # noqa: E402
+from check_runs import RUN_PENDING, gated_runs, latest_run, newest  # noqa: E402
 import windows  # noqa: E402
 import gh_retry  # noqa: E402
 from seal import emit, fnv1a, rate_limit, sealed, utc  # noqa: E402
@@ -212,7 +219,7 @@ FILES = re.compile(r'[\w./-]+\.(?:c|h|cc|cpp|hpp|py|S|s|ld|cmake|mk|ya?ml|json)\
 KEEP = 20
 # The members every command's line holds, as pr-babysit's relay schema reads them: bump it, and the workflow's COLLECT_CONTRACT
 # with it, on any change to them, so a workflow copy older or newer than this file is told apart from a mis-copied line (#293).
-CONTRACT = 1
+CONTRACT = 2
 RECALL_BYTES = 8192  # unmeasured: a relay copied 3.5 KB whole and failed at 28 KB and 51 KB (agentrc#9, #23, #20)
 SHA = re.compile(r'[0-9a-f]{40}')
 HIL_ROW = re.compile(r'^(?:\d+\.\d{3} )?(\S+)\s+(\S+)\s+\.\.\.\s+(\S.*)$')  # HIL_PROFILE=1 prefixes epoch seconds
@@ -379,18 +386,22 @@ def resolved(repo, head, check, cache):
 def summary(checks, mergeable, required=()):
     """(status, counts of the listed checks by bucket), the required checks folded in: one pending or missing keeps it
     running, one failed makes it red unless a listed check is still pending; nothing listed is running, unless a required
-    check failed."""
+    check failed. A run awaiting approval is a pending check that keeps it running only beside another one: alone, it
+    makes awaiting-approval what would be green, and red outranks it."""
     if mergeable not in ('MERGEABLE', 'CONFLICTING', 'UNKNOWN'):
         raise Failed(f'the PR\'s mergeable is {mergeable!r}')
     counts = {}
     for c in checks:
         counts[c['bucket']] = counts.get(c['bucket'], 0) + 1
+    gates = sum(1 for c in checks if c.get('approval'))
     buckets = {r['bucket'] for r in required}
     if mergeable == 'CONFLICTING':
         return 'conflicting', counts
-    if counts.get('pending') or mergeable == 'UNKNOWN' or buckets & {'pending', 'missing'} or not (checks or 'fail' in buckets):
+    if counts.get('pending', 0) > gates or mergeable == 'UNKNOWN' or buckets & {'pending', 'missing'} or not (checks or 'fail' in buckets):
         return 'running', counts
-    return ('red' if counts.get('fail') or counts.get('cancel') or 'fail' in buckets else 'green'), counts
+    if counts.get('fail') or counts.get('cancel') or 'fail' in buckets:
+        return 'red', counts
+    return ('awaiting-approval' if gates else 'green'), counts
 
 
 def unfinished_held(repo, checks, workflows):
@@ -411,15 +422,29 @@ def unfinished_held(repo, checks, workflows):
     return [{**c, 'bucket': 'pending'} if c['link'] in held else c for c in checks]
 
 
-def held_runs(repo, head, everything):
+def workflow_runs(path):
+    """Every workflow run a paginated Actions runs path lists."""
+    return listed(path, 'workflow_runs')
+
+
+def head_runs(repo, head):
+    return [r for r in workflow_runs(f'repos/{repo}/actions/runs?head_sha={head}') if r.get('head_sha') == head]
+
+
+def held_runs(runs, everything):
     """The head's unfinished workflow runs no pending check in the listing stands for, each as one pending check
     (#444): a run a concurrency group holds, or a re-run not yet started, registers no check run of its own, and the
     listing may still show the finished jobs of its earlier attempt."""
     seen = {m.group('run') for c in everything if c.get('bucket') == 'pending' and (m := ACTIONS_JOB.match(c.get('link') or ''))}
     return [{'name': f"{r.get('name') or r['path']} (run {r['id']}, {r['status']}, no pending job registered)", 'workflow': r.get('name') or '',
              'bucket': 'pending', 'link': r.get('html_url') or ''}
-            for r in listed(f'repos/{repo}/actions/runs?head_sha={head}', 'workflow_runs')
-            if r.get('head_sha') == head and r.get('status') in RUN_PENDING and str(r['id']) not in seen]
+            for r in runs if r.get('status') in RUN_PENDING and str(r['id']) not in seen]
+
+
+def approval_checks(gated):
+    """Each run awaiting approval as one pending check marked `approval` (#545): nothing else shows it."""
+    return [{'name': f"{r.get('name') or r['path']} (run {r['id']}, completed/action_required: awaiting maintainer approval)", 'workflow': r.get('name') or '',
+             'bucket': 'pending', 'link': r.get('html_url') or '', 'approval': True} for r in gated]
 
 
 def run_of(link):
@@ -514,8 +539,8 @@ def judged(repo, head, required):
 
 def inventory(repo, pr, head, wait, ignore=(), brief=False, links=None, required=True):
     """brief: the caller is shown no failing check while running, by the last mergeable read; links: the only checks
-    it asks about, by link; required False skips the required checks and the held runs (failures and bases, which judge
-    none)."""
+    it asks about, by link; required False skips the required checks and the head's runs, held or awaiting approval
+    (failures and bases, which judge none)."""
     view = before = pull(repo, pr)
     if before['state'] != 'OPEN':
         return ended(before)
@@ -537,8 +562,10 @@ def inventory(repo, pr, head, wait, ignore=(), brief=False, links=None, required
         everything = listing(repo, pr)
         ignored = sorted({c['name'] for c in everything if c['name'] in ignore})
         checks = unfinished_held(repo, [c for c in everything if c['name'] not in ignore], workflows)
-        if required and not any(c['bucket'] == 'pending' for c in checks):
-            checks += held_runs(repo, head, everything)
+        if required:
+            # The whole run listing only while nothing else is pending; the gates from it then, else by their own filter.
+            runs = None if any(c['bucket'] == 'pending' for c in checks) else head_runs(repo, head)
+            checks += held_runs(runs or [], everything) + approval_checks(gated_runs(repo, head, workflow_runs, runs))
         counts = summary(checks, view.get('mergeable'))[1]
         reqs = judge(view, counts)
         status = summary(checks, view.get('mergeable'), reqs)[0]
@@ -609,7 +636,7 @@ def printed(inv):
             'pending': inv['counts'].get('pending', 0), 'registered': sum(inv['counts'].values()), 'ignored': inv['ignored'],
             'waiting': fnv1a(json.dumps([inv['mergeable'], pending, *([unmet] if unmet else [])])) if inv['status'] == 'running' else '',
             'checks': listed, 'requiredChecks': [{k: r[k] for k in ('context', 'app', 'state', 'bucket')} for r in inv['required']],
-            'observedAt': utc(time.time())}
+            'awaitingApproval': sorted(c['name'] for c in inv['checks'] if c.get('approval')), 'observedAt': utc(time.time())}
 
 
 def evidence_dir(repo, pr, head):

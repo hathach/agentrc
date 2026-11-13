@@ -333,6 +333,18 @@ class LaunchResultTest(unittest.TestCase):
         rc, s = self.run_it(output(result=base))
         self.assertFalse(any(b.startswith('orphaned-run recovery') for b in s['blockers']), 'none asked, none named')
 
+    def test_a_stop_on_runs_awaiting_approval_names_them_and_that_nothing_here_approves_them(self):
+        # #545: a fork PR's runs held completed/action_required are no failure to re-run.
+        gated = ['Build (run 43344617970, completed/action_required: awaiting maintainer approval)']
+        base = {'pass': False, 'status': 'blocked', 'reason': 'ci-awaiting-approval', 'head': HEAD, 'awaitingApproval': gated,
+                'state': {'expectedHead': HEAD, 'cyclesUsed': 1, 'maxCycles': 5}}
+        rc, s = self.run_it(output(result=base))
+        self.assertEqual(len(s['blockers']), 1, s['blockers'])
+        self.assertIn('Build (run 43344617970', s['blockers'][0])
+        self.assertIn('nothing here approves or re-runs them', s['blockers'][0])
+        rc, s = self.run_it(output(result={**base, 'reason': 'ci-stuck', 'pending': 1}))
+        self.assertFalse(any('approve' in b for b in s['blockers']), 'only its own stop names them')
+
     def test_a_state_too_large_to_load_is_a_blocker(self):
         rc, s = self.run_it(output(result={'pass': True, 'status': 'complete', 'stateTooLarge': 270000,
                                            'state': {'expectedHead': NEXT, 'cyclesUsed': 1, 'maxCycles': 5}}))
@@ -388,7 +400,7 @@ class LaunchResultTest(unittest.TestCase):
 
     def test_every_stop_reason_of_the_workflow_is_refused_or_handled_elsewhere(self):
         handled_elsewhere = {  # blocked by receipts, budget, heads or CI fields, or left to chief's judgment
-            'adopt-needs-push', 'adopt-push-failed', 'adopt-push-unknown', 'budget-exhausted', 'build-unverifiable',
+            'adopt-needs-push', 'adopt-push-failed', 'adopt-push-unknown', 'budget-exhausted', 'build-unverifiable', 'ci-awaiting-approval',
             'cycle-threw', 'deferred-replies-unresolved', 'dirty-start', 'dry-run',
             'duplicate-finding-ids', 'fix-verification-failed', 'held-awaiting-caller', 'preflight-died', 'preflight-failed', 'push-failed',
             'review-challenger-died', 'review-report-unusable', 'review-validator-died', 'reviews-pending',

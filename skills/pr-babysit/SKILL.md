@@ -66,6 +66,8 @@ script the install lacks `stale-workflow`, and one whose `facts.py` lacks
 `launch_result.py` is the caller's, not the workflow's: it condenses a finished
 launch, lists the `blockers` to settle before continuing, and shows as `pinned`
 the arguments the state is fixed to, which a continuation passes unchanged.
+A head whose only CI left is Actions runs awaiting a maintainer's approval (collect.py's `awaiting-approval`) stops
+`ci-awaiting-approval` at the CI lane's read, naming them in `awaitingApproval`; nothing here approves or re-runs them.
 A launch on a PR no longer open stops `pr-merged` or `pr-closed`, at preflight or at the CI lane's next read; nothing is left to continue. Every GitHub or SonarCloud write reads the state first (`preflight.py --state`, or `push.py --open-pr` for a push) and goes on only for an OPEN PR; an unreadable state stops `pr-state-unread`.
 `preflight.py`, `harvest.py`, `scope_check.py`, `state_transfer.py`, `launch_result.py` and `commits.py` only read, except that
 each writes its AGENTRC_EMIT file, `preflight.py` creates the launch's receipts directory and `commits.py commit` stages and commits exactly its paths, saving its receipt; `hooks.py` runs the repository's hooks, which may rewrite

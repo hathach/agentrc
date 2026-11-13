@@ -1,4 +1,5 @@
-"""Tests for lib/check_runs.py, the run ordering collect.py and harvest.py share."""
+"""Tests for lib/check_runs.py, the run ordering collect.py and harvest.py share, and the approval gate collect.py and
+pr-review's prepare.py share."""
 import importlib.util
 import sys
 import unittest
@@ -58,6 +59,51 @@ class LatestRunTest(unittest.TestCase):
         for name in ('latest_run', 'newest', 'newest_reading', 'stamp'):
             self.assertIs(getattr(harvest, name), getattr(check_runs, name), name)
         self.assertIs(collect.latest_run, check_runs.latest_run)
+
+
+HEAD, OTHER = 'a' * 40, 'b' * 40
+
+
+def workflow_run(i, event='pull_request', status='completed', conclusion='action_required', head=HEAD):
+    return {'id': i, 'event': event, 'status': status, 'conclusion': conclusion, 'head_sha': head}
+
+
+class GatedRunsTest(unittest.TestCase):
+    def test_a_run_awaits_approval_only_as_a_completed_action_required_pull_request_run(self):
+        for want, r in ((True, workflow_run(1)),
+                        # hathach/tinyusb run 43103189104: a fork contributor's review comment, held the same way.
+                        (False, workflow_run(2, event='pull_request_review_comment')),
+                        (False, workflow_run(3, event='pull_request_target')),
+                        (False, workflow_run(4, status='queued', conclusion=None)),
+                        (False, workflow_run(5, status='in_progress', conclusion='action_required')),
+                        (False, workflow_run(6, conclusion='failure'))):
+            with self.subTest(r['id']):
+                self.assertIs(check_runs.awaiting_approval(r), want)
+
+    def test_gates_are_read_by_githubs_filter_unless_the_whole_listing_is_given(self):
+        listing = [workflow_run(1), workflow_run(2, head=OTHER), workflow_run(3, event='pull_request_review_comment'), workflow_run(4, conclusion='success')]
+        paths = []
+
+        def read(path):
+            paths.append(path)
+            return listing
+        self.assertEqual([r['id'] for r in check_runs.gated_runs('o/r', HEAD, read)], [1], 'another head\'s and other events\' left out')
+        self.assertEqual(paths, [f'repos/o/r/actions/runs?head_sha={HEAD}&event=pull_request&status=action_required'])
+        paths.clear()
+        self.assertEqual([r['id'] for r in check_runs.gated_runs('o/r', HEAD, read, listing)], [1])
+        self.assertEqual(check_runs.gated_runs('o/r', HEAD, read, []), [], 'an empty listing is still a listing')
+        self.assertEqual(paths, [], 'no request beside a listing already read')
+
+        def failing(path):
+            raise RuntimeError('HTTP 404')
+        with self.assertRaisesRegex(RuntimeError, 'HTTP 404'):
+            check_runs.gated_runs('o/r', HEAD, failing)
+
+    def test_prepare_and_collect_read_the_gates_through_the_shared_copy(self):
+        collect = load('ci_collect_gates', 'skills/ci-rerun/scripts/collect.py')
+        prepare = load('pr_review_prepare_gates', 'skills/pr-review/scripts/prepare.py')
+        self.assertIs(collect.gated_runs, check_runs.gated_runs)
+        self.assertIs(prepare.gated_runs, check_runs.gated_runs)
 
 
 if __name__ == '__main__':

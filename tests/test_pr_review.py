@@ -65,6 +65,7 @@ class FakeGitHub:
         self.state = 'OPEN'
         self.checks = []
         self.checks_code = 0
+        self.run_pages = [[]]  # the head's Actions runs, a list per page; a str fails the read with it
         self.reviews = {}
         self.review_comments = {}
         self.inline = []
@@ -205,6 +206,14 @@ class FakeGitHub:
         if argv[0] == 'api':
             path = next(a for a in argv[1:] if a.startswith('repos/')).split('?')[0]
             page = lambda xs: [list(xs)]  # noqa: E731 - --paginate --slurp shape
+            if path == f'repos/{REPO}/actions/runs':
+                if isinstance(self.run_pages, str):
+                    return 1, '', self.run_pages
+                query = next(a for a in argv if a.startswith('repos/')).split('?')[1]
+                assert query.startswith(f'head_sha={self.head}&event=pull_request&status=action_required&') and '--paginate' in argv, argv
+                # GitHub's own filter: the pull_request runs concluded action_required.
+                pages = [[r for r in rs if r.get('event') == 'pull_request' and r.get('conclusion') == 'action_required'] for rs in self.run_pages]
+                return 0, json.dumps([{'total_count': sum(map(len, pages)), 'workflow_runs': rs} for rs in pages])
             if path.count('/') == 2 and '--jq' in argv and argv[argv.index('--jq') + 1] == '.permissions':
                 got = self.perms.get(path[len('repos/'):])
                 return (1, '', got) if isinstance(got, str) else (0, json.dumps(got))
@@ -596,6 +605,54 @@ class Prepare(Case):
         ):
             self.gh.checks, self.gh.checks_code = checks, code
             self.assertEqual(self.prepare()['ci']['state'], want, checks)
+
+    def test_a_head_whose_actions_runs_wait_for_approval_is_pending_never_green(self):
+        # #545: adafruit/Adafruit_TinyUSB_Arduino#591, Build and HIL completed/action_required, only the bots' checks listed.
+        self.commit('src/core/a.c', 'int b;\n', 'b')
+        head = self.push_pr()
+        gate = lambda i, name, sha=None, event='pull_request': {'id': i, 'name': name, 'head_sha': sha or head, 'event': event,  # noqa: E731
+                                                                'status': 'completed', 'conclusion': 'action_required'}
+        done = lambda i, sha=None: {'id': i, 'name': 'Lint', 'head_sha': sha or head, 'status': 'completed', 'conclusion': 'success'}  # noqa: E731
+        bots = [{'name': 'CodeRabbit', 'state': 'SUCCESS'}, {'name': 'Greptile Review', 'state': 'SUCCESS'}]
+        blocker = '2 Actions run(s) wait for maintainer approval: Build (run 43344617970), HIL (run 43344617967)'
+        for what, checks, code, pages, want in (
+            ('bot checks pass', bots, 0, [[gate(43344617970, 'Build'), gate(43344617967, 'HIL')]], ('pending', 2, blocker)),
+            ('no check at all', [], 1, [[gate(43344617970, 'Build'), gate(43344617967, 'HIL')]], ('pending', 2, blocker)),
+            ('a gated run on a later page', bots, 0, [[done(1)], [gate(43344617970, 'Build'), gate(43344617967, 'HIL')]],
+             ('pending', 2, blocker)),
+            ('a check also action_required', bots + [{'name': 'x', 'state': 'ACTION_REQUIRED'}], 8,
+             [[gate(43344617970, 'Build'), gate(43344617967, 'HIL')]], ('pending', 3, blocker)),
+            ('a failed check outranks it', bots + [{'name': 'x', 'state': 'FAILURE'}], 0, [[gate(43344617970, 'Build'), gate(43344617967, 'HIL')]],
+             ('red', 2, blocker)),
+            ("another head's gated run", bots, 0, [[done(1), gate(2, 'Build', sha='f' * 40)]], ('green', 0, None)),
+            # hathach/tinyusb run 43103189104: a fork contributor's review comment, held, on a head whose CI ran.
+            ("a review comment's gated run", bots, 0, [[done(1), gate(43103189104, 'Claude Code', event='pull_request_review_comment')]],
+             ('green', 0, None)),
+            ('ordinary pending', bots + [{'name': 'x', 'state': 'PENDING'}], 8, [[done(1)]], ('pending', 0, None)),
+            ('ordinary failure', bots + [{'name': 'x', 'state': 'FAILURE'}], 0, [[done(1)]], ('red', 0, None)),
+            ('ordinary success', bots, 0, [[done(1)], []], ('green', 0, None)),
+        ):
+            with self.subTest(what):
+                self.gh.checks, self.gh.checks_code, self.gh.run_pages = checks, code, pages
+                got = self.prepare()
+                ci = got['ci']
+                self.assertEqual((ci['state'], ci['actionRequired'], ci.get('blocker')), want)
+                os.chdir(got['worktree'])
+                again = self.call(prepare, ['--check', '--pr', str(PR), '--repo', REPO, '--expected-head', head])['ci']
+                self.assertEqual(again, ci, '--check reads the same')
+                os.chdir(self.clone)
+
+    def test_unreadable_actions_runs_never_read_green(self):
+        self.commit('src/core/a.c', 'int b;\n', 'b')
+        self.push_pr()
+        self.gh.run_pages = 'gh: Not Found (HTTP 404)'
+        for checks, code, want in (([{'name': 'a', 'state': 'SUCCESS'}], 0, 'unknown'), ([], 1, 'unknown'),
+                                   ([{'name': 'a', 'state': 'PENDING'}], 8, 'pending'), ([{'name': 'a', 'state': 'FAILURE'}], 0, 'red')):
+            with self.subTest(checks=checks):
+                self.gh.checks, self.gh.checks_code = checks, code
+                ci = self.prepare()['ci']
+                self.assertEqual(ci['state'], want)
+                self.assertRegex(ci['blocker'], "^the head's Actions runs could not be read: .*HTTP 404")
 
     def test_check_refuses_a_moved_head(self):
         self.commit('src/core/a.c', 'int b;\n', 'b')

@@ -363,7 +363,7 @@ async function run(opts = {}) {
         if (opts.inventoryWait) await opts.inventoryWait(calls, label)
         answer = {
           head: ci.headSha ?? head, baseRef: 'master', status: ci.status, mergeable: ci.mergeable ?? (ci.status === 'conflicting' ? 'CONFLICTING' : 'MERGEABLE'),
-          requiredChecks: ci.requiredChecks ?? [],
+          requiredChecks: ci.requiredChecks ?? [], awaitingApproval: ci.awaitingApproval ?? [],
           pending: ci.pending ?? (ci.status === 'running' ? 1 : 0), checks: failed,
           // Every read sees CI move unless a fixture fixes what it waits on.
           registered: ci.registered ?? Math.max(1, failed.length), waiting: ci.status === 'running' ? ci.waiting ?? label : '',
@@ -2151,6 +2151,69 @@ test('CI stuck through two whole waits asks ci_recover.py once per head; a recov
   assert.deepEqual(recovers(moving.labels), [], 'only where ci-stuck would stop')
 })
 
+const GATED = ['Build (run 43344617970, completed/action_required: awaiting maintainer approval)',
+  'HIL (run 43344617967, completed/action_required: awaiting maintainer approval)']
+const AWAITING = { status: 'awaiting-approval', pending: 2, registered: 4, awaitingApproval: GATED, infraRerun: [], realFailures: [] }
+const REAL = { check: 'build / arm', firstError: 'boom', files: ['src/a.c'], verdict: 'real' }
+
+test('Actions runs awaiting approval alone stop the launch at once, naming them, never green and never waited on (#545)', async () => {
+  const { result, labels, logs } = await run({ ci: AWAITING, args: { maxCycles: 4 } })
+  assert.deepEqual([result.reason, result.cycles, result.head, result.awaitingApproval], ['ci-awaiting-approval', 1, HEAD, GATED], logs.join('\n'))
+  assert.notEqual(result.pass, true)
+  assert.deepEqual(labels.filter(l => l.startsWith('ci:')), ['ci:collect#1.1'], 'one read: no whole wait, no evidence, no judge')
+  assert.equal(labels.some(l => l.startsWith('ci:recover')), false)
+  assert.equal(result.history[0].ciWaited, undefined, 'no wait recorded for ci-stuck to compare')
+  assert.ok(logs.includes(`cycle 1: CI on ${HEAD.slice(0, 7)} waits for a maintainer to approve ${GATED.join(', ')} — nothing here approves or re-runs them`), logs.join('\n'))
+  assert.match(summaries(logs)[0], /^cycle 1 summary — CI awaiting-approval/)
+  // Never green: an inventory calling such a head green or running with nothing else pending is no inventory.
+  for (const [what, ci] of [['green', { ...GREEN, pending: 2, awaitingApproval: GATED }], ['running', { ...RUNNING, pending: 2, awaitingApproval: GATED }]]) {
+    const bad = await run({ ci, args: { maxCycles: 1 } })
+    assert.ok(bad.logs.some(l => /CI inventory is inconsistent/.test(l)), `${what}: ${bad.logs.join('\n')}`)
+    assert.notEqual(bad.result.pass, true, what)
+  }
+})
+
+test('Actions runs awaiting approval beside other work wait on it, and a failure is handled first (#545)', async () => {
+  // A pending check, or a held run, beside the gate: CI is still running, and ci-stuck reads it without the gate.
+  const pending = await run({ ci: { ...RUNNING, pending: 3, registered: 5, waiting: 'same', awaitingApproval: GATED }, args: { maxCycles: 4 } })
+  assert.deepEqual([pending.result.reason, pending.result.cycles], ['ci-stuck', 2], pending.logs.join('\n'))
+  assert.equal('awaitingApproval' in pending.result, false)
+  assert.deepEqual(pending.result.history[0].ciWaited, { head: HEAD, registered: 5, pending: 3, waiting: 'same' })
+  assert.equal(pending.logs.some(l => l.includes('approve')), false, pending.logs.join('\n'))
+  // A real failure beside the gate: the head is red, and its fix is published before anything stops on the gate.
+  const red = await run({ ci: { status: 'red', pending: 2, awaitingApproval: GATED, infraRerun: [], realFailures: [REAL] }, args: { autoPush: true, maxCycles: 1 } })
+  assert.ok(red.labels.includes('push#1-ci'), red.labels.join('\n'))
+  assert.notEqual(red.result.reason, 'ci-awaiting-approval')
+  assert.notEqual(red.result.pass, true)
+  // Failures all accepted beside the gate: nothing left to repair, and the gate still stands between the head and a pass.
+  const accepted = await run({ ci: { ...redWith(PVS).ci, pending: GATED.length, awaitingApproval: GATED }, args: { acceptedFailures: [byKey()], maxCycles: 1 } })
+  assert.deepEqual([accepted.result.pass, accepted.result.reason, accepted.result.awaitingApproval], [false, 'ci-awaiting-approval', GATED], accepted.logs.join('\n'))
+  assert.equal('acceptedFailures' in accepted.result, false)
+  assert.ok(accepted.logs.includes(`cycle 1: CI on ${HEAD.slice(0, 7)} waits for a maintainer to approve ${GATED.join(', ')} — nothing here approves or re-runs them`), accepted.logs.join('\n'))
+  assert.deepEqual(accepted.result.history[0].ci.awaitingApproval, GATED, 'the red report keeps the gates')
+  // A rig-side failure beside the gate is a failure first: it stops on that, never passes.
+  const rig = await run({ ci: { ...redWith(PVS).ci, pending: GATED.length, awaitingApproval: GATED }, args: { maxCycles: 1 } })
+  assert.deepEqual([rig.result.pass, rig.result.reason], [false, 'ci-red-rig-side'], rig.logs.join('\n'))
+})
+
+test('a conflicting PR or an unknown mergeability outranks runs awaiting approval (#545)', async () => {
+  const conflicting = await run({ ci: { ...AWAITING, status: 'conflicting', mergeable: 'CONFLICTING' }, args: { maxCycles: 3 } })
+  assert.equal(conflicting.result.reason, 'pr-conflicting', conflicting.logs.join('\n'))
+  const unknown = await run({ ci: { ...AWAITING, status: 'running', mergeable: 'UNKNOWN', waiting: 'same' }, args: { maxCycles: 1 } })
+  assert.equal(unknown.logs.some(l => /CI inventory is inconsistent/.test(l)), false, unknown.logs.join('\n'))
+  assert.notEqual(unknown.result.reason, 'ci-awaiting-approval')
+  assert.notEqual(unknown.result.pass, true)
+})
+
+test('a review-lane push supersedes the old head\'s runs awaiting approval; the new head is read again (#545)', async () => {
+  let cycle = 0
+  const reviewsPerCycle = () => ++cycle === 1 ? oneValid : { findings: [finding({ verdict: 'stale' })], replies: [], bots: 'reviewed' }
+  const { result, logs, labels } = await run({ reviewsPerCycle, ci: AWAITING, args: { autoPush: true, maxCycles: 2 } })
+  assert.ok(logs.some(l => /cycle 1: review-lane push superseded the CI run/.test(l)), logs.join('\n'))
+  assert.ok(labels.includes('ci:collect#2.1'), 'the new head is inventoried')
+  assert.deepEqual([result.reason, result.cycles, result.head], ['ci-awaiting-approval', 2, shaFor(1)], logs.join('\n'))
+})
+
 test('a required check not yet passed is waited for, never read as green, and stops ci-stuck by name', async () => {
   const missing = { context: 'build', app: -1, state: 'not registered', bucket: 'missing' }
   const none = { ...RUNNING, pending: 0, registered: 0, waiting: 'same', requiredChecks: [missing] }
@@ -2962,7 +3025,7 @@ test('a collector that dies gets one fresh agent; a second death leaves the cycl
 
 test('a collector failing the same way on two cycles running stops ci-collect-failed; a passing failure re-arms after a backoff', async () => {
   const failing = (error, when = () => true) => (l, a) => l.startsWith('ci:collect#') && when(cycleOf(l))
-    ? { error: typeof error === 'function' ? error(cycleOf(l)) : error, head: '', baseRef: '', status: '', mergeable: '', pending: 0, registered: 0, ignored: [], waiting: '', checks: [], requiredChecks: [], observedAt: '', contract: 0, seal: '' }
+    ? { error: typeof error === 'function' ? error(cycleOf(l)) : error, head: '', baseRef: '', status: '', mergeable: '', pending: 0, registered: 0, ignored: [], waiting: '', checks: [], requiredChecks: [], awaitingApproval: [], observedAt: '', contract: 0, seal: '' }
     : a
   const auth = await run({ args: { maxCycles: 4 }, garble: failing('gh: authentication expired') })
   assert.deepEqual([auth.result.reason, auth.result.detail, auth.result.cycles], ['ci-collect-failed', 'gh: authentication expired', 2], auth.logs.join('\n'))

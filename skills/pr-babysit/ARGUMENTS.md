@@ -121,7 +121,14 @@ A key not listed here throws before anything runs.
   wait; that pass is a grace period for checks that register late, not proof.
   An Actions run on the head that is unfinished with no pending job registered
   (one a concurrency group holds, a re-run not yet started) counts as a
-  pending check, so it is waited on. Where the same checks stay pending through
+  pending check, so it is waited on. Runs held for a maintainer's approval
+  (completed/action_required, a fork PR's) are never green and never re-run:
+  beside other pending work they are waited on with it, and a failure is
+  handled first; once they are all that is left, accepted failures aside
+  (which pass nothing while they stand), the CI lane stops
+  `ci-awaiting-approval`, naming them in `awaitingApproval`, after the review
+  lane's work settles; a review-lane push supersedes them, the new head read
+  again. The launch approves nothing. Where the same checks stay pending through
   two whole waits (`ci-stuck`), the launch first runs `ci_recover.py` once per
   head: a run still `queued` with no job past `ciWait`, after which a newer
   run in the repository completed, and that no concurrency group can be

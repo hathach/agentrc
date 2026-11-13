@@ -539,14 +539,16 @@ const REQUIRED_CHECK = {
 }
 // collect.py's CONTRACT: the members its lines hold, which these schemas read. A line of another is a collector older or newer
 // than this workflow copy, whose line its schema may not fit: told apart before the seal and the shape (#293).
-const COLLECT_CONTRACT = 1
+const COLLECT_CONTRACT = 2
 const collectorLine = (schema) => withSeal({ ...schema, required: [...schema.required, 'contract'], properties: { ...schema.properties, contract: { type: 'integer' } } })
 const INVENTORY = collectorLine({
-  type: 'object', required: ['head', 'baseRef', 'status', 'mergeable', 'pending', 'registered', 'ignored', 'waiting', 'checks', 'requiredChecks', 'observedAt'],
+  type: 'object', required: ['head', 'baseRef', 'status', 'mergeable', 'pending', 'registered', 'ignored', 'waiting', 'checks', 'requiredChecks', 'awaitingApproval', 'observedAt'],
   properties: {
     error: { type: ['string', 'null'] }, head: { type: 'string' }, baseRef: { type: 'string' }, status: { type: 'string' }, mergeable: { type: 'string' },
     pending: { type: 'integer' }, registered: { type: 'integer' }, ignored: { type: 'array', items: { type: 'string' } }, waiting: { type: 'string' },
-    checks: { type: 'array', items: COLLECT_CHECK }, requiredChecks: { type: 'array', items: REQUIRED_CHECK }, observedAt: { type: 'string' }, rateLimit: RATE_LIMIT,
+    checks: { type: 'array', items: COLLECT_CHECK }, requiredChecks: { type: 'array', items: REQUIRED_CHECK },
+    // Actions runs on the head held for maintainer approval, each one of the pending checks: only the approval starts them.
+    awaitingApproval: { type: 'array', items: { type: 'string' } }, observedAt: { type: 'string' }, rateLimit: RATE_LIMIT,
   },
 })
 const GATE = {
@@ -2595,8 +2597,11 @@ const ciLaneRun = async (cycle, lanes, entry) => {
   const failing = inv.checks.filter(c => c.bucket === 'fail' || c.bucket === 'cancel')
   const unmet = unmetOf(inv)
   const failedRequired = inv.requiredChecks.filter(r => r.bucket === 'fail')
+  // Runs awaiting approval are pending checks too, which only other pending work keeps running.
+  const gates = inv.awaitingApproval.length
   const shown = inv.mergeable === 'CONFLICTING' ? 'conflicting'
-    : inv.pending > 0 || inv.mergeable === 'UNKNOWN' || unmet.length ? 'running' : failing.length || failedRequired.length ? 'red' : null
+    : inv.pending > gates || inv.mergeable === 'UNKNOWN' || unmet.length ? 'running' : failing.length || failedRequired.length ? 'red'
+      : gates ? 'awaiting-approval' : null
   if (inv.head !== expectedHead || (shown ? inv.status !== shown : !['green', 'running'].includes(inv.status))) {
     log(`cycle ${cycle}: CI inventory is inconsistent — head ${inv.head.slice(0, 7) || 'none'} for ${expectedHead.slice(0, 7)}, ${inv.status} with ${failing.length} failing check(s); re-arming`)
     return null
@@ -2618,6 +2623,8 @@ const ciLaneRun = async (cycle, lanes, entry) => {
   }
   // No registered check stands for a PR GitHub cannot merge: judge nothing until the base is merged in.
   if (inv.status === 'conflicting') return { headSha: inv.head, status: 'conflicting', infraRerun: [], realFailures: [] }
+  // Only a maintainer's approval starts these runs: no wait or re-run here moves them, so nothing is waited for.
+  if (inv.status === 'awaiting-approval') return { headSha: inv.head, status: inv.status, awaitingApproval: inv.awaitingApproval, infraRerun: [], realFailures: [] }
   const gated = failing.filter(c => gateOf({ check: c.name, workflow: c.workflow }))
   // A gate is read afresh each time: a verdict an older launch stored for its link stands for nothing.
   for (const c of gated) ciVerdicts.delete(c.link)
@@ -2703,6 +2710,8 @@ const ciLaneRun = async (cycle, lanes, entry) => {
     ...(settling.length && inv.status !== 'running' ? { settling: true } : {}),
     ...(overdue.length ? { unregistered: overdue.map(c => `${c.workflow} / ${c.name}`) } : {}),
     ...(failedRequired.length ? { requiredFailed: failedRequired.map(({ context, app }) => ({ context, app })) } : {}),
+    // Runs awaiting approval beside failures: once those are handled, they still stand between the head and a pass.
+    ...(gates ? { awaitingApproval: inv.awaitingApproval } : {}),
     realFailures: cached.flatMap(c => keyed(c, JSON.parse(JSON.stringify(ciVerdicts.get(c.link).failures)), !ciVerdicts.get(c.link).refreshed)),
   }
   if (cached.length) log(`cycle ${cycle}: CI verdicts reused for ${cached.length} check(s) already judged on this head`)
@@ -3424,6 +3433,11 @@ const runLanes = async (cycle, entry, lanes) => {
       log(`cycle ${cycle}: PR #${args.pr} conflicts with its base — no check result stands for it`)
       return stop(cycle, 'pr-conflicting', { outstanding: outstanding() })
     }
+    const awaitingApproval = () => {
+      log(`cycle ${cycle}: CI on ${expectedHead.slice(0, 7)} waits for a maintainer to approve ${c.awaitingApproval.join(', ')} — nothing here approves or re-runs them`)
+      return stop(cycle, 'ci-awaiting-approval', { head: c.headSha, awaitingApproval: c.awaitingApproval, outstanding: outstanding() })
+    }
+    if (c.status === 'awaiting-approval') return awaitingApproval()
     // A mark may clear the SonarCloud gate this run failed on: read CI again rather than fix it.
     const marked = (entry.sonarMarked || 0) + await settleSonar(cycle, entry, ended)
     if (lanes.prState) return prEnded(cycle, lanes.prState)
@@ -3494,6 +3508,8 @@ const runLanes = async (cycle, entry, lanes) => {
       log(`cycle ${cycle}: CI red from required check(s) ${names.join(', ')} with no failure left to repair — stopping`)
       return stop(cycle, 'required-check-failed', { head: expectedHead, requiredFailed: c.requiredFailed, outstanding: outstanding() })
     }
+    // Accepted failures pass nothing while runs awaiting approval stand: only a maintainer starts them.
+    if (nothingToRepair(c) && c.awaitingApproval) return awaitingApproval()
     if (reviewsSettled && (c.status === 'green' || acceptedOnly(c))) {
       const owedNow = outstanding()
       if (owedNow.length > 0) {
