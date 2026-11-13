@@ -6,18 +6,14 @@
 pr-babysit's CI lane runs it where the same checks stayed pending through two whole CI waits (ci-stuck, #536). Run from
 the PR checkout; PR N is --repo's, else the checkout's one repository (facts.bind_repo). A run on the head is a suspected
 orphan, and acted on, only when all of this reads so under its lock, the last four just before the cancel: no
-concurrency group can be holding it (its workflow file at SHA declares no top-level `concurrency`, or no other unfinished
-run in the repository can share the group); the repository's newest completed run was created after it was queued
-(Actions runs other work); PR N is open at SHA; the run is on the PR's head branch and repository at SHA and `queued`; its
-attempt has been queued at least M minutes; and that attempt has no job. A workflow file that does not read, or no
-PyYAML, leaves the run alone.
+concurrency group can be holding it (its workflow file at SHA declares no top-level `concurrency`, its group is exactly
+`${{ github.run_id }}`, or no other unfinished run is in the repository at all); the repository's newest completed run
+was created after it was queued (Actions runs other work); PR N is open at SHA; the run is on the PR's head branch and
+repository at SHA and `queued`; its attempt has been queued at least M minutes; and that attempt has no job. A workflow
+file that does not read, or no PyYAML, leaves the run alone.
 
-What a group can share is inferred only from forms whose value proves it, each `${{ }}` expression taken whole: a group
-whose expressions are all `github.run_id`, `github.workflow` or a branch's (`github.ref` alone, or ended by it after
-any of `github.head_ref`, `github.event.pull_request.number`, `github.event.number` joined by `||`) is the run's own when
-one is github.run_id, else shared at most with a run of the same workflow when one is github.workflow, and on the same
-branch when one is a branch's (a run of an event other than push, pull_request or workflow_dispatch: on any branch).
-Any other group, a literal or any other expression among them, can be shared by every unfinished run in the repository.
+Any other group can be shared by any other unfinished run: groups compare case-insensitively, concatenated values can
+collide, and another workflow's group can be any expression of its own, none of which this script reads.
 
 Each run attempt acted on is recorded under the checkout's git common dir, in
 pr-babysit/ci-recover/<owner>-<repo>-<run>-<attempt>.json, under one lock held from the reads above to the last step.
@@ -64,9 +60,7 @@ CANCEL_WAIT = 45  # seconds: the whole script stays inside a relay's two-minute 
 RERUN_WAIT = 30
 POLL = 5
 UNFINISHED = ('queued', 'in_progress', 'waiting', 'pending', 'requested')
-EXPRESSION = re.compile(r'\$\{\{(.*?)\}\}', re.S)
-BEFORE_REF = ('github.head_ref', 'github.event.pull_request.number', 'github.event.number')  # each empty on a push
-BRANCH_EVENTS = ('push', 'pull_request', 'workflow_dispatch')  # github.ref of a run of these names its head_branch
+PER_RUN = re.compile(r'\$\{\{\s*github\.run_id\s*\}\}')  # as the whole group: no other run can share it
 REFUSED = re.compile(r'\bHTTP 4\d\d\b')
 ORDER = ('uncertain', 'failed', 'withheld', 'completed', 'recovered')
 # A read that fails or answers in another shape: one run's, which leaves the others' outcomes standing.
@@ -141,34 +135,11 @@ def group_of(repo, r):
     return str((c.get('group') if isinstance(c, dict) else c) or '')
 
 
-def scope(group):
-    """What the group's value provably varies with: {'run'}, else a subset of {'workflow', 'branch'}; set() when an
-    expression is of anything else, or there is none (a literal group)."""
-    kinds = set()
-    for e in EXPRESSION.findall(group):
-        terms = [t.strip() for t in e.lower().split('||')]  # GitHub reads context names case-insensitively
-        if terms == ['github.run_id']:
-            kinds.add('run')
-        elif terms == ['github.workflow']:
-            kinds.add('workflow')
-        elif terms[-1] == 'github.ref' and all(t in BEFORE_REF for t in terms[:-1]):
-            kinds.add('branch')
-        else:
-            return set()
-    return {'run'} if 'run' in kinds else kinds
-
-
 def holders(repo, r, group):
-    """The unfinished runs that could share the run's concurrency group, read for what the group provably names."""
-    kinds = scope(group)
-    if 'run' in kinds:
+    """The unfinished runs that could share the run's concurrency group: none for its own run id, else every other one."""
+    if PER_RUN.fullmatch(group):
         return []
-    others = [x for s in UNFINISHED for x in pages(f'repos/{repo}/actions/runs?status={s}', 'workflow_runs') if x.get('id') != r['id']]
-    if 'workflow' in kinds:  # github.workflow is the workflow's name: two files can share one
-        others = [x for x in others if x.get('workflow_id') == r.get('workflow_id') or x.get('name') == r.get('name')]
-    if 'branch' in kinds and r.get('event') in BRANCH_EVENTS:
-        others = [x for x in others if x.get('event') not in BRANCH_EVENTS or x.get('head_branch') == r.get('head_branch')]
-    return others
+    return [x for s in UNFINISHED for x in pages(f'repos/{repo}/actions/runs?status={s}', 'workflow_runs') if x.get('id') != r['id']]
 
 
 def on_head(repo, pr, head, run_id):

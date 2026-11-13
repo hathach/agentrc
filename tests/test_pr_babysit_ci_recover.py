@@ -174,33 +174,32 @@ class Recover(unittest.TestCase):
                     self.assertEqual(out['runs'], [])
                 self.assertEqual(self.records(), [], 'nothing recorded')
 
-    def test_a_concurrency_group_is_read_for_what_it_names(self):
-        elsewhere = {'id': 9, 'name': 'tests', 'workflow_id': 7, 'status': 'queued', 'head_branch': 'other', 'event': 'pull_request',
+    def test_only_no_group_or_the_run_id_alone_proves_no_run_can_hold_it(self):
+        elsewhere = {'id': 9, 'name': 'lint', 'workflow_id': 8, 'status': 'queued', 'head_branch': 'other', 'event': 'pull_request',
                      'head_repository': {'full_name': 'o/r'}}
-        other_workflow = dict(elsewhere, name='lint', workflow_id=8, head_branch='captain-prune')
         group = 'concurrency:\n  group: %s\n'.__mod__
         for what, workflow, unfinished, held in (
-                ("another branch's run, per-PR group", WORKFLOW, [elsewhere], False),
-                ("another workflow's run, per-workflow group", WORKFLOW, [other_workflow], False),
-                ('another workflow file of the same name, per-workflow group', WORKFLOW, [dict(other_workflow, name='tests')], True),
-                ("another branch's scheduled run, per-PR group", WORKFLOW, [dict(elsewhere, event='schedule')], True),
-                ('any run, a constant group', 'on: push\nconcurrency: deploy\n', [elsewhere], True),
-                ('any run, a literal that reads like an expression', 'concurrency: github.run_id\n', [other_workflow], True),
-                ('another branch, a per-workflow group', group('${{ github.workflow }}'), [elsewhere], True),
-                ('a per-run group', 'concurrency: ${{ github.run_id }}\n', [other_workflow], False),
-                ('a per-run group of the workflow', group("ci-${{ github.workflow }}-${{ github.run_id }}"), [elsewhere], False),
-                ('another branch, a ref compared', group("${{ github.ref == 'refs/heads/main' && 'production' || 'staging' }}"),
-                 [elsewhere], True),
-                ('another branch, head_ref alone (empty on a push)', group('${{ github.head_ref }}'), [elsewhere], True),
-                ('another branch, head_ref then ref', group('${{ github.head_ref || github.ref }}'), [elsewhere], False),
-                ('another workflow, a sha beside the workflow', group('${{ github.workflow }}-${{ github.sha }}'), [other_workflow], True),
-                ('no group', 'on: [push]\n', [other_workflow], False)):
+                ('no group', 'on: [push]\n', [elsewhere], False),
+                ('the run id alone', 'concurrency: ${{ github.run_id }}\n', [elsewhere], False),
+                ('the run id alone, as the group', group('${{github.run_id}}'), [elsewhere], False),
+                ('a per-PR group, no other unfinished run', WORKFLOW, [], False),
+                ("a per-PR group, another workflow's run on another branch", WORKFLOW, [elsewhere], True),
+                ('a constant group', 'on: push\nconcurrency: deploy\n', [elsewhere], True),
+                ('a literal that reads like the run id', 'concurrency: github.run_id\n', [elsewhere], True),
+                ('the run id beside the workflow', group('ci-${{ github.workflow }}-${{ github.run_id }}'), [elsewhere], True),
+                ('a ref compared', group("${{ github.ref == 'refs/heads/main' && 'production' || 'staging' }}"), [elsewhere], True),
+                # workflow ci on captain-prune and workflow ci-captain on prune both read ci-captain-prune
+                ('names that concatenate alike', group('${{ github.workflow }}-${{ github.head_ref || github.ref }}'),
+                 [dict(elsewhere, name='ci-captain', head_branch='prune')], True)):
             with self.subTest(what):
                 self.fresh()
                 gh = GitHub(workflow=workflow)
                 gh.unfinished = unfinished
                 out = self.go(gh)[1]
                 self.assertEqual(out['outcome'], 'none' if held else 'recovered', out)
+                if held:
+                    self.assertEqual((out['runs'][0]['outcome'], gh.posts), ('skipped', []))
+                    self.assertIn('may be held by run 9 (queued)', out['runs'][0]['reason'])
 
     def test_a_head_that_moves_or_a_run_that_starts_before_the_cancel_is_left_alone(self):
         gh = GitHub()
