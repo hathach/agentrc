@@ -52,6 +52,7 @@ BENCH = [
     {'name': 'bad_cfg', 'flasher': {'name': 'openocd', 'uid': '1', 'args': '-f "unterminated'}},
     {'name': 'bad_ids', 'flasher': {'name': 'openocd', 'uid': '1', 'vid_pid': '2e8a:000c', 'args': '-f x.cfg'}},
     {'name': 'stlink_args', 'flasher': {'name': 'stlink', 'uid': '3', 'args': '--connect-under-reset'}},
+    {'name': 'cross', 'flasher': {'name': 'jlink', 'uid': '8', 'args': '-device X'}},
 ]
 REGISTRY = MODULES['rtt'].hil_boards().registry()
 K64F = next(probe for probe, e in REGISTRY.items() if e['name'] == 'frdm_k64f')
@@ -59,6 +60,10 @@ BOARDS = [{**b, 'uid': f'BENCH-{i}'} for i, b in enumerate(BENCH)] + [
     {'name': 'frdm_k64f', 'uid': 'K64F', 'probe': K64F},
     {'name': 'frdm_k64f_again', 'uid': 'K64F', 'probe': K64F, 'flasher': {**REGISTRY[K64F]['flasher'], 'uid': K64F}},
 ]
+
+# a parked board, and a twin of an active name across the two sections
+PARKED = [{'name': 'parked', 'uid': 'P', 'flasher': {'name': 'jlink', 'uid': '5', 'args': '-device X'}},
+          {'name': 'cross', 'uid': 'P2', 'flasher': {'name': 'jlink', 'uid': '6', 'args': '-device X'}}]
 
 # (board, what the resolver says) - a string is the refusal, a dict the flasher it returns
 RESOLVE_CASES = [
@@ -74,12 +79,15 @@ RESOLVE_CASES = [
     ('int_uid', "uid must be a non-empty string"),
     ('no_kind', 'flasher: name None is none of'),
     ('no_flasher', 'names neither a registered probe nor a flasher'),
-    ('twin', '2 entries of that name'),
-    ('absent', '0 entries of that name'),
+    ('twin', "2 entries named 'twin'"),
+    ('absent', "0 entries named 'absent'"),
+    ('parked', 'parked is parked (boards-skip)'),
+    ('cross', "2 entries named 'cross'"),
     ('stlink_args', "a stlink entry's args are not openocd's"),
 ]
-BAD_FILES = [('[]', 'expected {"boards"'), ('{"boards": {}}', 'expected {"boards"'),
-             ('{"boards": ["k64f"]}', 'expected {"boards"'), ('{"boards": [', '--hil-config'), ('{}', 'expected {"boards"')]
+BAD_FILES = [('[]', 'a roster is {"boards"'), ('{"boards": {}}', 'a roster is {"boards"'),
+             ('{"boards": ["k64f"]}', 'boards: not an object'), ('{"boards": [', '--hil-config'),
+             ('{}', 'a roster is {"boards"'), ('{"boards": [], "boards-skip": {}}', 'a roster is {"boards"')]
 
 
 def setUpModule():
@@ -92,7 +100,7 @@ class Config(unittest.TestCase):
         self.addCleanup(d.cleanup)
         self.tmp = Path(d.name)
         self.config = self.tmp / 'hil.json'
-        self.config.write_text(json.dumps({'boards': BOARDS}))
+        self.config.write_text(json.dumps({'boards': BOARDS, 'boards-skip': PARKED}))
 
 
 class Resolver(Config):
@@ -273,8 +281,8 @@ class Cli(Config):
         for name, extra in (('rtt', ('--seconds', '1')), ('pc_sample', ('--elf', str(self.elf), *self.LINK))):
             for board, want in (('p4', "flashed over 'esptool'"), ('tm4c', "flashed over 'lm4flash'"),
                                 ('jtag', "must be exactly '-device NAME'"), ('quote', 'No closing quotation'),
-                                ('blank_uid', 'must be a non-empty string'), ('blank_dev', "must be exactly '-device NAME'"), ('twin', '2 entries of that name'),
-                                ('absent', '0 entries of that name')):
+                                ('blank_uid', 'must be a non-empty string'), ('blank_dev', "must be exactly '-device NAME'"), ('twin', "2 entries named 'twin'"),
+                                ('absent', "0 entries named 'absent'"), ('parked', 'is parked (boards-skip)')):
                 self.refused(name, ['--board', board, *extra], want)
         self.refused('rtt', ['--board', 'stlink_args', '--addr', '20000000', '--cfg', '-f x.cfg'], "args are not openocd's")
         self.refused('pc_sample', ['--board', 'max32', '--elf', str(self.elf), *self.LINK], 'J-Link only')
