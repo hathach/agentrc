@@ -26,10 +26,21 @@ SKILL_HOOKS = [s for s in SKILLS if (ROOT / 'hooks' / s / 'hooks.json').exists()
 
 
 def guard_command(script):
-    """The settings command of a Python hook: under the installing interpreter on Windows, where bash may find no
-    python3 and a hook that cannot start lets the call through."""
+    """The settings command of a Python hook as entry_command() reads it: on Windows exec form under the installing
+    interpreter, which Claude Code spawns with no shell."""
     command = shlex.quote(script.as_posix())
     return f'{shlex.quote(Path(sys.executable).as_posix())} {command}' if os.name == 'nt' else command
+
+
+def gate_command(hooks):
+    """The simplify gate's settings command: its sh wrapper, or on Windows its Python script."""
+    gate = hooks / 'simplify-gate'
+    return guard_command(gate / 'simplify_gate.py') if os.name == 'nt' else shlex.quote((gate / 'simplify-gate').as_posix())
+
+
+def entry_command(hook):
+    """A settings entry's command line, an exec-form entry's argument vector joined as bash quotes it."""
+    return shlex.join([hook['command'], *hook['args']]) if 'args' in hook else hook['command']
 
 
 def setUpModule():
@@ -58,7 +69,7 @@ class InstallTest(unittest.TestCase):
         return json.loads((self.claude / 'settings.json').read_text())
 
     def commands(self, data):
-        return {e: [h['command'] for g in gs for h in g['hooks']] for e, gs in data.get('hooks', {}).items()}
+        return TestCommands.of(data)
 
     def gate_stops(self, data):
         """The simplify gate's Stop commands, other hooks' left out."""
@@ -125,8 +136,8 @@ class InstallTest(unittest.TestCase):
             'Stop': [{'hooks': [{'type': 'command', 'command': 'other-stop'}]}]}}
         (self.claude / 'settings.json').write_text(json.dumps(before))
         self.ok('install', '--skill')
-        launcher = (self.claude / 'hooks' / 'simplify-gate' / 'simplify-gate').as_posix()  # bash runs it, also on Windows
-        guards = [guard_command(self.claude / 'hooks' / 'headless-chief' / g) for g in ('shadow_guard.py', 'chief_guard.py')]
+        launcher = gate_command(self.claude / 'hooks')
+        guards =[guard_command(self.claude / 'hooks' / 'headless-chief' / g) for g in ('shadow_guard.py', 'chief_guard.py')]
         watch = guard_command(self.claude / 'hooks' / 'captain' / 'captain_hook.py')
         data = self.settings()
         self.assertEqual(data['model'], 'x')
@@ -157,12 +168,13 @@ class InstallTest(unittest.TestCase):
                               env={**os.environ, 'HOME': str(home), 'USERPROFILE': str(home)})
         self.assertEqual(done.returncode, 0, done.stderr)
         data = json.loads((home / '.claude' / 'settings.json').read_text())
-        launcher = (home / '.claude' / 'hooks' / 'simplify-gate' / 'simplify-gate').as_posix()
+        gate = home / '.claude' / 'hooks' / 'simplify-gate'
         [command] = self.gate_stops(data)
-        self.assertEqual(command, f"'{launcher}'")
-        if os.name == 'nt':  # Claude Code runs it through bash: a backslash path would lose its separators
-            done = subprocess.run([shutil.which('bash'), '-c', f'printf %s {command}'], capture_output=True, text=True)
-            self.assertEqual(done.stdout, launcher)
+        if os.name == 'nt':  # exec form: the path is one argument as written, with / separators
+            [entry] = [h for g in data['hooks']['Stop'] for h in g['hooks'] if 'args' in h and 'simplify' in h['args'][0]]
+            self.assertEqual(entry['args'], [(gate / 'simplify_gate.py').as_posix()])
+        else:
+            self.assertEqual(command, f"'{(gate / 'simplify-gate').as_posix()}'")
 
     def test_settings_are_utf8(self):
         self.claude.mkdir()
@@ -182,7 +194,7 @@ class InstallTest(unittest.TestCase):
         (self.claude / 'settings.json').write_text(json.dumps({'hooks': {'Stop': [
             {'hooks': [{'type': 'command', 'command': command}]} for command in old]}}))
         self.ok('install', '--skill')
-        self.assertEqual(self.gate_stops(self.settings()), [Path(launcher).as_posix()])
+        self.assertEqual(self.gate_stops(self.settings()), [gate_command(self.claude / 'hooks')])
 
     def test_a_home_with_quotes_or_spaces_keeps_one_entry_per_hook(self):
         for name in ("O'Brien", "O'Brien Doe", 'John Doe'):
@@ -204,7 +216,7 @@ class InstallTest(unittest.TestCase):
                                           text=True, env=env)
                     self.assertEqual(done.returncode, 0, done.stderr)
                     data = json.loads((claude / 'settings.json').read_text())
-                    self.assertEqual(self.gate_stops(data), [shlex.quote(launcher.as_posix())])
+                    self.assertEqual(self.gate_stops(data), [gate_command(claude / 'hooks')])
                     self.assertEqual(self.commands(data)['PreToolUse'].count(guard_command(guard)), 1)
                     self.assertEqual(len(self.commands(data)['PreToolUse']), 2, 'each guard once')
                 done = subprocess.run([sys.executable, str(SCRIPT), 'remove', '--skill'], capture_output=True,
@@ -213,13 +225,24 @@ class InstallTest(unittest.TestCase):
                 self.assertNotIn('hooks', json.loads((claude / 'settings.json').read_text()))
 
     @unittest.skipUnless(os.name == 'nt', 'POSIX runs a Python hook by its shebang')
-    def test_a_python_hook_names_this_interpreter_for_bash_on_windows(self):
+    def test_a_python_hook_is_exec_form_under_this_interpreter_on_windows(self):
         self.ok('install', '--skill')
         guard = self.claude / 'hooks' / 'headless-chief' / 'chief_guard.py'
-        command = self.commands(self.settings())['PreToolUse'][1]
-        self.assertEqual(command, guard_command(guard))
-        done = subprocess.run([shutil.which('bash'), '-c', f"printf '%s\n' {command}"], capture_output=True, text=True)
-        self.assertEqual(done.stdout.splitlines(), [Path(sys.executable).as_posix(), guard.as_posix()])
+        entry = self.settings()['hooks']['PreToolUse'][1]['hooks'][0]
+        self.assertEqual((entry['command'], entry['args']), (Path(sys.executable).as_posix(), [guard.as_posix()]))
+        payload = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': 'ls'}})
+        done = subprocess.run([entry['command'], *entry['args']], input=payload, capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+
+    def test_the_chief_guards_block_when_they_fail_and_no_other_hook_does(self):
+        self.ok('install', '--skill')
+        hooks = self.settings()['hooks']
+        entries = {e: [h for g in gs for h in g['hooks']] for e, gs in hooks.items()}
+        self.assertEqual([h.get('onFailure') for h in entries['PreToolUse']], ['block', 'block'])
+        others = [h for e, hs in entries.items() if e != 'PreToolUse' for h in hs]
+        self.assertTrue(others)
+        self.assertFalse([h for h in others if 'onFailure' in h])
+        self.assertFalse([h for hs in entries.values() for h in hs if 'windows' in h], "hooks.json's own key stays out")
 
     @unittest.skipUnless(os.name == 'nt', 'POSIX needs no privilege to link')
     def test_no_symlink_privilege_refuses_before_touching_anything(self):
@@ -491,8 +514,8 @@ class ProjectInstallTest(unittest.TestCase):
         self.assertEqual(TestCommands.of(data), {
             'SessionStart': [watch],
             'PreToolUse': [guard_command(hooks / 'headless-chief' / g) for g in ('shadow_guard.py', 'chief_guard.py')],
-            'UserPromptSubmit': [shlex.quote((hooks / 'simplify-gate' / 'simplify-gate').as_posix())],
-            'Stop': [watch, shlex.quote((hooks / 'simplify-gate' / 'simplify-gate').as_posix())]})
+            'UserPromptSubmit': [gate_command(hooks)],
+            'Stop': [watch, gate_command(hooks)]})
         self.assertFalse((claude / 'settings.local.json.before-agentrc').exists())
         self.assertEqual(self.status(), '', 'every link and settings.local.json excluded')
         block = self.block()
@@ -883,14 +906,15 @@ class ProjectInstallTest(unittest.TestCase):
 
     def test_a_project_hook_runs_from_its_settings_command(self):
         self.ok('install', '--project', str(self.repo), '--skill')
-        command = TestCommands.of(self.local())['PreToolUse'][0]
-        if os.name == 'nt':  # Claude Code runs it through bash
-            done = subprocess.run([shutil.which('bash'), '-c', f"printf '%s\n' {command}"], capture_output=True, text=True)
-            self.assertEqual(done.stdout.splitlines()[-1],
-                             (self.repo / '.claude' / 'hooks' / 'headless-chief' / 'shadow_guard.py').as_posix())
+        entry = self.local()['hooks']['PreToolUse'][0]['hooks'][0]
+        if os.name == 'nt':  # exec form: Claude Code spawns it with no shell
+            self.assertEqual(entry['args'],
+                             [(self.repo / '.claude' / 'hooks' / 'headless-chief' / 'shadow_guard.py').as_posix()])
+            argv = [entry['command'], *entry['args']]
+        else:
+            argv = ['/bin/sh', '-c', entry['command']]
         payload = json.dumps({'tool_name': 'Workflow', 'cwd': str(self.repo)})
-        bash = shutil.which('bash') if os.name == 'nt' else '/bin/sh'
-        done = subprocess.run([bash, '-c', command], input=payload, capture_output=True, text=True,
+        done = subprocess.run(argv, input=payload, capture_output=True, text=True,
                               env={**self.env, 'CLAUDE_PROJECT_DIR': str(self.repo)})
         self.assertEqual(done.returncode, 0, done.stderr)
 
@@ -898,7 +922,7 @@ class ProjectInstallTest(unittest.TestCase):
 class TestCommands:
     @staticmethod
     def of(data):
-        return {e: [h['command'] for g in gs for h in g['hooks']] for e, gs in data.get('hooks', {}).items()}
+        return {e: [entry_command(h) for g in gs for h in g['hooks']] for e, gs in data.get('hooks', {}).items()}
 
 
 if __name__ == '__main__':

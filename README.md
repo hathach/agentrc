@@ -113,18 +113,21 @@ those:
 
 ### Windows
 
-Claude Code on Windows runs the Bash tool, hooks and the status line through
-Git Bash (or MSYS2), and the scripts run on native Windows from there. They read
-and write UTF-8 themselves, so no `-X utf8` or `PYTHONUTF8` is needed. Bash's
-`PATH` needs:
+Claude Code on Windows runs the Bash tool and the status line through Git Bash
+(or MSYS2), and the scripts run on native Windows from there. They read and
+write UTF-8 themselves, so no `-X utf8` or `PYTHONUTF8` is needed. `install.py`
+registers each hook in exec form, `"command": "<the python that ran install.py>"`
+with `"args": ["<hook>.py"]` (the simplify gate's `simplify_gate.py`, not its sh
+wrapper): Claude Code spawns it with no shell, so the hooks run with or without
+Git Bash, where a shell-form command would fall to PowerShell. Rerun it after
+replacing that Python, and name the interpreter the same way in the credit
+guard's recipe below. The chief guards also set `"onFailure": "block"`, so a
+guard that cannot start or times out blocks the call. Bash's `PATH` needs:
 
 - a `python3` that is a native CPython 3.12+ (python.org's install manager or MSYS2's mingw build), not the WindowsApps
-  alias and not MSYS2's `/usr/bin/python3`, for the workflows' script calls and the simplify gate's wrapper; PyYAML,
-  pytest and pytest-xdist in it for the tests, and PyYAML for `pr-babysit`'s `harvest.py`, which `pr-review` also
-  imports, to date a head by its pull_request runs (without it they go unread and the harvest says so). `install.py`
-  registers a Python hook as `'<the python that ran install.py>' '<hook>.py'`, since a hook that cannot start lets the
-  tool call through; rerun it after replacing that Python, and name the interpreter the same way in the credit guard's
-  recipe below.
+  alias and not MSYS2's `/usr/bin/python3`, for the workflows' script calls; PyYAML, pytest and pytest-xdist in it for
+  the tests, and PyYAML for `pr-babysit`'s `harvest.py`, which `pr-review` also imports, to date a head by its
+  pull_request runs (without it they go unread and the harvest says so).
 - `bash`, `cygpath` and `git` from Git for Windows or MSYS2: from Python a bare
   `bash` is System32's WSL launcher, so scripts look it up on `PATH`.
   `chief_guard.py` maps `/tmp`-style paths through `cygpath` and denies them
