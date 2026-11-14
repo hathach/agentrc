@@ -236,7 +236,11 @@ def hook_entry(hook, name):
     """Is this settings entry ours: does the command run out of the linked hook
     directory?"""
     root = claude_dir() / 'hooks' / name
-    # bash quoting as written now; on Windows also the list2cmdline form earlier versions wrote
+    # exec form, as Windows gets it: an argument names the script
+    args = hook.get('args')
+    if isinstance(args, list) and any(isinstance(a, str) and os.path.isabs(a) and inside(a, root) for a in args):
+        return True
+    # bash quoting as written now; on Windows also the forms earlier versions wrote, bash and list2cmdline
     for posix in (True, False) if os.name == 'nt' else (True,):
         try:
             words = shlex.split(hook.get('command', ''), posix=posix)
@@ -249,14 +253,22 @@ def hook_entry(hook, name):
     return False
 
 
-def quote_command(path):
-    """For the shell Claude Code runs hooks in, bash also on Windows: there a backslash is an escape. On
-    Windows a Python hook names this interpreter: bash may find no python3 there, and a hook that cannot
-    start lets the call through."""
-    command = shlex.quote(Path(path).as_posix())
+def hook_command(path):
+    """The command fields of a hook's settings entry. Shell form for sh, which runs the script by its shebang. On
+    Windows a Python hook is exec form instead, this interpreter with the script as its argument: Claude Code spawns it
+    with no shell, so it runs without Git Bash too, where a shell-form command falls to PowerShell, which cannot run a
+    bash command line, and it never depends on a python3 that bash may not find. A shell form there is quoted for
+    bash, where a backslash is an escape."""
     if os.name == 'nt' and Path(path).suffix == '.py':
-        command = f'{shlex.quote(Path(sys.executable).as_posix())} {command}'
-    return command
+        return {'command': Path(sys.executable).as_posix(), 'args': [Path(path).as_posix()]}
+    return {'command': shlex.quote(Path(path).as_posix())}
+
+
+def hook_settings(linked, hook):
+    """hooks.json's entry for the linked hook directory: on Windows its `windows` script replaces `command`, for a
+    hook whose own command is a shell script."""
+    script = hook.get('windows', hook['command']) if os.name == 'nt' else hook['command']
+    return {**{k: v for k, v in hook.items() if k != 'windows'}, **hook_command(linked / script)}
 
 
 def strip(hooks, name):
@@ -296,7 +308,7 @@ def plan_settings(names, install, statusline, keep_env=False, drop=()):
                 linked = claude_dir() / 'hooks' / name
                 for event, groups in json.loads((REPO / 'hooks' / name / 'hooks.json').read_text(encoding='utf-8')).items():
                     for group in groups:
-                        entries = [{**h, 'command': quote_command(linked / h['command'])} for h in group['hooks']]
+                        entries = [hook_settings(linked, h) for h in group['hooks']]
                         hooks.setdefault(event, []).append({**group, 'hooks': entries})
         if not hooks:
             del data['hooks']
