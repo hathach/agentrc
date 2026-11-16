@@ -122,7 +122,8 @@ wrapper): Claude Code spawns it with no shell, so the hooks run with or without
 Git Bash, where a shell-form command would fall to PowerShell. Rerun it after
 replacing that Python, and name the interpreter the same way in the credit
 guard's recipe below. The chief guards also set `"onFailure": "block"`, so a
-guard that cannot start or times out blocks the call. Bash's `PATH` needs:
+guard that cannot start or times out blocks the call; that needs Claude Code
+v2.1.295 or later, and an older one lets the call through. Bash's `PATH` needs:
 
 - a `python3` that is a native CPython 3.12+ (python.org's install manager or MSYS2's mingw build), not the WindowsApps
   alias and not MSYS2's `/usr/bin/python3`, for the workflows' script calls; PyYAML, pytest and pytest-xdist in it for

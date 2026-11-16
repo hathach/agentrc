@@ -236,9 +236,11 @@ def hook_entry(hook, name):
     """Is this settings entry ours: does the command run out of the linked hook
     directory?"""
     root = claude_dir() / 'hooks' / name
-    # exec form, as Windows gets it: an argument names the script
+    # exec form as hook_command() writes it on Windows: the interpreter, and the script as its only argument. A foreign
+    # entry that merely passes a file of the hook directory among other arguments is not ours
     args = hook.get('args')
-    if isinstance(args, list) and any(isinstance(a, str) and os.path.isabs(a) and inside(a, root) for a in args):
+    if isinstance(args, list) and len(args) == 1 and isinstance(args[0], str) and os.path.isabs(args[0]) and \
+            inside(args[0], root):
         return True
     # bash quoting as written now; on Windows also the forms earlier versions wrote, bash and list2cmdline
     for posix in (True, False) if os.name == 'nt' else (True,):

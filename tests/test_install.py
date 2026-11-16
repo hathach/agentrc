@@ -160,6 +160,19 @@ class InstallTest(unittest.TestCase):
         self.ok('remove', '--skill', cwd=ROOT / 'hooks')
         self.assertEqual(self.settings(), foreign)
 
+    def test_a_foreign_exec_hook_naming_a_file_of_ours_survives(self):
+        self.claude.mkdir()
+        data = (self.claude / 'hooks' / 'headless-chief' / 'policy.json').as_posix()
+        foreign = {'hooks': {'PreToolUse': [{'hooks': [
+            {'type': 'command', 'command': 'audit.exe', 'args': ['--config', data]},
+            {'type': 'command', 'command': 'audit.exe', 'args': [data, '--strict']}]}]}}
+        (self.claude / 'settings.json').write_text(json.dumps(foreign))
+        self.ok('install', '--skill')
+        kept = [h for g in self.settings()['hooks']['PreToolUse'] for h in g['hooks'] if h['command'] == 'audit.exe']
+        self.assertEqual(kept, foreign['hooks']['PreToolUse'][0]['hooks'], 'install keeps them')
+        self.ok('remove', '--skill')
+        self.assertEqual(self.settings(), foreign, 'remove keeps them')
+
     def test_a_hook_path_with_a_space_is_quoted(self):
         home = self.home / 'my home'
         home.mkdir()
