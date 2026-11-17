@@ -7,7 +7,7 @@ import os
 import unittest
 
 if os.name == 'nt':
-    raise unittest.SkipTest('the arduino engines are Linux only (fcntl)')
+    raise unittest.SkipTest('these engine fixtures require POSIX paths and symlinks; build locks have native tests')
 
 import contextlib
 import io
