@@ -6,7 +6,8 @@ and run a bounded read-only Codex YAGNI challenge over what changed in between.
 hooks.json beside this file) in `~/.claude/settings.json`, or with
 `--project <dir>` in `<dir>/.claude/settings.local.json`; they call
 `simplify-gate`, which runs this script only where the marker file
-`<git common dir>/simplify-gate` exists. The `simplify-gate` skill owns that
+`<git common dir>/simplify-gate` exists (on Windows they call this script,
+which checks the marker itself). The `simplify-gate` skill owns that
 marker, per repository and all of its worktrees, and may set
 `model=`/`effort=` lines in it to override the defaults below.
 

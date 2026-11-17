@@ -1,4 +1,4 @@
 {
-  "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "simplify-gate", "timeout": 30}]}],
-  "Stop": [{"hooks": [{"type": "command", "command": "simplify-gate", "timeout": 650}]}]
+  "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "simplify-gate", "windows": "simplify_gate.py", "timeout": 30}]}],
+  "Stop": [{"hooks": [{"type": "command", "command": "simplify-gate", "windows": "simplify_gate.py", "timeout": 650}]}]
 }
