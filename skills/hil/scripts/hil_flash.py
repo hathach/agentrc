@@ -534,7 +534,9 @@ def reset_openocd(flasher: dict, *, timeout, run=None) -> Operation:
     # caller's outer kill and orphan openocd on the probe, which is the stray the recovery
     # exists to avoid.
     halt_first = _halt_first(flasher)
-    mark = f'echo {{{RESET_RUN_MARK}}}; ' if halt_first else ''
+    # polled first: an SMP core's halt report may be deferred to the next poll, which the command
+    # dispatch before `reset` would otherwise print after the mark (openocd cortex_m.c smp poll)
+    mark = f'foreach t [target names] {{$t arp_poll}}; echo {{{RESET_RUN_MARK}}}; ' if halt_first else ''
     return _once(run, [*openocd_cmd_base(flasher), *halt_first, '-c', f'init; {mark}reset run; exit'],
                  timeout=timeout)
 
