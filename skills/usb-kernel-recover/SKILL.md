@@ -97,6 +97,15 @@ from agentrc's board registry, `hil` skill) and the probe serial. A convoy-safe 
 openocd -c "adapter serial <probe-sn>" <flasher args> -c "init; reset run; shutdown"
 ```
 
+When the flasher args name `target/rp2350.cfg`, halt both cores first, as the
+harness's `reset_openocd` does: openocd's SMP reset leaves core1 running while core0
+resets, and an RCP fault there can leave core0 stalled in its NMI handler (`hil_flash.py`):
+
+```bash
+openocd -c "adapter serial <probe-sn>" <flasher args> -c init -c "catch halt" \
+        -c "init; reset run; shutdown"
+```
+
 For stlink: `STM32_Programmer_CLI --connect port=swd sn=<probe-sn> --rst --go`.
 
 Any other runs only behind the shield (section 2), then unshield; for JLink:
