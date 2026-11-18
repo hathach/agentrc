@@ -1,5 +1,6 @@
-"""Transport primitives for herdr-core's CLI, `hc` (0.1.14), used by captain to talk to hc terminals. Judgment stays
-with the caller: these only ask hc, classify its answer, and name processes.
+"""Transport primitives for herdr-core's CLI, `hc` (0.1.14), used by bin/cc-start to start an hc terminal, plus the
+process helpers worktree-remove uses. Judgment stays with the caller: these only ask hc, classify its answer, and name
+processes.
 
 Every call takes an explicit deadline in seconds. hc prints its result as JSON on stdout and `{error: {kind,
 message}}` on stderr; options go before `--`, so a terminal name or a text never reads as one. A malformed answer,

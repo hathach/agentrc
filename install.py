@@ -215,16 +215,21 @@ def unlink(dst):
         print(f'{dst} is not a link, left alone')
 
 
-def prune(kind):
-    """Drop our links whose source left the repo, or is a skill directory without SKILL.md; leave every other link
-    alone, and never the directory a link names."""
+def dead(kind):
+    """(our links whose source left the repo, or is a skill directory without SKILL.md; those the repository tracks)."""
     source = REPO / {'skill': 'skills', 'agent': 'agents', 'hook': 'hooks', 'workflow': 'workflows', 'bin': 'bin'}[kind]
-    dead = [path for parent in dirs(kind) for path in (parent.iterdir() if parent.is_dir() else ())
-            if path.is_symlink() and (not path.exists() or kind == 'skill' and not (path / 'SKILL.md').is_file())
-            and inside(target(path), source)]
-    listed = tracked([relative(path) for path in dead]) if PROJECT else set()
-    for path in dead:
-        if PROJECT and is_tracked(relative(path), listed):
+    found = [path for parent in dirs(kind) for path in (parent.iterdir() if parent.is_dir() else ())
+             if path.is_symlink() and (not path.exists() or kind == 'skill' and not (path / 'SKILL.md').is_file())
+             and inside(target(path), source)]
+    listed = tracked([relative(path) for path in found]) if PROJECT else set()
+    return found, {path for path in found if PROJECT and is_tracked(relative(path), listed)}
+
+
+def prune(kind):
+    """Drop our dead links; leave every other link alone, and never the directory a link names."""
+    found, kept = dead(kind)
+    for path in found:
+        if path in kept:
             print(f'{path} is tracked by the repository, left alone')
         else:
             unlink(path)
@@ -563,14 +568,19 @@ def main(argv=None):
         if args.action == 'install' and not pairs:  # every entry skipped: no AGENTRC_DIR or exclude entry for none
             return
     hooks = [dst.name for kind, (_, dst) in pairs if kind == 'hook']  # a skipped hook's link is not registered
+    # a hook that left the repo, whose link prune() drops below: its settings entries would run a missing script
+    retired = []
+    if any(kind == 'hook' for kind, _ in chosen):
+        gone, tracked_links = dead('hook')
+        retired = [path.name for path in gone if path not in tracked_links]
     planned = None
-    if hooks or args.statusline or PROJECT:
+    if hooks or retired or args.statusline or PROJECT:
         removing = {dst for _, (_, dst) in pairs}
         keep_env = PROJECT and any(ours(p) and p not in removing for p in [PROJECT / 'CLAUDE.local.md'] + [
             p for kind in ('skill', 'agent', 'hook', 'workflow') for d in dirs(kind) if d.is_dir() for p in d.iterdir()])
         try:
             planned = plan_settings(hooks, args.action == 'install', args.statusline, keep_env,
-                                    [dst.name for dst in orphaned if ours(dst)])  # a project's own hook keeps its own
+                                    [dst.name for dst in orphaned if ours(dst)] + retired)  # a project's own hook keeps its own
         except (ValueError, TypeError, AttributeError, KeyError) as err:
             refuse(f'{settings()} cannot be edited ({err!r}); fix it first')
 

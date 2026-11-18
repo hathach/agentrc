@@ -138,12 +138,10 @@ class InstallTest(unittest.TestCase):
         self.ok('install', '--skill')
         launcher = gate_command(self.claude / 'hooks')
         guards =[guard_command(self.claude / 'hooks' / 'headless-chief' / g) for g in ('shadow_guard.py', 'chief_guard.py')]
-        watch = guard_command(self.claude / 'hooks' / 'captain' / 'captain_hook.py')
         data = self.settings()
         self.assertEqual(data['model'], 'x')
-        self.assertEqual(self.commands(data), {'SessionStart': ['other', watch], 'Stop': ['other-stop', watch, launcher],
+        self.assertEqual(self.commands(data), {'SessionStart': ['other'], 'Stop': ['other-stop', launcher],
                                                'UserPromptSubmit': [launcher], 'PreToolUse': guards})
-        self.assertEqual(data['hooks']['SessionStart'][-1]['matcher'], 'compact|clear')
         self.assertEqual([g['matcher'] for g in data['hooks']['PreToolUse']], ['Workflow|Agent', 'Bash|Write'])
         stop = data['hooks']['Stop'][-1]['hooks'][0]
         self.assertEqual(stop['timeout'], 650)
@@ -277,6 +275,21 @@ class InstallTest(unittest.TestCase):
         self.ok('install', '--skill')
         names = sorted(p.name for p in (self.claude / 'skills').iterdir())
         self.assertEqual(names, sorted(SKILLS + ['foreign', 'mine']))
+
+    def test_a_hook_that_left_the_repo_is_unregistered_with_its_link(self):
+        hooks = self.claude / 'hooks'
+        hooks.mkdir(parents=True)
+        os.symlink(ROOT / 'hooks' / 'gone', hooks / 'gone')   # a skill's hook since removed from agentrc
+        gone = guard_command(hooks / 'gone' / 'gone_hook.py')
+        (self.claude / 'settings.json').write_text(json.dumps({'hooks': {
+            'Stop': [{'hooks': [{'type': 'command', 'command': 'other-stop'}, {'type': 'command', 'command': gone}]}],
+            'SessionStart': [{'matcher': 'compact|clear', 'hooks': [{'type': 'command', 'command': gone}]}]}}))
+        self.ok('install', '--skill')
+        self.assertFalse((hooks / 'gone').is_symlink())
+        commands = self.commands(self.settings())
+        self.assertNotIn('SessionStart', commands)
+        self.assertEqual(commands['Stop'][0], 'other-stop')
+        self.assertNotIn(gone, [c for event in commands.values() for c in event])
 
     def test_a_skill_directory_without_skill_md_is_not_linked_and_its_link_is_pruned(self):
         repo = self.home / 'repo'
@@ -523,12 +536,10 @@ class ProjectInstallTest(unittest.TestCase):
         data = self.local()
         self.assertEqual(data['env'], {'AGENTRC_DIR': ROOT.as_posix()})
         hooks = claude / 'hooks'
-        watch = guard_command(hooks / 'captain' / 'captain_hook.py')
         self.assertEqual(TestCommands.of(data), {
-            'SessionStart': [watch],
             'PreToolUse': [guard_command(hooks / 'headless-chief' / g) for g in ('shadow_guard.py', 'chief_guard.py')],
             'UserPromptSubmit': [gate_command(hooks)],
-            'Stop': [watch, gate_command(hooks)]})
+            'Stop': [gate_command(hooks)]})
         self.assertFalse((claude / 'settings.local.json.before-agentrc').exists())
         self.assertEqual(self.status(), '', 'every link and settings.local.json excluded')
         block = self.block()
@@ -876,7 +887,7 @@ class ProjectInstallTest(unittest.TestCase):
         self.git('add', '-A')
         self.git('commit', '-qm', 'own hook')
         self.ok('install', '--project', str(self.repo), '--skill', '--skip-clashes')
-        self.assertEqual(sorted(TestCommands.of(self.local())), ['SessionStart', 'Stop', 'UserPromptSubmit'],
+        self.assertEqual(sorted(TestCommands.of(self.local())), ['Stop', 'UserPromptSubmit'],
                          'no PreToolUse guard')
 
     def test_a_dead_link_of_ours_is_pruned_with_its_entry(self):
