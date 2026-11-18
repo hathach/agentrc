@@ -171,7 +171,7 @@ def rp2350_halt_first_delta(case, observed):
         head, sep, tail = call['cmd'].partition(' -c "program ' if case['op'] == 'flash' else ' -c "init; reset run')
         assert sep, call['cmd']
         if case['op'] == 'reset':
-            sep = ' -c "init; foreach t [target names] {$t arp_poll}; echo {hil_flash: reset}; reset run'
+            sep = ' -c "init; foreach t [target names] {catch {$t arp_poll}}; echo {hil_flash: reset}; reset run'
         return {**call, 'cmd': f'{head} -c init -c "catch halt"{sep}{tail}'}
     return map_calls(observed, rewrite)
 

@@ -12,7 +12,7 @@ The request is hil_root.py's `reset-tt BUSPORT` (hil_root.argv: the rig's instal
 under sudo when it has one), which re-derives and checks the hub itself, bounded by
 HELPER_TIMEOUT through `run` (default hil_process.run_cmd), called as
 `run(cmd, timeout=..., quiet=True)` and expected to return rc 124 when it had to kill. A
-timeout costs that call; later ones on the hub wait only while the killed helper still runs
+timeout costs that call; later ones on the hub wait only while the killed helper may still run
 (_unconfirmed). When to reset is the caller's.
 """
 
@@ -28,7 +28,8 @@ FILES = ('skills/hil/scripts/hil_load.py', 'skills/hil/scripts/hil_process.py', 
 HELPER_TIMEOUT = 10
 
 # Hubs (by busport, which the helper resolves again) whose helper timed out in this process: the
-# (pid, start time) of each process of it that outlived the kill, or None when /proc may hide them.
+# (pid, start time) of each process of it that outlived the kill, or, while /proc may hide them, the
+# argv tail (a tuple) to look for them by again.
 # usbfs open, read and ioctl wait uninterruptibly for the HUB's device lock, which the hub driver
 # holds while it enumerates any of its ports (devio.c usb_lock_device), and sudo's root child is
 # beyond our kill: another helper would only queue behind one still waiting there.
@@ -75,10 +76,15 @@ def _listed(hp, tail) -> set | None:
         if not name.isdigit():
             continue
         try:
-            with open(f'/proc/{name}/cmdline', 'rb') as f:
-                args = f.read().split(b'\0')[:-1]      # a zombie's is empty
-            if args[-len(tail):] == tail and (start := _start(int(name))) is not None:
-                found.add((int(name), start))
+            # both files through one directory fd: it stays this process's, not a later one given its pid
+            fd = os.open(f'/proc/{name}', os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                with open('cmdline', 'rb', opener=_at(fd)) as f:
+                    args = f.read().split(b'\0')[:-1]      # a zombie's is empty
+                if args[-len(tail):] == tail and (start := _start(int(name), fd)) is not None:
+                    found.add((int(name), start))
+            finally:
+                os.close(fd)
         except (FileNotFoundError, ProcessLookupError):
             continue
         except OSError:
@@ -86,12 +92,20 @@ def _listed(hp, tail) -> set | None:
     return found
 
 
-def _start(pid) -> int | None:
-    """pid's start time (proc_pid_stat(5) field 22) while it runs; None once it has exited. OSError
-    when unreadable."""
+def _at(dir_fd):
+    return lambda path, flags: os.open(path, flags, dir_fd=dir_fd)
+
+
+def _start(pid, dir_fd=None) -> int | None:
+    """pid's start time (proc_pid_stat(5) field 22) while it runs, read through `dir_fd`, its /proc
+    directory, when given; None once it has exited. OSError when unreadable."""
     try:
-        fields = _process()._stat_fields(f'/proc/{pid}/stat')
-    except ProcessLookupError:
+        if dir_fd is None:
+            fields = _process()._stat_fields(f'/proc/{pid}/stat')
+        else:
+            with open('stat', errors='replace', opener=_at(dir_fd)) as f:
+                fields = f.read().rpartition(')')[2].split()
+    except (FileNotFoundError, ProcessLookupError):
         return None
     return None if fields is None or fields[0] in 'ZX' else int(fields[19])
 
@@ -108,8 +122,12 @@ def _waiting(hub) -> bool:
     """Whether a helper of `hub` that timed out may still be waiting on it, also while /proc does
     not answer within PROC_SCAN_BOUND; forgets it once not."""
     hp = _process()
-    if (left := _unconfirmed.get(hub, ())) is None or (
-            left and hp._bounded(lambda: _alive(left), hp.PROC_SCAN_BOUND, _recheck) is not False):
+    if isinstance(left := _unconfirmed.get(hub), tuple):
+        if (found := _survivors(left)) != set():
+            if found:
+                _unconfirmed[hub] = found
+            return True
+    elif left and hp._bounded(lambda: _alive(left), hp.PROC_SCAN_BOUND, _recheck) is not False:
         return True
     _unconfirmed.pop(hub, None)
     return False
@@ -139,7 +157,7 @@ def reset_tt(busport, speed, *, run=None) -> bool:
     if r.returncode == 124:
         # sudo's child and the helper's shebang keep the helper's path and arguments
         if (left := _survivors(cmd[-3:])) != set():
-            _unconfirmed[hub] = left
+            _unconfirmed[hub] = tuple(cmd[-3:]) if left is None else left
         print(f'Reset_TT {node} port {port}: helper timed out, possible hub-lock contention',
               file=sys.stderr)
         return False

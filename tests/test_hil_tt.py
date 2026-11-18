@@ -133,6 +133,19 @@ class Helper(unittest.TestCase):
             oks, calls, _ = self.reset(124, 0, 0)
         self.assertEqual((oks, len(calls)), ([False] * 3, 1))
 
+    def test_an_inconclusive_scan_is_retried_until_it_proves_none_left(self):
+        scans = iter([None, None, {(1, 2)}, set()])
+        tails = []
+        with mock.patch.object(tt, '_survivors', lambda tail: tails.append(tail) or next(scans)), \
+                mock.patch.object(tt.hil_root, 'argv', lambda *a: ['H', *a]):
+            oks, calls, _ = self.reset(124, 0)                      # the second call's scan: inconclusive again
+            self.assertEqual(tt._unconfirmed, {'5-1': ('H', 'reset-tt', '5-1.2')})
+            seen = [tt._waiting('5-1'), dict(tt._unconfirmed)]      # the third finds a survivor
+            tt._unconfirmed['5-1'] = ('H', 'reset-tt', '5-1.2')
+            seen += [tt._waiting('5-1'), dict(tt._unconfirmed)]     # the fourth finds none
+        self.assertEqual((oks, len(calls), seen), ([False, False], 1, [True, {'5-1': {(1, 2)}}, False, {}]))
+        self.assertEqual(tails, [['H', 'reset-tt', '5-1.2']] + [('H', 'reset-tt', '5-1.2')] * 3)
+
     def test_other_failures_only_report(self):
         oks, calls, err = self.reset(1, FileNotFoundError('sudo'), 0)
         self.assertEqual((oks, len(calls), err.count('failed')), ([True] * 3, 3, 2))
@@ -162,6 +175,16 @@ class Helper(unittest.TestCase):
                 redirect_stderr(io.StringIO()):
             self.assertFalse(tt.reset_tt('5-1.2', '12', run=lambda *a, **k: self.fail('no helper')))
 
+    def test_a_proc_directory_fd_reads_only_its_own_process(self):
+        child = subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.read()'], stdin=subprocess.PIPE)
+        fd = os.open(f'/proc/{child.pid}', os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, fd)
+        self.assertEqual(tt._start(child.pid, fd), tt._start(child.pid))
+        child.communicate(b'')
+        self.assertIsNone(tt._start(child.pid, fd))     # reaped: whatever runs under its pid now is not read
+        with self.assertRaises((FileNotFoundError, ProcessLookupError)):
+            open('cmdline', 'rb', opener=tt._at(fd)).close()
+
     def test_a_real_timeout_keeps_its_banner_off_stdout(self):
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(tt, 'HELPER_TIMEOUT', 1), redirect_stdout(out), redirect_stderr(err):
@@ -188,10 +211,18 @@ class Inconclusive(unittest.TestCase):
         self.release.wait(10)
 
     def test_a_blocked_recheck_keeps_the_hold_and_returns(self):
+        entered, first = [], threading.Event()
+
+        def blocked(*_):
+            entered.append(1)
+            first.set()
+            self.blocked()
         t0 = time.monotonic()
-        with mock.patch.object(tt, '_start', self.blocked):
-            held = [tt._waiting('5-1'), tt._waiting('5-1')]     # the second, behind the first's blocked thread
-        self.assertEqual((held, '5-1' in tt._unconfirmed), ([True, True], True))
+        with mock.patch.object(tt, '_start', blocked):
+            held = [tt._waiting('5-1')]
+            self.assertTrue(first.wait(2))
+            held.append(tt._waiting('5-1'))     # behind the first's blocked thread: no second one
+        self.assertEqual((held, '5-1' in tt._unconfirmed, len(entered)), ([True, True], True, 1))
         self.assertLess(time.monotonic() - t0, 2)
 
     def test_an_unreadable_survivor_keeps_the_hold(self):
@@ -208,12 +239,13 @@ class Inconclusive(unittest.TestCase):
 
 # A helper the hub lock holds: its child leaves the runner's session, beyond the group kill as sudo's
 # root child is, and waits until the lock is released (the file beside it); once it is, a helper succeeds.
+# Its directory going is a release too: a cleanup removing it may beat the child to the file.
 STALLED_HELPER = """import os, sys, time
 released = __file__ + '.released'
 if not os.path.exists(released):
     if os.fork() == 0:
         os.setsid()
-        while not os.path.exists(released):
+        while not os.path.exists(released) and os.path.exists(os.path.dirname(released)):
             time.sleep(0.02)
         os._exit(0)
     time.sleep(60)
@@ -234,7 +266,8 @@ class HubLockStall(unittest.TestCase):
         self.addCleanup(self.released.touch)
         for obj, name, value in ((tt.hil_root, 'tt_hub', lambda b: ('5-1', 2, 5, 58, (0, 0))),
                                  (tt.hil_root, 'argv', lambda *a: [sys.executable, '-I', str(self.helper), *a]),
-                                 (tt, '_unconfirmed', {}), (tt, 'HELPER_TIMEOUT', 1)):
+                                 (tt, '_unconfirmed', {}), (tt, 'HELPER_TIMEOUT', 1),
+                                 (tt._process(), '_proc_hides_others', lambda: False)):   # our uid's: shown
             patcher = mock.patch.object(obj, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)

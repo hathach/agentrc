@@ -535,8 +535,10 @@ def reset_openocd(flasher: dict, *, timeout, run=None) -> Operation:
     # exists to avoid.
     halt_first = _halt_first(flasher)
     # polled first: an SMP core's halt report may be deferred to the next poll, which the command
-    # dispatch before `reset` would otherwise print after the mark (openocd cortex_m.c smp poll)
-    mark = f'foreach t [target names] {{$t arp_poll}}; echo {{{RESET_RUN_MARK}}}; ' if halt_first else ''
+    # dispatch before `reset` would otherwise print after the mark (openocd cortex_m.c smp poll).
+    # `catch`: a failed poll (an unexamined core: handle_target_poll) would end the -c script before
+    # `reset run` (parse_config_file), leaving the cores `catch halt` halted
+    mark = f'foreach t [target names] {{catch {{$t arp_poll}}}}; echo {{{RESET_RUN_MARK}}}; ' if halt_first else ''
     return _once(run, [*openocd_cmd_base(flasher), *halt_first, '-c', f'init; {mark}reset run; exit'],
                  timeout=timeout)
 
