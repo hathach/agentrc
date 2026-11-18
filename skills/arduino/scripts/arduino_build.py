@@ -488,7 +488,7 @@ def rig_roster(path):
         boards = {b['name']: b for b in hil_boards.resolve_roster(roster)['boards']}
         for name, b in boards.items():
             if (lock := hil_boards.lock_name(b)) != name:
-                raise ValueError(f'{name}: lock {name!r} is not its registered board\'s, {lock}')
+                raise ValueError(f'{name}: its registry name is {lock}')
     except (OSError, ValueError, KeyError, TypeError) as e:
         raise ValueError(f'roster {path}: {e}')
     return boards

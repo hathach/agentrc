@@ -264,9 +264,9 @@ every consumer that needs a board's flasher resolves the roster entry through it
 policy, or `hil_boards.py roster FILE`); the resolved
 `flasher.uid` is the probe serial, and a board without `probe` (a bench board on a dev PC,
 or a rig one project owns) keeps a flasher of its own. A reader that needs only names reads the roster raw; one
-that needs a lock name takes `lock_name(entry)`, or `hil_boards.py lock FILE BOARD`, which
-prints the registry name, or a bench board's roster name. A board joins the farm, or its
-wiring changes (a replaced thumb drive included), by an agentrc commit to `boards.json`, then the project's agentrc pin. The
+that needs a lock name takes `lock_name(entry)`, or `hil_boards.py lock FILE BOARD`, which prints the registry name, or
+a bench board's roster name. A board joins the farm, or its wiring changes (a replaced thumb drive included), by an
+agentrc commit to `boards.json`, then the project's agentrc pin. The
 resolved entry carries the registry's `dev_attached` at its top level; a roster that still
 keeps its own copy (tinyusb's `tests.dev_attached`, Arduino's `arduino.dev_attached`) keeps
 it for the consumers that read it, with a warning on stderr naming whether it matches,

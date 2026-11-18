@@ -689,7 +689,7 @@ class Registry(Lib):
         self.assertEqual(board['uid'], 'DUT')
 
     def test_a_registered_board_keeps_the_registrys_name(self):
-        with self.assertRaisesRegex(ValueError, "lock 'metro_m4' is not its registered board's, metro_m4_express"):
+        with self.assertRaisesRegex(ValueError, "metro_m4: its registry name is metro_m4_express"):
             ab.rig_roster(self.roster(name='metro_m4'))
 
 

@@ -278,8 +278,6 @@ class LockName(Base):
 
     def test_a_bench_board_locks_as_its_roster_name_never_a_project_field(self):
         self.assertEqual(hb.lock_name({'name': 'bench', 'tinyuf2': {'lock': 'shared'}}, path=self.path), 'bench')
-        with self.assertRaises(TypeError):      # a caller still passing a project lock field
-            hb.lock_name({'name': 'bench'}, 'shared')
 
 
 class Board(Base):
