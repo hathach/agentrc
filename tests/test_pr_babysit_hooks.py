@@ -224,7 +224,9 @@ class HooksTest(unittest.TestCase):
     def run_script(self, *paths, cwd=None, env=None):
         done = subprocess.run([sys.executable, str(SCRIPT), *paths], cwd=cwd or self.repo,
                               env=env or self.env, capture_output=True, text=True)
-        return done.returncode, json.loads(done.stdout.splitlines()[-1])
+        lines = done.stdout.splitlines()
+        self.assertTrue(lines, f'hooks.py printed nothing (exit {done.returncode}); stderr:\n{done.stderr}')
+        return done.returncode, json.loads(lines[-1])
 
     def wait_for(self, done, failure, seconds=10):
         deadline = time.monotonic() + seconds
