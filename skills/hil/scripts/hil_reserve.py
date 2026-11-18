@@ -3,14 +3,12 @@
 every board lock of every supplied roster, taken by one process around the one supported
 mutation, after a coverage check of the subtree the operation reaches.
 
-  hil_reserve.py check <busport> [--scope root|hub] --roster FILE [SELECTOR] ...
-  hil_reserve.py run root-cycle|hub-cycle <busport> --roster FILE [SELECTOR] ... --reason TEXT
+  hil_reserve.py check <busport> [--scope root|hub] --roster FILE ...
+  hil_reserve.py run root-cycle|hub-cycle <busport> --roster FILE ... --reason TEXT
 
 A roster is a project's HIL roster JSON (`boards` and `boards-skip`; a parked board is still
-on the hub). An entry with `probe` locks as its registered board's name (hil_boards.lock_name);
-any other entry's lock is the dotted SELECTOR field, falling back to `name` only when the entry
-lacks it (tinyuf2: `tinyuf2.lock`; tinyusb: the default, `name`). A registered entry whose
-SELECTOR field names another lock is refused. Identities are every `uid`, `uart_uid` and
+on the hub). An entry with `probe` locks as its registered board's name, any other as its
+own `name` (hil_boards.lock_name). Identities are every `uid`, `uart_uid` and
 `serial` string in an entry outside its `dev_attached` lists (devices on the board's own USB host
 port, which this host never sees, some with serials as weak as "0"), compared in the form udev's
 usb_id gives a serial (whitespace runs and unsafe characters as `_`), case-insensitively; two
@@ -114,7 +112,6 @@ RECOVER_SCRIPT = INSTALLED_RECOVER if hil_root.present(INSTALLED_RECOVER) else \
 PR_SET_CHILD_SUBREAPER = 36
 HANDLED_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 SPAWN_SIGDEF = (signal.SIGPIPE, signal.SIGXFSZ)     # what Python ignores and Popen restores in a child
-_ABSENT = object()
 
 
 class Refused(Exception):
@@ -132,15 +129,6 @@ def identity(serial):
 
 
 # --- rosters -------------------------------------------------------------------------------
-def _field(entry, selector):
-    cur = entry
-    for part in selector.split('.'):
-        if not isinstance(cur, dict) or part not in cur:
-            return _ABSENT
-        cur = cur[part]
-    return cur
-
-
 def _identities(obj, out):
     """The raw identity strings of an entry, stripped and lower-cased."""
     if isinstance(obj, dict):
@@ -154,13 +142,13 @@ def _identities(obj, out):
             _identities(v, out)
 
 
-def load_rosters(specs):
-    """[(file, selector)] -> {'locks': sorted lock names, 'identities': {identity: {locks}}}.
+def load_rosters(paths):
+    """[roster file] -> {'locks': sorted lock names, 'identities': {identity: {locks}}}.
     Each entry is resolved through agentrc's board registry (hil_boards), so its probe serial is an
     identity too, and a registered board's lock is the registry's. A DUT uid under two lock names
     is a conflict; any other identity may serve several."""
     locks, ids, duts, raw_of = set(), {}, {}, {}
-    for path, selector in specs:
+    for path in paths:
         try:
             with open(path) as f:
                 roster = json.load(f)
@@ -172,11 +160,8 @@ def load_rosters(specs):
         for e in entries:
             if not isinstance(e, dict) or not isinstance(e.get('name'), str) or not e['name']:
                 raise Refused(f'roster {path}: an entry without a name')
-            own = _field(e, selector) if selector != 'name' else _ABSENT
-            if own is not _ABSENT and not isinstance(own, str):
-                raise Refused(f'roster {path}: {e["name"]}: lock name {own!r} is not a plain file name')
             try:
-                lock = hil_boards.lock_name(e, None if own is _ABSENT else own)
+                lock = hil_boards.lock_name(e)
                 if not LOCK_NAME_RE.match(lock):
                     raise Refused(f'roster {path}: {e["name"]}: lock name {lock!r} is not a plain file name')
                 e = hil_boards.resolve(e, roster=path)
@@ -524,8 +509,7 @@ def main(argv=None):
     sub = ap.add_subparsers(dest='cmd', required=True)
 
     def add_roster_args(p):
-        p.add_argument('--roster', nargs='+', action='append', required=True, metavar=('FILE', 'SELECTOR'),
-                       help='a roster file and, optionally, the dotted lock-name field (default name)')
+        p.add_argument('--roster', action='append', required=True, metavar='FILE', help='a roster file')
         p.add_argument('--budget', type=float, default=DEFAULT_BUDGET, help='seconds for the coverage walk')
 
     p_check = sub.add_parser('check')
@@ -542,14 +526,8 @@ def main(argv=None):
     try:
         if not uo.BUSPORT_RE.match(args.busport):
             ap.error(f'bad busport: {args.busport}')
-        specs = []
-        for r in args.roster:
-            if len(r) > 2:
-                ap.error('--roster takes FILE [SELECTOR]')
-            specs.append((r[0], r[1] if len(r) == 2 else 'name'))
-        args.roster = specs
         if args.cmd == 'check':
-            rosters = load_rosters(specs)
+            rosters = load_rosters(args.roster)
             print(describe(rosters, check(args.busport, rosters, args.budget, args.scope)))
             return 0
         return cmd_run(args)

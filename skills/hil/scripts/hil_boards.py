@@ -27,14 +27,13 @@ compared with it and warned about on stderr, never refused; resolve(entry, roste
 file in that warning. resolve_roster(roster) resolves `boards` and `boards-skip`.
 Both raise ValueError naming every problem. board(file, name, parked=) is the resolved entry a roster file
 names `name`, refusing a name no entry or several carry and, unless `parked`, one in `boards-skip`.
-lock_name(entry, own) is an entry's board lock.
+lock_name(entry) is an entry's board lock.
 A flasher is hil_flash.py's (SKILL.md, Flashers) or tinyusb's `wch_uart_loader` (`args` "" or absent); an
 `openocd` one may carry `args_program`, the openocd commands tinyusb runs after program or reset.
 
   hil_boards.py roster FILE         the resolved roster as JSON (exit 1 refused, 2 usage)
   hil_boards.py lock FILE BOARD     the board lock of board(FILE, BOARD, parked=True), resolved, so a
-                                    malformed entry is refused (lock_name without `own`: a project lock
-                                    field is not read)
+                                    malformed entry is refused
 """
 
 from __future__ import annotations
@@ -295,17 +294,14 @@ def _resolve(entry, path, roster=None) -> tuple:
     return copy.deepcopy(entry), ''
 
 
-def lock_name(entry, own=None, path=REGISTRY) -> str:
-    """The board lock of a roster entry: its registered board's `name`, else `own` (a project's
-    lock field) or the entry's `name`. A registered board whose `own` differs is refused."""
+def lock_name(entry, *, path=REGISTRY) -> str:
+    """The board lock of a roster entry: its registered board's `name`, else the entry's `name`."""
     if 'probe' in entry:
         reg, why = _registered(entry, path)
         if why:
             raise ValueError(why)
-        if own is not None and own != reg['name']:
-            raise ValueError(f'{entry.get("name")}: lock {own!r} is not its registered board\'s, {reg["name"]}')
         return reg['name']
-    return entry['name'] if own is None else own
+    return entry['name']
 
 
 def resolve(entry, path=REGISTRY, *, roster=None) -> dict:

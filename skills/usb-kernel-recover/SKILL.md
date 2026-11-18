@@ -151,11 +151,11 @@ mid-flash on. `hil_reserve.py` (`hil` skill) takes them all, around the cycle:
 
 ```bash
 python3 <hil skill dir>/scripts/hil_reserve.py run root-cycle <busport> \
-    --roster <roster> [SELECTOR] ... --reason "root-cycle <busport>"
+    --roster <roster> ... --reason "root-cycle <busport>"
 ```
 
 One `--roster` per project with boards on this host (the contract's Hosts/rosters
-names them and each project's lock-name field). `hil_reserve.py --help` has its
+names them). `hil_reserve.py --help` has its
 coverage, hold and release rules; a hold it keeps prints the token the contract's
 recovery procedure releases with. A refusal
 naming a runner's holder (`hil_test.py`) means CI is mid-test — wait, do not force.
