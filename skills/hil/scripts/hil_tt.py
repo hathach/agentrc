@@ -11,8 +11,9 @@ included. Reset_TT (11.24.2.9) frees them without resetting the port or the devi
 The request is hil_root.py's `reset-tt BUSPORT` (hil_root.argv: the rig's installed copy
 under sudo when it has one), which re-derives and checks the hub itself, bounded by
 HELPER_TIMEOUT through `run` (default hil_process.run_cmd), called as
-`run(cmd, timeout=..., quiet=True)` and expected to return rc 124 when it had to kill. When
-to reset is the caller's.
+`run(cmd, timeout=..., quiet=True)` and expected to return rc 124 when it had to kill. A
+timeout costs that call; later ones on the hub wait only while the killed helper still runs
+(_unconfirmed). When to reset is the caller's.
 """
 
 from __future__ import annotations
@@ -26,11 +27,12 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 FILES = ('skills/hil/scripts/hil_load.py', 'skills/hil/scripts/hil_process.py', 'skills/hil/scripts/hil_root.py')
 HELPER_TIMEOUT = 10
 
-# Hubs (by busport, which the helper resolves again) whose helper timed out in this process.
-# The usbfs ioctl waits for the HUB's device lock, which the hub driver holds while it
-# enumerates any of its ports: the helper may still be waiting there, so another would only
-# queue behind it.
-_unconfirmed: set = set()
+# Hubs (by busport, which the helper resolves again) whose helper timed out in this process: the
+# (pid, start time) of each process of it that outlived the kill, or None when /proc may hide them.
+# usbfs open, read and ioctl wait uninterruptibly for the HUB's device lock, which the hub driver
+# holds while it enumerates any of its ports (devio.c usb_lock_device), and sudo's root child is
+# beyond our kill: another helper would only queue behind one still waiting there.
+_unconfirmed: dict = {}
 
 
 def _hil_load():
@@ -54,11 +56,54 @@ def _process():
     return hil_load.load_file('skills/hil/scripts/hil_process.py')
 
 
+def _survivors(tail) -> set | None:
+    """(pid, start time) of each live process whose argv ends with `tail`; None when /proc may
+    hide or withhold one."""
+    if _process()._proc_hides_others():
+        return None
+    tail = [os.fsencode(a) for a in tail]
+    found = set()
+    for name in os.listdir('/proc'):
+        if not name.isdigit():
+            continue
+        try:
+            with open(f'/proc/{name}/cmdline', 'rb') as f:
+                args = f.read().split(b'\0')[:-1]      # a zombie's is empty
+            if args[-len(tail):] == tail and (start := _start(int(name))) is not None:
+                found.add((int(name), start))
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except OSError:
+            return None
+    return found
+
+
+def _start(pid) -> int | None:
+    """pid's start time (proc_pid_stat(5) field 22) while it runs; None once it has exited."""
+    try:
+        with open(f'/proc/{pid}/stat', errors='replace') as f:
+            fields = f.read().rpartition(')')[2].split()
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    return None if fields[0] in 'ZX' else int(fields[19])
+
+
+def _waiting(hub) -> bool:
+    """Whether a helper of `hub` that timed out may still be waiting on it; forgets it once not."""
+    if hub not in _unconfirmed:
+        return False
+    left = _unconfirmed[hub]
+    if left is None or any(_start(pid) == start for pid, start in left):
+        return True
+    _unconfirmed.pop(hub, None)
+    return False
+
+
 def reset_tt(busport, speed, *, run=None) -> bool:
     """Reset the device's TT if it has one of its own. False when that could not be
-    confirmed: this hub's helper timed out, now or earlier in this process."""
+    confirmed: this hub's helper timed out now, or an earlier one of it is still running."""
     hub = busport.rpartition('.')[0]
-    if hub in _unconfirmed:     # before discovery: a hub mid-reconfiguration may not resolve now
+    if _waiting(hub):           # before discovery: a hub mid-reconfiguration may not resolve now
         return False
     if speed not in ('12', '1.5'):
         return True
@@ -76,7 +121,9 @@ def reset_tt(busport, speed, *, run=None) -> bool:
         print(f'Reset_TT {node} port {port} failed: {e}', file=sys.stderr)
         return True
     if r.returncode == 124:
-        _unconfirmed.add(hub)
+        # sudo's child and the helper's shebang keep the helper's path and arguments
+        if (left := _survivors(cmd[-3:])) != set():
+            _unconfirmed[hub] = left
         print(f'Reset_TT {node} port {port}: helper timed out, possible hub-lock contention',
               file=sys.stderr)
         return False

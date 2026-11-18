@@ -13,6 +13,7 @@ import io
 import subprocess
 import sys
 import tempfile
+import time
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
@@ -50,7 +51,7 @@ class WhenToReset(unittest.TestCase):
             patcher = mock.patch.object(tt.hil_root, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
-        patcher = mock.patch.object(tt, '_unconfirmed', set())
+        patcher = mock.patch.object(tt, '_unconfirmed', {})
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -97,10 +98,10 @@ class WhenToReset(unittest.TestCase):
 
 class Helper(unittest.TestCase):
     """reset_tt through its runner: a timeout is unconfirmed and stops later helpers for that
-    hub; any other failure only reports."""
+    hub while what it left behind still runs; any other failure only reports."""
 
     def setUp(self):
-        for obj, name, value in ((tt.hil_root, 'tt_hub', lambda b: ('5-1', 2, 5, 58, (0, 0))), (tt, '_unconfirmed', set())):
+        for obj, name, value in ((tt.hil_root, 'tt_hub', lambda b: ('5-1', 2, 5, 58, (0, 0))), (tt, '_unconfirmed', {})):
             patcher = mock.patch.object(obj, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -121,9 +122,20 @@ class Helper(unittest.TestCase):
             oks = [tt.reset_tt('5-1.2', '12', run=run) for _ in outcomes]
         return oks, calls, err.getvalue()
 
-    def test_timeout_is_unconfirmed_and_not_repeated_for_that_hub(self):
-        oks, calls, err = self.reset(124, 0)
+    def test_timeout_is_unconfirmed_and_not_repeated_while_its_helper_runs(self):
+        with mock.patch.object(tt, '_survivors', lambda tail: {(os.getpid(), tt._start(os.getpid()))}):
+            oks, calls, err = self.reset(124, 0)
         self.assertEqual((oks, len(calls), 'timed out' in err), ([False, False], 1, True))
+
+    def test_a_timeout_that_left_no_helper_running_costs_only_that_call(self):
+        with mock.patch.object(tt, '_survivors', lambda tail: set()):
+            oks, calls, _ = self.reset(124, 0)
+        self.assertEqual((oks, len(calls), tt._unconfirmed), ([False, True], 2, {}))
+
+    def test_a_hub_whose_helper_proc_cannot_show_stays_unconfirmed(self):
+        with mock.patch.object(tt, '_survivors', lambda tail: None):
+            oks, calls, _ = self.reset(124, 0, 0)
+        self.assertEqual((oks, len(calls)), ([False] * 3, 1))
 
     def test_other_failures_only_report(self):
         oks, calls, err = self.reset(1, FileNotFoundError('sudo'), 0)
@@ -140,12 +152,16 @@ class Helper(unittest.TestCase):
             _, calls, _ = self.reset(0)
         self.assertEqual(calls[0][0], ['H', 'reset-tt', '5-1.2'])
 
-    def test_a_timeout_is_remembered_by_hub_busport(self):
-        self.reset(124)
-        self.assertEqual(tt._unconfirmed, {'5-1'})
+    def test_a_timeout_is_remembered_by_hub_busport_with_its_survivors(self):
+        tails = []
+        with mock.patch.object(tt.hil_root, 'argv', lambda *a: ['H', *a]), \
+                mock.patch.object(tt, '_survivors', lambda tail: tails.append(tail) or {(1, 2)}):
+            self.reset(124)
+        self.assertEqual((tt._unconfirmed, tails), ({'5-1': {(1, 2)}}, [['H', 'reset-tt', '5-1.2']]))
 
     def test_a_timed_out_hub_stays_unconfirmed_when_it_no_longer_resolves(self):
-        self.reset(124)
+        with mock.patch.object(tt, '_survivors', lambda tail: {(os.getpid(), tt._start(os.getpid()))}):
+            self.reset(124)
         with mock.patch.object(tt.hil_root, 'tt_hub', mock.Mock(side_effect=tt.hil_root.Refused('gone'))), \
                 redirect_stderr(io.StringIO()):
             self.assertFalse(tt.reset_tt('5-1.2', '12', run=lambda *a, **k: self.fail('no helper')))
@@ -159,6 +175,63 @@ class Helper(unittest.TestCase):
         self.assertIn('helper timed out', err.getvalue())
 
 
+# A helper the hub lock holds: its child leaves the runner's session, beyond the group kill as sudo's
+# root child is, and waits until the lock is released (the file beside it); once it is, a helper succeeds.
+STALLED_HELPER = """import os, sys, time
+released = __file__ + '.released'
+if not os.path.exists(released):
+    if os.fork() == 0:
+        os.setsid()
+        while not os.path.exists(released):
+            time.sleep(0.02)
+        os._exit(0)
+    time.sleep(60)
+"""
+
+
+class HubLockStall(unittest.TestCase):
+    """A helper held past HELPER_TIMEOUT by the hub lock, through the real runner: later calls on that hub
+    spawn no helper while it still waits, and once the lock is released and it exits, the next is
+    attempted and confirmed."""
+
+    def setUp(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        self.helper = Path(td.name) / 'helper.py'
+        self.helper.write_text(STALLED_HELPER)
+        self.released = Path(f'{self.helper}.released')
+        self.addCleanup(self.released.touch)
+        for obj, name, value in ((tt.hil_root, 'tt_hub', lambda b: ('5-1', 2, 5, 58, (0, 0))),
+                                 (tt.hil_root, 'argv', lambda *a: [sys.executable, '-I', str(self.helper), *a]),
+                                 (tt, '_unconfirmed', {}), (tt, 'HELPER_TIMEOUT', 1)):
+            patcher = mock.patch.object(obj, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.spawned = []
+
+    def run_helper(self, cmd, **kw):
+        self.spawned.append(cmd)
+        return hp.run_cmd(cmd, reap_grace=1, **kw)
+
+    def reset(self, busport='5-1.2'):
+        with redirect_stderr(io.StringIO()) as err:
+            return tt.reset_tt(busport, '12', run=self.run_helper), err.getvalue()
+
+    def test_a_stall_costs_the_call_it_hit_not_the_hub(self):
+        ok, err = self.reset()
+        self.assertEqual((ok, 'helper timed out' in err), (False, True))
+        [(pid, _)] = tt._unconfirmed['5-1']
+        self.assertEqual([self.reset()[0], self.reset('5-1.3')[0], len(self.spawned)], [False, False, 1])
+
+        self.released.touch()
+        for _ in range(250):
+            if tt._start(pid) is None:
+                break
+            time.sleep(0.02)
+        self.assertIsNone(tt._start(pid), 'the stalled helper did not exit once released')
+        self.assertEqual([self.reset()[0], len(self.spawned), tt._unconfirmed], [True, 2, {}])
+
+
 class RealHelper(unittest.TestCase):
     """The default runner launches the real hil_root.py, which re-derives the hub from sysfs
     itself: a busport no host has is refused there, before any device is opened."""
@@ -166,7 +239,7 @@ class RealHelper(unittest.TestCase):
     def test_the_default_runner_launches_hil_root(self):
         err = io.StringIO()
         with mock.patch.object(tt.hil_root, 'tt_hub', lambda b: ('999-1', 1, 999, 2, (0, 0))), \
-                mock.patch.object(tt, '_unconfirmed', set()), \
+                mock.patch.object(tt, '_unconfirmed', {}), \
                 mock.patch.object(os, 'geteuid', lambda: 0), redirect_stderr(err):   # no sudo in a test
             ok = tt.reset_tt('999-1.1', '12')
         self.assertTrue(ok)
