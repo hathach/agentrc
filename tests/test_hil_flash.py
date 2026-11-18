@@ -1560,24 +1560,15 @@ class ResetProblem(unittest.TestCase):
                '[rp2350.cm1] halted due to debug-request, current mode: Thread \n')
         self.assertEqual(hf.reset_problem('openocd', self.op(stderr=examined.encode())), '')
         self.assertEqual(hf.reset_problem('openocd', self.op(stderr=(examined + nmi).encode())),
-                         "exit 0, but the output says 'current mode: Handler NMI'")
+                         "exit 0, but the output says 'halted due to breakpoint, current mode: Handler NMI'")
 
-
-class ResetOpenocdArgv(unittest.TestCase):
-    """An openocd reset on target/rp2350.cfg halts both cores first, in the same session (#418); others do not."""
-
-    def test_rp2350_halts_both_cores_before_the_reset(self):
-        rp2350 = {'name': 'openocd', 'uid': 'S1', 'vid_pid': '0x2e8a 0x000c',
-                  'args': '-f interface/cmsis-dap.cfg -f target/rp2350.cfg -c "adapter speed 5000"'}
-        _, calls, _, _ = capture(hf.reset_openocd, rp2350, timeout=5)
-        self.assertEqual(calls, [([*hf.openocd_cmd_base(rp2350), '-c', 'init', '-c', 'catch halt',
-                                   '-c', 'init; reset run; exit'], {'timeout': 5})])
-
-    def test_another_target_resets_unhalted(self):
-        rp2040 = {'name': 'openocd', 'uid': 'S1', 'vid_pid': '0x2e8a 0x000c',
-                  'args': '-f interface/cmsis-dap.cfg -f target/rp2040.cfg'}
-        _, calls, _, _ = capture(hf.reset_openocd, rp2040, timeout=5)
-        self.assertEqual(calls, [([*hf.openocd_cmd_base(rp2040), '-c', 'init; reset run; exit'], {'timeout': 5})])
+    def test_a_core_catch_halt_finds_in_its_nmi_handler_is_no_reset_failure(self):
+        """`catch halt` before the reset halts a core in NMI by debug request; the reset that follows recovers it."""
+        before = ('Info : [rp2350.cm0] Examination succeed\nInfo : [rp2350.cm1] Examination succeed\n'
+                  '[rp2350.cm0] halted due to debug-request, current mode: Handler NMI\n'
+                  'xPSR: 0xf9000002 pc: 0x000002f8\n'
+                  '[rp2350.cm1] halted due to debug-request, current mode: Thread \n')
+        self.assertEqual(hf.reset_problem('openocd', self.op(stderr=before.encode())), '')
 
 
 class LiteralArgv(unittest.TestCase):

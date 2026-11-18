@@ -1258,10 +1258,11 @@ RESET_CONTACT = {
 }
 # Output showing no reset although the tool exited 0: openocd only warns on a failed examine and
 # only logs a failed event hook (a reset-assert hook then replaces the reset), and exits 0 with a
-# core halted in its NMI handler after the reset (#418); pyocd only logs an inaccessible core or an
-# invalid reset method; esptool exits 0 when the port refuses RTS/DTR.
+# core the reset left halted at a breakpoint in its NMI handler (#418; `catch halt`'s own halt before
+# it reads 'debug-request', cortex_m_halt_one); pyocd only logs an inaccessible core or an invalid
+# reset method; esptool exits 0 when the port refuses RTS/DTR.
 RESET_REFUTED = {
-    'openocd': ('examination failed', 'Execution of event', 'current mode: Handler NMI'),
+    'openocd': ('examination failed', 'Execution of event', 'halted due to breakpoint, current mode: Handler NMI'),
     'pyocd': ('is not accessible after reset', 'Invalid reset method'),
     'esptool': ('Chip was NOT reset',),
 }
