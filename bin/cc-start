@@ -52,7 +52,7 @@ def canonical(path):
 
 def checkout_root(arg):
     """The canonical top level of the git checkout or worktree arg names."""
-    if not (arg.startswith('/') or arg.startswith('~/')):
+    if not (os.path.isabs(arg) or arg.startswith('~/')):
         raise Refused(f'{arg}: name the checkout by an absolute or ~/ path; nothing started')
     try:
         root = os.path.realpath(os.path.expanduser(arg), strict=True)

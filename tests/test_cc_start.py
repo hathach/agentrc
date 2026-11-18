@@ -35,6 +35,7 @@ class StartTest(unittest.TestCase):
         repo.mkdir()
         subprocess.run(['git', 'init', '-q', str(repo)], check=True)
         self.root = os.path.realpath(repo)
+        self.elsewhere = os.path.realpath(tmp.name)   # an absolute directory that is not the checkout
         self.spaces = [{'id': 'spA', 'name': 'proj', 'folder': self.root, 'machine': None, 'tabs': [{'id': 'tbA'}]},
                        {'id': 'spB', 'name': 'other', 'folder': '/elsewhere', 'machine': None, 'tabs': []}]
         self.calls = []
@@ -158,7 +159,7 @@ class StartTest(unittest.TestCase):
         for terminal, code, said in [
             (self.terminal(app='shell'), 0, 'verification pending (not yet a Claude Code session)'),
             (self.terminal(state='finished'), 1, 'VERIFICATION FAILED: its terminal is finished'),
-            (self.terminal(cwd='/elsewhere'), 1, 'VERIFICATION FAILED: it runs in /elsewhere'),
+            (self.terminal(cwd=self.elsewhere), 1, f'VERIFICATION FAILED: it runs in {self.elsewhere}'),
             (None, 1, 'VERIFICATION FAILED: its terminal is gone'),
         ]:
             with self.subTest(said=said):
