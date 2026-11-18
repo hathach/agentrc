@@ -1,4 +1,4 @@
-"""bin/cc-start against a real git checkout, with hc, herdr-app and PATH replaced."""
+"""bin/claude-start against a real git checkout, with hc, herdr-app and PATH replaced."""
 import importlib.machinery
 import importlib.util
 import os
@@ -13,10 +13,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from helpers import guard_survivors  # noqa: E402
 
-_loader = importlib.machinery.SourceFileLoader('cc_start', str(ROOT / 'bin' / 'cc-start'))
-_spec = importlib.util.spec_from_loader('cc_start', _loader)
-cc = importlib.util.module_from_spec(_spec)
-_loader.exec_module(cc)
+_loader = importlib.machinery.SourceFileLoader('claude_start', str(ROOT / 'bin' / 'claude-start'))
+_spec = importlib.util.spec_from_loader('claude_start', _loader)
+cs = importlib.util.module_from_spec(_spec)
+_loader.exec_module(cs)
 
 
 def setUpModule():
@@ -43,9 +43,9 @@ class StartTest(unittest.TestCase):
         self.gets = {'t9': self.terminal()}
         self.missing = set()
         for target, attr, value in [
-            (cc.hc, 'run', self._hc),
-            (cc, 'herdr_spaces', lambda: self.spaces),
-            (cc.shutil, 'which', lambda p: None if p in self.missing else f'/bin/{p}'),
+            (cs.hc, 'run', self._hc),
+            (cs, 'herdr_spaces', lambda: self.spaces),
+            (cs.shutil, 'which', lambda p: None if p in self.missing else f'/bin/{p}'),
         ]:
             patcher = mock.patch.object(target, attr, value)
             patcher.start()
@@ -66,7 +66,7 @@ class StartTest(unittest.TestCase):
 
     def main(self, *argv):
         with mock.patch('builtins.print') as out:
-            code = cc.main([*argv])
+            code = cs.main([*argv])
         lines = [(str(c.args[0]), bool(c.kwargs.get('file'))) for c in out.call_args_list]
         return code, '\n'.join(t for t, err in lines if not err), '\n'.join(t for t, err in lines if err)
 
@@ -176,7 +176,7 @@ class StartTest(unittest.TestCase):
             if args[0] == 'get' and any(c[0] == 'run' for c in self.calls):
                 return ran(1, None, 'internal', 'boom')
             return ran(3, None, 'not_found', '') if args[0] == 'get' else ran(0, {})
-        with mock.patch.object(cc.hc, 'run', broken):
+        with mock.patch.object(cs.hc, 'run', broken):
             code, out, _ = self.main(self.root)
         self.assertEqual(code, 3)
         self.assertIn('VERIFICATION UNCHECKED', out)

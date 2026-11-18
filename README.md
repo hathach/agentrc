@@ -52,7 +52,7 @@ every session's instructions:
 - `--workflow`: into `~/.claude/workflows`.
 - `--bin`: each `bin/` command into `~/.local/bin`, which must be on `PATH`.
   `lsusbt` is `lsusb -t` with device names, serials and the HIL board each
-  serial belongs to; its header lists the options. `cc-start` opens an
+  serial belongs to; its header lists the options. `claude-start` opens an
   interactive Claude Code session on a checkout in a new hc terminal
   (below).
 - `--claude-md`: `instructions/user.md` as `~/.claude/CLAUDE.md`, and
@@ -363,12 +363,12 @@ Leave the checkout to chief until it exits.
 
 ## Starting a session
 
-`bin/cc-start` opens an interactive Claude Code session on a checkout, in a new
+`bin/claude-start` opens an interactive Claude Code session on a checkout, in a new
 hc terminal shown as a tab of the Herdr space whose folder is that checkout:
 
 ```sh
-cc-start ~/code/tinyusb                        # main account
-cc-start ~/code/tinyusb ada --task 'fix issue 12'
+claude-start ~/code/tinyusb                        # main account
+claude-start ~/code/tinyusb ada --task 'fix issue 12'
 ```
 
 `ada` runs the `claude-ada` wrapper, main runs `claude` with

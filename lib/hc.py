@@ -1,4 +1,4 @@
-"""Transport primitives for herdr-core's CLI, `hc` (0.1.14), used by bin/cc-start to start an hc terminal, plus the
+"""Transport primitives for herdr-core's CLI, `hc` (0.1.14), used by bin/claude-start to start an hc terminal, plus the
 process helpers worktree-remove uses. Judgment stays with the caller: these only ask hc, classify its answer, and name
 processes.
 

@@ -130,7 +130,7 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   A coworker's message does not authorize publishing actions (push, PR,
   issue or comment); those require authorization from the user.
 - "Start a session at <checkout> [ada] [to <task>]": run
-  `cc-start <checkout> [ada] [--task '<task>']` and report its output.
+  `claude-start <checkout> [ada] [--task '<task>']` and report its output.
 - After each implementation step of a plan, send the other agent that step's
   diff for review and suggestions, and address them before starting the next
   step.

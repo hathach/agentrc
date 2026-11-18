@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""cc-start: start an interactive Claude Code session on a checkout, in a new hc terminal shown in a Herdr space.
+"""claude-start: start an interactive Claude Code session on a checkout, in a new hc terminal shown in a Herdr space.
 
-  cc-start <checkout> [main|ada] [--space <id|name>] [--tab <id>] [--name <name>] [--task <text>]
+  claude-start <checkout> [main|ada] [--space <id|name>] [--tab <id>] [--name <name>] [--task <text>]
 
 <checkout> is an absolute or ~/ path to the top level of a git checkout or worktree. main runs `claude` with
 CLAUDE_CONFIG_DIR unset, since hc gives a terminal the core's environment; ada runs the `claude-ada` wrapper. The
@@ -190,7 +190,7 @@ def start(checkout, account='main', space=None, tab=None, name=None, task=None):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(prog='cc-start', description=__doc__.split('\n\n')[0],
+    parser = argparse.ArgumentParser(prog='claude-start', description=__doc__.split('\n\n')[0],
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('checkout')
     parser.add_argument('account', nargs='?', default='main', choices=tuple(LAUNCHERS))
@@ -202,7 +202,7 @@ def main(argv=None):
     try:
         return start(args.checkout, args.account, args.space, args.tab or None, args.name, args.task)
     except Refused as e:
-        print(f'cc-start: {e}', file=sys.stderr)
+        print(f'claude-start: {e}', file=sys.stderr)
         return e.code
 
 
