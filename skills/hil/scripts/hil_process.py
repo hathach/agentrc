@@ -211,8 +211,11 @@ def _await_group(p: subprocess.Popen, deadline: float) -> bool:
         except ChildProcessError:
             exited = True
         left = deadline - time.monotonic()
-        if exited and _bounded(lambda: _group_survivors(p.pid), max(0.0, left), last) is False:
-            return True
+        try:
+            if exited and _bounded(lambda: _group_survivors(p.pid), max(0.0, left), last) is False:
+                return True
+        except RuntimeError:    # the look's worker did not start (no reraise: fn's own errors stay in it)
+            pass
         left = deadline - time.monotonic()
         if left <= 0:
             return False

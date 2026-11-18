@@ -452,6 +452,14 @@ class TermBeforeKill(unittest.TestCase):
         self.assertLess(took, 0.5 + 1 + 1)
         self._gone(self.procs[0].pid)
 
+    def test_a_group_look_whose_worker_cannot_start_still_kills_and_returns_124(self):
+        """A failed /proc look is inconclusive: the stop waits out the TERM, SIGKILLs and reaps."""
+        with mock.patch.object(threading.Thread, 'start', side_effect=RuntimeError("can't start new thread")), \
+                redirect_stdout(io.StringIO()):
+            r = hp.run_cmd([sys.executable, '-c', DEAF], timeout=0.5, reap_grace=1)
+        self.assertEqual(r.returncode, 124)
+        self._gone(self.procs[0].pid)
+
     def test_a_member_left_after_the_leader_exits_is_killed(self):
         cmd = '(trap "" TERM; exec sleep 30) </dev/null >/dev/null 2>&1 & exec sleep 30'
         with redirect_stdout(io.StringIO()):

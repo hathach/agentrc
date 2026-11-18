@@ -244,6 +244,7 @@ class Inconclusive(unittest.TestCase):
                 mock.patch.object(tt, '_listed', lambda hp, t: set()), redirect_stderr(io.StringIO()):
             with no_thread:
                 held = [tt._waiting('5-1')]                     # a survivor's recheck
+                self.assertEqual(tt._unconfirmed, {'5-1': {(123, 456)}})
                 tt._unconfirmed.clear()
                 held.append(tt.reset_tt('5-1.2', '12', run=lambda c, **k: subprocess.CompletedProcess(c, 124, '', None)))
                 kept = dict(tt._unconfirmed)
