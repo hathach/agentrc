@@ -1425,26 +1425,28 @@ def run(profile, argv=None):
     return main(argv)
 
 
+@contextlib.contextmanager
 def build_lock(path):
-    """Hold the shared build directory until the returned file closes; refuse a competing process."""
-    lock = open(path, 'a+b')   # opening a contender must not truncate a locked file on Windows
-    try:
-        if os.name == 'nt':
-            import msvcrt
-            lock.seek(0)
-            try:
-                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
-            except OSError as e:
-                if e.errno not in (errno.EACCES, errno.EDEADLK):
-                    raise
-                raise BlockingIOError(e.errno, e.strerror) from e
-        else:
+    """Hold the shared build directory for the block; BlockingIOError while another process holds it."""
+    with open(path, 'a+b') as lock:   # opening a contender must not truncate a locked file on Windows
+        if os.name != 'nt':
             import fcntl
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BaseException:
-        lock.close()
-        raise
-    return lock
+            yield
+            return
+        import msvcrt
+        os.lseek(lock.fileno(), 0, os.SEEK_SET)
+        try:
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError as e:
+            if e.errno not in (errno.EACCES, errno.EDEADLK):
+                raise
+            raise BlockingIOError(e.errno, e.strerror) from e
+        try:
+            yield
+        finally:   # Windows frees a closed handle's locks only eventually, so a waiting build could still be refused
+            os.lseek(lock.fileno(), 0, os.SEEK_SET)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 def main(argv=None):

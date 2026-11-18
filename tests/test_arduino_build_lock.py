@@ -1,4 +1,6 @@
 """Real subprocess contention and owner-exit checks for the shared Arduino build lock."""
+import errno
+import os
 import subprocess
 import sys
 import unittest
@@ -6,24 +8,28 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import load_arduino_engine, load_arduino_fixture, tmpdir  # noqa: E402
+from helpers import guard_survivors, load_arduino_engine, load_arduino_fixture, tmpdir  # noqa: E402
 
 ab = load_arduino_engine('skills/arduino/scripts/arduino_build.py')
 CHILD = '''
-import os, sys
+import contextlib, os, sys
 sys.path.insert(0, sys.argv[1])
 from helpers import load_arduino_engine
 ab = load_arduino_engine('skills/arduino/scripts/arduino_build.py')
-try:
-    lock = ab.build_lock(sys.argv[2])
-except BlockingIOError:
-    sys.exit(73)
-if len(sys.argv) > 3:
-    print('locked', flush=True)
-    sys.stdin.readline()
-    os._exit(7)
-lock.close()
+with contextlib.ExitStack() as held:
+    try:
+        held.enter_context(ab.build_lock(sys.argv[2]))
+    except BlockingIOError:
+        sys.exit(73)
+    if len(sys.argv) > 3:
+        print('locked', flush=True)
+        sys.stdin.readline()
+        os._exit(7)
 '''
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 class BuildLock(unittest.TestCase):
@@ -78,3 +84,22 @@ class BuildLock(unittest.TestCase):
                 self.probe(0)   # the exception still owns the build stack here
             else:
                 self.fail('the build should have raised')
+
+    def test_windows_unlocks_before_close(self):
+        calls = []
+        fake = mock.Mock(LK_NBLCK='nb', LK_UNLCK='un')
+        fake.locking.side_effect = lambda fd, mode, n: calls.append((mode, n, os.lseek(fd, 0, os.SEEK_CUR)))
+        with mock.patch.dict(sys.modules, msvcrt=fake), mock.patch.object(ab.os, 'name', 'nt'):
+            with ab.build_lock(self.path) as held:
+                self.assertIsNone(held)
+                self.assertEqual(calls, [('nb', 1, 0)])
+        self.assertEqual(calls, [('nb', 1, 0), ('un', 1, 0)])   # released explicitly, not left to the close
+
+    def test_windows_contention_is_blocking_io_error(self):
+        fake = mock.Mock(LK_NBLCK='nb', LK_UNLCK='un')
+        fake.locking.side_effect = OSError(errno.EACCES, 'Permission denied')
+        with mock.patch.dict(sys.modules, msvcrt=fake), mock.patch.object(ab.os, 'name', 'nt'):
+            with self.assertRaises(BlockingIOError):
+                with ab.build_lock(self.path):
+                    self.fail('a held lock must not be entered')
+        self.assertEqual(len(fake.locking.call_args_list), 1)   # nothing to unlock when the lock was refused
