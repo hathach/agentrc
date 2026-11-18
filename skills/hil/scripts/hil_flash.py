@@ -497,9 +497,14 @@ def openocd_cmd_base(flasher: dict) -> list:
 # openocd's SMP reset (rp2350.cfg) warm-resets core0 by its own SYSRESETREQ before core1's, so core1 runs on in between;
 # an RCP fault core1 takes there (observed, cause undocumented) is cross-triggered on core0 (RP2350 datasheet 3.6.3.4),
 # whose RCP instructions then stall until a warm reset (3.6.3), timing out `program`'s rcp_init. Halting both cores
-# first: 0 of 655 such failures against 9 of 655 on the Fruit Jam (ci.lan, 2026-11-02; #395). `catch`: a halt request
-# takes no effect while halting is prohibited (Armv8-M ARM DHCSR.C_HALT, B13.4), and then `program` runs as before.
-HALT_BEFORE_PROGRAM_CFG = 'target/rp2350.cfg'
+# first: 0 of 655 such failures against 9 of 655 on the Fruit Jam (ci.lan, 2026-11-02; #395). `reset run` has the same
+# window: 1 of 7 Arduino console resets there left core0 halted in its NMI handler (2026-11-18; #418). `catch`: a halt
+# request takes no effect while halting is prohibited (Armv8-M ARM DHCSR.C_HALT, B13.4), and the command runs as before.
+HALT_BEFORE_RESET_CFG = 'target/rp2350.cfg'
+
+
+def _halt_first(flasher: dict) -> list:
+    return ['-c', 'init', '-c', 'catch halt'] if HALT_BEFORE_RESET_CFG in (flasher.get('args') or '') else []
 
 
 # `verify` is on by default, opted out per board with "verify": false. ch32v103r and
@@ -515,16 +520,16 @@ HALT_BEFORE_PROGRAM_CFG = 'target/rp2350.cfg'
 # recovery entries cannot run, so those entries empty the event in the roster instead.
 def flash_openocd(flasher: dict, firmware: str, *, timeout, run=None) -> Operation:
     verify = ' verify' if flasher.get('verify', True) else ''
-    halt = ['-c', 'init', '-c', 'catch halt'] if HALT_BEFORE_PROGRAM_CFG in (flasher.get('args') or '') else []
-    return _once(run, [*openocd_cmd_base(flasher), *halt, '-c', f'program {firmware}{verify} reset exit'],
-                 timeout=timeout)
+    return _once(run, [*openocd_cmd_base(flasher), *_halt_first(flasher),
+                       '-c', f'program {firmware}{verify} reset exit'], timeout=timeout)
 
 
 def reset_openocd(flasher: dict, *, timeout, run=None) -> Operation:
     # timeout: a post-hang recovery bounds this; an unbounded reset there would outlive the
     # caller's outer kill and orphan openocd on the probe, which is the stray the recovery
     # exists to avoid.
-    return _once(run, [*openocd_cmd_base(flasher), '-c', 'init; reset run; exit'], timeout=timeout)
+    return _once(run, [*openocd_cmd_base(flasher), *_halt_first(flasher), '-c', 'init; reset run; exit'],
+                 timeout=timeout)
 
 
 def run_openocd_commands(flasher: dict, commands: list, *, timeout, run=None, workdir=None) -> Operation:
@@ -1252,10 +1257,11 @@ RESET_CONTACT = {
     'openocd': ('Examination succeed', 'Examined RISC-V core', 'processor detected', 'SWD DPIDR'),
 }
 # Output showing no reset although the tool exited 0: openocd only warns on a failed examine and
-# only logs a failed event hook (a reset-assert hook then replaces the reset); pyocd only logs an
-# inaccessible core or an invalid reset method; esptool exits 0 when the port refuses RTS/DTR.
+# only logs a failed event hook (a reset-assert hook then replaces the reset), and exits 0 with a
+# core halted in its NMI handler after the reset (#418); pyocd only logs an inaccessible core or an
+# invalid reset method; esptool exits 0 when the port refuses RTS/DTR.
 RESET_REFUTED = {
-    'openocd': ('examination failed', 'Execution of event'),
+    'openocd': ('examination failed', 'Execution of event', 'current mode: Handler NMI'),
     'pyocd': ('is not accessible after reset', 'Invalid reset method'),
     'esptool': ('Chip was NOT reset',),
 }
