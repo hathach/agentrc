@@ -501,6 +501,11 @@ def openocd_cmd_base(flasher: dict) -> list:
 # window: 1 of 7 Arduino console resets there left core0 halted in its NMI handler (2026-11-18; #418). `catch`: a halt
 # request takes no effect while halting is prohibited (Armv8-M ARM DHCSR.C_HALT, B13.4), and the command runs as before.
 HALT_BEFORE_RESET_CFG = 'target/rp2350.cfg'
+# reset_openocd echoes this just before a halt-first `reset run`: a halt's reason cannot tell a core the reset left in
+# its NMI handler from one `catch halt` found there. The halt's debug-request outlives the reset (cortex_m_halt_one,
+# cortex_m_examine_debug_reason), and a core's own breakpoint halt can be polled before `halt` runs
+# (jim_command_dispatch). echo and the halt report are both LOG_USER, written and flushed in order to stderr (log_puts).
+RESET_RUN_MARK = 'hil_flash: reset'
 
 
 def _halt_first(flasher: dict) -> list:
@@ -528,7 +533,9 @@ def reset_openocd(flasher: dict, *, timeout, run=None) -> Operation:
     # timeout: a post-hang recovery bounds this; an unbounded reset there would outlive the
     # caller's outer kill and orphan openocd on the probe, which is the stray the recovery
     # exists to avoid.
-    return _once(run, [*openocd_cmd_base(flasher), *_halt_first(flasher), '-c', 'init; reset run; exit'],
+    halt_first = _halt_first(flasher)
+    mark = f'echo {{{RESET_RUN_MARK}}}; ' if halt_first else ''
+    return _once(run, [*openocd_cmd_base(flasher), *halt_first, '-c', f'init; {mark}reset run; exit'],
                  timeout=timeout)
 
 
@@ -1258,11 +1265,13 @@ RESET_CONTACT = {
 }
 # Output showing no reset although the tool exited 0: openocd only warns on a failed examine and
 # only logs a failed event hook (a reset-assert hook then replaces the reset), and exits 0 with a
-# core the reset left halted at a breakpoint in its NMI handler (#418; `catch halt`'s own halt before
-# it reads 'debug-request', cortex_m_halt_one); pyocd only logs an inaccessible core or an invalid
-# reset method; esptool exits 0 when the port refuses RTS/DTR.
+# core the reset left halted in its NMI handler (#418): any such halt after RESET_RUN_MARK, without
+# the mark one at a breakpoint; pyocd only logs an inaccessible core or an invalid reset method;
+# esptool exits 0 when the port refuses RTS/DTR.
+OPENOCD_NMI_BREAKPOINT = 'halted due to breakpoint, current mode: Handler NMI'
+OPENOCD_POST_RESET_NMI = 'current mode: Handler NMI'
 RESET_REFUTED = {
-    'openocd': ('examination failed', 'Execution of event', 'halted due to breakpoint, current mode: Handler NMI'),
+    'openocd': ('examination failed', 'Execution of event', OPENOCD_NMI_BREAKPOINT),
     'pyocd': ('is not accessible after reset', 'Invalid reset method'),
     'esptool': ('Chip was NOT reset',),
 }
@@ -1276,7 +1285,11 @@ def reset_problem(name: str, op) -> str:
     if name == 'jlink':
         return jlink_problem(op)
     out = hil_process.cmd_stdout_text(op.stdout) + '\n' + hil_process.cmd_stdout_text(op.stderr)
-    if said := next((m for m in RESET_REFUTED.get(name, ()) if m in out), None):
+    checks = [(m, out) for m in RESET_REFUTED.get(name, ())]
+    if name == 'openocd' and RESET_RUN_MARK in out:
+        after = out.rpartition(RESET_RUN_MARK)[2]
+        checks = [(OPENOCD_POST_RESET_NMI, after) if m == OPENOCD_NMI_BREAKPOINT else (m, text) for m, text in checks]
+    if said := next((m for m, text in checks if m in text), None):
         return f'exit 0, but the output says {said!r}'
     if name in RESET_CONTACT and not any(m in out for m in RESET_CONTACT[name]):
         return 'exit 0, but no line shows the target answering'
