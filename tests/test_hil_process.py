@@ -454,11 +454,15 @@ class TermBeforeKill(unittest.TestCase):
 
     def test_a_group_look_whose_worker_cannot_start_still_kills_and_returns_124(self):
         """A failed /proc look is inconclusive: the stop waits out the TERM, SIGKILLs and reaps."""
-        with mock.patch.object(threading.Thread, 'start', side_effect=RuntimeError("can't start new thread")), \
+        # the leader exits on the TERM, so the stop looks for the member that ignores it
+        cmd = '(trap "" TERM; exec sleep 30) </dev/null >/dev/null 2>&1 & exec sleep 30'
+        with mock.patch.object(threading.Thread, 'start',
+                               side_effect=RuntimeError("can't start new thread")) as start, \
                 redirect_stdout(io.StringIO()):
-            r = hp.run_cmd([sys.executable, '-c', DEAF], timeout=0.5, reap_grace=1)
+            r = hp.run_cmd(cmd, timeout=0.5, reap_grace=1)
+        self.assertTrue(start.called, 'no group look was attempted')
         self.assertEqual(r.returncode, 124)
-        self._gone(self.procs[0].pid)
+        self._gone(self.procs[0].pid)       # the member is in the leader's group
 
     def test_a_member_left_after_the_leader_exits_is_killed(self):
         cmd = '(trap "" TERM; exec sleep 30) </dev/null >/dev/null 2>&1 & exec sleep 30'
