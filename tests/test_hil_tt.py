@@ -271,6 +271,8 @@ class HubLockStall(unittest.TestCase):
             patcher = mock.patch.object(obj, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
+        if tt._survivors(('agentrc-no-such-tail',)) is None:     # Inconclusive covers that result
+            self.skipTest("/proc withholds another uid's process (hidepid=1, no exemption): no scan proves none")
         self.spawned = []
 
     def run_helper(self, cmd, **kw):
