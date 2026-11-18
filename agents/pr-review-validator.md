@@ -1,7 +1,7 @@
 ---
 name: pr-review-validator
 description: Harvest one PR's bot reviews (Copilot, CodeRabbit, Greptile, code scanning), report where each requested bot stands on the head SHA, and adversarially validate each finding against the code — verdict valid/invalid/stale, draft replies for refuted ones. Read-only; never edits code, never posts, never pushes.
-tools: Bash, Read, Grep, Glob
+tools: Bash, PowerShell, Read, Grep, Glob
 model: opus
 effort: high
 ---

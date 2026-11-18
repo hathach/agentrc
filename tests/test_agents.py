@@ -35,6 +35,22 @@ class AgentFiles(unittest.TestCase):
                     self.assertEqual(toml['name'], stem)
                     self.assertIn(f'${{AGENTRC_DIR:-$HOME/.codex}}/agents/{stem}.md', toml['developer_instructions'])
 
+    def test_a_role_with_a_shell_names_the_windows_one_unless_a_guard_reads_only_bash(self):
+        """On Windows a subagent's shell tool is named PowerShell, and a `tools` line filters out names the
+        harness does not offer: a role listing only Bash gets no shell there (#526). Other platforms ignore the
+        unknown name. A role whose hook guards its shell (captain, coworker, headless chief) keeps Bash alone:
+        its guard parses Bash commands only, so a PowerShell tool would run past it."""
+        guarded = {'captain', 'chief', 'coworker'}
+        for path in sorted(AGENTS.glob('*.md')):
+            front = yaml.safe_load(path.read_text().split('---')[1])
+            tools = [t.strip() for t in str(front.get('tools', '')).split(',')]
+            with self.subTest(path.stem):
+                if path.stem in guarded:
+                    self.assertNotIn('PowerShell', tools, 'its guard does not read PowerShell commands')
+                elif 'Bash' in tools:
+                    self.assertIn('PowerShell', tools)
+                    self.assertNotIn('hooks', front, 'a hooked role: decide whether its guard reads PowerShell')
+
     def test_chief_accepts_the_changed_criteria_hw_debugger_reports_on(self):
         """chief adjudicates a round from the hardware reference its Hardware section names, not from
         hw-debugger.md, so each carries the list of what counts as a changed round; the two copies must not drift."""
