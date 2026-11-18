@@ -44,12 +44,10 @@ class AgentFiles(unittest.TestCase):
         for path in sorted(AGENTS.glob('*.md')):
             front = yaml.safe_load(path.read_text().split('---')[1])
             tools = [t.strip() for t in str(front.get('tools', '')).split(',')]
-            if 'Bash' not in tools:
-                continue
             with self.subTest(path.stem):
                 if path.stem in guarded:
                     self.assertNotIn('PowerShell', tools, 'its guard does not read PowerShell commands')
-                else:
+                elif 'Bash' in tools:
                     self.assertIn('PowerShell', tools)
                     self.assertNotIn('hooks', front, 'a hooked role: decide whether its guard reads PowerShell')
 
