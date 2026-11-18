@@ -50,7 +50,8 @@ the library's build SKILL.md.
 
 import argparse
 import concurrent.futures
-import fcntl
+import contextlib
+import errno
 import functools
 import hashlib
 import importlib.util
@@ -1424,7 +1425,36 @@ def run(profile, argv=None):
     return main(argv)
 
 
+@contextlib.contextmanager
+def build_lock(path):
+    """Hold the shared build directory for the block; BlockingIOError while another process holds it."""
+    with open(path, 'a+b') as lock:   # opening a contender must not truncate a locked file on Windows
+        if os.name != 'nt':
+            import fcntl
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            yield
+            return
+        import msvcrt
+        os.lseek(lock.fileno(), 0, os.SEEK_SET)
+        try:
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError as e:
+            if e.errno not in (errno.EACCES, errno.EDEADLK):
+                raise
+            raise BlockingIOError(e.errno, e.strerror) from e
+        try:
+            yield
+        finally:   # Windows frees a closed handle's locks only eventually, so a waiting build could still be refused
+            os.lseek(lock.fileno(), 0, os.SEEK_SET)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+
+
 def main(argv=None):
+    with contextlib.ExitStack() as resources:
+        return _main(argv, resources)
+
+
+def _main(argv, resources):
     args = parse(argv if argv is not None else sys.argv[1:], getattr(P, '__doc__', None))
     roster = load_roster(args.hil_config) if args.hil_config else None
     # deduplicated: two workers on one sketch would share its build dir
@@ -1464,12 +1494,10 @@ def main(argv=None):
     build_root = P.ROOT / 'build'
     shared = build_root / 'hil'
     root = shared if args.shared else build_root / f'agent-{os.getpid()}'
-    lock = None
     if args.shared:
         shared.mkdir(parents=True, exist_ok=True)
-        lock = open(shared / '.lock', 'w')
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            resources.enter_context(build_lock(shared / '.lock'))
         except BlockingIOError:
             fail(f'{rel(shared)} is in use by another build or HIL run (its .lock is held)')
     cli_dir = build_root / f'.arduino-cli-{os.getpid()}' if core_mode() and any(sel['builds'].values()) else None
