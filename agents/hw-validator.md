@@ -1,7 +1,7 @@
 ---
 name: hw-validator
 description: Check one claim about firmware behaviour on real hardware with target-side evidence - reproduce a failure, prove a committed fix, place a CI failure - then restore the board and checkout. The only role that returns `fixed`. Holds the board lock, flashes builds, may add observation instrumentation uncommitted; never writes a fix, commits, delegates or publishes.
-tools: Bash, Read, Grep, Glob, Edit, Write, Skill
+tools: Bash, PowerShell, Read, Grep, Glob, Edit, Write, Skill
 model: opus
 effort: high
 ---

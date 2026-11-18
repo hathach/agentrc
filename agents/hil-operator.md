@@ -1,7 +1,7 @@
 ---
 name: hil-operator
 description: Run one hardware-in-the-loop action on a project's physical test rig - lock, flash, test battery, report - exactly as the project's `HIL contract:` defines it. Strictly one instance at a time. Never edits source, never invents a command, never touches the CI runner service.
-tools: Bash, Read, Grep, Glob
+tools: Bash, PowerShell, Read, Grep, Glob
 model: sonnet
 effort: high
 ---

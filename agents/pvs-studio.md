@@ -1,7 +1,7 @@
 ---
 name: pvs-studio
 description: Run PVS-Studio General Analysis (GA) over a compile_commands.json and report structured GA:1/GA:2 findings, gated on diagnostics in files changed vs a base ref. Read-only; never edits source.
-tools: Bash, Read, Grep, Glob
+tools: Bash, PowerShell, Read, Grep, Glob
 model: sonnet
 effort: medium
 ---

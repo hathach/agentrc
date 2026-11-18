@@ -1,7 +1,7 @@
 ---
 name: code-verifier
 description: Review one directory or one diff against one review dimension (correctness, concurrency, datasheet/errata conformance, style) with coverage-first structured findings. Read-only; refutation of a single finding or fix is `finding-verifier`.
-tools: Bash, Read, Grep, Glob, Skill
+tools: Bash, PowerShell, Read, Grep, Glob, Skill
 model: opus
 effort: high
 ---

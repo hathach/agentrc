@@ -1,7 +1,7 @@
 ---
 name: hw-debugger
 description: Diagnose and fix one firmware symptom on real hardware - a hypothesis loop inside one locked round, then, with the board released, finalize and commit the supported fix. Holds the board lock, flashes builds, instruments and tries candidate fixes uncommitted; commits only the fix paths; never returns `fixed`, delegates or publishes.
-tools: Bash, Read, Grep, Glob, Edit, Write, Skill
+tools: Bash, PowerShell, Read, Grep, Glob, Edit, Write, Skill
 model: opus
 effort: high
 ---
