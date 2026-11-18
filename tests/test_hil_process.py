@@ -456,12 +456,16 @@ class TermBeforeKill(unittest.TestCase):
         """A failed /proc look is inconclusive: the stop waits out the TERM, SIGKILLs and reaps."""
         # the leader exits on the TERM, so the stop looks for the member that ignores it
         cmd = '(trap "" TERM; exec sleep 30) </dev/null >/dev/null 2>&1 & exec sleep 30'
+        t0 = time.monotonic()
         with mock.patch.object(threading.Thread, 'start',
                                side_effect=RuntimeError("can't start new thread")) as start, \
                 redirect_stdout(io.StringIO()):
             r = hp.run_cmd(cmd, timeout=0.5, reap_grace=1)
+        took = time.monotonic() - t0
         self.assertTrue(start.called, 'no group look was attempted')
         self.assertEqual(r.returncode, 124)
+        self.assertGreaterEqual(took, 0.5 + hp._term_wait(1) - 0.05, 'a failed look cut the TERM grace short')
+        self.assertLess(took, 0.5 + 1 + 1)
         self._gone(self.procs[0].pid)       # the member is in the leader's group
 
     def test_a_member_left_after_the_leader_exits_is_killed(self):
