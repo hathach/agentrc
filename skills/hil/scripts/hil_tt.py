@@ -64,7 +64,17 @@ def _survivors(tail) -> set | None:
     """(pid, start time) of each live process whose argv ends with `tail`; None when /proc may
     hide or withhold one, or does not show them all within PROC_SCAN_BOUND."""
     hp = _process()
-    return hp._bounded(lambda: _listed(hp, tail), hp.PROC_SCAN_BOUND, _scan)
+    return _bounded(lambda: _listed(hp, tail), _scan)
+
+
+def _bounded(fn, last):
+    """hil_process._bounded within PROC_SCAN_BOUND; None also when no thread starts (the host at its
+    thread limit): an inconclusive look, not a failed reset."""
+    hp = _process()
+    try:
+        return hp._bounded(fn, hp.PROC_SCAN_BOUND, last)
+    except RuntimeError:
+        return None
 
 
 def _listed(hp, tail) -> set | None:
@@ -121,13 +131,12 @@ def _alive(left) -> bool:
 def _waiting(hub) -> bool:
     """Whether a helper of `hub` that timed out may still be waiting on it, also while /proc does
     not answer within PROC_SCAN_BOUND; forgets it once not."""
-    hp = _process()
     if isinstance(left := _unconfirmed.get(hub), tuple):
         if (found := _survivors(left)) != set():
             if found:
                 _unconfirmed[hub] = found
             return True
-    elif left and hp._bounded(lambda: _alive(left), hp.PROC_SCAN_BOUND, _recheck) is not False:
+    elif left and _bounded(lambda: _alive(left), _recheck) is not False:
         return True
     _unconfirmed.pop(hub, None)
     return False

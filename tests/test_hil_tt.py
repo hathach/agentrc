@@ -236,6 +236,20 @@ class Inconclusive(unittest.TestCase):
             self.assertIsNone(tt._survivors(['H', 'reset-tt', '5-1.2']))
         self.assertLess(time.monotonic() - t0, 2)
 
+    def test_no_thread_to_look_with_keeps_the_hold_until_one_proves_none(self):
+        no_thread = mock.patch.object(threading.Thread, 'start', mock.Mock(side_effect=RuntimeError("can't start new thread")))
+        tail = ('H', 'reset-tt', '5-1.2')
+        with mock.patch.object(tt.hil_root, 'tt_hub', lambda b: ('5-1', 2, 5, 58, (0, 0))), \
+                mock.patch.object(tt.hil_root, 'argv', lambda *a: ['H', *a]), \
+                mock.patch.object(tt, '_listed', lambda hp, t: set()), redirect_stderr(io.StringIO()):
+            with no_thread:
+                held = [tt._waiting('5-1')]                     # a survivor's recheck
+                tt._unconfirmed.clear()
+                held.append(tt.reset_tt('5-1.2', '12', run=lambda c, **k: subprocess.CompletedProcess(c, 124, '', None)))
+                kept = dict(tt._unconfirmed)
+            ok = tt.reset_tt('5-1.2', '12', run=lambda c, **k: subprocess.CompletedProcess(c, 0, '', None))
+        self.assertEqual((held, kept, ok, tt._unconfirmed), ([True, False], {'5-1': tail}, True, {}))
+
 
 # A helper the hub lock holds: its child leaves the runner's session, beyond the group kill as sudo's
 # root child is, and waits until the lock is released (the file beside it); once it is, a helper succeeds.
@@ -286,7 +300,10 @@ class HubLockStall(unittest.TestCase):
     def test_a_stall_costs_the_call_it_hit_not_the_hub(self):
         ok, err = self.reset()
         self.assertEqual((ok, 'helper timed out' in err), (False, True))
-        [(pid, _)] = tt._unconfirmed['5-1']
+        if isinstance(left := tt._unconfirmed['5-1'], tuple):
+            self.released.touch()
+            self.skipTest('the post-timeout /proc scan was inconclusive within PROC_SCAN_BOUND: no survivor to follow')
+        [(pid, _)] = left
         self.assertEqual([self.reset()[0], self.reset('5-1.3')[0], len(self.spawned)], [False, False, 1])
 
         self.released.touch()
