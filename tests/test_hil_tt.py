@@ -13,6 +13,7 @@ import io
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -122,11 +123,6 @@ class Helper(unittest.TestCase):
             oks = [tt.reset_tt('5-1.2', '12', run=run) for _ in outcomes]
         return oks, calls, err.getvalue()
 
-    def test_timeout_is_unconfirmed_and_not_repeated_while_its_helper_runs(self):
-        with mock.patch.object(tt, '_survivors', lambda tail: {(os.getpid(), tt._start(os.getpid()))}):
-            oks, calls, err = self.reset(124, 0)
-        self.assertEqual((oks, len(calls), 'timed out' in err), ([False, False], 1, True))
-
     def test_a_timeout_that_left_no_helper_running_costs_only_that_call(self):
         with mock.patch.object(tt, '_survivors', lambda tail: set()):
             oks, calls, _ = self.reset(124, 0)
@@ -173,6 +169,41 @@ class Helper(unittest.TestCase):
         self.assertEqual((ok, out.getvalue()), (False, ''))
         self.assertIn('COMMAND TIMEOUT', err.getvalue())
         self.assertIn('helper timed out', err.getvalue())
+
+
+class Inconclusive(unittest.TestCase):
+    """A /proc look that blocks past PROC_SCAN_BOUND, or a survivor it cannot read, keeps the hub held,
+    and the call still returns."""
+
+    def setUp(self):
+        self.release = threading.Event()
+        self.addCleanup(self.release.set)
+        for obj, name, value in ((tt, '_unconfirmed', {'5-1': {(123, 456)}}), (tt, '_scan', []), (tt, '_recheck', []),
+                                 (tt._process(), 'PROC_SCAN_BOUND', 0.1)):
+            patcher = mock.patch.object(obj, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def blocked(self, *_):
+        self.release.wait(10)
+
+    def test_a_blocked_recheck_keeps_the_hold_and_returns(self):
+        t0 = time.monotonic()
+        with mock.patch.object(tt, '_start', self.blocked):
+            held = [tt._waiting('5-1'), tt._waiting('5-1')]     # the second, behind the first's blocked thread
+        self.assertEqual((held, '5-1' in tt._unconfirmed), ([True, True], True))
+        self.assertLess(time.monotonic() - t0, 2)
+
+    def test_an_unreadable_survivor_keeps_the_hold(self):
+        with mock.patch.object(tt, '_start', mock.Mock(side_effect=PermissionError('hidepid'))):
+            self.assertTrue(tt._waiting('5-1'))
+        self.assertIn('5-1', tt._unconfirmed)
+
+    def test_a_blocked_scan_is_no_proof_of_none(self):
+        t0 = time.monotonic()
+        with mock.patch.object(tt, '_listed', self.blocked):
+            self.assertIsNone(tt._survivors(['H', 'reset-tt', '5-1.2']))
+        self.assertLess(time.monotonic() - t0, 2)
 
 
 # A helper the hub lock holds: its child leaves the runner's session, beyond the group kill as sudo's

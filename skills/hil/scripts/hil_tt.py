@@ -33,6 +33,9 @@ HELPER_TIMEOUT = 10
 # holds while it enumerates any of its ports (devio.c usb_lock_device), and sudo's root child is
 # beyond our kill: another helper would only queue behind one still waiting there.
 _unconfirmed: dict = {}
+# The last /proc scan and recheck thread: one blocked read, not one per call (hil_process._bounded).
+_scan: list = []
+_recheck: list = []
 
 
 def _hil_load():
@@ -58,8 +61,13 @@ def _process():
 
 def _survivors(tail) -> set | None:
     """(pid, start time) of each live process whose argv ends with `tail`; None when /proc may
-    hide or withhold one."""
-    if _process()._proc_hides_others():
+    hide or withhold one, or does not show them all within PROC_SCAN_BOUND."""
+    hp = _process()
+    return hp._bounded(lambda: _listed(hp, tail), hp.PROC_SCAN_BOUND, _scan)
+
+
+def _listed(hp, tail) -> set | None:
+    if hp._proc_hides_others():
         return None
     tail = [os.fsencode(a) for a in tail]
     found = set()
@@ -79,21 +87,29 @@ def _survivors(tail) -> set | None:
 
 
 def _start(pid) -> int | None:
-    """pid's start time (proc_pid_stat(5) field 22) while it runs; None once it has exited."""
+    """pid's start time (proc_pid_stat(5) field 22) while it runs; None once it has exited. OSError
+    when unreadable."""
     try:
-        with open(f'/proc/{pid}/stat', errors='replace') as f:
-            fields = f.read().rpartition(')')[2].split()
-    except (FileNotFoundError, ProcessLookupError):
+        fields = _process()._stat_fields(f'/proc/{pid}/stat')
+    except ProcessLookupError:
         return None
-    return None if fields[0] in 'ZX' else int(fields[19])
+    return None if fields is None or fields[0] in 'ZX' else int(fields[19])
+
+
+def _alive(left) -> bool:
+    """Whether any of `left` may still run: an unreadable one may."""
+    try:
+        return any(_start(pid) == start for pid, start in left)
+    except OSError:
+        return True
 
 
 def _waiting(hub) -> bool:
-    """Whether a helper of `hub` that timed out may still be waiting on it; forgets it once not."""
-    if hub not in _unconfirmed:
-        return False
-    left = _unconfirmed[hub]
-    if left is None or any(_start(pid) == start for pid, start in left):
+    """Whether a helper of `hub` that timed out may still be waiting on it, also while /proc does
+    not answer within PROC_SCAN_BOUND; forgets it once not."""
+    hp = _process()
+    if (left := _unconfirmed.get(hub, ())) is None or (
+            left and hp._bounded(lambda: _alive(left), hp.PROC_SCAN_BOUND, _recheck) is not False):
         return True
     _unconfirmed.pop(hub, None)
     return False
