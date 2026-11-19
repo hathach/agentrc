@@ -380,8 +380,8 @@ session run it on "start a session at <checkout>". It replaces the captain
 agent; an install with `--skill` unregisters captain's old Stop and
 SessionStart hook from `~/.claude/settings.json` only. Another config dir that
 was given them (`~/.claude-ada` here) keeps both `captain_hook.py` entries,
-whose script is gone: delete its Stop and SessionStart entries from that dir's
-`settings.json` by hand.
+whose script is gone: delete the Stop and SessionStart entries that run
+`captain_hook.py` from that dir's `settings.json` by hand.
 
 ## Tests
 
