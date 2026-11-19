@@ -271,17 +271,13 @@ class LockName(Base):
     def test_a_registered_board_locks_as_its_registry_name_whatever_the_roster_calls_it(self):
         for entry in ({'name': 'frdm_k64f', 'probe': '000621000000'}, {'name': 'k64f', 'probe': '000621000000'}):
             self.assertEqual(hb.lock_name(entry, path=self.path), 'k64f')
-        self.assertEqual(hb.lock_name({'name': 'x', 'probe': 'E661'}, 'max32', self.path), 'max32')
 
-    def test_a_registered_board_with_another_lock_is_refused(self):
-        with self.assertRaisesRegex(ValueError, "x: lock 'mimxrt' is not its registered board's, max32"):
-            hb.lock_name({'name': 'x', 'probe': 'E661'}, 'mimxrt', self.path)
+    def test_an_unregistered_probe_is_refused(self):
         with self.assertRaisesRegex(ValueError, "probe 'NOPE' is not in agentrc"):
             hb.lock_name({'name': 'x', 'probe': 'NOPE'}, path=self.path)
 
-    def test_a_bench_board_locks_as_its_own(self):
-        self.assertEqual(hb.lock_name({'name': 'bench'}, path=self.path), 'bench')
-        self.assertEqual(hb.lock_name({'name': 'bench'}, 'shared', self.path), 'shared')
+    def test_a_bench_board_locks_as_its_roster_name_never_a_project_field(self):
+        self.assertEqual(hb.lock_name({'name': 'bench', 'tinyuf2': {'lock': 'shared'}}, path=self.path), 'bench')
 
 
 class Board(Base):

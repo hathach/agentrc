@@ -212,7 +212,7 @@ class Fixture(unittest.TestCase):
         return self.udev / f'c189:{2 * 128 + self.devnum(name) - 1}'
 
     def rosters(self):
-        return ['--roster', str(TINYUSB), '--roster', str(TINYUF2), 'tinyuf2.lock']
+        return ['--roster', str(TINYUSB), '--roster', str(TINYUF2)]
 
     def fork_main(self, *args, action='ok', patch=None):
         """hil_reserve.main in a forked child; `patch(hr)` runs in the child first."""
@@ -278,9 +278,9 @@ class Fixture(unittest.TestCase):
 
 class Rosters(Fixture):
     def test_both_shapes_resolve_dedupe_and_sort(self):
-        r = hr.load_rosters([(str(TINYUSB), 'name'), (str(TINYUF2), 'tinyuf2.lock')])
+        r = hr.load_rosters([str(TINYUSB), str(TINYUF2)])
         # tinyusb lists raspberry_pi_pico2 and stm32h743eval twice (one parked); tinyuf2's imxrt1064_evk
-        # locks as mimxrt1064_evk, which tinyusb also names; its stm32f303disco has no lock field
+        # locks as its registry name, mimxrt1064_evk, which tinyusb also names; its bench stm32f303disco as its own
         self.assertEqual(r['locks'], ['mimxrt1064_evk', 'raspberry_pi_pico2', 'stm32f303disco', 'stm32h743eval'])
         self.assertEqual(r['identities']['e6633861a3978538'], {'raspberry_pi_pico2'})
         self.assertEqual(r['identities']['000725299165'], {'mimxrt1064_evk'})   # tinyuf2 flasher.uid
@@ -288,20 +288,14 @@ class Rosters(Fixture):
         self.assertEqual(r['identities']['uart-1064'], {'mimxrt1064_evk'})
 
     def test_a_probe_shared_by_two_entries_maps_to_both_locks(self):
-        self.assertEqual(hr.load_rosters([(str(TINYUSB), 'name')])['identities']['shared-probe-serial'],
+        self.assertEqual(hr.load_rosters([str(TINYUSB)])['identities']['shared-probe-serial'],
                          {'raspberry_pi_pico2', 'stm32h743eval'})
 
-    def test_the_selector_falls_back_to_name_only_when_the_field_is_absent(self):
-        bad = Path(self.td.name) / 'bad.json'
-        bad.write_text(json.dumps({'boards': [{'name': 'ok', 'tinyuf2': {'lock': 42}}]}))
-        with self.assertRaisesRegex(hr.Refused, "ok: lock name 42 is not a plain file name"):
-            hr.load_rosters([(str(bad), 'tinyuf2.lock')])
-        bad.write_text(json.dumps({'boards': [{'name': 'ok', 'tinyuf2': {'lock': ''}}]}))
-        with self.assertRaisesRegex(hr.Refused, "not a plain file name"):
-            hr.load_rosters([(str(bad), 'tinyuf2.lock')])
-        bad.write_text(json.dumps({'boards': [{'name': 'ok', 'tinyuf2': {'lock': None}}]}))
-        with self.assertRaisesRegex(hr.Refused, "ok: lock name None is not a plain file name"):
-            hr.load_rosters([(str(bad), 'tinyuf2.lock')])
+    def test_a_bench_board_locks_as_its_roster_name_whatever_a_project_field_says(self):
+        roster = Path(self.td.name) / 'r.json'
+        roster.write_text(json.dumps({'boards': [{'name': 'bench', 'uid': 'B', 'tinyuf2': {'lock': 'shared'},
+                                                  'flasher': {'name': 'jlink', 'uid': 'pb'}}]}))
+        self.assertEqual(hr.load_rosters([str(roster)])['locks'], ['bench'])
 
     def test_identities_compare_as_udev_records_a_serial(self):
         self.assertEqual(hr.identity('  AB  CD/x,y '), 'ab_cd_x_y')
@@ -309,9 +303,9 @@ class Rosters(Fixture):
         roster.write_text(json.dumps({'boards': [{'name': 'a', 'uid': 'AB CD', 'flasher': {'name': 'jlink', 'uid': 'pa'}},
                                                  {'name': 'b', 'uid': 'ab_cd', 'flasher': {'name': 'jlink', 'uid': 'pb'}}]}))
         with self.assertRaisesRegex(hr.Refused, "identities 'ab cd' and 'ab_cd' are one and the same to udev"):
-            hr.load_rosters([(str(roster), 'name')])
+            hr.load_rosters([str(roster)])
         roster.write_text(json.dumps({'boards': [{'name': 'a', 'uid': 'AB CD', 'flasher': {'name': 'jlink', 'uid': 'pa'}}]}))
-        got = hr.load_rosters([(str(roster), 'name')])
+        got = hr.load_rosters([str(roster)])
         self.assertEqual(got['identities'], {'ab_cd': {'a'}, 'pa': {'a'}})
         self.dev('3-1.4', serial='AB CD')                    # the sysfs form matches...
         (self.sys / '3-1.5').mkdir()
@@ -323,14 +317,14 @@ class Rosters(Fixture):
         bad = Path(self.td.name) / 'bad.json'
         bad.write_text(json.dumps({'boards': [{'name': 'a', 'uid': 'X1', 'flasher': {'name': 'jlink', 'uid': 'pa'}}, {'name': 'b', 'uid': 'x1', 'flasher': {'name': 'jlink', 'uid': 'pb'}}]}))
         with self.assertRaisesRegex(hr.Refused, 'uid x1 names two boards: a and b'):
-            hr.load_rosters([(str(bad), 'name')])
+            hr.load_rosters([str(bad)])
 
     def test_a_registered_board_is_one_lock_whatever_each_roster_calls_it(self):
         probe, entry = next(iter(hr.hil_boards.registry().items()))
         a, b = Path(self.td.name) / 'a.json', Path(self.td.name) / 'b.json'
         a.write_text(json.dumps({'boards': [{'name': 'a', 'uid': 'FW-A', 'probe': probe}]}))
         b.write_text(json.dumps({'boards': [{'name': 'b', 'uid': 'FW-B', 'probe': probe}]}))
-        got = hr.load_rosters([(str(a), 'name'), (str(b), 'name')])
+        got = hr.load_rosters([str(a), str(b)])
         lock = {entry['name']}
         self.assertEqual(got, {'locks': [entry['name']],
                                'identities': {'fw-a': lock, 'fw-b': lock, probe.lower(): lock}})
@@ -338,20 +332,15 @@ class Rosters(Fixture):
     def test_a_registered_board_locks_as_its_registry_name(self):
         probe, entry = next(iter(hr.hil_boards.registry().items()))
         roster = Path(self.td.name) / 'r.json'
-        roster.write_text(json.dumps({'boards': [{'name': 'its-repo-name', 'uid': 'X', 'probe': probe,
-                                                  'proj': {'lock': entry['name']}}]}))
-        for selector in ('name', 'proj.lock'):
-            self.assertEqual(hr.load_rosters([(str(roster), selector)])['locks'], [entry['name']])
-        roster.write_text(json.dumps({'boards': [{'name': 'n', 'uid': 'X', 'probe': probe, 'proj': {'lock': 'other'}}]}))
-        with self.assertRaisesRegex(hr.Refused, f"lock 'other' is not its registered board's, {entry['name']}"):
-            hr.load_rosters([(str(roster), 'proj.lock')])
+        roster.write_text(json.dumps({'boards': [{'name': 'its-repo-name', 'uid': 'X', 'probe': probe}]}))
+        self.assertEqual(hr.load_rosters([str(roster)])['locks'], [entry['name']])
 
     def test_attached_devices_are_no_identities_registry_or_roster_copy(self):
         probe = next(p for p, e in hr.hil_boards.registry().items() if 'dev_attached' in e)
         roster = Path(self.td.name) / 'r.json'
         roster.write_text(json.dumps({'boards': [{'name': 'x', 'uid': 'DUT-UID', 'probe': probe, 'tests': {
             'dev_attached': [{'vid_pid': '1a86_7523', 'serial': '0'}]}}]}))
-        ids = hr.load_rosters([(str(roster), 'name')])['identities']
+        ids = hr.load_rosters([str(roster)])['identities']
         self.assertEqual(set(ids), {'dut-uid', probe.lower()})
 
     def test_each_rosters_legacy_copy_warns_naming_its_file(self):
@@ -363,7 +352,7 @@ class Rosters(Fixture):
         hr.hil_boards._warned.clear()
         err = io.StringIO()
         with redirect_stderr(err):
-            hr.load_rosters([(str(a), 'name'), (str(b), 'name')])
+            hr.load_rosters([str(a), str(b)])
         self.assertEqual(err.getvalue().splitlines(), [f'hil_boards: roster {r}: x: tests.dev_attached duplicates '
                                                        f"agentrc's board registry ({entry['name']}); drop it from the roster"
                                                        for r in (a, b)])
@@ -373,7 +362,7 @@ class Rosters(Fixture):
         bad = Path(self.td.name) / 'bad.json'
         bad.write_text(json.dumps({'boards': [{'name': 'a', 'uid': 'X', 'probe': probe, 'flasher': entry['flasher']}]}))
         with self.assertRaisesRegex(hr.Refused, "come from agentrc's board registry"):
-            hr.load_rosters([(str(bad), 'name')])
+            hr.load_rosters([str(bad)])
 
     def test_malformed_rosters_and_lock_names_refuse(self):
         bad = Path(self.td.name) / 'bad.json'
@@ -382,12 +371,9 @@ class Rosters(Fixture):
                           (json.dumps({'boards': [{'name': '../etc', 'uid': 'u'}]}), 'not a plain file name')):
             bad.write_text(text)
             with self.assertRaisesRegex(hr.Refused, why):
-                hr.load_rosters([(str(bad), 'name')])
-        bad.write_text(json.dumps({'boards': [{'name': 'ok', 'tinyuf2': {'lock': 'a/b'}}]}))
-        with self.assertRaisesRegex(hr.Refused, 'not a plain file name'):
-            hr.load_rosters([(str(bad), 'tinyuf2.lock')])
+                hr.load_rosters([str(bad)])
         with self.assertRaisesRegex(hr.Refused, 'roster .*missing.json'):
-            hr.load_rosters([(str(Path(self.td.name) / 'missing.json'), 'name')])
+            hr.load_rosters([str(Path(self.td.name) / 'missing.json')])
 
 
 @unittest.skipUnless(Path('/home/hathach/code/tinyusb/test/hil/tinyusb.json').exists()
@@ -412,7 +398,7 @@ class RealRosters(unittest.TestCase):
             self.skipTest(f'tinyusb adapter not loadable here: {e}')
         for fn in ('tinyusb.json', 'local.json'):
             path = Path('/home/hathach/code/tinyusb/test/hil') / fn
-            got = hr.load_rosters([(str(path), 'name')])
+            got = hr.load_rosters([str(path)])
             self.assertEqual(got['locks'], sorted(set(adapter.boards_from_config(str(path)))), fn)
             roster = json.loads(path.read_text())
             for e in roster['boards']:
@@ -427,7 +413,7 @@ class RealRosters(unittest.TestCase):
             path = Path('/home/hathach/code/adafruit/tinyuf2/test/hil') / fn
             if not path.exists():
                 continue
-            got = hr.load_rosters([(str(path), 'tinyuf2.lock')])
+            got = hr.load_rosters([str(path)])
             roster = json.loads(path.read_text())
             compared = 0
             for e in roster['boards']:
@@ -525,7 +511,7 @@ class Check(Fixture):
         self.assertEqual((rc, 'over budget: subtree uninspectable' in out), (1, True), out)
 
     def test_usage_errors(self):
-        for argv in (('check', '../x', *self.rosters()), ('check', '3-1', '--roster', 'a', 'b', 'c'),
+        for argv in (('check', '../x', *self.rosters()), ('check', '3-1', '--roster', 'a', 'tinyuf2.lock'),
                      ('run', 'pci-rebind', '3-1', *self.rosters(), '--reason', 'r'),
                      ('run', 'root-cycle', '3-1', *self.rosters(), '--reason', 'r', '--script', 'x'),
                      ('check', '3-1', '--scope', 'port', *self.rosters())):

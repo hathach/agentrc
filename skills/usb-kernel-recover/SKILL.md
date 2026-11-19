@@ -97,6 +97,15 @@ from agentrc's board registry, `hil` skill) and the probe serial. A convoy-safe 
 openocd -c "adapter serial <probe-sn>" <flasher args> -c "init; reset run; shutdown"
 ```
 
+When the flasher args name `target/rp2350.cfg`, halt both cores first, as the
+harness's `reset_openocd` does: openocd's SMP reset leaves core1 running while core0
+resets, and an RCP fault there can leave core0 stalled in its NMI handler (`hil_flash.py`):
+
+```bash
+openocd -c "adapter serial <probe-sn>" <flasher args> -c init -c "catch halt" \
+        -c "init; reset run; shutdown"
+```
+
 For stlink: `STM32_Programmer_CLI --connect port=swd sn=<probe-sn> --rst --go`.
 
 Any other runs only behind the shield (section 2), then unshield; for JLink:
@@ -141,9 +150,11 @@ re-verify the root hub's identity. Each run is supervised (15 s, then SIGKILL).
 It still takes the root hub's own `device_lock` (`usbdev_open`, every usbfs ioctl:
 uninterruptible), so a root hub lock already held, such as `hub_wq` disconnecting the
 wedged child under it, blocks it in D state. The script then names the surviving pid,
-sends no further request and fails (exit 1), and the reservation below stays held: the
-software rung failed, so follow the contract's terminal recovery. It is not a
-guaranteed escape, only the rung that opens nothing but the root hub.
+sends no further request and fails (exit 1). The reservation below then prints a BLOCKER
+line with its token, logs the blocker in each board's cleanup log and releases the
+flocks; the survivor's logged failure stays open until an operator acknowledges it
+(`hil_lock.py resolve`). The software rung failed, so follow the contract's terminal
+recovery. It is not a guaranteed escape, only the rung that opens nothing but the root hub.
 
 That is a different lock from the host's **board flocks**, and this rung still needs
 those: it bounces every fixture under the root port, including boards another job is
@@ -151,13 +162,13 @@ mid-flash on. `hil_reserve.py` (`hil` skill) takes them all, around the cycle:
 
 ```bash
 python3 <hil skill dir>/scripts/hil_reserve.py run root-cycle <busport> \
-    --roster <roster> [SELECTOR] ... --reason "root-cycle <busport>"
+    --roster <roster> ... --reason "root-cycle <busport>"
 ```
 
 One `--roster` per project with boards on this host (the contract's Hosts/rosters
-names them and each project's lock-name field). `hil_reserve.py --help` has its
-coverage, hold and release rules; a hold it keeps prints the token the contract's
-recovery procedure releases with. A refusal
+names them). `hil_reserve.py --help` has its
+coverage, hold and release rules; a failed cycle releases every lock, and the token its
+BLOCKER line prints identifies that logged blocker, not a held lock. A refusal
 naming a runner's holder (`hil_test.py`) means CI is mid-test — wait, do not force.
 Give it the wedged probe's own busport (e.g. `13-1.6`), not the `13-1` hub path: the
 script derives the root port itself, and the serial guard and the success check both

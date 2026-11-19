@@ -8,7 +8,8 @@ argument are normalised, plus deliberate deltas since, each applied explicitly: 
 command files are unique per invocation, reused by its crash reruns and removed after it
 (jlink_command_file_delta), the J-Link flash script has no reset before `loadfile`
 (jlink_flash_script_delta), esptool runs with NO_COLOR=1 (esptool_no_color_delta), an openocd
-flash on target/rp2350.cfg halts both cores before `program` (rp2350_halt_first_delta), every
+flash or reset on target/rp2350.cfg halts both cores first and the reset echoes a mark before
+`reset run` (rp2350_halt_first_delta), every
 command is the pre-move shell string's words as an argv list (argv_delta), and a flash or reset returns an Operation carrying the runner's results as its attempts, whose last
 one is the result compared (provider_invoke). Equality there does not establish timing, signals or pyOCD's
 project-directory behaviour; test_hil_process and test_hil_pyocd do."""
@@ -160,14 +161,17 @@ def argv_delta(case, observed):
 
 
 def rp2350_halt_first_delta(case, observed):
-    """An openocd flash on target/rp2350.cfg halts both cores before `program` (#395)."""
+    """An openocd flash or reset on target/rp2350.cfg halts both cores before `program` (#395) or the reset (#418), and
+    the reset echoes a mark just before `reset run`."""
     f = case['flasher']
-    if f['name'].lower() != 'openocd' or case['op'] != 'flash' or 'target/rp2350.cfg' not in f['args']:
+    if f['name'].lower() != 'openocd' or case['op'] not in ('flash', 'reset') or 'target/rp2350.cfg' not in f['args']:
         return observed
 
     def rewrite(call):
-        head, sep, tail = call['cmd'].partition(' -c "program ')
+        head, sep, tail = call['cmd'].partition(' -c "program ' if case['op'] == 'flash' else ' -c "init; reset run')
         assert sep, call['cmd']
+        if case['op'] == 'reset':
+            sep = ' -c "init; foreach t [target names] {catch {$t arp_poll}}; echo {hil_flash: reset}; reset run'
         return {**call, 'cmd': f'{head} -c init -c "catch halt"{sep}{tail}'}
     return map_calls(observed, rewrite)
 
@@ -1550,6 +1554,48 @@ class ResetProblem(unittest.TestCase):
         for name, out in cases:
             with self.subTest(name=name, out=out):
                 self.assertIn('the output says', hf.reset_problem(name, self.op(stderr=out.encode())))
+
+    def test_an_rp2350_core_left_in_its_nmi_handler_is_no_reset(self):
+        """The Fruit Jam's console reset that exited 0 and never re-enumerated (#418), against a clean one."""
+        examined = ('Info : [rp2350.cm0] Examination succeed\nInfo : [rp2350.cm1] Examination succeed\n'
+                    '[rp2350.cm0] halted due to debug-request, current mode: Thread \n'
+                    '[rp2350.cm1] halted due to debug-request, current mode: Thread \n')
+        nmi = ('[rp2350.cm0] halted due to breakpoint, current mode: Handler NMI\nxPSR: 0xf9000002 pc: 0x000002f8\n'
+               '[rp2350.cm1] halted due to debug-request, current mode: Thread \n')
+        self.assertEqual(hf.reset_problem('openocd', self.op(stderr=examined.encode())), '')
+        self.assertEqual(hf.reset_problem('openocd', self.op(stderr=(examined + nmi).encode())),
+                         "exit 0, but the output says 'halted due to breakpoint, current mode: Handler NMI'")
+
+    def test_a_core_catch_halt_finds_in_its_nmi_handler_is_no_reset_failure(self):
+        """`catch halt` before the reset halts a core in NMI by debug request; the reset that follows recovers it."""
+        before = ('Info : [rp2350.cm0] Examination succeed\nInfo : [rp2350.cm1] Examination succeed\n'
+                  '[rp2350.cm0] halted due to debug-request, current mode: Handler NMI\n'
+                  'xPSR: 0xf9000002 pc: 0x000002f8\n'
+                  '[rp2350.cm1] halted due to debug-request, current mode: Thread \n')
+        self.assertEqual(hf.reset_problem('openocd', self.op(stderr=before.encode())), '')
+
+    def test_after_the_reset_mark_only_a_post_reset_nmi_halt_refutes(self):
+        """A halt's reason cannot place it before or after the reset (#418); reset_openocd's echoed mark does."""
+        examined = 'Info : [rp2350.cm0] Examination succeed\nInfo : [rp2350.cm1] Examination succeed\n'
+        clean = ('[rp2350.cm0] halted due to debug-request, current mode: Thread \n'
+                 '[rp2350.cm1] halted due to debug-request, current mode: Thread \n')
+        mark = hf.RESET_RUN_MARK + '\n'
+        failed = 'Warn : target rp2350.cm1 examination failed\n'
+        nmi = "exit 0, but the output says 'current mode: Handler NMI'"
+        def in_nmi(why):
+            return f'[rp2350.cm0] halted due to {why}, current mode: Handler NMI\nxPSR: 0xf9000002 pc: 0x000002f8\n'
+        cases = [(in_nmi('debug-request') + mark + clean, ''),
+                 (in_nmi('breakpoint') + mark + clean, ''),
+                 (clean + mark + in_nmi('debug-request'), nmi),
+                 (clean + mark + in_nmi('breakpoint'), nmi),
+                 (clean + mark + in_nmi('breakpoint') + clean.partition('\n')[2], nmi),
+                 (failed + mark + clean, "exit 0, but the output says 'examination failed'"),
+                 (in_nmi('breakpoint') + mark + failed, "exit 0, but the output says 'examination failed'")]
+        for out, want in cases:
+            with self.subTest(out=out):
+                self.assertEqual(hf.reset_problem('openocd', self.op(stderr=(examined + out).encode())), want)
+        self.assertIn('no line shows the target answering', hf.reset_problem('openocd', self.op(stderr=mark.encode())))
+
 
 class LiteralArgv(unittest.TestCase):
     """Every built command is an argv list and its environment a mapping: no shell parses a path,
