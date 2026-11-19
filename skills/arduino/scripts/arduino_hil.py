@@ -509,13 +509,23 @@ def detach(name, board, vid_pid, tracker):
     """Take the DUT off the bus through the probe, where DETACH names the openocd flasher's target cfg; evidence
     text. A failed write is evidence, not a failure: a firmware without USB has nothing to detach, and the enumeration
     check after the flash decides. vid_pid None (no record, as for a console reset): the DUT is whatever carries its
-    serial."""
+    serial, any VID; without a `usb_port` the wait covers only the ports carrying it before the detach, so a peer's
+    inconclusive serial read elsewhere on the host cannot hold it, and a DUT found at none is evidence, not detached."""
     if board['flasher']['name'] != 'openocd' or role(name) == 'host':
         return ''
     cfgs = shlex.split(board['flasher'].get('args', ''))
     cmds = next((c for cfg, c in DETACH.items() if cfg in cfgs), None)
     if not cmds:
         return ''
+    scopes = [board]
+    if not (vid_pid or board.get('usb_port')):
+        # usb_scan leaves out a serial read that was inconclusive, so one empty scan is not proof the DUT is gone
+        deadline = time.monotonic() + DETACH_WAIT
+        while not (found := A.usb.usb_scan(serial=board['uid'])) and time.monotonic() < deadline:
+            time.sleep(0.2)
+        if not found:
+            return f'no device {dut_name(board)} on the bus before the detach'
+        scopes = [{**board, 'usb_port': d['busport']} for d in found]
     op = A.flash.run_openocd_commands(board['flasher'], cmds, timeout=VERIFY_TIMEOUT, run=tracker.run)
     tracker.check()
     out = _text(op.stdout) + _text(op.stderr)
@@ -523,7 +533,7 @@ def detach(name, board, vid_pid, tracker):
         return f'detach session failed (exit {op.returncode})'
     deadline = time.monotonic() + DETACH_WAIT
     while time.monotonic() < deadline:
-        if dut_absent(vid_pid, board):
+        if all(dut_absent(vid_pid, b) for b in scopes):
             return 'detached'
         time.sleep(0.2)
     return f'still enumerated {DETACH_WAIT}s after the detach'
@@ -591,17 +601,16 @@ def dut_devices(vid_pid, board):
 
 
 def dut_absent(vid_pid, board):
-    """Whether the DUT is off the bus, any VID when vid_pid is None. A serial-keyed DUT is absent once no candidate
-    (with this VID:PID, at its `usb_port` when the roster sets one) carries its serial or one whose read was
-    inconclusive (missing, timed out, unreadable, or across a re-enumeration): that device could be it, as in
-    usb_absent. Only a host-wide scan, no VID:PID and no `usb_port`, passes over devices with no `serial` in their
-    enumeration: counting those would wait on every serial-less hub."""
+    """Whether the DUT is off the bus, any VID when vid_pid is None; vid_pid or a `usb_port` (detach's pin when the
+    roster has none) scopes it. A serial-keyed DUT is absent once no candidate (with this VID:PID, at its `usb_port`
+    when set) carries its serial or one whose read was inconclusive (missing, timed out, unreadable, or across a
+    re-enumeration): that device could be it, as in usb_absent."""
     if board.get('no_serial'):
         return not (dut_devices(vid_pid, board) if vid_pid else
                     [d for d in A.usb.usb_devices() if d['busport'] == board['usb_port']])
     uid, port = board['uid'].lower(), board.get('usb_port')
     for d in devices(vid_pid) if vid_pid else A.usb.usb_devices():
-        if (port and d['busport'] != port) or (not (vid_pid or port) and no_serial(d)):
+        if port and d['busport'] != port:
             continue
         sn = A.usb.read_sysfs(str(Path(d['dir']) / 'serial'))
         if sn is None or A.usb.enumeration_id(d['dir']) != d['ino'] or sn.lower() == uid:

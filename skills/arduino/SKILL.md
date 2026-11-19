@@ -78,7 +78,9 @@ retries, recovery) apply unchanged; these scripts load its `hil_*` scripts throu
   (with `usb_port`) is for firmware that reports no serial (ESP32 under Arduino): the serial-less device at that port.
   `hil_test.py commission` finds and confirms either under the restoration sketch.
 - **Probe detach**: before a flash or console reset through an openocd flasher whose args name `target/rp2040.cfg`
-  or `target/rp2350.cfg`, the engine clears the USB pull-up so the host sees the new image enumerate.
+  or `target/rp2350.cfg`, the engine clears the USB pull-up so the host sees the new image enumerate. A console
+  reset, with no record's VID:PID and no roster `usb_port`, waits only on the ports carrying the DUT's serial before
+  the detach; a DUT found at none fails the reset with nothing touched.
 - **Locks**: every library's harness takes the same physical board lock (`/tmp/tinyusb-hil-locks/<name>.lock`, the
   `hil` skill), so two libraries, and tinyusb or tinyuf2, exclude each other on a shared board. A run's or
   commission's lock ends with it: a cleanup it could not prove (a failed restore, children not proven ended) is a
