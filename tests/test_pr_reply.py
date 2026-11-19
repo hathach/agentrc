@@ -1134,7 +1134,9 @@ class CommentDigestTest(unittest.TestCase):
 
     def test_live_comments_keep_the_digest_recorded_before_their_rewrite(self):
         # tinyusb#4055 and #3862: pr-babysit recorded these before CodeRabbit added a status, or flipped its footer to reply.
-        for cid, before, now in (('4154162329', 'e2bfa191d40d', 'b8a6c31d627f'), ('4135986177', '679c9f9aaf47', 'd755e5bbc27a')):
+        # agentrc#556: 4612691321's second footer flipped to reply as well.
+        for cid, before, now in (('4154162329', 'e2bfa191d40d', 'b8a6c31d627f'), ('4135986177', '679c9f9aaf47', 'd755e5bbc27a'),
+                                 ('4612691321', 'ffa0e76dd6b9', '2d44ae043035')):
             c = self.live(cid)
             self.assertEqual(self.cd.sha12(c['body']), now)
             self.assertEqual(self.digest(c['body'], c['user']), before, cid)
@@ -1147,7 +1149,7 @@ class CommentDigestTest(unittest.TestCase):
                     '\n\n✅ Confirmed as addressed by @hathach']
         for word in ('comment', 'reply'):
             for status in statuses:
-                for again in ('', f'\n\n{FOOTER.format("comment")}') if status else ('',):
+                for again in ('', f'\n\n{FOOTER.format("comment")}', f'\n\n{FOOTER.format("reply")}') if status else ('',):
                     body = head + FOOTER.format(word) + status + again
                     self.assertEqual(self.digest(body, RABBIT), self.cd.sha12(first), repr(body))
                     also = self.aliases(body, RABBIT)
@@ -1172,6 +1174,55 @@ class CommentDigestTest(unittest.TestCase):
         self.assertNotEqual(self.digest('claim\n\n' + footer, RABBIT), self.digest('claim edited\n\n' + footer, RABBIT))
 
 
+class WalkthroughDigestTest(unittest.TestCase):
+    """CodeRabbit's summary comment digests without the banners and checkboxes it swaps in and out (agentrc#556)."""
+
+    cd = reply.comment_digest
+    BOX = '> - [ ] <!-- {"checkboxId":"e9bb8d72-00e8-4f67-9cb2-caf3b22574fe"} --> Trigger review'
+
+    def setUp(self):
+        # 14:22:34Z, answered; 14:26:32Z, after our Trigger review tick, the rate-limit banner in the skip banner's place.
+        self.before, self.after = (json.loads((DATA / f'6976119728-{t}.json').read_text(encoding='utf-8'))['body'] for t in ('142234', '142632'))
+
+    def digest(self, body):
+        return self.cd.digests(body, RABBIT)[0]
+
+    def test_a_banner_only_edit_keeps_the_digest(self):
+        self.assertNotEqual(self.before, self.after)
+        self.assertEqual(self.digest(self.after), self.digest(self.before))
+        self.assertEqual(self.digest(self.before.replace(self.BOX, '> - Running review...')), self.digest(self.before))
+        self.assertIn(self.cd.sha12(self.after), self.cd.digests(self.after, RABBIT)[1:], 'the raw body, which a digest recorded before may be')
+
+    def test_a_checkbox_only_edit_keeps_the_digest(self):
+        self.assertIn(self.BOX, self.before)
+        boxes = [self.BOX, '- [ ] <!-- {"checkboxId":"2708ad07-9f24-4260-9c11-7dc76a49f2e3"} -->',
+                 '- [ ] <!-- {"checkboxId": "6ba7b810-9dad-11d1-80b4-00c04fd430c8"']
+        for box in boxes:
+            with self.subTest(box):
+                self.assertIn(box, self.before)
+                self.assertEqual(self.digest(self.before.replace(box, box.replace('[ ]', '[x]'))), self.digest(self.before))
+
+    def test_an_approval_notice_or_a_moved_head_keeps_the_digest(self):
+        notice = ('<!-- review_stack_entry_end -->\n<!-- approval_notice_start -->\n**Automatic approval withheld**\n\n'
+                  '1 CodeRabbit review thread is still open.\n<!-- approval_notice_end -->\n')
+        self.assertEqual(self.digest(self.before.replace('<!-- review_stack_entry_end -->\n', notice)), self.digest(self.before))
+        self.assertIn('· previous review <code>7eb86</code>', self.before)
+        self.assertEqual(self.digest(self.before.replace('· previous review <code>', '· up to <code>')), self.digest(self.before))
+
+    def test_a_change_to_what_it_claims_changes_the_digest(self):
+        for old, new in (('It applies RP2350 halt-first handling', 'It applies RP2040 halt-first handling'),
+                         ('Linked Issues check', 'Linked Issue check'), ('The risk to merging is low.', 'The risk to merging is high.')):
+            with self.subTest(old):
+                self.assertIn(old, self.before)
+                self.assertNotEqual(self.digest(self.before.replace(old, new)), self.digest(self.before))
+                self.assertNotEqual(self.digest(self.after.replace(old, new)), self.digest(self.after))
+
+    def test_only_coderabbits_summary_is_read_so(self):
+        self.assertEqual(self.cd.digests(self.after, 'greptile-apps[bot]'), [self.cd.sha12(self.after)])
+        quoted = 'a reply\n\n' + self.after
+        self.assertEqual(self.cd.digests(quoted, RABBIT), [self.cd.sha12(quoted)])
+
+
 class CanonicalReuseTest(ReplyCase):
     """--reuse reads a CodeRabbit comment under its canonical digest; one recorded before that rule needs a new inspection."""
 
@@ -1188,6 +1239,21 @@ class CanonicalReuseTest(ReplyCase):
             self.assertEqual(self.gh.mutations, [('resolve', 'T10')] if verified else [])
         rc, out = self.main('--inspect', '10:55')
         self.assertEqual(out['inspected'][0]['originalDigest'], sha12(first))
+
+    def test_reuse_on_a_summary_holds_over_a_banner_swap_not_over_a_claim_edit(self):
+        before, after = (json.loads((DATA / f'6976119728-{t}.json').read_text(encoding='utf-8'))['body'] for t in ('142234', '142632'))
+        for now, verified in ((after, True), (after.replace('Linked Issues check', 'Linked Issue check'), False)):
+            with self.subTest(verified=verified):
+                self.setUp()
+                self.gh.issue_comment(20, before, RABBIT)
+                self.gh.issue_comment(56, reply.issue_body(self.gh.issue[20], 'answered'), ME)
+                rc, out = self.main('--inspect', '20:56')
+                pair = {k: out['inspected'][0][k] for k in ('commentId', 'replyId', 'bodyDigest', 'originalDigest')}
+                self.gh.issue[20]['body'] = now
+                rc, receipts = self.reuse(pair)
+                self.assertEqual(receipts[0]['verified'], verified, receipts)
+                if not verified:
+                    self.assertIn('comment 20 was edited since the inspection', receipts[0]['error'])
 
 
 if __name__ == '__main__':

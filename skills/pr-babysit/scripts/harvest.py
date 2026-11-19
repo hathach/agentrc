@@ -25,7 +25,7 @@ giving no countdown, else null), and comments (every
 inline comment, issue comment and review body by a --reviewers author: kind
 review|issue|review-body, commentId, source, author, body verbatim, digest
 (pr-reply's comment_digest.py: sha256 of the body, 12 hex, without what
-CodeRabbit rewrites at its end), aliases (the digests a body's earlier forms
+CodeRabbit rewrites at its end or swaps in its summary), aliases (the digests a body's earlier forms
 may have been recorded under; left out when there are none), path, line,
 commitId, createdAt, updatedAt, inReplyTo, url), and fingerprint: `<reviewers>|<auto-run>|<32 hex>`, a
 sha256 over what the bots left that a review of the head could rest on (each comment's kind, id and digest, each
