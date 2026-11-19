@@ -156,13 +156,17 @@ class StartTest(unittest.TestCase):
         self.assertIn('a terminal elsewhere: box/t9', err)
 
     def test_verification_outcomes(self):
+        no_foreground = {k: v for k, v in self.terminal().items() if k != 'foreground'}
         for terminal, code, said in [
             (self.terminal(app='shell'), 0, 'verification pending (not yet a Claude Code session)'),
             (self.terminal(state='finished'), 1, 'VERIFICATION FAILED: its terminal is finished'),
             (self.terminal(cwd=self.elsewhere), 1, f'VERIFICATION FAILED: it runs in {self.elsewhere}'),
             (None, 1, 'VERIFICATION FAILED: its terminal is gone'),
+            (no_foreground, 0, 'verification pending (its working directory is not yet known)'),
+            ({**no_foreground, 'foreground': {'cwd': None, 'pid': 77}}, 0,
+             'verification pending (its working directory is not yet known)'),
         ]:
-            with self.subTest(said=said):
+            with self.subTest(terminal=terminal, said=said):
                 self.gets = {'t9': terminal} if terminal else {}
                 got, out, _ = self.main(self.root)
                 self.assertEqual(got, code)

@@ -155,7 +155,9 @@ def verify(address, root):
     if ((t.get('status') or {}).get('app')) != CLAUDE_APP:
         return 'pending', 'not yet a Claude Code session'
     cwd = canonical((t.get('foreground') or {}).get('cwd'))
-    if cwd and cwd != root:
+    if not cwd:
+        return 'pending', 'its working directory is not yet known'
+    if cwd != root:
         return 'failed', f'it runs in {cwd}, not {root}'
     return 'verified', ''
 
