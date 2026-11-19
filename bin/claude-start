@@ -47,7 +47,12 @@ class Refused(Exception):
 
 
 def canonical(path):
-    return os.path.realpath(path) if path and os.path.isabs(path) else None
+    if not (path and os.path.isabs(path)):
+        return None
+    try:
+        return os.path.realpath(path)
+    except ValueError:   # an embedded NUL, or a name the filesystem encoding cannot encode: it names no path here
+        return None
 
 
 def checkout_root(arg):

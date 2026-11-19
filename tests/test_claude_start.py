@@ -180,18 +180,21 @@ class StartTest(unittest.TestCase):
         herdr = Path(self.elsewhere) / 'herdr'
         herdr.mkdir()
         (herdr / 'ls').write_text('import json, sys\nsys.stdout.buffer.write(json.dumps({"spaces": [{"folder": '
-                                  f'{root!r}}}]}}, ensure_ascii=False).encode())\n', encoding='utf-8')
+                                  f'{root!r}}}, {{"id": "spA", "folder": {self.root!r}}}]}}, ensure_ascii=False)'
+                                  '.encode())\n', encoding='utf-8')
         code = ('import importlib.machinery, importlib.util, sys; '
                 'l = importlib.machinery.SourceFileLoader("cs", sys.argv[1]); '
                 'm = importlib.util.module_from_spec(importlib.util.spec_from_loader("cs", l)); l.exec_module(m); '
                 'm.shutil.which = lambda p: sys.executable; '   # herdr-app ls runs ./ls under this interpreter
-                'print(ascii((m.checkout_root(sys.argv[2]) == sys.argv[2], m.herdr_spaces()[0]["folder"])))')
+                'print(ascii((m.checkout_root(sys.argv[2]) == sys.argv[2], m.herdr_spaces()[0]["folder"], '
+                'm.placement(m.checkout_root(sys.argv[3]), None, None, m.herdr_spaces()))))')
         env = {k: v for k, v in os.environ.items() if k not in ('PYTHONUTF8', 'PYTHONIOENCODING')}
         if os.name != 'nt':
             env.update(LC_ALL='C', PYTHONCOERCECLOCALE='0')   # Windows reads the ANSI code page instead
-        r = subprocess.run([sys.executable, '-X', 'utf8=0', '-c', code, str(ROOT / 'bin' / 'claude-start'), root],
-                           capture_output=True, text=True, env=env, cwd=herdr)
-        self.assertEqual((r.returncode, r.stdout.strip()), (0, ascii((True, root))), r.stderr)
+        # an ASCII checkout is still placed when a neighbouring space's folder cannot be encoded in this locale
+        r = subprocess.run([sys.executable, '-X', 'utf8=0', '-c', code, str(ROOT / 'bin' / 'claude-start'), root,
+                            self.root], capture_output=True, text=True, env=env, cwd=herdr)
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, ascii((True, root, 'spA'))), r.stderr)
 
     def test_an_hc_failure_while_verifying_is_unchecked(self):
         def broken(*args, timeout):
