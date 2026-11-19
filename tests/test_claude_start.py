@@ -172,6 +172,27 @@ class StartTest(unittest.TestCase):
                 self.assertEqual(got, code)
                 self.assertIn(said, out)
 
+    def test_a_non_ascii_checkout_and_herdr_app_output_are_read_whatever_the_locale(self):
+        # U+0141 leaves a 0x81 that cp1252 cannot decode, and ASCII cannot either
+        repo = Path(self.elsewhere) / 'prŁj'
+        subprocess.run(['git', 'init', '-q', str(repo)], check=True)
+        root = os.path.realpath(repo)
+        herdr = Path(self.elsewhere) / 'herdr'
+        herdr.mkdir()
+        (herdr / 'ls').write_text('import json, sys\nsys.stdout.buffer.write(json.dumps({"spaces": [{"folder": '
+                                  f'{root!r}}}]}}, ensure_ascii=False).encode())\n', encoding='utf-8')
+        code = ('import importlib.machinery, importlib.util, sys; '
+                'l = importlib.machinery.SourceFileLoader("cs", sys.argv[1]); '
+                'm = importlib.util.module_from_spec(importlib.util.spec_from_loader("cs", l)); l.exec_module(m); '
+                'm.shutil.which = lambda p: sys.executable; '   # herdr-app ls runs ./ls under this interpreter
+                'print(ascii((m.checkout_root(sys.argv[2]) == sys.argv[2], m.herdr_spaces()[0]["folder"])))')
+        env = {k: v for k, v in os.environ.items() if k not in ('PYTHONUTF8', 'PYTHONIOENCODING')}
+        if os.name != 'nt':
+            env.update(LC_ALL='C', PYTHONCOERCECLOCALE='0')   # Windows reads the ANSI code page instead
+        r = subprocess.run([sys.executable, '-X', 'utf8=0', '-c', code, str(ROOT / 'bin' / 'claude-start'), root],
+                           capture_output=True, text=True, env=env, cwd=herdr)
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, ascii((True, root))), r.stderr)
+
     def test_an_hc_failure_while_verifying_is_unchecked(self):
         def broken(*args, timeout):
             self.calls.append(args)

@@ -602,13 +602,13 @@ def main(argv=None):
         directories_for(settings())
     for _, (src, dst) in pairs:
         link(src, dst)
+    if planned:  # before the unlinks: a rerun after a failed write finds the dropped hooks only by their links
+        write_settings(*planned)
     for dst in orphaned:  # linked by an earlier install, before the project had the skill
         if ours(dst):
             unlink(dst)
     for kind in {kind for kind, _ in chosen if kind in KINDS}:
         prune(kind)
-    if planned:
-        write_settings(*planned)
     if PROJECT:
         local = [] if ignored_elsewhere(exclude, block, SETTINGS_LOCAL) else [SETTINGS_LOCAL]
         write_exclude(exclude, block, trees, [relative(dst) for _, (_, dst) in pairs] + local)

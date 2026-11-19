@@ -291,6 +291,22 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(commands['Stop'][0], 'other-stop')
         self.assertNotIn(gone, [c for event in commands.values() for c in event])
 
+    def test_a_failed_settings_write_keeps_a_retired_hook_link_for_the_rerun(self):
+        hooks = self.claude / 'hooks'
+        hooks.mkdir(parents=True)
+        os.symlink(ROOT / 'hooks' / 'gone', hooks / 'gone')
+        gone = guard_command(hooks / 'gone' / 'gone_hook.py')
+        (self.claude / 'settings.json').write_text(json.dumps({'hooks': {
+            'Stop': [{'hooks': [{'type': 'command', 'command': gone}]}]}}))
+        with mock.patch.object(Path, 'home', return_value=self.home), \
+                mock.patch.object(install, 'write_settings', side_effect=OSError('disk full')), \
+                contextlib.redirect_stdout(io.StringIO()), self.assertRaises(OSError):
+            install.main(['install', '--skill'])
+        self.assertTrue((hooks / 'gone').is_symlink(), 'the rerun still finds the retired hook')
+        self.ok('install', '--skill')
+        self.assertFalse((hooks / 'gone').is_symlink())
+        self.assertNotIn(gone, [c for event in self.commands(self.settings()).values() for c in event])
+
     def test_a_skill_directory_without_skill_md_is_not_linked_and_its_link_is_pruned(self):
         repo = self.home / 'repo'
         (repo / 'skills' / 'kept').mkdir(parents=True)

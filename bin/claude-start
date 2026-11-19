@@ -61,8 +61,10 @@ def checkout_root(arg):
     if not os.path.isdir(root):
         raise Refused(f'{arg}: not a directory; nothing started')
     try:
+        # git prints the path's own bytes (UTF-8 on Windows): decode them as os.fsdecode would, whatever the locale
         found = subprocess.run(['git', '-C', root, 'rev-parse', '--path-format=absolute', '--show-toplevel'],
-                               capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=HC_TIMEOUT_S)
+                               capture_output=True, text=True, encoding=sys.getfilesystemencoding(),
+                               errors=sys.getfilesystemencodeerrors(), stdin=subprocess.DEVNULL, timeout=HC_TIMEOUT_S)
     except (subprocess.SubprocessError, OSError) as e:
         raise Refused(f'{arg}: git could not be asked ({e}); nothing started') from None
     top = found.stdout.strip()
@@ -90,8 +92,8 @@ def herdr_spaces():
     if not exe:
         raise Refused('herdr-app is not on PATH, so no space can be named for the session; nothing started')
     try:
-        out = subprocess.run([exe, 'ls'], capture_output=True, text=True, stdin=subprocess.DEVNULL,
-                             timeout=HC_TIMEOUT_S)
+        out = subprocess.run([exe, 'ls'], capture_output=True, text=True, encoding='utf-8', errors='replace',
+                             stdin=subprocess.DEVNULL, timeout=HC_TIMEOUT_S)
         spaces = json.loads(out.stdout).get('spaces') if out.returncode == 0 else None
     except (subprocess.TimeoutExpired, OSError, ValueError, AttributeError):
         spaces = None
