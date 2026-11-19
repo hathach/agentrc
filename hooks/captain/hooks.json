@@ -1,4 +1,0 @@
-{
-  "SessionStart": [{"matcher": "compact|clear", "hooks": [{"type": "command", "command": "captain_hook.py", "timeout": 30}]}],
-  "Stop": [{"hooks": [{"type": "command", "command": "captain_hook.py", "timeout": 30}]}]
-}

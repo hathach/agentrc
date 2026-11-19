@@ -52,7 +52,9 @@ every session's instructions:
 - `--workflow`: into `~/.claude/workflows`.
 - `--bin`: each `bin/` command into `~/.local/bin`, which must be on `PATH`.
   `lsusbt` is `lsusb -t` with device names, serials and the HIL board each
-  serial belongs to; its header lists the options.
+  serial belongs to; its header lists the options. `claude-start` opens an
+  interactive Claude Code session on a checkout in a new hc terminal
+  (below).
 - `--claude-md`: `instructions/user.md` as `~/.claude/CLAUDE.md`, and
   `~/.codex/AGENTS.md` to it.
 - `--statusline`: the `statusline/` files into `~/.claude`, and `statusLine`
@@ -104,7 +106,6 @@ those:
   leaves a user-wide one in place; remove it as its own step, `install.py
   remove` with the user-wide flags and no `--project`.
 - Not supported with a project install either:
-  - `captain`, whose guard and scripts are user-wide only;
   - worktrees of one repository installed from different agentrc checkouts;
   - `install` or `remove` runs at the same time in worktrees of one
     repository;
@@ -360,42 +361,27 @@ it, an auto-fix review with the babysitting of its repairs; its pending reviews
 need no grant, under chief's standing exception.
 Leave the checkout to chief until it exits.
 
-## Captain session
+## Starting a session
 
-`agents/captain.md` is one seat over the other Claude Code sessions in this host's
-hc terminals (Codex terminals are left out): it lists them, asks the idle ones for
-status, reports one table and carries the human's own words, read from its own
-transcript, to the sessions they name. It checks what sessions report with read-only
-git and gh lookups and the files sessions and chiefs leave, and keeps its own memory,
-but never does the sessions' work; the one thing it publishes is a follow-up issue in
-hathach/agentrc for a defect in its own tooling, on the human's word. Its guard,
-`skills/captain/scripts/captain_guard.py`, declared as a hook in the agent file so
-it applies on every account, names in its docstring the calls it allows. It reads
-sessions from hc terminals, each pinned to the session Claude Code registered under
-its process's account config dir, because sessions run under more than one account
-(`CLAUDE_CONFIG_DIR`), each shown with the account its process runs under. Start
-it in its own terminal:
+`bin/claude-start` opens an interactive Claude Code session on a checkout, in a new
+hc terminal shown as a tab of the Herdr space whose folder is that checkout:
 
 ```sh
-~/code/agentrc/install.py install --agent --skill
-claude --agent captain
+claude-start ~/code/tinyusb                        # main account
+claude-start ~/code/tinyusb ada --task 'fix issue 12'
 ```
 
-A watch has sessions report at the end of each task, new and restarted ones too, until the human cancels it, whichever
-captain runs. It types into no session: `hooks/captain`, installed with the captain skill, lets a covered session
-join it at its next Stop or after a compaction or `/clear`, and costs a Python start and one marker-file check while
-no watch is open. Another config dir (`~/.claude-ada` here) needs the hook's two entries from
-`hooks/captain/hooks.json` in its own `settings.json`, as the `credit-guard` recipe above does for its own; a session
-started before its settings held them joins only once restarted.
-
-Reports can hand the human decisions, and `captain.py queue` lists those waiting, with a headless chief run's attention
-lines once `ingest --chief` records them; the human's verdict on one is relayed to its session or recorded, never
-inferred.
-
-Its memory is shared across accounts: an account whose config directory is not
-`~/.claude` links its `agent-memory` there, as the ada account does with
-`ln -s ~/.claude/agent-memory ~/.claude-ada/agent-memory`; without that link the
-guard denies its memory writes.
+`ada` runs the `claude-ada` wrapper, main runs `claude` with
+`CLAUDE_CONFIG_DIR` unset. `--space`, `--tab` and `--name` place and name it,
+and `--task` is its first prompt. Every check refuses before anything starts,
+and it waits up to 20 s to verify a Claude Code session came up in that
+checkout; its docstring lists the exit codes. `instructions/user.md` has a
+session run it on "start a session at <checkout>". It replaces the captain
+agent; an install with `--skill` unregisters captain's old Stop and
+SessionStart hook from `~/.claude/settings.json` only. Another config dir that
+was given them (`~/.claude-ada` here) keeps both `captain_hook.py` entries,
+whose script is gone: delete the Stop and SessionStart entries that run
+`captain_hook.py` from that dir's `settings.json` by hand.
 
 ## Tests
 

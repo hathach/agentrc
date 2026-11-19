@@ -1,6 +1,6 @@
 ---
 name: followup-issue
-description: Open one follow-up issue, or comment new evidence on the open issue covering the topic, and prove it landed. Use when chief, under a push grant covering them, files deferred work in the PR's repository or an agentrc tooling defect in hathach/agentrc, or when captain files its own tooling defect there on the human's word.
+description: Open one follow-up issue, or comment new evidence on the open issue covering the topic, and prove it landed. Use when chief, under a push grant covering them, files deferred work in the PR's repository or an agentrc tooling defect in hathach/agentrc.
 ---
 
 # Filing a follow-up issue
@@ -14,9 +14,7 @@ python3 "$P" create --repo <o/r> --allow-repo <o/r> [--allow-repo hathach/agentr
 python3 "$P" comment --repo <o/r> --allow-repo <o/r> --issue <N> --body-file <f>
 ```
 
-`--title-file <f>`, a file holding the title line, stands in for `--title`. Captain, whose guard admits no quoting,
-runs these steps with the recipes in `../captain/SKILL.md` from this skill's directory, its symlink resolved first:
-one-word searches, a title file and a body file.
+`--title-file <f>`, a file holding the title line, stands in for `--title`.
 
 ## Judgment
 

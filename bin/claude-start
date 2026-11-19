@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""claude-start: start an interactive Claude Code session on a checkout, in a new hc terminal shown in a Herdr space.
+
+  claude-start <checkout> [main|ada] [--space <id|name>] [--tab <id>] [--name <name>] [--task <text>]
+
+<checkout> is an absolute or ~/ path to the top level of a git checkout or worktree. main runs `claude` with
+CLAUDE_CONFIG_DIR unset, since hc gives a terminal the core's environment; ada runs the `claude-ada` wrapper. The
+session opens as a new tab of the Herdr space whose folder is the checkout, or of the space --space names by exact id or
+name; --tab puts it in an existing tab of that space instead. Its terminal is named <checkout>-<account> unless --name
+gives another. --task is the session's first prompt, passed to claude as its initial prompt.
+
+Every check refuses before anything starts. Nothing it starts is closed by it. Exit status:
+  0  started, and verified as a Claude Code session in the checkout, or still coming up (pending)
+  1  hc refused and nothing started, or the session failed verification
+  2  bad arguments or a refused check; nothing started
+  3  hc gave no local terminal address, so a session may have started: `hc ls` before starting again; or hc could not
+     be asked to verify it
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lib'))   # the agentrc checkout this runs from
+import hc  # noqa: E402
+
+HC_TIMEOUT_S = 30
+START_WAIT_S = 20
+CLAUDE_APP = 'claude-code'
+# what each account runs: main with CLAUDE_CONFIG_DIR unset in the program itself; ada through its wrapper, whose
+# argv[0] Herdr's my-agents mod draws the account icon from
+LAUNCHERS = {'main': ('env', 'claude'), 'ada': ('claude-ada',)}
+TERMINAL_NAME = re.compile(r'[a-z0-9][a-z0-9._-]{0,31}')   # hc's rule for a name
+ADDRESS = re.compile(r't[0-9][0-9a-z]*', re.I)   # a local hc terminal address, t7, which a name must not look like
+
+
+class Refused(Exception):
+    """A check failed before anything started: (message, exit status)."""
+
+    def __init__(self, message, code=2):
+        super().__init__(message)
+        self.code = code
+
+
+def canonical(path):
+    if not (path and os.path.isabs(path)):
+        return None
+    try:
+        return os.path.realpath(path)
+    except ValueError:   # an embedded NUL, or a name the filesystem encoding cannot encode: it names no path here
+        return None
+
+
+def checkout_root(arg):
+    """The canonical top level of the git checkout or worktree arg names."""
+    if not (os.path.isabs(arg) or arg.startswith('~/')):
+        raise Refused(f'{arg}: name the checkout by an absolute or ~/ path; nothing started')
+    try:
+        root = os.path.realpath(os.path.expanduser(arg), strict=True)
+    except OSError:
+        raise Refused(f'{arg}: no such directory; nothing started') from None
+    if not os.path.isdir(root):
+        raise Refused(f'{arg}: not a directory; nothing started')
+    try:
+        # git prints the path's own bytes (UTF-8 on Windows): decode them as os.fsdecode would, whatever the locale
+        found = subprocess.run(['git', '-C', root, 'rev-parse', '--path-format=absolute', '--show-toplevel'],
+                               capture_output=True, text=True, encoding=sys.getfilesystemencoding(),
+                               errors=sys.getfilesystemencodeerrors(), stdin=subprocess.DEVNULL, timeout=HC_TIMEOUT_S)
+    except (subprocess.SubprocessError, OSError) as e:
+        raise Refused(f'{arg}: git could not be asked ({e}); nothing started') from None
+    top = found.stdout.strip()
+    if found.returncode or not top:
+        raise Refused(f'{arg}: not a git checkout with a work tree; nothing started')
+    if os.path.realpath(top) != root:
+        raise Refused(f'{arg}: inside the checkout {top}, not its top level; nothing started')
+    return root
+
+
+def launcher(account, task):
+    """The argv that starts Claude Code under account, each program as PATH finds it now, with task as its first
+    prompt."""
+    found = {p: shutil.which(p) for p in LAUNCHERS[account]}
+    missing = [p for p, f in found.items() if not f]
+    if missing:
+        raise Refused(f'{missing[0]} is not on PATH, so {account} cannot be started; nothing started')
+    argv = [found['env'], '-u', 'CLAUDE_CONFIG_DIR', found['claude']] if account == 'main' else [found['claude-ada']]
+    return argv + ([task] if task else [])
+
+
+def herdr_spaces():
+    """The spaces `herdr-app ls` shows, each with its tabs."""
+    exe = shutil.which('herdr-app')
+    if not exe:
+        raise Refused('herdr-app is not on PATH, so no space can be named for the session; nothing started')
+    try:
+        out = subprocess.run([exe, 'ls'], capture_output=True, text=True, encoding='utf-8', errors='replace',
+                             stdin=subprocess.DEVNULL, timeout=HC_TIMEOUT_S)
+        spaces = json.loads(out.stdout).get('spaces') if out.returncode == 0 else None
+    except (subprocess.TimeoutExpired, OSError, ValueError, AttributeError):
+        spaces = None
+    if not isinstance(spaces, list) or not all(isinstance(sp, dict) for sp in spaces):
+        raise Refused('herdr-app ls gave no list of spaces (is the Herdr window open?); nothing started')
+    return spaces
+
+
+def placement(root, space, tab, spaces):
+    """The id of the space for the session: the one named by exact id, else by its one exact name, else the one local
+    space whose folder is root; a tab must be one of that space's."""
+    def named(sp):
+        return f'{sp.get("name")!r} ({sp.get("id")})'
+    if space:
+        hits = [sp for sp in spaces if sp.get('id') == space] or [sp for sp in spaces if sp.get('name') == space]
+        what = f'space {space}'
+    else:
+        hits = [sp for sp in spaces if not sp.get('machine') and isinstance(sp.get('folder'), str)
+                and canonical(sp['folder']) == root]
+        what = f'a space whose folder is {root}'
+    if len(hits) != 1:
+        listed = '; '.join(map(named, hits)) or 'none'
+        raise Refused(f'{what} matches {listed}: name it with --space <id>; nothing started')
+    chosen = hits[0]
+    if chosen.get('machine'):
+        raise Refused(f'space {named(chosen)} is on {chosen["machine"]}: only local sessions start; nothing started')
+    if not isinstance(chosen.get('id'), str) or not chosen['id']:
+        raise Refused(f'space {named(chosen)} has no id; nothing started')
+    if tab and tab not in [t.get('id') for t in chosen.get('tabs') or [] if isinstance(t, dict)]:
+        raise Refused(f'tab {tab} is not in space {named(chosen)}; nothing started')
+    return chosen['id']
+
+
+def terminal_name(root, account, name):
+    """The hc name for the session, <checkout>-<account> by default, never reshaped to fit."""
+    name = name or f'{os.path.basename(root)}-{account}'
+    if not TERMINAL_NAME.fullmatch(name) or ADDRESS.fullmatch(name):
+        raise Refused(f'{name}: hc names are 1-32 of a-z 0-9 - _ . from a letter or digit, never an address such as '
+                      't7; give one with --name; nothing started')
+    try:
+        holder = hc.get(name, timeout=HC_TIMEOUT_S)
+    except hc.Error as e:
+        raise Refused(f'{e}; nothing started') from None
+    if holder and holder.get('state') == 'live':
+        raise Refused(f'{name}: the live terminal {holder.get("address")} has that name; give another with --name; '
+                      'nothing started')
+    return name
+
+
+def verify(address, root):
+    """(verified | pending | failed | unchecked, why) of the session at address, after one bounded hc wait."""
+    hc.run('wait', '--json', '--timeout', str(START_WAIT_S), '--', address, timeout=START_WAIT_S + HC_TIMEOUT_S)
+    try:
+        t = hc.get(address, timeout=HC_TIMEOUT_S)
+    except hc.Error as e:
+        return 'unchecked', str(e)
+    if t is None:
+        return 'failed', 'its terminal is gone'
+    if t.get('state') != 'live':
+        return 'failed', f'its terminal is {t.get("state")}'
+    if ((t.get('status') or {}).get('app')) != CLAUDE_APP:
+        return 'pending', 'not yet a Claude Code session'
+    cwd = canonical((t.get('foreground') or {}).get('cwd'))
+    if not cwd:
+        return 'pending', 'its working directory is not yet known'
+    if cwd != root:
+        return 'failed', f'it runs in {cwd}, not {root}'
+    return 'verified', ''
+
+
+def start(checkout, account='main', space=None, tab=None, name=None, task=None):
+    root = checkout_root(checkout)
+    if task is not None and (not task.strip() or task.startswith('-')):
+        raise Refused('--task must be text that does not start with -; nothing started')
+    argv = launcher(account, task)
+    space_id = placement(root, space, tab, herdr_spaces())
+    name = terminal_name(root, account, name)
+    labels = ['--label', f'herdr.space={space_id}', *(['--label', f'herdr.tab={tab}'] if tab else [])]
+    outcome, body = hc.launch('--bg', '--keep', '--no-parent', '--name', name, '--cwd', root, *labels, '--', *argv,
+                              timeout=HC_TIMEOUT_S)
+    if outcome == hc.NOT_STARTED_OUTCOME:
+        print(f'hc refused, nothing started: {body}', file=sys.stderr)
+        return 1
+    if outcome != hc.STARTED or not hc.is_local(body['address']):
+        why = body if isinstance(body, str) else f'a terminal elsewhere: {body["address"]}'
+        print(f'hc gave no local terminal address, so a session may have started: {why}; check `hc ls` before '
+              'starting again', file=sys.stderr)
+        return 3
+    address = body['address']
+    verification, why = verify(address, root)
+    print(f'started {name} ({address}) in {root} under {account}, space {space_id}'
+          f'{f", tab {tab}" if tab else ", a new tab"}' + (', with its first task' if task else ''))
+    print({'verified': 'verified: a Claude Code session in that checkout',
+           'pending': f'verification pending ({why}): `hc get {address}` shows it once it is up',
+           'failed': f'VERIFICATION FAILED: {why}; close {address} yourself',
+           'unchecked': f'VERIFICATION UNCHECKED: {why}; `hc get {address}` shows whether it is up'}[verification])
+    return {'failed': 1, 'unchecked': 3}.get(verification, 0)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog='claude-start', description=__doc__.split('\n\n')[0],
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('checkout')
+    parser.add_argument('account', nargs='?', default='main', choices=tuple(LAUNCHERS))
+    parser.add_argument('--space')
+    parser.add_argument('--tab')
+    parser.add_argument('--name')
+    parser.add_argument('--task')
+    args = parser.parse_args(argv)
+    try:
+        return start(args.checkout, args.account, args.space, args.tab or None, args.name, args.task)
+    except Refused as e:
+        print(f'claude-start: {e}', file=sys.stderr)
+        return e.code
+
+
+if __name__ == '__main__':
+    sys.exit(main())
