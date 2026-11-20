@@ -362,7 +362,7 @@ if (args.state != null && args.stateRef != null) throw new Error('pass state or 
 const STATE_SCRIPT = `${AGENTRC}/skills/pr-babysit/scripts/state_transfer.py`
 // state_transfer.py's MAX, over its own measure: compact JSON with every non-ASCII UTF-16 unit escaped as \uXXXX.
 const STATE_MAX = 8 * 1024 * 1024
-const stateBytes = (st) => { const s = JSON.stringify(st); return s.length + 5 * (s.match(/[^\x00-\x7e]/g) || []).length }
+const stateBytes = (st) => { const s = JSON.stringify(st); return s.length + 5 * (s.length - s.replace(/[^\x00-\x7e]+/g, '').length) }
 // A state passed inline is one a model typed into the arguments: it keeps the bound a typed copy was given (62c54ae2),
 // measured before a stateRef load fills args.state.
 const INLINE_STATE_MAX = 64 * 1024
@@ -1199,9 +1199,9 @@ const stateOut = () => {
     debt: [...debt].map(([id, d]) => [id, { dismissals: [...d.dismissals], notes: [...d.notes], ...(d.edited ? { edited: d.edited } : {}), ...(d.digest !== undefined ? { digest: d.digest } : {}), ...(d.repair ? { repair: d.repair } : {}), ...(d.attempt ? { attempt: d.attempt } : {}), ...(d.rejudge ? { rejudge: d.rejudge } : {}) }]),
     last: history.length ? Object.fromEntries(CARRIED.filter(k => k in history[history.length - 1]).map(k => [k, history[history.length - 1][k]])) : null,
   }
+  // Measured unsealed, a digest being 8 hex digits whatever it is: only the state kept is sealed.
   const sized = (entries) => {
-    const state = { ...st, ciCache: { ...st.ciCache, entries } }
-    state.digest = sealOf(state)
+    const state = { ...st, ciCache: { ...st.ciCache, entries }, digest: '00000000' }
     return { state, size: stateBytes(state) }
   }
   // A state the loader refuses dead-ends the run; the verdict digests are a cache, recalled or judged again: the oldest
@@ -1221,6 +1221,7 @@ const stateOut = () => {
     out = sized(entries.slice(dropped))
     log(`state: ${bytes} bytes, over the ${STATE_MAX} a launch loads — the ${dropped} oldest of ${entries.length} CI verdict digest(s) left out, judged again by a later launch`)
   }
+  out.state.digest = sealOf(out.state)
   return out
 }
 const findingState = (f) => f.hold ? 'held' : f.deferral ? 'deferred' : f.verdict === 'valid' ? 'valid' : f.verdict === 'stale' ? 'stale' : 'refuted'

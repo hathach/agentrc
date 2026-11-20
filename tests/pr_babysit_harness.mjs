@@ -105,10 +105,11 @@ const chainAudit = (commits = [ADOPT], paths = ['src/adopted.c'], over = {}) => 
     changes: unpublished.length ? [{ sha: commits[commits.length - 1], paths: unpublished }] : [], refusal: '', ...over,
   }
 }
-const adoptionState = ({
+// A state as a launch returns it, unsealed: what a bound test measures before it seals the one it keeps.
+const unsealedState = ({
   maxCycles = 4, cyclesUsed = 1, reviewers = ['coderabbit'], autoRun = reviewers,
   protected: protectedPattern = null, pin = STATE_PIN, ...over
-} = {}) => seal({
+} = {}) => ({
   version: 4, pin: structuredClone(pin), expectedHead: HEAD, reviewClock: null, pending: null,
   config: {
     pr: 3888, reviewers, autoRun, checkoutDir: '.', ciWait: 30,
@@ -118,6 +119,7 @@ const adoptionState = ({
   ciCache: { reruns: [], entries: [] }, debt: [],
   last: cyclesUsed ? { cycle: cyclesUsed, head: HEAD } : null, ...over,
 })
+const adoptionState = (over) => seal(unsealedState(over))
 const adoptionArgs = (state, over = {}) => ({
   reviewers: state.config.reviewers, autoRun: state.config.autoRun,
   maxCycles: state.maxCycles, ciWait: state.config.ciWait,
@@ -2951,7 +2953,7 @@ const largest = (fits, hi) => {
   while (lo < hi) { const mid = Math.ceil((lo + hi) / 2); if (fits(mid)) lo = mid; else hi = mid - 1 }
   return lo
 }
-// A decision whose reason takes `bytes`: one string fills a state toward STATE_REF_MAX at little cost to seal.
+// A decision whose reason takes `bytes`: one string fills a state toward STATE_REF_MAX without thousands of entries to build.
 const padding = (bytes) => ['pad#1', { verdict: 'invalid', reason: 'x'.repeat(bytes) }]
 // n refuted findings, each with its reply: what grows a launch's saved state.
 const refuting = (n, reason) => ({ findings: Array.from({ length: n }, (_, i) => invalidFinding({ commentId: 100 + i, reason })),
@@ -2960,8 +2962,9 @@ const refuting = (n, reason) => ({ findings: Array.from({ length: n }, (_, i) =>
 test('a saved state stays loadable: the oldest CI verdict digests go first, and a state still too large is named', async () => {
   const MAX = STATE_REF_MAX
   // Loaded by stateRef (an inline state stops at 64 KiB), as large as one loads; the launch's refutations then grow it.
-  const bytes = (st) => { const t = JSON.stringify(st); return t.length + 5 * (t.match(/[^\x00-\x7e]/g) || []).length }
-  const fill = (make, hi) => make(largest(n => bytes(make(n)) <= MAX, hi))
+  const bytes = (st) => { const t = JSON.stringify(st); return t.length + 5 * (t.length - t.replace(/[^\x00-\x7e]+/g, '').length) }
+  // Measured unsealed with a stand-in digest of the same length, sealed once.
+  const fill = (make, hi) => seal(make(largest(n => bytes({ ...make(n), digest: '00000000' }) <= MAX, hi)))
   const base = { cyclesUsed: 1, maxCycles: 2 }
   const spent = (state, reviews) => {
     const { state: _, ...args } = adoptionArgs(state, { adoptHead: undefined })
@@ -2969,7 +2972,7 @@ test('a saved state stays loadable: the oldest CI verdict digests go first, and 
   }
   const small = await spent(adoptionState({ ...base, ciCache: { reruns: [], entries: [{ ...cacheFill(1)[0], head: HEAD }] } }), WAITING)
   assert.deepEqual(small.result.state.ciCache.entries, cacheFill(1), 'an entry saved with its head still loads, and is saved without it')
-  const full = fill(n => adoptionState({ ...base, decisions: [padding(MAX - 200000)], ciCache: { reruns: [], entries: cacheFill(n) } }), 5000)
+  const full = fill(n => unsealedState({ ...base, decisions: [padding(MAX - 200000)], ciCache: { reruns: [], entries: cacheFill(n) } }), 5000)
   const entries = full.ciCache.entries
   assert.equal(transferOf(full).error, undefined, 'a state at the bound loads')
   const cached = await spent(full, refuting(20, 'x'.repeat(1000)))
@@ -2984,7 +2987,7 @@ test('a saved state stays loadable: the oldest CI verdict digests go first, and 
   assert.match(transferOf(seal({ ...st, ciCache: { ...st.ciCache, entries: entries.slice(dropped - 1) } })).error, /^state too large/, 'as many as fit')
   // Measured as state_transfer.py measures it: a non-ASCII character is six bytes there.
   const ten = cacheFill(10)
-  const heavy = fill(n => adoptionState({ ...base, ciCache: { reruns: [], entries: ten },
+  const heavy = fill(n => unsealedState({ ...base, ciCache: { reruns: [], entries: ten },
     decisions: Array.from({ length: n }, (_, i) => [`${i}#1`, { verdict: 'invalid', reason: '→'.repeat(300) }]) }), 10000)
   const big = await spent(heavy, refuting(20, '→'.repeat(1000)))
   assert.deepEqual(big.result.state.ciCache.entries, ten, 'none left out when leaving them all out would not fit either')
@@ -3016,10 +3019,11 @@ test('a relaunch from a trimmed state recalls a verdict it kept', async () => {
   const first = await run({ store, args: YIELD, reviews: WAITING, ci: redWith(RIG).ci })
   const st = first.result.state
   // As many older digests as a stateRef loads; this launch's refutations then take the state over the bound.
-  const pad = (n) => seal({ ...st, decisions: [...st.decisions, padding(STATE_REF_MAX - 200000)],
+  // Measured with st's own digest, as long as the one seal gives it.
+  const pad = (n) => ({ ...st, decisions: [...st.decisions, padding(STATE_REF_MAX - 200000)],
     ciCache: { ...st.ciCache, entries: [...cacheFill(n, 1000), ...st.ciCache.entries] } })
   const lo = largest(n => JSON.stringify(pad(n)).length <= STATE_REF_MAX, 5000)
-  const padded = pad(lo)
+  const padded = seal(pad(lo))
   const trimmed = await run({ store, args: { ...YIELD, stateRef: { outputFile: '/tmp/tasks/w1.output', digest: padded.digest } }, load: padded,
     reviews: refuting(20, 'x'.repeat(1000)), ci: redWith(RIG).ci })
   const kept = trimmed.result.state.ciCache.entries
