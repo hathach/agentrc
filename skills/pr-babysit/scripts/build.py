@@ -24,10 +24,13 @@ facts.sealed): revision is HEAD, command with <BUILD> expanded, setup and
 requires as given ('' and [] without them), exit the shell's status,
 retained what cleanup had to leave behind. usageError is the line a command
 that refused its own arguments printed, else null: one that exited 2 in the
-build step and opened its output with argparse's `usage:` or an `error:` of its
-own (`error: ...` or `<prog>: error: ...`, as a check_build.py's refusal of
-`--worktree` without `--base`), or with Python's `can't open file`; it built
-nothing, so its failure says nothing of the change (#557).
+build step and opened its output with argparse's `usage:` (its `<prog>: error:`
+line reported when it printed one) or Python's `can't open file`, or printed an
+`error:` line (`error: ...` or `<prog>: error: ...`) naming one of the
+command's own options, as check_build.py's `error: --worktree needs --base`
+for `--worktree`; it built nothing, so its failure says nothing of the change
+(#557). A compiler's `error:`, such as rustc's or `clang: error: no such
+file`, names no option of the command and is the build's.
 Exit 0 with that line, whatever the build did; exit 2 with {"error": ...} when
 the build could not be set up, naming anything cleanup had to leave behind.
 
@@ -66,6 +69,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
+from commits import bounded  # noqa: E402
 from facts import Parser, Unusable, checkout_top, git, report  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
@@ -82,11 +86,10 @@ PR_SET_CHILD_SUBREAPER = 36  # prctl(2)
 # The line the shell prints as the build step starts: what follows is the command's own output.
 BUILD_MARK = '--- pr-babysit build.py: build ---'
 USAGE_EXIT = 2  # argparse's, and Python's for a script it cannot open
-# How a command refusing its arguments opens its output; its error line is reported over a `usage:` one.
-USAGE_ERROR = re.compile(r"(?:[\w.-]+: )?error: |.+: can't open file '")
-USAGE_OPEN = re.compile(f'usage: |{USAGE_ERROR.pattern}')
-USAGE_LINES = 20  # how far into the output the error form of a usage error is looked for
-USAGE_CHARS = 300
+USAGE_ERROR = re.compile(r'(?:[\w.-]+: )?error: ')
+NO_SCRIPT = re.compile(r".+: can't open file '")
+OPTION = re.compile(r'(?<!\S)--?[A-Za-z][\w-]*')  # a command's `-x` or `--xx` word, short of any `=value`
+USAGE_LINES = 20  # how far into the output a usage error's `error:` line is looked for
 
 
 def script(setup, requires, command):
@@ -99,17 +102,23 @@ def script(setup, requires, command):
             mark('prerequisite') + tools + mark('build') + f'echo {shlex.quote(BUILD_MARK)}\n' + command + '\n')
 
 
-def usage_error(log, stage, build_exit):
-    """The line a command refusing its own arguments printed in log, else None."""
+def usage_error(log, stage, build_exit, command):
+    """The line command printed in log refusing its own arguments, else None."""
     if stage != 'build' or build_exit != USAGE_EXIT:
         return None
     lines = Path(log).read_text(encoding='utf-8', errors='replace').splitlines()
     # the header shows the marker only inside its `$ echo` line
     printed = lines[lines.index(BUILD_MARK) + 1:] if BUILD_MARK in lines else []
-    out = [t for t in (''.join(c if c.isprintable() else ' ' for c in line).strip() for line in printed) if t]
-    if not out or not USAGE_OPEN.match(out[0]):
+    out = [t for t in (bounded(line).strip() for line in printed) if t]
+    if not out:
         return None
-    return next((t for t in out[:USAGE_LINES] if USAGE_ERROR.match(t)), out[0])[:USAGE_CHARS]
+    errors = [t for t in out[:USAGE_LINES] if USAGE_ERROR.match(t)]
+    if out[0].startswith('usage: '):
+        return next(iter(errors), out[0])
+    if NO_SCRIPT.match(out[0]):
+        return out[0]
+    options = set(OPTION.findall(command))
+    return next((t for t in errors if any(re.search(rf'(?<![\w-]){re.escape(o)}(?![\w-])', t) for o in options)), None)
 
 
 def snapshot(paths):
@@ -181,7 +190,7 @@ def finish(b, build_exit):
         if stage not in STAGES:
             raise Unusable(f'the build shell left no stage: {stage!r}')
         after = snapshot(b['paths'])
-        usage = usage_error(b['log'], stage, build_exit)
+        usage = usage_error(b['log'], stage, build_exit, b['command'])
     except (Unusable, OSError) as e:
         fail(b, e)
     return {'revision': b['revision'], 'snapshot': b['snapshot'], 'snapshotAfter': after, 'command': b['command'],

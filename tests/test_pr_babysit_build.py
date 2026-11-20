@@ -166,10 +166,16 @@ class BuildTest(unittest.TestCase):
     def test_a_command_refusing_its_own_arguments_is_told_from_a_failed_build(self):
         # #557: check_build.py's refusal of --worktree without --base failed every candidate as a broken build.
         py = shlex.quote(Path(sys.executable).as_posix())
+        (self.repo / 'check_build.py').write_text(
+            'import sys\n'
+            'if "--worktree" in sys.argv and "--base" not in sys.argv:\n'
+            '    print("\\x1b[31merror:\\x1b[0m" if "--color" in sys.argv else "error:", "--worktree needs --base", file=sys.stderr)\n'
+            '    print(\'{"pass": false, "boards": [], "error": "--worktree needs --base"}\')\n'
+            '    sys.exit(2)\n')
         parse = 'import argparse; p = argparse.ArgumentParser(prog="check_build.py"); p.add_argument("--base", required=True); p.parse_args()'
         for command, usage in (
-            ('echo "error: --worktree needs --base" >&2; echo \'{"pass": false, "error": "--worktree needs --base"}\'; exit 2',
-             'error: --worktree needs --base'),
+            (f'{py} check_build.py --scope src.c --worktree', 'error: --worktree needs --base'),
+            (f'{py} check_build.py --scope src.c --worktree --color', 'error: --worktree needs --base'),
             (f'{py} -c {shlex.quote(parse)} --scope src.c', 'check_build.py: error: the following arguments are required: --base'),
             (f'{py} no_such_check_build.py --scope src.c', ": can't open file '"),
         ):
@@ -177,7 +183,12 @@ class BuildTest(unittest.TestCase):
                 code, out = self.run_script('--path=.', '--setup=echo "error: setup says so"', '--command', command)
                 self.assertEqual((code, out['stage'], out['exit']), (0, 'build', 2), out)
                 self.assertIn(usage, out['usageError'])
-        for command, exit in (('echo "src.c:1:5: error: expected ;"; exit 2', 2), ('echo "error: x"; exit 1', 1),
+                self.assertTrue(out['usageError'].isprintable(), out['usageError'])
+        # a compiler's error names none of the command's options: make -s exits 2 on rustc's or clang's
+        for command, exit in (('f() { echo "error: this file contains an unclosed delimiter" >&2; return 2; }; f -s', 2),
+                              ("f() { echo \"clang: error: no such file or directory: 'src/new.c'\" >&2; return 2; }; f -c src/new.c", 2),
+                              ('f() { echo "gcc: error: x.c: No such file or directory" >&2; return 2; }; f -o x x.c', 2),
+                              ('echo "src.c:1:5: error: expected ;"; exit 2', 2), ('echo "error: x"; exit 1', 1),
                               ('echo "[ 1%] Building src.c"; echo "error: x"; exit 2', 2), ('exit 2', 2), ('true', 0)):
             with self.subTest(command):
                 code, out = self.run_script('--path=.', '--setup=echo "error: setup says so"', '--command', command)
