@@ -346,7 +346,8 @@ for (const x of [...pool, ...confirmedClaims.filter(c => c.path)]) onFile.set(x.
 const asked = new Set(discussion ? [] : [...onFile].filter(([, xs]) => xs.length > 1).map(([p]) => p))
 const groupPrompt = (
   'Group the review findings and thread claims below that describe the SAME defect in the same code: one group per defect, at least two members, only groups you are sure of. ' +
-  'An item belongs to a group only if its whole substance is that defect: a finding or claim that also raises another problem stays out. Items about different variants belong together only when the path and the fix are the same.\n' +
+  'An item belongs to a group only if its whole substance is that defect: a finding or claim that also raises another problem stays out. Items about different variants belong together only when the path and the fix are the same. ' +
+  'Every member of a group is on one file: items on different files are never one group, even with one cause (a header and its missing test).\n' +
   `Findings: ${JSON.stringify(pool.map((f, i) => ({ finding: i, file: f.file, line: f.line, dimension: f.dimension, why: whyOf(f) })).filter(f => asked.has(f.file)))}\n` +
   `Claims: ${JSON.stringify(confirmedClaims.filter(c => asked.has(c.path)).map(c => ({ claim: c.claimId, path: c.path, line: c.line, text: c.claim })))}`)
 // An item named twice, or an index or id that names nothing, is a grouping to distrust whole. A group of one, one across

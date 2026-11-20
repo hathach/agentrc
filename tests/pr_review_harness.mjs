@@ -667,6 +667,9 @@ test('a grouping that names an item twice or nothing is distrusted whole; a grou
     assert.ok(!labels.includes('group:retry'), 'a well-formed answer is not asked again')
     assert.ok(logs.includes(`1 group(s) dropped, their items left ungrouped: ${JSON.stringify([off])}`))
   }
+  const clean = await run(BASE, { audit: three, group: { groups: [{ findings: [0, 1], claims: [] }] } })
+  assert.match(clean.calls.find(c => c.label === 'group').prompt, /items on different files are never one group/, 'the first judgment is told the one-file rule')
+  assert.deepEqual([clean.result.coverage.unjudged, clean.labels.includes('group:retry')], [[], false], 'a grouping within the rule is judged whole')
   const dead = await run(BASE, { audit: two, group: null })
   assert.deepEqual([dead.result.draft.comments.length, dead.result.verdict.event], [3, 'REQUEST_CHANGES'])
   const odd = await run(BASE, { audit: audited({ ...finding('a'), file: 'constructor' }, { ...finding('b'), file: 'constructor' }),
