@@ -39,6 +39,10 @@ A core's profile (an Arduino platform checkout, e.g. adafruit:samd) adds these, 
                         .all.test.skip / .<filters>.test.skip / .<filters>.test.only markers its build_all.py reads
                         (honoured in a library too)
   fqbn(board, example)  the FQBN a sketch builds with on `board` (default the board's): one rig board, two menus
+  SOURCE_DIRS           path prefixes where an untracked file refuses a HIL record, as it would be missing from the
+                        record's patch (a library: src/, examples/, test/hil/; a core: its whole tree)
+
+PLATFORM picks the mechanics, Library or Core (M()); the rest of this file never tests the mode.
 
 PROFILE_API is the profile interface the three engines implement; a library's bootstrap refuses any other unloaded.
 PROFILE_FEATURES names the additive capabilities a bootstrap may require of these engines ('core': core mode,
@@ -108,6 +112,12 @@ def bind(profile):
         raise RuntimeError(f'{profile.ROOT}: HIL_SKETCHES: {"; ".join(problems)}')
     P = profile
     return sys.modules[__name__]
+
+
+def M():
+    """The bound profile's mechanics: Core for an Arduino platform checkout (it sets PLATFORM), else Library. Every
+    place the two differ asks this; nothing else tests the mode."""
+    return Core if getattr(P, 'PLATFORM', None) else Library
 
 
 NAMED_ID = re.compile(r'[A-Za-z0-9_][A-Za-z0-9_.+-]*')   # one build dir under <root>/<board>/, never . or .. or hidden
@@ -215,10 +225,6 @@ def rel(path):
 
 # ---- examples and ci-arduino's filters
 
-def core_mode():
-    return bool(getattr(P, 'PLATFORM', None))
-
-
 def sketch_roots():
     return tuple(getattr(P, 'SKETCH_ROOTS', ('examples',)))
 
@@ -239,19 +245,12 @@ def examples():
 
 
 @functools.lru_cache(maxsize=None)
-def _eligible(root, platform, example, core):
-    """ci-arduino's markers, or a core's tools/build_all.py ones (adafruit SAMD and nRF52): .all.test.skip in place
-    of .skip.txt."""
+def _eligible(root, platform, example, skipped):
+    """ci-arduino's markers, or a core's tools/build_all.py ones (adafruit SAMD and nRF52): `skipped` is the
+    mechanics' own skip marker check (.skip.txt, or .all.test.skip in its place)."""
     folder = root / example
-    if (folder / f'.{platform}.test.skip').exists():
+    if (folder / f'.{platform}.test.skip').exists() or skipped(folder, platform):
         return False
-    if core:
-        if (folder / '.all.test.skip').exists():
-            return False
-    else:
-        skip_txt = folder / '.skip.txt'
-        if skip_txt.exists() and any(line.strip() == platform for line in skip_txt.read_text().splitlines()):
-            return False
     if any(folder.glob('.*.test.only')):
         return (folder / f'.{platform}.test.only').exists()
     return True
@@ -264,7 +263,7 @@ def eligible(board, example):
     if not is_example(example):
         return 'span' in P.BOARDS[board] and example in hil_sketches(board)
     exclude = getattr(P, 'exclude', None)
-    return (_eligible(P.ROOT, P.BOARDS[board].get('filters', board), example, core_mode())
+    return (_eligible(P.ROOT, P.BOARDS[board].get('filters', board), example, M().skipped)
             and not (exclude and exclude(board, example)))
 
 
@@ -311,12 +310,12 @@ def example_of(path):
 
 
 def classify(path):
-    """(effect, detail, reason) for one changed path, first match wins: in a core an example sketch's own files, the
-    profile's source rules, then the common ones. effect: family | shared | boards | sketches | example | hil_sketch |
+    """(effect, detail, reason) for one changed path, first match wins: an example sketch's own files, the profile's
+    source rules, then the common ones. effect: family | shared | boards | sketches | example | hil_sketch |
     tests | fixture | hil | nothing | uncovered; `boards` builds every eligible sketch on the boards its detail names,
     `sketches` the sketch dirs its detail names on every representative."""
     ex = example_of(path)
-    if core_mode() and ex:
+    if ex:
         return 'example', ex, 'example sketch'
     own = P.classify_source(path)
     if own:
@@ -326,8 +325,6 @@ def classify(path):
     if path.startswith('src/'):
         return 'shared', None, 'shared library code'
     if is_example(path):
-        if ex:
-            return 'example', ex, 'example sketch'
         if path.endswith(('.md', '.txt', '.js', '.json', '.py', '.html')):
             return 'nothing', None, 'example documentation or host-side helper'
         return 'uncovered', None, 'under examples/ but in no sketch dir'
@@ -504,14 +501,16 @@ def load_roster(path):
 # ---- dependencies
 
 def depends(props_path):
-    """A library.properties' `depends=` names, version constraints dropped."""
+    """A library.properties' `depends=` names, version constraints dropped; none when there is no such file."""
+    if not Path(props_path).is_file():
+        return []
     m = re.search(r'^depends=(.*)$', Path(props_path).read_text(errors='replace'), re.M)
     return [n for n in (re.sub(r'\s*\(.*\)\s*$', '', d).strip() for d in (m.group(1).split(',') if m else [])) if n]
 
 
 def declared_dependencies():
     """library.properties `depends=` (a core has none) plus the profile's EXTRA_DEPENDENCIES, in order."""
-    own = [] if core_mode() else depends(P.ROOT / 'library.properties')
+    own = M().own_depends()
     return list(dict.fromkeys([*own, *P.EXTRA_DEPENDENCIES]))
 
 
@@ -583,7 +582,7 @@ def prepared_dependencies():
         lib = item.get('library', {})
         if lib.get('location') == 'user' and lib.get('name'):
             installed.setdefault(lib['name'], lib)
-    own = bundled_libraries(str(P.ROOT)) if core_mode() else {}
+    own = M().own_bundled()
     order, missing, todo, seen_own = [], [], declared_dependencies(), set()
     while todo:
         name = todo.pop(0)
@@ -598,16 +597,12 @@ def prepared_dependencies():
             missing.append(name)
             continue
         order.append(name)
-        props = Path(installed[name]['install_dir']) / 'library.properties'
-        todo += depends(props) if props.is_file() else []
+        todo += depends(Path(installed[name]['install_dir']) / 'library.properties')
     if missing:
         fail(f'dependencies not installed: {missing}',
              remedy='arduino-cli lib install ' + ' '.join(f'"{n}"' for n in missing))
     prepared = {n: _lib_identity(installed[n]) for n in order}
-    if core_mode():
-        return prepared
-    bundled = core_bundled_names()
-    for n in sorted(set(installed) & bundled - set(order) - {P.LIBRARY_NAME}):
+    for n in M().shadow_candidates(installed, order):
         prepared[n] = {**_lib_identity(installed[n]), 'shadowOnly': True}
     return prepared
 
@@ -671,6 +666,89 @@ def unexplained_libraries(used, prepared, platform_dirs):
     return bad, shadows
 
 
+# ---- the two mechanics (M() picks one)
+
+def _skip_listed(folder, platform):
+    skip_txt = folder / '.skip.txt'
+    return skip_txt.exists() and any(line.strip() == platform for line in skip_txt.read_text().splitlines())
+
+
+class Library:
+    """An Arduino library checkout: identified by library.properties, compiled with `--library ROOT` against the
+    user's environment, so a core's bundled copy of a dependency may be shadowed by a user copy, and a header from
+    another copy of the library is a warning."""
+    IDENTITY_FILE = 'library.properties'
+    ISOLATED = False      # no private arduino-cli config: compile_sketch reaches the checkout with --library
+    FOREIGN_FAILS = False
+    SOURCE_DIRS = SOURCE_DIRS   # an untracked file here would be missing from a record's patch
+
+    @staticmethod
+    def skipped(folder, platform):
+        return _skip_listed(folder, platform)
+
+    @staticmethod
+    def own_depends():
+        return depends(P.ROOT / 'library.properties')
+
+    @staticmethod
+    def own_bundled():
+        return {}
+
+    @staticmethod
+    def shadow_candidates(installed, order):
+        """User copies of libraries a core bundles, beyond the declared ones: prepared `shadowOnly`."""
+        return sorted(set(installed) & core_bundled_names() - set(order) - {P.LIBRARY_NAME})
+
+    @staticmethod
+    def not_this_checkout(platform, build_platform, used_libs):
+        used = [lib for lib in used_libs if lib.get('name') == P.LIBRARY_NAME]
+        if not used or Path(used[0]['install_dir']).resolve() != P.ROOT:
+            return f'{P.LIBRARY_NAME} came from {used[0]["install_dir"] if used else "nowhere"}, not this checkout'
+        return None
+
+    @staticmethod
+    def build_key(example):
+        return Path(example).name
+
+
+class Core:
+    """An Arduino platform checkout (the profile sets PLATFORM): identified by platform.txt, compiled through an
+    isolated sketchbook linking to ROOT (cli_env), its bundled libraries its own; a header from another copy of the
+    core fails the sketch, since the isolated environment reaches none."""
+    IDENTITY_FILE = 'platform.txt'
+    ISOLATED = True
+    FOREIGN_FAILS = True
+    SOURCE_DIRS = ('',)   # a core's whole tree is its source
+
+    @staticmethod
+    def skipped(folder, platform):
+        return (folder / '.all.test.skip').exists()
+
+    @staticmethod
+    def own_depends():
+        return []
+
+    @staticmethod
+    def own_bundled():
+        return bundled_libraries(str(P.ROOT))
+
+    @staticmethod
+    def shadow_candidates(installed, order):
+        return []
+
+    @staticmethod
+    def not_this_checkout(platform, build_platform, used_libs):
+        wrong = [f'{p.get("id")} from {p.get("install_dir")}' for p in (platform, build_platform)
+                 if not p.get('install_dir') or Path(p['install_dir']) != P.ROOT]
+        return f'the platform came from {wrong}, not this checkout' if wrong else None
+
+    @staticmethod
+    def build_key(example):
+        """Bundled libraries share example names: an example keys on its whole path (HIL sketches keep the basename
+        the record keys on)."""
+        return example.replace('/', '--') if is_example(example) else Path(example).name
+
+
 # ---- build
 
 def tool_version():
@@ -683,7 +761,7 @@ def foreign_headers(deps, cores=()):
     match and whether it lies in one of the build's `cores`."""
     found, roots = {}, {}
     for token in deps:
-        p = Path(os.path.realpath(token)) if core_mode() else Path(token)   # the sketchbook links to ROOT
+        p = Path(os.path.realpath(token))   # a core's isolated sketchbook links to ROOT
         if P.ROOT in p.parents:
             continue
         root = library_root(p, roots)
@@ -757,7 +835,7 @@ def library_root(path, cache):
             root = cache[parent]
             break
         walked.append(parent)
-        props = parent / ('platform.txt' if core_mode() else 'library.properties')
+        props = parent / M().IDENTITY_FILE
         if props.exists():
             name = re.search(r'^name=(.*)$', props.read_text(errors='replace'), re.M)
             root = parent if name and name.group(1).strip() == P.LIBRARY_NAME else None
@@ -875,20 +953,13 @@ def compile_sketch(board, example, build_dir, properties, prepared, config=None)
     used_libs = result.get('used_libraries', [])
     platform = result.get('board_platform') or {}
     build_platform = result.get('build_platform') or {}
-    if core_mode():
-        wrong = [f'{p.get("id")} from {p.get("install_dir")}' for p in (platform, build_platform)
-                 if not p.get('install_dir') or Path(p['install_dir']).resolve() != P.ROOT]
-        if wrong:
-            row.update(status='failed', firstError=f'the platform came from {wrong}, not this checkout')
-            return row
-        platform = {**platform, 'install_dir': str(P.ROOT)}
-        build_platform = {**build_platform, 'install_dir': str(P.ROOT)}
-    else:
-        used = [lib for lib in used_libs if lib.get('name') == P.LIBRARY_NAME]
-        if not used or Path(used[0]['install_dir']).resolve() != P.ROOT:
-            row.update(status='failed', firstError=f'{P.LIBRARY_NAME} came from '
-                       f'{used[0]["install_dir"] if used else "nowhere"}, not this checkout')
-            return row
+    # a core's platform is reported through the isolated sketchbook's link to ROOT: name the dir it resolves to
+    platform, build_platform = ({**p, 'install_dir': os.path.realpath(p['install_dir'])} if p.get('install_dir')
+                                else p for p in (platform, build_platform))
+    wrong = M().not_this_checkout(platform, build_platform, used_libs)
+    if wrong:
+        row.update(status='failed', firstError=wrong)
+        return row
     cores = [platform.get('install_dir'), build_platform.get('install_dir')]
     bad, shadows = unexplained_libraries(used_libs, prepared, cores)
     if bad:
@@ -905,7 +976,7 @@ def compile_sketch(board, example, build_dir, properties, prepared, config=None)
         shutil.copy2(boot_app0, build_dir / boot_app0.name)
     deps = dep_paths(build_dir)
     headers = foreign_headers(deps, cores)
-    if core_mode() and headers:   # the isolated environment reaches no other copy: one leaking in fails the sketch
+    if M().FOREIGN_FAILS and headers:
         row.update(status='failed', foreignHeaders=headers,
                    firstError=f'compiled against another copy of the core: {[h["path"] for h in headers][:3]}')
         return row
@@ -922,7 +993,7 @@ def compile_sketch(board, example, build_dir, properties, prepared, config=None)
 def build_key(example):
     """The build dir name of a sketch under <root>/<board>/: its basename, or in a core, whose bundled libraries
     share example names, its whole path for an example (HIL sketches keep the basename the record keys on)."""
-    return example.replace('/', '--') if core_mode() and is_example(example) else Path(example).name
+    return M().build_key(example)
 
 
 def basename_clashes(plan):
@@ -1484,7 +1555,7 @@ def _main(argv, resources):
         if before['dirty'] and not args.experimental:
             fail('a HIL record needs a clean tree (commit first), or --experimental', dirty=before['status'])
         untracked = [ln[3:] for ln in before['status'].splitlines() if ln.startswith('?? ') and
-                     (core_mode() or ln[3:].startswith(SOURCE_DIRS))]   # a core's whole tree is its source
+                     ln[3:].startswith(getattr(P, 'SOURCE_DIRS', M().SOURCE_DIRS))]
         if untracked:
             fail(f'untracked source would be missing from the record patch: {untracked}')
         stale = submodule_problems(before)
@@ -1501,7 +1572,7 @@ def _main(argv, resources):
             resources.enter_context(build_lock(shared / '.lock'))
         except BlockingIOError:
             fail(f'{rel(shared)} is in use by another build or HIL run (its .lock is held)')
-    cli_dir = build_root / f'.arduino-cli-{os.getpid()}' if core_mode() and any(sel['builds'].values()) else None
+    cli_dir = build_root / f'.arduino-cli-{os.getpid()}' if M().ISOLATED and any(sel['builds'].values()) else None
     try:
         config = cli_env(cli_dir, prepared) if cli_dir else None
         rows = build_all(args.jobs, sel['builds'], root, args.build_property, prepared, config)

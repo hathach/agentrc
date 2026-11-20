@@ -138,7 +138,7 @@ changes from a library:
 - **Sketches** are every `*.ino` dir under `SKETCH_ROOTS` (the bundled libraries, `extras/` included, as a core's
   `tools/build_all.py` scans), eligible by that script's `.all.test.skip` / `.<platform>.test.skip` /
   `.<platform>.test.only` markers and the profile's `exclude()`; they build under their path, since bundled libraries
-  share example names. A changed sketch file selects that sketch before the profile's rules.
+  share example names. A changed sketch file selects that sketch before the profile's rules (in a library too).
 - **Selection** adds two effects for `classify_source`: `boards` (every eligible sketch on the named boards, e.g. a
   `boards.txt` or `platform.txt` change on CI's matrix) and `sketches` (the named sketches on every representative,
   e.g. a bundled library's source).
@@ -150,7 +150,8 @@ changes from a library:
   that is no plain file name, an id listed twice in a role and one defined two ways across roles.
 - **Identity**: a record also binds the submodules (`git submodule status --recursive`) and refuses one that is not
   initialised, not at its gitlink or dirty (each one's own worktree, at any depth, whatever its `ignore` setting),
-  `--experimental` included: a record's patch carries no submodule bytes. A record also refuses any untracked file.
+  `--experimental` included: a record's patch carries no submodule bytes. A record also refuses any untracked file
+  (a library: under `src/`, `examples/` or `test/hil/`; either can set its own `SOURCE_DIRS`).
   Foreign headers are those from another copy of the core (by `platform.txt` `name=`).
 - **Base image** (feature `base`): a rig board whose sketches run only above other firmware (an nRF52's MBR,
   SoftDevice, bootloader and its settings) names those HEX files as `BOARDS[...]['base']`, with the address ranges

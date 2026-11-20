@@ -147,6 +147,65 @@ class Binding(Lib):
         self.assertTrue(json.loads(out.getvalue())['pass'])
 
 
+class Mechanics(Lib):
+    """#455: PLATFORM picks Library or Core once (M()); what does not depend on the mode is the same in both."""
+
+    def test_only_M_reads_the_mode(self):
+        import ast
+        tree = ast.parse(Path(ab.__file__).read_text())
+        readers = {fn.name for fn in ast.walk(tree) if isinstance(fn, ast.FunctionDef)
+                   for n in ast.walk(fn) if isinstance(n, ast.Constant) and n.value == 'PLATFORM'}
+        self.assertEqual(readers, {'M'})
+        self.assertIs(ab.M(), ab.Library)
+        self.patch(ab, 'P', fake.core_profile(fake.core(self.tmp / 'core'), self.agentrc))
+        self.assertIs(ab.M(), ab.Core)
+
+    def test_an_example_file_classifies_as_its_example_before_the_profile_rules(self):
+        self.patch(self.P, 'classify_source', lambda path: ('shared', None, 'everything'))
+        self.assertEqual(ab.classify('examples/Basic/echo/echo.ino')[:2], ('example', 'examples/Basic/echo'))
+        self.assertEqual(ab.classify('src/x.c')[:2], ('shared', None))
+
+    def test_depends_of_a_missing_file_is_none(self):
+        self.assertEqual(ab.depends(self.tmp / 'nowhere' / 'library.properties'), [])
+
+    def test_a_header_reached_through_a_link_into_the_checkout_is_not_foreign(self):
+        link = self.tmp / 'linked'
+        link.symlink_to(self.root, target_is_directory=True)
+        build = self.tmp / 'b'
+        build.mkdir()
+        (build / 'main.cpp.d').write_text(f'main.cpp.o: {link / "src/fake.h"}\n')
+        self.assertEqual(ab.foreign_headers(ab.dep_paths(build)), [])
+
+    def test_the_platform_dir_is_recorded_as_the_dir_it_resolves_to(self):
+        core = self.tmp / 'real core'
+        core.mkdir()
+        (self.tmp / 'core link').symlink_to(core, target_is_directory=True)
+        proc = cli_compile([{'name': fake.NAME, 'install_dir': str(self.root)}], 'x:y', '1.0',
+                           str(self.tmp / 'core link'), str(self.tmp / 'core link'))
+        with mock.patch.object(ab.subprocess, 'run', return_value=proc), \
+                mock.patch.object(ab, 'foreign_headers', return_value=[]):
+            row = ab.compile_sketch('rig_ocd', 'examples/Basic/echo', self.root / 'build/x', [], {})
+        self.assertEqual(row['status'], 'ok', row)
+        self.assertEqual((row['platform']['install_dir'], row['buildPlatform']['install_dir']), (str(core),) * 2)
+
+    def test_a_profile_may_widen_the_untracked_source_scope(self):
+        argv = ['--board', 'rig_jlink', '--shared', '--hil-config', str(self.root / 'test/hil/ci.json'), '--record',
+                str(self.root / 'build/hil/rig_jlink.build.json'), '--experimental']
+        fake.roster(self.root / 'test/hil/ci.json')
+        ident = {'head': 'abc', 'dirty': True, 'diffSha256': 'd', 'status': '?? tools/gen.py\n'}
+        self.patch(ab, 'source_identity', lambda: (ident, ''))
+        self.patch(ab, 'submodule_problems', lambda before: [])
+        self.patch(ab, 'prepared_dependencies', lambda: {})
+        self.patch(ab, 'build_all', lambda *a, **k: [])
+        self.patch(ab, 'make_record', lambda *a: (None, 'stopped at the record'))
+        code, out = self.run_main(argv)
+        self.assertEqual(out['firstError'], 'stopped at the record')
+        self.P.SOURCE_DIRS = ('src/', 'tools/')   # a fresh profile per test
+        code, out = self.run_main(argv)
+        self.assertEqual(code, 2)
+        self.assertIn("untracked source would be missing from the record patch: ['tools/gen.py']", out['error'])
+
+
 class Selection(Lib):
     def test_rules(self):
         cases = {
