@@ -108,6 +108,11 @@ def fork_child(body, timeout=10):
     return os.waitstatus_to_exitcode(done[1])
 
 
+# Prefixed to every -c script run as root: it fails at once when the child may write bytecode,
+# whatever the cache holds (root rewrites nothing when a user-owned .pyc is already current).
+NO_BYTECODE = "import sys\nassert sys.flags.dont_write_bytecode, 'root child runs without -B'\n"
+
+
 def assert_no_root_cache(test):
     """Python run as root under `sudo -n` from a user's checkout must not write bytecode into it
     (`-I` does not stop that; `-B` does): a root-owned __pycache__ blocks `git worktree remove`."""
@@ -4019,7 +4024,7 @@ class Pending(LockDir):
         ours = hil_lock.PendingSessions(BOARD, 'selftest')
         ours.add([{'receipt': 'ours'}])
         before = Path(ours.path).read_bytes()
-        r = subprocess.run([*argv, '-B', '-I', '-c', PENDING_AS, str(SCRIPT), shared, BOARD, '65534'],
+        r = subprocess.run([*argv, '-B', '-I', '-c', NO_BYTECODE + PENDING_AS, str(SCRIPT), shared, BOARD, '65534'],
                            capture_output=True, text=True, timeout=30)
         self.assertEqual(r.returncode, 0, r.stderr)
         assert_no_root_cache(self)
@@ -4158,7 +4163,7 @@ class CrossUserRelease(LockDir):
                 return json.loads(json.dumps(['released', hil_lock.release_token(token)]))
             except hil_lock.ReleaseRefused as e:
                 return ['refused', str(e)]
-        r = subprocess.run(['sudo', '-n', sys.executable, '-B', '-I', '-c', RELEASE_AS_ROOT, str(SCRIPT),
+        r = subprocess.run(['sudo', '-n', sys.executable, '-B', '-I', '-c', NO_BYTECODE + RELEASE_AS_ROOT, str(SCRIPT),
                             hil_lock.BOARD_LOCK_DIR, token], capture_output=True, text=True, timeout=30)
         self.assertEqual(r.returncode, 0, r.stderr)
         assert_no_root_cache(self)
