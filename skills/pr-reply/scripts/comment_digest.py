@@ -27,7 +27,8 @@ TAIL = re.compile(
     r'|Confirmed as addressed by @[A-Za-z0-9-]+(?:\[bot\])?))'
     r'(?P<again>\n\n' + EITHER + r')?)?\Z')
 # hathach/agentrc#556's summary comment, 42 saved versions: what changed there with no finding changing.
-WALKTHROUGH = re.compile(r'\A\s*(?:<!--(?:(?!-->).)*-->\s*)*?<!-- This is an auto-generated comment: summarize by coderabbit\.ai -->', re.S)
+SUMMARY = '<!-- This is an auto-generated comment: summarize by coderabbit.ai -->'
+WALKTHROUGH = re.compile(r'\A\s*(?:<!--(?:(?!-->).)*-->\s*)*?' + re.escape(SUMMARY), re.S)
 CHROME = re.compile(
     r'(?:<!-- This is an auto-generated comment: (?!summarize )(?P<notice>[^>]*?) by coderabbit\.ai -->.*?'
     r'<!-- end of auto-generated comment: (?P=notice) by coderabbit\.ai -->'
@@ -41,10 +42,15 @@ def sha12(text):
     return hashlib.sha256(text.encode()).hexdigest()[:12]
 
 
+def walkthrough(body):
+    """Whether body is CodeRabbit's summary comment, under any leading markers."""
+    return bool(WALKTHROUGH.match(body or ''))
+
+
 def forms(body, author):
     """The body's forms, its first one first; only the body itself when it has no other."""
     body = body or ''
-    if author == CODERABBIT and WALKTHROUGH.match(body):
+    if author == CODERABBIT and walkthrough(body):
         return list(dict.fromkeys((PREVIOUS.sub(r'\1up to \2', CHROME.sub('', body)), body)))
     m = TAIL.search(body) if author == CODERABBIT else None
     if not m:

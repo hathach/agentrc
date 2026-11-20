@@ -277,11 +277,13 @@ class SettleRules(unittest.TestCase):
 
     def test_only_coderabbits_walkthrough_issue_comment_loses_its_body(self):
         rabbit = 'coderabbitai[bot]'
-        walk = harvest.CR_WALKTHROUGH + '\n<!-- walkthrough_start -->\n## Walkthrough\nsequence diagrams\n<!-- walkthrough_end -->'
-        got = harvest.entry('issue', {'id': 5, 'user': {'login': rabbit}, 'html_url': 'u/5'}, 'coderabbit', walk, 't', 't')
-        self.assertEqual((got['body'], got['bodyOmitted'], got['bodyLength']), (None, 'coderabbit-walkthrough', len(walk)))
-        self.assertEqual([got['digest'], *got.get('aliases', [])], harvest.comment_digest.digests(walk, rabbit), 'the real body\'s digest')
-        self.assertEqual((got['commentId'], got['url'], got['kind'], got['source']), (5, 'u/5', 'issue', 'coderabbit'))
+        # CodeRabbit has opened its walkthrough with a version marker since 2026-11
+        for lead in ('', '<!-- coderabbit-ai-generated:v1 -->\n\n'):
+            walk = lead + harvest.CR_WALKTHROUGH + '\n<!-- walkthrough_start -->\n## Walkthrough\nsequence diagrams\n<!-- walkthrough_end -->'
+            got = harvest.entry('issue', {'id': 5, 'user': {'login': rabbit}, 'html_url': 'u/5'}, 'coderabbit', walk, 't', 't')
+            self.assertEqual((got['body'], got['bodyOmitted'], got['bodyLength']), (None, 'coderabbit-walkthrough', len(walk)), lead)
+            self.assertEqual([got['digest'], *got.get('aliases', [])], harvest.comment_digest.digests(walk, rabbit), 'the real body\'s digest')
+            self.assertEqual((got['commentId'], got['url'], got['kind'], got['source']), (5, 'u/5', 'issue', 'coderabbit'))
         prompt = '\n<details><summary>🤖 Prompt for AI Agents</summary>\nIn @a.c around line 3, fix it.\n</details>'
         kept = [('review-body', rabbit, 'coderabbit', harvest.CR_WALKTHROUGH + '\n<summary>🧹 Nitpick comments (1)</summary>' + prompt),
                 ('review', rabbit, 'coderabbit', harvest.CR_WALKTHROUGH + '\n_⚠️ Potential issue_' + prompt),

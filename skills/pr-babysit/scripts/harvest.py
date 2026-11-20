@@ -32,7 +32,7 @@ sha256 over what the bots left that a review of the head could rest on (each com
 submitted review by a reviewer, empty ones too, and the head's statuses and check runs from CodeRabbit and Greptile),
 never over a time, so a new, edited or dismissed review or a changed bot status changes it. Two bodies no finding comes from are left
 out, with body null, bodyOmitted and bodyLength: a CodeRabbit issue comment that opens
-with its walkthrough marker (CR_WALKTHROUGH), the auto-generated summary,
+with its walkthrough marker (CR_WALKTHROUGH) after any other HTML comments, the auto-generated summary,
 "coderabbit-walkthrough"; and a Copilot review body saying it could not review,
 "copilot-refusal". Their digest and aliases are still the real body's and identify them,
 and its url shows it (`gh api repos/<repo>/issues/comments/<commentId>` for the walkthrough). Exit 2 with {"error": ...} when gh cannot answer the PR, the
@@ -87,7 +87,7 @@ HEAD_ACTIVITIES = {'opened', 'synchronize', 'reopened', 'ready_for_review'}
 CR_PAUSED = '<!-- This is an auto-generated comment: review paused by coderabbit.ai -->'
 CR_RESUME = '`@coderabbitai resume` resumes it'
 CR_RATE = '<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->'
-CR_WALKTHROUGH = '<!-- This is an auto-generated comment: summarize by coderabbit.ai -->'
+CR_WALKTHROUGH = comment_digest.SUMMARY
 CR_RATE_STATUS = 'review rate limited'
 CR_REVIEW_FAILED = 'review failed'
 # A repository CodeRabbit reviews only on request: a box in its summary comment, ticked once asked, or these words beside it (#324).
@@ -603,7 +603,7 @@ def workflow_doc(repo, path, sha):
 def entry(kind, c, src, body, created, updated, path=None, line=None, commit=None, reply_to=None):
     author = c['user']['login']
     first, *also = comment_digest.digests(body, author)
-    walkthrough = kind == 'issue' and src == 'coderabbit' and (body or '').lstrip().startswith(CR_WALKTHROUGH)
+    walkthrough = kind == 'issue' and src == 'coderabbit' and comment_digest.walkthrough(body)
     refusal = kind == 'review-body' and src == 'copilot' and copilot_reading(body)[0] == 'settled'
     omitted = 'coderabbit-walkthrough' if walkthrough else 'copilot-refusal' if refusal else None
     shown = {'body': None, 'bodyOmitted': omitted, 'bodyLength': len(body)} if omitted else {'body': body or ''}
