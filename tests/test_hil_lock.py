@@ -108,6 +108,18 @@ def fork_child(body, timeout=10):
     return os.waitstatus_to_exitcode(done[1])
 
 
+def assert_no_root_cache(test):
+    """Python run as root under `sudo -n` from a user's checkout must not write bytecode into it
+    (`-I` does not stop that; `-B` does): a root-owned __pycache__ blocks `git worktree remove`."""
+    if os.geteuid() == 0:
+        return
+    cache = SCRIPT.parent / '__pycache__'
+    owned = [f.name for f in cache.iterdir() if f.lstat().st_uid == 0] if cache.is_dir() else []
+    test.assertEqual(owned, [], f'root-owned bytecode under {cache}')
+    if cache.is_dir():
+        test.assertNotEqual(cache.lstat().st_uid, 0, f'{cache} is root-owned')
+
+
 def make_receipt(test, state: Path, uid=None):
     """A run_tracked receipt in `state`, a new dir of `uid` (default ours), whose supervisor still
     holds its lock: `pending` until done()."""
@@ -4007,9 +4019,10 @@ class Pending(LockDir):
         ours = hil_lock.PendingSessions(BOARD, 'selftest')
         ours.add([{'receipt': 'ours'}])
         before = Path(ours.path).read_bytes()
-        r = subprocess.run([*argv, '-I', '-c', PENDING_AS, str(SCRIPT), shared, BOARD, '65534'],
+        r = subprocess.run([*argv, '-B', '-I', '-c', PENDING_AS, str(SCRIPT), shared, BOARD, '65534'],
                            capture_output=True, text=True, timeout=30)
         self.assertEqual(r.returncode, 0, r.stderr)
+        assert_no_root_cache(self)
         out = json.loads(r.stdout)
         self.assertEqual(out['read'], ['ok', [{'receipt': 'ours'}]])
         self.assertEqual((out['add'][0], out['clear'][0]), ('PermissionError', 'PermissionError'))
@@ -4145,9 +4158,10 @@ class CrossUserRelease(LockDir):
                 return json.loads(json.dumps(['released', hil_lock.release_token(token)]))
             except hil_lock.ReleaseRefused as e:
                 return ['refused', str(e)]
-        r = subprocess.run(['sudo', '-n', sys.executable, '-I', '-c', RELEASE_AS_ROOT, str(SCRIPT),
+        r = subprocess.run(['sudo', '-n', sys.executable, '-B', '-I', '-c', RELEASE_AS_ROOT, str(SCRIPT),
                             hil_lock.BOARD_LOCK_DIR, token], capture_output=True, text=True, timeout=30)
         self.assertEqual(r.returncode, 0, r.stderr)
+        assert_no_root_cache(self)
         return json.loads(r.stdout)
 
     def test_root_rechecks_the_receipts_as_the_holder(self):
