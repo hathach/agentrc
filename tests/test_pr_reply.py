@@ -1044,6 +1044,12 @@ RABBIT = reply.comment_digest.CODERABBIT
 FOOTER = reply.comment_digest.FOOTER
 
 
+def walkthroughs():
+    """agentrc#556's CodeRabbit summary at 14:22:34Z, answered, and at 14:26:32Z, after our Trigger review tick, the
+    rate-limit banner in the skip banner's place."""
+    return tuple(json.loads((DATA / f'6976119728-{t}.json').read_text(encoding='utf-8'))['body'] for t in ('142234', '142632'))
+
+
 class GhReadsTest(ReplyCase):
     """Our reply as gh reads it back: gh's sanitizer rewrites a cited `\\u001b` to `\\^[` (#461)."""
     BODY = 'Not so: the line escapes ESC as `\\u001b`.'
@@ -1181,8 +1187,7 @@ class WalkthroughDigestTest(unittest.TestCase):
     BOX = '> - [ ] <!-- {"checkboxId":"e9bb8d72-00e8-4f67-9cb2-caf3b22574fe"} --> Trigger review'
 
     def setUp(self):
-        # 14:22:34Z, answered; 14:26:32Z, after our Trigger review tick, the rate-limit banner in the skip banner's place.
-        self.before, self.after = (json.loads((DATA / f'6976119728-{t}.json').read_text(encoding='utf-8'))['body'] for t in ('142234', '142632'))
+        self.before, self.after = walkthroughs()
 
     def digest(self, body):
         return self.cd.digests(body, RABBIT)[0]
@@ -1241,7 +1246,7 @@ class CanonicalReuseTest(ReplyCase):
         self.assertEqual(out['inspected'][0]['originalDigest'], sha12(first))
 
     def test_reuse_on_a_summary_holds_over_a_banner_swap_not_over_a_claim_edit(self):
-        before, after = (json.loads((DATA / f'6976119728-{t}.json').read_text(encoding='utf-8'))['body'] for t in ('142234', '142632'))
+        before, after = walkthroughs()
         for now, verified in ((after, True), (after.replace('Linked Issues check', 'Linked Issue check'), False)):
             with self.subTest(verified=verified):
                 self.setUp()

@@ -50,7 +50,7 @@ def forms(body, author):
     if not m:
         return [body]
     head, status = body[:m.start()], m['status'] or ''
-    agains = [f'\n\n{FOOTER.format(w)}' for w in ('comment', 'reply')] if m['again'] else ['']
+    agains = [f'\n\n{FOOTER.format(w)}' for w in ('comment', 'reply')] if m['again'] else []
     out = []
     for tail in ('', status, *(status + a for a in agains)):
         for word in ('comment', 'reply'):
