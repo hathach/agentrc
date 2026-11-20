@@ -11,6 +11,8 @@ run(profile, argv), loading this file from the pinned agentrc (its `agentrc_pin.
   ROLE_TESTS            {role: (tests a board of that role may run)}
   RESTORE_TEST          {role: the test that checks the role's restoration sketch (the first HIL sketch)}
   TEST_FUNCS            {device test: fn(dev, nonce, deadline, tracker, run_dir, board) -> (ok, detail)}
+  CORE_TESTS            optional (feature 'battery'): {device test: (kind, stack)}, a test of the shared core battery
+                        below in place of a TEST_FUNCS entry; kind 'cdc' or 'timing', stack the INFO stack= it expects
   REPORT_SCHEMA         the run report's schema name
   check_board(name, entry, path)   optional: the library's roster checks; raise Refused
   step_host(name, board, image, test, run_dir, tracker)  required when a roster board has role host
@@ -21,6 +23,17 @@ on one physical board exclude each other. A run or commission is one hil_lock.bo
 hil_flash.probe_users on the board's probe: its lock ends with it, on its cleanup verdict, a failed cleanup logged
 (agentrc#464). A session command under the caller's hold takes the hold's session mutex and runs the same busy check
 itself. PENDING_KIND names the pending-session record an older engine kept: reported, never a refusal.
+
+The core battery (an Arduino core's shared host side, agentrc#488) talks to a HIL sketch over the DUT's USB CDC, one
+command line out and one reply line back carrying the command's nonce:
+  INFO <n>             HIL_INFO <n> stack=<stack> chip=<chip> f_cpu=<hz> [k=v...]
+  ECHO <n> <len><bytes>  the bytes back, then HIL_RESULT <n> echo PASS len=<len> crc=<crc32, 8 hex>
+  TIME <n>             HIL_RESULT <n> time PASS ms=<millis()> us=<micros()>
+  DELAY <n> <ms>       HIL_RESULT <n> delay PASS us=<micros() across delay(ms)>
+Its constants are the profile's, each optional: ECHO_LENGTHS (default 1, 63, 64, 65, 1000), TIMING_SPAN (3.0 s),
+DELAY_MS (1000), TIMING_TOLERANCE (0.01, a coarse functional bound, no clock-accuracy claim) and INFO_DETAIL
+(INFO fields a timing detail also names). The board's chip is its BUILD.BOARDS `chip`, else its `family`.
+A core-only test reuses the pieces: core_session(), core_info_problem(), core_timed(), core_timing_check().
 """
 
 import argparse
@@ -115,8 +128,15 @@ def bind(profile):
                 if profile.TESTS.get(t) != first]
     if set(profile.TESTS) != {t for tests in profile.ROLE_TESTS.values() for t in tests}:
         problems.append('TESTS and the union of ROLE_TESTS name different tests')
-    if set(profile.TEST_FUNCS) != set(profile.ROLE_TESTS.get('device', ())):
-        problems.append('TEST_FUNCS and ROLE_TESTS["device"] name different tests')
+    core = getattr(profile, 'CORE_TESTS', {})
+    bad = {t: spec for t, spec in core.items() if not (isinstance(spec, tuple) and len(spec) == 2 and
+                                                       spec[0] in CORE_KINDS and isinstance(spec[1], str))}
+    if bad:
+        problems.append(f'CORE_TESTS entries neither (cdc|timing, stack): {bad}')
+    if set(core) & set(profile.TEST_FUNCS):
+        problems.append(f'CORE_TESTS and TEST_FUNCS both define {sorted(set(core) & set(profile.TEST_FUNCS))}')
+    if set(profile.TEST_FUNCS) | set(core) != set(profile.ROLE_TESTS.get('device', ())):
+        problems.append('TEST_FUNCS with CORE_TESTS and ROLE_TESTS["device"] name different tests')
     if problems:
         raise RuntimeError(f'{profile.ROOT}: profile tables disagree: {"; ".join(problems)}')
     B.bind(profile.BUILD)
@@ -730,8 +750,8 @@ def step(name, board, image, test, run_dir, tracker):
 def run_test(test, dev, tracker, run_dir, board):
     """(ok, detail) of a device test's host check on `dev` within TEST_TIMEOUT."""
     try:
-        result = P.TEST_FUNCS[test](dev, secrets.token_hex(4), time.monotonic() + TEST_TIMEOUT, tracker, run_dir,
-                                    board)
+        result = test_func(test)(dev, secrets.token_hex(4), time.monotonic() + TEST_TIMEOUT, tracker, run_dir,
+                                 board)
     except Unclean:
         raise
     except Exception as e:   # a host-side failure of the check is the test's, once its children ended
@@ -746,6 +766,194 @@ def restore(name, board, images, run_dir, tracker):
     row = step(name, board, images[sketch], P.RESTORE_TEST[role(name)], run_dir, tracker)
     return {'pass': row['pass'], 'state': f'{sketch} restored' if row['pass'] else 'unknown',
             'evidence': row['detail'], **({'base': row['base']} if 'base' in row else {})}
+
+
+def test_func(test):
+    """The host check of a device test: the profile's own, or its CORE_TESTS entry's shared one."""
+    spec = getattr(P, 'CORE_TESTS', {}).get(test)
+    return CORE_KINDS[spec[0]](spec[1]) if spec else P.TEST_FUNCS[test]
+
+
+# ---- the core battery (module docstring)
+
+class CoreRejected(Exception):
+    """A core sketch's reply that is not the PASS the exchange expects."""
+
+
+class CoreConsole:
+    """The DUT's USB CDC tty: one command line out, its reply line (the one carrying the command's nonce) back."""
+
+    def __init__(self, port, deadline, log):
+        self.port, self.deadline, self.log = port, deadline, log
+
+    def send(self, data):
+        import serial
+        self.port.write_timeout = max(0.1, self.deadline - time.monotonic())
+        try:
+            self.port.write(data)
+        except serial.SerialTimeoutException:
+            raise TimeoutError(f'write of {data[:40]!r} timed out')
+
+    def read_exact(self, n):
+        got = b''
+        while len(got) < n and time.monotonic() < self.deadline:
+            got += self.port.read(n - len(got))
+        return got
+
+    def ask(self, line, nonce):
+        self.send(line.encode() + b'\n')
+        self.log.append(f'> {line}')
+        return self.reply(nonce)
+
+    def reply(self, nonce):
+        buf = b''
+        while time.monotonic() < self.deadline:
+            buf += self.port.read(self.port.in_waiting or 1)   # read(n) blocks for n bytes or the timeout
+            while b'\n' in buf:
+                raw, buf = buf.split(b'\n', 1)
+                text = raw.decode(errors='replace').strip()
+                if text:
+                    self.log.append(f'< {text}')
+                words = text.split()
+                if len(words) >= 2 and words[0] in ('HIL_INFO', 'HIL_RESULT') and words[1] == nonce:
+                    return words
+        raise TimeoutError(f'no reply for nonce {nonce} within the test timeout')
+
+
+def core_fields(words):
+    return dict(w.split('=', 1) for w in words if '=' in w)
+
+
+def core_passed(words, op):
+    """The fields of a `HIL_RESULT <nonce> <op> PASS ...` reply; CoreRejected naming the reply for any other."""
+    if words[0] != 'HIL_RESULT' or words[2:4] != [op, 'PASS']:
+        raise CoreRejected(f'{op}: {" ".join(words)}')
+    return core_fields(words)
+
+
+def core_chip(board):
+    """The chip a core sketch's INFO names for a roster board: its BUILD.BOARDS `chip`, else its `family`."""
+    entry = P.BUILD.BOARDS.get(board.get('name'))
+    return (entry.get('chip') or entry.get('family')) if entry else None
+
+
+def core_session(dev, deadline, run_dir, nonce, check):
+    """Open the DUT's CDC tty, run check(console, tty) -> (ok, detail), keep the exchange in the run dir as
+    core-<nonce>.log."""
+    import serial
+    tty = node(dev, '*:*/tty/tty*', deadline)
+    port = serial.Serial(tty, 115200, timeout=0.2)
+    log = []
+    try:
+        port.reset_input_buffer()
+        return check(CoreConsole(port, deadline, log), tty)
+    except CoreRejected as e:
+        return False, f'{tty}: {e}'
+    finally:
+        port.close()
+        (Path(run_dir) / f'core-{nonce}.log').write_text('\n'.join(log) + '\n')
+
+
+def core_info_problem(console, nonce, stack, board):
+    """'' when INFO reports `stack` and the board's chip, else why not; the INFO fields."""
+    words = console.ask(f'INFO {nonce}', nonce)
+    if words[0] != 'HIL_INFO':
+        return f'INFO answered {" ".join(words)}', {}
+    got = core_fields(words)
+    want = {'stack': stack, 'chip': core_chip(board)}
+    wrong = {k: got.get(k) for k, v in want.items() if v and got.get(k) != v}
+    return (f'INFO {wrong} != {want}' if wrong else ''), got
+
+
+def core_echo(console, nonce):
+    """ECHO each of ECHO_LENGTHS: the bytes come back as sent, then a PASS line with their length and crc32."""
+    import zlib
+    done = []
+    for i, n in enumerate(getattr(P, 'ECHO_LENGTHS', (1, 63, 64, 65, 1000))):
+        sub = f'{nonce}e{i}'
+        data = os.urandom(n)
+        console.send(f'ECHO {sub} {n}\n'.encode() + data)
+        got = console.read_exact(n)
+        if got != data:
+            return False, f'ECHO {n}: {len(got)} bytes back, {"equal" if got == data[:len(got)] else "differing"}'
+        f = core_passed(console.reply(sub), 'echo')
+        if (f.get('len'), f.get('crc')) != (str(n), f'{zlib.crc32(data):08x}'):
+            return False, f'ECHO {n}: result {f} (want len={n} crc={zlib.crc32(data):08x})'
+        done.append(n)
+    return True, f'echoed {done} bytes'
+
+
+def core_timed(console, line, nonce, op):
+    """(fields of its PASS reply, host send time, host receive time) of one exchange."""
+    t0 = time.monotonic()
+    words = console.ask(line, nonce)
+    return core_passed(words, op), t0, time.monotonic()
+
+
+def core_timing_problem(dev_ms, host_lo, host_hi):
+    """'' when the DUT's elapsed ms lies within the host's bracket [lo, hi] widened by TIMING_TOLERANCE, else why."""
+    tol = getattr(P, 'TIMING_TOLERANCE', 0.01)
+    lo, hi = host_lo * (1 - tol), host_hi * (1 + tol)
+    return '' if lo <= dev_ms <= hi else f'{dev_ms:.1f} ms outside the host bracket [{lo:.1f}, {hi:.1f}] ms'
+
+
+def core_timing_check(console, tty, nonce, stack, board):
+    """(ok, detail, INFO fields): INFO, then millis() and micros() advance with the host's monotonic clock over
+    TIMING_SPAN seconds and agree with each other, and delay(DELAY_MS) measures DELAY_MS within the bound."""
+    why, info = core_info_problem(console, nonce + 'i', stack, board)
+    if why:
+        return False, f'{tty}: {why}', info
+    a, a0, a1 = core_timed(console, f'TIME {nonce}a', nonce + 'a', 'time')
+    time.sleep(getattr(P, 'TIMING_SPAN', 3.0))
+    b, b0, b1 = core_timed(console, f'TIME {nonce}b', nonce + 'b', 'time')
+    try:
+        ms = (int(b['ms']) - int(a['ms'])) & 0xffffffff
+        us = (int(b['us']) - int(a['us'])) & 0xffffffff
+    except (KeyError, ValueError):
+        return False, f'{tty}: TIME replies {a}, {b}', info
+    # the DUT read its clock somewhere inside each exchange: the elapsed host time lies in [b0 - a1, b1 - a0]
+    lo, hi = (b0 - a1) * 1000, (b1 - a0) * 1000
+    why = core_timing_problem(ms, lo, hi)
+    if why:
+        return False, f'{tty}: millis() {why}', info
+    if abs(us / 1000 - ms) > 2:
+        return False, f'{tty}: micros() advanced {us} us while millis() advanced {ms} ms', info
+    delay_ms = getattr(P, 'DELAY_MS', 1000)
+    d, _, _ = core_timed(console, f'DELAY {nonce}d {delay_ms}', nonce + 'd', 'delay')
+    try:
+        delay_us = int(d['us'])
+    except (KeyError, ValueError):
+        return False, f'{tty}: DELAY reply {d}', info
+    why = core_timing_problem(delay_us / 1000, delay_ms, delay_ms + 2)   # delay() may run past its last tick
+    if why:
+        return False, f'{tty}: delay({delay_ms}) {why}', info
+    extra = ''.join(f' {k}={info.get(k)}' for k in getattr(P, 'INFO_DETAIL', ()))
+    return True, (f'{tty}: f_cpu={info.get("f_cpu")}{extra}: millis {ms} ms over host [{lo:.1f}, {hi:.1f}] ms, '
+                  f'micros {us} us, delay({delay_ms}) {delay_us} us'), info
+
+
+def core_cdc_test(stack):
+    """core_cdc under `stack`: INFO names the stack and the chip, ECHO returns every byte across packet bounds."""
+    def test(dev, nonce, deadline, tracker, run_dir, board):
+        def check(console, tty):
+            why, got = core_info_problem(console, nonce + 'i', stack, board)
+            if why:
+                return False, f'{tty}: {why}'
+            ok, detail = core_echo(console, nonce)
+            return ok, f'{tty}: {stack} stack, f_cpu={got.get("f_cpu")}: {detail}'
+        return core_session(dev, deadline, run_dir, nonce, check)
+    return test
+
+
+def core_timing_test(stack):
+    """core_timing: core_timing_check."""
+    def test(dev, nonce, deadline, tracker, run_dir, board):
+        return core_session(dev, deadline, run_dir, nonce,
+                            lambda console, tty: core_timing_check(console, tty, nonce, stack, board)[:2])
+    return test
+
+
+CORE_KINDS = {'cdc': core_cdc_test, 'timing': core_timing_test}
 
 
 # ---- the battery

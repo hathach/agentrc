@@ -42,7 +42,7 @@ A core's profile (an Arduino platform checkout, e.g. adafruit:samd) adds these, 
 
 PROFILE_API is the profile interface the three engines implement; a library's bootstrap refuses any other unloaded.
 PROFILE_FEATURES names the additive capabilities a bootstrap may require of these engines ('core': core mode,
-'base': a rig board's base image, 'named': named HIL builds).
+'base': a rig board's base image, 'named': named HIL builds, 'battery': arduino_hil's shared core battery).
 
 The JSON contract (stdout's last line, exits 0 pass, 1 failed, 2 usage or a missing prerequisite, 3 uncovered) is
 the library's build SKILL.md.
@@ -70,7 +70,7 @@ FILES = ('skills/hil/boards.json', 'skills/hil/scripts/hil_boards.py', 'skills/h
 SELF = 'skills/arduino/scripts/arduino_build.py'
 SCHEMA = 2
 PROFILE_API = 1   # bump on a change a library profile must follow, arduino_hil's and arduino_remote's included
-PROFILE_FEATURES = ('core', 'base', 'named')
+PROFILE_FEATURES = ('core', 'base', 'named', 'battery')
 COMPILE_TIMEOUT = 900
 BUILD_SCRIPTS = '.claude/skills/build/scripts/'
 HIL_CONTROL = ('.claude/skills/hil-contract/scripts/', 'test/hil/')
