@@ -162,6 +162,20 @@ const bare = (v) => Array.isArray(v) ? v.map(bare)
   : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).filter(([, x]) => x !== null).map(([k, x]) => [k, bare(x)])) : v
 const sealMatches = ({ seal, error, ...facts }) => seal === fnv1a(canonical(bare(facts)))
 const groupsOf = (list, n) => [...Array(Math.ceil(list.length / n)).keys()].map(k => list.slice(k * n, (k + 1) * n))
+// The runtime refuses a value holding an array longer than ARRAY_CAP across its VM boundary, the result included (Claude
+// Code 2.1.325): a state saves a longer one as { [CHUNKS]: its runs of ARRAY_CAP }, which a load unpacks before the
+// seal, taken over the unpacked state, is checked. No state field is named CHUNKS.
+const ARRAY_CAP = 4096
+const CHUNKS = '#chunks'
+const packed = (v) => Array.isArray(v) ? (v.length > ARRAY_CAP ? { [CHUNKS]: packed(groupsOf(v, ARRAY_CAP)) } : v.map(packed))
+  : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, packed(x)])) : v
+const unpacked = (v) => {
+  if (Array.isArray(v)) return v.map(unpacked)
+  if (!v || typeof v !== 'object') return v
+  const keys = Object.keys(v)
+  const runs = keys.length === 1 && keys[0] === CHUNKS ? unpacked(v[CHUNKS]) : null
+  return Array.isArray(runs) && runs.every(Array.isArray) ? runs.flat() : Object.fromEntries(keys.map(k => [k, unpacked(v[k])]))
+}
 const withSeal = (schema) => ({ ...schema, required: [...schema.required, 'seal'], properties: { ...schema.properties, seal: { type: 'string' } } })
 // '' for a path that escapes the repo or whose spelling names another file.
 const canon = (p) => {
@@ -370,6 +384,7 @@ if (args.state != null) {
   if (typeof args.state === 'string') args.state = JSON.parse(args.state)
   const size = stateBytes(args.state)
   if (size > INLINE_STATE_MAX) throw new Error(`state passed inline is ${size} bytes, over ${INLINE_STATE_MAX}: pass the saved output as stateRef`)
+  args.state = unpacked(args.state)
 }
 // A stateRef load's reading of whether the session directory is the state's checkoutDir: state_transfer.py's sealed
 // checkout, null when its line has none; undefined for an inline state.
@@ -387,8 +402,10 @@ if (args.stateRef != null) {
   // unless its script could not claim its file; a line, a refusal or a digest that does not match, is that file's answer.
   const load = (label) => emitted(`${IN_CHECKOUT}Editing nothing, ${runExactly(`${STATE_SCRIPT} '${file}'`)}`,
     { label, phase: 'Triage', agentType: 'relay', model: 'haiku', effort: 'low' })
-  const stateOf = ({ line }) => line && !line.error && line.digest === ref.digest && line.state && typeof line.state === 'object' &&
-    line.state.digest === ref.digest && sealOf(line.state) === ref.digest ? line.state : null
+  const stateOf = ({ line }) => {
+    const st = line && !line.error && line.digest === ref.digest && line.state && typeof line.state === 'object' ? unpacked(line.state) : null
+    return st && st.digest === ref.digest && sealOf(st) === ref.digest ? st : null
+  }
   // A state one module cannot hold comes as parts, each its own module beside the line holding a run of the state's JSON;
   // the joined state's seal catches a part changed or cut short.
   const joined = async (line) => {
@@ -1199,10 +1216,10 @@ const stateOut = () => {
     debt: [...debt].map(([id, d]) => [id, { dismissals: [...d.dismissals], notes: [...d.notes], ...(d.edited ? { edited: d.edited } : {}), ...(d.digest !== undefined ? { digest: d.digest } : {}), ...(d.repair ? { repair: d.repair } : {}), ...(d.attempt ? { attempt: d.attempt } : {}), ...(d.rejudge ? { rejudge: d.rejudge } : {}) }]),
     last: history.length ? Object.fromEntries(CARRIED.filter(k => k in history[history.length - 1]).map(k => [k, history[history.length - 1][k]])) : null,
   }
-  // Measured unsealed, a digest being 8 hex digits whatever it is: only the state kept is sealed.
+  // Measured packed as it is saved and unsealed, a digest being 8 hex digits whatever it is: only the state kept is sealed.
   const sized = (entries) => {
     const state = { ...st, ciCache: { ...st.ciCache, entries }, digest: '00000000' }
-    return { state, size: stateBytes(state) }
+    return { state, size: stateBytes(packed(state)) }
   }
   // A state the loader refuses dead-ends the run; the verdict digests are a cache, recalled or judged again: the oldest
   // go first, and none when leaving them all out would not make it loadable either.
@@ -1222,7 +1239,7 @@ const stateOut = () => {
     log(`state: ${bytes} bytes, over the ${STATE_MAX} a launch loads — the ${dropped} oldest of ${entries.length} CI verdict digest(s) left out, judged again by a later launch`)
   }
   out.state.digest = sealOf(out.state)
-  return out
+  return { state: packed(out.state), size: out.size }
 }
 const findingState = (f) => f.hold ? 'held' : f.deferral ? 'deferred' : f.verdict === 'valid' ? 'valid' : f.verdict === 'stale' ? 'stale' : 'refuted'
 // SonarCloud's own check, and Greptile's confidence check, a score of its review that collect.py reads by its app and

@@ -42,6 +42,30 @@ const canonical = (v) => Array.isArray(v) ? `[${v.map(canonical).join(',')}]`
   : v && typeof v === 'object' ? `{${Object.keys(v).sort().map(k => `${JSON.stringify(k)}:${canonical(v[k])}`).join(',')}}`
   : JSON.stringify(v)
 const seal = ({ digest, ...st }) => ({ ...st, digest: fnv1a(canonical(JSON.parse(JSON.stringify(st)))) })
+// The copy Claude Code 2.1.325 makes of a workflow's result as it leaves the VM (primitivizeDeep's copy, isLeaving), whose
+// refusal loses the result and the state in it: an array past 4096 entries or nesting past 28000 levels throws, a
+// function is left out (undefined in an array), a __proto__ key is dropped and a value met twice is copied once.
+const ARRAY_CAP = 4096
+const acrossVm = (root) => {
+  const seen = new Map()
+  const copy = (v, depth) => {
+    if (v === null || typeof v !== 'object') return typeof v === 'function' ? undefined : v
+    if (seen.has(v)) return seen.get(v)
+    if (depth > 28000) throw new Error('nesting deeper than 28000 levels is not supported')
+    if (Array.isArray(v)) {
+      const out = []
+      seen.set(v, out)
+      if (v.length > ARRAY_CAP) throw new Error(`array length ${v.length} exceeds the maximum of ${ARRAY_CAP} supported across the workflow VM boundary`)
+      for (let i = 0; i < v.length; i++) out[i] = copy(v[i], depth + 1)
+      return out
+    }
+    const out = {}
+    seen.set(v, out)
+    for (const k of Object.keys(v)) if (k !== '__proto__' && typeof v[k] !== 'function') out[k] = copy(v[k], depth + 1)
+    return out
+  }
+  return copy(root, 1)
+}
 // A line without its null members, which is what facts.py's seal is taken over.
 const bare = (v) => Array.isArray(v) ? v.map(bare)
   : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).filter(([, x]) => x !== null).map(([k, x]) => [k, bare(x)])) : v
@@ -750,8 +774,9 @@ async function run(opts = {}) {
         assert.match(value.replace(/^'(.*)'$/, '$1'), /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/, `${label}: coderabbit_trigger.py's ISO contract`)
       }
     }
+    const crossed = acrossVm(result)
     returned = true
-    return { result, logs, labels: calls.map(c => c.label), calls, napPoints, napMs, journal, loads, emitDir: emit.made, emitRoot: emit.root }
+    return { result: crossed, logs, labels: calls.map(c => c.label), calls, napPoints, napMs, journal, loads, emitDir: emit.made, emitRoot: emit.root }
   } finally {
     globalThis.setTimeout = realTimeout
     emit.cleanup(!returned)
@@ -8668,6 +8693,25 @@ test('a state loaded in parts keeps its offered reply body and carries its settl
   assert.deepEqual(carryOf(prompt), [{ commentId: 1, digest: 'd1', judgedSha: d.reviewedSha, paths: ['src/a.c', 'src/caller.c'] }])
   assert.equal(again.labels.some(l => /^(challenge|replies)#/.test(l)), false, again.labels.join(' '))
   assert.equal(again.result.pass, true)
+})
+
+test('a state holding an array the VM boundary cannot carry saves it in runs and loads it back as it was sealed (#539)', async () => {
+  const { state } = await savedForLoad()
+  const many = Array.from({ length: ARRAY_CAP + 1 - state.decisions.length }, (_, i) => [`${9000 + i}#1`, { commentId: 9000 + i, verdict: 'invalid' }])
+  const big = seal({ ...state, maxCycles: state.cyclesUsed, decisions: [...state.decisions, ...many] })
+  const args = (st) => ({ yieldAfterCycle: true, stateRef: { outputFile: '/tmp/tasks/w1.output', digest: st.digest } })
+  const first = await run({ args: args(big), load: big })
+  const saved = first.result.state
+  assert.equal(first.result.reason, 'budget-exhausted')
+  assert.deepEqual(saved.decisions['#chunks'].map(r => r.length), [ARRAY_CAP, 1], 'in runs the boundary carries')
+  assert.deepEqual([first.result.stateDigest, saved.digest, saved.decisions['#chunks'].flat()], [big.digest, big.digest, big.decisions],
+    'sealed as the state it holds')
+  assert.equal(transferOf(saved).error, undefined)
+  // Its saved output is the next launch's stateRef: loaded, unpacked and sealed the same, it saves the same runs back.
+  const again = await run({ args: args(saved), load: saved })
+  assert.deepEqual([again.result.reason, again.result.state], ['budget-exhausted', saved])
+  assert.throws(() => acrossVm(big), /^Error: array length 4097 exceeds the maximum of 4096 supported across the workflow VM boundary$/,
+    'unpacked, the boundary refuses it')
 })
 
 test('a failed emit-dir read is asked again by the next relay, the load\'s retry included', async () => {

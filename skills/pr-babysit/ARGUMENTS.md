@@ -183,7 +183,9 @@ A key not listed here throws before anything runs.
   loads a state of up to 8 MiB (compact ASCII JSON), past 384 KiB in parts
   that each fit a Workflow script file, an inline `state` one of up to 64 KiB;
   a launch whose returned state is larger says so (`stateTooLarge`), and
-  nothing trims its decisions or debt.
+  nothing trims its decisions or debt. An array in it longer than the 4096
+  entries the runtime carries out of a workflow is saved as
+  `{"#chunks": [runs of 4096]}`, joined back before its digest is checked.
   `launch_result.py`'s `stateRef` names a copy it keeps outside the Workflow
   task directory, so a host reset does not take the state with it. Nothing
   prunes those copies: one is needed only while a caller may continue from its
