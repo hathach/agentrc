@@ -861,6 +861,8 @@ const RECHECK = withSeal({
     staged: { type: 'array', items: { type: 'string' } }, status: { type: 'array', items: { type: 'string' } },
   },
 })
+// Characters of a refused hook's output tail the refusal detail keeps.
+const HOOK_TAIL_CHARS = 600
 const HOOKS = withSeal({
   type: 'object', additionalProperties: false,
   required: ['ran', 'passed', 'modifiedBy', 'failed', 'baselineFailed', 'notRerun', 'before', 'after', 'snapshotBefore', 'snapshotAfter'],
@@ -868,7 +870,7 @@ const HOOKS = withSeal({
     error: { type: 'string' },
     ran: { type: 'boolean' }, passed: { type: 'boolean' },
     modifiedBy: { type: 'array', items: { type: 'string' } },
-    failed: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['hook', 'error'], properties: { hook: { type: 'string' }, error: { type: 'string' } } } },
+    failed: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['hook', 'error'], properties: { hook: { type: 'string' }, error: { type: 'string' }, tail: { type: 'array', items: { type: 'string' } } } } },
     baselineFailed: { type: 'array', items: { type: 'string' } },
     notRerun: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['hook', 'why'], properties: { hook: { type: 'string' }, why: { type: 'string' } } } },
     before: { type: 'array', items: { type: 'string' } }, after: { type: 'array', items: { type: 'string' } },
@@ -1944,14 +1946,19 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
     failedIds.filter(i => i === h).length > 1)
   // a failure hooks.py never reran on HEAD carries its reason, such as an unreadable hook config, into the refusal
   const notRerun = new Map(hooks.notRerun.map(n => [n.hook, n.why]))
-  const failures = (fs) => fs.map(f => `${f.hook}: ${f.error}${notRerun.has(f.hook) ? ` (not rerun on HEAD: ${notRerun.get(f.hook)})` : ''}`).join('; ')
+  // a refusal keeps how each hook's output ended, bounded: its first line alone may not tell a failure from a flake (#558)
+  const ending = (f) => {
+    const text = (f.tail || []).join(' | ')
+    return text ? ` [output ends: ${text.length > HOOK_TAIL_CHARS ? `…${text.slice(1 - HOOK_TAIL_CHARS)}` : text}]` : ''
+  }
+  const failures = (fs, withTail = false) => fs.map(f => `${f.hook}: ${f.error}${notRerun.has(f.hook) ? ` (not rerun on HEAD: ${notRerun.get(f.hook)})` : ''}${withTail ? ending(f) : ''}`).join('; ')
   const hookWhy = outside.length ? `tree changed outside the fix scope before the hooks ran: ${outside.join(', ')}`
     : unsteady.length ? `regenerated path(s) no longer a plain modification when the hooks ran: ${unsteady.join(', ')}`
     : (hooks.passed && failedIds.length) || (!hooks.ran && failedIds.length) || hooks.baselineFailed.some(h => !failedIds.includes(h))
       ? 'hook evidence is inconsistent: a hook failed on HEAD without failing on the fix, or failed while the hooks passed or did not run'
     : unskippable.length ? `hook evidence is inconsistent: excused hook(s) modified files, cannot be skipped or share an id: ${unskippable.map(h => JSON.stringify(h)).join(', ')}`
     : hooks.ran && !hooks.passed && !failedIds.length ? 'the repository hooks do not pass on the fix, and pre-commit named no failing hook'
-    : blamed.length ? `the repository hooks do not pass on the fix: ${failures(blamed)}`
+    : blamed.length ? `the repository hooks do not pass on the fix: ${failures(blamed, true)}`
     : !hooks.ran && hooks.modifiedBy.length ? 'hook evidence is inconsistent: hooks reported modifying files without running'
     : !hooks.ran && regenerated.length ? `regenerated path(s) have no hook to vouch for them: ${regenerated.join(', ')}`
     : created.length ? `a hook created or renamed file(s): ${created.map(pathOf).join(', ')}`

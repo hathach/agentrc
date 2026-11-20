@@ -7259,6 +7259,20 @@ test('a failing hook is refused by name and first line unless it fails on HEAD t
     "the repository hooks do not pass on the fix: unit-test: preprocessing failed (not rerun on HEAD: PyYAML is not installed, nor is pre-commit's interpreter known, so the config was not read)")
 })
 
+test('a refused hook keeps how its output ended, bounded, and an excused one only its line (#558)', async () => {
+  const tail = ['bringing up nodes...', 'FAILED tests/test_a.py::t - AssertionError', '1 failed, 5 passed in 1.00s']
+  const suite = { hook: 'skill-tests', error: 'FAILED tests/test_a.py::t - AssertionError', tail }
+  const refused = await run({ ...publishing, hooks: { passed: false, failed: [suite] } })
+  assert.equal(refused.result.history[0].reviewPushFailed.detail,
+    `the repository hooks do not pass on the fix: skill-tests: ${suite.error} [output ends: ${tail.join(' | ')}]`)
+  const long = await run({ ...publishing, hooks: { passed: false, failed: [{ ...suite, tail: ['x'.repeat(400), 'y'.repeat(400)] }] } })
+  const ends = long.result.history[0].reviewPushFailed.detail.match(/ \[output ends: (.*)\]$/)[1]
+  assert.equal(ends, `…${'x'.repeat(196)} | ${'y'.repeat(400)}`, 'its last 600 characters, the cut marked')
+  const excused = await run({ ...publishing, hooks: { passed: false, failed: [suite], baselineFailed: ['skill-tests'] } })
+  assert.equal(excused.result.history[0].reviewPush.pass, true)
+  assert.ok(excused.logs.some(l => l.endsWith(`not counted against the fix: skill-tests: ${suite.error}`)))
+})
+
 test('a failure no hook owns, and hook output the excused hooks never judged, are refused by cause', async () => {
   const named = await run({ ...publishing, hooks: { passed: false } })
   assert.equal(named.result.history[0].reviewPushFailed.detail, 'the repository hooks do not pass on the fix, and pre-commit named no failing hook')
