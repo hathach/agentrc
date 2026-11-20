@@ -19,12 +19,17 @@ shell last entered: `setup`, `prerequisite` or `build`. A shell that stopped
 before `build` never built: its environment is missing, whatever its status.
 
 stdout ends with one JSON line {revision, snapshot, snapshotAfter, command,
-setup, requires, stage, buildDir, exit, log, retained, seal} (seal:
+setup, requires, stage, buildDir, exit, usageError, log, retained, seal} (seal:
 facts.sealed): revision is HEAD, command with <BUILD> expanded, setup and
 requires as given ('' and [] without them), exit the shell's status,
-retained what cleanup had to leave behind. Exit 0 with that line, whatever the build did; exit 2 with
-{"error": ...} when the build could not be set up, naming anything cleanup had
-to leave behind.
+retained what cleanup had to leave behind. usageError is the line a command
+that refused its own arguments printed, else null: one that exited 2 in the
+build step and opened its output with argparse's `usage:` or an `error:` of its
+own (`error: ...` or `<prog>: error: ...`, as a check_build.py's refusal of
+`--worktree` without `--base`), or with Python's `can't open file`; it built
+nothing, so its failure says nothing of the change (#557).
+Exit 0 with that line, whatever the build did; exit 2 with {"error": ...} when
+the build could not be set up, naming anything cleanup had to leave behind.
 
 With --job, the build outlives the call that asks for it, so a caller whose
 shell calls are bounded waits it out in several: DIR names it, the first call
@@ -74,6 +79,14 @@ TICK = 0.2  # seconds between the runner's and a waiting call's looks
 STOP_GRACE = 10  # seconds a stopped build gets after SIGTERM, then after SIGKILL
 REQUEST_WAIT = 10  # seconds an attaching call waits for the claiming call's request.json
 PR_SET_CHILD_SUBREAPER = 36  # prctl(2)
+# The line the shell prints as the build step starts: what follows is the command's own output.
+BUILD_MARK = '--- pr-babysit build.py: build ---'
+USAGE_EXIT = 2  # argparse's, and Python's for a script it cannot open
+# How a command refusing its arguments opens its output; its error line is reported over a `usage:` one.
+USAGE_ERROR = re.compile(r"(?:[\w.-]+: )?error: |.+: can't open file '")
+USAGE_OPEN = re.compile(f'usage: |{USAGE_ERROR.pattern}')
+USAGE_LINES = 20  # how far into the output the error form of a usage error is looked for
+USAGE_CHARS = 300
 
 
 def script(setup, requires, command):
@@ -83,7 +96,20 @@ def script(setup, requires, command):
                     for t in requires)
     # setup runs bare, never as a condition, so a `set -e` in it still stops the shell
     return (mark('setup') + (f'{setup}\npr_babysit_setup=$?; [ "$pr_babysit_setup" -eq 0 ] || exit "$pr_babysit_setup"\n' if setup else '') +
-            mark('prerequisite') + tools + mark('build') + command + '\n')
+            mark('prerequisite') + tools + mark('build') + f'echo {shlex.quote(BUILD_MARK)}\n' + command + '\n')
+
+
+def usage_error(log, stage, build_exit):
+    """The line a command refusing its own arguments printed in log, else None."""
+    if stage != 'build' or build_exit != USAGE_EXIT:
+        return None
+    lines = Path(log).read_text(encoding='utf-8', errors='replace').splitlines()
+    # the header shows the marker only inside its `$ echo` line
+    printed = lines[lines.index(BUILD_MARK) + 1:] if BUILD_MARK in lines else []
+    out = [t for t in (''.join(c if c.isprintable() else ' ' for c in line).strip() for line in printed) if t]
+    if not out or not USAGE_OPEN.match(out[0]):
+        return None
+    return next((t for t in out[:USAGE_LINES] if USAGE_ERROR.match(t)), out[0])[:USAGE_CHARS]
 
 
 def snapshot(paths):
@@ -155,11 +181,12 @@ def finish(b, build_exit):
         if stage not in STAGES:
             raise Unusable(f'the build shell left no stage: {stage!r}')
         after = snapshot(b['paths'])
+        usage = usage_error(b['log'], stage, build_exit)
     except (Unusable, OSError) as e:
         fail(b, e)
     return {'revision': b['revision'], 'snapshot': b['snapshot'], 'snapshotAfter': after, 'command': b['command'],
-            'setup': b['setup'], 'requires': b['requires'], 'stage': stage,
-            'buildDir': b['buildDir'], 'exit': build_exit, 'log': Path(b['log']).as_posix(), 'retained': cleanup(b)}
+            'setup': b['setup'], 'requires': b['requires'], 'stage': stage, 'buildDir': b['buildDir'], 'exit': build_exit,
+            'usageError': usage, 'log': Path(b['log']).as_posix(), 'retained': cleanup(b)}
 
 
 def parse(argv):

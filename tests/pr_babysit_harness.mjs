@@ -1617,6 +1617,24 @@ test('a build receipt counts only as the run that was asked for', async () => {
   }
 })
 
+test('a build command refusing its own arguments is a resolution failure, never a broken candidate (#557)', async () => {
+  const candidate = { exit: 2, usageError: 'error: --worktree needs --base' }
+  const resolved = await run({ reviews: oneValid, buildPlan: { command: 'python3 .claude/skills/build/scripts/check_build.py --scope src/a.c --worktree' }, candidate })
+  assert.equal(resolved.result.reason, 'build-unverifiable', 'not fix-verification-failed')
+  assert.match(resolved.result.detail, /^build contract not resolved: the resolved command refused its arguments and built nothing \(exit 2: error: --worktree needs --base\); log \/tmp\/candidate\.log$/)
+  assert.deepEqual(resolved.result.uncommitted, ['src/a.c'], 'the fix it left uncommitted is named')
+  assert.equal(resolved.labels.some(l => /^(compat#|push#)/.test(l)), false)
+  const given = await run({ reviews: oneValid, args: { build: 'make <BUILD>' }, candidate })
+  assert.equal(given.result.reason, 'build-unverifiable')
+  assert.match(given.result.detail, /^the caller's build command refused its arguments and built nothing \(exit 2: /)
+  // the resolver is told the change is uncommitted, and to give the contract's whole form for that
+  const resolve = resolved.calls.find(c => c.label === 'build:resolve#1-review').prompt
+  assert.match(resolve, /The change is uncommitted when command runs: .*such as `--base <ref> --worktree` with the ref the contract's own examples use, never a committed-only form or one flag of such a form without the others\./)
+  const failed = await run({ reviews: oneValid, candidate: { exit: 2 } })
+  assert.equal(failed.result.reason, 'fix-verification-failed', 'a build that ran and failed is the candidate\'s')
+  assert.deepEqual(failed.result.uncommitted, ['src/a.c'])
+})
+
 test('a contract setup and its tools go to build.py, and a shell that stopped before the build is the environment', async () => {
   const buildPlan = { command: 'idf.py -B <BUILD> build', setup: '. "$IDF_PATH/export.sh"', requires: ['idf.py'] }
   const ok = await run({ reviews: oneValid, buildPlan })
@@ -1808,6 +1826,7 @@ test('a second rejection of the same finding, across a resumed launch, stops for
   const again = await run({ reviews: oneValid, fix: rejecting('1#1'), args: { autoPush: true, maxCycles: 3, yieldAfterCycle: true, state: first.result.state } })
   assert.equal(again.result.reason, 'fix-verification-failed')
   assert.match(again.result.detail, /^1#1: rejected again by its writer — make test passes on HEAD for 1#1/)
+  assert.deepEqual(again.result.uncommitted, [], 'a writer that rejected its only finding left nothing uncommitted')
   const rewrittenEnd = { ...oneValid, findings: [finding({ commentDigest: 'd1new', commentAliases: ['d1'] })] }
   const aliased = await run({ reviews: rewrittenEnd, fix: rejecting('1#1'), args: { autoPush: true, maxCycles: 3, yieldAfterCycle: true, state: first.result.state } })
   assert.equal(aliased.result.reason, 'fix-verification-failed', 'a digest CodeRabbit only rewrote the end of is the same body')

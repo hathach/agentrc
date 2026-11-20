@@ -748,7 +748,7 @@ const BUILD_RUN = withSeal({
     revision: { type: 'string' }, snapshot: { type: 'string' }, snapshotAfter: { type: 'string' },
     command: { type: 'string' }, setup: { type: 'string' }, requires: { type: 'array', items: { type: 'string' } },
     stage: { type: 'string' },
-    buildDir: { type: 'string' }, exit: { type: 'integer' }, log: { type: 'string' },
+    buildDir: { type: 'string' }, exit: { type: 'integer' }, usageError: { type: ['string', 'null'] }, log: { type: 'string' },
     retained: { type: 'array', items: { type: 'string' } }, error: { type: 'string' },
   },
 })
@@ -1422,12 +1422,13 @@ const withheldStop = (cycles, lane, withheld) => {
   log(`cycle ${cycles}: every ${lane}-lane fix withheld for the caller — nothing left uncommitted`)
   return stop(cycles, 'fixes-withheld', { withheld })
 }
-// A writer ran, so its edits are left uncommitted; one that died may have edited before it did.
+// A writer ran, so its edits are left uncommitted for the caller's review, named in `uncommitted` (#557): the scope its
+// writers were given; one that died may have edited before it did.
 const unverifiedStop = (cycles, lane, verdict) => {
-  const { unverifiable, withheld, fixes } = verdict
+  const { unverifiable, withheld, fixes, owned } = verdict
   log(`cycle ${cycles}: ${lane}-lane fixes left uncommitted for the caller's review — not pushing unverified changes` +
-    (fixes.length ? '' : '; every writer died, so inspect the checkout for any edit they made'))
-  const also = withheld.length ? { withheld } : {}
+    (owned.length ? `: ${owned.join(', ')}` : '') + (fixes.length ? '' : '; every writer died, so inspect the checkout for any edit they made'))
+  const also = { uncommitted: owned, ...(withheld.length ? { withheld } : {}) }
   return unverifiable ? stop(cycles, 'build-unverifiable', { detail: unverifiable, ...(unverifiable.startsWith(BUILD_TIMED_OUT) ? { timedOut: true } : {}), ...also })
     : stop(cycles, 'fix-verification-failed', also)
 }
@@ -1571,7 +1572,10 @@ const buildCheck = async (tag, owned) => {
         'setup = the shell lines the contract says must run first in the same shell (sourcing a toolchain\'s environment script, say), else null; ' +
         'requires = the executables command runs that setup or the system must put on PATH, each a bare name; ' +
         // #309: a wrapper building one board per family needed Espressif's export.sh and idf.py, and a missing idf.py failed the batch.
-        'when command builds several targets or board families, a wrapper script\'s included, setup and requires hold every one\'s: each family\'s own setup the contract names (such as `. "$IDF_PATH/export.sh"` before an Espressif build) and each tool its build invokes, through the wrapper too (such as idf.py), so a missing one stops the shell before the build; ' +
+        'when command builds several targets or board families, a wrapper script\'s included, setup and requires hold every one\'s: each family\'s own setup the contract names (such as `. "$IDF_PATH/export.sh"` before an Espressif build) and each tool its build invokes, through the wrapper too (such as idf.py), so a missing one stops the shell before the build. ' +
+        // #557: a selection flag without the one it needs (check_build.py's --worktree without --base) refused every candidate.
+        'The change is uncommitted when command runs: where the contract selects what to build from a change, use the form it gives for uncommitted and untracked changes, with every argument that form needs, ' +
+        'such as `--base <ref> --worktree` with the ref the contract\'s own examples use, never a committed-only form or one flag of such a form without the others. ' +
         'contract = every instruction, doc and build-system file you read the contract from, any of these paths among them; command = null, with reason, when no build applies to these paths; error = why the contract could not be resolved, else null.',
         { label: `build:resolve#${tag}`, phase: 'Fix', model: 'sonnet', schema: BUILD_PLAN },
       ).catch(quiet(`build:resolve#${tag}`))
@@ -1612,6 +1616,11 @@ const buildCheck = async (tag, owned) => {
   if (r.retained.length) log(`build#${tag}: cleanup left ${r.retained.join(', ')}`)
   // A shell that stopped before the build says nothing of the code: its environment is missing.
   if (r.stage !== 'build') return `the build environment is not set up: its ${r.stage} step stopped the shell (exit ${r.exit}); log ${r.log}`
+  // A command that refused its own arguments built nothing: its plan failed, not the candidate (#557).
+  if (r.usageError) {
+    return `${plan === callerPlan ? "the caller's build command" : 'build contract not resolved: the resolved command'} refused its arguments and built nothing ` +
+      `(exit ${r.exit}: ${r.usageError}); log ${r.log}`
+  }
   return r.exit === 0 ? null : `${BUILD_FAILED} (exit ${r.exit}); log ${r.log}`
 }
 
@@ -3362,7 +3371,7 @@ const runLanes = async (cycle, entry, lanes) => {
       if (again.length) {
         const detail = again.map(x => `${x.id}: rejected again by its writer — ${x.evidence}`).join('; ')
         log(`cycle ${cycle}: ${detail}`)
-        return stop(cycle, 'fix-verification-failed', { detail })
+        return stop(cycle, 'fix-verification-failed', { detail, uncommitted: owned })
       }
       if (!verdict.dispatched && verdict.withheld.length) return withheldStop(cycle, 'review', verdict.withheld)
       if (args.autoPush !== true) {

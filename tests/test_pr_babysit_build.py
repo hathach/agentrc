@@ -163,6 +163,28 @@ class BuildTest(unittest.TestCase):
         _, out = self.run_script('--path=.', '--command', 'sh -c no-such-tool')
         self.assertEqual((out['stage'], out['exit']), ('build', 127))
 
+    def test_a_command_refusing_its_own_arguments_is_told_from_a_failed_build(self):
+        # #557: check_build.py's refusal of --worktree without --base failed every candidate as a broken build.
+        py = shlex.quote(Path(sys.executable).as_posix())
+        parse = 'import argparse; p = argparse.ArgumentParser(prog="check_build.py"); p.add_argument("--base", required=True); p.parse_args()'
+        for command, usage in (
+            ('echo "error: --worktree needs --base" >&2; echo \'{"pass": false, "error": "--worktree needs --base"}\'; exit 2',
+             'error: --worktree needs --base'),
+            (f'{py} -c {shlex.quote(parse)} --scope src.c', 'check_build.py: error: the following arguments are required: --base'),
+            (f'{py} no_such_check_build.py --scope src.c', ": can't open file '"),
+        ):
+            with self.subTest(command):
+                code, out = self.run_script('--path=.', '--setup=echo "error: setup says so"', '--command', command)
+                self.assertEqual((code, out['stage'], out['exit']), (0, 'build', 2), out)
+                self.assertIn(usage, out['usageError'])
+        for command, exit in (('echo "src.c:1:5: error: expected ;"; exit 2', 2), ('echo "error: x"; exit 1', 1),
+                              ('echo "[ 1%] Building src.c"; echo "error: x"; exit 2', 2), ('exit 2', 2), ('true', 0)):
+            with self.subTest(command):
+                code, out = self.run_script('--path=.', '--setup=echo "error: setup says so"', '--command', command)
+                self.assertEqual((out['exit'], out['usageError']), (exit, None), out)
+        _, out = self.run_script('--path=.', '--setup=echo "usage: x"; exit 2', '--command', 'true')
+        self.assertEqual((out['stage'], out['usageError']), ('setup', None), 'only the build step can refuse its arguments')
+
     def test_a_build_that_fails_or_kills_its_shell_is_a_build_failure(self):
         for command, exit in (('exit 3', 3), ('kill -9 $$', -9)):
             code, out = self.run_script('--path=.', '--command', command)
