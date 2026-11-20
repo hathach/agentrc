@@ -8616,16 +8616,18 @@ test('a state one module cannot hold loads in parts, each a module within the sc
   } finally { rmSync(first.emitRoot, { recursive: true, force: true }) }
 })
 
-test('a part missing, altered, another\'s or already there blocks the load before preflight, the stateRef untouched (#539)', async () => {
+test('a part missing, altered, cut short, another\'s or already there blocks the load before preflight, the stateRef untouched (#539)', async () => {
   const { state } = await savedForLoad()
   const big = seal({ ...state, decisions: [...state.decisions, ...othersWorth(600000)] })
   const stateRef = { outputFile: '/tmp/tasks/w1.output', digest: big.digest }
   const onParts = (change) => (l, a) => { if (l.startsWith('state:load')) change(a.parts); return a }
   for (const [what, opts, detail] of [
     ['missing', { garble: onParts(p => rmSync(p[1])) }, /^the state's part 2 of \d+ \(".+\.js\.part2\.js"\) is not the one its line names$/],
-    ['altered', { garble: onParts(p => writeFileSync(p[0], moduleOf(p[0], `${lineOf(p[0])} `))) }, /^the state's part 1 of \d+ /],
+    ['altered', { garble: onParts(p => writeFileSync(p[0], moduleOf(p[0], lineOf(p[0]).replace('invalid', 'invalie')))) },
+      /^the loaded state does not match stateRef\.digest$/],
+    ['cut short', { garble: onParts(p => writeFileSync(p[0], moduleOf(p[0], lineOf(p[0]).slice(0, -1)))) }, /^the state's \d+ parts do not join into JSON$/],
     ["another's", { garble: onParts(p => writeFileSync(p[0], readFileSync(p[1]))) }, /^the state's part 1 of \d+ /],
-    ['digests cut', { garble: (l, a) => l.startsWith('state:load') ? { ...a, partDigests: a.partDigests.slice(1) } : a }, /^the state_transfer\.py line names no parts to load$/],
+    ['none named', { garble: (l, a) => l.startsWith('state:load') ? { ...a, parts: [] } : a }, /^the state_transfer\.py line names no parts to load$/],
     ['already there', { beforeClaim: (l, file) => { if (l.startsWith('state:load')) writeFileSync(`${file}.part1.js`, 'stale') } },
       /^state_transfer\.py: cannot create .+\.js\.part1\.js: File exists$/],
   ]) {

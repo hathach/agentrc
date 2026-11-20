@@ -157,15 +157,15 @@ class StateTransferTest(unittest.TestCase):
                 big = self.dir / f'{what}-big.js'
                 self.assertEqual(self.run_script(self.saved(json.dumps({'result': {'state': state}}, ensure_ascii=False), f'{what}-big.output'), emit=big)[0], 0)
                 line = load(big)['line']
-                self.assertEqual(sorted(line), ['digest', 'partDigests', 'parts'])
+                self.assertEqual(sorted(line), ['digest', 'parts'])
                 self.assertEqual(line['parts'], [f'{big}.part{n}.js' for n in range(1, len(line['parts']) + 1)])
                 self.assertGreater(len(line['parts']), 1)
                 pieces = []
-                for path, digest in zip(line['parts'], line['partDigests'], strict=True):
+                for path in line['parts']:
                     self.assertLess(Path(path).stat().st_size, 524288, path)
                     self.assertLess(Path(path).stat().st_size, transfer.PART + 1024, path)
                     module = load(path)
-                    self.assertEqual((module['emit'], fnv1a(module['line'])), (path, digest))
+                    self.assertEqual(module['emit'], path)
                     pieces.append(module['line'])
                 self.assertEqual(''.join(pieces), json.dumps(state, ensure_ascii=True, separators=(',', ':')), 'its JSON, cut in order')
                 self.assertEqual(json.loads(''.join(pieces)), state)

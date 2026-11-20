@@ -13,10 +13,9 @@ and dir's as one, false when either cannot be read.
 
 Under AGENTRC_EMIT a state over PART bytes, whose one data module could pass the runtime's limit
 on a Workflow script file (524288 bytes in Claude Code 2.1.322), comes instead as
-{digest, parts, partDigests, checkout?}: its compact ASCII JSON cut in order into strings of at
-most PART bytes escaped, each the line of its own data module <AGENTRC_EMIT>.partN.js (N from 1),
-created before the line as that file is claimed, so one already there makes the line an error;
-partDigests are the workflow's fnv1a of each string.
+{digest, parts, checkout?}: its compact ASCII JSON cut in order into strings of at most PART
+bytes escaped, each the line of its own data module <AGENTRC_EMIT>.partN.js (N from 1), created
+before the line as that file is claimed, so one already there makes the line an error.
 
 The workflow runs it under AGENTRC_EMIT and loads the file that names (facts.py's
 report, lib/seal.py's emit), which then gets the line instead of stdout. Exit 0
@@ -30,7 +29,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from facts import Parser, Unusable, attempt, fnv1a, report, sealed  # noqa: E402
+from facts import Parser, Unusable, attempt, report, sealed  # noqa: E402
 import seal  # noqa: E402
 
 MAX = 8 * 1024 * 1024
@@ -82,12 +81,10 @@ def cut(text):
 
 
 def parts_of(text):
-    pieces = cut(text)
     try:
-        paths = [seal.emit_beside(f'.part{n}.js', piece) for n, piece in enumerate(pieces, 1)]
+        return {'parts': [seal.emit_beside(f'.part{n}.js', piece) for n, piece in enumerate(cut(text), 1)]}
     except OSError as e:
         raise Unusable(f'cannot create {e.filename}: {e.strerror}')
-    return {'parts': paths, 'partDigests': [fnv1a(p) for p in pieces]}
 
 
 def top_level(*at):

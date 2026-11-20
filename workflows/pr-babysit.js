@@ -389,17 +389,16 @@ if (args.stateRef != null) {
     { label, phase: 'Triage', agentType: 'relay', model: 'haiku', effort: 'low' })
   const stateOf = ({ line }) => line && !line.error && line.digest === ref.digest && line.state && typeof line.state === 'object' &&
     line.state.digest === ref.digest && sealOf(line.state) === ref.digest ? line.state : null
-  // A state one module cannot hold comes as parts, each its own module beside the line holding a run of the state's JSON.
+  // A state one module cannot hold comes as parts, each its own module beside the line holding a run of the state's JSON;
+  // the joined state's seal catches a part changed or cut short.
   const joined = async (line) => {
     if (line.error || line.parts === undefined) return { line }
-    const { parts, partDigests } = line
-    if (!Array.isArray(parts) || !parts.length || !Array.isArray(partDigests) || partDigests.length !== parts.length) {
-      return { why: 'the state_transfer.py line names no parts to load' }
-    }
+    const { parts } = line
+    if (!Array.isArray(parts) || !parts.length) return { why: 'the state_transfer.py line names no parts to load' }
     let text = ''
     for (const [i, path] of parts.entries()) {
       const p = typeof path === 'string' ? await loadData(path) : null
-      if (!p || p.emit !== path || typeof p.line !== 'string' || fnv1a(p.line) !== partDigests[i]) {
+      if (!p || p.emit !== path || typeof p.line !== 'string') {
         return { why: `the state's part ${i + 1} of ${parts.length} (${JSON.stringify(path)}) is not the one its line names` }
       }
       text += p.line
