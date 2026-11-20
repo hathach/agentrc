@@ -861,8 +861,6 @@ const RECHECK = withSeal({
     staged: { type: 'array', items: { type: 'string' } }, status: { type: 'array', items: { type: 'string' } },
   },
 })
-// Characters of a refused hook's output tail the refusal detail keeps.
-const HOOK_TAIL_CHARS = 600
 const HOOKS = withSeal({
   type: 'object', additionalProperties: false,
   required: ['ran', 'passed', 'modifiedBy', 'failed', 'baselineFailed', 'notRerun', 'before', 'after', 'snapshotBefore', 'snapshotAfter'],
@@ -1425,10 +1423,10 @@ const withheldStop = (cycles, lane, withheld) => {
 // A writer ran, so its edits are left uncommitted for the caller's review, named in `uncommitted` (#557): the scope its
 // writers were given; one that died may have edited before it did.
 const unverifiedStop = (cycles, lane, verdict) => {
-  const { unverifiable, withheld, fixes, owned } = verdict
+  const { unverifiable, withheld, fixes, uncommitted } = verdict
   log(`cycle ${cycles}: ${lane}-lane fixes left uncommitted for the caller's review — not pushing unverified changes` +
-    (owned.length ? `: ${owned.join(', ')}` : '') + (fixes.length ? '' : '; every writer died, so inspect the checkout for any edit they made'))
-  const also = { uncommitted: owned, ...(withheld.length ? { withheld } : {}) }
+    (uncommitted.length ? `: ${uncommitted.join(', ')}` : '') + (fixes.length ? '' : '; every writer died, so inspect the checkout for any edit they made'))
+  const also = { uncommitted, ...(withheld.length ? { withheld } : {}) }
   return unverifiable ? stop(cycles, 'build-unverifiable', { detail: unverifiable, ...(unverifiable.startsWith(BUILD_TIMED_OUT) ? { timedOut: true } : {}), ...also })
     : stop(cycles, 'fix-verification-failed', also)
 }
@@ -1719,6 +1717,8 @@ const fixAndVerify = async (workIn, tag, rejectable = false) => {
   const fixes = []
   // Only what a writer fixed is built, checked and published; a group whose every issue was rejected changed nothing.
   const changing = []
+  // A rejecting group's scope stays named uncommitted until its verifier finds no change there.
+  const unconfirmed = []
   for (const w of work) {
     const fix = await agent(
       `Fix the following issues on the PR branch. ${IN_CHECKOUT}\n` +
@@ -1752,6 +1752,7 @@ const fixAndVerify = async (workIn, tag, rejectable = false) => {
       'Return {"addresses": bool, "reason": string}.',
       { label: `check:${w.key}`, phase: 'Fix', agentType: 'finding-verifier', schema: CHECK },
     ).catch(quiet(`check:${w.key}`))
+    if (!kept.length && !(v && v.addresses)) unconfirmed.push(...w.files)
     fixes.push(verdictOf(fix, kept, !!(v && v.addresses), v ? v.reason : 'verifier died'))
   }
   const alive = fixes.filter(Boolean)
@@ -1762,6 +1763,7 @@ const fixAndVerify = async (workIn, tag, rejectable = false) => {
   const rejected = alive.filter(f => f.addresses === true).flatMap(f => f.rejected)
   const verified = unscoped.length === 0 && alive.length === work.length && unverified.length === 0
   const owned = [...new Set(changing.flatMap(c => [...c.files]))]
+  const uncommitted = [...new Set([...owned, ...unconfirmed])]
   const brief = { issues: changing.map(c => listOf(c.notes)), claims: changing.flatMap(c => c.notes.map(n => n.claim)), notes: alive.map(f => f.notes).filter(Boolean) }
   const fail = (why) => {
     for (const f of alive) Object.assign(f, { addresses: false, checkReason: why })
@@ -1785,6 +1787,7 @@ const fixAndVerify = async (workIn, tag, rejectable = false) => {
     fixes: alive,
     brief,
     owned,
+    uncommitted,
     unverifiable,
     rejected,
     withheld,
@@ -1955,19 +1958,16 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
     failedIds.filter(i => i === h).length > 1)
   // a failure hooks.py never reran on HEAD carries its reason, such as an unreadable hook config, into the refusal
   const notRerun = new Map(hooks.notRerun.map(n => [n.hook, n.why]))
-  // a refusal keeps how each hook's output ended, bounded: its first line alone may not tell a failure from a flake (#558)
-  const ending = (f) => {
-    const text = (f.tail || []).join(' | ')
-    return text ? ` [output ends: ${text.length > HOOK_TAIL_CHARS ? `…${text.slice(1 - HOOK_TAIL_CHARS)}` : text}]` : ''
-  }
-  const failures = (fs, withTail = false) => fs.map(f => `${f.hook}: ${f.error}${notRerun.has(f.hook) ? ` (not rerun on HEAD: ${notRerun.get(f.hook)})` : ''}${withTail ? ending(f) : ''}`).join('; ')
+  const failure = (f) => `${f.hook}: ${f.error}${notRerun.has(f.hook) ? ` (not rerun on HEAD: ${notRerun.get(f.hook)})` : ''}`
+  // a refusal keeps how each hook's output ended, as hooks.py bounded it: its first line alone may not tell a failure from a flake (#558)
+  const ending = (f) => f.tail?.length ? ` [output ends: ${f.tail.join(' | ')}]` : ''
   const hookWhy = outside.length ? `tree changed outside the fix scope before the hooks ran: ${outside.join(', ')}`
     : unsteady.length ? `regenerated path(s) no longer a plain modification when the hooks ran: ${unsteady.join(', ')}`
     : (hooks.passed && failedIds.length) || (!hooks.ran && failedIds.length) || hooks.baselineFailed.some(h => !failedIds.includes(h))
       ? 'hook evidence is inconsistent: a hook failed on HEAD without failing on the fix, or failed while the hooks passed or did not run'
     : unskippable.length ? `hook evidence is inconsistent: excused hook(s) modified files, cannot be skipped or share an id: ${unskippable.map(h => JSON.stringify(h)).join(', ')}`
     : hooks.ran && !hooks.passed && !failedIds.length ? 'the repository hooks do not pass on the fix, and pre-commit named no failing hook'
-    : blamed.length ? `the repository hooks do not pass on the fix: ${failures(blamed, true)}`
+    : blamed.length ? `the repository hooks do not pass on the fix: ${blamed.map(f => failure(f) + ending(f)).join('; ')}`
     : !hooks.ran && hooks.modifiedBy.length ? 'hook evidence is inconsistent: hooks reported modifying files without running'
     : !hooks.ran && regenerated.length ? `regenerated path(s) have no hook to vouch for them: ${regenerated.join(', ')}`
     : created.length ? `a hook created or renamed file(s): ${created.map(pathOf).join(', ')}`
@@ -1983,7 +1983,7 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
     log(`push#${cycle}-${what}: refusing to publish — ${hookWhy}`)
     return { pass: false, committed: false, detail: hookWhy, sha: '' }
   }
-  if (excused.length) log(`push#${cycle}-${what}: hook(s) failing on HEAD too, not counted against the fix: ${failures(excused)}`)
+  if (excused.length) log(`push#${cycle}-${what}: hook(s) failing on HEAD too, not counted against the fix: ${excused.map(failure).join('; ')}`)
   if (regenerated.length) log(`push#${cycle}-${what}: build output admitted into the commit: ${regenerated.join(', ')}`)
   if (hookPaths.length) log(`push#${cycle}-${what}: hook output admitted into the commit: ${hookPaths.join(', ')}`)
   const generatedPaths = [...new Set([...regenerated, ...hookPaths])]
@@ -3355,7 +3355,7 @@ const runLanes = async (cycle, entry, lanes) => {
       })))
       if (lanes.prState) return prEnded(cycle, lanes.prState)
       const verdict = await fixAndVerify(work, `${cycle}-review`, true)
-      const { ok, fixes, owned, brief, rejected } = verdict
+      const { ok, fixes, owned, uncommitted, brief, rejected } = verdict
       entry.reviewFixes = fixes
       // A rejected finding is held, its evidence on its decision, until the next harvest judges it again; a second rejection is the caller's.
       // Every rejection is held before any stop: an answered comment owes no debt, so only the hold keeps the finding outstanding.
@@ -3371,7 +3371,7 @@ const runLanes = async (cycle, entry, lanes) => {
       if (again.length) {
         const detail = again.map(x => `${x.id}: rejected again by its writer — ${x.evidence}`).join('; ')
         log(`cycle ${cycle}: ${detail}`)
-        return stop(cycle, 'fix-verification-failed', { detail, uncommitted: owned })
+        return stop(cycle, 'fix-verification-failed', { detail, uncommitted })
       }
       if (!verdict.dispatched && verdict.withheld.length) return withheldStop(cycle, 'review', verdict.withheld)
       if (args.autoPush !== true) {

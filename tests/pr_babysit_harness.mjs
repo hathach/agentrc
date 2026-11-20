@@ -1820,6 +1820,13 @@ test('a rejected point holds its whole comment: the fixed sibling is pushed, but
   assert.equal(result.observation.reviews.findings.find(f => f.findingId === '1#2').hold, 'its fix writer rejected it with evidence; judged again next cycle')
 })
 
+test('a rejection whose verifier still sees an edit names its scope uncommitted (#557)', async () => {
+  const { result, labels } = await run({ reviews: oneValid, fix: rejecting('1#1'), verify: { addresses: false, reason: 'src/a.c still has an edit' }, args: { autoPush: true, maxCycles: 1 } })
+  assert.equal(result.reason, 'fix-verification-failed')
+  assert.deepEqual(result.uncommitted, ['src/a.c'], 'the edit the verifier saw is left for the caller, named')
+  assert.equal(labels.some(l => /^(build[:#]|compat#|push#)/.test(l)), false, 'nothing of it is built or published')
+})
+
 test('a second rejection of the same finding, across a resumed launch, stops for the caller', async () => {
   const first = await run({ reviews: oneValid, fix: rejecting('1#1'), args: { autoPush: true, maxCycles: 3, yieldAfterCycle: true } })
   assert.equal(first.result.reason, 'yielded')
@@ -7278,7 +7285,7 @@ test('a failing hook is refused by name and first line unless it fails on HEAD t
     "the repository hooks do not pass on the fix: unit-test: preprocessing failed (not rerun on HEAD: PyYAML is not installed, nor is pre-commit's interpreter known, so the config was not read)")
 })
 
-test('a refused hook keeps how its output ended, bounded, and an excused one only its line (#558)', async () => {
+test('a refused hook keeps how its output ended as hooks.py bounded it, and an excused one only its line (#558)', async () => {
   const tail = ['bringing up nodes...', 'FAILED tests/test_a.py::t - AssertionError', '1 failed, 5 passed in 1.00s']
   const suite = { hook: 'skill-tests', error: 'FAILED tests/test_a.py::t - AssertionError', tail }
   const refused = await run({ ...publishing, hooks: { passed: false, failed: [suite] } })
@@ -7286,7 +7293,7 @@ test('a refused hook keeps how its output ended, bounded, and an excused one onl
     `the repository hooks do not pass on the fix: skill-tests: ${suite.error} [output ends: ${tail.join(' | ')}]`)
   const long = await run({ ...publishing, hooks: { passed: false, failed: [{ ...suite, tail: ['x'.repeat(400), 'y'.repeat(400)] }] } })
   const ends = long.result.history[0].reviewPushFailed.detail.match(/ \[output ends: (.*)\]$/)[1]
-  assert.equal(ends, `…${'x'.repeat(196)} | ${'y'.repeat(400)}`, 'its last 600 characters, the cut marked')
+  assert.equal(ends, `${'x'.repeat(400)} | ${'y'.repeat(400)}`, 'no second cut over the one hooks.py makes')
   const excused = await run({ ...publishing, hooks: { passed: false, failed: [suite], baselineFailed: ['skill-tests'] } })
   assert.equal(excused.result.history[0].reviewPush.pass, true)
   assert.ok(excused.logs.some(l => l.endsWith(`not counted against the fix: skill-tests: ${suite.error}`)))
