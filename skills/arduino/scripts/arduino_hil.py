@@ -520,7 +520,7 @@ def detach(name, board, vid_pid, tracker):
     ports = [board.get('usb_port')]
     if not (vid_pid or board.get('usb_port')):
         # usb_scan leaves out a serial read that was inconclusive, so one empty scan is not proof the DUT is gone.
-        # DETACH_WAIT bounds when a rescan may start, not the scan itself: one slow scan can overrun it.
+        # DETACH_WAIT limits retries; the sleep and next scan can overrun it.
         deadline = time.monotonic() + DETACH_WAIT
         while not (found := A.usb.usb_scan(serial=board['uid'])) and time.monotonic() < deadline:
             time.sleep(0.2)
