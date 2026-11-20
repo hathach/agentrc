@@ -88,7 +88,7 @@ BUILD_MARK = '--- pr-babysit build.py: build ---'
 USAGE_EXIT = 2  # argparse's, and Python's for a script it cannot open
 USAGE_ERROR = re.compile(r'(?:[\w.-]+: )?error: ')
 NO_SCRIPT = re.compile(r".+: can't open file '")
-OPTION = re.compile(r'(?<!\S)--?[A-Za-z][\w-]*')  # a command's `-x` or `--xx` word, short of any `=value`
+OPTION = re.compile(r'--?[A-Za-z][\w-]*')  # a command's `-x` or `--xx` word, short of any `=value`
 USAGE_LINES = 20  # how far into the output a usage error's `error:` line is looked for
 
 
@@ -117,7 +117,11 @@ def usage_error(log, stage, build_exit, command):
         return next(iter(errors), out[0])
     if NO_SCRIPT.match(out[0]):
         return out[0]
-    options = set(OPTION.findall(command))
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        words = command.split()
+    options = {m[0] for w in words if (m := OPTION.match(w))}
     return next((t for t in errors if any(re.search(rf'(?<![\w-]){re.escape(o)}(?![\w-])', t) for o in options)), None)
 
 

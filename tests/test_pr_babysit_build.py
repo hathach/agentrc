@@ -176,6 +176,8 @@ class BuildTest(unittest.TestCase):
         for command, usage in (
             (f'{py} check_build.py --scope src.c --worktree', 'error: --worktree needs --base'),
             (f'{py} check_build.py --scope src.c --worktree --color', 'error: --worktree needs --base'),
+            (f"{py} check_build.py --scope src.c '--worktree'", 'error: --worktree needs --base'),
+            (f'{py} check_build.py --scope src.c "--worktree"', 'error: --worktree needs --base'),
             (f'{py} -c {shlex.quote(parse)} --scope src.c', 'check_build.py: error: the following arguments are required: --base'),
             (f'{py} no_such_check_build.py --scope src.c', ": can't open file '"),
         ):
