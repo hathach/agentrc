@@ -253,11 +253,10 @@ def worded(output):
     return [t for t in (copyable(line).strip() for line in output.splitlines()) if re.search(r'[^\W_]', t)]
 
 
-def first_error(record):
-    """The line naming what failed the hook, bounded for a relay to copy (#558): pytest's first FAILED or ERROR line,
-    else the line after its short test summary banner, else the first line with a word that is no runner banner, else
-    the first with a word; what failed it when it printed none."""
-    lines = worded(record['output'])
+def first_error(record, lines):
+    """The line of lines, record's output as worded() gives it, naming what failed the hook, bounded for a relay to
+    copy (#558): pytest's first FAILED or ERROR line, else the line after its short test summary banner, else the first
+    line with a word that is no runner banner, else the first with a word; what failed it when it printed none."""
     summary = next((i for i, t in enumerate(lines) if PYTEST_SUMMARY in t), len(lines))
     text = next((t for t in lines if PYTEST_FAILURE.match(t)), None) or next(iter(lines[summary + 1:]), None) \
         or next((t for t in lines if not BANNER.match(t)), None) or next(iter(lines), None)
@@ -266,23 +265,22 @@ def first_error(record):
     return 'files were modified by this hook' if record['modified'] else f"exit code: {record['retcode']}"
 
 
-def tail(output):
-    """The last TAIL_LINES lines with a word of a hook's output, each bounded as first_error's line."""
-    return [t[:ERROR_CHARS] for t in worded(output)[-TAIL_LINES:]]
-
-
 def results(text, code):
-    """(ids of the hooks that modified files, {hook, index, error, output} of each failed hook, attributed()'s roster)
-    of one run from its records; a run they cannot attribute modified nothing it can name and, when it failed, has one
-    failure UNOWNED says why, with no roster."""
+    """(ids of the hooks that modified files, {hook, index, error, tail, output} of each failed hook, attributed()'s
+    roster) of one run from its records; a run they cannot attribute modified nothing it can name and, when it failed,
+    has one failure UNOWNED says why, with no roster."""
     try:
         roster, ran = attributed(text, code)
     except Unattributed as e:
-        return [], [{'hook': UNOWNED, 'error': copyable(f'pre-commit exited {code} naming no hook: {e}')}] if code \
-            else [], None
-    return ([r['id'] for r in ran if r['modified']],
-            [{'hook': r['id'], 'index': r['index'], 'error': first_error(r), 'output': r['output']}
-             for r in ran if r['failed']], roster)
+        return [], [{'hook': UNOWNED, 'error': copyable(f'pre-commit exited {code} naming no hook: {e}'), 'tail': []}] \
+            if code else [], None
+    failed = []
+    for r in ran:
+        if r['failed']:
+            lines = worded(r['output'])
+            failed.append({'hook': r['id'], 'index': r['index'], 'error': first_error(r, lines),
+                           'tail': [t[:ERROR_CHARS] for t in lines[-TAIL_LINES:]], 'output': r['output']})
+    return [r['id'] for r in ran if r['modified']], failed, roster
 
 
 def unselected(failure, roster):
@@ -720,7 +718,7 @@ def run_hooks(paths, deadline=DEADLINE, start=None):
         try:
             _, more, found, roster = passes(paths, deadline, start, 'without the excused', skip=excused)
         except Late as e:
-            failures.append({'hook': UNOWNED, 'error': copyable(str(e))})
+            failures.append({'hook': UNOWNED, 'error': copyable(str(e)), 'tail': []})
             break
         ids += [h for h in more if h not in ids]
         failures += found
@@ -742,7 +740,7 @@ def collect(argv):
     snapshot_before = snapshot(paths, before)
     ran, passed, ids, failures, base_failed, not_rerun = run_hooks(paths, deadline, start)
     after = status()
-    failed = [{'hook': f['hook'], 'error': f['error'], 'tail': tail(f.get('output', ''))} for f in failures]
+    failed = [{'hook': f['hook'], 'error': f['error'], 'tail': f['tail']} for f in failures]
     return {'ran': ran, 'passed': passed, 'modifiedBy': ids, 'failed': failed, 'baselineFailed': base_failed,
             'notRerun': not_rerun, 'before': before, 'after': after, 'snapshotBefore': snapshot_before,
             'snapshotAfter': snapshot(paths, after)}

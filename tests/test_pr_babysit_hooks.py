@@ -253,7 +253,7 @@ class HooksTest(unittest.TestCase):
         code, out = self.run_script('a.txt')
         self.assertEqual(code, 0)
         self.assertEqual((out['ran'], out['passed'], out['modifiedBy']), (False, True, []))
-        self.assertEqual((errors(out), out['baselineFailed'], out['notRerun']), ([], [], []))
+        self.assertEqual((out['failed'], out['baselineFailed'], out['notRerun']), ([], [], []))
         self.assertEqual(out['before'], [' M a.txt'])
         self.assertEqual(out['before'], out['after'])
         self.assertEqual(self.snap(out['snapshotBefore'])['a.txt'][0], '644')
@@ -344,7 +344,7 @@ class HooksTest(unittest.TestCase):
             with self.subTest(inherited='GIT_LITERAL_PATHSPECS' in env):
                 (self.repo / 'a.txt').write_text(f'edited {n}\n')
                 code, out = self.run_script('a.txt', env=env)
-                self.assertEqual((code, out['passed'], errors(out)), (0, True, []), out)
+                self.assertEqual((code, out['passed'], out['failed']), (0, True, []), out)
                 done = subprocess.run([sys.executable, str(SCRIPT.with_name('commits.py')), 'commit', 'a.txt'], cwd=self.repo,
                                       env=env, input='Fix\n', capture_output=True, text=True)
                 line = json.loads(done.stdout.splitlines()[-1])
@@ -362,7 +362,6 @@ class HooksTest(unittest.TestCase):
         self.assertEqual(len(self.worktrees()), 1, 'the HEAD worktree is removed')
         self.assertEqual(out['snapshotBefore'], out['snapshotAfter'])
 
-
     def test_a_runner_banner_is_passed_over_for_the_failing_test_and_the_output_tail_kept(self):
         self.configure('xdist')
         (self.repo / 'a.txt').write_text('bad\n')
@@ -373,6 +372,7 @@ class HooksTest(unittest.TestCase):
             'bringing up nodes...', 'bringing up nodes...', '..F.s [ 50%]', '.... [100%]', '=== FAILURES ===', '___ T.test_b ___', 'AssertionError: 1 != 2',
             '=== short test summary info ===', 'FAILED tests/test_b.py::T::test_b - AssertionError: 1 != 2',
             '1 failed, 6 passed, 1 skipped in 0.50s'][-hooks.TAIL_LINES:])
+
     def test_a_consumed_failure_is_not_excused_by_matching_lone_reruns(self):
         # Alone, on the change and on HEAD, consume fails alike as the host would; in the ordered run it reported a
         # regression from what the earlier hook left, in an ignored file or outside the checkout, and consumed it.
@@ -512,7 +512,7 @@ class HooksTest(unittest.TestCase):
                 self.assertIn('SyntaxError', plain.stderr)
                 code, out = self.run_script('a.txt', env=env)
                 self.assertEqual((code, out['passed']), (0, False))
-                self.assertEqual([f['hook'] for f in errors(out)], [hooks.UNOWNED])
+                self.assertEqual([f['hook'] for f in out['failed']], [hooks.UNOWNED])
 
     def configure_unfed(self, *ids, unfed=()):
         """configure() with each id in unfed given `pass_filenames: false`."""
@@ -528,7 +528,7 @@ class HooksTest(unittest.TestCase):
         (self.repo / 'a.txt').write_text('edited\n')  # scribble rewrites b.txt on HEAD only
         code, out = self.run_script('new.txt')
         self.assertEqual((code, out['passed']), (0, False))
-        self.assertEqual([f['hook'] for f in errors(out)], ['nocc', 'newcheck', 'scribble', 'broken'])
+        self.assertEqual([f['hook'] for f in out['failed']], ['nocc', 'newcheck', 'scribble', 'broken'])
         self.assertEqual((out['baselineFailed'], out['notRerun']), (['nocc'], []),
                          'only the identical failure is excused: newcheck fails otherwise on HEAD, scribble modifies a '
                          'file there, and broken is passed filenames, so HEAD has none to give it')
@@ -644,7 +644,7 @@ class HooksTest(unittest.TestCase):
         self.configure('litter', 'nolitter')
         code, out = self.run_script('a.txt')
         self.assertEqual((code, out['passed']), (0, False))
-        self.assertEqual([f['hook'] for f in errors(out)], ['litter', 'nolitter'])
+        self.assertEqual([f['hook'] for f in out['failed']], ['litter', 'nolitter'])
         self.assertEqual(out['baselineFailed'], ['litter'])
         self.assertEqual(len(self.worktrees()), 1)
 
@@ -685,7 +685,7 @@ class HooksTest(unittest.TestCase):
         (self.repo / 'a.txt').write_text('edited\n')
         code, out = self.run_script('a.txt')
         self.assertEqual((code, out['passed']), (0, False))
-        self.assertEqual([f['hook'] for f in errors(out)], ['scribble', 'showb'])
+        self.assertEqual([f['hook'] for f in out['failed']], ['scribble', 'showb'])
         self.assertEqual(out['baselineFailed'], ['showb'])
 
     def test_a_hook_failing_on_head_in_other_words_is_not_excused(self):
@@ -716,7 +716,7 @@ class HooksTest(unittest.TestCase):
         self.configure('where')
         (self.repo / 'a.txt').write_text('edited\n')
         code, out = self.run_script('a.txt')
-        self.assertEqual((code, out['passed'], [f['hook'] for f in errors(out)]), (0, False, ['where']))
+        self.assertEqual((code, out['passed'], [f['hook'] for f in out['failed']]), (0, False, ['where']))
         self.assertEqual(out['baselineFailed'], ['where'])
 
     def test_an_id_entries_share_is_never_rerun_on_head(self):
@@ -727,7 +727,7 @@ class HooksTest(unittest.TestCase):
         self.configure()
         (self.repo / 'a.txt').write_text('bad\n')
         code, out = self.run_script('a.txt')
-        self.assertEqual((code, out['passed'], [f['hook'] for f in errors(out)]), (0, False, ['dup', 'dup']))
+        self.assertEqual((code, out['passed'], [f['hook'] for f in out['failed']]), (0, False, ['dup', 'dup']))
         self.assertEqual(out['baselineFailed'], [])
         self.assertEqual(out['notRerun'], [{'hook': 'dup', 'why': 'SKIP would skip another hook by it'}])
 
@@ -803,7 +803,7 @@ class HooksTest(unittest.TestCase):
         (self.repo / 'a.txt').write_text('bad\n')
         code, out = self.run_script('a.txt')
         self.assertEqual((code, out['passed']), (0, False))
-        self.assertEqual([f['hook'] for f in errors(out)], ['broken', 'nocc', 'picky'])
+        self.assertEqual([f['hook'] for f in out['failed']], ['broken', 'nocc', 'picky'])
         self.assertEqual(out['baselineFailed'], ['broken', 'nocc'])
         self.assertEqual(out['notRerun'], [], 'picky was rerun on HEAD and passed there')
 
@@ -906,7 +906,7 @@ class HooksTest(unittest.TestCase):
         (self.repo / 'a.txt').write_text('edited\n')
         code, out = self.run_script('a.txt')
         self.assertEqual((code, out['passed']), (0, False))
-        self.assertEqual([f['hook'] for f in errors(out)], ['zhook', 'nocc'])
+        self.assertEqual([f['hook'] for f in out['failed']], ['zhook', 'nocc'])
         self.assertEqual(out['baselineFailed'], ['nocc'])
 
     def test_failed_results_a_passing_hook_prints_are_no_failures(self):
@@ -949,7 +949,7 @@ class HooksTest(unittest.TestCase):
         (self.repo / '.pre-commit-config.yaml').write_text(CONFIG.format(HOOK.format(id='ok') + HOOK.format(id='broken')))
         code, out = self.run_script('a.txt', '.pre-commit-config.yaml')
         self.assertEqual((code, out['passed']), (0, False))
-        self.assertEqual([f['hook'] for f in errors(out)], ['broken'])
+        self.assertEqual([f['hook'] for f in out['failed']], ['broken'])
         self.assertEqual(out['baselineFailed'], [])
 
     def test_a_hook_still_rewriting_files_is_not_rerun_on_head(self):
@@ -969,7 +969,7 @@ class HooksTest(unittest.TestCase):
         self.configure('same', 'abbrev')
         (self.repo / 'a.txt').write_text('edited\n')
         code, out = self.run_script('a.txt', 'b.txt', env={**self.env, 'ABBREV': str(self.abbrev())})
-        self.assertEqual((code, out['passed'], out['modifiedBy'], errors(out)), (0, True, [], []))
+        self.assertEqual((code, out['passed'], out['modifiedBy'], out['failed']), (0, True, [], []))
 
     def pack(self, count):
         """Add count blobs in one pack: 16383 packed objects abbreviate to 7 hex digits, 16384 to 8."""
@@ -986,7 +986,7 @@ class HooksTest(unittest.TestCase):
         (self.repo / 'a.txt').write_text('edited\n')
         self.assertEqual(self.abbrev(), 7)
         code, out = self.run_script('a.txt')
-        self.assertEqual((code, out['passed'], out['modifiedBy'], errors(out)), (0, True, [], []))
+        self.assertEqual((code, out['passed'], out['modifiedBy'], out['failed']), (0, True, [], []))
         self.assertEqual(self.abbrev(), 8, 'the pack crossed the boundary')
 
     def test_markers_a_hook_prints_are_not_read_as_pre_commits(self):
@@ -1373,7 +1373,7 @@ class RunHooksTest(unittest.TestCase):
                 mock.patch.object(hooks, 'baseline', return_value=(['broken'], {})):
             failures = hooks.run_hooks(['a.txt'])[3]
         self.assertEqual(failures[-1], {'hook': hooks.UNOWNED, 'error': (
-            'pre-commit exited 1 naming no hook: pre-commit 9.9  is not a version hook_runner.py supports')})
+            'pre-commit exited 1 naming no hook: pre-commit 9.9  is not a version hook_runner.py supports'), 'tail': []})
 
     def test_a_padded_id_is_named_as_pre_commit_holds_it_and_never_rerun_on_head(self):
         # SKIP strips each name it gives, so it cannot skip that hook.
@@ -1662,10 +1662,11 @@ class RecordsTest(unittest.TestCase):
 
     def test_the_tail_is_the_last_worded_lines_bounded(self):
         output = ''.join(f'line {n}\n=====\n' for n in range(hooks.TAIL_LINES + 5)) + 'x' * 300 + '\n\x1b[31mend\x07\n'
-        tail = hooks.tail(output)
-        self.assertEqual(tail, [f'line {n}' for n in range(7, hooks.TAIL_LINES + 5)] + ['x' * hooks.ERROR_CHARS, 'end'])
-        self.assertEqual(len(tail), hooks.TAIL_LINES)
-        self.assertEqual(hooks.tail(''), [])
+        code, text = run_of(failed('suite', output), failed('quiet'))
+        loud, quiet = hooks.results(text, code)[1]
+        self.assertEqual(loud['tail'], [f'line {n}' for n in range(7, hooks.TAIL_LINES + 5)] + ['x' * hooks.ERROR_CHARS, 'end'])
+        self.assertEqual(len(loud['tail']), hooks.TAIL_LINES)
+        self.assertEqual(quiet['tail'], [])
 
     def test_terminal_escapes_and_control_characters_never_reach_the_error(self):
         code, text = run_of(failed('fmt', '\x1b[31m\x1b[0m\n\x1b[31merror:\x07\tbad\x1b[0m\n'))
@@ -1705,7 +1706,7 @@ class RecordsTest(unittest.TestCase):
                 ('its records are malformed', self.records(start, roster, {'record': 'hook', 'index': 0}, end))):
             with self.subTest(why):
                 self.assertEqual(hooks.results(text, 1), ([], [{
-                    'hook': hooks.UNOWNED, 'error': f'pre-commit exited 1 naming no hook: {why}'}], None))
+                    'hook': hooks.UNOWNED, 'error': f'pre-commit exited 1 naming no hook: {why}', 'tail': []}], None))
                 with self.assertRaisesRegex(hooks.Unattributed, f'^{re.escape(why)}$'):
                     hooks.attributed(text, 1)
         # a run that passed has no failure to name
