@@ -922,7 +922,7 @@ class Record(RecordCase):
         self.assertEqual(rec['roster'], {'path': 'test/hil/ci.json', 'sha256': ab.sha256(self.roster)})
         self.assertEqual(rec['dependencies'], [dep])
         self.assertEqual(rec['contract'], {f: ab.sha256(self.root / f) for f in self.P.CONTRACT_FILES})
-        self.assertEqual(rec['agentrc'], {'commit': 'a' * 40, 'files': {
+        self.assertEqual(rec['agentrc'], {'commit': 'a' * 40, 'sha256': {
             f: ab.sha256(self.agentrc['root'] / f) for f in self.agentrc['files']}})
         self.assertEqual(rec['agentrcSource'], {'source': 'installed', 'dirty': False})   # provenance, not compared
 
@@ -947,12 +947,13 @@ class Record(RecordCase):
         self.assertEqual(err, "agentrc changed since this process loaded it: ['skills/hil/scripts/hil_lock.py']; "
                               "build again")
 
-    def test_contract_identity_skips_absent_contract_files_and_always_binds_this_engine(self):
+    def test_contract_identity_skips_absent_contract_files_and_binds_the_closure_as_loaded(self):
         (self.root / 'contract/pin.json').unlink()
-        self.agentrc['files'] = ['skills/hil/scripts/hil_lock.py']
+        (self.agentrc['root'] / 'skills/hil/scripts/hil_lock.py').write_text('# edited after load\n')
         ident = ab.contract_identity()
         self.assertEqual(list(ident['contract']), ['contract/check.py'])
-        self.assertEqual(sorted(ident['agentrc']['files']), [ab.SELF, 'skills/hil/scripts/hil_lock.py'])
+        self.assertEqual(ident['agentrc'], {'commit': 'a' * 40, 'sha256': self.agentrc['sha256']})
+        self.assertEqual(ab.agentrc_drift(), ['skills/hil/scripts/hil_lock.py'])
 
     def test_record_refuses_two_sketches_of_one_basename(self):
         row = self.samd_row()
