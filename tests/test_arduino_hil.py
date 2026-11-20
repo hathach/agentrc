@@ -911,11 +911,47 @@ class Detach(Base):
         self.A.flash.run_openocd_commands.assert_not_called()
 
     def test_detach_without_a_record_waits_for_the_serial(self):
-        dut, hub, other = self.device('21-1.3', 1, 'OUID'), self.device('21-1', 2), self.device('21-1.4', 3, 'X')
+        dut, other = self.device('21-1.3', 1, 'OUID'), self.device('21-1.4', 3, 'X')
         serials = {'dev1': 'ouid', 'dev3': 'X'}   # serial compared case aside
-        self.assertEqual(self.wait(self.board('rig_ocd'), None, [[hub, dut, other], [hub, other]], serials),
-                         'detached')
-        self.assertEqual(self.A.usb.usb_devices.call_args, mock.call())   # any VID: no record names one
+        self.A.usb.usb_scan.return_value = [{**dut, 'serial': 'ouid'}]
+        self.assertEqual(self.wait(self.board('rig_ocd'), None, [[dut, other], [other]], serials), 'detached')
+        self.assertEqual(self.A.usb.usb_scan.call_args, mock.call(serial='OUID'))   # any VID: no record names one
+        self.assertEqual(self.A.usb.usb_devices.call_args, mock.call())
+
+    def test_a_console_reset_waits_on_the_dut_alone(self):
+        board = self.board('rig_ocd')
+        dut, peer = self.device('21-1.3', 1, 'OUID'), self.device('21-1.4', 2, 'P')
+        again, moved = self.device('21-1.3', 3), self.device('21-1.3', 4)   # new enumerations at the DUT's port
+        self.A.usb.usb_scan.return_value = [{**dut, 'serial': 'OUID'}]
+        held = f'still enumerated {H.DETACH_WAIT}s after the detach'
+        for label, polls, serials, want in (
+                ("a peer's inconclusive read", [[dut, peer], [peer]], {'dev1': 'OUID'}, 'detached'),
+                ("the DUT's inconclusive read", [[dut, peer]] * 10, {'dev2': 'P'}, held),
+                ('the serial re-enumerated at its port', [[again, peer]] * 10, {'dev3': 'OUID'}, held),
+                ('an inconclusive read re-enumerated at its port', [[again, peer]] * 10, {}, held),
+                ('another serial at its port', [[dut, peer], [moved, peer]], {'dev1': 'OUID', 'dev4': 'Q'},
+                 'detached')):
+            with self.subTest(label):
+                self.assertEqual(self.wait(board, None, polls, serials), want)
+
+    def test_a_console_reset_reports_a_dut_not_on_the_bus(self):
+        self.A.usb.usb_scan.return_value = []
+        self.assertEqual(self.wait(self.board('rig_ocd'), None, [], {}),
+                         'no device with serial OUID on the bus before the detach')
+        self.assertGreater(self.A.usb.usb_scan.call_count, 1)   # rescanned for the detach wait
+        self.A.flash.run_openocd_commands.assert_not_called()
+        self.A.usb.usb_devices.assert_not_called()
+
+    def test_a_dut_missed_by_one_scan_is_found_by_the_next(self):
+        dut = self.device('21-1.3', 1, 'OUID')
+        self.A.usb.usb_scan.side_effect = [[], [dut]]
+        self.assertEqual(self.wait(self.board('rig_ocd'), None, [[]] * 3, {}), 'detached')
+        self.A.flash.run_openocd_commands.assert_called_once()
+
+    def test_a_record_keeps_the_vid_pid_wide_wait(self):
+        peer = self.device('21-1.4', 2, 'P')
+        self.assertEqual(self.wait(self.board('rig_ocd'), '239a:cafe', [[peer]] * 10, {}),
+                         f'still enumerated {H.DETACH_WAIT}s after the detach')
         self.A.usb.usb_scan.assert_not_called()
 
     def test_an_inconclusive_serial_read_is_no_detach(self):
