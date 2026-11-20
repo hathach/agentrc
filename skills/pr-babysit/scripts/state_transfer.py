@@ -5,19 +5,24 @@
 
 FILE is a saved Workflow output holding {"result": {"state": ...}}: the line is
 {digest, state, checkout?}, digest the state's own. The state must carry its digest and stay
-within MAX bytes as compact ASCII JSON, the measure pr-babysit's STATE_MAX takes. MAX keeps the
-emitted data module, the state and a few hundred bytes around it, within the runtime's limit on a
-Workflow script file (524288 bytes in Claude Code 2.1.322) with room to spare; it bounds what a
-launch loads, not how far a state may grow (#539).
+within MAX bytes as compact ASCII JSON, the measure pr-babysit's STATE_MAX takes; MAX bounds the
+memory a load takes, not how far a state may grow (#539).
 checkout, when the state pins a checkoutDir other than '.', is {dir, same, seal}
 (seal: facts.sealed): same whether git names this directory's worktree top level
 and dir's as one, false when either cannot be read.
 
+Under AGENTRC_EMIT a state over PART bytes, whose one data module could pass the runtime's limit
+on a Workflow script file (524288 bytes in Claude Code 2.1.322), comes instead as
+{digest, parts, partDigests, checkout?}: its compact ASCII JSON cut in order into strings of at
+most PART bytes escaped, each the line of its own data module <AGENTRC_EMIT>.partN.js (N from 1),
+created before the line as that file is claimed, so one already there makes the line an error;
+partDigests are the workflow's fnv1a of each string.
+
 The workflow runs it under AGENTRC_EMIT and loads the file that names (facts.py's
 report, lib/seal.py's emit), which then gets the line instead of stdout. Exit 0
 with that line; exit 2 with {"error": ...} when FILE cannot be read, holds no
-state, the state exceeds MAX bytes or the arguments are wrong. Never writes but
-the emitted file.
+state, the state exceeds MAX bytes, a part's file cannot be created or the
+arguments are wrong. Never writes but the emitted files.
 """
 
 import json
@@ -25,9 +30,11 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from facts import Parser, Unusable, attempt, report, sealed  # noqa: E402
+from facts import Parser, Unusable, attempt, fnv1a, report, sealed  # noqa: E402
+import seal  # noqa: E402
 
-MAX = 256 * 1024
+MAX = 8 * 1024 * 1024
+PART = 384 * 1024
 
 
 def read(path):
@@ -51,10 +58,36 @@ def state_of(path):
         raise Unusable(f'{path} holds no result.state object')
     if not isinstance(state.get('digest'), str):
         raise Unusable(f'the state in {path} has no digest')
-    size = len(json.dumps(state, ensure_ascii=True, separators=(',', ':')))
-    if size > MAX:
-        raise Unusable(f'state too large: {size} bytes (max {MAX})')
-    return state
+    text = json.dumps(state, ensure_ascii=True, separators=(',', ':'))
+    if len(text) > MAX:
+        raise Unusable(f'state too large: {len(text)} bytes (max {MAX})')
+    return state, text
+
+
+def escaped(text):
+    """len(json.dumps(text)) - 2 for a piece of compact ASCII JSON, in which a JSON string escapes only '"' and '\\'."""
+    return len(text) + text.count('"') + text.count('\\')
+
+
+def cut(text):
+    """text in order, in strings each at most PART bytes escaped."""
+    out, at = [], 0
+    while at < len(text):
+        n = PART
+        while escaped(text[at:at + n]) > PART:
+            n -= (escaped(text[at:at + n]) - PART + 1) // 2
+        out.append(text[at:at + n])
+        at += n
+    return out
+
+
+def parts_of(text):
+    pieces = cut(text)
+    try:
+        paths = [seal.emit_beside(f'.part{n}.js', piece) for n, piece in enumerate(pieces, 1)]
+    except OSError as e:
+        raise Unusable(f'cannot create {e.filename}: {e.strerror}')
+    return {'parts': paths, 'partDigests': [fnv1a(p) for p in pieces]}
 
 
 def top_level(*at):
@@ -77,9 +110,10 @@ def collect(argv):
     p = Parser(prog='state_transfer.py', add_help=False)
     p.add_argument('file')
     a = p.parse_args(argv)
-    state = state_of(a.file)
+    state, text = state_of(a.file)
     checkout = checkout_of(state)
-    return {'digest': state['digest'], 'state': state, **({'checkout': checkout} if checkout else {})}
+    whole = {'state': state} if seal.EMIT_TO is None or len(text) <= PART else parts_of(text)
+    return {'digest': state['digest'], **whole, **({'checkout': checkout} if checkout else {})}
 
 
 if __name__ == '__main__':

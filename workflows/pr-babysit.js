@@ -361,7 +361,7 @@ const emitted = async (prompt, { label, inputDir, ...opts }) => {
 if (args.state != null && args.stateRef != null) throw new Error('pass state or stateRef, not both')
 const STATE_SCRIPT = `${AGENTRC}/skills/pr-babysit/scripts/state_transfer.py`
 // state_transfer.py's MAX, over its own measure: compact JSON with every non-ASCII UTF-16 unit escaped as \uXXXX.
-const STATE_MAX = 256 * 1024
+const STATE_MAX = 8 * 1024 * 1024
 const stateBytes = (st) => { const s = JSON.stringify(st); return s.length + 5 * (s.match(/[^\x00-\x7e]/g) || []).length }
 // A state passed inline is one a model typed into the arguments: it keeps the bound a typed copy was given (62c54ae2),
 // measured before a stateRef load fills args.state.
@@ -389,10 +389,27 @@ if (args.stateRef != null) {
     { label, phase: 'Triage', agentType: 'relay', model: 'haiku', effort: 'low' })
   const stateOf = ({ line }) => line && !line.error && line.digest === ref.digest && line.state && typeof line.state === 'object' &&
     line.state.digest === ref.digest && sealOf(line.state) === ref.digest ? line.state : null
+  // A state one module cannot hold comes as parts, each its own module beside the line holding a run of the state's JSON.
+  const joined = async (line) => {
+    if (line.error || line.parts === undefined) return { line }
+    const { parts, partDigests } = line
+    if (!Array.isArray(parts) || !parts.length || !Array.isArray(partDigests) || partDigests.length !== parts.length) {
+      return { why: 'the state_transfer.py line names no parts to load' }
+    }
+    let text = ''
+    for (const [i, path] of parts.entries()) {
+      const p = typeof path === 'string' ? await loadData(path) : null
+      if (!p || p.emit !== path || typeof p.line !== 'string' || fnv1a(p.line) !== partDigests[i]) {
+        return { why: `the state's part ${i + 1} of ${parts.length} (${JSON.stringify(path)}) is not the one its line names` }
+      }
+      text += p.line
+    }
+    try { return { line: { ...line, state: JSON.parse(text) } } } catch { return { why: `the state's ${parts.length} parts do not join into JSON` } }
+  }
   let got = await load('state:load')
   if (!got.line && !got.unclaimable) got = await load('state:load.retry')
-  const { line, why } = got
-  const st = stateOf(got)
+  const { line, why } = got.line ? await joined(got.line) : got
+  const st = stateOf({ line })
   if (st) {
     args.state = st
     loadedCheckout = line.checkout ?? null
