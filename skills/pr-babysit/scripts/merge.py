@@ -66,22 +66,6 @@ def pr_identity(url):
     return (f'{m[1]}/{m[2]}'.lower(), int(m[3])) if m else None
 
 
-# workflows/pr-babysit.js's CHUNKS: a state saves an array its runtime's VM boundary cannot carry as {CHUNKS: its runs}.
-CHUNKS = '#chunks'
-
-
-def unpacked(v):
-    """The workflow's unpacked: the state as it was sealed, each {CHUNKS: runs} its runs joined back into one array."""
-    if isinstance(v, list):
-        return [unpacked(x) for x in v]
-    if not isinstance(v, dict):
-        return v
-    runs = unpacked(v[CHUNKS]) if list(v) == [CHUNKS] else None
-    if isinstance(runs, list) and all(isinstance(r, list) for r in runs):
-        return [x for r in runs for x in r]
-    return {k: unpacked(x) for k, x in v.items()}
-
-
 def state_digest(state):
     """The workflow's sealOf: fnv1a over the canonical JSON of the state without its digest, nulls kept."""
     return fnv1a(canonical({k: v for k, v in state.items() if k != 'digest'}, nulls=True))
@@ -120,7 +104,7 @@ def launch(output, path, digest, tree, url, waived=()):
     result = output.get('result')
     if not isinstance(result, dict) or not isinstance(result.get('state'), dict):
         raise Unusable(f'--output {path} holds no result with a state')
-    state, obs = unpacked(result['state']), result.get('observation') or {}
+    state, obs = result['state'], result.get('observation') or {}
     reviews = obs.get('reviews') or {}
     waiver = waived_stop(result, obs, waived)
     # The waived stop's own blockers go with its reason; summarize() reads everything else as it stands.

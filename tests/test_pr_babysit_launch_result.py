@@ -658,6 +658,14 @@ class LaunchResultTest(unittest.TestCase):
             'comment 6: settlement not processed: no review harvest in this launch'])
         self.assertEqual(s['result']['handoffs'][0]['commentDigest'], 'd5', 'the whole handoff stays in the reading')
 
+    def test_an_array_saved_in_runs_is_read_whole(self):
+        data = output()
+        handoffs = [{'commentId': n, 'why': 'edited after we answered it'} for n in range(4097)]
+        data['result']['handoffs'] = {'#chunks': [handoffs[:4096], handoffs[4096:]]}
+        _, s = self.run_it(data)
+        self.assertEqual(len([b for b in s['blockers'] if b.startswith('comment ')]), 4097)
+        self.assertEqual(s['result']['handoffs'][4096], handoffs[4096])
+
     def test_an_unmarked_sonarcloud_issue_is_a_blocker_even_on_a_green_launch(self):
         data = output(result={'pass': True, 'status': 'complete', 'sonarUnmarked': [
             {'commentId': 3, 'how': 'refutation', 'last': {'commentId': 3, 'issue': 'K3', 'outcome': 'failed', 'detail': 'HTTP 503'}},

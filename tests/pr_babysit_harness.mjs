@@ -66,6 +66,14 @@ const acrossVm = (root) => {
   }
   return copy(root, 1)
 }
+// pr-babysit's packing of a long array for that boundary, and the unpacking every reader of a saved output does.
+const CHUNKS = '#chunks'
+const groupsOf = (list, n) => Array.from({ length: Math.ceil(list.length / n) }, (_, k) => list.slice(k * n, (k + 1) * n))
+const packed = (v) => Array.isArray(v) ? (v.length > ARRAY_CAP ? { [CHUNKS]: packed(groupsOf(v, ARRAY_CAP)) } : v.map(packed))
+  : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, packed(x)])) : v
+const unpacked = (v) => Array.isArray(v) ? v.map(unpacked)
+  : v && typeof v === 'object' ? (Object.keys(v).join() === CHUNKS ? unpacked(v[CHUNKS]).flat()
+    : Object.fromEntries(Object.entries(v).map(([k, x]) => [k, unpacked(x)]))) : v
 // A line without its null members, which is what facts.py's seal is taken over.
 const bare = (v) => Array.isArray(v) ? v.map(bare)
   : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).filter(([, x]) => x !== null).map(([k, x]) => [k, bare(x)])) : v
@@ -689,7 +697,8 @@ async function run(opts = {}) {
   const workflow = async (ref, a) => {
     if (!ref || typeof ref.scriptPath !== 'string') throw new Error('pr-babysit nests only a data module, by scriptPath')
     loads.push(ref.scriptPath)
-    return loadModule(ref.scriptPath, a, { pipeline, parallel, log: (m) => logs.push(String(m)) })
+    // A module's value enters this VM across the same boundary a result leaves it by.
+    return acrossVm(await loadModule(ref.scriptPath, a, { pipeline, parallel, log: (m) => logs.push(String(m)) }))
   }
 
   // nap()'s real delay is minutes; fire it immediately and record where in the
@@ -8671,23 +8680,52 @@ test('a part missing, altered, cut short, another\'s or already there blocks the
   }
 })
 
+// A stateRef to `st` as its launch saved it: packed, as the boundary carries it.
+const savedRef = (st) => ({ outputFile: '/tmp/tasks/w1.output', digest: st.digest })
+
 test('a state holding an array the VM boundary cannot carry saves it in runs and loads it back as it was sealed (#539)', async () => {
   const { state } = await savedForLoad()
   const many = Array.from({ length: ARRAY_CAP + 1 - state.decisions.length }, (_, i) => [`${9000 + i}#1`, { commentId: 9000 + i, verdict: 'invalid' }])
   const big = seal({ ...state, maxCycles: state.cyclesUsed, decisions: [...state.decisions, ...many] })
-  const args = (st) => ({ yieldAfterCycle: true, stateRef: { outputFile: '/tmp/tasks/w1.output', digest: st.digest } })
-  const first = await run({ args: args(big), load: big })
+  const args = (st) => ({ yieldAfterCycle: true, stateRef: savedRef(st) })
+  const refused = await run({ args: args(big), load: big })
+  assert.equal(refused.result.reason, 'state-transfer-failed', 'unpacked, its line cannot enter the VM')
+  const first = await run({ args: args(big), load: packed(big) })
   const saved = first.result.state
   assert.equal(first.result.reason, 'budget-exhausted')
-  assert.deepEqual(saved.decisions['#chunks'].map(r => r.length), [ARRAY_CAP, 1], 'in runs the boundary carries')
-  assert.deepEqual([first.result.stateDigest, saved.digest, saved.decisions['#chunks'].flat()], [big.digest, big.digest, big.decisions],
-    'sealed as the state it holds')
+  assert.deepEqual(saved.decisions[CHUNKS].map(r => r.length), [ARRAY_CAP, 1], 'in runs the boundary carries')
+  assert.deepEqual([first.result.stateDigest, saved.digest, unpacked(saved)], [big.digest, big.digest, big], 'sealed as the state it holds')
   assert.equal(transferOf(saved).error, undefined)
   // Its saved output is the next launch's stateRef: loaded, unpacked and sealed the same, it saves the same runs back.
   const again = await run({ args: args(saved), load: saved })
   assert.deepEqual([again.result.reason, again.result.state], ['budget-exhausted', saved])
-  assert.throws(() => acrossVm(big), /^Error: array length 4097 exceeds the maximum of 4096 supported across the workflow VM boundary$/,
-    'unpacked, the boundary refuses it')
+})
+
+test('a result whose findings or handoffs outgrow the VM boundary is saved in runs, read back whole (#539)', async () => {
+  // Two settled findings on each of 2049 comments: carried, they come back as 4098 findings in one harvest.
+  const first = await run({ reviews: { findings: [invalidFinding(), invalidFinding({ line: 2 })], replies: [{ commentId: 1, body: 'not so' }], bots: 'reviewed' },
+    args: { maxCycles: 5, yieldAfterCycle: true } })
+  const st = unpacked(first.result.state)
+  const [answer] = st.answeredWith
+  const comments = Array.from({ length: 2049 }, (_, i) => i + 1)
+  const settled = seal({ ...st,
+    decisions: comments.flatMap(c => st.decisions.map(([id, d]) => [id.replace(/^1#/, `${c}#`), { ...d, commentId: c, digest: `d${c}` }])),
+    answeredWith: comments.map(c => [c, { ...answer[1], digest: `d${c}` }]) })
+  const carried = await run({ args: { maxCycles: 5, stateRef: savedRef(settled) }, load: packed(settled),
+    reviewsPerCycle: (p) => ({ findings: [], replies: [], bots: 'reviewed', carry: carrying(p) }) })
+  assert.equal(carried.result.pass, true, carried.logs.join('\n'))
+  const whole = unpacked(carried.result)
+  assert.equal(whole.observation.reviews.findings.length, 4098)
+  assert.ok(carried.result.observation.reviews.findings[CHUNKS], 'in runs')
+  assert.ok(carried.logs.some(l => /2049 comment\(s\) unchanged since their findings settled — carried/.test(l)), carried.logs.join('\n'))
+  assert.equal(unpacked(carried.result.state).decisions.length, 4098)
+  // 4097 comments handed to the caller.
+  const { state } = await savedForLoad()
+  const owed = seal({ ...state, maxCycles: state.cyclesUsed,
+    debt: Array.from({ length: ARRAY_CAP + 1 }, (_, i) => [9000 + i, { dismissals: [], notes: [], edited: true }]) })
+  const handed = await run({ args: { yieldAfterCycle: true, stateRef: savedRef(owed) }, load: packed(owed) })
+  assert.deepEqual(unpacked(handed.result.handoffs).map(h => h.commentId), owed.debt.map(([id]) => id))
+  assert.deepEqual(unpacked(handed.result.state), owed)
 })
 
 test('a failed emit-dir read is asked again by the next relay, the load\'s retry included', async () => {

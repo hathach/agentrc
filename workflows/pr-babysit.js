@@ -162,9 +162,9 @@ const bare = (v) => Array.isArray(v) ? v.map(bare)
   : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).filter(([, x]) => x !== null).map(([k, x]) => [k, bare(x)])) : v
 const sealMatches = ({ seal, error, ...facts }) => seal === fnv1a(canonical(bare(facts)))
 const groupsOf = (list, n) => [...Array(Math.ceil(list.length / n)).keys()].map(k => list.slice(k * n, (k + 1) * n))
-// The runtime refuses a value holding an array longer than ARRAY_CAP across its VM boundary, the result included (Claude
-// Code 2.1.325): a state saves a longer one as { [CHUNKS]: its runs of ARRAY_CAP }, which a load unpacks before the
-// seal, taken over the unpacked state, is checked. No state field is named CHUNKS.
+// The runtime refuses a value holding an array longer than ARRAY_CAP across its VM boundary either way (Claude Code
+// 2.1.325): a launch's result saves a longer one as { [CHUNKS]: its runs of ARRAY_CAP }, which every reader of the saved
+// output unpacks, a load before it checks the seal, taken over the unpacked state. No result field is named CHUNKS.
 const ARRAY_CAP = 4096
 const CHUNKS = '#chunks'
 const packed = (v) => Array.isArray(v) ? (v.length > ARRAY_CAP ? { [CHUNKS]: packed(groupsOf(v, ARRAY_CAP)) } : v.map(packed))
@@ -1239,7 +1239,7 @@ const stateOut = () => {
     log(`state: ${bytes} bytes, over the ${STATE_MAX} a launch loads — the ${dropped} oldest of ${entries.length} CI verdict digest(s) left out, judged again by a later launch`)
   }
   out.state.digest = sealOf(out.state)
-  return { state: packed(out.state), size: out.size }
+  return out
 }
 const findingState = (f) => f.hold ? 'held' : f.deferral ? 'deferred' : f.verdict === 'valid' ? 'valid' : f.verdict === 'stale' ? 'stale' : 'refuted'
 // SonarCloud's own check, and Greptile's confidence check, a score of its review that collect.py reads by its app and
@@ -1399,10 +1399,10 @@ const finish = (verdict, status) => {
   const { reason, pass, cycles, history: cycleHistory, ...rest } = verdict
   const crAsk = !pass && !['pr-merged', 'pr-closed'].includes(reason) ? unreviewedCodeRabbit() : null
   if (crAsk) rest.coderabbitAsk = coderabbitAskOf(crAsk)
-  return {
+  return packed({
     stateDigest: state.digest, status: status || (pass ? 'complete' : 'blocked'), ...(reason !== undefined ? { reason } : {}), pass, cycles,
     rollup: launchRollup(), ...rest, ...(size > STATE_MAX ? { stateTooLarge: size } : {}), ...(corrections.length ? { corrections } : {}), ...(handoffs.length ? { handoffs } : {}), ...(settlements.length ? { settlements } : {}), ...(sonarUnmarked.length ? { sonarUnmarked } : {}), history: cycleHistory, observation, state,
-  }
+  })
 }
 // Comments the caller answers; a replySettlements entry then settles each. A repair's draft is only in a state an
 // earlier launch saved.

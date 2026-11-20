@@ -6,7 +6,8 @@
 FILE is a saved Workflow output holding {"result": {"state": ...}}: the line is
 {digest, state, checkout?}, digest the state's own. The state must carry its digest and stay
 within MAX bytes as compact ASCII JSON, the measure pr-babysit's STATE_MAX takes; MAX bounds the
-memory a load takes, not how far a state may grow (#539).
+memory a load takes, not how far a state may grow (#539). The state goes as saved, its long arrays
+still packed (facts.CHUNKS): the line crosses the same VM boundary, and the workflow unpacks it.
 checkout, when the state pins a checkoutDir other than '.', is {dir, same, seal}
 (seal: facts.sealed): same whether git names this directory's worktree top level
 and dir's as one, false when either cannot be read.
