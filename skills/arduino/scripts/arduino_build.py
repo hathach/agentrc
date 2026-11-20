@@ -65,8 +65,8 @@ import sys
 from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-FILES = ('skills/hil/boards.json', 'skills/hil/scripts/hil_boards.py', 'skills/hil/scripts/hil_load.py',
-         'skills/hil/scripts/usb_observe.py')
+FILES = ('skills/hil/boards.json', 'skills/hil/scripts/agentrc_source.py', 'skills/hil/scripts/hil_boards.py',
+         'skills/hil/scripts/hil_load.py', 'skills/hil/scripts/usb_observe.py')
 SELF = 'skills/arduino/scripts/arduino_build.py'
 SCHEMA = 2
 PROFILE_API = 1   # bump on a change a library profile must follow, arduino_hil's and arduino_remote's included
@@ -95,6 +95,7 @@ def _hil_load():
 hil_load = _hil_load()
 hil_load.require(__file__, FILES)
 hil_boards = hil_load.load_file('skills/hil/scripts/hil_boards.py')
+agentrc_source = hil_load.load_file('skills/hil/scripts/agentrc_source.py')   # binding, drift and admission
 
 
 def bind(profile):
@@ -1268,19 +1269,27 @@ def content_digest(top):
 
 
 def contract_identity():
-    """What a HIL record binds besides its images: the library's contract files and the agentrc closure this
-    process loaded (SELF and the harness's), each by sha256. The harness admits a record only when both match."""
-    agentrc = Path(P.AGENTRC['root'])
-    files = sorted({SELF, *P.AGENTRC.get('files', ())})
+    """What a HIL record binds besides its images: the library's contract files by sha256, and the agentrc closure
+    this process loaded in agentrc_source's portable form, {commit, sha256} (the digests as loaded). The harness
+    admits a record only when the contract files and the agentrc closure's bytes match; the commit is provenance."""
     return {'contract': {f: sha256(P.ROOT / f) for f in P.CONTRACT_FILES if (P.ROOT / f).is_file()},
-            'agentrc': {'commit': P.AGENTRC['commit'], 'files': {f: sha256(agentrc / f) for f in files}}}
+            'agentrc': agentrc_source.portable(P.AGENTRC)}
 
 
-def agentrc_drift(files):
-    """The closure files whose digests in `files` differ from the ones this process loaded (AGENTRC sha256): an
-    engine already imported runs the loaded bytes, so a record or a stage must not bind newer ones."""
+def agentrc_drift(files=None):
+    """The closure files whose bytes differ from the ones this process loaded (AGENTRC sha256): now on disk, or in
+    `files` {path: sha256} (a copy's digests); an engine already imported runs the loaded bytes, so a record or a
+    stage must not bind newer ones."""
+    if files is None:
+        return agentrc_source.drift(P.AGENTRC)
     loaded = P.AGENTRC['sha256']
     return sorted(f for f in {*loaded, *files} if loaded.get(f) != files.get(f))
+
+
+def agentrc_mismatch(recorded):
+    """Why a record's agentrc binding is not this process's closure ('' when it is): agentrc_source.mismatch on the
+    bytes, the commit provenance only."""
+    return agentrc_source.mismatch(recorded, P.AGENTRC, commit=False)
 
 
 def make_record(args, board, rows, before, diff, roster_path, prepared):
@@ -1352,7 +1361,7 @@ def make_record(args, board, rows, before, diff, roster_path, prepared):
         }
     platform = rows[0]['platform']
     identity = contract_identity()
-    drift = agentrc_drift(identity['agentrc']['files'])
+    drift = agentrc_drift()
     if drift:
         return None, f'agentrc changed since this process loaded it: {drift}; build again'
     record = {

@@ -213,6 +213,10 @@ class Records(Base):
         other = src.portable(ident)
         other['sha256'] = {**other['sha256'], SCRIPT: '0' * 64}
         self.assertIn(f'files differ: {SCRIPT}', src.mismatch(other, ident))
+        moved = {**src.portable(ident), 'commit': 'b' * 40}   # another commit, the same closure bytes
+        self.assertIn('it was built with agentrc bbbbbbbbbbbb', src.mismatch(moved, ident))
+        self.assertEqual(src.mismatch(moved, ident, commit=False), '')
+        self.assertIn(f'files differ: {SCRIPT}', src.mismatch(other, ident, commit=False))
 
     def test_binding_require_and_mismatch_refuse_drift_since_load(self):
         ident = src.identity('installed', self.inst, [SCRIPT])

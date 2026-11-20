@@ -482,18 +482,25 @@ class Admission(Base):
 
     def test_agentrc_drift_refused(self):
         rec = self.record()
+        data = json.loads(rec.read_text())
+        self.assertEqual(data['agentrc'], {'commit': 'a' * 40, 'sha256': self.agentrc['sha256']})   # portable form
         lock = self.agentrc['root'] / 'skills/hil/scripts/hil_lock.py'
         loaded = lock.read_text()
         lock.write_text('# another agentrc\n')
-        with self.assertRaisesRegex(H.Refused, f'built with other agentrc files \\(agentrc {"a" * 12}\\) than this '
-                                               f'harness loads \\(agentrc {"a" * 12}\\): rebuild it'):
-            self.admit(rec)
         with self.assertRaisesRegex(H.Refused, r"agentrc changed since this harness loaded it: "
                                                r"\['skills/hil/scripts/hil_lock.py'\]; rerun"):
             self.admit(rec)
         lock.write_text(loaded)
         self.agentrc['commit'] = 'b' * 40   # another commit with the same closure: the files decide
         self.admit(rec)
+        other = {**data['agentrc']['sha256'], 'skills/hil/scripts/hil_lock.py': '0' * 64}
+        rec.write_text(json.dumps({**data, 'agentrc': {'commit': 'c' * 40, 'sha256': other}}))
+        with self.assertRaisesRegex(H.Refused, f'it was built with agentrc {"c" * 12}, this run loads {"b" * 12} '
+                                               r'\(files differ: skills/hil/scripts/hil_lock.py\): rebuild it'):
+            self.admit(rec)
+        rec.write_text(json.dumps({**data, 'agentrc': {'commit': 'a' * 40, 'files': data['agentrc']['sha256']}}))
+        with self.assertRaisesRegex(H.Refused, 'it binds no agentrc identity: rebuild it'):   # an older record
+            self.admit(rec)
 
     def test_image_must_match_the_flasher(self):
         rec = self.record()

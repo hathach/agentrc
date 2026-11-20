@@ -122,7 +122,8 @@ class Run(Checkout):
                  (lambda: self.record(contract={}), r"the contract files \['contract/check.py', 'contract/pin.json'\] "
                                                     r"differ"),
                  (lambda: (self.agentrc['root'] / 'skills/hil/scripts/hil_lock.py').write_text('# another\n'),
-                  'built with other agentrc files'),
+                  'agentrc changed since this harness loaded it'),
+                 (lambda: self.record(agentrc={'commit': 'a' * 40, 'sha256': {}}), 'it was built with agentrc'),
                  (lambda: self.record(board='rig_jlink'), 'it is for rig_jlink, not rig_ocd'))
         for spoil, why in cases:
             with self.subTest(why=why):
@@ -147,7 +148,7 @@ class Run(Checkout):
         (self.root / 'contract/pin.json').write_text('{"commit": "pinned"}\n')
         R.record_files(path, self.head, BOARD)
         (self.agentrc['root'] / fake.SELF).write_text('# a newer engine\n')
-        with self.assertRaisesRegex(SystemExit, 'built with other agentrc files'):
+        with self.assertRaisesRegex(SystemExit, 'agentrc changed since this harness loaded it'):
             R.record_files(path, self.head, BOARD)
 
     def test_named_builds_of_one_source_stage_and_pin_each_image(self):
@@ -442,13 +443,13 @@ class Session(Checkout):
         self.open()
         session = self.root / '.hil-remote/s1.session.json'
         self.assertEqual(json.loads(session.read_text())['agentrc'],
-                         {'commit': 'a' * 40, 'files': self.agentrc['sha256']})
+                         {'commit': 'a' * 40, 'sha256': self.agentrc['sha256']})
         rec = self.record(experimental=True)
         data = json.loads(session.read_text())
         session.write_text(json.dumps({**data, 'agentrc': {**data['agentrc'], 'commit': 'b' * 40}}))
         self.main('session', 'stage', 's1', str(rec))   # the commit is provenance: the files decide
-        files = {**data['agentrc']['files'], 'skills/hil/scripts/hil_lock.py': '0' * 64}
-        session.write_text(json.dumps({**data, 'agentrc': {**data['agentrc'], 'files': files}}))
+        files = {**data['agentrc']['sha256'], 'skills/hil/scripts/hil_lock.py': '0' * 64}
+        session.write_text(json.dumps({**data, 'agentrc': {**data['agentrc'], 'sha256': files}}))
         with self.assertRaisesRegex(SystemExit, 'not the ones the session opened with'):
             self.main('session', 'stage', 's1', str(rec))
 

@@ -288,7 +288,7 @@ def cmd_session_stage(a):
     staged over another would replace the images an earlier record, the restore's included, pins."""
     s = session_record(a.run_id)
     # record_files admits only records of this process's agentrc files; the rig's harness is the one staged at open
-    if B.contract_identity()['agentrc']['files'] != (s.get('agentrc') or {}).get('files'):
+    if B.contract_identity()['agentrc']['sha256'] != (s.get('agentrc') or {}).get('sha256'):
         core.fail('this agentrc\'s files are not the ones the session opened with, so the rig would refuse records '
                   'built with them: close the session and open a new one')
     tree = core.load_attempt(P.ROOT, runs(), a.run_id)
