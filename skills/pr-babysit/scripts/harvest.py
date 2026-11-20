@@ -87,7 +87,7 @@ HEAD_ACTIVITIES = {'opened', 'synchronize', 'reopened', 'ready_for_review'}
 CR_PAUSED = '<!-- This is an auto-generated comment: review paused by coderabbit.ai -->'
 CR_RESUME = '`@coderabbitai resume` resumes it'
 CR_RATE = '<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->'
-CR_WALKTHROUGH = '<!-- This is an auto-generated comment: summarize by coderabbit.ai -->'
+CR_WALKTHROUGH = comment_digest.SUMMARY
 CR_RATE_STATUS = 'review rate limited'
 CR_REVIEW_FAILED = 'review failed'
 # A repository CodeRabbit reviews only on request: a box in its summary comment, ticked once asked, or these words beside it (#324).

@@ -27,7 +27,8 @@ TAIL = re.compile(
     r'|Confirmed as addressed by @[A-Za-z0-9-]+(?:\[bot\])?))'
     r'(?P<again>\n\n' + EITHER + r')?)?\Z')
 # hathach/agentrc#556's summary comment, 42 saved versions: what changed there with no finding changing.
-WALKTHROUGH = re.compile(r'\A\s*(?:<!--(?:(?!-->).)*-->\s*)*?<!-- This is an auto-generated comment: summarize by coderabbit\.ai -->', re.S)
+SUMMARY = '<!-- This is an auto-generated comment: summarize by coderabbit.ai -->'
+WALKTHROUGH = re.compile(r'\A\s*(?:<!--(?:(?!-->).)*-->\s*)*?' + re.escape(SUMMARY), re.S)
 CHROME = re.compile(
     r'(?:<!-- This is an auto-generated comment: (?!summarize )(?P<notice>[^>]*?) by coderabbit\.ai -->.*?'
     r'<!-- end of auto-generated comment: (?P=notice) by coderabbit\.ai -->'
