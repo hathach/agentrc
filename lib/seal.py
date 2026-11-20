@@ -12,6 +12,7 @@ import re
 import subprocess
 import sys
 import time
+from packing import CHUNKS, unpacked  # noqa: F401  re-exported
 
 RATE_LIMITED = re.compile(r'rate limit|HTTP 429', re.I)
 
@@ -57,24 +58,6 @@ def canonical(v, nulls=False):
     text = json.dumps(bare(v), separators=(',', ':'), ensure_ascii=False)
     # JSON.stringify escapes a lone surrogate; ensure_ascii=False would hash it raw.
     return re.sub('[\ud800-\udfff]', lambda m: f'\\u{ord(m.group()):04x}', text)
-
-
-# workflows/pr-babysit.js's CHUNKS: a launch's result saves an array its runtime's VM boundary cannot carry as
-# {CHUNKS: its runs}.
-CHUNKS = '#chunks'
-
-
-def unpacked(v):
-    """The workflow's unpacked: a saved result as the launch built it, each {CHUNKS: runs} its runs joined back into one
-    array."""
-    if isinstance(v, list):
-        return [unpacked(x) for x in v]
-    if not isinstance(v, dict):
-        return v
-    runs = unpacked(v[CHUNKS]) if list(v) == [CHUNKS] else None
-    if isinstance(runs, list) and all(isinstance(r, list) for r in runs):
-        return [x for r in runs for x in r]
-    return {k: unpacked(x) for k, x in v.items()}
 
 
 def sealed(facts):

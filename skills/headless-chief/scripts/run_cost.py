@@ -52,7 +52,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from shadows import user_scope  # noqa: E402
-from seal import unpacked  # noqa: E402  lib/, which shadows puts on the path
+from packing import unpacked  # noqa: E402  lib/, which shadows puts on the path
 
 PARTS = ('in', 'out', 'read', 'w5m', 'w1h')
 # $ per million tokens for PARTS, by model id prefix; each fits claude's cost-state

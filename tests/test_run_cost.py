@@ -2,6 +2,8 @@
 import importlib.util
 import io
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -255,6 +257,14 @@ class RunCostTest(unittest.TestCase):
         (records / 'wf_runs.json').write_text(json.dumps({'runId': 'wf_runs', 'workflowName': 'pr-babysit',
                                                           'result': {'rollup': {'pushed': {'#chunks': [pushed[:4096], pushed[4096:]]}}}}))
         self.assertEqual(run_cost.did(run_cost.record_of(self.session, 'wf_runs')), 'pushed ' + ', '.join(s[:7] for s in pushed))
+
+    def test_run_cost_leaves_an_agentrc_emit_it_inherits_alone(self):
+        # seal.py claims AGENTRC_EMIT on import; the cost report reads records through packing.py, which does not
+        emit = self.projects.parent / 'emit.js'
+        r = subprocess.run([sys.executable, str(SCRIPT), '--help'], capture_output=True, text=True,
+                           env={**os.environ, 'AGENTRC_EMIT': str(emit)})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(emit.exists())
 
     def test_the_brief_form_tables_launches_and_usage_and_writes_the_full_output(self):
         records = self.session / 'workflows'
