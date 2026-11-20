@@ -52,6 +52,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from shadows import user_scope  # noqa: E402
+from seal import unpacked  # noqa: E402  lib/, which shadows puts on the path
 
 PARTS = ('in', 'out', 'read', 'w5m', 'w1h')
 # $ per million tokens for PARTS, by model id prefix; each fits claude's cost-state
@@ -333,12 +334,12 @@ def timeline(session, walls):
 
 @functools.lru_cache(maxsize=None)
 def record_of(session, run):
-    """A run's record beside the transcripts, or {}."""
+    """A run's record beside the transcripts, or {}; a pr-babysit result's long arrays unpacked."""
     try:
         r = json.loads((session / 'workflows' / f'{run}.json').read_text(encoding='utf-8'))
     except (OSError, ValueError):
         return {}
-    return r if isinstance(r, dict) else {}
+    return unpacked(r) if isinstance(r, dict) else {}
 
 
 def workflow_name(session, run):

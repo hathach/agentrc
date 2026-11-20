@@ -28,7 +28,7 @@ except ImportError:  # Windows
     import msvcrt
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
-from seal import EMIT_TO, canonical, emit, emit_beside, fnv1a, module_text, rate_limit, sealed, utc  # noqa: E402,F401  re-exported for the scripts
+from seal import CHUNKS, EMIT_TO, canonical, emit, emit_beside, fnv1a, module_text, rate_limit, sealed, unpacked, utc  # noqa: E402,F401  re-exported for the scripts
 import gh_repo  # noqa: E402
 import windows  # noqa: E402
 from gh_repo import HOST, REPO, github_repo  # noqa: E402,F401  re-exported for the scripts
@@ -50,24 +50,6 @@ ATTRIBUTION = tuple(re.compile(p, re.I | re.ASCII) for p in (
 def attribution_in(text):
     """The first line of text that credits an agent or links a session, stripped; None when there is none."""
     return next((line.strip() for line in text.split('\n') if any(p.search(line) for p in ATTRIBUTION)), None)
-
-
-# workflows/pr-babysit.js's CHUNKS: a launch's result saves an array its runtime's VM boundary cannot carry as
-# {CHUNKS: its runs}.
-CHUNKS = '#chunks'
-
-
-def unpacked(v):
-    """The workflow's unpacked: a saved result as the launch built it, each {CHUNKS: runs} its runs joined back into one
-    array."""
-    if isinstance(v, list):
-        return [unpacked(x) for x in v]
-    if not isinstance(v, dict):
-        return v
-    runs = unpacked(v[CHUNKS]) if list(v) == [CHUNKS] else None
-    if isinstance(runs, list) and all(isinstance(r, list) for r in runs):
-        return [x for r in runs for x in r]
-    return {k: unpacked(x) for k, x in v.items()}
 
 
 class Unusable(Exception):
