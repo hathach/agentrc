@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { test as nodeTest } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { ABSENT, AsyncFunction, SENTINEL, claimOf, emitDirs, emitOf, loadModule, moduleOf } from './emit_stub.mjs'
+import { ABSENT, AsyncFunction, SENTINEL, claimOf, emitDirs, emitOf, lineOf, loadModule, moduleOf } from './emit_stub.mjs'
 
 // The body runs as the runtime runs it; `meta` is exposed so its value, not its spelling, is checked.
 const body = readFileSync(new URL('../workflows/pr-babysit.js', import.meta.url), 'utf8')
@@ -42,6 +42,38 @@ const canonical = (v) => Array.isArray(v) ? `[${v.map(canonical).join(',')}]`
   : v && typeof v === 'object' ? `{${Object.keys(v).sort().map(k => `${JSON.stringify(k)}:${canonical(v[k])}`).join(',')}}`
   : JSON.stringify(v)
 const seal = ({ digest, ...st }) => ({ ...st, digest: fnv1a(canonical(JSON.parse(JSON.stringify(st)))) })
+// The copy Claude Code 2.1.325 makes of a workflow's result as it leaves the VM (primitivizeDeep's copy, isLeaving), whose
+// refusal loses the result and the state in it: an array past 4096 entries or nesting past 28000 levels throws, a
+// function is left out (undefined in an array), a __proto__ key is dropped and a value met twice is copied once.
+const ARRAY_CAP = 4096
+const acrossVm = (root) => {
+  const seen = new Map()
+  const copy = (v, depth) => {
+    if (v === null || typeof v !== 'object') return typeof v === 'function' ? undefined : v
+    if (seen.has(v)) return seen.get(v)
+    if (depth > 28000) throw new Error('nesting deeper than 28000 levels is not supported')
+    if (Array.isArray(v)) {
+      const out = []
+      seen.set(v, out)
+      if (v.length > ARRAY_CAP) throw new Error(`array length ${v.length} exceeds the maximum of ${ARRAY_CAP} supported across the workflow VM boundary`)
+      for (let i = 0; i < v.length; i++) out[i] = copy(v[i], depth + 1)
+      return out
+    }
+    const out = {}
+    seen.set(v, out)
+    for (const k of Object.keys(v)) if (k !== '__proto__' && typeof v[k] !== 'function') out[k] = copy(v[k], depth + 1)
+    return out
+  }
+  return copy(root, 1)
+}
+// pr-babysit's packing of a long array for that boundary, and the unpacking every reader of a saved output does.
+const CHUNKS = '#chunks'
+const groupsOf = (list, n) => Array.from({ length: Math.ceil(list.length / n) }, (_, k) => list.slice(k * n, (k + 1) * n))
+const packed = (v) => Array.isArray(v) ? (v.length > ARRAY_CAP ? { [CHUNKS]: packed(groupsOf(v, ARRAY_CAP)) } : v.map(packed))
+  : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, packed(x)])) : v
+const unpacked = (v) => Array.isArray(v) ? v.map(unpacked)
+  : v && typeof v === 'object' ? (Object.keys(v).join() === CHUNKS ? unpacked(v[CHUNKS]).flat()
+    : Object.fromEntries(Object.entries(v).map(([k, x]) => [k, unpacked(x)]))) : v
 // A line without its null members, which is what facts.py's seal is taken over.
 const bare = (v) => Array.isArray(v) ? v.map(bare)
   : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).filter(([, x]) => x !== null).map(([k, x]) => [k, bare(x)])) : v
@@ -105,10 +137,11 @@ const chainAudit = (commits = [ADOPT], paths = ['src/adopted.c'], over = {}) => 
     changes: unpublished.length ? [{ sha: commits[commits.length - 1], paths: unpublished }] : [], refusal: '', ...over,
   }
 }
-const adoptionState = ({
+// A state as a launch returns it, unsealed: what a bound test measures before it seals the one it keeps.
+const unsealedState = ({
   maxCycles = 4, cyclesUsed = 1, reviewers = ['coderabbit'], autoRun = reviewers,
   protected: protectedPattern = null, pin = STATE_PIN, ...over
-} = {}) => seal({
+} = {}) => ({
   version: 4, pin: structuredClone(pin), expectedHead: HEAD, reviewClock: null, pending: null,
   config: {
     pr: 3888, reviewers, autoRun, checkoutDir: '.', ciWait: 30,
@@ -118,6 +151,7 @@ const adoptionState = ({
   ciCache: { reruns: [], entries: [] }, debt: [],
   last: cyclesUsed ? { cycle: cyclesUsed, head: HEAD } : null, ...over,
 })
+const adoptionState = (over) => seal(unsealedState(over))
 const adoptionArgs = (state, over = {}) => ({
   reviewers: state.config.reviewers, autoRun: state.config.autoRun,
   maxCycles: state.maxCycles, ciWait: state.config.ciWait,
@@ -144,15 +178,21 @@ const conforms = (schema, value, at) => {
   return value
 }
 
-// The real state_transfer.py's line for a saved output holding `state`.
+// The real state_transfer.py's line for a saved output holding `state`; under `emit`, the AGENTRC_EMIT file the relay
+// stub claimed, the line it writes there, its parts left beside it and the file left claimed for the stub to write.
 const STATE_TRANSFER = fileURLToPath(new URL('../skills/pr-babysit/scripts/state_transfer.py', import.meta.url))
-const transferOf = (state) => {
+const transferOf = (state, emit) => {
   const dir = mkdtempSync(join(tmpdir(), 'pr-babysit-state-'))
   try {
     const file = join(dir, 'w.output')
     writeFileSync(file, JSON.stringify({ result: { state } }))
-    const done = spawnSync('python3', [STATE_TRANSFER, file], { encoding: 'utf8' })
-    return JSON.parse(done.stdout.trim().split('\n').at(-1))
+    if (emit) rmSync(emit)
+    const { AGENTRC_EMIT: _, ...env } = process.env
+    const done = spawnSync('python3', [STATE_TRANSFER, file], { encoding: 'utf8', env: emit ? { ...env, AGENTRC_EMIT: emit } : env, maxBuffer: 64 << 20 })
+    if (!emit) return JSON.parse(done.stdout.trim().split('\n').at(-1))
+    const line = lineOf(emit)
+    writeFileSync(emit, '')
+    return line
   } finally { rmSync(dir, { recursive: true, force: true }) }
 }
 
@@ -276,9 +316,9 @@ async function run(opts = {}) {
     })
     if (opts.throwOn && (typeof opts.throwOn === 'function' ? opts.throwOn(label) : label.startsWith(opts.throwOn))) throw new Error(`${label} exploded`)
     if (label === 'state:load' || label === 'state:load.retry') {
-      // The real state_transfer.py on a saved output holding opts.load.
+      // The real state_transfer.py on a saved output holding opts.load, its parts written beside its file.
       if (opts.load instanceof Error) throw opts.load
-      return transferOf(opts.load)
+      return transferOf(opts.load, emitOf(prompt))
     }
     if (label === 'preflight' || label === 'preflight.retry') {
       return patch({ ...PIN, head, prHead }, opts.preflight)
@@ -657,7 +697,8 @@ async function run(opts = {}) {
   const workflow = async (ref, a) => {
     if (!ref || typeof ref.scriptPath !== 'string') throw new Error('pr-babysit nests only a data module, by scriptPath')
     loads.push(ref.scriptPath)
-    return loadModule(ref.scriptPath, a, { pipeline, parallel, log: (m) => logs.push(String(m)) })
+    // A module's value enters this VM across the same boundary a result leaves it by.
+    return acrossVm(await loadModule(ref.scriptPath, a, { pipeline, parallel, log: (m) => logs.push(String(m)) }))
   }
 
   // nap()'s real delay is minutes; fire it immediately and record where in the
@@ -742,8 +783,9 @@ async function run(opts = {}) {
         assert.match(value.replace(/^'(.*)'$/, '$1'), /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/, `${label}: coderabbit_trigger.py's ISO contract`)
       }
     }
+    const crossed = acrossVm(result)
     returned = true
-    return { result, logs, labels: calls.map(c => c.label), calls, napPoints, napMs, journal, loads, emitDir: emit.made, emitRoot: emit.root }
+    return { result: crossed, logs, labels: calls.map(c => c.label), calls, napPoints, napMs, journal, loads, emitDir: emit.made, emitRoot: emit.root }
   } finally {
     globalThis.setTimeout = realTimeout
     emit.cleanup(!returned)
@@ -2937,7 +2979,7 @@ test('another harvest error keeps today\'s path: every reviewer unknown, re-arme
 })
 
 const cacheFill = (n, from = 0) => Array.from({ length: n }, (_, i) => ({ link: job(from + i), bucket: 'fail', digest: fnv1a(String(from + i)) }))
-const STATE_REF_MAX = 262144 // state_transfer.py's MAX: what a stateRef loads
+const STATE_REF_MAX = 8 * 1024 * 1024 // state_transfer.py's MAX: what a stateRef loads
 const INLINE_STATE_MAX = 65536 // what an inline state may be
 // The largest n in [0, hi] for which fits(n) holds, fits holding up to some n and failing past it.
 const largest = (fits, hi) => {
@@ -2945,6 +2987,8 @@ const largest = (fits, hi) => {
   while (lo < hi) { const mid = Math.ceil((lo + hi) / 2); if (fits(mid)) lo = mid; else hi = mid - 1 }
   return lo
 }
+// A decision whose reason takes `bytes`: one string fills a state toward STATE_REF_MAX without thousands of entries to build.
+const padding = (bytes) => ['pad#1', { verdict: 'invalid', reason: 'x'.repeat(bytes) }]
 // n refuted findings, each with its reply: what grows a launch's saved state.
 const refuting = (n, reason) => ({ findings: Array.from({ length: n }, (_, i) => invalidFinding({ commentId: 100 + i, reason })),
   replies: Array.from({ length: n }, (_, i) => ({ commentId: 100 + i, body: 'not so' })), bots: 'reviewed' })
@@ -2952,8 +2996,9 @@ const refuting = (n, reason) => ({ findings: Array.from({ length: n }, (_, i) =>
 test('a saved state stays loadable: the oldest CI verdict digests go first, and a state still too large is named', async () => {
   const MAX = STATE_REF_MAX
   // Loaded by stateRef (an inline state stops at 64 KiB), as large as one loads; the launch's refutations then grow it.
-  const bytes = (st) => { const t = JSON.stringify(st); return t.length + 5 * (t.match(/[^\x00-\x7e]/g) || []).length }
-  const fill = (make) => make(largest(n => bytes(make(n)) <= MAX, 20000))
+  const bytes = (st) => { const t = JSON.stringify(st); return t.length + 5 * (t.length - t.replace(/[^\x00-\x7e]+/g, '').length) }
+  // Measured unsealed with a stand-in digest of the same length, sealed once.
+  const fill = (make, hi) => seal(make(largest(n => bytes({ ...make(n), digest: '00000000' }) <= MAX, hi)))
   const base = { cyclesUsed: 1, maxCycles: 2 }
   const spent = (state, reviews) => {
     const { state: _, ...args } = adoptionArgs(state, { adoptHead: undefined })
@@ -2961,7 +3006,7 @@ test('a saved state stays loadable: the oldest CI verdict digests go first, and 
   }
   const small = await spent(adoptionState({ ...base, ciCache: { reruns: [], entries: [{ ...cacheFill(1)[0], head: HEAD }] } }), WAITING)
   assert.deepEqual(small.result.state.ciCache.entries, cacheFill(1), 'an entry saved with its head still loads, and is saved without it')
-  const full = fill(n => adoptionState({ ...base, ciCache: { reruns: [], entries: cacheFill(n) } }))
+  const full = fill(n => unsealedState({ ...base, decisions: [padding(MAX - 200000)], ciCache: { reruns: [], entries: cacheFill(n) } }), 5000)
   const entries = full.ciCache.entries
   assert.equal(transferOf(full).error, undefined, 'a state at the bound loads')
   const cached = await spent(full, refuting(20, 'x'.repeat(1000)))
@@ -2976,8 +3021,8 @@ test('a saved state stays loadable: the oldest CI verdict digests go first, and 
   assert.match(transferOf(seal({ ...st, ciCache: { ...st.ciCache, entries: entries.slice(dropped - 1) } })).error, /^state too large/, 'as many as fit')
   // Measured as state_transfer.py measures it: a non-ASCII character is six bytes there.
   const ten = cacheFill(10)
-  const heavy = fill(n => adoptionState({ ...base, ciCache: { reruns: [], entries: ten },
-    decisions: Array.from({ length: n }, (_, i) => [`${i}#1`, { verdict: 'invalid', reason: '→'.repeat(300) }]) }))
+  const heavy = fill(n => unsealedState({ ...base, ciCache: { reruns: [], entries: ten },
+    decisions: Array.from({ length: n }, (_, i) => [`${i}#1`, { verdict: 'invalid', reason: '→'.repeat(300) }]) }), 10000)
   const big = await spent(heavy, refuting(20, '→'.repeat(1000)))
   assert.deepEqual(big.result.state.ciCache.entries, ten, 'none left out when leaving them all out would not fit either')
   assert.equal(big.logs.some(l => /left out/.test(l)), false)
@@ -2988,7 +3033,7 @@ test('a saved state stays loadable: the oldest CI verdict digests go first, and 
   assert.ok(JSON.stringify(big.result.state).length < MAX, 'the JSON length alone would have passed it')
 })
 
-test('an inline state keeps the 64 KiB bound a typed copy was given; a stateRef loads one to 256 KiB (#539)', async () => {
+test('an inline state keeps the 64 KiB bound a typed copy was given; a stateRef loads a larger one (#539)', async () => {
   const sized = (target) => {
     const make = (n) => adoptionState({ cyclesUsed: 1, maxCycles: 2, ciCache: { reruns: [], entries: cacheFill(n) } })
     const n = largest(m => JSON.stringify(make(m)).length <= target, 40000)
@@ -3008,9 +3053,11 @@ test('a relaunch from a trimmed state recalls a verdict it kept', async () => {
   const first = await run({ store, args: YIELD, reviews: WAITING, ci: redWith(RIG).ci })
   const st = first.result.state
   // As many older digests as a stateRef loads; this launch's refutations then take the state over the bound.
-  const pad = (n) => seal({ ...st, ciCache: { ...st.ciCache, entries: [...cacheFill(n, 1000), ...st.ciCache.entries] } })
-  const lo = largest(n => JSON.stringify(pad(n)).length <= STATE_REF_MAX, 20000)
-  const padded = pad(lo)
+  // Measured with st's own digest, as long as the one seal gives it.
+  const pad = (n) => ({ ...st, decisions: [...st.decisions, padding(STATE_REF_MAX - 200000)],
+    ciCache: { ...st.ciCache, entries: [...cacheFill(n, 1000), ...st.ciCache.entries] } })
+  const lo = largest(n => JSON.stringify(pad(n)).length <= STATE_REF_MAX, 5000)
+  const padded = seal(pad(lo))
   const trimmed = await run({ store, args: { ...YIELD, stateRef: { outputFile: '/tmp/tasks/w1.output', digest: padded.digest } }, load: padded,
     reviews: refuting(20, 'x'.repeat(1000)), ci: redWith(RIG).ci })
   const kept = trimmed.result.state.ciCache.entries
@@ -8575,6 +8622,110 @@ test('a state that does not check out, or no line of this run, blocks before pre
     assert.match(got.result.detail, detail)
     assert.deepEqual(got.labels, /^the relay died$/.test(got.result.detail) ? ['state:load', 'state:load.retry'] : ['state:load'], 'nothing past the loader runs')
   }
+})
+
+// Decisions on other comments, as a large PR's state holds them, taking a state past one data module (#539).
+const othersWorth = (bytes) => Array.from({ length: Math.ceil(bytes / 1000) }, (_, i) =>
+  [`${9000 + i}#1`, { commentId: 9000 + i, verdict: 'invalid', reason: '→ "q" \\ '.repeat(100) }])
+const partsOf = (loads) => loads.filter(f => /\.js\.part\d+\.js$/.test(f))
+
+test('a state one module cannot hold loads in parts, each a module within the script limit, and saves its digest back (#539)', async () => {
+  const { state } = await savedForLoad()
+  const big = seal({ ...state, maxCycles: state.cyclesUsed, decisions: [...state.decisions, ...othersWorth(600000)] })
+  assert.ok(JSON.stringify(big).length > 524288, 'one module could not hold it')
+  const stateRef = { outputFile: '/tmp/tasks/w1.output', digest: big.digest }
+  const args = { yieldAfterCycle: true, stateRef }
+  // The arguments the workflow fills its loaded state into.
+  const given = { pr: 3888, maxCycles: 1, autoPush: true, reviewers: ['coderabbit'], ...args }
+  const first = await run({ rawArgs: given, load: big, keepEmit: true })
+  try {
+    assert.deepEqual(given.state, big, 'loaded whole, every decision and reply body in it')
+    assert.equal(first.result.reason, 'budget-exhausted')
+    assert.equal(first.result.state.digest, big.digest, 'saved back byte for byte: the same digest')
+    assert.deepEqual(first.result.state, big)
+    const parts = partsOf(first.loads)
+    assert.ok(parts.length >= 2, first.loads.join('\n'))
+    const line = first.loads.find(f => /\/state_load\.1\.[0-9a-f]{8}\.js$/.test(f))
+    assert.ok(parts.every(f => f.startsWith(`${line}.part`)), 'beside the line that names them')
+    for (const f of parts) assert.ok(readFileSync(f).length < 524288, `${f}: ${readFileSync(f).length} bytes`)
+    // A resume answers the relay from its journal and loads the same files; a rerun of the relay meets its claimed
+    // file, runs nothing, and the line there names its own parts.
+    const resumed = await run({ args, load: big, resume: first.journal })
+    assert.deepEqual([resumed.calls, resumed.loads, resumed.result], [[], first.loads, first.result])
+    const again = await run({ args, load: big, emitDir: first.emitDir })
+    assert.ok(again.logs.includes('state:load: the line an earlier attempt of this call wrote, reloaded'), again.logs.join('\n'))
+    assert.deepEqual([again.loads, again.result], [first.loads, first.result])
+  } finally { rmSync(first.emitRoot, { recursive: true, force: true }) }
+})
+
+test('a part missing, altered, cut short, another\'s or already there blocks the load before preflight, the stateRef untouched (#539)', async () => {
+  const { state } = await savedForLoad()
+  const big = seal({ ...state, decisions: [...state.decisions, ...othersWorth(600000)] })
+  const stateRef = { outputFile: '/tmp/tasks/w1.output', digest: big.digest }
+  const onParts = (change) => (l, a) => { if (l.startsWith('state:load')) change(a.parts); return a }
+  for (const [what, opts, detail] of [
+    ['missing', { garble: onParts(p => rmSync(p[1])) }, /^the state's part 2 of \d+ \(".+\.js\.part2\.js"\) is not the one its line names$/],
+    ['altered', { garble: onParts(p => writeFileSync(p[0], moduleOf(p[0], lineOf(p[0]).replace('invalid', 'invalie')))) },
+      /^the loaded state does not match stateRef\.digest$/],
+    ['cut short', { garble: onParts(p => writeFileSync(p[0], moduleOf(p[0], lineOf(p[0]).slice(0, 9)))) }, /^the state's \d+ parts do not join into JSON$/],
+    ["another's", { garble: onParts(p => writeFileSync(p[0], readFileSync(p[1]))) }, /^the state's part 1 of \d+ /],
+    ['none named', { garble: (l, a) => l.startsWith('state:load') ? { ...a, parts: [] } : a }, /^the state_transfer\.py line names no parts to load$/],
+    ['already there', { beforeClaim: (l, file) => { if (l.startsWith('state:load')) writeFileSync(`${file}.part1.js`, 'stale') } },
+      /^state_transfer\.py: cannot create .+\.js\.part1\.js: File exists$/],
+  ]) {
+    const got = await run({ args: { yieldAfterCycle: true, maxCycles: 3, stateRef }, load: big, ...opts })
+    assert.deepEqual([got.result.status, got.result.reason, got.result.stateRef], ['blocked', 'state-transfer-failed', stateRef], what)
+    assert.match(got.result.detail, detail, what)
+    assert.deepEqual(got.labels, ['state:load'], `${what}: nothing past the loader runs`)
+  }
+})
+
+// A stateRef to `st` as its launch saved it: packed, as the boundary carries it.
+const savedRef = (st) => ({ outputFile: '/tmp/tasks/w1.output', digest: st.digest })
+
+test('a state holding an array the VM boundary cannot carry saves it in runs and loads it back as it was sealed (#539)', async () => {
+  const { state } = await savedForLoad()
+  const many = Array.from({ length: ARRAY_CAP + 1 - state.decisions.length }, (_, i) => [`${9000 + i}#1`, { commentId: 9000 + i, verdict: 'invalid' }])
+  const big = seal({ ...state, maxCycles: state.cyclesUsed, decisions: [...state.decisions, ...many] })
+  const args = (st) => ({ yieldAfterCycle: true, stateRef: savedRef(st) })
+  const refused = await run({ args: args(big), load: big })
+  assert.equal(refused.result.reason, 'state-transfer-failed', 'unpacked, its line cannot enter the VM')
+  const first = await run({ args: args(big), load: packed(big) })
+  const saved = first.result.state
+  assert.equal(first.result.reason, 'budget-exhausted')
+  assert.deepEqual(saved.decisions[CHUNKS].map(r => r.length), [ARRAY_CAP, 1], 'in runs the boundary carries')
+  assert.deepEqual([first.result.stateDigest, saved.digest, unpacked(saved)], [big.digest, big.digest, big], 'sealed as the state it holds')
+  assert.equal(transferOf(saved).error, undefined)
+  // Its saved output is the next launch's stateRef: loaded, unpacked and sealed the same, it saves the same runs back.
+  const again = await run({ args: args(saved), load: saved })
+  assert.deepEqual([again.result.reason, again.result.state], ['budget-exhausted', saved])
+})
+
+test('a result whose findings or handoffs outgrow the VM boundary is saved in runs, read back whole (#539)', async () => {
+  // Two settled findings on each of 2049 comments: carried, they come back as 4098 findings in one harvest.
+  const first = await run({ reviews: { findings: [invalidFinding(), invalidFinding({ line: 2 })], replies: [{ commentId: 1, body: 'not so' }], bots: 'reviewed' },
+    args: { maxCycles: 5, yieldAfterCycle: true } })
+  const st = unpacked(first.result.state)
+  const [answer] = st.answeredWith
+  const comments = Array.from({ length: 2049 }, (_, i) => i + 1)
+  const settled = seal({ ...st,
+    decisions: comments.flatMap(c => st.decisions.map(([id, d]) => [id.replace(/^1#/, `${c}#`), { ...d, commentId: c, digest: `d${c}` }])),
+    answeredWith: comments.map(c => [c, { ...answer[1], digest: `d${c}` }]) })
+  const carried = await run({ args: { maxCycles: 5, stateRef: savedRef(settled) }, load: packed(settled),
+    reviewsPerCycle: (p) => ({ findings: [], replies: [], bots: 'reviewed', carry: carrying(p) }) })
+  assert.equal(carried.result.pass, true, carried.logs.join('\n'))
+  const whole = unpacked(carried.result)
+  assert.equal(whole.observation.reviews.findings.length, 4098)
+  assert.ok(carried.result.observation.reviews.findings[CHUNKS], 'in runs')
+  assert.ok(carried.logs.some(l => /2049 comment\(s\) unchanged since their findings settled — carried/.test(l)), carried.logs.join('\n'))
+  assert.equal(unpacked(carried.result.state).decisions.length, 4098)
+  // 4097 comments handed to the caller.
+  const { state } = await savedForLoad()
+  const owed = seal({ ...state, maxCycles: state.cyclesUsed,
+    debt: Array.from({ length: ARRAY_CAP + 1 }, (_, i) => [9000 + i, { dismissals: [], notes: [], edited: true }]) })
+  const handed = await run({ args: { yieldAfterCycle: true, stateRef: savedRef(owed) }, load: packed(owed) })
+  assert.deepEqual(unpacked(handed.result.handoffs).map(h => h.commentId), owed.debt.map(([id]) => id))
+  assert.deepEqual(unpacked(handed.result.state), owed)
 })
 
 test('a failed emit-dir read is asked again by the next relay, the load\'s retry included', async () => {

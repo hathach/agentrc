@@ -142,23 +142,56 @@ class StateTransferTest(unittest.TestCase):
         self.assertEqual(len(json.dumps(state, ensure_ascii=True, separators=(',', ':'))), size)
         return state
 
-    def test_a_state_loads_up_to_256_kib_measured_escaped_and_its_module_fits_a_workflow_script(self):
-        # #539: a stateRef state stopped at 64 KiB; the runtime refuses a Workflow script file over 524288 bytes
-        # (Claude Code 2.1.322), and the emitted module is the state plus its wrapper.
-        self.assertEqual(transfer.MAX, 256 * 1024)
+    def transfer(self, state, name, emit=None):
+        """run_script on a saved output holding state, its non-ASCII written raw."""
+        return self.run_script(self.saved(json.dumps({'result': {'state': state}}, ensure_ascii=False), name), emit=emit)
+
+    @unittest.skipUnless(shutil.which('node'), 'needs Node.js')
+    def test_a_state_one_module_holds_is_its_line_whole_and_a_larger_one_comes_in_parts_each_within_a_script_file(self):
+        # #539: the runtime refuses a Workflow script file over 524288 bytes (Claude Code 2.1.322).
+        self.assertEqual((transfer.MAX, transfer.PART), (8 * 1024 * 1024, 384 * 1024))
         for what, unit in (('ASCII', 'a'), ('escape-heavy', '\u2192\U0001F600"\\\n\x7f')):
             with self.subTest(what):
                 at = self.dir / f'{what}.js'
-                state = self.at_size(transfer.MAX, unit)
-                file = self.saved(json.dumps({'result': {'state': state}}, ensure_ascii=False), f'{what}.output')
-                self.assertEqual(self.run_script(file, emit=at)[0], 0)
-                self.assertEqual(load(at)['line']['state'], state)
-                self.assertLess(at.stat().st_size, 524288)
-                self.assertLess(at.stat().st_size, transfer.MAX + 1024, 'the wrapper adds a few hundred bytes')
-                over = self.saved(json.dumps({'result': {'state': self.at_size(transfer.MAX + 1, unit)}}, ensure_ascii=False), f'{what}-over.output')
-                code, out = self.run_script(over)
-                self.assertEqual(code, 2)
-                self.assertEqual(out['error'], f'state too large: {transfer.MAX + 1} bytes (max {transfer.MAX})')
+                state = self.at_size(transfer.PART, unit)
+                self.assertEqual(self.transfer(state, f'{what}.output', emit=at)[0], 0)
+                self.assertEqual(load(at)['line'], {'digest': 'x', 'state': state}, 'the line it always was')
+                self.assertLess(at.stat().st_size, transfer.PART + 1024, 'the wrapper adds a few hundred bytes')
+                state = self.at_size(600 * 1024, unit)
+                big = self.dir / f'{what}-big.js'
+                self.assertEqual(self.transfer(state, f'{what}-big.output', emit=big)[0], 0)
+                line = load(big)['line']
+                self.assertEqual(sorted(line), ['digest', 'parts'])
+                self.assertEqual(line['parts'], [f'{big}.part{n}.js' for n in range(1, len(line['parts']) + 1)])
+                self.assertGreater(len(line['parts']), 1)
+                pieces = []
+                for path in line['parts']:
+                    self.assertLess(Path(path).stat().st_size, transfer.PART + 1024, path)
+                    module = load(path)
+                    self.assertEqual(module['emit'], path)
+                    pieces.append(module['line'])
+                self.assertEqual(''.join(pieces), json.dumps(state, ensure_ascii=True, separators=(',', ':')), 'its JSON, cut in order')
+
+    def test_a_state_up_to_max_loads_and_a_larger_one_is_refused(self):
+        at = self.dir / 'state.1.js'
+        self.assertEqual(self.transfer(self.at_size(transfer.MAX, 'a'), 'max.output', emit=at)[0], 0)
+        parts = sorted(self.dir.glob('state.1.js.part*.js'))
+        self.assertTrue(parts and all(p.stat().st_size < 524288 for p in parts), parts)
+        self.assertEqual(self.transfer(self.at_size(transfer.MAX + 1, 'a'), 'over.output'),
+                         (2, {'error': f'state too large: {transfer.MAX + 1} bytes (max {transfer.MAX})'}))
+
+    def test_stdout_takes_a_state_of_any_size_whole(self):
+        state = self.at_size(600 * 1024, 'a')
+        self.assertEqual(self.transfer(state, 'big.output'), (0, {'digest': 'x', 'state': state}))
+
+    @unittest.skipUnless(shutil.which('node'), 'needs Node.js')
+    def test_a_part_already_there_is_never_overwritten_and_the_line_says_so(self):
+        at = self.dir / 'state.1.js'
+        there = self.dir / 'state.1.js.part2.js'
+        there.write_text('stale')
+        self.assertEqual(self.transfer(self.at_size(1024 * 1024, 'a'), 'big.output', emit=at)[0], 2)
+        self.assertEqual(load(at)['line'], {'error': f'cannot create {there}: File exists'})
+        self.assertEqual(there.read_text(), 'stale')
 
     @unittest.skipUnless(shutil.which('node'), 'needs Node.js')
     def test_an_error_line_is_emitted_too(self):

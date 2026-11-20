@@ -45,7 +45,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
 import windows  # noqa: E402
-from facts import Parser, Unusable, git, report  # noqa: E402
+from facts import Parser, Unusable, git, report, unpacked  # noqa: E402
 from state_transfer import MAX  # noqa: E402
 
 CONDENSED = ('history', 'observation', 'state')
@@ -199,6 +199,7 @@ def coderabbit_blocker(ask):
 
 
 def load_output(path):
+    """The saved Workflow output at path, None when empty, its arrays unpacked as the launch built them."""
     try:
         raw = Path(path).read_text(encoding='utf-8')
     except (OSError, UnicodeDecodeError) as e:
@@ -211,7 +212,7 @@ def load_output(path):
         raise Unusable(f'--output {path} is not JSON: {e}')
     if not isinstance(output, dict):
         raise Unusable(f'--output {path} is not a Workflow output object')
-    return output
+    return unpacked(output)
 
 
 def ci_recovery(r):

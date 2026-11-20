@@ -2,6 +2,8 @@
 import importlib.util
 import io
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -247,6 +249,22 @@ class RunCostTest(unittest.TestCase):
         write(beside / 'agent-e1.jsonl', [turn(f'e{t}', 'claude-haiku-4-5', f'2026-09-25T{t}Z', out=1) for t in ('10:06:00', '10:10:00')])
         self.assertIn('Session wall 11.0 min, of which Workflow runs 7.5 min.', self.main('--session-id', SID)[1])
         self.assertEqual(run_cost.lane_of(run_cost.stage_of('preflight.retry')), 'setup', 'a relay retry keeps its stage kind')
+
+    def test_a_record_saved_with_an_array_in_runs_is_read_whole(self):
+        records = self.session / 'workflows'
+        records.mkdir(parents=True)
+        pushed = [f'{n:040x}' for n in range(4097)]
+        (records / 'wf_runs.json').write_text(json.dumps({'runId': 'wf_runs', 'workflowName': 'pr-babysit',
+                                                          'result': {'rollup': {'pushed': {'#chunks': [pushed[:4096], pushed[4096:]]}}}}))
+        self.assertEqual(run_cost.did(run_cost.record_of(self.session, 'wf_runs')), 'pushed ' + ', '.join(s[:7] for s in pushed))
+
+    def test_run_cost_leaves_an_agentrc_emit_it_inherits_alone(self):
+        # seal.py claims AGENTRC_EMIT on import; the cost report reads records through packing.py, which does not
+        emit = self.projects.parent / 'emit.js'
+        r = subprocess.run([sys.executable, str(SCRIPT), '--help'], capture_output=True, text=True,
+                           env={**os.environ, 'AGENTRC_EMIT': str(emit)})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(emit.exists())
 
     def test_the_brief_form_tables_launches_and_usage_and_writes_the_full_output(self):
         records = self.session / 'workflows'

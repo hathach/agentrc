@@ -285,6 +285,16 @@ class MergeTest(unittest.TestCase):
         out['result']['state']['cyclesUsed'] = 1
         self.assertBlocked(self.run_it(out), 'does not match its own digest')
 
+    def test_a_state_saved_with_an_array_in_runs_is_read_as_it_was_sealed(self):
+        def packed(key, n):
+            out = launch_output({key: [[f'{i}#1', {}] for i in range(n)]})
+            whole = out['result']['state'][key]
+            out['result']['state'][key] = {'#chunks': [whole[:4096], whole[4096:]]}
+            return out
+        got = self.run_it(packed('decisions', 4097))
+        self.assertEqual((got['outcome'], got['blockers']), ('ready', []), got)
+        self.assertBlocked(self.run_it(packed('debt', 4097), '--merge'), r'^launch: 4097 comment\(s\) still owed a reply$')
+
     def test_an_output_without_a_fingerprint_cannot_authorize(self):
         got = self.run_it(launch_output(reviews={'fingerprint': None}), '--merge')
         self.assertBlocked(got, 'no review fingerprint')

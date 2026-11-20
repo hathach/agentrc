@@ -42,7 +42,7 @@ python3 "$S/greptile_trigger.py" --pr N [--repo R] --head <sha>  # comment `@gre
 python3 "$S/ci_recover.py" --pr N [--repo R] --head <sha> --wait-minutes M  # cancel and re-run, once per run attempt, an Actions run on the head queued with no job past M minutes; recorded under the git common dir
 python3 "$S/build.py" --path 'src/a.c' --command 'make -C <BUILD>' [--setup L] [--require T] [--job DIR --wait-seconds S --timeout-seconds T]  # build the checkout as it stands; --job detached, waited on S seconds a call
 python3 "$S/scope_check.py" --path 'src/a.c' --path 'test/test_a.c'  # which paths a fix writer may edit or create
-python3 "$S/state_transfer.py" <saved output>  # a stateRef's state whole with its digest
+python3 "$S/state_transfer.py" <saved output>  # a stateRef's state whole with its digest; under AGENTRC_EMIT one past 384 KiB in parts beside that file
 python3 "$S/facts.py" emit-dir                 # a new directory for one launch's AGENTRC_EMIT files, and its nonce; ones unwritten for 14 days go
 python3 "$S/launch_result.py" --output <saved output> [--state-ref F:D] [--checkout DIR] [--keys]  # the caller's reading of a launch; --keys: settled failures' keys too
 python3 "$S/merge.py" --pr-url <url> --base <branch> --checkout DIR --output <saved output> --state-digest D [--waive BOT] [--merge]  # chief's merge gate; inspects without --merge; --waive drops a bot from the required reviews, and a last launch's stop on that bot alone, on the owner's word, recorded as `waived`

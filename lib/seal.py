@@ -12,6 +12,7 @@ import re
 import subprocess
 import sys
 import time
+from packing import CHUNKS, unpacked  # noqa: F401  re-exported
 
 RATE_LIMITED = re.compile(r'rate limit|HTTP 429', re.I)
 
@@ -74,6 +75,10 @@ EMIT_REFUSED = 3
 EMIT_UNCLAIMABLE = 4
 
 
+def create(path):
+    return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+
+
 def claim():
     """Claim the file AGENTRC_EMIT names before the script does anything: created empty with O_EXCL, so a rerun that
     meets an earlier run's file, finished or cut short, or cannot tell (EACCES, EPERM...), exits EMIT_REFUSED at once
@@ -83,7 +88,7 @@ def claim():
     if not path:
         return None, None
     try:
-        return path, os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        return path, create(path)
     except OSError as e:
         why = f'AGENTRC_EMIT {path}: {e.strerror}: nothing was run'
         print(why, file=sys.stderr)
@@ -110,7 +115,19 @@ def emit(line, code):
         print(json.dumps(line))
         return code
     fd, emit_fd = emit_fd, None
-    with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as f:
-        f.write(module_text(EMIT_TO, line))
+    write_module(fd, EMIT_TO, line)
     print(f'the line is in {EMIT_TO}')
     return code
+
+
+def write_module(fd, path, line):
+    with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as f:
+        f.write(module_text(path, line))
+
+
+def emit_beside(suffix, line):
+    """Write line as a data module at EMIT_TO + suffix, created as claim() creates EMIT_TO, so an earlier run's file is
+    never overwritten (OSError instead), and return that path: for a line one module cannot hold."""
+    path = EMIT_TO + suffix
+    write_module(create(path), path, line)
+    return path

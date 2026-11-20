@@ -346,9 +346,9 @@ class LaunchResultTest(unittest.TestCase):
         self.assertFalse(any('approve' in b for b in s['blockers']), 'only its own stop names them')
 
     def test_a_state_too_large_to_load_is_a_blocker(self):
-        rc, s = self.run_it(output(result={'pass': True, 'status': 'complete', 'stateTooLarge': 270000,
+        rc, s = self.run_it(output(result={'pass': True, 'status': 'complete', 'stateTooLarge': 8400000,
                                            'state': {'expectedHead': NEXT, 'cyclesUsed': 1, 'maxCycles': 5}}))
-        self.assertEqual(s['blockers'], ['the returned state is 270000 bytes, over the 262144 a launch loads: no launch can continue '
+        self.assertEqual(s['blockers'], ['the returned state is 8400000 bytes, over the 8388608 a launch loads: no launch can continue '
                                          'from it; keep the output file and report it, never reset or reconstruct the state'])
 
     def test_a_launch_stopped_at_load_is_a_blocker_and_keeps_the_state_it_was_given(self):
@@ -657,6 +657,14 @@ class LaunchResultTest(unittest.TestCase):
             "edited after we answered it; rejudge requested: the rewrite dropped dma_drain()",
             'comment 6: settlement not processed: no review harvest in this launch'])
         self.assertEqual(s['result']['handoffs'][0]['commentDigest'], 'd5', 'the whole handoff stays in the reading')
+
+    def test_an_array_saved_in_runs_is_read_whole(self):
+        data = output()
+        handoffs = [{'commentId': n, 'why': 'edited after we answered it'} for n in range(4097)]
+        data['result']['handoffs'] = {'#chunks': [handoffs[:4096], handoffs[4096:]]}
+        _, s = self.run_it(data)
+        self.assertEqual(len([b for b in s['blockers'] if b.startswith('comment ')]), 4097)
+        self.assertEqual(s['result']['handoffs'][4096], handoffs[4096])
 
     def test_an_unmarked_sonarcloud_issue_is_a_blocker_even_on_a_green_launch(self):
         data = output(result={'pass': True, 'status': 'complete', 'sonarUnmarked': [

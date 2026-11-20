@@ -180,9 +180,14 @@ A key not listed here throws before anything runs.
 - `state` or `stateRef: { outputFile, digest }`: a previous launch's state, or
   the saved output holding it and its `stateDigest`, loaded whole from the file
   `state_transfer.py` emits and checked against that digest. A `stateRef`
-  loads a state of up to 256 KiB (compact ASCII JSON), an inline `state` one
-  of up to 64 KiB; a launch whose returned state is larger says so
-  (`stateTooLarge`), and nothing trims its decisions or debt.
+  loads a state of up to 8 MiB (compact ASCII JSON), past 384 KiB in parts
+  that each fit a Workflow script file, an inline `state` one of up to 64 KiB;
+  a launch whose returned state is larger says so (`stateTooLarge`), and
+  nothing trims its decisions or debt. An array anywhere in a launch's result
+  longer than the 4096 entries the runtime carries out of a workflow is saved
+  as `{"#chunks": [runs of 4096]}`: a load joins the state's back before its
+  digest is checked, and `launch_result.py` and `merge.py` read the output
+  whole.
   `launch_result.py`'s `stateRef` names a copy it keeps outside the Workflow
   task directory, so a host reset does not take the state with it. Nothing
   prunes those copies: one is needed only while a caller may continue from its

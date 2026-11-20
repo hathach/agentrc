@@ -18,6 +18,8 @@ export const emitOf = (prompt) => String(prompt).match(/AGENTRC_EMIT='([^']+)' /
 const asciiJson = (v) => JSON.stringify(v).replace(/[\u007f-\uffff]/g, c => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`)
 // The module lib/seal.py's emit writes to `file`, byte for byte.
 export const moduleOf = (file, line) => `export const meta = { name: 'emit', description: 'a script line' }\nreturn ${asciiJson({ emit: file, line })}\n`
+// The line of the module at `file`, as moduleOf writes it.
+export const lineOf = (file) => JSON.parse(readFileSync(file, 'utf8').match(/^return (.*)$/m)[1]).line
 // The sentinel facts.py emit-dir writes in its directory (EMIT_SENTINEL), an emitted module of its own path.
 export const SENTINEL = 'emit-dir.js'
 // lib/seal.py's claim of `file`: undefined once created empty, else the refusal the relay answers, nothing run.
@@ -48,7 +50,7 @@ export function emitDirs (prefix, given, keep) {
     },
     answer () {
       const dir = this.dir()
-      return { dir, nonce: JSON.parse(readFileSync(`${dir}/${SENTINEL}`, 'utf8').match(/^return (.*)$/m)[1]).line.nonce }
+      return { dir, nonce: lineOf(`${dir}/${SENTINEL}`).nonce }
     },
     get made () { return made },
     get root () { return root },
