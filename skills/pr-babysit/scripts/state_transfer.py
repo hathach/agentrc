@@ -13,9 +13,10 @@ and dir's as one, false when either cannot be read.
 
 Under AGENTRC_EMIT a state over PART bytes, whose one data module could pass the runtime's limit
 on a Workflow script file (524288 bytes in Claude Code 2.1.322), comes instead as
-{digest, parts, checkout?}: its compact ASCII JSON cut in order into strings of at most PART
-bytes escaped, each the line of its own data module <AGENTRC_EMIT>.partN.js (N from 1), created
-before the line as that file is claimed, so one already there makes the line an error.
+{digest, parts, checkout?}: its compact ASCII JSON cut in order into strings of PART // 2
+characters, at most PART bytes once escaped, each the line of its own data module
+<AGENTRC_EMIT>.partN.js (N from 1), created before the line as that file is claimed, so one already
+there makes the line an error.
 
 The workflow runs it under AGENTRC_EMIT and loads the file that names (facts.py's
 report, lib/seal.py's emit), which then gets the line instead of stdout. Exit 0
@@ -29,8 +30,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from facts import Parser, Unusable, attempt, report, sealed  # noqa: E402
-import seal  # noqa: E402
+from facts import EMIT_TO, Parser, Unusable, attempt, emit_beside, report, sealed  # noqa: E402
 
 MAX = 8 * 1024 * 1024
 PART = 384 * 1024
@@ -63,26 +63,15 @@ def state_of(path):
     return state, text
 
 
-def escaped(text):
-    """len(json.dumps(text)) - 2 for a piece of compact ASCII JSON, in which a JSON string escapes only '"' and '\\'."""
-    return len(text) + text.count('"') + text.count('\\')
-
-
 def cut(text):
-    """text in order, in strings each at most PART bytes escaped."""
-    out, at = [], 0
-    while at < len(text):
-        n = PART
-        while escaped(text[at:at + n]) > PART:
-            n -= (escaped(text[at:at + n]) - PART + 1) // 2
-        out.append(text[at:at + n])
-        at += n
-    return out
+    """text in order, in strings that stay within PART bytes as a JSON string: compact ASCII JSON escapes only '"' and
+    '\\' there, each to two bytes."""
+    return [text[at:at + PART // 2] for at in range(0, len(text), PART // 2)]
 
 
 def parts_of(text):
     try:
-        return {'parts': [seal.emit_beside(f'.part{n}.js', piece) for n, piece in enumerate(cut(text), 1)]}
+        return {'parts': [emit_beside(f'.part{n}.js', piece) for n, piece in enumerate(cut(text), 1)]}
     except OSError as e:
         raise Unusable(f'cannot create {e.filename}: {e.strerror}')
 
@@ -109,7 +98,7 @@ def collect(argv):
     a = p.parse_args(argv)
     state, text = state_of(a.file)
     checkout = checkout_of(state)
-    whole = {'state': state} if seal.EMIT_TO is None or len(text) <= PART else parts_of(text)
+    whole = {'state': state} if EMIT_TO is None or len(text) <= PART else parts_of(text)
     return {'digest': state['digest'], **whole, **({'checkout': checkout} if checkout else {})}
 
 

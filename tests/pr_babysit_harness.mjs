@@ -8625,7 +8625,7 @@ test('a part missing, altered, cut short, another\'s or already there blocks the
     ['missing', { garble: onParts(p => rmSync(p[1])) }, /^the state's part 2 of \d+ \(".+\.js\.part2\.js"\) is not the one its line names$/],
     ['altered', { garble: onParts(p => writeFileSync(p[0], moduleOf(p[0], lineOf(p[0]).replace('invalid', 'invalie')))) },
       /^the loaded state does not match stateRef\.digest$/],
-    ['cut short', { garble: onParts(p => writeFileSync(p[0], moduleOf(p[0], lineOf(p[0]).slice(0, -1)))) }, /^the state's \d+ parts do not join into JSON$/],
+    ['cut short', { garble: onParts(p => writeFileSync(p[0], moduleOf(p[0], lineOf(p[0]).slice(0, 9)))) }, /^the state's \d+ parts do not join into JSON$/],
     ["another's", { garble: onParts(p => writeFileSync(p[0], readFileSync(p[1]))) }, /^the state's part 1 of \d+ /],
     ['none named', { garble: (l, a) => l.startsWith('state:load') ? { ...a, parts: [] } : a }, /^the state_transfer\.py line names no parts to load$/],
     ['already there', { beforeClaim: (l, file) => { if (l.startsWith('state:load')) writeFileSync(`${file}.part1.js`, 'stale') } },
