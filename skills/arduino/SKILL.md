@@ -188,7 +188,10 @@ user. The library's workflow and report comment are its own.
 3. Write dedicated HIL sketches, never examples, that end each exchange with a result line tied to the host's nonce,
    and a restoration sketch with no erase or write path, so the state a battery leaves survives it (name any
    side effect its init still has, as SPIFlash's `flash.begin()` setting a quad-enable bit). Write their host-side
-   checks in `hil_test.py`.
+   checks in `hil_test.py`. A core reuses the shared battery instead (feature `battery`): its `core_cdc` and
+   `core_timing` sketches answer `arduino_hil.py`'s INFO / ECHO / TIME / DELAY protocol (its docstring), its profile
+   names them in `CORE_TESTS` with the stack INFO reports, sets `ECHO_LENGTHS` and its tolerances, and writes only
+   its own checks in `TEST_FUNCS`, built from the same pieces (an nRF52's RTOS check after `core_timing_check`).
 4. Add the boards to `test/hil/ci.json`, commission each (`hil_test.py commission` on the board's host), run the
    battery on the farm (`hil_remote.py run`), and record what no board covers as the contract's Limits.
 5. Contract tests for the profile in `.claude/test/`, a pre-commit hook running `agentrc_pin.py test` (the installed
@@ -197,4 +200,5 @@ user. The library's workflow and report comment are its own.
 
 A core follows the same steps with its core-mode profile; its `agentrc_pin.py` copy also refuses engines without
 core mode (`'core'` missing from `arduino_build.PROFILE_FEATURES`), one whose rig board has a base image without
-`'base'`, and one whose `HIL_SKETCHES` names a build without `'named'`, since `PROFILE_API` stays 1 for them.
+`'base'`, one whose `HIL_SKETCHES` names a build without `'named'`, and one whose profile sets `CORE_TESTS` without
+`'battery'`, since `PROFILE_API` stays 1 for them.
