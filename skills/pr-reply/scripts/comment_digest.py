@@ -41,10 +41,15 @@ def sha12(text):
     return hashlib.sha256(text.encode()).hexdigest()[:12]
 
 
+def walkthrough(body):
+    """Whether body is CodeRabbit's summary comment, under any leading markers."""
+    return bool(WALKTHROUGH.match(body or ''))
+
+
 def forms(body, author):
     """The body's forms, its first one first; only the body itself when it has no other."""
     body = body or ''
-    if author == CODERABBIT and WALKTHROUGH.match(body):
+    if author == CODERABBIT and walkthrough(body):
         return list(dict.fromkeys((PREVIOUS.sub(r'\1up to \2', CHROME.sub('', body)), body)))
     m = TAIL.search(body) if author == CODERABBIT else None
     if not m:
