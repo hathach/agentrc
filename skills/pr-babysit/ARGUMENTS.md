@@ -112,7 +112,11 @@ A key not listed here throws before anything runs.
   names still fails the build as unverified. The build runs detached and is
   waited on over calls of at most nine minutes each, up to 180 minutes; one
   past that is stopped, process tree included, and stops `build-unverifiable`
-  with `timedOut: true`, apart from a build that failed.
+  with `timedOut: true`, apart from a build that failed. A command that exits 2
+  refusing its own arguments (build.py's `usageError`) built nothing and stops
+  `build-unverifiable` too. Every `build-unverifiable` and
+  `fix-verification-failed` stop leaves the fixes uncommitted for the caller's
+  review and names the paths their writers were given in `uncommitted`.
 - `ciWait`: minutes to wait on pending checks, default 30. CodeRabbit's own
   check is left out when coderabbit is in `autoRun` and the review lane runs:
   the review lane waits on it. A head with no other check registered settles

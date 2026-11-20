@@ -748,7 +748,7 @@ const BUILD_RUN = withSeal({
     revision: { type: 'string' }, snapshot: { type: 'string' }, snapshotAfter: { type: 'string' },
     command: { type: 'string' }, setup: { type: 'string' }, requires: { type: 'array', items: { type: 'string' } },
     stage: { type: 'string' },
-    buildDir: { type: 'string' }, exit: { type: 'integer' }, log: { type: 'string' },
+    buildDir: { type: 'string' }, exit: { type: 'integer' }, usageError: { type: ['string', 'null'] }, log: { type: 'string' },
     retained: { type: 'array', items: { type: 'string' } }, error: { type: 'string' },
   },
 })
@@ -868,7 +868,7 @@ const HOOKS = withSeal({
     error: { type: 'string' },
     ran: { type: 'boolean' }, passed: { type: 'boolean' },
     modifiedBy: { type: 'array', items: { type: 'string' } },
-    failed: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['hook', 'error'], properties: { hook: { type: 'string' }, error: { type: 'string' } } } },
+    failed: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['hook', 'error'], properties: { hook: { type: 'string' }, error: { type: 'string' }, tail: { type: 'array', items: { type: 'string' } } } } },
     baselineFailed: { type: 'array', items: { type: 'string' } },
     notRerun: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['hook', 'why'], properties: { hook: { type: 'string' }, why: { type: 'string' } } } },
     before: { type: 'array', items: { type: 'string' } }, after: { type: 'array', items: { type: 'string' } },
@@ -1420,12 +1420,13 @@ const withheldStop = (cycles, lane, withheld) => {
   log(`cycle ${cycles}: every ${lane}-lane fix withheld for the caller — nothing left uncommitted`)
   return stop(cycles, 'fixes-withheld', { withheld })
 }
-// A writer ran, so its edits are left uncommitted; one that died may have edited before it did.
+// A writer ran, so its edits are left uncommitted for the caller's review, named in `uncommitted` (#557): the scope its
+// writers were given; one that died may have edited before it did.
 const unverifiedStop = (cycles, lane, verdict) => {
-  const { unverifiable, withheld, fixes } = verdict
+  const { unverifiable, withheld, fixes, uncommitted } = verdict
   log(`cycle ${cycles}: ${lane}-lane fixes left uncommitted for the caller's review — not pushing unverified changes` +
-    (fixes.length ? '' : '; every writer died, so inspect the checkout for any edit they made'))
-  const also = withheld.length ? { withheld } : {}
+    (uncommitted.length ? `: ${uncommitted.join(', ')}` : '') + (fixes.length ? '' : '; every writer died, so inspect the checkout for any edit they made'))
+  const also = { uncommitted, ...(withheld.length ? { withheld } : {}) }
   return unverifiable ? stop(cycles, 'build-unverifiable', { detail: unverifiable, ...(unverifiable.startsWith(BUILD_TIMED_OUT) ? { timedOut: true } : {}), ...also })
     : stop(cycles, 'fix-verification-failed', also)
 }
@@ -1569,7 +1570,10 @@ const buildCheck = async (tag, owned) => {
         'setup = the shell lines the contract says must run first in the same shell (sourcing a toolchain\'s environment script, say), else null; ' +
         'requires = the executables command runs that setup or the system must put on PATH, each a bare name; ' +
         // #309: a wrapper building one board per family needed Espressif's export.sh and idf.py, and a missing idf.py failed the batch.
-        'when command builds several targets or board families, a wrapper script\'s included, setup and requires hold every one\'s: each family\'s own setup the contract names (such as `. "$IDF_PATH/export.sh"` before an Espressif build) and each tool its build invokes, through the wrapper too (such as idf.py), so a missing one stops the shell before the build; ' +
+        'when command builds several targets or board families, a wrapper script\'s included, setup and requires hold every one\'s: each family\'s own setup the contract names (such as `. "$IDF_PATH/export.sh"` before an Espressif build) and each tool its build invokes, through the wrapper too (such as idf.py), so a missing one stops the shell before the build. ' +
+        // #557: a selection flag without the one it needs (check_build.py's --worktree without --base) refused every candidate.
+        'The change is uncommitted when command runs: where the contract selects what to build from a change, use the form it gives for uncommitted and untracked changes, with every argument that form needs, ' +
+        'such as `--base <ref> --worktree` with the ref the contract\'s own examples use, never a committed-only form or one flag of such a form without the others. ' +
         'contract = every instruction, doc and build-system file you read the contract from, any of these paths among them; command = null, with reason, when no build applies to these paths; error = why the contract could not be resolved, else null.',
         { label: `build:resolve#${tag}`, phase: 'Fix', model: 'sonnet', schema: BUILD_PLAN },
       ).catch(quiet(`build:resolve#${tag}`))
@@ -1610,6 +1614,11 @@ const buildCheck = async (tag, owned) => {
   if (r.retained.length) log(`build#${tag}: cleanup left ${r.retained.join(', ')}`)
   // A shell that stopped before the build says nothing of the code: its environment is missing.
   if (r.stage !== 'build') return `the build environment is not set up: its ${r.stage} step stopped the shell (exit ${r.exit}); log ${r.log}`
+  // A command that refused its own arguments built nothing: its plan failed, not the candidate (#557).
+  if (r.usageError) {
+    return `${plan === callerPlan ? "the caller's build command" : 'build contract not resolved: the resolved command'} refused its arguments and built nothing ` +
+      `(exit ${r.exit}: ${r.usageError}); log ${r.log}`
+  }
   return r.exit === 0 ? null : `${BUILD_FAILED} (exit ${r.exit}); log ${r.log}`
 }
 
@@ -1708,6 +1717,8 @@ const fixAndVerify = async (workIn, tag, rejectable = false) => {
   const fixes = []
   // Only what a writer fixed is built, checked and published; a group whose every issue was rejected changed nothing.
   const changing = []
+  // A rejecting group's scope stays named uncommitted until its verifier finds no change there.
+  const unconfirmed = []
   for (const w of work) {
     const fix = await agent(
       `Fix the following issues on the PR branch. ${IN_CHECKOUT}\n` +
@@ -1741,6 +1752,7 @@ const fixAndVerify = async (workIn, tag, rejectable = false) => {
       'Return {"addresses": bool, "reason": string}.',
       { label: `check:${w.key}`, phase: 'Fix', agentType: 'finding-verifier', schema: CHECK },
     ).catch(quiet(`check:${w.key}`))
+    if (!kept.length && !(v && v.addresses)) unconfirmed.push(...w.files)
     fixes.push(verdictOf(fix, kept, !!(v && v.addresses), v ? v.reason : 'verifier died'))
   }
   const alive = fixes.filter(Boolean)
@@ -1751,6 +1763,7 @@ const fixAndVerify = async (workIn, tag, rejectable = false) => {
   const rejected = alive.filter(f => f.addresses === true).flatMap(f => f.rejected)
   const verified = unscoped.length === 0 && alive.length === work.length && unverified.length === 0
   const owned = [...new Set(changing.flatMap(c => [...c.files]))]
+  const uncommitted = [...new Set([...owned, ...unconfirmed])]
   const brief = { issues: changing.map(c => listOf(c.notes)), claims: changing.flatMap(c => c.notes.map(n => n.claim)), notes: alive.map(f => f.notes).filter(Boolean) }
   const fail = (why) => {
     for (const f of alive) Object.assign(f, { addresses: false, checkReason: why })
@@ -1774,6 +1787,7 @@ const fixAndVerify = async (workIn, tag, rejectable = false) => {
     fixes: alive,
     brief,
     owned,
+    uncommitted,
     unverifiable,
     rejected,
     withheld,
@@ -1944,14 +1958,16 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
     failedIds.filter(i => i === h).length > 1)
   // a failure hooks.py never reran on HEAD carries its reason, such as an unreadable hook config, into the refusal
   const notRerun = new Map(hooks.notRerun.map(n => [n.hook, n.why]))
-  const failures = (fs) => fs.map(f => `${f.hook}: ${f.error}${notRerun.has(f.hook) ? ` (not rerun on HEAD: ${notRerun.get(f.hook)})` : ''}`).join('; ')
+  const failure = (f) => `${f.hook}: ${f.error}${notRerun.has(f.hook) ? ` (not rerun on HEAD: ${notRerun.get(f.hook)})` : ''}`
+  // a refusal keeps how each hook's output ended, as hooks.py bounded it: its first line alone may not tell a failure from a flake (#558)
+  const ending = (f) => f.tail?.length ? ` [output ends: ${f.tail.join(' | ')}]` : ''
   const hookWhy = outside.length ? `tree changed outside the fix scope before the hooks ran: ${outside.join(', ')}`
     : unsteady.length ? `regenerated path(s) no longer a plain modification when the hooks ran: ${unsteady.join(', ')}`
     : (hooks.passed && failedIds.length) || (!hooks.ran && failedIds.length) || hooks.baselineFailed.some(h => !failedIds.includes(h))
       ? 'hook evidence is inconsistent: a hook failed on HEAD without failing on the fix, or failed while the hooks passed or did not run'
     : unskippable.length ? `hook evidence is inconsistent: excused hook(s) modified files, cannot be skipped or share an id: ${unskippable.map(h => JSON.stringify(h)).join(', ')}`
     : hooks.ran && !hooks.passed && !failedIds.length ? 'the repository hooks do not pass on the fix, and pre-commit named no failing hook'
-    : blamed.length ? `the repository hooks do not pass on the fix: ${failures(blamed)}`
+    : blamed.length ? `the repository hooks do not pass on the fix: ${blamed.map(f => failure(f) + ending(f)).join('; ')}`
     : !hooks.ran && hooks.modifiedBy.length ? 'hook evidence is inconsistent: hooks reported modifying files without running'
     : !hooks.ran && regenerated.length ? `regenerated path(s) have no hook to vouch for them: ${regenerated.join(', ')}`
     : created.length ? `a hook created or renamed file(s): ${created.map(pathOf).join(', ')}`
@@ -1967,7 +1983,7 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
     log(`push#${cycle}-${what}: refusing to publish — ${hookWhy}`)
     return { pass: false, committed: false, detail: hookWhy, sha: '' }
   }
-  if (excused.length) log(`push#${cycle}-${what}: hook(s) failing on HEAD too, not counted against the fix: ${failures(excused)}`)
+  if (excused.length) log(`push#${cycle}-${what}: hook(s) failing on HEAD too, not counted against the fix: ${excused.map(failure).join('; ')}`)
   if (regenerated.length) log(`push#${cycle}-${what}: build output admitted into the commit: ${regenerated.join(', ')}`)
   if (hookPaths.length) log(`push#${cycle}-${what}: hook output admitted into the commit: ${hookPaths.join(', ')}`)
   const generatedPaths = [...new Set([...regenerated, ...hookPaths])]
@@ -3339,7 +3355,7 @@ const runLanes = async (cycle, entry, lanes) => {
       })))
       if (lanes.prState) return prEnded(cycle, lanes.prState)
       const verdict = await fixAndVerify(work, `${cycle}-review`, true)
-      const { ok, fixes, owned, brief, rejected } = verdict
+      const { ok, fixes, owned, uncommitted, brief, rejected } = verdict
       entry.reviewFixes = fixes
       // A rejected finding is held, its evidence on its decision, until the next harvest judges it again; a second rejection is the caller's.
       // Every rejection is held before any stop: an answered comment owes no debt, so only the hold keeps the finding outstanding.
@@ -3355,7 +3371,7 @@ const runLanes = async (cycle, entry, lanes) => {
       if (again.length) {
         const detail = again.map(x => `${x.id}: rejected again by its writer — ${x.evidence}`).join('; ')
         log(`cycle ${cycle}: ${detail}`)
-        return stop(cycle, 'fix-verification-failed', { detail })
+        return stop(cycle, 'fix-verification-failed', { detail, uncommitted })
       }
       if (!verdict.dispatched && verdict.withheld.length) return withheldStop(cycle, 'review', verdict.withheld)
       if (args.autoPush !== true) {

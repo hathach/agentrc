@@ -33,10 +33,13 @@ missing, partial, inconsistent or from a pre-commit version hook_runner.py does
 not support, names no hook: when it failed, failed holds `(pre-commit)` saying
 why, modifiedBy nothing from it, and it gets no retry.
 
-failed and baselineFailed explain a failure: failed, {hook, error} for each hook
-the first pass's last run failed, error the first line with a word in its
-output; and baselineFailed, the ids among those that, rerun alone in a detached
-worktree of HEAD on the same PATHs (on all of HEAD's files instead for a hook
+failed and baselineFailed explain a failure: failed, {hook, error, tail} for each
+hook the first pass's last run failed, error the line of its output naming the
+failure (pytest's first FAILED or ERROR line, else the first line after its short
+test summary, else the first line with a word that is no test runner's banner,
+such as pytest-xdist's `bringing up nodes...`) and tail the last TAIL_LINES lines
+with a word in it, empty for a failure no hook owns; and baselineFailed, the ids
+among those that, rerun alone in a detached worktree of HEAD on the same PATHs (on all of HEAD's files instead for a hook
 HEAD's config passes no filenames that none of PATH selected there), fail there
 with the output they printed in that run (comparable: its lines in any order, the tree's path read as the
 checkout's, and each number standing alone, such as a duration, line number,
@@ -50,9 +53,8 @@ run selected and those pre-commit resolves at any stage, aliases a remote
 manifest gives included (the commit's SKIP skips a commit-msg hook too, and a
 fail_fast stop at one leaves the rest unchecked), nor any when hook_runner.py's
 record of every stage's hooks is missing or malformed; notRerun is {hook, why} for each
-failed hook not rerun there; failed's error and notRerun's why hold no terminal
-escapes or control characters, as commits.py's detail. Each rerun gets a clean
-HEAD tree, checked out and reset without the repository's git hooks; removing it
+failed hook not rerun there; failed's error and tail lines and notRerun's why hold
+no terminal escapes or control characters, as commits.py's detail. Each rerun gets a clean HEAD tree, checked out and reset without the repository's git hooks; removing it
 removes its own registration, no other, and stderr names what stays. The tree
 has only what HEAD tracks: a hook that needs the checkout's ignored files
 (fetched dependencies) fails there differently and stays counted. There
@@ -107,6 +109,16 @@ CONFIG = '.pre-commit-config.yaml'
 DEADLINE = 540
 RUNNER = Path(__file__).resolve().with_name('hook_runner.py')
 ERROR_CHARS = 200
+# The last lines of a failed hook's output kept beside its error, each bounded as the error is.
+TAIL_LINES = 10
+# pytest's account of a failed test, in its short test summary.
+PYTEST_FAILURE = re.compile(r'(?:FAILED|ERROR) ')
+PYTEST_SUMMARY = 'short test summary info'
+# What a test runner prints before any result: pytest's session header, pytest-xdist's worker lines, and a progress
+# line of result letters, such as pytest's `..F.s  [ 40%]` or unittest's `..F`.
+BANNER = re.compile(r'=+ test session starts =+$|platform \S+ -- Python |(?:cachedir|rootdir|configfile|testpaths|plugins): '
+                    r'|bringing up nodes|created: \d+/\d+ workers?$|\d+ workers? \[\d+ items?\]$|collect(?:ing|ed) '
+                    r'|[.sxXfFEw]+(?: +\[ *\d+%\])?$')
 # Seconds past the deadline the HEAD worktree's removal may take.
 CLEANUP = 20
 # Any CPython or PyPy build's name: python3, python3.12, python3.13t, python3-dbg, pypy3, python.exe.
@@ -236,28 +248,39 @@ def attributed(text, code):
     return {**roster, 'everywhere': everywhere if whole else None}, ran
 
 
-def first_error(record):
-    """The first line with a word the hook printed, skipping rules such as unittest's `=====`, bounded for a relay to
-    copy; what failed it when it printed none."""
-    for line in record['output'].splitlines():
-        text = copyable(line).strip()
-        if re.search(r'[^\W_]', text):
-            return text[:ERROR_CHARS]
+def worded(output):
+    """output's lines with a word, as a relay can copy them; rules such as unittest's `=====` have none."""
+    return [t for t in (copyable(line).strip() for line in output.splitlines()) if re.search(r'[^\W_]', t)]
+
+
+def first_error(record, lines):
+    """The line of lines, record's output as worded() gives it, naming what failed the hook, bounded for a relay to
+    copy (#558): pytest's first FAILED or ERROR line, else the line after its short test summary banner, else the first
+    line with a word that is no runner banner, else the first with a word; what failed it when it printed none."""
+    summary = next((i for i, t in enumerate(lines) if PYTEST_SUMMARY in t), len(lines))
+    text = next((t for t in lines if PYTEST_FAILURE.match(t)), None) or next(iter(lines[summary + 1:]), None) \
+        or next((t for t in lines if not BANNER.match(t)), None) or next(iter(lines), None)
+    if text:
+        return text[:ERROR_CHARS]
     return 'files were modified by this hook' if record['modified'] else f"exit code: {record['retcode']}"
 
 
 def results(text, code):
-    """(ids of the hooks that modified files, {hook, index, error, output} of each failed hook, attributed()'s roster)
-    of one run from its records; a run they cannot attribute modified nothing it can name and, when it failed, has one
-    failure UNOWNED says why, with no roster."""
+    """(ids of the hooks that modified files, {hook, index, error, tail, output} of each failed hook, attributed()'s
+    roster) of one run from its records; a run they cannot attribute modified nothing it can name and, when it failed,
+    has one failure UNOWNED says why, with no roster."""
     try:
         roster, ran = attributed(text, code)
     except Unattributed as e:
-        return [], [{'hook': UNOWNED, 'error': copyable(f'pre-commit exited {code} naming no hook: {e}')}] if code \
-            else [], None
-    return ([r['id'] for r in ran if r['modified']],
-            [{'hook': r['id'], 'index': r['index'], 'error': first_error(r), 'output': r['output']}
-             for r in ran if r['failed']], roster)
+        return [], [{'hook': UNOWNED, 'error': copyable(f'pre-commit exited {code} naming no hook: {e}'), 'tail': []}] \
+            if code else [], None
+    failed = []
+    for r in ran:
+        if r['failed']:
+            lines = worded(r['output'])
+            failed.append({'hook': r['id'], 'index': r['index'], 'error': first_error(r, lines),
+                           'tail': [t[:ERROR_CHARS] for t in lines[-TAIL_LINES:]], 'output': r['output']})
+    return [r['id'] for r in ran if r['modified']], failed, roster
 
 
 def unselected(failure, roster):
@@ -695,7 +718,7 @@ def run_hooks(paths, deadline=DEADLINE, start=None):
         try:
             _, more, found, roster = passes(paths, deadline, start, 'without the excused', skip=excused)
         except Late as e:
-            failures.append({'hook': UNOWNED, 'error': copyable(str(e))})
+            failures.append({'hook': UNOWNED, 'error': copyable(str(e)), 'tail': []})
             break
         ids += [h for h in more if h not in ids]
         failures += found
@@ -717,7 +740,7 @@ def collect(argv):
     snapshot_before = snapshot(paths, before)
     ran, passed, ids, failures, base_failed, not_rerun = run_hooks(paths, deadline, start)
     after = status()
-    failed = [{'hook': f['hook'], 'error': f['error']} for f in failures]
+    failed = [{'hook': f['hook'], 'error': f['error'], 'tail': f['tail']} for f in failures]
     return {'ran': ran, 'passed': passed, 'modifiedBy': ids, 'failed': failed, 'baselineFailed': base_failed,
             'notRerun': not_rerun, 'before': before, 'after': after, 'snapshotBefore': snapshot_before,
             'snapshotAfter': snapshot(paths, after)}
