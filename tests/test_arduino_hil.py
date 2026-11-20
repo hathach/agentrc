@@ -911,28 +911,28 @@ class Detach(Base):
         self.A.flash.run_openocd_commands.assert_not_called()
 
     def test_detach_without_a_record_waits_for_the_serial(self):
-        dut, hub, other = self.device('21-1.3', 1, 'OUID'), self.device('21-1', 2), self.device('21-1.4', 3, 'X')
+        dut, other = self.device('21-1.3', 1, 'OUID'), self.device('21-1.4', 3, 'X')
         serials = {'dev1': 'ouid', 'dev3': 'X'}   # serial compared case aside
         self.A.usb.usb_scan.return_value = [{**dut, 'serial': 'ouid'}]
-        self.assertEqual(self.wait(self.board('rig_ocd'), None, [[hub, dut, other], [hub, other]], serials),
-                         'detached')
+        self.assertEqual(self.wait(self.board('rig_ocd'), None, [[dut, other], [other]], serials), 'detached')
         self.assertEqual(self.A.usb.usb_scan.call_args, mock.call(serial='OUID'))   # any VID: no record names one
         self.assertEqual(self.A.usb.usb_devices.call_args, mock.call())
 
     def test_a_console_reset_waits_on_the_dut_alone(self):
         board = self.board('rig_ocd')
         dut, peer = self.device('21-1.3', 1, 'OUID'), self.device('21-1.4', 2, 'P')
-        self.A.usb.usb_scan.return_value = [{**dut, 'serial': 'OUID'}]
-        self.assertEqual(self.wait(board, None, [[dut, peer], [peer]], {'dev1': 'OUID'}), 'detached')   # peer's read
-        self.assertEqual(self.wait(board, None, [[dut, peer]] * 10, {'dev2': 'P'}),   # inconclusive above; dut's here
-                         f'still enumerated {H.DETACH_WAIT}s after the detach')
         again, moved = self.device('21-1.3', 3), self.device('21-1.3', 4)   # new enumerations at the DUT's port
-        self.assertEqual(self.wait(board, None, [[again, peer]] * 10, {'dev3': 'OUID'}),
-                         f'still enumerated {H.DETACH_WAIT}s after the detach')
-        self.assertEqual(self.wait(board, None, [[again, peer]] * 10, {}),
-                         f'still enumerated {H.DETACH_WAIT}s after the detach')
-        self.assertEqual(self.wait(board, None, [[dut, peer], [moved, peer]], {'dev1': 'OUID', 'dev4': 'Q'}),
-                         'detached')
+        self.A.usb.usb_scan.return_value = [{**dut, 'serial': 'OUID'}]
+        held = f'still enumerated {H.DETACH_WAIT}s after the detach'
+        for label, polls, serials, want in (
+                ("a peer's inconclusive read", [[dut, peer], [peer]], {'dev1': 'OUID'}, 'detached'),
+                ("the DUT's inconclusive read", [[dut, peer]] * 10, {'dev2': 'P'}, held),
+                ('the serial re-enumerated at its port', [[again, peer]] * 10, {'dev3': 'OUID'}, held),
+                ('an inconclusive read re-enumerated at its port', [[again, peer]] * 10, {}, held),
+                ('another serial at its port', [[dut, peer], [moved, peer]], {'dev1': 'OUID', 'dev4': 'Q'},
+                 'detached')):
+            with self.subTest(label):
+                self.assertEqual(self.wait(board, None, polls, serials), want)
 
     def test_a_console_reset_reports_a_dut_not_on_the_bus(self):
         self.A.usb.usb_scan.return_value = []
@@ -948,15 +948,18 @@ class Detach(Base):
         self.assertEqual(self.wait(self.board('rig_ocd'), None, [[]] * 3, {}), 'detached')
         self.A.flash.run_openocd_commands.assert_called_once()
 
+    def test_a_record_keeps_the_vid_pid_wide_wait(self):
+        peer = self.device('21-1.4', 2, 'P')
+        self.assertEqual(self.wait(self.board('rig_ocd'), '239a:cafe', [[peer]] * 10, {}),
+                         f'still enumerated {H.DETACH_WAIT}s after the detach')
+        self.A.usb.usb_scan.assert_not_called()
+
     def test_an_inconclusive_serial_read_is_no_detach(self):
-        dut, peer = self.device('21-1.3', 1, 'OUID'), self.device('21-1.4', 2, 'P')
+        dut = self.device('21-1.3', 1, 'OUID')
         polls = [[dut]] * 10
         self.assertEqual(self.wait(self.board('rig_ocd'), '239a:cafe', polls, {}),
                          f'still enumerated {H.DETACH_WAIT}s after the detach')
         self.assertEqual(self.A.usb.usb_devices.call_args[1], {'vid_pid': ('239a', 'cafe')})
-        self.assertEqual(self.wait(self.board('rig_ocd'), '239a:cafe', [[peer]] * 10, {}),   # a record keeps the
-                         f'still enumerated {H.DETACH_WAIT}s after the detach')              # VID:PID-wide wait
-        self.A.usb.usb_scan.assert_not_called()
         self.A.usb.usb_devices.side_effect = None
         self.A.usb.enumeration_id = lambda d: 99   # read across a re-enumeration
         self.A.usb.read_sysfs = lambda path: 'X'
