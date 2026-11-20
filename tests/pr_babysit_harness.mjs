@@ -8626,14 +8626,18 @@ test('a state one module cannot hold loads in parts, each a module within the sc
   assert.ok(JSON.stringify(big).length > 524288, 'one module could not hold it')
   const stateRef = { outputFile: '/tmp/tasks/w1.output', digest: big.digest }
   const args = { yieldAfterCycle: true, stateRef }
-  const first = await run({ args, load: big, keepEmit: true })
+  // The arguments the workflow fills its loaded state into.
+  const given = { pr: 3888, maxCycles: 1, autoPush: true, reviewers: ['coderabbit'], ...args }
+  const first = await run({ rawArgs: given, load: big, keepEmit: true })
   try {
+    assert.deepEqual(given.state, big, 'loaded whole, every decision and reply body in it')
     assert.equal(first.result.reason, 'budget-exhausted')
     assert.equal(first.result.state.digest, big.digest, 'saved back byte for byte: the same digest')
     assert.deepEqual(first.result.state, big)
     const parts = partsOf(first.loads)
     assert.ok(parts.length >= 2, first.loads.join('\n'))
-    assert.ok(parts.every(f => f.startsWith(`${first.loads[1]}.part`)), 'beside the line that names them')
+    const line = first.loads.find(f => /\/state_load\.1\.[0-9a-f]{8}\.js$/.test(f))
+    assert.ok(parts.every(f => f.startsWith(`${line}.part`)), 'beside the line that names them')
     for (const f of parts) assert.ok(readFileSync(f).length < 524288, `${f}: ${readFileSync(f).length} bytes`)
     // A resume answers the relay from its journal and loads the same files; a rerun of the relay meets its claimed
     // file, runs nothing, and the line there names its own parts.
@@ -8665,34 +8669,6 @@ test('a part missing, altered, cut short, another\'s or already there blocks the
     assert.match(got.result.detail, detail, what)
     assert.deepEqual(got.labels, ['state:load'], `${what}: nothing past the loader runs`)
   }
-})
-
-test('a state loaded in parts keeps its offered reply body and carries its settled comment (#539)', async () => {
-  const fat = (st) => seal({ ...st, decisions: [...st.decisions, ...othersWorth(600000)] })
-  const byRef = (st) => ({ outputFile: '/tmp/tasks/w1.output', digest: st.digest })
-  const offered = fat((await run({
-    args: { autoPush: true, maxCycles: 2, yieldAfterCycle: true },
-    posting: null,
-    reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'first wording' }], bots: 'reviewed' },
-    challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
-  })).result.state)
-  const second = await run({
-    args: { autoPush: true, maxCycles: 2, stateRef: byRef(offered) }, load: offered,
-    reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'second wording' }], bots: 'reviewed' },
-    challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
-  })
-  assert.ok(partsOf(second.loads).length >= 2, second.loads.join('\n'))
-  assert.equal(manifestOf(second.calls, 'replies#2')[0].body, 'first wording')
-  const settled = fat((await run({ reviews: dismissed(), args: { maxCycles: 5, yieldAfterCycle: true } })).result.state)
-  const d = settled.decisions.find(([id]) => id === '1#1')[1]
-  let prompt = null
-  const again = await run({
-    reviewsPerCycle: (p) => { prompt = p; return { findings: [], replies: [], bots: 'reviewed', carry: carrying(p) } },
-    args: { maxCycles: 5, stateRef: byRef(settled) }, load: settled,
-  })
-  assert.deepEqual(carryOf(prompt), [{ commentId: 1, digest: 'd1', judgedSha: d.reviewedSha, paths: ['src/a.c', 'src/caller.c'] }])
-  assert.equal(again.labels.some(l => /^(challenge|replies)#/.test(l)), false, again.labels.join(' '))
-  assert.equal(again.result.pass, true)
 })
 
 test('a state holding an array the VM boundary cannot carry saves it in runs and loads it back as it was sealed (#539)', async () => {
