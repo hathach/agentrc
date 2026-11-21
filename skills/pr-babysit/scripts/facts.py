@@ -28,7 +28,7 @@ except ImportError:  # Windows
     import msvcrt
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
-from seal import CHUNKS, EMIT_TO, canonical, emit, emit_beside, fnv1a, module_text, rate_limit, sealed, unpacked, utc  # noqa: E402,F401  re-exported for the scripts
+from seal import CHUNKS, EMIT_TO, canonical, emit, emit_beside, fnv1a, module_text, rate_limit, sealed, stdin_bytes, unpacked, utc  # noqa: E402,F401  re-exported for the scripts
 import gh_repo  # noqa: E402
 import windows  # noqa: E402
 from gh_repo import HOST, REPO, github_repo  # noqa: E402,F401  re-exported for the scripts

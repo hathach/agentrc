@@ -86,6 +86,27 @@ class BashTest(unittest.TestCase):
             self.assertEqual(windows.bash(), 'bash')
 
 
+class PowerShellTest(unittest.TestCase):
+    def found(self, files, system_root, path=''):
+        with mock.patch.object(windows.os, 'name', 'nt'), \
+                mock.patch.dict(os.environ, {'SystemRoot': system_root, 'PATH': path}), \
+                mock.patch.object(windows.os.path, 'isfile', lambda p: p in files):
+            return windows.powershell()
+
+    def test_windows_powershell_comes_from_system32_alone(self):
+        program = os.path.join('C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+        planted = os.path.join('.', 'powershell.exe')
+        self.assertEqual(self.found({program, planted}, 'C:\\Windows', '.'), program)
+        self.assertIsNone(self.found({planted}, 'C:\\Windows', '.'), 'never one PATH or the working directory holds')
+        self.assertIsNone(self.found({os.path.join('Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')}, 'Windows'),
+                          'a SystemRoot that is not absolute names none')
+
+    def test_elsewhere_pwsh_from_path(self):
+        with mock.patch.object(windows.os, 'name', 'posix'), mock.patch.object(windows.shutil, 'which', return_value='/usr/bin/pwsh') as which:
+            self.assertEqual(windows.powershell(), '/usr/bin/pwsh')
+        which.assert_called_once_with('pwsh')
+
+
 class VolumeMountTest(unittest.TestCase):
     @unittest.skipUnless(NT, 'Windows volumes')
     def test_the_drive_mounting_a_volume_names_it(self):

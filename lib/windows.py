@@ -1,5 +1,5 @@
 """Windows runtime helpers the skills, hooks and statusline share: a program lookup that never takes the working
-directory, Git Bash found that way, a bounded process-tree kill, process liveness, a file step, os.replace among them,
+directory, Git Bash found that way, Windows PowerShell from System32, a bounded process-tree kill, process liveness, a file step, os.replace among them,
 retried while another process holds the file open, and the drive that mounts a volume.
 
 A script reaches it through its resolved path, as chief_guard.py reaches shadows.py:
@@ -8,6 +8,7 @@ rtt.py keeps its own copies (see its module docstring)."""
 import contextlib
 import os
 import re
+import shutil
 import subprocess
 import time
 from pathlib import PureWindowsPath
@@ -44,6 +45,16 @@ def bash():
     system32 = os.path.normcase(os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'System32'))
     return on_path('bash', ['.exe'], [d for d in os.environ.get('PATH', '').split(os.pathsep)
                                       if os.path.normcase(os.path.normpath(d.strip('"'))) != system32])
+
+
+def powershell():
+    """Windows PowerShell from SystemRoot's System32 (never a powershell.exe the working directory or PATH puts first)
+    on Windows, PowerShell 7's pwsh from PATH elsewhere; None when it is not there."""
+    if os.name != 'nt':
+        return shutil.which('pwsh')
+    system_root = os.environ.get('SystemRoot', '')
+    program = os.path.join(system_root, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+    return program if absolute(system_root) and os.path.isfile(program) else None
 
 
 def kill_tree(proc, timeout, total=False):

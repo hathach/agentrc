@@ -69,7 +69,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from facts import FULL_SHA, Unusable, attempt, attribution_in, git, report, run, sealed, status  # noqa: E402
+from facts import FULL_SHA, Unusable, attempt, attribution_in, git, report, run, sealed, status, stdin_bytes  # noqa: E402
 
 DETAIL_MAX = 500
 # What a git command exports to the hooks it runs and that changes how their own git commands read pathspecs: git
@@ -205,9 +205,11 @@ def outcome(paths, skip=()):
     env = hook_env(skip_env(skip) or os.environ)  # before anything is staged
     try:
         # -sig: a leading BOM would hide an attribution first line from attribution_in
-        message = sys.stdin.buffer.read().decode('utf-8-sig')
+        message = stdin_bytes().decode('utf-8-sig')
     except UnicodeDecodeError:
         raise Unusable('the message on stdin is not UTF-8')
+    except OSError as e:
+        raise Unusable(f'the message file AGENTRC_STDIN names is unreadable: {e}')
     if not message.strip():
         return {'committed': False, 'detail': 'the commit message is blank'}
     # Literal: a file named like pathspec magic, such as `:(top)*`, is that file only. The commit takes each path's own

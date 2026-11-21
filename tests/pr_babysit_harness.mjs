@@ -100,8 +100,16 @@ const keyOf = (f) => {
 // collect.py's output contract, as the workflow reads it.
 const COLLECT_CONTRACT = Number(body.match(/^const COLLECT_CONTRACT = (\d+)$/m)[1])
 // The checks a CI judge prompt asks about.
-// The values a relay prompt passes a script, each shell-quoted as --flag='value'.
-const flagValues = (prompt, flag) => [...String(prompt).matchAll(new RegExp(`--${flag}='((?:[^']|'\\\\'')*)'`, 'g'))].map(m => m[1].replaceAll("'\\''", "'"))
+// The values a relay prompt passes a script, each shell-quoted as --flag='value': bash's '\'' escapes, or under
+// PowerShell (its prelude) '' and the native word inside, in double quotes of its own when it has a blank or a quote.
+const PS_COMMAND = "$PSNativeCommandArgumentPassing = 'Legacy'; "
+const nativeWord = (w) => w.startsWith('"') && w.length > 1
+  ? w.slice(1, -1).replace(/(\\*)""/g, (_, b) => b.slice(b.length / 2) + '"').replace(/(\\+)$/, b => b.slice(b.length / 2)) : w
+const flagValues = (prompt, flag) => {
+  const ps = String(prompt).includes(PS_COMMAND)
+  return [...String(prompt).matchAll(new RegExp(`--${flag}='((?:[^']|${ps ? "''" : "'\\\\''"})*)'`, 'g'))]
+    .map(m => ps ? nativeWord(m[1].replaceAll("''", "'")) : m[1].replaceAll("'\\''", "'"))
+}
 const askedOf = (prompt) => JSON.parse(String(prompt).match(/each needing exactly one entry in your reply: (\[.*\])\./)[1])
 const manifestOf = (calls, label) => stagedOf(calls.find(c => c.label === label).prompt).replies
 // The nth commit a run makes. Each is distinct, as a real commit is, because the
@@ -197,11 +205,15 @@ const transferOf = (state, emit) => {
 }
 
 // The paths a prompt's command hands a script after `prefix`, each quoted as
-// shq quotes it (a `'` inside a path is `'\\''`).
+// shq quotes it (a `'` inside a path is `'\\''`; under PowerShell `''`, the script's
+// own path a double-quoted word).
 const SHQ = /'[^']*'(?:\\''[^']*')*/g
+const PSQ = /'(?:[^']|'')*'/g
 const quotedAfter = (prefix) => (prompt) => {
-  const m = String(prompt).match(new RegExp(`${prefix.source} ((?:${SHQ.source} ?)+)`))
-  return m ? [...m[1].matchAll(SHQ)].map(t => t[0].slice(1, -1).replaceAll(`'\\''`, `'`)) : []
+  const ps = String(prompt).includes(PS_COMMAND)
+  const q = ps ? PSQ : SHQ
+  const m = String(prompt).match(new RegExp(`${prefix.source.replace(/\\\.py/g, '\\.py"?')} ((?:${q.source} ?)+)`))
+  return m ? [...m[1].matchAll(q)].map(t => ps ? nativeWord(t[0].slice(1, -1).replaceAll("''", "'")) : t[0].slice(1, -1).replaceAll(`'\\''`, `'`)) : []
 }
 const pathLine = quotedAfter(new RegExp(`commits\\.py commit (?:--skip-hooks ${SHQ.source} )?--receipt ${SHQ.source} --request ${SHQ.source}`))
 const auditScope = quotedAfter(/commits\.py head --parent [0-9a-f]{40}/)
@@ -733,7 +745,7 @@ async function run(opts = {}) {
         const file = emitOf(prompt)
         let answer
         try {
-          const [, stageFile, claimFile] = String(prompt).match(/ stage '[^']+' [0-9a-f]{8} --from-transcript --line '([^']+)' --claimed '([^']+)' /) ?? []
+          const [, stageFile, claimFile] = String(prompt).match(/ stage '[^']+' [0-9a-f]{8} --from-transcript --line '([^']+)' --claimed '([^']+)'[ ;]/) ?? []
           if (stageFile) assert.equal(claimFile, file, 'the stage asks after the script\'s own file')
           // facts.py stage --claimed: whether an earlier attempt's script claimed its file, as the stage found it.
           const claimed = stageFile ? existsSync(file) : undefined
@@ -867,7 +879,7 @@ test('a malformed or unknown argument throws before any agent runs', async () =>
     [{ generated: '' }, /generated must be a non-empty regex string/],
     [{ autoPush: false, markSonar: true }, /markSonar publishes to SonarCloud: it needs autoPush/],
     // #311
-    [{ repository: PICO }, /unknown argument\(s\) \["repository"\]: pr-babysit takes only pr, repo, python, reviewers/],
+    [{ repository: PICO }, /unknown argument\(s\) \["repository"\]: pr-babysit takes only pr, repo, python, shell, reviewers/],
     [{ repo: 'adafruit' }, /repo must be OWNER\/NAME/],
     [{ repo: `${PICO}/x` }, /repo must be OWNER\/NAME/],
     [{ repo: 7 }, /repo must be OWNER\/NAME/],
@@ -1000,7 +1012,7 @@ test('the preflight pins the checkout without touching it', async () => {
   assert.equal(pre.label, 'preflight')
   assert.match(pre.prompt, /Editing and committing nothing/)
   assert.ok(pre.prompt.includes('preflight.py --pr 3888 --needs '), pre.prompt)
-  const scripts = new Set([...body.matchAll(/`\$\{AGENTRC\}(\/skills\/[\w./-]+\.py)`/g)].map(m => '"${AGENTRC_DIR:-$HOME/.claude}"' + m[1]).filter(p => !p.endsWith('/preflight.py')))
+  const scripts = new Set([...body.matchAll(/agentrcPath\('(skills\/[\w./-]+\.py)'\)/g)].map(m => '"${AGENTRC_DIR:-$HOME/.claude}"/' + m[1]).filter(p => !p.endsWith('/preflight.py')))
   assert.ok(scripts.size >= 10, 'the script constants were found')
   assert.deepEqual([...pre.prompt.matchAll(/ --needs (\S+?)(?=[ `])/g)].map(m => m[1]).sort(), [...scripts].sort(), 'every script the workflow calls is checked')
   assert.ok(logs.some(l =>
@@ -1488,18 +1500,48 @@ test('the committer gets the claims without their hints, and the message on stdi
   assert.doesNotMatch(commit, /temporary file|mktemp|rm -f/)
 })
 
-// A relay command as Bash runs it: `cmd` from its prompt, its AGENTRC_EMIT moved to `emit` (its stage's beside it, in
-// a directory standing for the launch's, with facts.py emit-dir's mark made before any relay's transcript); the
-// scripts under `root`.
+// A relay command as its shell runs it: `cmd` from its prompt, its AGENTRC_EMIT moved to `emit` (its stage's beside it,
+// in a directory standing for the launch's, with facts.py emit-dir's mark made before any relay's transcript); the
+// scripts under `root`. `sh` is one of SHELL_RUNS, bash by default.
 const launchMarked = (emit) => {
   const mark = join(dirname(emit), '.launch')
   if (!existsSync(mark)) writeFileSync(mark, `${Date.now() / 1000 - 60}\n`)
 }
-const runCommand = (cmd, root, emit, env = {}) => launchMarked(emit) ?? spawnSync('bash', ['-c', cmd.replace(/ --line '[^']+' /, ` --line '${emit}.stage.js' `)
-  .replace(/ --claimed '[^']+' /, ` --claimed '${emit}' `).replace(/AGENTRC_EMIT='[^']+' /, `AGENTRC_EMIT='${emit}' `)], { encoding: 'utf8', env: { ...process.env, AGENTRC_DIR: root, ...env } })
+const ON_WINDOWS = process.platform === 'win32'
+const SYSTEM32 = join(process.env.SystemRoot || 'C:\\Windows', 'System32')
+// bash on Windows only from PATH outside System32, whose bash.exe is WSL's launcher, as lib/windows.py's bash() finds it.
+const HAS_BASH = !ON_WINDOWS || (process.env.PATH || '').split(';').map(d => d.replace(/"/g, ''))
+  .some(d => d && d.toLowerCase() !== SYSTEM32.toLowerCase() && existsSync(join(d, 'bash.exe')))
+const POWERSHELL = ON_WINDOWS ? join(SYSTEM32, 'WindowsPowerShell', 'v1.0', 'powershell.exe') : 'pwsh'
+const HAS_POWERSHELL = spawnSync(POWERSHELL, ['-NoProfile', '-NonInteractive', '-Command', 'exit 0']).status === 0
+const located = (cmd, emit) => cmd.replace(/ --line '[^']+' /, ` --line '${emit}.stage.js' `).replace(/ --claimed '[^']+'([ ;])/, ` --claimed '${emit}'$1`)
+const SHELL_RUNS = [
+  { shell: 'bash', available: HAS_BASH, run: (cmd, emit, env) => spawnSync('bash', ['-c', located(cmd, emit).replace(/AGENTRC_EMIT='[^']+' /, `AGENTRC_EMIT='${emit}' `)], { encoding: 'utf8', env }) },
+  // -EncodedCommand: the command reaches PowerShell as the relay types it, no command-line quoting between
+  { shell: 'powershell', available: HAS_POWERSHELL, run: (cmd, emit, env) => spawnSync(POWERSHELL, ['-NoProfile', '-NonInteractive', '-EncodedCommand',
+    Buffer.from(located(cmd, emit).replace(/AGENTRC_EMIT='[^']+';/, `AGENTRC_EMIT='${emit}';`), 'utf16le').toString('base64')], { encoding: 'utf8', env }) },
+]
+const runCommand = (cmd, root, emit, env = {}, sh = SHELL_RUNS[0]) => launchMarked(emit) ?? sh.run(cmd, emit, { ...process.env, AGENTRC_DIR: root, ...env })
+// `body(sh)` as a test under each shell a launch can name, skipped where that shell does not run.
+const shellTest = (name, body) => {
+  for (const sh of SHELL_RUNS) {
+    const title = sh.shell === 'bash' ? name : `${name}, under ${sh.shell}`
+    if (sh.available) test(title, () => body(sh))
+    else nodeTest(title, { skip: `no ${sh.shell} here` }, () => {})
+  }
+}
+// A launch's args for sh: bash is the default.
+const shellArgs = (sh) => sh.shell === 'bash' ? {} : { shell: sh.shell }
 const commandOf = (prompt) => String(prompt).match(/run exactly `([^`]*)` and answer/)[1]
 // The interpreter the commands run under: PIN's /usr/bin/python3 does not exist on Windows; forward slashes for bash.
-const hostPython = () => spawnSync('python3', ['-c', 'import sys; print(sys.executable)'], { encoding: 'utf8' }).stdout.trim().replaceAll('\\', '/')
+// On Windows python first: a python.org install has no python3.exe.
+const hostPython = () => {
+  for (const name of ON_WINDOWS ? ['python', 'python3'] : ['python3']) {
+    const r = spawnSync(name, ['-c', 'import sys; print(sys.executable)'], { encoding: 'utf8' })
+    if (r.status === 0 && r.stdout.trim()) return r.stdout.trim().replaceAll('\\', '/')
+  }
+  throw new Error('no python3 (on Windows python) runs here')
+}
 // A relay's transcript as the runtime keeps it (#540): under CLAUDE_CONFIG_DIR's project directory of the session
 // CLAUDE_CODE_SESSION_ID names, its prompt the computed task of the first user record, each line indented two spaces
 // past the harness's frame; `after` the records that follow it. The env that names it.
@@ -1518,12 +1560,12 @@ const HOSTILE = `it's "quoted", \\ back\; \`tick\` $(touch /tmp/pwned) '\\'' \r\
 // A payload that does not decode to the JSON sent: cut short, other JSON, not base64.
 const corrupted = (b64, json) => [Buffer.from(json.slice(0, -1)).toString('base64'), Buffer.from('[]').toString('base64'), `${b64.slice(0, 10)}!${b64.slice(11)}`]
 
-test('hostile text in a reply body reaches reply.py byte for byte from the relay transcript; a corrupted payload runs no script (#510, #540)', async () => {
+shellTest('hostile text in a reply body reaches reply.py byte for byte from the relay transcript; a corrupted payload runs no script (#510, #540)', async (sh) => {
   const tmp = mkdtempSync(join(tmpdir(), 'pr-babysit-exec-'))
   let emitRoot = null
   try {
     const ran = await run({
-      keepEmit: true, args: { ...YIELD, python: hostPython() }, reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: HOSTILE }], bots: 'reviewed' },
+      keepEmit: true, args: { ...YIELD, python: hostPython(), ...shellArgs(sh) }, reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: HOSTILE }], bots: 'reviewed' },
     })
     emitRoot = ran.emitRoot
     const { calls } = ran
@@ -1542,14 +1584,14 @@ test('hostile text in a reply body reaches reply.py byte for byte from the relay
     const local = cmd.replace(/--receipt '[^']+'/, `--receipt '${out}'`)
     const env = transcript(join(tmp, 'config'), reply.prompt, { after: [
       { type: 'assistant', message: { content: [{ type: 'text', text: `AGENTRC-PAYLOAD ${PAYLOAD_LINE.exec(reply.prompt)[1]} ${fnv1a(JSON.stringify(sent))} W10=` }] } }] })
-    const got = runCommand(local, tmp, join(tmp, 'r.js'), env)
+    const got = runCommand(local, tmp, join(tmp, 'r.js'), env, sh)
     assert.equal(got.status, 0, got.stderr)
     assert.equal(readFileSync(`${out}.got`, 'utf8'), JSON.stringify(sent), "the manifest is the JSON the workflow sent, byte for byte, the assistant's quoted line ignored")
     assert.match(readFileSync(join(tmp, 'r.js.stage.js'), 'utf8'), /"line":\{"staged":"[^"]+","claimed":false\}/)
     // Cut short after its stage, before reply.py claimed its file: the same command run again stages again and goes on.
     rmSync(join(tmp, 'r.js'), { force: true })
     rmSync(`${out}.got`)
-    const again = runCommand(local, tmp, join(tmp, 'r.js'), env)
+    const again = runCommand(local, tmp, join(tmp, 'r.js'), env, sh)
     assert.equal(again.status, 0, again.stderr)
     assert.equal(readFileSync(`${out}.got`, 'utf8'), JSON.stringify(sent))
     assert.equal(existsSync('/tmp/pwned'), false)
@@ -1559,7 +1601,7 @@ test('hostile text in a reply body reaches reply.py byte for byte from the relay
       const config = join(tmp, `bad-${i}`)
       // The first as a resume meets it: an earlier attempt's script claimed its file and left it empty.
       if (i === 0) writeFileSync(join(tmp, `bad-${i}.js`), '')
-      const ran = runCommand(local, tmp, join(tmp, `bad-${i}.js`), transcript(config, reply.prompt.replace(b64, bad)))
+      const ran = runCommand(local, tmp, join(tmp, `bad-${i}.js`), transcript(config, reply.prompt.replace(b64, bad)), sh)
       assert.notEqual(ran.status, 0)
       assert.equal(existsSync(`${out}.got`), false, 'reply.py never ran')
       const line = readFileSync(join(tmp, `bad-${i}.js.stage.js`), 'utf8')
@@ -1572,12 +1614,12 @@ test('hostile text in a reply body reaches reply.py byte for byte from the relay
   }
 })
 
-test('a CI verdict reaches collect.py remember with no shell quoting, byte for byte; a malformed one is refused before it (#505, #540)', async () => {
+shellTest('a CI verdict reaches collect.py remember with no shell quoting, byte for byte; a malformed one is refused before it (#505, #540)', async (sh) => {
   const tmp = mkdtempSync(join(tmpdir(), 'pr-babysit-exec-'))
   const ROOT = fileURLToPath(new URL('..', import.meta.url))
   let emitRoot = null
   try {
-    const ran = await run({ keepEmit: true, args: { ...YIELD, python: hostPython() }, reviews: WAITING, ci: redWith({ ...RIG, firstError: HOSTILE }).ci })
+    const ran = await run({ keepEmit: true, args: { ...YIELD, python: hostPython(), ...shellArgs(sh) }, reviews: WAITING, ci: redWith({ ...RIG, firstError: HOSTILE }).ci })
     emitRoot = ran.emitRoot
     const { calls } = ran
     const remember = calls.find(c => c.label === 'ci:collect#1.w')
@@ -1587,7 +1629,7 @@ test('a CI verdict reaches collect.py remember with no shell quoting, byte for b
     const store = join(tmp, 'store')
     mkdirSync(store)
     const cmd = commandOf(remember.prompt)
-    const kept = runCommand(cmd, ROOT, join(tmp, 'w.js'), { TMPDIR: store, ...transcript(join(tmp, 'config'), remember.prompt) })
+    const kept = runCommand(cmd, ROOT, join(tmp, 'w.js'), { TMPDIR: store, ...transcript(join(tmp, 'config'), remember.prompt) }, sh)
     assert.equal(kept.status, 0, kept.stderr)
     const head = remember.prompt.match(/--head ([0-9a-f]{40})/)[1]
     const saved = JSON.parse(readFileSync(join(store, 'ci-collect', 'hathach_tinyusb', '3888', head, 'verdicts.json'), 'utf8'))
@@ -1598,7 +1640,7 @@ test('a CI verdict reaches collect.py remember with no shell quoting, byte for b
       const empty = join(tmp, `empty-${i}`)
       mkdirSync(empty)
       const env = transcript(join(tmp, `bad-${i}`), remember.prompt.replace(b64, bad))
-      assert.notEqual(runCommand(cmd, ROOT, join(tmp, `bad-${i}.js`), { TMPDIR: empty, ...env }).status, 0)
+      assert.notEqual(runCommand(cmd, ROOT, join(tmp, `bad-${i}.js`), { TMPDIR: empty, ...env }, sh).status, 0)
       assert.equal(existsSync(join(empty, 'ci-collect')), false, 'remember never ran')
       assert.equal(existsSync(join(tmp, `bad-${i}.js`)), false, 'no line')
     })
@@ -1607,6 +1649,64 @@ test('a CI verdict reaches collect.py remember with no shell quoting, byte for b
     if (emitRoot) rmSync(emitRoot, { recursive: true, force: true })
   }
 })
+
+test("a powershell launch runs as a bash one does, every relay command written for Windows PowerShell: no bash syntax, the stage's exit gating the script, stdin from a file", async () => {
+  const opts = { reviews: { findings: [finding(), invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'not so' }], bots: 'reviewed' } }
+  const bash = await run({ ...opts, args: { autoPush: true } })
+  const ps = await run({ ...opts, args: { autoPush: true, shell: 'powershell' } })
+  assert.deepEqual(ps.calls.map(c => c.label), bash.calls.map(c => c.label), 'the same relays, in the same order')
+  assert.equal(ps.result.pass, bash.result.pass)
+  // the state pins it, so a continuation names it again; a bash launch's state is as before
+  assert.deepEqual([ps.result.state.config.shell, 'shell' in bash.result.state.config], ['powershell', false])
+  const commands = ps.calls.filter(c => /run exactly `/.test(c.prompt)).map(c => [c.label, commandOf(c.prompt)])
+  assert.ok(commands.length > 5, JSON.stringify(commands))
+  const PRELUDE = `${PS_COMMAND}$agentrc = if ($env:AGENTRC_DIR) { $env:AGENTRC_DIR } else { "$HOME/.claude" }; `
+  for (const [label, cmd] of commands) {
+    assert.doesNotMatch(cmd, / && |\$\{AGENTRC_DIR:-| < '|(^|[^:])AGENTRC_EMIT='/, label)
+    assert.ok(cmd.startsWith(PRELUDE), `${label}: ${cmd}`)
+    if (!cmd.includes('AGENTRC_EMIT')) continue
+    assert.ok(cmd.endsWith('; exit $LASTEXITCODE'), `${label}: ${cmd}`)
+    // preflight runs under python, every later script under the interpreter it pins
+    assert.match(cmd, /\$env:AGENTRC_EMIT='[^']+'; (\$env:AGENTRC_STDIN = '[^']+'; )?& (python|'\/usr\/bin\/python3') "\$agentrc\/skills\//, label)
+  }
+  const replies = commandOf(ps.calls.find(c => c.label === 'replies#1').prompt)
+  assert.match(replies, /& '\/usr\/bin\/python3' "\$agentrc\/skills\/pr-babysit\/scripts\/facts\.py" stage '[^']+\.in' [0-9a-f]{8} --from-transcript --line '[^']+' --claimed '[^']+'; if \(\$LASTEXITCODE -eq 0\) \{ \$env:AGENTRC_EMIT='[^']+'; & .*reply\.py" .* \}; exit \$LASTEXITCODE$/)
+  const commit = commandOf(ps.calls.find(c => c.label === 'commit#1-review').prompt)
+  assert.match(commit, /\$env:AGENTRC_STDIN = '[^']+\/commit_1-review\.1\.[0-9a-f]{8}\.in'; & .*commits\.py" commit .* 'src\/a\.c'; exit \$LASTEXITCODE$/)
+  // emit:dir runs before preflight pins the interpreter: python, which a python.org install has alone
+  assert.ok(ps.journal.find(c => c.label === 'emit:dir').prompt.includes(`run exactly \`${PRELUDE}& python "$agentrc/skills/pr-babysit/scripts/facts.py" emit-dir\``))
+  await assert.rejects(run({ args: { shell: 'zsh' } }), /shell must be one of bash, powershell/)
+})
+
+// The quoting a PowerShell launch gives a value, as Windows PowerShell hands it to a native program: blanks, double
+// quotes, backslash runs before a quote or at the end, a single quote and an empty word each arrive as one argv entry.
+// Windows alone: pwsh elsewhere hands a native program an argv of its own splitting, and a launch names
+// shell: 'powershell' only on a Windows host that runs no bash.
+;(HAS_POWERSHELL && ON_WINDOWS ? test : (name) => nodeTest(name, { skip: 'needs Windows PowerShell' }, () => {}))(
+  'a powershell launch hands build.py a build command full of quoting as the caller gave it', async () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'pr-babysit-ps-'))
+    let emitRoot = null
+    try {
+      // curly single quotes too, which PowerShell also takes for '
+      const build = `python -c "print('a b')" --x='y z' "q\\"r" C:\\dir\\ \\\\"tail\\\\" '' a\u2019; Write-Output injected; # \u2018b\u201a\u201b end\\`
+      const ran = await run({ keepEmit: true, reviews: oneValid, args: { autoPush: true, shell: 'powershell', python: hostPython(), build } })
+      emitRoot = ran.emitRoot
+      const call = ran.calls.find(c => c.label.startsWith('build#'))
+      assert.ok(call, ran.calls.map(c => c.label).join(' '))
+      const stub = join(tmp, 'skills', 'pr-babysit', 'scripts')
+      mkdirSync(stub, { recursive: true })
+      writeFileSync(join(stub, 'build.py'), 'import json, os, sys\nopen(os.environ["ARGV_OUT"], "w", encoding="utf-8").write(json.dumps(sys.argv[1:]))\n')
+      const out = join(tmp, 'argv.json')
+      const got = runCommand(commandOf(call.prompt), tmp, join(tmp, 'b.js'), { ARGV_OUT: out }, SHELL_RUNS.find(s => s.shell === 'powershell'))
+      assert.equal(got.status, 0, got.stderr)
+      const argv = JSON.parse(readFileSync(out, 'utf8'))
+      assert.ok(argv.includes(`--command=${build}`), JSON.stringify(argv))
+      assert.ok(argv.includes('--path=src/a.c') && argv.includes('--shell=powershell'), JSON.stringify(argv))
+    } finally {
+      rmSync(tmp, { recursive: true, force: true })
+      if (emitRoot) rmSync(emitRoot, { recursive: true, force: true })
+    }
+  })
 
 test('every script input is written by the command that runs the script, at a path the workflow names (#510, #540)', async () => {
   const { calls } = await run({ reviews: { findings: [finding(), invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'not so' }], bots: 'reviewed' }, args: { autoPush: true } })

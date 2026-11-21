@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build pr-babysit's fix batch as the checkout stands and report what ran.
 
-  build.py --path P... --command CMD [--setup LINES] [--require TOOL ...]
+  build.py --path P... --command CMD [--setup LINES] [--require TOOL ...] [--shell bash|powershell]
            [--job DIR --wait-seconds S --timeout-seconds T [--abandon-seconds A]]
 
 Pass values as --flag=VALUE when one may start with a dash. Run from the
@@ -17,6 +17,11 @@ sourcing a toolchain's export script), checks that each TOOL is on PATH, then
 runs CMD, so the build sees what setup exported; `stage` names the step the
 shell last entered: `setup`, `prerequisite` or `build`. A shell that stopped
 before `build` never built: its environment is missing, whatever its status.
+The shell is bash (on Windows bash.exe from PATH), or with --shell powershell
+Windows PowerShell from System32 (pwsh off Windows), SETUP and CMD then
+PowerShell code, for a Windows host that runs no bash: a failed cmdlet stops
+the shell wherever it is, and a step's status is otherwise its last native
+program's.
 
 stdout ends with one JSON line {revision, snapshot, snapshotAfter, command,
 setup, requires, stage, buildDir, exit, usageError, log, retained, seal} (seal:
@@ -102,6 +107,27 @@ def script(setup, requires, command):
             mark('prerequisite') + tools + mark('build') + f'echo {shlex.quote(BUILD_MARK)}\n' + command + '\n')
 
 
+def ps_quote(s):
+    """A PowerShell single-quoted literal: ' and the curly single quotes PowerShell also takes for it, each doubled."""
+    return "'" + re.sub("['‘’‚‛]", lambda m: m[0] * 2, s) + "'"
+
+
+def ps_script(setup, requires, command):
+    """script() for Windows PowerShell: the same steps and marks. A failed cmdlet stops the shell with status 1
+    wherever it is ($ErrorActionPreference Stop: no later success masks it); a step's status is otherwise its last
+    native program's, as bash's is its last command's."""
+    mark = lambda stage: ("$ErrorActionPreference = 'Stop'\n" if stage == 'setup' else '') + \
+        f"[IO.File]::WriteAllText($env:PR_BABYSIT_STAGE, '{stage}')\n"
+    # $? first: any statement, the `if` reading LASTEXITCODE too, resets it
+    status = ('$pr_babysit_ok = $?\nif ($LASTEXITCODE) { exit $LASTEXITCODE }\n'
+              'if (-not $pr_babysit_ok) { exit 1 }\n')
+    tools = ''.join(f"if (-not (Get-Command {ps_quote(t)} -ErrorAction SilentlyContinue)) "
+                    f"{{ Write-Output ('missing tool: ' + {ps_quote(t)}); exit 127 }}\n" for t in requires)
+    return (mark('setup') + ('$global:LASTEXITCODE = 0\n' + f'{setup}\n' + status if setup else '') +
+            mark('prerequisite') + tools + mark('build') + f'Write-Output {ps_quote(BUILD_MARK)}\n' +
+            '$global:LASTEXITCODE = 0\n' + command + '\n' + status + 'exit 0\n')
+
+
 def usage_error(log, stage, build_exit, command):
     """The line command printed in log refusing its own arguments, else None."""
     if stage != 'build' or build_exit != USAGE_EXIT:
@@ -145,12 +171,21 @@ def bash():
     raise Unusable('no bash.exe on PATH (System32 holds only the WSL launcher)')
 
 
+def powershell():
+    if found := windows.powershell():
+        return found
+    raise Unusable('no Windows PowerShell in System32' if os.name == 'nt' else 'no pwsh on PATH')
+
+
 def prepare(a):
     """Everything a build needs before its shell runs, as one JSON-able record."""
-    sh = bash()
+    sh = powershell() if a.shell == 'powershell' else bash()
     # <BUILD> goes into the command unquoted: a temp dir with a blank or shell syntax in it would split or run
     if os.name == 'nt' and re.search(r'[\s\'"$`;&|<>()*?[\]{}!#]', Path(tempfile.gettempdir()).as_posix()):
         raise Unusable(f'the temp dir {tempfile.gettempdir()} holds a blank or shell syntax: point TMP and TEMP at a plain path')
+    # PowerShell also takes the curly quotes U+2018..U+201E for string delimiters
+    if a.shell == 'powershell' and re.search('[‘-„]', tempfile.gettempdir()):
+        raise Unusable(f'the temp dir {tempfile.gettempdir()} holds a PowerShell quote: point TMP and TEMP at a plain path')
     top = checkout_top()
 
     LOGS.mkdir(exist_ok=True)
@@ -161,7 +196,17 @@ def prepare(a):
     build = Path(tempfile.mkdtemp(prefix='pr-babysit-build-')).as_posix()  # C:/... survives an unquoted <BUILD>
     b = {'sh': sh, 'top': top, 'log': log, 'stageFile': stage_file, 'buildDir': build, 'paths': a.path,
          'command': a.command.replace('<BUILD>', build), 'setup': a.setup or '', 'requires': a.require}
-    b['shell'] = script(a.setup, a.require, b['command'])
+    if a.shell == 'powershell':
+        b['shell'] = ps_script(a.setup, a.require, b['command'])
+        # a file, -File: -Command would take the script's own quotes as the command line's; a BOM, which Windows
+        # PowerShell 5.1 needs to read the file as UTF-8
+        fd, ps1 = tempfile.mkstemp(prefix='build-', suffix='.ps1', dir=LOGS)
+        with os.fdopen(fd, 'w', encoding='utf-8-sig', newline='\n') as f:
+            f.write(b['shell'])
+        b['argv'] = [sh, '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ps1]
+    else:
+        b['shell'] = script(a.setup, a.require, b['command'])
+        b['argv'] = [sh, '-c', b['shell']]
     try:
         b['revision'], b['snapshot'] = git('rev-parse', 'HEAD').strip(), snapshot(a.path)
         with open(log, 'ab') as out:
@@ -174,6 +219,8 @@ def prepare(a):
 def cleanup(b):
     shutil.rmtree(b['buildDir'], ignore_errors=True)
     Path(b['stageFile']).unlink(missing_ok=True)
+    if b['argv'][-2] == '-File':
+        Path(b['argv'][-1]).unlink(missing_ok=True)
     return [b['buildDir']] if os.path.exists(b['buildDir']) else []
 
 
@@ -184,7 +231,7 @@ def fail(b, e):
 
 def spawn(b, **kw):
     with open(b['log'], 'ab') as out:
-        return subprocess.Popen([b['sh'], '-c', b['shell']], cwd=b['top'], stdout=out, stderr=subprocess.STDOUT,
+        return subprocess.Popen(b['argv'], cwd=b['top'], stdout=out, stderr=subprocess.STDOUT,
                                 env={**os.environ, 'PR_BABYSIT_STAGE': b['stageFile']}, **kw)
 
 
@@ -208,6 +255,7 @@ def parse(argv):
     p.add_argument('--command', required=True)
     p.add_argument('--setup')
     p.add_argument('--require', action='append', default=[])
+    p.add_argument('--shell', choices=('bash', 'powershell'), default='bash')
     p.add_argument('--job')
     p.add_argument('--wait-seconds', type=int)
     p.add_argument('--timeout-seconds', type=int)
@@ -361,7 +409,7 @@ def start(d, a):
 
 def request_of(a, revision):
     return {'paths': a.path, 'command': a.command, 'setup': a.setup or '', 'requires': a.require,
-            'timeoutSeconds': a.timeout_seconds, 'revision': revision}
+            'timeoutSeconds': a.timeout_seconds, 'revision': revision, **({'shell': a.shell} if a.shell != 'bash' else {})}
 
 
 def alive(pid):
