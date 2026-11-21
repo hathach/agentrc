@@ -2027,6 +2027,11 @@ class VerdictsTest(unittest.TestCase):
                 self.assertEqual(self.main('remember', stdin='not json'), (0, {'head': HEAD}))
         rc, r = self.main('recall', '--check', JOB.format(3))
         self.assertEqual((rc, r['verdicts']), (0, [self.ENTRY]))
+        # an unreadable one is the collector's own error line, never a traceback
+        with mock.patch.object(sys.modules['seal'], 'STDIN_FROM', str(Path(d) / 'gone.in')):
+            rc, _ = self.main('remember')
+        self.assertEqual(rc, 1)
+        self.assertIn('the input file AGENTRC_STDIN names is unreadable', self.printed)
 
     def test_a_later_verdict_for_a_link_replaces_the_earlier(self):
         self.main('remember', stdin=json.dumps([self.ENTRY]))

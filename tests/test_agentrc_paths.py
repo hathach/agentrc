@@ -20,8 +20,9 @@ ALLOWED = {}
 
 BASE = r'\$\{AGENTRC_DIR:-\$HOME/\.(?:claude|codex)\}'
 REST = r'([^\s`\'")\]\\]+)'  # a TOML basic string escapes the closing quote
-# the expansion, or a workflow's AGENTRC constant (its quoted shell text), and the path after it
-NAMED = re.compile(rf'{BASE}"?/{REST}|\$\{{AGENTRC\}}/{REST}')
+# the expansion, a workflow's AGENTRC constant (its quoted shell text) or its agentrcPath('x') (the path in either
+# shell), and the path after it
+NAMED = re.compile(rf'{BASE}"?/{REST}|\$\{{AGENTRC\}}/{REST}|agentrcPath\(\'([^\']+)\'\)')
 # a variable set to an agentrc path: S="${AGENTRC_DIR:-$HOME/.claude}/x" in a recipe, const S = `${AGENTRC}/x`
 ASSIGNED = re.compile(rf'^\s*(?:const\s+)?([A-Za-z_]\w*)\s*=\s*["`]?(?:{BASE}|\$\{{AGENTRC\}})/([^\s"`\']+)', re.M)
 
@@ -71,7 +72,7 @@ class AgentrcPaths(unittest.TestCase):
         """Directly, or through a variable set to an agentrc path in the same file (`$S/x.py`, `${S}/x.py`)."""
         bad = []
         for name, text in scanned():
-            named = [(m.start(), m[1] or m[2]) for m in NAMED.finditer(text)]
+            named = [(m.start(), m[1] or m[2] or m[3]) for m in NAMED.finditer(text)]
             for var, base in ASSIGNED.findall(text):
                 named += [(m.start(), f'{base}/{m[1]}') for m in re.finditer(rf'\$\{{?{var}\}}?/{REST}', text)]
             for at, path in named:

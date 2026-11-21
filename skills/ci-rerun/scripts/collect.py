@@ -1333,7 +1333,11 @@ def main(argv=None):
         elif a.command == 'bases':
             out = bases(a.repo, a.pr, a.head, a.check)
         elif a.command == 'remember':
-            out = remember(a.repo, a.pr, a.head, stdin_bytes())
+            try:
+                data = stdin_bytes()
+            except OSError as e:
+                raise Failed(f'the input file AGENTRC_STDIN names is unreadable: {e}') from None
+            out = remember(a.repo, a.pr, a.head, data)
         else:
             out = recall(a.repo, a.pr, a.head, a.check, a.offset)
         out, rc = finished(out), 0

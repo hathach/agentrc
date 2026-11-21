@@ -19,8 +19,9 @@ shell last entered: `setup`, `prerequisite` or `build`. A shell that stopped
 before `build` never built: its environment is missing, whatever its status.
 The shell is bash (on Windows bash.exe from PATH), or with --shell powershell
 Windows PowerShell from System32 (pwsh off Windows), SETUP and CMD then
-PowerShell code: a step fails on a native program's nonzero status or a failed
-cmdlet, for a Windows host that runs no bash.
+PowerShell code, for a Windows host that runs no bash: a failed cmdlet stops
+the shell wherever it is, and a step's status is otherwise its last native
+program's.
 
 stdout ends with one JSON line {revision, snapshot, snapshotAfter, command,
 setup, requires, stage, buildDir, exit, usageError, log, retained, seal} (seal:
@@ -111,9 +112,11 @@ def ps_quote(s):
 
 
 def ps_script(setup, requires, command):
-    """script() for Windows PowerShell: the same steps and marks, a step's failure its exit status (a native program's
-    last one, else 1 for a failed cmdlet)."""
-    mark = lambda stage: f"[IO.File]::WriteAllText($env:PR_BABYSIT_STAGE, '{stage}')\n"
+    """script() for Windows PowerShell: the same steps and marks. A failed cmdlet stops the shell with status 1
+    wherever it is ($ErrorActionPreference Stop: no later success masks it); a step's status is otherwise its last
+    native program's, as bash's is its last command's."""
+    mark = lambda stage: ("$ErrorActionPreference = 'Stop'\n" if stage == 'setup' else '') + \
+        f"[IO.File]::WriteAllText($env:PR_BABYSIT_STAGE, '{stage}')\n"
     # $? first: any statement, the `if` reading LASTEXITCODE too, resets it
     status = ('$pr_babysit_ok = $?\nif ($LASTEXITCODE) { exit $LASTEXITCODE }\n'
               'if (-not $pr_babysit_ok) { exit 1 }\n')

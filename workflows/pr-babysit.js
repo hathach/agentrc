@@ -43,7 +43,7 @@ const psLit = (s) => `'${String(s).replace(/'/g, "''")}'`
 const PS_PRELUDE = "$PSNativeCommandArgumentPassing = 'Legacy'; $agentrc = if ($env:AGENTRC_DIR) { $env:AGENTRC_DIR } else { \"$HOME/.claude\" }; "
 // An agentrc file as one word of a command (bash: the same two installs), quoted so a path with spaces stays one word;
 // PowerShell takes "..."/x as two, so its whole path is in the quotes.
-const agentrcPath = (rel) => PWSH ? `"$agentrc/${rel}"` : `"\${AGENTRC_DIR:-$HOME/.claude}"/${rel}`
+const agentrcPath = (rel) => PWSH ? `"$agentrc/${rel}"` : '"${AGENTRC_DIR:-$HOME/.claude}"/' + rel
 // One interpreter for every script (#234): the caller's, else the one `python3` (under PowerShell `python`, which a
 // python.org install has alone) names, by the absolute path preflight reports; never a search.
 const pythonArg = args.python ?? null
@@ -535,7 +535,7 @@ if (args.state !== undefined && args.state !== null) {
     const same = c !== undefined ? (c && sealMatches(c) && c.dir === pinnedDir ? { exit: c.same === true ? 0 : 1 } : null)
       : await agent(
         'Editing nothing, run exactly ' +
-        (PWSH ? `\`$t = git rev-parse --show-toplevel; if ($LASTEXITCODE -eq 0 -and $t -and $t -eq (git -C ${shq(pinnedDir)} rev-parse --show-toplevel)) { exit 0 } else { exit 1 }\``
+        (PWSH ? `\`${PS_PRELUDE}$t = git rev-parse --show-toplevel; if ($LASTEXITCODE -eq 0 -and $t -and $t -eq (git -C ${shq(pinnedDir)} rev-parse --show-toplevel)) { exit 0 } else { exit 1 }\``
           : `\`t=$(git rev-parse --show-toplevel) && [ -n "$t" ] && [ "$t" = "$(git -C ${shq(pinnedDir)} rev-parse --show-toplevel)" ]\``) +
         ' and answer its exit status as exit.',
         { label: 'state:checkout', phase: 'Triage', agentType: 'relay', model: 'haiku', effort: 'low', schema: RAN },

@@ -419,6 +419,10 @@ class PowerShellBuildTest(unittest.TestCase):
 
     def test_a_failed_cmdlet_fails_the_build_and_a_clean_one_passes(self):
         for command, status in (('Get-Item no-such-file', 1), ('Write-Output ok', 0), (self.py('pass'), 0),
+                                # a later success masks no failed cmdlet; a native status is the last program's
+                                ('Get-Item no-such-file; Write-Output after', 1),
+                # a native program's stderr is no failed cmdlet
+                (self.py('import sys; sys.stderr.write(chr(119) + chr(10))'), 0),
                                 (f"{self.py('import sys; sys.exit(4)')}; Write-Output after", 4)):
             _, out = self.run_script('--path=.', '--command', command)
             self.assertEqual((out['stage'], out['exit']), ('build', status), command)
@@ -429,6 +433,7 @@ class PowerShellBuildTest(unittest.TestCase):
             (['--require=git', '--require=no-such-tool'], 'prerequisite', 127),
             (['--setup=exit 3'], 'setup', 3),
             (['--setup=Get-Item no-such-file'], 'setup', 1),
+            (['--setup=Get-Item no-such-file; Write-Output after'], 'setup', 1),
             ([f"--setup={self.py('import sys; sys.exit(2)')}"], 'setup', 2),
         ):
             _, out = self.run_script('--path=.', *argv, '--command', "$null = New-Item -ItemType File -Path built")

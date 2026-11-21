@@ -1534,7 +1534,14 @@ const shellTest = (name, body) => {
 const shellArgs = (sh) => sh.shell === 'bash' ? {} : { shell: sh.shell }
 const commandOf = (prompt) => String(prompt).match(/run exactly `([^`]*)` and answer/)[1]
 // The interpreter the commands run under: PIN's /usr/bin/python3 does not exist on Windows; forward slashes for bash.
-const hostPython = () => spawnSync('python3', ['-c', 'import sys; print(sys.executable)'], { encoding: 'utf8' }).stdout.trim().replaceAll('\\', '/')
+// On Windows python first: a python.org install has no python3.exe.
+const hostPython = () => {
+  for (const name of ON_WINDOWS ? ['python', 'python3'] : ['python3']) {
+    const r = spawnSync(name, ['-c', 'import sys; print(sys.executable)'], { encoding: 'utf8' })
+    if (r.status === 0 && r.stdout.trim()) return r.stdout.trim().replaceAll('\\', '/')
+  }
+  throw new Error('no python3 (on Windows python) runs here')
+}
 // A relay's transcript as the runtime keeps it (#540): under CLAUDE_CONFIG_DIR's project directory of the session
 // CLAUDE_CODE_SESSION_ID names, its prompt the computed task of the first user record, each line indented two spaces
 // past the harness's frame; `after` the records that follow it. The env that names it.
@@ -1673,7 +1680,9 @@ test("a powershell launch runs as a bash one does, every relay command written f
 
 // The quoting a PowerShell launch gives a value, as Windows PowerShell hands it to a native program: blanks, double
 // quotes, backslash runs before a quote or at the end, a single quote and an empty word each arrive as one argv entry.
-;(HAS_POWERSHELL ? test : (name) => nodeTest(name, { skip: 'no PowerShell here' }, () => {}))(
+// Windows alone: pwsh elsewhere hands a native program an argv of its own splitting, and a launch names
+// shell: 'powershell' only on a Windows host that runs no bash.
+;(HAS_POWERSHELL && ON_WINDOWS ? test : (name) => nodeTest(name, { skip: 'needs Windows PowerShell' }, () => {}))(
   'a powershell launch hands build.py a build command full of quoting as the caller gave it', async () => {
     const tmp = mkdtempSync(join(tmpdir(), 'pr-babysit-ps-'))
     let emitRoot = null
