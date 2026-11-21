@@ -468,9 +468,13 @@ class CommitsTest(unittest.TestCase):
     def test_commit_takes_its_message_from_the_file_agentrc_stdin_names_and_hands_hooks_no_agentrc_stdin(self):
         # A PowerShell relay has no `<`: the file stands in for stdin, read as bytes, and the hook never sees the name.
         message = 'Fix the naïve check — ✓\n\nWhy.\n'
-        msg = self.repo.parent / 'msg.in'
+        # outside the repository, in a directory this test alone owns
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        inputs = Path(tmp.name)
+        msg = inputs / 'msg.in'
         msg.write_bytes(message.encode('utf-8'))
-        seen = self.repo.parent / 'seen'
+        seen = inputs / 'seen'
         self.hook(f'echo "${{AGENTRC_STDIN-unset}}" > "{seen.as_posix()}"')
         self.write('a.c', 'changed\n')
         code, out = self.run_script('commit', 'a.c', stdin='ignored\n', env={**ENV, 'AGENTRC_STDIN': str(msg)})
@@ -479,7 +483,7 @@ class CommitsTest(unittest.TestCase):
         if seen.exists():   # a hook runs where sh does
             self.assertEqual(seen.read_text().strip(), 'unset')
         self.write('a.c', 'again\n')
-        code, out = self.run_script('commit', 'a.c', env={**ENV, 'AGENTRC_STDIN': str(self.repo.parent / 'missing.in')})
+        code, out = self.run_script('commit', 'a.c', env={**ENV, 'AGENTRC_STDIN': str(inputs / 'missing.in')})
         self.assertEqual(code, 2)
         self.assertIn('AGENTRC_STDIN names is unreadable', out['error'])
 
