@@ -423,6 +423,18 @@ class PowerShellBuildTest(unittest.TestCase):
         self.assertEqual(Path(out['log']).parent, logs)
         self.assertEqual(list(logs.glob('*.ps1')), [], 'no script file left behind')
 
+    def test_a_temp_dir_holding_a_powershell_quote_is_refused_before_anything_is_made(self):
+        # <BUILD> goes into the PowerShell source raw: a curly quote there would end a string
+        for name in ('O’Brien', 'a“b'):
+            with self.subTest(name=name):
+                odd = self.repo.parent / name
+                odd.mkdir()
+                self.env = {**self.env, 'TMP': str(odd), 'TEMP': str(odd), 'TMPDIR': str(odd)}
+                code, out = self.run_script('--path=.', '--command', "$null = New-Item -ItemType File -Path '<BUILD>/out'")
+                self.assertEqual(code, 2, out)
+                self.assertIn('holds a PowerShell quote: point TMP and TEMP at a plain path', out['error'])
+                self.assertEqual(list(odd.iterdir()), [])
+
     def test_ps_quote_keeps_every_single_quote_powershell_reads_literal(self):
         for text in ("it's", 'a‘b’c', "‚'‛", "x'; Write-Output injected; #"):
             with self.subTest(text=text):

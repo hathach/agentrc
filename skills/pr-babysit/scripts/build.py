@@ -183,6 +183,9 @@ def prepare(a):
     # <BUILD> goes into the command unquoted: a temp dir with a blank or shell syntax in it would split or run
     if os.name == 'nt' and re.search(r'[\s\'"$`;&|<>()*?[\]{}!#]', Path(tempfile.gettempdir()).as_posix()):
         raise Unusable(f'the temp dir {tempfile.gettempdir()} holds a blank or shell syntax: point TMP and TEMP at a plain path')
+    # PowerShell also takes the curly quotes U+2018..U+201E for string delimiters
+    if a.shell == 'powershell' and re.search('[‘-„]', tempfile.gettempdir()):
+        raise Unusable(f'the temp dir {tempfile.gettempdir()} holds a PowerShell quote: point TMP and TEMP at a plain path')
     top = checkout_top()
 
     LOGS.mkdir(exist_ok=True)
