@@ -108,7 +108,8 @@ def script(setup, requires, command):
 
 
 def ps_quote(s):
-    return "'" + s.replace("'", "''") + "'"
+    """A PowerShell single-quoted literal: ' and the curly single quotes PowerShell also takes for it, each doubled."""
+    return "'" + re.sub("['‘’‚‛]", lambda m: m[0] * 2, s) + "'"
 
 
 def ps_script(setup, requires, command):

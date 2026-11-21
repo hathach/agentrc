@@ -1687,7 +1687,8 @@ test("a powershell launch runs as a bash one does, every relay command written f
     const tmp = mkdtempSync(join(tmpdir(), 'pr-babysit-ps-'))
     let emitRoot = null
     try {
-      const build = `python -c "print('a b')" --x='y z' "q\\"r" C:\\dir\\ \\\\"tail\\\\" '' end\\`
+      // curly single quotes too, which PowerShell also takes for '
+      const build = `python -c "print('a b')" --x='y z' "q\\"r" C:\\dir\\ \\\\"tail\\\\" '' a\u2019; Write-Output injected; # \u2018b\u201a\u201b end\\`
       const ran = await run({ keepEmit: true, reviews: oneValid, args: { autoPush: true, shell: 'powershell', python: hostPython(), build } })
       emitRoot = ran.emitRoot
       const call = ran.calls.find(c => c.label.startsWith('build#'))

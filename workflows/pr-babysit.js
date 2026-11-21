@@ -35,8 +35,9 @@ if (!SHELLS.includes(SHELL)) throw new Error(`shell must be one of ${SHELLS.join
 const PWSH = SHELL === 'powershell'
 // The tool a relay runs its command with, as the prompts name it.
 const SHELL_TOOL = PWSH ? 'PowerShell' : 'Bash'
-// A PowerShell string literal, for PowerShell's own use: a program it calls, a value it assigns.
-const psLit = (s) => `'${String(s).replace(/'/g, "''")}'`
+// A PowerShell string literal, for PowerShell's own use: a program it calls, a value it assigns. PowerShell takes the
+// curly single quotes ‘ ’ ‚ ‛ for ' too, so each is doubled as ' is.
+const psLit = (s) => `'${String(s).replace(/['‘’‚‛]/g, '$&$&')}'`
 // Every PowerShell command opens with it: on PowerShell 7.3+ native arguments pass as Windows PowerShell 5.1's do,
 // which shq's quoting is written for (5.1 just sets a variable), and $agentrc is the agentrc checkout a project install
 // names in AGENTRC_DIR, else the user install.

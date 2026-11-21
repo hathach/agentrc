@@ -405,6 +405,10 @@ class PowerShellBuildTest(unittest.TestCase):
 
     def test_the_build_runs_in_powershell_and_its_status_is_the_last_native_programs(self):
         (self.repo / 'src.c').write_text('int broken\n')
+        # a temp dir of this test's own, so the logs dir holds only this build's files
+        temp = self.repo.parent / 'temp'
+        temp.mkdir()
+        self.env = {**self.env, 'TMP': str(temp), 'TEMP': str(temp), 'TMPDIR': str(temp)}
         code, out = self.run_script('--path=.', '--command',
                                     "$null = New-Item -ItemType File -Path '<BUILD>/out'; "
                                     f"if ((Get-Content src.c) -ne 'int ok;') {{ {self.py('import sys; sys.exit(3)')} }}")
@@ -415,7 +419,17 @@ class PowerShellBuildTest(unittest.TestCase):
         log = Path(out['log']).read_text(encoding='utf-8', errors='replace')
         self.assertIn('$ $null = New-Item', log, 'the log shows the script')
         self.assertIn(f'\n{build.BUILD_MARK}\n', log, 'the build step announced itself')
-        self.assertEqual(list(Path(build.LOGS).glob(f'{Path(out["log"]).stem}*.ps1')), [], 'no script file left behind')
+        logs = temp / build.LOGS.name
+        self.assertEqual(Path(out['log']).parent, logs)
+        self.assertEqual(list(logs.glob('*.ps1')), [], 'no script file left behind')
+
+    def test_ps_quote_keeps_every_single_quote_powershell_reads_literal(self):
+        for text in ("it's", 'a‘b’c', "‚'‛", "x'; Write-Output injected; #"):
+            with self.subTest(text=text):
+                done = subprocess.run([build.windows.powershell(), '-NoProfile', '-NonInteractive', '-Command',
+                                       f'[Console]::OutputEncoding = [Text.Encoding]::UTF8; Write-Output {build.ps_quote(text)}'],
+                                      capture_output=True, encoding='utf-8')
+                self.assertEqual(done.stdout.strip(), text, done.stderr)
 
     def test_a_failed_cmdlet_fails_the_build_and_a_clean_one_passes(self):
         for command, status in (('Get-Item no-such-file', 1), ('Write-Output ok', 0), (self.py('pass'), 0),
