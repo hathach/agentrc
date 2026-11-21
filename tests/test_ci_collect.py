@@ -2018,6 +2018,16 @@ class VerdictsTest(unittest.TestCase):
         rc, r = self.main('recall', '--check', JOB.format(3), '--check', JOB.format(4))
         self.assertEqual((rc, r['verdicts']), (0, [self.ENTRY]))
 
+    def test_remember_reads_the_file_agentrc_stdin_named_in_place_of_stdin(self):
+        # A PowerShell relay has no `<`: lib/seal.py took the file's name at import, and its bytes are the input.
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / 'verdicts.in'
+            path.write_bytes(json.dumps([self.ENTRY], ensure_ascii=False).encode('utf-8'))
+            with mock.patch.object(sys.modules['seal'], 'STDIN_FROM', str(path)):
+                self.assertEqual(self.main('remember', stdin='not json'), (0, {'head': HEAD}))
+        rc, r = self.main('recall', '--check', JOB.format(3))
+        self.assertEqual((rc, r['verdicts']), (0, [self.ENTRY]))
+
     def test_a_later_verdict_for_a_link_replaces_the_earlier(self):
         self.main('remember', stdin=json.dumps([self.ENTRY]))
         other = {**self.ENTRY, 'link': JOB.format(4)}

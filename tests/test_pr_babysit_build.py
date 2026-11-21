@@ -390,5 +390,68 @@ class BuildTest(unittest.TestCase):
         self.assertIn('run from the checkout top level', out['error'])
 
 
+@unittest.skipUnless(build.windows.powershell(), 'needs Windows PowerShell (pwsh off Windows)')
+class PowerShellBuildTest(unittest.TestCase):
+    """--shell powershell: SETUP and CMD as Windows PowerShell code, for a Windows host that runs no bash."""
+    setUp = BuildTest.setUp
+    git = BuildTest.git
+    job = BuildTest.job
+
+    def run_script(self, *argv, cwd=None):
+        return BuildTest.run_script(self, *argv, '--shell=powershell', cwd=cwd)
+
+    def py(self, code):
+        return f"& '{Path(sys.executable).as_posix()}' -c '{code}'"
+
+    def test_the_build_runs_in_powershell_and_its_status_is_the_last_native_programs(self):
+        (self.repo / 'src.c').write_text('int broken\n')
+        code, out = self.run_script('--path=.', '--command',
+                                    "$null = New-Item -ItemType File -Path '<BUILD>/out'; "
+                                    f"if ((Get-Content src.c) -ne 'int ok;') {{ {self.py('import sys; sys.exit(3)')} }}")
+        self.assertEqual((code, out['stage'], out['exit'], out['revision']), (0, 'build', 3, self.base), out)
+        self.assertNotIn('<BUILD>', out['command'])
+        self.assertEqual(out['retained'], [])
+        self.assertFalse(os.path.exists(out['buildDir']))
+        log = Path(out['log']).read_text(encoding='utf-8', errors='replace')
+        self.assertIn('$ $null = New-Item', log, 'the log shows the script')
+        self.assertIn(f'\n{build.BUILD_MARK}\n', log, 'the build step announced itself')
+        self.assertEqual(list(Path(build.LOGS).glob(f'{Path(out["log"]).stem}*.ps1')), [], 'no script file left behind')
+
+    def test_a_failed_cmdlet_fails_the_build_and_a_clean_one_passes(self):
+        for command, status in (('Get-Item no-such-file', 1), ('Write-Output ok', 0), (self.py('pass'), 0),
+                                (f"{self.py('import sys; sys.exit(4)')}; Write-Output after", 4)):
+            _, out = self.run_script('--path=.', '--command', command)
+            self.assertEqual((out['stage'], out['exit']), ('build', status), command)
+
+    def test_a_missing_tool_or_failed_setup_never_reaches_the_build_and_setup_reaches_it(self):
+        for argv, stage, code in (
+            (['--require=no-such-tool'], 'prerequisite', 127),
+            (['--require=git', '--require=no-such-tool'], 'prerequisite', 127),
+            (['--setup=exit 3'], 'setup', 3),
+            (['--setup=Get-Item no-such-file'], 'setup', 1),
+            ([f"--setup={self.py('import sys; sys.exit(2)')}"], 'setup', 2),
+        ):
+            _, out = self.run_script('--path=.', *argv, '--command', "$null = New-Item -ItemType File -Path built")
+            self.assertEqual((out['stage'], out['exit']), (stage, code), argv)
+            self.assertFalse((self.repo / 'built').exists(), argv)
+        _, out = self.run_script('--path=.', '--require=no-such-tool', '--command', 'Write-Output never')
+        self.assertIn('missing tool: no-such-tool', Path(out['log']).read_text(encoding='utf-8', errors='replace'))
+        _, out = self.run_script('--path=.', "--setup=$env:PR_BABYSIT_T = 'set'", '--require=git',
+                                 '--command', "if ($env:PR_BABYSIT_T -ne 'set') { exit 5 }")
+        self.assertEqual((out['stage'], out['exit'], out['setup']), ('build', 0, "$env:PR_BABYSIT_T = 'set'"), out)
+
+    def test_a_job_builds_detached_and_its_request_names_the_shell(self):
+        command = "Add-Content -Path ../count -Value run; Start-Sleep 1"
+        code, out = self.job(command, 60)
+        self.assertEqual((code, out['state'], out['exit'], out['stage']), (0, 'done', 0, 'build'), out)
+        self.assertEqual(json.loads((self.repo.parent / 'job' / 'request.json').read_text())['request']['shell'], 'powershell')
+        self.assertEqual((self.repo.parent / 'count').read_text().split(), ['run'], 'built once')
+        # the same job asked under bash is another request
+        code, out = BuildTest.run_script(self, '--path=src.c', '--command', command, f'--job={self.repo.parent / "job"}',
+                                         '--wait-seconds=0', '--timeout-seconds=60', '--stop-grace-seconds=1')
+        self.assertEqual(code, 2)
+        self.assertIn('holds another build request', out['error'])
+
+
 if __name__ == '__main__':
     unittest.main()

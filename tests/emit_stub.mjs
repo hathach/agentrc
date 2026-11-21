@@ -12,8 +12,8 @@ export const AsyncFunction = Object.getPrototypeOf(async function () {}).constru
 // Shadowing them as parameters makes the body fail here the way it fails there.
 export const ABSENT = ['URL', 'URLSearchParams', 'TextEncoder', 'TextDecoder', 'Buffer', 'process', 'fetch', 'structuredClone']
 
-// The file a relay command hands its script as AGENTRC_EMIT.
-export const emitOf = (prompt) => String(prompt).match(/AGENTRC_EMIT='([^']+)' /)?.[1]
+// The file a relay command hands its script as AGENTRC_EMIT: bash's `AGENTRC_EMIT='f' cmd`, PowerShell's `$env:AGENTRC_EMIT='f';`.
+export const emitOf = (prompt) => String(prompt).match(/AGENTRC_EMIT='([^']+)'[ ;]/)?.[1]
 // Python's json.dumps with ensure_ascii, compact: every UTF-16 unit past 0x7e as \uXXXX.
 const asciiJson = (v) => JSON.stringify(v).replace(/[\u007f-\uffff]/g, c => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`)
 // The module lib/seal.py's emit writes to `file`, byte for byte.

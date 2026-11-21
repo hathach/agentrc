@@ -465,6 +465,24 @@ class CommitsTest(unittest.TestCase):
         self.assertEqual((code, out['committed']), (0, True), out)
         self.assertEqual(self.git('log', '-1', '--format=%B'), message + '\n')
 
+    def test_commit_takes_its_message_from_the_file_agentrc_stdin_names_and_hands_hooks_no_agentrc_stdin(self):
+        # A PowerShell relay has no `<`: the file stands in for stdin, read as bytes, and the hook never sees the name.
+        message = 'Fix the naïve check — ✓\n\nWhy.\n'
+        msg = self.repo.parent / 'msg.in'
+        msg.write_bytes(message.encode('utf-8'))
+        seen = self.repo.parent / 'seen'
+        self.hook(f'echo "${{AGENTRC_STDIN-unset}}" > "{seen.as_posix()}"')
+        self.write('a.c', 'changed\n')
+        code, out = self.run_script('commit', 'a.c', stdin='ignored\n', env={**ENV, 'AGENTRC_STDIN': str(msg)})
+        self.assertEqual((code, out['committed']), (0, True), out)
+        self.assertEqual(self.git('log', '-1', '--format=%B'), message + '\n')
+        if seen.exists():   # a hook runs where sh does
+            self.assertEqual(seen.read_text().strip(), 'unset')
+        self.write('a.c', 'again\n')
+        code, out = self.run_script('commit', 'a.c', env={**ENV, 'AGENTRC_STDIN': str(self.repo.parent / 'missing.in')})
+        self.assertEqual(code, 2)
+        self.assertIn('AGENTRC_STDIN names is unreadable', out['error'])
+
     def test_attempt_reads_utf8_output_whatever_the_locale(self):
         code, out, err = sys.modules['facts'].attempt(sys.executable, '-c', "import sys; sys.stdout.buffer.write('é ✓ 修复'.encode())")
         self.assertEqual((code, out, err), (0, 'é ✓ 修复', ''))

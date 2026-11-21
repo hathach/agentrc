@@ -202,7 +202,7 @@ import greptile  # noqa: E402
 from check_runs import RUN_PENDING, gated_runs, latest_run, newest  # noqa: E402
 import windows  # noqa: E402
 import gh_retry  # noqa: E402
-from seal import emit, fnv1a, rate_limit, sealed, utc  # noqa: E402
+from seal import emit, fnv1a, rate_limit, sealed, stdin_bytes, utc  # noqa: E402
 
 POLL = 30
 ACTIONS_JOB = re.compile(r'^https://github\.com/[^/]+/[^/]+/actions/runs/(?P<run>\d+)/job/(?P<job>\d+)')
@@ -1333,7 +1333,7 @@ def main(argv=None):
         elif a.command == 'bases':
             out = bases(a.repo, a.pr, a.head, a.check)
         elif a.command == 'remember':
-            out = remember(a.repo, a.pr, a.head, sys.stdin.buffer.read())
+            out = remember(a.repo, a.pr, a.head, stdin_bytes())
         else:
             out = recall(a.repo, a.pr, a.head, a.check, a.offset)
         out, rc = finished(out), 0

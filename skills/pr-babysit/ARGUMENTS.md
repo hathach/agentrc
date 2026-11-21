@@ -17,6 +17,16 @@ A key not listed here throws before anything runs.
   searches for another. Preflight checks it imports what the lanes need (PyYAML
   while a bot is waited on) and stops `python-unusable` naming what is missing.
   Per launch.
+- `shell`: `bash` (default) or `powershell`, the shell every relay command is
+  written for. `powershell` is for a Windows host that runs no bash (no Git
+  Bash): each command is Windows PowerShell 5.1 code the relay runs in its
+  PowerShell tool, a script's input file handed over in `AGENTRC_STDIN` (no
+  `<`), `python` defaults to `python` (a python.org install has no
+  `python3.exe`), and `build.py` runs the build in Windows PowerShell, so a
+  `build` command, and the contract a resolver reads for one, is PowerShell
+  code. A relay without the tool its launch's shell needs stops the launch at
+  `emit:dir`, naming the other value. A `powershell` launch's state pins it: a
+  continuation passes it again (`launch_result.py`'s `pinned`).
 - `reviewers`: of `copilot`, `coderabbit`, `greptile`, `code-scanning`;
   default `['coderabbit', 'greptile', 'code-scanning']`; `[]` runs no review lane.
 - `autoRun`: the reviewers that run on every push and gate done; default

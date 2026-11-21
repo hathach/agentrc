@@ -5,12 +5,11 @@ export const meta = {
   phases: [{ title: 'Triage' }, { title: 'Fix' }, { title: 'Push' }],
 }
 
-const AGENTRC = '"${AGENTRC_DIR:-$HOME/.claude}"'  // shell text, quoted so a path with spaces stays one word: the agentrc checkout a project install names in AGENTRC_DIR, else the user install
 // args: see skills/pr-babysit/ARGUMENTS.md.
 if (typeof args === 'string') {
   try { args = JSON.parse(args) } catch (e) { throw new Error(`args is not valid JSON (${e.message}); pass an object, and a state by stateRef`) }
 }
-const ARG_NAMES = ['pr', 'repo', 'python', 'reviewers', 'autoRun', 'maxCycles', 'autoPush', 'markSonar', 'coderabbitTrigger', 'greptileTrigger', 'checkoutDir',
+const ARG_NAMES = ['pr', 'repo', 'python', 'shell', 'reviewers', 'autoRun', 'maxCycles', 'autoPush', 'markSonar', 'coderabbitTrigger', 'greptileTrigger', 'checkoutDir',
   'protected', 'generated', 'ciWait', 'ciNotes', 'acceptedFailures', 'deferrals', 'replySettlements', 'build', 'yieldAfterCycle', 'yieldOnChange',
   'lane', 'state', 'stateRef', 'adoptHead', 'adoptProtected', 'adoptReviewedProtected', 'rebasedHead', 'rejudge', 'reserved']
 if (!args || !args.pr) {
@@ -28,12 +27,34 @@ const REPO_NAME = /^[A-Za-z0-9][A-Za-z0-9-]*\/(?!\.\.?$)[A-Za-z0-9._-]+$/
 if (args.repo != null && (typeof args.repo !== 'string' || !REPO_NAME.test(args.repo))) {
   throw new Error('repo must be OWNER/NAME, the repository PR pr belongs to (a fork PR\'s base repository)')
 }
-// One interpreter for every script (#234): the caller's, else the one `python3` names, by the absolute path preflight reports; never a search.
+// The shell every relay command is written for: bash, or Windows PowerShell on a Windows host that runs no bash. The
+// relay and every agent asked to run a command carry both tools; the command's own syntax is the one it is for.
+const SHELLS = ['bash', 'powershell']
+const SHELL = args.shell ?? 'bash'
+if (!SHELLS.includes(SHELL)) throw new Error(`shell must be one of ${SHELLS.join(', ')}: the shell every relay command is written for`)
+const PWSH = SHELL === 'powershell'
+// The tool a relay runs its command with, as the prompts name it.
+const SHELL_TOOL = PWSH ? 'PowerShell' : 'Bash'
+// A PowerShell string literal, for PowerShell's own use: a program it calls, a value it assigns.
+const psLit = (s) => `'${String(s).replace(/'/g, "''")}'`
+// Every PowerShell command opens with it: on PowerShell 7.3+ native arguments pass as Windows PowerShell 5.1's do,
+// which shq's quoting is written for (5.1 just sets a variable), and $agentrc is the agentrc checkout a project install
+// names in AGENTRC_DIR, else the user install.
+const PS_PRELUDE = "$PSNativeCommandArgumentPassing = 'Legacy'; $agentrc = if ($env:AGENTRC_DIR) { $env:AGENTRC_DIR } else { \"$HOME/.claude\" }; "
+// An agentrc file as one word of a command (bash: the same two installs), quoted so a path with spaces stays one word;
+// PowerShell takes "..."/x as two, so its whole path is in the quotes.
+const agentrcPath = (rel) => PWSH ? `"$agentrc/${rel}"` : `"\${AGENTRC_DIR:-$HOME/.claude}"/${rel}`
+// One interpreter for every script (#234): the caller's, else the one `python3` (under PowerShell `python`, which a
+// python.org install has alone) names, by the absolute path preflight reports; never a search.
 const pythonArg = args.python ?? null
 if (pythonArg !== null && (typeof pythonArg !== 'string' || !pythonArg.trim() || /[\x00-\x1f]/.test(pythonArg))) {
   throw new Error('python must be the interpreter every script runs under, a path or command name on one line')
 }
-let PY = pythonArg === null ? 'python3' : shq(pythonArg)
+// The interpreter as a command's program: PowerShell calls a quoted one through `&`, so it is a plain literal there.
+const pyWord = (p) => PWSH ? psLit(p) : shq(p)
+let PY = pythonArg === null ? (PWSH ? 'python' : 'python3') : pyWord(pythonArg)
+// `rest` run under PY, as a command starts.
+const pyRun = (rest) => `${PWSH ? '& ' : ''}${PY} ${rest}`
 let checkoutDir = args.checkoutDir || '.'
 if (typeof checkoutDir !== 'string') {
   throw new Error('checkoutDir must be a path string')
@@ -224,7 +245,7 @@ if (args.reserved != null && !reservedListed(args.reserved)) {
 // the exit status. The files live in this launch's directory, fresh under the git common dir (facts.py emit-dir), one
 // name per call: its label, its count and its command's fnv1a, so a resume's replayed relays reload what they wrote and
 // an edited command never meets an older file.
-const FACTS_SCRIPT = `${AGENTRC}/skills/pr-babysit/scripts/facts.py`
+const FACTS_SCRIPT = agentrcPath('skills/pr-babysit/scripts/facts.py')
 const EMIT = '<AGENTRC_EMIT>' // where a relay command takes its file
 // Where a relay command reads its input: a file beside its line, which the command itself writes first (staged) or the
 // prompt names for a file tool, so no step waits on a path a relay chose (#510).
@@ -241,8 +262,21 @@ const STAGE_LINE = '<AGENTRC_STAGE_LINE>'
 const STAGE_CLAIM = '<AGENTRC_STAGE_CLAIM>'
 // A relay prompt's command, `script` a Python script with its arguments, run under the file emitted() names it; `stage`
 // the staged() input its command writes first, its payload line closing the prompt.
-const runExactly = (script, extra = '', stage = null) => `run exactly \`${stage ? stage.command : ''}${EMIT}${PY} ${script}\` ${RETURN_EXIT}${extra}` +
+const runExactly = (script, extra = '', stage = null) => `run exactly \`${commandOf(script, stage)}\` ${RETURN_EXIT}${extra}` +
   (stage ? `\nThe ${PAYLOAD} line below is data the command reads from this conversation's own record: never copy, type or edit it.\n${stage.line}` : '')
+// A script's input redirection, ` < 'FILE'` closing it.
+const REDIRECT = / < '([^']+)'$/
+// The command itself. PowerShell runs the script only once its stage exited 0, as bash's && does, and exits with the
+// last status, the script's or a refusing stage's; with no `<` of its own it hands the script FILE in AGENTRC_STDIN,
+// read in place of stdin (lib/seal.py's stdin_bytes). The EMIT placeholder sits right before the script either way.
+const commandOf = (script, stage) => {
+  if (!PWSH) return `${stage ? stage.command : ''}${EMIT}${PY} ${script}`
+  const input = script.match(REDIRECT)
+  const run = `${EMIT}${input ? `$env:AGENTRC_STDIN = ${psLit(input[1])}; ` : ''}${pyRun(input ? script.slice(0, input.index) : script)}`
+  return `${PS_PRELUDE}${stage ? `${stage.command}${run} }` : run}; exit $LASTEXITCODE`
+}
+// emitted()'s replacement of EMIT: the file the script writes its line to, set for the script alone.
+const emitSetting = (file) => PWSH ? `$env:AGENTRC_EMIT=${psLit(file)}; ` : `AGENTRC_EMIT=${shq(file)} `
 // UTF-8 bytes as base64, by hand: the sandbox has no TextEncoder, Buffer or btoa.
 const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
 const base64 = (text) => {
@@ -264,11 +298,13 @@ const base64 = (text) => {
 // A script's JSON input as its command writes it to INPUT before the script runs. The base64 rides in the relay's
 // prompt on a line of its own, never in the command: a relay retyping a long literal changed it (#540). facts.py stage
 // --from-transcript reads that line from the relay's own transcript, refuses one that is not this JSON (its fnv1a) and
-// writes the bytes, all before `&&` lets the script start; no shell quoting or backslash meets the text (#417, #505).
+// writes the bytes, all before `&&` (PowerShell: the `if` commandOf closes) lets the script start; no shell quoting or
+// backslash meets the text (#417, #505).
 const PAYLOAD = 'AGENTRC-PAYLOAD'
 const staged = (v) => {
   const text = JSON.stringify(v)
-  return { command: `${PY} ${FACTS_SCRIPT} stage '${INPUT}' ${fnv1a(text)} --from-transcript --line ${STAGE_LINE} --claimed ${STAGE_CLAIM} && `,
+  const stage = pyRun(`${FACTS_SCRIPT} stage '${INPUT}' ${fnv1a(text)} --from-transcript --line ${STAGE_LINE} --claimed ${STAGE_CLAIM}`)
+  return { command: PWSH ? `${stage}; if ($LASTEXITCODE -eq 0) { ` : `${stage} && `,
     line: `${PAYLOAD} ${INPUT} ${fnv1a(text)} ${base64(text)}` }
 }
 const EMIT_DIR = { type: 'object', additionalProperties: false, required: ['dir'], properties: { dir: { type: 'string' }, nonce: { type: 'string' }, error: { type: 'string' } } }
@@ -283,9 +319,16 @@ let rootsNote = null
 // The scripts' checkout and the saved workflow's, each `<root> <short HEAD>`: a named launch loads the saved workflow,
 // which AGENTRC_DIR does not choose, while every script runs from AGENTRC_DIR (#480). The sandbox names no file of its own.
 const ROOTS = { type: 'object', additionalProperties: false, required: ['scripts', 'saved'], properties: { scripts: { type: 'string' }, saved: { type: 'string' } } }
-const ROOTS_CMD = 'for f in ' + `${AGENTRC}/skills/pr-babysit/scripts/facts.py "\${CLAUDE_CONFIG_DIR:-$HOME/.claude}/workflows/pr-babysit.js"; ` +
-  'do d=$([ -e "$f" ] && cd -P "$(dirname "$(readlink -f "$f")")" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null); ' +
-  'echo "${d:-unresolved} ${d:+$(git -C "$d" rev-parse --short HEAD 2>/dev/null)}"; done'
+const ROOTS_CMD = PWSH
+  // each link followed to its file, as readlink -f does; a Windows PowerShell 5.1 Target is an array
+  ? `${PS_PRELUDE}foreach ($f in @(${FACTS_SCRIPT},"$(if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { "$HOME/.claude" })/workflows/pr-babysit.js")) { ` +
+    '$d = $null; if (Test-Path -LiteralPath $f) { $p = (Resolve-Path -LiteralPath $f).Path; $i = Get-Item -LiteralPath $p; ' +
+    'while ($i.LinkType) { $p = [IO.Path]::GetFullPath([IO.Path]::Combine((Split-Path $p), @($i.Target)[0])); $i = Get-Item -LiteralPath $p }; ' +
+    '$d = git -C (Split-Path $p) rev-parse --show-toplevel 2>$null }; ' +
+    'if ($d) { "$d $(git -C $d rev-parse --short HEAD 2>$null)" } else { \'unresolved \' } }'
+  : 'for f in ' + `${FACTS_SCRIPT} "\${CLAUDE_CONFIG_DIR:-$HOME/.claude}/workflows/pr-babysit.js"; ` +
+    'do d=$([ -e "$f" ] && cd -P "$(dirname "$(readlink -f "$f")")" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null); ' +
+    'echo "${d:-unresolved} ${d:+$(git -C "$d" rev-parse --short HEAD 2>/dev/null)}"; done'
 const rootsOf = () => rootsNote ??= agent(`Editing nothing, run exactly \`${ROOTS_CMD}\` and return its first line as scripts and its second as saved, character for character.`,
   { label: 'emit:roots', phase: 'Triage', agentType: 'relay', model: 'haiku', effort: 'low', schema: ROOTS }).catch(() => null)
   .then(r => r ? `the scripts are ${r.scripts} (AGENTRC_DIR, else ~/.claude), and the saved workflow a named launch loads is ${r.saved}` : 'neither root could be read')
@@ -301,7 +344,7 @@ const maybeSkewOf = async (dir) => `the emit:dir relay answered ${JSON.stringify
 // A trust boundary: that proves consistency, not freshness; a resumed launch's replayed relay hands back the directory
 // and nonce of its first run, whose files its self-naming and seals reload.
 const emitDirOf = () => emitDir ??= agent(
-  `${IN_CHECKOUT}Editing and committing nothing, run exactly \`${PY} ${FACTS_SCRIPT} emit-dir\` and return the dir and nonce members of its last stdout ` +
+  `${IN_CHECKOUT}Editing and committing nothing, run exactly \`${PWSH ? PS_PRELUDE : ''}${pyRun(`${FACTS_SCRIPT} emit-dir`)}\` and return the dir and nonce members of its last stdout ` +
   'line as dir and nonce, character for character. If that line is {"error": ...}, or there is none, return its error, or what went wrong, as error, with dir = \'\'.',
   { label: 'emit:dir', phase: 'Triage', agentType: 'relay', model: 'haiku', effort: 'low', schema: EMIT_DIR },
 ).then(async r => {
@@ -318,8 +361,11 @@ const emitDirOf = () => emitDir ??= agent(
     return null
   }
   log(`emit:dir: no directory for the scripts' lines — ${r ? r.error || JSON.stringify(r.dir) : 'the relay died'}`)
-  // A facts.py without emit-dir answers its usage: a script copy older than this workflow.
-  emitWhy = r && /usage: facts\.py/.test(r.error || '') ? skewOf(r.error) : null
+  // A facts.py without emit-dir answers its usage: a script copy older than this workflow. A relay with no tool for
+  // this launch's shell (relay.md) names the other shell's launch.
+  emitWhy = r && /usage: facts\.py/.test(r.error || '') ? skewOf(r.error)
+    : r && /no tool for that shell|no Bash tool/i.test(r.error || '')
+      ? `the relay has no ${SHELL_TOOL} tool (${r.error}): relaunch with shell: '${PWSH ? 'bash' : 'powershell'}'` : null
   return null
 }, e => { log(`emit:dir errored — ${e && e.message}`); return null }).then(dir => {
   if (!dir) emitDir = null // only a directory is kept: the next relay, a .retry included, asks again
@@ -340,7 +386,7 @@ const emitted = async (prompt, { label, inputDir, ...opts }) => {
   const input = `${inputDir ?? dir}/${stem}.in`
   if (/['\x00-\x1f]/.test(input)) return { why: `the input file ${JSON.stringify(input)} holds a quote or control character` }
   const stageFile = `${dir}/${stem}.stage.js`
-  const ran = await agent(prompt.replace(EMIT, `AGENTRC_EMIT=${shq(file)} `).replace(STAGE_LINE, shq(stageFile))
+  const ran = await agent(prompt.replace(EMIT, emitSetting(file)).replace(STAGE_LINE, shq(stageFile))
     .replace(STAGE_CLAIM, shq(file)).split(INPUT).join(input),
     { label, ...opts, schema: RAN }).catch(e => { log(`${label} errored — ${e && e.message}`); return null })
   // A relay that died after its script wrote still leaves the line. On EMIT_REFUSED or EMIT_UNCLAIMABLE (lib/seal.py's
@@ -373,7 +419,7 @@ const emitted = async (prompt, { label, inputDir, ...opts }) => {
 }
 
 if (args.state != null && args.stateRef != null) throw new Error('pass state or stateRef, not both')
-const STATE_SCRIPT = `${AGENTRC}/skills/pr-babysit/scripts/state_transfer.py`
+const STATE_SCRIPT = agentrcPath('skills/pr-babysit/scripts/state_transfer.py')
 // state_transfer.py's MAX, over its own measure: compact JSON with every non-ASCII UTF-16 unit escaped as \uXXXX.
 const STATE_MAX = 8 * 1024 * 1024
 const stateBytes = (st) => { const s = JSON.stringify(st); return s.length + 5 * (s.length - s.replace(/[^\x00-\x7e]+/g, '').length) }
@@ -442,7 +488,10 @@ const ciCacheShaped = (c) => c && typeof c === 'object' &&
   Array.isArray(c.entries) && c.entries.every(e => e && ['link', 'bucket', 'digest'].every(k => typeof e[k] === 'string') &&
     (e.head === undefined || typeof e.head === 'string') && (e.placedWith === undefined || typeof e.placedWith === 'string') &&
     (e.refreshed === undefined || e.refreshed === true))
-const config = { pr: args.pr, reviewers, autoRun, checkoutDir, ciWait, protected: protectedRe ? protectedRe.source : null, generated: generatedRe ? generatedRe.source : null }
+// shell only when not bash's default: a state from before it, or of a bash launch, is unchanged; a powershell launch's
+// continuation passes it again, as launch_result.py's `pinned` shows.
+const config = { pr: args.pr, reviewers, autoRun, checkoutDir, ciWait, protected: protectedRe ? protectedRe.source : null, generated: generatedRe ? generatedRe.source : null,
+  ...(PWSH ? { shell: SHELL } : {}) }
 let restored = null
 if (args.state !== undefined && args.state !== null) {
   const st = args.state
@@ -486,7 +535,9 @@ if (args.state !== undefined && args.state !== null) {
     const same = c !== undefined ? (c && sealMatches(c) && c.dir === pinnedDir ? { exit: c.same === true ? 0 : 1 } : null)
       : await agent(
         'Editing nothing, run exactly ' +
-        `\`t=$(git rev-parse --show-toplevel) && [ -n "$t" ] && [ "$t" = "$(git -C ${shq(pinnedDir)} rev-parse --show-toplevel)" ]\` and answer its exit status as exit.`,
+        (PWSH ? `\`$t = git rev-parse --show-toplevel; if ($LASTEXITCODE -eq 0 -and $t -and $t -eq (git -C ${shq(pinnedDir)} rev-parse --show-toplevel)) { exit 0 } else { exit 1 }\``
+          : `\`t=$(git rev-parse --show-toplevel) && [ -n "$t" ] && [ "$t" = "$(git -C ${shq(pinnedDir)} rev-parse --show-toplevel)" ]\``) +
+        ' and answer its exit status as exit.',
         { label: 'state:checkout', phase: 'Triage', agentType: 'relay', model: 'haiku', effort: 'low', schema: RAN },
       ).catch(e => { log(`state:checkout errored — ${e && e.message}`); return null })
     if (same && same.exit === 0) {
@@ -940,22 +991,32 @@ const SCOPE_CHECK = withSeal({
   },
 })
 // Replies go only through reply.py, whose read-back receipts are the only proof: an agent's own "posted" once put a file path into 13 public replies, all 201.
-const REPLY_SCRIPT = `${AGENTRC}/skills/pr-reply/scripts/reply.py`
-const HOOKS_SCRIPT = `${AGENTRC}/skills/pr-babysit/scripts/hooks.py`
-const COMMITS_SCRIPT = `${AGENTRC}/skills/pr-babysit/scripts/commits.py`
-const PUSH_SCRIPT = `${AGENTRC}/skills/pr-babysit/scripts/push.py`
-const SONAR_SCRIPT = `${AGENTRC}/skills/pr-babysit/scripts/sonar.py`
-const CRTRIGGER_SCRIPT = `${AGENTRC}/skills/pr-babysit/scripts/coderabbit_trigger.py`
-const GTRIGGER_SCRIPT = `${AGENTRC}/skills/pr-babysit/scripts/greptile_trigger.py`
-const PREFLIGHT_SCRIPT = `${AGENTRC}/skills/pr-babysit/scripts/preflight.py`
-const HARVEST_SCRIPT = `${AGENTRC}/skills/pr-babysit/scripts/harvest.py`
-const BUILD_SCRIPT = `${AGENTRC}/skills/pr-babysit/scripts/build.py`
-const SCOPE_SCRIPT = `${AGENTRC}/skills/pr-babysit/scripts/scope_check.py`
-const COLLECT_SCRIPT = `${AGENTRC}/skills/ci-rerun/scripts/collect.py`
-const CIRECOVER_SCRIPT = `${AGENTRC}/skills/pr-babysit/scripts/ci_recover.py`
+const REPLY_SCRIPT = agentrcPath('skills/pr-reply/scripts/reply.py')
+const HOOKS_SCRIPT = agentrcPath('skills/pr-babysit/scripts/hooks.py')
+const COMMITS_SCRIPT = agentrcPath('skills/pr-babysit/scripts/commits.py')
+const PUSH_SCRIPT = agentrcPath('skills/pr-babysit/scripts/push.py')
+const SONAR_SCRIPT = agentrcPath('skills/pr-babysit/scripts/sonar.py')
+const CRTRIGGER_SCRIPT = agentrcPath('skills/pr-babysit/scripts/coderabbit_trigger.py')
+const GTRIGGER_SCRIPT = agentrcPath('skills/pr-babysit/scripts/greptile_trigger.py')
+const PREFLIGHT_SCRIPT = agentrcPath('skills/pr-babysit/scripts/preflight.py')
+const HARVEST_SCRIPT = agentrcPath('skills/pr-babysit/scripts/harvest.py')
+const BUILD_SCRIPT = agentrcPath('skills/pr-babysit/scripts/build.py')
+const SCOPE_SCRIPT = agentrcPath('skills/pr-babysit/scripts/scope_check.py')
+const COLLECT_SCRIPT = agentrcPath('skills/ci-rerun/scripts/collect.py')
+const CIRECOVER_SCRIPT = agentrcPath('skills/pr-babysit/scripts/ci_recover.py')
 // The preflight checks each is installed: a session's cached workflow definition can outlive a script it calls (#38).
 const NEEDED = [REPLY_SCRIPT, HOOKS_SCRIPT, COMMITS_SCRIPT, PUSH_SCRIPT, SONAR_SCRIPT, CRTRIGGER_SCRIPT, GTRIGGER_SCRIPT, HARVEST_SCRIPT, BUILD_SCRIPT, SCOPE_SCRIPT, COLLECT_SCRIPT, CIRECOVER_SCRIPT, STATE_SCRIPT, FACTS_SCRIPT]
-function shq (s) { return `'${String(s).replace(/'/g, `'\\''`)}'` }
+// A value as one word of a command: bash's single quotes. Under PowerShell, a literal Windows PowerShell 5.1 hands a
+// native program as one argv entry: 5.1 quotes a word again where a blank follows an even count of its double quotes,
+// escaped ones included, so a word with a blank or a double quote, or none at all, brings its own double quotes, each
+// inner one doubled ("" in a quoted span is one quote to the C runtime's argv parser, git's msvcrt excepted) and any
+// backslash run before a quote or the end doubled; a plain word goes as it is.
+function shq (s) {
+  s = String(s)
+  if (SHELL !== 'powershell') return `'${s.replace(/'/g, `'\\''`)}'`
+  if (s !== '' && !/[\s"]/.test(s)) return psLit(s)
+  return psLit(`"${s.replace(/(\\*)"/g, '$1$1""').replace(/(\\+)$/, '$1$1')}"`)
+}
 // The workflow's own check of a script's line against its schema: a member its schema allows null may be left out (a
 // script drops a null one) and reads null; an error line's other required members read empty.
 const nullable = (p) => !!p && Array.isArray(p.type) && p.type.includes('null')
@@ -992,7 +1053,9 @@ const noteLimit = (limit, from = '') => {
   githubLimit = limit
   if (!ciStopFile || from.startsWith('ci:')) return
   ciStopSent = agent(
-    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`touch -- ${shq(ciStopFile)}\` and answer its exit status as exit.`,
+    `${IN_CHECKOUT}Editing and committing nothing, run exactly ` +
+    // appending nothing creates the file and leaves one already there as it is
+    `\`${PWSH ? `[IO.File]::AppendAllText(${psLit(ciStopFile)}, '')` : `touch -- ${shq(ciStopFile)}`}\` and answer its exit status as exit.`,
     { label: 'stop:ci', phase: 'Triage', agentType: 'relay', model: 'haiku', effort: 'low', schema: RAN },
   ).catch(quiet('stop:ci'))
 }
@@ -1587,10 +1650,13 @@ const callerPlan = buildCmd && { command: buildCmd, setup: null, requires: [], c
 // The batch is built once, as it settled: a writer's own build ran before later writers' edits. A failure blocks.
 const BUILD_FAILED = 'the build failed'
 const BUILD_TIMED_OUT = 'the build timed out'
-// Each wait stays under the relay's 600000 ms Bash limit; the build itself is stopped past BUILD_LIMIT_MIN.
+// Each wait stays under the relay's 600000 ms shell-call limit; the build itself is stopped past BUILD_LIMIT_MIN.
 const BUILD_POLL_S = 540
 const BUILD_LIMIT_MIN = 180
 const BUILD_POLLS = Math.ceil(BUILD_LIMIT_MIN * 60 / BUILD_POLL_S) + 2
+// The shell build.py runs the build in, as the resolver writes for it: the relay's own.
+const BUILD_SHELL = PWSH ? 'Windows PowerShell' : 'shell'
+const IDF_SETUP = PWSH ? '. "$env:IDF_PATH/export.ps1"' : '. "$IDF_PATH/export.sh"'
 const buildCheck = async (tag, owned) => {
   let plan = callerPlan
   if (!plan) {
@@ -1600,11 +1666,11 @@ const buildCheck = async (tag, owned) => {
     if (!plan) {
       plan = await agent(
         `${IN_CHECKOUT}Editing and building nothing, resolve the repository's build contract (its agent instructions and build docs) for a change to ${owned.join(', ')}. ` +
-        "command = the shell command, run from the checkout's top level, that builds what these paths affect, with `<BUILD>` where the contract takes a fresh build directory; " +
-        'setup = the shell lines the contract says must run first in the same shell (sourcing a toolchain\'s environment script, say), else null; ' +
+        `command = the ${BUILD_SHELL} command, run from the checkout's top level, that builds what these paths affect, with \`<BUILD>\` where the contract takes a fresh build directory; ` +
+        `setup = the ${BUILD_SHELL} lines the contract says must run first in the same shell (sourcing a toolchain's environment script, say), else null; ` +
         'requires = the executables command runs that setup or the system must put on PATH, each a bare name; ' +
         // #309: a wrapper building one board per family needed Espressif's export.sh and idf.py, and a missing idf.py failed the batch.
-        'when command builds several targets or board families, a wrapper script\'s included, setup and requires hold every one\'s: each family\'s own setup the contract names (such as `. "$IDF_PATH/export.sh"` before an Espressif build) and each tool its build invokes, through the wrapper too (such as idf.py), so a missing one stops the shell before the build. ' +
+        `when command builds several targets or board families, a wrapper script's included, setup and requires hold every one's: each family's own setup the contract names (such as \`${IDF_SETUP}\` before an Espressif build) and each tool its build invokes, through the wrapper too (such as idf.py), so a missing one stops the shell before the build. ` +
         // #557: a selection flag without the one it needs (check_build.py's --worktree without --base) refused every candidate.
         'The change is uncommitted when command runs: where the contract selects what to build from a change, use the form it gives for uncommitted and untracked changes, with every argument that form needs, ' +
         'such as `--base <ref> --worktree` with the ref the contract\'s own examples use, never a committed-only form or one flag of such a form without the others. ' +
@@ -1618,13 +1684,13 @@ const buildCheck = async (tag, owned) => {
   if (plan.command === null) { log(`build#${tag}: no build applies — ${plan.reason}`); return null }
   // --flag=value throughout: a value such as -DBOARD=x must not read as a flag.
   const cmd = `${BUILD_SCRIPT}${owned.map(f => ` --path=${shq(f)}`).join('')} --command=${shq(plan.command)}` +
-    `${plan.setup ? ` --setup=${shq(plan.setup)}` : ''}${plan.requires.map(t => ` --require=${shq(t)}`).join('')}`
+    `${plan.setup ? ` --setup=${shq(plan.setup)}` : ''}${plan.requires.map(t => ` --require=${shq(t)}`).join('')}${PWSH ? ' --shell=powershell' : ''}`
   // The build runs detached in a job of this batch and head, so a contract longer than one shell call is waited out
   // over several bounded ones (#375); each call attaches to the same job, a retried or resumed one included.
   const job = `${pinned.receipts.trim()}/build-${tag}-${fnv1a(`${expectedHead} ${cmd}`)}`
   const prompt = `${IN_CHECKOUT}From the checkout's top level, editing nothing, ` +
     runExactly(`${cmd} --job=${shq(job)} --wait-seconds=${BUILD_POLL_S} --timeout-seconds=${BUILD_LIMIT_MIN * 60}`,
-      ' Run it in the foreground with a Bash timeout of 600000 ms, the tool\'s maximum: it returns within ten minutes, ' +
+      ` Run it in the foreground with a ${SHELL_TOOL} timeout of 600000 ms, the tool's maximum: it returns within ten minutes, ` +
       'the build left running for the next call when unfinished.')
   let r = null
   for (let n = 0; n < BUILD_POLLS; n++) {
@@ -1758,7 +1824,7 @@ const fixAndVerify = async (workIn, tag, rejectable = false) => {
       `Fix the following issues on the PR branch. ${IN_CHECKOUT}\n` +
       (protectedRe ? `Constraint: never modify a path matching ${protectedRe.source} — it is the caller's, and a failure that needs it changed stays red for the user.\n` : '') +
       (buildCmd
-        ? `Verify with: ${buildCmd} (a \`<BUILD>\` placeholder becomes a fresh \`mktemp -d\`).\n`
+        ? `Verify with: ${buildCmd} (a \`<BUILD>\` placeholder becomes a fresh ${PWSH ? 'empty directory under $env:TEMP, run in Windows PowerShell' : '`mktemp -d`'}).\n`
         : "Verify with the repository's build contract, resolved for your scope; do not invent a command.\n") +
       STOPS + '\n' +
       (rejectable
@@ -1957,7 +2023,7 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
   const hooks = await relayRun(
     `${IN_CHECKOUT}Editing nothing by hand, from the checkout's top level ` +
     // A repository's hooks may run its whole test suite: hooks.py stops them before this limit (#140).
-    runExactly(`${HOOKS_SCRIPT} ${quoted}`, ' Run it in the foreground with a Bash timeout of 600000 ms, the tool\'s maximum.'),
+    runExactly(`${HOOKS_SCRIPT} ${quoted}`, ` Run it in the foreground with a ${SHELL_TOOL} timeout of 600000 ms, the tool's maximum.`),
     { label: `hooks#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low', schema: HOOKS },
   )
   if (!hooks) return { pass: false, committed: false, detail: 'hook agent died', sha: '' }
@@ -2042,7 +2108,7 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
     // A file, not a here-document: no delimiter can collide with the message.
     // An installed pre-commit hook runs again on the commit: the hooks excused above stay excused there, the others run.
     'Only once that write has returned, ' + runExactly(`${COMMITS_SCRIPT} commit ${skipIds.length ? `--skip-hooks ${shq(skipIds.join(','))} ` : ''}--receipt ${receiptFile} --request ${shq(commitLabel)} ${scope.map(shq).join(' ')} < '${INPUT}'`,
-      ' Run it in the foreground with a Bash timeout of 600000 ms, the tool\'s maximum: an installed pre-commit hook runs again on the commit. ' +
+      ` Run it in the foreground with a ${SHELL_TOOL} timeout of 600000 ms, the tool's maximum: an installed pre-commit hook runs again on the commit. ` +
       'Do not push. Change nothing else, and never add a file a hook touched and retry.'),
     // A file tool may not write under .git, where the emit directory is.
     { label: commitLabel, phase: 'Push', model: 'haiku', effort: 'low', schema: COMMIT, fileTool: true, inputDir: pinned.receipts.trim() },
@@ -2185,7 +2251,7 @@ const recoverCi = async (cycle, entry) => {
   const r = await relayOnce(
     `${IN_CHECKOUT}Recover PR #${args.pr}'s Actions runs orphaned in queued: ` +
     runExactly(`${CIRECOVER_SCRIPT} --pr ${args.pr} --repo ${shq(repo)} --head ${expectedHead} --wait-minutes ${ciWait}`,
-      ' Run it in the foreground with a Bash timeout of 600000 ms, the tool\'s maximum: it keeps within it. Change nothing on GitHub yourself.'),
+      ` Run it in the foreground with a ${SHELL_TOOL} timeout of 600000 ms, the tool's maximum: it keeps within it. Change nothing on GitHub yourself.`),
     { label, phase: 'Triage', model: 'haiku', effort: 'low', schema: CI_RECOVER })
   const got = !r ? { outcome: 'unknown', detail: 'no answer: the recovery may have acted; its records under the git common dir say', runs: [] }
     : r.error ? { outcome: 'unknown', detail: r.error, runs: [] } : r
@@ -2576,7 +2642,7 @@ const ciLaneRun = async (cycle, lanes, entry) => {
     const prompt = (command) =>
       `${IN_CHECKOUT}Editing and committing nothing, ` +
       runExactly(`${COLLECT_SCRIPT} ${command} --repo ${shq(repo)} --pr ${args.pr} --head ${head}${payload ? ` < '${INPUT}'` : ''}`,
-        ' Run it in the foreground with a Bash timeout of 600000 ms, the tool\'s maximum.', payload ? staged(payload) : '')
+        ` Run it in the foreground with a ${SHELL_TOOL} timeout of 600000 ms, the tool's maximum.`, payload ? staged(payload) : '')
     const opts = { label, phase: 'Triage', model: 'haiku', effort: 'low', schema, contract: COLLECT_CONTRACT }
     // A skew stops the cycle (runLanes); to every reader here its line is an error.
     const skewed = (got) => {
@@ -2980,7 +3046,7 @@ const runLanes = async (cycle, entry, lanes) => {
     const candidates = carryCandidates()
     const reviewPrompt =
       `Validate the bot review findings on PR #${args.pr} per your procedure. ${IN_CHECKOUT}` +
-      `Harvest with exactly \`${PY} ${HARVEST_SCRIPT} --pr ${args.pr} --repo ${shq(repo)} --reviewers ${reviewers.join(',')}${waitedOn.length ? ` --auto-run ${waitedOn.join(',')}` : ''}` +
+      `Harvest with exactly \`${PWSH ? PS_PRELUDE : ''}${pyRun(HARVEST_SCRIPT)} --pr ${args.pr} --repo ${shq(repo)} --reviewers ${reviewers.join(',')}${waitedOn.length ? ` --auto-run ${waitedOn.join(',')}` : ''}` +
       `${candidates.length ? ` --carry ${shq(JSON.stringify(candidates))}` : ''}\`. ` +
       (owedLastCycle.length > 0
         ? 'These comments still owe an answer from an earlier cycle; report every finding on each as its body stands now, ' +
@@ -3720,7 +3786,7 @@ if (unusable) {
   log(`preflight: ${unusable}`)
   return finish(stop(lastCycle, 'python-unusable', { detail: unusable }))
 }
-if (pythonArg === null) PY = shq(pinned.python)
+if (pythonArg === null) PY = pyWord(pinned.python)
 const dirty = withoutIdeDrift(pinned.dirty)
 if (dirty.length !== pinned.dirty.length) log(`preflight: ignoring ${pinned.dirty.length - dirty.length} dirty .idea/ path(s) (IDE metadata)`)
 if (dirty.length) {

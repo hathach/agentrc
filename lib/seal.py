@@ -97,6 +97,17 @@ def claim():
 
 
 EMIT_TO, emit_fd = claim()
+# The file a PowerShell relay hands a script for its stdin: Windows PowerShell has no `<`, and a pipe would re-encode
+# the text. Popped at import, as AGENTRC_EMIT is, so no child the script starts reads it.
+STDIN_FROM = os.environ.pop('AGENTRC_STDIN', None)
+
+
+def stdin_bytes():
+    """The script's input, whole: the bytes of the file AGENTRC_STDIN named, else stdin's."""
+    if not STDIN_FROM:
+        return sys.stdin.buffer.read()
+    with open(STDIN_FROM, 'rb') as f:
+        return f.read()
 
 
 def module_text(path, line):
