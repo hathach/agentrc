@@ -48,6 +48,7 @@ session from its receipt:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
 import glob
 import hashlib
@@ -160,7 +161,8 @@ def _admit_session(retains_lock):
 
 # A per-serial record of what an openocd_esp operation left not proven ended (#214): a session the
 # reviewed `end` has not ended, or read_security's esptool child whose recheck is not `done`. Every
-# board access here refuses while one is listed, whatever process, run dir or project asks.
+# board access here refuses while one is listed, whatever process, run dir or project asks. A
+# session is listed before its server is spawned (Session.start), so even a SIGKILL leaves it listed.
 PENDING_KIND = 'openocd-esp'
 
 
@@ -181,6 +183,8 @@ def receipt_ended(receipt) -> bool:
         return session_state(receipt) == 'ended'
     if kind == 'tracked':
         return hil_process.recheck(receipt) == 'done'
+    if kind == 'trackedDir':
+        return hil_process.recheck_dir(receipt['stateDir'])[0] == 'done'
     return False
 
 
@@ -242,7 +246,7 @@ def _remedy(receipts, serial) -> str:
     ways = []
     if 'session' in kinds:
         ways.append('end a session with `hil_openocd_esp.py end --receipt <receipt>`')
-    if 'tracked' in kinds:
+    if kinds & {'tracked', 'trackedDir'}:
         ways.append("an esptool child's entry clears by itself once its recheck is done")
     ways.append(f'otherwise {NEEDS_RECOVERY}, then `hil_openocd_esp.py pending --serial {serial} --note <recovery>`')
     return '; '.join(ways)
@@ -270,6 +274,11 @@ def pending_entries(serial: str) -> dict:
     for e in entries:
         r = e['receipt']
         if receipt_ended(r):
+            continue
+        if receipt_kind(r) == 'trackedDir':      # its open operations, as recheck_dir finds them
+            for o in hil_process.recheck_dir(r['stateDir'])[1]:
+                if o not in out['receipts'] and o not in out['unrecheckable']:
+                    out['unrecheckable' if 'unrecheckable' in o else 'receipts'].append(o)
             continue
         out[{'tracked': 'receipts', 'session': 'retained'}.get(receipt_kind(r), 'unrecheckable')].append(r)
     return out
@@ -546,6 +555,8 @@ def _wrap(cmd, seq):
 
 
 DONE_QUERY = 'if {[info exists hil_done]} {set hil_done} else {list}'
+# command.c's refusal of an exec-mode command in a context still in config mode
+_MODE_REFUSED = "command must be used after 'init'"
 
 # target_handle_event's LOG_TARGET_ERROR "[%s] Execution of event %s failed:" (pinned build)
 _EVENT_FAILED_RE = re.compile(r'Error: \[(\S+)\] Execution of event (\S+) failed:')
@@ -596,13 +607,13 @@ class Session:
     """One managed openocd-esp32 server (module docstring). `ask` and `check` send one command
     and record it in `steps` with its outcome, answer and the log lines it produced."""
 
-    def __init__(self, argv, out, tcl_port, token):
-        self.argv, self.out = argv, out
+    def __init__(self, argv, out, tcl_port, token, serial=None):
+        self.argv, self.out, self.serial = argv, out, serial
         self.log, self.receipt = os.path.join(out, 'openocd.log'), os.path.join(out, 'receipt.json')
         self.lock_fd = None
         self.tcl = esp_session.Tcl(tcl_port, token)
         self.proc = self.rec = self.exit = self.failure = self.receipt_error = None
-        self.receipt_written = self.closed = self.timed_out = False
+        self.receipt_written = self.closed = self.timed_out = self.listed = False
         self.steps, self.deadline, self.seq = [], None, 0
 
     def start(self, deadline):
@@ -619,6 +630,11 @@ class Session:
                 self.lock_fd = _lock(self.receipt)
                 if self.lock_fd is None:
                     raise RuntimeError(f'{self.receipt}.lock is held by another owner')
+                if self.serial is not None:
+                    # write-ahead: listed before it exists, so a SIGKILL from here on leaves it refusing
+                    # (a receipt not yet written reads unreadable, never ended)
+                    pending(self.serial).add([{'receipt': self.receipt}])
+                    self.listed = True
                 self.proc = subprocess.Popen(self.argv, stdin=subprocess.DEVNULL, stdout=out, cwd=cwd,
                                              stderr=subprocess.STDOUT, start_new_session=True)
                 self.rec = {'pid': self.proc.pid, 'startTime': esp_session.start_time(self.proc.pid),
@@ -629,6 +645,9 @@ class Session:
                 self.receipt_written = True
             except BaseException:
                 if self.proc is None:
+                    if self.listed:     # nothing started: its write-ahead entry goes (kept if that fails)
+                        with contextlib.suppress(OSError, hil_lock.PendingRefused):
+                            pending(self.serial).withdraw(self.receipt)
                     self.release()
                 raise
             finally:
@@ -801,7 +820,7 @@ def _run(flasher: dict, work, *, workdir, timeout, openocd=None, record=None, bo
     out = tempfile.mkdtemp(prefix='hil_openocd_esp_', dir=workdir)
     port, token = esp_session.free_ports(1)[0], secrets.token_hex(8)
     s = Session(server_argv(tool, cfgs, location, flasher['uid'], tcl_port=port, token=token,
-                            log=os.path.join(out, 'openocd.log')), out, port, token)
+                            log=os.path.join(out, 'openocd.log')), out, port, token, serial=flasher['uid'])
     if box is not None:
         box.append(s)
     info = {'openocd': tool['banner'], 'scripts': tool['scripts'], 'location': location, 'serial': flasher['uid'],
@@ -1016,6 +1035,9 @@ def read_security(serial: str, *, chip: str, workdir, timeout, retains_lock=Fals
     if run is None:
         state = hil_process.state_dir(_workdir(workdir), SECURITY_STATE)
         grace = {} if reap_grace is None else {'reap_grace': reap_grace}
+        # write-ahead: the state dir is listed before the child starts in it, so a SIGKILL from here
+        # on leaves it refusing until recheck_dir finds every operation there done
+        pending(serial).add([{'receipt': {'stateDir': state, 'what': f'read_security on {tty}'}}])
 
         def run(cmd, cwd=None, **kw):
             return hil_process.run_tracked(cmd, cwd, settle=SECURITY_SETTLE, state_dir=state, verbose=verbose,
@@ -1306,6 +1328,8 @@ def _held_run(hold, serial, what, work, partial, segments=None):
         latch(serial, failed, what)
         raise
     latch(serial, op, what)
+    if op.cleanup == 'done':
+        pending_refusal(serial)         # its write-ahead entry, ended, goes with any other that has
     return op
 
 
@@ -1407,9 +1431,11 @@ def _end_owned(receipt, deadline) -> tuple:
                                    f'{NEEDS_RECOVERY}')
         if not esp_session.same_process(rec):        # the pidfd now names the identified process
             return stop('refused', f"process {rec['pid']} changed while it was identified: nothing sent")
+        if rec['init'] is None and rec['submitted'] == 0:
+            return _end_uninitialised(receipt, rec, pidfd, deadline, result, stop)
         if rec['init'] != 'ok':
-            return stop('refused', f"init {rec['init'] or 'never sent'}: the ordinary end (reset run, shutdown) is "
-                                   f'refused after a failed or unproven init; {NEEDS_RECOVERY}')
+            return stop('refused', f"init {rec['init']}: the ordinary end (reset run, shutdown) is refused after a "
+                                   f'failed or unproven init; {NEEDS_RECOVERY}')
         tcl = esp_session.Tcl(rec['ports'][2], rec['token'], deadline=deadline)
         done = tcl(DONE_QUERY)
         result['done'] = done
@@ -1421,9 +1447,23 @@ def _end_owned(receipt, deadline) -> tuple:
         mark = esp_session.size_of(rec['log']) or 0
         answer = tcl(_wrap('reset run', rec['submitted']))
         result['resetRun'] = answer
-        _, events = _log_since(rec['log'], mark)
+        lines, events = _log_since(rec['log'], mark)
         if events:
             result['events'] = events
+        if answer.startswith('HIL-ERR') and not events and any(_MODE_REFUSED in ln for ln in lines):
+            # init ran on the owner's connection, whose command context alone is in exec mode
+            # (server.c copies the context per connection; init sets the copy's mode): this
+            # connection may not reset, and the refusal touched nothing. Shutdown alone.
+            result['targetReset'] = False
+            _shutdown(tcl)
+            if not _exited(pidfd, deadline):
+                return stop('failed', 'openocd exit not confirmed after shutdown (still running?); rerun end')
+            esp_session.write_receipt(receipt, {**rec, 'closed': True, 'cleanup': 'done',
+                                    'end': {'resetRun': answer, 'shutdownOnly': "reset refused before 'init' on "
+                                            "end's connection; the target is left as the session left it",
+                                            'at': time.strftime('%Y-%m-%dT%H:%M:%S%z')}})
+            result['outcome'] = 'ended'
+            return 0, result
         if not answer.startswith('HIL-OK') or events:
             return stop('failed', f"'reset run' failed: {'; '.join(events) or answer}; {NEEDS_RECOVERY}")
         _shutdown(tcl)
@@ -1440,6 +1480,30 @@ def _end_owned(receipt, deadline) -> tuple:
             tcl.close()
         if pidfd is not None:
             os.close(pidfd)
+
+
+def _end_uninitialised(receipt, rec, pidfd, deadline, result, stop) -> tuple:
+    """End a server its owner left before init (started `noinit`, nothing submitted): no target was
+    touched, so `shutdown` alone, once the server proves no command ran, then its exit by pidfd.
+    openocd-esp32's shutdown still runs esp_common.cfg's pre-shutdown commands, which try to
+    examine the never-initialised targets and only log that they could not."""
+    tcl = esp_session.Tcl(rec['ports'][2], rec['token'], deadline=deadline)
+    try:
+        done = tcl(DONE_QUERY)
+        result['done'] = done
+        if done != '':
+            return stop('refused', f'init was never sent, yet the server has run #{done}: nothing sent; '
+                                   f'{NEEDS_RECOVERY}')
+        _shutdown(tcl)
+    finally:
+        tcl.close()
+    if not _exited(pidfd, deadline):
+        return stop('failed', 'openocd exit not confirmed after shutdown (still running?); rerun end')
+    esp_session.write_receipt(receipt, {**rec, 'closed': True, 'cleanup': 'done',
+                                        'end': {'shutdownOnly': 'init never sent',
+                                                'at': time.strftime('%Y-%m-%dT%H:%M:%S%z')}})
+    result['outcome'] = 'ended'
+    return 0, result
 
 
 def main(argv=None):

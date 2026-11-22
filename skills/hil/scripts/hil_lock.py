@@ -1936,6 +1936,25 @@ class PendingSessions(os.PathLike):
                 os.unlink(self.name, dir_fd=dfd)     # a removal a crash loses only refuses again
             return cleared
 
+    def withdraw(self, receipt) -> list:
+        """Remove the sessions whose receipt is `receipt`, for a consumer that listed one ahead of
+        starting it (write-ahead) and then started nothing; the record goes once it lists none.
+        Returns what it still lists. PendingRefused for an unreadable record, OSError when it
+        cannot be replaced or removed, the record kept."""
+        with self._locked() as dfd:
+            sessions = self._read()
+            if sessions is None:
+                raise PendingRefused(f'{self.path} is unreadable: kept as it is')
+            left = [e for e in sessions if e['receipt'] != receipt]
+            if len(left) == len(sessions):
+                return left
+            if left:
+                _replace_file(dfd, self.name, json.dumps({'sessions': left}, indent=1).encode())
+            else:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(self.name, dir_fd=dfd)
+            return left
+
     def cleared(self) -> list:
         """Every entry <record>.cleared.jsonl holds, oldest first; a line that is not a JSON
         object, or a last one without its newline (an append that failed), is skipped."""

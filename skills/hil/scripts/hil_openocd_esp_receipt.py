@@ -59,15 +59,18 @@ TRACKED_KEYS = frozenset({'token', 'supervisor', 'lock', 'record'})   # hil_proc
 
 
 def receipt_kind(receipt) -> str | None:
-    """'tracked' for a run_tracked receipt (an esptool child), 'session' for an openocd session's
-    (its receipt path, or its record), 'unreceipted' for the provider's own entry of an operation
-    that left no receipt, else None."""
+    """'tracked' for a run_tracked receipt (an esptool child), 'trackedDir' for the provider's
+    write-ahead entry of the run_tracked state dir a child is about to start in, 'session' for an
+    openocd session's (its receipt path, or its record), 'unreceipted' for the provider's own entry
+    of an operation that left no receipt, else None."""
     if isinstance(receipt, str):
         return 'session'
     if not isinstance(receipt, dict):
         return None
     if 'unreceipted' in receipt:
         return 'unreceipted'
+    if isinstance(receipt.get('stateDir'), str):
+        return 'trackedDir'
     if TRACKED_KEYS <= set(receipt):
         return 'tracked'
     if 'pid' in receipt and 'startTime' in receipt:
@@ -80,6 +83,8 @@ def describe(receipt) -> str:
     kind = receipt_kind(receipt)
     if kind == 'tracked':
         return f"esptool child, record {receipt.get('record')}"
+    if kind == 'trackedDir':
+        return f"esptool children in state dir {receipt['stateDir']} ({receipt.get('what')})"
     if kind == 'unreceipted':
         return f"an operation that left no receipt: {receipt.get('unreceipted')}"
     if kind == 'session' and isinstance(receipt, dict):

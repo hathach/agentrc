@@ -386,7 +386,12 @@ recovery stay the contract's. Linux only.
   end until what it left is listed, then delivered. A record that cannot take
   an entry (a full disk, an unreadable record) raises carrying the
   Operation, and the process keeps the entry, refusing that serial until a
-  later access lists it. Each refusal names what ends it, by kind.
+  later access lists it. A session is listed before its server is spawned
+  (write-ahead), so a SIGKILL anywhere after leaves it refusing; one that never
+  spawned withdraws its entry (`PendingSessions.withdraw`), and one that ended
+  clears it. The default security read lists its run_tracked state dir the
+  same way (a `trackedDir` entry), ended once `recheck_dir` finds every
+  operation there done. Each refusal names what ends it, by kind.
   `pending_entries(serial)` reads what is open without clearing it, split for
   `hil_lock.log_cleanup_failure`: `receipts` (tracked children), `retained`
   (sessions) and `unrecheckable` (unreceipted or unrecognised entries, and an
@@ -419,7 +424,12 @@ recovery stay the contract's. Linux only.
   another `end`) still holds the receipt's lock, the process is not the
   receipt's, no pidfd is available, init failed or is unproven (that board
   needs a separately reviewed recovery), or the last command sent is not known
-  to have run. Exit 0 closes the receipt with the results and keeps it, and a
+  to have run. A server whose owner left before init (init never sent, nothing
+  submitted) gets `shutdown` alone, once it proves no command ran. Init puts
+  only the owner's own Tcl connection in exec mode, so on an orphan `reset run`
+  is refused before 'init' and touches nothing: `end` then shuts the server
+  down alone, leaves the target as the session left it (`targetReset: false`)
+  and exits 0. Exit 0 closes the receipt with the results and keeps it, and a
   rerun on it exits 0 again; anything else (refusal, failure, timeout,
   interrupt) exits 1 with the receipt open (2: bad usage or an unreadable
   receipt). An older helper's cleanup holder waiting on the session is

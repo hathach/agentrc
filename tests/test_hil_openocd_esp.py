@@ -221,7 +221,7 @@ def reply(conn, text):
         pass                        # the client gave up; the command has run all the same
 def serve(conn):
     global done
-    buf = b''
+    buf, conn_init = b'', False     # FAKE_CONN_MODE: init puts only its own connection in exec mode
     while True:
         chunk = conn.recv(65536)
         if not chunk:
@@ -248,7 +248,13 @@ def serve(conn):
                 sys.exit(int(os.environ.get('FAKE_SHUTDOWN_RC', '0')))
             m = WRAPPED.match(cmd)
             event(tcl=m[1] if m else cmd)
-            answer = run(m[1]) if m else 'unwrapped'
+            if m and os.environ.get('FAKE_CONN_MODE') and m[1].split()[0] == 'reset' and not conn_init:
+                say("Error: The 'reset' command must be used after 'init'.")
+                answer = 'HIL-ERR '
+            else:
+                answer = run(m[1]) if m else 'unwrapped'
+            if m and m[1] == 'init':
+                conn_init = True
             if answer is None:
                 held.append(conn)   # its frame stays unread while the next connection is served
                 return
@@ -1370,6 +1376,40 @@ class PendingRegistry(SessionCase):
         self.assertPending(op)
         self.assertEqual(oe.pending(SERIAL).read(), [{'receipt': op.session['receipt']}])
 
+    def test_a_session_is_listed_before_its_server_is_spawned(self):
+        """agentrc#214 (ci.lan P4): a SIGKILL between the spawn and the latch left a live openocd that
+        no record listed. Listed write-ahead, the entry is there before the server exists."""
+        real, seen = oe.subprocess.Popen, []
+
+        def popen(argv, *a, **k):
+            if 'noinit' in argv:                 # the server, not `openocd --version`
+                seen.append(oe.pending(SERIAL).read())
+            return real(argv, *a, **k)
+        with mock.patch.object(oe.subprocess, 'Popen', popen):
+            op = self.reset()
+        self.assertEnded(op)
+        (listed,), = seen
+        self.assertEqual(listed, {'receipt': op.session['receipt']})
+        self.assertEqual(oe.pending(SERIAL).read(), [], 'an ended session clears its entry')
+
+    def test_a_server_that_never_spawned_withdraws_its_entry(self):
+        real = oe.subprocess.Popen
+
+        def popen(argv, *a, **k):
+            if 'noinit' in argv:
+                raise FileNotFoundError('openocd')
+            return real(argv, *a, **k)
+        with mock.patch.object(oe.subprocess, 'Popen', popen), self.assertRaises(FileNotFoundError):
+            self.reset()
+        self.assertEqual(oe.pending(SERIAL).read(), [])
+        self.assertEqual(self.pids(), [])
+
+    def test_a_record_that_cannot_take_the_entry_spawns_nothing(self):
+        with mock.patch.object(oe.hil_lock.PendingSessions, 'add', side_effect=OSError(errno.ENOSPC, 'full')), \
+                self.assertRaises(OSError):
+            self.reset()
+        self.assertEqual(self.pids(), [])
+
     def test_an_ended_reset_lists_nothing(self):
         self.assertEnded(self.reset())
         self.assertEqual(oe.pending(SERIAL).read(), [])
@@ -1559,6 +1599,32 @@ class End(SessionCase):
         self.assertEqual(self.after(n), ['token?', 'done?'])
         self.assertKept(path, rc)
 
+    def test_a_server_left_before_init_is_listed_and_ended_by_shutdown_alone(self):
+        """ci.lan P4: the owner gone before init (here interrupted as it would send it). The server
+        stays listed, and `end` shuts it down without `reset run`: no target was touched."""
+        real = oe.Session.ask
+
+        def ask(s, cmd):
+            if cmd == 'init':
+                raise KeyboardInterrupt
+            return real(s, cmd)
+        with mock.patch.object(oe.Session, 'ask', ask), self.assertRaises(KeyboardInterrupt) as cm:
+            oe._latched(BOARD, lambda s: None, workdir=str(self.work), timeout=5, openocd=str(self.exe))
+        path = cm.exception.operation.session['receipt']
+        self.assertEqual((self.receipt(path)['init'], self.receipt(path)['submitted']), (None, 0))
+        self.assertEqual(oe.pending(SERIAL).read(), [{'receipt': path}])
+        self.assertIn('end --receipt', oe.pending_refusal(SERIAL))
+        n = len(self.tcl())
+        rc, result = self.end(path)
+        self.assertEqual((rc, result['outcome'], result['done']), (0, 'ended', ''))
+        self.assertEqual(self.after(n), ['token?', 'done?', 'shutdown'])
+        rec = self.receipt(path)
+        self.assertEqual((rec['closed'], rec['cleanup'], rec['end']['shutdownOnly']), (True, 'done', 'init never sent'))
+        self.assertFalse(self.alive(rec['pid']))
+        self.assertEqual(self.signals(), [])
+        self.assertEqual(oe.pending_refusal(SERIAL), '')
+        self.assertEqual(oe.pending(SERIAL).read(), [])
+
     def test_after_a_failed_or_unproven_init_the_ordinary_end_is_refused(self):
         for script, state in (({'init': 'err:no device'}, 'failed'), ({'init': 'hang'}, 'sent')):
             with self.subTest(state=state):
@@ -1572,6 +1638,20 @@ class End(SessionCase):
                 self.assertEqual(self.after(n), [])
                 self.assertKept(path, rc)
                 self.reap()
+
+    def test_an_orphan_whose_owner_inited_on_its_own_connection_is_ended_by_shutdown(self):
+        """ci.lan P4: init ran on the dead owner's connection, so end's `reset run` is refused before
+        'init' and touches nothing; end shuts the server down and closes the receipt."""
+        path = self.pending(FAKE_CONN_MODE='1')
+        n = len(self.tcl())
+        rc, result = self.end(path)
+        self.assertEqual((rc, result['outcome'], result['targetReset']), (0, 'ended', False))
+        self.assertEqual(self.after(n), ['token?', 'done?', 'reset run', 'shutdown'])
+        rec = self.receipt(path)
+        self.assertEqual((rec['closed'], rec['cleanup']), (True, 'done'))
+        self.assertIn("reset refused before 'init'", rec['end']['shutdownOnly'])
+        self.assertFalse(self.alive(rec['pid']))
+        self.assertEqual(self.signals(), [])
 
     def test_a_failed_reset_run_is_never_followed_by_shutdown(self):
         path = self.pending({'reset run': 'err:Target not examined yet'})
@@ -2269,6 +2349,31 @@ class ReadSecurity(unittest.TestCase):
             oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=30, retains_lock=True, run=run)
         self.assertEqual(seen, ['interrupted'])
         self.assertEqual(signal.getsignal(signal.SIGINT), signal.default_int_handler, 'the hold is released')
+
+    def test_the_default_runs_state_dir_is_listed_before_the_child_starts(self):
+        """ci.lan P4: a SIGKILL during a read left nothing listed. The state dir is listed first, and
+        refuses while recheck_dir finds an operation there open."""
+        seen = []
+
+        def tracked(cmd, cwd=None, **kw):
+            seen.append(oe.pending(SERIAL).read())
+            r = subprocess.CompletedProcess(cmd, 0, self.line(sec()), None)
+            r.cleanup, r.receipt = 'done', None
+            return r
+        with mock.patch.object(oe.hil_process, 'run_tracked', tracked):
+            oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=30, retains_lock=True)
+        state = str(self.work / oe.SECURITY_STATE)
+        self.assertEqual(seen, [[{'receipt': {'stateDir': state, 'what': 'read_security on /dev/ttyACM3'}}]])
+        self.assertEqual(oe.pending(SERIAL).read(), [], 'a read that ended clears it')
+        left = {'token': 't', 'supervisor': {}, 'lock': f'{state}/hil_op_t.lock', 'record': f'{state}/t.json'}
+        oe.pending(SERIAL).add([{'receipt': {'stateDir': state, 'what': 'read_security on /dev/ttyACM3'}}])
+        with mock.patch.object(oe.hil_process, 'recheck_dir', return_value=('pending', [left])):
+            why = oe.pending_refusal(SERIAL)
+            self.assertIn(f'esptool children in state dir {state}', why)
+            self.assertIn('clears by itself once its recheck is done', why)
+            self.assertEqual(oe.pending_entries(SERIAL)['receipts'], [left])
+        self.assertEqual(oe.pending_refusal(SERIAL), '')
+        (self.work / oe.SECURITY_STATE).rmdir()
 
     def test_quiet_goes_to_the_default_run(self):
         seen = []
