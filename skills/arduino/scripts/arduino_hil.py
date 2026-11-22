@@ -891,9 +891,10 @@ def core_timed(console, line, nonce, op):
 
 
 def core_timing_problem(dev_ms, host_lo, host_hi):
-    """'' when the DUT's elapsed ms lies within the host's bracket [lo, hi] widened by TIMING_TOLERANCE, else why."""
+    """'' when the DUT's elapsed ms lies within the host's bracket [lo, hi] widened by TIMING_TOLERANCE and by the
+    1 ms a difference of two whole-ms millis() readings can lose or gain, else why."""
     tol = getattr(P, 'TIMING_TOLERANCE', 0.01)
-    lo, hi = host_lo * (1 - tol), host_hi * (1 + tol)
+    lo, hi = host_lo * (1 - tol) - 1, host_hi * (1 + tol) + 1
     return '' if lo <= dev_ms <= hi else f'{dev_ms:.1f} ms outside the host bracket [{lo:.1f}, {hi:.1f}] ms'
 
 

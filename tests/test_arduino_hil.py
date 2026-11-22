@@ -1592,6 +1592,13 @@ class CoreBattery(Base):
         self.assertFalse(ok)
         self.assertIn('millis()', detail)
 
+    def test_the_timing_bracket_allows_one_millis_tick_either_way(self):
+        # two whole-ms readings 50.9 ms apart can differ by 50: a true clock is not refused for its resolution
+        self.assertEqual(H.core_timing_problem(50, 50.9, 51.0), '')
+        self.assertEqual(H.core_timing_problem(51, 50.0, 50.0), '')
+        self.assertIn('outside the host bracket', H.core_timing_problem(49, 50.9, 51.0))
+        self.assertIn('outside the host bracket', H.core_timing_problem(52, 50.0, 50.0))
+
     def test_a_rejected_reply_fails_the_test_naming_it(self):
         dut = FakeCoreDut({'stack': 'tinyusb', 'chip': 'fa'})
         real = dut.write
