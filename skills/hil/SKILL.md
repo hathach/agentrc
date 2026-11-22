@@ -393,6 +393,10 @@ recovery stay the contract's. Linux only.
   same way (a `trackedDir` entry), ended once `recheck_dir` finds every
   operation there done (checked without tidying, so a receipt listed apart
   keeps its files), and withdrawn once the child's own receipt is listed. Each refusal names what ends it, by kind.
+  On a shared host that clear runs only as the user who owns the state dir and
+  the pending record: another user's state dir never rechecks `done`, so run
+  `hil_openocd_esp.py pending --serial <usj>` as that owner, or else follow the
+  separately reviewed recovery (`pending --note`).
   `pending_entries(serial)` reads what is open without clearing it, split for
   `hil_lock.log_cleanup_failure`: `receipts` (tracked children), `retained`
   (sessions) and `unrecheckable` (unreceipted or unrecognised entries, and an

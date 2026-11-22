@@ -552,6 +552,32 @@ class Record(unittest.TestCase):
         self.assertEqual(len(attempts), 1)
         self.assertEqual(signal.getsignal(signal.SIGINT), signal.default_int_handler, 'the hold is released')
 
+    def test_an_interrupt_pending_as_the_hold_starts_records_no_attempt(self):
+        """A SIGINT deferred before deliver() raises before the runner starts: no attempt is recorded, and an
+        earlier attempt still rides on .operation."""
+        old = signal.signal(signal.SIGINT, signal.default_int_handler)
+        self.addCleanup(signal.signal, signal.SIGINT, old)
+        real = hf.hil_process.InterruptHold
+
+        class Interrupted(real):
+            def __init__(self):
+                super().__init__()
+                signal.raise_signal(signal.SIGINT)
+
+        def run(cmd, **kw):
+            raise AssertionError('run started')
+        earlier = hf._record(['esptool'], None, subprocess.CompletedProcess(['esptool'], 2, '', None), None)
+        for before in ([], [earlier]):
+            with self.subTest(before=len(before)):
+                attempts = list(before)
+                with mock.patch.object(hf.hil_process, 'InterruptHold', Interrupted), \
+                        self.assertRaises(KeyboardInterrupt) as cm:
+                    hf._attempt(attempts, run, ['esptool'], timeout=5)
+                self.assertEqual(attempts, before)
+                op = getattr(cm.exception, 'operation', None)
+                self.assertEqual(op.attempts if op else (), tuple(before))
+                self.assertEqual(signal.getsignal(signal.SIGINT), signal.default_int_handler, 'the hold is released')
+
     def test_an_interrupt_during_a_run_still_reaches_it(self):
         old = signal.signal(signal.SIGINT, signal.default_int_handler)
         self.addCleanup(signal.signal, signal.SIGINT, old)

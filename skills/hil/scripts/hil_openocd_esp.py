@@ -174,15 +174,22 @@ def pending(serial: str):
     return hil_lock.PendingSessions('usj-' + serial.replace(':', '_'), PENDING_KIND)
 
 
+def _recheckable(receipt) -> bool:
+    """Whether a tracked receipt has the shape hil_process.recheck reads without raising: string token,
+    lock and record, a dict or no supervisor."""
+    return all(isinstance(receipt.get(k), str) for k in ('token', 'lock', 'record')) \
+        and isinstance(receipt.get('supervisor'), (dict, type(None)))
+
+
 def receipt_ended(receipt) -> bool:
     """Whether the process a receipt stands for is proven ended: a session's after the reviewed
-    end, a tracked child's once its recheck is `done`. Anything else, an unreceipted entry
-    included, is not: it clears only with a reviewed recovery's note."""
+    end, a tracked child's once its recheck is `done`. Anything else, an unreceipted entry or a
+    malformed tracked receipt included, is not: it clears only with a reviewed recovery's note."""
     kind = receipt_kind(receipt)
     if kind == 'session':
         return session_state(receipt) == 'ended'
     if kind == 'tracked':
-        return hil_process.recheck(receipt) == 'done'
+        return _recheckable(receipt) and hil_process.recheck(receipt) == 'done'
     if kind == 'trackedDir':      # tidying nothing: a receipt listed apart rechecks from those files
         return hil_process.recheck_dir(receipt['stateDir'], keep=hil_process._KeepAll())[0] == 'done'
     return False
@@ -256,8 +263,8 @@ def pending_entries(serial: str) -> dict:
     """What the USJ with `serial` has open, split for a consumer's cleanup evidence
     (hil_lock.log_cleanup_failure): {'receipts': tracked receipts, which hil_process.recheck
     rechecks, 'retained': session receipts, retained by session_state, 'unrecheckable': what
-    nothing can recheck (an unreceipted or unrecognised entry, or {'unreadable': <record>, 'error':
-    why} for a record that cannot be read)}. Only entries not proven ended, this process's
+    nothing can recheck (an unreceipted, unrecognised or malformed entry, or {'unreadable':
+    <record>, 'error': why} for a record that cannot be read)}. Only entries not proven ended, this process's
     unlisted ones (latch) included; reads without clearing, and never raises for the record."""
     record = pending(serial)
     out = {'receipts': [], 'retained': [], 'unrecheckable': []}
@@ -280,7 +287,10 @@ def pending_entries(serial: str) -> dict:
                 if o not in out['receipts'] and o not in out['unrecheckable']:
                     out['unrecheckable' if 'unrecheckable' in o else 'receipts'].append(o)
             continue
-        out[{'tracked': 'receipts', 'session': 'retained'}.get(receipt_kind(r), 'unrecheckable')].append(r)
+        kind = receipt_kind(r)
+        if kind == 'tracked' and not _recheckable(r):
+            kind = None
+        out[{'tracked': 'receipts', 'session': 'retained'}.get(kind, 'unrecheckable')].append(r)
     return out
 
 
@@ -1060,7 +1070,7 @@ def read_security(serial: str, *, chip: str, workdir, timeout, retains_lock=Fals
             return hil_process.run_tracked(cmd, cwd, settle=SECURITY_SETTLE, state_dir=state, verbose=verbose,
                                            quiet=quiet, **grace, **kw)
     what = f'read_security on {tty}'
-    hold = hil_process.InterruptHold()
+    hold, op = hil_process.InterruptHold(), None
     try:
         with tempfile.TemporaryDirectory(prefix='hil_security_', dir=_workdir(workdir)) as td:
             ops_file = os.path.join(td, 'ops.json')
@@ -1072,8 +1082,11 @@ def read_security(serial: str, *, chip: str, workdir, timeout, retains_lock=Fals
             op = _held_run(hold, serial, what,
                            lambda: hil_flash._once(run, argv, attempts, env=dict(hil_flash.ESPTOOL_ENV), timeout=timeout),
                            lambda: hil_flash.Operation(attempts) if attempts else None, ahead=ahead)
+    except BaseException as e:
+        op = getattr(e, 'operation', None) or op
+        raise
     finally:
-        hold.release()
+        _release(hold, op)
     try:
         if op.cleanup != 'done':
             raise RuntimeError(f'esptool_session on {tty}: cleanup {op.cleanup}, its child is not proven ended')
@@ -1295,10 +1308,8 @@ def flash_openocd_esp(flasher: dict, segments, *, security, workdir, timeout, op
             if diff is not None:
                 raise _Stop(f"read-back of {rec['file']} at 0x{rec['offset']:x} differs at +0x{diff:x}", end=True)
 
-    op = _latched(flasher, work, workdir=workdir, timeout=timeout, openocd=openocd, record={'security': security},
-                  segments=tuple(records))
-    op.segments = tuple(records)
-    return op
+    return _latched(flasher, work, workdir=workdir, timeout=timeout, openocd=openocd, record={'security': security},
+                    segments=tuple(records))
 
 
 def reset_openocd_esp(flasher: dict, *, workdir, timeout, openocd=None, retains_lock=False):
@@ -1363,18 +1374,35 @@ def _withdraw_ahead(serial, ahead):
             pending(serial).withdraw(ahead)
 
 
+def _release(hold, op):
+    """hold.release(); a signal it delivers carries `op`, the Operation so far, unless it has one."""
+    try:
+        hold.release()
+    except BaseException as late:
+        if op is not None and getattr(late, 'operation', None) is None:
+            late.operation = op
+        raise
+
+
 def _latched(flasher, work, *, segments=None, **kw):
     """_run once the USJ's pending record lists nothing open, listing what the session leaves
-    pending there, a raised one included, with interrupts held until it is listed (_held_run)."""
+    pending there, a raised one included, with interrupts held until it is listed (_held_run).
+    The Operation carries `segments` when given."""
     admit(flasher)
     serial = flasher['uid']
     _refuse_pending(serial)
-    hold, box = hil_process.InterruptHold(), []
+    hold, box, op = hil_process.InterruptHold(), [], None
     try:
-        return _held_run(hold, serial, f'openocd_esp on USJ {serial}', lambda: _run(flasher, work, box=box, **kw),
-                         lambda: getattr(box[0], 'finished', None) if box else None, segments)
+        op = _held_run(hold, serial, f'openocd_esp on USJ {serial}', lambda: _run(flasher, work, box=box, **kw),
+                       lambda: getattr(box[0], 'finished', None) if box else None, segments)
+        if segments is not None:
+            op.segments = segments
+        return op
+    except BaseException as e:
+        op = getattr(e, 'operation', None) or op
+        raise
     finally:
-        hold.release()
+        _release(hold, op)
 
 
 # -------------------------------------------------------------

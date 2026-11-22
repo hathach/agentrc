@@ -1335,10 +1335,34 @@ class PendingRegistry(SessionCase):
             signal.raise_signal(signal.SIGINT)
             return real(*a)
         with mock.patch.object(oe, '_run', lambda *a, **k: op), mock.patch.object(oe, 'latch', latch), \
-                self.assertRaises(KeyboardInterrupt):
+                self.assertRaises(KeyboardInterrupt) as cm:
             oe._latched(BOARD, 'reset')
+        self.assertIs(cm.exception.operation, op)
         self.assertEqual(oe.pending(SERIAL).read(), [{'receipt': '/w/receipt.json'}])
         self.assertEqual(signal.getsignal(signal.SIGINT), signal.default_int_handler)
+
+    def test_an_interrupt_during_a_flashs_latch_carries_the_operation_and_its_segments(self):
+        old = signal.signal(signal.SIGINT, signal.default_int_handler)
+        self.addCleanup(signal.signal, signal.SIGINT, old)
+        real, segments = oe.latch, ({'offset': 0, 'file': 'app.bin'},)
+
+        def latch(*a):
+            signal.raise_signal(signal.SIGINT)
+            return real(*a)
+
+        def failed(*a, **k):
+            e = RuntimeError('write failed')
+            e.operation = types.SimpleNamespace(cleanup='pending', receipts=('/w/failed.json',))
+            raise e
+        for name, run in (('returned', lambda *a, **k: types.SimpleNamespace(cleanup='pending',
+                                                                              receipts=('/w/receipt.json',))),
+                          ('raised', failed)):
+            fresh_locks(self)
+            with self.subTest(run=name), mock.patch.object(oe, '_run', run), mock.patch.object(oe, 'latch', latch), \
+                    self.assertRaises(KeyboardInterrupt) as cm:
+                oe._latched(BOARD, 'flash', segments=segments)
+            self.assertEqual(cm.exception.operation.segments, segments)
+            self.assertEqual(cm.exception.operation.receipts, (oe.pending(SERIAL).read()[0]['receipt'],))
 
     def test_a_session_the_record_cannot_list_carries_its_operation_and_refuses_until_listed(self):
         """agentrc#214: an ENOSPC from the record's add loses neither the session nor the refusal."""
@@ -1482,6 +1506,23 @@ class PendingRecord(unittest.TestCase):
         self.assertEqual(out['unrecheckable'], [{'unreadable': oe.pending(SERIAL).path,
                                                  'error': 'unparseable, or a malformed entry'}])
         self.assertEqual(out['retained'], ['/w/unlisted.json'])
+
+    def test_a_malformed_tracked_receipt_refuses_and_is_unrecheckable_rather_than_raising(self):
+        d = self.enterContext(tempfile.TemporaryDirectory())
+        lock = os.path.join(d, 'hil_op_t.lock')
+        Path(lock).touch()
+        good = {'token': 't', 'supervisor': {}, 'lock': lock, 'record': os.path.join(d, 'hil_op_t.json')}
+        for bad in (dict(good, supervisor='x'), dict(good, supervisor=[1]), dict(good, record=5),
+                    dict(good, lock=None), dict(good, token=7)):
+            fresh_locks(self)
+            oe.pending(SERIAL).add([{'receipt': bad}])
+            with self.subTest(receipt=bad):
+                self.assertIn('not proven ended', oe.pending_refusal(SERIAL))
+                self.assertEqual(oe.pending_entries(SERIAL), {'receipts': [], 'retained': [], 'unrecheckable': [bad]})
+        fresh_locks(self)
+        oe.pending(SERIAL).add([{'receipt': good}])
+        with mock.patch.object(oe.hil_process, 'recheck', return_value='done'):
+            self.assertEqual(oe.pending_refusal(SERIAL), '', 'a well-formed one still clears by itself')
 
     def test_each_refusal_names_what_ends_it(self):
         oe.latch(SERIAL, types.SimpleNamespace(cleanup='pending', receipts=('/w/receipt.json', self.tracked)), 'x')
@@ -2285,8 +2326,9 @@ class ReadSecurity(unittest.TestCase):
             r = subprocess.CompletedProcess(argv, 0, self.line(sec()), None)
             r.cleanup, r.receipt = 'pending', receipt
             return r
-        with mock.patch.object(oe, 'latch', latch), self.assertRaises(KeyboardInterrupt):
+        with mock.patch.object(oe, 'latch', latch), self.assertRaises(KeyboardInterrupt) as cm:
             oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=30, retains_lock=True, run=run)
+        self.assertEqual(cm.exception.operation.receipts, (receipt,))
         self.assertEqual(oe.pending(SERIAL).read(), [{'receipt': receipt}])
         self.assertEqual(list(self.work.iterdir()), [])
 

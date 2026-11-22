@@ -144,11 +144,18 @@ class Operation(subprocess.CompletedProcess):
 def _attempt(attempts: list, run, cmd, script=None, **kw) -> subprocess.CompletedProcess:
     """run(cmd), recorded in `attempts`. SIGINT and SIGTERM reach the run, and are held from its
     return (or raise) until it is recorded (hil_process.InterruptHold): an interrupt never takes
-    a runner's cleanup and receipt with it. One delivered after carries the operation so far."""
+    a runner's cleanup and receipt with it. One delivered after carries the operation so far; one
+    already pending as the hold starts raises before run(), recording no attempt."""
     hold = hil_process.InterruptHold()
     try:
         try:
             hold.deliver()
+        except BaseException as e:
+            hold.deferring = True
+            if attempts:
+                e.operation = Operation(attempts)
+            raise
+        try:
             ret = run(cmd, **kw)
         except BaseException as e:
             hold.deferring = True       # an attribute store, no interrupt check: deferred from here
