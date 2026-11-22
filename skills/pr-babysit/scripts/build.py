@@ -399,7 +399,9 @@ def start(d, a):
     write_json(d / 'request.json', req)
     (d / 'alive').touch()
     (d / 'poll').touch()
-    detach = ({'creationflags': subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == 'nt'
+    # Windows: a console of its own with no window, not none (DETACHED_PROCESS): the build shell and every console
+    # program below it would each open a visible console, and closing one stops the build (0xC000013A)
+    detach = ({'creationflags': subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == 'nt'
               else {'start_new_session': True})
     with open(d / 'runner.log', 'ab') as err:
         subprocess.Popen([sys.executable, str(Path(__file__).resolve()), '--run-job', str(d)], cwd=b['top'],

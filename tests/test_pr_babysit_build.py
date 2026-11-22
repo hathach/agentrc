@@ -483,6 +483,17 @@ class PowerShellBuildTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn('holds another build request', out['error'])
 
+    @unittest.skipUnless(os.name == 'nt', 'console windows exist only on Windows')
+    def test_a_job_builds_in_a_console_with_no_window(self):
+        # a detached runner with no console left the build shell to open a visible one, which closing stopped the build;
+        # the build prints 101 when its console has a visible window, 100 otherwise
+        code, out = self.job(self.py('import ctypes; h = ctypes.windll.kernel32.GetConsoleWindow(); '
+                                     'print(100 + int(bool(h) and bool(ctypes.windll.user32.IsWindowVisible(h))))'), 60)
+        self.assertEqual((code, out['state'], out['exit']), (0, 'done', 0), out)
+        lines = Path(out['log']).read_text(encoding='utf-8', errors='replace').split()
+        self.assertIn('100', lines)
+        self.assertNotIn('101', lines)
+
 
 if __name__ == '__main__':
     unittest.main()
