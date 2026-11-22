@@ -19,6 +19,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import warnings
 from pathlib import Path
 from unittest import mock
@@ -42,6 +43,21 @@ hf = load('agentrc_hil_flash', SCRIPTS / 'hil_flash.py')
 SERIAL = '30:ED:A0:E0:C9:02'
 BOARD = {'name': 'openocd_esp', 'uid': SERIAL, 'args': '-f board/esp32p4-builtin.cfg'}
 SECURITY = {'flashEncryption': 'off', 'secureBoot': 'off', 'source': 'esptool transcript /w/security.txt'}
+
+
+def read_op(security=SECURITY, cleanup='done'):
+    """read_security's Operation as flash_openocd_esp takes it: its evidence and its child's cleanup."""
+    return types.SimpleNamespace(security=security, cleanup=cleanup)
+
+
+def fresh_locks(test):
+    """A new BOARD_LOCK_DIR for the pending registry, so one test's latched session refuses no other."""
+    root = tempfile.mkdtemp(prefix='locks_')
+    test.addCleanup(shutil.rmtree, root, True)
+    p = mock.patch.object(oe.hil_lock, 'BOARD_LOCK_DIR', root)
+    p.start()
+    test.addCleanup(p.stop)
+    return root
 BANNER = f'Open On-Chip Debugger {oe.VERIFIED_OPENOCD} (2026-07-03-13:49)'
 
 
@@ -528,6 +544,7 @@ class SessionCase(unittest.TestCase):
         cleanup = mock.patch.object(oe, 'CLEANUP_TIMEOUT', 3)
         cleanup.start()
         self.addCleanup(cleanup.stop)
+        self.locks = fresh_locks(self)
         settle = mock.patch.object(oe, 'BOOT_SETTLE', 0)
         settle.start()
         self.addCleanup(settle.stop)
@@ -971,7 +988,7 @@ class Programming(SessionCase):
 
     def flash_op(self, segs=None, *, bank=None, **kw):
         env = {'FAKE_FLASH': str(self.flash), 'FAKE_BANK_SIZE': hex(self.BANK if bank is None else bank), **kw.pop('env', {})}
-        security = kw.pop('security', SECURITY)
+        security = kw.pop('security', read_op())
         return self.run_op(lambda timeout: oe.flash_openocd_esp(BOARD, self.segs if segs is None else segs,
                                                                  security=security, workdir=str(self.work),
                                                                  timeout=timeout, openocd=str(self.exe),
@@ -1064,7 +1081,17 @@ class Programming(SessionCase):
                          {**SECURITY, 'source': ''}, {k: v for k, v in SECURITY.items() if k != 'source'},
                          {**SECURITY, 'extra': 1}, 'off'):
             with self.subTest(security=security), self.assertRaisesRegex(ValueError, 'security'):
+                self.flash_op(security=read_op(security))
+        self.assertEqual(self.events(), [])
+
+    def test_bare_evidence_or_a_read_whose_child_is_not_proven_ended_is_refused(self):
+        """agentrc#213: only read_security's Operation, its child proven ended, admits a flash."""
+        for security in (SECURITY, None, 'off'):
+            with self.subTest(security=security), self.assertRaisesRegex(ValueError, "read_security's Operation"):
                 self.flash_op(security=security)
+        for cleanup in ('pending', 'unknown', None):
+            with self.subTest(cleanup=cleanup), self.assertRaisesRegex(RuntimeError, 'not proven ended'):
+                self.flash_op(security=read_op(cleanup=cleanup))
         self.assertEqual(self.events(), [])
 
     def test_a_corrupt_trailing_byte_the_verify_skips_fails_the_read_back(self):
@@ -1235,6 +1262,60 @@ class Reset(SessionCase):
         op = self.reset(timeout=2, script={'init': 'hang'})
         self.assertEqual((op.returncode, self.tcl()), (124, ['token?', 'init']))
         self.assertPending(op)
+
+
+class PendingRegistry(SessionCase):
+    """agentrc#214: a session left pending is listed under its USJ serial and refuses the next one."""
+
+    def reset(self, **kw):
+        return self.run_op(lambda timeout: oe.reset_openocd_esp(BOARD, workdir=str(self.work), timeout=timeout,
+                                                                 openocd=str(self.exe), retains_lock=True), **kw)
+
+    def test_a_pending_reset_refuses_the_next_flash_reset_and_read_until_it_ends(self):
+        op = self.reset(script={'reset run': 'event:reset-assert-post'})
+        self.assertPending(op)
+        self.assertEqual(oe.pending(SERIAL).read(), [{'receipt': op.session['receipt']}])
+        app = self.root / 'app.bin'
+        app.write_bytes(b'\xe9' + b'\0' * 4095)
+        seg = {'offset': 0x10000, 'file': str(app), 'size': 4096}
+        tcl = self.tcl()
+        for name, call in (('reset', lambda: oe.reset_openocd_esp(BOARD, workdir=str(self.work), timeout=5,
+                                                                    openocd=str(self.exe), retains_lock=True)),
+                           ('flash', lambda: oe.flash_openocd_esp(BOARD, [seg], security=read_op(), workdir=str(self.work),
+                                                                    timeout=5, openocd=str(self.exe),
+                                                                    retains_lock=True)),
+                           ('security', lambda: oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work),
+                                                                 timeout=5, retains_lock=True))):
+            with self.subTest(op=name), self.assertRaisesRegex(RuntimeError, 'not proven ended.*openocd_esp session'):
+                call()
+        self.assertEqual(self.tcl(), tcl, 'a refused operation reaches no server')
+        with mock.patch.object(oe, 'session_state', return_value='ended'):
+            self.assertEqual(oe.pending_refusal(SERIAL), '')
+        self.assertFalse(os.path.exists(oe.pending(SERIAL).path))
+
+    def test_an_ended_reset_lists_nothing(self):
+        self.assertEnded(self.reset())
+        self.assertEqual(oe.pending(SERIAL).read(), [])
+
+
+class ReceiptKind(unittest.TestCase):
+    def test_each_receipt_is_told_apart_and_named(self):
+        tracked = {'token': 't', 'supervisor': {}, 'lock': '/s/l', 'record': '/s/r.json', 'log': '/s/log'}
+        native = {'pid': 4, 'startTime': '99', 'log': '/w/openocd.log'}
+        for receipt, kind, text in ((tracked, 'tracked', 'esptool child, record /s/r.json'),
+                                    ('/w/receipt.json', 'session', 'receipt /w/receipt.json'),
+                                    (native, 'session', 'pid 4 start 99, receipt file unwritten, log /w/openocd.log'),
+                                    ({'unreceipted': 'read_security: cleanup unknown'}, 'unreceipted', 'no receipt'),
+                                    ({'other': 1}, None, 'unrecognised'), (7, None, 'unrecognised')):
+            with self.subTest(kind=kind):
+                self.assertEqual(oe.receipt_kind(receipt), kind)
+                self.assertIn(text, oe.describe(receipt))
+        self.assertFalse(oe.receipt_ended({'other': 1}))
+
+    def test_a_serial_maps_to_one_lock_name(self):
+        self.assertEqual(oe.pending('60:55:F9:F9:87:15').name, 'usj-60_55_F9_F9_87_15.openocd-esp-pending.json')
+        with self.assertRaises(ValueError):
+            oe.pending('../x')
 
 
 class End(SessionCase):
@@ -1585,7 +1666,7 @@ class RetainedLock(SessionCase):
         for g in guards:
             g.start()
             self.addCleanup(g.stop)
-        ops = {'flash': lambda **kw: oe.flash_openocd_esp(BOARD, [], security=SECURITY, workdir=str(self.work),
+        ops = {'flash': lambda **kw: oe.flash_openocd_esp(BOARD, [], security=read_op(), workdir=str(self.work),
                                                            timeout=5, **kw),
                'reset': lambda **kw: oe.reset_openocd_esp(BOARD, workdir=str(self.work), timeout=5, **kw),
                'security': lambda **kw: oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=5,
@@ -1813,6 +1894,7 @@ class SecurityEvidence(unittest.TestCase):
 class ReadSecurity(unittest.TestCase):
     def setUp(self):
         self.work = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.locks = fresh_locks(self)
         for target, value in (('usj_tty', lambda serial: '/dev/ttyACM3'),):
             p = mock.patch.object(oe, target, value)
             p.start()
@@ -1834,6 +1916,7 @@ class ReadSecurity(unittest.TestCase):
             r = subprocess.CompletedProcess(argv, rc, stdout, None)
             r.cleanup = cleanup
             return r
+        self.locks = fresh_locks(self)     # a read that latched refuses only its own test's next read
         try:
             return oe.read_security(SERIAL, chip=chip, workdir=str(self.work), timeout=30, retains_lock=True,
                                     esptool='esptool-5.3.1', run=run, **kw), seen
@@ -1876,6 +1959,7 @@ class ReadSecurity(unittest.TestCase):
             for out in ({'ok': True, 'results': {'unexpected': 1}}, {'ok': True, 'results': 7},
                         {'ok': True, 'results': []}, {'ok': True}, {'ok': True, 'results': [7]},
                         {'ok': True, 'results': [None]}, {'ok': True, 'results': [{'op': 'security'}]}, [1, 2], 'ok'):
+                fresh_locks(self)
                 with self.subTest(cleanup=cleanup, out=out), self.assertRaises((RuntimeError, ValueError)) as cm:
                     oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=30, retains_lock=True,
                                      run=tracked_run(json.dumps(out) + '\n', cleanup))
@@ -1925,6 +2009,70 @@ class ReadSecurity(unittest.TestCase):
         op = cm.exception.operation
         self.assertEqual((op.cleanup, op.receipts), ('pending', (receipt,)))
         (self.work / oe.SECURITY_STATE).rmdir()
+
+    def test_extra_read_ops_share_the_session_and_return_their_results(self):
+        snap = [{'op': 'md5', 'addr': 0x10000, 'size': 4096}, {'op': 'read', 'addr': 0, 'size': 16, 'file': '/w/b'}]
+        line = 'x\n' + json.dumps({'ok': True, 'esptool': '5.3.1', 'results': [sec(), {'md5': 'ab'}, {'size': 16}]})
+        op, seen = self.read(line, ops=snap)
+        (_, _, sent), = seen
+        self.assertEqual(sent, [{'op': 'security'}, *snap])
+        self.assertEqual(op.results, ({'md5': 'ab'}, {'size': 16}))
+        with self.assertRaisesRegex(RuntimeError, '1 more'):
+            self.read(self.line(sec()), ops=snap[:1])
+        for bad in ([{'op': 'write', 'addr': 0}], [{'op': 'security'}], ['md5']):
+            with self.subTest(ops=bad), self.assertRaisesRegex(ValueError, 'only esptool_session read and md5'):
+                self.read(self.line(sec()), ops=bad)
+
+    def test_reap_grace_and_verbose_reach_the_default_runner(self):
+        seen = []
+
+        def tracked(cmd, cwd=None, **kw):
+            seen.append(kw)
+            r = subprocess.CompletedProcess(cmd, 0, self.line(sec()), None)
+            r.cleanup, r.receipt = 'done', None
+            return r
+        with mock.patch.object(oe.hil_process, 'run_tracked', tracked):
+            oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=30, retains_lock=True,
+                             reap_grace=7.5, verbose=True)
+            oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=30, retains_lock=True)
+        self.assertEqual((seen[0]['reap_grace'], seen[0]['verbose']), (7.5, True))
+        self.assertNotIn('reap_grace', seen[1])
+        self.assertIs(seen[1]['verbose'], False)
+        (self.work / oe.SECURITY_STATE).rmdir()
+
+    def test_a_child_left_not_proven_ended_refuses_every_later_access_until_it_ends(self):
+        """agentrc#214: the serial's pending record, not a consumer's dict, refuses the next session."""
+        receipt = {'token': 'r1', 'supervisor': {'pid': 9}, 'lock': '/s/hil_op_r1.lock', 'record': '/s/hil_op_r1.json'}
+
+        def run(argv, **kw):
+            r = subprocess.CompletedProcess(argv, 0, self.line(sec()), None)
+            r.cleanup, r.receipt = 'pending', receipt
+            return r
+        with self.assertRaisesRegex(RuntimeError, 'not proven ended'):
+            oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=30, retains_lock=True, run=run)
+        self.assertEqual(oe.pending(SERIAL).read(), [{'receipt': receipt}])
+        touched = mock.patch.object(oe, 'usj_tty', side_effect=AssertionError('touched'))
+        with mock.patch.object(oe.hil_process, 'recheck', return_value='pending'), touched, \
+                self.assertRaisesRegex(RuntimeError, 'esptool child, record /s/hil_op_r1.json'):
+            oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=30, retains_lock=True, run=run)
+        with mock.patch.object(oe.hil_process, 'recheck', return_value='done'):
+            self.assertEqual(oe.pending_refusal(SERIAL), '')
+        self.assertEqual(oe.pending(SERIAL).read(), [])
+
+    def test_an_operation_that_left_no_receipt_refuses_until_a_reviewed_recovery(self):
+        def run(argv, **kw):
+            r = subprocess.CompletedProcess(argv, 0, self.line(sec()), None)
+            r.cleanup = 'unknown'
+            return r
+        with self.assertRaisesRegex(RuntimeError, 'not proven ended'):
+            oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=30, retains_lock=True, run=run)
+        self.assertIn('left no receipt', oe.pending_refusal(SERIAL))
+        oe.pending(SERIAL).clear(lambda e: False, note='reviewed: board power-cycled')
+        self.assertEqual(oe.pending_refusal(SERIAL), '')
+
+    def test_an_unreadable_record_refuses(self):
+        Path(oe.pending(SERIAL).path).write_text('{not json')
+        self.assertIn('unreadable', oe.pending_refusal(SERIAL))
 
     def test_an_unchecked_chip_is_refused_before_any_access(self):
         with mock.patch.object(oe, 'usj_tty', side_effect=AssertionError('touched')), \

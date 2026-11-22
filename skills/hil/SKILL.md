@@ -356,18 +356,30 @@ recovery stay the contract's. Linux only.
   `segments_from_flash_args(build_dir, chip, timeout=)` gives them from an
   ESP-IDF build's `flash_args`, refusing a build openocd would not write as
   esptool does.
-  A flash also requires `security`, the caller's evidence read from the chip
-  before programming: `{"flashEncryption": "off", "secureBoot": "off",
-  "source": <where it was read>}`. Without it, or with either feature not
-  `off`, the flash is refused before anything starts; the provider never
-  infers or defaults the chip's security state. `read_security(serial, chip=,
-  workdir=, timeout=, retains_lock=True)` reads it and hard-resets the chip,
-  its child run tracked by default (state in `workdir`) and its evidence
-  returned only once that child is proven ended (cleanup `done`), otherwise
-  raised with its receipts; `security_evidence(result, chip=, source=)`
-  reads a `security` op of the caller's own `scripts/esptool_session.py`.
+  A flash also requires `security`, the Operation `read_security(serial,
+  chip=, workdir=, timeout=, retains_lock=True)` returns: its child proven
+  ended (cleanup `done`) and its evidence, `{"flashEncryption": "off",
+  "secureBoot": "off", "source": <where it was read>}`, as `.security`. A bare
+  evidence dict, a read whose child is not proven ended, or either feature not
+  `off` is refused before anything starts (`admit_read`); the provider never
+  infers or defaults the chip's security state. `read_security` reads it and
+  hard-resets the chip, its child run tracked by default (state in `workdir`,
+  `reap_grace=` and `verbose=` passed on), and raises with its receipts
+  otherwise. `ops=` adds esptool_session read or md5 ops to that one session
+  (a snapshot of the flash before writing), their results as `.results`.
+  `security_evidence(result, chip=, source=)` reads a `security` op result.
   Unknown or contradictory evidence, or a chip outside `SECURITY_CHIPS`
   (ESP32-P4, ESP32-S3), is refused.
+  What an operation leaves not proven ended (a pending session, or the
+  security read's esptool child) is listed under its USJ serial in
+  `pending(serial)`, a `hil_lock.PendingSessions` record
+  (`usj-<serial>.openocd-esp-pending.json`), and every flash, reset and
+  `read_security` on that serial refuses while it lists one, whatever process
+  asks (`pending_refusal(serial)`, which clears a record whose every entry has
+  since ended). `receipt_kind(receipt)` (`session`, `tracked`, `unreceipted`)
+  and `describe(receipt)` name an entry; an unreceipted one, or an unreadable
+  record, clears only with a reviewed recovery's note
+  (`PendingSessions.clear(note=)`).
   Flash, reset and `read_security` run only for a caller that passes
   `retains_lock=True`, declaring it holds the board lock through each
   operation and logs a session it leaves pending, and never under a CI job (`RUNNER_TRACKING_ID` or

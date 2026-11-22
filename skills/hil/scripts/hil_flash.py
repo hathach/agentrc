@@ -38,7 +38,7 @@ FILES = ('skills/hil/scripts/hil_load.py', 'skills/hil/scripts/hil_process.py',
          'skills/hil/scripts/pyocd/run_pyocd.py', 'skills/hil/scripts/pyocd/user_script.py',
          'skills/hil/scripts/hil_openocd_esp.py', 'skills/hil/scripts/usb_observe.py',
          'skills/target-debug/scripts/esp_session.py', 'skills/hil/scripts/esptool_session.py',
-         'skills/hil/scripts/hil_openocd_esp_receipt.py')
+         'skills/hil/scripts/hil_openocd_esp_receipt.py', 'skills/hil/scripts/hil_lock.py')
 
 
 def _hil_load():

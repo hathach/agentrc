@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """The state of an `openocd_esp` session from its receipt (`hil` skill, Flashers), shared with
-hil_openocd_esp, which re-exports it. Stdlib only and importable alone: a detached lock keeper
-reads a receipt without loading the provider and its dependencies.
+hil_openocd_esp, which re-exports it, and what kind of receipt an operation left. Stdlib only and
+importable alone: a detached lock keeper reads a receipt without loading the provider and its
+dependencies.
+
+An openocd_esp operation leaves one of two receipts when it cannot prove its process ended: an
+openocd session's (its receipt.json path, or the record itself when the file could not be
+written), which only the reviewed `end` ends, and a hil_process.run_tracked receipt of an esptool
+child (read_security's), which ends once its recheck answers `done`. receipt_kind tells them apart
+and describe names one, so no consumer restates either's keys.
 """
 
 from __future__ import annotations
@@ -46,3 +53,38 @@ def session_state(receipt) -> str:
     except OSError:
         return 'running'
     return 'running' if len(fields) > 19 and fields[19] == str(start) else 'unresolved'
+
+
+TRACKED_KEYS = frozenset({'token', 'supervisor', 'lock', 'record'})   # hil_process.run_tracked's receipt
+
+
+def receipt_kind(receipt) -> str | None:
+    """'tracked' for a run_tracked receipt (an esptool child), 'session' for an openocd session's
+    (its receipt path, or its record), 'unreceipted' for the provider's own entry of an operation
+    that left no receipt, else None."""
+    if isinstance(receipt, str):
+        return 'session'
+    if not isinstance(receipt, dict):
+        return None
+    if 'unreceipted' in receipt:
+        return 'unreceipted'
+    if TRACKED_KEYS <= set(receipt):
+        return 'tracked'
+    if 'pid' in receipt and 'startTime' in receipt:
+        return 'session'
+    return None
+
+
+def describe(receipt) -> str:
+    """One line naming the process a receipt stands for, for a refusal or a cleanup log."""
+    kind = receipt_kind(receipt)
+    if kind == 'tracked':
+        return f"esptool child, record {receipt.get('record')}"
+    if kind == 'unreceipted':
+        return f"an operation that left no receipt: {receipt.get('unreceipted')}"
+    if kind == 'session' and isinstance(receipt, dict):
+        return (f"openocd_esp session pid {receipt.get('pid')} start {receipt.get('startTime')}, receipt file "
+                f"unwritten, log {receipt.get('log')}")
+    if kind == 'session':
+        return f'openocd_esp session, receipt {receipt}'
+    return f'unrecognised receipt {receipt!r:.200}'

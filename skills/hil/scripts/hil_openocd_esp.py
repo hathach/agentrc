@@ -67,7 +67,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 FILES = ('skills/hil/scripts/hil_load.py', 'skills/hil/scripts/usb_observe.py', 'skills/hil/scripts/hil_process.py',
          'skills/hil/scripts/hil_flash.py', 'skills/hil/scripts/pyocd/run_pyocd.py',
          'skills/hil/scripts/pyocd/user_script.py', 'skills/target-debug/scripts/esp_session.py',
-         'skills/hil/scripts/esptool_session.py', 'skills/hil/scripts/hil_openocd_esp_receipt.py')
+         'skills/hil/scripts/esptool_session.py', 'skills/hil/scripts/hil_openocd_esp_receipt.py',
+         'skills/hil/scripts/hil_lock.py')
 ESPTOOL_SESSION = os.path.join(HERE, 'esptool_session.py')   # read_security's child
 
 
@@ -92,6 +93,8 @@ hil_flash = hil_load.load_file('skills/hil/scripts/hil_flash.py')
 esp_session = hil_load.load_file('skills/target-debug/scripts/esp_session.py')
 receipt_state = hil_load.load_file('skills/hil/scripts/hil_openocd_esp_receipt.py')
 session_state, _int = receipt_state.session_state, receipt_state._int
+receipt_kind, describe = receipt_state.receipt_kind, receipt_state.describe
+hil_lock = hil_load.load_file('skills/hil/scripts/hil_lock.py')
 
 # The build whose program_esp, flash write_image/read_bank, esp_usb_jtag and shutdown paths were
 # read; another build is refused until its source is checked again. The pin also covers the `esp`
@@ -147,6 +150,65 @@ def refusal(*, retains_lock=False) -> str:
 def _admit_session(retains_lock):
     if why := refusal(retains_lock=retains_lock):
         raise RuntimeError(why)
+
+
+# A per-serial record of what an openocd_esp operation left not proven ended (#214): a session the
+# reviewed `end` has not ended, or read_security's esptool child whose recheck is not `done`. Every
+# board access here refuses while one is listed, whatever process, run dir or project asks.
+PENDING_KIND = 'openocd-esp'
+
+
+def pending(serial: str):
+    """hil_lock.PendingSessions of the USJ with `serial`: <usj-serial>.openocd-esp-pending.json in
+    BOARD_LOCK_DIR (':' written '_', which a lock name cannot hold)."""
+    if not isinstance(serial, str) or not hil_flash.UID_RE.fullmatch(serial):
+        raise ValueError(f'USJ serial {serial!r}: want letters, digits and _ . : + -')
+    return hil_lock.PendingSessions('usj-' + serial.replace(':', '_'), PENDING_KIND)
+
+
+def receipt_ended(receipt) -> bool:
+    """Whether the process a receipt stands for is proven ended: a session's after the reviewed
+    end, a tracked child's once its recheck is `done`. Anything else, an unreceipted entry
+    included, is not: it clears only with a reviewed recovery's note."""
+    kind = receipt_kind(receipt)
+    if kind == 'session':
+        return session_state(receipt) == 'ended'
+    if kind == 'tracked':
+        return hil_process.recheck(receipt) == 'done'
+    return False
+
+
+def pending_refusal(serial: str) -> str:
+    """Why board access to the USJ with `serial` is refused for what an earlier operation left
+    ('' when nothing is pending): a listed receipt not proven ended, or a record that cannot be
+    read. A record whose every entry has since ended is cleared."""
+    record = pending(serial)
+    sessions = record.read()
+    if sessions is None:
+        return f'{record} is unreadable: a session may still run on USJ {serial}; {NEEDS_RECOVERY}'
+    left = [e['receipt'] for e in sessions if not receipt_ended(e['receipt'])]
+    if left:
+        return (f'USJ {serial} has {len(left)} operation(s) not proven ended ({record}): '
+                + '; '.join(describe(r) for r in left[:3]) + f'; end them or {NEEDS_RECOVERY}')
+    if sessions:
+        record.clear(lambda e: receipt_ended(e['receipt']))
+    return ''
+
+
+def _refuse_pending(serial):
+    if why := pending_refusal(serial):
+        raise RuntimeError(why)
+
+
+def _latch(serial, op, what):
+    """List what `op` left not proven ended under `serial`: its receipts, or an unreceipted entry
+    naming `what` when it left none. Returns the entries listed."""
+    if op is None or op.cleanup == 'done':
+        return []
+    entries = [{'receipt': r} for r in op.receipts] or \
+        [{'receipt': {'unreceipted': f'{what}: cleanup {op.cleanup}', 'serial': serial}}]
+    pending(serial).add(entries)
+    return entries
 
 
 def admit(flasher: dict) -> tuple:
@@ -792,7 +854,7 @@ SECURITY_STATE = 'security-ops'
 
 
 def read_security(serial: str, *, chip: str, workdir, timeout, retains_lock=False, esptool: str = 'esptool',
-                  run=None, baud: int = ESP_BAUD):
+                  run=None, baud: int = ESP_BAUD, ops=(), reap_grace=None, verbose=False):
     """Read the security state of the chip behind the USJ with `serial` before an openocd_esp
     flash: one esptool_session.py child, under the interpreter of `esptool` (hil_flash
     tool_python), on usj_tty(serial), that reads GET_SECURITY_INFO and the eFuses on the ROM
@@ -804,24 +866,41 @@ def read_security(serial: str, *, chip: str, workdir, timeout, retains_lock=Fals
     Operation of the child with `security`, security_evidence's dict, only once the child is
     proven ended (cleanup `done`): an openocd session started beside a survivor would share the
     USJ with it. Otherwise, as for a failed child or evidence that is unknown or contradictory,
-    it raises carrying `.operation`, its cleanup and receipts."""
+    it raises carrying `.operation`, its cleanup and receipts, and lists what the child left in
+    the serial's pending record (pending), which refuses every later access until it ends.
+
+    `ops`: esptool_session.py read or md5 ops run in the same session after the security read,
+    so a caller's snapshot of the flash takes no second session; their results are the
+    Operation's `results`. `reap_grace` and `verbose` go to the default run_tracked. Refused too
+    while the serial's pending record lists an operation not proven ended (pending_refusal)."""
     _admit_session(retains_lock)
     _security_chip(chip)
+    ops = list(ops)
+    if not all(isinstance(o, dict) and o.get('op') in ('read', 'md5') for o in ops):
+        raise ValueError(f'ops {ops!r:.200}: only esptool_session read and md5 ops follow the security read')
+    _refuse_pending(serial)
     tty, python = usj_tty(serial), hil_flash.tool_python(esptool)
     if run is None:
         state = hil_process.state_dir(_workdir(workdir), SECURITY_STATE)
+        grace = {} if reap_grace is None else {'reap_grace': reap_grace}
 
         def run(cmd, cwd=None, **kw):
-            return hil_process.run_tracked(cmd, cwd, settle=SECURITY_SETTLE, state_dir=state, **kw)
+            return hil_process.run_tracked(cmd, cwd, settle=SECURITY_SETTLE, state_dir=state, verbose=verbose,
+                                           **grace, **kw)
     with tempfile.TemporaryDirectory(prefix='hil_security_', dir=_workdir(workdir)) as td:
-        ops = os.path.join(td, 'ops.json')
-        with open(ops, 'w') as f:
-            json.dump([{'op': 'security'}], f)
+        ops_file = os.path.join(td, 'ops.json')
+        with open(ops_file, 'w') as f:
+            json.dump([{'op': 'security'}, *ops], f)
         argv = [python, '-B', ESPTOOL_SESSION, '--port', tty, '--chip', chip, '--baud', str(baud),
-                '--after', 'hard-reset', ops]
-        op = hil_flash._once(run, argv, env=dict(hil_flash.ESPTOOL_ENV), timeout=timeout)
+                '--after', 'hard-reset', ops_file]
+        try:
+            op = hil_flash._once(run, argv, env=dict(hil_flash.ESPTOOL_ENV), timeout=timeout)
+        except BaseException as e:
+            _latch(serial, getattr(e, 'operation', None), f'read_security on {tty}')
+            raise
     try:
         if op.cleanup != 'done':
+            _latch(serial, op, f'read_security on {tty}')
             raise RuntimeError(f'esptool_session on {tty}: cleanup {op.cleanup}, its child is not proven ended')
         lines = hil_process.cmd_stdout_text(op.stdout).strip().splitlines()
         try:
@@ -832,8 +911,10 @@ def read_security(serial: str, *, chip: str, workdir, timeout, retains_lock=Fals
             raise RuntimeError(f'esptool_session on {tty} (rc {op.returncode}): '
                                f'{out.get("error") if isinstance(out, dict) else "no result line"}')
         results = out.get('results')
-        if not isinstance(results, list) or not results:
-            raise RuntimeError(f'esptool_session on {tty}: results {results!r}, want the security op\'s')
+        if not isinstance(results, list) or len(results) != 1 + len(ops):
+            raise RuntimeError(f'esptool_session on {tty}: results {results!r:.300}, want the security op\'s and '
+                               f'{len(ops)} more')
+        op.results = tuple(results[1:])
         op.security = security_evidence(results[0], chip=chip,
                                         source=f'esptool {out.get("esptool")} on {tty}, USJ {serial}, ROM loader')
     except Exception as e:      # every parse failure carries the child's operation, its cleanup and receipt
@@ -977,8 +1058,12 @@ def flash_openocd_esp(flasher: dict, segments, *, security, workdir, timeout, op
     managed session (module docstring) within `timeout` seconds, files in a new directory under
     `workdir`. The chip must not sit in its ROM loader (the `hil` skill's Flashers).
 
-    `security` is the caller's evidence that flash encryption and secure boot are off
-    (admit_security, such as read_security's), required and recorded as `session['security']`.
+    `security` is read_security's Operation: its child proven ended (cleanup `done`) and its
+    `security` evidence that flash encryption and secure boot are off (admit_security), recorded
+    as `session['security']`. A bare evidence dict is refused, as it proves no child ended: an
+    openocd session started beside a surviving esptool would share the USJ with it (#213).
+    Refused too while the USJ's pending record lists an operation not proven ended; a session
+    this flash leaves pending is listed there (pending).
     `retains_lock=True` is the caller's declaration that it holds the board lock through the
     operation and logs a session left pending (refusal); without it the flash is refused.
 
@@ -990,7 +1075,7 @@ def flash_openocd_esp(flasher: dict, segments, *, security, workdir, timeout, op
     (_program) and `readBack` (file, length, match, firstMismatch). Refusals raise ValueError
     or RuntimeError before anything starts."""
     _admit_session(retains_lock)
-    security = admit_security(security)
+    security = admit_read(security)
     admitted = admit_segments(segments)
     records = [rec for rec, _ in admitted]
 
@@ -1035,12 +1120,8 @@ def flash_openocd_esp(flasher: dict, segments, *, security, workdir, timeout, op
             if diff is not None:
                 raise _Stop(f"read-back of {rec['file']} at 0x{rec['offset']:x} differs at +0x{diff:x}", end=True)
 
-    try:
-        op = _run(flasher, work, workdir=workdir, timeout=timeout, openocd=openocd, record={'security': security})
-    except BaseException as e:
-        if hasattr(e, 'operation'):
-            e.operation.segments = tuple(records)
-        raise
+    op = _latched(flasher, work, workdir=workdir, timeout=timeout, openocd=openocd, record={'security': security},
+                  segments=tuple(records))
     op.segments = tuple(records)
     return op
 
@@ -1053,7 +1134,36 @@ def reset_openocd_esp(flasher: dict, *, workdir, timeout, openocd=None, retains_
     leaves the session pending instead. Refused without `retains_lock=True` (refusal).
     Returns hil_flash's Operation, as flash_openocd_esp without `segments`."""
     _admit_session(retains_lock)
-    return _run(flasher, lambda s: None, workdir=workdir, timeout=timeout, openocd=openocd)
+    return _latched(flasher, lambda s: None, workdir=workdir, timeout=timeout, openocd=openocd)
+
+
+def admit_read(read) -> dict:
+    """The admitted evidence of read_security's Operation `read`: refused unless its child is
+    proven ended (cleanup `done`) and its `security` passes admit_security."""
+    if isinstance(read, dict) or not hasattr(read, 'security') or not hasattr(read, 'cleanup'):
+        raise ValueError(f'security {type(read).__name__}: want read_security\'s Operation, whose child is proven '
+                         f'ended; bare evidence proves no child ended, and programming is refused')
+    if read.cleanup != 'done':
+        raise RuntimeError(f'the security read\'s cleanup is {read.cleanup}: its child is not proven ended')
+    return admit_security(read.security)
+
+
+def _latched(flasher, work, *, segments=None, **kw):
+    """_run once the USJ's pending record lists nothing open, listing what the session leaves
+    pending there, a raised one included."""
+    admit(flasher)
+    serial = flasher['uid']
+    _refuse_pending(serial)
+    try:
+        op = _run(flasher, work, **kw)
+    except BaseException as e:
+        if hasattr(e, 'operation'):
+            if segments is not None:
+                e.operation.segments = segments
+            _latch(serial, e.operation, f'openocd_esp on USJ {serial}')
+        raise
+    _latch(serial, op, f'openocd_esp on USJ {serial}')
+    return op
 
 
 # -------------------------------------------------------------
