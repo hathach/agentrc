@@ -61,6 +61,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -178,12 +179,41 @@ def receipt_ended(receipt) -> bool:
     return False
 
 
+# What latch could not write to a serial's record (OSError, PendingRefused): held in this process,
+# refusing every access here until a later pending_refusal lists it.
+_UNLISTED: dict = {}
+_UNLISTED_LOCK = threading.Lock()
+
+
+def _list_unlisted(serial, record):
+    """'' once what this process could not list under `serial` is listed, else why not."""
+    with _UNLISTED_LOCK:
+        entries = list(_UNLISTED.get(serial, ()))
+    if not entries:
+        return ''
+    try:
+        record.add(entries)
+    except (OSError, hil_lock.PendingRefused) as e:
+        return (f'USJ {serial} has {len(entries)} operation(s) not proven ended that {record} could not list ({e}): '
+                + '; '.join(describe(x['receipt']) for x in entries[:3]) + f'; {NEEDS_RECOVERY}')
+    with _UNLISTED_LOCK:
+        left = [x for x in _UNLISTED.get(serial, ()) if x not in entries]
+        if left:
+            _UNLISTED[serial] = left
+        else:
+            _UNLISTED.pop(serial, None)
+    return ''
+
+
 def pending_refusal(serial: str) -> str:
     """Why board access to the USJ with `serial` is refused for what an earlier operation left
-    ('' when nothing is pending): a listed receipt not proven ended, or a record that cannot be
-    read or cleared. A record whose every entry has since ended is cleared. Never raises for the
-    record: a failure to read or clear it is a refusal (a malformed serial stays ValueError)."""
+    ('' when nothing is pending): a listed receipt not proven ended, one this process could not
+    list (retried here first), or a record that cannot be read or cleared. A record whose every
+    entry has since ended is cleared. Never raises for the record: a failure to read or clear it
+    is a refusal (a malformed serial stays ValueError)."""
     record = pending(serial)
+    if why := _list_unlisted(serial, record):
+        return why
     try:
         sessions = record.read()
         if sessions is None:
@@ -191,7 +221,7 @@ def pending_refusal(serial: str) -> str:
         left = [e['receipt'] for e in sessions if not receipt_ended(e['receipt'])]
         if left:
             return (f'USJ {serial} has {len(left)} operation(s) not proven ended ({record}): '
-                    + '; '.join(describe(r) for r in left[:3]) + f'; end them or {NEEDS_RECOVERY}')
+                    + '; '.join(describe(r) for r in left[:3]) + f'; {_remedy(left, serial)}')
         if sessions:
             record.clear(lambda e: receipt_ended(e['receipt']))
     except hil_lock.PendingRefused as e:      # an entry listed since the read: ask again
@@ -199,6 +229,45 @@ def pending_refusal(serial: str) -> str:
     except OSError as e:
         return f'{record} cannot be read or cleared ({e}): a session may still run on USJ {serial}; {NEEDS_RECOVERY}'
     return ''
+
+
+def _remedy(receipts, serial) -> str:
+    """What ends the refusal for these open receipts, by kind."""
+    kinds = {receipt_kind(r) for r in receipts}
+    ways = []
+    if 'session' in kinds:
+        ways.append('end a session with `hil_openocd_esp.py end --receipt <receipt>`')
+    if 'tracked' in kinds:
+        ways.append("an esptool child's entry clears by itself once its recheck is done")
+    ways.append(f'otherwise {NEEDS_RECOVERY}, then `hil_openocd_esp.py pending --serial {serial} --note <recovery>`')
+    return '; '.join(ways)
+
+
+def pending_entries(serial: str) -> dict:
+    """What the USJ with `serial` has open, split for a consumer's cleanup evidence
+    (hil_lock.log_cleanup_failure): {'receipts': tracked receipts, which hil_process.recheck
+    rechecks, 'retained': session receipts, retained by session_state, 'unrecheckable': what
+    nothing can recheck (an unreceipted or unrecognised entry, or {'unreadable': <record>, 'error':
+    why} for a record that cannot be read)}. Only entries not proven ended, this process's
+    unlisted ones (latch) included; reads without clearing, and never raises for the record."""
+    record = pending(serial)
+    out = {'receipts': [], 'retained': [], 'unrecheckable': []}
+    with _UNLISTED_LOCK:
+        entries = list(_UNLISTED.get(serial, ()))
+    try:
+        sessions = record.read()
+        error = 'unparseable, or a malformed entry'
+    except OSError as e:
+        sessions, error = None, str(e)
+    if sessions is None:
+        out['unrecheckable'].append({'unreadable': str(record), 'error': error})
+    entries += [e for e in sessions or () if e not in entries]
+    for e in entries:
+        r = e['receipt']
+        if receipt_ended(r):
+            continue
+        out[{'tracked': 'receipts', 'session': 'retained'}.get(receipt_kind(r), 'unrecheckable')].append(r)
+    return out
 
 
 def _refuse_pending(serial):
@@ -210,12 +279,22 @@ def latch(serial, op, what):
     """List what Operation `op` left not proven ended under `serial`: its receipts, or an
     unreceipted entry naming `what` when it left none; nothing when `op` is None or its cleanup is
     `done`. Returns the entries listed. Public so a consumer's fake provider lists as this one
-    does; OSError or hil_lock.PendingRefused when the record cannot take them."""
+    does. When the record cannot take them (OSError, hil_lock.PendingRefused) that is raised
+    carrying `.operation`, and this process holds the entries, refusing every access to `serial`
+    until one lists them (pending_refusal)."""
     if op is None or op.cleanup == 'done':
         return []
     entries = [{'receipt': r} for r in op.receipts] or \
         [{'receipt': {'unreceipted': f'{what}: cleanup {op.cleanup}', 'serial': serial}}]
-    pending(serial).add(entries)
+    try:
+        pending(serial).add(entries)
+    except BaseException as e:
+        with _UNLISTED_LOCK:
+            held = _UNLISTED.setdefault(serial, [])
+            held.extend(x for x in entries if x not in held)
+        if getattr(e, 'operation', None) is None:
+            e.operation = op
+        raise
     return entries
 
 
@@ -1187,7 +1266,7 @@ def _held_run(hold, serial, what, work, segments=None):
     """work()'s Operation, with what it left listed under `serial` (latch), a raised one's
     included. SIGINT and SIGTERM reach work() through `hold` (hil_process.InterruptHold) and are
     deferred again from the first instruction after it, so none unwinds before the latch; the
-    caller's release() delivers them."""
+    caller's release() delivers them. A latch that fails raises carrying the Operation (latch)."""
     try:
         try:
             hold.deliver()

@@ -383,7 +383,16 @@ recovery stay the contract's. Linux only.
   an unreceipted one, or an unreadable record, clears only with a reviewed
   recovery's note (`PendingSessions.clear(note=)`, or the `pending` command
   below). SIGINT and SIGTERM reach each operation's run but are held from its
-  end until what it left is listed, then delivered. `read_security(quiet=True)`
+  end until what it left is listed, then delivered. A record that cannot take
+  an entry (a full disk, an unreadable record) raises carrying the
+  Operation, and the process keeps the entry, refusing that serial until a
+  later access lists it. Each refusal names what ends it, by kind.
+  `pending_entries(serial)` reads what is open without clearing it, split for
+  `hil_lock.log_cleanup_failure`: `receipts` (tracked children), `retained`
+  (sessions) and `unrecheckable` (unreceipted or unrecognised entries, and an
+  unreadable record as `{unreadable, error}`). `pending_refusal` clears entries
+  that have ended, so a run that must not retry after a child it left pending
+  keeps its own latch for that run. `read_security(quiet=True)`
   drops the COMMAND FAILED banner for a caller that reports the failure.
   Flash, reset and `read_security` run only for a caller that passes
   `retains_lock=True`, declaring it holds the board lock through each

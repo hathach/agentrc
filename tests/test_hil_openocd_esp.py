@@ -8,6 +8,7 @@ if os.name == 'nt':
     raise unittest.SkipTest('hil_openocd_esp is Linux only')
 
 import contextlib
+import errno
 import hashlib
 import importlib.util
 import io
@@ -56,9 +57,9 @@ def fresh_locks(test):
     """A new BOARD_LOCK_DIR for the pending registry, so one test's latched session refuses no other."""
     root = tempfile.mkdtemp(prefix='locks_')
     test.addCleanup(shutil.rmtree, root, True)
-    p = mock.patch.object(oe.hil_lock, 'BOARD_LOCK_DIR', root)
-    p.start()
-    test.addCleanup(p.stop)
+    for p in (mock.patch.object(oe.hil_lock, 'BOARD_LOCK_DIR', root), mock.patch.dict(oe._UNLISTED, clear=True)):
+        p.start()
+        test.addCleanup(p.stop)
     return root
 BANNER = f'Open On-Chip Debugger {oe.VERIFIED_OPENOCD} (2026-07-03-13:49)'
 
@@ -1310,6 +1311,24 @@ class PendingRegistry(SessionCase):
         self.assertEqual(oe.pending(SERIAL).read(), [{'receipt': '/w/receipt.json'}])
         self.assertEqual(signal.getsignal(signal.SIGINT), signal.default_int_handler)
 
+    def test_a_session_the_record_cannot_list_carries_its_operation_and_refuses_until_listed(self):
+        """agentrc#214: an ENOSPC from the record's add loses neither the session nor the refusal."""
+        op = types.SimpleNamespace(cleanup='pending', receipts=('/w/receipt.json',))
+        full = OSError(errno.ENOSPC, 'No space left on device')
+        with mock.patch.object(oe, '_run', lambda *a, **k: op), \
+                mock.patch.object(oe.hil_lock.PendingSessions, 'add', side_effect=full), \
+                self.assertRaises(OSError) as cm:
+            oe._latched(BOARD, 'reset')
+        self.assertIs(cm.exception.operation, op)
+        with mock.patch.object(oe.hil_lock.PendingSessions, 'add', side_effect=full):
+            self.assertIn('could not list', oe.pending_refusal(SERIAL))
+            with self.assertRaisesRegex(RuntimeError, 'could not list.*receipt /w/receipt.json'):
+                oe.reset_openocd_esp(BOARD, workdir=str(self.work), timeout=5, openocd=str(self.exe),
+                                     retains_lock=True)
+        self.assertIn('not proven ended', oe.pending_refusal(SERIAL), 'listed once the record takes it')
+        self.assertEqual(oe.pending(SERIAL).read(), [{'receipt': '/w/receipt.json'}])
+        self.assertEqual(oe._UNLISTED, {})
+
     def test_an_ended_reset_lists_nothing(self):
         self.assertEnded(self.reset())
         self.assertEqual(oe.pending(SERIAL).read(), [])
@@ -1346,6 +1365,38 @@ class PendingRecord(unittest.TestCase):
             self.assertIn('ask again', oe.pending_refusal(SERIAL))
         with mock.patch.object(oe.hil_lock.PendingSessions, 'read', side_effect=PermissionError('denied')):
             self.assertIn('cannot be read or cleared (denied)', oe.pending_refusal(SERIAL))
+
+    def test_pending_entries_split_what_is_open_for_cleanup_evidence(self):
+        self.assertEqual(oe.pending_entries(SERIAL), {'receipts': [], 'retained': [], 'unrecheckable': []})
+        bare = {'unreceipted': 'read_security on tty: cleanup unknown', 'serial': SERIAL}
+        oe.pending(SERIAL).add([{'receipt': self.tracked}, {'receipt': '/w/receipt.json'}, {'receipt': bare},
+                                {'receipt': '/w/ended.json'}])
+        oe._UNLISTED[SERIAL] = [{'receipt': '/w/unlisted.json'}]
+        ended = mock.patch.object(oe, 'session_state', lambda r: 'ended' if r == '/w/ended.json' else 'running')
+        with ended, mock.patch.object(oe.hil_process, 'recheck', return_value='running'):
+            self.assertEqual(oe.pending_entries(SERIAL), {'receipts': [self.tracked],
+                                                          'retained': ['/w/unlisted.json', '/w/receipt.json'],
+                                                          'unrecheckable': [bare]})
+        self.assertEqual(len(oe.pending(SERIAL).read()), 4, 'read, never cleared')
+        Path(oe.pending(SERIAL).path).write_text('{')
+        with ended:
+            out = oe.pending_entries(SERIAL)
+        self.assertEqual(out['unrecheckable'], [{'unreadable': oe.pending(SERIAL).path,
+                                                 'error': 'unparseable, or a malformed entry'}])
+        self.assertEqual(out['retained'], ['/w/unlisted.json'])
+
+    def test_each_refusal_names_what_ends_it(self):
+        oe.latch(SERIAL, types.SimpleNamespace(cleanup='pending', receipts=('/w/receipt.json', self.tracked)), 'x')
+        with mock.patch.object(oe.hil_process, 'recheck', return_value='running'):
+            why = oe.pending_refusal(SERIAL)
+        self.assertIn('hil_openocd_esp.py end --receipt', why)
+        self.assertIn('clears by itself once its recheck is done', why)
+        self.assertIn(f'pending --serial {SERIAL} --note', why)
+        fresh_locks(self)
+        oe.latch(SERIAL, types.SimpleNamespace(cleanup='unknown', receipts=()), 'x')
+        why = oe.pending_refusal(SERIAL)
+        self.assertNotIn('end --receipt', why)
+        self.assertIn('separately reviewed recovery, then `hil_openocd_esp.py pending', why)
 
     def test_the_pending_command_reports_then_clears_only_with_a_note(self):
         self.assertEqual(self.cli(), (0, {'mode': 'pending', 'serial': SERIAL, 'record': oe.pending(SERIAL).path,
@@ -2094,6 +2145,30 @@ class ReadSecurity(unittest.TestCase):
         with mock.patch.object(oe, 'latch', latch), self.assertRaises(KeyboardInterrupt):
             oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=30, retains_lock=True, run=run)
         self.assertEqual(oe.pending(SERIAL).read(), [{'receipt': receipt}])
+        self.assertEqual(list(self.work.iterdir()), [])
+
+    def test_a_child_the_record_cannot_list_carries_its_operation_and_refuses_until_listed(self):
+        receipt = {'token': 'r1', 'lock': '/state/hil_op_r1.lock'}
+
+        def run(argv, **kw):
+            r = subprocess.CompletedProcess(argv, 0, self.line(sec()), None)
+            r.cleanup, r.receipt = 'pending', receipt
+            return r
+        for failure in (OSError(errno.ENOSPC, 'No space left on device'),
+                        oe.hil_lock.PendingRefused('unreadable: kept as it is')):
+            fresh_locks(self)
+            with self.subTest(failure=failure):
+                with mock.patch.object(oe.hil_lock.PendingSessions, 'add', side_effect=failure), \
+                        self.assertRaises(type(failure)) as cm:
+                    oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=30, retains_lock=True,
+                                     run=run)
+                self.assertEqual(cm.exception.operation.receipts, (receipt,))
+                with mock.patch.object(oe.hil_lock.PendingSessions, 'add', side_effect=failure), \
+                        self.assertRaisesRegex(RuntimeError, 'could not list'):
+                    oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=30, retains_lock=True,
+                                     run=run)
+                self.assertIn('not proven ended', oe.pending_refusal(SERIAL))
+                self.assertEqual(oe.pending(SERIAL).read(), [{'receipt': receipt}])
         self.assertEqual(list(self.work.iterdir()), [])
 
     def test_an_interrupt_during_the_childs_run_reaches_it(self):
