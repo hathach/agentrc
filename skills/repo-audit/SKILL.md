@@ -13,8 +13,9 @@ Their docstrings own their contracts and exit codes.
 A="${AGENTRC_DIR:-$HOME/.claude}/skills/repo-audit/scripts"
 ```
 
-Work in a task worktree of the audited repository, never its primary checkout. The repository's `CLAUDE.md` names
-its contracts: the `Build contract:` (build, test and code-size commands), the `HIL contract:` and its rosters.
+Work in a task worktree of the audited repository, never its primary checkout. The repository's instruction file
+(`CLAUDE.md`, `AGENTS.md`) names its contracts: the `Build contract:` (build, test and code-size commands), the `HIL
+contract:` and its rosters.
 Everything below that says "the build contract" or "the HIL contract" means those.
 
 ## Start
