@@ -1220,6 +1220,13 @@ def worktree_status(subs=None):
     return status
 
 
+def untracked_source():
+    """Untracked files under SOURCE_DIRS, which a record's patch (`git diff HEAD`) leaves out; -z: a path keeps its
+    spaces and is not C-quoted (core.quotePath)."""
+    dirs = getattr(P, 'SOURCE_DIRS', M().SOURCE_DIRS)
+    return [n for n in git('ls-files', '--others', '--exclude-standard', '-z').split('\0') if n and n.startswith(dirs)]
+
+
 def source_identity():
     subs = submodules()
     status = worktree_status(subs)
@@ -1563,8 +1570,7 @@ def _main(argv, resources):
     if args.record:
         if before['dirty'] and not args.experimental:
             fail('a HIL record needs a clean tree (commit first), or --experimental', dirty=before['status'])
-        untracked = [ln[3:] for ln in before['status'].splitlines() if ln.startswith('?? ') and
-                     ln[3:].startswith(getattr(P, 'SOURCE_DIRS', M().SOURCE_DIRS))]
+        untracked = untracked_source()
         if untracked:
             fail(f'untracked source would be missing from the record patch: {untracked}')
         stale = submodule_problems(before)

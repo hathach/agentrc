@@ -117,6 +117,18 @@ class Lib(unittest.TestCase):
                 code = e.code
         return code, json.loads(out.getvalue().strip().splitlines()[-1])
 
+    def untracked(self, *names):
+        """self.root committed as a git checkout on the env the engine inherits, `names` then left untracked."""
+        env = git_env()
+        environ = mock.patch.dict(os.environ, env, clear=True)
+        environ.start()
+        self.addCleanup(environ.stop)
+        for a in (('init', '-q', '-b', 'main'), ('add', '-A'), ('commit', '-qm', 'base')):
+            subprocess.run(['git', '-C', str(self.root), *a], check=True, capture_output=True, env=env)
+        for name in names:
+            (self.root / name).parent.mkdir(parents=True, exist_ok=True)
+            (self.root / name).write_text('x')
+
     def dep(self, name, depends='', files=None):
         """An installed library in a fake user libraries dir: its arduino-cli `lib list` entry."""
         d = self.tmp / 'libraries' / name.replace(' ', '_')
@@ -192,6 +204,7 @@ class Mechanics(Lib):
         argv = ['--board', 'rig_jlink', '--shared', '--hil-config', str(self.root / 'test/hil/ci.json'), '--record',
                 str(self.root / 'build/hil/rig_jlink.build.json'), '--experimental']
         fake.roster(self.root / 'test/hil/ci.json')
+        self.untracked('tools/gen.py')
         ident = {'head': 'abc', 'dirty': True, 'diffSha256': 'd', 'status': '?? tools/gen.py\n'}
         self.patch(ab, 'source_identity', lambda: (ident, ''))
         self.patch(ab, 'submodule_problems', lambda before: [])
@@ -267,6 +280,7 @@ class Selection(Lib):
 
     def test_board_or_example_runs_are_narrowed_and_say_so(self):
         self.patch(ab, 'source_identity', lambda: ({'head': 'abc', 'dirty': False, 'status': ''}, ''))
+        self.patch(ab, 'untracked_source', lambda: [])
         self.patch(ab, 'prepared_dependencies', lambda: {})
         self.patch(ab, 'build_all', lambda *a: [])
         warning = 'explicit --board/--example selection: automatic change selection was not verified'
@@ -1044,9 +1058,10 @@ class Record(RecordCase):
     def test_record_needs_a_clean_tree_and_no_untracked_source(self):
         argv = ['--board', 'rig_jlink', '--shared', '--hil-config', str(self.roster), '--record',
                 str(self.root / 'build/hil/rig_jlink.build.json')]
+        self.untracked('src/new.c', 'src/new file.c', 'src/\u00fcber.c', 'docs/notes.txt')   # git C-quotes the 2nd, 3rd
         for status, extra, why in ((' M src/fake.h\n', [], 'clean tree'),
                                    ('?? src/new.c\n', ['--experimental'], "untracked source would be missing from "
-                                                                          "the record patch: ['src/new.c']")):
+                                    "the record patch: ['src/new file.c', 'src/new.c', 'src/\u00fcber.c']")):
             ident = {'head': 'abc', 'dirty': True, 'diffSha256': 'd', 'status': status}
             with self.subTest(why=why), mock.patch.object(ab, 'source_identity', return_value=(ident, '')):
                 code, out = self.run_main(argv + extra)
@@ -1461,6 +1476,7 @@ class Core(Lib):
         ident = {'head': 'abc', 'dirty': False, 'diffSha256': 'd', 'status': '',
                  'submodules': [{'path': 'libraries/USB', 'commit': 'a', 'state': '-'}]}
         self.patch(ab, 'source_identity', lambda: (ident, ''))
+        self.patch(ab, 'untracked_source', lambda: [])
         self.patch(ab, 'build_all', mock.Mock(side_effect=AssertionError('compiled')))
         for extra in ([], ['--experimental']):
             with self.subTest(extra=extra):
@@ -1551,6 +1567,7 @@ class Core(Lib):
         self.assertEqual((ident['dirty'], ab.submodule_problems(ident)), (False, []))
 
     def test_a_core_record_refuses_any_untracked_file(self):
+        self.untracked('variants/new/variant.h')
         self.patch(ab, 'source_identity', lambda: ({'head': 'abc', 'dirty': True, 'diffSha256': 'd',
                                                     'status': '?? variants/new/variant.h\n', 'submodules': []}, ''))
         self.patch(ab, 'build_all', mock.Mock(side_effect=AssertionError('compiled')))
