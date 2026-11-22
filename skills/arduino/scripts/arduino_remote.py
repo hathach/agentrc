@@ -29,8 +29,8 @@ from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FILES = ('skills/arduino/scripts/arduino_build.py', 'skills/arduino/scripts/arduino_hil.py', 'skills/hil/boards.json',
-         'skills/hil/scripts/esptool_session.py', 'skills/hil/scripts/hil_boards.py', 'skills/hil/scripts/hil_flash.py',
-         'skills/hil/scripts/hil_load.py',
+         'skills/hil/scripts/agentrc_source.py', 'skills/hil/scripts/esptool_session.py',
+         'skills/hil/scripts/hil_boards.py', 'skills/hil/scripts/hil_flash.py', 'skills/hil/scripts/hil_load.py',
          'skills/hil/scripts/hil_lock.py', 'skills/hil/scripts/hil_openocd_esp.py',
          'skills/hil/scripts/hil_openocd_esp_receipt.py', 'skills/hil/scripts/hil_process.py',
          'skills/hil/scripts/hil_remote_core.py', 'skills/hil/scripts/hil_report_core.py',
