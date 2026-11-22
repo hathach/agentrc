@@ -183,8 +183,8 @@ def receipt_ended(receipt) -> bool:
         return session_state(receipt) == 'ended'
     if kind == 'tracked':
         return hil_process.recheck(receipt) == 'done'
-    if kind == 'trackedDir':
-        return hil_process.recheck_dir(receipt['stateDir'])[0] == 'done'
+    if kind == 'trackedDir':      # tidying nothing: a receipt listed apart rechecks from those files
+        return hil_process.recheck_dir(receipt['stateDir'], keep=hil_process._KeepAll())[0] == 'done'
     return False
 
 
@@ -276,7 +276,7 @@ def pending_entries(serial: str) -> dict:
         if receipt_ended(r):
             continue
         if receipt_kind(r) == 'trackedDir':      # its open operations, as recheck_dir finds them
-            for o in hil_process.recheck_dir(r['stateDir'])[1]:
+            for o in hil_process.recheck_dir(r['stateDir'], keep=hil_process._KeepAll())[1]:
                 if o not in out['receipts'] and o not in out['unrecheckable']:
                     out['unrecheckable' if 'unrecheckable' in o else 'receipts'].append(o)
             continue
@@ -1046,12 +1046,15 @@ def read_security(serial: str, *, chip: str, workdir, timeout, retains_lock=Fals
         raise ValueError(f'ops {ops!r:.200}: only esptool_session read and md5 ops follow the security read')
     _refuse_pending(serial)
     tty, python = usj_tty(serial), hil_flash.tool_python(esptool)
+    ahead = None
     if run is None:
         state = hil_process.state_dir(_workdir(workdir), SECURITY_STATE)
         grace = {} if reap_grace is None else {'reap_grace': reap_grace}
         # write-ahead: the state dir is listed before the child starts in it, so a SIGKILL from here
-        # on leaves it refusing until recheck_dir finds every operation there done
-        pending(serial).add([{'receipt': {'stateDir': state, 'what': f'read_security on {tty}'}}])
+        # on leaves it refusing until recheck_dir finds every operation there done; withdrawn once
+        # the child's own receipt is listed (_held_run)
+        ahead = {'stateDir': state, 'what': f'read_security on {tty}'}
+        pending(serial).add([{'receipt': ahead}])
 
         def run(cmd, cwd=None, **kw):
             return hil_process.run_tracked(cmd, cwd, settle=SECURITY_SETTLE, state_dir=state, verbose=verbose,
@@ -1068,7 +1071,7 @@ def read_security(serial: str, *, chip: str, workdir, timeout, retains_lock=Fals
             attempts = []
             op = _held_run(hold, serial, what,
                            lambda: hil_flash._once(run, argv, attempts, env=dict(hil_flash.ESPTOOL_ENV), timeout=timeout),
-                           lambda: hil_flash.Operation(attempts) if attempts else None)
+                           lambda: hil_flash.Operation(attempts) if attempts else None, ahead=ahead)
     finally:
         hold.release()
     try:
@@ -1320,13 +1323,15 @@ def admit_read(read) -> dict:
     return admit_security(read.security)
 
 
-def _held_run(hold, serial, what, work, partial, segments=None):
+def _held_run(hold, serial, what, work, partial, segments=None, ahead=None):
     """work()'s Operation, with what it left listed under `serial` (latch), a raised one's
     included. SIGINT and SIGTERM reach work() through `hold` (hil_process.InterruptHold) and are
     deferred again from the first instruction after it, so none unwinds before the latch; the
     caller's release() delivers them. An exception without `.operation` (one that landed after
     work() had its result, before it returned) takes partial(), the Operation work() recorded
-    so far, or None. A latch that fails raises carrying the Operation (latch)."""
+    so far, or None. A latch that fails raises carrying the Operation (latch). `ahead`, a
+    write-ahead entry's receipt, is withdrawn once the Operation is listed: from there its own
+    receipts stand for it."""
     try:
         try:
             hold.deliver()
@@ -1340,11 +1345,22 @@ def _held_run(hold, serial, what, work, partial, segments=None):
         if (failed := getattr(e, 'operation', None)) is not None and segments is not None:
             failed.segments = segments
         latch(serial, failed, what)
+        if failed is not None:
+            _withdraw_ahead(serial, ahead)
         raise
     latch(serial, op, what)
+    _withdraw_ahead(serial, ahead)
     if op.cleanup == 'done':
         pending_refusal(serial)         # its write-ahead entry, ended, goes with any other that has
     return op
+
+
+def _withdraw_ahead(serial, ahead):
+    """Withdraw write-ahead entry `ahead` (None: none), keeping it when the record cannot be
+    changed: it then still refuses until it ends."""
+    if ahead is not None:
+        with contextlib.suppress(OSError, hil_lock.PendingRefused):
+            pending(serial).withdraw(ahead)
 
 
 def _latched(flasher, work, *, segments=None, **kw):

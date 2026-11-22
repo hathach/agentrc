@@ -2397,6 +2397,35 @@ class ReadSecurity(unittest.TestCase):
         self.assertEqual(oe.pending_refusal(SERIAL), '')
         (self.work / oe.SECURITY_STATE).rmdir()
 
+    def test_a_pending_read_lists_its_receipt_alone_and_checks_the_dir_without_tidying(self):
+        """Codex on tinyuf2: checking the trackedDir tidied the done files its own listed receipt
+        rechecks from, which then read unknown for good. Once the child's receipt is listed the dir
+        entry is withdrawn, and a dir check keeps every file."""
+        state = str(self.work / oe.SECURITY_STATE)
+        receipt = {'token': 't', 'supervisor': {}, 'lock': f'{state}/hil_op_t.lock', 'record': f'{state}/t.json'}
+
+        def tracked(cmd, cwd=None, **kw):
+            r = subprocess.CompletedProcess(cmd, 0, self.line(sec()), None)
+            r.cleanup, r.receipt = 'pending', receipt
+            return r
+        with mock.patch.object(oe.hil_process, 'run_tracked', tracked), self.assertRaisesRegex(RuntimeError,
+                                                                                               'not proven ended'):
+            oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=30, retains_lock=True)
+        self.assertEqual(oe.pending(SERIAL).read(), [{'receipt': receipt}])
+        seen = []
+
+        def recheck_dir(path, keep=()):
+            seen.append(('any-token' in keep, path))
+            return 'done', []
+        with mock.patch.object(oe.hil_process, 'recheck_dir', recheck_dir):
+            self.assertTrue(oe.receipt_ended({'stateDir': state}))
+            oe.pending_entries(SERIAL)
+        self.assertEqual(seen, [(True, state)])
+        with mock.patch.object(oe.hil_process, 'recheck', return_value='done'):
+            self.assertEqual(oe.pending_refusal(SERIAL), '', 'the completed read clears')
+        self.assertEqual(oe.pending(SERIAL).read(), [])
+        (self.work / oe.SECURITY_STATE).rmdir()
+
     def test_quiet_goes_to_the_default_run(self):
         seen = []
 

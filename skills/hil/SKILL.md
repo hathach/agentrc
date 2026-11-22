@@ -391,7 +391,8 @@ recovery stay the contract's. Linux only.
   spawned withdraws its entry (`PendingSessions.withdraw`), and one that ended
   clears it. The default security read lists its run_tracked state dir the
   same way (a `trackedDir` entry), ended once `recheck_dir` finds every
-  operation there done. Each refusal names what ends it, by kind.
+  operation there done (checked without tidying, so a receipt listed apart
+  keeps its files), and withdrawn once the child's own receipt is listed. Each refusal names what ends it, by kind.
   `pending_entries(serial)` reads what is open without clearing it, split for
   `hil_lock.log_cleanup_failure`: `receipts` (tracked children), `retained`
   (sessions) and `unrecheckable` (unreceipted or unrecognised entries, and an
