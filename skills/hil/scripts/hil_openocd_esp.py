@@ -213,9 +213,10 @@ _AHEAD_NAME = re.compile(r'ahead_[0-9a-f]+\.lock')
 
 
 def _ahead_held(path, state) -> bool:
-    """Whether trackedDir marker `path` may still be held: while its owner flocks it, or while it is
-    not a regular ahead_<hex>.lock file directly in `state` (read from a record anyone may write);
-    False once it is gone or released. Opened non-blocking so a planted FIFO cannot hang the probe."""
+    """Whether trackedDir marker `path` may still be held: while its owner flocks it, while it is
+    not a regular ahead_<hex>.lock file directly in `state` (read from a record anyone may write),
+    or while it cannot be opened, stated or flocked; False once it is gone or released. Opened
+    non-blocking so a planted FIFO cannot hang the probe."""
     if not (isinstance(path, str) and '\0' not in path and _AHEAD_NAME.fullmatch(os.path.basename(path))
             and path == os.path.join(state, os.path.basename(path))):
         return True
@@ -229,10 +230,8 @@ def _ahead_held(path, state) -> bool:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             return True
         fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-    except BlockingIOError:
+    except OSError:          # BlockingIOError (held) or ENOLCK and the like: unproven either way
         return True
-    except OSError:
-        pass
     finally:
         os.close(fd)
     return False
@@ -306,7 +305,8 @@ def pending_entries(serial: str) -> dict:
     """What the USJ with `serial` has open, split for a consumer's cleanup evidence
     (hil_lock.log_cleanup_failure): {'receipts': tracked receipts, which hil_process.recheck
     rechecks, 'retained': session receipts, retained by session_state, 'unrecheckable': what
-    nothing can recheck (an unreceipted, unrecognised or malformed entry, or {'unreadable':
+    nothing can recheck (an unreceipted, unrecognised or malformed entry, a state dir entry whose
+    dir shows nothing open yet, or {'unreadable':
     <record>, 'error': why} for a record that cannot be read)}. Only entries not proven ended, this process's
     unlisted ones (latch) included; reads without clearing, and never raises for the record."""
     record = pending(serial)
@@ -329,7 +329,10 @@ def pending_entries(serial: str) -> dict:
             if not _os_path(r['stateDir']):
                 out['unrecheckable'].append(r)
                 continue
-            for o in hil_process.recheck_dir(r['stateDir'], keep=hil_process._KeepAll())[1]:
+            found = hil_process.recheck_dir(r['stateDir'], keep=hil_process._KeepAll())[1]
+            if not found:      # a live owner whose child has no file there yet
+                out['unrecheckable'].append(r)
+            for o in found:
                 if o not in out['receipts'] and o not in out['unrecheckable']:
                     out['unrecheckable' if 'unrecheckable' in o else 'receipts'].append(o)
             continue

@@ -2520,6 +2520,32 @@ class ReadSecurity(unittest.TestCase):
                 self.assertEqual(seen, [False])
         self.assertTrue(oe.receipt_ended({'stateDir': state, 'what': 'x', 'aheadLock': marker}), 'released, as before')
 
+    def test_a_marker_whose_flock_probe_fails_reads_held(self):
+        """CodeRabbit on #214: an OSError other than BlockingIOError from the flock probe read released,
+        so the empty dir rechecked done and the entry cleared while its owner may still run."""
+        state = oe.hil_process.state_dir(str(self.work), oe.SECURITY_STATE)
+        fd, marker = oe._ahead_marker(state)
+        os.close(fd)
+        self.addCleanup(os.rmdir, state)
+        self.addCleanup(os.unlink, marker)
+        receipt = {'stateDir': state, 'what': 'read_security on /dev/ttyACM3', 'aheadLock': marker}
+        with mock.patch.object(oe.fcntl, 'flock', side_effect=OSError(errno.ENOLCK, 'No locks available')):
+            self.assertFalse(oe.receipt_ended(receipt))
+        self.assertTrue(oe.receipt_ended(receipt), 'released, as before')
+
+    def test_a_live_owners_empty_state_dir_entry_is_unrecheckable_cleanup_evidence(self):
+        """CodeRabbit on #214: a held marker over a dir with no child file yet gave pending_entries
+        nothing, the same as an idle board; the entry itself is listed instead."""
+        state = oe.hil_process.state_dir(str(self.work), oe.SECURITY_STATE)
+        fd, marker = oe._ahead_marker(state)
+        self.addCleanup(os.rmdir, state)
+        self.addCleanup(os.unlink, marker)
+        self.addCleanup(os.close, fd)
+        receipt = {'stateDir': state, 'what': 'read_security on /dev/ttyACM3', 'aheadLock': marker}
+        oe.pending(SERIAL).add([{'receipt': receipt}])
+        self.assertEqual(oe.pending_entries(SERIAL), {'receipts': [], 'retained': [], 'unrecheckable': [receipt]})
+        self.assertEqual(oe.pending(SERIAL).read(), [{'receipt': receipt}], 'read, never cleared')
+
     def test_a_state_dir_the_os_cannot_take_refuses_and_lists_unrecheckable_without_raising(self):
         """CodeRabbit on #214: a listed stateDir with a NUL or a lone surrogate (JSON decodes one) made
         recheck_dir raise out of pending_refusal and pending_entries, whose contract is never to."""
