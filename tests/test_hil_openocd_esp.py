@@ -1392,6 +1392,23 @@ class PendingRegistry(SessionCase):
         self.assertEqual(listed, {'receipt': op.session['receipt']})
         self.assertEqual(oe.pending(SERIAL).read(), [], 'an ended session clears its entry')
 
+    def test_a_receipt_that_could_not_be_written_is_relisted_by_its_record(self):
+        """tinyuf2: with write_receipt failing, the write-ahead path read unreadable for good. A
+        pending session is relisted by its record, the path withdrawn."""
+        real = oe.esp_session.write_receipt
+
+        def write(path, rec):
+            if not rec.get('closed') and rec.get('submitted') == 0 and rec.get('init') is None:
+                raise OSError(errno.ENOSPC, 'No space left on device')
+            return real(path, rec)
+        with mock.patch.object(oe.esp_session, 'write_receipt', write), self.assertRaises(OSError) as cm:
+            self.reset()
+        op = cm.exception.operation
+        (receipt,) = op.receipts
+        self.assertIsInstance(receipt, dict)
+        self.assertEqual(oe.pending(SERIAL).read(), [{'receipt': receipt}])
+        self.reap()
+
     def test_a_server_that_never_spawned_withdraws_its_entry(self):
         real = oe.subprocess.Popen
 
@@ -1496,6 +1513,11 @@ class PendingRecord(unittest.TestCase):
 
 
 class ReceiptKind(unittest.TestCase):
+    def test_recheck_dirs_entries_are_named(self):
+        self.assertIn("another user's state dir /s (uid 7)", oe.describe({'token': 'foreign:/s', 'foreign': '/s',
+                                                                          'uid': 7}))
+        self.assertIn('cannot be rechecked: lock missing', oe.describe({'unrecheckable': 'lock missing', 'files': []}))
+
     def test_each_receipt_is_told_apart_and_named(self):
         tracked = {'token': 't', 'supervisor': {}, 'lock': '/s/l', 'record': '/s/r.json', 'log': '/s/log'}
         native = {'pid': 4, 'startTime': '99', 'log': '/w/openocd.log'}

@@ -92,4 +92,8 @@ def describe(receipt) -> str:
                 f"unwritten, log {receipt.get('log')}")
     if kind == 'session':
         return f'openocd_esp session, receipt {receipt}'
+    if isinstance(receipt, dict) and 'foreign' in receipt:          # hil_process.recheck_dir's entries
+        return f"esptool child in another user's state dir {receipt['foreign']} (uid {receipt.get('uid')})"
+    if isinstance(receipt, dict) and 'unrecheckable' in receipt:
+        return f"esptool child that cannot be rechecked: {receipt['unrecheckable']}"
     return f'unrecognised receipt {receipt!r:.200}'

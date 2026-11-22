@@ -749,6 +749,18 @@ class Session:
                     self.receipt_error = e     # raised by _finish once the operation is built
         return cleanup
 
+    def _relist(self, record):
+        """The receipt file was never written, so its write-ahead path would read unreadable for
+        good: list the session by its in-memory `record` instead (None when it ended, whose
+        latch lists what an unproven end needs), then withdraw the path. Kept as it is when the
+        record cannot take that: the path still refuses."""
+        try:
+            if record is not None:
+                pending(self.serial).add([{'receipt': record}])
+            pending(self.serial).withdraw(self.receipt)
+        except (OSError, hil_lock.PendingRefused):
+            pass
+
     def operation(self, error=None, **extra):
         """hil_flash's Operation of one attempt, the session: argv, the commands sent as its
         script, the log as stdout, rc 0 (all done), 1 (failed), 124 (timed out) or None
@@ -756,6 +768,8 @@ class Session:
         self.tcl.close()    # an outstanding command still completes; the receipt reconnects
         cleanup = self.cleanup()
         receipt = None if cleanup != 'pending' else self.receipt if self.receipt_written else self.rec
+        if self.listed and not self.receipt_written and self.proc is not None:
+            self._relist(receipt)
         rc = None if error is not None else 124 if self.timed_out else 1 if self.failure else 0
         try:
             with open(self.log, errors='replace') as f:
