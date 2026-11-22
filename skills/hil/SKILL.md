@@ -376,10 +376,13 @@ recovery stay the contract's. Linux only.
   (`usj-<serial>.openocd-esp-pending.json`), and every flash, reset and
   `read_security` on that serial refuses while it lists one, whatever process
   asks (`pending_refusal(serial)`, which clears a record whose every entry has
-  since ended). `receipt_kind(receipt)` (`session`, `tracked`, `unreceipted`)
-  and `describe(receipt)` name an entry; an unreceipted one, or an unreadable
-  record, clears only with a reviewed recovery's note
-  (`PendingSessions.clear(note=)`).
+  since ended and never raises for the record: a failure to read or clear it
+  refuses). `latch(serial, op, what)` lists what an Operation left, so a
+  consumer's fake provider lists as this one does. `receipt_kind(receipt)`
+  (`session`, `tracked`, `unreceipted`) and `describe(receipt)` name an entry;
+  an unreceipted one, or an unreadable record, clears only with a reviewed
+  recovery's note (`PendingSessions.clear(note=)`, or the `pending` command
+  below).
   Flash, reset and `read_security` run only for a caller that passes
   `retains_lock=True`, declaring it holds the board lock through each
   operation and logs a session it leaves pending, and never under a CI job (`RUNNER_TRACKING_ID` or
@@ -394,6 +397,11 @@ recovery stay the contract's. Linux only.
   and start time alone, from `hil_openocd_esp_receipt.py`, which loads alone
   for a lock keeper. The module and function docstrings have the
   mechanics, `usj_tty` and `usj_node` included.
+- `scripts/hil_openocd_esp.py pending --serial <usj> [--note TEXT]` prints what
+  a USJ's pending record lists, each entry's kind, name and whether it ended,
+  and the refusal, exiting 1 while one is pending; with `--note`, the reviewed
+  recovery that proved them ended, it clears the record whatever it holds and
+  logs the note in `<record>.cleared.jsonl`.
 - `scripts/hil_openocd_esp.py end --receipt <receipt> [--timeout S]` ends such
   a pending session with `reset run` and a confirmed shutdown, within one
   deadline and never signalling it. It refuses on any doubt: the session (or

@@ -7,8 +7,10 @@ import unittest
 if os.name == 'nt':
     raise unittest.SkipTest('hil_openocd_esp is Linux only')
 
+import contextlib
 import hashlib
 import importlib.util
+import io
 import json
 import shutil
 import signal
@@ -1296,6 +1298,54 @@ class PendingRegistry(SessionCase):
     def test_an_ended_reset_lists_nothing(self):
         self.assertEnded(self.reset())
         self.assertEqual(oe.pending(SERIAL).read(), [])
+
+
+class PendingRecord(unittest.TestCase):
+    """agentrc#214: the record's refusal never raises, latch is public, and `pending` reads or clears it."""
+
+    def setUp(self):
+        fresh_locks(self)
+        self.tracked = {'token': 't', 'supervisor': {}, 'lock': '/s/l', 'record': '/s/r.json', 'log': '/s/log'}
+
+    def cli(self, *argv):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = oe.main(['pending', '--serial', SERIAL, *argv])
+        return rc, json.loads(out.getvalue())
+
+    def test_latch_lists_an_operations_receipts_or_names_what_left_none(self):
+        self.assertEqual(oe.latch(SERIAL, None, 'x'), [])
+        self.assertEqual(oe.latch(SERIAL, read_op(), 'x'), [])
+        op = types.SimpleNamespace(cleanup='pending', receipts=(self.tracked,))
+        self.assertEqual(oe.latch(SERIAL, op, 'x'), [{'receipt': self.tracked}])
+        bare = types.SimpleNamespace(cleanup='unknown', receipts=())
+        self.assertEqual(oe.latch(SERIAL, bare, 'read_security on tty'),
+                         [{'receipt': {'unreceipted': 'read_security on tty: cleanup unknown', 'serial': SERIAL}}])
+        self.assertEqual(len(oe.pending(SERIAL).read()), 2)
+
+    def test_a_record_that_cannot_be_read_or_cleared_refuses_rather_than_raising(self):
+        oe.latch(SERIAL, types.SimpleNamespace(cleanup='pending', receipts=(self.tracked,)), 'x')
+        with mock.patch.object(oe.hil_process, 'recheck', return_value='done'), \
+                mock.patch.object(oe.hil_lock.PendingSessions, 'clear',
+                                  side_effect=oe.hil_lock.PendingRefused('sessions [new] are not ended')):
+            self.assertIn('ask again', oe.pending_refusal(SERIAL))
+        with mock.patch.object(oe.hil_lock.PendingSessions, 'read', side_effect=PermissionError('denied')):
+            self.assertIn('cannot be read or cleared (denied)', oe.pending_refusal(SERIAL))
+
+    def test_the_pending_command_reports_then_clears_only_with_a_note(self):
+        self.assertEqual(self.cli(), (0, {'mode': 'pending', 'serial': SERIAL, 'record': oe.pending(SERIAL).path,
+                                          'outcome': 'clear', 'refusal': '', 'sessions': []}))
+        oe.latch(SERIAL, types.SimpleNamespace(cleanup='unknown', receipts=()), 'read_security on tty')
+        rc, out = self.cli()
+        self.assertEqual((rc, out['outcome']), (1, 'refused'))
+        self.assertEqual(out['sessions'], [{'kind': 'unreceipted', 'describe': oe.describe(
+            {'unreceipted': 'read_security on tty: cleanup unknown', 'serial': SERIAL}), 'ended': False}])
+        rc, out = self.cli('--note', 'esptool child gone: ps on ci.lan, 2026-11-22')
+        self.assertEqual((rc, out['outcome'], len(out['notEnded'])), (0, 'cleared', 1))
+        self.assertEqual(oe.pending(SERIAL).cleared()[-1]['note'], 'esptool child gone: ps on ci.lan, 2026-11-22')
+        self.assertEqual(self.cli()[0], 0)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            oe.main(['pending', '--serial', '../x'])
 
 
 class ReceiptKind(unittest.TestCase):

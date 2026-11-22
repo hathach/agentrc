@@ -181,17 +181,23 @@ def receipt_ended(receipt) -> bool:
 def pending_refusal(serial: str) -> str:
     """Why board access to the USJ with `serial` is refused for what an earlier operation left
     ('' when nothing is pending): a listed receipt not proven ended, or a record that cannot be
-    read. A record whose every entry has since ended is cleared."""
+    read or cleared. A record whose every entry has since ended is cleared. Never raises for the
+    record: a failure to read or clear it is a refusal (a malformed serial stays ValueError)."""
     record = pending(serial)
-    sessions = record.read()
-    if sessions is None:
-        return f'{record} is unreadable: a session may still run on USJ {serial}; {NEEDS_RECOVERY}'
-    left = [e['receipt'] for e in sessions if not receipt_ended(e['receipt'])]
-    if left:
-        return (f'USJ {serial} has {len(left)} operation(s) not proven ended ({record}): '
-                + '; '.join(describe(r) for r in left[:3]) + f'; end them or {NEEDS_RECOVERY}')
-    if sessions:
-        record.clear(lambda e: receipt_ended(e['receipt']))
+    try:
+        sessions = record.read()
+        if sessions is None:
+            return f'{record} is unreadable: a session may still run on USJ {serial}; {NEEDS_RECOVERY}'
+        left = [e['receipt'] for e in sessions if not receipt_ended(e['receipt'])]
+        if left:
+            return (f'USJ {serial} has {len(left)} operation(s) not proven ended ({record}): '
+                    + '; '.join(describe(r) for r in left[:3]) + f'; end them or {NEEDS_RECOVERY}')
+        if sessions:
+            record.clear(lambda e: receipt_ended(e['receipt']))
+    except hil_lock.PendingRefused as e:      # an entry listed since the read: ask again
+        return f'USJ {serial}: {e}; ask again, or end it'
+    except OSError as e:
+        return f'{record} cannot be read or cleared ({e}): a session may still run on USJ {serial}; {NEEDS_RECOVERY}'
     return ''
 
 
@@ -200,15 +206,40 @@ def _refuse_pending(serial):
         raise RuntimeError(why)
 
 
-def _latch(serial, op, what):
-    """List what `op` left not proven ended under `serial`: its receipts, or an unreceipted entry
-    naming `what` when it left none. Returns the entries listed."""
+def latch(serial, op, what):
+    """List what Operation `op` left not proven ended under `serial`: its receipts, or an
+    unreceipted entry naming `what` when it left none; nothing when `op` is None or its cleanup is
+    `done`. Returns the entries listed. Public so a consumer's fake provider lists as this one
+    does; OSError or hil_lock.PendingRefused when the record cannot take them."""
     if op is None or op.cleanup == 'done':
         return []
     entries = [{'receipt': r} for r in op.receipts] or \
         [{'receipt': {'unreceipted': f'{what}: cleanup {op.cleanup}', 'serial': serial}}]
     pending(serial).add(entries)
     return entries
+
+
+def pending_main(serial, note=None):
+    """(rc, result) of the `pending` command: what the record of the USJ with `serial` lists and
+    why access is refused, 0 when nothing is pending and 1 otherwise; with `note`, a separately
+    reviewed recovery's, the record is cleared whatever it holds and logged with the note."""
+    record = pending(serial)
+    result = {'mode': 'pending', 'serial': serial, 'record': str(record)}
+    if note is not None:
+        try:
+            cleared = record.clear(lambda e: receipt_ended(e['receipt']), note=note)
+        except (OSError, hil_lock.PendingRefused) as e:
+            return 1, dict(result, outcome='failed', error=str(e))
+        return 0, dict(result, outcome='cleared', sessions=cleared['sessions'], notEnded=cleared['notEnded'])
+    why = pending_refusal(serial)
+    try:
+        sessions = record.read()
+    except OSError:
+        sessions = None
+    listed = [{'kind': receipt_kind(e['receipt']), 'describe': describe(e['receipt']),
+               'ended': receipt_ended(e['receipt'])} for e in sessions or []]
+    return (1 if why else 0), dict(result, outcome='refused' if why else 'clear', refusal=why,
+                                   sessions=listed if sessions is not None else None)
 
 
 def admit(flasher: dict) -> tuple:
@@ -896,11 +927,11 @@ def read_security(serial: str, *, chip: str, workdir, timeout, retains_lock=Fals
         try:
             op = hil_flash._once(run, argv, env=dict(hil_flash.ESPTOOL_ENV), timeout=timeout)
         except BaseException as e:
-            _latch(serial, getattr(e, 'operation', None), f'read_security on {tty}')
+            latch(serial, getattr(e, 'operation', None), f'read_security on {tty}')
             raise
     try:
         if op.cleanup != 'done':
-            _latch(serial, op, f'read_security on {tty}')
+            latch(serial, op, f'read_security on {tty}')
             raise RuntimeError(f'esptool_session on {tty}: cleanup {op.cleanup}, its child is not proven ended')
         lines = hil_process.cmd_stdout_text(op.stdout).strip().splitlines()
         try:
@@ -1160,9 +1191,9 @@ def _latched(flasher, work, *, segments=None, **kw):
         if hasattr(e, 'operation'):
             if segments is not None:
                 e.operation.segments = segments
-            _latch(serial, e.operation, f'openocd_esp on USJ {serial}')
+            latch(serial, e.operation, f'openocd_esp on USJ {serial}')
         raise
-    _latch(serial, op, f'openocd_esp on USJ {serial}')
+    latch(serial, op, f'openocd_esp on USJ {serial}')
     return op
 
 
@@ -1287,13 +1318,25 @@ def _end_owned(receipt, deadline) -> tuple:
 
 def main(argv=None):
     p = argparse.ArgumentParser(description='End a pending openocd_esp session from its receipt '
-                                            '(end_session); one JSON object on stdout.')
+                                            "(end_session), or read or clear a USJ's pending record; "
+                                            'one JSON object on stdout.')
     sub = p.add_subparsers(dest='mode', required=True)
     e = sub.add_parser('end', help='reset run and shut down the session a receipt names')
     e.add_argument('--receipt', required=True, metavar='FILE')
     e.add_argument('--timeout', type=float, default=END_TIMEOUT, metavar='S',
                    help=f'one bound on the whole end, in seconds (default {END_TIMEOUT})')
+    q = sub.add_parser('pending', help="what a USJ's pending record lists and why access is refused; with --note, "
+                                       'clear it after a separately reviewed recovery')
+    q.add_argument('--serial', required=True, help='the USJ serial, as the board registry uid')
+    q.add_argument('--note', help='the reviewed recovery that proved the listed operations ended')
     a = p.parse_args(argv)
+    if a.mode == 'pending':
+        try:
+            rc, result = pending_main(a.serial, a.note)
+        except ValueError as err:
+            p.error(f'--serial {a.serial}: {err}')
+        print(json.dumps(result))
+        return rc
     if not (0 < a.timeout < float('inf')):
         p.error('--timeout must be a finite positive number of seconds')
     try:
