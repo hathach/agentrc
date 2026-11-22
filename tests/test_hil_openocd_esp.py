@@ -1364,6 +1364,16 @@ class PendingRegistry(SessionCase):
             self.assertEqual(cm.exception.operation.segments, segments)
             self.assertEqual(cm.exception.operation.receipts, (oe.pending(SERIAL).read()[0]['receipt'],))
 
+    def test_a_pending_flash_the_record_cannot_list_carries_its_segments(self):
+        """CodeRabbit on #214: the Operation a failed success-path latch raised lacked `.segments`."""
+        op, segments = types.SimpleNamespace(cleanup='pending', receipts=('/w/receipt.json',)), ({'offset': 0},)
+        with mock.patch.object(oe, '_run', lambda *a, **k: op), \
+                mock.patch.object(oe.hil_lock.PendingSessions, 'add', side_effect=OSError(errno.ENOSPC, 'full')), \
+                self.assertRaises(OSError) as cm:
+            oe._latched(BOARD, 'flash', segments=segments)
+        self.assertIs(cm.exception.operation, op)
+        self.assertEqual(op.segments, segments)
+
     def test_a_session_the_record_cannot_list_carries_its_operation_and_refuses_until_listed(self):
         """agentrc#214: an ENOSPC from the record's add loses neither the session nor the refusal."""
         op = types.SimpleNamespace(cleanup='pending', receipts=('/w/receipt.json',))
@@ -2509,6 +2519,20 @@ class ReadSecurity(unittest.TestCase):
                 self.assertFalse(t.is_alive(), 'the probe hung')
                 self.assertEqual(seen, [False])
         self.assertTrue(oe.receipt_ended({'stateDir': state, 'what': 'x', 'aheadLock': marker}), 'released, as before')
+
+    def test_a_state_dir_the_os_cannot_take_refuses_and_lists_unrecheckable_without_raising(self):
+        """CodeRabbit on #214: a listed stateDir with a NUL or a lone surrogate (JSON decodes one) made
+        recheck_dir raise out of pending_refusal and pending_entries, whose contract is never to."""
+        for state in ('/tmp/x\0y', '/tmp/x\ud800y'):
+            receipt = {'stateDir': state, 'what': 'read_security on /dev/ttyACM3'}
+            for r in (receipt, {**receipt, 'aheadLock': f'{state}/ahead_ab.lock'}):
+                with self.subTest(receipt=r):
+                    fresh_locks(self)
+                    oe.pending(SERIAL).add([{'receipt': r}])
+                    self.assertFalse(oe.receipt_ended(r))
+                    self.assertIn('not proven ended', oe.pending_refusal(SERIAL))
+                    self.assertEqual(oe.pending_entries(SERIAL), {'receipts': [], 'retained': [], 'unrecheckable': [r]})
+                    self.assertEqual(oe.pending(SERIAL).read(), [{'receipt': r}])
 
     def test_a_marker_is_0644_whatever_the_umask(self):
         state = oe.hil_process.state_dir(str(self.work), oe.SECURITY_STATE)

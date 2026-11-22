@@ -191,10 +191,22 @@ def receipt_ended(receipt) -> bool:
     if kind == 'tracked':
         return _recheckable(receipt) and hil_process.recheck(receipt) == 'done'
     if kind == 'trackedDir':      # tidying nothing: a receipt listed apart rechecks from those files
+        if not _os_path(receipt['stateDir']):
+            return False          # no dir to recheck: it clears only with a reviewed recovery's note
         if 'aheadLock' in receipt and _ahead_held(receipt['aheadLock'], receipt['stateDir']):
             return False          # a live owner, which may not have started its child in the dir yet
         return hil_process.recheck_dir(receipt['stateDir'], keep=hil_process._KeepAll())[0] == 'done'
     return False
+
+
+def _os_path(path: str) -> bool:
+    """Whether a path read from a record reaches the OS without raising: no NUL, and the filesystem
+    encoding takes it (JSON decodes a lone surrogate)."""
+    try:
+        os.fsencode(path)
+    except UnicodeEncodeError:
+        return False
+    return '\0' not in path
 
 
 _AHEAD_NAME = re.compile(r'ahead_[0-9a-f]+\.lock')
@@ -314,6 +326,9 @@ def pending_entries(serial: str) -> dict:
         if receipt_ended(r):
             continue
         if receipt_kind(r) == 'trackedDir':      # its open operations, as recheck_dir finds them
+            if not _os_path(r['stateDir']):
+                out['unrecheckable'].append(r)
+                continue
             for o in hil_process.recheck_dir(r['stateDir'], keep=hil_process._KeepAll())[1]:
                 if o not in out['receipts'] and o not in out['unrecheckable']:
                     out['unrecheckable' if 'unrecheckable' in o else 'receipts'].append(o)
@@ -1403,7 +1418,8 @@ def _held_run(hold, serial, what, work, partial, segments=None, ahead=None):
     work() had its result, before it returned) takes partial(), the Operation work() recorded
     so far, or None. A latch that fails raises carrying the Operation (latch). `ahead`, a
     write-ahead entry's receipt, is withdrawn once the Operation is listed: from there its own
-    receipts stand for it."""
+    receipts stand for it. A returned or raised Operation carries `segments` when given, before
+    its latch can fail."""
     try:
         try:
             hold.deliver()
@@ -1420,6 +1436,8 @@ def _held_run(hold, serial, what, work, partial, segments=None, ahead=None):
         if failed is not None:
             _withdraw_ahead(serial, ahead)
         raise
+    if segments is not None:
+        op.segments = segments
     latch(serial, op, what)
     _withdraw_ahead(serial, ahead)
     if op.cleanup == 'done':
@@ -1456,8 +1474,6 @@ def _latched(flasher, work, *, segments=None, **kw):
     try:
         op = _held_run(hold, serial, f'openocd_esp on USJ {serial}', lambda: _run(flasher, work, box=box, **kw),
                        lambda: getattr(box[0], 'finished', None) if box else None, segments)
-        if segments is not None:
-            op.segments = segments
         return op
     except BaseException as e:
         op = getattr(e, 'operation', None) or op
