@@ -13,6 +13,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import re
 import shutil
 import signal
 import socket
@@ -301,9 +302,12 @@ class FakeBus:
             p.start()
             test.addCleanup(p.stop)
 
-    def add(self, busport, serial=SERIAL, *, vid_pid=oe.USJ_VID_PID, bus=5, dev=14, udev=True, sysfs=True):
+    def add(self, busport, serial=SERIAL, *, vid_pid=oe.USJ_VID_PID, bus=5, dev=14, udev=True, sysfs=True,
+            product=None):
         d = self.sys / busport
         d.mkdir()
+        if product is not None:
+            (d / 'product').write_text(f'{product}\n')
         for name, value in (('idVendor', vid_pid[0]), ('idProduct', vid_pid[1]), ('busnum', bus), ('devnum', dev)):
             (d / name).write_text(f'{value}\n')
         if serial is not None and sysfs:
@@ -449,6 +453,25 @@ class UsjLocation(unittest.TestCase):
         self.bus.add('5-3.1', None, dev=9)
         with self.assertRaisesRegex(RuntimeError, r'cannot rule out 5-3\.1'):
             oe.usj_location(SERIAL)
+
+    def test_an_app_on_espressifs_default_ids_without_a_serial_is_ruled_out(self):
+        """ci.lan: an ESP32-S3 running an Arduino image enumerates as 303a:1001 with no serial."""
+        self.bus.add('5-3.4', product=oe.USJ_PRODUCT)
+        self.bus.add('11-1.3', None, dev=9, product='ESP32S3_DEV')
+        self.assertEqual(oe.usj_location(SERIAL), '5-3.4')
+        for busport, kw in (('11-1.4', {'product': oe.USJ_PRODUCT}),     # the USJ's product, its serial unread
+                            ('11-1.5', {}),                                 # no product to tell
+                            ('11-1.6', {'product': 'ESP32S3_DEV', 'sysfs_serial': True})):  # a serial it did not answer
+            with self.subTest(busport=busport):
+                d = self.bus.add(busport, None, dev=10 + len(busport), product=kw.get('product'))
+                if kw.get('sysfs_serial'):
+                    os.mkfifo(d / 'serial')          # present but unanswered (a read would block)
+                with mock.patch.object(oe.usb_observe, 'read_sysfs',
+                                       lambda path, *a: None if path.endswith('/serial') else
+                                       Path(path).read_text().strip() if os.path.exists(path) else None), \
+                        self.assertRaisesRegex(RuntimeError, f'cannot rule out {re.escape(busport)}'):
+                    oe.usj_location(SERIAL)
+                shutil.rmtree(d)
 
     def test_a_roster_port_is_checked_alone(self):
         self.bus.add('5-3.4')
@@ -1329,6 +1352,24 @@ class PendingRegistry(SessionCase):
         self.assertEqual(oe.pending(SERIAL).read(), [{'receipt': '/w/receipt.json'}])
         self.assertEqual(oe._UNLISTED, {})
 
+    def test_an_interrupt_after_the_session_is_built_still_lists_it(self):
+        """agentrc#214: a SIGINT landing once _finish has the session's Operation, before _run returns
+        it, takes the Operation from the session (box) and lists it."""
+        old = signal.signal(signal.SIGINT, signal.default_int_handler)
+        self.addCleanup(signal.signal, signal.SIGINT, old)
+        real = oe._finish
+
+        def finish(*a, **k):
+            op = real(*a, **k)
+            if 'error' not in k and len(a) == 1:
+                signal.raise_signal(signal.SIGINT)
+            return op
+        with mock.patch.object(oe, '_finish', finish), self.assertRaises(KeyboardInterrupt) as cm:
+            self.reset(script={'reset run': 'event:reset-assert-post'})
+        op = cm.exception.operation
+        self.assertPending(op)
+        self.assertEqual(oe.pending(SERIAL).read(), [{'receipt': op.session['receipt']}])
+
     def test_an_ended_reset_lists_nothing(self):
         self.assertEnded(self.reset())
         self.assertEqual(oe.pending(SERIAL).read(), [])
@@ -2170,6 +2211,47 @@ class ReadSecurity(unittest.TestCase):
                 self.assertIn('not proven ended', oe.pending_refusal(SERIAL))
                 self.assertEqual(oe.pending(SERIAL).read(), [{'receipt': receipt}])
         self.assertEqual(list(self.work.iterdir()), [])
+
+    def test_an_interrupt_as_the_child_returns_is_listed_with_its_receipt(self):
+        """agentrc#214: the earlier window, a SIGINT as the runner's result becomes the attempt."""
+        receipt = {'token': 'r1', 'lock': '/state/hil_op_r1.lock'}
+        old = signal.signal(signal.SIGINT, signal.default_int_handler)
+        self.addCleanup(signal.signal, signal.SIGINT, old)
+        real = oe.hil_flash._record
+
+        def record(*a):
+            signal.raise_signal(signal.SIGINT)
+            return real(*a)
+
+        def run(argv, **kw):
+            r = subprocess.CompletedProcess(argv, 0, self.line(sec()), None)
+            r.cleanup, r.receipt = 'pending', receipt
+            return r
+        with mock.patch.object(oe.hil_flash, '_record', record), self.assertRaises(KeyboardInterrupt) as cm:
+            oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=30, retains_lock=True, run=run)
+        self.assertEqual(cm.exception.operation.receipts, (receipt,))
+        self.assertEqual(oe.pending(SERIAL).read(), [{'receipt': receipt}])
+        self.assertEqual(list(self.work.iterdir()), [])
+
+    def test_an_interrupt_after_the_operation_is_built_is_listed_from_its_attempts(self):
+        receipt = {'token': 'r1', 'lock': '/state/hil_op_r1.lock'}
+        old = signal.signal(signal.SIGINT, signal.default_int_handler)
+        self.addCleanup(signal.signal, signal.SIGINT, old)
+        real = oe.hil_flash._once
+
+        def once(*a, **k):
+            op = real(*a, **k)
+            signal.raise_signal(signal.SIGINT)      # past _attempt's hold, before _held_run's
+            return op
+
+        def run(argv, **kw):
+            r = subprocess.CompletedProcess(argv, 0, self.line(sec()), None)
+            r.cleanup, r.receipt = 'pending', receipt
+            return r
+        with mock.patch.object(oe.hil_flash, '_once', once), self.assertRaises(KeyboardInterrupt) as cm:
+            oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=30, retains_lock=True, run=run)
+        self.assertEqual(cm.exception.operation.receipts, (receipt,))
+        self.assertEqual(oe.pending(SERIAL).read(), [{'receipt': receipt}])
 
     def test_an_interrupt_during_the_childs_run_reaches_it(self):
         old = signal.signal(signal.SIGINT, signal.default_int_handler)

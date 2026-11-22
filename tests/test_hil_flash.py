@@ -27,6 +27,7 @@ import re
 import secrets
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -528,6 +529,39 @@ class Record(unittest.TestCase):
             op = hf.reset_jlink(JLINK, timeout=30, crash_retries=2,
                                 run=self.answers((139, 'done', None), (139, 'unknown', None), (0, 'done', None)))
         self.assertEqual(([a.cleanup for a in op.attempts], op.cleanup), (['done', 'unknown', 'done'], 'unknown'))
+
+    def test_an_interrupt_as_a_run_returns_is_held_until_it_is_recorded(self):
+        """agentrc#214: a SIGINT landing as the runner hands back a pending result (here at _record's
+        entry) is delivered once the attempt, its cleanup and receipt, is recorded on .operation."""
+        old = signal.signal(signal.SIGINT, signal.default_int_handler)
+        self.addCleanup(signal.signal, signal.SIGINT, old)
+        real = hf._record
+
+        def record(*a):
+            signal.raise_signal(signal.SIGINT)
+            return real(*a)
+
+        def run(cmd, **kw):
+            r = subprocess.CompletedProcess(cmd, 0, '', None)
+            r.cleanup, r.receipt = 'pending', 'r1'
+            return r
+        attempts = []
+        with mock.patch.object(hf, '_record', record), self.assertRaises(KeyboardInterrupt) as cm:
+            hf._once(run, ['esptool'], attempts, timeout=5)
+        self.assertEqual((cm.exception.operation.cleanup, cm.exception.operation.receipts), ('pending', ('r1',)))
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(signal.getsignal(signal.SIGINT), signal.default_int_handler, 'the hold is released')
+
+    def test_an_interrupt_during_a_run_still_reaches_it(self):
+        old = signal.signal(signal.SIGINT, signal.default_int_handler)
+        self.addCleanup(signal.signal, signal.SIGINT, old)
+
+        def run(cmd, **kw):
+            signal.raise_signal(signal.SIGINT)
+            raise AssertionError('not interrupted')
+        with self.assertRaises(KeyboardInterrupt) as cm:
+            hf._once(run, ['esptool'], timeout=5)
+        self.assertTrue(cm.exception.operation.attempts[0].interrupted)
 
     def test_no_crash_rerun_over_a_pending_session(self):
         with tempfile.TemporaryDirectory() as d, contextlib.chdir(d), contextlib.redirect_stdout(io.StringIO()) as out:

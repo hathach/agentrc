@@ -13,8 +13,10 @@ but compares the serial only after opening (libusb_helper.c:272-286), so the ser
 would open every 303a:1001 ahead of the board's in libusb order. Not convoy-safe even pinned:
 esp_usb_jtag_revive_device (esp_usb_jtag.c:313-350, on a transfer error) finds the device
 again through jtag_libusb_find_device, which opens every 303a:1001 to read its serial and
-ignores the location (libusb_helper.c:500-540). openocd-esp32 source citations are at tag
-v0.12.0-esp32-20260703.
+ignores the location (libusb_helper.c:500-540). A 303a:1001 whose serial cannot be read is not
+ruled out, since it may hold the board's serial, unless it has no serial at all and a product that
+is not the USJ's (USJ_PRODUCT): an app on Espressif's default ids, which no serial compare can
+match. openocd-esp32 source citations are at tag v0.12.0-esp32-20260703.
 
 Session: one openocd server per operation, started with `noinit` in its own session (the
 terminal's SIGINT never reaches it) and driven over a Tcl port that must first answer this
@@ -104,6 +106,9 @@ hil_lock = hil_load.load_file('skills/hil/scripts/hil_lock.py')
 VERIFIED_OPENOCD = 'v0.12.0-esp32-20260703'
 OPENOCD_ENV = 'HIL_OPENOCD_ESP'
 USJ_VID_PID = ('303a', '1001')       # interface/esp_usb_jtag.cfg's `adapter usb vid_pid`
+# The ROM's product string of every chip's USB-Serial/JTAG, which always reports its MAC as a serial;
+# an app reusing Espressif's default 303a:1001 (TinyUSB's, Arduino's) reports its own product.
+USJ_PRODUCT = 'USB JTAG/serial debug unit'
 # adapter.c:324-331 warns about a location of 16 characters and truncates a longer one
 USB_LOCATION_MAX = 15
 
@@ -397,6 +402,16 @@ def _attr(d, name):
         return f.read().strip()
 
 
+def _not_a_usj(d) -> bool:
+    """Whether the 303a:1001 at sysfs dir `d`, whose serial could not be read, is ruled out: it
+    has no serial at all (no `serial` attribute, so no string openocd could match) and a readable
+    product that is not the USJ's, i.e. an app on Espressif's default ids. Anything unsure is not."""
+    if os.path.lexists(os.path.join(d, 'serial')):
+        return False                  # a serial it did not answer: may be any USJ
+    product = usb_observe.read_sysfs(os.path.join(d, 'product'))
+    return product is not None and product != USJ_PRODUCT
+
+
 def _usj_walk(serial: str) -> list:
     found, unknown = [], []
     for d in sorted(glob.glob(os.path.join(usb_observe.SYS_USB_DEVICES, '*-*'))):
@@ -417,7 +432,8 @@ def _usj_walk(serial: str) -> list:
         if sn is None:
             sn = usb_observe.read_sysfs(os.path.join(d, 'serial'))
         if sn is None:
-            unknown.append(busport)
+            if not _not_a_usj(d):
+                unknown.append(busport)
         elif sn == serial:            # openocd compares exactly (libusb_helper.c string_descriptor_equal)
             found.append((busport, bus, dev))
     if unknown:
@@ -744,7 +760,7 @@ def _finish(s, error=None, **info):
     hold = hil_process.InterruptHold()
     op = None
     try:
-        op = s.operation(error, **info)
+        op = s.finished = s.operation(error, **info)
     finally:
         s.release()
         try:
@@ -767,12 +783,14 @@ def _workdir(workdir) -> str:
     return path
 
 
-def _run(flasher: dict, work, *, workdir, timeout, openocd=None, record=None):
+def _run(flasher: dict, work, *, workdir, timeout, openocd=None, record=None, box=None):
     """Admit, resolve and start a session in a new directory under `workdir`, init it, run
     `work(session)` within `timeout` seconds, then end it as the module docstring says; `record`
     joins the operation's `session`. Refusals raise before anything starts; an exception after
     the start carries `.operation`. The USJ is resolved and the server started no earlier than
-    BOOT_SETTLE seconds after the call; admission runs inside that window, `timeout` after it."""
+    BOOT_SETTLE seconds after the call; admission runs inside that window, `timeout` after it.
+    `box`, a caller's empty list, gets the Session before it starts: its `finished` is the
+    Operation once built (_finish), for a caller whose interrupt landed after that."""
     t0 = time.monotonic()
     chip, cfgs = admit(flasher)
     workdir = _workdir(workdir)
@@ -784,6 +802,8 @@ def _run(flasher: dict, work, *, workdir, timeout, openocd=None, record=None):
     port, token = esp_session.free_ports(1)[0], secrets.token_hex(8)
     s = Session(server_argv(tool, cfgs, location, flasher['uid'], tcl_port=port, token=token,
                             log=os.path.join(out, 'openocd.log')), out, port, token)
+    if box is not None:
+        box.append(s)
     info = {'openocd': tool['banner'], 'scripts': tool['scripts'], 'location': location, 'serial': flasher['uid'],
             **(record or {})}
     try:
@@ -1009,8 +1029,10 @@ def read_security(serial: str, *, chip: str, workdir, timeout, retains_lock=Fals
                 json.dump([{'op': 'security'}, *ops], f)
             argv = [python, '-B', ESPTOOL_SESSION, '--port', tty, '--chip', chip, '--baud', str(baud),
                     '--after', 'hard-reset', ops_file]
-            op = _held_run(hold, serial, what, lambda: hil_flash._once(run, argv, env=dict(hil_flash.ESPTOOL_ENV),
-                                                                        timeout=timeout))
+            attempts = []
+            op = _held_run(hold, serial, what,
+                           lambda: hil_flash._once(run, argv, attempts, env=dict(hil_flash.ESPTOOL_ENV), timeout=timeout),
+                           lambda: hil_flash.Operation(attempts) if attempts else None)
     finally:
         hold.release()
     try:
@@ -1262,11 +1284,13 @@ def admit_read(read) -> dict:
     return admit_security(read.security)
 
 
-def _held_run(hold, serial, what, work, segments=None):
+def _held_run(hold, serial, what, work, partial, segments=None):
     """work()'s Operation, with what it left listed under `serial` (latch), a raised one's
     included. SIGINT and SIGTERM reach work() through `hold` (hil_process.InterruptHold) and are
     deferred again from the first instruction after it, so none unwinds before the latch; the
-    caller's release() delivers them. A latch that fails raises carrying the Operation (latch)."""
+    caller's release() delivers them. An exception without `.operation` (one that landed after
+    work() had its result, before it returned) takes partial(), the Operation work() recorded
+    so far, or None. A latch that fails raises carrying the Operation (latch)."""
     try:
         try:
             hold.deliver()
@@ -1275,6 +1299,8 @@ def _held_run(hold, serial, what, work, segments=None):
             hold.deferring = True       # an attribute store, no interrupt check: deferred from here
             hold.rearm()
     except BaseException as e:
+        if getattr(e, 'operation', None) is None and (found := partial()) is not None:
+            e.operation = found
         if (failed := getattr(e, 'operation', None)) is not None and segments is not None:
             failed.segments = segments
         latch(serial, failed, what)
@@ -1289,9 +1315,10 @@ def _latched(flasher, work, *, segments=None, **kw):
     admit(flasher)
     serial = flasher['uid']
     _refuse_pending(serial)
-    hold = hil_process.InterruptHold()
+    hold, box = hil_process.InterruptHold(), []
     try:
-        return _held_run(hold, serial, f'openocd_esp on USJ {serial}', lambda: _run(flasher, work, **kw), segments)
+        return _held_run(hold, serial, f'openocd_esp on USJ {serial}', lambda: _run(flasher, work, box=box, **kw),
+                         lambda: getattr(box[0], 'finished', None) if box else None, segments)
     finally:
         hold.release()
 

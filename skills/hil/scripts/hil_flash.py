@@ -142,14 +142,29 @@ class Operation(subprocess.CompletedProcess):
 
 
 def _attempt(attempts: list, run, cmd, script=None, **kw) -> subprocess.CompletedProcess:
+    """run(cmd), recorded in `attempts`. SIGINT and SIGTERM reach the run, and are held from its
+    return (or raise) until it is recorded (hil_process.InterruptHold): an interrupt never takes
+    a runner's cleanup and receipt with it. One delivered after carries the operation so far."""
+    hold = hil_process.InterruptHold()
     try:
-        ret = run(cmd, **kw)
-    except BaseException as e:
-        partial = subprocess.CompletedProcess(cmd, None, getattr(e, 'stdout', None), getattr(e, 'stderr', None))
-        attempts.append(_record(cmd, script, partial, e))
-        e.operation = Operation(attempts)
-        raise
-    attempts.append(_record(cmd, script, ret, None))
+        try:
+            hold.deliver()
+            ret = run(cmd, **kw)
+        except BaseException as e:
+            hold.deferring = True       # an attribute store, no interrupt check: deferred from here
+            partial = subprocess.CompletedProcess(cmd, None, getattr(e, 'stdout', None), getattr(e, 'stderr', None))
+            attempts.append(_record(cmd, script, partial, e))
+            e.operation = Operation(attempts)
+            raise
+        hold.deferring = True
+        attempts.append(_record(cmd, script, ret, None))
+    finally:
+        try:
+            hold.release()
+        except BaseException as late:
+            if attempts and getattr(late, 'operation', None) is None:
+                late.operation = Operation(attempts)
+            raise
     return ret
 
 
@@ -158,8 +173,10 @@ def _args(flasher: dict) -> list:
     return shlex.split(flasher.get('args') or '')
 
 
-def _once(run, cmd, **kw) -> Operation:
-    attempts = []
+def _once(run, cmd, attempts=None, **kw) -> Operation:
+    """One attempt's Operation; `attempts`, a caller's empty list, holds the attempt once it is
+    recorded, so a caller holding interrupts reads it after one cut this short."""
+    attempts = [] if attempts is None else attempts
     _attempt(attempts, _runner(run), cmd, **kw)
     return Operation(attempts)
 
