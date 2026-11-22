@@ -191,9 +191,38 @@ def receipt_ended(receipt) -> bool:
     if kind == 'tracked':
         return _recheckable(receipt) and hil_process.recheck(receipt) == 'done'
     if kind == 'trackedDir':      # tidying nothing: a receipt listed apart rechecks from those files
-        if isinstance(receipt.get('aheadLock'), str) and hil_process._held_lock(receipt['aheadLock']):
+        if 'aheadLock' in receipt and _ahead_held(receipt['aheadLock'], receipt['stateDir']):
             return False          # a live owner, which may not have started its child in the dir yet
         return hil_process.recheck_dir(receipt['stateDir'], keep=hil_process._KeepAll())[0] == 'done'
+    return False
+
+
+_AHEAD_NAME = re.compile(r'ahead_[0-9a-f]+\.lock')
+
+
+def _ahead_held(path, state) -> bool:
+    """Whether trackedDir marker `path` may still be held: while its owner flocks it, or while it is
+    not a regular ahead_<hex>.lock file directly in `state` (read from a record anyone may write);
+    False once it is gone or released. Opened non-blocking so a planted FIFO cannot hang the probe."""
+    if not (isinstance(path, str) and '\0' not in path and _AHEAD_NAME.fullmatch(os.path.basename(path))
+            and path == os.path.join(state, os.path.basename(path))):
+        return True
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return True
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
     return False
 
 
@@ -1035,6 +1064,7 @@ def _ahead_marker(state):
     path = os.path.join(state, f'ahead_{secrets.token_hex(8)}.lock')
     fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644)
     try:
+        os.fchmod(fd, 0o644)          # umask-proof
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BaseException:
         os.close(fd)
@@ -1048,7 +1078,8 @@ def _drop_marker(marker):
     if marker is not None:
         with contextlib.suppress(OSError):
             os.unlink(marker[1])
-        os.close(marker[0])
+        with contextlib.suppress(OSError):
+            os.close(marker[0])
 
 
 def read_security(serial: str, *, chip: str, workdir, timeout, retains_lock=False, esptool: str = 'esptool',
@@ -1113,8 +1144,10 @@ def read_security(serial: str, *, chip: str, workdir, timeout, retains_lock=Fals
         op = getattr(e, 'operation', None) or op
         raise
     finally:
-        _drop_marker(marker)
-        _release(hold, op)
+        try:
+            _drop_marker(marker)
+        finally:
+            _release(hold, op)
     try:
         if op.cleanup != 'done':
             raise RuntimeError(f'esptool_session on {tty}: cleanup {op.cleanup}, its child is not proven ended')

@@ -2473,7 +2473,7 @@ class ReadSecurity(unittest.TestCase):
         self.addCleanup(os.close, held_fd)
         what = 'read_security on /dev/ttyACM3'
         for receipt in ({'stateDir': state, 'what': what, 'aheadLock': marker},
-                        {'stateDir': state, 'what': what, 'aheadLock': f'{state}/ahead_gone.lock'},
+                        {'stateDir': state, 'what': what, 'aheadLock': f'{state}/ahead_00ff.lock'},
                         {'stateDir': state, 'what': what}):
             with self.subTest(receipt=receipt):
                 oe.pending(SERIAL).add([{'receipt': receipt}])
@@ -2484,6 +2484,42 @@ class ReadSecurity(unittest.TestCase):
         os.unlink(marker)
         os.unlink(held)
         os.rmdir(state)
+
+    def test_a_marker_that_is_not_a_regular_ahead_file_in_its_state_dir_keeps_refusing_without_hanging(self):
+        """The record is anyone's to write: a FIFO, a link, a path outside the state dir, another name,
+        a NUL or a non-str reads not ended, and the probe neither blocks on the FIFO nor raises."""
+        state = oe.hil_process.state_dir(str(self.work), oe.SECURITY_STATE)
+        fifo, outside, link = f'{state}/ahead_ab.lock', str(self.work / 'ahead_cd.lock'), f'{state}/ahead_ef.lock'
+        for f in (fifo, outside):
+            os.mkfifo(f)
+            self.addCleanup(os.unlink, f)
+            self.addCleanup(lambda f=f: os.close(os.open(f, os.O_RDWR | os.O_NONBLOCK)))   # frees a blocked open
+        fd, marker = oe._ahead_marker(state)
+        os.close(fd)
+        self.addCleanup(os.unlink, marker)
+        os.symlink(marker, link)
+        self.addCleanup(os.unlink, link)
+        for lock in (fifo, outside, link, f'{state}/other.lock', f'{state}/ahead_ab\0.lock', 7, None):
+            with self.subTest(lock=lock):
+                seen = []
+                t = threading.Thread(target=lambda: seen.append(oe.receipt_ended(
+                    {'stateDir': state, 'what': 'read_security on /dev/ttyACM3', 'aheadLock': lock})), daemon=True)
+                t.start()
+                t.join(5)
+                self.assertFalse(t.is_alive(), 'the probe hung')
+                self.assertEqual(seen, [False])
+        self.assertTrue(oe.receipt_ended({'stateDir': state, 'what': 'x', 'aheadLock': marker}), 'released, as before')
+
+    def test_a_marker_is_0644_whatever_the_umask(self):
+        state = oe.hil_process.state_dir(str(self.work), oe.SECURITY_STATE)
+        old = os.umask(0o077)
+        try:
+            fd, marker = oe._ahead_marker(state)
+        finally:
+            os.umask(old)
+        os.close(fd)
+        self.addCleanup(os.unlink, marker)
+        self.assertEqual(stat.S_IMODE(os.lstat(marker).st_mode), 0o644)
 
     def test_a_pending_read_lists_its_receipt_alone_and_checks_the_dir_without_tidying(self):
         """Codex on tinyuf2: checking the trackedDir tidied the done files its own listed receipt

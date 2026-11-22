@@ -392,7 +392,8 @@ recovery stay the contract's. Linux only.
   clears it. The default security read lists its run_tracked state dir the
   same way (a `trackedDir` entry), ended once its owner no longer holds the
   marker lock it took before listing it (`aheadLock`, so the dir still empty
-  before the child starts is not done) and `recheck_dir` finds every
+  before the child starts is not done; one that is not a regular
+  `ahead_<hex>.lock` file in that dir keeps it refusing) and `recheck_dir` finds every
   operation there done (checked without tidying, so a receipt listed apart
   keeps its files), and withdrawn once the child's own receipt is listed. Each refusal names what ends it, by kind.
   On a shared host that clear runs only as the user who owns the state dir and
