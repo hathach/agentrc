@@ -2427,7 +2427,9 @@ class ReadSecurity(unittest.TestCase):
         with mock.patch.object(oe.hil_process, 'run_tracked', tracked):
             oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=30, retains_lock=True)
         state = str(self.work / oe.SECURITY_STATE)
-        self.assertEqual(seen, [[{'receipt': {'stateDir': state, 'what': 'read_security on /dev/ttyACM3'}}]])
+        ((entry,),) = seen
+        self.assertRegex(entry['receipt'].pop('aheadLock'), rf'^{re.escape(state)}/ahead_[0-9a-f]{{16}}\.lock$')
+        self.assertEqual(entry, {'receipt': {'stateDir': state, 'what': 'read_security on /dev/ttyACM3'}})
         self.assertEqual(oe.pending(SERIAL).read(), [], 'a read that ended clears it')
         left = {'token': 't', 'supervisor': {}, 'lock': f'{state}/hil_op_t.lock', 'record': f'{state}/t.json'}
         oe.pending(SERIAL).add([{'receipt': {'stateDir': state, 'what': 'read_security on /dev/ttyACM3'}}])
@@ -2438,6 +2440,50 @@ class ReadSecurity(unittest.TestCase):
             self.assertEqual(oe.pending_entries(SERIAL)['receipts'], [left])
         self.assertEqual(oe.pending_refusal(SERIAL), '')
         (self.work / oe.SECURITY_STATE).rmdir()
+
+    def test_a_live_owners_state_dir_entry_survives_a_status_read_before_its_child_starts(self):
+        """Codex on #574: between listing the empty state dir and run_tracked's first file, an unlocked
+        `pending` read found it done and cleared it, so an owner dying before its latch left the
+        started child unlisted. The owner's marker lock keeps the entry until the child's receipt
+        stands for it; the marker goes with the read."""
+        seen = []
+
+        def tracked(cmd, cwd=None, **kw):
+            seen.append((oe.pending_main(SERIAL), oe.pending(SERIAL).read()))
+            r = subprocess.CompletedProcess(cmd, 0, self.line(sec()), None)
+            r.cleanup, r.receipt = 'done', None
+            return r
+        with mock.patch.object(oe.hil_process, 'run_tracked', tracked):
+            oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=30, retains_lock=True)
+        (((rc, result), listed),) = seen
+        state = str(self.work / oe.SECURITY_STATE)
+        self.assertEqual((rc, result['outcome'], [s['ended'] for s in result['sessions']]), (1, 'refused', [False]))
+        self.assertIn(f'esptool children in state dir {state}', result['refusal'])
+        self.assertEqual([e['receipt']['stateDir'] for e in listed], [state])
+        self.assertEqual(oe.pending(SERIAL).read(), [], 'a read that ended clears it')
+        (self.work / oe.SECURITY_STATE).rmdir()      # the marker is gone too
+
+    def test_a_state_dir_entry_whose_owner_died_before_its_child_or_lacks_a_marker_clears(self):
+        """A run that died between listing and spawn released its marker's lock: the empty dir
+        reads done as before, with the marker left or gone; a receipt without the field is as before."""
+        state = oe.hil_process.state_dir(str(self.work), oe.SECURITY_STATE)
+        fd, marker = oe._ahead_marker(state)
+        os.close(fd)        # the owner's death releases its flock
+        held_fd, held = oe._ahead_marker(state)
+        self.addCleanup(os.close, held_fd)
+        what = 'read_security on /dev/ttyACM3'
+        for receipt in ({'stateDir': state, 'what': what, 'aheadLock': marker},
+                        {'stateDir': state, 'what': what, 'aheadLock': f'{state}/ahead_gone.lock'},
+                        {'stateDir': state, 'what': what}):
+            with self.subTest(receipt=receipt):
+                oe.pending(SERIAL).add([{'receipt': receipt}])
+                self.assertTrue(oe.receipt_ended(receipt))
+                self.assertEqual(oe.pending_main(SERIAL)[0], 0)
+                self.assertEqual(oe.pending(SERIAL).read(), [])
+        self.assertFalse(oe.receipt_ended({'stateDir': state, 'what': what, 'aheadLock': held}))
+        os.unlink(marker)
+        os.unlink(held)
+        os.rmdir(state)
 
     def test_a_pending_read_lists_its_receipt_alone_and_checks_the_dir_without_tidying(self):
         """Codex on tinyuf2: checking the trackedDir tidied the done files its own listed receipt

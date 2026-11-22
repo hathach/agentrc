@@ -191,6 +191,8 @@ def receipt_ended(receipt) -> bool:
     if kind == 'tracked':
         return _recheckable(receipt) and hil_process.recheck(receipt) == 'done'
     if kind == 'trackedDir':      # tidying nothing: a receipt listed apart rechecks from those files
+        if isinstance(receipt.get('aheadLock'), str) and hil_process._held_lock(receipt['aheadLock']):
+            return False          # a live owner, which may not have started its child in the dir yet
         return hil_process.recheck_dir(receipt['stateDir'], keep=hil_process._KeepAll())[0] == 'done'
     return False
 
@@ -1026,6 +1028,29 @@ SECURITY_SETTLE = 2.0      # s run_tracked waits for the security read's descend
 SECURITY_STATE = 'security-ops'
 
 
+def _ahead_marker(state):
+    """(fd, path) of a new marker in run_tracked state dir `state`, flocked for as long as the fd is
+    open (never inherited), for a write-ahead entry's `aheadLock`. Not named `hil_op_`, so
+    recheck_dir never reads it: a lock-only hil_op_ file means a supervisor died starting."""
+    path = os.path.join(state, f'ahead_{secrets.token_hex(8)}.lock')
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BaseException:
+        os.close(fd)
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        raise
+    return fd, path
+
+
+def _drop_marker(marker):
+    if marker is not None:
+        with contextlib.suppress(OSError):
+            os.unlink(marker[1])
+        os.close(marker[0])
+
+
 def read_security(serial: str, *, chip: str, workdir, timeout, retains_lock=False, esptool: str = 'esptool',
                   run=None, baud: int = ESP_BAUD, ops=(), reap_grace=None, verbose=False, quiet=False):
     """Read the security state of the chip behind the USJ with `serial` before an openocd_esp
@@ -1056,22 +1081,24 @@ def read_security(serial: str, *, chip: str, workdir, timeout, retains_lock=Fals
         raise ValueError(f'ops {ops!r:.200}: only esptool_session read and md5 ops follow the security read')
     _refuse_pending(serial)
     tty, python = usj_tty(serial), hil_flash.tool_python(esptool)
-    ahead = None
-    if run is None:
-        state = hil_process.state_dir(_workdir(workdir), SECURITY_STATE)
-        grace = {} if reap_grace is None else {'reap_grace': reap_grace}
-        # write-ahead: the state dir is listed before the child starts in it, so a SIGKILL from here
-        # on leaves it refusing until recheck_dir finds every operation there done; withdrawn once
-        # the child's own receipt is listed (_held_run)
-        ahead = {'stateDir': state, 'what': f'read_security on {tty}'}
-        pending(serial).add([{'receipt': ahead}])
-
-        def run(cmd, cwd=None, **kw):
-            return hil_process.run_tracked(cmd, cwd, settle=SECURITY_SETTLE, state_dir=state, verbose=verbose,
-                                           quiet=quiet, **grace, **kw)
     what = f'read_security on {tty}'
+    ahead = marker = None
     hold, op = hil_process.InterruptHold(), None
     try:
+        if run is None:
+            state = hil_process.state_dir(_workdir(workdir), SECURITY_STATE)
+            grace = {} if reap_grace is None else {'reap_grace': reap_grace}
+            # write-ahead: the state dir is listed before the child starts in it, so a SIGKILL from here
+            # on leaves it refusing until recheck_dir finds every operation there done; withdrawn once
+            # the child's own receipt is listed (_held_run). Until then the marker's flock keeps it
+            # from reading done while the dir is still empty.
+            marker = _ahead_marker(state)
+            ahead = {'stateDir': state, 'what': what, 'aheadLock': marker[1]}
+            pending(serial).add([{'receipt': ahead}])
+
+            def run(cmd, cwd=None, **kw):
+                return hil_process.run_tracked(cmd, cwd, settle=SECURITY_SETTLE, state_dir=state, verbose=verbose,
+                                               quiet=quiet, **grace, **kw)
         with tempfile.TemporaryDirectory(prefix='hil_security_', dir=_workdir(workdir)) as td:
             ops_file = os.path.join(td, 'ops.json')
             with open(ops_file, 'w') as f:
@@ -1086,6 +1113,7 @@ def read_security(serial: str, *, chip: str, workdir, timeout, retains_lock=Fals
         op = getattr(e, 'operation', None) or op
         raise
     finally:
+        _drop_marker(marker)
         _release(hold, op)
     try:
         if op.cleanup != 'done':
