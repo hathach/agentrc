@@ -55,7 +55,8 @@ python3 "$P" comment --repo <o/r> --allow-repo <o/r> --issue <N> --body-file <f>
   command and output where there are any, else the cited source), the remaining
   work and why it is deferred. Title in the repository's style (agentrc:
   `<component>: <what is wrong>`). The follow-up label the repository's
-  `CLAUDE.md` names (agentrc: `follow-up`), else none; never a footer.
+  instruction file (`CLAUDE.md`, `AGENTS.md`) names (agentrc: `follow-up`),
+  else none; never a footer.
 - **Receipts, verbatim.** Return the JSON line unchanged. `uncertain` and
   `mismatch` are for a human: never rerun the command on them or post again
   by hand, since a lost write can surface late. Never file with `gh`

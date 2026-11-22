@@ -7,7 +7,7 @@ description: Shared mechanics of an Arduino library's or core's build and HIL co
 
 An Arduino library has no build of its own: sketches compile against its checkout with arduino-cli. Each library
 that has agent support keeps a build contract and a HIL contract; their mechanics live here, loaded from the agentrc
-commit the library pins, and the library keeps only what is its own. Read the library's contracts (its `CLAUDE.md`
+commit the library pins, and the library keeps only what is its own. Read the library's contracts (its `AGENTS.md`
 names them) for usage, exits and limits; this page is what they share and how a library adopts them.
 
 | Script                      | Gives                                                                                                     |
@@ -117,8 +117,8 @@ retries, recovery) apply unchanged; these scripts load its `hil_*` scripts throu
   clang-format takes the first `.clang-format` above the file, so format only in a checkout with none above its root
   (`~/Arduino/libraries/<lib>`, its `.worktrees/`): one nested under tinyusb or a core's `libraries/` (arduino-esp32
   has its own) formats in that tree's style, and v15 cannot parse tinyusb's file.
-- TinyUSB Arduino's vendored TinyUSB (the paths its `CLAUDE.md` names) keeps tinyusb's format: fix it in
-  hathach/tinyusb under tinyusb's `.clang-format`, then copy it back as that `CLAUDE.md` says.
+- TinyUSB Arduino's vendored TinyUSB (the paths its `AGENTS.md` names) keeps tinyusb's format: fix it in
+  hathach/tinyusb under tinyusb's `.clang-format`, then copy it back as that `AGENTS.md` says.
 
 ## A core
 
@@ -191,8 +191,12 @@ user. The library's workflow and report comment are its own.
 4. Add the boards to `test/hil/ci.json`, commission each (`hil_test.py commission` on the board's host), run the
    battery on the farm (`hil_remote.py run`), and record what no board covers as the contract's Limits.
 5. Contract tests for the profile in `.claude/test/`, a pre-commit hook running `agentrc_pin.py test` (the installed
-   agentrc locally, the pin in CI) beside the clang-format hook (Code format), and a `CLAUDE.md` naming the build and
-   HIL contracts.
+   agentrc locally, the pin in CI) beside the clang-format hook (Code format).
+6. Agent files with no tracked symlink: arduino-lint LS005 keeps a library release holding one out of the Library
+   Manager, and a core keeps the libraries' layout. A regular `AGENTS.md` names the build and HIL contracts and, in an
+   "Agent files" section, says the skills are in `.claude/skills/<name>/SKILL.md`; `CLAUDE.md` holds only
+   `@AGENTS.md`; no `.agents`. Copy SPIFlash's `no-symlinks` pre-commit hook unchanged. `install.py --project` links
+   are untracked, so they never reach a release.
 
 A core follows the same steps with its core-mode profile; its `agentrc_pin.py` copy also refuses engines without
 core mode (`'core'` missing from `arduino_build.PROFILE_FEATURES`), one whose rig board has a base image without

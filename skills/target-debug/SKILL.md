@@ -29,8 +29,8 @@ route per chip and the console.
 These skills know probes, not projects. Three things come from the project, and none of them is ever guessed:
 
 - **How to build a debug variant** (logging over RTT, trace init, where the ELF lands, the J-Link device name or OpenOCD
-  config of a board): the project's `Build contract:` line in its `CLAUDE.md` names the skill or document that says. No
-  contract: use the ELF and device/config the caller gave, and ask for what is missing.
+  config of a board): the project's `Build contract:` line in its instruction file (`CLAUDE.md`, `AGENTS.md`) names the
+  skill or document that says. No contract: use the ELF and device/config the caller gave, and ask for what is missing.
 - **How to take a rig board**: the project's `HIL contract:` line names its rig skill, which owns lock and release and
   says which HIL config json describes the host you are on. No contract: follow the procedure the caller gave; on a
   shared rig with none, ask before touching a board.

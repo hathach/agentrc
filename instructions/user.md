@@ -5,6 +5,9 @@
   `.claude/{agents,skills,workflows}` are canonical; keep `AGENTS.md ->
   CLAUDE.md` and `.agents -> .claude`. Migrating a repo to it is its own task,
   never a side effect.
+- Except an Arduino library or core: it tracks no symlink (arduino-lint
+  LS005), so a regular `AGENTS.md` holds the instructions and `CLAUDE.md` is
+  `@AGENTS.md`; the `arduino` skill's Adding a library has the layout.
 
 # Working rules
 Bias toward caution over speed. For trivial tasks, use judgment.
