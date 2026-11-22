@@ -5,8 +5,8 @@ for the API. Each consumer keeps its renderer, triggers, permissions and where i
 they share (Adafruit_TinyUSB_Arduino's hil_workflow.py, tinyuf2's hil_comment.py, tinyusb's code_size_ci.py).
 The sticky post itself stays marocchino/sticky-pull-request-comment.
 
-A script reaches it as it reaches lib/windows.py:
-`sys.path.insert(0, str(Path(__file__).resolve().parents[N] / 'lib'))`, then `import gh_pr_comment`, or runs it:
+It lives with the hil scripts so an install (which links skills/, not lib/) and a pin both carry it: a consumer loads
+it through hil_load (`load_file('skills/hil/scripts/gh_pr_comment.py')`, in its closure), or runs it:
 
   gh_pr_comment.py pr --repo R --head-sha SHA [--head-branch BR --head-repo R2] [--prs JSON]
       the one open PR of R a run is for, from its trusted workflow_run metadata (pull_requests, else a fork's
@@ -30,6 +30,7 @@ import sys
 from pathlib import Path
 from urllib.parse import quote
 
+FILES = ()             # loads and launches nothing by path (hil_load.py)
 GH_TIMEOUT = 60        # s per gh api call: a stalled one never blocks the job
 MAX_JSON = 1 << 20     # bytes of one artifact file read
 MAX_TEXT = 300         # characters of one untrusted string shown

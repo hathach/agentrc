@@ -437,6 +437,7 @@ recovery stay the contract's.
 | `hil_remote_core.py` | trees and attempts on a rig: staging, launch, status, fetch and copy-back |
 | `hil_tt.py` | Reset_TT of the hub TT a full- or low-speed device sits behind |
 | `hil_root.py` | every root operation of the usbtest, TT and USB network scripts, one checked verb each (`netns` moves a board's USB network interface, by its vendor id, into the namespace of a sandbox a user other than root created, the one `SUDO_UID` names when set); a rig grants its CI user sudo on its installed copy (`/usr/local/sbin/hil_root`), and separately on `/usr/local/sbin/usb_recover` for `hil_reserve.py run` recovery |
+| `gh_pr_comment.py` | a CI report posted on a PR by a later `workflow_run` job: the PR of a run (`pr_of_run`), a job's attempt, whether a run is still the newest for the PR's head (`fresh`), a bounded artifact JSON read, and table-safe, mention-neutral, capped comment text; its CLI (`pr`, `job-attempt`, `fresh`) exits 2 when the API cannot tell, never read as absent or stale |
 | `hil_usbtest.py` | usbtest binding, the device under test by serial (`find_device`), and bounded testusb case runs |
 | `usb_dfu.py`, `esptool_session.py` | a DFU runtime request, one esptool connection, each a child the runner can kill |
 

@@ -1,4 +1,4 @@
-"""lib/gh_pr_comment.py: the shared plumbing of a CI report posted on a PR by a later job (#471)."""
+"""skills/hil/scripts/gh_pr_comment.py: the shared plumbing of a CI report posted on a PR by a later job (#471)."""
 import io
 import json
 import os
@@ -10,11 +10,18 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lib'))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'skills' / 'hil' / 'scripts'))
 import gh_pr_comment as G  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors  # noqa: E402
 
 REPO = 'adafruit/tinyuf2'
 SHA = 'a' * 40
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 def api_of(answers):
@@ -68,7 +75,10 @@ class JobAttempt(unittest.TestCase):
         for jobs, want in (([{'name': 'hil-run', 'conclusion': 'success', 'run_attempt': 1}], 1),
                            ([{'name': 'hil-run', 'conclusion': 'failure'}], 2),
                            ([{'name': 'hil-run', 'conclusion': 'skipped', 'run_attempt': 2}], None),
-                           ([{'name': 'hil-run', 'conclusion': None}], None), ([{'name': 'other'}], None)):
+                           ([{'name': 'hil-run', 'conclusion': None}], None), ([{'name': 'other'}], None),
+                           ([{'name': 'build', 'conclusion': 'success', 'run_attempt': 2},
+                             {'name': 'hil-run', 'conclusion': 'success', 'run_attempt': 1},
+                             {'name': 'report', 'conclusion': 'failure', 'run_attempt': 2}], 1)):
             with self.subTest(jobs=jobs):
                 self.assertEqual(G.job_attempt(REPO, 11, 2, 'hil-run', api=api_of({path: jobs})), want)
 
@@ -190,6 +200,25 @@ class Cli(unittest.TestCase):
         self.assertTrue(out.startswith('stale: '))
         self.assertEqual(self.main(['job-attempt', '--repo', REPO, '--run-id', '1', '--attempt', '1', '--job', 'j'],
                                    api_of({'repos/': [{'name': 'j', 'conclusion': 'skipped'}]}))[:2], (0, ''))
+
+    def test_a_fork_lookup_matching_several_prs_posts_nothing(self):
+        pulls = [{'number': n, 'head': {'sha': SHA}, 'base': {'repo': {'full_name': REPO}}} for n in (3, 4)]
+        rc, out, err = self.main(['pr', '--repo', REPO, '--head-sha', SHA, '--head-branch', 'b', '--head-repo',
+                                  'me/r'], api_of({f'repos/{REPO}/pulls': pulls}))
+        self.assertEqual((rc, out), (0, ''))
+        self.assertIn('PRs [3, 4] share this run: no comment', err)
+
+    def test_job_attempt_and_fresh_api_failures_exit_unknown(self):
+        job = ['job-attempt', '--repo', REPO, '--run-id', '1', '--attempt', '1', '--job', 'hil-run']
+        fresh = ['fresh', '--repo', REPO, '--pr', '7', '--run-id', '100', '--attempt', '1', '--head-sha', SHA,
+                 '--workflow', 'hil.yml']
+        broken = {f'repos/{REPO}/pulls/7': {'head': head()}, 'repos/': G.ApiError('HTTP 503')}
+        for argv, answers in ((job, {'repos/': G.ApiError('HTTP 503')}), (fresh, broken),
+                              (fresh, {f'repos/{REPO}/pulls/7': {'no head': 1}})):
+            with self.subTest(argv=argv[0], answers=answers):
+                rc, out, err = self.main(argv, api_of(answers))
+                self.assertEqual((rc, out), (2, ''))
+                self.assertTrue(err.startswith('unknown: '))
 
 
 class Gh(unittest.TestCase):
