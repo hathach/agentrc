@@ -1295,6 +1295,21 @@ class PendingRegistry(SessionCase):
             self.assertEqual(oe.pending_refusal(SERIAL), '')
         self.assertFalse(os.path.exists(oe.pending(SERIAL).path))
 
+    def test_an_interrupt_after_a_session_is_held_until_it_is_listed(self):
+        old = signal.signal(signal.SIGINT, signal.default_int_handler)
+        self.addCleanup(signal.signal, signal.SIGINT, old)
+        op = types.SimpleNamespace(cleanup='pending', receipts=('/w/receipt.json',))
+        real = oe.latch
+
+        def latch(*a):
+            signal.raise_signal(signal.SIGINT)
+            return real(*a)
+        with mock.patch.object(oe, '_run', lambda *a, **k: op), mock.patch.object(oe, 'latch', latch), \
+                self.assertRaises(KeyboardInterrupt):
+            oe._latched(BOARD, 'reset')
+        self.assertEqual(oe.pending(SERIAL).read(), [{'receipt': '/w/receipt.json'}])
+        self.assertEqual(signal.getsignal(signal.SIGINT), signal.default_int_handler)
+
     def test_an_ended_reset_lists_nothing(self):
         self.assertEnded(self.reset())
         self.assertEqual(oe.pending(SERIAL).read(), [])
@@ -2058,6 +2073,59 @@ class ReadSecurity(unittest.TestCase):
             oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=30, retains_lock=True)
         op = cm.exception.operation
         self.assertEqual((op.cleanup, op.receipts), ('pending', (receipt,)))
+        (self.work / oe.SECURITY_STATE).rmdir()
+
+    def test_an_interrupt_after_the_child_is_held_until_what_it_left_is_listed(self):
+        """agentrc#214: a SIGINT landing between the child's end and its latch (here inside the latch,
+        and so before the work dir is removed) is delivered only once the receipt is listed."""
+        receipt = {'token': 'r1', 'lock': '/state/hil_op_r1.lock'}
+        old = signal.signal(signal.SIGINT, signal.default_int_handler)
+        self.addCleanup(signal.signal, signal.SIGINT, old)
+        real = oe.latch
+
+        def latch(*a):
+            signal.raise_signal(signal.SIGINT)
+            return real(*a)
+
+        def run(argv, **kw):
+            r = subprocess.CompletedProcess(argv, 0, self.line(sec()), None)
+            r.cleanup, r.receipt = 'pending', receipt
+            return r
+        with mock.patch.object(oe, 'latch', latch), self.assertRaises(KeyboardInterrupt):
+            oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=30, retains_lock=True, run=run)
+        self.assertEqual(oe.pending(SERIAL).read(), [{'receipt': receipt}])
+        self.assertEqual(list(self.work.iterdir()), [])
+
+    def test_an_interrupt_during_the_childs_run_reaches_it(self):
+        old = signal.signal(signal.SIGINT, signal.default_int_handler)
+        self.addCleanup(signal.signal, signal.SIGINT, old)
+        seen = []
+
+        def run(argv, **kw):
+            try:
+                signal.raise_signal(signal.SIGINT)
+            except KeyboardInterrupt:
+                seen.append('interrupted')
+                raise
+            seen.append('not interrupted')
+        with self.assertRaises(KeyboardInterrupt):
+            oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=30, retains_lock=True, run=run)
+        self.assertEqual(seen, ['interrupted'])
+        self.assertEqual(signal.getsignal(signal.SIGINT), signal.default_int_handler, 'the hold is released')
+
+    def test_quiet_goes_to_the_default_run(self):
+        seen = []
+
+        def tracked(cmd, cwd=None, **kw):
+            seen.append(kw.get('quiet'))
+            r = subprocess.CompletedProcess(cmd, 0, self.line(sec()), None)
+            r.cleanup, r.receipt = 'done', None
+            return r
+        with mock.patch.object(oe.hil_process, 'run_tracked', tracked):
+            for quiet in (False, True):
+                kw = {'quiet': True} if quiet else {}
+                oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=30, retains_lock=True, **kw)
+        self.assertEqual(seen, [False, True])
         (self.work / oe.SECURITY_STATE).rmdir()
 
     def test_extra_read_ops_share_the_session_and_return_their_results(self):

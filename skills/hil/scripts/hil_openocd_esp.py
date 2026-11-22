@@ -885,7 +885,7 @@ SECURITY_STATE = 'security-ops'
 
 
 def read_security(serial: str, *, chip: str, workdir, timeout, retains_lock=False, esptool: str = 'esptool',
-                  run=None, baud: int = ESP_BAUD, ops=(), reap_grace=None, verbose=False):
+                  run=None, baud: int = ESP_BAUD, ops=(), reap_grace=None, verbose=False, quiet=False):
     """Read the security state of the chip behind the USJ with `serial` before an openocd_esp
     flash: one esptool_session.py child, under the interpreter of `esptool` (hil_flash
     tool_python), on usj_tty(serial), that reads GET_SECURITY_INFO and the eFuses on the ROM
@@ -902,8 +902,11 @@ def read_security(serial: str, *, chip: str, workdir, timeout, retains_lock=Fals
 
     `ops`: esptool_session.py read or md5 ops run in the same session after the security read,
     so a caller's snapshot of the flash takes no second session; their results are the
-    Operation's `results`. `reap_grace` and `verbose` go to the default run_tracked. Refused too
-    while the serial's pending record lists an operation not proven ended (pending_refusal)."""
+    Operation's `results`. `reap_grace`, `verbose` and `quiet` (no COMMAND FAILED banner, for a
+    caller that reports the failure itself) go to the default run_tracked. Refused too while the
+    serial's pending record lists an operation not proven ended (pending_refusal). SIGINT and
+    SIGTERM reach the child's run but are held from its end until what it left is listed
+    (hil_process.InterruptHold), then delivered: an interrupt never unwinds past an unlisted child."""
     _admit_session(retains_lock)
     _security_chip(chip)
     ops = list(ops)
@@ -917,21 +920,22 @@ def read_security(serial: str, *, chip: str, workdir, timeout, retains_lock=Fals
 
         def run(cmd, cwd=None, **kw):
             return hil_process.run_tracked(cmd, cwd, settle=SECURITY_SETTLE, state_dir=state, verbose=verbose,
-                                           **grace, **kw)
-    with tempfile.TemporaryDirectory(prefix='hil_security_', dir=_workdir(workdir)) as td:
-        ops_file = os.path.join(td, 'ops.json')
-        with open(ops_file, 'w') as f:
-            json.dump([{'op': 'security'}, *ops], f)
-        argv = [python, '-B', ESPTOOL_SESSION, '--port', tty, '--chip', chip, '--baud', str(baud),
-                '--after', 'hard-reset', ops_file]
-        try:
-            op = hil_flash._once(run, argv, env=dict(hil_flash.ESPTOOL_ENV), timeout=timeout)
-        except BaseException as e:
-            latch(serial, getattr(e, 'operation', None), f'read_security on {tty}')
-            raise
+                                           quiet=quiet, **grace, **kw)
+    what = f'read_security on {tty}'
+    hold = hil_process.InterruptHold()
+    try:
+        with tempfile.TemporaryDirectory(prefix='hil_security_', dir=_workdir(workdir)) as td:
+            ops_file = os.path.join(td, 'ops.json')
+            with open(ops_file, 'w') as f:
+                json.dump([{'op': 'security'}, *ops], f)
+            argv = [python, '-B', ESPTOOL_SESSION, '--port', tty, '--chip', chip, '--baud', str(baud),
+                    '--after', 'hard-reset', ops_file]
+            op = _held_run(hold, serial, what, lambda: hil_flash._once(run, argv, env=dict(hil_flash.ESPTOOL_ENV),
+                                                                        timeout=timeout))
+    finally:
+        hold.release()
     try:
         if op.cleanup != 'done':
-            latch(serial, op, f'read_security on {tty}')
             raise RuntimeError(f'esptool_session on {tty}: cleanup {op.cleanup}, its child is not proven ended')
         lines = hil_process.cmd_stdout_text(op.stdout).strip().splitlines()
         try:
@@ -1179,22 +1183,38 @@ def admit_read(read) -> dict:
     return admit_security(read.security)
 
 
+def _held_run(hold, serial, what, work, segments=None):
+    """work()'s Operation, with what it left listed under `serial` (latch), a raised one's
+    included. SIGINT and SIGTERM reach work() through `hold` (hil_process.InterruptHold) and are
+    deferred again from the first instruction after it, so none unwinds before the latch; the
+    caller's release() delivers them."""
+    try:
+        try:
+            hold.deliver()
+            op = work()
+        finally:
+            hold.deferring = True       # an attribute store, no interrupt check: deferred from here
+            hold.rearm()
+    except BaseException as e:
+        if (failed := getattr(e, 'operation', None)) is not None and segments is not None:
+            failed.segments = segments
+        latch(serial, failed, what)
+        raise
+    latch(serial, op, what)
+    return op
+
+
 def _latched(flasher, work, *, segments=None, **kw):
     """_run once the USJ's pending record lists nothing open, listing what the session leaves
-    pending there, a raised one included."""
+    pending there, a raised one included, with interrupts held until it is listed (_held_run)."""
     admit(flasher)
     serial = flasher['uid']
     _refuse_pending(serial)
+    hold = hil_process.InterruptHold()
     try:
-        op = _run(flasher, work, **kw)
-    except BaseException as e:
-        if hasattr(e, 'operation'):
-            if segments is not None:
-                e.operation.segments = segments
-            latch(serial, e.operation, f'openocd_esp on USJ {serial}')
-        raise
-    latch(serial, op, f'openocd_esp on USJ {serial}')
-    return op
+        return _held_run(hold, serial, f'openocd_esp on USJ {serial}', lambda: _run(flasher, work, **kw), segments)
+    finally:
+        hold.release()
 
 
 # -------------------------------------------------------------

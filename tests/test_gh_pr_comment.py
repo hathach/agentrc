@@ -123,6 +123,9 @@ class Fresh(unittest.TestCase):
         fork = head(repo='me/tinyuf2')
         self.assertTrue(self.fresh([run(100, 5, repo='me/tinyuf2')], pr_head=fork)[0][0])
         self.assertFalse(self.fresh([run(100, 5, repo='other/tinyuf2')], pr_head=fork)[0][0])
+        # tinyusb's case: a newer run from the same fork on another branch is not this PR's
+        self.assertEqual(self.fresh([run(100, 5, repo='me/tinyuf2'), run(120, 6, repo='me/tinyuf2', branch='other')],
+                                    pr_head=fork)[0], (True, 'current'))
 
     def test_by_run_name_another_pr_on_the_same_head_is_not_this_ones(self):
         runs = [run(100, 5, [7, 8], title='HIL PR #7'), run(120, 6, [7, 8], title='HIL PR #8')]

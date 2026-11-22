@@ -382,7 +382,9 @@ recovery stay the contract's. Linux only.
   (`session`, `tracked`, `unreceipted`) and `describe(receipt)` name an entry;
   an unreceipted one, or an unreadable record, clears only with a reviewed
   recovery's note (`PendingSessions.clear(note=)`, or the `pending` command
-  below).
+  below). SIGINT and SIGTERM reach each operation's run but are held from its
+  end until what it left is listed, then delivered. `read_security(quiet=True)`
+  drops the COMMAND FAILED banner for a caller that reports the failure.
   Flash, reset and `read_security` run only for a caller that passes
   `retains_lock=True`, declaring it holds the board lock through each
   operation and logs a session it leaves pending, and never under a CI job (`RUNNER_TRACKING_ID` or
