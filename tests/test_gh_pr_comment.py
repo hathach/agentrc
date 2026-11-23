@@ -82,6 +82,13 @@ class JobAttempt(unittest.TestCase):
             with self.subTest(jobs=jobs):
                 self.assertEqual(G.job_attempt(REPO, 11, 2, 'hil-run', api=api_of({path: jobs})), want)
 
+    def test_two_jobs_of_the_name_are_unknown(self):
+        """CodeRabbit on #574: the first of two same-named jobs answered for both."""
+        jobs = [{'id': 5, 'name': 'hil-run', 'conclusion': 'skipped'}, {'id': 6, 'name': 'other'},
+                {'id': 7, 'name': 'hil-run', 'conclusion': 'success', 'run_attempt': 1}]
+        with self.assertRaisesRegex(G.ApiError, r'\b5\b.*\b7\b'):
+            G.job_attempt(REPO, 11, 2, 'hil-run', api=api_of({'repos/': jobs}))
+
 
 def head(sha=SHA, ref='feature', repo=REPO):
     return {'sha': sha, 'ref': ref, 'repo': {'full_name': repo}}
@@ -203,6 +210,24 @@ class Cli(unittest.TestCase):
         self.assertTrue(out.startswith('stale: '))
         self.assertEqual(self.main(['job-attempt', '--repo', REPO, '--run-id', '1', '--attempt', '1', '--job', 'j'],
                                    api_of({'repos/': [{'name': 'j', 'conclusion': 'skipped'}]}))[:2], (0, ''))
+
+    def test_job_attempt_of_a_name_two_jobs_share_exits_unknown(self):
+        jobs = [{'id': 5, 'name': 'j', 'conclusion': 'success'}, {'id': 7, 'name': 'j', 'conclusion': 'success'}]
+        rc, out, err = self.main(['job-attempt', '--repo', REPO, '--run-id', '1', '--attempt', '1', '--job', 'j'],
+                                 api_of({'repos/': jobs}))
+        self.assertEqual((rc, out), (2, ''))
+        self.assertTrue(err.startswith('unknown: '))
+
+    def test_prs_that_are_not_a_json_list_exit_unknown_and_an_empty_list_looks_up_a_fork(self):
+        """CodeRabbit on #574: malformed --prs read as no PR, so a same-repo run fell to the fork lookup."""
+        pulls = [{'number': 3, 'head': {'sha': SHA}, 'base': {'repo': {'full_name': REPO}}}]
+        argv = ['pr', '--repo', REPO, '--head-sha', SHA, '--head-branch', 'b', '--head-repo', 'me/r']
+        for prs in ('{', '{}', '7', 'null'):
+            with self.subTest(prs=prs):
+                rc, out, err = self.main([*argv, '--prs', prs], api_of({}))
+                self.assertEqual((rc, out), (2, ''))
+                self.assertIn('--prs', err)
+        self.assertEqual(self.main([*argv, '--prs', '[]'], api_of({f'repos/{REPO}/pulls': pulls}))[:2], (0, '3\n'))
 
     def test_a_fork_lookup_matching_several_prs_posts_nothing(self):
         pulls = [{'number': n, 'head': {'sha': SHA}, 'base': {'repo': {'full_name': REPO}}} for n in (3, 4)]

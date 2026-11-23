@@ -10,7 +10,8 @@ it through hil_load (`load_file('skills/hil/scripts/gh_pr_comment.py')`, in its 
 
   gh_pr_comment.py pr --repo R --head-sha SHA [--head-branch BR --head-repo R2] [--prs JSON]
       the one open PR of R a run is for, from its trusted workflow_run metadata (pull_requests, else a fork's
-      head repo, branch and SHA); prints its number, or nothing when there is none or more than one.
+      head repo, branch and SHA); prints its number, or nothing when there is none or more than one; a --prs
+      that is not a JSON list exits 2.
   gh_pr_comment.py job-attempt --repo R --run-id N --attempt N --job NAME
       the attempt job NAME of run N attempt N ran in; prints nothing when it was skipped or did not run.
   gh_pr_comment.py fresh --repo R --pr N --run-id N --attempt N --head-sha SHA --workflow FILE [--run-name T]
@@ -81,9 +82,12 @@ def pr_of_run(repo, *, head_sha, head_branch=None, head_repo=None, pull_requests
 
 def job_attempt(repo, run_id, attempt, job, api=gh):
     """The attempt job `job` of run `run_id` attempt `attempt` ran in (a re-run reuses an earlier attempt's
-    successful job), or None when it was skipped or has no conclusion. ApiError when the API cannot tell."""
+    successful job), or None when it was skipped or has no conclusion. ApiError when the API cannot tell, several
+    jobs of that name included."""
     jobs = api(f'repos/{repo}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100', 'jobs')
     named = [j for j in jobs if isinstance(j, dict) and j.get('name') == job]
+    if len(named) > 1:
+        raise ApiError(f'jobs {[j.get("id") for j in named]} of run {run_id} attempt {attempt} are all named {job!r}')
     if not named or named[0].get('conclusion') in (None, 'skipped'):
         return None
     return named[0].get('run_attempt') or int(attempt)
@@ -202,9 +206,12 @@ def main(argv=None, api=gh):
             try:
                 prs = json.loads(a.prs)
             except ValueError:
-                prs = []
+                prs = None
+            if not isinstance(prs, list):
+                print(f"--prs {a.prs[:MAX_TEXT]!r}: want the run's pull_requests as a JSON list", file=sys.stderr)
+                return 2
             number, why = pr_of_run(a.repo, head_sha=a.head_sha, head_branch=a.head_branch, head_repo=a.head_repo,
-                                    pull_requests=prs if isinstance(prs, list) else [], api=api)
+                                    pull_requests=prs, api=api)
             if number is None:
                 print(f'{why}: no comment', file=sys.stderr)
             else:
