@@ -124,6 +124,8 @@ def read_staged(staged, scripts):
     flag and the digest of exactly the closure of `scripts`, each a regular file with those bytes. Any gap is a
     SourceError, never a reason to look elsewhere."""
     staged = Path(staged)
+    if staged.is_symlink() or (staged / MANIFEST).is_symlink():
+        raise SourceError(f'{staged / MANIFEST} is not a regular file in a plain directory')
     try:
         m = json.loads((staged / MANIFEST).read_text(encoding='utf-8'))
     except (OSError, ValueError, RecursionError) as e:
@@ -184,7 +186,17 @@ def frozen(source, root, scripts, commit=None):
 def drift(ident):
     """The closure files whose bytes now differ from `ident`'s digests (a missing one included)."""
     root = Path(ident['root'])
-    return [f for f in ident['files'] if not (root / f).is_file() or sha256(root / f) != ident['sha256'][f]]
+    changed = []
+    for f in ident['files']:
+        parts = PurePosixPath(f).parts
+        linked = ident['source'] == 'staged' and any(root.joinpath(*parts[:i]).is_symlink()
+                                                    for i in range(len(parts) + 1))
+        try:
+            if linked or not (root / f).is_file() or sha256(root / f) != ident['sha256'][f]:
+                changed.append(f)
+        except OSError:
+            changed.append(f)
+    return changed
 
 
 def _drifted(ident):
@@ -235,12 +247,15 @@ def mismatch(recorded, ident, commit=True):
     return ''
 
 
-def stage(ident, into):
-    """Copy `ident`'s closure into <into>/.agentrc as regular files with its manifest, checking each copy against
-    the frozen digest (a file edited since load is refused, never staged); {.agentrc-relative path: sha256}."""
-    dest = Path(into) / STAGED
+def stage(ident, into, *, name=STAGED):
+    """Copy `ident`'s closure into <into>/<name> (default .agentrc), with its manifest, checking each copy against
+    the frozen digest; {into-relative path: sha256}, the manifest included. `name` is one plain directory name."""
+    if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9_.-]+', name) or name in ('.', '..'):
+        raise SourceError(f'invalid staged destination name: {name!r}')
+    dest = Path(into) / name
     if os.path.lexists(dest):
         raise SourceError(f'{dest} exists: a staged tree is written once')
+    binding(ident)
     root, out = Path(ident['root']), {}
     for f in ident['files']:
         target = dest / f
@@ -248,9 +263,9 @@ def stage(ident, into):
         shutil.copyfile(root / f, target)
         if sha256(target) != ident['sha256'][f]:
             raise SourceError(f'agentrc {f} changed since this process loaded it; rerun')
-        out[f'{STAGED}/{f}'] = ident['sha256'][f]
+        out[f'{name}/{f}'] = ident['sha256'][f]
     (dest / MANIFEST).write_text(json.dumps({'commit': ident['commit'], 'dirty': ident['dirty'],
                                              'sha256': ident['sha256']}, indent=1, sort_keys=True) + '\n',
                                  encoding='utf-8')
-    out[f'{STAGED}/{MANIFEST}'] = sha256(dest / MANIFEST)
+    out[f'{name}/{MANIFEST}'] = sha256(dest / MANIFEST)
     return out

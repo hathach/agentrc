@@ -60,7 +60,8 @@ LOCK_SCRIPT = 'skills/hil/scripts/hil_lock.py'
 SCRIPTS = (LOCK_SCRIPT, 'skills/hil/scripts/hil_flash.py', 'skills/hil/scripts/hil_process.py',
            'skills/hil/scripts/hil_report_core.py', 'skills/hil/scripts/usb_observe.py',
            'skills/hil/scripts/hil_openocd_esp.py')
-FILES = ('skills/arduino/scripts/arduino_build.py', 'skills/hil/boards.json', 'skills/hil/scripts/agentrc_source.py',
+FILES = ('skills/arduino/scripts/agentrc_pin.py', 'skills/arduino/scripts/arduino_build.py',
+         'skills/hil/boards.json', 'skills/hil/scripts/agentrc_source.py',
          'skills/hil/scripts/esptool_session.py', 'skills/hil/scripts/hil_boards.py', 'skills/hil/scripts/hil_flash.py',
          'skills/hil/scripts/hil_load.py',
          'skills/hil/scripts/hil_lock.py', 'skills/hil/scripts/hil_openocd_esp.py',
@@ -281,16 +282,17 @@ def record_problems(rec, board, head, experimental_ok, where):
     why = []
     if rec.get('library') != B.P.LIBRARY_NAME:
         why.append(f'it is a {rec.get("library")} record, this harness is {B.P.LIBRARY_NAME}\'s')
-    current = B.contract_identity()
+    try:
+        current = B.contract_identity()
+    except B.agentrc_source.SourceError as e:
+        return [f'{e}; rerun']
     changed = sorted(f for f in {*rec.get('contract', {}), *current['contract']}
                      if rec.get('contract', {}).get(f) != current['contract'].get(f))
     if changed:
         why.append(f'the contract files {changed} differ from the ones it was built with: rebuild it')
-    drift = B.agentrc_drift()
-    if drift:
-        why.append(f'agentrc changed since this harness loaded it: {drift}; rerun')
-    elif B.agentrc_mismatch(rec.get('agentrc')):   # the commit is provenance only
-        why.append(f'{B.agentrc_mismatch(rec.get("agentrc"))}: rebuild it')
+    mismatch = B.agentrc_mismatch(rec.get('agentrc'))   # the commit is provenance only
+    if mismatch:
+        why.append(f'{mismatch}: rebuild it')
     if rec['board'] != board:
         why.append(f'it is for {rec["board"]}, not {board}')
     if rec['experimental'] and not experimental_ok:

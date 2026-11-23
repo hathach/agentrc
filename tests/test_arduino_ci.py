@@ -75,7 +75,8 @@ class Pack(Checkout):
         manifest = json.loads((tree / R.MANIFEST).read_text())
         self.assertEqual(manifest['head'], self.head)
         pinned = [*self.BP.CONTRACT_FILES, ROSTER, f'build/hil/{BOARD}.build.json',
-                  f'build/hil/{BOARD}/echo/echo.ino.elf', *(f'agentrc/{f}' for f in self.agentrc['files'])]
+                  f'build/hil/{BOARD}/echo/echo.ino.elf', *(f'agentrc/{f}' for f in self.agentrc['files']),
+                  'agentrc/manifest.json']
         self.assertEqual(sorted(manifest['files']), sorted(pinned))
         for f in pinned:
             self.assertEqual(manifest['files'][f], hashlib.sha256((tree / f).read_bytes()).hexdigest(), f)
@@ -114,6 +115,15 @@ class Admit(Checkout):
 
     def test_admits_this_runs_tree(self):
         self.assertIsNone(self.admit())   # admitted: no refusal
+
+    def test_inner_manifest_is_accepted_only_when_pinned(self):
+        path = self.tree / R.MANIFEST
+        manifest = json.loads(path.read_text())
+        del manifest['files']['agentrc/manifest.json']
+        path.write_text(json.dumps(manifest))
+        self.assertRefused("unpinned ['agentrc/manifest.json']")
+        (self.tree / 'agentrc/manifest.json').unlink()
+        self.assertIsNone(self.admit())   # old trees have only the outer manifest
 
     def test_refuses_another_run_head_or_board(self):
         self.assertRefused('runId', run_id='78')

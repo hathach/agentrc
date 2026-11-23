@@ -89,7 +89,8 @@ class Run(Checkout):
         self.assertEqual(manifest['head'], self.head)
         self.assertEqual(manifest['agentrc'], {'commit': 'a' * 40, 'dirty': False})
         pinned = [*self.BP.CONTRACT_FILES, ROSTER, f'build/hil/{BOARD}.build.json',
-                  f'build/hil/{BOARD}/echo/echo.ino.elf', *(f'agentrc/{f}' for f in self.agentrc['files'])]
+                  f'build/hil/{BOARD}/echo/echo.ino.elf', *(f'agentrc/{f}' for f in self.agentrc['files']),
+                  'agentrc/manifest.json']
         self.assertEqual(sorted(manifest['files']), sorted(pinned))
         for f in pinned:
             self.assertEqual(manifest['files'][f], hashlib.sha256(self.staged[f]).hexdigest(), f)
@@ -98,8 +99,8 @@ class Run(Checkout):
 
     def test_staging_refuses_agentrc_files_changed_since_load(self):
         (self.agentrc['root'] / 'skills/hil/scripts/hil_lock.py').write_text('# pulled meanwhile\n')
-        with self.assertRaisesRegex(SystemExit, r"agentrc changed since this process loaded it: "
-                                                r"\['skills/hil/scripts/hil_lock.py'\]; rerun"):
+        with self.assertRaisesRegex(SystemExit, 'agentrc skills/hil/scripts/hil_lock.py changed since this process '
+                                                'loaded it; rerun'):
             R.snapshot(tmpdir(self), [], with_agentrc=True)
 
     def test_test_choices_are_the_profiles(self):
@@ -122,7 +123,7 @@ class Run(Checkout):
                  (lambda: self.record(contract={}), r"the contract files \['contract/check.py', 'contract/pin.json'\] "
                                                     r"differ"),
                  (lambda: (self.agentrc['root'] / 'skills/hil/scripts/hil_lock.py').write_text('# another\n'),
-                  'agentrc changed since this harness loaded it'),
+                  'agentrc .* changed since this process loaded it'),
                  (lambda: self.record(agentrc={'commit': 'a' * 40, 'sha256': {}}), 'it was built with agentrc'),
                  (lambda: self.record(board='rig_jlink'), 'it is for rig_jlink, not rig_ocd'))
         for spoil, why in cases:
@@ -148,7 +149,7 @@ class Run(Checkout):
         (self.root / 'contract/pin.json').write_text('{"commit": "pinned"}\n')
         R.record_files(path, self.head, BOARD)
         (self.agentrc['root'] / fake.SELF).write_text('# a newer engine\n')
-        with self.assertRaisesRegex(SystemExit, 'agentrc changed since this harness loaded it'):
+        with self.assertRaisesRegex(SystemExit, 'agentrc .* changed since this process loaded it'):
             R.record_files(path, self.head, BOARD)
 
     def test_named_builds_of_one_source_stage_and_pin_each_image(self):
@@ -452,6 +453,23 @@ class Session(Checkout):
         session.write_text(json.dumps({**data, 'agentrc': {**data['agentrc'], 'sha256': files}}))
         with self.assertRaisesRegex(SystemExit, 'not the ones the session opened with'):
             self.main('session', 'stage', 's1', str(rec))
+
+    def test_a_session_with_an_older_closure_remains_closable(self):
+        self.open()
+        path = self.root / '.hil-remote/s1.session.json'
+        data = json.loads(path.read_text())
+        path.write_text(json.dumps({**data, 'agentrc': {'commit': 'b' * 40, 'sha256': {'old.py': '0' * 64}}}))
+        rec = self.record(experimental=True)
+        with self.assertRaisesRegex(SystemExit, 'close the session and open a new one'):
+            self.main('session', 'stage', 's1', str(rec))
+        staged = dict(self.staged)
+        self.calls.clear()
+        rc, out = self.main('session', 'close', 's1')
+        self.assertEqual((rc, out['closed'], out['restoreExit']), (0, True, 0))
+        self.assertEqual(self.staged, staged)
+        self.assertEqual(self.calls, [['python3', '-u', self.HP.HIL, 'restore', '-b', BOARD, '--under-hold',
+                                      data['reason'], '--staged', R.MANIFEST, '--bundle', R.RESTORE_BUNDLE,
+                                      '--build-record', data['restoreRecord'], '--release', ROSTER]])
 
 
 if __name__ == '__main__':

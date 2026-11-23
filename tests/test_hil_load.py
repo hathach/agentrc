@@ -377,7 +377,7 @@ class Files(unittest.TestCase):
         self.assertIn('skills/target-debug/scripts/esp_session.py', files_of('skills/hil/scripts/hil_openocd_esp.py'))
 
     def test_an_arduino_engine_files_holds_what_each_of_them_loads_and_imports_alone(self):
-        engines = sorted(p.relative_to(ROOT).as_posix() for p in (ROOT / 'skills/arduino/scripts').glob('*.py'))
+        engines = sorted(p.relative_to(ROOT).as_posix() for p in (ROOT / 'skills/arduino/scripts').glob('arduino_*.py'))
         self.assertEqual(len(engines), 4, engines)
         for rel in engines:
             tree = {rel, *files_of(rel)}

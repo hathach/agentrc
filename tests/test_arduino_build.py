@@ -958,15 +958,17 @@ class Record(RecordCase):
     def test_record_refused_when_agentrc_changed_after_it_was_loaded(self):
         (self.agentrc['root'] / 'skills/hil/scripts/hil_lock.py').write_text('# pulled while building\n')
         _, err = self.record(self.samd_row())
-        self.assertEqual(err, "agentrc changed since this process loaded it: ['skills/hil/scripts/hil_lock.py']; "
+        self.assertEqual(err, "agentrc skills/hil/scripts/hil_lock.py changed since this process loaded it; "
                               "build again")
 
     def test_contract_identity_skips_absent_contract_files_and_binds_the_closure_as_loaded(self):
         (self.root / 'contract/pin.json').unlink()
-        (self.agentrc['root'] / 'skills/hil/scripts/hil_lock.py').write_text('# edited after load\n')
         ident = ab.contract_identity()
         self.assertEqual(list(ident['contract']), ['contract/check.py'])
         self.assertEqual(ident['agentrc'], {'commit': 'a' * 40, 'sha256': self.agentrc['sha256']})
+        (self.agentrc['root'] / 'skills/hil/scripts/hil_lock.py').write_text('# edited after load\n')
+        with self.assertRaisesRegex(ab.agentrc_source.SourceError, 'changed since this process loaded it'):
+            ab.contract_identity()
         self.assertEqual(ab.agentrc_drift(), ['skills/hil/scripts/hil_lock.py'])
 
     def test_record_refuses_two_sketches_of_one_basename(self):

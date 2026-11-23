@@ -69,7 +69,8 @@ import sys
 from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-FILES = ('skills/hil/boards.json', 'skills/hil/scripts/agentrc_source.py', 'skills/hil/scripts/hil_boards.py',
+FILES = ('skills/arduino/scripts/agentrc_pin.py', 'skills/hil/boards.json',
+         'skills/hil/scripts/agentrc_source.py', 'skills/hil/scripts/hil_boards.py',
          'skills/hil/scripts/hil_load.py', 'skills/hil/scripts/usb_observe.py')
 SELF = 'skills/arduino/scripts/arduino_build.py'
 SCHEMA = 2
@@ -1351,17 +1352,12 @@ def contract_identity():
     this process loaded in agentrc_source's portable form, {commit, sha256} (the digests as loaded). The harness
     admits a record only when the contract files and the agentrc closure's bytes match; the commit is provenance."""
     return {'contract': {f: sha256(P.ROOT / f) for f in P.CONTRACT_FILES if (P.ROOT / f).is_file()},
-            'agentrc': agentrc_source.portable(P.AGENTRC)}
+            'agentrc': agentrc_source.binding(P.AGENTRC)}
 
 
-def agentrc_drift(files=None):
-    """The closure files whose bytes differ from the ones this process loaded (AGENTRC sha256): now on disk, or in
-    `files` {path: sha256} (a copy's digests); an engine already imported runs the loaded bytes, so a record or a
-    stage must not bind newer ones."""
-    if files is None:
-        return agentrc_source.drift(P.AGENTRC)
-    loaded = P.AGENTRC['sha256']
-    return sorted(f for f in {*loaded, *files} if loaded.get(f) != files.get(f))
+def agentrc_drift():
+    """The closure files whose bytes differ from the ones this process loaded."""
+    return agentrc_source.drift(P.AGENTRC)
 
 
 def agentrc_mismatch(recorded):
@@ -1438,10 +1434,10 @@ def make_record(args, board, rows, before, diff, roster_path, prepared):
             **({'segments': [[o, n] for o, n in segments]} if segments else {}), **(extra or {}),
         }
     platform = rows[0]['platform']
-    identity = contract_identity()
-    drift = agentrc_drift()
-    if drift:
-        return None, f'agentrc changed since this process loaded it: {drift}; build again'
+    try:
+        identity = contract_identity()
+    except agentrc_source.SourceError as e:
+        return None, f'{e}; build again'
     record = {
         'version': SCHEMA, 'kind': 'arduino-hil-build', 'library': P.LIBRARY_NAME, 'board': board,
         'fqbn': P.BOARDS[board]['fqbn'], 'experimental': bool(args.experimental),

@@ -488,8 +488,8 @@ class Admission(Base):
         lock = self.agentrc['root'] / 'skills/hil/scripts/hil_lock.py'
         loaded = lock.read_text()
         lock.write_text('# another agentrc\n')
-        with self.assertRaisesRegex(H.Refused, r"agentrc changed since this harness loaded it: "
-                                               r"\['skills/hil/scripts/hil_lock.py'\]; rerun"):
+        with self.assertRaisesRegex(H.Refused, 'agentrc skills/hil/scripts/hil_lock.py changed since this process '
+                                               'loaded it; rerun'):
             self.admit(rec)
         lock.write_text(loaded)
         self.agentrc['commit'] = 'b' * 40   # another commit with the same closure: the files decide

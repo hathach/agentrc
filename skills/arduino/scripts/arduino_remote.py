@@ -5,6 +5,8 @@
 The rig gets binaries only: the library's contract files, the roster, the build records with their images and the
 agentrc closure the harness loads, each pinned by digest in manifest.json, in a create-only attempt dir
 <P.REMOTE_BASE>/<run-id> (agentrc hil_remote_core). Local records and collections live under P.REMOTE_RUNS.
+The inner agentrc/manifest.json is agentrc_source's frozen identity, itself pinned in the outer manifest's files.
+The outer agentrc {commit, dirty} remains readable by older consumer bootstraps.
 
 A library's `hil_remote.py` calls run(profile, argv) with its HIL profile (arduino_hil.py), which adds:
 
@@ -28,7 +30,8 @@ import time
 from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-FILES = ('skills/arduino/scripts/arduino_build.py', 'skills/arduino/scripts/arduino_hil.py', 'skills/hil/boards.json',
+FILES = ('skills/arduino/scripts/agentrc_pin.py', 'skills/arduino/scripts/arduino_build.py',
+         'skills/arduino/scripts/arduino_hil.py', 'skills/hil/boards.json',
          'skills/hil/scripts/agentrc_source.py', 'skills/hil/scripts/esptool_session.py',
          'skills/hil/scripts/hil_boards.py', 'skills/hil/scripts/hil_flash.py', 'skills/hil/scripts/hil_load.py',
          'skills/hil/scripts/hil_lock.py', 'skills/hil/scripts/hil_openocd_esp.py',
@@ -114,12 +117,10 @@ def snapshot(into, files, with_agentrc=False, bundle=None):
     digests = {f'{bundle}/{k}' if bundle else k: v
                for k, v in core.snapshot(P.ROOT, [P.ROOT / f for f in files], Path(into) / (bundle or '')).items()}
     if with_agentrc:
-        ag = Path(B.P.AGENTRC['root'])
-        copied = core.snapshot(ag, [ag / f for f in B.P.AGENTRC['files']], Path(into) / 'agentrc')
-        drift = B.agentrc_drift(copied)
-        if drift:
-            core.fail(f'agentrc changed since this process loaded it: {drift}; rerun')
-        digests.update({f'agentrc/{k}': v for k, v in copied.items()})
+        try:
+            digests.update(B.agentrc_source.stage(B.P.AGENTRC, into, name='agentrc'))
+        except (B.agentrc_source.SourceError, OSError) as e:
+            core.fail(f'{e}; rerun')
     return digests
 
 
@@ -288,7 +289,7 @@ def cmd_session_stage(a):
     staged over another would replace the images an earlier record, the restore's included, pins."""
     s = session_record(a.run_id)
     # record_files admits only records of this process's agentrc files; the rig's harness is the one staged at open
-    if B.contract_identity()['agentrc']['sha256'] != (s.get('agentrc') or {}).get('sha256'):
+    if B.agentrc_mismatch(s.get('agentrc')):
         core.fail('this agentrc\'s files are not the ones the session opened with, so the rig would refuse records '
                   'built with them: close the session and open a new one')
     tree = core.load_attempt(P.ROOT, runs(), a.run_id)
