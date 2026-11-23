@@ -439,7 +439,22 @@ def pre_commit(paths, deadline, start, what, hook=None, cwd=None, skip=()):
     except FileNotFoundError:
         raise Unusable(f"pre-commit's {python[0]} cannot run")
     finally:
-        os.unlink(records)
+        discard(records)
+
+
+def discard(path, tries=10, pause=0.2):
+    """Remove a temporary file this run made, best effort: on Windows a killed child that has not yet been reaped (or
+    one that left the group) can still hold it open, and an error here would replace the Late or result the caller
+    needs. Retried briefly, then left in the temp dir."""
+    for _ in range(tries):
+        try:
+            os.unlink(path)
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError:
+            time.sleep(pause)
+    return False
 
 
 def git_within(deadline, start, *argv, cwd=None):

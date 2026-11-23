@@ -13,8 +13,10 @@ but compares the serial only after opening (libusb_helper.c:272-286), so the ser
 would open every 303a:1001 ahead of the board's in libusb order. Not convoy-safe even pinned:
 esp_usb_jtag_revive_device (esp_usb_jtag.c:313-350, on a transfer error) finds the device
 again through jtag_libusb_find_device, which opens every 303a:1001 to read its serial and
-ignores the location (libusb_helper.c:500-540). openocd-esp32 source citations are at tag
-v0.12.0-esp32-20260703.
+ignores the location (libusb_helper.c:500-540). A 303a:1001 whose serial cannot be read is not
+ruled out, since it may hold the board's serial, unless it has no serial at all and a product that
+is not the USJ's (USJ_PRODUCT): an app on Espressif's default ids, which no serial compare can
+match. openocd-esp32 source citations are at tag v0.12.0-esp32-20260703.
 
 Session: one openocd server per operation, started with `noinit` in its own session (the
 terminal's SIGINT never reaches it) and driven over a Tcl port that must first answer this
@@ -46,6 +48,7 @@ session from its receipt:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
 import glob
 import hashlib
@@ -61,13 +64,15 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FILES = ('skills/hil/scripts/hil_load.py', 'skills/hil/scripts/usb_observe.py', 'skills/hil/scripts/hil_process.py',
          'skills/hil/scripts/hil_flash.py', 'skills/hil/scripts/pyocd/run_pyocd.py',
          'skills/hil/scripts/pyocd/user_script.py', 'skills/target-debug/scripts/esp_session.py',
-         'skills/hil/scripts/esptool_session.py', 'skills/hil/scripts/hil_openocd_esp_receipt.py')
+         'skills/hil/scripts/esptool_session.py', 'skills/hil/scripts/hil_openocd_esp_receipt.py',
+         'skills/hil/scripts/hil_lock.py')
 ESPTOOL_SESSION = os.path.join(HERE, 'esptool_session.py')   # read_security's child
 
 
@@ -92,6 +97,8 @@ hil_flash = hil_load.load_file('skills/hil/scripts/hil_flash.py')
 esp_session = hil_load.load_file('skills/target-debug/scripts/esp_session.py')
 receipt_state = hil_load.load_file('skills/hil/scripts/hil_openocd_esp_receipt.py')
 session_state, _int = receipt_state.session_state, receipt_state._int
+receipt_kind, describe = receipt_state.receipt_kind, receipt_state.describe
+hil_lock = hil_load.load_file('skills/hil/scripts/hil_lock.py')
 
 # The build whose program_esp, flash write_image/read_bank, esp_usb_jtag and shutdown paths were
 # read; another build is refused until its source is checked again. The pin also covers the `esp`
@@ -100,6 +107,9 @@ session_state, _int = receipt_state.session_state, receipt_state._int
 VERIFIED_OPENOCD = 'v0.12.0-esp32-20260703'
 OPENOCD_ENV = 'HIL_OPENOCD_ESP'
 USJ_VID_PID = ('303a', '1001')       # interface/esp_usb_jtag.cfg's `adapter usb vid_pid`
+# The ROM's product string of every chip's USB-Serial/JTAG, which always reports its MAC as a serial;
+# an app reusing Espressif's default 303a:1001 (TinyUSB's, Arduino's) reports its own product.
+USJ_PRODUCT = 'USB JTAG/serial debug unit'
 # adapter.c:324-331 warns about a location of 16 characters and truncates a longer one
 USB_LOCATION_MAX = 15
 
@@ -147,6 +157,262 @@ def refusal(*, retains_lock=False) -> str:
 def _admit_session(retains_lock):
     if why := refusal(retains_lock=retains_lock):
         raise RuntimeError(why)
+
+
+# A per-serial record of what an openocd_esp operation left not proven ended (#214): a session the
+# reviewed `end` has not ended, or read_security's esptool child whose recheck is not `done`. Every
+# board access here refuses while one is listed, whatever process, run dir or project asks. A
+# session is listed before its server is spawned (Session.start), so even a SIGKILL leaves it listed.
+PENDING_KIND = 'openocd-esp'
+
+
+def pending(serial: str):
+    """hil_lock.PendingSessions of the USJ with `serial`: <usj-serial>.openocd-esp-pending.json in
+    BOARD_LOCK_DIR (':' written '_', which a lock name cannot hold)."""
+    if not isinstance(serial, str) or not hil_flash.UID_RE.fullmatch(serial):
+        raise ValueError(f'USJ serial {serial!r}: want letters, digits and _ . : + -')
+    return hil_lock.PendingSessions('usj-' + serial.replace(':', '_'), PENDING_KIND)
+
+
+def _recheckable(receipt) -> bool:
+    """Whether a tracked receipt has the shape hil_process.recheck reads without raising: string token,
+    lock and record, a dict or no supervisor."""
+    return all(isinstance(receipt.get(k), str) for k in ('token', 'lock', 'record')) \
+        and isinstance(receipt.get('supervisor'), (dict, type(None)))
+
+
+def receipt_ended(receipt) -> bool:
+    """Whether the process a receipt stands for is proven ended: a session's after the reviewed
+    end, a tracked child's once its recheck is `done`. Anything else, an unreceipted entry or a
+    malformed tracked receipt included, is not: it clears only with a reviewed recovery's note."""
+    kind = receipt_kind(receipt)
+    if kind == 'session':
+        return session_state(receipt) == 'ended'
+    if kind == 'tracked':
+        return _recheckable(receipt) and hil_process.recheck(receipt) == 'done'
+    if kind == 'trackedDir':      # tidying nothing: a receipt listed apart rechecks from those files
+        if not _os_path(receipt['stateDir']):
+            return False          # no dir to recheck: it clears only with a reviewed recovery's note
+        if 'aheadLock' in receipt and _ahead_held(receipt['aheadLock'], receipt['stateDir']):
+            return False          # a live owner, which may not have started its child in the dir yet
+        return hil_process.recheck_dir(receipt['stateDir'], keep=hil_process._KeepAll())[0] == 'done'
+    return False
+
+
+def _os_path(path: str) -> bool:
+    """Whether a path read from a record reaches the OS without raising: no NUL, and the filesystem
+    encoding takes it (JSON decodes a lone surrogate)."""
+    try:
+        os.fsencode(path)
+    except UnicodeEncodeError:
+        return False
+    return '\0' not in path
+
+
+_AHEAD_NAME = re.compile(r'ahead_[0-9a-f]+\.lock')
+
+
+def _ahead_held(path, state) -> bool:
+    """Whether trackedDir marker `path` may still be held: while its owner flocks it, while it is
+    not a regular ahead_<hex>.lock file directly in `state` (read from a record anyone may write),
+    or while it cannot be opened, stated or flocked; False once it is gone or released. Opened
+    non-blocking so a planted FIFO cannot hang the probe."""
+    if not (isinstance(path, str) and '\0' not in path and _AHEAD_NAME.fullmatch(os.path.basename(path))
+            and path == os.path.join(state, os.path.basename(path))):
+        return True
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return True
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except OSError:          # BlockingIOError (held) or ENOLCK and the like: unproven either way
+        return True
+    finally:
+        os.close(fd)
+    return False
+
+
+# What latch could not write to a serial's record (OSError, PendingRefused): held in this process,
+# refusing every access here until a later pending_refusal lists it.
+_UNLISTED: dict = {}
+_UNLISTED_LOCK = threading.Lock()
+
+
+def _list_unlisted(serial, record):
+    """'' once what this process could not list under `serial` is listed, else why not."""
+    with _UNLISTED_LOCK:
+        entries = list(_UNLISTED.get(serial, ()))
+    if not entries:
+        return ''
+    try:
+        record.add(entries)
+    except (OSError, hil_lock.PendingRefused) as e:
+        return (f'USJ {serial} has {len(entries)} operation(s) not proven ended that {record} could not list ({e}): '
+                + '; '.join(describe(x['receipt']) for x in entries[:3]) + f'; {NEEDS_RECOVERY}')
+    with _UNLISTED_LOCK:
+        left = [x for x in _UNLISTED.get(serial, ()) if x not in entries]
+        if left:
+            _UNLISTED[serial] = left
+        else:
+            _UNLISTED.pop(serial, None)
+    return ''
+
+
+def pending_refusal(serial: str) -> str:
+    """Why board access to the USJ with `serial` is refused for what an earlier operation left
+    ('' when nothing is pending): a listed receipt not proven ended, one this process could not
+    list (retried here first), or a record that cannot be read or cleared. A record whose every
+    entry has since ended is cleared. Never raises for the record: a failure to read or clear it
+    is a refusal (a malformed serial stays ValueError)."""
+    record = pending(serial)
+    return _list_unlisted(serial, record) or _judge(serial, record)[0]
+
+
+def _judged(record):
+    """One read of `record` as (entry, receipt_ended) pairs; None when it is unreadable."""
+    sessions = record.read()
+    return None if sessions is None else [(e, receipt_ended(e['receipt'])) for e in sessions]
+
+
+def _judge(serial, record) -> tuple:
+    """(refusal, judged) of pending_refusal from one read of `record` (_judged; None when it was unreadable
+    or could not be read), clearing it when every entry that read lists has ended."""
+    judged = None
+    try:
+        judged = _judged(record)
+        if judged is None:
+            return f'{record} is unreadable: a session may still run on USJ {serial}; {NEEDS_RECOVERY}', None
+        left = [e['receipt'] for e, ended in judged if not ended]
+        if left:
+            return (f'USJ {serial} has {len(left)} operation(s) not proven ended ({record}): '
+                    + '; '.join(describe(r) for r in left[:3]) + f'; {_remedy(left, serial)}'), judged
+        if judged:
+            record.clear(lambda e: receipt_ended(e['receipt']))
+    except hil_lock.PendingRefused as e:      # an entry listed since the read: ask again
+        return f'USJ {serial}: {e}; ask again, or end it', judged
+    except OSError as e:
+        return (f'{record} cannot be read or cleared ({e}): a session may still run on USJ {serial}; '
+                f'{NEEDS_RECOVERY}'), judged
+    return '', judged
+
+
+def _remedy(receipts, serial) -> str:
+    """What ends the refusal for these open receipts, by kind."""
+    kinds = {receipt_kind(r) for r in receipts}
+    ways = []
+    if 'session' in kinds:
+        ways.append('end a session with `hil_openocd_esp.py end --receipt <receipt>`')
+    if kinds & {'tracked', 'trackedDir'}:
+        ways.append("an esptool child's entry clears by itself once its recheck is done")
+    ways.append(f'otherwise {NEEDS_RECOVERY}, then `hil_openocd_esp.py pending --serial {serial} --note <recovery>`')
+    return '; '.join(ways)
+
+
+def pending_entries(serial: str) -> dict:
+    """What the USJ with `serial` has open, split for a consumer's cleanup evidence
+    (hil_lock.log_cleanup_failure): {'receipts': tracked receipts, which hil_process.recheck
+    rechecks, 'retained': session receipts, retained by session_state, 'unrecheckable': what
+    nothing can recheck (an unreceipted, unrecognised or malformed entry, a state dir entry whose
+    owner's marker is held, or {'unreadable':
+    <record>, 'error': why} for a record that cannot be read)}. Only entries not proven ended, this process's
+    unlisted ones (latch) included; reads without clearing, and never raises for the record."""
+    record = pending(serial)
+    out = {'receipts': [], 'retained': [], 'unrecheckable': []}
+    with _UNLISTED_LOCK:
+        entries = list(_UNLISTED.get(serial, ()))
+    try:
+        sessions = record.read()
+        error = 'unparseable, or a malformed entry'
+    except OSError as e:
+        sessions, error = None, str(e)
+    if sessions is None:
+        out['unrecheckable'].append({'unreadable': str(record), 'error': error})
+    entries += [e for e in sessions or () if e not in entries]
+    for e in entries:
+        r = e['receipt']
+        if receipt_ended(r):
+            continue
+        if receipt_kind(r) == 'trackedDir':      # its open operations, as recheck_dir finds them
+            if not _os_path(r['stateDir']):
+                out['unrecheckable'].append(r)
+                continue
+            # sampled before the scan: an owner releases its marker only after latching its child,
+            # whose files the scan then finds; one seen held may start and latch it mid-scan
+            held = 'aheadLock' in r and _ahead_held(r['aheadLock'], r['stateDir'])
+            found = hil_process.recheck_dir(r['stateDir'], keep=hil_process._KeepAll())[1]
+            if held:
+                # a live owner whose own child may have no file there yet, whatever else the scan found
+                out['unrecheckable'].append(r)
+            for o in found:
+                if o not in out['receipts'] and o not in out['unrecheckable']:
+                    out['unrecheckable' if 'unrecheckable' in o else 'receipts'].append(o)
+            continue
+        kind = receipt_kind(r)
+        if kind == 'tracked' and not _recheckable(r):
+            kind = None
+        out[{'tracked': 'receipts', 'session': 'retained'}.get(kind, 'unrecheckable')].append(r)
+    return out
+
+
+def _refuse_pending(serial):
+    if why := pending_refusal(serial):
+        raise RuntimeError(why)
+
+
+def latch(serial, op, what):
+    """List what Operation `op` left not proven ended under `serial`: its receipts, or an
+    unreceipted entry naming `what` when it left none; nothing when `op` is None or its cleanup is
+    `done`. Returns the entries listed. Public so a consumer's fake provider lists as this one
+    does. When the record cannot take them (OSError, hil_lock.PendingRefused) that is raised
+    carrying `.operation`, and this process holds the entries, refusing every access to `serial`
+    until one lists them (pending_refusal)."""
+    if op is None or op.cleanup == 'done':
+        return []
+    entries = [{'receipt': r} for r in op.receipts] or \
+        [{'receipt': {'unreceipted': f'{what}: cleanup {op.cleanup}', 'serial': serial}}]
+    try:
+        pending(serial).add(entries)
+    except BaseException as e:
+        with _UNLISTED_LOCK:
+            held = _UNLISTED.setdefault(serial, [])
+            held.extend(x for x in entries if x not in held)
+        if getattr(e, 'operation', None) is None:
+            e.operation = op
+        raise
+    return entries
+
+
+def pending_main(serial, note=None):
+    """(rc, result) of the `pending` command: what the record of the USJ with `serial` lists and
+    why access is refused, 0 when nothing is pending and 1 otherwise; with `note`, a separately
+    reviewed recovery's, the record is cleared whatever it holds and logged with the note (a blank
+    note is refused, rc 1). The status is judged from one read of the record."""
+    record = pending(serial)
+    result = {'mode': 'pending', 'serial': serial, 'record': str(record)}
+    if note is not None:
+        if not note.strip():
+            return 1, dict(result, outcome='failed', error='--note is blank: name the reviewed recovery that '
+                                                           'proved the listed operations ended')
+        try:
+            cleared = record.clear(lambda e: receipt_ended(e['receipt']), note=note)
+        except (OSError, hil_lock.PendingRefused) as e:
+            return 1, dict(result, outcome='failed', error=str(e))
+        return 0, dict(result, outcome='cleared', sessions=cleared['sessions'], notEnded=cleared['notEnded'])
+    if why := _list_unlisted(serial, record):
+        try:
+            judged = _judged(record)
+        except OSError:
+            judged = None
+    else:
+        why, judged = _judge(serial, record)
+    listed = None if judged is None else [{'kind': receipt_kind(e['receipt']), 'describe': describe(e['receipt']),
+                                           'ended': ended} for e, ended in judged]
+    return (1 if why else 0), dict(result, outcome='refused' if why else 'clear', refusal=why, sessions=listed)
 
 
 def admit(flasher: dict) -> tuple:
@@ -225,6 +491,16 @@ def _attr(d, name):
         return f.read().strip()
 
 
+def _not_a_usj(d) -> bool:
+    """Whether the 303a:1001 at sysfs dir `d`, whose serial could not be read, is ruled out: it
+    has no serial at all (no `serial` attribute, so no string openocd could match) and a readable
+    product that is not the USJ's, i.e. an app on Espressif's default ids. Anything unsure is not."""
+    if os.path.lexists(os.path.join(d, 'serial')):
+        return False                  # a serial it did not answer: may be any USJ
+    product = usb_observe.read_sysfs(os.path.join(d, 'product'))
+    return product is not None and product != USJ_PRODUCT
+
+
 def _usj_walk(serial: str) -> list:
     found, unknown = [], []
     for d in sorted(glob.glob(os.path.join(usb_observe.SYS_USB_DEVICES, '*-*'))):
@@ -245,7 +521,8 @@ def _usj_walk(serial: str) -> list:
         if sn is None:
             sn = usb_observe.read_sysfs(os.path.join(d, 'serial'))
         if sn is None:
-            unknown.append(busport)
+            if not _not_a_usj(d):
+                unknown.append(busport)
         elif sn == serial:            # openocd compares exactly (libusb_helper.c string_descriptor_equal)
             found.append((busport, bus, dev))
     if unknown:
@@ -358,6 +635,8 @@ def _wrap(cmd, seq):
 
 
 DONE_QUERY = 'if {[info exists hil_done]} {set hil_done} else {list}'
+# command.c's refusal of an exec-mode command in a context still in config mode
+_MODE_REFUSED = "command must be used after 'init'"
 
 # target_handle_event's LOG_TARGET_ERROR "[%s] Execution of event %s failed:" (pinned build)
 _EVENT_FAILED_RE = re.compile(r'Error: \[(\S+)\] Execution of event (\S+) failed:')
@@ -408,13 +687,13 @@ class Session:
     """One managed openocd-esp32 server (module docstring). `ask` and `check` send one command
     and record it in `steps` with its outcome, answer and the log lines it produced."""
 
-    def __init__(self, argv, out, tcl_port, token):
-        self.argv, self.out = argv, out
+    def __init__(self, argv, out, tcl_port, token, serial=None):
+        self.argv, self.out, self.serial = argv, out, serial
         self.log, self.receipt = os.path.join(out, 'openocd.log'), os.path.join(out, 'receipt.json')
         self.lock_fd = None
         self.tcl = esp_session.Tcl(tcl_port, token)
         self.proc = self.rec = self.exit = self.failure = self.receipt_error = None
-        self.receipt_written = self.closed = self.timed_out = False
+        self.receipt_written = self.closed = self.timed_out = self.listed = False
         self.steps, self.deadline, self.seq = [], None, 0
 
     def start(self, deadline):
@@ -431,6 +710,11 @@ class Session:
                 self.lock_fd = _lock(self.receipt)
                 if self.lock_fd is None:
                     raise RuntimeError(f'{self.receipt}.lock is held by another owner')
+                if self.serial is not None:
+                    # write-ahead: listed before it exists, so a SIGKILL from here on leaves it refusing
+                    # (a receipt not yet written reads unreadable, never ended)
+                    pending(self.serial).add([{'receipt': self.receipt}])
+                    self.listed = True
                 self.proc = subprocess.Popen(self.argv, stdin=subprocess.DEVNULL, stdout=out, cwd=cwd,
                                              stderr=subprocess.STDOUT, start_new_session=True)
                 self.rec = {'pid': self.proc.pid, 'startTime': esp_session.start_time(self.proc.pid),
@@ -441,6 +725,9 @@ class Session:
                 self.receipt_written = True
             except BaseException:
                 if self.proc is None:
+                    if self.listed:     # nothing started: its write-ahead entry goes (kept if that fails)
+                        with contextlib.suppress(OSError, hil_lock.PendingRefused):
+                            pending(self.serial).withdraw(self.receipt)
                     self.release()
                 raise
             finally:
@@ -542,6 +829,18 @@ class Session:
                     self.receipt_error = e     # raised by _finish once the operation is built
         return cleanup
 
+    def _relist(self, record):
+        """The receipt file was never written, so its write-ahead path would read unreadable for
+        good: list the session by its in-memory `record` instead (None when it ended, whose
+        latch lists what an unproven end needs), then withdraw the path. Kept as it is when the
+        record cannot take that: the path still refuses."""
+        try:
+            if record is not None:
+                pending(self.serial).add([{'receipt': record}])
+            pending(self.serial).withdraw(self.receipt)
+        except (OSError, hil_lock.PendingRefused):
+            pass
+
     def operation(self, error=None, **extra):
         """hil_flash's Operation of one attempt, the session: argv, the commands sent as its
         script, the log as stdout, rc 0 (all done), 1 (failed), 124 (timed out) or None
@@ -549,6 +848,8 @@ class Session:
         self.tcl.close()    # an outstanding command still completes; the receipt reconnects
         cleanup = self.cleanup()
         receipt = None if cleanup != 'pending' else self.receipt if self.receipt_written else self.rec
+        if self.listed and not self.receipt_written and self.proc is not None:
+            self._relist(receipt)
         rc = None if error is not None else 124 if self.timed_out else 1 if self.failure else 0
         try:
             with open(self.log, errors='replace') as f:
@@ -572,7 +873,7 @@ def _finish(s, error=None, **info):
     hold = hil_process.InterruptHold()
     op = None
     try:
-        op = s.operation(error, **info)
+        op = s.finished = s.operation(error, **info)
     finally:
         s.release()
         try:
@@ -595,12 +896,14 @@ def _workdir(workdir) -> str:
     return path
 
 
-def _run(flasher: dict, work, *, workdir, timeout, openocd=None, record=None):
+def _run(flasher: dict, work, *, workdir, timeout, openocd=None, record=None, box=None):
     """Admit, resolve and start a session in a new directory under `workdir`, init it, run
     `work(session)` within `timeout` seconds, then end it as the module docstring says; `record`
     joins the operation's `session`. Refusals raise before anything starts; an exception after
     the start carries `.operation`. The USJ is resolved and the server started no earlier than
-    BOOT_SETTLE seconds after the call; admission runs inside that window, `timeout` after it."""
+    BOOT_SETTLE seconds after the call; admission runs inside that window, `timeout` after it.
+    `box`, a caller's empty list, gets the Session before it starts: its `finished` is the
+    Operation once built (_finish), for a caller whose interrupt landed after that."""
     t0 = time.monotonic()
     chip, cfgs = admit(flasher)
     workdir = _workdir(workdir)
@@ -611,7 +914,9 @@ def _run(flasher: dict, work, *, workdir, timeout, openocd=None, record=None):
     out = tempfile.mkdtemp(prefix='hil_openocd_esp_', dir=workdir)
     port, token = esp_session.free_ports(1)[0], secrets.token_hex(8)
     s = Session(server_argv(tool, cfgs, location, flasher['uid'], tcl_port=port, token=token,
-                            log=os.path.join(out, 'openocd.log')), out, port, token)
+                            log=os.path.join(out, 'openocd.log')), out, port, token, serial=flasher['uid'])
+    if box is not None:
+        box.append(s)
     info = {'openocd': tool['banner'], 'scripts': tool['scripts'], 'location': location, 'serial': flasher['uid'],
             **(record or {})}
     try:
@@ -791,8 +1096,33 @@ SECURITY_SETTLE = 2.0      # s run_tracked waits for the security read's descend
 SECURITY_STATE = 'security-ops'
 
 
+def _ahead_marker(state):
+    """(fd, path) of a new marker in run_tracked state dir `state`, flocked for as long as the fd is
+    open (never inherited), for a write-ahead entry's `aheadLock`. Not named `hil_op_`, so
+    recheck_dir never reads it: a lock-only hil_op_ file means a supervisor died starting."""
+    path = os.path.join(state, f'ahead_{secrets.token_hex(8)}.lock')
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644)
+    try:
+        os.fchmod(fd, 0o644)          # umask-proof
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BaseException:
+        os.close(fd)
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        raise
+    return fd, path
+
+
+def _drop_marker(marker):
+    if marker is not None:
+        with contextlib.suppress(OSError):
+            os.unlink(marker[1])
+        with contextlib.suppress(OSError):
+            os.close(marker[0])
+
+
 def read_security(serial: str, *, chip: str, workdir, timeout, retains_lock=False, esptool: str = 'esptool',
-                  run=None, baud: int = ESP_BAUD):
+                  run=None, baud: int = ESP_BAUD, ops=(), reap_grace=None, verbose=False, quiet=False):
     """Read the security state of the chip behind the USJ with `serial` before an openocd_esp
     flash: one esptool_session.py child, under the interpreter of `esptool` (hil_flash
     tool_python), on usj_tty(serial), that reads GET_SECURITY_INFO and the eFuses on the ROM
@@ -801,25 +1131,62 @@ def read_security(serial: str, *, chip: str, workdir, timeout, retains_lock=Fals
     default run_tracked with SECURITY_SETTLE and its state in `workdir`'s SECURITY_STATE dir,
     which outlives the call while a receipt names it. Refused, before any board access, as
     `refusal(retains_lock=)` refuses and for a chip not in SECURITY_CHIPS. Returns hil_flash's
-    Operation of the child with `security`, security_evidence's dict, only once the child is
+    Operation of the child with `security`, security_evidence's dict, and `serial`, only once the child is
     proven ended (cleanup `done`): an openocd session started beside a survivor would share the
     USJ with it. Otherwise, as for a failed child or evidence that is unknown or contradictory,
-    it raises carrying `.operation`, its cleanup and receipts."""
+    it raises carrying `.operation`, its cleanup and receipts, and lists what the child left in
+    the serial's pending record (pending), which refuses every later access until it ends.
+
+    `ops`: esptool_session.py read or md5 ops run in the same session after the security read,
+    so a caller's snapshot of the flash takes no second session; their results are the
+    Operation's `results`. `reap_grace`, `verbose` and `quiet` (no COMMAND FAILED banner, for a
+    caller that reports the failure itself) go to the default run_tracked. Refused too while the
+    serial's pending record lists an operation not proven ended (pending_refusal). SIGINT and
+    SIGTERM reach the child's run but are held from its end until what it left is listed
+    (hil_process.InterruptHold), then delivered: an interrupt never unwinds past an unlisted child."""
     _admit_session(retains_lock)
     _security_chip(chip)
+    ops = list(ops)
+    if not all(isinstance(o, dict) and o.get('op') in ('read', 'md5') for o in ops):
+        raise ValueError(f'ops {ops!r:.200}: only esptool_session read and md5 ops follow the security read')
+    _refuse_pending(serial)
     tty, python = usj_tty(serial), hil_flash.tool_python(esptool)
-    if run is None:
-        state = hil_process.state_dir(_workdir(workdir), SECURITY_STATE)
+    what = f'read_security on {tty}'
+    ahead = marker = None
+    hold, op = hil_process.InterruptHold(), None
+    try:
+        if run is None:
+            state = hil_process.state_dir(_workdir(workdir), SECURITY_STATE)
+            grace = {} if reap_grace is None else {'reap_grace': reap_grace}
+            # write-ahead: the state dir is listed before the child starts in it, so a SIGKILL from here
+            # on leaves it refusing until recheck_dir finds every operation there done; withdrawn once
+            # the child's own receipt is listed (_held_run). Until then the marker's flock keeps it
+            # from reading done while the dir is still empty.
+            marker = _ahead_marker(state)
+            ahead = {'stateDir': state, 'what': what, 'aheadLock': marker[1]}
+            pending(serial).add([{'receipt': ahead}])
 
-        def run(cmd, cwd=None, **kw):
-            return hil_process.run_tracked(cmd, cwd, settle=SECURITY_SETTLE, state_dir=state, **kw)
-    with tempfile.TemporaryDirectory(prefix='hil_security_', dir=_workdir(workdir)) as td:
-        ops = os.path.join(td, 'ops.json')
-        with open(ops, 'w') as f:
-            json.dump([{'op': 'security'}], f)
-        argv = [python, '-B', ESPTOOL_SESSION, '--port', tty, '--chip', chip, '--baud', str(baud),
-                '--after', 'hard-reset', ops]
-        op = hil_flash._once(run, argv, env=dict(hil_flash.ESPTOOL_ENV), timeout=timeout)
+            def run(cmd, cwd=None, **kw):
+                return hil_process.run_tracked(cmd, cwd, settle=SECURITY_SETTLE, state_dir=state, verbose=verbose,
+                                               quiet=quiet, **grace, **kw)
+        with tempfile.TemporaryDirectory(prefix='hil_security_', dir=_workdir(workdir)) as td:
+            ops_file = os.path.join(td, 'ops.json')
+            with open(ops_file, 'w') as f:
+                json.dump([{'op': 'security'}, *ops], f)
+            argv = [python, '-B', ESPTOOL_SESSION, '--port', tty, '--chip', chip, '--baud', str(baud),
+                    '--after', 'hard-reset', ops_file]
+            attempts = []
+            op = _held_run(hold, serial, what,
+                           lambda: hil_flash._once(run, argv, attempts, env=dict(hil_flash.ESPTOOL_ENV), timeout=timeout),
+                           lambda: hil_flash.Operation(attempts) if attempts else None, ahead=ahead)
+    except BaseException as e:
+        op = getattr(e, 'operation', None) or op
+        raise
+    finally:
+        try:
+            _drop_marker(marker)
+        finally:
+            _release(hold, op)
     try:
         if op.cleanup != 'done':
             raise RuntimeError(f'esptool_session on {tty}: cleanup {op.cleanup}, its child is not proven ended')
@@ -832,10 +1199,13 @@ def read_security(serial: str, *, chip: str, workdir, timeout, retains_lock=Fals
             raise RuntimeError(f'esptool_session on {tty} (rc {op.returncode}): '
                                f'{out.get("error") if isinstance(out, dict) else "no result line"}')
         results = out.get('results')
-        if not isinstance(results, list) or not results:
-            raise RuntimeError(f'esptool_session on {tty}: results {results!r}, want the security op\'s')
+        if not isinstance(results, list) or len(results) != 1 + len(ops):
+            raise RuntimeError(f'esptool_session on {tty}: results {results!r:.300}, want the security op\'s and '
+                               f'{len(ops)} more')
+        op.results = tuple(results[1:])
         op.security = security_evidence(results[0], chip=chip,
                                         source=f'esptool {out.get("esptool")} on {tty}, USJ {serial}, ROM loader')
+        op.serial = serial
     except Exception as e:      # every parse failure carries the child's operation, its cleanup and receipt
         e.operation = op
         raise
@@ -977,8 +1347,13 @@ def flash_openocd_esp(flasher: dict, segments, *, security, workdir, timeout, op
     managed session (module docstring) within `timeout` seconds, files in a new directory under
     `workdir`. The chip must not sit in its ROM loader (the `hil` skill's Flashers).
 
-    `security` is the caller's evidence that flash encryption and secure boot are off
-    (admit_security, such as read_security's), required and recorded as `session['security']`.
+    `security` is read_security's Operation of the flasher's USJ (its `serial` the `uid`; another
+    USJ's read is refused before any access): its child proven ended (cleanup `done`) and its
+    `security` evidence that flash encryption and secure boot are off (admit_security), recorded
+    as `session['security']`. A bare evidence dict is refused, as it proves no child ended: an
+    openocd session started beside a surviving esptool would share the USJ with it (#213).
+    Refused too while the USJ's pending record lists an operation not proven ended; a session
+    this flash leaves pending is listed there (pending).
     `retains_lock=True` is the caller's declaration that it holds the board lock through the
     operation and logs a session left pending (refusal); without it the flash is refused.
 
@@ -990,7 +1365,10 @@ def flash_openocd_esp(flasher: dict, segments, *, security, workdir, timeout, op
     (_program) and `readBack` (file, length, match, firstMismatch). Refusals raise ValueError
     or RuntimeError before anything starts."""
     _admit_session(retains_lock)
-    security = admit_security(security)
+    if getattr(security, 'serial', None) != flasher.get('uid'):
+        raise ValueError(f'security read of USJ {getattr(security, "serial", None)!r}: want read_security\'s '
+                         f'Operation of the flashed USJ {flasher.get("uid")!r}')
+    security = admit_read(security)
     admitted = admit_segments(segments)
     records = [rec for rec, _ in admitted]
 
@@ -1035,14 +1413,8 @@ def flash_openocd_esp(flasher: dict, segments, *, security, workdir, timeout, op
             if diff is not None:
                 raise _Stop(f"read-back of {rec['file']} at 0x{rec['offset']:x} differs at +0x{diff:x}", end=True)
 
-    try:
-        op = _run(flasher, work, workdir=workdir, timeout=timeout, openocd=openocd, record={'security': security})
-    except BaseException as e:
-        if hasattr(e, 'operation'):
-            e.operation.segments = tuple(records)
-        raise
-    op.segments = tuple(records)
-    return op
+    return _latched(flasher, work, workdir=workdir, timeout=timeout, openocd=openocd, record={'security': security},
+                    segments=tuple(records))
 
 
 def reset_openocd_esp(flasher: dict, *, workdir, timeout, openocd=None, retains_lock=False):
@@ -1053,7 +1425,90 @@ def reset_openocd_esp(flasher: dict, *, workdir, timeout, openocd=None, retains_
     leaves the session pending instead. Refused without `retains_lock=True` (refusal).
     Returns hil_flash's Operation, as flash_openocd_esp without `segments`."""
     _admit_session(retains_lock)
-    return _run(flasher, lambda s: None, workdir=workdir, timeout=timeout, openocd=openocd)
+    return _latched(flasher, lambda s: None, workdir=workdir, timeout=timeout, openocd=openocd)
+
+
+def admit_read(read) -> dict:
+    """The admitted evidence of read_security's Operation `read`: refused unless its child is
+    proven ended (cleanup `done`) and its `security` passes admit_security."""
+    if isinstance(read, dict) or not hasattr(read, 'security') or not hasattr(read, 'cleanup'):
+        raise ValueError(f'security {type(read).__name__}: want read_security\'s Operation, whose child is proven '
+                         f'ended; bare evidence proves no child ended, and programming is refused')
+    if read.cleanup != 'done':
+        raise RuntimeError(f'the security read\'s cleanup is {read.cleanup}: its child is not proven ended')
+    return admit_security(read.security)
+
+
+def _held_run(hold, serial, what, work, partial, segments=None, ahead=None):
+    """work()'s Operation, with what it left listed under `serial` (latch), a raised one's
+    included. SIGINT and SIGTERM reach work() through `hold` (hil_process.InterruptHold) and are
+    deferred again from the first instruction after it, so none unwinds before the latch; the
+    caller's release() delivers them. An exception without `.operation` (one that landed after
+    work() had its result, before it returned) takes partial(), the Operation work() recorded
+    so far, or None. A latch that fails raises carrying the Operation (latch). `ahead`, a
+    write-ahead entry's receipt, is withdrawn once the Operation is listed: from there its own
+    receipts stand for it. A returned or raised Operation carries `segments` when given, before
+    its latch can fail."""
+    try:
+        try:
+            hold.deliver()
+            op = work()
+        finally:
+            hold.deferring = True       # an attribute store, no interrupt check: deferred from here
+            hold.rearm()
+    except BaseException as e:
+        if getattr(e, 'operation', None) is None and (found := partial()) is not None:
+            e.operation = found
+        if (failed := getattr(e, 'operation', None)) is not None and segments is not None:
+            failed.segments = segments
+        latch(serial, failed, what)
+        if failed is not None:
+            _withdraw_ahead(serial, ahead)
+        raise
+    if segments is not None:
+        op.segments = segments
+    latch(serial, op, what)
+    _withdraw_ahead(serial, ahead)
+    if op.cleanup == 'done':
+        pending_refusal(serial)         # its write-ahead entry, ended, goes with any other that has
+    return op
+
+
+def _withdraw_ahead(serial, ahead):
+    """Withdraw write-ahead entry `ahead` (None: none), keeping it when the record cannot be
+    changed: it then still refuses until it ends."""
+    if ahead is not None:
+        with contextlib.suppress(OSError, hil_lock.PendingRefused):
+            pending(serial).withdraw(ahead)
+
+
+def _release(hold, op):
+    """hold.release(); a signal it delivers carries `op`, the Operation so far, unless it has one."""
+    try:
+        hold.release()
+    except BaseException as late:
+        if op is not None and getattr(late, 'operation', None) is None:
+            late.operation = op
+        raise
+
+
+def _latched(flasher, work, *, segments=None, **kw):
+    """_run once the USJ's pending record lists nothing open, listing what the session leaves
+    pending there, a raised one included, with interrupts held until it is listed (_held_run).
+    The Operation carries `segments` when given."""
+    admit(flasher)
+    serial = flasher['uid']
+    _refuse_pending(serial)
+    hold, box, op = hil_process.InterruptHold(), [], None
+    try:
+        op = _held_run(hold, serial, f'openocd_esp on USJ {serial}', lambda: _run(flasher, work, box=box, **kw),
+                       lambda: getattr(box[0], 'finished', None) if box else None, segments)
+        return op
+    except BaseException as e:
+        op = getattr(e, 'operation', None) or op
+        raise
+    finally:
+        _release(hold, op)
 
 
 # -------------------------------------------------------------
@@ -1140,9 +1595,11 @@ def _end_owned(receipt, deadline) -> tuple:
                                    f'{NEEDS_RECOVERY}')
         if not esp_session.same_process(rec):        # the pidfd now names the identified process
             return stop('refused', f"process {rec['pid']} changed while it was identified: nothing sent")
+        if rec['init'] is None and rec['submitted'] == 0:
+            return _end_uninitialised(receipt, rec, pidfd, deadline, result, stop)
         if rec['init'] != 'ok':
-            return stop('refused', f"init {rec['init'] or 'never sent'}: the ordinary end (reset run, shutdown) is "
-                                   f'refused after a failed or unproven init; {NEEDS_RECOVERY}')
+            return stop('refused', f"init {rec['init']}: the ordinary end (reset run, shutdown) is refused after a "
+                                   f'failed or unproven init; {NEEDS_RECOVERY}')
         tcl = esp_session.Tcl(rec['ports'][2], rec['token'], deadline=deadline)
         done = tcl(DONE_QUERY)
         result['done'] = done
@@ -1154,9 +1611,23 @@ def _end_owned(receipt, deadline) -> tuple:
         mark = esp_session.size_of(rec['log']) or 0
         answer = tcl(_wrap('reset run', rec['submitted']))
         result['resetRun'] = answer
-        _, events = _log_since(rec['log'], mark)
+        lines, events = _log_since(rec['log'], mark)
         if events:
             result['events'] = events
+        if answer.startswith('HIL-ERR') and not events and any(_MODE_REFUSED in ln for ln in lines):
+            # init ran on the owner's connection, whose command context alone is in exec mode
+            # (server.c copies the context per connection; init sets the copy's mode): this
+            # connection may not reset, and the refusal touched nothing. Shutdown alone.
+            result['targetReset'] = False
+            _shutdown(tcl)
+            if not _exited(pidfd, deadline):
+                return stop('failed', 'openocd exit not confirmed after shutdown (still running?); rerun end')
+            esp_session.write_receipt(receipt, {**rec, 'closed': True, 'cleanup': 'done',
+                                    'end': {'resetRun': answer, 'shutdownOnly': "reset refused before 'init' on "
+                                            "end's connection; the target is left as the session left it",
+                                            'at': time.strftime('%Y-%m-%dT%H:%M:%S%z')}})
+            result['outcome'] = 'ended'
+            return 0, result
         if not answer.startswith('HIL-OK') or events:
             return stop('failed', f"'reset run' failed: {'; '.join(events) or answer}; {NEEDS_RECOVERY}")
         _shutdown(tcl)
@@ -1175,15 +1646,51 @@ def _end_owned(receipt, deadline) -> tuple:
             os.close(pidfd)
 
 
+def _end_uninitialised(receipt, rec, pidfd, deadline, result, stop) -> tuple:
+    """End a server its owner left before init (started `noinit`, nothing submitted): no target was
+    touched, so `shutdown` alone, once the server proves no command ran, then its exit by pidfd.
+    openocd-esp32's shutdown still runs esp_common.cfg's pre-shutdown commands, which try to
+    examine the never-initialised targets and only log that they could not."""
+    tcl = esp_session.Tcl(rec['ports'][2], rec['token'], deadline=deadline)
+    try:
+        done = tcl(DONE_QUERY)
+        result['done'] = done
+        if done != '':
+            return stop('refused', f'init was never sent, yet the server has run #{done}: nothing sent; '
+                                   f'{NEEDS_RECOVERY}')
+        _shutdown(tcl)
+    finally:
+        tcl.close()
+    if not _exited(pidfd, deadline):
+        return stop('failed', 'openocd exit not confirmed after shutdown (still running?); rerun end')
+    esp_session.write_receipt(receipt, {**rec, 'closed': True, 'cleanup': 'done',
+                                        'end': {'shutdownOnly': 'init never sent',
+                                                'at': time.strftime('%Y-%m-%dT%H:%M:%S%z')}})
+    result['outcome'] = 'ended'
+    return 0, result
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description='End a pending openocd_esp session from its receipt '
-                                            '(end_session); one JSON object on stdout.')
+                                            "(end_session), or read or clear a USJ's pending record; "
+                                            'one JSON object on stdout.')
     sub = p.add_subparsers(dest='mode', required=True)
     e = sub.add_parser('end', help='reset run and shut down the session a receipt names')
     e.add_argument('--receipt', required=True, metavar='FILE')
     e.add_argument('--timeout', type=float, default=END_TIMEOUT, metavar='S',
                    help=f'one bound on the whole end, in seconds (default {END_TIMEOUT})')
+    q = sub.add_parser('pending', help="what a USJ's pending record lists and why access is refused; with --note, "
+                                       'clear it after a separately reviewed recovery')
+    q.add_argument('--serial', required=True, help='the USJ serial, as the board registry uid')
+    q.add_argument('--note', help='the reviewed recovery that proved the listed operations ended')
     a = p.parse_args(argv)
+    if a.mode == 'pending':
+        try:
+            rc, result = pending_main(a.serial, a.note)
+        except ValueError as err:
+            p.error(f'--serial {a.serial}: {err}')
+        print(json.dumps(result))
+        return rc
     if not (0 < a.timeout < float('inf')):
         p.error('--timeout must be a finite positive number of seconds')
     try:

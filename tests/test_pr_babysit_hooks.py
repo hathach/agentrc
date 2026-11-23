@@ -1275,6 +1275,34 @@ class KillTreeTest(unittest.TestCase):
         self.assertIsNotNone(proc.poll(), 'the run itself is killed whatever taskkill did')
 
 
+class DiscardTest(unittest.TestCase):
+    def test_a_file_still_held_is_retried_then_left_and_never_raises(self):
+        # Windows: a killed child not yet reaped holds the records file (WinError 32), which must not replace Late
+        held = PermissionError(32, 'The process cannot access the file because it is being used by another process')
+        with mock.patch.object(hooks.os, 'unlink', side_effect=held) as unlink, \
+                mock.patch.object(hooks.time, 'sleep') as sleep:
+            self.assertFalse(hooks.discard('records', tries=3, pause=0.1))
+        self.assertEqual(unlink.call_count, 3)
+        self.assertEqual(sleep.call_count, 3)
+
+    def test_a_file_released_on_a_retry_or_already_gone_is_removed(self):
+        with mock.patch.object(hooks.os, 'unlink', side_effect=[PermissionError(32, 'held'), None]), \
+                mock.patch.object(hooks.time, 'sleep'):
+            self.assertTrue(hooks.discard('records'))
+        with mock.patch.object(hooks.os, 'unlink', side_effect=FileNotFoundError):
+            self.assertTrue(hooks.discard('records'))
+
+    def test_pre_commits_own_error_survives_a_records_file_it_cannot_remove(self):
+        late = hooks.Late('pre-commit did not finish within 20 s (HEAD slow)')
+        with mock.patch.object(hooks, 'pre_commit_python', return_value=([sys.executable], 'entry.py')), \
+                mock.patch.object(hooks, 'bounded', side_effect=late), \
+                mock.patch.object(hooks.os, 'unlink', side_effect=PermissionError(32, 'held')), \
+                mock.patch.object(hooks.time, 'sleep'):
+            with self.assertRaises(hooks.Late) as caught:
+                hooks.pre_commit(['a.txt'], 20, 0, 'HEAD slow')
+        self.assertIs(caught.exception, late)
+
+
 class PinnedAbbrevTest(unittest.TestCase):
     def test_appends_after_the_callers_own_config_entries(self):
         env = hooks.pinned_abbrev({'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'core.abbrev', 'GIT_CONFIG_VALUE_0': '7'}, 9)

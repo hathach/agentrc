@@ -7,9 +7,13 @@ import unittest
 if os.name == 'nt':
     raise unittest.SkipTest('hil_openocd_esp is Linux only')
 
+import contextlib
+import errno
 import hashlib
 import importlib.util
+import io
 import json
+import re
 import shutil
 import signal
 import socket
@@ -19,6 +23,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import warnings
 from pathlib import Path
 from unittest import mock
@@ -42,6 +47,21 @@ hf = load('agentrc_hil_flash', SCRIPTS / 'hil_flash.py')
 SERIAL = '30:ED:A0:E0:C9:02'
 BOARD = {'name': 'openocd_esp', 'uid': SERIAL, 'args': '-f board/esp32p4-builtin.cfg'}
 SECURITY = {'flashEncryption': 'off', 'secureBoot': 'off', 'source': 'esptool transcript /w/security.txt'}
+
+
+def read_op(security=SECURITY, cleanup='done', serial=SERIAL):
+    """read_security's Operation as flash_openocd_esp takes it: its evidence, its child's cleanup and its USJ."""
+    return types.SimpleNamespace(security=security, cleanup=cleanup, serial=serial)
+
+
+def fresh_locks(test):
+    """A new BOARD_LOCK_DIR for the pending registry, so one test's latched session refuses no other."""
+    root = tempfile.mkdtemp(prefix='locks_')
+    test.addCleanup(shutil.rmtree, root, True)
+    for p in (mock.patch.object(oe.hil_lock, 'BOARD_LOCK_DIR', root), mock.patch.dict(oe._UNLISTED, clear=True)):
+        p.start()
+        test.addCleanup(p.stop)
+    return root
 BANNER = f'Open On-Chip Debugger {oe.VERIFIED_OPENOCD} (2026-07-03-13:49)'
 
 
@@ -201,7 +221,7 @@ def reply(conn, text):
         pass                        # the client gave up; the command has run all the same
 def serve(conn):
     global done
-    buf = b''
+    buf, conn_init = b'', False     # FAKE_CONN_MODE: init puts only its own connection in exec mode
     while True:
         chunk = conn.recv(65536)
         if not chunk:
@@ -228,7 +248,13 @@ def serve(conn):
                 sys.exit(int(os.environ.get('FAKE_SHUTDOWN_RC', '0')))
             m = WRAPPED.match(cmd)
             event(tcl=m[1] if m else cmd)
-            answer = run(m[1]) if m else 'unwrapped'
+            if m and os.environ.get('FAKE_CONN_MODE') and m[1].split()[0] == 'reset' and not conn_init:
+                say("Error: The 'reset' command must be used after 'init'.")
+                answer = 'HIL-ERR '
+            else:
+                answer = run(m[1]) if m else 'unwrapped'
+            if m and m[1] == 'init':
+                conn_init = True
             if answer is None:
                 held.append(conn)   # its frame stays unread while the next connection is served
                 return
@@ -282,9 +308,12 @@ class FakeBus:
             p.start()
             test.addCleanup(p.stop)
 
-    def add(self, busport, serial=SERIAL, *, vid_pid=oe.USJ_VID_PID, bus=5, dev=14, udev=True, sysfs=True):
+    def add(self, busport, serial=SERIAL, *, vid_pid=oe.USJ_VID_PID, bus=5, dev=14, udev=True, sysfs=True,
+            product=None):
         d = self.sys / busport
         d.mkdir()
+        if product is not None:
+            (d / 'product').write_text(f'{product}\n')
         for name, value in (('idVendor', vid_pid[0]), ('idProduct', vid_pid[1]), ('busnum', bus), ('devnum', dev)):
             (d / name).write_text(f'{value}\n')
         if serial is not None and sysfs:
@@ -431,6 +460,25 @@ class UsjLocation(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, r'cannot rule out 5-3\.1'):
             oe.usj_location(SERIAL)
 
+    def test_an_app_on_espressifs_default_ids_without_a_serial_is_ruled_out(self):
+        """ci.lan: an ESP32-S3 running an Arduino image enumerates as 303a:1001 with no serial."""
+        self.bus.add('5-3.4', product=oe.USJ_PRODUCT)
+        self.bus.add('11-1.3', None, dev=9, product='ESP32S3_DEV')
+        self.assertEqual(oe.usj_location(SERIAL), '5-3.4')
+        for busport, kw in (('11-1.4', {'product': oe.USJ_PRODUCT}),     # the USJ's product, its serial unread
+                            ('11-1.5', {}),                                 # no product to tell
+                            ('11-1.6', {'product': 'ESP32S3_DEV', 'sysfs_serial': True})):  # a serial it did not answer
+            with self.subTest(busport=busport):
+                d = self.bus.add(busport, None, dev=10 + len(busport), product=kw.get('product'))
+                if kw.get('sysfs_serial'):
+                    os.mkfifo(d / 'serial')          # present but unanswered (a read would block)
+                with mock.patch.object(oe.usb_observe, 'read_sysfs',
+                                       lambda path, *a: None if path.endswith('/serial') else
+                                       Path(path).read_text().strip() if os.path.exists(path) else None), \
+                        self.assertRaisesRegex(RuntimeError, f'cannot rule out {re.escape(busport)}'):
+                    oe.usj_location(SERIAL)
+                shutil.rmtree(d)
+
     def test_a_roster_port_is_checked_alone(self):
         self.bus.add('5-3.4')
         self.bus.add('5-3.1', None, dev=9)                    # unreadable: the bus-wide walk refuses
@@ -528,6 +576,7 @@ class SessionCase(unittest.TestCase):
         cleanup = mock.patch.object(oe, 'CLEANUP_TIMEOUT', 3)
         cleanup.start()
         self.addCleanup(cleanup.stop)
+        self.locks = fresh_locks(self)
         settle = mock.patch.object(oe, 'BOOT_SETTLE', 0)
         settle.start()
         self.addCleanup(settle.stop)
@@ -971,7 +1020,7 @@ class Programming(SessionCase):
 
     def flash_op(self, segs=None, *, bank=None, **kw):
         env = {'FAKE_FLASH': str(self.flash), 'FAKE_BANK_SIZE': hex(self.BANK if bank is None else bank), **kw.pop('env', {})}
-        security = kw.pop('security', SECURITY)
+        security = kw.pop('security', read_op())
         return self.run_op(lambda timeout: oe.flash_openocd_esp(BOARD, self.segs if segs is None else segs,
                                                                  security=security, workdir=str(self.work),
                                                                  timeout=timeout, openocd=str(self.exe),
@@ -1064,8 +1113,31 @@ class Programming(SessionCase):
                          {**SECURITY, 'source': ''}, {k: v for k, v in SECURITY.items() if k != 'source'},
                          {**SECURITY, 'extra': 1}, 'off'):
             with self.subTest(security=security), self.assertRaisesRegex(ValueError, 'security'):
-                self.flash_op(security=security)
+                self.flash_op(security=read_op(security))
         self.assertEqual(self.events(), [])
+
+    def test_bare_evidence_or_a_read_whose_child_is_not_proven_ended_is_refused(self):
+        """agentrc#213: only read_security's Operation, its child proven ended, admits a flash."""
+        for security in (SECURITY, None, 'off'):
+            with self.subTest(security=security), self.assertRaisesRegex(ValueError, "read_security's Operation"):
+                self.flash_op(security=security)
+        for cleanup in ('pending', 'unknown', None):
+            with self.subTest(cleanup=cleanup), self.assertRaisesRegex(RuntimeError, 'not proven ended'):
+                self.flash_op(security=read_op(cleanup=cleanup))
+        self.assertEqual(self.events(), [])
+
+    def test_a_security_read_of_another_usj_is_refused_before_any_access(self):
+        """CodeRabbit on #574: a read of any USJ admitted the flash of this one."""
+        never = {'side_effect': AssertionError('touched')}
+        with mock.patch.object(oe, '_usj_walk', **never), mock.patch.object(oe.subprocess, 'Popen', **never):
+            for serial in ('30:ED:A0:E0:C9:03', None):
+                with self.subTest(serial=serial), self.assertRaisesRegex(ValueError, 'USJ'):
+                    self.flash_op(security=read_op(serial=serial))
+            with self.assertRaisesRegex(ValueError, 'USJ'):
+                self.flash_op(security=types.SimpleNamespace(security=SECURITY, cleanup='done'))
+        self.assertEqual(self.events(), [])
+        self.assertEqual(oe.pending(SERIAL).read(), [])
+        self.assertEqual(self.flash_op(security=read_op(serial=SERIAL)).returncode, 0)
 
     def test_a_corrupt_trailing_byte_the_verify_skips_fails_the_read_back(self):
         op = self.flash_op(env={'FAKE_CORRUPT': 'tail'})
@@ -1237,6 +1309,328 @@ class Reset(SessionCase):
         self.assertPending(op)
 
 
+class PendingRegistry(SessionCase):
+    """agentrc#214: a session left pending is listed under its USJ serial and refuses the next one."""
+
+    def reset(self, **kw):
+        return self.run_op(lambda timeout: oe.reset_openocd_esp(BOARD, workdir=str(self.work), timeout=timeout,
+                                                                 openocd=str(self.exe), retains_lock=True), **kw)
+
+    def test_a_pending_reset_refuses_the_next_flash_reset_and_read_until_it_ends(self):
+        op = self.reset(script={'reset run': 'event:reset-assert-post'})
+        self.assertPending(op)
+        self.assertEqual(oe.pending(SERIAL).read(), [{'receipt': op.session['receipt']}])
+        app = self.root / 'app.bin'
+        app.write_bytes(b'\xe9' + b'\0' * 4095)
+        seg = {'offset': 0x10000, 'file': str(app), 'size': 4096}
+        tcl = self.tcl()
+        for name, call in (('reset', lambda: oe.reset_openocd_esp(BOARD, workdir=str(self.work), timeout=5,
+                                                                    openocd=str(self.exe), retains_lock=True)),
+                           ('flash', lambda: oe.flash_openocd_esp(BOARD, [seg], security=read_op(), workdir=str(self.work),
+                                                                    timeout=5, openocd=str(self.exe),
+                                                                    retains_lock=True)),
+                           ('security', lambda: oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work),
+                                                                 timeout=5, retains_lock=True))):
+            with self.subTest(op=name), self.assertRaisesRegex(RuntimeError, 'not proven ended.*openocd_esp session'):
+                call()
+        self.assertEqual(self.tcl(), tcl, 'a refused operation reaches no server')
+        with mock.patch.object(oe, 'session_state', return_value='ended'):
+            self.assertEqual(oe.pending_refusal(SERIAL), '')
+        self.assertFalse(os.path.exists(oe.pending(SERIAL).path))
+
+    def test_an_interrupt_after_a_session_is_held_until_it_is_listed(self):
+        old = signal.signal(signal.SIGINT, signal.default_int_handler)
+        self.addCleanup(signal.signal, signal.SIGINT, old)
+        op = types.SimpleNamespace(cleanup='pending', receipts=('/w/receipt.json',))
+        real = oe.latch
+
+        def latch(*a):
+            signal.raise_signal(signal.SIGINT)
+            return real(*a)
+        with mock.patch.object(oe, '_run', lambda *a, **k: op), mock.patch.object(oe, 'latch', latch), \
+                self.assertRaises(KeyboardInterrupt) as cm:
+            oe._latched(BOARD, 'reset')
+        self.assertIs(cm.exception.operation, op)
+        self.assertEqual(oe.pending(SERIAL).read(), [{'receipt': '/w/receipt.json'}])
+        self.assertEqual(signal.getsignal(signal.SIGINT), signal.default_int_handler)
+
+    def test_an_interrupt_during_a_flashs_latch_carries_the_operation_and_its_segments(self):
+        old = signal.signal(signal.SIGINT, signal.default_int_handler)
+        self.addCleanup(signal.signal, signal.SIGINT, old)
+        real, segments = oe.latch, ({'offset': 0, 'file': 'app.bin'},)
+
+        def latch(*a):
+            signal.raise_signal(signal.SIGINT)
+            return real(*a)
+
+        def failed(*a, **k):
+            e = RuntimeError('write failed')
+            e.operation = types.SimpleNamespace(cleanup='pending', receipts=('/w/failed.json',))
+            raise e
+        for name, run in (('returned', lambda *a, **k: types.SimpleNamespace(cleanup='pending',
+                                                                              receipts=('/w/receipt.json',))),
+                          ('raised', failed)):
+            fresh_locks(self)
+            with self.subTest(run=name), mock.patch.object(oe, '_run', run), mock.patch.object(oe, 'latch', latch), \
+                    self.assertRaises(KeyboardInterrupt) as cm:
+                oe._latched(BOARD, 'flash', segments=segments)
+            self.assertEqual(cm.exception.operation.segments, segments)
+            self.assertEqual(cm.exception.operation.receipts, (oe.pending(SERIAL).read()[0]['receipt'],))
+
+    def test_a_pending_flash_the_record_cannot_list_carries_its_segments(self):
+        """CodeRabbit on #214: the Operation a failed success-path latch raised lacked `.segments`."""
+        op, segments = types.SimpleNamespace(cleanup='pending', receipts=('/w/receipt.json',)), ({'offset': 0},)
+        with mock.patch.object(oe, '_run', lambda *a, **k: op), \
+                mock.patch.object(oe.hil_lock.PendingSessions, 'add', side_effect=OSError(errno.ENOSPC, 'full')), \
+                self.assertRaises(OSError) as cm:
+            oe._latched(BOARD, 'flash', segments=segments)
+        self.assertIs(cm.exception.operation, op)
+        self.assertEqual(op.segments, segments)
+
+    def test_a_session_the_record_cannot_list_carries_its_operation_and_refuses_until_listed(self):
+        """agentrc#214: an ENOSPC from the record's add loses neither the session nor the refusal."""
+        op = types.SimpleNamespace(cleanup='pending', receipts=('/w/receipt.json',))
+        full = OSError(errno.ENOSPC, 'No space left on device')
+        with mock.patch.object(oe, '_run', lambda *a, **k: op), \
+                mock.patch.object(oe.hil_lock.PendingSessions, 'add', side_effect=full), \
+                self.assertRaises(OSError) as cm:
+            oe._latched(BOARD, 'reset')
+        self.assertIs(cm.exception.operation, op)
+        with mock.patch.object(oe.hil_lock.PendingSessions, 'add', side_effect=full):
+            self.assertIn('could not list', oe.pending_refusal(SERIAL))
+            with self.assertRaisesRegex(RuntimeError, 'could not list.*receipt /w/receipt.json'):
+                oe.reset_openocd_esp(BOARD, workdir=str(self.work), timeout=5, openocd=str(self.exe),
+                                     retains_lock=True)
+        self.assertIn('not proven ended', oe.pending_refusal(SERIAL), 'listed once the record takes it')
+        self.assertEqual(oe.pending(SERIAL).read(), [{'receipt': '/w/receipt.json'}])
+        self.assertEqual(oe._UNLISTED, {})
+
+    def test_an_interrupt_after_the_session_is_built_still_lists_it(self):
+        """agentrc#214: a SIGINT landing once _finish has the session's Operation, before _run returns
+        it, takes the Operation from the session (box) and lists it."""
+        old = signal.signal(signal.SIGINT, signal.default_int_handler)
+        self.addCleanup(signal.signal, signal.SIGINT, old)
+        real = oe._finish
+
+        def finish(*a, **k):
+            op = real(*a, **k)
+            if 'error' not in k and len(a) == 1:
+                signal.raise_signal(signal.SIGINT)
+            return op
+        with mock.patch.object(oe, '_finish', finish), self.assertRaises(KeyboardInterrupt) as cm:
+            self.reset(script={'reset run': 'event:reset-assert-post'})
+        op = cm.exception.operation
+        self.assertPending(op)
+        self.assertEqual(oe.pending(SERIAL).read(), [{'receipt': op.session['receipt']}])
+
+    def test_a_session_is_listed_before_its_server_is_spawned(self):
+        """agentrc#214 (ci.lan P4): a SIGKILL between the spawn and the latch left a live openocd that
+        no record listed. Listed write-ahead, the entry is there before the server exists."""
+        real, seen = oe.subprocess.Popen, []
+
+        def popen(argv, *a, **k):
+            if 'noinit' in argv:                 # the server, not `openocd --version`
+                seen.append(oe.pending(SERIAL).read())
+            return real(argv, *a, **k)
+        with mock.patch.object(oe.subprocess, 'Popen', popen):
+            op = self.reset()
+        self.assertEnded(op)
+        (listed,), = seen
+        self.assertEqual(listed, {'receipt': op.session['receipt']})
+        self.assertEqual(oe.pending(SERIAL).read(), [], 'an ended session clears its entry')
+
+    def test_a_receipt_that_could_not_be_written_is_relisted_by_its_record(self):
+        """tinyuf2: with write_receipt failing, the write-ahead path read unreadable for good. A
+        pending session is relisted by its record, the path withdrawn."""
+        real = oe.esp_session.write_receipt
+
+        def write(path, rec):
+            if not rec.get('closed') and rec.get('submitted') == 0 and rec.get('init') is None:
+                raise OSError(errno.ENOSPC, 'No space left on device')
+            return real(path, rec)
+        with mock.patch.object(oe.esp_session, 'write_receipt', write), self.assertRaises(OSError) as cm:
+            self.reset()
+        op = cm.exception.operation
+        (receipt,) = op.receipts
+        self.assertIsInstance(receipt, dict)
+        self.assertEqual(oe.pending(SERIAL).read(), [{'receipt': receipt}])
+        self.reap()
+
+    def test_a_server_that_never_spawned_withdraws_its_entry(self):
+        real = oe.subprocess.Popen
+
+        def popen(argv, *a, **k):
+            if 'noinit' in argv:
+                raise FileNotFoundError('openocd')
+            return real(argv, *a, **k)
+        with mock.patch.object(oe.subprocess, 'Popen', popen), self.assertRaises(FileNotFoundError):
+            self.reset()
+        self.assertEqual(oe.pending(SERIAL).read(), [])
+        self.assertEqual(self.pids(), [])
+
+    def test_a_record_that_cannot_take_the_entry_spawns_nothing(self):
+        with mock.patch.object(oe.hil_lock.PendingSessions, 'add', side_effect=OSError(errno.ENOSPC, 'full')), \
+                self.assertRaises(OSError):
+            self.reset()
+        self.assertEqual(self.pids(), [])
+
+    def test_an_ended_reset_lists_nothing(self):
+        self.assertEnded(self.reset())
+        self.assertEqual(oe.pending(SERIAL).read(), [])
+
+
+class PendingRecord(unittest.TestCase):
+    """agentrc#214: the record's refusal never raises, latch is public, and `pending` reads or clears it."""
+
+    def setUp(self):
+        fresh_locks(self)
+        self.tracked = {'token': 't', 'supervisor': {}, 'lock': '/s/l', 'record': '/s/r.json', 'log': '/s/log'}
+
+    def cli(self, *argv):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = oe.main(['pending', '--serial', SERIAL, *argv])
+        return rc, json.loads(out.getvalue())
+
+    def test_latch_lists_an_operations_receipts_or_names_what_left_none(self):
+        self.assertEqual(oe.latch(SERIAL, None, 'x'), [])
+        self.assertEqual(oe.latch(SERIAL, read_op(), 'x'), [])
+        op = types.SimpleNamespace(cleanup='pending', receipts=(self.tracked,))
+        self.assertEqual(oe.latch(SERIAL, op, 'x'), [{'receipt': self.tracked}])
+        bare = types.SimpleNamespace(cleanup='unknown', receipts=())
+        self.assertEqual(oe.latch(SERIAL, bare, 'read_security on tty'),
+                         [{'receipt': {'unreceipted': 'read_security on tty: cleanup unknown', 'serial': SERIAL}}])
+        self.assertEqual(len(oe.pending(SERIAL).read()), 2)
+
+    def test_a_record_that_cannot_be_read_or_cleared_refuses_rather_than_raising(self):
+        oe.latch(SERIAL, types.SimpleNamespace(cleanup='pending', receipts=(self.tracked,)), 'x')
+        with mock.patch.object(oe.hil_process, 'recheck', return_value='done'), \
+                mock.patch.object(oe.hil_lock.PendingSessions, 'clear',
+                                  side_effect=oe.hil_lock.PendingRefused('sessions [new] are not ended')):
+            self.assertIn('ask again', oe.pending_refusal(SERIAL))
+        with mock.patch.object(oe.hil_lock.PendingSessions, 'read', side_effect=PermissionError('denied')):
+            self.assertIn('cannot be read or cleared (denied)', oe.pending_refusal(SERIAL))
+
+    def test_pending_entries_split_what_is_open_for_cleanup_evidence(self):
+        self.assertEqual(oe.pending_entries(SERIAL), {'receipts': [], 'retained': [], 'unrecheckable': []})
+        bare = {'unreceipted': 'read_security on tty: cleanup unknown', 'serial': SERIAL}
+        oe.pending(SERIAL).add([{'receipt': self.tracked}, {'receipt': '/w/receipt.json'}, {'receipt': bare},
+                                {'receipt': '/w/ended.json'}])
+        oe._UNLISTED[SERIAL] = [{'receipt': '/w/unlisted.json'}]
+        ended = mock.patch.object(oe, 'session_state', lambda r: 'ended' if r == '/w/ended.json' else 'running')
+        with ended, mock.patch.object(oe.hil_process, 'recheck', return_value='running'):
+            self.assertEqual(oe.pending_entries(SERIAL), {'receipts': [self.tracked],
+                                                          'retained': ['/w/unlisted.json', '/w/receipt.json'],
+                                                          'unrecheckable': [bare]})
+        self.assertEqual(len(oe.pending(SERIAL).read()), 4, 'read, never cleared')
+        Path(oe.pending(SERIAL).path).write_text('{')
+        with ended:
+            out = oe.pending_entries(SERIAL)
+        self.assertEqual(out['unrecheckable'], [{'unreadable': oe.pending(SERIAL).path,
+                                                 'error': 'unparseable, or a malformed entry'}])
+        self.assertEqual(out['retained'], ['/w/unlisted.json'])
+
+    def test_a_malformed_tracked_receipt_refuses_and_is_unrecheckable_rather_than_raising(self):
+        d = self.enterContext(tempfile.TemporaryDirectory())
+        lock = os.path.join(d, 'hil_op_t.lock')
+        Path(lock).touch()
+        good = {'token': 't', 'supervisor': {}, 'lock': lock, 'record': os.path.join(d, 'hil_op_t.json')}
+        for bad in (dict(good, supervisor='x'), dict(good, supervisor=[1]), dict(good, record=5),
+                    dict(good, lock=None), dict(good, token=7)):
+            fresh_locks(self)
+            oe.pending(SERIAL).add([{'receipt': bad}])
+            with self.subTest(receipt=bad):
+                self.assertIn('not proven ended', oe.pending_refusal(SERIAL))
+                self.assertEqual(oe.pending_entries(SERIAL), {'receipts': [], 'retained': [], 'unrecheckable': [bad]})
+        fresh_locks(self)
+        oe.pending(SERIAL).add([{'receipt': good}])
+        with mock.patch.object(oe.hil_process, 'recheck', return_value='done'):
+            self.assertEqual(oe.pending_refusal(SERIAL), '', 'a well-formed one still clears by itself')
+
+    def test_each_refusal_names_what_ends_it(self):
+        oe.latch(SERIAL, types.SimpleNamespace(cleanup='pending', receipts=('/w/receipt.json', self.tracked)), 'x')
+        with mock.patch.object(oe.hil_process, 'recheck', return_value='running'):
+            why = oe.pending_refusal(SERIAL)
+        self.assertIn('hil_openocd_esp.py end --receipt', why)
+        self.assertIn('clears by itself once its recheck is done', why)
+        self.assertIn(f'pending --serial {SERIAL} --note', why)
+        fresh_locks(self)
+        oe.latch(SERIAL, types.SimpleNamespace(cleanup='unknown', receipts=()), 'x')
+        why = oe.pending_refusal(SERIAL)
+        self.assertNotIn('end --receipt', why)
+        self.assertIn('separately reviewed recovery, then `hil_openocd_esp.py pending', why)
+
+    def test_a_blank_note_clears_nothing(self):
+        """CodeRabbit on #574: `--note ''` cleared the record as a reviewed recovery would."""
+        oe.latch(SERIAL, types.SimpleNamespace(cleanup='unknown', receipts=()), 'read_security on tty')
+        listed = oe.pending(SERIAL).read()
+        for note in ('', '   ', '\t\n'):
+            with self.subTest(note=note):
+                rc, out = self.cli('--note', note)
+                self.assertEqual((rc, out['outcome']), (1, 'failed'))
+                self.assertIn('blank', out['error'])
+                self.assertEqual(oe.pending_main(SERIAL, note)[0], 1)
+        self.assertEqual((oe.pending(SERIAL).read(), oe.pending(SERIAL).cleared()), (listed, []))
+
+    def test_the_pending_status_reports_one_read_of_the_record(self):
+        """CodeRabbit on #574: the outcome came from one read and the sessions from a second, so an
+        entry listed between them showed beside `clear`."""
+        real, reads = oe.hil_lock.PendingSessions.read, []
+        late = {'unreceipted': 'read_security on tty: cleanup unknown', 'serial': SERIAL}
+
+        def read(record):
+            got = real(record)
+            if not reads:
+                record.add([{'receipt': late}])
+            reads.append(got)
+            return got
+        with mock.patch.object(oe.hil_lock.PendingSessions, 'read', read):
+            rc, out = self.cli()
+        self.assertEqual((rc, out['outcome'], out['refusal'], out['sessions'], len(reads)), (0, 'clear', '', [], 1))
+        rc, out = self.cli()
+        self.assertEqual((rc, out['outcome'], [s['ended'] for s in out['sessions']]), (1, 'refused', [False]))
+
+    def test_the_pending_command_reports_then_clears_only_with_a_note(self):
+        self.assertEqual(self.cli(), (0, {'mode': 'pending', 'serial': SERIAL, 'record': oe.pending(SERIAL).path,
+                                          'outcome': 'clear', 'refusal': '', 'sessions': []}))
+        oe.latch(SERIAL, types.SimpleNamespace(cleanup='unknown', receipts=()), 'read_security on tty')
+        rc, out = self.cli()
+        self.assertEqual((rc, out['outcome']), (1, 'refused'))
+        self.assertEqual(out['sessions'], [{'kind': 'unreceipted', 'describe': oe.describe(
+            {'unreceipted': 'read_security on tty: cleanup unknown', 'serial': SERIAL}), 'ended': False}])
+        rc, out = self.cli('--note', 'esptool child gone: ps on ci.lan, 2026-11-22')
+        self.assertEqual((rc, out['outcome'], len(out['notEnded'])), (0, 'cleared', 1))
+        self.assertEqual(oe.pending(SERIAL).cleared()[-1]['note'], 'esptool child gone: ps on ci.lan, 2026-11-22')
+        self.assertEqual(self.cli()[0], 0)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            oe.main(['pending', '--serial', '../x'])
+
+
+class ReceiptKind(unittest.TestCase):
+    def test_recheck_dirs_entries_are_named(self):
+        self.assertIn("another user's state dir /s (uid 7)", oe.describe({'token': 'foreign:/s', 'foreign': '/s',
+                                                                          'uid': 7}))
+        self.assertIn('cannot be rechecked: lock missing', oe.describe({'unrecheckable': 'lock missing', 'files': []}))
+
+    def test_each_receipt_is_told_apart_and_named(self):
+        tracked = {'token': 't', 'supervisor': {}, 'lock': '/s/l', 'record': '/s/r.json', 'log': '/s/log'}
+        native = {'pid': 4, 'startTime': '99', 'log': '/w/openocd.log'}
+        for receipt, kind, text in ((tracked, 'tracked', 'esptool child, record /s/r.json'),
+                                    ('/w/receipt.json', 'session', 'receipt /w/receipt.json'),
+                                    (native, 'session', 'pid 4 start 99, receipt file unwritten, log /w/openocd.log'),
+                                    ({'unreceipted': 'read_security: cleanup unknown'}, 'unreceipted', 'no receipt'),
+                                    ({'other': 1}, None, 'unrecognised'), (7, None, 'unrecognised')):
+            with self.subTest(kind=kind):
+                self.assertEqual(oe.receipt_kind(receipt), kind)
+                self.assertIn(text, oe.describe(receipt))
+        self.assertFalse(oe.receipt_ended({'other': 1}))
+
+    def test_a_serial_maps_to_one_lock_name(self):
+        self.assertEqual(oe.pending('60:55:F9:F9:87:15').name, 'usj-60_55_F9_F9_87_15.openocd-esp-pending.json')
+        with self.assertRaises(ValueError):
+            oe.pending('../x')
+
+
 class End(SessionCase):
     """`end` from a pending session's receipt, against the fake server the session left running."""
 
@@ -1321,6 +1715,32 @@ class End(SessionCase):
         self.assertEqual(self.after(n), ['token?', 'done?'])
         self.assertKept(path, rc)
 
+    def test_a_server_left_before_init_is_listed_and_ended_by_shutdown_alone(self):
+        """ci.lan P4: the owner gone before init (here interrupted as it would send it). The server
+        stays listed, and `end` shuts it down without `reset run`: no target was touched."""
+        real = oe.Session.ask
+
+        def ask(s, cmd):
+            if cmd == 'init':
+                raise KeyboardInterrupt
+            return real(s, cmd)
+        with mock.patch.object(oe.Session, 'ask', ask), self.assertRaises(KeyboardInterrupt) as cm:
+            oe._latched(BOARD, lambda s: None, workdir=str(self.work), timeout=5, openocd=str(self.exe))
+        path = cm.exception.operation.session['receipt']
+        self.assertEqual((self.receipt(path)['init'], self.receipt(path)['submitted']), (None, 0))
+        self.assertEqual(oe.pending(SERIAL).read(), [{'receipt': path}])
+        self.assertIn('end --receipt', oe.pending_refusal(SERIAL))
+        n = len(self.tcl())
+        rc, result = self.end(path)
+        self.assertEqual((rc, result['outcome'], result['done']), (0, 'ended', ''))
+        self.assertEqual(self.after(n), ['token?', 'done?', 'shutdown'])
+        rec = self.receipt(path)
+        self.assertEqual((rec['closed'], rec['cleanup'], rec['end']['shutdownOnly']), (True, 'done', 'init never sent'))
+        self.assertFalse(self.alive(rec['pid']))
+        self.assertEqual(self.signals(), [])
+        self.assertEqual(oe.pending_refusal(SERIAL), '')
+        self.assertEqual(oe.pending(SERIAL).read(), [])
+
     def test_after_a_failed_or_unproven_init_the_ordinary_end_is_refused(self):
         for script, state in (({'init': 'err:no device'}, 'failed'), ({'init': 'hang'}, 'sent')):
             with self.subTest(state=state):
@@ -1334,6 +1754,20 @@ class End(SessionCase):
                 self.assertEqual(self.after(n), [])
                 self.assertKept(path, rc)
                 self.reap()
+
+    def test_an_orphan_whose_owner_inited_on_its_own_connection_is_ended_by_shutdown(self):
+        """ci.lan P4: init ran on the dead owner's connection, so end's `reset run` is refused before
+        'init' and touches nothing; end shuts the server down and closes the receipt."""
+        path = self.pending(FAKE_CONN_MODE='1')
+        n = len(self.tcl())
+        rc, result = self.end(path)
+        self.assertEqual((rc, result['outcome'], result['targetReset']), (0, 'ended', False))
+        self.assertEqual(self.after(n), ['token?', 'done?', 'reset run', 'shutdown'])
+        rec = self.receipt(path)
+        self.assertEqual((rec['closed'], rec['cleanup']), (True, 'done'))
+        self.assertIn("reset refused before 'init'", rec['end']['shutdownOnly'])
+        self.assertFalse(self.alive(rec['pid']))
+        self.assertEqual(self.signals(), [])
 
     def test_a_failed_reset_run_is_never_followed_by_shutdown(self):
         path = self.pending({'reset run': 'err:Target not examined yet'})
@@ -1585,7 +2019,7 @@ class RetainedLock(SessionCase):
         for g in guards:
             g.start()
             self.addCleanup(g.stop)
-        ops = {'flash': lambda **kw: oe.flash_openocd_esp(BOARD, [], security=SECURITY, workdir=str(self.work),
+        ops = {'flash': lambda **kw: oe.flash_openocd_esp(BOARD, [], security=read_op(), workdir=str(self.work),
                                                            timeout=5, **kw),
                'reset': lambda **kw: oe.reset_openocd_esp(BOARD, workdir=str(self.work), timeout=5, **kw),
                'security': lambda **kw: oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=5,
@@ -1813,6 +2247,7 @@ class SecurityEvidence(unittest.TestCase):
 class ReadSecurity(unittest.TestCase):
     def setUp(self):
         self.work = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.locks = fresh_locks(self)
         for target, value in (('usj_tty', lambda serial: '/dev/ttyACM3'),):
             p = mock.patch.object(oe, target, value)
             p.start()
@@ -1834,6 +2269,7 @@ class ReadSecurity(unittest.TestCase):
             r = subprocess.CompletedProcess(argv, rc, stdout, None)
             r.cleanup = cleanup
             return r
+        self.locks = fresh_locks(self)     # a read that latched refuses only its own test's next read
         try:
             return oe.read_security(SERIAL, chip=chip, workdir=str(self.work), timeout=30, retains_lock=True,
                                     esptool='esptool-5.3.1', run=run, **kw), seen
@@ -1852,6 +2288,7 @@ class ReadSecurity(unittest.TestCase):
         self.assertEqual({k: op.security[k] for k in OFF}, OFF)
         self.assertIn(f'esptool 5.3.1 on /dev/ttyACM3, USJ {SERIAL}', op.security['source'])
         self.assertEqual(oe.admit_security(op.security), op.security)
+        self.assertEqual(op.serial, SERIAL)
 
     def test_a_failed_child_or_unusable_evidence_raises_with_the_operation(self):
         on = {'flashEncryption': 'on', 'secureBoot': 'off'}
@@ -1876,6 +2313,7 @@ class ReadSecurity(unittest.TestCase):
             for out in ({'ok': True, 'results': {'unexpected': 1}}, {'ok': True, 'results': 7},
                         {'ok': True, 'results': []}, {'ok': True}, {'ok': True, 'results': [7]},
                         {'ok': True, 'results': [None]}, {'ok': True, 'results': [{'op': 'security'}]}, [1, 2], 'ok'):
+                fresh_locks(self)
                 with self.subTest(cleanup=cleanup, out=out), self.assertRaises((RuntimeError, ValueError)) as cm:
                     oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=30, retains_lock=True,
                                      run=tracked_run(json.dumps(out) + '\n', cleanup))
@@ -1925,6 +2363,428 @@ class ReadSecurity(unittest.TestCase):
         op = cm.exception.operation
         self.assertEqual((op.cleanup, op.receipts), ('pending', (receipt,)))
         (self.work / oe.SECURITY_STATE).rmdir()
+
+    def test_an_interrupt_after_the_child_is_held_until_what_it_left_is_listed(self):
+        """agentrc#214: a SIGINT landing between the child's end and its latch (here inside the latch,
+        and so before the work dir is removed) is delivered only once the receipt is listed."""
+        receipt = {'token': 'r1', 'lock': '/state/hil_op_r1.lock'}
+        old = signal.signal(signal.SIGINT, signal.default_int_handler)
+        self.addCleanup(signal.signal, signal.SIGINT, old)
+        real = oe.latch
+
+        def latch(*a):
+            signal.raise_signal(signal.SIGINT)
+            return real(*a)
+
+        def run(argv, **kw):
+            r = subprocess.CompletedProcess(argv, 0, self.line(sec()), None)
+            r.cleanup, r.receipt = 'pending', receipt
+            return r
+        with mock.patch.object(oe, 'latch', latch), self.assertRaises(KeyboardInterrupt) as cm:
+            oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=30, retains_lock=True, run=run)
+        self.assertEqual(cm.exception.operation.receipts, (receipt,))
+        self.assertEqual(oe.pending(SERIAL).read(), [{'receipt': receipt}])
+        self.assertEqual(list(self.work.iterdir()), [])
+
+    def test_a_child_the_record_cannot_list_carries_its_operation_and_refuses_until_listed(self):
+        receipt = {'token': 'r1', 'lock': '/state/hil_op_r1.lock'}
+
+        def run(argv, **kw):
+            r = subprocess.CompletedProcess(argv, 0, self.line(sec()), None)
+            r.cleanup, r.receipt = 'pending', receipt
+            return r
+        for failure in (OSError(errno.ENOSPC, 'No space left on device'),
+                        oe.hil_lock.PendingRefused('unreadable: kept as it is')):
+            fresh_locks(self)
+            with self.subTest(failure=failure):
+                with mock.patch.object(oe.hil_lock.PendingSessions, 'add', side_effect=failure), \
+                        self.assertRaises(type(failure)) as cm:
+                    oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=30, retains_lock=True,
+                                     run=run)
+                self.assertEqual(cm.exception.operation.receipts, (receipt,))
+                with mock.patch.object(oe.hil_lock.PendingSessions, 'add', side_effect=failure), \
+                        self.assertRaisesRegex(RuntimeError, 'could not list'):
+                    oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=30, retains_lock=True,
+                                     run=run)
+                self.assertIn('not proven ended', oe.pending_refusal(SERIAL))
+                self.assertEqual(oe.pending(SERIAL).read(), [{'receipt': receipt}])
+        self.assertEqual(list(self.work.iterdir()), [])
+
+    def test_an_interrupt_as_the_child_returns_is_listed_with_its_receipt(self):
+        """agentrc#214: the earlier window, a SIGINT as the runner's result becomes the attempt."""
+        receipt = {'token': 'r1', 'lock': '/state/hil_op_r1.lock'}
+        old = signal.signal(signal.SIGINT, signal.default_int_handler)
+        self.addCleanup(signal.signal, signal.SIGINT, old)
+        real = oe.hil_flash._record
+
+        def record(*a):
+            signal.raise_signal(signal.SIGINT)
+            return real(*a)
+
+        def run(argv, **kw):
+            r = subprocess.CompletedProcess(argv, 0, self.line(sec()), None)
+            r.cleanup, r.receipt = 'pending', receipt
+            return r
+        with mock.patch.object(oe.hil_flash, '_record', record), self.assertRaises(KeyboardInterrupt) as cm:
+            oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=30, retains_lock=True, run=run)
+        self.assertEqual(cm.exception.operation.receipts, (receipt,))
+        self.assertEqual(oe.pending(SERIAL).read(), [{'receipt': receipt}])
+        self.assertEqual(list(self.work.iterdir()), [])
+
+    def test_an_interrupt_after_the_operation_is_built_is_listed_from_its_attempts(self):
+        receipt = {'token': 'r1', 'lock': '/state/hil_op_r1.lock'}
+        old = signal.signal(signal.SIGINT, signal.default_int_handler)
+        self.addCleanup(signal.signal, signal.SIGINT, old)
+        real = oe.hil_flash._once
+
+        def once(*a, **k):
+            op = real(*a, **k)
+            signal.raise_signal(signal.SIGINT)      # past _attempt's hold, before _held_run's
+            return op
+
+        def run(argv, **kw):
+            r = subprocess.CompletedProcess(argv, 0, self.line(sec()), None)
+            r.cleanup, r.receipt = 'pending', receipt
+            return r
+        with mock.patch.object(oe.hil_flash, '_once', once), self.assertRaises(KeyboardInterrupt) as cm:
+            oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=30, retains_lock=True, run=run)
+        self.assertEqual(cm.exception.operation.receipts, (receipt,))
+        self.assertEqual(oe.pending(SERIAL).read(), [{'receipt': receipt}])
+
+    def test_an_interrupt_during_the_childs_run_reaches_it(self):
+        old = signal.signal(signal.SIGINT, signal.default_int_handler)
+        self.addCleanup(signal.signal, signal.SIGINT, old)
+        seen = []
+
+        def run(argv, **kw):
+            try:
+                signal.raise_signal(signal.SIGINT)
+            except KeyboardInterrupt:
+                seen.append('interrupted')
+                raise
+            seen.append('not interrupted')
+        with self.assertRaises(KeyboardInterrupt):
+            oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=30, retains_lock=True, run=run)
+        self.assertEqual(seen, ['interrupted'])
+        self.assertEqual(signal.getsignal(signal.SIGINT), signal.default_int_handler, 'the hold is released')
+
+    def test_the_default_runs_state_dir_is_listed_before_the_child_starts(self):
+        """ci.lan P4: a SIGKILL during a read left nothing listed. The state dir is listed first, and
+        refuses while recheck_dir finds an operation there open."""
+        seen = []
+
+        def tracked(cmd, cwd=None, **kw):
+            seen.append(oe.pending(SERIAL).read())
+            r = subprocess.CompletedProcess(cmd, 0, self.line(sec()), None)
+            r.cleanup, r.receipt = 'done', None
+            return r
+        with mock.patch.object(oe.hil_process, 'run_tracked', tracked):
+            oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=30, retains_lock=True)
+        state = str(self.work / oe.SECURITY_STATE)
+        ((entry,),) = seen
+        self.assertRegex(entry['receipt'].pop('aheadLock'), rf'^{re.escape(state)}/ahead_[0-9a-f]{{16}}\.lock$')
+        self.assertEqual(entry, {'receipt': {'stateDir': state, 'what': 'read_security on /dev/ttyACM3'}})
+        self.assertEqual(oe.pending(SERIAL).read(), [], 'a read that ended clears it')
+        left = {'token': 't', 'supervisor': {}, 'lock': f'{state}/hil_op_t.lock', 'record': f'{state}/t.json'}
+        oe.pending(SERIAL).add([{'receipt': {'stateDir': state, 'what': 'read_security on /dev/ttyACM3'}}])
+        with mock.patch.object(oe.hil_process, 'recheck_dir', return_value=('pending', [left])):
+            why = oe.pending_refusal(SERIAL)
+            self.assertIn(f'esptool children in state dir {state}', why)
+            self.assertIn('clears by itself once its recheck is done', why)
+            self.assertEqual(oe.pending_entries(SERIAL)['receipts'], [left])
+        self.assertEqual(oe.pending_refusal(SERIAL), '')
+        (self.work / oe.SECURITY_STATE).rmdir()
+
+    def test_a_live_owners_state_dir_entry_survives_a_status_read_before_its_child_starts(self):
+        """Codex on #574: between listing the empty state dir and run_tracked's first file, an unlocked
+        `pending` read found it done and cleared it, so an owner dying before its latch left the
+        started child unlisted. The owner's marker lock keeps the entry until the child's receipt
+        stands for it; the marker goes with the read."""
+        seen = []
+
+        def tracked(cmd, cwd=None, **kw):
+            seen.append((oe.pending_main(SERIAL), oe.pending(SERIAL).read()))
+            r = subprocess.CompletedProcess(cmd, 0, self.line(sec()), None)
+            r.cleanup, r.receipt = 'done', None
+            return r
+        with mock.patch.object(oe.hil_process, 'run_tracked', tracked):
+            oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=30, retains_lock=True)
+        (((rc, result), listed),) = seen
+        state = str(self.work / oe.SECURITY_STATE)
+        self.assertEqual((rc, result['outcome'], [s['ended'] for s in result['sessions']]), (1, 'refused', [False]))
+        self.assertIn(f'esptool children in state dir {state}', result['refusal'])
+        self.assertEqual([e['receipt']['stateDir'] for e in listed], [state])
+        self.assertEqual(oe.pending(SERIAL).read(), [], 'a read that ended clears it')
+        (self.work / oe.SECURITY_STATE).rmdir()      # the marker is gone too
+
+    def test_a_state_dir_entry_whose_owner_died_before_its_child_or_lacks_a_marker_clears(self):
+        """A run that died between listing and spawn released its marker's lock: the empty dir
+        reads done as before, with the marker left or gone; a receipt without the field is as before."""
+        state = oe.hil_process.state_dir(str(self.work), oe.SECURITY_STATE)
+        fd, marker = oe._ahead_marker(state)
+        os.close(fd)        # the owner's death releases its flock
+        held_fd, held = oe._ahead_marker(state)
+        self.addCleanup(os.close, held_fd)
+        what = 'read_security on /dev/ttyACM3'
+        for receipt in ({'stateDir': state, 'what': what, 'aheadLock': marker},
+                        {'stateDir': state, 'what': what, 'aheadLock': f'{state}/ahead_00ff.lock'},
+                        {'stateDir': state, 'what': what}):
+            with self.subTest(receipt=receipt):
+                oe.pending(SERIAL).add([{'receipt': receipt}])
+                self.assertTrue(oe.receipt_ended(receipt))
+                self.assertEqual(oe.pending_main(SERIAL)[0], 0)
+                self.assertEqual(oe.pending(SERIAL).read(), [])
+        self.assertFalse(oe.receipt_ended({'stateDir': state, 'what': what, 'aheadLock': held}))
+        os.unlink(marker)
+        os.unlink(held)
+        os.rmdir(state)
+
+    def test_a_marker_that_is_not_a_regular_ahead_file_in_its_state_dir_keeps_refusing_without_hanging(self):
+        """The record is anyone's to write: a FIFO, a link, a path outside the state dir, another name,
+        a NUL or a non-str reads not ended, and the probe neither blocks on the FIFO nor raises."""
+        state = oe.hil_process.state_dir(str(self.work), oe.SECURITY_STATE)
+        fifo, outside, link = f'{state}/ahead_ab.lock', str(self.work / 'ahead_cd.lock'), f'{state}/ahead_ef.lock'
+        for f in (fifo, outside):
+            os.mkfifo(f)
+            self.addCleanup(os.unlink, f)
+            self.addCleanup(lambda f=f: os.close(os.open(f, os.O_RDWR | os.O_NONBLOCK)))   # frees a blocked open
+        fd, marker = oe._ahead_marker(state)
+        os.close(fd)
+        self.addCleanup(os.unlink, marker)
+        os.symlink(marker, link)
+        self.addCleanup(os.unlink, link)
+        for lock in (fifo, outside, link, f'{state}/other.lock', f'{state}/ahead_ab\0.lock', 7, None):
+            with self.subTest(lock=lock):
+                seen = []
+                t = threading.Thread(target=lambda: seen.append(oe.receipt_ended(
+                    {'stateDir': state, 'what': 'read_security on /dev/ttyACM3', 'aheadLock': lock})), daemon=True)
+                t.start()
+                t.join(5)
+                self.assertFalse(t.is_alive(), 'the probe hung')
+                self.assertEqual(seen, [False])
+        self.assertTrue(oe.receipt_ended({'stateDir': state, 'what': 'x', 'aheadLock': marker}), 'released, as before')
+
+    def test_a_marker_whose_flock_probe_fails_reads_held(self):
+        """CodeRabbit on #214: an OSError other than BlockingIOError from the flock probe read released,
+        so the empty dir rechecked done and the entry cleared while its owner may still run."""
+        state = oe.hil_process.state_dir(str(self.work), oe.SECURITY_STATE)
+        fd, marker = oe._ahead_marker(state)
+        os.close(fd)
+        self.addCleanup(os.rmdir, state)
+        self.addCleanup(os.unlink, marker)
+        receipt = {'stateDir': state, 'what': 'read_security on /dev/ttyACM3', 'aheadLock': marker}
+        with mock.patch.object(oe.fcntl, 'flock', side_effect=OSError(errno.ENOLCK, 'No locks available')):
+            self.assertFalse(oe.receipt_ended(receipt))
+        self.assertTrue(oe.receipt_ended(receipt), 'released, as before')
+
+    def test_a_live_owners_empty_state_dir_entry_is_unrecheckable_cleanup_evidence(self):
+        """CodeRabbit on #214: a held marker over a dir with no child file yet gave pending_entries
+        nothing, the same as an idle board; the entry itself is listed instead."""
+        state = oe.hil_process.state_dir(str(self.work), oe.SECURITY_STATE)
+        fd, marker = oe._ahead_marker(state)
+        self.addCleanup(os.rmdir, state)
+        self.addCleanup(os.unlink, marker)
+        self.addCleanup(os.close, fd)
+        receipt = {'stateDir': state, 'what': 'read_security on /dev/ttyACM3', 'aheadLock': marker}
+        oe.pending(SERIAL).add([{'receipt': receipt}])
+        self.assertEqual(oe.pending_entries(SERIAL), {'receipts': [], 'retained': [], 'unrecheckable': [receipt]})
+        self.assertEqual(oe.pending(SERIAL).read(), [{'receipt': receipt}], 'read, never cleared')
+
+    def test_a_held_marker_keeps_its_receipt_beside_another_usjs_open_child(self):
+        """CodeRabbit on #214: two USJs sharing a workdir, the scan found the other's child while this
+        owner's marker was held and its child not started; only the other child was listed."""
+        state = oe.hil_process.state_dir(str(self.work), oe.SECURITY_STATE)
+        fd, marker = oe._ahead_marker(state)
+        self.addCleanup(os.rmdir, state)
+        self.addCleanup(os.unlink, marker)
+        self.addCleanup(os.close, fd)
+        receipt = {'stateDir': state, 'what': 'read_security on /dev/ttyACM3', 'aheadLock': marker}
+        other = {'token': 'o', 'supervisor': {}, 'lock': f'{state}/hil_op_o.lock', 'record': f'{state}/hil_op_o.json'}
+        oe.pending(SERIAL).add([{'receipt': receipt}])
+        with mock.patch.object(oe.hil_process, 'recheck_dir', return_value=('pending', [other])):
+            out = oe.pending_entries(SERIAL)
+        self.assertIn(receipt, out['unrecheckable'])
+        self.assertIn(other, out['receipts'])
+
+    def test_an_owner_that_latches_and_releases_mid_scan_still_leaves_cleanup_evidence(self):
+        """CodeRabbit on #214: the marker was sampled after the scan, so an owner that started its child,
+        latched it, withdrew its entry and released the marker in between left pending_entries nothing."""
+        state = oe.hil_process.state_dir(str(self.work), oe.SECURITY_STATE)
+        fd, marker = oe._ahead_marker(state)
+        self.addCleanup(os.rmdir, state)
+        self.addCleanup(os.unlink, marker)
+        receipt = {'stateDir': state, 'what': 'read_security on /dev/ttyACM3', 'aheadLock': marker}
+        oe.pending(SERIAL).add([{'receipt': receipt}])
+        child = {'token': 't', 'supervisor': {}, 'lock': f'{state}/hil_op_t.lock', 'record': f'{state}/hil_op_t.json'}
+
+        def owner_finishes(*a, **kw):
+            oe.pending(SERIAL).add([{'receipt': child}])
+            oe.pending(SERIAL).withdraw(receipt)
+            os.close(fd)
+            return 'done', []
+
+        with mock.patch.object(oe.hil_process, 'recheck_dir', side_effect=owner_finishes) as scan:
+            self.assertEqual(oe.pending_entries(SERIAL), {'receipts': [], 'retained': [], 'unrecheckable': [receipt]})
+        scan.assert_called_once()
+        self.assertFalse(oe._ahead_held(marker, state), 'released mid-scan')
+
+    def test_an_empty_state_dir_entry_without_a_held_marker_is_not_unrecheckable(self):
+        """Codex on #574: an empty state dir read as a live owner's whatever its marker; only a held
+        one keeps the entry as cleanup evidence."""
+        state = oe.hil_process.state_dir(str(self.work), oe.SECURITY_STATE)
+        self.addCleanup(os.rmdir, state)
+        fd, released = oe._ahead_marker(state)
+        os.close(fd)
+        self.addCleanup(os.unlink, released)
+        what = 'read_security on /dev/ttyACM3'
+        for receipt in ({'stateDir': state, 'what': what}, {'stateDir': state, 'what': what, 'aheadLock': released}):
+            with self.subTest(receipt=receipt):
+                fresh_locks(self)
+                oe.pending(SERIAL).add([{'receipt': receipt}])
+                # its child ended between receipt_ended's recheck and pending_entries' own
+                with mock.patch.object(oe, 'receipt_ended', return_value=False):
+                    self.assertEqual(oe.pending_entries(SERIAL), {'receipts': [], 'retained': [], 'unrecheckable': []})
+        fd, held = oe._ahead_marker(state)
+        self.addCleanup(os.unlink, held)
+        self.addCleanup(os.close, fd)
+        receipt = {'stateDir': state, 'what': what, 'aheadLock': held}
+        fresh_locks(self)
+        oe.pending(SERIAL).add([{'receipt': receipt}])
+        with mock.patch.object(oe, 'receipt_ended', return_value=False):
+            self.assertEqual(oe.pending_entries(SERIAL), {'receipts': [], 'retained': [], 'unrecheckable': [receipt]})
+
+    def test_a_state_dir_the_os_cannot_take_refuses_and_lists_unrecheckable_without_raising(self):
+        """CodeRabbit on #214: a listed stateDir with a NUL or a lone surrogate (JSON decodes one) made
+        recheck_dir raise out of pending_refusal and pending_entries, whose contract is never to."""
+        for state in ('/tmp/x\0y', '/tmp/x\ud800y'):
+            receipt = {'stateDir': state, 'what': 'read_security on /dev/ttyACM3'}
+            for r in (receipt, {**receipt, 'aheadLock': f'{state}/ahead_ab.lock'}):
+                with self.subTest(receipt=r):
+                    fresh_locks(self)
+                    oe.pending(SERIAL).add([{'receipt': r}])
+                    self.assertFalse(oe.receipt_ended(r))
+                    self.assertIn('not proven ended', oe.pending_refusal(SERIAL))
+                    self.assertEqual(oe.pending_entries(SERIAL), {'receipts': [], 'retained': [], 'unrecheckable': [r]})
+                    self.assertEqual(oe.pending(SERIAL).read(), [{'receipt': r}])
+
+    def test_a_marker_is_0644_whatever_the_umask(self):
+        state = oe.hil_process.state_dir(str(self.work), oe.SECURITY_STATE)
+        old = os.umask(0o077)
+        try:
+            fd, marker = oe._ahead_marker(state)
+        finally:
+            os.umask(old)
+        os.close(fd)
+        self.addCleanup(os.unlink, marker)
+        self.assertEqual(stat.S_IMODE(os.lstat(marker).st_mode), 0o644)
+
+    def test_a_pending_read_lists_its_receipt_alone_and_checks_the_dir_without_tidying(self):
+        """Codex on tinyuf2: checking the trackedDir tidied the done files its own listed receipt
+        rechecks from, which then read unknown for good. Once the child's receipt is listed the dir
+        entry is withdrawn, and a dir check keeps every file."""
+        state = str(self.work / oe.SECURITY_STATE)
+        receipt = {'token': 't', 'supervisor': {}, 'lock': f'{state}/hil_op_t.lock', 'record': f'{state}/t.json'}
+
+        def tracked(cmd, cwd=None, **kw):
+            r = subprocess.CompletedProcess(cmd, 0, self.line(sec()), None)
+            r.cleanup, r.receipt = 'pending', receipt
+            return r
+        with mock.patch.object(oe.hil_process, 'run_tracked', tracked), self.assertRaisesRegex(RuntimeError,
+                                                                                               'not proven ended'):
+            oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=30, retains_lock=True)
+        self.assertEqual(oe.pending(SERIAL).read(), [{'receipt': receipt}])
+        seen = []
+
+        def recheck_dir(path, keep=()):
+            seen.append(('any-token' in keep, path))
+            return 'done', []
+        with mock.patch.object(oe.hil_process, 'recheck_dir', recheck_dir):
+            self.assertTrue(oe.receipt_ended({'stateDir': state}))
+            oe.pending_entries(SERIAL)
+        self.assertEqual(seen, [(True, state)])
+        with mock.patch.object(oe.hil_process, 'recheck', return_value='done'):
+            self.assertEqual(oe.pending_refusal(SERIAL), '', 'the completed read clears')
+        self.assertEqual(oe.pending(SERIAL).read(), [])
+        (self.work / oe.SECURITY_STATE).rmdir()
+
+    def test_quiet_goes_to_the_default_run(self):
+        seen = []
+
+        def tracked(cmd, cwd=None, **kw):
+            seen.append(kw.get('quiet'))
+            r = subprocess.CompletedProcess(cmd, 0, self.line(sec()), None)
+            r.cleanup, r.receipt = 'done', None
+            return r
+        with mock.patch.object(oe.hil_process, 'run_tracked', tracked):
+            for quiet in (False, True):
+                kw = {'quiet': True} if quiet else {}
+                oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=30, retains_lock=True, **kw)
+        self.assertEqual(seen, [False, True])
+        (self.work / oe.SECURITY_STATE).rmdir()
+
+    def test_extra_read_ops_share_the_session_and_return_their_results(self):
+        snap = [{'op': 'md5', 'addr': 0x10000, 'size': 4096}, {'op': 'read', 'addr': 0, 'size': 16, 'file': '/w/b'}]
+        line = 'x\n' + json.dumps({'ok': True, 'esptool': '5.3.1', 'results': [sec(), {'md5': 'ab'}, {'size': 16}]})
+        op, seen = self.read(line, ops=snap)
+        (_, _, sent), = seen
+        self.assertEqual(sent, [{'op': 'security'}, *snap])
+        self.assertEqual(op.results, ({'md5': 'ab'}, {'size': 16}))
+        with self.assertRaisesRegex(RuntimeError, '1 more'):
+            self.read(self.line(sec()), ops=snap[:1])
+        for bad in ([{'op': 'write', 'addr': 0}], [{'op': 'security'}], ['md5']):
+            with self.subTest(ops=bad), self.assertRaisesRegex(ValueError, 'only esptool_session read and md5'):
+                self.read(self.line(sec()), ops=bad)
+
+    def test_reap_grace_and_verbose_reach_the_default_runner(self):
+        seen = []
+
+        def tracked(cmd, cwd=None, **kw):
+            seen.append(kw)
+            r = subprocess.CompletedProcess(cmd, 0, self.line(sec()), None)
+            r.cleanup, r.receipt = 'done', None
+            return r
+        with mock.patch.object(oe.hil_process, 'run_tracked', tracked):
+            oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=30, retains_lock=True,
+                             reap_grace=7.5, verbose=True)
+            oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=30, retains_lock=True)
+        self.assertEqual((seen[0]['reap_grace'], seen[0]['verbose']), (7.5, True))
+        self.assertNotIn('reap_grace', seen[1])
+        self.assertIs(seen[1]['verbose'], False)
+        (self.work / oe.SECURITY_STATE).rmdir()
+
+    def test_a_child_left_not_proven_ended_refuses_every_later_access_until_it_ends(self):
+        """agentrc#214: the serial's pending record, not a consumer's dict, refuses the next session."""
+        receipt = {'token': 'r1', 'supervisor': {'pid': 9}, 'lock': '/s/hil_op_r1.lock', 'record': '/s/hil_op_r1.json'}
+
+        def run(argv, **kw):
+            r = subprocess.CompletedProcess(argv, 0, self.line(sec()), None)
+            r.cleanup, r.receipt = 'pending', receipt
+            return r
+        with self.assertRaisesRegex(RuntimeError, 'not proven ended'):
+            oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=30, retains_lock=True, run=run)
+        self.assertEqual(oe.pending(SERIAL).read(), [{'receipt': receipt}])
+        touched = mock.patch.object(oe, 'usj_tty', side_effect=AssertionError('touched'))
+        with mock.patch.object(oe.hil_process, 'recheck', return_value='pending'), touched, \
+                self.assertRaisesRegex(RuntimeError, 'esptool child, record /s/hil_op_r1.json'):
+            oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=30, retains_lock=True, run=run)
+        with mock.patch.object(oe.hil_process, 'recheck', return_value='done'):
+            self.assertEqual(oe.pending_refusal(SERIAL), '')
+        self.assertEqual(oe.pending(SERIAL).read(), [])
+
+    def test_an_operation_that_left_no_receipt_refuses_until_a_reviewed_recovery(self):
+        def run(argv, **kw):
+            r = subprocess.CompletedProcess(argv, 0, self.line(sec()), None)
+            r.cleanup = 'unknown'
+            return r
+        with self.assertRaisesRegex(RuntimeError, 'not proven ended'):
+            oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=30, retains_lock=True, run=run)
+        self.assertIn('left no receipt', oe.pending_refusal(SERIAL))
+        oe.pending(SERIAL).clear(lambda e: False, note='reviewed: board power-cycled')
+        self.assertEqual(oe.pending_refusal(SERIAL), '')
+
+    def test_an_unreadable_record_refuses(self):
+        Path(oe.pending(SERIAL).path).write_text('{not json')
+        self.assertIn('unreadable', oe.pending_refusal(SERIAL))
 
     def test_an_unchecked_chip_is_refused_before_any_access(self):
         with mock.patch.object(oe, 'usj_tty', side_effect=AssertionError('touched')), \

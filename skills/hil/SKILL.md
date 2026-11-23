@@ -356,18 +356,58 @@ recovery stay the contract's. Linux only.
   `segments_from_flash_args(build_dir, chip, timeout=)` gives them from an
   ESP-IDF build's `flash_args`, refusing a build openocd would not write as
   esptool does.
-  A flash also requires `security`, the caller's evidence read from the chip
-  before programming: `{"flashEncryption": "off", "secureBoot": "off",
-  "source": <where it was read>}`. Without it, or with either feature not
-  `off`, the flash is refused before anything starts; the provider never
-  infers or defaults the chip's security state. `read_security(serial, chip=,
-  workdir=, timeout=, retains_lock=True)` reads it and hard-resets the chip,
-  its child run tracked by default (state in `workdir`) and its evidence
-  returned only once that child is proven ended (cleanup `done`), otherwise
-  raised with its receipts; `security_evidence(result, chip=, source=)`
-  reads a `security` op of the caller's own `scripts/esptool_session.py`.
+  A flash also requires `security`, the Operation `read_security(serial,
+  chip=, workdir=, timeout=, retains_lock=True)` returns: its child proven
+  ended (cleanup `done`) and its evidence, `{"flashEncryption": "off",
+  "secureBoot": "off", "source": <where it was read>}`, as `.security`. A bare
+  evidence dict, a read of another USJ (the Operation's `serial` is not the
+  flasher's `uid`), a read whose child is not proven ended, or either feature not
+  `off` is refused before anything starts (`admit_read`); the provider never
+  infers or defaults the chip's security state. `read_security` reads it and
+  hard-resets the chip, its child run tracked by default (state in `workdir`,
+  `reap_grace=` and `verbose=` passed on), and raises with its receipts
+  otherwise. `ops=` adds esptool_session read or md5 ops to that one session
+  (a snapshot of the flash before writing), their results as `.results`.
+  `security_evidence(result, chip=, source=)` reads a `security` op result.
   Unknown or contradictory evidence, or a chip outside `SECURITY_CHIPS`
   (ESP32-P4, ESP32-S3), is refused.
+  What an operation leaves not proven ended (a pending session, or the
+  security read's esptool child) is listed under its USJ serial in
+  `pending(serial)`, a `hil_lock.PendingSessions` record
+  (`usj-<serial>.openocd-esp-pending.json`), and every flash, reset and
+  `read_security` on that serial refuses while it lists one, whatever process
+  asks (`pending_refusal(serial)`, which clears a record whose every entry has
+  since ended and never raises for the record: a failure to read or clear it
+  refuses). `latch(serial, op, what)` lists what an Operation left, so a
+  consumer's fake provider lists as this one does. `receipt_kind(receipt)`
+  (`session`, `tracked`, `unreceipted`) and `describe(receipt)` name an entry;
+  an unreceipted one, or an unreadable record, clears only with a reviewed
+  recovery's note (`PendingSessions.clear(note=)`, or the `pending` command
+  below). SIGINT and SIGTERM reach each operation's run but are held from its
+  end until what it left is listed, then delivered. A record that cannot take
+  an entry (a full disk, an unreadable record) raises carrying the
+  Operation, and the process keeps the entry, refusing that serial until a
+  later access lists it. A session is listed before its server is spawned
+  (write-ahead), so a SIGKILL anywhere after leaves it refusing; one that never
+  spawned withdraws its entry (`PendingSessions.withdraw`), and one that ended
+  clears it. The default security read lists its run_tracked state dir the
+  same way (a `trackedDir` entry), ended once its owner no longer holds the
+  marker lock it took before listing it (`aheadLock`, so the dir still empty
+  before the child starts is not done; one that is not a regular
+  `ahead_<hex>.lock` file in that dir keeps it refusing) and `recheck_dir` finds every
+  operation there done (checked without tidying, so a receipt listed apart
+  keeps its files), and withdrawn once the child's own receipt is listed. Each refusal names what ends it, by kind.
+  On a shared host that clear runs only as the user who owns the state dir and
+  the pending record: another user's state dir never rechecks `done`, so run
+  `hil_openocd_esp.py pending --serial <usj>` as that owner, or else follow the
+  separately reviewed recovery (`pending --note`).
+  `pending_entries(serial)` reads what is open without clearing it, split for
+  `hil_lock.log_cleanup_failure`: `receipts` (tracked children), `retained`
+  (sessions) and `unrecheckable` (unreceipted or unrecognised entries, and an
+  unreadable record as `{unreadable, error}`). `pending_refusal` clears entries
+  that have ended, so a run that must not retry after a child it left pending
+  keeps its own latch for that run. `read_security(quiet=True)`
+  drops the COMMAND FAILED banner for a caller that reports the failure.
   Flash, reset and `read_security` run only for a caller that passes
   `retains_lock=True`, declaring it holds the board lock through each
   operation and logs a session it leaves pending, and never under a CI job (`RUNNER_TRACKING_ID` or
@@ -382,13 +422,24 @@ recovery stay the contract's. Linux only.
   and start time alone, from `hil_openocd_esp_receipt.py`, which loads alone
   for a lock keeper. The module and function docstrings have the
   mechanics, `usj_tty` and `usj_node` included.
+- `scripts/hil_openocd_esp.py pending --serial <usj> [--note TEXT]` prints what
+  a USJ's pending record lists, each entry's kind, name and whether it ended,
+  and the refusal, exiting 1 while one is pending; with `--note`, the reviewed
+  recovery that proved them ended, it clears the record whatever it holds and
+  logs the note in `<record>.cleared.jsonl` (a blank note clears nothing and
+  exits 1).
 - `scripts/hil_openocd_esp.py end --receipt <receipt> [--timeout S]` ends such
   a pending session with `reset run` and a confirmed shutdown, within one
   deadline and never signalling it. It refuses on any doubt: the session (or
   another `end`) still holds the receipt's lock, the process is not the
   receipt's, no pidfd is available, init failed or is unproven (that board
   needs a separately reviewed recovery), or the last command sent is not known
-  to have run. Exit 0 closes the receipt with the results and keeps it, and a
+  to have run. A server whose owner left before init (init never sent, nothing
+  submitted) gets `shutdown` alone, once it proves no command ran. Init puts
+  only the owner's own Tcl connection in exec mode, so on an orphan `reset run`
+  is refused before 'init' and touches nothing: `end` then shuts the server
+  down alone, leaves the target as the session left it (`targetReset: false`)
+  and exits 0. Exit 0 closes the receipt with the results and keeps it, and a
   rerun on it exits 0 again; anything else (refusal, failure, timeout,
   interrupt) exits 1 with the receipt open (2: bad usage or an unreadable
   receipt). An older helper's cleanup holder waiting on the session is
@@ -425,6 +476,7 @@ recovery stay the contract's.
 | `hil_remote_core.py` | trees and attempts on a rig: staging, launch, status, fetch and copy-back |
 | `hil_tt.py` | Reset_TT of the hub TT a full- or low-speed device sits behind |
 | `hil_root.py` | every root operation of the usbtest, TT and USB network scripts, one checked verb each (`netns` moves a board's USB network interface, by its vendor id, into the namespace of a sandbox a user other than root created, the one `SUDO_UID` names when set); a rig grants its CI user sudo on its installed copy (`/usr/local/sbin/hil_root`), and separately on `/usr/local/sbin/usb_recover` for `hil_reserve.py run` recovery |
+| `gh_pr_comment.py` | a CI report posted on a PR by a later `workflow_run` job: the PR of a run (`pr_of_run`), a job's attempt, whether a run is still the newest for the PR's head (`fresh`), a bounded artifact JSON read, and table-safe, mention-neutral, capped comment text; its CLI (`pr`, `job-attempt`, `fresh`) exits 2 when the API cannot tell, never read as absent or stale |
 | `hil_usbtest.py` | usbtest binding, the device under test by serial (`find_device`), and bounded testusb case runs |
 | `usb_dfu.py`, `esptool_session.py` | a DFU runtime request, one esptool connection, each a child the runner can kill |
 
