@@ -132,6 +132,8 @@ def _remove(tree):
     """Best-effort rmtree that also removes git's read-only object files, which Windows refuses to unlink."""
 
     def writable(func, path, _):
+        if func not in (os.unlink, os.rmdir) or os.path.islink(path):  # chmod follows links out of the tree
+            return
         try:
             os.chmod(path, stat.S_IWRITE)
             func(path)

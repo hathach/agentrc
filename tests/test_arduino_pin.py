@@ -445,6 +445,42 @@ class Pin(Consumer):
         self.assertEqual(list(dest.parent.iterdir()), [])
 
 
+    def restore_mode(self, *paths):
+        for path in paths:
+            self.addCleanup(os.chmod, path, 0o755)
+
+    @unittest.skipIf(os.name == 'nt' or os.geteuid() == 0, 'needs POSIX permissions that bind the caller')
+    def test_cleanup_ignores_an_unreadable_directory(self):
+        tree = self.tmp / 'tree'
+        tree.mkdir(mode=0)
+        self.restore_mode(tree)
+        self.pin._remove(tree)
+
+    def test_cleanup_never_chmods_through_a_symlink(self):
+        outside = self.tmp / 'outside'
+        outside.mkdir()
+        (outside / 'kept').write_text('x')
+        link = self.tmp / 'link'
+        try:
+            link.symlink_to(outside, target_is_directory=True)
+        except OSError as e:
+            self.skipTest(f'no symlinks: {e}')
+        before = outside.stat().st_mode
+        self.pin._remove(link)
+        self.assertEqual(outside.stat().st_mode, before)
+        self.assertTrue((outside / 'kept').is_file())
+        if os.name == 'nt' or os.geteuid() == 0:
+            return
+        sealed = self.tmp / 'tree/sealed'
+        sealed.mkdir(parents=True)
+        (sealed / 'link').symlink_to(outside / 'kept')
+        sealed.chmod(0o500)
+        self.restore_mode(sealed, sealed.parent)
+        before = (outside / 'kept').stat().st_mode
+        self.pin._remove(sealed.parent)
+        self.assertEqual((outside / 'kept').stat().st_mode, before)
+
+
 class Staged(Consumer):
     def test_precedence_and_partial_staging_never_fall_back(self):
         self.assertEqual(self.pin.source(), 'installed')
