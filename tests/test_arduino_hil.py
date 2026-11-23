@@ -23,6 +23,7 @@ import signal
 import subprocess
 import sys
 import time
+import zlib
 import types
 from pathlib import Path
 from unittest import mock
@@ -482,18 +483,25 @@ class Admission(Base):
 
     def test_agentrc_drift_refused(self):
         rec = self.record()
+        data = json.loads(rec.read_text())
+        self.assertEqual(data['agentrc'], {'commit': 'a' * 40, 'sha256': self.agentrc['sha256']})   # portable form
         lock = self.agentrc['root'] / 'skills/hil/scripts/hil_lock.py'
         loaded = lock.read_text()
         lock.write_text('# another agentrc\n')
-        with self.assertRaisesRegex(H.Refused, f'built with other agentrc files \\(agentrc {"a" * 12}\\) than this '
-                                               f'harness loads \\(agentrc {"a" * 12}\\): rebuild it'):
-            self.admit(rec)
         with self.assertRaisesRegex(H.Refused, r"agentrc changed since this harness loaded it: "
                                                r"\['skills/hil/scripts/hil_lock.py'\]; rerun"):
             self.admit(rec)
         lock.write_text(loaded)
         self.agentrc['commit'] = 'b' * 40   # another commit with the same closure: the files decide
         self.admit(rec)
+        other = {**data['agentrc']['sha256'], 'skills/hil/scripts/hil_lock.py': '0' * 64}
+        rec.write_text(json.dumps({**data, 'agentrc': {'commit': 'c' * 40, 'sha256': other}}))
+        with self.assertRaisesRegex(H.Refused, f'it was built with agentrc {"c" * 12}, this run loads {"b" * 12} '
+                                               r'\(files differ: skills/hil/scripts/hil_lock.py\): rebuild it'):
+            self.admit(rec)
+        rec.write_text(json.dumps({**data, 'agentrc': {'commit': 'a' * 40, 'files': data['agentrc']['sha256']}}))
+        with self.assertRaisesRegex(H.Refused, 'it binds no agentrc identity: rebuild it'):   # an older record
+            self.admit(rec)
 
     def test_image_must_match_the_flasher(self):
         rec = self.record()
@@ -1491,6 +1499,139 @@ class Battery(Base):
         code, out = self.main(['run', '-b', 'nope', str(self.roster)])
         self.assertEqual(code, 2)
         self.assertIn('nope', out['error'])
+
+
+class FakeCoreDut:
+    """A core HIL sketch on a fake pyserial port: answers INFO, ECHO, TIME and DELAY (arduino_hil's core battery
+    protocol) off the host's monotonic clock; `info`, `clock` (DUT ms per host ms) and `corrupt` bend it."""
+
+    def __init__(self, info, clock=1.0, corrupt=False):
+        self.info, self.clock, self.corrupt = info, clock, corrupt
+        self.inbuf, self.out, self.t0 = b'', b'', time.monotonic()
+        self.in_waiting, self.write_timeout = 0, None
+
+    def __call__(self, tty, baud, timeout):   # serial.Serial(tty, 115200, timeout=...)
+        self.tty = tty
+        return self
+
+    def now_us(self):
+        return int((time.monotonic() - self.t0) * 1e6 * self.clock)
+
+    def reset_input_buffer(self):
+        self.out = b''
+
+    def close(self):
+        pass
+
+    def write(self, data):
+        self.inbuf += data
+        while b'\n' in self.inbuf:
+            line, rest = self.inbuf.split(b'\n', 1)
+            words = line.decode().split()
+            if words[0] == 'ECHO':
+                n = int(words[2])
+                if len(rest) < n:
+                    return
+                data, self.inbuf = rest[:n], rest[n:]
+                back = bytes([data[0] ^ 1]) + data[1:] if self.corrupt else data
+                self.out += back + f'HIL_RESULT {words[1]} echo PASS len={n} crc={zlib.crc32(data):08x}\n'.encode()
+                continue
+            self.inbuf = rest
+            if words[0] == 'INFO':
+                self.out += (f'HIL_INFO {words[1]} ' + ' '.join(f'{k}={v}' for k, v in self.info.items()) +
+                             '\n').encode()
+            elif words[0] == 'TIME':
+                us = self.now_us()
+                self.out += f'HIL_RESULT {words[1]} time PASS ms={us // 1000} us={us}\n'.encode()
+            elif words[0] == 'DELAY':
+                self.out += f'HIL_RESULT {words[1]} delay PASS us={int(words[2]) * 1000 + 50}\n'.encode()
+
+    def read(self, n):
+        got, self.out = self.out[:n], self.out[n:]
+        return got
+
+
+class CoreBattery(Base):
+    """#488: the shared core battery: CORE_TESTS entries run arduino_hil's cdc and timing checks."""
+
+    def setUp(self):
+        super().setUp()
+        self.HP.ECHO_LENGTHS, self.HP.TIMING_SPAN, self.HP.DELAY_MS = (1, 64, 65), 0.05, 20   # a fresh profile
+        self.patch(H, 'node', lambda dev, pattern, deadline: '/dev/ttyACM9')
+        self.dev = {'busport': '1-1', 'dir': '/sys/x'}
+        self.run_dir = tmpdir(self)
+        self.board = {'name': 'rig_ocd'}   # BUILD.BOARDS family 'fa', no chip
+
+    def check(self, kind, stack, dut):
+        self.serial.Serial = dut
+        return H.CORE_KINDS[kind](stack)(self.dev, 'n1', time.monotonic() + 10, None, self.run_dir, self.board)
+
+    def test_cdc_passes_against_a_well_behaved_sketch_and_logs_the_exchange(self):
+        ok, detail = self.check('cdc', 'tinyusb', FakeCoreDut({'stack': 'tinyusb', 'chip': 'fa', 'f_cpu': '48'}))
+        self.assertTrue(ok, detail)
+        self.assertEqual(detail, '/dev/ttyACM9: tinyusb stack, f_cpu=48: echoed [1, 64, 65] bytes')
+        log = (self.run_dir / 'core-n1.log').read_text()
+        self.assertIn('> INFO n1i', log)
+        self.assertIn('HIL_RESULT n1e2 echo PASS len=65', log)
+
+    def test_cdc_fails_on_the_wrong_stack_or_chip_or_bytes(self):
+        for info, corrupt, why in (({'stack': 'arduino', 'chip': 'fa'}, False, "INFO {'stack': 'arduino'}"),
+                                   ({'stack': 'tinyusb', 'chip': 'fb'}, False, "INFO {'chip': 'fb'}"),
+                                   ({'stack': 'tinyusb', 'chip': 'fa'}, True, 'ECHO 1: 1 bytes back, differing')):
+            with self.subTest(why=why):
+                ok, detail = self.check('cdc', 'tinyusb', FakeCoreDut(info, corrupt=corrupt))
+                self.assertFalse(ok)
+                self.assertIn(why, detail)
+
+    def test_the_chip_is_the_boards_chip_else_its_family(self):
+        self.assertEqual(H.core_chip({'name': 'rig_ocd'}), 'fa')
+        self.assertEqual(H.core_chip({'name': 'rig_esp'}), 'esp32s3')
+        self.assertIsNone(H.core_chip({'name': 'nowhere'}))
+
+    def test_timing_passes_on_a_true_clock_and_fails_on_a_fast_one(self):
+        self.HP.INFO_DETAIL = ('crystalless',)
+        info = {'stack': 'arduino', 'chip': 'fa', 'f_cpu': '120', 'crystalless': '1'}
+        ok, detail = self.check('timing', 'arduino', FakeCoreDut(info))
+        self.assertTrue(ok, detail)
+        self.assertRegex(detail, r'^/dev/ttyACM9: f_cpu=120 crystalless=1: millis \d+ ms over host .* delay\(20\) '
+                                 r'20050 us$')
+        ok, detail = self.check('timing', 'arduino', FakeCoreDut(info, clock=1.2))
+        self.assertFalse(ok)
+        self.assertIn('millis()', detail)
+
+    def test_the_timing_bracket_allows_one_millis_tick_either_way(self):
+        # two whole-ms readings 50.9 ms apart can differ by 50: a true clock is not refused for its resolution
+        self.assertEqual(H.core_timing_problem(50, 50.9, 51.0), '')
+        self.assertEqual(H.core_timing_problem(51, 50.0, 50.0), '')
+        self.assertIn('outside the host bracket', H.core_timing_problem(49, 50.9, 51.0))
+        self.assertIn('outside the host bracket', H.core_timing_problem(52, 50.0, 50.0))
+
+    def test_a_rejected_reply_fails_the_test_naming_it(self):
+        dut = FakeCoreDut({'stack': 'tinyusb', 'chip': 'fa'})
+        real = dut.write
+
+        def write(data):
+            real(data)
+            dut.out = dut.out.replace(b'echo PASS', b'echo FAIL')
+        dut.write = write
+        ok, detail = self.check('cdc', 'tinyusb', dut)
+        self.assertEqual((ok, detail), (False, '/dev/ttyACM9: echo: HIL_RESULT n1e0 echo FAIL len=1 crc='
+                                               + detail.rsplit('crc=', 1)[1]))
+
+    def test_core_tests_resolve_and_bind_checks_them(self):
+        self.patch(H, 'P', None)
+        hp = fake.hil_profile(self.BP, TEST_FUNCS={'inout': lambda *a: (True, ''), 'probe': lambda *a: (True, '')},
+                              CORE_TESTS={'echo': ('cdc', 'tinyusb')})
+        self.assertIs(H.bind(hp), H)
+        self.assertEqual(H.test_func('echo').__qualname__, 'core_cdc_test.<locals>.test')
+        self.assertIs(H.test_func('probe'), hp.TEST_FUNCS['probe'])
+        for core, why in (({'echo': ('rtos', 'x')}, 'CORE_TESTS entries neither'),
+                          ({'echo': ('cdc', 'x'), 'probe': ('cdc', 'x')}, 'both define'),
+                          ({}, 'TEST_FUNCS with CORE_TESTS and ROLE_TESTS')):
+            self.patch(H, 'P', None)
+            with self.subTest(why=why), self.assertRaisesRegex(RuntimeError, why):
+                H.bind(fake.hil_profile(self.BP, TEST_FUNCS=hp.TEST_FUNCS, CORE_TESTS=core))
+        self.assertIn('battery', H.B.PROFILE_FEATURES)
 
 
 class Manual(Base):

@@ -117,6 +117,18 @@ class Lib(unittest.TestCase):
                 code = e.code
         return code, json.loads(out.getvalue().strip().splitlines()[-1])
 
+    def untracked(self, *names):
+        """self.root committed as a git checkout on the env the engine inherits, `names` then left untracked."""
+        env = git_env()
+        environ = mock.patch.dict(os.environ, env, clear=True)
+        environ.start()
+        self.addCleanup(environ.stop)
+        for a in (('init', '-q', '-b', 'main'), ('add', '-A'), ('commit', '-qm', 'base')):
+            subprocess.run(['git', '-C', str(self.root), *a], check=True, capture_output=True, env=env)
+        for name in names:
+            (self.root / name).parent.mkdir(parents=True, exist_ok=True)
+            (self.root / name).write_text('x')
+
     def dep(self, name, depends='', files=None):
         """An installed library in a fake user libraries dir: its arduino-cli `lib list` entry."""
         d = self.tmp / 'libraries' / name.replace(' ', '_')
@@ -145,6 +157,66 @@ class Binding(Lib):
             self.assertEqual(ab.run(self.P, ['--select-only', '--scope', 'README.md']), 0)
         self.assertIs(ab.P, self.P)
         self.assertTrue(json.loads(out.getvalue())['pass'])
+
+
+class Mechanics(Lib):
+    """#455: PLATFORM picks Library or Core once (M()); what does not depend on the mode is the same in both."""
+
+    def test_only_M_reads_the_mode(self):
+        import ast
+        tree = ast.parse(Path(ab.__file__).read_text())
+        readers = {fn.name for fn in ast.walk(tree) if isinstance(fn, ast.FunctionDef)
+                   for n in ast.walk(fn) if isinstance(n, ast.Constant) and n.value == 'PLATFORM'}
+        self.assertEqual(readers, {'M'})
+        self.assertIs(ab.M(), ab.Library)
+        self.patch(ab, 'P', fake.core_profile(fake.core(self.tmp / 'core'), self.agentrc))
+        self.assertIs(ab.M(), ab.Core)
+
+    def test_an_example_file_classifies_as_its_example_before_the_profile_rules(self):
+        self.patch(self.P, 'classify_source', lambda path: ('shared', None, 'everything'))
+        self.assertEqual(ab.classify('examples/Basic/echo/echo.ino')[:2], ('example', 'examples/Basic/echo'))
+        self.assertEqual(ab.classify('src/x.c')[:2], ('shared', None))
+
+    def test_depends_of_a_missing_file_is_none(self):
+        self.assertEqual(ab.depends(self.tmp / 'nowhere' / 'library.properties'), [])
+
+    def test_a_header_reached_through_a_link_into_the_checkout_is_not_foreign(self):
+        link = self.tmp / 'linked'
+        link.symlink_to(self.root, target_is_directory=True)
+        build = self.tmp / 'b'
+        build.mkdir()
+        (build / 'main.cpp.d').write_text(f'main.cpp.o: {link / "src/fake.h"}\n')
+        self.assertEqual(ab.foreign_headers(ab.dep_paths(build)), [])
+
+    def test_the_platform_dir_is_recorded_as_the_dir_it_resolves_to(self):
+        core = self.tmp / 'real core'
+        core.mkdir()
+        (self.tmp / 'core link').symlink_to(core, target_is_directory=True)
+        proc = cli_compile([{'name': fake.NAME, 'install_dir': str(self.root)}], 'x:y', '1.0',
+                           str(self.tmp / 'core link'), str(self.tmp / 'core link'))
+        with mock.patch.object(ab.subprocess, 'run', return_value=proc), \
+                mock.patch.object(ab, 'foreign_headers', return_value=[]):
+            row = ab.compile_sketch('rig_ocd', 'examples/Basic/echo', self.root / 'build/x', [], {})
+        self.assertEqual(row['status'], 'ok', row)
+        self.assertEqual((row['platform']['install_dir'], row['buildPlatform']['install_dir']), (str(core),) * 2)
+
+    def test_a_profile_may_widen_the_untracked_source_scope(self):
+        argv = ['--board', 'rig_jlink', '--shared', '--hil-config', str(self.root / 'test/hil/ci.json'), '--record',
+                str(self.root / 'build/hil/rig_jlink.build.json'), '--experimental']
+        fake.roster(self.root / 'test/hil/ci.json')
+        self.untracked('tools/gen.py')
+        ident = {'head': 'abc', 'dirty': True, 'diffSha256': 'd', 'status': '?? tools/gen.py\n'}
+        self.patch(ab, 'source_identity', lambda: (ident, ''))
+        self.patch(ab, 'submodule_problems', lambda before: [])
+        self.patch(ab, 'prepared_dependencies', lambda: {})
+        self.patch(ab, 'build_all', lambda *a, **k: [])
+        self.patch(ab, 'make_record', lambda *a: (None, 'stopped at the record'))
+        code, out = self.run_main(argv)
+        self.assertEqual(out['firstError'], 'stopped at the record')
+        self.P.SOURCE_DIRS = ('src/', 'tools/')   # a fresh profile per test
+        code, out = self.run_main(argv)
+        self.assertEqual(code, 2)
+        self.assertIn("untracked source would be missing from the record patch: ['tools/gen.py']", out['error'])
 
 
 class Selection(Lib):
@@ -208,6 +280,7 @@ class Selection(Lib):
 
     def test_board_or_example_runs_are_narrowed_and_say_so(self):
         self.patch(ab, 'source_identity', lambda: ({'head': 'abc', 'dirty': False, 'status': ''}, ''))
+        self.patch(ab, 'untracked_source', lambda: [])
         self.patch(ab, 'prepared_dependencies', lambda: {})
         self.patch(ab, 'build_all', lambda *a: [])
         warning = 'explicit --board/--example selection: automatic change selection was not verified'
@@ -863,7 +936,7 @@ class Record(RecordCase):
         self.assertEqual(rec['roster'], {'path': 'test/hil/ci.json', 'sha256': ab.sha256(self.roster)})
         self.assertEqual(rec['dependencies'], [dep])
         self.assertEqual(rec['contract'], {f: ab.sha256(self.root / f) for f in self.P.CONTRACT_FILES})
-        self.assertEqual(rec['agentrc'], {'commit': 'a' * 40, 'files': {
+        self.assertEqual(rec['agentrc'], {'commit': 'a' * 40, 'sha256': {
             f: ab.sha256(self.agentrc['root'] / f) for f in self.agentrc['files']}})
         self.assertEqual(rec['agentrcSource'], {'source': 'installed', 'dirty': False})   # provenance, not compared
 
@@ -888,12 +961,13 @@ class Record(RecordCase):
         self.assertEqual(err, "agentrc changed since this process loaded it: ['skills/hil/scripts/hil_lock.py']; "
                               "build again")
 
-    def test_contract_identity_skips_absent_contract_files_and_always_binds_this_engine(self):
+    def test_contract_identity_skips_absent_contract_files_and_binds_the_closure_as_loaded(self):
         (self.root / 'contract/pin.json').unlink()
-        self.agentrc['files'] = ['skills/hil/scripts/hil_lock.py']
+        (self.agentrc['root'] / 'skills/hil/scripts/hil_lock.py').write_text('# edited after load\n')
         ident = ab.contract_identity()
         self.assertEqual(list(ident['contract']), ['contract/check.py'])
-        self.assertEqual(sorted(ident['agentrc']['files']), [ab.SELF, 'skills/hil/scripts/hil_lock.py'])
+        self.assertEqual(ident['agentrc'], {'commit': 'a' * 40, 'sha256': self.agentrc['sha256']})
+        self.assertEqual(ab.agentrc_drift(), ['skills/hil/scripts/hil_lock.py'])
 
     def test_record_refuses_two_sketches_of_one_basename(self):
         row = self.samd_row()
@@ -984,9 +1058,10 @@ class Record(RecordCase):
     def test_record_needs_a_clean_tree_and_no_untracked_source(self):
         argv = ['--board', 'rig_jlink', '--shared', '--hil-config', str(self.roster), '--record',
                 str(self.root / 'build/hil/rig_jlink.build.json')]
+        self.untracked('src/new.c', 'src/new file.c', 'src/\u00fcber.c', 'docs/notes.txt')   # git C-quotes the 2nd, 3rd
         for status, extra, why in ((' M src/fake.h\n', [], 'clean tree'),
                                    ('?? src/new.c\n', ['--experimental'], "untracked source would be missing from "
-                                                                          "the record patch: ['src/new.c']")):
+                                    "the record patch: ['src/new file.c', 'src/new.c', 'src/\u00fcber.c']")):
             ident = {'head': 'abc', 'dirty': True, 'diffSha256': 'd', 'status': status}
             with self.subTest(why=why), mock.patch.object(ab, 'source_identity', return_value=(ident, '')):
                 code, out = self.run_main(argv + extra)
@@ -1401,6 +1476,7 @@ class Core(Lib):
         ident = {'head': 'abc', 'dirty': False, 'diffSha256': 'd', 'status': '',
                  'submodules': [{'path': 'libraries/USB', 'commit': 'a', 'state': '-'}]}
         self.patch(ab, 'source_identity', lambda: (ident, ''))
+        self.patch(ab, 'untracked_source', lambda: [])
         self.patch(ab, 'build_all', mock.Mock(side_effect=AssertionError('compiled')))
         for extra in ([], ['--experimental']):
             with self.subTest(extra=extra):
@@ -1491,6 +1567,7 @@ class Core(Lib):
         self.assertEqual((ident['dirty'], ab.submodule_problems(ident)), (False, []))
 
     def test_a_core_record_refuses_any_untracked_file(self):
+        self.untracked('variants/new/variant.h')
         self.patch(ab, 'source_identity', lambda: ({'head': 'abc', 'dirty': True, 'diffSha256': 'd',
                                                     'status': '?? variants/new/variant.h\n', 'submodules': []}, ''))
         self.patch(ab, 'build_all', mock.Mock(side_effect=AssertionError('compiled')))

@@ -217,15 +217,17 @@ def binding(ident):
     return portable(ident)
 
 
-def mismatch(recorded, ident):
+def mismatch(recorded, ident, commit=True):
     """Why a record's agentrc (portable form) is not `ident`'s, or the closure drifted since load, '' when neither:
-    a record without one predates the binding and is rebuilt, never admitted."""
+    a record without one predates the binding and is rebuilt, never admitted. With commit=False only the closure's
+    bytes must match, the commit being provenance (the Arduino engines: an agentrc commit that changes none of
+    their files keeps a record admissible)."""
     why = _drifted(ident)
     if why:
         return why
     if not isinstance(recorded, dict) or not isinstance(recorded.get('sha256'), dict):
         return 'it binds no agentrc identity'
-    if recorded != portable(ident):
+    if (recorded if commit else recorded['sha256']) != (portable(ident) if commit else ident['sha256']):
         files = sorted(f for f in {*recorded['sha256'], *ident['sha256']}
                        if recorded['sha256'].get(f) != ident['sha256'].get(f))
         return (f'it was built with agentrc {str(recorded.get("commit"))[:12]}, this run loads {ident["commit"][:12]}'

@@ -376,6 +376,20 @@ class Files(unittest.TestCase):
         self.assertIn('skills/usb-kernel-recover/scripts/root_port_cycle.py', files_of('skills/hil/scripts/hil_reserve.py'))
         self.assertIn('skills/target-debug/scripts/esp_session.py', files_of('skills/hil/scripts/hil_openocd_esp.py'))
 
+    def test_an_arduino_engine_files_holds_what_each_of_them_loads_and_imports_alone(self):
+        engines = sorted(p.relative_to(ROOT).as_posix() for p in (ROOT / 'skills/arduino/scripts').glob('*.py'))
+        self.assertEqual(len(engines), 4, engines)
+        for rel in engines:
+            tree = {rel, *files_of(rel)}
+            for f in sorted(f for f in tree if f.endswith('.py')):
+                self.assertLessEqual(direct(f) | set(files_of(f) or ()), tree, f'{rel}: via {f}')
+            with self.subTest(rel), tempfile.TemporaryDirectory() as td:
+                stage(Path(td), tree)
+                r = run_py('import importlib.util, sys\n'
+                           'spec = importlib.util.spec_from_file_location("m", sys.argv[1])\n'
+                           'spec.loader.exec_module(importlib.util.module_from_spec(spec))', Path(td) / rel)
+                self.assertEqual(r.returncode, 0, r.stderr)
+
     def test_a_tree_of_the_module_and_its_files_imports_and_runs_lazy_loads(self):
         for rel in MODULES:
             files = files_of(rel)
