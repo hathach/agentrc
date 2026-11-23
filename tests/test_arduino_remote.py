@@ -471,6 +471,14 @@ class Session(Checkout):
                                       data['reason'], '--staged', R.MANIFEST, '--bundle', R.RESTORE_BUNDLE,
                                       '--build-record', data['restoreRecord'], '--release', ROSTER]])
 
+    def test_session_stage_drift_requests_a_rerun_before_comparing_the_session(self):
+        self.open()
+        rec = self.record(experimental=True)
+        (self.agentrc['root'] / 'skills/hil/scripts/hil_lock.py').write_text('# edited after load\n')
+        with mock.patch.object(R.B, 'agentrc_mismatch', side_effect=AssertionError('compared a drifted closure')):
+            with self.assertRaisesRegex(SystemExit, 'changed since this process loaded it; rerun'):
+                self.main('session', 'stage', 's1', str(rec))
+
 
 if __name__ == '__main__':
     unittest.main()

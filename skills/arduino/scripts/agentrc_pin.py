@@ -28,7 +28,7 @@ import re
 import shutil
 import subprocess
 import sys
-from pathlib import Path, PurePosixPath, PureWindowsPath
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[4]
 PIN_FILE = ROOT / "test" / "hil" / "agentrc.json"
@@ -52,12 +52,9 @@ ENGINES = (
 
 
 class PinError(Exception):
-    def __init__(self, msg, remedy=""):
-        super().__init__(msg, remedy)
+    def __init__(self, msg, remedy=""):  # noqa: B042
+        super().__init__(msg)
         self.remedy = remedy
-
-    def __str__(self):
-        return str(self.args[0])
 
     def with_remedy(self):
         return f"{self} ({self.remedy})" if self.remedy else str(self)
@@ -75,6 +72,7 @@ def ci():
     return on
 
 
+@functools.cache
 def config():
     """Validated consumer configuration; no profile import (the profile imports this bootstrap)."""
     try:
@@ -89,19 +87,7 @@ def config():
         "cache_namespace": lambda v: isinstance(v, str) and bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", v)),
         "profile_api": lambda v: type(v) is int and v > 0,
         "features": lambda v: isinstance(v, list) and all(isinstance(f, str) and bool(f.strip()) for f in v),
-        "extra_engines": lambda v: isinstance(v, list)
-        and all(
-            isinstance(f, str)
-            and bool(f)
-            and "\x00" not in f
-            and "\\" not in f
-            and not PureWindowsPath(f).drive
-            and not PurePosixPath(f).is_absolute()
-            and ".." not in PurePosixPath(f).parts
-            and PurePosixPath(f).as_posix() == f
-            and f != "."
-            for f in v
-        ),
+        "extra_engines": lambda v: isinstance(v, list) and all(isinstance(f, str) and bool(f) for f in v),
     }
     for field, valid in rules.items():
         if not valid(data.get(field)):
@@ -185,15 +171,18 @@ def checkout():
     return dest
 
 
-def literal(root, rel, name):
-    """The source API literal, checked before agentrc code executes."""
+def literals(root, rel, *names):
+    """Read selected module-level literals in one parse, without executing the script."""
+    values = {}
     try:
         for node in ast.parse((Path(root) / rel).read_text(encoding="utf-8")).body:
-            if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == name for t in node.targets):
-                return ast.literal_eval(node.value)
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if getattr(target, "id", None) in names:
+                        values[target.id] = ast.literal_eval(node.value)
     except (OSError, ValueError, SyntaxError, RecursionError) as e:
-        raise PinError(f"agentrc {rel} at {root}: {name} is unreadable ({e})") from None
-    return None
+        raise PinError(f"agentrc {rel} at {root}: {names} is unreadable ({e})") from None
+    return values
 
 
 def loader(root):
@@ -234,38 +223,40 @@ def _selection():
     """The source module, real-checkout loader and frozen identity; cache only successful discovery."""
     data = config()
     src = source()
-    hint = {"staged": STAGE_HINT, "pin": FETCH_HINT, "installed": INSTALL_HINT}[src]
-    r = {"staged": lambda: ROOT / "agentrc", "pin": checkout, "installed": installed}[src]()
-    helper = None
+    root, hint = {
+        "staged": (lambda: ROOT / "agentrc", STAGE_HINT),
+        "pin": (checkout, FETCH_HINT),
+        "installed": (installed, INSTALL_HINT),
+    }[src]
     try:
-        api = literal(r, SOURCE, "API")
+        r = root()
+        api = literals(r, SOURCE, "API").get("API")
         if type(api) is not int or api != SOURCE_API:
-            raise PinError(f"agentrc at {r} implements source API {api}, this checkout needs {SOURCE_API}", hint)
+            raise PinError(f"agentrc at {r} implements source API {api}, this checkout needs {SOURCE_API}")
         real = (r / SOURCE).resolve().parents[3]
         hil_load = loader(real)
         helper = hil_load.load_file(SOURCE)
-        ident = helper.frozen(
-            src, r, (*ENGINES, SELF, *data["extra_engines"]), data["commit"] if src == "pin" else None
-        )
-        api = helper.literal(ident["root"], ENGINES[0], "PROFILE_API")
-        if type(api) is not int or api != data["profile_api"]:
-            raise PinError(
-                f'agentrc at {r} implements profile API {api}, this checkout needs {data["profile_api"]}', hint
+        try:
+            ident = helper.frozen(
+                src, r, (*ENGINES, SELF, *data["extra_engines"]), data["commit"] if src == "pin" else None
             )
-        features = helper.literal(ident["root"], ENGINES[0], "PROFILE_FEATURES", ())
+        except helper.SourceError as e:
+            raise PinError(str(e)) from None
+        profile = literals(ident["root"], ENGINES[0], "PROFILE_API", "PROFILE_FEATURES")
+        api = profile.get("PROFILE_API")
+        if type(api) is not int or api != data["profile_api"]:
+            raise PinError(f'agentrc at {r} implements profile API {api}, this checkout needs {data["profile_api"]}')
+        features = profile.get("PROFILE_FEATURES", ())
         if not isinstance(features, (list, tuple)) or not all(isinstance(f, str) for f in features):
-            raise PinError(f"agentrc at {r} has malformed PROFILE_FEATURES", hint)
+            raise PinError(f"agentrc at {r} has malformed PROFILE_FEATURES")
         missing = [f for f in data["features"] if f not in features]
         if missing:
-            raise PinError(f"agentrc at {r} lacks profile features {missing} ({ENGINES[0]} PROFILE_FEATURES)", hint)
-    except Exception as e:
-        if isinstance(e, PinError):
-            if not e.remedy:
-                e.remedy = hint
-            raise
-        if isinstance(e, (OSError, ImportError)) or (helper and isinstance(e, helper.SourceError)):
-            raise PinError(str(e), hint) from None
+            raise PinError(f"agentrc at {r} lacks profile features {missing} ({ENGINES[0]} PROFILE_FEATURES)")
+    except PinError as e:
+        e.remedy = hint
         raise
+    except (OSError, ImportError) as e:
+        raise PinError(str(e), hint) from None
     return helper, hil_load, ident
 
 
@@ -297,7 +288,7 @@ def check():
 
 
 def test():
-    if not _selection.cache_info().currsize and source() == "pin":
+    if source() == "pin":
         fetch()
     r = check()
     canonical = r / SELF

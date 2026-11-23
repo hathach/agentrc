@@ -969,7 +969,6 @@ class Record(RecordCase):
         (self.agentrc['root'] / 'skills/hil/scripts/hil_lock.py').write_text('# edited after load\n')
         with self.assertRaisesRegex(ab.agentrc_source.SourceError, 'changed since this process loaded it'):
             ab.contract_identity()
-        self.assertEqual(ab.agentrc_drift(), ['skills/hil/scripts/hil_lock.py'])
 
     def test_record_refuses_two_sketches_of_one_basename(self):
         row = self.samd_row()

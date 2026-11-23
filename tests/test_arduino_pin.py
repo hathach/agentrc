@@ -69,7 +69,7 @@ class Consumer(unittest.TestCase):
             (self.repo / rel).parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(ROOT / rel, self.repo / rel)
         for rel in (*self.pin.ENGINES, EXTRA, CI_ENGINE):
-            (self.repo / rel).write_text(f'FILES = ({LOADER!r}, {SOURCE!r}, {CANONICAL!r}, "lib/data.py")\n'
+            (self.repo / rel).write_text(f'FILES = ({LOADER!r}, {SOURCE!r}, "lib/data.py")\n'
                                        'PROFILE_API = 1\nPROFILE_FEATURES = ("core", "named", "battery")\n')
         (self.repo / 'lib').mkdir()
         (self.repo / 'lib/data.py').write_text('VALUE = 1\n')
@@ -92,6 +92,7 @@ class Consumer(unittest.TestCase):
         self.stack.enter_context(mock.patch.dict(os.environ, kw))
 
     def config(self, **kw):
+        self.pin.config.cache_clear()
         self.data.update(kw)
         (self.root / CONFIG).parent.mkdir(parents=True, exist_ok=True)
         (self.root / CONFIG).write_text(json.dumps(self.data))
@@ -122,16 +123,31 @@ class Consumer(unittest.TestCase):
 
 
 class Configuration(Consumer):
+    def test_configuration_is_read_and_validated_once(self):
+        with mock.patch.object(self.pin.json, 'loads', wraps=json.loads) as reads:
+            first = self.pin.config()
+            (self.root / CONFIG).write_text('invalid after selection')
+            self.assertIs(self.pin.config(), first)
+            self.assertEqual(self.pin.pin(), (str(self.repo), self.head))
+            self.assertEqual(self.pin.cache_dir(self.head), self.tmp / 'cache/fixture' / f'agentrc-{self.head}')
+        self.assertEqual(reads.call_count, 1)
+
+    def test_shared_closure_refuses_an_extra_engine_outside_agentrc(self):
+        self.config(extra_engines=['../outside.py'])
+        with self.assertRaisesRegex(self.pin.PinError, "outside itself: .*outside.py") as cm:
+            self.pin.identity()
+        self.assertEqual(cm.exception.remedy, self.pin.INSTALL_HINT)
+
     def test_explicit_fields_and_safe_namespace_and_paths(self):
         self.assertEqual(self.pin.config(), self.data)
         self.assertEqual(self.pin.pin(), (str(self.repo), self.head))
         self.assertEqual(self.pin.cache_dir(self.head), self.tmp / 'cache/fixture' / f'agentrc-{self.head}')
+        self.pin.config.cache_clear()
         bad = {'url': [None, 0, '', '  '], 'commit': [None, 1, 'abc', 'g' * 40],
                'cache_namespace': [None, 1, '', '.', '..', '../x', '/x', 'C:x', 'x/y', 'x\\y'],
                'profile_api': [None, True, 0, -1, '1', 1.0],
                'features': [None, 'core', {}, [1], [''], [' ']],
-               'extra_engines': [None, 'file.py', {}, [1], [''], ['.'], ['..'], ['../file.py'],
-                                 ['/file.py'], ['a/../file.py'], ['C:/x'], ['D:x'], ['a\\b'], ['a//b'], ['a\0b']]}
+               'extra_engines': [None, 'file.py', {}, [1], ['']]}
         for field, values in bad.items():
             for value in values:
                 with self.subTest(field=field, value=value):
@@ -159,7 +175,7 @@ class Configuration(Consumer):
         with mock.patch.object(self.pin, 'loader', side_effect=AssertionError('executed')):
             with self.assertRaisesRegex(self.pin.PinError, 'features'):
                 self.pin.identity()
-        self.config(features=[])
+        (self.root / CONFIG).write_text(json.dumps({**self.data, 'features': []}))
         self.assertEqual(self.pin.identity()['source'], 'installed')   # failures are not cached
 
     def test_ci_boolean_values_and_fetch_local_refusal(self):
@@ -179,6 +195,14 @@ class Configuration(Consumer):
 
 
 class Installed(Consumer):
+    def test_profile_capabilities_share_one_parse(self):
+        path = self.repo / BUILD
+        source = path.read_text() + '\nBUILD_MARKER = True\n'
+        path.write_text(source)
+        with mock.patch.object(self.pin.ast, 'parse', wraps=self.pin.ast.parse) as parse:
+            self.pin.identity()
+        self.assertEqual(sum(call.args[0] == source for call in parse.call_args_list), 2)   # FILES, then capabilities
+
     def test_identity_uses_the_checkout_behind_skill_links_and_extra_engines(self):
         self.config(extra_engines=[EXTRA])
         ident = self.pin.identity()
@@ -275,7 +299,7 @@ class Installed(Consumer):
             path = self.repo / 'lib/data.py'
             before = path.read_bytes()
             path.write_text('VALUE = 2\n')
-            for call in (lambda: self.pin.load(BUILD), self.pin.check, self.pin.test):
+            for call in (lambda: self.pin.load(BUILD), self.pin.check):
                 with self.assertRaisesRegex(self.pin.PinError, 'lib/data.py changed since'):
                     call()
             with self.assertRaisesRegex(helper.SourceError, 'lib/data.py changed since'):
@@ -471,6 +495,11 @@ class Staged(Consumer):
         path.symlink_to(self.repo / 'lib/data.py')
         with self.assertRaisesRegex(pin.PinError, 'lib/data.py changed since'):
             pin.load(BUILD)
+        helper, _, ident = pin._selection()
+        dest = self.tmp / 'restaged'
+        with self.assertRaisesRegex(helper.SourceError, 'lib/data.py changed since'):
+            helper.stage(ident, dest)
+        self.assertFalse(dest.exists())
 
     def test_symlinked_inner_manifest_is_refused(self):
         tree, pin, _ = self.stage()
@@ -490,7 +519,7 @@ class RealPack(unittest.TestCase):
         fake = load_arduino_fixture()
         fixture = fake.clean_checkout(tmp, git, '/build/\n')
         fixture.BP.CONTRACT_FILES = (*fixture.BP.CONTRACT_FILES, CONSUMER, CONFIG)
-        for name in ('canonical', 'tua', 'samd'):
+        for name in ('canonical', 'tua'):
             with self.subTest(bootstrap=name):
                 consumer = fixture.root / CONSUMER
                 consumer.parent.mkdir(parents=True, exist_ok=True)
@@ -505,8 +534,9 @@ class RealPack(unittest.TestCase):
                 git(fixture.root, 'add', '.')
                 git(fixture.root, 'commit', '-qm', f'bootstrap {name}')
                 head = git(fixture.root, 'rev-parse', 'HEAD')
-                ident = R.B.agentrc_source.identity('installed', ROOT, [BUILD,
-                    'skills/arduino/scripts/arduino_hil.py', 'skills/arduino/scripts/arduino_remote.py', *extra])
+                engines = R.B.agentrc_source.literal(fixture.root, CONSUMER, 'ENGINES')
+                scripts = [*engines, *([CANONICAL, *extra] if name == 'canonical' else [])]
+                ident = R.B.agentrc_source.identity('installed', ROOT, scripts)
                 fixture.BP.AGENTRC = ident
                 tree = tmp / f'packed-{name}'
                 with mock.patch.object(R, 'P', fixture.HP), mock.patch.object(R.H, 'P', fixture.HP), \
@@ -533,10 +563,7 @@ class RealPack(unittest.TestCase):
                 self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
                 result = json.loads(p.stdout)
                 self.assertEqual((result['source'], result['commit']), ('staged', ident['commit']))
-                expected = dict(ident['sha256'])
-                if name == 'samd':
-                    expected.pop(EXTRA)
-                self.assertEqual(result['sha256'], expected)
+                self.assertEqual(result['sha256'], ident['sha256'])
                 self.assertTrue(all(Path(f).is_relative_to(tree / 'agentrc') for f in result['engines']))
 
 

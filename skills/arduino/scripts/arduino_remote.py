@@ -30,8 +30,7 @@ import time
 from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-FILES = ('skills/arduino/scripts/agentrc_pin.py', 'skills/arduino/scripts/arduino_build.py',
-         'skills/arduino/scripts/arduino_hil.py', 'skills/hil/boards.json',
+FILES = ('skills/arduino/scripts/arduino_build.py', 'skills/arduino/scripts/arduino_hil.py', 'skills/hil/boards.json',
          'skills/hil/scripts/agentrc_source.py', 'skills/hil/scripts/esptool_session.py',
          'skills/hil/scripts/hil_boards.py', 'skills/hil/scripts/hil_flash.py', 'skills/hil/scripts/hil_load.py',
          'skills/hil/scripts/hil_lock.py', 'skills/hil/scripts/hil_openocd_esp.py',
@@ -288,8 +287,11 @@ def cmd_session_stage(a):
     """Stage the records into a new bundle dir of their own: records share build/hil/<board>/<sketch>/, so one
     staged over another would replace the images an earlier record, the restore's included, pins."""
     s = session_record(a.run_id)
+    drift = B.agentrc_source.drift(B.P.AGENTRC)
+    if drift:
+        core.fail(f'agentrc {", ".join(drift)} changed since this process loaded it; rerun')
     # record_files admits only records of this process's agentrc files; the rig's harness is the one staged at open
-    if B.agentrc_mismatch(s.get('agentrc')):
+    if B.agentrc_mismatch(s.get('agentrc'), check_drift=False):
         core.fail('this agentrc\'s files are not the ones the session opened with, so the rig would refuse records '
                   'built with them: close the session and open a new one')
     tree = core.load_attempt(P.ROOT, runs(), a.run_id)

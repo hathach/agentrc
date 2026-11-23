@@ -69,8 +69,7 @@ import sys
 from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-FILES = ('skills/arduino/scripts/agentrc_pin.py', 'skills/hil/boards.json',
-         'skills/hil/scripts/agentrc_source.py', 'skills/hil/scripts/hil_boards.py',
+FILES = ('skills/hil/boards.json', 'skills/hil/scripts/agentrc_source.py', 'skills/hil/scripts/hil_boards.py',
          'skills/hil/scripts/hil_load.py', 'skills/hil/scripts/usb_observe.py')
 SELF = 'skills/arduino/scripts/arduino_build.py'
 SCHEMA = 2
@@ -1282,7 +1281,8 @@ def _git_at(where, *args):
 def platform_git(install_dir, content=False):
     """{commit, dirty} of the git checkout at install_dir, None when it is not one. With `content`, also `content`:
     a sha256 over what its bytes add to that commit (content_digest), or None with `contentError` naming the input
-    it could not read."""
+    it could not read. `dirty` excludes untracked files. Records read this after compilation, not from an input
+    snapshot; a non-git Board Manager core has id/version provenance only."""
     p = _git_at(install_dir, 'rev-parse', 'HEAD')
     if p.returncode:
         return None
@@ -1300,7 +1300,8 @@ def content_digest(top):
     """sha256 over a git checkout's bytes beyond its HEAD, from structured inputs only (no diff text, so no git
     presentation setting enters it): each submodule's state, commit and path (`git submodule status --recursive`),
     then for the checkout and each initialised submodule every tracked path that differs from its own HEAD (status,
-    mode, current bytes; a link by its target) and every untracked file not ignored, each field length-framed.
+    mode, current bytes; a link by its target text, not the referenced bytes) and every untracked file not ignored,
+    each field length-framed.
     Ignored files are not bound. RuntimeError or OSError when an input cannot be read."""
     def run(where, *args):
         p = _git_at(where, *args)
@@ -1347,23 +1348,21 @@ def content_digest(top):
     return h.hexdigest()
 
 
+def contract_digests():
+    return {f: sha256(P.ROOT / f) for f in P.CONTRACT_FILES if (P.ROOT / f).is_file()}
+
+
 def contract_identity():
     """What a HIL record binds besides its images: the library's contract files by sha256, and the agentrc closure
     this process loaded in agentrc_source's portable form, {commit, sha256} (the digests as loaded). The harness
     admits a record only when the contract files and the agentrc closure's bytes match; the commit is provenance."""
-    return {'contract': {f: sha256(P.ROOT / f) for f in P.CONTRACT_FILES if (P.ROOT / f).is_file()},
-            'agentrc': agentrc_source.binding(P.AGENTRC)}
+    return {'contract': contract_digests(), 'agentrc': agentrc_source.binding(P.AGENTRC)}
 
 
-def agentrc_drift():
-    """The closure files whose bytes differ from the ones this process loaded."""
-    return agentrc_source.drift(P.AGENTRC)
-
-
-def agentrc_mismatch(recorded):
+def agentrc_mismatch(recorded, *, check_drift=True):
     """Why a record's agentrc binding is not this process's closure ('' when it is): agentrc_source.mismatch on the
     bytes, the commit provenance only."""
-    return agentrc_source.mismatch(recorded, P.AGENTRC, commit=False)
+    return agentrc_source.mismatch(recorded, P.AGENTRC, commit=False, check_drift=check_drift)
 
 
 def make_record(args, board, rows, before, diff, roster_path, prepared):

@@ -54,24 +54,11 @@ retries, recovery) apply unchanged; these scripts load its `hil_*` scripts throu
   dependency or one of their transitive `depends=` from its resolved directory, one bundled with the core, or a
   prepared user copy shadowing a library the build's own core bundles (hashed before any compile and recorded with
   `shadows`); any other fails the sketch.
-- **The HIL build record** (schema 2) binds a run to its firmware: HEAD and a clean tree, the FQBN, the core (`{id,
-  version, install_dir}`, and `{commit, dirty, content}` when it is a git checkout: `content` a sha256 over its tracked
-  diff, untracked files not ignored and submodules, or null with `contentError` when one is unreadable), the
-  resolved dependencies, the roster's sha256, the library's contract files and the agentrc engines'
-  closure by sha256 with its commit (provenance: the digests decide), and per sketch its images, load spans, VID:PID,
-  foreign headers and used libraries. Without `--experimental`, a foreign header that differs from the checkout
-  refuses the record unless it is the build's own core's copy: a core's bundled copy lags the library between core
-  releases, so it is recorded and the report names it (`firmware.driftedHeaders`), results covering that exact mix
-  and no ABI verdict beyond it.
-  The rig's installed core need not match or exist: HIL validates the recorded images. Core content binding covers
-  git checkouts only; a non-git Board Manager core has id/version provenance only. Content is read after compilation,
-  excludes ignored files and binds symlinks by their target text, not the referenced bytes. The recorded `dirty`
-  flag excludes untracked files; the report's `modified` label means only that flag, never a pristine-input claim.
-  Admission and staging require matching contract files and agentrc closure bytes; rebuild a refused record.
-  `agentrc_source.py` freezes identity per process and checks drift on each load, binding and stage. The build,
-  HIL and remote engines' docstrings define the record and manifests. A session keeps its original staged harness:
-  after an agentrc upgrade, close it and open another before staging records from the new closure. Closing an old
-  session still uses its staged restoration image and harness.
+- **The HIL build record**: the rig's installed core need not match or exist; HIL validates the recorded images.
+  Git-checkout cores are content-bound, other cores have id/version provenance only. The report's `modified` label
+  means only the recorded dirty flag. `arduino_build.py`'s `platform_git()` and `content_digest()` document the
+  binding limits. Rebuild a refused record. After an agentrc upgrade, close and reopen a session before staging
+  records from the new closure; closing still uses its original staged restoration image and harness.
 - **Core TinyUSB** (informational): each build row's `coreTinyUSB` lists, per copy of the TinyUSB an ESP32 core
   bundles (`include/arduino_tinyusb`), the headers the build's `.d` files took from it, its `tusb_option.h` version
   and the lib-builder's `versions.txt` `tinyusb:` ref (null when unreadable). Nothing admits or refuses on it.
@@ -177,14 +164,11 @@ The library's workflow and report comment are its own.
 
 ## Adding a library
 
-1. Copy `skills/arduino/scripts/agentrc_pin.py` from this repository verbatim to
-   `.claude/skills/hil-contract/scripts/agentrc_pin.py`; do not customize it. In `test/hil/agentrc.json`, keep `url`
-   and the full `commit` pin and set the four consumer fields: `cache_namespace` (a plain name unique to the
-   consumer), `profile_api` (`arduino_build.py`'s API), `features` (required capabilities, `[]` for a plain library)
-   and `extra_engines` (agentrc-relative scripts beyond the three engines, `[]` when none). The bootstrap's
-   docstring specifies validation. Put the JSON and bootstrap in the profile's `CONTRACT_FILES` so staged trees
-   carry them. Copy and repin together; keep profile/config and selected-copy integration tests in the consumer,
-   with common bootstrap behavior tested in agentrc.
+1. Copy `skills/arduino/scripts/agentrc_pin.py` verbatim to
+   `.claude/skills/hil-contract/scripts/agentrc_pin.py` and configure `test/hil/agentrc.json` as its docstring
+   specifies. Put both files in the profile's `CONTRACT_FILES` so staged trees carry them. Copy and repin together;
+   keep profile/config and selected-copy integration tests in the consumer, with common bootstrap behavior tested
+   in agentrc.
 2. Write the build profile: CI's matrix boards with their FQBNs, the rig boards it will run on (named as in agentrc's
    board registry, each with its `span`), representatives, classification of its `src/` tree, HIL sketches. Prove it
    with `check_build.py --select-only` on representative diffs and a full `--record` build per rig board.

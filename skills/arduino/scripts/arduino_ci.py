@@ -45,8 +45,7 @@ import time
 from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-FILES = ('skills/arduino/scripts/agentrc_pin.py', 'skills/arduino/scripts/arduino_remote.py',
-         'skills/arduino/scripts/arduino_build.py',
+FILES = ('skills/arduino/scripts/arduino_remote.py', 'skills/arduino/scripts/arduino_build.py',
          'skills/arduino/scripts/arduino_hil.py', 'skills/hil/boards.json', 'skills/hil/scripts/agentrc_source.py',
          'skills/hil/scripts/esptool_session.py',
          'skills/hil/scripts/hil_boards.py', 'skills/hil/scripts/hil_flash.py', 'skills/hil/scripts/hil_load.py',

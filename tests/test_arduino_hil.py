@@ -421,6 +421,12 @@ class Admission(Base):
         self.assertEqual((images['echo']['vidPid'], images['echo']['hex']), ('1234:5678', None))
         self.assertEqual(images['echo']['fqbn'], json.loads(self.record().read_text())['fqbn'])   # no per-sketch one
 
+    def test_record_admission_hashes_the_agentrc_closure_once(self):
+        rec = json.loads(self.record().read_text())
+        with mock.patch.object(H.B.agentrc_source, 'sha256', wraps=H.B.agentrc_source.sha256) as hashes:
+            self.assertEqual(H.record_problems(rec, 'rig_jlink', 'abc', False, 'HEAD'), [])
+        self.assertEqual(hashes.call_count, len(self.agentrc['files']))
+
     def test_admission_needs_no_core_installation_on_the_rig(self):
         missing = self.dir / 'build-machine/core'
         self.assertFalse(missing.exists())
