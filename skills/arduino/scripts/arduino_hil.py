@@ -281,16 +281,17 @@ def record_problems(rec, board, head, experimental_ok, where):
     why = []
     if rec.get('library') != B.P.LIBRARY_NAME:
         why.append(f'it is a {rec.get("library")} record, this harness is {B.P.LIBRARY_NAME}\'s')
-    current = B.contract_identity()
-    changed = sorted(f for f in {*rec.get('contract', {}), *current['contract']}
-                     if rec.get('contract', {}).get(f) != current['contract'].get(f))
+    drift = B.agentrc_source.drift(B.P.AGENTRC)
+    if drift:
+        return [f'agentrc {", ".join(drift)} changed since this process loaded it; rerun']
+    current = B.contract_digests()
+    changed = sorted(f for f in {*rec.get('contract', {}), *current}
+                     if rec.get('contract', {}).get(f) != current.get(f))
     if changed:
         why.append(f'the contract files {changed} differ from the ones it was built with: rebuild it')
-    drift = B.agentrc_drift()
-    if drift:
-        why.append(f'agentrc changed since this harness loaded it: {drift}; rerun')
-    elif B.agentrc_mismatch(rec.get('agentrc')):   # the commit is provenance only
-        why.append(f'{B.agentrc_mismatch(rec.get("agentrc"))}: rebuild it')
+    mismatch = B.agentrc_mismatch(rec.get('agentrc'), check_drift=False)   # the commit is provenance only
+    if mismatch:
+        why.append(f'{mismatch}: rebuild it')
     if rec['board'] != board:
         why.append(f'it is for {rec["board"]}, not {board}')
     if rec['experimental'] and not experimental_ok:
@@ -1148,6 +1149,20 @@ def schema():
                                check=check, empty=lambda b: not b['results'], render=render)
 
 
+def core_provenance(platform):
+    """Describe a record's core provenance; modified reflects only its recorded git dirty flag."""
+    parts = [f'{platform.get("id") or "?"} {platform.get("version") or "?"}']
+    git = platform.get('git')
+    if git is None:
+        return ', '.join([*parts, 'non-git: id/version only'])
+    parts.append(f'commit {(git.get("commit") or "?")[:12]}')
+    if git.get('dirty'):
+        parts.append('modified')
+    content = git.get('content')
+    parts.append(f'content {content[:12]}' if content else 'content unavailable')
+    return ', '.join(parts)
+
+
 def render(body):
     tests = sorted({t['test'] for r in body['results'] for t in r['tests']})
     mark = {True: '✅', False: '❌', None: '⚪'}
@@ -1167,6 +1182,9 @@ def render(body):
                 lines.append(f'- {r["board"]} {t["test"]}: {t["detail"]}')
         if r['detail']:
             lines.append(f'- {r["board"]}: {r["detail"]}')
+        platform = (r.get('firmware') or {}).get('platform')
+        if platform:
+            lines.append(f'- {r["board"]} core: {core_provenance(platform)}')
         drifted = (r.get('firmware') or {}).get('driftedHeaders')
         if drifted:
             lines.append(f'- {r["board"]}: its core\'s bundled copy of the library differs from the checkout in '

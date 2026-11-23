@@ -421,6 +421,27 @@ class Admission(Base):
         self.assertEqual((images['echo']['vidPid'], images['echo']['hex']), ('1234:5678', None))
         self.assertEqual(images['echo']['fqbn'], json.loads(self.record().read_text())['fqbn'])   # no per-sketch one
 
+    def test_record_admission_hashes_the_agentrc_closure_once(self):
+        rec = json.loads(self.record().read_text())
+        with mock.patch.object(H.B.agentrc_source, 'sha256', wraps=H.B.agentrc_source.sha256) as hashes:
+            self.assertEqual(H.record_problems(rec, 'rig_jlink', 'abc', False, 'HEAD'), [])
+        self.assertEqual(hashes.call_count, len(self.agentrc['files']))
+
+    def test_admission_needs_no_core_installation_on_the_rig(self):
+        missing = self.dir / 'build-machine/core'
+        self.assertFalse(missing.exists())
+        platform = {'id': 'vend:arch', 'version': '1.0', 'install_dir': str(missing),
+                    'git': {'commit': 'a' * 40, 'dirty': True, 'content': 'b' * 64}}
+        path = self.record(platform=platform)
+        rec = json.loads(path.read_text())
+        self.assertEqual(H.record_problems(rec, 'rig_jlink', 'abc', False, 'staged tree'), [])
+        admitted, images = self.admit(path, manifest={'head': 'abc'})
+        self.assertEqual(admitted['platform'], platform)
+        self.assertEqual(Path(images['echo']['elf']).read_bytes(), b'elf')
+        (self.root / 'build/hil/rig_jlink/echo/echo.ino.elf').write_bytes(b'tampered')
+        with self.assertRaisesRegex(H.Refused, 'changed since the record'):
+            self.admit(path, manifest={'head': 'abc'})
+
     def test_two_named_builds_of_one_source_are_admitted_by_name(self):
         rec = self.record()
         data = json.loads(rec.read_text())
@@ -488,8 +509,8 @@ class Admission(Base):
         lock = self.agentrc['root'] / 'skills/hil/scripts/hil_lock.py'
         loaded = lock.read_text()
         lock.write_text('# another agentrc\n')
-        with self.assertRaisesRegex(H.Refused, r"agentrc changed since this harness loaded it: "
-                                               r"\['skills/hil/scripts/hil_lock.py'\]; rerun"):
+        with self.assertRaisesRegex(H.Refused, 'agentrc skills/hil/scripts/hil_lock.py changed since this process '
+                                               'loaded it; rerun'):
             self.admit(rec)
         lock.write_text(loaded)
         self.agentrc['commit'] = 'b' * 40   # another commit with the same closure: the files decide
@@ -2554,7 +2575,46 @@ class BoardTaskOnTheRealLock(Base):
         self.assert_released()
 
 
+class CoreProvenance(unittest.TestCase):
+    def setUp(self):
+        self.platform = {'id': 'vend:arch', 'version': '1.0', 'install_dir': '/build-machine/core',
+                         'git': {'commit': 'a' * 40, 'dirty': False, 'content': 'b' * 64}}
+
+    def test_git_commit_and_content(self):
+        self.assertEqual(H.core_provenance(self.platform),
+                         'vend:arch 1.0, commit aaaaaaaaaaaa, content bbbbbbbbbbbb')
+
+    def test_modified_is_the_recorded_dirty_flag(self):
+        self.platform['git']['dirty'] = True
+        self.assertEqual(H.core_provenance(self.platform),
+                         'vend:arch 1.0, commit aaaaaaaaaaaa, modified, content bbbbbbbbbbbb')
+
+    def test_unavailable_content(self):
+        self.platform['git'].update(content=None, contentError='an input was unreadable')
+        self.assertEqual(H.core_provenance(self.platform),
+                         'vend:arch 1.0, commit aaaaaaaaaaaa, content unavailable')
+
+    def test_non_git_id_and_version_only(self):
+        self.platform['git'] = None
+        self.assertEqual(H.core_provenance(self.platform), 'vend:arch 1.0, non-git: id/version only')
+
+
 class Report(Base):
+    def test_render_shows_each_recorded_core_and_allows_missing_firmware(self):
+        self.A.report.table.return_value = 'table'
+        row = {'board': 'git-board', 'ran': True, 'pass': True, 'locked': False, 'tests': [],
+               'cleanup': {'pass': True, 'state': 'restored'}, 'detail': '',
+               'firmware': {'platform': {'id': 'vend:arch', 'version': '1.0',
+                                         'git': {'commit': 'a' * 40, 'dirty': True, 'content': 'b' * 64}}}}
+        other = {**row, 'board': 'non-git-board', 'firmware': {'platform': {'id': 'other:arch', 'version': '2.0',
+                                                                         'git': None}}}
+        absent = {k: v for k, v in row.items() if k != 'firmware'}
+        absent.update(board='not-run', ran=False)
+        md = H.render({'pass': True, 'caveat': '', 'exitCode': 0, 'results': [row, other, absent]})
+        self.assertIn('- git-board core: vend:arch 1.0, commit aaaaaaaaaaaa, modified, content bbbbbbbbbbbb\n', md)
+        self.assertIn('- non-git-board core: other:arch 2.0, non-git: id/version only\n', md)
+        self.assertNotIn('- not-run core:', md)
+
     def test_render_verdicts_and_exit(self):
         self.A.report.table = lambda headers, rows: '|'.join(headers) + '\n' + '\n'.join('|'.join(r) for r in rows)
         row = {'board': 'b', 'ran': True, 'pass': False, 'locked': False, 'recoveryBlocker': False,

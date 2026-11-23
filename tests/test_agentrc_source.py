@@ -145,6 +145,13 @@ class Staged(Base):
         with self.assertRaisesRegex(src.SourceError, 'written once'):
             src.stage(ident, staged.parent)
 
+    def test_destination_name_round_trip(self):
+        ident = src.identity('installed', self.inst, [SCRIPT])
+        tree = self.tmp / 'tree'
+        digests = src.stage(ident, tree, name='agentrc')
+        self.assertIn('agentrc/manifest.json', digests)
+        self.assertEqual(src.portable(src.identity('staged', tree / 'agentrc', [SCRIPT])), src.portable(ident))
+
     def test_every_gap_refused(self):
         def manifest(edit, name):
             ident, staged, _ = self.stage(name)

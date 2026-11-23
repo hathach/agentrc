@@ -210,7 +210,8 @@ def read_json(path):
 
 def admit_tree(src, board, head, run_id, roster):
     """Refused unless the packed dir `src` is this run's tree of `board` at `head`: provenance, manifest and files
-    agree, nothing is a link or unpinned, and its roster is this checkout's `roster`."""
+    agree, nothing is a link or unpinned (agentrc/manifest.json included), and its roster is this checkout's
+    `roster`. Only the root manifest and provenance are unpinned metadata, for old trees as well as new ones."""
     src = Path(src)
     if src.is_symlink() or not src.is_dir():
         raise Refused(f'no packed tree at {src}')

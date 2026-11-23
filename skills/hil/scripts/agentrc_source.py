@@ -119,11 +119,18 @@ def checkout_of(root, scripts):
     return co, files
 
 
+def _through_link(root, rel):
+    parts = PurePosixPath(rel).parts
+    return any(root.joinpath(*parts[:i]).is_symlink() for i in range(len(parts) + 1))
+
+
 def read_staged(staged, scripts):
     """The identity of the staged copy at `staged` (<consumer root>/.agentrc): its manifest names a commit, a dirty
     flag and the digest of exactly the closure of `scripts`, each a regular file with those bytes. Any gap is a
     SourceError, never a reason to look elsewhere."""
     staged = Path(staged)
+    if _through_link(staged, MANIFEST):
+        raise SourceError(f'{staged / MANIFEST} is not a regular file in a plain directory')
     try:
         m = json.loads((staged / MANIFEST).read_text(encoding='utf-8'))
     except (OSError, ValueError, RecursionError) as e:
@@ -134,9 +141,7 @@ def read_staged(staged, scripts):
             or not all(_safe_rel(k) and isinstance(v, str) for k, v in m['sha256'].items())):
         raise SourceError(f'{staged / MANIFEST} names no commit, dirty flag and file digests')
     for rel in m['sha256']:
-        parts = PurePosixPath(rel).parts
-        if (any(staged.joinpath(*parts[:i]).is_symlink() for i in range(len(parts) + 1))
-                or not (staged / rel).is_file()):
+        if _through_link(staged, rel) or not (staged / rel).is_file():
             raise SourceError(f'staged agentrc {rel} is missing or not a regular file in a plain directory')
     # the bytes first: a closure is read from the scripts' FILES, which only verified files may declare
     bad = [f for f, digest in m['sha256'].items() if sha256(staged / f) != digest]
@@ -184,7 +189,15 @@ def frozen(source, root, scripts, commit=None):
 def drift(ident):
     """The closure files whose bytes now differ from `ident`'s digests (a missing one included)."""
     root = Path(ident['root'])
-    return [f for f in ident['files'] if not (root / f).is_file() or sha256(root / f) != ident['sha256'][f]]
+    changed = []
+    for f in ident['files']:
+        try:
+            linked = ident['source'] == 'staged' and _through_link(root, f)
+            if linked or not (root / f).is_file() or sha256(root / f) != ident['sha256'][f]:
+                changed.append(f)
+        except OSError:
+            changed.append(f)
+    return changed
 
 
 def _drifted(ident):
@@ -217,12 +230,12 @@ def binding(ident):
     return portable(ident)
 
 
-def mismatch(recorded, ident, commit=True):
+def mismatch(recorded, ident, commit=True, *, check_drift=True):
     """Why a record's agentrc (portable form) is not `ident`'s, or the closure drifted since load, '' when neither:
     a record without one predates the binding and is rebuilt, never admitted. With commit=False only the closure's
     bytes must match, the commit being provenance (the Arduino engines: an agentrc commit that changes none of
-    their files keeps a record admissible)."""
-    why = _drifted(ident)
+    their files keeps a record admissible). `check_drift=False` is for a caller that just checked drift itself."""
+    why = _drifted(ident) if check_drift else ''
     if why:
         return why
     if not isinstance(recorded, dict) or not isinstance(recorded.get('sha256'), dict):
@@ -235,12 +248,13 @@ def mismatch(recorded, ident, commit=True):
     return ''
 
 
-def stage(ident, into):
-    """Copy `ident`'s closure into <into>/.agentrc as regular files with its manifest, checking each copy against
-    the frozen digest (a file edited since load is refused, never staged); {.agentrc-relative path: sha256}."""
-    dest = Path(into) / STAGED
+def stage(ident, into, *, name=STAGED):
+    """Copy `ident`'s closure into <into>/<name> (default .agentrc), with its manifest, checking each copy against
+    the frozen digest; {into-relative path: sha256}, the manifest included. `name` is one plain directory name."""
+    dest = Path(into) / name
     if os.path.lexists(dest):
         raise SourceError(f'{dest} exists: a staged tree is written once')
+    binding(ident)   # refuse a staged symlink even when its target still has the frozen bytes
     root, out = Path(ident['root']), {}
     for f in ident['files']:
         target = dest / f
@@ -248,9 +262,9 @@ def stage(ident, into):
         shutil.copyfile(root / f, target)
         if sha256(target) != ident['sha256'][f]:
             raise SourceError(f'agentrc {f} changed since this process loaded it; rerun')
-        out[f'{STAGED}/{f}'] = ident['sha256'][f]
+        out[f'{name}/{f}'] = ident['sha256'][f]
     (dest / MANIFEST).write_text(json.dumps({'commit': ident['commit'], 'dirty': ident['dirty'],
                                              'sha256': ident['sha256']}, indent=1, sort_keys=True) + '\n',
                                  encoding='utf-8')
-    out[f'{STAGED}/{MANIFEST}'] = sha256(dest / MANIFEST)
+    out[f'{name}/{MANIFEST}'] = sha256(dest / MANIFEST)
     return out

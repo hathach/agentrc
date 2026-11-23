@@ -22,13 +22,10 @@ retries, recovery) apply unchanged; these scripts load its `hil_*` scripts throu
 
 ## A library's side
 
-- `.claude/skills/hil-contract/scripts/agentrc_pin.py`: selects the agentrc the contracts load and loads the
-  engines from it: `agentrc/` in a tree staged on a rig (its `manifest.json` names the commit); in CI (`GITHUB_ACTIONS`
-  or `CI` true, any other value refused) the commit `test/hil/agentrc.json` pins (`{url, commit}`), fetched into
-  `~/.cache/<library>/agentrc-<commit>`; otherwise the installed agentrc, `"${AGENTRC_DIR:-$HOME/.claude}"`, never
-  fetched. It is the one piece each library copies: code cannot find itself. Its `ENGINES` closure is what a rig tree
-  carries and what a record binds, with the commit of the one checkout the closure resolves into and whether the
-  closure differs from it; it refuses engines whose `PROFILE_API` is not the library's before loading any.
+- `.claude/skills/hil-contract/scripts/agentrc_pin.py`: a verbatim copy of `scripts/agentrc_pin.py`, configured by
+  `test/hil/agentrc.json`. It selects the staged tree, CI pin or installed checkout, in that order. Its docstring
+  defines selection, configuration and commands; `hil`'s `agentrc_source.py` owns closure identity and drift.
+  `agentrc_pin.py test` refuses a copy that differs from the selected canonical file, naming the copy/repin remedy.
 - `.claude/skills/build/scripts/check_build.py`: the build profile (board table with CI's FQBNs from
   adafruit/ci-arduino `all_platforms.py` plus the rig boards, representatives per family, source classification,
   HIL sketches per role, VID:PID adapter, extra dependencies) and `main()`, which binds it to `arduino_build.py`.
@@ -57,20 +54,11 @@ retries, recovery) apply unchanged; these scripts load its `hil_*` scripts throu
   dependency or one of their transitive `depends=` from its resolved directory, one bundled with the core, or a
   prepared user copy shadowing a library the build's own core bundles (hashed before any compile and recorded with
   `shadows`); any other fails the sketch.
-- **The HIL build record** (schema 2) binds a run to its firmware: HEAD and a clean tree, the FQBN, the core (`{id,
-  version, install_dir}`, and `{commit, dirty, content}` when it is a git checkout: `content` a sha256 over its tracked
-  diff, untracked files not ignored and submodules, or null with `contentError` when one is unreadable; a core that is
-  no git checkout is identified by id and version only, and no harness compares the core with the rig's), the
-  resolved dependencies, the roster's sha256, the library's contract files and the agentrc engines'
-  closure by sha256 with its commit (provenance: the digests decide), and per sketch its images, load spans, VID:PID,
-  foreign headers and used libraries. Without `--experimental`, a foreign header that differs from the checkout
-  refuses the record unless it is the build's own core's copy: a core's bundled copy lags the library between core
-  releases, so it is recorded and the report names it (`firmware.driftedHeaders`), results covering that exact mix
-  and no ABI verdict beyond it.
-  The harness, and `hil_remote.py` before staging, refuse a record whose library, schema, contract files or agentrc
-  files differ from the ones running: rebuild it. Each process freezes the agentrc closure's digests
-  when it loads it and refuses to write, admit or stage a record once those files have changed under it; a manual
-  session refuses records built with other agentrc files than the ones it opened with.
+- **The HIL build record**: the rig's installed core need not match or exist; HIL validates the recorded images.
+  Git-checkout cores are content-bound, other cores have id/version provenance only. The report's `modified` label
+  means only the recorded dirty flag. `arduino_build.py`'s `platform_git()` and `content_digest()` document the
+  binding limits. Rebuild a refused record. After an agentrc upgrade, close and reopen a session before staging
+  records from the new closure; closing still uses its original staged restoration image and harness.
 - **Core TinyUSB** (informational): each build row's `coreTinyUSB` lists, per copy of the TinyUSB an ESP32 core
   bundles (`include/arduino_tinyusb`), the headers the build's `.d` files took from it, its `tusb_option.h` version
   and the lib-builder's `versions.txt` `tinyusb:` ref (null when unreadable). Nothing admits or refuses on it.
@@ -168,20 +156,19 @@ changes from a library:
 
 ## CI
 
-`arduino_ci.py` (a library's `hil_ci.py` wraps it) splits a HIL run across GitHub runners: a hosted runner per board
-sets the board up through adafruit/ci-arduino's own `install_library_deps()` and `install_platform()` (latest
-releases, nothing pinned; ci-arduino and its arduino-cli kept out of the checkout's status), builds the clean record
-and packs the tree `hil_remote.py` would stage, with a `provenance.json` naming the run; the rig runner admits each
-packed tree against its run, head and roster and runs the battery in it board by board, with a lock wait, one retry of
-a fail and a deadline, into a state dir kept across runs (`summary.json` per run, finished clean runs pruned). The
-admission checks consistency, not trust: a pull request's code, harness included, runs on the rig as the runner's
-user. The library's workflow and report comment are its own.
+`arduino_ci.py` (a library's `hil_ci.py` wraps it) splits a run between hosted builds and the farm's binary-only
+battery. Its docstring defines setup, packing, admission, lock waits, retries, deadlines and pruning. Packed trees
+pin the inner `agentrc/manifest.json` in the outer manifest; old bootstraps retain the outer commit/dirty identity.
+Admission checks consistency, not trust: a pull request's code, harness included, runs as the rig runner's user.
+The library's workflow and report comment are its own.
 
 ## Adding a library
 
-1. Copy `agentrc_pin.py` from a library that has it, changing only its cache namespace, and pin a commit of this
-   repository that has `skills/arduino/` for CI. Its `PROFILE_API` is `arduino_build.py`'s: a change to the profile
-   names the engines read bumps it there and in every library's copy together.
+1. Copy `skills/arduino/scripts/agentrc_pin.py` verbatim to
+   `.claude/skills/hil-contract/scripts/agentrc_pin.py` and configure `test/hil/agentrc.json` as its docstring
+   specifies. Put both files in the profile's `CONTRACT_FILES` so staged trees carry them. Copy and repin together;
+   keep profile/config and selected-copy integration tests in the consumer, with common bootstrap behavior tested
+   in agentrc.
 2. Write the build profile: CI's matrix boards with their FQBNs, the rig boards it will run on (named as in agentrc's
    board registry, each with its `span`), representatives, classification of its `src/` tree, HIL sketches. Prove it
    with `check_build.py --select-only` on representative diffs and a full `--record` build per rig board.
@@ -202,7 +189,8 @@ user. The library's workflow and report comment are its own.
    `@AGENTS.md`; no `.agents`. Copy SPIFlash's `no-symlinks` pre-commit hook unchanged. `install.py --project` links
    are untracked, so they never reach a release.
 
-A core follows the same steps with its core-mode profile; its `agentrc_pin.py` copy also refuses engines without
-core mode (`'core'` missing from `arduino_build.PROFILE_FEATURES`), one whose rig board has a base image without
-`'base'`, one whose `HIL_SKETCHES` names a build without `'named'`, and one whose profile sets `CORE_TESTS` without
-`'battery'`, since `PROFILE_API` stays 1 for them.
+A core follows the same steps with its core-mode profile. Set `features` to include `core`, plus `base` for a rig
+board's base image, `named` for named HIL builds and `battery` for `CORE_TESTS`. These are additive capabilities of
+profile API 1, checked before any engine executes. A consumer that runs the shared report commenter adds
+`skills/hil/scripts/gh_pr_comment.py` to `extra_engines`; one with a `hil_ci.py` wrapper also adds
+`skills/arduino/scripts/arduino_ci.py`. Every entry point loaded through the bootstrap must belong to its closure.
