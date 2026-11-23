@@ -456,6 +456,18 @@ class Pin(Consumer):
         self.restore_mode(tree)
         self.pin._remove(tree)
 
+    @unittest.skipIf(os.name == 'nt' or os.geteuid() == 0, 'needs POSIX permissions that bind the caller')
+    def test_cleanup_leaves_directory_modes_alone(self):
+        sealed = self.tmp / 'tree/sealed'
+        sealed.mkdir(parents=True)
+        (sealed / 'kept').write_text('x')
+        sealed.chmod(0o500)
+        self.restore_mode(sealed, sealed.parent)
+        before = sealed.parent.stat().st_mode, sealed.stat().st_mode
+        self.pin._remove(sealed.parent)
+        self.assertEqual((sealed.parent.stat().st_mode, sealed.stat().st_mode), before)
+        self.assertTrue((sealed / 'kept').is_file())
+
     def test_cleanup_never_chmods_through_a_symlink(self):
         outside = self.tmp / 'outside'
         outside.mkdir()
