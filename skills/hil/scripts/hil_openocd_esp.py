@@ -318,7 +318,7 @@ def pending_entries(serial: str) -> dict:
     (hil_lock.log_cleanup_failure): {'receipts': tracked receipts, which hil_process.recheck
     rechecks, 'retained': session receipts, retained by session_state, 'unrecheckable': what
     nothing can recheck (an unreceipted, unrecognised or malformed entry, a state dir entry whose
-    dir shows nothing open yet, or {'unreadable':
+    owner's marker is held, or {'unreadable':
     <record>, 'error': why} for a record that cannot be read)}. Only entries not proven ended, this process's
     unlisted ones (latch) included; reads without clearing, and never raises for the record."""
     record = pending(serial)
@@ -345,8 +345,8 @@ def pending_entries(serial: str) -> dict:
             # whose files the scan then finds; one seen held may start and latch it mid-scan
             held = 'aheadLock' in r and _ahead_held(r['aheadLock'], r['stateDir'])
             found = hil_process.recheck_dir(r['stateDir'], keep=hil_process._KeepAll())[1]
-            if not found and held:
-                # a live owner whose child had no file there yet
+            if held:
+                # a live owner whose own child may have no file there yet, whatever else the scan found
                 out['unrecheckable'].append(r)
             for o in found:
                 if o not in out['receipts'] and o not in out['unrecheckable']:

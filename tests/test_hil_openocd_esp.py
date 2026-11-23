@@ -2590,6 +2590,22 @@ class ReadSecurity(unittest.TestCase):
         self.assertEqual(oe.pending_entries(SERIAL), {'receipts': [], 'retained': [], 'unrecheckable': [receipt]})
         self.assertEqual(oe.pending(SERIAL).read(), [{'receipt': receipt}], 'read, never cleared')
 
+    def test_a_held_marker_keeps_its_receipt_beside_another_usjs_open_child(self):
+        """CodeRabbit on #214: two USJs sharing a workdir, the scan found the other's child while this
+        owner's marker was held and its child not started; only the other child was listed."""
+        state = oe.hil_process.state_dir(str(self.work), oe.SECURITY_STATE)
+        fd, marker = oe._ahead_marker(state)
+        self.addCleanup(os.rmdir, state)
+        self.addCleanup(os.unlink, marker)
+        self.addCleanup(os.close, fd)
+        receipt = {'stateDir': state, 'what': 'read_security on /dev/ttyACM3', 'aheadLock': marker}
+        other = {'token': 'o', 'supervisor': {}, 'lock': f'{state}/hil_op_o.lock', 'record': f'{state}/hil_op_o.json'}
+        oe.pending(SERIAL).add([{'receipt': receipt}])
+        with mock.patch.object(oe.hil_process, 'recheck_dir', return_value=('pending', [other])):
+            out = oe.pending_entries(SERIAL)
+        self.assertIn(receipt, out['unrecheckable'])
+        self.assertIn(other, out['receipts'])
+
     def test_an_owner_that_latches_and_releases_mid_scan_still_leaves_cleanup_evidence(self):
         """CodeRabbit on #214: the marker was sampled after the scan, so an owner that started its child,
         latched it, withdrew its entry and released the marker in between left pending_entries nothing."""
