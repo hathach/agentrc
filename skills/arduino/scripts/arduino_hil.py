@@ -1150,6 +1150,20 @@ def schema():
                                check=check, empty=lambda b: not b['results'], render=render)
 
 
+def core_provenance(platform):
+    """Describe a record's core provenance; modified reflects only its recorded git dirty flag."""
+    parts = [f'{platform.get("id") or "?"} {platform.get("version") or "?"}']
+    git = platform.get('git')
+    if git is None:
+        return ', '.join([*parts, 'non-git: id/version only'])
+    parts.append(f'commit {(git.get("commit") or "?")[:12]}')
+    if git.get('dirty'):
+        parts.append('modified')
+    content = git.get('content')
+    parts.append(f'content {content[:12]}' if content else 'content unavailable')
+    return ', '.join(parts)
+
+
 def render(body):
     tests = sorted({t['test'] for r in body['results'] for t in r['tests']})
     mark = {True: '✅', False: '❌', None: '⚪'}
@@ -1169,6 +1183,9 @@ def render(body):
                 lines.append(f'- {r["board"]} {t["test"]}: {t["detail"]}')
         if r['detail']:
             lines.append(f'- {r["board"]}: {r["detail"]}')
+        platform = (r.get('firmware') or {}).get('platform')
+        if platform:
+            lines.append(f'- {r["board"]} core: {core_provenance(platform)}')
         drifted = (r.get('firmware') or {}).get('driftedHeaders')
         if drifted:
             lines.append(f'- {r["board"]}: its core\'s bundled copy of the library differs from the checkout in '

@@ -69,6 +69,18 @@ class Checkout(unittest.TestCase):
 
 
 class Pack(Checkout):
+    def test_packed_admission_needs_no_build_machine_core(self):
+        missing = self.tmp / 'build-machine/core'
+        self.assertFalse(missing.exists())
+        platform = {'id': 'vend:arch', 'version': '1.0', 'install_dir': str(missing),
+                    'git': {'commit': 'a' * 40, 'dirty': False, 'content': None}}
+        rec = json.loads(self.record_path.read_text())
+        self.record_path.write_text(json.dumps({**rec, 'platform': platform}))
+        tree = self.pack() / BOARD
+        self.assertIsNone(C.admit_tree(tree, BOARD, self.head, HEAD_RUN, ROSTER))
+        packed = json.loads((tree / self.record_path.relative_to(self.root)).read_text())
+        self.assertEqual(packed['platform'], platform)
+
     def test_packs_the_tree_hil_remote_would_stage_with_provenance(self):
         out = self.pack()
         tree = out / BOARD

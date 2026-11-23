@@ -56,14 +56,17 @@ retries, recovery) apply unchanged; these scripts load its `hil_*` scripts throu
   `shadows`); any other fails the sketch.
 - **The HIL build record** (schema 2) binds a run to its firmware: HEAD and a clean tree, the FQBN, the core (`{id,
   version, install_dir}`, and `{commit, dirty, content}` when it is a git checkout: `content` a sha256 over its tracked
-  diff, untracked files not ignored and submodules, or null with `contentError` when one is unreadable; a core that is
-  no git checkout is identified by id and version only, and no harness compares the core with the rig's), the
+  diff, untracked files not ignored and submodules, or null with `contentError` when one is unreadable), the
   resolved dependencies, the roster's sha256, the library's contract files and the agentrc engines'
   closure by sha256 with its commit (provenance: the digests decide), and per sketch its images, load spans, VID:PID,
   foreign headers and used libraries. Without `--experimental`, a foreign header that differs from the checkout
   refuses the record unless it is the build's own core's copy: a core's bundled copy lags the library between core
   releases, so it is recorded and the report names it (`firmware.driftedHeaders`), results covering that exact mix
   and no ABI verdict beyond it.
+  The rig's installed core need not match or exist: HIL validates the recorded images. Core content binding covers
+  git checkouts only; a non-git Board Manager core has id/version provenance only. Content is read after compilation,
+  excludes ignored files and binds symlinks by their target text, not the referenced bytes. The recorded `dirty`
+  flag excludes untracked files; the report's `modified` label means only that flag, never a pristine-input claim.
   Admission and staging require matching contract files and agentrc closure bytes; rebuild a refused record.
   `agentrc_source.py` freezes identity per process and checks drift on each load, binding and stage. The build,
   HIL and remote engines' docstrings define the record and manifests. A session keeps its original staged harness:
