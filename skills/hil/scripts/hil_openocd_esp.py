@@ -341,9 +341,12 @@ def pending_entries(serial: str) -> dict:
             if not _os_path(r['stateDir']):
                 out['unrecheckable'].append(r)
                 continue
+            # sampled before the scan: an owner releases its marker only after latching its child,
+            # whose files the scan then finds; one seen held may start and latch it mid-scan
+            held = 'aheadLock' in r and _ahead_held(r['aheadLock'], r['stateDir'])
             found = hil_process.recheck_dir(r['stateDir'], keep=hil_process._KeepAll())[1]
-            if not found and 'aheadLock' in r and _ahead_held(r['aheadLock'], r['stateDir']):
-                # a live owner whose child has no file there yet
+            if not found and held:
+                # a live owner whose child had no file there yet
                 out['unrecheckable'].append(r)
             for o in found:
                 if o not in out['receipts'] and o not in out['unrecheckable']:

@@ -2590,6 +2590,28 @@ class ReadSecurity(unittest.TestCase):
         self.assertEqual(oe.pending_entries(SERIAL), {'receipts': [], 'retained': [], 'unrecheckable': [receipt]})
         self.assertEqual(oe.pending(SERIAL).read(), [{'receipt': receipt}], 'read, never cleared')
 
+    def test_an_owner_that_latches_and_releases_mid_scan_still_leaves_cleanup_evidence(self):
+        """CodeRabbit on #214: the marker was sampled after the scan, so an owner that started its child,
+        latched it, withdrew its entry and released the marker in between left pending_entries nothing."""
+        state = oe.hil_process.state_dir(str(self.work), oe.SECURITY_STATE)
+        fd, marker = oe._ahead_marker(state)
+        self.addCleanup(os.rmdir, state)
+        self.addCleanup(os.unlink, marker)
+        receipt = {'stateDir': state, 'what': 'read_security on /dev/ttyACM3', 'aheadLock': marker}
+        oe.pending(SERIAL).add([{'receipt': receipt}])
+        child = {'token': 't', 'supervisor': {}, 'lock': f'{state}/hil_op_t.lock', 'record': f'{state}/hil_op_t.json'}
+
+        def owner_finishes(*a, **kw):
+            oe.pending(SERIAL).add([{'receipt': child}])
+            oe.pending(SERIAL).withdraw(receipt)
+            os.close(fd)
+            return 'done', []
+
+        with mock.patch.object(oe.hil_process, 'recheck_dir', side_effect=owner_finishes) as scan:
+            self.assertEqual(oe.pending_entries(SERIAL), {'receipts': [], 'retained': [], 'unrecheckable': [receipt]})
+        scan.assert_called_once()
+        self.assertFalse(oe._ahead_held(marker, state), 'released mid-scan')
+
     def test_an_empty_state_dir_entry_without_a_held_marker_is_not_unrecheckable(self):
         """Codex on #574: an empty state dir read as a live owner's whatever its marker; only a held
         one keeps the entry as cleanup evidence."""
