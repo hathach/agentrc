@@ -26,6 +26,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -127,6 +128,19 @@ def problem(root, commit):
     return ""
 
 
+def _remove(tree):
+    """Best-effort rmtree that also removes git's read-only object files, which Windows refuses to unlink."""
+
+    def writable(func, path, _):
+        try:
+            os.chmod(path, stat.S_IWRITE)
+            func(path)
+        except OSError:
+            pass
+
+    shutil.rmtree(tree, onexc=writable)
+
+
 def fetch():
     if not ci():
         raise PinError("fetch runs in CI only: a dev PC loads the installed agentrc", INSTALL_HINT)
@@ -138,7 +152,7 @@ def fetch():
             raise PinError(f"{dest} exists but {why}; remove it and fetch again")
         return dest
     tmp = dest.with_name(dest.name + f".tmp-{os.getpid()}")
-    shutil.rmtree(tmp, ignore_errors=True)
+    _remove(tmp)
     tmp.mkdir(parents=True)
     for args in (
         ("init", "-q"),
@@ -148,12 +162,12 @@ def fetch():
     ):
         p = _git(tmp, *args)
         if p.returncode:
-            shutil.rmtree(tmp, ignore_errors=True)
+            _remove(tmp)
             raise PinError(f'git {" ".join(args)}: {p.stderr.strip()}')
     try:
         tmp.rename(dest)
     except OSError as e:  # A concurrent first fetch may have published its checkout first.
-        shutil.rmtree(tmp, ignore_errors=True)
+        _remove(tmp)
         if not dest.exists():
             raise PinError(f"{tmp} -> {dest}: {e}") from None
     why = problem(dest, commit)

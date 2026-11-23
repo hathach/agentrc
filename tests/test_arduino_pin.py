@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import unittest
@@ -86,7 +87,8 @@ class Consumer(unittest.TestCase):
         (self.install / 'skills').mkdir(parents=True)
         for skill in ('arduino', 'hil'):
             (self.install / 'skills' / skill).symlink_to(self.repo / 'skills' / skill, target_is_directory=True)
-        self.env(HOME=str(self.tmp / 'home'), XDG_CACHE_HOME=str(self.tmp / 'cache'))
+        home = str(self.tmp / 'home')   # Path.home() reads USERPROFILE on Windows, HOME elsewhere
+        self.env(HOME=home, USERPROFILE=home, XDG_CACHE_HOME=str(self.tmp / 'cache'))
 
     def env(self, **kw):
         self.stack.enter_context(mock.patch.dict(os.environ, kw))
@@ -164,7 +166,7 @@ class Configuration(Consumer):
         for raw in (b'{', b'\xff', b'[]', b'null', b'[' * 10000):
             with self.subTest(raw=raw[:20]):
                 (self.root / CONFIG).write_bytes(raw)
-                with self.assertRaisesRegex(self.pin.PinError, re.escape(CONFIG)):
+                with self.assertRaisesRegex(self.pin.PinError, re.escape(str(Path(CONFIG)))):
                     self.pin.config()
         (self.root / CONFIG).unlink()
         with self.assertRaisesRegex(self.pin.PinError, 'not readable JSON'):
@@ -372,6 +374,16 @@ class Pin(Consumer):
         super().setUp()
         self.env(CI='true', AGENTRC_DIR=str(self.tmp / 'must-not-use'))
 
+    def windows_unlink(self):
+        """Refuse to unlink a read-only file, as Windows does, so git's read-only objects test cleanup anywhere."""
+        real = os.unlink
+
+        def unlink(path, *, dir_fd=None):
+            if not os.stat(path, dir_fd=dir_fd, follow_symlinks=False).st_mode & stat.S_IWRITE:
+                raise PermissionError(13, 'read-only file', path)
+            real(path, dir_fd=dir_fd)
+        self.stack.enter_context(mock.patch.object(os, 'unlink', unlink))
+
     def test_ci_fetch_checkout_and_identity_ignore_installed(self):
         with self.assertRaisesRegex(self.pin.PinError, 'agentrc pin') as cm:
             self.pin.check()
@@ -398,6 +410,7 @@ class Pin(Consumer):
         self.assertEqual(self.pin.identity()['source'], 'pin')
 
     def test_concurrent_first_fetch_validates_the_winner(self):
+        self.windows_unlink()
         dest = self.pin.cache_dir(self.head)
         real = self.pin._git
 
@@ -412,6 +425,7 @@ class Pin(Consumer):
         self.assertEqual(list(dest.parent.iterdir()), [dest])
 
     def test_invalid_winner_and_fetch_failure_leave_no_temporary_tree(self):
+        self.windows_unlink()
         dest = self.pin.cache_dir(self.head)
         real = self.pin._git
 
