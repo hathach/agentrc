@@ -49,9 +49,9 @@ BOARD = {'name': 'openocd_esp', 'uid': SERIAL, 'args': '-f board/esp32p4-builtin
 SECURITY = {'flashEncryption': 'off', 'secureBoot': 'off', 'source': 'esptool transcript /w/security.txt'}
 
 
-def read_op(security=SECURITY, cleanup='done'):
-    """read_security's Operation as flash_openocd_esp takes it: its evidence and its child's cleanup."""
-    return types.SimpleNamespace(security=security, cleanup=cleanup)
+def read_op(security=SECURITY, cleanup='done', serial=SERIAL):
+    """read_security's Operation as flash_openocd_esp takes it: its evidence, its child's cleanup and its USJ."""
+    return types.SimpleNamespace(security=security, cleanup=cleanup, serial=serial)
 
 
 def fresh_locks(test):
@@ -1126,6 +1126,19 @@ class Programming(SessionCase):
                 self.flash_op(security=read_op(cleanup=cleanup))
         self.assertEqual(self.events(), [])
 
+    def test_a_security_read_of_another_usj_is_refused_before_any_access(self):
+        """CodeRabbit on #574: a read of any USJ admitted the flash of this one."""
+        never = {'side_effect': AssertionError('touched')}
+        with mock.patch.object(oe, '_usj_walk', **never), mock.patch.object(oe.subprocess, 'Popen', **never):
+            for serial in ('30:ED:A0:E0:C9:03', None):
+                with self.subTest(serial=serial), self.assertRaisesRegex(ValueError, 'USJ'):
+                    self.flash_op(security=read_op(serial=serial))
+            with self.assertRaisesRegex(ValueError, 'USJ'):
+                self.flash_op(security=types.SimpleNamespace(security=SECURITY, cleanup='done'))
+        self.assertEqual(self.events(), [])
+        self.assertEqual(oe.pending(SERIAL).read(), [])
+        self.assertEqual(self.flash_op(security=read_op(serial=SERIAL)).returncode, 0)
+
     def test_a_corrupt_trailing_byte_the_verify_skips_fails_the_read_back(self):
         op = self.flash_op(env={'FAKE_CORRUPT': 'tail'})
         seg = op.segments[1]
@@ -1546,6 +1559,36 @@ class PendingRecord(unittest.TestCase):
         why = oe.pending_refusal(SERIAL)
         self.assertNotIn('end --receipt', why)
         self.assertIn('separately reviewed recovery, then `hil_openocd_esp.py pending', why)
+
+    def test_a_blank_note_clears_nothing(self):
+        """CodeRabbit on #574: `--note ''` cleared the record as a reviewed recovery would."""
+        oe.latch(SERIAL, types.SimpleNamespace(cleanup='unknown', receipts=()), 'read_security on tty')
+        listed = oe.pending(SERIAL).read()
+        for note in ('', '   ', '\t\n'):
+            with self.subTest(note=note):
+                rc, out = self.cli('--note', note)
+                self.assertEqual((rc, out['outcome']), (1, 'failed'))
+                self.assertIn('blank', out['error'])
+                self.assertEqual(oe.pending_main(SERIAL, note)[0], 1)
+        self.assertEqual((oe.pending(SERIAL).read(), oe.pending(SERIAL).cleared()), (listed, []))
+
+    def test_the_pending_status_reports_one_read_of_the_record(self):
+        """CodeRabbit on #574: the outcome came from one read and the sessions from a second, so an
+        entry listed between them showed beside `clear`."""
+        real, reads = oe.hil_lock.PendingSessions.read, []
+        late = {'unreceipted': 'read_security on tty: cleanup unknown', 'serial': SERIAL}
+
+        def read(record):
+            got = real(record)
+            if not reads:
+                record.add([{'receipt': late}])
+            reads.append(got)
+            return got
+        with mock.patch.object(oe.hil_lock.PendingSessions, 'read', read):
+            rc, out = self.cli()
+        self.assertEqual((rc, out['outcome'], out['refusal'], out['sessions'], len(reads)), (0, 'clear', '', [], 1))
+        rc, out = self.cli()
+        self.assertEqual((rc, out['outcome'], [s['ended'] for s in out['sessions']]), (1, 'refused', [False]))
 
     def test_the_pending_command_reports_then_clears_only_with_a_note(self):
         self.assertEqual(self.cli(), (0, {'mode': 'pending', 'serial': SERIAL, 'record': oe.pending(SERIAL).path,
@@ -2245,6 +2288,7 @@ class ReadSecurity(unittest.TestCase):
         self.assertEqual({k: op.security[k] for k in OFF}, OFF)
         self.assertIn(f'esptool 5.3.1 on /dev/ttyACM3, USJ {SERIAL}', op.security['source'])
         self.assertEqual(oe.admit_security(op.security), op.security)
+        self.assertEqual(op.serial, SERIAL)
 
     def test_a_failed_child_or_unusable_evidence_raises_with_the_operation(self):
         on = {'flashEncryption': 'on', 'secureBoot': 'off'}
@@ -2545,6 +2589,31 @@ class ReadSecurity(unittest.TestCase):
         oe.pending(SERIAL).add([{'receipt': receipt}])
         self.assertEqual(oe.pending_entries(SERIAL), {'receipts': [], 'retained': [], 'unrecheckable': [receipt]})
         self.assertEqual(oe.pending(SERIAL).read(), [{'receipt': receipt}], 'read, never cleared')
+
+    def test_an_empty_state_dir_entry_without_a_held_marker_is_not_unrecheckable(self):
+        """Codex on #574: an empty state dir read as a live owner's whatever its marker; only a held
+        one keeps the entry as cleanup evidence."""
+        state = oe.hil_process.state_dir(str(self.work), oe.SECURITY_STATE)
+        self.addCleanup(os.rmdir, state)
+        fd, released = oe._ahead_marker(state)
+        os.close(fd)
+        self.addCleanup(os.unlink, released)
+        what = 'read_security on /dev/ttyACM3'
+        for receipt in ({'stateDir': state, 'what': what}, {'stateDir': state, 'what': what, 'aheadLock': released}):
+            with self.subTest(receipt=receipt):
+                fresh_locks(self)
+                oe.pending(SERIAL).add([{'receipt': receipt}])
+                # its child ended between receipt_ended's recheck and pending_entries' own
+                with mock.patch.object(oe, 'receipt_ended', return_value=False):
+                    self.assertEqual(oe.pending_entries(SERIAL), {'receipts': [], 'retained': [], 'unrecheckable': []})
+        fd, held = oe._ahead_marker(state)
+        self.addCleanup(os.unlink, held)
+        self.addCleanup(os.close, fd)
+        receipt = {'stateDir': state, 'what': what, 'aheadLock': held}
+        fresh_locks(self)
+        oe.pending(SERIAL).add([{'receipt': receipt}])
+        with mock.patch.object(oe, 'receipt_ended', return_value=False):
+            self.assertEqual(oe.pending_entries(SERIAL), {'receipts': [], 'retained': [], 'unrecheckable': [receipt]})
 
     def test_a_state_dir_the_os_cannot_take_refuses_and_lists_unrecheckable_without_raising(self):
         """CodeRabbit on #214: a listed stateDir with a NUL or a lone surrogate (JSON decodes one) made

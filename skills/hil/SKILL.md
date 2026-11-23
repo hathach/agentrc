@@ -360,7 +360,8 @@ recovery stay the contract's. Linux only.
   chip=, workdir=, timeout=, retains_lock=True)` returns: its child proven
   ended (cleanup `done`) and its evidence, `{"flashEncryption": "off",
   "secureBoot": "off", "source": <where it was read>}`, as `.security`. A bare
-  evidence dict, a read whose child is not proven ended, or either feature not
+  evidence dict, a read of another USJ (the Operation's `serial` is not the
+  flasher's `uid`), a read whose child is not proven ended, or either feature not
   `off` is refused before anything starts (`admit_read`); the provider never
   infers or defaults the chip's security state. `read_security` reads it and
   hard-resets the chip, its child run tracked by default (state in `workdir`,
@@ -425,7 +426,8 @@ recovery stay the contract's. Linux only.
   a USJ's pending record lists, each entry's kind, name and whether it ended,
   and the refusal, exiting 1 while one is pending; with `--note`, the reviewed
   recovery that proved them ended, it clears the record whatever it holds and
-  logs the note in `<record>.cleared.jsonl`.
+  logs the note in `<record>.cleared.jsonl` (a blank note clears nothing and
+  exits 1).
 - `scripts/hil_openocd_esp.py end --receipt <receipt> [--timeout S]` ends such
   a pending session with `reset run` and a confirmed shutdown, within one
   deadline and never signalling it. It refuses on any doubt: the session (or

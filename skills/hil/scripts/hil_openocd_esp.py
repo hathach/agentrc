@@ -270,23 +270,35 @@ def pending_refusal(serial: str) -> str:
     entry has since ended is cleared. Never raises for the record: a failure to read or clear it
     is a refusal (a malformed serial stays ValueError)."""
     record = pending(serial)
-    if why := _list_unlisted(serial, record):
-        return why
+    return _list_unlisted(serial, record) or _judge(serial, record)[0]
+
+
+def _judged(record):
+    """One read of `record` as (entry, receipt_ended) pairs; None when it is unreadable."""
+    sessions = record.read()
+    return None if sessions is None else [(e, receipt_ended(e['receipt'])) for e in sessions]
+
+
+def _judge(serial, record) -> tuple:
+    """(refusal, judged) of pending_refusal from one read of `record` (_judged; None when it was unreadable
+    or could not be read), clearing it when every entry that read lists has ended."""
+    judged = None
     try:
-        sessions = record.read()
-        if sessions is None:
-            return f'{record} is unreadable: a session may still run on USJ {serial}; {NEEDS_RECOVERY}'
-        left = [e['receipt'] for e in sessions if not receipt_ended(e['receipt'])]
+        judged = _judged(record)
+        if judged is None:
+            return f'{record} is unreadable: a session may still run on USJ {serial}; {NEEDS_RECOVERY}', None
+        left = [e['receipt'] for e, ended in judged if not ended]
         if left:
             return (f'USJ {serial} has {len(left)} operation(s) not proven ended ({record}): '
-                    + '; '.join(describe(r) for r in left[:3]) + f'; {_remedy(left, serial)}')
-        if sessions:
+                    + '; '.join(describe(r) for r in left[:3]) + f'; {_remedy(left, serial)}'), judged
+        if judged:
             record.clear(lambda e: receipt_ended(e['receipt']))
     except hil_lock.PendingRefused as e:      # an entry listed since the read: ask again
-        return f'USJ {serial}: {e}; ask again, or end it'
+        return f'USJ {serial}: {e}; ask again, or end it', judged
     except OSError as e:
-        return f'{record} cannot be read or cleared ({e}): a session may still run on USJ {serial}; {NEEDS_RECOVERY}'
-    return ''
+        return (f'{record} cannot be read or cleared ({e}): a session may still run on USJ {serial}; '
+                f'{NEEDS_RECOVERY}'), judged
+    return '', judged
 
 
 def _remedy(receipts, serial) -> str:
@@ -330,7 +342,8 @@ def pending_entries(serial: str) -> dict:
                 out['unrecheckable'].append(r)
                 continue
             found = hil_process.recheck_dir(r['stateDir'], keep=hil_process._KeepAll())[1]
-            if not found:      # a live owner whose child has no file there yet
+            if not found and 'aheadLock' in r and _ahead_held(r['aheadLock'], r['stateDir']):
+                # a live owner whose child has no file there yet
                 out['unrecheckable'].append(r)
             for o in found:
                 if o not in out['receipts'] and o not in out['unrecheckable']:
@@ -374,24 +387,29 @@ def latch(serial, op, what):
 def pending_main(serial, note=None):
     """(rc, result) of the `pending` command: what the record of the USJ with `serial` lists and
     why access is refused, 0 when nothing is pending and 1 otherwise; with `note`, a separately
-    reviewed recovery's, the record is cleared whatever it holds and logged with the note."""
+    reviewed recovery's, the record is cleared whatever it holds and logged with the note (a blank
+    note is refused, rc 1). The status is judged from one read of the record."""
     record = pending(serial)
     result = {'mode': 'pending', 'serial': serial, 'record': str(record)}
     if note is not None:
+        if not note.strip():
+            return 1, dict(result, outcome='failed', error='--note is blank: name the reviewed recovery that '
+                                                           'proved the listed operations ended')
         try:
             cleared = record.clear(lambda e: receipt_ended(e['receipt']), note=note)
         except (OSError, hil_lock.PendingRefused) as e:
             return 1, dict(result, outcome='failed', error=str(e))
         return 0, dict(result, outcome='cleared', sessions=cleared['sessions'], notEnded=cleared['notEnded'])
-    why = pending_refusal(serial)
-    try:
-        sessions = record.read()
-    except OSError:
-        sessions = None
-    listed = [{'kind': receipt_kind(e['receipt']), 'describe': describe(e['receipt']),
-               'ended': receipt_ended(e['receipt'])} for e in sessions or []]
-    return (1 if why else 0), dict(result, outcome='refused' if why else 'clear', refusal=why,
-                                   sessions=listed if sessions is not None else None)
+    if why := _list_unlisted(serial, record):
+        try:
+            judged = _judged(record)
+        except OSError:
+            judged = None
+    else:
+        why, judged = _judge(serial, record)
+    listed = None if judged is None else [{'kind': receipt_kind(e['receipt']), 'describe': describe(e['receipt']),
+                                           'ended': ended} for e, ended in judged]
+    return (1 if why else 0), dict(result, outcome='refused' if why else 'clear', refusal=why, sessions=listed)
 
 
 def admit(flasher: dict) -> tuple:
@@ -1110,7 +1128,7 @@ def read_security(serial: str, *, chip: str, workdir, timeout, retains_lock=Fals
     default run_tracked with SECURITY_SETTLE and its state in `workdir`'s SECURITY_STATE dir,
     which outlives the call while a receipt names it. Refused, before any board access, as
     `refusal(retains_lock=)` refuses and for a chip not in SECURITY_CHIPS. Returns hil_flash's
-    Operation of the child with `security`, security_evidence's dict, only once the child is
+    Operation of the child with `security`, security_evidence's dict, and `serial`, only once the child is
     proven ended (cleanup `done`): an openocd session started beside a survivor would share the
     USJ with it. Otherwise, as for a failed child or evidence that is unknown or contradictory,
     it raises carrying `.operation`, its cleanup and receipts, and lists what the child left in
@@ -1184,6 +1202,7 @@ def read_security(serial: str, *, chip: str, workdir, timeout, retains_lock=Fals
         op.results = tuple(results[1:])
         op.security = security_evidence(results[0], chip=chip,
                                         source=f'esptool {out.get("esptool")} on {tty}, USJ {serial}, ROM loader')
+        op.serial = serial
     except Exception as e:      # every parse failure carries the child's operation, its cleanup and receipt
         e.operation = op
         raise
@@ -1325,7 +1344,8 @@ def flash_openocd_esp(flasher: dict, segments, *, security, workdir, timeout, op
     managed session (module docstring) within `timeout` seconds, files in a new directory under
     `workdir`. The chip must not sit in its ROM loader (the `hil` skill's Flashers).
 
-    `security` is read_security's Operation: its child proven ended (cleanup `done`) and its
+    `security` is read_security's Operation of the flasher's USJ (its `serial` the `uid`; another
+    USJ's read is refused before any access): its child proven ended (cleanup `done`) and its
     `security` evidence that flash encryption and secure boot are off (admit_security), recorded
     as `session['security']`. A bare evidence dict is refused, as it proves no child ended: an
     openocd session started beside a surviving esptool would share the USJ with it (#213).
@@ -1342,6 +1362,9 @@ def flash_openocd_esp(flasher: dict, segments, *, security, workdir, timeout, op
     (_program) and `readBack` (file, length, match, firstMismatch). Refusals raise ValueError
     or RuntimeError before anything starts."""
     _admit_session(retains_lock)
+    if getattr(security, 'serial', None) != flasher.get('uid'):
+        raise ValueError(f'security read of USJ {getattr(security, "serial", None)!r}: want read_security\'s '
+                         f'Operation of the flashed USJ {flasher.get("uid")!r}')
     security = admit_read(security)
     admitted = admit_segments(segments)
     records = [rec for rec, _ in admitted]
