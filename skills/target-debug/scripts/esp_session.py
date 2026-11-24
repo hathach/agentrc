@@ -145,7 +145,7 @@ def tool(env, name):
     exe = which(os.environ.get(env) or name)
     if not exe:
         raise ToolError(f'{os.environ.get(env) or name} not found - install it or set {env}')
-    return exe
+    return os.path.abspath(exe)    # the receipt's argv[0]: `leave` may run from another directory
 
 
 def route_args(a):
@@ -168,7 +168,13 @@ def server_command(exe, a, ports, log, token=None):
     if a.rtos:
         cmd += ['-c', f'set ESP_RTOS {a.rtos}']
     # openocd runs `log_output <path>` as a Tcl line, where a Windows backslash would be an escape
-    return cmd + route_args(a) + ['-l', log.replace(os.sep, '/')]
+    return cmd + route_args(a) + ['-l', tcl_word(log.replace(os.sep, '/'))]
+
+
+def tcl_word(s):
+    """s as one literal Tcl word: Jim copies any backslashed character but a letter escape, and a backslashed
+    newline would be a space."""
+    return re.sub(r'[\s;$\[\]{}\\"]', lambda m: '\\n' if m[0] == '\n' else '\\' + m[0], s)
 
 
 class Tcl:

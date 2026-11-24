@@ -379,6 +379,28 @@ class Request(unittest.TestCase):
         self.assertEqual(out['outcome'], 'notLimited', 'a changed head is not asked about here')
         self.assertEqual(rig.posts, [])
 
+    def test_a_full_review_ask_that_hit_the_limit_is_asked_again_in_full(self):
+        # A no-files skip asked in full, then limited: an incremental retry would meet the same skip, and its full ask
+        # standing after the head event would then read as already asked.
+        full_ask = {'id': 50, 'body': trigger.FULL_REQUEST, 'created_at': '2026-10-13T09:30:00Z'}
+        for what, event_at in (('after the head event', '2026-10-13T09:00:00Z'), ('an unknown head event', None)):
+            with self.subTest(what):
+                code, out = self.run_with(rig := RequestRig(comments=[full_ask], event_at=event_at, body=trigger.FULL_REQUEST))
+                self.assertEqual((code, out['outcome'], out['commentId'], out['retryAt'], out['full']), (0, 'requested', 99, LIMITED['retryAt'], True))
+                self.assertEqual(len(rig.posts), 1)
+        again = dict(full_ask, id=51, created_at='2026-10-13T10:57:00Z')
+        code, out = self.run_with(rig := RequestRig(comments=[full_ask, again], body=trigger.FULL_REQUEST))
+        self.assertEqual((out['outcome'], out['commentId'], out['full']), ('already', 51, True), 'one full ask past the reset stands')
+        self.assertEqual(rig.posts, [])
+        older = dict(full_ask, created_at='2026-10-13T08:00:00Z')
+        code, out = self.run_with(rig := RequestRig(comments=[older]))
+        self.assertEqual((out['outcome'], out['commentId']), ('requested', 99), "an older head's full ask leaves the retry incremental")
+        self.assertNotIn('full', out)
+        incremental = {'id': 52, 'body': trigger.REQUEST, 'created_at': '2026-10-13T09:45:00Z'}
+        code, out = self.run_with(rig := RequestRig(comments=[full_ask, incremental]))
+        self.assertEqual(out['outcome'], 'requested', 'the newest ask on the head is the one the limit answered')
+        self.assertNotIn('full', out)
+
     def test_a_failed_or_unconfirmed_post_is_failed_with_its_limit(self):
         for what, rig in (('post failed', RequestRig(post_code=1)), ('read back differs', RequestRig(readback='something else'))):
             with self.subTest(what):

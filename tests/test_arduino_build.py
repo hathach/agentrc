@@ -503,6 +503,12 @@ class Provenance(Lib):
             '/t/hash#parent/g.h', '/t/dollar$parent/g.h', '/t/sp ace/g.h', '/t/bs\\ sp/g.h', '/t/tab\tx/g.h',
             '/t/end\\', '/t/lit\\x.h']))
 
+    def test_dep_paths_keep_windows_drive_letter_paths(self):
+        build = self.tmp / 'b'
+        build.mkdir()
+        (build / 'a.d').write_text('C:\\b\\a.cpp.o: C:\\x\\a.h \\\n C:/x/b.h d:\\x\\sp\\ ace.h /p/c.h rel/d.h\n')
+        self.assertEqual(sorted(ab.dep_paths(build)), sorted(['C:\\x\\a.h', 'C:/x/b.h', 'd:\\x\\sp ace.h', '/p/c.h']))
+
     def test_an_excluded_file_under_a_make_quoted_parent_is_found(self):
         for parent in ('hash#parent', 'dollar$parent', 'sp ace'):
             lib = self.tmp / parent / 'Lib'

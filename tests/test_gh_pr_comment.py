@@ -445,6 +445,12 @@ class Gh(unittest.TestCase):
         self.assertIn(['-F', 'number=7'], [argv[i:i + 2] for i in range(len(argv))])
         self.assertIsNone(r.call_args.kwargs['input'])
 
+    def test_its_output_is_read_as_utf8_whatever_the_locale(self):
+        ok = subprocess.CompletedProcess([], 0, '{"body": "caf\\u00e9 \\u2713"}', '')
+        with mock.patch.object(G.subprocess, 'run', return_value=ok) as r:
+            G.gh('repos/x/y/issues/comments/1')
+        self.assertEqual((r.call_args.kwargs['text'], r.call_args.kwargs['encoding']), (True, 'utf-8'))
+
 
 if __name__ == '__main__':
     unittest.main()

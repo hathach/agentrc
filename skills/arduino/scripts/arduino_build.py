@@ -805,12 +805,12 @@ def foreign_headers(deps, cores=()):
 
 
 def dep_paths(build_dir):
-    """The absolute paths a build's .d files name, each once, in no particular order."""
+    """The absolute paths, POSIX or drive-letter, a build's .d files name, each once, in no particular order."""
     seen = set()
     for dfile in Path(build_dir).rglob('*.d'):
         text = dfile.read_text(errors='replace').replace('\\\n', ' ')
         for token in make_words(text):
-            if not token.endswith(':') and token.startswith('/'):
+            if not token.endswith(':') and (token.startswith('/') or re.match(r'[A-Za-z]:[\\/]', token)):
                 seen.add(token)
     return list(seen)
 

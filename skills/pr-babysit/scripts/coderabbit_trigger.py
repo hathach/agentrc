@@ -29,7 +29,9 @@ run skipped as "No files to review" (#577), such as on a merge of the base whose
 net diff CodeRabbit reviewed on an earlier head. That skip is asked with
 `@coderabbitai full review`, every other request with `@coderabbitai review`:
 CodeRabbit's docs make `review` incremental, from the last reviewed commit, and
-`full review` review every file of the PR again. The outcome:
+`full review` review every file of the PR again. A limit after a `full review`
+ask, the newest ask since the head event (any, when that time is unknown), is
+retried with `full review` too. The outcome:
 
   requested   it is limited on HEAD and its reset plus a minute has passed, it
               skipped HEAD for a manual review and no box is ticked, its
@@ -202,15 +204,24 @@ def unasked(repo, pr, head, not_before=None):
     window = max(t for t in (reset_at, caller) if t)
     if max(t for t in (reset_at and reset_at + MARGIN, caller) if t) > stamp(seen['observedAt']):
         return {'outcome': 'notDue', 'detail': cr['reason'], **reset}, None
-    asked = [c for c in pages(f'repos/{{owner}}/{{repo}}/issues/{pr}/comments')
-             if (c.get('body') or '').strip() == REQUEST and stamp(c['created_at']) >= window]
+    comments = pages(f'repos/{{owner}}/{{repo}}/issues/{pr}/comments')
+    ask = limited_ask(comments, seen['headEventAt'])
+    asked = [c for c in comments if (c.get('body') or '').strip() == ask and stamp(c['created_at']) >= window]
     if asked:
-        return on_comment('already', asked[0], at=asked[0]['created_at'], **reset), None
+        return on_comment('already', asked[0], at=asked[0]['created_at'], **full(ask), **reset), None
     # The reads above take a while: a PR closed or pushed meanwhile is not asked about.
     why = unopened(pr, head)
     if why:
         return {'outcome': 'notLimited', 'detail': why}, None
-    return None, (REQUEST, reset)
+    return None, (ask, reset)
+
+
+def limited_ask(comments, event_at):
+    """The ask a limited head is retried with: FULL_REQUEST when the newest ask since EVENT_AT (any, when it is unknown)
+    was one, as on a no-files skip an incremental retry meets the same skip, else REQUEST."""
+    asks = [c for c in comments if (c.get('body') or '').strip() in (REQUEST, FULL_REQUEST)
+            and (event_at is None or stamp(c['created_at']) >= stamp(event_at))]
+    return FULL_REQUEST if asks and asks[-1]['body'].strip() == FULL_REQUEST else REQUEST
 
 
 def unasked_skip(pr, head, event_at, box=True, ask=REQUEST):

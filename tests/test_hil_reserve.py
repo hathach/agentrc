@@ -52,7 +52,7 @@ case "$ACTION" in
   survivor) setsid sleep 30 </dev/null >/dev/null 2>&1 & echo $! > "$ARGV_OUT.pid"; exit 0 ;;
   survivor-same-group) sleep 30 </dev/null >/dev/null 2>&1 & echo $! > "$ARGV_OUT.pid"; exit 0 ;;
   hang) sleep 30; exit 0 ;;
-  slow) sleep 1; exit 0 ;;
+  wait-done) for _ in $(seq 100); do [ -e "$ARGV_OUT.done" ] && break; sleep 0.1; done; exit 0 ;;
   signals) exec grep -E '^Sig(Blk|Ign):' /proc/$$/status > "$ARGV_OUT.sig" ;;
   trap) exec bash -c 'trap "echo TRAPPED; exit 7" TERM; trap "echo HUP TRAPPED" HUP; for _ in $(seq 50); do [ -e "$ARGV_OUT.done" ] && break; sleep 0.1; done' ;;
   refuse) exit 3 ;;
@@ -1069,6 +1069,7 @@ class RootCycleScript(Fixture):
 class ControllerFixture(Fixture):
     """A bound controller at ADDR owning bus 3 (480M) and bus 4 (5000M), a driverless one at IDLE."""
     ADDR, IDLE = '0000:05:00.0', '0000:06:00.0'
+    BOARDS = frozenset({'mimxrt1064_evk', 'raspberry_pi_pico2', 'stm32f303disco', 'stm32h743eval'})
 
     def setUp(self):
         super().setUp()
@@ -1104,10 +1105,11 @@ class ControllerFixture(Fixture):
         return self.fork_main('run', verb, addr, *self.rosters(), '--reason', 'test', '--budget', budget,
                               action=action, patch=patch)
 
-    def assert_blocked_on_every_lock(self, child, line):
+    def assert_blocked_on_every_lock(self, child, line, expected=BOARDS):
         self.assertEqual(child.wait(), 1, line)
+        self.assertEqual(set(self.records()), expected)
         self.assertEqual(self.held(), set())
-        for lock in self.records():
+        for lock in expected:
             self.assertTrue(self.flock_free(lock), lock)
             f = latest_failure(hr.hil_lock, lock)
             self.assertEqual((f['how'], f['tool'], f['token']), ('ended-failed', 'hil_reserve', token_of(line)))
@@ -1216,11 +1218,14 @@ class Controller(ControllerFixture):
         self.assertEqual(self.held(), set())
 
     def test_no_new_lock_name_is_admitted_until_the_run_ends(self):
-        p = self.run_ctl(action='slow')
+        done = Path(f'{self.argv_out}.done')
+        self.addCleanup(done.touch)                     # a failed assertion still ends the command
+        p = self.run_ctl(action='wait-done')
         self.wait_for(lambda: self.argv_out.exists(), 'the command to start')
         with self.assertRaisesRegex(hr.hil_lock.AdmissionClosed, 'late_board has no lock file yet'):
             hr.hil_lock.take_board_lock('late_board', 'a task starting mid-run')
         self.assertNotIn('late_board', hr.hil_lock.lock_names())
+        done.touch()
         out = p.output()
         self.assertEqual(p.returncode, 0, out)
         hr.hil_lock.take_board_lock('late_board', 'after the run').close()
@@ -1334,13 +1339,56 @@ class Controller(ControllerFixture):
         rc, out = main('check', self.IDLE, '--scope', 'controller', *self.rosters())
         self.assertEqual(rc, 0, out)
         self.assertIn(f'controller {self.IDLE}: 0x1912:0x0014 subsystem 0x1912:0x0014 class 0x0c0330, driver none', out)
-        p = self.run_ctl(action='bind', verb='pci-bind', addr=self.IDLE)
+        p = self.run_ctl(action='bind', verb='pci-bind', addr=self.IDLE,
+                         patch=lambda m: setattr(m, 'CONTROLLER_SETTLE', 0.3))
         out = p.output()
         self.assertEqual(p.returncode, 0, out)
         self.assertEqual(self.argv_out.read_text().split(), ['pci-bind', self.IDLE])
         self.assertIn(f'controller {self.IDLE} buses: - -> 3 (480M)', out)
         self.assertIn(f'released 4 lock(s); controller {self.IDLE} back, 5 node(s) on its buses', out)
         self.assertEqual(self.held(), set())
+
+    def test_pci_bind_waits_for_its_buses_to_settle_so_a_late_device_is_judged(self):
+        shutil.rmtree(self.pci / self.ADDR)
+
+        def patch(m):
+            real, looks = m.controller_walk, []
+            m.CONTROLLER_SETTLE = 0.3
+
+            def controller_walk(addr, identities, deadline, cached=True):
+                nodes = real(addr, identities, deadline, cached)
+                if not cached:                               # a restoration look
+                    looks.append(1)
+                    if len(looks) == 1:                      # enumerates once the first look showed the root hub
+                        self.dev('3-9', serial='late-keyboard')
+                return nodes
+            m.controller_walk = controller_walk
+        p = self.run_ctl(action='bind', verb='pci-bind', addr=self.IDLE, patch=patch)
+        line = p.blocker()
+        self.assertIn('3-9: serial late-keyboard matches no roster identity', line)
+        self.assertIn('not restored within 1 s', line)
+        self.assert_blocked_on_every_lock(p, line)
+
+    def test_pci_bind_passes_its_driver_and_only_pci_bind_takes_one(self):
+        shutil.rmtree(self.pci / self.ADDR)
+        os.environ['PCI_DEV'] = str(self.pci / self.IDLE)
+        p = self.fork_main('run', 'pci-bind', self.IDLE, *self.rosters(), '--reason', 'test', '--budget', '1',
+                           '--driver', 'xhci_hcd', action='bind', patch=lambda m: setattr(m, 'CONTROLLER_SETTLE', 0.3))
+        out = p.output()
+        self.assertEqual(p.returncode, 0, out)
+        self.assertEqual(self.argv_out.read_text().split(), ['pci-bind', self.IDLE, 'xhci_hcd'])
+        self.assertIn(f'sudo -n {hr.RECOVER_SCRIPT} pci-bind {self.IDLE} xhci_hcd\n', out)
+        self.argv_out.unlink()
+        for argv, why in ((('pci-rebind', self.ADDR, '--driver', 'xhci_hcd'), '--driver is for pci-bind only'),
+                          (('root-cycle', '3-1.1', '--driver', 'xhci_hcd'), '--driver is for pci-bind only'),
+                          (('pci-bind', self.IDLE, '--driver', 'xhci/../x'), 'bad driver name: xhci/../x')):
+            with self.subTest(argv=argv):
+                err = io.StringIO()
+                with redirect_stderr(err), self.assertRaises(SystemExit) as e:
+                    hr.main(['run', *argv, *self.rosters(), '--reason', 'r'])
+                self.assertEqual(e.exception.code, 2)
+                self.assertIn(why, err.getvalue())
+        self.assertFalse(self.argv_out.exists())
 
 
 class ControllerScript(ControllerFixture):

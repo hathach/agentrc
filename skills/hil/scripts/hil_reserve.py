@@ -6,7 +6,8 @@ one supported mutation, after a coverage check of what the operation reaches.
   hil_reserve.py check <busport> [--scope root|hub] --roster FILE ...
   hil_reserve.py check <pciaddr> --scope controller --roster FILE ...
   hil_reserve.py run root-cycle|hub-cycle <busport> --roster FILE ... --reason TEXT
-  hil_reserve.py run pci-rebind|pci-bind <pciaddr> --roster FILE ... --reason TEXT
+  hil_reserve.py run pci-rebind <pciaddr> --roster FILE ... --reason TEXT
+  hil_reserve.py run pci-bind <pciaddr> [--driver NAME] --roster FILE ... --reason TEXT
 
 A roster is a project's HIL roster JSON (`boards` and `boards-skip`; a parked board is still
 on the hub). An entry with `probe` locks as its registered board's name, any other as its
@@ -65,13 +66,16 @@ a BoardLocked a board task waits out), so the inventory is complete for those. A
 older hil_lock, a consumer pinned before it, can still create a name: the recheck under the hold
 refuses one it sees, and one created after the recheck goes unheld, so every consumer on the host
 must be pinned at or after this agentrc before a controller operation runs.
-`sudo -n <usb_recover> <verb> <pciaddr>` is never signalled: SIGINT/SIGTERM/SIGHUP during it are
+`sudo -n <usb_recover> <verb> <pciaddr> [driver]` (pci-bind's `--driver`, else the helper tries
+xhci-pci-renesas, then xhci_hcd) is never signalled: SIGINT/SIGTERM/SIGHUP during it are
 noted and ignored, since a rebind cut between its unbind and bind strands the controller, and
 one still running after CONTROLLER_COMMAND_BUDGET s (a write stuck in the kernel) is left
 running as a survivor while the run goes on to its outcome. Restored means the same PCI ids, a
 driver bound (pci-rebind: the one bound before), a bus registered, every pre-operation node back
 under its key with its sysfs serial matching, and everything now on its buses covered; a node
-new since is no gap when covered, since a dead controller's fixtures return with it. The output
+new since is no gap when covered, since a dead controller's fixtures return with it. When
+nothing but root hubs was on its buses before (pci-bind always), its buses must also look the
+same for CONTROLLER_SETTLE s, since the hub driver scans its ports after the bind returns. The output
 maps each bus's number before to its number now: re-derive every busport on them. The rest
 (exit 3, blockers, cleanup logs, exit codes) is as for the port operations. Prerequisite: a
 rig's root-owned /usr/local/sbin/usb_recover, which wins over the checkout's, must be refreshed
@@ -138,6 +142,11 @@ PCI_IDENTITY = ('vendor', 'device', 'subsystem_vendor', 'subsystem_device', 'cla
 USB_CONTROLLER_CLASS = '0x0c03'   # base class 0x0c serial bus, subclass 0x03 USB, as usb_recover.sh requires
 ROOT_HUB_RE = re.compile(r'^usb([0-9]+)$')
 CONTROLLER_COMMAND_BUDGET = 120.0   # s before a controller command is left running as a survivor
+# s a controller's buses must look the same when no device was on them before: hub_activate(HUB_INIT)
+# scans its ports from delayed work after the bind returns, and each connect debounces for up to 2 s
+# (hub.c HUB_DEBOUNCE_TIMEOUT) before its device appears
+CONTROLLER_SETTLE = 5.0
+DRIVER_RE = re.compile(r'^[A-Za-z0-9_-]+$')     # usb_recover.sh's DRIVER_RE
 DEFAULT_BUDGET = 60.0
 PROGRESS_EVERY = 60.0
 WAIT_POLL = 0.05           # s between looks at whether the command has ended
@@ -634,8 +643,8 @@ def controller_gaps(state, before, addr, rosters, deadline, seen):
     """What keeps the controller from counting as back: its PCI identity unchanged, a driver
     bound (pci-rebind: the same one), a bus registered, every pre-operation node back under
     its key, and everything now on its buses covered. A node new since is no gap when
-    covered: a dead controller's fixtures come back with it. `seen['after']` keeps the last
-    complete walk."""
+    covered: a dead controller's fixtures come back with it. With no device before, the buses
+    must also be unchanged for CONTROLLER_SETTLE s. `seen['after']` keeps the last complete walk."""
     try:
         now = controller_state(addr, deadline)
     except OverBudget:
@@ -663,6 +672,13 @@ def controller_gaps(state, before, addr, rosters, deadline, seen):
     by_key = {n['key']: n for n in after.values()}
     problems += [p for name, n in sorted(before.items())
                  if (p := _not_back(f'{name} ({n["key"]})', n, by_key.get(n['key'])))]
+    if all(ROOT_HUB_RE.match(name) for name in before):
+        # nothing to wait for by name: the first root-hub-only look would pass before any device enumerated
+        snap, now_t = snapshot(after), time.monotonic()
+        if seen.get('settle', (None,))[0] != snap:
+            seen['settle'] = (snap, now_t)
+        if (steady := now_t - seen['settle'][1]) < CONTROLLER_SETTLE:
+            problems.append(f'{addr}: buses unchanged for {steady:.1f} of {CONTROLLER_SETTLE:g} s')
     return problems
 
 
@@ -790,7 +806,7 @@ def cmd_run_controller(args):
         if created := sorted(set(host_locks(rosters)) - set(locks)):     # by a helper older than ADMISSION
             raise Refused('lock(s) created during the hold, so not held: ' + ' '.join(created))
     _hold(res, recheck)
-    argv = ['sudo', '-n', RECOVER_SCRIPT, args.verb, addr]
+    argv = ['sudo', '-n', RECOVER_SCRIPT, args.verb, addr, *([args.driver] if args.driver else [])]
     extra = sorted(set(locks) - set(rosters['locks']))
     print('hil_reserve: holding ' + ' '.join(res.locks)
           + (f'\nhil_reserve: of them in no roster given: {" ".join(extra)}' if extra else '')
@@ -837,6 +853,9 @@ def main(argv=None):
     p_run.add_argument('verb', choices=sorted(VERB_SCOPE))
     p_run.add_argument('target', metavar='busport|pciaddr')
     p_run.add_argument('--reason', required=True)
+    p_run.add_argument('--driver', metavar='NAME',
+                       help='pci-bind only: the driver to bind (default: the helper tries xhci-pci-renesas, '
+                            'then xhci_hcd)')
     add_roster_args(p_run)
     args = ap.parse_args(argv)
     scope = args.scope if args.cmd == 'check' else VERB_SCOPE[args.verb]
@@ -845,6 +864,11 @@ def main(argv=None):
             ap.error(f'bad pci address: {args.target}')
         if scope != 'controller' and not uo.BUSPORT_RE.match(args.target):
             ap.error(f'bad busport: {args.target}')
+        if getattr(args, 'driver', None) is not None:
+            if args.verb != 'pci-bind':
+                ap.error('--driver is for pci-bind only')
+            if not DRIVER_RE.match(args.driver):
+                ap.error(f'bad driver name: {args.driver}')
         if args.cmd == 'check':
             rosters = load_rosters(args.roster)
             if scope == 'controller':

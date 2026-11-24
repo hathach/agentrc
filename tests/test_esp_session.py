@@ -801,6 +801,28 @@ class WindowsPaths(unittest.TestCase):
             cmd = es.server_command('openocd', a, None, 'C:\\Users\\t\\out\\openocd.log')
         self.assertEqual(cmd[-2:], ['-l', 'C:/Users/t/out/openocd.log'])
 
+    def test_the_log_is_one_literal_word_of_openocds_tcl_line(self):
+        a = argparse.Namespace(board_cfg='board/esp32p4-builtin.cfg', adapter_serial='30:ED', adapter_speed=None,
+                               rtos=None)
+        for log, word in (('/tmp/my out/openocd.log', '/tmp/my\\ out/openocd.log'),
+                          ('/tmp/$x[y]{z}"q;\\/openocd.log', '/tmp/\\$x\\[y\\]\\{z\\}\\"q\\;\\\\/openocd.log'),
+                          ('/tmp/a\tb\nc/openocd.log', '/tmp/a\\\tb\\nc/openocd.log')):
+            with self.subTest(log=log), mock.patch.object(es.os, 'sep', '/'):
+                self.assertEqual(es.server_command('openocd', a, None, log)[-2:], ['-l', word])
+
+    def test_a_relative_openocd_is_recorded_absolute(self):
+        d = tmpdir(self)
+        (d / 'tools').mkdir()
+        stub = make_stub(d / 'tools', 'openocd', 'pass')
+        old = os.getcwd()
+        os.chdir(d)
+        self.addCleanup(os.chdir, old)
+        with mock.patch.dict(os.environ, {'ESP_SESSION_OPENOCD': os.path.join('.', 'tools', stub.name)}):
+            exe = es.tool('ESP_SESSION_OPENOCD', 'openocd')
+        self.assertTrue(os.path.isabs(exe), exe)
+        os.chdir(d / 'tools')
+        self.assertTrue(os.path.samefile(exe, stub))
+
     @unittest.skipUnless(os.name == 'nt', 'the Windows lookup')
     def test_a_bare_tool_name_is_never_taken_from_the_working_directory(self):
         d = tmpdir(self)

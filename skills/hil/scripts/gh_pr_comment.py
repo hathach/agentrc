@@ -70,7 +70,8 @@ def gh(path, paginate_key=None, timeout=GH_TIMEOUT, *, method=None, fields=None,
     if paginate_key:
         argv += ['--paginate', '--jq', f'.{paginate_key}[]']
     try:
-        p = subprocess.run([*argv, path], capture_output=True, text=True, timeout=timeout,
+        # gh writes UTF-8 whatever the locale: a Windows code page would garble or refuse a comment's text
+        p = subprocess.run([*argv, path], capture_output=True, text=True, encoding='utf-8', timeout=timeout,
                            input=None if payload is None else json.dumps(payload))
     except subprocess.TimeoutExpired:
         raise ApiError(f'gh api {path}: no reply in {timeout} s') from None
