@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
-import { chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { dirname } from 'node:path'
+import { spawnSync } from 'node:child_process'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { dirname, join } from 'node:path'
 import { test } from 'node:test'
 import { ABSENT, AsyncFunction, SENTINEL, claimOf, emitDirs, emitOf, loadModule, moduleOf } from './emit_stub.mjs'
 
@@ -200,7 +202,7 @@ test('a failed, moved-head or unidentified check stops before any review work', 
 test('a clean full review approves only with green CI, full coverage and hardware covered', async () => {
   const { result, audits, calls } = await run(BASE)
   assert.equal(result.verdict.event, 'APPROVE')
-  assert.deepEqual(audits[0], { dirs: ['src/core'], dimensions: audits[0].dimensions, diff: { base: MB, head: H }, root: '/w' })
+  assert.deepEqual(audits[0], { dirs: ['src/core'], dimensions: audits[0].dimensions, diff: { base: MB, head: H }, root: '/w', shell: 'bash' })
   assert.equal(audits[0].dimensions.length, 4)
   assert.ok(calls.filter(c => ['emit:dir', 'check', 'threads', 'ledger'].includes(c.label)).every(c => c.options.model === 'haiku'))
   assert.match(calls.find(c => c.label === 'check').prompt, /prepare\.py --check --pr 7 --repo o\/r --expected-head b{40}/)
@@ -1041,3 +1043,111 @@ test('a recheck raises no new nit; a plain review and what already stands keep t
   assert.deepEqual(plain.result.findings.map(f => f.severity), ['nit', 'nit', 'low'])
   assert.deepEqual(plain.result.suppressed, [])
 })
+
+// A launch with shell: 'powershell' (#555), the run every shell test below takes: a standing finding rechecked, a
+// claim on a path with a quote judged, and a facts directory with a blank.
+const INC = { ...BASE, mode: 'incremental', scopeBase: OLD, factsDir: '/tmp/led ger+/7' }
+const THREADS = `${INC.factsDir}/threads-${H}.json`
+const SHELL_STUBS = {
+  check: pinned(INC), threads: { file: THREADS, count: 1 }, recheck: { state: 'open', reason: 'still' }, judge: REFUTED,
+  ledger: { reviews: 1, last: { head: OLD }, open: [{ id: 'pr7-f1', status: 'open', file: 'src/core/a.c', line: 10, severity: 'high', commentId: 901 }] },
+  claims: { claims: [{ commentId: 55, threadId: 'T', author: 'maint', bot: false, path: "src/it's a.c", line: 3, url: 'https://x/c55', claim: 'overrun' }] },
+}
+const PS_PRELUDE = "$PSNativeCommandArgumentPassing = 'Legacy'; $agentrc = if ($env:AGENTRC_DIR) { $env:AGENTRC_DIR } else { \"$HOME/.claude\" }; "
+const PS_AGENTRC = '"$agentrc/'
+// What PowerShell cannot run: an environment prefix, an && chain, a ${NAME:-default} expansion, a < redirection, and
+// python3, which a python.org install does not have.
+const BASH_ONLY = /(^|[^:])AGENTRC_EMIT='| && |\$\{[A-Za-z_]+:-| < '|\bpython3\b/
+const commandOf = (prompt) => String(prompt).match(/[Rr]un exactly `([^`]*)`/)[1]
+const readCommandOf = (prompt) => String(prompt).match(/Read it with: (.*)\n/)[1]
+
+test('a powershell launch runs as a bash one, every command it writes Windows PowerShell with no bash syntax (#555)', async () => {
+  const bash = await run(INC, SHELL_STUBS)
+  const ps = await run({ ...INC, shell: 'powershell' }, SHELL_STUBS)
+  assert.deepEqual(ps.calls.map(c => c.label), bash.calls.map(c => c.label), 'the same agents, in the same order')
+  assert.deepEqual(ps.result.verdict, bash.result.verdict)
+  assert.ok(bash.calls.some(c => BASH_ONLY.test(c.prompt)), 'a bash launch writes bash')
+  for (const c of ps.calls) assert.doesNotMatch(c.prompt, BASH_ONLY, c.label)
+  const relays = ps.calls.filter(c => c.options.agentType === 'relay')
+  assert.deepEqual(relays.map(c => c.label), ['emit:dir', 'check', 'threads', 'ledger'])
+  assert.equal(commandOf(relays[0].prompt), `${PS_PRELUDE}& python ${PS_AGENTRC}skills/pr-babysit/scripts/facts.py" emit-dir`)
+  for (const c of relays.slice(1)) {
+    const script = { check: 'prepare', threads: 'threads', ledger: 'ledger' }[c.label]
+    assert.ok(commandOf(c.prompt).startsWith(`${PS_PRELUDE}$env:AGENTRC_EMIT='${emitOf(c.prompt)}'; & python ${PS_AGENTRC}skills/pr-review/scripts/${script}.py" `), c.prompt)
+    assert.ok(commandOf(c.prompt).endsWith('; exit $LASTEXITCODE'), c.prompt)
+  }
+  assert.equal(readCommandOf(ps.calls.find(c => c.label === 'recheck:pr7-f1').prompt),
+    `${PS_PRELUDE}& python ${PS_AGENTRC}skills/pr-review/scripts/ledger.py" show --pr 7 --repo o/r --finding pr7-f1`)
+  assert.ok(ps.calls.find(c => c.label === 'claims').prompt.includes(`${PS_AGENTRC}agents/pr-review-validator.md" do (expand that path in the shell ` +
+    `before reading it, the command opening with \`${PS_PRELUDE.trim()}\`, which sets $agentrc;`), 'its $agentrc is the prelude\'s')
+  // a single quote in a path doubled, as PowerShell reads it; bash's '\''
+  assert.ok(ps.calls.find(c => c.label === 'judge:0').prompt.includes(`-- 'src/it''s a.c'\``))
+  assert.ok(bash.calls.find(c => c.label === 'judge:0').prompt.includes(`-- 'src/it'\\''s a.c'\``))
+  assert.deepEqual([ps.audits[0].shell, bash.audits[0].shell], ['powershell', 'bash'], 'code-audit writes its diff command for the same shell')
+  await assert.rejects(run({ ...BASE, shell: 'zsh' }), /shell must be one of bash, powershell/)
+})
+
+test('a relay with no tool for the launch\'s shell blocks the launch naming the other shell (#555)', async () => {
+  for (const [shell, error, other] of [['powershell', 'this session offers no tool for that shell', 'bash'], ['bash', 'no Bash tool here', 'powershell']]) {
+    const got = await run({ ...BASE, shell }, {}, { dirAnswer: () => ({ dir: '', error }) })
+    assert.deepEqual([got.result.reason, got.result.detail], ['check-failed',
+      `the relay has no ${shell === 'bash' ? 'Bash' : 'PowerShell'} tool (${error}): relaunch with shell: '${other}'`], shell)
+  }
+})
+
+const ON_WINDOWS = process.platform === 'win32'
+const SYSTEM32 = join(process.env.SystemRoot || 'C:\\Windows', 'System32')
+// bash on Windows only from PATH outside System32, whose bash.exe is WSL's launcher.
+const HAS_BASH = !ON_WINDOWS || (process.env.PATH || '').split(';').map(d => d.replace(/"/g, ''))
+  .some(d => d && d.toLowerCase() !== SYSTEM32.toLowerCase() && existsSync(join(d, 'bash.exe')))
+const POWERSHELL = ON_WINDOWS ? join(SYSTEM32, 'WindowsPowerShell', 'v1.0', 'powershell.exe') : 'pwsh'
+const HAS_POWERSHELL = spawnSync(POWERSHELL, ['-NoProfile', '-NonInteractive', '-Command', 'exit 0']).status === 0
+const hostPython = () => {
+  for (const name of ON_WINDOWS ? ['python', 'python3'] : ['python3']) {
+    const r = spawnSync(name, ['-c', 'import sys; print(sys.executable)'], { encoding: 'utf8' })
+    if (r.status === 0 && r.stdout.trim()) return r.stdout.trim()
+  }
+  throw new Error('no python3 (on Windows python) runs here')
+}
+// A command as its shell runs it, its AGENTRC_EMIT moved to `emit` and its interpreter the host's (the command's own
+// is python3 or python, by name): -EncodedCommand hands PowerShell the command as the relay types it.
+const SHELL_RUNS = [
+  { shell: 'bash', available: HAS_BASH, run: (cmd, emit, env) => spawnSync('bash', ['-c',
+    cmd.replace(/AGENTRC_EMIT='[^']+' /, `AGENTRC_EMIT='${emit}' `).replace(/(^| )python3 /, `$1'${hostPython()}' `)], { encoding: 'utf8', env }) },
+  { shell: 'powershell', available: HAS_POWERSHELL, run: (cmd, emit, env) => spawnSync(POWERSHELL, ['-NoProfile', '-NonInteractive', '-EncodedCommand',
+    Buffer.from(cmd.replace(/AGENTRC_EMIT='[^']+';/, `AGENTRC_EMIT='${emit}';`).replace('& python ', `& '${hostPython()}' `), 'utf16le').toString('base64')], { encoding: 'utf8', env }) },
+]
+// Each script a relay or a verifier runs, as a stub writing the argv it got: to AGENTRC_EMIT where set, else stdout.
+const STUB = 'import json, os, sys\nline = json.dumps({"script": os.path.basename(sys.argv[0]), "argv": sys.argv[1:]})\n' +
+  'emit = os.environ.get("AGENTRC_EMIT")\nif emit:\n    open(emit, "w", encoding="utf-8").write(line)\nelse:\n    print(line)\n' +
+  'sys.exit(int(os.environ.get("STUB_EXIT", "0")))\n'
+
+for (const sh of SHELL_RUNS) {
+  const title = `every command a ${sh.shell} launch writes runs under ${sh.shell}, its script getting exactly the argv meant and its status the command's (#555)`
+  if (!sh.available) { test(title, { skip: `no ${sh.shell} here` }, () => {}); continue }
+  test(title, async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pr-review-shell-'))
+    try {
+      for (const rel of ['skills/pr-review/scripts/prepare.py', 'skills/pr-review/scripts/threads.py', 'skills/pr-review/scripts/ledger.py', 'skills/pr-babysit/scripts/facts.py']) {
+        mkdirSync(dirname(join(root, rel)), { recursive: true })
+        writeFileSync(join(root, rel), STUB)
+      }
+      const { calls } = await run({ ...INC, ...(sh.shell === 'bash' ? {} : { shell: sh.shell }) }, SHELL_STUBS)
+      const emit = join(root, 'line.json')
+      const ran = (cmd, exit = 0) => {
+        rmSync(emit, { force: true })
+        const got = sh.run(cmd, emit, { ...process.env, AGENTRC_DIR: root, STUB_EXIT: String(exit) })
+        assert.equal(got.status, exit, `${cmd}\n${got.stderr}`)
+        return JSON.parse(existsSync(emit) ? readFileSync(emit, 'utf8') : got.stdout.trim().split('\n').pop())
+      }
+      const relay = (label) => commandOf(calls.find(c => c.label === label).prompt)
+      const common = ['--pr', '7', '--repo', 'o/r']
+      assert.deepEqual(ran(relay('emit:dir')), { script: 'facts.py', argv: ['emit-dir'] })
+      assert.deepEqual(ran(relay('check')), { script: 'prepare.py', argv: ['--check', ...common, '--expected-head', H] })
+      assert.deepEqual(ran(relay('threads')), { script: 'threads.py', argv: [...common, '--out', THREADS] })
+      assert.deepEqual(ran(relay('ledger')), { script: 'ledger.py', argv: ['show', ...common, '--threads', THREADS, '--head', H, '--view'] })
+      assert.deepEqual(ran(readCommandOf(calls.find(c => c.label === 'recheck:pr7-f1').prompt)), { script: 'ledger.py', argv: ['show', ...common, '--finding', 'pr7-f1'] })
+      assert.deepEqual(ran(relay('check'), 3).script, 'prepare.py', "a failing script's status is the command's")
+    } finally { rmSync(root, { recursive: true, force: true }) }
+  })
+}

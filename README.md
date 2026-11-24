@@ -142,6 +142,11 @@ Claude Code sets `NoDefaultCurrentDirectoryInExePath`; set it too when running
 the scripts from another shell, or Windows runs a `git.exe` or `gh.exe` from the
 current directory, a PR checkout for many of them.
 
+Where a workflow's subagents get no Bash tool (no Git Bash), `pr-babysit` and `pr-review` take `shell: 'powershell'`,
+which writes every relay command as Windows PowerShell 5.1 code (`pr-babysit`'s `ARGUMENTS.md` has the details).
+`fix-issue` has no such mode: its co-plan goes through the `coworker` agent, whose `cowork.py` call and guard hook are
+Bash-only, so it needs Git Bash.
+
 `pr-babysit`'s build check puts a temp directory into the build command
 unquoted, so it refuses a temp dir with a blank or shell syntax in it, as a
 profile path such as `C:\Users\First Last` gives; point `TMP` and `TEMP` at a

@@ -8,14 +8,15 @@ export const meta = {
   ],
 }
 
-// args: { dirs: string[], dimensions: string[], diff?: { base, head }, root?: string, batch?: boolean }, dirs and
-// dimensions nonempty; no defaults, since `dimensions: []` would review nothing
+// args: { dirs: string[], dimensions: string[], diff?: { base, head }, root?: string, batch?: boolean,
+// shell?: 'bash' | 'powershell' }, dirs and dimensions nonempty; no defaults, since `dimensions: []` would review nothing
 // and look like a clean pass. `diff` (two full SHAs, the checkout at head) narrows
 // every unit to what base..head introduces or breaks, as a PR review needs; the
 // caller checks that the checkout is clean and at head before launching. `root`, the
 // checkout's absolute top, turns a scanner's absolute path under it into a relative one. `batch`
 // verifies close findings on one file in one dispatch once every scan is in (see Batching); it stays off
-// by default until it passes bench/finding-verify's adoption gate.
+// by default until it passes bench/finding-verify's adoption gate. `shell` (default bash) is the shell the diff command
+// a unit is given is written for, as pr-babysit's ARGUMENTS.md `shell` describes.
 const list = (v, name) => {
   if (!Array.isArray(v) || v.length === 0 || !v.every(s => typeof s === 'string' && s.trim())) {
     throw new Error(`args.${name} must be a nonempty array of nonblank strings; args is { dirs: string[], dimensions: string[] }`)
@@ -36,6 +37,7 @@ const DRIVE = /^[A-Za-z]:/
 const slashed = p => p.replace(/\\/g, '/').replace(/^[a-z](?=:)/, c => c.toUpperCase())
 if (args.root != null && !(typeof args.root === 'string' && /^(?:\/.|[A-Za-z]:[\\/])/.test(args.root))) throw new Error('args.root must be an absolute path')
 if (args.batch != null && typeof args.batch !== 'boolean') throw new Error('args.batch must be a boolean')
+if (args.shell != null && !['bash', 'powershell'].includes(args.shell)) throw new Error('args.shell must be bash or powershell')
 const root = args.root == null ? null : slashed(args.root).replace(/\/+$/, '')
 // A drive path's case is not its identity: the checkout's real path and a scanner's spelling may differ in it.
 const under = p => root && (DRIVE.test(root) ? p.slice(0, root.length + 1).toLowerCase() === `${root}/`.toLowerCase() : p.startsWith(`${root}/`))
@@ -49,8 +51,11 @@ const placed = (f) => {
     : file.split('/').includes('..') ? 'path escapes the checkout' : null
   return pathError ? { ...f, pathError } : { ...f, file }
 }
+// A PowerShell string literal, for PowerShell's own use: a program it calls, a value it assigns. PowerShell takes the
+// curly single quotes ‘ ’ ‚ ‛ for ' too, so each is doubled as ' is.
+const psLit = (s) => `'${String(s).replace(/['‘’‚‛]/g, '$&$&')}'`
 // Pinned SHAs, not HEAD: a checkout that moves under the run must not change what was reviewed.
-const shellQuote = s => `'${s.replace(/'/g, `'\\''`)}'`
+const shellQuote = s => args.shell === 'powershell' ? psLit(s) : `'${s.replace(/'/g, `'\\''`)}'`
 // A literal "." pathspec matches nothing, so the root group takes the whole diff.
 const pathspec = dir => dir === '.' ? '' : ` -- ${shellQuote(`:(literal,top)${dir}`)}`
 const scopeOf = dir => args.diff
