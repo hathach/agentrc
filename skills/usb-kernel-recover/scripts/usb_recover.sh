@@ -487,12 +487,15 @@ case "$action" in
       echo "bound pci $target ($drv)"
     else
       # Auto-try the xHCI drivers (Renesas uPD720201 uses xhci-pci-renesas; others xhci_hcd).
+      tried=''
       for cand in xhci-pci-renesas xhci_hcd; do
         [ -e "$SYSFS/bus/pci/drivers/$cand/bind" ] || continue
+        tried=yes
         if echo "$target" > "$SYSFS/bus/pci/drivers/$cand/bind" 2>/dev/null; then
           echo "bound pci $target ($cand)"; exit 0
         fi
       done
+      [ -n "$tried" ] || refuse "no known xHCI driver is loaded to bind $target; pass the driver explicitly"
       die "could not bind $target with a known xHCI driver; pass the driver explicitly"
     fi
     ;;

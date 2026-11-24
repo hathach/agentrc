@@ -408,6 +408,9 @@ class Verbs(VerbTree):
         (self.sys / 'bus/pci/drivers/xhci_hcd/bind').rename(self.sys / 'bus/pci/drivers/xhci_hcd/bind.off')
         self.assertIn('could not bind 0000:06:00.0 with a known xHCI driver',     # bind writes were tried
                       self.verb('pci-bind', '0000:06:00.0', code=1))
+        renesas.rmdir()                                                        # no candidate: nothing written
+        self.assertIn('no known xHCI driver is loaded to bind 0000:06:00.0',
+                      self.verb('pci-bind', '0000:06:00.0', code=3))
 
     def test_resolve_walks_up_to_the_usb_device(self):
         for a in ('busnum', 'devnum', 'authorized'):

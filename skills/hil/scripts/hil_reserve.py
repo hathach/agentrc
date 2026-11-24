@@ -75,7 +75,8 @@ driver bound (pci-rebind: the one bound before), a bus registered, every pre-ope
 under its key with its sysfs serial matching, and everything now on its buses covered; a node
 new since is no gap when covered, since a dead controller's fixtures return with it. When
 nothing but root hubs was on its buses before (pci-bind always), its buses must also look the
-same for CONTROLLER_SETTLE s, since the hub driver scans its ports after the bind returns. The output
+same for CONTROLLER_SETTLE s, since the hub driver scans its ports after the bind returns, so a
+--budget under CONTROLLER_SETTLE + RESTORE_POLL refuses before any lock is taken. The output
 maps each bus's number before to its number now: re-derive every busport on them. The rest
 (exit 3, blockers, cleanup logs, exit codes) is as for the port operations. Prerequisite: a
 rig's root-owned /usr/local/sbin/usb_recover, which wins over the checkout's, must be refreshed
@@ -137,6 +138,7 @@ VERB_SCOPE = {'root-cycle': 'root', 'hub-cycle': 'hub', 'pci-rebind': 'controlle
 SCOPE_NAME = {'root': 'root port', 'hub': 'hub', 'controller': 'controller'}
 REFUSED_UNWRITTEN = 3     # usb_recover.sh, every verb run here: refused before its first mutation
 SYS_PCI_DEVICES = '/sys/bus/pci/devices'
+SYS_PCI_DRIVERS = '/sys/bus/pci/drivers'
 PCI_RE = re.compile(r'^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9]$')   # usb_recover.sh's PCI_RE
 PCI_IDENTITY = ('vendor', 'device', 'subsystem_vendor', 'subsystem_device', 'class')
 USB_CONTROLLER_CLASS = '0x0c03'   # base class 0x0c serial bus, subclass 0x03 USB, as usb_recover.sh requires
@@ -146,6 +148,7 @@ CONTROLLER_COMMAND_BUDGET = 120.0   # s before a controller command is left runn
 # scans its ports from delayed work after the bind returns, and each connect debounces for up to 2 s
 # (hub.c HUB_DEBOUNCE_TIMEOUT) before its device appears
 CONTROLLER_SETTLE = 5.0
+PCI_BIND_DRIVERS = ('xhci-pci-renesas', 'xhci_hcd')   # usb_recover.sh's pci-bind candidates, in its order
 DRIVER_RE = re.compile(r'^[A-Za-z0-9_-]+$')     # usb_recover.sh's DRIVER_RE
 DEFAULT_BUDGET = 60.0
 PROGRESS_EVERY = 60.0
@@ -650,12 +653,14 @@ def controller_gaps(state, before, addr, rosters, deadline, seen):
     except OverBudget:
         raise
     except Refused as e:
+        seen.pop('settle', None)                  # an unreadable look breaks the unchanged run
         return [str(e)]
     problems = []
     if now['ids'] != state['ids']:
         problems.append(f'{addr}: PCI identity changed: ' + ', '.join(
             f'{a} {state["ids"][a]} -> {now["ids"][a]}' for a in PCI_IDENTITY if now['ids'][a] != state['ids'][a]))
     if now['driver'] is None:
+        seen.pop('settle', None)
         return problems + [f'{addr}: no driver bound (stranded; pci-bind attaches one)']
     if state['driver'] is not None and now['driver'] != state['driver']:
         problems.append(f'{addr}: bound to {now["driver"]}, was {state["driver"]}')
@@ -664,6 +669,7 @@ def controller_gaps(state, before, addr, rosters, deadline, seen):
     except OverBudget:
         raise
     except Refused as e:
+        seen.pop('settle', None)
         return problems + [str(e)]
     seen['after'] = after
     if not any(ROOT_HUB_RE.match(name) for name in after):
@@ -783,6 +789,10 @@ def cmd_run_controller(args):
     addr = args.target
     rosters = load_rosters(args.roster)
     state, nodes = check_controller(addr, rosters, args.budget, args.verb)
+    floor = CONTROLLER_SETTLE + RESTORE_POLL
+    if all(ROOT_HUB_RE.match(name) for name in nodes) and args.budget < floor:
+        raise Refused(f'--budget {args.budget:g} s is under {floor:g} s: with no device on its buses before, '
+                      f'{addr} counts as back only once they look the same for {CONTROLLER_SETTLE:g} s')
     _subreaper()
     try:
         hil_lock.ensure_lock_files(rosters['locks'])     # before admission closes, which refuses even our creates
@@ -816,14 +826,18 @@ def cmd_run_controller(args):
 
     def stale_helper(rc):
         """An exit 1 with nothing changed is what a helper older than its pci exit 3 gives for a
-        refusal before the unbind: still a blocker, since nothing proves which it was."""
+        refusal before its first write: still a blocker, since nothing proves which it was. A pci-bind
+        with a bind file to write reached that write in either helper, so its exit 1 is the bind's."""
+        if args.verb == 'pci-bind' and any(os.path.exists(os.path.join(SYS_PCI_DRIVERS, d, 'bind'))
+                                           for d in ([args.driver] if args.driver else PCI_BIND_DRIVERS)):
+            return None
         try:
             same = rc == 1 and unchanged()
         except Refused:
             same = False
         return (f'the controller is unchanged: if {RECOVER_SCRIPT} predates exit 3 for pci refusals '
                 f'(agentrc#236; refresh the root-owned copy with hil-farm-setup), this was a refusal '
-                f'before the unbind') if same else None
+                f'before its first write') if same else None
     status = _outcome(res, args.verb, argv, rc, args.budget, unchanged,
                       lambda deadline: controller_gaps(state, nodes, addr, rosters, deadline, seen), stale_helper)
     if 'after' in seen:

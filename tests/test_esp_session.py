@@ -33,7 +33,8 @@ start = start_time(os.getpid()) or '?'
 with open(os.environ['FAKE_PIDS'], 'a') as f:
     f.write(f'{os.getpid()} {start}\n')
 cs = [argv[i + 1] for i, a in enumerate(argv) if a == '-c']
-log = argv[argv.index('-l') + 1]
+# esp_session.tcl_word undone as Jim reads the word: a backslashed n is a newline, any other character itself
+log = re.sub(r'\\(.)', lambda m: '\n' if m[1] == 'n' else m[1], argv[argv.index('-l') + 1], flags=re.S)
 cores = os.environ.get('FAKE_CORES', 'chip.cpu0,chip.cpu1').split(',')
 with open(os.environ['FAKE_LOG'], 'a') as f:
     f.write(json.dumps({'tool': 'openocd', 'argv': argv}) + '\n')
@@ -294,6 +295,15 @@ class EspSessionTest(unittest.TestCase):
         for setting in ('set may-write-memory off', 'set may-call-functions off', 'set may-insert-breakpoints off'):
             self.assertLess(exs.index(setting), exs.index(next(e for e in exs if e.startswith('target'))))
         self.assertEqual(exs[-2:], ['monitor resume', 'detach'])
+
+    def test_an_out_directory_with_a_space_reaches_openocd_as_one_word(self):
+        self.out = self.d / 'my out'
+        rc, out, err = self.run_cli(self.session('inspect'), FAKE_OCD_LOG=str(self.out / 'openocd.log'))
+        self.assertEqual(rc, 0, err)
+        word = f'{self.out.as_posix()}/openocd.log'.replace(' ', '\\ ')
+        self.assertEqual(self.calls('openocd')[0][-2:], ['-l', word])
+        self.assertIn('Info : [chip.cpu0] Examination succeed', out['examination']['log'])
+        self.assertIn('Info : [chip.cpu0] Examination succeed', (self.out / 'openocd.log').read_text())
 
     def test_configuration_order(self):
         self.run_cli(self.session('inspect'))
