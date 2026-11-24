@@ -89,6 +89,8 @@ _ROUND_TRIP = """if True:
         sys.exit(f'error: {e.with_remedy()}')
     paths = {k: os.path.join(v, '') for k, v in sysconfig.get_paths().items()}
     lib = (paths['stdlib'], paths['platstdlib'])
+    if os.name == 'nt':  # stdlib extension modules sit in <base_exec_prefix>/DLLs, which sysconfig does not name
+        lib += (os.path.join(sys.base_exec_prefix, sys.platlibdir, ''),)
     site = (paths['purelib'], paths['platlib'])  # may sit inside stdlib
     modules = sorted(f for n in set(sys.modules) - before
                      if (f := getattr(sys.modules[n], '__file__', None))

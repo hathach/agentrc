@@ -1110,10 +1110,13 @@ const hostPython = () => {
   throw new Error('no python3 (on Windows python) runs here')
 }
 // A command as its shell runs it, its AGENTRC_EMIT moved to `emit` and its interpreter the host's (the command's own
-// is python3 or python, by name): -EncodedCommand hands PowerShell the command as the relay types it.
+// is python3 or python, by name): -EncodedCommand hands PowerShell the command as the relay types it. MSYS bash on
+// Windows rewrites a /-rooted argument to a native program as a Windows path; a launch's own paths there are native
+// already, so only the stand-in factsDir's would be, and conversion is off.
+const MSYS_VERBATIM = ON_WINDOWS ? { MSYS_NO_PATHCONV: '1', MSYS2_ARG_CONV_EXCL: '*' } : {}
 const SHELL_RUNS = [
   { shell: 'bash', available: HAS_BASH, run: (cmd, emit, env) => spawnSync('bash', ['-c',
-    cmd.replace(/AGENTRC_EMIT='[^']+' /, `AGENTRC_EMIT='${emit}' `).replace(/(^| )python3 /, `$1'${hostPython()}' `)], { encoding: 'utf8', env }) },
+    cmd.replace(/AGENTRC_EMIT='[^']+' /, `AGENTRC_EMIT='${emit}' `).replace(/(^| )python3 /, `$1'${hostPython()}' `)], { encoding: 'utf8', env: { ...env, ...MSYS_VERBATIM } }) },
   { shell: 'powershell', available: HAS_POWERSHELL, run: (cmd, emit, env) => spawnSync(POWERSHELL, ['-NoProfile', '-NonInteractive', '-EncodedCommand',
     Buffer.from(cmd.replace(/AGENTRC_EMIT='[^']+';/, `AGENTRC_EMIT='${emit}';`).replace('& python ', `& '${hostPython()}' `), 'utf16le').toString('base64')], { encoding: 'utf8', env }) },
 ]
