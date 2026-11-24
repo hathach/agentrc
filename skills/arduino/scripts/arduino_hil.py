@@ -1150,16 +1150,33 @@ def schema():
 
 
 def core_provenance(platform):
-    """Describe a record's core provenance; modified reflects only its recorded git dirty flag."""
-    parts = [f'{platform.get("id") or "?"} {platform.get("version") or "?"}']
-    git = platform.get('git')
+    """Describe a record's core provenance from untrusted fields: a non-string or empty one renders `?`, only
+    `dirty is True` is modified (any other non-False value is `dirty ?`), `git` None is a non-git core while any other
+    non-object, absent included (records always write it), is malformed, and missing content shows its
+    contentError."""
+    def text(value, n=None):
+        value = ' '.join(value.split())[:n] if isinstance(value, str) else ''
+        return value or '?'
+
+    if not isinstance(platform, dict):
+        return 'malformed core provenance'
+    parts = [f'{text(platform.get("id"))} {text(platform.get("version"))}']
+    git = platform.get('git', ...)
     if git is None:
         return ', '.join([*parts, 'non-git: id/version only'])
-    parts.append(f'commit {(git.get("commit") or "?")[:12]}')
-    if git.get('dirty'):
+    if not isinstance(git, dict):
+        return ', '.join([*parts, 'malformed git provenance'])
+    parts.append(f'commit {text(git.get("commit"), 12)}')
+    if git.get('dirty') is True:
         parts.append('modified')
-    content = git.get('content')
-    parts.append(f'content {content[:12]}' if content else 'content unavailable')
+    elif git.get('dirty') is not False:
+        parts.append('dirty ?')
+    if isinstance(git.get('content'), str) and git['content']:
+        parts.append(f'content {text(git["content"], 12)}')
+    elif 'contentError' in git:
+        parts.append(f'content unavailable: {text(git["contentError"])}')
+    else:
+        parts.append('content unavailable')
     return ', '.join(parts)
 
 

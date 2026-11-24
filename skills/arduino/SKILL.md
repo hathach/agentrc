@@ -25,7 +25,9 @@ retries, recovery) apply unchanged; these scripts load its `hil_*` scripts throu
 - `.claude/skills/hil-contract/scripts/agentrc_pin.py`: a verbatim copy of `scripts/agentrc_pin.py`, configured by
   `test/hil/agentrc.json`. It selects the staged tree, CI pin or installed checkout, in that order. Its docstring
   defines selection, configuration and commands; `hil`'s `agentrc_source.py` owns closure identity and drift.
-  `agentrc_pin.py test` refuses a copy that differs from the selected canonical file, naming the copy/repin remedy.
+  `agentrc_pin.py test` refuses a copy that differs from the selected canonical file, naming the copy/repin remedy,
+  then a consumer that fails its conformance check (`scripts/pin_conformance.py`'s `problems()` docstring, loaded
+  from the selected closure). A consumer's own tests keep only its configuration and profile wiring.
 - `.claude/skills/build/scripts/check_build.py`: the build profile (board table with CI's FQBNs from
   adafruit/ci-arduino `all_platforms.py` plus the rig boards, representatives per family, source classification,
   HIL sketches per role, VID:PID adapter, extra dependencies) and `main()`, which binds it to `arduino_build.py`.
@@ -56,8 +58,9 @@ retries, recovery) apply unchanged; these scripts load its `hil_*` scripts throu
   `shadows`); any other fails the sketch.
 - **The HIL build record**: the rig's installed core need not match or exist; HIL validates the recorded images.
   Git-checkout cores are content-bound, other cores have id/version provenance only. The report's `modified` label
-  means only the recorded dirty flag. `arduino_build.py`'s `platform_git()` and `content_digest()` document the
-  binding limits. Rebuild a refused record. After an agentrc upgrade, close and reopen a session before staging
+  means only a recorded `dirty: true`; `arduino_hil.py`'s `core_provenance()` renders a malformed field as `?` or
+  `malformed`, never as a claim. `arduino_build.py`'s `platform_git()` and `content_digest()` document the binding
+  limits. Rebuild a refused record. After an agentrc upgrade, close and reopen a session before staging
   records from the new closure; closing still uses its original staged restoration image and harness.
 - **Core TinyUSB** (informational): each build row's `coreTinyUSB` lists, per copy of the TinyUSB an ESP32 core
   bundles (`include/arduino_tinyusb`), the headers the build's `.d` files took from it, its `tusb_option.h` version
@@ -167,8 +170,8 @@ The library's workflow and report comment are its own.
 1. Copy `skills/arduino/scripts/agentrc_pin.py` verbatim to
    `.claude/skills/hil-contract/scripts/agentrc_pin.py` and configure `test/hil/agentrc.json` as its docstring
    specifies. Put both files in the profile's `CONTRACT_FILES` so staged trees carry them. Copy and repin together;
-   keep profile/config and selected-copy integration tests in the consumer, with common bootstrap behavior tested
-   in agentrc.
+   keep profile/config tests in the consumer, with common bootstrap behavior and the staged round trip (`test`'s
+   conformance check) in agentrc.
 2. Write the build profile: CI's matrix boards with their FQBNs, the rig boards it will run on (named as in agentrc's
    board registry, each with its `span`), representatives, classification of its `src/` tree, HIL sketches. Prove it
    with `check_build.py --select-only` on representative diffs and a full `--record` build per rig board.

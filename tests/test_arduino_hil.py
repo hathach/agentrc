@@ -2589,14 +2589,35 @@ class CoreProvenance(unittest.TestCase):
         self.assertEqual(H.core_provenance(self.platform),
                          'vend:arch 1.0, commit aaaaaaaaaaaa, modified, content bbbbbbbbbbbb')
 
-    def test_unavailable_content(self):
-        self.platform['git'].update(content=None, contentError='an input was unreadable')
+    def test_unavailable_content_shows_its_error(self):
+        self.platform['git'].update(content=None, contentError='an input\nwas unreadable')
         self.assertEqual(H.core_provenance(self.platform),
-                         'vend:arch 1.0, commit aaaaaaaaaaaa, content unavailable')
+                         'vend:arch 1.0, commit aaaaaaaaaaaa, content unavailable: an input was unreadable')
+        del self.platform['git']['contentError']
+        self.assertEqual(H.core_provenance(self.platform), 'vend:arch 1.0, commit aaaaaaaaaaaa, content unavailable')
 
     def test_non_git_id_and_version_only(self):
         self.platform['git'] = None
         self.assertEqual(H.core_provenance(self.platform), 'vend:arch 1.0, non-git: id/version only')
+
+    def test_untrusted_fields_never_raise_or_claim_more_than_recorded(self):
+        git = {'commit': 'a' * 40, 'dirty': False, 'content': 'b' * 64}
+        cases = (
+            ({'id': 1, 'version': None, 'git': {**git, 'commit': 7}}, '? ?, commit ?, content bbbbbbbbbbbb'),
+            ({'id': 'vend:arch', 'version': '1.0', 'git': 'a' * 40}, 'vend:arch 1.0, malformed git provenance'),
+            ({'id': 'vend:arch', 'version': '1.0', 'git': []}, 'vend:arch 1.0, malformed git provenance'),
+            ({'id': 'vend:arch', 'version': '1.0'}, 'vend:arch 1.0, malformed git provenance'),
+            ({'id': 'vend:arch', 'version': '1.0', 'git': {**git, 'dirty': 'false'}},
+             'vend:arch 1.0, commit aaaaaaaaaaaa, dirty ?, content bbbbbbbbbbbb'),
+            ({'id': 'vend:arch', 'version': '1.0', 'git': {**git, 'dirty': 1}},
+             'vend:arch 1.0, commit aaaaaaaaaaaa, dirty ?, content bbbbbbbbbbbb'),
+            ({'id': 'vend:arch', 'version': '1.0', 'git': {**git, 'content': 5, 'contentError': {'x': 1}}},
+             'vend:arch 1.0, commit aaaaaaaaaaaa, content unavailable: ?'),
+            (['vend:arch'], 'malformed core provenance'),
+        )
+        for platform, want in cases:
+            with self.subTest(platform=platform):
+                self.assertEqual(H.core_provenance(platform), want)
 
 
 class Report(Base):
