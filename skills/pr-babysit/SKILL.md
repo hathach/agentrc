@@ -37,7 +37,7 @@ python3 "$S/commits.py" head --parent <sha> 'src/a.c'  # audit the commit at HEA
 python3 "$S/commits.py" chain <from> <to> --published <pr-head> --base <base-head> --tip <base-tip>  # audit from..to for adoption, full SHAs; preflight's prBase and prBaseTip
 python3 "$S/push.py" --remote origin --branch <b> --sha <sha> --push-url <url> [--open-pr N] [--pr N] [--repo R]
 python3 "$S/sonar.py" --pr N [--repo R] --head <sha> --manifest <file> [--receipt <path>]  # mark answered code-scanning comments' SonarCloud issues false positive; a saved --receipt replays
-python3 "$S/coderabbit_trigger.py" --pr N [--repo R] --head <sha> [--request]  # tick CodeRabbit's Trigger review box when it skipped the head for a manual review; --request comments `@coderabbitai review` once its rate limit has reset, on such a skip no tick asked for, or when its review of the head failed
+python3 "$S/coderabbit_trigger.py" --pr N [--repo R] --head <sha> [--request]  # tick CodeRabbit's Trigger review box when it skipped the head for a manual review; --request comments `@coderabbitai review` once its rate limit has reset, on such a skip no tick asked for, or when its review of the head failed, and `@coderabbitai full review` when it skipped the head with no files to review
 python3 "$S/greptile_trigger.py" --pr N [--repo R] --head <sha>  # comment `@greptileai` once per head, recorded under the git common dir
 python3 "$S/ci_recover.py" --pr N [--repo R] --head <sha> --wait-minutes M  # cancel and re-run, once per run attempt, an Actions run on the head queued with no job past M minutes; recorded under the git common dir
 python3 "$S/build.py" --path 'src/a.c' --command 'make -C <BUILD>' [--setup L] [--require T] [--job DIR --wait-seconds S --timeout-seconds T]  # build the checkout as it stands; --job detached, waited on S seconds a call
@@ -75,7 +75,7 @@ files, and reruns failed ones alone in a temporary worktree of HEAD it then remo
 docstring says which failures that excuses from the verdict and the commit's SKIP; `build.py`
 builds the checkout in a fresh build directory; `push.py` publishes `<sha>` and reads back
 where it landed, `sonar.py` comments on and resolves SonarCloud issues, and `coderabbit_trigger.py` edits
-CodeRabbit's summary comment to tick its Trigger review box, or with `--request` posts one `@coderabbitai review` comment, and `greptile_trigger.py` posts one `@greptileai` comment, and `merge.py --merge` merges the PR. Run any of them by hand only with the user's authorization to publish there.
+CodeRabbit's summary comment to tick its Trigger review box, or with `--request` posts one `@coderabbitai review` (or `full review`) comment, and `greptile_trigger.py` posts one `@greptileai` comment, and `merge.py --merge` merges the PR. Run any of them by hand only with the user's authorization to publish there.
 
 ## Arguments
 

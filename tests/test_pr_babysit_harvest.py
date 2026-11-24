@@ -142,7 +142,7 @@ class SettleRules(unittest.TestCase):
                 r = harvest.coderabbit(HEAD, [], [dict(run_, output={'title': other})], [summary], EVENT)
                 self.assertEqual(r['reason'], f'check run skipped: {other}', 'only the manual-review title says it')
 
-    def test_a_no_files_to_review_coderabbit_check_run_is_a_skip_never_askable(self):
+    def test_a_no_files_to_review_coderabbit_check_run_is_a_skip_with_no_box_to_tick(self):
         # #372: hathach/tinyusb#4246's rebased head, check run 124595415060.
         run_ = {'id': 124595415060, 'name': 'CodeRabbit', 'status': 'completed', 'conclusion': 'skipped', 'started_at': '2026-09-25T09:00:00Z',
                 'completed_at': '2026-09-25T09:00:01Z', 'output': {'title': 'No files to review', 'summary': 'Result: Skipped - No files to review'}}

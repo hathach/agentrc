@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tick CodeRabbit's "Trigger review" box on PR N when it skipped HEAD for a manual review,
-or, with --request, ask it to review once its rate limit on HEAD has reset, when no tick asked for a skipped HEAD, or
-when its review of HEAD failed.
+or, with --request, ask it to review once its rate limit on HEAD has reset, when no tick asked for a skipped HEAD, when
+its review of HEAD failed, or, with a full review, when it skipped HEAD with no files to review.
 
   coderabbit_trigger.py --pr N --head SHA [--request [--not-before ISO]] [--repo OWNER/NAME]
 
@@ -24,14 +24,20 @@ Run from the PR checkout; PR N is --repo's, else the checkout's one repository
 With --request, CodeRabbit is read as harvest.py reads it, and a rate-limit
 notice leaves no box to tick (CodeRabbit's docs: comment `@coderabbitai review`
 after the reset); nor does a manual-review skip whose summary lost its box, or
-whose tick failed (#274), nor a review of HEAD that failed (#499). The outcome:
+whose tick failed (#274), nor a review of HEAD that failed (#499), nor a check
+run skipped as "No files to review" (#577), such as on a merge of the base whose
+net diff CodeRabbit reviewed on an earlier head. That skip is asked with
+`@coderabbitai full review`, every other request with `@coderabbitai review`:
+CodeRabbit's docs make `review` incremental, from the last reviewed commit, and
+`full review` review every file of the PR again. The outcome:
 
   requested   it is limited on HEAD and its reset plus a minute has passed, it
-              skipped HEAD for a manual review and no box is ticked, or its
-              review of HEAD failed; the comment was posted and read back
-  already     such a comment was posted at or after the reset, or, on a skip or
-              a failed review, at or after the head event (harvest.py's), or on
-              a skip the box is ticked
+              skipped HEAD for a manual review and no box is ticked, its
+              review of HEAD failed, or it found no files to review on HEAD;
+              the comment was posted and read back
+  already     such a comment (the same body) was posted at or after the reset,
+              or, on a skip or a failed review, at or after the head event
+              (harvest.py's), or on a manual-review skip the box is ticked
   notDue      the reset plus a minute is still ahead (retryAt), or no reset
               time can be read (retryAt null) and no --not-before stands in:
               nothing posted
@@ -42,7 +48,8 @@ moves the reset later, never earlier: a request is posted only once both have
 passed, and only one posted at or after both counts as already.
   notLimited  the PR is not open, SHA is not its head (both read again just
               before posting), or CodeRabbit is neither rate-limited on it,
-              skipped it for a manual review, nor failed its review
+              skipped it for a manual review or with no files to review, nor
+              failed its review
   failed      a read before the post, the post or its read-back failed, or on
               a skip or a failed review a standing comment cannot be placed
               against an unknown head event time
@@ -70,7 +77,9 @@ from facts import FULL_SHA, Parser, Unusable, attempt, bind_repo, report  # noqa
 from harvest import CR_TRIGGER_BOX as BOX, coderabbit, gh_json, observe, pages, stamp  # noqa: E402
 
 SKIP = 'review skipped: manual review required'
+NO_FILES = 'check run skipped: no files to review'
 REQUEST = '@coderabbitai review'
+FULL_REQUEST = '@coderabbitai full review'
 # Asked a minute past the reset, not at it, as pr-babysit naps to it.
 MARGIN = timedelta(minutes=1)
 ISO = re.compile(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ')
@@ -98,6 +107,11 @@ def on_comment(outcome, c, **members):
     return {'outcome': outcome, 'detail': f"comment {c['id']}", 'commentId': c['id'], **members}
 
 
+def full(body):
+    """The receipt member naming a full-review ask, which the workflow records as the command it sent."""
+    return {'full': True} if body == FULL_REQUEST else {}
+
+
 def by_coderabbit(c):
     return 'coderabbit' in ((c.get('user') or {}).get('login') or '').lower()
 
@@ -106,7 +120,12 @@ def state_of(cr):
     return f"CodeRabbit is {cr['state']}{'/' + cr['kind'] if cr['kind'] else ''}"
 
 
-def skipped(pr, head):
+def skipped(cr, prefix):
+    """Whether harvest.py's reading CR is a skip whose reason starts with PREFIX."""
+    return (cr['state'], cr['kind']) == ('settled', 'skipped') and cr['reason'].lower().startswith(prefix)
+
+
+def manual_skip(pr, head):
     """(None, the PR's comments) when HEAD is PR N's head and CodeRabbit's newest status or check run on it is the
     manual-review skip, (why not, None) otherwise."""
     if gh_json('api', f'repos/{{owner}}/{{repo}}/pulls/{pr}')['head']['sha'] != head:
@@ -116,13 +135,13 @@ def skipped(pr, head):
     comments = pages(f'repos/{{owner}}/{{repo}}/issues/{pr}/comments')
     # No head event: a SHA-less notice newer than the status or run cannot be placed, and reads unknown.
     cr = coderabbit(head, statuses, checks, comments, None)
-    if (cr['state'], cr['kind']) != ('settled', 'skipped') or not cr['reason'].lower().startswith(SKIP):
+    if not skipped(cr, SKIP):
         return f"{state_of(cr)}: {cr['reason']}", None
     return None, comments
 
 
 def trigger(pr, head):
-    why, comments = skipped(pr, head)
+    why, comments = manual_skip(pr, head)
     if why:
         return {'outcome': 'notSkipped', 'detail': why}
     holders = [c for c in comments if by_coderabbit(c) and len(BOX.findall(c.get('body') or '')) == 1]
@@ -160,16 +179,19 @@ def unopened(pr, head):
 
 
 def unasked(repo, pr, head, not_before=None):
-    """(None, the retryAt member) when the request is to be posted now, else (the outcome, None); it only reads."""
+    """(None, (the comment body, the retryAt member)) when the request is to be posted now, else (the outcome, None); it
+    only reads."""
     why = unopened(pr, head)
     if why:
         return {'outcome': 'notLimited', 'detail': why}, None
     seen = observe(repo, pr, ['coderabbit'], ['coderabbit'])
     cr = seen['bots'][0]
-    if seen['headSha'] == head and (cr['state'], cr['kind']) == ('settled', 'skipped') and cr['reason'].lower().startswith(SKIP):
+    if seen['headSha'] == head and skipped(cr, SKIP):
         return unasked_skip(pr, head, seen['headEventAt'])
     if seen['headSha'] == head and (cr['state'], cr['kind']) == ('settled', 'failed'):
         return unasked_skip(pr, head, seen['headEventAt'], box=False)
+    if seen['headSha'] == head and skipped(cr, NO_FILES):
+        return unasked_skip(pr, head, seen['headEventAt'], box=False, ask=FULL_REQUEST)
     if seen['headSha'] != head or (cr['state'], cr['kind']) != ('settled', 'limited'):
         return {'outcome': 'notLimited', 'detail': f"{state_of(cr)} on {seen['headSha'][:9]}: {cr['reason']}"}, None
     reset = {'retryAt': cr['retryAt']}
@@ -188,40 +210,42 @@ def unasked(repo, pr, head, not_before=None):
     why = unopened(pr, head)
     if why:
         return {'outcome': 'notLimited', 'detail': why}, None
-    return None, reset
+    return None, (REQUEST, reset)
 
 
-def unasked_skip(pr, head, event_at, box=True):
-    """unasked's answer on a manual-review skip: an ask stands when the box is ticked or a request follows the head event;
-    on a failed review (box False) only the request counts, as a ticked box may be what started the review that failed."""
+def unasked_skip(pr, head, event_at, box=True, ask=REQUEST):
+    """unasked's answer on a manual-review skip: an ask stands when the box is ticked or an ASK comment follows the head
+    event; on a failed review or a no-files skip (box False) only the comment counts, as a ticked box may be what started
+    the review that failed, and none asks for a no-files skip again."""
     comments = pages(f'repos/{{owner}}/{{repo}}/issues/{pr}/comments')
     reset = {'retryAt': None}
     ticked = [c for c in comments if box and by_coderabbit(c) and any(m['mark'] != ' ' for m in BOX.finditer(c.get('body') or ''))]
     if ticked:
         c = ticked[0]
         return on_comment('already', c, detail=f"comment {c['id']} has its Trigger review box ticked", at=c['updated_at'], **reset), None
-    standing = [c for c in comments if (c.get('body') or '').strip() == REQUEST]
+    standing = [c for c in comments if (c.get('body') or '').strip() == ask]
     if standing and event_at is None:
         raise Failed(f"the head event time is unknown, so comment {standing[-1]['id']} cannot be placed before or after it: nothing posted", 'read')
     # One at the head event's own second is taken as asked: a duplicate comment is the worse error here.
     asked = [c for c in standing if stamp(c['created_at']) >= stamp(event_at)]
     if asked:
-        return on_comment('already', asked[0], at=asked[0]['created_at'], **reset), None
+        return on_comment('already', asked[0], at=asked[0]['created_at'], **full(ask), **reset), None
     why = unopened(pr, head)
     if why:
         return {'outcome': 'notLimited', 'detail': why}, None
-    return None, reset
+    return None, (ask, reset)
 
 
 def request(repo, pr, head, not_before=None):
     try:
-        out, reset = unasked(repo, pr, head, not_before)
+        out, post = unasked(repo, pr, head, not_before)
     except Unusable as e:
         raise Failed(str(e), 'read')
     if out:
         return out
+    body, reset = post
     path = f'repos/{{owner}}/{{repo}}/issues/{pr}/comments'
-    code, out, err = attempt('gh', 'api', '-X', 'POST', path, '-f', f'body={REQUEST}')
+    code, out, err = attempt('gh', 'api', '-X', 'POST', path, '-f', f'body={body}')
     if code:
         raise Failed(f'gh api {path}: {err.strip() or f"exit {code}"}')
     try:
@@ -229,9 +253,9 @@ def request(repo, pr, head, not_before=None):
         back = gh_json('api', f"repos/{{owner}}/{{repo}}/issues/comments/{posted['id']}")
     except (ValueError, KeyError, TypeError, Unusable) as e:
         raise Failed(f'the posted request does not read back ({e})')
-    if (back.get('body') or '').strip() != REQUEST:
+    if (back.get('body') or '').strip() != body:
         raise Failed(f"comment {posted['id']} reads back as another body")
-    return on_comment('requested', posted, at=back['created_at'], **reset)
+    return on_comment('requested', posted, at=back['created_at'], **full(body), **reset)
 
 
 def collect(argv):

@@ -87,6 +87,11 @@ REFUSED = {
 USER_ASKS = ('the user comments `@coderabbitai review` on the PR or accepts the head '
              'unreviewed, and a relaunch helps only once CodeRabbit reviewed the head, or on a new head')
 CR_UNREVIEWED = 'CodeRabbit has not reviewed the head, and a coderabbitTrigger launch made its review required for every head of this run'
+# A "No files to review" skip (#577) is no review, and once this run asked on the head only the user or a new head moves it.
+NOTHING_TO_REVIEW = ('CodeRabbit had nothing to review on {head} (its check run skipped it: No files to review), and a coderabbitTrigger '
+                     'launch made its review required for every head of this run')
+NOTHING_ASKS = ('the user comments `@coderabbitai full review` on the PR or accepts the head unreviewed, or a new head is pushed; '
+                'a relaunch helps only once CodeRabbit reviewed the head, or on a new head')
 # A request whose read failed before its claim posted nothing, and the state keeps the head's one retry (#425).
 GREPTILE_RETRY = ('Greptile has not reviewed the head: its request failed on a read before posting, so it posted nothing, and no '
                   'cycle was left to retry it; a relaunch asks Greptile once more on this head from the returned state, once any other '
@@ -170,6 +175,9 @@ def sonar_route(last):
 
 
 ASKS = {'tick': 'a Trigger review tick', 'request': 'an `@coderabbitai review` comment'}
+# coderabbit_trigger.py asks a no-files skip for a full review (an incremental one answers the same skip); the run
+# marks that ask `full`.
+FULL_ASKS = dict(ASKS, request='an `@coderabbitai full review` comment')
 
 
 def relaunch_ask(ask):
@@ -182,20 +190,28 @@ def relaunch_ask(ask):
         when = f"next after {ask['nextAt']}" if ask['nextAt'] else 'next once a launch dates the limit'
         return (f"it is rate-limited, and a launch with coderabbitTrigger waits it out, commenting `@coderabbitai review` once per "
                 f"reset window, {when}" + (f" ({asked} request attempt{'s' if asked > 1 else ''} on this head so far)" if asked else ''))
+    if ask.get('relaunchAsks') == 'request' and ask.get('nothingToReview') is True:
+        return ('it skipped the head with no files to review and this run never asked on it: a relaunch with coderabbitTrigger '
+                'comments `@coderabbitai full review` once')
     if ask.get('relaunchAsks') == 'request' and ask.get('retryAt') is None:
         return ('it skipped the head for a manual review and no tick asked for its review: a relaunch with coderabbitTrigger '
                 'comments `@coderabbitai review` once')
     if ask.get('relaunchAsks') == 'request':
         return (f"it is rate-limited until {ask.get('retryAt')} and this run never asked on the head: a relaunch with "
                 'coderabbitTrigger after that comments `@coderabbitai review` once')
-    asked = '; '.join(f"{ASKS.get(a.get('ask'), a.get('ask'))} {'at ' + a['at'] if a.get('at') else 'that failed'}"
+    asked = '; '.join(f"{(FULL_ASKS if a.get('full') is True else ASKS).get(a.get('ask'), a.get('ask'))} "
+                      f"{'at ' + a['at'] if a.get('at') else 'that failed'}"
                       for a in ask.get('asked') or [])
     why = f'this run already used its one ask on the head ({asked})' if asked else "nothing in CodeRabbit's state is ours to ask"
     return f'{why}, so a relaunch will not ask CodeRabbit on this head'
 
 
-def coderabbit_blocker(ask):
-    return f'{CR_UNREVIEWED}; {relaunch_ask(ask)}' + ('' if ask.get('relaunchAsks') in ASKS else f': {USER_ASKS}')
+def coderabbit_blocker(ask, head):
+    if ask.get('nothingToReview') is True:
+        lead, user = NOTHING_TO_REVIEW.format(head=head[:7] if isinstance(head, str) and head else 'the head'), NOTHING_ASKS
+    else:
+        lead, user = CR_UNREVIEWED, USER_ASKS
+    return f'{lead}; {relaunch_ask(ask)}' + ('' if ask.get('relaunchAsks') in ASKS else f': {user}')
 
 
 def load_output(path):
@@ -447,7 +463,7 @@ def summarize(output, output_path, state_ref=None, tree=None, keys=False):
             notes.append(ENDED[result['reason']])
         ask = result.get('coderabbitAsk') if isinstance(result.get('coderabbitAsk'), dict) else None
         if ask and result.get('reason') == 'coderabbit-unreviewed':
-            blockers.append(coderabbit_blocker(ask))
+            blockers.append(coderabbit_blocker(ask, result.get('head')))
         else:
             if result.get('reason') == 'greptile-unreviewed' and result.get('greptileRetry') is True:
                 blockers.append(GREPTILE_RETRY)
