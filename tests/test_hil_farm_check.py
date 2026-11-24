@@ -859,7 +859,7 @@ class Main(unittest.TestCase):
         seen = []
 
         def tracked(cmd, cwd=None, **kw):
-            seen.append(sorted(os.listdir(mine.BOARD_LOCK_DIR)))
+            seen.append(sorted(f for f in os.listdir(mine.BOARD_LOCK_DIR) if f != mine.ADMISSION))
             r = subprocess.CompletedProcess(cmd, 0, 'ok', None)
             r.cleanup, r.receipt = 'done', None
             return r

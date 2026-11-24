@@ -162,11 +162,13 @@ nothing in it through a link.
   and, when anything but a clean, fully re-enumerated outcome follows,
   releases them with the blocker logged in each board's cleanup log
   (`end_failed`; a surviving process as an `unrecheckable` receipt, so that
-  failure stays open) and exits 1. A controller operation has no
-  inspected reservation yet; a contract refuses it. A runner that
-  cycles one hub port under the board's own lock is a limitation of this rule,
-  not an exemption, recorded in the contract's Limits with what else the cycle
-  is known to reach.
+  failure stays open) and exits 1. A controller operation (`usb-kernel-recover`'s `pci-rebind`, `pci-bind`, for a
+  dead controller) holds through `hil_reserve.py run pci-rebind|pci-bind <pciaddr>`, which a contract adopts in its
+  Reservation before running either verb, and only once every project on the host is pinned at or after the agentrc
+  whose `hil_lock` closes lock admission for the run (an older one still creates lock names the hold cannot see) and
+  the rig's installed `usb_recover` is refreshed by `hil-farm-setup`. `hil_reserve.py --help` has what it checks,
+  holds and judges. A runner that cycles one hub port under the board's own lock is a limitation of this rule, not an
+  exemption, recorded in the contract's Limits with what else the cycle is known to reach.
 
 Manual work on a rig board outside the contract's runner (`hw-validator`,
 `hw-debugger`, probe tools used directly) follows `target-debug`'s Delegated

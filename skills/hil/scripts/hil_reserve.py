@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Host-wide reservation for a root- or hub-port operation on a HIL host (`hil` skill, Board locks):
-every board lock of every supplied roster, taken by one process around the one supported
-mutation, after a coverage check of the subtree the operation reaches.
+"""Host-wide reservation for a root-port, hub-port or controller operation on a HIL host (`hil`
+skill, Board locks): every board lock of every supplied roster, taken by one process around the
+one supported mutation, after a coverage check of what the operation reaches.
 
   hil_reserve.py check <busport> [--scope root|hub] --roster FILE ...
+  hil_reserve.py check <pciaddr> --scope controller --roster FILE ...
   hil_reserve.py run root-cycle|hub-cycle <busport> --roster FILE ... --reason TEXT
+  hil_reserve.py run pci-rebind|pci-bind <pciaddr> --roster FILE ... --reason TEXT
 
 A roster is a project's HIL roster JSON (`boards` and `boards-skip`; a parked board is still
 on the hub). An entry with `probe` locks as its registered board's name, any other as its
@@ -48,12 +50,40 @@ stays open until an operator acknowledges it (`hil_lock.py resolve`). A reservat
 outright leaves its records, which the next task on each board logs. Exit 0 released, 1
 blocker or refused, 2 usage.
 
+Controller (pci-rebind, pci-bind; agentrc#236): the target is a PCI function, refused unless it
+is a USB controller (class 0x0c03) whose vendor, device, subsystem ids and class read, with a
+driver bound for pci-rebind and none for pci-bind. The walk spans every bus it owns: the usbN
+root hubs in its PCI directory, covered by the controller itself, and every device on those
+buses, under the same coverage rules. An unbind/bind renumbers those buses (17 and 18 came back
+as 1 and 2), so each node is keyed by its root hub's speed and its port path (`480M-2.7`), and
+two root hubs of one speed, or one whose speed does not read, refuse. A dead controller may show
+few devices or none, so its walk cannot reveal a missing roster: the hold is every roster's locks
+plus every lock name already in the lock dir, taken under hil_lock.close_admission: while the
+run lasts no new lock file is created by a taker running that hil_lock (hil_lock.AdmissionClosed,
+a BoardLocked a board task waits out), so the inventory is complete for those. A taker on an
+older hil_lock, a consumer pinned before it, can still create a name: the recheck under the hold
+refuses one it sees, and one created after the recheck goes unheld, so every consumer on the host
+must be pinned at or after this agentrc before a controller operation runs.
+`sudo -n <usb_recover> <verb> <pciaddr>` is never signalled: SIGINT/SIGTERM/SIGHUP during it are
+noted and ignored, since a rebind cut between its unbind and bind strands the controller, and
+one still running after CONTROLLER_COMMAND_BUDGET s (a write stuck in the kernel) is left
+running as a survivor while the run goes on to its outcome. Restored means the same PCI ids, a
+driver bound (pci-rebind: the one bound before), a bus registered, every pre-operation node back
+under its key with its sysfs serial matching, and everything now on its buses covered; a node
+new since is no gap when covered, since a dead controller's fixtures return with it. The output
+maps each bus's number before to its number now: re-derive every busport on them. The rest
+(exit 3, blockers, cleanup logs, exit codes) is as for the port operations. Prerequisite: a
+rig's root-owned /usr/local/sbin/usb_recover, which wins over the checkout's, must be refreshed
+(hil-farm-setup) from an agentrc with exit 3 for pci refusals; an older copy exits 1 for a
+refusal before the unbind, which ends as a blocker on every board, naming that helper.
+
 Signals: SIGINT/SIGTERM/SIGHUP before the command release the untouched reservation and
-exit 130; during the command SIGINT/SIGTERM are forwarded to its process group, while SIGHUP
-(a lost terminal or SSH session, not a request to abort) is noted and ignored so the mutation
-completes; afterwards all three are noted and ignored, so the reconciliation completes and
-its outcome is logged. The command starts with no signal blocked, so its own traps see what
-is forwarded. A command that cannot be started at all releases the reservation and refuses.
+exit 130; during a port command SIGINT/SIGTERM are forwarded to its process group (a
+controller command's never are, above), while SIGHUP (a lost terminal or SSH session, not a
+request to abort) is noted and ignored so the mutation completes; afterwards all three are
+noted and ignored, so the reconciliation completes and its outcome is logged. The command
+starts with no signal blocked, so its own traps see what is forwarded. A command that cannot be
+started at all releases the reservation and refuses.
 """
 import argparse
 import ctypes
@@ -97,9 +127,15 @@ LOCK_NAME_RE = hil_boards.LOCK_NAME_RE
 UDEV_UNSAFE_RE = re.compile(r'[^A-Za-z0-9#+.:=@_-]')   # what usb_id turns into '_' after whitespace runs
 IDENTITY_KEYS = ('uid', 'uart_uid', 'serial')
 HUB_CLASS = '09'
-VERB_SCOPE = {'root-cycle': 'root', 'hub-cycle': 'hub'}
-SCOPE_NAME = {'root': 'root port', 'hub': 'hub'}
-REFUSED_UNWRITTEN = 3     # usb_recover.sh, either verb: refused before its first mutation
+VERB_SCOPE = {'root-cycle': 'root', 'hub-cycle': 'hub', 'pci-rebind': 'controller', 'pci-bind': 'controller'}
+SCOPE_NAME = {'root': 'root port', 'hub': 'hub', 'controller': 'controller'}
+REFUSED_UNWRITTEN = 3     # usb_recover.sh, every verb run here: refused before its first mutation
+SYS_PCI_DEVICES = '/sys/bus/pci/devices'
+PCI_RE = re.compile(r'^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9]$')   # usb_recover.sh's PCI_RE
+PCI_IDENTITY = ('vendor', 'device', 'subsystem_vendor', 'subsystem_device', 'class')
+USB_CONTROLLER_CLASS = '0x0c03'   # base class 0x0c serial bus, subclass 0x03 USB, as usb_recover.sh requires
+ROOT_HUB_RE = re.compile(r'^usb([0-9]+)$')
+CONTROLLER_COMMAND_BUDGET = 120.0   # s before a controller command is left running as a survivor
 DEFAULT_BUDGET = 60.0
 PROGRESS_EVERY = 60.0
 WAIT_POLL = 0.05           # s between looks at whether the command has ended
@@ -199,6 +235,26 @@ def top(busport, scope):
     return busport.rsplit('.', 1)[0]
 
 
+def _read_node(d, name, deadline, cached):
+    """One device directory's {serial, udev, identity, cls, ino}; None when it vanished mid-walk
+    (the second walk reports the difference)."""
+    try:
+        ino = os.stat(d + '/').st_ino
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        raise Refused(f'{name}: cannot inspect ({e.strerror})')
+    cls = _bounded(os.path.join(d, 'bDeviceClass'), deadline)
+    serial = _bounded(os.path.join(d, 'serial'), deadline)
+    udev = None
+    if serial is None and cached:
+        bus, dev = (_bounded(os.path.join(d, a), deadline) for a in ('busnum', 'devnum'))   # lock-free
+        if bus and dev and bus.isdigit() and dev.isdigit():
+            udev = uo.udev_serial(int(bus), int(dev))
+    ident = identity(serial) if serial else identity(udev) if udev else None
+    return {'serial': serial, 'udev': udev, 'identity': ident or None, 'cls': cls, 'ino': ino}
+
+
 def walk(busport, identities, deadline, cached=True, scope='root'):
     """The subtree `top(busport, scope)` heads: {name: {serial, udev, identity, cls, ino,
     covered, why}}. `serial` is the sysfs read; `udev` its record, consulted only when sysfs
@@ -210,27 +266,22 @@ def walk(busport, identities, deadline, cached=True, scope='root'):
         name = os.path.basename(d)
         if ':' in name or not (name == root or name.startswith(root + '.')):
             continue
-        try:
-            ino = os.stat(d + '/').st_ino
-        except FileNotFoundError:
-            continue    # vanished mid-walk: the second walk reports the difference
-        except OSError as e:
-            raise Refused(f'{name}: cannot inspect ({e.strerror})')
-        cls = _bounded(os.path.join(d, 'bDeviceClass'), deadline)
-        serial = _bounded(os.path.join(d, 'serial'), deadline)
-        udev = None
-        if serial is None and cached:
-            bus, dev = (_bounded(os.path.join(d, a), deadline) for a in ('busnum', 'devnum'))   # lock-free
-            if bus and dev and bus.isdigit() and dev.isdigit():
-                udev = uo.udev_serial(int(bus), int(dev))
-        ident = identity(serial) if serial else identity(udev) if udev else None
-        nodes[name] = {'serial': serial, 'udev': udev, 'identity': ident or None, 'cls': cls, 'ino': ino}
+        if (n := _read_node(d, name, deadline, cached)) is not None:
+            nodes[name] = n
     if time.monotonic() > deadline:
         raise OverBudget('coverage check over budget: subtree uninspectable')
     if busport not in nodes:
         raise Refused(f'no device at {busport}')
+    return _judge(nodes, identities)
+
+
+def _judge(nodes, identities):
+    """Sets each port node's `covered` (the locks or 'hub' explaining it, None when nothing
+    does) and `why`; a node already judged (a root hub) is left as it is."""
     for name in sorted(nodes, key=lambda n: -n.count('.')):   # leaves first, so a hub sees its children judged
         n = nodes[name]
+        if 'covered' in n:
+            continue
         sn = n['identity']
         children = [c for c in nodes if c.startswith(name + '.') and c.count('.') == name.count('.') + 1]
         if n['cls'] is None:
@@ -282,6 +333,20 @@ def describe(rosters, nodes):
     return '\n'.join(lines)
 
 
+def describe_controller(addr, state, rosters, nodes):
+    locks = host_locks(rosters)
+    extra = sorted(set(locks) - set(rosters['locks']))
+    ids = state['ids']
+    lines = [f'controller {addr}: {ids["vendor"]}:{ids["device"]} subsystem {ids["subsystem_vendor"]}:'
+             f'{ids["subsystem_device"]} class {ids["class"]}, driver {state["driver"] or "none"}',
+             f'locks ({len(locks)}): ' + ' '.join(locks)]
+    if extra:
+        lines.append('  of them in no roster given: ' + ' '.join(extra))
+    for name, n in sorted(nodes.items()):
+        lines.append(f'  {name} ({n["key"]}): serial {shown(n)} -> {",".join(n["covered"])}')
+    return '\n'.join(lines)
+
+
 # --- processes -----------------------------------------------------------------------------
 def survivors(pgid):
     """Live descendants after the command was reaped: our remaining children (orphans
@@ -304,10 +369,12 @@ def _subreaper():
 
 # --- reservation ---------------------------------------------------------------------------
 class Reservation:
-    """The locks of one run, its records, and the signal policy per phase."""
+    """The locks of one run, its records, and the signal policy per phase. `forward` False
+    keeps every signal from the command: a controller rebind cut between its unbind and bind
+    would strand the controller."""
 
-    def __init__(self, locks, reason):
-        self.locks, self.reason = locks, reason
+    def __init__(self, locks, reason, forward=True, admission=None):
+        self.locks, self.reason, self.forward, self.admission = locks, reason, forward, admission
         self.token = secrets.token_hex(8)
         self._own = {'tool': 'hil_reserve', 'token': self.token, 'locks': list(locks)}
         self.handles = []
@@ -328,7 +395,7 @@ class Reservation:
         if self.phase == 'pre':          # nothing mutated yet: give the locks back and stop
             self.release()
             os._exit(130)
-        if self.phase == 'command' and signum != signal.SIGHUP:
+        if self.phase == 'command' and self.forward and signum != signal.SIGHUP:
             try:
                 os.killpg(self.pgid, signum)
                 self.noted.append(f'{name} forwarded')
@@ -354,9 +421,20 @@ class Reservation:
             except OSError:
                 pass
         self.handles = []
+        self._open_admission()
 
-    def run(self, argv):
-        """argv in its own process group; returns its exit code. A command that cannot be
+    def _open_admission(self):
+        """Last, once every lock is given back: new lock names are admitted again."""
+        if self.admission is not None:
+            try:
+                self.admission.close()
+            except OSError:
+                pass
+            self.admission = None
+
+    def run(self, argv, bound=None):
+        """argv in its own process group; returns its exit code, or None once it outran
+        `bound` seconds (it is left running, never signalled). A command that cannot be
         started mutated nothing: the reservation is released and Refused raised."""
         # a signal that lands while the child is being spawned waits until its group is known:
         # any thread may take it, but its handler runs here and the 'spawn' phase defers it
@@ -377,11 +455,15 @@ class Reservation:
             deferred, self.deferred = self.deferred, []
             for signum in deferred:
                 self._on_signal(signum, None)
-        next_progress = time.monotonic() + PROGRESS_EVERY
+        start = time.monotonic()
+        next_progress = start + PROGRESS_EVERY
         while True:
             done, status = os.waitpid(pid, os.WNOHANG)
             if done:
                 break
+            if bound is not None and time.monotonic() - start >= bound:
+                self.phase = 'post'
+                return None
             if time.monotonic() >= next_progress:
                 next_progress += PROGRESS_EVERY
                 try:
@@ -400,6 +482,7 @@ class Reservation:
         errors = hil_lock.end_failed(dict(zip(self.locks, self.handles)), self.reason, detail=detail,
                                      receipts=receipts, tool='hil_reserve', token=self.token)
         self.handles = []
+        self._open_admission()
         unlogged = '; '.join(f'{b}: {", ".join(e)}' for b, e in sorted(errors.items()))
         for stream in (sys.stdout, sys.stderr):
             try:
@@ -409,6 +492,20 @@ class Reservation:
             except (OSError, ValueError):
                 pass
         return 1
+
+def _not_back(label, n, got):
+    """Why the node `n` (pre-operation) is not back as `got` (its fresh sysfs look), or None."""
+    if got is None:
+        return f'{label} (serial {shown(n)}) not back: absent'
+    if n['identity'] is None:
+        # a hub without a serial stays without one
+        return f'{label} (no serial) not back: serial {got["serial"]}' if got['serial'] is not None else None
+    if got['serial'] is None:
+        return f'{label} (serial {shown(n)}) not back: serial unreadable'
+    if identity(got['serial']) != n['identity']:
+        return f'{label} (serial {shown(n)}) not back: serial {got["serial"]}'
+    return None
+
 
 def restoration_gaps(before, busport, rosters, deadline, scope='root'):
     """What keeps the subtree from counting as back: coverage from a fresh sysfs-only walk,
@@ -421,37 +518,156 @@ def restoration_gaps(before, busport, rosters, deadline, scope='root'):
     except Refused as e:                  # the target itself absent, or a node uninspectable: a gap, looked at again
         return [str(e)]
     problems = gaps(after)
-    for name, n in sorted(before.items()):
-        got = after.get(name)
-        if got is None:
-            problems.append(f'{name} (serial {shown(n)}) not back: absent')
-        elif n['identity'] is None:
-            if got['serial'] is not None:     # a hub without a serial stays without one
-                problems.append(f'{name} (no serial) not back: serial {got["serial"]}')
-        elif got['serial'] is None:
-            problems.append(f'{name} (serial {shown(n)}) not back: serial unreadable')
-        elif identity(got['serial']) != n['identity']:
-            problems.append(f'{name} (serial {shown(n)}) not back: serial {got["serial"]}')
+    problems += [p for name, n in sorted(before.items()) if (p := _not_back(name, n, after.get(name)))]
     problems += [f'{name}: new node (serial {shown(after[name])})' for name in sorted(set(after) - set(before))]
     return problems
 
 
-def cmd_run(args):
-    scope = VERB_SCOPE[args.verb]
-    rosters = load_rosters(args.roster)
-    nodes = check(args.busport, rosters, args.budget, scope)
-    if nodes[args.busport]['identity'] is None:
-        raise Refused(f'{args.busport} has no serial, in sysfs or recorded by udev, to bind the command to')
-    if args.verb == 'hub-cycle' and nodes[args.busport]['cls'] == HUB_CLASS:
-        raise Refused(f'{args.busport} is a hub: hub-cycle cycles a leaf only')
-    _subreaper()
-    res = Reservation(rosters['locks'], args.reason)
+# --- controller ----------------------------------------------------------------------------
+def controller_state(addr, deadline):
+    """The PCI function's {ids, driver}: `ids` its PCI_IDENTITY attributes, `driver` the bound
+    driver's name or None. Refused when it is absent, unreadable or not a USB controller."""
+    d = os.path.join(SYS_PCI_DEVICES, addr)
+    if not os.path.isdir(d):
+        raise Refused(f'no such pci device: {addr}')
+    ids = {a: _bounded(os.path.join(d, a), deadline) for a in PCI_IDENTITY}
+    if None in ids.values():
+        raise Refused(f'{addr}: ' + ', '.join(a for a, v in ids.items() if v is None) + ' unreadable')
+    if not ids['class'].startswith(USB_CONTROLLER_CLASS):
+        raise Refused(f'{addr} is not a USB controller (class {ids["class"]})')
+    try:
+        driver = os.path.basename(os.readlink(os.path.join(d, 'driver')))
+    except FileNotFoundError:
+        driver = None
+    except OSError as e:
+        raise Refused(f'{addr}: driver unreadable ({e.strerror})')
+    return {'ids': ids, 'driver': driver}
+
+
+def controller_walk(addr, identities, deadline, cached=True):
+    """Every bus the controller owns, as walk's nodes under their sysfs names, each with a
+    `key` that survives a renumbering: its root hub's speed and its port path (`480M-2.7`
+    for 17-2.7 under a 480 Mbps usb17). Root hubs are nodes too, covered by the controller."""
+    d = os.path.join(SYS_PCI_DEVICES, addr)
+    try:
+        entries = sorted(os.listdir(d))
+    except FileNotFoundError:
+        raise Refused(f'no such pci device: {addr}') from None
+    except OSError as e:
+        raise Refused(f'{addr}: cannot inspect ({e.strerror})')
+    nodes, speeds = {}, {}
+    for root in entries:
+        if not (m := ROOT_HUB_RE.match(root)):
+            continue
+        try:
+            ino = os.stat(os.path.join(d, root) + '/').st_ino
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            raise Refused(f'{root}: cannot inspect ({e.strerror})')
+        speed = _bounded(os.path.join(d, root, 'speed'), deadline)
+        if not speed:
+            raise Refused(f'{root}: speed unreadable, so its bus cannot be told apart across a renumbering')
+        if speed in speeds:
+            raise Refused(f'{speeds[speed]} and {root} are both {speed} Mbps root hubs of {addr}: '
+                          'their buses cannot be told apart across a renumbering')
+        speeds[speed] = root
+        nodes[root] = {'serial': None, 'udev': None, 'identity': None, 'cls': HUB_CLASS, 'ino': ino,
+                       'key': f'{speed}M', 'covered': ['controller'], 'why': ''}
+        bus = m.group(1)
+        for dev in sorted(glob.glob(os.path.join(uo.SYS_USB_DEVICES, f'{bus}-*'))):
+            name = os.path.basename(dev)
+            if not uo.BUSPORT_RE.match(name) or name.split('-')[0] != bus:
+                continue
+            if (n := _read_node(dev, name, deadline, cached)) is not None:
+                nodes[name] = dict(n, key=f'{speed}M-{name.split("-", 1)[1]}')
+    if time.monotonic() > deadline:
+        raise OverBudget('coverage check over budget: controller uninspectable')
+    return _judge(nodes, identities)
+
+
+def check_controller(addr, rosters, budget, verb=None):
+    """The controller's state and two walks of its buses within one budget; returns (state,
+    nodes) or raises Refused naming every gap. A verb also needs the driver state it acts on."""
+    deadline = time.monotonic() + budget
+    state = controller_state(addr, deadline)
+    if verb == 'pci-rebind' and state['driver'] is None:
+        raise Refused(f'no driver bound to {addr}: pci-bind attaches one')
+    if verb == 'pci-bind' and state['driver'] is not None:
+        raise Refused(f'{addr} already has a driver bound ({state["driver"]})')
+    first = controller_walk(addr, rosters['identities'], deadline)
+    second = controller_walk(addr, rosters['identities'], deadline)
+    if snapshot(first) != snapshot(second) or controller_state(addr, deadline) != state:
+        raise Refused('the controller changed during the check')
+    bad = gaps(second)
+    if bad:
+        raise Refused(f'uncovered on controller {addr}:\n  ' + '\n  '.join(bad))
+    return state, second
+
+
+def host_locks(rosters):
+    """Every roster's locks and every lock name already on the host: a dead controller hides
+    the boards it reaches, so no topology can show a roster missing from the list."""
+    try:
+        return sorted(set(rosters['locks']) | set(hil_lock.lock_names()))
+    except OSError as e:
+        raise Refused(f'{hil_lock.BOARD_LOCK_DIR}: {e}')
+
+
+def bus_map(before, after):
+    """'17 -> 1 (480M), 18 -> 2 (5000M)': each root hub's bus before the operation and now,
+    `-` for none before, `gone` for none now."""
+    def buses(nodes):
+        return {n['key']: name[len('usb'):] for name, n in nodes.items() if ROOT_HUB_RE.match(name)}
+    was, now = buses(before), buses(after)
+    return ', '.join(f'{was.get(k, "-")} -> {now.get(k, "gone")} ({k})'
+                     for k in sorted(set(was) | set(now), key=lambda k: (len(k), k)))   # 480M before 5000M
+
+
+def controller_gaps(state, before, addr, rosters, deadline, seen):
+    """What keeps the controller from counting as back: its PCI identity unchanged, a driver
+    bound (pci-rebind: the same one), a bus registered, every pre-operation node back under
+    its key, and everything now on its buses covered. A node new since is no gap when
+    covered: a dead controller's fixtures come back with it. `seen['after']` keeps the last
+    complete walk."""
+    try:
+        now = controller_state(addr, deadline)
+    except OverBudget:
+        raise
+    except Refused as e:
+        return [str(e)]
+    problems = []
+    if now['ids'] != state['ids']:
+        problems.append(f'{addr}: PCI identity changed: ' + ', '.join(
+            f'{a} {state["ids"][a]} -> {now["ids"][a]}' for a in PCI_IDENTITY if now['ids'][a] != state['ids'][a]))
+    if now['driver'] is None:
+        return problems + [f'{addr}: no driver bound (stranded; pci-bind attaches one)']
+    if state['driver'] is not None and now['driver'] != state['driver']:
+        problems.append(f'{addr}: bound to {now["driver"]}, was {state["driver"]}')
+    try:
+        after = controller_walk(addr, rosters['identities'], deadline, cached=False)
+    except OverBudget:
+        raise
+    except Refused as e:
+        return problems + [str(e)]
+    seen['after'] = after
+    if not any(ROOT_HUB_RE.match(name) for name in after):
+        problems.append(f'{addr}: no bus registered')
+    problems += gaps(after)
+    by_key = {n['key']: n for n in after.values()}
+    problems += [p for name, n in sorted(before.items())
+                 if (p := _not_back(f'{name} ({n["key"]})', n, by_key.get(n['key'])))]
+    return problems
+
+
+# --- run -----------------------------------------------------------------------------------
+def _hold(res, recheck):
+    """Take every lock, then `recheck()` (raising Refused) before anything is mutated, and
+    show each board's open cleanup failures."""
     res.install_signals()
     res.acquire()
     try:
-        again = check(args.busport, rosters, args.budget, scope)
-        if snapshot(again) != snapshot(nodes):
-            raise Refused('the subtree changed between the check and the hold')
+        recheck()
     except Refused:
         res.release()
         raise
@@ -460,48 +676,141 @@ def cmd_run(args):
             more = f' ({len(failures) - 1} earlier still open)' if len(failures) > 1 else ''
             print(f'hil_reserve: {lock}: an earlier task\'s cleanup failed: {hil_lock.failure_text(failures[-1])}{more}',
                   flush=True)
-    target = again[args.busport]      # the latest look: a raw sysfs serial over the udev form the script would refuse
-    argv = ['sudo', '-n', RECOVER_SCRIPT, args.verb, args.busport, target['serial'] or target['udev']]
-    print('hil_reserve: holding ' + ' '.join(res.locks) + '\nhil_reserve: ' + ' '.join(argv), flush=True)
-    rc = res.run(argv)
-    deadline = time.monotonic() + args.budget      # one deadline for everything that follows the command
+
+
+def _outcome(res, verb, argv, rc, budget, unchanged, look, failed_note=None):
+    """After the command: exit 0 with every lock released when it exited 0, left no survivor
+    and `look(deadline)` (restoration gaps, retried until the budget is spent) found none;
+    Refused when it refused before writing (exit 3) and `unchanged()` holds; else the blocker,
+    a failed exit followed by `failed_note(rc)` when given."""
+    deadline = time.monotonic() + budget      # one deadline for everything that follows the command
     problems, unproven = [], []
-    if rc != 0:
+    if rc is None:
+        problems.append(f'command still running after {CONTROLLER_COMMAND_BUDGET:g} s')
+    elif rc != 0:
         problems.append(f'command exited {rc}')
+        if failed_note and (note := failed_note(rc)):
+            problems.append(note)
     left = survivors(res.pgid)
     if left:
         problems.append(f'surviving pids {left}')
         # a survivor has no receipt to recheck: the marker keeps its logged failure open (resolve_restored)
         unproven.append({'unrecheckable': argv, 'survivors': left})
     if rc == REFUSED_UNWRITTEN and not left:
-        # the script refused before its first write: proven only if the subtree is unchanged
+        # the script refused before its first write: proven only if what it reaches is unchanged
         try:
-            unchanged = snapshot(check(args.busport, rosters, args.budget, scope)) == snapshot(nodes)
+            same = unchanged()
         except Refused:
-            unchanged = False
-        if unchanged and not res.noted:
+            same = False
+        if same and not res.noted:
             res.release()
-            raise Refused(f'{args.verb} refused before writing anything (its message above); locks released')
+            raise Refused(f'{verb} refused before writing anything (its message above); locks released')
     try:
-        gaps_left = restoration_gaps(nodes, args.busport, rosters, deadline, scope)
+        gaps_left = look(deadline)
     except OverBudget as e:
         gaps_left = [str(e)]
-    while gaps_left and (left := deadline - time.monotonic()) > 0:
-        time.sleep(min(RESTORE_POLL, left))
+    while gaps_left and (remaining := deadline - time.monotonic()) > 0:
+        time.sleep(min(RESTORE_POLL, remaining))
         try:
-            gaps_left = restoration_gaps(nodes, args.busport, rosters, deadline, scope)
+            gaps_left = look(deadline)
         except OverBudget:
             break                                   # mid-look: the last complete look stands
     if gaps_left:
-        gaps_left.append(f'not restored within {args.budget:g} s')
+        gaps_left.append(f'not restored within {budget:g} s')
     problems += gaps_left
     problems = res.noted + problems       # noted last: a signal can land during the reconciliation
     if problems:
         return res.end_blocked(problems, unproven)
     res.release()
-    print(f'hil_reserve: released {len(res.locks)} lock(s); {len(nodes)} node(s) back under '
-          f'{SCOPE_NAME[scope]} {top(args.busport, scope)}')
     return 0
+
+
+def cmd_run(args):
+    scope, busport = VERB_SCOPE[args.verb], args.target
+    if scope == 'controller':
+        return cmd_run_controller(args)
+    rosters = load_rosters(args.roster)
+    nodes = check(busport, rosters, args.budget, scope)
+    if nodes[busport]['identity'] is None:
+        raise Refused(f'{busport} has no serial, in sysfs or recorded by udev, to bind the command to')
+    if args.verb == 'hub-cycle' and nodes[busport]['cls'] == HUB_CLASS:
+        raise Refused(f'{busport} is a hub: hub-cycle cycles a leaf only')
+    _subreaper()
+    res = Reservation(rosters['locks'], args.reason)
+    seen = {}
+
+    def recheck():
+        seen['again'] = check(busport, rosters, args.budget, scope)
+        if snapshot(seen['again']) != snapshot(nodes):
+            raise Refused('the subtree changed between the check and the hold')
+    _hold(res, recheck)
+    target = seen['again'][busport]   # the latest look: a raw sysfs serial over the udev form the script would refuse
+    argv = ['sudo', '-n', RECOVER_SCRIPT, args.verb, busport, target['serial'] or target['udev']]
+    print('hil_reserve: holding ' + ' '.join(res.locks) + '\nhil_reserve: ' + ' '.join(argv), flush=True)
+    rc = res.run(argv)
+    status = _outcome(res, args.verb, argv, rc, args.budget,
+                      lambda: snapshot(check(busport, rosters, args.budget, scope)) == snapshot(nodes),
+                      lambda deadline: restoration_gaps(nodes, busport, rosters, deadline, scope))
+    if status == 0:
+        print(f'hil_reserve: released {len(res.locks)} lock(s); {len(nodes)} node(s) back under '
+              f'{SCOPE_NAME[scope]} {top(busport, scope)}')
+    return status
+
+
+def cmd_run_controller(args):
+    addr = args.target
+    rosters = load_rosters(args.roster)
+    state, nodes = check_controller(addr, rosters, args.budget, args.verb)
+    _subreaper()
+    try:
+        hil_lock.ensure_lock_files(rosters['locks'])     # before admission closes, which refuses even our creates
+        admission = hil_lock.close_admission()
+    except (hil_lock.BoardLocked, hil_lock.LockUnavailable, OSError) as e:
+        raise Refused(f'lock admission: {e}')
+    try:
+        locks = host_locks(rosters)
+    except Refused:
+        admission.close()
+        raise
+    res = Reservation(locks, args.reason, forward=False, admission=admission)
+
+    def unchanged():
+        again_state, again = check_controller(addr, rosters, args.budget, args.verb)
+        return again_state == state and snapshot(again) == snapshot(nodes)
+
+    def recheck():
+        if not unchanged():
+            raise Refused('the controller changed between the check and the hold')
+        if created := sorted(set(host_locks(rosters)) - set(locks)):     # by a helper older than ADMISSION
+            raise Refused('lock(s) created during the hold, so not held: ' + ' '.join(created))
+    _hold(res, recheck)
+    argv = ['sudo', '-n', RECOVER_SCRIPT, args.verb, addr]
+    extra = sorted(set(locks) - set(rosters['locks']))
+    print('hil_reserve: holding ' + ' '.join(res.locks)
+          + (f'\nhil_reserve: of them in no roster given: {" ".join(extra)}' if extra else '')
+          + '\nhil_reserve: ' + ' '.join(argv), flush=True)
+    rc = res.run(argv, bound=CONTROLLER_COMMAND_BUDGET)
+    seen = {}
+
+    def stale_helper(rc):
+        """An exit 1 with nothing changed is what a helper older than its pci exit 3 gives for a
+        refusal before the unbind: still a blocker, since nothing proves which it was."""
+        try:
+            same = rc == 1 and unchanged()
+        except Refused:
+            same = False
+        return (f'the controller is unchanged: if {RECOVER_SCRIPT} predates exit 3 for pci refusals '
+                f'(agentrc#236; refresh the root-owned copy with hil-farm-setup), this was a refusal '
+                f'before the unbind') if same else None
+    status = _outcome(res, args.verb, argv, rc, args.budget, unchanged,
+                      lambda deadline: controller_gaps(state, nodes, addr, rosters, deadline, seen), stale_helper)
+    if 'after' in seen:
+        print(f'hil_reserve: controller {addr} buses: {bus_map(nodes, seen["after"]) or "none"}; '
+              're-derive every busport on them', flush=True)
+    if status == 0:
+        print(f'hil_reserve: released {len(res.locks)} lock(s); controller {addr} back, '
+              f'{len(seen["after"])} node(s) on its buses')
+    return status
 
 
 def main(argv=None):
@@ -513,22 +822,30 @@ def main(argv=None):
         p.add_argument('--budget', type=float, default=DEFAULT_BUDGET, help='seconds for the coverage walk')
 
     p_check = sub.add_parser('check')
-    p_check.add_argument('busport')
+    p_check.add_argument('target', metavar='busport|pciaddr')
     p_check.add_argument('--scope', choices=sorted(SCOPE_NAME), default='root',
-                         help='what the coverage walk spans: the root port (default) or the parent hub')
+                         help='what the coverage walk spans: the root port (default), the parent hub, '
+                              'or every bus of the controller at a PCI address')
     add_roster_args(p_check)
     p_run = sub.add_parser('run')
     p_run.add_argument('verb', choices=sorted(VERB_SCOPE))
-    p_run.add_argument('busport')
+    p_run.add_argument('target', metavar='busport|pciaddr')
     p_run.add_argument('--reason', required=True)
     add_roster_args(p_run)
     args = ap.parse_args(argv)
+    scope = args.scope if args.cmd == 'check' else VERB_SCOPE[args.verb]
     try:
-        if not uo.BUSPORT_RE.match(args.busport):
-            ap.error(f'bad busport: {args.busport}')
+        if scope == 'controller' and not PCI_RE.match(args.target):
+            ap.error(f'bad pci address: {args.target}')
+        if scope != 'controller' and not uo.BUSPORT_RE.match(args.target):
+            ap.error(f'bad busport: {args.target}')
         if args.cmd == 'check':
             rosters = load_rosters(args.roster)
-            print(describe(rosters, check(args.busport, rosters, args.budget, args.scope)))
+            if scope == 'controller':
+                state, nodes = check_controller(args.target, rosters, args.budget)
+                print(describe_controller(args.target, state, rosters, nodes))
+            else:
+                print(describe(rosters, check(args.target, rosters, args.budget, scope)))
             return 0
         return cmd_run(args)
     except Refused as e:

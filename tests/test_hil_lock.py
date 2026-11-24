@@ -438,6 +438,48 @@ class Contention(LockDir):
                 journal.unlink(missing_ok=True)
 
 
+class Admission(LockDir):
+    """close_admission: while held, no new lock file is created (AdmissionClosed, contention a
+    board task waits out), an existing board locks as ever, and creates resume once it closes."""
+
+    def test_a_new_name_is_refused_while_admission_is_closed_and_an_existing_one_is_not(self):
+        hil_lock.ensure_lock_files([BOARD])
+        self.assertEqual(hil_lock.lock_names(), [BOARD])
+        self.assertTrue(self.flock_is_free())
+        adm = hil_lock.close_admission()
+        with self.assertRaisesRegex(hil_lock.AdmissionClosed, '^board locked: newboard has no lock file yet') as cm:
+            hil_lock.acquire_board_lock('newboard', reason='selftest')
+        self.assertIsInstance(cm.exception, hil_lock.BoardLocked)
+        with self.assertRaises(hil_lock.AdmissionClosed):
+            hil_lock.ensure_lock_files(['newboard'])
+        self.assertIsNotNone(self.acquire())               # an existing lock file needs no admission
+        with redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(hil_lock.cmd_release(['newboard']), 1)
+        self.assertIn('no new lock name is admitted', err.getvalue())
+        self.assertEqual(hil_lock.lock_names(), [BOARD])
+        adm.close()
+        hil_lock.acquire_board_lock('newboard', reason='selftest').close()
+        self.assertEqual(hil_lock.lock_names(), [BOARD, 'newboard'])
+
+    def test_a_board_task_waits_out_a_closed_admission(self):
+        adm = hil_lock.close_admission()
+        threading.Timer(0.3, adm.close).start()
+        with hil_lock.board_task(BOARD, 'selftest run', busy=lambda: [], wait=5) as task:
+            self.assertTrue(task.taken)
+
+    def test_a_second_closer_or_a_creator_mid_create_is_waited_for_then_refused(self):
+        adm = hil_lock.close_admission()
+        t0 = time.monotonic()
+        with self.assertRaisesRegex(hil_lock.LockUnavailable, r'\.admission\.mutex still shared after 0\.2 s'):
+            hil_lock.close_admission(wait=0.2)
+        self.assertGreaterEqual(time.monotonic() - t0, 0.2)
+        adm.close()
+        with open(os.path.join(self.dir, hil_lock.ADMISSION), 'r+') as creator:
+            fcntl.flock(creator, fcntl.LOCK_SH | fcntl.LOCK_NB)      # a creator between its create and its close
+            threading.Timer(0.2, creator.close).start()
+            hil_lock.close_admission(wait=5).close()
+
+
 class CleanupHolder(LockDir):
     def setUp(self):
         super().setUp()
@@ -1939,7 +1981,8 @@ class CleanupLog(LockDir):
     def test_a_reader_waits_for_an_append_and_creates_nothing(self):
         fh = self.acquire()
         self.assertIsNone(taken_failure(fh))
-        self.assertEqual(sorted(os.listdir(self.dir)), [BOARD + '.lock'], 'a read without a log creates nothing')
+        self.assertEqual(sorted(os.listdir(self.dir)), [hil_lock.ADMISSION, BOARD + '.lock'],    # the lock file's create
+                         'a read without a log creates nothing')
         hil_lock.release_board_lock(fh)
         real, seen = hil_lock._read_file, []
 
