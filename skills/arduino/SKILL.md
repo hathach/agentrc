@@ -69,6 +69,13 @@ retries, recovery) apply unchanged; these scripts load its `hil_*` scripts throu
 - **DUT identity**: the roster `uid` is the DUT's USB serial; `usb_port` additionally pins its bus port. `no_serial`
   (with `usb_port`) is for firmware that reports no serial (ESP32 under Arduino): the serial-less device at that port.
   `hil_test.py commission` finds and confirms either under the restoration sketch.
+- **Identity per USB stack**: an ESP32-S3's TinyUSB and USB-Serial/JTAG share one PHY and bus port but report
+  different serials, so a roster `uids` (`{"<USBMode option>": "<serial>"}`, distinct serials, `uid` among them, no
+  `no_serial`) gives each; admission picks the one a sketch's recorded FQBN `USBMode` names and refuses an image it
+  names none for. Without `uids`, `uid` identifies only images built with the rig FQBN's `USBMode`; another is
+  refused. Each serial is the one observed on the board under that image, never derived from another. An
+  `openocd-esp32` debug route on the DUT's own `usb_port` needs a `uids` entry naming its `debug.uid`, and `gdb`
+  refuses a sketch whose image enumerates as another; a route on a port of its own (the P4's) runs under any image.
 - **Probe detach**: before a flash or console reset through an openocd flasher whose args name `target/rp2040.cfg`
   or `target/rp2350.cfg`, the engine clears the USB pull-up so the host sees the new image enumerate. A console
   reset, with no record's VID:PID and no roster `usb_port`, waits only on the ports carrying the DUT's serial before

@@ -10,9 +10,10 @@ one supported mutation, after a coverage check of what the operation reaches.
 
 A roster is a project's HIL roster JSON (`boards` and `boards-skip`; a parked board is still
 on the hub). An entry with `probe` locks as its registered board's name, any other as its
-own `name` (hil_boards.lock_name). Identities are every `uid`, `uart_uid` and
-`serial` string in an entry outside its `dev_attached` lists (devices on the board's own USB host
-port, which this host never sees, some with serials as weak as "0"), compared in the form udev's
+own `name` (hil_boards.lock_name). Identities are every `uid`, `uart_uid` and `serial` string and
+every value of a `uids` map (the serial each image enumerates with) in an entry outside its
+`dev_attached` lists (devices on the board's own USB host port, which this host never sees, some
+with serials as weak as "0"), compared in the form udev's
 usb_id gives a serial (whitespace runs and unsafe characters as `_`), case-insensitively; two
 roster identities that become one that way are refused. The contract's Hosts/rosters is the roster list: the check refuses what
 the rosters do not explain, it never infers an inventory.
@@ -126,6 +127,7 @@ hil_boards = hil_load.load_file('skills/hil/scripts/hil_boards.py')
 LOCK_NAME_RE = hil_boards.LOCK_NAME_RE
 UDEV_UNSAFE_RE = re.compile(r'[^A-Za-z0-9#+.:=@_-]')   # what usb_id turns into '_' after whitespace runs
 IDENTITY_KEYS = ('uid', 'uart_uid', 'serial')
+IMAGE_UIDS = 'uids'       # {image: the serial it enumerates with}: each value is the DUT's identity (arduino_hil)
 HUB_CLASS = '09'
 VERB_SCOPE = {'root-cycle': 'root', 'hub-cycle': 'hub', 'pci-rebind': 'controller', 'pci-bind': 'controller'}
 SCOPE_NAME = {'root': 'root port', 'hub': 'hub', 'controller': 'controller'}
@@ -171,6 +173,8 @@ def _identities(obj, out):
         for k, v in obj.items():
             if k in IDENTITY_KEYS and isinstance(v, str) and v.strip():
                 out.add(v.strip().lower())
+            elif k == IMAGE_UIDS and isinstance(v, dict):
+                out.update(s.strip().lower() for s in v.values() if isinstance(s, str) and s.strip())
             elif k != 'dev_attached':
                 _identities(v, out)
     elif isinstance(obj, list):
@@ -181,8 +185,8 @@ def _identities(obj, out):
 def load_rosters(paths):
     """[roster file] -> {'locks': sorted lock names, 'identities': {identity: {locks}}}.
     Each entry is resolved through agentrc's board registry (hil_boards), so its probe serial is an
-    identity too, and a registered board's lock is the registry's. A DUT uid under two lock names
-    is a conflict; any other identity may serve several."""
+    identity too, and a registered board's lock is the registry's. A DUT uid, any image's `uids`
+    serial included, under two lock names is a conflict; any other identity may serve several."""
     locks, ids, duts, raw_of = set(), {}, {}, {}
     for path in paths:
         try:
@@ -204,9 +208,11 @@ def load_rosters(paths):
             except ValueError as err:
                 raise Refused(f'roster {path}: {err}')
             locks.add(lock)
-            uid = e['uid'].strip().lower()
-            if duts.setdefault(uid, lock) != lock:
-                raise Refused(f'uid {uid} names two boards: {duts[uid]} and {lock}')
+            dut = set()
+            _identities({'uid': e['uid'], IMAGE_UIDS: e.get(IMAGE_UIDS)}, dut)
+            for uid in sorted(dut):
+                if duts.setdefault(uid, lock) != lock:
+                    raise Refused(f'uid {uid} names two boards: {duts[uid]} and {lock}')
             found = set()
             _identities(e, found)
             for raw in found:

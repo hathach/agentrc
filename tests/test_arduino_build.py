@@ -1793,6 +1793,10 @@ class NamedBuilds(Lib):
         self.assertTrue(ab.eligible('rig_m4', 'core_cdc_tusb2'))
         self.assertFalse(ab.eligible('m4', 'core_cdc_tusb2'))   # a rig board's HIL build only
         self.assertEqual(ab.with_options('v:a:b', 'x=1'), 'v:a:b:x=1')
+        self.assertEqual(ab.menus('v:a:b:x=1,y=a=b:c'), {'x': '1', 'y': 'a=b:c'})
+        for fqbn_, options in (('v:a:b:x', 'y=1'), ('v:a:b', 'x=1,y')):
+            with self.subTest(fqbn=fqbn_, options=options), self.assertRaisesRegex(ValueError, 'have no "="'):
+                ab.with_options(fqbn_, options)
 
     def test_a_change_to_the_source_builds_every_name(self):
         sel = ab.select(['test/hil/core_cdc/core_cdc.ino'], roster=['rig_m4'])

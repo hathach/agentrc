@@ -329,6 +329,20 @@ class Rosters(Fixture):
         with self.assertRaisesRegex(hr.Refused, 'uid x1 names two boards: a and b'):
             hr.load_rosters([str(bad)])
 
+    def test_every_image_uid_is_a_dut_identity_and_conflicts_across_boards(self):
+        roster = Path(self.td.name) / 'r.json'
+        esp = {'name': 'esp', 'uid': 'primary-serial', 'uids': {'hwcdc': 'primary-serial', 'default': 'alternate-serial'},
+               'flasher': {'name': 'esptool', 'uid': 'pa'}}
+        roster.write_text(json.dumps({'boards': [esp]}))
+        got = hr.load_rosters([str(roster)])
+        self.assertEqual(got['identities'], {'primary-serial': {'esp'}, 'alternate-serial': {'esp'}, 'pa': {'esp'}})
+        self.dev('3-1.4', serial='alternate-serial')         # the other image's enumeration
+        self.assertEqual(hr.walk('3-1.4', got['identities'], time.monotonic() + 5)['3-1.4']['covered'], ['esp'])
+        other = {'name': 'other', 'uid': 'Alternate-Serial', 'flasher': {'name': 'jlink', 'uid': 'pb'}}
+        roster.write_text(json.dumps({'boards': [esp, other]}))
+        with self.assertRaisesRegex(hr.Refused, 'uid alternate-serial names two boards: esp and other'):
+            hr.load_rosters([str(roster)])
+
     def test_a_registered_board_is_one_lock_whatever_each_roster_calls_it(self):
         probe, entry = next(iter(hr.hil_boards.registry().items()))
         a, b = Path(self.td.name) / 'a.json', Path(self.td.name) / 'b.json'

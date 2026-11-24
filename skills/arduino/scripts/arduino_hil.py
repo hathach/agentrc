@@ -95,6 +95,9 @@ STEP_MAX = VERIFY_TIMEOUT + DETACH_WAIT + FLASH_TIMEOUT + VERIFY_TIMEOUT + ENUM_
 CLEANUP_RESERVE = STEP_MAX   # the restore is one more such step
 BASE_MAX = 2 * VERIFY_TIMEOUT   # a base image's check and rewrite before a flash (ensure_base), added per step
 PENDING_KIND = 'arduino-hil'   # an older engine's pending-session record, every Arduino library's
+# The FQBN menu whose option picks a roster `uids` identity: an ESP32 core's USB stack, TinyUSB on the OTG or the
+# USB-Serial/JTAG, which share the S3's one internal PHY (ESP32-S3 TRM 33.3.1, 33.4.1) and report different serials
+IDENTITY_MENU = 'USBMode'
 
 
 def _hil_load():
@@ -198,6 +201,16 @@ def load_roster(path):
         if flasher == 'esptool' and 'usb_port' not in b:
             # Arduino on ESP32 enumerates without an iSerial: the DUT is the device at its port
             raise Refused(f'roster {path}: {name}: an esptool board needs usb_port')
+        uids = b.get('uids')
+        if uids is not None:
+            if not (isinstance(uids, dict) and uids and
+                    all(isinstance(k, str) and k and isinstance(v, str) and v.strip() for k, v in uids.items())):
+                raise Refused(f'roster {path}: {name}: uids maps each {IDENTITY_MENU} option to the serial its image '
+                              f'enumerates with')
+            serials = [v.lower() for v in uids.values()]
+            if b.get('no_serial') or len(set(serials)) != len(serials) or b['uid'].lower() not in serials:
+                raise Refused(f'roster {path}: {name}: uids must name distinct serials, uid among them, and no '
+                              f'no_serial')
         dbg = b.get('debug', {})
         if not isinstance(dbg, dict):
             raise Refused(f'roster {path}: {name}: debug must be an object, or absent for no GDB route')
@@ -212,6 +225,9 @@ def load_roster(path):
             # the USB-Serial/JTAG is pinned by its bus-port, never by vid_pid
             raise Refused(f'roster {path}: {name}: an openocd-esp32 debug route is "-f board/{chip}-builtin.cfg", '
                           f'debug.uid and debug.usb_port (its bus-port), with no vid_pid')
+        if dut_port_debug_mode(b) == '':
+            raise Refused(f'roster {path}: {name}: a debug route on the DUT\'s own usb_port needs a uids entry '
+                          f'naming debug.uid, the image identity it enumerates under')
         if getattr(P, 'check_board', None):
             P.check_board(name, b, path)
     return boards
@@ -306,7 +322,7 @@ def record_problems(rec, board, head, experimental_ok, where):
 
 def admit(record_path, board, roster_path, run_dir, *, manifest=None, experimental_ok=False, base=None):
     """The record's images (checkout-relative paths, under `base` for a staged bundle) copied into the run dir once
-    they hash as recorded, or Refused."""
+    they hash as recorded, each with the DUT identity its FQBN picks (`uid`, image_uid), or Refused."""
     try:
         rec = json.loads(Path(record_path).read_text())
     except (OSError, ValueError) as e:
@@ -325,7 +341,8 @@ def admit(record_path, board, roster_path, run_dir, *, manifest=None, experiment
         raise Refused(f'the checkout has changes since the record: {status.splitlines()[:5]}')
     if B.sha256(roster_path) != rec['roster']['sha256']:
         raise Refused(f'{roster_path} changed since the record was built: rebuild it')
-    flasher = load_roster(roster_path)[board]['flasher']['name']
+    entry = load_roster(roster_path)[board]
+    flasher = entry['flasher']['name']
     want = B.IMAGE_KIND[flasher]
     if rec.get('role', 'device') != role(board):
         raise Refused(f'{record_path}: a {rec.get("role", "device")} record, {board} is a {role(board)} board')
@@ -337,10 +354,11 @@ def admit(record_path, board, roster_path, run_dir, *, manifest=None, experiment
         dest = Path(run_dir) / 'images' / name
         for rel, digest in s['sha256'].items():
             pinned_copy(Path(base or P.ROOT) / rel, digest, dest / Path(rel).name, rel)
+        fqbn = s.get('fqbn', rec['fqbn'])
         images[name] = {'elf': str(dest / Path(s['elf']).name),
                         'hex': str(dest / Path(s['hex']).name) if s.get('hex') else None,
-                        'vidPid': s['vidPid'], 'sha256': s['sha256'], 'dir': str(dest),
-                        'fqbn': s.get('fqbn', rec['fqbn']),
+                        'vidPid': s['vidPid'], 'sha256': s['sha256'], 'dir': str(dest), 'fqbn': fqbn,
+                        'uid': image_uid(board, entry, fqbn),
                         'segments': s.get('segments'), 'chip': rec.get('chip')}
     if rec.get('base'):
         base_image = admit_base(rec, board, Path(base or P.ROOT), Path(run_dir))
@@ -610,11 +628,51 @@ def no_serial(dev):
     return gone and A.usb.enumeration_id(dev['dir']) == dev['ino']
 
 
+def identity_option(fqbn):
+    """The FQBN's IDENTITY_MENU option, None when it sets none; Refused for a malformed option."""
+    try:
+        return B.menus(fqbn).get(IDENTITY_MENU)
+    except ValueError as e:
+        raise Refused(str(e)) from None
+
+
+def dut_port_debug_mode(board):
+    """For an openocd-esp32 debug route on the DUT's own usb_port, the uids option whose image enumerates as debug.uid
+    ('' when uids names none, which load_roster refuses); None for a route elsewhere or none."""
+    dbg = board.get('debug', {})
+    if dbg.get('tool') != 'openocd-esp32' or dbg['usb_port'] != board.get('usb_port'):
+        return None
+    return next((m for m, u in (board.get('uids') or {}).items() if u.lower() == dbg['uid'].lower()), '')
+
+
+def image_uid(name, board, fqbn):
+    """The serial an image built with `fqbn` enumerates with: the roster `uids` entry its IDENTITY_MENU option names,
+    else the roster `uid`, which is the identity under the rig FQBN's option only; Refused when the roster names
+    none for it. Each identity is observed on the board, never derived from another."""
+    mode = identity_option(fqbn)
+    named = f'{IDENTITY_MENU}={mode}' if mode else f'no {IDENTITY_MENU}'
+    uids = board.get('uids')
+    if uids is None:
+        if mode == identity_option(B.P.BOARDS[name]['fqbn']):
+            return board['uid']
+        raise Refused(f'{name}: {fqbn} builds {named}, not the rig FQBN\'s, under which the roster uid is the '
+                      f'identity: give the board uids, the serial each {IDENTITY_MENU} enumerates with')
+    if mode not in uids:
+        raise Refused(f'{name}: roster uids names no identity for {named} ({fqbn}): add the serial that image '
+                      f'enumerates with, observed on the board')
+    return uids[mode]
+
+
+def imaged(board, image):
+    """The roster entry as the DUT runs `image`: its `uid` the one admit() picked for the image."""
+    return {**board, 'uid': image['uid']}
+
+
 def dut_devices(vid_pid, board):
     """The DUT's enumerations with this VID:PID. Two independent roster settings: `no_serial` (the firmware reports
     none: ESP32 under Arduino) picks the serial-less device at `usb_port` (an ESP32-S3's ROM USB-Serial/JTAG,
     303a:1001 with its MAC as serial, shows at the same port while esptool runs); otherwise the serial must be the
-    roster uid, and a `usb_port` must hold it too."""
+    `uid` (the image's under imaged()), and a `usb_port` must hold it too."""
     if board.get('no_serial'):
         return [d for d in devices(vid_pid) if d['busport'] == board['usb_port'] and no_serial(d)]
     found = scan(vid_pid, board['uid'])
@@ -733,7 +791,7 @@ def step(name, board, image, test, run_dir, tracker):
         tracker.check()
         return row
     started = time.monotonic()
-    vid_pid = image['vidPid']
+    vid_pid, board = image['vidPid'], imaged(board, image)
     why, detached, dev = flash_and_enumerate(name, board, image, run_dir, tracker)
     if why:
         return {'test': test, 'pass': False, 'detail': why, 'detach': detached, **base_state(image)}
@@ -1600,6 +1658,12 @@ def op_gdb(args, board, run_dir, tracker, manifest):
     if not board.get('debug', {}).get('openocd'):
         raise Refused(f'{args.board} has no debug.openocd in {args.roster}')
     meta, image, _ = admit_sketch(args, args.sketch, run_dir, manifest, True)
+    dbg, uid, mode = board['debug'], image['uid'], dut_port_debug_mode(board)
+    if mode is not None and uid.lower() != dbg['uid'].lower():
+        # the DUT's own port: its USB-Serial/JTAG is there only while an image on that stack runs
+        raise Refused(f'{args.board}: its debug route is the USB-Serial/JTAG {dbg["uid"]} on the DUT\'s own usb_port '
+                      f'{dbg["usb_port"]}, there only under a {IDENTITY_MENU}={mode} image; {args.sketch} is built '
+                      f'{image["fqbn"]} and enumerates as {uid}')
     try:
         argv = gdb_argv(args.board, board, image['elf'], args.ex)
     except (ValueError, RuntimeError) as e:
@@ -1659,6 +1723,7 @@ def op_check(args, board, run_dir, tracker, manifest):
         raise Refused(f'{args.board} is a host board: read its console')
     test = args.test or P.RESTORE_TEST['device']
     meta, image, _ = admit_sketch(args, P.TESTS[test], run_dir, manifest, True)
+    board = imaged(board, image)
     devs = dut_devices(image['vidPid'], board)
     if len(devs) != 1:
         return {**meta, 'test': test, 'pass': False,
@@ -1685,6 +1750,7 @@ def flash_only(name, board, image, run_dir, tracker):
         why = flash(board['flasher'], image, run_dir, tracker)
         return {'pass': not why, 'detail': why or f'flashed {what} (a host board: read its console)',
                 **base_state(image)}
+    board = imaged(board, image)
     why, detached, dev = flash_and_enumerate(name, board, image, run_dir, tracker)
     if why:
         return {'pass': False, 'detail': why, 'detach': detached, **base_state(image)}
@@ -1764,6 +1830,8 @@ def commission(args, board, run_dir, tracker, out, ledger):
             out['previousPending'] = why
         _, images = admit(Path(args.record_dir) / f'{args.board}.build.json', args.board, args.roster, run_dir)
         image = images[restore_sketch(args.board)]
+        board = imaged(board, image)
+        out['rosterUid'] = board['uid']
         observed = []
         for action in ('flash', 'reset'):
             before = enumerated(image['vidPid'])

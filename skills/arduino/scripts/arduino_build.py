@@ -279,12 +279,20 @@ def fqbn(board, example):
     return with_options(base, options) if options else base
 
 
+def menus(fqbn_):
+    """{menu: option} of an FQBN's `vendor:arch:board:k=v,...` options; ValueError for an option with no `=`."""
+    options = [o for o in ':'.join(fqbn_.split(':')[3:]).split(',') if o]
+    bad = [o for o in options if '=' not in o]
+    if bad:
+        raise ValueError(f'{fqbn_}: menu options {bad} have no "="')
+    return dict(o.split('=', 1) for o in options)
+
+
 def with_options(fqbn_, options):
     """`fqbn_` with the menu options `k=v,...` set, each replacing the same menu's value or appended."""
-    parts = fqbn_.split(':')
-    menus = dict(o.split('=', 1) for o in ':'.join(parts[3:]).split(',') if o)
-    menus.update(o.split('=', 1) for o in options.split(',') if o)
-    return ':'.join(parts[:3]) + ':' + ','.join(f'{k}={v}' for k, v in menus.items())
+    base = ':'.join(fqbn_.split(':')[:3])
+    merged = {**menus(fqbn_), **menus(f'{base}:{options}')}
+    return base + ':' + ','.join(f'{k}={v}' for k, v in merged.items())
 
 
 # ---- selection
