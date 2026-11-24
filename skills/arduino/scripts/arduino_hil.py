@@ -77,8 +77,10 @@ NOT_HELD = 3   # a readable holder record shows no live hold under the caller's 
 RELEASE_FAILED = 5   # restore --release: the hold may still stand
 RESTORE_FAILED = 6   # restore --release: the restore failed or was refused, the hold released
 GDB_SERVER = ['-c', 'gdb port pipe', '-c', 'gdb memory_map disable', '-c', 'gdb breakpoint_override hard']
-# An RP2040 SMP resume restores core1 only after each core is polled (target-debug gdb.md, verified on the Pico)
-GDB_DETACH_RESUME = {'target/rp2040.cfg': '{ foreach u [target names] { $u arp_poll }; resume }'}   # by debug cfg
+# An RP2040/RP2350 SMP resume restores core1 only after each core is polled (target-debug gdb.md; verified on the
+# Pico and Pico 2: rp2350.cfg makes cm0/cm1 an smp pair by default, and a bare resume left cm1 halted)
+SMP_DETACH_RESUME = '{ foreach u [target names] { $u arp_poll }; resume }'
+GDB_DETACH_RESUME = {'target/rp2040.cfg': SMP_DETACH_RESUME, 'target/rp2350.cfg': SMP_DETACH_RESUME}   # by debug cfg
 # Espressif's gdb per chip whose datasheet names its core, Xtensa or RISC-V (hil-farm-setup farm.toml installs them):
 # gdb-multiarch has no Xtensa ESP target
 ESP_GDB = {'esp32': 'xtensa-esp32-elf-gdb', 'esp32s2': 'xtensa-esp32s2-elf-gdb', 'esp32s3': 'xtensa-esp32s3-elf-gdb',

@@ -75,7 +75,8 @@ gdb connect also removes every breakpoint and watchpoint (`gdb_server.c` in 0.12
 started with `-singlerun` exits at the detach, and its close restarts the core unless
 `monitor exec SetRestartOnClose = 0` came first (the J-Link close behaviour in `techniques.md`, PC-sampling). An SMP
 `monitor resume` restored both RP2040 cores only after `monitor foreach t [target names] {$t arp_poll}`; without it
-core1 stayed halted and openocd's next poll halted core0 again (verified 2026-10-16 raspberry_pi_pico). An openocd
+core1 stayed halted and openocd's next poll halted core0 again (verified 2026-10-16 raspberry_pi_pico; RP2350 the
+same, cm1 halted and TIMER0 paused until a reset, 2026-11-24 raspberry_pi_pico2). An openocd
 server did not stop on SIGINT there; SIGTERM stopped it.
 
 **Hardware budget — read it off the chip** (Cortex-M FPB/DWT, verified with `--budget` 2026-10-16: F407/M4 = 6 bp + 4

@@ -2148,7 +2148,11 @@ class Manual(Base):
         self.assertIn('interface/jlink.cfg', pipe)
         self.assertEqual(pipe[-1], 'foreach t [target names] { $t configure -event gdb-detach { resume } }')
         self.assertFalse(any('vid_pid' in w for w in pipe))
-        self.assertNotIn('arp_poll', H.gdb_argv('rig_host', self.board('rig_host'), 'fw.elf', [])[4])   # rp2350
+        rp2350 = shlex.split(H.gdb_argv('rig_host', self.board('rig_host'), 'fw.elf', [])[4]
+                             .removeprefix('target extended-remote | '))
+        self.assertIn('target/rp2350.cfg', rp2350)
+        self.assertEqual(rp2350[-1], 'foreach t [target names] { $t configure -event gdb-detach '
+                                     '{ foreach u [target names] { $u arp_poll }; resume } }')
 
     def test_gdb_takes_a_registered_boards_route_from_the_registry(self):
         self.BP.BOARDS['metro_m4_express'] = {'fqbn': 'vend:arch:metro', 'family': 'fb', 'filters': 'dev_b',
