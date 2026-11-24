@@ -32,6 +32,8 @@ from esp_session import start_time
 start = start_time(os.getpid()) or '?'
 with open(os.environ['FAKE_PIDS'], 'a') as f:
     f.write(f'{os.getpid()} {start}\n')
+    if os.name == 'nt':    # its make_stub launcher, which holds openocd.exe open until it exits
+        f.write(f"{os.getppid()} {start_time(os.getppid()) or '?'}\n")
 cs = [argv[i + 1] for i, a in enumerate(argv) if a == '-c']
 # esp_session.tcl_word undone as Jim reads the word: a backslashed n is a newline, any other character itself
 log = re.sub(r'\\(.)', lambda m: '\n' if m[1] == 'n' else m[1], argv[argv.index('-l') + 1], flags=re.S)
@@ -224,7 +226,8 @@ class EspSessionTest(unittest.TestCase):
         self.addCleanup(stop.set)
 
     def server_pids(self):
-        """(pid, start time) each fake server this test started wrote at its start."""
+        """(pid, start time) each fake server this test started wrote at its start, on Windows each followed by its
+        launcher's."""
         pids = self.d / 'servers'
         lines = pids.read_text().splitlines() if pids.exists() else []
         return [(int(pid), start) for pid, start in map(str.split, lines)]
@@ -239,7 +242,7 @@ class EspSessionTest(unittest.TestCase):
     def end_servers(self):
         """End the fake servers this test started, identified by pid and a command line naming this test's
         directory, not by receipts, which tests rewrite, leave open or rename with their output directory; on Windows
-        by pid and creation time, its launcher exiting with it."""
+        by pid and creation time, and its launcher waited for too: one still exiting keeps the directory's stub."""
         for pid, start in self.server_pids():
             if os.name == 'nt':
                 if es.start_time(pid) == start:
