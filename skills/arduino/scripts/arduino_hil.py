@@ -1565,8 +1565,8 @@ def esp_openocd(dbg, chip):
 
 
 def gdb_argv(name, board, elf, commands):
-    """gdb in batch mode (gdb-multiarch; Espressif's for the chip on debug.tool openocd-esp32) over an openocd it starts on a pipe, configured by the roster's debug.openocd and
-    pinned to the board's probe. The firmware must run on once gdb ends:
+    """gdb in batch mode (gdb-multiarch; Espressif's for the chip on debug.tool openocd-esp32) over an openocd it starts on a pipe, configured by the resolved debug.openocd (the
+    board registry's route, else the roster's) and pinned to the board's probe. The firmware must run on once gdb ends:
     - openocd halts the target on gdb's connect and has no default gdb-detach handler, so one resumes it; it runs when
       the connection closes (gdb_server.c gdb_connection_closed), i.e. when gdb exits, not at `detach`;
     - with a memory map openocd probes every flash bank on connect (gdb_server.c gdb_new_connection), and the

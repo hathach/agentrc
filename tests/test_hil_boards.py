@@ -3,6 +3,7 @@ board's flasher by probe serial. The shipped registry validates, a probe matches
 a registered board's own flasher, an unknown probe, an entry with neither, or a bench board
 claiming a registered probe are refused. Its `dev_attached` reaches the resolved entry's top
 level; a roster's own copy is compared and warned about, never refused, during the migration.
+Its `debug` route does too; a roster's own that differs is refused as drift, an equal one warned about.
 Every shipped `flasher_recover` records its hardware demonstration in its `note`."""
 import contextlib
 import importlib.util
@@ -262,6 +263,81 @@ class DevAttached(Base):
             with self.subTest(devices), self.assertRaisesRegex(ValueError, f'A: dev_attached: .*{why}'):
                 hb.registry(self.registry({'boards': {'A': {'name': 'a', 'flasher': {'name': 'jlink'},
                                                             'dev_attached': devices}}}))
+
+
+ROUTE = {'openocd': '-f interface/cmsis-dap.cfg -f target/rp2040.cfg -c "adapter speed 5000"'}
+# the Arduino rosters' debug.openocd (Adafruit_TinyUSB_Arduino, Adafruit_SPIFlash test/hil/ci.json), by probe
+ROSTER_ROUTES = {
+    'E6614103E72C1D2F': '-f interface/cmsis-dap.cfg -f target/rp2040.cfg -c "adapter speed 5000"',
+    'E6633861A3819D38': '-f interface/cmsis-dap.cfg -f target/rp2040.cfg -c "adapter speed 5000"',
+    'E6633861A3978538': '-f interface/cmsis-dap.cfg -f target/rp2350.cfg -c "adapter speed 5000"',
+    'E663AC91D3359B38': '-f interface/cmsis-dap.cfg -f target/rp2350.cfg -c "adapter speed 5000"',
+    '000063728691': '-f interface/jlink.cfg -c "transport select swd" -c "adapter speed 4000" -f target/atsame5x.cfg',
+}
+
+
+class Debug(Base):
+    def setUp(self):
+        hb._warned.clear()
+        self.path = self.registry({'boards': {**REG['boards'], 'E663': {'name': 'pico', 'flasher': OPENOCD,
+                                                                        'debug': {**ROUTE, 'note': 'n'}}}})
+
+    def resolve(self, entry, **kw):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            out = hb.resolve(entry, self.path, **kw)
+        return out, err.getvalue()
+
+    def test_the_shipped_routes_are_the_rosters_exactly(self):
+        self.assertEqual({p: e['debug']['openocd'] for p, e in hb.registry().items() if 'debug' in e}, ROSTER_ROUTES)
+        for probe, args in ROSTER_ROUTES.items():
+            with self.subTest(probe):
+                out = hb.resolve({'name': 'b', 'uid': 'U', 'probe': probe})
+                self.assertEqual(out['debug'], {'openocd': args})
+
+    def test_a_registered_board_gets_its_route_in_a_new_dict(self):
+        out, err = self.resolve({'name': 'p', 'uid': 'P', 'probe': 'E663'})
+        self.assertEqual((out['debug'], err), ({**ROUTE, 'note': 'n'}, ''))
+        out['debug']['openocd'] = 'x'
+        self.assertEqual(hb.registry(self.path)['E663']['debug']['openocd'], ROUTE['openocd'])
+
+    def test_an_equal_roster_route_is_accepted_with_a_warning(self):
+        entry = {'name': 'p', 'uid': 'P', 'probe': 'E663', 'debug': dict(ROUTE)}
+        out, err = self.resolve(entry, roster='ci.json')
+        self.assertEqual(out['debug'], {**ROUTE, 'note': 'n'})
+        self.assertEqual(err, "hil_boards: roster ci.json: p: debug duplicates agentrc's board registry (pico); "
+                              'drop it from the roster\n')
+        self.assertEqual(self.resolve(entry, roster='ci.json')[1], '')   # once per message
+        self.assertIn('debug duplicates', self.resolve({**entry, 'debug': {**ROUTE, 'note': 'other'}})[1])
+
+    def test_a_differing_roster_route_is_refused_as_drift(self):
+        for debug in ({'openocd': ROUTE['openocd'] + ' '}, {'openocd': '-f interface/cmsis-dap.cfg'},
+                      {**ROUTE, 'tool': 'openocd'}, {}, None, 'x'):
+            with self.subTest(debug), self.assertRaisesRegex(
+                    ValueError, r"p: debug .* differs from agentrc's board registry \(pico\), whose route is "
+                                r"\{'openocd': .*rp2040.*\}; drop it from the roster, or correct the registry's"):
+                hb.resolve({'name': 'p', 'uid': 'P', 'probe': 'E663', 'debug': debug}, self.path)
+        with self.assertRaisesRegex(ValueError, 'differs'):
+            hb.resolve_roster({'boards': [{'name': 'p', 'uid': 'P', 'probe': 'E663', 'debug': {}}]}, self.path)
+
+    def test_without_a_registry_route_and_on_a_bench_board_the_rosters_stands(self):
+        esp = {'openocd': '-f board/esp32p4-builtin.cfg', 'tool': 'openocd-esp32', 'uid': 'M', 'usb_port': '1-1'}
+        out, err = self.resolve({'name': 'k', 'uid': 'K', 'probe': '000621000000', 'debug': esp})
+        self.assertEqual((out['debug'], err), (esp, ''))
+        self.assertNotIn('debug', self.resolve({'name': 'k', 'uid': 'K', 'probe': '000621000000'})[0])
+        bench = {'name': 'b', 'uid': 'C', 'flasher': {'name': 'openocd', 'uid': '0673', 'args': '-f x.cfg'},
+                 'debug': {'openocd': '-f y.cfg'}}
+        self.assertEqual(self.resolve(bench), (bench, ''))
+
+    def test_malformed_registry_routes_are_refused(self):
+        for debug, why in (('x', 'not an object'), ({}, 'no openocd'), ({'openocd': ''}, 'openocd must be'),
+                           ({'openocd': ' '}, 'openocd must be'), ({'openocd': 1}, 'openocd must be'),
+                           ({**ROUTE, 'note': ''}, 'note must be'), ({**ROUTE, 'uid': 'E663'}, 'unknown key'),
+                           ({**ROUTE, 'tool': 'openocd-esp32'}, 'unknown key'),
+                           ({'openocd': '-c "adapter speed'}, 'openocd .*No closing quotation')):
+            with self.subTest(debug), self.assertRaisesRegex(ValueError, f'A: debug: {why}'):
+                hb.registry(self.registry({'boards': {'A': {'name': 'a', 'flasher': {'name': 'jlink'},
+                                                            'debug': debug}}}))
 
 
 class LockName(Base):

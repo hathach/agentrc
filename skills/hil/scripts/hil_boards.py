@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """The farm's board registry (`skills/hil/boards.json`): how each shared-farm board is flashed, keyed by
 the serial of the debug probe it is wired to. Each board has one probe, so its `flasher` and
-`flasher_recover` are farm facts, not a project's; so is `dev_attached`, the devices wired to its USB
-host port. A project roster names the board by `probe` and keeps its own `uid`, the serial its
-firmware reports, which differs per firmware, and its tests. Stdlib only.
+`flasher_recover` are farm facts, not a project's; so are `debug`, the openocd route a GDB session
+attaches through, and `dev_attached`, the devices wired to its USB host port. A project roster names the
+board by `probe` and keeps its own `uid`, the serial its firmware reports, which differs per firmware, and
+its tests. Stdlib only.
 
   {"boards": {"<probe serial>": {"name": <lock name>,
                                  "flasher": {name, args, vid_pid, verify, note},
                                  "flasher_recover": {name, args, vid_pid, verify, note},
+                                 "debug": {openocd, note},
                                  "dev_attached": [{vid_pid "vvvv:pppp", serial, is_cdc, is_msc,
                                                    block_size, block_count, msc_inquiry, note}]}}}
 
@@ -19,9 +21,11 @@ examples print "0" both for iSerialNumber 0 and for a failed read, so "0" is no 
 plain file name, and renamed only with a migration of the locks and records naming it.
 
 resolve(entry) is a roster entry with its board's `flasher` (its `uid` the probe serial) and
-`flasher_recover` filled in, and its registered `dev_attached` at the top level, a new dict. An entry
-with `probe` that also carries a flasher is refused as a duplicate; one without `probe` (a bench board,
-or a rig one project owns) keeps its own, unless its probe is a registered board's. Where the registry
+`flasher_recover` filled in, and its registered `debug` and `dev_attached` at the top level, a new dict.
+An entry with `probe` that also carries a flasher is refused as a duplicate; one without `probe` (a bench
+board, or a rig one project owns) keeps its own, unless its probe is a registered board's. Where the
+registry has a board's `debug`, a roster's own `debug` that differs from it (`note` aside) is refused as
+drift and an equal one is warned about on stderr; without one the roster's stands. Where the registry
 has a board's `dev_attached`, a copy its roster still carries (skills/hil/SKILL.md, Board registry) is
 compared with it and warned about on stderr, never refused; resolve(entry, roster=FILE) names the roster
 file in that warning. resolve_roster(roster) resolves `boards` and `boards-skip`.
@@ -43,6 +47,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -52,8 +57,9 @@ PHYSICAL = ('flasher', 'flasher_recover')
 LOCK_NAME_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]*\Z')   # also within hil_lock's own grammar
 FLASHER_NAMES = ('jlink', 'stlink', 'openocd', 'lm4flash', 'esptool', 'pyocd', 'openocd_esp', 'wch_uart_loader')
 _FLASHER_KEYS = {'name', 'uid', 'args', 'args_program', 'vid_pid', 'verify', 'note'}
-REGISTERED = (*PHYSICAL, 'dev_attached')   # what a registered board's resolved entry takes from here
+REGISTERED = (*PHYSICAL, 'debug', 'dev_attached')   # what a registered board's resolved entry takes from here
 _ENTRY_KEYS = {'name', *REGISTERED}
+_DEBUG_KEYS = {'openocd', 'note'}
 _DEV_KEYS = {'vid_pid', 'serial', 'is_cdc', 'is_msc', 'block_size', 'block_count', 'msc_inquiry', 'note'}
 DEV_VID_PID_RE = re.compile(r'[0-9a-f]{4}:[0-9a-f]{4}\Z')
 
@@ -109,6 +115,25 @@ def flasher_problem(flasher, *, has_uid=True) -> str:
         return f'vid_pid must be "0xVVVV 0xPPPP" pairs, got {flasher["vid_pid"]!r}'
     if 'verify' in flasher and not isinstance(flasher['verify'], bool):
         return f'verify must be true or false, got {flasher["verify"]!r}'
+    return ''
+
+
+def debug_problem(debug) -> str:
+    """Why `debug` is not a well-formed registry debug route, or ''. Its `openocd` is the -f/-c arguments
+    a GDB session starts openocd with; the probe is the board's own, so it carries no uid."""
+    if not isinstance(debug, dict):
+        return f'not an object: {debug!r}'
+    if set(debug) - _DEBUG_KEYS:
+        return f'unknown key(s) {", ".join(sorted(set(debug) - _DEBUG_KEYS))}'
+    if 'openocd' not in debug:
+        return 'no openocd (its -f/-c arguments)'
+    for key in ('openocd', 'note'):
+        if key in debug and not (isinstance(debug[key], str) and debug[key].strip()):
+            return f'{key} must be a non-empty string, got {debug[key]!r}'
+    try:
+        shlex.split(debug['openocd'])
+    except ValueError as e:
+        return f'openocd {debug["openocd"]!r}: {e}'
     return ''
 
 
@@ -175,6 +200,8 @@ def _check(boards: dict, path) -> list:
         for key in PHYSICAL:
             if key in e and (why := flasher_problem(e[key], has_uid=False)):
                 problems.append(f'{probe}: {key}: {why}')
+        if 'debug' in e and (why := debug_problem(e['debug'])):
+            problems.append(f'{probe}: debug: {why}')
         if 'dev_attached' in e and (why := dev_attached_problem(e['dev_attached'])):
             problems.append(f'{probe}: dev_attached: {why}')
     return [f'{path}: {p}' for p in problems]
@@ -250,6 +277,19 @@ def _copy_problem(local, registered) -> str:
 _warned: set = set()
 
 
+def _warn(path, roster, note):
+    """`note` on stderr once per registry and roster, asking for the roster's copy to go."""
+    if roster is not None:
+        note = f'roster {roster}: {note}'
+    if (path, note) not in _warned:
+        _warned.add((path, note))
+        print(f'hil_boards: {note}; drop it from the roster', file=sys.stderr)
+
+
+def _route(debug):
+    return {k: v for k, v in debug.items() if k != 'note'} if isinstance(debug, dict) else debug
+
+
 def _resolve(entry, path, roster=None) -> tuple:
     name = entry.get('name') if isinstance(entry, dict) else None
     label = name or '<unnamed>'
@@ -267,18 +307,20 @@ def _resolve(entry, path, roster=None) -> tuple:
         if inline:
             return None, (f'{label}: {" and ".join(inline)} of probe {probe} come from agentrc\'s board registry '
                           f'({reg["name"]}); drop them from the roster')
+        if 'debug' in reg and 'debug' in entry:
+            if _route(entry['debug']) != _route(reg['debug']):
+                return None, (f'{label}: debug {entry["debug"]!r} differs from agentrc\'s board registry '
+                              f'({reg["name"]}), whose route is {_route(reg["debug"])!r}; drop it from the '
+                              f'roster, or correct the registry\'s')
+            _warn(path, roster, f'{label}: debug duplicates agentrc\'s board registry ({reg["name"]})')
         if 'dev_attached' in reg:
             for where, local in _local_copies(entry):
                 why = _copy_problem(local, reg['dev_attached'])
                 kept = ('the registry\'s replaces it' if where == 'dev_attached'
                         else 'consumers reading it still get the roster\'s')
-                note = (f'{label}: {where} differs from agentrc\'s board registry ({reg["name"]}): {why}; {kept}'
-                        if why else f'{label}: {where} duplicates agentrc\'s board registry ({reg["name"]})')
-                if roster is not None:
-                    note = f'roster {roster}: {note}'
-                if (path, note) not in _warned:
-                    _warned.add((path, note))
-                    print(f'hil_boards: {note}; drop it from the roster', file=sys.stderr)
+                _warn(path, roster,
+                      f'{label}: {where} differs from agentrc\'s board registry ({reg["name"]}): {why}; {kept}'
+                      if why else f'{label}: {where} duplicates agentrc\'s board registry ({reg["name"]})')
         out = copy.deepcopy({**entry, **{k: reg[k] for k in REGISTERED if k in reg}})
         out['flasher']['uid'] = probe
         return out, ''

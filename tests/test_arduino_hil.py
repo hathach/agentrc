@@ -2033,6 +2033,23 @@ class Manual(Base):
         self.assertFalse(any('vid_pid' in w for w in pipe))
         self.assertNotIn('arp_poll', H.gdb_argv('rig_host', self.board('rig_host'), 'fw.elf', [])[4])   # rp2350
 
+    def test_gdb_takes_a_registered_boards_route_from_the_registry(self):
+        self.BP.BOARDS['metro_m4_express'] = {'fqbn': 'vend:arch:metro', 'family': 'fb', 'filters': 'dev_b',
+                                              'span': (0x4000, 0x80000)}
+        metro = {'name': 'metro_m4_express', 'uid': 'MUID', 'probe': '000063728691', 'arduino': {'tests': ['echo']}}
+        roster = self.dir / 'registered.json'
+        roster.write_text(json.dumps({'boards': [metro]}))
+        self.A.flash.openocd_cmd_base = lambda p: ['openocd', '-c', f'adapter serial {p["uid"]}',
+                                                   *(['vid_pid'] if 'vid_pid' in p else []), *shlex.split(p['args'])]
+        argv = H.gdb_argv('metro_m4_express', H.load_roster(roster)['metro_m4_express'], 'fw.elf', [])
+        self.assertEqual(shlex.split(argv[4].removeprefix('target extended-remote | ')), [
+            'openocd', '-c', 'adapter serial 000063728691', '-f', 'interface/jlink.cfg', '-c', 'transport select swd',
+            '-c', 'adapter speed 4000', '-f', 'target/atsame5x.cfg', *H.GDB_SERVER,
+            '-c', 'foreach t [target names] { $t configure -event gdb-detach { resume } }'])
+        roster.write_text(json.dumps({'boards': [{**metro, 'debug': {'openocd': '-f interface/jlink.cfg'}}]}))
+        with self.assertRaisesRegex(H.Refused, "metro_m4_express: debug .* differs from agentrc's board registry"):
+            H.load_roster(roster)
+
     def test_gdb_needs_a_debug_route(self):
         args = self.held(cmd='gdb', build_record='r.json', sketch='echo', ex=[], timeout=5)
         with self.assertRaisesRegex(H.Refused, 'rig_jlink has no debug.openocd'):

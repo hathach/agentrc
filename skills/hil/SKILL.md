@@ -249,7 +249,8 @@ a plain file name, and renamed only with a migration of the locks and records th
 name it. The devices wired to its USB host port are farm facts too: `dev_attached`, each
 with its `vid_pid` (`vvvv:pppp`), its `serial` as the host reads it (omitted when none was
 read), and what a test may use (`is_cdc`, `is_msc` with `block_size`, `block_count` and
-`msc_inquiry`). A project roster names the board by `"probe": "<serial>"`, matched exactly,
+`msc_inquiry`). So is `debug`, the openocd route a GDB session attaches through (`openocd`, its -f/-c
+arguments, and an optional `note`). A project roster names the board by `"probe": "<serial>"`, matched exactly,
 and keeps its own `uid` (the serial its firmware reports, which differs per firmware),
 name, tests and project fields, never the registry's. A `flasher_recover` arms in-run
 wedge recovery, so it joins only after a reset through it, and a reflash where openocd
@@ -270,7 +271,10 @@ agentrc commit to `boards.json`, then the project's agentrc pin. The
 resolved entry carries the registry's `dev_attached` at its top level; a roster that still
 keeps its own copy (tinyusb's `tests.dev_attached`, Arduino's `arduino.dev_attached`) keeps
 it for the consumers that read it, with a warning on stderr naming whether it matches,
-until each project reads the registry's.
+until each project reads the registry's. The resolved entry carries the registry's `debug` the same way; a
+roster's own `debug` for that board that differs from it (`note` aside) is refused as drift, and an equal one is
+accepted with that warning until the roster drops it. Without a registry `debug` (an Espressif USB-Serial/JTAG
+route, say) the roster's stands.
 
 ## Flashers
 
