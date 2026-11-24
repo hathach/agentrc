@@ -153,22 +153,23 @@ NOW = '2026-10-13T11:00:00Z'
 
 
 class RequestRig:
-    """A fake `gh api` for --request: the PR, harvest.observe's reading, the PR's comments, and each POST with its read-back."""
+    """A fake `gh api` for --request: the PR, harvest.observe's reading, the PR's comments, and each POST of BODY with its
+    read-back (BODY unless READBACK)."""
 
-    def __init__(self, cr=LIMITED, observed=NOW, comments=(), state='open', head=HEAD, readback=trigger.REQUEST, post_code=0, later=None,
-                 event_at='2026-10-13T09:00:00Z'):
+    def __init__(self, cr=LIMITED, observed=NOW, comments=(), state='open', head=HEAD, readback=None, post_code=0, later=None,
+                 event_at='2026-10-13T09:00:00Z', body=trigger.REQUEST):
         self.cr, self.observed, self.comments, self.state, self.head, self.event_at = dict(cr), observed, list(comments), state, head, event_at
         self.later, self.pulls = later, 0  # later: the PR's (state, head) on the read just before posting
-        self.readback, self.post_code, self.posts = readback, post_code, []
+        self.body, self.readback, self.post_code, self.posts = body, body if readback is None else readback, post_code, []
 
     def observe(self, repo, n, reviewers, auto):
         assert (repo, n, reviewers, auto) == ('o/r', 7, ['coderabbit'], ['coderabbit'])
         return {'headSha': self.head, 'observedAt': self.observed, 'headEventAt': self.event_at, 'bots': [self.cr], 'comments': []}
 
     def attempt(self, *argv, input=None):
-        assert argv[2:5] == ('-X', 'POST', 'repos/{owner}/{repo}/issues/7/comments') and argv[5:] == ('-f', f'body={trigger.REQUEST}'), argv
+        assert argv[2:5] == ('-X', 'POST', 'repos/{owner}/{repo}/issues/7/comments') and argv[5:] == ('-f', f'body={self.body}'), argv
         self.posts.append(argv)
-        return self.post_code, json.dumps({'id': 99, 'body': trigger.REQUEST}), 'boom' if self.post_code else ''
+        return self.post_code, json.dumps({'id': 99, 'body': self.body}), 'boom' if self.post_code else ''
 
     def run(self, *argv, ok=(0,)):
         path = argv[-1]
@@ -338,6 +339,7 @@ class Request(unittest.TestCase):
             with self.subTest(what):
                 code, out = self.run_with(rig := RequestRig(cr=failed, comments=comments))
                 self.assertEqual((code, out['outcome'], out['commentId'], out['retryAt']), (0, 'requested', 99, None))
+                self.assertNotIn('full', out, 'an incremental ask')
                 self.assertEqual(len(rig.posts), 1)
         mine = dict(older, id=51, created_at='2026-10-13T09:30:00Z')
         code, out = self.run_with(rig := RequestRig(cr=failed, comments=[mine]))
@@ -346,6 +348,58 @@ class Request(unittest.TestCase):
         code, out = self.run_with(rig := RequestRig(cr=failed, comments=[mine], event_at=None))
         self.assertEqual((out['outcome'], out['phase']), ('failed', 'read'), 'a request it cannot place')
         self.assertEqual(rig.posts, [])
+
+    def test_a_no_files_to_review_skip_is_asked_once_for_a_full_review_never_by_its_box(self):
+        # #577: adafruit/Adafruit_TinyUSB_Arduino#637's adopted base merge 693f5f6e, its check run skipped.
+        run_ = {'id': 1, 'name': 'CodeRabbit', 'status': 'completed', 'conclusion': 'skipped', 'started_at': '2026-10-13T08:35:58Z',
+                'completed_at': '2026-10-13T08:35:59Z', 'output': {'title': 'No files to review', 'summary': 'Result: Skipped - No files to review'}}
+        unticked = {'id': 5, 'user': {'login': BOT}, 'body': BOX, 'updated_at': '2026-10-13T08:00:00Z'}
+        ticked = dict(unticked, body=BOX.replace('[ ]', '[x]'), updated_at='2026-10-13T10:00:00Z')
+        skip = harvest.coderabbit(HEAD, [], [run_], [unticked], '2026-10-13T08:35:00Z')
+        self.assertEqual((skip['state'], skip['kind'], skip['reason']), ('settled', 'skipped', 'check run skipped: No files to review'))
+        older = {'id': 50, 'body': '@coderabbitai full review', 'created_at': '2026-10-13T08:00:00Z'}
+        # An incremental `@coderabbitai review` reviews from the last reviewed commit: it would answer the same skip.
+        incremental = {'id': 49, 'body': '@coderabbitai review', 'created_at': '2026-10-13T09:30:00Z'}
+        for what, comments in (('nothing asked', []), ('a ticked box, which asks no review here', [ticked]), ("an older head's request", [older]),
+                               ('an incremental request on the head', [incremental])):
+            with self.subTest(what):
+                code, out = self.run_with(rig := RequestRig(cr=skip, comments=comments, body=trigger.FULL_REQUEST))
+                self.assertEqual((code, out['outcome'], out['commentId'], out['retryAt'], out['full']), (0, 'requested', 99, None, True))
+                self.assertEqual(len(rig.posts), 1)
+        mine = dict(older, id=51, created_at='2026-10-13T09:30:00Z')
+        code, out = self.run_with(rig := RequestRig(cr=skip, comments=[mine], body=trigger.FULL_REQUEST))
+        self.assertEqual((out['outcome'], out['commentId'], out['full']), ('already', 51, True), 'never a second ask on the head')
+        self.assertEqual(rig.posts, [])
+        code, out = self.run_with(rig := RequestRig(cr=skip, comments=[mine], event_at=None, body=trigger.FULL_REQUEST))
+        self.assertEqual((out['outcome'], out['phase']), ('failed', 'read'), 'a request it cannot place')
+        self.assertEqual(rig.posts, [])
+        code, out = self.run_with(rig := RequestRig(cr=skip, body=trigger.FULL_REQUEST, readback=trigger.REQUEST))
+        self.assertEqual((out['outcome'], out['phase']), ('failed', 'post'), 'read back as the incremental ask, not ours')
+        code, out = self.run_with(rig := RequestRig(cr=skip, head='b' * 40))
+        self.assertEqual(out['outcome'], 'notLimited', 'a changed head is not asked about here')
+        self.assertEqual(rig.posts, [])
+
+    def test_a_full_review_ask_that_hit_the_limit_is_asked_again_in_full(self):
+        # A no-files skip asked in full, then limited: an incremental retry would meet the same skip, and its full ask
+        # standing after the head event would then read as already asked.
+        full_ask = {'id': 50, 'body': trigger.FULL_REQUEST, 'created_at': '2026-10-13T09:30:00Z'}
+        for what, event_at in (('after the head event', '2026-10-13T09:00:00Z'), ('an unknown head event', None)):
+            with self.subTest(what):
+                code, out = self.run_with(rig := RequestRig(comments=[full_ask], event_at=event_at, body=trigger.FULL_REQUEST))
+                self.assertEqual((code, out['outcome'], out['commentId'], out['retryAt'], out['full']), (0, 'requested', 99, LIMITED['retryAt'], True))
+                self.assertEqual(len(rig.posts), 1)
+        again = dict(full_ask, id=51, created_at='2026-10-13T10:57:00Z')
+        code, out = self.run_with(rig := RequestRig(comments=[full_ask, again], body=trigger.FULL_REQUEST))
+        self.assertEqual((out['outcome'], out['commentId'], out['full']), ('already', 51, True), 'one full ask past the reset stands')
+        self.assertEqual(rig.posts, [])
+        older = dict(full_ask, created_at='2026-10-13T08:00:00Z')
+        code, out = self.run_with(rig := RequestRig(comments=[older]))
+        self.assertEqual((out['outcome'], out['commentId']), ('requested', 99), "an older head's full ask leaves the retry incremental")
+        self.assertNotIn('full', out)
+        incremental = {'id': 52, 'body': trigger.REQUEST, 'created_at': '2026-10-13T09:45:00Z'}
+        code, out = self.run_with(rig := RequestRig(comments=[full_ask, incremental]))
+        self.assertEqual(out['outcome'], 'requested', 'the newest ask on the head is the one the limit answered')
+        self.assertNotIn('full', out)
 
     def test_a_failed_or_unconfirmed_post_is_failed_with_its_limit(self):
         for what, rig in (('post failed', RequestRig(post_code=1)), ('read back differs', RequestRig(readback='something else'))):

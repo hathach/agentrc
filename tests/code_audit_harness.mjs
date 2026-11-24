@@ -194,6 +194,14 @@ test('a diff dir with spaces or quotes is one shell-quoted pathspec', async () =
   assert.ok(calls[0].prompt.includes(`-- ':(literal,top)src/it'\\''s x'\``), calls[0].prompt)
 })
 
+test('under shell powershell the pathspec is a PowerShell literal, its single quotes doubled', async () => {
+  const base = 'a'.repeat(40), head = 'b'.repeat(40)
+  const dir = "src/it's \u2019x"
+  const { calls } = await run({ dirs: [dir], dimensions: ['correctness'], diff: { base, head }, shell: 'powershell' }, { scans: { [`${dir}|correctness`]: [] } })
+  assert.ok(calls[0].prompt.includes(`-- ':(literal,top)src/it''s \u2019\u2019x'\``), calls[0].prompt)
+  await assert.rejects(run({ ...ONE, shell: 'zsh' }), /args\.shell must be bash or powershell/)
+})
+
 test('the root group diffs the whole change, with no pathspec', async () => {
   const base = 'a'.repeat(40), head = 'b'.repeat(40)
   const { calls } = await run({ dirs: ['.'], dimensions: ['correctness'], diff: { base, head } }, { scans: { '.|correctness': [] } })

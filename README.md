@@ -142,6 +142,11 @@ Claude Code sets `NoDefaultCurrentDirectoryInExePath`; set it too when running
 the scripts from another shell, or Windows runs a `git.exe` or `gh.exe` from the
 current directory, a PR checkout for many of them.
 
+Where a workflow's subagents get no Bash tool (no Git Bash), `pr-babysit` and `pr-review` take `shell: 'powershell'`,
+which writes every relay command as Windows PowerShell 5.1 code (`pr-babysit`'s `ARGUMENTS.md` has the details).
+`fix-issue` has no such mode: its co-plan goes through the `coworker` agent, whose `cowork.py` call and guard hook are
+Bash-only, so it needs Git Bash.
+
 `pr-babysit`'s build check puts a temp directory into the build command
 unquoted, so it refuses a temp dir with a blank or shell syntax in it, as a
 profile path such as `C:\Users\First Last` gives; point `TMP` and `TEMP` at a
@@ -165,8 +170,6 @@ the skipped tests and notes for a port:
   control.
 - `target-debug`'s `sysview_record.py`, which refuses there: it drives SystemView
   under Xvfb and tracks its processes through `/proc` and process groups.
-- `target-debug`'s `esp_session.py`, which refuses there: it detaches openocd
-  as a POSIX session and identifies it through `/proc` (#130).
 
 The hardware-debug scripts run on Windows but are unverified on a board there
 (#130), and their tests skip the cases that drive POSIX stub executables or

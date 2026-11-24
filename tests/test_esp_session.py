@@ -1,11 +1,10 @@
+import argparse
 import contextlib
 import importlib.util
-import io
 import json
 import os
 import signal
 import socket
-import stat
 import subprocess
 import sys
 import tempfile
@@ -17,8 +16,8 @@ from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'target-debug' / 'scripts' / 'esp_session.py'
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import (SURVIVOR_GUARD_OFF, cut_comm_stat, end, guard_survivors, proc_open, proc_stat,  # noqa: E402
-                     reap_if_ours)
+from helpers import (SURVIVOR_GUARD_OFF, console_pids, cut_comm_stat, end, guard_survivors, make_stub,  # noqa: E402
+                     pid_alive, proc_open, proc_stat, reap_if_ours, tmpdir)
 
 # openocd-esp32 stand-in: --version banner; init/shutdown sessions; a server that logs its examination and
 # listening lines and answers the Tcl commands esp_session sends, with core states in FAKE_STATE.
@@ -28,14 +27,16 @@ argv = sys.argv[1:]
 if argv == ['--version']:
     sys.stderr.write(os.environ.get('FAKE_BANNER', 'Open On-Chip Debugger v0.12.0-esp32-20260703 (2026-07-03-13:49)') + '\n')
     sys.exit(0)
-try:
-    start = open('/proc/self/stat').read().rsplit(')', 1)[1].split()[19]
-except OSError:
-    start = '?'
+sys.path.append(os.environ['FAKE_ESPS_DIR'])
+from esp_session import start_time
+start = start_time(os.getpid()) or '?'
 with open(os.environ['FAKE_PIDS'], 'a') as f:
     f.write(f'{os.getpid()} {start}\n')
+    if os.name == 'nt':    # its make_stub launcher, which holds openocd.exe open until it exits
+        f.write(f"{os.getppid()} {start_time(os.getppid()) or '?'}\n")
 cs = [argv[i + 1] for i, a in enumerate(argv) if a == '-c']
-log = argv[argv.index('-l') + 1]
+# esp_session.tcl_word undone as Jim reads the word: a backslashed n is a newline, any other character itself
+log = re.sub(r'\\(.)', lambda m: '\n' if m[1] == 'n' else m[1], argv[argv.index('-l') + 1], flags=re.S)
 cores = os.environ.get('FAKE_CORES', 'chip.cpu0,chip.cpu1').split(',')
 with open(os.environ['FAKE_LOG'], 'a') as f:
     f.write(json.dumps({'tool': 'openocd', 'argv': argv}) + '\n')
@@ -195,18 +196,17 @@ def setUpModule():
     guard_survivors(__name__)
 
 
-@unittest.skipIf(os.name == 'nt', 'esp_session.py refuses on Windows: WindowsRefusal')
-@unittest.skipIf(SURVIVOR_GUARD_OFF, f"its fake servers are ended through the survivor guard's pidfds, off here: "
-                                     f'{SURVIVOR_GUARD_OFF}')
+@unittest.skipIf(SURVIVOR_GUARD_OFF and os.name != 'nt', f"its fake servers are ended through the survivor guard's "
+                                                         f'pidfds, off here: {SURVIVOR_GUARD_OFF}')
 class EspSessionTest(unittest.TestCase):
+    """On Windows the stand-ins are launchers (make_stub), and a fake server is the launcher's Python child."""
+
     def setUp(self):
         self._dir = tempfile.TemporaryDirectory()
         self.addCleanup(self._dir.cleanup)
         self.d = Path(self._dir.name)
         for name, body in (('openocd', FAKE_OPENOCD), ('fake-gdb', FAKE_GDB)):
-            f = self.d / name
-            f.write_text(body)
-            f.chmod(f.stat().st_mode | stat.S_IEXEC)
+            make_stub(self.d, name, body.split('\n', 1)[1])
         self.elf = self.d / 'fw.elf'
         self.elf.write_bytes(b'\x7fELF')
         self.anchor = self.d / 'console.bin'
@@ -215,8 +215,10 @@ class EspSessionTest(unittest.TestCase):
         self.out = self.d / 'out'
         self.env = {**os.environ, 'PATH': f'{self.d}{os.pathsep}{os.environ["PATH"]}', 'FAKE_LOG': str(self.log),
                     'FAKE_STATE': str(self.d / 'state.json'), 'FAKE_OCD_LOG': str(self.out / 'openocd.log'),
-                    'FAKE_PIDS': str(self.d / 'servers')}
+                    'FAKE_PIDS': str(self.d / 'servers'), 'FAKE_ESPS_DIR': str(SCRIPT.parent)}
         self.addCleanup(self.end_servers)
+        if os.name == 'nt':    # no zombies to reap
+            return
         stop = threading.Event()
         reaper = threading.Thread(target=self.reap_servers, args=(stop,), daemon=True)
         reaper.start()
@@ -224,7 +226,8 @@ class EspSessionTest(unittest.TestCase):
         self.addCleanup(stop.set)
 
     def server_pids(self):
-        """(pid, start time) each fake server this test started wrote at its start."""
+        """(pid, start time) each fake server this test started wrote at its start, on Windows each followed by its
+        launcher's."""
         pids = self.d / 'servers'
         lines = pids.read_text().splitlines() if pids.exists() else []
         return [(int(pid), start) for pid, start in map(str.split, lines)]
@@ -238,13 +241,23 @@ class EspSessionTest(unittest.TestCase):
 
     def end_servers(self):
         """End the fake servers this test started, identified by pid and a command line naming this test's
-        directory, not by receipts, which tests rewrite, leave open or rename with their output directory."""
+        directory, not by receipts, which tests rewrite, leave open or rename with their output directory; on Windows
+        by pid and creation time, and its launcher waited for too: one still exiting keeps the directory's stub."""
         for pid, start in self.server_pids():
+            if os.name == 'nt':
+                if es.start_time(pid) == start:
+                    with contextlib.suppress(OSError):    # it may exit meanwhile
+                        os.kill(pid, signal.SIGTERM)    # TerminateProcess
+                    deadline = time.monotonic() + 10
+                    while es.start_time(pid) == start and time.monotonic() < deadline:
+                        time.sleep(0.02)
+                continue
             if str(self.d) in ' '.join(es.cmdline(pid) or ()):
                 end(pid, start)
             else:
                 reap_if_ours(pid, start)
 
+    @unittest.skipIf(os.name == 'nt', 'Windows has no zombies to reap')
     def test_a_stale_registration_never_takes_another_childs_status(self):
         child = subprocess.Popen(['sh', '-c', 'exit 7'])
         deadline = time.monotonic() + 5
@@ -285,6 +298,15 @@ class EspSessionTest(unittest.TestCase):
         for setting in ('set may-write-memory off', 'set may-call-functions off', 'set may-insert-breakpoints off'):
             self.assertLess(exs.index(setting), exs.index(next(e for e in exs if e.startswith('target'))))
         self.assertEqual(exs[-2:], ['monitor resume', 'detach'])
+
+    def test_an_out_directory_with_a_space_reaches_openocd_as_one_word(self):
+        self.out = self.d / 'my out'
+        rc, out, err = self.run_cli(self.session('inspect'), FAKE_OCD_LOG=str(self.out / 'openocd.log'))
+        self.assertEqual(rc, 0, err)
+        word = f'{self.out.as_posix()}/openocd.log'.replace(' ', '\\ ')
+        self.assertEqual(self.calls('openocd')[0][-2:], ['-l', word])
+        self.assertIn('Info : [chip.cpu0] Examination succeed', out['examination']['log'])
+        self.assertIn('Info : [chip.cpu0] Examination succeed', (self.out / 'openocd.log').read_text())
 
     def test_configuration_order(self):
         self.run_cli(self.session('inspect'))
@@ -361,6 +383,8 @@ class EspSessionTest(unittest.TestCase):
         self.assertEqual(out['gdbExit'], 1)
         self.assertIsNone(out['budget'])
         self.assertIn('gdb exited 1', out['error'])
+        if os.name == 'nt':    # no signals to die of
+            return
         self.out.rename(self.d / 'out1')
         rc, out, err = self.run_cli(self.session('inspect', '--expr', 'x'), FAKE_EXPRS=json.dumps({'x': '42'}),
                                     FAKE_GDB_DIE_AFTER='end', FAKE_GDB_DIE=str(-signal.SIGSEGV))
@@ -427,7 +451,7 @@ class EspSessionTest(unittest.TestCase):
         self.assertNotIn('end', out)
         receipt = json.loads((self.out / 'receipt.json').read_text())
         self.assertFalse(receipt['closed'])
-        os.kill(receipt['pid'], signal.SIGKILL)    # the fake server, which nothing here may stop
+        self.end_servers()    # the fake server, which nothing here may stop
 
     def test_recover_is_bounded_and_never_kills(self):
         argv = [sys.executable, str(SCRIPT), 'recover', '--out', str(self.out), *BOARD, '--timeout', '1']
@@ -435,8 +459,8 @@ class EspSessionTest(unittest.TestCase):
         self.assertEqual(rc, 3, err)
         self.assertIn('not killed', out['error'])
         time.sleep(0.2)
-        self.assertTrue(os.path.exists(f"/proc/{out['pid']}"))
-        os.kill(out['pid'], signal.SIGKILL)
+        self.assertTrue(pid_alive(out['pid']))
+        self.end_servers()
 
     def test_the_tcl_side_resumes_what_gdb_left_halted(self):
         rc, out, err = self.run_cli(self.session('inspect'), FAKE_GDB_NO_RESUME='1')
@@ -485,6 +509,7 @@ class EspSessionTest(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertIn('nothing sent', out['error'])
 
+    @unittest.skipIf(os.name == 'nt', 'Windows sends no SIGTERM; test_ctrl_break_still_ends_the_session')
     def test_a_signal_still_ends_the_session(self):
         proc = subprocess.Popen(self.session('inspect', '--timeout', '30'), stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True, env={**self.env, 'FAKE_GDB_HANG': '1'})
@@ -502,6 +527,33 @@ class EspSessionTest(unittest.TestCase):
         self.assertIn('interrupted by signal 15', out['error'])
         self.assertEqual(out['end']['cores'], {'chip.cpu0': 'running', 'chip.cpu1': 'running'})
 
+    @unittest.skipUnless(os.name == 'nt', 'Ctrl-Break, the Windows console interrupt')
+    def test_ctrl_break_still_ends_the_session(self):
+        if not console_pids():
+            self.skipTest('this runner has no console for esp_session to share')
+        # its own group: CTRL_BREAK_EVENT goes to a group, which takes gdb along but must not reach openocd
+        proc = subprocess.Popen(self.session('inspect', '--timeout', '30'), stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, env={**self.env, 'FAKE_GDB_HANG': '1'},
+                                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+        self.addCleanup(proc.communicate)
+        self.addCleanup(proc.kill)
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline and not (self.out / 'openocd.log').exists():
+            time.sleep(0.05)
+        while time.monotonic() < deadline and 'accepting' not in (self.out / 'openocd.log').read_text():
+            time.sleep(0.05)
+        on_console = console_pids()
+        self.assertIn(proc.pid, on_console)
+        server = json.loads((self.out / 'receipt.json').read_text())['pid']
+        self.assertFalse({server, *(pid for pid, _ in self.server_pids())} & on_console)
+        proc.send_signal(signal.CTRL_BREAK_EVENT)
+        stdout, _ = proc.communicate(timeout=60)
+        out = json.loads(stdout)
+        self.assertEqual(proc.returncode, 3)
+        self.assertIn(f'interrupted by signal {int(signal.SIGBREAK)}', out['error'])
+        self.assertEqual(out['end']['cores'], {'chip.cpu0': 'running', 'chip.cpu1': 'running'})
+        self.assertTrue(json.loads((self.out / 'receipt.json').read_text())['closed'])
+
     def test_a_signal_while_a_tool_starts_still_ends_the_session(self):
         # SIGTERM lands inside Popen, after the fork: the process must be recorded, stopped and the session ended
         driver = (f'import os, signal, subprocess, sys\nsys.path.insert(0, {str(SCRIPT.parent)!r})\n'
@@ -509,14 +561,15 @@ class EspSessionTest(unittest.TestCase):
                   'class Popen(real):\n'
                   '    def __init__(self, args, *a, **k):\n'
                   '        super().__init__(args, *a, **k)\n'
-                  '        if (which == "server" and "-l" in args) or (which == "gdb" and os.path.basename(args[0]) == "fake-gdb"):\n'
-                  '            os.kill(os.getpid(), signal.SIGTERM)\n'
+                  '        tool = os.path.splitext(os.path.basename(args[0]))[0]\n'
+                  '        if (which == "server" and "-l" in args) or (which == "gdb" and tool == "fake-gdb"):\n'
+                  '            signal.raise_signal(signal.SIGTERM)\n'
                   'if which == "gdb-twice":\n'
                   '    which, base = "gdb", esp_session.Interrupted.__str__\n'
                   '    def again(self):\n'
                   '        if not getattr(again, "sent", False):\n'
                   '            again.sent = True\n'
-                  '            os.kill(os.getpid(), signal.SIGTERM)    # a second signal while the first is handled\n'
+                  '            signal.raise_signal(signal.SIGTERM)    # a second signal while the first is handled\n'
                   '        return base(self)\n'
                   '    esp_session.Interrupted.__str__ = again\n'
                   'esp_session.subprocess.Popen = Popen\nsys.exit(esp_session.main(sys.argv[1:]))')
@@ -661,14 +714,28 @@ class Receipts(unittest.TestCase):
         self.assertEqual(json.loads(path.read_text()), {'pid': 1})
         self.assertEqual(sorted(p.name for p in self.d.iterdir()), ['receipt.json'])
 
-    @unittest.skipUnless(os.path.isdir('/proc/self'), 'the identity check reads /proc')
-    def test_same_process_by_argv_tail_and_start_time(self):
-        me = {'pid': os.getpid(), 'argv': es.cmdline(os.getpid())[-1:], 'startTime': es.start_time(os.getpid())}
-        self.assertTrue(es.same_process(me))
-        self.assertFalse(es.same_process({**me, 'startTime': '1'}))
-        self.assertFalse(es.same_process({**me, 'argv': ['not-this']}))
-        self.assertFalse(es.same_process({k: v for k, v in me.items() if k != 'startTime'}))
+    def test_same_process_by_argv_and_start_time_until_it_exits(self):
+        # POSIX: argv's tail from /proc; Windows: the image file, a launcher there, and the creation time
+        stub = make_stub(self.d, 'stand-in', 'import time; time.sleep(30)')
+        proc = subprocess.Popen([str(stub)])
+        self.addCleanup(proc.wait)
+        self.addCleanup(es.stop, proc)
+        rec = {'pid': proc.pid, 'argv': [str(stub)], 'startTime': es.start_time(proc.pid)}
+        deadline = time.monotonic() + 10
+        while not es.same_process(rec) and time.monotonic() < deadline:    # POSIX: /proc names the exec'd argv
+            time.sleep(0.02)
+        self.assertTrue(es.same_process(rec))
+        self.assertFalse(es.same_process({**rec, 'startTime': '1'}))
+        self.assertFalse(es.same_process({**rec, 'argv': [sys.executable]}))
+        self.assertFalse(es.same_process({k: v for k, v in rec.items() if k != 'startTime'}))
+        self.assertFalse(es.wait_exit(proc.pid, None, 0.2))
+        es.stop(proc)
+        self.assertIsNotNone(proc.poll())
+        self.assertTrue(es.wait_exit(proc.pid, None, 5))
+        self.assertFalse(es.same_process(rec))
+        self.assertIsNone(es.start_time(proc.pid))
 
+    @unittest.skipIf(os.name == 'nt', 'Windows reads no /proc')
     def test_a_comm_cut_mid_character_still_gives_the_start_time(self):
         with mock.patch.object(es, 'open', proc_open({'/proc/4242/stat': cut_comm_stat(4242, start=777)}), create=True):
             self.assertEqual(es.start_time(4242), '777')
@@ -678,18 +745,109 @@ class Receipts(unittest.TestCase):
             self.assertFalse(es.same_process({'pid': os.getpid(), 'argv': ['x'], 'startTime': '1'}))
 
 
-class WindowsRefusal(unittest.TestCase):
-    def test_windows_is_refused_in_one_line_before_any_probe_session(self):
-        for argv in (['recover', '--out', 'out', *BOARD], ['leave', '--receipt', 'receipt.json']):
-            err = io.StringIO()
-            with self.subTest(mode=argv[0]), mock.patch.object(es.os, 'name', 'nt'), \
-                    mock.patch.object(es.subprocess, 'Popen', side_effect=AssertionError('launched')) as popen, \
-                    mock.patch.object(es, 'leave', side_effect=AssertionError('left')), \
-                    contextlib.redirect_stderr(err):
-                self.assertEqual(es.main(argv), 2)
-            popen.assert_not_called()
-            self.assertEqual(len(err.getvalue().splitlines()), 1, err.getvalue())
-            self.assertIn('not on Windows yet', err.getvalue())
+class WindowsExit(unittest.TestCase):
+    """Only Windows' word that the process exited counts as an exit; an unknown state never closes a receipt."""
+
+    def kernel32(self, opened, wait=None):
+        k = mock.Mock()
+        k.OpenProcess.return_value = 1 if opened else None
+        k.WaitForSingleObject.return_value = wait
+        return mock.patch.object(es, '_kernel32', return_value=k)
+
+    def test_the_wait_and_open_results(self):
+        for opened, wait, error, want in ((True, 0, 0, True), (True, 0x102, 0, False), (True, 0xFFFFFFFF, 6, None),
+                                          (False, None, 87, True), (False, None, 5, None)):
+            with self.subTest(opened=opened, wait=wait, error=error), self.kernel32(opened, wait), \
+                    mock.patch('ctypes.get_last_error', return_value=error, create=True):
+                self.assertIs(es._windows_exited(4242), want)
+
+    def test_each_caller_keeps_its_access_and_closes_the_handle(self):
+        for opened, wait, error, identified in ((True, 0x102, 0, True), (True, 0, 0, False),
+                                                (True, 0xFFFFFFFF, 6, False), (False, None, 87, False),
+                                                (False, None, 5, False)):
+            with self.subTest(opened=opened, wait=wait, error=error), self.kernel32(opened, wait) as kernel32, \
+                    mock.patch('ctypes.get_last_error', return_value=error, create=True):
+                k = kernel32.return_value
+                es._windows_exited(4242)
+                k.OpenProcess.assert_called_with(0x00100000, False, 4242)
+                self.assertEqual(es._windows_process(4242) is not None, identified)
+                k.OpenProcess.assert_called_with(0x1000 | 0x00100000, False, 4242)
+                self.assertEqual(k.CloseHandle.call_count, 2 if opened else 0)
+
+    def test_an_unknown_state_is_no_exit_and_leaves_the_receipt_open(self):
+        d = tmpdir(self)
+        receipt = d / 'receipt.json'
+        rec = {'pid': 4242, 'startTime': '1', 'argv': ['openocd'], 'ports': [1, 2, 3], 'token': 't',
+               'log': str(d / 'openocd.log'), 'closed': False}
+        receipt.write_text(json.dumps(rec))
+        (d / 'openocd.log').write_text('')
+        tcl = mock.Mock(**{'return_value.end.return_value': {'removed': '', 'cores': {'cpu0': 'running'}}})
+        with mock.patch.object(es.os, 'name', 'nt'), mock.patch.object(es, 'same_process', return_value=True), \
+                mock.patch.object(es, 'Tcl', tcl), mock.patch.object(es, '_windows_exited', return_value=None), \
+                mock.patch.object(es, 'SHUTDOWN_EXIT_WAIT', 0.3):
+            self.assertFalse(es.wait_exit(4242, None, 0.3))
+            result, rc = es.leave(str(receipt))
+        self.assertEqual(rc, 3)
+        self.assertIn('unconfirmed', result['error'])
+        self.assertFalse(json.loads(receipt.read_text())['closed'])
+        with mock.patch.object(es.os, 'name', 'nt'), mock.patch.object(es, '_windows_exited', return_value=True):
+            self.assertTrue(es.wait_exit(4242, None, 0.3))
+
+
+class WindowsPaths(unittest.TestCase):
+    def test_stop_runs_taskkill_only_from_an_absolute_system_root(self):
+        for root, ran in (('C:\\Windows', True), ('Windows', False), ('\\Windows', False), ('', False)):
+            proc = mock.Mock(pid=4242, **{'poll.return_value': None})
+            with self.subTest(root=root), mock.patch.object(es.os, 'name', 'nt'), \
+                    mock.patch.dict(os.environ, {'SystemRoot': root}), mock.patch.object(es.subprocess, 'run') as run:
+                es.stop(proc)
+            self.assertEqual(run.called, ran)
+            if ran:
+                self.assertEqual(run.call_args.args[0][1:], ['/T', '/F', '/PID', '4242'])
+                self.assertIn('creationflags', run.call_args.kwargs)
+            proc.kill.assert_called_once_with()
+
+    def test_the_log_reaches_openocds_tcl_line_with_forward_slashes(self):
+        a = argparse.Namespace(board_cfg='board/esp32p4-builtin.cfg', adapter_serial='30:ED', adapter_speed=None,
+                               rtos=None)
+        with mock.patch.object(es.os, 'sep', '\\'):
+            cmd = es.server_command('openocd', a, None, 'C:\\Users\\t\\out\\openocd.log')
+        self.assertEqual(cmd[-2:], ['-l', 'C:/Users/t/out/openocd.log'])
+
+    def test_the_log_is_one_literal_word_of_openocds_tcl_line(self):
+        a = argparse.Namespace(board_cfg='board/esp32p4-builtin.cfg', adapter_serial='30:ED', adapter_speed=None,
+                               rtos=None)
+        for log, word in (('/tmp/my out/openocd.log', '/tmp/my\\ out/openocd.log'),
+                          ('/tmp/$x[y]{z}"q;\\/openocd.log', '/tmp/\\$x\\[y\\]\\{z\\}\\"q\\;\\\\/openocd.log'),
+                          ('/tmp/a\tb\nc/openocd.log', '/tmp/a\\\tb\\nc/openocd.log')):
+            with self.subTest(log=log), mock.patch.object(es.os, 'sep', '/'):
+                self.assertEqual(es.server_command('openocd', a, None, log)[-2:], ['-l', word])
+
+    def test_a_relative_openocd_is_recorded_absolute(self):
+        d = tmpdir(self)
+        (d / 'tools').mkdir()
+        stub = make_stub(d / 'tools', 'openocd', 'pass')
+        old = os.getcwd()
+        os.chdir(d)
+        self.addCleanup(os.chdir, old)
+        with mock.patch.dict(os.environ, {'ESP_SESSION_OPENOCD': os.path.join('.', 'tools', stub.name)}):
+            exe = es.tool('ESP_SESSION_OPENOCD', 'openocd')
+        self.assertTrue(os.path.isabs(exe), exe)
+        os.chdir(d / 'tools')
+        self.assertTrue(os.path.samefile(exe, stub))
+
+    @unittest.skipUnless(os.name == 'nt', 'the Windows lookup')
+    def test_a_bare_tool_name_is_never_taken_from_the_working_directory(self):
+        d = tmpdir(self)
+        (d / 'here').mkdir()
+        make_stub(d / 'here', 'openocd', 'pass')
+        old = os.getcwd()
+        os.chdir(d / 'here')
+        self.addCleanup(os.chdir, old)
+        with mock.patch.dict(os.environ, {'PATH': os.pathsep.join(['.', 'here', str(d / 'none')])}):
+            self.assertIsNone(es.which('openocd'))
+        with mock.patch.dict(os.environ, {'PATH': os.pathsep.join(['.', f'"{d / "here"}"'])}):
+            self.assertTrue(os.path.samefile(es.which('openocd'), d / 'here' / 'openocd.exe'))
 
 
 if __name__ == '__main__':

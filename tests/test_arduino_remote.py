@@ -117,7 +117,7 @@ class Run(Checkout):
                  (lambda: self.record(experimental=True), 'experimental'),
                  (lambda: (self.root / f'build/hil/{BOARD}.build.json').unlink(), 'build record'),
                  (lambda: (self.root / ROSTER).write_text((self.root / ROSTER).read_text() + ' '), 'not clean'),
-                 (lambda: self.record(version=1), 'not a version 2 arduino-hil-build record: rebuild it'),
+                 (lambda: self.record(version=2), 'not a version 3 arduino-hil-build record: rebuild it'),
                  (lambda: self.record(library='Other Library'), 'it is a Other Library record, this harness is Fake '
                                                                 'USB Library\'s'),
                  (lambda: self.record(contract={}), r"the contract files \['contract/check.py', 'contract/pin.json'\] "

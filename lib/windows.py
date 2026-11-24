@@ -4,7 +4,7 @@ retried while another process holds the file open, and the drive that mounts a v
 
 A script reaches it through its resolved path, as chief_guard.py reaches shadows.py:
 `sys.path.insert(0, str(Path(__file__).resolve().parents[N] / 'lib'))`, then `import windows`.
-rtt.py keeps its own copies (see its module docstring)."""
+rtt.py and esp_session.py keep their own copies (see their module docstrings)."""
 import contextlib
 import os
 import re

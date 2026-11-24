@@ -200,9 +200,12 @@ recipe does not settle, go to step 7 with their error or `why`.
 3. `review`: the `pr-review` workflow with `{pr, repo, head, mergeBase, scopeBase, mode,
    groups, factsDir: <prepare's facts file's directory>, hil: {choice: 'none'}
    or {choice: 'boards', boards: [rows]}, hardwareRelevant, autoPost,
-   recheckFrom?, dimensions?}` (`mode: 'discussion'` for prepare's `same`;
+   recheckFrom?, dimensions?, shell?}` (`mode: 'discussion'` for prepare's `same`;
    `recheckFrom` is prepare's, set only on the recheck of step 6.4). `dimensions`
    comes from the project's instruction file when it names review dimensions.
+   `shell: 'powershell'` on a Windows host that runs no bash, as pr-babysit's `ARGUMENTS.md` `shell` describes: its
+   relay commands are then Windows PowerShell under `python`; a relay without the launch's shell blocks `check-failed`
+   naming the other value.
    Then `result.py --output <it>`, and the save next names, adding the request's words as `--reason` when it asks.
 4. `post`: `post.py` (pending), `post.py --auto` (auto-post) or `post.py --auto --defer-answers` (auto-fix); a
    `discussion` run always takes plain `post.py`. Its exit 1 names what it could not confirm; under auto-fix a

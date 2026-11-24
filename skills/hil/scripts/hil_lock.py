@@ -54,6 +54,7 @@ HOLD_KIND = 'hil_lock-hold'   # `holder` of a record this CLI's own hold process
 JOURNAL = '.takeover'         # <board>.takeover: an older helper's recovery takeover, live or left
 CLEANUP_LOG = '.cleanup.jsonl'   # <board>.cleanup.jsonl: the board's failed cleanups and restorations
 LOG_WAIT = 5.0                # s a cleanup-log reader or writer waits for its mutex
+ADMISSION = '.admission.mutex'  # shared by each new lock file's creator, exclusive under a host-wide reservation
 REWRITING = b'#'              # byte 0 of a record being rewritten: unreadable
 ACQUIRING = b'~'              # byte 0 while take_board_lock writes its first record: a free board
 UNLOGGED = b'!'               # byte 0 while end_failed writes an unlogged failure's evidence into its record
@@ -74,6 +75,11 @@ class LockUnavailable(RuntimeError):
 
 class BoardLocked(RuntimeError):
     """Another session holds the board; the message names its holder."""
+
+
+class AdmissionClosed(BoardLocked):
+    """The board has no lock file yet, and a host-wide reservation holds ADMISSION: no new lock
+    name is admitted until it ends."""
 
 
 class RecoveryBlocked(BoardLocked):
@@ -225,19 +231,89 @@ def lock_path(board: str) -> str:
 def flock_nb(board: str):
     """Open-or-create the lock file WITHOUT truncating (a losing racer must not wipe the
     winner's record) and take LOCK_EX|LOCK_NB. Returns the open handle; raises OSError when
-    the file is unsafe or the flock is held elsewhere (handle already closed)."""
-    _check_name(board)
-    dfd = _open_dir(create=True)
-    try:
-        fd = _open_file(dfd, f'{board}.lock', os.O_RDWR, create=True)
-    finally:
-        os.close(dfd)
-    fh = os.fdopen(fd, 'r+')
+    the file is unsafe or the flock is held elsewhere (handle already closed), AdmissionClosed
+    when it must be created while a reservation holds ADMISSION."""
+    fh = os.fdopen(_open_lock_file(board), 'r+')
     try:
         fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         fh.close()
         raise
+    return fh
+
+
+def _open_lock_file(board) -> int:
+    """`board`'s lock file opened, or created under _create_admitted when missing; takes no flock."""
+    _check_name(board)
+    dfd = _open_dir(create=True)
+    try:
+        try:
+            return _open_file(dfd, f'{board}.lock', os.O_RDWR)
+        except FileNotFoundError:
+            return _create_admitted(dfd, board)
+    finally:
+        os.close(dfd)
+
+
+def _create_admitted(dfd, board) -> int:
+    """Create `board`'s lock file under a shared flock on ADMISSION, so a reservation that
+    holds it exclusively (close_admission) has seen every lock name there will be until it
+    ends. AdmissionClosed while one does."""
+    afd = _open_file(dfd, ADMISSION, os.O_RDWR, create=True)
+    try:
+        try:
+            fcntl.flock(afd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise AdmissionClosed(f'board locked: {board} has no lock file yet, and no new lock name is admitted '
+                                  f'while a host-wide reservation holds {ADMISSION}') from None
+        return _open_file(dfd, f'{board}.lock', os.O_RDWR, create=True)
+    finally:
+        os.close(afd)
+
+
+def ensure_lock_files(boards) -> None:
+    """Create each board's lock file that is missing, taking no flock: a free board. A
+    reservation runs it before close_admission, which would refuse its own creates."""
+    for board in boards:
+        os.close(_open_lock_file(board))
+
+
+def _flock_wait(fd, wait) -> bool:
+    """LOCK_EX on `fd`, polled for at most `wait` s: False past it; any other OSError raises."""
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                return False
+        time.sleep(0.05)
+
+
+def close_admission(wait=None):
+    """Hold ADMISSION exclusively, so no new lock file is created until the returned handle
+    closes; lock_names() is then complete for every taker running this helper. Waits out
+    creators (each holds it shared for one create) for `wait` s (LOG_WAIT by default);
+    LockUnavailable otherwise, or when the dir or file cannot be used."""
+    if wait is None:
+        wait = LOG_WAIT
+    try:
+        dfd = _open_dir(create=True)
+        try:
+            fh = os.fdopen(_open_file(dfd, ADMISSION, os.O_RDWR, create=True), 'r+')
+        finally:
+            os.close(dfd)
+    except OSError as e:
+        raise _unavailable(e) from e
+    try:
+        held = _flock_wait(fh, wait)
+    except OSError as e:
+        fh.close()
+        raise _unavailable(e) from e
+    if not held:
+        fh.close()
+        raise LockUnavailable(f'board lock unavailable: {ADMISSION} still shared after {wait:g} s')
     return fh
 
 
@@ -588,15 +664,8 @@ def _log_locked(board, create=True):
     try:
         fd = _open_file(dfd, _log_name(board) + '.mutex', os.O_RDWR, create=create)
         try:
-            deadline = time.monotonic() + LOG_WAIT
-            while True:
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    break
-                except BlockingIOError:
-                    if time.monotonic() >= deadline:
-                        raise TimeoutError(f'{_log_name(board)}.mutex held past {LOG_WAIT}s') from None
-                    time.sleep(0.05)
+            if not _flock_wait(fd, LOG_WAIT):
+                raise TimeoutError(f'{_log_name(board)}.mutex held past {LOG_WAIT}s')
             yield dfd
         finally:
             os.close(fd)
@@ -2178,6 +2247,9 @@ def _release_one(b, victims) -> int:
     """Clear a stale record, or queue a provable hold holder for SIGTERM; 1 on a refusal."""
     try:
         fh = flock_nb(b)
+    except AdmissionClosed as e:
+        print(f'ERROR: {e}', file=sys.stderr)
+        return 1
     except BlockingIOError:
         state, info = record_state(b)
         if state != 'record':

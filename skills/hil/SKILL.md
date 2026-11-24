@@ -162,11 +162,13 @@ nothing in it through a link.
   and, when anything but a clean, fully re-enumerated outcome follows,
   releases them with the blocker logged in each board's cleanup log
   (`end_failed`; a surviving process as an `unrecheckable` receipt, so that
-  failure stays open) and exits 1. A controller operation has no
-  inspected reservation yet; a contract refuses it. A runner that
-  cycles one hub port under the board's own lock is a limitation of this rule,
-  not an exemption, recorded in the contract's Limits with what else the cycle
-  is known to reach.
+  failure stays open) and exits 1. A controller operation (`usb-kernel-recover`'s `pci-rebind`, `pci-bind`, for a
+  dead controller) holds through `hil_reserve.py run pci-rebind|pci-bind <pciaddr>`, which a contract adopts in its
+  Reservation before running either verb, and only once every project on the host is pinned at or after the agentrc
+  whose `hil_lock` closes lock admission for the run (an older one still creates lock names the hold cannot see) and
+  the rig's installed `usb_recover` is refreshed by `hil-farm-setup`. `hil_reserve.py --help` has what it checks,
+  holds and judges. A runner that cycles one hub port under the board's own lock is a limitation of this rule, not an
+  exemption, recorded in the contract's Limits with what else the cycle is known to reach.
 
 Manual work on a rig board outside the contract's runner (`hw-validator`,
 `hw-debugger`, probe tools used directly) follows `target-debug`'s Delegated
@@ -249,7 +251,8 @@ a plain file name, and renamed only with a migration of the locks and records th
 name it. The devices wired to its USB host port are farm facts too: `dev_attached`, each
 with its `vid_pid` (`vvvv:pppp`), its `serial` as the host reads it (omitted when none was
 read), and what a test may use (`is_cdc`, `is_msc` with `block_size`, `block_count` and
-`msc_inquiry`). A project roster names the board by `"probe": "<serial>"`, matched exactly,
+`msc_inquiry`). So is `debug`, the openocd route a GDB session attaches through (`openocd`, its -f/-c
+arguments, and an optional `note`). A project roster names the board by `"probe": "<serial>"`, matched exactly,
 and keeps its own `uid` (the serial its firmware reports, which differs per firmware),
 name, tests and project fields, never the registry's. A `flasher_recover` arms in-run
 wedge recovery, so it joins only after a reset through it, and a reflash where openocd
@@ -270,7 +273,10 @@ agentrc commit to `boards.json`, then the project's agentrc pin. The
 resolved entry carries the registry's `dev_attached` at its top level; a roster that still
 keeps its own copy (tinyusb's `tests.dev_attached`, Arduino's `arduino.dev_attached`) keeps
 it for the consumers that read it, with a warning on stderr naming whether it matches,
-until each project reads the registry's.
+until each project reads the registry's. The resolved entry carries the registry's `debug` the same way; a
+roster's own `debug` for that board that differs from it (`note` aside) is refused as drift, and an equal one is
+accepted with that warning until the roster drops it. Without a registry `debug` (an Espressif USB-Serial/JTAG
+route, say) the roster's stands.
 
 ## Flashers
 
@@ -476,7 +482,7 @@ recovery stay the contract's.
 | `hil_remote_core.py` | trees and attempts on a rig: staging, launch, status, fetch and copy-back |
 | `hil_tt.py` | Reset_TT of the hub TT a full- or low-speed device sits behind |
 | `hil_root.py` | every root operation of the usbtest, TT and USB network scripts, one checked verb each (`netns` moves a board's USB network interface, by its vendor id, into the namespace of a sandbox a user other than root created, the one `SUDO_UID` names when set); a rig grants its CI user sudo on its installed copy (`/usr/local/sbin/hil_root`), and separately on `/usr/local/sbin/usb_recover` for `hil_reserve.py run` recovery |
-| `gh_pr_comment.py` | a CI report posted on a PR by a later `workflow_run` job: the PR of a run (`pr_of_run`), a job's attempt, whether a run is still the newest for the PR's head (`fresh`), a bounded artifact JSON read, and table-safe, mention-neutral, capped comment text; its CLI (`pr`, `job-attempt`, `fresh`) exits 2 when the API cannot tell, never read as absent or stale |
+| `gh_pr_comment.py` | a CI report posted on a PR by a later `workflow_run` job: the PR of a run (`pr_of_run`), a job's attempt, whether a run is still the newest for the PR's head (`fresh`), a bounded artifact JSON read, table-safe, mention-neutral, capped comment text, and the sticky post (`post`, its docstring has the rules); its CLI (`pr`, `job-attempt`, `fresh`, `post`) exits 2 when the API cannot tell, never read as absent or stale |
 | `hil_usbtest.py` | usbtest binding, the device under test by serial (`find_device`), and bounded testusb case runs |
 | `usb_dfu.py`, `esptool_session.py` | a DFU runtime request, one esptool connection, each a child the runner can kill |
 

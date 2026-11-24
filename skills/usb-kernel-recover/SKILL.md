@@ -210,15 +210,19 @@ as opposed to ONE device wedged. The rungs above cannot help; the controller
 itself needs re-initialising.
 
 ```bash
-sudo <skill dir>/scripts/usb_recover.sh pci-rebind <pciaddr>  # unbind + bind the whole xHCI
-sudo <skill dir>/scripts/usb_recover.sh pci-bind   <pciaddr>  # only if it ends up driverless
+python3 <hil skill dir>/scripts/hil_reserve.py run pci-rebind <pciaddr> \
+    --roster <roster> ... --reason "pci-rebind <pciaddr>"   # unbind + bind the whole xHCI
+python3 <hil skill dir>/scripts/hil_reserve.py run pci-bind <pciaddr> \
+    --roster <roster> ... --reason "pci-bind <pciaddr>"     # only if it ends up driverless
 ```
 
-On a successful rebind every fixture re-enumerates, and **it renumbers every bus that
-controller owns** (observed: buses 17 and 18 came back as 1 and 2), so re-derive
-busports afterwards. No reservation tool covers a controller yet: a dead controller
-shows no topology to check, so `hil_reserve.py` refuses it, and a contract refuses
-the operation until it has its own procedure for it.
+On a successful rebind every fixture re-enumerates, and **it renumbers every bus that controller owns** (observed: buses
+17 and 18 came back as 1 and 2), so re-derive busports afterwards from the bus map the reservation prints. Every fixture
+on the controller goes down with it, so it runs only under that reservation, given every roster on the host, and only
+where the contract's Reservation allows it; `pci-bind` under the same reservation recovers a controller left driverless.
+Prerequisites: every project on the host pinned at or after the agentrc whose `hil_lock` closes lock admission for the
+run, and the rig's root-owned `/usr/local/sbin/usb_recover`, which the reservation prefers, refreshed by
+`hil-farm-setup`. `hil_reserve.py --help` has what it checks, holds and judges.
 
 Do NOT reach for it while a device-lock convoy is live — see Common mistakes.
 
@@ -284,6 +288,9 @@ Observed: 5 boards missing with a completely clean D-state list, because
   counts the subtree restored only from sysfs reads afterwards, never from that record.
 - `hil_reserve.py run root-cycle` has not been run against a real wedge; its
   hardware trial is agentrc#149.
+- `hil_reserve.py run pci-rebind` and `pci-bind` have not been run on hardware, and
+  when a rebind strands its controller is still unmeasured; the experiment that settles
+  the Common-mistakes entry above is agentrc#236.
 - `sudo` runs a user-owned script from a user-writable checkout: the existing trust
   boundary of the install, not widened by this skill.
 - Which hubs and controllers a host has, whether a port cycle cuts power there, and

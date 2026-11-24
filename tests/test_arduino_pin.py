@@ -23,10 +23,12 @@ CANONICAL = 'skills/arduino/scripts/agentrc_pin.py'
 CONSUMER = '.claude/skills/hil-contract/scripts/agentrc_pin.py'
 SOURCE = 'skills/hil/scripts/agentrc_source.py'
 LOADER = 'skills/hil/scripts/hil_load.py'
+CONFORMANCE = 'skills/arduino/scripts/pin_conformance.py'
 BUILD = 'skills/arduino/scripts/arduino_build.py'
 CI_ENGINE = 'skills/arduino/scripts/arduino_ci.py'
 EXTRA = 'skills/hil/scripts/gh_pr_comment.py'
 CONFIG = 'test/hil/agentrc.json'
+PROFILE = '.claude/skills/build/scripts/check_build.py'
 CLEAN_ENV = {k: v for k, v in os.environ.items()
              if not k.startswith('GIT_') and k not in ('AGENTRC_DIR', 'CI', 'GITHUB_ACTIONS')}
 
@@ -66,7 +68,7 @@ class Consumer(unittest.TestCase):
         shutil.copyfile(ROOT / CANONICAL, self.root / CONSUMER)
         self.pin = load(self.root / CONSUMER)
         self.repo = self.tmp / 'agentrc'
-        for rel in (CANONICAL, SOURCE, LOADER):
+        for rel in (CANONICAL, CONFORMANCE, SOURCE, LOADER):
             (self.repo / rel).parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(ROOT / rel, self.repo / rel)
         for rel in (*self.pin.ENGINES, EXTRA, CI_ENGINE):
@@ -83,6 +85,7 @@ class Consumer(unittest.TestCase):
         self.data = {'url': str(self.repo), 'commit': self.head, 'cache_namespace': 'fixture',
                      'profile_api': 1, 'features': [], 'extra_engines': []}
         self.config()
+        self.profile()
         self.install = self.tmp / 'home/.claude'
         (self.install / 'skills').mkdir(parents=True)
         for skill in ('arduino', 'hil'):
@@ -99,6 +102,11 @@ class Consumer(unittest.TestCase):
         (self.root / CONFIG).parent.mkdir(parents=True, exist_ok=True)
         (self.root / CONFIG).write_text(json.dumps(self.data))
 
+    def profile(self, contract=(PROFILE, CONSUMER, CONFIG)):
+        (self.root / PROFILE).parent.mkdir(parents=True, exist_ok=True)
+        (self.root / PROFILE).write_text(f'import agentrc_pin\nCONTRACT_FILES = {tuple(contract)!r}\n\n\n'
+                                         f'def engine():\n    return agentrc_pin.load({BUILD!r})\n')
+
     def runner_probe(self, root, source):
         tests = root / '.claude/test'
         tests.mkdir()
@@ -114,7 +122,7 @@ class Consumer(unittest.TestCase):
         helper, _, ident = self.pin._selection()
         tree = self.tmp / 'tree'
         digests = helper.stage(ident, tree, name='agentrc')
-        for rel in (CONSUMER, CONFIG):
+        for rel in (CONSUMER, CONFIG, PROFILE):
             (tree / rel).parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(self.root / rel, tree / rel)
             digests[rel] = helper.sha256(tree / rel)
@@ -210,7 +218,8 @@ class Installed(Consumer):
         ident = self.pin.identity()
         self.assertEqual((ident['source'], ident['root'], ident['commit'], ident['dirty']),
                          ('installed', str(self.repo), self.head, False))
-        self.assertEqual(ident['files'], sorted([*self.pin.ENGINES, SOURCE, LOADER, CANONICAL, EXTRA, 'lib/data.py']))
+        self.assertEqual(ident['files'], sorted([*self.pin.ENGINES, SOURCE, LOADER, CANONICAL, CONFORMANCE, EXTRA,
+                                               'lib/data.py']))
         self.assertEqual(self.pin.load(BUILD).__file__, str(self.repo / BUILD))
         self.assertEqual(self.pin.load('lib/data.py').VALUE, 1)
         with self.assertRaisesRegex(self.pin.PinError, 'not in the agentrc closure'):
@@ -332,6 +341,7 @@ class Runner(Consumer):
         self.env(GIT_DIR='x', GIT_INDEX_FILE='x', GIT_CONFIG_COUNT='1')
         before = dict(os.environ)
         with mock.patch.object(self.pin, 'fetch', side_effect=AssertionError('fetched')), \
+                mock.patch.object(self.pin, 'conformance', return_value=[]), \
                 contextlib.redirect_stdout(io.StringIO()) as out:
             self.assertEqual(self.pin.main(['check']), 0)
             with mock.patch.object(self.pin.subprocess, 'run', return_value=mock.Mock(returncode=5)) as run:
@@ -571,6 +581,117 @@ class Staged(Consumer):
         manifest.symlink_to(outside)
         with self.assertRaisesRegex(pin.PinError, 'not a regular file'):
             pin.check()
+
+
+class Conformance(Consumer):
+    def script(self, rel, text):
+        path = self.root / '.claude/skills' / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+
+    def test_a_conforming_consumer_has_no_problems_and_test_refuses_any(self):
+        self.config(extra_engines=[EXTRA])
+        self.script('hil-contract/scripts/hil_workflow.py',
+                    f'import agentrc_pin as pin\nfrom agentrc_pin import load as get\n'
+                    f'pin.load("{EXTRA}")\nget({BUILD!r})\nload(name)   # a local load()\n')
+        self.assertEqual(self.pin.conformance(), [])
+        with mock.patch.object(self.pin, 'conformance', return_value=['one', 'two']), \
+                mock.patch.object(self.pin.subprocess, 'run', side_effect=AssertionError('tests ran')):
+            with self.assertRaisesRegex(self.pin.PinError, 'does not conform: one; two'):
+                self.pin.test()
+
+    def test_contract_files_must_carry_the_bootstrap_and_its_configuration(self):
+        self.profile((PROFILE, CONSUMER))
+        with mock.patch.object(self.pin.load(CONFORMANCE), 'round_trip', side_effect=AssertionError('staged')):
+            problems = self.pin.conformance()
+        self.assertEqual(problems, [f"{PROFILE} CONTRACT_FILES lacks ['{CONFIG}']: a staged tree would not carry them"])
+        for text, why in (('CONTRACT_FILES = BASE + ("x",)\n', 'no CONTRACT_FILES literal'),
+                          ('CONTRACT_FILES = (1,)\n', 'no CONTRACT_FILES literal'),
+                          ('FILES = ()\n', 'no CONTRACT_FILES literal'),
+                          ('CONTRACT_FILES = (\n', 'unreadable')):
+            with self.subTest(text=text):
+                (self.root / PROFILE).write_text(text)
+                with self.assertRaisesRegex(self.pin.PinError, why):
+                    self.pin.conformance()
+        (self.root / PROFILE).unlink()
+        with self.assertRaisesRegex(self.pin.PinError, 'check_build.py is unreadable'):
+            self.pin.conformance()
+
+    def test_every_load_target_is_a_literal_in_the_closure(self):
+        hil = '.claude/skills/hil-contract/scripts'
+        self.script('hil-contract/scripts/hil_ci.py', f'import agentrc_pin\n\n\ndef ci():\n'
+                                                      f'    return agentrc_pin.load("{CI_ENGINE}")\n')
+        self.script('hil-contract/scripts/dynamic.py',
+                    'import agentrc_pin as pin\nfrom agentrc_pin import load\n'
+                    'pin.load(f"skills/{name}.py")\nload(rel="x")\nload("README.md")\n')
+        self.script('hil-contract/scripts/broken.py', 'agentrc_pin.load(\n')
+        conform = self.pin.load(CONFORMANCE)
+        self.assertEqual([t for _, t in conform._load_calls(ROOT / CANONICAL, own=True)], [CONFORMANCE])
+        bootstrap = (self.root / CONSUMER).read_text()
+        (self.root / CONSUMER).write_text(bootstrap + '\n\ndef extra(name):\n    return load(name)\n')
+        with mock.patch.object(conform, 'round_trip', return_value=[]):
+            problems = self.pin.conformance()
+        (self.root / CONSUMER).write_text(bootstrap)
+        self.assertEqual(problems[1], f'{hil}/broken.py is unreadable ('
+                                      f'{problems[1].split(" (", 1)[1]}')
+        self.assertEqual(problems[:1] + problems[2:], [
+            f'{CONSUMER}:{bootstrap.count(chr(10)) + 4}: agentrc_pin.load() takes one string literal, not a computed '
+            'target',
+            f'{hil}/dynamic.py:3: agentrc_pin.load() takes one string literal, not a computed target',
+            f'{hil}/dynamic.py:4: agentrc_pin.load() takes one string literal, not a computed target',
+            f"{hil}/dynamic.py:5: agentrc_pin.load('README.md') is outside the closure; add it to {CONFIG} "
+            'extra_engines',
+            f"{hil}/hil_ci.py:5: agentrc_pin.load('{CI_ENGINE}') is outside the closure; add it to {CONFIG} "
+            'extra_engines'])
+        (self.root / hil / 'broken.py').unlink()
+        (self.root / hil / 'dynamic.py').unlink()
+        self.config(extra_engines=[CI_ENGINE])
+        self.pin._selection.cache_clear()
+        self.assertEqual(self.pin.conformance(), [])
+
+    def test_the_round_trip_refuses_a_module_from_outside_the_staged_copy(self):
+        outside = self.tmp / 'outside'
+        outside.mkdir()
+        (outside / 'leaky.py').write_text('VALUE = 1\n')
+        (self.repo / EXTRA).write_text(f'import sys\nsys.path.insert(0, {str(outside)!r})\nimport leaky\n'
+                                       f'FILES = ({LOADER!r}, {SOURCE!r})\n')
+        git(self.repo, 'commit', '-qam', 'leak')
+        self.config(commit=git(self.repo, 'rev-parse', 'HEAD'), extra_engines=[EXTRA])
+        problems = self.pin.conformance()
+        self.assertEqual(len(problems), 1, problems)
+        self.assertRegex(problems[0], r'^a staged tree loads from outside its agentrc/: .*leaky\.py$')
+
+    def test_the_round_trip_refuses_a_tree_that_does_not_load(self):
+        real = self.pin.stage
+
+        def corrupt(into, name='agentrc'):
+            digests = real(into, name)
+            (Path(into) / name / BUILD).write_text('raise AssertionError("ran corrupt engine")\n')
+            return digests
+        with mock.patch.object(self.pin, 'stage', corrupt):
+            problems = self.pin.conformance()
+        self.assertEqual(len(problems), 1, problems)
+        self.assertRegex(problems[0], '^a staged tree does not load: .*differ from their manifest')
+
+    def test_stage_is_the_real_stager_and_writes_a_tree_once(self):
+        ident = self.pin.identity()
+        digests = self.pin.stage(self.tmp / 'tree')
+        self.assertEqual(set(digests), {f'agentrc/{f}' for f in (*ident['files'], 'manifest.json')})
+        self.assertEqual(json.loads((self.tmp / 'tree/agentrc/manifest.json').read_text())['sha256'], ident['sha256'])
+        with self.assertRaisesRegex(self.pin.PinError, 'written once') as cm:
+            self.pin.stage(self.tmp / 'tree')
+        self.assertIn('unchanged agentrc', cm.exception.remedy)
+        self.assertEqual(set(self.pin.stage(self.tmp / 'tree', name='other')),
+                         {f'other/{f}' for f in (*ident['files'], 'manifest.json')})
+
+    @unittest.skipIf(os.name == 'nt', 'the real Arduino engines are Linux only (fcntl)')
+    def test_the_real_engines_conform_from_this_checkout(self):
+        self.env(AGENTRC_DIR=str(ROOT))
+        self.config(features=['core', 'named', 'battery'], extra_engines=[EXTRA, CI_ENGINE])
+        self.script('hil-contract/scripts/hil_test.py',
+                    "import agentrc_pin\nE = agentrc_pin.load('skills/arduino/scripts/arduino_hil.py')\n")
+        self.assertEqual(self.pin.identity()['root'], str(ROOT))
+        self.assertEqual(self.pin.conformance(), [])
 
 
 @unittest.skipIf(os.name == 'nt', 'the real Arduino engines are Linux only (fcntl)')

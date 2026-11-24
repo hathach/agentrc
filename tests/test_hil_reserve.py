@@ -52,10 +52,20 @@ case "$ACTION" in
   survivor) setsid sleep 30 </dev/null >/dev/null 2>&1 & echo $! > "$ARGV_OUT.pid"; exit 0 ;;
   survivor-same-group) sleep 30 </dev/null >/dev/null 2>&1 & echo $! > "$ARGV_OUT.pid"; exit 0 ;;
   hang) sleep 30; exit 0 ;;
+  wait-done) for _ in $(seq 100); do [ -e "$ARGV_OUT.done" ] && break; sleep 0.1; done; exit 0 ;;
   signals) exec grep -E '^Sig(Blk|Ign):' /proc/$$/status > "$ARGV_OUT.sig" ;;
-  trap) exec bash -c 'trap "echo TRAPPED; exit 7" TERM; trap "echo HUP TRAPPED" HUP; for _ in $(seq 50); do sleep 0.1; done' ;;
+  trap) exec bash -c 'trap "echo TRAPPED; exit 7" TERM; trap "echo HUP TRAPPED" HUP; for _ in $(seq 50); do [ -e "$ARGV_OUT.done" ] && break; sleep 0.1; done' ;;
   refuse) exit 3 ;;
   refuse-drop) mv "$SYS_DEVICES/3-1.4.1" "$SYS_DEVICES/.gone"; exit 3 ;;
+  renumber|renumber-drop)    # a rebind: bus 3 (480M) comes back as 1, bus 4 (5000M) as 2
+    for d in "$SYS_DEVICES"/3-*; do mv "$d" "$SYS_DEVICES/1-${d##*/3-}"; done
+    mv "$PCI_DEV/usb3" "$PCI_DEV/usb1" && mv "$PCI_DEV/usb4" "$PCI_DEV/usb2" || exit 9
+    [ "$ACTION" = renumber ] || mv "$SYS_DEVICES/1-1.3" "$SYS_DEVICES/.gone"
+    exit 0 ;;
+  strand) rm "$PCI_DEV/driver" && rm -r "$PCI_DEV/usb3" "$PCI_DEV/usb4"; exit 1 ;;
+  swap-driver) ln -sfn "$PCI_DRIVERS/xhci_hcd" "$PCI_DEV/driver"; exit 0 ;;
+  bind) ln -s "$PCI_DRIVERS/xhci-pci-renesas" "$PCI_DEV/driver" && mkdir "$PCI_DEV/usb3" &&
+        echo 480 > "$PCI_DEV/usb3/speed"; exit 0 ;;
   probe-locks) python3 - "$LOCK_DIR" > "$ARGV_OUT.locks" <<'PY'
 import fcntl, os, sys
 for fn in sorted(os.listdir(sys.argv[1])):
@@ -318,6 +328,20 @@ class Rosters(Fixture):
         bad.write_text(json.dumps({'boards': [{'name': 'a', 'uid': 'X1', 'flasher': {'name': 'jlink', 'uid': 'pa'}}, {'name': 'b', 'uid': 'x1', 'flasher': {'name': 'jlink', 'uid': 'pb'}}]}))
         with self.assertRaisesRegex(hr.Refused, 'uid x1 names two boards: a and b'):
             hr.load_rosters([str(bad)])
+
+    def test_every_image_uid_is_a_dut_identity_and_conflicts_across_boards(self):
+        roster = Path(self.td.name) / 'r.json'
+        esp = {'name': 'esp', 'uid': 'primary-serial', 'uids': {'hwcdc': 'primary-serial', 'default': 'alternate-serial'},
+               'flasher': {'name': 'esptool', 'uid': 'pa'}}
+        roster.write_text(json.dumps({'boards': [esp]}))
+        got = hr.load_rosters([str(roster)])
+        self.assertEqual(got['identities'], {'primary-serial': {'esp'}, 'alternate-serial': {'esp'}, 'pa': {'esp'}})
+        self.dev('3-1.4', serial='alternate-serial')         # the other image's enumeration
+        self.assertEqual(hr.walk('3-1.4', got['identities'], time.monotonic() + 5)['3-1.4']['covered'], ['esp'])
+        other = {'name': 'other', 'uid': 'Alternate-Serial', 'flasher': {'name': 'jlink', 'uid': 'pb'}}
+        roster.write_text(json.dumps({'boards': [esp, other]}))
+        with self.assertRaisesRegex(hr.Refused, 'uid alternate-serial names two boards: esp and other'):
+            hr.load_rosters([str(roster)])
 
     def test_a_registered_board_is_one_lock_whatever_each_roster_calls_it(self):
         probe, entry = next(iter(hr.hil_boards.registry().items()))
@@ -1040,6 +1064,478 @@ class RootCycleScript(Fixture):
         self.assertIn('command exited 1', line)
         self.assertEqual(self.runs(), ['check', 'off', 'on'])
         self.assert_ended_blocked(p, token_of(line))
+
+
+class ControllerFixture(Fixture):
+    """A bound controller at ADDR owning bus 3 (480M) and bus 4 (5000M), a driverless one at IDLE."""
+    ADDR, IDLE = '0000:05:00.0', '0000:06:00.0'
+    BOARDS = frozenset({'mimxrt1064_evk', 'raspberry_pi_pico2', 'stm32f303disco', 'stm32h743eval'})
+
+    def setUp(self):
+        super().setUp()
+        shutil.rmtree(self.sys / '3-2')                   # the keyboard: on this controller, in no roster
+        root = Path(self.td.name)
+        self.pci, self.drivers = root / 'pci', root / 'drivers'
+        for name, path in (('SYS_PCI_DEVICES', self.pci), ('SYS_PCI_DRIVERS', self.drivers)):
+            self.addCleanup(setattr, hr, name, getattr(hr, name))
+            setattr(hr, name, str(path))
+        for drv in ('xhci-pci-renesas', 'xhci_hcd'):
+            (self.drivers / drv).mkdir(parents=True)
+        self.controller(self.ADDR, 'xhci-pci-renesas', {'usb3': '480', 'usb4': '5000'})
+        self.controller(self.IDLE, None, {})
+        for k in ('PCI_DEV', 'PCI_DRIVERS'):
+            self.addCleanup(os.environ.pop, k, None)
+        os.environ['PCI_DRIVERS'] = str(self.drivers)
+
+    def controller(self, addr, driver, hubs, cls='0x0c0330'):
+        d = self.pci / addr
+        d.mkdir(parents=True)
+        for attr, v in (('vendor', '0x1912'), ('device', '0x0014'), ('subsystem_vendor', '0x1912'),
+                        ('subsystem_device', '0x0014'), ('class', cls)):
+            (d / attr).write_text(v + '\n')
+        if driver:
+            (d / 'driver').symlink_to(self.drivers / driver)
+        for hub, speed in hubs.items():
+            (d / hub).mkdir()
+            (d / hub / 'speed').write_text(speed + '\n')
+        return d
+
+    def run_ctl(self, action='ok', verb='pci-rebind', addr=ADDR, patch=None, budget='1'):
+        os.environ['PCI_DEV'] = str(self.pci / addr)
+        return self.fork_main('run', verb, addr, *self.rosters(), '--reason', 'test', '--budget', budget,
+                              action=action, patch=patch)
+
+    def assert_blocked_on_every_lock(self, child, line):
+        self.assertEqual(child.wait(), 1, line)
+        self.assertEqual(set(self.records()), self.BOARDS)
+        self.assertEqual(self.held(), set())
+        for lock in self.BOARDS:
+            self.assertTrue(self.flock_free(lock), lock)
+            f = latest_failure(hr.hil_lock, lock)
+            self.assertEqual((f['how'], f['tool'], f['token']), ('ended-failed', 'hil_reserve', token_of(line)))
+
+
+class Controller(ControllerFixture):
+    """pci-rebind and pci-bind (agentrc#236): a PCI-identified controller whose every bus is
+    walked, nodes keyed across a renumbering, every lock on the host held, the command never
+    signalled and bounded, and restoration judged from the PCI function and its buses."""
+
+    def test_check_names_the_pci_identity_and_keys_every_bus_by_speed(self):
+        self.dev('5-1', serial='on-another-controller')   # bus 5 is not this controller's
+        rc, out = main('check', self.ADDR, '--scope', 'controller', *self.rosters())
+        self.assertEqual(rc, 0, out)
+        self.assertIn(f'controller {self.ADDR}: 0x1912:0x0014 subsystem 0x1912:0x0014 class 0x0c0330, '
+                      'driver xhci-pci-renesas', out)
+        self.assertIn('locks (4): mimxrt1064_evk raspberry_pi_pico2 stm32f303disco stm32h743eval', out)
+        for line in ('usb3 (480M): serial - -> controller', 'usb4 (5000M): serial - -> controller',
+                     '3-1 (480M-1): serial - -> hub', '3-1.1 (480M-1.1): serial E6633861A3978538 -> raspberry_pi_pico2'):
+            self.assertIn(line, out)
+        self.assertNotIn('5-1', out)
+
+    def test_an_unexplained_device_on_any_of_its_buses_refuses(self):
+        self.dev('3-2', serial='unrelated-keyboard')
+        rc, out = main('check', self.ADDR, '--scope', 'controller', *self.rosters())
+        self.assertEqual(rc, 1, out)
+        self.assertIn(f'uncovered on controller {self.ADDR}:\n  3-2: serial unrelated-keyboard matches no roster', out)
+        p = self.run_ctl()
+        self.assertEqual(p.wait(), 1)
+        self.assertFalse(self.argv_out.exists())
+        self.assertEqual(self.held(), set())
+
+    def test_a_target_that_is_no_usb_controller_or_in_the_wrong_driver_state_refuses(self):
+        self.controller('0000:07:00.0', 'xhci_hcd', {}, cls='0x020000')
+        for argv, why in ((('run', 'pci-rebind', '0000:07:00.0'), 'is not a USB controller (class 0x020000)'),
+                          (('run', 'pci-rebind', '0000:09:00.0'), 'no such pci device: 0000:09:00.0'),
+                          (('run', 'pci-rebind', self.IDLE), f'no driver bound to {self.IDLE}: pci-bind attaches one'),
+                          (('run', 'pci-bind', self.ADDR), f'{self.ADDR} already has a driver bound (xhci-pci-renesas)')):
+            with self.subTest(argv=argv):
+                rc, out = main(*argv, *self.rosters(), '--reason', 'test')
+                self.assertEqual(rc, 1, out)
+                self.assertIn(why, out)
+        (self.pci / self.ADDR / 'subsystem_device').unlink()
+        rc, out = main('check', self.ADDR, '--scope', 'controller', *self.rosters())
+        self.assertIn(f'{self.ADDR}: subsystem_device unreadable', out)
+        self.assertFalse(self.argv_out.exists())
+        for argv in (('run', 'pci-rebind', '05:00.0'), ('run', 'pci-bind', '3-1'), ('check', '3-1', '--scope', 'controller'),
+                     ('check', self.ADDR)):
+            with self.subTest(argv=argv), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                hr.main([*argv, *self.rosters(), *(('--reason', 'r') if argv[0] == 'run' else ())])
+
+    def test_two_root_hubs_of_one_speed_or_an_unreadable_speed_refuse(self):
+        (self.pci / self.ADDR / 'usb4' / 'speed').write_text('480\n')
+        rc, out = main('check', self.ADDR, '--scope', 'controller', *self.rosters())
+        self.assertEqual(rc, 1, out)
+        self.assertIn('usb3 and usb4 are both 480 Mbps root hubs', out)
+        (self.pci / self.ADDR / 'usb4' / 'speed').unlink()
+        rc, out = main('check', self.ADDR, '--scope', 'controller', *self.rosters())
+        self.assertIn('usb4: speed unreadable', out)
+
+    def test_a_rebind_that_renumbers_the_buses_is_restored_and_maps_them(self):
+        p = self.run_ctl(action='renumber')
+        out = p.output()
+        self.assertEqual(p.returncode, 0, out)
+        self.assertEqual(self.argv_out.read_text().split(), ['pci-rebind', self.ADDR])
+        self.assertIn(f'sudo -n {hr.RECOVER_SCRIPT} pci-rebind {self.ADDR}\n', out)
+        self.assertIn(f'controller {self.ADDR} buses: 3 -> 1 (480M), 4 -> 2 (5000M); re-derive every busport', out)
+        self.assertIn(f'released 4 lock(s); controller {self.ADDR} back, 6 node(s) on its buses', out)
+        self.assertEqual(self.held(), set())
+        self.assertTrue(all(self.flock_free(l) for l in self.records()))
+
+    def test_every_lock_name_on_the_host_is_held_and_a_held_one_refuses(self):
+        hr.hil_lock.release_board_lock(hr.hil_lock.take_board_lock('arduino_board', 'an earlier task'))
+        p = self.run_ctl(action='probe-locks')
+        out = p.output()
+        self.assertEqual(p.returncode, 0, out)
+        self.assertIn('holding arduino_board mimxrt1064_evk raspberry_pi_pico2 stm32f303disco stm32h743eval\n'
+                      'hil_reserve: of them in no roster given: arduino_board', out)
+        probed = dict(line.split() for line in Path(str(self.argv_out) + '.locks').read_text().splitlines())
+        self.assertEqual(set(probed.values()), {'held'})
+        self.assertEqual(len(probed), 5)
+        self.assertEqual(self.held(), set())
+        self.argv_out.unlink()
+        rival = hr.hil_lock.take_board_lock('arduino_board', 'a live task')
+        self.addCleanup(rival.close)
+        p = self.run_ctl()
+        out = p.output()
+        self.assertEqual(p.returncode, 1, out)
+        self.assertIn('refused: arduino_board: board locked: ', out)
+        self.assertFalse(self.argv_out.exists())
+        self.assertEqual(self.held(), {'arduino_board'})
+
+    def test_a_lock_created_during_the_hold_refuses(self):
+        def patch(m):
+            real, calls = m.host_locks, []
+
+            def host_locks(rosters):
+                calls.append(1)
+                return real(rosters) + (['late_board'] if len(calls) == 2 else [])
+            m.host_locks = host_locks
+        p = self.run_ctl(patch=patch)
+        out = p.output()
+        self.assertEqual(p.returncode, 1, out)
+        self.assertIn('lock(s) created during the hold, so not held: late_board', out)
+        self.assertFalse(self.argv_out.exists())
+        self.assertEqual(self.held(), set())
+
+    def test_no_new_lock_name_is_admitted_until_the_run_ends(self):
+        done = Path(f'{self.argv_out}.done')
+        self.addCleanup(done.touch)                     # a failed assertion still ends the command
+        p = self.run_ctl(action='wait-done')
+        self.wait_for(lambda: self.argv_out.exists(), 'the command to start')
+        with self.assertRaisesRegex(hr.hil_lock.AdmissionClosed, 'late_board has no lock file yet'):
+            hr.hil_lock.take_board_lock('late_board', 'a task starting mid-run')
+        self.assertNotIn('late_board', hr.hil_lock.lock_names())
+        done.touch()
+        out = p.output()
+        self.assertEqual(p.returncode, 0, out)
+        hr.hil_lock.take_board_lock('late_board', 'after the run').close()
+
+    def test_a_running_reservation_refuses_another_before_any_hold(self):
+        hr.hil_lock.ensure_lock_files(['mimxrt1064_evk', 'raspberry_pi_pico2', 'stm32f303disco', 'stm32h743eval'])
+        adm = hr.hil_lock.close_admission()
+        self.addCleanup(adm.close)
+        p = self.run_ctl(patch=lambda m: setattr(m.hil_lock, 'LOG_WAIT', 0.2))
+        out = p.output()
+        self.assertEqual(p.returncode, 1, out)
+        self.assertIn('refused: lock admission: board lock unavailable: .admission.mutex still shared', out)
+        self.assertFalse(self.argv_out.exists())
+        self.assertEqual(self.held(), set())
+
+    def test_a_controller_that_changes_between_the_check_and_the_hold_refuses(self):
+        def patch(m):
+            real, calls = m.check_controller, []
+
+            def check_controller(*a, **k):
+                calls.append(1)
+                if len(calls) == 2:
+                    (self.pci / self.ADDR / 'driver').unlink()
+                    (self.pci / self.ADDR / 'driver').symlink_to(self.drivers / 'xhci_hcd')
+                return real(*a, **k)
+            m.check_controller = check_controller
+        p = self.run_ctl(patch=patch)
+        out = p.output()
+        self.assertEqual(p.returncode, 1, out)
+        self.assertIn('the controller changed between the check and the hold', out)
+        self.assertFalse(self.argv_out.exists())
+
+    def test_a_stranded_controller_is_a_blocker_logged_on_every_board(self):
+        p = self.run_ctl(action='strand')
+        line = p.blocker()
+        self.assertIn('command exited 1', line)
+        self.assertIn(f'{self.ADDR}: no driver bound (stranded; pci-bind attaches one)', line)
+        self.assertIn('not restored within 1 s', line)
+        self.assert_blocked_on_every_lock(p, line)
+
+    def test_a_lost_node_a_changed_driver_or_identity_is_a_blocker(self):
+        p = self.run_ctl(action='renumber-drop')
+        out = p.output()
+        line = next(x for x in out.splitlines() if 'BLOCKER' in x)     # on stdout and stderr
+        self.assertIn('3-1.3 (480M-1.3) (serial 000725299165) not back: absent', line)
+        self.assertIn(f'controller {self.ADDR} buses: 3 -> 1 (480M), 4 -> 2 (5000M)', out)
+        self.assert_blocked_on_every_lock(p, line)
+        for f in self.sys.glob('1-*'):
+            f.rename(self.sys / f.name.replace('1-', '3-', 1))
+        for a, b in (('usb1', 'usb3'), ('usb2', 'usb4')):
+            (self.pci / self.ADDR / a).rename(self.pci / self.ADDR / b)
+        shutil.move(self.sys / '.gone', self.sys / '3-1.3')
+        self.argv_out.unlink()
+
+        def patch(m):
+            real = m.controller_state
+
+            def controller_state(addr, deadline):
+                st = real(addr, deadline)
+                if self.argv_out.exists():                    # after the command: another function at that address
+                    st['ids']['device'] = '0x0015'
+                return st
+            m.controller_state = controller_state
+        p = self.run_ctl(action='swap-driver', patch=patch)
+        line = p.blocker()
+        self.assertIn(f'{self.ADDR}: PCI identity changed: device 0x0014 -> 0x0015', line)
+        self.assertIn(f'{self.ADDR}: bound to xhci_hcd, was xhci-pci-renesas', line)
+        self.assert_blocked_on_every_lock(p, line)
+
+    def test_a_refusal_before_the_unbind_releases_when_the_controller_is_unchanged(self):
+        p = self.run_ctl(action='refuse')
+        out = p.output()
+        self.assertEqual((p.returncode, 'pci-rebind refused before writing anything' in out), (1, True), out)
+        self.assertNotIn('BLOCKER', out)
+        self.assertEqual(self.held(), set())
+        self.assertEqual([latest_failure(hr.hil_lock, l) for l in self.records()], [None] * 4)
+
+    def test_a_hung_command_is_left_running_unsignalled_past_its_bound_and_is_a_blocker(self):
+        def patch(m):
+            m.CONTROLLER_COMMAND_BUDGET = 0.5
+        p = self.run_ctl(action='hang', patch=patch)
+        line = p.blocker()
+        pids = [int(x) for x in line.split('surviving pids [')[1].split(']')[0].split(', ')]
+        self.addCleanup(lambda: [os.kill(x, signal.SIGKILL) for x in pids if hr.hil_lock.proc_start(x)])
+        self.assertIn('command still running after 0.5 s', line)
+        self.assert_blocked_on_every_lock(p, line)
+        self.assertTrue(all(hr.hil_lock.proc_start(x) for x in pids), 'a controller command was signalled')
+        f = latest_failure(hr.hil_lock, 'raspberry_pi_pico2')
+        [marker] = f['receipts']
+        self.assertEqual((marker['unrecheckable'][-2:], marker['survivors']), (['pci-rebind', self.ADDR], pids))
+
+    def test_signals_during_the_command_are_never_forwarded(self):
+        p = self.run_ctl(action='trap')
+        self.wait_for(lambda: self.argv_out.exists(), 'the command to start')
+        time.sleep(0.3)
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            p.send_signal(sig)
+            time.sleep(0.1)
+        self.assertIsNone(p.poll())
+        Path(f'{self.argv_out}.done').touch()           # the trap's loop ends early
+        out = p.through_blocker()
+        self.assertNotIn('TRAPPED', out)
+        line = out.splitlines()[-1]
+        for name in ('SIGTERM', 'SIGINT', 'SIGHUP'):
+            self.assertIn(f'{name} ignored during command', line)
+        self.assertNotIn('forwarded', line)
+        self.assert_blocked_on_every_lock(p, line)
+
+    def test_pci_bind_attaches_a_driverless_controller_and_admits_its_returning_fixtures(self):
+        shutil.rmtree(self.pci / self.ADDR)                # bus 3's devices come back under the idle controller
+        rc, out = main('check', self.IDLE, '--scope', 'controller', *self.rosters())
+        self.assertEqual(rc, 0, out)
+        self.assertIn(f'controller {self.IDLE}: 0x1912:0x0014 subsystem 0x1912:0x0014 class 0x0c0330, driver none', out)
+        p = self.run_ctl(action='bind', verb='pci-bind', addr=self.IDLE,
+                         patch=lambda m: setattr(m, 'CONTROLLER_SETTLE', 0.3))
+        out = p.output()
+        self.assertEqual(p.returncode, 0, out)
+        self.assertEqual(self.argv_out.read_text().split(), ['pci-bind', self.IDLE])
+        self.assertIn(f'controller {self.IDLE} buses: - -> 3 (480M)', out)
+        self.assertIn(f'released 4 lock(s); controller {self.IDLE} back, 5 node(s) on its buses', out)
+        self.assertEqual(self.held(), set())
+
+    def test_pci_bind_waits_for_its_buses_to_settle_so_a_late_device_is_judged(self):
+        shutil.rmtree(self.pci / self.ADDR)
+
+        def patch(m):
+            real, looks = m.controller_walk, []
+            m.CONTROLLER_SETTLE = 0.3
+
+            def controller_walk(addr, identities, deadline, cached=True):
+                nodes = real(addr, identities, deadline, cached)
+                if not cached:                               # a restoration look
+                    looks.append(1)
+                    if len(looks) == 1:                      # enumerates once the first look showed the root hub
+                        self.dev('3-9', serial='late-keyboard')
+                return nodes
+            m.controller_walk = controller_walk
+        p = self.run_ctl(action='bind', verb='pci-bind', addr=self.IDLE, patch=patch)
+        line = p.blocker()
+        self.assertIn('3-9: serial late-keyboard matches no roster identity', line)
+        self.assertIn('not restored within 1 s', line)
+        self.assert_blocked_on_every_lock(p, line)
+
+    def test_a_refused_look_restarts_the_settle_window(self):
+        rosters, seen = hr.load_rosters([str(TINYUSB), str(TINYUF2)]), {}
+
+        def look():
+            return hr.controller_gaps(state, {}, self.ADDR, rosters, time.monotonic() + 5, seen)
+        state = hr.controller_state(self.ADDR, time.monotonic() + 5)
+        self.assertIn(f'{self.ADDR}: buses unchanged for 0.0 of 5 s', look())
+        snap = seen['settle'][0]
+        seen['settle'] = (snap, time.monotonic() - 10)
+        self.assertEqual(look(), [])
+        sub = self.pci / self.ADDR / 'subsystem_device'
+        for cut, restore in ((lambda: sub.rename(f'{sub}.off'), lambda: os.rename(f'{sub}.off', sub)),
+                             (lambda: (self.pci / self.ADDR / 'driver').unlink(),
+                              lambda: (self.pci / self.ADDR / 'driver').symlink_to(self.drivers / 'xhci-pci-renesas'))):
+            with self.subTest(cut=cut):
+                seen['settle'] = (snap, time.monotonic() - 10)
+                cut()
+                self.assertTrue(look())
+                self.assertNotIn('settle', seen)
+                restore()
+                self.assertIn(f'{self.ADDR}: buses unchanged for 0.0 of 5 s', look())
+
+    def test_a_budget_too_short_to_settle_refuses_before_any_lock(self):
+        shutil.rmtree(self.pci / self.ADDR)
+        p = self.run_ctl(action='bind', verb='pci-bind', addr=self.IDLE, budget='5')
+        out = p.output()
+        self.assertEqual(p.returncode, 1, out)
+        self.assertIn(f'refused: --budget 5 s is under 5.5 s: with no device on its buses before, {self.IDLE}', out)
+        self.assertFalse(self.argv_out.exists())
+        self.assertEqual((self.held(), self.records()), (set(), {}))
+
+    def test_pci_bind_passes_its_driver_and_only_pci_bind_takes_one(self):
+        shutil.rmtree(self.pci / self.ADDR)
+        os.environ['PCI_DEV'] = str(self.pci / self.IDLE)
+        p = self.fork_main('run', 'pci-bind', self.IDLE, *self.rosters(), '--reason', 'test', '--budget', '1',
+                           '--driver', 'xhci_hcd', action='bind', patch=lambda m: setattr(m, 'CONTROLLER_SETTLE', 0.3))
+        out = p.output()
+        self.assertEqual(p.returncode, 0, out)
+        self.assertEqual(self.argv_out.read_text().split(), ['pci-bind', self.IDLE, 'xhci_hcd'])
+        self.assertIn(f'sudo -n {hr.RECOVER_SCRIPT} pci-bind {self.IDLE} xhci_hcd\n', out)
+        self.argv_out.unlink()
+        for argv, why in ((('pci-rebind', self.ADDR, '--driver', 'xhci_hcd'), '--driver is for pci-bind only'),
+                          (('root-cycle', '3-1.1', '--driver', 'xhci_hcd'), '--driver is for pci-bind only'),
+                          (('pci-bind', self.IDLE, '--driver', 'xhci/../x'), 'bad driver name: xhci/../x')):
+            with self.subTest(argv=argv):
+                err = io.StringIO()
+                with redirect_stderr(err), self.assertRaises(SystemExit) as e:
+                    hr.main(['run', *argv, *self.rosters(), '--reason', 'r'])
+                self.assertEqual(e.exception.code, 2)
+                self.assertIn(why, err.getvalue())
+        self.assertFalse(self.argv_out.exists())
+
+
+class ControllerScript(ControllerFixture):
+    """The real usb_recover.sh pci-rebind under `run`, against the fake PCI tree through the
+    script's non-root seam: its unbind then bind land, the reservation releases, and its
+    refusal before the unbind (exit 3) releases too."""
+
+    def setUp(self):
+        super().setUp()
+        root = Path(self.td.name)
+        (root / 'sysroot/bus/pci').mkdir(parents=True)
+        (root / 'sysroot/bus/pci/devices').symlink_to(self.pci)
+        (root / 'sysroot/bus/pci/drivers').symlink_to(self.drivers)
+        for drv in ('xhci-pci-renesas', 'xhci_hcd'):
+            for f in ('bind', 'unbind'):
+                (self.drivers / drv / f).write_text('')
+        (self.bin / 'sleep').write_text(SLEEP)
+        (self.bin / 'sleep').chmod(0o755)
+        hr.RECOVER_SCRIPT = str(USB_RECOVER)
+        self.addCleanup(os.environ.pop, 'USB_RECOVER_SYSFS', None)
+        os.environ['USB_RECOVER_SYSFS'] = str(root / 'sysroot')
+
+    def old_helper(self):
+        """usb_recover.sh as it was before its pci refusals exited 3 (die, exit 1): the copy a rig
+        keeps until hil-farm-setup refreshes it."""
+        text = USB_RECOVER.read_text()
+        head, sep, rest = text.partition('require_usb_controller() {')
+        pci, sep2, tail = rest.partition('  root-cycle)')
+        old = head + sep + pci.replace('refuse "', 'die "') + sep2 + tail
+        self.assertNotEqual(old, text)
+        path = self.bin / 'usb_recover_old.sh'
+        path.write_text(old)
+        path.chmod(0o755)
+        return str(path)
+
+    def test_an_old_helpers_refusal_fails_closed_naming_the_helper(self):
+        if os.geteuid() == 0:
+            self.skipTest('the fake-tree seams are ignored under root')
+        hr.RECOVER_SCRIPT = self.old_helper()
+
+        def patch(m):
+            real_run, link = m.Reservation.run, self.pci / self.ADDR / 'driver'
+
+            def run(res, argv, bound=None):
+                os.rename(link, f'{link}.off')           # the helper finds no driver: refused before the unbind
+                try:
+                    return real_run(res, argv, bound)
+                finally:
+                    os.rename(f'{link}.off', link)
+            m.Reservation.run = run
+        p = self.run_ctl(patch=patch)
+        out = p.output()
+        line = next(x for x in out.splitlines() if 'BLOCKER' in x)
+        self.assertIn(f'no driver bound to {self.ADDR}', out)
+        self.assertIn('command exited 1', line)
+        self.assertIn(f'the controller is unchanged: if {hr.RECOVER_SCRIPT} predates exit 3 for pci refusals', line)
+        self.assertIn('hil-farm-setup', line)
+        self.assert_blocked_on_every_lock(p, line)
+        for drv in ('xhci-pci-renesas', 'xhci_hcd'):
+            self.assertEqual((self.drivers / drv / 'unbind').read_text(), '')
+
+    def test_a_pci_bind_names_the_old_helper_only_when_it_had_no_bind_file_to_write(self):
+        if os.geteuid() == 0:
+            self.skipTest('the fake-tree seams are ignored under root')
+        settle = lambda m: setattr(m, 'CONTROLLER_SETTLE', 0.3)   # noqa: E731
+        for drv in ('xhci-pci-renesas', 'xhci_hcd'):
+            (self.drivers / drv / 'bind').unlink()
+        p = self.run_ctl(verb='pci-bind', addr=self.IDLE, patch=settle)
+        out = p.output()
+        self.assertEqual(p.returncode, 1, out)
+        self.assertIn(f'no known xHCI driver is loaded to bind {self.IDLE}', out)
+        self.assertIn('pci-bind refused before writing anything', out)
+        self.assertEqual(self.held(), set())
+        hr.RECOVER_SCRIPT = self.old_helper()
+        p = self.run_ctl(verb='pci-bind', addr=self.IDLE, patch=settle)
+        line = p.blocker()
+        self.assertIn('command exited 1', line)
+        self.assertIn(f'the controller is unchanged: if {hr.RECOVER_SCRIPT} predates exit 3', line)
+        self.assert_blocked_on_every_lock(p, line)
+        hr.RECOVER_SCRIPT = str(USB_RECOVER)
+        (self.drivers / 'xhci_hcd' / 'bind').mkdir()            # there, but its write fails: the kernel's rejection
+        os.environ['PCI_DEV'] = str(self.pci / self.IDLE)
+        p = self.fork_main('run', 'pci-bind', self.IDLE, *self.rosters(), '--reason', 'test', '--budget', '1',
+                           '--driver', 'xhci_hcd', patch=settle)
+        line = p.blocker()
+        self.assertIn('command exited 1', line)
+        self.assertNotIn('predates exit 3', line)
+        self.assert_blocked_on_every_lock(p, line)
+
+    def test_the_real_script_rebinds_under_the_reservation(self):
+        if os.geteuid() == 0:
+            self.skipTest('the fake-tree seams are ignored under root')
+        p = self.run_ctl()
+        out = p.output()
+        self.assertEqual(p.returncode, 0, out)
+        self.assertIn(f'rebound pci {self.ADDR} (xhci-pci-renesas)', out)
+        for f in ('unbind', 'bind'):
+            self.assertEqual((self.drivers / 'xhci-pci-renesas' / f).read_text(), f'{self.ADDR}\n')
+        self.assertEqual(self.held(), set())
+
+        def patch(m):
+            real_run, link = m.Reservation.run, self.pci / self.ADDR / 'driver'
+
+            def run(res, argv, bound=None):
+                os.rename(link, f'{link}.off')           # the script finds no driver: refused before the unbind
+                try:
+                    return real_run(res, argv, bound)
+                finally:
+                    os.rename(f'{link}.off', link)
+            m.Reservation.run = run
+        p = self.run_ctl(patch=patch)
+        out = p.output()
+        self.assertEqual(p.returncode, 1, out)
+        self.assertIn(f'no driver bound to {self.ADDR}', out)
+        self.assertIn('pci-rebind refused before writing anything', out)
+        self.assertEqual(self.held(), set())
 
 
 class RecoverScriptChoice(unittest.TestCase):

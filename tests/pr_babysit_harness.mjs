@@ -8514,6 +8514,84 @@ test('a failed CodeRabbit review gets one `@coderabbitai review` per head, waite
   assert.deepEqual(requests(plain.labels), [])
 })
 
+// harvest.py's reading of a CodeRabbit check run skipped as "No files to review".
+const noFilesCr = () => bot('coderabbit', { state: 'settled', kind: 'skipped', evidence: ['check run completed/skipped'], reason: 'check run skipped: No files to review' })
+
+test('a "No files to review" skip gets one `@coderabbitai full review` per head, waited on to the cap, never read as reviewed (#577)', async () => {
+  let n = 0
+  const { result, logs, labels, calls } = await run({
+    args: { coderabbitTrigger: true, maxCycles: 3 }, reviewsPerCycle: () => quiet([++n === 1 ? noFilesCr() : bot('coderabbit')]), crRequest: { outcome: 'requested', detail: 'comment 99', commentId: 99, retryAt: null, full: true },
+  })
+  assert.equal(result.pass, true, result.reason)
+  assert.deepEqual([triggers(labels), requests(labels)], [[], ['crrequest#1']], 'no box asks a no-files skip')
+  const call = calls.find(c => c.label === 'crrequest#1')
+  assert.ok(call.prompt.includes(`--head ${HEAD} --request\``), call.prompt)
+  assert.ok(call.prompt.includes('in full, as it skipped the head with no files to review'), call.prompt)
+  assert.equal(headLine(logs)[0], 'cycle 1 summary — CI green, reviews: coderabbit review triggered (check run skipped: No files to review, 10m to cap)')
+  // The skip standing at the cap after its one request stops unreviewed, and says so.
+  const capped = await run({ args: { coderabbitTrigger: true, maxCycles: 4 }, minutesPerCycle: 5, reviews: quiet([noFilesCr()]), crRequest: { outcome: 'requested', detail: 'comment 99', commentId: 99, retryAt: null, full: true } })
+  assert.equal(capped.result.reason, 'coderabbit-unreviewed')
+  assert.deepEqual([triggers(capped.labels), requests(capped.labels)], [[], ['crrequest#1']])
+  assert.deepEqual(capped.result.coderabbitAsk, { relaunchAsks: null, asked: [{ ask: 'request', at: at(0), requests: 1, full: true }], nothingToReview: true })
+  // Without the switch nothing is asked, and nothing requires CodeRabbit.
+  const plain = await run({ args: { maxCycles: 2 }, reviews: quiet([noFilesCr()]) })
+  assert.equal(plain.result.pass, true, plain.result.reason)
+  assert.deepEqual(requests(plain.labels), [])
+})
+
+test('an incremental ask that then meets a "No files to review" skip is reported as the command it sent (#577)', async () => {
+  const failedCr = () => bot('coderabbit', { state: 'settled', kind: 'failed', sha: 'head', evidence: ['check run completed/neutral'], reason: 'check run: Review failed' })
+  let n = 0
+  const { result, labels } = await run({ args: { coderabbitTrigger: true, maxCycles: 4 }, minutesPerCycle: 5,
+    reviewsPerCycle: () => quiet([++n === 1 ? failedCr() : noFilesCr()]) })
+  assert.equal(result.reason, 'coderabbit-unreviewed')
+  assert.deepEqual(requests(labels), ['crrequest#1'], 'its one ask on the head is spent')
+  assert.deepEqual(result.coderabbitAsk, { relaunchAsks: null, asked: [{ ask: 'request', at: at(0), requests: 1 }], nothingToReview: true })
+})
+
+test('the recorded ask is the command the trigger script sent, not the workflow\'s own reading (#577)', async () => {
+  const failedCr = () => bot('coderabbit', { state: 'settled', kind: 'failed', sha: 'head', evidence: ['check run completed/neutral'], reason: 'check run: Review failed' })
+  // The workflow read a failed review; the script, reading again, found the no-files skip and asked in full.
+  const { result } = await run({ args: { coderabbitTrigger: true, maxCycles: 4 }, minutesPerCycle: 5, reviews: quiet([failedCr()]),
+    crRequest: { outcome: 'requested', detail: 'comment 99', commentId: 99, retryAt: null, full: true } })
+  assert.equal(result.reason, 'coderabbit-unreviewed')
+  assert.deepEqual(result.coderabbitAsk, { relaunchAsks: null, asked: [{ ask: 'request', at: at(0), requests: 1, full: true }] })
+})
+
+test('an adopted base merge CodeRabbit finds nothing to review on is asked once, across resumes and a rate limit (#577)', async () => {
+  const Y = { coderabbitTrigger: true, maxCycles: 6, yieldAfterCycle: true }
+  // The head before the merge, reviewed: the merge adopted on top of it carries the same net diff.
+  const a = await run({ args: Y, reviews: quiet([bot('coderabbit')]) })
+  assert.equal(a.result.pass, true, a.result.reason)
+  const b = await run({ args: { ...Y, state: a.result.state, adoptHead: ADOPT }, preflight: { head: ADOPT, prHead: HEAD }, clockOffset: 20, reviews: quiet([noFilesCr()]), crRequest: { outcome: 'requested', detail: 'comment 99', commentId: 99, retryAt: null, full: true } })
+  assert.equal(b.result.state.expectedHead, ADOPT)
+  assert.equal(b.result.reason, 'yielded', 'waiting on its ask, not stopped')
+  assert.deepEqual(requests(b.labels), ['crrequest#2'])
+  assert.ok(b.calls.find(c => c.label === 'crrequest#2').prompt.includes(`--head ${ADOPT} --request\``))
+  assert.deepEqual(b.result.state.reviewClock.request, { at: at(20), retryAt: null, tried: at(20), full: true })
+  const resumed = (over) => run({ args: { ...Y, state: b.result.state }, preflight: { head: ADOPT, prHead: ADOPT }, ...over })
+  const reviewed = await resumed({ clockOffset: 25, reviews: quiet([bot('coderabbit')]) })
+  assert.equal(reviewed.result.pass, true, reviewed.result.reason)
+  assert.deepEqual(requests(reviewed.labels), [])
+  const stood = await resumed({ clockOffset: 31, reviews: quiet([noFilesCr()]) })
+  assert.equal(stood.result.reason, 'coderabbit-unreviewed', 'a skip is never a review')
+  assert.equal(stood.result.head, ADOPT)
+  assert.deepEqual(requests(stood.labels), [], 'never a second ask on the head')
+  assert.deepEqual(stood.result.coderabbitAsk, { relaunchAsks: null, asked: [{ ask: 'request', at: at(20), requests: 1, full: true }], nothingToReview: true })
+  // A limit after the ask waits out the window its request opened: nothing asked again before it.
+  const limited = await resumed({ clockOffset: 22, reviews: quiet([limitedCr(at(30))]) })
+  assert.equal(limited.result.reason, 'yielded', limited.result.reason)
+  assert.deepEqual(requests(limited.labels), [])
+  // A state that stopped on the skip before this ask existed: a relaunch with the switch asks once, the next nothing.
+  const { request, requests: _, ...clock } = b.result.state.reviewClock
+  const unasked = seal({ ...b.result.state, reviewClock: clock })
+  const c = await run({ args: { ...Y, state: unasked }, preflight: { head: ADOPT, prHead: ADOPT }, clockOffset: 40, reviews: quiet([noFilesCr()]) })
+  assert.deepEqual(requests(c.labels), ['crrequest#3'])
+  const d = await run({ args: { ...Y, state: c.result.state }, preflight: { head: ADOPT, prHead: ADOPT }, clockOffset: 52, reviews: quiet([noFilesCr()]) })
+  assert.deepEqual(requests(d.labels), [])
+  assert.equal(d.result.reason, 'coderabbit-unreviewed')
+})
+
 test('a cycle that asked a bot to review and then met a GitHub rate limit stays charged', async () => {
   const { result, labels } = await run({
     args: { coderabbitTrigger: true, maxCycles: 4 }, reviews: quiet([skippedCr()]),

@@ -18,7 +18,9 @@
 #   pci-rebind <pciaddr>   # e.g. 0000:05:00.0 -> unbind+bind the whole xHCI
 #                          # controller. For a DEAD CONTROLLER, not a wedged
 #                          # device: it renumbers every bus it owns.
-#   pci-bind   <pciaddr> [drv]  # re-attach a driver to a DRIVERLESS controller
+#                          # Exit 3: refused before the unbind was written.
+#   pci-bind   <pciaddr> [drv]  # re-attach a driver to a DRIVERLESS controller.
+#                          # Exit 3: refused before any bind was written.
 #   resolve    <devnode>   # e.g. /dev/ttyACM3 -> print its <busport> (no privilege needed)
 #   shield     <busport> <owner-pid>    # chmod 000 the nine locking attrs of the wedged leaf, its
 #                          # parent hub and the root hub so non-root libusb enumerators skip it;
@@ -89,8 +91,8 @@ lock_read() {
 # mistyped BDF can't unbind/reset an unrelated device (storage, NIC) on a shared HIL host.
 require_usb_controller() {
   local addr=$1 cls
-  cls=$(cat "$SYSFS/bus/pci/devices/$addr/class" 2>/dev/null) || die "no such pci device: $addr"
-  [[ "$cls" =~ ^0x0c03 ]] || die "$addr is not a USB controller (class $cls); refusing"
+  cls=$(cat "$SYSFS/bus/pci/devices/$addr/class" 2>/dev/null) || refuse "no such pci device: $addr"
+  [[ "$cls" =~ ^0x0c03 ]] || refuse "$addr is not a USB controller (class $cls); refusing"
 }
 
 # Generation marker for "did this device actually re-enumerate". A real disconnect destroys the
@@ -463,9 +465,9 @@ case "$action" in
     echo "re-authorized $target"
     ;;
   pci-rebind)
-    [[ "$target" =~ $PCI_RE ]] || die "bad pci addr: $target"
+    [[ "$target" =~ $PCI_RE ]] || refuse "bad pci addr: $target"
     require_usb_controller "$target"
-    [ -e "$SYSFS/bus/pci/devices/$target/driver" ] || die "no driver bound to $target"
+    [ -e "$SYSFS/bus/pci/devices/$target/driver" ] || refuse "no driver bound to $target"
     drv=$(basename "$(readlink -f "$SYSFS/bus/pci/devices/$target/driver")")
     echo "$target" > "$SYSFS/bus/pci/drivers/$drv/unbind"; sleep 1
     echo "$target" > "$SYSFS/bus/pci/drivers/$drv/bind"
@@ -473,24 +475,27 @@ case "$action" in
     ;;
   pci-bind)
     # Re-attach a driver to a controller left DRIVERLESS (e.g. a pci-rebind whose re-bind hung).
-    [[ "$target" =~ $PCI_RE ]] || die "bad pci addr: $target"
+    [[ "$target" =~ $PCI_RE ]] || refuse "bad pci addr: $target"
     require_usb_controller "$target"
-    [ -e "$SYSFS/bus/pci/devices/$target" ] || die "no such pci device: $target"
-    [ -e "$SYSFS/bus/pci/devices/$target/driver" ] && die "$target already has a driver bound"
+    [ -e "$SYSFS/bus/pci/devices/$target" ] || refuse "no such pci device: $target"
+    [ -e "$SYSFS/bus/pci/devices/$target/driver" ] && refuse "$target already has a driver bound"
     drv=${3:-}
     if [ -n "$drv" ]; then
-      [[ "$drv" =~ $DRIVER_RE ]] || die "bad driver name: $drv"
-      [ -e "$SYSFS/bus/pci/drivers/$drv/bind" ] || die "no such pci driver: $drv"
+      [[ "$drv" =~ $DRIVER_RE ]] || refuse "bad driver name: $drv"
+      [ -e "$SYSFS/bus/pci/drivers/$drv/bind" ] || refuse "no such pci driver: $drv"
       echo "$target" > "$SYSFS/bus/pci/drivers/$drv/bind"
       echo "bound pci $target ($drv)"
     else
       # Auto-try the xHCI drivers (Renesas uPD720201 uses xhci-pci-renesas; others xhci_hcd).
+      tried=''
       for cand in xhci-pci-renesas xhci_hcd; do
         [ -e "$SYSFS/bus/pci/drivers/$cand/bind" ] || continue
+        tried=yes
         if echo "$target" > "$SYSFS/bus/pci/drivers/$cand/bind" 2>/dev/null; then
           echo "bound pci $target ($cand)"; exit 0
         fi
       done
+      [ -n "$tried" ] || refuse "no known xHCI driver is loaded to bind $target; pass the driver explicitly"
       die "could not bind $target with a known xHCI driver; pass the driver explicitly"
     fi
     ;;

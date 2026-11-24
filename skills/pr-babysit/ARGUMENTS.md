@@ -50,9 +50,13 @@ A key not listed here throws before anything runs.
   for the review up to the silent-bot cap. Once
   per head too, it comments `@coderabbitai review` instead when that tick
   failed (a summary with no box to tick, a failed edit), unless the box reads
-  ticked or such a comment follows the head event, and when CodeRabbit's
-  review of the head failed (such as a `Review failed` check run), unless such a
-  comment follows the head event. A rate limit leaves no box:
+  ticked or such a comment follows the head event, when CodeRabbit's
+  review of the head failed (such as a `Review failed` check run), and
+  `@coderabbitai full review` when it skipped the head with no files to review
+  (a `No files to review` check run, such as on an adopted merge of the base
+  whose net diff it reviewed on an earlier head; an incremental `review` would
+  answer the same skip), each unless such a comment follows the head event.
+  That skip is never read as a review. A rate limit leaves no box:
   several PRs share the repository's hourly quota, so the launch waits the
   limit out with no ceiling and never stops for it, commenting
   `@coderabbitai review` once per reset window, a minute past the later of the
@@ -68,7 +72,8 @@ A key not listed here throws before anything runs.
   nothing more to ask) stops `coderabbit-unreviewed`, never a pass. That stop,
   and any other with CodeRabbit's last reading of the head no review, returns
   `coderabbitAsk`: the asks made on the head, the one a relaunch would still
-  make, if any, and for a limit `nextAt`, when the next request is due.
+  make, if any, for a limit `nextAt`, when the next request is due, and
+  `nothingToReview: true` when the reading is a no-files skip.
   Needs `autoPush` and `coderabbit` in `autoRun`; the switch itself is never
   restored from a state.
 - `greptileTrigger` (boolean, default false): set in the repository's

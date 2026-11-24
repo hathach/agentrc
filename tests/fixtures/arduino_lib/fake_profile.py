@@ -139,7 +139,7 @@ def hil_record(root, head, identity, board, at=None, **over):
     elf = root / f'build/hil/{board}/echo/echo.ino.elf'
     elf.parent.mkdir(parents=True, exist_ok=True)
     elf.write_bytes(b'elf')
-    rec = {'kind': 'arduino-hil-build', 'version': 2, 'library': NAME, 'board': board, 'experimental': False,
+    rec = {'kind': 'arduino-hil-build', 'version': 3, 'library': NAME, 'board': board, 'experimental': False,
            'source': {'head': head}, **identity,
            'sketches': {'echo': {'sha256': {elf.relative_to(root).as_posix(): hashlib.sha256(b'elf').hexdigest()}}},
            **over}

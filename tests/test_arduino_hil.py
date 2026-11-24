@@ -1,5 +1,5 @@
 """skills/arduino/scripts/arduino_hil.py is the HIL harness mechanics an Arduino library's hil_test.py binds its profile
-to: roster checks, build record admission (schema 2), DUT identity, flashing, the battery's lock and cleanup paths,
+to: roster checks, build record admission (schema 3), DUT identity, flashing, the battery's lock and cleanup paths,
 manual sessions, commissioning, verdicts and the report. Moved from Adafruit_TinyUSB_Arduino's hil_test.py (2989bca)
 with its .claude/test/test_hil.py, run here against a fake library (tests/fixtures/arduino_lib) with agentrc's lock,
 flash, process, report and USB modules and pyserial stubbed. Stubs prove the plumbing only; hardware behaviour is a
@@ -282,7 +282,7 @@ class Base(unittest.TestCase):
         rel = f'build/hil/{board}/echo/echo.ino.elf'
         (self.root / rel).parent.mkdir(parents=True, exist_ok=True)
         (self.root / rel).write_bytes(b'elf')
-        rec = {'kind': 'arduino-hil-build', 'version': 2, 'library': fake.NAME, 'board': board, 'experimental': False,
+        rec = {'kind': 'arduino-hil-build', 'version': 3, 'library': fake.NAME, 'board': board, 'experimental': False,
                'fqbn': 'f', 'platform': {}, 'source': {'head': 'abc', 'dirty': False}, 'role': 'device',
                'roster': {'sha256': sha(self.roster.read_bytes())}, **H.B.contract_identity(),
                'sketches': {'echo': {'example': 'examples/Basic/echo', 'vidPid': '1234:5678', 'elf': rel, 'hex': None,
@@ -482,8 +482,8 @@ class Admission(Base):
                           ({'source': {'head': 'old'}}, 'built at old, the checkout is at abc: rebuild'),
                           ({'roster': {'sha256': '0'}}, 'changed since the record was built'),
                           ({'role': 'host'}, 'a host record, rig_jlink is a device board'),
-                          ({'kind': 'other'}, 'not a version 2'),
-                          ({'version': 1}, 'not a version 2 arduino-hil-build record: rebuild it with the build '
+                          ({'kind': 'other'}, 'not a version 3'),
+                          ({'version': 2}, 'not a version 3 arduino-hil-build record: rebuild it with the build '
                                            'contract\'s --record'),
                           ({'library': 'Other Library'}, 'it is a Other Library record, this harness is Fake USB '
                                                          'Library\'s')):
@@ -756,7 +756,7 @@ class Esp(Base):
             H.gdb_argv('rig_esp', board, 'fw.elf', [])
 
     def test_flash_names_what_the_flasher_wrote(self):
-        image = {'elf': '/r/echo.ino.elf', 'hex': '/r/echo.ino.hex', 'segments': [[0, 'a'], [1, 'b']]}
+        image = {'elf': '/r/echo.ino.elf', 'hex': '/r/echo.ino.hex', 'segments': [[0, 'a'], [1, 'b']], 'uid': 'JUID'}
         self.assertEqual([H.written({'name': n}, image) for n in ('openocd', 'jlink', 'esptool')],
                          ['echo.ino.elf', 'echo.ino.hex', '2 flash_args images'])
         dev = {'busport': '9-1.4', 'devnum': 95, 'ino': 3, 'after': 1.9}
@@ -787,6 +787,121 @@ class Esp(Base):
         img = images['echo']
         self.assertEqual((img['chip'], img['segments']), ('esp32s3', [[0, 'a.bin']]))
         self.assertEqual(sorted(p.name for p in Path(img['dir']).iterdir()), sorted(files))
+
+
+class ImageIdentity(Base):
+    """agentrc#487: an ESP32-S3 image identifies by its USB stack (the FQBN's USBMode), TinyUSB and the
+    USB-Serial/JTAG sharing one PHY and one bus port with different serials; the serials here are opaque, as the
+    roster's must be observed ones."""
+    S3_USJ = {'openocd': '-f board/esp32s3-builtin.cfg', 'tool': 'openocd-esp32', 'uid': 'USJ-SN',
+              'usb_port': '11-1.3'}
+
+    def setUp(self):
+        super().setUp()
+        self.patch(self.BP, 'BOARDS', {**self.BP.BOARDS, 'rig_esp': {
+            **self.BP.BOARDS['rig_esp'], 'fqbn': 'esp:esp32:s3:USBMode=default,CDCOnBoot=cdc'}})
+
+    def s3(self, **over):
+        """rig_esp as the S3: its TinyUSB serial `uid`, the USJ's in `uids`, the debug route on the DUT's port."""
+        entry = {'uid': 'TUSB-SN', 'no_serial': None, 'uids': {'default': 'TUSB-SN', 'hwcdc': 'USJ-SN'},
+                 'debug': self.S3_USJ, **over}
+        self.roster = fake.roster(self.root / 'test/hil/ci.json', rig_esp=entry)
+        return self.board('rig_esp')
+
+    def admit(self, modes):
+        """Admit a rig_esp record with one sketch per {name: USBMode} (None: no USBMode in its FQBN)."""
+        sketches = {}
+        for name, mode in modes.items():
+            rel = f'build/hil/rig_esp/{name}/'
+            (self.root / rel).mkdir(parents=True, exist_ok=True)
+            (self.root / rel / 'a.elf').write_bytes(name.encode())
+            sketches[name] = {'image': 'esptool', 'elf': rel + 'a.elf', 'hex': None, 'vidPid': '303a:1001',
+                              'segments': [], 'sha256': {rel + 'a.elf': sha(name.encode())},
+                              'fqbn': 'esp:esp32:s3:' + (f'USBMode={mode},' if mode else '') + 'CDCOnBoot=cdc'}
+        path = self.record(board='rig_esp', chip='esp32s3', sketches=sketches)
+        with mock.patch.object(H, 'git_identity', return_value=('abc', '')):
+            return H.admit(path, 'rig_esp', self.roster, self.dir / 'run')[1]
+
+    def test_uids_are_validated(self):
+        cases = (({'uids': 'x'}, 'uids maps each USBMode option'),
+                 ({'uids': {}}, 'uids maps each USBMode option'),
+                 ({'uids': {'default': 'TUSB-SN', 'hwcdc': ' '}}, 'uids maps each USBMode option'),
+                 ({'uids': {'default': 'TUSB-SN', 'hwcdc': 'tusb-sn'}}, 'distinct serials'),
+                 ({'uids': {'default': 'OTHER', 'hwcdc': 'USJ-SN'}}, 'uid among them'),
+                 ({'no_serial': True}, 'no no_serial'),
+                 ({'uids': {'default': 'TUSB-SN'}}, "debug route on the DUT's own usb_port needs a uids entry"),
+                 ({'uids': None}, "debug route on the DUT's own usb_port needs a uids entry"))
+        for over, why in cases:
+            with self.subTest(over=over), self.assertRaisesRegex(H.Refused, why):
+                self.s3(**over)
+        self.assertEqual(self.s3(debug=None)['uids'], {'default': 'TUSB-SN', 'hwcdc': 'USJ-SN'})
+
+    def test_each_image_takes_the_identity_its_usb_mode_names(self):
+        self.s3()
+        images = self.admit({'echo': 'default', 'echo_usj': 'hwcdc'})
+        self.assertEqual({k: v['uid'] for k, v in images.items()}, {'echo': 'TUSB-SN', 'echo_usj': 'USJ-SN'})
+        for modes, why in (({'echo': 'cdc'}, r'no identity for USBMode=cdc \(esp:esp32:s3:USBMode=cdc'),
+                           ({'echo': None}, 'no identity for no USBMode'),
+                           ({'echo': 'hwcdc,Bad'}, r"menu options \['Bad'\] have no")):
+            with self.subTest(modes=modes), self.assertRaisesRegex(H.Refused, why):
+                self.admit(modes)
+
+    def test_without_uids_only_the_rig_usb_mode_takes_the_roster_uid(self):
+        self.s3(uids=None, debug=None)
+        self.assertEqual(self.admit({'echo': 'default'})['echo']['uid'], 'TUSB-SN')
+        with self.assertRaisesRegex(H.Refused, "builds USBMode=hwcdc, not the rig FQBN's.*give the board uids"):
+            self.admit({'echo': 'default', 'echo_usj': 'hwcdc'})
+
+    def test_flash_check_and_step_find_the_images_own_identity(self):
+        board = self.s3()
+        image = {**self.admit({'echo_usj': 'hwcdc'})['echo_usj'], 'segments': [[0, 'a.bin']]}
+        usj = {'busport': '11-1.3', 'ino': 4, 'devnum': 9, 'serial': 'USJ-SN'}
+        self.A.usb.usb_scan.side_effect = lambda vid_pid=None, serial=None: [usj] if serial == 'USJ-SN' else []
+        self.A.usb.usb_devices.return_value = [usj]
+        self.assertEqual(H.dut_devices('303a:1001', H.imaged(board, image)), [usj])
+        self.assertEqual(H.dut_devices('303a:1001', board), [])   # the TinyUSB serial: the misleading "no USB"
+        with mock.patch.object(H, 'flash', return_value=''), \
+                mock.patch.object(H, 'wait_enumerated', return_value=usj) as waited:
+            row = H.flash_only('rig_esp', board, image, self.dir, mock.Mock())
+        self.assertEqual(waited.call_args[0][1]['uid'], 'USJ-SN')
+        self.assertEqual(row['detail'], 'flashed 1 flash_args images; enumerated as 303a:1001 at 11-1.3')
+        args = argparse.Namespace(board='rig_esp', test=None)
+        with mock.patch.object(H, 'admit_sketch', return_value=({'record': 'r'}, image, {})):
+            row = H.op_check(args, board, self.dir, mock.Mock(), None)
+        self.assertEqual((row['pass'], row['device']['busport']), (True, '11-1.3'))
+        with mock.patch.object(H, 'flash', return_value=''), \
+                mock.patch.object(H, 'wait_enumerated', return_value=None) as waited:
+            row = H.step('rig_esp', board, image, 'echo', self.dir, mock.Mock())
+        self.assertEqual(waited.call_args[0][1]['uid'], 'USJ-SN')
+        self.assertIn('no 303a:1001 with serial USJ-SN at 11-1.3 enumerated anew', row['detail'])
+
+    def gdb(self, board, image):
+        args = argparse.Namespace(board='rig_esp', roster=str(self.roster), sketch='echo', ex=[], timeout=5)
+        with mock.patch.object(H, 'admit_sketch', return_value=({'record': 'r'}, image, {})), \
+                mock.patch.object(H, 'gdb_argv', return_value=['gdb']) as argv, \
+                mock.patch.object(H, 'run_child', return_value={'pass': True}):
+            row = H.op_gdb(args, board, self.dir, None, None)
+        return row, argv
+
+    def test_gdb_on_the_duts_own_port_refuses_under_a_tinyusb_image(self):
+        board = self.s3()
+        images = self.admit({'echo': 'default', 'echo_usj': 'hwcdc'})
+        with self.assertRaisesRegex(H.Refused, r"USB-Serial/JTAG USJ-SN on the DUT's own usb_port 11-1.3, there only "
+                                               r"under a USBMode=hwcdc image; echo is built "
+                                               r"esp:esp32:s3:USBMode=default,CDCOnBoot=cdc and enumerates as TUSB-SN"):
+            self.gdb(board, images['echo'])
+        row, argv = self.gdb(board, images['echo_usj'])
+        self.assertEqual((row['pass'], argv.call_args[0][2]), (True, images['echo_usj']['elf']))
+
+    def test_gdb_on_a_separate_debug_port_runs_under_a_tinyusb_image(self):
+        """The P4: its USB-Serial/JTAG on its own port (debug.usb_port 11-1.2) is there whatever the image."""
+        p4 = {**self.S3_USJ, 'openocd': '-f board/esp32p4-builtin.cfg', 'uid': '60:55:F9:F9:87:15',
+              'usb_port': '11-1.2'}
+        self.patch(self.BP, 'BOARDS', {**self.BP.BOARDS, 'rig_esp': {**self.BP.BOARDS['rig_esp'], 'chip': 'esp32p4'}})
+        board = self.s3(uid='0', uids=None, debug=p4)
+        row, argv = self.gdb(board, self.admit({'echo': 'default'})['echo'])
+        self.assertTrue(row['pass'])
+        argv.assert_called_once()
 
 
 class Console(Base):
@@ -1191,7 +1306,7 @@ class BaseImage(Base):
         return mock.patch.object(H, 'flash_and_enumerate', fe)
 
     def test_every_row_after_a_flash_names_the_base_state(self):
-        image = {'vidPid': '1234:5678', 'elf': 'a.elf', 'hex': 'a.hex', 'base': self.base()}
+        image = {'vidPid': '1234:5678', 'elf': 'a.elf', 'hex': 'a.hex', 'base': self.base(), 'uid': 'JUID'}
         board, said = self.board('rig_jlink'), 'rewritten: the run at 0x1000 differed'
         self.A.usb.usb_devices.return_value = []
         for why, dev in (('J-Link flash: x', None), ('', None)):
@@ -1213,7 +1328,7 @@ class Step(Base):
         board = self.board('rig_jlink')
         dev = {'busport': '1-1', 'dir': '/x'}
         with mock.patch.object(H, 'flash_and_enumerate', return_value=('', '', dev)):
-            row = H.step('rig_jlink', board, {'vidPid': '1234:5678'}, 'echo', self.dir, mock.Mock())
+            row = H.step('rig_jlink', board, {'vidPid': '1234:5678', 'uid': 'JUID'}, 'echo', self.dir, mock.Mock())
         self.assertEqual((row['pass'], row['device']), (True, '1-1'))
         a = seen.call_args[0]
         self.assertEqual((a[0], len(a[1]), a[4], a[5]), (dev, 8, self.dir, board))   # dev, nonce, ..., run_dir, board
@@ -1225,12 +1340,14 @@ class Step(Base):
         tracker.check.side_effect = H.Unclean('read-block: cleanup unknown')
         with mock.patch.object(H, 'flash_and_enumerate', return_value=('', '', {'busport': '1-1', 'dir': '/x'})), \
                 self.assertRaises(H.Unclean):
-            H.step('rig_jlink', self.board('rig_jlink'), {'vidPid': '1234:5678'}, 'inout', self.dir, tracker)
+            H.step('rig_jlink', self.board('rig_jlink'), {'vidPid': '1234:5678', 'uid': 'JUID'}, 'inout', self.dir,
+                   tracker)
 
     def test_no_new_enumeration_fails_naming_the_dut(self):
         self.A.usb.usb_devices.return_value = [{'busport': '3-1'}]
         with mock.patch.object(H, 'flash_and_enumerate', return_value=('', 'detached', None)):
-            row = H.step('rig_ocd', self.board('rig_ocd'), {'vidPid': '239a:cafe'}, 'echo', self.dir, mock.Mock())
+            row = H.step('rig_ocd', self.board('rig_ocd'), {'vidPid': '239a:cafe', 'uid': 'OUID'}, 'echo', self.dir,
+                         mock.Mock())
         self.assertFalse(row['pass'])
         self.assertIn("no 239a:cafe with serial OUID enumerated anew within 20s (that VID:PID at: ['3-1'])",
                       row['detail'])
@@ -1320,7 +1437,7 @@ class Battery(Base):
                 tracker._note('unknown', {'pid': 7}, ['probe-tool'])
             return True, 'echoed'
         self.HP.TEST_FUNCS['echo'] = echo
-        images = {'echo': {'sha256': {}, 'fqbn': 'vend:arch:rig_jlink', 'vidPid': '1234:5678'}}
+        images = {'echo': {'sha256': {}, 'fqbn': 'vend:arch:rig_jlink', 'vidPid': '1234:5678', 'uid': 'JUID'}}
         with mock.patch.object(H, 'flash_and_enumerate', return_value=('', '', {'busport': '1-1', 'dir': '/x'})):
             row = self.run_board(step=H.step, restore=H.restore,
                                  admit=lambda *a, **k: (json.loads(self.record().read_text()), images))
@@ -2031,7 +2148,28 @@ class Manual(Base):
         self.assertIn('interface/jlink.cfg', pipe)
         self.assertEqual(pipe[-1], 'foreach t [target names] { $t configure -event gdb-detach { resume } }')
         self.assertFalse(any('vid_pid' in w for w in pipe))
-        self.assertNotIn('arp_poll', H.gdb_argv('rig_host', self.board('rig_host'), 'fw.elf', [])[4])   # rp2350
+        rp2350 = shlex.split(H.gdb_argv('rig_host', self.board('rig_host'), 'fw.elf', [])[4]
+                             .removeprefix('target extended-remote | '))
+        self.assertIn('target/rp2350.cfg', rp2350)
+        self.assertEqual(rp2350[-1], 'foreach t [target names] { $t configure -event gdb-detach '
+                                     '{ foreach u [target names] { $u arp_poll }; resume } }')
+
+    def test_gdb_takes_a_registered_boards_route_from_the_registry(self):
+        self.BP.BOARDS['metro_m4_express'] = {'fqbn': 'vend:arch:metro', 'family': 'fb', 'filters': 'dev_b',
+                                              'span': (0x4000, 0x80000)}
+        metro = {'name': 'metro_m4_express', 'uid': 'MUID', 'probe': '000063728691', 'arduino': {'tests': ['echo']}}
+        roster = self.dir / 'registered.json'
+        roster.write_text(json.dumps({'boards': [metro]}))
+        self.A.flash.openocd_cmd_base = lambda p: ['openocd', '-c', f'adapter serial {p["uid"]}',
+                                                   *(['vid_pid'] if 'vid_pid' in p else []), *shlex.split(p['args'])]
+        argv = H.gdb_argv('metro_m4_express', H.load_roster(roster)['metro_m4_express'], 'fw.elf', [])
+        self.assertEqual(shlex.split(argv[4].removeprefix('target extended-remote | ')), [
+            'openocd', '-c', 'adapter serial 000063728691', '-f', 'interface/jlink.cfg', '-c', 'transport select swd',
+            '-c', 'adapter speed 4000', '-f', 'target/atsame5x.cfg', *H.GDB_SERVER,
+            '-c', 'foreach t [target names] { $t configure -event gdb-detach { resume } }'])
+        roster.write_text(json.dumps({'boards': [{**metro, 'debug': {'openocd': '-f interface/jlink.cfg'}}]}))
+        with self.assertRaisesRegex(H.Refused, "metro_m4_express: debug .* differs from agentrc's board registry"):
+            H.load_roster(roster)
 
     def test_gdb_needs_a_debug_route(self):
         args = self.held(cmd='gdb', build_record='r.json', sketch='echo', ex=[], timeout=5)
@@ -2067,7 +2205,7 @@ class Manual(Base):
 
     def test_check_runs_a_device_test_without_flashing(self):
         args = argparse.Namespace(board='rig_ocd', test=None)
-        image = {'vidPid': '239a:cafe'}
+        image = {'vidPid': '239a:cafe', 'uid': 'OUID'}
         self.HP.TEST_FUNCS['echo'] = lambda *a: (True, 'echoed')
         with mock.patch.object(H, 'admit_sketch', return_value=({'record': 'r'}, image, {})) as admitted, \
                 mock.patch.object(H, 'dut_devices', return_value=[{'busport': '21-1.3'}]), \
@@ -2150,6 +2288,7 @@ class Commission(Base):
         def bump(*a):
             ino[0] += 1
             return ''
+        image = {'uid': self.board(board)['uid'], **image}   # admit()'s, under the rig FQBN
         patches = {'admit': mock.Mock(return_value=({}, {'echo': image})), 'detach': mock.Mock(), 'flash': bump,
                    'reset': bump, **patches}
         with contextlib.ExitStack() as stack:
@@ -2535,7 +2674,7 @@ class BoardTaskOnTheRealLock(Base):
             ino[0] += 1
             return ''
         args = argparse.Namespace(board='rig_jlink', roster=str(self.roster), record_dir=str(self.dir))
-        with mock.patch.object(H, 'admit', return_value=({}, {'echo': {'vidPid': '1234:5678'}})), \
+        with mock.patch.object(H, 'admit', return_value=({}, {'echo': {'vidPid': '1234:5678', 'uid': 'JUID'}})), \
                 mock.patch.object(H, 'detach', detach), mock.patch.object(H, 'flash', bump), \
                 mock.patch.object(H, 'reset', bump), mock.patch.object(H.time, 'sleep'), \
                 mock.patch.object(H, 'scan', lambda *a: [{'serial': 'JUID', 'ino': ino[0]}]), \
@@ -2589,14 +2728,35 @@ class CoreProvenance(unittest.TestCase):
         self.assertEqual(H.core_provenance(self.platform),
                          'vend:arch 1.0, commit aaaaaaaaaaaa, modified, content bbbbbbbbbbbb')
 
-    def test_unavailable_content(self):
-        self.platform['git'].update(content=None, contentError='an input was unreadable')
+    def test_unavailable_content_shows_its_error(self):
+        self.platform['git'].update(content=None, contentError='an input\nwas unreadable')
         self.assertEqual(H.core_provenance(self.platform),
-                         'vend:arch 1.0, commit aaaaaaaaaaaa, content unavailable')
+                         'vend:arch 1.0, commit aaaaaaaaaaaa, content unavailable: an input was unreadable')
+        del self.platform['git']['contentError']
+        self.assertEqual(H.core_provenance(self.platform), 'vend:arch 1.0, commit aaaaaaaaaaaa, content unavailable')
 
     def test_non_git_id_and_version_only(self):
         self.platform['git'] = None
         self.assertEqual(H.core_provenance(self.platform), 'vend:arch 1.0, non-git: id/version only')
+
+    def test_untrusted_fields_never_raise_or_claim_more_than_recorded(self):
+        git = {'commit': 'a' * 40, 'dirty': False, 'content': 'b' * 64}
+        cases = (
+            ({'id': 1, 'version': None, 'git': {**git, 'commit': 7}}, '? ?, commit ?, content bbbbbbbbbbbb'),
+            ({'id': 'vend:arch', 'version': '1.0', 'git': 'a' * 40}, 'vend:arch 1.0, malformed git provenance'),
+            ({'id': 'vend:arch', 'version': '1.0', 'git': []}, 'vend:arch 1.0, malformed git provenance'),
+            ({'id': 'vend:arch', 'version': '1.0'}, 'vend:arch 1.0, malformed git provenance'),
+            ({'id': 'vend:arch', 'version': '1.0', 'git': {**git, 'dirty': 'false'}},
+             'vend:arch 1.0, commit aaaaaaaaaaaa, dirty ?, content bbbbbbbbbbbb'),
+            ({'id': 'vend:arch', 'version': '1.0', 'git': {**git, 'dirty': 1}},
+             'vend:arch 1.0, commit aaaaaaaaaaaa, dirty ?, content bbbbbbbbbbbb'),
+            ({'id': 'vend:arch', 'version': '1.0', 'git': {**git, 'content': 5, 'contentError': {'x': 1}}},
+             'vend:arch 1.0, commit aaaaaaaaaaaa, content unavailable: ?'),
+            (['vend:arch'], 'malformed core provenance'),
+        )
+        for platform, want in cases:
+            with self.subTest(platform=platform):
+                self.assertEqual(H.core_provenance(platform), want)
 
 
 class Report(Base):

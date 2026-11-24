@@ -148,6 +148,133 @@ class Fresh(unittest.TestCase):
                 self.fresh(runs)
 
 
+MARKER = '<!-- Sticky Pull Request Commenthil-report -->'
+
+
+def comment(cid, body=f'old\n{MARKER}', login='github-actions', minimized=False):
+    return {'databaseId': cid, 'author': None if login is None else {'login': login}, 'isMinimized': minimized,
+            'body': body}
+
+
+def post_api(comments, runs=None, viewer='github-actions[bot]', attempt_now=1, writes=None):
+    """A fake `gh` for post: the GraphQL viewer and comment pages, fresh's answers, and the writes."""
+    calls = []
+    runs = [run(100, 5, [7])] if runs is None else runs
+
+    def api(path, paginate_key=None, *, method=None, fields=None, payload=None):
+        calls.append({'path': path, 'key': paginate_key, 'method': method, 'fields': fields, 'payload': payload})
+        if path == 'graphql':
+            if paginate_key:
+                return comments() if callable(comments) else comments
+            return {'data': {'viewer': {'login': viewer}}}
+        if method:
+            return writes if writes is not None else {'html_url': f'https://github.com/{REPO}/pull/7#c'}
+        for prefix, value in ((f'repos/{REPO}/pulls/7', {'head': head()}),
+                              (f'repos/{REPO}/actions/workflows/hil.yml/runs', runs),
+                              (f'repos/{REPO}/actions/runs/100', {'run_attempt': attempt_now})):
+            if path.startswith(prefix):
+                return value
+        raise AssertionError(f'unexpected {path}')
+    api.calls = calls
+    return api
+
+
+def post(api, body='## HIL\n', header='hil-report', run_name=None):
+    return G.post(REPO, pr=7, header=header, body=body, head_sha=SHA, run_id=100, attempt=1, workflow='hil.yml',
+                  run_name=run_name, api=api)
+
+
+def writes(api):
+    return [c for c in api.calls if c['method']]
+
+
+class Post(unittest.TestCase):
+    def test_no_comment_of_ours_creates_one_with_the_sticky_marker_after_the_body(self):
+        api = post_api([comment(1, login='hathach'), comment(2, body='no marker'),
+                        comment(3, body='<!-- Sticky Pull Request Commentcode-size -->')])
+        self.assertEqual(post(api), (True, f'created https://github.com/{REPO}/pull/7#c'))
+        (w,) = writes(api)
+        self.assertEqual((w['path'], w['method']), (f'repos/{REPO}/issues/7/comments', 'POST'))
+        self.assertEqual(w['payload'], {'body': f'## HIL\n\n{MARKER}'}, "marocchino's bodyWithHeader")
+
+    def test_our_visible_marker_comment_is_updated_and_a_minimized_one_is_left(self):
+        api = post_api([comment(5, minimized=True), comment(6, login='hathach'), comment(9)])
+        self.assertTrue(post(api)[0])
+        (w,) = writes(api)
+        self.assertEqual((w['path'], w['method']), (f'repos/{REPO}/issues/comments/9', 'PATCH'))
+        self.assertTrue(w['payload']['body'].endswith(f'\n{MARKER}'))
+
+    def test_the_author_matches_with_or_without_the_bot_suffix(self):
+        for viewer, login in (('github-actions[bot]', 'github-actions'), ('hathach', 'hathach'),
+                              ('github-actions[bot]', 'github-actions[bot]')):
+            with self.subTest(viewer=viewer, login=login):
+                api = post_api([comment(9, login=login)], viewer=viewer)
+                post(api)
+                self.assertEqual(writes(api)[0]['method'], 'PATCH')
+        api = post_api([comment(9, login=None)])
+        post(api)
+        self.assertEqual(writes(api)[0]['method'], 'POST', 'a deleted author is not us')
+
+    def test_every_comment_page_is_read_through_one_paginated_query(self):
+        api = post_api([comment(9)])
+        post(api)
+        q = [c for c in api.calls if c['path'] == 'graphql' and c['key']]
+        self.assertEqual(len(q), 1)
+        self.assertEqual(q[0]['key'], 'data.repository.pullRequest.comments.nodes')
+        self.assertEqual({k: v for k, v in q[0]['fields'].items() if k != 'query'},
+                         {'owner': 'adafruit', 'name': 'tinyuf2', 'number': 7})
+        self.assertIn('$endCursor', q[0]['fields']['query'])
+        self.assertIn('pageInfo { hasNextPage endCursor }', q[0]['fields']['query'])
+
+    def test_two_visible_marker_comments_of_ours_are_ambiguous_and_nothing_is_written(self):
+        api = post_api([comment(5), comment(9), comment(3, minimized=True)])
+        with self.assertRaisesRegex(G.ApiError, r'\[5, 9\].*ambiguous'):
+            post(api)
+        self.assertEqual(writes(api), [])
+
+    def test_a_stale_run_or_attempt_writes_nothing(self):
+        for api, why in ((post_api([comment(9)], attempt_now=2), 'attempt 2 is newer'),
+                         (post_api([], runs=[run(100, 5, [7]), run(120, 6, [7])]), 'run 120 is newer')):
+            with self.subTest(why=why):
+                ok, got = post(api)
+                self.assertFalse(ok)
+                self.assertIn(why, got)
+                self.assertEqual(writes(api), [])
+
+    def test_freshness_is_checked_after_the_lookup_right_before_the_write(self):
+        api = post_api([comment(9)])
+        post(api)
+        order = [c['path'] if c['path'] != 'graphql' else ('comments' if c['key'] else 'viewer') for c in api.calls]
+        self.assertEqual(order[:2], ['viewer', 'comments'])
+        self.assertEqual(order[-2:], [f'repos/{REPO}/actions/runs/100', f'repos/{REPO}/issues/comments/9'])
+
+    def test_a_long_body_is_capped_with_the_marker_kept(self):
+        api = post_api([])
+        post(api, body='line\n' * 20000)
+        body = writes(api)[0]['payload']['body']
+        self.assertLessEqual(len(body), G.MAX_COMMENT + len(MARKER) + 1)
+        self.assertTrue(body.endswith(f"artifacts.\n\n{MARKER}"))
+
+    def test_a_blank_body_or_a_marker_breaking_header_refuses_before_any_call(self):
+        for body, header in (('  \n', 'hil-report'), ('x', ''), ('x', 'a-->b'), ('x', 'a\nb')):
+            with self.subTest(body=body, header=header):
+                api = post_api([])
+                with self.assertRaises(ValueError):
+                    post(api, body=body, header=header)
+                self.assertEqual(api.calls, [])
+
+    def test_a_malformed_or_failed_lookup_is_unknown(self):
+        def failed():
+            raise G.ApiError('HTTP 502')
+        ours = {'author': {'login': 'github-actions'}, 'body': MARKER}
+        for comments in (failed, [ours], [{**ours, 'databaseId': 'x'}]):
+            with self.subTest(comments=comments):
+                api = post_api(comments)
+                with self.assertRaises(G.ApiError):
+                    post(api)
+                self.assertEqual(writes(api), [])
+
+
 class Artifacts(unittest.TestCase):
     def setUp(self):
         self.base = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -249,6 +376,43 @@ class Cli(unittest.TestCase):
                 self.assertTrue(err.startswith('unknown: '))
 
 
+class PostCli(unittest.TestCase):
+    def setUp(self):
+        self.body = Path(self.enterContext(tempfile.TemporaryDirectory())) / 'comment.md'
+        self.body.write_text('## HIL\n', encoding='utf-8')
+        self.argv = ['post', '--repo', REPO, '--pr', '7', '--header', 'hil-report', '--body-file', str(self.body),
+                     '--run-id', '100', '--attempt', '1', '--head-sha', SHA, '--workflow', 'hil.yml']
+
+    def main(self, argv, api):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = G.main(argv, api=api)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_posted_stale_ambiguous_and_unreadable_exit_codes(self):
+        rc, out, _ = self.main(self.argv, post_api([comment(9)]))
+        self.assertEqual((rc, out), (0, f'updated https://github.com/{REPO}/pull/7#c\n'))
+        rc, out, _ = self.main(self.argv, post_api([], attempt_now=2))
+        self.assertEqual(rc, 1)
+        self.assertTrue(out.startswith('stale: '))
+        rc, out, err = self.main(self.argv, post_api([comment(5), comment(9)]))
+        self.assertEqual((rc, out), (2, ''))
+        self.assertIn('unknown: ', err)
+        self.body.write_text('')
+        rc, out, err = self.main(self.argv, post_api([]))
+        self.assertEqual((rc, out), (2, ''))
+        self.assertIn('not posted: the body is blank', err)
+        self.body.unlink()
+        rc, _, err = self.main(self.argv, post_api([]))
+        self.assertEqual(rc, 2)
+        self.assertIn('not posted: ', err)
+
+    def test_run_name_matches_by_display_title(self):
+        runs = [run(100, 5, [7, 8], title='HIL PR #7'), run(120, 6, [7, 8], title='HIL PR #8')]
+        self.assertEqual(self.main([*self.argv, '--run-name', 'HIL PR #7'], post_api([], runs=runs))[0], 0)
+        self.assertEqual(self.main(self.argv, post_api([], runs=runs))[0], 1)
+
+
 class Gh(unittest.TestCase):
     def test_paginated_lines_a_failure_and_a_timeout(self):
         ok = subprocess.CompletedProcess([], 0, '{"a": 1}\n{"a": 2}\n', '')
@@ -264,6 +428,29 @@ class Gh(unittest.TestCase):
         with mock.patch.object(G.subprocess, 'run', side_effect=FileNotFoundError('gh')), \
                 self.assertRaises(G.ApiError):
             G.gh('x')
+
+    def test_a_write_sends_its_payload_on_stdin_and_graphql_fields_are_typed(self):
+        ok = subprocess.CompletedProcess([], 0, '{"id": 1}', '')
+        with mock.patch.object(G.subprocess, 'run', return_value=ok) as r:
+            self.assertEqual(G.gh('repos/x/y/issues/7/comments', method='POST', payload={'body': 'x' * 70000}),
+                             {'id': 1})
+        argv = r.call_args.args[0]
+        self.assertEqual(argv[-4:], ['POST', '--input', '-', 'repos/x/y/issues/7/comments'])
+        self.assertEqual(json.loads(r.call_args.kwargs['input']), {'body': 'x' * 70000})
+        self.assertFalse(any(len(a) > 1000 for a in argv), 'the body is not on the command line')
+        with mock.patch.object(G.subprocess, 'run', return_value=ok) as r:
+            G.gh('graphql', 'data.n', fields={'query': 'q', 'name': 'r', 'number': 7})
+        argv = r.call_args.args[0]
+        self.assertIn(['-f', 'name=r'], [argv[i:i + 2] for i in range(len(argv))])
+        self.assertIn(['-F', 'number=7'], [argv[i:i + 2] for i in range(len(argv))])
+        self.assertIsNone(r.call_args.kwargs['input'])
+
+    def test_its_output_is_read_as_utf8_whatever_the_locale(self):
+        ok = subprocess.CompletedProcess([], 0, '{"body": "caf\\u00e9 \\u2713"}', '')
+        with mock.patch.object(G.subprocess, 'run', return_value=ok) as r:
+            G.gh('repos/x/y/issues/comments/1')
+        self.assertEqual((r.call_args.kwargs['text'], r.call_args.kwargs['encoding'], r.call_args.kwargs['errors']),
+                         (True, 'utf-8', 'replace'))
 
 
 if __name__ == '__main__':

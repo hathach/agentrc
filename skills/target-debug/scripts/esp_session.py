@@ -48,6 +48,11 @@ fail the run with the `recover` hint. `recover` is the separately chosen `init; 
 (espressif.md, "After an abnormal end"), bounded by --timeout and never killed. Nothing here
 resets, reflashes or kills on its own.
 
+On Windows openocd starts in a process group and a console of its own (POSIX: a session of its own), so no Ctrl-C,
+Ctrl-Break or close of this script's console reaches it, and `leave` identifies the process by its image file
+and creation time (GetProcessTimes) where POSIX reads argv and start time from /proc. A bare tool name is looked up
+there on PATH's absolute directories only, as .exe, never in the working directory. Unverified on a board there (#130).
+
 --anchor names the console capture already running (console_capture.py's --out file): its
 size is recorded at the start and the end, so the bytes printed during the session can be read
 from it and its .times file. --no-anchor states why there is none.
@@ -56,16 +61,18 @@ Output: one JSON object on stdout; <out> keeps openocd.log, gdb.log (values), gd
 and monitor output; budget writes both into gdb.log to keep their order) and receipt.json.
 
 Exit: 0 done and every core running at the end; 1 done, but an expression failed or a budget
-location was refused or unresolved (reported); 2 bad usage, or Windows, refused; 3 openocd, gdb or the Tcl port failed (a
+location was refused or unresolved (reported); 2 bad usage; 3 openocd, gdb or the Tcl port failed (a
 budget location gdb could not ask about or resolved to several addresses included; gdb exiting
 non-zero or by a signal leaves no budget), the run was interrupted, a core was left halted, removal
 is unchecked or failed, or the shutdown failed.
 
 Loaded by path by agentrc's skills/hil/scripts/hil_openocd_esp.py (and listed in hil_flash.py's FILES) and staged
-by tinyusb's hil-contract hil_remote.py: a rename or CLI change needs those consumers updated.
+by tinyusb's hil-contract hil_remote.py: a rename or CLI change needs those consumers updated. Staged without
+agentrc's lib/, it keeps its own Windows helpers.
 """
 import argparse
 import contextlib
+import functools
 import json
 import math
 import os
@@ -78,6 +85,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from pathlib import PureWindowsPath
 
 OBSERVER = ['set pagination off', 'set confirm off', 'set width 0', 'set may-write-memory off',
             'set may-write-registers off', 'set may-call-functions off']
@@ -85,6 +93,13 @@ TCL_END = b'\x1a'
 _MARK_RE = re.compile(r'^ESPS (\S+)-BEGIN *\n(.*?)^ESPS \1-END *$', re.M | re.S)
 _EXAMINE_RE = re.compile(r'^.*(Examination succeed|Examined |was reset|Reset cause).*$', re.M)
 _CONNECT_RE = re.compile(r"^.*(accepting 'gdb'|New GDB Connection|Target halted|Reset cause|was reset).*$", re.M)
+# SIGBREAK: Ctrl-Break at a Windows console
+STOP_SIGNALS = tuple(getattr(signal, n) for n in ('SIGTERM', 'SIGINT', 'SIGBREAK') if hasattr(signal, n))
+# no console interrupt of ours may reach openocd (Leave): Windows delivers one to every process on the console, so a
+# process group alone is not enough there
+DETACHED = ({'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW} if os.name == 'nt'
+            else {'start_new_session': True})
+SHUTDOWN_EXIT_WAIT = 10   # s openocd gets to exit after the Tcl shutdown
 
 
 class ToolError(RuntimeError):
@@ -107,11 +122,30 @@ def free_ports(n):
             s.close()
 
 
+def _absolute(directory):
+    """Has a drive and a root: '.', 'bin' or '\\bin' name a directory of the working directory or its drive."""
+    path = PureWindowsPath(directory)
+    return bool(path.drive and path.root)
+
+
+def which(name):
+    """shutil.which, but on Windows a bare name only from PATH's absolute directories, as .exe: shutil.which and
+    CreateProcess try the working directory, perhaps a checkout holding an openocd.exe, first."""
+    if os.name != 'nt' or os.path.dirname(name):
+        return shutil.which(name)
+    exe = name if name.lower().endswith('.exe') else name + '.exe'
+    for d in os.environ.get('PATH', '').split(os.pathsep):
+        d = d.strip('"')
+        if _absolute(d) and os.path.isfile(os.path.join(d, exe)):
+            return os.path.join(d, exe)
+    return None
+
+
 def tool(env, name):
-    exe = shutil.which(os.environ.get(env) or name)
+    exe = which(os.environ.get(env) or name)
     if not exe:
         raise ToolError(f'{os.environ.get(env) or name} not found - install it or set {env}')
-    return exe
+    return os.path.abspath(exe)    # the receipt's argv[0]: `leave` may run from another directory
 
 
 def route_args(a):
@@ -133,7 +167,14 @@ def server_command(exe, a, ports, log, token=None):
     cmd += ['-c', 'set ESP_FLASH_SIZE 0']
     if a.rtos:
         cmd += ['-c', f'set ESP_RTOS {a.rtos}']
-    return cmd + route_args(a) + ['-l', log]
+    # openocd runs `log_output <path>` as a Tcl line, where a Windows backslash would be an escape
+    return cmd + route_args(a) + ['-l', tcl_word(log.replace(os.sep, '/'))]
+
+
+def tcl_word(s):
+    """s as one literal Tcl word: Jim copies any backslashed character but a letter escape, and a backslashed
+    newline would be a space."""
+    return re.sub(r'[\s;$\[\]{}\\"]', lambda m: '\\n' if m[0] == '\n' else '\\' + m[0], s)
 
 
 class Tcl:
@@ -234,7 +275,72 @@ def end_errors(result, log):
     return errors
 
 
+@functools.cache
+def _kernel32():
+    import ctypes
+    from ctypes import wintypes
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.GetProcessTimes.argtypes = (wintypes.HANDLE,) + (ctypes.POINTER(wintypes.FILETIME),) * 4
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    kernel32.QueryFullProcessImageNameW.argtypes = (wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+                                                    ctypes.POINTER(wintypes.DWORD))
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    return kernel32
+
+
+@contextlib.contextmanager
+def _open_process(pid, access):
+    """(handle, exited) for pid opened with access, which must include SYNCHRONIZE; handle None when the open failed.
+    exited: True once Windows names pid exited (its handle signalled, or no process has pid), False while it runs,
+    None when Windows does not say (access denied, a failed wait)."""
+    import ctypes
+    kernel32 = _kernel32()
+    handle = kernel32.OpenProcess(access, False, pid)
+    if not handle:
+        yield None, (True if ctypes.get_last_error() == 87 else None)   # ERROR_INVALID_PARAMETER: no process has pid
+        return
+    try:
+        # WAIT_OBJECT_0, WAIT_TIMEOUT
+        yield handle, {0: True, 0x102: False}.get(kernel32.WaitForSingleObject(handle, 0))
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _windows_exited(pid):
+    """True once Windows names pid exited, False while it runs, None when Windows does not say: unknown is no exit."""
+    with _open_process(pid, 0x00100000) as (_, exited):   # SYNCHRONIZE
+        return exited
+
+
+def _windows_process(pid):
+    """(creation time, image file) of the Windows process pid while it runs; None once it has exited, when no
+    process has pid, or when Windows does not say: no identity."""
+    import ctypes
+    from ctypes import wintypes
+    kernel32 = _kernel32()
+    with _open_process(pid, 0x1000 | 0x00100000) as (handle, exited):   # PROCESS_QUERY_LIMITED_INFORMATION, SYNCHRONIZE
+        if exited is not False:
+            return None
+        times = [wintypes.FILETIME() for _ in range(4)]
+        image, size = ctypes.create_unicode_buffer(32768), wintypes.DWORD(32768)
+        if not (kernel32.GetProcessTimes(handle, *map(ctypes.byref, times))
+                and kernel32.QueryFullProcessImageNameW(handle, 0, image, ctypes.byref(size))):
+            return None
+        return str(times[0].dwHighDateTime << 32 | times[0].dwLowDateTime), image.value
+
+
 def start_time(pid):
+    """pid's start time as a string, None when it cannot be read: /proc's starttime, or on Windows the creation
+    FILETIME of a process that still runs."""
+    if os.name == 'nt':
+        found = _windows_process(pid)
+        return found and found[0]
     try:
         with open(f'/proc/{pid}/stat', errors='replace') as f:   # comm may be cut mid-UTF-8 character
             return f.read().rsplit(')', 1)[1].split()[19]
@@ -252,13 +358,22 @@ def wait_for(proc, path, pattern, deadline):
     raise ToolError(f'openocd did not print {pattern!r} in time; see {path}')
 
 
+def _exited(pid):
+    """Whether pid, not this process's child, is known to have exited: on Windows only Windows' word counts."""
+    if os.name == 'nt':
+        return _windows_exited(pid) is True
+    return not os.path.exists(f'/proc/{pid}')
+
+
 def wait_exit(pid, proc, seconds):
+    """Whether pid (proc, when it is this process's child) exited within seconds; False also when that stays
+    unknown."""
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         if proc is not None:
             if proc.poll() is not None:
                 return True
-        elif not os.path.exists(f'/proc/{pid}'):
+        elif _exited(pid):
             return True
         time.sleep(0.1)
     return False
@@ -285,6 +400,17 @@ def gdb_commands(mode, port, exprs, locations):
 
 def stop(proc):
     if proc is None or proc.poll() is not None:
+        return
+    if os.name == 'nt':    # SIGTERM is TerminateProcess there, which leaves the process's own children running
+        system_root = os.environ.get('SystemRoot', '')
+        if _absolute(system_root):   # never a taskkill.exe of the working directory
+            taskkill = os.path.join(system_root, 'System32', 'taskkill.exe')
+            with contextlib.suppress(OSError, subprocess.SubprocessError):
+                subprocess.run([taskkill, '/T', '/F', '/PID', str(proc.pid)], capture_output=True, timeout=5,
+                               creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        proc.kill()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(5)
         return
     for sig in (signal.SIGTERM, signal.SIGKILL):
         proc.send_signal(sig)
@@ -327,7 +453,16 @@ def cmdline(pid):
 
 def same_process(rec):
     """Whether rec's pid is still the process rec names: same argv (a script stand-in runs under its
-    interpreter, which /proc lists first, so the argv's tail) and start time."""
+    interpreter, which /proc lists first, so the argv's tail) and start time. Windows gives no other process's
+    argv: the image file is argv[0]'s, and the creation time is the same."""
+    if os.name == 'nt':
+        found = _windows_process(rec['pid'])
+        if found is None or found[0] != rec.get('startTime'):
+            return False
+        try:
+            return os.path.samefile(found[1], rec['argv'][0])
+        except OSError:
+            return False
     running = cmdline(rec['pid'])
     return running is not None and running[-len(rec['argv']):] == rec['argv'] \
         and start_time(rec['pid']) == rec.get('startTime')
@@ -349,8 +484,8 @@ def leave(receipt_path):
     except (OSError, ToolError) as e:
         result['error'] = f'Tcl port {rec["ports"][2]}: {e}'
         return result, 3
-    if not wait_exit(rec['pid'], None, 10):
-        result['error'] = 'openocd still runs after shutdown'
+    if not wait_exit(rec['pid'], None, SHUTDOWN_EXIT_WAIT):
+        result['error'] = 'openocd still runs after shutdown, or its exit is unconfirmed'
         return result, 3
     write_receipt(receipt_path, {**rec, 'closed': True})
     errors = end_errors(result, rec.get('log', ''))
@@ -440,10 +575,6 @@ def main(argv=None):
     p.add_argument('--timeout', type=float, default=60,
                    help='bound on the gdb session, or on recover, in seconds (default 60)')
     a = p.parse_args(argv)
-    if os.name == 'nt':    # before any probe session: a Windows run could not end it as Leave says
-        print('esp_session.py: not on Windows yet (#130): openocd is detached and identified as a POSIX session '
-              '(/proc)', file=sys.stderr)
-        return 2
     if a.mode == 'leave':
         if not a.receipt or a.out:
             p.error('leave takes --receipt only')
@@ -491,7 +622,7 @@ def main(argv=None):
         p.error('recover takes the route only')
     try:
         exe = tool('ESP_SESSION_OPENOCD', 'openocd')
-        gdb = shutil.which(a.gdb) if session else None
+        gdb = which(a.gdb) if session else None
         if session and not gdb:
             raise ToolError(f'--gdb {a.gdb}: not found')
         banner = subprocess.run([exe, '--version'], capture_output=True, text=True, timeout=10)
@@ -510,7 +641,7 @@ def main(argv=None):
         cmd = server_command(exe, a, None, log) + ['-c', 'init', '-c', 'shutdown']
         result['server'] = cmd
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
-                                start_new_session=True)
+                                **DETACHED)
         try:
             proc.wait(a.timeout)
         except subprocess.TimeoutExpired:
@@ -562,12 +693,12 @@ def main(argv=None):
     gdb_log, gdb_err = os.path.join(a.out, 'gdb.log'), os.path.join(a.out, 'gdb.err')
     errors = []
     try:
-        for sig in (signal.SIGTERM, signal.SIGINT):
+        for sig in STOP_SIGNALS:
             signal.signal(sig, on_signal)
         open(log, 'w').close()
         with held():
             server = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                      stdin=subprocess.DEVNULL, start_new_session=True)
+                                      stdin=subprocess.DEVNULL, **DETACHED)
             receipt_rec = {'pid': server.pid, 'startTime': start_time(server.pid), 'argv': cmd, 'ports': ports,
                            'token': token, 'log': os.path.abspath(log), 'closed': False,
                            'startedAt': time.strftime('%Y-%m-%dT%H:%M:%S%z')}
@@ -604,7 +735,7 @@ def main(argv=None):
     try:
         if server is not None and server.poll() is None:
             result['end'] = tcl.end()
-            if wait_exit(server.pid, server, 10):
+            if wait_exit(server.pid, server, SHUTDOWN_EXIT_WAIT):
                 write_receipt(receipt, {**receipt_rec, 'closed': True})
             else:
                 errors.append(f'openocd still runs after shutdown; end it with: esp_session.py leave --receipt {receipt}')

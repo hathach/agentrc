@@ -478,6 +478,36 @@ class LaunchResultTest(unittest.TestCase):
         self.assertIn('does not record its asks, and a failed tick leaves nothing on the PR, so a relaunch may not ask again: '
                       'the user comments `@coderabbitai review`', blockers[0])
 
+    def test_a_no_files_to_review_skip_says_it_had_nothing_to_review_and_what_moves_it(self):
+        # #577: an adopted base merge CodeRabbit skipped as "No files to review", after this run's one ask on it.
+        def stopped(ask, reason='coderabbit-unreviewed'):
+            return {'agentCount': 1, 'totalTokens': 10, 'logs': [], 'workflowProgress': [],
+                    'result': {'stateDigest': '0123abcd', 'pass': False, 'status': 'blocked', 'reason': reason, 'cycles': 5, 'head': HEAD,
+                               'state': {'expectedHead': HEAD, 'cyclesUsed': 5, 'maxCycles': 16}, 'coderabbitAsk': ask}}
+        spent = {'relaunchAsks': None, 'asked': [{'ask': 'request', 'at': '2026-11-23T08:40:00Z', 'requests': 1, 'full': True}], 'nothingToReview': True}
+        blockers = self.run_it(stopped(spent))[1]['blockers']
+        self.assertEqual(blockers, ['CodeRabbit had nothing to review on aaaaaaa (its check run skipped it: No files to review), and a '
+                                    'coderabbitTrigger launch made its review required for every head of this run; this run already used '
+                                    'its one ask on the head (an `@coderabbitai full review` comment at 2026-11-23T08:40:00Z), so a '
+                                    'relaunch will not ask CodeRabbit on this head: the user comments `@coderabbitai full review` on the '
+                                    'PR or accepts the head unreviewed, or a new head is pushed; a relaunch helps only once CodeRabbit '
+                                    'reviewed the head, or on a new head'])
+        # An incremental ask (after a failed review) that met a no-files skip names the command it sent.
+        earlier = {'relaunchAsks': None, 'asked': [{'ask': 'request', 'at': '2026-11-23T08:40:00Z', 'requests': 1}],
+                   'nothingToReview': True}
+        blockers = self.run_it(stopped(earlier))[1]['blockers']
+        self.assertIn('its one ask on the head (an `@coderabbitai review` comment at 2026-11-23T08:40:00Z)', blockers[0])
+        # A state that stopped on it before the ask existed: a relaunch asks once, and says so.
+        unasked = {'relaunchAsks': 'request', 'asked': [], 'nothingToReview': True, 'retryAt': None}
+        blockers = self.run_it(stopped(unasked))[1]['blockers']
+        self.assertEqual(blockers, ['CodeRabbit had nothing to review on aaaaaaa (its check run skipped it: No files to review), and a '
+                                    'coderabbitTrigger launch made its review required for every head of this run; it skipped the head '
+                                    'with no files to review and this run never asked on it: a relaunch with coderabbitTrigger comments '
+                                    '`@coderabbitai full review` once'])
+        s = self.run_it(stopped(unasked, 'reviews-pending'))[1]
+        self.assertEqual(s['notes'], ['CodeRabbit has not reviewed the head; it skipped the head with no files to review and this run '
+                                      'never asked on it: a relaunch with coderabbitTrigger comments `@coderabbitai full review` once'])
+
     def test_every_reviewer_keeps_its_state_kind_and_evidence(self):
         # #85: a Copilot quota notice left no finding, so its record is the only trace.
         data = output()

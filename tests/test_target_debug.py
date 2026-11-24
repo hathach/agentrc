@@ -801,7 +801,20 @@ class ProbeStateUnitTest(unittest.TestCase):
 
     def test_a_tool_that_outlives_its_kill_fails_naming_its_pid(self):
         # a tool in D state does not die on SIGKILL: its wait after the kill must be bounded
-        procs, waits, errors = [], [], []
+        for taskkill_took in (0, 2.5):    # s; the post-kill wait gets only what taskkill leaves of KILL_WAIT
+            with self.subTest(taskkill_took=taskkill_took):
+                self.check_outlived_kill(taskkill_took)
+
+    def check_outlived_kill(self, taskkill_took):
+        """The taskkill leg of windows.kill_tree, stubbed on every host, takes taskkill_took s of kill_tree's clock:
+        a real taskkill's latency on a loaded runner would move the measured wait (agentrc#575)."""
+        procs, waits, errors, taskkills = [], [], [], []
+        clock = [0.0]    # kill_tree's monotonic clock: only the stubbed taskkill advances it
+
+        def taskkill(argv, **kwargs):
+            taskkills.append((argv, kwargs))
+            clock[0] += taskkill_took
+            return subprocess.CompletedProcess(argv, 0)
 
         def call():
             try:
@@ -809,15 +822,24 @@ class ProbeStateUnitTest(unittest.TestCase):
             except probe_state.ToolError as e:
                 errors.append(e)
 
+        nt = types.SimpleNamespace(name='nt', environ={'SystemRoot': r'C:\Windows'}, path=ntpath)
         with mock.patch.object(probe_state, 'TERM_GRACE', 0.01), \
-                mock.patch.object(probe_state.subprocess, 'Popen', self.unreaped_popen(procs, waits)):
+                mock.patch.object(probe_state.subprocess, 'Popen', self.unreaped_popen(procs, waits)), \
+                mock.patch.object(probe_state.windows, 'os', nt), \
+                mock.patch.object(probe_state.windows, 'subprocess',
+                                  types.SimpleNamespace(run=taskkill, TimeoutExpired=subprocess.TimeoutExpired)), \
+                mock.patch.object(probe_state.windows, 'time',
+                                  types.SimpleNamespace(monotonic=lambda: clock[0])):
             caller = threading.Thread(target=call, daemon=True)
             caller.start()
             caller.join(20)
         self.assertFalse(caller.is_alive(), 'run() never returned')
-        self.assertEqual(len(waits), 1)
-        grace = 0 if os.name == 'nt' else 0.01    # Windows has no SIGTERM step
-        self.assertTrue(probe_state.KILL_WAIT - grace - 1 < waits[0] <= probe_state.KILL_WAIT - grace, waits)
+        budget = probe_state.KILL_WAIT - (0 if os.name == 'nt' else 0.01)    # Windows has no SIGTERM step
+        self.assertEqual(len(taskkills), 1)
+        argv, kwargs = taskkills[0]
+        self.assertEqual(argv, [r'C:\Windows\System32\taskkill.exe', '/T', '/F', '/PID', str(procs[0].pid)])
+        self.assertTrue(budget - 1 < kwargs['timeout'] <= budget, kwargs)
+        self.assertEqual(waits, [kwargs['timeout'] - taskkill_took])
         self.assertIsInstance(errors[0], probe_state.Unreaped)
         self.assertEqual(str(errors[0]), f'{os.path.basename(sys.executable)} pid {procs[0].pid} still ran 10 s after '
                                          f'its kill began (D state?): see usb-kernel-recover')

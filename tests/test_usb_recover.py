@@ -384,13 +384,15 @@ class Verbs(VerbTree):
                 seen.append((name, got))
         self.assertIn('rebound pci 0000:05:00.0 (xhci_hcd)', out)
         self.assertEqual(seen, [('unbind', '0000:05:00.0\n'), ('bind', '0000:05:00.0\n')])
-        self.assertIn('is not a USB controller (class 0x020000)', self.verb('pci-rebind', '0000:07:00.0', ok=False))
-        self.assertIn('no driver bound to 0000:06:00.0', self.verb('pci-rebind', '0000:06:00.0', ok=False))
-        self.assertIn('bad pci addr', self.verb('pci-rebind', '05:00.0', ok=False))
-        self.assertIn('no such pci device: 0000:09:00.0', self.verb('pci-rebind', '0000:09:00.0', ok=False))
+        # every refusal before the unbind is exit 3, which hil_reserve.py reads as nothing written
+        self.assertIn('is not a USB controller (class 0x020000)', self.verb('pci-rebind', '0000:07:00.0', code=3))
+        self.assertIn('no driver bound to 0000:06:00.0', self.verb('pci-rebind', '0000:06:00.0', code=3))
+        self.assertIn('bad pci addr', self.verb('pci-rebind', '05:00.0', code=3))
+        self.assertIn('no such pci device: 0000:09:00.0', self.verb('pci-rebind', '0000:09:00.0', code=3))
 
     def test_pci_bind_refuses_a_bound_controller_and_tries_the_xhci_drivers_in_order(self):
-        self.assertIn('already has a driver bound', self.verb('pci-bind', '0000:05:00.0', ok=False))
+        self.assertIn('already has a driver bound', self.verb('pci-bind', '0000:05:00.0', code=3))
+        self.assertIn('is not a USB controller', self.verb('pci-bind', '0000:07:00.0', code=3))
         out = self.verb('pci-bind', '0000:06:00.0')
         self.assertIn('bound pci 0000:06:00.0 (xhci-pci-renesas)', out)       # the first candidate that binds
         self.assertEqual((self.sys / 'bus/pci/drivers/xhci-pci-renesas/bind').read_text(), '0000:06:00.0\n')
@@ -401,11 +403,14 @@ class Verbs(VerbTree):
         self.assertIn('bound pci 0000:06:00.0 (xhci_hcd)', out)
         out = self.verb('pci-bind', '0000:06:00.0', 'xhci_hcd')
         self.assertIn('bound pci 0000:06:00.0 (xhci_hcd)', out)
-        self.assertIn('no such pci driver: nope', self.verb('pci-bind', '0000:06:00.0', 'nope', ok=False))
-        self.assertIn('bad driver name', self.verb('pci-bind', '0000:06:00.0', '../x', ok=False))
+        self.assertIn('no such pci driver: nope', self.verb('pci-bind', '0000:06:00.0', 'nope', code=3))
+        self.assertIn('bad driver name', self.verb('pci-bind', '0000:06:00.0', '../x', code=3))
         (self.sys / 'bus/pci/drivers/xhci_hcd/bind').rename(self.sys / 'bus/pci/drivers/xhci_hcd/bind.off')
-        self.assertIn('could not bind 0000:06:00.0 with a known xHCI driver',
-                      self.verb('pci-bind', '0000:06:00.0', ok=False))
+        self.assertIn('could not bind 0000:06:00.0 with a known xHCI driver',     # bind writes were tried
+                      self.verb('pci-bind', '0000:06:00.0', code=1))
+        renesas.rmdir()                                                        # no candidate: nothing written
+        self.assertIn('no known xHCI driver is loaded to bind 0000:06:00.0',
+                      self.verb('pci-bind', '0000:06:00.0', code=3))
 
     def test_resolve_walks_up_to_the_usb_device(self):
         for a in ('busnum', 'devnum', 'authorized'):

@@ -522,6 +522,7 @@ if (args.state !== undefined && args.state !== null) {
       (st.reviewClock.request === undefined || (st.reviewClock.request &&
         (st.reviewClock.request.retryAt === null || Number.isFinite(Date.parse(st.reviewClock.request.retryAt))) &&
         (st.reviewClock.request.tried === undefined || Number.isFinite(Date.parse(st.reviewClock.request.tried))) &&
+        (st.reviewClock.request.full === undefined || st.reviewClock.request.full === true) &&
         (st.reviewClock.request.at === null || Number.isFinite(Date.parse(st.reviewClock.request.at))))) &&
       (st.reviewClock.requestUnposted === undefined || st.reviewClock.requestUnposted === true) &&
       (st.reviewClock.unknown === undefined || (st.reviewClock.unknown && typeof st.reviewClock.unknown === 'object' &&
@@ -873,6 +874,7 @@ const TRIGGER = withSeal({
   properties: {
     error: { type: 'string' }, outcome: { type: 'string' }, detail: { type: 'string' }, at: { type: 'string' },
     retryAt: { type: ['string', 'null'] }, commentId: { type: ['integer', 'null'] }, phase: { type: ['string', 'null'] },
+    full: { type: 'boolean' },
   },
 })
 // ci_recover.py's line: what it did with each queued or recorded run on the head (#536).
@@ -2416,14 +2418,18 @@ const MANUAL_SKIP = /^review skipped: manual review required/i
 const manualSkip = (cr) => cr.state === 'settled' && cr.kind === 'skipped' && MANUAL_SKIP.test(cr.reason)
 const limited = (cr) => cr.state === 'settled' && cr.kind === 'limited'
 const reviewFailed = (cr) => cr.state === 'settled' && cr.kind === 'failed'
-// Manual skips get one tick and one fallback per head, a failed review one request per head (#499); a rate limit gets a
-// request each reset window.
+// harvest.py's reading of a head whose net diff CodeRabbit finds nothing new in, such as an adopted merge of the base (#577):
+// asked once, for a full review (an incremental `review` answers the same skip), never read as reviewed.
+const NO_FILES_SKIP = /^check run skipped: no files to review/i
+const nothingToReview = (cr) => cr.state === 'settled' && cr.kind === 'skipped' && NO_FILES_SKIP.test(cr.reason)
+// Manual skips get one tick and one fallback per head, a failed review (#499) or a skip with nothing to review one request
+// per head; a rate limit gets a request each reset window.
 const coderabbitAskable = (cr, clock) => {
   if (manualSkip(cr)) {
     if (clock.triggeredAt === undefined) return 'tick'
     return !clock.request && clock.triggeredAt === null ? 'request' : null
   }
-  if (reviewFailed(cr)) return clock.request ? null : 'request'
+  if (reviewFailed(cr) || nothingToReview(cr)) return clock.request ? null : 'request'
   return limited(cr) ? 'request' : null
 }
 const requestTried = (clock) => clock.request.tried ?? clock.request.at
@@ -2453,7 +2459,7 @@ const triggerCodeRabbit = async (cycle, r, bots, ended) => {
     reviewClock.triggeredAt = outcome === 'failed' ? null : Number.isFinite(Date.parse(t.at)) ? t.at : r.observedAt
   }
   if (limited(cr)) return requestCodeRabbit(cycle, r, cr, ended)
-  if (manual || reviewFailed(cr)) await requestCodeRabbit(cycle, r, cr, ended)
+  if (manual || reviewFailed(cr) || nothingToReview(cr)) await requestCodeRabbit(cycle, r, cr, ended)
   // Waits like a queued bot, its cap counted from the latest ask; working and reviewed go by settleBots alone. Any skip or
   // failed review after the ask is waited on too: the one asked about reads so until CodeRabbit starts again.
   const asks = [reviewClock.triggeredAt, reviewClock.request && reviewClock.request.at].filter(t => typeof t === 'string')
@@ -2500,12 +2506,12 @@ const unreviewedCodeRabbit = () => {
 const coderabbitAskOf = (cr) => {
   const clock = reviewClock && reviewClock.sha === expectedHead ? reviewClock : {}
   const asked = [...(clock.triggeredAt !== undefined ? [{ ask: 'tick', at: clock.triggeredAt }] : []),
-    ...(clock.request ? [{ ask: 'request', at: clock.request.at, requests: requestCount(clock) }] : [])]
+    ...(clock.request ? [{ ask: 'request', at: clock.request.at, requests: requestCount(clock), ...(clock.request.full ? { full: true } : {}) }] : [])]
   const relaunchAsks = coderabbitAskable(cr, clock)
   // A limit always reports nextAt, null when no clock of this head dates it.
   const next = limited(cr) ? requestDeadline(cr, clock) : NaN
-  return { relaunchAsks, asked, ...(limited(cr) ? { nextAt: Number.isFinite(next) ? isoSeconds(next) : null }
-    : relaunchAsks === 'request' ? { retryAt: cr.retryAt } : {}) }
+  return { relaunchAsks, asked, ...(nothingToReview(cr) ? { nothingToReview: true } : {}),
+    ...(limited(cr) ? { nextAt: Number.isFinite(next) ? isoSeconds(next) : null } : relaunchAsks === 'request' ? { retryAt: cr.retryAt } : {}) }
 }
 const waitAfter = (cr, askedAt, observedAt) => {
   cr.triggeredMin = Math.floor((Date.parse(observedAt) - Date.parse(askedAt)) / 60000)
@@ -2532,7 +2538,8 @@ const requestCodeRabbit = async (cycle, r, cr, ended) => {
     return retryLater(cr, Math.min(deadline, cap > observed ? cap : Infinity) - observed)
   }
   if (await ended('crrequest')) return
-  const why = limited(cr) ? 'after its rate limit' : reviewFailed(cr) ? 'again, its review of the head failed' : 'that it skipped for a manual review'
+  const why = limited(cr) ? 'after its rate limit' : reviewFailed(cr) ? 'again, its review of the head failed'
+    : nothingToReview(cr) ? 'in full, as it skipped the head with no files to review' : 'that it skipped for a manual review'
   const { t, outcome } = await relayTrigger(cycle, 'crrequest', CRTRIGGER_SCRIPT, `Ask CodeRabbit to review PR #${args.pr} ${why}`,
     ` --request${quota ? ` --not-before ${shq(isoSeconds(deadline))}` : ''}`, ['requested', 'already', 'notDue', 'notLimited', 'failed'])
   // A failure before the POST gets one retry (#276); a possibly posted attempt waits for the next window.
@@ -2551,7 +2558,9 @@ const requestCodeRabbit = async (cycle, r, cr, ended) => {
   if (quota && outcome === 'notLimited') { cr.done = false; return }
   const asking = ['requested', 'already', 'notLimited'].includes(outcome) && atOk
   reviewClock.requests = requestCount(reviewClock) + 1
-  reviewClock.request = { at: asking ? t.at : null, retryAt: reset ?? cr.retryAt, tried: atOk ? t.at : r.observedAt }
+  // The script reads CodeRabbit again and asks a no-files skip for a full review: its receipt names the command.
+  reviewClock.request = { at: asking ? t.at : null, retryAt: reset ?? cr.retryAt, tried: atOk ? t.at : r.observedAt,
+    ...(asking && t.full === true ? { full: true } : {}) }
   delete reviewClock.requestUnposted
   if (asking) waitAfter(cr, t.at, r.observedAt)
   if (quota) retryLater(cr, asking ? REVIEW_CAP_MIN * 60000 : requestDeadline(cr, reviewClock) - Date.parse(reviewClock.request.tried))
