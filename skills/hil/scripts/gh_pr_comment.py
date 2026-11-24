@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """The plumbing of a CI report posted on a pull request by a later job (#471): which PR a run is for, which
-attempt a job ran in, whether the run may still post, and the safe handling of its artifacts. Stdlib only, `gh`
-for the API. Each consumer keeps its renderer, triggers, permissions and where its check runs; this holds what
-they share (Adafruit_TinyUSB_Arduino's hil_workflow.py, tinyuf2's hil_comment.py, tinyusb's code_size_ci.py).
-The sticky post itself stays marocchino/sticky-pull-request-comment.
+attempt a job ran in, whether the run may still post, the safe handling of its artifacts, and the sticky post.
+Stdlib only, `gh` for the API. Each consumer keeps its renderer, triggers, permissions, concurrency group and where
+its check runs; this holds what they share (Adafruit_TinyUSB_Arduino's hil_workflow.py, tinyuf2's hil_comment.py,
+tinyusb's code_size_ci.py).
 
 It lives with the hil scripts so an install (which links skills/, not lib/) and a pin both carry it: a consumer loads
 it through hil_load (`load_file('skills/hil/scripts/gh_pr_comment.py')`, in its closure), or runs it:
@@ -18,6 +18,14 @@ it through hil_load (`load_file('skills/hil/scripts/gh_pr_comment.py')`, in its 
       exit 0 when run N attempt N is the newest run of FILE for the PR's current head, 1 when it is stale (why on
       stdout); `--run-name` matches runs by their display title (a run-name such as "HIL PR #N") instead of
       pull_requests, which lists every PR sharing a head.
+  gh_pr_comment.py post --repo R --pr N --header H --body-file F --run-id N --attempt N --head-sha SHA
+                        --workflow FILE [--run-name T]
+      create or update PR N's sticky comment under H with F's text, under the marker
+      marocchino/sticky-pull-request-comment uses for that header, so either finds the other's comment: the one
+      visible comment carrying it by the authenticated author (every page read), several being ambiguous. `fresh`
+      is checked again after that lookup, right before the write: prints `created|updated URL`, or exits 1 when
+      stale, nothing written; a blank or unreadable F, or an H that would break the marker, exits 2. Not atomic,
+      so run it inside the workflow's per-PR concurrency group.
 
 Every command exits 2 when the API cannot tell, with why on stderr: unknown is never read as absent or stale.
 """
@@ -36,20 +44,34 @@ GH_TIMEOUT = 60        # s per gh api call: a stalled one never blocks the job
 MAX_JSON = 1 << 20     # bytes of one artifact file read
 MAX_TEXT = 300         # characters of one untrusted string shown
 MAX_COMMENT = 60000    # GitHub caps a comment body at 65536
+MAX_BODY = 1 << 20     # bytes of a body file read
+COMMENTS_QUERY = '''query($owner: String!, $name: String!, $number: Int!, $endCursor: String) {
+  repository(owner: $owner, name: $name) { pullRequest(number: $number) {
+    comments(first: 100, after: $endCursor) {
+      nodes { databaseId author { login } isMinimized body }
+      pageInfo { hasNextPage endCursor } } } } }'''
 
 
 class ApiError(Exception):
     """The API could not answer: the caller reports unknown, never absent or stale."""
 
 
-def gh(path, paginate_key=None, timeout=GH_TIMEOUT):
-    """The API's JSON at `path` (a GET); with `paginate_key`, that list across every page."""
+def gh(path, paginate_key=None, timeout=GH_TIMEOUT, *, method=None, fields=None, payload=None):
+    """The API's JSON at `path`: a GET, or `method` with `payload` as its JSON body, or a GraphQL query whose
+    `fields` (an int typed, else raw) are its variables; with `paginate_key`, that list across every page."""
     # by PATH: Windows' CreateProcess searches System32 first and only for gh.exe
     argv = [shutil.which('gh') or 'gh', 'api', '-H', 'Accept: application/vnd.github+json']
+    if method:
+        argv += ['--method', method]
+    for k, v in (fields or {}).items():
+        argv += ['-F' if isinstance(v, int) else '-f', f'{k}={v}']
+    if payload is not None:
+        argv += ['--input', '-']    # on stdin: a body this long overflows a Windows command line
     if paginate_key:
         argv += ['--paginate', '--jq', f'.{paginate_key}[]']
     try:
-        p = subprocess.run([*argv, path], capture_output=True, text=True, timeout=timeout)
+        p = subprocess.run([*argv, path], capture_output=True, text=True, timeout=timeout,
+                           input=None if payload is None else json.dumps(payload))
     except subprocess.TimeoutExpired:
         raise ApiError(f'gh api {path}: no reply in {timeout} s') from None
     except OSError as e:
@@ -132,6 +154,57 @@ def fresh(repo, *, pr, head_sha, run_id, attempt, workflow, run_name=None, api=g
     return True, 'current'
 
 
+def sticky_marker(header):
+    """marocchino/sticky-pull-request-comment's marker for `header`; ValueError for one that would break it."""
+    if not header or '-->' in header or '\n' in header or '\r' in header:
+        raise ValueError(f'header {header[:MAX_TEXT]!r}: want a non-empty line without "-->"')
+    return f'<!-- Sticky Pull Request Comment{header} -->'
+
+
+def bare_login(login):
+    return login.removesuffix('[bot]') if isinstance(login, str) else None   # GraphQL drops a bot's [bot]
+
+
+def find_sticky(repo, pr, header, api=gh):
+    """The id of PR `pr`'s one visible comment by the authenticated author carrying `header`'s marker, the one
+    marocchino/sticky-pull-request-comment updates, or None. ApiError when several do or the API cannot tell."""
+    marker = sticky_marker(header)
+    owner, name = repo.split('/', 1)
+    try:
+        me = bare_login(api('graphql', fields={'query': 'query { viewer { login } }'})['data']['viewer']['login'])
+        nodes = api('graphql', 'data.repository.pullRequest.comments.nodes',
+                    fields={'query': COMMENTS_QUERY, 'owner': owner, 'name': name, 'number': int(pr)})
+        ours = [int(n['databaseId']) for n in nodes if isinstance(n, dict) and not n.get('isMinimized')
+                and marker in (n.get('body') or '') and me and bare_login((n.get('author') or {}).get('login')) == me]
+    except (KeyError, TypeError, ValueError) as e:
+        raise ApiError(f'malformed API answer: {type(e).__name__}: {e}') from None
+    if len(ours) > 1:
+        raise ApiError(f'comments {ours} of PR #{pr} all carry {marker}: which one is the report is ambiguous')
+    return ours[0] if ours else None
+
+
+def post(repo, *, pr, header, body, head_sha, run_id, attempt, workflow, run_name=None, api=gh):
+    """(posted, why): PR `pr`'s sticky comment under `header` created or updated with `body` (capped), the marker
+    after it as marocchino/sticky-pull-request-comment writes it, while `fresh` still holds, checked after the lookup
+    right before the write; (False, why) when stale, nothing written. ValueError for a blank body or a bad header,
+    ApiError when the API cannot tell or several comments carry the marker."""
+    marker = sticky_marker(header)
+    if not body.strip():
+        raise ValueError('the body is blank')
+    cid = find_sticky(repo, pr, header, api)
+    ok, why = fresh(repo, pr=pr, head_sha=head_sha, run_id=run_id, attempt=attempt, workflow=workflow,
+                    run_name=run_name, api=api)
+    if not ok:
+        return False, why
+    payload = {'body': f'{cap(body)}\n{marker}'}
+    if cid is None:
+        c = api(f'repos/{repo}/issues/{int(pr)}/comments', method='POST', payload=payload)
+    else:
+        c = api(f'repos/{repo}/issues/comments/{cid}', method='PATCH', payload=payload)
+    url = c.get('html_url') if isinstance(c, dict) else None
+    return True, f'{"created" if cid is None else "updated"} {url or f"comment {cid}"}'
+
+
 # ---- artifacts, read as untrusted data
 
 def read_artifact_json(base, rel, max_bytes=MAX_JSON):
@@ -176,6 +249,17 @@ def cap(text, limit=MAX_COMMENT, note='…truncated: see the run\'s artifacts.')
     return text[:cut] + '\n' + note + '\n'
 
 
+def read_body(path, max_bytes=MAX_BODY):
+    """The text of the renderer's body file; ValueError when it cannot be read or is over `max_bytes`."""
+    try:
+        p = Path(path)
+        if p.stat().st_size > max_bytes:
+            raise ValueError(f'{path}: over {max_bytes} bytes')
+        return p.read_text(encoding='utf-8')
+    except (OSError, UnicodeDecodeError) as e:
+        raise ValueError(f'{path}: {e}') from None
+
+
 # ---- CLI
 
 def main(argv=None, api=gh):
@@ -200,6 +284,10 @@ def main(argv=None, api=gh):
     f.add_argument('--head-sha', required=True)
     f.add_argument('--workflow', required=True, help='the workflow file name, e.g. hil.yml')
     f.add_argument('--run-name', help='match runs by this display title instead of pull_requests')
+    s = sub.add_parser('post')
+    for opt in ('--repo', '--pr', '--header', '--body-file', '--run-id', '--attempt', '--head-sha', '--workflow'):
+        s.add_argument(opt, required=True)
+    s.add_argument('--run-name')
     a = ap.parse_args(argv)
     try:
         if a.cmd == 'pr':
@@ -222,8 +310,17 @@ def main(argv=None, api=gh):
             if n is not None:
                 print(n)
             return 0
-        ok, why = fresh(a.repo, pr=a.pr, head_sha=a.head_sha, run_id=a.run_id, attempt=a.attempt,
-                        workflow=a.workflow, run_name=a.run_name, api=api)
+        if a.cmd == 'post':
+            try:
+                body = read_body(a.body_file)
+                ok, why = post(a.repo, pr=a.pr, header=a.header, body=body, head_sha=a.head_sha, run_id=a.run_id,
+                               attempt=a.attempt, workflow=a.workflow, run_name=a.run_name, api=api)
+            except ValueError as e:
+                print(f'not posted: {e}', file=sys.stderr)
+                return 2
+        else:
+            ok, why = fresh(a.repo, pr=a.pr, head_sha=a.head_sha, run_id=a.run_id, attempt=a.attempt,
+                            workflow=a.workflow, run_name=a.run_name, api=api)
     except ApiError as e:
         print(f'unknown: {e}', file=sys.stderr)
         return 2
