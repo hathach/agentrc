@@ -4,7 +4,6 @@ data/chief_run/stream.jsonl is a trimmed real capture (claude 2.1.280, one subag
 the subagent's reply reaches the stream only inside a top-level user tool_result, and no
 worker assistant event was streamed, so worker exclusion is shown on the event types
 that do appear."""
-import ctypes
 import importlib.util
 import io
 import json
@@ -23,7 +22,7 @@ from unittest import mock
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'headless-chief' / 'scripts' / 'chief_run.py'
 CAPTURE = Path(__file__).resolve().parent / 'data' / 'chief_run' / 'stream.jsonl'
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import guard_survivors, make_stub, pid_alive  # noqa: E402
+from helpers import console_pids, guard_survivors, make_stub, pid_alive  # noqa: E402
 
 FAKE = r'''#!/usr/bin/env python3
 import json, os, pathlib, sys, time
@@ -63,18 +62,6 @@ def text(msg_id, *blocks, parent=None):
 
 def result(body='chief: stage · done', is_error=False, subtype='success'):
     return {'type': 'result', 'subtype': subtype, 'is_error': is_error, 'result': body}
-
-
-def console_pids():
-    """Windows: the pids attached to this process's console, none without one."""
-    kernel32 = ctypes.WinDLL('kernel32')
-    pids = (ctypes.c_uint32 * 1024)()
-    while True:
-        # A short buffer gets no pids, only the count it needs: grow and retry.
-        n = kernel32.GetConsoleProcessList(pids, len(pids))
-        if n <= len(pids):
-            return set(pids[:n])
-        pids = (ctypes.c_uint32 * n)()
 
 
 def kill(pid):

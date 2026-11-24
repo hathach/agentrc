@@ -170,8 +170,6 @@ the skipped tests and notes for a port:
   control.
 - `target-debug`'s `sysview_record.py`, which refuses there: it drives SystemView
   under Xvfb and tracks its processes through `/proc` and process groups.
-- `target-debug`'s `esp_session.py`, which refuses there: it detaches openocd
-  as a POSIX session and identifies it through `/proc` (#130).
 
 The hardware-debug scripts run on Windows but are unverified on a board there
 (#130), and their tests skip the cases that drive POSIX stub executables or

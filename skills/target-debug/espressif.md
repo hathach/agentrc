@@ -97,6 +97,9 @@ python3 <skill dir>/scripts/esp_session.py inspect --out <new dir> --board-cfg b
 #   a server left running after exit 3: leave --receipt <out>/receipt.json
 ```
 
+On Windows it runs the same way, unverified on a board there (#130): openocd gets a console of its own, so a Ctrl-C
+or Ctrl-Break reaches the script, which still ends the session over the Tcl port.
+
 - Server initialization examines the cores and leaves them running (S2, S3, P4, S31 measured 2026-10-16); a telnet
   `halt` or the gdb connect halts them. Keep the three apart in a record: examination, gdb connect and a deliberate halt
   each change state differently.

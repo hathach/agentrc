@@ -54,6 +54,18 @@ def make_stub(bin_dir, name, source):
     return stub
 
 
+def console_pids():
+    """Windows: the pids attached to this process's console, none without one."""
+    kernel32 = ctypes.WinDLL('kernel32')
+    pids = (ctypes.c_uint32 * 1024)()
+    while True:
+        # A short buffer gets no pids, only the count it needs: grow and retry.
+        n = kernel32.GetConsoleProcessList(pids, len(pids))
+        if n <= len(pids):
+            return set(pids[:n])
+        pids = (ctypes.c_uint32 * n)()
+
+
 def pid_alive(pid):
     if os.name != 'nt':
         try:
