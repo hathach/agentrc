@@ -1,5 +1,5 @@
 """skills/arduino/scripts/arduino_hil.py is the HIL harness mechanics an Arduino library's hil_test.py binds its profile
-to: roster checks, build record admission (schema 2), DUT identity, flashing, the battery's lock and cleanup paths,
+to: roster checks, build record admission (schema 3), DUT identity, flashing, the battery's lock and cleanup paths,
 manual sessions, commissioning, verdicts and the report. Moved from Adafruit_TinyUSB_Arduino's hil_test.py (2989bca)
 with its .claude/test/test_hil.py, run here against a fake library (tests/fixtures/arduino_lib) with agentrc's lock,
 flash, process, report and USB modules and pyserial stubbed. Stubs prove the plumbing only; hardware behaviour is a
@@ -282,7 +282,7 @@ class Base(unittest.TestCase):
         rel = f'build/hil/{board}/echo/echo.ino.elf'
         (self.root / rel).parent.mkdir(parents=True, exist_ok=True)
         (self.root / rel).write_bytes(b'elf')
-        rec = {'kind': 'arduino-hil-build', 'version': 2, 'library': fake.NAME, 'board': board, 'experimental': False,
+        rec = {'kind': 'arduino-hil-build', 'version': 3, 'library': fake.NAME, 'board': board, 'experimental': False,
                'fqbn': 'f', 'platform': {}, 'source': {'head': 'abc', 'dirty': False}, 'role': 'device',
                'roster': {'sha256': sha(self.roster.read_bytes())}, **H.B.contract_identity(),
                'sketches': {'echo': {'example': 'examples/Basic/echo', 'vidPid': '1234:5678', 'elf': rel, 'hex': None,
@@ -482,8 +482,8 @@ class Admission(Base):
                           ({'source': {'head': 'old'}}, 'built at old, the checkout is at abc: rebuild'),
                           ({'roster': {'sha256': '0'}}, 'changed since the record was built'),
                           ({'role': 'host'}, 'a host record, rig_jlink is a device board'),
-                          ({'kind': 'other'}, 'not a version 2'),
-                          ({'version': 1}, 'not a version 2 arduino-hil-build record: rebuild it with the build '
+                          ({'kind': 'other'}, 'not a version 3'),
+                          ({'version': 2}, 'not a version 3 arduino-hil-build record: rebuild it with the build '
                                            'contract\'s --record'),
                           ({'library': 'Other Library'}, 'it is a Other Library record, this harness is Fake USB '
                                                          'Library\'s')):

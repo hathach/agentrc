@@ -55,7 +55,8 @@ retries, recovery) apply unchanged; these scripts load its `hil_*` scripts throu
   install` line. Nothing installs during builds. Every library a compile used must be this checkout, a declared
   dependency or one of their transitive `depends=` from its resolved directory, one bundled with the core, or a
   prepared user copy shadowing a library the build's own core bundles (hashed before any compile and recorded with
-  `shadows`); any other fails the sketch.
+  `shadows`); any other fails the sketch. A dependency binds its directory as `arduino_build.py`'s `tree_digest()`
+  documents, and a change to it during the run fails it.
 - **The HIL build record**: the rig's installed core need not match or exist; HIL validates the recorded images.
   Git-checkout cores are content-bound, other cores have id/version provenance only. The report's `modified` label
   means only a recorded `dirty: true`; `arduino_hil.py`'s `core_provenance()` renders a malformed field as `?` or

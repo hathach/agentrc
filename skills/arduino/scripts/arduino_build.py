@@ -72,7 +72,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 FILES = ('skills/hil/boards.json', 'skills/hil/scripts/agentrc_source.py', 'skills/hil/scripts/hil_boards.py',
          'skills/hil/scripts/hil_load.py', 'skills/hil/scripts/usb_observe.py')
 SELF = 'skills/arduino/scripts/arduino_build.py'
-SCHEMA = 2
+SCHEMA = 3
 PROFILE_API = 1   # bump on a change a library profile must follow, arduino_hil's and arduino_remote's included
 PROFILE_FEATURES = ('core', 'base', 'named', 'battery')
 COMPILE_TIMEOUT = 900
@@ -81,6 +81,10 @@ HIL_CONTROL = ('.claude/skills/hil-contract/scripts/', 'test/hil/')
 SOURCE_DIRS = ('src/', 'examples/', 'test/hil/')   # an untracked file here would be missing from a record's patch
 IMAGE_KIND = {'openocd': 'elf', 'jlink': 'hex', 'esptool': 'esptool'}   # what the HIL harness flashes per flasher
 BOOT_APP0 = 'tools/partitions/boot_app0.bin'   # the ESP core's otadata image its flash_args name, under the platform
+# top-level dirs arduino-cli never compiles from (src/ recursively, or the root and utility/ flat): task worktrees,
+# build and HIL output; a library's own run there must not read as dependency drift. A header there is still
+# reachable by an include path, so undigested_inputs() fails a build whose .d files name one.
+UNDIGESTED = ('.worktrees', 'build', '.hil-remote')
 
 P = None   # the bound profile
 
@@ -527,8 +531,10 @@ def _cli_json(*args):
 
 def tree_digest(root):
     """sha256 over a library dir's files (relative path and the bytes they resolve to, symlinked files and dirs
-    followed, each dir once, a symlinked dir's target bound too, .git excluded): what a dependency's identity binds,
-    dirty or not, git checkout or not."""
+    followed, each dir once, a symlinked dir's target bound too, .git and the top-level UNDIGESTED dirs excluded):
+    what a dependency's identity binds, dirty or not, git checkout or not; a build that read an excluded file fails
+    (undigested_inputs). Schema 3 records carry this digest; a schema 2 record's bound those dirs too and is refused
+    for a rebuild."""
     h, seen = hashlib.sha256(), set()
     root = Path(root)
     root_real = os.path.realpath(root)
@@ -542,7 +548,7 @@ def tree_digest(root):
             dirnames[:] = []
             continue
         seen.add(real)
-        dirnames[:] = sorted(d for d in dirnames if d != '.git')
+        dirnames[:] = sorted(d for d in dirnames if d != '.git' and not (dirpath == str(root) and d in UNDIGESTED))
         for name in sorted(filenames):
             f = Path(dirpath) / name
             h.update(f.relative_to(root).as_posix().encode() + b'\0')
@@ -618,6 +624,21 @@ def used_dependencies(prepared, rows):
     return {n: ({k: v for k, v in dep.items() if k != 'shadowOnly'} | {'shadows': shadows[n]}
                 if dep.get('shadowOnly') else dep)
             for n, dep in prepared.items() if not dep.get('shadowOnly') or n in shadows}
+
+
+def undigested_inputs(deps, prepared):
+    """The files a build read (`deps`, its dep_paths) under a prepared dependency's UNDIGESTED dirs, which its
+    digest does not bind: `#include "build/x.h"` from a flat library's root or `"../build/x.h"` from src/."""
+    excluded = [os.path.join(dep['dir'], d) for dep in prepared.values() for d in UNDIGESTED]
+    lexical, real = {os.path.normpath(x) for x in excluded}, {os.path.realpath(x) for x in excluded}
+    resolved = functools.lru_cache(maxsize=None)(os.path.realpath)
+
+    def hit(token):
+        # any dir prefix, as written (`..` resolved physically) or normalised, that is or resolves to an excluded
+        # dir: catches aliases of the dependency, symlinked dirs at any level and a symlinked final file
+        prefixes = {*Path(token).parents, *Path(os.path.normpath(token)).parents}
+        return any(str(q) in lexical or resolved(str(q)) in real for q in prefixes)
+    return sorted(t for t in deps if hit(t))
 
 
 def dependency_drift(deps):
@@ -780,10 +801,47 @@ def dep_paths(build_dir):
     seen = set()
     for dfile in Path(build_dir).rglob('*.d'):
         text = dfile.read_text(errors='replace').replace('\\\n', ' ')
-        for token in (t.replace('\\ ', ' ') for t in re.split(r'(?<!\\)\s+', text) if t):
+        for token in make_words(text):
             if not token.endswith(':') and token.startswith('/'):
                 seen.add(token)
     return list(seen)
+
+
+def make_words(text):
+    """The file names of a .d file's text, GCC's Make quoting (libcpp/mkdeps munge(), 7.3 through master) undone:
+    2N+1 backslashes before a space or tab are N and the blank, 2N before one are N ending the name, `\\#` is `#`
+    and `$$` is `$`; any other backslash is literal."""
+    words, word, i = [], [], 0
+    while i < len(text):
+        c = text[i]
+        if c == '\\':
+            j = i
+            while j < len(text) and text[j] == '\\':
+                j += 1
+            n, nxt = j - i, text[j:j + 1]
+            if nxt in (' ', '\t'):
+                word.append('\\' * (n // 2) + (nxt if n % 2 else ''))
+                i = j + n % 2
+            elif nxt == '#':
+                word.append('\\' * (n - 1) + '#')
+                i = j + 1
+            else:
+                word.append('\\' * n)
+                i = j
+        elif c == '$' and text[i + 1:i + 2] == '$':
+            word.append('$')
+            i += 2
+        elif c.isspace():
+            if word:
+                words.append(''.join(word))
+                word = []
+            i += 1
+        else:
+            word.append(c)
+            i += 1
+    if word:
+        words.append(''.join(word))
+    return words
 
 
 def core_tinyusb(deps):
@@ -976,6 +1034,11 @@ def compile_sketch(board, example, build_dir, properties, prepared, config=None)
             return row
         shutil.copy2(boot_app0, build_dir / boot_app0.name)
     deps = dep_paths(build_dir)
+    unbound = undigested_inputs(deps, prepared)
+    if unbound:
+        row.update(status='failed', firstError=f'compiled dependency files under {"/, ".join(UNDIGESTED)}/, which '
+                   f'its digest does not bind: {unbound[:3]}', remedy='move them out of those dirs')
+        return row
     headers = foreign_headers(deps, cores)
     if M().FOREIGN_FAILS and headers:
         row.update(status='failed', foreignHeaders=headers,

@@ -1,6 +1,6 @@
 """skills/arduino/scripts/arduino_build.py is the build mechanics an Arduino library's build contract binds its profile
 to: selection under ci-arduino's filters, compiles against the checkout, dependency and header provenance, image span
-checks and the HIL build record (schema 2). Moved from Adafruit_TinyUSB_Arduino's check_build.py (2989bca) with its
+checks and the HIL build record (schema 3). Moved from Adafruit_TinyUSB_Arduino's check_build.py (2989bca) with its
 .claude/test/test_build.py, run here against a fake library (tests/fixtures/arduino_lib). arduino-cli is stubbed:
 stubs prove the plumbing only; a real build is evidence only from a run of a library's contract."""
 import os
@@ -405,7 +405,7 @@ class Selection(Lib):
 
     def test_select_only_exit_and_shape(self):
         code, out = self.run_main(['--select-only', '--scope', 'README.md'])
-        self.assertEqual((code, out['version'], out['build']['builds']), (0, 2, {}))
+        self.assertEqual((code, out['version'], out['build']['builds']), (0, 3, {}))
         roster = fake.roster(self.root / 'test/hil/ci.json')
         code, out = self.run_main(['--select-only', '--scope', 'test/hil/sketches/probe', '--hil-config',
                                    str(roster)])
@@ -492,6 +492,30 @@ class Provenance(Lib):
         self.assertEqual(core, {same: True, other: True, gone: True, spaced / 'src/fake.h': False})
         self.assertFalse(any(h['core'] for h in ab.foreign_headers(ab.dep_paths(build))))
 
+    def test_dep_paths_undo_gccs_make_quoting(self):
+        # g++ 14.2 -MMD's spelling of t/hash#parent, t/dollar$parent, t/sp ace, t/bs\ sp and t/tab<TAB>x
+        line = ('m.o: m.cpp /t/hash\\#parent/g.h /t/dollar$$parent/g.h /t/sp\\ ace/g.h \\\n'
+                ' /t/bs\\\\\\ sp/g.h /t/tab\\\tx/g.h /t/end\\\\ /t/lit\\x.h\n')
+        build = self.tmp / 'b'
+        build.mkdir()
+        (build / 'm.d').write_text(line)
+        self.assertEqual(sorted(ab.dep_paths(build)), sorted([
+            '/t/hash#parent/g.h', '/t/dollar$parent/g.h', '/t/sp ace/g.h', '/t/bs\\ sp/g.h', '/t/tab\tx/g.h',
+            '/t/end\\', '/t/lit\\x.h']))
+
+    def test_an_excluded_file_under_a_make_quoted_parent_is_found(self):
+        for parent in ('hash#parent', 'dollar$parent', 'sp ace'):
+            lib = self.tmp / parent / 'Lib'
+            (lib / 'build').mkdir(parents=True)
+            (lib / 'build/generated.h').write_text('one')
+            build = self.tmp / parent / 'b'
+            build.mkdir()
+            quoted = str(lib).replace('$', '$$').replace('#', '\\#').replace(' ', '\\ ')
+            (build / 'a.cpp.d').write_text(f'a.cpp.o: {quoted}/Lib.h {quoted}/build/generated.h\n')
+            with self.subTest(parent=parent):
+                self.assertEqual(ab.undigested_inputs(ab.dep_paths(build), {'Lib': {'dir': str(lib)}}),
+                                 [f'{lib}/build/generated.h'])
+
     def test_core_tinyusb_names_the_esp_cores_bundled_copy_its_version_and_headers(self):
         d = self.tmp / 'esp32s3 libs/3.3.12'
         tusb = d / 'include/arduino_tinyusb'
@@ -564,6 +588,56 @@ class Provenance(Lib):
         self.assertEqual(deps.call_count, 1)
         self.assertEqual((row['foreignHeaders'], row['coreTinyUSB']), ([], [
             {'root': str(tusb), 'version': None, 'ref': None, 'headers': [str(tusb / 'include/tusb_config.h')]}]))
+
+    def test_a_dependency_file_its_digest_skips_fails_the_sketch(self):
+        flat = Path(self.dep('Flat', files={'Flat.h': '#include "build/generated.h"'})['library']['install_dir'])
+        rec = Path(self.dep('Rec', files={'src/Rec.h': '#include "../build/generated.h"'})['library']['install_dir'])
+        prepared = {'Flat': {'dir': str(flat)}, 'Rec': {'dir': str(rec)}}
+        # the paths gcc's .d files name for those includes under arduino-cli 1.5.1
+        for d, read in ((flat, ['Flat.h', 'build/generated.h']), (rec, ['src/Rec.h', 'src/../build/generated.h'])):
+            def run(*_, **__):
+                (self.root / 'b/a.cpp.d').write_text('a.cpp.o: ' + ' '.join(f'{d}/{f}' for f in read) + '\n')
+                return self.fake_compile()
+            with self.subTest(layout=d.name), mock.patch.object(ab.subprocess, 'run', side_effect=run):
+                row = ab.compile_sketch('rig_jlink', 'examples/Basic/echo', self.root / 'b', [], prepared)
+            self.assertEqual((row['status'], row['remedy']), ('failed', 'move them out of those dirs'))
+            self.assertEqual(row['firstError'], 'compiled dependency files under .worktrees/, build/, .hil-remote/, '
+                             f'which its digest does not bind: {[f"{d}/{read[1]}"]}')
+
+        def run(*_, **__):
+            (self.root / 'b/a.cpp.d').write_text(f'a.cpp.o: {rec}/src/Rec.h {rec}/src/build/b.h {flat}/Flat.h\n')
+            return self.fake_compile()
+        with mock.patch.object(ab.subprocess, 'run', side_effect=run):
+            self.assertEqual(ab.compile_sketch('rig_jlink', 'examples/Basic/echo', self.root / 'b', [],
+                                               prepared)['status'], 'ok')
+
+    def test_a_symlinked_excluded_dir_read_through_an_alias_of_the_dependency_fails(self):
+        lib = Path(self.dep('Lib', files={'Lib.h': '#include "build/generated.h"'})['library']['install_dir'])
+        external = self.tmp / 'external/output'
+        external.mkdir(parents=True)
+        (external / 'generated.h').write_text('one')
+        (lib / 'build').symlink_to(external, target_is_directory=True)
+        alias = self.tmp / 'isolated/libraries/Lib'   # cli_env()'s link to the prepared dir
+        alias.parent.mkdir(parents=True)
+        alias.symlink_to(lib, target_is_directory=True)
+        read = f'{alias}/build/generated.h'
+        self.assertEqual(ab.undigested_inputs([f'{alias}/Lib.h', read], {'Lib': {'dir': str(lib)}}), [read])
+        first = ab.tree_digest(lib)
+        (external / 'generated.h').write_text('two')
+        self.assertEqual(ab.tree_digest(lib), first)   # what makes the read unbound
+
+    def test_a_symlinked_header_in_an_excluded_dir_read_through_an_alias_fails(self):
+        lib = Path(self.dep('Lib', files={'Lib.h': '#include "build/generated.h"'})['library']['install_dir'])
+        (self.tmp / 'external').mkdir()
+        (self.tmp / 'external/generated.h').write_text('one')
+        (lib / 'build').mkdir()
+        (lib / 'build/generated.h').symlink_to(self.tmp / 'external/generated.h')
+        alias = self.tmp / 'isolated/libraries/Lib'
+        alias.parent.mkdir(parents=True)
+        alias.symlink_to(lib, target_is_directory=True)
+        read = f'{alias}/build/generated.h'
+        self.assertEqual(ab.undigested_inputs([f'{alias}/Lib.h', read, f'{alias}/src/x.h'], {'Lib': {'dir': str(lib)}}),
+                         [read])
 
     def test_missing_core_is_an_error_with_remedy(self):
         row = self.compile(self.fake_compile(success=False, err='Error resolving FQBN: platform x'), board='dev_a')
@@ -697,6 +771,34 @@ class Dependencies(Lib):
         (d / 'src/y.h').write_text('through the link')
         self.assertNotEqual(ab.tree_digest(d), linked)   # a symlinked file is its target's bytes
 
+    def test_tree_digest_skips_top_level_worktrees_and_build_output(self):
+        d = Path(self.dep('Dep A')['library']['install_dir'])   # a copy, no .git anywhere
+        first = ab.tree_digest(d)
+        for f in ('.worktrees/task/src/x.h', '.worktrees/task/.git', 'build/hil/a.elf', '.hil-remote/r/run.json'):
+            (d / f).parent.mkdir(parents=True, exist_ok=True)
+            (d / f).write_text('output')
+        self.assertEqual(ab.tree_digest(d), first)
+        (d / 'build/hil/a.elf').write_text('rebuilt')
+        self.assertEqual(ab.tree_digest(d), first)
+        (d / 'src/x.h').write_text('edited')
+        self.assertNotEqual(ab.tree_digest(d), first)
+        (d / 'src/x.h').write_text('Dep A')
+        for f in ('src/build/b.h', 'src/vendor/v.h', 'src/vendor/.git'):   # below the top, a nested repo included
+            (d / f).parent.mkdir(parents=True, exist_ok=True)
+            (d / f).write_text('one')
+        nested = ab.tree_digest(d)
+        self.assertNotEqual(nested, first)
+        (d / 'src/vendor/v.h').write_text('two')
+        self.assertNotEqual(ab.tree_digest(d), nested)
+        (d / 'src/build/b.h').write_text('two')
+        nested = ab.tree_digest(d)
+        (d / 'src/gen.h').symlink_to(d / 'build/gen.h')   # a compiled path linked into build/ binds its target
+        (d / 'build/gen.h').write_text('one')
+        linked = ab.tree_digest(d)
+        self.assertNotEqual(linked, nested)
+        (d / 'build/gen.h').write_text('two')
+        self.assertNotEqual(ab.tree_digest(d), linked)
+
     def test_tree_digest_follows_symlinked_dirs_once_and_takes_dangling_links(self):
         d = Path(self.dep('Dep A')['library']['install_dir'])
         shared = self.tmp / 'shared'
@@ -740,6 +842,15 @@ class Dependencies(Lib):
         self.assertEqual((code, out['pass']), (1, False))
         self.assertEqual(out['firstError'], "dependencies changed during the build: ['Dep A']")
         self.assertEqual(out['dependencies'], [prepared['Dep A']])
+
+    def test_a_dependencys_own_worktree_build_is_no_drift(self):
+        lib = self.dep('Dep A')
+        with self.installed(lib):
+            prepared = {'Dep A': ab._lib_identity(lib['library'])}
+        out = Path(prepared['Dep A']['dir']) / '.worktrees/task/build/hil/a.elf'
+        out.parent.mkdir(parents=True)
+        out.write_bytes(b'elf')
+        self.assertEqual(ab.dependency_drift(prepared), [])
 
 
 class Registry(Lib):
@@ -923,7 +1034,7 @@ class CoreContent(unittest.TestCase):
 
 
 class Record(RecordCase):
-    def test_jlink_board_records_the_hex_and_schema_2_identity(self):
+    def test_jlink_board_records_the_hex_and_schema_3_identity(self):
         dep = {'name': 'Dep A', 'version': '1', 'dir': '/l/A', 'location': 'user', 'sha256': 'f' * 64}
         rec, err = self.record(self.samd_row(), prepared={'Dep A': dep})
         self.assertIsNone(err)
@@ -932,7 +1043,7 @@ class Record(RecordCase):
         self.assertEqual(sorted(s['sha256']), ['build/hil/rig_jlink/echo/echo.ino.elf',
                                                'build/hil/rig_jlink/echo/echo.ino.hex'])
         self.assertEqual((rec['version'], rec['kind'], rec['library'], rec['role']),
-                         (2, 'arduino-hil-build', fake.NAME, 'device'))
+                         (3, 'arduino-hil-build', fake.NAME, 'device'))
         self.assertEqual(rec['roster'], {'path': 'test/hil/ci.json', 'sha256': ab.sha256(self.roster)})
         self.assertEqual(rec['dependencies'], [dep])
         self.assertEqual(rec['contract'], {f: ab.sha256(self.root / f) for f in self.P.CONTRACT_FILES})
