@@ -1256,6 +1256,66 @@ class Keeper(Fixture):
         self.wait_ended()
         self.assert_released(token, keeper)
 
+    def fail_release(self, case):
+        """A retained run whose first checked release fails as `case(m, faulty, tried)` makes it, while `faulty`
+        exists; returns (token, keeper, the file `case` touches once it failed, `faulty`)."""
+        faulty, tried = Path(self.td.name) / 'faulty', Path(self.td.name) / 'tried'
+        faulty.touch()
+
+        def patch(m):
+            m.PUBLISH_RETRY = (0.05, 0.1)
+            case(m, faulty, tried)
+        p = self.run_run(action='survivor', patch=patch, budget='0.3')
+        line = p.blocker()
+        orphan = self.orphan()
+        token, keeper = self.assert_retained(p, line)
+        self.kill(orphan)
+        self.wait_ended()
+        with mock.patch.object(hr.hil_lock, 'RELEASE_WAIT', 0.5):
+            with self.assertRaisesRegex(hr.hil_lock.ReleaseRefused, 'signalled, but holder pid'):
+                hr.hil_lock.release_token(token)
+        self.wait_for(tried.exists, 'the release to fail')
+        return token, keeper, faulty
+
+    def assert_released_once_healed(self, token, keeper, faulty):
+        self.assertTrue(all(not self.flock_free(lock) for lock in BOARDS))
+        faulty.unlink()
+        self.wait_for(lambda: all((r or {}).get('role') == 'cleanup-holder' for r in self.records().values())
+                      and (hr.hil_lock.fence_state() or {}).get('phase') == 'ended', 'the keeper to publish again')
+        self.assert_released(token, keeper)
+
+    def test_a_release_whose_fence_unlink_is_not_durable_publishes_again(self):
+        def case(m, faulty, tried):
+            real = m.hil_lock._unlink_fence
+
+            def unlink_fence():
+                real()
+                if faulty.exists():
+                    tried.touch()
+                    raise OSError(5, 'Input/output error')      # the dir fsync, after the unlink
+            m.hil_lock._unlink_fence = unlink_fence
+        self.assert_released_once_healed(*self.fail_release(case))
+
+    def test_a_release_whose_record_restore_fails_once_retries_it(self):
+        def case(m, faulty, tried):
+            real_unlink, real_write = m.hil_lock._unlink_fence, m.hil_lock.write_record
+
+            def unlink_fence():
+                if not tried.exists():
+                    tried.touch()
+                    raise OSError(5, 'Input/output error')
+                real_unlink()
+
+            def write_record(fh, reason, **extra):
+                if tried.exists() and faulty.exists() and os.readlink(f'/proc/self/fd/{fh.fileno()}').endswith(
+                        '/stm32f303disco.lock'):
+                    raise OSError(5, 'Input/output error')
+                real_write(fh, reason, **extra)
+            m.hil_lock._unlink_fence, m.hil_lock.write_record = unlink_fence, write_record
+        token, keeper, faulty = self.fail_release(case)
+        self.assertIsNone(hr.hil_lock.read_record('stm32f303disco'))
+        self.assert_released_once_healed(token, keeper, faulty)
+
     def test_a_keeper_started_with_a_dropped_variable_is_execd_afresh_without_it(self):
         hr.hil_lock.ENV_DROP = ('HIL_SELFTEST_SCOPE',)
         seen = Path(self.td.name) / 'exec'

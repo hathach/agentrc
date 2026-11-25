@@ -69,7 +69,8 @@ The fence alone records the phase: once the keeper reaped every descendant it ma
 (retried with backoff while everything stays held), which a process ending does not prove
 restored. Only `hil_lock.py release --token <token>` then releases, after checking the fence,
 and the keeper, checking again, clears the records, then the fence, then the flocks and
-admission. The fence refuses every take, of an existing lock name or a new one, once its keeper
+admission; a release that fails there restores the records and the `ended` fence, retried the
+same way, and waits for the next. The fence refuses every take, of an existing lock name or a new one, once its keeper
 is gone (hil_lock.FenceHeld): a keeper killed before `ended` leaves the host refusing until it
 reboots, one killed after until that token release clears it. The fence lives in the lock dir,
 which hil-farm-setup exempts from tmpfiles aging (`x /tmp/tinyusb-hil-locks`); a host without
@@ -621,15 +622,23 @@ class Reservation:
         return failed
 
     def keep_until_released(self) -> int:
-        """After the exit status went out: reap until no descendant is left, publish `ended` (the
-        fence, and any record not yet rewritten), retried with backoff while everything is kept,
-        then wait for SIGUSR1 from release_token. A request before that is dropped. Returns 0 once
+        """After the exit status went out: reap until no descendant is left, publish `ended`, then
+        wait for SIGUSR1 from release_token; a release that fails publishes again. Returns 0 once
         released."""
-        hil_process.reap_all()
+        while True:
+            hil_process.reap_all()
+            self._publish_ended()
+            signal.sigwaitinfo({signal.SIGUSR1})
+            if self._release_retained():
+                return 0
+
+    def _publish_ended(self):
+        """Every record a cleanup holder and the fence `ended`, retried with backoff while
+        everything is kept; a release request before that is dropped."""
         delay = PUBLISH_RETRY[0]
         while True:
             while signal.sigtimedwait({signal.SIGUSR1}, 0) is not None:
-                pass                              # sent before `ended` was published: no release
+                pass
             if self.unmarked:
                 self.unmarked = self._mark(self.unmarked)
             try:
@@ -638,13 +647,9 @@ class Reservation:
                 pass
             else:
                 if not self.unmarked:
-                    break
+                    return
             time.sleep(delay)
             delay = min(delay * 2, PUBLISH_RETRY[1])
-        while True:
-            signal.sigwaitinfo({signal.SIGUSR1})
-            if self._release_retained():
-                return 0
 
     def _release_retained(self) -> bool:
         if not hil_process.reap_until(time.monotonic()):
