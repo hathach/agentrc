@@ -32,9 +32,12 @@ A key not listed here throws before anything runs.
   The review lane's harvest also reads the comments people left: one by an
   owner, member or collaborator other than the PR's author and the posting
   account that still waits for an answer stops the launch `human-review`,
-  naming each in `waiting`, before anything is fixed, answered or pushed
-  (#591). No argument answers it: a relaunch passes once a person replied in
-  the thread or resolved it, or the author answered.
+  naming each in `waiting`, before anything is fixed, answered or pushed,
+  an unpublished `adoptHead` included, which a harvest before its push checks
+  (#591). No argument answers it: a relaunch passes an inline comment once its
+  thread is resolved or holds a later reply, and an issue comment or review
+  body once the PR's author or the posting account answered after it, never
+  on another person's reply (`SKILL.md`).
 - `autoRun`: the reviewers that run on every push and gate done; default
   `reviewers` without `copilot` and `code-scanning`, which are only harvested.
   Every reviewer is reported with its state; only these are waited on, which is
@@ -235,7 +238,11 @@ A key not listed here throws before anything runs.
   stops `pr-conflicting`; the merge that resolves it rejoins by `adoptHead`.
   An `adoptHead` naming a repair reconciled as published has nothing left to
   adopt; a reconciled adoption retried is audited from its own base and read
-  `already-published`.
+  `already-published`. With any `reviewers`, an unpublished chain is pushed
+  only once a harvest finds no comment a person waits on; a `human-review`,
+  `harvest-failed` or `github-rate-limited` stop there leaves it unpushed and
+  names it in `adoptionHeld`, retried by a relaunch with the returned
+  stateRef and the same `adoptHead`.
 - `adoptProtected`: exact repository-relative paths matching `protected` that a
   base merge in the `adoptHead` chain may change, such as a conflict resolved
   in a protected roster; only with `adoptHead`, per launch. A path an

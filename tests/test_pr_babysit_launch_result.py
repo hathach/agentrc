@@ -640,6 +640,27 @@ class LaunchResultTest(unittest.TestCase):
         self.assertEqual([b for b in elsewhere if b.startswith('heads disagree')], [f"heads disagree: {{'state': '{HEAD}', 'checkout': '{'c' * 40}'}}"],
                          'a checkout off the repair is not the one its adoption settles')
 
+    def test_an_adoption_held_before_its_push_names_the_relaunch_that_settles_it(self):
+        # #591: a stop before the adoption's push leaves the state at its from and the checkout at its to.
+        def held(reason, checkout=NEXT, **extra):
+            data = {'result': {'stateDigest': '0123abcd', 'pass': False, 'status': 'blocked', 'reason': reason, 'cycles': 2,
+                               'adoptionHeld': {'from': HEAD, 'to': NEXT}, **extra,
+                               'state': {'expectedHead': HEAD, 'pending': None, 'cyclesUsed': 2, 'maxCycles': 16}}}
+            return launch_result.summarize(data, '/t/w.output', tree={'branch': 'pr', 'head': checkout, 'dirty': []})['blockers']
+        route = (f'the adoption aaaaaaaa..bbbbbbbb was held before its push, unpublished: once the stop above is settled, relaunch '
+                 f'with the same stateRef and adoptHead {NEXT}, the checkout left at it, while the PR head is still aaaaaaaa')
+        heads = (f"heads disagree: {{'state': '{HEAD}', 'checkout': '{NEXT}'}}; the checkout holds the adoption held before its "
+                 'push, settled by its adoptHead relaunch')
+        url = 'https://github.com/o/r/pull/7#issuecomment-9'
+        self.assertEqual(held('human-review', waiting=[{'commentId': 9, 'author': 'HiFiPhile', 'url': url}]),
+                         [launch_result.STALLED['human-review'], f"comment 9 by HiFiPhile waits for a person's answer: {url}", route, heads])
+        for reason in ('harvest-failed', 'github-rate-limited'):
+            with self.subTest(reason):
+                self.assertEqual(held(reason), [launch_result.STALLED[reason], route, heads])
+        self.assertEqual([b for b in held('harvest-failed', checkout='c' * 40) if b.startswith('heads disagree')],
+                         [f"heads disagree: {{'state': '{HEAD}', 'checkout': '{'c' * 40}'}}"],
+                         'a checkout off the held adoption is not the one its relaunch settles')
+
     def test_an_unusable_validator_report_is_settled_by_a_relaunch_that_runs_it_again(self):
         for reason, error in (('duplicate-finding-ids', 'duplicate findingId'),
                               ('review-report-unusable', 'validator report unusable: no bots')):

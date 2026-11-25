@@ -356,6 +356,13 @@ async function run(opts = {}) {
       const [, published, base, tip] = String(prompt).match(/ --published ([0-9a-f]{40}) --base ([0-9a-f]{40}) --tip ([0-9a-f]{40})`/)
       return answer === null ? null : conforms(options.schema, { published, base, tip, ...structuredClone(answer) }, label)
     }
+    if (label === 'adopt:waiting' || label === 'adopt:waiting.retry') {
+      // harvest.py's line before an adoption's push (#591): opts.adoptWaiting the comments people wait on (a value, or a
+      // function of the label), null a dead relay, an { error } harvest.py's error line; else the case's reviews' own.
+      const answer = typeof opts.adoptWaiting === 'function' ? opts.adoptWaiting(label) : opts.adoptWaiting
+      if (answer === null || answer?.error) return answer
+      return { headSha: prHead, waiting: answer ?? (reviews instanceof Error ? [] : reviews.waiting ?? []) }
+    }
     if (label === 'adopt:push' || label === 'adopt:push.retry') {
       // push.py's receipt: by default the push landed on every pinned URL and the PR.
       const to = opts.args.adoptHead
@@ -3811,6 +3818,56 @@ test("a person's comment waiting for an answer stops the run before anything is 
   assert.ok(again.labels.some(l => l.startsWith('fix:')), again.labels.join(', '))
 })
 
+test("a person's comment waiting for an answer stops an unpublished adoption before its push, and a retry likewise (#591)", async () => {
+  const launch = { args: adoptionArgs(adoptionState(), { autoPush: true }), preflight: { head: ADOPT, prHead: HEAD } }
+  const { result, labels, calls, logs } = await run({ ...launch, adoptWaiting: [OBJECTION] })
+  assert.deepEqual([result.pass, result.reason], [false, 'human-review'])
+  const { digest, excerpt, ...named } = OBJECTION
+  assert.deepEqual(result.waiting, [named])
+  assert.match(result.detail, new RegExp(`theirs to answer or resolve; this run does not answer them; before the adoption push of ${ADOPT.slice(0, 7)}, left unpublished`))
+  assert.deepEqual(labels, ['preflight', 'adopt:audit', 'adopt:waiting'], 'nothing pushed, no cycle run')
+  assert.match(calls.find(c => c.label === 'adopt:waiting').prompt, /harvest\.py --pr 3888 --repo 'hathach\/tinyusb' --reviewers coderabbit` /)
+  assert.ok(logs.includes(`cycle 2: 1 comment(s) by people wait for an answer — 4682479462 by HiFiPhile (${OBJECTION.url}); ` +
+    'theirs to answer or resolve, this run does not answer them'), logs.join('\n'))
+  assert.equal('adoption' in result.history.at(-1), false, 'no adoption attempt is recorded')
+  assert.deepEqual([result.state.expectedHead, result.state.pending], [HEAD, null], 'the adoption stays to retry')
+  assert.deepEqual(result.adoptionHeld, { from: HEAD, to: ADOPT }, 'the stop names the adoption it held')
+  // The retry of a failed adoption push meets the same check.
+  const failed = await run({ ...launch, adoptPush: receiptOf(HEAD, HEAD, ' ! [rejected] non-fast-forward', false) })
+  assert.equal(failed.result.reason, 'adopt-push-failed')
+  const retry = await run({ ...launch, args: adoptionArgs(failed.result.state, { autoPush: true }), adoptWaiting: [OBJECTION] })
+  assert.equal(retry.result.reason, 'human-review')
+  assert.equal(retry.labels.includes('adopt:push'), false, retry.labels.join(', '))
+  assert.deepEqual(retry.result.adoptionHeld, { from: HEAD, to: ADOPT })
+  // Once nothing waits, the relaunch adopts as before.
+  const again = await run({ ...launch, args: adoptionArgs(result.state, { autoPush: true }) })
+  assert.deepEqual(again.labels.slice(0, 4), ['preflight', 'adopt:audit', 'adopt:waiting', 'adopt:push'])
+  assert.equal(again.result.history.at(-1).adoption.publication, 'pushed')
+  // A published adoption reads nothing before: the cycle's own harvest stops on the comment.
+  const published = await run({ ...launch, preflight: { head: ADOPT, prHead: ADOPT }, reviews: { ...oneValid, waiting: [OBJECTION] } })
+  assert.equal(published.result.reason, 'human-review')
+  assert.equal(published.labels.includes('adopt:waiting'), false, published.labels.join(', '))
+  assert.equal(published.result.history.at(-1).adoption.publication, 'already-published')
+  assert.equal('adoptionHeld' in published.result, false, 'nothing held: the adoption was already published')
+})
+
+test('a harvest that fails or is rate-limited before an adoption push stops it unpublished (#591)', async () => {
+  const launch = { args: adoptionArgs(adoptionState(), { autoPush: true }), preflight: { head: ADOPT, prHead: HEAD } }
+  const dead = await run({ ...launch, adoptWaiting: null })
+  assert.deepEqual([dead.result.reason, dead.result.detail], ['harvest-failed', `before the adoption push of ${ADOPT.slice(0, 7)}, left unpublished: the relay died`])
+  assert.deepEqual(dead.labels, ['preflight', 'adopt:audit', 'adopt:waiting', 'adopt:waiting.retry'])
+  assert.deepEqual(dead.result.adoptionHeld, { from: HEAD, to: ADOPT })
+  const error = await run({ ...launch, adoptWaiting: { error: 'gh pr view 3888: HTTP 404' } })
+  assert.deepEqual([error.result.reason, error.result.detail], ['harvest-failed', `before the adoption push of ${ADOPT.slice(0, 7)}, left unpublished: harvest.py: gh pr view 3888: HTTP 404`])
+  const recovered = await run({ ...launch, adoptWaiting: (l) => l === 'adopt:waiting' ? null : [] })
+  assert.equal(recovered.result.history.at(-1).adoption.publication, 'pushed')
+  const limited = await run({ ...launch, adoptWaiting: { error: 'gh api: HTTP 403: You have exceeded a secondary rate limit.', rateLimit: LIMIT } })
+  assert.equal(limited.result.reason, 'github-rate-limited')
+  assert.equal(limited.labels.includes('adopt:push'), false)
+  assert.deepEqual([limited.result.state.expectedHead, limited.result.state.pending], [HEAD, null])
+  assert.deepEqual(limited.result.adoptionHeld, { from: HEAD, to: ADOPT })
+})
+
 test('an empty waiting list stops nothing', async () => {
   const quiet = await run({ reviews: { ...oneValid, waiting: [] }, args: { autoPush: true } })
   const plain = await run({ reviews: oneValid, args: { autoPush: true } })
@@ -6683,7 +6740,7 @@ test('a chain merging the base branch\'s live tip is adopted and pushed while Gi
     args: adoptionArgs(state, { autoPush: true }), preflight: { head: ADOPT, prHead: HEAD },
   })
   assert.ok(calls.find(c => c.label === 'adopt:audit').prompt.includes(`--base ${BASE} --tip ${TIP}\``))
-  assert.deepEqual(labels.slice(0, 3), ['preflight', 'adopt:audit', 'adopt:push'])
+  assert.deepEqual(labels.slice(0, 4), ['preflight', 'adopt:audit', 'adopt:waiting', 'adopt:push'])
   assert.equal(result.history[1].adoption.publication, 'pushed')
   assert.ok(logs.includes(`preflight: master is at ${TIP.slice(0, 7)}, not the base ${BASE.slice(0, 7)} GitHub recorded at the PR's last push; a merge may come from either`), logs.join('\n'))
 })
@@ -6693,7 +6750,7 @@ test('adoption publishes before cycle watchers and reviews the adopted head', as
   const { result, labels, calls } = await run({
     args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD },
   })
-  assert.deepEqual(labels.slice(0, 3), ['preflight', 'adopt:audit', 'adopt:push'])
+  assert.deepEqual(labels.slice(0, 4), ['preflight', 'adopt:audit', 'adopt:waiting', 'adopt:push'])
   assert.ok(labels.indexOf('adopt:push') < labels.indexOf('ci:collect#2.1'), 'publication is confirmed before either watcher')
   assert.ok(labels.indexOf('adopt:push') < labels.indexOf('reviews#2'))
   assert.equal(labels.includes('adopt:readback'), false, 'the push receipt carries the read-back')
@@ -6722,7 +6779,7 @@ test('a lost adoption push receipt gets one fresh agent, which reads the push ba
     args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD },
     adoptPush: (label) => label === 'adopt:push' ? null : receiptOf(ADOPT, ADOPT, 'Everything up-to-date'),
   })
-  assert.deepEqual(labels.slice(0, 4), ['preflight', 'adopt:audit', 'adopt:push', 'adopt:push.retry'])
+  assert.deepEqual(labels.slice(0, 5), ['preflight', 'adopt:audit', 'adopt:waiting', 'adopt:push', 'adopt:push.retry'])
   assert.equal(result.history[1].adoption.publication, 'pushed')
   assert.equal(result.state.pending, null)
 })
@@ -6730,7 +6787,7 @@ test('a lost adoption push receipt gets one fresh agent, which reads the push ba
 test('an adoption push whose relay died after push.py wrote its line is read from the file, with no second push', async () => {
   const state = adoptionState()
   const late = await run({ args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD }, lostAnswer: (l) => l === 'adopt:push' })
-  assert.deepEqual(late.labels.slice(0, 3), ['preflight', 'adopt:audit', 'adopt:push'])
+  assert.deepEqual(late.labels.slice(0, 4), ['preflight', 'adopt:audit', 'adopt:waiting', 'adopt:push'])
   assert.equal(late.labels.includes('adopt:push.retry'), false)
   assert.equal(late.result.history[1].adoption.publication, 'pushed')
   assert.equal(late.result.state.pending, null)
@@ -6936,7 +6993,7 @@ test('a launch without a pinned state adopts a local chain whose base is the liv
   assert.equal(first.result.state.pin, null)
   for (const [name, args] of [['stateless', { maxCycles: 4 }], ["the wrong-head stop's state", { maxCycles: 4, state: first.result.state }]]) {
     const { result, labels, calls } = await run({ args: { ...args, adoptHead: ADOPT, autoPush: true }, preflight: { head: ADOPT, prHead: HEAD } })
-    assert.deepEqual(labels.slice(0, 3), ['preflight', 'adopt:audit', 'adopt:push'], name)
+    assert.deepEqual(labels.slice(0, 4), ['preflight', 'adopt:audit', 'adopt:waiting', 'adopt:push'], name)
     assert.ok(calls.find(c => c.label === 'adopt:audit').prompt.includes(`commits.py chain ${HEAD} ${ADOPT} --published ${HEAD} `), name)
     assert.deepEqual(result.history[0].adoption.commits, [ADOPT], name)
     assert.equal(result.history[0].adoption.publication, 'pushed', name)
@@ -6973,7 +7030,7 @@ test('a PR head pushed outside the workflow inside the audited chain is adopted 
   // #3988: 9cf0097 was pushed by hand after a launch, and the state's expectedHead no longer matched.
   const chain = chainAudit([ADOPT_MID, ADOPT], ['src/mid.c', 'src/adopted.c'])
   const pushed = await run({ args: adoptionArgs(adoptionState(), { autoPush: true }), preflight: { head: ADOPT, prHead: ADOPT_MID }, adoptAudit: chain })
-  assert.deepEqual(pushed.labels.slice(0, 3), ['preflight', 'adopt:audit', 'adopt:push'])
+  assert.deepEqual(pushed.labels.slice(0, 4), ['preflight', 'adopt:audit', 'adopt:waiting', 'adopt:push'])
   assert.equal(pushed.result.history[1].adoption.publication, 'pushed')
   assert.equal(pushed.result.state.expectedHead, ADOPT)
   const dry = await run({ args: adoptionArgs(adoptionState(), { autoPush: false }), preflight: { head: ADOPT, prHead: ADOPT_MID }, adoptAudit: chain })
@@ -7102,7 +7159,7 @@ test('an adoption decides an unpublished candidate while the PR still heads the 
     const { result, labels, logs } = await run({
       args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD },
     })
-    assert.deepEqual(labels.slice(0, 3), ['preflight', 'adopt:audit', 'adopt:push'], JSON.stringify(pending))
+    assert.deepEqual(labels.slice(0, 4), ['preflight', 'adopt:audit', 'adopt:waiting', 'adopt:push'], JSON.stringify(pending))
     assert.ok(logs.some(l => l.includes(`the unpublished candidate (${pending.stage}) is left to this adoption`)), JSON.stringify(pending))
     assert.equal(result.history[1].adoption.publication, 'pushed')
     assert.equal(result.state.pending, null)
@@ -7263,7 +7320,7 @@ test('a chain on a reconciled candidate is adopted from it (#443)', async () => 
     const p = state.pending
     const next = lane === 'adopt' ? ADOPT_MID : ADOPT
     const { result, labels, calls } = await run({ args: resumeArgs(state, { adoptHead: next }), preflight: { head: next, prHead: p.sha } })
-    assert.deepEqual(labels.slice(0, 3), ['preflight', 'adopt:audit', 'adopt:push'], lane)
+    assert.deepEqual(labels.slice(0, 4), ['preflight', 'adopt:audit', 'adopt:waiting', 'adopt:push'], lane)
     assert.match(calls.find(c => c.label === 'adopt:audit').prompt, new RegExp(`commits\\.py chain ${p.sha} ${next} --published ${p.sha} `), lane)
     assert.deepEqual(result.history[0].reconciled.sha, p.sha, lane)
     assert.deepEqual([result.history[1].adoption.from, result.history[1].adoption.to, result.history[1].adoption.publication], [p.sha, next, 'pushed'], lane)

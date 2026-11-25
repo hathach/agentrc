@@ -133,8 +133,10 @@ STALLED = {
     'human-review': 'a comment by a person (an owner, member or collaborator other than the PR\'s author and the posting '
                     'account) waits for an answer (`waiting`, each by comment id, author and url, listed below): it is the '
                     "human's to answer or resolve, so report each to the user and never answer, resolve or fix it on the "
-                    "run's behalf; relaunch from the stateRef once a person replied in its thread or resolved it, or the PR's "
-                    'author answered it (#591)',
+                    "run's behalf; relaunch from the stateRef once each clears: an inline comment once its thread is resolved "
+                    "or holds a later reply (a person's then waits in its place), an issue comment or review body once the PR's "
+                    'author or the posting account posted an issue comment or submitted a review after it, never on another '
+                    "person's reply (#591)",
     'harvest-failed': "harvest.py failed twice in a row (`detail`): fix what its error names, such as a module the "
                       "launch's interpreter lacks, or relaunch once a passing cause (a head still moving, a GitHub outage) cleared",
     'ci-collect-failed': "collect.py failed the same way on two cycles running (`detail`): fix what its error names, such as an "
@@ -276,6 +278,18 @@ def unpublished_repair(pending):
             f'stateRef and adoptHead {sha}, the checkout left at it, while the PR head is still {parent[:8]}; '
             f'once the PR heads {sha[:8]}, that launch reconciles it as published; moved elsewhere, it stops adopt-pending',
             f"the checkout holds the unpublished {pending['lane']} repair, settled by its adoptHead relaunch")
+
+
+def held_adoption(held):
+    """(from, to, the relaunch that settles it, what the heads blocker adds) for an adoption the stop held unpublished
+    before its push (#591), else None."""
+    if not (isinstance(held, dict) and held.get('from') and held.get('to')):
+        return None
+    start, to = str(held['from']), str(held['to'])
+    return (start, to,
+            f'the adoption {start[:8]}..{to[:8]} was held before its push, unpublished: once the stop above is settled, relaunch '
+            f'with the same stateRef and adoptHead {to}, the checkout left at it, while the PR head is still {start[:8]}',
+            'the checkout holds the adoption held before its push, settled by its adoptHead relaunch')
 
 
 def receipts(cycles, findings, unpublished=None):
@@ -485,6 +499,9 @@ def summarize(output, output_path, state_ref=None, tree=None, keys=False):
         if result.get('reason') == 'human-review':
             blockers += [f"comment {w.get('commentId')} by {w.get('author')} waits for a person's answer: {w.get('url')}"
                          for w in result.get('waiting') or [] if isinstance(w, dict)]
+        held = held_adoption(result.get('adoptionHeld'))
+        if held:
+            blockers.append(held[2])
         if result.get('reason') == 'held-awaiting-caller':
             blockers += [f"finding {h.get('findingId')} on comment {h.get('commentId')} is held for the caller, and another launch "
                          f"cannot lift it: {cut(h.get('reason') or '')}" for h in result.get('held') or []]
@@ -533,7 +550,9 @@ def summarize(output, output_path, state_ref=None, tree=None, keys=False):
             # the checkout at the unpublished repair, every other head at its parent
             repair = unpublished and (heads.get('checkout') == unpublished[1]
                                       and {v for k, v in heads.items() if k != 'checkout'} == {pending.get('parent')})
-            blockers.append(f'heads disagree: {heads}' + (f'; {unpublished[3]}' if repair else ''))
+            # the checkout at the held adoption's to, every other head at its from
+            adopting = held and heads.get('checkout') == held[1] and {v for k, v in heads.items() if k != 'checkout'} == {held[0]}
+            blockers.append(f'heads disagree: {heads}' + (f'; {unpublished[3]}' if repair else f'; {held[3]}' if adopting else ''))
     dirty = [l for l in (tree or {}).get('dirty') or [] if not ide_drift(l)]
     if tree and len(dirty) < len(tree['dirty']):
         notes.append(f'ignoring {len(tree["dirty"]) - len(dirty)} dirty .idea/ path(s) (IDE metadata)')

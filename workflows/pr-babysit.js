@@ -3032,6 +3032,16 @@ const restoreCarried = (cycle, r, candidates) => {
   return null
 }
 
+const humanReview = (cycle, waiting, also = '') => {
+  log(`cycle ${cycle}: ${waiting.length} comment(s) by people wait for an answer — ` +
+    `${waiting.map(w => `${w.commentId} by ${w.author} (${w.url})`).join(', ')}; theirs to answer or resolve, this run does not answer them`)
+  return stop(cycle, 'human-review', {
+    detail: `comments by people wait for an answer: theirs to answer or resolve; this run does not answer them${also}`,
+    waiting: waiting.map(({ kind, commentId, author, authorAssociation, path, line, createdAt, url }) =>
+      ({ kind, commentId, author, authorAssociation, path, line, createdAt, url })),
+  })
+}
+
 // #359: after a cycle that only waited out CodeRabbit's rate limit, a probe of harvest.py stands in for the validator
 // while CodeRabbit stays limited and the review evidence (harvest.py's fingerprint) is unchanged on the same head: the
 // validator would read the same comments. Its last report, as it returned it, goes on with the probe's bots and time.
@@ -3117,16 +3127,7 @@ const runLanes = async (cycle, entry, lanes) => {
       lastRead = { head: expectedHead, json: JSON.stringify(r) }
       // A person's comment still waiting for an answer is the human's to settle (#591): nothing is fixed, answered, pushed,
       // asked of a bot or counted done over it. A reply in its thread, its resolution or the author's answer lets a relaunch pass.
-      const waiting = r.waiting || []
-      if (waiting.length) {
-        log(`cycle ${cycle}: ${waiting.length} comment(s) by people wait for an answer — ` +
-          `${waiting.map(w => `${w.commentId} by ${w.author} (${w.url})`).join(', ')}; theirs to answer or resolve, this run does not answer them`)
-        return stop(cycle, 'human-review', {
-          detail: 'comments by people wait for an answer: theirs to answer or resolve; this run does not answer them',
-          waiting: waiting.map(({ kind, commentId, author, authorAssociation, path, line, createdAt, url }) =>
-            ({ kind, commentId, author, authorAssociation, path, line, createdAt, url })),
-        })
-      }
+      if (r.waiting && r.waiting.length) return humanReview(cycle, r.waiting)
     }
     if (r !== nobody) reviewedCycles.set(cycle, r.findings)
     entry.bots = r === nobody
@@ -3995,9 +3996,41 @@ expectedHead = adoption ? adoption.from : pinned.prHead.trim()
 pin = currentPin
 log(`preflight: ${pinned.prRepo} ${pinned.branch}@${pinned.head.slice(0, 7)} tracking ${pinned.remote}, clean`)
 
+// harvest.py's full line, of which an adoption's push reads only the comments people wait on (#591).
+const WAITING = {
+  type: 'object', required: ['waiting'],
+  properties: { error: { type: 'string' }, rateLimit: RATE_LIMIT, waiting: REVIEWS.properties.waiting },
+}
+// Why an unpublished adoption must not be pushed yet, as the stop to return, else null: the harvest runs on the head
+// after the push, too late for a person's comment already waiting (#591). Its stop names the adoption it held, which
+// stays the state's to retry with the same adoptHead while the checkout sits at its `to`.
+const adoptBlocked = async (entry) => {
+  if (reviewers.length === 0) return null
+  const adoptionHeld = { from: adoption.from, to: adoption.to }
+  const prompt = `${IN_CHECKOUT}Editing nothing, ` + runExactly(`${HARVEST_SCRIPT} --pr ${args.pr} --repo ${shq(repo)} --reviewers ${reviewers.join(',')}`)
+  const opts = { label: 'adopt:waiting', phase: 'Triage', model: 'haiku', effort: 'low', schema: WAITING }
+  const first = await relayRun(prompt, opts)
+  const r = !first || (first.error && !first.rateLimit) ? (await relayRetry(prompt, opts)) ?? first : first
+  const held = `before the adoption push of ${adoption.to.slice(0, 7)}, left unpublished`
+  if (r && r.rateLimit) {
+    log(`cycle ${entry.cycle}: GitHub refused harvest.py ${held} for a rate limit (${r.error}) — stopping; relaunch with the same adoptHead once it clears`)
+    return stop(entry.cycle, 'github-rate-limited', { rateLimit: githubLimit, adoptionHeld })
+  }
+  if (!r || r.error) {
+    const detail = `${held}: ${!r ? 'the relay died' : scriptError('harvest.py', r)}`
+    log(`cycle ${entry.cycle}: harvest.py failed twice — ${detail}`)
+    entry.error = `harvest.py failed: ${detail}`
+    return stop(entry.cycle, 'harvest-failed', { detail, adoptionHeld })
+  }
+  return r.waiting.length ? { ...humanReview(entry.cycle, r.waiting, `; ${held}: relaunch with the same adoptHead once they are settled`), adoptionHeld } : null
+}
 // Runs before any watcher so the attempt is recorded first; only a PR head read-back proves the push.
 const adopt = async (entry) => {
   const { from, to, commits, paths } = adoption
+  if (!adoption.published) {
+    const blocked = await adoptBlocked(entry)
+    if (blocked) return blocked
+  }
   entry.adoption = { from, to, commits, paths, publication: 'unknown', detail: 'publication not attempted yet' }
   if (adoption.published) {
     Object.assign(entry.adoption, { publication: 'already-published', detail: `PR #${args.pr} already heads ${to.slice(0, 7)}` })
