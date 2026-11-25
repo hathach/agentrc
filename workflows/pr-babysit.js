@@ -3665,10 +3665,7 @@ const runLanes = async (cycle, entry, lanes) => {
       return rearm()
     }
     const c = await ciPromise
-    if (lanes.judgeHumans) {
-      const waits = humansHold(cycle, entry, lanes.judgeHumans)
-      if (waits !== undefined) return waits
-    }
+    if (lanes.judgeHumans) return humansHold(cycle, entry, lanes.judgeHumans)
     if (entry.collectorSkew) {
       log(`cycle ${cycle}: ${entry.collectorSkew}`)
       entry.error = `collector skew: ${entry.collectorSkew}`
