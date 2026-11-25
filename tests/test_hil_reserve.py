@@ -28,7 +28,7 @@ from contextlib import redirect_stderr, redirect_stdout, suppress
 from pathlib import Path
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import exited, guard_survivors, latest_failure  # noqa: E402
+from helpers import end, exited, guard_survivors, latest_failure  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'hil' / 'scripts' / 'hil_reserve.py'
 DATA = Path(__file__).resolve().parent / 'data' / 'hil_reserve'
@@ -57,9 +57,11 @@ case "$ACTION" in
   survivor-same-group) sleep 30 </dev/null >/dev/null 2>&1 & echo $! > "$ARGV_OUT.pid"; exit 0 ;;
   hang) sleep 30; exit 0 ;;
   hang-pid) echo $$ > "$ARGV_OUT.pid"; exec sleep 30 ;;
-  late-fork) ( sleep 1.5; setsid sleep 30 </dev/null >/dev/null 2>&1 & echo $! > "$ARGV_OUT.late" ) \
+  late-fork) ( until [ -e "$ARGV_OUT.gate" ]; do sleep 0.05; done
+               setsid sleep 30 </dev/null >/dev/null 2>&1 & echo $! > "$ARGV_OUT.late" ) \
                </dev/null >/dev/null 2>&1 & echo $! > "$ARGV_OUT.pid"; exit 0 ;;
-  sudo-survivor) "$REAL_SUDO" -n sleep 3 </dev/null >/dev/null 2>&1 & echo $! > "$ARGV_OUT.pid"; exit 0 ;;
+  sudo-survivor) "$REAL_SUDO" -n /bin/sh -c 'until [ -e "$1" ]; do sleep 0.05; done' sh "$ARGV_OUT.gate" \
+                   </dev/null >/dev/null 2>&1 & echo $! > "$ARGV_OUT.pid"; exit 0 ;;
   wait-done) for _ in $(seq 100); do [ -e "$ARGV_OUT.done" ] && break; sleep 0.1; done; exit 0 ;;
   signals) exec grep -E '^Sig(Blk|Ign):' /proc/$$/status > "$ARGV_OUT.sig" ;;
   trap) exec bash -c 'trap "echo TRAPPED; exit 7" TERM; trap "echo HUP TRAPPED" HUP; for _ in $(seq 50); do [ -e "$ARGV_OUT.done" ] && break; sleep 0.1; done' ;;
@@ -192,8 +194,9 @@ class Fixture(unittest.TestCase):
         hr.uo.SYS_USB_DEVICES, hr.uo.UDEV_DATA = str(self.sys), str(self.udev)
         hr.hil_lock.BOARD_LOCK_DIR = str(self.locks)
         # the keeper stays a fork of the child, which the patches reach, even under an hc terminal or a runner
-        self.addCleanup(setattr, hr, 'KEEPER_ENV_DROP', hr.KEEPER_ENV_DROP)
-        hr.KEEPER_ENV_DROP = ('HIL_SELFTEST_NO_SCOPE',)
+        self.addCleanup(setattr, hr.hil_lock, 'ENV_DROP', hr.hil_lock.ENV_DROP)
+        hr.hil_lock.ENV_DROP = ('HIL_SELFTEST_NO_SCOPE',)
+        self.started = {}
         self.bin = root / 'bin'
         self.bin.mkdir()
         hr.RECOVER_SCRIPT = str(self.bin / 'usb_recover.sh')
@@ -307,7 +310,7 @@ class Fixture(unittest.TestCase):
         """The run exited 1 while its keeper, named on the BLOCKER line, holds every lock as a cleanup holder, lock
         admission and the host fence, the blocker logged on every board; returns (token, keeper pid)."""
         token, keeper = token_of(line), keeper_of(line)
-        self.addCleanup(self.kill_keeper, keeper)
+        self.track(keeper)
         self.assertIn(f'until `hil_lock.py release --token {token}` once its descendants ended', line)
         self.assertEqual(child.wait(), 1, line)
         self.assertIsNotNone(hr.hil_lock.proc_start(keeper), 'the keeper ended with the foreground')
@@ -315,8 +318,8 @@ class Fixture(unittest.TestCase):
         self.assertLessEqual(BOARDS, set(recs))
         for lock, rec in recs.items():
             self.assertFalse(self.flock_free(lock), lock)
-            self.assertEqual((rec['pid'], rec['role'], rec['token'], rec['reservation']['phase'], rec['cleanupOwed']),
-                             (keeper, 'cleanup-holder', token, phase, True), lock)
+            self.assertEqual((rec['pid'], rec['role'], rec['token'], rec['cleanupOwed']),
+                             (keeper, 'cleanup-holder', token, True), lock)
             f = latest_failure(hr.hil_lock, lock)
             self.assertEqual((f['how'], f['tool'], f['token'], f['pid']),
                              ('ended-failed', 'hil_reserve', token, keeper))
@@ -324,17 +327,31 @@ class Fixture(unittest.TestCase):
             hr.hil_lock.take_board_lock('raspberry_pi_pico2', 'a later task')
         with self.assertRaises(hr.hil_lock.AdmissionClosed):
             hr.hil_lock.take_board_lock('unseen_board', 'a new board')
-        self.assertEqual({k: v for k, v in hr.hil_lock.fence_state().items() if k in ('token', 'pid')},
-                         {'token': token, 'pid': keeper})
+        self.assertEqual({k: v for k, v in hr.hil_lock.fence_state().items() if k in ('token', 'pid', 'phase')},
+                         {'token': token, 'pid': keeper, 'phase': phase})
         return token, keeper
 
-    def kill_keeper(self, keeper):
-        if hr.hil_lock.proc_start(keeper) and not exited(keeper):
-            os.kill(keeper, signal.SIGKILL)
+    def track(self, pid):
+        """pid, ended at cleanup (helpers.end) unless `kill` ended it first."""
+        self.started[pid] = hr.hil_lock.proc_start(pid)
+        self.addCleanup(self.kill, pid)
+        return pid
+
+    def kill(self, pid):
+        end(pid, self.started[pid])
+
+    def orphan(self, suffix='.pid'):
+        return self.track(int(Path(str(self.argv_out) + suffix).read_text()))
+
+    def gate(self):
+        """The file a gated stub action waits for; touched at cleanup at the latest."""
+        gate = Path(str(self.argv_out) + '.gate')
+        self.addCleanup(gate.touch)
+        return gate
 
     def wait_ended(self):
-        self.wait_for(lambda: all(((r or {}).get('reservation') or {}).get('phase') == 'ended'
-                                  for r in self.records().values()), 'the keeper to mark its subtree ended')
+        self.wait_for(lambda: (hr.hil_lock.fence_state() or {}).get('phase') == 'ended',
+                      'the keeper to mark its subtree ended')
 
     def assert_released(self, token, keeper):
         """release_token ends the keeper: every lock free, the fence gone, admission open again."""
@@ -863,15 +880,10 @@ class Run(Fixture):
         q = self.run_run(action='new-node', busport='3-1.2')
         self.assertIn('3-1.9: new node (serial new)', q.blocker())
 
-    def orphan(self, suffix='.pid'):
-        pid = int(Path(str(self.argv_out) + suffix).read_text())
-        self.addCleanup(lambda: os.kill(pid, signal.SIGKILL) if hr.hil_lock.proc_start(pid) else None)
-        return pid
-
     def test_a_survivor_keeps_every_lock_admission_and_the_fence_until_its_token_release(self):
         for action in ('survivor', 'survivor-same-group'):
             with self.subTest(action=action):
-                p = self.run_run(action=action, budget='1')
+                p = self.run_run(action=action, budget='0.3')
                 line = p.blocker()
                 orphan = self.orphan()
                 token, keeper = self.assert_retained(p, line)
@@ -882,26 +894,27 @@ class Run(Fixture):
                                             rf"not signalled: .*its command's descendants are not proven ended "
                                             rf"\(surviving pids \[{orphan}\]\)"):
                     hr.hil_lock.release_token(token)
-                os.kill(orphan, signal.SIGKILL)
+                self.kill(orphan)
                 self.wait_ended()
-                self.assertEqual(hr.hil_lock.fence_state()['ended'], True)
                 self.assertTrue(all(not self.flock_free(lock) for lock in BOARDS))
                 self.assert_released(token, keeper)
                 self.argv_out.unlink()
 
     def test_a_descendant_forked_after_the_budget_keeps_the_host_until_it_ends(self):
-        p = self.run_run(action='late-fork', budget='1')
+        gate = self.gate()
+        p = self.run_run(action='late-fork', budget='0.3')
         line = p.blocker()
         first = self.orphan()
         token, keeper = self.assert_retained(p, line)
-        self.assertIn(f'surviving pids [{first}, ', line)              # the subshell and its sleep
+        self.assertRegex(line, rf'surviving pids \[{first}[],]')         # the subshell, maybe its sleep
+        gate.touch()
         self.wait_for(lambda: Path(str(self.argv_out) + '.late').exists(), 'the late fork')
         late = self.orphan('.late')
         self.wait_for(lambda: hr.hil_lock.proc_start(first) is None, 'the named survivor to end')
         with self.assertRaisesRegex(hr.hil_lock.ReleaseRefused, "its command's descendants are not proven ended"):
             hr.hil_lock.release_token(token)
-        self.assertEqual(self.records()['raspberry_pi_pico2']['reservation']['phase'], 'survivors')
-        os.kill(late, signal.SIGKILL)
+        self.assertEqual(hr.hil_lock.fence_state()['phase'], 'survivors')
+        self.kill(late)
         self.wait_ended()
         self.assert_released(token, keeper)
 
@@ -911,21 +924,23 @@ class Run(Fixture):
             self.skipTest('no passwordless `sudo -n` here to start a root descendant with')
         os.environ['REAL_SUDO'] = sudo
         self.addCleanup(os.environ.pop, 'REAL_SUDO', None)
-        p = self.run_run(action='sudo-survivor', budget='1')
+        gate = self.gate()
+        p = self.run_run(action='sudo-survivor', budget='0.3')
         line = p.blocker()
-        root = int(Path(str(self.argv_out) + '.pid').read_text())     # sudo itself, its sleep its child
+        root = int(Path(str(self.argv_out) + '.pid').read_text())     # sudo itself, its root sh its child
         token, keeper = self.assert_retained(p, line)
         self.assertIn(f'surviving pids [{root}', line)
-        self.wait_ended()                      # sleep 3 ends as root, sudo with it, reaped by the keeper
+        gate.touch()
+        self.wait_ended()                      # the root sh ends at the gate, sudo with it, reaped by the keeper
         self.assertIsNone(hr.hil_lock.proc_start(root))
         self.assert_released(token, keeper)
 
     def test_a_survivors_logged_failure_stays_open_after_a_later_restore(self):
-        p = self.run_run(action='survivor', budget='1')
+        p = self.run_run(action='survivor', budget='0.3')
         line = p.blocker()
         orphan = self.orphan()
         token, keeper = self.assert_retained(p, line)
-        os.kill(orphan, signal.SIGKILL)
+        self.kill(orphan)
         self.wait_ended()
         self.assert_released(token, keeper)
         for lock in BOARDS:
@@ -1068,12 +1083,12 @@ class Run(Fixture):
         self.assertEqual(self.held(), set())
 
         def after(m):
-            real = m.Reservation.settle
+            real = m.hil_process.reap_until
 
-            def settle(res, deadline):
+            def reap_until(deadline):
                 os.kill(os.getpid(), signal.SIGTERM)       # during reconciliation
-                return real(res, deadline)
-            m.Reservation.settle = settle
+                return real(deadline)
+            m.hil_process.reap_until = reap_until
         q = self.run_run(action='fail', patch=after)
         line = q.blocker()
         self.assertIn('SIGTERM ignored during post', line)
@@ -1094,7 +1109,7 @@ class Keeper(Fixture):
                      lambda: hr.hil_lock.take_board_lock('late_board', 'a new board')):
             with self.assertRaisesRegex(hr.hil_lock.FenceHeld, why):
                 take()
-        self.assertNotIn('late_board', hr.hil_lock.lock_names())
+        self.assertIsNone(hr.hil_lock.read_record('late_board'))     # its file may exist: the take refused
 
     def test_a_foreground_killed_before_the_go_runs_nothing_and_releases(self):
         gate, seen = Path(self.td.name) / 'gate', Path(self.td.name) / 'at-ready'
@@ -1139,11 +1154,10 @@ class Keeper(Fixture):
         p = self.run_run(action='hang-pid')
         self.wait_for(lambda: Path(str(self.argv_out) + '.pid').exists(), 'the command to start')
         command = int(Path(str(self.argv_out) + '.pid').read_text())
-        self.addCleanup(lambda: hr.hil_lock.proc_start(command) and os.kill(command, signal.SIGKILL))
-        keeper = self.keeper_pid()
+        self.track(command)
+        keeper = self.track(self.keeper_pid())
         token = self.records()['raspberry_pi_pico2']['token']
-        os.kill(keeper, signal.SIGKILL)
-        self.wait_gone(keeper)
+        self.kill(keeper)
         self.assertEqual(p.wait(), 1)
         self.assertTrue(all(self.flock_free(lock) for lock in BOARDS))      # the kernel dropped them
         self.assert_fenced("gone without proving its command's subtree ended: only a host reboot clears it")
@@ -1155,15 +1169,13 @@ class Keeper(Fixture):
         self.assertIn('raspberry_pi_pico2', self.held())                    # its record, for the next take to log
 
     def test_a_keeper_killed_once_its_subtree_ended_is_cleared_by_its_token(self):
-        p = self.run_run(action='survivor', budget='1')
+        p = self.run_run(action='survivor', budget='0.3')
         line = p.blocker()
-        orphan = int(Path(str(self.argv_out) + '.pid').read_text())
-        self.addCleanup(lambda: hr.hil_lock.proc_start(orphan) and os.kill(orphan, signal.SIGKILL))
+        orphan = self.orphan()
         token, keeper = self.assert_retained(p, line)
-        os.kill(orphan, signal.SIGKILL)
+        self.kill(orphan)
         self.wait_ended()
-        os.kill(keeper, signal.SIGKILL)
-        self.wait_gone(keeper)
+        self.kill(keeper)
         self.assert_fenced(f"gone after its command's subtree ended: `hil_lock.py release --token {token}` clears it")
         with redirect_stdout(io.StringIO()) as out:
             self.assertEqual(hr.hil_lock.cmd_release_token(token), 0)
@@ -1172,7 +1184,7 @@ class Keeper(Fixture):
         fh = hr.hil_lock.take_board_lock('raspberry_pi_pico2', 'the next task')      # logs what the keeper left
         self.addCleanup(fh.close)
         self.assertEqual(fh.cleanup_failures[-1]['how'], 'found-left')
-        self.assertEqual(fh.cleanup_failures[-1]['task']['reservation'], {'phase': 'ended'})
+        self.assertEqual(fh.cleanup_failures[-1]['task']['role'], 'cleanup-holder')
 
     def test_a_keeper_killed_while_finishing_leaves_the_host_fenced(self):
         def patch(m):
@@ -1212,15 +1224,40 @@ class Keeper(Fixture):
         line = p.blocker()
         self.assertIn('host fence not cleared: [Errno 5] Input/output error', line)
         self.assertNotIn('surviving pids', line)
-        token, keeper = token_of(line), keeper_of(line)
-        self.addCleanup(self.kill_keeper, keeper)
+        token, keeper = token_of(line), self.track(keeper_of(line))
         self.assertEqual(p.wait(), 1)
         self.wait_ended()
         self.assertTrue(all(not self.flock_free(lock) for lock in BOARDS))
         self.assert_released(token, keeper)
 
+    def test_an_ended_fence_not_written_is_retried_and_refuses_release_meanwhile(self):
+        failing, tried = self.gate(), Path(self.td.name) / 'tried'
+
+        def patch(m):
+            m.PUBLISH_RETRY = (0.05, 0.1)
+            real = m.hil_lock.arm_fence
+
+            def arm_fence(fence):
+                if fence['phase'] == 'ended' and not failing.exists():
+                    tried.touch()
+                    raise OSError(5, 'Input/output error')
+                return real(fence)
+            m.hil_lock.arm_fence = arm_fence
+        p = self.run_run(action='survivor', patch=patch, budget='0.3')
+        line = p.blocker()
+        orphan = self.orphan()
+        token, keeper = self.assert_retained(p, line)
+        self.kill(orphan)
+        self.wait_for(tried.exists, 'the keeper to fail to publish `ended`')
+        with self.assertRaisesRegex(hr.hil_lock.ReleaseRefused, "its command's descendants are not proven ended"):
+            hr.hil_lock.release_token(token)
+        self.assertTrue(all(not self.flock_free(lock) for lock in BOARDS))
+        failing.touch()
+        self.wait_ended()
+        self.assert_released(token, keeper)
+
     def test_a_keeper_started_with_a_dropped_variable_is_execd_afresh_without_it(self):
-        hr.KEEPER_ENV_DROP = ('HIL_SELFTEST_SCOPE',)
+        hr.hil_lock.ENV_DROP = ('HIL_SELFTEST_SCOPE',)
         seen = Path(self.td.name) / 'exec'
         wrapper = self.bin / 'python'
         wrapper.write_text(f'#!/bin/sh\nenv > {seen}.env\nprintf "%s\\0" "$@" > {seen}.argv\n'
@@ -1238,14 +1275,9 @@ class Keeper(Fixture):
         self.assertIn('HIL_SELFTEST_MARK=kept', env)
         self.assertFalse([e for e in env if e.startswith('HIL_SELFTEST_SCOPE=')], env)
         argv = Path(f'{seen}.argv').read_text().split('\0')
-        self.assertEqual((argv[:2], argv[3:5]), (['-I', '-c'], [str(SCRIPT), str(self.locks)]))
+        self.assertEqual((argv[:2], argv[3:6], json.loads(argv[6])[0]),
+                         (['-I', '-c'], ['agentrc_hil_reserve', str(SCRIPT), 'keeper_main'], str(self.locks)))
         self.assertEqual(self.records(), {})
-
-    def test_whether_the_keeper_starts_afresh_reads_the_environment_too(self):
-        hr.KEEPER_ENV_DROP = ('HIL_SELFTEST_SCOPE',)
-        self.assertFalse(hr._starts_tracked())
-        with mock.patch.dict(os.environ, {'HIL_SELFTEST_SCOPE': 'x'}):
-            self.assertTrue(hr._starts_tracked())
 
 
 class HubScope(Fixture):
@@ -1284,11 +1316,10 @@ class HubScope(Fixture):
     def test_a_hub_cycle_survivor_keeps_the_host_until_its_token_release(self):
         p = self.run_hub(action='survivor')
         line = p.blocker()
-        orphan = int(Path(str(self.argv_out) + '.pid').read_text())
-        self.addCleanup(lambda: hr.hil_lock.proc_start(orphan) and os.kill(orphan, signal.SIGKILL))
+        orphan = self.orphan()
         token, keeper = self.assert_retained(p, line)
         self.assertIn(f'surviving pids [{orphan}]', line)
-        os.kill(orphan, signal.SIGKILL)
+        self.kill(orphan)
         self.wait_ended()
         self.assert_released(token, keeper)
 
@@ -1343,15 +1374,14 @@ class RootCycleScript(Fixture):
         self.assertEqual(self.held(), set())
 
     def test_a_surviving_off_keeps_the_host_until_its_token_release(self):
-        p = self.run_run(action='off=survive', budget='1')
+        p = self.run_run(action='off=survive', budget='0.3')
         line = p.blocker()
-        orphan = int(Path(str(self.argv_out) + '.pid').read_text())
-        self.addCleanup(lambda: hr.hil_lock.proc_start(orphan) and os.kill(orphan, signal.SIGKILL))
+        orphan = self.orphan()
         self.assertIn('command exited 1', line)
         self.assertIn(f'surviving pids [{orphan}]', line)
         self.assertEqual(self.runs(), ['check', 'off'])          # no power-on after a survivor
         token, keeper = self.assert_retained(p, line)
-        os.kill(orphan, signal.SIGKILL)
+        self.kill(orphan)
         self.wait_ended()
         self.assert_released(token, keeper)
 
@@ -1612,7 +1642,8 @@ class Controller(ControllerFixture):
         p = self.run_ctl(action='hang', patch=patch)
         line = p.blocker()
         pids = [int(x) for x in line.split('surviving pids [')[1].split(']')[0].split(', ')]
-        self.addCleanup(lambda: [os.kill(x, signal.SIGKILL) for x in pids if hr.hil_lock.proc_start(x)])
+        for x in pids:
+            self.track(x)
         self.assertIn('command still running after 0.5 s', line)
         token, keeper = self.assert_retained(p, line)
         self.assertTrue(all(hr.hil_lock.proc_start(x) for x in pids), 'a controller command was signalled')
@@ -1620,7 +1651,7 @@ class Controller(ControllerFixture):
         [marker] = f['receipts']
         self.assertEqual((marker['unrecheckable'][-2:], marker['survivors']), (['pci-rebind', self.ADDR], pids))
         for x in pids:
-            os.kill(x, signal.SIGKILL)
+            self.kill(x)
         self.wait_ended()
         self.assert_released(token, keeper)
 
@@ -1660,12 +1691,11 @@ class Controller(ControllerFixture):
         p = self.run_ctl(action='survivor', verb='pci-bind', addr=self.IDLE,
                          patch=lambda m: setattr(m, 'CONTROLLER_SETTLE', 0.3))
         line = p.blocker()
-        orphan = int(Path(str(self.argv_out) + '.pid').read_text())
-        self.addCleanup(lambda: hr.hil_lock.proc_start(orphan) and os.kill(orphan, signal.SIGKILL))
+        orphan = self.orphan()
         token, keeper = self.assert_retained(p, line)
         self.assertIn(f'surviving pids [{orphan}]', line)
         self.assertIn(f'{self.IDLE}: no driver bound', line)
-        os.kill(orphan, signal.SIGKILL)
+        self.kill(orphan)
         self.wait_ended()
         self.assert_released(token, keeper)
 

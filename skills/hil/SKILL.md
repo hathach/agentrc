@@ -72,8 +72,7 @@ nothing in it through a link.
   (`role: cleanup-holder`) still holds its flock and never frees on its own:
   a taker refuses it as a recovery blocker and never waits on it, and the
   contract's Recovery ends it with that project's `hil_lock.py release
-  --token <token>`, as it ends a `hil_reserve.py` keeper's (below).
-  `hil_lock.py hold --take-over` is gone.
+  --token <token>`. `hil_lock.py hold --take-over` is gone.
 - The cleanup log, `<lock>.cleanup.jsonl` in the lock dir (0666, never
   removed), keeps one JSON line per event: `failed` (its `id`; `how`,
   `ended-failed` or `found-left`; the task's record, `detail`, the `receipts`
@@ -158,30 +157,21 @@ nothing in it through a link.
   or hub-port cycle that hold is this skill's `scripts/hil_reserve.py run`,
   given every roster on the host: it refuses when a device under the root
   port, or under the hub for a hub-port cycle, is not explained by those
-  rosters, holds every lock on the host (every roster's and every name already
-  in the lock dir, with lock admission closed) in one keeper process around the
-  one command it builds (`usb-kernel-recover`'s `root-cycle` or `hub-cycle`),
-  and, when anything but a clean, fully re-enumerated outcome follows with no
-  descendant of the command left, releases them with the blocker logged in each
-  board's cleanup log (`end_failed`) and exits 1. A descendant still alive after
-  one budget keeps the host instead (agentrc#586): the blocker is logged with
-  the survivors as an `unrecheckable` receipt, so that failure stays open, the
-  BLOCKER line names its token, and the keeper holds every flock as a cleanup
-  holder that takers refuse at once, lock admission and a host fence
-  (`.fence.json`) until `hil_lock.py release --token <token>` finds its subtree
-  ended, which it marks once it reaped every descendant. The keeper outlives the
-  `hil_reserve.py` it was started from, a kill of it included. The fence refuses
-  every take and every new lock name even after its keeper is gone
-  (`FenceHeld`, a recovery blocker): a keeper killed before its subtree ended
-  leaves the host refusing until it reboots, one killed after until that token
-  release clears it. A controller operation (`usb-kernel-recover`'s `pci-rebind`, `pci-bind`, for a
+  rosters, holds every lock on the host in one keeper process around the one
+  command it builds (`usb-kernel-recover`'s `root-cycle` or `hub-cycle`),
+  and, when anything but a clean, fully re-enumerated outcome follows,
+  releases them with the blocker logged in each board's cleanup log
+  (`end_failed`) and exits 1. A descendant of the command still alive keeps the
+  host instead until `hil_lock.py release --token <token>` once it ended
+  (agentrc#586); a `FenceHeld` refusal is such a hold, or a killed keeper's,
+  which only a reboot clears unless its fence says ended.
+  A controller operation (`usb-kernel-recover`'s `pci-rebind`, `pci-bind`, for a
   dead controller) holds through `hil_reserve.py run pci-rebind|pci-bind <pciaddr>`, which a contract adopts in its
-  Reservation before running either verb. Any `run` needs every project on the host pinned at or after the agentrc
-  whose `hil_lock` checks the host fence (an older one ignores the fence and still creates lock names the hold cannot
-  see), and a controller operation also the rig's installed `usb_recover` refreshed by `hil-farm-setup`.
-  `hil_reserve.py --help` has what it checks, holds and judges. A runner that cycles one hub port under the board's
-  own lock is a limitation of this rule, not an exemption, recorded in the contract's Limits with what else the cycle
-  is known to reach.
+  Reservation before running either verb, and only once the rig's installed `usb_recover` is refreshed by
+  `hil-farm-setup`. Every `run` needs every project on the host pinned at or after the agentrc whose `hil_lock` checks
+  the host fence (an older one ignores it and creates lock names the hold cannot see). `hil_reserve.py --help` has
+  what it checks, holds and judges. A runner that cycles one hub port under the board's own lock is a limitation of
+  this rule, not an exemption, recorded in the contract's Limits with what else the cycle is known to reach.
 
 Manual work on a rig board outside the contract's runner (`hw-validator`,
 `hw-debugger`, probe tools used directly) follows `target-debug`'s Delegated

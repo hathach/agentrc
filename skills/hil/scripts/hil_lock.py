@@ -70,6 +70,9 @@ RELEASE_WAIT = 3.0            # s a signalled holder gets to clear its records a
 # herdr-core (hc) ends every process whose starting environment carries a terminal's HC_SCOPE when it cleans up
 # after that terminal, setsid'd ones included: the hold holder, which outlives its terminal, starts without it
 HC_SCOPE = 'HC_SCOPE'
+# what ends a process by the environment it started with: hc's terminal cleanup, and a GitHub runner's job-end orphan
+# cleanup (actions/runner JobExtension, keyed on RUNNER_TRACKING_ID); a detached holder starts without them
+ENV_DROP = (HC_SCOPE, 'RUNNER_TRACKING_ID')
 _NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._+-]*\Z')
 
 
@@ -166,16 +169,26 @@ def _read_file(board, suffix):
     """The bytes of <board><suffix>, or None when it (or the dir) is absent; OSError when it
     is unsafe or unreadable."""
     _check_name(board)
+    return _read_name(board + suffix)
+
+
+def _read_name(name, dfd=None):
+    """_read_file of the lock dir's `name`, through `dfd` when the caller has the dir open."""
+    if dfd is None:
+        try:
+            dfd = _open_dir()
+        except FileNotFoundError:
+            return None
+        own = dfd
+    else:
+        own = None
     try:
-        dfd = _open_dir()
-    except FileNotFoundError:
-        return None
-    try:
-        fd = _open_file(dfd, board + suffix, os.O_RDONLY)
+        fd = _open_file(dfd, name, os.O_RDONLY)
     except FileNotFoundError:
         return None
     finally:
-        os.close(dfd)
+        if own is not None:
+            os.close(own)
     with os.fdopen(fd, 'rb') as f:
         return f.read()
 
@@ -245,33 +258,33 @@ def flock_nb(board: str):
     the file is unsafe or the flock is held elsewhere (handle already closed), AdmissionClosed
     when it must be created while a reservation holds ADMISSION, FenceHeld while a host fence
     is there."""
-    fh = os.fdopen(_open_lock_file(board), 'r+')
-    try:
-        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        _refuse_fenced()      # after the flock: a keeper that held it until it died had armed its fence first
-    except (OSError, FenceHeld):
-        fh.close()
-        raise
-    return fh
-
-
-def _open_lock_file(board) -> int:
-    """`board`'s lock file opened, or created under _create_admitted when missing; takes no flock."""
     _check_name(board)
     dfd = _open_dir(create=True)
     try:
+        fh = os.fdopen(_open_lock_file(dfd, board), 'r+')
         try:
-            return _open_file(dfd, f'{board}.lock', os.O_RDWR)
-        except FileNotFoundError:
-            return _create_admitted(dfd, board)
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _refuse_fenced(dfd)      # after the flock: a keeper that held it until it died had armed its fence first
+        except (OSError, FenceHeld):
+            fh.close()
+            raise
     finally:
         os.close(dfd)
+    return fh
+
+
+def _open_lock_file(dfd, board) -> int:
+    """`board`'s lock file opened, or created under _create_admitted when missing; takes no flock."""
+    try:
+        return _open_file(dfd, f'{board}.lock', os.O_RDWR)
+    except FileNotFoundError:
+        return _create_admitted(dfd, board)
 
 
 def _create_admitted(dfd, board) -> int:
     """Create `board`'s lock file under a shared flock on ADMISSION, so a reservation that
     holds it exclusively (close_admission) has seen every lock name there will be until it
-    ends. AdmissionClosed while one does, FenceHeld while a host fence is there."""
+    ends. AdmissionClosed while one does."""
     afd = _open_file(dfd, ADMISSION, os.O_RDWR, create=True)
     try:
         try:
@@ -279,7 +292,6 @@ def _create_admitted(dfd, board) -> int:
         except BlockingIOError:
             raise AdmissionClosed(f'board locked: {board} has no lock file yet, and no new lock name is admitted '
                                   f'while a host-wide reservation holds {ADMISSION}') from None
-        _refuse_fenced()
         return _open_file(dfd, f'{board}.lock', os.O_RDWR, create=True)
     finally:
         os.close(afd)
@@ -289,7 +301,13 @@ def ensure_lock_files(boards) -> None:
     """Create each board's lock file that is missing, taking no flock: a free board. A
     reservation runs it before close_admission, which would refuse its own creates."""
     for board in boards:
-        os.close(_open_lock_file(board))
+        _check_name(board)
+    dfd = _open_dir(create=True)
+    try:
+        for board in boards:
+            os.close(_open_lock_file(dfd, board))
+    finally:
+        os.close(dfd)
 
 
 def _flock_wait(fd, wait) -> bool:
@@ -332,29 +350,19 @@ def close_admission(wait=None):
 
 
 # --- host fence -----------------------------------------------------------------------------
-def fence_state():
+# FENCE is the one record of a keeper's phase: `command`, then `survivors` (its `survivors`) and `ended`. Only a
+# keeper holding ADMISSION exclusively writes or removes it, and so does a token release of a gone keeper's.
+def fence_state(dfd=None):
     """None without a host fence, else its record ({} when it cannot be read, which refuses all the same)."""
     try:
-        dfd = _open_dir()
-    except FileNotFoundError:
-        return None
+        state, rec = _parse(_read_name(FENCE, dfd))
     except OSError:
         return {}
-    try:
-        with os.fdopen(_open_file(dfd, FENCE, os.O_RDONLY), 'rb') as f:
-            state, rec = _parse(f.read())
-    except FileNotFoundError:
-        return None
-    except OSError:
-        return {}
-    finally:
-        os.close(dfd)
-    return rec if state == 'record' else {}
+    return None if state == 'absent' else rec if state == 'record' else {}
 
 
 def arm_fence(fence: dict) -> None:
-    """Write (or rewrite) the host fence `fence`, atomically and durably; hil_reserve's keeper does, under its
-    exclusive ADMISSION, before its command starts. OSError when it cannot be."""
+    """Write (or rewrite) the host fence, atomically and durably, under the caller's exclusive ADMISSION."""
     dfd = _open_dir()
     try:
         _replace_file(dfd, FENCE, json.dumps(fence).encode())
@@ -363,10 +371,12 @@ def arm_fence(fence: dict) -> None:
 
 
 def clear_fence(token) -> None:
-    """Remove the host fence when it is `token`'s, durably; any other is left. OSError when it cannot be."""
-    fence = fence_state()
-    if not fence or fence.get('token') != token:
-        return
+    """Remove the host fence when it is `token`'s, under the caller's exclusive ADMISSION."""
+    if (fence_state() or {}).get('token') == token:
+        _unlink_fence()
+
+
+def _unlink_fence() -> None:
     dfd = _open_dir()
     try:
         with contextlib.suppress(FileNotFoundError):
@@ -387,18 +397,18 @@ def fence_text(fence) -> str:
     """The host fence `fence` (fence_state's) for a message, with what ends it."""
     if not fence:
         return f'host fenced by an unreadable {FENCE}: only a host reboot clears it'
-    who = f'host fenced by hil_reserve pid {fence.get("pid")} (token {fence.get("token")})'
+    token = fence.get('token')
+    who = f'host fenced by hil_reserve pid {fence.get("pid")} (token {token})'
     if _fence_live(fence):
         return (f'{who}: its command or a descendant of it may still change the rig; `hil_lock.py release --token '
-                f'{fence.get("token")}` ends it once they ended')
-    if fence.get('ended') is True:
-        return (f"{who}, gone after its command's subtree ended: `hil_lock.py release --token {fence.get('token')}` "
-                f"clears it")
+                f'{token}` ends it once they ended')
+    if fence.get('phase') == 'ended':
+        return f"{who}, gone after its command's subtree ended: `hil_lock.py release --token {token}` clears it"
     return f"{who}, gone without proving its command's subtree ended: only a host reboot clears it"
 
 
-def _refuse_fenced() -> None:
-    if (fence := fence_state()) is not None:
+def _refuse_fenced(dfd) -> None:
+    if (fence := fence_state(dfd)) is not None:
         raise FenceHeld(f'board locked: {fence_text(fence)}')
 
 
@@ -539,7 +549,7 @@ def _owes_cleanup(info) -> bool:
 
 
 def _blocker_text(info) -> str:
-    return RESERVATION_BLOCKER if 'reservation' in info else RECOVERY_BLOCKER
+    return RESERVATION_BLOCKER if info.get('tool') == 'hil_reserve' else RECOVERY_BLOCKER
 
 
 def holder_text(info) -> str:
@@ -888,8 +898,8 @@ def _end_failed_each(handles, reason, detail, receipts, retained, extra, ended) 
     evidence = not lost
     for b, fh in handles.items():
         ended[b] = {'logged': False, 'cleared': False, 'evidence': evidence}
-        ended[b]['logged'] = guard([b], 'cleanup log not written', lambda: _log_ended(
-            b, fh, reason, detail, receipts, retained, extra)) is not None
+        ended[b]['logged'] = guard([b], 'cleanup log not written', lambda: log_held_failure(
+            b, fh, reason, detail=detail, receipts=receipts, retained=retained, **extra)) is not None
         if ended[b]['logged']:
             cleared = guard([b], 'record not cleared', lambda: clear_record(fh))
             if cleared is False:
@@ -906,7 +916,9 @@ def _end_failed_each(handles, reason, detail, receipts, retained, extra, ended) 
     return errors
 
 
-def _log_ended(board, fh, reason, detail, receipts, retained, extra) -> dict:
+def log_held_failure(board, fh, reason, *, detail, receipts=(), retained=(), **extra) -> dict:
+    """log_cleanup_failure for the board whose flock `fh` holds, its record as the task, the flock kept:
+    end_failed's first step, and a hil_reserve keeper's that keeps the host."""
     try:
         state, rec = _parse(_handle_record(fh))
     except OSError:
@@ -1901,36 +1913,42 @@ def _receipts_blocker(receipts, holder) -> str:
     return f'its operations are not proven ended: {"; ".join(runs)}' if runs else ''
 
 
-def _reservation_blocker(recs) -> str:
-    """Why a hil_reserve keeper's records `recs` do not show its command's subtree ended (their `reservation`, the
-    keeper's own ECHILD answer), '' when they do or carry none. Records that disagree, or a reservation that
-    cannot be read, refuse."""
-    named = [('reservation' in r, r.get('reservation')) for r in recs]
-    if any(n != named[0] for n in named):
-        return 'its records disagree on their reservation'
-    present, res = named[0] if named else (False, None)
-    if not present:
+def _keeper_blocker(fence, pid, start) -> str:
+    """Why the host fence does not show that the hil_reserve keeper `pid` started at `start` saw its command's
+    subtree end, '' when it does. A fence that is missing, another's or unreadable refuses."""
+    if not fence or (fence.get('pid'), fence.get('start')) != (pid, start):
+        return 'its host fence is missing or not its own, so its subtree is not proven ended'
+    if fence.get('phase') == 'ended':
         return ''
-    if not isinstance(res, dict) or res.get('phase') not in ('survivors', 'ended'):
-        return f'its reservation {res!r:.80} cannot be read'
-    if res['phase'] == 'ended':
-        return ''
-    return (f"its command's descendants are not proven ended (surviving pids "
-            f"{_live_survivors(res) or res.get('survivors')!r:.80}); its keeper reaps them and then marks it ended")
+    if fence.get('phase') == 'survivors':
+        return (f"its command's descendants are not proven ended (surviving pids "
+                f"{_live_survivors(fence) or fence.get('survivors')!r:.80}); its keeper marks its fence ended once "
+                f"it reaped them")
+    return f'its host fence says {fence.get("phase")!r:.40}, not that its subtree ended'
 
 
 def _clear_gone_fence(token, fence):
-    """`release --token` of a keeper gone with its host fence: cleared only when the fence says its command's
-    subtree ended; (pid, []) once it is."""
+    """`release --token` of a keeper gone with its host fence: cleared only when it says `ended`, and only under
+    ADMISSION, exclusive as a keeper's, rechecked there: a new keeper arms its own only while it holds that, so a
+    release racing another and a new reservation never removes the new fence. Returns (pid, None)."""
     pid = fence.get('pid')
-    if fence.get('ended') is not True:
+    if fence.get('phase') != 'ended':
         raise ReleaseRefused(f"not cleared: the host fence of token {token}: its keeper pid {pid} is gone without "
                              f"proving its command's subtree ended; only a host reboot clears it")
     try:
-        clear_fence(token)
+        admission = close_admission()
+    except LockUnavailable as e:
+        raise ReleaseRefused(f'not cleared: the host fence of token {token}: {e}') from e
+    try:
+        if (again := fence_state()) != fence or _fence_live(again):
+            raise ReleaseRefused(f'not cleared: the host fence of token {token} changed meanwhile: '
+                                 + (fence_text(again) if again is not None else 'it is gone'))
+        _unlink_fence()
     except OSError as e:
-        raise ReleaseRefused(f'the host fence of token {token} is not cleared: {e}')
-    return pid, []
+        raise ReleaseRefused(f'the host fence of token {token} is not cleared: {e}') from e
+    finally:
+        admission.close()
+    return pid, None
 
 
 def open_runs(receipts, states) -> list:
@@ -1943,13 +1961,13 @@ def release_token(token: str):
     on every board that carries the token, it is alive as recorded, its predicate holds,
     rechecked as the holder (_holder_ids), and SIGUSR1 reaches it through a pidfd; returns
     (pid, boards) once its records and flocks are gone. A hil_reserve keeper's predicate is its
-    records' `reservation`, which must say its command's subtree ended; the keeper checks again
-    before it clears its records and host fence. A dead holder is refused: its flocks are free,
-    and the next task takes its boards; a dead keeper's host fence is cleared, returning (pid, []),
-    only when it says that subtree ended, and otherwise stays until the host reboots."""
+    host fence (_keeper_blocker), which the keeper checks again before it lets go. A dead holder
+    is refused: its flocks are free, and the next task takes its boards; a dead keeper's fence is
+    cleared, returning (pid, None), only when it says `ended` (_clear_gone_fence)."""
     fence = fence_state()
-    if fence and fence.get('token') == token and not _fence_live(fence):
-        return _clear_gone_fence(token, fence)
+    mine = fence if fence and fence.get('token') == token else None
+    if mine and not _fence_live(mine):
+        return _clear_gone_fence(token, mine)
     found = {}
     for b in lock_names():
         rec = read_record(b)
@@ -1980,8 +1998,8 @@ def release_token(token: str):
                 f'pid {pid} is not the recorded holder (start {live} != {start})')
         raise ReleaseRefused(f'not signalled: {gone}; its flocks are free and the next task takes '
                              f'{", ".join(sorted(found))}')
-    why = '; '.join(w for w in (_reservation_blocker(found.values()),
-                                _release_blocker(receipts, (pid, start), retained)) if w)
+    keeper = _keeper_blocker(mine, pid, start) if first.get('tool') == 'hil_reserve' else ''
+    why = '; '.join(w for w in (keeper, _release_blocker(receipts, (pid, start), retained)) if w)
     if why:
         raise ReleaseRefused(f'not signalled: holder pid {pid} of token {token} keeps '
                              f'{", ".join(sorted(found))}: {why}')
@@ -2287,40 +2305,53 @@ def cmd_hold(boards, reason):
 
 def _starts_scoped() -> bool:
     """Whether os.environ or the environment this process started with (/proc/self/environ: what a fork keeps
-    whatever os.environ drops, and what hc reads) names HC_SCOPE; true when that is unreadable."""
-    if HC_SCOPE in os.environ:
+    whatever os.environ drops, and what hc and the runner read) names one of ENV_DROP; true when that is
+    unreadable."""
+    if any(k in os.environ for k in ENV_DROP):
         return True
     try:
         with open('/proc/self/environ', 'rb') as f:
-            return any(e.startswith(os.fsencode(HC_SCOPE) + b'=') for e in f.read().split(b'\0'))
+            names = {e.partition(b'=')[0] for e in f.read().split(b'\0')}
     except OSError:
         return True
+    return any(os.fsencode(k) in names for k in ENV_DROP)
 
 
-# a fresh interpreter's holder: argv is this file, BOARD_LOCK_DIR, the reason, the two pipe fds, the boards
-_HOLDER_BOOT = (
-    'import importlib.util, sys\n'
-    "spec = importlib.util.spec_from_file_location('agentrc_hil_lock', sys.argv[1])\n"
-    'lock = importlib.util.module_from_spec(spec)\n'
-    'sys.modules[spec.name] = lock\n'
-    'spec.loader.exec_module(lock)\n'
-    'lock.BOARD_LOCK_DIR = sys.argv[2]\n'
-    'lock._holder(sys.argv[6:], sys.argv[3], int(sys.argv[4]), int(sys.argv[5]))\n')
+# a fresh interpreter's entry: argv is the module's name and file, the function and its JSON arguments
+_FRESH_BOOT = (
+    'import importlib.util, json, sys\n'
+    'spec = importlib.util.spec_from_file_location(sys.argv[1], sys.argv[2])\n'
+    'mod = importlib.util.module_from_spec(spec)\n'
+    'sys.modules[spec.name] = mod\n'
+    'spec.loader.exec_module(mod)\n'
+    'getattr(mod, sys.argv[3])(*json.loads(sys.argv[4]))\n')
+
+
+def exec_fresh(name, path, entry, args, fds):
+    """Become `entry(*args)` of the module at `path` (loaded as `name`) in a fresh `python -I` whose environment is
+    os.environ without ENV_DROP, `fds` passed on: only an exec sets the environment a process started with. OSError
+    when the exec fails."""
+    env = {k: v for k, v in os.environ.items() if k not in ENV_DROP}
+    for fd in fds:
+        os.set_inheritable(fd, True)
+    os.execve(sys.executable, [sys.executable, '-I', '-c', _FRESH_BOOT, name, path, entry, json.dumps(args)], env)
 
 
 def _exec_holder(boards, reason, w_fd, ack_r):
-    """Become the holder in a fresh interpreter whose environment is os.environ without HC_SCOPE, the pipes passed
-    on: only an exec sets the environment a process started with. Never returns; a failed exec is reported."""
-    env = {k: v for k, v in os.environ.items() if k != HC_SCOPE}
+    """Become the holder in a fresh interpreter (exec_fresh). Never returns; a failed exec is reported."""
     try:
-        for fd in (w_fd, ack_r):
-            os.set_inheritable(fd, True)
-        os.execve(sys.executable, [sys.executable, '-I', '-c', _HOLDER_BOOT, os.path.abspath(__file__),
-                                   BOARD_LOCK_DIR, reason, str(w_fd), str(ack_r), *boards], env)
+        exec_fresh('agentrc_hil_lock', os.path.abspath(__file__), '_fresh_holder',
+                   [BOARD_LOCK_DIR, boards, reason, w_fd, ack_r], (w_fd, ack_r))
     except OSError as e:
         with contextlib.suppress(OSError):
             os.write(w_fd, f'0holder not started: {e}'.encode())
     os._exit(1)
+
+
+def _fresh_holder(lock_dir, boards, reason, w_fd, ack_r):
+    global BOARD_LOCK_DIR
+    BOARD_LOCK_DIR = lock_dir
+    _holder(boards, reason, w_fd, ack_r)
 
 
 def _holder(boards, reason, w_fd, ack_r):
@@ -2481,7 +2512,7 @@ def cmd_release_token(token):
     except ReleaseRefused as e:
         print(f'ERROR: {e}', file=sys.stderr)
         return 1
-    if not boards:
+    if boards is None:
         print(f'cleared the host fence of gone keeper pid {pid} (token {token})')
         return 0
     print(f'released {len(boards)} lock(s) of holder {pid} (token {token}): {", ".join(boards)}')

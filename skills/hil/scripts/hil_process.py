@@ -546,7 +546,6 @@ def _announce(cmd, r: subprocess.CompletedProcess, timeout, timed_out: bool, qui
 # --- run_tracked: completion proven by an operation-owned supervisor -------------------------
 PR_SET_CHILD_SUBREAPER = 36
 WAIT_ALL = 0x40000000       # __WALL (uapi linux/wait.h): a clone child is a child too
-SETTLE_POLL = 0.05
 SURVEY_BOUND = 1.0          # the supervisor's best-effort survivor listing, names only
 PROC_SCAN_BOUND = 5.0       # another uid's supervisors listed from /proc: past it, nothing is proven
 # On top of timeout + reap_grace + settle: the supervisor's interpreter start, survey and report.
@@ -653,11 +652,42 @@ def state_dir(parent: str, name: str = 'ops') -> str:
     return trusted_dir(path)
 
 
-def _become_subreaper() -> None:
+def become_subreaper() -> None:
     libc = ctypes.CDLL(None, use_errno=True)
     if libc.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
         err = ctypes.get_errno()
         raise OSError(err, f'cannot become a child subreaper: {os.strerror(err)}')
+
+
+def reap_until(deadline: float) -> bool:
+    """Reap every child that exits until none is left (True) or `deadline` passes (False). In a
+    subreaper every orphan of its subtree reparents to it, and a thread group leader with live
+    threads is never reaped (kernel/exit.c, delay_group_leader), so ECHILD proves the subtree
+    ended. SIGCHLD is blocked meanwhile: a blocked signal is never discarded as ignored, so it
+    wakes the wait for the next exit."""
+    mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGCHLD})
+    try:
+        while True:
+            try:
+                pid, _ = os.waitpid(-1, os.WNOHANG | WAIT_ALL)
+            except ChildProcessError:
+                return True
+            if pid:
+                continue
+            if (left := deadline - time.monotonic()) <= 0:
+                return False
+            signal.sigtimedwait({signal.SIGCHLD}, left)
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+
+
+def reap_all() -> None:
+    """Reap until no child is left, however long that takes."""
+    while True:
+        try:
+            os.waitpid(-1, WAIT_ALL)
+        except ChildProcessError:
+            return
 
 
 def _survey(root: int) -> dict:
@@ -744,8 +774,8 @@ def _supervise(job: dict) -> int:
     child subreaper owning one operation. It runs the command through _run, reports the result
     once waitpid finds no child left (done) or `settle` has passed (pending), and in that case
     keeps reaping until none is left. Every orphan in its subtree reparents to it, and a thread
-    group leader with live threads is never reaped (kernel/exit.c, delay_group_leader), so
-    ECHILD is proof. Its lock is held while it lives; `done` is written to its record first."""
+    group leader with live threads is never reaped (reap_until), so ECHILD is proof. Its lock is
+    held while it lives; `done` is written to its record first."""
     fd = job['report_fd']
     phase = {'now': 'setup', 'asked': False}
 
@@ -760,7 +790,7 @@ def _supervise(job: dict) -> int:
         signal.signal(sig, interrupt)
     record = {'token': job['token'], 'pid': os.getpid()}
     try:
-        _become_subreaper()
+        become_subreaper()
         lock = os.open(job['lock'], os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
         fcntl.flock(lock, fcntl.LOCK_EX)       # held until this process ends
         st = os.fstat(lock)
@@ -790,20 +820,11 @@ def _supervise(job: dict) -> int:
     except Exception as e:
         result = _error(e)
     phase['now'] = 'after'
-    deadline, reported = time.monotonic() + job['settle'], False
-    while True:
-        try:
-            pid, _ = os.waitpid(-1, WAIT_ALL | (0 if reported else os.WNOHANG))
-        except ChildProcessError:
-            break
-        if pid or reported:
-            continue
-        if time.monotonic() < deadline:
-            time.sleep(SETTLE_POLL)
-            continue
+    reported = not reap_until(time.monotonic() + job['settle'])
+    if reported:
         _send(fd, {'result': result, 'cleanup': 'pending', 'survivors': _bounded_survey(os.getpid())})
         os.close(fd)
-        reported = True
+        reap_all()
     _write_record(job['record'], {**record, 'cleanup': 'done'})
     if not reported:
         _send(fd, {'result': result, 'cleanup': 'done'})
