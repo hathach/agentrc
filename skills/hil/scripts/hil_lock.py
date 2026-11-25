@@ -371,8 +371,12 @@ def arm_fence(fence: dict) -> None:
 
 
 def clear_fence(token) -> None:
-    """Remove the host fence when it is `token`'s, under the caller's exclusive ADMISSION."""
-    if (fence_state() or {}).get('token') == token:
+    """Remove the host fence when it is `token`'s, under the caller's exclusive ADMISSION; OSError when it
+    cannot be read, or is empty or unreadable, since it may be `token`'s and stays."""
+    state, rec = _parse(_read_name(FENCE))
+    if state in ('empty', 'unreadable'):
+        raise OSError(errno.EIO, f'{FENCE} is {state}')
+    if state == 'record' and rec.get('token') == token:
         _unlink_fence()
 
 
@@ -650,10 +654,11 @@ def _valid_group(locks, board) -> bool:
 def take_board_lock(board: str, reason: str, *, protected=False, **extra):
     """Take the board's flock and record ourselves as its holder; returns the open handle
     (keep it referenced; release_board_lock or end_failed ends it). Raises BoardLocked when
-    another process holds the flock (RecoveryBlocked when that is a cleanup holder; FenceHeld
-    while a host fence is there), and LockUnavailable when the lock cannot be taken or
-    recorded (fail-closed). A free flock is always taken: what a task that ended without its
-    cleanup left there (_leftover) is appended to the board's cleanup log first, never a refusal.
+    another process holds the flock (RecoveryBlocked when that is a cleanup holder), FenceHeld
+    when it got past the flock, a free one included, while a host fence is there, and
+    LockUnavailable when the lock cannot be taken or recorded (fail-closed). Without a fence a
+    free flock is always taken: what a task that ended without its cleanup left there
+    (_leftover) is appended to the board's cleanup log first, never a refusal.
 
     The handle's `cleanup_failures` are the board's open failed cleanups (open_cleanup_failures),
     for the caller's report before any hardware access, the leftover found now last with

@@ -1926,7 +1926,8 @@ class HostFence(LockDir):
         Path(self.dir, hil_lock.FENCE).write_text('{"tok')
         with self.assertRaisesRegex(hil_lock.FenceHeld, r'unreadable \.fence\.json: only a host reboot clears it'):
             self.acquire()
-        hil_lock.clear_fence('tok')               # nobody's to clear
+        with self.assertRaisesRegex(OSError, r'\.fence\.json is unreadable'):
+            hil_lock.clear_fence('tok')           # it may be tok's: it stays
         self.assertEqual(hil_lock.fence_state(), {})
 
     def test_a_fence_armed_while_a_take_gets_its_flock_is_seen(self):
@@ -1950,6 +1951,18 @@ class HostFence(LockDir):
         hil_lock.clear_fence('tok')
         self.assertIsNone(hil_lock.fence_state())
         hil_lock.clear_fence('tok')               # none is no error
+
+    def test_a_fence_that_cannot_be_read_is_never_taken_for_cleared(self):
+        self.fence()
+        with mock.patch.object(hil_lock, '_read_name', side_effect=OSError(errno.EIO, 'Input/output error')):
+            with self.assertRaisesRegex(OSError, 'Input/output error'):
+                hil_lock.clear_fence('tok')
+        for data, state in ((b'', 'empty'), (b' \n', 'empty'), (b'{"tok', 'unreadable'), (b'[]', 'unreadable')):
+            with self.subTest(data=data):
+                Path(self.dir, hil_lock.FENCE).write_bytes(data)
+                with self.assertRaisesRegex(OSError, rf'\.fence\.json is {state}'):
+                    hil_lock.clear_fence('tok')
+                self.assertEqual(Path(self.dir, hil_lock.FENCE).read_bytes(), data)
 
 
 class ProtectedGroup(LockDir):
