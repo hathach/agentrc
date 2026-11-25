@@ -76,7 +76,8 @@ on hardware before its row can cite the fixture.
 - The probe stays on the latest STLINK-V3 firmware, V3J17M11 (J13 stalls after 2 KiB; no downgrade). Through OpenOCD
   0.12.0+dev-02620-g0ce743125 it loses bytes two ways (fixture, 10 s captures); the decode flags each loss as an
   unknown header or unexpected source and resynchronizes. Use 8 MHz with one source: 5 exception-trace (200 KB each)
-  and 4 PC-sampling (1.08 MB each) captures there were one clean segment each.
+  and 4 PC-sampling (1.08 MB each) captures there were one clean segment each. The row's ITM, data trace, PB3 and
+  restore checks date from 16 MHz on J12M3.
   - Breaking 0 to 5 bytes past a 2 KiB-multiple stream offset, at 16 MHz only: 15 to 20 per capture on J17 with either
     source alone, against 0 to 6 on J12M3. OpenOCD reads what the probe holds, up to 4096 bytes, every 1 ms
     (`stlink_usb_trace_read`, unchanged upstream), with no 2 KiB unit on its side.
