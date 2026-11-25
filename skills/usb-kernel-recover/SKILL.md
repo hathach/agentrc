@@ -53,29 +53,37 @@ rung 1 with no reboot. In this occurrence the reset was followed by disconnect,
 the queue's error report (`during the test, 32 errors out of 0`, with `-g 32`
 queued URBs on test 28, a bulk read) and owner exit, consistent with outstanding
 transfers completing or failing until the callback released the wait (rung 1's
-mechanism). Count it cleared only when the owner exits, the DUT re-enumerates
-and a fresh D-state check finds no holder; a flasher exit or a disconnect line
-alone is not enough. An owner still in D state is one the reset cannot release
-(rung 3) only once rung 1 has issued the reset — the flasher reported it, or,
-where the reset cannot reach the peripheral, park-flash's flasher reported a
-successful flash — and a fresh D-state check, taken after the disconnect and the
-pending URB completions had time to settle, still finds it. A reported reset
-that no `USB disconnect` line for the DUT follows, with the owner still in D
-state at a fresh check, did not reach the peripheral — unless that check also
-finds a task holding or waiting on the DUT's parent hub: a device-level
-bind/unbind writer (`__device_driver_lock`, above) or a `hub_event` kworker for
-that hub. `hub_event` takes the hub's lock (`usb_lock_device(hdev)`) before
-`usb_disconnect` logs that line (hub.c), so with such a task the missing line is
-inconclusive: follow the table's `hub_event` row, not park-flash. With none,
-park-flash next. If its flasher reports a successful flash, no disconnect
-follows either and a fresh check still finds the owner, escalate to rung 3, or
-to the contract's terminal recovery where the dispatch may not reach it. A
-park-flash that reports no successful flash proves nothing: a probe it cannot
-reach goes to rung 2, any other failure to the contract's terminal recovery,
-never rung 3. An owner that exited while a fresh check finds another holder:
-triage that one by its stack. No holder left but no DUT: the lock is free, so
-it is no longer a kernel wedge. If the DUT still has a sysfs node, use section 4; with none, `authorized` has nothing to act on, so go straight to the
-board's own recovery (park-flash). Never rung 3.
+mechanism).
+
+For this `test_queue` case:
+
+- **Cleared:** the owner exits, the DUT re-enumerates and a fresh D-state check
+  finds no holder. A flasher exit or a disconnect line alone is not enough.
+- **Disconnected, owner still in D state:** rung 3 only once rung 1 has issued
+  the reset — the flasher reported it, or, where the reset cannot reach the
+  peripheral, park-flash's flasher reported a successful flash — and a fresh
+  D-state check, taken after the disconnect and the pending URB completions had
+  time to settle, still finds the owner.
+- **No DUT `USB disconnect` line after a reported reset, owner still in D state
+  at a fresh check:** look in that same check for a task holding or waiting on
+  the DUT's parent hub: a device-level bind/unbind writer
+  (`__device_driver_lock`, above) or a `hub_event` kworker for that hub. With
+  such a task, follow the table's `hub_event` row, not park-flash: `hub_event`
+  takes the hub's lock (`usb_lock_device(hdev)`) before `usb_disconnect` logs
+  that line (hub.c), so the missing line is inconclusive. With none, the reset
+  did not reach the peripheral: park-flash next.
+- **That park-flash's flasher reports a successful flash, still no
+  disconnect:** if a fresh check still finds the owner, escalate to rung 3, or
+  to the contract's terminal recovery where the dispatch may not reach it.
+- **Park-flash reports no successful flash:** it proves nothing. A probe it
+  cannot reach goes to rung 2; any other failure goes to the contract's
+  terminal recovery, never rung 3.
+- **Owner exited, another holder remains at a fresh check:** triage that one
+  by its stack.
+- **No holder left, no DUT:** the lock is free, so this is no longer a kernel
+  wedge. If the DUT still has a sysfs node, use section 4; with none,
+  `authorized` has nothing to act on, so go straight to the board's own
+  recovery (park-flash). Never rung 3.
 
 Map the holder to a busport with **lock-free attrs only** (`devnum`, `idVendor`,
 `idProduct` are `usb_descriptor_attr*`, plain `sysfs_emit`, sysfs.c:688-705):
