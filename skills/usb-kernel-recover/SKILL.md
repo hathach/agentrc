@@ -33,7 +33,7 @@ sudo cat /proc/<pid>/stack          # never opens the node, so it cannot block
 
 | Stack shows | Meaning | Go to |
 |---|---|---|
-| `test_queue [usbtest]` → `usbtest_ioctl` → `usbdev_ioctl` | **owner, holds the lock**, waiting on queued transfers | rung 1 (DUT), then recheck; park-flash if no disconnect follows and nothing holds its hub |
+| `test_queue [usbtest]` → `usbtest_ioctl` → `usbdev_ioctl` | **owner, holds the lock**, waiting on queued transfers | rung 1 (DUT), then recheck; park-flash if no disconnect follows |
 | `usbdev_ioctl` + another driver-module wait | **owner, holds the lock** | inspect the wait; rung 3 — terminal if the permitted reset/disconnect cannot release it |
 | `usbdev_ioctl`, no driver frames | owner waiting on a URB | rung 1 (DUT) / rung 2 (probe) |
 | `usbdev_open`, sysfs reads | victim | ignore |
@@ -65,13 +65,13 @@ For this `test_queue` case:
   D-state check, taken after the disconnect and the pending URB completions had
   time to settle, still finds the owner.
 - **No DUT `USB disconnect` line after a reported reset, owner still in D state
-  at a fresh check:** look in that same check for a task holding or waiting on
-  the DUT's parent hub: a device-level bind/unbind writer
-  (`__device_driver_lock`, above) or a `hub_event` kworker for that hub. With
-  such a task, follow the table's `hub_event` row, not park-flash: `hub_event`
-  takes the hub's lock (`usb_lock_device(hdev)`) before `usb_disconnect` logs
-  that line (hub.c), so the missing line is inconclusive. With none, the reset
-  did not reach the peripheral: park-flash next.
+  at a fresh check:** park-flash next. A task holding or waiting on the DUT's
+  parent hub, a device-level bind/unbind writer (`__device_driver_lock`, above)
+  or a `hub_event` kworker for that hub, holds that line back: `hub_event` takes
+  the hub's lock (`usb_lock_device(hdev)`) before `usb_disconnect` logs it
+  (hub.c). With such a task the missing line shows neither that the reset
+  missed the peripheral nor that it reached it, so it never counts as the
+  disconnect rung 3 needs; park-flash's outcome, below, decides.
 - **That park-flash's flasher reports a successful flash, still no
   disconnect:** if a fresh check still finds the owner, escalate to rung 3, or
   to the contract's terminal recovery where the dispatch may not reach it.
