@@ -84,9 +84,10 @@ For this `test_queue` case:
   terminal recovery, never rung 3. After a successful rung 2, take a fresh
   D-state check and triage again by this list: the owner gone and the DUT back
   is Cleared; an owner still holding the DUT gets rung 1 again through the
-  restored probe, then park-flash. Rung 2 runs once per wedge: a failed
-  root-cycle, or a probe unreachable after one, restored in between or
-  not, goes to the contract's terminal recovery.
+  restored probe, then a fresh check triaged by this list again, so
+  park-flash runs only where a bullet above sends it. Rung 2 runs once per
+  wedge: a failed root-cycle, or a probe unreachable after one, restored in
+  between or not, goes to the contract's terminal recovery.
 - **Owner exited, another holder remains at a fresh check:** triage that one
   by its stack.
 - **No holder left, no DUT:** the lock is free, so this is no longer a kernel
