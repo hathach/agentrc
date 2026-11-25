@@ -64,6 +64,10 @@ For this `test_queue` case:
   peripheral, park-flash's flasher reported a successful flash — and a fresh
   D-state check, taken after the disconnect and the pending URB completions had
   time to settle, still finds the owner.
+- **Rung 1's flasher reports no reset, owner still in D state:** no reset
+  was issued, so never rung 3. A probe it cannot reach goes to rung 2 unless
+  rung 2 already ran (see the park-flash bullet); any other failure goes to
+  the contract's terminal recovery.
 - **No DUT `USB disconnect` line after a reported reset, owner still in D state
   at a fresh check:** park-flash next. A task holding or waiting on the DUT's
   parent hub, a device-level bind/unbind writer (`__device_driver_lock`, above)
@@ -80,8 +84,9 @@ For this `test_queue` case:
   terminal recovery, never rung 3. After a successful rung 2, take a fresh
   D-state check and triage again by this list: the owner gone and the DUT back
   is Cleared; an owner still holding the DUT gets rung 1 again through the
-  restored probe, then park-flash. A failed root-cycle, or a probe still
-  unreachable after one, goes to the contract's terminal recovery.
+  restored probe, then park-flash. Rung 2 runs once per wedge: a failed
+  root-cycle, or a probe unreachable after one, restored in between or
+  not, goes to the contract's terminal recovery.
 - **Owner exited, another holder remains at a fresh check:** triage that one
   by its stack.
 - **No holder left, no DUT:** the lock is free, so this is no longer a kernel
