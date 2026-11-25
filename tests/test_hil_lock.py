@@ -163,8 +163,9 @@ class LockDir(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
         os.environ.pop('HIL_NO_BOARD_LOCK', None)
-        # a hold's holder stays this process's fork, which the patches here reach, even under an hc terminal
-        self.patch(hil_lock, 'HC_SCOPE', 'HIL_SELFTEST_NO_SCOPE')
+        # a hold's holder stays this process's fork, which the patches here reach, even under an hc terminal or a
+        # runner job
+        self.patch(hil_lock, 'ENV_DROP', ('HIL_SELFTEST_NO_SCOPE',))
 
     def patch(self, obj, name, value):
         p = mock.patch.object(obj, name, value)
@@ -825,7 +826,7 @@ class DetachedHolder(LockDir):
     def scoped(self):
         """An hc terminal's environment: the holder must start without its HC_SCOPE. Returns a marker variable's
         `name=value`, which only processes started from this test carry in their starting environment."""
-        self.patch(hil_lock, 'HC_SCOPE', 'HC_SCOPE')
+        self.patch(hil_lock, 'ENV_DROP', ('HC_SCOPE', 'RUNNER_TRACKING_ID'))
         marker = f'HIL_SELFTEST_MARK={secrets.token_hex(8)}'
         os.environ.update([marker.split('='), ('HC_SCOPE', 'selftest-scope')])
         return marker
@@ -887,6 +888,18 @@ class DetachedHolder(LockDir):
             self.assertEqual(hil_lock.cmd_hold([BOARD + '-2'], 'selftest hold'), 1)
         self.assertIn('ERROR: holder not started: ', err.getvalue())
         self.assertIsNone(hil_lock.read_record(BOARD + '-2'))
+
+
+class EnvDrop(unittest.TestCase):
+    def test_whether_a_process_starts_scoped_reads_its_environment_and_a_runner_jobs_too(self):
+        # actions/runner's JobExtension ends every process started with its job's RUNNER_TRACKING_ID
+        self.assertIn('RUNNER_TRACKING_ID', hil_lock.ENV_DROP)
+        with mock.patch.dict(os.environ, {'RUNNER_TRACKING_ID': 'github_selftest'}):
+            self.assertTrue(hil_lock._starts_scoped())
+        with mock.patch.object(hil_lock, 'ENV_DROP', ('HIL_SELFTEST_SCOPE',)):
+            self.assertFalse(hil_lock._starts_scoped())
+            with mock.patch.dict(os.environ, {'HIL_SELFTEST_SCOPE': 'x'}):
+                self.assertTrue(hil_lock._starts_scoped())
 
 
 class SafeFiles(LockDir):
@@ -1803,6 +1816,153 @@ class LegacyRelease(LockDir):
         with self.assertRaisesRegex(hil_lock.ReleaseRefused, 'does not hold the flocks'):
             hil_lock.release_token('tok')
         self.assertEqual(signals, [])
+
+
+class ReservationRelease(LockDir):
+    """A hil_reserve keeper's cleanup holder (agentrc#586) is refused as one, and release_token signals it only
+    once its host fence, the one record of its phase, says its command's subtree ended."""
+
+    signals = LegacyRelease.signals
+
+    def test_only_a_keeper_whose_own_fence_says_ended_is_signalled(self):
+        sent = self.signals()
+        token, pid = start_legacy_holder(self, [BOARD], tool='hil_reserve')
+        start = hil_lock.proc_start(pid)
+        me = {'pid': os.getpid(), 'start': hil_lock.proc_start(os.getpid())}
+        with self.assertRaisesRegex(hil_lock.RecoveryBlocked, re.escape(hil_lock.RESERVATION_BLOCKER)):
+            self.acquire()
+        for fence, why in ((None, 'its host fence is missing or not its own'),
+                           ({**me, 'phase': 'ended'}, 'its host fence is missing or not its own'),
+                           ({'pid': pid, 'start': start, 'phase': 'survivors', 'survivors': [me]},
+                            rf"its command's descendants are not proven ended \(surviving pids \[{os.getpid()}\]\)"),
+                           ({'pid': pid, 'start': start, 'phase': 'command'},
+                            "its host fence says 'command', not that its subtree ended")):
+            with self.subTest(fence=fence):
+                if fence is not None:
+                    hil_lock.arm_fence({'token': token, **fence})
+                with self.assertRaisesRegex(hil_lock.ReleaseRefused,
+                                            f'not signalled: holder pid {pid} of token {token} keeps {BOARD}: {why}'):
+                    hil_lock.release_token(token)
+        self.assertEqual(sent, [])
+        hil_lock.arm_fence({'token': token, 'pid': pid, 'start': start, 'phase': 'ended', 'survivors': []})
+        self.assertEqual(hil_lock.release_token(token), (pid, [BOARD]))
+        self.assertEqual(sent, [signal.SIGUSR1])
+
+
+class HostFence(LockDir):
+    """A hil_reserve keeper's host fence (agentrc#586): checked once a flock is taken, it refuses every take, of an
+    existing lock name or a new one, at once (FenceHeld, a RecoveryBlocked) and names what ends it; release_token
+    clears it, under ADMISSION, only for a gone keeper whose fence says `ended`."""
+
+    def fence(self, pid=999999999, start='1', phase='command', token='tok'):
+        hil_lock.arm_fence({'token': token, 'pid': pid, 'start': start, 'phase': phase, 'survivors': []})
+
+    def test_a_gone_keepers_fence_refuses_every_take_until_a_reboot(self):
+        hil_lock.ensure_lock_files([BOARD])
+        self.fence()
+        why = "host fenced by hil_reserve pid 999999999 \\(token tok\\), gone without proving its command's " \
+              "subtree ended: only a host reboot clears it"
+        for take in (self.acquire, lambda: hil_lock.acquire_board_lock('newboard', reason='selftest'),
+                     lambda: hil_lock.flock_nb(BOARD).close()):
+            with self.assertRaisesRegex(hil_lock.FenceHeld, why) as cm:
+                take()
+            self.assertIsInstance(cm.exception, hil_lock.RecoveryBlocked)
+        self.assertTrue(self.flock_is_free())
+        t0 = time.monotonic()
+        with self.assertRaises(hil_lock.FenceHeld):
+            with hil_lock.board_task(BOARD, 'selftest run', busy=lambda: [], wait=5):
+                pass
+        self.assertLess(time.monotonic() - t0, 2, 'a fence is never waited on')
+        with quiet() as (out, err):
+            self.assertEqual(hil_lock.cmd_release([BOARD]), 1)
+            hil_lock.cmd_status()
+        self.assertRegex(err.getvalue(), why)
+        self.assertRegex(out.getvalue(), why)
+        with self.assertRaisesRegex(hil_lock.ReleaseRefused, 'only a host reboot clears it'):
+            hil_lock.release_token('tok')
+        self.assertIsNotNone(hil_lock.fence_state())
+
+    def test_a_gone_keeper_whose_fence_says_ended_is_cleared_by_its_token(self):
+        self.fence(phase='ended')
+        with self.assertRaisesRegex(hil_lock.FenceHeld, r'gone after its command.s subtree ended: '
+                                                        r'`hil_lock.py release --token tok` clears it'):
+            self.acquire()
+        with self.assertRaisesRegex(hil_lock.ReleaseRefused, 'no holder record carries token other'):
+            hil_lock.release_token('other')
+        with quiet() as (out, _):
+            self.assertEqual(hil_lock.cmd_release_token('tok'), 0)
+        self.assertIn('cleared the host fence of gone keeper pid 999999999 (token tok)', out.getvalue())
+        self.assertIsNone(hil_lock.fence_state())
+        self.assertIsNotNone(self.acquire())
+
+    def test_a_stale_release_racing_another_and_a_new_keeper_never_removes_the_new_fence(self):
+        real = hil_lock.close_admission
+        for keeper_holds in (False, True):
+            with self.subTest(keeper_holds=keeper_holds):
+                self.fence(phase='ended')
+                held = []
+
+                def close_admission(wait=None):
+                    # between this release's read and its admission: another release cleared the stale fence and
+                    # a new keeper armed its own, holding ADMISSION or just gone from it
+                    if keeper_holds:
+                        held.append(real())
+                    self.fence(pid=os.getpid(), start=hil_lock.proc_start(os.getpid()), token='new')
+                    return real(wait=0.2)
+                with mock.patch.object(hil_lock, 'close_admission', close_admission):
+                    with self.assertRaisesRegex(hil_lock.ReleaseRefused, 'not cleared: the host fence of token tok'):
+                        hil_lock.release_token('tok')
+                for h in held:
+                    h.close()
+                self.assertEqual(hil_lock.fence_state()['token'], 'new')
+
+    def test_a_live_keepers_or_an_unreadable_fence_refuses_too(self):
+        me = os.getpid()
+        self.fence(pid=me, start=hil_lock.proc_start(me))
+        with self.assertRaisesRegex(hil_lock.FenceHeld, 'its command or a descendant of it may still change the rig'):
+            self.acquire()
+        with self.assertRaisesRegex(hil_lock.ReleaseRefused, 'no holder record carries token tok'):
+            hil_lock.release_token('tok')        # a live keeper's fence goes only with its records
+        Path(self.dir, hil_lock.FENCE).write_text('{"tok')
+        with self.assertRaisesRegex(hil_lock.FenceHeld, r'unreadable \.fence\.json: only a host reboot clears it'):
+            self.acquire()
+        with self.assertRaisesRegex(OSError, r'\.fence\.json is unreadable'):
+            hil_lock.clear_fence('tok')           # it may be tok's: it stays
+        self.assertEqual(hil_lock.fence_state(), {})
+
+    def test_a_fence_armed_while_a_take_gets_its_flock_is_seen(self):
+        hil_lock.ensure_lock_files([BOARD])
+        real = fcntl.flock
+
+        def flock(fd, op):
+            real(fd, op)
+            if op & fcntl.LOCK_EX and hil_lock.fence_state() is None:
+                self.fence()                      # a keeper that held this flock until it died, just after arming
+        with mock.patch.object(hil_lock.fcntl, 'flock', flock):
+            with self.assertRaises(hil_lock.FenceHeld):
+                self.acquire()
+        self.assertTrue(self.flock_is_free())
+        self.assertEqual(self.lock_bytes(), b'')
+
+    def test_only_its_own_token_clears_a_fence(self):
+        self.fence()
+        hil_lock.clear_fence('other')
+        self.assertEqual(hil_lock.fence_state()['token'], 'tok')
+        hil_lock.clear_fence('tok')
+        self.assertIsNone(hil_lock.fence_state())
+        hil_lock.clear_fence('tok')               # none is no error
+
+    def test_a_fence_that_cannot_be_read_is_never_taken_for_cleared(self):
+        self.fence()
+        with mock.patch.object(hil_lock, '_read_name', side_effect=OSError(errno.EIO, 'Input/output error')):
+            with self.assertRaisesRegex(OSError, 'Input/output error'):
+                hil_lock.clear_fence('tok')
+        for data, state in ((b'', 'empty'), (b' \n', 'empty'), (b'{"tok', 'unreadable'), (b'[]', 'unreadable')):
+            with self.subTest(data=data):
+                Path(self.dir, hil_lock.FENCE).write_bytes(data)
+                with self.assertRaisesRegex(OSError, rf'\.fence\.json is {state}'):
+                    hil_lock.clear_fence('tok')
+                self.assertEqual(Path(self.dir, hil_lock.FENCE).read_bytes(), data)
 
 
 class ProtectedGroup(LockDir):
