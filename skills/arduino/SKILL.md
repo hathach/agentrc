@@ -89,7 +89,9 @@ retries, recovery) apply unchanged; these scripts load its `hil_*` scripts throu
   failure under it. A passing restore marks restored each open failure whose children and retained
   sessions are proven ended. `restore --release` releases the hold whatever the restore did: exit 0 restored, 6
   restore failed (released), 5 not released; `session close` counts 6 closed, and on a closed session prints its
-  recorded exits without the rig (exit 0). An older engine's pending record
+  recorded exits without the rig (exit 0). After a failed close (`restoreExit` 6, hold released), recovery takes a new
+  hold, first stops or reports every child the session left unproven, then restores with the session's record
+  (`restoreRecord`), never with the session's `result.json` as `--report`. An older engine's pending record
   (kind `arduino-hil`) is reported (`previousPending`), never a refusal.
 - **Busy check**: a run or commission is one `hil_lock.board_task` whose busy check, under its lock and before any tool,
   is agentrc `hil_flash.probe_users` on the board's probe; its docstring has what it covers (the probe's serial on a

@@ -1947,6 +1947,62 @@ class Manual(Base):
                 H.op_restore(args, None, self.dir / 'run', None, None)
         restore.assert_not_called()
 
+    def test_restore_refuses_a_session_result_as_its_report(self):
+        args = self.held(cmd='restore', build_record=str(self.record()), report=None, release=True)
+        failed = {'pass': False, 'state': 'unknown', 'evidence': 'no echo'}
+        with mock.patch.object(H, 'restore', return_value=failed), \
+                mock.patch.object(H, 'git_identity', return_value=('abc', '')), \
+                mock.patch.object(H.Tracker, '__init__', fake_tracker_init), \
+                mock.patch.object(H, 'release_hold', return_value={'exit': 0}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(H.manual(args), H.RESTORE_FAILED)
+        session = next((self.root / 'build/hil-manual').glob('rig_jlink-restore-*/result.json'))
+        self.lock.logged.clear()
+        args = self.held(cmd='restore', build_record=str(self.record()), report=str(session), release=True)
+        with mock.patch.object(H, 'restore') as restore, mock.patch.object(H, 'admit_sketch') as admit, \
+                mock.patch.object(H.Tracker, '__init__', fake_tracker_init), \
+                mock.patch.object(H, 'release_hold', return_value={'exit': 0}) as release, \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(H.manual(args), H.RESTORE_FAILED)
+        self.assertIn(f'--report {session} is no run report or commissioning result: no results',
+                      json.loads(out.getvalue())['error'])
+        admit.assert_not_called()
+        restore.assert_not_called()
+        release.assert_called_once_with('rig_jlink')
+        self.assertEqual(len(self.lock.logged), 1)
+
+    def test_restore_refuses_a_report_with_no_usable_results(self):
+        report = self.dir / 'report.json'
+        args = self.held(build_record=str(self.record()), report=str(report), release=False)
+        for body, why in (('[1]', 'not a JSON object but a list'), ('{"results": {}}', 'results is a dict, not a list'),
+                          ('{"results": [{"board": "rig_jlink"}]}', r'results rows \[0\] have no board and cleanup'),
+                          ('{"res', 'Unterminated string')):
+            with self.subTest(body=body):
+                report.write_text(body)
+                with mock.patch.object(H, 'admit_sketch') as admit, \
+                        self.assertRaisesRegex(H.Refused, f'--report {re.escape(str(report))}.*{why}'):
+                    H.op_restore(args, None, self.dir / 'run', None, None)
+                admit.assert_not_called()
+
+    def test_restore_checks_the_receipts_of_a_run_report_and_a_commissioning_result(self):
+        receipt = {'pid': 7, 'at': 1.0}
+        cleanup = {'evidence': 'x', 'released': True, 'receipts': [receipt]}
+        run = {'pass': False, 'caveat': '', 'exitCode': 1, '_hil': {'version': 1},
+               'results': [{'board': 'rig_ocd', 'cleanup': {'receipts': []}},
+                           {'board': 'rig_jlink', 'cleanup': cleanup}]}
+        commission = {'board': 'rig_jlink', 'rosterUid': 'JUID', 'error': 'x',
+                      'results': [{'board': 'rig_jlink', 'cleanup': cleanup}]}
+        report = self.dir / 'report.json'
+        args = self.held(build_record=str(self.record()), report=str(report), release=False)
+        for body in (run, commission):
+            report.write_text(json.dumps(body))
+            with self.subTest(body=body), mock.patch.object(H, 'proven_ended', return_value=False) as ended, \
+                    mock.patch.object(H, 'admit_sketch') as admit, \
+                    self.assertRaisesRegex(H.Refused, 'not proven ended'):
+                H.op_restore(args, None, self.dir / 'run', None, None)
+            ended.assert_called_once_with(receipt)
+            admit.assert_not_called()
+
     def test_restore_release_releases_the_hold_whatever_the_restore_did(self):
         args = self.held(cmd='restore', build_record=str(self.record()), report=None, release=True)
         restored = {'pass': True, 'state': 'echo restored', 'evidence': 'echo'}
@@ -2794,7 +2850,7 @@ class Report(Base):
         self.A.report.BodySchema = lambda **kw: kw
         sch = H.schema()
         self.assertEqual((sch['name'], sch['stem']), ('fake-usb-hil', 'hil_report'))
-        with self.assertRaisesRegex(ValueError, 'report body needs'):
+        with self.assertRaisesRegex(ValueError, 'report body: no caveat, exitCode, results'):
             sch['check']({'pass': True})
 
     def test_requested_boards_come_from_the_recorded_selection(self):
