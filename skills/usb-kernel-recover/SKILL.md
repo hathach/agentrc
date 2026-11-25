@@ -169,7 +169,9 @@ python3 <hil skill dir>/scripts/hil_reserve.py run root-cycle <busport> \
 One `--roster` per project with boards on this host (the contract's Hosts/rosters
 names them). `hil_reserve.py --help` has its
 coverage, hold and release rules; a failed cycle releases every lock unless a descendant
-survives (above), and the token its BLOCKER line prints identifies that logged blocker. A refusal
+survives (above) or its host fence cannot be cleared. Read its BLOCKER line: `holding`
+means the host is kept and its token is the one `hil_lock.py release --token` takes;
+`released` means the locks are gone and the failure is only logged. A refusal
 naming a runner's holder (`hil_test.py`) means CI is mid-test — wait, do not force.
 Give it the wedged probe's own busport (e.g. `13-1.6`), not the `13-1` hub path: the
 script derives the root port itself, and the serial guard and the success check both

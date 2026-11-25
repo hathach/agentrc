@@ -588,7 +588,6 @@ class Reservation:
         """A blocker that keeps the host (descendants `left` alive, or a fence not cleared): logged
         on every board with its flock kept, every record made a cleanup holder once, so a taker
         refuses at once (RecoveryBlocked), and the fence's phase `survivors`. Returns 1."""
-        signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR1})   # before a record names a cleanup holder
         self.retained, self.detail, self.receipts = True, '; '.join(problems), receipts
         for lock, fh in zip(self.locks, self.handles):
             try:
@@ -1143,6 +1142,9 @@ def _keep(args, chan, unblock):
     for s in HANDLED_SIGNALS:
         signal.signal(s, before_hold)
     signal.pthread_sigmask(signal.SIG_UNBLOCK, unblock)
+    # before any thread starts (a stranded read_sysfs reader would take release_token's process-directed SIGUSR1,
+    # whose default kills); nothing waits for it before retain, and the command starts with an empty mask
+    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR1})
     try:
         code = (cmd_run_controller if VERB_SCOPE[args.verb] == 'controller' else cmd_run_port)(args, chan)
     except Refused as e:
@@ -1166,19 +1168,29 @@ def _spool():
         os.unlink(path)
 
 
+def _fill_std_fds():
+    """/dev/null on each of fds 0-2 that is closed, so no spool or pipe lands there for the keeper's dup2s
+    to clobber."""
+    while (fd := os.open(os.devnull, os.O_RDWR)) <= 2:
+        pass
+    os.close(fd)
+
+
 def cmd_run(args, argv):
     """The foreground of `run`: start the keeper, relay its output, forward SIGINT, SIGTERM and
     SIGHUP to it, give it the go once it holds everything, and return the status it reports.
     The keeper, not this process, holds the locks; one that keeps them for descendants left
     alive outlives it."""
     try:
+        _fill_std_fds()
         (out_w, out_r), (err_w, err_r) = _spool(), _spool()
         status_r, status_w = os.pipe()
         ack_r, ack_w = os.pipe()
     except OSError as e:
         raise Refused(f'cannot start the keeper: {e}')
     for stream in (sys.stdout, sys.stderr):
-        stream.flush()
+        if stream is not None:      # None: Python started with that fd closed
+            stream.flush()
     mask = signal.pthread_sigmask(signal.SIG_BLOCK, HANDLED_SIGNALS)
     old = {}
     try:
@@ -1215,18 +1227,23 @@ def _relay(pid, status_fd, ack_fd, spools, go):
     """Copy the spools to their streams until the keeper's status arrives, acking its `ready` while `go`."""
     decoders = [codecs.getincrementaldecoder('utf-8')('replace') for _ in spools]
 
+    def emit(stream, text):
+        if text and stream is not None:
+            try:
+                stream.write(text)
+                stream.flush()
+            except (OSError, ValueError):
+                pass
+
     def copy(final=False):
+        """Each spool up to its size at the start: a descendant outrunning the copy waits for the next one."""
         for (fd, stream), dec in zip(spools, decoders):
-            text = ''
-            while chunk := os.read(fd, 65536):
-                text += dec.decode(chunk)
-            text += dec.decode(b'', final=final)
-            if text:
-                try:
-                    stream.write(text)
-                    stream.flush()
-                except (OSError, ValueError):
-                    pass
+            left = os.fstat(fd).st_size - os.lseek(fd, 0, os.SEEK_CUR)
+            while left > 0 and (chunk := os.read(fd, min(left, 65536))):
+                left -= len(chunk)
+                emit(stream, dec.decode(chunk))
+            if final:
+                emit(stream, dec.decode(b'', final=True))
     buf, code = b'', None
     while code is None:
         copy()

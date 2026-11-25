@@ -63,9 +63,14 @@ nothing in it through a link.
   releases it, and a failed cleanup under it is logged all the same. Its
   holder, like a remote attempt's supervisor, starts without the hc terminal's
   `HC_SCOPE`, so that terminal's cleanup does not end it. The
-  flock is the only refusal to take the lock; admission to the hardware is
-  the busy check's (below). A free flock is
-  always taken; what a task that ended without its cleanup left there (a
+  flock is the only refusal to take the lock, but for a `hil_reserve.py` host
+  fence (`.fence.json`): while it stands, a take that gets past its flock, a
+  free flock included, refuses with `FenceHeld` (the rig-wide operation rule
+  below has what clears it); a live keeper's held flocks still refuse first
+  (`RecoveryBlocked` once it keeps the host), and so does a new lock name while
+  it holds admission (`AdmissionClosed`). Admission to the hardware is the busy
+  check's (below). Without a fence a free
+  flock is always taken; what a task that ended without its cleanup left there (a
   record marked `cleanupOwed`, an unreadable record, an older helper's
   takeover journal) is first appended to the board's cleanup log as a failed
   cleanup, never a refusal. An older helper's cleanup holder
@@ -161,10 +166,13 @@ nothing in it through a link.
   command it builds (`usb-kernel-recover`'s `root-cycle` or `hub-cycle`),
   and, when anything but a clean, fully re-enumerated outcome follows,
   releases them with the blocker logged in each board's cleanup log
-  (`end_failed`) and exits 1. A descendant of the command still alive keeps the
-  host instead until `hil_lock.py release --token <token>` once it ended
-  (agentrc#586); a `FenceHeld` refusal is such a hold, or a killed keeper's,
-  which only a reboot clears unless its fence says ended.
+  (`end_failed`) and exits 1. A descendant of the command still alive, or a
+  host fence it cannot clear, keeps the host instead until `hil_lock.py
+  release --token <token>` once the descendants ended (agentrc#586). Its
+  BLOCKER line says which: `holding` means the reservation kept the host and
+  its token is the one that release takes; `released` means the locks are gone
+  and the failure is only logged. A `FenceHeld` refusal is such a hold, or a
+  killed keeper's, which only a reboot clears unless its fence says ended.
   A controller operation (`usb-kernel-recover`'s `pci-rebind`, `pci-bind`, for a
   dead controller) holds through `hil_reserve.py run pci-rebind|pci-bind <pciaddr>`, which a contract adopts in its
   Reservation before running either verb, and only once the rig's installed `usb_recover` is refreshed by
