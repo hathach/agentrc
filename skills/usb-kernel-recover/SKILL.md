@@ -77,7 +77,11 @@ For this `test_queue` case:
   to the contract's terminal recovery where the dispatch may not reach it.
 - **Park-flash reports no successful flash:** it proves nothing. A probe it
   cannot reach goes to rung 2; any other failure goes to the contract's
-  terminal recovery, never rung 3.
+  terminal recovery, never rung 3. After a successful rung 2, take a fresh
+  D-state check and triage again by this list: the owner gone and the DUT back
+  is Cleared; an owner still holding the DUT gets rung 1 again through the
+  restored probe, then park-flash. A failed root-cycle, or a probe still
+  unreachable after one, goes to the contract's terminal recovery.
 - **Owner exited, another holder remains at a fresh check:** triage that one
   by its stack.
 - **No holder left, no DUT:** the lock is free, so this is no longer a kernel
