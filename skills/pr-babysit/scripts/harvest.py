@@ -715,9 +715,10 @@ def waiting(repo, n, inline, issue, reviews):
     answers = [stamp(c['created_at']) for c in issue if (c['user']['login'] or '').lower() in answerers]
     answers += [stamp(r['submitted_at']) for r in reviews
                 if (r['user']['login'] or '').lower() in answerers and r.get('state') in REVIEW_SUBMITTED and r.get('submitted_at')]
+    latest_answer = max(answers, default=None)
     for kind, c, body, at in [*[('issue', c, c.get('body'), c['created_at']) for c in issue],
                               *[('review-body', r, r['body'], r['submitted_at']) for r in bodies]]:
-        if person(c) and not any(t > stamp(at) for t in answers):
+        if person(c) and (latest_answer is None or latest_answer <= stamp(at)):
             got.append(waiting_record(kind, c, body, at))
     return sorted(got, key=lambda w: (stamp(w['createdAt']), w['commentId']))
 
