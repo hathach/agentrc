@@ -19,7 +19,9 @@ point, loading this file from the pinned agentrc (its `agentrc_pin.py`). One pro
                         fqbn(), and a change to the dir builds every name it has
   SMOKE_BOARDS          boards whose restoration sketch a build-contract change builds (one per image kind)
   CONTRACT_TESTS        {name: test script}; a change to `.claude/test/test_<name>.py` runs it, a HIL change
-                        every one but `build`
+                        every one but `build`. `agentrc_pin` runs as the bootstrap's `agentrc_pin.py test` from ROOT
+                        instead of its script: the canonical-copy and conformance checks, then all of .claude/test,
+                        so a selected .claude/test/test_*.py is not run again (run_tests)
   NOTHING               path prefixes that build nothing (docs, agent and repo metadata)
   EXTRA_DEPENDENCIES    libraries the examples use beyond library.properties `depends=` (CI's install list)
   CONTRACT_FILES        library files a HIL record binds by sha256 (the wrapper scripts, the agentrc pin)
@@ -78,6 +80,9 @@ PROFILE_FEATURES = ('core', 'base', 'named', 'battery')
 COMPILE_TIMEOUT = 900
 BUILD_SCRIPTS = '.claude/skills/build/scripts/'
 HIL_CONTROL = ('.claude/skills/hil-contract/scripts/', 'test/hil/')
+PIN_TEST = 'agentrc_pin'
+PIN_BOOTSTRAP = HIL_CONTROL[0] + 'agentrc_pin.py'
+DISCOVERED = r'\.claude/test/test_[^/]*\.py'   # what the bootstrap's `test` runs too: unittest discover -s .claude/test
 SOURCE_DIRS = ('src/', 'examples/', 'test/hil/')   # an untracked file here would be missing from a record's patch
 IMAGE_KIND = {'openocd': 'elf', 'jlink': 'hex', 'esptool': 'esptool'}   # what the HIL harness flashes per flasher
 BOOT_APP0 = 'tools/partitions/boot_app0.bin'   # the ESP core's otadata image its flash_args name, under the platform
@@ -1095,15 +1100,27 @@ def build_all(jobs, plan, root, properties, prepared, config=None):
 
 
 def run_tests(names):
+    """One row per selected test. With PIN_TEST selected and its bootstrap there, a selected DISCOVERED script is not
+    run again: the bootstrap's `test` ran it, and its row (coveredBy) carries that run's status."""
+    covering = PIN_TEST in names and (P.ROOT / PIN_BOOTSTRAP).exists()
     rows = []
     for name in names:
-        script = P.ROOT / P.CONTRACT_TESTS[name]
+        if name == PIN_TEST:
+            script, argv, cwd = P.ROOT / PIN_BOOTSTRAP, ['test'], P.ROOT
+        else:
+            script, argv, cwd = P.ROOT / P.CONTRACT_TESTS[name], [], None
         if not script.exists():
             rows.append({'test': name, 'status': 'error', 'firstError': f'{rel(script)} missing'})
-            continue
-        p = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, timeout=600)
-        rows.append({'test': name, 'status': 'ok' if p.returncode == 0 else 'failed',
-                     'firstError': '' if p.returncode == 0 else (p.stderr.strip().splitlines() or ['?'])[-1]})
+        elif covering and name != PIN_TEST and re.fullmatch(DISCOVERED, P.CONTRACT_TESTS[name]):
+            rows.append({'test': name, 'coveredBy': PIN_TEST})
+        else:
+            p = subprocess.run([sys.executable, str(script), *argv], capture_output=True, text=True, timeout=600, cwd=cwd)
+            rows.append({'test': name, 'status': 'ok' if p.returncode == 0 else 'failed',
+                         'firstError': '' if p.returncode == 0 else (p.stderr.strip().splitlines() or ['?'])[-1]})
+    pin = next((r for r in rows if r['test'] == PIN_TEST), None)
+    for r in rows:
+        if 'coveredBy' in r:
+            r.update(status=pin['status'], firstError=pin['firstError'])
     return rows
 
 

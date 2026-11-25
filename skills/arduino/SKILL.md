@@ -36,9 +36,11 @@ retries, recovery) apply unchanged; these scripts load its `hil_*` scripts throu
   run the first HIL sketch).
   `hil_remote.py` is a wrapper around `arduino_remote.py`.
 - Rosters `test/hil/ci.json` (the farm) and a gitignored `test/hil/local.json` (a dev PC's boards); contract tests in
-  `.claude/test/`, run by pre-commit through `agentrc_pin.py test`. A farm board names its probe (`"probe"`, the `hil`
-  skill's board registry), which supplies its flasher, under the registry's name, which is its board lock; a dev PC's
-  unregistered board keeps a flasher of its own.
+  `.claude/test/`, run by pre-commit through `agentrc_pin.py test`. `check_build.py` runs the profile's
+  `CONTRACT_TESTS` entry `agentrc_pin` the same way, the bootstrap's `test` from the checkout root, so its copy and
+  conformance checks run there too; every other entry runs its own script (`arduino_build.py`'s `run_tests`). A farm
+  board names its probe (`"probe"`, the `hil` skill's board registry), which supplies its flasher, under the registry's
+  name, which is its board lock; a dev PC's unregistered board keeps a flasher of its own.
 
 ## What every library gets
 

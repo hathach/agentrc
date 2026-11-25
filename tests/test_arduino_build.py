@@ -356,6 +356,38 @@ class Selection(Lib):
         for path in ('test/hil/ci.json', 'test/hil/sketches/probe/probe.ino'):
             self.assertEqual(ab.select([path], roster=['rig_ocd'])['tests'], ['hil', 'hil_ci'], path)
 
+    def test_run_tests_runs_the_pin_entry_as_the_bootstrap_test_and_the_rest_directly(self):
+        pin_test = '.claude/test/test_agentrc_pin.py'
+        self.patch(self.P, 'CONTRACT_TESTS', {**self.P.CONTRACT_TESTS, 'agentrc_pin': pin_test,
+                                              'outside': 'test/hil/test_outside.py'})
+        for rel in ('.claude/test/test_build.py', 'test/hil/test_outside.py', pin_test, ab.PIN_BOOTSTRAP):
+            (self.root / rel).parent.mkdir(parents=True, exist_ok=True)
+            (self.root / rel).write_text('')
+        failed = mock.Mock(returncode=1, stderr='Traceback\nerror: bootstrap copy differs\n')
+        with mock.patch.object(ab.subprocess, 'run', side_effect=[failed, mock.Mock(returncode=0, stderr='')]) as run:
+            rows = ab.run_tests(['agentrc_pin', 'build', 'outside'])
+        self.assertEqual(rows, [
+            {'test': 'agentrc_pin', 'status': 'failed', 'firstError': 'error: bootstrap copy differs'},
+            {'test': 'build', 'coveredBy': 'agentrc_pin', 'status': 'failed',
+             'firstError': 'error: bootstrap copy differs'},
+            {'test': 'outside', 'status': 'ok', 'firstError': ''}])
+        self.assertEqual([(c.args[0], c.kwargs['cwd'], c.kwargs['timeout']) for c in run.call_args_list],
+                         [([sys.executable, str(self.root / ab.PIN_BOOTSTRAP), 'test'], self.root, 600),
+                          ([sys.executable, str(self.root / 'test/hil/test_outside.py')], None, 600)])
+        (self.root / '.claude/test/test_build.py').unlink()
+        with mock.patch.object(ab.subprocess, 'run', return_value=mock.Mock(returncode=0, stderr='')):
+            self.assertEqual(ab.run_tests(['agentrc_pin', 'build'])[1],
+                             {'test': 'build', 'status': 'error', 'firstError': '.claude/test/test_build.py missing'})
+        (self.root / '.claude/test/test_build.py').write_text('')
+        with mock.patch.object(ab.subprocess, 'run', return_value=mock.Mock(returncode=0, stderr='')) as run:
+            self.assertEqual(ab.run_tests(['build']), [{'test': 'build', 'status': 'ok', 'firstError': ''}])
+        self.assertEqual(run.call_args.args[0], [sys.executable, str(self.root / '.claude/test/test_build.py')])
+        (self.root / ab.PIN_BOOTSTRAP).unlink()
+        with mock.patch.object(ab.subprocess, 'run', return_value=mock.Mock(returncode=0, stderr='')):
+            self.assertEqual(ab.run_tests(['agentrc_pin', 'build']),
+                             [{'test': 'agentrc_pin', 'status': 'error', 'firstError': f'{ab.PIN_BOOTSTRAP} missing'},
+                              {'test': 'build', 'status': 'ok', 'firstError': ''}])
+
     def test_hil_selection_names_families_the_roster_lacks(self):
         sel = ab.select(['src/ports/fa/x.cpp', 'src/fake.h'], roster=['rig_ocd'])
         self.assertEqual(sel['hil']['boards'], ['rig_ocd'])
