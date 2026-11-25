@@ -135,8 +135,8 @@ STALLED = {
                     "human's to answer or resolve, so report each to the user and never answer, resolve or fix it on the "
                     "run's behalf; relaunch from the stateRef once each clears: an inline comment once its thread is resolved "
                     "or holds a later reply (a person's then waits in its place), an issue comment or review body once the PR's "
-                    'author or the posting account posted an issue comment or submitted a review after it, never on another '
-                    "person's reply (#591)",
+                    'author or the posting account posted an issue comment or submitted a review after it, after an issue '
+                    "comment's last edit, never on another person's reply (#591)",
     'harvest-failed': "harvest.py failed twice in a row (`detail`): fix what its error names, such as a module the "
                       "launch's interpreter lacks, or relaunch once a passing cause (a head still moving, a GitHub outage) cleared",
     'ci-collect-failed': "collect.py failed the same way on two cycles running (`detail`): fix what its error names, such as an "

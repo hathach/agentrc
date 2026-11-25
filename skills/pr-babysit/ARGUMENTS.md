@@ -36,8 +36,8 @@ A key not listed here throws before anything runs.
   an unpublished `adoptHead` included, which a harvest before its push checks
   (#591). No argument answers it: a relaunch passes an inline comment once its
   thread is resolved or holds a later reply, and an issue comment or review
-  body once the PR's author or the posting account answered after it, never
-  on another person's reply (`SKILL.md`).
+  body once the PR's author or the posting account answered after it, after
+  an issue comment's last edit, never on another person's reply (`SKILL.md`).
 - `autoRun`: the reviewers that run on every push and gate done; default
   `reviewers` without `copilot` and `code-scanning`, which are only harvested.
   Every reviewer is reported with its state; only these are waited on, which is

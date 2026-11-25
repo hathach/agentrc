@@ -70,11 +70,13 @@ A head whose only CI left is Actions runs awaiting a maintainer's approval (coll
 `ci-awaiting-approval` at the CI lane's read, naming them in `awaitingApproval`; nothing here approves or re-runs them.
 A comment by a person, an owner, member or collaborator other than the PR's author and the posting account, that still
 waits for an answer (harvest.py's `waiting`: an unresolved thread whose last word is theirs, or an issue comment or
-review body neither the author nor the posting account spoke after) stops the launch `human-review` right after the
-harvest, before anything is fixed, answered, pushed or counted done, naming each in `waiting` (#591); it is the
-human's to answer or resolve, never the run's. A relaunch passes an inline comment once its thread is resolved or holds
-a later reply, a person's then waiting in its place, and an issue comment or review body once the PR's author or the
-posting account posted an issue comment or submitted a review after it; another person's reply leaves those waiting.
+review body neither the author nor the posting account spoke after, an issue comment's last edit counting as its time)
+stops the launch `human-review` right after the harvest, before anything is fixed, answered, pushed or counted done,
+naming each in `waiting` (#591); it is the human's to answer or resolve, never the run's. A relaunch passes an inline
+comment once its thread is resolved or holds a later reply, a person's then waiting in its place, and an issue comment
+or review body once the PR's author or the posting account posted an issue comment or submitted a review after it, after
+an issue comment's last edit (GitHub's REST API gives a review no edit time); another person's reply leaves those
+waiting.
 An unpublished `adoptHead` gets the same check from a harvest before its push: a stop there, `harvest-failed` and
 `github-rate-limited` included, leaves it unpushed, the state at its base and the checkout at it, and names it in
 `adoptionHeld`; a relaunch from the returned stateRef with the same `adoptHead` retries it.

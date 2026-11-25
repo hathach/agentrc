@@ -55,9 +55,10 @@ neither the PR's author nor the authenticated gh account (the one pr-babysit pos
 it is the last comment of its review thread (a reply in a bot's thread too) and the thread is unresolved, read through
 GraphQL reviewThreads, keyed by each thread's first comment; a thread GraphQL does not list reads unresolved. An issue
 comment or a non-empty submitted review body waits while neither the PR's author nor that account has posted an issue
-comment or submitted a review after it. Each record: kind, commentId, author, authorAssociation, path and line (null
-but for an inline comment), createdAt, url, digest (sha256 of the body, 12 hex) and excerpt (its first EXCERPT
-characters, whitespace folded). GraphQL is asked only when such a person left a comment at all.
+comment or submitted a review after it, after an issue comment's last edit (`updated_at`; a review gives no edit time).
+Each record: kind, commentId, author, authorAssociation, path and line (null but for an inline comment), createdAt, url,
+digest (sha256 of the body, 12 hex) and excerpt (its first EXCERPT characters, whitespace folded). GraphQL is asked
+only when such a person left a comment at all.
 
 --probe prints only headSha, observedAt, headEventAt, headEventEvidence, bots and fingerprint, sealed (facts.sealed): what a workflow waiting out
 CodeRabbit's rate limit compares with its last full harvest (#359). It reads the waiting comments too, which its
@@ -716,9 +717,11 @@ def waiting(repo, n, inline, issue, reviews):
     answers += [stamp(r['submitted_at']) for r in reviews
                 if (r['user']['login'] or '').lower() in answerers and r.get('state') in REVIEW_SUBMITTED and r.get('submitted_at')]
     latest_answer = max(answers, default=None)
-    for kind, c, body, at in [*[('issue', c, c.get('body'), c['created_at']) for c in issue],
-                              *[('review-body', r, r['body'], r['submitted_at']) for r in bodies]]:
-        if person(c) and (latest_answer is None or latest_answer <= stamp(at)):
+    # An issue comment needs an answer after its last edit (`updated_at`, which also moves on changes that are no edit:
+    # an extra stop, never a missed one); REST gives a review no edit time, so its body counts from its submission.
+    for kind, c, body, at, said in [*[('issue', c, c.get('body'), c['created_at'], c['updated_at']) for c in issue],
+                                    *[('review-body', r, r['body'], r['submitted_at'], r['submitted_at']) for r in bodies]]:
+        if person(c) and (latest_answer is None or latest_answer <= stamp(said)):
             got.append(waiting_record(kind, c, body, at))
     return sorted(got, key=lambda w: (stamp(w['createdAt']), w['commentId']))
 

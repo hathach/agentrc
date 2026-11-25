@@ -932,6 +932,15 @@ class Waiting(unittest.TestCase):
             with self.subTest(name):
                 self.assertEqual(self.ids([], [ask, *issue], [body, *reviews]), want)
 
+    def test_an_issue_comment_edited_after_its_answer_waits_again(self):
+        answer = said(71, self.AUTHOR, '2026-11-20T11:00:00Z')
+        after = dict(said(70, self.MAINTAINER, '2026-11-20T10:00:00Z'), body='Still broken', updated_at='2026-11-20T12:00:00Z')
+        got, _ = self.read([], [after, answer])
+        self.assertEqual([(w['commentId'], w['createdAt'], w['digest']) for w in got], [(70, '2026-11-20T10:00:00Z', harvest.digest('Still broken'))])
+        before = dict(after, updated_at='2026-11-20T10:30:00Z')
+        self.assertEqual(self.ids([], [before, answer]), [], 'answered after the edit')
+        self.assertEqual(self.ids([], [dict(after, updated_at='2026-11-20T11:00:00Z'), answer]), [('issue', 70)], 'an answer at the edit is not after it')
+
     def test_a_long_body_is_cut_to_an_excerpt_and_its_digest_is_the_whole_bodys(self):
         long = 'word  \n' * 100
         got, _ = self.read([], [said(70, self.MAINTAINER, EVENT, long)])
