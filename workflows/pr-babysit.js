@@ -2915,6 +2915,8 @@ const ciLaneRun = async (cycle, lanes, entry) => {
     lanes.judgeHumans = judgeRead
     return report
   }
+  // The review lane may have pushed, or been held by its own read, while this one was out.
+  if (superseded()) return report
   const judged = await agent(
     `${IN_CHECKOUT}Judge the failing CI checks of PR #${args.pr} of ${repo} at head ${report.headSha} per your procedure. ` +
     `The collector's evidence for them is in ${ev.detail}. Run any ci-rerun script under ${PY}. The checks, each needing exactly one entry in your reply: ` +

@@ -514,8 +514,9 @@ async function run(opts = {}) {
       return sealLine({ headSha, observedAt, headEventAt, headEventEvidence, fingerprint, bots, humanWaiting: [], ...(opts.probe || {}) })
     }
     // harvest.py --reviewers '' --probe (#591): opts.humans(label), or the list, is what waits; null a dead relay, { error } its error line.
+    // opts.humans may be async, to hold one read until another lane has acted.
     if (label.startsWith('humans#') || label.startsWith('adopt:humans')) {
-      const w = typeof opts.humans === 'function' ? opts.humans(label) : opts.humans === undefined ? [] : opts.humans
+      const w = typeof opts.humans === 'function' ? await opts.humans(label) : opts.humans === undefined ? [] : opts.humans
       if (w === null || w.error) return w
       return sealLine({ headSha: head, observedAt: at(0), headEventAt: null, headEventEvidence: 'no reviewer auto-runs, so no head event is read',
         fingerprint: '||stub', bots: [], humanWaiting: structuredClone(w) })
@@ -8374,6 +8375,25 @@ test('a person\'s comment arriving while the CI lane reads its inventory and evi
   const clear = await run(opts)
   assert.ok(clear.labels.indexOf('humans#1-judge') < clear.labels.indexOf('ci:judge#1'), clear.labels.join(', '))
   assert.equal(clear.result.history[0].ciReran, 1, 'both reads clear, the judge re-runs it')
+})
+
+test('a review push or hold landing while the CI judge reads the people\'s comments leaves the judge undispatched (#591)', async () => {
+  // The judge's own read waits until the review lane has pushed, or been held by its read before the push.
+  const holdJudgeUntil = (step, trace, review) => async (label) => {
+    if (label.startsWith('humans#1-judge')) await afterReviewLane(step)(trace)
+    return label.startsWith('humans#1-review') ? review : []
+  }
+  for (const [name, step, review] of [['pushed', 'push#1-review', []], ['held', 'humans#1-review', [OBJECTION]]]) {
+    const trace = []
+    const { result, labels } = await run({ reviews: oneValid, ci: redWith(RIG).ci, judge: rerunAll, args: { autoPush: true, maxCycles: 1 },
+      trace, humans: holdJudgeUntil(step, trace, review) })
+    const why = `${name}: ${labels.join(', ')}`
+    assert.ok(labels.indexOf('humans#1-judge') < labels.indexOf(step), why)
+    assert.equal(labels.some(l => /^push#/.test(l)), name === 'pushed', why)
+    if (name === 'held') assert.equal(result.reason, 'human-review-pending', why)
+    assert.deepEqual(labels.filter(l => l.startsWith('ci:judge#')), [], why)
+    assert.equal(result.history[0].ciReran, undefined, why)
+  }
 })
 
 test('a review push held for a person\'s comment holds the CI judge too, though the cycle\'s read was clear (#591)', async () => {
