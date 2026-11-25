@@ -33,16 +33,29 @@ sudo cat /proc/<pid>/stack          # never opens the node, so it cannot block
 
 | Stack shows | Meaning | Go to |
 |---|---|---|
-| `usbdev_ioctl` + a driver module (`[usbtest]`) | **owner, holds the lock** | rung 3 — terminal |
+| `test_queue [usbtest]` → `usbtest_ioctl` → `usbdev_ioctl` | **owner, holds the lock**, waiting on queued transfers | rung 1 (DUT), then recheck |
+| `usbdev_ioctl` + another driver-module wait | **owner, holds the lock** | inspect the wait; rung 3 — terminal if the permitted reset/disconnect cannot release it |
 | `usbdev_ioctl`, no driver frames | owner waiting on a URB | rung 1 (DUT) / rung 2 (probe) |
 | `usbdev_open`, sysfs reads | victim | ignore |
 | `tee .../usbtest/bind`, `unbind` | **victim that SPREADS it** | stop issuing them |
-| `hub_event` in a kworker | teardown stuck behind an owner | rung 3 |
+| `hub_event` in a kworker | teardown stuck behind an owner | find and recover the owner first; rung 3 if its wait cannot be released |
 
 Driver-bind writes are not passive: `__device_driver_lock` (drivers/base/dd.c)
 takes `device_lock()` uninterruptibly **and `device_lock(parent)`**, because
 `usb_bus_type` sets `.need_parent_lock = true` (driver.c:2048) — each one holds
 the HUB's lock, which is how one wedged port takes a whole bus down.
+
+A `test_queue` owner waits with no timeout for its queued URBs (usbtest.c:2126,
+v6.12.113); `complicated_callback` stops resubmitting after a failed URB and
+completes the wait once none is pending (usbtest.c:1926-1968). One occurrence
+(ci.lan, 2026-11-24, tinyusb's `ea4088_quickstart`, `testusb -t 28`) cleared at
+rung 1 with no reboot. In this occurrence the reset was followed by disconnect,
+the queue's error report (`during the test, 32 errors out of 0`, with `-g 32`
+queued URBs on test 28, a bulk read) and owner exit, consistent with outstanding
+transfers completing or failing until the callback released the wait (rung 1's
+mechanism). Count it cleared only when the owner exits, the DUT re-enumerates
+and a fresh D-state check finds no holder; a flasher exit or a disconnect line
+alone is not enough. Otherwise go on to rung 3.
 
 Map the holder to a busport with **lock-free attrs only** (`devnum`, `idVendor`,
 `idProduct` are `usb_descriptor_attr*`, plain `sysfs_emit`, sysfs.c:688-705):
@@ -122,9 +135,12 @@ Reset **before** park-flash: non-destructive (the firmware under test survives
 for autopsy), no flash wear, and no bad park image — a `wfe`/`wfi` park has
 bricked SWD on mimxrt1064_evk and max32666fthr through a power cycle.
 `ResetTarget` measures 128-129 ms; cleared 57 → 0, 26 → 0 and 5 → 0 D-state
-processes, single shot each. Mechanism: chip reset drops the pull-up →
-`usb_hcd_flush_endpoint` unlinks the URB `-ESHUTDOWN` (hcd.c:1783) → the
-completion fires → the ioctl returns → the lock releases.
+processes, single shot each. Mechanism: chip reset drops the pull-up → the
+device detaches → the outstanding URBs complete or fail → the completion fires →
+the ioctl returns → the lock releases. A disconnect does not flush them under the
+lock: `usb_disconnect` reaches `usb_hcd_flush_endpoint` (`-ESHUTDOWN`, hcd.c:1783)
+only after `usb_lock_device`, so that flush runs once the owner has let go (hub.c
+`usb_disconnect`; usbtest.c's warning above `usbtest_ioctl`).
 
 Works on i.MX RT (`USBCMD.RS` = 0 detaches, RT1050 RM Rev 3 p.2453) **and on
 DWC2** — measured 2026-08-16 on stm32f407disco: `r; g` gave
@@ -191,7 +207,8 @@ the request runs under the hub's lock, so the script refuses a target whose seri
 does not answer, and the rungs above own it. Its guards, timing and the hub-dependent
 VBUS caveats are `usb_recover.sh`'s usage and its hub-cycle comment.
 
-**Rung 3 — terminal case: a driver ioctl that OWNS the lock.** No software cure:
+**Rung 3 — terminal case: a driver ioctl that OWNS the lock** in a wait the permitted
+reset/disconnect cannot release (section 1's table). No software cure:
 the task is uninterruptible and SIGKILL is queued, not delivered. Reboot with
 **sysrq**, never `reboot(2)` — a graceful reboot runs `device_shutdown()`, which
 takes every device lock and stalls on the wedged one.
