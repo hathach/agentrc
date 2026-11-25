@@ -23,7 +23,8 @@ BLOCKED, when it merges with --admin). Unknown or unreadable evidence is a block
 
 Without --merge nothing is written. With it and no blocker, it runs
 `gh pr merge N -R REPO --squash --match-head-commit HEAD --subject "<title> (#N)" --body ""`, with --admin only on
-BLOCKED, and reads the PR back. Only the head is enforced by GitHub at the merge; the rest is this re-read.
+BLOCKED, and reads the PR back. Only the head is enforced by GitHub at the merge; the rest is this re-read, the
+harvest read again after the PR's last read, so a comment posted between that harvest and the merge is not seen.
 
 stdout ends with one JSON line {pr, checkedHead, outcome, blockers, admin, waived, accepted, requirements, mergeCommit,
 mergedHead, closingIssues, detail, seal}: waived is the bots --waive named, the record of the owner's waiver; accepted
@@ -354,12 +355,16 @@ def collect(argv):
     if (last['state'], last['headRefOid'], last['mergeStateStatus']) != ('OPEN', head, pr['mergeStateStatus']):
         blockers.append(f"github: the PR changed during the checks: {last['state']}, head {last['headRefOid']}, merge state {last['mergeStateStatus']}")
     blockers += [b for b in pr_blockers(last, url, a.base, facts['state'], unstable=bool(accepted) and not ci) if b not in blockers]
+    if not blockers:
+        # Harvested again after the last read: a comment posted during the CI inspection waits for its answer too.
+        blockers += review_blockers(repo, n, facts['fingerprint'], head, waived)
     admin = last['mergeStateStatus'] == 'BLOCKED'
     # What GitHub reported and the required checks read: the evidence behind an --admin merge.
     requirements = {'mergeStateStatus': last['mergeStateStatus'], 'mergeable': last['mergeable'],
                     'reviewDecision': last.get('reviewDecision'), 'requiredChecks': checks}
     if blockers or not a.merge:
         return answer(n, head, 'not-ready' if blockers else 'ready', blockers, admin=admin and not blockers, pr=last, requirements=requirements)
+    # A comment posted between that harvest and this request is not seen: only the head is enforced at the merge.
     cmd = ['gh', 'pr', 'merge', str(n), '-R', repo, '--squash', '--match-head-commit', head,
            '--subject', f"{last['title']} (#{n})", '--body', '', *(['--admin'] if admin else [])]
     code, out, err = attempt(*cmd)

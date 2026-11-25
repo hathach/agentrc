@@ -128,8 +128,8 @@ class MergeTest(unittest.TestCase):
         got = self.run_it()
         self.assertEqual((got['outcome'], got['blockers'], got['admin'], got['checkedHead']), ('ready', [], False, HEAD), got)
         self.assertEqual(self.world.merges, [])
-        self.assertEqual(self.world.harvested, [['--pr', '7', '--reviewers', 'coderabbit,copilot,greptile', '--auto-run', 'coderabbit,greptile', '--repo', 'o/r']],
-                         "the launch's own harvest, against the PR's repository")
+        self.assertEqual(self.world.harvested, [['--pr', '7', '--reviewers', 'coderabbit,copilot,greptile', '--auto-run', 'coderabbit,greptile', '--repo', 'o/r']] * 2,
+                         "the launch's own harvest, against the PR's repository, before CI and after the last PR read")
         self.assertEqual(self.world.ran[0][2:], ['inventory', '--repo', 'o/r', '--pr', '7', '--head', HEAD], 'no ignored check')
 
     def test_a_merge_runs_the_exact_command_and_reads_it_back(self):
@@ -336,6 +336,14 @@ class MergeTest(unittest.TestCase):
                                                          rf'resolve: 4682479462 by HiFiPhile \({re.escape(url)}\)$')
         self.world.fresh['waiting'] = []
         self.assertEqual(self.run_it()['outcome'], 'ready', 'none waiting')
+
+    def test_a_comment_posted_during_the_ci_inspection_blocks_the_merge(self):
+        late = {**self.world.fresh, 'waiting': [{'commentId': 9, 'author': 'HiFiPhile', 'url': 'https://github.com/o/r/pull/7#issuecomment-9'}]}
+        answers = [copy.deepcopy(self.world.fresh), late]
+        with mock.patch.object(merge.harvest, 'collect', lambda argv: self.world.harvested.append(argv) or answers.pop(0)):
+            got = self.run_it(None, '--merge')
+        self.assertBlocked(got, r'^human-review: 1 comment\(s\) .*9 by HiFiPhile')
+        self.assertEqual(len(self.world.harvested), 2, 'read again after the last PR read')
 
     def test_only_the_owners_waiver_drops_a_bot_and_never_every_bot(self):
         # #292: Greptile left out of the launch at the owner's word; CodeRabbit reviewed the head.
