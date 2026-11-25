@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Where each requested review bot stands on a PR's head, and every comment its reviewers left.
 
-  harvest.py --pr N --reviewers copilot,coderabbit,greptile,code-scanning --auto-run coderabbit,greptile [--repo OWNER/REPO] [--probe | --carry JSON]
+  harvest.py --pr N --reviewers copilot,coderabbit,greptile,code-scanning --auto-run coderabbit,greptile [--repo OWNER/REPO] [--probe | --carry-file FILE]
 
 --auto-run names the bots settled from their artifacts, only coderabbit and greptile. Copilot is read
 from its newest submitted review on the head; any other reviewer is `harvested`, its state not read.
@@ -39,7 +39,8 @@ and its url shows it (`gh api repos/<repo>/issues/comments/<commentId>` for the 
 head, or a comment endpoint, plus facts.py's rateLimit when GitHub refused gh for a rate limit. A read GitHub answered
 HTTP 502, 503 or 504 is made again after lib/gh_retry.py's waits first; a write through gh_json, never.
 
---carry takes a JSON list of {commentId, digest, judgedSha, paths}: comments whose findings were all settled at
+--carry-file names a UTF-8 file holding a JSON list of {commentId, digest, judgedSha, paths}, which pr-babysit stages
+(facts.py stage) so no model retypes it: comments whose findings were all settled at
 judgedSha, paths the repository-relative files their verdicts rest on (null or [] when unbounded). The full output then
 has carry: one record per entry, {commentId, eligible, reason}, plus the comment's current commentDigest,
 commentAliases (when it has some) and source when eligible. An entry is eligible only when its comment is in this
@@ -48,8 +49,10 @@ or not, since judgedSha; unbounded paths only on judgedSha the head, with a clea
 Any git failure, missing commit or path outside the repository makes it ineligible, never eligible. An eligible
 comment's body is left out like the two below, bodyOmitted "carried": the caller restores its findings.
 
---probe prints only headSha, observedAt, headEventAt, headEventEvidence, bots and fingerprint, sealed (facts.sealed): what a workflow waiting out
-CodeRabbit's rate limit compares with its last full harvest (#359).
+--probe prints only headSha, observedAt, headEventAt, headEventEvidence, bots and fingerprint: what a workflow waiting out
+CodeRabbit's rate limit compares with its last full harvest (#359). Either line is sealed (facts.sealed); under
+AGENTRC_EMIT a full one holds, in place of comments, their index ({commentId, digest, aliases?, source}) and
+readingSha256 of <AGENTRC_EMIT>.reading.json, the whole reading as UTF-8 JSON indented one space (#582).
 """
 
 import base64
@@ -69,7 +72,7 @@ except ImportError:
     yaml = None
 
 sys.path.insert(0, str(Path(__file__).parent))
-from facts import FULL_SHA, Parser, RateLimited, Unusable, attempt, bind_repo, checkout_top, report, run, status  # noqa: E402
+from facts import EMIT_TO, FULL_SHA, Parser, RateLimited, Unusable, attempt, bind_repo, checkout_top, creating, report, run, sealed, status, write_beside  # noqa: E402
 
 PROBE = ('headSha', 'observedAt', 'headEventAt', 'headEventEvidence', 'bots', 'fingerprint')
 # reply.py checks a comment against the same digest, so both skills share one definition.
@@ -682,20 +685,23 @@ def observe(repo, n, reviewers, auto):
 CARRY_KEYS = {'commentId', 'digest', 'judgedSha', 'paths'}
 
 
-def carry_entries(text):
-    """--carry's list, or Unusable: the workflow built it, so a malformed one is no entry to judge."""
+def carry_entries(path):
+    """--carry-file's list, or Unusable: the workflow built it, so a malformed one is no entry to judge."""
     try:
-        entries = json.loads(text)
-    except ValueError as e:
-        raise Unusable(f'--carry is not JSON: {e}')
+        with open(path, encoding='utf-8') as f:
+            entries = json.load(f)
+    except OSError as e:
+        raise Unusable(f'cannot read --carry-file {path}: {e.strerror}')
+    except ValueError as e:  # UnicodeDecodeError included
+        raise Unusable(f'--carry-file {path} is not UTF-8 JSON: {e}')
     shaped = isinstance(entries, list) and all(
         isinstance(e, dict) and set(e) == CARRY_KEYS and type(e['commentId']) is int and isinstance(e['digest'], str) and
         isinstance(e['judgedSha'], str) and FULL_SHA.match(e['judgedSha']) and
         (e['paths'] is None or isinstance(e['paths'], list) and all(isinstance(x, str) for x in e['paths'])) for e in entries)
     if not shaped:
-        raise Unusable('--carry must be a JSON list of {commentId, digest, judgedSha (full SHA), paths (list of strings or null)}')
+        raise Unusable('--carry-file must hold a JSON list of {commentId, digest, judgedSha (full SHA), paths (list of strings or null)}')
     if len({e['commentId'] for e in entries}) != len(entries):
-        raise Unusable('--carry names a comment twice')
+        raise Unusable('--carry-file names a comment twice')
     return entries
 
 
@@ -722,7 +728,7 @@ def unchanged_since(judged, paths, head):
 
 
 def carried(entries, harvested, head):
-    """One record per --carry entry: whether its comment keeps its settled findings. An eligible comment's body is
+    """One record per --carry-file entry: whether its comment keeps its settled findings. An eligible comment's body is
     omitted from `harvested` (bodyOmitted "carried"): the caller restores its findings, so nobody reads it."""
     if not entries:
         return []
@@ -758,11 +764,11 @@ def collect(argv):
     p.add_argument('--auto-run', default='')
     p.add_argument('--repo')
     p.add_argument('--probe', action='store_true')
-    p.add_argument('--carry')
+    p.add_argument('--carry-file')
     a = p.parse_args(argv)
-    if a.probe and a.carry is not None:
-        raise Unusable('--probe reads no comments, so it takes no --carry')
-    entries = carry_entries(a.carry) if a.carry is not None else []
+    if a.probe and a.carry_file is not None:
+        raise Unusable('--probe reads no comments, so it takes no --carry-file')
+    entries = carry_entries(a.carry_file) if a.carry_file is not None else []
     reviewers = [r for r in a.reviewers.split(',') if r]
     auto = [r for r in a.auto_run.split(',') if r]
     unknown = [r for r in reviewers if r not in KNOWN] + [r for r in auto if r not in SETTLED]
@@ -780,5 +786,19 @@ def collect(argv):
     raise Unusable(f'the head moved during two reads in a row (now {again}); harvest again once it settles')
 
 
+def line(argv):
+    """collect's line sealed; under AGENTRC_EMIT a full one goes to its reading file, the file the validator reads in
+    pieces, and the line keeps only the comments' index: no data module or prompt need hold every body (#582)."""
+    facts = collect(argv)
+    if EMIT_TO is None or 'comments' not in facts:
+        return sealed(facts)
+    text = json.dumps(facts, ensure_ascii=False, indent=1) + '\n'
+    with creating():
+        write_beside('.reading.json', text)
+    index = [{k: c[k] for k in ('commentId', 'digest', 'aliases', 'source') if k in c} for c in facts['comments']]
+    rest = {k: v for k, v in facts.items() if k != 'comments'}
+    return sealed({**rest, 'index': index, 'readingSha256': hashlib.sha256(text.encode()).hexdigest()})
+
+
 if __name__ == '__main__':
-    sys.exit(report(collect, sys.argv[1:], seal='--probe' in sys.argv[1:], limits=True))
+    sys.exit(report(line, sys.argv[1:], limits=True))

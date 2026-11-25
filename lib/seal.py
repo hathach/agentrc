@@ -132,13 +132,22 @@ def emit(line, code):
 
 
 def write_module(fd, path, line):
+    write_text(fd, module_text(path, line))
+
+
+def write_text(fd, text):
     with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as f:
-        f.write(module_text(path, line))
+        f.write(text)
+
+
+def write_beside(suffix, text):
+    """Write text as UTF-8 at EMIT_TO + suffix, created as claim() creates EMIT_TO, so an earlier run's file is never
+    overwritten (OSError instead), and return that path."""
+    path = EMIT_TO + suffix
+    write_text(create(path), text)
+    return path
 
 
 def emit_beside(suffix, line):
-    """Write line as a data module at EMIT_TO + suffix, created as claim() creates EMIT_TO, so an earlier run's file is
-    never overwritten (OSError instead), and return that path: for a line one module cannot hold."""
-    path = EMIT_TO + suffix
-    write_module(create(path), path, line)
-    return path
+    """write_beside of line as a data module: for a line one module cannot hold."""
+    return write_beside(suffix, module_text(EMIT_TO + suffix, line))

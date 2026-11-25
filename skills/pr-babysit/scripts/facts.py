@@ -28,7 +28,7 @@ except ImportError:  # Windows
     import msvcrt
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
-from seal import CHUNKS, EMIT_TO, canonical, emit, emit_beside, fnv1a, module_text, rate_limit, sealed, stdin_bytes, unpacked, utc  # noqa: E402,F401  re-exported for the scripts
+from seal import CHUNKS, EMIT_TO, canonical, emit, emit_beside, fnv1a, module_text, rate_limit, sealed, stdin_bytes, unpacked, utc, write_beside  # noqa: E402,F401  re-exported for the scripts
 import gh_repo  # noqa: E402
 import windows  # noqa: E402
 from gh_repo import HOST, REPO, github_repo  # noqa: E402,F401  re-exported for the scripts
@@ -54,6 +54,15 @@ def attribution_in(text):
 
 class Unusable(Exception):
     pass
+
+
+@contextmanager
+def creating():
+    """A file beside AGENTRC_EMIT's that could not be created (seal.write_beside, emit_beside) as Unusable naming it."""
+    try:
+        yield
+    except OSError as e:
+        raise Unusable(f'cannot create {e.filename}: {e.strerror}') from None
 
 
 class RateLimited(Unusable):
