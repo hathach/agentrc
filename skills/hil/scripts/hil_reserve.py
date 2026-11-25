@@ -29,28 +29,49 @@ a roster identity, or when it is a hub (bDeviceClass 09) whose children are all 
 empty hub, an unreadable class, a node without an identity, an unmatched identity, a tree
 that differs between the walks, or a walk over budget refuses, naming each.
 
-run: check (hub-cycle: under the parent hub, and the target must not be a hub), take every
-lock (all-or-nothing), check again, run
+run: the work is a keeper's, a child in its own session (exec'd afresh without KEEPER_ENV_DROP
+when it started with one, so neither hc nor a runner's job-end cleanup ends it) and a child
+subreaper, which outlives this foreground: the foreground only relays the keeper's output
+(through unlinked spool files, never a pipe a descendant could hold), forwards SIGINT, SIGTERM
+and SIGHUP to it, gives it the go, and exits with the status it reports. The keeper checks
+(hub-cycle: under the parent hub, and the target must not be a hub), takes every lock on the
+host (all-or-nothing): every roster's and every name already in the lock dir, with lock
+admission closed (hil_lock.close_admission) so no taker running that hil_lock creates one until
+it ends; checks again, refusing a name created meanwhile by an older one; arms the host fence
+(hil_lock.arm_fence) and, once the foreground's go arrives within ACK_WAIT, runs
 `sudo -n <usb-kernel-recover>/scripts/usb_recover.sh <verb> <busport> <serial>` (the rig's
 /usr/local/sbin/usb_recover when installed) with
 the target's sysfs serial, or its udev one when sysfs did not answer (the script then warns
-and proceeds, as its own guard says), then validate: the command exited 0, no descendant
-survives (this process is a child subreaper, so orphans reparent to it), and the subtree is
+and proceeds, as its own guard says). Then it reaps for one budget until no child is left
+(ECHILD: every orphan of the command reparents to it, so that proves the subtree ended) and
+validates: the command exited 0 and the subtree is
 back: every pre-operation node with its sysfs serial readable and matching its identity (a
 udev record is admission evidence, never restoration evidence), nothing new, all of it
-covered. That restoration check repeats twice a second until it holds or one budget has
-passed since the command ended, every read bounded by that same deadline, since siblings
+covered. That restoration check repeats twice a second until it holds or one more budget has
+passed, every read bounded by that same deadline, since siblings
 re-enumerate one after another after the target. Only a restored subtree releases the
-locks cleanly, and only restoration gaps may clear by waiting: a non-zero exit, a survivor or
+locks cleanly, and only restoration gaps may clear by waiting: a non-zero exit or
 a signal stays a blocker, except that an exit 3 (the script refused before its first
 mutation) with an unchanged subtree, no survivor and no noted signal releases and refuses.
-Any other outcome is a blocker that ends with this run (agentrc#464): the BLOCKER line names
-the problems, hil_lock.end_failed logs them in every board's cleanup log, which the next task
-on each board reports, and every lock is released. A survivor is named, not waited for; it
-reparents to init once this process exits, and nothing can recheck it, so its logged failure
-stays open until an operator acknowledges it (`hil_lock.py resolve`). A reservation killed
-outright leaves its records, which the next task on each board logs. Exit 0 released, 1
-blocker or refused, 2 usage.
+With no descendant left, any other outcome is a blocker that ends with this run (agentrc#464):
+the fence is cleared, the BLOCKER line names the problems, hil_lock.end_failed logs them in
+every board's cleanup log, which the next task on each board reports, and every lock is
+released. A descendant still alive after the first budget (a survivor, named from /proc) keeps
+the host instead, whatever else happened: the blocker is logged on every board with the
+survivors as an `unrecheckable` receipt, so it stays open until an operator acknowledges it
+(`hil_lock.py resolve`), and the keeper rewrites every record as a cleanup holder (`role`, and
+a `reservation` whose `phase` is `survivors`), so every taker refuses at once
+(hil_lock.RecoveryBlocked), prints the BLOCKER line with its token, reports exit 1, and keeps
+every flock, admission and the fence. Once it reaped every descendant it marks the fence and
+the records `ended`, which a process ending does not prove restored: only
+`hil_lock.py release --token <token>` then releases, after checking them, and the keeper,
+checking again, clears the records, then the fence, then the flocks and admission. A fence
+that cannot be cleared keeps the host the same way. The fence refuses every take and every new
+lock name once its keeper is gone (hil_lock.FenceHeld): a keeper killed after arming it, its
+descendants maybe alive, leaves the host refusing until it reboots, or, once it had marked the
+fence ended, until `release --token` clears it. A keeper killed before arming it, or a
+reservation of a helper before it, leaves its records, which the next task on each board
+logs. Exit 0 released, 1 blocker or refused, 2 usage, 130 a signal before the command.
 
 Controller (pci-rebind, pci-bind; agentrc#236): the target is a PCI function, refused unless it
 is a USB controller (class 0x0c03) whose vendor, device, subsystem ids and class read, with a
@@ -59,13 +80,13 @@ root hubs in its PCI directory, covered by the controller itself, and every devi
 buses, under the same coverage rules. An unbind/bind renumbers those buses (17 and 18 came back
 as 1 and 2), so each node is keyed by its root hub's speed and its port path (`480M-2.7`), and
 two root hubs of one speed, or one whose speed does not read, refuse. A dead controller may show
-few devices or none, so its walk cannot reveal a missing roster: the hold is every roster's locks
-plus every lock name already in the lock dir, taken under hil_lock.close_admission: while the
-run lasts no new lock file is created by a taker running that hil_lock (hil_lock.AdmissionClosed,
-a BoardLocked a board task waits out), so the inventory is complete for those. A taker on an
-older hil_lock, a consumer pinned before it, can still create a name: the recheck under the hold
-refuses one it sees, and one created after the recheck goes unheld, so every consumer on the host
-must be pinned at or after this agentrc before a controller operation runs.
+few devices or none, so its walk cannot reveal a missing roster; the hold is every lock on the
+host, as for every verb: while the run lasts no new lock file is created by a taker running that
+hil_lock (hil_lock.AdmissionClosed, a BoardLocked a board task waits out), so the inventory is
+complete for those. A taker on an older hil_lock, a consumer pinned before it, can still create a
+name: the recheck under the hold refuses one it sees, and one created after the recheck goes
+unheld, and it never checks the fence, so every consumer on the host must be pinned at or after
+this agentrc before any `run`.
 `sudo -n <usb_recover> <verb> <pciaddr> [driver]` (pci-bind's `--driver`, else the helper tries
 xhci-pci-renesas, then xhci_hcd) is never signalled: SIGINT/SIGTERM/SIGHUP during it are
 noted and ignored, since a rebind cut between its unbind and bind strands the controller, and
@@ -83,15 +104,18 @@ rig's root-owned /usr/local/sbin/usb_recover, which wins over the checkout's, mu
 (hil-farm-setup) from an agentrc with exit 3 for pci refusals; an older copy exits 1 for a
 refusal before the unbind, which ends as a blocker on every board, naming that helper.
 
-Signals: SIGINT/SIGTERM/SIGHUP before the command release the untouched reservation and
-exit 130; during a port command SIGINT/SIGTERM are forwarded to its process group (a
-controller command's never are, above), while SIGHUP (a lost terminal or SSH session, not a
-request to abort) is noted and ignored so the mutation completes; afterwards all three are
-noted and ignored, so the reconciliation completes and its outcome is logged. The command
-starts with no signal blocked, so its own traps see what is forwarded. A command that cannot be
-started at all releases the reservation and refuses.
+Signals, as the foreground forwards them to the keeper: SIGINT/SIGTERM/SIGHUP before the
+command release the untouched reservation and exit 130; during a port command SIGINT/SIGTERM
+are forwarded to its process group (a controller command's never are, above), while SIGHUP (a
+lost terminal or SSH session, not a request to abort) is noted and ignored so the mutation
+completes; afterwards all three are noted and ignored, so the reconciliation completes and its
+outcome is logged. A foreground killed outright leaves the keeper to finish on its own: before
+the go it runs nothing and releases. The command starts with no signal blocked, stdin
+/dev/null, so its own traps see what is forwarded. A command that cannot be started at all
+releases the reservation and refuses.
 """
 import argparse
+import codecs
 import ctypes
 import glob
 import importlib.util
@@ -99,9 +123,12 @@ import json
 import os
 import re
 import secrets
+import select
 import signal
 import sys
+import tempfile
 import time
+import traceback
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FILES = ('skills/hil/scripts/hil_load.py', 'skills/hil/scripts/hil_lock.py', 'skills/hil/scripts/hil_process.py',
@@ -160,7 +187,11 @@ INSTALLED_RECOVER = '/usr/local/sbin/usb_recover'
 RECOVER_SCRIPT = INSTALLED_RECOVER if hil_root.present(INSTALLED_RECOVER) else \
     os.path.normpath(os.path.join(HERE, '..', '..', 'usb-kernel-recover', 'scripts', 'usb_recover.sh'))
 PR_SET_CHILD_SUBREAPER = 36
+WAIT_ALL = 0x40000000       # __WALL (uapi linux/wait.h): a clone child is a child too
 HANDLED_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+# what ends a process by its starting environment: hc's cleanup after its terminal, a GitHub runner's orphan cleanup
+KEEPER_ENV_DROP = (hil_lock.HC_SCOPE, 'RUNNER_TRACKING_ID')
+ACK_WAIT = 10.0             # s the keeper, holding everything, waits for the foreground's go before giving it back
 SPAWN_SIGDEF = (signal.SIGPIPE, signal.SIGXFSZ)     # what Python ignores and Popen restores in a child
 
 
@@ -387,19 +418,22 @@ def _subreaper():
 
 # --- reservation ---------------------------------------------------------------------------
 class Reservation:
-    """The locks of one run, its records, and the signal policy per phase. `forward` False
-    keeps every signal from the command: a controller rebind cut between its unbind and bind
-    would strand the controller."""
+    """The locks of one run, its records, its host fence and the signal policy per phase, in the
+    keeper. `forward` False keeps every signal from the command: a controller rebind cut between
+    its unbind and bind would strand the controller."""
 
-    def __init__(self, locks, reason, forward=True, admission=None):
+    def __init__(self, locks, reason, chan, forward=True, admission=None):
         self.locks, self.reason, self.forward, self.admission = locks, reason, forward, admission
+        self.chan, chan.res = chan, self
         self.token = secrets.token_hex(8)
-        self._own = {'tool': 'hil_reserve', 'token': self.token, 'locks': list(locks)}
+        self._own = {}
         self.handles = []
         self.phase = 'pre'          # pre -> spawn -> command -> post
         self.pgid = None
         self.noted = []
         self.deferred = []
+        self.retained = False
+        self.detail, self.receipts, self.unlogged = '', [], {}
 
     def install_signals(self):
         for s in HANDLED_SIGNALS:
@@ -412,6 +446,7 @@ class Reservation:
         name = signal.Signals(signum).name
         if self.phase == 'pre':          # nothing mutated yet: give the locks back and stop
             self.release()
+            self.chan.exit(130)
             os._exit(130)
         if self.phase == 'command' and self.forward and signum != signal.SIGHUP:
             try:
@@ -426,13 +461,43 @@ class Reservation:
 
     def acquire(self):
         try:
+            self._own = {'tool': 'hil_reserve', **hil_lock.holder_fields(self.token, self.locks)}
+        except (OSError, ValueError) as e:
+            self.release()
+            raise Refused(f'holder fields: {e}')
+        try:
             for lock in self.locks:
                 self.handles.append(hil_lock.take_board_lock(lock, self.reason, protected=True, **self._own))
         except (hil_lock.BoardLocked, hil_lock.LockUnavailable, ValueError) as e:
             self.release()
             raise Refused(f'{lock}: {e}')
 
+    def arm(self):
+        """The host fence, before the command: it outlives a keeper killed while a descendant may
+        still change the rig. One not written refuses, nothing run."""
+        try:
+            hil_lock.arm_fence(self._fence(False))
+        except OSError as e:
+            self.release()
+            raise Refused(f'host fence not written: {e}')
+
+    def _fence(self, ended):
+        return {'tool': 'hil_reserve', 'token': self.token, 'pid': os.getpid(), 'start': self._own['start'],
+                'locks': self.locks, 'ended': ended}
+
+    def unfence(self) -> str:
+        """Clear our host fence (none written is no error); why it could not be, or ''."""
+        try:
+            hil_lock.clear_fence(self.token)
+        except OSError as e:
+            return f'host fence not cleared: {e}'
+        return ''
+
     def release(self):
+        """Every lock back: the host fence first, while the flocks still exclude, admission last. Only once no
+        descendant of the command is left; one whose fence stays refuses every take until the host reboots."""
+        if why := self.unfence():
+            _say(f'hil_reserve: {why}; every lock on the host refuses until it reboots')
         for fh in self.handles:
             try:
                 hil_lock.release_board_lock(fh)
@@ -451,9 +516,14 @@ class Reservation:
             self.admission = None
 
     def run(self, argv, bound=None):
-        """argv in its own process group; returns its exit code, or None once it outran
-        `bound` seconds (it is left running, never signalled). A command that cannot be
-        started mutated nothing: the reservation is released and Refused raised."""
+        """argv in its own process group once the foreground gave its go; returns its exit code,
+        or None once it outran `bound` seconds (it is left running, never signalled). No go, or a
+        command that cannot be started, mutated nothing: the reservation is released and Refused
+        raised."""
+        if not self.chan.ready():
+            self.release()
+            raise Refused(f'no go from the foreground within {ACK_WAIT:g} s (gone or stopped): nothing run, '
+                          f'locks released')
         # a signal that lands while the child is being spawned waits until its group is known:
         # any thread may take it, but its handler runs here and the 'spawn' phase defers it
         # (glibc blocks every signal around posix_spawn's clone, so the spawn is never
@@ -492,6 +562,21 @@ class Reservation:
         self.phase = 'post'
         return os.waitstatus_to_exitcode(status)    # a signal death stays negative, as Popen's
 
+    def settle(self, deadline) -> bool:
+        """Reap until no child is left, or `deadline`; whether none is. Every orphan of the command
+        reparents to this subreaper, and a thread group leader with live threads is never reaped,
+        so ECHILD proves the command's whole subtree ended."""
+        while True:
+            try:
+                pid, _ = os.waitpid(-1, os.WNOHANG | WAIT_ALL)
+            except ChildProcessError:
+                return True
+            if pid:
+                continue
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(WAIT_POLL)
+
     def end_blocked(self, problems, receipts=()) -> int:
         """A blocker: named on both streams, logged on every board (hil_lock.end_failed, with
         `receipts`), and every lock released; returns the exit status, 1. A log or output failure
@@ -510,6 +595,100 @@ class Reservation:
             except (OSError, ValueError):
                 pass
         return 1
+
+    def retain(self, problems, receipts) -> int:
+        """A blocker that keeps the host: the command left descendants, or its fence could not be
+        cleared. Logged on every board without releasing (log_cleanup_failure), every record
+        rewritten as a cleanup holder (`role`, its `reservation`), so a taker refuses at once
+        (RecoveryBlocked); every flock, admission and the fence are kept for keep_until_released.
+        Returns the exit status, 1."""
+        signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR1})   # before a record names a cleanup holder
+        self.retained, self.detail, self.receipts = True, '; '.join(problems), receipts
+        for lock in self.locks:
+            try:
+                hil_lock.log_cleanup_failure(lock, self.reason, detail=self.detail, task=hil_lock.read_record(lock),
+                                             receipts=receipts, tool='hil_reserve', token=self.token)
+            except (OSError, TimeoutError, TypeError, ValueError) as e:
+                self.unlogged[lock] = f'cleanup log not written: {e}'
+        left = [r for r in receipts if 'survivors' in r]
+        survivors = [{'pid': p, 'start': hil_lock.proc_start(p)} for r in left for p in r['survivors']]
+        kept = self._mark({'phase': 'survivors', 'survivors': survivors})
+        notes = [f'not logged: {b}: {e}' for b, e in sorted(self.unlogged.items())]
+        notes += [f'record not rewritten: {e}' for e in kept]
+        _say(f'hil_reserve: BLOCKER token {self.token} pid {os.getpid()}: {self.detail}; restoration not '
+             f'established; holding {len(self.locks)} lock(s), lock admission and the host fence until '
+             f'`hil_lock.py release --token {self.token}` once its descendants ended, the blocker logged in each '
+             f"board's cleanup log" + (f' ({"; ".join(notes)})' if notes else ''), both=True)
+        return 1
+
+    def _mark(self, reservation) -> list:
+        """Every record rewritten as a cleanup holder carrying `reservation`; the boards whose rewrite failed."""
+        failed = []
+        for lock, fh in zip(self.locks, self.handles):
+            try:
+                hil_lock.write_record(fh, self.reason, **self._own, **{hil_lock.CLEANUP_OWED: True},
+                                      role=hil_lock.CLEANUP_ROLE, detail=self.detail, reservation=reservation)
+            except OSError as e:
+                failed.append(f'{lock}: {e}')
+        return failed
+
+    def keep_until_released(self) -> int:
+        """A retained reservation, after its exit status went out: reap until no descendant is
+        left, then mark the fence and every record ended and wait for SIGUSR1 (release_token,
+        once it read them ended). A request before that is dropped. Only then, rechecked, are the
+        records cleared, the fence removed, every flock dropped and admission reopened, in that
+        order. SIGINT, SIGTERM and SIGHUP stay noted and ignored. Returns 0 once released."""
+        while True:
+            try:
+                os.waitpid(-1, WAIT_ALL)
+            except ChildProcessError:
+                break
+        while signal.sigtimedwait({signal.SIGUSR1}, 0) is not None:
+            pass
+        try:
+            hil_lock.arm_fence(self._fence(True))
+        except OSError:
+            pass        # left unended: a keeper killed now leaves the host to its reboot
+        self._mark({'phase': 'ended'})
+        while True:
+            signal.sigwaitinfo({signal.SIGUSR1})
+            if self._release_retained():
+                return 0
+
+    def _release_retained(self) -> bool:
+        try:
+            os.waitpid(-1, os.WNOHANG | WAIT_ALL)
+            return False                          # a child again: never released on it
+        except ChildProcessError:
+            pass
+        logged = [fh for lock, fh in zip(self.locks, self.handles) if lock not in self.unlogged]
+        for fh in logged:
+            hil_lock.clear_record(fh)             # contention from here: a taker waits rather than refuses
+        if self.unfence():
+            self._mark({'phase': 'ended'})
+            return False
+        for fh in logged:
+            try:
+                fh.close()
+            except OSError:
+                pass
+        if self.unlogged:      # their failure logged now, or kept in the record for the next take
+            hil_lock.end_failed({b: fh for b, fh in zip(self.locks, self.handles) if b in self.unlogged},
+                                self.reason, detail=self.detail, receipts=self.receipts, tool='hil_reserve',
+                                token=self.token)
+        self.handles = []
+        self._open_admission()
+        return True
+
+
+def _say(text, both=False):
+    """`text` on stdout (and stderr with `both`); a lost reader never stops the keeper."""
+    for stream in (sys.stdout, sys.stderr) if both else (sys.stdout,):
+        try:
+            print(text, file=stream, flush=True)
+        except (OSError, ValueError):
+            pass
+
 
 def _not_back(label, n, got):
     """Why the node `n` (pre-operation) is not back as `got` (its fresh sysfs look), or None."""
@@ -689,111 +868,9 @@ def controller_gaps(state, before, addr, rosters, deadline, seen):
 
 
 # --- run -----------------------------------------------------------------------------------
-def _hold(res, recheck):
-    """Take every lock, then `recheck()` (raising Refused) before anything is mutated, and
-    show each board's open cleanup failures."""
-    res.install_signals()
-    res.acquire()
-    try:
-        recheck()
-    except Refused:
-        res.release()
-        raise
-    for lock, fh in zip(res.locks, res.handles):
-        if failures := fh.cleanup_failures:
-            more = f' ({len(failures) - 1} earlier still open)' if len(failures) > 1 else ''
-            print(f'hil_reserve: {lock}: an earlier task\'s cleanup failed: {hil_lock.failure_text(failures[-1])}{more}',
-                  flush=True)
-
-
-def _outcome(res, verb, argv, rc, budget, unchanged, look, failed_note=None):
-    """After the command: exit 0 with every lock released when it exited 0, left no survivor
-    and `look(deadline)` (restoration gaps, retried until the budget is spent) found none;
-    Refused when it refused before writing (exit 3) and `unchanged()` holds; else the blocker,
-    a failed exit followed by `failed_note(rc)` when given."""
-    deadline = time.monotonic() + budget      # one deadline for everything that follows the command
-    problems, unproven = [], []
-    if rc is None:
-        problems.append(f'command still running after {CONTROLLER_COMMAND_BUDGET:g} s')
-    elif rc != 0:
-        problems.append(f'command exited {rc}')
-        if failed_note and (note := failed_note(rc)):
-            problems.append(note)
-    left = survivors(res.pgid)
-    if left:
-        problems.append(f'surviving pids {left}')
-        # a survivor has no receipt to recheck: the marker keeps its logged failure open (resolve_restored)
-        unproven.append({'unrecheckable': argv, 'survivors': left})
-    if rc == REFUSED_UNWRITTEN and not left:
-        # the script refused before its first write: proven only if what it reaches is unchanged
-        try:
-            same = unchanged()
-        except Refused:
-            same = False
-        if same and not res.noted:
-            res.release()
-            raise Refused(f'{verb} refused before writing anything (its message above); locks released')
-    try:
-        gaps_left = look(deadline)
-    except OverBudget as e:
-        gaps_left = [str(e)]
-    while gaps_left and (remaining := deadline - time.monotonic()) > 0:
-        time.sleep(min(RESTORE_POLL, remaining))
-        try:
-            gaps_left = look(deadline)
-        except OverBudget:
-            break                                   # mid-look: the last complete look stands
-    if gaps_left:
-        gaps_left.append(f'not restored within {budget:g} s')
-    problems += gaps_left
-    problems = res.noted + problems       # noted last: a signal can land during the reconciliation
-    if problems:
-        return res.end_blocked(problems, unproven)
-    res.release()
-    return 0
-
-
-def cmd_run(args):
-    scope, busport = VERB_SCOPE[args.verb], args.target
-    if scope == 'controller':
-        return cmd_run_controller(args)
-    rosters = load_rosters(args.roster)
-    nodes = check(busport, rosters, args.budget, scope)
-    if nodes[busport]['identity'] is None:
-        raise Refused(f'{busport} has no serial, in sysfs or recorded by udev, to bind the command to')
-    if args.verb == 'hub-cycle' and nodes[busport]['cls'] == HUB_CLASS:
-        raise Refused(f'{busport} is a hub: hub-cycle cycles a leaf only')
-    _subreaper()
-    res = Reservation(rosters['locks'], args.reason)
-    seen = {}
-
-    def recheck():
-        seen['again'] = check(busport, rosters, args.budget, scope)
-        if snapshot(seen['again']) != snapshot(nodes):
-            raise Refused('the subtree changed between the check and the hold')
-    _hold(res, recheck)
-    target = seen['again'][busport]   # the latest look: a raw sysfs serial over the udev form the script would refuse
-    argv = ['sudo', '-n', RECOVER_SCRIPT, args.verb, busport, target['serial'] or target['udev']]
-    print('hil_reserve: holding ' + ' '.join(res.locks) + '\nhil_reserve: ' + ' '.join(argv), flush=True)
-    rc = res.run(argv)
-    status = _outcome(res, args.verb, argv, rc, args.budget,
-                      lambda: snapshot(check(busport, rosters, args.budget, scope)) == snapshot(nodes),
-                      lambda deadline: restoration_gaps(nodes, busport, rosters, deadline, scope))
-    if status == 0:
-        print(f'hil_reserve: released {len(res.locks)} lock(s); {len(nodes)} node(s) back under '
-              f'{SCOPE_NAME[scope]} {top(busport, scope)}')
-    return status
-
-
-def cmd_run_controller(args):
-    addr = args.target
-    rosters = load_rosters(args.roster)
-    state, nodes = check_controller(addr, rosters, args.budget, args.verb)
-    floor = CONTROLLER_SETTLE + RESTORE_POLL
-    if all(ROOT_HUB_RE.match(name) for name in nodes) and args.budget < floor:
-        raise Refused(f'--budget {args.budget:g} s is under {floor:g} s: with no device on its buses before, '
-                      f'{addr} counts as back only once they look the same for {CONTROLLER_SETTLE:g} s')
-    _subreaper()
+def _reserve(rosters, reason, chan, forward=True):
+    """The Reservation of every lock on the host (host_locks), taken with lock admission closed,
+    so no lock name is created until it ends (by a taker running this hil_lock)."""
     try:
         hil_lock.ensure_lock_files(rosters['locks'])     # before admission closes, which refuses even our creates
         admission = hil_lock.close_admission()
@@ -804,7 +881,133 @@ def cmd_run_controller(args):
     except Refused:
         admission.close()
         raise
-    res = Reservation(locks, args.reason, forward=False, admission=admission)
+    return Reservation(locks, reason, chan, forward=forward, admission=admission)
+
+
+def _hold(res, rosters, recheck):
+    """Take every lock, then `recheck()` (raising Refused) and refuse a lock name created
+    meanwhile, before anything is mutated; show each board's open cleanup failures and arm the
+    host fence."""
+    res.install_signals()
+    res.acquire()
+    try:
+        recheck()
+        if created := sorted(set(host_locks(rosters)) - set(res.locks)):     # by a helper older than ADMISSION
+            raise Refused('lock(s) created during the hold, so not held: ' + ' '.join(created))
+    except Refused:
+        res.release()
+        raise
+    for lock, fh in zip(res.locks, res.handles):
+        if failures := fh.cleanup_failures:
+            more = f' ({len(failures) - 1} earlier still open)' if len(failures) > 1 else ''
+            print(f'hil_reserve: {lock}: an earlier task\'s cleanup failed: {hil_lock.failure_text(failures[-1])}{more}',
+                  flush=True)
+    res.arm()
+
+
+def _holding(res, rosters, argv):
+    extra = sorted(set(res.locks) - set(rosters['locks']))
+    print('hil_reserve: holding ' + ' '.join(res.locks)
+          + (f'\nhil_reserve: of them in no roster given: {" ".join(extra)}' if extra else '')
+          + '\nhil_reserve: ' + ' '.join(argv), flush=True)
+
+
+def _outcome(res, verb, argv, rc, budget, unchanged, look, failed_note=None):
+    """After the command, once no descendant is left (ECHILD within one budget): exit 0 with
+    every lock released when it exited 0 and `look(deadline)` (restoration gaps, retried for
+    another budget) found none; Refused when it refused before writing (exit 3) and `unchanged()`
+    holds; else the blocker, a failed exit followed by `failed_note(rc)` when given, which
+    releases. A descendant still alive after that budget, or a fence that cannot be cleared,
+    retains the reservation instead (Reservation.retain)."""
+    ended = res.settle(time.monotonic() + budget)
+    deadline = time.monotonic() + budget      # one deadline for everything that follows
+    problems, unproven = [], []
+    if rc is None:
+        problems.append(f'command still running after {CONTROLLER_COMMAND_BUDGET:g} s')
+    elif rc != 0:
+        problems.append(f'command exited {rc}')
+        if failed_note and (note := failed_note(rc)):
+            problems.append(note)
+    if not ended:
+        left = survivors(res.pgid)
+        problems.append(f'surviving pids {left}')
+        # a survivor has no receipt to recheck: the marker keeps its logged failure open (resolve_restored)
+        unproven.append({'unrecheckable': argv, 'survivors': left})
+    refused = False
+    if rc == REFUSED_UNWRITTEN and ended and not res.noted:
+        # the script refused before its first write: proven only if what it reaches is unchanged
+        try:
+            refused = unchanged()
+        except Refused:
+            pass
+    if not refused:
+        try:
+            gaps_left = look(deadline)
+        except OverBudget as e:
+            gaps_left = [str(e)]
+        while gaps_left and (remaining := deadline - time.monotonic()) > 0:
+            time.sleep(min(RESTORE_POLL, remaining))
+            try:
+                gaps_left = look(deadline)
+            except OverBudget:
+                break                                   # mid-look: the last complete look stands
+        if gaps_left:
+            gaps_left.append(f'not restored within {budget:g} s')
+        problems += gaps_left
+    problems = res.noted + problems       # noted last: a signal can land during the reconciliation
+    if not ended:
+        return res.retain(problems, unproven)
+    if why := res.unfence():
+        return res.retain(problems + [why], unproven)
+    if refused:
+        res.release()
+        raise Refused(f'{verb} refused before writing anything (its message above); locks released')
+    if problems:
+        return res.end_blocked(problems, unproven)
+    res.release()
+    return 0
+
+
+def cmd_run_port(args, chan):
+    scope, busport = VERB_SCOPE[args.verb], args.target
+    rosters = load_rosters(args.roster)
+    nodes = check(busport, rosters, args.budget, scope)
+    if nodes[busport]['identity'] is None:
+        raise Refused(f'{busport} has no serial, in sysfs or recorded by udev, to bind the command to')
+    if args.verb == 'hub-cycle' and nodes[busport]['cls'] == HUB_CLASS:
+        raise Refused(f'{busport} is a hub: hub-cycle cycles a leaf only')
+    _subreaper()
+    res = _reserve(rosters, args.reason, chan)
+    seen = {}
+
+    def recheck():
+        seen['again'] = check(busport, rosters, args.budget, scope)
+        if snapshot(seen['again']) != snapshot(nodes):
+            raise Refused('the subtree changed between the check and the hold')
+    _hold(res, rosters, recheck)
+    target = seen['again'][busport]   # the latest look: a raw sysfs serial over the udev form the script would refuse
+    argv = ['sudo', '-n', RECOVER_SCRIPT, args.verb, busport, target['serial'] or target['udev']]
+    _holding(res, rosters, argv)
+    rc = res.run(argv)
+    status = _outcome(res, args.verb, argv, rc, args.budget,
+                      lambda: snapshot(check(busport, rosters, args.budget, scope)) == snapshot(nodes),
+                      lambda deadline: restoration_gaps(nodes, busport, rosters, deadline, scope))
+    if status == 0:
+        print(f'hil_reserve: released {len(res.locks)} lock(s); {len(nodes)} node(s) back under '
+              f'{SCOPE_NAME[scope]} {top(busport, scope)}')
+    return status
+
+
+def cmd_run_controller(args, chan):
+    addr = args.target
+    rosters = load_rosters(args.roster)
+    state, nodes = check_controller(addr, rosters, args.budget, args.verb)
+    floor = CONTROLLER_SETTLE + RESTORE_POLL
+    if all(ROOT_HUB_RE.match(name) for name in nodes) and args.budget < floor:
+        raise Refused(f'--budget {args.budget:g} s is under {floor:g} s: with no device on its buses before, '
+                      f'{addr} counts as back only once they look the same for {CONTROLLER_SETTLE:g} s')
+    _subreaper()
+    res = _reserve(rosters, args.reason, chan, forward=False)
 
     def unchanged():
         again_state, again = check_controller(addr, rosters, args.budget, args.verb)
@@ -813,14 +1016,9 @@ def cmd_run_controller(args):
     def recheck():
         if not unchanged():
             raise Refused('the controller changed between the check and the hold')
-        if created := sorted(set(host_locks(rosters)) - set(locks)):     # by a helper older than ADMISSION
-            raise Refused('lock(s) created during the hold, so not held: ' + ' '.join(created))
-    _hold(res, recheck)
+    _hold(res, rosters, recheck)
     argv = ['sudo', '-n', RECOVER_SCRIPT, args.verb, addr, *([args.driver] if args.driver else [])]
-    extra = sorted(set(locks) - set(rosters['locks']))
-    print('hil_reserve: holding ' + ' '.join(res.locks)
-          + (f'\nhil_reserve: of them in no roster given: {" ".join(extra)}' if extra else '')
-          + '\nhil_reserve: ' + ' '.join(argv), flush=True)
+    _holding(res, rosters, argv)
     rc = res.run(argv, bound=CONTROLLER_COMMAND_BUDGET)
     seen = {}
 
@@ -849,7 +1047,261 @@ def cmd_run_controller(args):
     return status
 
 
-def main(argv=None):
+# --- keeper --------------------------------------------------------------------------------
+class Channel:
+    """The keeper's side of its foreground: ready() asks for the go before the command starts,
+    exit(code) reports the status the foreground exits with, once. A foreground gone gives no
+    go and takes no report."""
+
+    def __init__(self, status_fd, ack_fd):
+        self.status_fd, self.ack_fd, self.res = status_fd, ack_fd, None
+
+    def _send(self, text) -> bool:
+        try:
+            os.write(self.status_fd, text.encode())
+        except OSError:
+            return False
+        return True
+
+    def ready(self) -> bool:
+        if not self._send('ready\n'):
+            return False
+        try:
+            go = bool(select.select([self.ack_fd], [], [], ACK_WAIT)[0]) and os.read(self.ack_fd, 1) == b'1'
+        except OSError:
+            go = False
+        os.close(self.ack_fd)
+        return go
+
+    def exit(self, code) -> None:
+        if self.status_fd is None:
+            return
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except (OSError, ValueError):
+                pass
+        self._send(f'exit {code}\n')
+        fd, self.status_fd = self.status_fd, None
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _starts_tracked() -> bool:
+    """Whether os.environ or the environment this process started with (/proc/self/environ: what a fork keeps
+    whatever os.environ drops, and what hc and the runner read) names one of KEEPER_ENV_DROP; true when that is
+    unreadable."""
+    if any(k in os.environ for k in KEEPER_ENV_DROP):
+        return True
+    try:
+        with open('/proc/self/environ', 'rb') as f:
+            names = {e.partition(b'=')[0] for e in f.read().split(b'\0')}
+    except OSError:
+        return True
+    return any(os.fsencode(k) in names for k in KEEPER_ENV_DROP)
+
+
+# a fresh interpreter's keeper: argv is this file, BOARD_LOCK_DIR and the job (keeper_main)
+_KEEPER_BOOT = (
+    'import importlib.util, sys\n'
+    "spec = importlib.util.spec_from_file_location('agentrc_hil_reserve', sys.argv[1])\n"
+    'mod = importlib.util.module_from_spec(spec)\n'
+    'sys.modules[spec.name] = mod\n'
+    'spec.loader.exec_module(mod)\n'
+    'mod.hil_lock.BOARD_LOCK_DIR = sys.argv[2]\n'
+    'mod.keeper_main(sys.argv[3])\n')
+
+
+def _run_argv(args):
+    return ['run', args.verb, args.target, '--reason', args.reason, '--budget', repr(args.budget),
+            *[x for r in args.roster for x in ('--roster', r)], *(['--driver', args.driver] if args.driver else [])]
+
+
+def _start_keeper(args, status_fd, ack_fd, out_fd, err_fd, close, unblock):
+    """The forked keeper: its own session, /dev/null as stdin and the foreground's spool files as
+    stdout and stderr; exec'd without KEEPER_ENV_DROP when it started with one, as hil_lock's hold
+    holder is. Never returns."""
+    code, chan = 1, Channel(status_fd, ack_fd)
+    try:
+        for fd in close:
+            os.close(fd)
+        os.setsid()
+        devnull = os.open(os.devnull, os.O_RDONLY)
+        for src, dst in ((devnull, 0), (out_fd, 1), (err_fd, 2)):
+            os.dup2(src, dst)
+        for fd in (devnull, out_fd, err_fd):
+            os.close(fd)
+        if _starts_tracked():
+            env = {k: v for k, v in os.environ.items() if k not in KEEPER_ENV_DROP}
+            job = json.dumps({'status': status_fd, 'ack': ack_fd, 'unblock': sorted(int(s) for s in unblock),
+                              'argv': _run_argv(args)})
+            for fd in (status_fd, ack_fd):
+                os.set_inheritable(fd, True)
+            os.execve(sys.executable, [sys.executable, '-I', '-c', _KEEPER_BOOT, os.path.abspath(__file__),
+                                       hil_lock.BOARD_LOCK_DIR, job], env)
+        code = _keep(args, chan, unblock)
+    except BaseException:
+        try:
+            os.write(2, traceback.format_exc().encode(errors='replace'))
+            chan.exit(1)
+        except BaseException:
+            pass
+    finally:
+        os._exit(code)       # never back into the foreground's frames
+
+
+def keeper_main(job):
+    """The keeper in a fresh interpreter (_start_keeper's exec). Never returns."""
+    job = json.loads(job)
+    for fd in (job['status'], job['ack']):
+        os.set_inheritable(fd, False)          # not the command's to keep open
+    code, chan = 1, Channel(job['status'], job['ack'])
+    try:
+        code = _keep(_parser().parse_args(job['argv']), chan, {signal.Signals(s) for s in job['unblock']})
+    except BaseException:
+        try:
+            traceback.print_exc()
+            chan.exit(1)
+        except BaseException:
+            pass
+    finally:
+        os._exit(code)
+
+
+def _keep(args, chan, unblock):
+    """The keeper: the whole run (`run`'s check, hold, command and outcome), its status reported
+    to the foreground, then, for a retained reservation, the hold until its token release.
+    Returns its exit code once it holds nothing."""
+    chan.replaced = (sys.stdout, sys.stderr)      # kept: one that owns fd 1 or 2 would close it once collected
+    sys.stdout = open(1, 'w', buffering=1, errors='backslashreplace', closefd=False)
+    sys.stderr = open(2, 'w', buffering=1, errors='backslashreplace', closefd=False)
+
+    def before_hold(*_):                 # nothing taken yet
+        chan.exit(130)
+        os._exit(130)
+    for s in HANDLED_SIGNALS:
+        signal.signal(s, before_hold)
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, unblock)
+    try:
+        code = (cmd_run_controller if VERB_SCOPE[args.verb] == 'controller' else cmd_run_port)(args, chan)
+    except Refused as e:
+        print(f'hil_reserve: refused: {e}', file=sys.stderr)
+        code = 1
+    chan.exit(code)
+    if chan.res is not None and chan.res.retained:
+        return chan.res.keep_until_released()
+    return code
+
+
+def _spool():
+    """(write fd, read fd) of an unlinked temp file for the keeper's output: unlike a pipe, a
+    descendant outliving the foreground never blocks on it, gets EPIPE, or holds the foreground's
+    own output open."""
+    fd, path = tempfile.mkstemp(prefix='hil_reserve.')
+    try:
+        return fd, os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+    finally:
+        os.unlink(path)
+
+
+def cmd_run(args):
+    """The foreground of `run`: start the keeper, relay its output, forward SIGINT, SIGTERM and
+    SIGHUP to it, give it the go once it holds everything, and return the status it reports.
+    The keeper, not this process, holds the locks; one that keeps them for descendants left
+    alive outlives it."""
+    try:
+        (out_w, out_r), (err_w, err_r) = _spool(), _spool()
+        status_r, status_w = os.pipe()
+        ack_r, ack_w = os.pipe()
+    except OSError as e:
+        raise Refused(f'cannot start the keeper: {e}')
+    for stream in (sys.stdout, sys.stderr):
+        stream.flush()
+    mask = signal.pthread_sigmask(signal.SIG_BLOCK, HANDLED_SIGNALS)
+    old = {}
+    try:
+        try:
+            pid = os.fork()
+        except OSError as e:
+            raise Refused(f'cannot start the keeper: {e}')
+        if pid == 0:
+            _start_keeper(args, status_w, ack_r, out_w, err_w, (status_r, ack_w, out_r, err_r),
+                          set(HANDLED_SIGNALS) - set(mask))
+        for fd in (status_w, ack_r, out_w, err_w):
+            os.close(fd)
+        go = [True]
+
+        def forward(signum, _):
+            go[0] = False
+            try:
+                os.kill(pid, signum)     # our child: its pid is not reused before we reap it
+            except ProcessLookupError:
+                pass
+        old = {s: signal.signal(s, forward) for s in HANDLED_SIGNALS}
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+    try:
+        return _relay(pid, status_r, ack_w, ((out_r, sys.stdout), (err_r, sys.stderr)), go)
+    finally:
+        for s, h in old.items():
+            signal.signal(s, h)
+        for fd in (status_r, out_r, err_r):
+            os.close(fd)
+
+
+def _relay(pid, status_fd, ack_fd, spools, go):
+    """Copy the spools to their streams until the keeper's status arrives, acking its `ready` while `go`."""
+    decoders = [codecs.getincrementaldecoder('utf-8')('replace') for _ in spools]
+
+    def copy(final=False):
+        for (fd, stream), dec in zip(spools, decoders):
+            text = ''
+            while chunk := os.read(fd, 65536):
+                text += dec.decode(chunk)
+            text += dec.decode(b'', final=final)
+            if text:
+                try:
+                    stream.write(text)
+                    stream.flush()
+                except (OSError, ValueError):
+                    pass
+    buf, code = b'', None
+    while code is None:
+        copy()
+        if not select.select([status_fd], [], [], WAIT_POLL)[0]:
+            continue
+        chunk = os.read(status_fd, 512)
+        if not chunk:
+            break
+        buf += chunk
+        while code is None and b'\n' in buf:
+            line, _, buf = buf.partition(b'\n')
+            if line == b'ready' and ack_fd is not None:
+                if go[0]:
+                    try:
+                        os.write(ack_fd, b'1')
+                    except OSError:
+                        pass
+                os.close(ack_fd)
+                ack_fd = None
+            elif line.startswith(b'exit '):
+                code = int(line[5:])
+    if ack_fd is not None:
+        os.close(ack_fd)
+    copy(final=True)
+    if code is None:
+        print(f'hil_reserve: its keeper (pid {pid}) ended without a status', file=sys.stderr)
+        code = 1
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        pass
+    return code
+
+
+def _parser():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest='cmd', required=True)
 
@@ -871,6 +1323,11 @@ def main(argv=None):
                        help='pci-bind only: the driver to bind (default: the helper tries xhci-pci-renesas, '
                             'then xhci_hcd)')
     add_roster_args(p_run)
+    return ap
+
+
+def main(argv=None):
+    ap = _parser()
     args = ap.parse_args(argv)
     scope = args.scope if args.cmd == 'check' else VERB_SCOPE[args.verb]
     try:

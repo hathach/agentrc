@@ -151,10 +151,13 @@ It still takes the root hub's own `device_lock` (`usbdev_open`, every usbfs ioct
 uninterruptible), so a root hub lock already held, such as `hub_wq` disconnecting the
 wedged child under it, blocks it in D state. The script then names the surviving pid,
 sends no further request and fails (exit 1). The reservation below then prints a BLOCKER
-line with its token, logs the blocker in each board's cleanup log and releases the
-flocks; the survivor's logged failure stays open until an operator acknowledges it
-(`hil_lock.py resolve`). The software rung failed, so follow the contract's terminal
-recovery. It is not a guaranteed escape, only the rung that opens nothing but the root hub.
+line with its token, logs the blocker in each board's cleanup log and keeps every board
+flock on the host, lock admission and its host fence while the survivor lives
+(agentrc#586); once it ended, `hil_lock.py release --token <token>` releases them, and
+the survivor's logged failure stays open until an operator acknowledges it
+(`hil_lock.py resolve`). A survivor that never ends (D state) keeps the host held until
+the reboot. The software rung failed, so follow the contract's terminal recovery. It is
+not a guaranteed escape, only the rung that opens nothing but the root hub.
 
 That is a different lock from the host's **board flocks**, and this rung still needs
 those: it bounces every fixture under the root port, including boards another job is
@@ -167,8 +170,11 @@ python3 <hil skill dir>/scripts/hil_reserve.py run root-cycle <busport> \
 
 One `--roster` per project with boards on this host (the contract's Hosts/rosters
 names them). `hil_reserve.py --help` has its
-coverage, hold and release rules; a failed cycle releases every lock, and the token its
-BLOCKER line prints identifies that logged blocker, not a held lock. A refusal
+coverage, hold and release rules; it holds every lock on the host, not only the rosters'.
+A failed cycle with no descendant left releases every lock, and the token its BLOCKER
+line prints identifies that logged blocker; one that left a descendant alive holds
+everything until `hil_lock.py release --token <token>` once that ended, and a refusal
+naming a host fence (`FenceHeld`) is such a hold, or one whose keeper was killed. A refusal
 naming a runner's holder (`hil_test.py`) means CI is mid-test — wait, do not force.
 Give it the wedged probe's own busport (e.g. `13-1.6`), not the `13-1` hub path: the
 script derives the root port itself, and the serial guard and the success check both
@@ -220,9 +226,10 @@ On a successful rebind every fixture re-enumerates, and **it renumbers every bus
 17 and 18 came back as 1 and 2), so re-derive busports afterwards from the bus map the reservation prints. Every fixture
 on the controller goes down with it, so it runs only under that reservation, given every roster on the host, and only
 where the contract's Reservation allows it; `pci-bind` under the same reservation recovers a controller left driverless.
-Prerequisites: every project on the host pinned at or after the agentrc whose `hil_lock` closes lock admission for the
-run, and the rig's root-owned `/usr/local/sbin/usb_recover`, which the reservation prefers, refreshed by
-`hil-farm-setup`. `hil_reserve.py --help` has what it checks, holds and judges.
+Prerequisites: every project on the host pinned at or after the agentrc whose `hil_lock` checks the host fence (which
+also closes lock admission for the run), and the rig's root-owned `/usr/local/sbin/usb_recover`, which the reservation
+prefers, refreshed by `hil-farm-setup`. A command left running past its bound keeps the host as a root-cycle survivor
+does. `hil_reserve.py --help` has what it checks, holds and judges.
 
 Do NOT reach for it while a device-lock convoy is live — see Common mistakes.
 
