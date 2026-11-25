@@ -426,6 +426,12 @@ class LaunchResultTest(unittest.TestCase):
         self.assertEqual(self.run_it(stopped('held-awaiting-caller', held=held))[1]['blockers'],
                          ['finding 7#1 on comment 7 is held for the caller, and another launch cannot lift it: '
                           'out of scope per https://x/1 (y): defer it by findingId, or drop the topic'])
+        # #591: each comment a person waits on is named, the human's to settle.
+        url = 'https://github.com/o/r/pull/7#discussion_r4682479462'
+        waiting = [{'kind': 'review', 'commentId': 4682479462, 'author': 'HiFiPhile', 'url': url}]
+        self.assertEqual(self.run_it(stopped('human-review', waiting=waiting))[1]['blockers'],
+                         [launch_result.STALLED['human-review'], f"comment 4682479462 by HiFiPhile waits for a person's answer: {url}"])
+        self.assertEqual(self.run_it(stopped('human-review', waiting=waiting))[1]['result']['waiting'], waiting, 'kept verbatim')
         for reason in ('yielded', 'pr-merged'):
             self.assertEqual(self.run_it(stopped(reason))[1]['blockers'], [], reason)
 

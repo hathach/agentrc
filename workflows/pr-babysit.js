@@ -720,12 +720,26 @@ const BOT_STATES = ['reviewed', 'working', 'queued', 'settled', 'absent', 'unkno
 const SETTLED_KINDS = ['skipped', 'limited', 'paused', 'failed']
 const REVIEWS = {
   type: 'object', additionalProperties: false,
-  required: ['headSha', 'observedAt', 'headEventAt', 'headEventEvidence', 'fingerprint', 'bots', 'findings', 'replies'],
+  required: ['headSha', 'observedAt', 'headEventAt', 'headEventEvidence', 'fingerprint', 'bots', 'waiting', 'findings', 'replies'],
   properties: {
     headSha: { type: 'string' }, observedAt: { type: 'string' },
     headEventAt: { type: ['string', 'null'] }, headEventEvidence: { type: 'string' },
     // harvest.py's, unchanged: the review evidence a merge checks again (merge.py).
     fingerprint: { type: 'string' },
+    // harvest.py's, unchanged: the comments by people that wait for an answer, the human's to settle, never findings (#591).
+    waiting: {
+      type: 'array',
+      items: {
+        type: 'object', additionalProperties: false,
+        required: ['kind', 'commentId', 'author', 'authorAssociation', 'path', 'line', 'createdAt', 'url', 'digest', 'excerpt'],
+        properties: {
+          kind: { type: 'string', enum: ['review', 'issue', 'review-body'] }, commentId: { type: 'integer' },
+          author: { type: 'string' }, authorAssociation: { type: 'string' },
+          path: { type: ['string', 'null'] }, line: { type: ['integer', 'null'] },
+          createdAt: { type: 'string' }, url: { type: 'string' }, digest: { type: 'string' }, excerpt: { type: 'string' },
+        },
+      },
+    },
     bots: {
       type: 'array',
       items: {
@@ -3101,6 +3115,18 @@ const runLanes = async (cycle, entry, lanes) => {
         return stop(cycle, 'review-report-unusable', { detail: why })
       }
       lastRead = { head: expectedHead, json: JSON.stringify(r) }
+      // A person's comment still waiting for an answer is the human's to settle (#591): nothing is fixed, answered, pushed,
+      // asked of a bot or counted done over it. A reply in its thread, its resolution or the author's answer lets a relaunch pass.
+      const waiting = r.waiting || []
+      if (waiting.length) {
+        log(`cycle ${cycle}: ${waiting.length} comment(s) by people wait for an answer — ` +
+          `${waiting.map(w => `${w.commentId} by ${w.author} (${w.url})`).join(', ')}; theirs to answer or resolve, this run does not answer them`)
+        return stop(cycle, 'human-review', {
+          detail: 'comments by people wait for an answer: theirs to answer or resolve; this run does not answer them',
+          waiting: waiting.map(({ kind, commentId, author, authorAssociation, path, line, createdAt, url }) =>
+            ({ kind, commentId, author, authorAssociation, path, line, createdAt, url })),
+        })
+      }
     }
     if (r !== nobody) reviewedCycles.set(cycle, r.findings)
     entry.bots = r === nobody

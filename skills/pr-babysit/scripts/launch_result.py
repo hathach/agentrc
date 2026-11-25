@@ -130,6 +130,11 @@ STALLED = {
     'pending-review': 'the posting account holds a pending review on the PR (`review`, by `login`), and GitHub refuses its replies '
                       'while it does: report it for the human to submit or delete, never submit or delete it yourself, and relaunch '
                       'from the stateRef once it is gone',
+    'human-review': 'a comment by a person (an owner, member or collaborator other than the PR\'s author and the posting '
+                    'account) waits for an answer (`waiting`, each by comment id, author and url, listed below): it is the '
+                    "human's to answer or resolve, so report each to the user and never answer, resolve or fix it on the "
+                    "run's behalf; relaunch from the stateRef once a person replied in its thread or resolved it, or the PR's "
+                    'author answered it (#591)',
     'harvest-failed': "harvest.py failed twice in a row (`detail`): fix what its error names, such as a module the "
                       "launch's interpreter lacks, or relaunch once a passing cause (a head still moving, a GitHub outage) cleared",
     'ci-collect-failed': "collect.py failed the same way on two cycles running (`detail`): fix what its error names, such as an "
@@ -477,6 +482,9 @@ def summarize(output, output_path, state_ref=None, tree=None, keys=False):
             runs = result.get('awaitingApproval') if isinstance(result.get('awaitingApproval'), list) else []
             blockers.append(f"the head's Actions runs {cut(', '.join(map(str, runs))) or '(unnamed)'} wait for a maintainer to approve "
                             "them on GitHub (#545): no failure, and nothing here approves or re-runs them; relaunch once they are approved")
+        if result.get('reason') == 'human-review':
+            blockers += [f"comment {w.get('commentId')} by {w.get('author')} waits for a person's answer: {w.get('url')}"
+                         for w in result.get('waiting') or [] if isinstance(w, dict)]
         if result.get('reason') == 'held-awaiting-caller':
             blockers += [f"finding {h.get('findingId')} on comment {h.get('commentId')} is held for the caller, and another launch "
                          f"cannot lift it: {cut(h.get('reason') or '')}" for h in result.get('held') or []]

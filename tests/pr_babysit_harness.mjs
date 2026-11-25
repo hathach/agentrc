@@ -308,9 +308,12 @@ async function run(opts = {}) {
       (opts.napClock ? napMs.reduce((sum, ms) => sum + ms, 0) / 60000 : 0))
     observed = observedAt
     const read = bots.map(b => ({ ...b, sha: b.sha === 'head' ? head : b.sha }))
-    // Like harvest.py's, over what the bots left and never a time: new or edited findings or a changed bot state change it.
-    const evidence = { findings: r.findings, replies: r.replies, bots: read.map(({ bot, state, kind, sha, evidence }) => ({ bot, state, kind, sha, evidence })) }
-    return { headSha: head, observedAt, headEventAt: null, headEventEvidence: 'stub', fingerprint: `stub|${fnv1a(canonical(evidence))}`, ...r, bots: read }
+    // Like harvest.py's, over what the bots left and never a time: new or edited findings or a changed bot state change it,
+    // and so does a comment waiting for a person's answer (#591).
+    const evidence = { findings: r.findings, replies: r.replies, bots: read.map(({ bot, state, kind, sha, evidence }) => ({ bot, state, kind, sha, evidence })),
+      ...(r.waiting?.length ? { waiting: r.waiting.map(({ kind, commentId, digest }) => ({ kind, commentId, digest })) } : {}) }
+    // No person's comment waits unless the case says one does.
+    return { headSha: head, observedAt, headEventAt: null, headEventEvidence: 'stub', fingerprint: `stub|${fnv1a(canonical(evidence))}`, waiting: [], ...r, bots: read }
   }
   const agent = async (prompt, options) => {
     const label = options.label
@@ -3781,6 +3784,39 @@ test('a harvest that printed no JSON line is retried and reported by its last st
   // A traceback, then a rate-limited retry: the limit decides.
   const limited = await run({ reviews: { ...LIMITED_REVIEWS, harvestError: 'ModuleNotFoundError: No module named greptile' }, args: { maxCycles: 4 } })
   assert.equal(limited.result.reason, 'github-rate-limited')
+})
+
+// #591: hathach/tinyusb#4613's collaborator objection, as harvest.py reports it.
+const OBJECTION = { kind: 'review', commentId: 4682479462, author: 'HiFiPhile', authorAssociation: 'COLLABORATOR', path: 'src/a.c', line: 3,
+  createdAt: '2026-09-16T09:00:00Z', url: 'https://github.com/hathach/tinyusb/pull/4613#discussion_r4682479462', digest: '0123456789ab',
+  excerpt: 'Keep TUSB_SPEED_LOW supported' }
+
+test("a person's comment waiting for an answer stops the run before anything is fixed, answered, pushed or asked (#591)", async () => {
+  const reviews = { findings: [finding(), invalidFinding({ commentId: 2 })], replies: [{ commentId: 2, body: 'not a bug: x' }], bots: 'reviewed',
+    waiting: [OBJECTION] }
+  const { result, labels, logs } = await run({ reviews, args: { autoPush: true, maxCycles: 4 } })
+  assert.deepEqual([result.pass, result.reason], [false, 'human-review'])
+  const { digest, excerpt, ...named } = OBJECTION
+  assert.deepEqual(result.waiting, [named], 'each comment named, by id, author and url')
+  assert.match(result.detail, /theirs to answer or resolve; this run does not answer them/)
+  assert.deepEqual(labels.filter(l => l.startsWith('reviews#')), ['reviews#1'], 'no further cycle')
+  assert.equal(labels.some(l => /^(fix:|scope:|check:|challenge#|build#|hooks#|audit#|push#|replies#|resolve#|defer#|coderabbit|greptile)/.test(l)), false,
+    labels.join(', '))
+  assert.equal(result.history[0].ci.status, 'green', 'the CI lane is still awaited')
+  assert.ok(logs.includes('cycle 1: 1 comment(s) by people wait for an answer — 4682479462 by HiFiPhile ' +
+    `(${OBJECTION.url}); theirs to answer or resolve, this run does not answer them`), logs.join('\n'))
+  // Once a person replied in the thread, resolved it or the author answered, harvest.py reports none: the relaunch goes on.
+  const again = await run({ reviews: { ...oneValid, waiting: [] }, args: { autoPush: true, maxCycles: 4, state: result.state } })
+  assert.notEqual(again.result.reason, 'human-review')
+  assert.ok(again.labels.some(l => l.startsWith('fix:')), again.labels.join(', '))
+})
+
+test('an empty waiting list stops nothing', async () => {
+  const quiet = await run({ reviews: { ...oneValid, waiting: [] }, args: { autoPush: true } })
+  const plain = await run({ reviews: oneValid, args: { autoPush: true } })
+  assert.deepEqual([quiet.result.pass, quiet.result.reason], [plain.result.pass, plain.result.reason])
+  assert.ok(quiet.labels.some(l => l.startsWith('fix:')), quiet.labels.join(', '))
+  assert.deepEqual(quiet.result.observation.reviews.waiting, [], "harvest.py's list reaches the observation")
 })
 
 test('a dead review validator still settles the CI lane', async () => {
@@ -7685,8 +7721,10 @@ const headLine = (logs) => summaries(logs).map(s => s.split('\n')[0])
 test('the validator contract is per-bot records, not a done flag', async () => {
   const { calls } = await run({})
   const schema = calls.find(c => c.label === 'reviews#1').schema
-  assert.deepEqual(schema.required, ['headSha', 'observedAt', 'headEventAt', 'headEventEvidence', 'fingerprint', 'bots', 'findings', 'replies'])
+  assert.deepEqual(schema.required, ['headSha', 'observedAt', 'headEventAt', 'headEventEvidence', 'fingerprint', 'bots', 'waiting', 'findings', 'replies'])
   assert.deepEqual(schema.properties.bots.items.required, ['bot', 'state', 'kind', 'sha', 'evidence', 'reason', 'retryAt'])
+  assert.deepEqual(schema.properties.waiting.items.required,
+    ['kind', 'commentId', 'author', 'authorAssociation', 'path', 'line', 'createdAt', 'url', 'digest', 'excerpt'], "harvest.py's records, copied whole (#591)")
   assert.deepEqual(schema.properties.bots.items.properties.state.enum, ['reviewed', 'working', 'queued', 'settled', 'absent', 'unknown', 'harvested'])
 })
 
@@ -8060,6 +8098,15 @@ test('a quota wait probes harvest.py instead of validating until CodeRabbit leav
     reviewsPerCycle: () => ({ ...quiet([++n < 3 ? limitedCr(at(20)) : bot('coderabbit')]), headEventAt: [at(-5), at(2)][n - 1] ?? null }) })
   assert.deepEqual(probes(reopened.labels), ['reviews:probe#2', 'reviews:probe#3'])
   assert.equal(reopened.result.state.reviewClock.eventAt, at(2))
+})
+
+test("a person's comment arriving during a quota wait changes the evidence the probe reads, and the run stops (#591)", async () => {
+  let n = 0
+  const { result, labels, logs } = await run({ args: { coderabbitTrigger: true, maxCycles: 2 }, napClock: true,
+    reviewsPerCycle: () => ({ ...quiet([limitedCr(at(20))]), ...(++n > 1 ? { waiting: [OBJECTION] } : {}) }) })
+  assert.deepEqual(labels.filter(l => l.startsWith('reviews#')).slice(0, 2), ['reviews#1', 'reviews#2'])
+  assert.ok(logs.some(l => /cycle 2: probe — the review evidence changed; validating in full/.test(l)), logs.join('\n'))
+  assert.equal(result.reason, 'human-review')
 })
 
 test('two lost hourly races on an unchanged limit are followed by another request and a review', async () => {

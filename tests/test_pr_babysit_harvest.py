@@ -826,6 +826,135 @@ class Fingerprint(unittest.TestCase):
         ev = self.evidence()
         self.assertNotEqual(harvest.fingerprint(['coderabbit', 'greptile'], ['coderabbit'], *ev), self.fp(*ev))
 
+    def test_a_comment_waiting_for_a_persons_answer_is_part_of_it(self):
+        """#591: a new, edited or answered comment by a person makes a quota-wait probe validate again."""
+        ev = self.evidence()
+        base = self.fp(*ev)
+        wait = {'kind': 'review', 'commentId': 60, 'digest': harvest.digest('Keep it')}
+        self.assertEqual(harvest.fingerprint(self.REVIEWERS, self.AUTO, *ev, []), base, 'none waiting leaves it as it was')
+        one = harvest.fingerprint(self.REVIEWERS, self.AUTO, *ev, [wait])
+        self.assertNotEqual(one, base, 'a new one')
+        self.assertNotEqual(harvest.fingerprint(self.REVIEWERS, self.AUTO, *ev, [dict(wait, digest=harvest.digest('Keep it, please'))]), one, 'an edited one')
+        self.assertNotEqual(harvest.fingerprint(self.REVIEWERS, self.AUTO, *ev, [dict(wait, commentId=61)]), one, 'another one')
+
+
+def person(login, association='COLLABORATOR', type_='User'):
+    return {'user': {'login': login, 'type': type_}, 'author_association': association}
+
+
+def inline(id_, who, at, reply_to=None, body='Keep TUSB_SPEED_LOW supported'):
+    return {'id': id_, **who, 'body': body, 'path': 'src/a.c', 'line': 3, 'commit_id': HEAD, 'created_at': at, 'updated_at': at,
+            'in_reply_to_id': reply_to, 'html_url': f'https://github.com/o/r/pull/7#discussion_r{id_}'}
+
+
+def said(id_, who, at, body='Please keep it'):
+    return {'id': id_, **who, 'body': body, 'created_at': at, 'updated_at': at, 'html_url': f'https://github.com/o/r/pull/7#issuecomment-{id_}'}
+
+
+def reviewed(id_, who, at, body='', state='COMMENTED'):
+    return {'id': id_, **who, 'body': body, 'state': state, 'commit_id': HEAD, 'submitted_at': at,
+            'html_url': f'https://github.com/o/r/pull/7#pullrequestreview-{id_}'}
+
+
+THREADS = f'api graphql -f query={harvest.THREADS_QUERY} -f owner=o -f name=r -F n=7'
+
+
+class Waiting(unittest.TestCase):
+    """#591: the comments by people that wait for an answer, the human's to settle."""
+    MAINTAINER = person('HiFiPhile')
+    AUTHOR = person('contributor', 'CONTRIBUTOR')
+    VIEWER = person('babysitter', 'MEMBER')
+    BOT = person('coderabbitai[bot]', 'NONE', 'Bot')
+
+    def read(self, inline_=(), issue=(), reviews=(), resolved=None):
+        with mock.patch.object(harvest, 'threads', return_value=('contributor', 'babysitter', resolved or {})) as threads:
+            got = harvest.waiting('o/r', 7, list(inline_), list(issue), list(reviews))
+        return got, threads.call_count
+
+    def ids(self, *a, **k):
+        return [(w['kind'], w['commentId']) for w in self.read(*a, **k)[0]]
+
+    def test_an_unresolved_inline_comment_by_a_trusted_person_waits(self):
+        got, _ = self.read([inline(60, self.MAINTAINER, '2026-11-20T10:00:00Z')], resolved={60: False})
+        self.assertEqual(got, [{'kind': 'review', 'commentId': 60, 'author': 'HiFiPhile', 'authorAssociation': 'COLLABORATOR',
+                                'path': 'src/a.c', 'line': 3, 'createdAt': '2026-11-20T10:00:00Z',
+                                'url': 'https://github.com/o/r/pull/7#discussion_r60', 'digest': harvest.digest('Keep TUSB_SPEED_LOW supported'),
+                                'excerpt': 'Keep TUSB_SPEED_LOW supported'}])
+        for association in ('OWNER', 'MEMBER'):
+            self.assertEqual(self.ids([inline(60, person('x', association), EVENT)]), [('review', 60)], association)
+
+    def test_a_bot_the_author_the_posting_account_or_an_untrusted_person_never_waits(self):
+        for name, who in (('a bot', self.BOT), ('a bot with a trusted association', person('github-actions[bot]', 'MEMBER', 'Bot')),
+                          ("the PR's author", person('Contributor', 'COLLABORATOR')), ('the posting account', self.VIEWER),
+                          ('a contributor', person('x', 'CONTRIBUTOR')), ('no association', {'user': {'login': 'x', 'type': 'User'}})):
+            with self.subTest(name):
+                self.assertEqual(self.ids([inline(60, who, EVENT)], [said(61, who, EVENT)], [reviewed(62, who, EVENT, 'please fix')]), [])
+
+    def test_graphql_is_asked_only_when_a_trusted_person_commented(self):
+        _, asked = self.read([inline(60, self.BOT, EVENT)], [said(61, person('x', 'NONE'), EVENT)], [reviewed(62, self.MAINTAINER, EVENT)])
+        self.assertEqual(asked, 0, "an empty review body is no person's comment")
+        _, asked = self.read([], [], [reviewed(62, self.MAINTAINER, EVENT, 'fix it', state='PENDING')])
+        self.assertEqual(asked, 0, 'nor is a pending review')
+        _, asked = self.read([], [said(61, self.MAINTAINER, EVENT)])
+        self.assertEqual(asked, 1)
+
+    def test_a_resolved_thread_or_one_whose_last_word_is_not_a_persons_does_not_wait(self):
+        root = inline(60, self.MAINTAINER, '2026-11-20T10:00:00Z')
+        self.assertEqual(self.ids([root], resolved={60: True}), [], 'resolved')
+        for name, who in (('the author', self.AUTHOR), ('the posting account', self.VIEWER), ('a bot', self.BOT)):
+            with self.subTest(name):
+                answered = [root, inline(61, who, '2026-11-20T11:00:00Z', reply_to=60)]
+                self.assertEqual(self.ids(answered, resolved={60: False}), [])
+        again = [root, inline(61, self.AUTHOR, '2026-11-20T11:00:00Z', reply_to=60), inline(62, self.MAINTAINER, '2026-11-20T12:00:00Z', reply_to=60)]
+        self.assertEqual(self.ids(list(reversed(again)), resolved={60: False}), [('review', 62)], 'the person spoke again: the last word is theirs')
+
+    def test_a_person_replying_in_a_bots_thread_waits(self):
+        thread = [inline(60, self.BOT, '2026-11-20T10:00:00Z', body='nit'), inline(61, self.MAINTAINER, '2026-11-20T11:00:00Z', reply_to=60, body='No, keep it')]
+        self.assertEqual(self.ids(thread, resolved={60: False}), [('review', 61)])
+        self.assertEqual(self.ids(thread, resolved={60: True}), [], 'the thread resolved')
+
+    def test_a_thread_graphql_does_not_list_reads_unresolved(self):
+        self.assertEqual(self.ids([inline(60, self.MAINTAINER, EVENT)], resolved={}), [('review', 60)])
+
+    def test_an_issue_comment_or_review_body_waits_until_the_author_or_the_posting_account_speaks_after_it(self):
+        ask = said(70, self.MAINTAINER, '2026-11-20T10:00:00Z')
+        body = reviewed(71, self.MAINTAINER, '2026-11-20T10:05:00Z', 'Changes needed', state='CHANGES_REQUESTED')
+        self.assertEqual(self.ids([], [ask], [body]), [('issue', 70), ('review-body', 71)])
+        for name, issue, reviews, want in (
+                ('an issue comment by the author after both', [said(72, self.AUTHOR, '2026-11-20T11:00:00Z')], [], []),
+                ('a review by the posting account after both', [], [reviewed(73, self.VIEWER, '2026-11-20T11:00:00Z')], []),
+                ('an answer between them', [said(72, self.AUTHOR, '2026-11-20T10:01:00Z')], [], [('review-body', 71)]),
+                ('an answer before both', [said(72, self.AUTHOR, '2026-11-20T09:00:00Z')], [], [('issue', 70), ('review-body', 71)]),
+                ('a pending review by the author', [], [reviewed(73, self.AUTHOR, '2026-11-20T11:00:00Z', state='PENDING')], [('issue', 70), ('review-body', 71)]),
+                ('a bot after both', [said(72, self.BOT, '2026-11-20T11:00:00Z')], [], [('issue', 70), ('review-body', 71)]),
+                ('another person after both', [said(72, person('y', 'MEMBER'), '2026-11-20T11:00:00Z')], [],
+                 [('issue', 70), ('review-body', 71), ('issue', 72)])):
+            with self.subTest(name):
+                self.assertEqual(self.ids([], [ask, *issue], [body, *reviews]), want)
+
+    def test_a_long_body_is_cut_to_an_excerpt_and_its_digest_is_the_whole_bodys(self):
+        long = 'word  \n' * 100
+        got, _ = self.read([], [said(70, self.MAINTAINER, EVENT, long)])
+        self.assertEqual((len(got[0]['excerpt']), got[0]['excerpt'][-1], got[0]['digest']), (harvest.EXCERPT + 1, '…', harvest.digest(long)))
+        self.assertNotIn('\n', got[0]['excerpt'])
+
+    def test_review_threads_are_read_page_by_page(self):
+        def page(nodes, after=None):
+            return {'data': {'viewer': {'login': 'babysitter'}, 'repository': {'pullRequest': {'author': {'login': 'contributor'}, 'reviewThreads': {
+                'pageInfo': {'hasNextPage': after is not None, 'endCursor': after}, 'nodes': nodes}}}}}
+        answers = [page([{'isResolved': True, 'comments': {'nodes': [{'databaseId': 60}]}}], 'c1'),
+                   page([{'isResolved': False, 'comments': {'nodes': [{'databaseId': 61}]}}, {'isResolved': False, 'comments': {'nodes': []}}])]
+        with mock.patch.object(harvest, 'gh_json', side_effect=answers) as gh:
+            self.assertEqual(harvest.threads('o/r', 7), ('contributor', 'babysitter', {60: True, 61: False}))
+        self.assertEqual([c.args[-2:] for c in gh.call_args_list], [('-F', 'n=7'), ('-f', 'after=c1')])
+        stuck = [page([], 'c1'), page([], 'c1')]
+        with mock.patch.object(harvest, 'gh_json', side_effect=stuck), self.assertRaisesRegex(harvest.Unusable, 'no new cursor'):
+            harvest.threads('o/r', 7)
+        ghost = page([])
+        ghost['data']['repository']['pullRequest']['author'] = None
+        with mock.patch.object(harvest, 'gh_json', return_value=ghost):
+            self.assertEqual(harvest.threads('o/r', 7)[0], '', 'a deleted author answers nothing')
+
 
 class EndToEnd(unittest.TestCase):
     def setUp(self):
@@ -895,6 +1024,39 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(sorted(probe), ['bots', 'fingerprint', 'headEventAt', 'headEventEvidence', 'headSha', 'observedAt'],
                          'what the workflow relays, whole, so its seal holds')
         self.assertEqual({k: probe[k] for k in probe if k != 'observedAt'}, {k: full[k] for k in probe if k != 'observedAt'})
+
+    def objection(self, answers, resolved=False):
+        """tinyusb#4613's shape (#591): a collaborator's inline objection on the PR, its thread as GraphQL reads it."""
+        answers['api --paginate --slurp repos/o/r/pulls/7/comments?per_page=100'][0][0].append(
+            inline(4682479462, person('HiFiPhile'), '2026-09-25T10:00:00Z'))
+        answers[THREADS] = [{'data': {'viewer': {'login': 'babysitter'}, 'repository': {'pullRequest': {
+            'author': {'login': 'contributor'}, 'reviewThreads': {'pageInfo': {'hasNextPage': False, 'endCursor': None},
+                                                                  'nodes': [{'isResolved': resolved, 'comments': {'nodes': [{'databaseId': 4682479462}]}}]}}}}}]
+        return answers
+
+    def test_a_persons_waiting_comment_is_reported_and_changes_the_fingerprint_a_probe_reads(self):
+        _, quiet = self.harvest(self.answers([HEAD]))
+        self.assertEqual(quiet['waiting'], [], 'nobody trusted commented, and no GraphQL is asked')
+        code, got = self.harvest(self.objection(self.answers([HEAD])))
+        self.assertEqual(code, 0, got)
+        self.assertEqual([(w['kind'], w['commentId'], w['author'], w['path']) for w in got['waiting']], [('review', 4682479462, 'HiFiPhile', 'src/a.c')])
+        self.assertNotIn(4682479462, [c['commentId'] for c in got['comments']], 'never a bot finding')
+        self.assertNotEqual(got['fingerprint'], quiet['fingerprint'])
+        code, probe = self.harvest(self.objection(self.answers([HEAD])), '--pr', '7', '--reviewers', 'coderabbit,copilot', '--auto-run', 'coderabbit', '--probe')
+        self.assertEqual(code, 0, probe)
+        self.assertNotIn('waiting', probe, "the probe's own shape")
+        self.assertEqual(probe['fingerprint'], got['fingerprint'], 'which a quota wait compares with the full harvest')
+        code, resolved = self.harvest(self.objection(self.answers([HEAD]), resolved=True))
+        self.assertEqual((code, resolved['waiting'], resolved['fingerprint']), (0, [], quiet['fingerprint']), 'resolved: as if never there')
+
+    def test_a_rate_limit_on_the_thread_read_is_reported(self):
+        answers = self.objection(self.answers([HEAD]))
+        answers[THREADS] = [{'stderr': 'GraphQL: API rate limit exceeded for user ID 249515.'}]
+        answers['api rate_limit'] = [{'resources': {'core': {'remaining': 5000, 'reset': 1790000000}, 'graphql': {'remaining': 0, 'reset': 1790000060}}}]
+        code, got = self.harvest(answers)
+        self.assertEqual(code, 2, got)
+        self.assertIn('rate limit', got['error'])
+        self.assertIn('rateLimit', got)
 
     def test_the_repo_named_is_read_instead_of_the_checkouts(self):
         answers = {k.replace('o/r', 'up/r'): v for k, v in self.answers([HEAD]).items()}

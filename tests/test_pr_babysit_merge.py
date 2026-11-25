@@ -326,6 +326,17 @@ class MergeTest(unittest.TestCase):
         self.world.fresh['bots'][1] = bot('copilot', 'settled', None, 'limited')
         self.assertEqual(self.run_it()['outcome'], 'ready', 'Copilot is not a required reviewer')
 
+    def test_a_comment_waiting_for_a_persons_answer_blocks_the_merge(self):
+        """#591: a maintainer's open objection is the human's to settle, never merged over."""
+        url = 'https://github.com/o/r/pull/7#discussion_r4682479462'
+        self.world.fresh['waiting'] = [{'kind': 'review', 'commentId': 4682479462, 'author': 'HiFiPhile', 'authorAssociation': 'COLLABORATOR',
+                                        'path': 'src/a.c', 'line': 3, 'createdAt': '2026-11-20T10:00:00Z', 'url': url, 'digest': '0' * 12,
+                                        'excerpt': 'Keep TUSB_SPEED_LOW supported'}]
+        self.assertBlocked(self.run_it(None, '--merge'), r'^human-review: 1 comment\(s\) by people wait for an answer, theirs to answer or '
+                                                         rf'resolve: 4682479462 by HiFiPhile \({re.escape(url)}\)$')
+        self.world.fresh['waiting'] = []
+        self.assertEqual(self.run_it()['outcome'], 'ready', 'none waiting')
+
     def test_only_the_owners_waiver_drops_a_bot_and_never_every_bot(self):
         # #292: Greptile left out of the launch at the owner's word; CodeRabbit reviewed the head.
         fp = f'coderabbit,copilot|coderabbit|{"0" * 32}'

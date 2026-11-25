@@ -27,10 +27,11 @@ review|issue|review-body, commentId, source, author, body verbatim, digest
 (pr-reply's comment_digest.py: sha256 of the body, 12 hex, without what
 CodeRabbit rewrites at its end or swaps in its summary), aliases (the digests a body's earlier forms
 may have been recorded under; left out when there are none), path, line,
-commitId, createdAt, updatedAt, inReplyTo, url), and fingerprint: `<reviewers>|<auto-run>|<32 hex>`, a
+commitId, createdAt, updatedAt, inReplyTo, url), waiting (below), and fingerprint: `<reviewers>|<auto-run>|<32 hex>`, a
 sha256 over what the bots left that a review of the head could rest on (each comment's kind, id and digest, each
-submitted review by a reviewer, empty ones too, and the head's statuses and check runs from CodeRabbit and Greptile),
-never over a time, so a new, edited or dismissed review or a changed bot status changes it. Two bodies no finding comes from are left
+submitted review by a reviewer, empty ones too, and the head's statuses and check runs from CodeRabbit and Greptile)
+and over each waiting comment's kind, id and digest, never over a time, so a new, edited or dismissed review, a changed
+bot status, or a person's comment that starts or stops waiting changes it. Two bodies no finding comes from are left
 out, with body null, bodyOmitted and bodyLength: a CodeRabbit issue comment that opens
 with its walkthrough marker (CR_WALKTHROUGH) after any other HTML comments, the auto-generated summary,
 "coderabbit-walkthrough"; and a Copilot review body saying it could not review,
@@ -48,8 +49,19 @@ or not, since judgedSha; unbounded paths only on judgedSha the head, with a clea
 Any git failure, missing commit or path outside the repository makes it ineligible, never eligible. An eligible
 comment's body is left out like the two below, bodyOmitted "carried": the caller restores its findings.
 
+waiting lists the comments by people that still wait for an answer (#591), the human's to settle and never a bot
+finding: by an account whose type is not Bot, whose author_association is OWNER, MEMBER or COLLABORATOR, and that is
+neither the PR's author nor the authenticated gh account (the one pr-babysit posts as). An inline comment waits when
+it is the last comment of its review thread (a reply in a bot's thread too) and the thread is unresolved, read through
+GraphQL reviewThreads, keyed by each thread's first comment; a thread GraphQL does not list reads unresolved. An issue
+comment or a non-empty submitted review body waits while neither the PR's author nor that account has posted an issue
+comment or submitted a review after it. Each record: kind, commentId, author, authorAssociation, path and line (null
+but for an inline comment), createdAt, url, digest (sha256 of the body, 12 hex) and excerpt (its first EXCERPT
+characters, whitespace folded). GraphQL is asked only when such a person left a comment at all.
+
 --probe prints only headSha, observedAt, headEventAt, headEventEvidence, bots and fingerprint, sealed (facts.sealed): what a workflow waiting out
-CodeRabbit's rate limit compares with its last full harvest (#359).
+CodeRabbit's rate limit compares with its last full harvest (#359). It reads the waiting comments too, which its
+fingerprint covers, but does not print them.
 """
 
 import base64
@@ -121,6 +133,13 @@ PAUSE_RESUME = re.compile(rf"Reviews resume automatically on ({'|'.join(MONTHS)}
 # A notice that names no resume date stands at most one billing period.
 PAUSE_UNDATED = timedelta(days=31)
 GREPTILE_ERROR = 'Greptile encountered an error while reviewing this PR'
+# The people whose comment waits for an answer (#591), and how much of its body a record shows.
+TRUSTED = ('OWNER', 'MEMBER', 'COLLABORATOR')
+EXCERPT = 200
+THREADS_QUERY = ('query($owner: String!, $name: String!, $n: Int!, $after: String) { viewer { login } '
+                 'repository(owner: $owner, name: $name) { pullRequest(number: $n) { author { login } '
+                 'reviewThreads(first: 100, after: $after) { pageInfo { hasNextPage endCursor } '
+                 'nodes { isResolved comments(first: 1) { nodes { databaseId } } } } } } }')
 GREPTILE_STATUS = '<!-- greptile-status -->'
 # How long a below-threshold confidence result may stand before its review on the head counts as not observed: pr-babysit's REVIEW_CAP_MIN.
 GREPTILE_REVIEW_WAIT = timedelta(minutes=10)
@@ -612,10 +631,10 @@ def entry(kind, c, src, body, created, updated, path=None, line=None, commit=Non
             'path': path, 'line': line, 'commitId': commit, 'createdAt': created, 'updatedAt': updated, 'inReplyTo': reply_to, 'url': c['html_url']}
 
 
-def comments(repo, n, reviewers, issue=None, reviews=None):
-    """Every comment by a reviewer; `issue` and `reviews` are those endpoints already read, None when they were not."""
+def comments(repo, n, reviewers, issue=None, reviews=None, inline=None):
+    """Every comment by a reviewer; `issue`, `reviews` and `inline` are those endpoints already read, None when they were not."""
     got = []
-    for c in pages(f'repos/{repo}/pulls/{n}/comments'):
+    for c in inline if inline is not None else pages(f'repos/{repo}/pulls/{n}/comments'):
         src = source_of(c['user']['login'], reviewers)
         if src:
             got.append(entry('review', c, src, c.get('body'), c['created_at'], c['updated_at'], c.get('path'),
@@ -631,10 +650,84 @@ def comments(repo, n, reviewers, issue=None, reviews=None):
     return got
 
 
-def fingerprint(reviewers, auto, harvested, reviews, statuses, checks):
+def trusted(c):
+    """Whether a comment or review is by a person a pr-babysit run must not talk over: no bot, and a trusted association."""
+    return (c.get('user') or {}).get('type') != 'Bot' and c.get('author_association') in TRUSTED
+
+
+def waiting_record(kind, c, body, created, path=None, line=None):
+    excerpt = ' '.join((body or '').split())
+    return {'kind': kind, 'commentId': c['id'], 'author': c['user']['login'], 'authorAssociation': c['author_association'],
+            'path': path, 'line': line, 'createdAt': created, 'url': c['html_url'], 'digest': digest(body),
+            'excerpt': excerpt if len(excerpt) <= EXCERPT else excerpt[:EXCERPT] + '\u2026'}
+
+
+def threads(repo, n):
+    """(the PR author's login, the gh account's login, {each review thread's first comment databaseId: isResolved}),
+    read through GraphQL a page of 100 threads at a time."""
+    owner, name = repo.split('/')
+    resolved, after = {}, None
+    while True:
+        got = gh_json('api', 'graphql', '-f', f'query={THREADS_QUERY}', '-f', f'owner={owner}', '-f', f'name={name}', '-F', f'n={n}',
+                      *(['-f', f'after={after}'] if after else []))
+        data = got['data']
+        pr = data['repository']['pullRequest']
+        page = pr['reviewThreads']
+        for t in page['nodes']:
+            first = t['comments']['nodes']
+            if first:
+                resolved[first[0]['databaseId']] = t['isResolved'] is True
+        if not page['pageInfo']['hasNextPage']:
+            return (pr.get('author') or {}).get('login') or '', data['viewer']['login'], resolved
+        if not page['pageInfo']['endCursor'] or page['pageInfo']['endCursor'] == after:
+            raise Unusable('GraphQL reviewThreads names a next page with no new cursor to it')
+        after = page['pageInfo']['endCursor']
+
+
+def waiting(repo, n, inline, issue, reviews):
+    """The comments by people still waiting for an answer (#591), oldest first; GraphQL is read only when a trusted
+    person commented at all."""
+    bodies = [r for r in reviews if (r.get('body') or '').strip() and r.get('state') in REVIEW_SUBMITTED]
+    if not any(map(trusted, [*inline, *issue, *bodies])):
+        return []
+    author, viewer, resolved = threads(repo, n)
+    answerers = {x.lower() for x in (author, viewer) if x}
+
+    def person(c):
+        return trusted(c) and (c['user']['login'] or '').lower() not in answerers
+
+    got = []
+    # A thread is its first comment and every reply to it; GitHub points a reply at the first comment, any chain followed.
+    by_id = {c['id']: c for c in inline}
+    roots = {}
+    for c in inline:
+        root, seen = c, {c['id']}
+        while root.get('in_reply_to_id') in by_id and root['in_reply_to_id'] not in seen:
+            root = by_id[root['in_reply_to_id']]
+            seen.add(root['id'])
+        roots.setdefault(root['id'], []).append(c)
+    for root, thread in roots.items():
+        last = max(thread, key=lambda c: (stamp(c['created_at']), c['id']))
+        if person(last) and not resolved.get(root, False):
+            got.append(waiting_record('review', last, last.get('body'), last['created_at'], last.get('path'),
+                                      last.get('line') or last.get('original_line')))
+    # What answers an issue comment or a review body: an issue comment or a submitted review by the author or the gh account.
+    answers = [stamp(c['created_at']) for c in issue if (c['user']['login'] or '').lower() in answerers]
+    answers += [stamp(r['submitted_at']) for r in reviews
+                if (r['user']['login'] or '').lower() in answerers and r.get('state') in REVIEW_SUBMITTED and r.get('submitted_at')]
+    for kind, c, body, at in [*[('issue', c, c.get('body'), c['created_at']) for c in issue],
+                              *[('review-body', r, r['body'], r['submitted_at']) for r in bodies]]:
+        if person(c) and not any(t > stamp(at) for t in answers):
+            got.append(waiting_record(kind, c, body, at))
+    return sorted(got, key=lambda w: (stamp(w['createdAt']), w['commentId']))
+
+
+def fingerprint(reviewers, auto, harvested, reviews, statuses, checks, waits=()):
     """`<reviewers>|<auto-run>|<32 hex>` over the review evidence on the PR, so a later harvest can tell whether any of
-    it changed; the reviewer lists are in it because they decide what is read."""
+    it changed; the reviewer lists are in it because they decide what is read. The comments waiting for a person's
+    answer are in it too; with none, it is what it was before they were read."""
     records = [['comment', c['kind'], c['commentId'], c['digest']] for c in harvested]
+    records += [['waiting', w['kind'], w['commentId'], w['digest']] for w in waits]
     records += [['review', v['id'], v.get('commit_id'), v.get('state'), digest(v.get('body'))]
                 for v in reviews if source_of(v['user']['login'], reviewers)]
     records += [['status', x.get('id'), x.get('context'), x['state'], x.get('description')] for x in statuses if x.get('context') == 'CodeRabbit']
@@ -645,7 +738,8 @@ def fingerprint(reviewers, auto, harvested, reviews, statuses, checks):
     return f"{','.join(reviewers)}|{','.join(auto)}|{hashlib.sha256(blob.encode()).hexdigest()[:32]}"
 
 
-def observe(repo, n, reviewers, auto):
+def observe(repo, n, reviewers, auto, people=False):
+    """One reading of the head; with people, the comments waiting for a person's answer too (`waiting`, else [])."""
     view = gh_json('pr', 'view', str(n), '-R', repo, '--json', 'headRefOid,headRefName,headRepository')
     head = view['headRefOid']
     if not FULL_SHA.match(head or ''):
@@ -656,9 +750,11 @@ def observe(repo, n, reviewers, auto):
         event_at, event_why = None, f'{e}, so whether its run dates the head is not known'
     statuses = pages(f'repos/{repo}/commits/{head}/statuses') if 'coderabbit' in auto else []
     checks = pages(f'repos/{repo}/commits/{head}/check-runs', 'check_runs') if auto else []
-    issue = pages(f'repos/{repo}/issues/{n}/comments') if auto else None
+    issue = pages(f'repos/{repo}/issues/{n}/comments')
     reviews = pages(f'repos/{repo}/pulls/{n}/reviews')
-    harvested = comments(repo, n, reviewers, issue, reviews)
+    inline = pages(f'repos/{repo}/pulls/{n}/comments')
+    harvested = comments(repo, n, reviewers, issue, reviews, inline)
+    waits = waiting(repo, n, inline, issue, reviews) if people else []
     now = datetime.now(timezone.utc)
     bots = []
     for bot in reviewers:
@@ -675,8 +771,8 @@ def observe(repo, n, reviewers, auto):
             n_ = sum(c['source'] == bot for c in harvested)
             bots.append(record(bot, 'harvested', f'{n_} comment(s) harvested; it does not auto-run here, so its state is not read'))
     return {'headSha': head, 'observedAt': now.strftime('%Y-%m-%dT%H:%M:%SZ'),
-            'headEventAt': event_at, 'headEventEvidence': event_why, 'bots': bots, 'comments': harvested,
-            'fingerprint': fingerprint(reviewers, auto, harvested, reviews, statuses, checks)}
+            'headEventAt': event_at, 'headEventEvidence': event_why, 'bots': bots, 'comments': harvested, 'waiting': waits,
+            'fingerprint': fingerprint(reviewers, auto, harvested, reviews, statuses, checks, waits)}
 
 
 CARRY_KEYS = {'commentId', 'digest', 'judgedSha', 'paths'}
@@ -771,7 +867,7 @@ def collect(argv):
     repo = bind_repo(a.repo)
     try:
         for _ in range(2):
-            seen = observe(repo, a.pr, reviewers, auto)
+            seen = observe(repo, a.pr, reviewers, auto, people=True)
             again = gh_json('pr', 'view', str(a.pr), '-R', repo, '--json', 'headRefOid')['headRefOid']
             if again == seen['headSha']:
                 return {k: seen[k] for k in PROBE} if a.probe else {**seen, 'carry': carried(entries, seen['comments'], seen['headSha'])}

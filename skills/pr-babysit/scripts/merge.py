@@ -9,7 +9,8 @@ FILE the last launch's saved Workflow output and D its stateDigest. Every condit
 every finding of its last harvest settled in its state; no blocker launch_result.py reads, no deferral, hold, reply
 debt or pending publication, its state matching D and its own digest, pinned to that PR), one head everywhere (the
 checkout's, the state's, the reviewed one, the reviews', CI's and the PR's), a fresh harvest (harvest.py with the
-launch's reviewers, from its fingerprint: the same fingerprint, CodeRabbit and Greptile both `reviewed` on the head
+launch's reviewers, from its fingerprint: the same fingerprint, no comment by a person waiting for an answer (its
+`waiting`, #591), CodeRabbit and Greptile both `reviewed` on the head
 and in its auto-run list, but for a bot --waive names: the owner's word that the merge goes without it, which a bot
 merely left out of auto-run never is; waiving both refuses, a merge needs one bot's review of the head),
 a fresh CI inventory (collect.py with no ignored check: green, mergeable, nothing pending, for the granted base,
@@ -238,6 +239,10 @@ def review_blockers(repo, n, fingerprint, head, waived=()):
         blockers.append(f"reviews: harvested head {fresh['headSha']}, not {head}")
     if fresh['fingerprint'] != fingerprint:
         blockers.append('fingerprint: the review evidence changed since the launch judged it: relaunch a `both` launch on the same state')
+    waits = fresh.get('waiting') or []
+    if waits:
+        named = ', '.join(f"{w.get('commentId')} by {w.get('author')} ({w.get('url')})" for w in waits)
+        blockers.append(f"human-review: {len(waits)} comment(s) by people wait for an answer, theirs to answer or resolve: {launch_result.cut(named)}")
     for b in fresh['bots']:
         if b['bot'] in required and (b['state'], b['sha']) != ('reviewed', head):
             blockers.append(f"{b['bot']}-unreviewed: {b['state']}{'/' + b['kind'] if b.get('kind') else ''}: {launch_result.cut(b.get('reason') or '')}")

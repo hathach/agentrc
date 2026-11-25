@@ -29,7 +29,7 @@ S="${AGENTRC_DIR:-$HOME/.claude}/skills/pr-babysit/scripts"
 python3 "$S/preflight.py" --pr N [--repo R] [--needs P] [--module M]  # the checkout, the PR it must stay and this interpreter; P a script the workflow calls, M a module it needs
 python3 "$S/preflight.py" --recheck            # before a commit: has the checkout moved?
 python3 "$S/preflight.py" --state N [--repo R]  # before a GitHub write: is the PR still OPEN?
-python3 "$S/harvest.py" --pr N [--repo R] --reviewers coderabbit,greptile --auto-run coderabbit  # bot states + review comments
+python3 "$S/harvest.py" --pr N [--repo R] --reviewers coderabbit,greptile --auto-run coderabbit  # bot states + review comments + people's comments still waiting
 python3 "$S/hooks.py" [--deadline-seconds N] 'src/a.c' 'docs/b.rst'   # from the checkout's top level; killed past N s (540), cleanup 20 s more
 python3 "$S/commits.py" commit [--skip-hooks <ids>] [--receipt <file> --request <r>] 'src/a.c' < msg  # commit exactly these paths, the message on stdin; the line saved to a new <file>; <ids> added to pre-commit's SKIP
 python3 "$S/commits.py" receipt <file> --request <r> --parent <sha> 'src/a.c'  # what that commit printed, for this request, parent and paths only
@@ -68,6 +68,12 @@ launch, lists the `blockers` to settle before continuing, and shows as `pinned`
 the arguments the state is fixed to, which a continuation passes unchanged.
 A head whose only CI left is Actions runs awaiting a maintainer's approval (collect.py's `awaiting-approval`) stops
 `ci-awaiting-approval` at the CI lane's read, naming them in `awaitingApproval`; nothing here approves or re-runs them.
+A comment by a person, an owner, member or collaborator other than the PR's author and the posting account, that still
+waits for an answer (harvest.py's `waiting`: an unresolved thread whose last word is theirs, or an issue comment or
+review body neither the author nor the posting account spoke after) stops the launch `human-review` right after the
+harvest, before anything is fixed, answered, pushed or counted done, naming each in `waiting` (#591); it is the
+human's to answer or resolve, never the run's, and a relaunch passes once a person replied, resolved it or the author
+answered. `merge.py` refuses a merge while one waits.
 A launch on a PR no longer open stops `pr-merged` or `pr-closed`, at preflight or at the CI lane's next read; nothing is left to continue. Every GitHub or SonarCloud write reads the state first (`preflight.py --state`, or `push.py --open-pr` for a push) and goes on only for an OPEN PR; an unreadable state stops `pr-state-unread`.
 `preflight.py`, `harvest.py`, `scope_check.py`, `state_transfer.py`, `launch_result.py` and `commits.py` only read, except that
 each writes its AGENTRC_EMIT file, `preflight.py` creates the launch's receipts directory and `commits.py commit` stages and commits exactly its paths, saving its receipt; `hooks.py` runs the repository's hooks, which may rewrite

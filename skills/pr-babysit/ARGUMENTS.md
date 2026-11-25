@@ -29,6 +29,12 @@ A key not listed here throws before anything runs.
   continuation passes it again (`launch_result.py`'s `pinned`).
 - `reviewers`: of `copilot`, `coderabbit`, `greptile`, `code-scanning`;
   default `['coderabbit', 'greptile', 'code-scanning']`; `[]` runs no review lane.
+  The review lane's harvest also reads the comments people left: one by an
+  owner, member or collaborator other than the PR's author and the posting
+  account that still waits for an answer stops the launch `human-review`,
+  naming each in `waiting`, before anything is fixed, answered or pushed
+  (#591). No argument answers it: a relaunch passes once a person replied in
+  the thread or resolved it, or the author answered.
 - `autoRun`: the reviewers that run on every push and gate done; default
   `reviewers` without `copilot` and `code-scanning`, which are only harvested.
   Every reviewer is reported with its state; only these are waited on, which is
