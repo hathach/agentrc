@@ -753,6 +753,137 @@ class RepositoryPause(unittest.TestCase):
                 harvest.repo_paused('o/r', 503, [], dict(self.ABSENT), None, self.NOW)
 
 
+def threads_key(cursor=None):
+    """FakeGh's key for one page of harvest.py's review threads query on o/r PR 7."""
+    return ' '.join(['api', 'graphql', '-f', f'query={harvest.THREADS_QUERY}', '-f', 'o=o', '-f', 'r=r', '-F', 'p=7',
+                     *(['-f', f'c={cursor}'] if cursor else [])])
+
+
+def threads_page(nodes, after=None, viewer='runner'):
+    return {'data': {'viewer': {'login': viewer},
+                     'repository': {'pullRequest': {'reviewThreads': {'pageInfo': {'hasNextPage': after is not None, 'endCursor': after},
+                                                                      'nodes': nodes}}}}}
+
+
+def thread(login, association='COLLABORATOR', resolved=False, typename='User', id_=70, body='keep it', line=12):
+    return {'isResolved': resolved, 'comments': {'nodes': [{
+        'databaseId': id_, 'author': {'__typename': typename, 'login': login}, 'authorAssociation': association, 'url': f'u/{id_}',
+        'path': 'src/a.c', 'line': line, 'originalLine': 9, 'createdAt': EVENT, 'body': body}]}}
+
+
+def said(login, body, at, id_, association='COLLABORATOR', type_='User'):
+    """An issue comment by a person, with the author_association GitHub gives it."""
+    return {**comment(login, body, at, id_=id_), 'user': {'login': login, 'type': type_}, 'author_association': association}
+
+
+def reviewed(login, body, at, id_, association='COLLABORATOR', state='COMMENTED', type_='User'):
+    return {**review(login, HEAD, body, at, id_), 'user': {'login': login, 'type': type_}, 'author_association': association, 'state': state}
+
+
+class HumanWaiting(unittest.TestCase):
+    """#591: a trusted person's comment that waits for an answer, read apart from the bots' comments."""
+    AUTHOR, RUNNER = 'alice', 'runner'
+
+    def waiting(self, issue=(), reviews=(), threads=(), viewer=RUNNER):
+        pages_ = iter([threads_page(list(threads), viewer=viewer)])
+        with mock.patch.object(harvest, 'gh_json', side_effect=lambda *a: next(pages_)):
+            return [(w['kind'], w['id']) for w in harvest.human_waiting('o/r', 7, self.AUTHOR, list(issue), list(reviews))]
+
+    def test_only_a_trusted_person_other_than_the_author_is_waited_for(self):
+        for name, c, want in (
+                ('owner', said('bob', 'no', EVENT, 1, 'OWNER'), [('issue', 1)]),
+                ('member', said('bob', 'no', EVENT, 1, 'MEMBER'), [('issue', 1)]),
+                ('collaborator', said('bob', 'no', EVENT, 1), [('issue', 1)]),
+                ('contributor', said('bob', 'no', EVENT, 1, 'CONTRIBUTOR'), []),
+                ('no association', said('bob', 'no', EVENT, 1, 'NONE'), []),
+                ('a bot account', said('ci-helper[bot]', 'no', EVENT, 1, 'MEMBER', 'Bot'), []),
+                ('the author', said('alice', 'no', EVENT, 1, 'OWNER'), []),
+                ('the author, cased otherwise', said('Alice', 'no', EVENT, 1, 'OWNER'), [])):
+            with self.subTest(name):
+                self.assertEqual(self.waiting(issue=[c]), want)
+        for name, t, want in (
+                ('collaborator', thread('bob'), [('inline', 70)]),
+                ('contributor', thread('bob', 'CONTRIBUTOR'), []),
+                ('a bot', thread('coderabbitai', 'NONE', typename='Bot'), []),
+                ('a bot the repository trusts', thread('helper', 'MEMBER', typename='Bot'), []),
+                ('the author', thread('alice', 'OWNER'), []),
+                ('a deleted account', {**thread('bob'), 'comments': {'nodes': [{**thread('bob')['comments']['nodes'][0], 'author': None}]}}, [])):
+            with self.subTest(name):
+                self.assertEqual(self.waiting(threads=[t]), want)
+        self.assertEqual(self.waiting(reviews=[reviewed('bob', 'Keep TUSB_SPEED_LOW', EVENT, 3, state='CHANGES_REQUESTED')]), [('review', 3)])
+        self.assertEqual(self.waiting(reviews=[reviewed('bob', '', EVENT, 3, state='APPROVED')]), [], 'an empty review body says nothing to answer')
+        self.assertEqual(self.waiting(reviews=[reviewed('bob', 'no', EVENT, 3, state='PENDING')]), [], 'an unsubmitted review')
+
+    def test_the_account_the_run_acts_as_neither_waits_nor_answers_unless_it_is_the_author(self):
+        own = [said('Runner', '@greptileai', EVENT, 1, 'OWNER')]
+        self.assertEqual(self.waiting(issue=own), [], 'its trigger comment')
+        self.assertEqual(self.waiting(reviews=[reviewed('runner', 'Found 2 issues', EVENT, 3, 'OWNER')]), [], 'its review body')
+        self.assertEqual(self.waiting(threads=[thread('runner', 'OWNER')]), [], 'its reply, last in an unresolved bot thread')
+        asked = said('bob', 'why?', '2026-09-25T09:00:00Z', 2)
+        self.assertEqual(self.waiting(issue=[asked, said('runner', 'x', '2026-09-25T09:00:01Z', 4, 'OWNER')]), [('issue', 2)],
+                         'not the author, so no answer')
+        self.assertEqual(self.waiting(issue=[asked, said('alice', 'x', '2026-09-25T09:00:01Z', 4, 'OWNER')], viewer='alice'), [],
+                         "the author's own run answers as the author")
+
+    def test_an_inline_thread_waits_while_unresolved_and_its_last_comment_is_a_trusted_persons(self):
+        self.assertEqual(self.waiting(threads=[thread('bob', resolved=True)]), [], 'resolved')
+        self.assertEqual(self.waiting(threads=[thread('alice', 'OWNER', id_=71)]), [], "the author's reply is the thread's last comment")
+        self.assertEqual(self.waiting(threads=[thread('bob', id_=72)]), [('inline', 72)], "the person's comment after the author's is its last")
+        self.assertEqual(self.waiting(threads=[{'isResolved': False, 'comments': {'nodes': []}}]), [])
+        pages_ = iter([threads_page([thread('bob', line=None)])])
+        with mock.patch.object(harvest, 'gh_json', side_effect=lambda *a: next(pages_)):
+            w, = harvest.human_waiting('o/r', 7, self.AUTHOR, [], [])
+        self.assertEqual(w, {'kind': 'inline', 'id': 70, 'author': 'bob', 'url': 'u/70', 'path': 'src/a.c', 'line': 9, 'createdAt': EVENT,
+                             'digest': harvest.digest('keep it')}, 'an outdated thread is located on its original line; no body')
+
+    def test_a_top_level_comment_is_answered_only_by_a_strictly_later_issue_comment_or_review_of_the_author(self):
+        asked = said('bob', 'why?', '2026-09-25T09:00:00Z', 1)
+        for name, answer, want in (
+                ('no answer', [], [('issue', 1)]),
+                ('an earlier comment', [said('alice', 'x', '2026-09-25T08:59:59Z', 2, 'OWNER')], [('issue', 1)]),
+                ('one at the same second', [said('alice', 'x', '2026-09-25T09:00:00Z', 2, 'OWNER')], [('issue', 1)]),
+                ('a later comment', [said('alice', 'x', '2026-09-25T09:00:01Z', 2, 'OWNER')], [])):
+            with self.subTest(name):
+                self.assertEqual(self.waiting(issue=[asked, *answer]), want)
+        for name, answer, want in (
+                ('an empty later review', reviewed('alice', '', '2026-09-25T09:00:01Z', 5, 'OWNER'), []),
+                ('a later review with a body', reviewed('alice', 'done', '2026-09-25T09:00:01Z', 5, 'OWNER'), []),
+                ('an unsubmitted later review', reviewed('alice', '', '2026-09-25T09:00:01Z', 5, 'OWNER', state='PENDING'), [('issue', 1)])):
+            with self.subTest(name):
+                self.assertEqual(self.waiting(issue=[asked], reviews=[answer]), want)
+        body = reviewed('bob', 'needs work', '2026-09-25T09:00:00Z', 3, state='CHANGES_REQUESTED')
+        self.assertEqual(self.waiting(issue=[said('alice', 'x', '2026-09-25T09:00:01Z', 2, 'OWNER')], reviews=[body]), [], 'a review body too')
+        self.assertEqual(self.waiting(reviews=[body], threads=[thread('alice', 'OWNER')]), [('review', 3)], 'an inline reply answers no top-level comment')
+
+    def test_the_threads_are_read_page_by_page_and_a_failed_read_is_an_error(self):
+        seen = []
+        answers = {None: threads_page([thread('bob', resolved=True, id_=80)], after='c1'), 'c1': threads_page([thread('bob', id_=81)])}
+
+        def gh(*argv):
+            seen.append(argv)
+            cursor = next((a[2:] for a in argv if a.startswith('c=')), None)
+            return answers[cursor]
+        with mock.patch.object(harvest, 'gh_json', side_effect=gh):
+            self.assertEqual([w['id'] for w in harvest.human_waiting('o/r', 7, self.AUTHOR, [], [])], [81])
+        self.assertEqual([a[-2:] for a in seen], [('-F', 'p=7'), ('-f', 'c=c1')])
+        with mock.patch.object(harvest, 'gh_json', side_effect=harvest.Unusable('gh api graphql: HTTP 502')):
+            with self.assertRaises(harvest.Unusable):
+                harvest.human_waiting('o/r', 7, self.AUTHOR, [], [])
+        with mock.patch.object(harvest, 'gh_json', return_value={'errors': [{'message': 'Something went wrong'}], 'data': None}):
+            with self.assertRaisesRegex(harvest.Unusable, 'Something went wrong'):
+                harvest.human_waiting('o/r', 7, self.AUTHOR, [], [])
+
+    def test_a_waiting_comment_is_in_the_fingerprint(self):
+        def fp(*waiting):
+            return harvest.fingerprint(['coderabbit'], ['coderabbit'], [], [], [], [], [{'kind': k, 'id': i, 'digest': d} for k, i, d in waiting])
+        base = fp(('issue', 1, 'd1'))
+        for name, other in (('none waiting', fp()), ('another one', fp(('issue', 1, 'd1'), ('inline', 2, 'd2'))),
+                            ('an edit', fp(('issue', 1, 'd9'))), ('another kind', fp(('review', 1, 'd1')))):
+            with self.subTest(name):
+                self.assertNotEqual(other, base)
+        self.assertEqual(fp(('issue', 1, 'd1')), base)
+
+
 class FakeGh:
     """A gh answering from a {joined argv: [answers...]} map; each call pops the first answer that remains."""
 
@@ -800,7 +931,7 @@ class Fingerprint(unittest.TestCase):
         return [inline], reviews, statuses, checks
 
     def fp(self, harvested, reviews, statuses, checks):
-        return harvest.fingerprint(self.REVIEWERS, self.AUTO, harvested, reviews, statuses, checks)
+        return harvest.fingerprint(self.REVIEWERS, self.AUTO, harvested, reviews, statuses, checks, [])
 
     def test_it_changes_with_the_review_evidence_and_nothing_else(self):
         base = self.fp(*self.evidence())
@@ -834,7 +965,7 @@ class Fingerprint(unittest.TestCase):
 
     def test_the_reviewer_lists_are_part_of_it(self):
         ev = self.evidence()
-        self.assertNotEqual(harvest.fingerprint(['coderabbit', 'greptile'], ['coderabbit'], *ev), self.fp(*ev))
+        self.assertNotEqual(harvest.fingerprint(['coderabbit', 'greptile'], ['coderabbit'], *ev, []), self.fp(*ev))
 
 
 class EndToEnd(unittest.TestCase):
@@ -846,10 +977,11 @@ class EndToEnd(unittest.TestCase):
 
     def answers(self, heads):
         R, N = 'o/r', 7
-        view = lambda h: {'headRefOid': h, 'headRefName': 'fix', 'headRepository': {'name': 'r', 'nameWithOwner': 'o/r'}}
+        view = lambda h: {'headRefOid': h, 'headRefName': 'fix', 'headRepository': {'name': 'r', 'nameWithOwner': 'o/r'}, 'author': {'login': 'alice'}}
         run = lambda id_, event, path, at, h=HEAD: {'id': id_, 'event': event, 'path': path, 'created_at': at, 'head_sha': h,
                                                     'head_branch': 'fix', 'head_repository': {'full_name': 'o/r'}}
-        a = {f'pr view {N} -R {R} --json headRefOid,headRefName,headRepository': [view(h) for h in heads],
+        a = {f'pr view {N} -R {R} --json headRefOid,headRefName,headRepository,author': [view(h) for h in heads],
+             threads_key(): [threads_page([])],
              f'pr view {N} -R {R} --json headRefOid': [{'headRefOid': h} for h in heads[1:] + heads[-1:]]}
         for h in set(heads):
             a[f'api --paginate --slurp repos/{R}/actions/runs?head_sha={h}&per_page=100'] = [[{'workflow_runs': [
@@ -902,7 +1034,7 @@ class EndToEnd(unittest.TestCase):
         argv = ['--pr', '7', '--reviewers', 'coderabbit,copilot', '--auto-run', 'coderabbit', '--probe']
         code, probe = self.harvest(self.answers([HEAD]), *argv)
         self.assertEqual(code, 0, probe)
-        self.assertEqual(sorted(probe), ['bots', 'fingerprint', 'headEventAt', 'headEventEvidence', 'headSha', 'observedAt'],
+        self.assertEqual(sorted(probe), ['bots', 'fingerprint', 'headEventAt', 'headEventEvidence', 'headSha', 'humanWaiting', 'observedAt'],
                          'what the workflow relays, whole, so its seal holds')
         self.assertEqual({k: probe[k] for k in probe if k != 'observedAt'}, {k: full[k] for k in probe if k != 'observedAt'})
 
@@ -959,8 +1091,60 @@ class EndToEnd(unittest.TestCase):
             self.assertEqual(sorted(harvest.line([*argv, '--probe'])), sorted([*harvest.PROBE, 'seal']), 'a probe reads no comments, so writes no reading')
         self.assertFalse(Path(f'{probe}.reading.json').exists())
 
+    def test_a_trusted_persons_waiting_comments_are_listed_apart_from_the_bots(self):
+        """#591: hathach/tinyusb#4613's shape, a collaborator's inline objection and review body the run never saw."""
+        answers = self.answers([HEAD])
+        answers[threads_key()] = [threads_page([thread('bob', resolved=True, id_=70)], after='p2')]
+        answers[threads_key('p2')] = [threads_page([thread('bob', id_=71, body='Keep TUSB_SPEED_LOW supported')])]
+        answers['api --paginate --slurp repos/o/r/pulls/7/reviews?per_page=100'][0][0].append(
+            reviewed('bob', 'see inline', '2026-09-25T09:10:00Z', 33, state='CHANGES_REQUESTED'))
+        code, got = self.harvest(answers)
+        self.assertEqual(code, 0, got)
+        self.assertEqual([(w['kind'], w['id'], w['author']) for w in got['humanWaiting']], [('inline', 71, 'bob'), ('review', 33, 'bob')])
+        self.assertEqual(got['humanWaiting'][0]['digest'], harvest.digest('Keep TUSB_SPEED_LOW supported'))
+        self.assertNotIn(33, [c['commentId'] for c in got['comments']], 'never a bot comment to judge')
+        self.assertTrue(all('body' not in w for w in got['humanWaiting']))
+        alone = {k: v for k, v in answers.items() if '/pulls/7/comments' not in k}
+        probe = self.harvest(alone, '--pr', '7', '--reviewers', '', '--probe')
+        self.assertEqual((probe[0], probe[1]['humanWaiting'], probe[1]['bots']), (0, got['humanWaiting'], []),
+                         'with no reviewer named, and no inline REST comment read')
+        fps = {got['fingerprint']}
+        for name, change in (
+                ('an edit', lambda a: a[threads_key('p2')][0]['data']['repository']['pullRequest']['reviewThreads']['nodes'][0]
+                 ['comments']['nodes'][0].update(body='Keep TUSB_SPEED_LOW, please')),
+                ('a resolution', lambda a: a[threads_key('p2')][0]['data']['repository']['pullRequest']['reviewThreads']['nodes'][0]
+                 .update(isResolved=True)),
+                ("the author's answer", lambda a: a['api --paginate --slurp repos/o/r/issues/7/comments?per_page=100'][0][0].append(
+                    said('alice', 'done', '2026-09-25T09:20:00Z', 23, 'OWNER')))):
+            with self.subTest(name):
+                changed = json.loads(json.dumps(answers))
+                change(changed)
+                code, again = self.harvest(changed)
+                self.assertEqual(code, 0, again)
+                self.assertNotIn(again['fingerprint'], fps)
+                fps.add(again['fingerprint'])
+
+    def test_an_unread_run_account_fails_the_harvest(self):
+        for name, page in (('no login', threads_page([], viewer=None)), ('no viewer', {'data': {**threads_page([])['data'], 'viewer': None}})):
+            with self.subTest(name):
+                answers = self.answers([HEAD])
+                answers[threads_key()] = [page]
+                code, got = self.harvest(answers)
+                self.assertEqual(code, 2, got)
+                self.assertNotIn('humanWaiting', got)
+
+    def test_a_failed_thread_read_fails_the_harvest(self):
+        for answer in ({'stderr': 'HTTP 401: Bad credentials'}, {'errors': [{'message': 'Could not resolve to a PullRequest'}], 'data': None}):
+            with self.subTest(answer):
+                answers = self.answers([HEAD])
+                answers[threads_key()] = [answer]
+                code, got = self.harvest(answers)
+                self.assertEqual(code, 2, got)
+                self.assertNotIn('humanWaiting', got)
+
     def test_the_repo_named_is_read_instead_of_the_checkouts(self):
         answers = {k.replace('o/r', 'up/r'): v for k, v in self.answers([HEAD]).items()}
+        answers[threads_key().replace(' -f o=o ', ' -f o=up ')] = answers.pop(threads_key())
         code, got = self.harvest(answers, '--pr', '7', '--reviewers', 'coderabbit,copilot', '--auto-run', 'coderabbit', '--repo', 'up/r')
         self.assertEqual((code, got['headSha']), (0, HEAD), got)
 
@@ -1050,7 +1234,7 @@ class EndToEnd(unittest.TestCase):
                 ('secondary', {'core': {'remaining': 5000, 'reset': 1790000000}}, (None, True))):
             with self.subTest(name):
                 answers = self.answers([HEAD])
-                answers['pr view 7 -R o/r --json headRefOid,headRefName,headRepository'] = [limited]
+                answers['pr view 7 -R o/r --json headRefOid,headRefName,headRepository,author'] = [limited]
                 answers['api rate_limit'] = [{'resources': resources}]
                 code, got = self.harvest(answers)
                 self.assertEqual(code, 2)
@@ -1058,7 +1242,7 @@ class EndToEnd(unittest.TestCase):
                 self.assertEqual((got['rateLimit']['resetAt'], got['rateLimit']['secondary']), want)
                 self.assertRegex(got['rateLimit']['observedAt'], r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$')
         answers = self.answers([HEAD])
-        answers['pr view 7 -R o/r --json headRefOid,headRefName,headRepository'] = [{'stderr': 'HTTP 404: Not Found'}]
+        answers['pr view 7 -R o/r --json headRefOid,headRefName,headRepository,author'] = [{'stderr': 'HTTP 404: Not Found'}]
         code, got = self.harvest(answers)
         self.assertEqual((code, 'rateLimit' in got), (2, False), 'another failure keeps its plain error line')
 

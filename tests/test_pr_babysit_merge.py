@@ -64,7 +64,8 @@ class World:
     def __init__(self):
         self.views = [live()]
         self.rules = []
-        self.fresh = {'headSha': HEAD, 'fingerprint': FP, 'bots': [bot('coderabbit'), bot('copilot', 'absent', None), bot('greptile')]}
+        self.fresh = {'headSha': HEAD, 'fingerprint': FP, 'bots': [bot('coderabbit'), bot('copilot', 'absent', None), bot('greptile')],
+                      'humanWaiting': []}
         self.inventory = {'head': HEAD, 'baseRef': 'main', 'status': 'green', 'mergeable': 'MERGEABLE', 'pending': 0, 'registered': 12,
                           'ignored': [], 'waiting': '', 'checks': [], 'requiredChecks': [], 'observedAt': 'now'}
         self.merged = (0, '', '')
@@ -330,7 +331,7 @@ class MergeTest(unittest.TestCase):
         # #292: Greptile left out of the launch at the owner's word; CodeRabbit reviewed the head.
         fp = f'coderabbit,copilot|coderabbit|{"0" * 32}'
         output = lambda: launch_output(reviews={'fingerprint': fp, 'bots': [bot('coderabbit')]})
-        self.world.fresh = {'headSha': HEAD, 'fingerprint': fp, 'bots': [bot('coderabbit'), bot('copilot', 'absent', None)]}
+        self.world.fresh = {'headSha': HEAD, 'fingerprint': fp, 'bots': [bot('coderabbit'), bot('copilot', 'absent', None)], 'humanWaiting': []}
         self.assertBlocked(self.run_it(output()), 'did not settle greptile')
         got = self.run_it(output(), '--waive', 'greptile')
         self.assertEqual((got['outcome'], got['blockers'], got['waived']), ('ready', [], ['greptile']), got)
@@ -408,6 +409,15 @@ class MergeTest(unittest.TestCase):
     def test_review_evidence_changed_since_the_launch(self):
         self.world.fresh['fingerprint'] = FP[:-1] + '1'
         self.assertBlocked(self.run_it(None, '--merge'), '^fingerprint: .*relaunch a `both` launch')
+
+    def test_a_trusted_persons_waiting_comment_refuses_the_merge_whatever_is_waived(self):
+        """#591: the fresh harvest's humanWaiting, even under the launch's own fingerprint."""
+        self.world.fresh['humanWaiting'] = [{'kind': 'inline', 'id': 71, 'author': 'bob', 'url': 'https://github.com/o/r/pull/7#discussion_r71',
+                                             'path': 'src/a.c', 'line': 3, 'createdAt': 'then', 'digest': 'd71'}]
+        got = self.run_it(None, '--merge')
+        self.assertBlocked(got, r'^human-review-pending: inline comment 71 by bob at src/a\.c:3 waits for an answer: https://github\.com/o/r/pull/7#discussion_r71$')
+        self.assertEqual(self.world.merges, [])
+        self.assertBlocked(self.run_it(None, '--waive', 'coderabbit', '--merge'), '^human-review-pending: ')
 
     def test_ci_must_be_green_with_nothing_ignored(self):
         cases = {

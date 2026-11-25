@@ -130,6 +130,9 @@ STALLED = {
     'pending-review': 'the posting account holds a pending review on the PR (`review`, by `login`), and GitHub refuses its replies '
                       'while it does: report it for the human to submit or delete, never submit or delete it yourself, and relaunch '
                       'from the stateRef once it is gone',
+    'human-review-pending': "a trusted person's review comment waits for an answer (`humanWaiting`, each listed below): it is the "
+                            "human's to settle, never a bot finding to judge, fix, reply to or resolve here; report each, and "
+                            'relaunch from the stateRef once the PR\'s author answered it or its thread is resolved',
     'harvest-failed': "harvest.py failed twice in a row (`detail`): fix what its error names, such as a module the "
                       "launch's interpreter lacks, or relaunch once a passing cause (a head still moving, a GitHub outage) cleared",
     'ci-collect-failed': "collect.py failed the same way on two cycles running (`detail`): fix what its error names, such as an "
@@ -240,6 +243,12 @@ def ci_recovery(r):
     return (f"orphaned-run recovery {r.get('outcome')}: {cut(r.get('detail') or '')}" + ''.join(f'\n- {x}' for x in runs) +
             '\nEach run attempt is cancelled and re-run at most once, by its record under the checkout\'s git common dir: a relaunch '
             'resumes a cancel that completed since, and sends nothing a record shows sent')
+
+
+def waiting_comment(w):
+    """One human-review-pending comment: who wrote it, where, and its link."""
+    where = f" at {w['path']}:{w.get('line')}" if w.get('path') else ''
+    return f"{w.get('kind')} comment {w.get('id')} by {w.get('author')}{where} waits for an answer: {w.get('url')}"
 
 
 def cut(text, limit=CUT):
@@ -477,6 +486,8 @@ def summarize(output, output_path, state_ref=None, tree=None, keys=False):
             runs = result.get('awaitingApproval') if isinstance(result.get('awaitingApproval'), list) else []
             blockers.append(f"the head's Actions runs {cut(', '.join(map(str, runs))) or '(unnamed)'} wait for a maintainer to approve "
                             "them on GitHub (#545): no failure, and nothing here approves or re-runs them; relaunch once they are approved")
+        if result.get('reason') == 'human-review-pending':
+            blockers += [waiting_comment(w) for w in result.get('humanWaiting') or [] if isinstance(w, dict)]
         if result.get('reason') == 'held-awaiting-caller':
             blockers += [f"finding {h.get('findingId')} on comment {h.get('commentId')} is held for the caller, and another launch "
                          f"cannot lift it: {cut(h.get('reason') or '')}" for h in result.get('held') or []]

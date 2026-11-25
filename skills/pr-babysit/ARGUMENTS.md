@@ -29,6 +29,12 @@ A key not listed here throws before anything runs.
   continuation passes it again (`launch_result.py`'s `pinned`).
 - `reviewers`: of `copilot`, `coderabbit`, `greptile`, `code-scanning`;
   default `['coderabbit', 'greptile', 'code-scanning']`; `[]` runs no review lane.
+  Either way harvest.py reads the comments of the people the repository trusts
+  each cycle, again right before each push and the fix notes after it, and
+  before an adoption's push: one that waits for an answer stops
+  `human-review-pending` before anything more is asked, fixed, answered or
+  pushed, listing it in `humanWaiting` for the human to settle; a repair it
+  holds stays committed, unpublished, as the state's `pending` candidate.
 - `autoRun`: the reviewers that run on every push and gate done; default
   `reviewers` without `copilot` and `code-scanning`, which are only harvested.
   Every reviewer is reported with its state; only these are waited on, which is
@@ -118,11 +124,17 @@ A key not listed here throws before anything runs.
 - `generated`: regex over repo-relative paths a fixer's build regenerates; a
   plain modification to one is admitted into the commit on the caller's word
   that the repository hooks validate it.
-- `build`: verify command, `<BUILD>` for a fresh build directory, carrying any
-  environment setup it needs; default the repository's build contract, its
-  setup and the tools it requires resolved with it, every built target's or
-  board family's included, a missing one stopping `build-unverifiable` rather
-  than failing the batch; per launch. Only a tool the resolver names is checked
+- `build`: verify command, `<BUILD>` for a fresh build directory and `<BASE>`
+  for the merge-base of HEAD and the PR's base as GitHub records it
+  (`baseRefOid`), carrying any environment setup it needs; a base not in the
+  checkout stops `build-unverifiable`: fetch it. Default the repository's build
+  contract, its setup and the tools it requires resolved with it, every built
+  target's or board family's included, a missing one stopping
+  `build-unverifiable` rather than failing the batch; per launch. A resolved
+  command selecting its targets from a change takes `<BASE>` for its base: one
+  whose `--base X` or `--base=X`, the only base syntax checked, names anything
+  but a whole `<BASE>` is a resolution failure, `build-unverifiable`, and
+  a given `build` is run as given. Only a tool the resolver names is checked
   before the build: one only a build wrapper invokes and the contract never
   names still fails the build as unverified. The build runs detached and is
   waited on over calls of at most nine minutes each, up to 180 minutes; one

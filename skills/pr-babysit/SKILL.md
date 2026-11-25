@@ -29,7 +29,7 @@ S="${AGENTRC_DIR:-$HOME/.claude}/skills/pr-babysit/scripts"
 python3 "$S/preflight.py" --pr N [--repo R] [--needs P] [--module M]  # the checkout, the PR it must stay and this interpreter; P a script the workflow calls, M a module it needs
 python3 "$S/preflight.py" --recheck            # before a commit: has the checkout moved?
 python3 "$S/preflight.py" --state N [--repo R]  # before a GitHub write: is the PR still OPEN?
-python3 "$S/harvest.py" --pr N [--repo R] --reviewers coderabbit,greptile --auto-run coderabbit  # bot states + review comments
+python3 "$S/harvest.py" --pr N [--repo R] --reviewers coderabbit,greptile --auto-run coderabbit  # bot states + review comments + people's comments awaiting an answer
 python3 "$S/hooks.py" [--deadline-seconds N] 'src/a.c' 'docs/b.rst'   # from the checkout's top level; killed past N s (540), cleanup 20 s more
 python3 "$S/commits.py" commit [--skip-hooks <ids>] [--receipt <file> --request <r>] 'src/a.c' < msg  # commit exactly these paths, the message on stdin; the line saved to a new <file>; <ids> added to pre-commit's SKIP
 python3 "$S/commits.py" receipt <file> --request <r> --parent <sha> 'src/a.c'  # what that commit printed, for this request, parent and paths only
@@ -40,7 +40,7 @@ python3 "$S/sonar.py" --pr N [--repo R] --head <sha> --manifest <file> [--receip
 python3 "$S/coderabbit_trigger.py" --pr N [--repo R] --head <sha> [--request]  # tick CodeRabbit's Trigger review box when it skipped the head for a manual review; --request comments `@coderabbitai review` once its rate limit has reset, on such a skip no tick asked for, or when its review of the head failed, and `@coderabbitai full review` when it skipped the head with no files to review
 python3 "$S/greptile_trigger.py" --pr N [--repo R] --head <sha>  # comment `@greptileai` once per head, recorded under the git common dir
 python3 "$S/ci_recover.py" --pr N [--repo R] --head <sha> --wait-minutes M  # cancel and re-run, once per run attempt, an Actions run on the head queued with no job past M minutes; recorded under the git common dir
-python3 "$S/build.py" --path 'src/a.c' --command 'make -C <BUILD>' [--setup L] [--require T] [--job DIR --wait-seconds S --timeout-seconds T]  # build the checkout as it stands; --job detached, waited on S seconds a call
+python3 "$S/build.py" --path 'src/a.c' --command 'make -C <BUILD>' [--base-sha SHA] [--setup L] [--require T] [--job DIR --wait-seconds S --timeout-seconds T]  # build the checkout as it stands; --job detached, waited on S seconds a call
 python3 "$S/scope_check.py" --path 'src/a.c' --path 'test/test_a.c'  # which paths a fix writer may edit or create
 python3 "$S/state_transfer.py" <saved output>  # a stateRef's state whole with its digest; under AGENTRC_EMIT one past 384 KiB in parts beside that file
 python3 "$S/facts.py" emit-dir                 # a new directory for one launch's AGENTRC_EMIT files, and its nonce; ones unwritten for 14 days go
@@ -68,6 +68,11 @@ launch, lists the `blockers` to settle before continuing, and shows as `pinned`
 the arguments the state is fixed to, which a continuation passes unchanged.
 A head whose only CI left is Actions runs awaiting a maintainer's approval (collect.py's `awaiting-approval`) stops
 `ci-awaiting-approval` at the CI lane's read, naming them in `awaitingApproval`; nothing here approves or re-runs them.
+A comment by a trusted person (author_association OWNER, MEMBER or COLLABORATOR, not a Bot account, not the PR's author)
+that still waits for an answer, harvest.py's `humanWaiting`, stops `human-review-pending` before any trigger, fix, reply
+or push, an adoption's included, naming each in `humanWaiting`; it is the human's to settle, never a bot finding, and
+`merge.py` refuses while one waits. Comments by the account the run acts as are its own, so they neither wait nor, unless
+it is the PR's author, answer.
 A launch on a PR no longer open stops `pr-merged` or `pr-closed`, at preflight or at the CI lane's next read; nothing is left to continue. Every GitHub or SonarCloud write reads the state first (`preflight.py --state`, or `push.py --open-pr` for a push) and goes on only for an OPEN PR; an unreadable state stops `pr-state-unread`.
 `preflight.py`, `harvest.py`, `scope_check.py`, `state_transfer.py`, `launch_result.py` and `commits.py` only read, except that
 each writes its AGENTRC_EMIT file, `preflight.py` creates the launch's receipts directory and `commits.py commit` stages and commits exactly its paths, saving its receipt; `hooks.py` runs the repository's hooks, which may rewrite

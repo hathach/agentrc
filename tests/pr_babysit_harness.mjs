@@ -142,6 +142,8 @@ const FOREIGN = 'c0ffee11223344556677889900aabbccddeeff01'
 const BASE = 'ba5eba5eba5eba5eba5eba5eba5eba5eba5eba5e'
 // The base branch's live tip, moved since the BASE GitHub recorded at the PR's last push.
 const TIP = '7e57e57e57e57e57e57e57e57e57e57e57e57e57'
+// The merge-base of BASE and the checkout's HEAD, what build.py resolves <BASE> to.
+const MERGE_BASE = 'fa5efa5efa5efa5efa5efa5efa5efa5efa5efa5e'
 // What the preflight pins, and what the pre-publish recheck must still find.
 const PIN = {
   python: '/usr/bin/python3', missing: [], repo: 'hathach/tinyusb', branch: 'claude/foo', prBranch: 'claude/foo',
@@ -483,7 +485,7 @@ async function run(opts = {}) {
       const { headSha, observedAt, headEventAt, headEventEvidence, fingerprint, bots } = r
       const carry = r.carry ?? carryOf(prompt).map(c => ({ commentId: c.commentId, eligible: false, reason: 'its body changed' }))
       const index = indexOf(r, carry)
-      const snapshot = { headSha, observedAt, headEventAt, headEventEvidence, fingerprint, bots, comments: r.comments ?? index, carry }
+      const snapshot = { headSha, observedAt, headEventAt, headEventEvidence, fingerprint, bots, comments: r.comments ?? index, humanWaiting: opts.harvestWaiting ?? [], carry }
       // harvest.py writes the reading beside its line, the file the validator reads, and keeps only the comments' index
       // in the line; opts.readingFile(path) may undo the file.
       const text = JSON.stringify(snapshot, null, 1) + '\n'
@@ -509,7 +511,14 @@ async function run(opts = {}) {
       if (opts.probe === null) return null
       if (opts.probe?.error) return opts.probe // harvest.py's error line
       const { headSha, observedAt, headEventAt, headEventEvidence, fingerprint, bots } = r
-      return sealLine({ headSha, observedAt, headEventAt, headEventEvidence, fingerprint, bots, ...(opts.probe || {}) })
+      return sealLine({ headSha, observedAt, headEventAt, headEventEvidence, fingerprint, bots, humanWaiting: [], ...(opts.probe || {}) })
+    }
+    // harvest.py --reviewers '' --probe (#591): opts.humans(label), or the list, is what waits; null a dead relay, { error } its error line.
+    if (label.startsWith('humans#') || label.startsWith('adopt:humans')) {
+      const w = typeof opts.humans === 'function' ? opts.humans(label) : opts.humans === undefined ? [] : opts.humans
+      if (w === null || w.error) return w
+      return sealLine({ headSha: head, observedAt: at(0), headEventAt: null, headEventEvidence: 'no reviewer auto-runs, so no head event is read',
+        fingerprint: '||stub', bots: [], humanWaiting: structuredClone(w) })
     }
     if (label === 'scope:check') {
       // scope_check.py's receipt over the paths the prompt asked it for; opts.lsFiles keeps those it accepts.
@@ -728,9 +737,11 @@ async function run(opts = {}) {
       brokenWriter = false
       if (over === null) return null
       const asked = (flag) => flagValues(prompt, flag)
+      const baseSha = asked('base-sha')[0] ?? null
+      const base = baseSha && MERGE_BASE
       return conforms(options.schema, bare({
         state: 'done', revision: head, snapshot: 'snap', snapshotAfter: 'snap',
-        command: asked('command')[0].replaceAll('<BUILD>', '/tmp/b'), setup: asked('setup')[0] ?? '', requires: asked('require'), stage: 'build',
+        command: asked('command')[0].replaceAll('<BUILD>', '/tmp/b').replaceAll('<BASE>', base ?? '<BASE>'), baseSha, base, setup: asked('setup')[0] ?? '', requires: asked('require'), stage: 'build',
         buildDir: '/tmp/b', exit,
         log: '/tmp/candidate.log', retained: [],
         ...(typeof over === 'function' ? over(label, String(prompt)) : over),
@@ -1038,13 +1049,14 @@ test('the usual launch, copilot and coderabbit, waits for coderabbit only', asyn
   assert.equal(result.pass, true, JSON.stringify(result.reason))
 })
 
-test('reviewers: [] runs no review lane at all and still completes', async () => {
-  const { result, labels, logs } = await run({
+test('reviewers: [] runs no review lane, reads only the people\'s comments, and still completes', async () => {
+  const { result, labels, logs, calls } = await run({
     args: { reviewers: [] },
     // Would be harvested if the lane ran; the stub is never reached.
     reviews: oneValid,
   })
   assert.equal(labels.some(l => l.startsWith('reviews#')), false, 'nobody to harvest, so nobody is asked')
+  assert.match(calls.find(c => c.label === 'humans#1').prompt, /harvest\.py --pr 3888 --repo 'hathach\/tinyusb' --reviewers '' --probe`/, '#591')
   assert.equal(labels.some(l => l.startsWith('fix:')), false)
   assert.ok(logs.some(l => l === 'cycle 1: no reviewers requested — CI lane only'))
   assert.deepEqual(result.rollup.observed, { reviews: false, ci: true }, 'no validator ran, so no review was observed')
@@ -1825,10 +1837,48 @@ test('a build command refusing its own arguments is a resolution failure, never 
   assert.match(given.result.detail, /^the caller's build command refused its arguments and built nothing \(exit 2: /)
   // the resolver is told the change is uncommitted, and to give the contract's whole form for that
   const resolve = resolved.calls.find(c => c.label === 'build:resolve#1-review').prompt
-  assert.match(resolve, /The change is uncommitted when command runs: .*such as `--base <ref> --worktree` with the ref the contract's own examples use, never a committed-only form or one flag of such a form without the others\./)
+  assert.match(resolve, /The change is uncommitted when command runs: .*such as `--base <BASE> --worktree`, never a committed-only form or one flag of such a form without the others;/)
   const failed = await run({ reviews: oneValid, candidate: { exit: 2 } })
   assert.equal(failed.result.reason, 'fix-verification-failed', 'a build that ran and failed is the candidate\'s')
   assert.deepEqual(failed.result.uncommitted, ['src/a.c'])
+})
+
+test('a resolved build diffs against the PR\'s recorded base as <BASE>, and one naming another base is a resolution failure (#587)', async () => {
+  const command = 'python3 .claude/skills/build/scripts/check_build.py --base <BASE> --worktree'
+  const ok = await run({ reviews: oneValid, buildPlan: { command } })
+  const resolve = ok.calls.find(c => c.label === 'build:resolve#1-review').prompt
+  assert.match(resolve, /its base argument is `<BASE>`, which becomes the merge-base of the PR's base and HEAD, never a branch or ref name/)
+  const build = ok.calls.find(c => c.label === 'build#1-review').prompt
+  assert.match(build, new RegExp(`--command='python3 \\.claude/skills/build/scripts/check_build\\.py --base <BASE> --worktree' --base-sha='${BASE}' --job=`))
+  assert.equal(ok.result.history[0].reviewPush.pass, true, 'the receipt\'s command matches with <BASE> as its recorded merge-base')
+  for (const candidate of [{ baseSha: TIP }, { base: null }, { base: 'master' }]) {
+    const { result } = await run({ reviews: oneValid, buildPlan: { command }, candidate })
+    assert.equal(result.reason, 'build-unverifiable', JSON.stringify(candidate))
+    assert.match(result.detail, /^the build did not count: the receipt is for another base$/)
+  }
+  const quoted = await run({ reviews: oneValid, buildPlan: { command: 'python3 check_build.py --base "<BASE>" --worktree' } })
+  assert.equal(quoted.result.history[0].reviewPush.pass, true, 'a quoted <BASE> is <BASE>')
+  for (const delimited of ['(python3 check_build.py --worktree --base "<BASE>")', 'python3 check_build.py --worktree --base "<BASE>"&& echo done']) {
+    const { result } = await run({ reviews: oneValid, buildPlan: { command: delimited } })
+    assert.equal(result.history[0].reviewPush.pass, true, `${delimited}: a shell delimiter ends the value`)
+  }
+  const moved = await run({ reviews: oneValid, buildPlan: { command }, candidate: { command: command.replace('<BASE>', TIP) } })
+  assert.match(moved.result.detail, /^the build did not count: the receipt is for another command$/)
+  for (const [stale, value] of [['--base master --worktree', 'master'], ['--base=origin/master --worktree', 'origin/master'],
+    ['--base <BASE> --worktree --base HEAD~1', 'HEAD~1'], ['"--base" master --worktree', 'master'], ['"--base=master" --worktree', 'master'],
+    ['--base "<BASE>:src" --worktree', '<BASE>:src'], ['--base "<BASE>$BASE_SUFFIX" --worktree', '<BASE>$BASE_SUFFIX']]) {
+    const { result, labels } = await run({ reviews: oneValid, buildPlan: { command: `python3 check_build.py ${stale}` } })
+    assert.equal(result.reason, 'build-unverifiable', `${stale}: not fix-verification-failed`)
+    assert.equal(result.detail, `build contract not resolved: the resolved command takes --base "${value}", not <BASE>, the PR's base`)
+    assert.deepEqual(result.uncommitted, ['src/a.c'])
+    assert.equal(labels.some(l => l.startsWith('build#')), false, 'nothing is built')
+  }
+  const given = await run({ reviews: oneValid, args: { build: 'python3 check_build.py --base master --worktree' } })
+  assert.doesNotMatch(given.calls.find(c => c.label === 'build#1-review').prompt, /--base-sha=/)
+  assert.equal(given.result.history[0].reviewPush.pass, true, "the caller's build runs as given")
+  const givenBase = await run({ reviews: oneValid, args: { build: 'make BASE=<BASE> -C <BUILD>' } })
+  assert.match(givenBase.calls.find(c => c.label === 'build#1-review').prompt, new RegExp(`--command='make BASE=<BASE> -C <BUILD>' --base-sha='${BASE}' --job=`))
+  assert.equal(givenBase.result.history[0].reviewPush.pass, true)
 })
 
 test('a contract setup and its tools go to build.py, and a shell that stopped before the build is the environment', async () => {
@@ -3861,7 +3911,7 @@ test('a dead review validator still settles the CI lane', async () => {
   const { result, logs, labels } = await run({ reviews: new Error('validator exploded') })
   assert.equal(result.reason, 'review-validator-died')
   assert.equal(result.history[0].error, 'pr-review-validator died')
-  assert.deepEqual(labels.slice(0, 4).sort(), ['ci:collect#1.1', 'preflight', 'reviews#1', 'reviews:harvest#1'], 'the CI lane was launched beside it')
+  assert.deepEqual(labels.slice(0, 5).sort(), ['ci:collect#1.1', 'humans#1', 'preflight', 'reviews#1', 'reviews:harvest#1'], 'the CI lane was launched beside it')
   assert.equal(result.history[0].ci.status, 'green', 'and awaited, so no agent outlives the workflow')
   assert.equal(summaries(logs).length, 1)
 })
@@ -6878,7 +6928,7 @@ test('a chain merging the base branch\'s live tip is adopted and pushed while Gi
     args: adoptionArgs(state, { autoPush: true }), preflight: { head: ADOPT, prHead: HEAD },
   })
   assert.ok(calls.find(c => c.label === 'adopt:audit').prompt.includes(`--base ${BASE} --tip ${TIP}\``))
-  assert.deepEqual(labels.slice(0, 3), ['preflight', 'adopt:audit', 'adopt:push'])
+  assert.deepEqual(labels.slice(0, 4), ['preflight', 'adopt:audit', 'adopt:humans', 'adopt:push'])
   assert.equal(result.history[1].adoption.publication, 'pushed')
   assert.ok(logs.includes(`preflight: master is at ${TIP.slice(0, 7)}, not the base ${BASE.slice(0, 7)} GitHub recorded at the PR's last push; a merge may come from either`), logs.join('\n'))
 })
@@ -6888,7 +6938,7 @@ test('adoption publishes before cycle watchers and reviews the adopted head', as
   const { result, labels, calls } = await run({
     args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD },
   })
-  assert.deepEqual(labels.slice(0, 3), ['preflight', 'adopt:audit', 'adopt:push'])
+  assert.deepEqual(labels.slice(0, 4), ['preflight', 'adopt:audit', 'adopt:humans', 'adopt:push'])
   assert.ok(labels.indexOf('adopt:push') < labels.indexOf('ci:collect#2.1'), 'publication is confirmed before either watcher')
   assert.ok(labels.indexOf('adopt:push') < labels.indexOf('reviews#2'))
   assert.equal(labels.includes('adopt:readback'), false, 'the push receipt carries the read-back')
@@ -6917,7 +6967,7 @@ test('a lost adoption push receipt gets one fresh agent, which reads the push ba
     args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD },
     adoptPush: (label) => label === 'adopt:push' ? null : receiptOf(ADOPT, ADOPT, 'Everything up-to-date'),
   })
-  assert.deepEqual(labels.slice(0, 4), ['preflight', 'adopt:audit', 'adopt:push', 'adopt:push.retry'])
+  assert.deepEqual(labels.slice(0, 5), ['preflight', 'adopt:audit', 'adopt:humans', 'adopt:push', 'adopt:push.retry'])
   assert.equal(result.history[1].adoption.publication, 'pushed')
   assert.equal(result.state.pending, null)
 })
@@ -6925,7 +6975,7 @@ test('a lost adoption push receipt gets one fresh agent, which reads the push ba
 test('an adoption push whose relay died after push.py wrote its line is read from the file, with no second push', async () => {
   const state = adoptionState()
   const late = await run({ args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD }, lostAnswer: (l) => l === 'adopt:push' })
-  assert.deepEqual(late.labels.slice(0, 3), ['preflight', 'adopt:audit', 'adopt:push'])
+  assert.deepEqual(late.labels.slice(0, 4), ['preflight', 'adopt:audit', 'adopt:humans', 'adopt:push'])
   assert.equal(late.labels.includes('adopt:push.retry'), false)
   assert.equal(late.result.history[1].adoption.publication, 'pushed')
   assert.equal(late.result.state.pending, null)
@@ -7131,7 +7181,7 @@ test('a launch without a pinned state adopts a local chain whose base is the liv
   assert.equal(first.result.state.pin, null)
   for (const [name, args] of [['stateless', { maxCycles: 4 }], ["the wrong-head stop's state", { maxCycles: 4, state: first.result.state }]]) {
     const { result, labels, calls } = await run({ args: { ...args, adoptHead: ADOPT, autoPush: true }, preflight: { head: ADOPT, prHead: HEAD } })
-    assert.deepEqual(labels.slice(0, 3), ['preflight', 'adopt:audit', 'adopt:push'], name)
+    assert.deepEqual(labels.slice(0, 4), ['preflight', 'adopt:audit', 'adopt:humans', 'adopt:push'], name)
     assert.ok(calls.find(c => c.label === 'adopt:audit').prompt.includes(`commits.py chain ${HEAD} ${ADOPT} --published ${HEAD} `), name)
     assert.deepEqual(result.history[0].adoption.commits, [ADOPT], name)
     assert.equal(result.history[0].adoption.publication, 'pushed', name)
@@ -7168,7 +7218,7 @@ test('a PR head pushed outside the workflow inside the audited chain is adopted 
   // #3988: 9cf0097 was pushed by hand after a launch, and the state's expectedHead no longer matched.
   const chain = chainAudit([ADOPT_MID, ADOPT], ['src/mid.c', 'src/adopted.c'])
   const pushed = await run({ args: adoptionArgs(adoptionState(), { autoPush: true }), preflight: { head: ADOPT, prHead: ADOPT_MID }, adoptAudit: chain })
-  assert.deepEqual(pushed.labels.slice(0, 3), ['preflight', 'adopt:audit', 'adopt:push'])
+  assert.deepEqual(pushed.labels.slice(0, 4), ['preflight', 'adopt:audit', 'adopt:humans', 'adopt:push'])
   assert.equal(pushed.result.history[1].adoption.publication, 'pushed')
   assert.equal(pushed.result.state.expectedHead, ADOPT)
   const dry = await run({ args: adoptionArgs(adoptionState(), { autoPush: false }), preflight: { head: ADOPT, prHead: ADOPT_MID }, adoptAudit: chain })
@@ -7297,7 +7347,7 @@ test('an adoption decides an unpublished candidate while the PR still heads the 
     const { result, labels, logs } = await run({
       args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD },
     })
-    assert.deepEqual(labels.slice(0, 3), ['preflight', 'adopt:audit', 'adopt:push'], JSON.stringify(pending))
+    assert.deepEqual(labels.slice(0, 4), ['preflight', 'adopt:audit', 'adopt:humans', 'adopt:push'], JSON.stringify(pending))
     assert.ok(logs.some(l => l.includes(`the unpublished candidate (${pending.stage}) is left to this adoption`)), JSON.stringify(pending))
     assert.equal(result.history[1].adoption.publication, 'pushed')
     assert.equal(result.state.pending, null)
@@ -7458,7 +7508,7 @@ test('a chain on a reconciled candidate is adopted from it (#443)', async () => 
     const p = state.pending
     const next = lane === 'adopt' ? ADOPT_MID : ADOPT
     const { result, labels, calls } = await run({ args: resumeArgs(state, { adoptHead: next }), preflight: { head: next, prHead: p.sha } })
-    assert.deepEqual(labels.slice(0, 3), ['preflight', 'adopt:audit', 'adopt:push'], lane)
+    assert.deepEqual(labels.slice(0, 4), ['preflight', 'adopt:audit', 'adopt:humans', 'adopt:push'], lane)
     assert.match(calls.find(c => c.label === 'adopt:audit').prompt, new RegExp(`commits\\.py chain ${p.sha} ${next} --published ${p.sha} `), lane)
     assert.deepEqual(result.history[0].reconciled.sha, p.sha, lane)
     assert.deepEqual([result.history[1].adoption.from, result.history[1].adoption.to, result.history[1].adoption.publication], [p.sha, next, 'pushed'], lane)
@@ -8238,6 +8288,121 @@ test('a rate-limited CodeRabbit waits past maxCycles for its reset and then its 
   assert.deepEqual(result.state.reviewClock, { sha: HEAD, eventAt: null, since: at(0), limitSeen: at(0), requests: 1,
     request: { at: at(21), retryAt: at(20), tried: at(21) } })
   assert.deepEqual(result.observation.launchActions[1].botAsks, [{ bot: 'coderabbit', kind: 'request', outcome: 'requested', commentId: 99, at: at(21), sha: HEAD }])
+})
+
+// #591: hathach/tinyusb#4613's collaborator objection, as harvest.py lists it.
+const OBJECTION = { kind: 'inline', id: 4682479462, author: 'HiFiPhile', url: 'https://github.com/hathach/tinyusb/pull/4613#discussion_r4682479462',
+  path: 'src/a.c', line: 1, createdAt: at(0), digest: 'a1b2c3d4e5f6' }
+const WRITES = /^(fix:|replies#|resolve#|defer#|push#|adopt:push|crtrigger#|crrequest#|greptile#|sonar#|ci:judge#)/
+
+test('a trusted person\'s comment waiting for an answer stops the launch before any trigger, fix, reply or push (#591)', async () => {
+  // The validator's report carries no humanWaiting: only the sealed read gates.
+  const reviews = { ...oneValid, findings: [finding(), invalidFinding({ commentId: 2 })], replies: [{ commentId: 2, body: 'not so' }] }
+  const { result, labels, logs, calls } = await run({ reviews, humans: [OBJECTION], args: { autoPush: true, coderabbitTrigger: true, maxCycles: 4 } })
+  assert.deepEqual([result.pass, result.reason, result.humanWaiting], [false, 'human-review-pending', [OBJECTION]])
+  assert.equal(result.cycles, 1)
+  assert.deepEqual(labels.filter(l => WRITES.test(l)), [], labels.join(', '))
+  assert.ok(logs.some(l => l.includes('wait for an answer (HiFiPhile: https://github.com/hathach/tinyusb/pull/4613#discussion_r4682479462)') &&
+    l.includes("they are the human's to settle")), logs.join('\n'))
+  assert.equal(result.state.debt.length, 0, 'no bot finding owed for it')
+  assert.ok(result.rollup.rows.every(r => r.commentId !== OBJECTION.id), 'never a findings row')
+  assert.match(calls.find(c => c.label === 'humans#1').prompt, /--reviewers '' --probe`/)
+  assert.equal('humanWaiting' in calls.find(c => c.label === 'reviews#1').schema.properties, false, 'no model reports it')
+  // Answered or resolved, a relaunch on the same state goes on.
+  // The full harvest's own humanWaiting, read before the gate's read came back clear, neither gates nor enters the report.
+  const again = await run({ reviews, harvestWaiting: [OBJECTION], args: { autoPush: true, maxCycles: 4, state: result.state } })
+  assert.notEqual(again.result.reason, 'human-review-pending')
+  const read = again.result.history.filter(h => h.reviews)
+  assert.ok(read.length && read.every(h => !('humanWaiting' in h.reviews)), JSON.stringify(read.map(h => Object.keys(h.reviews))))
+  assert.ok(again.labels.some(l => l.startsWith('fix:')), 'the bots\' findings are worked once it is settled')
+})
+
+test('reviewers: [] still reads the people\'s comments, and a failed read stops as a failed harvest (#591)', async () => {
+  const waiting = await run({ args: { reviewers: [] }, humans: [OBJECTION] })
+  assert.deepEqual([waiting.result.reason, waiting.result.humanWaiting], ['human-review-pending', [OBJECTION]])
+  assert.deepEqual(waiting.labels.filter(l => /^(reviews|humans)/.test(l)), ['humans#1'])
+  const failed = await run({ args: { reviewers: [] }, humans: { error: 'gh api graphql: HTTP 401: Bad credentials' } })
+  assert.deepEqual([failed.result.reason, failed.result.detail], ['harvest-failed', 'gh api graphql: HTTP 401: Bad credentials'])
+  assert.deepEqual(failed.labels.filter(l => /^(reviews|humans)/.test(l)), ['humans#1', 'humans#1.again'], 'read twice, as the validator does')
+  const dead = await run({ args: { reviewers: [] }, humans: null })
+  assert.equal(dead.result.reason, 'harvest-failed', 'never an empty list')
+})
+
+test('an unpublished adoption reads the people\'s comments before its push, and a waiting one stops it unpushed (#591)', async () => {
+  const state = adoptionState()
+  const { result, labels } = await run({ args: adoptionArgs(state, { autoPush: true }), preflight: { head: ADOPT, prHead: HEAD }, humans: [OBJECTION] })
+  assert.deepEqual([result.reason, result.humanWaiting], ['human-review-pending', [OBJECTION]])
+  assert.deepEqual(labels.slice(0, 3), ['preflight', 'adopt:audit', 'adopt:humans'])
+  assert.deepEqual(labels.filter(l => WRITES.test(l)), [], labels.join(', '))
+  assert.equal(result.history[result.history.length - 1].adoption, undefined, 'nothing attempted, so no publication to settle')
+  assert.equal(result.state.pending, null)
+  assert.equal(result.state.expectedHead, HEAD)
+  const published = await run({ args: adoptionArgs(adoptionState()), preflight: { head: ADOPT, prHead: ADOPT } })
+  assert.equal(published.labels.includes('adopt:humans'), false, 'an adoption already published pushes nothing: the cycle\'s read covers it')
+})
+
+test('a person\'s comment arriving during a quota wait stops the probed cycle (#591)', async () => {
+  const { result, labels } = await run({ args: { coderabbitTrigger: true, maxCycles: 1 }, napClock: true,
+    humans: (label) => label.startsWith('humans#2') ? [OBJECTION] : [], reviewsPerCycle: () => quiet([limitedCr(at(20))]) })
+  assert.deepEqual(labels.filter(l => /^(reviews|humans)/.test(l)).sort(), ['humans#1', 'humans#2', 'reviews#1', 'reviews:harvest#1', 'reviews:probe#2'])
+  assert.deepEqual([result.reason, result.humanWaiting, result.cycles], ['human-review-pending', [OBJECTION], 2])
+  assert.deepEqual(labels.filter(l => WRITES.test(l)), [], 'the probe is a read; nothing was asked either')
+})
+
+test('a person\'s waiting comment holds the CI judge, so a red CI is not re-run over it (#591)', async () => {
+  const { result, labels } = await run({ reviews: WAITING, ci: redWith(RIG).ci, judge: rerunAll, humans: [OBJECTION], args: { autoPush: true, maxCycles: 2 } })
+  assert.equal(result.reason, 'human-review-pending')
+  assert.deepEqual(labels.filter(l => l.startsWith('ci:judge#')), [])
+  assert.equal(result.history[0].ciReran, undefined)
+  const failed = await run({ reviews: WAITING, ci: redWith(RIG).ci, judge: rerunAll, humans: { error: 'gh api graphql: HTTP 502' }, args: { autoPush: true, maxCycles: 2 } })
+  assert.equal(failed.result.reason, 'harvest-failed')
+  assert.deepEqual(failed.labels.filter(l => l.startsWith('ci:judge#')), [], 'an unread list holds it too')
+  const clear = await run({ reviews: WAITING, ci: redWith(RIG).ci, judge: rerunAll, args: { autoPush: true, maxCycles: 1 } })
+  assert.equal(clear.result.history[0].ciReran, 1, 'a clear read lets the judge re-run it')
+})
+
+test('a review push held for a person\'s comment holds the CI judge too, though the cycle\'s read was clear (#591)', async () => {
+  for (const humans of [[OBJECTION], { error: 'gh api graphql: HTTP 502' }]) {
+    const { result, labels } = await run({ reviews: oneValid, ci: redWith(RIG).ci, judge: rerunAll, args: { autoPush: true, maxCycles: 2 },
+      humans: (label) => label.startsWith('humans#1-review') ? humans : [], evidence: afterReviewLane('humans#1-review') })
+    assert.equal(result.reason, Array.isArray(humans) ? 'human-review-pending' : 'harvest-failed', labels.join(', '))
+    assert.deepEqual(labels.filter(l => /^push#/.test(l)), [], labels.join(', '))
+    assert.deepEqual(labels.filter(l => l.startsWith('ci:judge#')), [], labels.join(', '))
+    assert.equal(result.history[0].ciReran, undefined)
+  }
+})
+
+test('a person\'s comment arriving while a lane fixes or commits stops its push, the commit left unpublished (#591)', async () => {
+  const lanes = { review: { reviews: oneValid }, ci: { reviews: { findings: [], replies: [], bots: 'reviewed' }, ci: redWith(REAL).ci } }
+  for (const [lane, opts] of Object.entries(lanes)) {
+    // Arriving while the writer fixes, or while the hooks and commit run: read at the push, after the audit.
+    for (const step of ['fix:', 'hooks#', 'commit#', 'audit#']) {
+      const trace = []
+      const { result, labels } = await run({ ...opts, trace, humans: () => trace.some(c => c.label.startsWith(step)) ? [OBJECTION] : [] })
+      const why = `${lane}, during ${step}: ${labels.join(', ')}`
+      assert.deepEqual([result.reason, result.humanWaiting], ['human-review-pending', [OBJECTION]], why)
+      assert.ok(labels.indexOf(`humans#1-${lane}`) > labels.indexOf(`audit#1-${lane}`), why)
+      assert.deepEqual(labels.filter(l => /^(push|resolve)#/.test(l)), [], why)
+      assert.deepEqual(result.state.pending, { sha: shaFor(1), parent: HEAD, lane, stage: 'push-failed' }, `${why}: the commit is the caller's to adopt`)
+      assert.equal(result.state.expectedHead, HEAD, why)
+    }
+    const failed = await run({ ...opts, humans: (label) => label === 'humans#1' ? [] : { error: 'gh api graphql: HTTP 502' } })
+    assert.deepEqual([failed.result.reason, failed.result.detail], ['harvest-failed', 'gh api graphql: HTTP 502'], lane)
+    assert.deepEqual(failed.labels.filter(l => /^push#/.test(l)), [], `${lane}: an unread list holds the push too`)
+    const clear = await run(opts)
+    assert.deepEqual(clear.labels.filter(l => l.startsWith('humans#')), ['humans#1', `humans#1-${lane}`, ...(lane === 'review' ? ['humans#1-resolve'] : [])],
+      `${lane}: one read at the push boundary`)
+  }
+})
+
+test('a person\'s comment arriving with a review push holds its fix notes (#591)', async () => {
+  const trace = []
+  const { result, labels } = await run({ reviews: oneValid, trace, humans: () => trace.some(c => c.label.startsWith('push#')) ? [OBJECTION] : [] })
+  assert.deepEqual([result.reason, result.humanWaiting], ['human-review-pending', [OBJECTION]], labels.join(', '))
+  assert.ok(labels.includes('push#1-review'))
+  assert.deepEqual(labels.filter(l => l.startsWith('resolve#')), [], 'no fix note posted over it')
+  assert.equal(result.state.pending, null, 'the push landed')
+  assert.equal(result.state.expectedHead, shaFor(1))
 })
 
 test('a quota wait probes harvest.py instead of validating until CodeRabbit leaves its limit or the evidence changes (#359)', async () => {

@@ -198,6 +198,67 @@ class BuildTest(unittest.TestCase):
         _, out = self.run_script('--path=.', '--setup=echo "usage: x"; exit 2', '--command', 'true')
         self.assertEqual((out['stage'], out['usageError']), ('setup', None), 'only the build step can refuse its arguments')
 
+    def commit(self, name, text):
+        (self.repo / name).write_text(text)
+        self.git('add', '-A')
+        self.git('commit', '-qm', name)
+        return self.git('rev-parse', 'HEAD').strip()
+
+    def test_base_is_the_merge_base_with_the_prs_recorded_base_never_a_stale_branch(self):
+        # #587: a stale local master diffed changes the PR never made. Here master lags the base the PR branched from,
+        # which moved on again after the PR branched, as GitHub's baseRefOid does.
+        self.git('branch', '-M', 'master')
+        self.git('checkout', '-qb', 'upstream')
+        forked = self.commit('upstream.c', 'int up;\n')
+        self.git('checkout', '-qb', 'pr')
+        self.commit('src.c', 'int pr;\n')
+        self.git('checkout', '-q', 'upstream')
+        recorded = self.commit('later.c', 'int later;\n')
+        self.git('checkout', '-q', 'pr')
+        (self.repo / 'new.c').write_text('int untracked;\n')
+        self.assertIn('upstream.c', self.git('diff', '--name-only', 'master'), 'the stale branch would select it')
+        selects = '{ git diff --name-only <BASE>; git ls-files --others --exclude-standard; } > ../selected && touch <BUILD>/out'
+        code, out = self.run_script('--path=.', '--command', selects, f'--base-sha={recorded}')
+        self.assertEqual((code, out['exit']), (0, 0), out)
+        self.assertEqual((out['baseSha'], out['base']), (recorded, forked))
+        self.assertEqual(out['command'], selects.replace('<BASE>', forked).replace('<BUILD>', out['buildDir']))
+        self.assertEqual((self.repo.parent / 'selected').read_text().split(), ['src.c', 'new.c'])
+        _, out = self.run_script('--path=.', '--command', 'true', f'--base-sha={recorded}')
+        self.assertEqual((out['baseSha'], out['base'], out['command']), (None, None, 'true'), 'a command without <BASE> ignores it')
+
+    def test_a_base_not_in_the_checkout_or_unrelated_fails_before_anything_is_made(self):
+        own = self.repo.parent / 'tmp'     # parallel tests make build dirs in the shared temp dir
+        own.mkdir()
+        self.env['TMPDIR'] = str(own)
+        branch = self.git('rev-parse', '--abbrev-ref', 'HEAD').strip()
+        self.git('checkout', '-q', '--orphan', 'unrelated')
+        orphan = self.commit('other.c', 'int other;\n')
+        self.git('checkout', '-q', branch)
+        for argv, why in [
+            (['--base-sha=' + 'f' * 40], f"the PR's base {'f' * 40} is not in the checkout: fetch it"),
+            ([f'--base-sha={orphan}'], f"the PR's base {orphan} has no merge-base with HEAD"),
+            ([], 'usage: <BASE> in --command needs --base-sha'),
+            (['--base-sha=' + self.base[:7]], 'usage: <BASE> in --command needs --base-sha, a full commit SHA'),
+        ]:
+            code, out = self.run_script('--path=.', '--command', 'touch ../ran && echo --base <BASE> > <BUILD>/out', *argv)
+            self.assertEqual(code, 2, argv)
+            self.assertIn(why, out['error'])
+            self.assertFalse((self.repo.parent / 'ran').exists(), argv)
+        self.assertEqual(list(own.glob('pr-babysit-build-*')), [], 'no build dir was made')
+
+    def test_a_jobs_request_names_its_base(self):
+        command = 'echo --base <BASE> > <BUILD>/out'
+        job = lambda sha: self.run_script('--path=src.c', '--command', command, f'--base-sha={sha}', f'--job={self.repo.parent / "job"}',
+                                          '--wait-seconds=30', '--timeout-seconds=60')
+        code, out = job(self.base)
+        self.assertEqual((code, out['state'], out['base']), (0, 'done', self.base), out)
+        self.assertEqual(json.loads((self.repo.parent / 'job' / 'request.json').read_text())['request']['baseSha'], self.base)
+        later = self.commit('src.c', 'int later;\n')
+        self.git('reset', '-q', '--soft', 'HEAD~')
+        code, out = job(later)
+        self.assertEqual(code, 2)
+        self.assertIn('holds another build request', out['error'])
+
     def test_a_build_that_fails_or_kills_its_shell_is_a_build_failure(self):
         for command, exit in (('exit 3', 3), ('kill -9 $$', -9)):
             code, out = self.run_script('--path=.', '--command', command)

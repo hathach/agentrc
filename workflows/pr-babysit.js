@@ -717,6 +717,18 @@ const exactly = (schema, key, idField, ids) => {
 }
 
 const BOT_STATES = ['reviewed', 'working', 'queued', 'settled', 'absent', 'unknown', 'harvested']
+// harvest.py's humanWaiting: a trusted person's comment that waits for an answer, no body and never a finding (#591);
+// read only through the sealed probe, never a model's report.
+const HUMAN_WAITING = {
+  type: 'array',
+  items: {
+    type: 'object', additionalProperties: false, required: ['kind', 'id', 'author', 'url', 'createdAt', 'digest'],
+    properties: {
+      kind: { type: 'string', enum: ['inline', 'issue', 'review'] }, id: { type: 'integer' }, author: { type: 'string' }, url: { type: 'string' },
+      path: { type: 'string' }, line: { type: ['integer', 'null'] }, createdAt: { type: 'string' }, digest: { type: 'string' },
+    },
+  },
+}
 const SETTLED_KINDS = ['skipped', 'limited', 'paused', 'failed']
 // One record per named reviewer, harvest.py's reading of where it stands on the head.
 const BOTS = {
@@ -767,15 +779,16 @@ const REVIEWS = {
     },
   },
 }
-// harvest.py --probe: a reading's head, head event, bots and fingerprint, no comments; what a quota wait compares (#359).
+// harvest.py --probe: a reading's head, head event, bots, humanWaiting and fingerprint, no comments; what a quota wait
+// compares (#359), and with no reviewer named every cycle's read of the people's comments (#591).
 const PROBE = withSeal({
   type: 'object', additionalProperties: false,
-  required: ['headSha', 'observedAt', 'headEventAt', 'headEventEvidence', 'fingerprint', 'bots'],
+  required: ['headSha', 'observedAt', 'headEventAt', 'headEventEvidence', 'fingerprint', 'bots', 'humanWaiting'],
   properties: {
     error: { type: 'string' }, rateLimit: RATE_LIMIT, headSha: { type: 'string' }, observedAt: { type: 'string' },
     headEventAt: { type: ['string', 'null'] }, headEventEvidence: { type: 'string' },
     // the review evidence a merge checks again (merge.py)
-    fingerprint: { type: 'string' }, bots: BOTS,
+    fingerprint: { type: 'string' }, bots: BOTS, humanWaiting: HUMAN_WAITING,
   },
 })
 // harvest.py's full line: the comments' index, whose bodies are in its reading file, and the carry records the workflow
@@ -845,7 +858,8 @@ const BUILD_RUN = withSeal({
   properties: {
     state: { type: 'string', enum: ['running', 'done', 'timedOut', 'abandoned'] }, elapsed: { type: 'integer' },
     revision: { type: 'string' }, snapshot: { type: 'string' }, snapshotAfter: { type: 'string' },
-    command: { type: 'string' }, setup: { type: 'string' }, requires: { type: 'array', items: { type: 'string' } },
+    command: { type: 'string' }, baseSha: { type: ['string', 'null'] }, base: { type: ['string', 'null'] },
+    setup: { type: 'string' }, requires: { type: 'array', items: { type: 'string' } },
     stage: { type: 'string' },
     buildDir: { type: 'string' }, exit: { type: 'integer' }, usageError: { type: ['string', 'null'] }, log: { type: 'string' },
     retained: { type: 'array', items: { type: 'string' } }, error: { type: 'string' },
@@ -1653,6 +1667,12 @@ const BUILD_POLLS = Math.ceil(BUILD_LIMIT_MIN * 60 / BUILD_POLL_S) + 2
 // The shell build.py runs the build in, as the resolver writes for it: the relay's own.
 const BUILD_SHELL = PWSH ? 'Windows PowerShell' : 'shell'
 const IDF_SETUP = PWSH ? '. "$env:IDF_PATH/export.ps1"' : '. "$IDF_PATH/export.sh"'
+// A resolved command's `--base X` or `--base=X` value other than a whole <BASE>, the PR's base build.py resolves (#587),
+// else null; only that syntax is checked, not every way a command can name a base. Quotes are dropped first, so neither
+// `"--base" master` hides one nor `--base "<BASE>"` is one; a shell delimiter ends <BASE>, as in `(... --base <BASE>)` or
+// `--base <BASE>&& ...`, and `<BASE>:src` names another ref.
+const foreignBase = (command) => [...command.replace(/['"]/g, '').matchAll(/(?:^|\s)--base(?:=|\s+)(<BASE>(?=$|[\s;&|()])|[^\s;&|()]*)/g)]
+  .map(m => m[1]).find(v => v !== '<BASE>') ?? null
 const buildCheck = async (tag, owned) => {
   let plan = callerPlan
   if (!plan) {
@@ -1669,17 +1689,23 @@ const buildCheck = async (tag, owned) => {
         `when command builds several targets or board families, a wrapper script's included, setup and requires hold every one's: each family's own setup the contract names (such as \`${IDF_SETUP}\` before an Espressif build) and each tool its build invokes, through the wrapper too (such as idf.py), so a missing one stops the shell before the build. ` +
         // #557: a selection flag without the one it needs (check_build.py's --worktree without --base) refused every candidate.
         'The change is uncommitted when command runs: where the contract selects what to build from a change, use the form it gives for uncommitted and untracked changes, with every argument that form needs, ' +
-        'such as `--base <ref> --worktree` with the ref the contract\'s own examples use, never a committed-only form or one flag of such a form without the others. ' +
+        // #587: the ref the contract's examples use (`--base master`) named a stale local master, which selected unrelated targets.
+        'such as `--base <BASE> --worktree`, never a committed-only form or one flag of such a form without the others; ' +
+        'its base argument is `<BASE>`, which becomes the merge-base of the PR\'s base and HEAD, never a branch or ref name, whatever the contract\'s own examples use. ' +
         'contract = every instruction, doc and build-system file you read the contract from, any of these paths among them; command = null, with reason, when no build applies to these paths; error = why the contract could not be resolved, else null.',
         { label: `build:resolve#${tag}`, phase: 'Fix', model: 'sonnet', schema: BUILD_PLAN },
       ).catch(quiet(`build:resolve#${tag}`))
       if (!plan || plan.error) return `build contract not resolved: ${plan ? plan.error : 'resolver died'}`
+      const base = plan.command === null ? null : foreignBase(plan.command)
+      if (base !== null) return `build contract not resolved: the resolved command takes --base ${JSON.stringify(base)}, not <BASE>, the PR's base`
       if (!contractTouched(plan, ownedSet)) buildPlans.set(planKey, plan)
     }
   }
   if (plan.command === null) { log(`build#${tag}: no build applies — ${plan.reason}`); return null }
   // --flag=value throughout: a value such as -DBOARD=x must not read as a flag.
+  const onBase = plan.command.includes('<BASE>')
   const cmd = `${BUILD_SCRIPT}${owned.map(f => ` --path=${shq(f)}`).join('')} --command=${shq(plan.command)}` +
+    `${onBase ? ` --base-sha=${shq(pinnedBase)}` : ''}` +
     `${plan.setup ? ` --setup=${shq(plan.setup)}` : ''}${plan.requires.map(t => ` --require=${shq(t)}`).join('')}${PWSH ? ' --shell=powershell' : ''}`
   // The build runs detached in a job of this batch and head, so a contract longer than one shell call is waited out
   // over several bounded ones (#375); each call attaches to the same job, a retried or resumed one included.
@@ -1701,7 +1727,8 @@ const buildCheck = async (tag, owned) => {
     : r.state !== 'done' ? `the build was ${r.state}`
     : lacking.length ? `the receipt has no ${lacking.join(', ')}`
     : r.revision !== expectedHead ? `the receipt is for ${String(r.revision).slice(0, 7)}, not ${expectedHead.slice(0, 7)}`
-    : r.command !== plan.command.replaceAll('<BUILD>', r.buildDir) ? 'the receipt is for another command'
+    : onBase && (r.baseSha !== pinnedBase || typeof r.base !== 'string' || !FULL_SHA.test(r.base)) ? 'the receipt is for another base'
+    : r.command !== plan.command.replaceAll('<BUILD>', r.buildDir).replaceAll('<BASE>', r.base) ? 'the receipt is for another command'
     : !['setup', 'prerequisite', 'build'].includes(r.stage) ? `the receipt names no step it stopped in (${JSON.stringify(r.stage)})`
     : r.setup !== (plan.setup || '') || JSON.stringify(r.requires) !== JSON.stringify(plan.requires) ? 'the receipt is for another setup'
     : r.snapshot !== r.snapshotAfter ? `the build changed ${owned.join(', ')}, which were verified before it`
@@ -1820,7 +1847,8 @@ const fixAndVerify = async (workIn, tag, rejectable = false) => {
       `Fix the following issues on the PR branch. ${IN_CHECKOUT}\n` +
       (protectedRe ? `Constraint: never modify a path matching ${protectedRe.source} — it is the caller's, and a failure that needs it changed stays red for the user.\n` : '') +
       (buildCmd
-        ? `Verify with: ${buildCmd} (a \`<BUILD>\` placeholder becomes a fresh ${PWSH ? 'empty directory under $env:TEMP, run in Windows PowerShell' : '`mktemp -d`'}).\n`
+        ? `Verify with: ${buildCmd} (a \`<BUILD>\` placeholder becomes a fresh ${PWSH ? 'empty directory under $env:TEMP, run in Windows PowerShell' : '`mktemp -d`'}` +
+          `${buildCmd.includes('<BASE>') ? `, \`<BASE>\` the output of \`git merge-base ${pinnedBase} HEAD\`` : ''}).\n`
         : "Verify with the repository's build contract, resolved for your scope; do not invent a command.\n") +
       STOPS + '\n' +
       (rejectable
@@ -2153,7 +2181,14 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
     return { pass: false, committed: true, detail: `commit failed audit: ${why}`, sha, ...(generatedPaths.length ? { generated: generatedPaths } : {}) }
   }
 
+  // #591: a comment posted while the lane fixed, ran the hooks or committed holds the push; the caller stops on `humans`.
+  const humans = githubLimit ? null : await readHumans(`humans#${cycle}-${what}`)
   if (githubLimit) return { pass: false, committed: true, detail: 'not pushed: GitHub refused a call for a rate limit this cycle', sha }
+  if (humans.harvestError || humans.humanWaiting.length) {
+    const held = humans.harvestError ? `the people's comments went unread: ${humans.harvestError}` : `${humans.humanWaiting.length} comment(s) by a trusted person wait for an answer`
+    log(`push#${cycle}-${what}: committed but NOT pushed — ${held}`)
+    return { pass: false, committed: true, detail: `not pushed: ${held}`, sha, humans, ...(generatedPaths.length ? { generated: generatedPaths } : {}) }
+  }
   beforePush()
   const push = await pushExact(sha, `push#${cycle}-${what}`)
   if (!push) return { pass: false, committed: true, detail: 'push agent died after the commit landed', sha, published: 'unknown' }
@@ -2839,11 +2874,18 @@ const ciLaneRun = async (cycle, lanes, entry) => {
   if (judging.length === 0 && gated.length === 0) return report
   // A review lane that ended without publishing leaves CI as it was: its concluded failures are still judged (#41).
   const superseded = () => {
-    const why = lanes.prState ? `PR #${args.pr} is ${lanes.prState}` : lanes.reviewPublishing ? 'the review lane attempted to publish' : null
+    const why = lanes.prState ? `PR #${args.pr} is ${lanes.prState}` : lanes.reviewPublishing ? 'the review lane attempted to publish'
+      : lanes.humansHeld ? "the review lane's read of the people's comments did not come back clear" : null
     if (why) log(`cycle ${cycle}: ${judging.length + gated.length} failing CI check(s) left unjudged — ${why}`)
     return !!why
   }
   if (superseded()) return report
+  // #591: the judge may re-run CI only once this cycle's read of the people's comments came back clear.
+  const humans = await lanes.humans
+  if (!humans.humanWaiting || humans.humanWaiting.length) {
+    log(`cycle ${cycle}: ${judging.length + gated.length} failing CI check(s) left unjudged — the people's comments did not read clear`)
+    return report
+  }
   const links = judging.map(c => c.link)
   const known = reruns.filter(r => r.sure).map(r => `${r.workflow} / ${r.check}`)
   const possible = reruns.filter(r => !r.sure).map(r => `${r.workflow} / ${r.check}`)
@@ -2947,7 +2989,8 @@ const ciLaneRun = async (cycle, lanes, entry) => {
 // Returns null to re-arm, or the final result.
 const runCycle = async (cycle, entry) => {
   // prState: 'merged' or 'closed' once read so, 'unread' when a read before a write failed; the review lane then stops at its next step.
-  const lanes = { reviewDone: false, reviewPublishing: false, ended: false, prState: null }
+  // humansHeld: a review-lane push held by its read of the people's comments, which holds the CI judge too (#591).
+  const lanes = { reviewDone: false, reviewPublishing: false, ended: false, prState: null, humansHeld: false }
   const verdict = await runLanes(cycle, entry, lanes)
   // The CI lane settles last, so it can read the merge after the review lane stopped for another reason.
   if (lanes.prState === 'merged' || lanes.prState === 'closed') return prEnded(cycle, lanes.prState)
@@ -3049,7 +3092,8 @@ const harvestReviews = async (cycle, candidates) => {
 // The validator judges that one reading's comments from the file harvest.py wrote beside its line (no prompt holds every
 // body), each by its id; their source and digests, and the report's other members, are the harvest's (#582).
 const judgeReviews = async (cycle, harvest, owedLastCycle) => {
-  const { seal, emitFile, index, carry, ...read } = harvest
+  // humanWaiting stays out of the review report: the gates read it only through readHumans (#591).
+  const { seal, emitFile, index, carry, humanWaiting, ...read } = harvest
   const readingFile = `${emitFile}.reading.json`
   const reviewPrompt =
     `Validate the bot review findings on PR #${args.pr} of ${repo} per your procedure. ${IN_CHECKOUT}` +
@@ -3081,12 +3125,51 @@ const judgeReviews = async (cycle, harvest, owedLastCycle) => {
   })
   return { ...read, findings, replies: judged.replies, carry }
 }
+// #591: what harvest.py reads of the people's comments with no reviewer named, sealed, before each cycle's writes, each
+// push and the fix notes after one, and an adoption's push: { humanWaiting }, or a harvestError or rateLimit (already
+// noted), run twice as the validator does.
+const readHumans = async (label) => {
+  const read = (tag) => relayOnce(
+    `${IN_CHECKOUT}Editing nothing, ${runExactly(`${HARVEST_SCRIPT} --pr ${args.pr} --repo ${shq(repo)} --reviewers ${shq('')} --probe`)}`,
+    { label: tag, phase: 'Triage', model: 'haiku', effort: 'low', schema: PROBE },
+  )
+  let p = await read(label)
+  if (!p || (p.error && !p.rateLimit)) p = await read(`${label}.again`) || p
+  return !p ? { harvestError: 'the relay died' } : p.rateLimit ? { rateLimit: { ...p.rateLimit, error: p.error } }
+    : p.error ? { harvestError: p.error } : { humanWaiting: p.humanWaiting }
+}
+// A trusted person's comment waiting for an answer is theirs to settle: nothing here asks, fixes, answers or pushes over it.
+const humanStop = (cycle, waiting) => {
+  log(`cycle ${cycle}: ${waiting.length} comment(s) by a trusted person wait for an answer (${waiting.map(w => `${w.author}: ${w.url}`).join(', ')}) — stopping; they are the human's to settle`)
+  return stop(cycle, 'human-review-pending', { humanWaiting: waiting })
+}
+// null on a rate limit (runCycle stops for it), a stop, or undefined when the read came back clear.
+const humansHold = (cycle, entry, humans) => {
+  if (humans.rateLimit) return null
+  if (humans.harvestError) {
+    log(`cycle ${cycle}: harvest.py could not read the people's comments — ${humans.harvestError}`)
+    entry.error = `harvest.py failed: ${humans.harvestError}`
+    return stop(cycle, 'harvest-failed', { detail: humans.harvestError })
+  }
+  if (humans.humanWaiting.length) return humanStop(cycle, humans.humanWaiting)
+}
+// A lane's stop on a push that did not land; one held for the people's comments keeps its commit as the pending candidate.
+const pushFailed = (cycle, entry, key, push) => {
+  const { humans, ...failed } = push
+  entry[key] = failed
+  if (push.prState) return prEnded(cycle, push.prState)
+  if (humans) return humansHold(cycle, entry, humans)
+  log(`cycle ${cycle}: ${key === 'ciPushFailed' ? 'CI' : 'review'}-lane push failed (${push.detail}) — stopping`)
+  return stop(cycle, 'push-failed')
+}
 const runLanes = async (cycle, entry, lanes) => {
   let ciPromise = null
   const ended = (what) => prGate(lanes, `${cycle}-${what}`)
   // Settle the CI lane in finally so no CI agent outlives the workflow.
   try {
     entry.lane = lane
+    // Read beside the CI lane, whose judge waits for it too.
+    lanes.humans = readHumans(`humans#${cycle}`)
     if (ciLane) {
       ciPromise = ciLaneRun(cycle, lanes, entry).catch(quiet(`cycle ${cycle}: CI lane`))
     }
@@ -3118,6 +3201,9 @@ const runLanes = async (cycle, entry, lanes) => {
       entry.error = `harvest.py failed: ${r.harvestError}`
       return stop(cycle, 'harvest-failed', { detail: r.harvestError })
     }
+    // #591: gated on the sealed read, never on a model's copy of it; everything before this only read.
+    const waits = humansHold(cycle, entry, await lanes.humans)
+    if (waits !== undefined) return waits
     if (r.unusable) {
       log(`cycle ${cycle}: validator report unusable — ${r.unusable}`)
       entry.error = `validator report unusable: ${r.unusable}`
@@ -3530,12 +3616,8 @@ const runLanes = async (cycle, entry, lanes) => {
       if (owned.length > 0) {
         // Any push attempt may have restarted CI, a refused or unknown one included.
         const push = await commitAndPush(cycle, 'review', owned, brief, () => { lanes.reviewPublishing = true })
-        if (!push.pass) {
-          entry.reviewPushFailed = push
-          if (push.prState) return prEnded(cycle, push.prState)
-          log(`cycle ${cycle}: review-lane push failed (${push.detail}) — stopping`)
-          return stop(cycle, 'push-failed')
-        }
+        if (push.humans) lanes.humansHeld = true
+        if (!push.pass) return pushFailed(cycle, entry, 'reviewPushFailed', push)
         entry.reviewPush = push
         // Built here: the read-back proves only a text the workflow chose.
         const heldNow = heldComments()
@@ -3558,6 +3640,9 @@ const runLanes = async (cycle, entry, lanes) => {
     }
     if (answerable.size > 0) {
       if (await ended('resolve')) return prEnded(cycle, lanes.prState)
+      // #591: a comment posted while the repair was pushed holds its fix notes too.
+      const waits = entry.reviewPush ? humansHold(cycle, entry, await readHumans(`humans#${cycle}-resolve`)) : undefined
+      if (waits !== undefined) return waits
       entry.fixNotePosts = await publishReplies(`resolve#${cycle}`, [...answerable.values()], 'fixNote', cycle, digestOf)
     }
 
@@ -3636,12 +3721,7 @@ const runLanes = async (cycle, entry, lanes) => {
       }
       if (!ok) return unverifiedStop(cycle, 'CI', verdict)
       const ciPush = await commitAndPush(cycle, 'ci', owned, brief)
-      if (!ciPush.pass) {
-        entry.ciPushFailed = ciPush
-        if (ciPush.prState) return prEnded(cycle, ciPush.prState)
-        log(`cycle ${cycle}: CI-lane push failed (${ciPush.detail}) — stopping`)
-        return stop(cycle, 'push-failed')
-      }
+      if (!ciPush.pass) return pushFailed(cycle, entry, 'ciPushFailed', ciPush)
       entry.ciPush = ciPush
       return null
     }
@@ -3766,6 +3846,7 @@ const runLanes = async (cycle, entry, lanes) => {
   } finally {
     lanes.ended = true
     if (ciPromise) entry.ci = await ciPromise
+    await lanes.humans
   }
 }
 
@@ -3808,6 +3889,8 @@ if (pinned.pr !== args.pr) {
   log(`preflight: the pin is of PR #${pinned.pr}, not #${args.pr}`)
   return finish(stop(lastCycle, 'preflight-failed', { detail: `the pin is of PR #${pinned.pr}` }))
 }
+// The PR's base as GitHub records it, what a build's <BASE> resolves against (#587).
+const pinnedBase = pinned.prBase.trim()
 // The repository every later call names must be the one asked for and the one the PR read lives in.
 const pinnedRepo = pinned.repo.trim()
 const notRepo = !REPO_NAME.test(pinnedRepo) ? `the pin names no repository OWNER/NAME (${JSON.stringify(pinned.repo)})`
@@ -3897,7 +3980,7 @@ let adoption = null
 if (adopting) {
   const prHead = pinned.prHead.trim()
   const X = reconciled && reconciled.sha === adoptHead ? reconciled.parent : restored && restored.pin ? restored.expectedHead : prHead
-  const base = pinned.prBase.trim()
+  const base = pinnedBase
   const tip = pinned.prBaseTip.trim()
   if (pinned.head.trim() !== adoptHead) {
     log(`preflight: HEAD is ${pinned.head.slice(0, 7)}, not the ${adoptHead.slice(0, 7)} to adopt`)
@@ -4006,6 +4089,14 @@ log(`preflight: ${pinned.prRepo} ${pinned.branch}@${pinned.head.slice(0, 7)} tra
 // Runs before any watcher so the attempt is recorded first; only a PR head read-back proves the push.
 const adopt = async (entry) => {
   const { from, to, commits, paths } = adoption
+  // #591: this push precedes the cycle's read, so the people's comments are read first; a stop here records no
+  // adoption, which a relaunch with the same adoptHead makes. readHumans noted a rate limit already.
+  if (!adoption.published) {
+    const humans = await readHumans('adopt:humans')
+    if (humans.rateLimit) return stop(entry.cycle, 'github-rate-limited', { rateLimit: githubLimit })
+    if (humans.harvestError) return stop(entry.cycle, 'harvest-failed', { detail: humans.harvestError })
+    if (humans.humanWaiting.length) return humanStop(entry.cycle, humans.humanWaiting)
+  }
   entry.adoption = { from, to, commits, paths, publication: 'unknown', detail: 'publication not attempted yet' }
   if (adoption.published) {
     Object.assign(entry.adoption, { publication: 'already-published', detail: `PR #${args.pr} already heads ${to.slice(0, 7)}` })
