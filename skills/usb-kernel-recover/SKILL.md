@@ -33,7 +33,7 @@ sudo cat /proc/<pid>/stack          # never opens the node, so it cannot block
 
 | Stack shows | Meaning | Go to |
 |---|---|---|
-| `test_queue [usbtest]` → `usbtest_ioctl` → `usbdev_ioctl` | **owner, holds the lock**, waiting on queued transfers | rung 1 (DUT), then recheck |
+| `test_queue [usbtest]` → `usbtest_ioctl` → `usbdev_ioctl` | **owner, holds the lock**, waiting on queued transfers | rung 1 (DUT), then recheck; park-flash if no disconnect follows |
 | `usbdev_ioctl` + another driver-module wait | **owner, holds the lock** | inspect the wait; rung 3 — terminal if the permitted reset/disconnect cannot release it |
 | `usbdev_ioctl`, no driver frames | owner waiting on a URB | rung 1 (DUT) / rung 2 (probe) |
 | `usbdev_open`, sysfs reads | victim | ignore |
@@ -59,7 +59,11 @@ alone is not enough. An owner still in D state is one the reset cannot release
 (rung 3) only once rung 1 has issued the reset — the flasher reported it, or
 park-flash ran where the reset cannot reach the peripheral — and a fresh D-state
 check, taken after the disconnect and the pending URB completions had time to
-settle, still finds it. An owner that exited while a fresh check finds another
+settle, still finds it. A reported reset that no `USB disconnect` line for the
+DUT follows, with the owner still in D state at a fresh check, did not reach the
+peripheral: park-flash next. If park-flash brings no disconnect either and a
+fresh check still finds the owner, escalate to rung 3, or to the contract's
+terminal recovery where the dispatch may not reach it. An owner that exited while a fresh check finds another
 holder: triage that one by its stack. No holder left but no DUT: the lock is
 free, so it is no longer a kernel wedge. If the DUT still has a sysfs node, use
 section 4; with none, `authorized` has nothing to act on, so go straight to the
