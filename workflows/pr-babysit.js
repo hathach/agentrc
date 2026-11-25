@@ -2915,7 +2915,8 @@ const ciLaneRun = async (cycle, lanes, entry) => {
     lanes.judgeHumans = judgeRead
     return report
   }
-  // The review lane may have pushed, or been held by its own read, while this one was out.
+  // The review lane may have pushed, been held by its own read, or met a rate limit while this one was out.
+  if (githubLimit) return null
   if (superseded()) return report
   const judged = await agent(
     `${IN_CHECKOUT}Judge the failing CI checks of PR #${args.pr} of ${repo} at head ${report.headSha} per your procedure. ` +

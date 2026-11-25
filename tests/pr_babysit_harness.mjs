@@ -8396,6 +8396,22 @@ test('a review push or hold landing while the CI judge reads the people\'s comme
   }
 })
 
+test('a rate limit the review lane meets while the CI judge reads the people\'s comments leaves the judge undispatched', async () => {
+  // The harvest waits for the judge's read, which waits for the harvest's refusal.
+  let refused = false
+  const { result, labels } = await run({ ci: redWith(RIG).ci, judge: rerunAll, args: { maxCycles: 4 },
+    reviewsWait: afterReviewLane('humans#1-judge'), reviewsPerCycle: () => { refused = true; return LIMITED_REVIEWS },
+    humans: async (label) => {
+      if (label.startsWith('humans#1-judge')) for (let i = 0; i < 1000 && !refused; i++) await tick()
+      for (let i = 0; i < 20; i++) await tick()
+      return []
+    } })
+  assert.ok(labels.includes('humans#1-judge'), labels.join(', '))
+  assert.deepEqual([result.reason, result.rateLimit], ['github-rate-limited', LIMITED_REVIEWS.rateLimit], labels.join(', '))
+  assert.deepEqual(labels.filter(l => l.startsWith('ci:judge#')), [], labels.join(', '))
+  assert.equal(result.history[0].ciReran, undefined)
+})
+
 test('a review push held for a person\'s comment holds the CI judge too, though the cycle\'s read was clear (#591)', async () => {
   for (const humans of [[OBJECTION], { error: 'gh api graphql: HTTP 502' }]) {
     const { result, labels } = await run({ reviews: oneValid, ci: redWith(RIG).ci, judge: rerunAll, args: { autoPush: true, maxCycles: 2 },
