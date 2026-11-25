@@ -1198,7 +1198,9 @@ class Keeper(Fixture):
             real = m.Channel.ready
 
             def ready(chan):
-                seen.write_text(str(os.getpid()))
+                tmp = seen.with_name(seen.name + '.tmp')    # published whole: the test parses it once it exists
+                tmp.write_text(str(os.getpid()))
+                os.replace(tmp, seen)
                 while not gate.exists():
                     time.sleep(0.02)
                 return real(chan)
