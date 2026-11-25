@@ -2,7 +2,9 @@
 """Board-lock primitive shared by every project on a HIL host: the per-board kernel
 flocks in BOARD_LOCK_DIR and their holder records (`hil` skill, Board locks), with a
 hold/release/status CLI and resolve/compact for the boards' cleanup logs. A project's HIL
-contract wraps it for its roster and lock names.
+contract wraps it for its roster and lock names. A hil_reserve keeper's host fence (FENCE) refuses
+every take and every new lock name (FenceHeld) for as long as it is there, checked once the flock
+or ADMISSION is taken, so a keeper killed after arming it is seen too.
 """
 import argparse
 import contextlib
@@ -49,12 +51,15 @@ PROTECTED_REASONS = {CI_REASON, 'farm_check'}
 CLEANUP_ROLE = 'cleanup-holder'
 RECOVERY_BLOCKER = ("an older helper's cleanup holder, which never frees on its own: its project's "
                     "`hil_lock.py release --token` ends it")
+RESERVATION_BLOCKER = ("a hil_reserve keeper holding the host while its command's descendants may still change the "
+                       "rig: `hil_lock.py release --token` ends it once they ended")
 CLEANUP_OWED = 'cleanupOwed'  # record mark of a taker whose task restores the board; older helpers ignore it
 HOLD_KIND = 'hil_lock-hold'   # `holder` of a record this CLI's own hold process wrote
 JOURNAL = '.takeover'         # <board>.takeover: an older helper's recovery takeover, live or left
 CLEANUP_LOG = '.cleanup.jsonl'   # <board>.cleanup.jsonl: the board's failed cleanups and restorations
 LOG_WAIT = 5.0                # s a cleanup-log reader or writer waits for its mutex
 ADMISSION = '.admission.mutex'  # shared by each new lock file's creator, exclusive under a host-wide reservation
+FENCE = '.fence.json'         # a hil_reserve keeper's host fence: written under its exclusive ADMISSION
 REWRITING = b'#'              # byte 0 of a record being rewritten: unreadable
 ACQUIRING = b'~'              # byte 0 while take_board_lock writes its first record: a free board
 UNLOGGED = b'!'               # byte 0 while end_failed writes an unlogged failure's evidence into its record
@@ -85,6 +90,12 @@ class AdmissionClosed(BoardLocked):
 class RecoveryBlocked(BoardLocked):
     """The flock is held by an older helper's cleanup holder (its record's `role`), which never
     frees on its own, so it is never waited out; its project's `release --token` ends it."""
+
+
+class FenceHeld(RecoveryBlocked):
+    """A hil_reserve keeper's host fence is in the lock dir: its command, or a descendant of it, may still
+    change the rig, so no lock is taken or created, never waited on. It goes with that keeper's checked end;
+    one whose keeper is gone before proving its command's subtree ended stays until the host reboots."""
 
 
 class ReleaseRefused(RuntimeError):
@@ -232,11 +243,13 @@ def flock_nb(board: str):
     """Open-or-create the lock file WITHOUT truncating (a losing racer must not wipe the
     winner's record) and take LOCK_EX|LOCK_NB. Returns the open handle; raises OSError when
     the file is unsafe or the flock is held elsewhere (handle already closed), AdmissionClosed
-    when it must be created while a reservation holds ADMISSION."""
+    when it must be created while a reservation holds ADMISSION, FenceHeld while a host fence
+    is there."""
     fh = os.fdopen(_open_lock_file(board), 'r+')
     try:
         fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+        _refuse_fenced()      # after the flock: a keeper that held it until it died had armed its fence first
+    except (OSError, FenceHeld):
         fh.close()
         raise
     return fh
@@ -258,7 +271,7 @@ def _open_lock_file(board) -> int:
 def _create_admitted(dfd, board) -> int:
     """Create `board`'s lock file under a shared flock on ADMISSION, so a reservation that
     holds it exclusively (close_admission) has seen every lock name there will be until it
-    ends. AdmissionClosed while one does."""
+    ends. AdmissionClosed while one does, FenceHeld while a host fence is there."""
     afd = _open_file(dfd, ADMISSION, os.O_RDWR, create=True)
     try:
         try:
@@ -266,6 +279,7 @@ def _create_admitted(dfd, board) -> int:
         except BlockingIOError:
             raise AdmissionClosed(f'board locked: {board} has no lock file yet, and no new lock name is admitted '
                                   f'while a host-wide reservation holds {ADMISSION}') from None
+        _refuse_fenced()
         return _open_file(dfd, f'{board}.lock', os.O_RDWR, create=True)
     finally:
         os.close(afd)
@@ -315,6 +329,77 @@ def close_admission(wait=None):
         fh.close()
         raise LockUnavailable(f'board lock unavailable: {ADMISSION} still shared after {wait:g} s')
     return fh
+
+
+# --- host fence -----------------------------------------------------------------------------
+def fence_state():
+    """None without a host fence, else its record ({} when it cannot be read, which refuses all the same)."""
+    try:
+        dfd = _open_dir()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return {}
+    try:
+        with os.fdopen(_open_file(dfd, FENCE, os.O_RDONLY), 'rb') as f:
+            state, rec = _parse(f.read())
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return {}
+    finally:
+        os.close(dfd)
+    return rec if state == 'record' else {}
+
+
+def arm_fence(fence: dict) -> None:
+    """Write (or rewrite) the host fence `fence`, atomically and durably; hil_reserve's keeper does, under its
+    exclusive ADMISSION, before its command starts. OSError when it cannot be."""
+    dfd = _open_dir()
+    try:
+        _replace_file(dfd, FENCE, json.dumps(fence).encode())
+    finally:
+        os.close(dfd)
+
+
+def clear_fence(token) -> None:
+    """Remove the host fence when it is `token`'s, durably; any other is left. OSError when it cannot be."""
+    fence = fence_state()
+    if not fence or fence.get('token') != token:
+        return
+    dfd = _open_dir()
+    try:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(FENCE, dir_fd=dfd)
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+def _fence_live(fence) -> bool:
+    """Whether the fence's keeper runs: a zombie one holds nothing."""
+    pid, start = fence.get('pid'), fence.get('start')
+    return (isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 and start is not None
+            and proc_start(pid) == start and not _exited(pid, start))
+
+
+def fence_text(fence) -> str:
+    """The host fence `fence` (fence_state's) for a message, with what ends it."""
+    if not fence:
+        return f'host fenced by an unreadable {FENCE}: only a host reboot clears it'
+    who = f'host fenced by hil_reserve pid {fence.get("pid")} (token {fence.get("token")})'
+    if _fence_live(fence):
+        return (f'{who}: its command or a descendant of it may still change the rig; `hil_lock.py release --token '
+                f'{fence.get("token")}` ends it once they ended')
+    if fence.get('ended') is True:
+        return (f"{who}, gone after its command's subtree ended: `hil_lock.py release --token {fence.get('token')}` "
+                f"clears it")
+    return f"{who}, gone without proving its command's subtree ended: only a host reboot clears it"
+
+
+def _refuse_fenced() -> None:
+    if (fence := fence_state()) is not None:
+        raise FenceHeld(f'board locked: {fence_text(fence)}')
 
 
 # --- holder records -------------------------------------------------------------------------
@@ -453,12 +538,16 @@ def _owes_cleanup(info) -> bool:
                                                                    or info.get(CLEANUP_OWED) is True))
 
 
+def _blocker_text(info) -> str:
+    return RESERVATION_BLOCKER if 'reservation' in info else RECOVERY_BLOCKER
+
+
 def holder_text(info) -> str:
-    """A holder record for a message; an older helper's cleanup holder is named as one."""
+    """A holder record for a message; a cleanup holder (an older helper's or a hil_reserve keeper's) is named as one."""
     if not isinstance(info, dict):
         return 'unknown holder'
     text = json.dumps(info)
-    return f'{text} ({RECOVERY_BLOCKER})' if is_cleanup_holder(info) else text
+    return f'{text} ({_blocker_text(info)})' if is_cleanup_holder(info) else text
 
 
 def _held_refusal(board) -> BoardLocked:
@@ -551,10 +640,10 @@ def _valid_group(locks, board) -> bool:
 def take_board_lock(board: str, reason: str, *, protected=False, **extra):
     """Take the board's flock and record ourselves as its holder; returns the open handle
     (keep it referenced; release_board_lock or end_failed ends it). Raises BoardLocked when
-    another process holds the flock (RecoveryBlocked when that is an older helper's cleanup
-    holder), and LockUnavailable when the lock cannot be taken or recorded (fail-closed). A
-    free flock is always taken: what a task that ended without its cleanup left there
-    (_leftover) is appended to the board's cleanup log first, never a refusal.
+    another process holds the flock (RecoveryBlocked when that is a cleanup holder; FenceHeld
+    while a host fence is there), and LockUnavailable when the lock cannot be taken or
+    recorded (fail-closed). A free flock is always taken: what a task that ended without its
+    cleanup left there (_leftover) is appended to the board's cleanup log first, never a refusal.
 
     The handle's `cleanup_failures` are the board's open failed cleanups (open_cleanup_failures),
     for the caller's report before any hardware access, the leftover found now last with
@@ -1812,6 +1901,38 @@ def _receipts_blocker(receipts, holder) -> str:
     return f'its operations are not proven ended: {"; ".join(runs)}' if runs else ''
 
 
+def _reservation_blocker(recs) -> str:
+    """Why a hil_reserve keeper's records `recs` do not show its command's subtree ended (their `reservation`, the
+    keeper's own ECHILD answer), '' when they do or carry none. Records that disagree, or a reservation that
+    cannot be read, refuse."""
+    named = [('reservation' in r, r.get('reservation')) for r in recs]
+    if any(n != named[0] for n in named):
+        return 'its records disagree on their reservation'
+    present, res = named[0] if named else (False, None)
+    if not present:
+        return ''
+    if not isinstance(res, dict) or res.get('phase') not in ('survivors', 'ended'):
+        return f'its reservation {res!r:.80} cannot be read'
+    if res['phase'] == 'ended':
+        return ''
+    return (f"its command's descendants are not proven ended (surviving pids "
+            f"{_live_survivors(res) or res.get('survivors')!r:.80}); its keeper reaps them and then marks it ended")
+
+
+def _clear_gone_fence(token, fence):
+    """`release --token` of a keeper gone with its host fence: cleared only when the fence says its command's
+    subtree ended; (pid, []) once it is."""
+    pid = fence.get('pid')
+    if fence.get('ended') is not True:
+        raise ReleaseRefused(f"not cleared: the host fence of token {token}: its keeper pid {pid} is gone without "
+                             f"proving its command's subtree ended; only a host reboot clears it")
+    try:
+        clear_fence(token)
+    except OSError as e:
+        raise ReleaseRefused(f'the host fence of token {token} is not cleared: {e}')
+    return pid, []
+
+
 def open_runs(receipts, states) -> list:
     """Each of `receipts` whose state (its `states` entry) is not done, as text with that state."""
     return [f'{_receipt_text(r)} {s}' for r, s in zip(receipts, states) if s != 'done']
@@ -1821,8 +1942,14 @@ def release_token(token: str):
     """End the token's holder: its token, pid, start, role, lock set and release predicate agree
     on every board that carries the token, it is alive as recorded, its predicate holds,
     rechecked as the holder (_holder_ids), and SIGUSR1 reaches it through a pidfd; returns
-    (pid, boards) once its records and flocks are gone. A dead holder is refused: its flocks
-    are free, and the next task takes its boards."""
+    (pid, boards) once its records and flocks are gone. A hil_reserve keeper's predicate is its
+    records' `reservation`, which must say its command's subtree ended; the keeper checks again
+    before it clears its records and host fence. A dead holder is refused: its flocks are free,
+    and the next task takes its boards; a dead keeper's host fence is cleared, returning (pid, []),
+    only when it says that subtree ended, and otherwise stays until the host reboots."""
+    fence = fence_state()
+    if fence and fence.get('token') == token and not _fence_live(fence):
+        return _clear_gone_fence(token, fence)
     found = {}
     for b in lock_names():
         rec = read_record(b)
@@ -1853,7 +1980,8 @@ def release_token(token: str):
                 f'pid {pid} is not the recorded holder (start {live} != {start})')
         raise ReleaseRefused(f'not signalled: {gone}; its flocks are free and the next task takes '
                              f'{", ".join(sorted(found))}')
-    why = _release_blocker(receipts, (pid, start), retained)
+    why = '; '.join(w for w in (_reservation_blocker(found.values()),
+                                _release_blocker(receipts, (pid, start), retained)) if w)
     if why:
         raise ReleaseRefused(f'not signalled: holder pid {pid} of token {token} keeps '
                              f'{", ".join(sorted(found))}: {why}')
@@ -2247,7 +2375,7 @@ def _release_one(b, victims) -> int:
     """Clear a stale record, or queue a provable hold holder for SIGTERM; 1 on a refusal."""
     try:
         fh = flock_nb(b)
-    except AdmissionClosed as e:
+    except (AdmissionClosed, FenceHeld) as e:
         print(f'ERROR: {e}', file=sys.stderr)
         return 1
     except BlockingIOError:
@@ -2257,7 +2385,7 @@ def _release_one(b, victims) -> int:
             return 1
         pid, reason = info.get('pid'), info.get('reason')
         if is_cleanup_holder(info):
-            why = RECOVERY_BLOCKER
+            why = _blocker_text(info)
         elif is_protected(info):
             why = 'wait for it to finish'
         elif info.get('holder') != HOLD_KIND or info.get('start') is None or not isinstance(pid, int):
@@ -2353,6 +2481,9 @@ def cmd_release_token(token):
     except ReleaseRefused as e:
         print(f'ERROR: {e}', file=sys.stderr)
         return 1
+    if not boards:
+        print(f'cleared the host fence of gone keeper pid {pid} (token {token})')
+        return 0
     print(f'released {len(boards)} lock(s) of holder {pid} (token {token}): {", ".join(boards)}')
     return 0
 
@@ -2380,7 +2511,8 @@ def failure_report(failures) -> dict:
 
 
 def cmd_status():
-    lines = []
+    fence = fence_state()
+    lines = [] if fence is None else [fence_text(fence)]
     for b in sorted(set(lock_names()) | set(journal_names()) | set(_names(CLEANUP_LOG, skip_hidden=True))):
         journal = journal_state(b)
         data, state, info = _record(b)
@@ -2449,7 +2581,9 @@ them ends that holder and releases all of its boards. `release --token` ends
 an older helper's cleanup holder, which never frees on its own, once its
 release predicate (the run_tracked receipts it waits for, the provider
 sessions in its `retained`) holds: until then it refuses, naming what is
-still open.
+still open. A hil_reserve keeper whose command left descendants holds every
+lock, lock admission and a host fence (.fence.json, which refuses every take
+even after its keeper is gone) until `release --token` finds them ended.
 
 A logged failure stays open until a task that restored the board proves its
 evidence ended. `resolve` closes one by an operator's acknowledgement with

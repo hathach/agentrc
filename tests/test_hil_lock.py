@@ -1805,6 +1805,127 @@ class LegacyRelease(LockDir):
         self.assertEqual(signals, [])
 
 
+class ReservationRelease(LockDir):
+    """A hil_reserve keeper's cleanup holder (agentrc#586) is refused as one, and release_token signals it only
+    once every record's `reservation` agrees its command's subtree ended."""
+
+    def signals(self):
+        sent = []
+        real = hil_lock.signal.pidfd_send_signal
+        self.patch(hil_lock.signal, 'pidfd_send_signal', lambda fd, sig: (sent.append(sig), real(fd, sig)))
+        return sent
+
+    def test_only_an_ended_reservation_is_signalled(self):
+        sent = self.signals()
+        me = {'pid': os.getpid(), 'start': hil_lock.proc_start(os.getpid())}
+        for n, (reservation, why) in enumerate((
+                ({'phase': 'survivors', 'survivors': [me]},
+                 rf"its command's descendants are not proven ended \(surviving pids \[{os.getpid()}\]\)"),
+                ({'phase': 'bogus'}, r"its reservation \{'phase': 'bogus'\} cannot be read"),
+                ('ended', "its reservation 'ended' cannot be read"))):
+            board = f'{BOARD}-{n}'
+            token, pid = start_legacy_holder(self, [board], reservation=reservation)
+            with self.assertRaisesRegex(hil_lock.RecoveryBlocked, re.escape(hil_lock.RESERVATION_BLOCKER)):
+                hil_lock.acquire_board_lock(board, reason='selftest')
+            with self.assertRaisesRegex(hil_lock.ReleaseRefused, f'not signalled: holder pid {pid} of token {token} '
+                                                                 f'keeps {board}: {why}'):
+                hil_lock.release_token(token)
+        other = BOARD + '-x'
+        token, pid = start_legacy_holder(self, [BOARD, other], reservation={'phase': 'ended'})
+        rec = hil_lock.read_record(other)
+        Path(hil_lock.lock_path(other)).write_text(json.dumps({**rec, 'reservation': {'phase': 'survivors'}}))
+        with self.assertRaisesRegex(hil_lock.ReleaseRefused, 'its records disagree on their reservation'):
+            hil_lock.release_token(token)
+        self.assertEqual(sent, [])
+        Path(hil_lock.lock_path(other)).write_text(json.dumps(rec))
+        self.assertEqual(hil_lock.release_token(token), (pid, sorted([BOARD, other])))
+        self.assertEqual(sent, [signal.SIGUSR1])
+
+
+class HostFence(LockDir):
+    """A hil_reserve keeper's host fence (agentrc#586): checked once a flock or ADMISSION is taken, it refuses
+    every take and every new lock name at once (FenceHeld, a RecoveryBlocked) and names what ends it;
+    release_token clears it only for a gone keeper that marked its command's subtree ended."""
+
+    def fence(self, pid=999999999, start='1', ended=False, token='tok'):
+        hil_lock.arm_fence({'tool': 'hil_reserve', 'token': token, 'pid': pid, 'start': start, 'locks': [BOARD],
+                            'ended': ended})
+
+    def test_a_gone_keepers_fence_refuses_every_take_until_a_reboot(self):
+        hil_lock.ensure_lock_files([BOARD])
+        self.fence()
+        why = "host fenced by hil_reserve pid 999999999 \\(token tok\\), gone without proving its command's " \
+              "subtree ended: only a host reboot clears it"
+        for take in (self.acquire, lambda: hil_lock.acquire_board_lock('newboard', reason='selftest'),
+                     lambda: hil_lock.ensure_lock_files(['newboard']), lambda: hil_lock.flock_nb(BOARD).close()):
+            with self.assertRaisesRegex(hil_lock.FenceHeld, why) as cm:
+                take()
+            self.assertIsInstance(cm.exception, hil_lock.RecoveryBlocked)
+        self.assertTrue(self.flock_is_free())
+        self.assertEqual(hil_lock.lock_names(), [BOARD])
+        t0 = time.monotonic()
+        with self.assertRaises(hil_lock.FenceHeld):
+            with hil_lock.board_task(BOARD, 'selftest run', busy=lambda: [], wait=5):
+                pass
+        self.assertLess(time.monotonic() - t0, 2, 'a fence is never waited on')
+        with quiet() as (out, err):
+            self.assertEqual(hil_lock.cmd_release([BOARD]), 1)
+            hil_lock.cmd_status()
+        self.assertRegex(err.getvalue(), why)
+        self.assertRegex(out.getvalue(), why)
+        with self.assertRaisesRegex(hil_lock.ReleaseRefused, 'only a host reboot clears it'):
+            hil_lock.release_token('tok')
+        self.assertIsNotNone(hil_lock.fence_state())
+
+    def test_a_gone_keeper_that_marked_its_subtree_ended_is_cleared_by_its_token(self):
+        self.fence(ended=True)
+        with self.assertRaisesRegex(hil_lock.FenceHeld, r'gone after its command.s subtree ended: '
+                                                        r'`hil_lock.py release --token tok` clears it'):
+            self.acquire()
+        with self.assertRaisesRegex(hil_lock.ReleaseRefused, 'no holder record carries token other'):
+            hil_lock.release_token('other')
+        with quiet() as (out, _):
+            self.assertEqual(hil_lock.cmd_release_token('tok'), 0)
+        self.assertIn('cleared the host fence of gone keeper pid 999999999 (token tok)', out.getvalue())
+        self.assertIsNone(hil_lock.fence_state())
+        self.assertIsNotNone(self.acquire())
+
+    def test_a_live_keepers_or_an_unreadable_fence_refuses_too(self):
+        me = os.getpid()
+        self.fence(pid=me, start=hil_lock.proc_start(me))
+        with self.assertRaisesRegex(hil_lock.FenceHeld, 'its command or a descendant of it may still change the rig'):
+            self.acquire()
+        with self.assertRaisesRegex(hil_lock.ReleaseRefused, 'no holder record carries token tok'):
+            hil_lock.release_token('tok')        # a live keeper's fence goes only with its records
+        Path(self.dir, hil_lock.FENCE).write_text('{"tok')
+        with self.assertRaisesRegex(hil_lock.FenceHeld, r'unreadable \.fence\.json: only a host reboot clears it'):
+            self.acquire()
+        hil_lock.clear_fence('tok')               # nobody's to clear
+        self.assertEqual(hil_lock.fence_state(), {})
+
+    def test_a_fence_armed_while_a_take_gets_its_flock_is_seen(self):
+        hil_lock.ensure_lock_files([BOARD])
+        real = fcntl.flock
+
+        def flock(fd, op):
+            real(fd, op)
+            if op & fcntl.LOCK_EX and hil_lock.fence_state() is None:
+                self.fence()                      # a keeper that held this flock until it died, just after arming
+        with mock.patch.object(hil_lock.fcntl, 'flock', flock):
+            with self.assertRaises(hil_lock.FenceHeld):
+                self.acquire()
+        self.assertTrue(self.flock_is_free())
+        self.assertEqual(self.lock_bytes(), b'')
+
+    def test_only_its_own_token_clears_a_fence(self):
+        self.fence()
+        hil_lock.clear_fence('other')
+        self.assertEqual(hil_lock.fence_state()['token'], 'tok')
+        hil_lock.clear_fence('tok')
+        self.assertIsNone(hil_lock.fence_state())
+        hil_lock.clear_fence('tok')               # none is no error
+
+
 class ProtectedGroup(LockDir):
     """A protected take declares its task's group on its first record (agentrc#197): descriptive
     since agentrc#464, still validated before anything is touched."""
