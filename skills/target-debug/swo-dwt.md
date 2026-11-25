@@ -221,8 +221,8 @@ Manchester (TPIU_DEVID). A CMSIS-DAP probe with SWO support wired to a target's 
 
 ## Known faults
 
-- STLINK-V3 (firmware J12M3) through OpenOCD on stm32h743nucleo loses a byte now and then: at 16 MHz near
-  2 KiB-multiple stream offsets (the decode breaks 0 to 5 bytes past one), and with exception trace and PC sampling
+- STLINK-V3 through OpenOCD on stm32h743nucleo loses bytes: at 16 MHz near 2 KiB-multiple stream offsets (the decode
+  breaks 0 to 5 bytes past one; far more often on firmware J17 than J12M3), and with exception trace and PC sampling
   together at all three rates tried (4, 8 and 16 MHz). The decode reports each as an unknown header or an unexpected
   source and resynchronizes; the counts and what was ruled out are in `swo-boards.md`.
 - A periodic DWT packet due while another is output comes out after it and can lose its own Local timestamp, taking
