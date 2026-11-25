@@ -31,7 +31,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from facts import EMIT_TO, Parser, Unusable, attempt, emit_beside, report, sealed  # noqa: E402
+from facts import EMIT_TO, Parser, Unusable, attempt, creating, emit_beside, report, sealed  # noqa: E402
 
 MAX = 8 * 1024 * 1024
 PART = 384 * 1024
@@ -71,10 +71,8 @@ def cut(text):
 
 
 def parts_of(text):
-    try:
+    with creating():
         return {'parts': [emit_beside(f'.part{n}.js', piece) for n, piece in enumerate(cut(text), 1)]}
-    except OSError as e:
-        raise Unusable(f'cannot create {e.filename}: {e.strerror}')
 
 
 def top_level(*at):

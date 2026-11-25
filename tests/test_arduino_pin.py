@@ -11,6 +11,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -692,6 +693,45 @@ class Conformance(Consumer):
                     "import agentrc_pin\nE = agentrc_pin.load('skills/arduino/scripts/arduino_hil.py')\n")
         self.assertEqual(self.pin.identity()['root'], str(ROOT))
         self.assertEqual(self.pin.conformance(), [])
+
+
+@unittest.skipIf(os.name == 'nt', 'the real Arduino engines are Linux only (fcntl)')
+class BuildRunsThePin(Consumer):
+    """arduino_build.run_tests() runs a consumer's `agentrc_pin` contract test through this bootstrap's `test`."""
+
+    def setUp(self):
+        super().setUp()
+        self.ab = load_arduino_engine(BUILD)
+        profile = types.SimpleNamespace(ROOT=self.root,
+                                        CONTRACT_TESTS={'agentrc_pin': '.claude/test/test_agentrc_pin.py'})
+        self.stack.enter_context(mock.patch.object(self.ab, 'P', profile))
+        self.consumer_test('pass')
+
+    def consumer_test(self, body):
+        (self.root / '.claude/test').mkdir(parents=True, exist_ok=True)
+        (self.root / '.claude/test/test_agentrc_pin.py').write_text(
+            f'import unittest\nclass Pin(unittest.TestCase):\n    def test_it(self):\n        {body}\n')
+
+    def run_pin(self):
+        [row] = self.ab.run_tests(['agentrc_pin'])
+        return row['status'], row['firstError']
+
+    def test_a_conforming_consumer_passes_and_its_test_failures_propagate(self):
+        self.assertEqual(self.run_pin(), ('ok', ''))
+        self.consumer_test('self.fail("consumer")')
+        self.assertEqual(self.run_pin(), ('failed', 'FAILED (failures=1)'))
+
+    def test_contract_files_without_the_configuration_fail(self):
+        self.profile((PROFILE, CONSUMER))
+        status, error = self.run_pin()
+        self.assertEqual(status, 'failed')
+        self.assertIn(f"CONTRACT_FILES lacks ['{CONFIG}']", error)
+
+    def test_a_drifted_bootstrap_copy_fails(self):
+        (self.root / CONSUMER).write_bytes((self.root / CONSUMER).read_bytes() + b'\n')
+        status, error = self.run_pin()
+        self.assertEqual(status, 'failed')
+        self.assertIn(f'bootstrap copy {self.root / CONSUMER} differs', error)
 
 
 @unittest.skipIf(os.name == 'nt', 'the real Arduino engines are Linux only (fcntl)')

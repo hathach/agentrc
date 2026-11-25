@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { test as nodeTest } from 'node:test'
@@ -78,12 +79,32 @@ const unpacked = (v) => Array.isArray(v) ? v.map(unpacked)
 const bare = (v) => Array.isArray(v) ? v.map(bare)
   : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).filter(([, x]) => x !== null).map(([k, x]) => [k, bare(x)])) : v
 const sealLine = (facts) => ({ ...facts, seal: fnv1a(canonical(bare(facts))) })
-// [reviewers, auto-runners] as the validator prompt's harvest command names them.
-const harvestFlags = (prompt) => ['--reviewers', '--auto-run'].map(f => new RegExp(`${f} ([^\\s\`]+)`).exec(String(prompt))?.[1].split(',') ?? [])
+// The runtime's limit on a Workflow script file.
+const SCRIPT_FILE_MAX = 524288
+// harvest.py's comment index for a stub reading: the comments the case lists, else those its findings, carried records
+// and replies name, each with its first digest, aliases and source.
+const indexOf = (r, carry) => {
+  const byId = new Map()
+  const add = (commentId, digest, aliases, source) => byId.has(commentId) || byId.set(commentId, { commentId, digest, ...(aliases ? { aliases } : {}), source })
+  for (const c of r.comments ?? []) add(c.commentId, c.digest, c.aliases, c.source)
+  if (r.comments) return [...byId.values()]
+  for (const f of r.findings ?? []) add(f.commentId, f.commentDigest, f.commentAliases, f.source)
+  for (const c of Array.isArray(carry) ? carry : []) if (c.eligible === true) add(c.commentId, c.commentDigest, c.commentAliases, c.source)
+  for (const x of r.replies ?? []) add(x.commentId, `d${x.commentId}`, undefined, 'coderabbit')
+  return [...byId.values()]
+}
+// [reviewers, auto-runners] as the harvest command names them.
+const harvestFlags = (prompt) => ['--reviewers', '--auto-run'].map(f => new RegExp(`${f} ([^\\s\`;]+)`).exec(String(prompt))?.[1].split(',') ?? [])
+// The harvest file a validator prompt names.
+const readingOf = (prompt) => String(prompt).match(/ is the UTF-8 JSON file '([^']+)'/)[1]
+// The full harvest a cycle's relay ran, first attempt.
+const harvestCall = (calls, cycle = null) => calls.find(c => c.label.startsWith(`reviews:harvest#${cycle ?? ''}`))
 // A relay prompt's staged() payload line: the input path, the JSON's fnv1a and its base64.
 const PAYLOAD_LINE = /^AGENTRC-PAYLOAD (.+) ([0-9a-f]{8}) ([A-Za-z0-9+/=]*)$/m
 // The JSON a relay command stages for its script (staged()), decoded as its Python stage decodes it.
 const stagedOf = (prompt) => JSON.parse(Buffer.from(String(prompt).match(PAYLOAD_LINE)[3], 'base64').toString('utf8'))
+// harvest.py --carry-file's list as the harvest command stages it, [] when it passes none.
+const carryOf = (prompt) => / --carry-file '/.test(String(prompt)) ? stagedOf(prompt) : []
 // The staged JSON's text, '' for a prompt that stages none.
 const stagedText = (prompt) => PAYLOAD_LINE.test(String(prompt)) ? JSON.stringify(stagedOf(prompt)) : ''
 // A prompt's trailing list on a line of its own.
@@ -276,17 +297,17 @@ async function run(opts = {}) {
   let returned = false
   let dirCalls = 0 // facts.py emit-dir runs; opts.dirAnswer(n) answers the nth instead (undefined: the directory and its nonce)
 
-  // One harvest per cycle, whichever of the validator and the probe (#359) asks for it first.
+  // One harvest per cycle, whichever of the full harvest and the probe (#359) asks for it first; the validator judges it.
   const readings = new Map()
   const reading = (cycle, prompt) => {
     if (!readings.has(cycle)) readings.set(cycle, harvestOf(prompt))
     return readings.get(cycle).then(r => structuredClone(r))
   }
   const harvestOf = async (prompt) => {
-    if (reviews instanceof Error) throw reviews
-    // opts.reviewsWait(calls): hold the validator's answer, as afterReviewLane holds the CI evidence.
+    // opts.reviewsWait(calls): hold the harvest, as afterReviewLane holds the CI evidence.
     if (opts.reviewsWait) await opts.reviewsWait(calls)
-    const r = structuredClone(opts.reviewsPerCycle ? opts.reviewsPerCycle(prompt) : reviews)
+    // A reviews Error is the validator's death (below); the harvest under it reads nothing.
+    const r = structuredClone(opts.reviewsPerCycle ? opts.reviewsPerCycle(prompt) : reviews instanceof Error ? { findings: [], replies: [] } : reviews)
     // A finding that relates to no earlier verdict and names no repair of ours, unless a case says it does.
     if (Array.isArray(r.findings)) r.findings = r.findings.map(f => ({ related: null, changeReason: null, fixedBy: null, ...f }))
     // `bots: 'reviewed'` / `'pending'` name every auto-running bot in that
@@ -450,7 +471,38 @@ async function run(opts = {}) {
       const judged = { checks: links.map(link => ({ link, failures: [failures[failed.findIndex(c => c.link === link)]] })), infraRerun: ci.infraRerun }
       return conforms(options.schema, opts.judge ? opts.judge(judged) : judged, label)
     }
-    if (label.startsWith('reviews#')) return reading(cycleOf(label), prompt)
+    // harvest.py's full line: this cycle's reading with its comments and carry records, every --carry-file entry ineligible
+    // unless the case lists them. A case's rateLimit or harvestError is the line each attempt prints instead.
+    if (label.startsWith('reviews:harvest#')) {
+      const r = await reading(cycleOf(label), prompt)
+      if (r.rateLimit) {
+        const { error, ...limit } = r.rateLimit
+        return { error, rateLimit: limit }
+      }
+      if (r.harvestError) return { error: r.harvestError }
+      const { headSha, observedAt, headEventAt, headEventEvidence, fingerprint, bots } = r
+      const carry = r.carry ?? carryOf(prompt).map(c => ({ commentId: c.commentId, eligible: false, reason: 'its body changed' }))
+      const index = indexOf(r, carry)
+      const snapshot = { headSha, observedAt, headEventAt, headEventEvidence, fingerprint, bots, comments: r.comments ?? index, carry }
+      // harvest.py writes the reading beside its line, the file the validator reads, and keeps only the comments' index
+      // in the line; opts.readingFile(path) may undo the file.
+      const text = JSON.stringify(snapshot, null, 1) + '\n'
+      const readingFile = `${emitOf(prompt)}.reading.json`
+      writeFileSync(readingFile, text)
+      opts.readingFile?.(readingFile)
+      const { comments, ...rest } = snapshot
+      return sealLine({ ...rest, index, readingSha256: createHash('sha256').update(text).digest('hex') })
+    }
+    // The validator judges the reading the harvest took this cycle, from the file its prompt names: its findings and
+    // replies, and the file's fingerprint as read (\'\' for a file it could not read).
+    if (label.startsWith('reviews#')) {
+      if (reviews instanceof Error) throw reviews
+      const { findings, replies } = await reading(cycleOf(label), prompt)
+      const named = readingOf(prompt)
+      // Each finding by its comment's id: the source and digests are the harvest's.
+      return { fingerprint: existsSync(named) ? JSON.parse(readFileSync(named, 'utf8')).fingerprint : '',
+        findings: findings.map(({ source, commentDigest, commentAliases, ...f }) => f), replies }
+    }
     // harvest.py --probe: this cycle's reading without its comments, sealed; opts.probe patches it, null a dead relay.
     if (label.startsWith('reviews:probe#')) {
       const r = await reading(cycleOf(label), prompt)
@@ -709,6 +761,8 @@ async function run(opts = {}) {
   const workflow = async (ref, a) => {
     if (!ref || typeof ref.scriptPath !== 'string') throw new Error('pr-babysit nests only a data module, by scriptPath')
     loads.push(ref.scriptPath)
+    // The runtime's limit on a Workflow script file (Claude Code 2.1.322).
+    if (statSync(ref.scriptPath, { throwIfNoEntry: false })?.size > SCRIPT_FILE_MAX) throw new Error(`${ref.scriptPath}: over ${SCRIPT_FILE_MAX} bytes`)
     // A module's value enters this VM across the same boundary a result leaves it by.
     return acrossVm(await loadModule(ref.scriptPath, a, { pipeline, parallel, log: (m) => logs.push(String(m)) }))
   }
@@ -929,7 +983,7 @@ test('omitted reviewers default to coderabbit and greptile auto-running, and cod
   for (const reviewers of [undefined, null]) {
     const { calls, result } = await run({ args: { reviewers } })
     assert.equal(result.pass, true)
-    const prompt = calls.find(c => c.label.startsWith('reviews#')).prompt
+    const prompt = harvestCall(calls).prompt
     assert.deepEqual(harvestFlags(prompt), [['coderabbit', 'greptile', 'code-scanning'], ['coderabbit', 'greptile']])
     assert.deepEqual(result.state.config.autoRun, ['coderabbit', 'greptile'])
   }
@@ -937,7 +991,7 @@ test('omitted reviewers default to coderabbit and greptile auto-running, and cod
 
 test('code-scanning is never waited for, and its findings are fixed like any bot\'s', async () => {
   const alone = await run({ args: { reviewers: ['code-scanning'] } })
-  assert.deepEqual(harvestFlags(alone.calls.find(c => c.label.startsWith('reviews#')).prompt), [['code-scanning'], []])
+  assert.deepEqual(harvestFlags(harvestCall(alone.calls).prompt), [['code-scanning'], []])
   assert.equal(alone.result.pass, true, JSON.stringify(alone.result.reason))
   const { calls, logs } = await run({
     args: { reviewers: ['code-scanning'] },
@@ -947,9 +1001,9 @@ test('code-scanning is never waited for, and its findings are fixed like any bot
   assert.match(rowsOf(summaries(logs)[0])[0][3], /^fixed \+ pushed/)
 })
 
-test('the requested reviewers, normalized, are the ones the validator is asked for', async () => {
+test('the requested reviewers, normalized, are the ones harvested', async () => {
   const { calls } = await run({ args: { reviewers: ['  CodeRabbit ', 'CopIlot'] } })
-  const reviews = calls.find(c => c.label.startsWith('reviews#'))
+  const reviews = harvestCall(calls)
   assert.deepEqual(harvestFlags(reviews.prompt)[0], ['coderabbit', 'copilot'])
   assert.doesNotMatch(reviews.prompt, /greptile/i, 'an unrequested bot must not be harvested')
 })
@@ -957,27 +1011,27 @@ test('the requested reviewers, normalized, are the ones the validator is asked f
 test('the auto-running reviewers are named apart from the harvest list', async () => {
   // Harvest-only Copilot must never become a settlement requirement.
   const split = await run({ args: { reviewers: ['greptile', 'coderabbit', 'copilot'], autoRun: [' CodeRabbit '] } })
-  const prompt = split.calls.find(c => c.label.startsWith('reviews#')).prompt
+  const prompt = harvestCall(split.calls).prompt
   assert.deepEqual(harvestFlags(prompt), [['greptile', 'coderabbit', 'copilot'], ['coderabbit']])
   // Default: everybody harvested; copilot, harvest-only, is not waited for.
   const same = await run({ args: { reviewers: ['greptile', 'coderabbit', 'copilot'] } })
-  assert.deepEqual(harvestFlags(same.calls.find(c => c.label.startsWith('reviews#')).prompt)[1], ['greptile', 'coderabbit'])
+  assert.deepEqual(harvestFlags(harvestCall(same.calls).prompt)[1], ['greptile', 'coderabbit'])
   const nobody = await run({ args: { reviewers: ['copilot'], autoRun: [] } })
-  assert.deepEqual(harvestFlags(nobody.calls.find(c => c.label.startsWith('reviews#')).prompt)[1], [])
+  assert.deepEqual(harvestFlags(harvestCall(nobody.calls).prompt)[1], [])
 })
 
 test('greptile is harvested and waited for, or harvested only', async () => {
   const waited = await run({ args: { reviewers: [' Greptile '] } })
-  assert.deepEqual(harvestFlags(waited.calls.find(c => c.label.startsWith('reviews#')).prompt), [['greptile'], ['greptile']])
+  assert.deepEqual(harvestFlags(harvestCall(waited.calls).prompt), [['greptile'], ['greptile']])
   assert.deepEqual(waited.result.state.config.autoRun, ['greptile'])
   const harvested = await run({ args: { reviewers: ['greptile'], autoRun: [] } })
-  assert.deepEqual(harvestFlags(harvested.calls.find(c => c.label.startsWith('reviews#')).prompt), [['greptile'], []])
+  assert.deepEqual(harvestFlags(harvestCall(harvested.calls).prompt), [['greptile'], []])
   assert.equal(harvested.result.pass, true, JSON.stringify(harvested.result.reason))
 })
 
 test('the usual launch, copilot and coderabbit, waits for coderabbit only', async () => {
   const { calls, result } = await run({ args: { reviewers: ['copilot', 'coderabbit'] } })
-  const reviews = calls.find(c => c.label.startsWith('reviews#'))
+  const reviews = harvestCall(calls)
   assert.deepEqual(harvestFlags(reviews.prompt), [['copilot', 'coderabbit'], ['coderabbit']])
   assert.deepEqual(result.state.config.reviewers, ['copilot', 'coderabbit'])
   assert.deepEqual(result.state.config.autoRun, ['coderabbit'])
@@ -1030,7 +1084,7 @@ test('the repo named is the one every gh-calling script is run against (#311)', 
   const named = await run({ reviews, scope: ['src/a.c'], args: { repo: PICO, autoPush: true, maxCycles: 2 }, preflight: picoPin })
   assert.ok(named.calls[0].prompt.includes(`--repo '${PICO}'\``), named.calls[0].prompt)
   const gh = named.calls.filter(c => GH_SCRIPT.test(c.prompt))
-  assert.ok(['reviews#1', 'replies#1', 'push#1-review', 'ci:collect#1.1', 'prstate#1-replies'].every(l => gh.some(c => c.label === l)), gh.map(c => c.label).join(', '))
+  assert.ok(['reviews:harvest#1', 'replies#1', 'push#1-review', 'ci:collect#1.1', 'prstate#1-replies'].every(l => gh.some(c => c.label === l)), gh.map(c => c.label).join(', '))
   for (const c of gh) assert.ok(c.prompt.includes(`--repo '${PICO}'`), `${c.label}: ${c.prompt}`)
   // Omitted, the repository preflight found the checkout naming is the one every later call names.
   const found = await run({ reviews, scope: ['src/a.c'], args: { autoPush: true, maxCycles: 2 }, preflight: picoPin })
@@ -1253,7 +1307,7 @@ test("facts.py's seal is the one the workflow checks, on text JSON escapes", asy
   assert.equal(done.status, 0, done.stderr)
   const printed = JSON.parse(done.stdout)
   const kept = await run({ preflight: printed })
-  assert.deepEqual(kept.labels.slice(0, 2), ['preflight', 'reviews#1'], 'the seal matched')
+  assert.deepEqual([kept.labels[0], kept.labels.includes('reviews#1')], ['preflight', true], 'the seal matched')
   assert.equal(kept.result.pass, true)
   // Keys JavaScript and a code-point sort order differently.
   const keyed = spawnSync('python3', ['-X', 'utf8', '-c', 'import json,sys; sys.path.insert(0, sys.argv[1]); from facts import sealed; print(sealed(json.loads(sys.stdin.read()))["seal"])',
@@ -2450,7 +2504,8 @@ test('a CI wait left early on a brief slice is classified from its full read', a
   const full = (l) => l.startsWith('ci:collect#1.full')
   const ciLabels = (calls) => calls.filter(c => c.label.startsWith('ci:')).map(c => c.label)
   const settled = await run({ throwOn: stops, ci: (l) => full(l) ? GREEN : RUNNING, args: { maxCycles: 1 } })
-  assert.deepEqual(ciLabels(settled.calls), ['ci:collect#1.1', 'ci:collect#1.full'], settled.logs.join('\n'))
+  // The harvest relay before the validator lets the wait poll again; however many brief slices, the full read is last.
+  assert.match(ciLabels(settled.calls).join(' '), /^(ci:collect#1\.\d+ )+ci:collect#1\.full$/, settled.logs.join('\n'))
   assert.equal(settled.result.history[0].ci.status, 'green', 'the full read, not the brief slice, is the CI observed')
   // Another head on the full read is never read as this head's CI.
   const moved = await run({ throwOn: stops, ci: (l) => full(l) ? { ...RUNNING, headSha: 'f'.repeat(40) } : RUNNING, args: { maxCycles: 1 } })
@@ -3019,7 +3074,8 @@ test('a call GitHub refused for a rate limit stops the launch, charged only for 
     assert.equal(r.result.reason, 'github-rate-limited', name)
     assert.deepEqual(r.result.rateLimit, rateLimit, name)
     assert.equal(r.result.state.cyclesUsed, cyclesUsed, name)
-    assert.deepEqual(r.labels.filter(l => l.startsWith('reviews#')), ['reviews#1'], name)
+    assert.deepEqual(r.labels.filter(l => l.startsWith('reviews:harvest#')), ['reviews:harvest#1'], name)
+    assert.equal(r.labels.includes('reviews#1'), !name.startsWith('the harvest'), `${name}: a refused harvest is never validated`)
     if (line) assert.ok(r.logs.some(l => line.test(l)), `${name}: ${r.logs.join('\n')}`)
     check?.(r)
   }
@@ -3751,14 +3807,14 @@ test('a mislabeled commit SHA is not shown as a commit', async () => {
   assert.equal(rowsOf(summaries(relabeled.logs)[0])[0][4], shaFor(1).slice(0, 8))
 })
 
-test('a harvest that failed twice stops the launch at once, whatever the validator calls it (#205)', async () => {
+test('a harvest that failed twice stops the launch at once, the validator never dispatched (#205)', async () => {
   const failed = { headSha: '', observedAt: '', headEventAt: null, headEventEvidence: 'harvest failed', fingerprint: '', bots: [], botsWhole: true,
     findings: [], replies: [], harvestError: 'PyYAML is not installed' }
   const { result, labels, logs } = await run({ reviews: failed, args: { autoPush: true, maxCycles: 4 } })
   assert.equal(result.reason, 'harvest-failed')
   assert.equal(result.detail, 'PyYAML is not installed')
   assert.equal(result.history[0].error, 'harvest.py failed: PyYAML is not installed')
-  assert.deepEqual(labels.filter(l => l.startsWith('reviews#')), ['reviews#1'], 'no further cycle')
+  assert.deepEqual(labels.filter(l => l.startsWith('reviews')), ['reviews:harvest#1', 'reviews:harvest#1.retry'], 'run once more, no validator and no further cycle')
   assert.equal(labels.some(l => /^(fix:|commit#|push#)/.test(l)), false)
   assert.equal(result.history[0].ci.status, 'green', 'the CI lane is still awaited')
   assert.ok(logs.some(l => l === 'cycle 1: harvest.py failed twice — PyYAML is not installed'), logs.join('\n'))
@@ -3771,29 +3827,48 @@ test('a report carrying both a rate limit and a harvest error takes the rate-lim
   assert.equal(result.state.cyclesUsed, 0)
 })
 
-test('a harvest that printed no JSON line is retried and reported by its last stderr line, a rate limit first (#240)', async () => {
-  const failed = { headSha: '', observedAt: '', headEventAt: null, headEventEvidence: 'harvest failed', fingerprint: '', bots: [], botsWhole: true, findings: [], replies: [] }
-  for (const error of ["PermissionError: [Errno 13] Permission denied: 'gh'", 'harvest.py printed nothing (exit 1)']) {
-    const { result, labels } = await run({ reviews: { ...failed, harvestError: error }, args: { maxCycles: 4 } })
-    assert.deepEqual([result.reason, result.detail], ['harvest-failed', error])
-    assert.deepEqual(labels.filter(l => l.startsWith('reviews#')), ['reviews#1'], 'stopped, no cycle spent re-reading it')
+test('a harvest that wrote no line is retried and reported by the transport, a rate limit first (#240)', async () => {
+  const harvest = (label) => label.startsWith('reviews:harvest#')
+  for (const [name, opts, detail, reached] of [
+    ['killed before its line', { killedAfter: harvest }, 'the script wrote no line (exit 137)'],
+    ['a dead relay', { garble: (label, line) => harvest(label) ? null : line }, /^harvest\.py brought back no usable line/],
+    ['a line off its seal', { garble: (label, line) => harvest(label) ? { ...line, seal: 'deadbeef' } : line }, /^harvest\.py brought back no usable line/],
+    ['a line with no carry records', { garble: (label, line) => harvest(label) ? (({ carry, seal, ...rest }) => sealLine(rest))(line) : line }, /^harvest\.py brought back no usable line/,
+      "reviews:harvest#1: the script's line is off its schema — line has no carry"],
+  ]) {
+    const { result, labels, logs } = await run({ ...opts, args: { maxCycles: 4 } })
+    assert.equal(result.reason, 'harvest-failed', name)
+    if (reached) assert.ok(logs.includes(reached), `${name}: ${logs.join('\n')}`)
+    if (typeof detail === 'string') assert.equal(result.detail, detail, name)
+    else assert.match(result.detail, detail, name)
+    assert.deepEqual(labels.filter(l => l.startsWith('reviews')), ['reviews:harvest#1', 'reviews:harvest#1.retry'], `${name}: stopped, no cycle spent re-reading it`)
   }
+  // The first attempt's error stands when its retry brought nothing back.
+  const first = await run({ reviews: { harvestError: 'gh: not logged in', findings: [], replies: [] },
+    garble: (label, line) => label === 'reviews:harvest#1.retry' ? null : line, args: { maxCycles: 4 } })
+  assert.deepEqual([first.result.reason, first.result.detail], ['harvest-failed', 'gh: not logged in'])
   // A traceback, then a rate-limited retry: the limit decides.
-  const limited = await run({ reviews: { ...LIMITED_REVIEWS, harvestError: 'ModuleNotFoundError: No module named greptile' }, args: { maxCycles: 4 } })
-  assert.equal(limited.result.reason, 'github-rate-limited')
+  const limited = await run({ reviews: LIMITED_REVIEWS, garble: (label, line) => label === 'reviews:harvest#1' ? null : line, args: { maxCycles: 4 } })
+  assert.deepEqual([limited.result.reason, limited.result.rateLimit], ['github-rate-limited', LIMITED_REVIEWS.rateLimit])
+  assert.equal(limited.labels.includes('reviews#1'), false)
+  // One that recovers on the retry is validated as any other.
+  const recovered = await run({ reviews: oneValid, garble: (label, line) => label === 'reviews:harvest#1' ? null : line, args: { maxCycles: 1 } })
+  assert.ok(recovered.labels.includes('reviews#1') && recovered.labels.includes('fix:src/a.c'), recovered.labels.join(' '))
+  assert.ok(recovered.logs.includes('reviews:harvest#1: relay recovered on the retry'), recovered.logs.join('\n'))
 })
 
 test('a dead review validator still settles the CI lane', async () => {
   const { result, logs, labels } = await run({ reviews: new Error('validator exploded') })
   assert.equal(result.reason, 'review-validator-died')
   assert.equal(result.history[0].error, 'pr-review-validator died')
-  assert.deepEqual(labels.slice(0, 3).sort(), ['ci:collect#1.1', 'preflight', 'reviews#1'], 'the CI lane was launched beside it')
+  assert.deepEqual(labels.slice(0, 4).sort(), ['ci:collect#1.1', 'preflight', 'reviews#1', 'reviews:harvest#1'], 'the CI lane was launched beside it')
   assert.equal(result.history[0].ci.status, 'green', 'and awaited, so no agent outlives the workflow')
   assert.equal(summaries(logs).length, 1)
 })
 
 test('a CI lane that reads the merge after the review validator died stops pr-merged', async () => {
-  const { result, logs } = await run({ reviews: new Error('validator exploded'), ci: { ...GREEN, status: 'merged', mergeable: 'UNKNOWN' } })
+  const { result, logs } = await run({ reviews: new Error('validator exploded'), ci: { ...GREEN, status: 'merged', mergeable: 'UNKNOWN' },
+    inventoryWait: afterReviewLane('reviews#') })
   assert.ok(logs.indexOf('cycle 1: PR #3888 is merged — ending both lanes') > logs.findIndex(l => l.startsWith('cycle 1: review validator')), logs.join('\n'))
   assert.equal(result.reason, 'pr-merged', logs.join('\n'))
   assert.equal(result.history[0].error, 'pr-review-validator died', 'the validator death stays on record')
@@ -4138,7 +4213,7 @@ test('the harvest contract requires a findingId on every finding', async () => {
   const { calls } = await run()
   const items = calls.find(c => c.label.startsWith('reviews#')).schema.properties.findings.items
   assert.ok(items.required.includes('findingId'), 'REVIEWS no longer requires findingId')
-  assert.ok(items.required.includes('commentDigest'), 'nor a digest to catch an edited comment')
+  assert.equal(['source', 'commentDigest', 'commentAliases'].some(k => k in items.properties), false, 'a comment\'s source and digests are the harvest\'s (#582)')
   assert.equal(items.additionalProperties, false)
 })
 
@@ -4727,29 +4802,28 @@ test('a stale reply after a failed fix note is a repair, not a second answer', a
   assert.deepEqual(debtOf(result, 1).repair, { replyId: null, error: 'no reply posted: offered fixNote is stale (now owes a refutation)' })
 })
 
-// The fix note of cycle 1 dies with its batch; from cycle 2 the validator judges each finding stale, fixedBy(sha, prompt) naming the commit.
+// The unposted fix notes a validator prompt names, null for none.
+const notedOf = (prompt) => { const m = String(prompt).match(/not yet posted[^[]*(\[.*?\])/); return m && JSON.parse(m[1]) }
+// The fix note of cycle 1 dies with its batch; from cycle 2 the validator judges each finding stale, fixedBy(sha) naming
+// cycle 1's repair commit, and named holds what each later validator prompt offered it.
 const renoteRun = (fixedBy, { first = structuredClone(oneValid), later = (f) => [f] } = {}) => {
   let cycle = 0
-  const named = []
   return run({
     args: { autoPush: true, maxCycles: 4 },
     dropDoneIds: (label) => cycle === 1 && label.startsWith('resolve#'),
-    reviewsPerCycle: (prompt) => {
+    reviewsPerCycle: () => {
       cycle++
       if (cycle === 1) return first
-      const sha = String(prompt).match(/not yet posted[^[]*(\[.*?\])/)?.[1]
-      named.push(sha && JSON.parse(sha))
-      const findings = first.findings.flatMap(f => later(finding({ ...f, verdict: 'stale', fixedBy: fixedBy(sha && JSON.parse(sha)[0].sha) }), cycle))
+      const findings = first.findings.flatMap(f => later(finding({ ...f, verdict: 'stale', fixedBy: fixedBy(shaFor(1)) }), cycle))
       return { findings, replies: [{ commentId: 1, body: 'already fixed' }], bots: 'reviewed' }
     },
-  }).then(out => ({ ...out, named }))
+  }).then(out => ({ ...out, named: out.calls.filter(c => /^reviews#[2-9]$/.test(c.label)).map(c => notedOf(c.prompt)) }))
 }
 
 test('a fix note whose batch died is posted as offered once the validator names our repair as the fix (#115)', async () => {
   const { result, calls, named } = await renoteRun((sha) => sha)
   const [offered, again] = manifestOf(calls, 'resolve#1').concat(manifestOf(calls, 'resolve#2'))
-  assert.match(named[0][0].sha, /^[0-9a-f]{40}$/)
-  assert.deepEqual(named[0], [{ commentId: 1, sha: named[0][0].sha }])
+  assert.deepEqual(named[0], [{ commentId: 1, sha: shaFor(1) }], 'the validator is told the repair the note names')
   assert.equal(again.body, offered.body, 'the offered body, byte for byte')
   assert.equal(calls.some(c => c.label.startsWith('replies#')), false, 'no "already fixed" reply')
   assert.equal(result.state.debt.some(([id]) => id === 1), false)
@@ -4786,13 +4860,13 @@ test('a deferred sibling the offered note states does not keep it from being pos
   const { result, calls } = await run({
     args: { autoPush: true, maxCycles: 4, deferrals: [deferral({ findingId: '1#2' })] },
     dropDoneIds: (label) => cycle === 1 && label.startsWith('resolve#'),
-    reviewsPerCycle: (prompt) => {
+    reviewsPerCycle: () => {
       cycle++
-      const sha = String(prompt).match(/not yet posted[^[]*(\[.*?\])/)?.[1]
-      const fixed = cycle === 1 ? finding() : finding({ verdict: 'stale', fixedBy: JSON.parse(sha)[0].sha })
+      const fixed = cycle === 1 ? finding() : finding({ verdict: 'stale', fixedBy: shaFor(1) })
       return { findings: [fixed, finding({ line: 2 })], replies: cycle === 1 ? [] : [{ commentId: 1, body: 'already fixed' }], bots: 'reviewed' }
     },
   })
+  assert.deepEqual(notedOf(calls.find(c => c.label === 'reviews#2').prompt), [{ commentId: 1, sha: shaFor(1) }])
   const [offered] = manifestOf(calls, 'resolve#1')
   assert.match(offered.body, new RegExp(`- src/a\\.c:2:\\n  .*${ISSUE}`))
   assert.equal(manifestOf(calls, 'resolve#2')[0].body, offered.body, 'the offered body, deferred point included')
@@ -4807,10 +4881,9 @@ test('a deferred sibling whose point the offered note does not state keeps it ha
   const opts = (reason) => ({
     args: { autoPush: true, maxCycles: 4, yieldAfterCycle: true, deferrals: [deferral({ findingId: '1#2', reason })] },
     dropDoneIds: (label) => cycle === 1 && label.startsWith('resolve#'),
-    reviewsPerCycle: (prompt) => {
+    reviewsPerCycle: () => {
       cycle++
-      const sha = String(prompt).match(/not yet posted[^[]*(\[.*?\])/)?.[1]
-      const fixed = cycle === 1 ? finding() : finding({ verdict: 'stale', fixedBy: JSON.parse(sha)[0].sha })
+      const fixed = cycle === 1 ? finding() : finding({ verdict: 'stale', fixedBy: shaFor(1) })
       return { findings: [fixed, finding({ line: 2 })], replies: cycle === 1 ? [] : [{ commentId: 1, body: 'already fixed' }], bots: 'reviewed' }
     },
   })
@@ -5264,14 +5337,12 @@ test('a settlement or a by-hand answer recorded before CodeRabbit rewrote its co
   assert.equal(later.result.handoffs, undefined)
 })
 
-test("findings that disagree on their comment's digest stop the run (#48)", async () => {
+test("every finding on one comment carries the one digest and aliases harvest.py read (#48, #582)", async () => {
   const split = { findings: [rewritten(), rewritten({ findingId: '1#2', line: 2, commentAliases: ['raw', 'other'] })], replies: [], bots: 'reviewed' }
-  const { result, labels } = await run({ reviews: split })
-  assert.equal(result.reason, 'review-report-unusable')
-  assert.equal(result.detail, "comment 1's findings disagree on its digest")
-  const reordered = { findings: [rewritten({ commentAliases: ['raw', 'other'] }), rewritten({ findingId: '1#2', line: 2, commentAliases: ['other', 'raw'] })], replies: [], bots: 'reviewed' }
-  assert.notEqual((await run({ reviews: reordered })).result.reason, 'review-report-unusable', 'the same aliases in another order agree')
-  assert.equal(labels.some(l => /^(fix:|replies#|resolve#|defer#)/.test(l)), false)
+  const { result } = await run({ reviews: split })
+  assert.notEqual(result.reason, 'review-report-unusable')
+  const [first, second] = result.history[0].reviews.findings
+  assert.deepEqual([second.commentDigest, second.commentAliases], [first.commentDigest, first.commentAliases])
 })
 
 test('an out-of-scope topic holds a finding its issue covers before the first harvest can fix it, and anything short of a clear no holds too (#39)', async () => {
@@ -5677,8 +5748,6 @@ test('a challenger overturning a posted dismissal is shown the earlier verdict',
   assert.deepEqual(result.corrections.map(c => c.now), ['the challenger: the ISR path skips the check'], 'the reversal the overturn made is reported')
 })
 
-// harvest.py --carry's list as the validator prompt passes it, [] when it passes none.
-const carryOf = (prompt) => { const m = String(prompt).match(/--carry '((?:[^']|'\\'')*)'/); return m ? JSON.parse(m[1].replaceAll("'\\''", "'")) : [] }
 // What harvest.py answers for those candidates: each eligible unless the case says otherwise.
 const carrying = (prompt, over = () => ({})) => carryOf(prompt).map(c => ({
   commentId: c.commentId, eligible: true, reason: 'unchanged', commentDigest: c.digest, source: 'coderabbit', ...over(c),
@@ -5770,13 +5839,15 @@ test('a quota wait that reuses a report with a carried comment restores it once 
   let n = 0
   const { result, labels, logs } = await run({
     args: { coderabbitTrigger: true, maxCycles: 5, state: first.result.state }, napClock: true,
-    // Fixed records: the stub harvests once per cycle, and a probe (no --carry) may ask first.
+    // Fixed records: the stub harvests once per cycle, and a probe (no --carry-file) may ask first.
     reviewsPerCycle: () => ({ ...quiet([++n < 3 ? limitedCr(at(20)) : bot('coderabbit')]),
       carry: [{ commentId: 1, eligible: true, reason: 'unchanged', commentDigest: 'd1', source: 'coderabbit' }] }),
   })
   assert.equal(result.pass, true, `${result.reason} ${result.detail}`)
   assert.ok(labels.some(l => l.startsWith('reviews:probe#')), labels.join(' '))
   assert.ok(logs.some(l => /probe — CodeRabbit still rate-limited and nothing new on the head/.test(l)), logs.join('\n'))
+  assert.equal(logs.filter(l => /unchanged since their findings settled — carried/.test(l)).length, labels.filter(l => l.startsWith('reviews:harvest#')).length,
+    'restored once per full harvest, never from the probe\'s reused report')
   assert.equal(labels.some(l => /^(challenge|replies)#/.test(l)), false, labels.join(' '))
   assert.deepEqual(result.state.decisions.map(([id, x]) => [id, x.reviewedSha, x.paths]), [['1#1', d.reviewedSha, d.paths]])
 })
@@ -5793,19 +5864,179 @@ test('only a comment whose every finding is an answered dismissal, nothing owed 
   assert.equal(carryOf(prompts[0])[0].paths, null)
 })
 
-test('a carry report that does not answer the candidates, or carries a comment it also judged, is unusable (#393)', async () => {
+test('a harvest whose carry records are malformed, or carry a comment the validator judged, is unusable (#393, #582)', async () => {
   const first = await run({ reviews: dismissed(), args: { maxCycles: 5, yieldAfterCycle: true } })
-  for (const [name, answer, detail] of [
-    ['missing', () => [], /carry records name \[\], not the comments harvest.py was given \[1\]/],
-    ['stray', (p) => [...carrying(p), { commentId: 9, eligible: true, reason: 'x', commentDigest: 'd9', source: 'coderabbit' }], /carry records name \[1,9\]/],
-    ['no digest', (p) => carrying(p, () => ({ commentDigest: undefined })), /carried comment 1 has no current digest or source/],
-  ]) {
-    const { result } = await run({ reviewsPerCycle: (p) => ({ findings: [], replies: [], bots: 'reviewed', carry: answer(p) }), args: { maxCycles: 5, state: first.result.state } })
-    assert.equal(result.reason, 'review-report-unusable', name)
-    assert.match(result.detail, detail, name)
+  // Malformed records are no line at all: run once more, then the harvest failed.
+  for (const [name, carry] of [['not a list', { 1: true }], ['eligible not a boolean', [{ commentId: 1, eligible: 'yes', reason: 'x' }]], ['no id', [{ eligible: false, reason: 'x' }]]]) {
+    const { result, labels } = await run({ reviewsPerCycle: () => ({ findings: [], replies: [], bots: 'reviewed', carry }), args: { maxCycles: 5, state: first.result.state } })
+    assert.deepEqual([result.reason, labels.some(l => l.startsWith('reviews#'))], ['harvest-failed', false], name)
   }
   const both = await run({ reviewsPerCycle: (p) => ({ ...dismissed(), carry: carrying(p) }), args: { maxCycles: 5, state: first.result.state } })
   assert.match(both.result.detail, /comment 1 is both carried and judged/)
+  const replied = await run({ reviewsPerCycle: (p) => ({ findings: [], replies: [{ commentId: 1, body: 'still not so' }], bots: 'reviewed', carry: carrying(p) }), args: { maxCycles: 5, state: first.result.state } })
+  assert.match(replied.result.detail, /comment 1 is both carried and judged/)
+})
+
+test('thirteen carried comments, several under aliases, are restored from the harvest with no carry returned by the validator (#582)', async () => {
+  const ids = Array.from({ length: 13 }, (_, i) => i + 1)
+  const first = await run({
+    reviews: { findings: ids.map(id => invalidFinding({ commentId: id, file: `src/f${id}.c`, reason: 'the caller checks it', dependsOn: ['src/caller.c'] })),
+      replies: ids.map(commentId => ({ commentId, body: 'not so' })), bots: 'reviewed' },
+    args: { maxCycles: 5, yieldAfterCycle: true },
+  })
+  assert.deepEqual(first.result.state.answeredWith.map(([id]) => id), ids)
+  // CodeRabbit rewrote every other comment's end: its current digest is new, the one we answered an alias among others.
+  const now = (c) => c.commentId % 2 ? { commentDigest: `${c.digest}-now`, commentAliases: [`${c.digest}-x`, c.digest, `${c.digest}-y`] } : {}
+  const again = await run({
+    reviewsPerCycle: (p) => ({ findings: [], replies: [], bots: 'reviewed', carry: carrying(p, now) }),
+    args: { maxCycles: 5, yieldAfterCycle: true, state: first.result.state }, keepEmit: true,
+  })
+  try {
+    assert.equal(again.result.pass, true, `${again.result.reason} ${again.result.detail}`)
+    assert.deepEqual(carryOf(harvestCall(again.calls).prompt).map(c => c.commentId), ids, 'every answered dismissal is a candidate')
+    const validator = again.calls.find(c => c.label.startsWith('reviews#'))
+    assert.equal(validator.prompt.includes('--carry'), false, 'the validator runs no harvest')
+    const reading = JSON.parse(readFileSync(readingOf(validator.prompt), 'utf8'))
+    assert.deepEqual(reading.carry.map(c => c.commentId), ids, 'it is handed the harvest the workflow read')
+    assert.equal('seal' in reading, false)
+    assert.ok(again.logs.some(l => /13 comment\(s\) unchanged since their findings settled — carried, not judged again/.test(l)), again.logs.join('\n'))
+    assert.equal(again.labels.some(l => /^(challenge|replies|resolve)#/.test(l)), false, again.labels.join(' '))
+    const decided = new Map(again.result.state.decisions)
+    assert.deepEqual([...decided.keys()], ids.map(id => `${id}#1`))
+    for (const id of ids) {
+      const was = new Map(first.result.state.decisions).get(`${id}#1`)
+      assert.deepEqual([decided.get(`${id}#1`).reviewedSha, decided.get(`${id}#1`).digest], [was.reviewedSha, id % 2 ? `d${id}-now` : `d${id}`], `comment ${id}`)
+    }
+    assert.deepEqual(again.result.state.answeredWith.map(([id, a]) => [id, a.digest]), ids.map(id => [id, id % 2 ? `d${id}-now` : `d${id}`]))
+    // A resume replays the harvest and the validator from the journal and reloads the harvest's line: nothing runs twice.
+    const resumed = await run({ resume: again.journal, reviewsPerCycle: () => { throw new Error('harvested again') },
+      args: { maxCycles: 5, yieldAfterCycle: true, state: first.result.state } })
+    assert.deepEqual(resumed.calls, [])
+    assert.deepEqual(resumed.result, again.result)
+  } finally { rmSync(again.emitRoot, { recursive: true, force: true }) }
+})
+
+test('a carried comment beside an ineligible one and a new one: only the carried is restored, the rest judged as reported (#582)', async () => {
+  const two = { findings: [invalidFinding({ dependsOn: ['src/caller.c'] }), invalidFinding({ commentId: 2, file: 'src/b.c', dependsOn: ['src/b.c'] })],
+    replies: [{ commentId: 1, body: 'not so' }, { commentId: 2, body: 'nor so' }], bots: 'reviewed' }
+  const first = await run({ reviews: two, args: { maxCycles: 5, yieldAfterCycle: true } })
+  const was = new Map(first.result.state.decisions)
+  const { result, labels, logs } = await run({
+    reviewsPerCycle: (p) => ({
+      findings: [finding({ commentId: 2, file: 'src/b.c', commentDigest: 'd2-edited', changeReason: 'b.c changed' }), finding({ commentId: 3, file: 'src/c.c' })],
+      replies: [], bots: 'reviewed',
+      carry: carrying(p).map(c => c.commentId === 2 ? { commentId: 2, eligible: false, reason: 'its body changed' } : c),
+    }),
+    challenge: confirming(), args: { autoPush: true, maxCycles: 5, yieldAfterCycle: true, state: first.result.state },
+  })
+  assert.ok(logs.some(l => /1 comment\(s\) unchanged since their findings settled — carried, not judged again/.test(l)), logs.join('\n'))
+  const decided = new Map(result.state.decisions)
+  assert.equal(decided.get('1#1').reviewedSha, was.get('1#1').reviewedSha, 'carried: kept where it was judged')
+  assert.equal(decided.get('2#1').verdict, 'valid', 'the ineligible comment judged again')
+  assert.ok(labels.includes('fix:src/b.c') && labels.includes('fix:src/c.c'), labels.join(' '))
+  assert.equal(labels.some(l => l.startsWith('replies#')), false, 'the carried comment is not answered again')
+})
+
+// A dismissal whose paths a relay retyping them could change: a quote, blanks, non-ASCII.
+const ODD_PATHS = { file: "src/it's naïve ✓.c", dependsOn: ['src/a b.h', 'lib/"q".c'] }
+
+test('the carry candidates reach harvest.py staged, every path and sha as decided, never typed into the command (#582)', async () => {
+  const first = await run({ reviews: dismissed(ODD_PATHS), args: { maxCycles: 5, yieldAfterCycle: true } })
+  const [[, d]] = first.result.state.decisions
+  const again = await run({ reviewsPerCycle: (p) => ({ findings: [], replies: [], bots: 'reviewed', carry: carrying(p) }), args: { maxCycles: 5, state: first.result.state } })
+  const harvest = harvestCall(again.calls)
+  assert.deepEqual(stagedOf(harvest.prompt), [{ commentId: 1, digest: 'd1', judgedSha: d.reviewedSha, paths: [...ODD_PATHS.dependsOn, ODD_PATHS.file].sort() }])
+  const cmd = commandOf(harvest.prompt)
+  const [, input] = cmd.match(/ stage '([^']+)' [0-9a-f]{8} --from-transcript /)
+  assert.ok(cmd.endsWith(` --carry-file '${input}'`), cmd)
+  assert.doesNotMatch(cmd, /judgedSha|naïve|--carry /, 'no candidate in the command')
+  assert.equal(harvest.model, 'haiku')
+  assert.equal(again.result.pass, true, again.logs.join('\n'))
+  // A stage that refused its payload ran no harvest: retried, then the harvest failed, the validator never dispatched.
+  const why = "facts.py stage: the payload for 'x.in' is not the JSON its digest names"
+  const refused = await run({ stageError: (l) => l.startsWith('reviews:harvest#') && why, args: { maxCycles: 5, state: first.result.state } })
+  assert.deepEqual([refused.result.reason, refused.result.detail], ['harvest-failed', why])
+  assert.equal(refused.labels.some(l => l.startsWith('reviews#')), false)
+})
+
+shellTest('staged carry candidates reach harvest.py byte for byte from the relay transcript; an altered payload runs no harvest (#582)', async (sh) => {
+  const tmp = mkdtempSync(join(tmpdir(), 'pr-babysit-exec-'))
+  const roots = []
+  try {
+    const args = { maxCycles: 5, yieldAfterCycle: true, python: hostPython(), ...shellArgs(sh) }
+    const first = await run({ reviews: dismissed(ODD_PATHS), args })
+    const ran = await run({ keepEmit: true, reviewsPerCycle: (p) => ({ findings: [], replies: [], bots: 'reviewed', carry: carrying(p) }), args: { ...args, state: first.result.state } })
+    roots.push(ran.emitRoot)
+    // harvest.py stands in as a copy of its --carry-file; the stage is the real facts.py's.
+    const scripts = join(tmp, 'skills', 'pr-babysit', 'scripts')
+    mkdirSync(scripts, { recursive: true })
+    writeFileSync(join(scripts, 'harvest.py'), 'import os, shutil, sys\nshutil.copy(sys.argv[sys.argv.index("--carry-file") + 1], os.environ["GOT"])\n')
+    cpSync(fileURLToPath(new URL('../lib', import.meta.url)), join(tmp, 'lib'), { recursive: true })
+    cpSync(fileURLToPath(new URL('../skills/pr-babysit/scripts/facts.py', import.meta.url)), join(scripts, 'facts.py'))
+    const harvest = harvestCall(ran.calls)
+    const sent = stagedOf(harvest.prompt)
+    const got = join(tmp, 'got.json')
+    const cmd = commandOf(harvest.prompt)
+    const done = runCommand(cmd, tmp, join(tmp, 'h.js'), { GOT: got, ...transcript(join(tmp, 'config'), harvest.prompt) }, sh)
+    assert.equal(done.status, 0, done.stderr)
+    assert.equal(readFileSync(got, 'utf8'), JSON.stringify(sent), 'the candidates as the workflow decided them, byte for byte')
+    assert.deepEqual(JSON.parse(readFileSync(got, 'utf8'))[0].paths, [...ODD_PATHS.dependsOn, ODD_PATHS.file].sort())
+    const b64 = PAYLOAD_LINE.exec(harvest.prompt)[3]
+    corrupted(b64, JSON.stringify(sent)).forEach((bad, i) => {
+      rmSync(got, { force: true })
+      // The first as a resume meets it: an earlier attempt's script claimed its file and left it empty.
+      if (i === 0) writeFileSync(join(tmp, `bad-${i}.js`), '')
+      const refused = runCommand(cmd, tmp, join(tmp, `bad-${i}.js`), { GOT: got, ...transcript(join(tmp, `bad-${i}`), harvest.prompt.replace(b64, bad)) }, sh)
+      assert.notEqual(refused.status, 0)
+      assert.equal(existsSync(got), false, 'harvest.py never ran')
+      const line = readFileSync(join(tmp, `bad-${i}.js.stage.js`), 'utf8')
+      assert.match(line, /facts\.py stage: the payload for .* is not/)
+      assert.match(line, i === 0 ? /,"claimed":true\}/ : /,"claimed":false\}/, 'it says whether the script\'s file was claimed')
+    })
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+    for (const r of roots) if (r) rmSync(r, { recursive: true, force: true })
+  }
+})
+
+test('a harvest too large for a prompt or a data module goes to the validator as its reading file (#582)', async () => {
+  // Nine 60,000-character bodies: one module of them passes the runtime's limit on a Workflow script file.
+  const comments = Array.from({ length: 9 }, (_, i) => ({ kind: 'review', commentId: 10 + i, source: 'coderabbit', body: `${i} ${'x'.repeat(60000)}`, digest: `d${10 + i}` }))
+  const reviews = { findings: [finding({ commentId: 10 })], replies: [], bots: 'reviewed', comments }
+  const { result, labels, calls, loads, logs, emitRoot } = await run({ reviews, args: { maxCycles: 1 }, keepEmit: true })
+  try {
+    assert.notEqual(result.reason, 'harvest-failed', logs.join('\n'))
+    assert.ok(labels.includes('reviews#1') && labels.includes('fix:src/a.c'), labels.join(' '))
+    // The line keeps the index: far under the runtime's limit on a Workflow script file.
+    const [module] = loads.filter(f => /reviews_harvest_1\.1\.[0-9a-f]+\.js$/.test(f))
+    assert.ok(statSync(module).size < SCRIPT_FILE_MAX / 50, `${statSync(module).size} bytes`)
+    const { seal, index, readingSha256, ...line } = lineOf(module)
+    assert.deepEqual(index, comments.map(({ commentId, digest, source }) => ({ commentId, digest, source })))
+    // The validator is handed the file, never a body; the file is the whole reading the line indexes.
+    const validator = calls.find(c => c.label === 'reviews#1')
+    assert.ok(validator.prompt.length < 4000 && !validator.prompt.includes('x'.repeat(100)), 'no comment body in the prompt')
+    assert.equal(readingOf(validator.prompt), `${module}.reading.json`)
+    const bytes = readFileSync(`${module}.reading.json`)
+    assert.equal(createHash('sha256').update(bytes).digest('hex'), readingSha256)
+    assert.deepEqual(JSON.parse(bytes), { ...line, comments })
+  } finally { rmSync(emitRoot, { recursive: true, force: true }) }
+})
+
+test('a validator that could not read the harvest file, or judged a comment it does not hold, settles nothing (#582)', async () => {
+  const gone = await run({ reviews: oneValid, readingFile: (path) => rmSync(path), args: { maxCycles: 1 } })
+  assert.equal(gone.result.reason, 'review-report-unusable')
+  assert.match(gone.result.detail, /^the validator answered fingerprint "", not the one in .*\.reading\.json: it did not read the harvest$/)
+  assert.equal(gone.labels.some(l => l.startsWith('fix:')), false)
+  // A finding or reply naming a comment the harvest does not hold is refused before anything acts on it.
+  const comments = [{ commentId: 1, digest: 'd1', source: 'coderabbit' }]
+  for (const [name, over] of [['finding', { findings: [finding({ commentId: 2 })] }], ['reply', { findings: [], replies: [{ commentId: 2, body: 'no' }] }]]) {
+    const stray = await run({ reviews: { replies: [], bots: 'reviewed', comments, ...over }, args: { maxCycles: 1 } })
+    assert.deepEqual([stray.result.reason, stray.result.detail], ['review-report-unusable', 'the validator judged comment 2, which the harvest does not hold'], name)
+    assert.equal(stray.labels.some(l => /^(fix:|replies#|resolve#)/.test(l)), false, name)
+  }
+  // harvest.py that could not write the file printed an error line: run once more, then the harvest failed.
+  const unwritable = await run({ reviews: { ...oneValid, harvestError: 'cannot create /e/h.js.reading.json: File exists' }, args: { maxCycles: 1 } })
+  assert.deepEqual([unwritable.result.reason, unwritable.result.detail], ['harvest-failed', 'cannot create /e/h.js.reading.json: File exists'])
 })
 
 test('a carried comment CodeRabbit rewrote at its end moves our answer to its current digest, never re-answers it (#393)', async () => {
@@ -7682,33 +7913,18 @@ const quiet = (bots) => ({ findings: [], replies: [], bots })
 const THREE = { reviewers: ['greptile', 'coderabbit', 'copilot'] }
 const headLine = (logs) => summaries(logs).map(s => s.split('\n')[0])
 
-test('the validator contract is per-bot records, not a done flag', async () => {
+test('the validator returns only its judgments; the per-bot records, not a done flag, are the harvest\'s (#582)', async () => {
   const { calls } = await run({})
   const schema = calls.find(c => c.label === 'reviews#1').schema
-  assert.deepEqual(schema.required, ['headSha', 'observedAt', 'headEventAt', 'headEventEvidence', 'fingerprint', 'bots', 'findings', 'replies'])
-  assert.deepEqual(schema.properties.bots.items.required, ['bot', 'state', 'kind', 'sha', 'evidence', 'reason', 'retryAt'])
-  assert.deepEqual(schema.properties.bots.items.properties.state.enum, ['reviewed', 'working', 'queued', 'settled', 'absent', 'unknown', 'harvested'])
+  assert.deepEqual(schema.required, ['fingerprint', 'findings', 'replies'], 'the fingerprint only as proof it read the harvest file')
+  assert.deepEqual(Object.keys(schema.properties), ['fingerprint', 'findings', 'replies'], 'no bots, carry or harvest error to copy')
+  assert.deepEqual(JSON.parse(body.match(/^const BOT_STATES = (\[.*\])$/m)[1].replaceAll("'", '"')), ['reviewed', 'working', 'queued', 'settled', 'absent', 'unknown', 'harvested'])
 })
 
 test('a harvest that leaves an auto-running bot unaccounted for is refused, not read as settled', async () => {
-  // The run-7 failure: a bot had no review of the head, and the run said done.
+  // The run-7 failure: a bot had no review of the head, and the run said done. harvest.py's sealed records are its own.
   for (const [bots, why] of [
     [[bot('greptile')], /no record for coderabbit/],
-    [[bot('greptile'), bot('greptile'), bot('coderabbit')], /two records for greptile/],
-    [[bot('greptile'), bot('coderabbit'), bot('code-scanning')], /record for code-scanning, which is not a reviewer here/],
-    [[bot('greptile'), bot('coderabbit'), absent('copilot', { state: 'harvested' })], /copilot is harvested, a state only a reviewer whose state is not read takes/],
-    [[bot('greptile', { state: 'harvested', sha: null, evidence: [], reason: 'x' }), bot('coderabbit')], /greptile is harvested/],
-    [[bot('greptile', { retryAt: at(5) }), bot('coderabbit')], /greptile has retryAt .* on a reviewed\/null record/],
-    [[bot('greptile', { state: 'settled', kind: 'limited', evidence: ['n'], reason: 'q', retryAt: 'soon' }), bot('coderabbit')], /greptile has retryAt "soon"/],
-    [[bot('greptile', { sha: FOREIGN }), bot('coderabbit')], /greptile record names c0ffee1, not the head/],
-    [[bot('greptile', { sha: 'abc' }), bot('coderabbit')], /greptile record names "abc", not the head/],
-    [[bot('greptile', { sha: null }), bot('coderabbit')], /greptile reviewed with no SHA/],
-    [[bot('greptile', { evidence: [] }), bot('coderabbit')], /greptile reviewed with no evidence/],
-    [[bot('greptile', { state: 'settled', kind: 'limited', evidence: ['  '], reason: 'quota' }), bot('coderabbit')], /greptile settled with no evidence/],
-    [[bot('greptile', { state: 'settled', kind: null, reason: 'declined' }), bot('coderabbit')], /greptile is settled with kind null/],
-    [[bot('greptile', { kind: 'paused' }), bot('coderabbit')], /greptile is reviewed with kind "paused"/],
-    [[bot('greptile', { state: 'settled', kind: 'skipped', sha: null, evidence: [], reason: 'declined' }), bot('coderabbit')], /greptile settled with no evidence/],
-    [[absent('greptile', { reason: ' ' }), bot('coderabbit')], /greptile absent with no reason/],
   ]) {
     const { result, logs, labels } = await run({ args: THREE, reviews: quiet(bots) })
     assert.equal(result.reason, 'review-report-unusable', `${why}: got ${result.reason}`)
@@ -7721,7 +7937,7 @@ test('a harvest that leaves an auto-running bot unaccounted for is refused, not 
 
 test('a harvest about another head, or with an unusable clock, is refused', async () => {
   for (const [over, why] of [
-    [{ headSha: FOREIGN }, /validator observed head c0ffee1, expected 0f1e2d3/],
+    [{ headSha: FOREIGN }, /harvest\.py read head c0ffee1, expected 0f1e2d3/],
     [{ observedAt: 'yesterday' }, /observedAt "yesterday" is not a timestamp/],
     [{ headEventAt: 'NaN' }, /headEventAt "NaN" is not a timestamp/],
     [{ headEventAt: at(5) }, /headEventAt .* is after observedAt/],
@@ -8032,6 +8248,7 @@ test('a quota wait probes harvest.py instead of validating until CodeRabbit leav
     reviewsPerCycle: () => quiet([++n < 3 ? limitedCr(at(20)) : bot('coderabbit')]) })
   assert.equal(waited.result.pass, true, waited.result.reason)
   assert.deepEqual([validated(waited.labels), probes(waited.labels)], [['reviews#1', 'reviews#3'], ['reviews:probe#2', 'reviews:probe#3']])
+  assert.deepEqual(waited.labels.filter(l => l.startsWith('reviews:harvest#')), ['reviews:harvest#1', 'reviews:harvest#3'], 'a probe that stands in runs no full harvest')
   assert.ok(waited.logs.some(l => /cycle 2: probe — CodeRabbit still rate-limited and nothing new on the head/.test(l)), waited.logs.join('\n'))
   assert.ok(waited.logs.some(l => /cycle 3: probe — .*; validating in full/.test(l)), "its review is evidence too")
   assert.match(waited.calls.find(c => c.label === 'reviews:probe#2').prompt, /harvest\.py --pr 3888 .* --auto-run coderabbit --probe`/)
@@ -8054,6 +8271,7 @@ test('a quota wait probes harvest.py instead of validating until CodeRabbit leav
       error: LIMITED_REVIEWS.rateLimit.error, rateLimit: LIMIT }, reviewsPerCycle: () => quiet([limitedCr(at(20))]) })
   assert.deepEqual([refused.result.reason, refused.result.rateLimit], ['github-rate-limited', LIMITED_REVIEWS.rateLimit])
   assert.deepEqual(validated(refused.labels), ['reviews#1'])
+  assert.deepEqual(refused.labels.filter(l => l.startsWith('reviews:harvest#')), ['reviews:harvest#1'], 'nor harvested to be refused')
   // A reopen on the same head during the wait restarts the review clock from the probe, not the stale report.
   n = 0
   const reopened = await run({ args: { coderabbitTrigger: true, maxCycles: 1 }, napClock: true,
@@ -9663,7 +9881,7 @@ test('greptileTrigger waits out a grace with Greptile absent, asks once, then wa
   assert.ok(call.prompt.includes(`greptile_trigger.py --pr 3888 --repo 'hathach/tinyusb' --head ${HEAD}\``), call.prompt)
   assert.deepEqual([call.agentType, call.model, call.phase], ['relay', 'haiku', 'Push'])
   assert.equal(labels.some(l => l.startsWith('prstate#')), false, 'the script reads the PR open at the head itself, just before it posts')
-  assert.deepEqual(harvestFlags(calls.find(c => c.label === 'reviews#1').prompt)[1], ['coderabbit', 'greptile'])
+  assert.deepEqual(harvestFlags(harvestCall(calls, 1).prompt)[1], ['coderabbit', 'greptile'])
   assert.ok(logs.includes('cycle 3: greptile#3: requested (comment 7)'), logs.join('\n'))
   assert.deepEqual(result.observation.launchActions.flatMap(a => a.botAsks || []), [{ bot: 'greptile', kind: 'request', outcome: 'requested', commentId: 7, at: at(2), sha: HEAD }])
   assert.deepEqual(result.state.reviewClock, { sha: HEAD, eventAt: null, since: at(0), greptileAt: at(2) })
@@ -9756,7 +9974,7 @@ test('the obligation outlives the switch: a resume without greptileTrigger still
   const b = await run({ args: { ...YG, state: a.result.state }, clockOffset: 3, reviews: silentG() })
   assert.equal(b.result.reason, 'yielded', 'still waited on without the switch')
   assert.deepEqual(gAsks(b.labels), [], 'and never asked without it')
-  assert.match(b.calls.find(c => c.label === 'reviews#2').prompt, /--auto-run coderabbit,greptile`/)
+  assert.match(harvestCall(b.calls, 2).prompt, /--auto-run coderabbit,greptile`/)
   const c = await run({ args: { ...YG, state: b.result.state }, clockOffset: 10, reviews: silentG() })
   assert.equal(c.result.reason, 'greptile-unreviewed')
   // After a request, the cap runs from it.
@@ -9804,7 +10022,7 @@ test('without the switch Greptile is harvested only; the switch needs autoPush a
   const { result, labels, calls } = await run({ args: { ...G, maxCycles: 3 } })
   assert.equal(result.pass, true, result.reason)
   assert.deepEqual(gAsks(labels), [])
-  assert.match(calls.find(c => c.label === 'reviews#1').prompt, /--auto-run coderabbit`/)
+  assert.match(harvestCall(calls, 1).prompt, /--auto-run coderabbit`/)
   assert.equal(result.state.greptileRequired, undefined)
   await assert.rejects(run({ args: { ...GT, autoPush: false } }), /greptileTrigger comments `@greptileai` on the PR: it needs autoPush/)
   await assert.rejects(run({ args: { ...GT, greptileTrigger: 'yes' } }), /greptileTrigger must be a boolean/)
@@ -9846,7 +10064,7 @@ test('the requirement latches for the run: a head adopted without the switch is 
     assert.equal(a.result.state.greptileRequired, true)
     const b = await run({ args: { ...YG, state: a.result.state, adoptHead: ADOPT }, preflight: { head: ADOPT, prHead: HEAD }, clockOffset: 20, reviews: silentG() })
     assert.equal(b.result.state.expectedHead, ADOPT)
-    assert.match(b.calls.find(c => c.label === 'reviews#2').prompt, /--auto-run coderabbit,greptile`/)
+    assert.match(harvestCall(b.calls, 2).prompt, /--auto-run coderabbit,greptile`/)
     assert.equal(b.result.reason, 'yielded', 'the new head is waited on, not passed')
     assert.deepEqual(gAsks(b.labels), [], 'nothing asked without the switch')
     assert.equal(b.result.state.reviewClock.sha, ADOPT)

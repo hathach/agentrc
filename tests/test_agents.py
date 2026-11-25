@@ -71,15 +71,14 @@ class AgentFiles(unittest.TestCase):
                 self.assertIn(trigger, ' '.join((AGENTS / f'{name}.md').read_text().split()))
 
     def test_pr_review_validator_keeps_the_keys_tinyusb_dismissals_are_keyed_on(self):
-        """pr-babysit.js keys deferrals on findingId and detects edited
-        comments through commentDigest."""
+        """pr-babysit.js keys deferrals on findingId; it detects edited comments through the digest harvest.py read,
+        which the validator no longer copies (#582)."""
         body = (AGENTS / 'pr-review-validator.md').read_text()
         example = self.contract_example('pr-review-validator.md')
         finding = example['findings'][0]
         self.assertEqual(finding['findingId'], f"{finding['commentId']}#1")
-        self.assertRegex(finding['commentDigest'], r'^[0-9a-f]{12}$')
+        self.assertFalse({'commentDigest', 'commentAliases', 'source'} & set(finding), 'the harvest\'s, not the validator\'s')
         self.assertIn('`findingId` of `<commentId>#<n>`', body)
-        self.assertIn("its comment's `digest` as `commentDigest`", body)
 
     def test_pr_ci_watcher_example_carries_the_verdict_pr_babysit_keys_on(self):
         """pr-babysit fixes only verdict 'real', stops honestly on 'unclassified', and needs one entry per check."""
