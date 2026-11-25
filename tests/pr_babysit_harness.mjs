@@ -8361,6 +8361,21 @@ test('a person\'s waiting comment holds the CI judge, so a red CI is not re-run 
   assert.equal(clear.result.history[0].ciReran, 1, 'a clear read lets the judge re-run it')
 })
 
+test('a person\'s comment arriving while the CI lane reads its inventory and evidence holds the CI judge (#591)', async () => {
+  const opts = { reviews: WAITING, ci: redWith(RIG).ci, judge: rerunAll, args: { autoPush: true, maxCycles: 1 } }
+  for (const humans of [[OBJECTION], { error: 'gh api graphql: HTTP 502' }]) {
+    const { result, labels, logs } = await run({ ...opts, humans: (label) => label.startsWith('humans#1-judge') ? humans : [] })
+    assert.equal(result.reason, Array.isArray(humans) ? 'human-review-pending' : 'harvest-failed', labels.join(', '))
+    assert.ok(labels.indexOf('humans#1-judge') > labels.indexOf('ci:collect#1.f'), labels.join(', '))
+    assert.deepEqual(labels.filter(l => l.startsWith('ci:judge#')), [], labels.join(', '))
+    assert.equal(result.history[0].ciReran, undefined)
+    assert.ok(logs.some(l => l.includes("cycle 1: 1 failing CI check(s) left unjudged — the people's comments did not read clear")), logs.join('\n'))
+  }
+  const clear = await run(opts)
+  assert.ok(clear.labels.indexOf('humans#1-judge') < clear.labels.indexOf('ci:judge#1'), clear.labels.join(', '))
+  assert.equal(clear.result.history[0].ciReran, 1, 'both reads clear, the judge re-runs it')
+})
+
 test('a review push held for a person\'s comment holds the CI judge too, though the cycle\'s read was clear (#591)', async () => {
   for (const humans of [[OBJECTION], { error: 'gh api graphql: HTTP 502' }]) {
     const { result, labels } = await run({ reviews: oneValid, ci: redWith(RIG).ci, judge: rerunAll, args: { autoPush: true, maxCycles: 2 },
@@ -8390,8 +8405,9 @@ test('a person\'s comment arriving while a lane fixes or commits stops its push,
     assert.deepEqual([failed.result.reason, failed.result.detail], ['harvest-failed', 'gh api graphql: HTTP 502'], lane)
     assert.deepEqual(failed.labels.filter(l => /^push#/.test(l)), [], `${lane}: an unread list holds the push too`)
     const clear = await run(opts)
-    assert.deepEqual(clear.labels.filter(l => l.startsWith('humans#')), ['humans#1', `humans#1-${lane}`, ...(lane === 'review' ? ['humans#1-resolve'] : [])],
-      `${lane}: one read at the push boundary`)
+    assert.deepEqual(clear.labels.filter(l => l.startsWith('humans#')),
+      ['humans#1', ...(lane === 'ci' ? ['humans#1-judge'] : []), `humans#1-${lane}`, ...(lane === 'review' ? ['humans#1-resolve'] : [])],
+      `${lane}: one read at the push boundary, after the CI judge's own`)
   }
 })
 

@@ -2880,12 +2880,13 @@ const ciLaneRun = async (cycle, lanes, entry) => {
     return !!why
   }
   if (superseded()) return report
-  // #591: the judge may re-run CI only once this cycle's read of the people's comments came back clear.
-  const humans = await lanes.humans
-  if (!humans.humanWaiting || humans.humanWaiting.length) {
-    log(`cycle ${cycle}: ${judging.length + gated.length} failing CI check(s) left unjudged — the people's comments did not read clear`)
-    return report
+  // #591: the judge may re-run CI only once this cycle's read of the people's comments came back clear, and again just before it.
+  const unclear = (humans, n) => {
+    if (humans.humanWaiting?.length === 0) return false
+    log(`cycle ${cycle}: ${n} failing CI check(s) left unjudged — the people's comments did not read clear`)
+    return true
   }
+  if (unclear(await lanes.humans, judging.length + gated.length)) return report
   const links = judging.map(c => c.link)
   const known = reruns.filter(r => r.sure).map(r => `${r.workflow} / ${r.check}`)
   const possible = reruns.filter(r => !r.sure).map(r => `${r.workflow} / ${r.check}`)
@@ -2908,6 +2909,12 @@ const ciLaneRun = async (cycle, lanes, entry) => {
   if (judging.length === 0) return report
   // The judge may re-run checks: the PR must read OPEN, and no review push may have landed during that read.
   if (await prGate(lanes, `${cycle}-judge`) || superseded()) return report
+  // A comment posted while the lane waited for the inventory or read the evidence holds it too; runLanes stops on it.
+  const judgeRead = await readHumans(`humans#${cycle}-judge`)
+  if (unclear(judgeRead, judging.length)) {
+    lanes.judgeHumans = judgeRead
+    return report
+  }
   const judged = await agent(
     `${IN_CHECKOUT}Judge the failing CI checks of PR #${args.pr} of ${repo} at head ${report.headSha} per your procedure. ` +
     `The collector's evidence for them is in ${ev.detail}. Run any ci-rerun script under ${PY}. The checks, each needing exactly one entry in your reply: ` +
@@ -2990,7 +2997,8 @@ const ciLaneRun = async (cycle, lanes, entry) => {
 const runCycle = async (cycle, entry) => {
   // prState: 'merged' or 'closed' once read so, 'unread' when a read before a write failed; the review lane then stops at its next step.
   // humansHeld: a review-lane push held by its read of the people's comments, which holds the CI judge too (#591).
-  const lanes = { reviewDone: false, reviewPublishing: false, ended: false, prState: null, humansHeld: false }
+  // judgeHumans: the CI judge's own read, when it did not come back clear.
+  const lanes = { reviewDone: false, reviewPublishing: false, ended: false, prState: null, humansHeld: false, judgeHumans: null }
   const verdict = await runLanes(cycle, entry, lanes)
   // The CI lane settles last, so it can read the merge after the review lane stopped for another reason.
   if (lanes.prState === 'merged' || lanes.prState === 'closed') return prEnded(cycle, lanes.prState)
@@ -3655,6 +3663,10 @@ const runLanes = async (cycle, entry, lanes) => {
       return rearm()
     }
     const c = await ciPromise
+    if (lanes.judgeHumans) {
+      const waits = humansHold(cycle, entry, lanes.judgeHumans)
+      if (waits !== undefined) return waits
+    }
     if (entry.collectorSkew) {
       log(`cycle ${cycle}: ${entry.collectorSkew}`)
       entry.error = `collector skew: ${entry.collectorSkew}`
