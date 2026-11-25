@@ -55,7 +55,11 @@ queued URBs on test 28, a bulk read) and owner exit, consistent with outstanding
 transfers completing or failing until the callback released the wait (rung 1's
 mechanism). Count it cleared only when the owner exits, the DUT re-enumerates
 and a fresh D-state check finds no holder; a flasher exit or a disconnect line
-alone is not enough. Otherwise go on to rung 3.
+alone is not enough. An owner still in D state after rung 1 is one the reset
+cannot release: rung 3. An owner that exited while a fresh check finds another
+holder: triage that one by its stack. No holder left but no DUT: the lock is
+free, so it is no longer a kernel wedge — section 4, then the board's own
+recovery (park-flash), never rung 3.
 
 Map the holder to a busport with **lock-free attrs only** (`devnum`, `idVendor`,
 `idProduct` are `usb_descriptor_attr*`, plain `sysfs_emit`, sysfs.c:688-705):

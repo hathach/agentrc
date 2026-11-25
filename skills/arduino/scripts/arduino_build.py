@@ -82,7 +82,9 @@ BUILD_SCRIPTS = '.claude/skills/build/scripts/'
 HIL_CONTROL = ('.claude/skills/hil-contract/scripts/', 'test/hil/')
 PIN_TEST = 'agentrc_pin'
 PIN_BOOTSTRAP = HIL_CONTROL[0] + 'agentrc_pin.py'
-DISCOVERED = r'\.claude/test/test_[^/]*\.py'   # what the bootstrap's `test` runs too: unittest discover -s .claude/test
+# what the bootstrap's `test` runs too: unittest discover -s .claude/test -p 'test_*.py', which skips a name
+# its VALID_MODULE_NAME ([_a-z]\w*\.py) refuses, such as test_build-extra.py
+DISCOVERED = r'\.claude/test/test_\w*\.py'
 SOURCE_DIRS = ('src/', 'examples/', 'test/hil/')   # an untracked file here would be missing from a record's patch
 IMAGE_KIND = {'openocd': 'elf', 'jlink': 'hex', 'esptool': 'esptool'}   # what the HIL harness flashes per flasher
 BOOT_APP0 = 'tools/partitions/boot_app0.bin'   # the ESP core's otadata image its flash_args name, under the platform

@@ -3829,14 +3829,16 @@ test('a report carrying both a rate limit and a harvest error takes the rate-lim
 
 test('a harvest that wrote no line is retried and reported by the transport, a rate limit first (#240)', async () => {
   const harvest = (label) => label.startsWith('reviews:harvest#')
-  for (const [name, opts, detail] of [
+  for (const [name, opts, detail, reached] of [
     ['killed before its line', { killedAfter: harvest }, 'the script wrote no line (exit 137)'],
     ['a dead relay', { garble: (label, line) => harvest(label) ? null : line }, /^harvest\.py brought back no usable line/],
     ['a line off its seal', { garble: (label, line) => harvest(label) ? { ...line, seal: 'deadbeef' } : line }, /^harvest\.py brought back no usable line/],
-    ['a line with no carry records', { garble: (label, line) => harvest(label) ? (({ carry, ...rest }) => rest)(line) : line }, /^harvest\.py brought back no usable line/],
+    ['a line with no carry records', { garble: (label, line) => harvest(label) ? (({ carry, seal, ...rest }) => sealLine(rest))(line) : line }, /^harvest\.py brought back no usable line/,
+      "reviews:harvest#1: the script's line is off its schema — line has no carry"],
   ]) {
-    const { result, labels } = await run({ ...opts, args: { maxCycles: 4 } })
+    const { result, labels, logs } = await run({ ...opts, args: { maxCycles: 4 } })
     assert.equal(result.reason, 'harvest-failed', name)
+    if (reached) assert.ok(logs.includes(reached), `${name}: ${logs.join('\n')}`)
     if (typeof detail === 'string') assert.equal(result.detail, detail, name)
     else assert.match(result.detail, detail, name)
     assert.deepEqual(labels.filter(l => l.startsWith('reviews')), ['reviews:harvest#1', 'reviews:harvest#1.retry'], `${name}: stopped, no cycle spent re-reading it`)

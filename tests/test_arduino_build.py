@@ -388,6 +388,18 @@ class Selection(Lib):
                              [{'test': 'agentrc_pin', 'status': 'error', 'firstError': f'{ab.PIN_BOOTSTRAP} missing'},
                               {'test': 'build', 'status': 'ok', 'firstError': ''}])
 
+    def test_run_tests_runs_a_script_unittest_discovery_skips_directly(self):
+        extra = '.claude/test/test_build-extra.py'
+        self.patch(self.P, 'CONTRACT_TESTS', {**self.P.CONTRACT_TESTS, 'agentrc_pin': '.claude/test/test_agentrc_pin.py',
+                                              'extra': extra})
+        for rel in (extra, ab.PIN_BOOTSTRAP):
+            (self.root / rel).parent.mkdir(parents=True, exist_ok=True)
+            (self.root / rel).write_text('')
+        with mock.patch.object(ab.subprocess, 'run', return_value=mock.Mock(returncode=0, stderr='')) as run:
+            rows = ab.run_tests(['agentrc_pin', 'extra'])
+        self.assertEqual(rows[1], {'test': 'extra', 'status': 'ok', 'firstError': ''})
+        self.assertEqual(run.call_args.args[0], [sys.executable, str(self.root / extra)])
+
     def test_hil_selection_names_families_the_roster_lacks(self):
         sel = ab.select(['src/ports/fa/x.cpp', 'src/fake.h'], roster=['rig_ocd'])
         self.assertEqual(sel['hil']['boards'], ['rig_ocd'])
