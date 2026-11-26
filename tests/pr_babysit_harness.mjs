@@ -8457,6 +8457,20 @@ test('a person\'s comment arriving with a review push holds its fix notes (#591)
   assert.equal(result.state.expectedHead, shaFor(1))
 })
 
+test('fix notes a person\'s comment held after their push are posted, citing the commit, once a relaunch reads it answered (#594)', async () => {
+  const trace = []
+  const first = await run({ reviews: oneValid, trace, humans: () => trace.some(c => c.label.startsWith('push#')) ? [OBJECTION] : [] })
+  assert.equal(first.result.reason, 'human-review-pending')
+  assert.deepEqual(first.result.rollup.rows.map(r => r.reply), [{ how: 'fixNote', replyId: null, settled: false, error: 'held for the people\'s comments, not posted' }])
+  const stale = { findings: [finding({ verdict: 'stale', fixedBy: shaFor(1) })], replies: [{ commentId: 1, body: 'already fixed' }], bots: 'reviewed' }
+  const { calls, labels } = await resumeAt(first.result.state, { reviews: stale, args: { maxCycles: 4 } })
+  assert.deepEqual(notedOf(calls.find(c => /^reviews#\d+$/.test(c.label)).prompt), [{ commentId: 1, sha: shaFor(1) }], labels.join(', '))
+  const notes = labels.filter(l => l.startsWith('resolve#'))
+  assert.equal(notes.length, 1, labels.join(', '))
+  assert.deepEqual(manifestOf(calls, notes[0]).map(x => x.body), [`Fixed in ${shaFor(1)}.\n\n- src/a.c:1`])
+  assert.deepEqual(labels.filter(l => l.startsWith('replies#')), [], 'no "already fixed" reply')
+})
+
 test('a person\'s comment arriving while the validator judges holds its refutations and deferrals (#591)', async () => {
   const refuting = { findings: [invalidFinding()], replies: [{ commentId: 1, body: 'not a bug' }], bots: 'reviewed' }
   for (const [what, opts] of [['replies', { reviews: refuting }], ['defer', { reviews: oneValid, args: { deferrals: [deferral()] } }]]) {

@@ -1391,7 +1391,7 @@ const replyRow = (cycles, commentId, digest, edited) => {
   if (s) got = { how: 'caller', replyId: s.replyId ?? null, settled: s.outcome === 'settled', ...(s.outcome !== 'settled' ? { error: `${s.outcome}: ${s.why}` } : {}) }
   // A reply offered with no receipt to show for it: its POST may or may not have landed.
   const a = (debt.get(commentId) || {}).attempt
-  if (!got && a && a.digest === digest) got = { how: a.how, replyId: null, settled: false, error: 'offered, no receipt shows it posted' }
+  if (!got && a && a.digest === digest) got = { how: a.how, replyId: null, settled: false, error: a.held ? 'held for the people\'s comments, not posted' : 'offered, no receipt shows it posted' }
   // A handoff outranks any earlier answer of ours on the body it concerns, its digest, else the comment as it reads now:
   // a correction or a rejudge found it owed again.
   const handed = (debt.get(commentId) || {}).digest
@@ -3656,6 +3656,11 @@ const runLanes = async (cycle, entry, lanes) => {
     }
     if (answerable.size > 0) {
       if (await ended('resolve')) return prEnded(cycle, lanes.prState)
+      // #594: offered before the read, so a launch it stops leaves these notes owed, citing their repair, to the next.
+      for (const { commentId, body, repair } of answerable.values()) {
+        const d = debt.get(commentId)
+        if (d && !d.attempt && repair) d.attempt = { body, how: 'fixNote', digest: digestOf.get(commentId), repair, held: true }
+      }
       // #591: a comment posted while the repair was pushed holds its fix notes too.
       const waits = entry.reviewPush ? humansHold(cycle, entry, await readHumans(`humans#${cycle}-resolve`)) : undefined
       if (waits !== undefined) return waits
