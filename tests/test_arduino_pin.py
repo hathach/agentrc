@@ -1,6 +1,7 @@
 """The canonical Arduino bootstrap: selection, config, fetch, copy equality and frozen shared-source identity.
 The consumer bootstrap tests live here; consumers retain their profile/config and selected-copy integration tests.
 Local git repositories and packed trees exercise the real loader; no network or rig is used."""
+import ast
 import contextlib
 import importlib.util
 import io
@@ -627,7 +628,8 @@ class Conformance(Consumer):
                     'pin.load(f"skills/{name}.py")\nload(rel="x")\nload("README.md")\n')
         self.script('hil-contract/scripts/broken.py', 'agentrc_pin.load(\n')
         conform = self.pin.load(CONFORMANCE)
-        self.assertEqual([t for _, t in conform._load_calls(ROOT / CANONICAL, own=True)], [CONFORMANCE])
+        canonical = ast.parse((ROOT / CANONICAL).read_text())
+        self.assertEqual([t for _, t in conform._load_calls(canonical, own=True)], [CONFORMANCE])
         bootstrap = (self.root / CONSUMER).read_text()
         (self.root / CONSUMER).write_text(bootstrap + '\n\ndef extra(name):\n    return load(name)\n')
         with mock.patch.object(conform, 'round_trip', return_value=[]):
@@ -649,6 +651,58 @@ class Conformance(Consumer):
         self.config(extra_engines=[CI_ENGINE])
         self.pin._selection.cache_clear()
         self.assertEqual(self.pin.conformance(), [])
+
+    def test_only_the_public_bootstrap_names_are_used(self):
+        hil = '.claude/skills/hil-contract/scripts'
+        self.script('hil-contract/scripts/public.py',
+                    'import agentrc_pin as pin\nfrom agentrc_pin import PinError, config, identity, stage\n'
+                    f'pin.load({BUILD!r}).run(pin.ci(), pin.config(), pin.identity(), pin.stage, pin.conformance)\n'
+                    'path = pin.__file__\n')
+        self.script('hil-contract/scripts/alias.py', 'import json, agentrc_pin as boot\nboot.ROOT = 1\n'
+                                                     'boot.literals(boot.ROOT, "tools/build_all.py")\n')
+        self.script('hil-contract/scripts/names.py', 'from agentrc_pin import load, _selection as sel, check\n')
+        test = self.root / '.claude/test/test_agentrc_pin.py'
+        test.parent.mkdir(parents=True, exist_ok=True)
+        test.write_text('import agentrc_pin\n\n\nassert agentrc_pin._selection()[0].stage\n'
+                        'raise agentrc_pin.PinError("x")\n')
+        with mock.patch.object(self.pin.load(CONFORMANCE), 'round_trip', return_value=[]):
+            self.assertEqual(self.pin.conformance(), [
+                f'{hil}/alias.py:2: uses agentrc_pin.ROOT, internal to the bootstrap',
+                f'{hil}/alias.py:3: uses agentrc_pin.ROOT, internal to the bootstrap',
+                f'{hil}/alias.py:3: uses agentrc_pin.literals, internal to the bootstrap',
+                f'{hil}/names.py:1: uses agentrc_pin._selection, internal to the bootstrap',
+                f'{hil}/names.py:1: uses agentrc_pin.check, internal to the bootstrap',
+                '.claude/test/test_agentrc_pin.py:4: uses agentrc_pin._selection, internal to the bootstrap'])
+
+    def test_an_alias_counts_only_in_the_scope_its_import_binds(self):
+        self.script('hil-contract/scripts/gpio.py',
+                    'def setup():\n    import agentrc_pin as pin\n    return pin.load("x")\n\n\n'
+                    'def find_gpio(pin):\n    return pin.number, pin.load(pin.name)\n')
+        self.script('hil-contract/scripts/outer.py',
+                    'import agentrc_pin as boot\n\n\ndef f():\n    return boot._selection()\n\n\n'
+                    'def g(boot):\n    return boot.x, [boot.y for boot in ()]\n')
+        conform = self.pin.load(CONFORMANCE)
+        hil = self.root / '.claude/skills/hil-contract/scripts'
+
+        def tree(name):
+            return ast.parse((hil / name).read_text())
+        self.assertEqual(conform._internal_uses(tree('gpio.py')), [])
+        self.assertEqual(conform._load_calls(tree('gpio.py')), [(3, 'x')])
+        self.assertEqual(conform._internal_uses(tree('outer.py')), [(5, '_selection')])
+        self.script('hil-contract/scripts/bare.py',
+                    'import agentrc_pin\n\n\ndef f(agentrc_pin):\n    return agentrc_pin.number\n\n\n'
+                    'def g():\n    return agentrc_pin.ROOT\n')
+        self.assertEqual(conform._internal_uses(tree('bare.py')), [(9, 'ROOT')])
+        self.script('hil-contract/scripts/glob.py',
+                    'def f():\n    global pin\n    import agentrc_pin as pin\n    return pin._selection()\n\n\n'
+                    'def g():\n    return pin.ROOT\n')
+        self.assertEqual(conform._internal_uses(tree('glob.py')), [(4, '_selection'), (8, 'ROOT')])
+        self.script('hil-contract/scripts/match.py',
+                    'import agentrc_pin as pin\n\n\ndef f(value):\n    match value:\n        case pin:\n'
+                    '            return pin.number\n\n\ndef g(v):\n    match v:\n        case [*pin]:\n'
+                    '            return pin.a\n        case {**pin}:\n            return pin.b\n\n\n'
+                    'def h():\n    return pin.ROOT\n')
+        self.assertEqual(conform._internal_uses(tree('match.py')), [(19, 'ROOT')])
 
     def test_the_round_trip_refuses_a_module_from_outside_the_staged_copy(self):
         outside = self.tmp / 'outside'

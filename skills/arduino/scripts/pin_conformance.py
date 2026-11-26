@@ -12,41 +12,158 @@ import tempfile
 from pathlib import Path
 
 FILES = ()  # loads and launches nothing by path (hil_load.py)
+# agentrc_pin.py's docstring names all but ci, which consumers use
+PUBLIC = frozenset({"ci", "config", "identity", "load", "stage", "conformance", "PinError"})
 
 
 class ConformanceError(Exception):
     """The consumer's profile is unreadable; the bootstrap reports it as its own error."""
 
 
-def _load_calls(path, own=False):
-    """(line, target or None when not one string literal) of each agentrc_pin.load() call in a script, through any
-    `import agentrc_pin as x` or `from agentrc_pin import load as y` name; `own` (the bootstrap) counts its bare
-    load() too."""
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    modules, loads = {"agentrc_pin"}, {"load"} if own else set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            modules.update(a.asname or a.name for a in node.names if a.name == "agentrc_pin")
-        elif isinstance(node, ast.ImportFrom) and node.module == "agentrc_pin":
-            loads.update(a.asname or a.name for a in node.names if a.name == "load")
-    for node in ast.walk(tree):
+_FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+_COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+_SCOPES = (*_FUNCTIONS, ast.ClassDef, *_COMPREHENSIONS)
+
+
+def _outer_parts(scope):
+    """The parts of a nested scope its enclosing scope evaluates: decorators, defaults, annotations, bases, and a
+    comprehension's first iterable."""
+    if isinstance(scope, _COMPREHENSIONS):
+        return [scope.generators[0].iter]
+    parts = list(getattr(scope, "decorator_list", []))
+    if isinstance(scope, ast.ClassDef):
+        return parts + scope.bases + scope.keywords
+    a = scope.args
+    parts += a.defaults + [d for d in a.kw_defaults if d]
+    if not isinstance(scope, ast.Lambda):
+        params = (*a.posonlyargs, *a.args, *a.kwonlyargs, a.vararg, a.kwarg)
+        parts += [x.annotation for x in params if x and x.annotation] + ([scope.returns] if scope.returns else [])
+    return parts
+
+
+def _own_nodes(scope):
+    """The nodes `scope` itself evaluates, each nested scope included as a node but not its body."""
+    if isinstance(scope, _COMPREHENSIONS):
+        g = scope.generators
+        todo = [*(getattr(scope, k) for k in ("elt", "key", "value") if hasattr(scope, k)), *(x.target for x in g)]
+        todo += [c for x in g for c in x.ifs] + [x.iter for x in g[1:]]
+    else:
+        todo = [scope.body] if isinstance(scope, ast.Lambda) else list(scope.body)
+    while todo:
+        node = todo.pop()
+        yield node
+        todo.extend(_outer_parts(node) if isinstance(node, _SCOPES) else ast.iter_child_nodes(node))
+
+
+_MODULE, _LOAD = "module", "load"  # what a name is bound to: the bootstrap, or its load(); False for anything else
+
+
+def _bindings(scope):
+    """({name: binding} of the names `scope` binds as its own, {name: binding} of those it declares global): an
+    `import agentrc_pin [as x]` binds _MODULE, a `from agentrc_pin import load [as y]` _LOAD, anything else False."""
+    bound, nonlocals, glob = {}, set(), set()
+    if isinstance(scope, _FUNCTIONS):
+        a = scope.args
+        bound.update((x.arg, False) for x in (*a.posonlyargs, *a.args, *a.kwonlyargs, a.vararg, a.kwarg) if x)
+    for node in _own_nodes(scope):
+        if isinstance(node, ast.Global):
+            glob.update(node.names)
+        elif isinstance(node, ast.Nonlocal):
+            nonlocals.update(node.names)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for a in node.names:
+                if isinstance(node, ast.Import):
+                    name, kind = a.asname or a.name.partition(".")[0], a.name == "agentrc_pin" and _MODULE
+                else:
+                    name, kind = a.asname or a.name, node.module == "agentrc_pin" and a.name == "load" and _LOAD
+                bound[name] = bound.get(name, False) or kind
+        elif isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
+            bound.setdefault(node.id, False)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.ExceptHandler)) and node.name:
+            bound.setdefault(node.name, False)
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name:
+            bound.setdefault(node.name, False)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            bound.setdefault(node.rest, False)
+    return {k: v for k, v in bound.items() if k not in nonlocals | glob}, {k: bound.get(k, False) for k in glob}
+
+
+def _scoped(tree, own=False):
+    """(node, {name: binding} visible there) for every node `tree` evaluates: a name is what binds it in its own
+    scope, else in an enclosing function's, else in the module's, which also takes every `global` binding; a module
+    that never rebinds `agentrc_pin` has it as the bootstrap, and the bootstrap itself (`own`) its def load()."""
+    scopes = [tree, *(n for n in ast.walk(tree) if isinstance(n, _SCOPES))]
+    binds = {s: _bindings(s) for s in scopes}
+    module = {"agentrc_pin": _MODULE, **binds[tree][0], **({"load": _LOAD} if own else {})}
+    for s in scopes[1:]:
+        for name, kind in binds[s][1].items():
+            module[name] = module.get(name, False) or kind
+
+    def walk(scope, visible):
+        local, glob = binds[scope]
+        here = module if scope is tree else {**visible, **local, **{n: module.get(n, False) for n in glob}}
+        for node in _own_nodes(scope):
+            yield node, here
+            if isinstance(node, _SCOPES):
+                # a class body is no enclosing scope
+                yield from walk(node, visible if isinstance(scope, ast.ClassDef) else here)
+
+    yield from walk(tree, {})
+
+
+def _load_calls(tree, own=False):
+    """[(line, target or None when not one string literal)] of each agentrc_pin.load() call in a script, in line
+    order, through a name bound to the bootstrap or its load() where the call is (_scoped)."""
+    calls = []
+    for node, here in _scoped(tree, own):
         f = getattr(node, "func", None)
-        if (isinstance(f, ast.Attribute) and f.attr == "load" and getattr(f.value, "id", None) in modules) or (
-            isinstance(f, ast.Name) and f.id in loads
+        if isinstance(node, ast.Call) and (
+            (isinstance(f, ast.Attribute) and f.attr == "load" and here.get(getattr(f.value, "id", None)) == _MODULE)
+            or (isinstance(f, ast.Name) and here.get(f.id) == _LOAD)
         ):
             arg = node.args[0] if len(node.args) == 1 and not node.keywords else None
-            yield node.lineno, arg.value if isinstance(arg, ast.Constant) and isinstance(arg.value, str) else None
+            target = arg.value if isinstance(arg, ast.Constant) and isinstance(arg.value, str) else None
+            calls.append((node.lineno, target))
+    return sorted(calls, key=lambda c: c[0])
+
+
+def _internal_uses(tree):
+    """(line, name) of each bootstrap name outside PUBLIC a script uses: an attribute of a name bound to the
+    bootstrap where it is used (_scoped), or a `from agentrc_pin import` name. Module dunders such as __file__ are
+    not the bootstrap's own."""
+
+    def internal(name):
+        return name not in PUBLIC and not (name.startswith("__") and name.endswith("__"))
+
+    uses = [
+        (node.lineno, a.name)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module == "agentrc_pin"
+        for a in node.names
+        if internal(a.name)
+    ]
+    uses += [
+        (node.lineno, node.attr)
+        for node, here in _scoped(tree)
+        if isinstance(node, ast.Attribute) and here.get(getattr(node.value, "id", None)) == _MODULE
+        and internal(node.attr)
+    ]
+    return sorted(uses)
 
 
 def _load_problems(root, bootstrap, pin_file, closure):
     problems = []
-    for path in sorted((root / ".claude" / "skills").rglob("*.py")):
+    claude = root / ".claude"
+    for path in sorted((*(claude / "skills").rglob("*.py"), *(claude / "test").rglob("*.py"))):
         where = path.relative_to(root).as_posix()
         try:
-            calls = list(_load_calls(path, own=where == bootstrap))
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            uses = _internal_uses(tree)
+            calls = _load_calls(tree, own=where == bootstrap) if path.is_relative_to(claude / "skills") else []
         except (OSError, ValueError, SyntaxError, RecursionError) as e:
             problems.append(f"{where} is unreadable ({e})")
             continue
+        problems += [f"{where}:{line}: uses agentrc_pin.{name}, internal to the bootstrap" for line, name in uses]
         for line, target in calls:
             if target is None:
                 problems.append(f"{where}:{line}: agentrc_pin.load() takes one string literal, not a computed target")
@@ -139,9 +256,9 @@ def problems(root, *, ident, stage, required, profile, bootstrap, pin_file, mani
     does, [] when nothing: its `profile`'s CONTRACT_FILES must carry the `bootstrap` and its `pin_file`
     configuration, the identity must hold the `required` files (the engines, the bootstrap and its FILES), every
     agentrc_pin.load() in .claude/skills, the bootstrap's own included, must name a closure file as one string
-    literal (read with ast), and a tree staged from the contract files and the closure with `stage` must select
-    this identity and load only from its own copy. Paths are consumer-relative; ConformanceError when the profile
-    has no readable CONTRACT_FILES."""
+    literal, .claude/skills and .claude/test must use only the bootstrap's PUBLIC names (both read with ast), and a
+    tree staged from the contract files and the closure with `stage` must select this identity and load only from its
+    own copy. Paths are consumer-relative; ConformanceError when the profile has no readable CONTRACT_FILES."""
     root = Path(root)
     contract = _contract_files(root, profile)
     found = []

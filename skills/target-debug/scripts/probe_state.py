@@ -13,7 +13,9 @@ Probe observations only: it never says whether the application works.
 The board's HIL config entry (the target-debug SKILL.md's HIL config table) gives the
 backend and probe: flasher `jlink` (args exactly `-device NAME`; --interface and
 --speed are the caller's) or `openocd` (args are its -f/-c arguments; vid_pid pins
-discovery). Any other flasher, a missing serial or an ambiguous board is refused.
+discovery). An openocd board agentrc's registry gives a `debug` route starts openocd with
+its `openocd` arguments instead (hil_debug_cfg). Any other flasher, a missing serial or an
+ambiguous board is refused.
 
 The caller holds the project's board lock for the whole run (target-debug, Delegated
 sessions); this script takes no lock and cannot check that one is held. The
@@ -190,6 +192,13 @@ def hil_flasher(path, board):
     if flasher['name'] == 'stlink' and 'args' in flasher:
         raise ValueError(f"--board {board}: a stlink entry's args are not openocd's")
     return flasher
+
+
+def hil_debug_cfg(flasher):
+    """The `debug.openocd` agentrc's registry gives an openocd `flasher`'s board, which hil_boards' debug_problem
+    holds to that probe, else None. A bench board's or a roster's own `debug` is never taken."""
+    reg = hil_boards().registry().get(flasher['uid'])
+    return reg['debug']['openocd'] if reg and 'debug' in reg else None
 
 
 def hil_jlink_device(board, flasher):
@@ -998,8 +1007,8 @@ def resolve(a, p):
             shlex.split(flasher['args'])
         except ValueError as e:
             raise ValueError(f"--board {a.board}: flasher.args {flasher['args']!r}: {e}")
-        return route, {'probe': flasher['uid'], 'cfg': flasher['args']}, OpenOCD(flasher['uid'], flasher['args'],
-                                                         vid_pid and vid_pid.strip())
+        cfg = hil_debug_cfg(flasher) or flasher['args']
+        return route, {'probe': flasher['uid'], 'cfg': cfg}, OpenOCD(flasher['uid'], cfg, vid_pid and vid_pid.strip())
     except ValueError as e:
         p.error(str(e))
 

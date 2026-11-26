@@ -60,6 +60,7 @@ _FLASHER_KEYS = {'name', 'uid', 'args', 'args_program', 'vid_pid', 'verify', 'no
 REGISTERED = (*PHYSICAL, 'debug', 'dev_attached')   # what a registered board's resolved entry takes from here
 _ENTRY_KEYS = {'name', *REGISTERED}
 _DEBUG_KEYS = {'openocd', 'note'}
+_DEBUG_COMMANDS = re.compile(r'adapter speed [0-9]+|transport select swd')
 _DEV_KEYS = {'vid_pid', 'serial', 'is_cdc', 'is_msc', 'block_size', 'block_count', 'msc_inquiry', 'note'}
 DEV_VID_PID_RE = re.compile(r'[0-9a-f]{4}:[0-9a-f]{4}\Z')
 
@@ -118,9 +119,14 @@ def flasher_problem(flasher, *, has_uid=True) -> str:
     return ''
 
 
-def debug_problem(debug) -> str:
-    """Why `debug` is not a well-formed registry debug route, or ''. Its `openocd` is the -f/-c arguments
-    a GDB session starts openocd with; the probe is the board's own, so it carries no uid."""
+def _interface_cfgs(words):
+    return [v for f, v in zip(words, words[1:]) if f == '-f' and v.startswith('interface/')]
+
+
+def debug_problem(debug, flasher=None) -> str:
+    """Why `debug` is not a well-formed registry debug route, or ''. Its `openocd` is the arguments a GDB
+    session starts openocd with on the board's own probe, so it carries no uid: only `-f FILE` and `-c COMMAND`
+    pairs, each command one of _DEBUG_COMMANDS, and on an openocd `flasher` its probe's interface cfgs."""
     if not isinstance(debug, dict):
         return f'not an object: {debug!r}'
     if set(debug) - _DEBUG_KEYS:
@@ -131,9 +137,23 @@ def debug_problem(debug) -> str:
         if key in debug and not (isinstance(debug[key], str) and debug[key].strip()):
             return f'{key} must be a non-empty string, got {debug[key]!r}'
     try:
-        shlex.split(debug['openocd'])
+        words = shlex.split(debug['openocd'])
     except ValueError as e:
         return f'openocd {debug["openocd"]!r}: {e}'
+    pairs = list(zip(words[::2], words[1::2]))
+    if len(words) % 2 or any(f not in ('-f', '-c') or not v or v.startswith('-') for f, v in pairs):
+        return f'openocd {debug["openocd"]!r}: only -f FILE and -c COMMAND pairs'
+    bad = [v for f, v in pairs if f == '-c' and not _DEBUG_COMMANDS.fullmatch(v)]
+    if bad:
+        return f'openocd -c {bad[0]!r}: a route\'s commands are only "adapter speed N" and "transport select swd"'
+    # malformed args are the flasher's own problem
+    if isinstance(flasher, dict) and flasher.get('name') == 'openocd' and isinstance(flasher.get('args', ''), str):
+        try:
+            own = _interface_cfgs(shlex.split(flasher.get('args', '')))
+        except ValueError as e:
+            return f'flasher args {flasher.get("args")!r}: {e}'
+        if _interface_cfgs(words) != own:
+            return f'openocd interface cfgs {_interface_cfgs(words)} are not its flasher\'s {own}'
     return ''
 
 
@@ -200,7 +220,7 @@ def _check(boards: dict, path) -> list:
         for key in PHYSICAL:
             if key in e and (why := flasher_problem(e[key], has_uid=False)):
                 problems.append(f'{probe}: {key}: {why}')
-        if 'debug' in e and (why := debug_problem(e['debug'])):
+        if 'debug' in e and (why := debug_problem(e['debug'], e.get('flasher'))):
             problems.append(f'{probe}: debug: {why}')
         if 'dev_attached' in e and (why := dev_attached_problem(e['dev_attached'])):
             problems.append(f'{probe}: dev_attached: {why}')

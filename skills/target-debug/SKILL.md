@@ -53,7 +53,9 @@ A J-Link entry supplies neither interface nor speed. On the J-Link route `--inte
 the OpenOCD route they live inside `--cfg` and the two flags are refused. `pc_sample.py` and `sysview_record.py`
 (`jlink` entries only) merge a `jlink` entry the same way; `autopsy.py`, `probe_state.py` and `sysview_dump.py` take
 `jlink` and `openocd` entries from the entry alone, as `pc_sample.py` takes an `openocd` one. `etm_capture.py` does not
-read it — a J-Trace is one probe moved between boards, named with `--probe`.
+read it — a J-Trace is one probe moved between boards, named with `--probe`. A registered board's `debug.openocd` is
+its GDB route, the registry's, which `hil_boards.py` holds to the flasher's probe: `probe_state.py` starts openocd with
+it, and a hand-run GDB session takes it from `hil_boards.py roster FILE` (`hil` skill), not from `flasher.args`.
 
 ## Delegated sessions
 

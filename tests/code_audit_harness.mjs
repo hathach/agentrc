@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
+import { BASH_ONLY } from './emit_stub.mjs'
 
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
 const body = readFileSync(new URL('../workflows/code-audit.js', import.meta.url), 'utf8')
@@ -351,6 +352,17 @@ const BATCHED = { dirs: ['src/portable/x'], dimensions: ['correctness', 'concurr
 const scansOf = (correctness, concurrency = []) => ({ 'src/portable/x|correctness': correctness, 'src/portable/x|concurrency': concurrency })
 const batchCalls = (calls) => calls.filter(c => c.label.startsWith('verify:b'))
 const singles = (calls) => calls.filter(c => /^verify:d/.test(c.label)).map(c => c.label)
+
+test('under shell powershell no prompt a unit gets carries bash syntax (#555)', async () => {
+  const diff = { base: 'a'.repeat(40), head: 'b'.repeat(40) }
+  const scans = { ...scansOf([finding(1, 'a'), finding(5, 'b'), finding(40, 'far')], [{ ...finding(9, 'c'), hardware: null }]),
+    '.|correctness': [], '.|concurrency': [] }
+  const verdicts = { a: true, b: false, far: null, c: { real: true, reason: 'holds' } }
+  const { calls } = await run({ ...BATCHED, dirs: [...BATCHED.dirs, '.'], diff, shell: 'powershell' }, { scans, verdicts })
+  assert.deepEqual([...new Set(calls.map(c => c.label.match(/^(scan|verify:b|verify:d)/)[1]))].sort(),
+    ['scan', 'verify:b', 'verify:d'], 'scans, batches and single verifiers, retries included')
+  for (const c of calls) assert.doesNotMatch(c.prompt, BASH_ONLY, c.label)
+})
 
 test('batch mode verifies close findings on one file together, across dimensions, and leaves the rest alone', async () => {
   const scans = scansOf([finding(1, 'a'), finding(5, 'b'), finding(40, 'far'), { ...finding(2, 'other file'), file: 'src/b.c' }], [finding(9, 'c')])

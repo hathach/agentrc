@@ -263,7 +263,8 @@ name it. The devices wired to its USB host port are farm facts too: `dev_attache
 with its `vid_pid` (`vvvv:pppp`), its `serial` as the host reads it (omitted when none was
 read), and what a test may use (`is_cdc`, `is_msc` with `block_size`, `block_count` and
 `msc_inquiry`). So is `debug`, the openocd route a GDB session attaches through (`openocd`, its -f/-c
-arguments, and an optional `note`). A project roster names the board by `"probe": "<serial>"`, matched exactly,
+arguments, and an optional `note`): only `-f FILE` and `-c` pairs, each command `adapter speed N` or `transport
+select swd`, and on an openocd flasher that flasher's `-f interface/` cfgs (`debug_problem`). A project roster names the board by `"probe": "<serial>"`, matched exactly,
 and keeps its own `uid` (the serial its firmware reports, which differs per firmware),
 name, tests and project fields, never the registry's. A `flasher_recover` arms in-run
 wedge recovery, so it joins only after a reset through it, and a reflash where openocd
@@ -555,6 +556,14 @@ recovery stay the contract's.
   below for one attempt and for a retry sequence.
 - A remote attempt is created once, under its own lease, and launched once;
   it is never wiped by the core, and its retention is the project's.
+- A CI report posted on a PR by a `workflow_run` job goes through
+  `gh_pr_comment.py` (its usage has the commands), from the agentrc the
+  project pins: an Arduino contract names it in `extra_engines`, and tinyusb
+  and tinyuf2 load it from their pin; the job keeps its renderer and posts
+  under the header its existing sticky comment uses. The posting job needs
+  `permissions: pull-requests: write` (`actions: read` for artifacts) and a
+  per-PR `concurrency` group without cancel-in-progress, since `post` is not
+  atomic. Adafruit_TinyUSB_Arduino's `hil_comment.yml` is the worked example.
 
 ## Reporting
 

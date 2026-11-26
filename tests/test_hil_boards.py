@@ -266,6 +266,7 @@ class DevAttached(Base):
 
 
 ROUTE = {'openocd': '-f interface/cmsis-dap.cfg -f target/rp2040.cfg -c "adapter speed 5000"'}
+PICO = {**OPENOCD, 'args': ROUTE['openocd']}
 # the Arduino rosters' debug.openocd (Adafruit_TinyUSB_Arduino, Adafruit_SPIFlash test/hil/ci.json), by probe
 ROSTER_ROUTES = {
     'E6614103E72C1D2F': '-f interface/cmsis-dap.cfg -f target/rp2040.cfg -c "adapter speed 5000"',
@@ -279,7 +280,7 @@ ROSTER_ROUTES = {
 class Debug(Base):
     def setUp(self):
         hb._warned.clear()
-        self.path = self.registry({'boards': {**REG['boards'], 'E663': {'name': 'pico', 'flasher': OPENOCD,
+        self.path = self.registry({'boards': {**REG['boards'], 'E663': {'name': 'pico', 'flasher': PICO,
                                                                         'debug': {**ROUTE, 'note': 'n'}}}})
 
     def resolve(self, entry, **kw):
@@ -338,6 +339,33 @@ class Debug(Base):
             with self.subTest(debug), self.assertRaisesRegex(ValueError, f'A: debug: {why}'):
                 hb.registry(self.registry({'boards': {'A': {'name': 'a', 'flasher': {'name': 'jlink'},
                                                             'debug': debug}}}))
+
+    def test_a_registry_route_is_only_plain_pairs_on_its_flashers_probe(self):
+        pairs, commands = 'only -f FILE and -c COMMAND pairs', 'a route\'s commands are only'
+        for args, why in (('-f interface/cmsis-dap.cfg --command "adapter speed 1"', pairs),
+                          ('-f interface/cmsis-dap.cfg -cadapter', pairs), ('-finterface/cmsis-dap.cfg', pairs),
+                          ('-f interface/cmsis-dap.cfg -c', pairs), ('-f -c -c "adapter speed 1"', pairs),
+                          ('-f interface/cmsis-dap.cfg -c "eval adapter serial X"', commands),
+                          ('-f interface/cmsis-dap.cfg -c "adapter speed 1; adapter serial X"', commands),
+                          ('-f interface/cmsis-dap.cfg -c "adapter speed [adapter serial X]"', commands),
+                          ('-f interface/cmsis-dap.cfg -c "adapter serial X"', commands),
+                          ('-f interface/cmsis-dap.cfg -c "adapter driver cmsis-dap"', commands),
+                          ('-f interface/cmsis-dap.cfg -c "adapter speed 1\nshutdown"', commands),
+                          ('-f interface/jlink.cfg -f target/rp2040.cfg',
+                           "interface cfgs .*jlink.* are not its flasher's"),
+                          ('-f target/rp2040.cfg', "interface cfgs \\[\\] are not its flasher's")):
+            with self.subTest(args), self.assertRaisesRegex(ValueError, f'A: debug: .*{why}'):
+                hb.registry(self.registry({'boards': {'A': {'name': 'a', 'flasher': PICO,
+                                                            'debug': {'openocd': args}}}}))
+        for args in (42, ['-f', 'interface/cmsis-dap.cfg']):
+            with self.subTest(args), self.assertRaisesRegex(ValueError, r'A: flasher: args must be a non-empty string'):
+                hb.registry(self.registry({'boards': {'A': {'name': 'a', 'flasher': {**PICO, 'args': args},
+                                                            'debug': ROUTE}}}))
+        # a J-Link board's route reaches its probe through openocd's jlink driver: no flasher interface to match
+        jlink = '-f interface/jlink.cfg -c "transport select swd" -c "adapter speed 4000" -f target/atsame5x.cfg'
+        reg = hb.registry(self.registry({'boards': {'A': {'name': 'a', 'flasher': JLINK,
+                                                          'debug': {'openocd': jlink}}}}))
+        self.assertEqual(reg['A']['debug']['openocd'], jlink)
 
 
 class LockName(Base):
