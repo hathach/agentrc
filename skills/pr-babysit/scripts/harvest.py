@@ -145,7 +145,8 @@ TRUSTED = ('OWNER', 'MEMBER', 'COLLABORATOR')
 EXCERPT = 200
 # The run's own posts, which answer no person: a request to a bot, and pr-reply's reply quoting the comment it answers.
 BOT_ASK = re.compile(r'\s*@(?:coderabbitai|greptileai)\b', re.I)
-REPLY_QUOTE = re.compile(r'> (\S+)\n\n')
+# pr-reply quotes an issue comment's or a review's html_url: a person's quote of a line of text is no such reply.
+REPLY_QUOTE = re.compile(r'> (https://\S+#(?:issuecomment|pullrequestreview)-\d+)\n\n')
 THREADS_QUERY = ('query($owner: String!, $name: String!, $n: Int!, $after: String) { viewer { login } '
                  'repository(owner: $owner, name: $name) { pullRequest(number: $n) { author { login } '
                  'reviewThreads(first: 100, after: $after) { pageInfo { hasNextPage endCursor } '

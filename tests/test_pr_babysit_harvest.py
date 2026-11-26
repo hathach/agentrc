@@ -973,6 +973,10 @@ class Waiting(unittest.TestCase):
                 self.assertEqual(self.ids([], [ask, *issue], [body, *reviews]), both)
         quoting = said(72, self.VIEWER, '2026-11-20T11:00:00Z', f"> {ask['html_url']}\n\nKept as asked.")
         self.assertEqual(self.ids([], [ask, quoting], [body]), [('review-body', 71)], 'a reply quoting the comment answers that one only')
+        for name, line in (('a one-word line', 'Why?'), ('a link to elsewhere', 'https://example.com/spec')):
+            with self.subTest(name):
+                answer = said(72, self.AUTHOR, '2026-11-20T11:00:00Z', f'> {line}\n\nBecause the spec says so.')
+                self.assertEqual(self.ids([], [ask, answer], [body]), [], "the author's quote-reply of text answers both")
         self.assertEqual(self.ids([], [ask, said(72, self.VIEWER, '2026-11-20T11:00:00Z', 'Kept as asked, @coderabbitai')], [body]), [],
                          'a mention later in the body is no bot request')
 
