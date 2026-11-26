@@ -340,10 +340,28 @@ class MergeTest(unittest.TestCase):
     def test_a_comment_posted_during_the_ci_inspection_blocks_the_merge(self):
         late = {**self.world.fresh, 'waiting': [{'commentId': 9, 'author': 'HiFiPhile', 'url': 'https://github.com/o/r/pull/7#issuecomment-9'}]}
         answers = [copy.deepcopy(self.world.fresh), late]
-        with mock.patch.object(merge.harvest, 'collect', lambda argv: self.world.harvested.append(argv) or answers.pop(0)):
+        # One log across GitHub, harvest.py and collect.py: the second harvest must follow the CI inspection and the last PR read.
+        order = []
+        gh_json, attempt = self.world.gh_json, self.world.attempt
+
+        def harvested(argv):
+            order.append('harvest')
+            self.world.harvested.append(argv)
+            return answers.pop(0)
+
+        def read(*argv):
+            order.append('pr' if argv[:2] == ('api', 'graphql') else 'rules')
+            return gh_json(*argv)
+
+        def ran(*argv):
+            order.append('inventory' if argv[1].endswith('collect.py') else argv[0])
+            return attempt(*argv)
+
+        with mock.patch.object(merge.harvest, 'collect', harvested), mock.patch.object(merge.harvest, 'gh_json', read), \
+                mock.patch.object(merge, 'attempt', ran):
             got = self.run_it(None, '--merge')
         self.assertBlocked(got, r'^human-review: 1 comment\(s\) .*9 by HiFiPhile')
-        self.assertEqual(len(self.world.harvested), 2, 'read again after the last PR read')
+        self.assertEqual(order, ['pr', 'rules', 'harvest', 'inventory', 'pr', 'harvest'], 'read again after the CI inspection and the last PR read')
 
     def test_only_the_owners_waiver_drops_a_bot_and_never_every_bot(self):
         # #292: Greptile left out of the launch at the owner's word; CodeRabbit reviewed the head.
