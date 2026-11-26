@@ -99,9 +99,10 @@ def _bindings(scope):
 
 
 def _internal_uses(path):
-    """(line, name) of each bootstrap name outside PUBLIC a script uses: an attribute of `agentrc_pin`, or of an
-    `import agentrc_pin as x` name where that import binds it (its scope and the nested ones that do not rebind x),
-    or a `from agentrc_pin import` name. Module dunders such as __file__ are not the bootstrap's own."""
+    """(line, name) of each bootstrap name outside PUBLIC a script uses: an attribute of an `import agentrc_pin [as
+    x]` name where that import binds it (its scope and the nested scopes that do not rebind x; a module that never
+    rebinds `agentrc_pin` counts it as the bootstrap), or a `from agentrc_pin import` name. Module dunders such as
+    __file__ are not the bootstrap's own."""
 
     def internal(name):
         return name not in PUBLIC and not (name.startswith("__") and name.endswith("__"))
@@ -112,9 +113,8 @@ def _internal_uses(path):
         module = here if isinstance(scope, ast.Module) else module
         inner = visible if isinstance(scope, ast.ClassDef) else here  # a class body is no enclosing scope
         for node in _own_nodes(scope):
-            if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and internal(node.attr) and (
-                node.value.id == "agentrc_pin" or here.get(node.value.id)
-            ):
+            name = node.value.id if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) else None
+            if name and here.get(name) and internal(node.attr):
                 uses.append((node.lineno, node.attr))
             elif isinstance(node, _SCOPES):
                 scan(node, inner, module)
@@ -127,7 +127,7 @@ def _internal_uses(path):
         for a in node.names
         if internal(a.name)
     ]
-    scan(tree, {}, {})
+    scan(tree, {"agentrc_pin": True}, {})
     return sorted(uses)
 
 
