@@ -3519,7 +3519,7 @@ const runLanes = async (cycle, entry, lanes) => {
     }
     const repliesHeld = "before this cycle's replies, none posted"
     if (!settlementsTried && settlementsArg.length && r !== nobody) {
-      const blocked = args.autoPush === true ? await clearToWrite('replies', repliesHeld) : null
+      const blocked = args.autoPush === true ? await clearToWrite('reuse', repliesHeld) : null
       if (blocked) return blocked
       for (const id of await settleCaller(cycle, digestOf, held, ended)) ledger.delete(id)
     }
@@ -3562,7 +3562,9 @@ const runLanes = async (cycle, entry, lanes) => {
       .map(id => ({ commentId: id, body: deferredOn(id).map(deferralLine).join('\n') }))
     if (deferralReplies.length > 0 && args.autoPush === true) {
       if (await ended('defer')) return prEnded(cycle, lanes.prState)
-      const blocked = await clearToWrite('defer', repliesHeld)
+      const replied = entry.refutedPosts ? entry.refutedPosts.replied : []
+      const blocked = await clearToWrite('defer', replied.length
+        ? `after this cycle's replies to comments ${replied.join(', ')}, before its deferrals, none posted` : "before this cycle's deferrals, none posted")
       if (blocked) return blocked
       entry.deferralPosts = await publishReplies(`defer#${cycle}`, deferralReplies, 'deferral', cycle, digestOf)
     }

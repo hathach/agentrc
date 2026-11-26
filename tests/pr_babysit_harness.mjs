@@ -4015,6 +4015,8 @@ test("each write batch of a cycle reads waiting comments again, so none is poste
     reviews: { findings: [finding(), invalidFinding({ commentId: 2 })], replies: [{ commentId: 2, body: 'not a bug: x' }], bots: 'reviewed' } })
   assert.deepEqual(deferred.labels.filter(l => /^(waiting|replies|defer|resolve)#/.test(l)), ['waiting#1-replies', 'replies#1', 'waiting#1-defer'])
   assert.equal(deferred.result.reason, 'human-review')
+  assert.deepEqual(deferred.result.history[0].refutedPosts.replied, [2])
+  assert.match(deferred.result.detail, /; after this cycle's replies to comments 2, before its deferrals, none posted$/)
 })
 
 test("a human-review stop keeps its comments and uncommitted fixes when the CI lane met a rate limit, the limit beside them (#591)", async () => {
@@ -5240,6 +5242,7 @@ test('a reply that reads back as the offered body is the caller\'s to settle on,
   const settlement = { commentId: 2, commentDigest: 'd2', replyId: 502, bodyDigest: fnv1a('not so'), headSha: first.result.state.expectedHead }
   const { result, labels, calls } = await resumeAt(first.result.state, { ...wrong, args: { autoPush: true, maxCycles: 3, replySettlements: [settlement] } })
   assert.deepEqual(labels.filter(l => /^(replies|inspect|edit|reuse)#/.test(l)), ['reuse#2'])
+  assert.deepEqual(labels.filter(l => /^(waiting#2|reuse#)/.test(l)), ['waiting#2-reuse', 'reuse#2'])
   assert.deepEqual(stagedOf(calls.find(c => c.label === 'reuse#2').prompt).reuses,
     [{ commentId: 2, replyId: 502, bodyDigest: fnv1a('not so'), originalDigest: 'd2' }])
   assert.equal(result.pass, true, result.reason)
