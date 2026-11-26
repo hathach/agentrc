@@ -138,7 +138,8 @@ STALLED = {
                     "an issue comment or review body once one of them posted an issue comment or a non-empty review body "
                     "after it, after an issue comment's last edit, never a bot request or a reply quoting another comment, "
                     "never on another person's reply; a stop before a push left its verified fixes uncommitted, named in "
-                    "`uncommitted`, for the caller's review (#591)",
+                    "`uncommitted`, for the caller's review, and one after a review-lane push left its fix notes owed, "
+                    "which a later launch posts as offered (#591)",
     'harvest-failed': "harvest.py failed twice in a row (`detail`): fix what its error names, such as a module the "
                       "launch's interpreter lacks, or relaunch once a passing cause (a head still moving, a GitHub outage) cleared",
     'ci-collect-failed': "collect.py failed the same way on two cycles running (`detail`): fix what its error names, such as an "
@@ -151,6 +152,11 @@ STALLED = {
     'reviews-stuck': "a review bot's state stayed unreadable, unchanged, for the wait cap: read its evidence in `bots` "
                      '(an artifact harvest.py does not know, a tie, a failed read) and relaunch once it changed or harvest.py reads it',
 }
+
+
+# A rate limit met in the cycle a human-review stop ended, which keeps that stop's handoff (#591).
+RATE_LIMITED_TOO = ('GitHub also refused a call for a rate limit (`rateLimit`): once the comments are settled, relaunch from '
+                    'the stateRef only after its resetAt, or a few minutes later for a secondary limit')
 
 
 # What settles a blocker that names no stop reason of its own.
@@ -501,6 +507,8 @@ def summarize(output, output_path, state_ref=None, tree=None, keys=False):
         if result.get('reason') == 'human-review':
             blockers += [f"comment {w.get('commentId')} by {w.get('author')} waits for a person's answer: {w.get('url')}"
                          for w in result.get('waiting') or [] if isinstance(w, dict)]
+            if isinstance(result.get('rateLimit'), dict):
+                blockers.append(RATE_LIMITED_TOO)
         held = held_adoption(result.get('adoptionHeld'))
         if held:
             blockers.append(held[2])

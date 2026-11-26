@@ -3831,7 +3831,7 @@ test("a person's comment waiting for an answer stops an unpublished adoption bef
   assert.deepEqual([result.pass, result.reason], [false, 'human-review'])
   const { digest, excerpt, ...named } = OBJECTION
   assert.deepEqual(result.waiting, [named])
-  assert.match(result.detail, new RegExp(`theirs to answer or resolve; this run does not answer them; before the adoption push of ${ADOPT.slice(0, 7)}, left unpublished`))
+  assert.match(result.detail, new RegExp(`theirs to answer or resolve; this run does not answer them; before the adoption push of ${ADOPT.slice(0, 7)}, left unpublished: relaunch with the same adoptHead once they are settled$`))
   assert.deepEqual(labels, ['preflight', 'adopt:audit', 'adopt:waiting'], 'nothing pushed, no cycle run')
   assert.match(calls.find(c => c.label === 'adopt:waiting').prompt, /harvest\.py --pr 3888 --repo 'hathach\/tinyusb' --reviewers coderabbit` /)
   assert.ok(logs.includes(`cycle 2: 1 comment(s) by people wait for an answer — 4682479462 by HiFiPhile (${OBJECTION.url}); ` +
@@ -3870,6 +3870,7 @@ test('a harvest that fails or is rate-limited before an adoption push stops it u
   assert.equal(recovered.result.history.at(-1).adoption.publication, 'pushed')
   const limited = await run({ ...launch, adoptWaiting: { error: 'gh api: HTTP 403: You have exceeded a secondary rate limit.', rateLimit: LIMIT } })
   assert.equal(limited.result.reason, 'github-rate-limited')
+  assert.ok(limited.logs.some(l => l.endsWith('— stopping; relaunch with the same adoptHead once it clears')), limited.logs.join('\n'))
   assert.equal(limited.labels.includes('adopt:push'), false)
   assert.deepEqual([limited.result.state.expectedHead, limited.result.state.pending], [HEAD, null])
   assert.deepEqual(limited.result.adoptionHeld, { from: HEAD, to: ADOPT })
@@ -3892,12 +3893,47 @@ test("a person's comment posted after the cycle's harvest stops the run before i
   assert.ok(labels.some(l => l.startsWith('fix:')), labels.join(', '))
   assert.equal(labels.some(l => /^(recheck|hooks|push|resolve)#/.test(l)), false, labels.join(', '))
   assert.equal(result.history[0].ci.status, 'green', 'the CI lane is still awaited')
-  // With none waiting, the one reading before the push stands for its fix notes too.
+  // With none waiting, its fix notes read again after the push, which may take minutes.
   const quiet = await run(launch)
-  assert.deepEqual(quiet.labels.filter(l => l.startsWith('waiting#1-')), ['waiting#1-review'])
+  assert.deepEqual(quiet.labels.filter(l => l.startsWith('waiting#1-')), ['waiting#1-review', 'waiting#1-resolve'])
   assert.ok(quiet.labels.indexOf('waiting#1-review') < quiet.labels.indexOf('recheck#1-review'), quiet.labels.join(', '))
-  assert.ok(quiet.labels.includes('resolve#1'), quiet.labels.join(', '))
+  assert.ok(quiet.labels.indexOf('push#1-review') < quiet.labels.indexOf('waiting#1-resolve'), quiet.labels.join(', '))
+  assert.ok(quiet.labels.indexOf('waiting#1-resolve') < quiet.labels.indexOf('resolve#1'), quiet.labels.join(', '))
   assert.match(quiet.calls.find(c => c.label === 'waiting#1-review').prompt, /harvest\.py --pr 3888 --repo 'hathach\/tinyusb' --reviewers coderabbit`/)
+})
+
+test("a person's comment posted during the review-lane push stops the run before its fix notes, each owed as offered to a later launch (#591)", async () => {
+  const launch = { reviews: oneValid, scope: ['src/a.c'], args: { autoPush: true, maxCycles: 3 } }
+  const { result, labels } = await run({ ...launch, writeWaiting: (l) => l === 'waiting#1-resolve' ? [OBJECTION] : [] })
+  assert.deepEqual([result.pass, result.reason], [false, 'human-review'])
+  assert.match(result.detail, /; after the review-lane push, before this cycle's fix notes, none posted, each owed as offered$/)
+  assert.ok(labels.includes('push#1-review'), labels.join(', '))
+  assert.equal(labels.includes('resolve#1'), false, labels.join(', '))
+  const sha = result.history[0].reviewPush.sha
+  const { attempt } = debtOf(result, 1)
+  assert.deepEqual([attempt.how, attempt.repair], ['fixNote', { sha, findings: ['1#1'] }])
+  assert.equal(attempt.body, `Fixed in ${sha}.\n\n- src/a.c:1`)
+  // Once nothing waits, the relaunch's validator is told of the note and, naming the push as the fix, gets it posted as offered.
+  const again = await resumeAt(result.state, { args: { autoPush: true, maxCycles: 3 }, reviewsPerCycle: (prompt) => {
+    const named = String(prompt).match(/not yet posted[^[]*(\[.*?\])/)?.[1]
+    return { findings: [finding({ verdict: 'stale', fixedBy: named && JSON.parse(named)[0].sha })], replies: [], bots: 'reviewed' }
+  } })
+  assert.deepEqual(manifestOf(again.calls, 'resolve#2').map(x => x.body), [attempt.body])
+  assert.equal(again.result.state.debt.some(([id]) => id === 1), false)
+})
+
+test("a human-review stop keeps its comments and uncommitted fixes when the CI lane met a rate limit, the limit beside them (#591)", async () => {
+  const limit = { error: 'gh pr checks: GraphQL: API rate limit exceeded', ...LIMIT, resetAt: at(60), secondary: false }
+  const harvested = await run({ reviews: { ...oneValid, waiting: [OBJECTION] }, garble: limitedInventory, args: { autoPush: true, maxCycles: 4 } })
+  assert.deepEqual([harvested.result.reason, harvested.result.waiting.map(w => w.commentId)], ['human-review', [OBJECTION.commentId]])
+  assert.deepEqual(harvested.result.rateLimit, limit)
+  assert.ok(harvested.logs.includes(`cycle 1: GitHub refused a call for a rate limit (${limit.error}) too — relaunch after ${at(60)}`), harvested.logs.join('\n'))
+  const beforePush = await run({ reviews: oneValid, scope: ['src/a.c'], garble: limitedInventory, args: { autoPush: true, maxCycles: 4 },
+    writeWaiting: (l) => l === 'waiting#1-review' ? [OBJECTION] : [] })
+  assert.equal(beforePush.result.reason, 'human-review')
+  assert.match(beforePush.result.detail, /; before the review-lane push, its verified fixes left uncommitted$/)
+  assert.deepEqual(beforePush.result.uncommitted, ['src/a.c'])
+  assert.deepEqual(beforePush.result.rateLimit, limit)
 })
 
 test("a person's comment posted after the cycle's harvest stops the run before its replies, read once for every batch (#591)", async () => {

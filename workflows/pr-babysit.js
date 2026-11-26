@@ -2326,7 +2326,8 @@ const pay = (commentId, how, digest, sonarNote) => {
 // While its body stands, none of a comment's findings is this run's to fix or answer once the caller answered it.
 const answeredByHand = (f) => { const a = answeredWith.get(f.commentId); return !!a && a.how === 'byHand' && a.digest === f.commentDigest }
 
-const publishReplies = async (label, drafts, how, cycle, digestOf) => {
+// offerOnly: record each draft as offered and send nothing, so a later launch owes it as offered (#115).
+const publishReplies = async (label, drafts, how, cycle, digestOf, offerOnly = false) => {
   // A reply that exists with the wrong content, or a draft that cannot be posted, is a repair: the caller's, never answered again on top.
   const repair = (commentId, replyId, error) => {
     debtEntry(commentId).repair = { replyId, error: replyId ? error : `no reply posted: ${error}` }
@@ -2353,7 +2354,7 @@ const publishReplies = async (label, drafts, how, cycle, digestOf) => {
     if (scanning) sonarNotes.set(commentId, out)
   }
   // Every draft went to the caller: the handoffs name them, and no batch was sent.
-  if (replies.length === 0) return null
+  if (replies.length === 0 || offerOnly) return null
   if (pendingReview) return { pass: false, detail: `not sent: pending review ${pendingReview.review} of ${pendingReview.login}`, receipts: [], replied: [] }
   const out = await runReplyScript(label, 'manifest', `Publish these replies on PR #${args.pr}`,
     'Do not post, edit or delete anything yourself and do not change a body; the script posts once, reads back and resolves.',
@@ -2977,7 +2978,14 @@ const runCycle = async (cycle, entry) => {
   // Another cycle would meet the same refusal: the caller relaunches once it clears (#90).
   if (githubLimit && verdict?.reason !== 'github-rate-limited') {
     const { error, resetAt, secondary } = githubLimit
-    log(`cycle ${cycle}: GitHub refused a call for a ${secondary ? 'secondary ' : ''}rate limit (${error}) — stopping; relaunch ${resetAt ? `after ${resetAt}` : 'once it clears'}`)
+    const refused = `GitHub refused a call for a ${secondary ? 'secondary ' : ''}rate limit (${error})`
+    const relaunch = `relaunch ${resetAt ? `after ${resetAt}` : 'once it clears'}`
+    // A person's comment outranks the limit: the stop keeps its handoff and uncommitted fixes, the limit beside them.
+    if (verdict?.reason === 'human-review') {
+      log(`cycle ${cycle}: ${refused} too — ${relaunch}`)
+      return { ...verdict, rateLimit: githubLimit }
+    }
+    log(`cycle ${cycle}: ${refused} — stopping; ${relaunch}`)
     return stop(cycle, 'github-rate-limited', { rateLimit: githubLimit })
   }
   // Every later reply batch meets the same refusal until a human submits or deletes the review.
@@ -3052,8 +3060,8 @@ const WAITING = {
 }
 // harvest.py read again just before a write, as the stop to return, else null (#591): the harvest the write rests on is
 // minutes old, and a reply or resolve of ours in a person's thread would read as its answer. `held` names what the stop
-// leaves undone, `extra` the stop's members that name it.
-const waitingNow = async (entry, label, held, extra = {}) => {
+// leaves undone, `extra` the stop's members that name it, `relaunch` how a relaunch retries it.
+const waitingNow = async (entry, label, held, extra = {}, relaunch = '') => {
   if (reviewers.length === 0) return null
   const prompt = `${IN_CHECKOUT}Editing nothing, ` + runExactly(`${HARVEST_SCRIPT} --pr ${args.pr} --repo ${shq(repo)} --reviewers ${reviewers.join(',')}`)
   const opts = { label, phase: 'Triage', model: 'haiku', effort: 'low', schema: WAITING }
@@ -3061,7 +3069,7 @@ const waitingNow = async (entry, label, held, extra = {}) => {
   // harvest.py's own error line is run once more, as the validator does; a rate limit or a file never claimed is not.
   const r = retriable(first) || (first.error && !first.transport && !first.rateLimit) ? (await relayRetry(prompt, opts)) ?? first : first
   if (r && r.rateLimit) {
-    log(`cycle ${entry.cycle}: GitHub refused harvest.py ${held} for a rate limit (${r.error}) — stopping`)
+    log(`cycle ${entry.cycle}: GitHub refused harvest.py ${held} for a rate limit (${r.error}) — stopping${relaunch && `; relaunch ${relaunch} once it clears`}`)
     return stop(entry.cycle, 'github-rate-limited', { rateLimit: githubLimit, ...extra })
   }
   if (!r || r.error) {
@@ -3070,7 +3078,7 @@ const waitingNow = async (entry, label, held, extra = {}) => {
     entry.error = `harvest.py failed: ${detail}`
     return stop(entry.cycle, 'harvest-failed', { detail, ...extra })
   }
-  return r.waiting.length ? humanReview(entry.cycle, r.waiting, `; ${held}`, extra) : null
+  return r.waiting.length ? humanReview(entry.cycle, r.waiting, `; ${held}${relaunch && `: relaunch ${relaunch} once they are settled`}`, extra) : null
 }
 
 // #359: after a cycle that only waited out CodeRabbit's rate limit, a probe of harvest.py stands in for the validator
@@ -3162,7 +3170,7 @@ const runLanes = async (cycle, entry, lanes) => {
       if (r.waiting && r.waiting.length) return humanReview(cycle, r.waiting)
     }
     // harvest.py read again just before this cycle writes, which may be minutes after the harvest above (#591); a clear
-    // reading stands until a fix's verification has run, which takes long.
+    // reading stands until a fix's verification or a push has run, which take long.
     let clear = false
     const clearToWrite = async (what, held, extra) => {
       if (clear) return null
@@ -3571,7 +3579,6 @@ const runLanes = async (cycle, entry, lanes) => {
         return prEnded(cycle, lanes.prState)
       }
       if (owned.length > 0) {
-        // Its fix notes follow the push with no other check: a stop between them would leave a fixed finding owing a refutation.
         const blocked = await clearToWrite('review', 'before the review-lane push, its verified fixes left uncommitted', { uncommitted })
         if (blocked) return blocked
         // Any push attempt may have restarted CI, a refused or unknown one included.
@@ -3583,6 +3590,8 @@ const runLanes = async (cycle, entry, lanes) => {
           return stop(cycle, 'push-failed')
         }
         entry.reviewPush = push
+        // The push, hooks included, may take minutes: its fix notes read harvest.py again.
+        clear = false
         // Built here: the read-back proves only a text the workflow chose.
         const heldNow = heldComments()
         for (const f of validFindings) {
@@ -3604,9 +3613,11 @@ const runLanes = async (cycle, entry, lanes) => {
     }
     if (answerable.size > 0) {
       if (await ended('resolve')) return prEnded(cycle, lanes.prState)
-      const blocked = await clearToWrite('resolve', "before this cycle's fix notes, none posted")
-      if (blocked) return blocked
-      entry.fixNotePosts = await publishReplies(`resolve#${cycle}`, [...answerable.values()], 'fixNote', cycle, digestOf)
+      const notes = [...answerable.values()]
+      const blocked = await clearToWrite('resolve', `${entry.reviewPush ? 'after the review-lane push, ' : ''}before this cycle's fix notes, none posted, each owed as offered`)
+      // Offered, not posted: a later launch whose validator names the repair as the fix posts each as offered (#115).
+      if (blocked) { await publishReplies(`resolve#${cycle}`, notes, 'fixNote', cycle, digestOf, true); return blocked }
+      entry.fixNotePosts = await publishReplies(`resolve#${cycle}`, notes, 'fixNote', cycle, digestOf)
     }
 
     lanes.reviewDone = true
@@ -4059,7 +4070,7 @@ log(`preflight: ${pinned.prRepo} ${pinned.branch}@${pinned.head.slice(0, 7)} tra
 // stays the state's to retry with the same adoptHead while the checkout sits at its `to`.
 const adoptBlocked = (entry) => waitingNow(entry, 'adopt:waiting',
   `before the adoption push of ${adoption.to.slice(0, 7)}, left unpublished`,
-  { adoptionHeld: { from: adoption.from, to: adoption.to } })
+  { adoptionHeld: { from: adoption.from, to: adoption.to } }, 'with the same adoptHead')
 // Runs before any watcher so the attempt is recorded first; only a PR head read-back proves the push.
 const adopt = async (entry) => {
   const { from, to, commits, paths } = adoption

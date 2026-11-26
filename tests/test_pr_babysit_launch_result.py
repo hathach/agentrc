@@ -432,6 +432,10 @@ class LaunchResultTest(unittest.TestCase):
         self.assertEqual(self.run_it(stopped('human-review', waiting=waiting))[1]['blockers'],
                          [launch_result.STALLED['human-review'], f"comment 4682479462 by HiFiPhile waits for a person's answer: {url}"])
         self.assertEqual(self.run_it(stopped('human-review', waiting=waiting))[1]['result']['waiting'], waiting, 'kept verbatim')
+        limit = {'observedAt': '2026-09-16T10:05:00Z', 'resetAt': None, 'secondary': True, 'error': 'gh api: HTTP 403'}
+        self.assertEqual(self.run_it(stopped('human-review', waiting=waiting, rateLimit=limit))[1]['blockers'],
+                         [launch_result.STALLED['human-review'], f"comment 4682479462 by HiFiPhile waits for a person's answer: {url}",
+                          launch_result.RATE_LIMITED_TOO], 'a rate limit met beside it is named after the comments')
         for reason in ('yielded', 'pr-merged'):
             self.assertEqual(self.run_it(stopped(reason))[1]['blockers'], [], reason)
 

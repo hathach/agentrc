@@ -79,11 +79,13 @@ person's waits in its place. An issue comment or review body waits until the aut
 issue comment or submits a non-empty review body after it, after an issue comment's last edit (GitHub's REST API gives a
 review no edit time); a reply quoting it answers it, another person's reply never.
 With any `reviewers`, harvest.py is read again just before the run writes, since the cycle's harvest may be minutes
-old: before the caller's settlements and the cycle's replies (once for them all), before a review- or CI-lane push (its
-fix notes follow on that reading) and before fix notes with no push. A comment waiting then stops `human-review` the
-same way, nothing of that write done; a push's verified fixes are left uncommitted, named in `uncommitted`, as a
-`fix-verification-failed` stop leaves them. A comment posted after that reading, or while CI is waited on with nothing
-left to write, is the next harvest's (the next cycle's, the next launch's or `merge.py`'s).
+old: before the caller's settlements and the cycle's replies (once for them all), before a review- or CI-lane push, and
+before fix notes, again after a push. A comment waiting then stops `human-review` the same way, nothing of that write
+done; a push's verified fixes are left uncommitted, named in `uncommitted`, as a `fix-verification-failed` stop leaves
+them, and a review-lane push's fix notes stay owed as offered, posted by a later launch whose validator names that push
+as their fix (#115). A comment posted after that reading, or while CI is waited on with nothing left to write, is the
+next harvest's (the next cycle's, the next launch's or `merge.py`'s). A rate limit met in the cycle a `human-review`
+stop ended rides on it as `rateLimit`, the comments and `uncommitted` kept.
 An unpublished `adoptHead` gets the same check from a harvest before its push: a stop there, `harvest-failed` and
 `github-rate-limited` included, leaves it unpushed, the state at its base and the checkout at it, and names it in
 `adoptionHeld`; a relaunch from the returned stateRef with the same `adoptHead` retries it. With `reviewers: []` neither

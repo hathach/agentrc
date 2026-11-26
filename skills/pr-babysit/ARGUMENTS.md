@@ -35,7 +35,8 @@ A key not listed here throws before anything runs.
   naming each in `waiting`, before anything is fixed, answered or pushed,
   an unpublished `adoptHead` included, which a harvest before its push checks
   (#591); harvest.py is read again just before each write of a cycle, a push
-  stopped there leaving its verified fixes uncommitted, named in `uncommitted`.
+  stopped there leaving its verified fixes uncommitted, named in `uncommitted`,
+  and fix notes stopped after a review-lane push owed to a later launch.
   No argument answers it: a relaunch passes an inline comment once its thread
   is resolved or the author or the posting account replied after it, and an
   issue comment or review body once one of them answered after it, after an
