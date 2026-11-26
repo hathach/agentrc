@@ -3606,6 +3606,8 @@ const runLanes = async (cycle, entry, lanes) => {
         claim: `${f.file}:${f.line} ${f.claim}`,
       })))
       if (lanes.prState) return prEnded(cycle, lanes.prState)
+      // A comment the CI judge's read found holds the fix writer too; one landing during the fix is the push's read.
+      if (lanes.judgeHumans) return humansHold(cycle, entry, lanes.judgeHumans)
       const verdict = await fixAndVerify(work, `${cycle}-review`, true)
       const { ok, fixes, owned, uncommitted, brief, rejected } = verdict
       entry.reviewFixes = fixes

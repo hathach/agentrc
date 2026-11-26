@@ -8363,6 +8363,14 @@ test('a person\'s waiting comment holds the CI judge, so a red CI is not re-run 
   assert.equal(clear.result.history[0].ciReran, 1, 'a clear read lets the judge re-run it')
 })
 
+test('a person\'s comment the CI judge\'s read finds before the review lane reaches its fixes holds the fix writer (#591)', async () => {
+  const { result, labels } = await run({ reviews: oneValid, ci: redWith(RIG).ci, judge: rerunAll, args: { autoPush: true, maxCycles: 2 },
+    reviewsWait: afterReviewLane('humans#1-judge'), humans: (label) => label.startsWith('humans#1-judge') ? [OBJECTION] : [] })
+  assert.deepEqual([result.reason, result.humanWaiting], ['human-review-pending', [OBJECTION]], labels.join(', '))
+  assert.ok(labels.indexOf('humans#1-judge') < labels.indexOf('reviews#1'), labels.join(', '))
+  assert.deepEqual(labels.filter(l => WRITES.test(l)), [], labels.join(', '))
+})
+
 test('a person\'s comment arriving while the CI lane reads its inventory and evidence holds the CI judge (#591)', async () => {
   const opts = { reviews: WAITING, ci: redWith(RIG).ci, judge: rerunAll, args: { autoPush: true, maxCycles: 1 } }
   for (const humans of [[OBJECTION], { error: 'gh api graphql: HTTP 502' }]) {
