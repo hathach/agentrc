@@ -3204,15 +3204,9 @@ const runLanes = async (cycle, entry, lanes) => {
       // asked of a bot or counted done over it. Its resolution, or an answer after it by the author or the posting account, lets a relaunch pass.
       if (r.waiting && r.waiting.length) return humanReview(cycle, r.waiting)
     }
-    // harvest.py read again just before this cycle writes, which may be minutes after the harvest above (#591); a clear
-    // reading stands until a fix's verification or a push has run, which take long.
-    let clear = false
-    const clearToWrite = async (what, held, extra) => {
-      if (clear) return null
-      const blocked = await waitingNow(entry, `waiting#${cycle}-${what}`, held, extra)
-      clear = !blocked
-      return blocked
-    }
+    // harvest.py read again just before each of this cycle's write batches, which may be minutes after the harvest above
+    // (#591); no reading outlives the write or relay after it, as a person may answer an earlier batch meanwhile.
+    const clearToWrite = (what, held, extra) => waitingNow(entry, `waiting#${cycle}-${what}`, held, extra)
     entry.bots = r === nobody
       ? { waitedMin: 0, since: null, clock: null, bots: [] }
       : settleBots(r)
@@ -3568,7 +3562,7 @@ const runLanes = async (cycle, entry, lanes) => {
       .map(id => ({ commentId: id, body: deferredOn(id).map(deferralLine).join('\n') }))
     if (deferralReplies.length > 0 && args.autoPush === true) {
       if (await ended('defer')) return prEnded(cycle, lanes.prState)
-      const blocked = await clearToWrite('replies', repliesHeld)
+      const blocked = await clearToWrite('defer', repliesHeld)
       if (blocked) return blocked
       entry.deferralPosts = await publishReplies(`defer#${cycle}`, deferralReplies, 'deferral', cycle, digestOf)
     }
@@ -3584,7 +3578,6 @@ const runLanes = async (cycle, entry, lanes) => {
       })))
       if (lanes.prState) return prEnded(cycle, lanes.prState)
       const verdict = await fixAndVerify(work, `${cycle}-review`, true)
-      clear = false
       const { ok, fixes, owned, uncommitted, brief, rejected } = verdict
       entry.reviewFixes = fixes
       // A rejected finding is held, its evidence on its decision, until the next harvest judges it again; a second rejection is the caller's.
@@ -3625,8 +3618,6 @@ const runLanes = async (cycle, entry, lanes) => {
           return stop(cycle, 'push-failed')
         }
         entry.reviewPush = push
-        // The push, hooks included, may take minutes: its fix notes read harvest.py again.
-        clear = false
         // Built here: the read-back proves only a text the workflow chose.
         const heldNow = heldComments()
         for (const f of validFindings) {
@@ -3721,7 +3712,6 @@ const runLanes = async (cycle, entry, lanes) => {
         text: `CI ${rf.check}: ${rf.firstError}`,
       })))
       const verdict = await fixAndVerify(work, `${cycle}-ci`)
-      clear = false
       const { ok, fixes, owned, brief } = verdict
       entry.ciFixes = fixes
       if (!verdict.dispatched && verdict.withheld.length) return withheldStop(cycle, 'CI', verdict.withheld)

@@ -3996,6 +3996,27 @@ test("a person's comment posted during the review-lane push stops the run before
   assert.equal(again.result.state.debt.some(([id]) => id === 1), false)
 })
 
+test("each write batch of a cycle reads waiting comments again, so none is posted over a person's comment that came after an earlier batch (#591)", async () => {
+  // A stateful reading: clear the first time, the objection on every later one.
+  const objectionAfterFirst = () => { let n = 0; return (l) => l.endsWith('.retry') || n++ === 0 ? [] : [OBJECTION] }
+  const launch = { reviews: oneValid, scope: ['src/a.c'], args: { autoPush: true, maxCycles: 3 } }
+  const stopped = await run({ ...launch, writeWaiting: (l) => l === 'waiting#1-resolve' ? [OBJECTION] : [] })
+  const sha = stopped.result.history[0].reviewPush.sha
+  // The offered fix note waits behind the refutation batch, whose reading may be minutes old by then.
+  const again = await resumeAt(stopped.result.state, { args: { autoPush: true, maxCycles: 3 }, writeWaiting: objectionAfterFirst(),
+    reviewsPerCycle: () => ({ findings: [finding({ verdict: 'stale', fixedBy: sha }), invalidFinding({ commentId: 2 })],
+      replies: [{ commentId: 2, body: 'not a bug: x' }], bots: 'reviewed' }) })
+  assert.deepEqual(again.labels.filter(l => /^(waiting|replies|defer|resolve)#/.test(l)), ['waiting#2-replies', 'replies#2', 'waiting#2-resolve'])
+  assert.equal(again.result.reason, 'human-review')
+  assert.match(again.result.detail, /; before this cycle's fix notes, none posted, each owed as offered$/)
+  assert.equal(debtOf(again.result, 1).attempt.how, 'fixNote', 'the note is still owed as offered')
+  // A deferral reply after a refutation batch reads again too.
+  const deferred = await run({ args: { autoPush: true, maxCycles: 3, deferrals: [deferral()] }, writeWaiting: objectionAfterFirst(),
+    reviews: { findings: [finding(), invalidFinding({ commentId: 2 })], replies: [{ commentId: 2, body: 'not a bug: x' }], bots: 'reviewed' } })
+  assert.deepEqual(deferred.labels.filter(l => /^(waiting|replies|defer|resolve)#/.test(l)), ['waiting#1-replies', 'replies#1', 'waiting#1-defer'])
+  assert.equal(deferred.result.reason, 'human-review')
+})
+
 test("a human-review stop keeps its comments and uncommitted fixes when the CI lane met a rate limit, the limit beside them (#591)", async () => {
   const limit = { error: 'gh pr checks: GraphQL: API rate limit exceeded', ...LIMIT, resetAt: at(60), secondary: false }
   const harvested = await run({ reviews: { ...oneValid, waiting: [OBJECTION] }, garble: limitedInventory, args: { autoPush: true, maxCycles: 4 } })
@@ -4010,7 +4031,7 @@ test("a human-review stop keeps its comments and uncommitted fixes when the CI l
   assert.deepEqual(beforePush.result.rateLimit, limit)
 })
 
-test("a person's comment posted after the cycle's harvest stops the run before its replies, read once for every batch (#591)", async () => {
+test("a person's comment posted after the cycle's harvest stops the run before its replies, read once for the batch (#591)", async () => {
   const reviews = { findings: [invalidFinding({ commentId: 2 })], replies: [{ commentId: 2, body: 'not a bug: x' }], bots: 'reviewed' }
   const { result, labels } = await run({ reviews, args: { autoPush: true, maxCycles: 3 }, writeWaiting: [OBJECTION] })
   assert.deepEqual([result.reason, result.waiting.map(w => w.commentId)], ['human-review', [OBJECTION.commentId]])
