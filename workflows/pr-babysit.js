@@ -2011,8 +2011,8 @@ const cycleSummary = (entry) => {
     : `${head}\n${mdTable(['Bot', 'Finding', 'Verdict', 'Outcome', 'Commit'], rows)}`
 }
 
-// beforePush runs at once before the push, the first step that can restart CI.
-const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => {}) => {
+// beforePush runs at once before the push, the first step that can restart CI; held() is the CI judge's hold of the people's comments.
+const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => {}, held = () => null) => {
   // Commit by explicit path: a stray edit on an unowned path must not ride along (one on an owned path is indistinguishable from ours). A protected path here means the scope filter broke.
   const sneaked = protectedRe ? owned.filter(f => protectedRe.test(f)) : []
   if (sneaked.length) {
@@ -2186,12 +2186,14 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
   }
 
   // #591: a comment posted while the lane fixed, ran the hooks or committed holds the push; the caller stops on `humans`.
-  const humans = githubLimit ? null : await readHumans(`humans#${cycle}-${what}`)
+  // The judge's hold, recorded before this read or while it was out, holds it too.
+  const read = held() || githubLimit ? null : await readHumans(`humans#${cycle}-${what}`)
   if (githubLimit) return { pass: false, committed: true, detail: 'not pushed: GitHub refused a call for a rate limit this cycle', sha }
+  const humans = held() || read
   if (humans.harvestError || humans.humanWaiting.length) {
-    const held = humans.harvestError ? `the people's comments went unread: ${humans.harvestError}` : `${humans.humanWaiting.length} comment(s) by a trusted person wait for an answer`
-    log(`push#${cycle}-${what}: committed but NOT pushed — ${held}`)
-    return { pass: false, committed: true, held: true, detail: `not pushed: ${held}`, sha, humans, ...(generatedPaths.length ? { generated: generatedPaths } : {}) }
+    const why = humans.harvestError ? `the people's comments went unread: ${humans.harvestError}` : `${humans.humanWaiting.length} comment(s) by a trusted person wait for an answer`
+    log(`push#${cycle}-${what}: committed but NOT pushed — ${why}`)
+    return { pass: false, committed: true, held: true, detail: `not pushed: ${why}`, sha, humans, ...(generatedPaths.length ? { generated: generatedPaths } : {}) }
   }
   beforePush()
   const push = await pushExact(sha, `push#${cycle}-${what}`)
@@ -2478,20 +2480,21 @@ const requestDeadline = (cr, clock) => {
 }
 // Whole seconds, as coderabbit_trigger.py reads them.
 const isoSeconds = (ms) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z')
-const triggerCodeRabbit = async (cycle, r, bots, ended) => {
+// held(): the CI judge's hold of the people's comments, checked just before each ask (#591).
+const triggerCodeRabbit = async (cycle, r, bots, ended, held) => {
   const cr = bots.bots.find(b => b.bot === 'coderabbit')
   if (!coderabbitRequired || !cr) return
   const manual = manualSkip(cr)
   // Once per head, whatever the outcome: a failed tick is not retried into a storm. Without the switch, only an earlier ask is waited on.
   if (coderabbitTrigger && coderabbitAskable(cr, reviewClock) === 'tick') {
-    if (await ended('crtrigger')) return
+    if (await ended('crtrigger') || held()) return
     const { t, outcome } = await relayTrigger(cycle, 'crtrigger', CRTRIGGER_SCRIPT, `Tick CodeRabbit's Trigger review box on PR #${args.pr}`, '',
       ['ticked', 'already', 'notSkipped', 'failed'])
     // notSkipped waits too: a review that started since the harvest, or a newer head, is for the next harvest to read.
     reviewClock.triggeredAt = outcome === 'failed' ? null : Number.isFinite(Date.parse(t.at)) ? t.at : r.observedAt
   }
-  if (limited(cr)) return requestCodeRabbit(cycle, r, cr, ended)
-  if (manual || reviewFailed(cr) || nothingToReview(cr)) await requestCodeRabbit(cycle, r, cr, ended)
+  if (limited(cr)) return requestCodeRabbit(cycle, r, cr, ended, held)
+  if (manual || reviewFailed(cr) || nothingToReview(cr)) await requestCodeRabbit(cycle, r, cr, ended, held)
   // Waits like a queued bot, its cap counted from the latest ask; working and reviewed go by settleBots alone. Any skip or
   // failed review after the ask is waited on too: the one asked about reads so until CodeRabbit starts again.
   const asks = [reviewClock.triggeredAt, reviewClock.request && reviewClock.request.at].filter(t => typeof t === 'string')
@@ -2554,7 +2557,7 @@ const retryLater = (cr, ms) => {
   // Never under a minute: a reset just behind the clock would otherwise run the next cycle at once.
   cr.retryWaitMs = Math.min(Math.max(60000, ms), HOUR_MS)
 }
-const requestCodeRabbit = async (cycle, r, cr, ended) => {
+const requestCodeRabbit = async (cycle, r, cr, ended, held) => {
   const asked = reviewClock.request
   const quota = limited(cr) && coderabbitTrigger
   if (asked && !quota) {
@@ -2569,7 +2572,7 @@ const requestCodeRabbit = async (cycle, r, cr, ended) => {
     if (cap > observed && asked.at !== null) waitAfter(cr, asked.at, r.observedAt)
     return retryLater(cr, Math.min(deadline, cap > observed ? cap : Infinity) - observed)
   }
-  if (await ended('crrequest')) return
+  if (await ended('crrequest') || held()) return
   const why = limited(cr) ? 'after its rate limit' : reviewFailed(cr) ? 'again, its review of the head failed'
     : nothingToReview(cr) ? 'in full, as it skipped the head with no files to review' : 'that it skipped for a manual review'
   const { t, outcome } = await relayTrigger(cycle, 'crrequest', CRTRIGGER_SCRIPT, `Ask CodeRabbit to review PR #${args.pr} ${why}`,
@@ -2609,8 +2612,9 @@ const requestGreptile = async (cycle, r, bots, lanes, ended) => {
   if (!g || !greptileRequired || (g.state !== 'absent' && g.state !== 'queued')) return null
   if (greptileTrigger && g.state === 'absent' && reviewClock.greptileAt === undefined) {
     g.done = false
-    // The script reads the PR open at the head itself, just before it posts; another lane's closure or rate limit holds it here.
-    if (bots.waitedMin < GREPTILE_GRACE_MIN || lanes.prState || githubLimit) return null
+    // The script reads the PR open at the head itself, just before it posts; another lane's closure, rate limit or the CI
+    // judge's hold of the people's comments holds it here.
+    if (bots.waitedMin < GREPTILE_GRACE_MIN || lanes.prState || githubLimit || lanes.judgeHumans) return null
     const { t, outcome } = await relayTrigger(cycle, 'greptile', GTRIGGER_SCRIPT, `Ask Greptile to review PR #${args.pr}`, '',
       ['requested', 'already', 'notOpen', 'failed', 'uncertain', 'ambiguous'])
     // Merged or closed ends the launch; open at another head stops: the head this run must have reviewed is not the PR's.
@@ -3251,9 +3255,12 @@ const runLanes = async (cycle, entry, lanes) => {
     entry.bots = r === nobody
       ? { waitedMin: 0, since: null, clock: null, bots: [] }
       : settleBots(r)
-    if (r !== nobody) await triggerCodeRabbit(cycle, r, entry.bots, ended)
+    // #591: a comment the CI judge's read found, before or during the asks, holds them.
+    if (lanes.judgeHumans) return humansHold(cycle, entry, lanes.judgeHumans)
+    if (r !== nobody) await triggerCodeRabbit(cycle, r, entry.bots, ended, () => lanes.judgeHumans)
     const unasked = r !== nobody ? await requestGreptile(cycle, r, entry.bots, lanes, ended) : null
     if (lanes.prState) return prEnded(cycle, lanes.prState)
+    if (lanes.judgeHumans) return humansHold(cycle, entry, lanes.judgeHumans)
     if (unasked) {
       log(`cycle ${cycle}: Greptile must review ${expectedHead.slice(0, 7)}, and its request ended ${unasked} — stopping, the head unreviewed`)
       return stop(cycle, 'greptile-unreviewed', { head: expectedHead, bots: entry.bots.bots.filter(b => b.bot === 'greptile').map(botOut),
@@ -3648,7 +3655,7 @@ const runLanes = async (cycle, entry, lanes) => {
       }
       if (owned.length > 0) {
         // Any push attempt may have restarted CI, a refused or unknown one included.
-        const push = await commitAndPush(cycle, 'review', owned, brief, () => { lanes.reviewPublishing = true })
+        const push = await commitAndPush(cycle, 'review', owned, brief, () => { lanes.reviewPublishing = true }, () => lanes.judgeHumans)
         if (push.humans) lanes.humansHeld = true
         if (!push.pass) return pushFailed(cycle, entry, 'reviewPushFailed', push)
         entry.reviewPush = push

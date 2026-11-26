@@ -8382,6 +8382,30 @@ test('a person\'s comment the CI judge\'s read finds while the review lane check
   assert.equal(result.state.pending, null)
 })
 
+test('a person\'s comment the CI judge\'s read finds while a review push reads the people\'s comments holds the push (#591)', async () => {
+  const trace = []
+  let judged = false
+  const { result, labels } = await run({ reviews: oneValid, ci: redWith(RIG).ci, judge: rerunAll, args: { autoPush: true, maxCycles: 2 }, trace,
+    // The judge's read comes back held while the push's own read is out, which then comes back clear.
+    humans: async (label) => {
+      if (label.startsWith('humans#1-judge')) {
+        for (let i = 0; i < 1000 && !trace.some(c => c.label.startsWith('humans#1-review')); i++) await tick()
+        judged = true
+        return [OBJECTION]
+      }
+      if (label.startsWith('humans#1-review')) for (let i = 0; i < 1000 && !judged; i++) await tick()
+      for (let i = 0; i < 20; i++) await tick()
+      return []
+    } })
+  const why = labels.join(', ')
+  assert.deepEqual([result.reason, result.humanWaiting], ['human-review-pending', [OBJECTION]], why)
+  assert.ok(labels.includes('humans#1-review') && judged, why)
+  assert.deepEqual(labels.filter(l => /^(push|resolve)#/.test(l)), [], `${why}: nothing pushed over it`)
+  assert.deepEqual(result.state.pending, { sha: shaFor(1), parent: HEAD, lane: 'review', stage: 'push-held' }, `${why}: the commit is the caller's to adopt`)
+  assert.equal(result.history[0].reviewPushFailed.held, true, why)
+  assert.equal(result.state.expectedHead, HEAD, why)
+})
+
 test('a person\'s comment arriving while the CI lane reads its inventory and evidence holds the CI judge (#591)', async () => {
   const opts = { reviews: WAITING, ci: redWith(RIG).ci, judge: rerunAll, args: { autoPush: true, maxCycles: 1 } }
   for (const humans of [[OBJECTION], { error: 'gh api graphql: HTTP 502' }]) {
@@ -10362,6 +10386,24 @@ test('without the switch Greptile is harvested only; the switch needs autoPush a
   const auto = await run({ args: { reviewers: ['greptile'], greptileTrigger: true, maxCycles: 8 }, minutesPerCycle: 2, reviews: quiet([absent('greptile')]) })
   assert.equal(auto.result.reason, 'greptile-unreviewed')
   assert.deepEqual(gAsks(auto.labels), ['greptile#2'])
+})
+
+test('a person\'s comment the CI judge\'s read finds before the review lane asks a bot to review holds the ask (#591)', async () => {
+  const red = { ci: redWith(RIG).ci, judge: rerunAll }
+  const cr = { ...red, args: { coderabbitTrigger: true, maxCycles: 2 }, reviews: quiet([skippedCr()]) }
+  // Greptile is asked two minutes into the head, on a launch resumed from one that yielded in its grace.
+  const yielded = await run({ args: { ...G, greptileTrigger: true, maxCycles: 6, yieldAfterCycle: true }, reviews: silentG() })
+  const gt = { ...red, args: { ...G, greptileTrigger: true, maxCycles: 6, yieldAfterCycle: true, state: yielded.result.state }, clockOffset: 3, reviews: silentG() }
+  for (const [bot, opts, cycle, ask] of [['coderabbit', cr, 1, 'crtrigger#1'], ['greptile', gt, 2, 'greptile#2']]) {
+    const judge = `humans#${cycle}-judge`
+    const { result, labels } = await run({ ...opts, reviewsWait: afterReviewLane(judge), humans: (label) => label.startsWith(judge) ? [OBJECTION] : [] })
+    const why = `${bot}: ${labels.join(', ')}`
+    assert.deepEqual([result.reason, result.humanWaiting], ['human-review-pending', [OBJECTION]], why)
+    assert.ok(labels.indexOf(judge) >= 0 && labels.indexOf(judge) < labels.indexOf(`reviews#${cycle}`), why)
+    assert.deepEqual(labels.filter(l => WRITES.test(l)), [], `${why}: nothing asked over it`)
+    const clear = await run(opts)
+    assert.ok(clear.labels.includes(ask), `${bot}: asked once the reads are clear: ${clear.labels.join(', ')}`)
+  }
 })
 
 test('a rate-limited Greptile is not waited for: the pass names it unreviewed, beside a CodeRabbit limit waited out', async () => {
