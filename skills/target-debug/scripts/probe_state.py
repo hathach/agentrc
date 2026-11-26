@@ -13,7 +13,9 @@ Probe observations only: it never says whether the application works.
 The board's HIL config entry (the target-debug SKILL.md's HIL config table) gives the
 backend and probe: flasher `jlink` (args exactly `-device NAME`; --interface and
 --speed are the caller's) or `openocd` (args are its -f/-c arguments; vid_pid pins
-discovery). Any other flasher, a missing serial or an ambiguous board is refused.
+discovery). An openocd board agentrc's registry gives a `debug` route on that probe
+(hil_debug_cfg) starts openocd with its `openocd` arguments instead. Any other flasher, a
+missing serial or an ambiguous board is refused.
 
 The caller holds the project's board lock for the whole run (target-debug, Delegated
 sessions); this script takes no lock and cannot check that one is held. The
@@ -190,6 +192,29 @@ def hil_flasher(path, board):
     if flasher['name'] == 'stlink' and 'args' in flasher:
         raise ValueError(f"--board {board}: a stlink entry's args are not openocd's")
     return flasher
+
+
+def _interface_cfgs(words):
+    return [b for a, b in zip(words, words[1:]) if a == '-f' and b.startswith('interface/')]
+
+
+def hil_debug_cfg(path, board, flasher):
+    """The registry's `debug.openocd` of an openocd `flasher`'s board when it reaches that probe (the same
+    interface cfgs, and no adapter serial, driver or vid_pid of its own), else None: flasher.args stays the
+    route. A bench board's or a roster's own `debug` is never taken, since hil_boards validates only the
+    registry's (an esp32 route names another tool and probe)."""
+    hb = hil_boards()
+    try:
+        reg = hb.registry().get(hb.board(path, board, parked=False).get('probe'))
+    except (ImportError, OSError, ValueError) as e:
+        raise ValueError(f'--hil-config {path} --board {board}: {e}')
+    if not reg or 'debug' not in reg:
+        return None
+    words = shlex.split(reg['debug']['openocd'])
+    if _interface_cfgs(words) != _interface_cfgs(shlex.split(flasher['args'])) or any(
+            re.match(r'\s*adapter\s+(serial|driver|usb\s+vid_pid)\b', w) for w in words):
+        return None
+    return reg['debug']['openocd']
 
 
 def hil_jlink_device(board, flasher):
@@ -998,8 +1023,8 @@ def resolve(a, p):
             shlex.split(flasher['args'])
         except ValueError as e:
             raise ValueError(f"--board {a.board}: flasher.args {flasher['args']!r}: {e}")
-        return route, {'probe': flasher['uid'], 'cfg': flasher['args']}, OpenOCD(flasher['uid'], flasher['args'],
-                                                         vid_pid and vid_pid.strip())
+        cfg = hil_debug_cfg(a.hil_config, a.board, flasher) or flasher['args']
+        return route, {'probe': flasher['uid'], 'cfg': cfg}, OpenOCD(flasher['uid'], cfg, vid_pid and vid_pid.strip())
     except ValueError as e:
         p.error(str(e))
 

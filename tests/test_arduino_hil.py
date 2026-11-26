@@ -2229,7 +2229,7 @@ class Manual(Base):
 
     def test_gdb_needs_a_debug_route(self):
         args = self.held(cmd='gdb', build_record='r.json', sketch='echo', ex=[], timeout=5)
-        with self.assertRaisesRegex(H.Refused, 'rig_jlink has no debug.openocd'):
+        with self.assertRaisesRegex(H.Refused, r"neither agentrc's board registry nor .* gives rig_jlink a debug route"):
             H.op_gdb(args, {**self.board('rig_jlink'), 'debug': {}}, self.dir, None, None)
 
     def test_foreign_or_missing_hold_refused(self):

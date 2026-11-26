@@ -1684,7 +1684,8 @@ def gdb_argv(name, board, elf, commands):
 
 def op_gdb(args, board, run_dir, tracker, manifest):
     if not board.get('debug', {}).get('openocd'):
-        raise Refused(f'{args.board} has no debug.openocd in {args.roster}')
+        raise Refused(f"neither agentrc's board registry nor {args.roster} gives {args.board} a debug route "
+                      f'(debug.openocd)')
     meta, image, _ = admit_sketch(args, args.sketch, run_dir, manifest, True)
     dbg, uid, mode = board['debug'], image['uid'], dut_port_debug_mode(board)
     if mode is not None and uid.lower() != dbg['uid'].lower():
