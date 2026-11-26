@@ -12,7 +12,7 @@ import tempfile
 from pathlib import Path
 
 FILES = ()  # loads and launches nothing by path (hil_load.py)
-# agentrc_pin.py's docstring names all but ci, which consumers use; its next change lists ci too
+# agentrc_pin.py's docstring names all but ci, which consumers use
 PUBLIC = frozenset({"ci", "config", "identity", "load", "stage", "conformance", "PinError"})
 
 
