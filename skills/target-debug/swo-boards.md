@@ -83,7 +83,8 @@ on hardware before its row can cite the fixture.
     (`stlink_usb_trace_read`, unchanged upstream), with no 2 KiB unit on its side.
   - With exception trace and PC sampling together, inside a packet next to a sleep PC sample and an exception packet,
     anywhere in the stream, at 4, 8 and 16 MHz on J12M3 and J17 alike (J17 at 8 MHz: 20 per 1.28 MB). The same
-    sources on stm32f407disco through J-Link lose nothing (1.14 MB); target and probe are not told apart here (#306).
+    sources on stm32f407disco through J-Link lose nothing (1.14 MB). Not pursued (#306); another clock setup or probe
+    needs its own measurement.
 - OpenOCD's `-pin-freq 0` picks 24 MHz, not a divisor of 400 MHz: always name the rate.
 
 ## ra6m5_ek
