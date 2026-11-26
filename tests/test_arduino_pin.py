@@ -672,6 +672,18 @@ class Conformance(Consumer):
                 f'{hil}/names.py:1: uses agentrc_pin.ci, internal to the bootstrap',
                 '.claude/test/test_agentrc_pin.py:4: uses agentrc_pin._selection, internal to the bootstrap'])
 
+    def test_an_alias_counts_only_in_the_scope_its_import_binds(self):
+        self.script('hil-contract/scripts/gpio.py',
+                    'def setup():\n    import agentrc_pin as pin\n    return pin.load("x")\n\n\n'
+                    'def find_gpio(pin):\n    return pin.number\n')
+        self.script('hil-contract/scripts/outer.py',
+                    'import agentrc_pin as boot\n\n\ndef f():\n    return boot._selection()\n\n\n'
+                    'def g(boot):\n    return boot.x, [boot.y for boot in ()]\n')
+        conform = self.pin.load(CONFORMANCE)
+        hil = self.root / '.claude/skills/hil-contract/scripts'
+        self.assertEqual(conform._internal_uses(hil / 'gpio.py'), [])
+        self.assertEqual(conform._internal_uses(hil / 'outer.py'), [(5, '_selection')])
+
     def test_the_round_trip_refuses_a_module_from_outside_the_staged_copy(self):
         outside = self.tmp / 'outside'
         outside.mkdir()
