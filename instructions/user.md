@@ -134,6 +134,8 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   issue or comment); those require authorization from the user.
 - "Start a session at <checkout> [ada] [to <task>]": run
   `claude-start <checkout> [ada] [--task '<task>']` and report its output.
+- Put a prompt or command you suggest I send alone in its own message or code
+  block, with no @mention.
 - After each implementation step of a plan, send the other agent that step's
   diff for review and suggestions, and address them before starting the next
   step.
