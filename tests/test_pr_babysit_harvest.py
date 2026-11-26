@@ -897,16 +897,39 @@ class Waiting(unittest.TestCase):
         self.assertEqual(asked, 0, 'nor is a pending review')
         _, asked = self.read([], [said(61, self.MAINTAINER, EVENT)])
         self.assertEqual(asked, 1)
+        _, asked = self.read([], [said(61, self.VIEWER, EVENT)])
+        self.assertEqual(asked, 1, 'the posting account is learnt from the GraphQL read, so its own comment asks it too')
 
     def test_a_resolved_thread_or_one_whose_last_word_is_not_a_persons_does_not_wait(self):
         root = inline(60, self.MAINTAINER, '2026-11-20T10:00:00Z')
         self.assertEqual(self.ids([root], resolved={60: True}), [], 'resolved')
-        for name, who in (('the author', self.AUTHOR), ('the posting account', self.VIEWER), ('a bot', self.BOT)):
+        for name, who in (('the author', self.AUTHOR), ('the posting account', self.VIEWER)):
             with self.subTest(name):
                 answered = [root, inline(61, who, '2026-11-20T11:00:00Z', reply_to=60)]
                 self.assertEqual(self.ids(answered, resolved={60: False}), [])
         again = [root, inline(61, self.AUTHOR, '2026-11-20T11:00:00Z', reply_to=60), inline(62, self.MAINTAINER, '2026-11-20T12:00:00Z', reply_to=60)]
         self.assertEqual(self.ids(list(reversed(again)), resolved={60: False}), [('review', 62)], 'the person spoke again: the last word is theirs')
+        other = [root, inline(61, person('y', 'MEMBER'), '2026-11-20T11:00:00Z', reply_to=60)]
+        self.assertEqual(self.ids(other, resolved={60: False}), [('review', 61)], "another person's reply waits in its place")
+
+    def test_a_bots_reply_answers_no_persons_inline_comment(self):
+        """A bot that answers replies in its own thread (CodeRabbit does) leaves a person's objection there waiting."""
+        thread = [inline(60, self.BOT, '2026-11-20T10:00:00Z', body='nit'), inline(61, self.MAINTAINER, '2026-11-20T11:00:00Z', reply_to=60, body='No, keep it'),
+                  inline(62, self.BOT, '2026-11-20T11:01:00Z', reply_to=60, body='Understood')]
+        self.assertEqual(self.ids(thread, resolved={60: False}), [('review', 61)])
+        answered = [*thread, inline(63, self.VIEWER, '2026-11-20T12:00:00Z', reply_to=60, body='Kept')]
+        self.assertEqual(self.ids(answered, resolved={60: False}), [], 'the posting account answered after it')
+
+    def test_an_outdated_comment_reads_its_original_line(self):
+        outdated = dict(inline(60, self.MAINTAINER, EVENT), line=None, original_line=9)
+        self.assertEqual([w['line'] for w in self.read([outdated])[0]], [9])
+
+    def test_replies_whose_first_comment_is_gone_are_one_thread(self):
+        """GitHub keys a thread whose first comment was deleted by a comment still there: any of them reads its resolution."""
+        replies = [inline(61, self.MAINTAINER, '2026-11-20T11:00:00Z', reply_to=60), inline(62, self.VIEWER, '2026-11-20T12:00:00Z', reply_to=60)]
+        self.assertEqual(self.ids(replies, resolved={61: False}), [], 'one thread, answered by the posting account')
+        self.assertEqual(self.ids(replies[:1], resolved={61: False}), [('review', 61)])
+        self.assertEqual(self.ids(replies[:1], resolved={61: True}), [], 'resolved, keyed by the reply GraphQL names first')
 
     def test_a_person_replying_in_a_bots_thread_waits(self):
         thread = [inline(60, self.BOT, '2026-11-20T10:00:00Z', body='nit'), inline(61, self.MAINTAINER, '2026-11-20T11:00:00Z', reply_to=60, body='No, keep it')]
@@ -922,7 +945,7 @@ class Waiting(unittest.TestCase):
         self.assertEqual(self.ids([], [ask], [body]), [('issue', 70), ('review-body', 71)])
         for name, issue, reviews, want in (
                 ('an issue comment by the author after both', [said(72, self.AUTHOR, '2026-11-20T11:00:00Z')], [], []),
-                ('a review by the posting account after both', [], [reviewed(73, self.VIEWER, '2026-11-20T11:00:00Z')], []),
+                ('a review by the posting account after both', [], [reviewed(73, self.VIEWER, '2026-11-20T11:00:00Z', 'Done')], []),
                 ('an answer between them', [said(72, self.AUTHOR, '2026-11-20T10:01:00Z')], [], [('review-body', 71)]),
                 ('an answer before both', [said(72, self.AUTHOR, '2026-11-20T09:00:00Z')], [], [('issue', 70), ('review-body', 71)]),
                 ('a pending review by the author', [], [reviewed(73, self.AUTHOR, '2026-11-20T11:00:00Z', state='PENDING')], [('issue', 70), ('review-body', 71)]),
@@ -931,6 +954,34 @@ class Waiting(unittest.TestCase):
                  [('issue', 70), ('review-body', 71), ('issue', 72)])):
             with self.subTest(name):
                 self.assertEqual(self.ids([], [ask, *issue], [body, *reviews]), want)
+
+    def test_the_runs_own_posts_answer_nobody(self):
+        """pr-babysit posts as the gh account: its bot requests, its quoted replies to bot comments and the empty review GitHub
+        wraps each thread reply in come after a person's comment without answering it."""
+        ask = said(70, self.MAINTAINER, '2026-11-20T10:00:00Z')
+        body = reviewed(71, self.MAINTAINER, '2026-11-20T10:05:00Z', 'Changes needed', state='CHANGES_REQUESTED')
+        both = [('issue', 70), ('review-body', 71)]
+        bot_comment = 'https://github.com/o/r/pull/7#issuecomment-50'
+        for name, issue, reviews in (
+                ('a CodeRabbit request', [said(72, self.VIEWER, '2026-11-20T11:00:00Z', '@coderabbitai review')], []),
+                ('a full CodeRabbit request', [said(72, self.VIEWER, '2026-11-20T11:00:00Z', '@coderabbitai full review')], []),
+                ('a Greptile request', [said(72, self.VIEWER, '2026-11-20T11:00:00Z', '@greptileai')], []),
+                ("the author's own request", [said(72, self.AUTHOR, '2026-11-20T11:00:00Z', '@CodeRabbitAI review')], []),
+                ("a reply to a bot's comment", [said(72, self.VIEWER, '2026-11-20T11:00:00Z', f'> {bot_comment}\n\nFixed in abc.')], []),
+                ('the empty review around a thread reply', [], [reviewed(73, self.VIEWER, '2026-11-20T11:00:00Z')])):
+            with self.subTest(name):
+                self.assertEqual(self.ids([], [ask, *issue], [body, *reviews]), both)
+        quoting = said(72, self.VIEWER, '2026-11-20T11:00:00Z', f"> {ask['html_url']}\n\nKept as asked.")
+        self.assertEqual(self.ids([], [ask, quoting], [body]), [('review-body', 71)], 'a reply quoting the comment answers that one only')
+        self.assertEqual(self.ids([], [ask, said(72, self.VIEWER, '2026-11-20T11:00:00Z', 'Kept as asked, @coderabbitai')], [body]), [],
+                         'a mention later in the body is no bot request')
+
+    def test_a_bot_authors_logins_match_across_the_apis(self):
+        """GraphQL names a Bot author without the `[bot]` REST gives it: dependabot's comment answers on its own PR."""
+        ask = said(70, self.MAINTAINER, '2026-11-20T10:00:00Z')
+        answer = said(71, person('dependabot[bot]', 'NONE', 'Bot'), '2026-11-20T11:00:00Z', 'Rebased')
+        with mock.patch.object(harvest, 'threads', return_value=('dependabot', 'babysitter', {})):
+            self.assertEqual(harvest.waiting('o/r', 7, [], [ask, answer], []), [])
 
     def test_an_issue_comment_edited_after_its_answer_waits_again(self):
         answer = said(71, self.AUTHOR, '2026-11-20T11:00:00Z')

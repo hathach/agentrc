@@ -51,14 +51,20 @@ comment's body is left out like the two below, bodyOmitted "carried": the caller
 
 waiting lists the comments by people that still wait for an answer (#591), the human's to settle and never a bot
 finding: by an account whose type is not Bot, whose author_association is OWNER, MEMBER or COLLABORATOR, and that is
-neither the PR's author nor the authenticated gh account (the one pr-babysit posts as). An inline comment waits when
-it is the last comment of its review thread (a reply in a bot's thread too) and the thread is unresolved, read through
-GraphQL reviewThreads, keyed by each thread's first comment; a thread GraphQL does not list reads unresolved. An issue
-comment or a non-empty submitted review body waits while neither the PR's author nor that account has posted an issue
-comment or submitted a review after it, after an issue comment's last edit (`updated_at`; a review gives no edit time).
-Each record: kind, commentId, author, authorAssociation, path and line (null but for an inline comment), createdAt, url,
-digest (sha256 of the body, 12 hex) and excerpt (its first EXCERPT characters, whitespace folded). GraphQL is asked
-only when such a person left a comment at all.
+neither the PR's author nor the authenticated gh account (the one pr-babysit posts as), logins compared without a
+`[bot]` suffix, which GraphQL leaves out. An answer comes from the author or that account, and the run's own posts are
+none: no request to a bot (a body opening `@coderabbitai` or `@greptileai`), no empty review body (what GitHub wraps a
+thread reply in) and no reply quoting another comment's URL (pr-reply's `> <url>` first line). An inline comment waits
+while it is the latest comment by such a person in its review thread, that thread is unresolved and neither the author
+nor that account replied after it; a bot's reply answers nothing, and another person's waits in its place. Threads are
+read through GraphQL reviewThreads, each keyed by its first comment; a thread GraphQL does not list reads unresolved,
+and a reply whose first comment is gone joins the thread of that comment's id. An issue comment or a non-empty
+submitted review body waits until the author or that account posts an issue comment or submits a non-empty review body
+after it, after an issue comment's last edit (`updated_at`; a review gives no edit time), one quoting its own URL
+included. Each record: kind, commentId, author, authorAssociation, path and line (null but for an inline comment; an
+outdated one's original_line), createdAt, url, digest (sha256 of the body, 12 hex) and excerpt (its first EXCERPT
+characters, whitespace folded). GraphQL is asked only when an owner, member or collaborator other than a bot commented
+at all, the author or the gh account included: who those two are is learnt from that read.
 
 --probe prints only headSha, observedAt, headEventAt, headEventEvidence, bots and fingerprint, sealed (facts.sealed): what a workflow waiting out
 CodeRabbit's rate limit compares with its last full harvest (#359). It reads the waiting comments too, which its
@@ -137,6 +143,9 @@ GREPTILE_ERROR = 'Greptile encountered an error while reviewing this PR'
 # The people whose comment waits for an answer (#591), and how much of its body a record shows.
 TRUSTED = ('OWNER', 'MEMBER', 'COLLABORATOR')
 EXCERPT = 200
+# The run's own posts, which answer no person: a request to a bot, and pr-reply's reply quoting the comment it answers.
+BOT_ASK = re.compile(r'\s*@(?:coderabbitai|greptileai)\b', re.I)
+REPLY_QUOTE = re.compile(r'> (\S+)\n\n')
 THREADS_QUERY = ('query($owner: String!, $name: String!, $n: Int!, $after: String) { viewer { login } '
                  'repository(owner: $owner, name: $name) { pullRequest(number: $n) { author { login } '
                  'reviewThreads(first: 100, after: $after) { pageInfo { hasNextPage endCursor } '
@@ -685,17 +694,31 @@ def threads(repo, n):
         after = page['pageInfo']['endCursor']
 
 
+def login(c):
+    """An account's login as both APIs name it: GraphQL gives a Bot's without the `[bot]` REST adds."""
+    return ((c.get('user') or {}).get('login') or '').lower().removesuffix('[bot]')
+
+
+def quoted(body):
+    """The URL a reply quotes on its first line as pr-reply writes it, else None."""
+    m = REPLY_QUOTE.match(body or '')
+    return m and m[1]
+
+
 def waiting(repo, n, inline, issue, reviews):
     """The comments by people still waiting for an answer (#591), oldest first; GraphQL is read only when a trusted
-    person commented at all."""
+    account commented at all."""
     bodies = [r for r in reviews if (r.get('body') or '').strip() and r.get('state') in REVIEW_SUBMITTED]
     if not any(map(trusted, [*inline, *issue, *bodies])):
         return []
     author, viewer, resolved = threads(repo, n)
-    answerers = {x.lower() for x in (author, viewer) if x}
+    answerers = {x.lower().removesuffix('[bot]') for x in (author, viewer) if x}
 
     def person(c):
-        return trusted(c) and (c['user']['login'] or '').lower() not in answerers
+        return trusted(c) and login(c) not in answerers
+
+    def answerer(c):
+        return login(c) in answerers
 
     got = []
     # A thread is its first comment and every reply to it; GitHub points a reply at the first comment, any chain followed.
@@ -706,22 +729,27 @@ def waiting(repo, n, inline, issue, reviews):
         while root.get('in_reply_to_id') in by_id and root['in_reply_to_id'] not in seen:
             root = by_id[root['in_reply_to_id']]
             seen.add(root['id'])
-        roots.setdefault(root['id'], []).append(c)
-    for root, thread in roots.items():
-        last = max(thread, key=lambda c: (stamp(c['created_at']), c['id']))
-        if person(last) and not resolved.get(root, False):
+        gone = root.get('in_reply_to_id')
+        roots.setdefault(gone if gone and gone not in by_id else root['id'], []).append(c)
+    for thread in roots.values():
+        thread.sort(key=lambda c: (stamp(c['created_at']), c['id']))
+        said = [i for i, c in enumerate(thread) if person(c)]
+        # GraphQL keys a thread by its first comment still there, which is one of these.
+        if not said or any(resolved.get(c['id'], False) for c in thread):
+            continue
+        last = thread[said[-1]]
+        if not any(map(answerer, thread[said[-1] + 1:])):
             got.append(waiting_record('review', last, last.get('body'), last['created_at'], last.get('path'),
                                       last.get('line') or last.get('original_line')))
-    # What answers an issue comment or a review body: an issue comment or a submitted review by the author or the gh account.
-    answers = [stamp(c['created_at']) for c in issue if (c['user']['login'] or '').lower() in answerers]
-    answers += [stamp(r['submitted_at']) for r in reviews
-                if (r['user']['login'] or '').lower() in answerers and r.get('state') in REVIEW_SUBMITTED and r.get('submitted_at')]
-    latest_answer = max(answers, default=None)
+    # What answers an issue comment or a review body: an issue comment or a non-empty review body by the author or the
+    # gh account, never a request to a bot, and a reply quoting a comment only for that comment.
+    answers = [(stamp(c['created_at']), quoted(c.get('body'))) for c in issue if answerer(c) and not BOT_ASK.match(c.get('body') or '')]
+    answers += [(stamp(r['submitted_at']), quoted(r['body'])) for r in bodies if answerer(r) and r.get('submitted_at')]
     # An issue comment needs an answer after its last edit (`updated_at`, which also moves on changes that are no edit:
     # an extra stop, never a missed one); REST gives a review no edit time, so its body counts from its submission.
-    for kind, c, body, at, said in [*[('issue', c, c.get('body'), c['created_at'], c['updated_at']) for c in issue],
-                                    *[('review-body', r, r['body'], r['submitted_at'], r['submitted_at']) for r in bodies]]:
-        if person(c) and (latest_answer is None or latest_answer <= stamp(said)):
+    for kind, c, body, at, edited in [*[('issue', c, c.get('body'), c['created_at'], c['updated_at']) for c in issue],
+                                      *[('review-body', r, r['body'], r['submitted_at'], r['submitted_at']) for r in bodies]]:
+        if person(c) and not any(when > stamp(edited) and quoted in (None, c['html_url']) for when, quoted in answers):
             got.append(waiting_record(kind, c, body, at))
     return sorted(got, key=lambda w: (stamp(w['createdAt']), w['commentId']))
 
