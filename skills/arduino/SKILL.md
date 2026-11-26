@@ -29,7 +29,7 @@ retries, recovery) apply unchanged; these scripts load its `hil_*` scripts throu
   then a consumer that fails its conformance check (`scripts/pin_conformance.py`'s `problems()` docstring, loaded
   from the selected closure). A consumer's own tests keep only its configuration and profile wiring.
   A consumer reads its own sources itself (`ast`), never through bootstrap internals: conformance refuses any
-  `agentrc_pin` name outside the public ones its docstring lists.
+  `agentrc_pin` name outside `pin_conformance.py`'s `PUBLIC` (the docstring's list plus `ci()`).
 - `.claude/skills/build/scripts/check_build.py`: the build profile (board table with CI's FQBNs from
   adafruit/ci-arduino `all_platforms.py` plus the rig boards, representatives per family, source classification,
   HIL sketches per role, VID:PID adapter, extra dependencies) and `main()`, which binds it to `arduino_build.py`.
