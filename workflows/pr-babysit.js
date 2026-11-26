@@ -2999,7 +2999,7 @@ const ciLaneRun = async (cycle, lanes, entry) => {
 // Returns null to re-arm, or the final result.
 const runCycle = async (cycle, entry) => {
   // prState: 'merged' or 'closed' once read so, 'unread' when a read before a write failed; the review lane then stops at its next step.
-  // humansHeld: a review-lane push held by its read of the people's comments, which holds the CI judge too (#591).
+  // humansHeld: a review-lane push or post held by its read of the people's comments, which holds the CI judge too (#591).
   // judgeHumans: the CI judge's own read, when it did not come back clear.
   const lanes = { reviewDone: false, reviewPublishing: false, ended: false, prState: null, humansHeld: false, judgeHumans: null }
   const verdict = await runLanes(cycle, entry, lanes)
@@ -3176,6 +3176,12 @@ const pushFailed = (cycle, entry, key, push) => {
 const runLanes = async (cycle, entry, lanes) => {
   let ciPromise = null
   const ended = (what) => prGate(lanes, `${cycle}-${what}`)
+  // #591: a hold before a review-lane post holds the CI judge too, whose own clear read may land after it.
+  const heldBefore = async (what) => {
+    const waits = humansHold(cycle, entry, await readHumans(`humans#${cycle}-${what}`))
+    if (waits !== undefined) lanes.humansHeld = true
+    return waits
+  }
   // Settle the CI lane in finally so no CI agent outlives the workflow.
   try {
     entry.lane = lane
@@ -3574,7 +3580,7 @@ const runLanes = async (cycle, entry, lanes) => {
       // Keep the receipt first: a cycle that dies after posting must still say what went out.
       if (await ended('replies')) return prEnded(cycle, lanes.prState)
       // #591: the cycle's read ran beside the validator; a comment posted while it judged holds the replies too.
-      const waits = humansHold(cycle, entry, await readHumans(`humans#${cycle}-replies`))
+      const waits = await heldBefore('replies')
       if (waits !== undefined) return waits
       entry.refutedPosts = await publishReplies(`replies#${cycle}`, freshReplies, 'refutation', cycle, digestOf)
       entry.sonarMarked = await settleSonar(cycle, entry, ended)
@@ -3585,7 +3591,7 @@ const runLanes = async (cycle, entry, lanes) => {
       .map(id => ({ commentId: id, body: deferredOn(id).map(deferralLine).join('\n') }))
     if (deferralReplies.length > 0 && args.autoPush === true) {
       if (await ended('defer')) return prEnded(cycle, lanes.prState)
-      const waits = humansHold(cycle, entry, await readHumans(`humans#${cycle}-defer`))
+      const waits = await heldBefore('defer')
       if (waits !== undefined) return waits
       entry.deferralPosts = await publishReplies(`defer#${cycle}`, deferralReplies, 'deferral', cycle, digestOf)
     }
@@ -3662,7 +3668,7 @@ const runLanes = async (cycle, entry, lanes) => {
         if (d && !d.attempt && repair) d.attempt = { body, how: 'fixNote', digest: digestOf.get(commentId), repair, held: true }
       }
       // #591: a comment posted while the validator judged or the repair was pushed holds its fix notes too, restored ones included.
-      const waits = humansHold(cycle, entry, await readHumans(`humans#${cycle}-resolve`))
+      const waits = await heldBefore('resolve')
       if (waits !== undefined) return waits
       entry.fixNotePosts = await publishReplies(`resolve#${cycle}`, [...answerable.values()], 'fixNote', cycle, digestOf)
     }

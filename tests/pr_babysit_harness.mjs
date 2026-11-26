@@ -8489,6 +8489,26 @@ test('a person\'s comment arriving while the validator judges holds its refutati
   }
 })
 
+test('a refutation or deferral held for a person\'s comment holds a CI judge whose clear read lands after it (#591)', async () => {
+  const refuting = { findings: [invalidFinding()], replies: [{ commentId: 1, body: 'not a bug' }], bots: 'reviewed' }
+  for (const [what, opts] of [['replies', { reviews: refuting }], ['defer', { reviews: oneValid, args: { deferrals: [deferral()] } }]]) {
+    const trace = []
+    const { result, labels } = await run({ ...opts, ci: redWith(RIG).ci, judge: rerunAll, args: { autoPush: true, maxCycles: 2, ...opts.args }, trace,
+      // Each read waits for the other to be out: the judge's comes back clear only after the hold.
+      humans: async (label) => {
+        if (label.startsWith('humans#1-judge')) await afterReviewLane(`humans#1-${what}`)(trace)
+        if (!label.startsWith(`humans#1-${what}`)) return []
+        for (let i = 0; i < 1000 && !trace.some(c => c.label.startsWith('humans#1-judge')); i++) await tick()
+        return [OBJECTION]
+      } })
+    const why = `${what}: ${labels.join(', ')}`
+    assert.ok(labels.includes('humans#1-judge'), why)
+    assert.equal(result.reason, 'human-review-pending', why)
+    assert.deepEqual(labels.filter(l => l.startsWith('ci:judge#')), [], why)
+    assert.equal(result.history[0].ciReran, undefined, why)
+  }
+})
+
 test('a fix note restored from a held launch is posted only after a fresh read of the people\'s comments (#594)', async () => {
   const trace = []
   const first = await run({ reviews: oneValid, trace, humans: () => trace.some(c => c.label.startsWith('push#')) ? [OBJECTION] : [] })
