@@ -8457,6 +8457,22 @@ test('a person\'s comment arriving with a review push holds its fix notes (#591)
   assert.equal(result.state.expectedHead, shaFor(1))
 })
 
+test('a person\'s comment arriving while the validator judges holds its refutations and deferrals (#591)', async () => {
+  const refuting = { findings: [invalidFinding()], replies: [{ commentId: 1, body: 'not a bug' }], bots: 'reviewed' }
+  for (const [what, opts] of [['replies', { reviews: refuting }], ['defer', { reviews: oneValid, args: { deferrals: [deferral()] } }]]) {
+    for (const humans of [[OBJECTION], { error: 'gh api graphql: HTTP 502' }]) {
+      const { result, labels } = await run({ ...opts, humans: (label) => label.startsWith(`humans#1-${what}`) ? humans : [] })
+      const why = `${what}: ${labels.join(', ')}`
+      assert.equal(result.reason, Array.isArray(humans) ? 'human-review-pending' : 'harvest-failed', why)
+      assert.ok(labels.indexOf(`humans#1-${what}`) > labels.indexOf('reviews#1'), why)
+      assert.deepEqual(labels.filter(l => /^(replies|defer|resolve)#/.test(l)), [], `${why}: nothing posted over it`)
+    }
+    const clear = await run(opts)
+    assert.deepEqual(clear.labels.filter(l => l.startsWith('humans#')), ['humans#1', `humans#1-${what}`], what)
+    assert.ok(clear.labels.includes(`${what}#1`), `${what}: posted once the read is clear`)
+  }
+})
+
 test('a quota wait probes harvest.py instead of validating until CodeRabbit leaves its limit or the evidence changes (#359)', async () => {
   const validated = (labels) => labels.filter(l => l.startsWith('reviews#'))
   const probes = (labels) => labels.filter(l => l.startsWith('reviews:probe#'))

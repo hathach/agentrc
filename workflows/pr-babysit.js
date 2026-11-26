@@ -3136,9 +3136,9 @@ const judgeReviews = async (cycle, harvest, owedLastCycle) => {
   })
   return { ...read, findings, replies: judged.replies, carry }
 }
-// #591: what harvest.py reads of the people's comments with no reviewer named, sealed, before each cycle's writes, each
-// push and the fix notes after one, and an adoption's push: { humanWaiting }, or a harvestError or rateLimit (already
-// noted), run twice as the validator does.
+// #591: what harvest.py reads of the people's comments with no reviewer named, sealed, before each cycle's writes, its
+// refutations, its deferrals, each push and the fix notes after one, and an adoption's push: { humanWaiting }, or a
+// harvestError or rateLimit (already noted), run twice as the validator does.
 const readHumans = async (label) => {
   const read = (tag) => relayOnce(
     `${IN_CHECKOUT}Editing nothing, ${runExactly(`${HARVEST_SCRIPT} --pr ${args.pr} --repo ${shq(repo)} --reviewers ${shq('')} --probe`)}`,
@@ -3573,6 +3573,9 @@ const runLanes = async (cycle, entry, lanes) => {
     if (freshReplies.length > 0 && args.autoPush === true) {
       // Keep the receipt first: a cycle that dies after posting must still say what went out.
       if (await ended('replies')) return prEnded(cycle, lanes.prState)
+      // #591: the cycle's read ran beside the validator; a comment posted while it judged holds the replies too.
+      const waits = humansHold(cycle, entry, await readHumans(`humans#${cycle}-replies`))
+      if (waits !== undefined) return waits
       entry.refutedPosts = await publishReplies(`replies#${cycle}`, freshReplies, 'refutation', cycle, digestOf)
       entry.sonarMarked = await settleSonar(cycle, entry, ended)
       if (lanes.prState) return prEnded(cycle, lanes.prState)
@@ -3582,6 +3585,8 @@ const runLanes = async (cycle, entry, lanes) => {
       .map(id => ({ commentId: id, body: deferredOn(id).map(deferralLine).join('\n') }))
     if (deferralReplies.length > 0 && args.autoPush === true) {
       if (await ended('defer')) return prEnded(cycle, lanes.prState)
+      const waits = humansHold(cycle, entry, await readHumans(`humans#${cycle}-defer`))
+      if (waits !== undefined) return waits
       entry.deferralPosts = await publishReplies(`defer#${cycle}`, deferralReplies, 'deferral', cycle, digestOf)
     }
 
