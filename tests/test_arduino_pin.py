@@ -665,12 +665,12 @@ class Conformance(Consumer):
                         'raise agentrc_pin.PinError("x")\n')
         with mock.patch.object(self.pin.load(CONFORMANCE), 'round_trip', return_value=[]):
             self.assertEqual(self.pin.conformance(), [
-                f'{hil}/alias.py:2 uses agentrc_pin.ROOT, internal to the bootstrap',
-                f'{hil}/alias.py:3 uses agentrc_pin.ROOT, internal to the bootstrap',
-                f'{hil}/alias.py:3 uses agentrc_pin.literals, internal to the bootstrap',
-                f'{hil}/names.py:1 uses agentrc_pin._selection, internal to the bootstrap',
-                f'{hil}/names.py:1 uses agentrc_pin.ci, internal to the bootstrap',
-                '.claude/test/test_agentrc_pin.py:4 uses agentrc_pin._selection, internal to the bootstrap'])
+                f'{hil}/alias.py:2: uses agentrc_pin.ROOT, internal to the bootstrap',
+                f'{hil}/alias.py:3: uses agentrc_pin.ROOT, internal to the bootstrap',
+                f'{hil}/alias.py:3: uses agentrc_pin.literals, internal to the bootstrap',
+                f'{hil}/names.py:1: uses agentrc_pin._selection, internal to the bootstrap',
+                f'{hil}/names.py:1: uses agentrc_pin.ci, internal to the bootstrap',
+                '.claude/test/test_agentrc_pin.py:4: uses agentrc_pin._selection, internal to the bootstrap'])
 
     def test_the_round_trip_refuses_a_module_from_outside_the_staged_copy(self):
         outside = self.tmp / 'outside'

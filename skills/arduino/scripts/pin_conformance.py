@@ -70,7 +70,7 @@ def _load_problems(root, bootstrap, pin_file, closure):
         except (OSError, ValueError, SyntaxError, RecursionError) as e:
             problems.append(f"{where} is unreadable ({e})")
             continue
-        problems += [f"{where}:{line} uses agentrc_pin.{name}, internal to the bootstrap" for line, name in uses]
+        problems += [f"{where}:{line}: uses agentrc_pin.{name}, internal to the bootstrap" for line, name in uses]
         for line, target in calls:
             if target is None:
                 problems.append(f"{where}:{line}: agentrc_pin.load() takes one string literal, not a computed target")
