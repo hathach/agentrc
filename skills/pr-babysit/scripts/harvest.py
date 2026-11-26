@@ -732,13 +732,9 @@ def waiting(repo, n, inline, issue, reviews):
         gone = root.get('in_reply_to_id')
         roots.setdefault(gone if gone and gone not in by_id else root['id'], []).append(c)
     for thread in roots.values():
-        thread.sort(key=lambda c: (stamp(c['created_at']), c['id']))
-        said = [i for i, c in enumerate(thread) if person(c)]
+        last = max((c for c in thread if person(c) or answerer(c)), key=lambda c: (stamp(c['created_at']), c['id']), default=None)
         # GraphQL keys a thread by its first comment still there, which is one of these.
-        if not said or any(resolved.get(c['id'], False) for c in thread):
-            continue
-        last = thread[said[-1]]
-        if not any(map(answerer, thread[said[-1] + 1:])):
+        if last and person(last) and not any(resolved.get(c['id'], False) for c in thread):
             got.append(waiting_record('review', last, last.get('body'), last['created_at'], last.get('path'),
                                       last.get('line') or last.get('original_line')))
     # What answers an issue comment or a review body: an issue comment or a non-empty review body by the author or the
