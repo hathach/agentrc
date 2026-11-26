@@ -235,11 +235,12 @@ class Poster:
 
         def after_answer(answerers):
             answered = [c['id'] for c in thread if c['user']['login'] in answerers or (c['id'] == target['id'] and person(c, answerers))]
-            return [c for c in thread if person(c, answerers) and c['id'] > max(answered, default=0)]
+            latest = max(answered, default=0)
+            return next((c for c in thread if person(c, answerers) and c['id'] > latest), None)
         # The PR author is read only when a comment could be a person's.
         if not after_answer({self.me}):
             return None
-        return next(iter(after_answer({self.me, self.author()})), None)
+        return after_answer({self.me, self.author()})
 
     def unanswered(self, target, what):
         """Why a reply or resolve in target's thread must wait for a person, None when it need not."""
