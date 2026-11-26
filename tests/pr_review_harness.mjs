@@ -4,7 +4,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, wr
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { test } from 'node:test'
-import { ABSENT, AsyncFunction, SENTINEL, claimOf, emitDirs, emitOf, loadModule, moduleOf } from './emit_stub.mjs'
+import { ABSENT, AsyncFunction, BASH_ONLY, SENTINEL, claimOf, emitDirs, emitOf, loadModule, moduleOf } from './emit_stub.mjs'
 
 const body = readFileSync(new URL('../workflows/pr-review.js', import.meta.url), 'utf8')
   .replace(/^export const meta = /m, 'const meta = globalThis.__meta = ')
@@ -1055,9 +1055,6 @@ const SHELL_STUBS = {
 }
 const PS_PRELUDE = "$PSNativeCommandArgumentPassing = 'Legacy'; $agentrc = if ($env:AGENTRC_DIR) { $env:AGENTRC_DIR } else { \"$HOME/.claude\" }; "
 const PS_AGENTRC = '"$agentrc/'
-// What PowerShell cannot run: an environment prefix, an && chain, a ${NAME:-default} expansion, a < redirection, and
-// python3, which a python.org install does not have.
-const BASH_ONLY = /(^|[^:])AGENTRC_EMIT='| && |\$\{[A-Za-z_]+:-| < '|\bpython3\b/
 const commandOf = (prompt) => String(prompt).match(/[Rr]un exactly `([^`]*)`/)[1]
 const readCommandOf = (prompt) => String(prompt).match(/Read it with: (.*)\n/)[1]
 
