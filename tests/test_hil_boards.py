@@ -357,6 +357,10 @@ class Debug(Base):
             with self.subTest(args), self.assertRaisesRegex(ValueError, f'A: debug: .*{why}'):
                 hb.registry(self.registry({'boards': {'A': {'name': 'a', 'flasher': PICO,
                                                             'debug': {'openocd': args}}}}))
+        for args in (42, ['-f', 'interface/cmsis-dap.cfg']):
+            with self.subTest(args), self.assertRaisesRegex(ValueError, r'A: flasher: args must be a non-empty string'):
+                hb.registry(self.registry({'boards': {'A': {'name': 'a', 'flasher': {**PICO, 'args': args},
+                                                            'debug': ROUTE}}}))
         # a J-Link board's route reaches its probe through openocd's jlink driver: no flasher interface to match
         jlink = '-f interface/jlink.cfg -c "transport select swd" -c "adapter speed 4000" -f target/atsame5x.cfg'
         reg = hb.registry(self.registry({'boards': {'A': {'name': 'a', 'flasher': JLINK,

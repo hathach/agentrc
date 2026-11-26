@@ -146,7 +146,8 @@ def debug_problem(debug, flasher=None) -> str:
     bad = [v for f, v in pairs if f == '-c' and not _DEBUG_COMMANDS.fullmatch(v)]
     if bad:
         return f'openocd -c {bad[0]!r}: a route\'s commands are only "adapter speed N" and "transport select swd"'
-    if isinstance(flasher, dict) and flasher.get('name') == 'openocd':
+    # malformed args are the flasher's own problem
+    if isinstance(flasher, dict) and flasher.get('name') == 'openocd' and isinstance(flasher.get('args', ''), str):
         try:
             own = _interface_cfgs(shlex.split(flasher.get('args', '')))
         except ValueError as e:
