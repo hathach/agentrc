@@ -33,16 +33,67 @@ sudo cat /proc/<pid>/stack          # never opens the node, so it cannot block
 
 | Stack shows | Meaning | Go to |
 |---|---|---|
-| `usbdev_ioctl` + a driver module (`[usbtest]`) | **owner, holds the lock** | rung 3 — terminal |
+| `test_queue [usbtest]` → `usbtest_ioctl` → `usbdev_ioctl` | **owner, holds the lock**, waiting on queued transfers | rung 1 (DUT), then recheck; park-flash if no disconnect follows |
+| `usbdev_ioctl` + another driver-module wait | **owner, holds the lock** | inspect the wait; rung 3 — terminal if the permitted reset/disconnect cannot release it |
 | `usbdev_ioctl`, no driver frames | owner waiting on a URB | rung 1 (DUT) / rung 2 (probe) |
 | `usbdev_open`, sysfs reads | victim | ignore |
 | `tee .../usbtest/bind`, `unbind` | **victim that SPREADS it** | stop issuing them |
-| `hub_event` in a kworker | teardown stuck behind an owner | rung 3 |
+| `hub_event` in a kworker | teardown stuck behind an owner | find and recover the owner first; rung 3 if its wait cannot be released |
 
 Driver-bind writes are not passive: `__device_driver_lock` (drivers/base/dd.c)
 takes `device_lock()` uninterruptibly **and `device_lock(parent)`**, because
 `usb_bus_type` sets `.need_parent_lock = true` (driver.c:2048) — each one holds
 the HUB's lock, which is how one wedged port takes a whole bus down.
+
+A `test_queue` owner waits with no timeout for its queued URBs (usbtest.c:2126,
+v6.12.113); `complicated_callback` stops resubmitting after a failed URB and
+completes the wait once none is pending (usbtest.c:1926-1968). One occurrence
+(ci.lan, 2026-11-24, tinyusb's `ea4088_quickstart`, `testusb -t 28`) cleared at
+rung 1 with no reboot. In this occurrence the reset was followed by disconnect,
+the queue's error report (`during the test, 32 errors out of 0`, with `-g 32`
+queued URBs on test 28, a bulk read) and owner exit, consistent with outstanding
+transfers completing or failing until the callback released the wait (rung 1's
+mechanism).
+
+For this `test_queue` case:
+
+- **Cleared:** the owner exits, the DUT re-enumerates and a fresh D-state check
+  finds no holder. A flasher exit or a disconnect line alone is not enough.
+- **Disconnected, owner still in D state:** rung 3 only once rung 1 has issued
+  the reset — the flasher reported it, or, where the reset cannot reach the
+  peripheral, park-flash's flasher reported a successful flash — and a fresh
+  D-state check, taken after the disconnect and the pending URB completions had
+  time to settle, still finds the owner.
+- **Rung 1's flasher reports no reset, owner still in D state:** no reset
+  was issued, so never rung 3. A probe it cannot reach goes to rung 2 unless
+  rung 2 already ran (see the park-flash bullet); any other failure goes to
+  the contract's terminal recovery.
+- **No DUT `USB disconnect` line after a reported reset, owner still in D state
+  at a fresh check:** park-flash next. A task holding or waiting on the DUT's
+  parent hub, a device-level bind/unbind writer (`__device_driver_lock`, above)
+  or a `hub_event` kworker for that hub, holds that line back: `hub_event` takes
+  the hub's lock (`usb_lock_device(hdev)`) before `usb_disconnect` logs it
+  (hub.c). With such a task the missing line shows neither that the reset
+  missed the peripheral nor that it reached it, so it never counts as the
+  disconnect rung 3 needs; park-flash's outcome, below, decides.
+- **That park-flash's flasher reports a successful flash, still no
+  disconnect:** if a fresh check still finds the owner, escalate to rung 3, or
+  to the contract's terminal recovery where the dispatch may not reach it.
+- **Park-flash reports no successful flash:** it proves nothing. A probe it
+  cannot reach goes to rung 2; any other failure goes to the contract's
+  terminal recovery, never rung 3. After a successful rung 2, take a fresh
+  D-state check and triage again by this list: the owner gone and the DUT back
+  is Cleared; an owner still holding the DUT gets rung 1 again through the
+  restored probe, then a fresh check triaged by this list again, so
+  park-flash runs only where a bullet above sends it. Rung 2 runs once per
+  wedge: a failed root-cycle, or a probe unreachable after one, restored in
+  between or not, goes to the contract's terminal recovery.
+- **Owner exited, another holder remains at a fresh check:** triage that one
+  by its stack.
+- **No holder left, no DUT:** the lock is free, so this is no longer a kernel
+  wedge. If the DUT still has a sysfs node, use section 4; with none,
+  `authorized` has nothing to act on, so go straight to the board's own
+  recovery (park-flash). Never rung 3.
 
 Map the holder to a busport with **lock-free attrs only** (`devnum`, `idVendor`,
 `idProduct` are `usb_descriptor_attr*`, plain `sysfs_emit`, sysfs.c:688-705):
@@ -122,9 +173,12 @@ Reset **before** park-flash: non-destructive (the firmware under test survives
 for autopsy), no flash wear, and no bad park image — a `wfe`/`wfi` park has
 bricked SWD on mimxrt1064_evk and max32666fthr through a power cycle.
 `ResetTarget` measures 128-129 ms; cleared 57 → 0, 26 → 0 and 5 → 0 D-state
-processes, single shot each. Mechanism: chip reset drops the pull-up →
-`usb_hcd_flush_endpoint` unlinks the URB `-ESHUTDOWN` (hcd.c:1783) → the
-completion fires → the ioctl returns → the lock releases.
+processes, single shot each. Mechanism: chip reset drops the pull-up → the
+device detaches → the outstanding URBs complete or fail → the completion fires →
+the ioctl returns → the lock releases. A disconnect does not flush them under the
+lock: `usb_disconnect` reaches `usb_hcd_flush_endpoint` (`-ESHUTDOWN`, hcd.c:1783)
+only after `usb_lock_device`, so that flush runs once the owner has let go (hub.c
+`usb_disconnect`; usbtest.c's warning above `usbtest_ioctl`).
 
 Works on i.MX RT (`USBCMD.RS` = 0 detaches, RT1050 RM Rev 3 p.2453) **and on
 DWC2** — measured 2026-08-16 on stm32f407disco: `r; g` gave
@@ -191,7 +245,8 @@ the request runs under the hub's lock, so the script refuses a target whose seri
 does not answer, and the rungs above own it. Its guards, timing and the hub-dependent
 VBUS caveats are `usb_recover.sh`'s usage and its hub-cycle comment.
 
-**Rung 3 — terminal case: a driver ioctl that OWNS the lock.** No software cure:
+**Rung 3 — terminal case: a driver ioctl that OWNS the lock** in a wait the permitted
+reset/disconnect cannot release (section 1's table). No software cure:
 the task is uninterruptible and SIGKILL is queued, not delivered. Reboot with
 **sysrq**, never `reboot(2)` — a graceful reboot runs `device_shutdown()`, which
 takes every device lock and stalls on the wedged one.

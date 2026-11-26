@@ -6,6 +6,7 @@ import io
 import json
 import os
 import re
+import runpy
 import subprocess
 import sys
 import tempfile
@@ -29,6 +30,15 @@ EVENT = '2026-09-25T08:00:00Z'
 
 def user(login):
     return {'login': login}
+
+
+def staged(test, data):
+    """A --carry-file holding data, bytes as they are and text as UTF-8, outside any checkout under test."""
+    d = tempfile.TemporaryDirectory()
+    test.addCleanup(d.cleanup)
+    path = Path(d.name) / 'carry.in'
+    path.write_bytes(data if isinstance(data, bytes) else data.encode())
+    return str(path)
 
 
 def review(login, commit, body='', at='2026-09-25T09:00:00Z', id_=1):
@@ -1072,10 +1082,10 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(got['comments'][0]['body'], 'fix this')
         self.assertRegex(got['fingerprint'], r'^coderabbit,copilot\|coderabbit\|[0-9a-f]{32}$')
         self.assertEqual(self.harvest(self.answers([HEAD]))[1]['fingerprint'], got['fingerprint'], 'a second read of the same evidence')
-        self.assertEqual(got['carry'], [], 'no --carry, nothing carried')
+        self.assertEqual(got['carry'], [], 'no --carry-file, nothing carried')
         entry = {'commentId': 40, 'digest': harvest.digest('fix this'), 'judgedSha': HEAD, 'paths': ['a.c']}
         code, carried = self.harvest(self.answers([HEAD]), '--pr', '7', '--reviewers', 'coderabbit,copilot', '--auto-run', 'coderabbit',
-                                     '--carry', json.dumps([entry]))
+                                     '--carry-file', staged(self, json.dumps([entry])))
         self.assertEqual((code, [(c['commentId'], c['eligible']) for c in carried['carry']]), (0, [(40, False)]),
                          'this checkout is not at the fixture head')
 
@@ -1121,6 +1131,59 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(code, 2, got)
         self.assertIn('rate limit', got['error'])
         self.assertIn('rateLimit', got)
+
+    def test_the_script_seals_its_full_line_as_its_probe(self):
+        """#582: pr-babysit reads the full harvest from the relay's file as it reads the probe, refusing a line off its seal."""
+        for extra in ([], ['--probe']):
+            with self.subTest(extra=extra):
+                gh = FakeGh(self.root, self.answers([HEAD]))
+                out = io.StringIO()
+                argv = [str(SCRIPT), '--pr', '7', '--reviewers', 'coderabbit,copilot', '--auto-run', 'coderabbit', '--repo', 'o/r', *extra]
+                with run_gh_as(gh.stub), redirect_stdout(out), mock.patch.object(sys, 'argv', argv), self.assertRaises(SystemExit) as done:
+                    runpy.run_path(str(SCRIPT), run_name='__main__')
+                self.assertEqual(done.exception.code, 0)
+                line = json.loads(out.getvalue().splitlines()[-1])
+                self.assertEqual('carry' in line, not extra)
+                rest = {k: v for k, v in line.items() if k != 'seal'}
+                self.assertEqual(line['seal'], sys.modules['facts'].sealed(rest)['seal'])
+
+    def test_under_emit_the_bodies_go_to_the_reading_file_and_the_line_keeps_their_index(self):
+        """#582: nine 60,000-character bodies would pass the runtime's 524288-byte limit on a Workflow script file, and a
+        validator's prompt: the line holds only their index, the reading file all of it."""
+        answers = self.answers([HEAD])
+        big = [{'id': 40 + i, 'user': user('coderabbitai[bot]'), 'body': f'{i} "\\ ' + 'é' * 60000, 'path': 'a.c', 'line': 3, 'commit_id': HEAD,
+                'created_at': EVENT, 'updated_at': EVENT, 'in_reply_to_id': None, 'html_url': f'u/{40 + i}'} for i in range(9)]
+        answers['api --paginate --slurp repos/o/r/pulls/7/comments?per_page=100'] = [[big]]
+        argv = ['--pr', '7', '--reviewers', 'coderabbit,copilot', '--auto-run', 'coderabbit', '--repo', 'o/r']
+        with run_gh_as(FakeGh(self.root, answers).stub):
+            whole = harvest.line(argv)
+        self.assertIn('comments', whole, 'no AGENTRC_EMIT: the reading whole, as printed')
+        emit = str(self.root / 'h.1.js')
+        patched = (lambda to: (mock.patch.object(harvest, 'EMIT_TO', to), mock.patch.object(sys.modules['seal'], 'EMIT_TO', to)))
+        a, b = patched(emit)
+        with run_gh_as(FakeGh(self.root, answers).stub), a, b:
+            got = harvest.line(argv)
+        self.assertNotIn('comments', got)
+        self.assertEqual(got['seal'], sys.modules['facts'].sealed({k: v for k, v in got.items() if k != 'seal'})['seal'])
+        self.assertEqual(got['index'], [{k: c[k] for k in ('commentId', 'digest', 'aliases', 'source') if k in c} for c in whole['comments']])
+        self.assertLess(len(json.dumps(got)), 524288 // 50)
+        # The reading the validator reads in pieces: the line's members with the comments in place of their index.
+        data = Path(f'{emit}.reading.json').read_bytes()
+        self.assertEqual(hashlib.sha256(data).hexdigest(), got['readingSha256'])
+        reading = json.loads(data)
+        self.assertEqual(data, (json.dumps(reading, ensure_ascii=False, indent=1) + '\n').encode())
+        rest = {k: v for k, v in got.items() if k not in ('index', 'readingSha256', 'seal', 'observedAt')}
+        self.assertEqual({k: v for k, v in reading.items() if k != 'observedAt'}, rest | {'comments': whole['comments']})
+        # A file already there, an earlier run's, is never overwritten: the harvest fails closed.
+        a, b = patched(emit)
+        with run_gh_as(FakeGh(self.root, answers).stub), a, b, \
+                self.assertRaisesRegex(harvest.Unusable, f'cannot create {re.escape(emit)}\\.reading\\.json: File exists'):
+            harvest.line(argv)
+        probe = str(self.root / 'p.1.js')
+        a, b = patched(probe)
+        with run_gh_as(FakeGh(self.root, answers).stub), a, b:
+            self.assertEqual(sorted(harvest.line([*argv, '--probe'])), sorted([*harvest.PROBE, 'seal']), 'a probe reads no comments, so writes no reading')
+        self.assertFalse(Path(f'{probe}.reading.json').exists())
 
     def test_the_repo_named_is_read_instead_of_the_checkouts(self):
         answers = {k.replace('o/r', 'up/r'): v for k, v in self.answers([HEAD]).items()}
@@ -1333,7 +1396,7 @@ class EndToEnd(unittest.TestCase):
 
 
 class Carry(unittest.TestCase):
-    """#393: --carry says which settled comments keep their findings, from git in a real checkout."""
+    """#393: --carry-file says which settled comments keep their findings, from git in a real checkout."""
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -1461,12 +1524,15 @@ class Carry(unittest.TestCase):
     def test_a_malformed_carry_list_is_unusable(self):
         good = self.entry(['a.c'])
         for text in ('nope', '{}', json.dumps([{**good, 'extra': 1}]), json.dumps([{**good, 'judgedSha': 'abc'}]),
-                     json.dumps([{**good, 'commentId': True}]), json.dumps([{**good, 'paths': 'a.c'}]), json.dumps([good, good])):
+                     json.dumps([{**good, 'commentId': True}]), json.dumps([{**good, 'paths': 'a.c'}]), json.dumps([good, good]),
+                     b'[{"paths": ["\xff"]}]'):
             with self.subTest(text), self.assertRaises(harvest.Unusable):
-                harvest.carry_entries(text)
-        self.assertEqual(harvest.carry_entries(json.dumps([good])), [good])
+                harvest.carry_entries(staged(self, text))
+        with self.assertRaisesRegex(harvest.Unusable, 'cannot read --carry-file'):
+            harvest.carry_entries(str(self.repo / 'gone.in'))
+        self.assertEqual(harvest.carry_entries(staged(self, json.dumps([good]))), [good])
         with self.assertRaises(harvest.Unusable):
-            harvest.collect(['--pr', '7', '--reviewers', 'coderabbit', '--probe', '--carry', '[]'])
+            harvest.collect(['--pr', '7', '--reviewers', 'coderabbit', '--probe', '--carry-file', staged(self, '[]')])
 
 
 if __name__ == '__main__':

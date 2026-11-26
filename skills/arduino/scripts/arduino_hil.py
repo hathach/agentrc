@@ -1200,10 +1200,21 @@ def end_row(row, task):
 REPORT_BODY_KEYS = ('pass', 'caveat', 'exitCode', 'results')
 
 
+def report_body_error(body, keys):
+    """'' when `body` is a JSON object holding `keys` with a list `results`, else what it lacks."""
+    if not isinstance(body, dict):
+        return f'not a JSON object but a {type(body).__name__}'
+    if missing := [k for k in keys if k not in body]:
+        return f'no {", ".join(missing)}'
+    if not isinstance(body['results'], list):
+        return f'results is a {type(body["results"]).__name__}, not a list'
+    return ''
+
+
 def schema():
     def check(body):
-        if not all(k in body for k in REPORT_BODY_KEYS) or not isinstance(body['results'], list):
-            raise ValueError(f'report body needs {REPORT_BODY_KEYS}')
+        if why := report_body_error(body, REPORT_BODY_KEYS):
+            raise ValueError(f'report body: {why}')
 
     return A.report.BodySchema(name=P.REPORT_SCHEMA, version=1, stem='hil_report', evidence='firmware-validation',
                                check=check, empty=lambda b: not b['results'], render=render)
@@ -1550,9 +1561,24 @@ def op_flash(args, board, run_dir, tracker, manifest):
     return {**meta, **flash_only(args.board, board, image, run_dir, tracker)}
 
 
+def failed_report(path):
+    """A `restore --report` input: a run report or a commissioning result.json, both with results rows; a session
+    command's result.json has none."""
+    try:
+        failed = json.loads(Path(path).read_text())
+    except (OSError, ValueError) as e:
+        raise Refused(f'--report {path}: {e}')
+    if why := report_body_error(failed, ('results',)):
+        raise Refused(f'--report {path} is no run report or commissioning result: {why}')
+    if bad := [i for i, row in enumerate(failed['results'])
+               if not isinstance(row, dict) or 'board' not in row or not isinstance(row.get('cleanup'), dict)]:
+        raise Refused(f'--report {path}: results rows {bad[:5]} have no board and cleanup object')
+    return failed
+
+
 def op_restore(args, board, run_dir, tracker, manifest):
     if args.report:
-        failed = json.loads(Path(args.report).read_text())
+        failed = failed_report(args.report)
         cleanups = [row['cleanup'] for row in failed['results'] if row['board'] == args.board]
         receipts = [r for c in cleanups for r in c.get('receipts', [])]
         receipts += [p['receipt'] for c in cleanups for p in c.get('pending', []) if p['receipt'] not in receipts]

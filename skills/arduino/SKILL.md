@@ -36,9 +36,11 @@ retries, recovery) apply unchanged; these scripts load its `hil_*` scripts throu
   run the first HIL sketch).
   `hil_remote.py` is a wrapper around `arduino_remote.py`.
 - Rosters `test/hil/ci.json` (the farm) and a gitignored `test/hil/local.json` (a dev PC's boards); contract tests in
-  `.claude/test/`, run by pre-commit through `agentrc_pin.py test`. A farm board names its probe (`"probe"`, the `hil`
-  skill's board registry), which supplies its flasher, under the registry's name, which is its board lock; a dev PC's
-  unregistered board keeps a flasher of its own.
+  `.claude/test/`, run by pre-commit through `agentrc_pin.py test`. `check_build.py` runs the profile's
+  `CONTRACT_TESTS` entry `agentrc_pin` the same way, the bootstrap's `test` from the checkout root, so its copy and
+  conformance checks run there too; every other entry runs its own script (`arduino_build.py`'s `run_tests`). A farm
+  board names its probe (`"probe"`, the `hil` skill's board registry), which supplies its flasher, under the registry's
+  name, which is its board lock; a dev PC's unregistered board keeps a flasher of its own.
 
 ## What every library gets
 
@@ -89,7 +91,9 @@ retries, recovery) apply unchanged; these scripts load its `hil_*` scripts throu
   failure under it. A passing restore marks restored each open failure whose children and retained
   sessions are proven ended. `restore --release` releases the hold whatever the restore did: exit 0 restored, 6
   restore failed (released), 5 not released; `session close` counts 6 closed, and on a closed session prints its
-  recorded exits without the rig (exit 0). An older engine's pending record
+  recorded exits without the rig (exit 0). After a failed close (`restoreExit` 6, hold released), recovery takes a new
+  hold, first stops or reports every child the session left unproven, then restores with the session's record
+  (`restoreRecord`), never with the session's `result.json` as `--report`. An older engine's pending record
   (kind `arduino-hil`) is reported (`previousPending`), never a refusal.
 - **Busy check**: a run or commission is one `hil_lock.board_task` whose busy check, under its lock and before any tool,
   is agentrc `hil_flash.probe_users` on the board's probe; its docstring has what it covers (the probe's serial on a
