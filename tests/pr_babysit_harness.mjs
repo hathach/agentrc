@@ -363,6 +363,13 @@ async function run(opts = {}) {
       if (answer === null || answer?.error) return answer
       return { headSha: prHead, waiting: answer ?? (reviews instanceof Error ? [] : reviews.waiting ?? []) }
     }
+    if (/^waiting#\d+-\w+(\.retry)?$/.test(label)) {
+      // harvest.py read again before a cycle's write (#591): opts.writeWaiting as opts.adoptWaiting, a function of the label;
+      // else nothing waits, as the cycle's own harvest found.
+      const answer = typeof opts.writeWaiting === 'function' ? opts.writeWaiting(label) : opts.writeWaiting
+      if (answer === null || answer?.error) return answer
+      return { headSha: head, waiting: answer ?? [] }
+    }
     if (label === 'adopt:push' || label === 'adopt:push.retry') {
       // push.py's receipt: by default the push landed on every pinned URL and the PR.
       const to = opts.args.adoptHead
@@ -3876,6 +3883,82 @@ test('an empty waiting list stops nothing', async () => {
   assert.deepEqual(quiet.result.observation.reviews.waiting, [], "harvest.py's list reaches the observation")
 })
 
+test("a person's comment posted after the cycle's harvest stops the run before its push, its verified fixes left uncommitted (#591)", async () => {
+  const launch = { reviews: oneValid, scope: ['src/a.c'], args: { autoPush: true, maxCycles: 3 } }
+  const { result, labels } = await run({ ...launch, writeWaiting: (l) => l === 'waiting#1-review' ? [OBJECTION] : [] })
+  assert.deepEqual([result.pass, result.reason], [false, 'human-review'])
+  assert.match(result.detail, /; before the review-lane push, its verified fixes left uncommitted$/)
+  assert.deepEqual(result.uncommitted, ['src/a.c'])
+  assert.ok(labels.some(l => l.startsWith('fix:')), labels.join(', '))
+  assert.equal(labels.some(l => /^(recheck|hooks|push|resolve)#/.test(l)), false, labels.join(', '))
+  assert.equal(result.history[0].ci.status, 'green', 'the CI lane is still awaited')
+  // With none waiting, the one reading before the push stands for its fix notes too.
+  const quiet = await run(launch)
+  assert.deepEqual(quiet.labels.filter(l => l.startsWith('waiting#1-')), ['waiting#1-review'])
+  assert.ok(quiet.labels.indexOf('waiting#1-review') < quiet.labels.indexOf('recheck#1-review'), quiet.labels.join(', '))
+  assert.ok(quiet.labels.includes('resolve#1'), quiet.labels.join(', '))
+  assert.match(quiet.calls.find(c => c.label === 'waiting#1-review').prompt, /harvest\.py --pr 3888 --repo 'hathach\/tinyusb' --reviewers coderabbit`/)
+})
+
+test("a person's comment posted after the cycle's harvest stops the run before its replies, read once for every batch (#591)", async () => {
+  const reviews = { findings: [invalidFinding({ commentId: 2 })], replies: [{ commentId: 2, body: 'not a bug: x' }], bots: 'reviewed' }
+  const { result, labels } = await run({ reviews, args: { autoPush: true, maxCycles: 3 }, writeWaiting: [OBJECTION] })
+  assert.deepEqual([result.reason, result.waiting.map(w => w.commentId)], ['human-review', [OBJECTION.commentId]])
+  assert.match(result.detail, /; before this cycle's replies, none posted$/)
+  assert.equal(labels.some(l => /^(replies|defer|resolve)#/.test(l)), false, labels.join(', '))
+  const quiet = await run({ reviews, args: { autoPush: true, maxCycles: 3 } })
+  assert.deepEqual(quiet.labels.filter(l => /^(waiting|replies)#/.test(l)), ['waiting#1-replies', 'replies#1'])
+  // A dry run writes nothing, so it reads nothing again.
+  const dry = await run({ reviews, args: { autoPush: false, maxCycles: 3 } })
+  assert.equal(dry.labels.some(l => l.startsWith('waiting#')), false, dry.labels.join(', '))
+})
+
+test("a person's comment posted during the CI wait stops the CI-lane push, its verified fixes left uncommitted (#591)", async () => {
+  const ci = { status: 'red', infraRerun: [], realFailures: [{ check: 'build / arm', firstError: 'error in src/a.c', files: ['src/a.c'], verdict: 'real' }] }
+  const { result, labels } = await run({ reviews: { findings: [], replies: [], bots: 'reviewed' }, ci,
+    writeWaiting: (l) => l === 'waiting#1-ci' ? [OBJECTION] : [] })
+  assert.equal(result.reason, 'human-review')
+  assert.match(result.detail, /; before the CI-lane push, its verified fixes left uncommitted$/)
+  assert.deepEqual(result.uncommitted, ['src/a.c'])
+  assert.equal(labels.includes('push#1-ci'), false, labels.join(', '))
+})
+
+test('a reading before a write that fails stops the run, its file never claimed run once and named as no line of harvest.py (#591)', async () => {
+  const launch = { reviews: oneValid, scope: ['src/a.c'], args: { autoPush: true, maxCycles: 3 } }
+  const failed = await run({ ...launch, writeWaiting: { error: 'gh api graphql: HTTP 502' } })
+  assert.deepEqual([failed.result.reason, failed.result.detail],
+    ['harvest-failed', 'before the review-lane push, its verified fixes left uncommitted: harvest.py: gh api graphql: HTTP 502'])
+  assert.deepEqual(failed.labels.filter(l => l.startsWith('waiting#')), ['waiting#1-review', 'waiting#1-review.retry'])
+  assert.deepEqual(failed.result.uncommitted, ['src/a.c'])
+  const limited = await run({ ...launch, writeWaiting: { error: 'gh api: HTTP 403: You have exceeded a secondary rate limit.', rateLimit: LIMIT } })
+  assert.equal(limited.result.reason, 'github-rate-limited')
+  assert.deepEqual(limited.result.uncommitted, ['src/a.c'], "the stop's own members kept")
+  assert.equal(limited.labels.includes('waiting#1-review.retry'), false)
+  // An adoption's reading whose emit file cannot be claimed ran nothing: no second attempt, and no harvest.py error.
+  const away = (label, file) => {
+    const d = dirname(file)
+    if (label === 'adopt:waiting') renameSync(d, `${d}.away`)
+    else if (existsSync(`${d}.away`)) renameSync(`${d}.away`, d)
+  }
+  const unclaimed = await run({ args: adoptionArgs(adoptionState(), { autoPush: true }), preflight: { head: ADOPT, prHead: HEAD }, beforeClaim: away })
+  assert.equal(unclaimed.result.reason, 'harvest-failed')
+  assert.match(unclaimed.result.detail, /^before the adoption push of [0-9a-f]{7}, left unpublished: no harvest\.py line came back: the script could not claim .+: nothing was run$/)
+  assert.equal(unclaimed.journal.some(j => j.label === 'adopt:waiting.retry'), false, 'no fresh attempt')
+})
+
+test('an adoption with no reviewers reads no waiting comments before its push (#591)', async () => {
+  const state = adoptionState({ reviewers: [], autoRun: [] })
+  const { result, labels } = await run({ args: adoptionArgs(state, { autoPush: true }), preflight: { head: ADOPT, prHead: HEAD } })
+  assert.deepEqual(labels.slice(0, 3), ['preflight', 'adopt:audit', 'adopt:push'])
+  assert.equal(result.history.at(-1).adoption.publication, 'pushed')
+})
+
+test('a human-review stop reports the reviews its harvest observed (#591)', async () => {
+  const { result } = await run({ reviews: { ...oneValid, waiting: [OBJECTION] }, args: { autoPush: true, maxCycles: 3 } })
+  assert.equal(result.reason, 'human-review')
+  assert.equal(result.rollup.observed.reviews, true)
+})
+
 test('a dead review validator still settles the CI lane', async () => {
   const { result, logs, labels } = await run({ reviews: new Error('validator exploded') })
   assert.equal(result.reason, 'review-validator-died')
@@ -4729,6 +4812,11 @@ test('a settlement is refused at another head, on a held, changed or not handed-
   assert.deepEqual(held.result.settlements, [{ commentId: 1, outcome: 'refused', why: 'a point of the comment is held' }])
   const unharvested = await run({ throwOn: (l) => l.startsWith('reviews#'), preflight: at, args: { ...YIELD, state, replySettlements: [settlement] } })
   assert.deepEqual(unharvested.result.settlements, [{ commentId: 1, outcome: 'not processed', why: 'no review harvest in this launch' }])
+  // #591: a harvest that ran, then stopped on a person's comment, is no missing harvest.
+  const people = await run({ reviews: { ...edited, waiting: [OBJECTION] }, preflight: at, args: { ...YIELD, state, replySettlements: [settlement] } })
+  assert.equal(people.result.reason, 'human-review')
+  assert.deepEqual(people.result.settlements,
+    [{ commentId: 1, outcome: 'not processed', why: 'the launch stopped human-review after its review harvest, before settling it' }])
 })
 
 test('a fix note reads as deferred only while it still owes a dismissal', async () => {

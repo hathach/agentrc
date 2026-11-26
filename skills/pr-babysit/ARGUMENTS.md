@@ -34,10 +34,14 @@ A key not listed here throws before anything runs.
   account that still waits for an answer stops the launch `human-review`,
   naming each in `waiting`, before anything is fixed, answered or pushed,
   an unpublished `adoptHead` included, which a harvest before its push checks
-  (#591). No argument answers it: a relaunch passes an inline comment once its
-  thread is resolved or holds a later reply, and an issue comment or review
-  body once the PR's author or the posting account answered after it, after
-  an issue comment's last edit, never on another person's reply (`SKILL.md`).
+  (#591); harvest.py is read again just before each write of a cycle, a push
+  stopped there leaving its verified fixes uncommitted, named in `uncommitted`.
+  No argument answers it: a relaunch passes an inline comment once its thread
+  is resolved or the author or the posting account replied after it, and an
+  issue comment or review body once one of them answered after it, after an
+  issue comment's last edit, never with a bot request, an empty review or a
+  reply quoting another comment, and never on another person's reply
+  (`SKILL.md`).
 - `autoRun`: the reviewers that run on every push and gate done; default
   `reviewers` without `copilot` and `code-scanning`, which are only harvested.
   Every reviewer is reported with its state; only these are waited on, which is

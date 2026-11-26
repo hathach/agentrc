@@ -69,17 +69,25 @@ the arguments the state is fixed to, which a continuation passes unchanged.
 A head whose only CI left is Actions runs awaiting a maintainer's approval (collect.py's `awaiting-approval`) stops
 `ci-awaiting-approval` at the CI lane's read, naming them in `awaitingApproval`; nothing here approves or re-runs them.
 A comment by a person, an owner, member or collaborator other than the PR's author and the posting account, that still
-waits for an answer (harvest.py's `waiting`: an unresolved thread whose last word is theirs, or an issue comment or
-review body neither the author nor the posting account spoke after, an issue comment's last edit counting as its time)
-stops the launch `human-review` right after the harvest, before anything is fixed, answered, pushed or counted done,
-naming each in `waiting` (#591); it is the human's to answer or resolve, never the run's. A relaunch passes an inline
-comment once its thread is resolved or holds a later reply, a person's then waiting in its place, and an issue comment
-or review body once the PR's author or the posting account posted an issue comment or submitted a review after it, after
-an issue comment's last edit (GitHub's REST API gives a review no edit time); another person's reply leaves those
-waiting.
+waits for an answer (harvest.py's `waiting`) stops the launch `human-review` right after the harvest, before anything is
+fixed, answered, pushed or counted done, naming each in `waiting` (#591); it is the human's to answer or resolve, never
+the run's. Only the PR's author or the posting account answers, and never with what the run itself posts as that
+account: a request to a bot (`@coderabbitai`, `@greptileai`), the empty review GitHub wraps a thread reply in, or a reply
+quoting another comment (pr-reply's `> <url>`). An inline comment waits while it is its unresolved thread's latest
+comment by a person with no reply by the author or the posting account after it; a bot's reply answers nothing, another
+person's waits in its place. An issue comment or review body waits until the author or the posting account posts an
+issue comment or submits a non-empty review body after it, after an issue comment's last edit (GitHub's REST API gives a
+review no edit time); a reply quoting it answers it, another person's reply never.
+With any `reviewers`, harvest.py is read again just before the run writes, since the cycle's harvest may be minutes
+old: before the caller's settlements and the cycle's replies (once for them all), before a review- or CI-lane push (its
+fix notes follow on that reading) and before fix notes with no push. A comment waiting then stops `human-review` the
+same way, nothing of that write done; a push's verified fixes are left uncommitted, named in `uncommitted`, as a
+`fix-verification-failed` stop leaves them. A comment posted after that reading, or while CI is waited on with nothing
+left to write, is the next harvest's (the next cycle's, the next launch's or `merge.py`'s).
 An unpublished `adoptHead` gets the same check from a harvest before its push: a stop there, `harvest-failed` and
 `github-rate-limited` included, leaves it unpushed, the state at its base and the checkout at it, and names it in
-`adoptionHeld`; a relaunch from the returned stateRef with the same `adoptHead` retries it.
+`adoptionHeld`; a relaunch from the returned stateRef with the same `adoptHead` retries it. With `reviewers: []` neither
+check runs: no one's comments are read.
 `merge.py` refuses a merge while one waits.
 A launch on a PR no longer open stops `pr-merged` or `pr-closed`, at preflight or at the CI lane's next read; nothing is left to continue. Every GitHub or SonarCloud write reads the state first (`preflight.py --state`, or `push.py --open-pr` for a push) and goes on only for an OPEN PR; an unreadable state stops `pr-state-unread`.
 `preflight.py`, `harvest.py`, `scope_check.py`, `state_transfer.py`, `launch_result.py` and `commits.py` only read, except that

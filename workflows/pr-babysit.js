@@ -1473,7 +1473,9 @@ const finish = (verdict, status) => {
   const { state, size } = stateOut()
   if (size > STATE_MAX) log(`state: ${size} bytes, over the ${STATE_MAX} a launch loads — no launch can continue from it`)
   const handoffs = handoffList()
-  if (!settlementsTried) for (const s of settlementsArg) settlements.push({ commentId: s.commentId, outcome: 'not processed', why: 'no review harvest in this launch' })
+  const unsettledWhy = history.slice(launchFrom).some(e => reviewedCycles.has(e.cycle))
+    ? `the launch stopped ${verdict.reason} after its review harvest, before settling it` : 'no review harvest in this launch'
+  if (!settlementsTried) for (const s of settlementsArg) settlements.push({ commentId: s.commentId, outcome: 'not processed', why: unsettledWhy })
   const sonarUnmarked = !markSonar ? [] : [...answeredWith].filter(([, a]) => a.sonar)
     .map(([commentId, a]) => ({ commentId, how: (a.sonarOf || a).how, last: sonarLast.get(commentId) || (sonarDown ? { outcome: 'not asked', detail: sonarDown } : null) }))
   const { reason, pass, cycles, history: cycleHistory, ...rest } = verdict
@@ -2973,7 +2975,7 @@ const runCycle = async (cycle, entry) => {
   // The CI lane settles last, so it can read the merge after the review lane stopped for another reason.
   if (lanes.prState === 'merged' || lanes.prState === 'closed') return prEnded(cycle, lanes.prState)
   // Another cycle would meet the same refusal: the caller relaunches once it clears (#90).
-  if (githubLimit) {
+  if (githubLimit && verdict?.reason !== 'github-rate-limited') {
     const { error, resetAt, secondary } = githubLimit
     log(`cycle ${cycle}: GitHub refused a call for a ${secondary ? 'secondary ' : ''}rate limit (${error}) — stopping; relaunch ${resetAt ? `after ${resetAt}` : 'once it clears'}`)
     return stop(cycle, 'github-rate-limited', { rateLimit: githubLimit })
@@ -3032,14 +3034,43 @@ const restoreCarried = (cycle, r, candidates) => {
   return null
 }
 
-const humanReview = (cycle, waiting, also = '') => {
+const humanReview = (cycle, waiting, also = '', extra = {}) => {
   log(`cycle ${cycle}: ${waiting.length} comment(s) by people wait for an answer — ` +
     `${waiting.map(w => `${w.commentId} by ${w.author} (${w.url})`).join(', ')}; theirs to answer or resolve, this run does not answer them`)
   return stop(cycle, 'human-review', {
     detail: `comments by people wait for an answer: theirs to answer or resolve; this run does not answer them${also}`,
     waiting: waiting.map(({ kind, commentId, author, authorAssociation, path, line, createdAt, url }) =>
       ({ kind, commentId, author, authorAssociation, path, line, createdAt, url })),
+    ...extra,
   })
+}
+
+// harvest.py's full line, of which a check before a write reads only the comments people wait on (#591).
+const WAITING = {
+  type: 'object', required: ['waiting'],
+  properties: { error: { type: 'string' }, rateLimit: RATE_LIMIT, waiting: REVIEWS.properties.waiting },
+}
+// harvest.py read again just before a write, as the stop to return, else null (#591): the harvest the write rests on is
+// minutes old, and a reply or resolve of ours in a person's thread would read as its answer. `held` names what the stop
+// leaves undone, `extra` the stop's members that name it.
+const waitingNow = async (entry, label, held, extra = {}) => {
+  if (reviewers.length === 0) return null
+  const prompt = `${IN_CHECKOUT}Editing nothing, ` + runExactly(`${HARVEST_SCRIPT} --pr ${args.pr} --repo ${shq(repo)} --reviewers ${reviewers.join(',')}`)
+  const opts = { label, phase: 'Triage', model: 'haiku', effort: 'low', schema: WAITING }
+  const first = await relayRun(prompt, opts)
+  // harvest.py's own error line is run once more, as the validator does; a rate limit or a file never claimed is not.
+  const r = retriable(first) || (first.error && !first.transport && !first.rateLimit) ? (await relayRetry(prompt, opts)) ?? first : first
+  if (r && r.rateLimit) {
+    log(`cycle ${entry.cycle}: GitHub refused harvest.py ${held} for a rate limit (${r.error}) — stopping`)
+    return stop(entry.cycle, 'github-rate-limited', { rateLimit: githubLimit, ...extra })
+  }
+  if (!r || r.error) {
+    const detail = `${held}: ${!r ? 'the relay died' : r.transport ? `no harvest.py line came back: ${r.error}` : scriptError('harvest.py', r)}`
+    log(`cycle ${entry.cycle}: harvest.py failed twice — ${detail}`)
+    entry.error = `harvest.py failed: ${detail}`
+    return stop(entry.cycle, 'harvest-failed', { detail, ...extra })
+  }
+  return r.waiting.length ? humanReview(entry.cycle, r.waiting, `; ${held}`, extra) : null
 }
 
 // #359: after a cycle that only waited out CodeRabbit's rate limit, a probe of harvest.py stands in for the validator
@@ -3125,11 +3156,20 @@ const runLanes = async (cycle, entry, lanes) => {
         return stop(cycle, 'review-report-unusable', { detail: why })
       }
       lastRead = { head: expectedHead, json: JSON.stringify(r) }
+      reviewedCycles.set(cycle, r.findings)
       // A person's comment still waiting for an answer is the human's to settle (#591): nothing is fixed, answered, pushed,
-      // asked of a bot or counted done over it. A reply in its thread, its resolution or the author's answer lets a relaunch pass.
+      // asked of a bot or counted done over it. Its resolution, or an answer after it by the author or the posting account, lets a relaunch pass.
       if (r.waiting && r.waiting.length) return humanReview(cycle, r.waiting)
     }
-    if (r !== nobody) reviewedCycles.set(cycle, r.findings)
+    // harvest.py read again just before this cycle writes, which may be minutes after the harvest above (#591); a clear
+    // reading stands until a fix's verification has run, which takes long.
+    let clear = false
+    const clearToWrite = async (what, held, extra) => {
+      if (clear) return null
+      const blocked = await waitingNow(entry, `waiting#${cycle}-${what}`, held, extra)
+      clear = !blocked
+      return blocked
+    }
     entry.bots = r === nobody
       ? { waitedMin: 0, since: null, clock: null, bots: [] }
       : settleBots(r)
@@ -3440,7 +3480,12 @@ const runLanes = async (cycle, entry, lanes) => {
       const d = debt.get(id)
       return !d || [...(dismissalsToo ? d.dismissals : []), ...d.notes].every(k => harvested.has(k))
     }
-    if (!settlementsTried && settlementsArg.length && r !== nobody) (await settleCaller(cycle, digestOf, held, ended)).forEach(id => ledger.delete(id))
+    const repliesHeld = "before this cycle's replies, none posted"
+    if (!settlementsTried && settlementsArg.length && r !== nobody) {
+      const blocked = args.autoPush === true ? await clearToWrite('replies', repliesHeld) : null
+      if (blocked) return blocked
+      for (const id of await settleCaller(cycle, digestOf, held, ended)) ledger.delete(id)
+    }
     if (lanes.prState) return prEnded(cycle, lanes.prState)
     r.findings = r.findings.filter(f => !answeredByHand(f))
 
@@ -3469,6 +3514,8 @@ const runLanes = async (cycle, entry, lanes) => {
     if (freshReplies.length > 0 && args.autoPush === true) {
       // Keep the receipt first: a cycle that dies after posting must still say what went out.
       if (await ended('replies')) return prEnded(cycle, lanes.prState)
+      const blocked = await clearToWrite('replies', repliesHeld)
+      if (blocked) return blocked
       entry.refutedPosts = await publishReplies(`replies#${cycle}`, freshReplies, 'refutation', cycle, digestOf)
       entry.sonarMarked = await settleSonar(cycle, entry, ended)
       if (lanes.prState) return prEnded(cycle, lanes.prState)
@@ -3478,6 +3525,8 @@ const runLanes = async (cycle, entry, lanes) => {
       .map(id => ({ commentId: id, body: deferredOn(id).map(deferralLine).join('\n') }))
     if (deferralReplies.length > 0 && args.autoPush === true) {
       if (await ended('defer')) return prEnded(cycle, lanes.prState)
+      const blocked = await clearToWrite('replies', repliesHeld)
+      if (blocked) return blocked
       entry.deferralPosts = await publishReplies(`defer#${cycle}`, deferralReplies, 'deferral', cycle, digestOf)
     }
 
@@ -3492,6 +3541,7 @@ const runLanes = async (cycle, entry, lanes) => {
       })))
       if (lanes.prState) return prEnded(cycle, lanes.prState)
       const verdict = await fixAndVerify(work, `${cycle}-review`, true)
+      clear = false
       const { ok, fixes, owned, uncommitted, brief, rejected } = verdict
       entry.reviewFixes = fixes
       // A rejected finding is held, its evidence on its decision, until the next harvest judges it again; a second rejection is the caller's.
@@ -3521,6 +3571,9 @@ const runLanes = async (cycle, entry, lanes) => {
         return prEnded(cycle, lanes.prState)
       }
       if (owned.length > 0) {
+        // Its fix notes follow the push with no other check: a stop between them would leave a fixed finding owing a refutation.
+        const blocked = await clearToWrite('review', 'before the review-lane push, its verified fixes left uncommitted', { uncommitted })
+        if (blocked) return blocked
         // Any push attempt may have restarted CI, a refused or unknown one included.
         const push = await commitAndPush(cycle, 'review', owned, brief, () => { lanes.reviewPublishing = true })
         if (!push.pass) {
@@ -3551,6 +3604,8 @@ const runLanes = async (cycle, entry, lanes) => {
     }
     if (answerable.size > 0) {
       if (await ended('resolve')) return prEnded(cycle, lanes.prState)
+      const blocked = await clearToWrite('resolve', "before this cycle's fix notes, none posted")
+      if (blocked) return blocked
       entry.fixNotePosts = await publishReplies(`resolve#${cycle}`, [...answerable.values()], 'fixNote', cycle, digestOf)
     }
 
@@ -3620,6 +3675,7 @@ const runLanes = async (cycle, entry, lanes) => {
         text: `CI ${rf.check}: ${rf.firstError}`,
       })))
       const verdict = await fixAndVerify(work, `${cycle}-ci`)
+      clear = false
       const { ok, fixes, owned, brief } = verdict
       entry.ciFixes = fixes
       if (!verdict.dispatched && verdict.withheld.length) return withheldStop(cycle, 'CI', verdict.withheld)
@@ -3628,6 +3684,8 @@ const runLanes = async (cycle, entry, lanes) => {
         return stop(cycle, 'dry-run', { dryRun: true })
       }
       if (!ok) return unverifiedStop(cycle, 'CI', verdict)
+      const blocked = await clearToWrite('ci', 'before the CI-lane push, its verified fixes left uncommitted', { uncommitted: verdict.uncommitted })
+      if (blocked) return blocked
       const ciPush = await commitAndPush(cycle, 'ci', owned, brief)
       if (!ciPush.pass) {
         entry.ciPushFailed = ciPush
@@ -3996,34 +4054,12 @@ expectedHead = adoption ? adoption.from : pinned.prHead.trim()
 pin = currentPin
 log(`preflight: ${pinned.prRepo} ${pinned.branch}@${pinned.head.slice(0, 7)} tracking ${pinned.remote}, clean`)
 
-// harvest.py's full line, of which an adoption's push reads only the comments people wait on (#591).
-const WAITING = {
-  type: 'object', required: ['waiting'],
-  properties: { error: { type: 'string' }, rateLimit: RATE_LIMIT, waiting: REVIEWS.properties.waiting },
-}
 // Why an unpublished adoption must not be pushed yet, as the stop to return, else null: the harvest runs on the head
 // after the push, too late for a person's comment already waiting (#591). Its stop names the adoption it held, which
 // stays the state's to retry with the same adoptHead while the checkout sits at its `to`.
-const adoptBlocked = async (entry) => {
-  if (reviewers.length === 0) return null
-  const adoptionHeld = { from: adoption.from, to: adoption.to }
-  const prompt = `${IN_CHECKOUT}Editing nothing, ` + runExactly(`${HARVEST_SCRIPT} --pr ${args.pr} --repo ${shq(repo)} --reviewers ${reviewers.join(',')}`)
-  const opts = { label: 'adopt:waiting', phase: 'Triage', model: 'haiku', effort: 'low', schema: WAITING }
-  const first = await relayRun(prompt, opts)
-  const r = !first || (first.error && !first.rateLimit) ? (await relayRetry(prompt, opts)) ?? first : first
-  const held = `before the adoption push of ${adoption.to.slice(0, 7)}, left unpublished`
-  if (r && r.rateLimit) {
-    log(`cycle ${entry.cycle}: GitHub refused harvest.py ${held} for a rate limit (${r.error}) — stopping; relaunch with the same adoptHead once it clears`)
-    return stop(entry.cycle, 'github-rate-limited', { rateLimit: githubLimit, adoptionHeld })
-  }
-  if (!r || r.error) {
-    const detail = `${held}: ${!r ? 'the relay died' : scriptError('harvest.py', r)}`
-    log(`cycle ${entry.cycle}: harvest.py failed twice — ${detail}`)
-    entry.error = `harvest.py failed: ${detail}`
-    return stop(entry.cycle, 'harvest-failed', { detail, adoptionHeld })
-  }
-  return r.waiting.length ? { ...humanReview(entry.cycle, r.waiting, `; ${held}: relaunch with the same adoptHead once they are settled`), adoptionHeld } : null
-}
+const adoptBlocked = (entry) => waitingNow(entry, 'adopt:waiting',
+  `before the adoption push of ${adoption.to.slice(0, 7)}, left unpublished`,
+  { adoptionHeld: { from: adoption.from, to: adoption.to } })
 // Runs before any watcher so the attempt is recorded first; only a PR head read-back proves the push.
 const adopt = async (entry) => {
   const { from, to, commits, paths } = adoption
