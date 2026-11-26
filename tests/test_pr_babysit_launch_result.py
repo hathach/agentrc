@@ -634,14 +634,18 @@ class LaunchResultTest(unittest.TestCase):
                                   'state': {'expectedHead': HEAD, 'pending': {'sha': NEXT, 'parent': HEAD, 'lane': lane, 'stage': stage}}})
             actions = data['result']['observation']['actions']
             actions.pop('reviewPush')
-            actions[f'{lane}Push'] = {'pass': False, 'committed': True, 'sha': NEXT, 'detail': 'push rejected'}
+            actions[f'{lane}Push'] = {'pass': False, 'committed': True, 'sha': NEXT, 'detail': 'push rejected',
+                                      **({'held': True} if stage == 'push-held' else {})}
             return launch_result.summarize(data, '/t/w.output', tree={'branch': 'pr', 'head': checkout, 'dirty': []})['blockers']
         for lane in ('review', 'ci'):
-            for stage in ('push-failed', 'publication-unknown'):
+            for stage in ('push-failed', 'push-held', 'publication-unknown'):
                 with self.subTest(lane=lane, stage=stage):
+                    held = stage == 'push-held'
+                    answered = "once the people's comments it was held for are answered, " if held else ''
                     self.assertEqual(failed(lane, stage), [
-                        f'uncertain publication: {lane}Push: push rejected; the {lane} repair bbbbbbbb on aaaaaaaa is unpublished '
-                        f'({stage}): relaunch with the same stateRef and adoptHead {NEXT}, the checkout left at it, while the PR '
+                        f"{'held' if held else 'uncertain'} publication: {lane}Push: push rejected; the {lane} repair bbbbbbbb on "
+                        f'aaaaaaaa is unpublished ({stage}): {answered}'
+                        f'relaunch with the same stateRef and adoptHead {NEXT}, the checkout left at it, while the PR '
                         'head is still aaaaaaaa; once the PR heads bbbbbbbb, that launch reconciles it as published; moved elsewhere, '
                         'it stops adopt-pending',
                         f"heads disagree: {{'state': '{HEAD}', 'checkout': '{NEXT}'}}; the checkout holds the unpublished {lane} "

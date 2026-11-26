@@ -1280,7 +1280,7 @@ const pendingOf = () => {
   for (const [lane, key] of [['review', 'reviewPushFailed'], ['ci', 'ciPushFailed']]) {
     const f = last && last[key]
     if (f && f.committed && f.sha) {
-      return { sha: f.sha, parent: expectedHead, lane, stage: f.detail.startsWith('commit failed audit') ? 'audit-blocked' : f.published === 'unknown' ? 'publication-unknown' : 'push-failed' }
+      return { sha: f.sha, parent: expectedHead, lane, stage: f.detail.startsWith('commit failed audit') ? 'audit-blocked' : f.held ? 'push-held' : f.published === 'unknown' ? 'publication-unknown' : 'push-failed' }
     }
     if (f && f.committed) return { sha: null, parent: expectedHead, lane, stage: 'audit-unknown' }
     if (f && f.committed === null) return { sha: null, parent: expectedHead, lane, stage: 'push-unknown' }
@@ -2187,7 +2187,7 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
   if (humans.harvestError || humans.humanWaiting.length) {
     const held = humans.harvestError ? `the people's comments went unread: ${humans.harvestError}` : `${humans.humanWaiting.length} comment(s) by a trusted person wait for an answer`
     log(`push#${cycle}-${what}: committed but NOT pushed — ${held}`)
-    return { pass: false, committed: true, detail: `not pushed: ${held}`, sha, humans, ...(generatedPaths.length ? { generated: generatedPaths } : {}) }
+    return { pass: false, committed: true, held: true, detail: `not pushed: ${held}`, sha, humans, ...(generatedPaths.length ? { generated: generatedPaths } : {}) }
   }
   beforePush()
   const push = await pushExact(sha, `push#${cycle}-${what}`)
@@ -3968,7 +3968,7 @@ let reconciled = null
 const candidate = restored && restored.pin && restored.pending
 const source = candidate && history.length ? history[history.length - 1][candidate.lane === 'adopt' ? 'adoption' : `${candidate.lane}PushFailed`] : null
 if (source && candidate.sha && candidate.sha === pinned.prHead.trim() && (candidate.lane === 'adopt' ? source.to : source.sha) === candidate.sha &&
-  ['publication-unknown', 'push-failed', 'adopt-push-unknown', 'adopt-push-failed'].includes(candidate.stage)) {
+  ['publication-unknown', 'push-failed', 'push-held', 'adopt-push-unknown', 'adopt-push-failed'].includes(candidate.stage)) {
   const { lane, stage, sha, parent } = candidate
   const failure = lane === 'adopt' ? { publication: source.publication, detail: source.detail } : source
   reconciled = { lane, stage, sha, parent, failure }

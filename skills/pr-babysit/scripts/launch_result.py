@@ -270,13 +270,14 @@ def finding_verdicts(findings, comment_id):
 
 def unpublished_repair(pending):
     """(push lane, sha, the relaunch that settles it, what the heads blocker adds) for a review or CI repair the state
-    holds unpublished after its push failed or went unknown, else None."""
+    holds unpublished after its push failed, went unknown or was held for the people's comments, else None."""
     if not (isinstance(pending, dict) and pending.get('lane') in ('review', 'ci') and pending.get('sha')
-            and pending.get('stage') in ('push-failed', 'publication-unknown')):
+            and pending.get('stage') in ('push-failed', 'push-held', 'publication-unknown')):
         return None
     sha, parent = pending['sha'], str(pending.get('parent') or '')
+    held = "once the people's comments it was held for are answered, " if pending['stage'] == 'push-held' else ''
     return (f"{pending['lane']}Push", sha,
-            f"the {pending['lane']} repair {sha[:8]} on {parent[:8]} is unpublished ({pending['stage']}): relaunch with the same "
+            f"the {pending['lane']} repair {sha[:8]} on {parent[:8]} is unpublished ({pending['stage']}): {held}relaunch with the same "
             f'stateRef and adoptHead {sha}, the checkout left at it, while the PR head is still {parent[:8]}; '
             f'once the PR heads {sha[:8]}, that launch reconciles it as published; moved elsewhere, it stops adopt-pending',
             f"the checkout holds the unpublished {pending['lane']} repair, settled by its adoptHead relaunch")
@@ -302,7 +303,8 @@ def receipts(cycles, findings, unpublished=None):
                 pushes.append({'lane': lane, **p})
                 if p.get('pass') is not True or p.get('committed') is None:
                     settle = unpublished and unpublished[:2] == (lane, p.get('sha'))
-                    blocking.append(f'uncertain publication: {lane}: {cut(p.get("detail", ""))}' + (f'; {unpublished[2]}' if settle else ''))
+                    blocking.append(f'{"held" if p.get("held") else "uncertain"} publication: {lane}: {cut(p.get("detail", ""))}'
+                                    + (f'; {unpublished[2]}' if settle else ''))
         for kind in ('refutedPosts', 'fixNotePosts', 'deferralPosts'):
             posts = actions.get(kind)
             if posts:

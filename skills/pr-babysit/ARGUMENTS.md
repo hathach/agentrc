@@ -35,7 +35,8 @@ A key not listed here throws before anything runs.
   adoption's push: one that waits for an answer stops
   `human-review-pending` before anything more is asked, fixed, answered or
   pushed, listing it in `humanWaiting` for the human to settle; a repair it
-  holds stays committed, unpublished, as the state's `pending` candidate.
+  holds stays committed, unpublished, as the state's `pending` candidate at
+  stage `push-held`.
 - `autoRun`: the reviewers that run on every push and gate done; default
   `reviewers` without `copilot` and `code-scanning`, which are only harvested.
   Every reviewer is reported with its state; only these are waited on, which is
@@ -221,7 +222,8 @@ A key not listed here throws before anything runs.
   prunes those copies: one is needed only while a caller may continue from its
   `stateRef`, so a finished PR's can be deleted by hand. A candidate the state
   holds unpublished (a repair or an adoption whose push failed or went
-  unread) that the live PR head now is exactly was published after all:
+  unread, or a repair whose push the people's comments held) that the live PR
+  head now is exactly was published after all:
   preflight records it so, its failure kept as the evidence in the state's
   `last.reconciled`, and continues from it, debt, answers and decisions kept.
   Ancestry or a `rebasedHead` proves nothing: any other unpublished candidate

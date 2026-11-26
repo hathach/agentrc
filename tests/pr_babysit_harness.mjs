@@ -7434,10 +7434,11 @@ test('rejected or dead adoption pushes preserve the ledger and recover without r
 
 // #443: a candidate recorded unpublished whose push landed after all, made by a real failing launch.
 const RED_ARM = { status: 'red', infraRerun: [], realFailures: [{ check: 'build / arm', firstError: 'boom', files: ['src/a.c'], verdict: 'real' }] }
-const UNPUBLISHED = [['review', 'publication-unknown'], ['review', 'push-failed'], ['ci', 'publication-unknown'], ['ci', 'push-failed'],
-  ['adopt', 'adopt-push-unknown'], ['adopt', 'adopt-push-failed']]
+const UNPUBLISHED = [['review', 'publication-unknown'], ['review', 'push-failed'], ['review', 'push-held'], ['ci', 'publication-unknown'],
+  ['ci', 'push-failed'], ['ci', 'push-held'], ['adopt', 'adopt-push-unknown'], ['adopt', 'adopt-push-failed']]
 const unpublished = async (lane, stage) => {
-  const failing = stage === 'publication-unknown' ? { throwOn: 'push#' } : { push: null }
+  const failing = stage === 'publication-unknown' ? { throwOn: 'push#' }
+    : stage === 'push-held' ? { humans: (label) => label === `humans#1-${lane}` ? [OBJECTION] : [] } : { push: null }
   if (lane === 'review') return (await run({ reviews: oneValid, args: { maxCycles: 4 }, ...failing })).result.state
   if (lane === 'ci') return (await run({ ci: RED_ARM, args: { maxCycles: 4 }, ...failing })).result.state
   const adoptPush = stage === 'adopt-push-unknown' ? null : receiptOf(HEAD, HEAD, ' ! [rejected] non-fast-forward', false)
@@ -8434,7 +8435,8 @@ test('a person\'s comment arriving while a lane fixes or commits stops its push,
       assert.deepEqual([result.reason, result.humanWaiting], ['human-review-pending', [OBJECTION]], why)
       assert.ok(labels.indexOf(`humans#1-${lane}`) > labels.indexOf(`audit#1-${lane}`), why)
       assert.deepEqual(labels.filter(l => /^(push|resolve)#/.test(l)), [], why)
-      assert.deepEqual(result.state.pending, { sha: shaFor(1), parent: HEAD, lane, stage: 'push-failed' }, `${why}: the commit is the caller's to adopt`)
+      assert.deepEqual(result.state.pending, { sha: shaFor(1), parent: HEAD, lane, stage: 'push-held' }, `${why}: the commit is the caller's to adopt`)
+      assert.equal(result.history[0][`${lane}PushFailed`].held, true, why)
       assert.equal(result.state.expectedHead, HEAD, why)
     }
     const failed = await run({ ...opts, humans: (label) => label === 'humans#1' ? [] : { error: 'gh api graphql: HTTP 502' } })
