@@ -12,7 +12,8 @@ import tempfile
 from pathlib import Path
 
 FILES = ()  # loads and launches nothing by path (hil_load.py)
-PUBLIC = frozenset({"config", "identity", "load", "stage", "conformance", "PinError"})  # agentrc_pin.py's docstring
+# agentrc_pin.py's docstring names them
+PUBLIC = frozenset({"ci", "config", "identity", "load", "stage", "conformance", "PinError"})
 
 
 class ConformanceError(Exception):

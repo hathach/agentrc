@@ -654,11 +654,11 @@ class Conformance(Consumer):
         hil = '.claude/skills/hil-contract/scripts'
         self.script('hil-contract/scripts/public.py',
                     'import agentrc_pin as pin\nfrom agentrc_pin import PinError, config, identity, stage\n'
-                    f'pin.load({BUILD!r}).run(pin.config(), pin.identity(), pin.stage, pin.conformance)\n'
+                    f'pin.load({BUILD!r}).run(pin.ci(), pin.config(), pin.identity(), pin.stage, pin.conformance)\n'
                     'path = pin.__file__\n')
         self.script('hil-contract/scripts/alias.py', 'import json, agentrc_pin as boot\nboot.ROOT = 1\n'
                                                      'boot.literals(boot.ROOT, "tools/build_all.py")\n')
-        self.script('hil-contract/scripts/names.py', 'from agentrc_pin import load, _selection as sel, ci\n')
+        self.script('hil-contract/scripts/names.py', 'from agentrc_pin import load, _selection as sel, check\n')
         test = self.root / '.claude/test/test_agentrc_pin.py'
         test.parent.mkdir(parents=True, exist_ok=True)
         test.write_text('import agentrc_pin\n\n\nassert agentrc_pin._selection()[0].stage\n'
@@ -669,7 +669,7 @@ class Conformance(Consumer):
                 f'{hil}/alias.py:3: uses agentrc_pin.ROOT, internal to the bootstrap',
                 f'{hil}/alias.py:3: uses agentrc_pin.literals, internal to the bootstrap',
                 f'{hil}/names.py:1: uses agentrc_pin._selection, internal to the bootstrap',
-                f'{hil}/names.py:1: uses agentrc_pin.ci, internal to the bootstrap',
+                f'{hil}/names.py:1: uses agentrc_pin.check, internal to the bootstrap',
                 '.claude/test/test_agentrc_pin.py:4: uses agentrc_pin._selection, internal to the bootstrap'])
 
     def test_an_alias_counts_only_in_the_scope_its_import_binds(self):
