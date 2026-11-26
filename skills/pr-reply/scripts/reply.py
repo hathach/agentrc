@@ -16,7 +16,12 @@ would not anchor inline). A review reply goes to the thread's first comment, whe
 GitHub files every reply, and is read back: it must match the body as gh reads it
 (lib/gh_reads.py), sit in that
 thread after the comment it answers, and carry our login and the PR, before the
-thread is resolved; the other two
+thread is resolved. A review reply is neither posted nor its thread resolved
+while a person's comment waits in the thread, by fresh listing: one by a
+trusted account (OWNER, MEMBER or COLLABORATOR, no Bot), neither ours nor the
+PR author's, after the last comment by us or the author (and after the target,
+when the target is itself a person's); the receipt's error names it, since
+pr-babysit's harvest.py would read our reply or the resolve as its answer. The other two
 have no thread: the reply is an issue comment whose body is the original's URL
 as a quote line plus the text. Every reply digest here is the text's, the
 quote line left out. A reply of ours with the identical body already
@@ -123,6 +128,7 @@ THREADS_QUERY = ('query($o:String!,$r:String!,$p:Int!,$c:String){repository(owne
                  'nodes{id isResolved comments(first:1){nodes{databaseId}}}}}}}')
 RESOLVE_MUTATION = 'mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{isResolved}}}'
 BODY_MAX = 300
+TRUSTED = ('OWNER', 'MEMBER', 'COLLABORATOR')  # harvest.py's: who a run must not talk over
 
 
 class ApiError(Exception):
@@ -195,6 +201,7 @@ class Poster:
         self._review = None
         self._issue = None
         self._reviews = None
+        self._author = None
 
     def review_comments(self):
         if self._review is None:
@@ -210,6 +217,35 @@ class Poster:
         if self._reviews is None:
             self._reviews = api('GET', f'repos/{self.repo}/pulls/{self.pr}/reviews?per_page=100', paginate=True)
         return self._reviews
+
+    def author(self):
+        if self._author is None:
+            self._author = api('GET', f'repos/{self.repo}/pulls/{self.pr}')['user']['login']
+        return self._author
+
+    def waiting_person(self, target):
+        """From a fresh listing, the first comment in target's thread by a person (a trusted account, no Bot, neither ours
+        nor the PR author's) after the last one by us or the author, and after target when target is a person's, else None."""
+        self._review = None
+        root = thread_root(target)
+        thread = [c for c in self.review_comments() if root in (c['id'], c.get('in_reply_to_id'))]
+
+        def person(c, answerers):
+            return (c.get('user') or {}).get('type') != 'Bot' and c.get('author_association') in TRUSTED and c['user']['login'] not in answerers
+
+        def after_answer(answerers):
+            answered = [c['id'] for c in thread if c['user']['login'] in answerers or (c['id'] == target['id'] and person(c, answerers))]
+            return [c for c in thread if person(c, answerers) and c['id'] > max(answered, default=0)]
+        # The PR author is read only when a comment could be a person's.
+        if not after_answer({self.me}):
+            return None
+        return next(iter(after_answer({self.me, self.author()})), None)
+
+    def unanswered(self, target, what):
+        """Why a reply or resolve in target's thread must wait for a person, None when it need not."""
+        c = self.waiting_person(target)
+        return c and (f"comment {c['id']} by {c['user']['login']} in this thread waits for a person's answer after ours "
+                      f"and the PR author's: {what}")
 
     def pending_review(self):
         """Our PENDING review on the PR, None when there is none; ApiError when the reviews could not be listed."""
@@ -298,6 +334,9 @@ class Poster:
     def resolve(self, target):
         """Resolve review comment target's thread, found by its first comment: the target can lie past any page of
         the thread's comments."""
+        why = self.unanswered(target, 'thread not resolved')
+        if why:
+            return why
         root = thread_root(target)
         owner, name = self.repo.split('/', 1)
         cursor = None
@@ -480,6 +519,10 @@ def handle(poster, item):
         if found:
             reply_id = found[0]
         else:
+            why = poster.unanswered(original, 'not posted') if kind == 'review' else None
+            if why:
+                rc['error'] = why
+                return rc
             rc['sent'] = True
             try:
                 reply_id = poster.post(kind, original, body)

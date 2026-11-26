@@ -44,9 +44,11 @@ class FakeGitHub:
         self.mutations = []
         self.calls = []
         self.reads = lambda out: out  # a response's JSON text as gh returns it
+        self.author = 'contributor'
 
-    def review_comment(self, cid, body='bot says', login='bot', thread=None, parent=None):
-        self.review[cid] = {'id': cid, 'body': body, 'user': {'login': login}, 'in_reply_to_id': parent,
+    def review_comment(self, cid, body='bot says', login='bot', thread=None, parent=None, association=None, type='User'):
+        self.review[cid] = {'id': cid, 'body': body, 'user': {'login': login, 'type': type}, 'in_reply_to_id': parent,
+                            'author_association': association,
                             'pull_request_url': f'https://api.github.com/repos/{REPO}/pulls/{PR}',
                             'html_url': f'https://github.com/{REPO}/pull/{PR}#discussion_r{cid}'}
         t = thread or f'T{cid}'
@@ -81,6 +83,8 @@ class FakeGitHub:
         pages = (lambda xs: [list(xs)]) if paginate else (lambda xs: list(xs))
         if path == 'user':
             return {'login': ME}
+        if path == f'repos/{REPO}/pulls/{PR}' and method == 'GET':
+            return {'number': PR, 'user': {'login': self.author}}
         m = re.fullmatch(rf'repos/{REPO}/pulls/{PR}/comments', path)
         if m and method == 'GET':
             return pages(self.review.values())
@@ -587,7 +591,8 @@ class ReplyTest(ReplyCase):
         self.assertEqual(rc, 0, receipts)
         listings = [a[3].split('?')[0] for a in self.gh.calls if a[:3] == ['api', '-X', 'GET'] and '--paginate' in a]
         self.assertEqual({p: listings.count(p) for p in (f'repos/{REPO}/pulls/{PR}/comments', f'repos/{REPO}/issues/{PR}/comments')},
-                         {f'repos/{REPO}/pulls/{PR}/comments': 2, f'repos/{REPO}/issues/{PR}/comments': 2}, 'once, then once after its own POST')
+                         {f'repos/{REPO}/pulls/{PR}/comments': 4, f'repos/{REPO}/issues/{PR}/comments': 2},
+                         'once, then once after its own POST; a review thread also before its POST and its resolve')
 
     def test_a_failed_post_citing_a_json_escape_adopts_the_reply_as_it_reads_back(self):
         self.gh.reads = GhReadsTest.reads
@@ -623,6 +628,78 @@ class ReplyTest(ReplyCase):
         self.run_script([{'commentId': 10, 'body': 'right text'}])
         methods = {a[2] for a in self.gh.calls if a[0] == 'api' and len(a) > 3 and a[1] == '-X'}
         self.assertLessEqual(methods, {'GET', 'POST'})
+
+
+class WaitingPersonTest(ReplyCase):
+    """A person's comment in the thread after our last answer: harvest.py would read our reply or the resolve as its answer."""
+
+    def answer(self, reply_id=11):
+        return {'commentId': 10, 'replyId': reply_id, 'bodyDigest': reply.fnv1a('ok'), 'originalDigest': reply.original_digest(self.gh.review[10])}
+
+    def test_a_persons_reply_blocks_the_post(self):
+        self.gh.review_comment(10)
+        self.gh.review_comment(11, 'wait, I disagree', 'maint', thread='T10', parent=10, association='MEMBER')
+        rc, receipts = self.run_script([{'commentId': 10, 'body': 'ok'}])
+        self.assertEqual(rc, 1)
+        self.assertEqual((receipts[0]['sent'], receipts[0]['replyId'], receipts[0]['verified'], receipts[0]['resolved']), (False, None, False, None))
+        self.assertEqual(receipts[0]['error'], "comment 11 by maint in this thread waits for a person's answer after ours and the PR author's: not posted")
+        self.assertEqual(self.gh.mutations, [])
+
+    def test_a_persons_reply_blocks_the_resolve(self):
+        self.gh.review_comment(10)
+        self.gh.review_comment(11, 'ok', ME, thread='T10', parent=10, association='OWNER')
+        self.gh.review_comment(12, 'not ok', 'maint', thread='T10', parent=10, association='COLLABORATOR')
+        for settle in (lambda: self.reuse(self.answer()), lambda: self.run_script([{'commentId': 10, 'body': 'ok'}])):
+            rc, receipts = settle()
+            self.assertEqual(rc, 1)
+            self.assertEqual((receipts[0]['replyId'], receipts[0]['verified'], receipts[0]['resolved']), (11, True, False))
+            self.assertIn('comment 12 by maint', receipts[0]['error'])
+            self.assertTrue(receipts[0]['error'].endswith('thread not resolved'))
+        self.assertEqual(self.gh.mutations, [])
+        self.assertFalse(self.gh.threads['T10']['resolved'])
+
+    def test_a_persons_reply_landing_after_our_post_blocks_the_resolve(self):
+        self.gh.review_comment(10)
+        real = self.gh.rest
+
+        def rest(method, path, body, paginate):
+            got = real(method, path, body, paginate)
+            if method == 'POST':
+                self.gh.review_comment(950, 'hold on', 'maint', thread='T10', parent=10, association='OWNER')
+            return got
+        self.gh.rest = rest
+        rc, receipts = self.run_script([{'commentId': 10, 'body': 'ok'}])
+        self.assertEqual((rc, receipts[0]['posted'], receipts[0]['verified'], receipts[0]['resolved']), (1, True, True, False))
+        self.assertIn('comment 950 by maint', receipts[0]['error'])
+        self.assertEqual([m[0] for m in self.gh.mutations], ['post-reply'])
+
+    def test_a_bots_or_an_untrusted_or_an_answered_comment_does_not_block(self):
+        self.gh.review_comment(10)
+        self.gh.review_comment(11, 'early word', 'maint', thread='T10', parent=10, association='MEMBER')
+        self.gh.review_comment(12, 'answered', ME, thread='T10', parent=10, association='OWNER')
+        self.gh.review_comment(13, 'bot again', 'coderabbitai[bot]', thread='T10', parent=10, association='MEMBER', type='Bot')
+        self.gh.review_comment(14, 'drive-by', 'stranger', thread='T10', parent=10, association='NONE')
+        self.gh.review_comment(15, 'thanks', 'contributor', thread='T10', parent=10, association='CONTRIBUTOR')
+        rc, receipts = self.run_script([{'commentId': 13, 'body': 'ok'}])
+        self.assertEqual((rc, receipts[0]['verified'], receipts[0]['resolved'], receipts[0]['error']), (0, True, True, None), receipts)
+        self.assertEqual([m[0] for m in self.gh.mutations], ['post-reply', 'resolve'])
+
+    def test_the_pr_authors_reply_does_not_block_and_is_read_only_when_needed(self):
+        self.gh.review_comment(10)
+        self.gh.review_comment(11, 'done', 'contributor', thread='T10', parent=10, association='MEMBER')
+        rc, receipts = self.run_script([{'commentId': 10, 'body': 'ok'}])
+        self.assertEqual((rc, receipts[0]['resolved']), (0, True), receipts)
+        self.assertEqual(sum(a[:4] == ['api', '-X', 'GET', f'repos/{REPO}/pulls/{PR}'] for a in self.gh.calls), 1, 'read once, then cached')
+        self.setUp()
+        self.gh.review_comment(10)
+        self.run_script([{'commentId': 10, 'body': 'ok'}])
+        self.assertFalse(any(a[:4] == ['api', '-X', 'GET', f'repos/{REPO}/pulls/{PR}'] for a in self.gh.calls), 'no person, no PR read')
+
+    def test_answering_a_persons_comment_answers_it(self):
+        self.gh.review_comment(10, 'please rename', 'maint', association='MEMBER')
+        self.gh.review_comment(11, 'and this too', 'maint', thread='T10', parent=10, association='MEMBER')
+        rc, receipts = self.run_script([{'commentId': 11, 'body': 'renamed both'}])
+        self.assertEqual((rc, receipts[0]['resolved'], receipts[0]['error']), (0, True, None), receipts)
 
 
 class FollowUpTest(ReplyCase):
