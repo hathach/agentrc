@@ -21,7 +21,8 @@ while a person's comment waits in the thread, by fresh listing: one by a
 trusted account (OWNER, MEMBER or COLLABORATOR, no Bot), neither ours nor the
 PR author's, after the last comment by us or the author (and after the target,
 when the target is itself a person's); the receipt's error names it, since
-pr-babysit's harvest.py would read our reply or the resolve as its answer. The other two
+pr-babysit's harvest.py would read our reply or the resolve as its answer; a thread
+someone already resolved reads resolved all the same. The other two
 have no thread: the reply is an issue comment whose body is the original's URL
 as a quote line plus the text. Every reply digest here is the text's, the
 quote line left out. A reply of ours with the identical body already
@@ -335,9 +336,6 @@ class Poster:
     def resolve(self, target):
         """Resolve review comment target's thread, found by its first comment: the target can lie past any page of
         the thread's comments."""
-        why = self.unanswered(target, 'thread not resolved')
-        if why:
-            return why
         root = thread_root(target)
         owner, name = self.repo.split('/', 1)
         cursor = None
@@ -350,6 +348,9 @@ class Poster:
                 if [c['databaseId'] for c in t['comments']['nodes']] == [root]:
                     if t['isResolved']:
                         return None
+                    why = self.unanswered(target, 'thread not resolved')
+                    if why:
+                        return why
                     r = graphql(RESOLVE_MUTATION, {'id': t['id']})
                     ok = r.get('data', {}).get('resolveReviewThread', {}).get('thread', {}).get('isResolved')
                     return None if ok else 'resolve mutation did not report isResolved'

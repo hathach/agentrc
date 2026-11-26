@@ -658,6 +658,18 @@ class WaitingPersonTest(ReplyCase):
         self.assertEqual(self.gh.mutations, [])
         self.assertFalse(self.gh.threads['T10']['resolved'])
 
+    def test_a_thread_resolved_by_hand_reads_resolved(self):
+        self.gh.review_comment(10)
+        self.gh.review_comment(11, 'ok', ME, thread='T10', parent=10, association='OWNER')
+        self.gh.review_comment(12, 'not ok', 'maint', thread='T10', parent=10, association='COLLABORATOR')
+        self.gh.threads['T10']['resolved'] = True
+        for settle in (lambda: self.run_script([{'commentId': 10, 'body': 'ok'}]), lambda: self.reuse(self.answer()),
+                       lambda: self.edit({**self.answer(), 'body': 'ok'})):
+            rc, receipts = settle()
+            self.assertEqual((rc, receipts[0]['replyId'], receipts[0]['verified'], receipts[0]['resolved'], receipts[0]['error']),
+                             (0, 11, True, True, None), receipts)
+        self.assertEqual(self.gh.mutations, [])
+
     def test_a_persons_reply_landing_after_our_post_blocks_the_resolve(self):
         self.gh.review_comment(10)
         real = self.gh.rest
