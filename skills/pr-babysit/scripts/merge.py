@@ -11,7 +11,8 @@ debt or pending publication, its state matching D and its own digest, pinned to 
 checkout's, the state's, the reviewed one, the reviews', CI's and the PR's), a fresh harvest (harvest.py with the
 launch's reviewers, from its fingerprint: the same fingerprint, CodeRabbit and Greptile both `reviewed` on the head
 and in its auto-run list, but for a bot --waive names: the owner's word that the merge goes without it, which a bot
-merely left out of auto-run never is; waiving both refuses, a merge needs one bot's review of the head),
+merely left out of auto-run never is; waiving both refuses, a merge needs one bot's review of the head; no trusted
+person's comment waiting for an answer, its humanWaiting, which no --waive covers),
 a fresh CI inventory (collect.py with no ignored check: green, mergeable, nothing pending, for the granted base,
 the base branch's required checks each passed on the head from the app it must come from; red only when every failed
 check is an execution the launch judged on the head, its state's ciCache naming that link and bucket, each failure its
@@ -238,6 +239,7 @@ def review_blockers(repo, n, fingerprint, head, waived=()):
         blockers.append(f"reviews: harvested head {fresh['headSha']}, not {head}")
     if fresh['fingerprint'] != fingerprint:
         blockers.append('fingerprint: the review evidence changed since the launch judged it: relaunch a `both` launch on the same state')
+    blockers += [f'human-review-pending: {launch_result.waiting_comment(w)}' for w in fresh['humanWaiting']]
     for b in fresh['bots']:
         if b['bot'] in required and (b['state'], b['sha']) != ('reviewed', head):
             blockers.append(f"{b['bot']}-unreviewed: {b['state']}{'/' + b['kind'] if b.get('kind') else ''}: {launch_result.cut(b.get('reason') or '')}")

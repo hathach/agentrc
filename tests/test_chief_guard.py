@@ -260,18 +260,19 @@ class ChiefGuard(unittest.TestCase):
                 self.assert_denied(c, named)
 
     def test_the_scan_is_linear(self):
-        # a regex that backtracks would run past the hook's deadline, which cannot interrupt it
-        start = time.monotonic()
-        r = self.hook('git push\necho $((' + '$aaaa ' * 16 + "'))")
-        self.assertEqual(r.returncode, 2, r.stderr)
-        self.assertLess(time.monotonic() - start, 5)
+        # a regex that backtracks would run past the hook's deadline, which cannot interrupt it; this process's CPU time
+        # is the scan's, never a loaded host's scheduling or the git calls' (#597)
+        start = time.process_time()
+        code, err = self.check('git push\necho $((' + '$aaaa ' * 16 + "'))")
+        self.assertEqual(code, 2, err)
+        self.assertLess(time.process_time() - start, 3)
         for c in ('echo $((' + '$aaaa ' * 20000 + "'))", "echo $'" + 'a' * 200000 + "'",
                   "cat <<'E'\n" + 'x\n' * 200000 + 'E', 'git status ' + '\\\n' * 50000, 'echo ' + 'a\\\n' * 30000, 'echo "' + '$x ' * 50000 + '"',
                   "echo '" + 'x' * 200000 + "'", 'echo ' + '<\\\n' * 30000 + 'x'):
             with self.subTest(c=c[:30]):
-                start = time.monotonic()
+                start = time.process_time()
                 self.check(c)
-                self.assertLess(time.monotonic() - start, 3)
+                self.assertLess(time.process_time() - start, 3)
 
     def test_a_command_behind_a_redirect_or_a_deferred_form_is_seen(self):
         # #229: an fd before a redirect is the redirect's, not the command word

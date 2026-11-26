@@ -345,6 +345,24 @@ class LaunchResultTest(unittest.TestCase):
         rc, s = self.run_it(output(result={**base, 'reason': 'ci-stuck', 'pending': 1}))
         self.assertFalse(any('approve' in b for b in s['blockers']), 'only its own stop names them')
 
+    def test_a_human_review_stop_lists_each_waiting_comment_as_the_humans_to_settle(self):
+        # #591: never a finding the caller judges; a relaunch helps once each is answered or resolved.
+        waiting = [{'kind': 'inline', 'id': 71, 'author': 'bob', 'url': 'https://github.com/o/r/pull/7#discussion_r71', 'path': 'src/a.c',
+                    'line': 3, 'createdAt': '2026-11-01T00:00:00Z', 'digest': 'd71'},
+                   {'kind': 'review', 'id': 33, 'author': 'carol', 'url': 'https://github.com/o/r/pull/7#pullrequestreview-33',
+                    'createdAt': '2026-11-01T00:00:00Z', 'digest': 'd33'}]
+        base = {'pass': False, 'status': 'blocked', 'reason': 'human-review-pending', 'head': HEAD, 'humanWaiting': waiting,
+                'state': {'expectedHead': HEAD, 'cyclesUsed': 1, 'maxCycles': 5}}
+        rc, s = self.run_it(output(result=base))
+        self.assertEqual(s['blockers'], [launch_result.STALLED['human-review-pending'],
+                                         'inline comment 71 by bob at src/a.c:3 waits for an answer: https://github.com/o/r/pull/7#discussion_r71',
+                                         'review comment 33 by carol waits for an answer: https://github.com/o/r/pull/7#pullrequestreview-33'])
+        self.assertIn("the human's to settle", s['blockers'][0])
+        self.assertIn('once the PR\'s author answered it or its thread is resolved', s['blockers'][0])
+        self.assertEqual(s['result']['humanWaiting'], waiting, 'kept verbatim')
+        rc, s = self.run_it(output(result={**base, 'reason': 'unactionable'}))
+        self.assertFalse(any('waits for an answer' in b for b in s['blockers']), 'only its own stop lists them')
+
     def test_a_state_too_large_to_load_is_a_blocker(self):
         rc, s = self.run_it(output(result={'pass': True, 'status': 'complete', 'stateTooLarge': 8400000,
                                            'state': {'expectedHead': NEXT, 'cyclesUsed': 1, 'maxCycles': 5}}))
@@ -616,14 +634,18 @@ class LaunchResultTest(unittest.TestCase):
                                   'state': {'expectedHead': HEAD, 'pending': {'sha': NEXT, 'parent': HEAD, 'lane': lane, 'stage': stage}}})
             actions = data['result']['observation']['actions']
             actions.pop('reviewPush')
-            actions[f'{lane}Push'] = {'pass': False, 'committed': True, 'sha': NEXT, 'detail': 'push rejected'}
+            actions[f'{lane}Push'] = {'pass': False, 'committed': True, 'sha': NEXT, 'detail': 'push rejected',
+                                      **({'held': True} if stage == 'push-held' else {})}
             return launch_result.summarize(data, '/t/w.output', tree={'branch': 'pr', 'head': checkout, 'dirty': []})['blockers']
         for lane in ('review', 'ci'):
-            for stage in ('push-failed', 'publication-unknown'):
+            for stage in ('push-failed', 'push-held', 'publication-unknown'):
                 with self.subTest(lane=lane, stage=stage):
+                    held = stage == 'push-held'
+                    answered = "once the people's comments it was held for are answered, " if held else ''
                     self.assertEqual(failed(lane, stage), [
-                        f'uncertain publication: {lane}Push: push rejected; the {lane} repair bbbbbbbb on aaaaaaaa is unpublished '
-                        f'({stage}): relaunch with the same stateRef and adoptHead {NEXT}, the checkout left at it, while the PR '
+                        f"{'held' if held else 'uncertain'} publication: {lane}Push: push rejected; the {lane} repair bbbbbbbb on "
+                        f'aaaaaaaa is unpublished ({stage}): {answered}'
+                        f'relaunch with the same stateRef and adoptHead {NEXT}, the checkout left at it, while the PR '
                         'head is still aaaaaaaa; once the PR heads bbbbbbbb, that launch reconciles it as published; moved elsewhere, '
                         'it stops adopt-pending',
                         f"heads disagree: {{'state': '{HEAD}', 'checkout': '{NEXT}'}}; the checkout holds the unpublished {lane} "

@@ -287,8 +287,8 @@ def attempt_entry(run_dir, code, row, seconds):
 
 
 def lock_observed(board):
-    """Whether the board's flock is held (True), free (False) or cannot be read (None): hil_lock.flock_observed, which
-    reads /proc/locks and takes nothing. The battery's own take stays the authority."""
+    """Whether the board's flock is held (True), free (False) or cannot be read (None), as hil_lock.flock_observed reads
+    it without taking it. The battery's own take stays the authority."""
     return H.A.lock.flock_observed(board)
 
 

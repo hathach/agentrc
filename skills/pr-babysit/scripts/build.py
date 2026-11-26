@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build pr-babysit's fix batch as the checkout stands and report what ran.
 
-  build.py --path P... --command CMD [--setup LINES] [--require TOOL ...] [--shell bash|powershell]
+  build.py --path P... --command CMD [--base-sha SHA] [--setup LINES] [--require TOOL ...] [--shell bash|powershell]
            [--job DIR --wait-seconds S --timeout-seconds T [--abandon-seconds A]]
 
 Pass values as --flag=VALUE when one may start with a dash. Run from the
@@ -10,7 +10,12 @@ included, in a fresh build directory that `<BUILD>` in CMD names, removed
 afterwards; the log is kept. `snapshot` names the state of PATH, a sha256 over
 `git diff --binary HEAD -- PATH` and every untracked file under PATH, taken
 before the build and again after it as `snapshotAfter`: a build that rewrote
-the batch's sources shows as two different digests.
+the batch's sources shows as two different digests. `<BASE>` in CMD names
+`git merge-base SHA HEAD`, the PR's base as --base-sha gives it, so a build
+that selects its targets from a change diffs against that base, never a local
+branch that may lag it (#587); a SHA not in the checkout, or one with no
+merge-base, is an error before anything is made. CMD without `<BASE>` ignores
+--base-sha.
 
 One shell runs SETUP (the environment the build contract requires, such as
 sourcing a toolchain's export script), checks that each TOOL is on PATH, then
@@ -24,9 +29,11 @@ the shell wherever it is, and a step's status is otherwise its last native
 program's.
 
 stdout ends with one JSON line {revision, snapshot, snapshotAfter, command,
-setup, requires, stage, buildDir, exit, usageError, log, retained, seal} (seal:
-facts.sealed): revision is HEAD, command with <BUILD> expanded, setup and
-requires as given ('' and [] without them), exit the shell's status,
+baseSha, base, setup, requires, stage, buildDir, exit, usageError, log,
+retained, seal} (seal: facts.sealed): revision is HEAD, command as run, its
+<BUILD> and <BASE> expanded, baseSha the --base-sha <BASE> was resolved from
+and base what it became (both null without <BASE>), setup and requires as
+given ('' and [] without them), exit the shell's status,
 retained what cleanup had to leave behind. usageError is the line a command
 that refused its own arguments printed, else null: one that exited 2 in the
 build step and opened its output with argparse's `usage:` (its `<prog>: error:`
@@ -75,7 +82,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from commits import bounded  # noqa: E402
-from facts import Parser, Unusable, checkout_top, git, report  # noqa: E402
+from facts import FULL_SHA, Parser, Unusable, attempt, checkout_top, git, report  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
 import windows  # noqa: E402
@@ -177,6 +184,16 @@ def powershell():
     raise Unusable('no Windows PowerShell in System32' if os.name == 'nt' else 'no pwsh on PATH')
 
 
+def merge_base(sha):
+    """What <BASE> names: sha's merge-base with HEAD; Unusable when sha is not in the checkout or has none."""
+    if attempt('git', 'cat-file', '-e', f'{sha}^{{commit}}')[0]:
+        raise Unusable(f"the PR's base {sha} is not in the checkout: fetch it")
+    code, out, err = attempt('git', 'merge-base', sha, 'HEAD')
+    if code:
+        raise Unusable(f"the PR's base {sha} has no merge-base with HEAD" + (f': {err.strip()}' if err.strip() else ''))
+    return out.strip()
+
+
 def prepare(a):
     """Everything a build needs before its shell runs, as one JSON-able record."""
     sh = powershell() if a.shell == 'powershell' else bash()
@@ -187,6 +204,7 @@ def prepare(a):
     if a.shell == 'powershell' and re.search('[‘-„]', tempfile.gettempdir()):
         raise Unusable(f'the temp dir {tempfile.gettempdir()} holds a PowerShell quote: point TMP and TEMP at a plain path')
     top = checkout_top()
+    base = a.base_sha and merge_base(a.base_sha)
 
     LOGS.mkdir(exist_ok=True)
     fd, log = tempfile.mkstemp(prefix='candidate-', suffix='.log', dir=LOGS)
@@ -195,7 +213,8 @@ def prepare(a):
     os.close(fd)
     build = Path(tempfile.mkdtemp(prefix='pr-babysit-build-')).as_posix()  # C:/... survives an unquoted <BUILD>
     b = {'sh': sh, 'top': top, 'log': log, 'stageFile': stage_file, 'buildDir': build, 'paths': a.path,
-         'command': a.command.replace('<BUILD>', build), 'setup': a.setup or '', 'requires': a.require}
+         'command': a.command.replace('<BUILD>', build).replace('<BASE>', base or ''), 'baseSha': a.base_sha, 'base': base,
+         'setup': a.setup or '', 'requires': a.require}
     if a.shell == 'powershell':
         b['shell'] = ps_script(a.setup, a.require, b['command'])
         # a file, -File: -Command would take the script's own quotes as the command line's; a BOM, which Windows
@@ -245,14 +264,15 @@ def finish(b, build_exit):
     except (Unusable, OSError) as e:
         fail(b, e)
     return {'revision': b['revision'], 'snapshot': b['snapshot'], 'snapshotAfter': after, 'command': b['command'],
-            'setup': b['setup'], 'requires': b['requires'], 'stage': stage, 'buildDir': b['buildDir'], 'exit': build_exit,
-            'usageError': usage, 'log': Path(b['log']).as_posix(), 'retained': cleanup(b)}
+            'baseSha': b['baseSha'], 'base': b['base'], 'setup': b['setup'], 'requires': b['requires'], 'stage': stage,
+            'buildDir': b['buildDir'], 'exit': build_exit, 'usageError': usage, 'log': Path(b['log']).as_posix(), 'retained': cleanup(b)}
 
 
 def parse(argv):
     p = Parser(prog='build.py')
     p.add_argument('--path', action='append', required=True)
     p.add_argument('--command', required=True)
+    p.add_argument('--base-sha')
     p.add_argument('--setup')
     p.add_argument('--require', action='append', default=[])
     p.add_argument('--shell', choices=('bash', 'powershell'), default='bash')
@@ -262,6 +282,10 @@ def parse(argv):
     p.add_argument('--abandon-seconds', type=int, default=ABANDON)
     p.add_argument('--stop-grace-seconds', type=int, default=STOP_GRACE, help=argparse.SUPPRESS)  # tests only
     a = p.parse_args(argv)
+    if '<BASE>' in a.command and not (a.base_sha and FULL_SHA.match(a.base_sha)):
+        raise Unusable('usage: <BASE> in --command needs --base-sha, a full commit SHA')
+    if '<BASE>' not in a.command:
+        a.base_sha = None  # a command without <BASE> ignores it
     if (a.job is None) != (a.wait_seconds is None) or (a.job is None) != (a.timeout_seconds is None):
         raise Unusable('usage: --job, --wait-seconds and --timeout-seconds go together')
     if a.job is not None and (a.wait_seconds < 0 or a.timeout_seconds < 1 or a.stop_grace_seconds < 1):
@@ -410,7 +434,8 @@ def start(d, a):
 
 
 def request_of(a, revision):
-    return {'paths': a.path, 'command': a.command, 'setup': a.setup or '', 'requires': a.require,
+    return {'paths': a.path, 'command': a.command, **({'baseSha': a.base_sha} if a.base_sha else {}),
+            'setup': a.setup or '', 'requires': a.require,
             'timeoutSeconds': a.timeout_seconds, 'revision': revision, **({'shell': a.shell} if a.shell != 'bash' else {})}
 
 

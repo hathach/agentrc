@@ -1636,9 +1636,19 @@ class RunTracked(unittest.TestCase):
             def alarm(*_):
                 raise KeyboardInterrupt
             signal.signal(signal.SIGALRM, alarm)
+
+            def once_escaped():
+                # an interrupt before the escapee leads its own session kills it with the group, leaving no receipt (#596)
+                pid = wait_file(f'{D}/gc')
+                while os.getsid(pid) != pid:
+                    time.sleep(0.005)
+                signal.pthread_kill(threading.main_thread().ident, signal.SIGALRM)    # to the thread that waits
             out = []
             for cmd in ('sleep 30', f'setsid sleep 30 </dev/null >/dev/null 2>&1 & echo $! > {D}/gc; sleep 30'):
-                signal.setitimer(signal.ITIMER_REAL, 0.5)
+                if cmd == 'sleep 30':
+                    signal.setitimer(signal.ITIMER_REAL, 0.5)
+                else:
+                    threading.Thread(target=once_escaped, daemon=True).start()
                 t0 = time.monotonic()
                 try:
                     hp.run_tracked(cmd, timeout=20, settle=0.5, state_dir=S)
@@ -1656,6 +1666,7 @@ class RunTracked(unittest.TestCase):
         killed, escaped = res['out']
         self.assertEqual((killed['cleanup'], killed['receipt']), ('done', None))
         self.assertLess(killed['took'], 10)
+        self.assertTrue(escaped['receipt'], escaped)
         self.assertEqual((escaped['cleanup'], escaped['before'], escaped['after']), ('pending', 'pending', 'done'))
 
     def test_an_interrupt_and_a_timeout_let_a_cooperative_child_shut_down(self):

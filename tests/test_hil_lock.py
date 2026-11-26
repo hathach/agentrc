@@ -323,6 +323,20 @@ class FlockIsTheOnlyAuthority(LockDir):
         self.patch(hil_lock, 'PROC_LOCKS', str(Path(self.dir, 'missing')))
         self.assertIsNone(hil_lock.flock_observed(BOARD))
 
+    def test_flock_observed_reads_free_only_when_two_reads_miss_it(self):
+        """agentrc#589: a read of /proc/locks can miss a held flock while other locks change between its chunks."""
+        Path(hil_lock.lock_path(BOARD)).write_text('{}')
+        st = os.stat(hil_lock.lock_path(BOARD))
+        hit = f'1: FLOCK  ADVISORY  WRITE 7 {os.major(st.st_dev):02x}:{os.minor(st.st_dev):02x}:{st.st_ino} 0 EOF\n'
+        miss = '1: FLOCK  ADVISORY  WRITE 7 00:00:1 0 EOF\n'
+        for reads, seen in (([hit], True), ([miss, hit], True), ([miss, miss], False),
+                            ([miss, OSError(errno.EACCES, 'denied')], None), ([OSError(errno.ENOENT, 'gone')], None)):
+            with self.subTest(reads=reads), mock.patch.object(hil_lock, 'open', create=True, side_effect=[
+                    r if isinstance(r, OSError) else io.StringIO(r) for r in reads]) as read, \
+                    mock.patch.object(hil_lock.fcntl, 'flock', mock.Mock(side_effect=AssertionError('flocked'))):
+                self.assertIs(hil_lock.flock_observed(BOARD), seen)
+                self.assertEqual(read.call_count, len(reads))
+
     def test_a_live_pid_record_without_the_flock_does_not_refuse_an_acquire(self):
         Path(hil_lock.lock_path(BOARD)).write_text(json.dumps({'pid': os.getppid(), 'reason': 'stale'}))
         self.assertIsNotNone(self.acquire())

@@ -130,6 +130,9 @@ STALLED = {
     'pending-review': 'the posting account holds a pending review on the PR (`review`, by `login`), and GitHub refuses its replies '
                       'while it does: report it for the human to submit or delete, never submit or delete it yourself, and relaunch '
                       'from the stateRef once it is gone',
+    'human-review-pending': "a trusted person's review comment waits for an answer (`humanWaiting`, each listed below): it is the "
+                            "human's to settle, never a bot finding to judge, fix, reply to or resolve here; report each, and "
+                            'relaunch from the stateRef once the PR\'s author answered it or its thread is resolved',
     'harvest-failed': "harvest.py failed twice in a row (`detail`): fix what its error names, such as a module the "
                       "launch's interpreter lacks, or relaunch once a passing cause (a head still moving, a GitHub outage) cleared",
     'ci-collect-failed': "collect.py failed the same way on two cycles running (`detail`): fix what its error names, such as an "
@@ -242,6 +245,12 @@ def ci_recovery(r):
             'resumes a cancel that completed since, and sends nothing a record shows sent')
 
 
+def waiting_comment(w):
+    """One human-review-pending comment: who wrote it, where, and its link."""
+    where = f" at {w['path']}:{w.get('line')}" if w.get('path') else ''
+    return f"{w.get('kind')} comment {w.get('id')} by {w.get('author')}{where} waits for an answer: {w.get('url')}"
+
+
 def cut(text, limit=CUT):
     text = ' '.join(str(text).split())
     return text if len(text) <= limit else text[:limit] + '…'
@@ -261,13 +270,14 @@ def finding_verdicts(findings, comment_id):
 
 def unpublished_repair(pending):
     """(push lane, sha, the relaunch that settles it, what the heads blocker adds) for a review or CI repair the state
-    holds unpublished after its push failed or went unknown, else None."""
+    holds unpublished after its push failed, went unknown or was held for the people's comments, else None."""
     if not (isinstance(pending, dict) and pending.get('lane') in ('review', 'ci') and pending.get('sha')
-            and pending.get('stage') in ('push-failed', 'publication-unknown')):
+            and pending.get('stage') in ('push-failed', 'push-held', 'publication-unknown')):
         return None
     sha, parent = pending['sha'], str(pending.get('parent') or '')
+    held = "once the people's comments it was held for are answered, " if pending['stage'] == 'push-held' else ''
     return (f"{pending['lane']}Push", sha,
-            f"the {pending['lane']} repair {sha[:8]} on {parent[:8]} is unpublished ({pending['stage']}): relaunch with the same "
+            f"the {pending['lane']} repair {sha[:8]} on {parent[:8]} is unpublished ({pending['stage']}): {held}relaunch with the same "
             f'stateRef and adoptHead {sha}, the checkout left at it, while the PR head is still {parent[:8]}; '
             f'once the PR heads {sha[:8]}, that launch reconciles it as published; moved elsewhere, it stops adopt-pending',
             f"the checkout holds the unpublished {pending['lane']} repair, settled by its adoptHead relaunch")
@@ -293,7 +303,8 @@ def receipts(cycles, findings, unpublished=None):
                 pushes.append({'lane': lane, **p})
                 if p.get('pass') is not True or p.get('committed') is None:
                     settle = unpublished and unpublished[:2] == (lane, p.get('sha'))
-                    blocking.append(f'uncertain publication: {lane}: {cut(p.get("detail", ""))}' + (f'; {unpublished[2]}' if settle else ''))
+                    blocking.append(f'{"held" if p.get("held") else "uncertain"} publication: {lane}: {cut(p.get("detail", ""))}'
+                                    + (f'; {unpublished[2]}' if settle else ''))
         for kind in ('refutedPosts', 'fixNotePosts', 'deferralPosts'):
             posts = actions.get(kind)
             if posts:
@@ -477,6 +488,8 @@ def summarize(output, output_path, state_ref=None, tree=None, keys=False):
             runs = result.get('awaitingApproval') if isinstance(result.get('awaitingApproval'), list) else []
             blockers.append(f"the head's Actions runs {cut(', '.join(map(str, runs))) or '(unnamed)'} wait for a maintainer to approve "
                             "them on GitHub (#545): no failure, and nothing here approves or re-runs them; relaunch once they are approved")
+        if result.get('reason') == 'human-review-pending':
+            blockers += [waiting_comment(w) for w in result.get('humanWaiting') or [] if isinstance(w, dict)]
         if result.get('reason') == 'held-awaiting-caller':
             blockers += [f"finding {h.get('findingId')} on comment {h.get('commentId')} is held for the caller, and another launch "
                          f"cannot lift it: {cut(h.get('reason') or '')}" for h in result.get('held') or []]

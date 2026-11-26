@@ -27,16 +27,20 @@ review|issue|review-body, commentId, source, author, body verbatim, digest
 (pr-reply's comment_digest.py: sha256 of the body, 12 hex, without what
 CodeRabbit rewrites at its end or swaps in its summary), aliases (the digests a body's earlier forms
 may have been recorded under; left out when there are none), path, line,
-commitId, createdAt, updatedAt, inReplyTo, url), and fingerprint: `<reviewers>|<auto-run>|<32 hex>`, a
+commitId, createdAt, updatedAt, inReplyTo, url), humanWaiting (#591: the comments human_waiting() finds waiting for a
+trusted person's answer, never a finding: kind inline|issue|review, id, author, url, path and line for an inline one,
+createdAt and digest, no body), and fingerprint: `<reviewers>|<auto-run>|<32 hex>`, a
 sha256 over what the bots left that a review of the head could rest on (each comment's kind, id and digest, each
-submitted review by a reviewer, empty ones too, and the head's statuses and check runs from CodeRabbit and Greptile),
-never over a time, so a new, edited or dismissed review or a changed bot status changes it. Two bodies no finding comes from are left
+submitted review by a reviewer, empty ones too, and the head's statuses and check runs from CodeRabbit and Greptile)
+and over each waiting comment's kind, id and digest,
+never over a time, so a new, edited or dismissed review, a changed bot status or a human comment that starts or stops
+waiting changes it. Two bodies no finding comes from are left
 out, with body null, bodyOmitted and bodyLength: a CodeRabbit issue comment that opens
 with its walkthrough marker (CR_WALKTHROUGH) after any other HTML comments, the auto-generated summary,
 "coderabbit-walkthrough"; and a Copilot review body saying it could not review,
 "copilot-refusal". Their digest and aliases are still the real body's and identify them,
 and its url shows it (`gh api repos/<repo>/issues/comments/<commentId>` for the walkthrough). Exit 2 with {"error": ...} when gh cannot answer the PR, the
-head, or a comment endpoint, plus facts.py's rateLimit when GitHub refused gh for a rate limit. A read GitHub answered
+head, a comment endpoint or the review threads, plus facts.py's rateLimit when GitHub refused gh for a rate limit. A read GitHub answered
 HTTP 502, 503 or 504 is made again after lib/gh_retry.py's waits first; a write through gh_json, never.
 
 --carry-file names a UTF-8 file holding a JSON list of {commentId, digest, judgedSha, paths}, which pr-babysit stages
@@ -49,8 +53,9 @@ or not, since judgedSha; unbounded paths only on judgedSha the head, with a clea
 Any git failure, missing commit or path outside the repository makes it ineligible, never eligible. An eligible
 comment's body is left out like the two below, bodyOmitted "carried": the caller restores its findings.
 
---probe prints only headSha, observedAt, headEventAt, headEventEvidence, bots and fingerprint: what a workflow waiting out
-CodeRabbit's rate limit compares with its last full harvest (#359). Either line is sealed (facts.sealed); under
+--probe prints only headSha, observedAt, headEventAt, headEventEvidence, bots, humanWaiting and fingerprint: what a
+workflow waiting out CodeRabbit's rate limit compares with its last full harvest (#359), and, with --reviewers '', the
+read of the people's comments it gates each cycle on (#591). Either line is sealed (facts.sealed); under
 AGENTRC_EMIT a full one holds, in place of comments, their index ({commentId, digest, aliases?, source}) and
 readingSha256 of <AGENTRC_EMIT>.reading.json, the whole reading as UTF-8 JSON indented one space (#582).
 """
@@ -74,7 +79,7 @@ except ImportError:
 sys.path.insert(0, str(Path(__file__).parent))
 from facts import EMIT_TO, FULL_SHA, Parser, RateLimited, Unusable, attempt, bind_repo, checkout_top, creating, report, run, sealed, status, write_beside  # noqa: E402
 
-PROBE = ('headSha', 'observedAt', 'headEventAt', 'headEventEvidence', 'bots', 'fingerprint')
+PROBE = ('headSha', 'observedAt', 'headEventAt', 'headEventEvidence', 'bots', 'humanWaiting', 'fingerprint')
 # reply.py checks a comment against the same digest, so both skills share one definition.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'pr-reply' / 'scripts'))
 import comment_digest  # noqa: E402
@@ -130,6 +135,13 @@ GREPTILE_REVIEW_WAIT = timedelta(minutes=10)
 FAILED_RUN = ('failure', 'cancelled', 'timed_out', 'action_required')
 RUN_PROGRESS = {'queued': ('queued', 'check run queued'), 'in_progress': ('working', 'check run in progress')}
 WORKFLOW_RETRY_S = 2
+# Who may hold a babysat PR back with a comment (#591): an account the repository trusts, never a bot or the PR's author.
+TRUSTED = ('OWNER', 'MEMBER', 'COLLABORATOR')
+# Every review thread with its last comment, paged as reply.py's THREADS_QUERY is, and the account gh acts as.
+THREADS_QUERY = ('query($o:String!,$r:String!,$p:Int!,$c:String){viewer{login} repository(owner:$o,name:$r){'
+                 'pullRequest(number:$p){reviewThreads(first:100,after:$c){pageInfo{hasNextPage endCursor}'
+                 'nodes{isResolved comments(last:1){nodes{databaseId author{__typename login} authorAssociation url path line '
+                 'originalLine createdAt body}}}}}}}')
 
 
 class Unreadable(Unusable):
@@ -634,10 +646,65 @@ def comments(repo, n, reviewers, issue=None, reviews=None):
     return got
 
 
-def fingerprint(reviewers, auto, harvested, reviews, statuses, checks):
+def trusted(login, association, bot, excluded):
+    return association in TRUSTED and not bot and bool(login) and login.lower() not in excluded
+
+
+def review_threads(repo, n):
+    """(every review thread of the PR with its last comment, the login gh acts as); a failed read is Unusable, never no
+    threads or no account."""
+    owner, name = repo.split('/', 1)
+    threads, cursor, viewer = [], None, None
+    while True:
+        got = gh_json('api', 'graphql', '-f', f'query={THREADS_QUERY}', '-f', f'o={owner}', '-f', f'r={name}', '-F', f'p={n}',
+                      *(['-f', f'c={cursor}'] if cursor else []))
+        if got.get('errors'):
+            raise Unusable(f"the review threads query answered errors: {json.dumps(got['errors'])[:300]}")
+        viewer = viewer or got['data']['viewer']['login']
+        if not isinstance(viewer, str) or not viewer:
+            raise Unusable('the review threads query named no account gh acts as')
+        page = got['data']['repository']['pullRequest']['reviewThreads']
+        threads += page['nodes']
+        if not page['pageInfo']['hasNextPage']:
+            return threads, viewer
+        cursor = page['pageInfo']['endCursor']
+
+
+def human_waiting(repo, n, author, issue, reviews):
+    """The comments of a trusted person (author_association OWNER, MEMBER or COLLABORATOR, not a Bot account, not the
+    PR's author, not the account gh acts as, whose comments are the run's own) that wait for an answer: an unresolved
+    thread whose last comment is one, or an issue comment or non-empty submitted review body with no issue comment or
+    submitted review, an empty one too, by the PR's author strictly after it; an inline reply answers none."""
+    threads, viewer = review_threads(repo, n)
+    excluded = {author.lower(), viewer.lower()}
+    waiting = []
+    for t in threads:
+        last = t['comments']['nodes']
+        if t['isResolved'] or not last:
+            continue
+        c, who = last[0], last[0]['author'] or {}
+        if trusted(who.get('login'), c['authorAssociation'], who.get('__typename') == 'Bot', excluded):
+            waiting.append({'kind': 'inline', 'id': c['databaseId'], 'author': who['login'], 'url': c['url'], 'path': c['path'],
+                            'line': c['line'] if c['line'] is not None else c['originalLine'], 'createdAt': c['createdAt'], 'digest': digest(c['body'])})
+    by_author = lambda u: (u['login'] or '').lower() == author.lower()
+    answers = [stamp(c['created_at']) for c in issue if by_author(c['user'])] + \
+        [stamp(v['submitted_at']) for v in reviews if by_author(v['user']) and v.get('state') in REVIEW_SUBMITTED]
+    answered = max(answers, default=None)
+    tops = [('issue', c, c['created_at']) for c in issue] + \
+        [('review', v, v['submitted_at']) for v in reviews if v.get('state') in REVIEW_SUBMITTED and (v.get('body') or '').strip()]
+    for kind, c, at in tops:
+        if trusted(c['user']['login'], c.get('author_association'), c['user'].get('type') == 'Bot', excluded) and \
+                (answered is None or answered <= stamp(at)):
+            waiting.append({'kind': kind, 'id': c['id'], 'author': c['user']['login'], 'url': c['html_url'], 'createdAt': at,
+                            'digest': digest(c.get('body'))})
+    return waiting
+
+
+def fingerprint(reviewers, auto, harvested, reviews, statuses, checks, waiting):
     """`<reviewers>|<auto-run>|<32 hex>` over the review evidence on the PR, so a later harvest can tell whether any of
     it changed; the reviewer lists are in it because they decide what is read."""
     records = [['comment', c['kind'], c['commentId'], c['digest']] for c in harvested]
+    records += [['human', w['kind'], w['id'], w['digest']] for w in waiting]
     records += [['review', v['id'], v.get('commit_id'), v.get('state'), digest(v.get('body'))]
                 for v in reviews if source_of(v['user']['login'], reviewers)]
     records += [['status', x.get('id'), x.get('context'), x['state'], x.get('description')] for x in statuses if x.get('context') == 'CodeRabbit']
@@ -649,7 +716,7 @@ def fingerprint(reviewers, auto, harvested, reviews, statuses, checks):
 
 
 def observe(repo, n, reviewers, auto):
-    view = gh_json('pr', 'view', str(n), '-R', repo, '--json', 'headRefOid,headRefName,headRepository')
+    view = gh_json('pr', 'view', str(n), '-R', repo, '--json', 'headRefOid,headRefName,headRepository,author')
     head = view['headRefOid']
     if not FULL_SHA.match(head or ''):
         raise Unusable(f'gh pr view {n}: no head SHA')
@@ -659,9 +726,10 @@ def observe(repo, n, reviewers, auto):
         event_at, event_why = None, f'{e}, so whether its run dates the head is not known'
     statuses = pages(f'repos/{repo}/commits/{head}/statuses') if 'coderabbit' in auto else []
     checks = pages(f'repos/{repo}/commits/{head}/check-runs', 'check_runs') if auto else []
-    issue = pages(f'repos/{repo}/issues/{n}/comments') if auto else None
+    issue = pages(f'repos/{repo}/issues/{n}/comments')
     reviews = pages(f'repos/{repo}/pulls/{n}/reviews')
-    harvested = comments(repo, n, reviewers, issue, reviews)
+    harvested = comments(repo, n, reviewers, issue, reviews) if reviewers else []
+    waiting = human_waiting(repo, n, view['author']['login'], issue, reviews)
     now = datetime.now(timezone.utc)
     bots = []
     for bot in reviewers:
@@ -678,8 +746,8 @@ def observe(repo, n, reviewers, auto):
             n_ = sum(c['source'] == bot for c in harvested)
             bots.append(record(bot, 'harvested', f'{n_} comment(s) harvested; it does not auto-run here, so its state is not read'))
     return {'headSha': head, 'observedAt': now.strftime('%Y-%m-%dT%H:%M:%SZ'),
-            'headEventAt': event_at, 'headEventEvidence': event_why, 'bots': bots, 'comments': harvested,
-            'fingerprint': fingerprint(reviewers, auto, harvested, reviews, statuses, checks)}
+            'headEventAt': event_at, 'headEventEvidence': event_why, 'bots': bots, 'comments': harvested, 'humanWaiting': waiting,
+            'fingerprint': fingerprint(reviewers, auto, harvested, reviews, statuses, checks, waiting)}
 
 
 CARRY_KEYS = {'commentId', 'digest', 'judgedSha', 'paths'}

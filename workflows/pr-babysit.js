@@ -717,6 +717,18 @@ const exactly = (schema, key, idField, ids) => {
 }
 
 const BOT_STATES = ['reviewed', 'working', 'queued', 'settled', 'absent', 'unknown', 'harvested']
+// harvest.py's humanWaiting: a trusted person's comment that waits for an answer, no body and never a finding (#591);
+// read only through the sealed probe, never a model's report.
+const HUMAN_WAITING = {
+  type: 'array',
+  items: {
+    type: 'object', additionalProperties: false, required: ['kind', 'id', 'author', 'url', 'createdAt', 'digest'],
+    properties: {
+      kind: { type: 'string', enum: ['inline', 'issue', 'review'] }, id: { type: 'integer' }, author: { type: 'string' }, url: { type: 'string' },
+      path: { type: 'string' }, line: { type: ['integer', 'null'] }, createdAt: { type: 'string' }, digest: { type: 'string' },
+    },
+  },
+}
 const SETTLED_KINDS = ['skipped', 'limited', 'paused', 'failed']
 // One record per named reviewer, harvest.py's reading of where it stands on the head.
 const BOTS = {
@@ -767,15 +779,16 @@ const REVIEWS = {
     },
   },
 }
-// harvest.py --probe: a reading's head, head event, bots and fingerprint, no comments; what a quota wait compares (#359).
+// harvest.py --probe: a reading's head, head event, bots, humanWaiting and fingerprint, no comments; what a quota wait
+// compares (#359), and with no reviewer named every cycle's read of the people's comments (#591).
 const PROBE = withSeal({
   type: 'object', additionalProperties: false,
-  required: ['headSha', 'observedAt', 'headEventAt', 'headEventEvidence', 'fingerprint', 'bots'],
+  required: ['headSha', 'observedAt', 'headEventAt', 'headEventEvidence', 'fingerprint', 'bots', 'humanWaiting'],
   properties: {
     error: { type: 'string' }, rateLimit: RATE_LIMIT, headSha: { type: 'string' }, observedAt: { type: 'string' },
     headEventAt: { type: ['string', 'null'] }, headEventEvidence: { type: 'string' },
     // the review evidence a merge checks again (merge.py)
-    fingerprint: { type: 'string' }, bots: BOTS,
+    fingerprint: { type: 'string' }, bots: BOTS, humanWaiting: HUMAN_WAITING,
   },
 })
 // harvest.py's full line: the comments' index, whose bodies are in its reading file, and the carry records the workflow
@@ -845,7 +858,8 @@ const BUILD_RUN = withSeal({
   properties: {
     state: { type: 'string', enum: ['running', 'done', 'timedOut', 'abandoned'] }, elapsed: { type: 'integer' },
     revision: { type: 'string' }, snapshot: { type: 'string' }, snapshotAfter: { type: 'string' },
-    command: { type: 'string' }, setup: { type: 'string' }, requires: { type: 'array', items: { type: 'string' } },
+    command: { type: 'string' }, baseSha: { type: ['string', 'null'] }, base: { type: ['string', 'null'] },
+    setup: { type: 'string' }, requires: { type: 'array', items: { type: 'string' } },
     stage: { type: 'string' },
     buildDir: { type: 'string' }, exit: { type: 'integer' }, usageError: { type: ['string', 'null'] }, log: { type: 'string' },
     retained: { type: 'array', items: { type: 'string' } }, error: { type: 'string' },
@@ -1266,7 +1280,7 @@ const pendingOf = () => {
   for (const [lane, key] of [['review', 'reviewPushFailed'], ['ci', 'ciPushFailed']]) {
     const f = last && last[key]
     if (f && f.committed && f.sha) {
-      return { sha: f.sha, parent: expectedHead, lane, stage: f.detail.startsWith('commit failed audit') ? 'audit-blocked' : f.published === 'unknown' ? 'publication-unknown' : 'push-failed' }
+      return { sha: f.sha, parent: expectedHead, lane, stage: f.detail.startsWith('commit failed audit') ? 'audit-blocked' : f.held ? 'push-held' : f.published === 'unknown' ? 'publication-unknown' : 'push-failed' }
     }
     if (f && f.committed) return { sha: null, parent: expectedHead, lane, stage: 'audit-unknown' }
     if (f && f.committed === null) return { sha: null, parent: expectedHead, lane, stage: 'push-unknown' }
@@ -1377,7 +1391,7 @@ const replyRow = (cycles, commentId, digest, edited) => {
   if (s) got = { how: 'caller', replyId: s.replyId ?? null, settled: s.outcome === 'settled', ...(s.outcome !== 'settled' ? { error: `${s.outcome}: ${s.why}` } : {}) }
   // A reply offered with no receipt to show for it: its POST may or may not have landed.
   const a = (debt.get(commentId) || {}).attempt
-  if (!got && a && a.digest === digest) got = { how: a.how, replyId: null, settled: false, error: 'offered, no receipt shows it posted' }
+  if (!got && a && a.digest === digest) got = { how: a.how, replyId: null, settled: false, error: a.held ? 'held for the people\'s comments, not posted' : 'offered, no receipt shows it posted' }
   // A handoff outranks any earlier answer of ours on the body it concerns, its digest, else the comment as it reads now:
   // a correction or a rejudge found it owed again.
   const handed = (debt.get(commentId) || {}).digest
@@ -1653,6 +1667,12 @@ const BUILD_POLLS = Math.ceil(BUILD_LIMIT_MIN * 60 / BUILD_POLL_S) + 2
 // The shell build.py runs the build in, as the resolver writes for it: the relay's own.
 const BUILD_SHELL = PWSH ? 'Windows PowerShell' : 'shell'
 const IDF_SETUP = PWSH ? '. "$env:IDF_PATH/export.ps1"' : '. "$IDF_PATH/export.sh"'
+// A resolved command's `--base X` or `--base=X` value other than a whole <BASE>, the PR's base build.py resolves (#587),
+// else null; only that syntax is checked, not every way a command can name a base. Quotes are dropped first, so neither
+// `"--base" master` hides one nor `--base "<BASE>"` is one; a shell delimiter ends <BASE>, as in `(... --base <BASE>)` or
+// `--base <BASE>&& ...`, and `<BASE>:src` names another ref.
+const foreignBase = (command) => [...command.replace(/['"]/g, '').matchAll(/(?:^|\s)--base(?:=|\s+)(<BASE>(?=$|[\s;&|()])|[^\s;&|()]*)/g)]
+  .map(m => m[1]).find(v => v !== '<BASE>') ?? null
 const buildCheck = async (tag, owned) => {
   let plan = callerPlan
   if (!plan) {
@@ -1669,17 +1689,23 @@ const buildCheck = async (tag, owned) => {
         `when command builds several targets or board families, a wrapper script's included, setup and requires hold every one's: each family's own setup the contract names (such as \`${IDF_SETUP}\` before an Espressif build) and each tool its build invokes, through the wrapper too (such as idf.py), so a missing one stops the shell before the build. ` +
         // #557: a selection flag without the one it needs (check_build.py's --worktree without --base) refused every candidate.
         'The change is uncommitted when command runs: where the contract selects what to build from a change, use the form it gives for uncommitted and untracked changes, with every argument that form needs, ' +
-        'such as `--base <ref> --worktree` with the ref the contract\'s own examples use, never a committed-only form or one flag of such a form without the others. ' +
+        // #587: the ref the contract's examples use (`--base master`) named a stale local master, which selected unrelated targets.
+        'such as `--base <BASE> --worktree`, never a committed-only form or one flag of such a form without the others; ' +
+        'its base argument is `<BASE>`, which becomes the merge-base of the PR\'s base and HEAD, never a branch or ref name, whatever the contract\'s own examples use. ' +
         'contract = every instruction, doc and build-system file you read the contract from, any of these paths among them; command = null, with reason, when no build applies to these paths; error = why the contract could not be resolved, else null.',
         { label: `build:resolve#${tag}`, phase: 'Fix', model: 'sonnet', schema: BUILD_PLAN },
       ).catch(quiet(`build:resolve#${tag}`))
       if (!plan || plan.error) return `build contract not resolved: ${plan ? plan.error : 'resolver died'}`
+      const base = plan.command === null ? null : foreignBase(plan.command)
+      if (base !== null) return `build contract not resolved: the resolved command takes --base ${JSON.stringify(base)}, not <BASE>, the PR's base`
       if (!contractTouched(plan, ownedSet)) buildPlans.set(planKey, plan)
     }
   }
   if (plan.command === null) { log(`build#${tag}: no build applies — ${plan.reason}`); return null }
   // --flag=value throughout: a value such as -DBOARD=x must not read as a flag.
+  const onBase = plan.command.includes('<BASE>')
   const cmd = `${BUILD_SCRIPT}${owned.map(f => ` --path=${shq(f)}`).join('')} --command=${shq(plan.command)}` +
+    `${onBase ? ` --base-sha=${shq(pinnedBase)}` : ''}` +
     `${plan.setup ? ` --setup=${shq(plan.setup)}` : ''}${plan.requires.map(t => ` --require=${shq(t)}`).join('')}${PWSH ? ' --shell=powershell' : ''}`
   // The build runs detached in a job of this batch and head, so a contract longer than one shell call is waited out
   // over several bounded ones (#375); each call attaches to the same job, a retried or resumed one included.
@@ -1701,7 +1727,8 @@ const buildCheck = async (tag, owned) => {
     : r.state !== 'done' ? `the build was ${r.state}`
     : lacking.length ? `the receipt has no ${lacking.join(', ')}`
     : r.revision !== expectedHead ? `the receipt is for ${String(r.revision).slice(0, 7)}, not ${expectedHead.slice(0, 7)}`
-    : r.command !== plan.command.replaceAll('<BUILD>', r.buildDir) ? 'the receipt is for another command'
+    : onBase && (r.baseSha !== pinnedBase || typeof r.base !== 'string' || !FULL_SHA.test(r.base)) ? 'the receipt is for another base'
+    : r.command !== plan.command.replaceAll('<BUILD>', r.buildDir).replaceAll('<BASE>', r.base) ? 'the receipt is for another command'
     : !['setup', 'prerequisite', 'build'].includes(r.stage) ? `the receipt names no step it stopped in (${JSON.stringify(r.stage)})`
     : r.setup !== (plan.setup || '') || JSON.stringify(r.requires) !== JSON.stringify(plan.requires) ? 'the receipt is for another setup'
     : r.snapshot !== r.snapshotAfter ? `the build changed ${owned.join(', ')}, which were verified before it`
@@ -1736,7 +1763,8 @@ const checkCompat = async (label, paths, brief) => {
 
 // ok only if every group was scoped, fixed and verified.
 // rejectable: a writer may reject an issue with evidence instead of fixing it; the issue is then judged again, never dismissed here (#44).
-const fixAndVerify = async (workIn, tag, rejectable = false) => {
+// held(): the caller's hold of the people's comments, read once the scope is checked; it stops the batch before any writer edits.
+const fixAndVerify = async (workIn, tag, rejectable = false, held = () => null) => {
   const listOf = (notes) => notes.map(n => rejectable ? `[${n.id}] ${n.text}` : n.text).join('\n- ')
   const textOf = (w) => listOf(w.notes)
   const verdictOf = (fix, kept, addresses, checkReason) => ({ ...fix, ids: kept.map(n => n.id), addresses, checkReason })
@@ -1809,6 +1837,9 @@ const fixAndVerify = async (workIn, tag, rejectable = false) => {
     work.push(g)
   }
   const scopeOf = (w) => [...w.files].join(', ')
+  // Checked once, while nothing is edited: a stop between writers would leave a dirty tree the next start refuses.
+  const hold = held()
+  if (hold) return { hold }
   // One writer at a time: a writer's build reads the whole checkout, so a sibling's unfinished edit or experiment would break it (#43).
   const fixes = []
   // Only what a writer fixed is built, checked and published; a group whose every issue was rejected changed nothing.
@@ -1820,7 +1851,8 @@ const fixAndVerify = async (workIn, tag, rejectable = false) => {
       `Fix the following issues on the PR branch. ${IN_CHECKOUT}\n` +
       (protectedRe ? `Constraint: never modify a path matching ${protectedRe.source} — it is the caller's, and a failure that needs it changed stays red for the user.\n` : '') +
       (buildCmd
-        ? `Verify with: ${buildCmd} (a \`<BUILD>\` placeholder becomes a fresh ${PWSH ? 'empty directory under $env:TEMP, run in Windows PowerShell' : '`mktemp -d`'}).\n`
+        ? `Verify with: ${buildCmd} (a \`<BUILD>\` placeholder becomes a fresh ${PWSH ? 'empty directory under $env:TEMP, run in Windows PowerShell' : '`mktemp -d`'}` +
+          `${buildCmd.includes('<BASE>') ? `, \`<BASE>\` the output of \`git merge-base ${pinnedBase} HEAD\`` : ''}).\n`
         : "Verify with the repository's build contract, resolved for your scope; do not invent a command.\n") +
       STOPS + '\n' +
       (rejectable
@@ -1979,8 +2011,8 @@ const cycleSummary = (entry) => {
     : `${head}\n${mdTable(['Bot', 'Finding', 'Verdict', 'Outcome', 'Commit'], rows)}`
 }
 
-// beforePush runs at once before the push, the first step that can restart CI.
-const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => {}) => {
+// beforePush runs at once before the push, the first step that can restart CI; held() is the CI judge's hold of the people's comments.
+const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => {}, held = () => null) => {
   // Commit by explicit path: a stray edit on an unowned path must not ride along (one on an owned path is indistinguishable from ours). A protected path here means the scope filter broke.
   const sneaked = protectedRe ? owned.filter(f => protectedRe.test(f)) : []
   if (sneaked.length) {
@@ -2153,7 +2185,16 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
     return { pass: false, committed: true, detail: `commit failed audit: ${why}`, sha, ...(generatedPaths.length ? { generated: generatedPaths } : {}) }
   }
 
+  // #591: a comment posted while the lane fixed, ran the hooks or committed holds the push; the caller stops on `humans`.
+  // The judge's hold, recorded before this read or while it was out, holds it too.
+  const read = held() || githubLimit ? null : await readHumans(`humans#${cycle}-${what}`)
   if (githubLimit) return { pass: false, committed: true, detail: 'not pushed: GitHub refused a call for a rate limit this cycle', sha }
+  const humans = held() || read
+  if (humans.harvestError || humans.humanWaiting.length) {
+    const why = humans.harvestError ? `the people's comments went unread: ${humans.harvestError}` : `${humans.humanWaiting.length} comment(s) by a trusted person wait for an answer`
+    log(`push#${cycle}-${what}: committed but NOT pushed — ${why}`)
+    return { pass: false, committed: true, held: true, detail: `not pushed: ${why}`, sha, humans, ...(generatedPaths.length ? { generated: generatedPaths } : {}) }
+  }
   beforePush()
   const push = await pushExact(sha, `push#${cycle}-${what}`)
   if (!push) return { pass: false, committed: true, detail: 'push agent died after the commit landed', sha, published: 'unknown' }
@@ -2439,20 +2480,21 @@ const requestDeadline = (cr, clock) => {
 }
 // Whole seconds, as coderabbit_trigger.py reads them.
 const isoSeconds = (ms) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z')
-const triggerCodeRabbit = async (cycle, r, bots, ended) => {
+// held(): the CI judge's hold of the people's comments, checked just before each ask (#591).
+const triggerCodeRabbit = async (cycle, r, bots, ended, held) => {
   const cr = bots.bots.find(b => b.bot === 'coderabbit')
   if (!coderabbitRequired || !cr) return
   const manual = manualSkip(cr)
   // Once per head, whatever the outcome: a failed tick is not retried into a storm. Without the switch, only an earlier ask is waited on.
   if (coderabbitTrigger && coderabbitAskable(cr, reviewClock) === 'tick') {
-    if (await ended('crtrigger')) return
+    if (await ended('crtrigger') || held()) return
     const { t, outcome } = await relayTrigger(cycle, 'crtrigger', CRTRIGGER_SCRIPT, `Tick CodeRabbit's Trigger review box on PR #${args.pr}`, '',
       ['ticked', 'already', 'notSkipped', 'failed'])
     // notSkipped waits too: a review that started since the harvest, or a newer head, is for the next harvest to read.
     reviewClock.triggeredAt = outcome === 'failed' ? null : Number.isFinite(Date.parse(t.at)) ? t.at : r.observedAt
   }
-  if (limited(cr)) return requestCodeRabbit(cycle, r, cr, ended)
-  if (manual || reviewFailed(cr) || nothingToReview(cr)) await requestCodeRabbit(cycle, r, cr, ended)
+  if (limited(cr)) return requestCodeRabbit(cycle, r, cr, ended, held)
+  if (manual || reviewFailed(cr) || nothingToReview(cr)) await requestCodeRabbit(cycle, r, cr, ended, held)
   // Waits like a queued bot, its cap counted from the latest ask; working and reviewed go by settleBots alone. Any skip or
   // failed review after the ask is waited on too: the one asked about reads so until CodeRabbit starts again.
   const asks = [reviewClock.triggeredAt, reviewClock.request && reviewClock.request.at].filter(t => typeof t === 'string')
@@ -2515,7 +2557,7 @@ const retryLater = (cr, ms) => {
   // Never under a minute: a reset just behind the clock would otherwise run the next cycle at once.
   cr.retryWaitMs = Math.min(Math.max(60000, ms), HOUR_MS)
 }
-const requestCodeRabbit = async (cycle, r, cr, ended) => {
+const requestCodeRabbit = async (cycle, r, cr, ended, held) => {
   const asked = reviewClock.request
   const quota = limited(cr) && coderabbitTrigger
   if (asked && !quota) {
@@ -2530,7 +2572,7 @@ const requestCodeRabbit = async (cycle, r, cr, ended) => {
     if (cap > observed && asked.at !== null) waitAfter(cr, asked.at, r.observedAt)
     return retryLater(cr, Math.min(deadline, cap > observed ? cap : Infinity) - observed)
   }
-  if (await ended('crrequest')) return
+  if (await ended('crrequest') || held()) return
   const why = limited(cr) ? 'after its rate limit' : reviewFailed(cr) ? 'again, its review of the head failed'
     : nothingToReview(cr) ? 'in full, as it skipped the head with no files to review' : 'that it skipped for a manual review'
   const { t, outcome } = await relayTrigger(cycle, 'crrequest', CRTRIGGER_SCRIPT, `Ask CodeRabbit to review PR #${args.pr} ${why}`,
@@ -2570,8 +2612,9 @@ const requestGreptile = async (cycle, r, bots, lanes, ended) => {
   if (!g || !greptileRequired || (g.state !== 'absent' && g.state !== 'queued')) return null
   if (greptileTrigger && g.state === 'absent' && reviewClock.greptileAt === undefined) {
     g.done = false
-    // The script reads the PR open at the head itself, just before it posts; another lane's closure or rate limit holds it here.
-    if (bots.waitedMin < GREPTILE_GRACE_MIN || lanes.prState || githubLimit) return null
+    // The script reads the PR open at the head itself, just before it posts; another lane's closure, rate limit or the CI
+    // judge's hold of the people's comments holds it here.
+    if (bots.waitedMin < GREPTILE_GRACE_MIN || lanes.prState || githubLimit || lanes.judgeHumans) return null
     const { t, outcome } = await relayTrigger(cycle, 'greptile', GTRIGGER_SCRIPT, `Ask Greptile to review PR #${args.pr}`, '',
       ['requested', 'already', 'notOpen', 'failed', 'uncertain', 'ambiguous'])
     // Merged or closed ends the launch; open at another head stops: the head this run must have reviewed is not the PR's.
@@ -2592,10 +2635,11 @@ const requestGreptile = async (cycle, r, bots, lanes, ended) => {
   return null
 }
 
-// The caller's replies on comments handed to it settle once reply.py reads both back at the head they were judged on; a dry run settles none. Returns the ids settled.
+// The caller's replies on comments handed to it settle once reply.py reads both back at the head they were judged on; a dry run settles none.
+// Returns the ids settled, or null when the CI judge's hold (judgeHeld) lands while the PR state is read.
 const settlements = []
 let settlementsTried = false
-const settleCaller = async (cycle, digestOf, held, ended) => {
+const settleCaller = async (cycle, digestOf, held, ended, judgeHeld) => {
   const refuse = (s, why) => {
     settlements.push({ commentId: s.commentId, outcome: 'refused', why })
     log(`cycle ${cycle}: comment ${s.commentId} not settled on the caller's reply ${s.replyId} — ${why}`)
@@ -2612,6 +2656,10 @@ const settleCaller = async (cycle, digestOf, held, ended) => {
   })
   settlementsTried = true
   if (!ready.length || await ended('reuse')) return []
+  if (judgeHeld()) {
+    ready.forEach(s => refuse(s, 'held for the people\'s comments'))
+    return null
+  }
   const out = await runReplyScript(`reuse#${cycle}`, 'reuse', `Settle these comments on PR #${args.pr} on the replies already there`,
     'The script posts nothing; do not post, edit or delete anything yourself.',
     { reuses: ready.map(s => ({ commentId: s.commentId, replyId: s.replyId, bodyDigest: s.bodyDigest, originalDigest: s.commentDigest })) })
@@ -2839,11 +2887,19 @@ const ciLaneRun = async (cycle, lanes, entry) => {
   if (judging.length === 0 && gated.length === 0) return report
   // A review lane that ended without publishing leaves CI as it was: its concluded failures are still judged (#41).
   const superseded = () => {
-    const why = lanes.prState ? `PR #${args.pr} is ${lanes.prState}` : lanes.reviewPublishing ? 'the review lane attempted to publish' : null
+    const why = lanes.prState ? `PR #${args.pr} is ${lanes.prState}` : lanes.reviewPublishing ? 'the review lane attempted to publish'
+      : lanes.humansHeld ? "the review lane's read of the people's comments did not come back clear" : null
     if (why) log(`cycle ${cycle}: ${judging.length + gated.length} failing CI check(s) left unjudged — ${why}`)
     return !!why
   }
   if (superseded()) return report
+  // #591: the judge may re-run CI only once this cycle's read of the people's comments came back clear, and again just before it.
+  const unclear = (humans, n) => {
+    if (humans.humanWaiting?.length === 0) return false
+    log(`cycle ${cycle}: ${n} failing CI check(s) left unjudged — the people's comments did not read clear`)
+    return true
+  }
+  if (unclear(await lanes.humans, judging.length + gated.length)) return report
   const links = judging.map(c => c.link)
   const known = reruns.filter(r => r.sure).map(r => `${r.workflow} / ${r.check}`)
   const possible = reruns.filter(r => !r.sure).map(r => `${r.workflow} / ${r.check}`)
@@ -2866,6 +2922,15 @@ const ciLaneRun = async (cycle, lanes, entry) => {
   if (judging.length === 0) return report
   // The judge may re-run checks: the PR must read OPEN, and no review push may have landed during that read.
   if (await prGate(lanes, `${cycle}-judge`) || superseded()) return report
+  // A comment posted while the lane waited for the inventory or read the evidence holds it too; runLanes stops on it.
+  const judgeRead = await readHumans(`humans#${cycle}-judge`)
+  if (unclear(judgeRead, judging.length)) {
+    lanes.judgeHumans = judgeRead
+    return report
+  }
+  // The review lane may have pushed, been held by its own read, or met a rate limit while this one was out.
+  if (githubLimit) return null
+  if (superseded()) return report
   const judged = await agent(
     `${IN_CHECKOUT}Judge the failing CI checks of PR #${args.pr} of ${repo} at head ${report.headSha} per your procedure. ` +
     `The collector's evidence for them is in ${ev.detail}. Run any ci-rerun script under ${PY}. The checks, each needing exactly one entry in your reply: ` +
@@ -2947,7 +3012,9 @@ const ciLaneRun = async (cycle, lanes, entry) => {
 // Returns null to re-arm, or the final result.
 const runCycle = async (cycle, entry) => {
   // prState: 'merged' or 'closed' once read so, 'unread' when a read before a write failed; the review lane then stops at its next step.
-  const lanes = { reviewDone: false, reviewPublishing: false, ended: false, prState: null }
+  // humansHeld: a review-lane push or post held by its read of the people's comments, which holds the CI judge too (#591).
+  // judgeHumans: the CI judge's own read, when it did not come back clear.
+  const lanes = { reviewDone: false, reviewPublishing: false, ended: false, prState: null, humansHeld: false, judgeHumans: null }
   const verdict = await runLanes(cycle, entry, lanes)
   // The CI lane settles last, so it can read the merge after the review lane stopped for another reason.
   if (lanes.prState === 'merged' || lanes.prState === 'closed') return prEnded(cycle, lanes.prState)
@@ -3049,7 +3116,8 @@ const harvestReviews = async (cycle, candidates) => {
 // The validator judges that one reading's comments from the file harvest.py wrote beside its line (no prompt holds every
 // body), each by its id; their source and digests, and the report's other members, are the harvest's (#582).
 const judgeReviews = async (cycle, harvest, owedLastCycle) => {
-  const { seal, emitFile, index, carry, ...read } = harvest
+  // humanWaiting stays out of the review report: the gates read it only through readHumans (#591).
+  const { seal, emitFile, index, carry, humanWaiting, ...read } = harvest
   const readingFile = `${emitFile}.reading.json`
   const reviewPrompt =
     `Validate the bot review findings on PR #${args.pr} of ${repo} per your procedure. ${IN_CHECKOUT}` +
@@ -3081,12 +3149,61 @@ const judgeReviews = async (cycle, harvest, owedLastCycle) => {
   })
   return { ...read, findings, replies: judged.replies, carry }
 }
+// #591: what harvest.py reads of the people's comments with no reviewer named, sealed, before each cycle's writes, its
+// refutations, its deferrals, each push and the fix notes after one, and an adoption's push: { humanWaiting }, or a
+// harvestError or rateLimit (already noted), run twice as the validator does.
+const readHumans = async (label) => {
+  const read = (tag) => relayOnce(
+    `${IN_CHECKOUT}Editing nothing, ${runExactly(`${HARVEST_SCRIPT} --pr ${args.pr} --repo ${shq(repo)} --reviewers ${shq('')} --probe`)}`,
+    { label: tag, phase: 'Triage', model: 'haiku', effort: 'low', schema: PROBE },
+  )
+  let p = await read(label)
+  if (!p || (p.error && !p.rateLimit)) p = await read(`${label}.again`) || p
+  return !p ? { harvestError: 'the relay died' } : p.rateLimit ? { rateLimit: { ...p.rateLimit, error: p.error } }
+    : p.error ? { harvestError: p.error } : { humanWaiting: p.humanWaiting }
+}
+// A trusted person's comment waiting for an answer is theirs to settle: nothing here asks, fixes, answers or pushes over it.
+const humanStop = (cycle, waiting) => {
+  log(`cycle ${cycle}: ${waiting.length} comment(s) by a trusted person wait for an answer (${waiting.map(w => `${w.author}: ${w.url}`).join(', ')}) — stopping; they are the human's to settle`)
+  return stop(cycle, 'human-review-pending', { humanWaiting: waiting })
+}
+// null on a rate limit (runCycle stops for it), a stop, or undefined when the read came back clear.
+const humansHold = (cycle, entry, humans) => {
+  if (humans.rateLimit) return null
+  if (humans.harvestError) {
+    log(`cycle ${cycle}: harvest.py could not read the people's comments — ${humans.harvestError}`)
+    entry.error = `harvest.py failed: ${humans.harvestError}`
+    return stop(cycle, 'harvest-failed', { detail: humans.harvestError })
+  }
+  if (humans.humanWaiting.length) return humanStop(cycle, humans.humanWaiting)
+}
+// A lane's stop on a push that did not land; one held for the people's comments keeps its commit as the pending candidate.
+const pushFailed = (cycle, entry, key, push) => {
+  const { humans, ...failed } = push
+  entry[key] = failed
+  if (push.prState) return prEnded(cycle, push.prState)
+  if (humans) return humansHold(cycle, entry, humans)
+  log(`cycle ${cycle}: ${key === 'ciPushFailed' ? 'CI' : 'review'}-lane push failed (${push.detail}) — stopping`)
+  return stop(cycle, 'push-failed')
+}
 const runLanes = async (cycle, entry, lanes) => {
   let ciPromise = null
   const ended = (what) => prGate(lanes, `${cycle}-${what}`)
+  // #591: a hold before a review-lane post holds the CI judge too, whose own clear read may land after it; the judge's hold,
+  // recorded before this read or while it was out, holds the post.
+  const heldBefore = async (what) => {
+    const judged = () => lanes.judgeHumans ? humansHold(cycle, entry, lanes.judgeHumans) : undefined
+    let waits = judged()
+    if (waits === undefined) waits = humansHold(cycle, entry, await readHumans(`humans#${cycle}-${what}`))
+    if (waits === undefined) waits = judged()
+    if (waits !== undefined) lanes.humansHeld = true
+    return waits
+  }
   // Settle the CI lane in finally so no CI agent outlives the workflow.
   try {
     entry.lane = lane
+    // Read beside the CI lane, whose judge waits for it too.
+    lanes.humans = readHumans(`humans#${cycle}`)
     if (ciLane) {
       ciPromise = ciLaneRun(cycle, lanes, entry).catch(quiet(`cycle ${cycle}: CI lane`))
     }
@@ -3118,6 +3235,9 @@ const runLanes = async (cycle, entry, lanes) => {
       entry.error = `harvest.py failed: ${r.harvestError}`
       return stop(cycle, 'harvest-failed', { detail: r.harvestError })
     }
+    // #591: gated on the sealed read, never on a model's copy of it; everything before this only read.
+    const waits = humansHold(cycle, entry, await lanes.humans)
+    if (waits !== undefined) return waits
     if (r.unusable) {
       log(`cycle ${cycle}: validator report unusable — ${r.unusable}`)
       entry.error = `validator report unusable: ${r.unusable}`
@@ -3140,9 +3260,12 @@ const runLanes = async (cycle, entry, lanes) => {
     entry.bots = r === nobody
       ? { waitedMin: 0, since: null, clock: null, bots: [] }
       : settleBots(r)
-    if (r !== nobody) await triggerCodeRabbit(cycle, r, entry.bots, ended)
+    // #591: a comment the CI judge's read found, before or during the asks, holds them.
+    if (lanes.judgeHumans) return humansHold(cycle, entry, lanes.judgeHumans)
+    if (r !== nobody) await triggerCodeRabbit(cycle, r, entry.bots, ended, () => lanes.judgeHumans)
     const unasked = r !== nobody ? await requestGreptile(cycle, r, entry.bots, lanes, ended) : null
     if (lanes.prState) return prEnded(cycle, lanes.prState)
+    if (lanes.judgeHumans) return humansHold(cycle, entry, lanes.judgeHumans)
     if (unasked) {
       log(`cycle ${cycle}: Greptile must review ${expectedHead.slice(0, 7)}, and its request ended ${unasked} — stopping, the head unreviewed`)
       return stop(cycle, 'greptile-unreviewed', { head: expectedHead, bots: entry.bots.bots.filter(b => b.bot === 'greptile').map(botOut),
@@ -3447,7 +3570,19 @@ const runLanes = async (cycle, entry, lanes) => {
       const d = debt.get(id)
       return !d || [...(dismissalsToo ? d.dismissals : []), ...d.notes].every(k => harvested.has(k))
     }
-    if (!settlementsTried && settlementsArg.length && r !== nobody) (await settleCaller(cycle, digestOf, held, ended)).forEach(id => ledger.delete(id))
+    if (!settlementsTried && settlementsArg.length && r !== nobody) {
+      // #591: reply.py --reuse resolves threads, so it waits on a read after the challenge and topic checks, the judge's too.
+      if (args.autoPush === true) {
+        const waits = await heldBefore('reuse')
+        if (waits !== undefined) return waits
+      }
+      const settled = await settleCaller(cycle, digestOf, held, ended, () => lanes.judgeHumans)
+      if (!settled) {
+        lanes.humansHeld = true
+        return humansHold(cycle, entry, lanes.judgeHumans)
+      }
+      settled.forEach(id => ledger.delete(id))
+    }
     if (lanes.prState) return prEnded(cycle, lanes.prState)
     r.findings = r.findings.filter(f => !answeredByHand(f))
 
@@ -3476,6 +3611,9 @@ const runLanes = async (cycle, entry, lanes) => {
     if (freshReplies.length > 0 && args.autoPush === true) {
       // Keep the receipt first: a cycle that dies after posting must still say what went out.
       if (await ended('replies')) return prEnded(cycle, lanes.prState)
+      // #591: the cycle's read ran beside the validator; a comment posted while it judged holds the replies too.
+      const waits = await heldBefore('replies')
+      if (waits !== undefined) return waits
       entry.refutedPosts = await publishReplies(`replies#${cycle}`, freshReplies, 'refutation', cycle, digestOf)
       entry.sonarMarked = await settleSonar(cycle, entry, ended)
       if (lanes.prState) return prEnded(cycle, lanes.prState)
@@ -3485,6 +3623,8 @@ const runLanes = async (cycle, entry, lanes) => {
       .map(id => ({ commentId: id, body: deferredOn(id).map(deferralLine).join('\n') }))
     if (deferralReplies.length > 0 && args.autoPush === true) {
       if (await ended('defer')) return prEnded(cycle, lanes.prState)
+      const waits = await heldBefore('defer')
+      if (waits !== undefined) return waits
       entry.deferralPosts = await publishReplies(`defer#${cycle}`, deferralReplies, 'deferral', cycle, digestOf)
     }
 
@@ -3498,7 +3638,10 @@ const runLanes = async (cycle, entry, lanes) => {
         claim: `${f.file}:${f.line} ${f.claim}`,
       })))
       if (lanes.prState) return prEnded(cycle, lanes.prState)
-      const verdict = await fixAndVerify(work, `${cycle}-review`, true)
+      // A comment the CI judge's read found, before or while the scope is checked, holds the fix writer too; one landing during the fix is the push's read.
+      if (lanes.judgeHumans) return humansHold(cycle, entry, lanes.judgeHumans)
+      const verdict = await fixAndVerify(work, `${cycle}-review`, true, () => lanes.judgeHumans)
+      if (verdict.hold) return humansHold(cycle, entry, verdict.hold)
       const { ok, fixes, owned, uncommitted, brief, rejected } = verdict
       entry.reviewFixes = fixes
       // A rejected finding is held, its evidence on its decision, until the next harvest judges it again; a second rejection is the caller's.
@@ -3529,13 +3672,9 @@ const runLanes = async (cycle, entry, lanes) => {
       }
       if (owned.length > 0) {
         // Any push attempt may have restarted CI, a refused or unknown one included.
-        const push = await commitAndPush(cycle, 'review', owned, brief, () => { lanes.reviewPublishing = true })
-        if (!push.pass) {
-          entry.reviewPushFailed = push
-          if (push.prState) return prEnded(cycle, push.prState)
-          log(`cycle ${cycle}: review-lane push failed (${push.detail}) — stopping`)
-          return stop(cycle, 'push-failed')
-        }
+        const push = await commitAndPush(cycle, 'review', owned, brief, () => { lanes.reviewPublishing = true }, () => lanes.judgeHumans)
+        if (push.humans) lanes.humansHeld = true
+        if (!push.pass) return pushFailed(cycle, entry, 'reviewPushFailed', push)
         entry.reviewPush = push
         // Built here: the read-back proves only a text the workflow chose.
         const heldNow = heldComments()
@@ -3558,6 +3697,14 @@ const runLanes = async (cycle, entry, lanes) => {
     }
     if (answerable.size > 0) {
       if (await ended('resolve')) return prEnded(cycle, lanes.prState)
+      // #594: offered before the read, so a launch it stops leaves these notes owed, citing their repair, to the next.
+      for (const { commentId, body, repair } of answerable.values()) {
+        const d = debt.get(commentId)
+        if (d && !d.attempt && repair) d.attempt = { body, how: 'fixNote', digest: digestOf.get(commentId), repair, held: true }
+      }
+      // #591: a comment posted while the validator judged or the repair was pushed holds its fix notes too, restored ones included.
+      const waits = await heldBefore('resolve')
+      if (waits !== undefined) return waits
       entry.fixNotePosts = await publishReplies(`resolve#${cycle}`, [...answerable.values()], 'fixNote', cycle, digestOf)
     }
 
@@ -3570,6 +3717,7 @@ const runLanes = async (cycle, entry, lanes) => {
       return rearm()
     }
     const c = await ciPromise
+    if (lanes.judgeHumans) return humansHold(cycle, entry, lanes.judgeHumans)
     if (entry.collectorSkew) {
       log(`cycle ${cycle}: ${entry.collectorSkew}`)
       entry.error = `collector skew: ${entry.collectorSkew}`
@@ -3636,18 +3784,18 @@ const runLanes = async (cycle, entry, lanes) => {
       }
       if (!ok) return unverifiedStop(cycle, 'CI', verdict)
       const ciPush = await commitAndPush(cycle, 'ci', owned, brief)
-      if (!ciPush.pass) {
-        entry.ciPushFailed = ciPush
-        if (ciPush.prState) return prEnded(cycle, ciPush.prState)
-        log(`cycle ${cycle}: CI-lane push failed (${ciPush.detail}) — stopping`)
-        return stop(cycle, 'push-failed')
-      }
+      if (!ciPush.pass) return pushFailed(cycle, entry, 'ciPushFailed', ciPush)
       entry.ciPush = ciPush
       return null
     }
     const now = entry.ciWaited, prev = before('ciWaited')
     if (c.status === 'running' && now && (now.registered > 0 || now.unmet) && prev && ['head', 'registered', 'pending', 'waiting'].every(k => now[k] === prev[k])) {
       const earlier = ciRecoveries.get(expectedHead)
+      // #591: the cancel and re-run come after the CI wait, which the cycle's read and a judge that never ran did not cover.
+      if (!earlier && !githubLimit) {
+        const waits = await heldBefore('cirecover')
+        if (waits !== undefined) return waits
+      }
       const recovery = earlier ?? await recoverCi(cycle, entry)
       if (!earlier && ['recovered', 'completed'].includes(recovery?.outcome)) {
         // The new attempts, or a run that completed after the cancel, move CI: two more whole waits before ci-stuck reads again.
@@ -3766,6 +3914,7 @@ const runLanes = async (cycle, entry, lanes) => {
   } finally {
     lanes.ended = true
     if (ciPromise) entry.ci = await ciPromise
+    await lanes.humans
   }
 }
 
@@ -3808,6 +3957,8 @@ if (pinned.pr !== args.pr) {
   log(`preflight: the pin is of PR #${pinned.pr}, not #${args.pr}`)
   return finish(stop(lastCycle, 'preflight-failed', { detail: `the pin is of PR #${pinned.pr}` }))
 }
+// The PR's base as GitHub records it, what a build's <BASE> resolves against (#587).
+const pinnedBase = pinned.prBase.trim()
 // The repository every later call names must be the one asked for and the one the PR read lives in.
 const pinnedRepo = pinned.repo.trim()
 const notRepo = !REPO_NAME.test(pinnedRepo) ? `the pin names no repository OWNER/NAME (${JSON.stringify(pinned.repo)})`
@@ -3863,7 +4014,7 @@ let reconciled = null
 const candidate = restored && restored.pin && restored.pending
 const source = candidate && history.length ? history[history.length - 1][candidate.lane === 'adopt' ? 'adoption' : `${candidate.lane}PushFailed`] : null
 if (source && candidate.sha && candidate.sha === pinned.prHead.trim() && (candidate.lane === 'adopt' ? source.to : source.sha) === candidate.sha &&
-  ['publication-unknown', 'push-failed', 'adopt-push-unknown', 'adopt-push-failed'].includes(candidate.stage)) {
+  ['publication-unknown', 'push-failed', 'push-held', 'adopt-push-unknown', 'adopt-push-failed'].includes(candidate.stage)) {
   const { lane, stage, sha, parent } = candidate
   const failure = lane === 'adopt' ? { publication: source.publication, detail: source.detail } : source
   reconciled = { lane, stage, sha, parent, failure }
@@ -3897,7 +4048,7 @@ let adoption = null
 if (adopting) {
   const prHead = pinned.prHead.trim()
   const X = reconciled && reconciled.sha === adoptHead ? reconciled.parent : restored && restored.pin ? restored.expectedHead : prHead
-  const base = pinned.prBase.trim()
+  const base = pinnedBase
   const tip = pinned.prBaseTip.trim()
   if (pinned.head.trim() !== adoptHead) {
     log(`preflight: HEAD is ${pinned.head.slice(0, 7)}, not the ${adoptHead.slice(0, 7)} to adopt`)
@@ -4006,6 +4157,14 @@ log(`preflight: ${pinned.prRepo} ${pinned.branch}@${pinned.head.slice(0, 7)} tra
 // Runs before any watcher so the attempt is recorded first; only a PR head read-back proves the push.
 const adopt = async (entry) => {
   const { from, to, commits, paths } = adoption
+  // #591: this push precedes the cycle's read, so the people's comments are read first; a stop here records no
+  // adoption, which a relaunch with the same adoptHead makes. readHumans noted a rate limit already.
+  if (!adoption.published) {
+    const humans = await readHumans('adopt:humans')
+    if (humans.rateLimit) return stop(entry.cycle, 'github-rate-limited', { rateLimit: githubLimit })
+    if (humans.harvestError) return stop(entry.cycle, 'harvest-failed', { detail: humans.harvestError })
+    if (humans.humanWaiting.length) return humanStop(entry.cycle, humans.humanWaiting)
+  }
   entry.adoption = { from, to, commits, paths, publication: 'unknown', detail: 'publication not attempted yet' }
   if (adoption.published) {
     Object.assign(entry.adoption, { publication: 'already-published', detail: `PR #${args.pr} already heads ${to.slice(0, 7)}` })
