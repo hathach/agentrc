@@ -3661,8 +3661,8 @@ const runLanes = async (cycle, entry, lanes) => {
         const d = debt.get(commentId)
         if (d && !d.attempt && repair) d.attempt = { body, how: 'fixNote', digest: digestOf.get(commentId), repair, held: true }
       }
-      // #591: a comment posted while the repair was pushed holds its fix notes too.
-      const waits = entry.reviewPush ? humansHold(cycle, entry, await readHumans(`humans#${cycle}-resolve`)) : undefined
+      // #591: a comment posted while the validator judged or the repair was pushed holds its fix notes too, restored ones included.
+      const waits = humansHold(cycle, entry, await readHumans(`humans#${cycle}-resolve`))
       if (waits !== undefined) return waits
       entry.fixNotePosts = await publishReplies(`resolve#${cycle}`, [...answerable.values()], 'fixNote', cycle, digestOf)
     }

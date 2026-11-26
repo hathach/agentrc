@@ -8489,6 +8489,21 @@ test('a person\'s comment arriving while the validator judges holds its refutati
   }
 })
 
+test('a fix note restored from a held launch is posted only after a fresh read of the people\'s comments (#594)', async () => {
+  const trace = []
+  const first = await run({ reviews: oneValid, trace, humans: () => trace.some(c => c.label.startsWith('push#')) ? [OBJECTION] : [] })
+  assert.equal(first.result.reason, 'human-review-pending')
+  const stale = { findings: [finding({ verdict: 'stale', fixedBy: shaFor(1) })], replies: [], bots: 'reviewed' }
+  const again = []
+  const { result, labels } = await resumeAt(first.result.state, { reviews: stale, args: { maxCycles: 4 }, trace: again,
+    humans: () => again.some(c => /^reviews#\d+$/.test(c.label)) ? [OBJECTION] : [] })
+  assert.equal(result.reason, 'human-review-pending', labels.join(', '))
+  assert.ok(labels.includes('humans#2-resolve'), labels.join(', '))
+  assert.deepEqual(labels.filter(l => l.startsWith('resolve#')), [], 'nothing posted over it')
+  const clear = await resumeAt(first.result.state, { reviews: stale, args: { maxCycles: 4 } })
+  assert.ok(clear.labels.indexOf('humans#2-resolve') < clear.labels.indexOf('resolve#2'), clear.labels.join(', '))
+})
+
 test('a quota wait probes harvest.py instead of validating until CodeRabbit leaves its limit or the evidence changes (#359)', async () => {
   const validated = (labels) => labels.filter(l => l.startsWith('reviews#'))
   const probes = (labels) => labels.filter(l => l.startsWith('reviews:probe#'))
