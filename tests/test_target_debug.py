@@ -1214,17 +1214,16 @@ class HaltTclTest(unittest.TestCase):
 
 
 class ProbeStateRouteTest(unittest.TestCase):
-    """resolve(): an openocd board's route is its registry `debug.openocd` only when hil_boards validated it there
-    and it reaches the flasher's probe; anything else keeps flasher.args."""
+    """resolve(): an openocd board's route is its registry `debug.openocd` (hil_boards' debug_problem holds it to
+    the flasher's probe), else flasher.args; a roster's or bench board's own `debug` is never taken."""
     PICO, CH32, METRO = 'E6614103E72C1D2F', 'A76D8F062C2A', '000063728691'
     ARGS = '-f interface/cmsis-dap.cfg -f target/rp2040.cfg -c "adapter speed 5000"'
 
     def setUp(self):
         self.d = tmpdir(self)
         hb = probe_state.hil_boards()
-        boards = json.loads(Path(hb.REGISTRY).read_text())
-        self.boards = boards['boards']
-        self.assertEqual(self.boards[self.PICO]['debug']['openocd'], self.boards[self.PICO]['flasher']['args'])
+        self.boards = json.loads(Path(hb.REGISTRY).read_text())['boards']
+        self.assertEqual(self.boards[self.PICO]['debug']['openocd'], self.ARGS)
         self.registry = self.d / 'boards.json'
         real = hb.registry
         stack = contextlib.ExitStack()
@@ -1232,53 +1231,38 @@ class ProbeStateRouteTest(unittest.TestCase):
         stack.enter_context(mock.patch.object(hb, 'registry', lambda path=None: real(self.registry)))
         stack.enter_context(mock.patch.object(probe_state, 'tool', lambda env, posix, nt=None: posix))
 
+    def error(self, msg):
+        raise AssertionError(msg)
+
     def resolve(self, entry, pico_debug=None, **flags):
         if pico_debug is not None:
             self.boards[self.PICO]['debug'] = {'openocd': pico_debug}
         self.registry.write_text(json.dumps({'boards': self.boards}))
-        hb = probe_state.hil_boards()
-        hb._cache.pop(os.path.realpath(self.registry), None)
+        probe_state.hil_boards()._cache.pop(os.path.realpath(self.registry), None)
         roster = self.d / 'hil.json'
         roster.write_text(json.dumps({'boards': [{'uid': 'U', **entry, 'name': 'b'}]}))
         a = types.SimpleNamespace(hil_config=str(roster), board='b', interface=flags.get('interface'),
                                   speed=flags.get('speed'))
+        return probe_state.resolve(a, types.SimpleNamespace(error=self.error))
 
-        class Parser:
-            def error(self, msg):
-                raise AssertionError(msg)
-        return probe_state.resolve(a, Parser())
-
-    def test_a_registry_route_on_the_flashers_probe_is_taken(self):
+    def test_the_registry_route_is_taken_and_nothing_else(self):
         debug = '-f interface/cmsis-dap.cfg -f target/rp2040.cfg -c "adapter speed 1000"'
         route, ident, backend = self.resolve({'probe': self.PICO}, debug)
-        self.assertEqual((route, ident), ('openocd', {'probe': self.PICO, 'cfg': debug}))
-        self.assertEqual(backend.cfg, debug)
+        self.assertEqual((route, ident, backend.cfg), ('openocd', {'probe': self.PICO, 'cfg': debug}, debug))
         self.assertIn(f'adapter serial {self.PICO}', backend.cmd)
         self.assertIn('adapter usb vid_pid 0x2e8a 0x000c', backend.cmd)
-        self.assertEqual(self.resolve({'probe': self.PICO}, self.ARGS)[1]['cfg'], self.ARGS)   # today's registry
-
-    def test_anything_else_keeps_flasher_args(self):
         ch32 = self.boards[self.CH32]['flasher']['args']
         bench = {'name': 'openocd', 'uid': 'E1', 'args': '-f interface/cmsis-dap.cfg -f target/max32665.cfg'}
-        esp = {'tool': 'openocd-esp32', 'uid': '30:ED:A0:00:00:01', 'openocd': '-f board/esp32s3-builtin.cfg'}
-        for why, entry, pico_debug, want in (
-                ('no registry debug', {'probe': self.CH32}, None, ch32),
-                ("a roster's own debug", {'probe': self.CH32, 'debug': {'openocd': '-f target/other.cfg'}}, None, ch32),
-                ('a malformed roster debug', {'probe': self.CH32, 'debug': {'openocd': '-f "open'}}, None, ch32),
-                ('another tool', {'probe': self.CH32, 'debug': esp}, None, ch32),
-                ('a bench debug', {'flasher': bench, 'debug': {'openocd': '-f interface/cmsis-dap.cfg'}}, None,
-                 bench['args']),
-                ('another interface', {'probe': self.PICO}, '-f interface/jlink.cfg -f target/rp2040.cfg', self.ARGS),
-                ('another serial', {'probe': self.PICO}, f'{self.ARGS} -c "adapter serial X"', self.ARGS),
-                ('another driver', {'probe': self.PICO}, f'-c "adapter driver cmsis-dap" {self.ARGS}', self.ARGS),
-                ('a compound command', {'probe': self.PICO}, f'{self.ARGS} -c "adapter speed 1000; adapter serial X"',
-                 self.ARGS),
-                ('a substitution', {'probe': self.PICO}, f'{self.ARGS} -c "adapter speed [adapter serial X]"',
-                 self.ARGS),
-                ('an attached -c', {'probe': self.PICO}, f'{self.ARGS} "-cadapter serial X"', self.ARGS)):
+        for why, entry, want in (('no registry debug', {'probe': self.CH32}, ch32),
+                                 ("a roster's own", {'probe': self.CH32, 'debug': {'openocd': '-f t.cfg'}}, ch32),
+                                 ('a bench debug', {'flasher': bench, 'debug': {'openocd': '-f t.cfg'}},
+                                  bench['args'])):
             with self.subTest(why):
-                route, ident, backend = self.resolve(entry, pico_debug)
-                self.assertEqual((route, ident['cfg'], backend.cfg), ('openocd', want, want))
+                self.assertEqual(self.resolve(entry)[1]['cfg'], want)
+
+    def test_a_route_the_registry_refuses_never_reaches_the_probe(self):
+        with self.assertRaisesRegex(AssertionError, 'debug: openocd -c .*adapter serial'):
+            self.resolve({'probe': self.PICO}, f'{self.ARGS} -c "adapter serial X"')
 
     def test_a_jlink_board_with_a_debug_route_stays_on_jlink(self):
         self.assertIn('debug', self.boards[self.METRO])

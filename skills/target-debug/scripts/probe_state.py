@@ -13,9 +13,9 @@ Probe observations only: it never says whether the application works.
 The board's HIL config entry (the target-debug SKILL.md's HIL config table) gives the
 backend and probe: flasher `jlink` (args exactly `-device NAME`; --interface and
 --speed are the caller's) or `openocd` (args are its -f/-c arguments; vid_pid pins
-discovery). An openocd board agentrc's registry gives a `debug` route on that probe
-(hil_debug_cfg) starts openocd with its `openocd` arguments instead. Any other flasher, a
-missing serial or an ambiguous board is refused.
+discovery). An openocd board agentrc's registry gives a `debug` route starts openocd with
+its `openocd` arguments instead (hil_debug_cfg). Any other flasher, a missing serial or an
+ambiguous board is refused.
 
 The caller holds the project's board lock for the whole run (target-debug, Delegated
 sessions); this script takes no lock and cannot check that one is held. The
@@ -194,39 +194,11 @@ def hil_flasher(path, board):
     return flasher
 
 
-def _interface_cfgs(words):
-    return [b for a, b in zip(words, words[1:]) if a == '-f' and b.startswith('interface/')]
-
-
-def _plain_command(c):
-    """One Tcl command, and no adapter command but a plain `adapter speed N`: a `;`, newline or `[` could run a
-    second one, such as another adapter serial."""
-    if re.search(r'[;\n\[]', c):
-        return False
-    return not re.match(r'\s*adapter\b', c) or bool(re.fullmatch(r'\s*adapter\s+speed\s+\d+\s*', c))
-
-
-def _plain_commands(words):
-    return not any(w.startswith('-c') and w != '-c' for w in words) and all(
-        _plain_command(c) for a, c in zip(words, words[1:]) if a == '-c')
-
-
-def hil_debug_cfg(path, board, flasher):
-    """The registry's `debug.openocd` of an openocd `flasher`'s board when it reaches that probe (the same
-    interface cfgs, and plain commands: no adapter command but its speed), else None: flasher.args stays the
-    route. A bench board's or a roster's own `debug` is never taken, since hil_boards validates only the
-    registry's (an esp32 route names another tool and probe)."""
-    hb = hil_boards()
-    try:
-        reg = hb.registry().get(hb.board(path, board, parked=False).get('probe'))
-    except (ImportError, OSError, ValueError) as e:
-        raise ValueError(f'--hil-config {path} --board {board}: {e}')
-    if not reg or 'debug' not in reg:
-        return None
-    words = shlex.split(reg['debug']['openocd'])
-    if _interface_cfgs(words) != _interface_cfgs(shlex.split(flasher['args'])) or not _plain_commands(words):
-        return None
-    return reg['debug']['openocd']
+def hil_debug_cfg(flasher):
+    """The `debug.openocd` agentrc's registry gives an openocd `flasher`'s board, which hil_boards' debug_problem
+    holds to that probe, else None. A bench board's or a roster's own `debug` is never taken."""
+    reg = hil_boards().registry().get(flasher['uid'])
+    return reg['debug']['openocd'] if reg and 'debug' in reg else None
 
 
 def hil_jlink_device(board, flasher):
@@ -1035,7 +1007,7 @@ def resolve(a, p):
             shlex.split(flasher['args'])
         except ValueError as e:
             raise ValueError(f"--board {a.board}: flasher.args {flasher['args']!r}: {e}")
-        cfg = hil_debug_cfg(a.hil_config, a.board, flasher) or flasher['args']
+        cfg = hil_debug_cfg(flasher) or flasher['args']
         return route, {'probe': flasher['uid'], 'cfg': cfg}, OpenOCD(flasher['uid'], cfg, vid_pid and vid_pid.strip())
     except ValueError as e:
         p.error(str(e))

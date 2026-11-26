@@ -263,7 +263,8 @@ name it. The devices wired to its USB host port are farm facts too: `dev_attache
 with its `vid_pid` (`vvvv:pppp`), its `serial` as the host reads it (omitted when none was
 read), and what a test may use (`is_cdc`, `is_msc` with `block_size`, `block_count` and
 `msc_inquiry`). So is `debug`, the openocd route a GDB session attaches through (`openocd`, its -f/-c
-arguments, and an optional `note`). A project roster names the board by `"probe": "<serial>"`, matched exactly,
+arguments, and an optional `note`): only `-f FILE` and `-c` pairs, each command `adapter speed N` or `transport
+select swd`, and on an openocd flasher that flasher's `-f interface/` cfgs (`debug_problem`). A project roster names the board by `"probe": "<serial>"`, matched exactly,
 and keeps its own `uid` (the serial its firmware reports, which differs per firmware),
 name, tests and project fields, never the registry's. A `flasher_recover` arms in-run
 wedge recovery, so it joins only after a reset through it, and a reflash where openocd
