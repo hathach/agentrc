@@ -81,6 +81,10 @@ def _bindings(scope):
             bound.setdefault(node.id, False)
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.ExceptHandler)) and node.name:
             bound.setdefault(node.name, False)
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name:
+            bound.setdefault(node.name, False)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            bound.setdefault(node.rest, False)
     return {k: v for k, v in bound.items() if k not in nonlocals | glob}, {k: bound.get(k, False) for k in glob}
 
 
