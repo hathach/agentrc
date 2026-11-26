@@ -523,6 +523,8 @@ async function run(opts = {}) {
     }
     if (label === 'scope:check') {
       // scope_check.py's receipt over the paths the prompt asked it for; opts.lsFiles keeps those it accepts.
+      // opts.scopeWait(calls): hold the check, as afterReviewLane holds the CI evidence.
+      if (opts.scopeWait) await opts.scopeWait(calls)
       const asked = flagValues(prompt, 'path')
       const ok = opts.lsFiles ? opts.lsFiles(asked) : asked
       return conforms(options.schema, bare({
@@ -8371,6 +8373,15 @@ test('a person\'s comment the CI judge\'s read finds before the review lane reac
   assert.deepEqual(labels.filter(l => WRITES.test(l)), [], labels.join(', '))
 })
 
+test('a person\'s comment the CI judge\'s read finds while the review lane checks its fix scope holds the fix writer (#591)', async () => {
+  const { result, labels } = await run({ reviews: oneValid, ci: redWith(RIG).ci, judge: rerunAll, args: { autoPush: true, maxCycles: 2 },
+    scopeWait: afterReviewLane('humans#1-judge'), humans: (label) => label.startsWith('humans#1-judge') ? [OBJECTION] : [] })
+  assert.deepEqual([result.reason, result.humanWaiting], ['human-review-pending', [OBJECTION]], labels.join(', '))
+  assert.ok(labels.indexOf('scope:check') >= 0 && labels.indexOf('scope:check') < labels.indexOf('humans#1-judge'), labels.join(', '))
+  assert.deepEqual(labels.filter(l => WRITES.test(l) || /^(check:|build|commit#)/.test(l)), [], `${labels.join(', ')}: nothing edited, built or committed`)
+  assert.equal(result.state.pending, null)
+})
+
 test('a person\'s comment arriving while the CI lane reads its inventory and evidence holds the CI judge (#591)', async () => {
   const opts = { reviews: WAITING, ci: redWith(RIG).ci, judge: rerunAll, args: { autoPush: true, maxCycles: 1 } }
   for (const humans of [[OBJECTION], { error: 'gh api graphql: HTTP 502' }]) {
@@ -8514,6 +8525,34 @@ test('a refutation or deferral held for a person\'s comment holds a CI judge who
     assert.equal(result.reason, 'human-review-pending', why)
     assert.deepEqual(labels.filter(l => l.startsWith('ci:judge#')), [], why)
     assert.equal(result.history[0].ciReran, undefined, why)
+  }
+})
+
+test('a person\'s comment the CI judge\'s read finds before or during a refutation, deferral or fix-note read holds that batch (#591)', async () => {
+  const refuting = { findings: [invalidFinding()], replies: [{ commentId: 1, body: 'not a bug' }], bots: 'reviewed' }
+  const batches = [['replies', { reviews: refuting }], ['defer', { reviews: oneValid, args: { deferrals: [deferral()] } }], ['resolve', { reviews: oneValid }]]
+  for (const [what, opts] of batches) {
+    for (const when of ['during', 'before']) {
+      const trace = []
+      let judged = false
+      const { result, labels } = await run({ ...opts, ci: redWith(RIG).ci, judge: rerunAll, args: { autoPush: true, maxCycles: 2, ...opts.args }, trace,
+        // during: the judge's read comes back held while the batch's own read is out, which then comes back clear.
+        ...(when === 'before' ? { reviewsWait: afterReviewLane('humans#1-judge') } : {}),
+        humans: async (label) => {
+          if (label.startsWith('humans#1-judge')) {
+            if (when === 'during') for (let i = 0; i < 1000 && !trace.some(c => c.label.startsWith(`humans#1-${what}`)); i++) await tick()
+            judged = true
+            return [OBJECTION]
+          }
+          if (label.startsWith(`humans#1-${what}`)) for (let i = 0; i < 1000 && !judged; i++) await tick()
+          for (let i = 0; i < 20; i++) await tick()
+          return []
+        } })
+      const why = `${what}, ${when}: ${labels.join(', ')}`
+      assert.deepEqual([result.reason, result.humanWaiting], ['human-review-pending', [OBJECTION]], why)
+      assert.deepEqual(labels.filter(l => /^(replies|defer|resolve)#/.test(l)), [], `${why}: nothing posted over it`)
+      assert.equal(labels.includes(`humans#1-${what}`), when === 'during', `${why}: a hold already recorded needs no read`)
+    }
   }
 })
 

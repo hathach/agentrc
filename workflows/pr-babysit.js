@@ -1763,7 +1763,8 @@ const checkCompat = async (label, paths, brief) => {
 
 // ok only if every group was scoped, fixed and verified.
 // rejectable: a writer may reject an issue with evidence instead of fixing it; the issue is then judged again, never dismissed here (#44).
-const fixAndVerify = async (workIn, tag, rejectable = false) => {
+// held(): the caller's hold of the people's comments, read once the scope is checked; it stops the batch before any writer edits.
+const fixAndVerify = async (workIn, tag, rejectable = false, held = () => null) => {
   const listOf = (notes) => notes.map(n => rejectable ? `[${n.id}] ${n.text}` : n.text).join('\n- ')
   const textOf = (w) => listOf(w.notes)
   const verdictOf = (fix, kept, addresses, checkReason) => ({ ...fix, ids: kept.map(n => n.id), addresses, checkReason })
@@ -1836,6 +1837,9 @@ const fixAndVerify = async (workIn, tag, rejectable = false) => {
     work.push(g)
   }
   const scopeOf = (w) => [...w.files].join(', ')
+  // Checked once, while nothing is edited: a stop between writers would leave a dirty tree the next start refuses.
+  const hold = held()
+  if (hold) return { hold }
   // One writer at a time: a writer's build reads the whole checkout, so a sibling's unfinished edit or experiment would break it (#43).
   const fixes = []
   // Only what a writer fixed is built, checked and published; a group whose every issue was rejected changed nothing.
@@ -3176,9 +3180,13 @@ const pushFailed = (cycle, entry, key, push) => {
 const runLanes = async (cycle, entry, lanes) => {
   let ciPromise = null
   const ended = (what) => prGate(lanes, `${cycle}-${what}`)
-  // #591: a hold before a review-lane post holds the CI judge too, whose own clear read may land after it.
+  // #591: a hold before a review-lane post holds the CI judge too, whose own clear read may land after it; the judge's hold,
+  // recorded before this read or while it was out, holds the post.
   const heldBefore = async (what) => {
-    const waits = humansHold(cycle, entry, await readHumans(`humans#${cycle}-${what}`))
+    const judged = () => lanes.judgeHumans ? humansHold(cycle, entry, lanes.judgeHumans) : undefined
+    let waits = judged()
+    if (waits === undefined) waits = humansHold(cycle, entry, await readHumans(`humans#${cycle}-${what}`))
+    if (waits === undefined) waits = judged()
     if (waits !== undefined) lanes.humansHeld = true
     return waits
   }
@@ -3606,9 +3614,10 @@ const runLanes = async (cycle, entry, lanes) => {
         claim: `${f.file}:${f.line} ${f.claim}`,
       })))
       if (lanes.prState) return prEnded(cycle, lanes.prState)
-      // A comment the CI judge's read found holds the fix writer too; one landing during the fix is the push's read.
+      // A comment the CI judge's read found, before or while the scope is checked, holds the fix writer too; one landing during the fix is the push's read.
       if (lanes.judgeHumans) return humansHold(cycle, entry, lanes.judgeHumans)
-      const verdict = await fixAndVerify(work, `${cycle}-review`, true)
+      const verdict = await fixAndVerify(work, `${cycle}-review`, true, () => lanes.judgeHumans)
+      if (verdict.hold) return humansHold(cycle, entry, verdict.hold)
       const { ok, fixes, owned, uncommitted, brief, rejected } = verdict
       entry.reviewFixes = fixes
       // A rejected finding is held, its evidence on its decision, until the next harvest judges it again; a second rejection is the caller's.
