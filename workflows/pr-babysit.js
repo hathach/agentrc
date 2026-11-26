@@ -2635,10 +2635,11 @@ const requestGreptile = async (cycle, r, bots, lanes, ended) => {
   return null
 }
 
-// The caller's replies on comments handed to it settle once reply.py reads both back at the head they were judged on; a dry run settles none. Returns the ids settled.
+// The caller's replies on comments handed to it settle once reply.py reads both back at the head they were judged on; a dry run settles none.
+// Returns the ids settled, or null when the CI judge's hold (judgeHeld) lands while the PR state is read.
 const settlements = []
 let settlementsTried = false
-const settleCaller = async (cycle, digestOf, held, ended) => {
+const settleCaller = async (cycle, digestOf, held, ended, judgeHeld) => {
   const refuse = (s, why) => {
     settlements.push({ commentId: s.commentId, outcome: 'refused', why })
     log(`cycle ${cycle}: comment ${s.commentId} not settled on the caller's reply ${s.replyId} — ${why}`)
@@ -2655,6 +2656,10 @@ const settleCaller = async (cycle, digestOf, held, ended) => {
   })
   settlementsTried = true
   if (!ready.length || await ended('reuse')) return []
+  if (judgeHeld()) {
+    ready.forEach(s => refuse(s, 'held for the people\'s comments'))
+    return null
+  }
   const out = await runReplyScript(`reuse#${cycle}`, 'reuse', `Settle these comments on PR #${args.pr} on the replies already there`,
     'The script posts nothing; do not post, edit or delete anything yourself.',
     { reuses: ready.map(s => ({ commentId: s.commentId, replyId: s.replyId, bodyDigest: s.bodyDigest, originalDigest: s.commentDigest })) })
@@ -3571,7 +3576,12 @@ const runLanes = async (cycle, entry, lanes) => {
         const waits = await heldBefore('reuse')
         if (waits !== undefined) return waits
       }
-      (await settleCaller(cycle, digestOf, held, ended)).forEach(id => ledger.delete(id))
+      const settled = await settleCaller(cycle, digestOf, held, ended, () => lanes.judgeHumans)
+      if (!settled) {
+        lanes.humansHeld = true
+        return humansHold(cycle, entry, lanes.judgeHumans)
+      }
+      settled.forEach(id => ledger.delete(id))
     }
     if (lanes.prState) return prEnded(cycle, lanes.prState)
     r.findings = r.findings.filter(f => !answeredByHand(f))

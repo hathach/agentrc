@@ -391,8 +391,8 @@ async function run(opts = {}) {
     // Whether the session directory is the state's pinned checkoutDir: opts.sameCheckout the exit (0 by default), null a dead relay.
     if (label === 'state:checkout') return opts.sameCheckout === null ? null : { exit: opts.sameCheckout ?? 0 }
     if (label.startsWith('prstate#')) {
-      // preflight.py --state before a publication the CI lane is not watching: OPEN unless opts.prState (a value, or a function of the label) says otherwise.
-      const state = typeof opts.prState === 'function' ? opts.prState(label) : opts.prState === undefined ? 'OPEN' : opts.prState
+      // preflight.py --state before a publication the CI lane is not watching: OPEN unless opts.prState (a value, or a function of the label, maybe async) says otherwise.
+      const state = typeof opts.prState === 'function' ? await opts.prState(label) : opts.prState === undefined ? 'OPEN' : opts.prState
       return state === null ? null : conforms(options.schema, { state }, label)
     }
     if (label.startsWith('recheck#')) {
@@ -8610,6 +8610,36 @@ test('a person\'s comment after the cycle\'s read holds the settlement on the ca
   const clear = await resumeAt(first.result.state, opts)
   assert.ok(clear.labels.includes('humans#2-reuse') && clear.labels.indexOf('humans#2-reuse') < clear.labels.indexOf('reuse#2'), clear.labels.join(', '))
   assert.equal(clear.result.pass, true, clear.result.reason)
+})
+
+test('a person\'s comment the CI judge\'s read finds while the settlement\'s PR state is read holds the settlement (#591)', async () => {
+  const wrong = {
+    reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'not so' }], bots: 'reviewed' },
+    challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
+  }
+  const parent = (rs, l) => l === 'replies#1' ? rs.map(r => ({ ...r, verified: false, resolved: null, error: 'read-back mismatch on thread' })) : rs
+  const first = await run({ ...wrong, args: { ...YIELD }, receipts: parent })
+  const settlement = { commentId: 2, commentDigest: 'd2', replyId: 502, bodyDigest: fnv1a('not so'), headSha: first.result.state.expectedHead }
+  const trace = []
+  let judged = false
+  // The judge's read comes back held while the settlement's PR-state read is out, which then comes back OPEN.
+  const { result, labels } = await resumeAt(first.result.state, { ...wrong, ci: redWith(RIG).ci, judge: rerunAll, trace,
+    args: { autoPush: true, maxCycles: 3, replySettlements: [settlement] },
+    humans: async (label) => {
+      if (!label.startsWith('humans#2-judge')) return []
+      for (let i = 0; i < 1000 && !trace.some(c => c.label.startsWith('prstate#2-reuse')); i++) await tick()
+      judged = true
+      return [OBJECTION]
+    },
+    prState: async (label) => {
+      if (label.startsWith('prstate#2-reuse')) for (let i = 0; i < 1000 && !judged; i++) await tick()
+      return 'OPEN'
+    } })
+  const why = labels.join(', ')
+  assert.ok(judged && labels.includes('humans#2-reuse') && labels.includes('prstate#2-reuse'), why)
+  assert.deepEqual([result.reason, result.humanWaiting], ['human-review-pending', [OBJECTION]], why)
+  assert.deepEqual(labels.filter(l => l.startsWith('reuse#')), [], `${why}: no thread resolved over it`)
+  assert.deepEqual(labels.filter(l => l.startsWith('ci:judge#')), [], why)
 })
 
 test('a person\'s comment during the CI wait holds the recovery of orphaned runs (#591)', async () => {
