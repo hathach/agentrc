@@ -555,6 +555,18 @@ recovery stay the contract's.
   below for one attempt and for a retry sequence.
 - A remote attempt is created once, under its own lease, and launched once;
   it is never wiped by the core, and its retention is the project's.
+- A CI report posted on a PR by a `workflow_run` job goes through
+  `gh_pr_comment.py`, from the agentrc the project pins: an Arduino contract
+  names it in `extra_engines`, and tinyusb and tinyuf2 load it from their pin;
+  the job loads it through `hil_load` or runs its CLI, and keeps its renderer.
+  Resolve the PR with `pr` (from the run's own metadata, so a fork's PR works),
+  the attempt the job that produced the artifacts ran in with `job-attempt`,
+  check `fresh`, render the body from the artifacts as data, then `post
+  --header` with the header the existing sticky comment uses. The posting job
+  needs `permissions: pull-requests: write` (`actions: read` for artifacts)
+  and a per-PR `concurrency` group without cancel-in-progress: `post` checks
+  freshness again before it writes, but is not atomic.
+  Adafruit_TinyUSB_Arduino's `hil_comment.yml` is the worked example.
 
 ## Reporting
 
