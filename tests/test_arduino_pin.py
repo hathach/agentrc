@@ -687,6 +687,10 @@ class Conformance(Consumer):
                     'import agentrc_pin\n\n\ndef f(agentrc_pin):\n    return agentrc_pin.number\n\n\n'
                     'def g():\n    return agentrc_pin.ROOT\n')
         self.assertEqual(conform._internal_uses(hil / 'bare.py'), [(9, 'ROOT')])
+        self.script('hil-contract/scripts/glob.py',
+                    'def f():\n    global pin\n    import agentrc_pin as pin\n    return pin._selection()\n\n\n'
+                    'def g():\n    return pin.ROOT\n')
+        self.assertEqual(conform._internal_uses(hil / 'glob.py'), [(4, '_selection'), (8, 'ROOT')])
 
     def test_the_round_trip_refuses_a_module_from_outside_the_staged_copy(self):
         outside = self.tmp / 'outside'

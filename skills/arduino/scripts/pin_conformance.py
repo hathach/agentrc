@@ -76,7 +76,8 @@ def _own_nodes(scope):
 
 
 def _bindings(scope):
-    """({name: whether `import agentrc_pin as name` binds it} of the names `scope` binds, its `global` names)."""
+    """({name: whether `import agentrc_pin as name` binds it} of the names `scope` binds, its `global` names, and
+    those of its bindings that are the module's for being `global`)."""
     bound, declared, glob = {}, set(), set()
     if isinstance(scope, _FUNCTIONS):
         a = scope.args
@@ -95,20 +96,22 @@ def _bindings(scope):
             bound.setdefault(node.id, False)
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.ExceptHandler)) and node.name:
             bound.setdefault(node.name, False)
-    return {k: v for k, v in bound.items() if k not in declared}, glob
+    return {k: v for k, v in bound.items() if k not in declared}, glob, {k: v for k, v in bound.items() if k in glob}
 
 
 def _internal_uses(path):
     """(line, name) of each bootstrap name outside PUBLIC a script uses: an attribute of an `import agentrc_pin [as
-    x]` name where that import binds it (its scope and the nested scopes that do not rebind x; a module that never
-    rebinds `agentrc_pin` counts it as the bootstrap), or a `from agentrc_pin import` name. Module dunders such as
-    __file__ are not the bootstrap's own."""
+    x]` name where that import binds it (its scope, the module's for a `global` x, and the nested scopes that do not
+    rebind x; a module that never rebinds `agentrc_pin` counts it as the bootstrap), or a `from agentrc_pin import`
+    name. Module dunders such as __file__ are not the bootstrap's own."""
 
     def internal(name):
         return name not in PUBLIC and not (name.startswith("__") and name.endswith("__"))
 
     def scan(scope, visible, module):
-        bound, glob = _bindings(scope)
+        bound, glob, _ = _bindings(scope)
+        if isinstance(scope, ast.Module):
+            bound.update((n, bound.get(n, False) or pin) for n, pin in exported.items())
         here = {**visible, **bound, **{n: module.get(n, False) for n in glob}}
         module = here if isinstance(scope, ast.Module) else module
         inner = visible if isinstance(scope, ast.ClassDef) else here  # a class body is no enclosing scope
@@ -127,6 +130,11 @@ def _internal_uses(path):
         for a in node.names
         if internal(a.name)
     ]
+    exported = {}
+    for node in ast.walk(tree):
+        if isinstance(node, _SCOPES):
+            for n, pin in _bindings(node)[2].items():
+                exported[n] = exported.get(n, False) or pin
     scan(tree, {"agentrc_pin": True}, {})
     return sorted(uses)
 
