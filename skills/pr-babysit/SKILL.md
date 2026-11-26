@@ -78,9 +78,9 @@ comment by a person with no reply by the author or the posting account after it;
 person's waits in its place. An issue comment or review body waits until the author or the posting account posts an
 issue comment or submits a non-empty review body after it, after an issue comment's last edit (GitHub's REST API gives a
 review no edit time); a reply quoting it answers it, another person's reply never.
-With any `reviewers`, harvest.py is read again just before the run writes, since the cycle's harvest may be minutes
-old: before the caller's settlements and the cycle's replies (once for them all), before a review- or CI-lane push, and
-before fix notes, again after a push. A comment waiting then stops `human-review` the same way, nothing of that write
+With any `reviewers`, harvest.py is read again just before each write batch, since the cycle's harvest may be minutes
+old: a fresh read before the caller's settlements, the cycle's replies, its deferrals, a review- or CI-lane push, and
+fix notes (after any push). A comment waiting then stops `human-review` the same way, nothing of that write
 done; a push's verified fixes are left uncommitted, named in `uncommitted`, as a `fix-verification-failed` stop leaves
 them, and a review-lane push's fix notes stay owed as offered, posted by a later launch whose validator names that push
 as their fix (#115). A comment posted after that reading, or while CI is waited on with nothing left to write, is the
