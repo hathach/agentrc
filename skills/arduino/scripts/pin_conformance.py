@@ -20,26 +20,6 @@ class ConformanceError(Exception):
     """The consumer's profile is unreadable; the bootstrap reports it as its own error."""
 
 
-def _load_calls(path, own=False):
-    """(line, target or None when not one string literal) of each agentrc_pin.load() call in a script, through any
-    `import agentrc_pin as x` or `from agentrc_pin import load as y` name; `own` (the bootstrap) counts its bare
-    load() too."""
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    modules, loads = {"agentrc_pin"}, {"load"} if own else set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            modules.update(a.asname or a.name for a in node.names if a.name == "agentrc_pin")
-        elif isinstance(node, ast.ImportFrom) and node.module == "agentrc_pin":
-            loads.update(a.asname or a.name for a in node.names if a.name == "load")
-    for node in ast.walk(tree):
-        f = getattr(node, "func", None)
-        if (isinstance(f, ast.Attribute) and f.attr == "load" and getattr(f.value, "id", None) in modules) or (
-            isinstance(f, ast.Name) and f.id in loads
-        ):
-            arg = node.args[0] if len(node.args) == 1 and not node.keywords else None
-            yield node.lineno, arg.value if isinstance(arg, ast.Constant) and isinstance(arg.value, str) else None
-
-
 _FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
 _COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 _SCOPES = (*_FUNCTIONS, ast.ClassDef, *_COMPREHENSIONS)
@@ -75,54 +55,82 @@ def _own_nodes(scope):
         todo.extend(_outer_parts(node) if isinstance(node, _SCOPES) else ast.iter_child_nodes(node))
 
 
+_MODULE, _LOAD = "module", "load"  # what a name is bound to: the bootstrap, or its load(); False for anything else
+
+
 def _bindings(scope):
-    """({name: whether `import agentrc_pin as name` binds it} of the names `scope` binds, its `global` names, and
-    those of its bindings that are the module's for being `global`)."""
-    bound, declared, glob = {}, set(), set()
+    """({name: binding} of the names `scope` binds as its own, {name: binding} of those it declares global): an
+    `import agentrc_pin [as x]` binds _MODULE, a `from agentrc_pin import load [as y]` _LOAD, anything else False."""
+    bound, nonlocals, glob = {}, set(), set()
     if isinstance(scope, _FUNCTIONS):
         a = scope.args
         bound.update((x.arg, False) for x in (*a.posonlyargs, *a.args, *a.kwonlyargs, a.vararg, a.kwarg) if x)
     for node in _own_nodes(scope):
-        if isinstance(node, (ast.Global, ast.Nonlocal)):
-            declared.update(node.names)
-            if isinstance(node, ast.Global):
-                glob.update(node.names)
+        if isinstance(node, ast.Global):
+            glob.update(node.names)
+        elif isinstance(node, ast.Nonlocal):
+            nonlocals.update(node.names)
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
             for a in node.names:
-                name = a.asname or a.name.partition(".")[0]
-                pin = isinstance(node, ast.Import) and a.name == "agentrc_pin"
-                bound[name] = bound.get(name, False) or pin
+                if isinstance(node, ast.Import):
+                    name, kind = a.asname or a.name.partition(".")[0], a.name == "agentrc_pin" and _MODULE
+                else:
+                    name, kind = a.asname or a.name, node.module == "agentrc_pin" and a.name == "load" and _LOAD
+                bound[name] = bound.get(name, False) or kind
         elif isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
             bound.setdefault(node.id, False)
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.ExceptHandler)) and node.name:
             bound.setdefault(node.name, False)
-    return {k: v for k, v in bound.items() if k not in declared}, glob, {k: v for k, v in bound.items() if k in glob}
+    return {k: v for k, v in bound.items() if k not in nonlocals | glob}, {k: bound.get(k, False) for k in glob}
 
 
-def _internal_uses(path):
-    """(line, name) of each bootstrap name outside PUBLIC a script uses: an attribute of an `import agentrc_pin [as
-    x]` name where that import binds it (its scope, the module's for a `global` x, and the nested scopes that do not
-    rebind x; a module that never rebinds `agentrc_pin` counts it as the bootstrap), or a `from agentrc_pin import`
-    name. Module dunders such as __file__ are not the bootstrap's own."""
+def _scoped(tree, own=False):
+    """(node, {name: binding} visible there) for every node `tree` evaluates: a name is what binds it in its own
+    scope, else in an enclosing function's, else in the module's, which also takes every `global` binding; a module
+    that never rebinds `agentrc_pin` has it as the bootstrap, and the bootstrap itself (`own`) its def load()."""
+    scopes = [tree, *(n for n in ast.walk(tree) if isinstance(n, _SCOPES))]
+    binds = {s: _bindings(s) for s in scopes}
+    module = {"agentrc_pin": _MODULE, **binds[tree][0], **({"load": _LOAD} if own else {})}
+    for s in scopes[1:]:
+        for name, kind in binds[s][1].items():
+            module[name] = module.get(name, False) or kind
+
+    def walk(scope, visible):
+        local, glob = binds[scope]
+        here = module if scope is tree else {**visible, **local, **{n: module.get(n, False) for n in glob}}
+        for node in _own_nodes(scope):
+            yield node, here
+            if isinstance(node, _SCOPES):
+                # a class body is no enclosing scope
+                yield from walk(node, visible if isinstance(scope, ast.ClassDef) else here)
+
+    yield from walk(tree, {})
+
+
+def _load_calls(tree, own=False):
+    """[(line, target or None when not one string literal)] of each agentrc_pin.load() call in a script, in line
+    order, through a name bound to the bootstrap or its load() where the call is (_scoped)."""
+    calls = []
+    for node, here in _scoped(tree, own):
+        f = getattr(node, "func", None)
+        if isinstance(node, ast.Call) and (
+            (isinstance(f, ast.Attribute) and f.attr == "load" and here.get(getattr(f.value, "id", None)) == _MODULE)
+            or (isinstance(f, ast.Name) and here.get(f.id) == _LOAD)
+        ):
+            arg = node.args[0] if len(node.args) == 1 and not node.keywords else None
+            target = arg.value if isinstance(arg, ast.Constant) and isinstance(arg.value, str) else None
+            calls.append((node.lineno, target))
+    return sorted(calls, key=lambda c: c[0])
+
+
+def _internal_uses(tree):
+    """(line, name) of each bootstrap name outside PUBLIC a script uses: an attribute of a name bound to the
+    bootstrap where it is used (_scoped), or a `from agentrc_pin import` name. Module dunders such as __file__ are
+    not the bootstrap's own."""
 
     def internal(name):
         return name not in PUBLIC and not (name.startswith("__") and name.endswith("__"))
 
-    def scan(scope, visible, module):
-        bound, glob, _ = _bindings(scope)
-        if isinstance(scope, ast.Module):
-            bound.update((n, bound.get(n, False) or pin) for n, pin in exported.items())
-        here = {**visible, **bound, **{n: module.get(n, False) for n in glob}}
-        module = here if isinstance(scope, ast.Module) else module
-        inner = visible if isinstance(scope, ast.ClassDef) else here  # a class body is no enclosing scope
-        for node in _own_nodes(scope):
-            name = node.value.id if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) else None
-            if name and here.get(name) and internal(node.attr):
-                uses.append((node.lineno, node.attr))
-            elif isinstance(node, _SCOPES):
-                scan(node, inner, module)
-
-    tree = ast.parse(path.read_text(encoding="utf-8"))
     uses = [
         (node.lineno, a.name)
         for node in ast.walk(tree)
@@ -130,12 +138,12 @@ def _internal_uses(path):
         for a in node.names
         if internal(a.name)
     ]
-    exported = {}
-    for node in ast.walk(tree):
-        if isinstance(node, _SCOPES):
-            for n, pin in _bindings(node)[2].items():
-                exported[n] = exported.get(n, False) or pin
-    scan(tree, {"agentrc_pin": True}, {})
+    uses += [
+        (node.lineno, node.attr)
+        for node, here in _scoped(tree)
+        if isinstance(node, ast.Attribute) and here.get(getattr(node.value, "id", None)) == _MODULE
+        and internal(node.attr)
+    ]
     return sorted(uses)
 
 
@@ -145,8 +153,9 @@ def _load_problems(root, bootstrap, pin_file, closure):
     for path in sorted((*(claude / "skills").rglob("*.py"), *(claude / "test").rglob("*.py"))):
         where = path.relative_to(root).as_posix()
         try:
-            uses = _internal_uses(path)
-            calls = list(_load_calls(path, own=where == bootstrap)) if path.is_relative_to(claude / "skills") else []
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            uses = _internal_uses(tree)
+            calls = _load_calls(tree, own=where == bootstrap) if path.is_relative_to(claude / "skills") else []
         except (OSError, ValueError, SyntaxError, RecursionError) as e:
             problems.append(f"{where} is unreadable ({e})")
             continue
