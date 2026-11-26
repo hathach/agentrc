@@ -12,6 +12,7 @@ import tempfile
 from pathlib import Path
 
 FILES = ()  # loads and launches nothing by path (hil_load.py)
+PUBLIC = frozenset({"config", "identity", "load", "stage", "conformance", "PinError"})  # agentrc_pin.py's docstring
 
 
 class ConformanceError(Exception):
@@ -38,15 +39,38 @@ def _load_calls(path, own=False):
             yield node.lineno, arg.value if isinstance(arg, ast.Constant) and isinstance(arg.value, str) else None
 
 
+def _internal_uses(path):
+    """(line, name) of each bootstrap name outside PUBLIC a script uses: an attribute of any `import agentrc_pin`
+    name, or a `from agentrc_pin import` name. Module dunders such as __file__ are not the bootstrap's own."""
+
+    def internal(name):
+        return name not in PUBLIC and not (name.startswith("__") and name.endswith("__"))
+
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    modules, uses = {"agentrc_pin"}, []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules.update(a.asname or a.name for a in node.names if a.name == "agentrc_pin")
+        elif isinstance(node, ast.ImportFrom) and node.module == "agentrc_pin":
+            uses += [(node.lineno, a.name) for a in node.names if internal(a.name)]
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and getattr(node.value, "id", None) in modules and internal(node.attr):
+            uses.append((node.lineno, node.attr))
+    return sorted(uses)
+
+
 def _load_problems(root, bootstrap, pin_file, closure):
     problems = []
-    for path in sorted((root / ".claude" / "skills").rglob("*.py")):
+    claude = root / ".claude"
+    for path in sorted((*(claude / "skills").rglob("*.py"), *(claude / "test").rglob("*.py"))):
         where = path.relative_to(root).as_posix()
         try:
-            calls = list(_load_calls(path, own=where == bootstrap))
+            uses = _internal_uses(path)
+            calls = list(_load_calls(path, own=where == bootstrap)) if path.is_relative_to(claude / "skills") else []
         except (OSError, ValueError, SyntaxError, RecursionError) as e:
             problems.append(f"{where} is unreadable ({e})")
             continue
+        problems += [f"{where}:{line} uses agentrc_pin.{name}, internal to the bootstrap" for line, name in uses]
         for line, target in calls:
             if target is None:
                 problems.append(f"{where}:{line}: agentrc_pin.load() takes one string literal, not a computed target")
@@ -139,9 +163,9 @@ def problems(root, *, ident, stage, required, profile, bootstrap, pin_file, mani
     does, [] when nothing: its `profile`'s CONTRACT_FILES must carry the `bootstrap` and its `pin_file`
     configuration, the identity must hold the `required` files (the engines, the bootstrap and its FILES), every
     agentrc_pin.load() in .claude/skills, the bootstrap's own included, must name a closure file as one string
-    literal (read with ast), and a tree staged from the contract files and the closure with `stage` must select
-    this identity and load only from its own copy. Paths are consumer-relative; ConformanceError when the profile
-    has no readable CONTRACT_FILES."""
+    literal, .claude/skills and .claude/test must use only the bootstrap's PUBLIC names (both read with ast), and a
+    tree staged from the contract files and the closure with `stage` must select this identity and load only from its
+    own copy. Paths are consumer-relative; ConformanceError when the profile has no readable CONTRACT_FILES."""
     root = Path(root)
     contract = _contract_files(root, profile)
     found = []
