@@ -8595,6 +8595,35 @@ test('a fix note restored from a held launch is posted only after a fresh read o
   assert.ok(clear.labels.indexOf('humans#2-resolve') < clear.labels.indexOf('resolve#2'), clear.labels.join(', '))
 })
 
+test('a person\'s comment after the cycle\'s read holds the settlement on the caller\'s reply, which resolves its thread (#591)', async () => {
+  const wrong = {
+    reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'not so' }], bots: 'reviewed' },
+    challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
+  }
+  const parent = (rs, l) => l === 'replies#1' ? rs.map(r => ({ ...r, verified: false, resolved: null, error: 'read-back mismatch on thread' })) : rs
+  const first = await run({ ...wrong, args: { ...YIELD }, receipts: parent })
+  const settlement = { commentId: 2, commentDigest: 'd2', replyId: 502, bodyDigest: fnv1a('not so'), headSha: first.result.state.expectedHead }
+  const opts = { ...wrong, args: { autoPush: true, maxCycles: 3, replySettlements: [settlement] } }
+  const { result, labels } = await resumeAt(first.result.state, { ...opts, humans: (label) => label.startsWith('humans#2-reuse') ? [OBJECTION] : [] })
+  assert.deepEqual([result.reason, result.humanWaiting], ['human-review-pending', [OBJECTION]], labels.join(', '))
+  assert.deepEqual(labels.filter(l => l.startsWith('reuse#')), [], 'no thread resolved over it')
+  const clear = await resumeAt(first.result.state, opts)
+  assert.ok(clear.labels.includes('humans#2-reuse') && clear.labels.indexOf('humans#2-reuse') < clear.labels.indexOf('reuse#2'), clear.labels.join(', '))
+  assert.equal(clear.result.pass, true, clear.result.reason)
+})
+
+test('a person\'s comment during the CI wait holds the recovery of orphaned runs (#591)', async () => {
+  const stuck = { ...RUNNING, pending: 2, waiting: 'same' }
+  const recovered = { outcome: 'recovered', detail: 'run 43095438193 attempt 1: recovered', runs: [] }
+  const opts = { ci: stuck, ciRecover: recovered, args: { maxCycles: 6 } }
+  const { result, labels } = await run({ ...opts, humans: (label) => label.startsWith('humans#2-cirecover') ? [OBJECTION] : [] })
+  assert.deepEqual([result.reason, result.humanWaiting], ['human-review-pending', [OBJECTION]], labels.join(', '))
+  assert.deepEqual(labels.filter(l => l.startsWith('cirecover#')), [], 'nothing cancelled or re-run over it')
+  const clear = await run(opts)
+  assert.deepEqual(clear.labels.filter(l => /^(humans#2-|cirecover#)/.test(l)), ['humans#2-cirecover', 'cirecover#2'], clear.labels.join(', '))
+  assert.deepEqual(clear.labels.filter(l => /-cirecover/.test(l)), ['humans#2-cirecover'], 'the recovery made on the head is reused without another read')
+})
+
 test('a quota wait probes harvest.py instead of validating until CodeRabbit leaves its limit or the evidence changes (#359)', async () => {
   const validated = (labels) => labels.filter(l => l.startsWith('reviews#'))
   const probes = (labels) => labels.filter(l => l.startsWith('reviews:probe#'))

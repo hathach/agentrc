@@ -31,8 +31,10 @@ A key not listed here throws before anything runs.
   default `['coderabbit', 'greptile', 'code-scanning']`; `[]` runs no review lane.
   Either way harvest.py reads the comments of the people the repository trusts
   each cycle, again right before each push and the fix notes after it, before
-  the refutations and before the deferrals are posted, and before an
-  adoption's push: one that waits for an answer stops
+  the refutations and before the deferrals are posted, before settling on the
+  caller's `replySettlements`, before a CI recovery cancels and re-runs
+  orphaned runs, and before an adoption's push: one that waits for an
+  answer stops
   `human-review-pending` before anything more is asked, fixed, answered or
   pushed, listing it in `humanWaiting` for the human to settle; a repair it
   holds stays committed, unpublished, as the state's `pending` candidate at

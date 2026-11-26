@@ -3565,7 +3565,14 @@ const runLanes = async (cycle, entry, lanes) => {
       const d = debt.get(id)
       return !d || [...(dismissalsToo ? d.dismissals : []), ...d.notes].every(k => harvested.has(k))
     }
-    if (!settlementsTried && settlementsArg.length && r !== nobody) (await settleCaller(cycle, digestOf, held, ended)).forEach(id => ledger.delete(id))
+    if (!settlementsTried && settlementsArg.length && r !== nobody) {
+      // #591: reply.py --reuse resolves threads, so it waits on a read after the challenge and topic checks, the judge's too.
+      if (args.autoPush === true) {
+        const waits = await heldBefore('reuse')
+        if (waits !== undefined) return waits
+      }
+      (await settleCaller(cycle, digestOf, held, ended)).forEach(id => ledger.delete(id))
+    }
     if (lanes.prState) return prEnded(cycle, lanes.prState)
     r.findings = r.findings.filter(f => !answeredByHand(f))
 
@@ -3774,6 +3781,11 @@ const runLanes = async (cycle, entry, lanes) => {
     const now = entry.ciWaited, prev = before('ciWaited')
     if (c.status === 'running' && now && (now.registered > 0 || now.unmet) && prev && ['head', 'registered', 'pending', 'waiting'].every(k => now[k] === prev[k])) {
       const earlier = ciRecoveries.get(expectedHead)
+      // #591: the cancel and re-run come after the CI wait, which the cycle's read and a judge that never ran did not cover.
+      if (!earlier && !githubLimit) {
+        const waits = await heldBefore('cirecover')
+        if (waits !== undefined) return waits
+      }
       const recovery = earlier ?? await recoverCi(cycle, entry)
       if (!earlier && ['recovered', 'completed'].includes(recovery?.outcome)) {
         // The new attempts, or a run that completed after the cancel, move CI: two more whole waits before ci-stuck reads again.
