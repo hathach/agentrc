@@ -1270,7 +1270,12 @@ class ProbeStateRouteTest(unittest.TestCase):
                  bench['args']),
                 ('another interface', {'probe': self.PICO}, '-f interface/jlink.cfg -f target/rp2040.cfg', self.ARGS),
                 ('another serial', {'probe': self.PICO}, f'{self.ARGS} -c "adapter serial X"', self.ARGS),
-                ('another driver', {'probe': self.PICO}, f'-c "adapter driver cmsis-dap" {self.ARGS}', self.ARGS)):
+                ('another driver', {'probe': self.PICO}, f'-c "adapter driver cmsis-dap" {self.ARGS}', self.ARGS),
+                ('a compound command', {'probe': self.PICO}, f'{self.ARGS} -c "adapter speed 1000; adapter serial X"',
+                 self.ARGS),
+                ('a substitution', {'probe': self.PICO}, f'{self.ARGS} -c "adapter speed [adapter serial X]"',
+                 self.ARGS),
+                ('an attached -c', {'probe': self.PICO}, f'{self.ARGS} "-cadapter serial X"', self.ARGS)):
             with self.subTest(why):
                 route, ident, backend = self.resolve(entry, pico_debug)
                 self.assertEqual((route, ident['cfg'], backend.cfg), ('openocd', want, want))

@@ -198,9 +198,22 @@ def _interface_cfgs(words):
     return [b for a, b in zip(words, words[1:]) if a == '-f' and b.startswith('interface/')]
 
 
+def _plain_command(c):
+    """One Tcl command, and no adapter command but a plain `adapter speed N`: a `;`, newline or `[` could run a
+    second one, such as another adapter serial."""
+    if re.search(r'[;\n\[]', c):
+        return False
+    return not re.match(r'\s*adapter\b', c) or bool(re.fullmatch(r'\s*adapter\s+speed\s+\d+\s*', c))
+
+
+def _plain_commands(words):
+    return not any(w.startswith('-c') and w != '-c' for w in words) and all(
+        _plain_command(c) for a, c in zip(words, words[1:]) if a == '-c')
+
+
 def hil_debug_cfg(path, board, flasher):
     """The registry's `debug.openocd` of an openocd `flasher`'s board when it reaches that probe (the same
-    interface cfgs, and no adapter serial, driver or vid_pid of its own), else None: flasher.args stays the
+    interface cfgs, and plain commands: no adapter command but its speed), else None: flasher.args stays the
     route. A bench board's or a roster's own `debug` is never taken, since hil_boards validates only the
     registry's (an esp32 route names another tool and probe)."""
     hb = hil_boards()
@@ -211,8 +224,7 @@ def hil_debug_cfg(path, board, flasher):
     if not reg or 'debug' not in reg:
         return None
     words = shlex.split(reg['debug']['openocd'])
-    if _interface_cfgs(words) != _interface_cfgs(shlex.split(flasher['args'])) or any(
-            re.match(r'\s*adapter\s+(serial|driver|usb\s+vid_pid)\b', w) for w in words):
+    if _interface_cfgs(words) != _interface_cfgs(shlex.split(flasher['args'])) or not _plain_commands(words):
         return None
     return reg['debug']['openocd']
 
