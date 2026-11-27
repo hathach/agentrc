@@ -746,6 +746,26 @@ class WaitingPersonTest(ReplyCase):
         self.run_script([{'commentId': 10, 'body': 'ok'}])
         self.assertFalse(any(a[:4] == ['api', '-X', 'GET', f'repos/{REPO}/pulls/{PR}'] for a in self.gh.calls), 'no person, no PR read')
 
+    def test_a_bot_typed_pr_authors_reply_does_not_answer_a_person(self):
+        # harvest.py skips Bot-typed comments, so a Bot-typed PR author's reply leaves the maintainer waiting.
+        self.gh.review_comment(10)
+        self.gh.review_comment(11, 'wait, I disagree', 'maint', thread='T10', parent=10, association='MEMBER')
+        self.gh.review_comment(12, 'auto note', 'contributor', thread='T10', parent=10, association='CONTRIBUTOR', type='Bot')
+        rc, receipts = self.run_script([{'commentId': 10, 'body': 'ok'}])
+        self.assertEqual((rc, receipts[0]['sent'], receipts[0]['replyId'], receipts[0]['resolved']), (1, False, None, None), receipts)
+        self.assertIn('comment 11 by maint', receipts[0]['error'])
+        self.assertEqual(self.gh.mutations, [])
+        self.setUp()
+        self.gh.review_comment(10)
+        self.gh.review_comment(11, 'ok', ME, thread='T10', parent=10, association='OWNER')
+        self.gh.review_comment(12, 'not ok', 'maint', thread='T10', parent=10, association='COLLABORATOR')
+        self.gh.review_comment(13, 'auto note', 'contributor', thread='T10', parent=10, association='CONTRIBUTOR', type='Bot')
+        rc, receipts = self.reuse(self.answer())
+        self.assertEqual((rc, receipts[0]['replyId'], receipts[0]['verified'], receipts[0]['resolved']), (1, 11, True, False), receipts)
+        self.assertIn('comment 12 by maint', receipts[0]['error'])
+        self.assertEqual(self.gh.mutations, [])
+        self.assertFalse(self.gh.threads['T10']['resolved'])
+
     def test_answering_a_persons_comment_answers_it(self):
         self.gh.review_comment(10, 'please rename', 'maint', association='MEMBER')
         self.gh.review_comment(11, 'and this too', 'maint', thread='T10', parent=10, association='MEMBER')

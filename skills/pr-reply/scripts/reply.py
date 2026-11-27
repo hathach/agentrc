@@ -245,7 +245,10 @@ class Poster:
             return (c.get('user') or {}).get('type') != 'Bot' and c.get('author_association') in TRUSTED and c['user']['login'] not in answerers
 
         def after_answer(answerers):
-            answered = [c['id'] for c in thread if c['user']['login'] in answerers or (c['id'] == target['id'] and person(c, answerers))]
+            # harvest.py skips Bot-typed comments, so only ours answers when Bot-typed, not the PR author's.
+            answered = [c['id'] for c in thread if c['user']['login'] == self.me or
+                        (c['user']['login'] in answerers and c['user'].get('type') != 'Bot') or
+                        (c['id'] == target['id'] and person(c, answerers))]
             latest = max(answered, default=0)
             # Our posted reply answers only what was listed before it; any other answer after a comment answers it.
             before = max((i for i in answered if i != reply_id), default=0)
