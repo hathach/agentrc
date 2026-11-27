@@ -712,6 +712,27 @@ class WaitingPersonTest(ReplyCase):
         self.assertEqual([m[0] for m in self.gh.mutations], ['post-reply'])
         self.assertFalse(self.gh.threads['T10']['resolved'])
 
+    def test_a_rerun_keeps_an_unseen_comment_open_until_a_later_answer(self):
+        # The rerun finds reply 902 and posts nothing: maintainer 901, which our POST never saw, still waits.
+        self.gh.review_comment(10)
+        self.inject_before_post()
+        manifest = [{'commentId': 10, 'body': 'ok'}]
+        rc, receipts = self.run_script(manifest)
+        self.assertEqual((rc, receipts[0]['replyId'], receipts[0]['posted'], receipts[0]['resolved']), (1, 902, True, False), receipts)
+        rc, receipts = self.run_script(manifest)
+        r = receipts[0]
+        self.assertEqual((rc, r['replyId'], r['sent'], r['posted'], r['verified'], r['resolved']), (1, 902, False, False, True, False), receipts)
+        self.assertEqual(r['error'], "comment 901 by maint in this thread came in unseen as our reply 902 was posted and waits "
+                                     "for a person's answer: thread not resolved")
+        self.assertEqual([m[0] for m in self.gh.mutations], ['post-reply'])
+        self.assertFalse(self.gh.threads['T10']['resolved'])
+        self.gh.review_comment(960, 'answered', 'contributor', thread='T10', parent=10, association='CONTRIBUTOR')
+        rc, receipts = self.run_script(manifest)
+        r = receipts[0]
+        self.assertEqual((rc, r['replyId'], r['sent'], r['posted'], r['verified'], r['resolved'], r['error']),
+                         (0, 902, False, False, True, True, None), receipts)
+        self.assertEqual([m[0] for m in self.gh.mutations], ['post-reply', 'resolve'])
+
     def test_an_unseen_comment_answered_later_or_by_no_person_does_not_block(self):
         for what, over in (('a bot', {'login': 'coderabbitai[bot]', 'type': 'Bot'}),
                            ('untrusted', {'association': 'NONE'}),

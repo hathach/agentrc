@@ -24,7 +24,9 @@ when the target is itself a person's); the receipt's error names it, since
 pr-babysit's harvest.py would read our reply or the resolve as its answer. A
 reply this run posted answers only the thread's comments listed before the POST:
 a person's comment that came in between and sits before it keeps the thread open
-unless a later answer by us or the author follows it. A thread
+unless a later answer by us or the author follows it; a rerun that finds that
+reply holds it to the same, a person's comment before it and after the last other
+answer by us or the author counting as one that came in unseen. A thread
 someone already resolved reads resolved all the same. The other two
 have no thread: the reply is an issue comment whose body is the original's URL
 as a quote line plus the text. Every reply digest here is the text's, the
@@ -543,6 +545,9 @@ def handle(poster, item):
         seen = None
         if found:
             reply_id = found[0]
+            # Its POST went out only when its check found no person waiting after the last answer, so a person's
+            # comment between that answer and our reply was missing from that check's listing: none counts as seen.
+            seen = set() if kind == 'review' else None
         else:
             why = poster.unanswered(original, 'not posted') if kind == 'review' else None
             if why:
