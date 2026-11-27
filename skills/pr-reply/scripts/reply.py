@@ -16,7 +16,18 @@ would not anchor inline). A review reply goes to the thread's first comment, whe
 GitHub files every reply, and is read back: it must match the body as gh reads it
 (lib/gh_reads.py), sit in that
 thread after the comment it answers, and carry our login and the PR, before the
-thread is resolved; the other two
+thread is resolved. A review reply is neither posted nor its thread resolved
+while a person's comment waits in the thread, by fresh listing: one by a
+trusted account (OWNER, MEMBER or COLLABORATOR, no Bot), neither ours nor the
+PR author's, after the last comment by us or the author (and after the target,
+when the target is itself a person's); the receipt's error names it, since
+pr-babysit's harvest.py would read our reply or the resolve as its answer. A
+reply this run posted answers only the thread's comments listed before the POST:
+a person's comment that came in between and sits before it keeps the thread open
+unless a later answer by us or the author follows it; a rerun that finds that
+reply holds it to the same, a person's comment before it and after the last other
+answer by us or the author counting as one that came in unseen. A thread
+someone already resolved reads resolved all the same. The other two
 have no thread: the reply is an issue comment whose body is the original's URL
 as a quote line plus the text. Every reply digest here is the text's, the
 quote line left out. A reply of ours with the identical body already
@@ -123,6 +134,7 @@ THREADS_QUERY = ('query($o:String!,$r:String!,$p:Int!,$c:String){repository(owne
                  'nodes{id isResolved comments(first:1){nodes{databaseId}}}}}}}')
 RESOLVE_MUTATION = 'mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{isResolved}}}'
 BODY_MAX = 300
+TRUSTED = ('OWNER', 'MEMBER', 'COLLABORATOR')  # harvest.py's: who a run must not talk over
 
 
 class ApiError(Exception):
@@ -195,6 +207,7 @@ class Poster:
         self._review = None
         self._issue = None
         self._reviews = None
+        self._author = None
 
     def review_comments(self):
         if self._review is None:
@@ -210,6 +223,55 @@ class Poster:
         if self._reviews is None:
             self._reviews = api('GET', f'repos/{self.repo}/pulls/{self.pr}/reviews?per_page=100', paginate=True)
         return self._reviews
+
+    def author(self):
+        if self._author is None:
+            self._author = api('GET', f'repos/{self.repo}/pulls/{self.pr}')['user']['login']
+        return self._author
+
+    def thread(self, target):
+        """The comments of target's thread in the review comment listing last read, read now when none is cached."""
+        root = thread_root(target)
+        return [c for c in self.review_comments() if root in (c['id'], c.get('in_reply_to_id'))]
+
+    def waiting_person(self, target, posted=None):
+        """From a fresh listing, the first comment in target's thread by a person (a trusted account, no Bot, neither ours
+        nor the PR author's) after the last one by us or the author, and after target when target is a person's, else None.
+        posted, (reply id, ids of the thread's comments listed before that reply was posted), keeps that reply from
+        answering a comment it came after unseen: one that landed between the listing and GitHub taking the POST."""
+        self._review = None
+        thread = self.thread(target)
+        reply_id, seen = posted or (None, None)
+
+        def person(c, answerers):
+            return (c.get('user') or {}).get('type') != 'Bot' and c.get('author_association') in TRUSTED and c['user']['login'] not in answerers
+
+        def after_answer(answerers):
+            # harvest.py skips Bot-typed comments, so only ours answers when Bot-typed, not the PR author's.
+            answered = [c['id'] for c in thread if c['user']['login'] == self.me or
+                        (c['user']['login'] in answerers and c['user'].get('type') != 'Bot') or
+                        (c['id'] == target['id'] and person(c, answerers))]
+            latest = max(answered, default=0)
+            # Our posted reply answers only what was listed before it; any other answer after a comment answers it.
+            before = max((i for i in answered if i != reply_id), default=0)
+            return next((c for c in thread if person(c, answerers) and
+                         (c['id'] > latest or (seen is not None and c['id'] > before and c['id'] not in seen))), None)
+        # The PR author is read only when a comment could be a person's.
+        if not after_answer({self.me}):
+            return None
+        return after_answer({self.me, self.author()})
+
+    def unanswered(self, target, what, posted=None):
+        """Why a reply or resolve in target's thread must wait for a person, None when it need not; posted as for
+        waiting_person."""
+        c = self.waiting_person(target, posted)
+        if not c:
+            return None
+        if posted and c['id'] < posted[0] and c['id'] not in posted[1]:
+            return (f"comment {c['id']} by {c['user']['login']} in this thread came in unseen as our reply {posted[0]} "
+                    f"was posted and waits for a person's answer: {what}")
+        return (f"comment {c['id']} by {c['user']['login']} in this thread waits for a person's answer after ours "
+                f"and the PR author's: {what}")
 
     def pending_review(self):
         """Our PENDING review on the PR, None when there is none; ApiError when the reviews could not be listed."""
@@ -295,9 +357,9 @@ class Poster:
         bad = ([] if reads_as_sent(c.get('body'), body) else ['body']) + self.misplaced(kind, target, c)
         return (True, None) if not bad else (False, f'read-back mismatch on {", ".join(bad)}')
 
-    def resolve(self, target):
+    def resolve(self, target, posted=None):
         """Resolve review comment target's thread, found by its first comment: the target can lie past any page of
-        the thread's comments."""
+        the thread's comments. posted as for waiting_person, when this run posted the reply."""
         root = thread_root(target)
         owner, name = self.repo.split('/', 1)
         cursor = None
@@ -310,6 +372,9 @@ class Poster:
                 if [c['databaseId'] for c in t['comments']['nodes']] == [root]:
                     if t['isResolved']:
                         return None
+                    why = self.unanswered(target, 'thread not resolved', posted)
+                    if why:
+                        return why
                     r = graphql(RESOLVE_MUTATION, {'id': t['id']})
                     ok = r.get('data', {}).get('resolveReviewThread', {}).get('thread', {}).get('isResolved')
                     return None if ok else 'resolve mutation did not report isResolved'
@@ -477,9 +542,19 @@ def handle(poster, item):
             rc['replyId'] = found[0]
             rc['error'] = f'reply {found[0]} of ours is already on this comment in other words; the caller reconciles it'
             return rc
+        seen = None
         if found:
             reply_id = found[0]
+            # Its POST went out only when its check found no person waiting after the last answer, so a person's
+            # comment between that answer and our reply was missing from that check's listing: none counts as seen.
+            seen = set() if kind == 'review' else None
         else:
+            why = poster.unanswered(original, 'not posted') if kind == 'review' else None
+            if why:
+                rc['error'] = why
+                return rc
+            # The thread as that check saw it: a comment missing here and older than our reply came in unseen by it.
+            seen = {c['id'] for c in poster.thread(original)} if kind == 'review' else None
             rc['sent'] = True
             try:
                 reply_id = poster.post(kind, original, body)
@@ -497,7 +572,7 @@ def handle(poster, item):
         rc['replyId'] = reply_id
         rc['verified'], rc['error'] = poster.verify(kind, original, reply_id, body)
         if rc['verified'] and kind == 'review':
-            rc['error'] = poster.resolve(original)
+            rc['error'] = poster.resolve(original, (reply_id, seen) if seen is not None else None)
             rc['resolved'] = rc['error'] is None
     except ApiError as e:
         rc['error'] = str(e)

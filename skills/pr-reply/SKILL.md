@@ -17,8 +17,11 @@ ours to the comment (in its thread after it, or quoting it) blocks the post: its
 names that reply with `verified: false`, for the caller to reconcile. An entry
 with `"secondAnswer": true`, for a comment edited after we answered it, may go
 beside our inline reply; a quoting reply of ours that gives the same kind of
-answer (a `Fixed in ` note, or anything else) still blocks it. Its receipts are
-the evidence; a `201` from GitHub is not.
+answer (a `Fixed in ` note, or anything else) still blocks it. A review reply is
+neither posted nor its thread resolved while a trusted person's comment (owner,
+member or collaborator, no bot, neither ours nor the PR author's) waits in the
+thread after the last one by us or the author; the receipt's error names it. Its
+receipts are the evidence; a `201` from GitHub is not.
 
 ```bash
 R="${AGENTRC_DIR:-$HOME/.claude}/skills/pr-reply/scripts/reply.py"

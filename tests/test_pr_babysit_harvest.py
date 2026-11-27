@@ -766,9 +766,14 @@ def threads_page(nodes, after=None, viewer='runner'):
 
 
 def thread(login, association='COLLABORATOR', resolved=False, typename='User', id_=70, body='keep it', line=12):
-    return {'isResolved': resolved, 'comments': {'nodes': [{
+    return {'id': f'T{id_}', 'isResolved': resolved, 'comments': {'pageInfo': {'hasPreviousPage': False, 'startCursor': None}, 'nodes': [{
         'databaseId': id_, 'author': {'__typename': typename, 'login': login}, 'authorAssociation': association, 'url': f'u/{id_}',
         'path': 'src/a.c', 'line': line, 'originalLine': 9, 'createdAt': EVENT, 'body': body}]}}
+
+
+def thread_key(thread_id, before):
+    """The gh argv of harvest.py's query for a review thread's comments before a cursor."""
+    return ('api', 'graphql', '-f', f'query={harvest.THREAD_QUERY}', '-f', f't={thread_id}', '-f', f'b={before}')
 
 
 def said(login, body, at, id_, association='COLLABORATOR', type_='User'):
@@ -829,7 +834,8 @@ class HumanWaiting(unittest.TestCase):
         self.assertEqual(self.waiting(threads=[thread('bob', resolved=True)]), [], 'resolved')
         self.assertEqual(self.waiting(threads=[thread('alice', 'OWNER', id_=71)]), [], "the author's reply is the thread's last comment")
         self.assertEqual(self.waiting(threads=[thread('bob', id_=72)]), [('inline', 72)], "the person's comment after the author's is its last")
-        self.assertEqual(self.waiting(threads=[{'isResolved': False, 'comments': {'nodes': []}}]), [])
+        self.assertEqual(self.waiting(threads=[{'id': 'T0', 'isResolved': False,
+                                                'comments': {'pageInfo': {'hasPreviousPage': False, 'startCursor': None}, 'nodes': []}}]), [])
         pages_ = iter([threads_page([thread('bob', line=None)])])
         with mock.patch.object(harvest, 'gh_json', side_effect=lambda *a: next(pages_)):
             w, = harvest.human_waiting('o/r', 7, self.AUTHOR, [], [])
@@ -846,7 +852,7 @@ class HumanWaiting(unittest.TestCase):
             with self.subTest(name):
                 self.assertEqual(self.waiting(issue=[asked, *answer]), want)
         for name, answer, want in (
-                ('an empty later review', reviewed('alice', '', '2026-09-25T09:00:01Z', 5, 'OWNER'), []),
+                ('an empty later review, a thread reply', reviewed('alice', '', '2026-09-25T09:00:01Z', 5, 'OWNER'), [('issue', 1)]),
                 ('a later review with a body', reviewed('alice', 'done', '2026-09-25T09:00:01Z', 5, 'OWNER'), []),
                 ('an unsubmitted later review', reviewed('alice', '', '2026-09-25T09:00:01Z', 5, 'OWNER', state='PENDING'), [('issue', 1)])):
             with self.subTest(name):
@@ -854,6 +860,109 @@ class HumanWaiting(unittest.TestCase):
         body = reviewed('bob', 'needs work', '2026-09-25T09:00:00Z', 3, state='CHANGES_REQUESTED')
         self.assertEqual(self.waiting(issue=[said('alice', 'x', '2026-09-25T09:00:01Z', 2, 'OWNER')], reviews=[body]), [], 'a review body too')
         self.assertEqual(self.waiting(reviews=[body], threads=[thread('alice', 'OWNER')]), [('review', 3)], 'an inline reply answers no top-level comment')
+
+    def test_the_runs_own_posts_as_the_author_answer_no_person(self):
+        asked = said('bob', 'why?', '2026-09-25T09:00:00Z', 1)
+        later = '2026-09-25T09:00:01Z'
+        for name, answer, want in (
+                ('a request to CodeRabbit', said('alice', '@coderabbitai review', later, 2, 'OWNER'), [('issue', 1)]),
+                ('a request to Greptile', said('alice', ' @GreptileAI', later, 2, 'OWNER'), [('issue', 1)]),
+                ('a reply quoting a bot comment', said('alice', '> https://github.com/o/r/pull/7#issuecomment-9\n\nFixed in abc', later, 2, 'OWNER'),
+                 [('issue', 1)]),
+                ('a reply quoting a bot review', said('alice', '> https://github.com/o/r/pull/7#pullrequestreview-9\n\nNot a bug', later, 2, 'OWNER'),
+                 [('issue', 1)]),
+                ('a person quoting a line of text', said('alice', '> why?\n\nbecause', later, 2, 'OWNER'), []),
+                ('a mention later in the text', said('alice', 'Done, thanks @coderabbitai', later, 2, 'OWNER'), [])):
+            with self.subTest(name):
+                self.assertEqual(self.waiting(issue=[asked, answer]), want)
+        own = {**asked, 'html_url': 'https://github.com/o/r/pull/7#issuecomment-1'}
+        self.assertEqual(self.waiting(issue=[own, said('alice', '> https://github.com/o/r/pull/7#issuecomment-1\n\nok', later, 2, 'OWNER')]),
+                         [], "pr-reply's quote of that comment answers it")
+        body = reviewed('bob', 'needs work', '2026-09-25T09:00:00Z', 3, state='CHANGES_REQUESTED')
+        self.assertEqual(self.waiting(reviews=[body, reviewed('alice', '> https://github.com/o/r/pull/7#issuecomment-9\n\nx', later, 5, 'OWNER')]),
+                         [('review', 3)], 'a review body quoting another comment')
+        for name, ask in (('Copilot', '@copilot review'), ('CodeRabbit', ' @CodeRabbitAI review')):
+            with self.subTest(f'a review body asking {name}'):
+                self.assertEqual(self.waiting(issue=[asked], reviews=[body, reviewed('alice', ask, later, 5, 'OWNER')]),
+                                 [('issue', 1), ('review', 3)])
+        self.assertEqual(self.waiting(issue=[asked], reviews=[reviewed('alice', 'Done, thanks @copilot', later, 5, 'OWNER')]), [],
+                         'a review body that mentions a bot later in its text')
+
+    def test_an_issue_comment_edited_after_its_answer_waits_again(self):
+        answer = said('alice', 'x', '2026-09-25T09:00:01Z', 2, 'OWNER')
+        asked = said('bob', 'why?', '2026-09-25T09:00:00Z', 1)
+        self.assertEqual(self.waiting(issue=[asked, answer]), [])
+        self.assertEqual(self.waiting(issue=[{**asked, 'updated_at': '2026-09-25T09:00:02Z'}, answer]), [('issue', 1)])
+        self.assertEqual(self.waiting(issue=[{**asked, 'updated_at': '2026-09-25T09:00:02Z'}, answer,
+                                             said('alice', 'y', '2026-09-25T09:00:03Z', 4, 'OWNER')]), [], 'answered again')
+
+    def test_a_bots_reply_after_a_persons_inline_comment_answers_nothing(self):
+        def tail(*who, resolved=False):
+            nodes = [thread(login, association, typename=typename, id_=70 + i)['comments']['nodes'][0]
+                     for i, (login, association, typename) in enumerate(who)]
+            return {'id': 'T70', 'isResolved': resolved, 'comments': {'pageInfo': {'hasPreviousPage': False, 'startCursor': None}, 'nodes': nodes}}
+        bot = ('coderabbitai', 'NONE', 'Bot')
+        self.assertEqual(self.waiting(threads=[tail(bot, ('bob', 'COLLABORATOR', 'User'), bot)]), [('inline', 71)],
+                         "a person's reply in a bot's thread, the bot answering it")
+        self.assertEqual(self.waiting(threads=[tail(('bob', 'COLLABORATOR', 'User'), bot, bot)]), [('inline', 70)])
+        self.assertEqual(self.waiting(threads=[tail(('bob', 'COLLABORATOR', 'User'), ('eve', 'CONTRIBUTOR', 'User'))]), [('inline', 70)],
+                         'nor does an untrusted account')
+        self.assertEqual(self.waiting(threads=[tail(('bob', 'COLLABORATOR', 'User'), ('carol', 'MEMBER', 'User'), bot)]), [('inline', 71)],
+                         "another person's comment waits in its place")
+        self.assertEqual(self.waiting(threads=[tail(('bob', 'COLLABORATOR', 'User'), ('alice', 'OWNER', 'User'), bot)]), [], 'the author answered')
+        self.assertEqual(self.waiting(threads=[tail(bot, ('bob', 'COLLABORATOR', 'User'), ('runner', 'OWNER', 'User'))]), [],
+                         'the account gh acts as replied after it')
+        self.assertEqual(self.waiting(threads=[tail(('bob', 'COLLABORATOR', 'User'), bot, resolved=True)]), [], 'resolved')
+        self.assertEqual(self.waiting(threads=[tail(bot, bot)]), [])
+        self.assertIn('comments(last:100)', harvest.THREADS_QUERY)
+
+    def test_a_tail_of_bot_replies_is_read_on_backward_to_the_comment_that_decides(self):
+        def node(login, association, typename, id_):
+            return thread(login, association, typename=typename, id_=id_)['comments']['nodes'][0]
+
+        def comments(nodes, before=None):
+            return {'pageInfo': {'hasPreviousPage': before is not None, 'startCursor': before}, 'nodes': nodes}
+
+        bots = [node('coderabbitai', 'NONE', 'Bot', 200 + i) for i in range(harvest.THREAD_TAIL)]
+        untrusted = [node('eve', 'CONTRIBUTOR', 'User', 400 + i) for i in range(harvest.THREAD_TAIL)]
+        bob, alice = node('bob', 'COLLABORATOR', 'User', 70), node('alice', 'OWNER', 'User', 71)
+
+        def read(*older, resolved=False, tail=bots):
+            """The PR's one thread, its tail `tail` with older comments before cursor b1, then each of `older` in turn: a
+            list of comments, with a further cursor when it is a (nodes, cursor) pair, or a whole gh answer when a dict."""
+            t = {'id': 'TX', 'isResolved': resolved, 'comments': comments(tail, 'b1')}
+            answers = {threads_key(): threads_page([t])}
+            for i, got in enumerate(older, 1):
+                nodes, before = got if isinstance(got, tuple) else (got, None)
+                answers[' '.join(thread_key('TX', f'b{i}'))] = got if isinstance(got, dict) else {'data': {'node': {'comments': comments(nodes, before)}}}
+            seen = []
+
+            def gh(*argv):
+                seen.append(' '.join(argv))
+                return answers[' '.join(argv)]
+            with mock.patch.object(harvest, 'gh_json', side_effect=gh):
+                got = [(w['kind'], w['id']) for w in harvest.human_waiting('o/r', 7, self.AUTHOR, [], [])]
+            return got, len(seen) - 1
+
+        self.assertEqual(read([bob]), ([('inline', 70)], 1), "a person's comment behind a full tail of bot replies")
+        self.assertEqual(read([bob], tail=untrusted), ([('inline', 70)], 1), 'and behind a full tail of untrusted replies')
+        self.assertEqual(read(([*bots], 'b2'), [bob, *bots[:3]]), ([('inline', 70)], 2), 'two pages back')
+        self.assertEqual(read([bob, alice]), ([], 1), 'the author answered before the bots')
+        self.assertEqual(read([node('coderabbitai', 'NONE', 'Bot', 9)]), ([], 1), 'only bots, to the thread start')
+        self.assertEqual(read(tail=[*bots[:99], bob]), ([('inline', 70)], 0), 'a decider in the tail reads nothing older')
+        self.assertEqual(read([bob], resolved=True), ([], 0), 'a resolved thread is not read on')
+        for name, answer, why in (('errors', {'errors': [{'message': 'Something went wrong'}], 'data': None}, 'Something went wrong'),
+                                  ('no thread', {'data': {'node': None}}, 'review thread TX did not read')):
+            with self.subTest(name), self.assertRaisesRegex(harvest.Unusable, why):
+                read(answer)
+        with mock.patch.object(harvest, 'gh_json', side_effect=[threads_page([{'id': 'TX', 'isResolved': False, 'comments': comments(bots, 'b1')}]),
+                                                               harvest.Unusable('gh api graphql: HTTP 502')]):
+            with self.assertRaises(harvest.Unusable, msg='a failed read is never the thread start'):
+                harvest.human_waiting('o/r', 7, self.AUTHOR, [], [])
+        no_cursor = {'id': 'TX', 'isResolved': False, 'comments': {'pageInfo': {'hasPreviousPage': True, 'startCursor': None}, 'nodes': bots}}
+        with mock.patch.object(harvest, 'gh_json', side_effect=[threads_page([no_cursor])]):
+            with self.assertRaisesRegex(harvest.Unusable, 'no cursor'):
+                harvest.human_waiting('o/r', 7, self.AUTHOR, [], [])
 
     def test_the_threads_are_read_page_by_page_and_a_failed_read_is_an_error(self):
         seen = []
