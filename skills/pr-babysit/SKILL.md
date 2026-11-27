@@ -72,7 +72,10 @@ A comment by a trusted person (author_association OWNER, MEMBER or COLLABORATOR,
 that still waits for an answer, harvest.py's `humanWaiting`, stops `human-review-pending` before any trigger, fix, reply
 or push, an adoption's included, naming each in `humanWaiting`; it is the human's to settle, never a bot finding, and
 `merge.py` refuses while one waits. Comments by the account the run acts as are its own, so they neither wait nor, unless
-it is the PR's author, answer.
+it is the PR's author, answer a top-level comment; even then a request to a bot, an empty review body (a thread reply)
+or a pr-reply reply quoting another comment answers none, and an issue comment edited after its answer waits again. A
+bot's reply after a person's inline comment answers nothing; `reply.py` neither replies in nor resolves a thread where
+one waits.
 A launch on a PR no longer open stops `pr-merged` or `pr-closed`, at preflight or at the CI lane's next read; nothing is left to continue. Every GitHub or SonarCloud write reads the state first (`preflight.py --state`, or `push.py --open-pr` for a push) and goes on only for an OPEN PR; an unreadable state stops `pr-state-unread`.
 `preflight.py`, `harvest.py`, `scope_check.py`, `state_transfer.py`, `launch_result.py` and `commits.py` only read, except that
 each writes its AGENTRC_EMIT file, `preflight.py` creates the launch's receipts directory and `commits.py commit` stages and commits exactly its paths, saving its receipt; `hooks.py` runs the repository's hooks, which may rewrite

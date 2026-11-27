@@ -137,11 +137,17 @@ RUN_PROGRESS = {'queued': ('queued', 'check run queued'), 'in_progress': ('worki
 WORKFLOW_RETRY_S = 2
 # Who may hold a babysat PR back with a comment (#591): an account the repository trusts, never a bot or the PR's author.
 TRUSTED = ('OWNER', 'MEMBER', 'COLLABORATOR')
-# Every review thread with its last comment, paged as reply.py's THREADS_QUERY is, and the account gh acts as.
+# Every review thread with its newest THREAD_TAIL comments, paged as reply.py's THREADS_QUERY is, and the account gh
+# acts as. A bot's reply after a person's comment answers nothing, so a thread's last comment alone is not enough.
+THREAD_TAIL = 100
 THREADS_QUERY = ('query($o:String!,$r:String!,$p:Int!,$c:String){viewer{login} repository(owner:$o,name:$r){'
-                 'pullRequest(number:$p){reviewThreads(first:100,after:$c){pageInfo{hasNextPage endCursor}'
-                 'nodes{isResolved comments(last:1){nodes{databaseId author{__typename login} authorAssociation url path line '
+                 f'pullRequest(number:$p){{reviewThreads(first:100,after:$c){{pageInfo{{hasNextPage endCursor}}'
+                 f'nodes{{isResolved comments(last:{THREAD_TAIL}){{nodes{{databaseId author{{__typename login}} authorAssociation url path line '
                  'originalLine createdAt body}}}}}}}')
+# The run's own posts as the PR's author, which answer no person: a request to a bot, and pr-reply's reply quoting the
+# html_url of another comment on its first line (reply.py's quote line).
+BOT_ASK = re.compile(r'\s*@(?:coderabbitai|greptileai|copilot)\b', re.I)
+REPLY_QUOTE = re.compile(r'> (https://\S+#(?:issuecomment|pullrequestreview)-\d+)\n\n')
 
 
 class Unreadable(Unusable):
@@ -670,31 +676,45 @@ def review_threads(repo, n):
         cursor = page['pageInfo']['endCursor']
 
 
+def quoted(body):
+    """The comment URL a reply quotes on its first line as pr-reply writes it, else None."""
+    m = REPLY_QUOTE.match(body or '')
+    return m and m[1]
+
+
 def human_waiting(repo, n, author, issue, reviews):
     """The comments of a trusted person (author_association OWNER, MEMBER or COLLABORATOR, not a Bot account, not the
-    PR's author, not the account gh acts as, whose comments are the run's own) that wait for an answer: an unresolved
-    thread whose last comment is one, or an issue comment or non-empty submitted review body with no issue comment or
-    submitted review, an empty one too, by the PR's author strictly after it; an inline reply answers none."""
+    PR's author, not the account gh acts as, whose comments are the run's own) that wait for an answer.
+
+    An inline comment waits while its thread is unresolved and it is the thread's newest comment by such a person, the
+    PR's author or the account gh acts as: a bot's reply after it, or anyone else's, answers nothing. An issue comment
+    or a non-empty submitted review body waits until the PR's author posts an issue comment or submits a non-empty
+    review body strictly after it (after an issue comment's last edit, `updated_at`; a review gives no edit time). What
+    the run posts as the author answers none: a request to a bot, an empty review body (what GitHub wraps a thread reply
+    in) and a pr-reply reply quoting another comment's URL; an inline reply answers no top-level comment."""
     threads, viewer = review_threads(repo, n)
     excluded = {author.lower(), viewer.lower()}
     waiting = []
     for t in threads:
-        last = t['comments']['nodes']
-        if t['isResolved'] or not last:
+        if t['isResolved']:
             continue
-        c, who = last[0], last[0]['author'] or {}
-        if trusted(who.get('login'), c['authorAssociation'], who.get('__typename') == 'Bot', excluded):
+        # GraphQL lists a thread's comments oldest first; the newest one a person or an answerer left decides.
+        c = next((c for c in reversed(t['comments']['nodes']) if (c['author'] or {}).get('__typename') != 'Bot' and (
+            ((c['author'] or {}).get('login') or '').lower() in excluded or c['authorAssociation'] in TRUSTED)), None)
+        who = (c or {}).get('author') or {}
+        if c and trusted(who.get('login'), c['authorAssociation'], who.get('__typename') == 'Bot', excluded):
             waiting.append({'kind': 'inline', 'id': c['databaseId'], 'author': who['login'], 'url': c['url'], 'path': c['path'],
                             'line': c['line'] if c['line'] is not None else c['originalLine'], 'createdAt': c['createdAt'], 'digest': digest(c['body'])})
     by_author = lambda u: (u['login'] or '').lower() == author.lower()
-    answers = [stamp(c['created_at']) for c in issue if by_author(c['user'])] + \
-        [stamp(v['submitted_at']) for v in reviews if by_author(v['user']) and v.get('state') in REVIEW_SUBMITTED]
-    answered = max(answers, default=None)
-    tops = [('issue', c, c['created_at']) for c in issue] + \
-        [('review', v, v['submitted_at']) for v in reviews if v.get('state') in REVIEW_SUBMITTED and (v.get('body') or '').strip()]
-    for kind, c, at in tops:
+    answers = [(stamp(c['created_at']), quoted(c.get('body'))) for c in issue
+               if by_author(c['user']) and not BOT_ASK.match(c.get('body') or '')]
+    answers += [(stamp(v['submitted_at']), quoted(v['body'])) for v in reviews
+                if by_author(v['user']) and v.get('state') in REVIEW_SUBMITTED and (v.get('body') or '').strip()]
+    tops = [('issue', c, c['created_at'], c.get('updated_at') or c['created_at']) for c in issue] + \
+        [('review', v, v['submitted_at'], v['submitted_at']) for v in reviews if v.get('state') in REVIEW_SUBMITTED and (v.get('body') or '').strip()]
+    for kind, c, at, edited in tops:
         if trusted(c['user']['login'], c.get('author_association'), c['user'].get('type') == 'Bot', excluded) and \
-                (answered is None or answered <= stamp(at)):
+                not any(when > stamp(edited) and url in (None, c['html_url']) for when, url in answers):
             waiting.append({'kind': kind, 'id': c['id'], 'author': c['user']['login'], 'url': c['html_url'], 'createdAt': at,
                             'digest': digest(c.get('body'))})
     return waiting
