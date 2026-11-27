@@ -138,12 +138,16 @@ WORKFLOW_RETRY_S = 2
 # Who may hold a babysat PR back with a comment (#591): an account the repository trusts, never a bot or the PR's author.
 TRUSTED = ('OWNER', 'MEMBER', 'COLLABORATOR')
 # Every review thread with its newest THREAD_TAIL comments, paged as reply.py's THREADS_QUERY is, and the account gh
-# acts as. A bot's reply after a person's comment answers nothing, so a thread's last comment alone is not enough.
+# acts as. A bot's reply after a person's comment answers nothing, so a thread's last comment alone is not enough, and a
+# tail no person or answerer is in is read on backward, THREAD_TAIL comments at a time, through THREAD_QUERY.
 THREAD_TAIL = 100
+THREAD_COMMENTS = ('pageInfo{hasPreviousPage startCursor} nodes{databaseId author{__typename login} authorAssociation url path line '
+                   'originalLine createdAt body}')
 THREADS_QUERY = ('query($o:String!,$r:String!,$p:Int!,$c:String){viewer{login} repository(owner:$o,name:$r){'
-                 f'pullRequest(number:$p){{reviewThreads(first:100,after:$c){{pageInfo{{hasNextPage endCursor}}'
-                 f'nodes{{isResolved comments(last:{THREAD_TAIL}){{nodes{{databaseId author{{__typename login}} authorAssociation url path line '
-                 'originalLine createdAt body}}}}}}}')
+                 'pullRequest(number:$p){reviewThreads(first:100,after:$c){pageInfo{hasNextPage endCursor}'
+                 f'nodes{{id isResolved comments(last:{THREAD_TAIL}){{' + THREAD_COMMENTS + '}}}}}}')
+THREAD_QUERY = ('query($t:ID!,$b:String!){node(id:$t){... on PullRequestReviewThread{'
+                f'comments(last:{THREAD_TAIL},before:$b){{' + THREAD_COMMENTS + '}}}}')
 # The run's own posts as the PR's author, which answer no person: a request to a bot, and pr-reply's reply quoting the
 # html_url of another comment on its first line (reply.py's quote line).
 BOT_ASK = re.compile(r'\s*@(?:coderabbitai|greptileai|copilot)\b', re.I)
@@ -657,8 +661,8 @@ def trusted(login, association, bot, excluded):
 
 
 def review_threads(repo, n):
-    """(every review thread of the PR with its last comment, the login gh acts as); a failed read is Unusable, never no
-    threads or no account."""
+    """(every review thread of the PR with its newest THREAD_TAIL comments, the login gh acts as); a failed read is
+    Unusable, never no threads or no account."""
     owner, name = repo.split('/', 1)
     threads, cursor, viewer = [], None, None
     while True:
@@ -676,6 +680,26 @@ def review_threads(repo, n):
         cursor = page['pageInfo']['endCursor']
 
 
+def newest_first(t):
+    """A review thread's comments, newest first, its older ones read THREAD_TAIL at a time only once the caller has
+    gone past every comment read so far; a failed read is Unusable, never the thread's start."""
+    got = t['comments']
+    while True:
+        yield from reversed(got['nodes'])
+        if not got['pageInfo']['hasPreviousPage']:
+            return
+        before = got['pageInfo']['startCursor']
+        if not isinstance(before, str) or not before:
+            raise Unusable(f"review thread {t['id']} has older comments and no cursor to read them by")
+        answer = gh_json('api', 'graphql', '-f', f'query={THREAD_QUERY}', '-f', f"t={t['id']}", '-f', f'b={before}')
+        if answer.get('errors'):
+            raise Unusable(f"the review thread query answered errors: {json.dumps(answer['errors'])[:300]}")
+        node = (answer.get('data') or {}).get('node')
+        if not node:
+            raise Unusable(f"review thread {t['id']} did not read")
+        got = node['comments']
+
+
 def quoted(body):
     """The comment URL a reply quotes on its first line as pr-reply writes it, else None."""
     m = REPLY_QUOTE.match(body or '')
@@ -690,16 +714,18 @@ def human_waiting(repo, n, author, issue, reviews):
     PR's author or the account gh acts as: a bot's reply after it, or anyone else's, answers nothing. An issue comment
     or a non-empty submitted review body waits until the PR's author posts an issue comment or submits a non-empty
     review body strictly after it (after an issue comment's last edit, `updated_at`; a review gives no edit time). What
-    the run posts as the author answers none: a request to a bot, an empty review body (what GitHub wraps a thread reply
-    in) and a pr-reply reply quoting another comment's URL; an inline reply answers no top-level comment."""
+    the run posts as the author answers none: a request to a bot, in an issue comment or a review body, an empty review
+    body (what GitHub wraps a thread reply in) and a pr-reply reply quoting another comment's URL; an inline reply
+    answers no top-level comment."""
     threads, viewer = review_threads(repo, n)
     excluded = {author.lower(), viewer.lower()}
     waiting = []
     for t in threads:
         if t['isResolved']:
             continue
-        # GraphQL lists a thread's comments oldest first; the newest one a person or an answerer left decides.
-        c = next((c for c in reversed(t['comments']['nodes']) if (c['author'] or {}).get('__typename') != 'Bot' and (
+        # GraphQL lists a thread's comments oldest first; the newest one a person or an answerer left decides, however
+        # many bot or untrusted replies follow it.
+        c = next((c for c in newest_first(t) if (c['author'] or {}).get('__typename') != 'Bot' and (
             ((c['author'] or {}).get('login') or '').lower() in excluded or c['authorAssociation'] in TRUSTED)), None)
         who = (c or {}).get('author') or {}
         if c and trusted(who.get('login'), c['authorAssociation'], who.get('__typename') == 'Bot', excluded):
@@ -709,7 +735,8 @@ def human_waiting(repo, n, author, issue, reviews):
     answers = [(stamp(c['created_at']), quoted(c.get('body'))) for c in issue
                if by_author(c['user']) and not BOT_ASK.match(c.get('body') or '')]
     answers += [(stamp(v['submitted_at']), quoted(v['body'])) for v in reviews
-                if by_author(v['user']) and v.get('state') in REVIEW_SUBMITTED and (v.get('body') or '').strip()]
+                if by_author(v['user']) and v.get('state') in REVIEW_SUBMITTED and (v.get('body') or '').strip()
+                and not BOT_ASK.match(v.get('body') or '')]
     tops = [('issue', c, c['created_at'], c.get('updated_at') or c['created_at']) for c in issue] + \
         [('review', v, v['submitted_at'], v['submitted_at']) for v in reviews if v.get('state') in REVIEW_SUBMITTED and (v.get('body') or '').strip()]
     for kind, c, at, edited in tops:

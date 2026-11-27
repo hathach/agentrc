@@ -685,6 +685,45 @@ class WaitingPersonTest(ReplyCase):
         self.assertIn('comment 950 by maint', receipts[0]['error'])
         self.assertEqual([m[0] for m in self.gh.mutations], ['post-reply'])
 
+    def inject_before_post(self, login='maint', association='MEMBER', type='User', then=()):
+        """A comment by login landing after the pre-post listing and before GitHub takes our reply, so its id is below the
+        reply's; then: (id, login, association) comments landing after the reply."""
+        real = self.gh.rest
+
+        def rest(method, path, body, paginate):
+            if method == 'POST':
+                self.gh.next_id += 1
+                self.gh.review_comment(self.gh.next_id, 'hold on', login, thread='T10', parent=10, association=association, type=type)
+            got = real(method, path, body, paginate)
+            if method == 'POST':
+                for cid, who, assoc in then:
+                    self.gh.review_comment(cid, 'later', who, thread='T10', parent=10, association=assoc)
+            return got
+        self.gh.rest = rest
+
+    def test_a_persons_reply_landing_before_our_post_is_not_answered_by_it(self):
+        self.gh.review_comment(10)
+        self.inject_before_post()
+        rc, receipts = self.run_script([{'commentId': 10, 'body': 'ok'}])
+        r = receipts[0]
+        self.assertEqual((rc, r['replyId'], r['posted'], r['verified'], r['resolved']), (1, 902, True, True, False), receipts)
+        self.assertEqual(r['error'], "comment 901 by maint in this thread came in unseen as our reply 902 was posted and waits "
+                                     "for a person's answer: thread not resolved")
+        self.assertEqual([m[0] for m in self.gh.mutations], ['post-reply'])
+        self.assertFalse(self.gh.threads['T10']['resolved'])
+
+    def test_an_unseen_comment_answered_later_or_by_no_person_does_not_block(self):
+        for what, over in (('a bot', {'login': 'coderabbitai[bot]', 'type': 'Bot'}),
+                           ('untrusted', {'association': 'NONE'}),
+                           ('the PR author', {'login': 'contributor'}),
+                           ('answered by the PR author after our reply', {'then': ((960, 'contributor', 'CONTRIBUTOR'),)})):
+            with self.subTest(what):
+                self.setUp()
+                self.gh.review_comment(10)
+                self.inject_before_post(**over)
+                rc, receipts = self.run_script([{'commentId': 10, 'body': 'ok'}])
+                self.assertEqual((rc, receipts[0]['resolved'], receipts[0]['error']), (0, True, None), receipts)
+
     def test_a_bots_or_an_untrusted_or_an_answered_comment_does_not_block(self):
         self.gh.review_comment(10)
         self.gh.review_comment(11, 'early word', 'maint', thread='T10', parent=10, association='MEMBER')
